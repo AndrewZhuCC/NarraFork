@@ -1,5 +1,6 @@
 import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
@@ -11,6 +12,7 @@ import type { ServerWebSocket } from "bun";
 export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
 
+import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -27,7 +29,7 @@ import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
-import { hotOnce } from "../lib/hot-safe";
+import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
@@ -75,6 +77,7 @@ import {
 	createCatchUpBuffer,
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
+import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
@@ -119,6 +122,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages";
 
 // Client → Server messages
 export type NarratorClientMessage =
+	| GitWorkspaceClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -191,6 +195,7 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	releaseGitWorkspaceSubscriptions(ws);
 	connections.delete(ws);
 	const userId = ws.data.userId;
 	if (!userId) return;
@@ -970,6 +975,70 @@ if (hotOnce("narrafork.humanAttentionWs.listenersRegistered")) {
 	});
 }
 
+/**
+ * Per-user coalescing for notification-center frames.
+ *
+ * Fan-out can insert many rows for one user in a burst (DM + permission offer).
+ * The client is required to treat the frame as "stale", not as data — so we
+ * collapse bursts to one wake-up per user per flush window instead of one frame
+ * per row.
+ */
+const NOTIFICATION_CENTER_FLUSH_MS = 50;
+const notificationCenterPending = hotSafe(
+	"narrafork.notificationCenterWs.pending",
+	() =>
+		new Map<
+			string,
+			{
+				kinds?: Set<"chat_message" | "permission_request">;
+				timer?: ReturnType<typeof setTimeout>;
+			}
+		>(),
+);
+
+function flushNotificationCenterBroadcast(userId: string): void {
+	const pending = notificationCenterPending.get(userId);
+	if (!pending) return;
+	notificationCenterPending.delete(userId);
+	if (pending.timer !== undefined) clearTimeout(pending.timer);
+	const frame: Extract<
+		NarratorServerMessage,
+		{ type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE }
+	> = {
+		type: NOTIFICATION_CENTER_CHANGED_WS_TYPE,
+	};
+	if (pending.kinds && pending.kinds.size > 0) {
+		frame.kinds = [...pending.kinds];
+	}
+	broadcastToUser(userId, frame);
+}
+
+function scheduleNotificationCenterBroadcast(
+	userId: string,
+	kinds?: Array<"chat_message" | "permission_request">,
+): void {
+	if (!userId) return;
+	let pending = notificationCenterPending.get(userId);
+	if (!pending) {
+		pending = {};
+		notificationCenterPending.set(userId, pending);
+	}
+	if (kinds?.length) {
+		if (!pending.kinds) pending.kinds = new Set();
+		for (const kind of kinds) pending.kinds.add(kind);
+	}
+	if (pending.timer !== undefined) return;
+	pending.timer = setTimeout(() => {
+		flushNotificationCenterBroadcast(userId);
+	}, NOTIFICATION_CENTER_FLUSH_MS);
+}
+
+if (hotOnce("narrafork.notificationCenterWs.listenersRegistered")) {
+	eventBus.on(NOTIFICATION_CENTER_CHANGED_WS_TYPE, (event) => {
+		scheduleNotificationCenterBroadcast(event.userId, event.kinds);
+	});
+}
+
 /** Broadcast a message to ALL narrator WS connections (not filtered by subscription). */
 export function broadcastToAll(message: Record<string, unknown>): void {
 	const payload = JSON.stringify(message);
@@ -1493,6 +1562,10 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "git_workspace_subscribe":
+			case "git_workspace_unsubscribe":
+				await handleGitWorkspaceMessage(ws, msg);
+				break;
 			case "pong":
 				// Heartbeat response — lastPongAt already updated above
 				break;

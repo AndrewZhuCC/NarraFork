@@ -18,6 +18,7 @@ import { describe, expect, test } from "bun:test";
 import type { PostgresClient } from "./postgres-client";
 import {
 	AMBIENT_DATABASE_URL_ENV,
+	assertPostgresMigrationHistory,
 	DATABASE_BACKEND_ENV,
 	DATABASE_URL_ENV,
 	DatabaseConfigError,
@@ -29,6 +30,20 @@ import {
 } from "./postgres-runtime";
 
 const PG_URL = "postgres://nf:topsecret@127.0.0.1:5432/narrafork";
+
+test("PostgreSQL refuses a divergent applied migration branch before running SQL", () => {
+	const migrations = [{ hash: "published", folderMillis: 200 }];
+	expect(() => assertPostgresMigrationHistory(undefined, migrations)).not.toThrow();
+	expect(() =>
+		assertPostgresMigrationHistory({ hash: "published", created_at: "200" }, migrations),
+	).not.toThrow();
+	expect(() =>
+		assertPostgresMigrationHistory({ hash: "local-fork", created_at: 100 }, migrations),
+	).toThrow("migration history diverges");
+	expect(() =>
+		assertPostgresMigrationHistory({ hash: "local-fork", created_at: 200 }, migrations),
+	).toThrow("migration history diverges");
+});
 
 function postgresSection(section?: unknown): unknown {
 	return section ?? { backend: "postgres" };

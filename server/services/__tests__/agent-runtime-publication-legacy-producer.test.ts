@@ -49,9 +49,28 @@ db.insert(backgroundTasks)
 		},
 	])
 	.run();
+const oldEntry = {
+	kind: "bg_bash" as const,
+	task: {
+		id: "old-completed",
+		type: "bash" as const,
+		title: "finished",
+		alias: "finished",
+		status: "completed",
+		outputPreview: "old done result",
+	},
+};
 mock.module("../../db", () => ({ db, sqlite }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
-const { runtimePublication: publisher } = await import("../agent-runtime/publication");
+const { runtimePublication: publisher, activateSqliteRuntimePublication } = await import(
+	"../agent-runtime/publication"
+);
+publisher.setLegacyCompletionAdmissionReader((source) =>
+	source.taskId === oldEntry.task.id
+		? { ...source, token: oldEntry, eventKind: "completed" }
+		: undefined,
+);
+activateSqliteRuntimePublication(db);
 publisher.stop();
 tasks.setBroadcastFnForTests(() => {});
 afterAll(async () => {
@@ -88,22 +107,6 @@ test("real pre-upgrade live completion and unknown crash are grandfathered even 
 	expect(unknown?.logicalRunId).toMatch(/^legacy:unknown:/);
 	expect(unknown?.status).toBe("failed");
 	expect(unknown?.output).toContain("outcome unknown");
-	const oldEntry = {
-		kind: "bg_bash" as const,
-		task: {
-			id: "old-completed",
-			type: "bash" as const,
-			title: "finished",
-			alias: "finished",
-			status: "completed",
-			outputPreview: "old done result",
-		},
-	};
-	publisher.setLegacyCompletionAdmissionReader((source) =>
-		source.taskId === oldEntry.task.id
-			? { ...source, token: oldEntry, eventKind: "completed" }
-			: undefined,
-	);
 	expect(publisher.migrateLegacyTaskNotice("parent", oldEntry)).toBe("migrated");
 	expect(publisher.migrateLegacyTaskNotice("parent", oldEntry)).toBe("migrated");
 	publisher.flushRecipient("parent");

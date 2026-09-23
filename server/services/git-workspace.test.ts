@@ -761,8 +761,20 @@ test("sibling-directory observations include other narrators but redact private 
 	for (const suffix of ["modifications?scope=uncommitted", "modifications"]) {
 		const response = await request(suffix);
 		expect(response.status).toBe(200);
-		const body = (await response.json()) as { byFile: { filePath: string }[] };
-		expect(body.byFile.some((entry) => entry.filePath === "packages/b/change.txt")).toBe(true);
+		const body = (await response.json()) as {
+			byFile: {
+				filePath: string;
+				recentEvents: {
+					actor: { kind: string; narratorId: string | null; title: string | null };
+				}[];
+			}[];
+		};
+		const file = body.byFile.find((entry) => entry.filePath === "packages/b/change.txt");
+		expect(file?.recentEvents[0]?.actor).toMatchObject({
+			kind: "narrator_unknown",
+			narratorId: null,
+			title: null,
+		});
 		expect(JSON.stringify(body)).not.toContain("PRIVATE ACTOR TITLE");
 		expect(JSON.stringify(body)).not.toContain("PRIVATE TOOL ID");
 		expect(JSON.stringify(body)).not.toContain(privateActor);

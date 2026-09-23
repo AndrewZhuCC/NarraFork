@@ -17,15 +17,19 @@ describe("validate-local-upgrade", () => {
 	test("validates migration 0013 on an isolated fixture copy", async () => {
 		const root = mkdtempSync(join(tmpdir(), "nf-local-upgrade-validator-"));
 		try {
-			const preMigrations = join(root, "drizzle-pre-0013");
+			const preMigrations = join(root, "drizzle");
 			cpSync(join(ROOT, "drizzle"), preMigrations, { recursive: true });
 			const journalPath = join(preMigrations, "meta/_journal.json");
 			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-			journal.entries = journal.entries.filter(
-				(entry: { tag: string }) => entry.tag !== "0013_omniscient_dormammu",
+			const migrationIndex = journal.entries.findIndex(
+				(entry: { tag: string }) => entry.tag === "0013_omniscient_dormammu",
 			);
+			if (migrationIndex < 0) throw new Error("Missing 0013 migration fixture");
+			const target = journal.entries[migrationIndex] as { tag: string };
+			for (const entry of journal.entries.splice(migrationIndex) as Array<{ tag: string }>) {
+				rmSync(join(preMigrations, `${entry.tag}.sql`));
+			}
 			writeFileSync(journalPath, JSON.stringify(journal));
-			rmSync(join(preMigrations, "0013_omniscient_dormammu.sql"));
 
 			const original = join(root, "backup.db");
 			const db = new Database(original);
@@ -91,6 +95,10 @@ describe("validate-local-upgrade", () => {
 			).toBe(false);
 			db.close();
 
+			journal.entries.push(target);
+			writeFileSync(journalPath, JSON.stringify(journal));
+			cpSync(join(ROOT, "drizzle", `${target.tag}.sql`), join(preMigrations, `${target.tag}.sql`));
+
 			const validation = join(root, "validation.db");
 			cpSync(original, validation);
 			const online = join(root, "online.db");
@@ -104,7 +112,7 @@ describe("validate-local-upgrade", () => {
 					"--database",
 					validation,
 					"--migrations",
-					join(ROOT, "drizzle"),
+					preMigrations,
 					"--online-database",
 					online,
 					"--backup-original",
@@ -150,7 +158,8 @@ describe("validate-local-upgrade", () => {
 				const narrator = validated
 					.query("SELECT next_seq FROM narrators WHERE id = 'narrator-fixture'")
 					.get() as { next_seq: number };
-				expect(narrator.next_seq).toBe(8);
+				// The first persisted ref claim raises this floor; migration preserves it.
+				expect(narrator.next_seq).toBe(0);
 				const recovery = validated
 					.query(
 						"SELECT workspace_lease_id FROM file_change_scope_recoveries WHERE id = 'recovery-fixture'",
@@ -163,6 +172,81 @@ describe("validate-local-upgrade", () => {
 				expect(leases.count).toBe(0);
 			} finally {
 				validated.close();
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 300_000);
+
+	test("validates migration 0014 on an isolated fixture copy", async () => {
+		const root = mkdtempSync(join(tmpdir(), "nf-local-upgrade-0014-"));
+		try {
+			const migrations = join(root, "drizzle");
+			cpSync(join(ROOT, "drizzle"), migrations, { recursive: true });
+			const journalPath = join(migrations, "meta/_journal.json");
+			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+			const target = journal.entries.pop() as { tag: string };
+			expect(target.tag).toBe("0014_blue_tomorrow_man");
+			writeFileSync(journalPath, JSON.stringify(journal));
+			rmSync(join(migrations, `${target.tag}.sql`));
+
+			const original = join(root, "backup.db");
+			const db = new Database(original);
+			db.exec("PRAGMA foreign_keys=ON");
+			applyPendingMigrationsByHash(db, migrations);
+			await applySqliteDataBackfills(db);
+			db.run(
+				"INSERT INTO narrators (id, created_at, updated_at, traits, next_seq) VALUES (?, ?, ?, ?, ?)",
+				["narrator-0014", "2026-09-21T00:00:00Z", "2026-09-21T00:00:00Z", '["standalone"]', 0],
+			);
+			db.run(
+				"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, ?, ?, ?)",
+				["message-0014", "narrator-0014", "user", "[]", "2026-09-21T00:00:00Z"],
+			);
+			db.close();
+
+			journal.entries.push(target);
+			writeFileSync(journalPath, JSON.stringify(journal));
+			cpSync(join(ROOT, "drizzle", `${target.tag}.sql`), join(migrations, `${target.tag}.sql`));
+			const validation = join(root, "validation.db");
+			cpSync(original, validation);
+			const online = join(root, "online.db");
+			writeFileSync(online, "not opened");
+			const originalHash = sha256(original);
+			const child = Bun.spawnSync({
+				cmd: [
+					process.execPath,
+					join(ROOT, "scripts/validate-local-upgrade.ts"),
+					"--database", validation,
+					"--migrations", migrations,
+					"--online-database", online,
+					"--backup-original", original,
+					"--backup-sha256", originalHash,
+					"--source-sha256", "1".repeat(64),
+					"--commit", "a".repeat(40),
+					"--version", "0.7.8",
+				],
+				cwd: ROOT,
+				env: { ...Bun.env, NARRAFORK_HOME: join(root, "home"), NARRAFORK_LOG_LEVEL: "error" },
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 300_000,
+			});
+			expect(child.exitCode, child.stderr.toString()).toBe(0);
+			const report = JSON.parse(child.stdout.toString());
+			expect(report.status).toBe("ok");
+			expect(report.targetMigrations).toEqual([
+				{ tag: target.tag, hash: sha256(join(ROOT, "drizzle", `${target.tag}.sql`)) },
+			]);
+			expect(sha256(original)).toBe(originalHash);
+			const upgraded = new Database(validation, { readonly: true });
+			try {
+				expect(upgraded.query("SELECT id FROM narrator_messages").all()).toContainEqual({ id: "message-0014" });
+				for (const table of ["notifications", "user_usage_totals", "workspace_execution_owners"]) {
+					expect(upgraded.query("SELECT 1 FROM sqlite_master WHERE name=?").get(table)).not.toBeNull();
+				}
+			} finally {
+				upgraded.close();
 			}
 		} finally {
 			rmSync(root, { recursive: true, force: true });

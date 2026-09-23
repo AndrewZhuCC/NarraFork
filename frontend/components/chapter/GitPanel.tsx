@@ -14,10 +14,16 @@ import { IconArrowLeft, IconRefresh } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { type GitTarget, invalidateWorkspaceQueries, useGitWorkspace } from "../../hooks/useGit";
+import {
+	type GitTarget,
+	invalidateWorkspaceQueries,
+	useGitWorkspace,
+	useGitWorkspaceSubscription,
+} from "../../hooks/useGit";
 import { gitTargetKey } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 import { GitChangesTab } from "./GitChangesTab";
+import { GitCommitGraph } from "./GitCommitGraph";
 import { GitCommitsTab } from "./GitCommitsTab";
 import { GitStashTab } from "./GitStashTab";
 
@@ -141,6 +147,7 @@ function GitPanelContent({
 	const { t } = useTranslation("git");
 	const qc = useQueryClient();
 	const [view, setView] = useState<GitPanelView>("changes");
+	useGitWorkspaceSubscription(target);
 
 	const refresh = () => {
 		if (onRefresh) onRefresh();
@@ -157,7 +164,10 @@ function GitPanelContent({
 				</Alert>
 			)}
 			{view === "changes" ? (
-				<GitChangesTab target={target} onRefresh={refresh} onOpenSecondaryView={setView} />
+				<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+					<GitChangesTab target={target} onRefresh={refresh} onOpenSecondaryView={setView} />
+					<GitCommitGraph target={target} />
+				</Box>
 			) : (
 				<Stack gap={0} style={{ flex: 1, minHeight: 0 }}>
 					<Group

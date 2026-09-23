@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import { DEFAULT_CONTEXT_THRESHOLDS_DRAFT } from "../components/narrator/context-management/types";
 import en from "../locales/en/settings.json";
 import zh from "../locales/zh-CN/settings.json";
 
@@ -79,18 +80,42 @@ describe("compaction-only context settings", () => {
 			new URL("../components/narrator/NarratorPanel.tsx", import.meta.url),
 			"utf8",
 		);
+		const draftTypes = readFileSync(
+			new URL("../components/narrator/context-management/types.ts", import.meta.url),
+			"utf8",
+		);
+		const modal = readFileSync(
+			new URL(
+				"../components/narrator/context-management/ContextThresholdSettingsModal.tsx",
+				import.meta.url,
+			),
+			"utf8",
+		);
 		expect(DEFAULT_CONTEXT_THRESHOLDS).toEqual({
 			standard: { compactStart: 95 },
 			large: { compactStart: 75 },
 		});
+		expect(DEFAULT_CONTEXT_THRESHOLDS_DRAFT).toBe(DEFAULT_CONTEXT_THRESHOLDS);
+		expect(draftTypes).toContain(
+			"export const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = DEFAULT_CONTEXT_THRESHOLDS",
+		);
 		expect(hook).toContain("cloneDefaultContextThresholds()");
-		for (const size of ["standard", "large"]) {
+		expect(panel).toContain(
+			"settingsData?.agent?.contextThresholds ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT",
+		);
+		expect(panel).toContain("current={contextThresholdSettings}");
+		for (const size of ["standard", "large"] as const) {
 			expect(section).toContain(`DEFAULT_CONTEXT_THRESHOLDS.${size}.compactStart`);
-			expect(panel).toContain(`DEFAULT_CONTEXT_THRESHOLDS.${size}.compactStart`);
+			expect(
+				panel.includes(`DEFAULT_CONTEXT_THRESHOLDS_DRAFT.${size}.compactStart`),
+				`panel ${size} fallback must use the shared draft default`,
+			).toBe(true);
+			expect(modal).toContain(`value={draft.contextThresholds.${size}.compactStart}`);
+			expect(modal).toContain(`DEFAULT_CONTEXT_THRESHOLDS_DRAFT.${size}.compactStart`);
 		}
 		expect(panel).toContain("api.triggerCompact(narratorId)");
-		expect(panel).toContain('t("contextThresholdSettingsTitle")');
-		for (const source of [hook, page, section, panel]) {
+		expect(modal).toContain('t("contextThresholdSettingsTitle")');
+		for (const source of [hook, page, section, panel, modal]) {
 			expect(source).not.toMatch(/prun/i);
 		}
 	});

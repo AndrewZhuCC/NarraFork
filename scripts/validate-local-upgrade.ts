@@ -10,8 +10,9 @@ import { runMigrations } from "../server/db/run-migrations";
 const ALLOWED_TARGET_TAGS = new Set([
 	"0012_curved_bloodstorm",
 	"0013_omniscient_dormammu",
+	"0014_blue_tomorrow_man",
 ]);
-const JOURNAL_TAIL_TAG = "0013_omniscient_dormammu";
+const JOURNAL_TAIL_TAGS = new Set(["0013_omniscient_dormammu", "0014_blue_tomorrow_man"]);
 const MAX_REPORT_BYTES = 64 * 1024;
 
 type Args = {
@@ -96,12 +97,13 @@ function tableDigest(
 	db: Database,
 	table: string,
 	excluded: ReadonlySet<string> = new Set(),
+	key = "id",
 ): Record<string, unknown> {
 	if (!tableExists(db, table)) throw new Error(`Missing required table: ${table}`);
 	const selected = columns(db, table).filter((column) => !excluded.has(column));
-	if (!selected.includes("id")) throw new Error(`Missing stable row key: ${table}.id`);
+	if (!selected.includes(key)) throw new Error(`Missing stable row key: ${table}.${key}`);
 	const statement = db.prepare(
-		`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)} ORDER BY id`,
+		`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)} ORDER BY ${quoteIdentifier(key)}`,
 	);
 	const hash = createHash("sha256");
 	hash.update(`${JSON.stringify(selected)}\n`);
@@ -122,20 +124,43 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	const is0014 = targetTag === "0014_blue_tomorrow_man";
 	const summary: Record<string, unknown> = {
 		narrators: tableDigest(db, "narrators", excludeNew ? new Set(["next_seq"]) : new Set()),
 		narrator_tool_calls: tableDigest(
 			db,
 			"narrator_tool_calls",
-			excludeNew ? new Set(["stream_completed_at"]) : new Set(),
+			excludeNew
+				? new Set(
+						is0014
+							? ["cost_status", "cost_missing_fields"]
+							: ["stream_completed_at", "cost_status", "cost_missing_fields"],
+						)
+				: new Set(),
 		),
 	};
-	if (targetTag === "0013_omniscient_dormammu") {
+	if (targetTag === "0013_omniscient_dormammu" || is0014) {
 		summary.file_change_scope_recoveries = tableDigest(
 			db,
 			"file_change_scope_recoveries",
-			excludeNew ? new Set(["workspace_lease_id"]) : new Set(),
+			excludeNew
+				? new Set(
+						is0014
+							? ["resolution_authority", "maintenance_evidence_json"]
+							: ["workspace_lease_id", "resolution_authority", "maintenance_evidence_json"],
+						)
+				: new Set(),
 		);
+	}
+	if (is0014) {
+		for (const [table, added, key] of [
+			["api_requests", ["user_id", "cost_status", "cost_missing_fields"], "id"],
+			["credential_usage_totals", ["partial_request_count"], "id"],
+			["narrator_messages", ["cost_status", "cost_missing_fields"], "id"],
+			["workspace_write_leases", ["execution_class", "termination_evidence_json"], "lease_id"],
+		] as const) {
+			summary[table] = tableDigest(db, table, excludeNew ? new Set<string>(added) : new Set(), key);
+		}
 	}
 	return summary;
 }
@@ -166,13 +191,25 @@ function tableSchemaShape(db: Database, table: string): Record<string, unknown> 
 	};
 }
 
-function schemaShape(db: Database): Record<string, unknown> {
-	return {
+function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
+	const shape: Record<string, unknown> = {
 		fileChangeScopeRecoveries: tableSchemaShape(db, "file_change_scope_recoveries"),
 		workspaceWriteLeases: tableSchemaShape(db, "workspace_write_leases"),
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0014_blue_tomorrow_man") {
+		for (const table of [
+			"notifications",
+			"user_usage_totals",
+			"workspace_execution_owners",
+			"api_requests",
+			"credential_usage_totals",
+			"narrator_messages",
+			"narrator_tool_calls",
+		]) shape[table] = tableSchemaShape(db, table);
+	}
+	return shape;
 }
 
 function ledger(db: Database): string[] {
@@ -236,8 +273,8 @@ async function main() {
 		entries?: Array<{ tag?: string }>;
 	};
 	const tags = journal.entries?.map((entry) => entry.tag) ?? [];
-	if (tags.length !== migrationFiles.length || tags.at(-1) !== JOURNAL_TAIL_TAG) {
-		throw new Error(`${JOURNAL_TAIL_TAG} is not the journal tail`);
+	if (tags.length !== migrationFiles.length || !JOURNAL_TAIL_TAGS.has(tags.at(-1) ?? "")) {
+		throw new Error("Unexpected migration journal tail");
 	}
 	const migrationsWithTags = migrationFiles.map((migration, index) => ({
 		...migration,
@@ -267,20 +304,29 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		const newTable =
+		const newTables =
 			target.tag === "0012_curved_bloodstorm"
-				? "file_change_scope_recoveries"
-				: "workspace_write_leases";
-		if (!(newTable in expectedCounts)) expectedCounts[newTable] = 0;
+				? ["file_change_scope_recoveries"]
+				: target.tag === "0013_omniscient_dormammu"
+					? ["workspace_write_leases"]
+					: ["notifications", "user_usage_totals", "workspace_execution_owners"];
+		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");
 		}
-		if (canonical(affectedSummary(db, target.tag, true)) !== canonical(beforeAffected)) {
-			throw new Error("Existing affected-table fields changed");
+		const afterAffected = affectedSummary(db, target.tag, true);
+		if (canonical(afterAffected) !== canonical(beforeAffected)) {
+			const changed = Object.keys(beforeAffected).filter(
+				(table) => canonical(beforeAffected[table]) !== canonical(afterAffected[table]),
+			);
+			throw new Error(`Existing affected-table fields changed: ${changed.join(", ")}`);
 		}
 		if (target.tag === "0013_omniscient_dormammu") {
-			if (columns(db, "workspace_write_leases").length !== 15) {
-				throw new Error("workspace_write_leases does not have 15 columns");
+			const originalLeaseColumns = columns(db, "workspace_write_leases").filter(
+				(column) => column !== "execution_class" && column !== "termination_evidence_json",
+			);
+			if (originalLeaseColumns.length !== 15) {
+				throw new Error("workspace_write_leases does not have 15 original columns");
 			}
 			const populatedLeaseIds = db
 				.query(
@@ -291,14 +337,11 @@ async function main() {
 				throw new Error("Existing recovery rows gained workspace_lease_id values");
 			}
 		}
-		const badNextSeq = db
-			.query(
-				`SELECT count(*) AS count FROM narrators n WHERE n.next_seq < COALESCE((` +
-					`SELECT r.seq + 1 FROM narrator_message_refs r WHERE r.narrator_id=n.id ` +
-					`ORDER BY r.seq DESC LIMIT 1), 0)`,
-			)
-			.get() as { count: number };
-		if (Number(badNextSeq.count) !== 0) throw new Error("next_seq backfill invariant failed");
+		// Historical gaps are repaired on the first claim, not during startup migration.
+		const badNextSeq = db.query("SELECT count(*) AS count FROM narrators WHERE next_seq < 0").get() as {
+			count: number;
+		};
+		if (Number(badNextSeq.count) !== 0) throw new Error("next_seq cannot be negative");
 		if (hadNextSeq) {
 			const lowered = db
 				.query(
@@ -312,7 +355,7 @@ async function main() {
 		fresh.exec("PRAGMA foreign_keys=ON");
 		try {
 			await runUpgrade(fresh);
-			if (canonical(schemaShape(db)) !== canonical(schemaShape(fresh))) {
+			if (canonical(schemaShape(db, target.tag)) !== canonical(schemaShape(fresh, target.tag))) {
 				throw new Error(`${target.tag} schema does not match a fresh migration schema`);
 			}
 		} finally {
@@ -323,7 +366,7 @@ async function main() {
 			ledger: ledger(db),
 			counts: rowCounts(db),
 			affected: affectedSummary(db, target.tag, false),
-			schema: schemaShape(db),
+			schema: schemaShape(db, target.tag),
 		});
 		await runUpgrade(db);
 		assertIntegrity(db);
@@ -331,7 +374,7 @@ async function main() {
 			ledger: ledger(db),
 			counts: rowCounts(db),
 			affected: affectedSummary(db, target.tag, false),
-			schema: schemaShape(db),
+			schema: schemaShape(db, target.tag),
 		});
 		if (firstState !== secondState) throw new Error("Upgrade is not idempotent");
 

@@ -5,6 +5,7 @@ import {
 	summarizeCodexRemoteItems,
 	truncateCompactError,
 } from "@shared/compact-message";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -366,6 +367,7 @@ export function createCompactProgressReporter(options: {
 }
 
 export interface CustomCompactOptions {
+	userId?: string | null;
 	mode?: CompactMode;
 	appendHint?: string;
 	signal?: AbortSignal;
@@ -648,6 +650,7 @@ export function triggerMidTurnCompact(
 	onCompactDone?: () => void,
 	mode: CompactMode = "background",
 	contextPercentBefore?: number,
+	userId?: string | null,
 ): void {
 	if (compactLocks.has(narratorId)) {
 		logger.debug("Compact already in progress, skipping mid-turn trigger", { narratorId });
@@ -681,6 +684,7 @@ export function triggerMidTurnCompact(
 		});
 		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
 			mode: effectiveMode,
+			userId,
 			trigger: "background",
 			...(contextPercentBefore != null ? { contextPercentBefore } : {}),
 		});
@@ -868,6 +872,7 @@ async function retryFailedCompactUnlocked(
 	locale: Locale,
 	messageId: string,
 	model?: string,
+	userId?: string | null,
 ) {
 	if (compactLocks.has(narratorId)) {
 		throw new AppError("Compact already in progress", 409, "COMPACT_IN_PROGRESS");
@@ -910,6 +915,7 @@ async function retryFailedCompactUnlocked(
 		const promise = runCustomCompact(narratorId, locale, prepared.id, {
 			mode: "blocking",
 			trigger: "retry",
+			userId,
 			model: prepared.model,
 			reuseFailedMessageId: prepared.id,
 			preparedRetryMessage: prepared,
@@ -966,21 +972,40 @@ async function doRunCustomCompact({
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { variant: true, model: true, reasoningEffort: true },
+		columns: {
+			variant: true,
+			model: true,
+			parentNarratorId: true,
+			subagentType: true,
+			reasoningEffort: true,
+		},
 	});
 	const active = activeNarrators.get(narratorId);
+	const summaryUserId = options?.userId === undefined ? active?._currentUserId : options.userId;
+	// Compaction is also a provider boundary. Resolve inherited pool policy for the
+	// actual compact user rather than reusing an earlier turn's cached active model.
+	const inheritedModel =
+		narrator?.model === FOLLOW_PARENT_MODEL
+			? await (await import("./subagent-model")).resolveSubagentModelForRun(
+					narrator,
+					summaryUserId ?? null,
+					active?.alive ? active.provider : undefined,
+				)
+			: null;
 	const runtime = active?.alive ? active : activeSubagentSettings.get(narratorId);
 	// Match the next normal request: use live settings, but re-resolve a primary's
 	// raw references when its cached settings revision has fallen behind.
 	const staleRuntime = active?.alive && active._settingsRevision !== getSettingsRevision();
-	const remoteModel = staleRuntime
-		? (active._modelRef ?? narrator?.model)
-		: runtime?.model || narrator?.model;
-	const remoteEffort = staleRuntime
-		? active._reasoningEffortRef
-		: runtime
-			? runtime.reasoningEffort
-			: narrator?.reasoningEffort;
+	const remoteModel =
+		inheritedModel?.model ??
+		(staleRuntime ? (active._modelRef ?? narrator?.model) : runtime?.model || narrator?.model);
+	const remoteEffort =
+		inheritedModel?.reasoningEffort ??
+		(staleRuntime
+			? active._reasoningEffortRef
+			: runtime
+				? runtime.reasoningEffort
+				: narrator?.reasoningEffort);
 	let resolvedCompact: ReturnType<typeof resolveProviderAndModel> | null = null;
 	let resolutionError: unknown;
 	try {
@@ -1219,6 +1244,7 @@ async function doRunCustomCompact({
 						retryCount += 1;
 						compactProgress.reportRetry(retryCount, info.error);
 					},
+					summaryUserId,
 				);
 			}
 		}
@@ -1236,6 +1262,7 @@ async function doRunCustomCompact({
 					retryCount += 1;
 					compactProgress.reportRetry(retryCount, info.error);
 				},
+				summaryUserId,
 			);
 		}
 		const { summary, contextPercent } = compactResult;
@@ -1523,6 +1550,7 @@ async function runSegmentCompactUnlocked(
 	narratorId: string,
 	locale: Locale,
 	messageIds: string[],
+	userId?: string | null,
 ): Promise<void> {
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
@@ -1547,6 +1575,7 @@ async function runSegmentCompactUnlocked(
 		narratorId,
 		locale,
 		messageIds,
+		userId,
 		signal: abortController.signal,
 		hooks: { beat: watchdog.beat, timeoutReason: watchdog.firedReason },
 	}).then(
@@ -1586,12 +1615,14 @@ async function doRunSegmentCompact({
 	narratorId,
 	locale,
 	messageIds,
+	userId,
 	signal,
 	hooks,
 }: {
 	narratorId: string;
 	locale: Locale;
 	messageIds: string[];
+	userId?: string | null;
 	signal?: AbortSignal;
 	hooks?: CompactRunHooks;
 }): Promise<boolean> {
@@ -1650,6 +1681,7 @@ async function doRunSegmentCompact({
 				segmentRetryCount += 1;
 				compactProgress.reportRetry(segmentRetryCount, info.error);
 			},
+			userId,
 		);
 		compactProgress.finish();
 		// Enforce cancellation at the persistence boundary too, so a summary that

@@ -1,5 +1,5 @@
 import { db } from "@server/db";
-import { apiRequests, chapters, narrators } from "@server/db/schema";
+import { chapters, narrators } from "@server/db/schema";
 import {
 	RAW_DUMP_INLINE_MAX_BYTES,
 	type RawDumpSpillMeta,
@@ -9,10 +9,14 @@ import {
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { getEffectiveModelMetadata, withModelMetadataSnapshot } from "@server/lib/model-catalog";
 import { settings } from "@server/lib/settings";
-import { calculateCost, type UsageData } from "@server/lib/usage-tracking";
+import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
+import { captureReferencePricingSnapshot, cloneReferencePricingSnapshot } from "./model-pricing";
+import { calculateCostDetailed, type UsageData } from "@server/lib/usage-tracking";
 import { sliceToUtf8Budget, utf8Bytes, withinUtf8Budget } from "@server/lib/utf8-budget";
 import { recordCredentialUsage } from "@server/services/credential-usage-totals";
+import { insertApiRequestWithUserUsage } from "@server/services/user-usage-totals";
 import { eq } from "drizzle-orm";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
 import type { ApiRequestDiagnostics } from "./agent/types";
@@ -36,14 +40,20 @@ export type ApiRequestKind =
 	| "internal";
 
 export interface ApiRequestStartOptions {
+	/** Actual initiating user; unknown/system requests remain unattributed. */
+	userId?: string | null;
 	narratorId?: string | null;
 	provider: string;
 	model: string;
 	credentialId?: string | null;
 	kind?: ApiRequestKind;
+	/** Captured by the stream producer; absence means capture at this API boundary. */
+	referencePricingSnapshot?: ReferencePricingSnapshot;
 }
 
 export interface ApiRequestHandle extends ApiRequestStartOptions {
+	readonly userId: string | null;
+	readonly referencePricingSnapshot: ReferencePricingSnapshot;
 	id: string;
 	startTime: number;
 	kind: ApiRequestKind;
@@ -84,6 +94,10 @@ export interface ApiRequestFinishOptions {
 export function startApiRequest(options: ApiRequestStartOptions): ApiRequestHandle {
 	return {
 		...options,
+		referencePricingSnapshot: options.referencePricingSnapshot === undefined
+			? captureReferencePricingSnapshot(options.model)
+			: cloneReferencePricingSnapshot(options.referencePricingSnapshot),
+		userId: options.userId ?? null,
 		id: generateId(),
 		kind: options.kind ?? "internal",
 		startTime: Date.now(),
@@ -460,7 +474,7 @@ export async function finishApiRequest(
 	options: ApiRequestFinishOptions = {},
 ): Promise<string> {
 	const usage = options.usage ?? null;
-	const cost = usage ? calculateCost(usage, handle.provider, handle.model) : null;
+	const cost = usage ? calculateCostDetailed(usage, handle.provider, handle.model, handle.referencePricingSnapshot) : null;
 	const persistenceOptions =
 		normalizedDiagnostics(options) && !allowsFullRawDump(options)
 			? { ...options, rawDump: undefined }
@@ -480,8 +494,9 @@ export async function finishApiRequest(
 			})
 		: null;
 
-	await db.insert(apiRequests).values({
+	const inserted = insertApiRequestWithUserUsage({
 		id: handle.id,
+		userId: handle.userId,
 		narratorId: handle.narratorId ?? null,
 		messageId: options.messageId ?? null,
 		kind: handle.kind,
@@ -497,7 +512,9 @@ export async function finishApiRequest(
 		reasoningTokens: usage?.reasoningTokens ?? 0,
 		ttftMs: options.ttftMs ?? null,
 		durationMs: options.durationMs ?? Date.now() - handle.startTime,
-		costUsd: cost?.totalCost ?? null,
+		costUsd: cost && cost.status !== "unknown" ? cost.knownCost : null,
+		costStatus: cost?.status ?? "unknown",
+		costMissingFields: cost?.missingFields ?? [],
 		contextPercent: options.contextPercent ?? null,
 		meterUsage: options.meterUsage ?? null,
 		meterUnit: options.meterUnit ?? null,
@@ -505,6 +522,9 @@ export async function finishApiRequest(
 		rawDumpJson: rawDump,
 		createdAt,
 	});
+
+	// Duplicate completion must not charge either rollup again.
+	if (!inserted) return handle.id;
 
 	// Roll the same numbers into the durable per-credential totals. This must
 	// happen on the same path as the detail insert so the two cannot drift; the
@@ -531,7 +551,8 @@ export async function finishApiRequest(
 			cachedInputTokens: usage.cachedInputTokens,
 			cacheCreationTokens: usage.cacheCreationInputTokens,
 			reasoningTokens: usage.reasoningTokens,
-			costUsd: cost?.totalCost ?? null,
+			costUsd: cost && cost.status !== "unknown" ? cost.knownCost : null,
+			costStatus: cost?.status ?? "unknown",
 			at: createdAt,
 		});
 	}
@@ -542,6 +563,18 @@ export async function finishApiRequest(
 export interface TrackApiRequestOptions extends ApiRequestStartOptions {}
 
 export async function trackApiRequest<T>(
+	options: TrackApiRequestOptions,
+	fn: () => Promise<T>,
+): Promise<T> {
+	return withModelMetadataSnapshot(() => {
+		// Capture discovered metadata as well as catalog/local revisions before any
+		// adapter work. The same ALS scope survives fn's awaits through cost recording.
+		getEffectiveModelMetadata(options.model);
+		return trackApiRequestInSnapshot(options, fn);
+	});
+}
+
+async function trackApiRequestInSnapshot<T>(
 	options: TrackApiRequestOptions,
 	fn: () => Promise<T>,
 ): Promise<T> {

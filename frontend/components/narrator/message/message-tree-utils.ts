@@ -12,6 +12,7 @@ import type {
 	ToolCallRecord,
 	TreeMessage,
 } from "@frontend/lib/api";
+import { mergeToolLifecycleRecord, type ToolLifecycleRecord } from "@shared/tool-row-status";
 
 interface ToolCall {
 	toolUseId: string;
@@ -104,8 +105,28 @@ export function upsertSubagentToolCallHeader(
 		// flag on every such event would make the badge flicker off the moment the
 		// taken-over child ran anything.
 		...(activity?.takenOver ? { takenOver: true } : {}),
+		// Tool headers carry no file evidence; keep the last aggregate until a
+		// snapshot actually supplies a replacement (including an explicit empty one).
+		...(activity && Object.hasOwn(activity, "fileChanges")
+			? { fileChanges: activity.fileChanges }
+			: {}),
 		latestToolCalls: latest.slice(-3),
 	};
+}
+
+/** A newly assigned child must never inherit the previous child's file evidence. */
+export function activityForSubagent(
+	activity: SubagentActivitySummary | null | undefined,
+	subagentNarratorId: string | null | undefined,
+): SubagentActivitySummary | undefined {
+	if (
+		activity?.subagentNarratorId &&
+		subagentNarratorId &&
+		activity.subagentNarratorId !== subagentNarratorId
+	) {
+		return undefined;
+	}
+	return activity ?? undefined;
 }
 
 /** Replace authoritative activity details without letting an empty model erase a known value. */
@@ -113,20 +134,21 @@ export function replaceSubagentActivitySnapshot(
 	activity: SubagentActivitySummary,
 	previous?: SubagentActivitySummary,
 ): SubagentActivitySummary {
+	const sameChild = activityForSubagent(previous, activity.subagentNarratorId);
 	const reasoningEffort =
 		normalizeSubagentReasoningEffort(activity.reasoningEffort) ??
-		normalizeSubagentReasoningEffort(previous?.reasoningEffort);
+		normalizeSubagentReasoningEffort(sameChild?.reasoningEffort);
 	const hasFileChanges = Object.hasOwn(activity, "fileChanges");
 	let normalized: SubagentActivitySummary = {
-		subagentNarratorId: activity.subagentNarratorId ?? null,
-		model: normalizeSubagentModel(activity.model) ?? normalizeSubagentModel(previous?.model),
+		subagentNarratorId: activity.subagentNarratorId ?? sameChild?.subagentNarratorId ?? null,
+		model: normalizeSubagentModel(activity.model) ?? normalizeSubagentModel(sameChild?.model),
 		// Incremental activity snapshots may omit fileChanges while the child is
 		// still running. Preserve the last known list in that case; an explicit
 		// empty array remains authoritative and clears it.
 		...(hasFileChanges
 			? { fileChanges: activity.fileChanges }
-			: previous?.fileChanges
-				? { fileChanges: previous.fileChanges }
+			: sameChild?.fileChanges
+				? { fileChanges: sameChild.fileChanges }
 				: {}),
 		...(reasoningEffort ? { reasoningEffort } : {}),
 		// The snapshot is AUTHORITATIVE for takeover (the server reads the live
@@ -140,6 +162,45 @@ export function replaceSubagentActivitySnapshot(
 		normalized = upsertSubagentToolCallHeader(normalized, header);
 	}
 	return normalized;
+}
+
+/** Merge sparse projections without losing a same-attempt child activity aggregate. */
+export function mergeToolRecordWithSubagentActivity<
+	P extends ToolLifecycleRecord,
+	I extends ToolLifecycleRecord,
+>(previous: P | undefined, incoming: I | undefined): P & I {
+	const merged = mergeToolLifecycleRecord(previous, incoming);
+	if (!previous || !incoming) return merged;
+	const result: ToolLifecycleRecord = { ...merged };
+	// Keep the owner of retained activity evidence across sparse projections too.
+	// Otherwise attempt 1 → unknown → attempt 2 loses the boundary and leaks files.
+	if (incoming.executionAttempt == null && Number.isSafeInteger(previous.executionAttempt)) {
+		result.executionAttempt = previous.executionAttempt;
+	}
+	const differentAttempt =
+		Number.isSafeInteger(previous.executionAttempt) &&
+		Number.isSafeInteger(incoming.executionAttempt) &&
+		previous.executionAttempt !== incoming.executionAttempt;
+	if (differentAttempt) {
+		// The lifecycle merger inherits descriptive fields on retry. Activity is
+		// execution evidence, not description, and must not survive that inheritance.
+		if (!Object.hasOwn(incoming, "_subagentActivity")) delete result._subagentActivity;
+		return result as P & I;
+	}
+	if (!Object.hasOwn(incoming, "_subagentActivity")) {
+		if (Object.hasOwn(previous, "_subagentActivity")) {
+			result._subagentActivity = previous._subagentActivity;
+		}
+	} else if (isRecord(incoming._subagentActivity)) {
+		result._subagentActivity = replaceSubagentActivitySnapshot(
+			incoming._subagentActivity as unknown as SubagentActivitySummary,
+			isRecord(previous._subagentActivity)
+				? (previous._subagentActivity as unknown as SubagentActivitySummary)
+				: undefined,
+		);
+	}
+	// Explicit null/undefined activities and missing tool blocks remain authoritative.
+	return result as P & I;
 }
 
 /** Update the Agent/Task/Send tool block identified by parentToolUseId in a message tree. */
@@ -220,12 +281,17 @@ function hasToolUseInMessage(msg: TreeMessage, toolUseId: string | null | undefi
  * Merge fields while preserving a persisted tool input when the incoming input
  * only contains streaming progress markers. Started/permission updates still
  * replace the full input object as before.
+ *
+ * Status is phase-ranked: a late snapshot must not move a tool BACKWARDS
+ * (`running` over a live-patched `success`). That regression is exactly how a
+ * finished call keeps its spinner until the next structural reload.
  */
-function mergeToolFields<T extends { inputJson?: unknown; outputJson?: unknown }>(
+function mergeToolFields<T extends { inputJson?: unknown; outputJson?: unknown; status?: unknown }>(
 	existing: T,
 	fields: Record<string, unknown>,
 ): T & Record<string, unknown> {
-	const merged = { ...existing, ...fields } as T & Record<string, unknown>;
+	const lifecycle = mergeToolLifecycleRecord(existing, fields);
+	const merged = { ...existing, ...fields, ...lifecycle } as T & Record<string, unknown>;
 	const incomingInput = fields.inputJson;
 	if (
 		isRecord(incomingInput) &&

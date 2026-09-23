@@ -53,6 +53,7 @@ import {
 	useClearSubagentModelRestriction,
 	useCmdBlacklist,
 	useCmdWhitelist,
+	useExtractSubagentToPrimary,
 	useNarrator,
 	useNarratorCustomTraits,
 	useNarratorSkills,
@@ -81,7 +82,11 @@ import type {
 	WhitelistDir,
 } from "../../../lib/api";
 import { api } from "../../../lib/api";
-import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../../lib/constants";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_PARENT_MODEL,
+	NARRATOR_STATUS_COLORS,
+} from "../../../lib/constants";
 import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -393,6 +398,10 @@ function NarratorDetailsContent({
 
 	const chapterId = narrator?.chapterId ? String(narrator.chapterId) : "";
 	const parentNarratorId = narrator?.parentNarratorId ? String(narrator.parentNarratorId) : "";
+	// Same identity rule as NarratorPanel / server `isSubagentVariant`.
+	const isSubagent = !!(narrator as { variant?: string } | undefined)?.variant?.startsWith(
+		"subagent:",
+	);
 
 	const { data: chapter } = useChapter(opened ? chapterId : "");
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
@@ -424,9 +433,11 @@ function NarratorDetailsContent({
 	const refreshNarratorSkillsMutation = useRefreshNarratorSkills();
 
 	const resolvedModel =
-		narrator?.model && narrator.model !== FOLLOW_DEFAULT_MODEL
-			? narrator.model
-			: defaultModelValue || narrator?.model || t("details.notAvailable");
+		narrator?.model === FOLLOW_PARENT_MODEL
+			? t("followParent")
+			: narrator?.model && narrator.model !== FOLLOW_DEFAULT_MODEL
+				? narrator.model
+				: defaultModelValue || narrator?.model || t("details.notAvailable");
 
 	const activeTerminalCount = useMemo(
 		() => (terminals ?? []).filter((terminal) => terminal.status === "running").length,
@@ -498,6 +509,7 @@ function NarratorDetailsContent({
 		},
 	});
 	const updateCwdMutation = useUpdateCwd();
+	const extractPrimaryMutation = useExtractSubagentToPrimary();
 	const disabledToolsDraft = useDetailsDraft(customTraits?.disabledTools?.tools ?? EMPTY_SELECTION);
 	const { value: disabledToolSelection, setValue: setDisabledToolSelection } = disabledToolsDraft;
 	const blockAllDraft = useDetailsDraft(customTraits?.blockedSkills?.all ?? false);
@@ -732,6 +744,34 @@ function NarratorDetailsContent({
 		});
 	};
 
+	const handleExtractToPrimary = () => {
+		extractPrimaryMutation.mutate(
+			{
+				narratorId,
+				locale: i18n.language === "zh-CN" ? "zh-CN" : "en",
+			},
+			{
+				onSuccess: (data) => {
+					const newId = (data as { narrator?: { id?: string } })?.narrator?.id;
+					notifications.show({
+						message: t("extractToPrimarySuccess"),
+						color: "teal",
+					});
+					if (newId) {
+						navigate({ to: "/narrators/$narratorId", params: { narratorId: newId } });
+					}
+				},
+				onError: (error: Error) => {
+					notifications.show({
+						message: error.message || t("extractToPrimaryFailed"),
+						color: "red",
+						autoClose: 5000,
+					});
+				},
+			},
+		);
+	};
+
 	const handleSaveDisabledTools = async () => {
 		await updateDisabledToolsMutation.mutateAsync({ id: narratorId, tools: disabledToolSelection });
 		disabledToolsDraft.reset(disabledToolSelection);
@@ -820,6 +860,7 @@ function NarratorDetailsContent({
 		t("details.backgroundStatus"),
 		t("details.pendingModelRestore"),
 		t("details.enabledTools"),
+		...(isSubagent ? [t("extractToPrimary"), t("extractToPrimaryHint")] : []),
 		resolvedModel,
 	];
 	const sessionMatchedFilter = sectionMatches(
@@ -1422,6 +1463,28 @@ function NarratorDetailsContent({
 								<Text size="sm" ta="left" style={{ whiteSpace: "pre-wrap" }}>
 									{String(narrator.backgroundResult)}
 								</Text>
+							}
+						/>
+					) : null}
+					{/* Subagent-only session action. Lives here rather than the status bar
+					    so the composer row stays free of a rare, irreversible-looking CTA. */}
+					{isSubagent ? (
+						<DetailRow
+							label={t("extractToPrimary")}
+							value={
+								<Group justify="flex-end" gap="xs">
+									<Tooltip label={t("extractToPrimaryHint")} multiline maw={320}>
+										<Button
+											size="xs"
+											variant="light"
+											color="indigo"
+											loading={extractPrimaryMutation.isPending}
+											onClick={handleExtractToPrimary}
+										>
+											{t("extractToPrimary")}
+										</Button>
+									</Tooltip>
+								</Group>
 							}
 						/>
 					) : null}

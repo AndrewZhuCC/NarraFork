@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { hotSafe } from "../lib/hot-safe";
@@ -19,6 +19,7 @@ import {
 import type { LegacyCompletionAdmission } from "./agent-runtime/publication-outbox";
 import type { CompletedNotification } from "./background-task-service";
 import type { CompletedBgSubagentNotification } from "./bg-completion-queue";
+import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "./narrator-refs/seq-store";
 import type { ParentInboundMessage } from "./parent-inbound-queue";
 
@@ -90,7 +91,7 @@ function persistUnboundLegacyAgentMessage(
 	narratorId: string,
 	entry: Extract<PendingInjection, { kind: "subagent_message" }>,
 ): void {
-	db.transaction((tx) => {
+	dbTransactionWithSeqFloor(narratorId, (tx) => {
 		const messageId = generateId();
 		const text = `旧代理消息无法绑定工具执行 / Legacy agent message has no exact execution receipt. It was not resent.\nSender: ${entry.message.fromId}\n${entry.message.text.slice(0, 8000)}`;
 		tx.insert(narratorMessages)
@@ -144,6 +145,8 @@ export async function pushPendingInjection(narratorId: string, entry: PendingInj
 	await enqueueInboxAgent(entry.message.delivery, entry.message.text, {
 		channel: "parent",
 		fromMessageId: entry.message.fromMessageId,
+		userId: entry.message.userId ?? null,
+		createdBy: entry.message.userId ?? null,
 	});
 }
 
@@ -164,6 +167,7 @@ export function projectPendingInjection(
 			logicalRunId: string;
 			eventKind: string;
 			resultRef?: string;
+			userId?: string | null;
 		}>(row);
 		if (!metadata.taskId || !metadata.eventKind) throw new Error("Invalid task notice metadata");
 		const task = db
@@ -172,7 +176,36 @@ export function projectPendingInjection(
 			.where(eq(backgroundTasks.id, metadata.taskId))
 			.get();
 		const status = metadata.eventKind === "timed_out" ? "timeout" : metadata.eventKind;
-		if (metadata.producerKind === "bash")
+		if (metadata.producerKind === "bash") {
+			// Read only the bounded terminal presentation for this exact attempt.
+			// Legacy rows can still contain 512KiB; never load them in full here.
+			const result =
+				metadata.resultRef === `background_task:${metadata.taskId}:${metadata.logicalRunId}`
+					? db
+							.select({
+								output: sql<string | null>`substr(${backgroundTasks.output}, 1, 5121)`,
+								exitCode: backgroundTasks.exitCode,
+							})
+							.from(backgroundTasks)
+							.where(
+								and(
+									eq(backgroundTasks.id, metadata.taskId),
+									eq(backgroundTasks.logicalRunId, metadata.logicalRunId),
+									eq(backgroundTasks.parentNarratorId, row.narratorId),
+								),
+							)
+							.get()
+					: undefined;
+			const ref = task?.alias ?? metadata.taskId;
+			let output = result?.output;
+			if (output != null && Buffer.byteLength(output, "utf8") >= 5120) {
+				// Old tasks (or a failed spill) retain their bounded original for Await.
+				output = `${output.slice(0, 256)}\n[Output preview truncated; captured output file unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`;
+			}
+			const outputPreview =
+				output == null
+					? `${row.text}\n[Result snapshot unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`
+					: `${output || "(empty output)"}${result?.exitCode != null ? `\n[exit code: ${result.exitCode}]` : ""}`;
 			return {
 				kind: "bg_bash",
 				task: {
@@ -181,9 +214,11 @@ export function projectPendingInjection(
 					title: task?.title ?? null,
 					alias: task?.alias ?? null,
 					status,
-					outputPreview: row.text,
+					outputPreview,
+					userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
 				},
 			};
+		}
 		const narrator = db
 			.select({ title: narrators.title })
 			.from(narrators)
@@ -220,6 +255,7 @@ export function projectPendingInjection(
 				result: result?.slice(0, 12000),
 				resultTruncated: !!result && result.length > 12000,
 				resultMessageId,
+				userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
 			},
 		};
 	}
@@ -229,6 +265,7 @@ export function projectPendingInjection(
 		kind: "subagent_message",
 		message: {
 			delivery,
+			userId: metadata.userId ?? row.createdBy ?? null,
 			fromId: delivery.sender.id,
 			fromTitle: delivery.sender.title ?? null,
 			fromLabel: delivery.sender.label,
@@ -240,6 +277,49 @@ export function projectPendingInjection(
 		},
 	};
 }
+
+/** Attribution ledger for durable task notices that outlived in-memory completion payloads. */
+const taskNoticeUsers = hotSafe(
+	"narrafork:parent-injection-task-notice-user",
+	() => new Map<string, string | null>(),
+);
+
+export function recordTaskNoticeUser(taskId: string, userId: string | null | undefined): void {
+	taskNoticeUsers.set(taskId, userId ?? null);
+}
+
+function peekTaskNoticeUser(taskId: string): string | null {
+	return taskNoticeUsers.get(taskId) ?? null;
+}
+
+/** Keep unattributed legacy/system entries null rather than charging the parent user. */
+export function pendingInjectionUserId(entry: PendingInjection): string | null {
+	if (entry.kind === "subagent_message") return entry.message.userId ?? null;
+	const task = entry.task as { userId?: string | null; id: string };
+	return task.userId ?? peekTaskNoticeUser(task.id);
+}
+
+/**
+ * Contiguous same-user prefix over the durable projection.
+ * Explicit user restricts delivery to that principal; omitted means oldest entry's owner.
+ * Never skip an entry: FIFO holds across users and producer kinds alike.
+ */
+export async function takePendingInjectionBatch(
+	parentNarratorId: string,
+	userId?: string | null,
+): Promise<{ userId: string | null; entries: PendingInjection[] } | null> {
+	const list = await drainPendingInjections(parentNarratorId);
+	if (!list.length) return null;
+	const owner = userId === undefined ? pendingInjectionUserId(list[0]) : userId;
+	const entries: PendingInjection[] = [];
+	for (const entry of list) {
+		if (pendingInjectionUserId(entry) !== owner) break;
+		entries.push(entry);
+	}
+	if (!entries.length) return null;
+	return { userId: owner, entries };
+}
+
 export async function hasPendingInjections(narratorId: string): Promise<boolean> {
 	await migrateLegacyParentInjections(narratorId);
 	return hasInboxKind(narratorId, ["agent_message", "task_notice"]);

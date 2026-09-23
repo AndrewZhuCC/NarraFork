@@ -1,3 +1,4 @@
+import type { ReferenceCostSummary } from "../lib/usage-cost";
 /**
  * Pointer left on the dump when the complete copy was written to a file.
  *
@@ -54,8 +55,10 @@ export interface UsageHistoryRawDump {
 	};
 }
 
-export interface UsageHistoryRecord {
+export interface UsageHistoryRecord extends ReferenceCostSummary {
 	id: string;
+	userId?: string | null;
+	username?: string | null;
 	narratorId: string | null;
 	/** 外部 Agent 写入时自带的叙述者文本（无 narrator 关联时用于占位显示）。 */
 	agentLabel?: string | null;
@@ -87,7 +90,7 @@ export interface UsageHistoryRecord {
 	rawDump?: UsageHistoryRawDump | null;
 }
 
-export interface UsageHistoryStats {
+export interface UsageHistoryStats extends ReferenceCostSummary {
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -104,7 +107,7 @@ export interface UsageHistoryStats {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint {
+export interface UsageHistoryTimeSeriesPoint extends ReferenceCostSummary {
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -137,6 +140,8 @@ export interface UsageHistoryTimeSeriesResponse {
 }
 
 export interface UsageHistoryFilters {
+	/** '__unattributed__' selects requests without known ownership. */
+	userId?: string;
 	narratorId?: string;
 	chapterId?: string;
 	projectId?: string;
@@ -158,7 +163,7 @@ export interface UsageHistoryFilters {
  * consumption, not an amount billed, and `costIsPartial` marks that some
  * requests had no known price.
  */
-export interface CredentialUsageTotals {
+export interface CredentialUsageTotals extends ReferenceCostSummary {
 	provider: string;
 	credentialId: string;
 	requestCount: number;
@@ -215,7 +220,29 @@ export interface UsageHistoryProvidersResponse {
 	providers: string[];
 }
 
-export type UsageBreakdownDimension = "provider" | "model" | "kind";
+export interface UserUsageTotals extends ReferenceCostSummary {
+	userId: string;
+	username: string | null;
+	requestCount: number;
+	inputTokens: number;
+	outputTokens: number;
+	cachedInputTokens: number;
+	cacheCreationTokens: number;
+	reasoningTokens: number;
+	costUsd: number;
+	unpricedRequestCount: number;
+	firstUsedAt: string;
+	lastUsedAt: string;
+}
+
+export interface UserUsageTotalsResponse {
+	records: UserUsageTotals[];
+	hasMore: boolean;
+	nextCursor: string | null;
+	limit: number;
+}
+
+export type UsageBreakdownDimension = "provider" | "model" | "kind" | "user";
 export type UsageBreakdownMetric =
 	| "requests"
 	| "tokens"

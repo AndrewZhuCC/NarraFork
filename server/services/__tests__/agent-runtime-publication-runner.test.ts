@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
-import { cleanDb } from "../../../tests/setup";
-import { db, sqlite } from "../../db";
+import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -12,14 +11,23 @@ import {
 } from "../../db/schema";
 import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
-import { runtimePublication } from "../agent-runtime/publication";
-import { backgroundTaskService } from "../background-task-service";
-import * as session from "../narrator-session";
-import * as executor from "../subagent-executor";
-import { resumeSubagent } from "../subagent-resume";
 
+const { db, sqlite } = getTestDb();
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+const { activateSqliteRuntimePublication, runtimePublication } = await import(
+	"../agent-runtime/publication"
+);
+const { backgroundTaskService } = await import("../background-task-service");
+const session = await import("../narrator-session");
+const executor = await import("../subagent-executor");
+const { resumeSubagent } = await import("../subagent-resume");
+activateSqliteRuntimePublication(db);
 runtimePublication.stop();
 afterEach(() => cleanDb(sqlite));
+afterAll(() => {
+	sqlite.close();
+	mock.restore();
+});
 
 async function fixture(background: boolean) {
 	const parent = generateId(),
@@ -90,15 +98,28 @@ async function fixture(background: boolean) {
 	db.insert(narratorMessageRefs)
 		.values({ id: generateId(), narratorId: child, messageId: childMessageId, seq: 1 })
 		.run();
-	const run = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
-	if (background)
-		await backgroundTaskService.createAgentTask({
+	if (background) {
+		const task = await backgroundTaskService.createAgentTask({
 			id: child,
 			parentNarratorId: parent,
 			subagentNarratorId: child,
 			subagentType: "general",
 			toolUseId,
 		});
+		if (!task.logicalRunId) throw new Error("Background task has no publication run");
+		return {
+			parent,
+			child,
+			toolCallId,
+			run: {
+				producerKind: "agent" as const,
+				taskId: child,
+				recipientId: parent,
+				logicalRunId: task.logicalRunId,
+			},
+		};
+	}
+	const run = runtimePublication.startAgentRun({ narratorId: child, parentNarratorId: parent });
 	return { parent, child, toolCallId, run };
 }
 
@@ -191,6 +212,7 @@ describe("runner publication waits for the exact parent tool transaction", () =>
 					finalText: "NEW RESULT",
 					hasError: false,
 					allowInboxWake: true,
+					finalUserId: null,
 				});
 				const originalConclusion = session.updateToolCallConclusion;
 				const conclusion = spyOn(session, "updateToolCallConclusion").mockImplementation(

@@ -9,7 +9,10 @@ const inbox = await import("../agent-runtime/inbox");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
-const { runtimePublication } = await import("../agent-runtime/publication");
+const { runtimePublication, activateSqliteRuntimePublication } = await import(
+	"../agent-runtime/publication"
+);
+activateSqliteRuntimePublication(db);
 runtimePublication.setWake(undefined);
 const store = createMailboxStore(db);
 const time = "2026-09-09T00:00:00.000Z";

@@ -57,6 +57,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { HistoryRecoveryPanel } from "../HistoryRecoveryPanel";
 import { ManualOlderHistoryLoad } from "../history/ManualOlderHistoryLoad";
 import {
 	resolveOlderHistoryAutoLoad,
@@ -853,6 +854,7 @@ export const PretextExactMessageList = memo(
 						status?: string;
 						_sendDeliveryTargets?: unknown;
 						_sendDeliveryTargetCount?: number;
+						_streamingOutput?: unknown;
 					};
 					if (typeof call.toolName !== "string") return "";
 					const outputMetadata =
@@ -866,15 +868,28 @@ export const PretextExactMessageList = memo(
 						sourceMetadata && typeof sourceMetadata === "object"
 							? (sourceMetadata as Record<string, unknown>)
 							: undefined;
+					// Lift `_streamingOutput` the same way segment-adapter's resolveToolMetadata
+					// does: ContextAsk's live char counter (and any other streaming body) lives
+					// on the call record, not inside `_metadata`.
+					const baseMetadata =
+						metadata || call._streamingOutput != null
+							? {
+									...metadata,
+									...(call._streamingOutput != null &&
+									(metadata as Record<string, unknown> | undefined)?._streamingOutput === undefined
+										? { _streamingOutput: call._streamingOutput }
+										: {}),
+								}
+							: undefined;
 					const summaryMetadata =
 						call.toolName === "Send"
 							? {
-									...metadata,
+									...baseMetadata,
 									status: call.status,
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: metadata;
+							: baseMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, {
 						communicationRunning: t("communicationRunning"),
 						communicationNoRecipients: t("communicationNoRecipients"),
@@ -885,6 +900,9 @@ export const PretextExactMessageList = memo(
 						communicationTimeout: t("communicationTimeout"),
 						communicationCancelled: t("communicationCancelled"),
 						communicationError: t("communicationError"),
+						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
+						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
+						contextAskStatusSummary: t("contextAskStatusSummary"),
 					});
 				},
 				[t],
@@ -1198,6 +1216,7 @@ export const PretextExactMessageList = memo(
 				smoothFollowerRef.current?.snapToTarget();
 				// Reduced motion: no capture, so the layout effect below finds nothing to play
 				// and the fold applies instantly (the committed geometry).
+				foldCaptureRef.current = null;
 				if (prefersReducedMotion()) return;
 				const read = readFoldGeometryRef.current?.();
 				if (!read || read.geometry.size === 0) {
@@ -1289,7 +1308,10 @@ export const PretextExactMessageList = memo(
 									| { rows?: readonly { key: string; cardMeasured?: unknown }[] }
 									| undefined;
 								const row = measured?.rows?.find((r) => r.key === rowKey);
-								if (row?.cardMeasured != null) {
+								// Without a capture (reduced motion or unavailable geometry), no
+								// resize op will run and no onDone will release the card. Commit
+								// the summary directly instead of retaining it in the short row.
+								if (row?.cardMeasured != null && foldCaptureRef.current !== null) {
 									setClosingRows((prev) => {
 										const next = new Map(prev);
 										const rows = new Set(prev.get(key) ?? []);
@@ -4840,6 +4862,15 @@ export const PretextExactMessageList = memo(
 								}}
 							>
 								{pretextDocument.error ? (
+									<HistoryRecoveryPanel
+										narratorId={narratorId}
+										loadError={pretextDocument.error}
+										onRecovered={() => pretextDocument.reload()}
+									/>
+								) : null}
+								{pretextDocument.error &&
+								(pretextDocument.error as { data?: { code?: string } }).data?.code !==
+									"HISTORY_AGGREGATE_UNAVAILABLE" ? (
 									<Group gap="xs" align="center">
 										<Text size="sm" c="red">
 											{pretextDocument.error.message || tCommon("unknownError")}
@@ -4853,9 +4884,8 @@ export const PretextExactMessageList = memo(
 											{tCommon("retry")}
 										</Anchor>
 									</Group>
-								) : (
-									<NarratorMessageListSkeleton />
-								)}
+								) : null}
+								{!pretextDocument.error ? <NarratorMessageListSkeleton /> : null}
 							</div>
 						)}
 						{tailFooter ? (

@@ -47,6 +47,8 @@ export interface SessionWSAuth {
 	sessionExp?: number;
 	/** `sub` of that token, for logging when the connection is dropped. */
 	sessionUserId?: string;
+	/** Token generation at upgrade; Git subscriptions revalidate it against the live user. */
+	sessionTokenVersion?: number;
 }
 
 export type WSData =
@@ -152,6 +154,7 @@ export function resolveWSData(
 			userRole: userInfo?.role,
 			sessionExp: sessionAuth?.sessionExp,
 			sessionUserId: sessionAuth?.sessionUserId,
+			sessionTokenVersion: sessionAuth?.sessionTokenVersion,
 		};
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {

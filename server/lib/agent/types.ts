@@ -5,6 +5,7 @@ import type {
 	ApiRequestDiagnostics,
 	KnowledgeInjectionRecord,
 	ReasoningProviderMetadata,
+	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
@@ -737,9 +738,11 @@ export type AgentEvent =
 	| {
 			type: "api_request_start";
 			requestId: string;
+			userId?: string | null;
 			provider: string;
 			model: string;
 			credentialId?: string;
+			referencePricingSnapshot?: ReferencePricingSnapshot;
 	  }
 	| {
 			type: "api_request_end";
@@ -1197,11 +1200,14 @@ export interface AgentConfig {
 	/** Called whenever the completed-tool counter advances, so the caller can persist it. */
 	onCompletedToolCount?: (completedToolCount: number) => void;
 	/**
-	 * Called before each non-first turn/retry to check if runtime settings should be switched.
-	 * Changes are applied at the safe point before the next provider API request, so running
-	 * tools are not interrupted while the next model request uses fresh settings.
+	 * Called at request boundaries (including the first request and retries) to check
+	 * whether runtime settings should switch. May await policy/model inheritance
+	 * resolution; synchronous callers remain supported. Never aborts in-flight work.
 	 */
-	getRuntimeSettingsOverride?: () => RuntimeSettingsOverride | null;
+	getRuntimeSettingsOverride?: () =>
+		| RuntimeSettingsOverride
+		| null
+		| Promise<RuntimeSettingsOverride | null>;
 	/**
 	 * Legacy model-only override hook. Prefer getRuntimeSettingsOverride for new callers.
 	 * Returns the new model string (e.g. "nug:claude-opus-4.6") or null to keep current.
@@ -1223,6 +1229,10 @@ export interface AgentConfig {
 	 * Defaults to 0 (no in-loop retry — caller handles it).
 	 */
 	maxTransientRetries?: number;
+	/** Maximum distinct tool calls in one provider response (default 32, range 1–128). */
+	maxToolCallsPerResponse?: number;
+	/** Interrupt the owning narrator when a response exceeds its tool-call limit. */
+	onToolCallLimitExceeded?: (limit: number) => void;
 	/**
 	 * Number of completed tool calls without visible text before a progress sidecar is injected.
 	 * -1 disables the reminder. Defaults to 20.

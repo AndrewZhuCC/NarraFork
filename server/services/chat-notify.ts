@@ -25,7 +25,11 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { eq } from "drizzle-orm";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
-import { hydrateMessageForBroadcast, listRoomUnreadForFanout } from "./chat-service";
+import {
+	hydrateMessageForBroadcast,
+	listRoomUnreadForFanout,
+	probeRoomUnreadForUser,
+} from "./chat-service";
 
 /** Injectable so tests can assert routing without a live WebSocket server. */
 interface ChatNotifyChannel {
@@ -135,10 +139,11 @@ async function onRoomRead(event: {
 	});
 	// The reader's own badge just changed, and they may be reading in another tab
 	// that does not have this room subscribed.
+	const unread = await probeRoomUnreadForUser(event.roomId, event.userId);
 	target.broadcastToUser(event.userId, {
 		type: "chat:unread_changed",
 		roomId: event.roomId,
-		unread: 0,
+		unread: unread.count,
 	});
 }
 

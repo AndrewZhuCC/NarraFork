@@ -17,7 +17,6 @@ import { trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
 import type { ContentBlock } from "../narrator-panel-types";
-import { interruptAndInsert } from "./interrupt-and-insert";
 import type { BooleanOverride, DangerReflectionOverride } from "./reflection-types";
 
 /** Subset of a send response that indicates a buffered (queued) message. */
@@ -168,7 +167,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		enterQueueMode,
 		ctrlEnterQueueMode,
 		createNarrator,
-		interruptNarrator,
 		registerSubmitToNarrator,
 		setNarratorWorking,
 		navigateToNarrator,
@@ -252,11 +250,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	/**
 	 * Send as a new turn on an idle narrator.
 	 *
-	 * `priority` is not about queue ordering here — an idle narrator has no turn to
-	 * cut in front of. It is the explicit "do not wait for the running compaction"
-	 * opt-out: the server queues an idle-but-compacting narrator's messages by
-	 * default, and this flag makes it start the turn immediately instead. On a
-	 * narrator that is neither busy nor compacting it changes nothing.
+	 * Preserve explicit queue intent even when the UI reports idle: a stopped
+	 * narrator can still have pending messages, or can become active before the
+	 * request arrives. `priority` also opts out of waiting for running compaction;
+	 * that branch deliberately does not forward `interrupt`.
 	 */
 	const submitMessage = async (
 		msg: string,
@@ -265,7 +262,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		signal?: AbortSignal,
 		priority?: boolean,
 		fileReferences: FileReference[] = [],
+		interrupt?: boolean,
 	) => {
+		if (interrupt) priority = true;
 		const optimisticBlocks: ContentBlock[] = [
 			...fileReferences.map((reference) => ({ type: "file_reference", reference })),
 			...images.map((f) => ({
@@ -292,6 +291,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				reportUploadProgress,
 				signal,
 				fileReferences,
+				interrupt,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -353,7 +353,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		signal?: AbortSignal,
 		references?: FileReference[],
 		includeCommentDrafts = true,
+		interrupt?: boolean,
 	): Promise<boolean> => {
+		if (interrupt) priority = true;
 		const draft = trimFileReferenceInput({
 			text: composerRef.current?.getText() ?? "",
 			fileReferences: composerRef.current?.getFileReferences() ?? [],
@@ -379,6 +381,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				reportUploadProgress,
 				signal,
 				fileReferences,
+				interrupt,
 			);
 			const buffered = applyBufferedSendResult(
 				result,
@@ -428,10 +431,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	 * onto it as "turn" = wait, anything else = run now (`priority` opts out of the
 	 * server-side queue).
 	 *
-	 * When the narrator is fully idle, `mode` is ignored and the message is sent
-	 * directly (an idle session is never interrupted). `/new` while active always
-	 * uses the normal queue regardless of mode — spawning a new narrator should
-	 * not interrupt the current turn.
+	 * When fully idle, preserve `mode` for any pending queue or newer server-side
+	 * turn: only primary narrators carry the hard-interrupt intent. `/new` while
+	 * active always uses the normal queue regardless of mode — spawning a new
+	 * narrator should not interrupt the current turn.
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
 		const composerText = composerRef.current?.getText() ?? "";
@@ -556,17 +559,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				} else if (mode === "tool") {
 					await doSendBuffered(msg, true, abortController.signal);
 				} else {
-					// "interrupt": stop the old loop and wait for its finalizer before
-					// accepting the replacement message. A 409/settled:false response is
-					// a bounded failure of that ordering, not an invitation to send the
-					// same message through the queue as a second attempt.
-					const inserted = await interruptAndInsert(
-						() => interruptNarrator.mutateAsync({ id: narratorId, waitForIdle: true }),
-						() => doSendBuffered(msg, false, abortController.signal).then(() => true),
-					);
-					if (inserted === undefined) {
-						notifications.show({ message: t("interruptNotSettled"), color: "yellow" });
-					}
+					// The server accepts the replacement before interrupting the old loop.
+					// One request preserves priority and avoids a stop/send race window.
+					await doSendBuffered(msg, true, abortController.signal, fileReferences, true, true);
 				}
 				return;
 			}
@@ -612,8 +607,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				images,
 				textFiles,
 				abortController.signal,
-				undefined,
+				mode !== "turn",
 				fileReferences,
+				!isSubagent && mode === "interrupt" ? true : undefined,
 			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();

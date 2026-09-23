@@ -9,6 +9,7 @@ import type {
 	BackgroundTaskProgressFrame,
 } from "@shared/background-task-list";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
@@ -56,8 +57,14 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
+	/** Per-user activity invalidation; no titles, previews or source identifiers. */
+	| {
+			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
+			kinds?: Array<"chat_message" | "permission_request">;
+	  }
 	| RecentTabsDelta
 	| NarratorWsSubscriptionLimitError
 	| RecentTabsSnapshotMessage
@@ -575,7 +582,13 @@ export type NarratorServerMessage =
 			newMessageId?: string;
 			replacementMessageId?: string;
 	  }
-	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
+	| {
+			type: "narrator_forked";
+			narratorId: string;
+			parentNarratorId: string;
+			/** Extract-to-primary: parentNarratorId is the source, not the DB parent. */
+			extracted?: boolean;
+	  }
 	| {
 			type: "narrator_error";
 			narratorId: string;

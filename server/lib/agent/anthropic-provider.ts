@@ -47,6 +47,12 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import {
+	assertModelInputModalities,
+	effectiveProviderMetadata,
+	resolveMetadataReasoning,
+	resolveOutputTokenLimit,
+} from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
@@ -562,12 +568,6 @@ const MIN_THINKING_BUDGET = 1_024;
  */
 const RELAY_THINKING_BUDGET = 10_000;
 
-function resolveGenerateMaxTokens(options?: GenerateOptions): number {
-	const requested = options?.maxOutputTokens;
-	if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_GENERATE_MAX_TOKENS;
-	return Math.min(DEFAULT_MAX_TOKENS, Math.max(1, Math.floor(requested)));
-}
-
 /**
  * Map reasoning effort to Anthropic thinking configuration.
  *
@@ -605,17 +605,28 @@ function buildThinkingConfig(
 	| { type: "enabled"; budget_tokens: number }
 	| { type: "disabled" }
 	| undefined {
-	if (!supportsThinking(model)) return undefined;
+	const metadata = effectiveProviderMetadata(model);
+	if (metadata.reasoning?.supported === false) return undefined;
+	if (metadata.reasoning?.supported !== true && !supportsThinking(model)) return undefined;
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 
 	// "none" explicitly disables thinking
 	if (reasoningEffort === "none") {
 		return { type: "disabled" };
 	}
 
-	if (hasCredentialBoundReasoning(model)) return { type: "adaptive" };
+	if (hasCredentialBoundReasoning(model) && metadata.reasoning?.mode !== "budget")
+		return { type: "adaptive" };
 
 	const budget = Math.min(RELAY_THINKING_BUDGET, maxTokens - 1);
-	if (budget < MIN_THINKING_BUDGET) return { type: "disabled" };
+	if (budget < MIN_THINKING_BUDGET) {
+		if (metadata.reasoning?.canDisable === false) {
+			throw new Error(
+				`Model ${model} requires thinking, but its requested output limit cannot fit the minimum thinking budget.`,
+			);
+		}
+		return { type: "disabled" };
+	}
 	return { type: "enabled", budget_tokens: budget };
 }
 
@@ -648,7 +659,11 @@ export function mapEffortParam(
 	model: string,
 	reasoningEffort: string | undefined,
 ): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
+	const metadata = effectiveProviderMetadata(model);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
+	if (metadata.reasoning?.levels?.length)
+		return reasoningEffort as "low" | "medium" | "high" | "xhigh" | "max";
 	const isKnownClaude = parseClaudeModel(model) != null;
 	const supported =
 		!isKnownClaude || supportsXhighEffort(model)
@@ -862,14 +877,15 @@ export function getAnthropicEffectiveContextWindow(
 	model: string,
 	config: AnthropicProviderConfig,
 ): number | null {
-	const resolved = resolveModelContextWindow(model, config.prefix);
+	const resolved = resolveModelContextWindow(parseModelId(model).model, config.prefix);
 	// Official-API floor, but never above an explicit configuration. A per-model
 	// override typed in settings, or the provider's own defaultContextWindow, is
 	// a deliberate user decision (relays commonly cap far below 1M) — raising it
 	// to 1M here would make the custom value look ignored and delay auto-compact
 	// past the real limit. Only derived values (gateway catalog, built-in table,
 	// 128k fallback) get lifted to the official 1M window.
-	const explicit = resolved.source === "user" || resolved.source === "provider";
+	const explicit =
+		resolved.source === "user" || resolved.source === "provider" || resolved.source === "card";
 	if (!explicit && config.officialApi && supportsAnthropic1mContext(model)) {
 		return Math.max(resolved.contextWindow, 1_000_000);
 	}
@@ -1036,15 +1052,9 @@ async function parseAnthropicGenerateResponse(
 	if (invalidReason && !outputTruncated) {
 		const message =
 			json.error?.message ??
-			(invalidReason === "max_tokens"
-				? "Response truncated: model reached maximum token limit."
-				: invalidReason === "model_context_window_exceeded"
-					? "The model has reached its context window limit."
-					: invalidReason === "refusal"
-						? "Claude refused to provide this response."
-						: invalidReason === "content_filter"
-							? "Response blocked by content filter."
-							: "Anthropic API error");
+			(json.error
+				? `Upstream returned error ${invalidReason} (no error message provided).`
+				: `Upstream returned stop_reason=${stopReason} (no error message provided).`);
 		const diagnostics = parseErrorDiagnostics(
 			{ reason: invalidReason, message, error: json.error },
 			{ source: "provider", phase: "json_response", reason: invalidReason, message },
@@ -1640,10 +1650,14 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		// Use the unified Anthropic Messages output token ceiling. Every model in
 		// the supported range caps at or above it.
-		const maxTokens = DEFAULT_MAX_TOKENS;
+		const maxTokens = resolveOutputTokenLimit(
+			effectiveProviderMetadata(params.model),
+			params.maxOutputTokens,
+			DEFAULT_MAX_TOKENS,
+		)!;
 
 		// Build thinking configuration
-		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort, maxTokens);
+		const thinkingConfig = buildThinkingConfig(params.model, params.reasoningEffort, maxTokens);
 		const thinkingEnabled = !!thinkingConfig && thinkingConfig.type !== "disabled";
 
 		// When thinking is not enabled, strip thinking/redacted_thinking blocks from
@@ -1765,15 +1779,20 @@ export class AnthropicProvider implements ProviderAdapter {
 		// (the session path always resolves a tier), but under the blacklist policy
 		// it would impose a tier on every third-party model whose caller left it
 		// unset. The OpenAI path already sends nothing in that case.
-		if (supportsEffort(model) && params.reasoningEffort !== "none") {
-			const effort = mapEffortParam(model, params.reasoningEffort);
+		if (
+			supportsEffort(model) ||
+			effectiveProviderMetadata(params.model).reasoning?.supported === true
+		) {
+			const effort = mapEffortParam(params.model, params.reasoningEffort);
 			if (effort) body.output_config = { effort };
 		}
 
 		// DeepSeek effort: output_config.effort controls thinking intensity
 		// (DeepSeek supports "high" and "max"; low/medium map to high)
 		if (isDeepSeek && thinkingEnabled) {
-			const effort = mapDeepSeekEffort(params.reasoningEffort);
+			const effort = mapDeepSeekEffort(
+				resolveMetadataReasoning(effectiveProviderMetadata(params.model), params.reasoningEffort),
+			);
 			if (effort) {
 				body.output_config = { effort };
 			}
@@ -1800,6 +1819,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (requestMetadata) body.metadata = requestMetadata;
 
 		// Request path: official API uses ?beta=true, proxy mode uses plain path.
+		assertModelInputModalities(params.model, body);
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
 		const reqHeaders = this.buildRequestHeaders(
@@ -2137,22 +2157,37 @@ export class AnthropicProvider implements ProviderAdapter {
 			stream: true;
 			system?: Array<Record<string, unknown>>;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
+			output_config?: { effort: string };
 			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
-			max_tokens: resolveGenerateMaxTokens(options),
+			max_tokens: resolveOutputTokenLimit(
+				effectiveProviderMetadata(model),
+				options?.maxOutputTokens,
+				DEFAULT_GENERATE_MAX_TOKENS,
+			)!,
 			messages,
 			stream: true,
 		};
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
-		if (options?.reasoningEffort !== undefined) {
-			const thinkingConfig = buildThinkingConfig(
-				bareModel,
-				options.reasoningEffort,
-				body.max_tokens,
-			);
+		const reasoningEffort =
+			options?.reasoningEffort ??
+			effectiveProviderMetadata(model).reasoning?.defaultLevel ??
+			undefined;
+		if (reasoningEffort !== undefined) {
+			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
+			const effort = mapEffortParam(model, reasoningEffort);
+			if (
+				effort &&
+				(supportsEffort(bareModel) ||
+					effectiveProviderMetadata(model).reasoning?.supported === true)
+			) {
+				body.output_config = {
+					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
+				};
+			}
 		}
 		const metadata = this.buildRequestMetadata(isOfficial);
 		if (metadata) body.metadata = metadata;
@@ -2224,22 +2259,37 @@ export class AnthropicProvider implements ProviderAdapter {
 			messages: AnthropicMessage[];
 			stream: true;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
+			output_config?: { effort: string };
 			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
-			max_tokens: resolveGenerateMaxTokens(options),
+			max_tokens: resolveOutputTokenLimit(
+				effectiveProviderMetadata(model),
+				options?.maxOutputTokens,
+				DEFAULT_GENERATE_MAX_TOKENS,
+			)!,
 			messages,
 			stream: true,
 		};
 		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
 		if (system) body.system = system;
-		if (options?.reasoningEffort !== undefined) {
-			const thinkingConfig = buildThinkingConfig(
-				bareModel,
-				options.reasoningEffort,
-				body.max_tokens,
-			);
+		const reasoningEffort =
+			options?.reasoningEffort ??
+			effectiveProviderMetadata(model).reasoning?.defaultLevel ??
+			undefined;
+		if (reasoningEffort !== undefined) {
+			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
+			const effort = mapEffortParam(model, reasoningEffort);
+			if (
+				effort &&
+				(supportsEffort(bareModel) ||
+					effectiveProviderMetadata(model).reasoning?.supported === true)
+			) {
+				body.output_config = {
+					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
+				};
+			}
 		}
 		const metadata = this.buildRequestMetadata(isOfficial);
 		if (metadata) body.metadata = metadata;
@@ -2283,6 +2333,12 @@ export class AnthropicProvider implements ProviderAdapter {
 		blockedDomains?: string[];
 		signal?: AbortSignal;
 	}): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
+		const metadataModel = params.model.startsWith(`${this.config.prefix}:`)
+			? params.model
+			: `${this.config.prefix}:${params.model}`;
+		if (effectiveProviderMetadata(metadataModel).nativeSearch?.supported === false) {
+			throw new Error(`Model ${params.model} does not support native search.`);
+		}
 		const apiKey = this.config.apiKey;
 		if (!apiKey) {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
@@ -2304,7 +2360,11 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const body: Record<string, unknown> = {
 			model: bareModel,
-			max_tokens: WEB_SEARCH_MAX_TOKENS,
+			max_tokens: resolveOutputTokenLimit(
+				effectiveProviderMetadata(metadataModel),
+				undefined,
+				WEB_SEARCH_MAX_TOKENS,
+			)!,
 			messages,
 			stream: true,
 			tools: [searchTool],
@@ -2355,8 +2415,9 @@ async function collectWebSearchStream(
 	let stopReason: string | undefined;
 
 	const handleEvent = (event: AnthropicStreamEvent): void => {
-		if (event.type === "error") {
-			throw new Error(`Anthropic web search error: ${event.error?.message ?? "unknown error"}`);
+		const streamError = extractAnthropicStreamError(event);
+		if (streamError) {
+			throw new Error(`Anthropic web search error: ${streamError.message}`);
 		}
 		if (event.type === "message_delta" && event.delta?.stop_reason) {
 			stopReason = event.delta.stop_reason;
@@ -2651,7 +2712,7 @@ export function extractAnthropicStreamError(
 	const message =
 		nestedMessage ??
 		(topMessageIsString ? (raw.message as string) : undefined) ??
-		"Anthropic API error";
+		`Upstream returned error ${reason || "api_error"} (no error message provided).`;
 
 	return {
 		reason: reason || "api_error",
@@ -3009,7 +3070,7 @@ export function parseAnthropicEvent(
 
 			// Critical stop reasons → invalidState for special handling
 			if (stopReason === "max_tokens") {
-				const message = "Response truncated: model reached maximum token limit.";
+				const message = "Upstream returned stop_reason=max_tokens (no error message provided).";
 				results.push({
 					invalidState: {
 						reason: "max_tokens",
@@ -3021,7 +3082,8 @@ export function parseAnthropicEvent(
 					},
 				});
 			} else if (stopReason === "model_context_window_exceeded") {
-				const message = "The model has reached its context window limit.";
+				const message =
+					"Upstream returned stop_reason=model_context_window_exceeded (no error message provided).";
 				results.push({
 					invalidState: {
 						reason: "model_context_window_exceeded",
@@ -3033,8 +3095,7 @@ export function parseAnthropicEvent(
 					},
 				});
 			} else if (stopReason === "refusal") {
-				const message =
-					"Claude is unable to respond to this request, which appears to violate the Usage Policy.";
+				const message = "Upstream returned stop_reason=refusal (no error message provided).";
 				results.push({
 					invalidState: {
 						reason: "refusal",

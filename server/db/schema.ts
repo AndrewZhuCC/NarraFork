@@ -8,6 +8,7 @@ import type {
 	FileChangeState,
 } from "@shared/file-change-protocol";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
+import type { NotificationLink } from "@shared/notification-center";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
 import { sql } from "drizzle-orm";
 import {
@@ -462,8 +463,10 @@ export const narrators = sqliteTable(
 		/**
 		 * Allocation counter for narrator_message_refs.seq: the next claimable seq, claimed by
 		 * `next_seq = next_seq + 1 … RETURNING` (which doubles as the per-narrator row lock).
-		 * Before startup completes, data-backfills.ts raises existing counters to at least
-		 * MAX(refs.seq)+1 (or 0), without lowering previously claimed values.
+		 * Startup does NOT scan all narrators to repair this counter. On process-lifetime first
+		 * write, choke points raise the floor to at least MAX(refs.seq)+1 inside the write
+		 * transaction (one-way ratchet) and mark the narrator healed only after that transaction
+		 * commits. Project import raises floors for imported ids after import commits.
 		 */
 		nextSeq: integer("next_seq").notNull().default(0),
 		// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
@@ -1322,6 +1325,9 @@ export const narratorMessages = sqliteTable(
 		contentText: text("content_text"),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
+		/** Null marks an untouched historical record. */
+		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
+		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
 		turnUsageJson: text("turn_usage_json", { mode: "json" }),
 		provider: text("provider"),
 		credentialId: text("credential_id"),
@@ -1574,6 +1580,8 @@ export const narratorToolCalls = sqliteTable(
 		cacheCreationCost: real("cache_creation_cost").notNull().default(0),
 		cacheReadCost: real("cache_read_cost").notNull().default(0),
 		totalCost: real("total_cost").notNull().default(0),
+		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
+		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
 		// Provider and model info
 		provider: text("provider"), // anthropic, openai, codex, nug, gemini
 		model: text("model"), // claude-3-5-sonnet-20241022, gpt-4o, etc.
@@ -3102,6 +3110,9 @@ export const apiRequests = sqliteTable(
 	"api_requests",
 	{
 		id: text("id").primaryKey(),
+		/** Request initiator, frozen at start; null for unknown legacy/system usage.
+		 * No FK: removing a user must not rewrite the accounting identity. */
+		userId: text("user_id"),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
 		agentLabel: text("agent_label"),
@@ -3126,6 +3137,9 @@ export const apiRequests = sqliteTable(
 		durationMs: integer("duration_ms"), // 总耗时
 		// 成本
 		costUsd: real("cost_usd"),
+		/** Null marks an untouched historical record. */
+		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
+		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
 		// 上下文使用率
 		contextPercent: real("context_percent"),
 		// Metering（NUG）
@@ -3144,10 +3158,30 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
 	],
 );
+
+// === user_usage_totals ===
+// One bounded lifetime rollup per user, independent of request/narrator cleanup.
+// No user FK: deletion keeps the original accounting ID; labels resolve at read time.
+// Legacy requests are deliberately not backfilled: their initiator is unknown.
+export const userUsageTotals = sqliteTable("user_usage_totals", {
+	userId: text("user_id").primaryKey(),
+	requestCount: integer("request_count").notNull().default(0),
+	inputTokens: integer("input_tokens").notNull().default(0),
+	outputTokens: integer("output_tokens").notNull().default(0),
+	cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+	cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+	reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+	costUsd: real("cost_usd").notNull().default(0),
+	unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	partialRequestCount: integer("partial_request_count").notNull().default(0),
+	firstUsedAt: text("first_used_at").notNull(),
+	lastUsedAt: text("last_used_at").notNull(),
+});
 
 // === credential_usage_totals ===
 // Lifetime token/cost rollup per (provider, credential, model).
@@ -3192,6 +3226,7 @@ export const credentialUsageTotals = sqliteTable(
 		 * "cost covers N of M requests" instead of presenting a silent undercount.
 		 */
 		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+		partialRequestCount: integer("partial_request_count").notNull().default(0),
 		firstSeenAt: text("first_seen_at").notNull(),
 		lastSeenAt: text("last_seen_at").notNull(),
 	},
@@ -3710,6 +3745,14 @@ export const fileChangeScopes = sqliteTable(
 	],
 );
 
+// Immutable process identity registered once per newly-created execution owner epoch.
+// Missing/unknown identities are deliberately not backfilled from a later process.
+export const workspaceExecutionOwners = sqliteTable("workspace_execution_owners", {
+	ownerEpoch: text("owner_epoch").primaryKey(),
+	identityJson: text("identity_json", { mode: "json" }).$type<unknown>(),
+	createdAt: text("created_at").notNull(),
+});
+
 // A scope is stable identity; each execution retains its own immutable physical ranges.
 // No TTL can release executing/quarantined work. Settled records are pruned in bounded batches.
 export const workspaceWriteLeases = sqliteTable(
@@ -3721,6 +3764,9 @@ export const workspaceWriteLeases = sqliteTable(
 			.references(() => fileChangeScopes.id),
 		deviceId: text("device_id").notNull(),
 		ownerEpoch: text("owner_epoch").notNull(),
+		executionClass: text("execution_class", { enum: ["local_file_io", "unknown"] })
+			.notNull()
+			.default("unknown"),
 		runtimeEpoch: text("runtime_epoch").notNull(),
 		runtimeGeneration: integer("runtime_generation").notNull(),
 		fencingToken: integer("fencing_token").notNull(),
@@ -3747,6 +3793,13 @@ export const workspaceWriteLeases = sqliteTable(
 			}>()
 			.notNull(),
 		executionEndedAt: text("execution_ended_at"),
+		terminationEvidenceJson: text("termination_evidence_json", { mode: "json" }).$type<{
+			version: 1;
+			kind: "owner_ended";
+			ownerEpoch: string;
+			reason: string;
+			observedAt: string;
+		}>(),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -3754,6 +3807,7 @@ export const workspaceWriteLeases = sqliteTable(
 		index("idx_workspace_lease_device_status").on(table.deviceId, table.status, table.leaseId),
 		index("idx_workspace_lease_scope").on(table.scopeId, table.status, table.leaseId),
 		index("idx_workspace_lease_cleanup").on(table.status, table.updatedAt, table.leaseId),
+		index("idx_workspace_lease_owner").on(table.ownerEpoch, table.leaseId),
 	],
 );
 
@@ -3766,6 +3820,21 @@ export const fileChangeScopeRecoveries = sqliteTable(
 		id: text("id").primaryKey(),
 		/** Immutable audit reference; terminal lease pruning must not delete the audit. */
 		workspaceLeaseId: text("workspace_lease_id"),
+		resolutionAuthority: text("resolution_authority", {
+			enum: ["execution_proven", "administrator_attested", "system_reconciled"],
+		})
+			.notNull()
+			.default("execution_proven"),
+		/** Explicit maintenance evidence; never interpreted as OS process-death proof. */
+		maintenanceEvidenceJson: text("maintenance_evidence_json", { mode: "json" }).$type<{
+			version: 1;
+			mode: "legacy_owner_offline";
+			oldOwnerEpoch: string | null;
+			operatorReason: string;
+			maintenanceAuthority: "exclusive_instance_lock";
+			generation: string;
+			attestedAt: string;
+		}>(),
 		scopeId: text("scope_id")
 			.notNull()
 			.references(() => fileChangeScopes.id),
@@ -5379,5 +5448,47 @@ export const oauthAccessTokens = sqliteTable(
 		index("idx_oauth_access_tokens_user").on(table.userId),
 		// FK covering index for user deletion.
 		index("idx_oauth_access_tokens_revoked_by_user").on(table.revokedByUserId),
+	],
+);
+
+// === notifications ===
+// Activity history and acknowledgement. Human Attention owns actionable state;
+// sourceState and effective readAt are derived against current source/ACL data.
+// Dedup key: unique (user_id, kind, source_key) so reconnects/WS resubscribe
+// never create a second row for the same source event.
+export const notifications = sqliteTable(
+	"notifications",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["chat_message", "permission_request"] }).notNull(),
+		/** Best-effort denormalized filters; null when the source has no project/chapter. */
+		projectId: text("project_id"),
+		chapterId: text("chapter_id"),
+		/** Required for permission_request; chat_message may leave this null. */
+		narratorId: text("narrator_id"),
+		title: text("title").notNull(),
+		preview: text("preview").notNull().default(""),
+		/** Deep link snapshot; lists must not recompute it by joining source tables. */
+		linkJson: text("link_json", { mode: "json" }).$type<NotificationLink>().notNull(),
+		/** chat_message → chat_messages.id; permission_request → narrator_tool_calls.id */
+		sourceKey: text("source_key").notNull(),
+		status: text("status", { enum: ["unread", "read"] })
+			.notNull()
+			.default("unread"),
+		createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+		readAt: integer("read_at", { mode: "timestamp_ms" }),
+	},
+	(table) => [
+		uniqueIndex("idx_notifications_user_kind_source").on(table.userId, table.kind, table.sourceKey),
+		index("idx_notifications_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_notifications_user_status_created").on(
+			table.userId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
 	],
 );

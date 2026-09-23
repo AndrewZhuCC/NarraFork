@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { MantineProvider } from "@mantine/core";
 import {
 	CARD_SHIMMER_CLASS,
+	TOOL_SHIMMER_QUEUED_EXIT_MS,
 	TRACE_SHIMMER_CLASS,
 	TRACE_SHIMMER_FLASH_HOLD_MS,
 	TRACE_SHIMMER_FLASH_MS,
@@ -35,8 +36,10 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
+import { measureToolCall, type ToolCallData } from "../measure/measure-tool-call";
 import { measureActivityTrace } from "../measure/measure-tool-run";
 import { installCanvasStub } from "../measure/test-canvas-stub";
+import { RenderToolCall } from "./RenderToolCall";
 import { RenderToolRun } from "./RenderToolRun";
 
 const disposeCanvasStub = installCanvasStub();
@@ -81,6 +84,7 @@ interface RowInput {
 	shimmer?: boolean;
 	title?: string;
 	reflectionStatus?: string;
+	queuedBehindUpstream?: boolean;
 }
 
 function traceOf(rows: RowInput[]) {
@@ -139,6 +143,57 @@ describe("a folded trace row paints its shimmer state", () => {
 		expect(shimmerClasses(trace([{ status: "initializing" }]))).toEqual([
 			TRACE_SHIMMER_CLASS.streaming,
 		]);
+	});
+
+	it("parks QUEUED behind an earlier same-turn tool instead of streaming", () => {
+		// The three-way distinction: streaming (args arriving) vs running (executing)
+		// vs queued (args ready, blocked by an earlier call). Without
+		// `queuedBehindUpstream`, initializing still looks like streaming.
+		expect(
+			shimmerClasses(
+				trace([{ status: "running" }, { status: "initializing", queuedBehindUpstream: true }]),
+			),
+		).toEqual([TRACE_SHIMMER_CLASS.running, TRACE_SHIMMER_CLASS.queued]);
+		expect(
+			shimmerClasses(trace([{ status: "initializing", queuedBehindUpstream: false }])),
+		).toEqual([TRACE_SHIMMER_CLASS.streaming]);
+	});
+
+	it("names the queued state for readers who cannot use colour", () => {
+		const html = renderToStaticMarkup(
+			<MantineProvider defaultColorScheme="dark">
+				<RenderToolRun
+					measured={traceOf([{ status: "initializing", queuedBehindUpstream: true }])}
+					labels={{ shimmerState: { queued: "等待前面的工具完成" } }}
+				/>
+			</MantineProvider>,
+		);
+		expect(html).toContain("等待前面的工具完成");
+		expect(html).toContain(TRACE_SHIMMER_CLASS.queued);
+	});
+
+	it("fades the queued wash OUT instead of cutting it when the next phase starts", () => {
+		// Leaving queued must not snap: the infinite pulse freezes mid-opacity and the
+		// next class replaces it in one frame. The leave class holds for
+		// TOOL_SHIMMER_QUEUED_EXIT_MS and dissolves the slate tint first.
+		// Static: a row that is already running has no exit class (mount is not a
+		// transition — same rule as the outcome flash).
+		expect(shimmerClasses(trace([{ status: "running" }]))).toEqual([TRACE_SHIMMER_CLASS.running]);
+		// CSS pin: the exit class exists and is NOT the looping queued sweep.
+		const traceCss = readFileSync(
+			join(import.meta.dir, "..", "..", "..", "..", "styles", "trace-shimmer.css"),
+			"utf8",
+		);
+		const cardCss = readFileSync(
+			join(import.meta.dir, "..", "..", "..", "..", "styles", "card-shimmer.css"),
+			"utf8",
+		);
+		expect(traceCss).toContain(`.${TRACE_SHIMMER_CLASS.queued_out}`);
+		expect(cardCss).toContain(`.${CARD_SHIMMER_CLASS.queued_out}`);
+		expect(traceCss).toContain("nf-trace-queued-out");
+		expect(cardCss).toContain("nf-card-queued-out");
+		expect(cardCss).toContain(`${TOOL_SHIMMER_QUEUED_EXIT_MS}ms`);
+		expect(traceCss).toContain(`${TOOL_SHIMMER_QUEUED_EXIT_MS}ms`);
 	});
 
 	it("goes SILENT when the row is waiting on the user", () => {
@@ -434,9 +489,20 @@ describe("a folded trace row is reachable without colour or a mouse", () => {
 				</MantineProvider>,
 			),
 		);
-		// A settled `fail` row paints no shimmer, so nothing is named — the label only
-		// describes a state the row is actually IN.
-		expect(root.querySelector("[aria-label]")).toBeNull();
+		// A settled `fail` row paints no shimmer, so the ROW carries no name — the
+		// shimmer label only describes a state the row is actually IN.
+		//
+		// Scoped to the row itself rather than "no `[aria-label]` in the tree": the
+		// status GLYPH is a second, independent label channel, and a failed row's red X
+		// is exactly the mark a colour-blind reader needs named (asserted below). The
+		// invariant here is about the shimmer label, so the selector has to say so.
+		expect(root.querySelector("[data-nf-trace-titlerow]")?.hasAttribute("aria-label")).toBe(false);
+		// The glyph, however, IS named — and from its own bundle, not the shimmer's.
+		expect(
+			root
+				.querySelector('[data-testid="trace-row-status-slot"] [aria-label]')
+				?.getAttribute("aria-label") ?? "",
+		).toBe("failed");
 
 		const live = measureActivityTrace(
 			[
@@ -458,9 +524,12 @@ describe("a folded trace row is reachable without colour or a mouse", () => {
 				</MantineProvider>,
 			),
 		);
-		expect(liveRoot.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "").toContain(
-			"正在审查",
-		);
+		// Read off the ROW, not "the first labelled node": the status glyph also carries
+		// one now, and a `querySelector` that happened to reach it first would make this
+		// assertion about the wrong channel.
+		expect(
+			liveRoot.querySelector("[data-nf-trace-titlerow]")?.getAttribute("aria-label") ?? "",
+		).toContain("正在审查");
 	});
 
 	it("leaves a NON-expandable row out of the tab order", () => {
@@ -479,6 +548,74 @@ describe("a folded trace row is reachable without colour or a mouse", () => {
 		);
 		expect(root.querySelector('[role="button"]')).toBeNull();
 	});
+});
+
+describe("queued exit survives subsequent phase transitions", () => {
+	for (const surface of ["row", "card"] as const) {
+		for (const next of ["running", "reflecting"] as const) {
+			it(`${surface}: queued → ${next} → ${next === "running" ? "success" : "running"} clears the exit`, async () => {
+				const host = document.createElement("div");
+				document.body.appendChild(host);
+				const root = createRoot(host);
+				const classes = surface === "row" ? TRACE_SHIMMER_CLASS : CARD_SHIMMER_CLASS;
+				const draw = (phase: "queued" | "running" | "reflecting" | "success") => {
+					const status =
+						phase === "queued" ? "initializing" : phase === "reflecting" ? "pending" : phase;
+					const queuedBehindUpstream = phase === "queued";
+					const reflecting = phase === "reflecting";
+					act(() => {
+						root.render(
+							<MantineProvider defaultColorScheme="dark">
+								{surface === "row" ? (
+									<RenderToolRun
+										measured={traceOf([
+											{
+												status,
+												queuedBehindUpstream,
+												reflectionStatus: reflecting ? "running" : undefined,
+											},
+										])}
+									/>
+								) : (
+									<RenderToolCall
+										measured={measureToolCall(
+											{
+												toolName: "Bash",
+												summary: "bun test",
+												category: "bash",
+												status,
+												queuedBehindUpstream,
+												reflection: reflecting ? { title: "Reviewing", status: "running" } : null,
+											} satisfies ToolCallData,
+											WIDTH,
+											5,
+										)}
+									/>
+								)}
+							</MantineProvider>,
+						);
+					});
+				};
+				try {
+					draw("queued");
+					expect(host.querySelector(`.${classes.queued}`)).not.toBeNull();
+					draw(next);
+					expect(host.querySelector(`.${classes.queued_out}`)).not.toBeNull();
+					const finalPhase = next === "running" ? "success" : "running";
+					draw(finalPhase);
+					expect(host.querySelector(`.${classes.queued_out}`)).not.toBeNull();
+					await act(async () => {
+						await new Promise((resolve) => setTimeout(resolve, TOOL_SHIMMER_QUEUED_EXIT_MS + 30));
+					});
+					expect(host.querySelector(`.${classes.queued_out}`)).toBeNull();
+					expect(host.querySelector(`.${classes[finalPhase]}`)).not.toBeNull();
+				} finally {
+					act(() => root.unmount());
+					host.remove();
+				}
+			});
+		}
+	}
 });
 
 describe("the one-shot closing sweep", () => {

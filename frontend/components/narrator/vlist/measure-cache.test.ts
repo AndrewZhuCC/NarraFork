@@ -749,28 +749,28 @@ describe("extractDataRevision", () => {
 		const unanswered = askDetail({
 			header: "Pick",
 			omitHeader: true,
-			options: [{ label: "Alpha" }, { label: "Beta" }],
+			options: [{ header: "Alpha" }, { header: "Beta" }],
 		});
 		const answered = askDetail({
 			header: "Pick",
 			omitHeader: true,
-			options: [{ label: "Alpha", selected: true }, { label: "Beta" }],
+			options: [{ header: "Alpha", selected: true }, { header: "Beta" }],
 			answer: "Answer: Alpha",
 		});
 		expect(extractDataRevision(unanswered)).not.toBe(extractDataRevision(answered));
 
 		// Option / question count and description text all move the revision.
-		const oneOption = askDetail({ header: "Pick", options: [{ label: "Alpha" }] });
+		const oneOption = askDetail({ header: "Pick", options: [{ header: "Alpha" }] });
 		expect(extractDataRevision(oneOption)).not.toBe(extractDataRevision(unanswered));
 		const described = askDetail({
 			header: "Pick",
-			options: [{ label: "Alpha", description: "a much longer description line" }],
+			options: [{ header: "Alpha", description: "a much longer description line" }],
 		});
 		expect(extractDataRevision(described)).not.toBe(extractDataRevision(oneOption));
 		// omitHeader changes the height (one row less) and must be part of the key.
 		expect(extractDataRevision(oneOption)).not.toBe(
 			extractDataRevision(
-				askDetail({ header: "Pick", omitHeader: true, options: [{ label: "Alpha" }] }),
+				askDetail({ header: "Pick", omitHeader: true, options: [{ header: "Alpha" }] }),
 			),
 		);
 	});
@@ -874,6 +874,39 @@ describe("extractDataRevision", () => {
 			expect(some).toContain("df:12/3");
 			// A corrected count re-keys as well.
 			expect(extractDataRevision(rowWith({ added: 40, removed: 3 }))).not.toBe(some);
+		});
+
+		/**
+		 * The per-row PAINTED duration, which is not always `timing.durationMs`.
+		 *
+		 * It derives from `_metadata.execDurationMs`, and a live patch can land that
+		 * metadata ALONE on a call whose status is already terminal — the same window
+		 * `diffStats` above needs its own key component for. Without this the rebuild
+		 * serves the pre-patch row and keeps painting the figure that includes the gate
+		 * wait, which is worse than painting none: a duration reads as authoritative.
+		 */
+		it("keys each row's painted duration independently of the full span", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const rowWith = (displayDurationMs?: number) => ({
+				headerCount: "1 call",
+				items: [
+					{
+						key: "tool-tu-1",
+						title: "Bash · git diff",
+						status: "success",
+						// Held FIXED across the cases, which is the point: only the painted
+						// figure moves, so nothing else in the key can cover for it.
+						timing: { createdAt: 0, durationMs: 20_000 },
+						...(displayDurationMs != null ? { displayDurationMs } : {}),
+					},
+				],
+			});
+			const none = extractDataRevision(rowWith());
+			const exec = extractDataRevision(rowWith(1_200));
+			expect(exec).not.toBe(none);
+			expect(exec).toContain("tmd:1200");
+			// A corrected figure re-keys too.
+			expect(extractDataRevision(rowWith(1_500))).not.toBe(exec);
 		});
 
 		it("a collapsed fold pays nothing (no card → no card component)", async () => {
@@ -1127,7 +1160,7 @@ describe("subagent file-change cache identity", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const rows = [file, { ...file, deviceId: "device-b" }];
 		expect(extractDataRevision(data({ files: rows }))).not.toBe(
-			extractDataRevision(data({ files: rows.toReversed() })),
+			extractDataRevision(data({ files: [...rows].reverse() })),
 		);
 		const rev = (deviceId: string, workspacePath: string) =>
 			extractDataRevision(data({ files: [{ ...file, deviceId, workspacePath }] }));

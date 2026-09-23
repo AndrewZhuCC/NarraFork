@@ -35,6 +35,7 @@ import {
 	ThemeIcon,
 	UnstyledButton,
 } from "@mantine/core";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 // The row height comes from the shared row metrics, resolved at RENDER time, so it
 // tracks the reader's typography exactly as the measure side does.
 import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
@@ -76,6 +77,7 @@ import { TRACE_CHEVRON, TRACE_ROW_GAP, TRACE_ROW_ICON } from "../measure/measure
 import { typographyMetrics } from "../pretext-fonts";
 import type { VListViewControls } from "../VListContentViewHost";
 import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
+import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { swallowSelectionClick } from "./key-activate";
@@ -87,9 +89,11 @@ import {
 	ToolTimingArea,
 	type ToolTimingLabels,
 } from "./RenderToolCall";
+import { subagentFilePathDisplays } from "./subagent-file-paths";
 import {
-	hasToolRowStatusMark,
 	isTerminalToolRowStatus,
+	resolveToolRowStatusMark,
+	type ToolRowStatusMark,
 	TRACE_ROW_STATUS_SLOT_STYLE,
 	TraceRowStatusGlyph,
 } from "./trace-row-status";
@@ -113,6 +117,8 @@ export interface SubagentLabels {
 	backgroundBadge?: string;
 	/** "Taken over by user" badge label. */
 	takenOverBadge?: string;
+	/** The model follows the parent's live selection, not a concrete snapshot. */
+	followParent?: string;
 	/** File-changes section title ("Changed files"). */
 	fileChanges?: string;
 	/** Suffix for a file whose line counts are unknown. */
@@ -145,9 +151,15 @@ export interface SubagentLabels {
 	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
 	 */
 	timing?: ToolTimingLabels;
+	/**
+	 * Names for a recent-call row's status MARK, for readers who get neither the
+	 * glyph's colour nor its shape. Absent → the glyph's own English fallbacks.
+	 * Attributes only → height-neutral.
+	 */
+	statusMark?: Partial<Record<ToolRowStatusMark, string>>;
 }
 
-const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
+const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = {
 	recentCalls: "Recent calls",
 	openSession: "Open full session",
 	prompt: "Prompt",
@@ -156,6 +168,7 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
+	followParent: "Follow parent",
 	fileChanges: "Changed files",
 	linesNotMeasured: "lines not measured",
 	moreFiles: "{count} more files",
@@ -206,11 +219,12 @@ function withCount(template: string, count: number): string {
 }
 
 /**
- * Labels after merging the defaults: every string is present, while `timing` stays
- * optional because ToolTimingArea owns its own English fallback bundle.
+ * Labels after merging the defaults: every string is present, while `timing` and
+ * `statusMark` stay optional because `ToolTimingArea` and `TraceRowStatusGlyph` own
+ * their own English fallback bundles.
  */
-type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing">> &
-	Pick<SubagentLabels, "timing">;
+type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing" | "statusMark">> &
+	Pick<SubagentLabels, "timing" | "statusMark">;
 
 interface RenderSubagentProps {
 	measured: MeasuredSubagent;
@@ -368,16 +382,15 @@ function RecentCallCategoryChip({
 	return (
 		// Same `data-trace-row-chip` marker a folded trace row's chip carries — the two
 		// rows are one shape, so a parity test must be able to find both the same way.
-		<ThemeIcon
+		// Shared CategoryChip: ThemeIcon light + CATEGORY_COLOR, identical to the card header.
+		<CategoryChip
 			data-trace-row-chip
 			size={TRACE_ROW_ICON}
-			variant="light"
 			color={CATEGORY_COLOR[resolved] ?? "gray"}
-			radius="sm"
 			data-testid="subagent-activity-category-chip"
 		>
 			<Icon size={TRACE_ROW_GLYPH_SIZE} />
-		</ThemeIcon>
+		</CategoryChip>
 	);
 }
 
@@ -535,7 +548,7 @@ function SubagentInner({
 				) : null}
 				{model ? (
 					<Badge data-testid="subagent-model" size="xs" variant="light" color="violet">
-						{model}
+						{model === FOLLOW_PARENT_MODEL ? labels.followParent : model}
 					</Badge>
 				) : null}
 				{reasoningEffort ? (
@@ -596,6 +609,12 @@ function SubagentInner({
 	let recentCalls: React.ReactNode = null;
 	if (measured.recentCallsHeight > 0) {
 		const rows = recentCallNames.slice(0, measured.recentRowCount);
+		// Resolved once per row, ahead of the map: the mark decides BOTH whether the
+		// 12px slot exists and which glyph fills it, and two separate evaluations of
+		// that question are how a slot ends up reserved around nothing.
+		const statusMarks = rows.map((_name, i) =>
+			resolveToolRowStatusMark(measured.recentCallTimings[i]?.status),
+		);
 		recentCalls = (
 			<div
 				key="recent"
@@ -696,12 +715,21 @@ function SubagentInner({
 										);
 									})()}
 								</Text>
-								{/* Only DEVIATION is marked (in flight / failed / cancelled); a
-								    successful call draws nothing, so the slot is absent rather than
-								    blank — see @shared/tool-row-status. */}
-								{hasToolRowStatusMark(measured.recentCallTimings[i]?.status) ? (
+								{/* Only DEVIATION is marked (in flight / queued / awaiting / failed /
+								    cancelled); a successful call draws nothing, so the slot is absent
+								    rather than blank — see @shared/tool-row-status.
+
+								    No context is passed: this projection
+								    (`SubagentToolCallHeader`) carries no upstream-queue verdict and no
+								    gate status, so a queued child call still reads as in flight here.
+								    `pending` is nonetheless corrected by the shared rule, which is the
+								    case these rows actually hit. */}
+								{statusMarks[i] ? (
 									<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
-										<TraceRowStatusGlyph status={measured.recentCallTimings[i]?.status} />
+										<TraceRowStatusGlyph
+											mark={statusMarks[i] as ToolRowStatusMark}
+											labels={labels.statusMark}
+										/>
 									</Box>
 								) : null}
 								{/* Per-row timing (SubagentCard.tsx:684 parity). `recentCallTimings`
@@ -949,6 +977,7 @@ function SubagentBody({
 	// File changes: what the child wrote to disk. Rows reuse the recent-call geometry
 	// (one truncating xs mono line each), so the measured height is row count × line.
 	if (measured.fileChangesHeight > 0 && fileChanges) {
+		const fileDisplays = subagentFilePathDisplays(fileChanges.files, labels);
 		const rows = fileChanges.files.slice(0, measured.fileChangeRowCount);
 		const hidden = Math.max(0, fileChanges.totalFiles - rows.length);
 		const canToggle = fileChanges.files.length > FILE_CHANGE_MAX_ROWS && !!onToggleFileChanges;
@@ -1011,36 +1040,39 @@ function SubagentBody({
 					</Text>
 				) : null}
 				<div style={{ display: "flex", flexDirection: "column", gap: FILE_CHANGE_STACK_GAP }}>
-					{rows.map((file) => (
+					{rows.map((file, index) => (
 						<Group
 							key={subagentFileChangeIdentityKey(file)}
 							data-testid="subagent-file-change"
 							data-file-identity={subagentFileChangeIdentityKey(file)}
+							title={fileDisplays[index].title}
 							gap={6}
 							wrap="nowrap"
 							style={{ ...rowStyle, overflow: "hidden" }}
 						>
+							{fileDisplays[index].location ? (
+								<Text
+									data-testid="subagent-file-location"
+									size="xs"
+									c="dimmed"
+									truncate
+									ff="monospace"
+									style={{ flex: "0 1 auto", minWidth: 0, maxWidth: "40%" }}
+									title={fileDisplays[index].title}
+								>
+									{fileDisplays[index].location}
+								</Text>
+							) : null}
 							<Text
-								data-testid="subagent-file-location"
-								size="xs"
-								c="dimmed"
-								truncate
-								ff="monospace"
-								style={{ flex: "0 1 auto", minWidth: 0, maxWidth: "40%" }}
-								title={`${file.deviceId || labels.unknownDevice} · ${file.workspacePath || labels.unknownWorkspace}`}
-							>
-								{file.deviceId || labels.unknownDevice} ·{" "}
-								{file.workspacePath || labels.unknownWorkspace}
-							</Text>
-							<Text
+								data-testid="subagent-file-path"
 								size="xs"
 								c="dimmed"
 								truncate
 								ff="monospace"
 								style={{ flex: "0 1 auto", minWidth: 0 }}
-								title={file.filePath}
+								title={fileDisplays[index].title}
 							>
-								{file.filePath}
+								{fileDisplays[index].path}
 							</Text>
 							{/* Same green/red plain text the tool cards use, so one file reads
 						    identically wherever it appears. */}

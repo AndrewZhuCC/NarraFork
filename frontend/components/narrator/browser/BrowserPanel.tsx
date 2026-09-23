@@ -47,6 +47,11 @@ import {
 	safeAreaFullscreenModalBodyStyle,
 } from "../../../lib/safe-area";
 import {
+	type BrowserKeyInput,
+	BrowserKeyStrokeBroker,
+	mapBrowserKeyEvent,
+} from "./browser-keyboard";
+import {
 	type BrowserPreviewViewport,
 	getBrowserPreviewExpandedWidth,
 	getBrowserPreviewNavigationUrl,
@@ -594,9 +599,27 @@ function BrowserSessionCard({
 		};
 	}, []);
 
+	// A single queue orders key batches and mouse gestures, including ones entered
+	// while an earlier interaction is in flight. Recreate after StrictMode cleanup.
+	const keyBrokerRef = useRef<BrowserKeyStrokeBroker | null>(null);
+	const executeInteractionRef = useRef<
+		((params: BrowserInteractionParams, broker: BrowserKeyStrokeBroker) => void) | null
+	>(null);
+	useEffect(() => {
+		const broker = new BrowserKeyStrokeBroker((keys: BrowserKeyInput[]) => {
+			executeInteractionRef.current?.({ action: "type", keys }, broker);
+		});
+		keyBrokerRef.current = broker;
+		return () => {
+			keyBrokerRef.current = null;
+			broker.dispose();
+		};
+	}, []);
+
 	const executeInteraction = useCallback(
-		(params: BrowserInteractionParams) => {
-			if (localInteractionPendingRef.current) return;
+		(params: BrowserInteractionParams, broker: BrowserKeyStrokeBroker) => {
+			if (keyBrokerRef.current !== broker) return;
+
 			if (postClickRefreshTimerRef.current) {
 				clearTimeout(postClickRefreshTimerRef.current);
 				postClickRefreshTimerRef.current = null;
@@ -609,6 +632,7 @@ function BrowserSessionCard({
 				{ narratorId, sessionId: session.id, params },
 				{
 					onSuccess: (blob) => {
+						if (keyBrokerRef.current !== broker) return;
 						applyPreviewBlob(blob, requestSeq);
 						if (params.action === "click") {
 							if (postClickRefreshTimerRef.current) {
@@ -624,127 +648,67 @@ function BrowserSessionCard({
 						}
 					},
 					onError: () => {
-						if (previewRequestSeqRef.current === requestSeq) setError(true);
+						if (keyBrokerRef.current === broker && previewRequestSeqRef.current === requestSeq) {
+							setError(true);
+						}
 					},
 					onSettled: () => {
+						if (keyBrokerRef.current !== broker) return;
 						localInteractionPendingRef.current = false;
+						broker.release();
 					},
 				},
 			);
 		},
 		[applyPreviewBlob, interactMutation, narratorId, queryClient, session.id],
 	);
+	// The broker is mounted once; its callback uses the latest request handler.
+	executeInteractionRef.current = executeInteraction;
+
+	const queueInteraction = useCallback((params: BrowserInteractionParams) => {
+		const broker = keyBrokerRef.current;
+		broker?.enqueueInteraction(() => executeInteractionRef.current?.(params, broker));
+	}, []);
 
 	const handleRemoteClick = useCallback(
 		(coordinate: { x: number; y: number }) => {
-			executeInteraction({ action: "click", coordinate });
+			queueInteraction({ action: "click", coordinate });
 		},
-		[executeInteraction],
+		[queueInteraction],
 	);
 
 	const handleRemoteScroll = useCallback(
 		(coordinate: { x: number; y: number }, direction: "up" | "down", amount: number) => {
-			executeInteraction({ action: "scroll", coordinate, direction, amount });
+			queueInteraction({ action: "scroll", coordinate, direction, amount });
 		},
-		[executeInteraction],
+		[queueInteraction],
 	);
 
 	const handleRemoteDrag = useCallback(
 		(coordinate: { x: number; y: number }, endCoordinate: { x: number; y: number }) => {
-			executeInteraction({ action: "drag", coordinate, endCoordinate });
+			queueInteraction({ action: "drag", coordinate, endCoordinate });
 		},
-		[executeInteraction],
+		[queueInteraction],
 	);
 
-	// Keyboard input batching — all keystrokes go into a queue, flushed after 150ms of inactivity.
-	// The queue preserves order: [{text:"hel"}, {key:"Backspace"}, {text:"lo"}] etc.
-	// Consecutive printable chars are merged into a single {text} entry.
-	const keyQueueRef = useRef<Array<{ text?: string; key?: string }>>([]);
-	const keyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// Keyboard handler — always queue mapped keys; the broker serializes flushes
+	// with in-flight interactions so rapid typing is never dropped.
+	const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+		// Don't capture if user is typing in an input/textarea within the panel
+		const tag = (e.target as HTMLElement).tagName;
+		if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
-	const flushKeyQueue = useCallback(() => {
-		if (keyTimerRef.current) {
-			clearTimeout(keyTimerRef.current);
-			keyTimerRef.current = null;
-		}
-		const queue = keyQueueRef.current;
-		if (queue.length === 0) return;
-		keyQueueRef.current = [];
-		executeInteraction({ action: "type", keys: queue });
-	}, [executeInteraction]);
+		const mapped = mapBrowserKeyEvent(e.key, {
+			ctrlKey: e.ctrlKey,
+			metaKey: e.metaKey,
+			altKey: e.altKey,
+		});
+		if (mapped === "ignore") return;
 
-	// Cleanup flush timer on unmount
-	useEffect(() => {
-		return () => {
-			if (keyTimerRef.current) clearTimeout(keyTimerRef.current);
-		};
+		e.preventDefault();
+		e.stopPropagation();
+		keyBrokerRef.current?.push(mapped);
 	}, []);
-
-	// Keyboard handler — map DOM KeyboardEvent to browser key presses
-	const handleKeyDown = useCallback(
-		(e: React.KeyboardEvent<HTMLDivElement>) => {
-			// Don't capture if user is typing in an input/textarea within the panel
-			const tag = (e.target as HTMLElement).tagName;
-			if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-			if (localInteractionPendingRef.current) return;
-
-			// Map special keys
-			const specialKeys: Record<string, string> = {
-				Enter: "Enter",
-				Tab: "Tab",
-				Escape: "Escape",
-				Backspace: "Backspace",
-				Delete: "Delete",
-				ArrowUp: "ArrowUp",
-				ArrowDown: "ArrowDown",
-				ArrowLeft: "ArrowLeft",
-				ArrowRight: "ArrowRight",
-				Home: "Home",
-				End: "End",
-				PageUp: "PageUp",
-				PageDown: "PageDown",
-				" ": "Space",
-				F1: "F1",
-				F2: "F2",
-				F3: "F3",
-				F4: "F4",
-				F5: "F5",
-				F6: "F6",
-				F7: "F7",
-				F8: "F8",
-				F9: "F9",
-				F10: "F10",
-				F11: "F11",
-				F12: "F12",
-			};
-
-			const queue = keyQueueRef.current;
-			const mappedKey = specialKeys[e.key];
-
-			if (mappedKey) {
-				queue.push({ key: mappedKey });
-			} else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-				// Merge consecutive printable chars into one {text} entry
-				const last = queue[queue.length - 1];
-				if (last?.text != null) {
-					last.text += e.key;
-				} else {
-					queue.push({ text: e.key });
-				}
-			} else {
-				// Unhandled key (Shift, Ctrl alone, etc.) — leave it to the local UI.
-				return;
-			}
-
-			e.preventDefault();
-			e.stopPropagation();
-
-			// Reset the debounce timer
-			if (keyTimerRef.current) clearTimeout(keyTimerRef.current);
-			keyTimerRef.current = setTimeout(flushKeyQueue, 150);
-		},
-		[flushKeyQueue],
-	);
 
 	const isTracing = session.tracing?.active ?? false;
 	const networkRequestCount = session.networkRequestCount ?? 0;

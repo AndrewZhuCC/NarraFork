@@ -11,7 +11,7 @@ import {
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorBufferedMessages as mailbox, narrators } from "../db/schema";
 import {
@@ -256,11 +256,7 @@ function rowById(id: string): MailboxRow | undefined {
 }
 /** SQLite's synchronous ownership probe mirrors the bounded PostgreSQL adapter lookup. */
 function rowByStagingId(stagingId: string): MailboxRow | undefined {
-	const candidates = db
-		.select()
-		.from(mailbox)
-		.where(eq(mailbox.kind, "user_input"))
-		.all();
+	const candidates = db.select().from(mailbox).where(eq(mailbox.kind, "user_input")).all();
 	return candidates.find(
 		(candidate) => json<{ stagingId?: string }>(candidate.metadataJson, {}).stagingId === stagingId,
 	);
@@ -288,6 +284,7 @@ function ensureStagingDirectory(id: string): string {
 }
 interface StagingMetadata {
 	preserveWorkTurn?: boolean;
+	executionIntent?: BufferedMessage["executionIntent"];
 	stagingId?: string;
 	fileReferencesPath?: string;
 	commandTextPath?: string;
@@ -437,12 +434,21 @@ export function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
 		return [new File([Bun.file(s.path)], s.filename, { type: "text/plain" })];
 	});
 }
+/** These inputs must cross the old loop's finalizer (including temporary-model restore). */
+export function mailboxInputRequiresFreshTurn(
+	row: Pick<RuntimeMailboxRow, "metadataJson">,
+): boolean {
+	const intent = json<StagingMetadata>(row.metadataJson, {}).executionIntent;
+	return !!(intent?.modelOverride || intent?.controlCommand);
+}
+
 export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessage {
 	if (row.kind !== "user_input") throw new Error("Expected user mailbox input");
 	const saved = json<SavedBufferedFile[]>(row.textFilePathsJson, []);
 	const payload = json<{ path: string } | null>(row.payloadRefJson, null);
 	const metadata = json<StagingMetadata>(row.metadataJson, {});
 	return {
+		executionIntent: metadata.executionIntent,
 		id: row.id,
 		preserveWorkTurn: metadata.preserveWorkTurn,
 		state: row.state === "failed" ? "failed" : "queued",
@@ -550,6 +556,7 @@ export async function enqueueBufferedMessage(
 	fileReferences?: FileReferenceSnapshot[],
 	frontOrder: "stack" | "fifo" = "stack",
 	preserveWorkTurn = false,
+	executionIntent?: BufferedMessage["executionIntent"],
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
@@ -572,7 +579,7 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId };
+		const metadata: StagingMetadata = { stagingId, executionIntent };
 		if (preserveWorkTurn) metadata.preserveWorkTurn = true;
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);

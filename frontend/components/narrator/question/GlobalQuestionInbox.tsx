@@ -195,23 +195,8 @@ export function HumanAttentionInboxDrawer({
 	currentNarratorId?: string;
 }) {
 	const { t } = useTranslation("narrator");
-	const client = useQueryClient();
-	const navigate = useNavigate();
-	const openSession = useCallback(
-		(narratorId: string) => {
-			// Same-session navigation does not unmount the drawer: close it explicitly.
-			onClose();
-			void navigate({ to: "/narrators/$narratorId", params: { narratorId } });
-		},
-		[navigate, onClose],
-	);
 	const query = useHumanAttention(opened);
 	const items = loadedHumanAttentionItems(query.data?.pages);
-	const { current, others } = groupHumanAttentionByScope(items, currentNarratorId);
-	useEffect(() => {
-		if (opened)
-			void client.invalidateQueries({ queryKey: humanAttentionListKey }, { cancelRefetch: false });
-	}, [client, opened]);
 	useMobileDrawerHistory(opened, onClose);
 	return (
 		<Drawer
@@ -219,6 +204,9 @@ export function HumanAttentionInboxDrawer({
 			onClose={onClose}
 			position="right"
 			size="lg"
+			onKeyDown={(event) => {
+				if (["Enter", "ArrowLeft", "ArrowRight"].includes(event.key)) event.stopPropagation();
+			}}
 			title={
 				<Group gap="xs">
 					<IconInbox size={18} />
@@ -232,65 +220,97 @@ export function HumanAttentionInboxDrawer({
 				</Group>
 			}
 		>
-			<PermEnterHintCtx.Provider value={isolatedPermissionKeys}>
-				{/* Stop portal events before they reach the session's composer shortcuts. */}
-				<Stack
-					gap="lg"
-					onKeyDown={(event) => {
-						if (["Enter", "ArrowLeft", "ArrowRight"].includes(event.key)) event.stopPropagation();
-					}}
-				>
-					<Text size="xs" c="dimmed">
-						{t("humanAttentionDesc")}
-					</Text>
-					{query.isLoading && <Text size="sm">{t("humanAttentionLoading")}</Text>}
-					{query.isError && (
-						<RetryNotice
-							message={t("humanAttentionLoadError")}
-							retry={() => void query.refetch()}
-							busy={query.isFetching}
-						/>
-					)}
-					{!query.isLoading && !query.isError && !query.hasNextPage && !items.length && (
-						<Text size="sm" c="dimmed">
-							{t("humanAttentionEmpty")}
-						</Text>
-					)}
-					{current.length > 0 && (
-						<Stack gap="sm" data-attention-scope="current">
-							<Text size="xs" fw={600} c="dimmed">
-								{t("inboxGroupCurrentSession")}
-							</Text>
-							{current.map((item) => (
-								<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
-							))}
-						</Stack>
-					)}
-					{current.length > 0 && others.length > 0 && <Divider />}
-					{others.length > 0 && (
-						<Stack gap="sm" data-attention-scope="others">
-							{currentNarratorId && (
-								<Text size="xs" fw={600} c="dimmed">
-									{t("inboxGroupOtherSessions")}
-								</Text>
-							)}
-							{others.map((item) => (
-								<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
-							))}
-						</Stack>
-					)}
-					{query.hasNextPage && (
-						<Button
-							variant="light"
-							loading={query.isFetchingNextPage}
-							onClick={() => void query.fetchNextPage()}
-						>
-							{t("humanAttentionLoadMore")}
-						</Button>
-					)}
-				</Stack>
-			</PermEnterHintCtx.Provider>
+			{opened && (
+				<HumanAttentionInboxContent onClose={onClose} currentNarratorId={currentNarratorId} />
+			)}
 		</Drawer>
+	);
+}
+
+/** Shared decision surface. Both drawers use the same authority and private forms. */
+export function HumanAttentionInboxContent({
+	onClose,
+	currentNarratorId,
+}: {
+	onClose: () => void;
+	currentNarratorId?: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const client = useQueryClient();
+	const navigate = useNavigate();
+	const openSession = useCallback(
+		(narratorId: string) => {
+			// Same-session navigation does not unmount a drawer: close it explicitly.
+			onClose();
+			void navigate({ to: "/narrators/$narratorId", params: { narratorId } });
+		},
+		[navigate, onClose],
+	);
+	const query = useHumanAttention();
+	const items = loadedHumanAttentionItems(query.data?.pages);
+	const { current, others } = groupHumanAttentionByScope(items, currentNarratorId);
+	useEffect(() => {
+		void client.invalidateQueries({ queryKey: humanAttentionListKey }, { cancelRefetch: false });
+	}, [client]);
+	return (
+		<PermEnterHintCtx.Provider value={isolatedPermissionKeys}>
+			{/* Stop portal events before they reach the session's composer shortcuts. */}
+			<Stack
+				gap="lg"
+				onKeyDown={(event) => {
+					if (["Enter", "ArrowLeft", "ArrowRight"].includes(event.key)) event.stopPropagation();
+				}}
+			>
+				<Text size="xs" c="dimmed">
+					{t("humanAttentionDesc")}
+				</Text>
+				{query.isLoading && <Text size="sm">{t("humanAttentionLoading")}</Text>}
+				{query.isError && (
+					<RetryNotice
+						message={t("humanAttentionLoadError")}
+						retry={() => void query.refetch()}
+						busy={query.isFetching}
+					/>
+				)}
+				{!query.isLoading && !query.isError && !query.hasNextPage && !items.length && (
+					<Text size="sm" c="dimmed">
+						{t("humanAttentionEmpty")}
+					</Text>
+				)}
+				{current.length > 0 && (
+					<Stack gap="sm" data-attention-scope="current">
+						<Text size="xs" fw={600} c="dimmed">
+							{t("inboxGroupCurrentSession")}
+						</Text>
+						{current.map((item) => (
+							<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
+						))}
+					</Stack>
+				)}
+				{current.length > 0 && others.length > 0 && <Divider />}
+				{others.length > 0 && (
+					<Stack gap="sm" data-attention-scope="others">
+						{currentNarratorId && (
+							<Text size="xs" fw={600} c="dimmed">
+								{t("inboxGroupOtherSessions")}
+							</Text>
+						)}
+						{others.map((item) => (
+							<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
+						))}
+					</Stack>
+				)}
+				{query.hasNextPage && (
+					<Button
+						variant="light"
+						loading={query.isFetchingNextPage}
+						onClick={() => void query.fetchNextPage()}
+					>
+						{t("humanAttentionLoadMore")}
+					</Button>
+				)}
+			</Stack>
+		</PermEnterHintCtx.Provider>
 	);
 }
 

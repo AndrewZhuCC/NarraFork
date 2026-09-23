@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
 	isPreloadedMode,
@@ -106,16 +107,20 @@ import {
 	inboxConsumption,
 	inboxMetadata,
 	materializeClaimedInboxUserMessage,
+	peekInbox,
 	persistClaimedUserInput,
 	releaseInboxClaim,
 	runtimeInbox,
 	wakeInboxIfEligible,
 	withInboxOwner,
 } from "./agent-runtime/inbox";
+import { createInheritedModelRuntime } from "./agent-runtime/inherited-model";
+import { MAILBOX_LIMITS } from "./agent-runtime/limits";
 import { runAgentLoopUnlocked } from "./agent-runtime/orchestrator";
 import {
 	createRuntimeMapView,
 	type ExecutionOwner,
+	getExecutionOwner,
 	isExecutionSuspended,
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
@@ -171,6 +176,7 @@ import {
 	registerConclusionWatcher,
 	resolveManualOverride,
 } from "./subagent-manual-override";
+import { resolveSubagentModelForRun } from "./subagent-model";
 import { isTakenOver } from "./subagent-takeover";
 import { resolveEffectiveTraits } from "./trait-layer-service";
 import { worktreeWatcher } from "./worktree-watcher";
@@ -569,9 +575,21 @@ export async function executeQueuedNewCommand(
 	initialMessage: string,
 ): Promise<string> {
 	const sourceNarrator = await narratorService.getById(active.narratorId);
+	// `/new` spawns an independent primary session, so it must never inherit the
+	// `__parent__` sentinel (prepareNarratorCreation rejects it: only subagents may
+	// follow). Materialize the currently effective model, matching the idle route path.
+	const newModel =
+		sourceNarrator.model === FOLLOW_PARENT_MODEL
+			? (
+					await resolveSubagentModelForRun(
+						sourceNarrator,
+						buffered.createdBy ?? sourceNarrator.ownerUserId,
+					)
+				).model
+			: (sourceNarrator.model ?? undefined);
 	const newNarrator = await narratorService.create({
 		chapterId: null,
-		model: sourceNarrator.model ?? undefined,
+		model: newModel,
 		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
 		permissionMode: sourceNarrator.permissionMode ?? undefined,
 		reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
@@ -724,23 +742,36 @@ export async function resumeNextBufferedMessage(
 	active: ActiveNarrator,
 	locale: Locale,
 ): Promise<void> {
-	return withNarratorStartAdmission(active.narratorId, () =>
+	const dispatch = await withNarratorStartAdmission(active.narratorId, () =>
 		resumeNextBufferedMessageUnlocked(active, locale),
 	);
+	await dispatch?.();
 }
 
 async function resumeNextBufferedMessageUnlocked(
 	active: ActiveNarrator,
 	locale: Locale,
-): Promise<void> {
+): Promise<void | (() => Promise<void>)> {
 	const narratorId = active.narratorId;
 	if (isLoopRunning(narratorId)) return;
 	const inputOwner = tryClaimExecution(narratorId, "tool-replay");
 	if (!inputOwner) return;
 	let claimedRow: RuntimeMailboxRow | undefined;
+	let ownerTransferred = false;
 	try {
-		// Consume one bounded notification batch before adopting the next user input.
-		await drainAndPersistPendingInjections(active);
+		await flushInboxPublicationBarrier(narratorId);
+		// Explicit user work authorizes delivery of its preceding notices even in
+		// plan mode. Drain bounded batches without skipping a mailbox barrier. Cap
+		// passes by the maximum possible non-user backlog and stop on no progress;
+		// yield between batches instead of accumulating their potentially large text.
+		for (let pass = 0; pass < MAILBOX_LIMITS.agentPending + MAILBOX_LIMITS.noticePending; pass++) {
+			const before = await peekInbox(narratorId);
+			if (!before || before.kind === "user_input") break;
+			await drainAndPersistPendingInjections(active);
+			const after = await peekInbox(narratorId);
+			if (!after || after.id === before.id) break;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
 		claimedRow = await claimInboxHead(narratorId, (candidate) => candidate.kind === "user_input");
 		if (!claimedRow) return;
 		const first = projectMailboxUserMessage(claimedRow);
@@ -750,14 +781,15 @@ async function resumeNextBufferedMessageUnlocked(
 		// they are what a restore needs when it has not.
 		const newCommand = parseQueuedNewCommand(first.text, first.commandText);
 		const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
-		if (newCommand) {
-			await withInboxOwner(narratorId, async () => {
+		const controlCommand = first.executionIntent?.controlCommand;
+		if (newCommand || controlCommand) {
+			const commandMessage = await withInboxOwner(narratorId, async () => {
 				const row = claimedRow;
 				if (!row) throw new ValidationError("Buffered command claim missing");
 				try {
 					// PostgreSQL: one queue materialize section; SQLite: the placement transaction.
 					if (getNarratorMessageRefsPort()) {
-						await materializeClaimedInboxUserMessage({
+						return await materializeClaimedInboxUserMessage({
 							claim: inboxClaim(row),
 							reservedMessageId: row.recipientMessageId,
 							narratorId,
@@ -766,9 +798,8 @@ async function resumeNextBufferedMessageUnlocked(
 							commandText: first.commandText,
 							createdBy: first.createdBy,
 						});
-						return;
 					}
-					await narratorService.persistUserMessage(
+					return await narratorService.persistUserMessage(
 						narratorId,
 						first.text,
 						[{ type: "text", text: first.text }],
@@ -782,6 +813,14 @@ async function resumeNextBufferedMessageUnlocked(
 					throw error;
 				}
 			});
+			if (!first.preserveWorkTurn) active._upstreamWorkTurnId = first.id;
+			if (controlCommand) {
+				broadcastToNarrator(narratorId, {
+					type: "user_message",
+					narratorId,
+					message: fileReferenceMessageForDisplay(commandMessage),
+				});
+			}
 		}
 		broadcastToNarrator(narratorId, {
 			type: "buffer_consumed",
@@ -793,7 +832,16 @@ async function resumeNextBufferedMessageUnlocked(
 		const settleAfterTerminalCommand = async () => {
 			// More queued behind this terminal command → keep draining; else settle idle.
 			if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
-				await resumeNextBufferedMessage(active, locale);
+				// Let this terminal command release its outer admission and wake promise
+				// before scheduling a later command that may run for minutes.
+				setImmediate(() => {
+					void wakeInboxIfEligible(narratorId, locale).catch((error) => {
+						logger.warn("Terminal command inbox wake failed", {
+							narratorId,
+							error: String(error),
+						});
+					});
+				});
 				return;
 			}
 			await narratorService
@@ -811,7 +859,45 @@ async function resumeNextBufferedMessageUnlocked(
 			broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(err) });
 		};
 
-		if (newCommand) {
+		if (controlCommand) {
+			// Transfer the epoch, not the start mutex. Publish the controller before
+			// releasing admission so an interrupt during async command setup is retained.
+			const controller = new AbortController();
+			active.abortController = controller;
+			ownerTransferred = true;
+			return async () => {
+				let commandError: unknown;
+				try {
+					await executeQueuedControlCommand(narratorId, first, locale, controller.signal);
+					await cleanupBufferedTextFilesAsync(first.id);
+				} catch (error) {
+					commandError = error;
+				}
+				let nextDispatch: void | (() => Promise<void>);
+				try {
+					nextDispatch = await withNarratorStartAdmission(narratorId, async () => {
+						// A late command must neither settle nor release a newer epoch.
+						if (!inputOwner.isCurrent()) return;
+						if (commandError !== undefined)
+							await handleTerminalCommandError("control command", commandError);
+						inputOwner.release();
+						// Release, next-input claim and idle write share the same admission.
+						// No concurrent accept may start a new owner between these steps.
+						if ((await getBufferedMessagesAsync(narratorId)).length > 0)
+							return resumeNextBufferedMessageUnlocked(active, locale);
+						await narratorService
+							.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
+								substatus: ["unread"],
+							})
+							.catch(() => {});
+					});
+				} finally {
+					// Admission can reject during a revert; compare-and-release is still safe.
+					inputOwner.release();
+				}
+				await nextDispatch?.();
+			};
+		} else if (newCommand) {
 			inputOwner.release();
 			await executeQueuedNewCommand(active, first, newCommand.initialMessage)
 				.then(async (newNarratorId) => {
@@ -895,10 +981,12 @@ async function resumeNextBufferedMessageUnlocked(
 				});
 		}
 	} finally {
-		try {
-			if (claimedRow) await releaseInboxClaim(claimedRow, "Buffered resume did not commit");
-		} finally {
-			inputOwner.release();
+		if (!ownerTransferred) {
+			try {
+				if (claimedRow) await releaseInboxClaim(claimedRow, "Buffered resume did not commit");
+			} finally {
+				inputOwner.release();
+			}
 		}
 	}
 }
@@ -1138,8 +1226,10 @@ async function createNarrator(
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
 
-	const narratorModelRef = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-	const narratorModel = resolveEffectiveModel(narratorModelRef);
+	const inheritedModel =
+		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
+	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
+	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
@@ -1150,11 +1240,16 @@ async function createNarrator(
 		_persistedConversationId: effectiveConversationId ?? null,
 		cwd: narratorCwd,
 		_modelRef: narratorModelRef,
+		_modelSelectionRef: narrator.model ?? FOLLOW_DEFAULT_MODEL,
+		_followParentNarratorId:
+			narrator.model === FOLLOW_PARENT_MODEL ? narrator.parentNarratorId : undefined,
+		_inheritedReasoningEffort: inheritedModel?.reasoningEffort,
 		_settingsRevision: getSettingsRevision(),
 		model: narratorModel,
 		provider: narratorProvider,
 		_reasoningEffortRef: narrator.reasoningEffort ?? null,
 		reasoningEffort:
+			inheritedModel?.reasoningEffort ??
 			narrator.reasoningEffort ??
 			resolveDefaultReasoningEffort(narratorProvider, narratorModel) ??
 			null,
@@ -1845,11 +1940,14 @@ async function deliverPendingInjectionsInOrder(
 	adoptedDeliveries?: AgentMessageDelivery[],
 	adoptedMailbox?: MailboxDeliveryConsumption[],
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
+	active?: ActiveNarrator,
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
 		await migrateLegacyParentInjections(narratorId);
 		const schedule = mode === "busy" ? "onNextTurn" : "none";
 		const parts: string[] = [];
+		const { pendingInjectionUserId } = await import("./parent-injection-queue");
+		let principalSet = false;
 
 		// One injection row PER entry. The queue's global arrival order is the truth, so we
 		// walk `pending` directly rather than grouping consecutive same-kind entries into a
@@ -1885,6 +1983,13 @@ async function deliverPendingInjectionsInOrder(
 					mailboxClaim: inboxClaim(row),
 					recipientMessageId: row.recipientMessageId ?? undefined,
 				};
+				if (active && !principalSet) {
+					const entryUser = pendingInjectionUserId(entry);
+					if (entryUser !== null && entryUser !== undefined) {
+						active._currentUserId = entryUser;
+						principalSet = true;
+					}
+				}
 				const text = await deliverPendingInjection(
 					narratorId,
 					locale,
@@ -1975,7 +2080,7 @@ export async function deliverPendingInjection(
 							alias: task.alias ?? null,
 							title: task.title,
 							status: task.status,
-							preview: task.resultPreview ?? "",
+							preview: task.result ?? "Result snapshot unavailable.",
 							...(task.resultTruncated ? { truncated: true } : {}),
 							// Reader-only navigation target (the agent's own message that produced
 							// this result). Omitted rather than stored as null when absent, so a
@@ -1987,13 +2092,9 @@ export async function deliverPendingInjection(
 				},
 				locale,
 			);
-			// The idle path keeps its own longer wording (full result + how to Await it),
-			// which is what that path has always sent and is asserted elsewhere; the
-			// structured body rides along either way for the reader.
-			const content =
-				mode === "idle"
-					? formatBackgroundCompletionNotifications([task], { includeResult: true })
-					: projected.content;
+			// Completion is useful at either boundary only when it includes the result.
+			// Keep the bounded snapshot in the injected history, not just the UI sidecar.
+			const content = formatBackgroundCompletionNotifications([task], { includeResult: true });
 			const { turnText } = await deliverInjection(narratorId, {
 				...placement,
 				content,
@@ -2109,6 +2210,7 @@ export async function drainAndPersistPendingInjections(
 		undefined,
 		undefined,
 		subagent,
+		active,
 	);
 }
 
@@ -2216,6 +2318,7 @@ export async function drainInjectionsIntoHistory(
 		adoptedDeliveries,
 		adoptedMailbox,
 		subagent,
+		active,
 	);
 	if (eventText) parts.push(eventText);
 	if (subagent) {
@@ -2434,6 +2537,8 @@ export interface ContextManagementOptions {
 	getModel: () => string;
 	/** Dynamic getter for the current provider (supports mid-loop model switching) */
 	getProvider: () => string;
+	/** Current execution principal for summary usage attribution. */
+	getUserId?: () => string | null | undefined;
 	/** Whether this narrator is a subagent (all messages have parentToolUseId) */
 	isSubagent?: boolean;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
@@ -2464,6 +2569,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		locale,
 		getModel,
 		getProvider,
+		getUserId,
 		isSubagent: isSubagentNarrator,
 		onCompactDone,
 		isCompactDone,
@@ -2494,7 +2600,14 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		}
 		const thresholds = getContextThresholds(getModel(), getProvider());
 		if (percentage >= thresholds.compactStart && !compactLocks.has(narratorId)) {
-			triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
+			triggerMidTurnCompact(
+				narratorId,
+				locale,
+				onCompactDone,
+				"background",
+				percentage,
+				getUserId?.(),
+			);
 		}
 	};
 
@@ -2546,6 +2659,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 					mode: "blocking",
 					trigger: "reasoning_only",
 					contextPercentBefore: contextUsagePercentage,
+					userId: getUserId?.(),
 					signal,
 				});
 			} else if (!compacted && compactLocks.has(narratorId)) {
@@ -2880,6 +2994,9 @@ async function feedMessageUnlocked(
 			origin,
 		})) as unknown as typeof narratorMessages.$inferSelect;
 		if (!accepted.preserveWorkTurn) active._upstreamWorkTurnId = claimedInput.id;
+		if (accepted.executionIntent?.modelOverride) {
+			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
+		}
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		throw error;
@@ -3265,6 +3382,212 @@ async function updateToolCallConclusionUnlocked(opts: {
 }
 
 // === Public API ===
+
+export interface UserMessageAdmissionOptions {
+	images?: ImageRef[];
+	locale?: Locale;
+	replyInUserLanguage?: boolean;
+	commandText?: string | null;
+	userId?: string | null;
+	creator?: Parameters<typeof enqueueBufferedMessage>[5];
+	textFiles?: File[];
+	preBashCommand?: string | null;
+	fileReferences?: FileReferenceSnapshot[];
+	priority?: boolean;
+	interrupt?: boolean;
+	executionIntent?: BufferedMessage["executionIntent"];
+	/** Compaction policy may require durable acceptance without starting a loop. */
+	queueOnly?: boolean;
+}
+
+export type UserMessageAdmissionResult =
+	| { buffered: true; id: string; bufferedAt: string }
+	| { buffered: false; userMsg: typeof narratorMessages.$inferSelect };
+
+/** Execute a materialized control under its own execution epoch, never the old loop's. */
+async function executeQueuedControlCommand(
+	narratorId: string,
+	message: BufferedMessage,
+	locale: Locale,
+	signal: AbortSignal,
+): Promise<void> {
+	const { resolveCommand } = await import("./command-service");
+	const handlers = await import("./narrator-service");
+	const userId = message.createdBy ?? undefined;
+	if (!userId) throw new ValidationError("Queued control command has no user principal");
+	const result = await resolveCommand(message.text, narratorId, userId);
+	if (signal.aborted) return;
+	if (!result.resolved) throw new ValidationError("Queued control command is no longer available");
+	if ("bashCommand" in result && !("expandedPrompt" in result)) {
+		await handlers.handleBashCommand(narratorId, result.bashCommand, result.rawCommand, userId, {
+			skipUserMessage: true,
+			signal,
+		});
+	} else if ("loadTool" in result || "loadToolNotFound" in result) {
+		await handlers.handleLoadToolCommand(narratorId, result, locale, userId);
+	} else if ("unloadTool" in result || "unloadToolNotFound" in result) {
+		await handlers.handleUnloadToolCommand(narratorId, result, locale);
+	} else if ("blockSkill" in result) {
+		await handlers.handleBlockSkillCommand(narratorId, result, locale);
+	} else if ("blockAllSkills" in result) {
+		await handlers.handleBlockAllSkillsCommand(narratorId, result, locale);
+	} else if ("unblockSkill" in result) {
+		await handlers.handleUnblockSkillCommand(narratorId, result, locale);
+	} else if ("unblockAllSkills" in result) {
+		await handlers.handleUnblockAllSkillsCommand(narratorId, result, locale);
+	} else {
+		throw new ValidationError("Unsupported queued control command");
+	}
+}
+
+/**
+ * HTTP user-input admission. Acceptance is durable, not a promise to own the next
+ * turn: an earlier mailbox row or publication barrier must produce 202, not an
+ * error that restores an already-accepted draft and deletes its uploaded images.
+ *
+ * The start admission also serializes the live loop's user-input claim. An
+ * interrupting input is queued before aborting the captured old owner; no finalizer
+ * is awaited under this lock, and no new owner can be accidentally interrupted.
+ */
+export async function acceptUserMessage(
+	narratorId: string,
+	prompt: string,
+	options: UserMessageAdmissionOptions = {},
+): Promise<UserMessageAdmissionResult> {
+	const locale = options.locale ?? "en";
+	const result = await withNarratorStartAdmission(
+		narratorId,
+		async (): Promise<UserMessageAdmissionResult> => {
+			const narrator = await narratorService.getById(narratorId);
+			if (isSubagentVariant(narrator.variant))
+				throw new ValidationError("Subagent messages must be sent through resumeSubagent");
+			const oldOwner = getExecutionOwner(narratorId);
+			const oldController = activeNarrators.get(narratorId)?.abortController;
+			const oldRecovery = plannedUpdateRecoveryControls.get(narratorId);
+			const busy = isNarratorRuntimeBusy(narratorId) || isLoopRunning(narratorId);
+			const inputOwner =
+				!busy && !options.queueOnly ? tryClaimExecution(narratorId, "tool-replay") : undefined;
+			try {
+				const accepted = await enqueueBufferedMessage(
+					narratorId,
+					prompt,
+					options.images,
+					options.commandText,
+					options.userId,
+					options.creator,
+					options.textFiles,
+					options.priority || options.interrupt ? "front" : "back",
+					options.preBashCommand,
+					options.fileReferences,
+					"stack",
+					false,
+					options.executionIntent,
+				);
+				if (!accepted.ok) throw new ValidationError("Message queue is full");
+				const queued = {
+					buffered: true as const,
+					id: accepted.id,
+					bufferedAt: accepted.bufferedAt,
+				};
+				// From here onward the mailbox owns the payload. Dispatch/notification failure
+				// must not make HTTP callers retry the same input or discard its attachments.
+				let claimed: RuntimeMailboxRow | undefined;
+				try {
+					if (options.interrupt && busy) {
+						const ownerUnchanged = getExecutionOwner(narratorId) === oldOwner;
+						const controllerUnchanged =
+							activeNarrators.get(narratorId)?.abortController === oldController;
+						const recoveryUnchanged = plannedUpdateRecoveryControls.get(narratorId) === oldRecovery;
+						if (ownerUnchanged && controllerUnchanged && recoveryUnchanged)
+							interruptNarrator(narratorId);
+					} else if (options.priority && busy) {
+						requestBufferedMessageSoftStop(narratorId);
+					}
+					if (busy) await reconcileRunningStatus(narratorId);
+					if (inputOwner?.isCurrent()) {
+						const active = await ensureNarrator(narratorId, locale, options.replyInUserLanguage);
+						await flushInboxPublicationBarrier(narratorId);
+						await drainAndPersistPendingInjections(active);
+						// A command queued while busy may reach admission after the old loop
+						// exits. Leave it to the command-aware buffered consumer, not feedMessage.
+						const queuedCommand =
+							options.executionIntent?.controlCommand ||
+							parseQueuedNewCommand(prompt, options.commandText) ||
+							parseQueuedGoalCommand(prompt, options.commandText);
+						claimed = queuedCommand
+							? undefined
+							: await claimInboxHead(
+									narratorId,
+									(row) => row.id === accepted.id && row.kind === "user_input",
+								);
+						if (claimed) {
+							const { userMsg, userBroadcasted } = await feedMessage(
+								narratorId,
+								prompt,
+								options.images,
+								locale,
+								options.replyInUserLanguage,
+								options.commandText,
+								options.userId,
+								options.textFiles,
+								options.preBashCommand,
+								{
+									bufferedDelivery: true,
+									bufferedId: accepted.id,
+									bufferedRow: claimed,
+									bufferedOwner: inputOwner,
+								},
+								undefined,
+								options.fileReferences,
+							);
+							if (!userBroadcasted)
+								broadcastToNarrator(narratorId, {
+									type: "user_message",
+									narratorId,
+									message: fileReferenceMessageForDisplay(userMsg),
+								});
+							return { buffered: false, userMsg };
+						}
+					}
+					broadcastToNarrator(narratorId, {
+						type: "buffer_set",
+						narratorId,
+						messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+					});
+				} catch (error) {
+					// feedMessage can fail before entering its own claim cleanup (for
+					// example while resolving the session). Never strand this owner's claim.
+					if (claimed)
+						await releaseInboxClaim(claimed, error).catch((releaseError) => {
+							logger.warn("Accepted user input claim release deferred", {
+								narratorId,
+								messageId: accepted.id,
+								error: String(releaseError),
+							});
+						});
+					logger.warn("Accepted user input dispatch deferred", {
+						narratorId,
+						messageId: accepted.id,
+						error: String(error),
+					});
+				}
+				return queued;
+			} finally {
+				inputOwner?.release();
+			}
+		},
+	);
+	if (result.buffered) {
+		// Outside start admission: waking takes the same lock, so awaiting it inside
+		// would deadlock. The wake rechecks compactLocks too: compaction may have
+		// finished while an attachment was staging, before there was anything to drain.
+		// A busy old loop will wake the inbox again after finalization.
+		void wakeInboxIfEligible(narratorId, locale).catch((error) => {
+			logger.warn("Accepted user input wake deferred", { narratorId, error: String(error) });
+		});
+	}
+	return result;
+}
 
 /**
  * Send a message to a narrator (fire-and-forget).
@@ -3950,8 +4273,8 @@ async function startSubagentInjectionContinuation(
  * are queued now precisely because the recovery claim made the narrator look busy.
  *
  * Never competes with a live owner, and repairs a status row that outlived recovery.
- * Unlike automatic goal/inbound continuation, queued user input must also resume in
- * plan mode: it is an explicit instruction, not permission to leave planning.
+ * Queued user input is explicit work, including in plan mode; only autonomous
+ * goal/inbound continuation must refuse to wake a plan-mode narrator.
  */
 export async function resumeBufferedMessagesIfIdle(
 	narratorId: string,
@@ -3959,7 +4282,7 @@ export async function resumeBufferedMessagesIfIdle(
 	replyInUserLanguage = false,
 ): Promise<{ resumed: boolean }> {
 	if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
-	return continuationStartLock.acquire(narratorId, async () => {
+	const result = await continuationStartLock.acquire(narratorId, async () => {
 		if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
 		// A live loop (or any other runtime owner) will consume the queue itself.
 		if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
@@ -3975,9 +4298,11 @@ export async function resumeBufferedMessagesIfIdle(
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { resumed: false };
 
-		await resumeNextBufferedMessage(active, locale);
-		return { resumed: true };
+		const dispatch = await resumeNextBufferedMessageUnlocked(active, locale);
+		return { resumed: true, dispatch };
 	});
+	if ("dispatch" in result) await result.dispatch?.();
+	return { resumed: result.resumed };
 }
 
 /**
@@ -6735,9 +7060,78 @@ export function resolveRuntimeReasoningEffort(
 	return reasoningEffort ?? resolveDefaultReasoningEffort(provider, model) ?? null;
 }
 
+export const inheritedModelRuntime = createInheritedModelRuntime({
+	getActive: (id) => activeNarrators.get(id),
+	activeValues: () => activeNarrators.values(),
+	readNarrator: (id) =>
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { model: true, parentNarratorId: true, subagentType: true, reasoningEffort: true },
+		}),
+	resolve: async (narrator, actingUserId, stickyProvider) => {
+		const settingsRevision = getSettingsRevision();
+		return {
+			...(await resolveSubagentModelForRun(narrator, actingUserId, stickyProvider)),
+			settingsRevision,
+		};
+	},
+	apply: (active, resolved) => {
+		active._modelRef = resolved.modelRef;
+		active.model = resolved.model;
+		active.provider = resolveProvider(resolved.model);
+		active._settingsRevision = resolved.settingsRevision;
+		active._inheritedReasoningEffort = resolved.reasoningEffort;
+		active.reasoningEffort = resolveRuntimeReasoningEffort(
+			active.provider,
+			active.model,
+			resolved.reasoningEffort ?? active._reasoningEffortRef,
+		);
+		broadcastToNarrator(active.narratorId, {
+			type: "model_changed",
+			narratorId: active.narratorId,
+			model: FOLLOW_PARENT_MODEL,
+		});
+		broadcastToNarrator(active.narratorId, {
+			type: "model_settings_changed",
+			narratorId: active.narratorId,
+			model: active.model,
+			reasoningEffort: active.reasoningEffort ?? null,
+			status: active._loopRunning ? "pending" : "updated",
+			applyAt: active._loopRunning ? "next_model_request" : "next_request",
+		});
+	},
+	reportError: (active, error) => {
+		logger.warn("Failed to refresh inherited runtime model", {
+			narratorId: active.narratorId,
+			error: String(error),
+		});
+	},
+});
+
+/** Await only at request boundaries, never cancel an already-running provider request. */
+export async function settleNarratorRuntimeModel(active: ActiveNarrator): Promise<void> {
+	await inheritedModelRuntime.settle(active);
+	while (
+		active.alive &&
+		active._modelSelectionRef === FOLLOW_PARENT_MODEL &&
+		active._settingsRevision !== getSettingsRevision()
+	) {
+		// A default/aggregation change must go through pool policy again, not the
+		// ordinary resolveEffectiveModel shortcut (which knows nothing about ACL).
+		inheritedModelRuntime.refresh(active);
+		await inheritedModelRuntime.settle(active);
+	}
+}
+
 export function updateNarratorModel(narratorId: string, model: string): void {
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
+		inheritedModelRuntime.select(active, model || FOLLOW_DEFAULT_MODEL);
+		if (model === FOLLOW_PARENT_MODEL) {
+			inheritedModelRuntime.refresh(active);
+			inheritedModelRuntime.parentChanged(narratorId);
+			return;
+		}
 		active._modelRef = model || FOLLOW_DEFAULT_MODEL;
 		active._settingsRevision = getSettingsRevision();
 		const effectiveModel = resolveEffectiveModel(active._modelRef, active.provider);
@@ -6762,7 +7156,10 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
-	} else if (updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))) {
+	} else if (
+		model !== FOLLOW_PARENT_MODEL &&
+		updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))
+	) {
 		// Subagent: update lightweight settings map; loop picks it up via getRuntimeSettingsOverride
 		const effectiveModel = resolveEffectiveModel(model);
 		const sa = activeSubagentSettings.get(narratorId);
@@ -6775,6 +7172,7 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			applyAt: "next_model_request",
 		});
 	}
+	inheritedModelRuntime.parentChanged(narratorId);
 }
 
 export function updateNarratorReasoningEffort(
@@ -6787,7 +7185,7 @@ export function updateNarratorReasoningEffort(
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
 			active.model,
-			active._reasoningEffortRef,
+			active._inheritedReasoningEffort ?? reasoningEffort,
 		);
 		broadcastToNarrator(narratorId, {
 			type: "model_settings_changed",
@@ -6811,11 +7209,30 @@ export function updateNarratorReasoningEffort(
 	}
 }
 
-/**
- * Set a temporary model override for the current agent loop.
- * Persists the original model to DB so it survives server restarts.
- * After the loop finishes, the model will be restored automatically.
- */
+/** Apply only after the input owns execution and its predecessor has finalized. */
+async function applyAcceptedModelOverride(
+	narratorId: string,
+	override: NonNullable<BufferedMessage["executionIntent"]>["modelOverride"],
+): Promise<void> {
+	if (!override?.model) return;
+	const narrator = await narratorService.getById(narratorId);
+	// Both fields change together. A retried temporary override must preserve the
+	// original baseline, and a permanent override must clear any stale restore marker.
+	await db
+		.update(narrators)
+		.set({
+			model: override.model,
+			pendingModelRestore:
+				override.mode === "temporary"
+					? (narrator.pendingModelRestore ?? narrator.model ?? "__default__")
+					: null,
+			updatedAt: new Date().toISOString(),
+		})
+		.where(eq(narrators.id, narratorId));
+	updateNarratorModel(narratorId, override.model);
+}
+
+/** Persist the original model so the loop finalizer (or startup recovery) can restore it. */
 export async function setTemporaryModelRestore(
 	narratorId: string,
 	originalModel: string,

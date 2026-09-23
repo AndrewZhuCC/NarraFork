@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +11,16 @@ import {
 } from "./run-migrations";
 
 let sqlite: Database | undefined;
+
+const committedMigrationWhens = new Set(
+	(
+		JSON.parse(
+			readFileSync(new URL("../../drizzle/meta/_journal.json", import.meta.url), "utf8"),
+		) as {
+			entries: Array<{ when: number }>;
+		}
+	).entries.map((entry) => entry.when),
+);
 
 afterEach(() => {
 	sqlite?.close();
@@ -626,53 +636,46 @@ describe("hash-based migration self-heal", () => {
 		)?.hash;
 	}
 
-	// folderMillis of the migration that creates narrator_tool_continuations (0090) — a
-	// pure additive migration — and of a destructive rebuild migration (0028 benchmark_runs).
-	const TOOL_CONTINUATIONS_WHEN = 1784524348158; // 0090_public_nextwave
-	const BENCHMARK_RUNS_WHEN = 1777102252438; // 0028_pale_silhouette (DROP+RENAME rebuild)
+	// Present in the compressed local baseline: 0014 creates notifications, 0010 rebuilds narrators.
+	const NOTIFICATIONS_WHEN = 1790156684839;
+	const NARRATORS_REBUILD_WHEN = 1789350740582;
 
-	test("recreates a missing table after the watermark was polluted (the real incident)", async () => {
+	test("recreates a missing notifications table despite a poisoned watermark", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
-		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(true);
+		expect(tableExists(sqlite, "notifications")).toBe(true);
 
-		// Simulate the dirty database: the table and its migration hash are gone, but later
-		// migrations stay applied, and a poisoned row lifts the MAX(created_at) watermark far
-		// past every journal entry — exactly what makes Drizzle's migrate() skip the gap.
-		const removedHash = migrationHashByWhen(sqlite, TOOL_CONTINUATIONS_WHEN);
+		// Remove the real 0014 hash and table; a later foreign-branch timestamp alone must
+		// not mask the missing migration from the hash-based executor.
+		const removedHash = migrationHashByWhen(sqlite, NOTIFICATIONS_WHEN);
 		expect(removedHash).toBeDefined();
-		sqlite.run("DROP TABLE narrator_tool_continuations");
-		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [TOOL_CONTINUATIONS_WHEN]);
+		sqlite.run("DROP TABLE notifications");
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [NOTIFICATIONS_WHEN]);
 		sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
 			"forked-branch-marker",
 			9999999999999,
 		]);
-		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(false);
+		expect(tableExists(sqlite, "notifications")).toBe(false);
 
-		// Re-running migrations must rebuild the missing table and re-stamp its hash.
 		await runMigrations(sqlite);
-		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(true);
-		expect(migrationHashByWhen(sqlite, TOOL_CONTINUATIONS_WHEN)).toBe(removedHash);
-
-		// Column / index / foreign-key shape matches the committed migration.
+		expect(tableExists(sqlite, "notifications")).toBe(true);
+		expect(migrationHashByWhen(sqlite, NOTIFICATIONS_WHEN)).toBe(removedHash);
 		const columns = (
-			sqlite.prepare("PRAGMA table_info(narrator_tool_continuations)").all() as Array<{
-				name: string;
-			}>
+			sqlite.prepare("PRAGMA table_info(notifications)").all() as Array<{ name: string }>
 		).map((row) => row.name);
-		expect(columns).toContain("tool_call_id");
-		expect(columns).toContain("update_epoch");
+		expect(columns).toContain("source_key");
+		expect(columns).toContain("status");
 		const indexes = (
 			sqlite
 				.prepare(
-					"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='narrator_tool_continuations' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+					"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='notifications' AND name NOT LIKE 'sqlite_%' ORDER BY name",
 				)
 				.all() as Array<{ name: string }>
 		).map((row) => row.name);
 		expect(indexes).toEqual([
-			"idx_tool_continuations_epoch_state",
-			"idx_tool_continuations_narrator_state",
-			"idx_tool_continuations_tool_call",
+			"idx_notifications_user_created",
+			"idx_notifications_user_kind_source",
+			"idx_notifications_user_status_created",
 		]);
 	});
 
@@ -684,49 +687,33 @@ describe("hash-based migration self-heal", () => {
 		expect(hashCount(sqlite)).toBe(before);
 	});
 
-	test("does NOT re-run a destructive migration whose target table already exists (dirty hole)", async () => {
+	test("does NOT re-run a destructive narrator rebuild across a real journal hash hole", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
-		sqlite.run("PRAGMA foreign_keys = ON");
-
-		// Seed a benchmark_runs row (the destructive 0028 migration rebuilds this table).
-		sqlite.run("INSERT INTO benchmark_suites (id, name, created_at) VALUES (?, ?, ?)", [
-			"suite-1",
-			"Suite",
-			"now",
-		]);
 		sqlite.run(
-			"INSERT INTO benchmark_runs (id, suite_id, name, model, created_at) VALUES (?, ?, ?, ?, ?)",
-			["run-1", "suite-1", "Run", "model-x", "now"],
+			"INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('kept', 'preserved', 'now', 'now')",
 		);
 
-		// Make 0028's hash a "hole": remove it while every later migration stays applied.
-		// benchmark_runs keeps its final structure and its row.
-		const removedHash = migrationHashByWhen(sqlite, BENCHMARK_RUNS_WHEN);
+		// 0010 rebuilds narrators with DROP+RENAME; later 0011–0014 hashes remain stamped.
+		const removedHash = migrationHashByWhen(sqlite, NARRATORS_REBUILD_WHEN);
 		expect(removedHash).toBeDefined();
-		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [BENCHMARK_RUNS_WHEN]);
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [NARRATORS_REBUILD_WHEN]);
+		expect(migrationHashByWhen(sqlite, NARRATORS_REBUILD_WHEN)).toBeUndefined();
 
-		// Re-running must NOT drop/rebuild benchmark_runs (that would delete the row). It only
-		// re-stamps the hash because the table already holds the migration's final shape.
 		await runMigrations(sqlite);
-		expect(
-			(sqlite.prepare("SELECT COUNT(*) AS count FROM benchmark_runs").get() as { count: number })
-				.count,
-		).toBe(1);
-		expect(migrationHashByWhen(sqlite, BENCHMARK_RUNS_WHEN)).toBe(removedHash);
+		expect(sqlite.prepare("SELECT title FROM narrators WHERE id = 'kept'").get()).toEqual({
+			title: "preserved",
+		});
+		expect(migrationHashByWhen(sqlite, NARRATORS_REBUILD_WHEN)).toBe(removedHash);
 	});
 
-	test("DOES run a destructive migration on a fresh database (target created earlier in the same run)", async () => {
-		// A fresh database applies the entire journal in one run. The destructive rebuild
-		// migrations must execute normally so the final foreign-key/index shape is correct;
-		// they must NOT be mistaken for "already effective" just because an earlier migration
-		// in the same run created the target table. Covered end-to-end by the cascade tests
-		// above (which assert ON DELETE cascade only the 0091 rebuild produces); here we assert
-		// the executor stamped every journal entry with zero skipped rebuilds.
+	test("DOES run destructive migrations on a fresh database (targets created earlier)", async () => {
+		// A fresh database applies the entire journal in one run. Rebuilds must not be
+		// mistaken for already-effective holes because earlier entries created their tables.
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
-		// All destructive rebuild targets exist with their post-rebuild shape.
-		expect(tableExists(sqlite, "benchmark_runs")).toBe(true);
+		expect(tableExists(sqlite, "narrators")).toBe(true);
+		expect(tableExists(sqlite, "file_change_execution_segments")).toBe(true);
 		expect(tableExists(sqlite, "terminal_view_state")).toBe(true);
 		const cascade = (
 			sqlite.prepare("PRAGMA foreign_key_list(terminal_view_state)").all() as Array<{
@@ -861,8 +848,10 @@ describe("destructive migration statement-level error tolerance", () => {
 });
 
 describe("fast_mode_override backfill (real migration replay)", () => {
-	// folderMillis of 0104_lame_alice, the migration that adds narrators.fast_mode_override.
+	// The compressed local baseline already creates the column in 0001. Keep the
+	// original upgrade tests executable only where the pre-0104 history exists.
 	const FAST_MODE_OVERRIDE_WHEN = 1785722772073;
+	const legacyTest = test.skipIf(!committedMigrationWhens.has(FAST_MODE_OVERRIDE_WHEN));
 
 	function overrideOf(database: Database, narratorId: string): string {
 		return (
@@ -897,7 +886,7 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 		return database;
 	}
 
-	test("pins narrators that had fast mode ON so the new default cannot silently disable them", async () => {
+	legacyTest("pins fast-mode ON narrators across upgrade", async () => {
 		sqlite = await databaseBeforeFastModeOverride();
 
 		await runMigrations(sqlite);
@@ -905,7 +894,7 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 		expect(overrideOf(sqlite, "narrator-fast")).toBe("on");
 	});
 
-	test("leaves narrators that had fast mode OFF on inherit so they follow the user default", async () => {
+	legacyTest("leaves fast-mode OFF narrators inheriting the default", async () => {
 		sqlite = await databaseBeforeFastModeOverride();
 
 		await runMigrations(sqlite);
@@ -913,7 +902,7 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 		expect(overrideOf(sqlite, "narrator-slow")).toBe("inherit");
 	});
 
-	test("does not re-pin a narrator that later chose inherit while its legacy mirror stayed on", async () => {
+	legacyTest("never re-pins an explicit inherit choice on repeat migration", async () => {
 		// The deprecated fast_mode column is only a mirror; once the column exists the
 		// backfill must never run again, or a user's explicit "follow default" choice
 		// would be reverted on every startup.
@@ -927,11 +916,23 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 
 		expect(overrideOf(sqlite, "narrator-fast")).toBe("inherit");
 	});
+
+	test("compressed baseline preserves explicit fast-mode overrides on repeat migration", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		sqlite.run(
+			"INSERT INTO narrators (id, fast_mode, fast_mode_override, created_at, updated_at) VALUES ('fast', 1, 'inherit', 'now', 'now'), ('pinned', 0, 'on', 'now', 'now')",
+		);
+		await runMigrations(sqlite);
+		expect(overrideOf(sqlite, "fast")).toBe("inherit");
+		expect(overrideOf(sqlite, "pinned")).toBe("on");
+	});
 });
 
 describe("narrator visibility backfill (real migration replay)", () => {
-	// folderMillis of 0125_salty_iron_fist, the migration that adds narrators.visibility.
+	// Pre-ACL replay is unavailable after the local history was compressed into 0001.
 	const NARRATOR_VISIBILITY_WHEN = 1786791964480;
+	const legacyTest = test.skipIf(!committedMigrationWhens.has(NARRATOR_VISIBILITY_WHEN));
 
 	function visibilityOf(database: Database, narratorId: string): string {
 		return (
@@ -987,7 +988,7 @@ describe("narrator visibility backfill (real migration replay)", () => {
 		return database;
 	}
 
-	test("publishes pre-ACL narrators so an upgrade never hides existing work", async () => {
+	legacyTest("publishes pre-ACL narrators so an upgrade never hides existing work", async () => {
 		sqlite = await databaseBeforeNarratorVisibility();
 
 		await runMigrations(sqlite);
@@ -1006,7 +1007,7 @@ describe("narrator visibility backfill (real migration replay)", () => {
 		).toBe(true);
 	});
 
-	test("leaves the owner null so only admins can re-home a legacy narrator", async () => {
+	legacyTest("leaves the owner null so only admins can re-home a legacy narrator", async () => {
 		sqlite = await databaseBeforeNarratorVisibility();
 
 		await runMigrations(sqlite);
@@ -1017,7 +1018,7 @@ describe("narrator visibility backfill (real migration replay)", () => {
 		expect(row.owner).toBeNull();
 	});
 
-	test("does not re-publish a legacy narrator an admin later made private", async () => {
+	legacyTest("does not re-publish a legacy narrator an admin later made private", async () => {
 		// The whole reason the backfill is gated on the column's prior absence: a
 		// heuristic re-run would keep undoing a deliberate "make this private again".
 		sqlite = await databaseBeforeNarratorVisibility();
@@ -1029,7 +1030,7 @@ describe("narrator visibility backfill (real migration replay)", () => {
 		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("private");
 	});
 
-	test("leaves narrators created after the upgrade private by default", async () => {
+	legacyTest("leaves narrators created after the upgrade private by default", async () => {
 		sqlite = await databaseBeforeNarratorVisibility();
 		await runMigrations(sqlite);
 		sqlite.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
@@ -1041,6 +1042,26 @@ describe("narrator visibility backfill (real migration replay)", () => {
 		await runMigrations(sqlite);
 
 		expect(visibilityOf(sqlite, "narrator-new")).toBe("private");
+	});
+
+	test("compressed baseline retains narrator visibility decisions and null owner", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		sqlite.run(
+			"INSERT INTO narrators (id, created_at, updated_at) VALUES ('legacy', 'now', 'now')",
+		);
+		expect(visibilityOf(sqlite, "legacy")).toBe("private");
+		sqlite.run("UPDATE narrators SET visibility = 'public' WHERE id = 'legacy'");
+		await runMigrations(sqlite);
+		expect(
+			sqlite.prepare("SELECT visibility, owner_user_id FROM narrators WHERE id='legacy'").get(),
+		).toEqual({
+			visibility: "public",
+			owner_user_id: null,
+		});
+		sqlite.run("UPDATE narrators SET visibility = 'private' WHERE id = 'legacy'");
+		await runMigrations(sqlite);
+		expect(visibilityOf(sqlite, "legacy")).toBe("private");
 	});
 });
 
@@ -1061,8 +1082,10 @@ describe("narrator visibility backfill (real migration replay)", () => {
  * and `project` cases below are what fail.
  */
 describe("narrator write audience is never widened by migrating (real migration replay)", () => {
-	// folderMillis of 0138_pale_komodo, the migration that adds narrators.write_audience.
+	// 0138 is absent in the compressed baseline; keep the historical upgrade regression
+	// without mistaking an existing 0001 column for a freshly added column.
 	const WRITE_AUDIENCE_WHEN = 1787393037284;
+	const legacyTest = test.skipIf(!committedMigrationWhens.has(WRITE_AUDIENCE_WHEN));
 
 	function writeAudienceOf(database: Database, narratorId: string): string {
 		return (
@@ -1098,7 +1121,7 @@ describe("narrator write audience is never widened by migrating (real migration 
 		return database;
 	}
 
-	test("a publicly READABLE session does not become publicly drivable", async () => {
+	legacyTest("a publicly READABLE session does not become publicly drivable", async () => {
 		sqlite = await databaseBeforeWriteAudience();
 
 		await runMigrations(sqlite);
@@ -1109,7 +1132,7 @@ describe("narrator write audience is never widened by migrating (real migration 
 		expect(writeAudienceOf(sqlite, "narrator-public")).toBe("owner");
 	});
 
-	test("a project-visible session does not become project-drivable", async () => {
+	legacyTest("a project-visible session does not become project-drivable", async () => {
 		sqlite = await databaseBeforeWriteAudience();
 
 		await runMigrations(sqlite);
@@ -1119,7 +1142,7 @@ describe("narrator write audience is never widened by migrating (real migration 
 		expect(writeAudienceOf(sqlite, "narrator-project")).toBe("owner");
 	});
 
-	test("a private session stays owner-only", async () => {
+	legacyTest("a private session stays owner-only", async () => {
 		sqlite = await databaseBeforeWriteAudience();
 
 		await runMigrations(sqlite);
@@ -1127,7 +1150,7 @@ describe("narrator write audience is never widened by migrating (real migration 
 		expect(writeAudienceOf(sqlite, "narrator-private")).toBe("owner");
 	});
 
-	test("an explicitly widened session is left alone by later migrations", async () => {
+	legacyTest("an explicitly widened session is left alone by later migrations", async () => {
 		// The other direction: once an owner deliberately opens a session up, replaying
 		// migrations must not pull it back. Nothing should be writing this column during a
 		// migration at all, and this is what would catch a "corrective" one.
@@ -1140,7 +1163,7 @@ describe("narrator write audience is never widened by migrating (real migration 
 		expect(writeAudienceOf(sqlite, "narrator-public")).toBe("public");
 	});
 
-	test("narrators created after the upgrade default to owner-only", async () => {
+	legacyTest("narrators created after the upgrade default to owner-only", async () => {
 		sqlite = await databaseBeforeWriteAudience();
 		await runMigrations(sqlite);
 		sqlite.run(
@@ -1153,6 +1176,24 @@ describe("narrator write audience is never widened by migrating (real migration 
 		// A new public session is a choice about who may WATCH. The service layer decides
 		// its write audience at creation; migrations never revisit it.
 		expect(writeAudienceOf(sqlite, "narrator-after")).toBe("owner");
+	});
+
+	test("compressed baseline never derives write audience from read visibility", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		for (const visibility of ["public", "project", "private"]) {
+			sqlite.run(
+				"INSERT INTO narrators (id, visibility, created_at, updated_at) VALUES (?, ?, 'now', 'now')",
+				[visibility, visibility],
+			);
+		}
+		await runMigrations(sqlite);
+		for (const visibility of ["public", "project", "private"]) {
+			expect(writeAudienceOf(sqlite, visibility)).toBe("owner");
+		}
+		sqlite.run("UPDATE narrators SET write_audience = 'public' WHERE id = 'public'");
+		await runMigrations(sqlite);
+		expect(writeAudienceOf(sqlite, "public")).toBe("public");
 	});
 });
 
@@ -1315,11 +1356,16 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		);
 	}
 
-	// folderMillis of 0103_redundant_valkyrie — the migration from the reported incident: it
-	// drops idx_blacklist_cmds_narrator_pattern and replaces it with two partial indexes.
+	// 0103/0093 are unavailable in the compressed baseline. The synthetic index/drop
+	// fixtures below remain active even when these historical replay cases are skipped.
 	const BLACKLIST_PARTIAL_INDEX_WHEN = 1785508212529;
+	const RETIRED_COLUMN_WHEN = 1785085127123;
+	const legacyBlacklistTest = test.skipIf(
+		!committedMigrationWhens.has(BLACKLIST_PARTIAL_INDEX_WHEN),
+	);
+	const legacyRetiredTest = test.skipIf(!committedMigrationWhens.has(RETIRED_COLUMN_WHEN));
 
-	test("heals the reported incident: replaying 0103 when its dropped index is already gone", async () => {
+	legacyBlacklistTest("0103 hash hole tolerates an already-dropped index", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
 
@@ -1358,7 +1404,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 
 		await runMigrations(sqlite);
 
-		expect(stampedHashes(sqlite)).toBeGreaterThan(0);
+		expect(stampedHashes(sqlite)).toBe(committedMigrationWhens.size);
 		expect(sqlite.prepare("SELECT title FROM narrators WHERE id='preserved'").get()).toEqual({
 			title: "keep-title",
 		});
@@ -1382,7 +1428,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		"ALTER TABLE `__new_narrators` RENAME TO `narrators`;",
 	];
 
-	test("heals a real 0093 hash hole after 0170 without restoring the retired column", async () => {
+	legacyRetiredTest("0093 hash hole keeps the 0170-retired column absent", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
 		sqlite.run(
@@ -1512,9 +1558,16 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			"ALTER TABLE `t` DROP COLUMN `present`;",
 		]);
 
-		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
-			/no such column/i,
-		);
+		let error: unknown;
+		try {
+			applyPendingMigrationsByHash(sqlite, folder);
+		} catch (caught) {
+			error = caught;
+		}
+		// Bun 1.4.2 reports "SQL logic error" here; the actual SQLite failure must
+		// still propagate rather than being forgiven as an already-satisfied DROP.
+		expect(error).toBeInstanceOf(SQLiteError);
+		expect(error).toMatchObject({ code: "SQLITE_ERROR" });
 		expect(columnNames(sqlite, "t")).toEqual(["id", "present"]);
 		expect(stampedHashes(sqlite)).toBe(0);
 	});

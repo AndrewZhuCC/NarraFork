@@ -88,8 +88,9 @@ class InstallTest(unittest.TestCase):
                 kwargs['stderr'].write(b'validation failed')
                 return installer.subprocess.CompletedProcess(command, 1)
             values = dict(zip(command[2::2], command[3::2]))
-            pending = [{'tag': '0012_curved_bloodstorm',
-                        'hash': installer.digest(self.repo / 'drizzle/0012_curved_bloodstorm.sql')}]
+            journal = json.loads((self.repo / 'drizzle/meta/_journal.json').read_text())
+            tag = journal['entries'][-1]['tag']
+            pending = [{'tag': tag, 'hash': installer.digest(self.repo / 'drizzle' / (tag + '.sql'))}]
             report = {
                 'status': 'ok', 'validator': 1,
                 'backupSha256': values['--backup-sha256'],
@@ -134,9 +135,8 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.link.resolve(), self.target)
         self.assertEqual(json.loads(self.placed.read_text())['newBinaryPath'], str(self.target))
         backups = list(self.state.glob('backup-before-stable-signing-*'))
-        self.assertEqual(len(backups), 2)
-        self.assertTrue(any((p / 'narrafork-server').exists() and
-                            (p / 'narrafork-server').read_bytes() == b'first signed build' for p in backups))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / 'narrafork-server').read_bytes(), b'first signed build')
 
     def test_failed_post_install_check_restores_previous_stable_binary_and_pointers(self):
         self.install()
@@ -168,6 +168,24 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(record['pendingMigrations'], ['0012_curved_bloodstorm'])
         self.assertEqual(installer.digest(backup / 'narrafork.db'),
                          record['migrationValidation']['backupSha256'])
+
+    def test_reviewed_0014_requires_validation_before_install(self):
+        journal_path = self.repo / 'drizzle/meta/_journal.json'
+        journal = json.loads(journal_path.read_text())
+        journal['entries'].append({'tag': '0014_blue_tomorrow_man'})
+        journal_path.write_text(json.dumps(journal))
+        (self.repo / 'drizzle/0014_blue_tomorrow_man.sql').write_text('SELECT 14;')
+        with self.assertRaisesRegex(AssertionError, 'Validate pending migrations separately'):
+            self.install()
+        self.install(validate=True)
+        backup = next(p for p in self.state.glob('backup-before-stable-signing-*')
+                      if (p / 'install-record.json').is_file())
+        record = json.loads((backup / 'install-record.json').read_text())
+        self.assertEqual(record['pendingMigrations'], ['0014_blue_tomorrow_man'])
+        self.assertEqual(record['migrationValidation']['targetMigrations'], [{
+            'tag': '0014_blue_tomorrow_man',
+            'hash': installer.digest(self.repo / 'drizzle/0014_blue_tomorrow_man.sql'),
+        }])
 
     def test_validation_failure_does_not_replace_binary_or_pointers(self):
         self.add_pending_0012()

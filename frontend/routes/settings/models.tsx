@@ -35,6 +35,7 @@ function SettingsModelsPage() {
 		providerLabels,
 		aggregations,
 		agentModeUnsupportedProviders,
+		catalogMissingModels,
 	} = useAllModels();
 	const is = useInstanceSettingsContext();
 	const qc = useQueryClient();
@@ -132,6 +133,7 @@ function SettingsModelsPage() {
 				routerModels={is.routerModels}
 				setRouterModels={is.setRouterModels}
 				groupedModels={groupedModels}
+				catalogMissingModels={catalogMissingModels}
 				navigate={navigate}
 			/>
 			<Divider />

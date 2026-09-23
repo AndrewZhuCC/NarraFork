@@ -77,6 +77,7 @@ export interface InstanceSettingsState {
 	dangerSkipReadOnlyConfirmations: boolean;
 	autoContinuationMode: AutoContinuationMode;
 	maxTransientRetries: number;
+	maxToolCallsPerResponse: number;
 	silentToolCallThreshold: number;
 	pipelineUnusedToolCallThreshold: number;
 	behaviorFenceInterval: number;
@@ -198,6 +199,7 @@ function makeDefaults(): InstanceSettingsState {
 		dangerSkipReadOnlyConfirmations: false,
 		autoContinuationMode: "protectedOnly",
 		maxTransientRetries: 10,
+		maxToolCallsPerResponse: 32,
 		silentToolCallThreshold: 50,
 		pipelineUnusedToolCallThreshold: 10,
 		behaviorFenceInterval: -1,
@@ -315,6 +317,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					(settings.agent?.autoContinuationMode as AutoContinuationMode | undefined) ??
 					"protectedOnly",
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
+				maxToolCallsPerResponse: settings.agent?.maxToolCallsPerResponse ?? 32,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 50,
 				pipelineUnusedToolCallThreshold: settings.agent?.pipelineUnusedToolCallThreshold ?? 10,
 				behaviorFenceInterval: settings.agent?.behaviorFenceInterval ?? -1,
@@ -461,6 +464,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					reasoningEffortBlocklist: state.reasoningEffortBlocklist.filter((r) => r.pattern.trim()),
 					routerModels: state.routerModels.filter((r) => r.pattern.trim()),
 					maxTransientRetries: state.maxTransientRetries,
+					maxToolCallsPerResponse: state.maxToolCallsPerResponse,
 					silentToolCallThreshold: state.silentToolCallThreshold,
 					pipelineUnusedToolCallThreshold:
 						state.pipelineUnusedToolCallThreshold === 0 ? 1 : state.pipelineUnusedToolCallThreshold,

@@ -486,6 +486,7 @@ export const updateSettingsSchema = z
 					.max(100)
 					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
+				maxToolCallsPerResponse: z.number().int().min(1).max(128),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
 				pipelineUnusedToolCallThreshold: z
 					.number()
@@ -1282,6 +1283,7 @@ settingsRoutes.post("/test-model", requireAdmin, async (c) => {
 		const result = await capture.run(() =>
 			agentGenerateWithMetaResolved(prompt, resolved, undefined, undefined, {
 				kind: "settings_test",
+				userId: c.get("user").sub,
 			}),
 		);
 		const diagnostics = buildModelTestDiagnostics({

@@ -32,6 +32,20 @@ describe("PostgreSQL narrator WebSocket admission", () => {
 		).toBe("narrator");
 	});
 
+	test("carries the JWT version into narrator WebSocket data for live Git authorization", async () => {
+		const data = resolveWSData(
+			new URL("http://localhost/ws/narrator"),
+			{ userId: "user-1", username: "user", avatarColor: null, avatarImageId: null },
+			undefined,
+			{ sessionUserId: "user-1", sessionExp: 2000000000, sessionTokenVersion: 3 },
+		);
+		expect(data?.channel).toBe("narrator");
+		if (data?.channel !== "narrator") throw new Error("Narrator WS data missing");
+		expect(data.sessionTokenVersion).toBe(3);
+		const source = await Bun.file(new URL("../../main.ts", import.meta.url)).text();
+		expect(source).toContain("sessionTokenVersion: payload[SESSION_VERSION_CLAIM]");
+	});
+
 	test("runs the Bun upgrade gate before OAuth, JWT, user lookup, or server.upgrade effects", async () => {
 		const source = await Bun.file(new URL("../../main.ts", import.meta.url)).text();
 		const gate = source.indexOf("const narratorWsRefusal = narratorWebSocketBackendRefusal(");

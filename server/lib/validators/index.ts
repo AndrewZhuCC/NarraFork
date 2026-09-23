@@ -156,6 +156,7 @@ export {
 	createWhitelistDirSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
+	extractPrimarySchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,
 	humanAttentionListQuerySchema,
@@ -189,6 +190,12 @@ export {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "./narrators";
+export {
+	notificationIdParamSchema,
+	notificationKindSchema,
+	notificationListQuerySchema,
+	notificationMarkReadSchema,
+} from "./notifications";
 export {
 	createProjectSchema,
 	projectChapterSettingsSchema,

@@ -781,6 +781,14 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		roomKind: access.room.kind,
 		narratorId: access.room.narratorId,
 	});
+	// Sending also commits a read watermark. Every consumer must hear the same
+	// receipt as explicit reading, including activity history in another tab.
+	eventBus.emit({
+		type: "chat:room_read",
+		roomId: input.roomId,
+		userId: input.senderUserId,
+		lastReadSeq: seq,
+	});
 
 	return row;
 }
@@ -1972,7 +1980,10 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 			: 'You are summarizing a team chat excerpt so a developer can forward it to an AI coding assistant. Output the essentials: conclusions, decisions, action items, open questions. Preserve concrete file names, commands and identifiers verbatim. A leading [replying to X: "…"] marks which message a line answers — use it to attribute agreement and disagreement correctly. No preamble or pleasantries.';
 
 	try {
-		const result = await summaryGenerate(transcript, systemPrompt, { kind: "chat_summarize" });
+		const result = await summaryGenerate(transcript, systemPrompt, {
+			kind: "chat_summarize",
+			userId: input.userId,
+		});
 		return { summary: result.text.trim() };
 	} catch (err) {
 		logger.warn("Chat summarize failed", {

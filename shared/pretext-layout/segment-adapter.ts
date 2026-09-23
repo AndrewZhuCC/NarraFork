@@ -40,6 +40,8 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
+import { resolveToolDisplayDurationMs } from "../tool-display-duration";
+import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
 	type CommunicationState,
 	communicationSelectors,
@@ -554,6 +556,11 @@ interface AdapterTraceItem {
 	 */
 	status?: string | null;
 	/**
+	 * Height-neutral: an earlier same-turn tool still owns the execution slot.
+	 * Painted as the parked slate shimmer. See `@shared/tool-shimmer`.
+	 */
+	queuedBehindUpstream?: boolean;
+	/**
 	 * A live reflection gate's status on this call, when it has one.
 	 *
 	 * Render-only and height-neutral: it selects the row's shimmer colour (purple while
@@ -571,6 +578,20 @@ interface AdapterTraceItem {
 	 * popover is portaled.
 	 */
 	timing?: Record<string, number>;
+	/**
+	 * The duration the row PAINTS, when it differs from `timing.durationMs`.
+	 *
+	 * `timing.durationMs` is the full span attributed to the call, including time
+	 * spent waiting on a gate or queued behind a sibling — correct for the popover's
+	 * "Total", misleading as the one figure beside a shell command. Resolved by
+	 * `@shared/tool-display-duration`, the same rule the card header uses.
+	 *
+	 * Absent when no duration is known. Height-neutral (one nowrap span in the row's
+	 * fixed line), but KEYED in `traceRevision`: it is painted from the cached
+	 * payload and can land alone when a late metadata patch arrives on an
+	 * already-terminal status.
+	 */
+	displayDurationMs?: number;
 	/** Selection / menu coordinates (renderer only, height-neutral). */
 	identity?: AdapterTraceRowIdentity;
 	/**
@@ -3214,6 +3235,12 @@ interface ToolRunContext {
 	inRun: boolean;
 	isLast: boolean;
 	isSoleSubagent: boolean;
+	/**
+	 * Height-neutral shimmer input: an earlier call in the same turn still owns
+	 * the execution slot. See `@shared/tool-shimmer` — painted as the parked
+	 * slate mark, never as a sweep.
+	 */
+	queuedBehindUpstream?: boolean;
 }
 
 export interface CommunicationBubbleData {
@@ -3664,6 +3691,10 @@ function buildToolCardData(
 		summary: toolSummary(item.tc, ctx),
 		status: item.tc.status ?? "success",
 		isStreaming,
+		// Height-neutral shimmer input. Keyed in measure-cache `extractDataRevision`
+		// because an earlier sibling finishing is the ONLY thing that clears this
+		// while this call's own status stays `initializing`.
+		...(runContext.queuedBehindUpstream ? { queuedBehindUpstream: true } : {}),
 		// `+N -N` for a settled Write/Edit. Height-neutral (one nowrap span in the
 		// fixed header row) but PAINTED from the cached payload, so it is keyed in
 		// `extractDataRevision` — see CONTRACT.md §4.5 constraint 3.
@@ -3879,14 +3910,132 @@ function parseEpochMs(value: unknown): number | undefined {
 	return Number.isNaN(parsed) ? undefined : parsed;
 }
 
+/** Compact peer facts for the queued detector. */
+function toolUpstreamPeer(item: AdapterToolItem, ctx: AdapterContext): ToolUpstreamPeer {
+	return {
+		status: item.tc.status ?? null,
+		isStreaming: isStreamingToolItem(item),
+		hasPendingPermission: ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false,
+		reflectionStatus: resolveToolReflectionStatus(item, ctx) ?? null,
+		// Name + input let the detector ask whether this peer runs in the SAME parallel
+		// group as the call being judged. Without them a concurrent sibling is
+		// indistinguishable from an upstream blocker.
+		toolName: item.tc.toolName ?? null,
+		input: asObject(item.tc.inputJson),
+	};
+}
+
 /**
- * A tool's reflection-gate STATUS, or undefined when it has no gate.
+ * A peer reconstructed from an enriched `tool_use` block.
  *
- * Split out from `resolveToolReflection` because a folded row needs only this one
- * field (to pick its shimmer colour) and must not pay for building a whole measurable
- * notice — a fold can hold hundreds of rows. Same live-wins precedence as the card,
- * so the two cannot disagree about whether a gate is running.
+ * `enrichToolUseBlocks` copies `status` / `permissionSuggestions` / `inputJson`
+ * onto every tool_use block, so a block is enough to answer "does this earlier
+ * call still own the slot?" — which is exactly what the activity fold needs for
+ * a sibling that was SPLIT OUT as a standalone permission card and is therefore
+ * not in the fold's own `earlier` list.
  */
+function blockAsToolUpstreamPeer(
+	block: AdapterContentBlock,
+	ctx: AdapterContext,
+): ToolUpstreamPeer {
+	const toolUseId = typeof block.id === "string" ? block.id : undefined;
+	const input = asObject(block.inputJson ?? block.input);
+	const status = typeof block.status === "string" ? block.status : null;
+	const suggestions = Array.isArray(block.permissionSuggestions)
+		? (block.permissionSuggestions as unknown[])
+		: null;
+	const reflection = getPermissionReflectionSuggestion({
+		suggestions,
+		permissionSuggestions: suggestions,
+	});
+	return {
+		status,
+		isStreaming:
+			input._streamingChars != null ||
+			// A live streaming tool_use may not yet carry the `_streamingChars` wrapper.
+			status === "streaming",
+		// A live request can exist before the row's status re-read; the explicit
+		// resolver is authoritative when it knows this id.
+		hasPendingPermission:
+			(toolUseId ? ctx.resolveHasPendingPermission?.(toolUseId) === true : false) ||
+			status === "pending",
+		reflectionStatus: reflection?.status ?? null,
+		toolName:
+			(typeof block.name === "string" && block.name) ||
+			(typeof block.toolName === "string" && block.toolName) ||
+			null,
+		input,
+	};
+}
+
+/**
+ * Provider-order upstream peers for `item`.
+ *
+ * ⚠️ Must not trust the fold's `earlier` list alone. `groupRenderUnits` splits a
+ * permission-blocked tool OUT of the activity fold as a standalone full card
+ * (`splitToolRunForActivity`), so the next folded row starts with an empty
+ * `earlier` array even though that call still owns the execution slot. The
+ * second folded row then only sees the first — which is why it looked like only
+ * the third call was queued while the second stayed neutral.
+ *
+ * The message's enriched `tool_use` blocks are the complete order, including
+ * those split-out cards. Unit-local `earlier` still covers tools from OTHER
+ * messages in the same activity unit.
+ */
+function collectUpstreamPeers(
+	item: AdapterToolItem,
+	earlier: readonly AdapterToolItem[],
+	ctx: AdapterContext,
+): ToolUpstreamPeer[] {
+	const peers: ToolUpstreamPeer[] = [];
+	const blocks = item.msg?.contentJson;
+	const covered = new Set<string>();
+	if (Array.isArray(blocks)) {
+		for (let i = 0; i < item.blockIndex; i++) {
+			const block = blocks[i];
+			if (!block || block.type !== "tool_use") continue;
+			if (typeof block.id === "string" && block.id) covered.add(block.id);
+			peers.push(blockAsToolUpstreamPeer(block, ctx));
+		}
+	}
+	for (const peer of earlier) {
+		// Same-message peers are already in `peers` via blockIndex order.
+		if (peer.msg && item.msg && peer.msg === item.msg && peer.blockIndex < item.blockIndex) {
+			continue;
+		}
+		const id = peer.tc.toolUseId;
+		if (id && covered.has(id)) continue;
+		peers.push(toolUpstreamPeer(peer, ctx));
+	}
+	return peers;
+}
+
+/**
+ * Whether THIS tool call is queued behind an earlier same-turn call.
+ *
+ * `earlier` is the provider-order prefix of tool items that sit before this one
+ * in the run/activity sequence. Reasoning steps are not peers — they do not
+ * occupy the tool execution slot. Message-local earlier `tool_use` blocks are
+ * merged in as well (see `collectUpstreamPeers`).
+ */
+function isQueuedBehindUpstreamTools(
+	item: AdapterToolItem,
+	earlier: readonly AdapterToolItem[],
+	ctx: AdapterContext,
+): boolean {
+	return isToolQueuedBehindUpstream({
+		status: item.tc.status ?? null,
+		isStreaming: isStreamingToolItem(item),
+		hasPendingPermission: ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false,
+		reflectionStatus: resolveToolReflectionStatus(item, ctx) ?? null,
+		// This call's own name/input: the detector needs both sides to decide whether
+		// they land in one parallel group.
+		toolName: item.tc.toolName ?? null,
+		input: asObject(item.tc.inputJson),
+		earlierTools: collectUpstreamPeers(item, earlier, ctx),
+	});
+}
+
 function resolveToolReflectionStatus(
 	item: AdapterToolItem,
 	ctx: AdapterContext,
@@ -4119,6 +4268,7 @@ function toolTraceItem(
 	item: AdapterToolItem,
 	ctx: AdapterContext,
 	expanded = false,
+	queuedBehindUpstream = false,
 ): AdapterTraceItem {
 	const summary = toolSummary(item.tc, ctx);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
@@ -4128,15 +4278,27 @@ function toolTraceItem(
 	const canDrillDown = !!item.tc.toolUseId;
 	// The gate's own status, read with the same live-wins precedence the card uses.
 	const reflectionStatus = resolveToolReflectionStatus(item, ctx);
+	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson);
+	// The figure the row PAINTS, which is not always `timing.durationMs`: for bash
+	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
+	// that waited 19s on a gate read as a 20s command. Same shared rule the card
+	// header uses — the two must not disagree about one call. Height-neutral.
+	const displayDurationMs = resolveToolDisplayDurationMs({
+		category,
+		execDurationMs: readFiniteNumber(asObject(resolveToolMetadata(item.tc)).execDurationMs),
+		durationMs: readFiniteNumber(item.tc.durationMs) ?? deriveDuration(item.tc),
+	});
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
 		iconColor: ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
 		toolName: item.tc.toolName,
-		category: ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson),
+		category,
 		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
+		// Height-neutral shimmer input — same contract as `reflectionStatus`.
+		...(queuedBehindUpstream ? { queuedBehindUpstream: true } : {}),
 		// `+N -N` for a Write/Edit row. Same lane as `status` / `timing`: painted
 		// inside the row's fixed line, height-neutral, and keyed in `traceRevision`.
 		...toolDiffStatsFields(item, isStreamingToolItem(item), resolveToolMetadata(item.tc)),
@@ -4148,9 +4310,10 @@ function toolTraceItem(
 		// own card), so this is usually absent; it exists so the row is correct wherever
 		// a gated call does end up folded, rather than silently mis-coloured.
 		...(reflectionStatus ? { reflectionStatus } : {}),
-		// Same stamp record a subagent card's header uses, so a folded row shows the
-		// SAME duration the full card would at a higher LOD. Height-neutral.
+		// Same stamp record a subagent card's header uses, so the row's timing popover
+		// reports the same phase breakdown the full card would. Height-neutral.
 		timing: cardTiming(item.tc),
+		...(displayDurationMs != null ? { displayDurationMs } : {}),
 		identity: toolRowIdentity(item),
 		// Same value the standalone card carries, so the two renderings of this tool
 		// are pairable across an LOD change (see AdapterTraceItem.unitId).
@@ -4174,7 +4337,12 @@ function toolTraceItem(
 						card: buildToolCardData(
 							item,
 							ctx,
-							{ inRun: false, isLast: true, isSoleSubagent: false },
+							{
+								inRun: false,
+								isLast: true,
+								isSoleSubagent: false,
+								...(queuedBehindUpstream ? { queuedBehindUpstream: true } : {}),
+							},
 							ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false,
 						),
 					}
@@ -4211,6 +4379,7 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 				inRun: previousIsTool || nextIsTool,
 				isLast: !nextIsTool,
 				isSoleSubagent,
+				queuedBehindUpstream: isQueuedBehindUpstreamTools(item, items.slice(0, index), ctx),
 			});
 		});
 	}
@@ -4225,6 +4394,11 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 					inRun: false,
 					isLast: true,
 					isSoleSubagent,
+					queuedBehindUpstream: isQueuedBehindUpstreamTools(
+						group.item,
+						items.slice(0, group.index),
+						ctx,
+					),
 				}),
 			);
 			continue;
@@ -4389,6 +4563,9 @@ function adaptActivityItems(
 	//    down by one and a stored index starts addressing a different tool. See
 	//    `AdapterContext.isRowExpanded`.
 	const expandedIndices: number[] = [];
+	// Tool items seen so far in THIS activity sequence, for the queued detector.
+	// Reasoning steps are skipped — they do not occupy the tool execution slot.
+	const earlierToolItems: AdapterToolItem[] = [];
 	// Blocks of ONE reasoning run that were already consumed by the run that started
 	// at an earlier item. The fold receives a run block-by-block (the grouper pushes
 	// them individually, sharing `stableKeyBase`), but the steps must come from the
@@ -4536,7 +4713,9 @@ function adaptActivityItems(
 			: toolItemKey(toolItem);
 		const expanded = ctx.isRowExpanded?.(traceKey, rowKey) ?? false;
 		if (expanded) expandedIndices.push(traceItems.length);
-		const toolRow = toolTraceItem(toolItem, ctx, expanded);
+		const queuedBehindUpstream = isQueuedBehindUpstreamTools(toolItem, earlierToolItems, ctx);
+		earlierToolItems.push(toolItem);
+		const toolRow = toolTraceItem(toolItem, ctx, expanded, queuedBehindUpstream);
 		// `unitId` moves with the key: two calls sharing an id are still two distinct
 		// pieces of content.
 		if (item.dedupeSuffix) {

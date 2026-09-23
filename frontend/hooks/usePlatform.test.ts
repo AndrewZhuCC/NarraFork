@@ -50,6 +50,7 @@ const STORAGE_DOM_GLOBALS = [
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
 	"getComputedStyle",
+	"localStorage",
 	"IS_REACT_ACT_ENVIRONMENT",
 ] as const;
 
@@ -90,8 +91,11 @@ function installStorageTestDom() {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
+	// No stored token: useCurrentUser stays disabled and the admin-only card stays gated.
+	const localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 
 	Object.assign(window, {
+		localStorage,
 		ResizeObserver: StorageTestResizeObserver,
 		matchMedia,
 		requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(callback, 0),
@@ -101,6 +105,7 @@ function installStorageTestDom() {
 		window,
 		document: window.document,
 		navigator: window.navigator,
+		localStorage,
 		Event: window.Event,
 		Document: window.Document,
 		ShadowRoot: window.ShadowRoot,
@@ -268,6 +273,7 @@ describe("StorageSection health states", () => {
 		expect(text).toContain("Click Scan to analyze storage usage");
 		expect(text).not.toContain("Loading storage capabilities");
 		expect(text).not.toContain("Storage status unavailable");
+		expect(text).not.toContain("Workspace write barriers");
 		expect(findStorageButton("Scan").disabled).toBe(false);
 	});
 

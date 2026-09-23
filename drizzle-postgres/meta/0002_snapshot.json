@@ -1,5 +1,5 @@
 {
-  "id": "6b88bed1-17e7-4ab6-84e2-17566be039b6",
+  "id": "082531c2-a64e-410c-ac83-31c94eed92c7",
   "prevId": "827d79d0-8075-493f-954b-2003153f491d",
   "version": "7",
   "dialect": "postgresql",
@@ -5654,6 +5654,12 @@
           "type": "text",
           "primaryKey": true,
           "notNull": true
+        },
+        "workspace_lease_id": {
+          "name": "workspace_lease_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "scope_id": {
           "name": "scope_id",
@@ -17848,12 +17854,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "reasoning_effort": {
-          "name": "reasoning_effort",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
         "permission_mode": {
           "name": "permission_mode",
           "type": "text",
@@ -21255,6 +21255,205 @@
             "id"
           ],
           "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.workspace_write_leases": {
+      "name": "workspace_write_leases",
+      "schema": "",
+      "columns": {
+        "lease_id": {
+          "name": "lease_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "owner_epoch": {
+          "name": "owner_epoch",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "runtime_epoch": {
+          "name": "runtime_epoch",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "runtime_generation": {
+          "name": "runtime_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fencing_token": {
+          "name": "fencing_token",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scope_revision": {
+          "name": "scope_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "path_flavor": {
+          "name": "path_flavor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ranges_json": {
+          "name": "ranges_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "mutation_manifest_json": {
+          "name": "mutation_manifest_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "execution_ended_at": {
+          "name": "execution_ended_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_workspace_lease_device_status": {
+          "name": "idx_workspace_lease_device_status",
+          "columns": [
+            {
+              "expression": "device_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_workspace_lease_scope": {
+          "name": "idx_workspace_lease_scope",
+          "columns": [
+            {
+              "expression": "scope_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_workspace_lease_cleanup": {
+          "name": "idx_workspace_lease_cleanup",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "lease_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "workspace_write_leases_scope_id_file_change_scopes_id_fk": {
+          "name": "workspace_write_leases_scope_id_file_change_scopes_id_fk",
+          "tableFrom": "workspace_write_leases",
+          "tableTo": "file_change_scopes",
+          "columnsFrom": [
+            "scope_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
           "onUpdate": "no action"
         }
       },

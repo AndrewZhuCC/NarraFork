@@ -19,6 +19,8 @@ import {
 import { recordCacheDropDiagnostic, resetCacheDropBaseline } from "../cache-drop-diagnostics";
 import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
+import { withModelMetadataSnapshotIterator } from "../model-catalog";
+import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
@@ -1397,6 +1399,7 @@ export async function runReflectionLoop(
 					event.requestId,
 					startApiRequest({
 						narratorId: parentConfig.narratorId,
+						userId: parentConfig.userId,
 						provider: event.provider,
 						model: event.model,
 						credentialId: event.credentialId,
@@ -2383,7 +2386,13 @@ async function executeToolAfterReflections(
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
  */
-export async function* agentLoop(
+export function agentLoop(
+	...args: Parameters<typeof agentLoopInMetadataSnapshot>
+): ReturnType<typeof agentLoopInMetadataSnapshot> {
+	return withModelMetadataSnapshotIterator(() => agentLoopInMetadataSnapshot(...args));
+}
+
+async function* agentLoopInMetadataSnapshot(
 	config: AgentConfig,
 	userText: string,
 	history: unknown[],
@@ -2893,17 +2902,31 @@ export async function* agentLoop(
 		historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 	}
 
-	function hasPendingRuntimeSettingsOverride(): boolean {
-		const runtimeSettings = config.getRuntimeSettingsOverride?.();
-		return Boolean(
-			(runtimeSettings && Object.keys(runtimeSettings).length > 0) || config.getModelOverride?.(),
-		);
+	async function hasPendingRuntimeSettingsOverride(): Promise<boolean> {
+		// Probe only: a settle/resolve failure here must not escalate a retry path
+		// into a whole-turn exception. Treat "cannot tell" as "no pending switch"
+		// and keep the current model; real authorization failures still surface
+		// from applyPendingRuntimeSettings.
+		try {
+			const runtimeSettings = await config.getRuntimeSettingsOverride?.();
+			return Boolean(
+				(runtimeSettings && Object.keys(runtimeSettings).length > 0) || config.getModelOverride?.(),
+			);
+		} catch (error) {
+			logger.warn("Failed to probe pending runtime settings override", {
+				narratorId: config.narratorId,
+				error: String(error),
+			});
+			return false;
+		}
 	}
 
 	async function applyPendingRuntimeSettings(
 		cause: "turn" | "retry",
 	): Promise<Extract<AgentEvent, { type: "model_switched" }> | null> {
-		const settingsOverride = config.getRuntimeSettingsOverride?.() ?? null;
+		// Resolve authorization before touching adapters/history. A rejection must
+		// propagate rather than silently issuing a request with an obsolete model.
+		const settingsOverride = (await config.getRuntimeSettingsOverride?.()) ?? null;
 		const legacyModelOverride = config.getModelOverride?.() ?? null;
 		const newModel = settingsOverride?.model || legacyModelOverride;
 		const hasReasoningOverride =
@@ -3058,6 +3081,18 @@ export async function* agentLoop(
 				signatureSource?: string;
 			}> = [];
 			const toolUses: AgentToolUse[] = [];
+			// Tool cancellation is independent from the caller's user-interrupt signal.
+			const toolAbort = new AbortController();
+			// Preserve live runtime setting updates on the original config during retries.
+			const toolSignal = AbortSignal.any([config.signal, toolAbort.signal]);
+			const toolConfig = new Proxy(config, {
+				get(target, key, receiver) {
+					return key === "signal" ? toolSignal : Reflect.get(target, key, receiver);
+				},
+			});
+			const throwIfUserAborted = (): void => {
+				if (config.signal.aborted) throw config.signal.reason ?? new Error("Aborted");
+			};
 			type ToolOrderIdentity = {
 				toolUseId: string;
 				arrivalOrder: number;
@@ -3154,6 +3189,34 @@ export async function* agentLoop(
 			// still streaming remains an ordering barrier even if a later call is ready.
 			const streamReadyTools = new Set<string>();
 			let streamExecutionOpen = false;
+			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
+				const existing = earlyExecMap.get(tu.toolUseId);
+				if (existing) return existing;
+				const execution = settleToolExecutionResult(
+					executeToolAfterReflections(tu, toolConfig, history, locale),
+				);
+				earlyExecMap.set(tu.toolUseId, execution);
+				void execution.then((result) => {
+					settledResults.set(tu.toolUseId, result);
+					pumpStreamingTools();
+				});
+				return execution;
+			};
+			async function waitForToolOrAbort<T>(execution: Promise<T>): Promise<T | null> {
+				if (config.signal.aborted) return null;
+				let onAbort = () => {};
+				try {
+					return await Promise.race([
+						execution,
+						new Promise<null>((resolve) => {
+							onAbort = () => resolve(null);
+							config.signal.addEventListener("abort", onAbort, { once: true });
+						}),
+					]);
+				} finally {
+					config.signal.removeEventListener("abort", onAbort);
+				}
+			}
 			const pumpStreamingTools = (): void => {
 				if (
 					!streamExecutionOpen ||
@@ -3180,16 +3243,8 @@ export async function* agentLoop(
 				for (const tu of candidates) {
 					// Register only actual starts, never promises for queued tools: the
 					// cut-in/abort paths must distinguish running work from skippable work.
-					const execution = settleToolExecutionResult(
-						executeToolAfterReflections(tu, config, history, locale),
-					);
-					earlyExecMap.set(tu.toolUseId, execution);
-					void execution.then((result) => {
-						settledResults.set(tu.toolUseId, result);
-						// Includes the after-snapshot boundary, so a dependent write can
-						// start safely even while the provider is waiting for another token.
-						pumpStreamingTools();
-					});
+					if (config.signal.aborted || toolAbort.signal.aborted) break;
+					startToolExecution(tu);
 				}
 			};
 			// Track which tool_results have already been yielded during streaming
@@ -3357,6 +3412,16 @@ export async function* agentLoop(
 				}
 				yield* drainSettledEarlyToolResults();
 				detachStartedEarlyToolResults();
+				// Completed/persisted calls that never started still need a terminal result.
+				for (const tu of toolUses) {
+					if (earlyExecMap.has(tu.toolUseId) || yieldedToolResults.has(tu.toolUseId)) continue;
+					yieldedToolResults.add(tu.toolUseId);
+					yield earlyToolResultEvent(tu, {
+						output: locale === "zh-CN" ? "工具执行已取消。" : "Tool execution cancelled.",
+						isError: true,
+						durationMs: 0,
+					});
+				}
 			}
 
 			function hasStartedEarlyToolExecution(): boolean {
@@ -3448,6 +3513,7 @@ export async function* agentLoop(
 			 * gets a pointer, so no attempt looks like a failure without evidence.
 			 */
 			let malformedSpillReuseToken: string | undefined;
+			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -3476,9 +3542,11 @@ export async function* agentLoop(
 				yield {
 					type: "api_request_start",
 					requestId,
+					userId: requestUserId,
 					provider: effectiveProvider,
 					model: effectiveModel,
 					credentialId,
+					referencePricingSnapshot: captureReferencePricingSnapshot(effectiveModel),
 				};
 			}
 
@@ -4094,6 +4162,34 @@ export async function* agentLoop(
 						: undefined;
 
 				const attemptAbort = new AbortController();
+				const configuredToolLimit = config.maxToolCallsPerResponse ?? 32;
+				const toolCallLimit = Number.isFinite(configuredToolLimit)
+					? Math.min(128, Math.max(1, Math.floor(configuredToolLimit)))
+					: 32;
+				const responseToolIds = new Set<string>();
+				const toolLimitState = { exceeded: false };
+				const toolLimitStop = new Error("Tool call limit exceeded");
+				const registerResponseTool = (id: string): void => {
+					throwIfUserAborted();
+					if (responseToolIds.has(id)) return;
+					if (responseToolIds.size < toolCallLimit) {
+						responseToolIds.add(id);
+						return;
+					}
+					toolLimitState.exceeded = true;
+					streamExecutionOpen = false;
+					toolAbort.abort(toolLimitStop);
+					attemptAbort.abort(toolLimitStop);
+					try {
+						config.onToolCallLimitExceeded?.(toolCallLimit);
+					} catch {
+						// The owning narrator's notification must not defeat local cancellation.
+						logger.warn("Tool call limit interruption callback failed", {
+							narratorId: config.narratorId,
+						});
+					}
+					throw toolLimitStop;
+				};
 				let firstTokenTimeoutTriggered = false;
 				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
 				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
@@ -4153,6 +4249,8 @@ export async function* agentLoop(
 						model: effectiveModel,
 						tools: structuredClone(tools),
 					});
+					const toolSnapshot = requestToolSnapshots.get(config);
+					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,
@@ -4187,12 +4285,15 @@ export async function* agentLoop(
 
 					streamExecutionOpen = true;
 					for await (const parsed of stream) {
+						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
 						// tool must not release more queued work while failure handling runs.
 						if (parsed.invalidState || parsed.silentDisconnect) streamExecutionOpen = false;
 						// Make every identity in this provider event visible before ANY yield.
 						// Completed calls and an earlier unfinished chunk may arrive together.
-						for (const tu of parsed.toolUses ?? []) {
+						// Pre-register only a bounded ordering window. Admission below checks
+						// completed content in order, before admitting the rest of a huge batch.
+						for (const tu of (parsed.toolUses ?? []).slice(0, toolCallLimit)) {
 							tu.name = canonicalizeToolName(tu.name);
 							markCompletedToolUse(tu);
 						}
@@ -4406,6 +4507,8 @@ export async function* agentLoop(
 							// 3. Yield block_complete + tool_call + start eager execution here,
 							//    mirroring what the streaming stop path would have done.
 							for (const tu of parsed.toolUses) {
+								throwIfUserAborted();
+								tu.name = canonicalizeToolName(tu.name);
 								const identity = markCompletedToolUse(tu);
 								// Skip duplicates — the streaming path may have already
 								// completed this tool call via toolUseChunk stop. Preserve any
@@ -4421,6 +4524,7 @@ export async function* agentLoop(
 								if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
 									tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
 								}
+								registerResponseTool(tu.toolUseId);
 								toolUses.push(tu);
 
 								// If this tool was also being streamed via toolUseChunk, remove it
@@ -4452,12 +4556,14 @@ export async function* agentLoop(
 									} satisfies ContentBlock,
 								};
 
+								throwIfUserAborted();
 								yield {
 									type: "tool_call",
 									toolUseId: tu.toolUseId,
 									toolName: tu.name,
 									input: tu.input,
 								};
+								throwIfUserAborted();
 								streamReadyTools.add(tu.toolUseId);
 								pumpStreamingTools();
 							}
@@ -4465,6 +4571,10 @@ export async function* agentLoop(
 
 						// Handle streaming tool use chunks
 						if (parsed.toolUseChunk) {
+							throwIfUserAborted();
+							if (parsed.toolUseChunk.toolUseId) {
+								registerResponseTool(parsed.toolUseChunk.toolUseId);
+							}
 							const { toolUseId: id, input, stop } = parsed.toolUseChunk;
 							// Same canonicalization as the non-streaming path: the accumulator
 							// stores this name and every later lookup (field config, registry,
@@ -4761,6 +4871,7 @@ export async function* agentLoop(
 											if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
 												tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
 											}
+											registerResponseTool(tu.toolUseId);
 											toolUses.push(tu);
 										}
 										toolUseAccum.delete(id);
@@ -4790,6 +4901,7 @@ export async function* agentLoop(
 										};
 
 										// Notify frontend the tool has started
+										throwIfUserAborted();
 										yield {
 											type: "tool_call",
 											toolUseId: id,
@@ -4798,6 +4910,7 @@ export async function* agentLoop(
 											streamStartedAt: acc.startedAt,
 											streamCompletedAt: acc.streamCompletedAt,
 										};
+										throwIfUserAborted();
 										streamReadyTools.add(id);
 										pumpStreamingTools();
 
@@ -5369,7 +5482,7 @@ export async function* agentLoop(
 									}
 									continue chatRetryLoop;
 								}
-								if (hasPendingRuntimeSettingsOverride()) {
+								if (await hasPendingRuntimeSettingsOverride()) {
 									yield* finishRequest(message);
 									const switchEvent = await applyPendingRuntimeSettings("retry");
 									if (switchEvent) {
@@ -5409,9 +5522,26 @@ export async function* agentLoop(
 						}
 					}
 					streamExecutionOpen = false;
+					throwIfUserAborted();
 					yield* flushRequestStart();
 				} catch (err) {
 					streamExecutionOpen = false;
+					if (toolLimitState.exceeded) {
+						const message =
+							locale === "zh-CN"
+								? `单次模型回复的工具调用超过 ${toolCallLimit} 个，已中断。`
+								: `Interrupted: this model response exceeded ${toolCallLimit} tool calls.`;
+						logger.warn("Tool call limit exceeded", {
+							narratorId: config.narratorId,
+							limit: toolCallLimit,
+						});
+						await Promise.resolve();
+						yield* drainEarlyToolResultsAfterAbort();
+						yield* outputContent.flush();
+						yield* finishRequest(message);
+						yield { type: "error", message };
+						return;
+					}
 					if (config.signal.aborted) {
 						// Let already-fulfilled eager tool promises publish into `settledResults`,
 						// then persist their completed results before surfacing the abort.  Without
@@ -5472,7 +5602,7 @@ export async function* agentLoop(
 							}
 							continue; // retry provider.chat()
 						}
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							yield* finishRequest(firstTokenTimeoutMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
@@ -5850,7 +5980,7 @@ export async function* agentLoop(
 							}
 							continue; // retry provider.chat()
 						}
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							yield* finishRequest(msg);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
@@ -5916,7 +6046,7 @@ export async function* agentLoop(
 						}
 						continue; // retry provider.chat()
 					}
-					if (hasPendingRuntimeSettingsOverride()) {
+					if (await hasPendingRuntimeSettingsOverride()) {
 						yield* finishRequest(firstTokenTimeoutMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
@@ -6031,7 +6161,7 @@ export async function* agentLoop(
 							model: effectiveModel,
 							requestId,
 						});
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
 								yield switchEvent;
@@ -6090,7 +6220,7 @@ export async function* agentLoop(
 							}
 							continue; // retry provider.chat()
 						}
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							yield* finishRequest(lastRetryErrorMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
@@ -6158,7 +6288,7 @@ export async function* agentLoop(
 					}
 					const emptyResponseMessage = `${effectiveProvider}: ${emptyResponseText}`;
 					requestDiagnostics = buildEmptyDiagnostics(emptyResponseMessage);
-					if (hasPendingRuntimeSettingsOverride()) {
+					if (await hasPendingRuntimeSettingsOverride()) {
 						yield* finishRequest(emptyResponseMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
@@ -6300,7 +6430,7 @@ export async function* agentLoop(
 
 					// Shared retry ceiling with empty responses to avoid infinite loops.
 					if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES) {
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
 								yield switchEvent;
@@ -6653,7 +6783,6 @@ export async function* agentLoop(
 				if (group.length === 1) {
 					// Serial execution (single tool)
 					const tu = group[0];
-					const earlyPromise = earlyExecMap.get(tu.toolUseId);
 					if (!streamReadyTools.has(tu.toolUseId)) {
 						yield {
 							type: "tool_call",
@@ -6665,11 +6794,19 @@ export async function* agentLoop(
 						};
 						streamReadyTools.add(tu.toolUseId);
 					}
+					if (config.signal.aborted) {
+						yield* drainEarlyToolResultsAfterAbort();
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
 					// settleToolExecutionResult converts a genuine rejection into a formal
 					// isError ToolExecResult so a throwing serial tool never aborts the loop.
-					const result = await settleToolExecutionResult(
-						earlyPromise ?? executeToolAfterReflections(tu, config, history, locale),
-					);
+					const result = await waitForToolOrAbort(startToolExecution(tu));
+					if (!result) {
+						yield* drainEarlyToolResultsAfterAbort();
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 					// When the permission handler redirected the input (e.g. the plan file),
 					// update the in-memory tool_use so pushAssistantTurn writes the correct
@@ -6751,6 +6888,7 @@ export async function* agentLoop(
 					// Parallel execution (multiple Task calls)
 					// Yield tool_call events for tools not already started during streaming
 					for (const tu of group) {
+						if (config.signal.aborted) break;
 						if (!streamReadyTools.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
 							yield {
 								type: "tool_call",
@@ -6768,13 +6906,16 @@ export async function* agentLoop(
 					// genuine rejection from one parallel tool becomes a formal isError result
 					// instead of rejecting the Promise.race — the siblings keep yielding and
 					// persisting, and the model still gets a tool_result in the original order.
-					const execEntries = group.map((tu) => ({
-						tu,
-						promise: settleToolExecutionResult(
-							earlyExecMap.get(tu.toolUseId) ??
-								executeToolAfterReflections(tu, config, history, locale),
-						),
-					}));
+					if (config.signal.aborted) {
+						yield* drainEarlyToolResultsAfterAbort();
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+					const execEntries: Array<{ tu: AgentToolUse; promise: Promise<ToolExecResult> }> = [];
+					for (const tu of group) {
+						if (config.signal.aborted) break;
+						execEntries.push({ tu, promise: startToolExecution(tu) });
+					}
 
 					// Wrap each promise to carry its index so we know which resolved
 					const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
@@ -6787,7 +6928,12 @@ export async function* agentLoop(
 					let maxParallelMs = 0;
 
 					while (remaining.size > 0) {
-						const winner = await Promise.race(remaining);
+						const winner = await waitForToolOrAbort(Promise.race(remaining));
+						if (!winner) {
+							yield* drainEarlyToolResultsAfterAbort();
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
 						const { i, result } = winner;
 						settled[i] = result;
 

@@ -1,5 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { type ModelCard, validateRawMetadata } from "@shared/model-catalog/card";
+import type { ResolvedModelMetadata } from "@shared/model-catalog/schema/catalog";
+import { validateMetadata } from "@shared/model-catalog/src/index";
 import { getNarraforkHome } from "./narrafork-home";
 import type { NUGProviderConfig } from "./settings/types";
 
@@ -18,6 +21,9 @@ export interface NugModelInfo extends Record<string, unknown> {
 	contextLength?: number;
 	contextWindow?: number;
 	effortLevels?: string[];
+	metadata?: ResolvedModelMetadata;
+	/** Optional complete v2 card from a new NUG; old NUG responses omit it. */
+	modelCard?: ModelCard;
 }
 
 export interface ResolvedNugModelMeta {
@@ -32,6 +38,8 @@ export interface ResolvedNugModelMeta {
 	available?: boolean;
 	contextWindow?: number;
 	effortLevels?: string[];
+	metadata?: ResolvedModelMetadata;
+	modelCard?: ModelCard;
 }
 
 export interface NugModelsGroup {
@@ -73,6 +81,34 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 	const id = String(raw.id ?? "").trim();
 	if (!id) return null;
 	const info: NugModelInfo = { ...raw, id };
+	// A malformed or future envelope must not turn missing capabilities into false.
+	delete info.metadata;
+	delete info.modelCard;
+	if (raw.metadata && typeof raw.metadata === "object") {
+		const envelope = raw.metadata as ResolvedModelMetadata;
+		if (envelope.schemaVersion === 1) {
+			try {
+				info.metadata = { ...envelope, metadata: validateMetadata(envelope.metadata) };
+			} catch {
+				/* compatibility projection remains usable */
+			}
+		}
+	}
+	// Prefer the complete v2 card when a new NUG provides it; keep the v1
+	// projection so old readers and fallbacks stay unchanged.
+	// `validateRawMetadata` rejects operational/credential keys and structural abuse;
+	// a rejected card is dropped (same catch strategy as the metadata envelope) rather
+	// than cached and written to disk.
+	if (raw.modelCard && typeof raw.modelCard === "object") {
+		const card = raw.modelCard as ModelCard;
+		if (card.schemaVersion === 2 && card.metadata && typeof card.metadata === "object") {
+			try {
+				info.modelCard = { ...card, metadata: validateRawMetadata(card.metadata) };
+			} catch {
+				/* discard the card; the v1 projection remains usable */
+			}
+		}
+	}
 	if (raw.model != null) info.model = String(raw.model);
 	if (raw.name != null) info.name = String(raw.name);
 	if (raw.channel != null) info.channel = String(raw.channel);
@@ -440,6 +476,8 @@ export function resolveNugModelMeta(
 			available: hit.available,
 			contextWindow: hit.contextWindow ?? hit.contextLength,
 			effortLevels: hit.effortLevels,
+			metadata: hit.metadata,
+			modelCard: hit.modelCard,
 		};
 	}
 

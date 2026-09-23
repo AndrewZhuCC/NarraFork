@@ -1,5 +1,6 @@
 import { agentGenerateWithHistory, withAuxiliaryRetry } from "@server/lib/agent";
 import { getToolMessage, type Locale } from "@server/lib/prompt-i18n";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	type AskQuestionInput,
@@ -7,6 +8,7 @@ import {
 	coerceAskQuestions,
 } from "./ask-user-question-coerce";
 import { narratorService } from "./narrator-service";
+import { resolveSubagentModelForRun } from "./subagent-model";
 
 export type { AskQuestionInput, AskQuestionOption };
 // Re-export the pure coercion module's public API so existing import paths
@@ -49,9 +51,10 @@ function buildQuestionsText(questions: AskQuestionInput[]): string {
 	return questions
 		.map((q) => {
 			const opts = q.options.length
-				? `\nOptions: ${q.options.map((o) => `${o.label} — ${o.description}`).join("; ")}`
+				? `\nOptions: ${q.options.map((o) => `${o.header} — ${o.description ?? ""}`).join("; ")}`
 				: "\n(free-text, no predefined options)";
-			return `Key: "${q.question}"\nQuestion: ${q.header}${opts}`;
+			// header = short title; description = full prompt. Answers are keyed by header.
+			return `Title: ${q.header}\nQuestion: ${q.description || q.header}${opts}`;
 		})
 		.join("\n\n");
 }
@@ -77,8 +80,8 @@ function normalizeAnswerValue(
 	rawValue: unknown,
 	locale: Locale,
 ): string {
-	const labels = question.options.map((option) => option.label);
-	const fallback = labels[0] ?? DEFAULT_FREE_TEXT_ANSWER[locale] ?? DEFAULT_FREE_TEXT_ANSWER.en;
+	const headers = question.options.map((option) => option.header);
+	const fallback = headers[0] ?? DEFAULT_FREE_TEXT_ANSWER[locale] ?? DEFAULT_FREE_TEXT_ANSWER.en;
 	if (rawValue == null) return fallback;
 
 	const rawParts = Array.isArray(rawValue) ? rawValue : [rawValue];
@@ -88,14 +91,14 @@ function normalizeAnswerValue(
 		.filter(Boolean);
 
 	if (stringParts.length === 0) return fallback;
-	if (!labels.length) return stringParts.join(", ");
+	if (!headers.length) return stringParts.join(", ");
 
 	if (question.multiSelect) {
-		const matched = stringParts.filter((part) => labels.includes(part));
+		const matched = stringParts.filter((part) => headers.includes(part));
 		return matched.length > 0 ? matched.join(", ") : stringParts.join(", ");
 	}
 
-	const exact = stringParts.find((part) => labels.includes(part));
+	const exact = stringParts.find((part) => headers.includes(part));
 	return exact ?? stringParts[0] ?? fallback;
 }
 
@@ -105,6 +108,7 @@ export async function generateAskUserQuestionAnswers(
 	options: {
 		locale?: Locale;
 		model?: string | null;
+		actingUserId?: string | null;
 		mode?: "suggest" | "reflection";
 		signal?: AbortSignal;
 		/**
@@ -117,6 +121,15 @@ export async function generateAskUserQuestionAnswers(
 ): Promise<Record<string, string>> {
 	const locale = options.locale ?? "en";
 	const mode = options.mode ?? "reflection";
+	const model =
+		options.model === FOLLOW_PARENT_MODEL
+			? (
+					await resolveSubagentModelForRun(
+						await narratorService.getById(narratorId),
+						options.actingUserId,
+					)
+				).model
+			: (options.model ?? undefined);
 	const conversationContext = await buildConversationContext(narratorId);
 	const questionsText = buildQuestionsText(questions);
 	const userMessage = conversationContext
@@ -131,7 +144,7 @@ export async function generateAskUserQuestionAnswers(
 	try {
 		raw = await withAuxiliaryRetry(
 			() =>
-				agentGenerateWithHistory(systemPrompt, userMessage, options.model ?? undefined, locale, {
+				agentGenerateWithHistory(systemPrompt, userMessage, model, locale, {
 					reasoningEffort: "none",
 					...(options.signal ? { signal: options.signal } : {}),
 					...(options.onProgress
@@ -149,7 +162,10 @@ export async function generateAskUserQuestionAnswers(
 	const parsed = parseAnswerObject(raw);
 	const answers: Record<string, string> = {};
 	for (const question of questions) {
-		answers[question.question] = normalizeAnswerValue(question, parsed[question.question], locale);
+		// Model-facing key is the uniquified question header. Internal id still
+		// accepted for older reflection prompts / stored drafts.
+		const rawValue = parsed[question.header] ?? parsed[question.id];
+		answers[question.header] = normalizeAnswerValue(question, rawValue, locale);
 	}
 	return answers;
 }

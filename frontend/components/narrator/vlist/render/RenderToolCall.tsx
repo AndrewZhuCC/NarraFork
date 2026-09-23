@@ -60,6 +60,7 @@ import {
 	CARD_SHIMMER_CLASS,
 	resolveToolShimmerFlash,
 	resolveToolShimmerPhase,
+	TOOL_SHIMMER_QUEUED_EXIT_MS,
 	type ToolShimmerFlash,
 } from "@shared/tool-shimmer";
 import {
@@ -124,6 +125,7 @@ import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
 import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
+import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
@@ -250,6 +252,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	taskOutput: "indigo",
 	agent: "pink",
 	await: "indigo",
+	contextAsk: "indigo",
 	send: "blue",
 	ask: "blue",
 	plan: "grape",
@@ -275,11 +278,6 @@ const STATUS_COLOR: Record<ToolCallStatus, string> = {
 
 function cssColor(color: string, shade: number): string {
 	return `var(--mantine-color-${color}-${shade})`;
-}
-
-/** Mantine `-light` background variable (category-icon chip / subtle fills). */
-function cssLight(color: string): string {
-	return `var(--mantine-color-${color}-light)`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -506,26 +504,15 @@ function ToolHeaderRow({
 			onClick={onToggle ? swallowSelectionClick(onToggle) : undefined}
 			onKeyDown={onToggle ? activateOnKey(onToggle) : undefined}
 		>
-			<span
-				style={{
-					// The SAME tile size a folded trace row uses, so drilling in or out does not
-					// resize the chip mid-morph. Height-neutral: the header's 19px text line
-					// dominates `max(icon, text)` at this size.
-					width: HEADER_CATEGORY_ICON,
-					height: HEADER_CATEGORY_ICON,
-					minWidth: HEADER_CATEGORY_ICON,
-					display: "inline-flex",
-					alignItems: "center",
-					justifyContent: "center",
-					borderRadius: "var(--mantine-radius-sm)",
-					background: cssLight(color),
-					color: cssColor(color, 6),
-				}}
-			>
+			{/* SAME CategoryChip as a folded trace row / subagent recent-call row.
+			    Hand-rolled orange-light + shade-6 looked like the same colour in source
+			    but resolved differently under ThemeIcon's variantColorResolver, so the
+			    chip retinted on drill-in. Size stays HEADER_CATEGORY_ICON (14). */}
+			<CategoryChip data-nf-card-header-chip size={HEADER_CATEGORY_ICON} color={color}>
 				{/* Same glyph size a folded row's chip uses, so the icon does not change size
 				    across the morph now that both tiles are the same 14px lane. */}
 				<Icon size={CARD_HEADER_INNER_ICON} />
-			</span>
+			</CategoryChip>
 			<span
 				style={{
 					// Live typography, not CSS vars: the height model measures this line as
@@ -728,6 +715,13 @@ function TimingText({
 	if (!showElapsed && !showDuration && timeoutMs == null) return null;
 	return (
 		<span
+			// The ONE marker every timing cell carries, in every form (card header,
+			// subagent header, recent-call row, folded trace row) — they all render this
+			// component. It exists so a test can compare the two forms' figures by
+			// SELECTING this cell: matching the tail of a row's `textContent` silently
+			// fails instead, because a chevron / flex spacer follows the timing.
+			// Attribute only → height-neutral.
+			data-nf-tool-timing
 			style={{
 				display: "inline-flex",
 				alignItems: "center",
@@ -1045,10 +1039,17 @@ export function ToolTimingArea({
 		if (!canEditTimeout) setEditorOpened(false);
 	}, [canEditTimeout]);
 
+	// The live counter measures EXECUTION when the call has an execution stamp, and
+	// only falls back to the caller's `startedAt` (stream start / creation) when it
+	// does not. Without this a call that spent 19s behind a reflection gate showed
+	// "19s" the instant it began running — a number that describes waiting, presented
+	// as the tool's own elapsed time. While it is still waiting there is no execution
+	// stamp, so the fallback keeps that phase counting as before.
+	const elapsedFrom = timing?.executionStartedAt ?? startedAt;
 	const text = (
 		<TimingText
 			running={running}
-			startedAt={startedAt}
+			startedAt={elapsedFrom}
 			durationMs={durationMs}
 			timeoutMs={timeoutMs}
 			timeoutInteractive={canEditTimeout}
@@ -1706,6 +1707,7 @@ function AskDetailBlocks({
 /** Text colour per ask-replay row role (mirrors the classic banner's tints). */
 function askRoleColor(role: string, selected: boolean): string | undefined {
 	switch (role) {
+		case "ask-description":
 		case "ask-option-desc":
 			return "var(--mantine-color-dimmed)";
 		case "ask-answer":
@@ -2016,6 +2018,7 @@ function useToolCardShimmerClass(
 	isStreaming: boolean,
 	hasPermission: boolean,
 	reflectionStatus: string | null,
+	queuedBehindUpstream?: boolean,
 ): string | undefined {
 	const prevStatusRef = useRef<ToolCallStatus | null>(null);
 	const [flash, setFlash] = useState<ToolShimmerFlash | null>(null);
@@ -2046,7 +2049,32 @@ function useToolCardShimmerClass(
 		status,
 		reflectionStatus,
 		hasPendingPermission: hasPermission,
+		// The adapter already walked the real provider-order prefix; this is its verdict,
+		// not a peer list. See `ToolShimmerPhaseInput.queuedBehindUpstream`.
+		queuedBehindUpstream,
 	});
+	// Leaving queued must dissolve the slate wash instead of swapping the class in
+	// one frame (the infinite pulse freezes mid-opacity and the next overlay snaps
+	// in). Hold `queued_out` for the shared exit duration; a re-entry into queued
+	// cancels it so a flicker of two queued calls cannot stack fades.
+	const isQueued = phase === "queued";
+	const prevQueuedRef = useRef(false);
+	const [queuedExit, setQueuedExit] = useState(false);
+	useEffect(() => {
+		const wasQueued = prevQueuedRef.current;
+		prevQueuedRef.current = isQueued;
+		if (isQueued) {
+			setQueuedExit(false);
+			return;
+		}
+		if (wasQueued) {
+			setQueuedExit(true);
+			const timer = setTimeout(() => setQueuedExit(false), TOOL_SHIMMER_QUEUED_EXIT_MS);
+			return () => clearTimeout(timer);
+		}
+		// Non-queued phase changes must not cancel the exit timer (e.g. running → success).
+	}, [isQueued]);
+	if (queuedExit && phase !== "queued") return CARD_SHIMMER_CLASS.queued_out;
 	if (phase) return CARD_SHIMMER_CLASS[phase];
 	if (flash) return CARD_SHIMMER_CLASS[flash];
 	return undefined;
@@ -2080,6 +2108,7 @@ export function RenderToolCall({
 		inRun,
 		isLast,
 		isStreaming,
+		queuedBehindUpstream,
 		category,
 		status,
 	} = measured;
@@ -2092,6 +2121,7 @@ export function RenderToolCall({
 		isStreaming,
 		permission != null,
 		reflection?.status ?? null,
+		queuedBehindUpstream,
 	);
 	const borderColor =
 		permission != null

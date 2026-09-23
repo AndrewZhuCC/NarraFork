@@ -75,6 +75,8 @@ const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] 
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
 	// GPT-6 Astra requires reasoning, so it intentionally omits `none`.
 	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+	"gpt-6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+	"gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-terra": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -259,20 +261,21 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	]);
 	const reasoningEffortOptions = useMemo(() => {
 		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
+		const card = modelCardIndex
+			? lookupModelCard(
+					getBareModelForReasoning(resolvedModel, resolvedModelOption),
+					modelCardIndex,
+				)?.card
+			: undefined;
+		// Missing catalog data is not evidence that a new model lacks a tier.
+		if (!card) return GENERIC_REASONING_EFFORT_TIERS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
 		// Model cards: the editable replacement for the hardcoded per-model tables.
 		// `none` is appended here rather than stored on the card, because on a card
 		// it would become a clamp target able to silently turn a requested `low`
 		// into thinking switched off.
-		const cardTiers = modelCardIndex
-			? cardEffortLevels(
-					lookupModelCard(
-						getBareModelForReasoning(resolvedModel, resolvedModelOption),
-						modelCardIndex,
-					)?.card,
-				)
-			: undefined;
+		const cardTiers = cardEffortLevels(card);
 		if (cardTiers?.length) {
 			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
 				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
@@ -306,10 +309,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		if (isGemini) {
 			return GEMINI_REASONING_EFFORT_OPTIONS;
 		}
-		// Everything else — a third-party model on a generic relay, with no tier
-		// table of its own. Uses the shared generic ladder (none/low/medium/high/
-		// max) that the backend clamps against, so the menu cannot offer a tier
-		// the request path would silently rewrite.
+		// No declared tier table: keep all efforts available on generic relays.
 		return GENERIC_REASONING_EFFORT_TIERS;
 	}, [
 		codexCapableProviders,

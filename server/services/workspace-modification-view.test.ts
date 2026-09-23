@@ -14,6 +14,7 @@ import {
 import { generateId } from "../lib/id";
 import { recordAttribution, recordAttributions } from "./file-attribution-service";
 import { normalizeWorkspacePath } from "./git-workspace";
+import { redactGitModificationView } from "./git-workspace-attribution";
 import {
 	findImpreciseChanges,
 	getWorkspaceModificationView,
@@ -477,6 +478,78 @@ describe("projections", () => {
 
 		expect(withTimeline.timeline).toEqual([]);
 		expect(without.timeline).toBeUndefined();
+	});
+
+	test("every nested actor obeys the viewer's ACL across byFile and timeline pages", async () => {
+		const ws = makeWorkspace("nf-view-private-actors-");
+		const alice = await createUser("alice");
+		const bob = await createUser("bob");
+		const aliceNarrator = await createNarrator("ALICE PRIVATE TITLE", ws);
+		const bobNarrator = await createNarrator("BOB PRIVATE TITLE", ws);
+		await db
+			.update(narrators)
+			.set({ ownerUserId: alice.id, visibility: "private" })
+			.where(eq(narrators.id, aliceNarrator));
+		await db
+			.update(narrators)
+			.set({ ownerUserId: bob.id, visibility: "private" })
+			.where(eq(narrators.id, bobNarrator));
+		await seedEvents(ws, [
+			{
+				filePath: "shared.ts",
+				action: "write",
+				narratorId: aliceNarrator,
+				changedAt: "2026-01-01T00:00:00.000Z",
+			},
+			{
+				filePath: "shared.ts",
+				action: "edit",
+				narratorId: bobNarrator,
+				changedAt: "2026-01-02T00:00:00.000Z",
+			},
+		]);
+
+		for (const [user, ownTitle, hiddenTitle, hiddenId, expectedTitles] of [
+			[
+				alice,
+				"ALICE PRIVATE TITLE",
+				"BOB PRIVATE TITLE",
+				bobNarrator,
+				[null, "ALICE PRIVATE TITLE"],
+			],
+			[bob, "BOB PRIVATE TITLE", "ALICE PRIVATE TITLE", aliceNarrator, ["BOB PRIVATE TITLE", null]],
+		] as const) {
+			const principal = { userId: user.id, isAdmin: false };
+			const summary = await redactGitModificationView(
+				await getWorkspaceModificationView(ws, { projection: "byFile" }),
+				principal,
+			);
+			expect(summary.timeline).toBeUndefined();
+			expect(summary.byFile[0]?.recentEvents.map((event) => event.actor.title)).toEqual([
+				...expectedTitles,
+			]);
+			expect(summary.byFile[0]?.actors.map((actor) => actor.title)).toEqual([...expectedTitles]);
+			expect(JSON.stringify(summary)).toContain(ownTitle);
+			expect(JSON.stringify(summary)).not.toContain(hiddenTitle);
+			expect(JSON.stringify(summary)).not.toContain(hiddenId);
+
+			let cursor: { changedAt: string; rowId: string } | null | undefined;
+			const pageTitles: Array<string | null> = [];
+			do {
+				const page = await redactGitModificationView(
+					await getWorkspaceModificationView(ws, { limit: 1, cursor: cursor ?? undefined }),
+					principal,
+				);
+				const event = timelineOf(page)[0];
+				if (!event) throw new Error("expected one event per page");
+				pageTitles.push(event.actor.title);
+				expect(page.byFile[0]?.recentEvents[0]?.actor.title).toBe(event.actor.title);
+				expect(JSON.stringify(page)).not.toContain(hiddenTitle);
+				expect(JSON.stringify(page)).not.toContain(hiddenId);
+				cursor = page.nextCursor;
+			} while (cursor);
+			expect(pageTitles).toEqual([...expectedTitles]);
+		}
 	});
 });
 

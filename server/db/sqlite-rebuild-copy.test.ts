@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
@@ -11,6 +11,14 @@ import { fileAttributions } from "./schema";
 const databases: Database[] = [];
 const tempFolders: string[] = [];
 const migrationsPath = join(import.meta.dir, "../../drizzle");
+// The compressed migration history no longer contains these upstream SQL fixtures. If restored,
+// run both exact-byte 0153 checks again; synthetic rebuild tests below always remain active.
+const hasLegacyAttributionMigrations = [
+	"0044_bizarre_phalanx.sql",
+	"0146_mysterious_phalanx.sql",
+	"0147_easy_grey_gargoyle.sql",
+	"0153_tan_bushwacker.sql",
+].every((file) => existsSync(join(migrationsPath, file)));
 const breakpoint = "\n--> statement-breakpoint\n";
 
 afterEach(() => {
@@ -134,28 +142,30 @@ describe("canonical Drizzle rebuild-copy compatibility", () => {
 		expect(db.query("SELECT count(*) AS n FROM __drizzle_migrations").get()).toEqual({ n: 1 });
 	});
 
-	test("real 0153 preserves two legacy 13-column attributions, NULLs seven new columns and repairs user deletion", () => {
-		const db = database();
-		// 0.6.6→0.7.2 failed here: Drizzle CHECKs name `__new_file_attributions.lines_added`,
-		// and legacy ALTER TABLE does not rewrite that qualifier on RENAME.
-		db.run("PRAGMA legacy_alter_table = ON");
-		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
-		db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
-		for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
-			db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
-		}
-		db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
-		db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
-		db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
-		db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
-		expect(db.query("PRAGMA table_info(file_attributions)").all()).toHaveLength(13);
-		expect(db.query("PRAGMA foreign_key_list(file_attributions)").all()).toContainEqual(
-			expect.objectContaining({ from: "user_id", on_delete: "NO ACTION" }),
-		);
+	test.skipIf(!hasLegacyAttributionMigrations)(
+		"real 0153 preserves two legacy 13-column attributions, NULLs seven new columns and repairs user deletion",
+		() => {
+			const db = database();
+			// 0.6.6→0.7.2 failed here: Drizzle CHECKs name `__new_file_attributions.lines_added`,
+			// and legacy ALTER TABLE does not rewrite that qualifier on RENAME.
+			db.run("PRAGMA legacy_alter_table = ON");
+			db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
+			db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
+			for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
+				db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
+			}
+			db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
+			db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
+			db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
+			db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
+			expect(db.query("PRAGMA table_info(file_attributions)").all()).toHaveLength(13);
+			expect(db.query("PRAGMA foreign_key_list(file_attributions)").all()).toContainEqual(
+				expect.objectContaining({ from: "user_id", on_delete: "NO ACTION" }),
+			);
 
-		db.run("INSERT INTO users VALUES ('user-1'), ('user-2')");
-		db.run("INSERT INTO narrators VALUES ('narrator-1'), ('narrator-2')");
-		db.run(`INSERT INTO file_attributions
+			db.run("INSERT INTO users VALUES ('user-1'), ('user-2')");
+			db.run("INSERT INTO narrators VALUES ('narrator-1'), ('narrator-2')");
+			db.run(`INSERT INTO file_attributions
 			(id, device_id, workspace_path, file_path, narrator_id, user_id, subagent_type,
 			 action, tool_name, tool_use_id, lines_added, lines_removed, changed_at)
 			VALUES
@@ -163,86 +173,90 @@ describe("canonical Drizzle rebuild-copy compatibility", () => {
 			 'edit', 'Edit', 'tool-1', 12, 4, '2026-09-01T10:00:00Z'),
 			('attr-2', 'remote-2', '/work/two', 'src/two.ts', 'narrator-2', 'user-2', NULL,
 			 'write', 'Write', 'tool-2', 0, NULL, '2026-09-02T11:00:00Z')`);
-		// Fresh statements across DDL: Bun's query() cache can retain SELECT * result column names.
-		const oldRows = db.prepare("SELECT * FROM file_attributions ORDER BY id").all() as Array<
-			Record<string, string | number | null>
-		>;
-		const newColumns = {
-			operation_id: null,
-			effect_id: null,
-			scope_id: null,
-			file_key: null,
-			actor_subject_key: null,
-			actor_snapshot_json: null,
-			attribution_grade: null,
-		};
-		const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
-		// Exact committed bytes go only to a temporary fixture; never patch drizzle/ or its journal.
-		const folder = migrationsWith(sql, "0153_tan_bushwacker");
-		applyPendingMigrationsByHash(db, folder);
+			// Fresh statements across DDL: Bun's query() cache can retain SELECT * result column names.
+			const oldRows = db.prepare("SELECT * FROM file_attributions ORDER BY id").all() as Array<
+				Record<string, string | number | null>
+			>;
+			const newColumns = {
+				operation_id: null,
+				effect_id: null,
+				scope_id: null,
+				file_key: null,
+				actor_subject_key: null,
+				actor_snapshot_json: null,
+				attribution_grade: null,
+			};
+			const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
+			// Exact committed bytes go only to a temporary fixture; never patch drizzle/ or its journal.
+			const folder = migrationsWith(sql, "0153_tan_bushwacker");
+			applyPendingMigrationsByHash(db, folder);
 
-		expect(db.query("PRAGMA table_info(file_attributions)").all()).toHaveLength(20);
-		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
-			oldRows.map((row) => ({ ...row, ...newColumns })),
-		);
-		expect(db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
-		expect(db.query("PRAGMA foreign_key_check(file_attributions)").all()).toEqual([]);
-		expect(db.query("SELECT hash FROM __drizzle_migrations").all()).toEqual([
-			{ hash: createHash("sha256").update(sql).digest("hex") },
-		]);
-		applyPendingMigrationsByHash(db, folder);
-		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
-			oldRows.map((row) => ({ ...row, ...newColumns })),
-		);
-		db.run("DELETE FROM users WHERE id = 'user-1'");
-		expect(db.query("SELECT id, user_id FROM file_attributions ORDER BY id").all()).toEqual([
-			{ id: "attr-1", user_id: null },
-			{ id: "attr-2", user_id: "user-2" },
-		]);
-		db.run("DELETE FROM users WHERE id = 'user-2'");
-		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
-			oldRows.map((row) => ({ ...row, ...newColumns, user_id: null })),
-		);
-	});
+			expect(db.query("PRAGMA table_info(file_attributions)").all()).toHaveLength(20);
+			expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
+				oldRows.map((row) => ({ ...row, ...newColumns })),
+			);
+			expect(db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+			expect(db.query("PRAGMA foreign_key_check(file_attributions)").all()).toEqual([]);
+			expect(db.query("SELECT hash FROM __drizzle_migrations").all()).toEqual([
+				{ hash: createHash("sha256").update(sql).digest("hex") },
+			]);
+			applyPendingMigrationsByHash(db, folder);
+			expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
+				oldRows.map((row) => ({ ...row, ...newColumns })),
+			);
+			db.run("DELETE FROM users WHERE id = 'user-1'");
+			expect(db.query("SELECT id, user_id FROM file_attributions ORDER BY id").all()).toEqual([
+				{ id: "attr-1", user_id: null },
+				{ id: "attr-2", user_id: "user-2" },
+			]);
+			db.run("DELETE FROM users WHERE id = 'user-2'");
+			expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
+				oldRows.map((row) => ({ ...row, ...newColumns, user_id: null })),
+			);
+		},
+	);
 
-	test("real 0153 renames under legacy_alter_table because CHECK no longer names __new_file_attributions", () => {
-		const db = database();
-		db.run("PRAGMA legacy_alter_table = ON");
-		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
-		db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
-		for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
-			db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
-		}
-		db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
-		db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
-		db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
-		db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
-		db.run(`INSERT INTO file_attributions
+	test.skipIf(!hasLegacyAttributionMigrations)(
+		"real 0153 renames under legacy_alter_table because CHECK no longer names __new_file_attributions",
+		() => {
+			const db = database();
+			db.run("PRAGMA legacy_alter_table = ON");
+			db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
+			db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
+			for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
+				db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
+			}
+			db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
+			db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
+			db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
+			db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
+			db.run(`INSERT INTO file_attributions
 			(id, device_id, workspace_path, file_path, narrator_id, user_id, subagent_type,
 			 action, tool_name, tool_use_id, lines_added, lines_removed, changed_at)
 			VALUES
 			('attr-1', 'local', '/work/one', 'src/one.ts', null, null, null,
 			 'edit', 'Edit', 'tool-1', 12, 4, '2026-09-01T10:00:00Z')`);
-		const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
-		applyPendingMigrationsByHash(db, migrationsWith(sql, "0153_tan_bushwacker"));
+			const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
+			applyPendingMigrationsByHash(db, migrationsWith(sql, "0153_tan_bushwacker"));
 
-		const created = db
-			.query("SELECT sql FROM sqlite_master WHERE name = 'file_attributions'")
-			.get() as {
-			sql: string;
-		};
-		expect(created.sql).not.toContain("__new_file_attributions");
-		expect(created.sql).toContain("ck_file_attr_line_counts");
-		expect(db.query("SELECT id, lines_added, lines_removed FROM file_attributions").all()).toEqual([
-			{ id: "attr-1", lines_added: 12, lines_removed: 4 },
-		]);
-		expect(() =>
-			db.run(`INSERT INTO file_attributions
+			const created = db
+				.query("SELECT sql FROM sqlite_master WHERE name = 'file_attributions'")
+				.get() as {
+				sql: string;
+			};
+			expect(created.sql).not.toContain("__new_file_attributions");
+			expect(created.sql).toContain("ck_file_attr_line_counts");
+			expect(
+				db.query("SELECT id, lines_added, lines_removed FROM file_attributions").all(),
+			).toEqual([{ id: "attr-1", lines_added: 12, lines_removed: 4 }]);
+			expect(() =>
+				db.run(`INSERT INTO file_attributions
 				(id, device_id, workspace_path, file_path, action, changed_at, lines_added)
 				VALUES ('attr-bad', 'local', '/work', 'x.ts', 'edit', '2026-09-01T10:00:00Z', -1)`),
-		).toThrow(/ck_file_attr_line_counts|CHECK constraint/i);
-		expect(db.query("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 1 });
-	});
+			).toThrow(/ck_file_attr_line_counts|CHECK constraint/i);
+			expect(db.query("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 1 });
+		},
+	);
 
 	test("strips this __new_ table's CHECK qualifier without rewriting the same text inside a string", () => {
 		const db = database();
@@ -293,7 +307,10 @@ describe("canonical Drizzle rebuild-copy compatibility", () => {
 		};
 		expect(created.sql).not.toMatch(/"__new_x"\s*\.\s*"added"/);
 		expect(created.sql).toContain("ck_own");
-		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([{ id: "row-1" }, { id: "row-2" }]);
+		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([
+			{ id: "row-1" },
+			{ id: "row-2" },
+		]);
 	});
 
 	test("omits new columns so text, numeric and expression defaults apply to every copied row", () => {

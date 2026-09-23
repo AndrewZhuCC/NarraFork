@@ -16,6 +16,7 @@ import { logger } from "../../lib/logger";
 import {
 	claimNextRefSeq,
 	NARRATOR_REF_SEQ_EMPTY_TOP,
+	raiseSeqFloorForClaim,
 	readTopRefSeq,
 } from "../narrator-refs/seq-store";
 import { MAILBOX_LIMITS as L } from "./limits";
@@ -261,6 +262,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		if (inserted) {
 			// Single seq authority (narrator-refs/seq-store.ts); base 0 for an empty
 			// narrator, unified with every other refs writer.
+			raiseSeqFloorForClaim(tx, narratorId);
 			tx.insert(narratorMessageRefs)
 				.values({
 					id: generateId(),
@@ -443,6 +445,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					if (inserted) {
 						// Single seq authority (narrator-refs/seq-store.ts); base 0 for an
 						// empty narrator, unified with every other refs writer.
+						raiseSeqFloorForClaim(tx, recipientId);
 						tx.insert(narratorMessageRefs)
 							.values({
 								id: generateId(),
@@ -1310,14 +1313,72 @@ export function getRuntimePublicationService(): AsyncRuntimePublicationService {
 	return service;
 }
 
-// The import-time backend decision uses the SAME pure resolver
-// (`resolveDatabaseBackendConfig`, imported from db/postgres-runtime — NOT from the
-// db index, whose exports are substituted by test mocks) that db/index.ts used to
-// install the fail-closed SQLite proxies, with one addition: a queue bound BEFORE
-// this module was imported (test harnesses) also selects the PostgreSQL facade.
-// On SQLite the service is constructed at module scope exactly as before (the
-// legacy rowid boundary keeps its import-time capture semantics); on PostgreSQL
-// the fail-closed facade above takes over and no proxy is touched.
+// SQLite producers register at module scope, before db/index.ts may have finished its
+// top-level await. Keep those registrations, but capture the legacy rowid boundary only
+// at the explicit startup gate, after migrations and before new work is accepted.
+const sqlitePublicationRegistrations: PgPublicationRegistrations = { legacyReaders: new Map() };
+let sqlitePublicationService: RuntimePublicationService | undefined;
+let sqlitePublicationStopped = false;
+
+export function activateSqliteRuntimePublication(database: RuntimeDb): void {
+	if (publicationBackend() !== "sqlite")
+		throw new Error("Cannot activate SQLite runtime publication on the PostgreSQL backend");
+	if (!database) throw new Error("SQLite runtime publication requires an initialized database");
+	if (sqlitePublicationService) return;
+	const service = createRuntimePublicationService(database);
+	for (const kind of ["agent", "bash"] as const) {
+		const reader = sqlitePublicationRegistrations.legacyReaders.get(kind);
+		if (reader) service.setLegacyRuntimeAdmissionReader(kind, reader);
+	}
+	if (sqlitePublicationRegistrations.completionReader)
+		service.setLegacyCompletionAdmissionReader(sqlitePublicationRegistrations.completionReader);
+	service.setWake(sqlitePublicationRegistrations.wake);
+	if (sqlitePublicationStopped) service.stop();
+	sqlitePublicationService = service;
+}
+
+function createDeferredSqlitePublicationFacade(): RuntimePublicationService {
+	const ready = () => {
+		if (!sqlitePublicationService)
+			throw new Error("SQLite runtime publication is not activated; startup must complete first");
+		return sqlitePublicationService;
+	};
+	return {
+		get store() {
+			return ready().store;
+		},
+		reserve: (...args) => ready().reserve(...args),
+		startAgentRun: (...args) => ready().startAgentRun(...args),
+		getAgentRun: (...args) => ready().getAgentRun(...args),
+		persistResult: (...args) => ready().persistResult(...args),
+		commit: (...args) => ready().commit(...args),
+		flushRecipient: (...args) => ready().flushRecipient(...args),
+		flushPage: (...args) => ready().flushPage(...args),
+		schedule: (...args) => ready().schedule(...args),
+		hasPendingSource: (...args) => ready().hasPendingSource(...args),
+		newBashRun: (...args) => ready().newBashRun(...args),
+		migrateLegacyTaskNotice: (...args) => ready().migrateLegacyTaskNotice(...args),
+		setLegacyRuntimeAdmissionReader: (kind, reader) => {
+			sqlitePublicationRegistrations.legacyReaders.set(kind, reader);
+			sqlitePublicationService?.setLegacyRuntimeAdmissionReader(kind, reader);
+		},
+		setLegacyCompletionAdmissionReader: (reader) => {
+			sqlitePublicationRegistrations.completionReader = reader;
+			sqlitePublicationService?.setLegacyCompletionAdmissionReader(reader);
+		},
+		setWake: (handler) => {
+			sqlitePublicationRegistrations.wake = handler;
+			sqlitePublicationService?.setWake(handler);
+		},
+		stop: () => {
+			sqlitePublicationStopped = true;
+			sqlitePublicationService?.stop();
+		},
+	};
+}
+
+// The import-time backend decision uses only pure resolvers, never the unfinished
+// SQLite db handle (nor an invented PostgreSQL runtime).
 export const runtimePublication: RuntimePublicationService = (() => {
 	if (resolveDatabaseBackendConfig().backend === "postgres")
 		return createUnwiredPublicationFacade(pgPublicationRegistrations);
@@ -1328,7 +1389,7 @@ export const runtimePublication: RuntimePublicationService = (() => {
 		// A selector-env/backend mismatch is a startup error reported by the startup
 		// path; module construction must not crash before that report exists.
 	}
-	return createRuntimePublicationService(db);
+	return createDeferredSqlitePublicationFacade();
 })();
 workerLifecycle.stop = () => runtimePublication.stop();
 export async function flushRuntimePublications(recipientId?: string): Promise<void> {

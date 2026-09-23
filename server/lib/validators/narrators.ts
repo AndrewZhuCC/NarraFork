@@ -158,6 +158,7 @@ export const sendMessageSchema = z
 	.object({
 		message: z.string().default(""),
 		priority: z.boolean().optional(),
+		interrupt: z.boolean().optional(),
 		fileReferences: fileReferencesSchema.optional(),
 	})
 	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {
@@ -475,6 +476,16 @@ export const forkNarratorSchema = z
 		message: "forkMessageId or forkMessageUuid is required",
 	});
 
+/**
+ * Extract a subagent into an independent primary narrator (materialized history copy).
+ * Distinct from fork: the source stays a subagent; the product is a primary session.
+ */
+export const extractPrimarySchema = z.object({
+	title: z.string().min(1).max(200).optional(),
+	inheritMode: z.enum(["full", "compressed"]).optional(),
+	locale: z.enum(["en", "zh-CN"]).optional(),
+});
+
 export const askInPassingSchema = z.object({
 	question: z.string().min(1).max(10000),
 	pendingMessageId: z.string().min(1),
@@ -585,12 +596,17 @@ export const suggestAnswersSchema = z.object({
 	questions: z
 		.array(
 			z.object({
-				question: z.string().min(1),
+				// Advertised shape is header + description only; legacy key fields are
+				// accepted so older clients can still post suggest payloads.
+				id: z.string().min(1).optional(),
+				question: z.string().min(1).optional(),
 				header: z.string().min(1),
+				description: z.string().optional(),
 				options: z.array(
 					z.object({
-						label: z.string(),
-						description: z.string(),
+						header: z.string().min(1).optional(),
+						label: z.string().optional(),
+						description: z.string().optional(),
 					}),
 				),
 				multiSelect: z.boolean().optional(),

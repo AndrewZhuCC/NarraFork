@@ -134,6 +134,8 @@ export interface TokenUsageSnapshot {
 }
 
 export interface EventHandlerContext {
+	/** Initiating user captured for this pass, including background translations. */
+	userId?: string | null;
 	/** Production runners require durable receipts; standalone display adapters may omit them. */
 	requireToolCallBinding?: boolean;
 	/** Narrator ID that owns the messages (subagent's own ID) */
@@ -509,6 +511,30 @@ export function clearStreamingSnapshot(narratorId: string): void {
 	streamingSnapshots.delete(narratorId);
 }
 
+/** Reset one author's stream without deleting concurrently running relatives. */
+function clearAuthorStreamingSnapshot(ctx: EventHandlerContext): void {
+	const ownerId = ctx.parentToolUseId ? ctx.narratorId : ctx.broadcastTargetId;
+	const owner = streamingSnapshots.get(ownerId);
+	// A narrator's snapshot also holds its children's tool summaries. Those children
+	// can keep running after this author finishes a message or retries an attempt.
+	const childTools = new Map(
+		[...(owner?.toolChunks ?? [])].filter(([, chunk]) => chunk.parentToolUseId),
+	);
+	if (childTools.size > 0) {
+		streamingSnapshots.set(ownerId, { streamingBlocks: [], toolChunks: childTools });
+	} else {
+		clearStreamingSnapshot(ownerId);
+	}
+	if (ctx.parentToolUseId) {
+		const parent = streamingSnapshots.get(ctx.broadcastTargetId);
+		if (parent) {
+			for (const [id, chunk] of parent.toolChunks) {
+				if (chunk.parentToolUseId === ctx.parentToolUseId) parent.toolChunks.delete(id);
+			}
+		}
+	}
+}
+
 // === Dual broadcast for subagent self-subscription ===
 
 /**
@@ -715,8 +741,7 @@ async function discardAttemptPersistedBlocks(
 	// client rendering blocks that no longer exist until something else happens to
 	// retire them. Done regardless of whether a partial row exists: the streaming
 	// blocks are client state and are not conditional on persistence.
-	clearStreamingSnapshot(broadcastTargetId);
-	if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+	clearAuthorStreamingSnapshot(ctx);
 	ctx.fileReferenceContexts?.clear();
 	ctx.committedContentSnapshots?.clear();
 	ctx.unpublishedContentBlockIds?.clear();
@@ -1002,7 +1027,7 @@ function translateReasoningBlock(
 			const result = await summaryGenerate(
 				reasoningText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
-				{ narratorId, kind: "reasoning_translation" },
+				{ narratorId, userId: ctx.userId ?? null, kind: "reasoning_translation" },
 				undefined,
 				undefined,
 				resolveTranslationModelOverride(),
@@ -1849,8 +1874,7 @@ export async function processEvent(
 			ctx.fileReferenceContexts?.clear();
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();
-			clearStreamingSnapshot(broadcastTargetId);
-			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+			clearAuthorStreamingSnapshot(ctx);
 			ctx.attemptBlockBaselines?.clear();
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 
@@ -2248,8 +2272,7 @@ export async function processEvent(
 
 		case "error": {
 			// Snapshot: clear streaming state on error
-			clearStreamingSnapshot(broadcastTargetId);
-			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+			clearAuthorStreamingSnapshot(ctx);
 			ctx.fileReferenceContexts?.clear();
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();
@@ -2315,8 +2338,7 @@ export async function processEvent(
 			// A reasoning-only dead turn was discarded. Clear the streaming snapshot
 			// (which still holds the live reasoning that will not be persisted) and
 			// tell the frontend to drop the streaming blocks it is currently showing.
-			clearStreamingSnapshot(broadcastTargetId);
-			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+			clearAuthorStreamingSnapshot(ctx);
 			ctx.fileReferenceContexts?.clear();
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();
@@ -2790,9 +2812,15 @@ export async function processEvent(
 				event.requestId,
 				startApiRequest({
 					narratorId,
+					// Event owner only. Falling back to ctx.userId would re-attribute a
+					// request that arrived without a user to whoever owns the context later
+					// (e.g. a parent pass after a subagent turn) — usage stats must not
+					// invent an owner. Missing event.userId stays null.
+					userId: event.userId ?? null,
 					provider: event.provider,
 					model: event.model,
 					credentialId: event.credentialId,
+					referencePricingSnapshot: event.referencePricingSnapshot,
 					kind: "narrator",
 				}),
 			);

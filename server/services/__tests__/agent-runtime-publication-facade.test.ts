@@ -5,19 +5,63 @@
  * every database operation throws a precise error instead of touching the fail-closed
  * SQLite proxy.
  *
- * This suite runs on SQLite: it constructs the facade directly (the module-level export
- * keeps the eager SQLite service here, pinned by every other publication test).
+ * This suite runs on SQLite: it constructs the PG facade directly and verifies that
+ * the module-level SQLite facade waits for explicit startup activation.
  */
-import { expect, test } from "bun:test";
-import { db } from "../../db";
+import { afterAll, expect, test } from "bun:test";
+import { getTestDb } from "../../../tests/setup";
+import { narrators } from "../../db/schema";
 import {
+	activateSqliteRuntimePublication,
 	createRuntimePublicationService,
 	createUnwiredPublicationFacade,
 	runtimePublication,
 } from "../agent-runtime/publication";
 
-// Retire the module-level worker's timer so this file leaves no scheduled flush behind.
+const { db, sqlite } = getTestDb();
+afterAll(() => sqlite.close());
+// Keep the module-level worker stopped once the explicit startup gate constructs it.
 runtimePublication.stop();
+
+test("SQLite import stays inert; early registrations survive startup activation exactly once", async () => {
+	expect(() => runtimePublication.store).toThrow("not activated");
+	const { agentLoop } = await import("../../lib/agent/loop");
+	expect(typeof agentLoop).toBe("function");
+	expect(() => runtimePublication.store).toThrow("not activated");
+	expect(() => runtimePublication.newBashRun("task", "parent")).toThrow("not activated");
+	let wakes = 0;
+	runtimePublication.setWake(() => {
+		wakes++;
+	});
+	runtimePublication.setLegacyRuntimeAdmissionReader("agent", () => undefined);
+	runtimePublication.setLegacyCompletionAdmissionReader(() => undefined);
+	expect(() => activateSqliteRuntimePublication(undefined as never)).toThrow(
+		"initialized database",
+	);
+	activateSqliteRuntimePublication(db);
+	const store = runtimePublication.store;
+	activateSqliteRuntimePublication(db);
+	expect(runtimePublication.store).toBe(store);
+
+	const now = new Date().toISOString();
+	db.insert(narrators)
+		.values({ id: "publication-startup-parent", createdAt: now, updatedAt: now })
+		.run();
+	const run = runtimePublication.newBashRun(
+		"publication-startup-task",
+		"publication-startup-parent",
+	);
+	db.transaction((tx) => {
+		runtimePublication.reserve(run, tx);
+		runtimePublication.commit(
+			{ ...run, eventKind: "completed", resultRef: "startup-result", summary: "done" },
+			tx,
+		);
+	});
+	expect(runtimePublication.flushRecipient(run.recipientId)).toBe(1);
+	expect(wakes).toBe(1);
+	runtimePublication.setWake(undefined);
+});
 
 test("the facade exposes the exact synchronous API surface of the real service", () => {
 	const real = createRuntimePublicationService(db);

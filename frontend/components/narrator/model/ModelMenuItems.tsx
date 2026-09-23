@@ -1,6 +1,8 @@
 import { ActionIcon, Badge, Box, CloseButton, Group, Menu, Text, TextInput } from "@mantine/core";
 import {
+	IconAlertTriangle,
 	IconCheck,
+	IconDotsVertical,
 	IconInfoCircle,
 	IconPencil,
 	IconRefresh,
@@ -11,11 +13,16 @@ import { useTranslation } from "react-i18next";
 import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
+	FOLLOW_PARENT_MODEL,
 	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
-import { centerModelMenuSelection, modelMenuSelection } from "./model-menu-selection";
+import {
+	canAssignGlobalModelRole,
+	centerModelMenuSelection,
+	modelMenuSelection,
+} from "./model-menu-selection";
 
 /**
  * The provider-grouped model list rendered inside a narrator's model menu.
@@ -24,6 +31,12 @@ import { centerModelMenuSelection, modelMenuSelection } from "./model-menu-selec
  * pencil that opens the global model picker, and a NUG provider group gets a
  * refresh button that re-fetches that gateway's catalog (which is also what
  * clears a stale "temporarily unavailable" flag).
+ *
+ * Each settable model row also gets a three-dot control that expands the
+ * global-role actions (default / summary) inline below the row. Inline expansion
+ * rather than a nested Menu on purpose: Mantine v7 has no Menu.Sub, and a
+ * Menu/Popover nested inside this dropdown is unreliable (the outer menu
+ * intercepts the trigger) — same reasoning as CompactMenuSub.
  */
 export function ModelMenuItems({
 	allModels,
@@ -37,6 +50,10 @@ export function ModelMenuItems({
 	providerLabels,
 	onEditDefaultModel,
 	onEditSummaryModel,
+	onSetAsDefaultModel,
+	onSetAsSummaryModel,
+	defaultModelValue,
+	summaryModelValue,
 	nugProviderIdByPrefix,
 	onRefreshProviderModels,
 	refreshingProviderId,
@@ -57,6 +74,20 @@ export function ModelMenuItems({
 	onEditDefaultModel?: () => void;
 	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
 	onEditSummaryModel?: () => void;
+	/**
+	 * When provided together with a settable model value, each model row gets a
+	 * three-dot menu that can promote that model to the instance default.
+	 */
+	onSetAsDefaultModel?: (model: string) => void;
+	/**
+	 * When provided together with a settable model value, each model row gets a
+	 * three-dot menu that can promote that model to the instance summary slot.
+	 */
+	onSetAsSummaryModel?: (model: string) => void;
+	/** Current instance default model, used to mark the three-dot menu action. */
+	defaultModelValue?: string | null;
+	/** Current instance summary model, used to mark the three-dot menu action. */
+	summaryModelValue?: string | null;
 	/**
 	 * Provider prefix → NUG provider id. Groups are keyed by prefix, but the
 	 * refresh endpoint is keyed by provider id, so the mapping is what makes a
@@ -81,10 +112,13 @@ export function ModelMenuItems({
 	const selectedItemRef = useRef<HTMLButtonElement>(null);
 	const footerRef = useRef<HTMLDivElement>(null);
 	const [filter, setFilter] = useState("");
+	/** Model value whose three-dot global-role actions are currently expanded. */
+	const [actionsModelValue, setActionsModelValue] = useState<string | null>(null);
 	// Never recenter on search or catalog refresh, including during the exit transition.
 	useEffect(() => {
 		if (!opened) {
 			setFilter("");
+			setActionsModelValue(null);
 			return;
 		}
 		const frame = window.requestAnimationFrame(() => {
@@ -148,6 +182,12 @@ export function ModelMenuItems({
 	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
 	return (
 		<>
+			{/* Inheritance is a current-state label, not a catalog model or a global role. */}
+			{currentModel === FOLLOW_PARENT_MODEL && (
+				<Menu.Item disabled ref={selectedItemRef} rightSection={<IconCheck size={14} />}>
+					{t("followParent")}
+				</Menu.Item>
+			)}
 			{totalCostUsd != null && totalCostUsd > 0 && (
 				<>
 					<Menu.Label ta="right">${totalCostUsd.toFixed(4)}</Menu.Label>
@@ -235,6 +275,69 @@ export function ModelMenuItems({
 									? currentAgg?.aggId === aggId
 									: selection.value === m.value;
 								const showMembers = isAggItem && selected && selection.members.length > 0;
+								// Three-dot actions only on top-level rows that can actually occupy a
+								// global slot. Meta sentinels would make the slot circular.
+								// A delisted-but-pinned model must not offer "set as default/summary" —
+								// that would just re-affirm the dead pin. Offer the role pickers instead.
+								const isCatalogMissing = m.catalogMissing === true;
+								const showActionsToggle =
+									(canAssignGlobalModelRole(m.value) &&
+										!!(onSetAsDefaultModel || onSetAsSummaryModel) &&
+										!isCatalogMissing) ||
+									(isCatalogMissing && !!(onEditDefaultModel || onEditSummaryModel));
+								const actionsOpen = showActionsToggle && actionsModelValue === m.value;
+								const globalRoleActions: Array<{
+									key: "default" | "summary";
+									label: string;
+									current: boolean;
+									onSelect: () => void;
+								}> = [];
+								if (isCatalogMissing) {
+									if (onEditDefaultModel) {
+										globalRoleActions.push({
+											key: "default",
+											label: t("editDefaultModel"),
+											current: !!defaultModelValue && defaultModelValue === m.value,
+											onSelect: () => onEditDefaultModel(),
+										});
+									}
+									if (onEditSummaryModel) {
+										globalRoleActions.push({
+											key: "summary",
+											label: t("editSummaryModel"),
+											current: !!summaryModelValue && summaryModelValue === m.value,
+											onSelect: () => onEditSummaryModel(),
+										});
+									}
+								} else if (showActionsToggle) {
+									if (onSetAsDefaultModel) {
+										globalRoleActions.push({
+											key: "default",
+											label: t("setAsDefaultModel"),
+											current: !!defaultModelValue && defaultModelValue === m.value,
+											onSelect: () => onSetAsDefaultModel(m.value),
+										});
+									}
+									if (onSetAsSummaryModel) {
+										globalRoleActions.push({
+											key: "summary",
+											label: t("setAsSummaryModel"),
+											current: !!summaryModelValue && summaryModelValue === m.value,
+											onSelect: () => onSetAsSummaryModel(m.value),
+										});
+									}
+								}
+								const catalogMissingHint = isCatalogMissing
+									? m.pinnedAs?.length
+										? t("modelCatalogMissingHint", {
+												roles: m.pinnedAs
+													.map((role) =>
+														role === "default" ? ts("defaultModel") : ts("summaryModel"),
+													)
+													.join(" / "),
+											})
+										: t("modelCatalogMissingHintGeneric")
+									: null;
 								return (
 									<Fragment key={m.value}>
 										<Menu.Item
@@ -247,6 +350,11 @@ export function ModelMenuItems({
 											onClick={() => onSelect(m.value)}
 											rightSection={
 												<Group gap={4} wrap="nowrap">
+													{isCatalogMissing && (
+														<Badge size="xs" variant="light" color="orange">
+															{t("modelCatalogMissing")}
+														</Badge>
+													)}
 													{m.available === false && (
 														<Badge size="xs" variant="light" color="yellow">
 															{t("modelTemporarilyUnavailable")}
@@ -257,7 +365,7 @@ export function ModelMenuItems({
 															×{m.rateMultiplier}
 														</Badge>
 													)}
-													{m.pricing && (
+													{onShowPrice && !m.value.startsWith(AGG_MODEL_PREFIX) && (
 														<ActionIcon
 															component="div"
 															role="button"
@@ -265,11 +373,23 @@ export function ModelMenuItems({
 															variant="subtle"
 															color="gray"
 															size="sm"
-															aria-label={t("viewModelPrice")}
+															aria-label={ts("catalog.details")}
 															onClick={(e) => {
 																e.stopPropagation();
 																e.preventDefault();
-																onShowPrice?.(m);
+																const actualValue =
+																	m.provider === "__default__"
+																		? defaultModelValue
+																		: m.provider === "__summary__"
+																			? summaryModelValue
+																			: m.value;
+																onShowPrice?.(actualValue ? { ...m, value: actualValue } : m);
+															}}
+															onKeyDown={(event) => {
+																if (event.key !== "Enter" && event.key !== " ") return;
+																event.preventDefault();
+																event.stopPropagation();
+																event.currentTarget.click();
 															}}
 														>
 															<IconInfoCircle size={14} />
@@ -279,13 +399,69 @@ export function ModelMenuItems({
 														size={14}
 														style={{ visibility: selected ? "visible" : "hidden" }}
 													/>
+													{showActionsToggle && (
+														<ActionIcon
+															component="div"
+															role="button"
+															tabIndex={0}
+															variant="subtle"
+															color="gray"
+															size="sm"
+															aria-label={t("modelActions")}
+															aria-expanded={actionsOpen}
+															title={t("modelActions")}
+															onClick={(e) => {
+																e.stopPropagation();
+																e.preventDefault();
+																setActionsModelValue((prev) => (prev === m.value ? null : m.value));
+															}}
+														>
+															<IconDotsVertical size={14} />
+														</ActionIcon>
+													)}
 												</Group>
 											}
 											fw={selected ? 600 : 400}
-											c={m.available === false ? "dimmed" : undefined}
+											c={m.available === false || isCatalogMissing ? "dimmed" : undefined}
 										>
-											{m.label}
+											<Box>
+												<Text size="sm" inherit>
+													{m.label}
+												</Text>
+												{catalogMissingHint && (
+													<Group gap={4} wrap="nowrap" mt={2} align="flex-start">
+														<IconAlertTriangle size={12} color="var(--mantine-color-orange-6)" />
+														<Text size="xs" c="orange" lh={1.3}>
+															{catalogMissingHint}
+														</Text>
+													</Group>
+												)}
+											</Box>
 										</Menu.Item>
+										{actionsOpen && globalRoleActions.length > 0 && (
+											<Box onClick={(e) => e.stopPropagation()} data-model-role-actions={m.value}>
+												{globalRoleActions.map((action) => (
+													<Menu.Item
+														key={action.key}
+														rightSection={action.current ? <IconCheck size={14} /> : undefined}
+														styles={{
+															itemLabel: {
+																width: "100%",
+																textAlign: "right",
+															},
+														}}
+														onClick={(e) => {
+															e.stopPropagation();
+															e.preventDefault();
+															action.onSelect();
+															setActionsModelValue(null);
+														}}
+													>
+														{action.label}
+													</Menu.Item>
+												))}
+											</Box>
+										)}
 										{showMembers &&
 											aggId &&
 											[undefined, ...selection.members].map((member) => {

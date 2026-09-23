@@ -425,6 +425,8 @@ export interface WorkspaceBarrier {
 	ranges: { kind: string; canonicalPath: string }[];
 	executionEnded: boolean;
 	blockedReason: string | null;
+	maintenanceRequired?: boolean;
+	ownerProbeRetryAllowed?: boolean;
 	kind: "quarantined" | "unverified_root";
 	local: boolean;
 	operations: WorkspaceBarrierOperation[];
@@ -460,6 +462,7 @@ export interface WorkspaceBarrierObservationResult {
 }
 
 export interface WorkspaceBarrierRecoveryResult {
+	remaining?: { rootVerificationRequired: boolean; legacyBarrier: boolean; leaseBarrier: boolean };
 	recovered: "barrier_cleared" | "root_verified";
 	settledEffectCount: number;
 	revision?: number;
@@ -1002,6 +1005,22 @@ export interface PretextDocumentPageResult {
 	/** More rows exist older than this page (drives reverse infinite scroll). */
 	hasPrev: boolean;
 	messageVersion: number;
+}
+
+export interface HistoryRecoveryCandidate {
+	messageId: string;
+	seq: number;
+	role: string;
+	createdAt: string;
+	toolCount: number;
+	byteSize: number;
+	preview: string | null;
+	latest: boolean;
+}
+
+export interface HistoryRecoveryResult {
+	candidates: HistoryRecoveryCandidate[];
+	thresholds: { toolCount: number; byteSize: number };
 }
 
 export interface MessageLocationResult {

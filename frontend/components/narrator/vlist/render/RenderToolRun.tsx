@@ -38,6 +38,7 @@ import { Box, Group, Text, ThemeIcon } from "@mantine/core";
 import {
 	resolveToolShimmerFlash,
 	resolveToolShimmerPhase,
+	TOOL_SHIMMER_QUEUED_EXIT_MS,
 	type ToolShimmerFlash,
 	type ToolShimmerKind,
 	TRACE_SHIMMER_CLASS,
@@ -75,14 +76,16 @@ import {
 	traceMetrics,
 } from "../measure/measure-tool-run";
 import { typographyMetrics } from "../pretext-fonts";
+import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import {
-	hasToolRowStatusMark,
 	isTerminalToolRowStatus,
+	resolveToolRowStatusMark,
+	type ToolRowStatusMark,
 	TRACE_ROW_STATUS_SLOT_STYLE,
 	TraceRowStatusGlyph,
 } from "./trace-row-status";
@@ -142,13 +145,24 @@ export interface TraceRenderLabels {
 	 * geometry.
 	 */
 	shimmerState?: Partial<Record<ToolShimmerKind, string>>;
+	/**
+	 * One name per status MARK, for readers who do not get the glyph's colour or
+	 * shape. Distinct from `shimmerState` on purpose: shimmer is silent for two of
+	 * the states a mark does report (`pending` gets no sweep at all), so a row
+	 * awaiting a decision would otherwise have no accessible name anywhere.
+	 * Attributes only — height-neutral.
+	 */
+	statusMark?: Partial<Record<ToolRowStatusMark, string>>;
 }
 
-/** English names for the five shimmer states, used when no labels are injected. */
+/** English names for the shimmer states, used when no labels are injected. */
 const DEFAULT_SHIMMER_STATE_LABELS: Readonly<Record<ToolShimmerKind, string>> = {
 	streaming: "receiving input",
 	reflecting: "under review",
 	running: "running",
+	queued: "waiting for earlier tools",
+	// Transient leave-fade of the queued wash; named only so the Record stays total.
+	queued_out: "waiting for earlier tools",
 	success: "succeeded",
 	failed: "failed",
 };
@@ -396,6 +410,7 @@ export function RenderToolRun({
 					closing={closingRowKeys?.has(row.key) === true}
 					timingLabels={labels.timing}
 					shimmerStateLabels={labels.shimmerState}
+					statusMarkLabels={labels.statusMark}
 					liveTail={rowLiveTails?.get(row.key)}
 					liveTailChars={labels.liveTailChars}
 					// Only the row still being written may fade. `row.shimmer` is the
@@ -484,7 +499,34 @@ function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
 		// The row's only disambiguation for a `pending` tool: without it a deliberating
 		// gate would fall silent instead of turning purple.
 		reflectionStatus: row.reflectionStatus ?? null,
+		// Parked slate mark when an earlier same-turn call still owns the slot. The
+		// adapter resolved this from the real sibling prefix; a folded row cannot see
+		// its peers, so it passes the verdict rather than a synthesized peer list.
+		queuedBehindUpstream: row.queuedBehindUpstream,
 	});
+	// Leaving queued dissolves the slate tint instead of cutting the pulse mid-cycle
+	// (see CARD path and `TOOL_SHIMMER_QUEUED_EXIT_MS`).
+	const isQueued = phase === "queued";
+	const prevQueuedRef = useRef(false);
+	const [queuedExit, setQueuedExit] = useState(false);
+	useEffect(() => {
+		const wasQueued = prevQueuedRef.current;
+		prevQueuedRef.current = isQueued;
+		if (isQueued) {
+			setQueuedExit(false);
+			return;
+		}
+		if (wasQueued) {
+			setQueuedExit(true);
+			const timer = setTimeout(() => setQueuedExit(false), TOOL_SHIMMER_QUEUED_EXIT_MS);
+			return () => clearTimeout(timer);
+		}
+		// Non-queued phase changes must not cancel the exit timer (e.g. running → success).
+	}, [isQueued]);
+	// The leave-fade outranks a live phase for one short window: the parked mark
+	// must finish dissolving before the next sweep paints over it. A re-entry into
+	// queued cancels the fade (handled above).
+	if (queuedExit && phase !== "queued") return "queued_out";
 	// A live phase outranks a pending flash (a retry that resumed inside the window).
 	if (phase) return phase;
 	if (flash) return flash;
@@ -683,6 +725,7 @@ function TraceRowView({
 	closing = false,
 	timingLabels,
 	shimmerStateLabels,
+	statusMarkLabels,
 	liveTail,
 	liveTailChars,
 	animateStreaming,
@@ -698,6 +741,7 @@ function TraceRowView({
 	closing?: boolean;
 	timingLabels?: ToolTimingLabels;
 	shimmerStateLabels?: TraceRenderLabels["shimmerState"];
+	statusMarkLabels?: TraceRenderLabels["statusMark"];
 	liveTail?: { charCount: number; tail: string };
 	liveTailChars?: (formatted: string) => string;
 	/** This row is the live one AND the fade is enabled (see RenderToolRunProps). */
@@ -736,6 +780,13 @@ function TraceRowView({
 	// ONE call per row, deliberately above both label branches — see the module header
 	// on why calling it inside each branch loses a transition.
 	const shimmerKind = useTraceRowShimmerKind(row);
+	// The row's status mark, resolved ONCE from the same two facts the shimmer above
+	// reads. Passing them here is what stops a parked call from spinning beside text
+	// that says it is waiting (see `@shared/tool-row-status`).
+	const statusMark = resolveToolRowStatusMark(row.status, {
+		queuedBehindUpstream: row.queuedBehindUpstream,
+		reflectionStatus: row.reflectionStatus ?? null,
+	});
 	const shimmerClass = shimmerKind ? TRACE_SHIMMER_CLASS[shimmerKind] : undefined;
 	const shimmerLabel = shimmerStateLabel(shimmerKind, shimmerStateLabels);
 	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
@@ -797,23 +848,17 @@ function TraceRowView({
 			</Box>
 			{icon ? (
 				// `data-trace-row-chip`: the marker every compact row's category chip
-				// carries, so a parity test can find the SAME lane in a trace row and in a
-				// subagent card's recent-call row instead of guessing at each one's markup.
-				<ThemeIcon
+				// carries, so a parity test can find the SAME lane in a trace row, a
+				// subagent card's recent-call row, and an expanded tool card header.
+				// `iconColor` is the caller's explicit override (reasoning rows use grape);
+				// absent → the row's own CATEGORY via the shared table.
+				<CategoryChip
 					data-trace-row-chip
 					size={TRACE_ROW_ICON}
-					variant="light"
-					// `iconColor` is the caller's explicit override (reasoning rows use grape).
-					// Absent → derive the tint from the row's own CATEGORY, the same table the
-					// tool header and a subagent card's recent-call rows read. Falling back to
-					// grey here meant a row whose adapter supplied `category` but not
-					// `iconColor` rendered a colourless chip — the one thing the chip exists
-					// to avoid.
 					color={row.iconColor ?? categoryColor(row.category)}
-					radius="sm"
 				>
 					{icon}
-				</ThemeIcon>
+				</CategoryChip>
 			) : null}
 			{/* `flex: 0 1 auto` (not `flex: 1`) is what lets the status + duration HUG the
 			    title instead of being flung to the row's right edge. A short title keeps
@@ -835,16 +880,30 @@ function TraceRowView({
 			    duration beside it (fixed line, nowrap, height-neutral). Before the
 			    status so it stays adjacent to the path it describes. */}
 			<DiffStatsText stats={row.diffStats} />
-			{hasToolRowStatusMark(row.status) ? (
+			{statusMark ? (
 				<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
-					<TraceRowStatusGlyph status={row.status} />
+					<TraceRowStatusGlyph mark={statusMark} labels={statusMarkLabels} />
 				</Box>
 			) : null}
+			{/* ⚠️ `running` is narrowed past "not terminal": a QUEUED or AWAITING row has
+			    not executed for a single millisecond, and an elapsed counter there
+			    measures from the moment the model began writing the call's arguments —
+			    a row that had never run showed "17s", which reads as time the tool
+			    spent working. With `running` false and no final duration yet, the whole
+			    timing text is omitted (see `TimingText`), which is the honest output.
+
+			    Narrowed HERE rather than in `isTerminalToolRowStatus`: that predicate
+			    also gates the card's timeout editor, and a call awaiting approval must
+			    keep it. */}
 			{row.timing ? (
 				<ToolTimingArea
-					running={!isTerminalToolRowStatus(row.status)}
+					running={
+						!isTerminalToolRowStatus(row.status) &&
+						statusMark !== "queued" &&
+						statusMark !== "awaiting"
+					}
 					startedAt={row.timing.startedAt ?? row.timing.createdAt}
-					durationMs={row.timing.durationMs}
+					durationMs={row.displayDurationMs ?? row.timing.durationMs}
 					timing={row.timing}
 					labels={timingLabels}
 				/>

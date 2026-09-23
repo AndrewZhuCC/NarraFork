@@ -1,7 +1,9 @@
 import { formatCompactNumber, formatDuration } from "@frontend/lib/compact-number";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { formatReferenceCost } from "@frontend/lib/usage-cost";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
+import { usageUserLabel } from "@frontend/lib/usage-history-user";
 import type { UsageHistoryRawDumpSpill, UsageHistoryRecord } from "@frontend/types/usage-history";
 import {
 	ActionIcon,
@@ -749,6 +751,11 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 
 								<SimpleGrid cols={1} spacing="xs">
 									<DetailField
+										label={t("usageHistoryUser")}
+										value={usageUserLabel(record, t("usageHistoryUnattributed"))}
+										compact
+									/>
+									<DetailField
 										label={t("usageHistoryTableNarrator")}
 										value={
 											showNarratorId
@@ -799,9 +806,10 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 									value={
 										record.meterUsage != null
 											? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
-											: record.costUsd != null
-												? `$${record.costUsd.toFixed(6)}`
-												: "-"
+											: formatReferenceCost(record, record.costUsd, {
+													unknown: t("usageCostUnknown"),
+													partial: t("usageCostPartial"),
+												})
 									}
 									compact
 								/>
@@ -826,6 +834,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 						<Table.Thead>
 							<Table.Tr>
 								<Table.Th>{t("usageHistoryTableTime")}</Table.Th>
+								<Table.Th>{t("usageHistoryUser")}</Table.Th>
 								<Table.Th>
 									<Group gap={8} wrap="nowrap">
 										{t("usageHistoryTableNarrator")}
@@ -921,6 +930,11 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										</Stack>
 									</Table.Td>
 									<Table.Td>
+										<Text size="sm" title={record.userId ?? undefined}>
+											{usageUserLabel(record, t("usageHistoryUnattributed"))}
+										</Text>
+									</Table.Td>
+									<Table.Td>
 										<Text size="sm" ff={showNarratorId ? "monospace" : undefined}>
 											{showNarratorId
 												? (record.narratorId ?? "-")
@@ -974,7 +988,10 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											</Text>
 										) : (
 											<Text size="sm" fw={500} c={record.costUsd ? "green" : "dimmed"}>
-												{record.costUsd != null ? `$${record.costUsd.toFixed(6)}` : "-"}
+												{formatReferenceCost(record, record.costUsd, {
+													unknown: t("usageCostUnknown"),
+													partial: t("usageCostPartial"),
+												})}
 											</Text>
 										)}
 									</Table.Td>
@@ -1024,6 +1041,19 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 				size="xl"
 				centered
 			>
+				{selectedRecord ? (
+					<SimpleGrid cols={2} mb="sm">
+						<DetailField
+							label={t("usageHistoryUser")}
+							value={usageUserLabel(selectedRecord, t("usageHistoryUnattributed"))}
+						/>
+						<DetailField
+							label={t("usageHistoryUserId")}
+							value={selectedRecord.userId ?? "-"}
+							monospace
+						/>
+					</SimpleGrid>
+				) : null}
 				{selectedRecord?.errorMessage || selectedRecord?.hasRawDump ? (
 					<Group justify="flex-end" mb="sm" gap="xs">
 						{selectedRecord.errorMessage ? (

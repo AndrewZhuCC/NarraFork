@@ -1,1 +1,0 @@
-ALTER TABLE "scheduled_tasks" ADD COLUMN "reasoning_effort" text;

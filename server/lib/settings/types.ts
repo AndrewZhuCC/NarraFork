@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
+import type { ModelCatalogSettings } from "../model-catalog";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
@@ -692,6 +693,8 @@ export interface NarraForkSettings {
 		 * map force-overrides one exact `provider:model` value.
 		 */
 		modelCards?: ModelCard[];
+		/** Versioned public metadata overlays; never stores the public catalog itself. */
+		modelCatalog?: ModelCatalogSettings;
 		/** Translate reasoning/thinking blocks via translationModel after each block completes. */
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
@@ -757,6 +760,8 @@ export interface NarraForkSettings {
 		requestDumpMaxSize: number;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
+		/** Maximum tool calls per model response (integer 1–128). Exceeding it aborts the narrator, not a session-wide cumulative limit. */
+		maxToolCallsPerResponse: number;
 		/** Tool-call count without visible text before asking the model for a short progress update. -1 = disabled. */
 		silentToolCallThreshold: number;
 		/** Pipeline capture inactivity threshold in tool calls. -1 = disabled. */

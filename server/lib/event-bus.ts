@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
+import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
 import type { PublicCodexQuotaOverview } from "./codex-manager";
@@ -147,6 +148,18 @@ export type NarraForkEvent =
 	  }
 	/** Data-free invalidation after a human decision source changes. */
 	| { type: "human_attention:changed" }
+	/**
+	 * Notification-center projection changed for one user (insert/mark-read/delete).
+	 * Carries no titles/rows — clients refetch unread-count and, if open, the list.
+	 * `userId` is required: this is a per-user event; broadcasting it fleet-wide
+	 * would wake every client into a useless empty-list refetch.
+	 */
+	| {
+			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
+			userId: string;
+			/** Optional kind hints only; never titles/previews/ids of rows. */
+			kinds?: Array<"chat_message" | "permission_request">;
+	  }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
@@ -209,8 +222,14 @@ export type NarraForkEvent =
 			detail?: string;
 	  }
 	| { type: "narrator:title_updated"; narratorId: string; title: string }
-	// Narrator fork
-	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
+	// Narrator fork. `extracted: true` means extract-to-primary: parentNarratorId is
+	// the SOURCE subagent for provenance, not the new row's DB parent (which is null).
+	| {
+			type: "narrator:forked";
+			narratorId: string;
+			parentNarratorId: string;
+			extracted?: boolean;
+	  }
 	// Narrator subagent
 	| {
 			type: "narrator:subagent_started";

@@ -7,7 +7,8 @@ import type {
 	FileChangeProjectionCompleteness,
 } from "../../shared/file-change-protocol";
 import { type ApiError, api } from "../lib/api";
-import { type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
+import { type GitLogEntry, type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
+import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
 import { useNarrator } from "./useNarrator";
 
@@ -16,7 +17,7 @@ export type {
 	CurrentDiffTarget,
 	CurrentDiffView,
 } from "../../server/services/git-current-diff-view";
-export type { GitTarget, GitWorkspace } from "../lib/api/git";
+export type { GitLogEntry, GitTarget, GitWorkspace } from "../lib/api/git";
 
 // Types
 export interface GitStatusSummary {
@@ -43,14 +44,6 @@ export interface GitStatusSummary {
 	branch: string;
 	linesAdded: number;
 	linesRemoved: number;
-}
-
-export interface GitLogEntry {
-	sha: string;
-	shortSha: string;
-	message: string;
-	author: string;
-	date: string;
 }
 
 export interface GitStashEntry {
@@ -127,6 +120,7 @@ export interface WorkspaceModificationView {
 
 // Workspace facts share a cache across narrators, never across devices/worktrees.
 const GIT_QUERY_GC_TIME_MS = 60_000;
+const GIT_WORKSPACE_RECOVERY_INTERVAL_MS = 30_000;
 export const GIT_FACT_QUERIES = [
 	"gitStatus",
 	"gitModifications",
@@ -294,6 +288,30 @@ export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace)
 	};
 }
 
+const gitWorkspaceSubscriptions = new WeakMap<QueryClient, GitWorkspaceSubscriptions>();
+
+/** The panel owns the subscription, not individual status/diff observers. */
+export function useGitWorkspaceSubscription(target: GitTarget) {
+	const qc = useQueryClient();
+	const chapterId = typeof target === "string" ? target : undefined;
+	const narratorId = typeof target === "string" ? undefined : target.narratorId;
+	const workspaceKey = gitTargetKey(target);
+	useEffect(() => {
+		let subscriptions = gitWorkspaceSubscriptions.get(qc);
+		if (!subscriptions) {
+			subscriptions = new GitWorkspaceSubscriptions(qc, narratorWSManager);
+			gitWorkspaceSubscriptions.set(qc, subscriptions);
+		}
+		return subscriptions.subscribe(
+			chapterId ?? {
+				narratorId: narratorId as string,
+				workspaceKey: workspaceKey as string,
+				canWrite: false,
+			},
+		);
+	}, [qc, chapterId, narratorId, workspaceKey]);
+}
+
 // One permission subscription per QueryClient, shared by all mounted workspace consumers.
 const gitAccessSubscriptions = new WeakMap<
 	QueryClient,
@@ -378,7 +396,19 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		enabled: !!narratorId && detection.enabled,
 		retry: false,
 		staleTime: 5_000,
-		refetchInterval: 30_000,
+		// A non-ready workspace has no panel watch yet. Probe only recoverable
+		// states until ready; Git facts remain subscription-driven, never polled.
+		refetchInterval: (query) => {
+			if (query.state.status === "error") {
+				const status = (query.state.error as ApiError)?.status;
+				return !status || status >= 500 ? GIT_WORKSPACE_RECOVERY_INTERVAL_MS : false;
+			}
+			return ["not_git", "missing_directory", "git_unavailable", "device_offline"].includes(
+				query.state.data?.state ?? "",
+			)
+				? GIT_WORKSPACE_RECOVERY_INTERVAL_MS
+				: false;
+		},
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 	useEffect(() => {
@@ -434,6 +464,7 @@ export function invalidateWorkspaceQueries(
 	qc: ReturnType<typeof useQueryClient>,
 	target: GitTarget,
 ): void {
+	gitWorkspaceSubscriptions.get(qc)?.retry(target);
 	const keys = new Set([gitTargetKey(target)]);
 	const workspaces = qc
 		.getQueriesData<GitWorkspace>({ queryKey: ["gitWorkspace"] })
@@ -473,7 +504,6 @@ export function useGitStatus(target: GitTarget | undefined | null) {
 			readWorkspace(qc, target, () => api.getGitStatus(target as GitTarget, signal)),
 		enabled: !!target,
 		retry: false,
-		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
@@ -498,20 +528,23 @@ export function useGitModifications(target: GitTarget | undefined | null) {
 			),
 		enabled: !!target,
 		retry: false,
-		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
-export function useGitLog(target: GitTarget | undefined | null, limit = 50, skip = 0) {
+export function useGitLog(
+	target: GitTarget | undefined | null,
+	limit = 50,
+	skip = 0,
+	enabled = true,
+) {
 	const qc = useQueryClient();
 	return useQuery<GitLogEntry[]>({
 		queryKey: ["gitLog", gitTargetKey(target), limit, skip],
 		queryFn: ({ signal }) =>
 			readWorkspace(qc, target, () => api.getGitLog(target as GitTarget, limit, skip, signal)),
-		enabled: !!target,
+		enabled: !!target && enabled,
 		retry: false,
-		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
@@ -524,7 +557,6 @@ export function useGitStashList(target: GitTarget | undefined | null) {
 			readWorkspace(qc, target, () => api.getGitStashList(target as GitTarget, signal)),
 		enabled: !!target,
 		retry: false,
-		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
@@ -543,7 +575,6 @@ export function useGitDiff(
 			),
 		enabled: !!target && !!file,
 		retry: false,
-		refetchInterval: 30_000,
 		gcTime: 30_000,
 	});
 }

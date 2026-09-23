@@ -241,9 +241,9 @@ export const ASK_OPTIONS_MAX = 8;
 
 /** One option of a read-only AskUserQuestion replay. */
 export interface ToolAskOption {
-	/** Option label (wraps). */
-	label: string;
-	/** Option description under the label (wraps). */
+	/** Option title (wraps). */
+	header: string;
+	/** Option description under the header (wraps). */
 	description?: string;
 	/** Whether the submitted answer selected this option (multi-select aware). */
 	selected?: boolean;
@@ -251,8 +251,10 @@ export interface ToolAskOption {
 
 /** One question of a read-only AskUserQuestion replay. */
 export interface ToolAskQuestion {
-	/** Question header (wraps). */
+	/** Full question text (wraps). */
 	header: string;
+	/** Optional extra context under the header. */
+	description?: string;
 	/**
 	 * True when the card's own header summary already shows this exact text (the
 	 * single-question case), so the detail region must not repeat it.
@@ -960,6 +962,8 @@ function classifyByCategory(
 			return classifyBrowser(status, inputJson, outputJson, metadata);
 		case "knowledge":
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
+		case "contextAsk":
+			return classifyContextAsk(inputJson, outputJson, metadata, status);
 		default:
 			return classifyGeneric(inputJson, outputJson);
 	}
@@ -2062,7 +2066,11 @@ function classifySend(
 
 interface AskQuestion {
 	header?: string;
+	description?: string;
+	/** Legacy fields kept only so history still renders. */
 	question?: string;
+	content?: string;
+	id?: string;
 	options?: unknown[];
 	multiSelect?: boolean;
 }
@@ -2093,6 +2101,15 @@ function nonEmptyString(value: unknown): string | undefined {
 	return value.trim().length > 0 ? value : undefined;
 }
 
+/** True when a legacy string looks like a machine key rather than display text. */
+function isAskKeyLike(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed || trimmed === "undefined" || trimmed === "null") return false;
+	if (trimmed.length > 40) return false;
+	if (/[？?！!：:\n]/.test(trimmed)) return false;
+	return /^[A-Za-z0-9][\w.-]*$/.test(trimmed) || trimmed.length <= 24;
+}
+
 /**
  * Split a multi-select answer (`"Alpha, Beta"`) into its parts. Mirrors
  * `splitAnswerParts` in frontend/components/narrator/question/ask-user-question-utils.ts
@@ -2118,10 +2135,9 @@ function askOptionSelected(answer: string | undefined, optionLabel: string): boo
  * Resolve the submitted answer for one question.
  *
  * Mirrors `resolveSavedAnswer` in ask-user-question-utils.ts: the answers map is
- * keyed by the tool's `question` field, but providers occasionally omit it (the
- * UI then falls back to `header`), and a single-question call whose key drifted
- * still has exactly one answer to show. Reading only `answers[question]` — the
- * previous behaviour — rendered those cases as unanswered.
+ * keyed by the question `header` (the only field the advertised schema guarantees).
+ * Legacy keys (`id`, old `question`) and a single-question fallback still work so
+ * older stored calls do not render as unanswered.
  */
 function resolveAskAnswer(
 	q: AskQuestion,
@@ -2129,11 +2145,12 @@ function resolveAskAnswer(
 	answers: Record<string, unknown>,
 	allowSingleAnswerFallback: boolean,
 ): string | undefined {
-	const byQuestion =
-		typeof q.question === "string" ? nonEmptyString(answers[q.question]) : undefined;
-	if (byQuestion) return byQuestion;
 	const byHeader = nonEmptyString(answers[header]);
 	if (byHeader) return byHeader;
+	const byId = typeof q.id === "string" ? nonEmptyString(answers[q.id]) : undefined;
+	if (byId) return byId;
+	const byLegacy = typeof q.question === "string" ? nonEmptyString(answers[q.question]) : undefined;
+	if (byLegacy) return byLegacy;
 	if (allowSingleAnswerFallback) {
 		const values = Object.values(answers)
 			.map(nonEmptyString)
@@ -2168,23 +2185,40 @@ function classifyAsk(
 
 	const questions: ToolAskQuestion[] = [];
 	for (const q of rawQuestions.slice(0, ASK_QUESTIONS_MAX)) {
-		const headerText = readLeafText(q.header);
-		const header = headerText?.trim() ? headerText : "Question";
+		// Advertised shape: short header + full description. Legacy bodies may sit in
+		// content/question; keep the short title as header when both exist.
+		const rawHeader = readLeafText(q.header);
+		const rawDescription = readLeafText(q.description);
+		const rawContent = readLeafText(q.content);
+		const rawLegacyBody =
+			typeof q.question === "string" && !isAskKeyLike(q.question) ? q.question : undefined;
+		const body = rawDescription || rawContent || rawLegacyBody;
+		const header = rawHeader?.trim() ? rawHeader : (body?.split("\n")[0] ?? "Question");
+		const description =
+			body && body !== header
+				? body
+				: rawDescription && rawDescription !== header
+					? rawDescription
+					: undefined;
 		const answer = resolveAskAnswer(q, header, answers, omitHeader);
 		const rawOptions = Array.isArray(q.options) ? q.options : [];
 		const options: ToolAskOption[] = [];
 		const optionLabels: string[] = [];
 		for (const opt of rawOptions.slice(0, ASK_OPTIONS_MAX)) {
 			const o = asObject(opt);
-			const label = (o ? readLeafText(o.label) : undefined) ?? "";
+			const optionHeader =
+				(o ? readLeafText(o.header) : undefined) ??
+				(o ? readLeafText(o.label) : undefined) ??
+				(o ? readLeafText(o.title) : undefined) ??
+				"";
 			// The option DESCRIPTION is half the information in the banner; carrying
-			// only the label dropped it entirely.
-			const description = (o ? readLeafText(o.description) : undefined) ?? "";
-			if (label) optionLabels.push(label);
+			// only the header dropped it entirely.
+			const descriptionText = (o ? readLeafText(o.description) : undefined) ?? "";
+			if (optionHeader) optionLabels.push(optionHeader);
 			options.push({
-				label,
-				...(description ? { description } : {}),
-				...(askOptionSelected(answer, label) ? { selected: true } : {}),
+				header: optionHeader,
+				...(descriptionText ? { description: descriptionText } : {}),
+				...(askOptionSelected(answer, optionHeader) ? { selected: true } : {}),
 			});
 		}
 		// An answer matching no option (or no combination of options) is free text.
@@ -2197,6 +2231,7 @@ function classifyAsk(
 			);
 		questions.push({
 			header,
+			...(description && description !== header ? { description } : {}),
 			...(omitHeader ? { omitHeader: true } : {}),
 			...(q.multiSelect === true ? { multiSelect: true } : {}),
 			options,
@@ -2947,4 +2982,125 @@ function classifyKnowledge(
 /** In-app link to a knowledge entry (the chunked EntryLink target). */
 function knowledgeEntryHref(entryId: string): string {
 	return `/knowledge/${entryId}`;
+}
+
+/**
+ * ContextAsk's tool_output while the summary model is still streaming is a bare
+ * cumulative character count (`onProgress` → `emitOutput(String(n))`), not a body.
+ * Readers want that as a counter; painting it as markdown would show a lone number.
+ */
+function contextAskLiveOutputChars(
+	metadata: Record<string, unknown> | null,
+	outputJson: unknown,
+): number | null {
+	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+	if (raw === undefined) return null;
+	const trimmed = raw.trim();
+	if (!/^\d+$/.test(trimmed)) return null;
+	const n = Number(trimmed);
+	return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Strip the server-authored heading and trailing source-warning from a ContextAsk
+ * result so the card body is the answer alone. Failures return the input unchanged —
+ * older rows and localized headings must never make the result disappear.
+ */
+function stripContextAskEnvelope(text: string): string {
+	let body = text;
+	// English: `ContextAsk result for <label>:\n\n…`
+	body = body.replace(/^ContextAsk result for [^\r\n]*:\r?\n\r?\n/, "");
+	// zh-CN: `ContextAsk（<label>）结果：\n\n…`
+	body = body.replace(/^ContextAsk（[^\r\n]*）结果：\r?\n\r?\n/, "");
+	// Trailing safety warnings (already surfaced as badges).
+	body = body.replace(/\n\n(?:Note:|注意：)[^\n]*$/, "");
+	return body.trim();
+}
+
+function classifyContextAsk(
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+	status: string | null | undefined,
+): ToolDetailData {
+	const input = asObject(inputJson);
+	const target = asObject(metadata?.target);
+	const targetLabel = readLeafText(target?.title) ?? extractField(inputJson, "id") ?? "subagent";
+	const questionsSource = Array.isArray(metadata?.questions)
+		? (metadata.questions as unknown[])
+		: Array.isArray(input?.questions)
+			? (input.questions as unknown[])
+			: [];
+	const questions = questionsSource
+		.map((q) => readLeafText(q) ?? (typeof q === "string" ? q : undefined))
+		.filter((q): q is string => q !== undefined && q.trim().length > 0)
+		.slice(0, 8);
+	const messageCount =
+		typeof metadata?.messageCount === "number" ? metadata.messageCount : undefined;
+	const contextPercent =
+		typeof metadata?.contextPercent === "number" ? metadata.contextPercent : undefined;
+	const chunkCount = typeof metadata?.chunkCount === "number" ? metadata.chunkCount : undefined;
+	const sourceTruncated = metadata?.sourceTruncated === true;
+	const hasMore = metadata?.hasMore === true;
+	const toolCallsTruncated = metadata?.toolCallsTruncated === true;
+
+	const liveChars = isTerminalToolStatus(status)
+		? null
+		: contextAskLiveOutputChars(metadata, outputJson);
+
+	const badges = chips([
+		chip(questions.length > 0 ? `${questions.length} questions` : "status summary", "indigo"),
+		chip(messageCount != null ? `${messageCount} msgs` : undefined, "gray"),
+		chip(contextPercent != null ? `${contextPercent}% ctx` : undefined, "cyan"),
+		chip(chunkCount != null && chunkCount > 1 ? `${chunkCount} chunks` : undefined, "gray"),
+		chip(sourceTruncated ? "source truncated" : undefined, "orange"),
+		chip(toolCallsTruncated ? "tools truncated" : undefined, "orange"),
+		chip(hasMore ? "older history omitted" : undefined, "orange"),
+	]);
+
+	const questionLines = questions.map((q, i) => `${i + 1}. ${q}`);
+	const rawOutput = resolveDisplayText(outputJson);
+	const answer = rawOutput ? stripContextAskEnvelope(rawOutput) : "";
+	// A bare numeric streaming snapshot must never be painted as the answer body.
+	const answerIsLiveCount = liveChars != null && answer !== "" && /^\d+$/.test(answer.trim());
+	const answerBody = answerIsLiveCount ? "" : answer;
+
+	return (
+		sections([
+			section(
+				"meta.target",
+				undefined,
+				metaRows([badgeRow(chips([chip(`→ ${targetLabel}`, "blue"), ...badges]))]),
+			),
+			section(
+				"input.questions",
+				"input",
+				questionLines.length > 0
+					? {
+							kind: "structured",
+							badgeRows: 0,
+							bodyLines: questionLines,
+						}
+					: null,
+			),
+			section(
+				"output.main",
+				"result",
+				answerBody
+					? capped("output.main", "code", {
+							text: answerBody,
+							format: "markdown",
+							contentLines: countLines(answerBody),
+							...truncatedFlag(outputJson),
+						})
+					: liveChars != null
+						? {
+								kind: "structured",
+								badgeRows: 0,
+								bodyLines: [`${liveChars} chars`],
+							}
+						: null,
+			),
+		]) ?? { kind: "sections", sections: [] }
+	);
 }

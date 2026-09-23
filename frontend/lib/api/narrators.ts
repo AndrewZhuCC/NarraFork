@@ -26,6 +26,7 @@ import type {
 	CompactMessageDetail,
 	DirectoryBlacklistRuleInput,
 	DirectoryWhitelistRuleInput,
+	HistoryRecoveryResult,
 	MessageLocationResult,
 	NarratorAccess,
 	NarratorGrant,
@@ -198,12 +199,37 @@ export interface RevertHistorySummary {
 	deletedBlockCount: number;
 }
 
+/**
+ * One concrete holder that is currently refusing a safe file rollback.
+ * Advisory only: listing a blocker never authorizes a wider plan.
+ */
+export interface RevertBlocker {
+	kind:
+		| "running_tool"
+		| "uncoordinated_activity"
+		| "write_lease"
+		| "pending_mutation"
+		| "recovery_hold"
+		| "narrator_busy"
+		| "planner_busy"
+		| "scope_not_active"
+		| "pending_operation";
+	toolCallId?: string;
+	toolName?: string;
+	operationId?: string;
+	messageId?: string;
+	leaseId?: string;
+	detail?: string;
+}
+
 export interface RevertActionPreview {
 	action: RevertAction;
 	plan: RevertActionPlan | null;
 	executable: false;
 	historySummary: RevertHistorySummary | null;
 	unavailable?: ScopedRevertUnavailableReason;
+	/** Present when the server could name the running/unfinished holders. */
+	blockers?: RevertBlocker[];
 }
 
 /** Bounded metadata only; snapshots and file contents are not loaded by this UI. */
@@ -294,6 +320,7 @@ export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreview
 	revertPlan?: RevertPlanReview;
 	previewIssue?: RevertPlanPreviewIssue;
 	previewError?: string;
+	blockers?: RevertBlocker[];
 	scope?: RevertScope;
 	affectedFiles: F[];
 	narratorScope?: {
@@ -686,6 +713,9 @@ export const narratorsApi = {
 			`/narrators/${id}/message-location/${encodeURIComponent(messageId)}`,
 			{ signal },
 		),
+	// Bounded oversized-message scan used when the timeline cannot paginate.
+	getHistoryRecovery: (id: string, signal?: AbortSignal) =>
+		request<HistoryRecoveryResult>(`/narrators/${id}/history-recovery`, { signal }),
 	// Full-text search within a single narrator's own conversation history.
 	searchNarratorMessages: (id: string, q: string, limit?: number) => {
 		const params = new URLSearchParams({ q });
@@ -1274,7 +1304,10 @@ export const narratorsApi = {
 		onUploadProgress?: (fraction: number) => void,
 		signal?: AbortSignal,
 		fileReferences?: FileReference[],
+		interrupt?: boolean,
 	) => {
+		// Interrupt-and-insert is one request; its replacement always has queue priority.
+		if (interrupt) priority = true;
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
@@ -1291,6 +1324,7 @@ export const narratorsApi = {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
 			if (priority) formData.append("priority", "true");
+			if (interrupt) formData.append("interrupt", "true");
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
 			}
@@ -1305,7 +1339,12 @@ export const narratorsApi = {
 			res = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify({ message, ...(priority ? { priority: true } : {}), fileReferences }),
+				body: JSON.stringify({
+					message,
+					...(priority ? { priority: true } : {}),
+					...(interrupt ? { interrupt: true } : {}),
+					fileReferences,
+				}),
 				signal,
 			});
 		}
@@ -1813,6 +1852,18 @@ export const narratorsApi = {
 		request<{ type: "unlocked" | "forked"; narrator?: ApiEntity; chapter?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
+		),
+	/** Extract a subagent into an independent primary narrator (control-plane promotion). */
+	extractSubagentToPrimary: (
+		narratorId: string,
+		opts?: { title?: string; inheritMode?: "full" | "compressed"; locale?: "en" | "zh-CN" },
+	) =>
+		request<{ type: "extracted"; narrator: ApiEntity }>(
+			`/narrators/${narratorId}/extract-primary`,
+			{
+				method: "POST",
+				body: JSON.stringify(opts ?? {}),
+			},
 		),
 	forkFromMessages: (narratorId: string, messageIds: string[], title?: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork-messages`, {

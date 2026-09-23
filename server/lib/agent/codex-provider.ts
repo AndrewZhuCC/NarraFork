@@ -28,6 +28,7 @@ import {
 import {
 	appendCodexNativeTools,
 	applyCodexReflectionTools,
+	applyOpenAIModelMetadata,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
 	type OAIContentPart,
@@ -835,9 +836,11 @@ export class CodexProvider implements ProviderAdapter {
 				} as unknown as OAIMessage);
 			}
 		}
-		if (params.content && params.content !== ".") {
+		if ((params.content && params.content !== ".") || params.images?.length) {
 			if (params.images?.length) {
-				const parts: OAIContentPart[] = [{ type: "text", text: params.content }];
+				const parts: OAIContentPart[] = [];
+				if (params.content && params.content !== ".")
+					parts.push({ type: "text", text: params.content });
 				for (const img of params.images) {
 					parts.push({
 						type: "image_url",
@@ -891,7 +894,7 @@ export class CodexProvider implements ProviderAdapter {
 		const tools =
 			params.reflectionParentTools ?? (Array.isArray(params.tools) ? [...params.tools] : []);
 		if (!params.reflectionParentTools) {
-			appendCodexNativeTools(tools, model, {
+			appendCodexNativeTools(tools, params.model, {
 				webSearch: this.useWebSearch && isNativeSearchChannelFirstEnabled(),
 				imageGeneration: this.useImageGeneration,
 			});
@@ -900,13 +903,14 @@ export class CodexProvider implements ProviderAdapter {
 
 		applyCodexStableRequestFields(request, {
 			identity: createCodexRequestIdentity(params.conversationId),
-			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
+			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		applyCodexReflectionTools(request, params);
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}
 
+		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
 		return request;
 	}
 

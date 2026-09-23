@@ -15,8 +15,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureGrammarFixture } from "../../structural/__tests__/grammar-fixture";
+import { MAX_TRAVERSAL_DEPTH } from "../../structural/outline";
+import { treeSitterProvider } from "../../structural/tree-sitter-provider";
 import type { ToolContext } from "../../types";
 import { structSedTool } from "../struct-sed";
+import { structViewTool } from "../struct-view";
 
 const TS_SOURCE = `export class PaymentService {
 	/** Charge one order. */
@@ -219,6 +222,122 @@ describe("dry run is the default", () => {
 	});
 });
 
+describe("line statistics", () => {
+	/**
+	 * The header `+N -N` must describe what actually changed in the file, not the size of
+	 * the addressed range. An earlier version compared `selected region` vs
+	 * `content ?? ""`, so a one-token substitute across an 89-line symbol reported `-89`
+	 * while the card showed a single edited line.
+	 */
+	test("substitute counts the lines it rewrote, not the whole selected range", async () => {
+		const target = join(workDir, "stats-substitute.txt");
+		// Ten lines in the selection; only one token on one line changes.
+		writeFileSync(
+			target,
+			`${Array.from({ length: 10 }, (_, i) => `line ${i + 1} const local = ${i};`).join("\n")}\n`,
+			"utf8",
+		);
+		const result = await run({
+			file_path: target,
+			command: "substitute",
+			address: "1,10",
+			pattern: "const local",
+			replacement: "let local",
+			flags: "g",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.replacements).toBe(10);
+		// Every line is rewritten in place: 10 removed + 10 added, NOT 0/10 or 0/10-range.
+		expect(result.metadata?.linesAdded).toBe(10);
+		expect(result.metadata?.linesRemoved).toBe(10);
+	});
+
+	test("a single-token substitute reports one added and one removed", async () => {
+		const target = join(workDir, "stats-substitute-one.txt");
+		writeFileSync(
+			target,
+			"header\nconst local = structuredClone(cfg.local);\nfooter\nmore\nlines\nhere\n",
+			"utf8",
+		);
+		const result = await run({
+			file_path: target,
+			command: "substitute",
+			address: "2",
+			pattern: "const local",
+			replacement: "let local",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.replacements).toBe(1);
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
+	});
+
+	test("insert reports additions only, not a rewrite of the kept region", async () => {
+		const target = join(workDir, "stats-insert.txt");
+		writeFileSync(target, "alpha\nbeta\ngamma\n", "utf8");
+		const result = await run({
+			file_path: target,
+			command: "insert",
+			address: "2,3",
+			content: "new line\n",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(0);
+	});
+
+	test("delete reports removals only", async () => {
+		const target = join(workDir, "stats-delete.txt");
+		writeFileSync(target, "alpha\nbeta\ngamma\ndelta\n", "utf8");
+		const result = await run({
+			file_path: target,
+			command: "delete",
+			address: "2,3",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.linesAdded).toBe(0);
+		expect(result.metadata?.linesRemoved).toBe(2);
+	});
+
+	test("replace diffs the region against its replacement", async () => {
+		const target = join(workDir, "stats-replace.txt");
+		writeFileSync(target, "alpha\nbeta\ngamma\ndelta\n", "utf8");
+		const result = await run({
+			file_path: target,
+			command: "replace",
+			address: "2",
+			content: "BETA",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
+	});
+
+	test("a surgical substitute in a file past the whole-file budget still counts the real change", async () => {
+		// Past `MAX_WHOLE_FILE_STATS_CHARS`, the whole-file diff is dropped. The window
+		// fallback must still answer — otherwise a one-line fix in a large module would
+		// either vanish or (worse) report the entire addressed range as deleted.
+		const target = join(workDir, "stats-large.txt");
+		// ~100KB of padding so whole-file stats refuse the input budget.
+		const filler = Array.from(
+			{ length: 500 },
+			(_, i) => `padding line ${i} ${"x".repeat(100)}`,
+		).join("\n");
+		writeFileSync(target, `${filler}\nconst local = 1;\n${filler}\n`, "utf8");
+		const result = await run({
+			file_path: target,
+			command: "substitute",
+			address: "1,$",
+			pattern: "const local",
+			replacement: "let local",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.replacements).toBe(1);
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
+	});
+});
+
 describe("cross-file destinations", () => {
 	test("refuses to_file instead of silently ignoring it", async () => {
 		// Ignoring it resolved the destination inside the SOURCE file, so a same-line
@@ -392,6 +511,111 @@ describe("structural addressing", () => {
 	});
 });
 
+describe("truncated outlines never authorize symbol-based edits", () => {
+	let filePath: string;
+	let source: string;
+
+	beforeAll(() => {
+		filePath = join(workDir, "truncated.ts");
+		// Only two target declarations; the intervening data exhausts the VISITED
+		// budget, not the 5000-declaration limit. The file remains below 2 MB.
+		source = `class A { target() {} }\nconst cfg = {${"a:0,".repeat(350_000)}};\nclass B { target() {} }\n`;
+		writeFileSync(filePath, source, "utf8");
+	});
+
+	test("the raised budget fully covers the former 600 KB reproducer", async () => {
+		if (!hasGrammar) return;
+		const text = `class A { target() {} }\nconst cfg = {${"a:0,".repeat(150_000)}};\nclass B { target() {} }\n`;
+		const doc = { filePath: join(workDir, "within-budget.ts"), text, languageId: "typescript" };
+		expect(await treeSitterProvider.isOutlineTruncated?.(doc)).toBe(false);
+		expect((await treeSitterProvider.locate(doc, { symbol: "target" })).length).toBe(2);
+	});
+
+	test("refuses bare, qualified and numbered selectors, even on the cached outline", async () => {
+		if (!hasGrammar) return;
+		for (const symbol of ["target", "A.target", "target#1"]) {
+			const result = await run({ file_path: filePath, command: "delete", symbol });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("truncated");
+			expect(result.output).toContain("`address`");
+		}
+		expect(readFileSync(filePath, "utf8")).toBe(source);
+	});
+
+	test("refuses a symbolic copy/move destination and batch operation", async () => {
+		if (!hasGrammar) return;
+		for (const command of ["copy", "move"]) {
+			const result = await run({ file_path: filePath, command, address: "3", to_symbol: "target" });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("truncated");
+			expect(result.output).toContain("`to_address`");
+		}
+		const batch = await run({
+			file_path: filePath,
+			operations: [{ command: "delete", symbol: "target" }],
+		});
+		expect(batch.isError).toBe(true);
+		expect(batch.output).toContain("truncated");
+		expect(readFileSync(filePath, "utf8")).toBe(source);
+	});
+
+	test("explicit line addresses remain usable", async () => {
+		if (!hasGrammar) return;
+		const result = await run({ file_path: filePath, command: "delete", address: "3" });
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("DRY RUN");
+		expect(result.metadata?.startLine).toBe(3);
+		expect(readFileSync(filePath, "utf8")).toBe(source);
+	});
+
+	test("read modes warn about partial results, and symbol stashes refuse them", async () => {
+		if (!hasGrammar) return;
+		for (const mode of ["outline", "api", "extract", "find"]) {
+			const result = await structViewTool.execute(
+				{ file_path: filePath, mode, symbol: "target" },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("Outline truncated");
+		}
+		const missingDeclaration = await structViewTool.execute(
+			{ mode: "find", symbol: "B" },
+			makeCtx(),
+		);
+		expect(missingDeclaration.metadata?.declarations).toBe(0);
+		expect(missingDeclaration.metadata?.truncatedOutlines).toBe(1);
+		expect(missingDeclaration.output).toContain("Outline truncated");
+		const missing = await structViewTool.execute(
+			{ file_path: filePath, mode: "extract", symbol: "B.target" },
+			makeCtx(),
+		);
+		expect(missing.isError).toBe(true);
+		expect(missing.output).toContain("Outline truncated");
+		const stash = await structViewTool.execute(
+			{ file_path: filePath, mode: "stash", symbol: "target" },
+			makeCtx(),
+		);
+		expect(stash.isError).toBe(true);
+		expect(stash.output).toContain("truncated");
+		const addressed = await structViewTool.execute(
+			{ file_path: filePath, mode: "stash", address: "3" },
+			makeCtx(),
+		);
+		expect(addressed.isError).toBeFalsy();
+	});
+
+	test("the depth budget also blocks edits when very few nodes are visited", async () => {
+		if (!hasGrammar) return;
+		const deepFile = join(workDir, "deep.ts");
+		const depth = MAX_TRAVERSAL_DEPTH + 20;
+		const text = `class A { target() {} }\nconst cfg = ${"{a:".repeat(depth)}0${"}".repeat(depth)};\nclass B { target() {} }\n`;
+		writeFileSync(deepFile, text, "utf8");
+		const result = await run({ file_path: deepFile, command: "delete", symbol: "target" });
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("truncated");
+		expect(readFileSync(deepFile, "utf8")).toBe(text);
+	});
+});
 describe("cleanup", () => {
 	test("removes the temp workspace", () => {
 		rmSync(workDir, { recursive: true, force: true });

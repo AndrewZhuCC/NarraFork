@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
@@ -11,8 +11,7 @@ import type { ActiveNarrator } from "../narrator-session-state";
 // Real configured provider classification, real provider history and the real outer
 // runtime; only model I/O and its bounded delay are replaced. Run in an isolated process.
 const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { settings, usesStatefulModel } = await import("../../lib/settings");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
@@ -23,6 +22,7 @@ const executor = await import("../narrator-executor");
 const recovery = await import("../narrator-recovery");
 const savedOpenai = settings.openaiProviders;
 const savedAnthropic = settings.anthropicProviders;
+const savedMaxToolCallsPerResponse = settings.agent.maxToolCallsPerResponse;
 const ids = ["retry-parent", "retry-primary", "retry-child"];
 const marker = "CONTINUATION_CONTEXT Self-continuations left: 5";
 
@@ -34,9 +34,9 @@ afterEach(() => {
 	}
 	settings.openaiProviders = savedOpenai;
 	settings.anthropicProviders = savedAnthropic;
+	settings.agent.maxToolCallsPerResponse = savedMaxToolCallsPerResponse;
 	mock.restore();
 });
-afterAll(() => mock.module("../../db", () => realDb));
 
 function session(id: string, model: string, provider: string): ActiveNarrator {
 	return {
@@ -55,6 +55,69 @@ function session(id: string, model: string, provider: string): ActiveNarrator {
 		_blockedSkills: { all: false, names: new Set() },
 		_substatus: new Set(),
 	};
+}
+
+test("buffered metadata preserves approval work turn and deferred execution intent together", async () => {
+	const id = "retry-primary";
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({ id, cwd: process.env.HOME, createdAt: now, updatedAt: now });
+	const { enqueueBufferedMessage, getBufferedMessagesAsync } = await import("../narrator-buffer");
+	const accepted = await enqueueBufferedMessage(
+		id,
+		"approve and continue",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		"back",
+		undefined,
+		undefined,
+		"stack",
+		true,
+		{ controlCommand: true },
+	);
+	expect(accepted.ok).toBe(true);
+	expect(await getBufferedMessagesAsync(id)).toEqual([
+		expect.objectContaining({
+			id: accepted.id,
+			preserveWorkTurn: true,
+			executionIntent: { controlCommand: true },
+		}),
+	]);
+});
+
+for (const explicitUserId of [undefined, "compact-requester"] as const) {
+	test(`local compact attributes summary to ${explicitUserId ?? "active turn"}`, async () => {
+		const id = "retry-primary";
+		const prefix = "runtime_compact";
+		const model = `${prefix}:gpt-5`;
+		settings.openaiProviders = [
+			{
+				id: prefix,
+				name: prefix,
+				prefix,
+				apiKey: "test-only",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "gpt-5",
+				apiMode: "responses",
+			},
+		];
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id, model, createdAt: now, updatedAt: now });
+		await narratorService.persistUserMessage(id, "compact this turn");
+		const active = session(id, model, prefix);
+		active._currentUserId = "active-user";
+		activeNarrators.set(id, active);
+		const { narratorContext } = await import("../narrator-context");
+		const summary = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "safe summary",
+		});
+		const { runCustomCompact } = await import("../narrator-compact");
+		expect(await runCustomCompact(id, "en", undefined, { userId: explicitUserId })).toBe(true);
+		expect(summary).toHaveBeenCalledTimes(1);
+		expect(summary.mock.calls[0]?.[9]).toBe(explicitUserId ?? "active-user");
+	});
 }
 
 describe("run-local reasoning effort", () => {
@@ -116,7 +179,7 @@ describe("run-local reasoning effort", () => {
 					expect(config.reasoningEffort).toBe(expected);
 					for (const revision of [active._settingsRevision, -1]) {
 						active._settingsRevision = revision;
-						const next = config.getRuntimeSettingsOverride?.();
+						const next = await config.getRuntimeSettingsOverride?.();
 						expect(next?.reasoningEffort ?? config.reasoningEffort).toBe(expected);
 						expect(active._reasoningEffortRef).toBe(narratorEffort);
 						expect(active.reasoningEffort).toBe(baseline ?? null);
@@ -156,6 +219,120 @@ describe("run-local reasoning effort", () => {
 					(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.reasoningEffort,
 				).toBe(narratorEffort);
 			}
+		});
+	}
+});
+
+describe("tool-call limit stops the real runtime without locking later user turns", () => {
+	for (const kind of ["primary", "subagent"] as const) {
+		test(`${kind}: configured limit aborts once and suppresses retry and inbox wake`, async () => {
+			const prefix = "runtime_tool_limit";
+			const model = `${prefix}:gpt-5`;
+			settings.agent.maxToolCallsPerResponse = 7;
+			settings.openaiProviders = [
+				{
+					id: prefix,
+					name: prefix,
+					prefix,
+					apiKey: "test-only",
+					baseUrl: "https://example.invalid/v1",
+					defaultModel: "gpt-5",
+					apiMode: "responses",
+				},
+			];
+			const id = kind === "primary" ? "retry-primary" : "retry-child";
+			const now = new Date().toISOString();
+			for (const target of ["retry-parent", id]) {
+				await db.insert(narrators).values({
+					id: target,
+					type: target === "retry-child" ? "subagent" : "primary",
+					variant: target === "retry-child" ? "subagent:general" : "primary",
+					parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+					model,
+					autoContinuationOverride: "off",
+					cwd: process.env.HOME,
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+			const profile: RuntimeProfile =
+				kind === "primary"
+					? { kind }
+					: {
+							kind,
+							parentNarratorId: "retry-parent",
+							parentToolUseId: "origin-tool",
+							subagentType: "general",
+							systemPrompt: "tool limit contract",
+							initialHistory: [],
+						};
+			const active = session(id, model, prefix);
+			activeNarrators.set(id, active);
+			const owner = tryClaimExecution(id, kind);
+			if (!owner) throw new Error("Missing tool-limit owner");
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.maxToolCallsPerResponse).toBe(7);
+				expect(options.config.signal.aborted).toBe(false);
+				expect(options.config.onToolCallLimitExceeded).toBeDefined();
+				options.config.onToolCallLimitExceeded?.(7);
+				expect(options.config.signal.aborted).toBe(true);
+				// Even if a pass carries a recovery hint, the limit must win first.
+				return {
+					finalText: "",
+					hasError: false,
+					shouldUpdateTitle: false,
+					retryableError: "transient failure after limit",
+					interrupted: true,
+				};
+			});
+			const retry = spyOn(recovery, "handleTransientError").mockResolvedValue({
+				shouldRetry: true,
+				delayMs: 0,
+			});
+			const outcome = await runAgentLoopUnlocked(
+				active,
+				owner,
+				"first user input",
+				undefined,
+				profile,
+			);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(retry).not.toHaveBeenCalled();
+			expect(outcome.hasError).toBe(true);
+			expect(outcome.allowInboxWake).toBe(false);
+			const stopped = await narratorService.getById(id);
+			expect(stopped.status).toBe("idle");
+			expect(stopped.substatus).toContain("interrupted");
+
+			// A separate explicit user turn gets a fresh controller and local limit flag.
+			owner.release();
+			const next = session(id, model, prefix);
+			activeNarrators.set(id, next);
+			const nextOwner = tryClaimExecution(id, kind);
+			if (!nextOwner) throw new Error("Missing new user-turn owner");
+			execute.mockImplementation(async (options) => {
+				expect(options.config.signal.aborted).toBe(false);
+				expect(options.userText).toBe("new explicit user input");
+				return {
+					finalText: "finished",
+					hasError: false,
+					shouldUpdateTitle: false,
+					completedNaturally: true,
+					completedAssistantTurn: true,
+				};
+			});
+			const resumed = await runAgentLoopUnlocked(
+				next,
+				nextOwner,
+				"new explicit user input",
+				undefined,
+				profile,
+			);
+			expect(execute).toHaveBeenCalledTimes(2);
+			expect(retry).not.toHaveBeenCalled();
+			expect(resumed.hasError).toBe(false);
+			expect(resumed.allowInboxWake).toBe(true);
+			expect(resumed.finalText).toBe("finished");
 		});
 	}
 });

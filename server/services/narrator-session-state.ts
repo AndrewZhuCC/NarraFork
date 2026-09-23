@@ -33,8 +33,18 @@ export interface ActiveNarrator {
 	/** Last accepted user input; retries, tool decisions and system continuations keep this ID. */
 	_upstreamWorkTurnId?: string;
 	cwd: string;
-	/** Raw model reference stored on the narrator, e.g. __default__ or __agg__:id. */
+	/** Runtime reference (e.g. __default__ or __agg__:id), never the __parent__ sentinel. */
 	_modelRef?: string;
+	/** Persisted selection, kept separate from the pool-authorized runtime reference. */
+	_modelSelectionRef?: string;
+	/** Cached inheritance edge; only active sessions participate in live propagation. */
+	_followParentNarratorId?: string | null;
+	/** Invalidates asynchronous inheritance resolutions after a manual/parent model change. */
+	_modelRefreshVersion?: number;
+	_modelRefreshPending?: Promise<void>;
+	_modelRefreshError?: unknown;
+	/** Fixed effort mandated by the inherited model's selected pool entry. */
+	_inheritedReasoningEffort?: ReasoningEffort;
 	model: string;
 	provider: string;
 	/** Settings revision used to derive `_modelRef` / `_reasoningEffortRef` into runtime values. */
@@ -299,9 +309,16 @@ export interface SavedBufferedFile {
 
 // === BufferedMessage interface ===
 
+export interface BufferedExecutionIntent {
+	modelOverride?: { model: string; mode: "temporary" | "permanent" };
+	/** Built-in control command; execute only after the previous owner has finalized. */
+	controlCommand?: boolean;
+}
+
 export interface BufferedMessage {
 	/** Tool approval feedback is user-authored, but continues the existing work turn. */
 	preserveWorkTurn?: boolean;
+	executionIntent?: BufferedExecutionIntent;
 	id: string;
 	text: string;
 	/** Server-accepted immutable bytes; summaries expose only reference metadata. */

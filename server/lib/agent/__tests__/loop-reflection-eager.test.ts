@@ -28,7 +28,7 @@ let onNormalStarted: (() => void) | undefined;
 let onSessionToolStarted: (() => void) | undefined;
 
 const testProvider: ProviderAdapter = {
-	formatTools: (tools) => tools,
+	formatTools: (tools) => tools.map(({ name, description }) => ({ name, description })),
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
@@ -366,7 +366,10 @@ describe("reflection-only tools are not eager-executed mid-stream", () => {
 		const events = await runUntilAbortMidStream();
 
 		expect(executionOrder).toEqual([]);
-		expect(events.some((event) => event.type === "tool_result")).toBe(false);
+		// Persisted but unstarted calls receive cancellation results, not execution.
+		const results = events.filter((event) => event.type === "tool_result");
+		expect(results).toHaveLength(2);
+		expect(results.every((event) => event.isError && event.durationMs === 0)).toBe(true);
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 

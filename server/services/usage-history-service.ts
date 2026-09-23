@@ -1,15 +1,54 @@
 import { db } from "@server/db";
-import { apiRequests, chapters, narrators } from "@server/db/schema";
+import { getDbPath } from "@server/db/connection";
+import { apiRequests, chapters, narrators, users } from "@server/db/schema";
 import { redactSpillPointerPaths } from "@server/lib/api-request-dump-store";
+import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
+import { runReadTask } from "@server/lib/db-worker/pool";
+import { AppError } from "@server/lib/errors";
+import { logger } from "@server/lib/logger";
 import {
 	encodeUsageHistoryCursor,
 	type UsageHistoryCursor,
 } from "@server/lib/usage-history-cursor";
 import { normalizeModelFamily } from "@shared/model-id";
+
+const costCoverageSelection = {
+	unpricedRequestCount: sql<number>`coalesce(sum(case when ${apiRequests.costStatus} in ('partial','unknown') or (${apiRequests.costStatus} is null and ${apiRequests.costUsd} is null) then 1 else 0 end), 0)`,
+	partialRequestCount: sql<number>`coalesce(sum(case when ${apiRequests.costStatus} = 'partial' then 1 else 0 end), 0)`,
+};
+function costCoverage(row?: {
+	totalRequests?: number;
+	requestCount?: number;
+	count?: number;
+	unpricedRequestCount?: number;
+	partialRequestCount?: number;
+}) {
+	const unpricedRequestCount = Number(row?.unpricedRequestCount ?? 0);
+	const partialRequestCount = Number(row?.partialRequestCount ?? 0);
+	return {
+		unpricedRequestCount,
+		partialRequestCount,
+		costStatus: aggregateCostStatus(
+			Number(row?.totalRequests ?? row?.requestCount ?? row?.count ?? 0),
+			unpricedRequestCount,
+			partialRequestCount,
+		),
+		costIsPartial: unpricedRequestCount > 0,
+	};
+}
+interface CostCoverage {
+	costStatus: CostStatus;
+	costIsPartial: boolean;
+	unpricedRequestCount: number;
+	partialRequestCount: number;
+}
+
 import { and, desc, eq, gte, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
+	/** Historical owner; __unattributed__ selects requests with no recorded owner. */
+	userId?: string;
 	narratorId?: string;
 	chapterId?: string;
 	projectId?: string;
@@ -23,7 +62,7 @@ export interface UsageHistoryFilters {
 	includeSubagents?: boolean;
 }
 
-export interface UsageHistoryStats {
+export interface UsageHistoryStats extends CostCoverage {
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -40,7 +79,7 @@ export interface UsageHistoryStats {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint {
+export interface UsageHistoryTimeSeriesPoint extends CostCoverage {
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -77,7 +116,7 @@ export interface UsageHistoryTimeSeriesOptions {
 	now?: Date;
 }
 
-export type UsageBreakdownDimension = "provider" | "model" | "kind";
+export type UsageBreakdownDimension = "provider" | "model" | "kind" | "user";
 export type UsageBreakdownMetric =
 	| "requests"
 	| "tokens"
@@ -93,14 +132,14 @@ export interface UsageBreakdownEntry {
 	count: number;
 }
 
-export interface UsageBreakdownResponse {
+export interface UsageBreakdownResponse extends CostCoverage {
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
 	entries: UsageBreakdownEntry[];
 	total: number;
 }
 
-export interface UsageStackedTimeSeriesResponse {
+export interface UsageStackedTimeSeriesResponse extends CostCoverage {
 	granularity: UsageHistoryGranularity;
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
@@ -263,6 +302,8 @@ function toNumber(value: unknown): number {
 
 export interface UsageHistoryRecord {
 	id: string;
+	userId: string | null;
+	username: string | null;
 	narratorId: string | null;
 	// 外部 Agent 写入时自带的叙述者文本（无 narrator 关联时用于占位显示）
 	agentLabel?: string | null;
@@ -281,6 +322,8 @@ export interface UsageHistoryRecord {
 	ttftMs: number | null;
 	durationMs: number | null;
 	costUsd: number | null;
+	costStatus: CostStatus | null;
+	costMissingFields: string[] | null;
 	contextPercent: number | null;
 	meterUsage: number | null;
 	meterUnit: string | null;
@@ -302,6 +345,8 @@ export interface UsageHistoryRecord {
  */
 export interface RawDumpSource {
 	id: string;
+	userId: string | null;
+	username: string | null;
 	narratorId: string | null;
 	narratorTitle: string | null;
 	chapterId: string | null;
@@ -319,6 +364,8 @@ export interface RawDumpSource {
 
 interface UsageHistoryListRow {
 	id: string;
+	userId: string | null;
+	username: string | null;
 	narratorId: string | null;
 	agentLabel: string | null;
 	kind: string;
@@ -335,6 +382,8 @@ interface UsageHistoryListRow {
 	ttftMs: number | null;
 	durationMs: number | null;
 	costUsd: number | null;
+	costStatus: CostStatus | null;
+	costMissingFields: string[] | null;
 	contextPercent: number | null;
 	meterUsage: number | null;
 	meterUnit: string | null;
@@ -347,8 +396,56 @@ interface UsageHistoryListRow {
 	projectId: string | null;
 }
 
+export interface UsageHistoryExecutionOptions {
+	signal?: AbortSignal;
+}
+
+interface UsageAggregateQuery<Row> extends PromiseLike<Row[]> {
+	toSQL(): { sql: string; params: unknown[] };
+	_: { selectedFields: Record<string, unknown> };
+}
+
 export class UsageHistoryService {
-	constructor(private readonly database: typeof db = db) {}
+	constructor(
+		private readonly database: typeof db = db,
+		private readonly workerDbPath: string | null = database === db ? getDbPath() : null,
+	) {}
+
+	/** Injected in-memory databases execute locally; production never falls back to a scan. */
+	private async aggregate<Row>(
+		query: UsageAggregateQuery<Row>,
+		maxRows: number,
+		execution: UsageHistoryExecutionOptions = {},
+	): Promise<Row[]> {
+		if (!this.workerDbPath) return await query;
+		const startedAt = Date.now();
+		const compiled = query.toSQL();
+		try {
+			return await runReadTask<Row[]>(
+				this.workerDbPath,
+				{
+					kind: "usageHistoryQuery",
+					sql: compiled.sql,
+					params: compiled.params as (string | number | null)[],
+					columns: Object.keys(query._.selectedFields),
+					maxRows,
+				},
+				{ timeoutMs: 30_000, signal: execution.signal },
+			);
+		} catch (error) {
+			logger.warn("Usage history aggregation worker failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw new AppError(
+				"Usage statistics are temporarily unavailable",
+				503,
+				"USAGE_QUERY_UNAVAILABLE",
+			);
+		} finally {
+			const durationMs = Date.now() - startedAt;
+			if (durationMs > 1000) logger.warn("Slow usage history aggregation", { durationMs });
+		}
+	}
 
 	/**
 	 * Get credential display name from provider snapshots.
@@ -363,6 +460,10 @@ export class UsageHistoryService {
 	private mapListRecord(row: UsageHistoryListRow): UsageHistoryRecord {
 		return {
 			...row,
+			costMissingFields:
+				typeof row.costMissingFields === "string"
+					? JSON.parse(row.costMissingFields)
+					: row.costMissingFields,
 			credentialName: this.getCredentialName(row.provider, row.credentialId),
 			inputTokens: row.inputTokens ?? 0,
 			outputTokens: row.outputTokens ?? 0,
@@ -388,14 +489,16 @@ export class UsageHistoryService {
 		}
 	}
 
-	async listProviders(): Promise<string[]> {
-		const rows = await this.database
+	async listProviders(execution: UsageHistoryExecutionOptions = {}): Promise<string[]> {
+		const query = this.database
 			.select({ provider: apiRequests.provider })
 			.from(apiRequests)
 			.where(sql`${apiRequests.provider} is not null and trim(${apiRequests.provider}) <> ''`)
 			.groupBy(apiRequests.provider)
-			.orderBy(sql`lower(${apiRequests.provider}) asc`);
+			.orderBy(sql`lower(${apiRequests.provider}) asc`)
+			.limit(1000);
 
+		const rows = await this.aggregate(query, 1000, execution);
 		return rows.flatMap((row) => (row.provider ? [row.provider] : []));
 	}
 
@@ -403,22 +506,27 @@ export class UsageHistoryService {
 		filters: UsageHistoryFilters,
 		page = 1,
 		pageSize = 50,
+		execution: UsageHistoryExecutionOptions = {},
 	): Promise<{ records: UsageHistoryRecord[]; total: number }> {
 		const offset = (page - 1) * pageSize;
 		const conditions = this.buildWhereConditions(filters);
 
-		const [countResult] = await this.database
+		const countQuery = this.database
 			.select({ count: sql<number>`count(*)` })
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions));
 
+		const [countResult] = await this.aggregate(countQuery, 1, execution);
 		const total = countResult?.count ?? 0;
 
 		const records = await this.database
 			.select({
 				id: apiRequests.id,
+				userId: apiRequests.userId,
+				username: users.username,
 				narratorId: apiRequests.narratorId,
 				agentLabel: apiRequests.agentLabel,
 				kind: apiRequests.kind,
@@ -435,6 +543,8 @@ export class UsageHistoryService {
 				ttftMs: apiRequests.ttftMs,
 				durationMs: apiRequests.durationMs,
 				costUsd: apiRequests.costUsd,
+				costStatus: apiRequests.costStatus,
+				costMissingFields: apiRequests.costMissingFields,
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
@@ -449,6 +559,7 @@ export class UsageHistoryService {
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.orderBy(desc(apiRequests.createdAt), desc(apiRequests.id))
 			.limit(pageSize)
@@ -482,6 +593,8 @@ export class UsageHistoryService {
 		const rows = await this.database
 			.select({
 				id: apiRequests.id,
+				userId: apiRequests.userId,
+				username: users.username,
 				narratorId: apiRequests.narratorId,
 				agentLabel: apiRequests.agentLabel,
 				kind: apiRequests.kind,
@@ -498,6 +611,8 @@ export class UsageHistoryService {
 				ttftMs: apiRequests.ttftMs,
 				durationMs: apiRequests.durationMs,
 				costUsd: apiRequests.costUsd,
+				costStatus: apiRequests.costStatus,
+				costMissingFields: apiRequests.costMissingFields,
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
@@ -512,6 +627,7 @@ export class UsageHistoryService {
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.orderBy(desc(apiRequests.createdAt), desc(apiRequests.id))
 			.limit(boundedLimit + 1);
@@ -533,10 +649,13 @@ export class UsageHistoryService {
 		};
 	}
 
-	async getUsageStats(filters: UsageHistoryFilters): Promise<UsageHistoryStats> {
+	async getUsageStats(
+		filters: UsageHistoryFilters,
+		execution: UsageHistoryExecutionOptions = {},
+	): Promise<UsageHistoryStats> {
 		const conditions = this.buildWhereConditions(filters);
 
-		const [stats] = await this.database
+		const query = this.database
 			.select({
 				totalRequests: sql<number>`count(*)`,
 				totalInputTokens: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
@@ -547,14 +666,17 @@ export class UsageHistoryService {
 				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
 				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
 				totalCost: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`,
+				...costCoverageSelection,
 				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
 				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions));
 
+		const [stats] = await this.aggregate(query, 1, execution);
 		const totalInputTokens = stats?.totalInputTokens ?? 0;
 		const totalOutputTokens = stats?.totalOutputTokens ?? 0;
 		const totalCacheCreationTokens = stats?.totalCacheCreationTokens ?? 0;
@@ -573,6 +695,7 @@ export class UsageHistoryService {
 			totalTokens:
 				totalInputTokens + totalOutputTokens + totalCacheCreationTokens + totalCacheReadTokens,
 			totalCost: stats?.totalCost ?? 0,
+			...costCoverage(stats),
 			averageDurationMs: stats?.averageDurationMs ?? 0,
 			averageTtftMs: stats?.averageTtftMs ?? 0,
 		};
@@ -581,6 +704,7 @@ export class UsageHistoryService {
 	async getUsageTimeSeries(
 		filters: UsageHistoryFilters,
 		options: UsageHistoryTimeSeriesOptions = {},
+		execution: UsageHistoryExecutionOptions = {},
 	): Promise<UsageHistoryTimeSeriesResponse> {
 		const granularity = options.granularity ?? "day";
 		const config = USAGE_TIME_SERIES_CONFIG[granularity];
@@ -592,7 +716,7 @@ export class UsageHistoryService {
 		});
 		const bucket = getBucketExpression(granularity);
 
-		const rows = await this.database
+		const query = this.database
 			.select({
 				bucket,
 				requestCount: sql<number>`count(*)`,
@@ -604,6 +728,7 @@ export class UsageHistoryService {
 				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
 				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
 				totalCost: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`,
+				...costCoverageSelection,
 				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
 				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
 				errorCount: sql<number>`coalesce(sum(case when ${apiRequests.errorMessage} is not null and trim(${apiRequests.errorMessage}) <> '' then 1 else 0 end), 0)`,
@@ -615,10 +740,12 @@ export class UsageHistoryService {
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(bucket)
 			.orderBy(bucket);
 
+		const rows = await this.aggregate(query, config.maxBuckets, execution);
 		const rowsByBucket = new Map(rows.map((row) => [row.bucket, row]));
 		const points = buildBucketTimestamps(
 			range.startBucketDate,
@@ -643,6 +770,7 @@ export class UsageHistoryService {
 				totalTokens:
 					totalInputTokens + totalOutputTokens + totalCacheCreationTokens + totalCacheReadTokens,
 				totalCost: toNumber(row?.totalCost),
+				...costCoverage(row),
 				averageDurationMs: toNumber(row?.averageDurationMs),
 				averageTtftMs: toNumber(row?.averageTtftMs),
 				errorCount: toNumber(row?.errorCount),
@@ -676,6 +804,8 @@ export class UsageHistoryService {
 		const [record] = await this.database
 			.select({
 				id: apiRequests.id,
+				userId: apiRequests.userId,
+				username: users.username,
 				narratorId: apiRequests.narratorId,
 				kind: apiRequests.kind,
 				provider: apiRequests.provider,
@@ -696,6 +826,7 @@ export class UsageHistoryService {
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(eq(apiRequests.id, id));
 		if (!record) return null;
 		return {
@@ -708,6 +839,8 @@ export class UsageHistoryService {
 		const [record] = await this.database
 			.select({
 				id: apiRequests.id,
+				userId: apiRequests.userId,
+				username: users.username,
 				narratorId: apiRequests.narratorId,
 				kind: apiRequests.kind,
 				provider: apiRequests.provider,
@@ -723,6 +856,8 @@ export class UsageHistoryService {
 				ttftMs: apiRequests.ttftMs,
 				durationMs: apiRequests.durationMs,
 				costUsd: apiRequests.costUsd,
+				costStatus: apiRequests.costStatus,
+				costMissingFields: apiRequests.costMissingFields,
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
@@ -737,6 +872,7 @@ export class UsageHistoryService {
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(eq(apiRequests.id, id));
 
 		if (!record) return null;
@@ -764,69 +900,83 @@ export class UsageHistoryService {
 			metric: UsageBreakdownMetric;
 			cluster?: boolean;
 		},
+		execution: UsageHistoryExecutionOptions = {},
 	): Promise<UsageBreakdownResponse> {
 		const { dimension, metric, cluster = true } = options;
 		const conditions = this.buildWhereConditions(filters);
 
 		const dimensionColumn = this.getDimensionColumn(dimension);
 		const metricAgg = this.getMetricAggregation(metric);
-
-		// For model dimension with clustering, fetch more rows then cluster in JS
 		const shouldCluster = dimension === "model" && cluster;
 		const queryLimit = shouldCluster ? 200 : 20;
 
-		const rows = await this.database
+		const query = this.database
 			.select({
-				label: dimensionColumn,
+				label: dimension === "user" ? this.getDimensionLabel(dimension) : dimensionColumn,
 				value: metricAgg,
 				count: sql<number>`count(*)`,
+				// Window totals are evaluated before LIMIT, so user proportions include all users.
+				overallValue:
+					dimension === "user" ? sql<number>`sum(${metricAgg}) over ()` : sql<number>`0`,
+				overallCount: dimension === "user" ? sql<number>`sum(count(*)) over ()` : sql<number>`0`,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(dimensionColumn)
 			.orderBy(sql`${metricAgg} DESC`)
 			.limit(queryLimit);
 
-		let entries: UsageBreakdownEntry[];
-
-		if (shouldCluster) {
-			// JS-layer clustering: normalize model names and merge
-			const clusterMap = new Map<string, { value: number; count: number }>();
-			for (const row of rows) {
-				const family = normalizeModelFamily(String(row.label ?? null));
-				const existing = clusterMap.get(family);
-				if (existing) {
-					existing.value += toNumber(row.value);
-					existing.count += toNumber(row.count);
-				} else {
-					clusterMap.set(family, {
-						value: toNumber(row.value),
-						count: toNumber(row.count),
-					});
-				}
+		const rows = await this.aggregate(query, queryLimit, execution);
+		const grouped = new Map<string, { value: number; count: number }>();
+		const entries: UsageBreakdownEntry[] = [];
+		for (const row of rows) {
+			const label = shouldCluster ? normalizeModelFamily(row.label) : row.label;
+			if (shouldCluster) {
+				const previous = grouped.get(label) ?? { value: 0, count: 0 };
+				previous.value += toNumber(row.value);
+				previous.count += toNumber(row.count);
+				grouped.set(label, previous);
+			} else {
+				entries.push({
+					label,
+					value: toNumber(row.value),
+					count: toNumber(row.count),
+					percentage: 0,
+				});
 			}
-			// Sort by value desc, take top 20
-			entries = [...clusterMap.entries()]
-				.sort((a, b) => b[1].value - a[1].value)
-				.slice(0, 20)
-				.map(([label, data]) => ({ label, ...data, percentage: 0 }));
-		} else {
-			entries = rows.map((row) => ({
-				label: String(row.label ?? "unknown"),
-				value: toNumber(row.value),
-				count: toNumber(row.count),
-				percentage: 0,
-			}));
+		}
+		if (shouldCluster) {
+			entries.push(
+				...[...grouped.entries()]
+					.sort((a, b) => b[1].value - a[1].value)
+					.slice(0, 20)
+					.map(([label, value]) => ({ label, ...value, percentage: 0 })),
+			);
 		}
 
-		const total = entries.reduce((sum, e) => sum + e.value, 0);
+		const visibleTotal = entries.reduce((sum, entry) => sum + entry.value, 0);
+		const total = dimension === "user" ? toNumber(rows[0]?.overallValue) : visibleTotal;
+		if (dimension === "user") {
+			const otherCount =
+				toNumber(rows[0]?.overallCount) - entries.reduce((sum, entry) => sum + entry.count, 0);
+			if (otherCount > 0)
+				entries.push({
+					label: "other",
+					value: total - visibleTotal,
+					count: otherCount,
+					percentage: 0,
+				});
+		}
 		for (const entry of entries) {
 			entry.percentage = total > 0 ? Math.round((entry.value / total) * 10000) / 100 : 0;
 		}
 
-		return { dimension, metric, entries, total };
+		// Coverage is over the whole filter, not merely the visible top-N slice.
+		const coverage = await this.getUsageStats(filters, execution);
+		return { dimension, metric, entries, total, ...costCoverage(coverage) };
 	}
 
 	async getUsageTimeSeriesStacked(
@@ -839,6 +989,7 @@ export class UsageHistoryService {
 			cluster?: boolean;
 			now?: Date;
 		},
+		execution: UsageHistoryExecutionOptions = {},
 	): Promise<UsageStackedTimeSeriesResponse> {
 		const granularity = options.granularity ?? "day";
 		const topN = Math.min(Math.max(options.topN ?? 5, 2), 10);
@@ -854,54 +1005,70 @@ export class UsageHistoryService {
 		const dimensionColumn = this.getDimensionColumn(dimension);
 		const metricAgg = this.getMetricAggregation(metric);
 
-		// Step 1: determine top N labels by total value
-		// For model dimension, fetch more rows then cluster in JS
-		const topQueryLimit = shouldCluster ? 200 : topN;
-		const topLabelsRaw = await this.database
+		// Group users by historical ID, never by their mutable display names.
+		const topQuery = this.database
 			.select({
 				label: dimensionColumn,
+				displayLabel: dimension === "user" ? this.getDimensionLabel(dimension) : dimensionColumn,
 				total: metricAgg,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(dimensionColumn)
-			.orderBy(sql`${metricAgg} DESC`)
-			.limit(topQueryLimit);
-
-		let topLabelSet: Set<string>;
+			.orderBy(sql`${metricAgg} DESC`, dimensionColumn)
+			.limit(shouldCluster ? 200 : topN);
+		const topLabelsRaw = await this.aggregate(topQuery, shouldCluster ? 200 : topN, execution);
+		const familyTotals = new Map<string, number>();
 		if (shouldCluster) {
-			// Cluster model families and pick top N
-			const familyTotals = new Map<string, number>();
 			for (const row of topLabelsRaw) {
-				const family = normalizeModelFamily(String(row.label ?? null));
+				const family = normalizeModelFamily(row.label);
 				familyTotals.set(family, (familyTotals.get(family) ?? 0) + toNumber(row.total));
 			}
-			topLabelSet = new Set(
-				[...familyTotals.entries()]
-					.sort((a, b) => b[1] - a[1])
-					.slice(0, topN)
-					.map(([label]) => label),
-			);
-		} else {
-			topLabelSet = new Set(topLabelsRaw.map((r) => String(r.label ?? "unknown")));
 		}
+		const topLabelSet = new Set(
+			shouldCluster
+				? [...familyTotals.entries()]
+						.sort((a, b) => b[1] - a[1])
+						.slice(0, topN)
+						.map(([label]) => label)
+				: topLabelsRaw.map((row) => row.label),
+		);
+		const displayLabels = new Map(topLabelsRaw.map((row) => [row.label, row.displayLabel]));
 
-		// Step 2: get time-bucketed data for top labels
+		// Fold non-top dimensions into NULL in SQL, not after transferring every dimension.
+		// NULL is an internal "other" bucket distinct from real labels such as "other".
 		const bucket = getBucketExpression(granularity);
-		const rows = await this.database
+		const groupedLabel = shouldCluster
+			? dimensionColumn
+			: topLabelSet.size
+				? sql<string | null>`case when ${dimensionColumn} in (${sql.join(
+						[...topLabelSet].map((label) => sql`${label}`),
+						sql`, `,
+					)}) then ${dimensionColumn} else null end`
+				: sql<string | null>`null`;
+		const bucketQuery = this.database
 			.select({
 				bucket,
-				label: dimensionColumn,
+				label: groupedLabel,
 				value: metricAgg,
+				requestCount: sql<number>`count(*)`,
+				...costCoverageSelection,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
-			.groupBy(bucket, dimensionColumn)
+			.groupBy(bucket, groupedLabel)
 			.orderBy(bucket);
+		const rows = await this.aggregate(
+			bucketQuery,
+			shouldCluster ? 10_000 : USAGE_TIME_SERIES_CONFIG[granularity].maxBuckets * (topN + 1),
+			execution,
+		);
 
 		// Step 3: build timestamps and series
 		const timestamps = buildBucketTimestamps(
@@ -915,12 +1082,11 @@ export class UsageHistoryService {
 		const otherMap = new Map<string, number>();
 
 		for (const row of rows) {
-			const rawLabel = String(row.label ?? "unknown");
-			const label = shouldCluster ? normalizeModelFamily(rawLabel) : rawLabel;
+			const label = shouldCluster ? normalizeModelFamily(row.label) : row.label;
 			const ts = row.bucket;
 			const value = toNumber(row.value);
 
-			if (topLabelSet.has(label)) {
+			if (label !== null && topLabelSet.has(label)) {
 				let labelMap = dataMap.get(label);
 				if (!labelMap) {
 					labelMap = new Map();
@@ -953,7 +1119,7 @@ export class UsageHistoryService {
 		for (const label of topLabelSet) {
 			const labelData = dataMap.get(label);
 			series.push({
-				label,
+				label: displayLabels.get(label) ?? label,
 				color: STACKED_COLORS[colorIndex % STACKED_COLORS.length],
 				data: timestamps.map((ts) => ({ timestamp: ts, value: labelData?.get(ts) ?? 0 })),
 			});
@@ -975,11 +1141,27 @@ export class UsageHistoryService {
 			dimension,
 			metric,
 			series,
+			...costCoverage(
+				rows.reduce(
+					(sum, row) => ({
+						requestCount: sum.requestCount + toNumber(row.requestCount),
+						unpricedRequestCount: sum.unpricedRequestCount + toNumber(row.unpricedRequestCount),
+						partialRequestCount: sum.partialRequestCount + toNumber(row.partialRequestCount),
+					}),
+					{ requestCount: 0, unpricedRequestCount: 0, partialRequestCount: 0 },
+				),
+			),
 			timestamps,
 			truncated: range.truncated,
 			effectiveStartDate: range.effectiveStartDate,
 			effectiveEndDate: range.effectiveEndDate,
 		};
+	}
+
+	private getDimensionLabel(dimension: UsageBreakdownDimension) {
+		return dimension === "user"
+			? sql<string>`case when ${apiRequests.userId} is null then '__unattributed__' else coalesce(${users.username}, ${apiRequests.userId}) end`
+			: this.getDimensionColumn(dimension);
 	}
 
 	private getDimensionColumn(dimension: UsageBreakdownDimension) {
@@ -990,6 +1172,8 @@ export class UsageHistoryService {
 				return sql<string>`coalesce(${apiRequests.model}, 'unknown')`;
 			case "kind":
 				return sql<string>`${apiRequests.kind}`;
+			case "user":
+				return sql<string>`coalesce(${apiRequests.userId}, '__unattributed__')`;
 		}
 	}
 
@@ -1016,6 +1200,14 @@ export class UsageHistoryService {
 		const model = normalizeModelFilter(filters.model);
 		const kind = filters.kind?.trim();
 		const credentialId = filters.credentialId?.trim();
+		const userId = filters.userId?.trim();
+		if (userId) {
+			conditions.push(
+				userId === "__unattributed__"
+					? sql`${apiRequests.userId} IS NULL`
+					: eq(apiRequests.userId, userId),
+			);
+		}
 
 		if (filters.narratorId) {
 			// Both sides of the OR must be predicates on `api_requests.narrator_id` so

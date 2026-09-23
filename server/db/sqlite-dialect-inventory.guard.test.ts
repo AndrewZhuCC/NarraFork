@@ -474,6 +474,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
+	"server/lib/db-worker/usage-history-query.ts": ["driver"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
 	"server/lib/project-db.ts": ["driver", "pragma"],
 	"server/routes/storage.ts": ["vacuum"],
@@ -490,6 +491,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
 	"server/services/file-change-evidence.ts": ["nativeClient"],
+	"server/services/file-change-namespace-reset.ts": ["rowid"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
 		"pragma",
@@ -590,8 +592,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
+	"server/services/usage-history-service.ts": ["connectionModule"],
+	"server/services/workspace-execution-owner.ts": ["nativeClient", "drizzleDialect"],
+	"server/services/workspace-metadata-retry.ts": ["errorCode"],
 	"server/services/workspace-modification-view.ts": ["rowid"],
-	"server/services/workspace-write-coordinator.ts": ["drizzleDialect", "pragma"],
+	"server/services/workspace-write-coordinator.ts": ["nativeClient", "drizzleDialect", "pragma"],
+	"server/services/workspace-write-lease-store.ts": ["json1"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 
@@ -615,6 +621,8 @@ function isExempt(posixPath: string): boolean {
 	if (fileName.includes(".test.") || fileName.includes(".spec.")) return true;
 	if (posixPath.includes("/__tests__/")) return true;
 	if (posixPath.startsWith("tests/")) return true;
+	// A tracked, standalone in-memory migration fixture, not a served DB module.
+	if (posixPath === "server/db/.tmp-migration-fixture.ts") return true;
 
 	// Operator CLI tools, run by a human against a local file — not part of the served app.
 	if (posixPath.startsWith("server/scripts/")) return true;
@@ -1125,6 +1133,7 @@ describe("SQLite dialect inventory guard", () => {
 		expect(isExempt("server/db/fts.test.ts")).toBe(true);
 		expect(isExempt("server/services/__tests__/knowledge-smoke.ts")).toBe(true);
 		expect(isExempt("tests/fixtures/knowledge-grants.ts")).toBe(true);
+		expect(isExempt("server/db/.tmp-migration-fixture.ts")).toBe(true);
 		expect(isExempt("server/scripts/approve-all.ts")).toBe(true);
 		expect(isExempt("scripts/purge-test-pollution.ts")).toBe(true);
 		expect(isExempt("server/generated/embedded-changelog.ts")).toBe(true);
@@ -1133,6 +1142,7 @@ describe("SQLite dialect inventory guard", () => {
 		// exempt shapes. `services/` is not `server/scripts/`, and a module named after tests
 		// still ships.
 		expect(isExempt("server/db/connection.ts")).toBe(false);
+		expect(isExempt("server/db/.tmp-migration-fixture-extra.ts")).toBe(false);
 		expect(isExempt("server/services/search-service.ts")).toBe(false);
 		expect(isExempt("server/services/benchmark-service.ts")).toBe(false);
 		expect(isExempt("shared/subagent-tool-summary.ts")).toBe(false);

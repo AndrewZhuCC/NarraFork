@@ -52,6 +52,7 @@
  */
 
 import { migrate } from "drizzle-orm/bun-sql/migrator";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { type CapabilityResult, notApplicable } from "./backend/capability";
@@ -320,6 +321,24 @@ type PostgresConfig = Extract<ResolvedDatabaseConfig, { backend: "postgres" }>;
 
 export type { PostgresConfig as ResolvedPostgresConfig };
 
+/** A released migration fork must never be mistaken for the next sequential migration. */
+export function assertPostgresMigrationHistory(
+	latest: { hash: string; created_at: number | string | bigint } | undefined,
+	migrations: ReadonlyArray<{ hash: string; folderMillis: number }>,
+): void {
+	if (!latest) return;
+	if (
+		migrations.some(
+			(migration) =>
+				migration.hash === latest.hash && migration.folderMillis === Number(latest.created_at),
+		)
+	)
+		return;
+	throw new Error(
+		"PostgreSQL migration history diverges from this release; automatic migration is blocked. Back up the database and reconcile its applied migration branch before upgrading.",
+	);
+}
+
 async function startPostgresRuntimeWithDeps(
 	config: PostgresConfig,
 	deps: PostgresRuntimeDeps,
@@ -374,10 +393,24 @@ async function startPostgresRuntimeWithDeps(
 				runMigrationsForDriver({ driver: "postgresql", run }));
 		await runMigrations(async (folder) => {
 			migrationFolder = folder;
-			await (deps.migrateFolder ?? ((c, f) => migrate(c.db, { migrationsFolder: f })))(
-				client,
-				folder,
-			);
+			await (
+				deps.migrateFolder ??
+				(async (c, f) => {
+					const [relation] = await c.sql.unsafe(
+						"SELECT to_regclass('drizzle.__drizzle_migrations') AS migration_table",
+					);
+					if (relation?.migration_table) {
+						const [latest] = await c.sql.unsafe(
+							"SELECT hash, created_at FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1",
+						);
+						assertPostgresMigrationHistory(
+							latest as { hash: string; created_at: number | string | bigint } | undefined,
+							readMigrationFiles({ migrationsFolder: f }),
+						);
+					}
+					await migrate(c.db, { migrationsFolder: f });
+				})
+			)(client, folder);
 		});
 	} catch (error) {
 		await close().catch(() => {});

@@ -1,6 +1,8 @@
+import { getEffectiveModelMetadata } from "../model-catalog";
 import {
 	getAnthropicProviderConfig,
 	getGrokProviderConfig,
+	getOpenaiProviderConfig,
 	isAnthropicProvider,
 	settings,
 	usesCodexModel,
@@ -31,13 +33,20 @@ export function isNativeSearchEnabled(config: NarraForkSettings = settings): boo
  * toggled, not a permanent regression.
  */
 export function usesInlineNativeSearch(provider: string, model: string): boolean {
-	if (usesCodexModel(provider, model)) return true;
+	if (
+		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.metadata.nativeSearch?.supported === false
+	)
+		return false;
+	if (usesCodexModel(provider, model)) {
+		if (provider === "codex" && settings.codex?.useWebSearch === false) return false;
+		return getOpenaiProviderConfig(provider)?.codexWebSearch !== false;
+	}
 	// Grok declares its own server-side search tools (web_search / x_search) in the
 	// main /responses request. Only counts as inline when at least one search switch
 	// is on, otherwise the function WebSearch tool stays visible.
 	const config = getGrokProviderConfig(provider);
-	if (config) return !!config.enableWebSearch || !!config.enableXSearch;
-	return false;
+	return !!config && (!!config.enableWebSearch || !!config.enableXSearch);
 }
 
 /**
@@ -64,7 +73,13 @@ export function usesInlineNativeSearch(provider: string, model: string): boolean
  * it fails the side request cleanly — the router then falls through to the
  * next configured channel. Non-official providers never qualify.
  */
-export function usesSideRequestNativeSearch(provider: string): boolean {
+export function usesSideRequestNativeSearch(provider: string, model?: string): boolean {
+	if (
+		model &&
+		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.metadata.nativeSearch?.supported === false
+	)
+		return false;
 	if (!isAnthropicProvider(provider)) return false;
 	const config = getAnthropicProviderConfig(provider);
 	return !!config?.officialApi && config.nativeSearch !== false;
@@ -86,7 +101,7 @@ export function hasSideRequestNativeSearchProvider(config: NarraForkSettings = s
 
 /** Whether this provider/model can perform provider-side web search at all. */
 export function supportsNativeSearch(provider: string, model: string): boolean {
-	return usesInlineNativeSearch(provider, model) || usesSideRequestNativeSearch(provider);
+	return usesInlineNativeSearch(provider, model) || usesSideRequestNativeSearch(provider, model);
 }
 
 /**

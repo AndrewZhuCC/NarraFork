@@ -15,9 +15,12 @@ import { createMailboxStore } from "../agent-runtime/mailbox";
 const { db, sqlite } = getTestDb();
 mock.module("../../db", () => ({ db, sqlite }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
-const { runtimePublication: publisher, createRuntimePublicationService } = await import(
-	"../agent-runtime/publication"
-);
+const {
+	runtimePublication: publisher,
+	createRuntimePublicationService,
+	activateSqliteRuntimePublication,
+} = await import("../agent-runtime/publication");
+activateSqliteRuntimePublication(db);
 publisher.stop(); // Tests explicitly step the production worker; no clock races.
 tasks.setBroadcastFnForTests(() => {});
 const mailbox = createMailboxStore(db);
@@ -148,8 +151,7 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	test("new Agent logical runs preserve old source and planned recovery reuses its reservation", async () => {
-		const first = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
-		await tasks.createAgentTask({
+		const first = await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
 			parentNarratorId: "parent",
@@ -218,13 +220,14 @@ describe("real task producers use publication outbox", () => {
 		await startBash("large");
 		await tasks.markCompleted("large", "x".repeat(2 * 1024 * 1024));
 		const task = await tasks.getById("large");
-		expect(Buffer.byteLength(task?.output ?? "")).toBe(512 * 1024);
+		expect(Buffer.byteLength(task?.output ?? "")).toBeLessThan(5120);
+		expect(task?.output).toContain("toolcall_");
 		expect(task?.outputTruncated).toBe(true);
+		expect(task?.output).toContain("No Await is needed");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	});
 
 	test("Agent retains full source and stores only a bounded immutable display receipt", async () => {
-		publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
 		await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",
@@ -261,7 +264,6 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	test("Agent with no result message has a UTF8 bounded explicit fallback", async () => {
-		publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
 		await tasks.createAgentTask({
 			id: "child",
 			subagentNarratorId: "child",

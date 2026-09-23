@@ -452,6 +452,7 @@ export function useRevertActionPreview(
 			affectedFiles: files,
 			previewIssue: issue,
 			previewError: current?.error,
+			blockers: response?.blockers,
 			narratorScope: {
 				available: !!plan && !issue && current?.filesComplete === true,
 				reason: response?.unavailable,
@@ -761,6 +762,27 @@ export function usePromoteNarrator() {
 	});
 }
 
+export function useExtractSubagentToPrimary() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (vars: {
+			narratorId: string;
+			title?: string;
+			inheritMode?: "full" | "compressed";
+			locale?: "en" | "zh-CN";
+		}) =>
+			api.extractSubagentToPrimary(vars.narratorId, {
+				title: vars.title,
+				inheritMode: vars.inheritMode,
+				locale: vars.locale,
+			}),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useNarrator(id: string) {
 	return useQuery({
 		queryKey: ["narrators", id],
@@ -808,6 +830,7 @@ export function useCreateNarrator() {
 			model?: string;
 			systemPrompt?: string;
 			permissionMode?: string;
+			startInPlanMode?: boolean;
 			reasoningEffort?: string | null;
 			fastModeOverride?: "inherit" | "on" | "off";
 			relaxedPlan?: boolean;

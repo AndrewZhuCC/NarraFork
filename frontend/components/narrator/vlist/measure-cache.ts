@@ -258,6 +258,10 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-takeover payload and the header stays silent about why
 	// the session stopped.
 	if (d.isTakenOver === true) rev += "|tv:1";
+	// Queued-behind-upstream shimmer. Height-neutral (a class name / aria label),
+	// keyed because an earlier sibling finishing is the ONLY event that clears it
+	// while this call's own status stays `initializing`.
+	if (d.queuedBehindUpstream === true) rev += "|tq:1";
 	// `+N -N` line counts. Height-neutral (a nowrap span in the fixed header row),
 	// keyed for the same reason `timeoutMs` and `isTakenOver` are: it is PAINTED from
 	// the cached payload and can APPEAR while nothing else in the key moves. Two such
@@ -405,6 +409,8 @@ function traceRevision(d: Record<string, unknown>): string {
 		// a gate resolving does not necessarily move the tool's own status, and a stale
 		// entry would keep a settled row purple.
 		if (typeof r.reflectionStatus === "string") rev += `|trs:${r.reflectionStatus}`;
+		// Same reason as the card-level `|tq:1` above: painted from the cached payload.
+		if (r.queuedBehindUpstream === true) rev += "|trq:1";
 		// Per-row `+N -N`, keyed for the same reason the card-level one above is.
 		rev += diffStatsRevision(r.diffStats);
 		// The row's duration is height-neutral but PAINTED from the cached payload, so
@@ -415,6 +421,13 @@ function traceRevision(d: Record<string, unknown>): string {
 			const duration = (r.timing as Record<string, unknown>).durationMs;
 			if (typeof duration === "number") rev += `|tm:${duration}`;
 		}
+		// The figure actually PAINTED, which for bash is the pure execution time rather
+		// than `timing.durationMs` (see `@shared/tool-display-duration`). Keyed
+		// separately because it derives from `_metadata.execDurationMs`, which a live
+		// patch can land ALONE on an already-terminal status — the same reason
+		// `diffStats` above needs its own component. Serving the stale figure would be
+		// worse than serving none: a duration looks authoritative.
+		if (typeof r.displayDurationMs === "number") rev += `|tmd:${r.displayDurationMs}`;
 		// An expandable body is measured as markdown when its row is expanded.
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
@@ -835,7 +848,8 @@ function leafTextRevision(d: Record<string, unknown>): string {
 			for (const option of q.options as unknown[]) {
 				if (option == null || typeof option !== "object") continue;
 				const o = option as Record<string, unknown>;
-				if (typeof o.label === "string") rev += `|al:${textSignature(o.label)}`;
+				if (typeof o.header === "string") rev += `|al:${textSignature(o.header)}`;
+				else if (typeof o.label === "string") rev += `|al:${textSignature(o.label)}`;
 				if (typeof o.description === "string") rev += `|ad:${textSignature(o.description)}`;
 				// Selection is height-neutral on its own, but it flips with the answer and
 				// keeping it here makes the revision a faithful digest of the payload.

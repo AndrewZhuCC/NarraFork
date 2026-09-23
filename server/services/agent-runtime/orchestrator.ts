@@ -4,6 +4,7 @@ import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
@@ -89,6 +90,7 @@ import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service"
 import {
 	cleanupBufferedTextFilesAsync,
 	getBufferedMessagesAsync,
+	mailboxInputRequiresFreshTurn,
 	projectMailboxUserMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
@@ -144,6 +146,7 @@ import {
 	getSubagentFinalText,
 	getSubagentResultMessageId,
 	hasPendingBufferedWork,
+	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
@@ -153,6 +156,8 @@ import {
 	resolveRuntimeReasoningEffort,
 	resolveSessionDevices,
 	setNarratorDefaultDevice,
+	settleNarratorRuntimeModel,
+	updateNarratorModel,
 	updateToolCallConclusion,
 } from "../narrator-session";
 import type { ActiveNarrator, BufferedMessage } from "../narrator-session-state";
@@ -173,6 +178,7 @@ import {
 	planModeAskedOnce,
 	recordNarratorRuntimeModel,
 	resetActiveUpstreamSession,
+	withNarratorMutationAdmission,
 } from "../narrator-session-state";
 import { clearAliasRegistry, clearTeamFileChanges } from "../narrator-subagent";
 import { generateAndSetTitle } from "../narrator-title";
@@ -493,6 +499,7 @@ export async function runAgentLoopUnlocked(
 			clearActiveHistoryCompactPending(narratorId);
 
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
+			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
@@ -518,27 +525,43 @@ export async function runAgentLoopUnlocked(
 				? rawMessages.map((m) => ({ ...m, parentToolUseId: null }))
 				: rawMessages;
 
-			active._modelRef =
-				!runState.initialSettingsApplied && profile.kind === "subagent"
-					? (profile.initialModel ?? freshNarrator.model ?? FOLLOW_DEFAULT_MODEL)
-					: (freshNarrator.model ?? FOLLOW_DEFAULT_MODEL);
+			// The row is authoritative, including a pin made after the executor built
+			// its one-time snapshot. initialModel only identifies the initial history.
+			const modelSelectionRef = freshNarrator.model ?? FOLLOW_DEFAULT_MODEL;
+			if (
+				active._modelRefreshVersion !== modelVersionBeforeLoad &&
+				active._modelSelectionRef !== undefined
+			) {
+				// A live update landed while the DB/OAuth/device snapshot was awaited.
+				// That newer selection must not be replaced by the pass's older row.
+				await settleNarratorRuntimeModel(active);
+			} else {
+				inheritedModelRuntime.select(active, modelSelectionRef, freshNarrator.parentNarratorId);
+				active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
+				if (modelSelectionRef === FOLLOW_PARENT_MODEL) {
+					inheritedModelRuntime.refresh(active);
+					await settleNarratorRuntimeModel(active);
+				} else {
+					active._modelRef = modelSelectionRef;
+					active._settingsRevision = getSettingsRevision();
+					active.model = resolveEffectiveModel(modelSelectionRef, active.provider);
+					active.provider = resolveProvider(active.model);
+					active.reasoningEffort = resolveRuntimeReasoningEffort(
+						active.provider,
+						active.model,
+						active._reasoningEffortRef,
+					);
+				}
+			}
 			runState.initialSettingsApplied = true;
-			active._settingsRevision = getSettingsRevision();
-			active.model = resolveEffectiveModel(active._modelRef, active.provider);
 			const turnModelRef = active._modelRef;
 			const turnEffectiveModel = active.model;
-			active.provider = resolveProvider(active.model);
-			active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
-			active.reasoningEffort = resolveRuntimeReasoningEffort(
-				active.provider,
-				active.model,
-				active._reasoningEffortRef,
-			);
+			const turnModelRefreshVersion = active._modelRefreshVersion;
 			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
 			recordNarratorRuntimeModel(
 				narratorId,
-				active._modelRef ?? FOLLOW_DEFAULT_MODEL,
+				active._modelSelectionRef ?? active._modelRef ?? FOLLOW_DEFAULT_MODEL,
 				resolved.provider,
 				resolved.model,
 			);
@@ -580,7 +603,15 @@ export async function runAgentLoopUnlocked(
 				currentInput: runState.input.text,
 			});
 			let { history, trailingToolResults } = preparedHistory;
-			const usesInitialHistory = runState.firstPass && profile.kind === "subagent";
+			// The caller's history was formatted using its initial model. A parent or
+			// manual change can select another protocol before this first pass starts.
+			// Never overwrite the freshly rebuilt history with that obsolete snapshot.
+			const usesInitialHistory =
+				runState.firstPass &&
+				profile.kind === "subagent" &&
+				active._modelSelectionRef !== FOLLOW_PARENT_MODEL &&
+				(profile.initialModel === active.model ||
+					(!profile.initialModel && profile.initialHistory?.length === 0));
 			if (usesInitialHistory && profile.kind === "subagent") {
 				history = profile.initialHistory;
 				trailingToolResults = profile.initialTrailingToolResults ?? [];
@@ -621,6 +652,7 @@ export async function runAgentLoopUnlocked(
 				getFileReferenceContext: () => getAgentFileReferenceContext(config),
 				narratorId,
 				broadcastTargetId: saParentNarratorId ?? narratorId,
+				userId: active._currentUserId ?? null,
 				sseEmitter: active.events,
 				conversationId: active.conversationId,
 				locale: active.locale,
@@ -676,6 +708,7 @@ export async function runAgentLoopUnlocked(
 				isSubagent: isSubagentNarrator,
 				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
+				getUserId: () => active._currentUserId,
 				onCompactDone: () => {
 					compactDoneFlag = true;
 				},
@@ -999,10 +1032,7 @@ export async function runAgentLoopUnlocked(
 				},
 			};
 
-			const resolvedReasoningEffort =
-				runReasoningEffort ??
-				(freshNarrator.reasoningEffort ||
-					resolveDefaultReasoningEffort(resolved.provider, resolved.model));
+			const resolvedReasoningEffort = runReasoningEffort ?? active.reasoningEffort ?? undefined;
 
 			// Resolved per turn, not frozen at creation: an "inherit" override follows
 			// the acting user's fastModeDefault preference, so flipping that default
@@ -1047,6 +1077,7 @@ export async function runAgentLoopUnlocked(
 			await ensureSkillCacheFreshForActiveNarrator(active);
 			const availableDevices = turnSessionDevices;
 
+			let toolCallLimitExceeded = false;
 			const config: import("../../lib/agent").AgentConfig = {
 				runtimePolicy,
 				narratorId,
@@ -1143,6 +1174,11 @@ export async function runAgentLoopUnlocked(
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
+				maxToolCallsPerResponse: settings.agent.maxToolCallsPerResponse,
+				onToolCallLimitExceeded: () => {
+					toolCallLimitExceeded = true;
+					active.abortController.abort();
+				},
 				pipelineUnusedToolCallThreshold: getPipelineUnusedToolCallThreshold(),
 				retryBackoffCeilMs: getRetryBackoffCeilMs(),
 				firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
@@ -1282,13 +1318,17 @@ export async function runAgentLoopUnlocked(
 					}
 					return turnText ?? "";
 				},
-				getRuntimeSettingsOverride: () => {
+				getRuntimeSettingsOverride: async () => {
+					await settleNarratorRuntimeModel(active);
 					// active.model/reasoningEffort are updated in real time by narrator routes.
 					// For raw refs that follow settings (__default__ / __agg__), also re-resolve
 					// when global settings change so the next API request picks up default-model
 					// or aggregation membership/routing updates, including retry attempts.
 					const revision = getSettingsRevision();
-					if (active._settingsRevision !== revision) {
+					if (
+						active._modelSelectionRef !== FOLLOW_PARENT_MODEL &&
+						active._settingsRevision !== revision
+					) {
 						active._settingsRevision = revision;
 						const modelRef = active._modelRef ?? FOLLOW_DEFAULT_MODEL;
 						const resolvedModel = resolveEffectiveModel(modelRef, active.provider);
@@ -1542,8 +1582,11 @@ export async function runAgentLoopUnlocked(
 					target: active,
 					isCurrent: () => active.alive && owner.isCurrent(),
 					hasModelChanged: () =>
+						active._modelRefreshVersion !== turnModelRefreshVersion ||
 						active._modelRef !== turnModelRef ||
 						active.model !== turnEffectiveModel ||
+						(active._modelSelectionRef === FOLLOW_PARENT_MODEL &&
+							active._settingsRevision !== getSettingsRevision()) ||
 						(turnModelRef === FOLLOW_DEFAULT_MODEL &&
 							resolveEffectiveModel(turnModelRef, active.provider) !== turnEffectiveModel),
 					subscribe: subscribeSettingsChanges,
@@ -1638,6 +1681,16 @@ export async function runAgentLoopUnlocked(
 				hooks,
 			});
 			runState.lastPass = result;
+			if (toolCallLimitExceeded) {
+				// Stop before any retry, review/task continuation or buffered-message replay.
+				// A new explicit user turn can still start normally; no persistent latch.
+				runState.hadError = true;
+				runState.wasInterrupted = true;
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				await finalizeInterruptedRun(active, narratorId, partialId);
+				break;
+			}
 			runState.recovery.overflowRetries = resetContextOverflowRetriesAfterProgress(
 				runState.recovery.overflowRetries,
 				result.completedAssistantTurn,
@@ -2253,14 +2306,15 @@ export async function runAgentLoopUnlocked(
 						// Fire-and-forget: compact runs in the background.
 						// On completion it resets the narrator's conversationId so the next
 						// agent loop iteration starts a fresh API conversation.
-						runCustomCompact(narratorId, locale, boundaryMessageId, { mode: "background" }).catch(
-							(compactErr) => {
-								logger.error("Auto-compact failed", {
-									narratorId,
-									error: String(compactErr),
-								});
-							},
-						);
+						runCustomCompact(narratorId, locale, boundaryMessageId, {
+							mode: "background",
+							userId: active._currentUserId,
+						}).catch((compactErr) => {
+							logger.error("Auto-compact failed", {
+								narratorId,
+								error: String(compactErr),
+							});
+						});
 					} else {
 						logger.info("Compact requested but not enough messages to compact", {
 							narratorId,
@@ -2318,10 +2372,23 @@ export async function runAgentLoopUnlocked(
 				!runState.hadError &&
 				!isNarratorRevertAdmissionBlocked(narratorId)
 			) {
-				const bufferedRow = await claimInboxHead(
-					narratorId,
-					(candidate) => candidate.kind === "user_input",
-				);
+				// Serialize this claim with HTTP acceptance + interrupt. Otherwise a live
+				// loop can consume the replacement while its enqueue is returning, then
+				// the interrupt intended for the old input would abort the new one.
+				let requiresFreshTurn = false;
+				const bufferedRow = await withNarratorMutationAdmission(narratorId, async () => {
+					if (active.abortController.signal.aborted) return undefined;
+					return claimInboxHead(narratorId, (candidate) => {
+						requiresFreshTurn = mailboxInputRequiresFreshTurn(candidate);
+						return (
+							!active.abortController.signal.aborted &&
+							candidate.kind === "user_input" &&
+							!requiresFreshTurn
+						);
+					});
+				});
+				// Let the finalizer restore the previous model and release its epoch first.
+				if (requiresFreshTurn) break;
 				let buffered: BufferedMessage | undefined;
 				try {
 					buffered = bufferedRow ? projectMailboxUserMessage(bufferedRow) : undefined;
@@ -2471,7 +2538,10 @@ export async function runAgentLoopUnlocked(
 						commandText: buffered.commandText,
 						createdBy: buffered.createdBy,
 					});
-					if (!buffered.preserveWorkTurn) active._upstreamWorkTurnId = buffered.id;
+					if (!buffered.preserveWorkTurn) {
+						active._upstreamWorkTurnId = buffered.id;
+						active._currentUserId = buffered.createdBy ?? null;
+					}
 					pendingBufferedDelivery = undefined;
 					await cleanupBufferedTextFilesAsync(buffered._stagingId ?? buffered.id);
 					broadcastToNarrator(narratorId, {
@@ -2853,6 +2923,9 @@ export async function runAgentLoopUnlocked(
 								updatedAt: new Date().toISOString(),
 							})
 							.where(eq(narrators.id, narratorId));
+						updateNarratorModel(narratorId, restoreModel);
+						// The primary active is already marked dead above, so the live
+						// updater only propagates to followers; still publish this DB restore.
 						broadcastToNarrator(narratorId, {
 							type: "model_changed",
 							narratorId,

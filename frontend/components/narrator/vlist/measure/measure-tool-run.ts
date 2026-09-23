@@ -291,6 +291,11 @@ export interface TraceItemData {
 	 */
 	status?: string | null;
 	/**
+	 * Height-neutral: an earlier same-turn tool still owns the execution slot.
+	 * See `@shared/tool-shimmer`.
+	 */
+	queuedBehindUpstream?: boolean;
+	/**
 	 * Lifecycle stamps for the row's trailing timing text (renderer only).
 	 *
 	 * HEIGHT-NEUTRAL for the same reason the tool card's header timing is: an
@@ -298,6 +303,15 @@ export interface TraceItemData {
 	 * line, and the breakdown popover is portaled.
 	 */
 	timing?: Partial<ToolTimingStamps> | null;
+	/**
+	 * The duration the row PAINTS, when it differs from `timing.durationMs` (bash
+	 * prefers pure execution time — see `@shared/tool-display-duration`).
+	 *
+	 * HEIGHT-NEUTRAL for the same reason `timing` is: one nowrap span in the row's
+	 * fixed line. Still keyed in `traceRevision`, because the renderer paints it from
+	 * the cached payload.
+	 */
+	displayDurationMs?: number | null;
 	/**
 	 * Added / removed line counts for a Write/Edit row (`+12 -3`).
 	 *
@@ -444,6 +458,12 @@ export interface MeasuredTraceRow {
 	 */
 	timing: ToolTimingStamps | null;
 	/**
+	 * The duration the row paints (renderer only; height-neutral). Null → fall back
+	 * to `timing.durationMs`. See `@shared/tool-display-duration` for why the two
+	 * differ for bash.
+	 */
+	displayDurationMs: number | null;
+	/**
 	 * Added / removed line counts for a Write/Edit row (renderer only;
 	 * height-neutral). Null when the row is not a file tool or the counts are
 	 * unknown — never `{ added: 0, removed: 0 }` for "unknown".
@@ -455,6 +475,8 @@ export interface MeasuredTraceRow {
 	category?: string;
 	/** Streaming shimmer flag (renderer). */
 	shimmer: boolean;
+	/** Height-neutral: earlier same-turn tool still owns the slot (renderer). */
+	queuedBehindUpstream?: boolean;
 	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
 	reflectionStatus?: string;
 	/** Whether this row has an expandable body. */
@@ -851,8 +873,10 @@ export function measureCollapsibleTrace(
 			// `recentCallTimings`.
 			status: item.status ?? null,
 			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
+			displayDurationMs: item.displayDurationMs ?? null,
 			diffStats: item.diffStats ?? null,
 			shimmer: !!item.shimmer,
+			queuedBehindUpstream: item.queuedBehindUpstream === true ? true : undefined,
 			reflectionStatus: item.reflectionStatus,
 			expandable,
 			expanded,
@@ -916,6 +940,13 @@ export interface ActivityTraceItem {
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
+	/**
+	 * Tool name / category for the row's chip glyph (renderer; height-neutral).
+	 * `measureCollapsibleTrace` already passthroughs both onto `MeasuredTraceRow`;
+	 * they were missing from this input type, so call sites had to cast.
+	 */
+	toolName?: string;
+	category?: string;
 	shimmer?: boolean;
 	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
 	reflectionStatus?: string;

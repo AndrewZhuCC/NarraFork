@@ -124,6 +124,7 @@ import {
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { letterSpacingPxFor, scaleFontSize } from "@shared/pretext-layout/typography";
+import { resolveToolDisplayDurationMs } from "@shared/tool-display-duration";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -205,6 +206,7 @@ export type ToolCategory =
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "contextAsk"
 	| "generic";
 
 /** Tool-call status (subset of the live statuses that affect the height model). */
@@ -580,6 +582,11 @@ export interface ToolCallData {
 	/** True while the tool input is still streaming (lodExempt, no fold). */
 	isStreaming?: boolean;
 	/**
+	 * Height-neutral: an earlier same-turn tool still owns the execution slot.
+	 * See `@shared/tool-shimmer`.
+	 */
+	queuedBehindUpstream?: boolean;
+	/**
 	 * Added / removed line counts for a settled Write/Edit (`+12 -3`).
 	 *
 	 * HEIGHT-NEUTRAL: one nowrap span inside the already-fixed header row, exactly
@@ -807,6 +814,8 @@ export interface MeasuredToolCall extends MeasuredElement {
 	lodExempt: boolean;
 	/** Mirrors data.isStreaming. */
 	isStreaming: boolean;
+	/** Mirrors data.queuedBehindUpstream (renderer; height-neutral). */
+	queuedBehindUpstream?: boolean;
 	/** Rendered inside a run (no border + divider). */
 	inRun: boolean;
 	/** In-run last-row flag (no divider). */
@@ -1545,13 +1554,29 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 		nextMargin = QUESTION_STACK_GAP;
 	}
 
+	if (question.description?.trim()) {
+		push(
+			makeInline(
+				question.description,
+				OPTION_DESC_FONT,
+				OPTION_DESC_LINE_HEIGHT,
+				0,
+				nextMargin,
+				"vlist-tc-ask-description",
+				{ role: "ask-description" },
+			),
+		);
+		nextMargin = QUESTION_STACK_GAP;
+	}
+
 	const control = question.multiSelect === true ? "checkbox" : "radio";
 	question.options.slice(0, ASK_OPTIONS_MAX).forEach((option, index) => {
 		// The first option is separated from the header by the question gap; later
 		// options by the tighter options gap.
+		const optionTitle = option.header.length > 0 ? option.header : " ";
 		push(
 			makeInline(
-				option.label.length > 0 ? option.label : " ",
+				optionTitle,
 				OPTION_LABEL_FONT,
 				OPTION_LABEL_LINE_HEIGHT,
 				OPTION_INDENT,
@@ -1990,6 +2015,7 @@ export function measureToolCall(
 		effectiveOpened,
 		lodExempt,
 		isStreaming,
+		queuedBehindUpstream: data.queuedBehindUpstream === true ? true : undefined,
 		inRun,
 		isLast,
 		hasBorder,
@@ -2010,9 +2036,11 @@ export function measureToolCall(
 		diffStats: data.diffStats ?? null,
 		isRemoteTarget: data.isRemoteTarget === true,
 		isTakenOver: data.isTakenOver === true,
-		// Bash prefers pure execution time (mirrors the chunked getBashExecDurationMs).
-		displayDurationMs:
-			(data.category === "bash" ? data.execDurationMs : undefined) ?? data.durationMs ?? null,
+		// Bash prefers pure execution time. The rule lives in
+		// `@shared/tool-display-duration` so the folded trace row applies the SAME one —
+		// it used to paint raw `durationMs`, and one call reported 1s as a card and 20s
+		// as a row.
+		displayDurationMs: resolveToolDisplayDurationMs(data),
 		startedAt: data.startedAt ?? null,
 		timeoutMs: data.timeoutMs ?? null,
 		timing: resolveToolTimingStamps(data),

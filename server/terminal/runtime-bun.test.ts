@@ -72,7 +72,7 @@ describe.skipIf(IS_WINDOWS)("spawnBunTerminal controlling terminal", () => {
 
 		expect(out).toContain("CTTY_FAIL");
 		// `ps` reports "?" precisely because there is no controlling terminal.
-		expect(out).toMatch(/^\s*\?\s*$/m);
+		expect(out).toMatch(/^\s*\?{1,2}\s*$/m);
 	});
 
 	test("the child can open /dev/tty", async () => {
@@ -88,7 +88,8 @@ describe.skipIf(IS_WINDOWS)("spawnBunTerminal controlling terminal", () => {
 	test("the child is its own session and process-group leader on the PTY", async () => {
 		// `ps` reports TT as "?" for a process with no controlling terminal even
 		// when its stdio is a pts — that "?" is the actual defect signature.
-		const out = await collect('ps -o sid=,pgid=,tty= -p $$; echo "SELF=$$"; exit 0');
+		const sessionColumn = process.platform === "darwin" ? "sess" : "sid";
+		const out = await collect(`ps -o ${sessionColumn}=,pgid=,tty= -p $$; echo "SELF=$$"; exit 0`);
 		const selfPid = /SELF=(\d+)/.exec(out)?.[1] ?? "";
 		expect(selfPid).not.toBe("");
 		const psLine =
@@ -96,13 +97,14 @@ describe.skipIf(IS_WINDOWS)("spawnBunTerminal controlling terminal", () => {
 				.split(/\r?\n/)
 				.map((line) => line.trim())
 				.find((line) => /^\d+\s+\d+\s+\S+$/.test(line)) ?? "";
-		expect(psLine).not.toBe("");
+		expect(psLine, out).not.toBe("");
 		const [sid, pgid, tty] = psLine.split(/\s+/);
-		expect(tty).toMatch(/^pts\//);
+		expect(tty).toMatch(process.platform === "darwin" ? /^ttys\w+$/ : /^pts\//);
 		// setsid() makes the child both session and process-group leader, which is
 		// the prerequisite for the shell being able to hand the foreground group to
 		// a job (and therefore for Ctrl-C to reach anything).
-		expect(sid).toBe(selfPid);
+		// Darwin's `ps sess` is not the POSIX SID (it may report 0).
+		if (process.platform !== "darwin") expect(sid).toBe(selfPid);
 		expect(pgid).toBe(selfPid);
 	});
 

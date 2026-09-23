@@ -629,6 +629,8 @@ export const narratorMessages = pgTable(
 		contentText: text("content_text"),
 		tokensIn: integer("tokens_in"),
 		costUsd: doublePrecision("cost_usd"),
+		costStatus: text("cost_status"),
+		costMissingFields: jsonText("cost_missing_fields"),
 		turnUsageJson: jsonText("turn_usage_json"),
 		provider: text("provider"),
 		credentialId: text("credential_id"),
@@ -759,6 +761,8 @@ export const narratorToolCalls = pgTable(
 		cacheCreationCost: doublePrecision("cache_creation_cost").notNull().default(0),
 		cacheReadCost: doublePrecision("cache_read_cost").notNull().default(0),
 		totalCost: doublePrecision("total_cost").notNull().default(0),
+		costStatus: text("cost_status"),
+		costMissingFields: jsonText("cost_missing_fields"),
 		provider: text("provider"),
 		model: text("model"),
 		resultMessageId: text("result_message_id"),
@@ -1682,6 +1686,7 @@ export const apiRequests = pgTable(
 	"api_requests",
 	{
 		id: text("id").primaryKey().notNull(),
+		userId: text("user_id"),
 		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "cascade",
 		}),
@@ -1703,6 +1708,8 @@ export const apiRequests = pgTable(
 		ttftMs: integer("ttft_ms"),
 		durationMs: integer("duration_ms"),
 		costUsd: doublePrecision("cost_usd"),
+		costStatus: text("cost_status"),
+		costMissingFields: jsonText("cost_missing_fields"),
 		contextPercent: doublePrecision("context_percent"),
 		meterUsage: doublePrecision("meter_usage"),
 		meterUnit: text("meter_unit"),
@@ -1716,9 +1723,25 @@ export const apiRequests = pgTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
 	],
 );
+
+export const userUsageTotals = pgTable("user_usage_totals", {
+	userId: text("user_id").primaryKey().notNull(),
+	requestCount: integer("request_count").notNull().default(0),
+	inputTokens: integer("input_tokens").notNull().default(0),
+	outputTokens: integer("output_tokens").notNull().default(0),
+	cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+	cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+	reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+	costUsd: doublePrecision("cost_usd").notNull().default(0),
+	unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	partialRequestCount: integer("partial_request_count").notNull().default(0),
+	firstUsedAt: text("first_used_at").notNull(),
+	lastUsedAt: text("last_used_at").notNull(),
+});
 
 export const credentialUsageTotals = pgTable(
 	"credential_usage_totals",
@@ -1735,6 +1758,7 @@ export const credentialUsageTotals = pgTable(
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
 		costUsd: doublePrecision("cost_usd").notNull().default(0),
 		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+		partialRequestCount: integer("partial_request_count").notNull().default(0),
 		firstSeenAt: text("first_seen_at").notNull(),
 		lastSeenAt: text("last_seen_at").notNull(),
 	},
@@ -2103,6 +2127,12 @@ export const fileChangeScopes = pgTable(
 	],
 );
 
+export const workspaceExecutionOwners = pgTable("workspace_execution_owners", {
+	ownerEpoch: text("owner_epoch").primaryKey().notNull(),
+	identityJson: jsonText("identity_json"),
+	createdAt: text("created_at").notNull(),
+});
+
 export const workspaceWriteLeases = pgTable(
 	"workspace_write_leases",
 	{
@@ -2112,6 +2142,7 @@ export const workspaceWriteLeases = pgTable(
 			.references((): PgColumn => fileChangeScopes.id, {}),
 		deviceId: text("device_id").notNull(),
 		ownerEpoch: text("owner_epoch").notNull(),
+		executionClass: text("execution_class").notNull().default("unknown"),
 		runtimeEpoch: text("runtime_epoch").notNull(),
 		runtimeGeneration: integer("runtime_generation").notNull(),
 		fencingToken: integer("fencing_token").notNull(),
@@ -2121,6 +2152,7 @@ export const workspaceWriteLeases = pgTable(
 		rangesJson: jsonText("ranges_json").notNull(),
 		mutationManifestJson: jsonText("mutation_manifest_json").notNull(),
 		executionEndedAt: text("execution_ended_at"),
+		terminationEvidenceJson: jsonText("termination_evidence_json"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -2128,6 +2160,7 @@ export const workspaceWriteLeases = pgTable(
 		index("idx_workspace_lease_device_status").on(table.deviceId, table.status, table.leaseId),
 		index("idx_workspace_lease_scope").on(table.scopeId, table.status, table.leaseId),
 		index("idx_workspace_lease_cleanup").on(table.status, table.updatedAt, table.leaseId),
+		index("idx_workspace_lease_owner").on(table.ownerEpoch, table.leaseId),
 	],
 );
 
@@ -2136,6 +2169,8 @@ export const fileChangeScopeRecoveries = pgTable(
 	{
 		id: text("id").primaryKey().notNull(),
 		workspaceLeaseId: text("workspace_lease_id"),
+		resolutionAuthority: text("resolution_authority").notNull().default("execution_proven"),
+		maintenanceEvidenceJson: jsonText("maintenance_evidence_json"),
 		scopeId: text("scope_id")
 			.notNull()
 			.references((): PgColumn => fileChangeScopes.id, {}),
@@ -3391,10 +3426,41 @@ export const oauthAccessTokens = pgTable(
 		index("idx_oauth_access_tokens_revoked_by_user").on(table.revokedByUserId),
 	],
 );
+
+export const notifications = pgTable(
+	"notifications",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		projectId: text("project_id"),
+		chapterId: text("chapter_id"),
+		narratorId: text("narrator_id"),
+		title: text("title").notNull(),
+		preview: text("preview").notNull().default(""),
+		linkJson: jsonText("link_json").notNull(),
+		sourceKey: text("source_key").notNull(),
+		status: text("status").notNull().default("unread"),
+		createdAt: bigint("created_at", { mode: "number" }).notNull(),
+		readAt: bigint("read_at", { mode: "number" }),
+	},
+	(table) => [
+		uniqueIndex("idx_notifications_user_kind_source").on(table.userId, table.kind, table.sourceKey),
+		index("idx_notifications_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_notifications_user_status_created").on(
+			table.userId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 108,
-  "columnCount": 1557,
+  "tableCount": 111,
+  "columnCount": 1597,
   "tables": [
     {
       "exportName": "projects",
@@ -7220,6 +7286,25 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "costStatus",
+          "name": "cost_status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "costMissingFields",
+          "name": "cost_missing_fields",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "turnUsageJson",
           "name": "turn_usage_json",
           "kind": "text",
@@ -8191,6 +8276,25 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "costStatus",
+          "name": "cost_status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "costMissingFields",
+          "name": "cost_missing_fields",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "provider",
@@ -13559,6 +13663,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "narratorId",
           "name": "narrator_id",
           "kind": "text",
@@ -13742,6 +13855,25 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "costStatus",
+          "name": "cost_status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "costMissingFields",
+          "name": "cost_missing_fields",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "contextPercent",
           "name": "context_percent",
           "kind": "real",
@@ -13837,6 +13969,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_api_requests_user_created",
+          "columns": [
+            "userId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_api_requests_credential",
           "columns": [
             "credentialId",
@@ -13845,6 +13986,144 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "userUsageTotals",
+      "name": "user_usage_totals",
+      "columns": [
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "requestCount",
+          "name": "request_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "inputTokens",
+          "name": "input_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "outputTokens",
+          "name": "output_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "cachedInputTokens",
+          "name": "cached_input_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "cacheCreationTokens",
+          "name": "cache_creation_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "reasoningTokens",
+          "name": "reasoning_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "costUsd",
+          "name": "cost_usd",
+          "kind": "real",
+          "pgType": "double precision",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "unpricedRequestCount",
+          "name": "unpriced_request_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "partialRequestCount",
+          "name": "partial_request_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "firstUsedAt",
+          "name": "first_used_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastUsedAt",
+          "name": "last_used_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -13971,6 +14250,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "unpricedRequestCount",
           "name": "unpriced_request_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "partialRequestCount",
+          "name": "partial_request_count",
           "kind": "integer",
           "pgType": "integer",
           "notNull": true,
@@ -16453,6 +16743,46 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "workspaceExecutionOwners",
+      "name": "workspace_execution_owners",
+      "columns": [
+        {
+          "property": "ownerEpoch",
+          "name": "owner_epoch",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "identityJson",
+          "name": "identity_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "workspaceWriteLeases",
       "name": "workspace_write_leases",
       "columns": [
@@ -16497,6 +16827,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "executionClass",
+          "name": "execution_class",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"unknown\"",
+          "defaultExpression": "\"unknown\""
         },
         {
           "property": "runtimeEpoch",
@@ -16582,6 +16923,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "terminationEvidenceJson",
+          "name": "termination_evidence_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -16627,6 +16978,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "leaseId"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_workspace_lease_owner",
+          "columns": [
+            "ownerEpoch",
+            "leaseId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],
@@ -16652,6 +17011,27 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "workspaceLeaseId",
           "name": "workspace_lease_id",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "resolutionAuthority",
+          "name": "resolution_authority",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"execution_proven\"",
+          "defaultExpression": "\"execution_proven\""
+        },
+        {
+          "property": "maintenanceEvidenceJson",
+          "name": "maintenance_evidence_json",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,
@@ -24012,6 +24392,178 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_oauth_access_tokens_revoked_by_user",
           "columns": [
             "revokedByUserId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "notifications",
+      "name": "notifications",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "notifications_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "chapterId",
+          "name": "chapter_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "title",
+          "name": "title",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "preview",
+          "name": "preview",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"\"",
+          "defaultExpression": "\"\""
+        },
+        {
+          "property": "linkJson",
+          "name": "link_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceKey",
+          "name": "source_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"unread\"",
+          "defaultExpression": "\"unread\""
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "integer",
+          "mode": "timestamp_ms",
+          "pgType": "bigint",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "readAt",
+          "name": "read_at",
+          "kind": "integer",
+          "mode": "timestamp_ms",
+          "pgType": "bigint",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_notifications_user_kind_source",
+          "columns": [
+            "userId",
+            "kind",
+            "sourceKey"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_notifications_user_created",
+          "columns": [
+            "userId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_notifications_user_status_created",
+          "columns": [
+            "userId",
+            "status",
+            "createdAt",
+            "id"
           ],
           "unique": false
         }

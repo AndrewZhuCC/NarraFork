@@ -32,6 +32,7 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import ts from "typescript";
 
 const FRONTEND_ROOT = join(import.meta.dir, "..");
 const REPO_ROOT = join(FRONTEND_ROOT, "..");
@@ -151,6 +152,47 @@ function resolveLocalSpecifier(specifier: string, importer: string): string | nu
 	return null;
 }
 
+/** Imports and re-exports that remain after TypeScript erases type-only edges. */
+function runtimeStaticSpecifiers(source: string, file: string): string[] {
+	const ast = ts.createSourceFile(
+		file,
+		source,
+		ts.ScriptTarget.Latest,
+		false,
+		file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+	);
+	const specifiers: string[] = [];
+	for (const statement of ast.statements) {
+		if (ts.isImportDeclaration(statement)) {
+			const clause = statement.importClause;
+			if (
+				clause?.isTypeOnly ||
+				(clause?.namedBindings &&
+					ts.isNamedImports(clause.namedBindings) &&
+					!clause.name &&
+					clause.namedBindings.elements.length > 0 &&
+					clause.namedBindings.elements.every((element) => element.isTypeOnly))
+			)
+				continue;
+		} else if (ts.isExportDeclaration(statement)) {
+			if (
+				statement.isTypeOnly ||
+				(statement.exportClause &&
+					ts.isNamedExports(statement.exportClause) &&
+					statement.exportClause.elements.length > 0 &&
+					statement.exportClause.elements.every((element) => element.isTypeOnly))
+			)
+				continue;
+		} else {
+			continue;
+		}
+		if (statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+			specifiers.push(statement.moduleSpecifier.text);
+		}
+	}
+	return specifiers;
+}
+
 /**
  * Every local module statically reachable from `main.tsx`, EXCLUDING the `App.tsx`
  * subtree (which is a valid boundary and stops propagation) and CSS (handled by Vite's
@@ -175,17 +217,9 @@ function modulesReachableFromEntry(): string[] {
 			return;
 		}
 
-		// `import x from "y"` / `export … from "y"` (barrels re-export, which counts), and
-		// bare side-effect `import "y"`.
-		const patterns = [
-			/(?:^|\n)\s*(?:import|export)\b[^;\n]*?from\s+["']([^"']+)["']/g,
-			/(?:^|\n)\s*import\s+["']([^"']+)["']/g,
-		];
-		for (const pattern of patterns) {
-			for (const match of source.matchAll(pattern)) {
-				const resolved = resolveLocalSpecifier(match[1], file);
-				if (resolved && resolved !== appTsx) walk(resolved);
-			}
+		for (const specifier of runtimeStaticSpecifiers(source, file)) {
+			const resolved = resolveLocalSpecifier(specifier, file);
+			if (resolved && resolved !== appTsx) walk(resolved);
 		}
 	};
 
@@ -288,6 +322,21 @@ describe("the entry's import graph stays small", () => {
 	 * module adds dozens at once, and nothing about that is visible at runtime.
 	 */
 	const BUDGET = 25;
+
+	it("walks runtime edges but ignores imports and re-exports erased by TypeScript", () => {
+		const specifiers = runtimeStaticSpecifiers(
+			`import type { A } from "./import-type";
+			export type { B } from "./export-type";
+			import { type C } from "./named-type";
+			export { type D } from "./named-export-type";
+			import { type E, value } from "./mixed-import";
+			export { type F, value } from "./mixed-export";
+			import "./side-effect";
+			import("./dynamic");`,
+			"fixture.ts",
+		);
+		expect(specifiers).toEqual(["./mixed-import", "./mixed-export", "./side-effect"]);
+	});
 
 	it(`keeps at most ${BUDGET} local modules on the reload path`, () => {
 		const reachable = modulesReachableFromEntry();

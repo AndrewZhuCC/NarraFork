@@ -11,6 +11,7 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
+import { SESSION_VERSION_CLAIM } from "../shared/session-auth";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -70,6 +71,7 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
+import { activateSqliteRuntimePublication } from "./services/agent-runtime/publication";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
@@ -94,6 +96,11 @@ import {
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
+import {
+	startNotificationCenterMaintenance,
+	stopNotificationCenterMaintenance,
+} from "./services/notification-center-maintenance";
+import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { initChatNotify } from "./services/chat-notify";
@@ -137,6 +144,12 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver((_pr
 	return pluginProviderRegistry.tryResolveProvider(model)?.adapter ?? null;
 });
 
+// A circular import may evaluate publication.ts while db/index.ts is still awaiting
+// migrations. Explicitly await its completion before capturing the legacy rowid
+// boundary, ahead of startup recovery or HTTP/WS work creating new task sources.
+const initializedDb = await import("./db");
+if (activeDatabaseBackend === "sqlite") activateSqliteRuntimePublication(initializedDb.db);
+
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
 recoverProviderPrefixMigrationOnStartup();
@@ -152,6 +165,38 @@ if (postgresRuntime) {
 	// timeout fail the process closed with a diagnosable error — the request hot path
 	// never re-probes the catalog, and there is no SQLite fallback.
 	await activatePostgresRuntimeQueue();
+}
+
+// Invalidate interrupted merge sessions before HTTP/WS or narrator recovery can
+// accept an old continue/cancel decision. This gate only updates session metadata;
+// it must never restore a worktree or advance chapter snapshots. Fail closed if
+// the database cannot invalidate old sessions, rather than serving stale commands.
+if (activeDatabaseBackend === "sqlite") {
+	try {
+		await chapterBatchMerge.cleanupStaleSessions();
+	} catch (error) {
+		logger.error("Interrupted merge-session startup gate failed; refusing to serve requests", {
+			error: String(error),
+		});
+		throw error;
+	}
+}
+
+// Record the actual local process owner once, before HTTP/agent writes can start.
+// Identity probe failure never invents proof; unavailable registration disables reconciliation.
+const {
+	initializeWorkspaceOwnerOnStartup,
+	startWorkspaceStartupReconciliation,
+	stopWorkspaceStartupReconciliation,
+} = await import("./services/workspace-startup-reconciliation");
+if (activeDatabaseBackend === "sqlite") {
+	try {
+		await initializeWorkspaceOwnerOnStartup();
+	} catch (error) {
+		logger.warn("Workspace execution owner registration unavailable; barriers remain protected", {
+			error: String(error),
+		});
+	}
 }
 
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
@@ -975,6 +1020,7 @@ function startServer(listenPort: number) {
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
 						sessionUserId: payload.sub,
+						sessionTokenVersion: payload[SESSION_VERSION_CLAIM],
 					});
 					if (!wsData) {
 						return new Response("Unknown WebSocket endpoint", { status: 404 });
@@ -1272,6 +1318,7 @@ async function openAsApp(url: string) {
 // there is the "cannot skip verification" answer). A server-managed engine verifies itself.
 if (activeDatabaseBackend === "sqlite") {
 	scheduleBackgroundIntegrityCheck(startupShutdownState);
+	startWorkspaceStartupReconciliation();
 }
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
@@ -1439,11 +1486,6 @@ async function reportBrokenModelNarrators(recoveryError: string): Promise<void> 
 	}
 }
 
-// Mark interrupted merge sessions as error
-chapterBatchMerge.cleanupStaleSessions().catch((err) => {
-	logger.error("Merge session cleanup failed", { error: String(err) });
-});
-
 // Clean up leftover share directories from previous server runs
 import { cleanupStaleShares } from "./lib/shares";
 
@@ -1486,6 +1528,18 @@ void startupReadiness.barrier.then((recovery) => {
 	}
 	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	startScheduledTaskScheduler();
+	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
+	// must not keep update checkpoint scans or UI recovery cards looking "busy".
+	import("./services/abandoned-tool-cleanup")
+		.then(({ cleanupAbandonedToolCalls }) => cleanupAbandonedToolCalls())
+		.then((result) => {
+			if (result.cleaned > 0) {
+				logger.info("Startup abandoned tool-call cleanup finished", result);
+			}
+		})
+		.catch((err) => {
+			logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
+		});
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -1534,6 +1588,10 @@ initKnowledgeNotify();
 
 // Register chat notification bridge (room messages to viewers, unread badges to the rest)
 initChatNotify();
+
+// Activity projections consume source events independently of WebSocket delivery.
+initNotificationFanout();
+startNotificationCenterMaintenance();
 
 // Reconcile container states on startup (mark stale DB records as stopped)
 reconcileContainerStates().catch((err) => {
@@ -1645,6 +1703,12 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		acceptingHttpRequests = false;
+		await shutdownStep(
+			tracker,
+			"workspaceReconciliation.stop",
+			stopWorkspaceStartupReconciliation,
+			5_000,
+		);
 		const shutdownRequestId = httpRequestContext.getStore();
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
@@ -1674,6 +1738,8 @@ async function performGracefulShutdown(
 
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
+		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
+		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
 		if (!options.skipBashProcessKill) {

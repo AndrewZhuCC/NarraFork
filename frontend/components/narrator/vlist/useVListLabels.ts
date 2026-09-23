@@ -26,6 +26,7 @@
  * titles) flow through the adapter instead, where they are measured.
  */
 
+import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -159,6 +160,15 @@ export interface VListRenderLabels {
 		 * this stays height-neutral.
 		 */
 		shimmerState: Record<ToolShimmerKind, string>;
+		/**
+		 * One name per status MARK (the 12px glyph at the row's end).
+		 *
+		 * Separate from `shimmerState` because the two do not cover the same states:
+		 * shimmer is deliberately SILENT for a call awaiting a person, while the mark
+		 * reports it — so that row would otherwise have no accessible name at all.
+		 * Attributes only → height-neutral.
+		 */
+		statusMark: Record<ToolRowStatusMark, string>;
 	};
 	subagent: {
 		recentCalls: string;
@@ -170,6 +180,7 @@ export interface VListRenderLabels {
 		backgroundBadge: string;
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
+		followParent: string;
 		/** File-changes section title. */
 		fileChanges: string;
 		/** Suffix for a file whose line counts are unknown. */
@@ -191,6 +202,11 @@ export interface VListRenderLabels {
 		collapseFiles: string;
 		/** Same bundle as the tool card: the header + recent-call rows reuse it. */
 		timing: VListTimingLabels;
+		/**
+		 * Same bundle the folded trace row uses: a recent-call row draws the SAME
+		 * status glyph, so it must name those states the same way.
+		 */
+		statusMark: Record<ToolRowStatusMark, string>;
 	};
 	permission: {
 		executionTarget: string;
@@ -493,6 +509,17 @@ export function useVListLabels(): VListLabels {
 			timeoutSeconds: t("timeoutSeconds"),
 			timeoutUpdate: t("timeoutUpdate"),
 		};
+		// Shared by the folded trace row and the subagent card's recent-call rows: they
+		// draw the SAME glyph from the SAME shared rule, so one bundle. `awaiting` has
+		// no shimmer counterpart, which makes this the only accessible name a row
+		// waiting on a person gets.
+		const statusMark: Record<ToolRowStatusMark, string> = {
+			running: t("traceRowMark.running"),
+			queued: t("traceRowMark.queued"),
+			awaiting: t("traceRowMark.awaiting"),
+			failed: t("traceRowMark.failed"),
+			cancelled: t("traceRowMark.cancelled"),
+		};
 		return {
 			reasoning: {
 				reasoning: t("reasoning"),
@@ -566,9 +593,12 @@ export function useVListLabels(): VListLabels {
 					streaming: t("traceRowState.streaming"),
 					reflecting: t("traceRowState.reflecting"),
 					running: t("traceRowState.running"),
+					queued: t("traceRowState.queued"),
+					queued_out: t("traceRowState.queued_out"),
 					success: t("traceRowState.success"),
 					failed: t("traceRowState.failed"),
 				},
+				statusMark,
 			},
 			subagent: {
 				recentCalls: t("subagentRecentCalls"),
@@ -581,6 +611,7 @@ export function useVListLabels(): VListLabels {
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
+				followParent: t("followParent"),
 				fileChanges: t("subagentChangedFiles"),
 				linesNotMeasured: t("subagentLinesNotMeasured"),
 				moreFiles: t("subagentMoreFiles"),
@@ -596,6 +627,7 @@ export function useVListLabels(): VListLabels {
 				fileEdits: t("subagentFileChangesEdits"),
 				collapseFiles: t("subagentFileChangesCollapse"),
 				timing,
+				statusMark,
 			},
 			permission,
 			askUserQuestion: {
