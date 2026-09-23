@@ -205,9 +205,13 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 			"workspace_execution_owners",
 			"api_requests",
 			"credential_usage_totals",
-			"narrator_messages",
 			"narrator_tool_calls",
 		]) shape[table] = tableSchemaShape(db, table);
+		// Legacy message migrations arrange existing columns differently; compare the
+		// two added fields by definition, not their physical cid/index positions.
+		for (const column of ["cost_status", "cost_missing_fields"]) {
+			shape[`narrator_messages.${column}`] = columnShape(db, "narrator_messages", column);
+		}
 	}
 	return shape;
 }
