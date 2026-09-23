@@ -319,7 +319,8 @@ export function NarratorPanel({
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
-	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
+	// Keep an explicitly enabled narrator scan alive after its Git panel closes.
+	useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
 	const [chunkTailMeta, setMessageListTailMeta] = useState<MessageListTailMeta>({
@@ -2589,10 +2590,8 @@ export function NarratorPanel({
 		narratorId,
 		headerHostCapabilities,
 		dock,
-		gitWorkspaceAvailable:
-			!gitWorkspaceQuery.isError &&
-			gitWorkspaceQuery.data?.state === "ready" &&
-			gitWorkspaceQuery.data.capabilities.read,
+		// The panel owns opt-in discovery, so its entry must remain reachable before probing.
+		gitWorkspaceAvailable: !isWorkspacePreview,
 		tasksSupported,
 		tasksButtonEnabled,
 		specToolAvailable,

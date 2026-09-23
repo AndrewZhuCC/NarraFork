@@ -1,4 +1,15 @@
-import { ActionIcon, Alert, Box, Button, Group, Loader, Select, Stack, Text } from "@mantine/core";
+import {
+	ActionIcon,
+	Alert,
+	Box,
+	Button,
+	Group,
+	Loader,
+	Select,
+	Stack,
+	Switch,
+	Text,
+} from "@mantine/core";
 import { IconArrowLeft, IconRefresh } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -38,62 +49,81 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 			? undefined
 			: workspaceQuery.error?.message || workspace?.reason;
 
-	if (workspaceQuery.isPending) return <Loader size="sm" />;
-
 	return (
 		<Stack gap={4} style={{ height: "100%", minHeight: 0 }}>
-			{repositories.length > 1 && (
-				<Select
-					mx="xs"
-					mt="xs"
-					size="xs"
-					aria-label={t("workspace.repositorySelect")}
-					data={repositories.map((repository) => ({
-						value: repository.workspaceKey,
-						label: repository.relativePath || ".",
-					}))}
-					value={workspace?.workspaceKey}
-					allowDeselect={false}
-					onChange={(workspaceKey) => workspaceQuery.selectWorkspace(workspaceKey)}
+			<Box px="xs" pt="xs">
+				<Switch
+					size="sm"
+					checked={workspaceQuery.detectionEnabled}
+					label={t("workspace.detectionToggle")}
+					description={t("workspace.detectionDescription")}
+					onChange={(event) => workspaceQuery.setDetectionEnabled(event.currentTarget.checked)}
 				/>
-			)}
-			{workspace?.capabilities.read && workspace.discoveryTruncated && (
-				<Alert color="yellow" mx="xs" mt={repositories.length > 1 ? 0 : "xs"} py={4}>
-					<Text size="xs">{t("workspace.discoveryTruncated")}</Text>
+			</Box>
+			{!workspaceQuery.detectionEnabled ? (
+				<Alert color="gray" mx="xs" mt={4}>
+					{t("workspace.detectionDisabled")}
 				</Alert>
-			)}
-			{!target ? (
-				<Stack gap={4} p="xs">
-					<Group justify="flex-end">
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							leftSection={<IconRefresh size={13} />}
-							loading={workspaceQuery.isFetching}
-							onClick={() => workspaceQuery.refetch()}
-						>
-							{t("workspace.retry")}
-						</Button>
-					</Group>
-					<Alert
-						color="yellow"
-						title={t(
-							`workspace.${workspaceQuery.isError ? "error" : (workspace?.state ?? "error")}`,
-						)}
-					>
-						{errorDetail}
-					</Alert>
-				</Stack>
+			) : workspaceQuery.isPending ? (
+				<Group justify="center" style={{ flex: 1 }}>
+					<Loader size="sm" />
+				</Group>
 			) : (
-				<ConfirmDialogProvider
-					key={`${narratorId}:${gitTargetKey(target)}:${workspace?.cwd}:${workspace?.capabilities.write}`}
-				>
-					<GitPanelContent
-						target={target}
-						onRefresh={() => invalidateWorkspaceQueries(qc, target)}
-						readOnly={!workspace?.capabilities.write}
-					/>
-				</ConfirmDialogProvider>
+				<>
+					{repositories.length > 1 && (
+						<Select
+							mx="xs"
+							mt="xs"
+							size="xs"
+							aria-label={t("workspace.repositorySelect")}
+							data={repositories.map((repository) => ({
+								value: repository.workspaceKey,
+								label: repository.relativePath || ".",
+							}))}
+							value={workspace?.workspaceKey}
+							allowDeselect={false}
+							onChange={(workspaceKey) => workspaceQuery.selectWorkspace(workspaceKey)}
+						/>
+					)}
+					{workspace?.capabilities.read && workspace.discoveryTruncated && (
+						<Alert color="yellow" mx="xs" mt={repositories.length > 1 ? 0 : "xs"} py={4}>
+							<Text size="xs">{t("workspace.discoveryTruncated")}</Text>
+						</Alert>
+					)}
+					{!target ? (
+						<Stack gap={4} p="xs">
+							<Group justify="flex-end">
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									leftSection={<IconRefresh size={13} />}
+									loading={workspaceQuery.isFetching}
+									onClick={() => workspaceQuery.refetch()}
+								>
+									{t("workspace.retry")}
+								</Button>
+							</Group>
+							<Alert
+								color="yellow"
+								title={t(
+									`workspace.${workspaceQuery.isError ? "error" : (workspace?.state ?? "error")}`,
+								)}
+							>
+								{errorDetail}
+							</Alert>
+						</Stack>
+					) : (
+						<ConfirmDialogProvider
+							key={`${narratorId}:${gitTargetKey(target)}:${workspace?.cwd}:${workspace?.capabilities.write}`}
+						>
+							<GitPanelContent
+								target={target}
+								onRefresh={() => invalidateWorkspaceQueries(qc, target)}
+								readOnly={!workspace?.capabilities.write}
+							/>
+						</ConfirmDialogProvider>
+					)}
+				</>
 			)}
 		</Stack>
 	);

@@ -57,7 +57,7 @@ describe("git APIs", () => {
 			canWrite: true,
 		};
 		const controller = new AbortController();
-		await api.getGitWorkspace("independent", controller.signal);
+		await api.getGitWorkspace("independent", controller.signal, target.workspaceKey, true);
 		await api.getGitStatus(target, controller.signal);
 		await api.getGitModifications(
 			target,
@@ -79,6 +79,9 @@ describe("git APIs", () => {
 		expect(calls.every((call) => call.url.startsWith("/api/narrators/independent/git/"))).toBe(
 			true,
 		);
+		const workspaceUrl = new URL(calls[0]?.url ?? "", "http://localhost");
+		expect(workspaceUrl.searchParams.get("workspaceKey")).toBe("device-a:/repo");
+		expect(workspaceUrl.searchParams.get("discover")).toBe("1");
 		controller.abort();
 		expect(calls.slice(0, 6).every((call) => call.signal?.aborted)).toBe(true);
 		expect(

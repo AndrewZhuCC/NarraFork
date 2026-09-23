@@ -257,6 +257,7 @@ export async function authorizeGitTarget(
 	source: { narratorId: string } | { chapterId: string },
 	need: "read" | "write",
 	requestedWorkspaceKey?: string,
+	discoverNested = false,
 ): Promise<GitWorkspaceTarget> {
 	const principal = narratorPrincipalOf(c);
 	const signal = c.req.raw.signal;
@@ -396,6 +397,7 @@ export async function authorizeGitTarget(
 					throw error;
 				}
 			},
+			discoverNested || requestedWorkspaceKey !== undefined,
 		);
 	} else {
 		await requireChapterAccess(c, source.chapterId, need);

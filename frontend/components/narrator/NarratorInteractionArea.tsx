@@ -190,7 +190,11 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 			{/* Chapter bar — clicking the info strip opens the Git view. */}
 			{props.chapterId && (
-				<ChapterBar chapterId={props.chapterId} onOpenGitPanel={props.onOpenGitPanel} />
+				<ChapterBar
+					chapterId={props.chapterId}
+					narratorId={props.common.narratorId}
+					onOpenGitPanel={props.onOpenGitPanel}
+				/>
 			)}
 
 			{/* Standalone narrators have no chapter bar; offer the git workspace strip instead. */}

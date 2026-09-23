@@ -40,7 +40,7 @@ async function git(cwd: string, ...args: string[]) {
 }
 async function newRepo(name: string, commit = true) {
 	const path = join(root, name);
-	await mkdir(path);
+	await mkdir(path, { recursive: true });
 	await git(path, "init", "-b", "main");
 	if (commit) {
 		await writeFile(join(path, "seed.txt"), "seed\n");
@@ -158,6 +158,54 @@ describe("Git workspace discovery", () => {
 		expect(
 			gitWorkspaceIdentity({ deviceId: "another-device", paths: localBackend.paths }, repo),
 		).not.toBe(a.workspaceKey);
+	});
+	test("nested discovery is opt-in and selected repositories remain usable", async () => {
+		const plain = join(root, "plain");
+		await mkdir(plain);
+		const nested = await newRepo("plain/one/two/repo");
+		const tooDeep = await newRepo("plain/one/two/three/repo");
+		await db.update(narrators).set({ cwd: plain }).where(eq(narrators.id, narratorId));
+		const glob = spyOn(localBackend, "glob");
+		try {
+			const initial = await workspace();
+			expect(initial.state).toBe("not_git");
+			expect(initial.rootPath).toBeNull();
+			expect(initial.repositories ?? []).toEqual([]);
+			expect(glob).not.toHaveBeenCalled();
+
+			const discoveredResponse = await request("workspace?discover=1");
+			expect(discoveredResponse.status).toBe(200);
+			const discovered = (await discoveredResponse.json()) as GitWorkspace;
+			expect(discovered.state).toBe("ready");
+			expect(discovered.rootPath).toBe(nested);
+			expect(discovered.repositories?.map(({ rootPath }) => rootPath)).toEqual([nested]);
+			expect(discovered.repositories?.some(({ rootPath }) => rootPath === tooDeep)).toBe(false);
+			expect(glob).toHaveBeenCalled();
+
+			await writeFile(join(nested, "seed.txt"), "nested change\n");
+			const workspaceKey = discovered.workspaceKey as string;
+			const status = await request(`status?workspaceKey=${encodeURIComponent(workspaceKey)}`);
+			expect(status.status).toBe(200);
+			expect(((await status.json()) as { hasChanges: boolean }).hasChanges).toBe(true);
+			expect((await request("stage", { all: true, workspaceKey })).status).toBe(200);
+			expect(await git(nested, "diff", "--cached", "--name-only")).toBe("seed.txt");
+		} finally {
+			glob.mockRestore();
+		}
+	});
+	test("a Git cwd remains the selected root without nested discovery", async () => {
+		const glob = spyOn(localBackend, "glob");
+		try {
+			const direct = await workspace();
+			expect(direct.state).toBe("ready");
+			expect(direct.rootPath).toBe(repo);
+			const explicit = await request("workspace?discover=1");
+			expect(explicit.status).toBe(200);
+			expect(((await explicit.json()) as GitWorkspace).rootPath).toBe(repo);
+			expect(glob).not.toHaveBeenCalled();
+		} finally {
+			glob.mockRestore();
+		}
 	});
 	test("linked worktrees share repository but never workspace identities", async () => {
 		const linked = join(root, "linked");

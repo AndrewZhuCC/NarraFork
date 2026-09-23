@@ -135,6 +135,78 @@ export const GIT_FACT_QUERIES = [
 	"gitStashList",
 ];
 
+const GIT_DETECTION_PREF_PREFIX = "narrafork_git_detection_enabled:";
+const gitDetectionListeners = new Set<() => void>();
+let gitDetectionStorageListener: ((event: StorageEvent) => void) | null = null;
+let gitDetectionStorageWindow: Window | null = null;
+const gitDetectionFallback = new Set<string>();
+
+function gitDetectionKey(narratorId: string): string {
+	return `${GIT_DETECTION_PREF_PREFIX}${narratorId}`;
+}
+
+function readGitDetection(narratorId: string | null | undefined): boolean {
+	if (!narratorId) return false;
+	try {
+		return localStorage.getItem(gitDetectionKey(narratorId)) === "1";
+	} catch {
+		return gitDetectionFallback.has(narratorId);
+	}
+}
+
+function notifyGitDetectionListeners() {
+	for (const listener of gitDetectionListeners) listener();
+}
+
+function ensureGitDetectionStorageListener() {
+	if (gitDetectionStorageListener || typeof window === "undefined") return;
+	gitDetectionStorageListener = (event) => {
+		if (event.key !== null && !event.key.startsWith(GIT_DETECTION_PREF_PREFIX)) return;
+		notifyGitDetectionListeners();
+	};
+	gitDetectionStorageWindow = window;
+	window.addEventListener("storage", gitDetectionStorageListener);
+}
+
+function subscribeGitDetection(listener: () => void) {
+	gitDetectionListeners.add(listener);
+	ensureGitDetectionStorageListener();
+	return () => {
+		gitDetectionListeners.delete(listener);
+		if (gitDetectionListeners.size > 0 || !gitDetectionStorageListener) return;
+		gitDetectionStorageWindow?.removeEventListener("storage", gitDetectionStorageListener);
+		gitDetectionStorageListener = null;
+		gitDetectionStorageWindow = null;
+	};
+}
+
+function persistGitDetection(narratorId: string, enabled: boolean) {
+	try {
+		if (enabled) localStorage.setItem(gitDetectionKey(narratorId), "1");
+		else localStorage.removeItem(gitDetectionKey(narratorId));
+		gitDetectionFallback.delete(narratorId);
+	} catch {
+		if (enabled) gitDetectionFallback.add(narratorId);
+		else gitDetectionFallback.delete(narratorId);
+	}
+	notifyGitDetectionListeners();
+}
+
+function useGitDetectionPreference(narratorId: string | null | undefined) {
+	const enabled = useSyncExternalStore(
+		subscribeGitDetection,
+		() => readGitDetection(narratorId),
+		() => false,
+	);
+	const setEnabled = useCallback(
+		(nextEnabled: boolean) => {
+			if (narratorId) persistGitDetection(narratorId, nextEnabled);
+		},
+		[narratorId],
+	);
+	return { enabled, setEnabled };
+}
+
 const GIT_WORKSPACE_SELECTIONS_KEY = "narrafork_git_workspace_selections";
 const gitWorkspaceSelectionListeners = new Set<() => void>();
 
@@ -264,7 +336,11 @@ async function readWorkspace<T>(
 export function useGitWorkspace(narratorId: string | null | undefined, revision?: unknown) {
 	const qc = useQueryClient();
 	const { data: narrator } = useNarrator(narratorId ?? "");
-	useEffect(() => (narratorId ? subscribeGitAccess(qc) : undefined), [qc, narratorId]);
+	const detection = useGitDetectionPreference(narratorId);
+	useEffect(
+		() => (narratorId && detection.enabled ? subscribeGitAccess(qc) : undefined),
+		[qc, narratorId, detection.enabled],
+	);
 	const context = revision ?? [
 		narrator?.cwd,
 		narrator?.chapterId,
@@ -274,36 +350,72 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	const selectionScope = JSON.stringify([narratorId, context]);
 	const selection = useGitWorkspaceSelection(selectionScope);
 	const query = useQuery({
-		queryKey: ["gitWorkspace", narratorId, context, selection.workspaceKey],
+		queryKey: ["gitWorkspace", narratorId, detection.enabled, context, selection.workspaceKey],
 		queryFn: async ({ signal }) => {
 			try {
 				return await api.getGitWorkspace(
 					narratorId as string,
 					signal,
 					selection.workspaceKey ?? undefined,
+					true,
 				);
 			} catch (error) {
 				if (selection.workspaceKey && (error as ApiError)?.status === 409) {
 					selection.clearIfCurrent(selection.workspaceKey);
-					return api.getGitWorkspace(narratorId as string, signal);
+					return api.getGitWorkspace(narratorId as string, signal, undefined, true);
 				}
 				throw error;
 			}
 		},
-		enabled: !!narratorId,
+		enabled: !!narratorId && detection.enabled,
 		retry: false,
 		staleTime: 5_000,
 		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
+	useEffect(() => {
+		if (!narratorId || detection.enabled) return;
+		const workspaces = qc.getQueriesData<GitWorkspace>({ queryKey: ["gitWorkspace"] });
+		const disabledWorkspaceKeys = new Set(
+			workspaces
+				.filter(([key, workspace]) => key[1] === narratorId && workspace?.workspaceKey)
+				.map(([, workspace]) => workspace?.workspaceKey as string),
+		);
+		const retainedWorkspaceKeys = new Set(
+			workspaces
+				.filter(
+					([key, workspace]) => key[1] !== narratorId && key[2] === true && workspace?.workspaceKey,
+				)
+				.map(([, workspace]) => workspace?.workspaceKey as string),
+		);
+		const shouldClearQuery = (candidate: { queryKey: readonly unknown[] }) => {
+			const [prefix, scope, kind] = candidate.queryKey;
+			if (prefix === "gitWorkspace") return scope === narratorId && kind !== false;
+			if (prefix === "narrators") {
+				return scope === narratorId && kind === "file-tree-status";
+			}
+			return (
+				GIT_FACT_QUERIES.includes(String(prefix)) &&
+				disabledWorkspaceKeys.has(String(scope)) &&
+				!retainedWorkspaceKeys.has(String(scope))
+			);
+		};
+		void qc.cancelQueries({ predicate: shouldClearQuery });
+		qc.removeQueries({ predicate: shouldClearQuery });
+	}, [qc, narratorId, detection.enabled]);
 	// Do not leave private facts visible after an authorization/capability failure.
 	useEffect(() => {
 		if (!query.isError && query.data?.capabilities.read !== false) return;
 		qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
 	}, [qc, query.isError, query.data?.capabilities.read]);
-	const target = !query.isError ? gitWorkspaceTarget(narratorId as string, query.data) : null;
+	const target =
+		detection.enabled && !query.isError
+			? gitWorkspaceTarget(narratorId as string, query.data)
+			: null;
 	return {
 		...query,
+		detectionEnabled: detection.enabled,
+		setDetectionEnabled: detection.setEnabled,
 		workspaceKey: target && typeof target !== "string" ? target.workspaceKey : null,
 		target,
 		selectWorkspace: selection.selectWorkspace,

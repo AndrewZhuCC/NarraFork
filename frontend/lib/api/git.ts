@@ -57,12 +57,18 @@ function gitRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 // Reads are cancellable by React Query; writes are never retried automatically.
 export const gitApi = {
-	getGitWorkspace: (narratorId: string, signal?: AbortSignal, workspaceKey?: string) => {
+	getGitWorkspace: (
+		narratorId: string,
+		signal?: AbortSignal,
+		workspaceKey?: string,
+		discoverNested = false,
+	) => {
 		const path = `/narrators/${encodeURIComponent(narratorId)}/git/workspace`;
-		return gitRequest<GitWorkspace>(
-			workspaceKey ? `${path}?workspaceKey=${encodeURIComponent(workspaceKey)}` : path,
-			{ signal },
-		);
+		const params = new URLSearchParams();
+		if (workspaceKey) params.set("workspaceKey", workspaceKey);
+		if (discoverNested) params.set("discover", "1");
+		const query = params.toString();
+		return gitRequest<GitWorkspace>(query ? `${path}?${query}` : path, { signal });
 	},
 	getGitStatus: (target: GitTarget, signal?: AbortSignal) =>
 		gitRequest<ApiEntity>(gitReadPath(target, "/status"), { signal }),

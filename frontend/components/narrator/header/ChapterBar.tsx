@@ -157,10 +157,18 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 			? gitWorkspaceTarget(narratorId, workspaceQuery.data)
 			: null,
 	);
-	const { data: chapterStatus } = useChapterGitStatus(narratorId ? null : chapterId);
+	const { data: chapterStatus } = useChapterGitStatus(
+		!narratorId || (workspaceQuery.detectionEnabled && workspaceQuery.data?.chapterId === chapterId)
+			? chapterId
+			: null,
+	);
 	const gitStatus = narratorId
 		? workspaceStatus
-			? { ...workspaceStatus, commitsAhead: 0, baseBranch: "" }
+			? {
+					...workspaceStatus,
+					commitsAhead: chapterStatus?.commitsAhead ?? 0,
+					baseBranch: chapterStatus?.baseBranch ?? "",
+				}
 			: undefined
 		: chapterStatus;
 	// Git lives in the dockview surface (right side), not in a collapse below this
@@ -269,7 +277,7 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 						·
 					</Text>
 					<Text size="xs" c="dimmed" ff="monospace" truncate>
-						{narratorId ? workspaceStatus?.branch || "Git" : chapter.branch}
+						{workspaceStatus?.branch || chapter.branch}
 					</Text>
 					{gitStatus &&
 						(gitStatus.commitsAhead > 0 ||

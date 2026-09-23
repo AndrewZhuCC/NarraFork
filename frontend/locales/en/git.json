@@ -1,5 +1,8 @@
 {
 	"panel.title": "Git",
+	"workspace.detectionToggle": "Enable Git detection",
+	"workspace.detectionDescription": "Detect Git repositories for this narrator and refresh status every 30 seconds.",
+	"workspace.detectionDisabled": "Git detection is off. Enable it to scan the workspace and read Git status.",
 	"workspace.statusTruncated": "Status output was truncated; file counts may be incomplete. Bulk actions affect the entire working tree.",
 	"workspace.sectionTruncated": "{{section}} count is a lower bound",
 	"workspace.serverFilesTruncated": "some files are not shown",

@@ -156,6 +156,7 @@ export async function resolveNarratorGitTarget(
 		target: GitWorkspaceTarget,
 		deadline: number,
 	) => Promise<"authorized" | "denied" | "budget_exhausted">,
+	discoverNested = false,
 ): Promise<GitWorkspaceTarget> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -258,7 +259,7 @@ export async function resolveNarratorGitTarget(
 		}
 		return target;
 	}
-	if (probe.state !== "not_git") return target;
+	if (probe.state !== "not_git" || !discoverNested) return target;
 
 	const discoveryStarted = performance.now();
 	const discoveryDeadline = discoveryStarted + GIT_WORKSPACE_DISCOVERY_BUDGET_MS;

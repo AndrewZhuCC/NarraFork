@@ -40,6 +40,8 @@ class TestResizeObserver {
 	disconnect() {}
 }
 
+const GIT_DETECTION_PREF_PREFIX = "narrafork_git_detection_enabled:";
+
 let root: Root | undefined;
 let restoreGitApi: (() => void) | undefined;
 
@@ -228,6 +230,12 @@ function buttonByLabel(container: HTMLElement, label: string): HTMLButtonElement
 		throw new Error(`Button not found: ${label}`);
 	}
 	return button;
+}
+
+function setCheckbox(input: HTMLInputElement | undefined | null, checked: boolean) {
+	if (!input) throw new Error("Checkbox not found");
+	input.checked = checked;
+	input.dispatchEvent(new Event("click", { bubbles: true }));
 }
 
 /**
@@ -779,6 +787,186 @@ describe("GitPanel", () => {
 		};
 	}
 
+	test("narrator Git detection defaults off and synchronizes per narrator", async () => {
+		const workspaceCalls: Array<{
+			narratorId: string;
+			workspaceKey?: string;
+			discoverNested?: boolean;
+		}> = [];
+		const original = {
+			getGitWorkspace: api.getGitWorkspace,
+			getGitStatus: api.getGitStatus,
+			getGitModifications: api.getGitModifications,
+		};
+		api.getGitWorkspace = async (narratorId, _signal, workspaceKey, discoverNested) => {
+			workspaceCalls.push({ narratorId, workspaceKey, discoverNested });
+			return readyWorkspace();
+		};
+		api.getGitStatus = async () => makeStatus();
+		api.getGitModifications = async () => ({ byFile: [], actors: [], hasMore: false });
+		restoreGitApi = () => Object.assign(api, original);
+
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		for (const narratorId of ["narrator-a", "narrator-b"]) {
+			queryClient.setQueryData(["narrators", narratorId], {
+				id: narratorId,
+				cwd: "/repo/sub",
+				chapterId: null,
+				contextProjectId: "project-context",
+			});
+		}
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<div data-panel="a-one">
+								<GitPanel narratorId="narrator-a" />
+							</div>
+							<div data-panel="a-two">
+								<GitPanel narratorId="narrator-a" />
+							</div>
+							<div data-panel="b">
+								<GitPanel narratorId="narrator-b" />
+							</div>
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		const switches = Array.from(
+			container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+		);
+		expect(switches).toHaveLength(3);
+		expect(switches.every((input) => !input.checked)).toBe(true);
+		expect(workspaceCalls).toEqual([]);
+		expect(container.querySelector('[data-panel="a-one"]')?.textContent).toContain(
+			"Git detection is off",
+		);
+
+		setCheckbox(switches[0], true);
+		await flushRender();
+		await flushRender();
+		await flushRender();
+		await flushRender();
+
+		expect(switches[0]?.checked).toBe(true);
+		expect(switches[1]?.checked).toBe(true);
+		expect(switches[2]?.checked).toBe(false);
+		expect(workspaceCalls).toEqual([
+			{ narratorId: "narrator-a", workspaceKey: undefined, discoverNested: true },
+		]);
+		expect(localStorage.getItem(`${GIT_DETECTION_PREF_PREFIX}narrator-a`)).toBe("1");
+		expect(localStorage.getItem(`${GIT_DETECTION_PREF_PREFIX}narrator-b`)).toBeNull();
+		expect(container.querySelector('[data-panel="a-one"]')?.textContent).toContain("Changes");
+		expect(container.querySelector('[data-panel="b"]')?.textContent).toContain(
+			"Git detection is off",
+		);
+		queryClient.clear();
+	});
+
+	test("disabling narrator Git detection aborts and clears dependent queries", async () => {
+		const narratorId = "narrator-stop-git";
+		localStorage.setItem(`${GIT_DETECTION_PREF_PREFIX}${narratorId}`, "1");
+		let workspaceCalls = 0;
+		let workspaceSignal: AbortSignal | undefined;
+		const original = {
+			getGitWorkspace: api.getGitWorkspace,
+			getGitStatus: api.getGitStatus,
+			getGitModifications: api.getGitModifications,
+		};
+		api.getGitWorkspace = async (_narratorId, signal) => {
+			workspaceCalls++;
+			workspaceSignal = signal;
+			return new Promise<GitWorkspace>((_resolve, reject) => {
+				if (signal?.aborted) reject(new Error("aborted"));
+				else signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+			});
+		};
+		api.getGitStatus = async () => makeStatus();
+		api.getGitModifications = async () => ({ byFile: [], actors: [], hasMore: false });
+		restoreGitApi = () => Object.assign(api, original);
+
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["narrators", narratorId], {
+			id: narratorId,
+			cwd: "/repo/sub",
+			chapterId: null,
+			contextProjectId: "project-context",
+		});
+		const workspaceQueryKey = [
+			"gitWorkspace",
+			narratorId,
+			true,
+			["/repo/sub", null, "project-context", undefined],
+			null,
+		];
+		queryClient.setQueryData(workspaceQueryKey, readyWorkspace(), { updatedAt: 0 });
+		queryClient.setQueryData(["gitStatus", "local:/repo"], makeStatus());
+		const fileTreeQueryKey = [
+			"narrators",
+			narratorId,
+			"file-tree-status",
+			"/repo/sub",
+			"local:/repo",
+		];
+		queryClient.setQueryData(fileTreeQueryKey, {
+			isGitRepo: true,
+			files: [],
+			totalFiles: 0,
+			truncated: false,
+		});
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel narratorId={narratorId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+		await flushRender();
+		expect(workspaceCalls).toBe(1);
+		expect(workspaceSignal?.aborted).toBe(false);
+
+		const detectionSwitch = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		expect(detectionSwitch?.checked).toBe(true);
+		setCheckbox(detectionSwitch, false);
+		await flushRender();
+		await flushRender();
+
+		expect(workspaceSignal?.aborted).toBe(true);
+		expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
+		expect(queryClient.getQueryData(fileTreeQueryKey)).toBeUndefined();
+		expect(container.textContent).toContain("Git detection is off");
+		await queryClient.invalidateQueries({ queryKey: ["gitWorkspace", narratorId] });
+		await flushRender();
+		expect(workspaceCalls).toBe(1);
+		queryClient.clear();
+	});
+
 	async function renderNarratorWorkspace(initial: GitWorkspace) {
 		let workspace = initial;
 		const calls: Array<{ name: string; target?: GitTarget }> = [];
@@ -819,6 +1007,7 @@ describe("GitPanel", () => {
 			},
 		});
 		const narratorId = "standalone-workspace";
+		localStorage.setItem(`${GIT_DETECTION_PREF_PREFIX}${narratorId}`, "1");
 		queryClient.setQueryData(["narrators", narratorId], {
 			id: narratorId,
 			cwd: "/repo/sub",
@@ -828,7 +1017,9 @@ describe("GitPanel", () => {
 		const workspaceQueryKey = [
 			"gitWorkspace",
 			narratorId,
+			true,
 			["/repo/sub", null, "project-context", undefined],
+			null,
 		];
 		queryClient.setQueryData(workspaceQueryKey, workspace);
 		if (workspace.workspaceKey)
@@ -967,7 +1158,9 @@ describe("GitPanel", () => {
 		buttonByLabel(container, "AI Generate").click();
 		await flushRender();
 		await flushRender();
-		expect(container.querySelector("input")?.value).toBe("old workspace draft");
+		expect(
+			container.querySelector<HTMLInputElement>('input[placeholder="Commit message..."]')?.value,
+		).toBe("old workspace draft");
 		buttonByText(container, "Discard All").click();
 		await flushRender();
 		await flushRender();
@@ -976,7 +1169,9 @@ describe("GitPanel", () => {
 		update(readyWorkspace({ workspaceKey: "remote:/repo", deviceId: "remote", rootPath: "/repo" }));
 		await flushRender();
 		await flushRender();
-		expect(container.querySelector("input")?.value).toBe("");
+		expect(
+			container.querySelector<HTMLInputElement>('input[placeholder="Commit message..."]')?.value,
+		).toBe("");
 		expect(document.body.textContent).not.toContain("permanently discard");
 		expect(calls.filter((call) => call.name === "discard")).toHaveLength(0);
 		queryClient.clear();

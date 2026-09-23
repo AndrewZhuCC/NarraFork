@@ -126,6 +126,8 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 	routes.use(`${prefix}/*`, async (c, next) => {
 		const need = c.req.method === "GET" ? "read" : "write";
 		const workspaceRequest = c.req.method === "GET" && c.req.path.endsWith("/workspace");
+		const discoverNested =
+			source === "narrator" && workspaceRequest && c.req.query("discover") === "1";
 		const origin =
 			source === "chapter"
 				? { chapterId: c.req.param("chapterId") ?? "" }
@@ -143,7 +145,7 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 			(typeof requestedWorkspaceKey !== "string" || requestedWorkspaceKey.length > 256)
 		)
 			throw new ValidationError("Invalid Git workspace key");
-		const target = await authorizeGitTarget(c, origin, need, requestedWorkspaceKey);
+		const target = await authorizeGitTarget(c, origin, need, requestedWorkspaceKey, discoverNested);
 		if (workspaceRequest && requestedWorkspaceKey !== undefined)
 			assertGitWorkspaceKey(target.workspace, requestedWorkspaceKey);
 		if (!workspaceRequest) {
