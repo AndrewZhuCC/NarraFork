@@ -139,18 +139,22 @@ const GIT_DETECTION_PREF_PREFIX = "narrafork_git_detection_enabled:";
 const gitDetectionListeners = new Set<() => void>();
 let gitDetectionStorageListener: ((event: StorageEvent) => void) | null = null;
 let gitDetectionStorageWindow: Window | null = null;
-const gitDetectionFallback = new Set<string>();
+const gitDetectionFallback = new Map<string, boolean>();
 
 function gitDetectionKey(narratorId: string): string {
 	return `${GIT_DETECTION_PREF_PREFIX}${narratorId}`;
 }
 
-function readGitDetection(narratorId: string | null | undefined): boolean {
-	if (!narratorId) return false;
+function readGitDetectionOverride(narratorId: string | null | undefined): boolean | null {
+	if (!narratorId) return null;
+	if (gitDetectionFallback.has(narratorId)) return gitDetectionFallback.get(narratorId) ?? null;
 	try {
-		return localStorage.getItem(gitDetectionKey(narratorId)) === "1";
+		const stored = localStorage.getItem(gitDetectionKey(narratorId));
+		if (stored === "1") return true;
+		if (stored === "0") return false;
+		return null;
 	} catch {
-		return gitDetectionFallback.has(narratorId);
+		return null;
 	}
 }
 
@@ -182,22 +186,26 @@ function subscribeGitDetection(listener: () => void) {
 
 function persistGitDetection(narratorId: string, enabled: boolean) {
 	try {
-		if (enabled) localStorage.setItem(gitDetectionKey(narratorId), "1");
-		else localStorage.removeItem(gitDetectionKey(narratorId));
+		localStorage.setItem(gitDetectionKey(narratorId), enabled ? "1" : "0");
 		gitDetectionFallback.delete(narratorId);
 	} catch {
-		if (enabled) gitDetectionFallback.add(narratorId);
-		else gitDetectionFallback.delete(narratorId);
+		gitDetectionFallback.set(narratorId, enabled);
 	}
 	notifyGitDetectionListeners();
 }
 
 function useGitDetectionPreference(narratorId: string | null | undefined) {
-	const enabled = useSyncExternalStore(
+	const override = useSyncExternalStore(
 		subscribeGitDetection,
-		() => readGitDetection(narratorId),
-		() => false,
+		() => readGitDetectionOverride(narratorId),
+		() => null,
 	);
+	const { data: settings, isError } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		enabled: !!narratorId,
+	});
+	const enabled = override ?? (!isError && settings?.git?.narratorDetectionDefaultEnabled === true);
 	const setEnabled = useCallback(
 		(nextEnabled: boolean) => {
 			if (narratorId) persistGitDetection(narratorId, nextEnabled);

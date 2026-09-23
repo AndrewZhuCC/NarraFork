@@ -787,17 +787,23 @@ describe("GitPanel", () => {
 		};
 	}
 
-	test("narrator Git detection defaults off and synchronizes per narrator", async () => {
+	test("narrator Git detection safely defaults off and synchronizes per narrator", async () => {
 		const workspaceCalls: Array<{
 			narratorId: string;
 			workspaceKey?: string;
 			discoverNested?: boolean;
 		}> = [];
 		const original = {
+			getSettings: api.getSettings,
 			getGitWorkspace: api.getGitWorkspace,
 			getGitStatus: api.getGitStatus,
 			getGitModifications: api.getGitModifications,
 		};
+		let failSettings: (error: Error) => void = () => {};
+		api.getSettings = () =>
+			new Promise((_resolve, reject) => {
+				failSettings = reject;
+			});
 		api.getGitWorkspace = async (narratorId, _signal, workspaceKey, discoverNested) => {
 			workspaceCalls.push({ narratorId, workspaceKey, discoverNested });
 			return readyWorkspace();
@@ -854,6 +860,18 @@ describe("GitPanel", () => {
 			"Git detection is off",
 		);
 
+		failSettings(new Error("settings unavailable"));
+		await flushRender();
+		expect(switches.every((input) => !input.checked)).toBe(true);
+		expect(workspaceCalls).toEqual([]);
+
+		queryClient.setQueryData(["settings"], {
+			git: { narratorDetectionDefaultEnabled: false },
+		});
+		await flushRender();
+		expect(switches.every((input) => !input.checked)).toBe(true);
+		expect(workspaceCalls).toEqual([]);
+
 		setCheckbox(switches[0], true);
 		await flushRender();
 		await flushRender();
@@ -875,7 +893,89 @@ describe("GitPanel", () => {
 		queryClient.clear();
 	});
 
-	test("disabling narrator Git detection aborts and clears dependent queries", async () => {
+	test("server default enables detection while explicit false survives panel remounts", async () => {
+		const workspaceCalls: string[] = [];
+		const original = {
+			getGitWorkspace: api.getGitWorkspace,
+			getGitStatus: api.getGitStatus,
+			getGitModifications: api.getGitModifications,
+		};
+		api.getGitWorkspace = async (narratorId) => {
+			workspaceCalls.push(narratorId);
+			return readyWorkspace();
+		};
+		api.getGitStatus = async () => makeStatus();
+		api.getGitModifications = async () => ({ byFile: [], actors: [], hasMore: false });
+		restoreGitApi = () => Object.assign(api, original);
+
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["settings"], {
+			git: { narratorDetectionDefaultEnabled: true },
+		});
+		for (const narratorId of ["narrator-default-a", "narrator-default-b"]) {
+			queryClient.setQueryData(["narrators", narratorId], {
+				id: narratorId,
+				cwd: "/repo/sub",
+				chapterId: null,
+				contextProjectId: "project-context",
+			});
+		}
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		const renderPanels = () => {
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<QueryClientProvider client={queryClient}>
+							<ConfirmDialogProvider>
+								<GitPanel narratorId="narrator-default-a" />
+								<GitPanel narratorId="narrator-default-b" />
+							</ConfirmDialogProvider>
+						</QueryClientProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		};
+		root = createRoot(container);
+		renderPanels();
+		await flushRender();
+		await flushRender();
+		await flushRender();
+
+		let switches = Array.from(
+			container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+		);
+		expect(switches).toHaveLength(2);
+		expect(switches.every((input) => input.checked)).toBe(true);
+		expect([...workspaceCalls].sort()).toEqual(["narrator-default-a", "narrator-default-b"]);
+
+		setCheckbox(switches[0], false);
+		await flushRender();
+		await flushRender();
+
+		expect(switches[0]?.checked).toBe(false);
+		expect(switches[1]?.checked).toBe(true);
+		expect(localStorage.getItem(`${GIT_DETECTION_PREF_PREFIX}narrator-default-a`)).toBe("0");
+		expect(localStorage.getItem(`${GIT_DETECTION_PREF_PREFIX}narrator-default-b`)).toBeNull();
+
+		root.unmount();
+		root = createRoot(container);
+		renderPanels();
+		await flushRender();
+		await flushRender();
+		switches = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'));
+		expect(switches[0]?.checked).toBe(false);
+		expect(switches[1]?.checked).toBe(true);
+		expect([...workspaceCalls].sort()).toEqual(["narrator-default-a", "narrator-default-b"]);
+		queryClient.clear();
+	});
+
+	test("legacy explicit enable can be disabled and aborts dependent queries", async () => {
 		const narratorId = "narrator-stop-git";
 		localStorage.setItem(`${GIT_DETECTION_PREF_PREFIX}${narratorId}`, "1");
 		let workspaceCalls = 0;
@@ -902,6 +1002,9 @@ describe("GitPanel", () => {
 				queries: { retry: false, staleTime: Infinity },
 				mutations: { retry: false },
 			},
+		});
+		queryClient.setQueryData(["settings"], {
+			git: { narratorDetectionDefaultEnabled: false },
 		});
 		queryClient.setQueryData(["narrators", narratorId], {
 			id: narratorId,
@@ -953,11 +1056,16 @@ describe("GitPanel", () => {
 
 		const detectionSwitch = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		expect(detectionSwitch?.checked).toBe(true);
+		queryClient.setQueryData(["settings"], {
+			git: { narratorDetectionDefaultEnabled: true },
+		});
+		await flushRender();
 		setCheckbox(detectionSwitch, false);
 		await flushRender();
 		await flushRender();
 
 		expect(workspaceSignal?.aborted).toBe(true);
+		expect(localStorage.getItem(`${GIT_DETECTION_PREF_PREFIX}${narratorId}`)).toBe("0");
 		expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
 		expect(queryClient.getQueryData(fileTreeQueryKey)).toBeUndefined();
 		expect(container.textContent).toContain("Git detection is off");

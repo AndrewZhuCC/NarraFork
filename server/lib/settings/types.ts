@@ -598,6 +598,10 @@ export interface NarraForkSettings {
 		 */
 		extraWritableDirs: string[];
 	};
+	git: {
+		/** Instance default; a per-narrator localStorage override takes precedence. */
+		narratorDetectionDefaultEnabled: boolean;
+	};
 	/** Knowledge base: how knowledge is auto-injected into agent context. */
 	knowledge: {
 		/** "summary" = inject matched entry summaries; "off" = disable passive injection. */
@@ -636,14 +640,14 @@ export interface NarraForkSettings {
 		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
 		/** Whether newly-created narrators should start with the plan trait enabled. */
 		defaultStartInPlanMode: boolean;
-	summaryModel: string;
-	/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
-	translationModel: string;
-	/** Model used for prompt optimization. "__summary__" follows summaryModel dynamically. */
-	promptOptimizeModel: string;
-	/** Maximum number of context messages for prompt optimization. Default 10. */
-	promptOptimizeContextMaxMessages?: number;
-	customModels: ModelOption[];
+		summaryModel: string;
+		/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
+		translationModel: string;
+		/** Model used for prompt optimization. "__summary__" follows summaryModel dynamically. */
+		promptOptimizeModel: string;
+		/** Maximum number of context messages for prompt optimization. Default 10. */
+		promptOptimizeContextMaxMessages?: number;
+		customModels: ModelOption[];
 		hiddenModels: string[];
 		maxTurns: number;
 		subagentModels: {

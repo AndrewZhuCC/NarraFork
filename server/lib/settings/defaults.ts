@@ -21,6 +21,7 @@ export const DEFAULTS: NarraForkSettings = {
 		// in-browser editor can only write inside a narrator's own worktree.
 		extraWritableDirs: [] as string[],
 	},
+	git: { narratorDetectionDefaultEnabled: false },
 	knowledge: {
 		injectMode: "summary",
 		maxInjectedEntries: 3,
@@ -301,6 +302,12 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"paths.extraWritableDirs": {
 		desc: "浏览器内编辑器额外允许写入的目录（绝对路径）。默认只允许写入叙述者自己的 worktree；此处每一项都会扩大写入范围，请只填确实需要编辑的目录。符号链接会被解析后再校验，凭据文件（settings.json、数据库、~/.ssh 等）即使在允许目录内也仍然拒绝写入。",
 		type: "string[]",
+	},
+
+	// ── git ─────────────────────────────────────────────────────────────
+	"git.narratorDetectionDefaultEnabled": {
+		desc: "叙述者 Git 检测的实例级默认开关。每台 NarraFork 实例独立保存，因此本机与 ks-mini 可设置不同默认值；浏览器按叙述者保存在 localStorage 中的覆盖值优先。此设置仅决定未覆盖叙述者的默认检测行为，不改变服务端 Git 鉴权或仓库根探测逻辑。",
+		type: "boolean",
 	},
 
 	// ── knowledge ───────────────────────────────────────────────────────

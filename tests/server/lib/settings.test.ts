@@ -155,6 +155,24 @@ describe("auto-continuation defaults", () => {
 	});
 });
 
+describe("Git narrator detection default", () => {
+	it("defaults off and accepts only boolean settings patches", async () => {
+		expect(getDefaults().git.narratorDetectionDefaultEnabled).toBe(false);
+		const { updateSettingsSchema } = await import("../../../server/routes/settings");
+
+		for (const narratorDetectionDefaultEnabled of [true, false]) {
+			expect(
+				updateSettingsSchema.safeParse({ git: { narratorDetectionDefaultEnabled } }).success,
+			).toBe(true);
+		}
+		expect(
+			updateSettingsSchema.safeParse({
+				git: { narratorDetectionDefaultEnabled: "true" },
+			}).success,
+		).toBe(false);
+	});
+});
+
 describe("stripObsoleteSettingsKeys", () => {
 	it("removes pruning settings while preserving custom compaction thresholds", () => {
 		const value: Record<string, unknown> = {

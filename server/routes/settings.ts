@@ -387,6 +387,12 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		git: z
+			.object({
+				narratorDetectionDefaultEnabled: z.boolean(),
+			})
+			.partial()
+			.optional(),
 		/**
 		 * Per-instance branding. Validated STRICTLY here even though every read path
 		 * falls back to defaults: an admin who typed a malformed colour should be told
