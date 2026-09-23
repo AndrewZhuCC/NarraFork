@@ -51,6 +51,7 @@ import { getShikiLang } from "../../../lib/shiki-lang";
 import { ImageViewer } from "../../common/ImageViewer";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { type SelectionCommentPayload, SelectionPopover } from "../../common/SelectionPopover";
+import { TruncatedPath } from "../../common/TruncatedPath";
 import { TruncatedText } from "../../common/TruncatedText";
 import { addCommentDraft } from "../comment-draft-store";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
@@ -442,15 +443,18 @@ export function FileViewerContent({
 
 	const header = (
 		<Group gap={6} px="xs" py={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-			{/* The name is the ONLY flexible item here (see HEADER_FLEXIBLE_STYLE); the
-			    full path is on hover, since the basename alone is what gets clipped. */}
-			<TruncatedText
-				text={fileName}
-				tooltipLabel={filePath}
-				size="xs"
-				fw={600}
-				style={HEADER_FLEXIBLE_STYLE}
-			/>
+			{/* The path/name is the only flexible item; controls retain their width. */}
+			{referenceOrigin ? (
+				<TruncatedPath path={filePath} fw={600} />
+			) : (
+				<TruncatedText
+					text={fileName}
+					tooltipLabel={filePath}
+					size="xs"
+					fw={600}
+					style={HEADER_FLEXIBLE_STYLE}
+				/>
+			)}
 			{modes.length > 1 && (
 				<SegmentedControl
 					size="xs"

@@ -41,6 +41,7 @@ import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { TruncatedPath } from "../../common/TruncatedPath";
 import { addCommentDraft } from "../comment-draft-store";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import type { DiffLine } from "../diff/DiffView";
@@ -748,9 +749,13 @@ function FileEditorDocument({
 		>
 			<Group justify="space-between" gap="xs" px="xs" py={6} wrap="nowrap">
 				<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-					<Text size="xs" c="dimmed" truncate title={filePath}>
-						{filePanelBaseName(filePath)}
-					</Text>
+					{referenceOrigin ? (
+						<TruncatedPath path={filePath} />
+					) : (
+						<Text size="xs" c="dimmed" truncate title={filePath}>
+							{filePanelBaseName(filePath)}
+						</Text>
+					)}
 					{readOnly && (
 						<Badge size="xs" color="gray">
 							{t("fileEditor.readOnly")}

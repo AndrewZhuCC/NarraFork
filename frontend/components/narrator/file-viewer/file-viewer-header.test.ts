@@ -39,8 +39,7 @@ describe("file viewer header flex roles", () => {
 });
 
 describe("header title text", () => {
-	// The header shows the basename (the path goes in the tooltip), so the string
-	// under test is what the flex row has to fit.
+	// Ordinary files keep the basename; reference-opened files show the full path.
 	it("shows the basename of a deep path, for both separators", () => {
 		expect(fileBaseName("/repo/.narrafork/dumps/api-request-2026-08-17.json")).toBe(
 			"api-request-2026-08-17.json",
@@ -52,5 +51,15 @@ describe("header title text", () => {
 
 	it("falls back to the whole string when there is no separator", () => {
 		expect(fileBaseName("notes.txt")).toBe("notes.txt");
+	});
+
+	it("keeps resolved reference paths in the binary header and file panel title", async () => {
+		const viewer = await Bun.file(new URL("./FileViewerContent.tsx", import.meta.url)).text();
+		expect(viewer).toContain("<TruncatedPath path={filePath} fw={600} />");
+
+		const dock = await Bun.file(new URL("../dock/panels.tsx", import.meta.url)).text();
+		const filePanel = dock.slice(dock.indexOf("export function FileDockPanel"));
+		expect(filePanel).toContain("referenceOrigin ? filePath : fileName?.trim()");
+		expect(filePanel).toContain("props.api.setTitle(displayTitle)");
 	});
 });

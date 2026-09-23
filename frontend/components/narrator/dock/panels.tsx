@@ -188,7 +188,7 @@ function ToolPanelHeader({
 			}}
 		>
 			{icon ? <Box style={{ display: "flex", flexShrink: 0 }}>{icon}</Box> : null}
-			<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
+			<Text size="sm" fw={600} truncate title={title} style={{ flex: 1, minWidth: 0 }}>
 				{title}
 			</Text>
 			{/* `nodrag` on the interactive parts, matching the pointerdown guard above but
@@ -983,7 +983,9 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 	);
 	// Selections still belong to the receiving chat, not the file-operation session.
 	const publishSelection = useFilePanelSelectionPublisher();
-	const title = fileName?.trim() || filePanelBaseName(filePath) || t("fileViewer.title");
+	const title =
+		(referenceOrigin ? filePath : fileName?.trim() || filePanelBaseName(filePath)) ||
+		t("fileViewer.title");
 	const [editorDirty, setEditorDirty] = useState(false);
 	const dirtyRef = useRef(false);
 	const onDirtyChange = useCallback((dirty: boolean) => {

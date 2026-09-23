@@ -252,6 +252,17 @@ async function mount(props: Partial<FileEditorContentProps> = {}) {
 	if (!model) throw new Error(`Editor missing: ${host.textContent}`);
 	return model;
 }
+
+test("reference-opened text files display their full path without changing ordinary file titles", async () => {
+	const path = "/work/nested/中文.md";
+	await mount({ filePath: path, referenceOrigin: true });
+	expect(host.querySelector("bdo")?.textContent).toBe(path);
+
+	await mount({ filePath: path, referenceOrigin: false });
+	expect(host.querySelector("bdo")).toBeNull();
+	expect(host.textContent).toContain("中文.md");
+});
+
 function iconButton(icon: string) {
 	const button = host.querySelector(`.tabler-icon-${icon}`)?.closest("button");
 	if (!button) throw new Error(`Missing ${icon} button`);
