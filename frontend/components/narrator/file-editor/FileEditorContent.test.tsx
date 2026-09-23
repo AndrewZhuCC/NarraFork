@@ -253,10 +253,10 @@ async function mount(props: Partial<FileEditorContentProps> = {}) {
 	return model;
 }
 
-test("reference-opened text files display their full path without changing ordinary file titles", async () => {
+test("reference-opened text files display their workspace-relative path without changing ordinary file titles", async () => {
 	const path = "/work/nested/中文.md";
-	await mount({ filePath: path, referenceOrigin: true });
-	expect(host.querySelector("bdo")?.textContent).toBe(path);
+	await mount({ filePath: path, referenceOrigin: true, displayPath: "nested/中文.md" });
+	expect(host.querySelector("bdo")?.textContent).toBe("nested/中文.md");
 
 	await mount({ filePath: path, referenceOrigin: false });
 	expect(host.querySelector("bdo")).toBeNull();

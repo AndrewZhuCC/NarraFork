@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { filePathRelativeToWorkspace } from "../../../lib/format";
 import { fileBaseName, HEADER_FIXED_STYLE, HEADER_FLEXIBLE_STYLE } from "./FileViewerContent";
 
 /**
@@ -39,7 +40,33 @@ describe("file viewer header flex roles", () => {
 });
 
 describe("header title text", () => {
-	// Ordinary files keep the basename; reference-opened files show the full path.
+	// Ordinary files keep the basename; references show a workspace-relative path.
+	it("shortens only references inside the workspace on the matching device", () => {
+		const local = { deviceId: "local", cwd: "/work/repo/" };
+		expect(filePathRelativeToWorkspace("/work/repo/src/a.ts", "local", local)).toBe("src/a.ts");
+		expect(filePathRelativeToWorkspace("/work/repository/src/a.ts", "local", local)).toBe(
+			"/work/repository/src/a.ts",
+		);
+		expect(filePathRelativeToWorkspace("/work/repo/src/a.ts", "remote", local)).toBe(
+			"/work/repo/src/a.ts",
+		);
+		expect(filePathRelativeToWorkspace("/work/repo/src/a.ts", "local", null)).toBe(
+			"/work/repo/src/a.ts",
+		);
+		expect(
+			filePathRelativeToWorkspace("c:/WORK/Repo/src/a.ts", "remote", {
+				deviceId: "remote",
+				cwd: "C:\\work\\repo",
+			}),
+		).toBe("src/a.ts");
+		expect(filePathRelativeToWorkspace("/work/file.ts", "local", { ...local, cwd: "/" })).toBe(
+			"work/file.ts",
+		);
+		expect(filePathRelativeToWorkspace("C:/file.ts", "local", { ...local, cwd: "C:\\" })).toBe(
+			"file.ts",
+		);
+	});
+
 	it("shows the basename of a deep path, for both separators", () => {
 		expect(fileBaseName("/repo/.narrafork/dumps/api-request-2026-08-17.json")).toBe(
 			"api-request-2026-08-17.json",
@@ -53,13 +80,13 @@ describe("header title text", () => {
 		expect(fileBaseName("notes.txt")).toBe("notes.txt");
 	});
 
-	it("keeps resolved reference paths in the binary header and file panel title", async () => {
+	it("uses a display-only relative path in the preview and dock title", async () => {
 		const viewer = await Bun.file(new URL("./FileViewerContent.tsx", import.meta.url)).text();
-		expect(viewer).toContain("<TruncatedPath path={filePath} fw={600} />");
+		expect(viewer).toContain("<TruncatedPath path={displayPath ?? filePath} fw={600} />");
 
 		const dock = await Bun.file(new URL("../dock/panels.tsx", import.meta.url)).text();
 		const filePanel = dock.slice(dock.indexOf("export function FileDockPanel"));
-		expect(filePanel).toContain("referenceOrigin ? filePath : fileName?.trim()");
+		expect(filePanel).toContain("referenceOrigin ? referenceDisplayPath : fileName?.trim()");
 		expect(filePanel).toContain("props.api.setTitle(displayTitle)");
 	});
 });

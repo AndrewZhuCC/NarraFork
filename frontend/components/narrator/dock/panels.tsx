@@ -42,6 +42,7 @@ import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
+import { filePathRelativeToWorkspace } from "../../../lib/format";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { getFilePreviewType } from "../file-panel/FilePreviewModal";
@@ -964,6 +965,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 		filePath,
 		fileName,
 		deviceId = "local",
+		workspaceCwd,
 		selection,
 		highlightRequestId,
 		referenceOrigin,
@@ -977,14 +979,22 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 			openFilePanel?.(target.path, undefined, {
 				...target,
 				fileNarratorId,
+				workspaceCwd: target.deviceId === deviceId ? workspaceCwd : undefined,
 				referenceOrigin: true,
 			}),
-		[openFilePanel, fileNarratorId],
+		[openFilePanel, fileNarratorId, deviceId, workspaceCwd],
 	);
 	// Selections still belong to the receiving chat, not the file-operation session.
 	const publishSelection = useFilePanelSelectionPublisher();
+	const referenceDisplayPath = referenceOrigin
+		? filePathRelativeToWorkspace(
+				filePath,
+				deviceId,
+				workspaceCwd ? { deviceId, cwd: workspaceCwd } : null,
+			)
+		: undefined;
 	const title =
-		(referenceOrigin ? filePath : fileName?.trim() || filePanelBaseName(filePath)) ||
+		(referenceOrigin ? referenceDisplayPath : fileName?.trim() || filePanelBaseName(filePath)) ||
 		t("fileViewer.title");
 	const [editorDirty, setEditorDirty] = useState(false);
 	const dirtyRef = useRef(false);
@@ -1080,6 +1090,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							commentNarratorId={hostNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
+							displayPath={referenceDisplayPath}
 							selection={selection}
 							navigationRequestId={highlightRequestId}
 							onDirtyChange={onDirtyChange}
@@ -1092,6 +1103,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							commentNarratorId={hostNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
+							displayPath={referenceDisplayPath}
 							selection={selection}
 							highlightRequestId={highlightRequestId}
 						/>

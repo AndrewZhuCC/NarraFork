@@ -528,6 +528,7 @@ export class WorkspaceDockStore {
 			options.fileNarratorId === hostNarratorId ? undefined : options.fileNarratorId;
 		const navigation = {
 			deviceId,
+			workspaceCwd: options.workspaceCwd,
 			fileNarratorId,
 			toolEdit: options.toolEdit,
 			selection: options.selection,

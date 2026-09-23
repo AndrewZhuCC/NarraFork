@@ -462,6 +462,7 @@ export function NarratorDockProvider({
 				options.fileNarratorId === narratorId ? undefined : options.fileNarratorId;
 			const navigation = {
 				deviceId,
+				workspaceCwd: options.workspaceCwd,
 				fileNarratorId,
 				toolEdit: options.toolEdit,
 				selection: options.selection,

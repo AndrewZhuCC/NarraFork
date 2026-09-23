@@ -91,6 +91,7 @@ import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
 	calculateEffectiveTurnElapsedMs,
+	filePathRelativeToWorkspace,
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
@@ -1875,21 +1876,6 @@ export function NarratorPanel({
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
 	// Drawer). Kept lifted here: its handlers feed the fileReferenceScope memo
 	// below (consumed by descendants) and the Drawer lives in this panel's JSX.
-	const {
-		internalFileViewerPath,
-		setInternalFileViewerPath,
-		internalFileViewerTarget,
-		handleOpenFilePanel,
-		handleOpenReferencedFile,
-		canOpenReferencedFile,
-	} = useInternalFileViewer({ narratorId, isWorkspacePreview, t });
-	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
-	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
-		null,
-	);
-	const addFileReference = useCallback((reference: FileReference) => {
-		composerRef.current?.addFileReference(reference);
-	}, []);
 	const fileReferenceDevice = executionDevicesQuery.data
 		? (executionDevicesQuery.data.defaultDeviceId ?? "local")
 		: undefined;
@@ -1905,6 +1891,34 @@ export function NarratorPanel({
 				: null,
 		[fileReferenceDevice, fileReferenceCwd],
 	);
+	const {
+		internalFileViewerPath,
+		setInternalFileViewerPath,
+		internalFileViewerTarget,
+		handleOpenFilePanel,
+		handleOpenReferencedFile,
+		canOpenReferencedFile,
+	} = useInternalFileViewer({
+		narratorId,
+		isWorkspacePreview,
+		workspaceContext: fileReferenceContext,
+		t,
+	});
+	const internalViewerDisplayPath =
+		internalFileViewerPath && internalFileViewerTarget
+			? filePathRelativeToWorkspace(
+					internalFileViewerPath,
+					internalFileViewerTarget.deviceId,
+					fileReferenceContext,
+				)
+			: undefined;
+	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
+	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
+		null,
+	);
+	const addFileReference = useCallback((reference: FileReference) => {
+		composerRef.current?.addFileReference(reference);
+	}, []);
 	const fileReferenceScope = useMemo<FileReferenceScopeValue>(
 		() => ({
 			narratorId,
@@ -3555,13 +3569,18 @@ export function NarratorPanel({
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
-							// The viewer body already shows the base name; the title carries the
-							// full path so the drawer adds information rather than repeating it.
+							// The title adds the workspace-relative path for references; files
+							// outside that workspace retain their full path.
 							//
 							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
 							// so a deep path keeps the filename — the part that identifies the file —
 							// visible instead of clipping it and leaving only directories.
-							title={<TruncatedPath path={internalFileViewerPath} fw={600} />}
+							title={
+								<TruncatedPath
+									path={internalViewerDisplayPath ?? internalFileViewerPath}
+									fw={600}
+								/>
+							}
 							closeButtonProps={{ size: "sm" }}
 							styles={{
 								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -3594,6 +3613,7 @@ export function NarratorPanel({
 									commentNarratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
+									displayPath={internalViewerDisplayPath}
 									selection={internalFileViewerTarget?.selection}
 									highlightRequestId={internalFileViewerTarget?.highlightRequestId}
 									onOpenFileTarget={handleOpenReferencedFile}

@@ -101,6 +101,8 @@ export interface FileEditorContentProps {
 	commentNarratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
+	/** Display label only; filePath remains the absolute file identity. */
+	displayPath?: string;
 	selection?: FileSelection;
 	navigationRequestId?: string;
 	onFileReferenceSelectionChange?: (
@@ -142,6 +144,7 @@ function FileEditorDocument({
 	commentNarratorId,
 	deviceId = "local",
 	referenceOrigin = false,
+	displayPath,
 	selection,
 	navigationRequestId,
 	onFileReferenceSelectionChange,
@@ -750,7 +753,7 @@ function FileEditorDocument({
 			<Group justify="space-between" gap="xs" px="xs" py={6} wrap="nowrap">
 				<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
 					{referenceOrigin ? (
-						<TruncatedPath path={filePath} />
+						<TruncatedPath path={displayPath ?? filePath} />
 					) : (
 						<Text size="xs" c="dimmed" truncate title={filePath}>
 							{filePanelBaseName(filePath)}

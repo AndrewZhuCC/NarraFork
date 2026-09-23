@@ -170,6 +170,8 @@ export interface FileViewerContentProps {
 	deviceId?: string;
 	/** References use scoped text/image readers, never the legacy binary/download reader. */
 	referenceOrigin?: boolean;
+	/** Display label only; filePath remains the absolute file identity. */
+	displayPath?: string;
 	selection?: FileSelection;
 	highlightRequestId?: string;
 	onOpenFileTarget?: (target: FileTarget) => void;
@@ -210,6 +212,7 @@ export function FileViewerContent({
 	commentNarratorId,
 	deviceId = "local",
 	referenceOrigin = false,
+	displayPath,
 	selection,
 	highlightRequestId,
 	onOpenFileTarget,
@@ -445,7 +448,7 @@ export function FileViewerContent({
 		<Group gap={6} px="xs" py={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 			{/* The path/name is the only flexible item; controls retain their width. */}
 			{referenceOrigin ? (
-				<TruncatedPath path={filePath} fw={600} />
+				<TruncatedPath path={displayPath ?? filePath} fw={600} />
 			) : (
 				<TruncatedText
 					text={fileName}
