@@ -305,9 +305,9 @@ export function bindModelCatalogSettings(settings: NarraForkSettings, save: () =
 				...(base ?? { id }),
 				metadata: {},
 				rawMetadata: undefined, // Identity edits must not pin the preset's complete source.
-				name: card.displayName ?? base?.name,
-				family: card.family ?? base?.family,
-				notes: card.notes ?? base?.notes,
+				name: card.displayName || base?.name,
+				family: card.family || base?.family,
+				notes: card.notes || base?.notes,
 				matches: {
 					...base?.matches,
 					...(card.aliases ? { aliases: card.aliases } : {}),
