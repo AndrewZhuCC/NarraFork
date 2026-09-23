@@ -26,7 +26,6 @@ import {
 	useResolvedModelCard,
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
-import { Z } from "../../lib/z-index";
 import { ModelCardDetails } from "./ModelCardDetails";
 import {
 	buildCatalogPatch,
@@ -319,7 +318,6 @@ export function ModelCatalogEditor({
 			title={`${t(`catalog.${target.kind}`)} · ${target.isNew ? t("catalog.create") : target.id}`}
 			size="lg"
 			centered
-			zIndex={Z.modal + 1}
 		>
 			<Stack>
 				{readOnly && <Alert>{t("catalog.readOnly")}</Alert>}
