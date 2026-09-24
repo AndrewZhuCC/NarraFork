@@ -1085,6 +1085,7 @@
 	"fileViewer.nodesTruncated": "[节点树已截断以保持界面响应。]",
 	"fileViewer.binaryHint": "该类型文件请使用图片/PDF 查看器打开。",
 	"fileTree.title": "文件",
+	"createSubagent": "新建子代理",
 	"fileTree.noRoot": "该叙述者没有工作目录，无法浏览文件。",
 	"fileTree.empty": "该目录为空。",
 	"fileTree.refresh": "刷新",

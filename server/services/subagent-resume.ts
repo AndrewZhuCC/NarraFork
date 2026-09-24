@@ -684,7 +684,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				commandText: input.commandText,
 				createdBy: input.createdBy,
 				userId: input.executionPrincipal ? input.executionPrincipal.userId : input.createdBy,
-				canReportToParent: input.actor === "parent_agent",
+				canReportToParent: input.actor === "parent_agent" || standaloneOrigin,
 				signal: runSignal,
 				abortController,
 				updateExecutionLease: input.updateExecutionLease,

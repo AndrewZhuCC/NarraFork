@@ -1086,6 +1086,7 @@
 	"fileViewer.nodesTruncated": "[Node tree truncated to keep the UI responsive.]",
 	"fileViewer.binaryHint": "This file type opens in the image/PDF viewer.",
 	"fileTree.title": "Files",
+	"createSubagent": "New subagent",
 	"fileTree.noRoot": "This narrator has no working directory, so there is nothing to browse.",
 	"fileTree.empty": "This directory is empty.",
 	"fileTree.refresh": "Refresh",

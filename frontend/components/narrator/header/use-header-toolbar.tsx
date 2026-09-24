@@ -71,6 +71,7 @@ export interface UseHeaderToolbarOptions {
 	handleSelectLod: (lod: RenderLod) => void;
 	setAsDefault: () => void;
 	openPluginPanel: (pick: PluginContributionPick) => void;
+	onCreateSubagent?: () => void;
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
@@ -126,6 +127,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		handleSelectLod,
 		setAsDefault,
 		openPluginPanel,
+		onCreateSubagent,
 		t,
 	} = options;
 
@@ -147,6 +149,8 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					// Chapter or standalone, the git panel is offered whenever a
 					// workspace resolves with read capability for this narrator.
 					return gitWorkspaceAvailable;
+				case "subagent":
+					return !!onCreateSubagent;
 				case "browser":
 					return browserSessionsSupported !== false;
 				case "device":
@@ -169,6 +173,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			browserSessionsSupported,
 			executionDevicesQuery.data?.devices.length,
 			dock,
+			onCreateSubagent,
 		],
 	);
 
@@ -271,6 +276,9 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "filetree":
 					dock?.toggleToolPanel("filetree");
 					return;
+				case "subagent":
+					onCreateSubagent?.();
+					return;
 				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
 				// transcript while a slider moves, so there is no drawer fallback to offer.
 				case "appearance":
@@ -289,6 +297,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			onOpenTerminalPanel,
 			toggleTerminalTool,
 			toggleSpecTool,
+			onCreateSubagent,
 		],
 	);
 

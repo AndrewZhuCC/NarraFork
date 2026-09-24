@@ -129,6 +129,13 @@ describe("panel toolbar controller", () => {
 		expect(overlay().props.controlled.opened).toBe(false);
 	});
 
+	test("one click creates a manual subagent without entering a prompt", async () => {
+		const create = mock(() => {});
+		await render({ ...options(), onCreateSubagent: create });
+		controller.activateToolbarEntry("subagent");
+		expect(create).toHaveBeenCalledTimes(1);
+	});
+
 	test("terminal uses the host callback, with the standalone toggle as fallback", async () => {
 		const props = options();
 		const open = mock(() => {});

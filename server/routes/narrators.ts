@@ -148,6 +148,7 @@ import {
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
+	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	settings,
 } from "../lib/settings";
@@ -1163,6 +1164,30 @@ narratorRoutes.post("/", async (c) => {
 		ownerUserId,
 	});
 	return c.json(publicNarratorResponse(narrator), 201);
+});
+
+// Human-started subagent: create the same child as Agent, but wait for its first message.
+narratorRoutes.post("/:id/subagents", async (c) => {
+	const parentNarratorId = c.req.param("id");
+	const parent = await narratorService.getById(parentNarratorId);
+	const inheritedTraits = parseTraits(parent.traits).filter(
+		(trait) =>
+			trait.startsWith(DISABLED_TOOLS_TRAIT_PREFIX) ||
+			trait.startsWith(BLOCKED_SKILLS_TRAIT_PREFIX),
+	);
+	const child = await narratorService.createSubagent({
+		parentNarratorId,
+		subagentOriginKind: "standalone",
+		subagentType: "general",
+		cwd: parent.cwd ?? ".",
+		model: resolveEffectiveModel(parent.model),
+		reasoningEffort: parent.reasoningEffort ?? resolveDefaultReasoningEffort(),
+		inheritedTraits,
+	});
+	// createSubagent's tool-born default is working; a child without a run must be idle
+	// so its first user message starts the existing resume path instead of being queued.
+	await narratorService.updateStatus(child.id, "idle");
+	return c.json(publicNarratorResponse({ ...child, status: "idle" }), 201);
 });
 
 // Create a Setup Assistant narrator that installs the missing system dependencies.

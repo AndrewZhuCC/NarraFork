@@ -35,6 +35,7 @@ import {
 	IconSearch,
 	IconTerminal,
 	IconTextSize,
+	IconUserPlus,
 	IconWorldWww,
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
@@ -111,6 +112,11 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		// overflow menu that opens nothing, which is precisely the dead-control trap the
 		// notes on `hosts` describe. Add it back together with a mobile host.
 		hosts: ["dock"],
+	},
+	subagent: {
+		labelKey: "createSubagent",
+		icon: IconUserPlus,
+		hosts: ["inline"],
 	},
 	details: {
 		labelKey: "details.title",

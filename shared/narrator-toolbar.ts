@@ -39,6 +39,7 @@ export const NARRATOR_TOOLBAR_IDS = [
 	"tasks",
 	"filemod",
 	"filetree",
+	"subagent",
 	"details",
 	"terminal",
 	"spec",

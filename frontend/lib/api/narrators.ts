@@ -631,6 +631,8 @@ export const narratorsApi = {
 		handle?: string;
 		kind?: "knowledge" | "setup";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
+	createSubagent: (parentNarratorId: string) =>
+		request<ApiEntity>(`/narrators/${parentNarratorId}/subagents`, { method: "POST" }),
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system
 	 * dependencies on this machine. Returns `created: false` when nothing

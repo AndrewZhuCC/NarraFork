@@ -2653,6 +2653,16 @@ export function NarratorPanel({
 		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
 	);
 
+	const createSubagentMutation = useMutation({
+		mutationFn: () => api.createSubagent(narratorId),
+		onSuccess: (child) => handleVlistViewSubagentSession(child.id),
+		onError: (error: Error) => notifications.show({ message: error.message, color: "red" }),
+	});
+	const handleCreateSubagent = useCallback(
+		() => createSubagentMutation.mutate(),
+		[createSubagentMutation.mutate],
+	);
+
 	const toolbarController = useHeaderToolbar({
 		narratorId,
 		headerHostCapabilities,
@@ -2684,6 +2694,7 @@ export function NarratorPanel({
 		handleSelectLod,
 		setAsDefault,
 		openPluginPanel,
+		onCreateSubagent: !isSubagent && !isWorkspacePreview ? handleCreateSubagent : undefined,
 		t,
 	});
 
