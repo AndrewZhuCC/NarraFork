@@ -621,6 +621,8 @@ export const narrators = sqliteTable(
 		isAskInPassing: integer("is_ask_in_passing", { mode: "boolean" }).notNull().default(false),
 		/** ISO timestamp when the current (or last) turn started */
 		turnStartedAt: text("turn_started_at"),
+		/** Fixed end of the last turn; unrelated narrator edits must not move this timestamp. */
+		turnEndedAt: text("turn_ended_at"),
 		/** Monotonically increasing counter bumped on every message add/delete/update */
 		messageVersion: integer("message_version").notNull().default(0),
 		/** Monotonically increasing counter bumped when the visible timeline structure changes. */

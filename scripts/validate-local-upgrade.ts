@@ -11,8 +11,13 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0012_curved_bloodstorm",
 	"0013_omniscient_dormammu",
 	"0014_blue_tomorrow_man",
+	"0015_nifty_magma",
 ]);
-const JOURNAL_TAIL_TAGS = new Set(["0013_omniscient_dormammu", "0014_blue_tomorrow_man"]);
+const JOURNAL_TAIL_TAGS = new Set([
+	"0013_omniscient_dormammu",
+	"0014_blue_tomorrow_man",
+	"0015_nifty_magma",
+]);
 const MAX_REPORT_BYTES = 64 * 1024;
 
 type Args = {
@@ -124,6 +129,11 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0015_nifty_magma") {
+		return {
+			narrators: tableDigest(db, "narrators", excludeNew ? new Set(["turn_ended_at"]) : new Set()),
+		};
+	}
 	const is0014 = targetTag === "0014_blue_tomorrow_man";
 	const summary: Record<string, unknown> = {
 		narrators: tableDigest(db, "narrators", excludeNew ? new Set(["next_seq"]) : new Set()),
@@ -198,6 +208,9 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0015_nifty_magma") {
+		shape["narrators.turn_ended_at"] = columnShape(db, "narrators", "turn_ended_at");
+	}
 	if (targetTag === "0014_blue_tomorrow_man") {
 		for (const table of [
 			"notifications",
@@ -313,7 +326,9 @@ async function main() {
 				? ["file_change_scope_recoveries"]
 				: target.tag === "0013_omniscient_dormammu"
 					? ["workspace_write_leases"]
-					: ["notifications", "user_usage_totals", "workspace_execution_owners"];
+					: target.tag === "0014_blue_tomorrow_man"
+						? ["notifications", "user_usage_totals", "workspace_execution_owners"]
+						: [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");
@@ -324,6 +339,14 @@ async function main() {
 				(table) => canonical(beforeAffected[table]) !== canonical(afterAffected[table]),
 			);
 			throw new Error(`Existing affected-table fields changed: ${changed.join(", ")}`);
+		}
+		if (target.tag === "0015_nifty_magma") {
+			const populatedTurnEnds = db
+				.query("SELECT count(*) AS count FROM narrators WHERE turn_ended_at IS NOT NULL")
+				.get() as { count: number };
+			if (Number(populatedTurnEnds.count) !== 0) {
+				throw new Error("Existing narrators gained turn_ended_at values");
+			}
 		}
 		if (target.tag === "0013_omniscient_dormammu") {
 			const originalLeaseColumns = columns(db, "workspace_write_leases").filter(

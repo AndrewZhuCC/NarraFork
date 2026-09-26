@@ -124,24 +124,26 @@ describe("TurnElapsedTime", () => {
 		expect(text()).toMatch(/0:0[234]/);
 	});
 
-	test("stopping freezes at updatedAt and switching to another turn resets immediately", async () => {
+	test("stopping freezes at turnEndedAt even after re-render; another turn resets", async () => {
 		const startedAt = new Date(Date.now() - 60_000).toISOString();
-		const updatedAt = new Date(Date.now() - 30_000).toISOString();
-		await render(
+		const turnEndedAt = new Date(Date.now() - 30_000).toISOString();
+		const finishedTurn = () => (
 			<TurnElapsedTime
 				turnStartedAt={startedAt}
-				endAt={updatedAt}
+				endAt={turnEndedAt}
 				running={false}
 				substatus={[]}
 				isMobile={false}
-			/>,
+			/>
 		);
+		await render(finishedTurn());
 		expect(text()).toContain("0:30");
 
 		await act(async () => {
 			await new Promise((resolve) => setTimeout(resolve, 1200));
 		});
-		// No interval is armed for a finished turn: the frozen value must not drift.
+		// A later render must still use the fixed end, never the wall clock.
+		await render(finishedTurn());
 		expect(text()).toContain("0:30");
 
 		// A new turn must not show the previous turn's elapsed value for a commit.
@@ -156,6 +158,25 @@ describe("TurnElapsedTime", () => {
 		);
 		expect(text()).toContain("0:00");
 		expect(text()).not.toContain("0:30");
+	});
+
+	test("a finished turn without a valid end stays hidden, but explicit text remains visible", async () => {
+		const startedAt = new Date(Date.now() - 60_000).toISOString();
+		await render(<TurnElapsedTime turnStartedAt={startedAt} running={false} isMobile={false} />);
+		expect(container.querySelector("button, span")).toBeNull();
+
+		await render(
+			<TurnElapsedTime
+				turnStartedAt={startedAt}
+				endAt="invalid"
+				running={false}
+				isMobile={false}
+			/>,
+		);
+		expect(container.querySelector("button, span")).toBeNull();
+
+		await render(<TurnElapsedTime text="prior duration" isMobile={false} />);
+		expect(text()).toContain("prior duration");
 	});
 });
 

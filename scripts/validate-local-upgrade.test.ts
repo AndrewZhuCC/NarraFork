@@ -36,6 +36,8 @@ describe("validate-local-upgrade", () => {
 			db.exec("PRAGMA foreign_keys=ON");
 			applyPendingMigrationsByHash(db, preMigrations);
 			await applySqliteDataBackfills(db);
+			// Current ensureColumns would add 0015's nullable field; pre-seed it to isolate 0013.
+			db.exec("ALTER TABLE narrators ADD COLUMN turn_ended_at text");
 			db.run(
 				"INSERT INTO narrators (id, created_at, updated_at, traits, next_seq) VALUES (?, ?, ?, ?, ?)",
 				[
@@ -185,16 +187,23 @@ describe("validate-local-upgrade", () => {
 			cpSync(join(ROOT, "drizzle"), migrations, { recursive: true });
 			const journalPath = join(migrations, "meta/_journal.json");
 			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-			const target = journal.entries.pop() as { tag: string };
-			expect(target.tag).toBe("0014_blue_tomorrow_man");
+			const migrationIndex = journal.entries.findIndex(
+				(entry: { tag: string }) => entry.tag === "0014_blue_tomorrow_man",
+			);
+			if (migrationIndex < 0) throw new Error("Missing 0014 migration fixture");
+			const target = journal.entries[migrationIndex] as { tag: string };
+			for (const entry of journal.entries.splice(migrationIndex) as Array<{ tag: string }>) {
+				rmSync(join(migrations, `${entry.tag}.sql`));
+			}
 			writeFileSync(journalPath, JSON.stringify(journal));
-			rmSync(join(migrations, `${target.tag}.sql`));
 
 			const original = join(root, "backup.db");
 			const db = new Database(original);
 			db.exec("PRAGMA foreign_keys=ON");
 			applyPendingMigrationsByHash(db, migrations);
 			await applySqliteDataBackfills(db);
+			// Current ensureColumns would add 0015's nullable field; pre-seed it to isolate 0014.
+			db.exec("ALTER TABLE narrators ADD COLUMN turn_ended_at text");
 			db.run(
 				"INSERT INTO narrators (id, created_at, updated_at, traits, next_seq) VALUES (?, ?, ?, ?, ?)",
 				["narrator-0014", "2026-09-21T00:00:00Z", "2026-09-21T00:00:00Z", '["standalone"]', 0],
@@ -245,6 +254,104 @@ describe("validate-local-upgrade", () => {
 				for (const table of ["notifications", "user_usage_totals", "workspace_execution_owners"]) {
 					expect(upgraded.query("SELECT 1 FROM sqlite_master WHERE name=?").get(table)).not.toBeNull();
 				}
+			} finally {
+				upgraded.close();
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 300_000);
+
+	test("validates migration 0015 without changing existing narrator data", async () => {
+		const root = mkdtempSync(join(tmpdir(), "nf-local-upgrade-0015-"));
+		try {
+			const migrations = join(root, "drizzle");
+			cpSync(join(ROOT, "drizzle"), migrations, { recursive: true });
+			const journalPath = join(migrations, "meta/_journal.json");
+			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+			const target = journal.entries.pop() as { tag: string };
+			expect(target.tag).toBe("0015_nifty_magma");
+			writeFileSync(journalPath, JSON.stringify(journal));
+			rmSync(join(migrations, `${target.tag}.sql`));
+
+			const original = join(root, "backup.db");
+			const db = new Database(original);
+			db.exec("PRAGMA foreign_keys=ON");
+			applyPendingMigrationsByHash(db, migrations);
+			await applySqliteDataBackfills(db);
+			db.run(
+				"INSERT INTO narrators (id, created_at, updated_at, traits, next_seq) VALUES (?, ?, ?, ?, ?)",
+				["narrator-0015", "2026-09-21T00:00:00Z", "2026-09-22T00:00:00Z", '["standalone"]', 17],
+			);
+			const before = db
+				.query("SELECT id, created_at, updated_at, traits, next_seq FROM narrators")
+				.get();
+			db.close();
+
+			journal.entries.push(target);
+			writeFileSync(journalPath, JSON.stringify(journal));
+			cpSync(join(ROOT, "drizzle", `${target.tag}.sql`), join(migrations, `${target.tag}.sql`));
+			const validation = join(root, "validation.db");
+			cpSync(original, validation);
+			const online = join(root, "online.db");
+			writeFileSync(online, "not opened");
+			const originalHash = sha256(original);
+			const sourceHash = "1".repeat(64);
+			const commit = "a".repeat(40);
+			const version = "0.7.9";
+			const child = Bun.spawnSync({
+				cmd: [
+					process.execPath,
+					join(ROOT, "scripts/validate-local-upgrade.ts"),
+					"--database",
+					validation,
+					"--migrations",
+					migrations,
+					"--online-database",
+					online,
+					"--backup-original",
+					original,
+					"--backup-sha256",
+					originalHash,
+					"--source-sha256",
+					sourceHash,
+					"--commit",
+					commit,
+					"--version",
+					version,
+				],
+				cwd: ROOT,
+				env: { ...Bun.env, NARRAFORK_HOME: join(root, "home"), NARRAFORK_LOG_LEVEL: "error" },
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 300_000,
+			});
+			expect(child.exitCode, child.stderr.toString()).toBe(0);
+			const report = JSON.parse(child.stdout.toString());
+			expect(report.status).toBe("ok");
+			expect(report.targetMigrations).toEqual([
+				{ tag: target.tag, hash: sha256(join(ROOT, "drizzle", `${target.tag}.sql`)) },
+			]);
+			expect(report.backupSha256).toBe(originalHash);
+			expect(report.sourceSha256).toBe(sourceHash);
+			expect(report.commit).toBe(commit);
+			expect(report.version).toBe(version);
+			expect(report.checks).toMatchObject({
+				schemaMatchesFresh: true,
+				rowCountsPreserved: true,
+				affectedFieldsPreserved: true,
+				idempotent: true,
+			});
+			expect(sha256(original)).toBe(originalHash);
+			const upgraded = new Database(validation, { readonly: true });
+			try {
+				expect(
+					upgraded
+						.query(
+							"SELECT id, created_at, updated_at, traits, next_seq, turn_ended_at FROM narrators",
+						)
+						.get(),
+				).toEqual({ ...before, turn_ended_at: null });
 			} finally {
 				upgraded.close();
 			}

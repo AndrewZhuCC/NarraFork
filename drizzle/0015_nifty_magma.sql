@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `turn_ended_at` text;

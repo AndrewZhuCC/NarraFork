@@ -254,8 +254,8 @@ def main():
                                      [item['name'] for item in pending_files])
         assert [item['name'] for item in pending_files] in (
             ['0012_curved_bloodstorm.sql'], ['0013_omniscient_dormammu.sql'],
-            ['0014_blue_tomorrow_man.sql'],
-        ), ('Validation is limited to a single reviewed migration (0012, 0013 or 0014)',
+            ['0014_blue_tomorrow_man.sql'], ['0015_nifty_magma.sql'],
+        ), ('Validation is limited to a single reviewed migration (0012, 0013, 0014 or 0015)',
             [item['name'] for item in pending_files])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)

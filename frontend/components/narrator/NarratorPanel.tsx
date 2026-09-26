@@ -1738,26 +1738,36 @@ export function NarratorPanel({
 	// --- Turn elapsed timer ---
 	// Hooks must stay above the `if (!narrator) return` early exit below.
 	const turnStartedAt = narrator?.turnStartedAt as string | null | undefined;
-	const narratorUpdatedAt = narrator?.updatedAt as string | null | undefined;
+	const turnEndedAt = narrator?.turnEndedAt as string | null | undefined;
+	const validTurnEndedAt =
+		turnEndedAt && Number.isFinite(Date.parse(turnEndedAt)) ? turnEndedAt : null;
+	const isTurnRunning = isWorking || isWaiting;
 	const [turnElapsed, setTurnElapsed] = useState<number | null>(null);
 	useEffect(() => {
 		const update = () => {
+			if (!isTurnRunning && !validTurnEndedAt) {
+				setTurnElapsed(null);
+				return;
+			}
 			const elapsedMs = calculateEffectiveTurnElapsedMs({
 				turnStartedAt,
-				endAt: showWorkIndicator ? undefined : narratorUpdatedAt,
+				endAt: isTurnRunning ? undefined : validTurnEndedAt,
 				nowMs: Date.now(),
 				substatus,
 			});
 			setTurnElapsed(elapsedMs == null ? null : Math.floor(elapsedMs / 1000));
 		};
 		update();
-		if (!turnStartedAt || !showWorkIndicator) return;
+		if (!turnStartedAt || !isTurnRunning) return;
 		const id = setInterval(update, 1000);
 		return () => clearInterval(id);
-	}, [turnStartedAt, showWorkIndicator, narratorUpdatedAt, substatus]);
+	}, [turnStartedAt, isTurnRunning, validTurnEndedAt, substatus]);
 	const turnElapsedText = useMemo(
-		() => (turnElapsed == null ? null : formatColonDuration(turnElapsed)),
-		[turnElapsed],
+		() =>
+			turnElapsed == null || !turnStartedAt || (!isTurnRunning && !validTurnEndedAt)
+				? null
+				: formatColonDuration(turnElapsed),
+		[turnElapsed, turnStartedAt, isTurnRunning, validTurnEndedAt],
 	);
 	const turnStartedAtLabel = useMemo(() => {
 		if (!turnStartedAt) return null;

@@ -2558,6 +2558,10 @@ const sqliteNarratorPersistence = {
 							// provider diagnostics actually told us whether a retry is worthwhile.
 							errorRetryable: normalizedErrorMessage ? (normalizedErrorRetryable ?? null) : null,
 							updatedAt: now,
+							turnEndedAt:
+								status === "working" || status === "waiting"
+									? null
+									: sql`CASE WHEN ${narrators.status} IN ('working', 'waiting') AND ${narrators.turnStartedAt} IS NOT NULL THEN ${now} ELSE ${narrators.turnEndedAt} END`,
 							...(turnStartedAt !== undefined && { turnStartedAt }),
 							...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
 						})
@@ -2731,6 +2735,8 @@ const sqliteNarratorPersistence = {
 		// The execution generation to broadcast on the terminal (done/unread)
 		// transition so clients can dedup notifications per turn (see updateStatus).
 		let broadcastTurnStartedAt: string | undefined;
+		const turnEndedAtUpdate =
+			"turn_ended_at = CASE WHEN ? IN ('working', 'waiting') THEN NULL WHEN status IN ('working', 'waiting') AND turn_started_at IS NOT NULL THEN ? ELSE turn_ended_at END";
 		const placeholders = expected.map(() => "?").join(",");
 		const runCompareAndSet = async () => {
 			if (requestedSubstatus !== undefined) {
@@ -2759,13 +2765,17 @@ const sqliteNarratorPersistence = {
 					sqlite
 						.prepare(
 							substatusJson !== undefined
-								? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
-								: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+								? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ?, ${turnEndedAtUpdate} WHERE id = ? AND status IN (${placeholders})`
+								: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ?, ${turnEndedAtUpdate} WHERE id = ? AND status IN (${placeholders})`,
 						)
 						.run(
 							...(substatusJson !== undefined
-								? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
-								: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
+								? [newStatus, normalizedErrorMessage, substatusJson, now]
+								: [newStatus, normalizedErrorMessage, now]),
+							newStatus,
+							now,
+							narratorId,
+							...expected,
 						),
 				{ label: "compareAndSetStatus.write", maxRetries: 5 },
 			);

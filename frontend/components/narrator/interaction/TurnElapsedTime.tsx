@@ -41,11 +41,12 @@ export const TurnElapsedTime = memo(function TurnElapsedTime({
 	const { t, i18n } = useTranslation("narrator");
 	// Derive from current props during render: switching narrator/turn or stopping
 	// must not display the previous turn's cached elapsed value for one commit.
+	const validEndAt = endAt && Number.isFinite(Date.parse(endAt)) ? endAt : null;
 	const elapsedMs =
-		turnStartedAt != null
+		turnStartedAt != null && (running || validEndAt)
 			? calculateEffectiveTurnElapsedMs({
 					turnStartedAt,
-					endAt: running ? undefined : endAt,
+					endAt: running ? undefined : validEndAt,
 					nowMs: Date.now(),
 					substatus,
 				})
