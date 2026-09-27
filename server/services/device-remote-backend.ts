@@ -82,6 +82,7 @@ export interface RemoteBackendOptions {
 class RemoteExecHandle implements ExecHandle {
 	readonly pid = undefined;
 	private exitedFlag = false;
+	private truncatedFlag = false;
 	private dataCbs: Array<(chunk: Uint8Array) => void> = [];
 	private abort = new AbortController();
 	readonly exited: Promise<number | null>;
@@ -93,11 +94,18 @@ class RemoteExecHandle implements ExecHandle {
 		timeoutMs: number,
 		maxBytes: number,
 	) {
-		// Bridge the caller's abort signal into our internal one.
+		// The session signal can outlive hundreds of completed Bash calls. Detach
+		// this bridge on every terminal path, not just when the owner aborts.
+		const onAbort = () => this.abort.abort();
 		if (params.signal) {
 			if (params.signal.aborted) this.abort.abort();
-			else params.signal.addEventListener("abort", () => this.abort.abort(), { once: true });
+			else params.signal.addEventListener("abort", onAbort, { once: true });
 		}
+		const cleanup = () => {
+			this.exitedFlag = true;
+			params.signal?.removeEventListener("abort", onAbort);
+			this.dataCbs.length = 0;
+		};
 
 		this.exited = sendRpc(
 			deviceId,
@@ -120,11 +128,14 @@ class RemoteExecHandle implements ExecHandle {
 			},
 		).then(
 			(result) => {
-				this.exitedFlag = true;
+				cleanup();
+				// The executor reports truncation (byte cap, force-closed inherited
+				// pipes, abandoned queue); surface it rather than drop it.
+				this.truncatedFlag = (result as ExecStartResult)?.truncated === true;
 				return (result as ExecStartResult)?.exitCode ?? null;
 			},
 			(err) => {
-				this.exitedFlag = true;
+				cleanup();
 				throw err;
 			},
 		);
@@ -136,6 +147,10 @@ class RemoteExecHandle implements ExecHandle {
 
 	isExited(): boolean {
 		return this.exitedFlag;
+	}
+
+	outputIncomplete(): boolean {
+		return this.truncatedFlag;
 	}
 
 	async kill(): Promise<void> {

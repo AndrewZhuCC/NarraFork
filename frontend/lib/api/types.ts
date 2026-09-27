@@ -7,6 +7,7 @@ export type {
 import type { TextCitation } from "@shared/citations";
 import type { FileReference, FileReferenceContext } from "@shared/file-reference";
 import type { LocalizedValue } from "@shared/i18n-locales";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
@@ -562,6 +563,8 @@ export interface SubagentActivitySummary {
 	model: string | null;
 	/** Effective tier, already resolving a null narrator override through the global default. */
 	reasoningEffort?: string | null;
+	/** Last run's follow/fallback decision for `__parent__` children. */
+	modelInheritance?: SubagentModelInheritance;
 	latestToolCalls: SubagentToolCallHeader[];
 	/** Bounded file-change summary projected for the child activity card. */
 	fileChanges?: SubagentFileChanges;
@@ -665,6 +668,8 @@ export interface BaseContentBlock {
 	 * stops appearing after a restart.
 	 */
 	_takenOver?: boolean;
+	/** Client-only live block: this body existed in an accepted catch-up snapshot. */
+	_streamAnimSnapshotEpoch?: number;
 	/** Source citations on assistant text blocks, indexed against `text`. */
 	citations?: TextCitation[];
 	fileReferenceContext?: FileReferenceContext;
@@ -987,6 +992,13 @@ export interface TreeMessage {
 	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
 	 */
 	liveBlockIndex?: number;
+	/**
+	 * Client-only synthetic row: animation baseline of the last accepted text
+	 * snapshot. Travels with this message through the layout commit, so new
+	 * animation identity can never be paired with the preceding layout's body.
+	 * Not part of the persisted message or server protocol.
+	 */
+	_streamAnimSnapshotEpoch?: number;
 }
 
 export interface PaginatedNarrators {

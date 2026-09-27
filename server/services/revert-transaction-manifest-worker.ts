@@ -70,6 +70,8 @@ if (port) {
 			});
 		}
 	});
+	// The caller may probe compiled entry paths, but must never dispatch before this handshake.
+	port.postMessage({ type: "revert-manifest-worker-ready", version: 1 });
 }
 
 /** Also works for terminal journals: applying twice cannot bypass the original UI consent. */
@@ -416,9 +418,11 @@ function validate(
 					equal(file.desired, row?.desiredStateJson),
 				"FILE_METADATA",
 			);
+			// Filesystem grammars only. The caller's scopeIdentity() additionally binds
+			// every file to the live local backend's flavor before any target IO.
 			check(
 				file.identity.deviceId === "local" &&
-					file.identity.pathFlavor === "posix" &&
+					(file.identity.pathFlavor === "posix" || file.identity.pathFlavor === "windows") &&
 					file.identity.objectRole === "referent",
 				"UNSUPPORTED_TARGET",
 			);

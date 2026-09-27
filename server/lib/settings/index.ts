@@ -11,7 +11,13 @@ import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
-import { bindModelCatalogSettings, startModelCatalogDailyCheck, reconcileLegacyWindowSettings, markLegacyWindowSettingsSaved, settingsWithRawModelCatalog } from "../model-catalog";
+import {
+	bindModelCatalogSettings,
+	markLegacyWindowSettingsSaved,
+	reconcileLegacyWindowSettings,
+	settingsWithRawModelCatalog,
+	startModelCatalogDailyCheck,
+} from "../model-catalog";
 import { getNarraforkHome } from "../narrafork-home";
 import {
 	normalizeDefaultNarratorVisibility,
@@ -292,6 +298,23 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	// Old installs persisted 16, overriding the raised default forever. Record this
+	// migration once so an operator can still deliberately choose 16 afterwards.
+	if (merged.devices && (raw.devices?.rpcConcurrencyDefaultsVersion ?? 0) < 1) {
+		if (raw.devices?.maxConcurrentRpcPerDevice === 16) {
+			const next = DEFAULTS.devices?.maxConcurrentRpcPerDevice ?? 64;
+			merged.devices.maxConcurrentRpcPerDevice = next;
+			// Also catches a deliberate 16 set before this migration existed, so leave
+			// a trace; setting 16 again afterwards is preserved.
+			logger.info("Migrated devices.maxConcurrentRpcPerDevice to the raised default", {
+				from: 16,
+				to: next,
+			});
+		}
+		merged.devices.rpcConcurrencyDefaultsVersion = 1;
+		needsSave = true;
+	}
+
 	// Raise the superseded 1MB raw-dump ceiling.
 	//
 	// 1MB was the old default and is below the size of essentially any request worth
@@ -471,7 +494,6 @@ function loadSettingsFromDisk(): NarraForkSettings {
 
 	// Pricing lives in its own module so cost attribution does not have to pull in
 	// the settings module graph; push the operator overrides into it on load.
-
 
 	return merged;
 }
@@ -756,7 +778,9 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
-		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), { mode: 0o600 });
+		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
+			mode: 0o600,
+		});
 		renameSync(tempPath, settingsPath);
 	} catch (error) {
 		rmSync(tempPath, { force: true });

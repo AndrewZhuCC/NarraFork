@@ -305,11 +305,12 @@ export interface ExactRowProps {
 	/**
 	 * Generation of the current mount, for the fade's animation-store scope.
 	 *
-	 * Part of the row's memo signature by construction (it is a prop), which matters:
-	 * the epoch changes exactly once per mount / narrator switch, and the frame that
-	 * carries the new value is the one that must seal.
+	 * Explicitly compared by the memo signature: the frame carrying a new epoch
+	 * must seal even when its measured geometry and text are unchanged.
 	 */
 	streamAnimMountEpoch?: number;
+	/** Accepted snapshot baseline paired with the currently committed layout. */
+	streamAnimSnapshotEpoch?: number;
 	/**
 	 * This row's Dynamic Spec task state is LIVE: it is the newest spec-task surface
 	 * in the document AND the narrator is running, so its `doing` row is describing
@@ -371,6 +372,7 @@ export const ExactRow = memo(
 		viewControls,
 		animateStreaming,
 		streamAnimMountEpoch,
+		streamAnimSnapshotEpoch,
 		specTaskLive,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
@@ -642,6 +644,7 @@ export const ExactRow = memo(
 			specKey: item.spec.key,
 			narratorId,
 			...(streamAnimMountEpoch != null ? { mountEpoch: streamAnimMountEpoch } : {}),
+			...(streamAnimSnapshotEpoch != null ? { snapshotEpoch: streamAnimSnapshotEpoch } : {}),
 		});
 		if (streamAnim) Object.assign(extra, streamAnim);
 		// Subagent card's in-card "open full session" button. RenderSubagent has
@@ -669,7 +672,7 @@ export const ExactRow = memo(
 												"This older message has no receipt link. Opened the recipient's session instead.")
 											: reason === "unavailable"
 												? (labels?.communicationReceiptUnavailable ??
-													"The message has not been received yet or is no longer available. Please try again later.")
+													"The message has not been received yet or is no longer available. Opened the recipient's session without jumping to a message.")
 												: (labels?.communicationReceiptError ??
 													"Could not locate the received message."),
 								}),
@@ -975,6 +978,9 @@ export const ExactRow = memo(
 		prev.askInPassingPending === next.askInPassingPending &&
 		prev.onOpenAskInPassingTarget === next.onOpenAskInPassingTarget &&
 		prev.viewControls === next.viewControls &&
+		prev.animateStreaming === next.animateStreaming &&
+		prev.streamAnimMountEpoch === next.streamAnimMountEpoch &&
+		prev.streamAnimSnapshotEpoch === next.streamAnimSnapshotEpoch &&
 		// The spinner gate: it flips when the narrator settles or when a newer task
 		// surface arrives, and neither moves `measured` (a glyph swap is
 		// height-neutral). Without this term the previous live row keeps spinning

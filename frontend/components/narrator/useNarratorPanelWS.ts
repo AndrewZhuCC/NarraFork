@@ -1460,6 +1460,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, model } : old,
 				);
 			},
+			onModelInheritanceChanged: (modelInheritance) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, modelInheritance } : old,
+				);
+			},
 			onSubagentSuspended: (subagentNarratorId: string) => {
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},

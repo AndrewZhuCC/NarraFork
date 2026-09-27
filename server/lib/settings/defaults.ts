@@ -215,7 +215,8 @@ export const DEFAULTS: NarraForkSettings = {
 		globalDefaultDeviceId: null,
 		rpcTimeoutMs: 120_000,
 		maxRpcBytes: 10 * 1024 * 1024,
-		maxConcurrentRpcPerDevice: 16,
+		maxConcurrentRpcPerDevice: 64,
+		rpcConcurrencyDefaultsVersion: 1,
 		transferChunkBytes: 1024 * 1024,
 		transferConcurrency: 4,
 		maxConcurrentTransfersPerDevice: 2,
@@ -399,7 +400,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 	},
 	"devices.maxConcurrentRpcPerDevice": {
-		desc: "每个设备允许的最大并发 RPC 数。",
+		desc: "每个设备允许的最大并发短 RPC 数，默认 64。长期打开的 PTY 会话（pty.open）不占用此配额，但 pty.write/resize/kill 等短调用仍会占用。",
+		type: "number",
+	},
+	"devices.rpcConcurrencyDefaultsVersion": {
+		desc: "RPC 并发默认值的一次性迁移版本（系统内部使用）。",
 		type: "number",
 	},
 	"devices.transferChunkBytes": {
