@@ -12,11 +12,13 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0013_omniscient_dormammu",
 	"0014_blue_tomorrow_man",
 	"0015_nifty_magma",
+	"0016_high_shiva",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
 	"0014_blue_tomorrow_man",
 	"0015_nifty_magma",
+	"0016_high_shiva",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
 
@@ -129,6 +131,9 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0016_high_shiva") {
+		return { narrator_message_refs: tableDigest(db, "narrator_message_refs") };
+	}
 	if (targetTag === "0015_nifty_magma") {
 		return {
 			narrators: tableDigest(db, "narrators", excludeNew ? new Set(["turn_ended_at"]) : new Set()),
@@ -201,6 +206,32 @@ function tableSchemaShape(db: Database, table: string): Record<string, unknown> 
 	};
 }
 
+function narratorRefsIndexShape(db: Database) {
+	const name = "idx_narrator_refs_narrator_id";
+	const index = (
+		db.query(`PRAGMA index_list(${quoteIdentifier("narrator_message_refs")})`).all() as Array<{
+			name: string;
+			unique: number;
+			partial: number;
+		}>
+	).find((row) => row.name === name);
+	if (!index || index.unique !== 0 || index.partial !== 0) {
+		throw new Error(`${name} must exist and be non-unique and non-partial`);
+	}
+	const indexColumns = (
+		db.query(`PRAGMA index_info(${quoteIdentifier(name)})`).all() as Array<{
+			seqno: number;
+			name: string | null;
+		}>
+	)
+		.sort((left, right) => left.seqno - right.seqno)
+		.map((row) => row.name);
+	if (JSON.stringify(indexColumns) !== JSON.stringify(["narrator_id", "id"])) {
+		throw new Error(`${name} columns must be narrator_id, id in that order`);
+	}
+	return { name: index.name, unique: index.unique, partial: index.partial, columns: indexColumns };
+}
+
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
 	const shape: Record<string, unknown> = {
 		fileChangeScopeRecoveries: tableSchemaShape(db, "file_change_scope_recoveries"),
@@ -208,6 +239,9 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0016_high_shiva") {
+		shape["narrator_message_refs.idx_narrator_refs_narrator_id"] = narratorRefsIndexShape(db);
+	}
 	if (targetTag === "0015_nifty_magma") {
 		shape["narrators.turn_ended_at"] = columnShape(db, "narrators", "turn_ended_at");
 	}

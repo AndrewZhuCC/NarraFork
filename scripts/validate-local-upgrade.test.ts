@@ -262,30 +262,52 @@ describe("validate-local-upgrade", () => {
 		}
 	}, 300_000);
 
-	test("validates migration 0015 without changing existing narrator data", async () => {
-		const root = mkdtempSync(join(tmpdir(), "nf-local-upgrade-0015-"));
+	async function validateTailMigration(targetTag: "0015_nifty_magma" | "0016_high_shiva") {
+		const root = mkdtempSync(join(tmpdir(), `nf-local-upgrade-${targetTag.slice(0, 4)}-`));
 		try {
 			const migrations = join(root, "drizzle");
 			cpSync(join(ROOT, "drizzle"), migrations, { recursive: true });
 			const journalPath = join(migrations, "meta/_journal.json");
 			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-			const target = journal.entries.pop() as { tag: string };
-			expect(target.tag).toBe("0015_nifty_magma");
+			const migrationIndex = journal.entries.findIndex(
+				(entry: { tag: string }) => entry.tag === targetTag,
+			);
+			if (migrationIndex < 0) throw new Error(`Missing ${targetTag} migration fixture`);
+			const target = journal.entries[migrationIndex] as { tag: string };
+			for (const entry of journal.entries.splice(migrationIndex) as Array<{ tag: string }>) {
+				rmSync(join(migrations, `${entry.tag}.sql`));
+			}
 			writeFileSync(journalPath, JSON.stringify(journal));
-			rmSync(join(migrations, `${target.tag}.sql`));
 
 			const original = join(root, "backup.db");
 			const db = new Database(original);
 			db.exec("PRAGMA foreign_keys=ON");
 			applyPendingMigrationsByHash(db, migrations);
 			await applySqliteDataBackfills(db);
+			const narratorId = `narrator-${targetTag.slice(0, 4)}`;
 			db.run(
 				"INSERT INTO narrators (id, created_at, updated_at, traits, next_seq) VALUES (?, ?, ?, ?, ?)",
-				["narrator-0015", "2026-09-21T00:00:00Z", "2026-09-22T00:00:00Z", '["standalone"]', 17],
+				[narratorId, "2026-09-21T00:00:00Z", "2026-09-22T00:00:00Z", '["standalone"]', 17],
 			);
 			const before = db
 				.query("SELECT id, created_at, updated_at, traits, next_seq FROM narrators")
 				.get();
+			if (targetTag === "0016_high_shiva") {
+				expect(
+					db
+						.query("SELECT name FROM sqlite_master WHERE name='idx_narrator_refs_narrator_id'")
+						.get(),
+				).toBeNull();
+				db.run(
+					"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, ?, ?, ?)",
+					["message-0016", narratorId, "user", "[]", "2026-09-21T00:00:00Z"],
+				);
+				db.run(
+					"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)",
+					["ref-0016", narratorId, "message-0016", 7],
+				);
+			}
+			const beforeRef = db.query("SELECT * FROM narrator_message_refs WHERE id='ref-0016'").get();
 			db.close();
 
 			journal.entries.push(target);
@@ -345,18 +367,56 @@ describe("validate-local-upgrade", () => {
 			expect(sha256(original)).toBe(originalHash);
 			const upgraded = new Database(validation, { readonly: true });
 			try {
-				expect(
-					upgraded
-						.query(
-							"SELECT id, created_at, updated_at, traits, next_seq, turn_ended_at FROM narrators",
-						)
-						.get(),
-				).toEqual({ ...before, turn_ended_at: null });
+				if (targetTag === "0016_high_shiva") {
+					expect(beforeRef).not.toBeNull();
+					const index = (
+						upgraded.query("PRAGMA index_list('narrator_message_refs')").all() as Array<{
+							name: string;
+							unique: number;
+							partial: number;
+						}>
+					).find((row) => row.name === "idx_narrator_refs_narrator_id");
+					expect(index).toMatchObject({
+						name: "idx_narrator_refs_narrator_id",
+						unique: 0,
+						partial: 0,
+					});
+					const indexColumns = (
+						upgraded.query("PRAGMA index_info('idx_narrator_refs_narrator_id')").all() as Array<{
+							seqno: number;
+							name: string | null;
+						}>
+					)
+						.sort((left, right) => left.seqno - right.seqno)
+						.map((row) => row.name);
+					expect(indexColumns).toEqual(["narrator_id", "id"]);
+					expect(
+						upgraded.query("SELECT * FROM narrator_message_refs WHERE id='ref-0016'").get(),
+					).toEqual(beforeRef);
+				} else {
+					expect(
+						upgraded
+							.query(
+								"SELECT id, created_at, updated_at, traits, next_seq, turn_ended_at FROM narrators",
+							)
+							.get(),
+					).toEqual({ ...before, turn_ended_at: null });
+				}
 			} finally {
 				upgraded.close();
 			}
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	}, 300_000);
+	}
+	test(
+		"validates migration 0015 without changing existing narrator data",
+		() => validateTailMigration("0015_nifty_magma"),
+		300_000,
+	);
+	test(
+		"validates migration 0016 without changing existing refs",
+		() => validateTailMigration("0016_high_shiva"),
+		300_000,
+	);
 });

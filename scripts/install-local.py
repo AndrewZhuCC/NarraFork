@@ -228,8 +228,8 @@ def main():
                                      [entry['tag'] for entry in pending])
         assert [entry['tag'] for entry in pending] in (
             ['0012_curved_bloodstorm'], ['0013_omniscient_dormammu'],
-            ['0014_blue_tomorrow_man'], ['0015_nifty_magma'],
-        ), ('Validation is limited to a single reviewed migration (0012, 0013, 0014 or 0015)',
+            ['0014_blue_tomorrow_man'], ['0015_nifty_magma'], ['0016_high_shiva'],
+        ), ('Validation is limited to a single reviewed migration (0012, 0013, 0014, 0015 or 0016)',
             [entry['tag'] for entry in pending])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
