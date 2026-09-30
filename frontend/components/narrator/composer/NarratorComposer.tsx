@@ -50,7 +50,10 @@ import {
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
-import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
+import {
+	TextareaOptimizeControls,
+	textareaOptimizeControlsWidth,
+} from "./TextareaOptimizeControls";
 
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 
@@ -1106,13 +1109,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							onContextMessageCountChange={optimizeHook.setContextMessageCount}
 						/>
 					}
-					rightSectionWidth={64}
-					styles={{
-						section: {
-							alignItems: "center",
-							paddingRight: 8,
-						},
-					}}
+					// Reserve the controls' actual width. Mantine does not measure a rightSection: it writes this
+					// value straight into the input's `padding-inline-end`, and the literal "auto" made that
+					// declaration invalid, so the buttons covered the tail of the text instead of sitting beside it.
+					rightSectionWidth={textareaOptimizeControlsWidth(true)}
 				/>
 				<ComposerFullscreenModal
 					opened={fullscreenOpened}

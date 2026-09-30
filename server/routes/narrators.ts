@@ -21,6 +21,7 @@ import {
 	count as countFn,
 	desc,
 	eq,
+	exists,
 	gt,
 	gte,
 	inArray,
@@ -55,6 +56,7 @@ import {
 import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
+import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
@@ -303,6 +305,7 @@ import {
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
+import { reconstructToolExecutionTarget } from "../services/narrator-persistence";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
 	answerAsyncQuestion,
@@ -4174,6 +4177,22 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				...(parentToolUseId ? { toolUseId: parentToolUseId } : {}),
 			});
 
+		// A suspended foreground runner retains its loop flag and abort controller.
+		// Settle its control wait before treating those as an executing turn; a pending
+		// stop alone cannot wake the runner to consume that marker.
+		if (isManualOverride(id)) {
+			const finalText = await getSubagentFinalText(id);
+			const hasError = parseSubstatus(narrator.substatus).includes("error");
+			if (resolveManualOverride(id, finalText, hasError)) {
+				clearTakenOver(id);
+				await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+				await broadcastReleased();
+				return c.json({ stopped: true, deferred: false });
+			}
+			// Resume may have claimed the wait during the lookup. Re-probe the live
+			// runner below and defer handoff to that turn instead of releasing twice.
+		}
+
 		// Probe after the awaited lookups, immediately before marking the
 		// handoff. A loop can finish while those awaits yield. Its CURRENT owner,
 		// not the mode it originally started in, decides who must settle the result.
@@ -4232,17 +4251,6 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		// Idle — resolve the parent's blocked Promise immediately with the current result.
 		const finalText = await getSubagentFinalText(id);
 		const hasError = parseSubstatus(narrator.substatus).includes("error");
-
-		// Foreground-loop takeover: the parent is blocked in waitForManualOverride.
-		// Resolve it directly; the parent's runForegroundLoop finalizer returns the
-		// result and cleans up status.
-		if (isManualOverride(id)) {
-			clearTakenOver(id);
-			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-			resolveManualOverride(id, finalText, hasError);
-			await broadcastReleased();
-			return c.json({ stopped: true, deferred: false });
-		}
 
 		// Session-engine takeover (e.g. continued from a manual_override): the parent
 		// was already unblocked when the user continued the subagent, and a conclusion
@@ -6154,20 +6162,50 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 	// and serializing that on every refresh is synchronous main-thread work for a picker
 	// nobody scrolls that far back in. The newest window is the useful one, so take the
 	// tail and re-sort ascending for the UI.
+	//
+	// The ref window is taken FIRST, as its own subquery, and only then joined to the
+	// message row for `role`/`createdAt`. Written the other way round — join first, then
+	// `ORDER BY ref.seq DESC LIMIT n` — the planner drove from `narrator_messages` through
+	// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL` predicate
+	// matches ~90% of every message in the database, and sorted this narrator's entire ref
+	// set in a temp B-tree to read 500 rows: ~300ms. Driving from `idx_narrator_refs_seq`
+	// makes the ORDER BY free and lets the LIMIT stop the scan early: 3.3ms, identical rows.
+	// The EXISTS is not decoration here — with the join still in place the planner ignores
+	// it and keeps the bad plan, so this query needs the refs-first shape rather than a
+	// predicate swap (unlike the ref-only queries in narrator-session.ts).
+	const newestRefPage = db
+		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				exists(
+					db
+						.select({ one: sql`1` })
+						.from(narratorMessages)
+						.where(
+							and(
+								eq(narratorMessages.id, narratorMessageRefs.messageId),
+								isNull(narratorMessages.parentToolUseId),
+							),
+						),
+				),
+			),
+		)
+		.orderBy(desc(narratorMessageRefs.seq))
+		.limit(FILE_MODIFICATION_TIMELINE_LIMIT + 1)
+		.as("newest_ref_page");
+
 	const newestRefs = await db
 		.select({
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
+			messageId: newestRefPage.messageId,
+			seq: newestRefPage.seq,
 			role: narratorMessages.role,
 			createdAt: narratorMessages.createdAt,
 		})
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), isNull(narratorMessages.parentToolUseId)),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(FILE_MODIFICATION_TIMELINE_LIMIT + 1);
+		.from(newestRefPage)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, newestRefPage.messageId))
+		.orderBy(desc(newestRefPage.seq));
 
 	const timelineTruncated = newestRefs.length > FILE_MODIFICATION_TIMELINE_LIMIT;
 	const windowRefs = timelineTruncated
@@ -6677,9 +6715,47 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 			canonicalFilePath: true,
 			runtimeGeneration: true,
 			executionTargetsJson: true,
+			deviceSelectionSource: true,
 		},
 	});
 	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
+
+	// StructSed records no replayable file identity until it has written, and its pending
+	// input is a selector (symbol / address) rather than text. Preview it by re-running the
+	// tool's own pipeline as a dry run against the frozen target: that reads the file and
+	// resolves the address exactly as the approved call will, and writes nothing.
+	if (toolCall.toolName === "StructSed") {
+		const input =
+			toolCall.inputJson &&
+			typeof toolCall.inputJson === "object" &&
+			!Array.isArray(toolCall.inputJson)
+				? (toolCall.inputJson as Record<string, unknown>)
+				: null;
+		if (!input) return c.json({ error: "Tool call has no input" }, 400);
+		const target = reconstructToolExecutionTarget(toolCall);
+		const cwd = target?.cwd ?? (await resolveNarratorCwd(narratorId));
+		if (!cwd) return c.json({ error: "Tool call has no working directory" }, 409);
+		const outcome = await previewStructSedChange(input, {
+			narratorId,
+			cwd,
+			signal: c.req.raw.signal,
+			locale: (await getUserLanguage(c.get("user").sub)) as Locale,
+			requestPermission: async () => ({ behavior: "deny", message: "preview only" }),
+			...(target ? { executionTarget: target } : {}),
+		});
+		if ("error" in outcome) {
+			return c.json({ error: outcome.error, code: "STRUCT_SED_PREVIEW_FAILED" }, 409);
+		}
+		return c.json({
+			deviceId: target?.deviceId ?? "local",
+			filePath: outcome.preview.filePath,
+			currentContent: outcome.preview.before,
+			previewContent: outcome.preview.after,
+			diffWindow: outcome.window,
+			toolName: toolCall.toolName,
+			inputJson: toolCall.inputJson,
+		});
+	}
 
 	let identity: DeviceFileIdentity | null;
 	try {

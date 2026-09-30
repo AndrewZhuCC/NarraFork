@@ -15,7 +15,7 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, exists, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
@@ -212,6 +212,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
+	resolveNarratorAdmissionRoot,
 	updateActiveSubagentModel,
 	updateActiveSubagentReasoningEffort,
 	waitForNarratorAdmissionWork,
@@ -4374,6 +4375,35 @@ export async function startParentInboundContinuationIfPossible(
  */
 const RETRY_TAIL_SCAN_LIMIT = 10;
 
+/**
+ * `narrator_message_refs` stores only the reference; "is this a real top-level turn?"
+ * lives on the message row (its `parent_tool_use_id` and `role`). Expressed as a
+ * correlated EXISTS rather than a join, deliberately.
+ *
+ * Joining the message row put `parent_tool_use_id IS NULL` in the WHERE clause, which
+ * the planner satisfied by driving FROM `narrator_messages` through
+ * `idx_messages_parent_tool_use_lookup` — a predicate matching ~90% of every message in
+ * the database — then looking up each ref and sorting the narrator's whole ref set in a
+ * temp B-tree just to read a handful of rows (281-293ms on a 131k-message library).
+ * As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order and stops after
+ * the LIMIT, answering each probe from the message primary key: 0.00-0.01ms, with
+ * row-for-row identical results on the three largest narrators.
+ */
+function messageRefExists(opts: {
+	roles?: readonly ("user" | "assistant")[];
+	requireTopLevel?: boolean;
+}) {
+	const conditions = [eq(narratorMessages.id, narratorMessageRefs.messageId)];
+	if (opts.requireTopLevel) conditions.push(isNull(narratorMessages.parentToolUseId));
+	if (opts.roles) conditions.push(inArray(narratorMessages.role, [...opts.roles]));
+	return exists(
+		db
+			.select({ one: sql`1` })
+			.from(narratorMessages)
+			.where(and(...conditions)),
+	);
+}
+
 /** Minimal message shape needed to pick the retry target. */
 interface RetryCandidateMessage {
 	id: string;
@@ -4465,13 +4495,11 @@ async function retryLastMessageUnlocked(
 			seq: narratorMessageRefs.seq,
 		})
 		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
 				isNull(narratorMessageRefs.segmentCompactId),
-				isNull(narratorMessages.parentToolUseId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
+				messageRefExists({ roles: ["user", "assistant"], requireTopLevel: true }),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -4927,12 +4955,10 @@ async function reExecuteDeniedToolCallUnlocked(
 	const lastRef = await db
 		.select({ messageId: narratorMessageRefs.messageId })
 		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
-				isSubagent ? undefined : isNull(narratorMessages.parentToolUseId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
+				messageRefExists({ roles: ["user", "assistant"], requireTopLevel: !isSubagent }),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -5438,7 +5464,9 @@ async function rollbackToBlockUnlocked(
 			blocksToDelete,
 			{
 				preserveConversationId: true,
-				skipRevert: opts?.skipRevert,
+				// History-only: file state was already settled in step 0. Also avoids the
+				// per-block rebuild loop inside deleteMessageBlocks.
+				skipRevert: true,
 			},
 		);
 
@@ -6737,18 +6765,17 @@ export async function acquireNarratorRevertAdmission(
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	signal.throwIfAborted();
-	if (isSubagentVariant(narrator.variant)) {
-		throw new AppError(
-			"File revert admission only supports primary narrators",
-			409,
-			"NARRATOR_REVERT_SUBAGENT_UNSUPPORTED",
-		);
-	}
+	// Users drive subagents directly, so a subagent is a valid revert root. It
+	// reserves (and interrupts) only itself: its parent and siblings keep running.
+	// The persisted root still orders it against a revert of the whole team.
+	const isSubagent = isSubagentVariant(narrator.variant);
+	const rootId = isSubagent ? await resolveNarratorAdmissionRoot(narratorId) : narratorId;
+	signal.throwIfAborted();
 	const busy = () => isNarratorRuntimeBusy(narratorId) || compactLocks.has(narratorId);
 	if (!interrupt && (busy() || hasNarratorAdmissionWork(narratorId))) {
 		throw new AppError("Narrator execution has not settled", 409, "NARRATOR_REVERT_BUSY");
 	}
-	const reservation = reserveNarratorRevertAdmission(narratorId);
+	const reservation = reserveNarratorRevertAdmission(narratorId, rootId);
 	let released = false;
 	const releaseAndResume = () => {
 		if (released) return;
@@ -6785,7 +6812,8 @@ export async function acquireNarratorRevertAdmission(
 				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
 					// A soft foreground abort suspends for manual input; a revert needs
 					// the real terminal boundary, including an already-suspended runner.
-					if (owner !== narratorId) interruptForegroundSubagent(owner, { hard: true });
+					if (owner !== narratorId || isSubagent)
+						interruptForegroundSubagent(owner, { hard: true });
 					const controllers = [
 						activeNarrators.get(owner)?.abortController,
 						getBackgroundAbortControllers().get(owner),
@@ -6848,7 +6876,11 @@ export async function interruptAndWaitForIdle(
 	narratorId: string,
 	opts?: { timeoutMs?: number },
 ): Promise<boolean> {
-	const busy = () => isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId);
+	// A manual-override suspension retains the runner but executes no turn. Local
+	// abort cannot wake that wait; the next resumed turn rebuilds history from DB.
+	const busy = () =>
+		!isExecutionSuspended(narratorId) &&
+		(isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId));
 	if (!busy()) return true;
 
 	// A suspended permission request is not something an abort can reach: the loop is

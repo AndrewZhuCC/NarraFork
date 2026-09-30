@@ -62,7 +62,10 @@ import {
 	readFileReferences,
 	trimFileReferenceInput,
 } from "../composer/file-reference-input";
-import { TextareaOptimizeControls } from "../composer/TextareaOptimizeControls";
+import {
+	TextareaOptimizeControls,
+	textareaOptimizeControlsWidth,
+} from "../composer/TextareaOptimizeControls";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
@@ -193,9 +196,16 @@ export function MessageEditorPanel({
 			: [],
 	);
 	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
-	// File references (in-text markers like #file(...))
+	// File references (in-text markers like #file(...)). Like the two initializers
+	// above, the persisted metadata lives on the message's `file_reference` blocks;
+	// `initialText` only carries the surrounding text, so seeding from it yields []
+	// and silently drops every reference the message already had.
 	const [editFileReferences, setEditFileReferences] = useState<FileReference[]>(() =>
-		readFileReferences(initialText),
+		isUser
+			? readFileReferences(
+					blocks.filter((block) => block.type === "file_reference").map((block) => block.reference),
+				)
+			: [],
 	);
 	const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
 
@@ -584,13 +594,8 @@ export function MessageEditorPanel({
 								onContextMessageCountChange={optimizeHook.setContextMessageCount}
 							/>
 						}
-						rightSectionWidth="auto"
-						styles={{
-							section: {
-								alignItems: "center",
-								paddingRight: 8,
-							},
-						}}
+						// Reserved width, not "auto": see textareaOptimizeControlsWidth.
+						rightSectionWidth={textareaOptimizeControlsWidth(true)}
 					/>
 					<Text size="xs" c="dimmed">
 						{t("editAssistantHint")}
@@ -657,13 +662,8 @@ export function MessageEditorPanel({
 								onContextMessageCountChange={optimizeHook.setContextMessageCount}
 							/>
 						}
-						rightSectionWidth="auto"
-						styles={{
-							section: {
-								alignItems: "center",
-								paddingRight: 8,
-							},
-						}}
+						// Reserved width, not "auto": see textareaOptimizeControlsWidth.
+						rightSectionWidth={textareaOptimizeControlsWidth(true)}
 					/>
 					{hasEditImages && (
 						<Group gap="xs">
