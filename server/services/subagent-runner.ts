@@ -627,40 +627,41 @@ export async function announceResumedBackgroundTask(
 	}
 }
 
-export async function commitResumedBackgroundTaskAnnouncement(
+export function commitResumedBackgroundTaskAnnouncement(
 	notice: ResumedBackgroundTaskAnnouncement,
 	finalText: string,
 	tx: import("./agent-runtime/mailbox-types").RuntimeTx,
-): Promise<void> {
+): void | Promise<void> {
 	if (resolveRuntimeQueueBackend() === "postgres") {
-		const pub = getRuntimePublicationService();
-		const run = await pub.getAgentRun(notice.subagentId, notice.parentNarratorId);
-		if (notice.logicalRunId && notice.logicalRunId !== run.logicalRunId) {
-			throw new ValidationError("Stale resumed task publication");
-		}
-		// B2 fix: use carried narrator fields instead of direct db.select(narrators).
-		// The fields were captured at announcement construction time from the narrator
-		// that was already loaded, so no SQLite touch is needed on the PG path.
-		const source =
-			notice.subagentTraits !== undefined
-				? { id: notice.subagentId, traits: notice.subagentTraits, title: notice.subagentTitle }
-				: undefined;
-		const alias = source
-			? agentLabelFromNarrator(source, notice.parentNarratorId)
-			: notice.subagentId;
-		const title = source?.title?.slice(0, 80) ?? alias;
-		const eventKind = publicationEvent(notice.status) as
-			| "completed"
-			| "failed"
-			| "timed_out"
-			| "cancelled";
-		await pub.commitAgentTerminal({
-			run,
-			eventKind,
-			text: finalText,
-			summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended; use Await({ type: "agent", id: "${alias}" }) for the stored result.`,
-		});
-		return;
+		return (async () => {
+			const pub = getRuntimePublicationService();
+			const run = await pub.getAgentRun(notice.subagentId, notice.parentNarratorId);
+			if (notice.logicalRunId && notice.logicalRunId !== run.logicalRunId) {
+				throw new ValidationError("Stale resumed task publication");
+			}
+			// B2 fix: use carried narrator fields instead of direct db.select(narrators).
+			// The fields were captured at announcement construction time from the narrator
+			// that was already loaded, so no SQLite touch is needed on the PG path.
+			const source =
+				notice.subagentTraits !== undefined
+					? { id: notice.subagentId, traits: notice.subagentTraits, title: notice.subagentTitle }
+					: undefined;
+			const alias = source
+				? agentLabelFromNarrator(source, notice.parentNarratorId)
+				: notice.subagentId;
+			const title = source?.title?.slice(0, 80) ?? alias;
+			const eventKind = publicationEvent(notice.status) as
+				| "completed"
+				| "failed"
+				| "timed_out"
+				| "cancelled";
+			await pub.commitAgentTerminal({
+				run,
+				eventKind,
+				text: finalText,
+				summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended; use Await({ type: "agent", id: "${alias}" }) for the stored result.`,
+			});
+		})();
 	}
 	// SQLite path: use the caller's sync tx.
 	const run = runtimePublication.getAgentRun(notice.subagentId, notice.parentNarratorId, tx);

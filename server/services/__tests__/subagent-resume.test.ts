@@ -96,6 +96,8 @@ beforeAll(async () => {
 	const realSettings = { ...(await import("../../lib/settings")) };
 	const realDbModule = { ...(await import("../../db")) };
 	const realDb = realDbModule.db;
+	const { activateSqliteRuntimePublication } = await import("../agent-runtime/publication");
+	activateSqliteRuntimePublication(realDb);
 	const query = {
 		...realDb.query,
 		narratorMessages: {
