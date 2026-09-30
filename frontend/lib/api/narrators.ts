@@ -1805,8 +1805,16 @@ export const narratorsApi = {
 			filePath: string;
 			currentContent: string | null;
 			previewContent: string | null;
-			/** StructSed only: changed region with context; null when too large to diff. */
-			diffWindow?: { oldText: string; newText: string; startLine: number } | null;
+			/** StructSed only: every changed region with context, each with its own origins. */
+			diffHunks?: Array<{
+				oldText: string;
+				newText: string;
+				oldStart: number;
+				newStart: number;
+				truncated?: true;
+			}>;
+			/** StructSed only: changed regions left out past the server's hunk cap. */
+			diffOmittedHunks?: number;
 			toolName: string;
 			inputJson: Record<string, unknown>;
 		}>(

@@ -20,6 +20,7 @@ import {
 	Loader,
 	Modal,
 	Paper,
+	Stack,
 	Text,
 	Textarea,
 	Tooltip,
@@ -97,25 +98,36 @@ function StructSedChangePreview({ permission }: { permission: PendingPermission 
 			</Text>
 		);
 	}
-	const window = data?.diffWindow;
-	if (!window) {
+	const hunks = data?.diffHunks ?? [];
+	if (hunks.length === 0) {
 		return data ? (
 			<Text size="xs" c="dimmed" mb="xs">
 				{t("fileMod_diffTooLarge")}
 			</Text>
 		) : null;
 	}
-	const filePath = data.filePath ?? "";
+	const language = (data?.filePath ?? "").split(".").pop() ?? "";
+	// One diff per changed region: a move is a removal here and an insertion there, and
+	// showing them as one window would pull in every untouched line between them.
 	return (
-		<Box mb="xs">
-			<DiffView
-				oldStr={window.oldText}
-				newStr={window.newText}
-				startLine={window.startLine}
-				maxHeight={360}
-				language={filePath.split(".").pop() ?? ""}
-			/>
-		</Box>
+		<Stack gap={6} mb="xs">
+			{hunks.map((hunk) => (
+				<DiffView
+					key={`${hunk.oldStart}:${hunk.newStart}`}
+					oldStr={hunk.oldText}
+					newStr={hunk.newText}
+					startLine={hunk.oldStart}
+					newStartLine={hunk.newStart}
+					maxHeight={hunks.length > 1 ? 240 : 360}
+					language={language}
+				/>
+			))}
+			{data?.diffOmittedHunks ? (
+				<Text size="xs" c="dimmed">
+					{t("fileMod_diffHunksOmitted", { count: data.diffOmittedHunks })}
+				</Text>
+			) : null}
+		</Stack>
 	);
 }
 
