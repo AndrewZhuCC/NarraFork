@@ -3446,6 +3446,29 @@ async function executeQueuedControlCommand(
 	}
 }
 
+// Called under start admission after verifying that no live loop owns this failure.
+async function reportQueuedMessageStartFailure(narratorId: string, error: unknown): Promise<void> {
+	const errorMessage = String(error);
+	try {
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage,
+		});
+		broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: errorMessage });
+		broadcastToNarrator(narratorId, {
+			type: "buffer_set",
+			narratorId,
+			messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+		});
+	} catch (reportError) {
+		// The mailbox already owns the input; reporting must not turn acceptance into a failure.
+		logger.warn("Queued message startup failure notification deferred", {
+			narratorId,
+			error: String(reportError),
+		});
+	}
+}
+
 /**
  * HTTP user-input admission. Acceptance is durable, not a promise to own the next
  * turn: an earlier mailbox row or publication barrier must produce 202, not an
@@ -3576,6 +3599,10 @@ export async function acceptUserMessage(
 						messageId: accepted.id,
 						error: String(error),
 					});
+					// isLoopRunning also counts this admission's own tool-replay reservation.
+					if (inputOwner?.isCurrent() && !activeNarrators.get(narratorId)?._loopRunning) {
+						await reportQueuedMessageStartFailure(narratorId, error);
+					}
 				}
 				return queued;
 			} finally {
@@ -4293,19 +4320,26 @@ export async function resumeBufferedMessagesIfIdle(
 		// A live loop (or any other runtime owner) will consume the queue itself.
 		if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
 
-		// Recovery left the row at `working` with nobody behind it; drop it to idle so
-		// the resumed turn transitions honestly instead of stacking onto a zombie.
-		await reconcileRunningStatus(narratorId);
+		try {
+			// Recovery left the row at `working` with nobody behind it; drop it to idle so
+			// the resumed turn transitions honestly instead of stacking onto a zombie.
+			await reconcileRunningStatus(narratorId);
 
-		const narrator = await narratorService.getById(narratorId);
-		if (isSubagentVariant(narrator.variant)) return { resumed: false };
-		if (narrator.status !== "idle") return { resumed: false };
+			const narrator = await narratorService.getById(narratorId);
+			if (isSubagentVariant(narrator.variant)) return { resumed: false };
+			if (narrator.status !== "idle") return { resumed: false };
 
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { resumed: false };
+			const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+			if (active._loopRunning) return { resumed: false };
 
-		const dispatch = await resumeNextBufferedMessageUnlocked(active, locale);
-		return { resumed: true, dispatch };
+			const dispatch = await resumeNextBufferedMessageUnlocked(active, locale);
+			return { resumed: true, dispatch };
+		} catch (error) {
+			if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) {
+				await reportQueuedMessageStartFailure(narratorId, error);
+			}
+			throw error;
+		}
 	});
 	if ("dispatch" in result) await result.dispatch?.();
 	return { resumed: result.resumed };

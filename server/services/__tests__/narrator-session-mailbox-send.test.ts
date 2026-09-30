@@ -63,6 +63,8 @@ mock.module("../../lib/agent/provider", () => ({
 
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { bindRuntimeQueue } = await import("../agent-runtime/runtime-queue-port");
+const { activateSqliteRuntimePublication } = await import("../agent-runtime/publication");
+activateSqliteRuntimePublication(db);
 const {
 	acceptUserMessage,
 	closeNarrator,
@@ -137,6 +139,70 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	providerCalls.length = 0;
 	beforeResponse = undefined;
+});
+
+test.each([
+	"admission",
+	"wake",
+] as const)("preserves queued input and reports prompt-loading failure (%s)", async (entry) => {
+	const narratorId = `mailbox-start-failure-${entry}`;
+	seedNarrator(narratorId);
+	const promptModule = await import("../narrator-prompt");
+	const websocketModule = await import("../../websocket/narrator-ws");
+	const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+	const error = Object.assign(new Error("EPERM: operation not permitted, open 'CLAUDE.md'"), {
+		code: "EPERM",
+	});
+	const promptSpy = spyOn(promptModule, "buildEffectiveSystemPrompt").mockRejectedValue(error);
+	const broadcastSpy = spyOn(websocketModule, "broadcastToNarrator");
+	try {
+		if (entry === "admission") {
+			await expect(acceptUserMessage(narratorId, "keep this input")).resolves.toMatchObject({
+				buffered: true,
+			});
+		} else {
+			await enqueueBufferedMessage(narratorId, "keep this input");
+		}
+		await expect(wakeInboxIfEligible(narratorId)).resolves.toBe(false);
+		const row = db.select().from(narrators).where(eq(narrators.id, narratorId)).get();
+		expect(row?.status).toBe("idle");
+		expect(row?.errorMessage).toContain("EPERM");
+		expect(JSON.parse(row?.substatus ?? "[]")).toContain("error");
+		expect(getExecutionOwner(narratorId)).toBeUndefined();
+		const queued = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.narratorId, narratorId))
+			.all();
+		expect(queued).toHaveLength(1);
+		expect(queued[0]?.state).toBe("queued");
+		expect(queued[0]?.text).toBe("keep this input");
+		expect(providerCalls).toHaveLength(0);
+		expect(broadcastSpy).toHaveBeenCalledWith(
+			narratorId,
+			expect.objectContaining({ type: "narrator_error", error: String(error) }),
+		);
+		expect(broadcastSpy).toHaveBeenCalledWith(
+			narratorId,
+			expect.objectContaining({ type: "buffer_set", messages: expect.any(Array) }),
+		);
+
+		promptSpy.mockRestore();
+		await expect(wakeInboxIfEligible(narratorId)).resolves.toBe(true);
+		await waitForIdle(narratorId);
+		expect(providerCalls).toEqual(["keep this input"]);
+		const delivered = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.narratorId, narratorId))
+			.all();
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.state).toBe("materialized");
+	} finally {
+		promptSpy.mockRestore();
+		broadcastSpy.mockRestore();
+		closeNarrator(narratorId);
+	}
 });
 
 test("consumes earlier cancelled task notices before sending a new idle user input", async () => {
