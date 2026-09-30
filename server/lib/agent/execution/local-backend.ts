@@ -411,9 +411,11 @@ export class LocalBackend implements ExecutionBackend {
 				size: st.size,
 				resolvedPath,
 			};
-		} catch {
+		} catch (error) {
 			throwIfReadAborted(opts?.signal);
-			return null;
+			const code = (error as NodeJS.ErrnoException)?.code;
+			if (code === "ENOENT" || code === "ENOTDIR") return null;
+			throw error;
 		}
 	}
 

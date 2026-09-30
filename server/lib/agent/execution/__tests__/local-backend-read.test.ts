@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -8,6 +8,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathsEqualForOS } from "../../../platform-path";
@@ -36,6 +37,40 @@ afterEach(() => {
 });
 
 describe("LocalBackend atomic bounded reads", () => {
+	test("statFile distinguishes directories from missing paths and non-directory parents", async () => {
+		const root = tempRoot();
+		const file = join(root, "file");
+		writeFileSync(file, "content");
+		const backend = new LocalBackend();
+
+		expect(await backend.statFile(root)).toMatchObject({ isDirectory: true, isFile: false });
+		expect(await backend.statFile(join(root, "missing"))).toBeNull();
+		expect(await backend.statFile(join(file, "child"))).toBeNull();
+	});
+
+	test.each([
+		"EPERM",
+		"EACCES",
+		"EIO",
+	])("statFile propagates %s from canonicalization and stat", async (code) => {
+		const root = tempRoot();
+		const backend = new LocalBackend();
+		const error = Object.assign(new Error(code), { code });
+		const realpath = spyOn(fs, "realpath").mockRejectedValue(error);
+		try {
+			await expect(backend.statFile(root)).rejects.toBe(error);
+		} finally {
+			realpath.mockRestore();
+		}
+
+		const stat = spyOn(fs, "stat").mockRejectedValue(error);
+		try {
+			await expect(backend.statFile(root)).rejects.toBe(error);
+		} finally {
+			stat.mockRestore();
+		}
+	});
+
 	test("keeps POSIX backslashes as filename characters in canonical identity", async () => {
 		if (process.platform === "win32") return;
 		const root = tempRoot();
