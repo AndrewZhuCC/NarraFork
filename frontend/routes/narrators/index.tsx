@@ -37,6 +37,12 @@ const CreateNarratorModal = lazy(() =>
 	})),
 );
 
+const ImportSessionModal = lazy(() =>
+	import("../../components/narrator/session-interchange/ImportSessionModal").then((m) => ({
+		default: m.ImportSessionModal,
+	})),
+);
+
 interface NarratorSearchParams extends NarratorListSearchParams {
 	create?: boolean;
 }
@@ -93,6 +99,7 @@ function NarratorsPage() {
 	);
 	const archiveNarrator = useArchiveNarrator();
 	const [opened, { open, close }] = useDisclosure(false);
+	const [importOpened, { open: openImport, close: closeImport }] = useDisclosure(false);
 	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
@@ -180,6 +187,14 @@ function NarratorsPage() {
 		[navigate],
 	);
 
+	const handleImported = useCallback(
+		(data: { narratorId: string; title: string }) => {
+			addRecentTab({ type: "narrator", id: data.narratorId, title: data.title });
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.narratorId } });
+		},
+		[navigate],
+	);
+
 	return (
 		<Stack>
 			{/* Desktop header */}
@@ -189,6 +204,9 @@ function NarratorsPage() {
 					<NarratorListControls state={listState} onChange={setSearch} includeExtraFilters />
 					<Button variant="subtle" component={Link} to="/narrators/archived">
 						{t("viewArchived")}
+					</Button>
+					<Button variant="default" onClick={openImport}>
+						{t("sessionInterchange.importButton")}
 					</Button>
 					<Button onClick={guardedOpen}>{t("newNarrator")}</Button>
 				</Group>
@@ -200,6 +218,9 @@ function NarratorsPage() {
 					<Title order={3}>{t("title")}</Title>
 					<Group gap="xs">
 						<NarratorListExtraFiltersButton state={listState} onChange={setSearch} />
+						<Button size="xs" variant="default" onClick={openImport}>
+							{t("sessionInterchange.importButton")}
+						</Button>
 						<Button size="xs" onClick={guardedOpen}>
 							{t("newNarrator")}
 						</Button>
@@ -272,6 +293,16 @@ function NarratorsPage() {
 			{opened && (
 				<Suspense fallback={null}>
 					<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
+				</Suspense>
+			)}
+
+			{importOpened && (
+				<Suspense fallback={null}>
+					<ImportSessionModal
+						opened={importOpened}
+						onClose={closeImport}
+						onImported={handleImported}
+					/>
 				</Suspense>
 			)}
 

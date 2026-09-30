@@ -226,6 +226,15 @@ export {
 	updateScheduledTaskSchema,
 } from "./scheduled-tasks";
 export {
+	type SessionLocationInput,
+	sessionExportDownloadQuerySchema,
+	sessionExportToSchema,
+	sessionImportFromPathSchema,
+	sessionImportUploadFieldsSchema,
+	sessionInterchangeFormatSchema,
+	sessionScanQuerySchema,
+} from "./session-interchange";
+export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
