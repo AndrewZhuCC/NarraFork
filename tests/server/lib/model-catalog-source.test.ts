@@ -3,6 +3,7 @@ import { gzipSync } from "node:zlib";
 import {
 	catalogFromArchive,
 	catalogFromModelFiles,
+	CATALOG_REVISION_URL,
 	MAX_CATALOG_BYTES,
 	parseCatalogRevision,
 } from "../../../server/lib/model-catalog/source";
@@ -107,11 +108,16 @@ describe("data-only model directory adapter", () => {
 		).rejects.toThrow();
 	});
 	test("pins a Git SHA and rejects paths in place of revisions", () => {
-		expect(parseCatalogRevision({ sha: version, commit: { committer: { date } } })).toEqual({
-			version,
-			publishedAt: date,
-		});
+		const commit = { sha: version, commit: { committer: { date } } };
+		const url = new URL(CATALOG_REVISION_URL);
+		expect(url.pathname).toBe("/repos/NarraFork/narrafork-model-catalog/commits");
+		expect(url.searchParams.get("sha")).toBe("main");
+		expect(url.searchParams.get("per_page")).toBe("1");
+		expect(parseCatalogRevision([commit])).toEqual({ version, publishedAt: date });
+		expect(parseCatalogRevision(commit)).toEqual({ version, publishedAt: date });
 		for (const value of [
+			[],
+			[commit, commit],
 			null,
 			{},
 			{ sha: "../../evil" },

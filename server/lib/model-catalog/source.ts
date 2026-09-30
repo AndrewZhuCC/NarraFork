@@ -15,13 +15,14 @@ import {
 import { legacyMetadataToRaw } from "@shared/model-catalog/card-resolver";
 
 export const CATALOG_REVISION_URL =
-	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/commits/main";
+	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/commits?sha=main&per_page=1";
 export const CATALOG_ARCHIVE_BASE =
 	"https://codeload.github.com/NarraFork/narrafork-model-catalog/tar.gz/";
 export const MAX_CATALOG_BYTES = 16 * 1024 * 1024;
 
 export function parseCatalogRevision(value: unknown): { version: string; publishedAt: string } {
-	const revision = value as { sha?: string; commit?: { committer?: { date?: string } } } | null;
+	const entry = Array.isArray(value) && value.length === 1 ? value[0] : value;
+	const revision = entry as { sha?: string; commit?: { committer?: { date?: string } } } | null;
 	const version = revision?.sha;
 	const publishedAt = revision?.commit?.committer?.date;
 	if (
