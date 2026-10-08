@@ -42,7 +42,7 @@ import {
 	type VListViewTarget,
 } from "./vlist-content-view-target";
 import type { VListEditRole } from "./vlist-edit-target";
-import type { VListInteractionState } from "./vlist-interaction-state";
+import { textExpansionSignature, type VListInteractionState } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListRowActionTarget, VListRowToolActions } from "./vlist-row-actions";
 import { sameBoundActionKeys, sameNumberList } from "./vlist-row-payload-reuse";
@@ -274,6 +274,7 @@ export function resolveTraceRowIdentity(
 		identity.tool = {
 			toolName: rowIdentity.toolName ?? meta?.toolName ?? "",
 			toolUseId,
+			...(meta?.isRunningBash ? { isRunningBash: true } : {}),
 			...(meta?.filePath ? { filePath: meta.filePath } : {}),
 			...(meta?.isReadTool ? { isReadTool: true } : {}),
 			// Gates "open in panel". Broader than isReadTool (any Read/Write/Edit with
@@ -395,7 +396,7 @@ export function rowInteractionSig(state: VListInteractionState, key: string): st
 	// The file-list fold changes how many rows are DRAWN, so it must move the opts
 	// signature — otherwise expanding it would not re-measure the card.
 	const fileChangesOpen = state.fileChangesOpen.has(key) ? 1 : 0;
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}`;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}:${textExpansionSignature(state, key)}`;
 }
 
 /**
@@ -445,7 +446,9 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 		// The inspector's content is derived from the spec; a different injection body
 		// must not inherit a neighbour's "what the model saw" text.
 		a.inspectContent?.text === b.inspectContent?.text &&
-		a.inspectContent?.title === b.inspectContent?.title
+		a.inspectContent?.title === b.inspectContent?.title &&
+		// Selection is painted state; a flip must repaint the row.
+		a.selected === b.selected
 	);
 }
 
@@ -455,6 +458,8 @@ export function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | un
 	if (!a || !b) return false;
 	return (
 		a.toolName === b.toolName &&
+		a.toolUseId === b.toolUseId &&
+		a.isRunningBash === b.isRunningBash &&
 		a.filePath === b.filePath &&
 		a.isFileTool === b.isFileTool &&
 		a.isReadTool === b.isReadTool &&
@@ -486,6 +491,8 @@ export interface RowToggles {
 	onToggleRow: (rowIndex: number, rowKey?: string) => void;
 	/** Flip a translated body between its translation and the original. */
 	onToggleTranslation: () => void;
+	/** Full body expansion, not the card/trace-row fold. */
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	/**
 	 * Fold / unfold a subagent card's PROMPT body — a second, independent fold
 	 * inside the card (parity with the chunked SubagentCard's `showPrompt`).
@@ -530,4 +537,7 @@ export interface RowInteraction {
 	 * `modelFacing`, with the speaker/source label as the inspector's title.
 	 */
 	inspectContent?: { title: string; text: string };
+	/** Message-level selection (chat rooms): outline + modifier-click toggle. */
+	selected?: boolean;
+	onToggleSelect?: (opts: { shiftKey: boolean }) => void;
 }

@@ -82,7 +82,9 @@ export {
 } from "./explorations";
 export { type FsWriteInput, fsWriteSchema } from "./fs";
 export {
+	gitCommitDiffQuerySchema,
 	gitCommitSchema,
+	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,
@@ -139,9 +141,12 @@ export {
 	askInPassingSchema,
 	askInPassingStartSchema,
 	asyncQuestionAnswerSchema,
+	asyncQuestionDetailQuerySchema,
 	asyncQuestionListQuerySchema,
+	asyncQuestionSupplementSchema,
 	batchDeleteBlocksSchema,
 	browserInteractSchema,
+	bufferQueueModeSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
@@ -180,6 +185,7 @@ export {
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
+	updateBufferedMessageModeSchema,
 	updateBufferedMessageSchema,
 	updateNarratorCwdSchema,
 	updateNarratorDraftSchema,

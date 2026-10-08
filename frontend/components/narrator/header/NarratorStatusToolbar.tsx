@@ -14,6 +14,7 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useInputMenu } from "../../../hooks/useInputMenu";
 import { getNarratorStatusInlineStyle } from "../../../lib/safe-area";
 
 const DEFAULT_GAP_PX = 4;
@@ -24,11 +25,14 @@ const DEFAULT_GAP_PX = 4;
  */
 const MORE_BUTTON_WIDTH_PX = 22;
 /**
- * Locks the status row height so toggling the overflow button or moving the
- * terminal action (whose badge reserves 5px of block padding) can never change
- * the row's height. 28px covers the tallest inline control plus its reserve.
+ * Locks the status row height so toggling the overflow button, moving the
+ * terminal action (whose badge reserves 5px of block padding) or switching
+ * between the wide and narrow panel layouts can never change the row's height.
+ * 30px matches the tallest inline control — the desktop branch's xs
+ * NativeSelect/Button (Mantine `--input-height-xs` / `--button-height-xs`),
+ * which exceeds the ActionIcon-sm rows used by the narrow branch (22px).
  */
-export const NARRATOR_STATUS_ROW_MIN_HEIGHT_PX = 28;
+export const NARRATOR_STATUS_ROW_MIN_HEIGHT_PX = 30;
 /**
  * Space kept for the leading status dot / label / elapsed time. Those controls
  * truncate, so the toolbar may claim everything else on the row.
@@ -297,11 +301,24 @@ export function BackgroundTasksStatusButton({
 	const label = t("backgroundTasks.activeCount", { count: runningCount });
 	return (
 		<Tooltip label={t("backgroundTasks.openPanel")} withinPortal>
+			{/*
+				UnstyledButton ships `font-size: var(--mantine-font-size-md)`. As an
+				inline-block button that strut sets the line box taller than the
+				wrapped `size="xs"` label, so this segment grew ~5px above its
+				TruncatedText neighbours and the row read as "heights not aligned".
+				`display: inline-flex` blockifies the label into a flex item, so the
+				button's height is exactly the text's — same contract as TurnElapsedTime.
+			*/}
 			<UnstyledButton
 				type="button"
 				onClick={onOpen}
 				aria-label={label}
-				style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+				style={{
+					flexShrink: 0,
+					whiteSpace: "nowrap",
+					display: "inline-flex",
+					alignItems: "center",
+				}}
 			>
 				<Text component="span" size="xs" c="blue">
 					<span aria-hidden="true">· </span>
@@ -325,6 +342,7 @@ export function NarratorStatusToolbar({
 	measurementKey: string;
 	reservedTextWidth?: number;
 }) {
+	const inputMenu = useInputMenu();
 	const rowRef = useContext(NarratorStatusRowContext);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const leadingRef = useRef<HTMLDivElement>(null);
@@ -518,7 +536,13 @@ export function NarratorStatusToolbar({
 				),
 			)}
 			{overflowActions.length > 0 && (
-				<Menu position="top-end" withinPortal keepMounted transitionProps={{ duration: 0 }}>
+				<Menu
+					{...inputMenu.menuProps}
+					position="top-end"
+					withinPortal
+					keepMounted
+					transitionProps={{ duration: 0 }}
+				>
 					<Menu.Target>
 						<Tooltip label={moreLabel}>
 							<ActionIcon
@@ -527,13 +551,14 @@ export function NarratorStatusToolbar({
 								size="sm"
 								aria-label={moreLabel}
 								data-testid="narrator-status-more"
+								{...inputMenu.targetProps}
 								style={{ flexShrink: 0 }}
 							>
 								<IconDotsVertical size={16} />
 							</ActionIcon>
 						</Tooltip>
 					</Menu.Target>
-					<Menu.Dropdown>
+					<Menu.Dropdown style={{ overflowY: "auto" }}>
 						{overflowActions.map((action) => (
 							<Fragment key={action.key}>{action.render("menu")}</Fragment>
 						))}

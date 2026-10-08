@@ -13,12 +13,16 @@
  */
 
 /** Scroll position at which a container is scrolled fully to the bottom. */
-export function getScrollBottomTarget(node: HTMLElement | null): number {
+export function getScrollBottomTarget(
+	node: Pick<HTMLElement, "scrollHeight" | "clientHeight"> | null,
+): number {
 	return node ? Math.max(0, node.scrollHeight - node.clientHeight) : 0;
 }
 
 /** Distance in px from the container's current position to its bottom. */
-export function getDistanceFromBottom(node: HTMLElement): number {
+export function getDistanceFromBottom(
+	node: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
+): number {
 	return Math.max(0, node.scrollHeight - node.scrollTop - node.clientHeight);
 }
 
@@ -77,8 +81,10 @@ export function isUpwardHistoryScroll(
  * The reader cannot leave the bottom without moving the scroll position: every
  * gesture that travels toward earlier content LOWERS scrollTop. Content growing
  * below the viewport (or the viewport itself getting shorter) leaves scrollTop
- * untouched and moves the bottom away from it. So "scrollTop did not decrease" is
- * the exact discriminator between the two, and it needs no per-gesture listener.
+ * untouched and moves the bottom away from it. With stable viewport geometry,
+ * "scrollTop did not decrease" distinguishes growth from upward scrolling. Viewport
+ * resize/focus adjustments can also lower scrollTop; the shell checks those
+ * separately with isBottomLostToViewportResize.
  *
  * ## The defect this closes
  *
@@ -108,6 +114,24 @@ export function isBottomLostToContentGrowth(
 	// programmatic write must not read as an upward gesture. A real gesture moves
 	// further than the epsilon the bottom itself is detected with.
 	return reportedScrollTop >= previousScrollTop - SCROLL_ECHO_EPSILON;
+}
+
+/**
+ * Resizing a pinned viewport can move scrollTop as well as its bottom (keyboard
+ * focus reveal / browser clamping). Compare with the height sampled alongside the
+ * last scroll position, not React's asynchronously committed viewport height.
+ * Explicit upward gestures detach first, so a resize never overrides reader intent.
+ */
+export function isBottomLostToViewportResize(
+	pinnedToBottom: boolean,
+	previousHeight: number | null,
+	reportedHeight: number,
+): boolean {
+	return (
+		pinnedToBottom &&
+		previousHeight !== null &&
+		Math.abs(reportedHeight - previousHeight) > SCROLL_ECHO_EPSILON
+	);
 }
 
 /**

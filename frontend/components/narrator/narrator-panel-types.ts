@@ -74,6 +74,9 @@ export type { PendingPermission } from "@frontend/types/narrator";
  */
 export interface AsyncQuestionSlot {
 	id: string;
+	question?: import("@frontend/types/narrator").AsyncQuestion;
+	readOnly?: boolean;
+	summaryOnly?: boolean;
 	/** Local draft identity; distinct from the async API record id. */
 	draftId?: string;
 	questions: Question[];
@@ -83,8 +86,10 @@ export interface AsyncQuestionSlot {
 	awaited?: boolean;
 	/** Copy for the awaited notice, resolved by the owner (the bridge has no i18n). */
 	awaitedLabel?: string;
-	onSubmit: (questionId: string, answers: Record<string, string>) => void;
+	onSubmit: (questionId: string, answers: Record<string, string>) => unknown;
 	onDismiss: (questionId: string) => void;
+	/** Close without notifying the narrator; absent where the question is not ignorable. */
+	onIgnore?: (questionId: string) => void;
 }
 
 export interface PermissionCallbacks {
@@ -192,12 +197,6 @@ export interface NarratorPanelProps {
 	workspacePreview?: boolean;
 	/** Skip auto-focusing the main input when a preview is promoted to primary */
 	suppressAutoFocusOnPromote?: boolean;
-	/** Whether the file modifications panel is open (desktop sidebar mode) */
-	fileModPanelOpen?: boolean;
-	/** Toggle the file modifications panel (desktop sidebar mode) */
-	onToggleFileModPanel?: () => void;
-	/** Callback that NarratorPanel calls when file-mod panel props change, so the parent can render the sidebar */
-	onFileModPropsChange?: (props: FileModPanelExternalProps) => void;
 	/** Whether the details panel is open (desktop sidebar mode) */
 	detailsPanelOpen?: boolean;
 	/** Toggle the details panel (desktop sidebar mode) */
@@ -208,20 +207,6 @@ export interface NarratorPanelProps {
 	specPanelOpen?: boolean;
 	/** Toggle the spec panel (desktop sidebar mode) */
 	onToggleSpecPanel?: () => void;
-}
-
-/** Props that NarratorPanel exposes for the external file-mod sidebar panel */
-export interface FileModPanelExternalProps {
-	narratorId: string;
-	pendingPermission: PendingPermission | null;
-	onPermissionDecision: (
-		requestId: string,
-		decision: "allow" | "deny",
-		feedbackText?: string,
-	) => void;
-	deletePreviewMessageId: string | null;
-	onConfirmDelete: () => void;
-	onCancelDelete: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB

@@ -10,11 +10,190 @@
  * 6. Large-window regression: 6000+ items still fully cached, no thrash.
  */
 
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
 	installCanvasStub();
+});
+
+describe("text preview cache keys", () => {
+	it("budgets the full preview source and nested trace bodies, not visible geometry", async () => {
+		const { retainedBodySourceChars, MeasureCache } = await import("./measure-cache");
+		const sourceText = "x".repeat(200);
+		const stub = {
+			height: 20,
+			blocks: [],
+			frame: { blocks: [], contentHeight: 20, usedWidth: 10 },
+			contentWidth: 10,
+			usedWidth: 10,
+		};
+		const body = { ...stub, textPreview: { sourceText } };
+		expect(retainedBodySourceChars(body)).toBe(200);
+		expect(retainedBodySourceChars({ rows: [{ body }] })).toBe(200);
+		const cache = new MeasureCache(100, 100);
+		cache.set("oversized-preview", body as never);
+		expect(cache.size).toBe(0);
+	});
+
+	it("invalidates hydration hidden behind an identical communication preview", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const data = (text: string, truncated: boolean) => ({
+			message: "prefix",
+			messageTruncated: true,
+			messageBody: { text, textTruncated: truncated },
+		});
+		expect(extractDataRevision(data("prefix first", true))).not.toBe(
+			extractDataRevision(data("prefix second", false)),
+		);
+	});
+
+	it("keys direct text expansion independently from card expansion", async () => {
+		const { buildCacheKey } = await import("./measure-cache");
+		const key = (opts: Record<string, unknown>) => buildCacheKey("body", "reasoning", 400, 5, opts);
+		expect(key({ expanded: true, textExpanded: false })).not.toBe(
+			key({ expanded: true, textExpanded: true }),
+		);
+	});
+
+	it("treats trace body keys as a set without comma or ordering collisions", async () => {
+		const { buildCacheKey } = await import("./measure-cache");
+		const key = (keys: string[]) =>
+			buildCacheKey("trace", "activity-trace", 400, 2, { textExpandedKeys: keys });
+		expect(key(["b", "a"])).toBe(key(["a", "b", "a"]));
+		expect(key(["a,b"])).not.toBe(key(["a", "b"]));
+		expect(key(["0"])).not.toBe(key(["1"]));
+	});
+
+	it("invalidates same-length edits to a trace's original body", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const data = (body: string) => ({ steps: [{ key: "seg0", title: "step", body }] });
+		expect(extractDataRevision(data("first"))).not.toBe(extractDataRevision(data("other")));
+	});
+});
+
+describe("mixed action-card append cache locality", () => {
+	it.each([
+		"tool",
+		"search",
+		"generation",
+		"subagent",
+	])("append after a %s tail invalidates only that tail and the new card", async (tail) => {
+		const { segmentMessages } = await import("../message/message-segments");
+		const { adaptSegments } = await import("./segment-adapter");
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		const tool = (id: string, name = "Read") => ({
+			type: "tool_use",
+			id,
+			name,
+			status: "success",
+			inputJson: { file_path: "a.ts", prompt: "inspect" },
+		});
+		const search = { type: "web_search", query: "layout", status: "completed" };
+		const generation = { type: "image_generation", status: "completed", width: 320, height: 160 };
+		const tails = { tool: tool("tail"), search, generation, subagent: tool("tail-agent", "Agent") };
+		function msg(id: string, contentJson: Record<string, unknown>[]) {
+			return {
+				id,
+				role: "assistant",
+				contentJson,
+				toolCalls: [],
+				children: [],
+				parentToolUseId: null,
+			} as unknown as import("../narrator-panel-types").NarratorMsg;
+		}
+		const messages = [
+			msg("stable", [tool("read"), search, generation, tool("agent", "Agent")]),
+			msg("tail", [tails[tail as keyof typeof tails]]),
+		];
+		const adapt = (source: typeof messages) =>
+			adaptSegments(
+				segmentMessages(source) as unknown as import("./segment-adapter").AdapterSegment[],
+				{ lod: 5 },
+			);
+		const measure = (spec: import("./segment-adapter").ElementSpec) =>
+			measureElementCached(spec.kind, spec.data, 860, 5, spec.opts, spec.key, "stable-document");
+		measureCache.clear();
+		try {
+			const before = adapt(messages);
+			const measuredBefore = before.map(measure);
+			expect(measureCache.misses).toBe(5);
+			const after = adapt([...messages, msg("appended", [tool("new-tool")])]);
+			const measuredAfter = after.map(measure);
+			expect(measureCache.hits).toBe(4);
+			expect(measureCache.misses).toBe(7);
+			for (let i = 0; i < 4; i++) {
+				expect(after[i]).toEqual(before[i]);
+				expect(measuredAfter[i]).toBe(measuredBefore[i]);
+			}
+			expect(before[4]?.opts).toMatchObject({ inRun: true, isLast: true });
+			expect(after[4]?.opts).toMatchObject({ inRun: true, isLast: false });
+			expect(measuredAfter[4]).not.toBe(measuredBefore[4]);
+			expect(after[5]?.opts).toMatchObject({ inRun: true, isLast: true });
+			expect(after.map(measure)).toEqual(measuredAfter);
+			expect(measureCache.misses).toBe(7);
+			expect(measureCache.hits).toBe(10);
+		} finally {
+			measureCache.clear();
+		}
+	});
+});
+
+describe("chat grouped-header cached measurements", () => {
+	it("remeasures a grouped row when a tail reload makes it the first row", async () => {
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached, VLIST_REGISTRY } = await import("./registry");
+		const { adaptSegment } = await import("./segment-adapter");
+		const adapt = (omitHeader: boolean) => {
+			const spec = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "stable-chat-message",
+						role: "user",
+						contentJson: [{ type: "text", text: "Unchanged body" }],
+						omitHeader,
+					},
+				},
+				{ lod: 5 },
+			)[0];
+			if (!spec) throw new Error("missing user bubble spec");
+			return spec;
+		};
+		const measure = (spec: import("./segment-adapter").ElementSpec) =>
+			measureElementCached(spec.kind, spec.data, 600, 5, spec.opts, spec.key, "chat:0");
+		measureCache.clear();
+		try {
+			const grouped = adapt(true);
+			const first = measure(grouped);
+			const withHeader = adapt(false);
+			expect(withHeader.key).toBe(grouped.key);
+			const second = measure(withHeader);
+			expect(second).not.toBe(first);
+			expect(second.height).toBeGreaterThan(first.height);
+			expect(second).toEqual(
+				VLIST_REGISTRY[withHeader.kind].measure(withHeader.data, 600, 5, withHeader.opts),
+			);
+			expect(measure(adapt(false))).toBe(second);
+			const regrouped = measure(adapt(true));
+			expect(regrouped).not.toBe(second);
+			expect(regrouped.height).toBe(first.height);
+			expect(measureCache.misses).toBe(3);
+			expect(measureCache.hits).toBe(1);
+		} finally {
+			measureCache.clear();
+		}
+	});
+
+	it("normalizes effective defaults and invalidates a change of body format", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = { role: "user", text: "**same body**" };
+		const initial = extractDataRevision(base);
+		expect(extractDataRevision({ ...base, hasHeader: true, bodyFormat: "plain" })).toBe(initial);
+		expect(extractDataRevision({ ...base, hasHeader: false })).not.toBe(initial);
+		expect(extractDataRevision({ ...base, bodyFormat: "markdown" })).not.toBe(initial);
+	});
 });
 
 describe("ask-in-passing cached measurements", () => {
@@ -339,6 +518,217 @@ describe("canonical body revision", () => {
 		expect(extractDataRevision({ items: [{ key: "row", card: changed }] })).not.toBe(
 			extractDataRevision({ items: [{ key: "row", card }] }),
 		);
+	});
+});
+
+describe("bounded immutable text signatures", () => {
+	beforeEach(async () => {
+		const { measureCache } = await import("./measure-cache");
+		measureCache.clear();
+	});
+
+	it("preserves the original UTF-16/FNV signature on cold and warm paths", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		// Fixed pre-optimization results, including the sampling and admission boundaries.
+		const cases: [string, string][] = [
+			["", "0.ztntfp"],
+			["unchanged", "9.1ufp29q"],
+			["历史正文", "4.1r1v6oz"],
+			["a".repeat(512), "512.6a1fph"],
+			["a".repeat(513), "513.is5zjg"],
+			["b".repeat(2048), "2048.yqoan9"],
+			["\ud83d\ude42\ud800x", "4.13mfu1y"],
+			["z".repeat(2_000_000), "2000000.1jkoc6l"],
+		];
+		for (const [text, signature] of cases) {
+			expect(cache.signatureForText(text)).toBe(signature);
+			expect(cache.signatureForText(text)).toBe(signature);
+		}
+	});
+
+	it("reuses text across newly adapted data but detects same-length edits", async () => {
+		const { extractDataRevision, measureCache } = await import("./measure-cache");
+		const data = { text: "unchanged" };
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			const original = extractDataRevision(data);
+			const coldReads = sampling.mock.calls.length;
+			expect(coldReads).toBe(data.text.length);
+			const adaptedAgain = extractDataRevision({ ...data });
+			const warmReads = sampling.mock.calls.length;
+			expect(adaptedAgain).toBe(original);
+			expect(warmReads).toBe(coldReads);
+			data.text = "UNCHANGED";
+			expect(extractDataRevision(data)).not.toBe(original);
+			expect(sampling.mock.calls.length).toBe(coldReads + data.text.length);
+			expect(measureCache.textSignatureEntries).toBe(2);
+		} finally {
+			sampling.mockRestore();
+		}
+	});
+
+	it("still reads mutable status, nested body/range, permissions and trace identities", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const body = {
+			...bodyFixture("output.main", "aaaa bbbb"),
+			range: { ...createSourceText("aaaa bbbb", { epoch: "epoch-one" }).range },
+		};
+		const row = {
+			key: "row-one",
+			title: "same title",
+			bodyText: "same body",
+			identity: { toolDetailRef: { toolCallId: "call-one", messageId: "message-one" } },
+		};
+		const data = {
+			status: "running",
+			timeoutMs: 1000,
+			truncatedLeafCount: 1,
+			detail: { kind: "sections", sections: [{ key: "output.main", body }] },
+			permissionForm: { height: 80, prediction: { feedbackRows: 1 } },
+			items: [row],
+		};
+		let previous = extractDataRevision(data);
+		for (const mutate of [
+			() => {
+				data.status = "success";
+			},
+			() => {
+				data.timeoutMs = 2000;
+			},
+			() => {
+				data.truncatedLeafCount = 0;
+			},
+			() => {
+				body.text = "aaaabbbb_";
+			},
+			() => {
+				body.text = "aaaa\nbbbb";
+			},
+			() => {
+				body.format = "text";
+			},
+			() => {
+				body.range.epoch = "epoch-two";
+			},
+			() => {
+				body.range.startColumn = 2;
+			},
+			() => {
+				data.permissionForm.height = 120;
+			},
+			() => {
+				data.permissionForm.prediction.feedbackRows = 2;
+			},
+			() => {
+				row.identity.toolDetailRef.toolCallId = "call-two";
+			},
+			() => {
+				row.bodyText = "new_ body";
+			},
+			() => {
+				data.items.push({ ...row, key: "row-two" });
+			},
+		]) {
+			mutate();
+			const next = extractDataRevision(data);
+			expect(next).not.toBe(previous);
+			previous = next;
+		}
+	});
+
+	it("does not admit oversized strings and always keeps their sampling bounded", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		const huge = "z".repeat(2_000_000);
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			cache.signatureForText(huge);
+			const firstReads = sampling.mock.calls.length;
+			cache.signatureForText(huge);
+			expect(firstReads).toBe(513); // Original 512 samples plus the final character.
+			expect(sampling.mock.calls.length).toBe(firstReads * 2);
+			expect(cache.textSignatureEntries).toBe(0);
+			expect(cache.retainedTextSignatureChars).toBe(0);
+		} finally {
+			sampling.mockRestore();
+		}
+	});
+
+	it("admits the maximum short length but bypasses the first oversized key", async () => {
+		const { MeasureCache, TEXT_SIGNATURE_MAX_TEXT_CHARS } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		cache.signatureForText("x".repeat(TEXT_SIGNATURE_MAX_TEXT_CHARS));
+		cache.signatureForText("x".repeat(TEXT_SIGNATURE_MAX_TEXT_CHARS + 1));
+		expect(cache.textSignatureEntries).toBe(1);
+		expect(cache.retainedTextSignatureChars).toBe(TEXT_SIGNATURE_MAX_TEXT_CHARS);
+	});
+
+	it("bounds entry count without evicting the admitted sequential-scan cohort", async () => {
+		const { MeasureCache, TEXT_SIGNATURE_MAX_ENTRIES } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		for (let index = 0; index < TEXT_SIGNATURE_MAX_ENTRIES; index++) {
+			cache.signatureForText(`entry-${String(index).padStart(5, "0")}`);
+		}
+		const chars = cache.retainedTextSignatureChars;
+		expect(cache.textSignatureEntries).toBe(TEXT_SIGNATURE_MAX_ENTRIES);
+		cache.signatureForText("later-cold-value");
+		expect(cache.textSignatureEntries).toBe(TEXT_SIGNATURE_MAX_ENTRIES);
+		expect(cache.retainedTextSignatureChars).toBe(chars);
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			cache.signatureForText("entry-00000");
+			expect(sampling.mock.calls.length).toBe(0);
+		} finally {
+			sampling.mockRestore();
+		}
+	});
+
+	it("bounds retained UTF-16 characters independently of the entry ceiling", async () => {
+		const { MeasureCache, TEXT_SIGNATURE_MAX_TEXT_CHARS, TEXT_SIGNATURE_CHAR_BUDGET } =
+			await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		const suffix = "文".repeat(TEXT_SIGNATURE_MAX_TEXT_CHARS - 6);
+		const count = Math.floor(TEXT_SIGNATURE_CHAR_BUDGET / TEXT_SIGNATURE_MAX_TEXT_CHARS);
+		for (let index = 0; index < count; index++) {
+			cache.signatureForText(`${String(index).padStart(6, "0")}${suffix}`);
+		}
+		expect(cache.retainedTextSignatureChars).toBe(TEXT_SIGNATURE_CHAR_BUDGET);
+		cache.signatureForText("later");
+		expect(cache.retainedTextSignatureChars).toBe(TEXT_SIGNATURE_CHAR_BUDGET);
+		expect(cache.textSignatureEntries).toBe(count);
+	});
+
+	it("clears signatures with storage, while stats resets leave warm values intact", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(1);
+		const text = "unchanged";
+		cache.signatureForText(text);
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			cache.resetStats();
+			cache.signatureForText(text);
+			expect(sampling.mock.calls.length).toBe(0);
+			cache.clear();
+			expect(cache.textSignatureEntries).toBe(0);
+			expect(cache.retainedTextSignatureChars).toBe(0);
+			cache.signatureForText(text);
+			expect(sampling.mock.calls.length).toBe(text.length);
+			const measured = {
+				height: 1,
+				blocks: [],
+				contentWidth: 1,
+				usedWidth: 1,
+				frame: null,
+			} as never;
+			cache.set("first", measured);
+			cache.set("second", measured); // Measurement storage reached its own ceiling.
+			expect(cache.textSignatureEntries).toBe(0);
+			expect(cache.retainedTextSignatureChars).toBe(0);
+		} finally {
+			sampling.mockRestore();
+		}
 	});
 });
 
@@ -907,6 +1297,33 @@ describe("extractDataRevision", () => {
 			expect(exec).toContain("tmd:1200");
 			// A corrected figure re-keys too.
 			expect(extractDataRevision(rowWith(1_500))).not.toBe(exec);
+		});
+
+		it("keys terminal timing corrections on cards and rows even with unchanged displayed duration", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const base = {
+				status: "success",
+				durationMs: 1000,
+				executionStartedAt: 0,
+				completedAt: 1000,
+			};
+			const changed = {
+				...base,
+				fileChangeTiming: { waitMs: 200, executionMs: 800, totalMs: 1000 },
+			};
+			expect(extractDataRevision(changed)).not.toBe(extractDataRevision(base));
+			expect(extractDataRevision({ ...changed, completedAt: 1100 })).not.toBe(
+				extractDataRevision(changed),
+			);
+			const trace = (timing: unknown) => ({
+				items: [{ key: "tool-tu-1", timing, displayDurationMs: 800 }],
+			});
+			expect(extractDataRevision(trace(changed))).not.toBe(extractDataRevision(trace(base)));
+			expect(
+				extractDataRevision(
+					trace({ ...changed, fileChangeTiming: { waitMs: 300, executionMs: 800, totalMs: 1100 } }),
+				),
+			).not.toBe(extractDataRevision(trace(changed)));
 		});
 
 		it("a collapsed fold pays nothing (no card → no card component)", async () => {
@@ -1508,3 +1925,31 @@ function bodyFixture(
 		followTarget: { kind: "end" },
 	};
 }
+
+describe("responsive usage cached measurements", () => {
+	it("keys second-line presence and content at an unchanged width/document/key", async () => {
+		const { measureElementCached } = await import("./registry");
+		const data = { placement: "trailing" as const, text: "tokens" };
+		const measure = (secondaryText?: string) =>
+			measureElementCached(
+				"turn-usage",
+				{ ...data, ...(secondaryText ? { secondaryText } : {}) },
+				600,
+				5,
+				undefined,
+				"same-width-usage-cache-test",
+				"same-doc",
+			);
+		const desktop = measure();
+		const mobile = measure("cost A");
+		const edited = measure("cost B");
+		expect(mobile.height).toBeGreaterThan(desktop.height);
+		expect(edited.height).toBe(mobile.height);
+		expect(edited).not.toBe(mobile);
+		expect((edited as import("./measure/measure-turn-usage").MeasuredTurnUsage).lines).toEqual([
+			"tokens",
+			"cost B",
+		]);
+		expect(measure()).toEqual(desktop);
+	});
+});

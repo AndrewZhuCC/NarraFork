@@ -7,7 +7,6 @@ import {
 	Group,
 	HoverCard,
 	Loader,
-	Menu,
 	ScrollArea,
 	Stack,
 	Text,
@@ -21,7 +20,6 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconCopy,
-	IconDotsVertical,
 	IconFilter,
 	IconFilterOff,
 	IconFolder,
@@ -52,6 +50,7 @@ import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
 import { useGitViewMode } from "../../hooks/useGitViewMode";
 import { type GitTarget, gitCanWrite, gitTargetKey } from "../../lib/api/git";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionLabels } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
@@ -139,12 +138,10 @@ export function GitChangesTab({
 	chapterId,
 	target = chapterId ?? "",
 	onRefresh,
-	onOpenSecondaryView,
 }: {
 	chapterId?: string;
 	target?: GitTarget;
 	onRefresh?: () => void;
-	onOpenSecondaryView?: (view: "commits" | "stash") => void;
 }) {
 	const canWrite = gitCanWrite(target);
 	const preferenceKey = gitTargetKey(target) ?? "";
@@ -375,18 +372,18 @@ export function GitChangesTab({
 
 			<Group gap={6} px="xs" py={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 				{/* Counts live on the section headers below; this title is just the panel name. */}
-				<Text size="sm" fw={600} style={{ flex: 1, minWidth: 0 }}>
+				<Text size="sm" fw={600} style={{ flexShrink: 0, flexGrow: status.branch ? 0 : 1 }}>
 					{t("panel.changes")}
 				</Text>
 				{status.branch && (
-					<Group gap={2} wrap="nowrap" style={{ minWidth: 0, maxWidth: "34%" }}>
+					<Group gap={2} wrap="nowrap" justify="flex-end" style={{ flex: 1, minWidth: 0 }}>
 						<Text
 							size="xs"
 							c="dimmed"
 							ff="monospace"
 							truncate
 							title={status.branch}
-							style={{ minWidth: 0, userSelect: "text" }}
+							style={{ minWidth: 0, flexShrink: 1, userSelect: "text" }}
 						>
 							{status.branch}
 						</Text>
@@ -396,6 +393,7 @@ export function GitChangesTab({
 								color={clipboard.copied ? "green" : "gray"}
 								size="sm"
 								aria-label={t("panel.copyBranch")}
+								style={{ flexShrink: 0 }}
 								onClick={() => clipboard.copy(status.branch)}
 							>
 								{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
@@ -403,7 +401,7 @@ export function GitChangesTab({
 						</Tooltip>
 					</Group>
 				)}
-				<Button.Group>
+				<Button.Group style={{ flexShrink: 0 }}>
 					<Button
 						size="compact-xs"
 						variant={viewMode === "tree" ? "filled" : "subtle"}
@@ -431,21 +429,6 @@ export function GitChangesTab({
 						<IconRefresh size={15} />
 					</ActionIcon>
 				</Tooltip>
-				{onOpenSecondaryView && (
-					<Menu withinPortal position="bottom-end">
-						<Menu.Target>
-							<ActionIcon size="sm" variant="subtle" aria-label={t("panel.moreActions")}>
-								<IconDotsVertical size={15} />
-							</ActionIcon>
-						</Menu.Target>
-						<Menu.Dropdown>
-							<Menu.Item onClick={() => onOpenSecondaryView("commits")}>
-								{t("panel.commits")}
-							</Menu.Item>
-							<Menu.Item onClick={() => onOpenSecondaryView("stash")}>{t("panel.stash")}</Menu.Item>
-						</Menu.Dropdown>
-					</Menu>
-				)}
 			</Group>
 
 			{status.truncated && (
@@ -945,12 +928,12 @@ function FileRow({
  */
 function formatAttributionTime(value: string): string {
 	try {
-		return new Intl.DateTimeFormat(undefined, {
+		return formatLocaleDateTime(value, {
 			month: "short",
 			day: "numeric",
 			hour: "numeric",
 			minute: "2-digit",
-		}).format(new Date(value));
+		});
 	} catch {
 		return value;
 	}

@@ -51,6 +51,11 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import {
+	measureMessageCharacters,
+	measureSummaryCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -68,6 +73,7 @@ import {
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
 import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
+import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
@@ -94,8 +100,8 @@ import {
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
 import {
+	getCurrentSubagentFileChangeOptions,
 	getFileChangesBySubagent,
-	type SubagentExecutionBoundary,
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
@@ -103,6 +109,23 @@ import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
+
+async function notifyQuestionHistoryAfterCommit(
+	narratorId: string,
+	questionIds: string[],
+): Promise<void> {
+	if (!questionIds.length) return;
+	try {
+		const { notifyQuestionHistoryChanged } = await import("./narrator-question-service");
+		await notifyQuestionHistoryChanged(narratorId, questionIds);
+	} catch (error) {
+		logger.warn("Committed question history notification deferred", {
+			narratorId,
+			error: String(error),
+		});
+		broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+	}
+}
 
 /** A scope is a choice, never permission to fall back to a broader writer. */
 async function revertForDeletedMessages(
@@ -805,6 +828,7 @@ function applyBlockDeletionTx(
 	const patch = {
 		contentJson: remaining,
 		contentText: contentText || null,
+		contextCharsJson: measureMessageCharacters(message.role, remaining, contentText),
 		// A file rollback invalidates the old message-level boundary; text-only and
 		// history-only edits do not change the captured filesystem observation.
 		...(!opts?.skipRevert && removedToolIds.length > 0
@@ -916,6 +940,7 @@ async function deleteBlockSelection(
 	const removedRefMessageIds = planned.plans
 		.filter((plan) => plan.remaining.length === 0)
 		.map((plan) => plan.message.id);
+	let affectedQuestionIds: string[] = [];
 	const mutate = () =>
 		db.transaction((tx) => {
 			// Recheck refs, content, tool evidence and narrator version after async rollback.
@@ -927,6 +952,13 @@ async function deleteBlockSelection(
 					"HISTORY_DELETE_STALE",
 				);
 			}
+			affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+				deletedMessageIds: [...removedRefMessageIds, ...planned.derived.messageIds],
+				deletedToolBlocks: toolUses.filter(
+					(block): block is { messageId: string; toolUseId: string } =>
+						typeof block.toolUseId === "string",
+				),
+			}).affectedQuestionIds;
 			insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
 			deleteOrphanedMessages(tx, planned.derived.messageIds);
 			for (const plan of planned.plans) {
@@ -943,6 +975,7 @@ async function deleteBlockSelection(
 					.set({
 						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
 						updatedAt: new Date().toISOString(),
 					})
 					.where(eq(narrators.id, narratorId))
@@ -951,6 +984,7 @@ async function deleteBlockSelection(
 		});
 	if (snapshotRevert) await commitSnapshotRevert(snapshotRevert, mutate);
 	else mutate();
+	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
 
 	// Persisted block edits must reach already-open narrators. Broadcast the exact
 	// post-COW message row; a refresh remains the source of truth, while this keeps
@@ -1151,6 +1185,7 @@ function deleteOutputlessAssistantMessage(
 			.set({
 				apiConversationId: null,
 				messageVersion: sql`${narrators.messageVersion} + 1`,
+				contextUsageSnapshotJson: null,
 				messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
 				updatedAt: new Date().toISOString(),
 			})
@@ -1160,7 +1195,7 @@ function deleteOutputlessAssistantMessage(
 	});
 }
 
-function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
+export function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	return blocks.some((block) => parseCompactMessageBlock(block) !== null);
 }
@@ -1347,6 +1382,19 @@ function planMessageRangeDeletion(
 				inclusive
 					? gte(narratorMessageRefs.seq, boundary.seq)
 					: gt(narratorMessageRefs.seq, boundary.seq),
+				// A history-only action must retain previously detached file evidence,
+				// not delete/recreate its IDs on every retry. Match only our internal
+				// checkpoint shape, never all hidden/compacted refs. File rollback still
+				// selects these records through the ordinary range above.
+				opts?.skipRevert
+					? sql`NOT EXISTS (
+						SELECT 1 FROM ${narratorMessages}
+						WHERE ${narratorMessages.id} = ${narratorMessageRefs.messageId}
+						AND ${narratorMessageRefs.segmentCompactId} = ${narratorMessageRefs.messageId}
+						AND ${narratorMessages.role} = 'disp'
+						AND ${narratorMessages.contentJson} = ${JSON.stringify([{ type: "file_history_checkpoint" }])}
+					)`
+					: undefined,
 			),
 		)
 		.orderBy(narratorMessageRefs.seq)
@@ -1437,8 +1485,12 @@ async function deleteMessageRange(
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
+	let affectedQuestionIds: string[] = [];
 	const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
 		if (planned.refs.length === 0) return;
+		affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+			deletedMessageIds: planned.refs.map((ref) => ref.messageId),
+		}).affectedQuestionIds;
 		insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints);
 		deleteRecipientMessageRefs(tx)
 			.where(
@@ -1456,6 +1508,7 @@ async function deleteMessageRange(
 			.set({
 				...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 				messageVersion: sql`${narrators.messageVersion} + 1`,
+				contextUsageSnapshotJson: null,
 				updatedAt: new Date().toISOString(),
 			})
 			.where(eq(narrators.id, narratorId))
@@ -1489,6 +1542,7 @@ async function deleteMessageRange(
 		);
 		revertWarnings = result.warnings ?? [];
 	}
+	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
 	// Same retire rule as block delete: a removed Agent/Task card archives its subagent.
 	if (planned.derived.subagentNarratorIds.length > 0) {
 		const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
@@ -1519,6 +1573,7 @@ function insertFileHistoryCheckpoints(
 				narratorId,
 				role: "disp",
 				contentJson: [{ type: "file_history_checkpoint" }],
+				contextCharsJson: { segments: [] },
 				contentText: null,
 				createdAt: new Date().toISOString(),
 			})
@@ -2165,7 +2220,6 @@ interface SubagentActivityOwner {
 	subagentNarratorId: string;
 	model: string | null;
 	reasoningEffort: string | null;
-	executionBoundary: SubagentExecutionBoundary;
 }
 
 /**
@@ -2309,14 +2363,10 @@ async function buildSubagentActivities(
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
-	const executionBoundariesBySubagent = new Map(
-		owners.map((owner) => [owner.subagentNarratorId, owner.executionBoundary] as const),
-	);
+	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
-	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, {
-		executionBoundariesBySubagent,
-	});
+	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2387,6 +2437,9 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
 						executionAttempt: narratorToolCalls.executionAttempt,
 						executionSegmentId: narratorToolCalls.executionSegmentId,
+						executionStartedAt: narratorToolCalls.executionStartedAt,
+						createdAt: narratorToolCalls.createdAt,
+						completedAt: narratorToolCalls.completedAt,
 						callerSeq: sql<
 							number | null
 						>`(SELECT aggregate_ref.seq FROM narrator_message_refs aggregate_ref
@@ -2566,12 +2619,6 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 			subagentNarratorId: row.id,
 			model: row.model,
 			reasoningEffort: row.reasoningEffort,
-			executionBoundary: {
-				sourceToolCallId: parent.id,
-				executionAttempt: parent.executionAttempt ?? null,
-				executionIdentityVersion: parent.executionIdentityVersion ?? null,
-				executionSegmentId: parent.executionSegmentId ?? null,
-			},
 		});
 		ownerGroups.set(parentToolUseId, group);
 	}
@@ -3314,8 +3361,14 @@ const narratorMessageQueriesUnlocked = {
 				contentText: true,
 				parentToolUseId: true,
 				messageUuid: true,
+				createdBy: true,
+				origin: true,
+				originLabel: true,
 			},
 			with: {
+				// Only public identity fields, never credentials or the complete user row.
+				creator: { columns: { username: true } },
+				narrator: { columns: { title: true } },
 				toolCalls: {
 					columns: {
 						id: true,
@@ -3406,7 +3459,11 @@ const narratorMessageQueriesUnlocked = {
 		const messageIds = refRows.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
+			with: {
+				toolCalls: true,
+				creator: { columns: { username: true } },
+				narrator: { columns: { title: true } },
+			},
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
@@ -4346,7 +4403,7 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async deleteCompactMessage(narratorId: string, messageId: string) {
-		return db.transaction((tx) => {
+		const result = db.transaction((tx) => {
 			// Resolve the message through the caller-owned ref. The message owner is
 			// intentionally ignored because forked narrators share immutable history.
 			const currentRef = tx.query.narratorMessageRefs
@@ -4406,10 +4463,12 @@ const narratorMessageQueriesUnlocked = {
 					...(compactBlock.status === "compacted"
 						? {
 								contextSummary: null,
+								contextSummaryChars: 0,
 								apiConversationId: null,
 							}
 						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4419,6 +4478,8 @@ const narratorMessageQueriesUnlocked = {
 				previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
 			};
 		});
+		queueContextCharacterRefresh(narratorId);
+		return result;
 	},
 
 	async deleteMessage(
@@ -4477,6 +4538,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4541,6 +4603,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4596,6 +4659,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4642,6 +4706,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4713,6 +4778,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4736,6 +4802,7 @@ const narratorMessageQueriesUnlocked = {
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId));
 			const narrator = await db.query.narrators.findFirst({
@@ -4783,6 +4850,7 @@ const narratorMessageQueriesUnlocked = {
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
@@ -4867,7 +4935,7 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
-		return db.transaction((tx) => {
+		const result = db.transaction((tx) => {
 			const ref = tx.query.narratorMessageRefs
 				.findFirst({
 					where: and(
@@ -4898,6 +4966,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narratorMessages)
 				.set({
 					contentJson: [newBlock],
+					contextCharsJson: { segments: [] },
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,
 				})
 				.where(eq(narratorMessages.id, copied.messageId))
@@ -4906,14 +4975,18 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					contextSummary: summary,
+					contextSummaryChars: measureSummaryCharacters(summary),
 					apiConversationId: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
 			return copied.messageId;
 		});
+		queueContextCharacterRefresh(narratorId, result);
+		return result;
 	},
 
 	async getPendingPermissions(narratorId: string) {

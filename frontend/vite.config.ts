@@ -68,7 +68,7 @@ try {
  * literal here keeps `shiki/langs` out of the bundle while leaving the module
  * resolvable for Bun, tests and type checking (see that file's header).
  */
-function shikiLanguageAliases(): Plugin {
+function shikiLanguageAliases(required = true): Plugin {
 	const aliases = createShikiLanguageAliasMap(bundledLanguagesInfo, bundledLanguagesAlias);
 	const source = `export const SHIKI_LANGUAGE_ALIASES = ${JSON.stringify(aliases)};`;
 	let substituted = false;
@@ -96,7 +96,14 @@ function shikiLanguageAliases(): Plugin {
 		 * observe both facts: whether `load()` fired, and what actually got emitted.
 		 */
 		generateBundle(_options, bundle) {
-			if (!substituted) {
+			const includesAliases = Object.values(bundle).some(
+				(output) =>
+					output.type === "chunk" &&
+					Object.keys(output.modules).some(
+						(id) => normalizeModulePath(id.split("?")[0] ?? "") === SHIKI_LANGUAGE_ALIASES_MODULE,
+					),
+			);
+			if (!substituted && (required || includesAliases)) {
 				this.error(
 					`narrafork-shiki-language-aliases never matched ${SHIKI_LANGUAGE_ALIASES_MODULE}. ` +
 						"The module was probably moved or renamed — update SHIKI_LANGUAGE_ALIASES_MODULE, " +
@@ -357,6 +364,11 @@ function webManifestAsset(appName: string, shortName: string): Plugin {
 		theme_color: "#1a1b1e",
 		background_color: "#1a1b1e",
 		display: "standalone",
+		// Prefer WCO for installed desktop PWAs: the OS window controls become a
+		// floating overlay and the page paints the whole title-bar strip, so our
+		// (narrower) header can sit beside the buttons. Unsupported browsers fall
+		// back to `display: "standalone"` with no behavioural change.
+		display_override: ["window-controls-overlay"],
 		// Relative, for the same reason as `base: "./"` above: a rooted scope claims the
 		// proxy's whole origin, which both overreaches and is wrong about where the app
 		// lives. The browser resolves these against the manifest's own URL, so under a
@@ -496,6 +508,12 @@ export default defineConfig(({ mode, command }) => {
 		 * entry script.
 		 */
 		base: "./",
+		worker: {
+			format: "es",
+			// Worker graphs have their own plugins: never inline Shiki's entire grammar registry.
+			// Editor-only workers do not import Shiki and need no substitution.
+			plugins: () => [shikiLanguageAliases(false)],
+		},
 		define: {
 			// Inject dev ports whenever running the dev server (regardless of mode)
 			// so that WS URL rewriting works in start:dev (production mode + vite serve)

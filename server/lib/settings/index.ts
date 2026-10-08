@@ -29,6 +29,7 @@ import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
 import type { NarraForkSettings } from "./types";
+import { normalizeUpdateSourceSettings } from "./update-source";
 
 export {
 	customApiProtocolFromAnthropic,
@@ -42,7 +43,9 @@ export {
 	isAnthropicCustomApiProtocol,
 	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
+	migrateLegacyCustomApiProtocol,
 	migrateProviderPrefixReferences,
+	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	type ProviderPrefixChange,
 	rewriteModelReference,
@@ -132,7 +135,7 @@ export const narraforkDir = getNarraforkHome();
 const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
-const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS = ["nkpProviders", "nkpQuotas"] as const;
+const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = [];
 
 /** The superseded 1MB `agent.requestDumpMaxSize` default, rewritten on load. */
 const LEGACY_REQUEST_DUMP_MAX_SIZE = 1024 * 1024;
@@ -258,7 +261,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
 
-	let needsSave = false;
+	const normalizedUpdate = normalizeUpdateSourceSettings(merged, raw);
+	merged.update = normalizedUpdate.update;
+	let needsSave = normalizedUpdate.needsSave;
 	if (stripObsoleteSettingsKeys(mergedAny)) {
 		needsSave = true;
 	}
@@ -483,6 +488,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (migrateBrowserProxy(merged)) {
+		needsSave = true;
+	}
+
 	if (normalizeSettingsProxyUrls(merged)) {
 		needsSave = true;
 	}
@@ -664,28 +673,41 @@ export function normalizeProxyUrl(value: string | null | undefined): string | un
 	}
 }
 
-export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean {
-	const proxy = settings.proxy;
-	if (!proxy) return false;
-	if (proxy.mode !== "custom") {
-		// url is only meaningful in custom mode — drop stale values.
-		if (proxy.url !== undefined) {
-			delete proxy.url;
-			return true;
-		}
-		return false;
-	}
-	const before = proxy.url;
-	const after = normalizeProxyUrl(before);
-	if (before === after) return false;
-	if (before && !after) {
-		// Preserve unsupported or malformed legacy values so the transport fails
-		// closed and the UI can ask the user to migrate them. Silently switching
-		// to direct mode would bypass an explicitly configured network boundary.
-		return false;
-	}
-	proxy.url = after;
+/** Preserve the formerly shared Browser/WebFetch override once, on settings load. */
+export function migrateBrowserProxy(settings: NarraForkSettings): boolean {
+	if (settings.agent.browserProxy !== undefined) return false;
+	// Persist even the inherited default so later WebFetch edits cannot be mistaken
+	// for a legacy shared override on the next restart. Do not alias the objects.
+	settings.agent.browserProxy = {
+		...(settings.agent.webFetchPolicy?.proxy ?? { mode: "default" }),
+	};
 	return true;
+}
+
+export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean {
+	let changed = false;
+	for (const proxy of [
+		settings.proxy,
+		settings.agent?.webFetchPolicy?.proxy,
+		settings.agent?.browserProxy,
+	]) {
+		if (!proxy) continue;
+		if (proxy.mode !== "custom") {
+			if (proxy.url !== undefined) {
+				delete proxy.url;
+				changed = true;
+			}
+			continue;
+		}
+		const before = proxy.url;
+		const after = normalizeProxyUrl(before);
+		// Preserve unsupported legacy values: silently falling back to direct
+		// would bypass an explicitly configured network boundary.
+		if (before === after || (before && !after)) continue;
+		proxy.url = after;
+		changed = true;
+	}
+	return changed;
 }
 
 /**

@@ -30,6 +30,7 @@
 
 import type { SerializedDockview } from "dockview-react";
 import { filePanelIdentity } from "../../narrator/dock/dock-panel-types";
+import { removeRetiredFilemodPanels } from "../../narrator/panels/layout-envelope";
 import { filePanelResourceId, filePanelResourceParams } from "../../narrator/panels/panel-kind";
 import {
 	isToolEditReference,
@@ -81,6 +82,7 @@ export interface DetachedPanelEntry {
 	fileNarratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
+	largeFileConfirmed?: boolean;
 	toolEdit?: ToolEditReference;
 }
 
@@ -152,12 +154,17 @@ export function resourceIdOf(panel: DetachedPanelEntry): string | undefined {
  *
  * Like `panelIdFor`, this serves the upgrade and create paths only.
  */
-export function makePanelEntry(kind: DetachablePanelKind, resourceId?: string): DetachedPanelEntry {
+export function makePanelEntry(
+	kind: DetachablePanelKind,
+	resourceId?: string,
+	state?: Pick<DetachedPanelEntry, "largeFileConfirmed">,
+): DetachedPanelEntry {
 	return {
 		panelId: panelIdFor(kind, resourceId),
 		kind,
 		...(kind === "subagent" && resourceId ? { subagentNarratorId: resourceId } : {}),
 		...(kind === "file" && resourceId ? filePanelResourceParams(resourceId) : {}),
+		...(kind === "file" && state?.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 	};
 }
 
@@ -203,7 +210,7 @@ function parsePanelEntry(value: unknown): DetachedPanelEntry | null {
 	// function of kind + resource, so recomputing it repairs any drift (a hand-
 	// edited file, a value written by an older shape) instead of trusting a key
 	// that no longer matches what it identifies.
-	return makePanelEntry(v.kind, resourceId);
+	return makePanelEntry(v.kind, resourceId, { largeFileConfirmed: v.largeFileConfirmed === true });
 }
 
 /** Whether a value looks like a restorable dockview layout. */
@@ -235,7 +242,10 @@ function parseNode(value: unknown): DetachedNode | null {
 	const geometry = { id: v.id, x: v.x, y: v.y, w: v.w, h: v.h };
 
 	// v3: a real dockview layout.
-	if (isLayout(v.layout)) return { ...geometry, layout: v.layout };
+	if (isLayout(v.layout)) {
+		const layout = removeRetiredFilemodPanels(v.layout);
+		return layout ? { ...geometry, layout } : null;
+	}
 
 	// v2: a `panels[]` list. v1: the entry itself described a single panel.
 	const rawPanels = Array.isArray(v.panels)

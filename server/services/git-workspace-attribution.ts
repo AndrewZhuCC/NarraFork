@@ -159,10 +159,7 @@ export function redactGitActors(
 			...file,
 			lastActor: actor(file.lastActor),
 			actors: file.actors.map(actor),
-			recentEvents: file.recentEvents.map((event) => ({
-				...event,
-				actor: actor(event.actor),
-			})),
+			recentEvents: file.recentEvents.map((event) => ({ ...event, actor: actor(event.actor) })),
 		})),
 		currentDiff: view.currentDiff
 			? {

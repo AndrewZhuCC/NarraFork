@@ -20,11 +20,12 @@ import {
 	type UseStatusBarPropsOptions,
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
-import { HumanAttentionInboxButton } from "./question/GlobalQuestionInbox";
+import { useNarratorPanelCompact } from "./panels/compact-context";
+import { PermissionRuleResultNotice } from "./permission/PermissionRuleResultNotice";
 
 /**
  * Context shared by several of the interaction area's sub-regions (status bar,
- * queue hook, composer, inbox, merged hint). Passed ONCE and merged locally into
+ * queue hook, composer, merged hint). Passed ONCE and merged locally into
  * the grouped prop objects, rather than repeated inside each of statusBarInputs /
  * queueDeps / composerRowProps by the panel.
  */
@@ -32,7 +33,6 @@ export interface NarratorInteractionCommon {
 	narratorId: string;
 	narrator: UseStatusBarPropsOptions["narrator"];
 	isWorkspacePreview: boolean;
-	compact: boolean | undefined;
 	isMobileViewport: boolean;
 }
 
@@ -71,15 +71,12 @@ export interface NarratorInteractionAreaProps {
 	// ── Status bar — raw inputs; the props are assembled here via useStatusBarProps
 	//    (model / reasoning / codex / permission control sub-objects are computed
 	//    from the control hooks rather than in NarratorPanel). The shared context
-	//    fields (narratorId/narrator/isWorkspacePreview/compact/isMobileViewport)
-	//    come from `common` and are omitted here. ──
+	//    fields (narratorId/narrator/isWorkspacePreview/isMobileViewport) come from
+	//    `common`; compact comes from the responsive context. All are omitted here. ──
 	statusBarInputs: Omit<
 		UseStatusBarPropsOptions,
 		"narratorId" | "narrator" | "isWorkspacePreview" | "compact" | "isMobileViewport"
 	>;
-
-	// ── Human-attention inbox ──
-	showHumanAttentionInbox: boolean;
 
 	// ── Composer row — the queue press-and-hold gesture fields are injected here
 	//    from the local useQueuedMessageActions call, not threaded from the panel;
@@ -100,6 +97,8 @@ export interface NarratorInteractionAreaProps {
 
 export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const { t } = useTranslation("narrator");
+	const retainWorktreeRequirement = (text: string) =>
+		props.composerRowProps.composerRef.current?.appendText(text);
 	const bottomSpacing = useBottomSpacing();
 	const commentDrafts = useCommentDrafts(props.common.narratorId);
 	const { data: specFiles } = useSpecFiles(props.common.narratorId);
@@ -110,10 +109,13 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	}, [specFiles]);
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
-	const statusBar = useStatusBarProps({ ...props.common, ...props.statusBarInputs });
+	const compact = useNarratorPanelCompact();
+	const statusBar = useStatusBarProps({ ...props.common, ...props.statusBarInputs, compact });
 	// Queue buffer interactions live here rather than in the panel: every output
 	// below is consumed only within this component's subtree.
 	const {
+		visibleQueuedMessages,
+		urgentDispatches,
 		queueHoldProgress,
 		startQueueHold,
 		cancelQueueHold,
@@ -123,6 +125,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		handleRemoveQueued,
 		handleRetryQueued,
 		handleDragEndQueued,
+		handleMoveQueued,
+		handleChangeMode,
 		editingQueuedId,
 		queueExpanded,
 		setQueueExpanded,
@@ -131,11 +135,9 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		handleSaveEditQueued,
 	} = useQueuedMessageActions({ narratorId: props.common.narratorId, ...props.queueDeps, t });
 
-	const hasImages = props.attachedImages.length > 0;
-
 	return (
 		<Box style={{ position: "relative", flexShrink: 0 }}>
-			{/* Thin resize line at the Git boundary; the line itself is the drag target. */}
+			{/* Resize boundary; the queue draws its own top border when present. */}
 			<Box
 				onPointerDown={startBottomSpacingResize}
 				role="separator"
@@ -150,8 +152,64 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 					cursor: "ns-resize",
 					touchAction: "none",
 					zIndex: 100,
-					borderTop: "1px solid var(--mantine-color-default-border)",
+					borderTop:
+						props.queueDeps.queuedMessages.length > 0
+							? undefined
+							: "1px solid var(--mantine-color-default-border)",
 				}}
+			/>
+
+			{/* Queued messages indicator */}
+			<QueuedMessagesPanel
+				narratorId={props.common.narratorId}
+				queuedMessages={visibleQueuedMessages ?? props.queueDeps.queuedMessages}
+				urgentDispatches={urgentDispatches}
+				queueExpanded={queueExpanded}
+				setQueueExpanded={setQueueExpanded}
+				editingQueuedId={editingQueuedId}
+				handleDragEndQueued={handleDragEndQueued}
+				handleMoveQueued={handleMoveQueued}
+				handleChangeMode={handleChangeMode}
+				handleSaveEditQueued={handleSaveEditQueued}
+				handleCancelEditQueued={handleCancelEditQueued}
+				handleStartEditQueued={handleStartEditQueued}
+				handleRemoveQueued={handleRemoveQueued}
+				handleRetryQueued={handleRetryQueued}
+				handleCancelAllQueued={handleCancelAllQueued}
+			/>
+
+			{/* Chapter bar — clicking the info strip opens the Git view. */}
+			{props.chapterId && (
+				<ChapterBar
+					chapterId={props.chapterId}
+					narratorId={props.common.narratorId}
+					onOpenGitPanel={props.onOpenGitPanel}
+					onRequirement={retainWorktreeRequirement}
+				/>
+			)}
+
+			{/* Standalone narrators have no chapter bar; offer the git workspace strip instead. */}
+			{!props.chapterId && props.onOpenGitPanel && (
+				<Box style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}>
+					<NarratorGitBar
+						narratorId={props.common.narratorId}
+						onOpenGitPanel={props.onOpenGitPanel}
+						onRequirement={retainWorktreeRequirement}
+					/>
+				</Box>
+			)}
+
+			{/* Policy activation is shown only after a successful execution receipt. */}
+			{!props.common.isWorkspacePreview && (
+				<PermissionRuleResultNotice
+					key={props.common.narratorId}
+					narratorId={props.common.narratorId}
+				/>
+			)}
+			{/* Status bar */}
+			<NarratorInteractionStatusBar
+				{...statusBar}
+				borderTop={props.chapterId || props.onOpenGitPanel ? undefined : statusBar.borderTop}
 			/>
 
 			{/* Staged image + text-file previews (owns its own object-URL previews). */}
@@ -171,52 +229,6 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 			{/* Upload / send progress while attachments upload. */}
 			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
-
-			{/* Queued messages indicator */}
-			<QueuedMessagesPanel
-				queuedMessages={props.queueDeps.queuedMessages}
-				queueExpanded={queueExpanded}
-				setQueueExpanded={setQueueExpanded}
-				editingQueuedId={editingQueuedId}
-				hasImages={hasImages}
-				handleDragEndQueued={handleDragEndQueued}
-				handleSaveEditQueued={handleSaveEditQueued}
-				handleCancelEditQueued={handleCancelEditQueued}
-				handleStartEditQueued={handleStartEditQueued}
-				handleRemoveQueued={handleRemoveQueued}
-				handleRetryQueued={handleRetryQueued}
-				handleCancelAllQueued={handleCancelAllQueued}
-			/>
-
-			{/* Chapter bar — clicking the info strip opens the Git view. */}
-			{props.chapterId && (
-				<ChapterBar
-					chapterId={props.chapterId}
-					narratorId={props.common.narratorId}
-					onOpenGitPanel={props.onOpenGitPanel}
-				/>
-			)}
-
-			{/* Standalone narrators have no chapter bar; offer the git workspace strip instead. */}
-			{!props.chapterId && props.onOpenGitPanel && (
-				<Box style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}>
-					<NarratorGitBar
-						narratorId={props.common.narratorId}
-						onOpenGitPanel={props.onOpenGitPanel}
-					/>
-				</Box>
-			)}
-
-			{/* Status bar */}
-			<NarratorInteractionStatusBar {...statusBar} />
-
-			{/* Question inbox, directly above the composer. */}
-			{!props.common.isWorkspacePreview && props.showHumanAttentionInbox && (
-				<Box px="md" pb={4} style={{ flexShrink: 0 }}>
-					<HumanAttentionInboxButton currentNarratorId={props.common.narratorId} />
-				</Box>
-			)}
-
 			{/* Input */}
 			{props.common.isWorkspacePreview ? null : props.isChapterMerged ? (
 				<Box

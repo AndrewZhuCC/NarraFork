@@ -1,10 +1,14 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { segmentMessages } from "../message/message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import {
 	type AdapterActivityInput,
+	type AdapterContentBlock,
 	type AdapterContext,
 	type AdapterSegment,
+	adaptRenderUnits,
 	adaptSegment,
 	adaptSegments,
 	classifyContentBlock,
@@ -2296,8 +2300,8 @@ describe("folded tool rows — drill-down payload", () => {
 		inputJson: { file_path: "/a/b.ts" },
 		outputJson: { _text: "line1\nline2\n" },
 	});
-	const msgWith = (blocks: unknown[], id = "m1") =>
-		({ id, role: "assistant", contentJson: blocks }) as never;
+	const msgWith = (blocks: unknown[], id = "m1", model?: string) =>
+		({ id, role: "assistant", contentJson: blocks, model }) as never;
 	const activityRows = (spec: { data: unknown }): Row[] => (spec.data as { items: Row[] }).items;
 
 	it("a collapsed row carries no card (the fold stays cheap)", async () => {
@@ -2351,7 +2355,7 @@ describe("folded tool rows — drill-down payload", () => {
 	it("reports the expanded row's index over the EMITTED rows, not the input items", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const blocks = [{ type: "reasoning", text: "**A**\n\nfirst\n\n**B**\n\nsecond" }];
-		const msg = msgWith(blocks);
+		const msg = msgWith(blocks, "m1", "gpt-5.6");
 		const items = [
 			{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
 			{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
@@ -2378,7 +2382,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const openedFor = (text: string) => {
 			const blocks = [{ type: "reasoning", text }];
-			const msg = msgWith(blocks);
+			const msg = msgWith(blocks, "m1", "gpt-5.6");
 			const spec = adaptActivityUnit(
 				[
 					{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
@@ -2550,6 +2554,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const msg = {
 			id: "m-reason",
+			model: "gpt-5.6",
 			role: "assistant" as const,
 			contentJson: [
 				{
@@ -2580,6 +2585,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const msg = {
 			id: "__streaming__",
+			model: "gpt-5.6",
 			role: "assistant" as const,
 			contentJson: [
 				{ type: "reasoning", text: ["**Check the cache**", "The key folds lod in."].join("\n") },
@@ -2618,6 +2624,97 @@ describe("folded tool rows — drill-down payload", () => {
 	});
 });
 
+describe("structured reasoning model gate", () => {
+	const models = [
+		"gpt-5.6",
+		"nug:openai:GPT-5.6",
+		"claude-sonnet-4.6",
+		"gemini-3",
+		undefined,
+	] as const;
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s gates short titles and the long-single shortcut for live and historical messages", async (lod) => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const { parseReasoningSegments } = await import("@shared/pretext-layout/reasoning-segments");
+		for (const model of models) {
+			for (const id of ["__streaming__", "gate-history"]) {
+				for (const text of [
+					"**Plan**\n\nbody\n\n**Check**\n\nnext",
+					`**Plan**\n\n${"body ".repeat(40_000)}`,
+				]) {
+					const block = { type: "reasoning", text };
+					const msg = { id, role: "assistant", model, contentJson: [block] };
+					let parses = 0;
+					const ctx: AdapterContext = {
+						lod,
+						resolveReasoningSegments: (source) => {
+							parses++;
+							return parseReasoningSegments(source);
+						},
+					};
+					const isGpt = model === "gpt-5.6" || model === "nug:openai:GPT-5.6";
+					if (lod <= 2) {
+						const spec = adaptActivityUnit(
+							[{ kind: "reasoning", msg, blockIndex: 0, block }],
+							`gate-${model}-${id}`,
+							ctx,
+						);
+						const rows = (spec.data as { items: { bodyText?: string; title: string }[] }).items;
+						expect(rows).toHaveLength(isGpt && text.length < 100 ? 2 : 1);
+						if (!isGpt && id !== "__streaming__") expect(rows[0]?.bodyText).toBe(text);
+					} else {
+						const [spec] = adaptSegment({ kind: "message", msg }, ctx);
+						expect(spec!.kind).toBe(isGpt ? "reasoning-steps" : "reasoning");
+						if (!isGpt) expect((spec!.data as { text: string }).text).toBe(text);
+						else
+							expect((spec!.data as { steps: { title: string }[] }).steps[0]?.title).toBe("Plan");
+						if (text.length > 100) expect(parses).toBe(0);
+					}
+					if (!isGpt) expect(parses).toBe(0);
+				}
+			}
+		}
+	});
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s uses each message's model in mixed live/history sessions", async (lod) => {
+		const { groupRenderUnits } = await import("../trace/render-units");
+		const text = "**Plan**\n\nbody\n\n**Check**\n\nnext";
+		for (const liveModel of ["gpt-5.6", "claude-sonnet-4.6", undefined]) {
+			const messages = ["gpt-5.6", "claude-sonnet-4.6", undefined, liveModel].map(
+				(model, index) => ({
+					id: index === 3 ? "__streaming__" : `mixed-${index}`,
+					role: "assistant",
+					model,
+					contentJson: [{ type: "reasoning", text }],
+					toolCalls: [],
+					children: [],
+				}),
+			);
+			const units = groupRenderUnits(segmentMessages(messages as never), lod <= 2);
+			const specs = adaptRenderUnits(units as never, { lod });
+			if (lod <= 2) {
+				const rows = specs.flatMap(
+					(spec) => (spec.data as { items?: { bodyText?: string }[] }).items ?? [],
+				);
+				expect(rows).toHaveLength(liveModel === "gpt-5.6" ? 6 : 5);
+				expect(rows[2]?.bodyText).toBe(text);
+				expect(rows[3]?.bodyText).toBe(text);
+			} else {
+				expect(specs.map((spec) => spec.kind)).toEqual([
+					"reasoning-steps",
+					"reasoning",
+					"reasoning",
+					liveModel === "gpt-5.6" ? "reasoning-steps" : "reasoning",
+				]);
+			}
+		}
+	});
+});
+
 describe("LOD matrix adapter semantics", () => {
 	it("renders structured reasoning as the SAME expandable step trace at L3/L4/L5", () => {
 		// There is no level whose step titles are visible but unopenable (the former
@@ -2626,6 +2723,7 @@ describe("LOD matrix adapter semantics", () => {
 			kind: "message",
 			msg: {
 				id: "reasoning-1",
+				model: "gpt-5.6",
 				role: "assistant",
 				contentJson: [
 					{ type: "reasoning", text: ["**Plan**", "<!-- -->", "**Check**", "body"].join("\n\n") },
@@ -3941,6 +4039,7 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 	const twoStepMessage = (id = "real-msg", blocks?: unknown[]) =>
 		({
 			id,
+			model: "gpt-5.6",
 			role: "assistant",
 			contentJson: blocks ?? [
 				{ type: "reasoning", text: "**第一步**\n\n分析正文。\n\n**第二步**\n\n继续分析。" },
@@ -4140,8 +4239,346 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
  *
  * So these cases pin the routing and the payload, not a nesting arrangement.
  */
+describe("mixed action-card display runs from real message segments", () => {
+	function msg(id: string, blocks: Record<string, unknown>[], role = "assistant"): NarratorMsg {
+		return {
+			id,
+			role,
+			contentJson: blocks,
+			toolCalls: [],
+			children: [],
+			parentToolUseId: null,
+		} as unknown as NarratorMsg;
+	}
+	function tool(id: string, name = "Read") {
+		return {
+			type: "tool_use",
+			id,
+			name,
+			inputJson:
+				name === "Send"
+					? { id: "worker", message: "hello" }
+					: { file_path: "a.ts", prompt: "inspect" },
+			status: "success",
+		};
+	}
+	const search = { type: "web_search", query: "layout", status: "completed" };
+	const generated = { type: "image_generation", status: "completed", width: 320, height: 160 };
+	function adapt(messages: NarratorMsg[], ctx = CTX) {
+		return adaptSegments(segmentMessages(messages) as unknown as AdapterSegment[], ctx);
+	}
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s joins visible tools, subagent and native cards across assistant boundaries", (lod) => {
+		const messages = [
+			msg("mixed-a", [{ ...tool("read"), status: "running" }, search]),
+			msg("mixed-b", [generated, tool("agent", "Agent"), { ...tool("last"), status: "running" }]),
+		];
+		// Active tools stay full cards even at low LOD; no fabricated ElementSpecs.
+		const ctx: AdapterContext = { lod, recentMessageIds: new Set(messages.map((m) => m.id)) };
+		const specs = adapt(messages, ctx);
+		expect(specs.map((s) => s.kind)).toEqual([
+			"tool-call",
+			"web-search",
+			"media",
+			"subagent-card",
+			"tool-call",
+		]);
+		expect(specs.map((s) => [s.opts?.inRun, s.opts?.isLast])).toEqual([
+			[true, false],
+			[true, false],
+			[true, false],
+			[true, false],
+			[true, true],
+		]);
+		for (const spec of specs.filter((s) => s.kind === "tool-call")) {
+			expect(spec.data).toMatchObject({ inRun: spec.opts?.inRun, isLast: spec.opts?.isLast });
+		}
+		expect(
+			adaptRenderUnits(
+				(segmentMessages(messages) as unknown as AdapterSegment[]).map((seg) => ({
+					kind: "segment",
+					seg,
+				})),
+				ctx,
+			),
+		).toEqual(specs);
+	});
+
+	it.each([
+		["text", [{ type: "text", text: "answer" }], "assistant"],
+		["thinking", [{ type: "thinking", thinking: "considering" }], "assistant"],
+		["attachment", [{ type: "image", width: 320, height: 160 }], "assistant"],
+		["user", [{ type: "text", text: "next question" }], "user"],
+		["empty user", [], "user"],
+		["system", [{ type: "text", text: "notice" }], "system"],
+		["communication", [tool("send", "Send")], "assistant"],
+	] as const)("%s breaks two otherwise adjacent native-card runs", (_label, blocks, role) => {
+		const messages = [
+			msg("before", [tool("before-tool"), search]),
+			msg("breaker", [...blocks], role),
+			msg("after", [generated, tool("after-tool")]),
+		];
+		const specs = adapt(messages);
+		expect(
+			adaptRenderUnits(
+				(segmentMessages(messages) as unknown as AdapterSegment[]).map((seg) => ({
+					kind: "segment",
+					seg,
+				})),
+				CTX,
+			),
+		).toEqual(specs);
+		const cards = specs.filter(
+			(s) =>
+				["tool-call", "web-search", "media"].includes(s.kind) &&
+				!(s.kind === "media" && (s.data as { type: string }).type !== "image_generation"),
+		);
+		expect(cards.map((s) => [s.opts?.inRun, s.opts?.isLast])).toEqual([
+			[true, false],
+			[true, true],
+			[true, false],
+			[true, true],
+		]);
+	});
+
+	it("activity traces break runs, and collapsed low-LOD tools do not bridge native cards", () => {
+		const segments = segmentMessages([
+			msg("before", [search]),
+			msg("old-tool", [tool("old")]),
+			msg("after", [generated]),
+		]) as unknown as AdapterSegment[];
+		const low = adaptSegments(segments, { lod: 1, recentMessageIds: new Set() });
+		expect(low.map((s) => s.kind)).toEqual(["web-search", "tool-run-count", "media"]);
+		expect(low[0]?.opts).toMatchObject({ inRun: false, isLast: true });
+		expect(low[2]?.opts).toMatchObject({ inRun: false, isLast: true });
+		const activity = adaptRenderUnits(
+			[
+				{ kind: "segment", seg: segments[0]! },
+				{ kind: "activity", key: "trace-break", items: [], sourceMessages: [] },
+				{ kind: "segment", seg: segments[2]! },
+			],
+			CTX,
+		);
+		expect(activity.map((s) => s.kind)).toEqual(["web-search", "activity-trace", "media"]);
+		expect(activity[0]?.opts).toMatchObject({ inRun: false, isLast: true });
+		expect(activity[2]?.opts).toMatchObject({ inRun: false, isLast: true });
+	});
+
+	it("stream append changes only the prior tail's run context and leaves earlier cards stable", () => {
+		const messages = [msg("stable", [tool("stable-read"), search, generated])];
+		const before = adapt(messages);
+		const after = adapt([...messages, msg("append", [tool("append-tool")])]);
+		expect(after.slice(0, 2)).toEqual(before.slice(0, 2));
+		expect(before[2]?.opts).toMatchObject({ inRun: true, isLast: true });
+		expect(after[2]?.opts).toMatchObject({ inRun: true, isLast: false });
+		expect(after[3]?.opts).toMatchObject({ inRun: true, isLast: true });
+	});
+});
+
 describe("adaptSegment — a concluded review", () => {
 	const CTX: AdapterContext = { lod: 5 };
+
+	describe("independent text preview expansion", () => {
+		const message = (
+			id: string,
+			role: string,
+			contentJson: AdapterContentBlock[],
+			model?: string,
+		): AdapterSegment => ({
+			kind: "message",
+			msg: { id, role, contentJson, model },
+		});
+
+		it("preserves durable body expansion across streaming hand-off without reusing it for a new block", async () => {
+			const { textExpansionStateKey } = await import("./segment-adapter");
+			const { createVListInteractionState, setVListTextExpanded, isVListTextExpanded } =
+				await import("./vlist-interaction-state");
+			let state = createVListInteractionState(5);
+			const context: AdapterContext = {
+				lod: 5,
+				isTextExpanded: (key, bodyKey) => isVListTextExpanded(state, key, bodyKey),
+			};
+			const text = "full retained body ".repeat(1000);
+			const make = (messageId: string, blockId: string, body = text) =>
+				adaptSegment(
+					message(
+						messageId,
+						"assistant",
+						[{ type: "reasoning", id: blockId, text: body }],
+						"gpt-5.6",
+					),
+					context,
+				)[0]!;
+			const live = make("__streaming__", "durable-reasoning");
+			const canonical = textExpansionStateKey(live.key, live.lifecycleId);
+			state = setVListTextExpanded(state, live.key, true, undefined, canonical);
+			expect(make("__streaming__", "durable-reasoning").opts!.textExpanded).toBe(true);
+			const committed = make("persisted-1", "durable-reasoning");
+			expect(committed.key).not.toBe(live.key);
+			expect(committed.opts!.textExpanded).toBe(true);
+			expect((committed.data as { text: string }).text).toBe(text);
+			expect(make("__streaming__", "new-turn-reasoning").opts!.textExpanded).toBe(false);
+			state = setVListTextExpanded(state, committed.key, false, undefined, canonical);
+			expect(make("__streaming__", "durable-reasoning").opts!.textExpanded).toBe(false);
+			expect(isVListTextExpanded(state, live.key)).toBe(false);
+
+			const structured = make(
+				"__streaming__",
+				"durable-steps",
+				"**First**\n\nfirst\n\n**Second**\n\nsecond",
+			);
+			state = setVListTextExpanded(
+				state,
+				structured.key,
+				true,
+				"seg0",
+				textExpansionStateKey(structured.key, structured.lifecycleId),
+			);
+			expect(
+				make("persisted-steps", "durable-steps", "**First**\n\nfirst\n\n**Second**\n\nsecond").opts!
+					.textExpandedKeys,
+			).toEqual(["seg0"]);
+		});
+
+		it("forwards the same direct body option for ordinary and streaming reasoning", () => {
+			for (const id of ["ordinary", "__streaming__"]) {
+				const [spec] = adaptSegment(
+					message(id, "assistant", [{ type: "reasoning", text: "whole source" }]),
+					{
+						lod: 5,
+						isTextExpanded: (key) => key === `${id}-b0`,
+					},
+				);
+				expect(spec!.opts!.textExpanded).toBe(true);
+				expect((spec!.data as { text: string }).text).toBe("whole source");
+			}
+		});
+
+		it("does not change ordinary markdown or message-bubble measurement options", () => {
+			for (const role of ["user", "assistant"]) {
+				const [spec] = adaptSegment(
+					message("plain", role, [{ type: "text", text: "full source" }]),
+					{
+						lod: 5,
+						isTextExpanded: () => true,
+					},
+				);
+				expect(spec!.opts).toBeUndefined();
+			}
+		});
+
+		it("wires native injection bodies independently of mutation permissions", () => {
+			const [spec] = adaptSegment(
+				message("inject", "sys", [
+					{
+						type: "system_injection",
+						source: "team_message",
+						modelText: "full source",
+						body: {
+							kind: "messages",
+							items: [{ fromId: "worker", fromType: "subagent", text: "full source" }],
+						},
+					},
+				]),
+				{
+					lod: 5,
+					isTextExpanded: () => true,
+				},
+			);
+			expect(spec!.kind).toBe("injection-bubble");
+			expect(spec!.opts!.textExpanded).toBe(true);
+		});
+
+		it("addresses step bodies by emitted row key while retaining full source", () => {
+			const body = "source paragraph ".repeat(1000);
+			const [spec] = adaptSegment(
+				message(
+					"steps",
+					"assistant",
+					[{ type: "reasoning", text: `**First**\n\n${body}\n\n**Second**\n\nsecond body` }],
+					"gpt-5.6",
+				),
+				{
+					lod: 5,
+					expandedRows: () => [0],
+					isTextExpanded: (key, bodyKey) => key === "steps-b0" && bodyKey === "seg0",
+				},
+			);
+			expect(spec!.kind).toBe("reasoning-steps");
+			expect(spec!.opts!.textExpandedKeys).toEqual(["seg0"]);
+			expect((spec!.data as { steps: { body: string }[] }).steps[0]!.body).toBe(body.trim());
+		});
+
+		it("avoids re-parsing a giant single titled paragraph but preserves later step identity", async () => {
+			const { parseReasoningSegments } = await import("@shared/pretext-layout/reasoning-segments");
+			const body = "full body ".repeat(40_000);
+			let parses = 0;
+			const context: AdapterContext = {
+				lod: 5,
+				resolveReasoningSegments: (text) => {
+					parses++;
+					return parseReasoningSegments(text);
+				},
+			};
+			const make = (text: string) =>
+				adaptSegment(
+					message("large-single-step", "assistant", [{ type: "reasoning", text }], "gpt-5.6"),
+					context,
+				)[0]!;
+			const first = make(`**First**\n\n${body}`);
+			const appended = make(`**First**\n\n${body}append`);
+			expect(parses).toBe(0);
+			expect(first.kind).toBe("reasoning-steps");
+			expect((appended.data as { steps: { body: string; key: string }[] }).steps[0]).toMatchObject({
+				body: `${body}append`,
+				key: "seg0",
+			});
+			const second = make(`**First**\n\n${body}append\n\n**Second**\n\nnext`);
+			expect(parses).toBe(1);
+			expect((second.data as { steps: { key: string }[] }).steps.map((step) => step.key)).toEqual([
+				"seg0",
+				"seg1",
+			]);
+		});
+
+		it("keeps full step bodies and keys exact across high-LOD multi-paragraph streaming", async () => {
+			const { parseReasoningSegments } = await import("@shared/pretext-layout/reasoning-segments");
+			const text = `**First**\n\n${"first paragraph\n\n".repeat(1000)}**Second**\n\n${"second paragraph\n\n".repeat(1000)}`;
+			for (const length of [9000, 16000, 22000, text.length]) {
+				const source = text.slice(0, length);
+				const [spec] = adaptSegment(
+					message("__streaming__", "assistant", [{ type: "reasoning", text: source }], "gpt-5.6"),
+					{ lod: 5 },
+				);
+				const steps = (spec!.data as { steps: { key: string; body: string | null }[] }).steps;
+				const expected = parseReasoningSegments(source);
+				expect(steps.map((step) => step.key)).toEqual(expected.map((_, index) => `seg${index}`));
+				expect(steps.map((step) => step.body)).toEqual(
+					expected.map((step) => (step.isEmpty ? null : step.body)),
+				);
+			}
+		});
+
+		it("budgets a giant plain run before paragraph parsing without losing source", () => {
+			const text = "plain reasoning ".repeat(40_000);
+			let parses = 0;
+			const [spec] = adaptSegment(
+				message("large-plain", "assistant", [{ type: "reasoning", text }], "gpt-5.6"),
+				{
+					lod: 5,
+					resolveReasoningSegments: () => {
+						parses++;
+						return [];
+					},
+				},
+			);
+			expect(parses).toBe(0);
+			expect(spec!.kind).toBe("reasoning");
+			expect((spec!.data as { text: string }).text).toBe(text);
+		});
+	});
 
 	describe("publication result receipts", () => {
 		const publicationResult = {

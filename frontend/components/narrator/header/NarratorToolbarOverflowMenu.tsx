@@ -283,6 +283,12 @@ export interface NarratorToolbarOverflowMenuProps {
 	/** Archive action, pinned below the sortable list. Omit to hide it. */
 	onArchive?: () => void;
 	archiveLoading?: boolean;
+	/**
+	 * Opens the compatibility modal. The modal itself lives outside this dropdown
+	 * (rendered by the caller): nested in here it would unmount with the menu and
+	 * sit under the open dropdown on a phone.
+	 */
+	onOpenCompatibility?: () => void;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -296,8 +302,10 @@ export function NarratorToolbarOverflowMenu({
 	renderInlineOptions,
 	onArchive,
 	archiveLoading,
+	onOpenCompatibility,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
+	const { t: tp } = useTranslation("projects");
 	const [menuOpen, setMenuOpen] = useState(false);
 	/**
 	 * At most one expansion at a time, and never across an open/close cycle: a
@@ -494,6 +502,19 @@ export function NarratorToolbarOverflowMenu({
 						})}
 					</SortableContext>
 				</DndContext>
+				{onOpenCompatibility && (
+					<>
+						<Menu.Divider />
+						<Menu.Item
+							onClick={() => {
+								closeMenu();
+								onOpenCompatibility();
+							}}
+						>
+							{tp("compatibility.title")}
+						</Menu.Item>
+					</>
+				)}
 				{onArchive ? (
 					<>
 						<Menu.Divider />

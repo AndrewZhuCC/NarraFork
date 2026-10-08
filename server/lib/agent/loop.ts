@@ -1,5 +1,13 @@
 import { resolve } from "node:path";
+import type { ContextCharCache } from "@shared/context-composition";
+import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	createStreamingEditOrigin,
+	STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS,
+	type StreamingEditOrigin,
+	validateStreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
@@ -17,13 +25,20 @@ import {
 	resolveBooleanOverride,
 } from "../boolean-override";
 import { recordCacheDropDiagnostic, resetCacheDropBaseline } from "../cache-drop-diagnostics";
+import { matchContextComposition, validInputCharacters } from "../context-usage-snapshot";
 import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { shouldUseNativeSearch } from "../search/native";
+import {
+	consumeSearchExecutionTurn,
+	getSearchExecutionScope,
+	matchesSearchExecutionScope,
+	SearchExecutionBudgetExceededError,
+} from "../search/execution-scope";
+import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
@@ -42,8 +57,8 @@ import {
 	isResumableError,
 	isRetryableError,
 } from "./error-handling";
-import { estimateTokens } from "./estimate-tokens";
 import { localPathSemantics } from "./execution/path-semantics";
+import { countInputCharacters } from "./input-characters";
 import {
 	buildMalformedCaptureRecord,
 	isMalformedRequestBodyError,
@@ -51,6 +66,13 @@ import {
 } from "./malformed-request-dump";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ChatParams, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
+import { projectQuestionModelInput } from "./question-model-input";
+import {
+	bindPermissionRecovery,
+	isRecoveredHumanPermission,
+	type PersistedRecoveryGate,
+	recoveryReflection,
+} from "./recovery-gate";
 import { ApiRequestDumpCollector, CACHE_DIAGNOSTIC_DUMP_MAX_BYTES } from "./request-dump";
 import { detectShell } from "./shell";
 import {
@@ -62,12 +84,14 @@ import {
 import {
 	executeTool,
 	freezeToolExecution,
+	getReflectionToolRejection,
 	preAdmitToolExecution,
 	releaseToolAdmissionState,
 	sanitizeBrokenInput,
 	type ToolAdmissionState,
 	type ToolExecResult,
 } from "./tool-executor";
+import { ToolInputStream } from "./tool-input-stream";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import {
@@ -147,150 +171,10 @@ export function filterDeviceTools(
 // requiring a complete JSON object. Used to provide structured
 // field data to the frontend instead of raw JSON.
 
-/** Find the unescaped closing quote in a JSON string value. Returns -1 if not found. */
-function findClosingQuote(s: string, start: number): number {
-	for (let i = start; i < s.length; i++) {
-		if (s.charCodeAt(i) === 0x5c /* \ */) {
-			i++; // skip escaped char
-			continue;
-		}
-		if (s.charCodeAt(i) === 0x22 /* " */) return i;
-	}
-	return -1;
-}
-
-/** Decode JSON string escapes, withholding an incomplete trailing escape until a later chunk. */
-function decodeJsonStringFragment(s: string): { text: string; consumedChars: number } {
-	let text = "";
-	let i = 0;
-	while (i < s.length) {
-		const ch = s[i];
-		if (ch !== "\\") {
-			text += ch;
-			i++;
-			continue;
-		}
-
-		if (i + 1 >= s.length) break;
-		const escaped = s[i + 1];
-		switch (escaped) {
-			case '"':
-				text += '"';
-				i += 2;
-				break;
-			case "\\":
-				text += "\\";
-				i += 2;
-				break;
-			case "/":
-				text += "/";
-				i += 2;
-				break;
-			case "b":
-				text += "\b";
-				i += 2;
-				break;
-			case "f":
-				text += "\f";
-				i += 2;
-				break;
-			case "n":
-				text += "\n";
-				i += 2;
-				break;
-			case "r":
-				text += "\r";
-				i += 2;
-				break;
-			case "t":
-				text += "\t";
-				i += 2;
-				break;
-			case "u": {
-				const hex = s.slice(i + 2, i + 6);
-				if (hex.length < 4) return { text, consumedChars: i };
-				if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
-					text += `\\${escaped}`;
-					i += 2;
-					break;
-				}
-				text += String.fromCharCode(Number.parseInt(hex, 16));
-				i += 6;
-				break;
-			}
-			default:
-				// Preserve malformed escapes rather than dropping user-visible text.
-				text += `\\${escaped}`;
-				i += 2;
-		}
-	}
-	return { text, consumedChars: i };
-}
-
-/** Unescape JSON string content. Incomplete trailing escapes are preserved for completed fields. */
-function unescapeJsonString(s: string): string {
-	const decoded = decodeJsonStringFragment(s);
-	return decoded.consumedChars === s.length
-		? decoded.text
-		: decoded.text + s.slice(decoded.consumedChars);
-}
-
-interface ExtractedFieldsResult {
-	/** Completed short fields (key → unescaped value) */
-	fields: Record<string, string>;
-	/** The field currently being written (no closing quote yet), or null */
-	activeField: { name: string; rawStart: number } | null;
-}
-
-/**
- * Extract selected fields from an incomplete JSON object.
- * Scans for `"key": "value"` patterns, handling escaped quotes correctly, and also
- * captures completed primitive values such as booleans for short fields.
- * Returns completed fields and identifies the currently-streaming string field.
- */
-function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): ExtractedFieldsResult {
-	const fields: Record<string, string> = {};
-	let activeField: ExtractedFieldsResult["activeField"] = null;
-
-	// Match `"key" :` patterns
-	const keyRe = /"(\w+)"\s*:\s*/g;
-	for (;;) {
-		const m = keyRe.exec(raw);
-		if (m === null) break;
-		const key = m[1];
-		if (!wantedKeys.has(key)) continue;
-		const afterColon = m.index + m[0].length;
-		if (afterColon >= raw.length) continue;
-		if (raw.charCodeAt(afterColon) !== 0x22 /* " */) {
-			const primitiveMatch = raw
-				.slice(afterColon)
-				.match(/^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
-			if (primitiveMatch) {
-				fields[key] = primitiveMatch[1];
-				keyRe.lastIndex = afterColon + primitiveMatch[0].length;
-			}
-			continue;
-		}
-		const valueStart = afterColon + 1;
-		const closeQuote = findClosingQuote(raw, valueStart);
-		if (closeQuote !== -1) {
-			// Complete field
-			fields[key] = unescapeJsonString(raw.slice(valueStart, closeQuote));
-			// Advance past this field so we don't re-match inside the value
-			keyRe.lastIndex = closeQuote + 1;
-		} else {
-			// No closing quote — this field is still being written
-			activeField = { name: key, rawStart: valueStart };
-			break; // Nothing meaningful after an incomplete string value
-		}
-	}
-	return { fields, activeField };
-}
-
 /** Per-tool mapping: which fields to extract, and which are "large" (streamed incrementally) */
 const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = {
 	Write: { short: ["file_path"], large: ["content"] },
-	Edit: { short: ["file_path", "replace_all"], large: ["old_string", "new_string"] },
+	Edit: { short: ["file_path", "device", "replace_all"], large: ["old_string", "new_string"] },
 	Bash: { short: ["description"], large: ["command"] },
 	Grep: { short: ["pattern", "path", "glob", "output_mode", "type"], large: [] },
 	Glob: { short: ["pattern", "path"], large: [] },
@@ -317,34 +201,51 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
 };
 
-function getToolWantedKeys(toolName: string): Set<string> {
-	const config = TOOL_FIELD_CONFIG[toolName];
-	if (!config) return new Set();
-	return new Set([...config.short, ...config.large]);
-}
-
-/** Tools whose input is short enough that streaming JSON parsing adds no value.
- *  We still emit tool_use_chunk events (so the frontend shows the shimmer),
- *  but skip extractJsonFields / streaming field extraction entirely.
- *  Tools with short fields (e.g. Grep.pattern, Read.file_path) still need extraction. */
-function isShortInputTool(name: string): boolean {
-	const config = TOOL_FIELD_CONFIG[name];
-	if (!config) return true; // not in config → short by default
-	return config.large.length === 0 && config.short.length === 0;
+interface StreamingToolAccumulator {
+	name: string;
+	stream: ToolInputStream;
+	totalChars: number;
+	startedAt: number;
+	streamCompletedAt?: number;
+	extractedFilePath?: string;
+	extractedFields?: Record<string, string>;
+	pendingShort: Record<string, string>;
+	streamingMetadata?: Record<string, unknown>;
+	streamingEditOrigin?: StreamingEditOrigin;
+	metadataAttempted?: boolean;
+	lastYieldedAt: number;
+	outputIndex?: number;
+	thoughtSignature?: string;
+	thoughtSignatureSource?: string;
 }
 
 function normalizeLineEndings(text: string): string {
 	return text.replaceAll("\r\n", "\n");
 }
 
-async function resolveStreamingEditMetadata(
-	acc: { name: string; extractedFilePath?: string; extractedFields?: Record<string, string> },
+export async function resolveStreamingEditMetadata(
+	acc: {
+		name: string;
+		extractedFilePath?: string;
+		extractedFields?: Record<string, string>;
+		streamingEditOrigin?: StreamingEditOrigin;
+	},
 	cwd: string,
+	toolUseId: string,
+	defaultDeviceId = "local",
 ): Promise<Record<string, unknown> | undefined> {
 	if (acc.name !== "Edit") return undefined;
 	const filePath = acc.extractedFilePath ?? acc.extractedFields?.file_path;
 	const oldString = acc.extractedFields?.old_string;
-	if (!filePath || oldString == null || oldString === "") return undefined;
+	const device = acc.extractedFields?.device ?? defaultDeviceId;
+	// This matcher reads local files only. Never borrow a local path for a remote tool.
+	if (
+		device !== "local" ||
+		!filePath ||
+		!oldString ||
+		oldString.length > STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS
+	)
+		return undefined;
 
 	try {
 		const resolvedPath = resolve(cwd, filePath);
@@ -354,11 +255,23 @@ async function resolveStreamingEditMetadata(
 		const replaceAll = acc.extractedFields?.replace_all === "true";
 		const match = findReplaceMatch(content, normalizedOld, replaceAll);
 		const lineCount = normalizedOld.split("\n").length;
-		return {
+		const metadata = {
 			startLine: match.startLine,
 			endLine: match.startLine + lineCount - 1,
 			matchStatus: "matched",
 		};
+		acc.streamingEditOrigin = createStreamingEditOrigin(
+			toolUseId,
+			{
+				file_path: filePath,
+				old_string: oldString,
+				device,
+				replace_all: replaceAll,
+			},
+			metadata,
+			device,
+		);
+		return metadata;
 	} catch (err) {
 		return {
 			matchStatus: "unmatched",
@@ -623,6 +536,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"StartPipeline",
 	"ExtractPipeline",
 	"AskUserQuestion",
+	"Question",
 	"EnterPlanMode",
 	"ExitPlanMode",
 ]);
@@ -1089,10 +1003,20 @@ export function buildTaskReflectionPrompt(
 	mutations: ProtectedTaskMutation[],
 	locale: Locale,
 ): string {
+	const decisionGuidance =
+		locale === "zh-CN"
+			? "\n\n你最多有两轮决策机会，每轮只调用一个允许的工具：TaskReflectConfirm 或 TaskReflectRevise。首次工具或参数错误可依据 tool result 在第二轮纠正；成功后立即结束，两轮仍未形成有效决策则不执行原修改。不要直接编辑任务文件。反馈及 nextSteps 应说明主助手能执行的工作，不要要求它调用反思专用工具。"
+			: "\n\nYou have at most two decision responses; call exactly one allowed tool per response: TaskReflectConfirm or TaskReflectRevise. Correct a mistaken tool or invalid arguments using the tool result in the second response. Stop on success; without a valid decision after two responses, the original change will not execute. Do not edit the task file directly. Feedback and nextSteps must describe work the main assistant can perform, not ask it to call reflection-only tools.";
 	if (locale === "zh-CN") {
-		return `你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n只需回答一个问题：这次修改是否违背了用户真正要求的东西？\n\n- 没有违背 → TaskReflectConfirm。\n- 违背（用户明确要求保证完成的事会被放弃、缩水，或未做完却标记为完成）→ TaskReflectRevise。\n\n证据用来帮你判断意图，不是审核标准本身。任何工作都能被要求更多证据，把"还能想出一件未被证明的事"当作驳回理由会产生无法通过的死循环。已有证据足以说明用户的实际诉求已满足时就确认，即使还能设想更完备的验收。\n\n如果该条目没有可判定的完成条件（"全量验收"、"确保质量"、"不得影响某处"这类无终点表述），它作为调度任务本身有缺陷，继续要证据只是浪费时间。此时把它改写成有明确完成条件的有限任务、或移除 protected 标记，都是合法纠正：只要用户的原始诉求仍以某种形式保留（改写后的任务、behavior_fence 或系统/项目指令）就确认。用户从未要求保证完成时同理。只有当改动实质上是在放弃用户要求的工作时才驳回。\n\ncreatedBy 字段影响保守程度，不替代上面的判断：createdBy=user、system 或 unknown 时要更保守，不能因为任务麻烦就完成、删除或改写；createdBy=assistant 仍不允许绕过真实的有限任务，但纠正它自己误建的条目门槛更低。\n\n驳回时 nextSteps 必须给出具体可完成的下一步。如果写不出"做完这一步就能通过"的指示，说明问题在任务的形式而非证据，应要求把它改写成有限任务。`;
+		return (
+			`你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n只需回答一个问题：这次修改是否违背了用户真正要求的东西？\n\n- 没有违背 → TaskReflectConfirm。\n- 违背（用户明确要求保证完成的事会被放弃、缩水，或未做完却标记为完成）→ TaskReflectRevise。\n\n证据用来帮你判断意图，不是审核标准本身。任何工作都能被要求更多证据，把"还能想出一件未被证明的事"当作驳回理由会产生无法通过的死循环。已有证据足以说明用户的实际诉求已满足时就确认，即使还能设想更完备的验收。\n\n如果该条目没有可判定的完成条件（"全量验收"、"确保质量"、"不得影响某处"这类无终点表述），它作为调度任务本身有缺陷，继续要证据只是浪费时间。此时把它改写成有明确完成条件的有限任务、或移除 protected 标记，都是合法纠正：只要用户的原始诉求仍以某种形式保留（改写后的任务、behavior_fence 或系统/项目指令）就确认。用户从未要求保证完成时同理。只有当改动实质上是在放弃用户要求的工作时才驳回。\n\ncreatedBy 字段影响保守程度，不替代上面的判断：createdBy=user、system 或 unknown 时要更保守，不能因为任务麻烦就完成、删除或改写；createdBy=assistant 仍不允许绕过真实的有限任务，但纠正它自己误建的条目门槛更低。\n\n驳回时 nextSteps 必须给出具体可完成的下一步。如果写不出"做完这一步就能通过"的指示，说明问题在任务的形式而非证据，应要求把它改写成有限任务。` +
+			decisionGuidance
+		);
 	}
-	return `You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nAnswer one question: does this change betray what the user actually asked for?\n\n- It does not → TaskReflectConfirm.\n- It does (work the user demanded be guaranteed would be dropped, watered down, or marked finished while incomplete) → TaskReflectRevise.\n\nEvidence helps you judge intent; it is not the standard itself. Any body of work admits a further demand for proof, so treating "one more thing could be proven" as grounds for denial produces a loop no change can pass. When the evidence already shows the user's real requirement is met, confirm — even if a more exhaustive acceptance is imaginable.\n\nIf the entry has no decidable completion condition ("full acceptance", "ensure quality", "must not affect X" — phrasings with no terminal state), it is malformed as a scheduler entry and demanding more evidence only burns time. Rewriting it into a finite task with an explicit completion condition, or removing the protected flag, is then a legitimate repair: confirm as long as the user's original requirement survives somewhere (the rewritten task, behavior_fence, or system/project instructions). The same holds when the user never demanded that guarantee. Deny only when the change amounts to abandoning work the user asked for.\n\nThe \`createdBy\` field weights how conservative to be; it does not replace the judgement above. For createdBy=user, system, or unknown, be more conservative — inconvenience never justifies completion, deletion, or rewriting. For createdBy=assistant, there is still no licence to bypass a real finite task, but repairing an entry it malformed itself carries a lower bar.\n\nWhen denying, nextSteps must name a concrete, completable action. If you cannot write an instruction of the form "do this and it passes", the problem is the task's shape rather than the evidence — require a rewrite into a finite task.`;
+	return (
+		`You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nAnswer one question: does this change betray what the user actually asked for?\n\n- It does not → TaskReflectConfirm.\n- It does (work the user demanded be guaranteed would be dropped, watered down, or marked finished while incomplete) → TaskReflectRevise.\n\nEvidence helps you judge intent; it is not the standard itself. Any body of work admits a further demand for proof, so treating "one more thing could be proven" as grounds for denial produces a loop no change can pass. When the evidence already shows the user's real requirement is met, confirm — even if a more exhaustive acceptance is imaginable.\n\nIf the entry has no decidable completion condition ("full acceptance", "ensure quality", "must not affect X" — phrasings with no terminal state), it is malformed as a scheduler entry and demanding more evidence only burns time. Rewriting it into a finite task with an explicit completion condition, or removing the protected flag, is then a legitimate repair: confirm as long as the user's original requirement survives somewhere (the rewritten task, behavior_fence, or system/project instructions). The same holds when the user never demanded that guarantee. Deny only when the change amounts to abandoning work the user asked for.\n\nThe \`createdBy\` field weights how conservative to be; it does not replace the judgement above. For createdBy=user, system, or unknown, be more conservative — inconvenience never justifies completion, deletion, or rewriting. For createdBy=assistant, there is still no licence to bypass a real finite task, but repairing an entry it malformed itself carries a lower bar.\n\nWhen denying, nextSteps must name a concrete, completable action. If you cannot write an instruction of the form "do this and it passes", the problem is the task's shape rather than the evidence — require a rewrite into a finite task.` +
+		decisionGuidance
+	);
 }
 
 export interface ReflectionLoopRunOptions {
@@ -1101,6 +1025,7 @@ export interface ReflectionLoopRunOptions {
 	prompt: string;
 	reflectionLoop: NonNullable<AgentConfig["reflectionLoop"]>;
 	abortController?: AbortController;
+	/** Decision responses, hard-capped at two; transport retries have a separate budget. */
 	maxTurns?: number;
 	label?: string;
 	/**
@@ -1129,6 +1054,10 @@ export interface ReflectionLoopObservation {
 	assistantTextPreview: string;
 	toolCalls: string[];
 	toolResults: Array<{ toolName: string; isError: boolean; outputPreview: string }>;
+	/** True only after a successful tool result from this gate's allowlist. */
+	decisionSucceeded?: boolean;
+	/** Valid danger fallback parsed from one response, never accumulated display text. */
+	dangerTextDecision?: NonNullable<ReturnType<typeof parseDangerReflectionTextFallback>>;
 	errors: string[];
 	invalidStates: string[];
 	/** Transient retries the nested loop performed before settling. */
@@ -1150,20 +1079,57 @@ export interface ReflectionLoopObservation {
 /** Longest failure reason surfaced to a card; long provider HTML gets clipped. */
 const REFLECTION_FAILURE_SUMMARY_LIMIT = 300;
 
-/**
- * One sentence a gate can persist as its decision reason.
- *
- * Keeps the gate's name first (the card shows this next to the tool), then the concrete
- * cause. Falls back to the historical wording when no cause could be derived, so the string
- * is never empty.
- */
 export function buildReflectionFallbackMessage(
 	gateLabel: string,
 	failureSummary: string | undefined,
+	locale: Locale = "en",
 ): string {
-	return failureSummary
-		? `${gateLabel} could not decide: ${failureSummary}`
-		: `${gateLabel} did not reach a decision in its single allowed response`;
+	const zh = locale === "zh-CN";
+	const label =
+		gateLabel === "ExitPlanMode reflection"
+			? zh
+				? "计划检查"
+				: "Plan check"
+			: gateLabel === "taskReflection"
+				? zh
+					? "任务状态检查"
+					: "Task status check"
+				: zh
+					? "操作安全检查"
+					: "Operation safety check";
+	// Tool results contain instructions for the INTERNAL reviewer. Never forward them
+	// to the main assistant or a human, who cannot use reflection decision tools.
+	let cause: string;
+	if (failureSummary?.startsWith("provider error")) {
+		cause = zh ? "模型服务请求失败" : "the model service request failed";
+	} else if (failureSummary?.includes("crashed")) {
+		cause = zh ? "检查流程发生内部错误" : "the check encountered an internal error";
+	} else if (failureSummary?.startsWith("invalid provider response")) {
+		cause = zh ? "模型服务返回了无法处理的响应" : "the model service returned an unusable response";
+	} else if (failureSummary?.includes("rejected")) {
+		cause = zh
+			? "检查助手调用了不允许的工具或使用了无效参数"
+			: "the reviewer used a disallowed tool or invalid arguments";
+	} else {
+		cause = zh
+			? "检查助手未能在最多两轮回复内给出有效决策"
+			: "the reviewer did not produce a valid decision within at most two responses";
+	}
+	const next =
+		gateLabel === "ExitPlanMode reflection"
+			? zh
+				? "计划尚未提交，执行阶段未开始。这不代表计划内容被否决；无需仅因本次检查失败修改计划。确认计划仍有效后，可重新提交 ExitPlanMode；若持续失败，向用户报告检查故障。"
+				: "The plan was not submitted and implementation has not started. This is not a rejection of the plan's content; do not revise it solely because this check failed. If the plan is still valid, resubmit ExitPlanMode; report the check failure to the user if it persists."
+			: gateLabel === "taskReflection"
+				? zh
+					? "任务状态修改未执行，原任务状态保留。这不代表完成证据已被否定；确认依据仍有效后可重新提交原修改，持续失败时向用户报告检查故障。"
+					: "The task status change did not execute; the original task status is preserved. This does not reject the completion evidence. Resubmit the original change if its evidence remains valid; report the check failure to the user if it persists."
+				: zh
+					? "待检查的操作未获准执行。这不是风险审查的实质否决；重新确认操作仍符合用户意图后可重试，或选择更安全的替代方案；持续失败时请求人工处理。"
+					: "The pending operation was not authorized to execute. This is not a substantive risk rejection. Reconfirm that it still matches the user's intent before retrying, or choose a safer alternative; request human handling if the check keeps failing.";
+	return zh
+		? `${label}未完成：${cause}。${next}`
+		: `${label} could not complete: ${cause}. ${next}`;
 }
 
 /**
@@ -1201,9 +1167,10 @@ export function summarizeReflectionFailure(
 	if (observed.invalidStates.length > 0) {
 		return `invalid provider response: ${condenseReflectionFailure(observed.invalidStates[0])}`;
 	}
+	if (observed.decisionSucceeded || observed.dangerTextDecision) return undefined;
 	const erroredTool = observed.toolResults.find((result) => result.isError);
 	if (erroredTool) {
-		return `the ${erroredTool.toolName} decision was rejected: ${condenseReflectionFailure(
+		return `the ${erroredTool.toolName} tool call was rejected: ${condenseReflectionFailure(
 			erroredTool.outputPreview,
 		)}`;
 	}
@@ -1259,6 +1226,7 @@ async function recordReflectionApiRequestEnd(
 			ttftMs: event.ttftMs ?? null,
 			durationMs: event.durationMs ?? null,
 			contextPercent: event.contextPercent ?? null,
+			contextSnapshot: event.contextSnapshot,
 			meterUsage: event.meterUsage ?? null,
 			meterUnit: event.meterUnit ?? null,
 			errorMessage: event.errorMessage ?? null,
@@ -1319,6 +1287,14 @@ const requestToolSnapshots = new WeakMap<
 >();
 const inheritedPromptConfigs = new WeakSet<AgentConfig>();
 
+function buildReflectionCorrectionPrompt(config: AgentConfig): string {
+	const tools = config.reflectionLoop?.allowedTools.join(", ") ?? "";
+	const strict = config.reflectionLoop?.context.purpose === "permissionRuleRequest";
+	const budget = strict ? "一轮" : "两轮";
+	return config.locale === "zh-CN"
+		? `检查尚未形成有效决策。你最多有${budget}决策机会；如仍有下一轮，请根据工具结果纠正工具或参数，且只调用一个当前允许的决策工具：${tools}。不要执行原操作，也不要直接修改文件；通过决策返回具体反馈，由主助手处理。不要要求主助手调用反思专用工具。`
+		: `The check has not produced a valid decision. You have at most ${strict ? "one decision response" : "two decision responses"}; if another remains, correct the tool or arguments using its result and call exactly one currently allowed decision tool: ${tools}. Do not execute the original operation or edit files; return concrete feedback through the decision for the main assistant to act on. Do not ask the main assistant to call reflection-only tools.`;
+}
 export async function runReflectionLoop(
 	options: ReflectionLoopRunOptions,
 ): Promise<ReflectionLoopObservation> {
@@ -1328,7 +1304,7 @@ export async function runReflectionLoop(
 		prompt,
 		reflectionLoop,
 		abortController = new AbortController(),
-		maxTurns = 1,
+		maxTurns = 2,
 		label = "reflection loop",
 		onProgress,
 		injectParentSystemPrompt,
@@ -1341,7 +1317,7 @@ export async function runReflectionLoop(
 	//
 	// Letting the nested loop inject again produced two copies — a stray
 	// `__SYSTEM__:` user block on Anthropic, doubled `instructions` on
-	// codex/openai, a duplicated leading userInputMessage on some gateways — and, because
+	// codex/openai, a duplicated leading user message on some gateways — and, because
 	// the duplicate lands at the very front, it shifted every following byte and
 	// destroyed the cacheable prefix this loop shares with the parent
 	// conversation. Prompt caching is a byte-exact prefix match, so a reflection
@@ -1363,16 +1339,22 @@ export async function runReflectionLoop(
 		retries: 0,
 	};
 	const onParentAbort = () => abortController.abort();
-	parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
+	if (parentConfig.signal.aborted) onParentAbort();
+	else parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
 	try {
 		const reflectionConfig: AgentConfig = {
 			...parentConfig,
 			signal: abortController.signal,
-			maxTurns,
+			maxTurns: Number.isFinite(maxTurns) ? Math.max(1, Math.min(2, Math.floor(maxTurns))) : 2,
 			reflectionLoop,
 			// Keep systemPrompt available to dynamic tool definitions; suppress only injection.
 			getRuntimeSettingsOverride: undefined,
 			getModelOverride: undefined,
+			// Auxiliary inputs cannot replace or pin the parent conversation's classification.
+			freezeContextComposition: undefined,
+			onToolsCharacters: undefined,
+			// Auxiliary decision tools are not the original filesystem execution attempt.
+			onToolExecutionFinalAuthorization: undefined,
 			// Reflection is an auxiliary call: follow the user's retry policy but
 			// hard-cap attempts (e.g. don't inherit an infinite/-1 or oversized
 			// maxTransientRetries from the parent primary loop).
@@ -1387,7 +1369,10 @@ export async function runReflectionLoop(
 			getAfterToolsInjections: undefined,
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
-			shouldStop: undefined,
+			shouldStop: () => observed.decisionSucceeded === true,
+			guidanceSignal: undefined,
+			urgentGuidanceSignal: undefined,
+			onToolExecutionInvoking: undefined,
 			// Declaration filtering remains inherited; execution uses the gate's hard ceiling.
 			allowedTools: new Set(reflectionLoop.allowedTools),
 			disabledTools: undefined,
@@ -1436,6 +1421,13 @@ export async function runReflectionLoop(
 				observed.assistantMessages++;
 				if (event.text) {
 					observed.assistantText = `${observed.assistantText}${event.text}`.slice(0, 4000);
+					if (
+						reflectionLoop.context.kind === "dangerReflection" &&
+						reflectionLoop.context.purpose !== "permissionRuleRequest"
+					) {
+						const textDecision = parseDangerReflectionTextFallback(event.text);
+						if (textDecision) observed.dangerTextDecision = textDecision;
+					}
 				}
 				if (!observed.assistantTextPreview && event.text) {
 					observed.assistantTextPreview = event.text.slice(0, 500);
@@ -1446,6 +1438,7 @@ export async function runReflectionLoop(
 			} else if (event.type === "tool_call") {
 				observed.toolCalls.push(event.toolName);
 			} else if (event.type === "tool_result") {
+				if (!event.isError && allowedTools.has(event.toolName)) observed.decisionSucceeded = true;
 				observed.toolResults.push({
 					toolName: event.toolName,
 					isError: event.isError,
@@ -1480,8 +1473,15 @@ export async function runReflectionLoop(
 				});
 			}
 		}
+		if (
+			reflectionLoop.context.purpose === "permissionRuleRequest" &&
+			(abortController.signal.aborted || pendingApiRequests.size > 0)
+		)
+			observed.errors.push(
+				"Permission rule reflection did not finish its provider request normally",
+			);
 		observed.failureSummary = summarizeReflectionFailure(observed);
-		if (observed.toolCalls.length === 0 || observed.toolResults.some((result) => result.isError)) {
+		if (!observed.decisionSucceeded && !observed.dangerTextDecision) {
 			logger.warn(`${label} completed without a successful reflection tool decision`, {
 				narratorId: parentConfig.narratorId,
 				kind: reflectionLoop.context.kind,
@@ -1518,6 +1518,7 @@ async function runDangerReflectionLoop(
 			allowedTools: [...DANGER_REFLECTION_TOOLS],
 			context: {
 				kind: "dangerReflection",
+				purpose: pause.purpose,
 				requestId: pause.requestId,
 				toolUseId: toolUse.toolUseId,
 				data: {
@@ -1527,7 +1528,9 @@ async function runDangerReflectionLoop(
 			},
 		},
 		abortController: reflectionAbort,
-		maxTurns: 1,
+		// Permission-rule approvals require a single clean decision; preserve that
+		// stricter security contract rather than accepting a corrected approval.
+		maxTurns: pause.purpose === "permissionRuleRequest" ? 1 : 2,
 		label: "Danger reflection loop",
 	});
 }
@@ -1558,7 +1561,7 @@ async function runExitPlanModeReflectionLoop(
 			},
 		},
 		abortController: reflectionAbort,
-		maxTurns: 1,
+		maxTurns: 2,
 		label: "ExitPlanMode reflection loop",
 	});
 }
@@ -1590,7 +1593,7 @@ async function runTaskReflectionLoop(
 			},
 		},
 		abortController: reflectionAbort,
-		maxTurns: 1,
+		maxTurns: 2,
 		label: "Task reflection loop",
 	});
 }
@@ -1598,7 +1601,8 @@ async function runTaskReflectionLoop(
 function parseDangerReflectionTextFallback(
 	text: string,
 ): { action: "confirm"; reflection?: string } | { action: "cancel"; reason?: string } | null {
-	const match = text.match(/<DangerDecision>\s*([\s\S]*?)\s*<\/DangerDecision>/i);
+	// Keep fallback JSON parsing bounded, independently of accumulated display text.
+	const match = text.slice(0, 4000).match(/<DangerDecision>\s*([\s\S]*?)\s*<\/DangerDecision>/i);
 	if (!match) return null;
 	try {
 		const parsed = JSON.parse(match[1]) as {
@@ -1659,7 +1663,7 @@ async function discardDangerReflectionRuntimeState(requestId: string): Promise<v
 	}
 }
 
-async function resolveDangerReflectionDecision(
+export async function resolveDangerReflectionDecision(
 	config: AgentConfig,
 	history: unknown[],
 	pause: DangerReflectionPermission,
@@ -1713,6 +1717,40 @@ async function resolveDangerReflectionDecision(
 		.finally(() => {
 			reflectionDone = true;
 		});
+	if (pause.purpose === "permissionRuleRequest") {
+		// Confirm is only a candidate in this domain. Await clean provider/loop completion
+		// before letting the permission service persist approval and consume the receipt.
+		const observed = await reflectionPromise;
+		const completedNormally =
+			!config.signal.aborted &&
+			!reflectionAbort.signal.aborted &&
+			observed.errors.length === 0 &&
+			observed.invalidStates.length === 0;
+		const validToolDecision =
+			observed.toolResults.filter(
+				(result) => result.toolName === "DangerConfirm" && !result.isError,
+			).length === 1 &&
+			!observed.toolResults.some((result) => result.isError || result.toolName === "DangerCancel");
+		const { completePermissionRuleRequestReflection, cancelDangerReflection } = await import(
+			"@server/services/narrator-permission"
+		);
+		const completed = await completePermissionRuleRequestReflection(pause.requestId, {
+			completedNormally,
+			validToolDecision,
+			usedTextFallback: false,
+		});
+		if (!completed && !(await isDangerReflectionWaitingForUser(pause.requestId))) {
+			await cancelDangerReflection(
+				pause.requestId,
+				"Permission rule reflection did not complete with a valid tool decision",
+				undefined,
+				{ failed: true },
+			);
+		}
+		const decision = await pause.decision;
+		await discardDangerReflectionRuntimeState(pause.requestId);
+		return decision;
+	}
 	const decision = await Promise.race([
 		pause.decision.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async (observed) => {
@@ -1720,7 +1758,7 @@ async function resolveDangerReflectionDecision(
 				return pause.decision;
 			}
 
-			const textFallback = parseDangerReflectionTextFallback(observed.assistantText);
+			const textFallback = observed.dangerTextDecision;
 			if (textFallback) {
 				const { cancelDangerReflection, confirmDangerReflection } = await import(
 					"@server/services/narrator-permission"
@@ -1739,6 +1777,7 @@ async function resolveDangerReflectionDecision(
 			const fallbackMessage = buildReflectionFallbackMessage(
 				"Danger reflection",
 				observed.failureSummary,
+				(config.locale as Locale) ?? "en",
 			);
 			const { cancelDangerReflection } = await import("@server/services/narrator-permission");
 			const cancelled = await cancelDangerReflection(pause.requestId, fallbackMessage, undefined, {
@@ -1770,14 +1809,16 @@ async function resolveDangerReflectionDecision(
 }
 
 interface ExitPlanReflectionGateResult {
+	checkFailed?: boolean;
 	decision: ExitPlanReflectionDecision | { action: "manual"; reason?: string };
 	input: Record<string, unknown>;
 }
 
-async function resolveExitPlanModeReflection(
+export async function resolveExitPlanModeReflection(
 	config: AgentConfig,
 	history: unknown[],
 	toolUse: AgentToolUse,
+	recoveryGate?: PersistedRecoveryGate,
 	toolCallId?: string,
 ): Promise<ExitPlanReflectionGateResult> {
 	const locale = (config.locale as Locale) ?? "en";
@@ -1803,7 +1844,31 @@ async function resolveExitPlanModeReflection(
 		};
 	}
 
-	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const restoredReflection = recoveryReflection(recoveryGate);
+	if (
+		restoredReflection?.type === "plan_reflection" &&
+		restoredReflection.status === "awaiting_user"
+	) {
+		// A taken-over plan gate is no longer AI-owned. The caller must re-register
+		// the real ExitPlanMode permission under the original tool-call identity.
+		// Do not create a synthetic running gate or launch an auxiliary model request.
+		if (typeof toolUse.input.plan === "string" && toolUse.input.plan !== resolvedInput.input.plan) {
+			return {
+				decision: {
+					action: "revise",
+					feedback: "Plan changed while its approval was awaiting a user",
+				},
+				input: toolUse.input,
+			};
+		}
+		return {
+			decision: { action: "manual", reason: "Restored user-owned plan approval" },
+			input: resolvedInput.input,
+		};
+	}
+	const requestId =
+		restoredReflection?.requestId ??
+		`exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -1812,11 +1877,20 @@ async function resolveExitPlanModeReflection(
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: resolvedInput.input,
-		...(toolCallId ? { toolCallId } : {}),
+		toolCallId:
+			toolCallId ?? recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+		restoredStartedAt: restoredReflection?.startedAt,
 		abortController: reflectionAbort,
 	});
+	const onPreparationAbort = () => {
+		reflectionAbort.abort(config.signal.reason);
+		void cancelExitPlanReflection(requestId, "Tool preparation cancelled");
+	};
+	if (config.signal.aborted) onPreparationAbort();
+	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
 	await markExitPlanReflectionStarted(requestId);
 	let reflectionDone = false;
+	let failedCheckFeedback: string | undefined;
 	const reflectionPromise = runExitPlanModeReflectionLoop(
 		config,
 		history,
@@ -1839,10 +1913,8 @@ async function resolveExitPlanModeReflection(
 				if (isExitPlanReflectionWaitingForUser(requestId)) {
 					return { action: "manual" as const };
 				}
-				// The plan gate's feedback goes back to the MODEL as revision guidance, so a
-				// concrete cause matters twice over: a provider fault tells it to retry the same
-				// plan, while "replied without calling a decision tool" tells it to answer with
-				// the tool. The old fixed string asserted the latter even for the former.
+				// Failure is not a substantive revision decision. Feedback here is addressed
+				// to the main assistant/user, never to the internal reflection reviewer.
 				const failureSummary =
 					typeof outcome === "string"
 						? `the reflection loop crashed before producing a decision: ${outcome}`
@@ -1850,8 +1922,12 @@ async function resolveExitPlanModeReflection(
 				const fallbackMessage = buildReflectionFallbackMessage(
 					"ExitPlanMode reflection",
 					failureSummary,
+					locale,
 				);
-				const cancelled = await cancelExitPlanReflection(requestId, fallbackMessage);
+				failedCheckFeedback = fallbackMessage;
+				const cancelled = await cancelExitPlanReflection(requestId, fallbackMessage, {
+					failed: true,
+				});
 				if (cancelled) return decisionPromise;
 
 				// Prefer an already-settled decision if the tool resolved concurrently;
@@ -1872,8 +1948,15 @@ async function resolveExitPlanModeReflection(
 			logger.warn("ExitPlanMode reflection loop cleanup failed", { err: String(err) });
 		});
 	}
+	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupExitPlanReflection(requestId);
-	return { decision, input: resolvedInput.input };
+	return {
+		decision,
+		input: resolvedInput.input,
+		// The decision promise can win the race before cancelExitPlanReflection's
+		// await resumes. Derive the outcome from the winning decision, not timing.
+		checkFailed: decision.action === "revise" && decision.feedback === failedCheckFeedback,
+	};
 }
 
 function resolvePlanReflectionAutoApprove(
@@ -2067,10 +2150,22 @@ async function finalizeExitPlanReflectionApproval(
 	}
 }
 
-function buildExitPlanReflectionDeniedToolResult(
+export function buildExitPlanReflectionDeniedToolResult(
 	decision: ExitPlanReflectionDecision,
 	locale: Locale,
+	checkFailed = false,
 ): ToolExecResult {
+	if (checkFailed) {
+		return {
+			output:
+				decision.action === "revise"
+					? decision.feedback
+					: buildReflectionFallbackMessage("ExitPlanMode reflection", undefined, locale),
+			isError: true,
+			durationMs: 0,
+			completedAt: Date.now(),
+		};
+	}
 	const feedback =
 		decision.action === "revise" && decision.feedback.trim()
 			? decision.feedback.trim()
@@ -2102,7 +2197,19 @@ function buildTaskReflectionDeniedToolResult(
 	decision: TaskReflectionDecision,
 	locale: Locale,
 	mutations: ProtectedTaskMutation[],
+	checkFailed = false,
 ): ToolExecResult {
+	if (checkFailed) {
+		return {
+			output:
+				decision.action === "revise"
+					? decision.feedback
+					: buildReflectionFallbackMessage("taskReflection", undefined, locale),
+			isError: true,
+			durationMs: 0,
+			completedAt: Date.now(),
+		};
+	}
 	const feedback =
 		decision.action === "revise" && decision.feedback.trim()
 			? decision.feedback.trim()
@@ -2156,8 +2263,11 @@ async function resolveTaskReflection(
 	history: unknown[],
 	toolUse: AgentToolUse,
 	candidateContent: string,
+	recoveryGate?: PersistedRecoveryGate,
+	onRestoredHumanWait?: () => void,
 ): Promise<{
 	decision: TaskReflectionDecision;
+	checkFailed?: boolean;
 	input: Record<string, unknown>;
 	mutations: ProtectedTaskMutation[];
 } | null> {
@@ -2168,9 +2278,22 @@ async function resolveTaskReflection(
 		filePath,
 		candidateContent,
 	);
-	if (analysis.protectedMutations.length === 0) return null;
-
-	const requestId = `task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const restoredReflection = recoveryReflection(recoveryGate);
+	if (
+		restoredReflection?.type === "task_reflection" &&
+		restoredReflection.status === "awaiting_user"
+	) {
+		// User takeover freezes the question they were shown, even if the spec changed
+		// while the server was down. The actual spec write still revalidates on execution.
+		if (!Array.isArray(restoredReflection.mutations))
+			throw new Error("Invalid persisted task reflection");
+		analysis.protectedMutations = restoredReflection.mutations as ProtectedTaskMutation[];
+	}
+	if (analysis.protectedMutations.length === 0 && restoredReflection?.status !== "awaiting_user")
+		return null;
+	const requestId =
+		restoredReflection?.requestId ??
+		`task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createTaskReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -2180,10 +2303,31 @@ async function resolveTaskReflection(
 		toolName: toolUse.name,
 		inputJson: input,
 		mutations: analysis.protectedMutations,
+		toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+		restoredStartedAt: restoredReflection?.startedAt,
 		abortController: reflectionAbort,
 	});
+	const onPreparationAbort = () => {
+		reflectionAbort.abort(config.signal.reason);
+		void reviseTaskReflection(requestId, "Tool preparation cancelled", undefined, "user");
+	};
+	if (config.signal.aborted) onPreparationAbort();
+	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
+	if (restoredReflection?.status === "awaiting_user") {
+		const { takeOverTaskReflection } = await import("./tools/task-reflection");
+		await takeOverTaskReflection(requestId, "Restored user-owned task reflection");
+		onRestoredHumanWait?.();
+		try {
+			const decision = await decisionPromise;
+			return { decision, input, mutations: analysis.protectedMutations };
+		} finally {
+			config.signal.removeEventListener("abort", onPreparationAbort);
+			cleanupTaskReflection(requestId);
+		}
+	}
 	await markTaskReflectionStarted(requestId);
 	let reflectionDone = false;
+	let failedCheckFeedback: string | undefined;
 	const reflectionPromise = runTaskReflectionLoop(
 		config,
 		history,
@@ -2212,12 +2356,24 @@ async function resolveTaskReflection(
 				typeof outcome === "string"
 					? `the reflection loop crashed before producing a decision: ${outcome}`
 					: outcome.failureSummary;
-			const fallbackMessage = buildReflectionFallbackMessage("taskReflection", failureSummary);
+			const fallbackMessage = buildReflectionFallbackMessage(
+				"taskReflection",
+				failureSummary,
+				(config.locale as Locale) ?? "en",
+			);
 			const fallbackNextSteps =
-				"Review the protected task, gather concrete evidence, and try the tasks.json change again only if it remains justified.";
-			// Broadcast a resolved (cancelled) state so live clients converge instead of
-			// showing a perpetually-running reflection notice.
-			const cancelled = await reviseTaskReflection(requestId, fallbackMessage, fallbackNextSteps);
+				config.locale === "zh-CN"
+					? "保留原任务状态，确认已有证据仍有效后重新提交原修改；若检查持续失败，向用户报告。"
+					: "Keep the original task status; resubmit the original change if its evidence remains valid. Report persistent check failures to the user.";
+			// Persist/broadcast check failure, not a substantive task revision decision.
+			failedCheckFeedback = fallbackMessage;
+			const cancelled = await reviseTaskReflection(
+				requestId,
+				fallbackMessage,
+				fallbackNextSteps,
+				undefined,
+				{ failed: true },
+			);
 			if (cancelled) return decisionPromise;
 
 			const alreadySettled = await Promise.race<TaskReflectionDecision | null>([
@@ -2237,13 +2393,99 @@ async function resolveTaskReflection(
 			logger.warn("Task reflection loop cleanup failed", { err: String(err) });
 		});
 	}
+	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupTaskReflection(requestId);
-	return { decision, input, mutations: analysis.protectedMutations };
+	return {
+		decision,
+		input,
+		mutations: analysis.protectedMutations,
+		checkFailed: decision.action === "revise" && decision.feedback === failedCheckFeedback,
+	};
 }
 
 interface ExecuteToolAfterReflectionsOptions {
 	admissionState?: ToolAdmissionState;
 	preAdmissionComplete?: boolean;
+	executeOptions?: Parameters<typeof executeTool>[2];
+	recoveryGate?: PersistedRecoveryGate;
+}
+
+/** Recovery/retry uses the same gates as the live loop, never the bare executor. */
+export async function executePersistedToolAfterReflections(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	history: unknown[],
+	options: Parameters<typeof executeTool>[2] & { recoveryGate?: PersistedRecoveryGate } = {},
+): Promise<ToolExecResult> {
+	if (options.recoveryGate?.executionStartedAt) {
+		return {
+			output: "Recovery refused: tool execution already started",
+			isError: true,
+			durationMs: 0,
+		};
+	}
+	if (options.recoveryGate && options.toolCallBinding?.toolCallId !== options.recoveryGate.id) {
+		return {
+			output: "Recovery refused: mismatched tool-call identity",
+			isError: true,
+			durationMs: 0,
+		};
+	}
+	// Pending gates must enter permission again, even if a caller supplied an old grant.
+	if (options.recoveryGate?.status === "pending") {
+		options = { ...options, preGrantedPermission: undefined };
+	}
+	const originalPermissionHandler = config.permissionHandler;
+	const recoveredConfig: AgentConfig = {
+		...config,
+		toolExecutionBindings: new WeakMap(),
+		permissionHandler: async (name, input, toolUseId, permissionOptions) => {
+			if (options.recoveryGate && permissionOptions) {
+				bindPermissionRecovery(permissionOptions, options.recoveryGate);
+			}
+			const result = await originalPermissionHandler(name, input, toolUseId, permissionOptions);
+			if (result.behavior !== "dangerReflection") return result;
+			if (recoveryReflection(options.recoveryGate)?.status === "awaiting_user") {
+				return result.decision;
+			}
+			return resolveDangerReflectionDecision(recoveredConfig, history, result, {
+				name,
+				input: result.input,
+				toolUseId,
+			});
+		},
+	};
+	if (options.toolCallBinding) {
+		recoveredConfig.toolExecutionBindings?.set(tu, options.toolCallBinding);
+	}
+	if (options.preFrozenTarget) {
+		const deviceId = options.preFrozenTarget.deviceId;
+		if (
+			(deviceId === "local" && config.allowLocalExecution === false) ||
+			(deviceId !== "local" && !config.availableDevices?.some((device) => device.id === deviceId))
+		) {
+			return {
+				output: "Recovery refused: frozen device is no longer authorized",
+				isError: true,
+				durationMs: 0,
+			};
+		}
+		const { resolveBackend } = await import("./execution/registry");
+		recoveredConfig.executionTarget = options.preFrozenTarget;
+		recoveredConfig.executionBackend = resolveBackend({
+			requested: options.preFrozenTarget.deviceId,
+		});
+	}
+	return executeToolAfterReflections(
+		tu,
+		recoveredConfig,
+		history,
+		(config.locale as Locale) ?? "en",
+		{
+			executeOptions: options,
+			recoveryGate: options.recoveryGate,
+		},
+	);
 }
 
 async function executeToolAfterReflections(
@@ -2253,7 +2495,14 @@ async function executeToolAfterReflections(
 	locale: Locale,
 	options: ExecuteToolAfterReflectionsOptions = {},
 ): Promise<ToolExecResult> {
-	const admissionState = options.admissionState ?? {};
+	const admissionState = options.admissionState ?? {
+		toolCallBinding: options.executeOptions?.toolCallBinding,
+	};
+	const reflectionRejection = getReflectionToolRejection(tu, config);
+	if (reflectionRejection) {
+		releaseToolAdmissionState(admissionState);
+		return reflectionRejection;
+	}
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
 	let preAdmissionComplete = options.preAdmissionComplete === true;
 	if (!preAdmissionComplete || !admissionState.startGrant) {
@@ -2263,6 +2512,19 @@ async function executeToolAfterReflections(
 	let admissionHandedToExecutor = false;
 	try {
 		const freezeExecution = async (): Promise<void> => {
+			// Recovery already carries an immutable target. The executor revalidates it at
+			// final start; resolving it afresh here would change selectionSource before approval.
+			if (options.executeOptions?.preFrozenTarget) {
+				await config.runtimeAuthorizationGuard?.();
+				const frozen = options.executeOptions.preFrozenTarget;
+				if (
+					frozen.runtimeGeneration !== undefined &&
+					config.executionBackend?.runtimeGeneration !== frozen.runtimeGeneration
+				) {
+					throw new Error("Frozen device runtime generation changed before reflection");
+				}
+				return;
+			}
 			if (!preFrozenExecution) preFrozenExecution = await freezeToolExecution(tu, config);
 		};
 		if (tu.name === "ExitPlanMode") {
@@ -2286,6 +2548,7 @@ async function executeToolAfterReflections(
 			admissionHandedToExecutor = true;
 			try {
 				const result = await executeTool(tu, config, {
+					...options.executeOptions,
 					...executeOptions,
 					admissionState,
 					preAdmissionComplete,
@@ -2296,7 +2559,9 @@ async function executeToolAfterReflections(
 					tu.toolUseId,
 					result.isError === true,
 				);
-				return result;
+				return config.reflectionLoop && result.isError
+					? { ...result, output: `${result.output}\n\n${buildReflectionCorrectionPrompt(config)}` }
+					: result;
 			} catch (err) {
 				await finalizeExitPlanReflectionApproval(config.narratorId, tu.toolUseId, true);
 				throw err;
@@ -2305,7 +2570,12 @@ async function executeToolAfterReflections(
 
 		// Decision-time reload: the permission-menu "计划反思" switch must apply to a
 		// still-running pass, not only to the next AgentConfig snapshot.
-		if (tu.name === "ExitPlanMode" && (await shouldRunExitPlanModeReflectionLive(config))) {
+		if (
+			tu.name === "ExitPlanMode" &&
+			!isRecoveredHumanPermission(options.recoveryGate) &&
+			(recoveryReflection(options.recoveryGate)?.type === "plan_reflection" ||
+				(await shouldRunExitPlanModeReflectionLive(config)))
+		) {
 			const reflectionConfig = preFrozenExecution
 				? {
 						...config,
@@ -2316,7 +2586,12 @@ async function executeToolAfterReflections(
 			// Freezing the execution target clones config; WeakMap entries do not spread.
 			const parentTools = requestToolSnapshots.get(config);
 			if (parentTools) requestToolSnapshots.set(reflectionConfig, parentTools);
-			const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
+			const reflected = await resolveExitPlanModeReflection(
+				reflectionConfig,
+				history,
+				tu,
+				options.recoveryGate,
+			);
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
 				// User manually took over the plan reflection; the loop falls back to the
@@ -2328,7 +2603,11 @@ async function executeToolAfterReflections(
 				reflected.decision.action !== "confirm" &&
 				reflected.decision.action !== "confirm_compact"
 			) {
-				return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
+				return buildExitPlanReflectionDeniedToolResult(
+					reflected.decision,
+					locale,
+					reflected.checkFailed,
+				);
 			}
 
 			const shouldCompact = reflected.decision.action === "confirm_compact";
@@ -2350,7 +2629,14 @@ async function executeToolAfterReflections(
 					// taskReflection persists permission-like status on the original row. Admission
 					// already passed; now freeze the deterministic spec target before reflection.
 					await freezeExecution();
-					const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
+					const reflected = await resolveTaskReflection(
+						config,
+						history,
+						tu,
+						candidateContent,
+						options.recoveryGate,
+						() => releaseToolAdmissionState(admissionState),
+					);
 					if (reflected) {
 						tu.input = reflected.input;
 						if (reflected.decision.action !== "confirm") {
@@ -2358,6 +2644,7 @@ async function executeToolAfterReflections(
 								reflected.decision,
 								locale,
 								reflected.mutations,
+								reflected.checkFailed,
 							);
 						}
 						grantTaskReflection(config.narratorId, tu.toolUseId);
@@ -2381,6 +2668,13 @@ async function executeToolAfterReflections(
 						}
 					}
 				} catch (err) {
+					if (recoveryReflection(options.recoveryGate)?.type === "task_reflection") {
+						return {
+							output: `Task reflection recovery failed: ${extractErrorMessage(err)}`,
+							isError: true,
+							durationMs: 0,
+						};
+					}
 					logger.debug("Skipping taskReflection preflight", {
 						toolUseId: tu.toolUseId,
 						error: err instanceof Error ? err.message : String(err),
@@ -2411,6 +2705,10 @@ async function* agentLoopInMetadataSnapshot(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
+	const guidanceSignal =
+		config.guidanceSignal && config.urgentGuidanceSignal
+			? AbortSignal.any([config.guidanceSignal, config.urgentGuidanceSignal])
+			: (config.guidanceSignal ?? config.urgentGuidanceSignal);
 	// Each loop owns its receipts. Nested reflection loops must not inherit a parent's row.
 	const executionBindings = new WeakMap<AgentToolUse, import("./types").ToolCallBinding>();
 	config.toolExecutionBindings = executionBindings;
@@ -2429,7 +2727,11 @@ async function* agentLoopInMetadataSnapshot(
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
 	let effectiveProvider = resolvedProvider.provider;
-	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
+	const searchScope = getSearchExecutionScope();
+	const maxTurns = Math.min(
+		config.maxTurns ?? settings.agent.maxTurns,
+		searchScope?.remainingTurns ?? Number.POSITIVE_INFINITY,
+	);
 	const locale = (config.locale as Locale) ?? "en";
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
@@ -2469,6 +2771,7 @@ async function* agentLoopInMetadataSnapshot(
 				name: toolName,
 				input: result.input,
 			},
+			undefined,
 			result.requestId,
 		);
 		if (reflected.decision.action === "manual") {
@@ -2568,7 +2871,10 @@ async function* agentLoopInMetadataSnapshot(
 			// session, so a native-only channel list would otherwise advertise a tool
 			// that always errors on non-opted providers).
 			resolved.some((t) => t.name === "WebSearch") &&
-			!hasUsableFunctionSearchChannelFor(providerName)
+			!(searchScope || config.runtimePolicy?.searchOnly
+				? (!searchScope || matchesSearchExecutionScope(providerName, modelName)) &&
+					usesSideRequestNativeSearch(providerName, modelName)
+				: hasUsableFunctionSearchChannelFor(providerName))
 		) {
 			resolved = resolved.filter((t) => t.name !== "WebSearch");
 		}
@@ -2592,9 +2898,23 @@ async function* agentLoopInMetadataSnapshot(
 		return resolved;
 	}
 
+	async function reportToolsCharacters(formattedTools: unknown): Promise<void> {
+		if (!config.onToolsCharacters) return;
+		try {
+			const counts = await countInputCharacters({ tools: formattedTools }, config.signal);
+			if (counts) await config.onToolsCharacters(counts.toolsChars);
+		} catch (error) {
+			logger.warn("Failed to store context tool characters", {
+				narratorId: config.narratorId,
+				error: String(error),
+			});
+		}
+	}
+
 	let tools =
 		inheritedTools?.tools ??
 		provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+	await reportToolsCharacters(tools);
 	/**
 	 * The plan-mode tool-description state `tools` was formatted with.
 	 *
@@ -2964,6 +3284,7 @@ async function* agentLoopInMetadataSnapshot(
 				config.provider = newResolved.provider;
 				if (providerChanged || modelChanged) {
 					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					await reportToolsCharacters(tools);
 					// This re-format already applied the current plan-mode state; record it so the
 					// turn-boundary check does not immediately redo the same work.
 					toolsPlanModeDisabled = planModeDisablesTools();
@@ -3022,9 +3343,24 @@ async function* agentLoopInMetadataSnapshot(
 			yield { type: "error", message: "Aborted" };
 			return;
 		}
+		if (guidanceSignal?.aborted) {
+			// FIFO guidance may intentionally enter a pass already stopped. Consume the
+			// host flag and preserve pending input without activating provider/preflight IO.
+			config.shouldStop?.();
+			const isFirstTurn = turnIndex === 0;
+			provider.pushUserTurn(
+				history,
+				isFirstTurn ? userText : nextTurnContent,
+				effectiveModel,
+				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+				isFirstTurn ? images : undefined,
+			);
+			yield { type: "turn_complete", turnIndex };
+			return;
+		}
 		// A reflection sub-loop runs inside the parent's tool admission, so it must not be
 		// parked behind the update gate — see beginNarratorResponseActivity for the deadlock.
-		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
+		let responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
 			isReflection: !!config.reflectionLoop,
 		});
 		try {
@@ -3053,6 +3389,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
 					toolsPlanModeDisabled = planModeDisabledNow;
 					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					await reportToolsCharacters(tools);
 					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
 						narratorId: config.narratorId,
 						planModeDisablesTools: planModeDisabledNow,
@@ -3096,7 +3433,11 @@ async function* agentLoopInMetadataSnapshot(
 			// Tool cancellation is independent from the caller's user-interrupt signal.
 			const toolAbort = new AbortController();
 			// Preserve live runtime setting updates on the original config during retries.
-			const toolSignal = AbortSignal.any([config.signal, toolAbort.signal]);
+			const toolSignal = AbortSignal.any([
+				config.signal,
+				toolAbort.signal,
+				...(config.urgentGuidanceSignal ? [config.urgentGuidanceSignal] : []),
+			]);
 			const toolConfig = new Proxy(config, {
 				get(target, key, receiver) {
 					return key === "signal" ? toolSignal : Reflect.get(target, key, receiver);
@@ -3154,6 +3495,12 @@ async function* agentLoopInMetadataSnapshot(
 				return identity;
 			};
 			const markCompletedToolUse = (tu: AgentToolUse): ToolOrderIdentity => {
+				// These are UI-only annotations, not Edit parameters. Strip model-authored
+				// claims before persistence too (including the non-streaming provider path).
+				if (tu.name === "Edit" && tu.input && typeof tu.input === "object") {
+					delete tu.input._streamingMetadata;
+					delete tu.input._streamingEditOrigin;
+				}
 				const identity = registerToolOrderIdentity(tu, isStrictSerial(tu));
 				if (tu.outputIndex == null && identity.outputIndex != null) {
 					tu.outputIndex = identity.outputIndex;
@@ -3190,6 +3537,11 @@ async function* agentLoopInMetadataSnapshot(
 			 * the turn the caller already agreed to end.
 			 */
 			const observeSoftStopForTurn = (): boolean => {
+				if (!gracefulStopRequested && guidanceSignal?.aborted) {
+					// Consume the host's one-shot flag too, so the next pass is not stopped again.
+					config.shouldStop?.();
+					gracefulStopRequested = true;
+				}
 				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 				return gracefulStopRequested;
 			};
@@ -3204,9 +3556,48 @@ async function* agentLoopInMetadataSnapshot(
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
+				const preparationAbort = new AbortController();
+				const onGuidance = () =>
+					preparationAbort.abort(new Error("Stopped for immediate guidance"));
+				const removeGuidance = () => guidanceSignal?.removeEventListener("abort", onGuidance);
+				if (guidanceSignal?.aborted) onGuidance();
+				else guidanceSignal?.addEventListener("abort", onGuidance, { once: true });
+				const preparationSignal = AbortSignal.any([toolSignal, preparationAbort.signal]);
+				const invocationConfig = new Proxy(toolConfig, {
+					get(target, key, receiver) {
+						if (key === "signal") return preparationSignal;
+						if (key === "permissionHandler") {
+							return ((name, input, id, options) =>
+								target.permissionHandler(name, input, id, {
+									...options,
+									signal: preparationSignal,
+								})) satisfies AgentConfig["permissionHandler"];
+						}
+						if (key === "onToolExecutionInvoking") {
+							return (tool: AgentToolUse) => {
+								// No await between this synchronous boundary and tool.execute.
+								preparationSignal.throwIfAborted();
+								removeGuidance();
+								target.onToolExecutionInvoking?.(tool);
+							};
+						}
+						return Reflect.get(target, key, receiver);
+					},
+				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, toolConfig, history, locale),
-				);
+					executeToolAfterReflections(tu, invocationConfig, history, locale),
+				)
+					.then((result) =>
+						preparationAbort.signal.aborted
+							? {
+									...result,
+									output: getToolMessage("skippedForSoftStop", locale),
+									isError: true,
+									metadata: { ...result.metadata, skippedForSoftStop: true },
+								}
+							: result,
+					)
+					.finally(removeGuidance);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
 					settledResults.set(tu.toolUseId, result);
@@ -3214,19 +3605,22 @@ async function* agentLoopInMetadataSnapshot(
 				});
 				return execution;
 			};
-			async function waitForToolOrAbort<T>(execution: Promise<T>): Promise<T | null> {
-				if (config.signal.aborted) return null;
+			async function waitForToolOrAbort<T>(
+				execution: Promise<T>,
+				signal = toolWaitAbortSignal,
+			): Promise<T | null> {
+				if (signal.aborted) return null;
 				let onAbort = () => {};
 				try {
 					return await Promise.race([
 						execution,
 						new Promise<null>((resolve) => {
 							onAbort = () => resolve(null);
-							config.signal.addEventListener("abort", onAbort, { once: true });
+							signal.addEventListener("abort", onAbort, { once: true });
 						}),
 					]);
 				} finally {
-					config.signal.removeEventListener("abort", onAbort);
+					signal.removeEventListener("abort", onAbort);
 				}
 			}
 			const pumpStreamingTools = (): void => {
@@ -3264,31 +3658,73 @@ async function* agentLoopInMetadataSnapshot(
 			// Track tool calls whose input was broken (output cut off mid-stream)
 			const brokenToolUseIds = new Set<string>();
 			// Accumulator for streaming tool use events (input arrives in chunks)
-			const toolUseAccum = new Map<
-				string,
-				{
-					name: string;
-					inputChunks: string[];
-					totalChars: number;
-					startedAt: number;
-					streamCompletedAt?: number;
-					extractedFilePath?: string;
-					extractedFields?: Record<string, string>;
-					/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
-					streamingMetadata?: Record<string, unknown>;
-					/** Name of the large field currently being streamed */
-					activeStreamingField?: string;
-					/** How many raw chars of the active field have been decoded and emitted so far */
-					streamingFieldYielded: number;
-					lastYieldedAt: number;
-					/** Provider-native content block index for interleaved ordering. */
-					outputIndex?: number;
-					/** Gemini 3 thought signature attached to this functionCall part. */
-					thoughtSignature?: string;
-					/** Upstream identity that minted the Gemini thought signature. */
-					thoughtSignatureSource?: string;
+			const toolUseAccum = new Map<string, StreamingToolAccumulator>();
+			async function* flushToolInput(
+				id: string,
+				acc: StreamingToolAccumulator,
+			): AsyncGenerator<AgentEvent> {
+				if (!acc.metadataAttempted && acc.name === "Edit" && acc.extractedFilePath) {
+					const oldString = acc.stream.getField("old_string");
+					if (oldString != null) {
+						acc.metadataAttempted = true;
+						const metadataAcc = {
+							...acc,
+							extractedFields: { ...acc.extractedFields, old_string: oldString },
+						};
+						acc.streamingMetadata = await resolveStreamingEditMetadata(
+							metadataAcc,
+							config.cwd,
+							id,
+							config.defaultDeviceId ?? "local",
+						);
+						// The matcher mints evidence on its argument; keep it on the real accumulator.
+						acc.streamingEditOrigin = metadataAcc.streamingEditOrigin;
+					}
 				}
-			>();
+				const fields = acc.stream.drainFields();
+				const dirty = acc.pendingShort;
+				acc.pendingShort = {};
+				acc.lastYieldedAt = Date.now();
+				const base = {
+					type: "tool_use_chunk" as const,
+					toolUseId: id,
+					toolName: acc.name,
+					inputCharsTotal: acc.totalChars,
+					...(acc.extractedFilePath && {
+						extractedFilePath: acc.extractedFilePath,
+						contentCharsReceived: Math.max(
+							0,
+							acc.totalChars - `"file_path":"${acc.extractedFilePath}",`.length,
+						),
+					}),
+					...(Object.keys(dirty).length > 0 && { extractedFields: dirty }),
+					...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
+				};
+				// A chunk can close multiple fields. Preserve their order as individual events.
+				if (fields.length === 0) yield base;
+				else for (const streamingField of fields) yield { ...base, streamingField };
+			}
+			function resetToolInput(acc: StreamingToolAccumulator, snapshot: string): void {
+				acc.stream = new ToolInputStream(
+					TOOL_FIELD_CONFIG[acc.name]?.short,
+					TOOL_FIELD_CONFIG[acc.name]?.large,
+				);
+				acc.stream.feed(snapshot);
+				acc.totalChars = acc.stream.totalChars;
+				acc.extractedFields = undefined;
+				acc.extractedFilePath = undefined;
+				acc.pendingShort = {};
+				acc.metadataAttempted = false;
+				acc.streamingMetadata = undefined;
+				acc.streamingEditOrigin = undefined;
+			}
+			function collectShortFields(acc: StreamingToolAccumulator): boolean {
+				const dirty = acc.stream.takeShortFields();
+				Object.assign(acc.pendingShort, dirty);
+				acc.extractedFields = { ...acc.extractedFields, ...dirty };
+				if (dirty.file_path != null) acc.extractedFilePath = dirty.file_path;
+				return Object.keys(dirty).length > 0;
+			}
 			// Accumulator for native web search calls (Codex web_search tool)
 			const webSearchAccum = new Map<
 				string,
@@ -3397,11 +3833,21 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
+			const toolWaitAbortSignal = config.urgentGuidanceSignal
+				? AbortSignal.any([config.signal, config.urgentGuidanceSignal])
+				: config.signal;
 			async function* drainStartedEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const earlyPromise = earlyExecMap.get(tu.toolUseId);
 					if (earlyPromise && !settledResults.has(tu.toolUseId)) {
-						settledResults.set(tu.toolUseId, await earlyPromise);
+						const result = await waitForToolOrAbort(earlyPromise, toolWaitAbortSignal);
+						if (!result) {
+							// Urgent guidance/hard interruption may not wait for a tool which ignores
+							// cancellation. The abort drain owns its late persistence, not a fake result.
+							yield* drainEarlyToolResultsAfterAbort();
+							return;
+						}
+						settledResults.set(tu.toolUseId, result);
 					}
 				}
 				yield* drainSettledEarlyToolResults();
@@ -3458,6 +3904,28 @@ async function* agentLoopInMetadataSnapshot(
 				| undefined;
 			let requestContextPercent: number | undefined;
 			let upstreamContextPercent: number | undefined;
+			let requestRawContextWindow: number | undefined;
+			let inputCharacters: ContextInputCharacters | null = null;
+			let inputComposition: ContextCharCache | null = null;
+			let contextSnapshot: ContextUsageSnapshot | undefined;
+			function snapshotContext(
+				source: ContextUsageSnapshot["source"],
+				percentage: number | null,
+				window: number | null,
+				occupied: number | null,
+			): ContextUsageSnapshot {
+				contextSnapshot = {
+					requestId,
+					startedAt: new Date(requestStartTime || Date.now()).toISOString(),
+					source,
+					percentage,
+					contextWindow: window,
+					occupiedTokens: occupied,
+					inputCharacters,
+					composition: matchContextComposition(inputComposition, inputCharacters),
+				};
+				return contextSnapshot;
+			}
 			let requestMeterUsage: number | undefined;
 			let requestMeterUnit: string | undefined;
 			let sawMeaningfulResponse = false;
@@ -3622,7 +4090,8 @@ async function* agentLoopInMetadataSnapshot(
 			};
 
 			function getEstimatedUpstreamPromptTokens(): number | undefined {
-				const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+				const contextWindow =
+					requestRawContextWindow ?? getModelContextWindow(effectiveModel, effectiveProvider);
 				return upstreamContextPercent !== undefined && contextWindow
 					? Math.round((upstreamContextPercent / 100) * contextWindow)
 					: undefined;
@@ -3681,21 +4150,38 @@ async function* agentLoopInMetadataSnapshot(
 								: dumpSnapshot,
 					});
 				}
+				if (!contextSnapshot) {
+					const window = getModelContextWindow(effectiveModel, effectiveProvider);
+					if (window && inputCharacters) {
+						const occupied = Math.ceil(inputCharacters.totalChars * 0.3);
+						const percentage = (occupied / window) * 100;
+						requestContextPercent = Math.min(percentage, 100);
+						const snapshot = snapshotContext("estimate", percentage, window, occupied);
+						yield {
+							type: "context_usage",
+							percentage: requestContextPercent,
+							source: "estimate",
+							snapshot,
+							promptTokens: occupied,
+							contextWindow: window,
+							isEstimated: true,
+						};
+					}
+				}
 				yield {
 					type: "api_request_end",
 					requestId,
 					credentialId,
-					// Keep measured counts independent of window occupancy. Only replace
-					// missing/zero prompt placeholders with the upstream-derived estimate.
-					usage:
-						upstreamContextPercent !== undefined && !requestUsage?.promptTokens
-							? {
-									...requestUsage,
-									inputTokens: getEstimatedUpstreamPromptTokens(),
-									promptTokens: getEstimatedUpstreamPromptTokens(),
-									completionTokens: requestUsage?.completionTokens || estimateTokens(assistantText),
-								}
-							: requestUsage,
+					// Billing counters are never synthesized from occupancy.
+					usage: requestUsage,
+					contextSnapshot:
+						contextSnapshot ??
+						snapshotContext(
+							"estimate",
+							null,
+							getModelContextWindow(effectiveModel, effectiveProvider) ?? null,
+							null,
+						),
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
 					contextPercent: requestContextPercent,
@@ -4105,6 +4591,7 @@ async function* agentLoopInMetadataSnapshot(
 				outputContent.reset();
 				textOutputIndex = undefined;
 				reasoningBlockMap.clear();
+				redactedThinkingBlocks.length = 0;
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
 				nextToolArrivalOrder = 0;
@@ -4153,7 +4640,11 @@ async function* agentLoopInMetadataSnapshot(
 				requestStartPending = false;
 				requestTtftMs = undefined;
 				requestUsage = undefined;
+				inputCharacters = null;
+				inputComposition = null;
+				contextSnapshot = undefined;
 				upstreamContextPercent = undefined;
+				requestRawContextWindow = undefined;
 				requestContextPercent = undefined;
 				requestMeterUsage = undefined;
 				requestMeterUnit = undefined;
@@ -4174,6 +4665,16 @@ async function* agentLoopInMetadataSnapshot(
 						: undefined;
 
 				const attemptAbort = new AbortController();
+				let updateReasoningInterrupted = false;
+				const updateReasoningStop = new Error("Reasoning paused for graceful restart");
+				const guidanceStop = new Error("Stopped for immediate guidance");
+				const onGuidanceAbort = () => {
+					observeSoftStopForTurn();
+					streamExecutionOpen = false;
+					attemptAbort.abort(guidanceStop);
+				};
+				if (guidanceSignal?.aborted) onGuidanceAbort();
+				else guidanceSignal?.addEventListener("abort", onGuidanceAbort, { once: true });
 				const configuredToolLimit = config.maxToolCallsPerResponse ?? 32;
 				const toolCallLimit = Number.isFinite(configuredToolLimit)
 					? Math.min(128, Math.max(1, Math.floor(configuredToolLimit)))
@@ -4265,16 +4766,33 @@ async function* agentLoopInMetadataSnapshot(
 					config.signal.addEventListener("abort", onParentAbort, { once: true });
 				}
 
+				responseActivity.setReasoningAbort(() => {
+					updateReasoningInterrupted = true;
+					attemptAbort.abort(updateReasoningStop);
+				});
 				try {
+					if (updateReasoningInterrupted) throw updateReasoningStop;
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
+					const questionInput = projectQuestionModelInput(
+						history,
+						content,
+						pendingToolResults,
+						config.getQuestionModelReceipts?.() ?? [],
+					);
 					// This is adoption by the recipient loop, not persistence, wake admission,
 					// or upstream response success. An interrupted/preparation-failed pass never
 					// reaches it. Receipt failures cannot retract input or cause redelivery.
 					if (!attemptAbort.signal.aborted) {
 						const callbacks = pendingInputConsumptions.splice(0);
-						callbacks.unshift(() => config.onModelInputConsumed?.(sourceInputHistory, content));
+						callbacks.unshift(() =>
+							config.onModelInputConsumed?.(
+								sourceInputHistory,
+								content,
+								questionInput.answerEventIds,
+							),
+						);
 						for (const callback of callbacks) {
 							try {
 								callback();
@@ -4298,12 +4816,26 @@ async function* agentLoopInMetadataSnapshot(
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
+					if (searchScope) {
+						if (!matchesSearchExecutionScope(effectiveProvider, effectiveModel)) {
+							yield {
+								type: "error",
+								message: "Search execution provider/model changed outside its scope",
+							};
+							return;
+						}
+						if (searchScope.remainingTurns <= 0) {
+							yield { type: "error", message: new SearchExecutionBudgetExceededError().message };
+							return;
+						}
+						consumeSearchExecutionTurn();
+					}
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,
 						model: effectiveModel,
 						cwd: config.cwd,
-						history,
+						history: questionInput.history,
 						tools,
 						// Only Codex reads these inactive declarations; other providers keep their tool list.
 						get reflectionTools() {
@@ -4317,7 +4849,7 @@ async function* agentLoopInMetadataSnapshot(
 								? parentTools.tools
 								: []
 							: undefined,
-						toolResults: pendingToolResults,
+						toolResults: questionInput.toolResults,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						workTurnId: config.getWorkTurnId?.(),
@@ -4327,11 +4859,37 @@ async function* agentLoopInMetadataSnapshot(
 						requestDump,
 						resetUpstreamSession,
 						onRequestStart: markRequestStarted,
+						onInputCharacters: async (counts) => {
+							inputCharacters = validInputCharacters(counts);
+							try {
+								inputComposition =
+									(await config.freezeContextComposition?.(
+										inputCharacters,
+										requestId,
+										new Date(requestStartTime || Date.now()).toISOString(),
+										attemptAbort.signal,
+									)) ?? null;
+							} catch {
+								inputComposition = null;
+							}
+						},
 						...(isFirstTurn && images?.length ? { images } : {}),
 					});
 
 					streamExecutionOpen = true;
 					for await (const parsed of stream) {
+						if (updateReasoningInterrupted) throw updateReasoningStop;
+						// Once visible text or a tool starts, drain the whole response safely.
+						if (
+							parsed.text ||
+							parsed.toolUseChunk ||
+							parsed.toolUses?.length ||
+							parsed.webSearch ||
+							parsed.imageGeneration
+						) {
+							responseActivity.setReasoningAbort(null);
+						}
+						if (guidanceSignal?.aborted) throw guidanceStop;
 						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
 						// tool must not release more queued work while failure handling runs.
@@ -4559,6 +5117,22 @@ async function* agentLoopInMetadataSnapshot(
 							for (const tu of parsed.toolUses) {
 								throwIfUserAborted();
 								tu.name = canonicalizeToolName(tu.name);
+								const pendingInput = toolUseAccum.get(tu.toolUseId);
+								if (pendingInput) {
+									if (tu.input != null && typeof tu.input === "object" && !("_raw" in tu.input)) {
+										const snapshot = JSON.stringify(tu.input);
+										const prefix = pendingInput.stream.materializeRaw();
+										if (snapshot.startsWith(prefix))
+											pendingInput.stream.feed(snapshot.slice(prefix.length));
+										else if (JSON.stringify(pendingInput.stream.finish()) !== snapshot) {
+											yield* flushToolInput(tu.toolUseId, pendingInput);
+											resetToolInput(pendingInput, snapshot);
+										}
+										pendingInput.totalChars = pendingInput.stream.totalChars;
+										collectShortFields(pendingInput);
+									}
+									yield* flushToolInput(tu.toolUseId, pendingInput);
+								}
 								const identity = markCompletedToolUse(tu);
 								// Skip duplicates — the streaming path may have already
 								// completed this tool call via toolUseChunk stop. Preserve any
@@ -4580,7 +5154,7 @@ async function* agentLoopInMetadataSnapshot(
 								// If this tool was also being streamed via toolUseChunk, remove it
 								// from the accumulator so it isn't flagged as orphaned.
 								// This happens with some providers (e.g. NUG) that send both a
-								// streaming toolUseEvent and a non-streaming toolUse/toolUses for
+								// streaming tool-use event and a non-streaming toolUse/toolUses for
 								// the same call — especially for tools with empty parameters.
 								const wasStreaming = toolUseAccum.has(tu.toolUseId);
 								if (wasStreaming) {
@@ -4658,9 +5232,12 @@ async function* agentLoopInMetadataSnapshot(
 									} else {
 										toolUseAccum.set(id, {
 											name,
-											inputChunks: [],
+											stream: new ToolInputStream(
+												TOOL_FIELD_CONFIG[name]?.short,
+												TOOL_FIELD_CONFIG[name]?.large,
+											),
 											totalChars: 0,
-											streamingFieldYielded: 0,
+											pendingShort: {},
 											startedAt: Date.now(),
 											lastYieldedAt: Date.now(),
 											outputIndex: parsed.toolUseChunk.outputIndex,
@@ -4678,6 +5255,7 @@ async function* agentLoopInMetadataSnapshot(
 								}
 								const acc = toolUseAccum.get(id);
 								if (acc) {
+									if (stop) acc.streamCompletedAt = Date.now();
 									if (parsed.toolUseChunk.outputIndex != null) {
 										acc.outputIndex = parsed.toolUseChunk.outputIndex;
 									}
@@ -4687,213 +5265,39 @@ async function* agentLoopInMetadataSnapshot(
 										acc.thoughtSignature = chunkThoughtSignature;
 										acc.thoughtSignatureSource = chunkThoughtSignatureSource;
 									}
-									const shortInput = isShortInputTool(acc.name);
-									if (typeof input === "string") {
-										acc.inputChunks.push(input);
-										acc.totalChars += input.length;
-
-										// Short-input tools: skip field extraction, just throttle the chunk event
-										if (shortInput) {
-											const now = Date.now();
-											if (now - acc.lastYieldedAt >= 50) {
-												acc.lastYieldedAt = now;
-												yield {
-													type: "tool_use_chunk",
-													toolUseId: id,
-													toolName: acc.name,
-													inputCharsTotal: acc.totalChars,
-												};
-											}
+									// finalInput is an authoritative snapshot, never an append delta.
+									const finalInput = parsed.toolUseChunk.finalInput;
+									if (typeof finalInput === "string") {
+										const prefix = acc.stream.materializeRaw();
+										if (finalInput.startsWith(prefix)) {
+											// The authoritative snapshot can seal an actual append-only prefix.
+											acc.stream.feed(finalInput.slice(prefix.length));
 										} else {
-											// Extract structured fields from the incomplete JSON
-											const raw = acc.inputChunks.join("");
-											const wantedKeys = getToolWantedKeys(acc.name);
-											let fieldsChanged = false;
-
-											if (wantedKeys.size > 0) {
-												const result = extractJsonFields(raw, wantedKeys);
-
-												// Update completed short fields
-												for (const [key, value] of Object.entries(result.fields)) {
-													if (!acc.extractedFields) acc.extractedFields = {};
-													if (acc.extractedFields[key] !== value) {
-														acc.extractedFields[key] = value;
-														fieldsChanged = true;
-													}
-												}
-
-												// Update file_path shortcut (used by header summary)
-												if (result.fields.file_path && !acc.extractedFilePath) {
-													acc.extractedFilePath = result.fields.file_path;
-													fieldsChanged = true;
-												}
-
-												// Track the active streaming field
-												if (result.activeField) {
-													if (acc.activeStreamingField !== result.activeField.name) {
-														acc.streamingFieldYielded = 0;
-													}
-													acc.activeStreamingField = result.activeField.name;
-												}
-											}
-
-											if (
-												!acc.streamingMetadata &&
-												acc.name === "Edit" &&
-												acc.extractedFields?.old_string != null &&
-												(acc.extractedFilePath || acc.extractedFields.file_path)
-											) {
-												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
-												fieldsChanged = true;
-											}
-
-											// Throttle: yield at most once per 50ms per tool.
-
-											// Bypass throttle when fields change so the frontend
-											// can display them immediately.
-											const now = Date.now();
-											if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
-												acc.lastYieldedAt = now;
-
-												// Calculate content chars (total minus file_path JSON overhead)
-												let contentChars = acc.totalChars;
-												if (acc.extractedFilePath) {
-													const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`
-														.length;
-													contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-												}
-
-												// Compute streaming field delta
-												let streamingField:
-													| { name: string; delta: string; startsField?: boolean }
-													| undefined;
-												if (acc.activeStreamingField && wantedKeys.size > 0) {
-													const sfResult = extractJsonFields(raw, wantedKeys);
-													if (
-														sfResult.activeField &&
-														sfResult.activeField.name === acc.activeStreamingField
-													) {
-														const fullRaw = raw.slice(sfResult.activeField.rawStart);
-														if (fullRaw.length > acc.streamingFieldYielded) {
-															const decoded = decodeJsonStringFragment(
-																fullRaw.slice(acc.streamingFieldYielded),
-															);
-															if (decoded.text) {
-																streamingField = {
-																	name: acc.activeStreamingField,
-																	delta: decoded.text,
-																	startsField: acc.streamingFieldYielded === 0,
-																};
-															}
-															acc.streamingFieldYielded += decoded.consumedChars;
-														}
-													}
-												}
-
-												yield {
-													type: "tool_use_chunk",
-													toolUseId: id,
-													toolName: acc.name,
-													inputCharsTotal: acc.totalChars,
-													...(acc.extractedFilePath && {
-														extractedFilePath: acc.extractedFilePath,
-													}),
-													...(acc.extractedFilePath && {
-														contentCharsReceived: contentChars,
-													}),
-													...(acc.extractedFields && {
-														extractedFields: acc.extractedFields,
-													}),
-													...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
-													...(streamingField && { streamingField }),
-												};
-											}
+											yield* flushToolInput(id, acc);
+											resetToolInput(acc, finalInput);
 										}
+									} else if (typeof input === "string") acc.stream.feed(input);
+									else if (input != null) {
+										// Gemini and other whole-input providers use the same field pipeline.
+										acc.stream.feed(JSON.stringify(input));
+									}
+									acc.totalChars = acc.stream.totalChars;
+									const fieldsChanged = collectShortFields(acc);
+									if (
+										!stop &&
+										(fieldsChanged ||
+											acc.stream.hasClosedFields ||
+											Date.now() - acc.lastYieldedAt >= 50)
+									) {
+										yield* flushToolInput(id, acc);
 									}
 									if (stop) {
-										// Sample before the final Edit metadata read and any downstream awaits.
-										// This is the provider-input boundary, not the later tool_call delivery time.
-										acc.streamCompletedAt = Date.now();
-										const stopRaw = acc.inputChunks.join("");
-
-										// Short-input tools: skip field extraction on stop too
-										if (shortInput) {
-											yield {
-												type: "tool_use_chunk",
-												toolUseId: id,
-												toolName: acc.name,
-												inputCharsTotal: acc.totalChars,
-											};
-										} else {
-											// Final yield: flush any remaining streaming field delta
-											const stopWantedKeys = getToolWantedKeys(acc.name);
-											if (
-												!acc.streamingMetadata &&
-												acc.name === "Edit" &&
-												acc.extractedFields?.old_string != null &&
-												(acc.extractedFilePath || acc.extractedFields.file_path)
-											) {
-												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
-											}
-											let streamingField:
-												| { name: string; delta: string; startsField?: boolean }
-												| undefined;
-
-											if (acc.activeStreamingField && stopWantedKeys.size > 0) {
-												const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
-												if (
-													sfResult.activeField &&
-													sfResult.activeField.name === acc.activeStreamingField
-												) {
-													const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
-													if (fullRaw.length > acc.streamingFieldYielded) {
-														const decoded = decodeJsonStringFragment(
-															fullRaw.slice(acc.streamingFieldYielded),
-														);
-														if (decoded.text) {
-															streamingField = {
-																name: acc.activeStreamingField,
-																delta: decoded.text,
-																startsField: acc.streamingFieldYielded === 0,
-															};
-														}
-														acc.streamingFieldYielded += decoded.consumedChars;
-													}
-												}
-											}
-
-											let contentChars = acc.totalChars;
-											if (acc.extractedFilePath) {
-												const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-												contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-											}
-											yield {
-												type: "tool_use_chunk",
-												toolUseId: id,
-												toolName: acc.name,
-												inputCharsTotal: acc.totalChars,
-												...(acc.extractedFilePath && {
-													extractedFilePath: acc.extractedFilePath,
-												}),
-												...(acc.extractedFilePath && {
-													contentCharsReceived: contentChars,
-												}),
-												...(acc.extractedFields && {
-													extractedFields: acc.extractedFields,
-												}),
-												...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
-												...(streamingField && { streamingField }),
-											};
-										}
-
-										let parsedInput: Record<string, unknown> = {};
-										if (stopRaw) {
-											try {
-												parsedInput = JSON.parse(stopRaw);
-											} catch {
-												parsedInput = { _raw: stopRaw };
-											}
-										}
+										yield* flushToolInput(id, acc);
+										const parsedInput = acc.stream.finish();
+										const streamingEditOrigin =
+											(parsedInput?.device ?? config.defaultDeviceId ?? "local") === "local"
+												? validateStreamingEditOrigin(acc.streamingEditOrigin, id, parsedInput)
+												: undefined;
 										const tu: AgentToolUse = {
 											toolUseId: id,
 											name: acc.name,
@@ -4957,6 +5361,7 @@ async function* agentLoopInMetadataSnapshot(
 											toolUseId: id,
 											toolName: tu.name,
 											input: parsedInput,
+											streamingEditOrigin,
 											streamStartedAt: acc.startedAt,
 											streamCompletedAt: acc.streamCompletedAt,
 										};
@@ -5040,22 +5445,33 @@ async function* agentLoopInMetadataSnapshot(
 							};
 						}
 						if (
+							parsed.usage?.contextWindow != null &&
+							Number.isFinite(parsed.usage.contextWindow) &&
+							parsed.usage.contextWindow > 0
+						)
+							requestRawContextWindow = parsed.usage.contextWindow;
+						if (
 							parsed.contextUsagePercentage != null &&
 							Number.isFinite(parsed.contextUsagePercentage)
 						) {
 							receivedUsage = true;
 							// Upstream occupancy is independent of measured/billed token counts.
-							const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
+							const ctxWin =
+								requestRawContextWindow ?? getModelContextWindow(effectiveModel, effectiveProvider);
 							upstreamContextPercent = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
 							requestContextPercent = upstreamContextPercent;
 							const estimatedPromptTokens = getEstimatedUpstreamPromptTokens();
-							const estimatedCompletionTokens = estimateTokens(assistantText);
 							yield {
 								type: "context_usage",
 								percentage: upstreamContextPercent,
+								source: "upstream",
+								snapshot: snapshotContext(
+									"upstream",
+									upstreamContextPercent,
+									ctxWin ?? null,
+									estimatedPromptTokens ?? null,
+								),
 								promptTokens: estimatedPromptTokens,
-								inputTokens: estimatedPromptTokens,
-								completionTokens: estimatedCompletionTokens,
 								contextWindow: ctxWin ?? undefined,
 								isEstimated: true,
 							};
@@ -5131,10 +5547,41 @@ async function* agentLoopInMetadataSnapshot(
 								yield {
 									type: "context_usage",
 									percentage: requestContextPercent,
+									source: "usage",
+									snapshot: snapshotContext(
+										"usage",
+										percentage,
+										contextWindow,
+										parsed.usage.promptTokens,
+									),
 									...requestUsage,
 									contextWindow,
+									isEstimated: false,
 								};
 							}
+						}
+						if (
+							upstreamContextPercent !== undefined &&
+							requestRawContextWindow &&
+							(contextSnapshot as ContextUsageSnapshot | undefined)?.contextWindow !==
+								requestRawContextWindow
+						) {
+							const occupied = getEstimatedUpstreamPromptTokens();
+							const snapshot = snapshotContext(
+								"upstream",
+								upstreamContextPercent,
+								requestRawContextWindow,
+								occupied ?? null,
+							);
+							yield {
+								type: "context_usage",
+								percentage: upstreamContextPercent,
+								source: "upstream",
+								snapshot,
+								promptTokens: occupied,
+								contextWindow: requestRawContextWindow,
+								isEstimated: true,
+							};
 						}
 						if (parsed.webSearch) {
 							const ws = parsed.webSearch;
@@ -5572,6 +6019,7 @@ async function* agentLoopInMetadataSnapshot(
 						}
 					}
 					streamExecutionOpen = false;
+					if (updateReasoningInterrupted) throw updateReasoningStop;
 					throwIfUserAborted();
 					yield* flushRequestStart();
 				} catch (err) {
@@ -5606,6 +6054,26 @@ async function* agentLoopInMetadataSnapshot(
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
+					}
+					if (updateReasoningInterrupted) {
+						// Request-local abort: preserve the narrator/user input and retry budget.
+						// Consume cleanup before opening the durable checkpoint fence.
+						clearFirstTokenTimer();
+						clearStreamIdleTimer();
+						yield* abandonAttemptForReplay(updateReasoningStop.message);
+						responseActivity.release();
+						responseActivity = await beginNarratorResponseActivity(
+							config.narratorId,
+							config.signal,
+							{ isReflection: !!config.reflectionLoop },
+						);
+						continue;
+					}
+					if (guidanceSignal?.aborted) {
+						observeSoftStopForTurn();
+						// Guidance is not a transport fault. Finalize this partial turn below,
+						// without replay/retry or cancelling tools whose bodies already began.
+						break;
 					}
 					if (firstTokenTimeoutTriggered) {
 						requestDiagnostics = normalizeApiRequestDiagnostics({
@@ -6109,13 +6577,19 @@ async function* agentLoopInMetadataSnapshot(
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
 				} finally {
+					responseActivity.setReasoningAbort(null);
 					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
+					guidanceSignal?.removeEventListener("abort", onGuidanceAbort);
 					startFirstTokenTimerForAttempt = undefined;
 				}
 
+				if (guidanceSignal?.aborted) {
+					observeSoftStopForTurn();
+					break;
+				}
 				if (firstTokenTimeoutTriggered) {
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						source: "agent",
@@ -6233,7 +6707,12 @@ async function* agentLoopInMetadataSnapshot(
 				// Skipped once tool progress exists: the ellipsis reasoning is degenerate but a
 				// completed tool call is not, and replaying would throw the call (and any result
 				// it already produced) away. The turn then finishes normally instead.
-				if (mimoEllipsisRetry && completionLimitMessage == null && canReplayInPlace()) {
+				if (
+					!config.reflectionLoop &&
+					mimoEllipsisRetry &&
+					completionLimitMessage == null &&
+					canReplayInPlace()
+				) {
 					chatRetryCount++;
 					const delayMs = Math.min(
 						TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
@@ -6254,6 +6733,35 @@ async function* agentLoopInMetadataSnapshot(
 						return;
 					}
 					continue; // retry provider.chat()
+				}
+
+				// Empty/reasoning-only model answers consume reflection decision turns too.
+				// Do not inherit the primary loop's extra content-recovery requests or compact it.
+				if (
+					config.reflectionLoop &&
+					requestStarted &&
+					!sawErrorEvent &&
+					!lastRetryErrorMessage &&
+					completionLimitMessage == null &&
+					toolUses.length === 0 &&
+					!assistantText.trim()
+				) {
+					yield* finishRequest();
+					if (turnIndex + 1 >= maxTurns) {
+						yield { type: "done" };
+						return;
+					}
+					provider.pushUserTurn(
+						history,
+						content,
+						effectiveModel,
+						isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					);
+					pendingToolResults = [];
+					nextTurnContent = buildReflectionCorrectionPrompt(config);
+					yield { type: "turn_complete", turnIndex };
+					turnIndex++;
+					continue turnLoop;
 				}
 
 				// Empty response check — request succeeded but returned no content.
@@ -6738,22 +7246,7 @@ async function* agentLoopInMetadataSnapshot(
 			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
 				applyToolUseIdRemap(list, turnToolUseIdRemap);
 
-			// ── Estimate token usage when provider doesn't report it ──
-			// Some providers don't report token usage in their API responses.
-			// For these cases, we estimate based on text length to provide usage statistics.
-			if (!requestUsage && upstreamContextPercent === undefined) {
-				const historyText = JSON.stringify(history);
-				const systemText = config.systemPrompt ?? "";
-				const estimatedInputTokens =
-					estimateTokens(historyText) + estimateTokens(systemText) + estimateTokens(content);
-				const estimatedOutputTokens = estimateTokens(assistantText);
-
-				requestUsage = {
-					inputTokens: estimatedInputTokens,
-					promptTokens: estimatedInputTokens,
-					completionTokens: estimatedOutputTokens,
-				};
-			}
+			// No fabricated billing counters: occupancy estimates live only in contextSnapshot.
 
 			// Emit API request end event, retaining the failed stream's diagnostics.
 			yield* finishRequest(pendingResumableError?.message);
@@ -6768,28 +7261,7 @@ async function* agentLoopInMetadataSnapshot(
 			reasoningOnlyRetries = 0;
 			reasoningOnlyCompactAttempted = false;
 
-			// ── Fallback: estimate context usage when the provider reported nothing ──
-			if (!receivedUsage) {
-				const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
-				if (contextWindow) {
-					// Estimate prompt tokens from history + system prompt + current turn content
-					const historyText = JSON.stringify(history);
-					const systemText = config.systemPrompt ?? "";
-					const estimatedPromptTokens =
-						estimateTokens(historyText) +
-						estimateTokens(systemText) +
-						estimateTokens(content) +
-						estimateTokens(assistantText);
-					const percentage = Math.min((estimatedPromptTokens / contextWindow) * 100, 100);
-					yield {
-						type: "context_usage",
-						percentage,
-						promptTokens: estimatedPromptTokens,
-						contextWindow,
-						isEstimated: true,
-					};
-				}
-			}
+			// The input-only fallback is emitted by finishRequest, before its matching end event.
 
 			// Detect orphaned tool uses — tool calls whose streaming input was cut off
 			// before receiving a stop signal (typically due to API max_tokens truncation).
@@ -6843,10 +7315,33 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
+			// A request cancelled before producing content must not persist an empty
+			// assistant turn (some providers reject it when history is replayed).
+			if (
+				guidanceSignal?.aborted &&
+				!assistantText &&
+				toolUses.length === 0 &&
+				!collectReasoningBlocks(reasoningBlockMap) &&
+				!collectCompletedWebSearches(webSearchAccum) &&
+				!collectCompletedImageGenerations(imageGenAccum)
+			) {
+				responseActivity.release();
+				provider.pushUserTurn(
+					history,
+					isFirstTurn ? userText : content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					isFirstTurn ? images : undefined,
+				);
+				yield { type: "turn_complete", turnIndex };
+				return;
+			}
+
 			// Yield the complete assistant message on every successful turn. Event consumers
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
 			yield {
 				type: "assistant_message",
+				outputCompleted: !pendingResumableError,
 				onToolPersisted: (toolUseId, binding) => {
 					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
 					if (tu) bindExecution(tu, binding);
@@ -6860,6 +7355,70 @@ async function* agentLoopInMetadataSnapshot(
 			// The provider response is now complete and every produced tool has a stable row.
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
+
+			if (guidanceSignal?.aborted) {
+				observeSoftStopForTurn();
+				yield* drainStartedEarlyToolResults();
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+				// Still-running detached calls retain their real pending rows. Do not fabricate
+				// skipped results or replay their incomplete pairs into model-facing history.
+				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
+				const guidanceResults: unknown[] = [];
+				for (const tu of guidanceTools) {
+					const result = settledResults.get(tu.toolUseId) ?? {
+						output: getToolMessage("skippedForSoftStop", locale),
+						isError: true,
+						durationMs: 0,
+						completedAt: Date.now(),
+						metadata: { skippedForSoftStop: true },
+					};
+					if (!yieldedToolResults.has(tu.toolUseId)) {
+						yieldedToolResults.add(tu.toolUseId);
+						yield earlyToolResultEvent(tu, result);
+					}
+					guidanceResults.push(
+						provider.formatToolResult(
+							turnToolUseIdRemap.get(tu.toolUseId) ?? tu.toolUseId,
+							result.output,
+							result.isError ?? false,
+							result.images,
+							tu.name,
+						),
+					);
+				}
+				provider.pushUserTurn(
+					history,
+					isFirstTurn ? userText : content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					isFirstTurn ? images : undefined,
+				);
+				if (
+					assistantText ||
+					guidanceTools.length > 0 ||
+					collectReasoningBlocks(reasoningBlockMap)
+				) {
+					provider.pushAssistantTurn(
+						history,
+						assistantText,
+						toHistoryToolUses(guidanceTools),
+						collectReasoningBlocks(reasoningBlockMap),
+						collectCompletedWebSearches(webSearchAccum),
+						messageId,
+						collectCompletedImageGenerations(imageGenAccum),
+						textOutputIndex,
+						redactedThinkingBlocks,
+						orderedAssistantContent(toHistoryToolUses(guidanceTools)),
+					);
+				}
+				if (guidanceResults.length > 0)
+					provider.pushUserTurn(history, "", effectiveModel, guidanceResults);
+				yield { type: "turn_complete", turnIndex };
+				return;
+			}
 
 			if (hasOrphanedToolUses) {
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
@@ -6893,6 +7452,32 @@ async function* agentLoopInMetadataSnapshot(
 					turnIndex++;
 					continue;
 				}
+			}
+
+			// A prose-only reflection gets one internal correction, never instructions
+			// addressed to the main assistant. Keep valid danger fallback tags terminal.
+			if (
+				toolUses.length === 0 &&
+				config.reflectionLoop &&
+				turnIndex + 1 < maxTurns &&
+				!(
+					config.reflectionLoop.context.kind === "dangerReflection" &&
+					config.reflectionLoop.context.purpose !== "permissionRuleRequest" &&
+					parseDangerReflectionTextFallback(assistantText)
+				)
+			) {
+				provider.pushUserTurn(
+					history,
+					isFirstTurn ? userText : content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+				);
+				provider.pushAssistantTurn(history, assistantText, []);
+				pendingToolResults = [];
+				nextTurnContent = buildReflectionCorrectionPrompt(config);
+				yield { type: "turn_complete", turnIndex };
+				turnIndex++;
+				continue;
 			}
 
 			// No tool calls → we're done
@@ -6966,7 +7551,11 @@ async function* agentLoopInMetadataSnapshot(
 					const result = await waitForToolOrAbort(startToolExecution(tu));
 					if (!result) {
 						yield* drainEarlyToolResultsAfterAbort();
-						yield { type: "error", message: "Aborted" };
+						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
+						else {
+							observeSoftStopForTurn();
+							yield { type: "turn_complete", turnIndex };
+						}
 						return;
 					}
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
@@ -7093,7 +7682,11 @@ async function* agentLoopInMetadataSnapshot(
 						const winner = await waitForToolOrAbort(Promise.race(remaining));
 						if (!winner) {
 							yield* drainEarlyToolResultsAfterAbort();
-							yield { type: "error", message: "Aborted" };
+							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
+							else {
+								observeSoftStopForTurn();
+								yield { type: "turn_complete", turnIndex };
+							}
 							return;
 						}
 						const { i, result } = winner;
@@ -7210,7 +7803,16 @@ async function* agentLoopInMetadataSnapshot(
 							continue;
 						}
 
-						const result = await earlyPromise;
+						const result = await waitForToolOrAbort(earlyPromise);
+						if (!result) {
+							yield* drainEarlyToolResultsAfterAbort();
+							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
+							else {
+								observeSoftStopForTurn();
+								yield { type: "turn_complete", turnIndex };
+							}
+							return;
+						}
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
 						if (result.updatedInput) remainingTool.input = result.updatedInput;
 						await processToolResultInjections(remainingTool, result);
@@ -7282,9 +7884,10 @@ async function* agentLoopInMetadataSnapshot(
 				// formatted from tu.toolUseId and are only renamed further below.
 				pendingToolResults = pendingToolResults.filter((tr) => {
 					const toolUseId =
-						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).toolUseId ??
-						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).call_id ??
-						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).tool_call_id;
+						(tr as { toolUseId?: string }).toolUseId ??
+						(tr as { tool_use_id?: string }).tool_use_id ??
+						(tr as { call_id?: string }).call_id ??
+						(tr as { tool_call_id?: string }).tool_call_id;
 					return !toolUseId || !brokenToolUseIds.has(toolUseId);
 				});
 				provider.pushAssistantTurn(
@@ -7366,5 +7969,8 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
+	if (searchScope) {
+		yield { type: "error", message: new SearchExecutionBudgetExceededError().message };
+	}
 	yield { type: "max_turns_exceeded", maxTurns };
 }

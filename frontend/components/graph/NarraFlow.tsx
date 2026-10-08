@@ -24,7 +24,6 @@ import {
 	useFsRevealCapability,
 	useNarratorReviewToolsCapability,
 } from "@frontend/hooks/usePlatform";
-import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
@@ -348,8 +347,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	});
 
 	const deleteChapter = useDeleteChapter();
-	const { removeTab } = useRecentTabs();
-
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 	// `hasWorktree` decides which confirmation text is shown. The server only reaches its
 	// `deleteBranch` call inside an `if (chapter.worktreePath)` block, so a chapter
@@ -1671,6 +1668,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			panelId: string;
 			kind: string | undefined;
 			resourceId?: string;
+			largeFileConfirmed?: boolean;
 			screenX: number;
 			screenY: number;
 		}) => {
@@ -1700,7 +1698,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					w: 480,
 					h: 360,
 					// No layout yet: the surface builds one on first mount and persists it.
-					pendingPanels: [makePanelEntry(kind, resourceId)],
+					pendingPanels: [makePanelEntry(kind, resourceId, input)],
 				});
 				if (!result.ok) {
 					refusal = result.reason;
@@ -1776,6 +1774,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				panelId,
 				kind: final.toolKind,
 				...(final.resourceId ? { resourceId: final.resourceId } : {}),
+				...(final.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 				screenX: hint.x,
 				screenY: hint.y,
 			});
@@ -1854,6 +1853,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				panelId: subject.panelId,
 				kind: subject.kind,
 				...(subject.resourceId ? { resourceId: subject.resourceId } : {}),
+				...(subject.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 				screenX: e.clientX,
 				screenY: e.clientY,
 			});
@@ -2312,12 +2312,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			onSuccess: () => {
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 				queryClient.invalidateQueries({ queryKey: ["narrators"] });
-				// Remove the chapter tab from recent tabs to prevent ghost entries
-				removeTab("chapter", deleteTarget.id);
+				// Cascade cleanup after the chapter entity is gone. Bypasses removeTab and
+				// marks `cascade` so no undo token is minted for a ghost entry.
+				api.removeRecentTab("chapter", deleteTarget.id, { cascade: true }).catch(() => {});
 				setDeleteTarget(null);
 			},
 		});
-	}, [deleteTarget, deleteChapter, queryClient, removeTab]);
+	}, [deleteTarget, deleteChapter, queryClient]);
 
 	if (isLoading) {
 		return (

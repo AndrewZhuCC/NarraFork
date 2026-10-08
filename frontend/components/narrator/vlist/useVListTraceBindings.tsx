@@ -57,6 +57,7 @@ const MESSAGE_HANDLERS = [
 const TOOL_HANDLERS = [
 	"onViewSubagentSession",
 	"onDetachSubagent",
+	"onDetachBash",
 	"onCancelBackgroundTask",
 	"onOpenFilePanel",
 ] as const;
@@ -118,6 +119,9 @@ function projectHandlers(
 	if (meta?.filePath && meta.isFileTool) projected.onOpenFilePanel = handlers.onOpenFilePanel;
 	if (meta?.subagentNarratorId ?? meta?.awaitAgentNarratorId ?? meta?.sendTargetNarratorId) {
 		projected.onViewSubagentSession = handlers.onViewSubagentSession;
+	}
+	if (meta?.toolName === "Bash" && meta.isRunningBash && meta.toolUseId) {
+		projected.onDetachBash = handlers.onDetachBash;
 	}
 	if (meta?.subagentNarratorId && !meta.isTerminal) {
 		if (meta.isBackground) projected.onCancelBackgroundTask = handlers.onCancelBackgroundTask;
@@ -214,6 +218,7 @@ function bindGroup(narratorId: string, rows: Map<string, BoundRow>): TraceGroupB
 							toolDetailRef={toolDetailRef}
 							onViewSubagentSession={handlers.onViewSubagentSession}
 							onDetachSubagent={handlers.onDetachSubagent}
+							onDetachBash={handlers.onDetachBash}
 							onCancelBackgroundTask={handlers.onCancelBackgroundTask}
 							onOpenFilePanel={handlers.onOpenFilePanel}
 						>

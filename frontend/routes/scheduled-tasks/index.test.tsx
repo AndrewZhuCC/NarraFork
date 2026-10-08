@@ -42,6 +42,7 @@ const task: ScheduledTask = {
 	projectId: null,
 	chapterId: null,
 	narratorMode: "reuse",
+	cleanupPolicy: { mode: "none" },
 	reuseNarratorId: "narrator-1",
 	createdBy: null,
 	lastRunAt: null,

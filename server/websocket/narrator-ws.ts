@@ -2,12 +2,21 @@ import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import {
+	TEXT_DOCUMENT_PACKET_BYTES,
+	TEXT_DOCUMENT_PAGE_CHARS,
+} from "@shared/pretext-layout/text-document";
+import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
 	type NarratorWsSubscriptionLimitError,
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import type { ServerWebSocket } from "bun";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
+import { toolInputStreamSource } from "../services/tool-input-stream-source";
 
 export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
@@ -69,7 +78,14 @@ import {
 	updateBufferedMessage,
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
+import { permissionPolicyChanges } from "../services/permission-rule-service";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
+import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
+import {
+	onPublicShareRevoked,
+	revalidatePublicShare,
+	type VerifiedPublicShare,
+} from "../services/public-narrator-share-service";
 import {
 	bufferRealtimeMessage,
 	type CatchUpBuffer,
@@ -116,6 +132,15 @@ export interface NarratorWSData {
 	 * which are treated as non-admin.
 	 */
 	userRole?: string;
+	/**
+	 * Anonymous public-share reader. When present the connection carries NO user
+	 * identity: narrator subscribe is scoped to exactly this share's narrator,
+	 * chat subscribe to exactly its discussion room, and write frames stay
+	 * refused by the existing `!userId` guard (read-only by construction).
+	 * Revalidated at subscribe time; a revocation closes the socket.
+	 */
+	publicShare?: VerifiedPublicShare;
+	publicShareConnectionLease?: PublicShareConnectionLease;
 }
 
 type NarratorSubscriptionKind = "list" | "panel" | "messages";
@@ -179,13 +204,31 @@ type ViewerInfo = {
 	avatarImageId: string | null;
 };
 
-const connections = new Set<NarratorWS>();
-const connectionsByUserId = new Map<string, Set<NarratorWS>>();
+const connections = hotSafe("narrafork.narratorWs.connections", () => new Set<NarratorWS>());
+const connectionsByUserId = hotSafe(
+	"narrafork.narratorWs.connectionsByUserId",
+	() => new Map<string, Set<NarratorWS>>(),
+);
+
+// A revoked share link drops its open sockets immediately rather than waiting
+// for the next revalidation: the revoke listener fires post-commit, and closing
+// here is the only place that sees the live connection set.
+onPublicShareRevoked((shareId) => {
+	for (const ws of connections) {
+		if (ws.data.publicShare?.shareId !== shareId) continue;
+		toolInputLaneSender.close(ws);
+		try {
+			ws.close(4001, "Share link revoked");
+		} catch {
+			// An already-closing socket is the outcome we wanted anyway.
+		}
+	}
+});
 
 function addConnection(ws: NarratorWS): void {
 	connections.add(ws);
 	const userId = ws.data.userId;
-	if (!userId) return;
+	if (!userId || ws.data.publicShare) return;
 	let userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) {
 		userConnections = new Set();
@@ -195,10 +238,20 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	toolInputLaneSender.close(ws);
+	ws.data.publicShareConnectionLease?.release();
+	removeAllChatSubscriptions(ws);
 	releaseGitWorkspaceSubscriptions(ws);
-	connections.delete(ws);
+	const removed = connections.delete(ws);
+	if (removed && ws.data.publicShare) {
+		try {
+			ws.close(1001, "Share connection closed");
+		} catch {
+			/* Already closed. */
+		}
+	}
 	const userId = ws.data.userId;
-	if (!userId) return;
+	if (!userId || ws.data.publicShare) return;
 	const userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) return;
 	userConnections.delete(ws);
@@ -216,7 +269,10 @@ function removeConnection(ws: NarratorWS): void {
 // two members are fixed at creation, and a narrator room follows the narrator's
 // visibility. ⚠️ If leaving/kicking is ever added, that path MUST also evict the
 // user's sockets from this index.
-const chatRoomSubscribers = new Map<string, Set<NarratorWS>>();
+const chatRoomSubscribers = hotSafe(
+	"narrafork.narratorWs.chatRoomSubscribers",
+	() => new Map<string, Set<NarratorWS>>(),
+);
 
 /** Per-connection ceiling, mirroring the narrator subscription cap's intent. */
 export const MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION = 50;
@@ -255,6 +311,7 @@ export function broadcastToChatRoom(roomId: string, message: NarratorServerMessa
 	if (!subscribers || subscribers.size === 0) return;
 	const payload = JSON.stringify(message);
 	for (const ws of subscribers) {
+		if (ws.data.publicShare && ws.data.publicShare.roomId !== roomId) continue;
 		try {
 			ws.send(payload);
 		} catch {
@@ -357,9 +414,266 @@ export function getNarratorConnections(): Set<NarratorWS> {
 
 // === Public API for services to push messages directly ===
 
+type ToolInputChunkMessage = Extract<NarratorServerMessage, { type: "tool_use_chunk" }>;
+
+/** Split only the recoverable tool-input lane; the raw UTF16 offset, not JSON chars, advances. */
+export function* toolInputFrames(message: ToolInputChunkMessage): Generator<string> {
+	const update = message.inputDocument;
+	if (!update) {
+		yield JSON.stringify(message);
+		return;
+	}
+	const field = message.streamingField;
+	const delta = field?.delta ?? "";
+	const { preview: _preview, ...ref } = update.ref;
+	// This lane carries source identity/progress plus a bounded path label, never a second body preview.
+	const base = {
+		type: message.type,
+		narratorId: message.narratorId,
+		toolCallId: message.toolCallId,
+		toolUseId: message.toolUseId,
+		toolName: message.toolName,
+		inputCharsTotal: message.inputCharsTotal,
+		...(message.parentToolUseId ? { parentToolUseId: message.parentToolUseId } : {}),
+		...(message.subagentNarratorId ? { subagentNarratorId: message.subagentNarratorId } : {}),
+		...(message.extractedFilePath
+			? { extractedFilePath: message.extractedFilePath.slice(0, 4096) }
+			: {}),
+		...(message.contentCharsReceived != null
+			? { contentCharsReceived: message.contentCharsReceived }
+			: {}),
+		...(message.extractedFields?.file_path
+			? { extractedFields: { file_path: message.extractedFields.file_path.slice(0, 4096) } }
+			: {}),
+	};
+	let at = 0;
+	do {
+		let count = Math.min(TEXT_DOCUMENT_PAGE_CHARS, delta.length - at);
+		let payload: string;
+		while (true) {
+			const last = at + count === delta.length;
+			const offset = update.offset + at;
+			payload = JSON.stringify({
+				...base,
+				inputDocument: { ref: { ...ref, complete: last && ref.complete }, offset },
+				...(field
+					? {
+							streamingField: {
+								...field,
+								delta: delta.slice(at, at + count),
+								offset,
+								startsField: at === 0 && field.startsField,
+								complete: last && field.complete,
+							},
+						}
+					: {}),
+			});
+			if (
+				Buffer.byteLength(payload) <= TEXT_DOCUMENT_PACKET_BYTES &&
+				(count > 0 || delta.length === 0)
+			)
+				break;
+			if (!count) throw new Error("Tool input metadata exceeds packet budget");
+			count = Math.floor(count / 2);
+		}
+		yield payload;
+		at += count;
+	} while (at < delta.length);
+}
+
+type InputLaneSocket = Pick<NarratorWS, "send" | "close" | "getBufferedAmount">;
+const INPUT_LANE_BACKLOG_BYTES = 256 * 1024;
+
+export interface ToolInputFrameIdentity {
+	narratorId: string;
+	refId: string;
+	epoch: string;
+}
+interface QueuedToolInputFrame {
+	payload: string;
+	identity?: ToolInputFrameIdentity;
+	bytes: number;
+}
+interface ToolInputSocketQueue {
+	frames: QueuedToolInputFrame[];
+	bytes: number;
+	blocked: boolean;
+	flushing: boolean;
+	blockedAt?: number;
+	timer?: ReturnType<typeof setTimeout>;
+}
+
+/** Bun send(-1) has ALREADY enqueued that frame. Only later unsent frames enter our bounded queue. */
+export class ToolInputLaneSender {
+	private readonly states = new WeakMap<InputLaneSocket, ToolInputSocketQueue>();
+	constructor(
+		private readonly maxBytes = INPUT_LANE_BACKLOG_BYTES,
+		private readonly revalidate: (
+			ws: InputLaneSocket,
+			identity: ToolInputFrameIdentity,
+		) => boolean | Promise<boolean> = () => true,
+	) {}
+
+	close(ws: InputLaneSocket): void {
+		const state = this.states.get(ws);
+		if (state?.timer) clearTimeout(state.timer);
+		this.states.delete(ws);
+	}
+
+	clearNarrator(ws: InputLaneSocket, narratorId: string): void {
+		const state = this.states.get(ws);
+		if (!state) return;
+		state.frames = state.frames.filter((frame) => frame.identity?.narratorId !== narratorId);
+		state.bytes = state.frames.reduce((bytes, frame) => bytes + frame.bytes, 0);
+	}
+
+	private recover(ws: InputLaneSocket): false {
+		this.close(ws);
+		try {
+			ws.close(1013, "Tool input recovery required");
+		} catch {
+			/* Already closed. */
+		}
+		return false;
+	}
+
+	send(ws: InputLaneSocket, payload: string, identity?: ToolInputFrameIdentity): boolean {
+		let state = this.states.get(ws);
+		if (!state) {
+			state = { frames: [], bytes: 0, blocked: false, flushing: false };
+			this.states.set(ws, state);
+		}
+		const bytes = Buffer.byteLength(payload);
+		if (ws.getBufferedAmount() + state.bytes + bytes > this.maxBytes) return this.recover(ws);
+		if (state.blocked || state.flushing || state.frames.length) {
+			state.frames.push({ payload, identity, bytes });
+			state.bytes += bytes;
+		} else {
+			try {
+				const result = ws.send(payload);
+				if (result === 0) return this.recover(ws);
+				state.blocked = result === -1;
+				if (state.blocked) state.blockedAt = Date.now();
+			} catch {
+				return this.recover(ws);
+			}
+		}
+		this.schedule(ws, state);
+		return true;
+	}
+
+	private schedule(ws: InputLaneSocket, state: ToolInputSocketQueue): void {
+		if (state.flushing || state.timer || (!state.blocked && !state.frames.length)) return;
+		state.timer = setTimeout(() => {
+			state.timer = undefined;
+			void this.flush(ws, state);
+		}, 16);
+		state.timer.unref?.();
+	}
+
+	private async flush(ws: InputLaneSocket, state: ToolInputSocketQueue): Promise<void> {
+		if (this.states.get(ws) !== state || state.flushing) return;
+		if (state.blockedAt != null && Date.now() - state.blockedAt >= 10_000) {
+			this.recover(ws);
+			return;
+		}
+		state.flushing = true;
+		try {
+			if (ws.getBufferedAmount() !== 0) return;
+			state.blocked = false;
+			while (state.frames.length && !state.blocked) {
+				const frame = state.frames.shift();
+				if (!frame) break;
+				state.bytes -= frame.bytes;
+				if (frame.identity && !(await this.revalidate(ws, frame.identity))) continue;
+				if (this.states.get(ws) !== state) return;
+				const result = ws.send(frame.payload);
+				if (result === 0) {
+					this.recover(ws);
+					return;
+				}
+				state.blocked = result === -1;
+				if (state.blocked) state.blockedAt = Date.now();
+			}
+		} catch {
+			this.recover(ws);
+		} finally {
+			state.flushing = false;
+			if (this.states.get(ws) === state) this.schedule(ws, state);
+		}
+	}
+}
+export async function revalidateQueuedToolInputFrame(
+	socket: InputLaneSocket,
+	identity: ToolInputFrameIdentity,
+): Promise<boolean> {
+	const ws = socket as NarratorWS;
+	const current = () =>
+		connections.has(ws) &&
+		ws.data.subscribedNarrators.has(identity.narratorId) &&
+		toolInputStreamSource.isCurrentInputLane(identity.narratorId, identity.refId, identity.epoch);
+	if (!current()) return false;
+	if (ws.data.publicShare) {
+		if (ws.data.publicShare.narratorId !== identity.narratorId) return false;
+		try {
+			revalidatePublicShare(ws.data.publicShare);
+		} catch {
+			return false;
+		}
+		return current();
+	}
+	if (!ws.data.userId) return false;
+	const allowed = await authorizeNarratorId(
+		identity.narratorId,
+		{
+			userId: ws.data.userId,
+			isAdmin: ws.data.userRole === "admin",
+		},
+		"read",
+	);
+	// ACL lookup is async: subscription, connection and occurrence may change while it runs.
+	return allowed && current();
+}
+const toolInputLaneSender = hotSafe(
+	"toolInputLaneSender",
+	() => new ToolInputLaneSender(INPUT_LANE_BACKLOG_BYTES, revalidateQueuedToolInputFrame),
+);
+
+function sendToolInputLane(ws: NarratorWS, message: ToolInputChunkMessage): boolean {
+	try {
+		if (!message.inputDocument) return false;
+		const ref = toolInputStreamSource.descriptor(message.inputDocument.ref.id);
+		if (ref.source?.narratorId !== message.narratorId) return false;
+		const identity = { narratorId: message.narratorId, refId: ref.id, epoch: ref.epoch };
+		if (
+			!toolInputStreamSource.isCurrentInputLane(identity.narratorId, identity.refId, identity.epoch)
+		)
+			return true;
+		if (ws.data.publicShare) revalidatePublicShare(ws.data.publicShare);
+		for (const payload of toolInputFrames(message)) {
+			if (!toolInputLaneSender.send(ws, payload, identity)) return false;
+		}
+		return true;
+	} catch {
+		// Never claim an unavailable source is recoverable, or send an oversized packet.
+		return false;
+	}
+}
+
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
+	if (message.type === "tool_use_chunk" && message.inputDocument) {
+		for (const ws of connections) {
+			if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
+			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
+			// Offset-aware, source-backed frames can cross REST catch-up without an unbounded body buffer.
+			if (!sendToolInputLane(ws, message)) removeConnection(ws);
+		}
+		eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
+		return;
+	}
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
+		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 		if (ws.data.subscribedNarrators.has(narratorId)) {
 			if (ws.data.catchingUpNarrators.has(narratorId)) {
 				const buffer = ws.data.catchUpBuffers.get(narratorId);
@@ -379,6 +693,16 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
 
+// Replace the callback on hot reload; a hotOnce listener would retain the old emitter.
+const permissionPolicyBridge = hotSafe<{ dispose?: () => void }>(
+	"narrafork.permissionPolicyWsBridge",
+	() => ({}),
+);
+permissionPolicyBridge.dispose?.();
+permissionPolicyBridge.dispose = permissionPolicyChanges.on((event) => {
+	broadcastToNarrator(event.narratorId, event);
+});
+
 function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	message: T,
 	subscriptionRequestId?: string,
@@ -387,6 +711,8 @@ function withSubscriptionRequestId<T extends Record<string, unknown>>(
 }
 
 function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
+	if (message.type === "tool_use_chunk" && message.inputDocument)
+		return sendToolInputLane(ws, message as unknown as ToolInputChunkMessage);
 	try {
 		ws.send(JSON.stringify(message));
 		return true;
@@ -423,10 +749,36 @@ async function authorizeReadableNarrators(
 ): Promise<string[]> {
 	const userId = ws.data.userId;
 	if (!userId) {
-		for (const narratorId of narratorIds) {
-			safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+		// Public-share reader: the share itself is the grant, scoped to exactly one
+		// narrator. Revalidated synchronously so a revoked link cannot hold a
+		// subscription; anything else is denied in the same indistinguishable shape.
+		const share = ws.data.publicShare;
+		if (!share) {
+			for (const narratorId of narratorIds) {
+				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+			}
+			return [];
 		}
-		return [];
+		let liveShare: VerifiedPublicShare;
+		try {
+			liveShare = revalidatePublicShare(share);
+		} catch {
+			for (const narratorId of narratorIds) {
+				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+			}
+			return [];
+		}
+		const allowed: string[] = [];
+		for (const narratorId of new Set(narratorIds)) {
+			if (narratorId === liveShare.narratorId) {
+				allowed.push(narratorId);
+			} else {
+				ws.data.subscribedNarrators.delete(narratorId);
+				toolInputLaneSender.clearNarrator(ws, narratorId);
+				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+			}
+		}
+		return allowed;
 	}
 	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
 	const allowed: string[] = [];
@@ -449,6 +801,7 @@ async function authorizeReadableNarrators(
 			allowed.push(narratorId);
 		} else {
 			ws.data.subscribedNarrators.delete(narratorId);
+			toolInputLaneSender.clearNarrator(ws, narratorId);
 			safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
 		}
 	}
@@ -654,10 +1007,44 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 		if (!connections.has(ws)) return;
 		const batchIds = narratorIds.slice(offset, offset + RECENT_TABS_WS_BATCH_SIZE);
 		const rows = await loadStatusRows(batchIds);
+		// Load counts after status so an idle snapshot also carries the background
+		// occupancy signal. Use the same bounded count semantics as the runtime API.
+		let counts: Map<string, number> | undefined;
+		const freshCountIds = new Set<string>();
+		try {
+			const { backgroundTaskService } = await import("../services/background-task-service");
+			const versionsAtRead = new Map(
+				rows.map((row) => [row.id, backgroundTaskService.getListVersion(row.id)]),
+			);
+			counts = await backgroundTaskService.countActiveByParentBatch(rows.map((row) => row.id));
+			// List subscriptions are already live. A count frame delivered during
+			// this read must win over the older snapshot, independently per narrator.
+			for (const row of rows) {
+				if (versionsAtRead.get(row.id) === backgroundTaskService.getListVersion(row.id)) {
+					freshCountIds.add(row.id);
+				}
+			}
+		} catch (err) {
+			// Occupancy can be incomplete; do not lose basic status or invent zeros.
+			logger.warn("Failed to load background counts for narrator list snapshot", {
+				count: rows.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		if (!connections.has(ws)) return;
 		const rowsById = new Map(rows.map((row) => [row.id, row]));
 		const items = batchIds.flatMap((id) => {
 			const row = rowsById.get(id);
-			return row ? [toListStateSnapshotItem(row)] : [];
+			return row
+				? [
+						{
+							...toListStateSnapshotItem(row),
+							...(counts && freshCountIds.has(id)
+								? { activeBackgroundTaskCount: counts.get(id) ?? 0 }
+								: {}),
+						},
+					]
+				: [];
 		});
 		if (!safeSend(ws, { type: "list_state_snapshot", items })) return;
 	}
@@ -710,7 +1097,8 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
 		if (!snap) continue;
-		const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
+		const hasStreaming =
+			snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0 || snap.model !== undefined;
 		if (!hasStreaming) continue;
 		if (
 			!safeSend(
@@ -719,6 +1107,8 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					{
 						type: "streaming_snapshot",
 						narratorId: id,
+						model: snap.model,
+						provider: snap.provider,
 						streamingBlocks: snap.streamingBlocks,
 						toolChunks: [...snap.toolChunks.values()],
 					},
@@ -929,6 +1319,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 		}
 		if (allowed) continue;
 		ws.data.subscribedNarrators.delete(narratorId);
+		toolInputLaneSender.clearNarrator(ws, narratorId);
 		safeSend(ws, { type: "subscribe_denied", narratorId });
 	}
 }
@@ -1039,10 +1430,11 @@ if (hotOnce("narrafork.notificationCenterWs.listenersRegistered")) {
 	});
 }
 
-/** Broadcast a message to ALL narrator WS connections (not filtered by subscription). */
+/** Deployment-wide frames are for authenticated sessions, NEVER anonymous share readers. */
 export function broadcastToAll(message: Record<string, unknown>): void {
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
+		if (ws.data.publicShare) continue;
 		try {
 			ws.send(payload);
 		} catch {
@@ -1059,7 +1451,7 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 export function broadcastToAdmins(message: Record<string, unknown>): void {
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
-		if (ws.data.userRole !== "admin") continue;
+		if (ws.data.publicShare || ws.data.userRole !== "admin") continue;
 		try {
 			ws.send(payload);
 		} catch {
@@ -1549,6 +1941,21 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 
 export const handleNarratorWS = {
 	open(ws: NarratorWS) {
+		const lease = ws.data.publicShareConnectionLease;
+		if (
+			lease &&
+			!lease.open(() => {
+				removeConnection(ws);
+				try {
+					ws.close(1001, "Share connection expired");
+				} catch {
+					/* Already closed. */
+				}
+			})
+		) {
+			ws.close(1008, "Share connection reservation expired");
+			return;
+		}
 		ws.data.lastPongAt = Date.now();
 		addConnection(ws);
 	},
@@ -1564,6 +1971,21 @@ export const handleNarratorWS = {
 			return;
 		}
 		const msg = result.data;
+
+		// Anonymous grants permit only the transcript/room protocol and heartbeat.
+		// In particular, output-stats sends directly from the connection registry.
+		if (
+			ws.data.publicShare &&
+			![
+				"pong",
+				"subscribe",
+				"unsubscribe",
+				"sync_check",
+				"chat_subscribe",
+				"chat_unsubscribe",
+			].includes(msg.type)
+		)
+			return;
 
 		// Update heartbeat timestamp on any valid message
 		ws.data.lastPongAt = Date.now();
@@ -1659,6 +2081,7 @@ export const handleNarratorWS = {
 			case "unsubscribe": {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.delete(id);
+					toolInputLaneSender.clearNarrator(ws, id);
 				}
 				break;
 			}
@@ -1891,7 +2314,24 @@ export const handleNarratorWS = {
 			}
 			case "chat_subscribe": {
 				const userId = ws.data.userId;
-				if (!userId) break;
+				if (!userId) {
+					// Public-share reader: exactly the share's own discussion room, nothing
+					// else. Revalidated so a revoked link cannot keep the room feed.
+					const share = ws.data.publicShare;
+					if (!share) break;
+					let liveShare: VerifiedPublicShare;
+					try {
+						liveShare = revalidatePublicShare(share);
+					} catch {
+						break;
+					}
+					for (const roomId of msg.roomIds) {
+						if (roomId !== liveShare.roomId) continue;
+						if (ws.data.subscribedChatRooms.has(roomId)) continue;
+						addChatSubscription(ws, roomId);
+					}
+					break;
+				}
 				const { assertCanRead } = await import("../services/chat-service");
 				for (const roomId of msg.roomIds) {
 					if (ws.data.subscribedChatRooms.has(roomId)) continue;
@@ -1987,16 +2427,24 @@ export const handleNarratorWS = {
 					// so it survives page refresh.
 					try {
 						const row = db
-							.select({ id: narratorToolCalls.id, inputJson: narratorToolCalls.inputJson })
+							.select({
+								id: narratorToolCalls.id,
+								messageId: narratorToolCalls.messageId,
+								inputJson: narratorToolCalls.inputJson,
+							})
 							.from(narratorToolCalls)
 							.where(eq(narratorToolCalls.toolUseId, msg.toolUseId))
 							.get();
 						if (row) {
 							const input = row.inputJson && typeof row.inputJson === "object" ? row.inputJson : {};
 							db.update(narratorToolCalls)
-								.set({ inputJson: { ...input, timeout: newMs } })
+								.set({
+									inputJson: { ...input, timeout: newMs },
+									inputChars: measureSerializedCharacters({ ...input, timeout: newMs }),
+								})
 								.where(eq(narratorToolCalls.id, row.id))
 								.run();
+							queueContextCharacterRefresh(msg.narratorId, row.messageId);
 						}
 					} catch (err) {
 						logger.warn("Failed to persist updated timeout", {

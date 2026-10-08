@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
+import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
@@ -10,11 +11,14 @@ import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { resolveProviderAndModel } from "../../lib/agent";
 import { analyzeShellCommand } from "../../lib/agent/bash-analyze";
+import { LOCAL_DEVICE_ID } from "../../lib/agent/execution/backend";
 import { projectFileReferenceText } from "../../lib/agent/file-reference-projection";
 import {
 	acknowledgePipelineExitConfirmation,
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
+import { modelInputContainsText } from "../../lib/agent/question-model-input";
+import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
@@ -30,6 +34,7 @@ import {
 	resolveAutoContinuationMode,
 	resolveBooleanOverride,
 } from "../../lib/boolean-override";
+import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
 import { resolveFastModeForUser } from "../../lib/fast-mode";
@@ -51,6 +56,10 @@ import { resolveKnownUnavailableNugModel } from "../../lib/nug-model-availabilit
 import { markNugCachedModelUnavailable } from "../../lib/nug-model-cache";
 import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
+import {
+	getSearchExecutionScope,
+	SearchExecutionBudgetExceededError,
+} from "../../lib/search/execution-scope";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
@@ -96,6 +105,7 @@ import {
 	toBufferSummary,
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
+import { freezeNarratorContextComposition } from "../narrator-context-composition";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -133,6 +143,7 @@ import {
 	buildSystemPrompt,
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
+	consumeQuestionAnswerModelReceipts,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
@@ -145,7 +156,7 @@ import {
 	getLatestSubagentParentToolUseId,
 	getSubagentFinalText,
 	getSubagentResultMessageId,
-	hasPendingBufferedWork,
+	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
@@ -207,6 +218,7 @@ import {
 	markPendingStopTakeover,
 } from "../subagent-takeover";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
+import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { resolveEffectiveTraits } from "../trait-layer-service";
 import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
@@ -226,12 +238,42 @@ import {
 	isForegroundTurnInterrupted,
 	resetForegroundTurn,
 } from "./control";
-import { buildRuntimeHistory } from "./history";
+import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
+import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
+
+/**
+ * Where a narrator's file-mutating tool calls should be git-tracked, or null.
+ *
+ * Chapter narrators track their worktree. Chapter-less narrators track their
+ * cwd, but only a local Git repo — gitService spawns local git, so a remote
+ * device would report the host's state. Evaluated per tool call rather than
+ * per session so a mid-session cwd switch re-evaluates `_isInGitRepo`.
+ *
+ * Known gap: `_isInGitRepo` is probed at session creation and cwd switches
+ * only, so a `git init` inside the current directory activates the push path
+ * no sooner than the next session/cwd change; the client-side `not_git`
+ * workspace re-probe interval covers the bar in the meantime.
+ */
+export function gitTrackPathForSession(
+	session: Pick<
+		ActiveNarrator,
+		"_worktreePath" | "_chapterId" | "_isInGitRepo" | "_defaultDeviceId" | "cwd"
+	>,
+): string | null {
+	if (session._worktreePath && session._chapterId) return session._worktreePath;
+	if (
+		!session._chapterId &&
+		session._isInGitRepo === true &&
+		(session._defaultDeviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID
+	)
+		return session.cwd;
+	return null;
+}
 
 /** Return whether a completed Bash input contains a parsed Git command. */
 export async function isGitCommandToolResult(
@@ -391,6 +433,12 @@ export async function runAgentLoopUnlocked(
 			userId: active._currentUserId,
 			replyInUserLanguage: active._replyInUserLanguage,
 		});
+		// A legitimately admitted run is an explicit recovery from a previous stop.
+		if (!active.abortController.signal.aborted)
+			db.update(narrators)
+				.set({ lastStopReason: "normal" })
+				.where(eq(narrators.id, narratorId))
+				.run();
 		const initNarrator = await narratorService.getById(narratorId);
 		if (
 			profile.kind === "primary" &&
@@ -501,6 +549,13 @@ export async function runAgentLoopUnlocked(
 
 	try {
 		while (active.alive && owner.isCurrent()) {
+			// Request-only control has one pass lifetime; a new pass must never inherit
+			// an already-consumed guidance abort from the preceding request.
+			active._guidanceAbortController = new AbortController();
+			active._urgentGuidanceAbortController = new AbortController();
+			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
+				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
+			}
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
 				const command = runState.pendingPrePromptBashCommand;
 				runState.pendingPrePromptBashCommand = undefined;
@@ -538,6 +593,10 @@ export async function runAgentLoopUnlocked(
 			// Always use getModelHistorySinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
+			// Materialize queued receipts before building history. They then enter this
+			// request exactly once through normal history adoption (including subagents).
+			if (!active.abortController.signal.aborted)
+				await drainAndPersistPendingInjections(active, subagentPlacement);
 			const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			// History below is rebuilt from the latest post-compact messages, so any
 			// pending-compact guard set by a background compact can be released here.
@@ -546,6 +605,13 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			if (profile.kind === "primary" || active._workspaceContext) {
+				if (active._workspaceInstallFailed)
+					throw new Error("Workspace context installation requires session recovery");
+				const { workspaceContextService } = await import("../workspace-context-service");
+				active._workspaceContext = await workspaceContextService.get(narratorId);
+				active._workspacePassInvalidated = false;
+			}
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
 				active._currentUserId,
@@ -646,8 +712,13 @@ export async function runAgentLoopUnlocked(
 				profile: isSubagentNarrator ? "subagent" : "primary",
 				sourceMessages: dbMessages,
 				currentInput: runState.input.text,
+				attachmentCwd: active.cwd,
+				attachmentSignal: active.abortController.signal,
 			});
 			let { history, trailingToolResults } = preparedHistory;
+			let initialQuestionReceiptText = "";
+			const receipts = questionModelReceipts(preparedHistory.modelMessages);
+			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
 			// The caller's history was formatted using its initial model. A parent or
 			// manual change can select another protocol before this first pass starts.
 			// Never overwrite the freshly rebuilt history with that obsolete snapshot.
@@ -660,10 +731,48 @@ export async function runAgentLoopUnlocked(
 			if (usesInitialHistory && profile.kind === "subagent") {
 				history = profile.initialHistory;
 				trailingToolResults = profile.initialTrailingToolResults ?? [];
+				// The runner prepared this packet before this pass's mailbox drain.
+				// Retain compressed/fork context and caller principal, but merge any
+				// newly persisted user receipts that packet could not have included.
+				const ownedReceiptIds = new Set(
+					preparedHistory.modelMessages
+						.filter((message) => message.narratorId === narratorId)
+						.map((message) => message.id),
+				);
+				const missing = receipts.filter(
+					({ id, text }) =>
+						ownedReceiptIds.has(id) &&
+						!modelInputContainsText(
+							[history, profile.initialCurrentText ?? preparedHistory.currentInputText],
+							text,
+						),
+				);
+				// Fold these into the current user packet, not history: inserting a
+				// user turn before initialTrailingToolResults would break providers
+				// requiring tool_result immediately after its assistant tool_use.
+				initialQuestionReceiptText = missing.map(({ text }) => text).join("\n\n");
 			}
 			runState.firstPass = false;
 
-			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
+			const storeRuntimeCharacters = async (values: {
+				systemChars?: number;
+				toolsChars?: number;
+			}) => {
+				try {
+					const { storeContextRuntimeCharacters } = await import("../narrator-context-composition");
+					await storeContextRuntimeCharacters(narratorId, values);
+				} catch (error) {
+					logger.warn("Failed to store context runtime characters", {
+						narratorId,
+						error: String(error),
+					});
+				}
+			};
+			const {
+				prompt: freshSystemPrompt,
+				usedCompactSummary,
+				summaryRange,
+			} = await buildSystemPrompt(
 				{
 					systemPrompt: oauthRuntime
 						? (oauthRuntime.systemPrompt ?? null)
@@ -691,6 +800,18 @@ export async function runAgentLoopUnlocked(
 						? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 						: profile.systemPrompt
 					: freshSystemPrompt;
+			const { buildPendingQuestionHint } = await import("../narrator-question-service");
+			const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
+			if (pendingQuestionHint)
+				active.systemPrompt = `${active.systemPrompt ?? ""}\n\n${pendingQuestionHint}`;
+			const initialSystemChars = countRuntimeSystemCharacters(
+				active.systemPrompt,
+				freshNarrator.contextSummary,
+				profile.kind === "primary" ? summaryRange : undefined,
+			);
+			// Already-held prompt/summary memory, never a cache count or a GET body read.
+			let runtimeSummaryChars = (active.systemPrompt?.length ?? 0) - initialSystemChars;
+			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = createRuntimeEventContext({
@@ -754,6 +875,8 @@ export async function runAgentLoopUnlocked(
 				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
 				getUserId: () => active._currentUserId,
+				getAttachmentCwd: () => active.cwd,
+				attachmentSignal: active.abortController.signal,
 				onCompactDone: () => {
 					compactDoneFlag = true;
 				},
@@ -763,15 +886,25 @@ export async function runAgentLoopUnlocked(
 				},
 				rebuildSystemPrompt: async () => {
 					const freshNarrator = await narratorService.getById(narratorId);
-					if (profile.kind === "subagent")
-						return profile.rebuildSystemPrompt
-							? profile.rebuildSystemPrompt(freshNarrator.contextSummary)
+					if (profile.kind === "subagent") {
+						const prompt = profile.rebuildSystemPrompt
+							? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 							: profile.systemPrompt;
+						const hint = await buildPendingQuestionHint(narratorId);
+						const finalPrompt = hint ? `${prompt}\n\n${hint}` : prompt;
+						const systemChars = countRuntimeSystemCharacters(
+							finalPrompt,
+							freshNarrator.contextSummary,
+						);
+						runtimeSummaryChars = (finalPrompt?.length ?? 0) - systemChars;
+						await storeRuntimeCharacters({ systemChars });
+						return finalPrompt;
+					}
 					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
 						narratorId,
 						active._currentUserId,
 					);
-					const { prompt } = await buildSystemPrompt(
+					const { prompt, summaryRange } = await buildSystemPrompt(
 						{
 							systemPrompt: freshOAuthRuntime
 								? (freshOAuthRuntime.systemPrompt ?? null)
@@ -792,10 +925,19 @@ export async function runAgentLoopUnlocked(
 						// model being told to write somewhere the gate then rejects.
 						active._planFilePath,
 					);
+					const hint = await buildPendingQuestionHint(narratorId);
+					const finalPrompt = hint ? `${prompt}\n\n${hint}` : prompt;
+					const systemChars = countRuntimeSystemCharacters(
+						finalPrompt,
+						freshNarrator.contextSummary,
+						summaryRange,
+					);
+					runtimeSummaryChars = (finalPrompt?.length ?? 0) - systemChars;
+					await storeRuntimeCharacters({ systemChars });
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
 					// Setting active.systemPrompt would create a second source of truth.
-					return prompt;
+					return finalPrompt;
 				},
 			});
 
@@ -874,6 +1016,13 @@ export async function runAgentLoopUnlocked(
 							relaxedPlan: true,
 						});
 					}
+					if (planState.planReflectionDisabled) {
+						broadcastToNarrator(narratorId, {
+							type: "reflection_overrides_changed",
+							narratorId,
+							planReflectionAutoApproveOverride: "off",
+						});
+					}
 					active._preparedPlanModes?.delete(toolCallId);
 				},
 				onEnterPlanModeFailed: async (toolCallId, toolUseId) => {
@@ -933,8 +1082,13 @@ export async function runAgentLoopUnlocked(
 					if (!active._usedCompactSummary) return;
 					await db
 						.update(narrators)
-						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+						.set({
+							contextSummary: null,
+							contextSummaryChars: 0,
+							updatedAt: new Date().toISOString(),
+						})
 						.where(eq(narrators.id, narratorId));
+					queueContextCharacterRefresh(narratorId);
 					active._usedCompactSummary = false;
 				},
 				onToolResult: (event) => {
@@ -947,76 +1101,75 @@ export async function runAgentLoopUnlocked(
 						suggestedCwd: recovery.suggestedCwd,
 					};
 				},
-				onGitTrack:
-					active._worktreePath && active._chapterId
-						? (toolName, toolUseId, input) => {
-								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-								const chapterId = active._chapterId as string;
-								const worktreePath = active._worktreePath as string;
-								const baseBranch = active._baseBranch as string | undefined;
-								const scheduleRefresh = (delayMs: number) => {
-									// Collapse rapid successive calls into one trailing query. Git commands
-									// use delay 0 so branch/commit-only changes are visible immediately.
-									if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-									active._gitTrackTimer = setTimeout(() => {
-										active._gitTrackTimer = undefined;
-										// File changes just happened → invalidate then read through
-										// the shared cache so co-located narrators reuse one query.
-										invalidateStatus(worktreePath);
-										Promise.all([
-											getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
-											baseBranch
-												? gitService.getCommitsAhead(worktreePath, baseBranch)
-												: Promise.resolve({ count: 0, baseBranch: "" }),
-										]).then(
-											([gitStatus, ahead]) => {
-												// Strip files array from WS broadcast to avoid
-												// sending huge payloads when many files are changed.
-												// The Git panel fetches the full list via API.
-												const { files: _files, ...statusWithoutFiles } = gitStatus;
-												broadcastToNarrator(narratorId, {
-													type: "git_status",
-													narratorId,
-													chapterId,
-													toolUseId,
-													status: statusWithoutFiles as typeof gitStatus,
-													commitsAhead: ahead.count,
-													baseBranch: ahead.baseBranch,
-													linesAdded: gitStatus.linesAdded,
-													linesRemoved: gitStatus.linesRemoved,
-												});
-											},
-											(err) => {
-												logger.debug("Git status tracking failed", {
-													narratorId,
-													error: String(err),
-												});
-											},
-										);
-									}, delayMs);
-								};
+				// gitTrackPathForSession decides per tool call, not per session: a
+				// mid-session cwd switch re-evaluates _isInGitRepo. Without this hook a
+				// standalone narrator's git bar never moved until a foreground refetch.
+				onGitTrack: (toolName, toolUseId, input) => {
+					if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+					const chapterId = active._chapterId ?? null;
+					const worktreePath = gitTrackPathForSession(active);
+					if (!worktreePath) return;
+					const baseBranch = active._baseBranch as string | undefined;
+					const scheduleRefresh = (delayMs: number) => {
+						// Collapse rapid successive calls into one trailing query. Git commands
+						// use delay 0 so branch/commit-only changes are visible immediately.
+						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+						active._gitTrackTimer = setTimeout(() => {
+							active._gitTrackTimer = undefined;
+							// File changes just happened → invalidate then read through
+							// the shared cache so co-located narrators reuse one query.
+							invalidateStatus(worktreePath);
+							Promise.all([
+								getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
+								baseBranch
+									? gitService.getCommitsAhead(worktreePath, baseBranch)
+									: Promise.resolve({ count: 0, baseBranch: "" }),
+							]).then(
+								([gitStatus, ahead]) => {
+									// Strip files array from WS broadcast to avoid
+									// sending huge payloads when many files are changed.
+									// The Git panel fetches the full list via API.
+									const { files: _files, ...statusWithoutFiles } = gitStatus;
+									broadcastToNarrator(narratorId, {
+										type: "git_status",
+										narratorId,
+										chapterId,
+										toolUseId,
+										status: statusWithoutFiles as typeof gitStatus,
+										commitsAhead: ahead.count,
+										baseBranch: ahead.baseBranch,
+										linesAdded: gitStatus.linesAdded,
+										linesRemoved: gitStatus.linesRemoved,
+									});
+								},
+								(err) => {
+									logger.debug("Git status tracking failed", {
+										narratorId,
+										error: String(err),
+									});
+								},
+							);
+						}, delayMs);
+					};
 
-								if (toolName !== SHELL_TOOL_NAME) {
-									scheduleRefresh(800);
-									return;
-								}
+					if (toolName !== SHELL_TOOL_NAME) {
+						scheduleRefresh(800);
+						return;
+					}
 
-								const shellCwd =
-									typeof input?.workdir === "string"
-										? resolve(active.cwd, input.workdir)
-										: active.cwd;
-								void isGitCommandToolResult(toolName, input, shellCwd).then(
-									(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
-									(error) => {
-										logger.debug("Git command detection failed; using normal status tracking", {
-											narratorId,
-											error: String(error),
-										});
-										scheduleRefresh(800);
-									},
-								);
-							}
-						: undefined,
+					const shellCwd =
+						typeof input?.workdir === "string" ? resolve(active.cwd, input.workdir) : active.cwd;
+					void isGitCommandToolResult(toolName, input, shellCwd).then(
+						(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
+						(error) => {
+							logger.debug("Git command detection failed; using normal status tracking", {
+								narratorId,
+								error: String(error),
+							});
+							scheduleRefresh(800);
+						},
+					);
+				},
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
@@ -1123,7 +1276,10 @@ export async function runAgentLoopUnlocked(
 			const availableDevices = turnSessionDevices;
 
 			let toolCallLimitExceeded = false;
+			const passWorkspaceContext = active._workspaceContext;
 			const config: import("../../lib/agent").AgentConfig = {
+				// Freeze this logical run's segment across every retry/compact pass.
+				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,
 				narratorId,
 				conversationId: active.conversationId,
@@ -1131,9 +1287,44 @@ export async function runAgentLoopUnlocked(
 				model: resolved.model,
 				provider: resolved.provider,
 				cwd: active.cwd,
+				workspaceContext: passWorkspaceContext,
+				assertWorkspaceCurrent: passWorkspaceContext
+					? () => {
+							if (
+								active._workspaceInstallFailed ||
+								active._workspacePassInvalidated ||
+								active._workspaceContext?.revision !== passWorkspaceContext.revision ||
+								active._workspaceContext?.contextKey !== passWorkspaceContext.contextKey
+							)
+								throw new Error("Workspace changed; this old pass cannot start more tools");
+						}
+					: undefined,
+				switchWorkingDirectory:
+					profile.kind === "primary" && !oauthRuntime
+						? async (request) => {
+								const { workspaceContextService } = await import("../workspace-context-service");
+								return workspaceContextService.switch(narratorId, request, {
+									origin: "agent",
+									active,
+									userId: active._currentUserId,
+								});
+							}
+						: undefined,
 				systemPrompt: active.systemPrompt ?? undefined,
+				onToolsCharacters: (toolsChars) => storeRuntimeCharacters({ toolsChars }),
+				freezeContextComposition: (counts, requestId, startedAt, signal) =>
+					freezeNarratorContextComposition(
+						narratorId,
+						counts,
+						requestId,
+						startedAt,
+						runtimeSummaryChars,
+						signal,
+					),
 				locale,
 				signal: active.abortController.signal,
+				guidanceSignal: active._guidanceAbortController.signal,
+				urgentGuidanceSignal: active._urgentGuidanceAbortController.signal,
 				chapterId: active._chapterId,
 				parentNarratorId: saParentNarratorId,
 				parentToolUseId: saParentToolUseId,
@@ -1181,9 +1372,8 @@ export async function runAgentLoopUnlocked(
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
-				get defaultDeviceId() {
-					return active._defaultDeviceId ?? null;
-				},
+				// A pass owns its device identity; selection changes only affect the next pass.
+				defaultDeviceId: active._defaultDeviceId ?? null,
 				availableDevices,
 				setDefaultDevice: oauthRuntime
 					? async (deviceId) => {
@@ -1234,6 +1424,13 @@ export async function runAgentLoopUnlocked(
 				disabledTools: active._disabledTools,
 				allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
 				allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+				onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
+					narratorId,
+					cwd: active.cwd,
+					signal: active.abortController.signal,
+					userId: active._currentUserId,
+					reviewReadOnlyBash: profile.kind === "subagent" && profile.subagentType === "review",
+				}),
 				runtimeAuthorizationGuard: oauthRuntime
 					? async () => {
 							await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
@@ -1279,7 +1476,7 @@ export async function runAgentLoopUnlocked(
 				permissionHandler: (toolName, input, toolUseId, options) =>
 					handlePermission(
 						narratorId,
-						active.abortController.signal,
+						options?.signal ?? active.abortController.signal,
 						toolName,
 						input,
 						toolUseId,
@@ -1312,7 +1509,17 @@ export async function runAgentLoopUnlocked(
 					// close the window so later tool calls in the same turn cannot write the fence.
 					clearBehaviorFenceEditGrant(narratorId);
 				},
-				onModelInputConsumed: consumeAgentMessageHistory,
+				getQuestionModelReceipts: () =>
+					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
+				onModelInputConsumed: (history, content, answerEventIds) => {
+					consumeAgentMessageHistory(history, content);
+					// DB presence and Await completion are only candidates. The loop
+					// confirms the IDs actually supplied after projection/compaction.
+					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
+					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
+					for (const id of answerEventIds ?? [])
+						active._questionAnswerFallbackMessageIds?.delete(id);
+				},
 				getAfterToolsInjections: () =>
 					drainInjectionsIntoHistory(active, locale, subagentPlacement),
 				deliverInjectionRow: async (injection) => {
@@ -1427,6 +1634,14 @@ export async function runAgentLoopUnlocked(
 					);
 				},
 				shouldStop: () => {
+					// Cancellation is irreversible even when the queued guidance has since
+					// been removed/downgraded. Record the actual pass interruption using
+					// its captured signals, independently of whether input remains. This
+					// keeps ordinary next steps behind recovery of the unfinished work.
+					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
+						active._bufferSoftStopTaken = true;
+					}
+					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
 					if (profile.kind === "subagent" && shouldStopSubagentForBufferedMessageSync(narratorId)) {
 						active._bufferSoftStopTaken = true;
 						return true;
@@ -1434,7 +1649,7 @@ export async function runAgentLoopUnlocked(
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedWork(narratorId),
+						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
 					});
 					active._feedbackSoftStop = decision.feedbackSoftStop;
 					active._bufferSoftStop = decision.bufferSoftStop;
@@ -1491,7 +1706,12 @@ export async function runAgentLoopUnlocked(
 			// Run one agent loop pass
 
 			// Preserve the exact prepared packet: a pure tool replay never gets synthetic text.
-			let effectiveText = usesInitialHistory ? runState.input.text : preparedHistory.currentText;
+			let effectiveText =
+				usesInitialHistory && profile.kind === "subagent"
+					? (profile.initialCurrentText ?? preparedHistory.currentInputText)
+					: preparedHistory.currentText;
+			if (initialQuestionReceiptText)
+				effectiveText = [effectiveText, initialQuestionReceiptText].filter(Boolean).join("\n\n");
 			const _isPureToolResultReplay = !effectiveText.trim() && trailingToolResults.length > 0;
 
 			// Passive knowledge injection (point A): when this turn carries real user text,
@@ -1540,7 +1760,7 @@ export async function runAgentLoopUnlocked(
 								hits,
 							});
 							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
-							effectiveText = `${effectiveText}\n\n${block}`;
+							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
 						}
 					}
 				} catch (err) {
@@ -1738,6 +1958,18 @@ export async function runAgentLoopUnlocked(
 				hooks,
 			});
 			runState.lastPass = result;
+			if (
+				active._workspacePassInvalidated &&
+				!active._workspaceInstallFailed &&
+				!active.abortController.signal.aborted
+			) {
+				// Rebuild config, permissions, skills, prompt and file-reference lanes together.
+				active._workspacePassInvalidated = false;
+				runState.input.text =
+					"Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.";
+				runState.input.images = undefined;
+				continue;
+			}
 			if (toolCallLimitExceeded) {
 				// Stop before any retry, review/task continuation or buffered-message replay.
 				// A new explicit user turn can still start normally; no persistent latch.
@@ -1767,6 +1999,55 @@ export async function runAgentLoopUnlocked(
 			runState.hitMaxTurns = result.maxTurnsExceeded === true;
 
 			runState.totalTokens += accountTokenUsageForTurn(active);
+			const searchScope = getSearchExecutionScope();
+			if (searchScope && (searchScope.remainingTurns <= 0 || result.maxTurnsExceeded)) {
+				// No retry/spec/goal continuation can acquire a fresh budget implicitly.
+				const completedNaturally =
+					result.completedNaturally === true &&
+					!result.hasError &&
+					!result.maxTurnsExceeded &&
+					!result.aborted &&
+					!result.interrupted &&
+					!result.contextLengthExceeded &&
+					!result.silentDisconnect &&
+					!result.paymentRequired &&
+					!result.modelUnavailable &&
+					!result.retryableError;
+				if (!completedNaturally) {
+					// Recovery signals often leave hasError=false and finalText contains
+					// partial assistant output, not the upstream failure. Keep their specific
+					// error instead of masking it with the exhausted-budget fallback.
+					const message =
+						result.paymentRequired?.message ||
+						result.modelUnavailable?.message ||
+						result.retryableError ||
+						(result.hasError && !result.maxTurnsExceeded ? result.finalText : "") ||
+						(result.silentDisconnect ? "Codex WebSocket silent disconnect" : "") ||
+						(result.contextLengthExceeded ? "Error: context length exceeded" : "") ||
+						(result.aborted ? "Aborted" : "") ||
+						new SearchExecutionBudgetExceededError().message;
+					const errorCode = result.paymentRequired
+						? "payment_required"
+						: (result.retryableErrorCode ?? result.errorCode);
+					const diagnostics =
+						result.modelUnavailable?.diagnostics ??
+						result.retryableDiagnostics ??
+						result.errorDiagnostics;
+					runState.hadError = true;
+					runState.finalText = message;
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+						errorCode,
+						diagnostics,
+					});
+					active.events.emit("event", {
+						type: "error",
+						data: { message, errorCode, diagnostics },
+					});
+				}
+				break;
+			}
 
 			// Suppress runaway auto-continuation when a continuation pass makes no effective
 			// progress: either it called no tools, or it repeatedly hit the same protected-task
@@ -2430,6 +2711,7 @@ export async function runAgentLoopUnlocked(
 				!active.abortController.signal.aborted
 			) {
 				const input = await consumeNextBufferedSubagentMessage({
+					onlyGuidance: active._bufferSoftStopTaken === true,
 					narratorId,
 					parentNarratorId: profile.parentNarratorId,
 					toolUseId: profile.parentToolUseId,
@@ -2459,12 +2741,16 @@ export async function runAgentLoopUnlocked(
 				const bufferedRow = await withNarratorMutationAdmission(narratorId, async () => {
 					if (active.abortController.signal.aborted) return undefined;
 					return claimInboxHead(narratorId, (candidate) => {
+						if (
+							active.abortController.signal.aborted ||
+							candidate.kind !== "user_input" ||
+							(active._bufferSoftStopTaken && bufferedRowMode(candidate) === "turn")
+						)
+							return false;
+						// A blocked ordinary next step must not end unfinished recovery
+						// merely because its later execution needs a fresh owner/model.
 						requiresFreshTurn = mailboxInputRequiresFreshTurn(candidate);
-						return (
-							!active.abortController.signal.aborted &&
-							candidate.kind === "user_input" &&
-							!requiresFreshTurn
-						);
+						return !requiresFreshTurn;
 					});
 				});
 				// Let the finalizer restore the previous model and release its epoch first.
@@ -2500,6 +2786,14 @@ export async function runAgentLoopUnlocked(
 					}
 					// Broadcast which message was consumed + remaining queue snapshot
 					const remaining = toBufferSummary(await getBufferedMessagesAsync(narratorId));
+					active._bufferGuidancePending = remaining.some(
+						(message) =>
+							message.state !== "failed" &&
+							resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+					);
+					// Materialize accumulated guidance before starting another model
+					// request, so one request sees the whole FIFO batch.
+					active._bufferSoftStop = active._bufferGuidancePending;
 					broadcastToNarrator(narratorId, {
 						type: "buffer_consumed",
 						narratorId,
@@ -3203,9 +3497,11 @@ export async function runAgentLoopUnlocked(
 			? `${finalText.trim()}\n\n${continuationStopNote}`
 			: continuationStopNote;
 	}
+	if (runState.hadError && !active.abortController.signal.aborted)
+		db.update(narrators).set({ lastStopReason: "error" }).where(eq(narrators.id, narratorId)).run();
 	return {
 		started: true,
-		allowInboxWake: !runState.hadError,
+		allowInboxWake: !runState.hadError && !active.abortController.signal.aborted,
 		finalText,
 		hasError: runState.hadError,
 		aborted: runState.wasInterrupted,

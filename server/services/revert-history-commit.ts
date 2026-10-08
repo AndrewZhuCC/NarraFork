@@ -1,35 +1,17 @@
 /**
- * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
- * deliberate capability decision, not unfinished porting.
+ * CAPABILITY BOUNDARY: this module depends on SQLite's connection-scoped
+ * preparation stamp (`total_changes()` + `PRAGMA data_version` +
+ * `PRAGMA schema_version` + `PRAGMA foreign_keys` + `PRAGMA busy_timeout`),
+ * `INDEXED BY`/`rowid` keyset scans, and direct `SELECT changes()` row counts.
+ * The stamp conservatively rejects every intervening write.
  *
- * Its guarantees are built on connection-scoped SQLite facts:
- *
- *   - the preparation stamp (`total_changes()` + `PRAGMA data_version` +
- *     `PRAGMA schema_version` + `PRAGMA foreign_keys` + `PRAGMA busy_timeout`),
- *     which conservatively rejects EVERY intervening write — PostgreSQL has no
- *     per-connection counters for these;
- *   - `INDEXED BY` + `rowid` keyset scans and `SELECT changes()` per statement;
- *   - the `INDEX_TRIGGERS` whitelist over `sqlite_schema`, which fail-closes on
- *     any trigger other than the reviewed FTS maintenance ones before a single
- *     row moves.
- *
- * THE PG DECISION ON TRIGGERS (定案, batch E): a PostgreSQL history revert
- * applies the same row-level UPDATE/DELETE/INSERT program — it does NOT rebuild
- * content tables (nothing in this module does either), and it does NOT detach,
- * re-create or otherwise manage triggers. The FTS shadow tables on PG are owned
- * by the `ensurePgFts` catalog (`server/db/pg-fts.ts`), whose triggers maintain
- * the shadows automatically for ordinary DML; that automatic maintenance is
- * exactly the behavior the SQLite whitelist exists to protect. The whitelist's
- * fail-closed rule carries over unchanged in spirit: a PG implementation must
- * refuse to run when any NON-catalog trigger exists on the mutated tables
- * (`narrator_messages`, `narrator_tool_calls`, `narrator_message_refs`,
- * `narrators`), because an unreviewed trigger can mutate rows outside the fixed
- * manifest. The mechanism this decision rests on — catalog triggers keep the
- * shadow in sync across revert-shaped DML with zero management — is pinned by
- * `tests/server/services/pg-revert-trigger-policy.test.ts`.
+ * History uses ordinary row-level DML in the caller's real transaction. Enabled
+ * SQLite foreign keys and application-owned triggers execute normally, including
+ * FTS maintenance; SQL failures propagate so history and the caller's journal
+ * roll back together. This module never rebuilds tables or manages triggers.
  */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { getTableColumns } from "drizzle-orm";
@@ -38,6 +20,16 @@ import { narratorMessages, narratorToolCalls } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import type { NarratorPrincipal } from "./narrator-acl";
+import {
+	buildQuestionHistoryInboxProgram,
+	buildQuestionHistoryProgram,
+	QUESTION_HISTORY_BYTES,
+	QUESTION_HISTORY_COLUMNS,
+	QUESTION_HISTORY_LIMIT,
+	type QuestionHistoryEvent,
+	type QuestionHistoryInboxRow,
+	type QuestionHistoryRow,
+} from "./narrator-question-history";
 import {
 	REVERT_SELECTION_PAGE_ITEMS,
 	type RevertSelectionBlock,
@@ -76,6 +68,7 @@ export interface RevertHistoryCommitOptions {
 export interface RevertHistoryApplyResult {
 	/** Only emit context invalidations/broadcasts AFTER the caller commits. */
 	affectedNarratorIds: string[];
+	affectedQuestionIds: string[];
 	replacements: { refId: string; previousMessageId: string; messageId: string }[];
 }
 
@@ -115,18 +108,32 @@ type AssociationRule = {
 	index: string;
 	target: "narrator_messages" | "narrator_tool_calls";
 	action: "delete" | "null";
-	fk: "NO ACTION" | "CASCADE" | "SET NULL" | null;
+	idColumn?: string;
 };
 /** Explicit interpretation of the collector's MESSAGE/TOOL_ASSOCIATIONS, not SQL supplied
  * by a manifest. In particular segment_compact_id is a logical edge, NOT a schema FK. */
 const ASSOCIATIONS: readonly AssociationRule[] = [
+	{
+		table: "permission_rule_requests",
+		column: "tool_call_id",
+		index: "uq_permission_rule_request_attempt",
+		target: "narrator_tool_calls",
+		action: "delete",
+	},
+	{
+		table: "narrator_question_events",
+		column: "message_id",
+		index: "sqlite_autoindex_narrator_question_events_1",
+		target: "narrator_messages",
+		action: "delete",
+		idColumn: "message_id",
+	},
 	{
 		table: "narrators",
 		column: "fork_message_id",
 		index: "idx_narrators_fork_message",
 		target: "narrator_messages",
 		action: "null",
-		fk: "NO ACTION",
 	},
 	{
 		table: "chapter_commits",
@@ -134,7 +141,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_chapter_commits_narrator_message",
 		target: "narrator_messages",
 		action: "null",
-		fk: "SET NULL",
 	},
 	{
 		table: "spec_file_revisions",
@@ -142,7 +148,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_spec_file_revisions_source_message",
 		target: "narrator_messages",
 		action: "null",
-		fk: "SET NULL",
 	},
 	{
 		table: "narrator_patches",
@@ -150,7 +155,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_patches_message",
 		target: "narrator_messages",
 		action: "delete",
-		fk: "CASCADE",
 	},
 	{
 		table: "api_requests",
@@ -158,7 +162,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_api_requests_message",
 		target: "narrator_messages",
 		action: "null",
-		fk: "SET NULL",
 	},
 	{
 		table: "knowledge_injection_events",
@@ -166,7 +169,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_kie_trigger_message",
 		target: "narrator_messages",
 		action: "null",
-		fk: "SET NULL",
 	},
 	{
 		table: "narrator_message_refs",
@@ -174,7 +176,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_narrator_refs_segment_compact",
 		target: "narrator_messages",
 		action: "null",
-		fk: null,
 	},
 	{
 		table: "narrator_questions",
@@ -182,7 +183,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_narrator_questions_tool_call",
 		target: "narrator_tool_calls",
 		action: "delete",
-		fk: "CASCADE",
 	},
 	{
 		table: "narrator_tool_continuations",
@@ -190,7 +190,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_tool_continuations_tool_call",
 		target: "narrator_tool_calls",
 		action: "delete",
-		fk: "CASCADE",
 	},
 	{
 		table: "knowledge_injection_events",
@@ -198,7 +197,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		index: "idx_kie_trigger_tool_call",
 		target: "narrator_tool_calls",
 		action: "null",
-		fk: "SET NULL",
 	},
 ];
 const MESSAGE_COLUMNS = Object.values(getTableColumns(narratorMessages))
@@ -208,34 +206,6 @@ const TOOL_COLUMNS = Object.values(getTableColumns(narratorToolCalls))
 	.filter((column) => !column.generated)
 	.map((column) => column.name);
 const PAGE = REVERT_SELECTION_PAGE_ITEMS;
-const MAX_SCHEMA_TABLES = 512;
-const MAX_SCHEMA_FKS = 4096;
-// Reviewed index-maintenance triggers from db/fts.ts. Custom mutation triggers cannot
-// smuggle unmanifested cascades/writes into an otherwise bounded SQL program.
-const INDEX_TRIGGERS = new Set(
-	[
-		`CREATE TRIGGER narrator_messages_fts_insert AFTER INSERT ON narrator_messages BEGIN
-	 INSERT INTO narrator_messages_fts(rowid, content_text) VALUES (NEW.rowid, NEW.content_text); END`,
-		`CREATE TRIGGER narrator_messages_fts_update AFTER UPDATE ON narrator_messages BEGIN
-	 INSERT INTO narrator_messages_fts(narrator_messages_fts, rowid, content_text) VALUES ('delete', OLD.rowid, OLD.content_text);
-	 INSERT INTO narrator_messages_fts(rowid, content_text) VALUES (NEW.rowid, NEW.content_text); END`,
-		`CREATE TRIGGER narrator_messages_fts_delete AFTER DELETE ON narrator_messages BEGIN
-	 INSERT INTO narrator_messages_fts(narrator_messages_fts, rowid, content_text) VALUES ('delete', OLD.rowid, OLD.content_text); END`,
-		`CREATE TRIGGER narrators_fts_insert AFTER INSERT ON narrators WHEN NEW.title IS NOT NULL BEGIN
-	 INSERT INTO narrators_fts(rowid, title) VALUES (NEW.rowid, NEW.title); END`,
-		`CREATE TRIGGER narrators_fts_update AFTER UPDATE OF title ON narrators WHEN OLD.title IS NOT NULL OR NEW.title IS NOT NULL BEGIN
-	 INSERT INTO narrators_fts(narrators_fts, rowid, title) SELECT 'delete', OLD.rowid, OLD.title WHERE OLD.title IS NOT NULL;
-	 INSERT OR IGNORE INTO narrators_fts(rowid, title) SELECT NEW.rowid, NEW.title WHERE NEW.title IS NOT NULL; END`,
-		`CREATE TRIGGER narrators_fts_delete AFTER DELETE ON narrators WHEN OLD.title IS NOT NULL BEGIN
-	 INSERT INTO narrators_fts(narrators_fts, rowid, title) VALUES ('delete', OLD.rowid, OLD.title); END`,
-	].map(normalizeTrigger),
-);
-function normalizeTrigger(text: string) {
-	return text
-		.replace(/\bIF NOT EXISTS\s+/gi, "")
-		.replace(/\s+/g, " ")
-		.trim();
-}
 
 /** Dormant M3 history component. It does NOT apply/replay files, claim files_verified,
  * commit a revert journal, invoke old async deletion adapters, or start a transaction.
@@ -253,8 +223,9 @@ function normalizeTrigger(text: string) {
  * replay a partially used program. No mutation material or original body escapes WeakMap.
  *
  * Collector policy still applies: running tools/compacts, ambiguous legacy subagents,
- * unmaterialized inherited refs and incomplete evidence are refused. Extra FK edges and
- * compact rewrites requiring refs outside the fixed collector manifest are refused too.
+ * unmaterialized inherited refs and incomplete evidence are refused. Compact rewrites
+ * requiring refs outside the fixed collector manifest are refused too. Additional schema
+ * associations and triggers are enforced by SQLite, not a hand-maintained whitelist.
  * File effects/operations/attributions are retained, never duplicated or re-attributed.
  */
 export class RevertHistoryCommitService {
@@ -305,7 +276,7 @@ export class RevertHistoryCommitService {
 			signal,
 			expiresAt: Date.now() + this.timeoutMs,
 			statements: [],
-			result: { affectedNarratorIds: [], replacements: [] },
+			result: { affectedNarratorIds: [], affectedQuestionIds: [], replacements: [] },
 		};
 		const worker = new RewriteWorker(signal);
 		this.active++;
@@ -321,7 +292,7 @@ export class RevertHistoryCommitService {
 			if (!current.evidenceComplete || current.issues.length)
 				throw fail("EVIDENCE_INCOMPLETE", "The complete fixed selection is not settled");
 			await compareSelection(fixed, current, () => this.pause(snapshot));
-			await this.verifyForeignKeys(snapshot);
+			await this.verifyCopyProjection(snapshot);
 			await this.build(snapshot, current, worker);
 		} finally {
 			await worker.close();
@@ -377,6 +348,7 @@ export class RevertHistoryCommitService {
 			}
 			return {
 				affectedNarratorIds: [...snapshot.result.affectedNarratorIds],
+				affectedQuestionIds: [...snapshot.result.affectedQuestionIds],
 				replacements: snapshot.result.replacements.map((row) => ({ ...row })),
 			};
 		} finally {
@@ -418,7 +390,7 @@ export class RevertHistoryCommitService {
 		if (this.stamp() !== work.stamp) throw fail("STALE", "Database changed during preparation");
 	}
 	private async pause(work: Snapshot) {
-		await yieldToEventLoop();
+		await yieldToEventLoop(0);
 		this.check(work);
 	}
 	private one<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): T {
@@ -451,35 +423,11 @@ export class RevertHistoryCommitService {
 		}
 	}
 
-	private async verifyForeignKeys(work: Snapshot) {
-		const mutatedTables = new Set([
-			"narrator_messages",
-			"narrator_tool_calls",
-			"narrator_message_refs",
-			"narrators",
-			...ASSOCIATIONS.map((rule) => rule.table),
-		]);
-		const triggers = this.root
-			.query<{ name: string; tbl_name: string; bytes: number }, []>(
-				"SELECT name,tbl_name,octet_length(sql) AS bytes FROM sqlite_schema WHERE type='trigger' ORDER BY name LIMIT 129",
-			)
-			.all();
-		bound(triggers.length, 128, "schema triggers");
-		for (const trigger of triggers) {
-			if (!mutatedTables.has(trigger.tbl_name)) continue;
-			bound(trigger.bytes, 4096, "trigger metadata bytes");
-			const row = this.one<{ sql: string }>(
-				work,
-				"SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=? AND octet_length(sql)<=4096 LIMIT 1",
-				[trigger.name],
-			);
-			if (!INDEX_TRIGGERS.has(normalizeTrigger(row.sql)))
-				throw fail(
-					"UNSUPPORTED_ASSOCIATION",
-					"An unreviewed trigger can mutate rows outside the fixed history manifest",
-				);
-			await this.pause(work);
-		}
+	private async verifyCopyProjection(work: Snapshot) {
+		// The application-owned schema and SQLite's enabled FK/trigger machinery are
+		// authoritative. Do not veto a user's recovery because an unrelated table or
+		// trigger was added after a hand-maintained whitelist was written.
+		// Only COW copy projections need a structural check to avoid dropping columns.
 		for (const [table, expected] of [
 			["narrator_messages", MESSAGE_COLUMNS],
 			["narrator_tool_calls", TOOL_COLUMNS],
@@ -498,62 +446,6 @@ export class RevertHistoryCommitService {
 				);
 			await this.pause(work);
 		}
-		// Schema metadata only, never global application IDs/large columns. Unknown inbound
-		// edges (including a cascade from one of our cascade leaves) fail closed, even empty.
-		const deletedTables = new Set([
-			"narrator_messages",
-			"narrator_message_refs",
-			"narrator_tool_calls",
-			"narrator_patches",
-			"narrator_questions",
-			"narrator_tool_continuations",
-		]);
-		const allowed = new Map<string, string>();
-		for (const rule of ASSOCIATIONS)
-			if (rule.fk) allowed.set(`${rule.table}:${rule.column}:${rule.target}:id`, rule.fk);
-		allowed.set("narrator_message_refs:message_id:narrator_messages:id", "NO ACTION");
-		allowed.set("narrator_tool_calls:message_id:narrator_messages:id", "NO ACTION");
-		const found = new Set<string>();
-		let cursor = "";
-		let tableCount = 0;
-		let fkCount = 0;
-		for (;;) {
-			this.check(work);
-			const tables = this.root
-				.query<{ name: string }, SQLQueryBindings[]>(
-					"SELECT name FROM sqlite_schema WHERE type='table' AND name > ? ORDER BY name LIMIT ?",
-				)
-				.all(cursor, PAGE + 1);
-			for (const table of tables.slice(0, PAGE)) {
-				bound(++tableCount, MAX_SCHEMA_TABLES, "schema tables");
-				const fks = this.root
-					.query<{ table: string; from: string; to: string; on_delete: string }, [string]>(
-						'SELECT "table", "from", "to", on_delete FROM pragma_foreign_key_list(?) LIMIT 4097',
-					)
-					.all(table.name);
-				fkCount += fks.length;
-				bound(fkCount, MAX_SCHEMA_FKS, "schema foreign keys");
-				for (const fk of fks) {
-					if (!deletedTables.has(fk.table)) continue;
-					const key = `${table.name}:${fk.from}:${fk.table}:${fk.to}`;
-					if (allowed.get(key) !== fk.on_delete)
-						throw fail(
-							"UNSUPPORTED_ASSOCIATION",
-							"A database FK is not covered by the collector action whitelist",
-						);
-					found.add(key);
-				}
-			}
-			if (tables.length <= PAGE) break;
-			cursor = tables[PAGE - 1].name;
-			await this.pause(work);
-		}
-		for (const key of allowed.keys())
-			if (!found.has(key))
-				throw fail(
-					"UNSUPPORTED_SCHEMA",
-					"A required history FK is missing from the injected database",
-				);
 	}
 
 	private async build(work: Snapshot, selection: RevertSelectionResult, worker: RewriteWorker) {
@@ -626,7 +518,7 @@ export class RevertHistoryCommitService {
 		const messageSizes = new Map<string, number>();
 		const toolSizes = new Map<string, number>();
 		for (const message of messages) {
-			// Reviewed FTS triggers also touch OLD.content_text on update/delete. Gate its
+			// FTS maintenance triggers also touch OLD.content_text on update/delete. Gate its
 			// complete size without selecting the text, including for full deletions.
 			const textSize = this.one<{ bytes: number }>(
 				work,
@@ -730,7 +622,7 @@ export class RevertHistoryCommitService {
 			for (const targetId of targets) {
 				const rows = await this.page<{ id: string }>(
 					work,
-					`SELECT id,rowid AS cursor FROM ${rule.table}`,
+					`SELECT ${rule.idColumn ?? "id"} AS id,rowid AS cursor FROM ${rule.table}`,
 					rule.index,
 					rule.column,
 					targetId,
@@ -756,10 +648,10 @@ export class RevertHistoryCommitService {
 				const ref = refFor(edge.id);
 				addAffected(ref.narrator_id);
 				patchRef(ref).patch.segment_compact_id = null;
-			} else {
+			} else if (edge.table !== "narrator_question_events") {
 				const rule = ASSOCIATIONS.find((r) => r.table === edge.table && r.column === edge.column);
 				const where = {
-					id: edge.id,
+					[rule?.idColumn ?? "id"]: edge.id,
 					...Object.fromEntries(edges.map((e) => [e.column, e.targetId])),
 				};
 				associationProgram.push(
@@ -769,6 +661,7 @@ export class RevertHistoryCommitService {
 				);
 			}
 		}
+		const questionProgram = await this.prepareQuestions(work, selection);
 		for (const id of affected) {
 			const narrator = this.one<Narrator>(
 				work,
@@ -786,7 +679,8 @@ export class RevertHistoryCommitService {
 		for (const [id, bytes] of messageSizes) {
 			const message = messageById.get(id);
 			if (!message) throw fail("MANIFEST_INVALID", "Unknown rewrite");
-			const columns = message.action === "copy_on_write" ? MESSAGE_COLUMNS : ["content_json"];
+			const columns =
+				message.action === "copy_on_write" ? MESSAGE_COLUMNS : ["content_json", "role"];
 			bodies.set(
 				id,
 				this.one<Row>(
@@ -816,7 +710,12 @@ export class RevertHistoryCommitService {
 			if (!original || typeof original.content_json !== "string")
 				throw fail("BODY_INVALID", "No raw body");
 			const selectedBlocks = blocks.get(message.id) ?? [];
-			const rewritten = await worker.rewrite(message, selectedBlocks, original.content_json);
+			const rewritten = await worker.rewrite(
+				message,
+				selectedBlocks,
+				original.content_json,
+				String(original.role),
+			);
 			this.check(work);
 			producedBytes += rewritten.bytes;
 			bound(producedBytes, FILE_CHANGE_LIMITS.historyCowBytes, "rewritten body bytes");
@@ -826,6 +725,7 @@ export class RevertHistoryCommitService {
 			const patch: Row = {
 				content_json: rewritten.body,
 				content_text: rewritten.text,
+				context_chars_json: rewritten.contextCharsJson,
 				...(invalidBoundary ? { tree_hash_after: null, snapshot_commit_sha: null } : {}),
 			};
 			if (message.action === "rewrite") {
@@ -905,6 +805,7 @@ export class RevertHistoryCommitService {
 		const messageChanges = refProgram.length + messages.filter((m) => m.action !== "unlink").length;
 		const relatedChanges =
 			associationProgram.length +
+			questionProgram.length +
 			narratorProgram.length +
 			[...changes.values()].filter((action) => action !== "retain").length;
 		bound(
@@ -918,6 +819,7 @@ export class RevertHistoryCommitService {
 			"actual tool/related mutations",
 		);
 		work.statements.push(
+			...questionProgram,
 			...associationProgram,
 			...messageProgram,
 			...refProgram,
@@ -935,6 +837,158 @@ export class RevertHistoryCommitService {
 		work.result.affectedNarratorIds = [...affected];
 		this.check(work);
 	}
+	/** Materialize every question/event write before issuing the capability. Apply does
+	 * not call the ordinary reconciliation helper or discover any new history rows. */
+	private async prepareQuestions(work: Snapshot, selection: RevertSelectionResult) {
+		const questions = new Map<string, QuestionHistoryRow>();
+		const requests = new Set<string>();
+		const physicallyDeleted = new Set<string>();
+		const deletedByOwner = new Map<string, Set<string>>();
+		const authorized = new Set(selection.messageVersions.map((row) => row.narratorId));
+		const add = (row: QuestionHistoryRow, requestRemoved = false) => {
+			if (!authorized.has(row.narrator_id))
+				throw fail(
+					"UNAUTHORIZED_ASSOCIATION",
+					"Question owner is outside the fixed history manifest",
+				);
+			questions.set(row.id, row);
+			if (requestRemoved) requests.add(row.id);
+			bound(questions.size, QUESTION_HISTORY_LIMIT, "question history rows");
+		};
+		const read = (text: string, values: SQLQueryBindings[]) => {
+			this.check(work);
+			const rows = this.root.query<QuestionHistoryRow, SQLQueryBindings[]>(text).all(...values);
+			bound(rows.length, QUESTION_HISTORY_LIMIT, "question candidates");
+			return rows;
+		};
+		for (const message of selection.history.messages) {
+			if (message.action === "delete" || message.action === "unlink") {
+				const ids = deletedByOwner.get(message.narratorId) ?? new Set<string>();
+				ids.add(message.id);
+				deletedByOwner.set(message.narratorId, ids);
+				for (const row of read(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_tool_calls t INDEXED BY idx_toolcalls_message CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.id WHERE q.narrator_id=? AND t.message_id=? LIMIT ?`,
+					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
+				))
+					add(row, true);
+				for (const row of read(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE q.narrator_id=? AND e.message_id=? LIMIT 1`,
+					[message.narratorId, message.id],
+				))
+					add(row);
+				for (const row of read(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q INDEXED BY idx_narrator_questions_answer_message WHERE q.narrator_id=? AND q.answer_message_id=? LIMIT ?`,
+					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
+				))
+					add(row);
+			} else {
+				for (const block of selection.history.blocks) {
+					if (
+						block.messageId !== message.id ||
+						block.action !== "remove" ||
+						block.type !== "tool_use"
+					)
+						continue;
+					for (const row of read(
+						`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_tool_calls t INDEXED BY idx_toolcalls_message CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.id WHERE q.narrator_id=? AND t.message_id=? AND t.tool_use_id=? LIMIT ?`,
+						[message.narratorId, message.id, block.toolUseId, QUESTION_HISTORY_LIMIT + 1],
+					))
+						add(row, true);
+				}
+			}
+			await this.pause(work);
+		}
+		// Explicitly include all cascade leaves, including a question's older events.
+		// A FK whitelist is not permission to let SQLite discover an unbounded write set.
+		for (const edge of selection.history.associations) {
+			if (edge.table === "narrator_questions") {
+				const row = this.one<QuestionHistoryRow>(
+					work,
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q WHERE q.id=? LIMIT 1`,
+					[edge.id],
+				);
+				add(row, true);
+				physicallyDeleted.add(row.id);
+			} else if (edge.table === "narrator_question_events") {
+				const row = this.one<QuestionHistoryRow>(
+					work,
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? LIMIT 1`,
+					[edge.id],
+				);
+				add(row);
+				const ids = deletedByOwner.get(row.narrator_id) ?? new Set<string>();
+				ids.add(edge.id);
+				deletedByOwner.set(row.narrator_id, ids);
+			}
+		}
+		const program: Statement[] = [];
+		const inboxRows = new Map<string, QuestionHistoryInboxRow>();
+		let count = 0;
+		let bytes = 0;
+		for (const question of questions.values()) {
+			const sizes = await this.page<{ bytes: number }>(
+				work,
+				"SELECT coalesce(octet_length(resolution_json),0) AS bytes,rowid AS cursor FROM narrator_question_events",
+				"idx_question_events_question_rowid",
+				"question_id",
+				question.id,
+			);
+			count += sizes.length;
+			bytes += sizes.reduce((sum, row) => sum + row.bytes, 0);
+			bound(count, QUESTION_HISTORY_LIMIT, "question history events");
+			bound(bytes, QUESTION_HISTORY_BYTES, "question resolution bytes");
+			const events = await this.page<QuestionHistoryEvent>(
+				work,
+				"SELECT question_id,message_id,kind,created_at,resolution_json,rowid AS cursor FROM narrator_question_events",
+				"idx_question_events_question_rowid",
+				"question_id",
+				question.id,
+			);
+			const deleted = deletedByOwner.get(question.narrator_id) ?? new Set<string>();
+			for (const eventId of new Set([
+				...events
+					.filter(
+						(event) =>
+							requests.has(question.id) ||
+							physicallyDeleted.has(question.id) ||
+							deleted.has(event.message_id),
+					)
+					.map((event) => event.message_id),
+				...(question.answer_message_id &&
+				(requests.has(question.id) || deleted.has(question.answer_message_id))
+					? [question.answer_message_id]
+					: []),
+			])) {
+				this.check(work);
+				const rows = this.root
+					.query<QuestionHistoryInboxRow, SQLQueryBindings[]>(
+						"SELECT id,narrator_id,recipient_message_id FROM narrator_buffered_messages INDEXED BY idx_nbm_reserved WHERE narrator_id=? AND recipient_message_id=? AND kind='task_notice' AND source_key=? LIMIT ?",
+					)
+					.all(
+						question.narrator_id,
+						eventId,
+						`question-answer:${eventId}`,
+						QUESTION_HISTORY_LIMIT + 1,
+					);
+				for (const row of rows) inboxRows.set(row.id, row);
+				bound(inboxRows.size, QUESTION_HISTORY_LIMIT, "question inbox rows");
+			}
+			const plan = buildQuestionHistoryProgram(
+				question,
+				events,
+				deleted,
+				requests.has(question.id),
+				physicallyDeleted.has(question.id),
+			);
+			if (plan.statements.length || physicallyDeleted.has(question.id))
+				work.result.affectedQuestionIds.push(question.id);
+			program.push(...plan.statements);
+			await this.pause(work);
+		}
+		program.push(...buildQuestionHistoryInboxProgram([...inboxRows.values()]));
+		return program;
+	}
+
 	private report(phase: "prepare" | "apply", started: number, statements: number) {
 		const durationMs = performance.now() - started;
 		if (durationMs < (phase === "apply" ? 100 : 1000)) return;
@@ -1182,7 +1236,7 @@ function fail(code: string, message: string) {
 	return new RevertHistoryCommitError(code, message);
 }
 
-type Rewritten = { body: string; text: string | null; bytes: number };
+type Rewritten = { body: string; text: string | null; bytes: number; contextCharsJson: string };
 class RewriteWorker {
 	private worker: Worker | undefined;
 	private termination: Promise<number> | undefined;
@@ -1194,6 +1248,7 @@ class RewriteWorker {
 		message: RevertSelectionMessage,
 		blocks: RevertSelectionBlock[],
 		body: string,
+		role: string,
 	): Promise<Rewritten> {
 		this.signal.throwIfAborted();
 		if (!this.worker) {
@@ -1220,6 +1275,7 @@ class RewriteWorker {
 				message,
 				blocks,
 				body,
+				role,
 				limit: FILE_CHANGE_LIMITS.historyCowBytes,
 			});
 		});
@@ -1238,11 +1294,64 @@ class RewriteWorker {
 /** Parsing and hashing even a single 4MiB message runs off the main thread. Retained JSON
  * element substrings are copied verbatim (large numbers, escapes, whitespace and key order
  * survive); all other SQL JSON strings are copied without decoding/re-encoding at all. */
-const REWRITE_WORKER = `
+export const REWRITE_WORKER = `
 const { parentPort } = require('node:worker_threads');
 const { createHash } = require('node:crypto');
 const hash = value => createHash('sha256').update(value).digest('hex');
-parentPort.on('message', ({message, blocks, body, limit}) => {
+// Fixed worker implementation: no source-file imports or executable request payloads.
+// Representative block/role cases are compared against context-characters.ts in tests.
+function measureCharacters(role, blocks, contentText) {
+ if (role === 'disp') return {segments: []};
+ const segments = [];
+ const userTextParts = [];
+ const addChars = (category, chars) => {
+  if (!Number.isSafeInteger(chars) || chars <= 0) return;
+  const previous = segments[segments.length - 1];
+  if (previous && previous.category === category && !previous.toolUseId) previous.chars += chars;
+  else segments.push({category, chars});
+ };
+ const add = (category, text) => { if (typeof text === 'string') { if (category === 'user') userTextParts.push(text); addChars(category, text.length); } };
+ const category = role === 'user' ? 'user' : role === 'assistant' ? 'assistant' : role === 'sys' || role === 'system' ? 'system' : 'other';
+ for (const block of blocks) {
+  if (!block || typeof block !== 'object') continue;
+  switch (block.type) {
+   case 'tool_use': {
+    const toolUseId = typeof block.id === 'string' ? block.id : block.toolUseId;
+    if (typeof toolUseId === 'string') segments.push({category: 'toolCall', chars: 0, toolUseId});
+    break;
+   }
+   case 'tool_result': case 'image': case 'redacted_thinking': case 'info': case 'error': case 'compact':
+    break;
+   case 'segment_compact':
+    if (block.status !== 'compacting' && block.status !== 'failed') add('summary', block.summary);
+    break;
+   case 'file_reference':
+    add('attachment', block.snapshotText);
+    break;
+   case 'text_file': {
+    const text = block.text ?? block.content;
+    const chars = block.contentChars ?? block.chars;
+    if (typeof text === 'string') add('attachment', text);
+    else if (typeof chars === 'number') addChars('attachment', chars);
+    break;
+   }
+   case 'attachment': case 'document':
+    add('attachment', block.text ?? block.content ?? block.source?.text);
+    break;
+   case 'thinking':
+    add(category, block.thinking ?? block.text);
+    break;
+   default:
+    add(category, block.modelText ?? block.text);
+  }
+ }
+ if (role === 'user' && typeof contentText === 'string' && blocks.some(block => block?.type === 'text_file')) {
+  const body = userTextParts.join('\\n');
+  if (contentText.startsWith(body)) addChars('attachment', contentText.length - body.length);
+ }
+ return {segments};
+}
+parentPort.on('message', ({message, blocks, body, role, limit}) => {
  try {
   if (Buffer.byteLength(body) > limit || hash(body) !== message.contentDigest) throw Error('Raw body commitment changed');
   const parsed = JSON.parse(body);
@@ -1274,7 +1383,9 @@ parentPort.on('message', ({message, blocks, body, limit}) => {
   const rewritten = '[' + kept.join(',') + ']'; const text = texts.join('\\n') || null;
   const bytes = Buffer.byteLength(rewritten) + (text ? Buffer.byteLength(text) : 0);
   if (bytes > limit) throw Error('Rewritten body exceeds byte budget');
-  parentPort.postMessage({body: rewritten, text, bytes});
+  const retainedBlocks = parsed.filter((_, i) => blocks[i].action === 'retain');
+  const contextCharsJson = JSON.stringify(measureCharacters(role, retainedBlocks, text));
+  parentPort.postMessage({body: rewritten, text, bytes, contextCharsJson});
  } catch (error) { parentPort.postMessage({error: error.message}); }
 });
 `;

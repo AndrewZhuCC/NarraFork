@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
-import { eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators } from "../db/schema";
+import { chapters, narratorBufferedMessages as mailbox, narrators } from "../db/schema";
 import { projectFileReferenceText } from "../lib/agent/file-reference-projection";
+import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -30,6 +31,7 @@ import {
 	enqueueInboxAgent,
 	hasQueuedInboxRowSync,
 	type InboxAgentMetadata,
+	type InboxExecutionBinding,
 	inboxAgentText,
 	inboxClaim,
 	inboxConsumption,
@@ -39,6 +41,8 @@ import {
 	materializeClaimedInboxUserMessage,
 	peekInbox,
 	releaseInboxClaim,
+	resolveInboxExecutionBinding,
+	wakeInboxIfEligible,
 	withInboxOwner,
 } from "./agent-runtime/inbox";
 import type { RuntimeForegroundControl } from "./agent-runtime/input";
@@ -48,6 +52,7 @@ import {
 	claimExecutionPass,
 	clearRuntimeBufferSoftStop,
 	type ExecutionOwner,
+	getExecutionOwner,
 	hasRuntimeBufferSoftStop,
 	requestRuntimeBufferSoftStop,
 	tryClaimExecution,
@@ -73,13 +78,14 @@ import type { ExecuteLoopResult } from "./narrator-executor";
 import { buildSystemInjectionBlock, deliverInjection } from "./narrator-injection";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { narratorService } from "./narrator-service";
-import { toBufferSummary } from "./narrator-session";
+import { requestBufferedMessageSoftStop, toBufferSummary } from "./narrator-session";
 import {
 	type ActiveNarrator,
 	activeNarrators,
 	knowledgeInjectionCycleStates,
 	registerActiveSubagent,
 	unregisterActiveSubagent,
+	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
@@ -117,9 +123,12 @@ export interface SubagentBufferedMessage {
 	prePromptBashCommand?: string;
 	bufferedAt: string;
 	priority?: boolean;
+	queueMode?: "turn" | "tool" | "interrupt";
 }
 
 export interface SubagentExecOptions {
+	/** Persisted child-run segment, independent of its parent result slot. */
+	executionSegmentId?: string;
 	control?: RuntimeForegroundControl;
 	narratorId: string;
 	parentNarratorId: string;
@@ -144,6 +153,7 @@ export interface SubagentExecOptions {
 	systemPrompt: string;
 	/** Initial history (empty for new subagents, pre-loaded for continued) */
 	initialHistory: unknown[];
+	initialCurrentText?: string;
 	initialTrailingToolResults?: unknown[];
 	initialPrePromptBashCommand?: string;
 	/** Accepted input consumed before this runtime session was created. */
@@ -195,6 +205,13 @@ export function acceptsBufferedSubagentInput(
 		(row.kind === "agent_message" && inboxMetadata<InboxAgentMetadata>(row).channel === "buffer")
 	);
 }
+function isSubagentGuidanceRow(row: Pick<RuntimeMailboxRow, "kind" | "metadataJson">): boolean {
+	// Legacy parent delivery and omitted modes keep their prior safe-boundary semantics.
+	return (
+		row.kind !== "user_input" || inboxMetadata<{ queueMode?: string }>(row).queueMode !== "turn"
+	);
+}
+
 async function peekSubagentBufferedMessage(
 	narratorId: string,
 ): Promise<SubagentBufferedMessage | undefined> {
@@ -212,11 +229,52 @@ export function getSubagentBufferedMessagesMap() {
 /** Stop the current subagent loop at the next safe post-tool boundary. */
 export function requestSubagentBufferedMessageSoftStop(subagentId: string): void {
 	requestRuntimeBufferSoftStop(subagentId);
+	const active = activeNarrators.get(subagentId);
+	if (active) active._bufferGuidancePending = true;
+}
+
+/** Cut in without settling the runner, detaching the parent, or ending manual takeover. */
+export function applySubagentBufferedQueueModeControl(
+	subagentId: string,
+	mode: "turn" | "tool" | "interrupt",
+	hasPendingGuidance?: boolean,
+	targetQueued = true,
+): void {
+	// Mode PATCH supplies authoritative post-commit state, including PostgreSQL rows.
+	// A failed target may be edited, but it must never cancel the current execution.
+	const active = activeNarrators.get(subagentId);
+	if (active && hasPendingGuidance !== undefined)
+		active._bufferGuidancePending = hasPendingGuidance;
+	if (!targetQueued) return;
+	const pendingGuidance =
+		hasPendingGuidance ??
+		getSubagentBufferedMessages(subagentId).some(
+			(message) =>
+				message.state !== "failed" &&
+				(message.queueMode === "tool" || message.queueMode === "interrupt"),
+		);
+	if (mode === "turn") {
+		if (!pendingGuidance) clearRuntimeBufferSoftStop(subagentId);
+		return;
+	}
+	if (!pendingGuidance) return;
+	requestSubagentBufferedMessageSoftStop(subagentId);
+	requestBufferedMessageSoftStop(subagentId);
+	if (mode === "interrupt") {
+		activeNarrators
+			.get(subagentId)
+			?._urgentGuidanceAbortController?.abort(new Error("Urgent subagent guidance requested"));
+	}
 }
 
 /** Whether a queued user message should stop this loop at its next safe boundary. */
 export async function shouldStopSubagentForBufferedMessage(subagentId: string): Promise<boolean> {
-	return hasRuntimeBufferSoftStop(subagentId) && !!(await peekInbox(subagentId));
+	if (!hasRuntimeBufferSoftStop(subagentId)) return false;
+	const head = await peekInbox(subagentId);
+	const pending = !!head && isSubagentGuidanceRow(head);
+	const active = activeNarrators.get(subagentId);
+	if (active) active._bufferGuidancePending = pending;
+	return pending;
 }
 
 /**
@@ -228,8 +286,18 @@ export async function shouldStopSubagentForBufferedMessage(subagentId: string): 
  */
 export function shouldStopSubagentForBufferedMessageSync(subagentId: string): boolean {
 	if (!hasRuntimeBufferSoftStop(subagentId)) return false;
-	if (getRuntimeQueuePort()) return true;
-	return hasQueuedInboxRowSync(subagentId);
+	if (getRuntimeQueuePort()) {
+		return activeNarrators.get(subagentId)?._bufferGuidancePending === true;
+	}
+	if (!hasQueuedInboxRowSync(subagentId)) return false;
+	const head = db
+		.select({ kind: mailbox.kind, metadataJson: mailbox.metadataJson })
+		.from(mailbox)
+		.where(and(eq(mailbox.narratorId, subagentId), eq(mailbox.state, "queued")))
+		.orderBy(asc(mailbox.seq))
+		.limit(1)
+		.get();
+	return !!head && isSubagentGuidanceRow(head);
 }
 
 export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
@@ -264,10 +332,13 @@ export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
 export function canDeliverBufferedMessageInPass(
 	message: Pick<
 		SubagentBufferedMessage,
-		"images" | "textFiles" | "fileReferences" | "createdBy" | "prePromptBashCommand"
+		"images" | "textFiles" | "fileReferences" | "createdBy" | "prePromptBashCommand" | "queueMode"
 	>,
 	currentUserId: string | null | undefined,
 ): boolean {
+	// Explicit user queue modes restart a pass; turn must wait for natural completion.
+	// Legacy agent deliveries retain their after-tools conversational injection.
+	if (message.queueMode !== undefined) return false;
 	if (message.images?.length) return false;
 	if (message.textFiles?.length) return false;
 	// Accepted snapshots must commit before consuming; the in-pass legacy path
@@ -493,6 +564,7 @@ export interface SubagentBufferedMessageOptions {
 	createdBy?: string | null;
 	prePromptBashCommand?: string;
 	position?: "front" | "back";
+	queueMode?: "turn" | "tool" | "interrupt";
 }
 
 export async function pushSubagentBufferedMessage(
@@ -526,6 +598,8 @@ export async function pushSubagentBufferedMessage(
 		options?.fileReferences,
 		"fifo",
 		options?.preserveWorkTurn,
+		undefined,
+		options?.queueMode,
 	);
 }
 
@@ -538,19 +612,58 @@ export async function bufferSubagentUserMessage(
 		requestSoftStop?: boolean;
 	},
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
-	const { priority = false, requestSoftStop = true, ...messageOptions } = options ?? {};
-	const result = await pushSubagentBufferedMessage(subagentId, text, {
-		...messageOptions,
-		position: priority ? "front" : "back",
+	let needsWake = false;
+	let wakeLocale: Locale = "en";
+	const accepted = await withNarratorStartAdmission(subagentId, async () => {
+		const previousActive = activeNarrators.get(subagentId);
+		const previousOwner = getExecutionOwner(subagentId);
+		wakeLocale = previousActive?.locale ?? "en";
+		const { priority = false, requestSoftStop = true, ...messageOptions } = options ?? {};
+		const result = await pushSubagentBufferedMessage(subagentId, text, {
+			...messageOptions,
+			position:
+				messageOptions.queueMode !== undefined
+					? messageOptions.queueMode === "turn"
+						? "back"
+						: "front"
+					: priority
+						? "front"
+						: "back",
+		});
+		// Commit input before cancellation, while claims/start remain excluded. A finalizer
+		// may finish without this lock; never redirect the old request onto its replacement.
+		if (
+			result.ok &&
+			activeNarrators.get(subagentId) === previousActive &&
+			getExecutionOwner(subagentId) === previousOwner
+		) {
+			if (messageOptions.queueMode !== undefined) {
+				if (messageOptions.queueMode !== "turn") {
+					applySubagentBufferedQueueModeControl(subagentId, messageOptions.queueMode, true, true);
+				}
+			} else if (requestSoftStop) {
+				requestSubagentBufferedMessageSoftStop(subagentId);
+			}
+		}
+		needsWake =
+			result.ok &&
+			!!(previousActive || previousOwner) &&
+			!getExecutionOwner(subagentId) &&
+			activeNarrators.get(subagentId) !== previousActive;
+		return result;
 	});
-	if (result.ok && requestSoftStop) requestSubagentBufferedMessageSoftStop(subagentId);
-	return result;
+	// Never wait for a terminal finalizer while holding admission. The normal runner
+	// finalizer handles still-owned runs; an owner that already departed needs a wake.
+	if (needsWake) void wakeInboxIfEligible(subagentId, wakeLocale);
+	return accepted;
 }
 
 /** Clear the entire subagent buffer queue and any pending post-tool stop. */
 export async function clearSubagentBufferedMessages(subagentId: string): Promise<void> {
 	await clearBufferedMessages(subagentId);
 	clearRuntimeBufferSoftStop(subagentId);
+	const active = activeNarrators.get(subagentId);
+	if (active) active._bufferGuidancePending = false;
 }
 
 /** Get the full subagent buffer queue (for REST hydration). */
@@ -606,7 +719,11 @@ export async function removeSubagentBufferedMessage(
 	messageId: string,
 ): Promise<boolean> {
 	const removed = await removeBufferedMessage(subagentId, messageId);
-	if (!(await peekInbox(subagentId))) clearRuntimeBufferSoftStop(subagentId);
+	const next = await peekInbox(subagentId);
+	const pendingGuidance = !!next && isSubagentGuidanceRow(next);
+	const active = activeNarrators.get(subagentId);
+	if (active) active._bufferGuidancePending = pendingGuidance;
+	if (!pendingGuidance) clearRuntimeBufferSoftStop(subagentId);
 	return removed;
 }
 
@@ -714,13 +831,15 @@ export async function loadSubagentHistory(
 	model: string,
 	provider: string,
 	currentInput?: string,
-): Promise<import("../lib/agent/provider").BuiltHistory> {
+	attachmentCwd?: string,
+): Promise<import("../lib/agent/provider").BuiltHistory & { currentText?: string }> {
 	return buildRuntimeHistory({
 		narratorId,
 		model,
 		provider,
 		profile: "subagent",
 		currentInput,
+		attachmentCwd,
 	});
 }
 
@@ -736,14 +855,25 @@ async function saveBufferedTextFiles(cwd: string, files?: File[]): Promise<TextF
 	return saved;
 }
 
-async function persistNextBufferedSubagentMessage(opts: {
+/** All claim callers, including in-pass delivery, share producer mutation admission. */
+function persistNextBufferedSubagentMessage(
+	opts: Parameters<typeof persistNextBufferedSubagentMessageAdmitted>[0],
+): ReturnType<typeof persistNextBufferedSubagentMessageAdmitted> {
+	return withNarratorMutationAdmission(opts.narratorId, () =>
+		persistNextBufferedSubagentMessageAdmitted(opts),
+	);
+}
+
+async function persistNextBufferedSubagentMessageAdmitted(opts: {
 	expectedMessageId?: string;
+	onlyGuidance?: boolean;
 	narratorId: string;
 	parentNarratorId: string;
 	toolUseId: string;
 	cwd: string;
 }): Promise<{
 	buffered: SubagentBufferedMessage;
+	executionBinding: InboxExecutionBinding | null;
 	userMsg:
 		| Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>
 		| MaterializedInboxUserMessage;
@@ -754,6 +884,7 @@ async function persistNextBufferedSubagentMessage(opts: {
 		narratorId,
 		(head) =>
 			acceptsBufferedSubagentInput(head) &&
+			(!opts.onlyGuidance || isSubagentGuidanceRow(head)) &&
 			(opts.expectedMessageId === undefined || head.id === opts.expectedMessageId),
 	);
 	if (!row) return null;
@@ -835,6 +966,17 @@ async function persistNextBufferedSubagentMessage(opts: {
 	const workTurnId = row.kind === "user_input" && !buffered.preserveWorkTurn ? row.id : undefined;
 	const active = activeNarrators.get(narratorId);
 	if (active && workTurnId) active._upstreamWorkTurnId = workTurnId;
+	if (buffered.queueMode === "interrupt") {
+		// This mutation admission excludes new guidance producers. The urgent input
+		// now owns the next request: old tool guidance must not spend its soft stop
+		// against that fresh pass. Later guidance can arm a new stop after unlock.
+		// Do this before fallible presentation/cleanup: materialization is committed.
+		clearRuntimeBufferSoftStop(narratorId);
+		if (active) {
+			active._bufferSoftStop = false;
+			active._bufferSoftStopTaken = false;
+		}
+	}
 	try {
 		broadcastToNarrator(parentNarratorId, {
 			type: "user_message",
@@ -847,8 +989,11 @@ async function persistNextBufferedSubagentMessage(opts: {
 			message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
 		});
 		if (buffered._stagingId) await cleanupBufferedTextFilesAsync(buffered._stagingId);
-		if (!(await getBufferedMessagesAsync(narratorId)).length)
-			clearRuntimeBufferSoftStop(narratorId);
+		const next = await peekInbox(narratorId);
+		const pendingGuidance = !!next && isSubagentGuidanceRow(next);
+		const active = activeNarrators.get(narratorId);
+		if (active) active._bufferGuidancePending = pendingGuidance;
+		if (!pendingGuidance) clearRuntimeBufferSoftStop(narratorId);
 		const remaining = toBufferSummary(await getSubagentBufferedMessagesAsync(narratorId));
 		broadcastToNarrator(parentNarratorId, {
 			type: "buffer_consumed",
@@ -868,7 +1013,12 @@ async function persistNextBufferedSubagentMessage(opts: {
 			error: String(error),
 		});
 	}
-	return { buffered, userMsg, workTurnId };
+	return {
+		buffered,
+		userMsg,
+		workTurnId,
+		executionBinding: await resolveInboxExecutionBinding(row),
+	};
 }
 
 /** The running-pass path shares the same durable claim/restore boundary as restarts. */
@@ -879,17 +1029,19 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 	cwd: string;
 	currentUserId?: string | null;
 }): Promise<{ buffered: SubagentBufferedMessage; text: string } | null> {
-	const buffered = await peekSubagentBufferedMessage(opts.narratorId);
-	if (
-		!buffered ||
-		(await shouldStopSubagentForBufferedMessage(opts.narratorId)) ||
-		!canDeliverBufferedMessageInPass(buffered, opts.currentUserId)
-	)
-		return null;
 	try {
-		const claimed = await persistNextBufferedSubagentMessage({
-			...opts,
-			expectedMessageId: buffered.id,
+		const claimed = await withNarratorMutationAdmission(opts.narratorId, async () => {
+			const buffered = await peekSubagentBufferedMessage(opts.narratorId);
+			if (
+				!buffered ||
+				(await shouldStopSubagentForBufferedMessage(opts.narratorId)) ||
+				!canDeliverBufferedMessageInPass(buffered, opts.currentUserId)
+			)
+				return null;
+			return persistNextBufferedSubagentMessage({
+				...opts,
+				expectedMessageId: buffered.id,
+			});
 		});
 		if (!claimed) return null;
 		const hint = await deliverBufferedKnowledgeHint({
@@ -901,7 +1053,10 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 			locale: activeNarrators.get(opts.narratorId)?.locale,
 			inPass: true,
 		});
-		const text = projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences);
+		const text = projectMessageSenderText(
+			{ ...claimed.userMsg, messageUuid: null },
+			projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences),
+		);
 		return { buffered: claimed.buffered, text: hint ? `${text}\n\n${hint}` : text };
 	} catch (error) {
 		logger.error("Failed to persist injected subagent user message; retained for retry", {
@@ -920,8 +1075,11 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	provider: string;
 	cwd: string;
 	locale?: string;
+	onlyGuidance?: boolean;
 }): Promise<{
 	prompt: string;
+	/** Exact claimed input's source, not whichever Send happened to trigger the wake. */
+	executionBinding?: InboxExecutionBinding | null;
 	/** Raw current input for an orchestrator that will rebuild history itself. */
 	currentInput?: string;
 	/** Only present for an actually consumed user_input mailbox row. */
@@ -932,91 +1090,106 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	preservePrincipal?: boolean;
 	prePromptBashCommand?: string;
 } | null> {
-	return withInboxOwner(opts.narratorId, async () => {
-		const head = await peekInbox(opts.narratorId);
-		if (head && !acceptsBufferedSubagentInput(head)) {
-			const row = await claimInboxHead(
-				opts.narratorId,
-				(candidate) => candidate.kind !== "user_input",
-			);
-			if (!row) return null;
-			try {
-				const { deliverPendingInjection } = await import("./narrator-session");
-				const text = await deliverPendingInjection(
+	// Admission precedes temporary ownership as well as head selection. A producer's
+	// committed row must not replace its old guidance pass before cancellation returns.
+	// Only claim/materialization is locked; history, knowledge scans and runner work are not.
+	const consumed = await withNarratorMutationAdmission(opts.narratorId, () =>
+		withInboxOwner(opts.narratorId, async () => {
+			const head = await peekInbox(opts.narratorId);
+			if (head && opts.onlyGuidance && !isSubagentGuidanceRow(head)) return null;
+			if (head && !acceptsBufferedSubagentInput(head)) {
+				const row = await claimInboxHead(
 					opts.narratorId,
-					(opts.locale ?? "en") as Locale,
-					"idle",
-					"none",
-					{
-						...projectPendingInjection(row),
-						mailboxClaim: inboxClaim(row),
-						recipientMessageId: row.recipientMessageId ?? undefined,
-					},
-					{ parentNarratorId: opts.parentNarratorId, parentToolUseId: opts.toolUseId },
+					(candidate) => candidate.kind !== "user_input",
 				);
-				const rebuilt = await loadSubagentHistory(
-					opts.narratorId,
-					opts.model,
-					opts.provider,
-					text ?? undefined,
-				);
-				return {
-					prompt: rebuilt.trailingUserText ?? text ?? "",
-					currentInput: "",
-					history: rebuilt.history,
-					trailingToolResults: rebuilt.trailingToolResults,
-					userId: row.createdBy,
-					preservePrincipal: true,
-				};
-			} catch (error) {
-				await releaseInboxClaim(row, error);
-				throw error;
+				if (!row) return null;
+				try {
+					const { deliverPendingInjection } = await import("./narrator-session");
+					const text = await deliverPendingInjection(
+						opts.narratorId,
+						(opts.locale ?? "en") as Locale,
+						"idle",
+						"none",
+						{
+							...projectPendingInjection(row),
+							mailboxClaim: inboxClaim(row),
+							recipientMessageId: row.recipientMessageId ?? undefined,
+						},
+						{ parentNarratorId: opts.parentNarratorId, parentToolUseId: opts.toolUseId },
+					);
+					return { kind: "notice" as const, row, text };
+				} catch (error) {
+					await releaseInboxClaim(row, error);
+					throw error;
+				}
 			}
-		}
-		const claimed = await persistNextBufferedSubagentMessage(opts);
-		if (!claimed) return null;
-		const { buffered, userMsg } = claimed;
-		const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
-		// Point A for a message that could NOT be folded into the running pass (attachments, a
-		// pre-prompt command, or a different acting user). Scanned here rather than at the
-		// three call sites — the executor's pass restart, the runner's post-interrupt drain and
-		// its takeover suspension all funnel through this function, and a per-site scan is how
-		// one of them would end up forgotten.
-		//
-		// Write the hint BEFORE rebuilding. Some builders lift the trailing sys row out of
-		// history; the rebuilt current-turn text below must carry that extracted field too.
-		await deliverBufferedKnowledgeHint({
-			narratorId,
-			parentNarratorId,
-			toolUseId,
-			text: buffered.text,
-			turnUserId: buffered.createdBy,
-			locale: opts.locale,
-		});
-
-		const modelText = projectFileReferenceText(
-			userMsg.contentText ?? buffered.text,
-			buffered.fileReferences,
+			const claimed = await persistNextBufferedSubagentMessage(opts);
+			return claimed ? { kind: "user" as const, ...claimed } : null;
+		}),
+	);
+	if (!consumed) return null;
+	if (consumed.kind === "notice") {
+		const rebuilt = await loadSubagentHistory(
+			opts.narratorId,
+			opts.model,
+			opts.provider,
+			consumed.text ?? undefined,
+			opts.cwd,
 		);
-		const rebuilt = await loadSubagentHistory(narratorId, model, provider, modelText);
-		// Match the primary loop's currentTurnText: only prepend context the builder
-		// extracted. Official Anthropic keeps sys as system history, so replaying the
-		// persisted hint itself here would inject it twice.
-		const prompt = rebuilt.trailingUserText?.trim()
+		return {
+			prompt: rebuilt.trailingUserText ?? consumed.text ?? "",
+			currentInput: "",
+			history: rebuilt.history,
+			trailingToolResults: rebuilt.trailingToolResults,
+			userId: consumed.row.createdBy,
+			preservePrincipal: true,
+			executionBinding: null,
+		};
+	}
+	const { buffered, userMsg } = consumed;
+	const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
+	// Point A for a message that could NOT be folded into the running pass (attachments, a
+	// pre-prompt command, or a different acting user). Scanned here rather than at the
+	// three call sites — the executor's pass restart, the runner's post-interrupt drain and
+	// its takeover suspension all funnel through this function, and a per-site scan is how
+	// one of them would end up forgotten.
+	//
+	// Write the hint BEFORE rebuilding. Some builders lift the trailing sys row out of
+	// history; the rebuilt current-turn text below must carry that extracted field too.
+	await deliverBufferedKnowledgeHint({
+		narratorId,
+		parentNarratorId,
+		toolUseId,
+		text: buffered.text,
+		turnUserId: buffered.createdBy,
+		locale: opts.locale,
+	});
+
+	const modelText = projectFileReferenceText(
+		userMsg.contentText ?? buffered.text,
+		buffered.fileReferences,
+	);
+	const rebuilt = await loadSubagentHistory(narratorId, model, provider, modelText, opts.cwd);
+	// Match the primary loop's currentTurnText: only prepend context the builder
+	// extracted. Official Anthropic keeps sys as system history, so replaying the
+	// persisted hint itself here would inject it twice.
+	const prompt =
+		rebuilt.currentText ??
+		(rebuilt.trailingUserText?.trim()
 			? modelText.trim()
 				? `${rebuilt.trailingUserText}\n\n${modelText}`
 				: rebuilt.trailingUserText
-			: modelText;
-		return {
-			prompt,
-			workTurnId: claimed.workTurnId,
-			currentInput: modelText,
-			history: rebuilt.history,
-			trailingToolResults: rebuilt.trailingToolResults,
-			userId: buffered.createdBy,
-			prePromptBashCommand: buffered.prePromptBashCommand,
-		};
-	});
+			: modelText);
+	return {
+		prompt,
+		workTurnId: consumed.workTurnId,
+		currentInput: modelText,
+		executionBinding: consumed.executionBinding,
+		history: rebuilt.history,
+		trailingToolResults: rebuilt.trailingToolResults,
+		userId: buffered.createdBy,
+		prePromptBashCommand: buffered.prePromptBashCommand,
+	};
 }
 
 /**
@@ -1234,6 +1407,8 @@ async function runSubagentRuntime(
 			.catch(() => false));
 	if (!owner.isCurrent())
 		throw new AppError("Subagent execution owner expired", 409, "NARRATOR_EXECUTION_BUSY");
+	const queuedHead = await peekInbox(opts.narratorId);
+	active._bufferGuidancePending = !!queuedHead && isSubagentGuidanceRow(queuedHead);
 	activeNarrators.set(opts.narratorId, active);
 	// Legacy child scan helpers and the shared pass use the same compact-cycle object.
 	knowledgeInjectionCycleStates.set(opts.narratorId, getSubagentKnowledgeCycle(opts.narratorId));
@@ -1245,6 +1420,7 @@ async function runSubagentRuntime(
 	try {
 		const result = await runAgentLoopUnlocked(active, owner, opts.prompt, undefined, {
 			kind: "subagent",
+			executionSegmentId: opts.executionSegmentId,
 			parentNarratorId: opts.parentNarratorId,
 			parentToolUseId: opts.toolUseId,
 			subagentType: opts.subagentType,
@@ -1253,6 +1429,7 @@ async function runSubagentRuntime(
 			initialModel: opts.model,
 			rebuildSystemPrompt: opts.rebuildSystemPrompt,
 			initialHistory: opts.initialHistory,
+			initialCurrentText: opts.initialCurrentText,
 			initialTrailingToolResults: opts.initialTrailingToolResults,
 			initialPrePromptBashCommand: opts.initialPrePromptBashCommand,
 			control: opts.control,

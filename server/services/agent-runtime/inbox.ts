@@ -1,7 +1,17 @@
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
-import { narratorBufferedMessages as mailbox, narrators, narratorToolCalls } from "../../db/schema";
+import {
+	narratorBufferedMessages as mailbox,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
+import {
+	projectInjectionSenderText,
+	projectMessageSenderText,
+} from "../../lib/agent/sender-projection";
+import type { ToolCallBinding } from "../../lib/agent/types";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
@@ -10,6 +20,7 @@ import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
+import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
 import { getExecutionOwner, tryClaimExecution } from "./ownership";
 import {
@@ -40,6 +51,48 @@ export interface InboxAgentMetadata {
 	fromMessageId?: string | null;
 	/** Initiating user for the producing pass; null/undefined means unattributed. */
 	userId?: string | null;
+}
+
+export interface InboxExecutionBinding {
+	toolCallBinding: ToolCallBinding;
+	bindingToolUseId: string;
+	bindingNarratorId: string;
+}
+
+/** Recover only the exact durable sender attempt, never the child's creation call. */
+export async function resolveInboxExecutionBinding(
+	row: RuntimeMailboxRow,
+): Promise<InboxExecutionBinding | null> {
+	if (!row.sourceNarratorId || !row.sourceToolCallId || row.sourceAttempt == null) return null;
+	try {
+		const source = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, row.sourceToolCallId),
+				eq(narratorToolCalls.narratorId, row.sourceNarratorId),
+				eq(narratorToolCalls.executionAttempt, row.sourceAttempt),
+			),
+			columns: { messageId: true, toolUseId: true },
+		});
+		if (!source) return null;
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const binding = await narratorPersistence.getToolCallBinding(
+			row.sourceNarratorId,
+			source.messageId,
+			source.toolUseId,
+			row.sourceToolCallId,
+		);
+		return {
+			toolCallBinding: binding,
+			bindingToolUseId: source.toolUseId,
+			bindingNarratorId: row.sourceNarratorId,
+		};
+	} catch (error) {
+		logger.warn("Mailbox execution receipt unavailable; preserving unverified input", {
+			mailboxId: row.id,
+			error: String(error),
+		});
+		return null;
+	}
 }
 
 export function inboxMetadata<T>(row: Pick<RuntimeMailboxRow, "metadataJson">): T {
@@ -336,6 +389,23 @@ export async function hasInboxKind(narratorId: string, kinds: MailboxKind[]): Pr
 		.limit(1)
 		.get();
 }
+/** Wake authority is separate from consumption: broadcasts remain visible to live runners. */
+export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boolean> {
+	const port = getRuntimeQueuePort();
+	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
+	return !!db
+		.select({ id: mailbox.id })
+		.from(mailbox)
+		.where(
+			and(
+				eq(mailbox.narratorId, narratorId),
+				eq(mailbox.state, "queued"),
+				sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
+			),
+		)
+		.limit(1)
+		.get();
+}
 /**
  * The eligible-head projection the claim predicate sees, widened to the dialect-neutral
  * row. The SQLite `EligibleMailboxHead` narrows `kind` to an enum union; both adapters'
@@ -477,14 +547,60 @@ export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown):
  */
 async function readClaimCommittedState(
 	claim: MailboxClaim,
-): Promise<{ state: string; currentMessageId: string | null } | undefined> {
+): Promise<
+	| { state: string; currentMessageId: string | null; kind: string; lastError: string | null }
+	| undefined
+> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.getStateById(claim.id, claim.narratorId);
 	return db
-		.select({ state: mailbox.state, currentMessageId: mailbox.currentMessageId })
+		.select({
+			state: mailbox.state,
+			currentMessageId: mailbox.currentMessageId,
+			kind: mailbox.kind,
+			lastError: mailbox.lastError,
+		})
 		.from(mailbox)
 		.where(and(eq(mailbox.id, claim.id), eq(mailbox.narratorId, claim.narratorId)))
 		.get();
+}
+
+async function inboxInjectionText(
+	narratorId: string,
+	options: import("../narrator-injection").DeliverInjectionOptions,
+): Promise<string> {
+	const text = options.content.trim();
+	if (options.role !== "user")
+		return projectInjectionSenderText(text, options.source, options.body);
+	let creator: { username: string } | null = null;
+	if (options.createdBy) {
+		try {
+			const refs = getNarratorMessageRefsPort();
+			creator = refs
+				? await refs.creator(options.createdBy)
+				: ((await db.query.users.findFirst({
+						where: eq(users.id, options.createdBy),
+						columns: { username: true },
+					})) ?? null);
+		} catch (error) {
+			logger.warn("Injection sender name unavailable", { narratorId, error: String(error) });
+		}
+	}
+	return projectMessageSenderText(
+		{
+			id: options.messageId ?? "",
+			narratorId,
+			role: "user",
+			createdBy: options.createdBy,
+			creator,
+			origin: "user",
+			parentToolUseId: null,
+			messageUuid: null,
+			contentText: text,
+			contentJson: [{ type: "system_injection", source: options.source, body: options.body }],
+		},
+		text,
+	);
 }
 
 /** A lost post-commit WS frame must not discard the already materialized model projection. */
@@ -493,7 +609,13 @@ export async function deliverInboxInjection(
 	options: import("../narrator-injection").DeliverInjectionOptions,
 	claim?: MailboxClaim,
 ): Promise<import("../narrator-injection").DeliverInjectionResult> {
-	if (claim) assertInboxClaimOwner(claim);
+	if (claim) {
+		assertInboxClaimOwner(claim);
+		// Avoid entering the persistence/retry logger for an already-revoked notice.
+		// The post-error guards below still cover revocation after this read.
+		if (isAwaitedTerminalConsumption(await readClaimCommittedState(claim)))
+			return { messageId: null, turnText: "", started: false, interjected: false };
+	}
 	// The refs port — not an env probe — decides the branch. A claimed delivery on
 	// PostgreSQL materializes through the queue's own section (message + ref + mailbox
 	// flip in ONE transaction); the SQLite placement hook never crosses into it.
@@ -504,6 +626,15 @@ export async function deliverInboxInjection(
 			// Same rule as the SQLite half below: a lost post-commit frame must not discard
 			// the already materialized projection.
 			const committed = await readClaimCommittedState(claim);
+			if (
+				error instanceof Error &&
+				error.message === "Stale mailbox claim" &&
+				isAwaitedTerminalConsumption(committed)
+			) {
+				// Empty string is intentional: injection consumers use `turnText ?? content`.
+				// Null would re-inject the revoked notice despite its absent history row.
+				return { messageId: null, turnText: "", started: false, interjected: false };
+			}
 			if (committed?.state !== "materialized" || committed.currentMessageId !== options.messageId)
 				throw error;
 			logger.warn("Mailbox projection committed; notification delivery failed", {
@@ -512,7 +643,8 @@ export async function deliverInboxInjection(
 			});
 			return {
 				messageId: committed.currentMessageId,
-				turnText: options.schedule === "onNextTurn" ? options.content.trim() : null,
+				turnText:
+					options.schedule === "onNextTurn" ? await inboxInjectionText(narratorId, options) : null,
 				started: false,
 				interjected: false,
 			};
@@ -531,6 +663,13 @@ export async function deliverInboxInjection(
 		});
 	} catch (error) {
 		const committed = claim ? await readClaimCommittedState(claim) : undefined;
+		if (
+			error instanceof Error &&
+			error.message === "Stale mailbox claim" &&
+			isAwaitedTerminalConsumption(committed)
+		) {
+			return { messageId: null, turnText: "", started: false, interjected: false };
+		}
 		if (committed?.state !== "materialized" || committed.currentMessageId !== options.messageId)
 			throw error;
 		logger.warn("Mailbox projection committed; notification delivery failed", {
@@ -539,7 +678,8 @@ export async function deliverInboxInjection(
 		});
 		return {
 			messageId: committed.currentMessageId,
-			turnText: options.schedule === "onNextTurn" ? options.content.trim() : null,
+			turnText:
+				options.schedule === "onNextTurn" ? await inboxInjectionText(narratorId, options) : null,
 			started: false,
 			interjected: false,
 		};
@@ -673,7 +813,7 @@ async function deliverClaimedInboxInjectionPg(
 		);
 		const result = {
 			messageId: reservedMessageId,
-			turnText: schedule === "onNextTurn" ? content : null,
+			turnText: schedule === "onNextTurn" ? await inboxInjectionText(narratorId, options) : null,
 			started: false,
 			interjected: false,
 		};
@@ -978,12 +1118,49 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			const row = port
 				? await port.mailbox.readRecipientRoute(narratorId)
 				: db
-						.select({ variant: narrators.variant, status: narrators.status })
+						.select({
+							variant: narrators.variant,
+							status: narrators.status,
+							lastStopReason: narrators.lastStopReason,
+						})
 						.from(narrators)
 						.where(eq(narrators.id, narratorId))
 						.get();
 			if (!row || row.status === "archived") return false;
-			if (!(await hasInboxKind(narratorId, ["user_input", "agent_message"]))) {
+			const pendingHead = await peekInbox(narratorId);
+			const hasExplicitUserInput = await hasInboxKind(narratorId, ["user_input"]);
+			if (
+				!hasExplicitUserInput &&
+				"lastStopReason" in row &&
+				(row.lastStopReason === "user_interrupt" || row.lastStopReason === "error")
+			)
+				return false;
+			if (
+				!hasExplicitUserInput &&
+				pendingHead &&
+				inboxMetadata<{
+					questionAnswer?: {
+						executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
+					};
+				}>(pendingHead).questionAnswer
+			) {
+				const answer = inboxMetadata<{
+					questionAnswer: {
+						executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
+					};
+				}>(pendingHead).questionAnswer;
+				if (!answer.executionPrincipal) return false;
+				const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+				return (
+					await startInjectionContinuationIfPossible(
+						narratorId,
+						locale,
+						false,
+						answer.executionPrincipal,
+					)
+				).started;
+			}
+			if (!(await hasWakeEligibleInboxInput(narratorId))) {
 				const notice = port
 					? await port.mailbox.hasActionableTaskNotice(narratorId)
 					: !!db
@@ -1014,8 +1191,11 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 					if (!head || !acceptsBufferedSubagentInput(head)) return false;
 				}
 				const { resumeSubagent } = await import("../subagent-resume");
+				const head = await peekInbox(narratorId);
+				const executionBinding = head ? await resolveInboxExecutionBinding(head) : null;
 				return (
 					await resumeSubagent({
+						...executionBinding,
 						subagentId: narratorId,
 						intent: "follow_up",
 						actor: "parent_agent",

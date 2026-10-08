@@ -78,6 +78,8 @@ export interface PanelDragState {
 	 * panels leave it unset.
 	 */
 	resourceId?: string;
+	/** Panel-local loading state, separate from the drag's resource identity. */
+	largeFileConfirmed?: boolean;
 }
 
 type MoveListener = (state: PanelDragState) => void;
@@ -151,11 +153,9 @@ function beginPointerDrag(state: PanelDragState) {
 	_ownsPointer = true;
 	document.addEventListener("pointermove", onDocPointerMove, true);
 	document.addEventListener("pointerup", onDocPointerUp, true);
-	// Touch drags can be interrupted by the browser (e.g. a native gesture wins
-	// despite touch-action, or an interruption like an incoming call). Treat a
-	// pointercancel like a pointerup so the singleton never gets stuck with a
-	// half-live drag (grabbing cursor, swallowed next click).
-	document.addEventListener("pointercancel", onDocPointerUp, true);
+	// A browser interruption must release the cursor/listeners WITHOUT committing
+	// the last hover target as a drop.
+	document.addEventListener("pointercancel", cancelDrag, true);
 }
 
 /** Promote the pending drag to a live drag (first time the threshold is crossed). */
@@ -171,7 +171,7 @@ function activatePendingDrag(x: number, y: number) {
 function teardownPointerListeners() {
 	document.removeEventListener("pointermove", onDocPointerMove, true);
 	document.removeEventListener("pointerup", onDocPointerUp, true);
-	document.removeEventListener("pointercancel", onDocPointerUp, true);
+	document.removeEventListener("pointercancel", cancelDrag, true);
 }
 
 /**
@@ -206,6 +206,8 @@ export function startPanelDrag(args: {
 	surfaceId?: string;
 	toolKind?: string;
 	resourceId?: string;
+	/** Panel-local loading state, separate from the drag's resource identity. */
+	largeFileConfirmed?: boolean;
 	x: number;
 	y: number;
 }) {
@@ -219,6 +221,7 @@ export function startPanelDrag(args: {
 		...(args.surfaceId ? { surfaceId: args.surfaceId } : {}),
 		...(args.toolKind ? { toolKind: args.toolKind } : {}),
 		...(args.resourceId ? { resourceId: args.resourceId } : {}),
+		...(args.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 		// Fall back to id-shape inference when the caller didn't classify.
 		subjectKind: args.subjectKind ?? (isSyntheticSubjectId(args.id) ? "tool" : "narrator"),
 	});
@@ -250,6 +253,8 @@ export function startDetachedPanelDrag(args: {
 	 */
 	toolKind?: string;
 	resourceId?: string;
+	/** Panel-local loading state, separate from the drag's resource identity. */
+	largeFileConfirmed?: boolean;
 	x: number;
 	y: number;
 }) {
@@ -260,6 +265,7 @@ export function startDetachedPanelDrag(args: {
 		y: args.y,
 		...(args.toolKind ? { toolKind: args.toolKind } : {}),
 		...(args.resourceId ? { resourceId: args.resourceId } : {}),
+		...(args.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 		subjectKind: "tool",
 	});
 }
@@ -278,7 +284,7 @@ function onDocPointerMove(e: PointerEvent) {
 	emit();
 }
 
-function onDocPointerUp() {
+function onDocPointerUp(event: PointerEvent) {
 	teardownPointerListeners();
 	_ownsPointer = false;
 	// Released before crossing the threshold → this was a click, not a drag.
@@ -290,7 +296,8 @@ function onDocPointerUp() {
 	}
 	document.body.style.userSelect = "";
 	document.body.style.cursor = "";
-	const final = _current;
+	// The release can cross a group/zone boundary without a final pointermove.
+	const final = _current ? { ..._current, x: event.clientX, y: event.clientY } : null;
 	_current = null;
 	for (const fn of _endListeners) fn(final);
 }
@@ -307,6 +314,27 @@ export function moveDrag(x: number, y: number) {
 	if (!_current) return;
 	_current = { ..._current, x, y };
 	emit();
+}
+
+/**
+ * Cancel without committing a drop. Live drags notify end listeners with null;
+ * pending pointer drags are discarded silently. Repeated cancellation is a no-op.
+ * Manual drags need no document, while pointer drags also release their listeners
+ * and cursor styles. State is cleared before notifying consumers.
+ */
+export function cancelDrag(): void {
+	const wasActive = _current !== null;
+	if (_ownsPointer) {
+		teardownPointerListeners();
+		document.body.style.userSelect = "";
+		document.body.style.cursor = "";
+	}
+	_pending = null;
+	_current = null;
+	_ownsPointer = false;
+	if (wasActive) {
+		for (const fn of _endListeners) fn(null);
+	}
 }
 
 export function endDrag(): PanelDragState | null {

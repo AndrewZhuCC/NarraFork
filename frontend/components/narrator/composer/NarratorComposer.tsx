@@ -1104,7 +1104,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							withContext={optimizeHook.withContext}
 							onToggleContext={optimizeHook.toggleContext}
 							onOptimize={optimizeHook.handleOptimize}
-							onExpand={openFullscreen}
+							onCancelOptimize={optimizeHook.cancelOptimize}
+							onExpand={() => {
+								optimizeHook.cancelOptimize();
+								openFullscreen();
+							}}
 							contextMessageCount={optimizeHook.contextMessageCount}
 							onContextMessageCountChange={optimizeHook.setContextMessageCount}
 						/>

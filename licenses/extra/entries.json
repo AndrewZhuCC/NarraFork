@@ -19,7 +19,48 @@
 		"author": "Meta Platforms, Inc. and affiliates",
 		"repository": "https://github.com/facebook/zstd",
 		"textFile": "zstd.txt",
-		"distributedVia": "Static binaries at vendor/zstd/zstd-linux-{x64,arm64}, built by scripts/build-zstd-static.sh and shipped for delta updates."
+		"distributedVia": "Linux static helpers at vendor/zstd/zstd-linux-{x64,arm64}; native Windows ARM64 zstd-win-arm64.exe at dist/helpers/windows-arm64/, built from the same upstream source by scripts/prepare-windows-arm64-helpers.ts for delta updates."
+	},
+	{
+		"name": "ripgrep",
+		"version": "15.1.0",
+		"license": "MIT",
+		"declaredLicense": "MIT OR Unlicense",
+		"selectionReason": "MIT branch selected; the upstream Windows ARM64 release supplies LICENSE-MIT verbatim.",
+		"author": "Andrew Gallant",
+		"repository": "https://github.com/BurntSushi/ripgrep",
+		"textFile": "ripgrep.txt",
+		"distributedVia": "Six native CLI helpers for Linux/macOS/Windows x64 and ARM64 prepared by scripts/prepare-ripgrep-helpers.ts under dist/helpers/ripgrep/, for separately authorized distribution via the update server tools endpoint."
+	},
+	{
+		"name": "PCRE2 (ripgrep helpers)",
+		"version": "10.45",
+		"license": "BSD-3-Clause WITH PCRE2-exception",
+		"author": "Philip Hazel, Zoltan Herczeg and PCRE2 contributors",
+		"repository": "https://github.com/PCRE2Project/pcre2",
+		"textFile": "pcre2.txt",
+		"distributedVia": "Included in the official ripgrep 15.1.0 CLI helpers (features:+pcre2).",
+		"note": "Verbatim LICENCE.md from upstream tag pcre2-10.45, including the binary-library redistribution exemption."
+	},
+	{
+		"name": "LLVM compiler-rt",
+		"version": "20.1.7",
+		"license": "Apache-2.0 WITH LLVM-exception",
+		"author": "LLVM Project contributors",
+		"repository": "https://github.com/llvm/llvm-project",
+		"textFile": "llvm-compiler-rt.txt",
+		"distributedVia": "Compiler builtins statically linked into zstd-win-arm64.exe by the pinned llvm-mingw 20250613 cross-toolchain.",
+		"note": "The verbatim LICENSE.TXT from the verified llvm-mingw archive includes LLVM's full license and exceptions; the compiler executable itself is build-only, not distributed."
+	},
+	{
+		"name": "MinGW-w64 runtime",
+		"version": "bundled with llvm-mingw 20250613",
+		"license": "LicenseRef-MinGW-w64-runtime",
+		"author": "MinGW-w64 project and runtime contributors",
+		"repository": "https://github.com/mingw-w64/mingw-w64",
+		"textFile": "mingw-w64-runtime.txt",
+		"distributedVia": "Statically linked into native zstd-win-arm64.exe; Windows UCRT system DLLs are not redistributed.",
+		"note": "Mixed runtime licenses: the complete upstream COPYING.MinGW-w64-runtime.txt notices are reproduced verbatim rather than reduced to a guessed SPDX identifier."
 	},
 	{
 		"name": "musl libc",
@@ -32,7 +73,7 @@
 	},
 	{
 		"name": "Go standard library",
-		"version": "1.23+",
+		"version": "1.24+",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/go",
@@ -76,6 +117,24 @@
 		"distributedVia": "Compiled into the remote executor binaries (remote-executor/go.mod, indirect)."
 	},
 	{
+		"name": "github.com/ebitengine/purego",
+		"version": "0.10.2",
+		"license": "Apache-2.0",
+		"author": "The Ebitengine Authors",
+		"repository": "https://github.com/ebitengine/purego",
+		"textFile": "go-purego.txt",
+		"distributedVia": "Compiled into the macOS remote executor for native ACL calls without CGO. Runtime-derived files are covered by the companion BSD-3-Clause entry."
+	},
+	{
+		"name": "github.com/ebitengine/purego (Go runtime-derived code)",
+		"version": "0.10.2",
+		"license": "BSD-3-Clause",
+		"author": "The Go Authors",
+		"repository": "https://github.com/ebitengine/purego",
+		"textFile": "go-stdlib.txt",
+		"distributedVia": "Go runtime/cgo code copied by purego and compiled into the macOS remote executor; files and attribution are listed in purego v0.10.2 README External Code."
+	},
+	{
 		"name": "@parcel/watcher native binaries",
 		"version": "2.5.6",
 		"license": "MIT",
@@ -83,5 +142,15 @@
 		"repository": "https://github.com/parcel-bundler/watcher",
 		"textFile": "parcel-watcher.txt",
 		"distributedVia": "Eight platform `watcher.node` binaries embedded by scripts/download-parcel-watcher.ts, which fetches them straight from the npm registry — they never appear in node_modules, so the dependency scan cannot see them."
+	},
+	{
+		"name": "@cherrystudio/provider-registry (provider preset data)",
+		"version": "0.0.1-alpha.1 (commit 4edb3b85630469e1a784577ec47540cb646d9781)",
+		"license": "MIT",
+		"author": "Cherry Studio",
+		"repository": "https://github.com/CherryHQ/cherry-studio/tree/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry",
+		"textFile": "cherry-studio-provider-registry.txt",
+		"distributedVia": "Compatible provider names and API endpoints adapted from packages/provider-registry/data/providers.json into frontend/components/providers/provider-presets.ts and bundled in the frontend.",
+		"note": "The fixed-commit subpackage package.json declares MIT and Cherry Studio authorship; the root is AGPL. No main src code is copied. The accompanying disclosure explains protocol/URL mapping and includes a standard MIT template copied from installed normalize-path/LICENSE, not a verbatim license file supplied by upstream."
 	}
 ]

@@ -928,9 +928,14 @@ export interface BufferMessageSummary {
 	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
+	/** Explicit sending intent; older servers only provide priority. */
+	queueMode?: "turn" | "tool" | "interrupt";
 }
 
 export interface TreeMessage {
+	/** Actual model/provider for this message, not the narrator's current selection. */
+	model?: string | null;
+	provider?: string | null;
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;
@@ -999,6 +1004,24 @@ export interface TreeMessage {
 	 * Not part of the persisted message or server protocol.
 	 */
 	_streamAnimSnapshotEpoch?: number;
+	/**
+	 * Chat/discussion projection only (never produced by the narrator API): a
+	 * reply quote strip for the user bubble. The kernel's AdapterMessage passthrough
+	 * reads it verbatim; see shared/pretext-layout/segment-adapter.ts.
+	 */
+	replyQuote?: {
+		authorName: string | null;
+		text: string;
+		state: "quoted" | "deleted" | "unavailable";
+		targetId?: string | null;
+		targetSeq?: number | null;
+	} | null;
+	/** Chat/discussion projection only: a grouped follow-up omits the bubble header. */
+	omitHeader?: boolean;
+	/** Chat projection opts into Markdown; narrator user messages stay plain. */
+	bodyFormat?: "plain" | "markdown";
+	/** Chat/discussion projection only: tombstone label replacing the body. */
+	deletedLabel?: string;
 }
 
 export interface PaginatedNarrators {
@@ -1103,6 +1126,13 @@ export interface CodexUsageWindow {
 	window_type: CodexUsageWindowType;
 }
 
+export interface CodexCredits {
+	has_credits: boolean;
+	unlimited: boolean;
+	/** Decimal balance kept as a string to preserve precision. */
+	balance: string | null;
+}
+
 export interface CodexUsageData {
 	plan_type: string;
 	primary_window?: CodexUsageWindow;
@@ -1115,6 +1145,8 @@ export interface CodexUsageData {
 	};
 	/** Rate-limit reset credits available for immediate window resets, when reported upstream. */
 	reset_credits_available?: number;
+	/** Spendable Codex credit balance, when reported upstream. */
+	credits?: CodexCredits;
 	queriedAt: string;
 }
 

@@ -102,8 +102,16 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (q: string, entities = "chapters,messages") =>
-		request<SearchResponse>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
+	search: (
+		q: string,
+		entities = "chapters,messages",
+		sort?: "time" | "relevance",
+		signal?: AbortSignal,
+	) =>
+		request<SearchResponse>(
+			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
+			{ signal },
+		),
 
 	// Favorite Directories
 	listFavoriteDirectories: () => request<ApiEntity[]>("/favorites"),
@@ -348,6 +356,28 @@ export const miscApi = {
 	// authoritative post-change state rather than having to infer it.
 	mcpDisconnectServer: (id: string) =>
 		request<Record<string, unknown>>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
+	// Re-fetch one server's tool list (reconnects only if the live connection is gone).
+	mcpRefreshServer: (id: string) =>
+		request<{
+			ok: boolean;
+			toolCount: number;
+			error?: string;
+			status: Record<string, unknown>;
+		}>(`/mcp/servers/${id}/refresh`, { method: "POST" }),
+	// Re-fetch tool lists of every enabled MCP server.
+	mcpRefreshAllServers: () =>
+		request<{
+			ok: boolean;
+			refreshed: number;
+			failed: number;
+			results: Array<{
+				serverId: string;
+				name: string;
+				ok: boolean;
+				toolCount: number;
+				error?: string;
+			}>;
+		}>("/mcp/servers/refresh", { method: "POST" }),
 	mcpTestConnection: (data: Record<string, unknown>) =>
 		request<{
 			ok: boolean;
@@ -452,9 +482,14 @@ export const miscApi = {
 			body: JSON.stringify({ callbackUrl }),
 		}),
 	codexBrowserAuthState: () =>
-		request<{ pending: boolean; redirectUri: string; localCallbackServer?: boolean }>(
-			"/codex/auth/browser/state",
-		),
+		request<{
+			pending: boolean;
+			status?: string;
+			errorCode?: string;
+			error?: string;
+			redirectUri: string;
+			localCallbackServer?: boolean;
+		}>("/codex/auth/browser/state"),
 	codexDeviceAuthStart: () =>
 		request<{
 			deviceAuthId: string;
@@ -1108,8 +1143,15 @@ export const miscApi = {
 		request<{
 			updateAvailable: boolean;
 			currentVersion: string;
+			source?: "github" | "update-server";
+			repository?: string;
+			error?: string;
+			errorCode?: string;
+			retryAfter?: number;
 			latestVersion?: string;
 			releaseInfo?: {
+				source?: "github" | "update-server";
+				repository?: string;
 				version: string;
 				releaseDate: string;
 				releaseNotes?: string | Record<string, string>;
@@ -1125,7 +1167,7 @@ export const miscApi = {
 			downloadSize?: number;
 			totalSize?: number;
 			zstdPatchSize?: number;
-			strategy?: "zstd";
+			strategy?: "full" | "zstd";
 			patchChain?: Array<{
 				fromVersion: string;
 				toVersion: string;

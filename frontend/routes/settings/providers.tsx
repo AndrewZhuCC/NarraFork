@@ -3,7 +3,7 @@ import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } fr
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useSearch } from "@tanstack/react-router";
+import { createFileRoute, Outlet, useRouterState, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
@@ -20,10 +20,13 @@ import { getModelDefaultContextWindow } from "../../components/providers/model-c
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
+import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
+import { ProviderAddContext } from "../../components/providers/provider-add-context";
 import {
-	type AddProviderType,
-	ProviderOverviewView,
-} from "../../components/providers/ProviderOverviewView";
+	type AddProviderDraft,
+	customProviderFromDraft,
+	nugProviderFromDraft,
+} from "../../components/providers/provider-add-draft";
 import {
 	createSnapshot,
 	initialProvidersState,
@@ -132,6 +135,9 @@ function SettingsProvidersPage() {
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const nugRefreshCapability = useProviderModelRefreshCapability("nug");
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const isAddingProvider = useRouterState({
+		select: (router) => router.matches.some((match) => match.routeId === "/settings/providers/add"),
+	});
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
 		oauth_error?: string;
@@ -303,49 +309,17 @@ function SettingsProvidersPage() {
 
 	// ── Add provider ──
 	const handleAddProvider = useCallback(
-		(type: AddProviderType) => {
+		(draft: AddProviderDraft) => {
 			const id = Math.random().toString(36).slice(2, 10);
-			switch (type) {
-				case "nug":
-					dispatchers.setNugProviders((prev) => [
-						...prev,
-						{ id, name: "NUG", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
-					]);
-					break;
-				default: {
-					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nug">, string> = {
-						"anthropic-compatible": t("addProviderAnthropicCompatible"),
-						"anthropic-official": t("addProviderClaudeCode"),
-						"codex-native": t("addProviderCodex"),
-						"responses-compatible": t("addProviderResponses"),
-						"completions-compatible": t("addProviderCompletions"),
-						"gemini-compatible": t("addProviderGemini"),
-					};
-					// Gemini defaults to Google's endpoint; others start blank.
-					const isGemini = type === "gemini-compatible";
-					dispatchers.setCustomApiProviders((prev) => [
-						...prev,
-						{
-							id,
-							name: defaultNameByProtocol[type],
-							prefix: "",
-							apiKey: "",
-							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
-							defaultModel: isGemini ? "gemini-3-flash-preview" : "",
-							protocol: type,
-							...(isGemini ? { geminiTransport: "generate-content" as const } : {}),
-							codexAccountId: "",
-							codexWebSocket: false,
-							tlsRejectUnauthorized: true,
-						},
-					]);
-					break;
-				}
+			if (draft.protocol === "nug") {
+				dispatchers.setNugProviders((prev) => [...prev, nugProviderFromDraft(id, draft)]);
+			} else {
+				const provider = customProviderFromDraft(id, { ...draft, protocol: draft.protocol });
+				dispatchers.setCustomApiProviders((prev) => [...prev, provider]);
 			}
-			// Route to new provider by its immutable ID
 			setSelectedProvider(id);
 		},
-		[dispatchers, t],
+		[dispatchers],
 	);
 
 	// ── Server-side context window merge (e.g. after a provider model add) ──
@@ -858,6 +832,14 @@ function SettingsProvidersPage() {
 
 	if (isLoading) return <Loader />;
 
+	if (isAddingProvider) {
+		return (
+			<ProviderAddContext value={handleAddProvider}>
+				<Outlet />
+			</ProviderAddContext>
+		);
+	}
+
 	// ── Render overview or config view ──
 	const renderContent = () => {
 		if (selectedProvider) {
@@ -897,7 +879,6 @@ function SettingsProvidersPage() {
 				hiddenModels={state.hiddenModels}
 				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
 				onOpenProviderConfig={setSelectedProvider}
-				onAddProvider={handleAddProvider}
 				selectedProvider={selectedProvider}
 			/>
 		);

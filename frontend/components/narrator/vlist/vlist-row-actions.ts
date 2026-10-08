@@ -18,7 +18,10 @@
  */
 
 import type { RevertScope } from "../../../lib/api/narrators";
-import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
+import type {
+	CustomMessageMenuItem,
+	MessageContextMenuActions,
+} from "../message/MessageContextMenuCtx";
 import type { VListToolMeta } from "./vlist-tool-meta";
 
 /**
@@ -91,6 +94,8 @@ export interface VListRowHandlers {
 	onOpenChapter?: (chapterId: string) => void;
 	/** Detach a running subagent to a background task; absent → item hidden. */
 	onDetachSubagent?: (narratorId: string) => void;
+	/** Detach this running foreground Bash tool call, not a child narrator. */
+	onDetachBash?: (toolUseId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
 	/**
@@ -99,6 +104,13 @@ export interface VListRowHandlers {
 	 * hidden, exactly like the standalone narrator embed.
 	 */
 	onOpenFilePanel?: (filePath: string) => void;
+	/**
+	 * Host-defined extra menu items (a chat room's reply/delete, a share page's
+	 * "copy text"). Called per row with the owning message id; absent/undefined
+	 * result → no extra section. Keep it referentially stable (useCallback) —
+	 * rowActionHandlerDependencies keys on it.
+	 */
+	customMessageActions?: (messageId: string) => CustomMessageMenuItem[] | undefined;
 }
 
 /**
@@ -120,8 +132,10 @@ export function rowActionHandlerDependencies(
 		handlers?.onEditMessage,
 		handlers?.onViewSubagentSession,
 		handlers?.onDetachSubagent,
+		handlers?.onDetachBash,
 		handlers?.onCancelBackgroundTask,
 		handlers?.onOpenFilePanel,
+		handlers?.customMessageActions,
 	];
 }
 
@@ -139,6 +153,8 @@ export interface VListRowToolActions {
 	onViewSubagentSession?: () => void;
 	/** "Detach to background". */
 	onDetachSubagent?: () => void;
+	/** "Detach to background" for a Bash tool call. */
+	onDetachBash?: () => void;
 	/** "Cancel background task". */
 	onCancelBackgroundTask?: () => void;
 	/** "Open in panel" — a file-oriented tool's path, bound to the dock host. */
@@ -161,6 +177,11 @@ export function buildRowToolActions(
 ): VListRowToolActions {
 	const actions: VListRowToolActions = {};
 	if (!meta) return actions;
+
+	if (meta.toolName === "Bash" && meta.isRunningBash && meta.toolUseId && handlers.onDetachBash) {
+		const toolUseId = meta.toolUseId;
+		actions.onDetachBash = () => handlers.onDetachBash?.(toolUseId);
+	}
 
 	// File viewer: any Read / Write / Edit with a path (the panel shows the file's
 	// current on-disk content, so a write is as valid an entry point as a read).
@@ -271,6 +292,9 @@ export function buildRowCtxActions(
 	} else if (target.editable !== false && handlers.onEditMessage) {
 		actions.onEditMessage = () => handlers.onEditMessage?.(messageId);
 	}
+
+	const customItems = handlers.customMessageActions?.(messageId);
+	if (customItems && customItems.length > 0) actions.customItems = customItems;
 
 	return actions;
 }

@@ -1,5 +1,9 @@
 import type { Locale } from "@shared/i18n-locales";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
+import type {
+	ScheduledTaskCleanupPolicy,
+	ScheduledTaskCleanupResult,
+} from "@shared/scheduled-task-cleanup";
 import { request } from "./client";
 
 export type ScheduledTaskRunContext = "standalone" | "chapter";
@@ -24,6 +28,7 @@ export interface ScheduledTask {
 	projectId: string | null;
 	chapterId: string | null;
 	narratorMode: ScheduledTaskNarratorMode;
+	cleanupPolicy: ScheduledTaskCleanupPolicy;
 	reuseNarratorId: string | null;
 	createdBy: string | null;
 	lastRunAt: string | null;
@@ -69,6 +74,7 @@ export interface ScheduledTaskInput {
 	projectId?: string | null;
 	chapterId?: string | null;
 	narratorMode?: ScheduledTaskNarratorMode;
+	cleanupPolicy?: ScheduledTaskCleanupPolicy;
 	enabled?: boolean;
 }
 
@@ -102,6 +108,10 @@ export const scheduledTasksApi = {
 		}),
 	runScheduledTask: (id: string) =>
 		request<ScheduledTask>(`/scheduled-tasks/${encodeURIComponent(id)}/run`, {
+			method: "POST",
+		}),
+	cleanupScheduledTask: (id: string) =>
+		request<ScheduledTaskCleanupResult>(`/scheduled-tasks/${encodeURIComponent(id)}/cleanup`, {
 			method: "POST",
 		}),
 	deleteScheduledTask: (id: string) =>

@@ -413,7 +413,7 @@ export const knowledgeEntryLinks = sqliteTable(
 >
 > 已实现的是**条目级链接**（3.7）：`POST/GET /api/knowledge/entries/:id/links`、`DELETE /api/knowledge/links/:id`、`GET /api/knowledge/entries/:id/graph`。正文里写 `[[...]]` 目前只是普通文本，不会建链、不会渲染成内链。
 >
-> 请勿按本节做任何假设（例如"引用会自动同步"或"存在 anchor 定位"）。若要落地，需要新增 schema 列 + 迁移 + 解析器 + 前端渲染，属独立立项。
+> 请勿按本节做任何假设（例如"引用会自动同步"或"存在 anchor 定位"）。若要落地，需要新增 schema 列 + 迁移 + 解析器 + 前端渲染，属独立立项。下列 3.5/3.7 中涉及 `scope=inline` / 部分索引 `WHERE scope='entry'` / `view.*` / `renderContent` 的叙述均为**设计稿**，当前 `knowledge_entry_links` 无 scope 列、无该部分索引。
 
 内容级（inline）链接的来源是**正文里的内联引用标记**。约定一套与 markdown 兼容的语法，在保存版本时解析、回填 `knowledge_entry_links`（scope=inline）。
 
@@ -971,7 +971,7 @@ principal P：clearance=secret，grantedTags={product:M20}
 | 加载 | `Skill` 工具按 name 主动加载 | 关键词注入被动命中 + 检索 API 主动查 |
 | 结构化检索 | 否（仅按 name） | 是（FTS5 + tag + metadata） |
 | 条目关系 | 无（各 skill 独立） | 有向带类型的条目链接，构成知识图谱（3.7） |
-| 内容适配 | 无（整文件加载） | 条件内容块按 viewContext（产品版本/受众）裁剪同一条目（3.9） |
+| 内容适配 | 无（整文件加载） | 条件内容块按 viewContext（产品版本/受众）裁剪同一条目（3.9，**设计未实现**） |
 | 版本管理 | 靠 git | 写时复制 revision |
 | 权限 | 跟随项目文件可见性 | 分级（密级）+ 分 tag（受控标签）双轴授权 |
 | 适合 | 工具型/操作型知识 | 资料型/可检索/可互联知识 |
@@ -981,17 +981,19 @@ principal P：clearance=secret，grantedTags={product:M20}
 
 ---
 
-## 8. 迁移与落地步骤
+## 8. 迁移与落地步骤（历史设计步骤）
+
+> 本节是设计期的落地清单。表结构与服务此后继续扩容（现有 14 张 `knowledge_*` 表，含 drafts/submissions/links/injection/audit/packs 等）。下列步骤中涉及 3.8/3.9 的部分**尚未实现**，其余已落地。
 
 沿用 CLAUDE.md 的数据库迁移规则（改 `schema.ts` → `bun run db:generate` → `bun run db:migrate`，**禁止手改 drizzle/**）：
 
-1. `schema.ts` 新增 8 张表：collections / entries / revisions / levels / tags / entry_tags / grants / entry_links。`entry_links` 的部分唯一索引（`WHERE scope='entry'`）需从 `drizzle-orm` import `sql`；复合主键表（entry_tags）需 import `primaryKey`（见 3.5 注）。
+1. `schema.ts` 新增核心表：collections / entries / revisions / levels / tags / entry_tags / grants / entry_links（后续另增 drafts、submissions、tag_types、acl_events、injection_events、packs 等）。`entry_links` 当前仅条目级（无 scope 列）；复合主键表（entry_tags）需 import `primaryKey`（见 3.5 注）。
 2. `bun run db:generate` 生成迁移；可附种子脚本写入默认密级（public/internal/confidential/secret）。
 3. `server/db/fts.ts` 追加 `knowledge_entries_fts` 虚拟表 + 触发器 + rebuild（加入检测列表）。
 4. `validators/knowledge.ts` 增 Zod schema 并在 `validators/index.ts` 汇出。
-5. `server/services/knowledge-service.ts` 实现（含双轴 `canRead`/`canWrite` + grant 聚合 + 条目级链接 CRUD/图遍历的权限过滤 + `addRevision` 内的正文内联解析与 inline 链接重建 + 对照集合 `viewDimensions` 的条件块校验/warnings + `renderContent` 条件块裁剪，**先 ACL 后裁剪**）。条件块解析/求值与维度类型比较（semver/enum/numeric）是无副作用纯函数，可独立单测（不同 viewContext → 不同裁剪输出；缺 key 策略；版本号语义比较；未声明 key/非法取值告警）。
-6. `server/routes/knowledge.ts` + `app.route` 挂载（JWT 内部接口，含 grants/levels/links 管理端点；entries/search 接受 `view.*` 查询参数）。
-7. 前端：知识库管理页（集合/条目/标签筛选/版本历史/编辑 + 密级标记 + 受控标签 + 授权管理 + 条目链接与反向引用/图视图 + 正文内联引用的编辑辅助与渲染跳转 + 条件块编辑/预览与 viewContext 切换预览）——按 frontend 现有 Mantine + TanStack 模式。
+5. `server/services/knowledge-service.ts` 实现（含双轴 `canRead`/`canWrite` + grant 聚合 + 条目级链接 CRUD/图遍历的权限过滤 + ~~`addRevision` 内的正文内联解析与 inline 链接重建 + 对照集合 `viewDimensions` 的条件块校验/warnings + `renderContent` 条件块裁剪~~（**3.8/3.9，未实现**））。
+6. `server/routes/knowledge.ts` + `app.route` 挂载（JWT 内部接口，含 grants/levels/links 管理端点）。
+7. 前端：知识库管理页（集合/条目/标签筛选/版本历史/编辑 + 密级标记 + 受控标签 + 授权管理 + 条目链接与反向引用/图视图）——按 frontend 现有 Mantine + TanStack 模式。~~正文内联引用编辑辅助、条件块编辑/预览~~（**3.8/3.9，未实现**）。
 8. 开放 API 部分见 `OPEN_API.md`。
 
 ---
@@ -1047,4 +1049,4 @@ principal P：clearance=secret，grantedTags={product:M20}
 - **知识图谱无可视化**：`useEntryGraph` hook 与 `GET /entries/:id/graph` 都已就绪，缺 React Flow 之类的图视图组件。
 - **条目筛选**：`GET /entries` 支持 `tag`，但前端无标签筛选控件；按密级筛选前后端都没有。
 - **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页。
-- **无应用内通知中心**：知识库通知走 WS 推送 + React Query 失效（6.7.6），没有落库的未读列表，也没有 toast。全库没有 `notifications` 表，`notification-service` 是钉钉/飞书 webhook——要做通知中心应作为**平台级能力**立项（不止知识库需要），并需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。
+- **知识库事件尚未进站内通知中心**：平台已有应用内通知中心（`notifications` 表 + NotificationBell/Drawer），但知识库通知仍走 WS 推送 + React Query 失效（6.7.6），未写入通知中心的未读列表。`notification-service` 另有钉钉/飞书 webhook。要把知识库审核/发布等事件接入通知中心，需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。

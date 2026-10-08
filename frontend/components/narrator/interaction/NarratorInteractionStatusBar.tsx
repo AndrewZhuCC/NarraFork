@@ -17,6 +17,7 @@ import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
 import {
 	AGG_MODEL_PREFIX,
@@ -47,6 +48,7 @@ import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
 import { PermissionMenuContent } from "./PermissionMenuContent";
+import { createPlanReflectionStatusAction } from "./PlanReflectionStatusControl";
 import { ReasoningEffortMenuItems } from "./ReasoningEffortMenuItems";
 import type {
 	BooleanOverride,
@@ -248,6 +250,7 @@ export interface NarratorInteractionStatusBarProps {
 }
 
 export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBarProps) {
+	const inputMenu = useInputMenu();
 	const {
 		narrator,
 		narratorId,
@@ -343,6 +346,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				return workIndicator.quotaWaitText;
 			case "spec_task":
 				return workIndicator.currentSpecTask?.text ?? t("thinking");
+			case "reflecting":
+				return t("status_reflecting");
 			case "waiting":
 				return t("status_waiting");
 			case "planning":
@@ -362,6 +367,28 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 		t,
 	]);
 
+	const planReflectionAction = createPlanReflectionStatusAction({
+		hasPlanTrait: permission.hasPlanTrait,
+		supported: permission.planReflection.supported,
+		isWorkspacePreview,
+		effective: permission.planReflection.effective,
+		globalDefault: permission.planReflection.global,
+		disabled: permission.reflectionSettingsDisabled,
+		onChange: permission.planReflection.onChange,
+		t,
+	});
+	const planReflectionActions = planReflectionAction ? [planReflectionAction] : [];
+	// The translated state label changes the action's intrinsic width, including
+	// while it lives in the overflow menu and cannot be measured inline.
+	const statusToolbarMeasurementKey = `${mobile.measurementKey}\u0001${
+		planReflectionAction
+			? t(
+					permission.planReflection.effective
+						? "planReflectionApprovalOn"
+						: "planReflectionApprovalOff",
+				)
+			: ""
+	}`;
 	const followsParent = narrator.model === FOLLOW_PARENT_MODEL;
 	const canFollowParent = !!narrator.variant?.startsWith("subagent:");
 	const inheritance = followsParent ? modelInheritanceLabel(narrator.modelInheritance, t) : null;
@@ -376,45 +403,67 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				ownsHorizontalSafeArea={props.ownsHorizontalSafeArea}
 				borderTop={props.borderTop}
 			>
-				{workIndicator.show && !isWorkspacePreview ? (
-					<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
-				) : (
-					<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
-						<Box
-							w={8}
-							h={8}
+				<Group
+					gap={6}
+					align="center"
+					wrap="nowrap"
+					style={{ flex: 1, minWidth: 0, overflow: "hidden" }}
+				>
+					{workIndicator.show && !isWorkspacePreview ? (
+						<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
+					) : (
+						<Group
+							gap={6}
+							wrap="nowrap"
 							style={{
-								borderRadius: "50%",
-								backgroundColor: statusRegistry.accentVar(workIndicator.statusBarDisplay, "filled"),
-								flexShrink: 0,
+								flex: 1,
+								minWidth: 0,
+								overflow: "hidden",
 							}}
-						/>
-						<TruncatedText size="xs" c="dimmed" text={t(workIndicator.statusBarDisplay.labelKey)} />
-						{tasks.supported && tasks.buttonEnabled && (
-							<BackgroundTasksStatusButton
-								runningCount={tasks.runningCount}
-								onOpen={tasks.onOpenPanel}
+						>
+							<Box
+								w={8}
+								h={8}
+								style={{
+									borderRadius: "50%",
+									backgroundColor: statusRegistry.accentVar(
+										workIndicator.statusBarDisplay,
+										"filled",
+									),
+									flexShrink: 0,
+								}}
 							/>
-						)}
-						{workIndicator.compactFailure && !workIndicator.isCompacting && (
-							<Text
+							<TruncatedText
 								size="xs"
-								c="red"
-								style={{ flexShrink: 0 }}
-								title={workIndicator.compactFailure.error || undefined}
-							>
-								· {t("compactFailed")}
-							</Text>
-						)}
-						{workIndicator.turnElapsedText && !isWorkspacePreview && (
-							<TurnElapsedTime
-								text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
-								startedAtLabel={workIndicator.turnStartedAtLabel}
-								isMobile={isMobileViewport}
+								c="dimmed"
+								text={t(workIndicator.statusBarDisplay.labelKey)}
 							/>
-						)}
-					</Group>
-				)}
+							{tasks.supported && tasks.buttonEnabled && (
+								<BackgroundTasksStatusButton
+									runningCount={tasks.runningCount}
+									onOpen={tasks.onOpenPanel}
+								/>
+							)}
+							{workIndicator.compactFailure && !workIndicator.isCompacting && (
+								<Text
+									size="xs"
+									c="red"
+									style={{ flexShrink: 0 }}
+									title={workIndicator.compactFailure.error || undefined}
+								>
+									· {t("compactFailed")}
+								</Text>
+							)}
+							{workIndicator.turnElapsedText && !isWorkspacePreview && (
+								<TurnElapsedTime
+									text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
+									startedAtLabel={workIndicator.turnStartedAtLabel}
+									isMobile={isMobileViewport}
+								/>
+							)}
+						</Group>
+					)}
+				</Group>
 				{workIndicator.show && !isWorkspacePreview && workIndicator.turnElapsedText && (
 					<TurnElapsedTime
 						text={workIndicator.turnElapsedText}
@@ -561,6 +610,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 													<Menu
 														position="top-end"
+														{...inputMenu.menuProps}
 														{...MODEL_MENU_POSITIONING}
 														opened={menuOpenDesktop}
 														onChange={(o) => {
@@ -571,6 +621,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 													>
 														<Menu.Target>
 															<NativeSelect
+																{...inputMenu.targetProps}
 																size="xs"
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
@@ -627,6 +678,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																allModels={model.allModels}
 																currentModel={narrator.model}
 																canFollowParent={canFollowParent}
+																inheritance={narrator.modelInheritance}
 																totalCostUsd={narrator.totalCostUsd}
 																onSelect={(v) =>
 																	model.mutation.mutate({ id: narratorId, model: v })
@@ -647,9 +699,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 
 												{/* Reasoning Effort (Codex + Anthropic providers) */}
 												{reasoning.supported && (
-													<Menu position="top-end">
+													<Menu {...inputMenu.menuProps} position="top-end">
 														<Menu.Target>
 															<NativeSelect
+																{...inputMenu.targetProps}
 																size="xs"
 																data={[
 																	{
@@ -699,6 +752,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												>
 													{narrator.isAskInPassing ? (
 														<NativeSelect
+															{...inputMenu.targetProps}
 															size="xs"
 															leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
 															data={[{ value: "readOnly", label: t("perm_readOnly") }]}
@@ -708,9 +762,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															style={{ pointerEvents: "auto", opacity: 0.6 }}
 														/>
 													) : (
-														<Menu position="top-end">
+														<Menu {...inputMenu.menuProps} position="top-end">
 															<Menu.Target>
 																<NativeSelect
+																	{...inputMenu.targetProps}
 																	size="xs"
 																	leftSection={
 																		PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
@@ -838,9 +893,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												)}
 											</Group>
 										}
-										actions={mobile.bottomActions ?? []}
+										actions={[...planReflectionActions, ...(mobile.bottomActions ?? [])]}
 										moreLabel={t("moreActions")}
-										measurementKey={mobile.measurementKey}
+										measurementKey={statusToolbarMeasurementKey}
 									/>
 								</Box>
 							)}
@@ -854,8 +909,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 										<>
 											<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 												<Menu
-													position="bottom-end"
+													position="top-end"
 													withinPortal
+													{...inputMenu.menuProps}
 													{...MODEL_MENU_POSITIONING}
 													opened={menuOpenMobile}
 													onChange={(o) => {
@@ -869,6 +925,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															size="sm"
 															color={inheritance?.fallback ? "yellow" : "gray"}
 															aria-label={followsParent ? followLabel : t("modelTooltip")}
+															{...inputMenu.targetProps}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
@@ -899,10 +956,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															allModels={model.allModels}
 															currentModel={narrator.model}
 															canFollowParent={canFollowParent}
+															inheritance={narrator.modelInheritance}
 															totalCostUsd={narrator.totalCostUsd}
 															onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
 															onShowPrice={setPriceModel}
-															label={t("modelTooltip")}
 															providerLabels={model.providerLabels}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
@@ -918,13 +975,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 
 											{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 											{reasoning.supported && (
-												<Menu position="bottom-end" withinPortal>
+												<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
 													<Menu.Target>
 														<ActionIcon
 															variant="subtle"
 															color="gray"
 															size="sm"
 															aria-label={t("reasoningEffort")}
+															{...inputMenu.targetProps}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
@@ -989,13 +1047,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 														{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
 													</ActionIcon>
 												) : (
-													<Menu position="bottom-end" withinPortal>
+													<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
 														<Menu.Target>
 															<ActionIcon
 																variant="subtle"
 																color="gray"
 																size="sm"
 																aria-label={t("permissionMode")}
+																{...inputMenu.targetProps}
 															>
 																{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
 																	<IconShield size={16} />
@@ -1060,9 +1119,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 											</Tooltip>
 										</>
 									}
-									actions={mobile.actions}
+									actions={[...planReflectionActions, ...mobile.actions]}
 									moreLabel={t("moreActions")}
-									measurementKey={mobile.measurementKey}
+									measurementKey={statusToolbarMeasurementKey}
 								/>
 							</Box>
 						</Group>
@@ -1084,7 +1143,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
  * JSX flatter; it reads the same grouped props.
  */
 function UnstyledButtonWorkIndicator(
-	props: NarratorInteractionStatusBarProps & { workIndicatorText: string },
+	props: NarratorInteractionStatusBarProps & {
+		workIndicatorText: string;
+	},
 ) {
 	const { workIndicator, queue, t, workIndicatorText } = props;
 	return (
@@ -1111,10 +1172,27 @@ function UnstyledButtonWorkIndicator(
 			style={{ minWidth: 0, flex: 1 }}
 		>
 			<Group gap={6} wrap="nowrap">
-				<Loader size={14} color={workIndicator.color} style={{ flexShrink: 0 }} />
+				{workIndicator.plan.primary === "reflecting" ? (
+					<Box
+						c={workIndicator.color}
+						style={{
+							display: "flex",
+							width: 14,
+							height: 14,
+							alignItems: "center",
+							justifyContent: "center",
+							flexShrink: 0,
+						}}
+					>
+						{/* Match the trace row's optical centering without changing the icon slot. */}
+						<IconShield size={14} style={{ display: "block", transform: "translateY(-1px)" }} />
+					</Box>
+				) : (
+					<Loader size={14} color={workIndicator.color} style={{ flexShrink: 0 }} />
+				)}
 				{/* The current task text can be long (spec task titles especially), so
 				    reveal the full string on hover/tap when the row clips it. */}
-				<TruncatedText size="xs" c={workIndicator.color} text={workIndicatorText} />
+				<TruncatedText size="xs" lh="14px" c={workIndicator.color} text={workIndicatorText} />
 				{((queue.positionValue != null && queue.positionValue > 0) || queue.messageValue) && (
 					<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 						·{" "}

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { JsonRpcNotification, ProviderStreamEvent } from "@server/lib/plugins/protocol";
 import {
 	PluginProviderRpcClient,
+	type ProviderOperation,
 	type ProviderRpcRequestOptions,
 	type ProviderRpcTransport,
 	type ProviderStreamWindow,
@@ -193,13 +194,18 @@ function generateParams() {
 }
 
 async function setup(
-	options: { window?: Partial<ProviderStreamWindow>; limits?: Record<string, number> } = {},
+	options: {
+		window?: Partial<ProviderStreamWindow>;
+		limits?: Record<string, number>;
+		idFactory?: (prefix: "op" | "rpc") => string;
+	} = {},
 ) {
 	const transport = new MockTransport();
 	const client = new PluginProviderRpcClient({
 		transport,
 		expectedPluginId: "com.example.provider",
 		streamWindow: options.window,
+		idFactory: options.idFactory,
 		limits: {
 			streamIdleTimeoutMs: 10_000,
 			operationTimeoutMs: 10_000,
@@ -374,6 +380,100 @@ describe("accepted streaming and operation registry", () => {
 
 		expect(client.getDiagnostics().activeOperations).toBe(0);
 		await expect(stream.next()).rejects.toMatchObject({ code: "UNKNOWN_RESULT" });
+	});
+});
+
+describe("outbound request byte limits", () => {
+	async function completeOperation(transport: MockTransport, operation: ProviderOperation) {
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" }, done: false });
+		await expect(stream.next()).resolves.toMatchObject({ done: true });
+	}
+
+	it.each([
+		"chat",
+		"generate",
+	] as const)("enforces the full UTF-8 %s params boundary and recovers after rejection", async (kind) => {
+		let nextId = 0;
+		const idFactory = (prefix: "op" | "rpc") => `${prefix}_${String(++nextId).padStart(4, "0")}`;
+		const start = (client: PluginProviderRpcClient, text: string) => {
+			if (kind === "generate") {
+				return client.generate({
+					...generateParams(),
+					request: { mode: "prompt", text },
+				});
+			}
+			const params = chatParams();
+			return client.chat({
+				...params,
+				request: {
+					...params.request,
+					current: {
+						...params.request.current,
+						text,
+						images: [{ mediaType: "image/png", dataBase64: "AQID".repeat(16) }],
+					},
+				},
+			});
+		};
+		// Capture the actual params, including the host's fixed-width IDs and stream window.
+		const probe = await setup({ idFactory });
+		clients.push(probe.client);
+		const probeOperation = await start(probe.client, "");
+		const probeRequest = probe.transport.requests.find(
+			(request) => request.method === `provider.${kind}`,
+		);
+		expect(probeRequest).toBeDefined();
+		const probeParams = getRecord(probeRequest?.params);
+		expect(probeParams.protocolVersion).toBe(protocolVersion);
+		expect(probeParams.operationId).toBe(probeOperation.operationId);
+		expect(probeParams.streamWindow).toMatchObject({ maxUnackedEvents: 64 });
+		const overhead = Buffer.byteLength(JSON.stringify(probeParams), "utf8");
+		await completeOperation(probe.transport, probeOperation);
+
+		// Multi-byte text plus JSON-escaped characters catches UTF-16/string-length accounting.
+		const text = `${"界".repeat(16)}"\\`;
+		const textJsonBytes = Buffer.byteLength(JSON.stringify(text), "utf8") - 2;
+		const maxRequestBytes = overhead + textJsonBytes;
+		const { client, transport } = await setup({ limits: { maxRequestBytes }, idFactory });
+		clients.push(client);
+		const operation = await start(client, text);
+		const sent = transport.requests.find((request) => request.method === `provider.${kind}`);
+		const sentParams = getRecord(sent?.params);
+		expect(Buffer.byteLength(JSON.stringify(sentParams), "utf8")).toBe(maxRequestBytes);
+		const {
+			protocolVersion: _protocolVersion,
+			operationId: _operationId,
+			streamWindow: _streamWindow,
+			...callerParams
+		} = sentParams;
+		expect(Buffer.byteLength(JSON.stringify(callerParams), "utf8")).toBeLessThan(maxRequestBytes);
+		expect(JSON.stringify(sentParams).length).toBeLessThan(maxRequestBytes);
+		await completeOperation(transport, operation);
+
+		const requestsBeforeRejection = transport.requests.length;
+		expect(Buffer.byteLength(JSON.stringify(`${text}x`), "utf8") - 2 + overhead).toBe(
+			maxRequestBytes + 1,
+		);
+		await expect(start(client, `${text}x`)).rejects.toMatchObject({ code: "OUTPUT_LIMIT" });
+		expect(transport.requests.length).toBe(requestsBeforeRejection);
+		expect(client.getDiagnostics()).toMatchObject({
+			activeOperations: 0,
+			queuedBytes: 0,
+			operations: [],
+			transportKilled: false,
+		});
+		expect(transport.killed).toHaveLength(0);
+		const recovered = await start(client, "ok");
+		await completeOperation(transport, recovered);
+		expect(client.getDiagnostics().activeOperations).toBe(0);
 	});
 });
 
@@ -852,5 +952,127 @@ describe("operation limits and crash semantics", () => {
 		expect(transport.requests.filter((item) => item.method === "provider.cancel")).toHaveLength(1);
 		await Bun.sleep(20);
 		expect(transport.killed).toEqual([]);
+	});
+});
+
+describe("provider dump events", () => {
+	function dumpChatParams(maxBytes = 1024) {
+		return { ...chatParams(), requestDump: { maxBytes } };
+	}
+
+	it("delivers solicited dump events without marking the operation as visible output", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.chat(dumpChatParams());
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.request",
+				url: "https://upstream.example.test/v1/chat",
+				headers: { "content-type": "application/json" },
+				bodyChunk: "{}",
+				final: true,
+			}),
+		);
+		transport.emit(
+			notification(operation.operationId, 2, {
+				type: "dump.response",
+				status: 200,
+				bodyChunk: "data: ok",
+				final: true,
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "dump.request" } });
+		// Dump events are diagnostic metadata: the operation must stay replay-safe until
+		// real model output arrives, otherwise an upstream retry would be blocked by
+		// evidence collection alone.
+		expect(operation.replaySafe).toBe(true);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "dump.response" } });
+		transport.emit(notification(operation.operationId, 3, { type: "text.delta", text: "hi" }));
+		transport.emit(
+			notification(operation.operationId, 4, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "text.delta" } });
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(stream.next()).resolves.toMatchObject({ done: true });
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("rejects unsolicited dump events as a protocol violation", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		// No requestDump hint: the plugin may not emit dump events, because hosts that
+		// predate them would kill the transport on the unknown event type.
+		const operation = await client.chat(chatParams());
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.request",
+				url: "https://upstream.example.test/v1/chat",
+				final: true,
+			}),
+		);
+		await expect(stream.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+		expect(client.getDiagnostics().protocolErrors).toBe(1);
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("rejects dump events on generate operations as a protocol violation", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.generate(generateParams());
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.response",
+				status: 200,
+				bodyChunk: "ok",
+				final: true,
+			}),
+		);
+		await expect(stream.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+		expect(client.getDiagnostics().protocolErrors).toBe(1);
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("cancels the operation when dump output exceeds the advertised budget", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.chat(dumpChatParams(4));
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.response",
+				status: 200,
+				bodyChunk: "toolong",
+			}),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const cancellations = transport.requests.filter((item) => item.method === "provider.cancel");
+		expect(cancellations).toHaveLength(1);
+		expect(cancellations[0].params).toMatchObject({
+			operationId: operation.operationId,
+			reason: "output_limit",
+		});
+		transport.emit(
+			notification(operation.operationId, 2, {
+				type: "error",
+				error: { classification: "cancelled", code: "OUTPUT_LIMIT", message: "limited" },
+			}),
+		);
+		transport.emit(
+			notification(operation.operationId, 3, {
+				type: "done",
+				status: "failed",
+				stopReason: "error",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "error" } });
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(stream.next()).rejects.toMatchObject({ code: "OUTPUT_LIMIT" });
 	});
 });

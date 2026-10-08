@@ -14,6 +14,7 @@
  */
 
 import { hasUsablePlanBody } from "../plan-reference";
+import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
 import {
 	deriveToolProgress,
@@ -44,6 +45,7 @@ import {
 	type SourceTextRange,
 } from "./source-text";
 import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
+import { workspaceObject, workspaceSummary, workspaceText } from "./workspace-tool-display";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Canonical tool-detail bodies and ordered sections.
@@ -119,6 +121,44 @@ export type ToolBodyFollowTarget =
 	| { kind: "end" }
 	| { kind: "diff-row"; focus: DiffSourcePoint | null };
 
+/** Runtime boundary for the renderer marker; arbitrary tool-input objects are not references. */
+export function isTextDocumentRef(
+	value: unknown,
+): value is import("./text-document").TextDocumentRef {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const ref = value as Record<string, unknown>;
+	if (
+		typeof ref.id !== "string" ||
+		!ref.id ||
+		typeof ref.epoch !== "string" ||
+		!ref.epoch ||
+		!Number.isSafeInteger(ref.length) ||
+		(ref.length as number) < 0 ||
+		!Number.isSafeInteger(ref.revision) ||
+		(ref.revision as number) < 0 ||
+		typeof ref.complete !== "boolean" ||
+		typeof ref.originKnown !== "boolean" ||
+		(ref.preview !== undefined && typeof ref.preview !== "string")
+	)
+		return false;
+	if (ref.source !== undefined) {
+		if (!ref.source || typeof ref.source !== "object" || Array.isArray(ref.source)) return false;
+		const source = ref.source as Record<string, unknown>;
+		if (
+			typeof source.narratorId !== "string" ||
+			typeof source.toolUseId !== "string" ||
+			typeof source.field !== "string"
+		)
+			return false;
+		if (
+			source.executionAttempt !== undefined &&
+			(!Number.isSafeInteger(source.executionAttempt) || (source.executionAttempt as number) < 0)
+		)
+			return false;
+	}
+	return true;
+}
+
 /** One canonical body descriptor. Geometry and viewport reading state live elsewhere. */
 export interface ToolCappedDetail {
 	kind: "capped";
@@ -130,6 +170,11 @@ export interface ToolCappedDetail {
 	range?: SourceTextRange;
 	revision?: string | number;
 	diffDocument?: DiffDocument;
+	/** Complete Write source; text is only its bounded measurement preview. */
+	textDocument?: import("./text-document").TextDocumentRef;
+	/** Pending historical source identity; UI never mistakes its preview for a full document. */
+	textDocumentSource?: import("./text-document").TextDocumentSource;
+	textDocumentError?: boolean;
 	/** Height budget only; labels and presentation never derive from it. */
 	cap: DetailCapKind;
 	/** Estimated content line count (× DETAIL_CONTENT_LINE_HEIGHT). */
@@ -156,6 +201,8 @@ export interface ToolCappedDetail {
 	 * aspect-fitted content height over the fixed fallback).
 	 */
 	media?: ToolMediaRef;
+	/** Typed share body; never route non-images through VListImage. */
+	sharePreview?: SharePreviewRef;
 	/**
 	 * True when `text` is only a PREFIX of the real body (a truncated leaf).
 	 *
@@ -869,7 +916,11 @@ export function describeToolBody(
 		: metadata?._streamingOutputRange;
 	return {
 		...body,
-		id: toolBodyId(input.toolUseId ?? `preview:${input.previewId}`, body.source, input.occurrence),
+		id: toolBodyId(
+			body.textDocument?.id ?? input.toolUseId ?? `preview:${input.previewId}`,
+			body.source,
+			body.textDocument ? undefined : input.occurrence,
+		),
 		live: body.format !== "media" && live,
 		...(isSourceTextRange(range) ? { range } : {}),
 		...(body.diffDocument
@@ -964,6 +1015,8 @@ function classifyByCategory(
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
+		case "workspace":
+			return classifyWorkspace(toolName, inputJson, outputJson, input.labels, metadata);
 		default:
 			return classifyGeneric(inputJson, outputJson);
 	}
@@ -1309,15 +1362,39 @@ function classifyFile(
 			}),
 		]);
 	}
-	const text = readLeafText(fields.content);
+	const textDocument =
+		toolName === "Write" && isTextDocumentRef(fields.textDocument)
+			? fields.textDocument
+			: undefined;
+	const text = textDocument
+		? (textDocument.preview ?? readLeafText(fields.content)?.slice(0, 2048) ?? "")
+		: readLeafText(fields.content);
 	return sections([
 		section("meta.file", undefined, metaRows([pathRow(fp)])),
-		textSection("input.content", text === undefined ? undefined : fields.content, "input", {
-			cap: inputLive ? "streaming" : "code",
-			text,
-			format: "code",
-			...(fp ? { codeLangPath: fp } : {}),
-		}),
+		textSection(
+			"input.content",
+			textDocument ? text : text === undefined ? undefined : fields.content,
+			"input",
+			{
+				cap: inputLive ? "streaming" : "code",
+				text,
+				...(textDocument
+					? { textDocument, revision: textDocument.revision, textTruncated: false }
+					: toolName === "Write" &&
+							fields.textDocumentSource &&
+							typeof fields.textDocumentSource === "object"
+						? {
+								textDocumentSource:
+									fields.textDocumentSource as import("./text-document").TextDocumentSource,
+							}
+						: {}),
+				...(toolName === "Write" && fields.textDocumentError === true
+					? { textDocumentError: true }
+					: {}),
+				format: "code",
+				...(fp ? { codeLangPath: fp } : {}),
+			},
+		),
 	]);
 }
 
@@ -1401,11 +1478,12 @@ function classifyBash(
 			undefined,
 			backgroundTaskId
 				? metaRows([
-						badgeRow(
-							chips([chip(backgroundTaskId, "blue")]),
-							labels?.backgroundTaskStarted ??
+						{
+							text:
+								labels?.backgroundTaskStarted ??
 								"Started in the background; see Background tasks for progress.",
-						),
+							dimmed: true,
+						},
 					])
 				: null,
 		),
@@ -2555,6 +2633,12 @@ function classifyShare(
 	}
 	const filename = readLeafText(metadata.filename) ?? "file";
 	const downloadUrl = metadata.downloadUrl;
+	const capability =
+		metadata.previewType === "unsupported" ||
+		metadata.compressed === true ||
+		metadata.isDirectory === true
+			? { kind: "unsupported" as const, mime: "application/octet-stream" }
+			: classifySharePreview(filename);
 	const sizeFormatted = readLeafText(metadata.sizeFormatted);
 	const fileCount = typeof metadata.fileCount === "number" ? metadata.fileCount : undefined;
 	const expiryHours = typeof metadata.expiryHours === "number" ? metadata.expiryHours : undefined;
@@ -2575,7 +2659,10 @@ function classifyShare(
 					"violet",
 				),
 				chip(fileCount != null && fileCount > 0 ? `${fileCount} files` : undefined, "cyan"),
-				chip(metadata.preview === true ? "preview" : undefined, "teal"),
+				chip(
+					metadata.preview === true && capability.kind !== "unsupported" ? "preview" : undefined,
+					"teal",
+				),
 				chip(expiryHours != null ? `${expiryHours}h` : undefined, "yellow"),
 			]),
 			actions: [
@@ -2584,8 +2671,20 @@ function classifyShare(
 			],
 		},
 	]);
-	const sharePreviewUrl = readLeafText(metadata.previewUrl);
-	if (metadata.preview === true && sharePreviewUrl !== undefined) {
+	const legacyRequested =
+		!Object.hasOwn(metadata, "previewRequested") &&
+		inputJson !== null &&
+		typeof inputJson === "object" &&
+		(inputJson as Record<string, unknown>).preview === true;
+	const previewRequested = metadata.previewRequested === true || legacyRequested;
+	const sharePreviewUrl =
+		readLeafText(metadata.previewUrl) ??
+		(previewRequested &&
+		capability.kind !== "unsupported" &&
+		/^\/api\/shares\/[\w-]+$/.test(downloadUrl)
+			? `${downloadUrl}/preview`
+			: undefined);
+	if ((metadata.preview === true && sharePreviewUrl !== undefined) || previewRequested) {
 		return sections([
 			section("meta.share", undefined, header),
 			section(
@@ -2593,8 +2692,30 @@ function classifyShare(
 				undefined,
 				capped("output.main", "media", {
 					format: "media",
-					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) },
+					contentPx:
+						capability.kind === "image"
+							? MEDIA_IMAGE_CONTENT_PX
+							: sharePreviewHeight(capability.kind, 480),
+					...(capability.kind === "image"
+						? { media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) } }
+						: {}),
+					sharePreview: {
+						...capability,
+						filename,
+						url: sharePreviewUrl,
+						downloadUrl,
+						expiresAt: readLeafText(metadata.expiresAt),
+						reason:
+							metadata.previewReason === "tooLarge"
+								? "tooLarge"
+								: metadata.previewReason === "compressed" ||
+										metadata.compressed === true ||
+										metadata.isDirectory === true
+									? "compressed"
+									: capability.kind === "unsupported"
+										? "unsupported"
+										: undefined,
+					},
 				}),
 			),
 		]);
@@ -3192,4 +3313,110 @@ function classifyContextAsk(
 			),
 		]) ?? { kind: "sections", sections: [] }
 	);
+}
+
+/** Workspace cards deliberately use plain rows, not protocol dumps or badge strips. */
+function classifyWorkspace(
+	toolName: string,
+	input: unknown,
+	output: unknown,
+	labels?: Record<string, string>,
+	metadata?: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const args = workspaceObject(input);
+	const envelope = workspaceObject(output);
+	const raw = envelope && "_text" in envelope ? envelope._text : output;
+	const result = workspaceObject(raw) ?? workspaceObject(tryParseJson(readLeafText(raw)));
+	const rows: ToolMetaRow[] = [];
+	const text = (key: Parameters<typeof workspaceText>[0]) => workspaceText(key, labels);
+	const pathRow = (path: unknown, branch?: unknown) => {
+		const value = readLeafText(path);
+		if (!value) return;
+		const name = readLeafText(branch)?.replace(/^refs\/heads\//, "");
+		rows.push({ text: name ? `${name} · ${value}` : value, mono: true });
+	};
+	let handled = false;
+	if (
+		[
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+		].includes(toolName)
+	) {
+		if (
+			toolName === "ListWorktrees" ||
+			(toolName === "Worktree" && readLeafText(args?.action) === "list")
+		) {
+			const list = workspaceObject(metadata?.workspaceWorktrees) ?? result;
+			if (Array.isArray(list?.entries)) {
+				rows.push({ text: text("workspaceList") });
+				for (const entry of list.entries) {
+					const item = workspaceObject(entry);
+					pathRow(
+						item?.path,
+						item?.branch ?? (item?.detached ? text("workspaceDetached") : undefined),
+					);
+				}
+				if (!list.entries.length) rows.push({ text: text("workspaceEmpty") });
+				if (list.truncated === true) rows.push({ text: text("workspaceTruncated") });
+				handled = true;
+			} else rows.push({ text: text("workspaceList") });
+		} else {
+			const worktree = workspaceObject(result?.worktree);
+			const outcome = readLeafText(result?.outcome);
+			rows.push({
+				text:
+					outcome === "created"
+						? text("workspaceCreated")
+						: outcome === "failed"
+							? text("workspaceFailed")
+							: outcome === "unknown"
+								? text("workspaceUnknown")
+								: text(
+										toolName === "AttachWorktree"
+											? "workspaceAttach"
+											: toolName === "GetWorktreeOperation"
+												? "workspaceOperation"
+												: "workspaceCreate",
+									),
+			});
+			pathRow(
+				worktree?.path ?? args?.destinationPath,
+				worktree?.branch ?? args?.branchName ?? workspaceObject(args?.branch)?.name,
+			);
+			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
+		}
+	} else if (toolName === "SwitchWorkingDirectory") {
+		const previous = workspaceObject(result?.previous);
+		const current = workspaceObject(result?.current);
+		const target = current ?? workspaceObject(args?.target);
+		rows.push({
+			text:
+				result?.changed === true
+					? text("workspaceChanged")
+					: result?.changed === false
+						? text("workspaceUnchanged")
+						: text("workspaceSwitch"),
+		});
+		const from = readLeafText(previous?.cwd);
+		const to = readLeafText(target?.cwd);
+		if (to) rows.push({ text: from && from !== to ? `${from} → ${to}` : to, mono: true });
+		const device = readLeafText(target?.deviceId);
+		if (device && device !== "local") rows.push({ text: device, mono: true });
+		handled = typeof result?.changed === "boolean";
+	} else {
+		rows.push({ text: workspaceSummary(toolName, input, labels) });
+	}
+	const error = workspaceObject(result?.error);
+	const message = readLeafText(error?.message) ?? readLeafText(result?.error);
+	if (message) {
+		rows.push({ text: message, dimmed: false });
+		handled = true;
+	}
+	return sections([
+		section("meta.workspace", undefined, metaRows(rows)),
+		...(!handled ? [textSection("output.main", output, "output")] : []),
+	]);
 }

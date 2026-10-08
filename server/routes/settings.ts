@@ -31,9 +31,9 @@ import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
-import { executeSearch, listSearchChannels } from "../lib/search/router";
+import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
-import { scheduleServerRestart } from "../lib/server-restart";
+import { restartServerForResponse } from "../lib/server-restart";
 import {
 	customApiProvidersToAnthropic,
 	customApiProvidersToGemini,
@@ -48,6 +48,7 @@ import {
 	isOpenAICustomApiProtocol,
 	migrateProviderPrefixReferences,
 	type NarraForkSettings,
+	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
@@ -55,9 +56,7 @@ import {
 	settings,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
-// Imported from lib (not the update service) so a route never depends on a service
-// for pure validation; update-service re-exports the same predicate.
-import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
+import { updateSourceSettingsSchema } from "../lib/settings/update-source";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -69,6 +68,7 @@ import {
 import {
 	defaultNarratorVisibilitySchema,
 	defaultNarratorWriteAudienceSchema,
+	diskSafetySettingsSchema,
 } from "../lib/validators/settings";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
@@ -140,13 +140,18 @@ const proxyOverrideSchema = z
 	})
 	.optional();
 
+// Accepts the current 4 protocols plus the 4 removed legacy values; inbound
+// payloads are normalized (legacy → current) before persistence/derivation.
 const customApiProtocolSchema = z.enum([
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+	"gemini-compatible",
+	// Legacy values, migrated by normalizeCustomApiProvider.
 	"anthropic-official",
 	"anthropic-compatible",
 	"codex-native",
 	"responses-compatible",
-	"completions-compatible",
-	"gemini-compatible",
 ]);
 
 const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
@@ -366,6 +371,7 @@ export const updateSettingsSchema = z
 				}
 			})
 			.optional(),
+		diskSafety: diskSafetySettingsSchema.optional(),
 		paths: z
 			.object({
 				defaultProjectDir: z.string().min(1),
@@ -452,6 +458,7 @@ export const updateSettingsSchema = z
 				planReflectionAutoApprove: z.boolean(),
 				planReflectionAllowAutoCompact: z.boolean(),
 				questionReflectionEnabled: z.boolean(),
+				permissionRuleAutoApprove: z.boolean(),
 				questionReflectionTimeoutMs: z.number().int().min(10000).max(3600000),
 				dangerReflectionLevel: dangerReflectionLevelSchema,
 				dangerReflectionEnabled: z.boolean(),
@@ -546,6 +553,8 @@ export const updateSettingsSchema = z
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
 				queueDuringCompaction: z.boolean().optional(),
+				browserProxy: proxyOverrideSchema,
+				notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),
@@ -692,31 +701,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		update: z
-			.object({
-				// "" clears the override so the built-in default server is used again.
-				//
-				// The https refine is a real gate, not cosmetics: update payloads are trusted
-				// on TLS alone (the expected SHA-512 ships in the same response as the
-				// binary), so a plaintext origin hands a man in the middle code execution.
-				// `getServerBaseUrl` already refuses to fetch from one, but without this an
-				// administrator typing `http://` would get a 200 and a silently disabled
-				// updater instead of being told why.
-				serverUrl: z
-					.union([
-						z.string().url().refine(isTrustedUpdateServerUrl, {
-							message: "Update server must use https (plaintext http is only allowed for loopback)",
-						}),
-						z.literal(""),
-					])
-					.optional(),
-				product: z.string().min(1).optional(),
-				channel: z.enum(["stable", "beta"]).optional(),
-				checkIntervalMinutes: z.number().int().min(0).optional(),
-				autoDownload: z.boolean().optional(),
-			})
-			.partial()
-			.optional(),
+		update: updateSourceSettingsSchema,
 		vnet: z
 			.object({
 				enabled: z.boolean(),
@@ -840,6 +825,22 @@ function restoreMaskedSearchProviderBaseUrl(
 	}
 }
 
+function restoreMaskedSearchProvider(
+	provider: NonNullable<NarraForkSettings["search"]>["customProviders"][number],
+	existing: NonNullable<NarraForkSettings["search"]>["customProviders"][number] | undefined,
+): void {
+	if (provider.apiKey?.startsWith("*")) provider.apiKey = existing?.apiKey ?? "";
+	const headers = provider.headers;
+	if (headers) {
+		for (const [key, value] of Object.entries(headers)) {
+			if (isSensitiveHeaderName(key) && value.startsWith("*")) {
+				headers[key] = existing?.headers?.[key] ?? "";
+			}
+		}
+	}
+	restoreMaskedSearchProviderBaseUrl(provider, existing);
+}
+
 function maskSearchSettings(search: NarraForkSettings["search"]): NarraForkSettings["search"] {
 	if (!search) return undefined;
 	return {
@@ -873,6 +874,7 @@ export function buildServerRestartUrl(
 	port: number,
 	tlsEnabled: boolean,
 ): string {
+	// host/port/protocol must come from the actual listener, never from configured auto-lan intent.
 	const redirectHost = isWildcardListenHost(host) ? new URL(requestUrl).hostname : host;
 	return `${tlsEnabled ? "https" : "http"}://${formatUrlHost(redirectHost)}:${port}`;
 }
@@ -1344,6 +1346,8 @@ const testSearchSchema = z.object({
 	query: z.string().min(2).max(1000),
 	purpose: z.string().max(1000).optional(),
 	channelId: z.string().optional(),
+	channel: searchChannelSchema.optional(),
+	customProvider: customSearchProviderSchema.optional(),
 });
 
 settingsRoutes.post("/search/test", requireAdmin, async (c) => {
@@ -1352,14 +1356,25 @@ settingsRoutes.post("/search/test", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		throw new ValidationError(parsed.error.issues.map((i) => i.message).join(", "));
 	}
+	const customProvider = parsed.data.customProvider;
+	if (customProvider) {
+		restoreMaskedSearchProvider(
+			customProvider,
+			settings.search?.customProviders.find((item) => item.id === customProvider.id),
+		);
+	}
 	try {
-		const result = await executeSearch({
-			query: parsed.data.query,
-			purpose: parsed.data.purpose,
-			channelId: parsed.data.channelId,
-			locale: "zh-CN",
-			signal: c.req.raw.signal,
-		});
+		const result = await testSearchChannel(
+			{
+				query: parsed.data.query,
+				purpose: parsed.data.purpose,
+				channelId: parsed.data.channelId,
+				locale: "zh-CN",
+				signal: c.req.raw.signal,
+				userId: c.get("user").sub,
+			},
+			{ channel: parsed.data.channel, customProvider: parsed.data.customProvider },
+		);
 		return c.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -1487,16 +1502,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			current.geminiProviders?.find((p) => p.id === id)?.apiKey ??
 			"";
 
-		// Preserve real API keys for unified custom API providers.
+		// Preserve real API keys for unified custom API providers. Inbound protocols
+		// are normalized first so legacy values migrate before storage/derivation.
 		if (validated.customApiProviders) {
-			for (const p of validated.customApiProviders) {
+			const normalizedCustomApiProviders = validated.customApiProviders.map((p) =>
+				normalizeCustomApiProvider(p),
+			);
+			for (const p of normalizedCustomApiProviders) {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
 				}
 			}
-			validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
-			validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
-			validated.geminiProviders = customApiProvidersToGemini(validated.customApiProviders);
+			validated.customApiProviders = normalizedCustomApiProviders;
+			validated.openaiProviders = customApiProvidersToOpenAI(normalizedCustomApiProviders);
+			validated.anthropicProviders = customApiProvidersToAnthropic(normalizedCustomApiProviders);
+			validated.geminiProviders = customApiProvidersToGemini(normalizedCustomApiProviders);
 		}
 
 		// Preserve real API keys for OpenAI-compatible providers.
@@ -1562,17 +1582,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			const currentProviders = current.search?.customProviders ?? [];
 			for (const p of validated.search.customProviders) {
 				const existing = currentProviders.find((cp) => cp.id === p.id);
-				if (p.apiKey?.startsWith("*")) {
-					p.apiKey = existing?.apiKey ?? "";
-				}
-				if (p.headers) {
-					for (const [key, value] of Object.entries(p.headers)) {
-						if (isSensitiveHeaderName(key) && value.startsWith("*")) {
-							p.headers[key] = existing?.headers?.[key] ?? "";
-						}
-					}
-				}
-				restoreMaskedSearchProviderBaseUrl(p, existing);
+				restoreMaskedSearchProvider(p, existing);
 			}
 		}
 
@@ -1710,12 +1720,9 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
 		const needsRestart = serverAddressChanged || tlsChanged;
 
-		if (needsRestart) {
-			scheduleServerRestart(newHost, newPort);
-		}
-
-		const newUrl = needsRestart
-			? buildServerRestartUrl(c.req.url, newHost, newPort, newTls?.enabled === true)
+		const address = needsRestart ? await restartServerForResponse(newHost, newPort) : undefined;
+		const newUrl = address
+			? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
 			: undefined;
 
 		// Observability: record who changed the instance-wide summary model and to
@@ -1766,12 +1773,10 @@ settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
 	};
 	saveSettings(merged);
 
-	// Schedule server restart to apply TLS
-	const host = merged.server.host;
-	const port = merged.server.port;
-	scheduleServerRestart(host, port);
-
-	const newUrl = buildServerRestartUrl(c.req.url, host, port, true);
+	const address = await restartServerForResponse(merged.server.host, merged.server.port);
+	const newUrl = address
+		? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
+		: undefined;
 	return c.json({
 		certPath: result.certPath,
 		keyPath: result.keyPath,

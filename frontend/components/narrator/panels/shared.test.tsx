@@ -25,7 +25,27 @@ const DOM_KEYS = [
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
 	"IS_REACT_ACT_ENVIRONMENT",
+	"MutationObserver",
 ] as const;
+
+class TestMutationObserver {
+	static instances: TestMutationObserver[] = [];
+	target: Node | null = null;
+	disconnected = false;
+	constructor(readonly callback: MutationCallback) {
+		TestMutationObserver.instances.push(this);
+	}
+	observe(target: Node, options: MutationObserverInit) {
+		expect(options).toEqual({ attributes: true, attributeFilter: ["style"] });
+		this.target = target;
+	}
+	disconnect() {
+		this.disconnected = true;
+	}
+	notify() {
+		if (!this.disconnected) this.callback([], this as unknown as MutationObserver);
+	}
+}
 
 /**
  * Minimal DOM for react-dom to render into. Same shape as the other DOM harnesses
@@ -47,6 +67,7 @@ async function installDom(): Promise<() => void> {
 			setTimeout(() => cb(Date.now()), 0) as unknown as number,
 		cancelAnimationFrame: (h: number) => clearTimeout(h),
 		IS_REACT_ACT_ENVIRONMENT: false,
+		MutationObserver: TestMutationObserver,
 	};
 	for (const key of DOM_KEYS) {
 		Object.defineProperty(globalThis, key, { value: values[key], configurable: true });
@@ -69,7 +90,14 @@ async function installDom(): Promise<() => void> {
  * past a 5px threshold, so the state under test is read after a
  * threshold-crossing pointermove.
  */
-async function captureDrag(opts: { toolKind?: string; surfaceId?: string } = {}) {
+async function captureDrag(
+	opts: {
+		toolKind?: string;
+		surfaceId?: string;
+		resourceId?: string;
+		largeFileConfirmed?: boolean;
+	} = {},
+) {
 	const React = await import("react");
 	const { createRoot } = await import("react-dom/client");
 	const { flushSync } = await import("react-dom");
@@ -87,7 +115,13 @@ async function captureDrag(opts: { toolKind?: string; surfaceId?: string } = {})
 			props,
 			"__terminal__",
 			"tool",
-			opts.toolKind ? { toolKind: opts.toolKind } : undefined,
+			opts.toolKind
+				? {
+						toolKind: opts.toolKind,
+						resourceId: opts.resourceId,
+						largeFileConfirmed: opts.largeFileConfirmed,
+					}
+				: undefined,
 		);
 		return null;
 	}
@@ -132,7 +166,140 @@ afterAll(async () => {
 	restoreDom?.();
 });
 
+async function mountGeometryProbe(style?: string) {
+	const React = await import("react");
+	const { createRoot } = await import("react-dom/client");
+	const { flushSync } = await import("react-dom");
+	const { usePanelGeometryReady } = await import("./shared");
+	const container = document.createElement("div");
+	if (style !== undefined) {
+		container.className = "dv-render-overlay";
+		container.setAttribute("style", style);
+	}
+	document.body.appendChild(container);
+	const root = createRoot(container);
+	let mounts = 0;
+	let unmounts = 0;
+	let initialWidth = "";
+	const onAttach = () => {};
+	function Content() {
+		React.useLayoutEffect(() => {
+			mounts++;
+			initialWidth = container.style.width;
+			return () => {
+				unmounts++;
+			};
+		}, []);
+		return <span>content</span>;
+	}
+	function Probe() {
+		const { ref, geometryReady } = usePanelGeometryReady(onAttach);
+		return <div ref={ref}>{geometryReady && <Content />}</div>;
+	}
+	const observerStart = TestMutationObserver.instances.length;
+	flushSync(() => root.render(<Probe />));
+	return {
+		container,
+		get mounts() {
+			return mounts;
+		},
+		get unmounts() {
+			return unmounts;
+		},
+		get initialWidth() {
+			return initialWidth;
+		},
+		get observers() {
+			return TestMutationObserver.instances.slice(observerStart);
+		},
+		update(style: string) {
+			flushSync(() => {
+				container.setAttribute("style", style);
+				for (const observer of this.observers) observer.notify();
+			});
+		},
+		dispose() {
+			flushSync(() => root.unmount());
+			container.remove();
+		},
+	};
+}
+
+describe("usePanelGeometryReady", () => {
+	it("waits for the visible positioned overlay, then keeps content mounted", async () => {
+		const probe = await mountGeometryProbe("visibility: hidden");
+		try {
+			expect(probe.mounts).toBe(0);
+			probe.update("visibility: hidden; width: 520px; height: 700px");
+			expect(probe.mounts).toBe(0);
+			probe.update("width: 520px; height: 0px");
+			expect(probe.mounts).toBe(0);
+			probe.update("width: 520px; height: 700px");
+			expect(probe.mounts).toBe(1);
+			expect(probe.initialWidth).toBe("520px");
+			expect(probe.observers.every((observer) => observer.disconnected)).toBe(true);
+			probe.update("visibility: hidden; width: 800px; height: 700px");
+			probe.update("width: 420px; height: 700px");
+			expect(probe.mounts).toBe(1);
+			expect(probe.unmounts).toBe(0);
+		} finally {
+			probe.dispose();
+		}
+	});
+
+	it("mounts immediately in an already positioned overlay", async () => {
+		const probe = await mountGeometryProbe("width: 520px; height: 700px");
+		try {
+			expect(probe.mounts).toBe(1);
+			expect(probe.observers).toHaveLength(0);
+		} finally {
+			probe.dispose();
+		}
+	});
+
+	it("does not delay hosts without an overlay", async () => {
+		const probe = await mountGeometryProbe();
+		try {
+			expect(probe.mounts).toBe(1);
+			expect(probe.observers).toHaveLength(0);
+		} finally {
+			probe.dispose();
+		}
+	});
+
+	it("disconnects a pending observer when the host unmounts", async () => {
+		const probe = await mountGeometryProbe("visibility: hidden");
+		expect(probe.mounts).toBe(0);
+		expect(probe.observers).toHaveLength(1);
+		probe.dispose();
+		expect(probe.observers[0]?.disconnected).toBe(true);
+	});
+});
+
 describe("usePanelHeaderDrag", () => {
+	it("preserves panel consent through a header tear-out and detached persistence", async () => {
+		const { makePanelEntry, parseDetachedNodes, serializeDetachedNodes } = await import(
+			"../../graph/dock/detached-panels"
+		);
+		for (const largeFileConfirmed of [true, false, undefined]) {
+			const state = await captureDrag({
+				toolKind: "file",
+				resourceId: "/large.ts",
+				largeFileConfirmed,
+			});
+			if (!state) throw new Error("drag state missing");
+			expect(state.resourceId).toBe("/large.ts");
+			const entry = makePanelEntry("file", state.resourceId, state);
+			const raw = serializeDetachedNodes([
+				{ id: "detached", x: 0, y: 0, w: 480, h: 360, pendingPanels: [entry] },
+			]);
+			const restored = parseDetachedNodes(raw)[0].pendingPanels?.[0];
+			expect(restored?.panelId).toBe("file:/large.ts");
+			if (largeFileConfirmed) expect(restored?.largeFileConfirmed).toBe(true);
+			else expect(restored).not.toHaveProperty("largeFileConfirmed");
+		}
+	});
+
 	it("carries panelId so the surface treats the drop as moving THIS panel", async () => {
 		const state = await captureDrag({ toolKind: "terminal" });
 		expect(state?.panelId).toBe("ndock-terminal");
@@ -161,5 +328,59 @@ describe("usePanelHeaderDrag", () => {
 		// non-existent narrator.
 		const state = await captureDrag({ toolKind: "terminal" });
 		expect(state?.subjectKind).toBe("tool");
+	});
+});
+
+describe("usePanelCompact retained hidden surfaces", () => {
+	it("keeps the last visible breakpoint through zero-width parking and resumes normally", async () => {
+		const React = await import("react");
+		const { createRoot } = await import("react-dom/client");
+		const { flushSync } = await import("react-dom");
+		const { usePanelCompact } = await import("./shared");
+		const previous = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
+		let callback: ResizeObserverCallback | undefined;
+		let disconnected = false;
+		class Observer {
+			constructor(cb: ResizeObserverCallback) {
+				callback = cb;
+			}
+			observe() {}
+			disconnect() {
+				disconnected = true;
+			}
+		}
+		Object.defineProperty(globalThis, "ResizeObserver", { configurable: true, value: Observer });
+		const element = document.body.appendChild(document.createElement("div"));
+		const root = createRoot(element);
+		let compact = true;
+		function Probe() {
+			const state = usePanelCompact();
+			compact = state.compact;
+			return React.createElement("div", { ref: state.ref });
+		}
+		const resize = (width: number) =>
+			flushSync(() =>
+				callback?.([{ contentRect: { width } } as ResizeObserverEntry], {} as ResizeObserver),
+			);
+		try {
+			flushSync(() => root.render(React.createElement(Probe)));
+			expect(compact).toBe(true);
+			resize(0);
+			expect(compact).toBe(true);
+			resize(900);
+			expect(compact).toBe(false);
+			resize(0);
+			expect(compact).toBe(false);
+			resize(639);
+			expect(compact).toBe(true);
+			resize(640);
+			expect(compact).toBe(false);
+		} finally {
+			flushSync(() => root.unmount());
+			expect(disconnected).toBe(true);
+			element.remove();
+			if (previous) Object.defineProperty(globalThis, "ResizeObserver", previous);
+			else Reflect.deleteProperty(globalThis, "ResizeObserver");
+		}
 	});
 });

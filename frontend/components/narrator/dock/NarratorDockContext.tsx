@@ -34,10 +34,7 @@ import {
 	type PluginUiHostSurface,
 	PluginUiSurfaceProvider,
 } from "../../plugins/PluginUiSurfaceContext";
-import type {
-	FileModPanelExternalProps,
-	NarratorDetailsPanelExternalProps,
-} from "../narrator-panel-types";
+import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
 	type FileOpenOptions,
@@ -129,10 +126,6 @@ export interface NarratorDockContextValue {
 
 	/** Live dockview api ref (bound by the surface once ready). */
 	apiRef: RefObject<DockviewApi | null>;
-
-	/** Published by chat, read by the file-modifications panel. */
-	fileModProps: FileModPanelExternalProps | null;
-	setFileModProps: (props: FileModPanelExternalProps | null) => void;
 
 	/** Published by chat, read by the details panel. */
 	detailsProps: NarratorDetailsPanelExternalProps | null;
@@ -265,7 +258,6 @@ export function NarratorDockProvider({
 	children: React.ReactNode;
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
-	const [fileModProps, setFileModProps] = useState<FileModPanelExternalProps | null>(null);
 	const [fileReferenceSelection, setFileReferenceSelection] =
 		useState<FileReferenceEditorSelection | null>(null);
 	const [detailsProps, setDetailsProps] = useState<NarratorDetailsPanelExternalProps | null>(null);
@@ -653,6 +645,56 @@ export function NarratorDockProvider({
 	// context value below only rebuilds when truly necessary (narratorId/chapterId
 	// change, or local state changes). If a new call site is added without
 	// useCallback, the entire context will re-create on every parent render.
+	// Publishing details/file/browser state must not replace the chat/terminal
+	// bridges. Their consumers register in effects; changing these identities
+	// tears down and re-registers the same session during each responsive handoff.
+	const bridgeCallbacks = useMemo<
+		Pick<
+			NarratorDockContextValue,
+			| "registerAppendChatInput"
+			| "appendChatInput"
+			| "registerWriteTerminalStdin"
+			| "writeTerminalStdin"
+			| "registerScrollToMessage"
+			| "scrollToMessage"
+			| "registerSubmitToNarrator"
+			| "submitToNarrator"
+		>
+	>(
+		() => ({
+			registerAppendChatInput: (fn) => {
+				bridgesRef.current.appendChatInput = fn;
+				return () => {
+					if (bridgesRef.current.appendChatInput === fn) bridgesRef.current.appendChatInput = null;
+				};
+			},
+			appendChatInput: (text) => bridgesRef.current.appendChatInput?.(text),
+			registerWriteTerminalStdin: (fn) => {
+				bridgesRef.current.writeTerminalStdin = fn;
+				return () => {
+					if (bridgesRef.current.writeTerminalStdin === fn)
+						bridgesRef.current.writeTerminalStdin = null;
+				};
+			},
+			writeTerminalStdin: (text) => bridgesRef.current.writeTerminalStdin?.(text),
+			registerScrollToMessage: (fn) => {
+				bridgesRef.current.scrollToMessage = fn;
+				return () => {
+					if (bridgesRef.current.scrollToMessage === fn) bridgesRef.current.scrollToMessage = null;
+				};
+			},
+			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
+			registerSubmitToNarrator: (fn) => {
+				bridgesRef.current.submitToNarrator = fn;
+				return () => {
+					if (bridgesRef.current.submitToNarrator === fn)
+						bridgesRef.current.submitToNarrator = null;
+				};
+			},
+			submitToNarrator: (text) => bridgesRef.current.submitToNarrator?.(text),
+		}),
+		[],
+	);
 	const value = useMemo<NarratorDockContextValue>(() => {
 		return {
 			narratorId,
@@ -663,8 +705,6 @@ export function NarratorDockProvider({
 			onBack,
 			onMinimize,
 			apiRef,
-			fileModProps,
-			setFileModProps,
 			fileReferenceSelection,
 			setFileReferenceSelection,
 			registerAddFileReference,
@@ -673,42 +713,7 @@ export function NarratorDockProvider({
 			setDetailsProps,
 			browserInfo,
 			setBrowserInfo,
-			registerAppendChatInput: (fn) => {
-				bridgesRef.current.appendChatInput = fn;
-				return () => {
-					if (bridgesRef.current.appendChatInput === fn) {
-						bridgesRef.current.appendChatInput = null;
-					}
-				};
-			},
-			appendChatInput: (text) => bridgesRef.current.appendChatInput?.(text),
-			registerWriteTerminalStdin: (fn) => {
-				bridgesRef.current.writeTerminalStdin = fn;
-				return () => {
-					if (bridgesRef.current.writeTerminalStdin === fn) {
-						bridgesRef.current.writeTerminalStdin = null;
-					}
-				};
-			},
-			writeTerminalStdin: (text) => bridgesRef.current.writeTerminalStdin?.(text),
-			registerScrollToMessage: (fn) => {
-				bridgesRef.current.scrollToMessage = fn;
-				return () => {
-					if (bridgesRef.current.scrollToMessage === fn) {
-						bridgesRef.current.scrollToMessage = null;
-					}
-				};
-			},
-			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
-			registerSubmitToNarrator: (fn) => {
-				bridgesRef.current.submitToNarrator = fn;
-				return () => {
-					if (bridgesRef.current.submitToNarrator === fn) {
-						bridgesRef.current.submitToNarrator = null;
-					}
-				};
-			},
-			submitToNarrator: (text) => bridgesRef.current.submitToNarrator?.(text),
+			...bridgeCallbacks,
 			openToolTypes,
 			refreshOpenToolTypes,
 			openToolPanel,
@@ -719,6 +724,7 @@ export function NarratorDockProvider({
 			toggleToolPanel,
 		};
 	}, [
+		bridgeCallbacks,
 		narratorId,
 		chapterId,
 		hostOwnsTitle,
@@ -726,7 +732,6 @@ export function NarratorDockProvider({
 		highlightMessageId,
 		onBack,
 		onMinimize,
-		fileModProps,
 		fileReferenceSelection,
 		registerAddFileReference,
 		addFileReference,
@@ -742,8 +747,12 @@ export function NarratorDockProvider({
 		toggleToolPanel,
 	]);
 
+	const pluginHostContext = useMemo(
+		() => ({ surface: pluginSurface, narratorId, chapterId }),
+		[pluginSurface, narratorId, chapterId],
+	);
 	return (
-		<PluginUiSurfaceProvider hostContext={{ surface: pluginSurface, narratorId, chapterId }}>
+		<PluginUiSurfaceProvider hostContext={pluginHostContext}>
 			<NarratorDockContext.Provider value={value}>{children}</NarratorDockContext.Provider>
 		</PluginUiSurfaceProvider>
 	);

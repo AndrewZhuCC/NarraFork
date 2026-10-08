@@ -9,27 +9,44 @@
  * only on the parent's NEXT turn, and an idle parent has no next turn: nothing woke
  * it. So the panel showed a fresh result while the agent never acted on it.
  *
- * The fix is a wake, not a second copy of the result. Everything asserted here fails
- * SILENTLY in production, which is why it is pinned:
+ * Completion notices must carry this run's result, not merely point at a rewritten
+ * historical tool result. These contracts fail silently in production:
  *
  *   - not delivering        → an idle parent never acts on the new result
- *   - carrying the result   → the same output appears twice in one request
+ *   - omitting the result   → readers and the current turn cannot see what finished
  *   - delivering too early  → the woken turn is built from the SUPERSEDED tool result
  *   - waking after a stop   → a turn is spent on work the user just interrupted
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { readFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
-import { narratorBufferedMessages, narrators } from "../../db/schema";
+import { narratorBufferedMessages, narrators, runtimePublicationOutbox } from "../../db/schema";
+import * as publicationModule from "../agent-runtime/publication";
 import { runtimePublication } from "../agent-runtime/publication";
+import * as runtimeQueueModule from "../agent-runtime/runtime-queue-port";
+import { runAtomicWrite } from "../agent-runtime/runtime-write";
+import {
+	backgroundAgentNoticePreview,
+	formatBackgroundCompletionNotifications,
+} from "../bg-completion-queue";
 import { projectPendingInjection } from "../parent-injection-queue";
 import {
 	announceResumedBackgroundTask,
 	commitResumedBackgroundTaskAnnouncement,
 	planResumedBackgroundTaskNotice,
 } from "../subagent-runner";
+
+describe("resumed background start — no mailbox publication", () => {
+	it("does not produce a started intent or reserve a started publication slot", () => {
+		const source = readFileSync(new URL("../subagent-runner.ts", import.meta.url), "utf8");
+		expect(source).not.toContain('eventKind: "started"');
+		expect(source).not.toContain("notifyParentOfResumedBackgroundTask");
+		expect(source).not.toMatch(/started:\s*!!priorTaskVersion/);
+	});
+});
 
 describe("planResumedBackgroundTaskNotice", () => {
 	it("delivers and wakes for an ordinary manual continuation", () => {
@@ -109,6 +126,81 @@ describe("planResumedBackgroundTaskNotice", () => {
 	});
 });
 
+describe("resumed announcement backend transaction contracts", () => {
+	for (const fails of [false, true]) {
+		it(`awaits the PostgreSQL terminal commit${fails ? " and propagates rejection" : ""} without SQLite`, async () => {
+			const facade = publicationModule.getRuntimePublicationService();
+			const run = {
+				producerKind: "agent" as const,
+				taskId: "pg-resumed-child",
+				logicalRunId: "pg-resumed-run",
+				recipientId: "pg-resumed-parent",
+			};
+			let release!: () => void;
+			const barrier = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let entered!: () => void;
+			const committing = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const backend = spyOn(runtimeQueueModule, "resolveRuntimeQueueBackend").mockReturnValue(
+				"postgres",
+			);
+			const publication = spyOn(publicationModule, "getRuntimePublicationService").mockReturnValue({
+				...facade,
+				backend: "postgres",
+				getAgentRun: async () => run,
+				commitAgentTerminal: async (input) => {
+					expect(input).toMatchObject({ run, text: "PG result", eventKind: "completed" });
+					entered();
+					await barrier;
+					if (fails) throw new Error("PG commit failed");
+					return { status: "committed", deliveryId: null, arrivalSeq: null };
+				},
+			});
+			const sqliteRead = spyOn(db, "select").mockImplementation(() => {
+				throw new Error("PostgreSQL announcement must not read SQLite");
+			});
+			const sqliteTransaction = spyOn(db, "transaction").mockImplementation(() => {
+				throw new Error("PostgreSQL announcement must not open a SQLite transaction");
+			});
+			try {
+				const completion = commitResumedBackgroundTaskAnnouncement(
+					{
+						subagentId: run.taskId,
+						parentNarratorId: run.recipientId,
+						logicalRunId: run.logicalRunId,
+						status: "completed",
+						wakeParent: true,
+						locale: "en",
+					},
+					"PG result",
+				);
+				expect(completion).toBeInstanceOf(Promise);
+				let settled = false;
+				const observed = Promise.resolve(completion).finally(() => {
+					settled = true;
+				});
+				await committing;
+				expect(settled).toBe(false);
+				release();
+				if (fails) await expect(observed).rejects.toThrow("PG commit failed");
+				else await observed;
+				expect(settled).toBe(true);
+				expect(sqliteRead).not.toHaveBeenCalled();
+				expect(sqliteTransaction).not.toHaveBeenCalled();
+			} finally {
+				release();
+				sqliteTransaction.mockRestore();
+				sqliteRead.mockRestore();
+				publication.mockRestore();
+				backend.mockRestore();
+			}
+		});
+	}
+});
+
 describe("the announcement is handed to the caller, not fired by the runner", () => {
 	/**
 	 * ⚠️ ORDER, and it is invisible when wrong.
@@ -142,8 +234,13 @@ describe("the announcement is handed to the caller, not fired by the runner", ()
 		expect(announce).toBeGreaterThan(conclusion);
 	});
 
-	for (const status of ["completed", "cancelled"] as const) {
-		it(`projects only the conclusion pointer and ${status === "completed" ? "wakes once" : "does not wake after stop"}`, async () => {
+	for (const [status, result] of [
+		["completed", "本轮复核结果：滚动位置正确"],
+		["cancelled", "取消时已完成的结果"],
+		["completed", ""],
+		["completed", "x".repeat(12001)],
+	] as const) {
+		it(`projects this run's ${result.length}-character result and ${status === "completed" ? "wakes once" : "does not wake after stop"}`, async () => {
 			cleanDb(sqlite);
 			// Step the actual worker explicitly; no provider request or timing race.
 			runtimePublication.stop();
@@ -177,9 +274,28 @@ describe("the announcement is handed to the caller, not fired by the runner", ()
 				wakeParent: status === "completed",
 				locale: "en" as const,
 			};
-			const result = "PRIVATE FINAL RESULT MUST NOT BE INJECTED AGAIN";
+			// Seed a previous run so the projection cannot accidentally use its output.
+			runAtomicWrite(db, "test.seedPreviousResult", (tx) =>
+				runtimePublication.persistResult(
+					{ ...run, logicalRunId: "previous-notice-run" },
+					"OLD RESULT",
+					tx,
+				),
+			);
 			try {
-				db.transaction((tx) => commitResumedBackgroundTaskAnnouncement(notice, result, tx));
+				const before = db.select().from(runtimePublicationOutbox).all();
+				expect(() =>
+					runAtomicWrite(db, "test.rollbackResumedAnnouncement", (tx) => {
+						expect(commitResumedBackgroundTaskAnnouncement(notice, result, tx)).toBeUndefined();
+						throw new Error("rollback resumed announcement");
+					}),
+				).toThrow("rollback resumed announcement");
+				expect(db.select().from(runtimePublicationOutbox).all()).toEqual(before);
+				expect(
+					runAtomicWrite(db, "test.commitResumedAnnouncement", (tx) =>
+						commitResumedBackgroundTaskAnnouncement(notice, result, tx),
+					),
+				).toBeUndefined();
 				await announceResumedBackgroundTask(notice);
 				runtimePublication.flushRecipient("notice-parent");
 				await announceResumedBackgroundTask(notice);
@@ -190,14 +306,48 @@ describe("the announcement is handed to the caller, not fired by the runner", ()
 					.where(eq(narratorBufferedMessages.narratorId, "notice-parent"))
 					.all();
 				expect(rows).toHaveLength(1);
-				expect(rows[0].text).not.toContain(result);
+				if (result) expect(rows[0].text).not.toContain(result);
 				const projected = projectPendingInjection(rows[0]);
 				expect(projected.kind).toBe("bg_agent");
 				if (projected.kind !== "bg_agent") throw new Error("Expected task notice projection");
-				expect(projected.task.result).toBeUndefined();
-				expect(projected.task.noticeText).toBe(rows[0].text);
+				const boundedResult = result.slice(0, 12000);
+				expect(projected.task.result).toBe(boundedResult);
+				expect(projected.task.resultTruncated).toBe(result.length > 12000);
 				expect(projected.task.resultMessageId).toBeTruthy();
-				expect(projected.task.resultPreview).not.toContain(result);
+				expect(backgroundAgentNoticePreview(projected.task, "zh-CN")).toBe(boundedResult);
+				const formatted = formatBackgroundCompletionNotifications([projected.task]);
+				expect(formatted).toContain(boundedResult || "(empty)");
+				if (result.length > 12000) {
+					expect(formatted).toContain("truncated");
+					expect(formatted).toContain("Await(");
+				}
+				expect(formatBackgroundCompletionNotifications([projected.task])).not.toContain(
+					"OLD RESULT",
+				);
+				const metadata = JSON.parse(rows[0].metadataJson ?? "{}");
+				expect(metadata.resultRef).not.toStartWith("conclusion:");
+				const legacy = projectPendingInjection({
+					...rows[0],
+					metadataJson: JSON.stringify({
+						...metadata,
+						resultRef: `conclusion:${metadata.resultRef}`,
+					}),
+				});
+				expect(legacy.kind).toBe("bg_agent");
+				if (legacy.kind === "bg_agent") expect(legacy.task.result).toBe(boundedResult);
+				const missing = projectPendingInjection({
+					...rows[0],
+					metadataJson: JSON.stringify({
+						...metadata,
+						resultRef: "conclusion:message:missing-result",
+					}),
+				});
+				if (missing.kind !== "bg_agent") throw new Error("Expected missing result projection");
+				expect(missing.task.result).toBeUndefined();
+				expect(formatBackgroundCompletionNotifications([missing.task])).toContain(
+					"could not load the result",
+				);
+				expect(formatBackgroundCompletionNotifications([missing.task])).toContain("Await(");
 				expect(wakes).toBe(status === "completed" ? 1 : 0);
 			} finally {
 				runtimePublication.setWake(undefined);

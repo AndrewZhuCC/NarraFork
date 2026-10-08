@@ -26,6 +26,7 @@ export interface UpdateCoordinationStatus {
 	phase: UpdatePhase;
 	scheduled: boolean;
 	targetVersion?: string;
+	operation?: "update" | "system_shutdown";
 	updateEpoch?: string;
 	pendingBackgroundBashCount: number;
 	pendingOrdinaryExecutionCount: number;
@@ -67,6 +68,8 @@ export interface PlannedUpdateRecoverySnapshot {
 	 * before the replacement was spawned, and on those written by older binaries.
 	 */
 	handoffMarkerNonce?: string;
+	/** Explicit one-shot authorization for a user-started process after system preparation. */
+	resumeOnNextStartup?: boolean;
 	/**
 	 * Written by a FAILED update attempt purely to preserve diagnostics.
 	 *
@@ -84,6 +87,8 @@ interface WritablePlannedUpdateRecoverySnapshot {
 	targetVersion?: string;
 	capturedAt: string;
 	handoffMarkerNonce?: string;
+	/** Explicit one-shot authorization for a user-started process after system preparation. */
+	resumeOnNextStartup?: boolean;
 	evidenceOnly?: boolean;
 	narrators: NarratorRecoveryTarget[];
 }
@@ -107,9 +112,15 @@ export interface UpdateCheckpointActivityLease {
 	release(): void;
 }
 
+export interface NarratorResponseActivityLease extends UpdateCheckpointActivityLease {
+	/** Only the current request may be stopped; null protects text/tool output. */
+	setReasoningAbort(abort: (() => void) | null): void;
+}
+
 interface CoordinatorState {
 	phase: UpdatePhase;
 	targetVersion?: string;
+	operation?: "update" | "system_shutdown";
 	updateEpoch?: string;
 	error?: string;
 	errorKind?: "failed" | "cancelled";
@@ -175,6 +186,7 @@ interface CheckpointActivityRecord {
 	toolUseId?: string;
 	updateEpoch?: string;
 	startedAt: number;
+	reasoningAbort?: (() => void) | null;
 }
 
 const UPDATE_DIR = getNarraforkPath("updates");
@@ -294,6 +306,7 @@ function resolveStatus(): UpdateCoordinationStatus {
 	return {
 		phase: state.phase,
 		scheduled: state.phase !== "idle",
+		operation: state.operation,
 		...(state.targetVersion ? { targetVersion: state.targetVersion } : {}),
 		...(state.updateEpoch ? { updateEpoch: state.updateEpoch } : {}),
 		pendingBackgroundBashCount,
@@ -532,8 +545,8 @@ function waitForCoordination(
 }
 
 /**
- * Track one provider response that may still produce tool rows. Phase two prevents new
- * responses from entering while allowing a response already in flight to reach persistence.
+ * Track one provider response that may still produce tool rows. Scheduled updates park
+ * new responses and stop reasoning-only requests; text/tool responses drain to persistence.
  *
  * A REFLECTION request is exempt, and must be: a reflection gate (danger / plan / task /
  * question) runs inside tool admission, so by the time it issues its request the parent
@@ -553,14 +566,28 @@ export async function beginNarratorResponseActivity(
 	narratorId: string,
 	signal?: AbortSignal,
 	options: { isReflection?: boolean } = {},
-): Promise<UpdateCheckpointActivityLease> {
+): Promise<NarratorResponseActivityLease> {
 	if (options.isReflection) {
-		return { token: generateToken("reflection_response"), release() {} };
+		return { token: generateToken("reflection_response"), release() {}, setReasoningAbort() {} };
 	}
-	while (state.phase === "quiescing_tools" || state.phase === "restarting") {
+	while (state.phase !== "idle") {
 		await waitUntilUpdateGateOpens(signal);
 	}
-	return registerCheckpointActivity(responseActivities, "response", { narratorId });
+	const activity = registerCheckpointActivity(responseActivities, "response", { narratorId });
+	return {
+		...activity,
+		setReasoningAbort(abort) {
+			const record = responseActivities.get(activity.token);
+			if (!record) return;
+			record.reasoningAbort = abort;
+			if (state.phase !== "idle") abort?.();
+		},
+	};
+}
+
+/** Do not release the fence until the event consumer has removed this attempt's output. */
+function interruptReasoningResponses(): void {
+	for (const record of responseActivities.values()) record.reasoningAbort?.();
 }
 
 /** Track a rejected tool admission until its durable continuation row is stable. */
@@ -754,8 +781,12 @@ export function registerNarratorLoop(
 	};
 }
 
-export function scheduleUpdate(targetVersion?: string): UpdateCoordinationStatus {
+export function scheduleUpdate(
+	targetVersion?: string,
+	operation: "update" | "system_shutdown" = "update",
+): UpdateCoordinationStatus {
 	if (state.phase !== "idle") return resolveStatus();
+	state.operation = operation;
 	state.phase = "draining_background_bash";
 	state.targetVersion = targetVersion;
 	state.updateEpoch = generateUpdateEpoch();
@@ -763,6 +794,7 @@ export function scheduleUpdate(targetVersion?: string): UpdateCoordinationStatus
 	state.errorKind = undefined;
 	// A cancellation belongs to the epoch that was cancelled; never inherit it.
 	state.cancelRequestedEpoch = undefined;
+	interruptReasoningResponses();
 	logger.info("Update scheduled; draining background Bash executions", {
 		targetVersion,
 		updateEpoch: state.updateEpoch,
@@ -785,6 +817,7 @@ export async function waitForBackgroundBashDrain(): Promise<void> {
 export function beginQuiescingTools(): UpdateCoordinationStatus {
 	if (state.phase === "draining_background_bash") {
 		state.phase = "quiescing_tools";
+		interruptReasoningResponses();
 		logger.info("Background Bash drained; closing the checkpoint fence", {
 			updateEpoch: state.updateEpoch,
 			pendingOrdinaryExecutionCount: countExecutions("ordinary"),
@@ -848,6 +881,7 @@ export function failScheduledUpdate(
 	options: { cancelled?: boolean } = {},
 ): UpdateCoordinationStatus {
 	state.phase = "idle";
+	state.operation = undefined;
 	state.targetVersion = undefined;
 	state.updateEpoch = undefined;
 	state.cancelRequestedEpoch = undefined;
@@ -937,6 +971,7 @@ export function parsePlannedUpdateRecoverySnapshot(
 			? { handoffMarkerNonce: parsed.handoffMarkerNonce }
 			: {}),
 		...(parsed.evidenceOnly === true ? { evidenceOnly: true } : {}),
+		...(parsed.resumeOnNextStartup === true ? { resumeOnNextStartup: true } : {}),
 		narrators,
 	};
 }
@@ -1058,10 +1093,16 @@ export type RecoveryManifestRejection =
  * nonce there would silently drop the one legitimate resume during the upgrade that introduces it.
  */
 export function classifyRecoveryManifestOwnership(
-	snapshot: Pick<PlannedUpdateRecoverySnapshot, "handoffMarkerNonce" | "evidenceOnly">,
+	snapshot: Pick<
+		PlannedUpdateRecoverySnapshot,
+		"handoffMarkerNonce" | "evidenceOnly" | "resumeOnNextStartup"
+	>,
 	handoff: { markerNonce?: string } | null,
 ): { owned: true } | { owned: false; reason: RecoveryManifestRejection } {
 	if (snapshot.evidenceOnly) return { owned: false, reason: "evidence_only" };
+	if (snapshot.resumeOnNextStartup && !snapshot.handoffMarkerNonce && !handoff) {
+		return { owned: true };
+	}
 	if (!handoff) return { owned: false, reason: "not_a_replacement_process" };
 	if (!snapshot.handoffMarkerNonce) return { owned: true };
 	if (snapshot.handoffMarkerNonce !== handoff.markerNonce) {
@@ -1108,6 +1149,7 @@ export function resetUpdateCoordinationForTests(): void {
 	checkpointFenceWaiters = [];
 	for (const waiter of pending) waiter.resolve();
 	state.phase = "idle";
+	state.operation = undefined;
 	state.targetVersion = undefined;
 	state.updateEpoch = undefined;
 	state.error = undefined;

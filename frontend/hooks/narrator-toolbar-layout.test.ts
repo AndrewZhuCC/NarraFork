@@ -69,6 +69,27 @@ describe("mergeToolbarLayout", () => {
 		expect(flat.indexOf("lodlevel")).toBeLessThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
 	});
 
+	it("removes retired filemod while retaining saved zones and remaining order", () => {
+		const flat = ids(
+			mergeToolbarLayout({
+				items: [
+					{ id: "git" },
+					{ id: "filemod" },
+					{ id: NARRATOR_TOOLBAR_DIVIDER_ID },
+					{ id: "filetree" },
+					{ id: NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID },
+					{ id: "terminal" },
+				],
+			}),
+		);
+		expect(flat).not.toContain("filemod");
+		expect(flat[0]).toBe("git");
+		expect(flat.indexOf("filetree")).toBeGreaterThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
+		expect(flat.indexOf("terminal")).toBeGreaterThan(
+			flat.indexOf(NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID),
+		);
+	});
+
 	it("drops unknown ids rather than resurrecting a removed feature", () => {
 		const merged = mergeToolbarLayout({
 			items: [{ id: "git" }, { id: "mock-stream-debug" }, { id: NARRATOR_TOOLBAR_DIVIDER_ID }],
@@ -363,9 +384,11 @@ describe("partitionToolbar", () => {
 				entries: all,
 				hostCapabilities: ["drawer", "inline"],
 				visibleLimit: 2,
-				entryEnabled: (id) => id !== "tasks" && id !== "filemod",
+				entryEnabled: (id) => id !== "tasks",
 			});
-			expect(visible.map((d) => d.id)).toEqual(["details", "spec"]);
+			// filetree is drawer-capable since MobileToolPanelHost grew a tree drawer,
+			// so on this host it legitimately takes the first capped slot.
+			expect(visible.map((d) => d.id)).toEqual(["filetree", "details"]);
 		});
 
 		it("drops disabled entries from both lists on an uncapped host", () => {

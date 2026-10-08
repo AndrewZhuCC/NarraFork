@@ -1,7 +1,7 @@
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { and, asc, eq, isNotNull } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessages, narrators } from "../db/schema";
+import { backgroundTasks, narratorMessages, narrators } from "../db/schema";
 import {
 	freezeFileReferenceSnapshots,
 	getFileReferenceSnapshots,
@@ -15,7 +15,10 @@ import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getRuntimePublicationService } from "./agent-runtime/publication";
+import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { classifyRuntimeWriteError, runAtomicWrite } from "./agent-runtime/runtime-write";
+import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
@@ -24,6 +27,7 @@ import {
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
+import { establishSubagentExecutionSegment } from "./subagent-execution-boundary";
 import { consumeNextBufferedSubagentMessage, loadSubagentHistory } from "./subagent-executor";
 import {
 	claimManualOverride,
@@ -51,6 +55,12 @@ export type SubagentResumeIntent =
 export type SubagentResumeActor = "user" | "parent_agent";
 
 export interface ResumeSubagentInput {
+	/** Initiating call for this new execution, independent of the original result slot. */
+	toolCallBinding?: import("../lib/agent/types").ToolCallBinding;
+	bindingToolUseId?: string;
+	bindingNarratorId?: string;
+	/** Includes pre-continuation denied-tool I/O in the run's attribution window. */
+	fileChangeStartedAt?: string;
 	/** Trusted automatic-continuation identity, separate from message audit author. */
 	executionPrincipal?: import("./narrator-question-service").QuestionExecutionPrincipal;
 	/** Wake an already accepted mailbox head without creating a second user message. */
@@ -70,8 +80,8 @@ export interface ResumeSubagentInput {
 	editMessageId?: string;
 	editContent?: string;
 	/**
-	 * Roll back the file changes truncated by a `retry_last_input` resume; defaults
-	 * to true, which is what every retry did before this was expressible.
+	 * Roll back the file changes truncated by a `retry_last_input` resume only
+	 * when explicitly true; omitted or false preserves the workspace files.
 	 *
 	 * Distinct from `editRevertFiles`: an edit resume rewrites the intent to
 	 * `retry_last_input` after its own rollback has already run, and that second
@@ -181,8 +191,11 @@ function stripSubagentResultPrefix(output: string): string {
 }
 
 function extractPromptText(contentText: string | null | undefined): string {
-	const text = contentText?.trim() ?? "";
-	if (!text) throw new ValidationError("The last subagent user message has no text to retry");
+	const text = contentText ?? "";
+	if (!text.trim())
+		throw new ValidationError("The last subagent user message has no text to retry");
+	// Keep accepted bytes exact: sender/attachment projections match this packet,
+	// including leading whitespace and the separator before attached_files.
 	return text;
 }
 
@@ -213,16 +226,14 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				getFileReferenceSnapshots(lastUserMessage.contentJson),
 			),
 		);
-		// `skipRevert` must be forwarded, not defaulted. `deleteMessagesAfter` rolls the
-		// workspace back unless told otherwise, so omitting it here reverts files that
-		// the caller may have explicitly asked to keep — and a `regenerate_edited_message`
-		// resume arrives here having ALREADY performed (or deliberately skipped) exactly
-		// that rollback, so a second one is both unrequested and, once its own
-		// regeneration is live, liable to fail on the workspace-write guard.
+		// Retry truncates conversation history, not workspace files, unless rollback
+		// was explicitly requested. An edit resume arrives here having already
+		// performed (or deliberately skipped) its rollback and forces false to avoid
+		// an unrequested second rollback that may fail on the workspace-write guard.
 		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
 			input.subagentId,
 			lastUserMessage.id,
-			{ skipRevert: input.retryRevertFiles === false },
+			{ skipRevert: input.retryRevertFiles !== true },
 		);
 		if (deletedMessageIds.length > 0) {
 			broadcastToNarrator(input.subagentId, {
@@ -238,12 +249,24 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				});
 			}
 		}
-		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider, prompt);
+		const rebuilt = await loadSubagentHistory(
+			input.subagentId,
+			effectiveModel,
+			provider,
+			prompt,
+			narrator.cwd ?? undefined,
+		);
 		initialHistory = rebuilt.history;
 		initialTrailingToolResults = rebuilt.trailingToolResults;
 		persistPrompt = false;
 	} else if (input.intent === "continue_tool_results") {
-		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider);
+		const rebuilt = await loadSubagentHistory(
+			input.subagentId,
+			effectiveModel,
+			provider,
+			undefined,
+			narrator.cwd ?? undefined,
+		);
 		if (rebuilt.trailingToolResults.length > 0) {
 			prompt = "";
 			persistPrompt = false;
@@ -340,10 +363,15 @@ async function deliverCompletedResume(
 					) {
 						throw new ValidationError("Standalone worker creation binding has changed");
 					}
-					if (announcement)
-						runAtomicWrite(db, "subagent-resume.commitStandaloneAnnouncement", (tx) =>
-							commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
-						);
+					if (announcement) {
+						if (resolveRuntimeQueueBackend() === "postgres") {
+							await commitResumedBackgroundTaskAnnouncement(announcement, completionOutput);
+						} else {
+							runAtomicWrite(db, "subagent-resume.commitStandaloneAnnouncement", (tx) =>
+								commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
+							);
+						}
+					}
 					active.delivered = true;
 					activeResumeRuns.delete(subagentId);
 					return;
@@ -373,6 +401,7 @@ async function deliverCompletedResume(
 						originToolUseId,
 					);
 				}
+				const pgAnnouncement = announcement && resolveRuntimeQueueBackend() === "postgres";
 				await updateToolCallConclusion({
 					subagentId,
 					parentNarratorId: narrator.parentNarratorId as string,
@@ -382,10 +411,13 @@ async function deliverCompletedResume(
 					messageId: reference.messageId,
 					toolCallId: reference.toolCallId,
 					resultMessageId,
-					onPersist: announcement
-						? (tx) => commitResumedBackgroundTaskAnnouncement(announcement, finalText, tx)
-						: undefined,
+					onPersist:
+						announcement && !pgAnnouncement
+							? (tx) => commitResumedBackgroundTaskAnnouncement(announcement, finalText, tx)
+							: undefined,
 				});
+				// The conclusion hook is SQLite-only; PG owns its async publication transaction.
+				if (pgAnnouncement) await commitResumedBackgroundTaskAnnouncement(announcement, finalText);
 				active.delivered = true;
 				activeResumeRuns.delete(subagentId);
 			});
@@ -432,6 +464,44 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 }
 
 async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
+	let preContinuationRun: import("./agent-runtime/publication-outbox").PublicationRun | undefined;
+	let retryRunTransferred = false;
+	let retryWasBackground = false;
+	const settleFailedBackgroundRetry = async (error: string) => {
+		if (!retryWasBackground || !preContinuationRun) return;
+		const logicalRunId = preContinuationRun.logicalRunId;
+		const completedAt = new Date().toISOString();
+		const output = `Re-execution failed: ${error}`;
+		await db
+			.update(narrators)
+			.set({
+				backgroundStatus: "failed",
+				backgroundResult: output,
+				backgroundCompletedAt: completedAt,
+				updatedAt: completedAt,
+			})
+			.where(and(eq(narrators.id, input.subagentId), eq(narrators.logicalRunId, logicalRunId)));
+		await db
+			.update(backgroundTasks)
+			.set({
+				status: "failed",
+				output,
+				outputBytes: Buffer.byteLength(output),
+				outputTruncated: false,
+				completedAt,
+				updatedAt: completedAt,
+			})
+			.where(
+				and(
+					eq(backgroundTasks.id, input.subagentId),
+					eq(backgroundTasks.logicalRunId, logicalRunId),
+				),
+			);
+		backgroundTaskService.notifyDerivedStatusChanged(
+			preContinuationRun.recipientId,
+			input.subagentId,
+		);
+	};
 	input = {
 		...input,
 		fileReferences:
@@ -500,6 +570,12 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 			if (!input.retryToolUseId) {
 				throw new ValidationError("retryToolUseId is required to retry a denied tool");
 			}
+			// Admission must precede any run mutation. Once admitted, establish the run
+			// before prepareToolCallAttempt so both tool I/O and continuation share it.
+			const publication = getRuntimePublicationService();
+			const parentNarratorId = original.parentNarratorId;
+			let retryRun: typeof preContinuationRun;
+			const fileChangeStartedAt = new Date().toISOString();
 			const { reExecuteDeniedToolCall } = await import("./narrator-session");
 			const retried = await reExecuteDeniedToolCall(
 				input.subagentId,
@@ -507,9 +583,70 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				input.locale,
 				input.replyInUserLanguage ?? false,
 				input.createdBy,
-				{ autoContinue: false },
+				{
+					autoContinue: false,
+					onAdmitted: async () => {
+						retryRun = await publication.startAgentRun({
+							narratorId: input.subagentId,
+							parentNarratorId,
+						});
+						preContinuationRun = retryRun;
+						retryWasBackground = original.isBackground;
+						if (retryWasBackground) {
+							await db
+								.update(narrators)
+								.set({
+									backgroundStatus: "running",
+									backgroundResult: null,
+									backgroundCompletedAt: null,
+									turnStartedAt: fileChangeStartedAt,
+									updatedAt: fileChangeStartedAt,
+								})
+								.where(
+									and(
+										eq(narrators.id, input.subagentId),
+										eq(narrators.logicalRunId, retryRun.logicalRunId),
+									),
+								);
+							await db
+								.update(backgroundTasks)
+								.set({
+									status: "running",
+									output: null,
+									outputBytes: 0,
+									outputTruncated: false,
+									notified: false,
+									completedAt: null,
+									startedAt: fileChangeStartedAt,
+									updatedAt: fileChangeStartedAt,
+								})
+								.where(
+									and(
+										eq(backgroundTasks.id, input.subagentId),
+										eq(backgroundTasks.logicalRunId, retryRun.logicalRunId),
+									),
+								);
+							backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, input.subagentId);
+						}
+						await establishSubagentExecutionSegment({
+							childNarratorId: input.subagentId,
+							parentNarratorId,
+							logicalRunId: retryRun.logicalRunId,
+							toolUseId: input.bindingToolUseId ?? originToolUseId,
+							binding: input.toolCallBinding,
+							bindingNarratorId: input.bindingNarratorId,
+						});
+					},
+				},
 			);
 			if (!retried.ok || !retried.shouldContinue) {
+				if (retryRun) {
+					await settleFailedBackgroundRetry(
+						retried.ok ? (retried.errorMessage ?? "Retry did not continue") : retried.reason,
+					);
+					await publication.releaseUnusedRunSlots(retryRun);
+					preContinuationRun = undefined;
+				}
 				return {
 					started: false,
 					resumedSuspendedRunner: false,
@@ -517,7 +654,13 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					...(!retried.ok ? { retryDeniedReason: retried.reason } : {}),
 				};
 			}
-			effectiveInput = { ...input, intent: "continue_tool_results" };
+			if (!retryRun) throw new Error("Retry continuation has no admitted logical run");
+			effectiveInput = {
+				...input,
+				intent: "continue_tool_results",
+				resumeLogicalRunId: retryRun.logicalRunId,
+				fileChangeStartedAt,
+			};
 		}
 		if (effectiveInput.intent === "regenerate_edited_message") {
 			if (!effectiveInput.editMessageId || effectiveInput.editContent === undefined) {
@@ -686,6 +829,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 								prepared.effectiveModel,
 								prepared.provider,
 								currentInput,
+								prepared.narrator.cwd ?? undefined,
 							);
 
 				const runtime = getManualOverrideRuntime(input.subagentId);
@@ -742,6 +886,10 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 		try {
 			const started = await startContinuedSubagent({
 				newUserInput,
+				toolCallBinding: input.toolCallBinding,
+				bindingToolUseId: input.bindingToolUseId,
+				bindingNarratorId: input.bindingNarratorId,
+				fileChangeStartedAt: effectiveInput.fileChangeStartedAt,
 				deferPublicationRelease: true,
 				subagentId: input.subagentId,
 				parentNarratorId: original.parentNarratorId,
@@ -770,11 +918,12 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				// Forwarded so the resumed-task notice knows whether the tool result below
 				// will be rewritten (i.e. whether the parent already has the output).
 				skipConclusionDelivery: input.skipConclusionDelivery,
-				resumeLogicalRunId: input.resumeLogicalRunId,
+				resumeLogicalRunId: effectiveInput.resumeLogicalRunId,
 				timeoutMs: input.timeoutMs,
 				executionDeadlineAt: input.executionDeadlineAt,
 				executionTimeoutMs: input.executionTimeoutMs,
 			});
+			retryRunTransferred = true;
 			const active = activeResumeRuns.get(input.subagentId);
 			if (active?.token === token && active.publicationClaimId === publicationClaimId) {
 				active.runId = started.runId;
@@ -800,10 +949,15 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 						await withSubagentResumeLock(input.subagentId, async () => {
 							const active = activeResumeRuns.get(input.subagentId);
 							if (active?.token === token && active.runId === started.runId) {
-								if (announcement)
-									runAtomicWrite(db, "subagent-resume.commitSkippedAnnouncement", (tx) =>
-										commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
-									);
+								if (announcement) {
+									if (resolveRuntimeQueueBackend() === "postgres") {
+										await commitResumedBackgroundTaskAnnouncement(announcement, output);
+									} else {
+										runAtomicWrite(db, "subagent-resume.commitSkippedAnnouncement", (tx) =>
+											commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
+										);
+									}
+								}
 								activeResumeRuns.delete(input.subagentId);
 							}
 						});
@@ -865,5 +1019,25 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 			await restoreTemporaryModel(input.subagentId).catch(() => {});
 			throw error;
 		}
+	}).catch(async (error) => {
+		if (preContinuationRun && !retryRunTransferred) {
+			await settleFailedBackgroundRetry(
+				error instanceof Error ? error.message : String(error),
+			).catch((settlementError) => {
+				logger.warn("Failed to settle pre-continuation background retry", {
+					subagentId: input.subagentId,
+					error: String(settlementError),
+				});
+			});
+			await getRuntimePublicationService()
+				.releaseUnusedRunSlots(preContinuationRun)
+				.catch((cleanupError) => {
+					logger.warn("Failed to release pre-continuation retry publication slots", {
+						subagentId: input.subagentId,
+						error: String(cleanupError),
+					});
+				});
+		}
+		throw error;
 	});
 }

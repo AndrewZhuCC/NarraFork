@@ -38,6 +38,7 @@ import {
 	ProviderInvalidStateError,
 } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
+import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	ChatParams,
@@ -56,6 +57,7 @@ import {
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
+import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -741,7 +743,8 @@ interface ToolAccumEntry {
 	outputIndex?: number;
 	id: string;
 	name: string;
-	args: string;
+	args?: string;
+	inputStream?: ToolInputStream;
 	emitted: boolean;
 }
 
@@ -877,7 +880,17 @@ export function getAnthropicEffectiveContextWindow(
 	model: string,
 	config: AnthropicProviderConfig,
 ): number | null {
-	const resolved = resolveModelContextWindow(parseModelId(model).model, config.prefix);
+	// Do NOT strip the first `:` segment here. For NUG delegates `model` is the
+	// full routed id (`<channel>:<model>`, e.g. antigravity:gemini-3.8-flash-high)
+	// and stripping would drop the channel, producing a lookup key
+	// (`gw:gemini-3.8-flash-high`) that matches neither the NUG cache nor the
+	// model catalog — everything silently falls back to the 272k default and the
+	// wrong value then overrides the correct top-level one in loop.ts. Direct
+	// Anthropic providers pass bare ids, where nothing is stripped anyway, and
+	// resolveModelContextWindow already handles a model that starts with
+	// `config.prefix`. Keeping the routed id also makes per-model user overrides
+	// and local bindings keyed on the full id resolve identically on both paths.
+	const resolved = resolveModelContextWindow(model, config.prefix);
 	// Official-API floor, but never above an explicit configuration. A per-model
 	// override typed in settings, or the provider's own defaultContextWindow, is
 	// a deliberate user decision (relays commonly cap far below 1M) — raising it
@@ -1855,6 +1868,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 		});
 
+		await reportInputCharacters(params, body);
 		const bodyStr = JSON.stringify(body);
 
 		params.onRequestStart?.();
@@ -2412,6 +2426,7 @@ async function collectWebSearchStream(
 	const textByIndex = new Map<number, string>();
 	const sources: Array<{ title?: string; url?: string }> = [];
 	const seenUrls = new Set<string>();
+	let hasSearchResultEvidence = false;
 	let stopReason: string | undefined;
 
 	const handleEvent = (event: AnthropicStreamEvent): void => {
@@ -2430,6 +2445,9 @@ async function collectWebSearchStream(
 				textByIndex.set(idx, block.text ?? "");
 			} else if (block.type === "web_search_tool_result") {
 				if (Array.isArray(block.content)) {
+					// A completed result block proves execution, even with zero matches.
+					// Neither assistant prose/URLs nor server_tool_use alone proves it.
+					hasSearchResultEvidence = true;
 					for (const row of block.content) {
 						if (row.url && seenUrls.has(row.url)) continue;
 						if (row.url) seenUrls.add(row.url);
@@ -2484,15 +2502,17 @@ async function collectWebSearchStream(
 		.map(([, value]) => value)
 		.join("\n")
 		.trim();
-	if (!text && sources.length === 0) {
-		// An empty stream is a failed search, not an empty answer: report it as a
-		// channel error so the fallback chain runs. max_tokens here means the
-		// budget was exhausted before any text block appeared.
+	if (!hasSearchResultEvidence && !text && sources.length === 0) {
+		// No completed search and no content: preserve the upstream stop reason
+		// for diagnosis. A genuine empty result block is still a valid search.
 		throw new Error(
 			stopReason && stopReason !== "end_turn"
 				? `Anthropic web search returned no content (stop_reason: ${stopReason})`
 				: "Anthropic web search returned no content",
 		);
+	}
+	if (!hasSearchResultEvidence) {
+		throw new Error("Anthropic web search returned no search result evidence");
 	}
 	return { text, sources };
 }
@@ -2657,16 +2677,6 @@ export async function* parseAnthropicSSEStream(
 	}
 }
 
-/** Try to parse a string as JSON. Returns true if valid. */
-function isParsableJson(s: string): boolean {
-	try {
-		JSON.parse(s);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /** Accumulator for thinking block signature (keyed by content_block index). */
 type ThinkingAccumEntry = { signature: string; blockIndex: number };
 
@@ -2788,7 +2798,7 @@ export function parseAnthropicEvent(
 			toolAccum.set(idx, {
 				id: block.id,
 				name: block.name,
-				args: "",
+				inputStream: new ToolInputStream(),
 				emitted: false,
 				outputIndex: idx,
 			});
@@ -2940,7 +2950,7 @@ export function parseAnthropicEvent(
 
 			const acc = toolAccum.get(idx);
 			if (acc && !acc.emitted) {
-				acc.args += event.delta.partial_json;
+				toolInputStreamFor(acc).feed(event.delta.partial_json);
 				const results: ParsedStreamEvent[] = [
 					{
 						toolUseChunk: {
@@ -2953,7 +2963,7 @@ export function parseAnthropicEvent(
 					},
 				];
 				// Early completion if args form valid JSON
-				if (isParsableJson(acc.args)) {
+				if (toolInputStreamFor(acc).hasCompleteInput()) {
 					results.push({
 						toolUseChunk: {
 							toolUseId: acc.id,

@@ -41,6 +41,7 @@ const WORK_INDICATOR_FLAGS = [
 
 function workIndicatorInput(overrides: Partial<WorkIndicatorInput> = {}): WorkIndicatorInput {
 	return {
+		isReflecting: false,
 		isRetrying: false,
 		isBlockingCompacting: false,
 		isBackgroundCompacting: false,
@@ -68,6 +69,24 @@ function allWorkIndicatorInputs(): WorkIndicatorInput[] {
 }
 
 describe("planNarratorWorkIndicator", () => {
+	test("reflection takes precedence over waiting and task summaries", () => {
+		expect(
+			planNarratorWorkIndicator(
+				workIndicatorInput({
+					isReflecting: true,
+					isWaiting: true,
+					hasSpecTask: true,
+				}),
+			).primary,
+		).toBe("reflecting");
+		const display = getNarratorStatusBarDisplay({
+			panelNarratorId: "n",
+			narrator: { id: "n", status: "waiting" },
+			liveSubstatus: ["reflecting"],
+		});
+		expect(display.labelKey).toBe("status_reflecting");
+		expect(display.color).toBe("indigo");
+	});
 	test("a plain background compaction is reported once, in the primary slot", () => {
 		// The regression: the primary label already says "compacting in background",
 		// so appending the short suffix repeated both the phrase and the progress
@@ -224,6 +243,13 @@ describe("getNarratorStatusBarDisplay", () => {
 });
 
 describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
+	test("reflection icon and label have matching centered boxes", async () => {
+		const source = await statusBar();
+		expect(source).toContain('lh="14px"');
+		expect(source).toContain('justifyContent: "center"');
+		expect(source).toContain('alignItems: "center"');
+		expect(source).toContain("height: 14");
+	});
 	const statusBar = () =>
 		Bun.file(new URL("../interaction/NarratorInteractionStatusBar.tsx", import.meta.url)).text();
 	const turnElapsed = () =>
@@ -260,8 +286,8 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 		// arms its tooltip while the text is really cut off (a native title would not
 		// work on touch).
 		expect(source).toContain('import { TruncatedText } from "../../common/TruncatedText";');
-		expect(source).toContain(
-			'<TruncatedText size="xs" c="dimmed" text={t(workIndicator.statusBarDisplay.labelKey)} />',
+		expect(source).toMatch(
+			/<TruncatedText\b(?=[^>]*\bsize="xs")(?=[^>]*\bc="dimmed")(?=[^>]*\btext=\{t\(workIndicator\.statusBarDisplay\.labelKey\)\})[^>]*\/>/,
 		);
 		expect(source).toContain("text={quota.balance}");
 
@@ -273,6 +299,21 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 		);
 		expect(body).toContain("<TruncatedText");
 		expect(body).toMatch(/Popover\.Dropdown[\s\S]*\{text\}[\s\S]*\{startedAtLabel\}/);
+	});
+
+	test("desktop and compact toolbars both budget the reflection action", async () => {
+		const source = await statusBar();
+		// The behavioral/layout tests exercise the action and real toolbar. This
+		// module-boundary guard verifies that neither caller leaves it in clipped text.
+		expect(source).toContain("createPlanReflectionStatusAction({");
+		expect(source).not.toContain("<PlanReflectionStatusControl");
+		expect(source).toMatch(
+			/actions=\{\[\s*\.\.\.planReflectionActions,\s*\.\.\.\(mobile\.bottomActions\s*\?\?\s*\[\]\)\s*\]\}/,
+		);
+		expect(source).toMatch(
+			/actions=\{\[\s*\.\.\.planReflectionActions,\s*\.\.\.mobile\.actions\s*\]\}/,
+		);
+		expect(source.match(/measurementKey=\{statusToolbarMeasurementKey\}/g)).toHaveLength(2);
 	});
 
 	test("icon-only status actions expose stable accessible names", async () => {

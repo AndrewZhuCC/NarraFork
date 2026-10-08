@@ -74,6 +74,7 @@ import {
 	IconListCheck,
 	IconLoader2,
 	IconLock,
+	IconPlayerPause,
 	IconPlayerPlay,
 	IconPlayerStop,
 	type IconProps,
@@ -82,9 +83,15 @@ import {
 } from "@tabler/icons-react";
 import type { ComponentType, ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-status";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { resolveToolCallTiming } from "@shared/tool-display-duration";
+import { DocumentCodeBody } from "../../content/DocumentCodeBody";
+import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
+import { queueDocumentFind } from "../../content/document-find-intent";
+import { TokenFlowText } from "../../content/TokenLines";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
@@ -94,6 +101,7 @@ import {
 	DETAIL_BOX_PADDING_X,
 	DETAIL_BOX_PADDING_Y,
 	DETAIL_TOP_MARGIN,
+	detailBodyFont,
 	detailBodyFontSize,
 	detailContentLineHeight,
 	ENTRY_SNIPPET_MAX_LINES,
@@ -105,6 +113,7 @@ import {
 	HEADER_CELL_GAP,
 	headerRowHeight,
 	isRunningStatus,
+	META_BADGE_ROW,
 	type MeasuredToolBody,
 	type MeasuredToolCall,
 	type MeasuredToolCallGroup,
@@ -125,6 +134,7 @@ import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
 import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
+import { useDeferredInteractionMount } from "../vlist-interaction-admission-context";
 import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
@@ -133,7 +143,7 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
-import { TokenFlowText } from "./TokenLines";
+import { ShareFilePreview } from "./ShareFilePreview";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +159,8 @@ export interface ToolCallLabels {
 	remote?: string;
 	/** Header badge label for a call blocked by a user takeover of its subagent. */
 	takenOver?: string;
+	/** Header button that opens the session this call waits on (Await-agent). */
+	openSession?: string;
 	/**
 	 * Localized `_planFile` provenance template, e.g. `"Plan from {file}"`. The
 	 * measure layer only carries the raw path (shared/ has no i18n), so the
@@ -189,6 +201,7 @@ const DEFAULT_LABELS: Required<
 		| "output"
 		| "remote"
 		| "takenOver"
+		| "openSession"
 		| "planSource"
 		| "download"
 		| "copy"
@@ -201,6 +214,7 @@ const DEFAULT_LABELS: Required<
 	output: "Output",
 	remote: "remote",
 	takenOver: "Taken over by user",
+	openSession: "Open full session",
 	planSource: "Plan from {file}",
 	download: "Download",
 	copy: "Copy link",
@@ -264,6 +278,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	skill: "grape",
 	browser: "teal",
 	knowledge: "grape",
+	workspace: "gray",
 	generic: "gray",
 };
 
@@ -417,6 +432,8 @@ function InlineLines({
 // Header row.
 // ─────────────────────────────────────────────────────────────────────────────
 interface ToolHeaderRowProps {
+	queuedBehindUpstream?: boolean;
+	reflectionStatus?: string | null;
 	toolName: string;
 	summary: string;
 	category: ToolCategory;
@@ -453,6 +470,8 @@ interface ToolHeaderRowProps {
 }
 
 function ToolHeaderRow({
+	queuedBehindUpstream,
+	reflectionStatus,
 	toolName,
 	summary,
 	category,
@@ -476,6 +495,7 @@ function ToolHeaderRow({
 }: ToolHeaderRowProps) {
 	const color = CATEGORY_COLOR[category];
 	const statusColor = STATUS_COLOR[status];
+	const statusMark = resolveToolRowStatusMark(status, { reflectionStatus, queuedBehindUpstream });
 	const running = isRunningStatus(status);
 	return (
 		<Group
@@ -620,7 +640,11 @@ function ToolHeaderRow({
 						flexShrink: 0,
 					}}
 				>
-					<StatusGlyph status={status} color={statusColor} />
+					{statusMark != null ? (
+						<TraceRowStatusGlyph mark={statusMark} />
+					) : (
+						<StatusGlyph status={status} color={statusColor} />
+					)}
 				</span>
 				{/* Timing lives INSIDE the existing single header row (height-neutral):
 			    a live elapsed counter while running, else the final duration. The
@@ -768,6 +792,9 @@ export interface ToolTimingLabels {
 	/** Carries a literal `{duration}` placeholder. */
 	total: string;
 	permissionWait: string;
+	streaming?: string;
+	wait?: string;
+	executionSpan?: string;
 	execution: string;
 	/** Carries a literal `{time}` placeholder (aria-label / group tooltip). */
 	startedAt: string;
@@ -786,6 +813,9 @@ const DEFAULT_TIMING_LABELS: ToolTimingLabels = {
 	completed: "Execution completed",
 	total: "Total {duration}",
 	permissionWait: "Permission wait {duration}",
+	streaming: "Streaming duration: {duration}",
+	wait: "Waiting {duration}",
+	executionSpan: "Execution span (includes unmeasured waits) {duration}",
 	execution: "Execution {duration}",
 	startedAt: "Started at {time}",
 	timeoutSeconds: "Timeout (seconds)",
@@ -810,7 +840,9 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
 		timing.streamCompletedAt != null ||
 		timing.permissionStartedAt != null ||
 		timing.executionStartedAt != null ||
-		timing.completedAt != null
+		timing.completedAt != null ||
+		timing.fileChangeTiming != null ||
+		timing.execDurationMs != null
 	);
 }
 
@@ -821,33 +853,25 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
  * the chunked version readable:
  *   - the generic "Started" row is SUPPRESSED when it coincides with one of the
  *     named phases (otherwise every card shows the same timestamp twice), and
- *   - `completed` falls back through executionStarted + displayed duration, then
- *     earliest start + final duration, so a card whose completion stamp never
- *     persisted still closes out its timeline.
+ *   - completion stamps are never inferred from an attributed duration: it can
+ *     include streaming/waits and exclude preceding sibling execution. Summaries
+ *     use the same measured phases as the inspector without moving timestamps.
  */
 function ToolTimingBreakdown({
 	timing,
-	displayDurationMs,
 	labels,
 }: {
 	timing: ToolTimingStamps;
 	displayDurationMs?: number | null;
 	labels: ToolTimingLabels;
 }) {
-	const resolvedStart = earliestToolStartMs(timing);
 	const explicitCandidates = [timing.startedAt, timing.createdAt].filter(
 		(value): value is number => value != null,
 	);
 	const explicitStarted = explicitCandidates.length > 0 ? Math.min(...explicitCandidates) : null;
 	const { streamStartedAt, streamCompletedAt, permissionStartedAt, executionStartedAt } = timing;
-	const finalDurationMs = timing.durationMs ?? displayDurationMs ?? null;
-	const completed =
-		timing.completedAt ??
-		(executionStartedAt != null && displayDurationMs != null
-			? executionStartedAt + displayDurationMs
-			: resolvedStart != null && finalDurationMs != null
-				? resolvedStart + finalDurationMs
-				: null);
+	const phases = resolveToolCallTiming(timing);
+	const completed = phases.completed;
 	const genericStarted =
 		explicitStarted != null &&
 		explicitStarted !== streamStartedAt &&
@@ -875,7 +899,13 @@ function ToolTimingBreakdown({
 		] as Array<{ key: string; label: string; time: number | null }>
 	).filter((step): step is { key: string; label: string; time: number } => step.time != null);
 
-	if (steps.length === 0) return null;
+	if (
+		steps.length === 0 &&
+		phases.totalMs == null &&
+		phases.executionMs == null &&
+		phases.waitMs == null
+	)
+		return null;
 
 	const precise = (ms: number) => formatDurationText(ms, { style: "precise" });
 
@@ -903,9 +933,23 @@ function ToolTimingBreakdown({
 					</Group>
 				);
 			})}
-			{resolvedStart != null && completed != null ? (
+			{phases.totalMs != null ? (
 				<Text size="xs" c="dimmed">
-					{fillLabel(labels.total, "duration", precise(Math.max(0, completed - resolvedStart)))}
+					{fillLabel(labels.total, "duration", precise(phases.totalMs))}
+				</Text>
+			) : null}
+			{phases.streamingMs != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(
+						labels.streaming ?? "Streaming duration: {duration}",
+						"duration",
+						precise(phases.streamingMs),
+					)}
+				</Text>
+			) : null}
+			{phases.waitMs != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(labels.wait ?? "Waiting {duration}", "duration", precise(phases.waitMs))}
 				</Text>
 			) : null}
 			{permissionStartedAt != null && executionStartedAt != null ? (
@@ -917,12 +961,14 @@ function ToolTimingBreakdown({
 					)}
 				</Text>
 			) : null}
-			{executionStartedAt != null && completed != null ? (
+			{phases.executionMs != null ? (
 				<Text size="xs" c="dimmed">
 					{fillLabel(
-						labels.execution,
+						phases.fileWaitMs != null
+							? labels.execution
+							: (labels.executionSpan ?? labels.execution),
 						"duration",
-						precise(Math.max(0, completed - executionStartedAt)),
+						precise(phases.executionMs),
 					)}
 				</Text>
 			) : null}
@@ -1030,9 +1076,45 @@ export function ToolTimingArea({
 	const [breakdownOpened, setBreakdownOpened] = useState(false);
 	const [editorOpened, setEditorOpened] = useState(false);
 	const pointerTypeRef = useRef<string | null>(null);
+	const triggerRef = useRef<HTMLButtonElement | null>(null);
 
 	const canEditTimeout = running && timeoutMs != null && onUpdateTimeout != null;
 	const showBreakdown = hasTimingDetails(timing);
+	const breakdownMount = useDeferredInteractionMount({
+		enabled: showBreakdown,
+		immediate: running || breakdownOpened || editorOpened,
+	});
+	const [breakdownPrimed, setBreakdownPrimed] = useState(showBreakdown && breakdownMount.ready);
+	useEffect(() => {
+		if (!showBreakdown || !breakdownMount.ready) {
+			setBreakdownPrimed(false);
+			return;
+		}
+		if (breakdownPrimed) return;
+		// Portal first mounts its closed Transition in a layout-effect update. Keep
+		// this cold request closed for one frame so first-open still fades in.
+		const frame = requestAnimationFrame(() => setBreakdownPrimed(true));
+		return () => cancelAnimationFrame(frame);
+	}, [showBreakdown, breakdownMount.ready, breakdownPrimed]);
+	useEffect(() => {
+		if (!breakdownOpened || breakdownPrimed) return;
+		// Mantine cannot dismiss an opened request while its cold Transition is still
+		// priming. Preserve Escape/outside cancellation during that single frame.
+		const outside = (event: Event) => {
+			if (!triggerRef.current?.contains(event.target as Node)) setBreakdownOpened(false);
+		};
+		const onPendingEscape = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setBreakdownOpened(false);
+		};
+		document.addEventListener("mousedown", outside);
+		document.addEventListener("touchstart", outside);
+		document.addEventListener("keydown", onPendingEscape, true);
+		return () => {
+			document.removeEventListener("mousedown", outside);
+			document.removeEventListener("touchstart", outside);
+			document.removeEventListener("keydown", onPendingEscape, true);
+		};
+	}, [breakdownOpened, breakdownPrimed]);
 
 	// A closed editor must not linger once the tool stops running.
 	useEffect(() => {
@@ -1066,8 +1148,10 @@ export function ToolTimingArea({
 
 	const trigger = (
 		<UnstyledButton
+			ref={triggerRef}
 			type="button"
 			aria-label={ariaLabel}
+			onFocus={breakdownMount.ensure}
 			style={{
 				display: "inline-flex",
 				alignItems: "center",
@@ -1080,15 +1164,21 @@ export function ToolTimingArea({
 			}}
 			onPointerDown={(event: React.PointerEvent) => {
 				event.stopPropagation();
+				breakdownMount.ensure();
 				pointerTypeRef.current = event.pointerType;
 			}}
 			onPointerCancel={(event: React.PointerEvent) => {
 				event.stopPropagation();
 				pointerTypeRef.current = null;
 			}}
-			onKeyDown={(event: React.KeyboardEvent) => event.stopPropagation()}
+			onKeyDown={(event: React.KeyboardEvent) => {
+				event.stopPropagation();
+				if (event.key === "Escape") setBreakdownOpened(false);
+				else breakdownMount.ensure();
+			}}
 			onClick={(event: React.MouseEvent) => {
 				event.stopPropagation();
+				breakdownMount.ensure();
 				const pointerType = pointerTypeRef.current;
 				pointerTypeRef.current = null;
 				if (pointerType === "mouse" && canEditTimeout) {
@@ -1105,7 +1195,7 @@ export function ToolTimingArea({
 
 	const withBreakdown = showBreakdown ? (
 		<Popover
-			opened={breakdownOpened}
+			opened={breakdownOpened && breakdownPrimed}
 			onChange={setBreakdownOpened}
 			position="top"
 			withArrow
@@ -1113,16 +1203,18 @@ export function ToolTimingArea({
 			shadow="md"
 		>
 			<Popover.Target>{trigger}</Popover.Target>
-			<Popover.Dropdown
-				onPointerDown={(event) => event.stopPropagation()}
-				onClick={(event) => event.stopPropagation()}
-			>
-				<ToolTimingBreakdown
-					timing={timing as ToolTimingStamps}
-					displayDurationMs={durationMs}
-					labels={merged}
-				/>
-			</Popover.Dropdown>
+			{breakdownMount.ready ? (
+				<Popover.Dropdown
+					onPointerDown={(event) => event.stopPropagation()}
+					onClick={(event) => event.stopPropagation()}
+				>
+					<ToolTimingBreakdown
+						timing={timing as ToolTimingStamps}
+						displayDurationMs={durationMs}
+						labels={merged}
+					/>
+				</Popover.Dropdown>
+			) : null}
 		</Popover>
 	) : (
 		trigger
@@ -1153,6 +1245,7 @@ function StatusGlyph({ status, color }: { status: ToolCallStatus; color: string 
 	const c = cssColor(color, 6);
 	switch (status) {
 		case "pending":
+			return <IconPlayerPause size={12} color={c} />;
 		case "running":
 		case "initializing":
 			return <IconLoader2 size={12} color={c} className="vlist-spin" />;
@@ -1462,6 +1555,7 @@ function DetailBlocks({
 	height,
 	labels,
 	narratorId,
+	openSession,
 	specTasksLive,
 }: {
 	kind: MeasuredToolBody["kind"];
@@ -1471,6 +1565,12 @@ function DetailBlocks({
 	height: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	/**
+	 * "Open full session" affordance for a call waiting on a subagent
+	 * (Await-agent / single-target Send). Painted on the FIRST badges row — the
+	 * meta header — where the call's type/target/timeout chips already live.
+	 */
+	openSession?: { onOpen: () => void; label: string };
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
 }) {
@@ -1479,6 +1579,11 @@ function DetailBlocks({
 	const color = kind === "error" ? "var(--mantine-color-red-text)" : undefined;
 	const isSpecTasks = kind === "spec-tasks";
 	const isError = kind === "error";
+	// The open-session button rides the FIRST badges row (the meta header), so a
+	// card whose detail has several badge rows paints it exactly once.
+	const openSessionIndex = openSession
+		? blocks.findIndex((b) => b.kind === "fixed" && b.tag === "detail-meta-badges")
+		: -1;
 	return (
 		<div style={{ position: "relative", width: availableWidth, height }}>
 			{blocks.map((block, index) => {
@@ -1586,6 +1691,35 @@ function DetailBlocks({
 										{b.label}
 									</Badge>
 								))}
+								{/* "Open full session" rides the meta header's badges row (the
+							    card's second line). The row is measured at META_BADGE_ROW
+							    (16px) and its box is overflow-hidden, so the button resets
+							    the compact-xs root's fixed 22px height to fit the same
+							    lane as the size-xs badges beside it — nothing here can
+							    move the measured geometry. */}
+								{openSession && index === openSessionIndex ? (
+									<Button
+										data-testid="tool-open-session"
+										size="compact-xs"
+										variant="subtle"
+										styles={{
+											root: {
+												height: "auto",
+												minHeight: 0,
+												padding: "0 6px",
+												fontSize: typographyMetrics().size.xs,
+												lineHeight: `${META_BADGE_ROW - 2}px`,
+												flexShrink: 0,
+											},
+										}}
+										onClick={(e: React.MouseEvent) => {
+											e.stopPropagation();
+											openSession.onOpen();
+										}}
+									>
+										{openSession.label}
+									</Button>
+								) : null}
 							</Group>
 						) : null}
 						{progress ? <MetaProgress progress={progress} /> : null}
@@ -1726,6 +1860,7 @@ function DetailRegion({
 	availableWidth,
 	labels,
 	narratorId,
+	openSession,
 	viewTargets,
 	viewControls,
 	specTasksLive,
@@ -1734,6 +1869,8 @@ function DetailRegion({
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	/** "Open full session" affordance for an Await-agent card's badges row. */
+	openSession?: { onOpen: () => void; label: string };
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
@@ -1770,6 +1907,7 @@ function DetailRegion({
 							measured={section.measuredBody}
 							labels={labels}
 							narratorId={narratorId}
+							openSession={openSession}
 							viewTarget={
 								section.measuredBody.model.kind === "capped"
 									? findViewTarget(viewTargets, section.measuredBody.model.source)
@@ -1790,6 +1928,7 @@ export function RenderToolBody({
 	measured,
 	labels = DEFAULT_LABELS,
 	narratorId,
+	openSession,
 	viewTarget,
 	viewControls,
 	specTasksLive,
@@ -1797,11 +1936,25 @@ export function RenderToolBody({
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
 	narratorId?: string;
+	/** "Open full session" affordance for an Await-agent card's badges row. */
+	openSession?: { onOpen: () => void; label: string };
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
 }) {
 	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
+	// The content-view host can update independently of the body. Keep its
+	// Markdown input stable instead of manufacturing a fresh wrapper each time.
+	const markdownMeasured = useMemo(
+		() => ({
+			height: frame.contentHeight,
+			blocks,
+			frame,
+			contentWidth,
+			usedWidth: frame.usedWidth,
+		}),
+		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
+	);
 	if (model.kind === "ask")
 		return (
 			<AskDetailBlocks
@@ -1820,11 +1973,22 @@ export function RenderToolBody({
 				availableWidth={contentWidth}
 				height={height}
 				labels={labels}
+				openSession={openSession}
 				specTasksLive={specTasksLive}
 			/>
 		);
 	if (model.format === "media") {
 		const block = blocks[0];
+		if (model.sharePreview) {
+			const box = block?.kind === "fixed" ? readExactDisplayBox(block.data) : null;
+			return (
+				<ShareFilePreview
+					preview={model.sharePreview}
+					height={height}
+					displayWidth={box?.displayWidth}
+				/>
+			);
+		}
 		return model.media ? (
 			<VListImage
 				media={model.media}
@@ -1846,12 +2010,32 @@ export function RenderToolBody({
 			{(onReaderProgress) => (
 				<AutoFollowScroll
 					bodyId={model.id}
+					onKeyDown={(event) => {
+						if (
+							!model.textDocumentSource ||
+							!(event.ctrlKey || event.metaKey) ||
+							event.altKey ||
+							event.shiftKey ||
+							event.key.toLowerCase() !== "f" ||
+							(event.target instanceof Element &&
+								event.target.closest("input,textarea,[contenteditable=true]"))
+						)
+							return;
+						event.preventDefault();
+						event.stopPropagation();
+						queueDocumentFind(model.textDocumentSource);
+						if (viewTarget) viewControls?.requestFullPayload?.(viewTarget);
+					}}
 					live={model.live}
 					revision={model.revision}
 					followTarget={model.followTarget.kind === "diff-row" ? "row" : "end"}
-					layout={model.format === "diff" ? { width: contentWidth, height } : undefined}
+					layout={
+						model.format === "diff" || model.textDocument
+							? { width: contentWidth, height }
+							: undefined
+					}
 					contentPadding={
-						model.format === "diff"
+						model.format === "diff" || model.textDocument
 							? { x: DETAIL_BOX_PADDING_X, y: DETAIL_BOX_PADDING_Y }
 							: undefined
 					}
@@ -1876,7 +2060,25 @@ export function RenderToolBody({
 							: { whiteSpace: "pre" }),
 					}}
 				>
-					{model.format === "diff" ? (
+					{model.textDocumentSource ? (
+						<DocumentSourceStatus
+							failed={model.textDocumentError}
+							onRetry={
+								viewTarget ? () => viewControls?.requestFullPayload?.(viewTarget) : undefined
+							}
+						/>
+					) : null}
+					{model.textDocument ? (
+						<DocumentCodeBody
+							document={model.textDocument}
+							language={resolveDetailLang(model)}
+							wordWrap={wordWrap}
+							font={detailBodyFont()}
+							fontRevision={typographyMetrics().revision}
+							lineHeight={detailContentLineHeight()}
+							letterSpacing={letterSpacingForFont(detailBodyFont())}
+						/>
+					) : model.format === "diff" ? (
 						<DiffContent
 							document={model.diffDocument}
 							language={resolveDetailLang(model)}
@@ -1903,15 +2105,7 @@ export function RenderToolBody({
 									{formatPlanSource(labels.planSource, model.sourcePath)}
 								</Text>
 							) : null}
-							<RenderMarkdown
-								measured={{
-									height: frame.contentHeight,
-									blocks,
-									frame,
-									contentWidth,
-									usedWidth: frame.usedWidth,
-								}}
-							/>
+							<RenderMarkdown measured={markdownMeasured} />
 						</div>
 					) : model.customHighlight && !showSource ? (
 						<CustomHighlightedBody text={model.text ?? ""} kind={model.customHighlight} />
@@ -1939,6 +2133,12 @@ export interface RenderToolCallProps {
 	narratorId?: string;
 	/** Toggle expand/collapse (header click). */
 	onToggle?: () => void;
+	/**
+	 * Open the full session of the subagent this call waits on (an Await-agent
+	 * card whose target resolved, or a single-target Send). Same affordance as
+	 * the subagent card's in-card button; absent → no button.
+	 */
+	onOpenSession?: () => void;
 	/**
 	 * Terminate the running tool. Supplied by the integration layer for bash / MCP
 	 * cards (the chunked header's InlineTerminateControl equivalent).
@@ -2145,6 +2345,7 @@ export function RenderToolCall({
 	icon,
 	narratorId,
 	onToggle,
+	onOpenSession,
 	onTerminate,
 	onUpdateTimeout,
 	onPermissionAllow,
@@ -2230,6 +2431,8 @@ export function RenderToolCall({
 	const body = (
 		<>
 			<ToolHeaderRow
+				queuedBehindUpstream={queuedBehindUpstream}
+				reflectionStatus={reflection?.status}
 				toolName={measured.toolName}
 				summary={measured.summary}
 				category={category}
@@ -2261,6 +2464,12 @@ export function RenderToolCall({
 							availableWidth={contentWidth}
 							labels={merged}
 							narratorId={narratorId}
+							// The "open full session" button lives on the badges row of the
+							// card's meta header (the second line), not the toggleable header
+							// row — see DetailBlocks.
+							openSession={
+								onOpenSession ? { onOpen: onOpenSession, label: merged.openSession } : undefined
+							}
 							viewTargets={viewTargets}
 							viewControls={viewControls}
 							specTasksLive={specTasksLive}

@@ -11,6 +11,7 @@ import type {
 	ReasoningProviderMetadata,
 	WebSearchAction,
 } from "@shared/agent-protocol/types";
+import type { ContextInputCharacters } from "@shared/context-usage";
 import { catalogError } from "../errors";
 import {
 	FOLLOW_DEFAULT_MODEL,
@@ -104,6 +105,8 @@ export interface ChatParams extends ProtocolChatParams {
 	reflectionParentTools?: unknown[];
 	/** Execution ceiling when reflection inherits the complete parent tool declarations. */
 	reflectionAllowedTools?: readonly string[];
+	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
+	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
 
 export interface GenerateOptions {

@@ -7,6 +7,7 @@ import {
 	type SourceTextSnapshot,
 	safeSourceSliceStart,
 } from "@shared/pretext-layout/source-text";
+import { copyStreamingEditInput } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { SubagentActivitySummary, TreeMessage } from "../../lib/api";
 import {
@@ -172,6 +173,8 @@ export function getStreamingFieldPreview(value: string): string {
  * a real tool-call card with the resolved input/status/output.
  */
 export interface TopLevelStreamingChunk {
+	/** Full Write content lives in the document store, never this hot model. */
+	textDocument?: import("@shared/pretext-layout/text-document").TextDocumentRef;
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
@@ -230,11 +233,25 @@ export function foldStreamingToolFields(
 		inputCharsTotal: number;
 		extractedFields?: Record<string, string>;
 		streamingField?: { name: string; delta: string; startsField?: boolean };
+		inputDocument?: import("@shared/pretext-layout/text-document").TextDocumentStreamUpdate;
 	},
 ): Pick<
 	TopLevelStreamingChunk,
 	"streamingFieldName" | "streamingFieldValue" | "streamingFieldRanges" | "extractedFields"
 > {
+	// Descriptor-backed Write.content never enters the legacy 16k tail accumulator.
+	if (event.inputDocument || previous?.textDocument) {
+		const fields = { ...previous?.extractedFields, ...event.extractedFields };
+		delete fields.content;
+		const name = event.streamingField?.name;
+		if (!name || name === "content")
+			return {
+				extractedFields: fields,
+				streamingFieldName: "content",
+				streamingFieldValue:
+					event.inputDocument?.ref.preview ?? previous?.textDocument?.preview ?? "",
+			};
+	}
 	const fields = { ...previous?.extractedFields };
 	const ranges = { ...previous?.streamingFieldRanges };
 	let name = previous?.streamingFieldName;
@@ -313,9 +330,17 @@ export function completeStreamingFieldRanges(
 
 function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unknown> {
 	const ranges = chunk.streamingFieldRanges
-		? { _streamingFieldRanges: chunk.streamingFieldRanges }
-		: {};
-	if (chunk._input) return { ...chunk._input, ...ranges };
+		? {
+				_streamingFieldRanges: chunk.streamingFieldRanges,
+				...(chunk.textDocument ? { textDocument: chunk.textDocument } : {}),
+			}
+		: chunk.textDocument
+			? { textDocument: chunk.textDocument }
+			: {};
+	if (chunk._input) {
+		// Validated once on started/updatedInput; rendering never re-hashes old_string.
+		return copyStreamingEditInput(chunk._input, ranges);
+	}
 	return {
 		_streamingChars: chunk.inputCharsTotal,
 		...(chunk.extractedFilePath ? { _streamingFilePath: chunk.extractedFilePath } : {}),
@@ -343,7 +368,16 @@ function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unkn
 export function topLevelStreamingChunkToToolFields(
 	chunk: TopLevelStreamingChunk,
 ): Record<string, unknown> {
+	// Edit preview origins belong to input._streamingMetadata. Promoting them to
+	// result metadata would bypass target validation and shadow the actual result.
+	const metadata = chunk._metadata ?? (chunk.toolName === "Edit" ? undefined : chunk.metadata);
 	const receipts = {
+		...(chunk.textDocument?.source?.toolCallId
+			? { tcId: chunk.textDocument.source.toolCallId }
+			: {}),
+		...(chunk.textDocument?.source?.executionAttempt !== undefined
+			? { executionAttempt: chunk.textDocument.source.executionAttempt }
+			: {}),
 		...(chunk._sendDeliveryTargets ? { _sendDeliveryTargets: chunk._sendDeliveryTargets } : {}),
 		...(chunk._sendDeliveryTargetCount !== undefined
 			? { _sendDeliveryTargetCount: chunk._sendDeliveryTargetCount }
@@ -370,9 +404,7 @@ export function topLevelStreamingChunkToToolFields(
 			...(chunk._startedAt != null ? { startedAt: chunk._startedAt } : {}),
 			...(chunk._output !== undefined ? { outputJson: chunk._output } : {}),
 			...(chunk._durationMs != null ? { durationMs: chunk._durationMs } : {}),
-			...((chunk._metadata ?? chunk.metadata)
-				? { _metadata: chunk._metadata ?? chunk.metadata }
-				: {}),
+			...(metadata ? { _metadata: metadata } : {}),
 			...(chunk._longRunning ? { _longRunning: true } : {}),
 			...(chunk._streamedFullOutput ? { _streamedFullOutput: true } : {}),
 			_streamingOutput: chunk._streamingOutput,
@@ -383,7 +415,7 @@ export function topLevelStreamingChunkToToolFields(
 	return {
 		...receipts,
 		inputJson: streamingChunkInput(chunk),
-		...(chunk.metadata ? { _metadata: chunk.metadata } : {}),
+		...(chunk.metadata && chunk.toolName !== "Edit" ? { _metadata: chunk.metadata } : {}),
 	};
 }
 
@@ -432,12 +464,49 @@ function recordMatchesToolFields(
 	return true;
 }
 
+/** Write document attempts carry a stronger identity than a reusable provider id. */
+function findStreamingChunkMessage(
+	messages: readonly TreeMessage[],
+	chunk: TopLevelStreamingChunk,
+): TreeMessage | undefined {
+	const source = chunk.textDocument?.source;
+	if (!chunk.textDocument)
+		return findMsgByToolUseIdInTree(messages as TreeMessage[], chunk.toolUseId) ?? undefined;
+	if (!source) return undefined;
+	for (const message of messages) {
+		if (message.narratorId === source.narratorId) {
+			const matches = (pk: unknown, attempt: unknown) =>
+				source.toolCallId
+					? pk === source.toolCallId
+					: source.messageId
+						? message.id === source.messageId &&
+							(source.executionAttempt === undefined || attempt === source.executionAttempt)
+						: source.executionAttempt !== undefined && attempt === source.executionAttempt;
+			if (
+				(message.toolCalls ?? []).some(
+					(call) => call.toolUseId === chunk.toolUseId && matches(call.id, call.executionAttempt),
+				) ||
+				message.contentJson.some(
+					(block) =>
+						block.type === "tool_use" &&
+						block.id === chunk.toolUseId &&
+						matches(block.tcId, block.executionAttempt),
+				)
+			)
+				return message;
+		}
+		const child = findStreamingChunkMessage(message.children ?? [], chunk);
+		if (child) return child;
+	}
+	return undefined;
+}
+
 /** Return whether both persisted representations already contain the live chunk fields. */
 export function topLevelStreamingChunkMatchesPersistedTool(
 	messages: TreeMessage[],
 	chunk: TopLevelStreamingChunk,
 ): boolean {
-	const message = findMsgByToolUseIdInTree(messages, chunk.toolUseId);
+	const message = findStreamingChunkMessage(messages, chunk);
 	if (!message) return false;
 	const records: Array<Record<string, unknown>> = [];
 	for (const toolCall of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
@@ -468,7 +537,7 @@ export function splitTopLevelStreamingChunksByPersistedToolUse(
 	const matched: TopLevelStreamingChunk[] = [];
 	const unmatched: TopLevelStreamingChunk[] = [];
 	for (const chunk of chunks) {
-		if (findMsgByToolUseIdInTree(messages, chunk.toolUseId)) matched.push(chunk);
+		if (findStreamingChunkMessage(messages, chunk)) matched.push(chunk);
 		else unmatched.push(chunk);
 	}
 	return { matched, unmatched };
@@ -479,7 +548,9 @@ export function getSyntheticTopLevelStreamingChunks(
 	messages: NarratorMsg[],
 	reconciledToolUseIds: ReadonlySet<string>,
 ): TopLevelStreamingChunk[] {
-	const candidates = chunks.filter((chunk) => !reconciledToolUseIds.has(chunk.toolUseId));
+	const candidates = chunks.filter(
+		(chunk) => chunk.textDocument || !reconciledToolUseIds.has(chunk.toolUseId),
+	);
 	return splitTopLevelStreamingChunksByPersistedToolUse(candidates, messages).unmatched;
 }
 
@@ -522,8 +593,8 @@ export function buildTopLevelStreamingChunksMsg(
 					...(chunk._startedAt && { startedAt: chunk._startedAt }),
 					...(chunk._output !== undefined && { outputJson: chunk._output }),
 					...(chunk._durationMs != null && { durationMs: chunk._durationMs }),
+					...(chunk.metadata && chunk.toolName !== "Edit" && { _metadata: chunk.metadata }),
 					...(chunk._metadata && { _metadata: chunk._metadata }),
-					...(chunk.metadata && { _metadata: chunk.metadata }),
 					...(chunk._longRunning && { _longRunning: true }),
 					...(chunk._streamedFullOutput && { _streamedFullOutput: true }),
 					...(chunk._streamingOutput && { _streamingOutput: chunk._streamingOutput }),
@@ -549,6 +620,26 @@ export function buildTopLevelStreamingChunksMsg(
 					_metadata: chunk.metadata,
 				} as (typeof toolCalls)[number];
 			}
+		}
+		if (chunk.textDocument?.source) {
+			const index = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+			if (index >= 0)
+				toolCalls[index] = {
+					...toolCalls[index],
+					...(chunk.textDocument.source.toolCallId
+						? { id: chunk.textDocument.source.toolCallId }
+						: {}),
+					...(chunk.textDocument.source.executionAttempt !== undefined
+						? { executionAttempt: chunk.textDocument.source.executionAttempt }
+						: {}),
+				};
+			for (const block of blocks)
+				if (block.type === "tool_use" && block.id === chunk.toolUseId) {
+					if (chunk.textDocument.source.toolCallId)
+						block.tcId = chunk.textDocument.source.toolCallId;
+					if (chunk.textDocument.source.executionAttempt !== undefined)
+						block.executionAttempt = chunk.textDocument.source.executionAttempt;
+				}
 		}
 		if (chunk._sendDeliveryTargets || chunk._sendDeliveryTargetCount !== undefined) {
 			const index = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);

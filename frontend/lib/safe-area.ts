@@ -15,6 +15,18 @@ export const SAFE_AREA_INSET_BOTTOM = `var(--app-safe-area-inset-bottom, ${PHYSI
  * also the no-JS fallback, so the two paths agree by construction.
  */
 export const APP_VIEWPORT_BOTTOM = "var(--app-viewport-bottom, 100dvh)";
+/**
+ * How much of the dynamic viewport the virtual keyboard occludes, in px.
+ *
+ * Companion to `--app-viewport-bottom`: that variable shrinks the shell to the
+ * visible bottom (the squeeze response), while this one carries the occluded
+ * height for surfaces that instead keep their pre-keyboard size and ride up
+ * over the keyboard (the push-up response — the director surface on narrow
+ * screens consumes it, via safe-area.css's gating rule; there is intentionally
+ * no JS consumer, so nothing imports this constant yet). Unset at rest — the
+ * `0px` fallback in the expression is what consumers resolve then.
+ */
+export const APP_KEYBOARD_OCCLUSION = "var(--app-keyboard-occlusion, 0px)";
 
 export const AUTHENTICATED_APP_SHELL_ATTRIBUTE = "data-nf-authenticated-app-shell";
 export const APP_SHELL_CLASSNAME = "nf-app-shell";
@@ -421,6 +433,11 @@ function supportsVirtualKeyboard(targetWindow: Window): boolean {
 function isStandaloneDisplay(targetWindow: Window): boolean {
 	if (targetWindow.matchMedia?.("(display-mode: standalone)").matches === true) return true;
 	if (targetWindow.matchMedia?.("(display-mode: fullscreen)").matches === true) return true;
+	// WCO is its own display-mode, not "standalone" — without this branch the
+	// tracker's standalone guarantee would silently drop out in the one installed
+	// mode we actually prefer on desktop.
+	if (targetWindow.matchMedia?.("(display-mode: window-controls-overlay)").matches === true)
+		return true;
 	// iOS Safari's non-standard flag, still the only signal in older home-screen apps.
 	return (targetWindow.navigator as { standalone?: boolean }).standalone === true;
 }
@@ -451,9 +468,10 @@ export function installAuthenticatedAppShellRootLock(
 }
 
 /**
- * Own the two root-level mobile layout variables for the whole AppShell.
- * Consumers only read SAFE_AREA_INSET_BOTTOM / APP_VIEWPORT_BOTTOM; no child
- * panel should separately subtract keyboard height or add Home Indicator space.
+ * Own the root-level mobile layout variables for the whole AppShell.
+ * Consumers read SAFE_AREA_INSET_BOTTOM / APP_VIEWPORT_BOTTOM (and the CSS
+ * gating rule reads the keyboard occlusion); no child panel should separately
+ * subtract keyboard height or add Home Indicator space.
  */
 export function installAppViewportTracking(
 	targetWindow: Window = window,
@@ -476,11 +494,11 @@ export function installAppViewportTracking(
 	const update = () => {
 		animationFrame = 0;
 		if (disposed) return;
-		// Measure the engine's viewport units with the override removed, otherwise a
-		// previously published `--app-viewport-bottom` would size `html` and make the
-		// probe report the old value back — a feedback loop that latches the keyboard
-		// height in place after the keyboard closes.
-		root.style.removeProperty("--app-viewport-bottom");
+		// The fixed probes declare dvh/lvh explicitly: they measure the viewport,
+		// not html's overridden height. Keep the current shell height during these
+		// synchronous layout reads. Removing it here temporarily expands the message
+		// viewport and clamps scrollTop; restoring the same height afterward cannot
+		// restore that position (and the scroll frame sees no height change).
 		const dynamicViewportHeight = measureViewportUnit("100dvh");
 		const largeViewportHeight = measureViewportUnit("100lvh");
 		// Measured the same way as the two viewport units so all three land in one
@@ -509,6 +527,13 @@ export function installAppViewportTracking(
 				"--app-viewport-bottom",
 				`${snapViewportBottomForPaint(state.viewportBottom)}px`,
 			);
+			// Same outward rounding as the shell height: the lift may overshoot by
+			// under a CSS pixel, never stop short and leave a sliver uncovered.
+			const occlusion = Math.max(0, dynamicViewportHeight - state.viewportBottom);
+			root.style.setProperty("--app-keyboard-occlusion", `${Math.ceil(occlusion)}px`);
+		} else {
+			root.style.removeProperty("--app-viewport-bottom");
+			root.style.removeProperty("--app-keyboard-occlusion");
 		}
 		// `env(safe-area-inset-bottom)` positions the home indicator against the
 		// physical screen. Publish it only when the visible viewport actually reaches
@@ -567,6 +592,7 @@ export function installAppViewportTracking(
 		for (const timer of settleTimers) targetWindow.clearTimeout(timer);
 		settleTimers.clear();
 		root.style.removeProperty("--app-viewport-bottom");
+		root.style.removeProperty("--app-keyboard-occlusion");
 		root.style.removeProperty("--app-safe-area-inset-bottom");
 		root.removeAttribute("data-virtual-keyboard-open");
 	};

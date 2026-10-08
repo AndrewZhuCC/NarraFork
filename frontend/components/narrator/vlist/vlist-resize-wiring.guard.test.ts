@@ -1,127 +1,270 @@
 /**
- * vlist-resize-wiring.guard.test.ts — Source-level guard on the resize handler.
- *
- * The behavioural test (`vlist-drag-freeze.test.tsx`) exercises a REPRODUCTION of
- * the handler, so it cannot notice if the real one drifts from it. That is exactly
- * how the height write escaped three rounds of fixes: every pure-function test
- * passed while the shell kept re-rendering 1601 DOM nodes per drag frame.
- *
- * So the wiring itself is asserted here: the height write must be gated, and the
- * gate must be the drag suppression.
+ * Production resize wiring: wrapping is frozen; exact viewport height stays live.
+ * Only initial/commit and non-pending height observations feed the full layout. Scheduler
+ * behaviour is tested against createVListResizeController in vlist-live-resize.test.ts,
+ * not a reproduction of the shell handler.
  */
-
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { shellModule } from "./guard-source";
-
-const SHELL = join(import.meta.dir, "PretextExactMessageList.tsx");
+import { readVlistFile, shellModule, shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 
 function shell(): string {
-	return readFileSync(SHELL, "utf8");
+	return shellModule("PretextExactMessageList.tsx");
 }
 
-/**
- * The row component's own module, which owns the memo comparator asserted on below.
- *
- * Read separately from the shell (rather than through the concatenated module set)
- * because the comparator is located by cutting from `const ExactRow = memo(` to the
- * next `\n);` — sentinels that a concatenated source could satisfy from a different
- * module, silently moving the window off its subject.
- */
+/** The memo comparator belongs to the row's own module, never a concatenated slice. */
 function row(): string {
 	return shellModule("ExactRow.tsx");
 }
 
-/**
- * The body of the width/height ResizeObserver effect.
- *
- * Anchored on the effect's FIRST statement (`const node = viewportNode;`) rather than
- * on the `settleTimer` declaration below it. Anchoring on the latter silently excluded
- * the lines above it, so the "node comes from state" assertion looked outside its own
- * subject and failed even though the wiring was correct.
- */
-function resizeEffect(source: string): string {
-	const start = source.indexOf("const node = viewportNode;");
-	expect(start).toBeGreaterThan(-1);
-	const end = source.indexOf("const hasTailFooter", start);
-	expect(end).toBeGreaterThan(start);
-	return source.slice(start, end);
+function region(source: string, anchor: string): string {
+	const result = sliceBracketedRegion(source, anchor);
+	if (result === null) throw new Error(`Production resize region not found: ${anchor}`);
+	return result;
 }
 
-describe("resize handler wiring", () => {
-	it("gates the viewport-height write behind the drag suppression", () => {
-		const effect = resizeEffect(shell());
-		// The ONLY per-frame height write must be guarded.
-		expect(effect).toMatch(/if\s*\(\s*!suppressHeightWrite\(\)\s*\)\s*setViewportHeight\(/);
-		// An unguarded per-frame write would re-render every mounted row.
-		expect(effect).not.toMatch(/^\s*setViewportHeight\(node\.clientHeight\);\s*$/m);
+/** Match the actual layout effect, including synchronous setup and cleanup. */
+function resizeEffect(source: string): string {
+	const start = source.lastIndexOf(
+		"useLayoutEffect(() => {",
+		source.indexOf("const node = viewportNode;"),
+	);
+	expect(start).toBeGreaterThan(-1);
+	const effect = region(source.slice(start), "useLayoutEffect(");
+	expect(effect).toContain("const node = viewportNode;");
+	return effect;
+}
+
+function resizeOptions(): string {
+	return region(resizeEffect(shell()), "createVListResizeController({");
+}
+
+describe("production resize handler wiring", () => {
+	it("publishes full-build height on initial/commit, never from a live preview", () => {
+		const options = resizeOptions();
+		for (const name of ["onInitial", "onCommit"]) {
+			const callback = region(options, `${name}: ({ width, height }) => {`);
+			expect(callback.match(/setLayoutHeight\s*\(/g)).toHaveLength(1);
+			expect(callback).toMatch(/setLayoutHeight\(height\)/);
+			expect(callback).toMatch(/setViewportHeight\(height\)/);
+			expect(callback).toMatch(/setContentWidth\(width\)/);
+		}
+		expect(options).toContain('previewPolicy: "freeze"');
+		expect(options).toMatch(/onPreview:\s*\(\)\s*=>\s*false/);
+		expect(options).not.toContain(".previewWidth(");
 	});
 
-	it("defines the suppression from BOTH the deferral and the live pointer", () => {
+	it("lets observer height reach the build only after controller.observe says not pending", () => {
+		const measure = region(resizeEffect(shell()), "const measure = () => {");
+		const idle = region(measure, "if (!controller.isPending()) {");
+		expect(idle).not.toMatch(/setViewportHeight/);
+		expect(idle).toMatch(/setLayoutHeight\(node\.clientHeight\)/);
+		expect(measure.replace(idle, "")).toMatch(/setViewportHeight\(node\.clientHeight\)/);
+		expect(measure.indexOf("controller.observe();")).toBeGreaterThan(-1);
+		expect(measure.indexOf("controller.observe();")).toBeLessThan(measure.indexOf(idle));
+		// Live viewport height is outside the gate; no full-layout writes may escape it.
+		expect(measure.replace(idle, "")).not.toMatch(/setLayoutHeight|setContentWidth/);
+	});
+
+	it("accounts for every exact-height and layout-height write across the production shell", () => {
+		const source = shellSource();
+		// Initial + commit + live observer. Only the idle observer updates layoutHeight.
+		expect(source.match(/setViewportHeight\s*\(/g)).toHaveLength(3);
+		expect(source.match(/setLayoutHeight\s*\(/g)).toHaveLength(3);
+	});
+
+	it("wires observer, synchronous initial measurement, release and disposal to the controller", () => {
 		const effect = resizeEffect(shell());
+		expect(shell()).toMatch(
+			/import\s*\{[^}]*createVListResizeController[^}]*\}\s*from\s*"\.\/vlist-live-resize"/,
+		);
+		expect(effect).toMatch(/createPointerDragTracker\(\(\)\s*=>\s*controller\.release\(\)\)/);
+		expect(effect).toContain("new ResizeObserver(measure)");
+		expect(effect).toContain("observer?.observe(node)");
+		const initialMeasure = effect.match(/^\s*measure\(\);\s*$/m);
+		expect(initialMeasure).not.toBeNull();
+		const initialMeasureIndex = initialMeasure?.index ?? -1;
+		expect(initialMeasureIndex).toBeGreaterThan(-1);
+		expect(initialMeasureIndex).toBeLessThan(effect.indexOf("new ResizeObserver(measure)"));
+		// The synchronous layout-effect path, not an rAF or 140ms timer, owns first paint.
+		const setup = effect.slice(0, initialMeasureIndex);
+		expect(setup).not.toMatch(/requestAnimationFrame|setTimeout/);
+		for (const cleanup of [
+			"observer?.disconnect()",
+			"pointerTracker.dispose()",
+			"controller.dispose()",
+		]) {
+			expect(effect).toContain(cleanup);
+		}
 		expect(effect).toMatch(
-			/const\s+suppressHeightWrite\s*=\s*\(\)\s*=>\s*deferred\s*&&\s*pointerTracker\.isDown\(\)/,
+			/if\s*\(resizeControllerRef\.current\s*===\s*controller\)\s*resizeControllerRef\.current\s*=\s*null/,
 		);
 	});
 
-	it("releases the withheld height inside the commit branch", () => {
-		const effect = resizeEffect(shell());
-		const commitIndex = effect.indexOf("if (decision.commit) {");
-		expect(commitIndex).toBeGreaterThan(-1);
-		const branch = effect.slice(commitIndex, effect.indexOf("return;", commitIndex));
-		expect(branch).toMatch(/if\s*\(\s*deferred\s*\)\s*setViewportHeight\(/);
-		expect(branch).toContain("setContentWidth(");
-	});
-
-	it("keeps exactly one height write per commit and one per observer frame", () => {
-		const effect = resizeEffect(shell());
-		const writes = effect.match(/setViewportHeight\(/g) ?? [];
-		// One in the commit branch, one (guarded) in the observer callback.
-		expect(writes.length).toBe(2);
-	});
-
-	it("guard self-check: the effect body is located and non-trivial", () => {
-		const effect = resizeEffect(shell());
-		expect(effect.length).toBeGreaterThan(500);
-		expect(effect).toContain("ResizeObserver");
-	});
-
-	// The observed node must be an effect DEPENDENCY, not a ref read at mount.
-	//
-	// `assignViewport` is rebuilt whenever the host's `scrollRef` prop changes
-	// identity (an inline arrow does that on every host render), and React answers a
-	// changed ref callback by detaching with null then re-attaching the node. An
-	// effect that merely read `viewportRef.current` does NOT re-run, so the observer
-	// keeps watching a node that is no longer in the document: no further callback
-	// arrives, the width freezes at the last committed value, and the pointer-release
-	// path re-reads the same stale node so `resolveWidthSettle` answers NO_ACTION.
-	//
-	// A source guard, because the failure is structural: every pure-function test and
-	// every "is the observer wired" assertion passes either way.
-	it("observes the viewport node as a dependency, not a mount-time ref read", () => {
+	it("reads current committed width, live document and live pointer rather than captured state", () => {
 		const source = shell();
-		const effect = resizeEffect(source);
-		// The node comes from state...
+		const options = resizeOptions();
+		expect(options).toMatch(/getCommittedWidth:\s*\(\)\s*=>\s*committedContentWidthRef\.current/);
+		expect(options).toMatch(/pointerDown:\s*\(\)\s*=>\s*pointerTracker\.isDown\(\)/);
+		expect(source).toMatch(/pretextDocumentRef\.current\s*=\s*pretextDocument\s*;/);
+		expect(options).toContain('previewPolicy: "freeze"');
+		expect(options).not.toContain(".previewWidth(");
+	});
+
+	it("uses an explicit commit epoch to finish a pending preview even at the starting width", () => {
+		const source = shell();
+		const commit = region(resizeOptions(), "onCommit: ({ width, height }) => {");
+		expect(source).toMatch(/\[widthCommitEpoch,\s*setWidthCommitEpoch\]\s*=\s*useState\(0\)/);
+		expect(commit).toMatch(/setWidthCommitEpoch\(\(epoch\)\s*=>\s*epoch\s*\+\s*1\)/);
+		expect(commit).not.toMatch(/\bif\s*\(/);
+		expect(region(source, "usePretextDocument(narratorId, {")).toContain("widthCommitEpoch,");
+		const hook = readVlistFile("usePretextDocument.ts");
+		expect(hook).toContain("const lastWidthCommitEpochRef = useRef(options.widthCommitEpoch)");
+		const finish = region(
+			hook,
+			"if (lastWidthCommitEpochRef.current !== options.widthCommitEpoch) {",
+		);
+		expect(finish).toContain("coordinator.finishResize(");
+		expect(finish).not.toMatch(/contentWidth\s*[!=]==?/);
+		const rebuildEffect = region(hook, "useEffect(");
+		expect(rebuildEffect).toContain(finish);
+		expect(rebuildEffect).toMatch(/^\s*options\.widthCommitEpoch,\s*$/m);
+		expect(rebuildEffect).toContain("lastWidthCommitEpochRef.current = options.widthCommitEpoch");
+	});
+
+	it("refreshes a semantic snapshot or scrolled window through the active controller", () => {
+		const source = shell();
+		expect(resizeEffect(source)).toContain("resizeControllerRef.current = controller");
+		const start = source.lastIndexOf(
+			"useLayoutEffect(() => {",
+			source.indexOf("void pretextDocument.resizeRevision;"),
+		);
+		expect(start).toBeGreaterThan(-1);
+		const refresh = region(source.slice(start), "useLayoutEffect(");
+		expect(refresh).toContain("resizeControllerRef.current?.refresh()");
+		expect(refresh).toMatch(/\[pretextDocument\.resizeRevision,\s*scrollTop\]/);
+		const scroll = region(source, "const processScrollFrame = useCallback(() => {");
+		expect(scroll).toContain("resizeControllerRef.current?.refresh()");
+		// Refresh reuses rAF preview, not observer evaluation that could rearm settling.
+		expect(readVlistFile("vlist-live-resize.ts")).toMatch(/refresh:\s*preview\b/);
+	});
+
+	it("uses each item's actual outer width for rows instead of the shared live preview width", () => {
+		const props = region(shell(), "const rowProps: ExactRowProps = {");
+		expect(props).toMatch(/contentWidth:\s*item\.contentWidth\s*\?\?\s*contentWidth\b/);
+		expect(props).not.toMatch(
+			/contentWidth:\s*(?:displayContentWidth|pretextDocument\.resizeWidth)/,
+		);
+		const preview = readVlistFile("vlist-resize-preview.ts");
+		expect(preview).toMatch(
+			/nextItems\[itemIndex\]\s*=\s*\{\s*spec,\s*measured,\s*contentWidth:\s*width\s*\}/,
+		);
+		expect(preview).toMatch(/item\.contentWidth\s*\?\?\s*input\.committedWidth/);
+	});
+
+	it("observes the viewport node as a dependency, not a mount-time ref read", () => {
+		const effect = resizeEffect(shell());
 		expect(effect).toMatch(/const\s+node\s*=\s*viewportNode\s*;/);
 		expect(effect).not.toMatch(/const\s+node\s*=\s*viewportRef\.current\s*;/);
-		// ...and the effect's dependency list names it, so a replaced node rebuilds
-		// the observer.
-		const depsIndex = source.indexOf("}, [viewportNode, centeredColumn]);");
-		expect(depsIndex).toBeGreaterThan(-1);
+		expect(effect).toMatch(
+			/\[viewportNode,\s*centeredColumn,\s*readViewportView,\s*writeScrollTop,\s*morphScrollOrigin\]/,
+		);
 	});
 
 	it("mirrors the viewport node into state from the ref callback", () => {
-		const source = shell();
-		const assign = source.slice(
-			source.indexOf("const assignViewport = useCallback("),
-			source.indexOf("const assignContent = useCallback("),
-		);
+		const assign = region(shell(), "const assignViewport = useCallback(");
 		expect(assign.length).toBeGreaterThan(100);
-		// Both writes: the ref (read synchronously by scroll handlers) and the state
-		// (the observer's dependency). Dropping either reopens the freeze.
 		expect(assign).toContain("viewportRef.current = node;");
 		expect(assign).toContain("setViewportNode(node);");
+	});
+
+	it("guard self-check: the actual resize layout effect includes options and observer", () => {
+		const effect = resizeEffect(shell());
+		expect(effect.length).toBeGreaterThan(500);
+		expect(effect).toContain("createVListResizeController({");
+		expect(effect).toContain("ResizeObserver");
+		expect(effect).toContain("onCommit:");
+	});
+});
+
+describe("production permission height reporting during frozen resize", () => {
+	function permissionReporterHarness() {
+		type Entry = { requestId: string; height: number; width: number };
+		let published = new Map<string, Entry>();
+		let writes = 0;
+		let refreshes = 0;
+		const state = {
+			pendingRequestIdByToolUseIdRef: { current: new Map([["tool", "request"]]) },
+			rowWidthsRef: { current: new Map([["row", 700]]) },
+			resizeFormHeightsRef: { current: new Map<string, Entry>() },
+			resizeDirtyKeysRef: { current: new Set<string>() },
+			resizeControllerRef: {
+				current: {
+					isPending: () => true,
+					refresh: () => {
+						refreshes++;
+					},
+				},
+			},
+			setPermissionFormHeights: (update: (prev: Map<string, Entry>) => Map<string, Entry>) => {
+				published = update(published);
+				writes++;
+			},
+		};
+		const callback = region(shell(), "const reportPermissionFormHeight = useCallback(");
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(`
+			const useCallback = (callback: unknown) => callback;
+			const { ${Object.keys(state).join(", ")} } = state;
+			${callback};
+			return reportPermissionFormHeight;
+		`);
+		const report = new Function("state", code)(state) as (
+			toolUseId: string,
+			height: number,
+			width: number,
+			rowKey: string,
+		) => void;
+		return {
+			state,
+			report,
+			get published() {
+				return published;
+			},
+			get writes() {
+				return writes;
+			},
+			get refreshes() {
+				return refreshes;
+			},
+		};
+	}
+
+	it("publishes changed form content at committed row width even while resize is pending", () => {
+		const h = permissionReporterHarness();
+		h.report("tool", 300.4, 700, "row");
+		expect(h.published.get("tool")).toEqual({ requestId: "request", height: 300, width: 700 });
+		h.report("tool", 340.4, 700, "row");
+		expect(h.published.get("tool")?.height).toBe(340);
+		expect(h.writes).toBe(2);
+		expect(h.refreshes).toBe(0);
+		expect(h.state.resizeDirtyKeysRef.current.size).toBe(0);
+	});
+
+	it("still rejects stale widths, missing requests and duplicate or invalid height reports", () => {
+		const h = permissionReporterHarness();
+		for (const height of [0, -1, Number.NaN, Number.POSITIVE_INFINITY])
+			h.report("tool", height, 700, "row");
+		h.report("missing-tool", 300, 700, "row");
+		h.report("tool", 300, 640, "row");
+		h.report("tool", 300, 700, "missing-row");
+		expect(h.writes).toBe(0);
+		h.report("tool", 300, 700, "row");
+		h.report("tool", 301, 700, "row");
+		expect(h.writes).toBe(1);
+		h.state.pendingRequestIdByToolUseIdRef.current.set("tool", "replacement");
+		h.report("tool", 300, 700, "row");
+		expect(h.writes).toBe(2);
+		expect(h.published.get("tool")?.requestId).toBe("replacement");
 	});
 });
 
@@ -165,6 +308,12 @@ describe("ExactRow memo identity", () => {
 
 	// Everything the row paints from `spec` must be compared, or a change would not
 	// reach the DOM. Today that is `key` and `unitId` (`data-nf-unit`).
+	//
+	// `data` is exempt: it is measured INTO `measured` (the comparator's first
+	// clause), so a different `data` already yields a different `measured` object
+	// and never needs its own comparison — see ExactRow's comparator comment and
+	// measure-cache.extractDataRevision. Reads of `spec.data.*` in the row body are
+	// for interaction callbacks (e.g. the reply-quote jump target), not paint.
 	it("compares every spec field the row renders", () => {
 		const source = row();
 		const rowBody = source.slice(
@@ -174,6 +323,7 @@ describe("ExactRow memo identity", () => {
 		const readFields = new Set(
 			[...rowBody.matchAll(/item\.spec\.([a-zA-Z]+)/g)].map((match) => match[1]),
 		);
+		readFields.delete("data");
 		expect(readFields.size).toBeGreaterThan(0);
 		const cmp = comparator(source);
 		for (const field of readFields) {

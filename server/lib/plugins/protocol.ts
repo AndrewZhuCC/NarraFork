@@ -1,4 +1,9 @@
 import { CITATION_LIMITS } from "@shared/citations";
+import { CONTEXT_CATEGORIES } from "@shared/context-composition";
+import {
+	MAX_INPUT_COMPOSITION_SEGMENTS,
+	readInputCompositionSegments,
+} from "@shared/context-usage";
 import { z } from "zod";
 import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
@@ -9,8 +14,18 @@ export const manifestSchemaVersion = MANIFEST_SCHEMA_VERSION;
 export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 /** Provider business protocol negotiated on top of the RPC transport. */
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
-/** Bounded host-to-provider request budget; inbound events keep their smaller limits. */
-export const PROVIDER_REQUEST_MAX_BYTES = 32 * 1024 * 1024;
+/** Full UTF-8 JSON-RPC request body budget, including base64 images; inbound limits stay small. */
+export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
+/**
+ * Ceiling on the dump budget the host advertises to a plugin in
+ * `ProviderChatParams.requestDump.maxBytes`. The operator-configured
+ * `agent.requestDumpMaxSize` is a retention ceiling and may be far larger; what crosses
+ * the RPC boundary must stay well below the per-operation output budget (24 MiB) that
+ * dump events share with the model's actual output.
+ */
+export const PLUGIN_REQUEST_DUMP_MAX_BYTES = 4 * 1024 * 1024;
+/** Maximum size of a single `dump.request`/`dump.response` body chunk. */
+export const PLUGIN_DUMP_CHUNK_MAX_CHARS = 64 * 1024;
 /** MessageChannel UI bridge protocol. */
 export const NARRAFORK_UI_PROTOCOL = "narrafork.ui/1" as const;
 
@@ -66,11 +81,11 @@ export const RPC_CANCEL_REQUEST_METHOD = "$/cancelRequest" as const;
 export const RPC_CREDIT_METHOD = "$/credit" as const;
 
 // Transport enforces the actual UTF-8 frame budget. These traversal guards must
-// accommodate long provider histories within the 32 MiB outbound frame limit:
+// accommodate histories and base64 images within the provider outbound frame limit:
 // even the smallest JSON array entry takes two bytes (value + separator).
 const MAX_JSON_DEPTH = 128;
-const MAX_JSON_NODES = 16 * 1024 * 1024;
-const MAX_JSON_STRING_LENGTH = 32 * 1024 * 1024;
+const MAX_JSON_NODES = PROVIDER_REQUEST_MAX_BYTES / 2;
+const MAX_JSON_STRING_LENGTH = PROVIDER_REQUEST_MAX_BYTES;
 const FORBIDDEN_JSON_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -523,6 +538,33 @@ export const providerUsageSchema = z
 	})
 	.strict();
 
+/**
+ * Header map carried by dump events. Bounded in entry count and per-field size; values
+ * are masked by the host before persistence regardless of what the plugin sent.
+ */
+const dumpHeadersSchema = z
+	.record(z.string().max(200), z.string().max(4_000))
+	.refine((headers) => Object.keys(headers).length <= 64, {
+		message: "dump headers must not exceed 64 entries",
+	})
+	.optional();
+
+// Reject oversized arrays before Zod traverses their entries. Only numeric classification
+// crosses this boundary: message bodies and write-time tool IDs are not wire metadata.
+const inputCompositionSegmentsSchema = z.preprocess(
+	(value) => (Array.isArray(value) && value.length > MAX_INPUT_COMPOSITION_SEGMENTS ? null : value),
+	z
+		.array(
+			z
+				.object({
+					category: z.enum(CONTEXT_CATEGORIES),
+					chars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+				})
+				.strict(),
+		)
+		.max(MAX_INPUT_COMPOSITION_SEGMENTS),
+);
+
 export const providerStreamEventSchema = z.discriminatedUnion("type", [
 	z
 		.object({
@@ -530,6 +572,36 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 			credentialId: optionalTextSchema,
 			upstreamRequestId: optionalTextSchema,
 			reasoningSource: optionalTextSchema,
+			/** Complete final model input; absent for plugins that cannot report it. */
+			inputCharacters: z
+				.object({
+					totalChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					systemChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					toolsChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					compositionSegments: inputCompositionSegmentsSchema.nullable().optional(),
+				})
+				.strict()
+				.refine((counts) => counts.systemChars + counts.toolsChars <= counts.totalChars)
+				.refine((counts) => {
+					if (counts.compositionSegments == null) return true;
+					const segments = readInputCompositionSegments(
+						counts.compositionSegments,
+						counts.totalChars,
+					);
+					if (!segments) return false;
+					let systemChars = 0;
+					let toolsChars = 0;
+					for (const segment of segments) {
+						if (segment.category === "system" || segment.category === "summary") {
+							systemChars += segment.chars;
+						} else if (segment.category === "toolDefinition") {
+							toolsChars += segment.chars;
+						}
+					}
+					return systemChars === counts.systemChars && toolsChars === counts.toolsChars;
+				}, "Input composition must match total and fixed-prefix character counts")
+				.nullable()
+				.optional(),
 		})
 		.strict(),
 	z
@@ -694,6 +766,37 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 			responseId: optionalTextSchema,
 			credentialId: optionalTextSchema,
 			usage: providerUsageSchema.optional(),
+		})
+		.strict(),
+	// ── Upstream request/response dump (opt-in per chat call) ──
+	// A plugin may emit these ONLY when the chat params carried `requestDump` — the
+	// field's presence is the compatibility negotiation: hosts that predate these event
+	// types never send the hint, so a compliant plugin never makes an old host choke on
+	// an unknown event. The host enforces the rule as a protocol violation.
+	// Bodies travel in ≤64KiB chunks to respect the 256KiB frame limit; an event carrying
+	// `url`/`headers` (request) or `status`/`headers` (response) opens a new upstream
+	// attempt, `final: true` closes the current body. The host sanitizes everything —
+	// plugins MUST NOT rely on their own masking being sufficient.
+	z
+		.object({
+			type: z.literal("dump.request"),
+			transport: optionalTextSchema,
+			url: z.string().max(2_048).optional(),
+			headers: dumpHeadersSchema,
+			bodyChunk: z.string().min(1).max(PLUGIN_DUMP_CHUNK_MAX_CHARS).optional(),
+			final: z.boolean().optional(),
+			truncated: z.boolean().optional(),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("dump.response"),
+			status: z.number().int().min(100).max(599).optional(),
+			headers: dumpHeadersSchema,
+			bodyChunk: z.string().min(1).max(PLUGIN_DUMP_CHUNK_MAX_CHARS).optional(),
+			final: z.boolean().optional(),
+			truncated: z.boolean().optional(),
+			error: z.string().max(4_000).optional(),
 		})
 		.strict(),
 ]);

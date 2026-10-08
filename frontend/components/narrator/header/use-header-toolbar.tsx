@@ -51,7 +51,6 @@ export interface UseHeaderToolbarOptions {
 	// Active-state inputs.
 	mobileTasksOpen: boolean;
 	mobileToolPanel: MobileToolPanelKind | null;
-	fileModDrawerOpened: boolean;
 	detailsOpened: boolean;
 	terminalToolOpened: boolean;
 	specToolOpened: boolean;
@@ -59,7 +58,6 @@ export interface UseHeaderToolbarOptions {
 	// Activation actions.
 	setMobileTasksOpen: Dispatch<SetStateAction<boolean>>;
 	setMobileToolPanel: Dispatch<SetStateAction<MobileToolPanelKind | null>>;
-	setFileModDrawerOpened: Dispatch<SetStateAction<boolean>>;
 	toggleDetails: () => void;
 	toggleTerminalTool: () => void;
 	toggleSpecTool: () => void;
@@ -111,13 +109,11 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		executionDevicesQuery,
 		mobileTasksOpen,
 		mobileToolPanel,
-		fileModDrawerOpened,
 		detailsOpened,
 		terminalToolOpened,
 		specToolOpened,
 		setMobileTasksOpen,
 		setMobileToolPanel,
-		setFileModDrawerOpened,
 		toggleDetails,
 		toggleTerminalTool,
 		toggleSpecTool,
@@ -201,8 +197,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			switch (id) {
 				case "tasks":
 					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
-				case "filemod":
-					return fileModDrawerOpened;
 				case "details":
 					return detailsOpened;
 				case "terminal":
@@ -210,7 +204,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "spec":
 					return specToolOpened;
 				case "git":
-					return dock?.openToolTypes.has("git") ?? false;
+					return dock ? dock.openToolTypes.has("git") : mobileToolPanel === "git";
 				case "search":
 					return dock ? dock.openToolTypes.has("search") : mobileToolPanel === "search";
 				case "browser":
@@ -218,20 +212,12 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "userchat":
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
 				case "filetree":
-					return dock?.openToolTypes.has("filetree") ?? false;
+					return dock ? dock.openToolTypes.has("filetree") : mobileToolPanel === "filetree";
 				default:
 					return false;
 			}
 		},
-		[
-			dock,
-			mobileTasksOpen,
-			fileModDrawerOpened,
-			detailsOpened,
-			terminalToolOpened,
-			specToolOpened,
-			mobileToolPanel,
-		],
+		[dock, mobileTasksOpen, detailsOpened, terminalToolOpened, specToolOpened, mobileToolPanel],
 	);
 
 	/**
@@ -251,9 +237,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					if (dock) dock.toggleToolPanel("tasks");
 					else setMobileTasksOpen((v) => !v);
 					return;
-				case "filemod":
-					setFileModDrawerOpened((v: boolean) => !v);
-					return;
 				case "details":
 					toggleDetails();
 					return;
@@ -267,14 +250,12 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "search":
 				case "browser":
 				case "userchat":
+				case "filetree":
 					if (dock) dock.toggleToolPanel(id);
 					else {
 						const kind = id as MobileToolPanelKind;
 						setMobileToolPanel((current) => (current === kind ? null : kind));
 					}
-					return;
-				case "filetree":
-					dock?.toggleToolPanel("filetree");
 					return;
 				case "subagent":
 					onCreateSubagent?.();
@@ -292,7 +273,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			dock,
 			setMobileTasksOpen,
 			setMobileToolPanel,
-			setFileModDrawerOpened,
 			toggleDetails,
 			onOpenTerminalPanel,
 			toggleTerminalTool,

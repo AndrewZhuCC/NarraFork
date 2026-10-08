@@ -119,6 +119,8 @@ export interface DirEntry {
 
 /** Options for reading raw file bytes. */
 export interface ReadBytesOptions {
+	/** Byte offset; remote executors must negotiate fs.read.offset.v1. */
+	offset?: number;
 	/** Maximum number of bytes to return. Backend truncates beyond this. */
 	maxBytes?: number;
 	/**
@@ -137,6 +139,13 @@ export interface ReadBytesOptions {
 export interface WriteBytesOptions {
 	/** Canonical create/existing path authorized before the write. */
 	expectedResolvedPath?: string;
+}
+
+export interface ConditionalWriteBytesOptions {
+	expectedBytes: Uint8Array | null;
+	expectedResolvedPath: string;
+	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
 export interface ReadBytesResult {
@@ -294,6 +303,8 @@ export interface ExecutionBackend {
 	/** Feature-negotiated structured remote Git; absent on local/legacy backends. */
 	readonly supportsGitWorkspace?: boolean;
 	readonly supportsGitWorkspaceWatch?: boolean;
+	/** Executor advertises the read-only commit preview operations. */
+	readonly supportsGitCommitPreview?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";
@@ -324,6 +335,12 @@ export interface ExecutionBackend {
 	statFile(path: string, opts?: FileMetadataOptions): Promise<FileStat | null>;
 	readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult>;
 	writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void>;
+	/** Executor-serialized check-and-replace, not an OS-level CAS against external writers. */
+	conditionalWriteFileBytes?(
+		path: string,
+		bytes: Uint8Array,
+		opts: ConditionalWriteBytesOptions,
+	): Promise<void>;
 	/** Remove one file. Must be idempotent for a missing path and must not remove directories. */
 	removeFile(path: string): Promise<void>;
 	mkdirp(path: string): Promise<void>;

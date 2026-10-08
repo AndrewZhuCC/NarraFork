@@ -35,13 +35,13 @@ import {
 	useState,
 } from "react";
 import type { PanelDragState } from "../../lib/panel-drag";
-import { type DropIndicator, type DropZoneThresholds, resolveNativeDrop } from "./drop-intent";
+import type { DropIndicator, DropZoneThresholds } from "./drop-intent";
 import { DefaultSurfaceTab, withSurfaceTabMenu } from "./SurfaceTab";
 import {
 	bindNativeDropPreview,
 	DOCKVIEW_SURFACE_ATTR,
 	type DockviewDropTarget,
-	dropExistingPanel,
+	dropNativePanel,
 	useDockviewDnd,
 } from "./useDockviewDnd";
 
@@ -106,6 +106,8 @@ export interface DockviewSurfaceProps {
 	 * Leave unset to inherit dockview's default.
 	 */
 	defaultRenderer?: "always" | "onlyWhenVisible";
+	/** Keep temporary workspace windows inside the available surface. */
+	floatingGroupBounds?: "boundedWithinViewport";
 	/**
 	 * Per-panel tab renderers, keyed by the `tabComponent` name a panel is added
 	 * with. Used e.g. to give the focus dock's chat panel a close-less tab so the
@@ -150,6 +152,7 @@ export function DockviewSurface({
 	themeless,
 	apiRef: externalApiRef,
 	defaultRenderer,
+	floatingGroupBounds,
 	tabComponents,
 	surfaceId,
 }: DockviewSurfaceProps) {
@@ -196,16 +199,8 @@ export function DockviewSurface({
 		(event: DockviewWillDropEvent) => {
 			setNativeIndicator(null);
 			const api = apiRef.current;
-			if (!api || event.defaultPrevented) return;
-			const resolved = resolveNativeDrop(api, event, thresholds, enableSwapZone);
-			if (!resolved) return;
-			event.preventDefault();
-			const { panelId, hit } = resolved;
-			dropExistingPanel(api, panelId, {
-				groupId: hit.group.id,
-				intent: hit.intent,
-				targetPanelId: hit.targetPanelId,
-			});
+			if (!api) return;
+			dropNativePanel(api, event, thresholds, enableSwapZone);
 		},
 		[apiRef, enableSwapZone, thresholds],
 	);
@@ -260,6 +255,7 @@ export function DockviewSurface({
 					onDidDrop={handleDidDrop}
 					onWillDrop={handleWillDrop}
 					defaultRenderer={defaultRenderer}
+					floatingGroupBounds={floatingGroupBounds}
 				/>
 				{dropIndicator && (
 					<Box

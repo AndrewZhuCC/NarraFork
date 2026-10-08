@@ -1,11 +1,13 @@
-import type { AsyncQuestion, PendingPermission } from "@frontend/types/narrator";
+import type { PendingPermission } from "@frontend/types/narrator";
 import type { BackgroundTaskListDelta } from "@shared/background-task-list";
 import {
 	isSubagentModelInheritance,
 	type SubagentModelInheritance,
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -28,7 +30,11 @@ import {
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
-import { useAsyncQuestionListChange } from "./useAsyncQuestions";
+import {
+	type AsyncQuestionPush,
+	readAsyncQuestionPush,
+	useAsyncQuestionListChange,
+} from "./useAsyncQuestions";
 
 function nonEmptyString(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -398,7 +404,7 @@ export function coercePermissionRoutingFields(
 	};
 }
 
-interface NarratorWSCallbacks {
+export interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onStreamEvent?: (data: { event?: Record<string, unknown>; [key: string]: unknown }) => void;
@@ -450,7 +456,7 @@ interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & {
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 		},
 	) => void;
@@ -477,7 +483,7 @@ interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & {
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 			nextSteps?: string;
 		},
@@ -517,8 +523,16 @@ interface NarratorWSCallbacks {
 	 * delta, so a consumer that missed an event still converges on the correct state.
 	 */
 	onAsyncQuestionChanged?: (data: {
-		change: "opened" | "answered" | "dismissed" | "withdrawn" | "awaited" | "await_ended";
-		question: AsyncQuestion;
+		change:
+			| "opened"
+			| "answered"
+			| "dismissed"
+			| "withdrawn"
+			| "awaited"
+			| "await_ended"
+			| "resolved"
+			| "supplemented";
+		question: AsyncQuestionPush;
 	}) => void;
 	/**
 	 * Live progress of a running reflection gate. Fires on a throttled cadence, so
@@ -536,6 +550,8 @@ interface NarratorWSCallbacks {
 		input?: Record<string, unknown>,
 		parentToolUseId?: string,
 		meta?: SubagentToolEventMeta,
+		streamingEditOrigin?: StreamingEditOrigin,
+		inputDocument?: TextDocumentStreamUpdate,
 	) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
@@ -546,8 +562,15 @@ interface NarratorWSCallbacks {
 		contentCharsReceived?: number,
 		extractedFields?: Record<string, string>,
 		metadata?: Record<string, unknown>,
-		streamingField?: { name: string; delta: string; startsField?: boolean },
+		streamingField?: {
+			name: string;
+			delta: string;
+			startsField?: boolean;
+			offset?: number;
+			complete?: boolean;
+		},
 		meta?: SubagentToolEventMeta,
+		inputDocument?: TextDocumentStreamUpdate,
 	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
@@ -649,9 +672,11 @@ interface NarratorWSCallbacks {
 		contextWindow?: number,
 		isEstimated?: boolean,
 		compactStart?: number,
+		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
 	onGitStatus?: (data: {
-		chapterId: string;
+		/** Null for chapter-less narrators; workspace-keyed queries still apply. */
+		chapterId: string | null;
 		commitsAhead: number;
 		baseBranch: string;
 		linesAdded: number;
@@ -845,7 +870,14 @@ interface NarratorWSCallbacks {
 			avatarImageId: string | null;
 		}>,
 	) => void;
+	onStreamingIdentity?: (identity: {
+		model: string;
+		provider: string;
+		parentToolUseId?: string;
+	}) => void;
 	onStreamingSnapshot?: (snapshot: {
+		model?: string;
+		provider?: string;
 		streamingBlocks: Array<
 			| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 			| {
@@ -877,9 +909,11 @@ interface NarratorWSCallbacks {
 			inputCharsTotal: number;
 			parentToolUseId?: string;
 			extractedFilePath?: string;
+			inputDocument?: TextDocumentStreamUpdate;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
+			streamingEditOrigin?: StreamingEditOrigin;
 			/** The INPUT finished parsing — NOT "executing" (see `executing`). */
 			started?: boolean;
 			/** Permission granted and execution under way. */
@@ -1005,6 +1039,15 @@ export function useNarratorWS(
 							narratorWSManager.noteMessage(subscribedId, data.message as TreeMessage);
 						}
 						break;
+					case "streaming_identity":
+						if (typeof data.model === "string" && typeof data.provider === "string") {
+							callbackOwner.callbacks.onStreamingIdentity?.({
+								model: data.model,
+								provider: data.provider,
+								parentToolUseId: nonEmptyString(data.parentToolUseId) ?? undefined,
+							});
+						}
+						break;
 					case "stream_event":
 						callbackOwner.callbacks.onStreamEvent?.(data);
 						break;
@@ -1067,7 +1110,7 @@ export function useNarratorWS(
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
-							decision: data.decision as "allow" | "deny" | "aborted",
+							decision: data.decision as "allow" | "deny" | "aborted" | "failed",
 							reason: data.reason as string | undefined,
 						});
 						break;
@@ -1097,7 +1140,7 @@ export function useNarratorWS(
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
-							decision: data.decision as "allow" | "deny" | "aborted",
+							decision: data.decision as "allow" | "deny" | "aborted" | "failed",
 							reason: data.reason as string | undefined,
 							nextSteps: data.nextSteps as string | undefined,
 						});
@@ -1140,7 +1183,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "async_question_changed": {
-						const question = data.question as AsyncQuestion | undefined;
+						const question = readAsyncQuestionPush(data);
 						if (question?.id) {
 							callbackOwner.callbacks.onAsyncQuestionChanged?.({
 								change: data.change as
@@ -1149,7 +1192,9 @@ export function useNarratorWS(
 									| "dismissed"
 									| "withdrawn"
 									| "awaited"
-									| "await_ended",
+									| "await_ended"
+									| "resolved"
+									| "supplemented",
 								question,
 							});
 						}
@@ -1179,6 +1224,8 @@ export function useNarratorWS(
 							data.input as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
 							subagentToolEventMeta(data),
+							readStreamingEditOrigin(data.streamingEditOrigin),
+							data.inputDocument as TextDocumentStreamUpdate | undefined,
 						);
 						break;
 					case "tool_use_chunk":
@@ -1192,9 +1239,16 @@ export function useNarratorWS(
 							data.extractedFields as Record<string, string> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
 							data.streamingField as
-								| { name: string; delta: string; startsField?: boolean }
+								| {
+										name: string;
+										delta: string;
+										startsField?: boolean;
+										offset?: number;
+										complete?: boolean;
+								  }
 								| undefined,
 							subagentToolEventMeta(data),
+							data.inputDocument as TextDocumentStreamUpdate | undefined,
 						);
 						break;
 					case "tool_completed":
@@ -1382,19 +1436,18 @@ export function useNarratorWS(
 								data.contextWindow as number | undefined,
 								data.isEstimated as boolean | undefined,
 								data.compactStart as number | undefined,
+								data.snapshot as import("@shared/context-usage").ContextUsageSnapshot | undefined,
 							);
 						}
 						break;
 					case "git_status":
-						if (data.chapterId) {
-							callbackOwner.callbacks.onGitStatus?.({
-								chapterId: data.chapterId as string,
-								commitsAhead: (data.commitsAhead as number) ?? 0,
-								baseBranch: (data.baseBranch as string) ?? "",
-								linesAdded: (data.linesAdded as number) ?? 0,
-								linesRemoved: (data.linesRemoved as number) ?? 0,
-							});
-						}
+						callbackOwner.callbacks.onGitStatus?.({
+							chapterId: (data.chapterId as string | null) ?? null,
+							commitsAhead: (data.commitsAhead as number) ?? 0,
+							baseBranch: (data.baseBranch as string) ?? "",
+							linesAdded: (data.linesAdded as number) ?? 0,
+							linesRemoved: (data.linesRemoved as number) ?? 0,
+						});
 						break;
 					case "workspace_paths_changed": {
 						// An empty `changes` with `truncated` set is meaningful (everything is
@@ -1739,6 +1792,8 @@ export function useNarratorWS(
 						break;
 					case "streaming_snapshot":
 						callbackOwner.callbacks.onStreamingSnapshot?.({
+							model: nonEmptyString(data.model) ?? undefined,
+							provider: nonEmptyString(data.provider) ?? undefined,
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
 								| {
 										type: "reasoning";
@@ -1779,9 +1834,11 @@ export function useNarratorWS(
 								inputCharsTotal: number;
 								parentToolUseId?: string;
 								extractedFilePath?: string;
+								inputDocument?: TextDocumentStreamUpdate;
 								contentCharsReceived?: number;
 								extractedFields?: Record<string, string>;
 								metadata?: Record<string, unknown>;
+								streamingEditOrigin?: StreamingEditOrigin;
 								/** The INPUT finished parsing — NOT "executing" (see `executing`). */
 								started?: boolean;
 								/** Permission granted and execution under way. */
@@ -1901,6 +1958,7 @@ export interface NarratorListWSEvent {
 		| "permissionMode"
 		| "presence"
 		| "terminalCount"
+		| "backgroundTaskCount"
 		| "containerStatus"
 		| "draft"
 		/**
@@ -1927,6 +1985,7 @@ export interface NarratorListWSEvent {
 		avatarImageId: string | null;
 	}>;
 	activeTerminalCount?: number;
+	activeBackgroundTaskCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
 	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */

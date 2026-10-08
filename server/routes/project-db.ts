@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { narratorPrincipalOf } from "../lib/narrator-access";
 import { getHome } from "../lib/platform";
 import { requireProjectAccess } from "../lib/project-access";
 import { getProjectDbPath } from "../lib/project-db";
@@ -27,7 +28,14 @@ projectDbRoutes.post("/:id/backup/sync", async (c) => {
 	if (!project) throw new NotFoundError("Project", id);
 	if (!project.gitPath) throw new ValidationError("Project has no git path configured");
 
-	const result = await fullSync(id);
+	// Project management is not ownership of private conversation history. The worker
+	// authorizes every narrator and immutable dependency in one source snapshot before
+	// publishing any rows; permission failures return 403 without a partial archive write.
+	const result = await fullSync(id, {
+		signal: c.req.raw.signal,
+		actor: narratorPrincipalOf(c),
+		worker: true,
+	});
 	return c.json(result);
 });
 
@@ -62,6 +70,14 @@ projectDbRoutes.post("/import", async (c) => {
 		throw new ValidationError(`Path does not exist: ${gitPath}`);
 	}
 
-	const result = await importProject(gitPath);
+	const result = await importProject(
+		gitPath,
+		{},
+		{
+			actor: narratorPrincipalOf(c),
+			signal: c.req.raw.signal,
+			worker: true,
+		},
+	);
 	return c.json(result, result.skipped ? 200 : 201);
 });

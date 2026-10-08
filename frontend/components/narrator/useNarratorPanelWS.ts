@@ -1,15 +1,21 @@
 import { notifications } from "@mantine/notifications";
+import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
-import { invalidateWorkspaceQueries } from "../../hooks/useGit";
+import { invalidateGitStatusPushQueries, invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import { statusRegistry } from "../../lib/status-registry";
+import {
+	contextSnapshotFields,
+	contextSnapshotFromHistory,
+	legacyContextSnapshot,
+} from "./context-management/context-usage-state";
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
 import type {
@@ -120,22 +126,6 @@ function usePageVisibility(): boolean {
 	return visible;
 }
 
-function numericUsageField(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number | undefined {
-	const promptTokens = numericUsageField(turnUsage.prompt_tokens);
-	if (promptTokens != null) return promptTokens;
-	const inputTokens = numericUsageField(turnUsage.input_tokens);
-	if (inputTokens == null) return undefined;
-	return (
-		inputTokens +
-		(numericUsageField(turnUsage.cached_input_tokens) ?? 0) +
-		(numericUsageField(turnUsage.cache_creation_input_tokens) ?? 0)
-	);
-}
-
 interface InitialMessageStatus {
 	statusReady?: boolean;
 	contextPercent?: number | null;
@@ -215,6 +205,7 @@ export interface UseNarratorPanelWSReturn {
 	 */
 	reconcileBufferedMessages: () => void;
 	substatus: string[];
+	contextSnapshot: ContextUsageSnapshot | null;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
 	/**
@@ -270,6 +261,7 @@ export interface UseNarratorPanelWSReturn {
 
 interface StatusState {
 	substatus: string[];
+	contextSnapshot: ContextUsageSnapshot | null;
 	contextPercent: number | null;
 	contextStale: boolean;
 	promptTokens: number | null;
@@ -452,6 +444,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, [narratorId]);
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
 		substatus: [],
+		contextSnapshot: null,
 		contextPercent: null,
 		contextStale: false,
 		promptTokens: null,
@@ -463,6 +456,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	});
 	const {
 		substatus,
+		contextSnapshot,
 		contextPercent,
 		contextStale,
 		promptTokens,
@@ -472,6 +466,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		compactProgress,
 		compactFailure,
 	} = statusState;
+	const contextInitRef = useRef(false);
+	const contextLiveRef = useRef(false);
+	const contextCompositionSignatureRef = useRef<string | null>(null);
 	const suppressMessageDerivedCompactingRef = useRef(false);
 
 	// --- Seed substatus from persisted narrator data ---
@@ -487,6 +484,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
 	useEffect(() => {
 		substatusSeededRef.current = false;
+		contextInitRef.current = false;
+		contextLiveRef.current = false;
+		contextCompositionSignatureRef.current = null;
+		dispatchStatus({
+			type: "patch",
+			payload: {
+				contextSnapshot: null,
+				contextPercent: null,
+				promptTokens: null,
+				contextWindow: null,
+				isEstimated: false,
+				contextStale: false,
+			},
+		});
 		suppressMessageDerivedCompactingRef.current = false;
 		dispatchStatus({
 			type: "patch",
@@ -512,11 +523,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			dispatchStatus({
 				type: "patch",
 				payload: {
-					contextPercent: typeof v === "function" ? v(statusState.contextPercent) : v,
+					...contextSnapshotFields(
+						legacyContextSnapshot(
+							typeof v === "function" ? v(statusState.contextPercent) : v,
+							null,
+							statusState.contextWindow,
+							true,
+						),
+					),
+					contextStale: true,
 				},
 			});
 		},
-		[statusState.contextPercent],
+		[statusState.contextPercent, statusState.contextWindow],
 	);
 	const [browserSessionCount, setBrowserSessionCount] = useState(0);
 	// Carries a monotonic seq alongside the sessionId so consecutive visual
@@ -876,15 +895,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				if (compactBlock) {
 					const patch: Partial<StatusState> = {};
-					if (compactBlock.status === "compacted" && wsData.message?.contextPercent != null) {
-						patch.contextPercent = wsData.message.contextPercent as number;
-					}
 					const tu = wsData.message?.turnUsageJson as Record<string, unknown> | null | undefined;
-					if (compactBlock.status === "compacted" && tu) {
-						const restoredPromptTokens = promptTokensFromTurnUsage(tu);
-						if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
-						if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
-						patch.isEstimated = !!tu.is_estimated;
+					if (compactBlock.status === "compacted" && !contextLiveRef.current) {
+						Object.assign(
+							patch,
+							contextSnapshotFields(contextSnapshotFromHistory(wsData.message?.contextPercent, tu)),
+						);
 					}
 					if (Object.keys(patch).length > 0) {
 						dispatchStatus({ type: "patch", payload: patch });
@@ -1191,15 +1207,30 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, ...overrides } : old,
 				);
 			},
-			onContextUsage: (percentage, pTokens, ctxWindow, isEst, compactStart) => {
+			onContextUsage: (percentage, pTokens, ctxWindow, isEst, compactStart, snapshot) => {
+				contextLiveRef.current = true;
+				contextInitRef.current = true;
+				const resolved =
+					parseContextUsageSnapshot(snapshot) ??
+					legacyContextSnapshot(percentage, pTokens, ctxWindow, isEst);
+				const signature = JSON.stringify([
+					resolved.requestId,
+					resolved.composition?.generation,
+					resolved.inputCharacters,
+					resolved.occupiedTokens,
+					resolved.percentage,
+					resolved.contextWindow,
+					resolved.source,
+				]);
+				if (signature !== contextCompositionSignatureRef.current) {
+					contextCompositionSignatureRef.current = signature;
+					void qc.invalidateQueries({ queryKey: ["contextComposition", narratorId], exact: true });
+				}
 				dispatchStatus({
 					type: "patch",
 					payload: {
-						contextPercent: percentage,
+						...contextSnapshotFields(resolved),
 						contextStale: false,
-						promptTokens: pTokens ?? null,
-						contextWindow: ctxWindow ?? null,
-						isEstimated: !!isEst,
 						activeCompactStart: compactStart ?? null,
 					},
 				});
@@ -1313,14 +1344,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
 			onGitStatus: (data) => {
-				qc.setQueryData(["chapterGitStatus", data.chapterId], {
-					commitsAhead: data.commitsAhead,
-					baseBranch: data.baseBranch,
-					linesAdded: data.linesAdded,
-					linesRemoved: data.linesRemoved,
-				});
-				// Open Git panels have a workspace-scoped subscription. The legacy status
-				// event updates the chapter badge only; it must not reload every Git log.
+				if (data.chapterId) {
+					qc.setQueryData(["chapterGitStatus", data.chapterId], {
+						commitsAhead: data.commitsAhead,
+						baseBranch: data.baseBranch,
+						linesAdded: data.linesAdded,
+						linesRemoved: data.linesRemoved,
+					});
+				}
+				// The workspace bars (NarratorGitBar / ChapterBar with a narrator) read
+				// workspace-keyed gitStatus queries, which the chapter badge patch above
+				// never touches — without this the bar kept pre-session numbers until a
+				// foreground/reconnect refetch. Open Git panels additionally have their
+				// own workspace subscription; double invalidation is idempotent.
+				invalidateGitStatusPushQueries(qc, narratorId, data.chapterId);
 			},
 			onCommitSyncError: (event) => {
 				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });
@@ -1608,31 +1645,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	]);
 
 	// --- Initialize context state from initial message data ---
-	const contextInitRef = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
-	useEffect(() => {
-		contextInitRef.current = false;
-		dispatchStatus({ type: "patch", payload: { contextStale: false } });
-	}, [narratorId]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator reset must rehydrate even when the initial object is unchanged
 	useEffect(() => {
 		if (contextInitRef.current) return;
 		if (!initialMessageStatus?.statusReady) return;
-		const patch: Partial<StatusState> = {};
-		if (initialMessageStatus.contextPercent != null) {
-			patch.contextPercent = initialMessageStatus.contextPercent;
-			const tu = initialMessageStatus.turnUsageJson as Record<string, unknown> | null | undefined;
-			if (tu) {
-				const restoredPromptTokens = promptTokensFromTurnUsage(tu);
-				if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
-				if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
-				patch.isEstimated = !!tu.is_estimated;
-			}
-		}
+		const patch = contextSnapshotFields(
+			contextSnapshotFromHistory(
+				initialMessageStatus.contextPercent,
+				initialMessageStatus.turnUsageJson as Record<string, unknown> | null | undefined,
+			),
+		);
 		if (Object.keys(patch).length > 0) {
 			dispatchStatus({ type: "patch", payload: patch });
 		}
 		contextInitRef.current = true;
-	}, [initialMessageStatus]);
+	}, [initialMessageStatus, narratorId]);
 
 	return useMemo(
 		() => ({
@@ -1649,6 +1676,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			setQueuedMessages,
 			reconcileBufferedMessages,
 			substatus,
+			contextSnapshot,
 			contextPercent,
 			setContextPercent,
 			contextStale,
@@ -1685,6 +1713,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			queuedMessages,
 			reconcileBufferedMessages,
 			substatus,
+			contextSnapshot,
 			contextPercent,
 			setContextPercent,
 			contextStale,

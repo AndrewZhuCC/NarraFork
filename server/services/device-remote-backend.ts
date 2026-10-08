@@ -6,6 +6,7 @@
  * from rpc_stream frames into the ExecHandle's onData callback.
  */
 import type {
+	ConditionalWriteBytesOptions,
 	DevicePlatform,
 	DirEntry,
 	ExecHandle,
@@ -24,6 +25,7 @@ import type {
 	WriteBytesOptions,
 } from "../lib/agent/execution/backend";
 import {
+	FEATURE_GIT_COMMIT_PREVIEW_V1,
 	FEATURE_GIT_WORKSPACE_V1,
 	FEATURE_GIT_WORKSPACE_WATCH_V1,
 	GIT_WORKSPACE_MAX_BYTES,
@@ -45,7 +47,9 @@ import type {
 	RpcMethod,
 } from "../lib/agent/execution/rpc-types";
 import {
+	FEATURE_FS_CONDITIONAL_WRITE_V1,
 	FEATURE_FS_READ_BOUNDED_V1,
+	FEATURE_FS_READ_OFFSET_V1,
 	FEATURE_GLOB_BOUNDED_V1,
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
@@ -257,6 +261,11 @@ export class RemoteBackend implements ExecutionBackend {
 	}
 
 	async readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult> {
+		if (
+			opts?.offset !== undefined &&
+			(!Number.isSafeInteger(opts.offset) || opts.offset < 0 || opts.maxBytes === undefined)
+		)
+			throw new RangeError("Positional reads require a nonnegative safe offset and maxBytes");
 		const expectedResolvedPath = opts?.expectedResolvedPath;
 		if (expectedResolvedPath && !this.supportsFsReadAtomicResolvedPath) {
 			throw new Error(`Remote device ${this.deviceId} does not support atomic resolved-path reads`);
@@ -266,6 +275,7 @@ export class RemoteBackend implements ExecutionBackend {
 			{
 				path,
 				maxBytes: opts?.maxBytes ?? this.maxBytes,
+				...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
 				timeoutMs: opts?.timeoutMs,
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
 			},
@@ -275,6 +285,7 @@ export class RemoteBackend implements ExecutionBackend {
 				requiredFeatures: [
 					...(expectedResolvedPath ? [FS_READ_ATOMIC_RESOLVED_PATH_FEATURE] : []),
 					...(opts?.timeoutMs !== undefined ? [FEATURE_FS_READ_BOUNDED_V1] : []),
+					...(opts?.offset !== undefined ? [FEATURE_FS_READ_OFFSET_V1] : []),
 				],
 			},
 		)) as FsReadResult;
@@ -313,6 +324,50 @@ export class RemoteBackend implements ExecutionBackend {
 			},
 			expectedResolvedPath ? { requiredFeatures: [FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE] } : {},
 		);
+	}
+
+	async conditionalWriteFileBytes(
+		path: string,
+		bytes: Uint8Array,
+		opts: ConditionalWriteBytesOptions,
+	): Promise<void> {
+		if (!hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_CONDITIONAL_WRITE_V1)) {
+			throw new Error(
+				`Remote device ${this.deviceId} needs an executor upgrade for conditional writes`,
+			);
+		}
+		if (bytes.byteLength > 2_000_000 || (opts.expectedBytes?.byteLength ?? 0) > 2_000_000) {
+			throw new Error("Conditional write exceeds the 2000000-byte file limit");
+		}
+		opts.signal?.throwIfAborted();
+		try {
+			const result = (await this.rpc(
+				"fs.writeConditional",
+				{
+					path,
+					dataB64: toBase64(bytes),
+					expectedDataB64: opts.expectedBytes === null ? null : toBase64(opts.expectedBytes),
+					expectedResolvedPath: opts.expectedResolvedPath,
+					timeoutMs: Math.min(opts.timeoutMs ?? 30_000, 30_000),
+				},
+				{
+					signal: opts.signal,
+					timeoutMs: Math.min(opts.timeoutMs ?? 30_000, 30_000),
+					requiredFeatures: [FEATURE_FS_CONDITIONAL_WRITE_V1],
+				},
+			)) as { applied: boolean; conflict?: boolean };
+			if (result.conflict)
+				throw new Error("Conditional write conflict: file changed; preview again before retrying");
+			if (!result.applied) throw new Error("Conditional write returned an invalid result");
+		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("Conditional write conflict:"))
+				throw error;
+			const detail = error instanceof Error ? ` Remote error: ${error.message.slice(0, 1024)}` : "";
+			throw new Error(
+				`Remote conditional-write outcome is unknown; inspect the remote file before retrying. The stash is retained.${detail}`,
+				{ cause: error },
+			);
+		}
 	}
 
 	async removeFile(path: string): Promise<void> {
@@ -411,11 +466,16 @@ export class RemoteBackend implements ExecutionBackend {
 		);
 	}
 
+	get supportsGitCommitPreview(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_COMMIT_PREVIEW_V1);
+	}
+
 	async gitWorkspace(
 		request: GitWorkspaceRequest,
 		signal?: AbortSignal,
 	): Promise<GitWorkspaceResult> {
 		const timeoutMs = request.timeoutMs ?? GIT_WORKSPACE_TIMEOUT_MS;
+		const preview = request.operation === "commitDetail" || request.operation === "commitDiff";
 		return (await this.rpc(
 			"git.workspace",
 			{
@@ -423,7 +483,13 @@ export class RemoteBackend implements ExecutionBackend {
 				timeoutMs,
 				maxBytes: Math.min(request.maxBytes ?? GIT_WORKSPACE_MAX_BYTES, this.maxBytes),
 			},
-			{ signal, timeoutMs: timeoutMs + 5_000, requiredFeatures: [FEATURE_GIT_WORKSPACE_V1] },
+			{
+				signal,
+				timeoutMs: timeoutMs + 5_000,
+				requiredFeatures: preview
+					? [FEATURE_GIT_WORKSPACE_V1, FEATURE_GIT_COMMIT_PREVIEW_V1]
+					: [FEATURE_GIT_WORKSPACE_V1],
+			},
 		)) as GitWorkspaceResult;
 	}
 

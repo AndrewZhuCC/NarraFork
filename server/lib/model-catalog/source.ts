@@ -3,28 +3,31 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
-import type { CatalogDocument } from "@shared/model-catalog/schema/catalog";
-import { validateCatalog } from "@shared/model-catalog/src/index";
 import {
 	decimalValue,
 	multiplyDecimal,
+	type RawCatalog,
 	rawCatalogFromModelFiles,
 	validateRawMetadata,
-	type RawCatalog,
 } from "@shared/model-catalog/card";
 import { legacyMetadataToRaw } from "@shared/model-catalog/card-resolver";
+import type { CatalogDocument } from "@shared/model-catalog/schema/catalog";
+import { validateCatalog } from "@shared/model-catalog/src/index";
 
+// Commit details include file patches; branch metadata keeps checks independent of diff size.
 export const CATALOG_REVISION_URL =
-	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/commits?sha=main&per_page=1";
+	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/branches/main";
 export const CATALOG_ARCHIVE_BASE =
 	"https://codeload.github.com/NarraFork/narrafork-model-catalog/tar.gz/";
+export const MAX_CATALOG_REVISION_BYTES = 1024 * 1024;
 export const MAX_CATALOG_BYTES = 16 * 1024 * 1024;
 
 export function parseCatalogRevision(value: unknown): { version: string; publishedAt: string } {
-	const entry = Array.isArray(value) && value.length === 1 ? value[0] : value;
-	const revision = entry as { sha?: string; commit?: { committer?: { date?: string } } } | null;
-	const version = revision?.sha;
-	const publishedAt = revision?.commit?.committer?.date;
+	const branch = value as {
+		commit?: { sha?: string; commit?: { committer?: { date?: string } } };
+	} | null;
+	const version = branch?.commit?.sha;
+	const publishedAt = branch?.commit?.commit?.committer?.date;
 	if (
 		typeof version !== "string" ||
 		!/^[a-f0-9]{40}$/.test(version) ||
@@ -61,7 +64,10 @@ export function sourceMetadata(value: unknown): unknown {
 		return value;
 	const metadata: Record<string, Record<string, unknown>> = {};
 	const set = (group: string, field: string, source: string) => {
-		if (Object.hasOwn(raw, source)) (metadata[group] ??= {})[field] = raw[source];
+		if (Object.hasOwn(raw, source)) {
+			metadata[group] ??= {};
+			metadata[group][field] = raw[source];
+		}
 	};
 	set("limits", "contextWindow", "max_input_tokens");
 	set("limits", "maxOutputTokens", "max_output_tokens");
@@ -75,8 +81,10 @@ export function sourceMetadata(value: unknown): unknown {
 		delete metadata.limits!.contextWindow;
 	set("modalities", "input", "supported_modalities");
 	set("modalities", "output", "supported_output_modalities");
-	if (!("supported_modalities" in raw) && raw.supports_vision === true)
-		(metadata.modalities ??= {}).input = ["text", "image"];
+	if (!("supported_modalities" in raw) && raw.supports_vision === true) {
+		metadata.modalities ??= {};
+		metadata.modalities.input = ["text", "image"];
+	}
 	set("nativeSearch", "supported", "supports_web_search");
 	set("reasoning", "supported", "supports_reasoning");
 	set("reasoning", "mode", "reasoning_mode");
@@ -85,7 +93,10 @@ export function sourceMetadata(value: unknown): unknown {
 	set("reasoning", "canDisable", "supports_none_reasoning_effort");
 	set("reasoning", "canDisable", "can_disable_reasoning");
 	for (const [field, key] of Object.entries(sourcePrices)) {
-		if (Object.hasOwn(raw, key)) (metadata.referencePricing ??= {})[field] = sourcePrice(raw[key]);
+		if (Object.hasOwn(raw, key)) {
+			metadata.referencePricing ??= {};
+			metadata.referencePricing[field] = sourcePrice(raw[key]);
+		}
 	}
 	if (metadata.referencePricing)
 		Object.assign(metadata.referencePricing, { currency: "USD", unit: "perMillionTokens" });
@@ -134,10 +145,13 @@ export function sourceMetadata(value: unknown): unknown {
 					field === "output" ? outputMultiplier : inputMultiplier,
 				);
 		}
-		(metadata.referencePricing ??= {}).longContext = tier;
+		metadata.referencePricing ??= {};
+		metadata.referencePricing.longContext = tier;
 	}
-	if (Object.hasOwn(raw, "reference_pricing_long_context"))
-		(metadata.referencePricing ??= {}).longContext = raw.reference_pricing_long_context;
+	if (Object.hasOwn(raw, "reference_pricing_long_context")) {
+		metadata.referencePricing ??= {};
+		metadata.referencePricing.longContext = raw.reference_pricing_long_context;
+	}
 	return metadata;
 }
 export function catalogFromModelFiles(

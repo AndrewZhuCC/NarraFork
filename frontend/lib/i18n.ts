@@ -100,6 +100,29 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	const path = normalizePathname(pathname);
 	if (path.startsWith("/shared/narrators/")) return ["common", "errors", "publicShare"];
 
+	// Private windows share auth/theme, not the navigation's translation bundles.
+	if (path === "/windows" || path.startsWith("/windows/")) {
+		const gitWindow =
+			path.startsWith("/windows/git/narrators/") || path.startsWith("/windows/git/chapters/");
+		if (gitWindow) return ["common", "errors", "git"];
+		// Panel/workspace windows render panels whose components each carry their own
+		// namespace (terminal, git, knowledge, …) — preload the full panel set.
+		if (path.startsWith("/windows/panel") || path.startsWith("/windows/workspaces/")) {
+			return [
+				"common",
+				"errors",
+				"narrator",
+				"narrators",
+				"terminal",
+				"git",
+				"chat",
+				"knowledge",
+				"plugins",
+			];
+		}
+		return ["common", "errors"];
+	}
+
 	const publicNamespaces = PUBLIC_PATH_NAMESPACES.get(path);
 	if (publicNamespaces) return publicNamespaces;
 
@@ -126,6 +149,9 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"git",
 			"chat",
 		];
+	}
+	if (path.startsWith("/git/narrators/") || path.startsWith("/git/chapters/")) {
+		return ["git"];
 	}
 	if (path === "/messages") return ["common", "nav", "chat"];
 	if (path === "/narrators") return ["common", "nav", "narrators", "narrator", "chat"];

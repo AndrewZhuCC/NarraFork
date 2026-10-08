@@ -1,6 +1,11 @@
 /** One human-decision center. List queries carry summaries; expanded rows own their forms. */
 
 import type { ExecutionTargetIdentity } from "@frontend/lib/api/types";
+import {
+	localizeDangerDetailText,
+	localizeDangerText,
+	localizeDangerTexts,
+} from "@frontend/lib/localize-danger-copy";
 import type { AsyncQuestion, PendingPermission } from "@frontend/types/narrator";
 import {
 	Alert,
@@ -23,7 +28,7 @@ import {
 	reflectionTitleKeySuffix,
 } from "@shared/pretext-layout/reflection";
 import { IconClockPause, IconInbox } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
@@ -31,7 +36,6 @@ import {
 	Suspense,
 	useCallback,
 	useEffect,
-	useMemo,
 	useRef,
 	useState,
 } from "react";
@@ -51,8 +55,9 @@ import { api } from "../../../lib/api";
 import { readSession, writeSession } from "../../../lib/session-store";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
-import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
+import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
+import { AsyncQuestionSummary } from "./AsyncQuestionDetail";
 import { toBannerQuestions } from "./async-question-questions";
 
 /**
@@ -127,45 +132,46 @@ export function HumanAttentionInboxButton({
 		others.length > 0 ? t("inboxBadgeOtherSessions", { count: others.length }) : null,
 	].filter((label): label is string => label !== null);
 
-	// A failed first load is unknown, not an authoritative empty inbox. Keep a retry entry.
-	if (!opened && items.length === 0 && !query.hasNextPage && !query.isError) return null;
+	// The archive is navigation, not a notification: pending/history remain reachable
+	// after the last open item is answered. Only live attention adds urgent styling.
+	const hasAttention = items.length > 0 || query.hasNextPage;
 	return (
 		<>
-			{(items.length > 0 || query.hasNextPage || query.isError) && (
-				<Button
-					size={variant === "compact" ? "compact-xs" : "compact-sm"}
-					fullWidth={variant === "row"}
-					justify={variant === "row" ? "flex-start" : undefined}
-					variant={blocking > 0 ? "light" : "subtle"}
-					color={blocking > 0 ? "yellow" : "gray"}
-					leftSection={blocking > 0 ? <IconClockPause size={14} /> : <IconInbox size={14} />}
-					onClick={() => setOpened(true)}
-					aria-label={t("humanAttentionOpen", { count })}
-				>
-					<Group gap={6} wrap="wrap">
+			<Button
+				size={variant === "compact" ? "compact-xs" : "compact-sm"}
+				fullWidth={variant === "row"}
+				justify={variant === "row" ? "flex-start" : undefined}
+				variant={blocking > 0 ? "light" : "subtle"}
+				color={blocking > 0 ? "yellow" : "gray"}
+				leftSection={blocking > 0 ? <IconClockPause size={14} /> : <IconInbox size={14} />}
+				onClick={() => setOpened(true)}
+				aria-label={hasAttention ? t("humanAttentionOpen", { count }) : t("humanAttentionTitle")}
+			>
+				<Group gap={6} wrap="wrap">
+					<Text size="xs">
+						{query.isError && !items.length
+							? t("humanAttentionLoadError")
+							: hasAttention
+								? t("humanAttentionBadge", { count })
+								: t("humanAttentionTitle")}
+					</Text>
+					{currentNarratorId && scopeLabels.length > 0 && (
 						<Text size="xs">
-							{query.isError && !items.length
-								? t("humanAttentionLoadError")
-								: t("humanAttentionBadge", { count })}
+							{scopeLabels.map((label, index) => (
+								<span key={label}>
+									{index > 0 ? " · " : null}
+									{label}
+								</span>
+							))}
 						</Text>
-						{currentNarratorId && scopeLabels.length > 0 && (
-							<Text size="xs">
-								{scopeLabels.map((label, index) => (
-									<span key={label}>
-										{index > 0 ? " · " : null}
-										{label}
-									</span>
-								))}
-							</Text>
-						)}
-						{blocking > 0 && (
-							<Text size="xs" fw={600}>
-								{t("inboxBadgeAwaitedSuffix", { count: blocking })}
-							</Text>
-						)}
-					</Group>
-				</Button>
-			)}
+					)}
+					{blocking > 0 && (
+						<Text size="xs" fw={600}>
+							{t("inboxBadgeAwaitedSuffix", { count: blocking })}
+						</Text>
+					)}
+				</Group>
+			</Button>
 			<HumanAttentionInboxDrawer
 				opened={opened}
 				onClose={() => setOpened(false)}
@@ -227,6 +233,52 @@ export function HumanAttentionInboxDrawer({
 	);
 }
 
+function QuestionLifecycleGroup({ filter }: { filter: "pending" | "history" }) {
+	const { t } = useTranslation("narrator");
+	const [expanded, setExpanded] = useState(filter === "pending");
+	const query = useInfiniteQuery({
+		queryKey: [...globalQuestionsQueryKey, filter],
+		initialPageParam: undefined as string | undefined,
+		queryFn: ({ pageParam }) => api.getGlobalQuestionPage(filter, pageParam),
+		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		enabled: expanded,
+	});
+	return (
+		<Stack gap="sm" data-question-group={filter}>
+			<Button
+				variant="subtle"
+				aria-expanded={expanded}
+				onClick={() => setExpanded((value) => !value)}
+			>
+				{t(filter === "pending" ? "asyncQuestionPendingGroup" : "asyncQuestionHistoryGroup")}
+			</Button>
+			{expanded && (
+				<>
+					{query.isLoading && <Text size="xs">{t("humanAttentionLoading")}</Text>}
+					{query.isError && (
+						<RetryNotice message={query.error.message} retry={() => void query.refetch()} />
+					)}
+					{query.data?.pages
+						.flatMap((page) => page.items ?? [])
+						.map((question) => (
+							<Paper key={question.id} withBorder p="sm">
+								<Text size="xs" c="dimmed">
+									{question.narratorTitle || question.narratorId}
+								</Text>
+								<AsyncQuestionSummary question={question} readOnly={question.canAct === false} />
+							</Paper>
+						))}
+					{query.hasNextPage && (
+						<Button loading={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>
+							{t("humanAttentionLoadMore")}
+						</Button>
+					)}
+				</>
+			)}
+		</Stack>
+	);
+}
+
 /** Shared decision surface. Both drawers use the same authority and private forms. */
 export function HumanAttentionInboxContent({
 	onClose,
@@ -263,6 +315,9 @@ export function HumanAttentionInboxContent({
 			>
 				<Text size="xs" c="dimmed">
 					{t("humanAttentionDesc")}
+				</Text>
+				<Text size="sm" fw={600} data-question-group="open">
+					{t("asyncQuestionOpenGroup")}
 				</Text>
 				{query.isLoading && <Text size="sm">{t("humanAttentionLoading")}</Text>}
 				{query.isError && (
@@ -309,6 +364,9 @@ export function HumanAttentionInboxContent({
 						{t("humanAttentionLoadMore")}
 					</Button>
 				)}
+				<Divider />
+				<QuestionLifecycleGroup filter="pending" />
+				<QuestionLifecycleGroup filter="history" />
 			</Stack>
 		</PermEnterHintCtx.Provider>
 	);
@@ -572,7 +630,12 @@ function ReflectionReviewCard({
 	);
 	// The server already promotes the reflection reason to `decisionReason`; showing
 	// the identical sentence twice reads as two separate findings.
-	const reason = reflection.reason === decisionReason ? undefined : reflection.reason;
+	const rawReason = reflection.reason === decisionReason ? undefined : reflection.reason;
+	const summary = reflection.summary ? localizeDangerText(reflection.summary, t) : undefined;
+	const reason = rawReason ? localizeDangerText(rawReason, t) : undefined;
+	const consequences = localizeDangerTexts(reflection.consequences, t);
+	const alternatives = localizeDangerTexts(reflection.alternatives, t);
+	const details = reflection.details.map((detail) => localizeDangerDetailText(detail, t));
 	return (
 		<Paper withBorder p="xs" radius="sm">
 			<Stack gap={4}>
@@ -588,20 +651,14 @@ function ReflectionReviewCard({
 						</Badge>
 					)}
 				</Group>
-				{reflection.summary && <ReviewLine value={reflection.summary} />}
+				{summary && <ReviewLine value={summary} />}
 				{reason && <ReviewLine value={reason} />}
 				{reflection.nextSteps && (
 					<ReviewLine value={t("reflectionNextSteps", { nextSteps: reflection.nextSteps })} />
 				)}
-				<ReviewBullets
-					label={t("humanAttentionDangerConsequences")}
-					items={reflection.consequences}
-				/>
-				<ReviewBullets
-					label={t("humanAttentionDangerAlternatives")}
-					items={reflection.alternatives}
-				/>
-				<ReviewBullets label={t("humanAttentionDangerDetails")} items={reflection.details} />
+				<ReviewBullets label={t("humanAttentionDangerConsequences")} items={consequences} />
+				<ReviewBullets label={t("humanAttentionDangerAlternatives")} items={alternatives} />
+				<ReviewBullets label={t("humanAttentionDangerDetails")} items={details} />
 				{reflection.mutations.length > 0 && (
 					<Stack gap={2}>
 						<Text size="xs" fw={600}>
@@ -874,13 +931,6 @@ function HumanAttentionForm({
 			if (throwOnError) throw error;
 		}
 	};
-	const fileDrawer = useMemo(
-		() => ({
-			// The inbox has no workspace file drawer; open the ACTUAL owner rather than a noop or parent.
-			openForApproval: () => onOpenSession(item.narratorId),
-		}),
-		[item.narratorId, onOpenSession],
-	);
 
 	if (query.isLoading) return <Text size="sm">{t("humanAttentionLoading")}</Text>;
 	if (query.isError)
@@ -915,6 +965,11 @@ function HumanAttentionForm({
 			<Text size="xs" c="dimmed">
 				{t("humanAttentionOwner", { narrator: item.narratorId, request: item.requestId })}
 			</Text>
+			{question && (
+				<Text size="sm" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+					{question.context || t("asyncQuestionContextUnknown")}
+				</Text>
+			)}
 			{permission?.subagentNarratorId && (
 				<Text size="xs" c="dimmed">
 					{t("humanAttentionChild", { narrator: permission.subagentNarratorId })}
@@ -951,19 +1006,26 @@ function HumanAttentionForm({
 					<AskUserQuestionBanner
 						requestId={item.requestId}
 						draftId={question.toolCallId}
+						answerKey="id"
 						questions={toBannerQuestions(question.questions)}
 						readOnly={readOnly}
 						busy={mutation.isPending}
 						denyLabel={t("asyncQuestionDismiss")}
 						onSubmit={(_id, answers) =>
-							void run(() =>
-								api.answerAsyncQuestion(item.narratorId, item.requestId, {
-									answers,
-									...(question.annotations ? { annotations: question.annotations } : {}),
-								}),
+							run(
+								() =>
+									api.answerAsyncQuestion(item.narratorId, item.requestId, {
+										answers,
+										...(question.annotations ? { annotations: question.annotations } : {}),
+									}),
+								true,
 							)
 						}
 						onDeny={() => void run(() => api.dismissAsyncQuestion(item.narratorId, item.requestId))}
+						onIgnore={() =>
+							void run(() => api.ignoreAsyncQuestion(item.narratorId, item.requestId))
+						}
+						ignoreLabel={t("asyncQuestionIgnore")}
 					/>
 				) : permission?.toolName === "AskUserQuestion" ? (
 					<AskUserQuestionBanner
@@ -983,24 +1045,22 @@ function HumanAttentionForm({
 						onReflect={() => void run(() => api.reflectQuestion(item.requestId))}
 					/>
 				) : permission && !readOnly ? (
-					<FileModDrawerCtx.Provider value={fileDrawer}>
-						<InlinePermission
-							permission={{ ...permission, id: item.requestId }}
-							onPlanPreviewChange={preview}
-							onPlanReflect={() => run(() => api.reflectPlan(item.requestId), true)}
-							onDecision={(_id, decision, feedbackText, compactAfter, updatedPlan) =>
-								void run(() =>
-									decision === "allow"
-										? api.approvePermission(item.requestId, {
-												feedbackText,
-												compactAfter,
-												updatedPlan,
-											})
-										: api.denyPermission(item.requestId, { feedbackText }),
-								)
-							}
-						/>
-					</FileModDrawerCtx.Provider>
+					<InlinePermission
+						permission={{ ...permission, id: item.requestId }}
+						onPlanPreviewChange={preview}
+						onPlanReflect={() => run(() => api.reflectPlan(item.requestId), true)}
+						onDecision={(_id, decision, feedbackText, compactAfter, updatedPlan) =>
+							void run(() =>
+								decision === "allow"
+									? api.approvePermission(item.requestId, {
+											feedbackText,
+											compactAfter,
+											updatedPlan,
+										})
+									: api.denyPermission(item.requestId, { feedbackText }),
+							)
+						}
+					/>
 				) : null}
 			</Box>
 		</Stack>

@@ -48,6 +48,14 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
 	"ExtractPipeline",
 	"EnterPlanMode",
 	"ExitPlanMode",
+	"SwitchWorkingDirectory",
+	"SwitchDevice",
+	"Worktree",
+	"ListWorktrees",
+	"CreateWorktree",
+	"AttachWorktree",
+	"GetWorktreeOperation",
+	"RequestPermissionRule",
 ]);
 
 /**

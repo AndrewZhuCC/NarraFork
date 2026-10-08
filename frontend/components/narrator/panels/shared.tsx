@@ -5,9 +5,10 @@
  */
 
 import type { IDockviewPanelProps } from "dockview-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type PanelDragSubjectKind, startPanelDrag } from "../../../lib/panel-drag";
 import { useDockviewSurfaceId } from "../../dockview";
+import { usePanelHeaderControls } from "./panel-header-controls";
 
 /** Width (px) below which a chat panel should use its compact toolbar layout. */
 export const COMPACT_WIDTH_THRESHOLD = 640;
@@ -26,13 +27,62 @@ export function usePanelCompact(): {
 		roRef.current?.disconnect();
 		if (!el) return;
 		const ro = new ResizeObserver((entries) => {
-			setCompact((entries[0]?.contentRect.width ?? 0) < COMPACT_WIDTH_THRESHOLD);
+			const width = entries[0]?.contentRect.width ?? 0;
+			// A retained desktop dock is off-layout on mobile. Keep its last visible
+			// chrome until it is shown again, rather than publishing a false breakpoint.
+			if (width <= 0) return;
+			setCompact(width < COMPACT_WIDTH_THRESHOLD);
 		});
 		ro.observe(el);
 		roRef.current = ro;
 	}, []);
 	useEffect(() => () => roRef.current?.disconnect(), []);
 	return { ref, compact };
+}
+
+/**
+ * Dockview's always-rendered panels mount inside an unpositioned overlay. Its
+ * actual size is written on the next animation frame, even though the content
+ * can already read a temporary full-surface width. Mount expensive content only
+ * after that first positioning; never gate it again during moves or tab changes.
+ */
+export function usePanelGeometryReady(onAttach: (el: HTMLDivElement | null) => void): {
+	ref: (el: HTMLDivElement | null) => void;
+	geometryReady: boolean;
+} {
+	const [node, setNode] = useState<HTMLDivElement | null>(null);
+	const [geometryReady, setGeometryReady] = useState(false);
+	const ref = useCallback(
+		(el: HTMLDivElement | null) => {
+			onAttach(el);
+			setNode(el);
+		},
+		[onAttach],
+	);
+	useLayoutEffect(() => {
+		if (!node || geometryReady) return;
+		const overlay = node.closest<HTMLElement>(".dv-render-overlay");
+		if (!overlay) {
+			setGeometryReady(true);
+			return;
+		}
+		const isPositioned = () =>
+			overlay.style.visibility !== "hidden" &&
+			Number.parseFloat(overlay.style.width) > 0 &&
+			Number.parseFloat(overlay.style.height) > 0;
+		if (isPositioned()) {
+			setGeometryReady(true);
+			return;
+		}
+		const observer = new MutationObserver(() => {
+			if (!isPositioned()) return;
+			observer.disconnect();
+			setGeometryReady(true);
+		});
+		observer.observe(overlay, { attributes: true, attributeFilter: ["style"] });
+		return () => observer.disconnect();
+	}, [node, geometryReady]);
+	return { ref, geometryReady };
 }
 
 /**
@@ -59,16 +109,19 @@ export function usePanelHeaderDrag(
 	 * this panel elsewhere (e.g. tear it out onto the story-network canvas) without
 	 * parsing `panelId`'s `ndock-<kind>` shape.
 	 */
-	detach?: { toolKind: string; resourceId?: string },
+	detach?: { toolKind: string; resourceId?: string; largeFileConfirmed?: boolean },
 ): (e: React.PointerEvent) => void {
 	// Stamped onto the drag so a surface receiving the drop can tell "my own panel
 	// being rearranged" from "a panel belonging to another surface" — panel ids are
 	// global, so without it a foreign id would resolve against the wrong api.
+	const controls = usePanelHeaderControls();
 	const surfaceId = useDockviewSurfaceId();
 	const toolKind = detach?.toolKind;
 	const resourceId = detach?.resourceId;
+	const largeFileConfirmed = detach?.largeFileConfirmed === true;
 	return useCallback(
 		(e: React.PointerEvent) => {
+			if (controls?.onPointerDown?.(e)) return;
 			startPanelDrag({
 				panelId: props.api.id,
 				id: subjectId,
@@ -78,10 +131,20 @@ export function usePanelHeaderDrag(
 				...(surfaceId ? { surfaceId } : {}),
 				...(toolKind ? { toolKind } : {}),
 				...(resourceId ? { resourceId } : {}),
+				...(largeFileConfirmed ? { largeFileConfirmed: true } : {}),
 				x: e.clientX,
 				y: e.clientY,
 			});
 		},
-		[props.api, subjectId, subjectKind, surfaceId, toolKind, resourceId],
+		[
+			controls,
+			props.api,
+			subjectId,
+			subjectKind,
+			surfaceId,
+			toolKind,
+			resourceId,
+			largeFileConfirmed,
+		],
 	);
 }

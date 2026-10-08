@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
+import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
+import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -26,6 +29,8 @@ import {
 	finishApiRequest,
 	startApiRequest,
 } from "../lib/api-request-tracker";
+import { measureMessageCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
+import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
@@ -42,6 +47,8 @@ import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tra
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { FileReferenceContextTracker } from "./file-reference-context";
+import { storeNarratorContextUsage } from "./narrator-context-composition";
+import { completeAssistantOutput } from "./narrator-output-recovery";
 import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
@@ -51,6 +58,127 @@ import {
 	truncateToolIO,
 } from "./narrator-service";
 import { recordOutputChunk } from "./output-stats";
+import { toolInputStreamSource } from "./tool-input-stream-source";
+
+/** Maps are scoped to this consumer/session, not globally to provider tool ids. */
+const inputSourceContexts = hotSafe(
+	"toolInputSourceContexts",
+	() =>
+		new WeakMap<
+			EventHandlerContext,
+			{
+				attempt: string;
+				refs: Map<string, string>;
+			}
+		>(),
+);
+function inputSourceContext(ctx: EventHandlerContext) {
+	let state = inputSourceContexts.get(ctx);
+	if (!state) {
+		state = { attempt: randomUUID(), refs: new Map() };
+		inputSourceContexts.set(ctx, state);
+	}
+	return state;
+}
+function inputSourceId(ctx: EventHandlerContext, toolUseId: string): string {
+	const state = inputSourceContext(ctx);
+	let id = state.refs.get(toolUseId);
+	if (!id) {
+		id = toolInputStreamSource.create(
+			{ narratorId: ctx.narratorId, toolUseId, field: "content" },
+			`${ctx.conversationId}/${state.attempt}/${randomUUID()}`,
+		).id;
+		state.refs.set(toolUseId, id);
+	}
+	return id;
+}
+function snapshotInputDocument(
+	ctx: EventHandlerContext,
+	toolUseId: string,
+	update: TextDocumentStreamUpdate,
+): void {
+	const snap = getOrCreateSnapshot(ctx.narratorId);
+	const old = snap.toolChunks.get(toolUseId);
+	const parent = streamingSnapshots.get(ctx.broadcastTargetId)?.toolChunks.get(toolUseId);
+	const base = { ...old, ...parent };
+	const {
+		parentToolUseId: _parent,
+		subagentNarratorId: _child,
+		metadata: _metadata,
+		extractedFields: fields,
+		...self
+	} = base;
+	const filePath = fields?.file_path;
+	snap.toolChunks.set(toolUseId, {
+		toolCallId: null,
+		toolUseId,
+		toolName: "Write",
+		inputCharsTotal: 0,
+		...self,
+		...(filePath ? { extractedFields: { file_path: filePath.slice(0, 4096) } } : {}),
+		inputDocument: { ref: update.ref, offset: update.ref.length },
+	});
+}
+async function discardInputSources(ctx: EventHandlerContext, ids?: string[]): Promise<void> {
+	const state = inputSourceContexts.get(ctx);
+	if (!state) return;
+	for (const [toolUseId, refId] of state.refs) {
+		if (ids && !ids.includes(toolUseId)) continue;
+		await toolInputStreamSource.discard(refId);
+		state.refs.delete(toolUseId);
+	}
+}
+async function handoffWriteInput(
+	ctx: EventHandlerContext,
+	toolUseId: string,
+	content: string,
+	messageId: string,
+	binding: import("../lib/agent/types").ToolCallBinding,
+	allowRelease = false,
+): Promise<void> {
+	let refId = inputSourceId(ctx, toolUseId);
+	let ref = toolInputStreamSource.descriptor(refId);
+	if (ref.source?.toolCallId === binding.toolCallId && !allowRelease) return;
+	if (allowRelease && !(await toolInputStreamSource.matches(refId, content))) {
+		// Permission edits/retry attempts switch epoch; never mutate an already-observed raw source.
+		inputSourceContext(ctx).refs.delete(toolUseId);
+		refId = inputSourceId(ctx, toolUseId);
+		ref = toolInputStreamSource.descriptor(refId);
+	}
+	if (ref.length > content.length)
+		throw new CriticalEventPersistenceError("Write source exceeds final content");
+	await toolInputStreamSource.append(refId, content.slice(ref.length), ref.length, true);
+	const persisted = await toolInputStreamSource.handoff(
+		refId,
+		{
+			toolCallId: binding.toolCallId,
+			messageId,
+			executionAttempt: binding.attempt,
+		},
+		content.length,
+		allowRelease,
+	);
+	const inputDocument = { ref: persisted, offset: persisted.length };
+	snapshotInputDocument(ctx, toolUseId, inputDocument);
+	// Metadata-only alias update. Only self sees it; parent remains a summary.
+	broadcastToNarrator(ctx.narratorId, {
+		type: "tool_use_chunk",
+		narratorId: ctx.narratorId,
+		toolCallId: binding.toolCallId,
+		toolUseId,
+		toolName: "Write",
+		inputCharsTotal: ctx.toolUseCharsMap?.get(toolUseId) ?? 0,
+		streamingField: { name: "content", delta: "", offset: persisted.length, complete: true },
+		inputDocument,
+	});
+}
+
+function boundedWriteInput(input: Record<string, unknown>, update?: TextDocumentStreamUpdate) {
+	if (!update) return input;
+	return {
+		...(typeof input.file_path === "string" ? { file_path: input.file_path.slice(0, 4096) } : {}),
+	};
+}
 
 /**
  * Finish an already-started tool after its loop has drained/aborted. This intentionally
@@ -122,6 +250,7 @@ export async function persistDetachedToolResult(
  * - Subagent: broadcastTargetId === parentNarratorId, has parentToolUseId/subagentModel
  */
 export interface TokenUsageSnapshot {
+	contextSnapshot?: ContextUsageSnapshot;
 	promptTokens?: number;
 	inputTokens?: number;
 	completionTokens?: number;
@@ -310,6 +439,7 @@ export interface ToolChunkSnapshot {
 	parentToolUseId?: string;
 	subagentNarratorId?: string;
 	extractedFilePath?: string;
+	inputDocument?: TextDocumentStreamUpdate;
 	contentCharsReceived?: number;
 	extractedFields?: Record<string, string>;
 	metadata?: Record<string, unknown>;
@@ -330,6 +460,7 @@ export interface ToolChunkSnapshot {
 	executing?: boolean;
 	/** Input payload from tool_started */
 	input?: unknown;
+	streamingEditOrigin?: StreamingEditOrigin;
 	/** Timestamp from tool_started */
 	streamStartedAt?: number;
 	/** Timestamp sampled when the provider finished streaming tool input. */
@@ -397,6 +528,9 @@ export type SnapshotStreamingBlock =
 	  };
 
 export interface StreamingSnapshot {
+	/** Actual upstream request identity, not the narrator's configured defaults. */
+	model?: string;
+	provider?: string;
 	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
 	streamingBlocks: SnapshotStreamingBlock[];
 	toolChunks: Map<string, ToolChunkSnapshot>;
@@ -510,6 +644,9 @@ export function getStreamingSnapshot(narratorId: string): StreamingSnapshot | un
 /** Clear the streaming snapshot for a narrator (session end / error). */
 export function clearStreamingSnapshot(narratorId: string): void {
 	streamingSnapshots.delete(narratorId);
+	void toolInputStreamSource.discardUnpersisted(narratorId).catch(() => {
+		logger.warn("Tool input stream cleanup failed", { narratorId });
+	});
 }
 
 /** Reset one author's stream without deleting concurrently running relatives. */
@@ -607,6 +744,8 @@ function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): bool
 	dualBroadcast(ctx, resetMessage);
 
 	const snapshotData = {
+		model: snap.model,
+		provider: snap.provider,
 		streamingBlocks: snap.streamingBlocks,
 		toolChunks: [...snap.toolChunks.values()],
 	};
@@ -819,7 +958,7 @@ async function discardAttemptPersistedBlocks(
 	});
 	ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
 
-	const partialId = ctx.getPartialMessageId();
+	let partialId = ctx.getPartialMessageId();
 	// Correlated by requestId, not by "the most recent api_request_start": that event
 	// is flushed lazily, so an attempt that produced nothing emits its discard first.
 	// Recording here (idempotently) yields this attempt's own starting block count.
@@ -840,6 +979,12 @@ async function discardAttemptPersistedBlocks(
 			: [];
 		if (blocks.length <= baseline) return;
 
+		// An in-flight partial may have been forked. Keep execution/approval identity
+		// on the real owner while isolating sibling snapshots before any mutation.
+		partialId = await narratorPersistence.copyOnWriteMessage(narratorId, partialId, undefined, {
+			preserveExecutionOwner: true,
+		});
+		ctx.setPartialMessageId(partialId);
 		const discarded = blocks.slice(baseline);
 		const discardedToolUseIds = discarded.flatMap((block) =>
 			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
@@ -889,10 +1034,19 @@ async function discardAttemptPersistedBlocks(
 			)
 			.join("\n");
 
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: nextBlocks, contentText: contentText || null })
-			.where(eq(narratorMessages.id, partialId));
+		// A fork can acquire a ref after the earlier tool-isolation COW returned.
+		// Recheck membership and truncate atomically, never in a separate UPDATE.
+		partialId = await narratorPersistence.copyOnWriteMessage(
+			narratorId,
+			partialId,
+			{
+				contentJson: nextBlocks,
+				contentText: contentText || null,
+				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
+			},
+			{ preserveExecutionOwner: true },
+		);
+		ctx.setPartialMessageId(partialId);
 
 		logger.info("Discarded persisted blocks of a replayed attempt", {
 			narratorId,
@@ -909,6 +1063,7 @@ async function discardAttemptPersistedBlocks(
 		// Publish the truncated row (and bump the sync version, mirroring every other
 		// message mutation) so an attached client and a reconnecting one agree.
 		await bumpNarratorMessageVersion(narratorId);
+		queueContextCharacterRefresh(narratorId, partialId);
 		const updated = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, partialId),
 			with: { toolCalls: true },
@@ -1284,6 +1439,19 @@ export async function processEvent(
 		}
 
 		case "tool_call": {
+			let inputDocument: TextDocumentStreamUpdate | undefined;
+			if (event.toolName === "Write" && typeof event.input.content === "string") {
+				const refId = inputSourceId(ctx, event.toolUseId);
+				const ref = toolInputStreamSource.descriptor(refId);
+				if (ref.length > event.input.content.length)
+					throw new CriticalEventPersistenceError("Write source exceeds final content");
+				inputDocument = await toolInputStreamSource.append(
+					refId,
+					event.input.content.slice(ref.length),
+					ref.length,
+					true,
+				);
+			}
 			// Workspace captures belong to executeTool's awaited lifecycle, not UI events.
 			const routing = subagentToolRouting(ctx, event.toolUseId);
 			// The child row's label. Computed once and reused by both the snapshot and
@@ -1302,7 +1470,11 @@ export async function processEvent(
 					toolName: event.toolName,
 					inputCharsTotal: existing?.inputCharsTotal ?? 0,
 					started: true,
-					...(!ctx.parentToolUseId && { input: event.input }),
+					...(!ctx.parentToolUseId && {
+						input: boundedWriteInput(event.input, inputDocument),
+						streamingEditOrigin: event.streamingEditOrigin,
+					}),
+					...(!ctx.parentToolUseId && inputDocument ? { inputDocument } : {}),
 					...summaryField,
 					streamStartedAt: event.streamStartedAt,
 					streamCompletedAt: event.streamCompletedAt,
@@ -1314,7 +1486,9 @@ export async function processEvent(
 				...routing,
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
-				input: event.input,
+				input: boundedWriteInput(event.input, inputDocument),
+				streamingEditOrigin: event.streamingEditOrigin,
+				...(inputDocument ? { inputDocument } : {}),
 				streamStartedAt: event.streamStartedAt,
 				streamCompletedAt: event.streamCompletedAt,
 			};
@@ -1334,10 +1508,31 @@ export async function processEvent(
 						}
 					: selfMessage,
 			);
+			if (inputDocument) snapshotInputDocument(ctx, event.toolUseId, inputDocument);
 			return null;
 		}
 
 		case "tool_use_chunk": {
+			let inputDocument: TextDocumentStreamUpdate | undefined;
+			if (event.toolName === "Write" && event.streamingField?.name === "content") {
+				const field = event.streamingField;
+				const sourceContext = inputSourceContext(ctx);
+				const previousId = sourceContext.refs.get(event.toolUseId);
+				if (field.startsField && previousId) {
+					const previous = toolInputStreamSource.descriptor(previousId);
+					if (previous.length > 0 || previous.complete) {
+						// A restarted decoded field is a new occurrence, not an append into old raw offsets.
+						sourceContext.refs.delete(event.toolUseId);
+						if (!previous.source?.toolCallId) await toolInputStreamSource.discard(previousId);
+					}
+				}
+				inputDocument = await toolInputStreamSource.append(
+					inputSourceId(ctx, event.toolUseId),
+					field.delta,
+					field.offset,
+					field.complete,
+				);
+			}
 			// Clear "reasoning" substatus when tool use starts
 			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
 				ctx.removeSubstatus("reasoning").catch(() => {});
@@ -1406,6 +1601,7 @@ export async function processEvent(
 				...(event.extractedFields && { extractedFields: event.extractedFields }),
 				...(event.metadata && { metadata: event.metadata }),
 				...(event.streamingField && { streamingField: event.streamingField }),
+				...(inputDocument ? { inputDocument } : {}),
 			};
 			dualBroadcast(
 				ctx,
@@ -1426,6 +1622,7 @@ export async function processEvent(
 						}
 					: selfMessage,
 			);
+			if (inputDocument) snapshotInputDocument(ctx, event.toolUseId, inputDocument);
 			return null;
 		}
 
@@ -1553,6 +1750,7 @@ export async function processEvent(
 								...(tokenUsage.contextWindow != null && {
 									context_window: tokenUsage.contextWindow,
 								}),
+								...(tokenUsage.contextSnapshot && { context_snapshot: tokenUsage.contextSnapshot }),
 								...(tokenUsage.isEstimated && { is_estimated: true }),
 							}
 						: undefined,
@@ -1570,6 +1768,7 @@ export async function processEvent(
 					...(textBlockId ? { id: textBlockId } : {}),
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
+					...(block.completed != null ? { completed: block.completed } : {}),
 					...(fileReferenceContext ? { fileReferenceContext } : {}),
 					...(block.citations ? { citations: block.citations } : {}),
 				});
@@ -1588,6 +1787,7 @@ export async function processEvent(
 					...(block.id ? { id: block.id } : {}),
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
+					...(block.completed != null ? { completed: block.completed } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
 				});
@@ -1634,6 +1834,9 @@ export async function processEvent(
 				ctx.toolExecutionReceipts ??= new Map();
 				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
 				event.onToolPersisted?.(binding);
+				if (block.name === "Write" && typeof block.input.content === "string") {
+					await handoffWriteInput(ctx, block.toolUseId, block.input.content, partialId, binding);
+				}
 			} else if (block.type === "web_search") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "web_search",
@@ -1756,6 +1959,7 @@ export async function processEvent(
 						...(tokenUsage.contextWindow != null && {
 							context_window: tokenUsage.contextWindow,
 						}),
+						...(tokenUsage.contextSnapshot && { context_snapshot: tokenUsage.contextSnapshot }),
 						...(tokenUsage.isEstimated && { is_estimated: true }),
 					}
 				: undefined;
@@ -1786,6 +1990,7 @@ export async function processEvent(
 					content.push({
 						type: "text",
 						text: event.text,
+						completed: event.outputCompleted !== false,
 						...(fileReferenceContext ? { fileReferenceContext } : {}),
 						...(event.citations?.length ? { citations: event.citations } : {}),
 					});
@@ -1836,9 +2041,21 @@ export async function processEvent(
 						: undefined,
 				});
 				savedId = saved.id;
+				if (turnUsage)
+					await db
+						.update(narratorMessages)
+						.set({ turnUsageJson: turnUsage })
+						.where(eq(narratorMessages.id, savedId));
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
+			}
+
+			// A checkpoint/abort flush is not a completion boundary. Only this final
+			// successful event promotes remaining text/reasoning blocks to completed.
+			if (event.outputCompleted !== false) {
+				savedId = await completeAssistantOutput(narratorId, savedId);
+				if (partialId && savedId !== partialId) ctx.setPartialMessageId(savedId);
 			}
 
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
@@ -1858,8 +2075,16 @@ export async function processEvent(
 				if (reorderedContent) {
 					await db
 						.update(narratorMessages)
-						.set({ contentJson: reorderedContent })
+						.set({
+							contentJson: reorderedContent,
+							contextCharsJson: measureMessageCharacters(
+								"assistant",
+								reorderedContent,
+								fullMessage.contentText,
+							),
+						})
 						.where(eq(narratorMessages.id, savedId));
+					queueContextCharacterRefresh(narratorId, savedId);
 					fullMessage = { ...fullMessage, contentJson: reorderedContent };
 				}
 			}
@@ -1891,6 +2116,9 @@ export async function processEvent(
 					ctx.toolCallIdsMap.set(tu.toolUseId, binding.toolCallId);
 					ctx.toolExecutionReceipts.set(tu.toolUseId, { messageId: savedId, binding });
 					event.onToolPersisted?.(tu.toolUseId, binding);
+					if (tu.name === "Write" && typeof tu.input.content === "string") {
+						await handoffWriteInput(ctx, tu.toolUseId, tu.input.content, savedId, binding);
+					}
 				}
 			}
 
@@ -1998,6 +2226,8 @@ export async function processEvent(
 				binding?.toolCallId ?? ctx.preparedPlanModeToolCalls?.get(event.toolUseId);
 			// Snapshot: remove completed tool from active chunks
 			streamingSnapshots.get(broadcastTargetId)?.toolChunks.delete(event.toolUseId);
+			if (ctx.parentToolUseId)
+				streamingSnapshots.get(narratorId)?.toolChunks.delete(event.toolUseId);
 
 			const status = event.isError ? "fail" : "success";
 			const preparedPlanToolCallId = ctx.preparedPlanModeToolCalls?.get(event.toolUseId);
@@ -2208,6 +2438,29 @@ export async function processEvent(
 				}
 			}
 
+			const finalWriteInput = event.brokenInputOverride ?? event.updatedInput ?? event.input;
+			if (
+				event.toolName === "Write" &&
+				toolResultPersisted &&
+				binding &&
+				typeof finalWriteInput?.content === "string"
+			) {
+				const sourceMessageId =
+					receipt?.messageId ??
+					toolInputStreamSource.descriptor(inputSourceId(ctx, event.toolUseId)).source?.messageId;
+				if (sourceMessageId) {
+					await handoffWriteInput(
+						ctx,
+						event.toolUseId,
+						finalWriteInput.content,
+						sourceMessageId,
+						binding,
+						true,
+					);
+					streamingSnapshots.get(narratorId)?.toolChunks.delete(event.toolUseId);
+				}
+			}
+
 			if (preparedPlanToolCallId && !shouldCommitEnterPlanModeAtomically) {
 				ctx.preparedPlanModeToolCalls?.delete(event.toolUseId);
 				try {
@@ -2281,6 +2534,8 @@ export async function processEvent(
 		 * learn the tool is running rather than inferring it from `started`.
 		 */
 		case "tool_executing": {
+			const selfTool = streamingSnapshots.get(narratorId)?.toolChunks.get(event.toolUseId);
+			if (selfTool?.inputDocument) selfTool.executing = true;
 			{
 				const snap = getOrCreateSnapshot(broadcastTargetId);
 				const existing = snap.toolChunks.get(event.toolUseId);
@@ -2404,6 +2659,7 @@ export async function processEvent(
 		}
 
 		case "stream_reset": {
+			await discardInputSources(ctx);
 			// A reasoning-only dead turn was discarded. Clear the streaming snapshot
 			// (which still holds the live reasoning that will not be persisted) and
 			// tell the frontend to drop the streaming blocks it is currently showing.
@@ -2421,6 +2677,9 @@ export async function processEvent(
 		}
 
 		case "tool_use_discarded": {
+			await discardInputSources(ctx, event.toolUseIds);
+			const selfSnapshot = streamingSnapshots.get(narratorId);
+			for (const id of event.toolUseIds) selfSnapshot?.toolChunks.delete(id);
 			// A retried attempt abandoned tool ids whose arguments never finished
 			// streaming. Those cards exist only on the client (no tool-call row was
 			// ever created), and no later event would retire them — without this they
@@ -2539,9 +2798,14 @@ export async function processEvent(
 		case "context_usage": {
 			ctx.setContextUsagePct(event.percentage);
 			const previousUsage = ctx.getTokenUsage() ?? {};
+			const snapshot = boundedContextSnapshot(event.snapshot);
+			if (snapshot) await storeNarratorContextUsage(narratorId, snapshot);
 			ctx.setTokenUsage({
 				...previousUsage,
-				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+				...(snapshot ? { contextSnapshot: snapshot } : {}),
+				isEstimated: event.isEstimated === true,
+				...(event.promptTokens != null &&
+					(!event.source || event.source === "usage") && { promptTokens: event.promptTokens }),
 				...(event.inputTokens != null && { inputTokens: event.inputTokens }),
 				...(event.completionTokens != null && { completionTokens: event.completionTokens }),
 				...(event.reasoningTokens != null && { reasoningTokens: event.reasoningTokens }),
@@ -2556,7 +2820,6 @@ export async function processEvent(
 					cacheCreation1hTokens: event.cacheCreation1hTokens,
 				}),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-				...(event.isEstimated && { isEstimated: true }),
 			});
 
 			// Resolve active thresholds based on context window size
@@ -2569,10 +2832,12 @@ export async function processEvent(
 			dualBroadcast(ctx, {
 				type: "context_usage",
 				narratorId: broadcastTargetId,
+				source: event.source,
+				snapshot: snapshot ?? undefined,
 				percentage: event.percentage,
 				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-				...(event.isEstimated && { isEstimated: true }),
+				isEstimated: event.isEstimated === true,
 				...(isSubagent && { isSubagent: true }),
 				compactStart:
 					activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
@@ -2580,10 +2845,12 @@ export async function processEvent(
 			ctx.sseEmitter?.emit("event", {
 				type: "context_usage",
 				data: {
+					source: event.source,
+					snapshot: snapshot ?? undefined,
 					percentage: event.percentage,
 					...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 					...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-					...(event.isEstimated && { isEstimated: true }),
+					isEstimated: event.isEstimated === true,
 					compactStart:
 						activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 				},
@@ -2667,7 +2934,7 @@ export async function processEvent(
 				reason: event.reason,
 				message: event.message,
 			});
-			const invalidStateEvent = {
+			const invalidStateErrorEvent = {
 				type: "error",
 				error: {
 					type: "invalid_state",
@@ -2679,11 +2946,11 @@ export async function processEvent(
 			dualBroadcast(ctx, {
 				type: "stream_event",
 				narratorId: broadcastTargetId,
-				event: invalidStateEvent,
+				event: invalidStateErrorEvent,
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "stream_event",
-				data: invalidStateEvent,
+				data: invalidStateErrorEvent,
 			});
 			return null;
 		}
@@ -2876,6 +3143,28 @@ export async function processEvent(
 		}
 
 		case "api_request_start": {
+			// Counters and frozen classifications never carry across attempts.
+			ctx.setTokenUsage(undefined);
+			// This context is runtime state; durable checkpoints must use the same
+			// resolved request identity as the live row, not a configured model alias.
+			ctx.model = event.model;
+			ctx.provider = event.provider;
+			const snap = getOrCreateSnapshot(narratorId);
+			snap.model = event.model;
+			snap.provider = event.provider;
+			dualBroadcast(ctx, {
+				type: "streaming_identity",
+				narratorId: broadcastTargetId,
+				model: event.model,
+				provider: event.provider,
+				...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
+			});
+			const sourceContext = inputSourceContext(ctx);
+			if (sourceContext.attempt !== event.requestId) {
+				await toolInputStreamSource.discardUnpersisted(narratorId);
+				sourceContext.refs.clear();
+				sourceContext.attempt = event.requestId;
+			}
 			// Store request start info in context for later use
 			if (!ctx.apiRequestsMap) ctx.apiRequestsMap = new Map();
 			ctx.apiRequestsMap.set(
@@ -2903,6 +3192,7 @@ export async function processEvent(
 		}
 
 		case "attempt_discarded": {
+			if (inputSourceContexts.get(ctx)?.attempt === event.requestId) await discardInputSources(ctx);
 			// The loop is about to replay the identical request. Everything this attempt
 			// persisted must go: blocks are written as they complete, so leaving them
 			// would stack a near-identical copy of the reasoning and tool calls onto the
@@ -2929,6 +3219,40 @@ export async function processEvent(
 		}
 
 		case "api_request_end": {
+			const snapshot = boundedContextSnapshot(event.contextSnapshot);
+			if (snapshot) {
+				await storeNarratorContextUsage(narratorId, snapshot);
+				ctx.setTokenUsage({
+					...ctx.getTokenUsage(),
+					contextSnapshot: snapshot,
+					...(event.usage ?? {}),
+					...(event.usage ? { isEstimated: false } : {}),
+				});
+				if (snapshot.percentage != null) {
+					dualBroadcast(ctx, {
+						type: "context_usage",
+						narratorId: broadcastTargetId,
+						percentage: snapshot.percentage,
+						source: snapshot.source,
+						snapshot,
+						promptTokens: snapshot.occupiedTokens ?? undefined,
+						contextWindow: snapshot.contextWindow ?? undefined,
+						isEstimated: snapshot.source !== "usage",
+						...(ctx.parentToolUseId ? { isSubagent: true } : {}),
+					});
+					ctx.sseEmitter?.emit("event", {
+						type: "context_usage",
+						data: {
+							percentage: snapshot.percentage,
+							source: snapshot.source,
+							snapshot,
+							promptTokens: snapshot.occupiedTokens ?? undefined,
+							contextWindow: snapshot.contextWindow ?? undefined,
+							isEstimated: snapshot.source !== "usage",
+						},
+					});
+				}
+			}
 			// Create API request record in database
 			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
 			if (!requestInfo) {
@@ -2955,6 +3279,7 @@ export async function processEvent(
 					ttftMs: event.ttftMs ?? null,
 					durationMs: event.durationMs ?? null,
 					contextPercent: event.contextPercent ?? null,
+					contextSnapshot: snapshot,
 					meterUsage: event.meterUsage ?? null,
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,

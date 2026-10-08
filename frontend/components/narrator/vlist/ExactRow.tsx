@@ -21,7 +21,7 @@
 
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
-import { memo, type ReactNode, useLayoutEffect, useRef } from "react";
+import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
 import { MessageIdentityCtx } from "../MessageIdentityCtx";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { openCommunicationRecipient } from "./communication-navigation";
@@ -39,6 +39,7 @@ import type {
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { renderLabelsForKind, type VListRenderLabels } from "./useVListLabels";
+import type { UseVListToolDetailsResult } from "./useVListToolDetails";
 import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
 import { VListRowInteraction } from "./VListRowInteraction";
 import type { VListCompactRowActions } from "./vlist-compact-bridge";
@@ -58,6 +59,7 @@ import {
 	TRACE_KINDS,
 } from "./vlist-exact-row-state";
 import { type InjectionNavigation, injectInjectionBubbleChrome } from "./vlist-injection-header";
+import { VListInteractionRowBoundsContext } from "./vlist-interaction-admission-context";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListRowToolActions } from "./vlist-row-actions";
@@ -141,6 +143,7 @@ export interface ExactRowProps {
 	/** Interaction signature for this row's key; changes force a re-render. */
 	interactionSig: string;
 	toggles: RowToggles;
+	resolveToolDetailStatus?: UseVListToolDetailsResult["resolveToolDetailStatus"];
 	/** Localized chrome bundles for the render layer (stable across renders). */
 	renderLabels: VListRenderLabels;
 	/** Present when this row carries a single-block interaction menu. */
@@ -167,6 +170,7 @@ export interface ExactRowProps {
 	 * attachments stay non-interactive. HEIGHT-NEUTRAL.
 	 */
 	onOpenFilePanel?: (filePath: string) => void;
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 	/** Localized label for a clickable attachment row (tooltip / aria). */
 	openAttachmentLabel?: string;
 	/** Localized "was truncated" note painted inside an injection bubble. */
@@ -333,6 +337,12 @@ export interface ExactRowProps {
 	 * Height-neutral: it only swaps a glyph inside an already-reserved lane.
 	 */
 	specTaskLive?: boolean;
+	/**
+	 * Quote-strip jump: the shell's cross-page message jump, bound by the shell so
+	 * a reply strip click pages history until the target is covered. Absent → the
+	 * strip renders inert.
+	 */
+	onQuoteJump?: (targetId: string) => void;
 }
 
 /**
@@ -352,11 +362,13 @@ export const ExactRow = memo(
 		messageSeq,
 		messageRole,
 		toggles,
+		resolveToolDetailStatus,
 		renderLabels,
 		interaction,
 		rowInteraction,
 		closingRowKeys,
 		onOpenFilePanel,
+		onFetchAttachment,
 		openAttachmentLabel,
 		injectionNoteLabel,
 		reviewTruncatedLabel,
@@ -388,12 +400,35 @@ export const ExactRow = memo(
 		streamAnimMountEpoch,
 		streamAnimSnapshotEpoch,
 		specTaskLive,
+		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
+		// Read-only shares retain this reader-owned fold without enabling mutation/menu actions.
+		extra.textPreviewLabels = renderLabels.textPreview;
+		extra.onToggleTextExpanded = toggles.onToggleTextExpanded;
+		if (kind === "communication-bubble" && resolveToolDetailStatus) {
+			const source = item.spec.data as {
+				toolUseId?: string;
+				toolDetailRef?: Parameters<typeof resolveToolDetailStatus>[1];
+			};
+			if (source.toolUseId) {
+				const status = resolveToolDetailStatus(source.toolUseId, source.toolDetailRef);
+				extra.fullTextLoading = status.loading;
+				extra.fullTextError = status.error;
+			}
+		}
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
+		// Reply quote strip: wire the jump when the strip carries a reachable target.
+		if (kind === "message-bubble" && onQuoteJump) {
+			const quote = (item.spec.data as { quote?: { targetId?: string | null } | null })?.quote;
+			if (quote?.targetId) {
+				const targetId = quote.targetId;
+				extra.onQuoteClick = () => onQuoteJump(targetId);
+			}
+		}
 		// Which side the bubble sits on + its tint. Resolved here, not in the adapter:
 		// a teammate's turn and your own are the same height, so viewer identity must
 		// not reach the measured data (it would fork the cache per user).
@@ -432,6 +467,7 @@ export const ExactRow = memo(
 		// dockview surface. The path itself already rode along as height-neutral
 		// measure data, so this only binds the handler.
 		injectUserBubbleAttachmentOpen(kind, extra, onOpenFilePanel, openAttachmentLabel);
+		if (kind === "message-bubble") extra.onFetchAttachment = onFetchAttachment;
 		injectRenderLabels(kind, extra, renderLabels);
 		if (TOGGLEABLE_CARD_KINDS.has(kind)) {
 			extra.onToggle = toggles.onToggle;
@@ -578,6 +614,13 @@ export const ExactRow = memo(
 				// zero-DOM height prediction is untouched.
 				if (onTerminate && canTerminateTool(card.toolName)) {
 					cardExtra.onTerminate = onTerminate;
+				}
+				// "Open full session" for an Await-agent / single-target Send row. The
+				// trace element carries no per-row interaction, so bind from this row's
+				// own tool actions — the same source the subagent drill-down uses.
+				const drillToolActions = resolveRowToolActions?.(row.key);
+				if (drillToolActions?.onViewSubagentSession) {
+					cardExtra.onOpenSession = drillToolActions.onViewSubagentSession;
 				}
 				if (
 					resolveUpdateTimeout &&
@@ -726,6 +769,12 @@ export const ExactRow = memo(
 			extra.onTogglePrompt = toggles.onTogglePrompt;
 			extra.onToggleFileChanges = toggles.onToggleFileChanges;
 		}
+		// Await-agent / single-target Send card: same "open full session" button the
+		// subagent card draws, bound from the same row action. Only rows whose target
+		// resolved carry the action (buildRowToolActions), so the button never no-ops.
+		if (kind === "tool-call" && interaction?.toolActions?.onViewSubagentSession) {
+			extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+		}
 		// Long-running bash / MCP tools get the header terminate control (parity with
 		// the chunked InlineTerminateControl). Only cards that can actually be stopped
 		// receive the callback, so the button never appears where it would no-op.
@@ -828,6 +877,20 @@ export const ExactRow = memo(
 		// selection surface. The chunked path behaves the same way (its edit branch
 		// returns before ContentViewer), so the row temporarily has no
 		// data-block-id — expected, and it comes back when editing ends.
+		const immediateInteraction =
+			item.spec.opts?.streamingContent === true ||
+			animateStreaming === true ||
+			extra.isActive === true ||
+			specTaskLive === true ||
+			permissionSlot != null ||
+			editorSlot != null ||
+			(traceRowPermissionSlots?.size ?? 0) > 0 ||
+			askInPassingPending != null ||
+			(kind === "tool-call" && isRunningStatus((item.measured as MeasuredToolCall).status));
+		const admissionBounds = useMemo(
+			() => ({ top, height, immediate: immediateInteraction }),
+			[top, height, immediateInteraction],
+		);
 		const body = editorBody ?? renderElement(kind, item.measured, extra);
 		// A plain content row has no capped box of its own, so its viewer action bar
 		// wraps the whole row body. Never while editing: the editor replaces the row.
@@ -861,6 +924,8 @@ export const ExactRow = memo(
 							toolActions={interaction.toolActions}
 							onViewOriginal={interaction.onViewOriginal}
 							inspectContent={interaction.inspectContent}
+							selected={interaction.selected}
+							onToggleSelect={interaction.onToggleSelect}
 							onOpenFullscreen={
 								menuViewTarget && viewControls
 									? () => viewControls.openFullscreen(menuViewTarget)
@@ -937,13 +1002,15 @@ export const ExactRow = memo(
 							style={{ position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
 						/>
 					))}
-					{isDynamic ? (
-						<DynamicHeightReporter onHeight={onUnknownHeight}>
-							{interactiveBody}
-						</DynamicHeightReporter>
-					) : (
-						interactiveBody
-					)}
+					<VListInteractionRowBoundsContext.Provider value={admissionBounds}>
+						{isDynamic ? (
+							<DynamicHeightReporter onHeight={onUnknownHeight}>
+								{interactiveBody}
+							</DynamicHeightReporter>
+						) : (
+							interactiveBody
+						)}
+					</VListInteractionRowBoundsContext.Provider>
 				</div>
 				{/* The extended part of the hit box (the gap below this row) carries no
 				    text of its own, so a drag-selection crossing it would still fail to
@@ -973,6 +1040,8 @@ export const ExactRow = memo(
 		prev.item.measured === next.item.measured &&
 		prev.item.spec.key === next.item.spec.key &&
 		prev.item.spec.kind === next.item.spec.kind &&
+		prev.item.spec.opts === next.item.spec.opts &&
+		prev.item.spec.lifecycleId === next.item.spec.lifecycleId &&
 		// Painted as `data-nf-unit` (the LOD-independent row identity), so a change
 		// must reach the DOM even though it affects nothing else.
 		prev.item.spec.unitId === next.item.spec.unitId &&
@@ -985,10 +1054,13 @@ export const ExactRow = memo(
 		prev.messageRole === next.messageRole &&
 		prev.interactionSig === next.interactionSig &&
 		prev.toggles === next.toggles &&
+		prev.renderLabels === next.renderLabels &&
+		prev.resolveToolDetailStatus === next.resolveToolDetailStatus &&
 		prev.interaction === next.interaction &&
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
+		prev.onFetchAttachment === next.onFetchAttachment &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
 		prev.injectionNoteLabel === next.injectionNoteLabel &&
 		prev.reviewTruncatedLabel === next.reviewTruncatedLabel &&

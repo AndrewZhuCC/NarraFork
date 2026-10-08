@@ -1,6 +1,6 @@
-import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
+import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Badge,
@@ -39,23 +39,13 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import {
-	lazy,
-	Suspense,
-	useCallback,
-	useEffect,
-	useLayoutEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
 import { useGitWorkspace } from "../../hooks/useGit";
-import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
@@ -94,6 +84,11 @@ import {
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateExecutionDevice,
+	useWorkspaceContext,
+	workspaceFileTarget,
+} from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertScope } from "../../lib/api/narrators";
 import { statusRegistry } from "../../lib/constants";
@@ -117,35 +112,31 @@ import { type SelectionCommentPayload, SelectionPopover } from "../common/Select
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
+import { NarratorCompatibilityModal } from "../project/NarratorCompatibilityEntry";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
 } from "./background/BackgroundTasksDrawer";
 import { resolveChatCommentAnchor } from "./comment-anchor";
 import { addCommentDraft, createCommentDraft } from "./comment-draft-store";
-import {
-	COMPACTING_MARKER_ATTR,
-	CompactSummaryModal,
-	CompactSummaryModalCtx,
-} from "./compact/compact-summary-modal";
+import { COMPACTING_MARKER_ATTR, CompactSummaryModalCtx } from "./compact/compact-summary-modal";
 import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
-import { ContextThresholdSettingsModal } from "./context-management/ContextThresholdSettingsModal";
+import { ContextCompositionMenu } from "./context-management/ContextCompositionMenu";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { getFilePreviewType } from "./file-panel/FilePreviewModal";
+import { LargeFileGate } from "./file-panel/LargeFileGate";
 import { HeaderToolbar } from "./header/HeaderToolbar";
-import {
-	HEADER_LEADING_GAP_PX,
-	HEADER_ROW_PADDING_PX,
-	headerTitleLayoutWidth,
-	resolveHeaderLayoutAfterTitle,
-} from "./header/header-title-width";
+import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
+import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
+import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
@@ -162,16 +153,18 @@ import {
 	normalizeDangerReflectionLevel,
 	normalizeDangerReflectionOverride,
 } from "./interaction/reflection-types";
-import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
 import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
+import {
+	ordinaryPromoteDestination,
+	useNarratorForkActions,
+} from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
-import { useResolvedModel } from "./interaction/use-resolved-model";
+import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
@@ -193,8 +186,17 @@ import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
-import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
-import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
+import {
+	createResponsiveNarratorPanel,
+	NarratorPanelCompactContext,
+} from "./panels/compact-context";
+import {
+	CompactSummaryModal,
+	ContextThresholdSettingsModal,
+	LeakedToolCallModal,
+	RevertActionConfirmModal,
+	SetGlobalModelModal,
+} from "./panels/memoized-dialogs";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -203,12 +205,12 @@ import { useMessageSelection } from "./selection/use-message-selection";
 import { revealSpecFile } from "./spec/spec-file-reveal";
 import {
 	AllowRetryCtx,
-	FileModDrawerCtx,
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
 import { useNarratorAsyncQuestionSlots } from "./useNarratorAsyncQuestionSlots";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
+import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
@@ -220,11 +222,6 @@ const NarratorDetailsPanel = lazy(() =>
 
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
-);
-const FileModificationsDrawer = lazy(() =>
-	import("./file-panel/FileModificationsDrawer").then((module) => ({
-		default: module.FileModificationsDrawer,
-	})),
 );
 // Body of the read-only file viewer. Shared with the `file` dock panel — the
 // drawer below is just the off-dock (mobile) host for the same content, so both
@@ -246,14 +243,6 @@ const PretextExactMessageList = lazy(() =>
 	})),
 );
 
-/** Mount the lazy drawer only after it is first opened; keep it mounted on close. */
-export function shouldRenderFileModificationsDrawer(
-	opened: boolean,
-	hasBeenOpened: boolean,
-): boolean {
-	return opened || hasBeenOpened;
-}
-
 type CompactingMarkerKind = "context" | "segment";
 
 function getMessageViewportScrollBottom(scroller: HTMLElement) {
@@ -264,7 +253,11 @@ function _getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
 	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
 }
 
-export function NarratorPanel({
+export const NarratorPanel = createResponsiveNarratorPanel<NarratorPanelProps>(NarratorPanelBody);
+
+// Own query/WS/state updates still render normally; only the responsive compact flag
+// is excluded from this memo boundary and delivered directly to the two leaves.
+function NarratorPanelBody({
 	narratorId,
 	narrator: narratorProp,
 	onForkFromMessage,
@@ -274,7 +267,6 @@ export function NarratorPanel({
 	appendInputRef,
 	terminalOpen,
 	onToggleTerminal,
-	compact,
 	ownsHorizontalSafeArea = false,
 	onMinimize,
 	onBack,
@@ -285,29 +277,15 @@ export function NarratorPanel({
 	onOpenTerminalPanel,
 	workspacePreview,
 	suppressAutoFocusOnPromote,
-	fileModPanelOpen,
-	onToggleFileModPanel,
-	onFileModPropsChange,
 	detailsPanelOpen,
 	onToggleDetailsPanel,
 	onDetailsPropsChange,
 	specPanelOpen,
 	onToggleSpecPanel,
-}: NarratorPanelProps) {
+}: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
-	const humanAttentionQuery = useHumanAttention(!workspacePreview);
-	const attentionItems = loadedHumanAttentionItems(humanAttentionQuery.data?.pages);
-	// Only synchronous decisions owned by this session already have a tail prompt.
-	// Async asks (even when awaited), child sessions and unknown pages still need the inbox.
-	const showHumanAttentionInbox =
-		humanAttentionQuery.isError ||
-		humanAttentionQuery.hasNextPage ||
-		attentionItems.length === 0 ||
-		attentionItems.some(
-			(item) => item.narratorId !== narratorId || item.source === "question" || !item.blocking,
-		);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -316,9 +294,10 @@ export function NarratorPanel({
 	// bridges chat input to it, so sibling tool panels can consume it. Outside a
 	// provider these all fall back to the legacy prop callbacks.
 	const dock = useNarratorDockContext();
+	const workspaceDock = useWorkspaceDock();
 	const pluginSurface = usePluginUiSurface();
+	const workspaceId = pluginSurface?.hostContext.workspaceId;
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
-	const effOnFileModPropsChange = onFileModPropsChange ?? dock?.setFileModProps;
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
@@ -336,7 +315,7 @@ export function NarratorPanel({
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
 	// Keep an explicitly enabled narrator scan alive after its Git panel closes.
-	useGitWorkspace(isWorkspacePreview ? null : narratorId);
+	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
 	const [chunkTailMeta, setMessageListTailMeta] = useState<MessageListTailMeta>({
@@ -391,11 +370,12 @@ export function NarratorPanel({
 	} = useAllModels();
 	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
+	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
-	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const isMobileViewport = useMobileViewport();
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
 
@@ -478,19 +458,9 @@ export function NarratorPanel({
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useMutation({
-		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narratorExecutionDevices", narratorId] });
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
-			qc.resetQueries({ queryKey: ["gitWorkspace", narratorId] });
-		},
-		onError: (error) =>
-			notifications.show({
-				color: "red",
-				message: error instanceof Error ? error.message : String(error),
-			}),
-	});
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
+		notifications.show({ color: "red", message: error.message }),
+	);
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -500,13 +470,15 @@ export function NarratorPanel({
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
 		},
 	});
+	// Mutation result objects are render snapshots; the mutation method is stable.
+	const mutateSettings = updateSettingsMutation.mutate;
 	// Which global model the "edit" modal is targeting ("default" | "summary" | null).
 	const [globalModelEditTarget, setGlobalModelEditTarget] = useState<"default" | "summary" | null>(
 		null,
 	);
 	const handleSetDefaultModel = useCallback(
 		(model: string) => {
-			updateSettingsMutation.mutate(
+			mutateSettings(
 				{ agent: { defaultModel: model } },
 				{
 					onSuccess: () => {
@@ -516,11 +488,11 @@ export function NarratorPanel({
 				},
 			);
 		},
-		[updateSettingsMutation, t],
+		[mutateSettings, t],
 	);
 	const handleSetSummaryModel = useCallback(
 		(model: string) => {
-			updateSettingsMutation.mutate(
+			mutateSettings(
 				{ agent: { summaryModel: model } },
 				{
 					onSuccess: () => {
@@ -530,7 +502,7 @@ export function NarratorPanel({
 				},
 			);
 		},
-		[updateSettingsMutation, t],
+		[mutateSettings, t],
 	);
 	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
 	// is also how a stale "temporarily unavailable" flag gets cleared, since a
@@ -611,17 +583,12 @@ export function NarratorPanel({
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
-				if (data.type === "forked" && data.chapter) {
+				if (data.type === "forked") {
 					notifications.show({
 						message: t("promote_success_forked"),
 						color: "teal",
 					});
-					navigate({
-						to: "/projects/$projectId",
-						params: {
-							projectId: (data.chapter as Record<string, string>).projectId,
-						},
-					});
+					navigate(ordinaryPromoteDestination(data.narratorId));
 				} else {
 					notifications.show({
 						message: t("promote_success_unlocked"),
@@ -651,63 +618,41 @@ export function NarratorPanel({
 	 */
 	const hostOwnsTitle = dock?.hostOwnsTitle === true;
 
-	/*
-	 * Title-first header arithmetic (no flex fight):
-	 *   1. W = pretext measure of the COMPLETE title string
-	 *   2. Title box = W (fixed)
-	 *   3. Tools = resolveHeaderLayoutAfterTitle(rowWidth, W, …) → how many fit
-	 */
-	const headerRowRef = useRef<HTMLDivElement>(null);
-	const [headerRowWidth, setHeaderRowWidth] = useState(0);
-	/*
-	 * Skeleton early-return (`if (!narrator)` at the bottom) runs AFTER hooks: the
-	 * first layout pass sees `headerRowRef.current === null`. A dep array of only
-	 * `[headerRowReady]` would run once on mount, miss that null ref, and never
-	 * re-arm when the real header mounts — width would stay 0 and `unmeasured`
-	 * forever. Re-check every commit instead; setState to the same value bails out.
-	 */
-	const [headerRowReady, setHeaderRowReady] = useState(false);
-	useLayoutEffect(() => {
-		if (headerRowRef.current) {
-			setHeaderRowReady(true);
-			return;
-		}
-		setHeaderRowReady(false);
-	});
-	useLayoutEffect(() => {
-		if (!headerRowReady) return;
-		const el = headerRowRef.current;
-		if (!el) return;
-		const read = () => {
-			const w = el.getBoundingClientRect().width;
-			if (w > 0) setHeaderRowWidth(w);
-		};
-		read();
-		if (typeof ResizeObserver === "undefined") {
-			window.addEventListener("resize", read);
-			return () => window.removeEventListener("resize", read);
-		}
-		const ro = new ResizeObserver(read);
-		ro.observe(el);
-		return () => ro.disconnect();
-	}, [headerRowReady]);
-
 	const headerDisplayTitle = narrator?.title || t("untitled");
 	const headerTitleFullWidth = useMemo(() => {
 		if (hostOwnsTitle || isWorkspacePreview) return 0;
 		return headerTitleLayoutWidth(headerDisplayTitle);
 	}, [hostOwnsTitle, isWorkspacePreview, headerDisplayTitle]);
 
+	// Single predicate for the leading chrome slot: the layout budget
+	// (`showBack`) and the render branch below must never disagree. A
+	// host-provided `onBack` (subagent → parent, workspace origin) wins over
+	// the chapterId surrender — subagents inherit the parent's chapterId, and
+	// without this their header has no way back at all.
+	const showLeadingChrome = showHeaderLeadingChrome({
+		isWorkspacePreview,
+		onMinimize,
+		chapterId,
+		onBack,
+	});
+
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
-	// resolves the actual member at request time).
+	// resolves the actual member at request time). A follow-parent subagent
+	// resolves through its server-reported inheritance instead of the raw
+	// `__parent__` sentinel, which no capability lookup can parse.
 	// Only the model *resolution* stays in the panel: resolvedModel feeds the NUG
 	// quota, Kimi usage and context-threshold queries and the WS state below. The
 	// reasoning/codex/fast-mode/permission control derivations moved down into the
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
-		useResolvedModel(narrator?.model, defaultModelValue, aggregations, allModels);
+		useResolvedModel(
+			capabilityModelReference(narrator?.model, narrator?.modelInheritance?.model),
+			defaultModelValue,
+			aggregations,
+			allModels,
+		);
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -1173,27 +1118,9 @@ export function NarratorPanel({
 		});
 	}, [dockSetBrowserInfo, wsState.browserSessionCount, wsState.browserVisualChange]);
 
-	// Auto-open the browser dock panel when a NEW session appears (count rises).
-	// The first observed value only seeds the ref so an initial load / reconnect
-	// with pre-existing sessions doesn't force the panel open — only a genuine
-	// increase (a freshly created session) triggers it. Opening an already-open
-	// panel just re-activates it, which is fine when a second session starts.
+	// Browser session updates only refresh panel data and badges. Opening the
+	// browser panel is a user action, not a side effect of loading sessions.
 	const dockOpenToolPanel = dock?.openToolPanel;
-	const prevBrowserSessionCountRef = useRef<number | undefined>(undefined);
-	useEffect(() => {
-		const prev = prevBrowserSessionCountRef.current;
-		const cur = wsState.browserSessionCount;
-		prevBrowserSessionCountRef.current = cur;
-		if (prev === undefined) return;
-		if (cur > prev && !isWorkspacePreview && browserSessionsCapability.supported !== false) {
-			dockOpenToolPanel?.("browser");
-		}
-	}, [
-		dockOpenToolPanel,
-		wsState.browserSessionCount,
-		isWorkspacePreview,
-		browserSessionsCapability.supported,
-	]);
 
 	const {
 		disconnected,
@@ -1204,10 +1131,10 @@ export function NarratorPanel({
 		setQueuedMessages,
 		reconcileBufferedMessages,
 		substatus,
+		contextSnapshot,
 		contextPercent,
 		promptTokens,
 		contextWindow,
-		isEstimated,
 		contextStale,
 		activeCompactStart,
 		compactProgress,
@@ -1385,48 +1312,6 @@ export function NarratorPanel({
 		effOnDetailsPropsChange(detailsPanelExternalProps);
 	}, [dock, detailsOpened, detailsPanelExternalProps, narrator, effOnDetailsPropsChange]);
 
-	// File modifications drawer/panel state
-	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
-	// otherwise use internal state (mobile drawer / workspace fallback).
-	const [internalFileModOpen, setInternalFileModOpen] = useState(false);
-	const fileModDrawerOpened = dock
-		? dock.openToolTypes.has("filemod")
-		: onToggleFileModPanel
-			? (fileModPanelOpen ?? false)
-			: internalFileModOpen;
-	const [fileModDrawerHasOpened, setFileModDrawerHasOpened] = useState(false);
-	useEffect(() => {
-		if (fileModDrawerOpened) setFileModDrawerHasOpened(true);
-	}, [fileModDrawerOpened]);
-	const fileModPanelOpenRef = useRef(fileModPanelOpen ?? false);
-	fileModPanelOpenRef.current = fileModPanelOpen ?? false;
-	const externalSetFileModOpened = useCallback(
-		(v: boolean | ((prev: boolean) => boolean)) => {
-			if (!onToggleFileModPanel) return;
-			if (typeof v === "function") {
-				const next = v(fileModPanelOpenRef.current);
-				if (next !== fileModPanelOpenRef.current) onToggleFileModPanel();
-			} else if (v !== fileModPanelOpenRef.current) {
-				onToggleFileModPanel();
-			}
-		},
-		[onToggleFileModPanel],
-	);
-	const dockFileModToggle = useCallback(
-		(v: boolean | ((prev: boolean) => boolean)) => {
-			if (!dock) return;
-			const cur = dock.openToolTypes.has("filemod");
-			const next = typeof v === "function" ? v(cur) : v;
-			if (next !== cur) dock.toggleToolPanel("filemod");
-		},
-		[dock],
-	);
-	const setFileModDrawerOpened = dock
-		? dockFileModToggle
-		: onToggleFileModPanel
-			? externalSetFileModOpened
-			: setInternalFileModOpen;
-
 	// Spec toggle: three mutually-exclusive routes, in precedence order.
 	//  1. dock spec tab   — the unified surface, but ONLY for the dock's own base
 	//     narrator. When a subagent session is pushed into the dock, `dock.narratorId`
@@ -1515,6 +1400,15 @@ export function NarratorPanel({
 			version: string;
 			hash: string;
 		}) => {
+			if (workspaceDock && pluginSurface) {
+				workspaceDock.openPluginPanel(narratorId, pick, {
+					...pluginSurface.hostContext,
+					narratorId,
+					chapterId,
+					projectId,
+				});
+				return;
+			}
 			const api = dockApiRef?.current;
 			if (!api) return;
 			// A plugin contribution is a singleton per narrator surface: re-picking it
@@ -1545,10 +1439,8 @@ export function NarratorPanel({
 			});
 			api.addPanel(request);
 		},
-		[dockApiRef, pluginSurface, narratorId, chapterId, projectId],
+		[dockApiRef, pluginSurface, narratorId, chapterId, projectId, workspaceDock],
 	);
-	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
-	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
 
 	// ── Asynchronous questions (AskUserQuestion with `async: true`) ──────────
 	//
@@ -1561,49 +1453,11 @@ export function NarratorPanel({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, !isWorkspacePreview);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, true, isWorkspacePreview);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
 	);
-
-	// Get the first pending Write/Edit permission for the drawer
-	const firstEditPermission = useMemo(() => {
-		for (const perm of renderPermCb.pendingPermissions) {
-			if (perm.toolName === "Write" || perm.toolName === "Edit") {
-				return perm;
-			}
-		}
-		return null;
-	}, [renderPermCb.pendingPermissions]);
-
-	// Expose file-mod panel props to parent for desktop sidebar rendering
-	useEffect(() => {
-		if (effOnFileModPropsChange) {
-			effOnFileModPropsChange({
-				narratorId,
-				pendingPermission: firstEditPermission,
-				onPermissionDecision: renderPermCb.onPermissionDecision,
-				deletePreviewMessageId,
-				onConfirmDelete: () => {
-					pendingDeleteCallback?.();
-					setDeletePreviewMessageId(null);
-					setPendingDeleteCallback(null);
-				},
-				onCancelDelete: () => {
-					setDeletePreviewMessageId(null);
-					setPendingDeleteCallback(null);
-				},
-			});
-		}
-	}, [
-		effOnFileModPropsChange,
-		narratorId,
-		firstEditPermission,
-		renderPermCb.onPermissionDecision,
-		deletePreviewMessageId,
-		pendingDeleteCallback,
-	]);
 
 	const isWorking = narrator?.status === "working";
 	/**
@@ -1652,7 +1506,7 @@ export function NarratorPanel({
 	const handleSaveContextThresholdSettings = useCallback(
 		// `normalized` is already clamped/rounded by the modal.
 		(normalized: ContextManagementDraft) => {
-			updateSettingsMutation.mutate(
+			mutateSettings(
 				{
 					agent: {
 						contextThresholds: normalized.contextThresholds,
@@ -1667,7 +1521,7 @@ export function NarratorPanel({
 				},
 			);
 		},
-		[closeContextThresholdSettings, t, updateSettingsMutation],
+		[closeContextThresholdSettings, t, mutateSettings],
 	);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
@@ -1723,17 +1577,19 @@ export function NarratorPanel({
 	 * the blue-toned neutral from the status registry so they read as "the system is
 	 * waiting", not "you need to do something".
 	 */
-	const workIndicatorColor = isRetrying
-		? "yellow"
-		: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
-			? "orange"
-			: isWaitingForRecovery
-				? modelUnavailableColor
-				: isWaiting
-					? "yellow"
-					: isPlanning
-						? "green"
-						: "blue";
+	const workIndicatorColor = substatus.includes("reflecting")
+		? statusRegistry.narratorSubstatus("reflecting").color
+		: isRetrying
+			? "yellow"
+			: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
+				? "orange"
+				: isWaitingForRecovery
+					? modelUnavailableColor
+					: isWaiting
+						? "yellow"
+						: isPlanning
+							? "green"
+							: "blue";
 
 	// --- Turn elapsed timer ---
 	// Hooks must stay above the `if (!narrator) return` early exit below.
@@ -1781,13 +1637,6 @@ export function NarratorPanel({
 			latestSpecTasksToolUseId: chunkTailMeta.latestSpecTasksToolUseId ?? null,
 		}),
 		[isWorking, chunkTailMeta.latestSpecTasksToolUseId],
-	);
-
-	const fileModDrawerCtxValue = useMemo(
-		() => ({
-			openForApproval: () => setFileModDrawerOpened(true),
-		}),
-		[setFileModDrawerOpened],
 	);
 
 	// What the composer currently holds, split by ownership: the text flag comes
@@ -1860,6 +1709,56 @@ export function NarratorPanel({
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 	});
+
+	// Slash-command handlers for /fork and /compact, mirroring the manual
+	// controls exactly: fork from the latest real message (its right-click fork
+	// action — chapter-bound narrators open the same host fork flow), and trigger
+	// a compaction (the context-ring "compact now" action, with the same
+	// capability gating handleCompactBefore applies).
+	const handleForkCommand = useCallback(() => {
+		const lastMessage = effectiveLastMessage;
+		if (!lastMessage || String(lastMessage.id).startsWith("optimistic-") || !forkHandler) {
+			notifications.show({
+				title: t("slashForkNoMessage"),
+				message: "",
+				color: "yellow",
+				autoClose: 4000,
+			});
+			return;
+		}
+		forkHandler(lastMessage.id);
+	}, [effectiveLastMessage, forkHandler, t]);
+
+	const handleCompactCommand = useCallback(() => {
+		if (!compactSupported) {
+			notifications.show({
+				title: t("compactUnsupportedTitle"),
+				message: compactUnsupportedReason,
+				color: "yellow",
+			});
+			return;
+		}
+		if (compactUsesFallbackSummary) {
+			notifications.show({
+				title: t("compactFallbackSummaryTitle"),
+				message: compactFallbackSummaryReason,
+				color: "yellow",
+				autoClose: 5000,
+			});
+		}
+		// Compacting state will arrive via substatus_change WS event
+		api.triggerCompact(narratorId).catch((err) => {
+			handleCompactError(err);
+		});
+	}, [
+		narratorId,
+		handleCompactError,
+		compactSupported,
+		compactUnsupportedReason,
+		compactUsesFallbackSummary,
+		compactFallbackSummaryReason,
+		t,
+	]);
 	// --- Message rendering setup ---
 
 	// --- Multi-select (state + range/toggle handlers + toolbar + batch actions) ---
@@ -1934,25 +1833,29 @@ export function NarratorPanel({
 	const [mobileToolPanel, setMobileToolPanel] = useState<MobileToolPanelKind | null>(null);
 	/** Off-dock host state for the background-tasks drawer. */
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
+	/**
+	 * Compatibility modal state lives here, not in the overflow menu: the menu's
+	 * dropdown unmounts on close and would take a nested modal down with it.
+	 */
+	const [compatibilityOpen, setCompatibilityOpen] = useState(false);
+	/**
+	 * Only an explicit project context gets the menu entry: without one the modal
+	 * is just a directory of links, which is noise in the toolbar menu.
+	 */
+	const compatibilityProjectId =
+		workspaceContext?.contextProjectId ?? projectId ?? narrator?.contextProjectId;
+	/** Stable identity so HeaderToolbar's memo is not busted every render. */
+	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
 	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
 
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
 	// Drawer). Kept lifted here: its handlers feed the fileReferenceScope memo
 	// below (consumed by descendants) and the Drawer lives in this panel's JSX.
-	const fileReferenceDevice = executionDevicesQuery.data
-		? (executionDevicesQuery.data.defaultDeviceId ?? "local")
-		: undefined;
-	const fileReferenceCwd =
-		fileReferenceDevice === "local"
-			? (fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath)
-			: executionDevicesQuery.data?.devices.find((device) => device.id === fileReferenceDevice)
-					?.defaultCwd;
+	// Never pair a freshly selected device with a cached local cwd. The server's
+	// single revisioned snapshot owns # references, the file tree and default cwd.
 	const fileReferenceContext = useMemo<FileReferenceContext | null>(
-		() =>
-			fileReferenceDevice && fileReferenceCwd
-				? { deviceId: fileReferenceDevice, cwd: fileReferenceCwd }
-				: null,
-		[fileReferenceDevice, fileReferenceCwd],
+		() => workspaceFileTarget(workspaceContext),
+		[workspaceContext],
 	);
 	const {
 		internalFileViewerPath,
@@ -2088,6 +1991,22 @@ export function NarratorPanel({
 		}
 	}, []);
 
+	const handleDetachBash = useCallback(
+		async (toolUseId: string) => {
+			try {
+				await api.detachBash(narratorId, toolUseId);
+			} catch (error) {
+				// Completion can race the menu click; the server is authoritative.
+				if (error instanceof ApiError && error.status === 409) return;
+				notifications.show({
+					color: "red",
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+		[narratorId],
+	);
+
 	const handleCancelSubagentBackground = useCallback(
 		async (subagentNarratorId: string) => {
 			try {
@@ -2141,6 +2060,7 @@ export function NarratorPanel({
 			// Gated on provider capability, mirroring SubagentCard: an unsupported
 			// backend hides the item rather than failing on click.
 			onDetachSubagent: canDetachSubagentToBackground ? handleDetachSubagent : undefined,
+			onDetachBash: handleDetachBash,
 			onCancelBackgroundTask: canCancelSubagentBackground
 				? handleCancelSubagentBackground
 				: undefined,
@@ -2168,6 +2088,7 @@ export function NarratorPanel({
 			handleVlistViewSubagentSession,
 			canDetachSubagentToBackground,
 			handleDetachSubagent,
+			handleDetachBash,
 			canCancelSubagentBackground,
 			handleCancelSubagentBackground,
 			handleOpenFilePanel,
@@ -2576,6 +2497,8 @@ export function NarratorPanel({
 		setNarratorWorking,
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+		onForkCommand: handleForkCommand,
+		onCompactCommand: handleCompactCommand,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
@@ -2646,7 +2569,7 @@ export function NarratorPanel({
 	const headerHostCapabilities = useMemo<NarratorToolbarHost[]>(() => {
 		if (isWorkspacePreview) return ["inline"];
 		// A drawer host exists whenever this panel is not a lightweight preview: it
-		// either owns its own drawers (details / filemod / spec) or is handed one by
+		// either owns its own drawers (details / spec) or is handed one by
 		// the route (terminal), and MobileToolPanelHost covers the rest.
 		const caps: NarratorToolbarHost[] = ["inline", "drawer"];
 		if (dock) caps.push("dock");
@@ -2688,13 +2611,11 @@ export function NarratorPanel({
 		executionDevicesQuery,
 		mobileTasksOpen,
 		mobileToolPanel,
-		fileModDrawerOpened,
 		detailsOpened,
 		terminalToolOpened,
 		specToolOpened,
 		setMobileTasksOpen,
 		setMobileToolPanel,
-		setFileModDrawerOpened,
 		toggleDetails,
 		toggleTerminalTool,
 		toggleSpecTool,
@@ -2707,27 +2628,6 @@ export function NarratorPanel({
 		onCreateSubagent: !isSubagent && !isWorkspacePreview ? handleCreateSubagent : undefined,
 		t,
 	});
-
-	/** Title-first: full pretext W fixed, then tools packed into the remainder. */
-	const headerLayout = useMemo(
-		() =>
-			resolveHeaderLayoutAfterTitle({
-				rowWidth: headerRowWidth,
-				titleFullWidth: headerTitleFullWidth,
-				showBack: !isWorkspacePreview,
-				showTitleActions: !hostOwnsTitle && !isWorkspacePreview,
-				surfacedToolCount: toolbarController.toolbarSurfacedDefs.length,
-				showClose: !!onClose,
-			}),
-		[
-			headerRowWidth,
-			headerTitleFullWidth,
-			isWorkspacePreview,
-			hostOwnsTitle,
-			toolbarController.toolbarSurfacedDefs.length,
-			onClose,
-		],
-	);
 
 	// Memoized so header capacity changes do not rebuild bottom actions on every
 	// incidental panel render; capacity itself lives inside HeaderToolbar.
@@ -2764,7 +2664,29 @@ export function NarratorPanel({
 		[toolbarInlineControls, toolbarController, narratorId, toolbarBadgeCounts, t],
 	);
 
-	if (!narrator) return <NarratorPanelSkeleton />;
+	const closeLeakedToolCallModal = useCallback(
+		() => setLeakedToolEvent(null),
+		[setLeakedToolEvent],
+	);
+	const closeGlobalModelModal = useCallback(() => setGlobalModelEditTarget(null), []);
+	const openGlobalAgentSettings = useCallback(
+		() => navigate({ to: "/settings/agent" }),
+		[navigate],
+	);
+	const cancelRollback = useCallback(() => {
+		if (!revertHistorySubmitting) setPendingRollback(null);
+	}, [revertHistorySubmitting, setPendingRollback]);
+	const cancelBlockDelete = useCallback(() => {
+		if (!revertHistorySubmitting) setPendingBlockDelete(null);
+	}, [revertHistorySubmitting, setPendingBlockDelete]);
+
+	// List props are not detail readiness: wait until the workspace shape is known
+	// before exposing messages, otherwise a late Git strip shifts the whole panel.
+	if (
+		!narrator ||
+		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
+	)
+		return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,
@@ -2778,6 +2700,7 @@ export function NarratorPanel({
 	 * twice. See planNarratorWorkIndicator for the invariant.
 	 */
 	const workIndicatorPlan = planNarratorWorkIndicator({
+		isReflecting: substatus.includes("reflecting"),
 		isRetrying,
 		isBlockingCompacting,
 		isBackgroundCompacting,
@@ -2826,7 +2749,13 @@ export function NarratorPanel({
 			: "Context";
 	const contextRingNode = (
 		<Box
+			component="button"
+			type="button"
+			aria-label={t("contextComposition.title")}
 			style={{
+				border: 0,
+				padding: 0,
+				background: "transparent",
 				position: "relative",
 				width: 24,
 				height: 24,
@@ -2879,68 +2808,62 @@ export function NarratorPanel({
 	const contextIndicator = isWorkspacePreview ? (
 		contextRingNode
 	) : (
-		<Menu position="top-start">
-			<Menu.Target>{contextRingNode}</Menu.Target>
-			<Menu.Dropdown>
-				{contextStale && (
-					<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
-						{t("contextStaleHint")}
-					</Menu.Label>
-				)}
-				<Menu.Label c="dimmed" fz={10}>
-					{t("activeThresholds", {
-						compact: activeCompactStart ?? modelThresholds?.compactStart,
-					})}
+		<ContextCompositionMenu
+			narratorId={narratorId}
+			totalTokens={promptTokens}
+			snapshot={contextSnapshot}
+			target={contextRingNode}
+		>
+			<Menu.Label c="dimmed" fz={10}>
+				{t("activeThresholds", {
+					compact: activeCompactStart ?? modelThresholds?.compactStart,
+				})}
+			</Menu.Label>
+			<Menu.Item
+				leftSection={<IconSettings size={14} />}
+				c="dimmed"
+				fz="xs"
+				onClick={handleOpenContextThresholdSettings}
+			>
+				{t("thresholdSettings")}
+			</Menu.Item>
+			<Menu.Divider />
+			{hasContextData && (
+				<Menu.Label>{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}</Menu.Label>
+			)}
+			{promptTokens != null && (
+				<Menu.Label>
+					{contextWindow != null
+						? t("contextUsageTokensWithWindow", {
+								tokens: formatCompactNumber(promptTokens).compact,
+								window: formatCompactNumber(contextWindow).compact,
+							})
+						: t("contextUsageTokens", {
+								tokens: formatCompactNumber(promptTokens).compact,
+							})}
 				</Menu.Label>
-				<Menu.Item
-					leftSection={<IconSettings size={14} />}
-					c="dimmed"
-					fz="xs"
-					onClick={handleOpenContextThresholdSettings}
-				>
-					{t("thresholdSettings")}
-				</Menu.Item>
-				<Menu.Divider />
-				{hasContextData && (
-					<Menu.Label>
-						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-					</Menu.Label>
-				)}
-				{promptTokens != null && (
-					<Menu.Label>
-						{contextWindow != null
-							? t("contextUsageTokensWithWindow", {
-									tokens: formatLocaleNumber(promptTokens),
-									window: formatLocaleNumber(contextWindow),
-								})
-							: t("contextUsageTokens", {
-									tokens: formatLocaleNumber(promptTokens),
-								})}
-						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
-					</Menu.Label>
-				)}
-				<Menu.Divider />
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						// Compacting state will arrive via substatus_change WS event
-						api.triggerCompact(narratorId).catch((err) => {
-							handleCompactError(err);
-						});
-					}}
-				>
-					{t("triggerCompact")}
-				</Menu.Item>
-				<Menu.Item
-					leftSection={<IconEraser size={14} />}
-					onClick={() => {
-						api.clearContext(narratorId).catch(() => {});
-					}}
-				>
-					{t("clearContext")}
-				</Menu.Item>
-			</Menu.Dropdown>
-		</Menu>
+			)}
+			<Menu.Divider />
+			<Menu.Item
+				leftSection={<IconArrowsMinimize size={14} />}
+				onClick={() => {
+					// Compacting state will arrive via substatus_change WS event
+					api.triggerCompact(narratorId).catch((err) => {
+						handleCompactError(err);
+					});
+				}}
+			>
+				{t("triggerCompact")}
+			</Menu.Item>
+			<Menu.Item
+				leftSection={<IconEraser size={14} />}
+				onClick={() => {
+					api.clearContext(narratorId).catch(() => {});
+				}}
+			>
+				{t("clearContext")}
+			</Menu.Item>
+		</ContextCompositionMenu>
 	);
 
 	// Configuration controls stay fixed; movable tools follow the saved bottom order.
@@ -2997,148 +2920,137 @@ export function NarratorPanel({
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
 					    fixed title @ pretext W, then only tools that fit after it. */}
-					<div
-						ref={headerRowRef}
-						className={onHeaderPointerDown ? "nf-panel-header" : undefined}
-						style={{
-							display: "flex",
-							alignItems: "center",
-							flexWrap: "nowrap",
-							// Must match HEADER_ROW_GAP_PX / HEADER_LEADING_GAP_PX in header-title-width.
-							gap: HEADER_LEADING_GAP_PX,
-							padding: `8px ${HEADER_ROW_PADDING_PX / 2}px`,
-							borderBottom: "1px solid var(--mantine-color-default-border)",
-							flexShrink: 0,
-							overflow: "hidden",
-							cursor: onHeaderPointerDown ? "grab" : undefined,
-						}}
-						onPointerDown={
-							onHeaderPointerDown
-								? (e: React.PointerEvent) => {
-										// Skip drag initiation when clicking interactive elements
-										const el = e.target as HTMLElement;
-										if (el.closest("button, a, input, select, textarea, [role='button']")) return;
-										onHeaderPointerDown(e);
-									}
-								: undefined
-						}
+					<NarratorHeaderLayout
+						titleFullWidth={headerTitleFullWidth}
+						showBack={showLeadingChrome}
+						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
+						showClose={!!onClose}
+						onHeaderPointerDown={onHeaderPointerDown}
 					>
-						{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
-						<div
-							style={{
-								display: "flex",
-								alignItems: "center",
-								gap: HEADER_LEADING_GAP_PX,
-								flexWrap: "nowrap",
-								flex: "0 0 auto",
-								minWidth: 0,
-								maxWidth: "100%",
-								overflow: "hidden",
-							}}
-						>
-							{!isWorkspacePreview &&
-								(onMinimize ? (
-									<Tooltip label={t("backToGraph")} position="right">
-										<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
-											<IconArrowsMinimize size={16} />
-										</ActionIcon>
-									</Tooltip>
-								) : onBack ? (
-									<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
-										<IconArrowLeft size={16} />
-									</ActionIcon>
-								) : onOpenStandalonePage ? (
-									<Tooltip label={t("openStandalonePage")} position="right">
-										<ActionIcon
-											size="sm"
-											variant="subtle"
-											color="gray"
-											onClick={onOpenStandalonePage}
-										>
-											<IconExternalLink size={16} />
-										</ActionIcon>
-									</Tooltip>
-								) : compact ? (
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										color="gray"
-										onClick={() =>
-											navigate({
-												to: "/narrators/$narratorId",
-												params: { narratorId },
-												search: { from: "graph" },
-											})
-										}
-									>
-										<IconExternalLink size={16} />
-									</ActionIcon>
-								) : (
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										color="gray"
-										onClick={() => navigate({ to: ".." })}
-									>
-										<IconArrowLeft size={16} />
-									</ActionIcon>
-								))}
-							{/*
-							 * `flex: 1` even when the title is suppressed: it is what pushes the
-							 * tool row to the right edge, and it hands the freed width to those
-							 * buttons instead of leaving a gap where the title used to be.
-							 *
-							 * The floor that keeps the title readable is the capacity BUDGET
-							 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
-							 * would win against the tool row's `flex-shrink: 0` only by overflowing
-							 * or wrapping a nowrap row — both worse than the truncation it would
-							 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
-							 * budgets it by policy instead of reading a width this element derives
-							 * from whatever the tool row left over.
-							 */}
-							<NarratorPanelHeaderTitle
-								narratorId={narratorId}
-								narrator={narrator}
-								hostOwnsTitle={hostOwnsTitle}
-								isWorkspacePreview={isWorkspacePreview}
-								titleFullWidth={headerLayout.titleWidth}
-							/>
-							{disconnected && !isWorkspacePreview && (
-								<Badge
-									size="xs"
-									variant="dot"
-									color="red"
-									style={{ cursor: "pointer", flex: "0 0 auto" }}
-									onClick={reconnect}
-									title={t("reconnect")}
+						{(headerLayout) => (
+							<>
+								{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
+								<div
+									style={{
+										display: "flex",
+										alignItems: "center",
+										gap: HEADER_LEADING_GAP_PX,
+										flexWrap: "nowrap",
+										flex: "0 0 auto",
+										minWidth: 0,
+										maxWidth: "100%",
+										overflow: "hidden",
+									}}
 								>
-									{t("disconnected")}
-								</Badge>
-							)}
-						</div>
-						{!isWorkspacePreview && (
-							<HeaderToolbar
-								narratorId={narratorId}
-								controller={toolbarController}
-								inlineControls={toolbarInlineControls}
-								toolbarBadgeCounts={toolbarBadgeCounts}
-								headerHostCapabilities={headerHostCapabilities}
-								openArchiveConfirm={openArchiveConfirm}
-								archiveMutation={archiveMutation}
-								dock={dock}
-								mockStreamEnabled={mockStreamEnabled}
-								onClose={onClose}
-								visibleToolCount={headerLayout.visibleToolCount}
-								unmeasured={headerLayout.unmeasured}
-								t={t}
-							/>
+									{showLeadingChrome &&
+										(onBack ? (
+											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+												<IconArrowLeft size={16} />
+											</ActionIcon>
+										) : onOpenStandalonePage ? (
+											<Tooltip label={t("openStandalonePage")} position="right">
+												<ActionIcon
+													size="sm"
+													variant="subtle"
+													color="gray"
+													onClick={onOpenStandalonePage}
+												>
+													<IconExternalLink size={16} />
+												</ActionIcon>
+											</Tooltip>
+										) : (
+											<NarratorPanelCompactContext.Consumer>
+												{(compact) =>
+													compact || workspaceId ? (
+														<ActionIcon
+															size="sm"
+															variant="subtle"
+															color="gray"
+															onClick={() =>
+																navigate({
+																	to: "/narrators/$narratorId",
+																	params: { narratorId },
+																	search: workspaceId
+																		? { from: "workspace", workspaceId }
+																		: { from: "graph" },
+																})
+															}
+														>
+															<IconExternalLink size={16} />
+														</ActionIcon>
+													) : (
+														<ActionIcon
+															size="sm"
+															variant="subtle"
+															color="gray"
+															onClick={() => navigate({ to: ".." })}
+														>
+															<IconArrowLeft size={16} />
+														</ActionIcon>
+													)
+												}
+											</NarratorPanelCompactContext.Consumer>
+										))}
+									{/*
+									 * `flex: 1` even when the title is suppressed: it is what pushes the
+									 * tool row to the right edge, and it hands the freed width to those
+									 * buttons instead of leaving a gap where the title used to be.
+									 *
+									 * The floor that keeps the title readable is the capacity BUDGET
+									 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+									 * would win against the tool row's `flex-shrink: 0` only by overflowing
+									 * or wrapping a nowrap row — both worse than the truncation it would
+									 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+									 * budgets it by policy instead of reading a width this element derives
+									 * from whatever the tool row left over.
+									 */}
+									<NarratorPanelHeaderTitle
+										narratorId={narratorId}
+										narrator={narrator}
+										hostOwnsTitle={hostOwnsTitle}
+										isWorkspacePreview={isWorkspacePreview}
+										titleFullWidth={headerLayout.titleWidth}
+									/>
+									{disconnected && !isWorkspacePreview && (
+										<Badge
+											size="xs"
+											variant="dot"
+											color="red"
+											style={{ cursor: "pointer", flex: "0 0 auto" }}
+											onClick={reconnect}
+											title={t("reconnect")}
+										>
+											{t("disconnected")}
+										</Badge>
+									)}
+								</div>
+								{!isWorkspacePreview && (
+									<HeaderToolbar
+										narratorId={narratorId}
+										controller={toolbarController}
+										inlineControls={toolbarInlineControls}
+										toolbarBadgeCounts={toolbarBadgeCounts}
+										headerHostCapabilities={headerHostCapabilities}
+										openArchiveConfirm={openArchiveConfirm}
+										archiveMutation={archiveMutation}
+										dock={dock}
+										mockStreamEnabled={mockStreamEnabled}
+										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+										onClose={onClose}
+										visibleToolCount={headerLayout.visibleToolCount}
+										unmeasured={headerLayout.unmeasured}
+										t={t}
+									/>
+								)}
+							</>
 						)}
-					</div>
+					</NarratorHeaderLayout>
 
 					<LeakedToolCallModal
 						narratorId={narratorId}
 						event={leakedToolEvent}
-						onClose={() => setLeakedToolEvent(null)}
+						onClose={closeLeakedToolCallModal}
 					/>
 
 					<Modal
@@ -3182,6 +3094,12 @@ export function NarratorPanel({
 						onClose={closeCompactSummaryModal}
 					/>
 
+					<NarratorCompatibilityModal
+						projectId={compatibilityProjectId}
+						opened={compatibilityOpen}
+						onClose={() => setCompatibilityOpen(false)}
+					/>
+
 					<ContextThresholdSettingsModal
 						opened={contextThresholdSettingsOpened}
 						onClose={closeContextThresholdSettings}
@@ -3189,7 +3107,7 @@ export function NarratorPanel({
 						onSave={handleSaveContextThresholdSettings}
 						saving={updateSettingsMutation.isPending}
 						canSave={!!settingsData}
-						onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
+						onOpenGlobalSettings={openGlobalAgentSettings}
 					/>
 
 					{/* Keep the Details drawer mounted (only gate on context, not on
@@ -3231,55 +3149,53 @@ export function NarratorPanel({
 							<CompactSummaryModalCtx.Provider value={compactSummaryModalCtxValue}>
 								<MessageSelectionCtx.Provider value={selectionCtxValue}>
 									<AllowRetryCtx.Provider value={allowRetryCtxValue}>
-										<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
-											<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-												<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-													<RenderLodCtx.Provider value={renderLodCtxValue}>
-														{/* Same message-shaped skeleton the list itself shows while its
+										<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+											<EditingMessageCtx.Provider value={editingMessageCtxValue}>
+												<RenderLodCtx.Provider value={renderLodCtxValue}>
+													{/* Same message-shaped skeleton the list itself shows while its
 													    document loads, so the lazy-chunk wait and the document wait
 													    look like one continuous placeholder (no blank → text flash).
 													    The column geometry comes from the shared helper rather than
 													    Mantine padding, so this fallback, the list's own placeholder
 													    and the real rows are all the same width — otherwise the
 													    mount stepped through two different column widths. */}
-														<Suspense
-															fallback={
-																<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
-																	<NarratorMessageListSkeleton />
-																</Box>
-															}
-														>
-															<PretextExactMessageList
-																ref={chunkListRef}
-																narratorId={narratorId}
-																isSubagent={isSubagent}
-																isActive={isActive}
-																scrollRef={chunkViewportRef}
-																contentRef={contentRef}
-																onAtBottomChange={setIsAtBottom}
-																onUnreadCountChange={setUnreadCount}
-																onTailMetaChange={handleMessageListTailMetaChange}
-																onLodStep={handleLodStep}
-																onSelectionResolverChange={setChunkSelectionResolver}
-																rowHandlers={vlistRowHandlers}
-																permCb={permCbWithAsyncQuestions}
-																hasChapter={hasChapter}
-																highlightMessageId={highlightMessageId}
-																highlightRequestId={highlightRequestId}
-																tailFooter={messageListTailFooter}
-															/>
-														</Suspense>
-													</RenderLodCtx.Provider>
-													<LodSwitchToast
-														lod={renderLod}
-														isDefault={renderLodIsDefault}
-														onSetAsDefault={setAsDefault}
-														onSelectLod={handleSelectLod}
-														pinned={lodIndicatorPinned}
-													/>
-												</EditingMessageCtx.Provider>
-											</LatestTodosToolUseIdCtx.Provider>
-										</FileModDrawerCtx.Provider>
+													<Suspense
+														fallback={
+															<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
+																<NarratorMessageListSkeleton />
+															</Box>
+														}
+													>
+														<PretextExactMessageList
+															ref={chunkListRef}
+															narratorId={narratorId}
+															isSubagent={isSubagent}
+															isActive={isActive}
+															scrollRef={chunkViewportRef}
+															contentRef={contentRef}
+															onAtBottomChange={setIsAtBottom}
+															onUnreadCountChange={setUnreadCount}
+															onTailMetaChange={handleMessageListTailMetaChange}
+															onLodStep={handleLodStep}
+															onSelectionResolverChange={setChunkSelectionResolver}
+															rowHandlers={vlistRowHandlers}
+															permCb={permCbWithAsyncQuestions}
+															hasChapter={hasChapter}
+															highlightMessageId={highlightMessageId}
+															highlightRequestId={highlightRequestId}
+															tailFooter={messageListTailFooter}
+														/>
+													</Suspense>
+												</RenderLodCtx.Provider>
+												<LodSwitchToast
+													lod={renderLod}
+													isDefault={renderLodIsDefault}
+													onSetAsDefault={setAsDefault}
+													onSelectLod={handleSelectLod}
+													pinned={lodIndicatorPinned}
+												/>
+											</EditingMessageCtx.Provider>
+										</LatestTodosToolUseIdCtx.Provider>
 									</AllowRetryCtx.Provider>
 								</MessageSelectionCtx.Provider>
 							</CompactSummaryModalCtx.Provider>
@@ -3406,7 +3322,7 @@ export function NarratorPanel({
 
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
-						common={{ narratorId, narrator, isWorkspacePreview, compact, isMobileViewport }}
+						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
 						updateAttachedImages={updateAttachedImages}
@@ -3434,7 +3350,6 @@ export function NarratorPanel({
 									? () => dock.openToolPanel("git")
 									: () => setMobileToolPanel("git")
 						}
-						showHumanAttentionInbox={showHumanAttentionInbox}
 						isChapterMerged={isChapterMerged}
 						statusBarInputs={{
 							ownsHorizontalSafeArea,
@@ -3606,35 +3521,6 @@ export function NarratorPanel({
 					/>
 					{/* ═══════════════════ End Bottom Interaction Area ═══════════════════ */}
 
-					{/* Only mount the lazy Drawer after its first open (mobile / workspace). */}
-					{!dock &&
-						!onToggleFileModPanel &&
-						shouldRenderFileModificationsDrawer(fileModDrawerOpened, fileModDrawerHasOpened) && (
-							<Suspense fallback={null}>
-								<FileModificationsDrawer
-									narratorId={narratorId}
-									opened={fileModDrawerOpened}
-									onClose={() => {
-										setFileModDrawerOpened(false);
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-									pendingPermission={firstEditPermission}
-									onPermissionDecision={renderPermCb.onPermissionDecision}
-									deletePreviewMessageId={deletePreviewMessageId}
-									onConfirmDelete={() => {
-										pendingDeleteCallback?.();
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-									onCancelDelete={() => {
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-								/>
-							</Suspense>
-						)}
-
 					{/* Internal spec drawer — the third fallback when there is no dock spec
 					    tab (off-dock page) or the dock is showing a pushed subagent. Bound to
 					    THIS panel's narratorId so subagents show their own tasks. */}
@@ -3719,18 +3605,28 @@ export function NarratorPanel({
 									</Center>
 								}
 							>
-								<FileViewerContent
-									key={internalFileViewerPath}
-									filePath={internalFileViewerPath}
+								<LargeFileGate
 									narratorId={narratorId}
-									commentNarratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
-									displayPath={internalViewerDisplayPath}
-									selection={internalFileViewerTarget?.selection}
-									highlightRequestId={internalFileViewerTarget?.highlightRequestId}
-									onOpenFileTarget={handleOpenReferencedFile}
-								/>
+									legacyViewer
+									filePath={internalFileViewerPath}
+									enabled={getFilePreviewType(internalFileViewerPath) === "text"}
+									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
+								>
+									<FileViewerContent
+										key={internalFileViewerPath}
+										filePath={internalFileViewerPath}
+										narratorId={narratorId}
+										commentNarratorId={narratorId}
+										deviceId={internalFileViewerTarget?.deviceId ?? "local"}
+										referenceOrigin={!!internalFileViewerTarget}
+										displayPath={internalViewerDisplayPath}
+										selection={internalFileViewerTarget?.selection}
+										highlightRequestId={internalFileViewerTarget?.highlightRequestId}
+										onOpenFileTarget={handleOpenReferencedFile}
+									/>
+								</LargeFileGate>
 							</Suspense>
 						</Drawer>
 					)}
@@ -3762,6 +3658,9 @@ export function NarratorPanel({
 									});
 								}}
 								onForwardToNarrator={forwardTextToNarrator}
+								// Off-dock the tree's files open in this panel's internal
+								// viewer Drawer (defined whenever !dock && !isWorkspacePreview).
+								onOpenFile={handleOpenFilePanel}
 							/>
 							<BackgroundTasksDrawerHost
 								narratorId={narratorId}
@@ -3778,9 +3677,7 @@ export function NarratorPanel({
 				pending={pendingRollback}
 				submitting={revertHistorySubmitting}
 				onConfirm={confirmRollback}
-				onCancel={() => {
-					if (!revertHistorySubmitting) setPendingRollback(null);
-				}}
+				onCancel={cancelRollback}
 			/>
 			<RevertActionConfirmModal
 				narratorId={narratorId}
@@ -3788,9 +3685,7 @@ export function NarratorPanel({
 				pending={pendingBlockDelete}
 				submitting={revertHistorySubmitting}
 				onConfirm={confirmBlockDelete}
-				onCancel={() => {
-					if (!revertHistorySubmitting) setPendingBlockDelete(null);
-				}}
+				onCancel={cancelBlockDelete}
 			/>
 			<SetGlobalModelModal
 				opened={globalModelEditTarget != null}
@@ -3798,7 +3693,7 @@ export function NarratorPanel({
 				groupedModels={groupedModels}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
-				onClose={() => setGlobalModelEditTarget(null)}
+				onClose={closeGlobalModelModal}
 				onConfirm={
 					globalModelEditTarget === "summary" ? handleSetSummaryModel : handleSetDefaultModel
 				}

@@ -26,6 +26,7 @@
  * titles) flow through the adapter instead, where they are measured.
  */
 
+import { dangerCopyLabels } from "@shared/danger-copy";
 import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
@@ -87,6 +88,9 @@ export interface VListTimingLabels {
 	completed: string;
 	total: string;
 	permissionWait: string;
+	streaming?: string;
+	wait?: string;
+	executionSpan?: string;
 	execution: string;
 	startedAt: string;
 	timeoutSeconds: string;
@@ -95,6 +99,7 @@ export interface VListTimingLabels {
 
 /** Per-kind render label bundles, keyed by the vlist element kind. */
 export interface VListRenderLabels {
+	textPreview?: { expand: string; collapse: string; loading?: string; loadFailed?: string };
 	reasoning: {
 		reasoning: string;
 		thinking: string;
@@ -113,6 +118,8 @@ export interface VListRenderLabels {
 		remote: string;
 		/** Header badge for a call blocked by a user takeover of its subagent. */
 		takenOver: string;
+		/** Header button opening the session an Await-agent call waits on. */
+		openSession: string;
 		/** `_planFile` provenance template carrying a literal `{file}` placeholder. */
 		planSource: string;
 		/**
@@ -320,6 +327,9 @@ export function useVListLabels(): VListLabels {
 			// ── message-origin attribution ──────────────────────────────────────────
 			// The origin_notice heading is composed during adaptation (it is a
 			// measured row), so these belong to the adapter labels.
+			asyncQuestionUser: t("you"),
+			asyncQuestionAnswerEvent: t("asyncQuestionAnswerEvent", { id: "{id}" }),
+			asyncQuestionSupplementEvent: t("asyncQuestionSupplementEvent", { id: "{id}" }),
 			originKindSystem: t("origin.kind.system"),
 			originKindAssistant: t("origin.kind.assistant"),
 			originSourceAutoContinuation: t("origin.source.autoContinuation"),
@@ -356,6 +366,20 @@ export function useVListLabels(): VListLabels {
 			// ── read-only AskUserQuestion replay ────────────────────────────────────
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
+			workspaceCreate: t("workspaceCreate"),
+			workspaceAttach: t("workspaceAttach"),
+			workspaceOperation: t("workspaceOperation"),
+			workspaceList: t("workspaceList"),
+			workspaceSwitch: t("workspaceSwitch"),
+			workspaceDevice: t("workspaceDevice"),
+			workspaceCreated: t("workspaceCreated"),
+			workspaceFailed: t("workspaceFailed"),
+			workspaceUnknown: t("workspaceUnknown"),
+			workspaceChanged: t("workspaceChanged"),
+			workspaceUnchanged: t("workspaceUnchanged"),
+			workspaceEmpty: t("workspaceEmpty"),
+			workspaceTruncated: t("workspaceTruncated"),
+			workspaceDetached: t("workspaceDetached"),
 			backgroundTaskStarted: t("backgroundTaskStarted"),
 			sendAwaitReply: t("sendAwaitReply"),
 			communicationBroadcast: t("communicationBroadcast"),
@@ -373,6 +397,9 @@ export function useVListLabels(): VListLabels {
 			communicationReceiptLegacy: t("communicationReceiptLegacy"),
 			communicationReceiptUnavailable: t("communicationReceiptUnavailable"),
 			communicationReceiptError: t("communicationReceiptError"),
+			contextAskOutputChars: t("contextAskOutputChars", { count: COUNT_PLACEHOLDER }),
+			contextAskQuestions: t("contextAskQuestions", { count: COUNT_PLACEHOLDER }),
+			contextAskStatusSummary: t("contextAskStatusSummary"),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
 			specProtectedBadge: t("specProtectedBadge"),
@@ -433,6 +460,20 @@ export function useVListLabels(): VListLabels {
 			// through the adapter rather than the render layer.
 			...reflectionTitleLabels(t),
 			reflectionNextSteps: t("reflectionNextSteps", { nextSteps: "{nextSteps}" }),
+			// System reflection reasons that are not status restatements (see
+			// shared/pretext-layout/reflection-reason.ts). The summary wraps, so these
+			// are measured adapter labels rather than render-layer strings.
+			reflectionReasonNarratorAborted: t("reflectionReasonNarratorAborted"),
+			reflectionReasonDangerCancelledByUser: t("reflectionReasonDangerCancelledByUser"),
+			reflectionReasonDangerCancelledByLoop: t("reflectionReasonDangerCancelledByLoop"),
+			reflectionReasonDangerInterrupted: t("reflectionReasonDangerInterrupted"),
+			reflectionReasonDangerAlreadyResolved: t("reflectionReasonDangerAlreadyResolved"),
+			reflectionReasonTaskApprovedByUser: t("reflectionReasonTaskApprovedByUser"),
+			reflectionReasonTaskRejectedByUser: t("reflectionReasonTaskRejectedByUser"),
+			reflectionReasonTaskDeclinedNextSteps: t("reflectionReasonTaskDeclinedNextSteps"),
+			// Danger assessment copy. Generated matrix, same contract as the
+			// reflection titles above — a dropped key still fails the coverage guard.
+			...dangerCopyLabels(t),
 			// ── side-car footnotes (one per system injection) ──────────────────────
 			// All of these are MEASURED text — the source name sits in the header row and
 			// the body lines are wrapped by the measure pass — so they flow through the
@@ -509,6 +550,11 @@ export function useVListLabels(): VListLabels {
 			permissionWait: t("toolCallInspector.timing.permissionWait", {
 				duration: DURATION_PLACEHOLDER,
 			}),
+			streaming: t("toolCallInspector.timing.streaming", { duration: DURATION_PLACEHOLDER }),
+			wait: t("toolCallInspector.timing.wait", { duration: DURATION_PLACEHOLDER }),
+			executionSpan: t("toolCallInspector.timing.executionSpan", {
+				duration: DURATION_PLACEHOLDER,
+			}),
 			execution: t("toolCallInspector.timing.execution", { duration: DURATION_PLACEHOLDER }),
 			startedAt: t("toolStartedAt", { time: TIME_PLACEHOLDER }),
 			timeoutSeconds: t("timeoutSeconds"),
@@ -521,11 +567,18 @@ export function useVListLabels(): VListLabels {
 		const statusMark: Record<ToolRowStatusMark, string> = {
 			running: t("traceRowMark.running"),
 			queued: t("traceRowMark.queued"),
+			reflecting: t("status_reflecting"),
 			awaiting: t("traceRowMark.awaiting"),
 			failed: t("traceRowMark.failed"),
 			cancelled: t("traceRowMark.cancelled"),
 		};
 		return {
+			textPreview: {
+				expand: t("textPreview.expand"),
+				collapse: t("textPreview.collapse"),
+				loading: t("textPreview.loading"),
+				loadFailed: t("textPreview.loadFailed"),
+			},
 			reasoning: {
 				reasoning: t("reasoning"),
 				thinking: t("thinking"),
@@ -541,6 +594,9 @@ export function useVListLabels(): VListLabels {
 				// The SAME key the narrator status chip uses for `taken_over`, so the
 				// blocked card and the child's own status read identically.
 				takenOver: t("subagentTakenOver"),
+				// The SAME wording the subagent card's own button uses — opening the
+				// awaited child is the same action from a different card.
+				openSession: t("openFullSubagentSession"),
 				// The raw `_planFile` path lives in the measured detail (shared/ has no
 				// i18n), so inject the template with a literal placeholder and let the
 				// render layer substitute the path — same trick as COUNT_PLACEHOLDER.
@@ -592,6 +648,7 @@ export function useVListLabels(): VListLabels {
 				liveTailChars: (formatted: string) => t("reasoningChars", { formatted }),
 				// A live reasoning row that has opened but carries no text yet.
 				reasoningPending: t("reasoningPending"),
+				reasoningEmpty: t("reasoningEmpty"),
 				// Same bundle the tool card and the subagent card use: a folded row now
 				// carries its own duration + lifecycle popover.
 				timing,

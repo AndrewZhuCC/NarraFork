@@ -34,8 +34,10 @@ import { fileChangeBlobs, fileChangeScopes, revertOperationFiles } from "../db/s
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import {
 	createFileChangeIdentity,
+	type FileChangeScopeIdentity,
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
 } from "./file-change-identity";
@@ -52,6 +54,7 @@ import {
 	preflightLocalFileRestore,
 	restoreLocalFile,
 } from "./file-change-local-restore";
+import { FileChangeNamespaceBusyError } from "./file-change-namespace-reset";
 import { type LocalFileChangeRuntime, localFileChangeRuntimeBinding } from "./file-change-runtime";
 import type { NarratorPrincipal } from "./narrator-acl";
 import { type RevertHistoryApplyResult, RevertHistoryCommitService } from "./revert-history-commit";
@@ -82,7 +85,30 @@ import {
 	type WorkspaceWriteLease,
 } from "./workspace-write-coordinator";
 
+import {
+	freezeWorkspaceRanges,
+	WORKSPACE_RANGE_LIMITS,
+	type WorkspaceWriteRange,
+} from "./workspace-write-ranges";
+
 export { RevertTransactionError } from "./revert-transaction-worker";
+
+/** Admission bounds for already-authorized fixed targets, never additional mutation authority. */
+export function buildRevertScopeRanges(
+	scope: Readonly<FileChangeScopeIdentity>,
+	canonicalPaths: readonly string[],
+): readonly WorkspaceWriteRange[] {
+	bound(canonicalPaths.length, FILE_CHANGE_LIMITS.revertFiles, 1);
+	const ranges = canonicalPaths.map((canonicalPath) => ({ kind: "file" as const, canonicalPath }));
+	if (
+		ranges.length <= WORKSPACE_RANGE_LIMITS.count &&
+		Buffer.byteLength(JSON.stringify({ version: 1, ranges })) <= WORKSPACE_RANGE_LIMITS.jsonBytes
+	)
+		return freezeWorkspaceRanges(scope, ranges);
+	// Do not hide an invalid/out-of-scope target behind the conservative fallback.
+	for (const range of ranges) freezeWorkspaceRanges(scope, [range]);
+	return freezeWorkspaceRanges(scope);
+}
 
 type Namespace = Awaited<ReturnType<LocalFileChangeRuntime["verifyNamespace"]>>;
 type Scope = typeof fileChangeScopes.$inferSelect;
@@ -93,6 +119,7 @@ export interface RevertTransactionRequest {
 	planHash: string;
 	/** Required by HTTP; internal callers may still exercise non-UI preview plans. */
 	action?: FileChangeRevertAction;
+	acceptSnapshotRestore?: true;
 	signal?: AbortSignal;
 }
 export interface RevertTransactionOutcome {
@@ -247,8 +274,10 @@ export class RevertTransactionService {
 		operation: RevertJournalOperation,
 		signal: AbortSignal,
 	): Promise<void> {
-		if (!request.action) return;
-		await this.namespace(signal);
+		// Terminal replay checks immutable consent only, not target IO. A reopened
+		// runtime may supply a new namespace object with the same durable binding.
+		const terminal = operation.status !== "prepared";
+		await this.namespace(signal, terminal);
 		const blob = this.db
 			.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
 			.from(fileChangeBlobs)
@@ -264,10 +293,13 @@ export class RevertTransactionService {
 		await worker<boolean>(
 			{
 				action: "entrypoint",
-				raw: { ref, bytes: await this.readBlob(ref, signal) },
+				raw: { ref, bytes: await this.readBlob(ref, signal, terminal) },
 				operation,
 				userId: request.principal.userId,
-				expectedAction: request.action,
+				...(request.action === undefined ? {} : { expectedAction: request.action }),
+				...(request.acceptSnapshotRestore === undefined
+					? {}
+					: { acceptSnapshotRestore: request.acceptSnapshotRestore }),
 			},
 			signal,
 		);
@@ -294,15 +326,13 @@ export class RevertTransactionService {
 		const started = performance.now();
 		let responseTimer: ReturnType<typeof setTimeout> | undefined;
 		let stopResponse: () => void = () => {};
-		const body = this.options.runtime
-			.withNamespaceAccess(() => this.run(run))
-			.finally(() => {
-				this.active--;
-				clearTimeout(deadline);
-				if (responseTimer) clearTimeout(responseTimer);
-				controller.signal.removeEventListener("abort", stopResponse);
-				input.signal?.removeEventListener("abort", abort);
-			});
+		const body = this.run(run).finally(() => {
+			this.active--;
+			clearTimeout(deadline);
+			if (responseTimer) clearTimeout(responseTimer);
+			controller.signal.removeEventListener("abort", stopResponse);
+			input.signal?.removeEventListener("abort", abort);
+		});
 		const limited = new Promise<RevertTransactionOutcome>((resolve, reject) => {
 			stopResponse = () => {
 				responseTimer = setTimeout(() => {
@@ -324,240 +354,278 @@ export class RevertTransactionService {
 	}
 
 	private async run(run: Run): Promise<RevertTransactionOutcome> {
-		run.signal.throwIfAborted();
-		await this.options.access.authenticate(run.request.principal, run.signal);
-		const context = await this.options.access.resolveContext({
-			principal: run.request.principal,
-			narratorId: run.request.narratorId,
-			signal: run.signal,
-		});
-		run.ctx = {
-			owner: {
-				subjectKey: `human:${run.request.principal.userId}`,
-				narratorId: run.request.narratorId,
-				projectId: context.projectId,
-			},
-			planId: run.request.planId,
-			planHash: run.request.planHash,
-		};
-		const operation = this.journal.getOperation(run.ctx);
-		if (
-			operation.scope !== "narrator" ||
-			!["revert", "history_delete", "rollback_to_block"].includes(operation.kind)
-		)
-			throw fail("UNSUPPORTED");
-		await this.verifyEntrypoint(run.request, operation, run.signal);
-		if (operation.status !== "prepared") return this.outcome(run, operation);
-		if (this.plans.getSummary(run.ctx.owner, operation.id).expired) throw fail("EXPIRED");
-		await this.namespace(run.signal);
-		const rows: RevertJournalFile[] = [];
-		let cursor: string | undefined;
-		do {
-			const page = this.journal.listFiles(run.ctx, { cursor, limit: 32 });
-			rows.push(...page.items);
-			bound(rows.length, FILE_CHANGE_LIMITS.revertFiles);
-			cursor = page.nextCursor ?? undefined;
-			if (page.hasMore && !cursor) throw fail("INCOMPLETE_FILES");
-			await yieldToEventLoop();
+		// Namespace admission protects preview/blob reads, but must end before waiting
+		// for workspace admission: writes acquire coordinator -> namespace, never reverse.
+		const preflight = await this.options.runtime.withNamespaceAccess(async () => {
 			run.signal.throwIfAborted();
-		} while (cursor);
-		const raw: Extract<TransactionManifestRequest, { action: "validate" }>["raw"] = [];
-		for (const digest of [
-			operation.planBlobDigest,
-			operation.selectorBlobDigest,
-			operation.historyManifestBlobDigest,
-		]) {
-			const row = this.db
-				.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
-				.from(fileChangeBlobs)
-				.where(eq(fileChangeBlobs.digest, digest ?? ""))
-				.get();
-			if (!digest || row?.status !== "ready") throw fail("MANIFEST_UNAVAILABLE");
-			const ref: FileChangeBlobRef = { algorithm: "sha256", digest, sizeBytes: row.size };
-			raw.push({ ref, bytes: await this.readBlob(ref, run.signal) });
-		}
-		const manifest = await worker<ValidatedTransactionManifest>(
-			{ action: "validate", raw, operation, files: rows, userId: run.request.principal.userId },
-			run.signal,
-		);
-		run.usedBytes = manifest.evidenceBytes;
-		bound(run.usedBytes, this.maxEvidenceBytes);
-		for (const ref of manifest.rawRefs) await this.readBlob(ref, run.signal);
-		const scopes = new Map<string, Scope>();
-		for (const file of manifest.files) {
-			const fileAccess = {
+			await this.options.access.authenticate(run.request.principal, run.signal);
+			const context = await this.options.access.resolveContext({
 				principal: run.request.principal,
-				owner: run.ctx.owner,
-				identity: file.identity,
+				narratorId: run.request.narratorId,
 				signal: run.signal,
-			};
-			await this.options.access.authorizeFile(fileAccess);
-			const preview = await this.options.access.resolveFile(fileAccess);
-			await preview.assertCurrent({ signal: run.signal });
-			if (
-				!fileChangeExecutionBindingMatches(preview.executionBinding, file.executionBinding) ||
-				preview.scopeRevision !== file.scopeRevision ||
-				fileChangeIdentityKey(preview.identity) !== fileChangeIdentityKey(file.identity) ||
-				preview.identity.scopeId !== file.identity.scopeId
-			)
-				throw fail("PLAN_STALE");
-			const scope = this.db
-				.select()
-				.from(fileChangeScopes)
-				.where(eq(fileChangeScopes.id, file.identity.scopeId))
-				.get();
-			if (
-				!scope ||
-				scope.status !== "active" ||
-				scope.revision !== file.scopeRevision ||
-				scope.fencingToken !== file.executionBinding.fencingToken ||
-				scope.activeLeaseId ||
-				scope.activeMutationCount
-			)
-				throw fail("SCOPE_STALE");
-			this.scopeIdentity(scope, file);
-			if ((await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object)
-				throw fail("ROOT_STALE");
-			scopes.set(scope.id, scope);
-			const fixed = rows.find((row) => row.sequence === file.sequence);
-			if (!fixed) throw fail("INCOMPLETE_FILES");
-			run.files.push({ manifest: file, fixed, scope, objectIdentity: null });
-		}
-		run.worktreePaths = [...new Set([...scopes.values()].map((scope) => scope.canonicalRoot))];
-		bound(scopes.size, WORKSPACE_WRITE_COORDINATOR_LIMITS.batchScopes);
-		for (const scope of scopes.values()) {
-			// Reserve independent compensation IDs too; never auto-split one fixed transaction.
-			bound(
-				run.files.filter((file) => file.scope.id === scope.id).length * 2,
-				WORKSPACE_WRITE_COORDINATOR_LIMITS.mutationsPerLease,
-			);
-		}
-		const perform = async (batch?: WorkspaceWriteBatch) => {
-			run.leases = batch?.leases ?? [];
-			const current = this.journal.getOperation(run.ctx as RevertJournalContext);
-			if (current.status !== "prepared") return this.outcome(run, current);
-			for (const file of run.files) {
-				const lease = this.lease(run, file);
-				if (
-					lease.scopeRevision !== file.manifest.scopeRevision + 1 ||
-					lease.executionBinding.fencingToken !== file.manifest.executionBinding.fencingToken + 1 ||
-					lease.executionBinding.runtimeEpoch !== file.manifest.executionBinding.runtimeEpoch ||
-					lease.executionBinding.runtimeGeneration !==
-						file.manifest.executionBinding.runtimeGeneration
-				)
-					throw fail("WAITING_PLAN_STALE");
-				await this.guard(run, file, lease, run.signal);
-				// This first read only captures the inode. The full restore preflight below
-				// repeats typed/raw/permissions/path checks for every ORIGINAL expected/desired.
-				file.objectIdentity = await currentObjectIdentity(
-					file.manifest.identity.canonicalPath,
-					run.signal,
-				);
-				const result = await preflightLocalFileRestore(
-					this.restoreInput(run, file, lease, run.signal),
-				);
-				await result.whenSettled;
-				if (result.status !== "not_dispatched" || result.reason !== "preflight_verified")
-					throw fail(`FILE_PREFLIGHT_${result.reason.toUpperCase()}`);
-			}
-			// Validate history SQL/COW/cascade support before any target IO, not only at commit.
-			if (operation.kind !== "revert")
-				await this.history.prepare({
-					principal: run.request.principal,
-					fixedSelection: manifest.selection,
-					signal: run.signal,
-				});
-			await this.authorizeOwner(run, run.signal);
-			await this.freshSelection(run, manifest);
-			run.signal.throwIfAborted();
-			try {
-				const admission = await this.journal.startExecution(
-					run.ctx as RevertJournalContext,
-					manifest.proof,
-					{ signal: run.signal },
-				);
-				if (!admission.started) return this.outcome(run, admission.operation);
-				run.started = true;
-				// startExecution validates paginated plan metadata. Catch history writes
-				// during those awaits before the first target can be dispatched.
-				await this.freshSelection(run, manifest);
-				for (const file of run.files) {
-					run.signal.throwIfAborted();
-					const lease = this.lease(run, file);
-					const apply = () => this.mutate(run, file, lease, "apply", run.signal);
-					const result = batch ? await batch.runInScope(lease.token, apply) : await apply();
-					if (
-						!result.confirmed ||
-						(result.outcome !== "applied" &&
-							!fileChangeStatesEqual(file.manifest.expected, file.manifest.desired))
-					)
-						throw fail("FILE_NOT_APPLIED");
-				}
-				// Current state AND original after inode must still match before history can commit.
-				for (const file of run.files) await this.verifyDesired(run, file, run.signal);
-				await this.freshSelection(run, manifest);
-				const finished = await this.journal.finishFiles(run.ctx as RevertJournalContext, {
-					signal: run.signal,
-				});
-				if (finished.status !== "files_verified") throw fail("FILES_UNVERIFIED");
-				await this.authorizeOwner(run, run.signal);
-				// No journal/coordinator/catalog writes after this preparation until commit.
-				const prepared =
-					operation.kind === "revert"
-						? null
-						: await this.history.prepare({
-								principal: run.request.principal,
-								fixedSelection: manifest.selection,
-								signal: run.signal,
-							});
-				// Last read-only file sweep AFTER every history/owner preparation await.
-				// No publication/receipt/lease mutation here: preserve the prepared history
-				// stamp while detecting external changes during the worker/ACL window.
-				for (const file of run.files) await this.verifyDesired(run, file, run.signal);
-				run.signal.throwIfAborted();
-				const committed = this.journal.commit(run.ctx as RevertJournalContext, {
-					db: this.db,
-					apply: (tx) => {
-						if (prepared) run.historyResult = this.history.applyToTransaction(tx, prepared);
-					},
-				});
-				return this.outcome(run, committed);
-			} catch (error) {
-				const live = this.safeOperation(run);
-				if (live?.status === "committed") return this.outcome(run, live);
-				if (!run.started) {
-					if (live?.status === "prepared") throw error;
-					this.quarantine(run);
-					return this.outcome(run, live, false, "ADMISSION_RESULT_UNKNOWN");
-				}
-				if (!live || this.db.$client.inTransaction) {
-					this.quarantine(run);
-					return this.outcome(run, live, false, "COMMIT_RESULT_UNKNOWN");
-				}
-				return this.compensate(run, batch);
-			}
-		};
-		// No fabricated scope for positive no_dispatch / history-only selections.
-		if (!scopes.size) return perform();
-		try {
-			return await this.options.runtime.coordinator.withRollbackMany(
-				{
-					scopes: [...scopes.values()].map((scope) => ({
-						scope,
-						runtime: this.runtimeBinding(scope.deviceId),
-						// This service exclusively awaits native restoreLocalFile IO; it
-						// does not launch Bash or delegate mutations to remote processes.
-						executionClass: "local_file_io" as const,
-					})),
-					signal: run.signal,
+			});
+			run.ctx = {
+				owner: {
+					subjectKey: `human:${run.request.principal.userId}`,
+					narratorId: run.request.narratorId,
+					projectId: context.projectId,
 				},
-				perform,
+				planId: run.request.planId,
+				planHash: run.request.planHash,
+			};
+			const operation = this.journal.getOperation(run.ctx);
+			if (
+				operation.scope !== "narrator" ||
+				!["revert", "history_delete", "rollback_to_block"].includes(operation.kind)
+			)
+				throw fail("UNSUPPORTED");
+			await this.verifyEntrypoint(run.request, operation, run.signal);
+			if (operation.status !== "prepared") return { outcome: this.outcome(run, operation) };
+			if (this.plans.getSummary(run.ctx.owner, operation.id).expired) throw fail("EXPIRED");
+			await this.namespace(run.signal);
+			const rows: RevertJournalFile[] = [];
+			let cursor: string | undefined;
+			do {
+				const page = this.journal.listFiles(run.ctx, { cursor, limit: 32 });
+				rows.push(...page.items);
+				bound(rows.length, FILE_CHANGE_LIMITS.revertFiles);
+				cursor = page.nextCursor ?? undefined;
+				if (page.hasMore && !cursor) throw fail("INCOMPLETE_FILES");
+				await yieldToEventLoop();
+				run.signal.throwIfAborted();
+			} while (cursor);
+			const raw: Extract<TransactionManifestRequest, { action: "validate" }>["raw"] = [];
+			for (const digest of [
+				operation.planBlobDigest,
+				operation.selectorBlobDigest,
+				operation.historyManifestBlobDigest,
+			]) {
+				const row = this.db
+					.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
+					.from(fileChangeBlobs)
+					.where(eq(fileChangeBlobs.digest, digest ?? ""))
+					.get();
+				if (!digest || row?.status !== "ready") throw fail("MANIFEST_UNAVAILABLE");
+				const ref: FileChangeBlobRef = { algorithm: "sha256", digest, sizeBytes: row.size };
+				raw.push({ ref, bytes: await this.readBlob(ref, run.signal) });
+			}
+			const manifest = await worker<ValidatedTransactionManifest>(
+				{
+					action: "validate",
+					raw,
+					operation,
+					files: rows,
+					userId: run.request.principal.userId,
+					...(run.request.acceptSnapshotRestore === undefined
+						? {}
+						: { acceptSnapshotRestore: run.request.acceptSnapshotRestore }),
+				},
+				run.signal,
 			);
-		} catch (error) {
-			// A failed lease-release SQL write after commit cannot turn committed history
-			// into a reported preflight rejection or trigger compensation after release.
-			if (!run.started) throw error;
-			return this.outcome(run, this.safeOperation(run), false, "COORDINATOR_RECOVERY_REQUIRED");
+			run.usedBytes = manifest.evidenceBytes;
+			bound(run.usedBytes, this.maxEvidenceBytes);
+			for (const ref of manifest.rawRefs) await this.readBlob(ref, run.signal);
+			const scopes = new Map<string, Scope>();
+			for (const file of manifest.files) {
+				const fileAccess = {
+					principal: run.request.principal,
+					owner: run.ctx.owner,
+					identity: file.identity,
+					signal: run.signal,
+				};
+				await this.options.access.authorizeFile(fileAccess);
+				const preview = await this.options.access.resolveFile(fileAccess);
+				await preview.assertCurrent({ signal: run.signal });
+				if (
+					preview.executionBinding.deviceId !== file.executionBinding.deviceId ||
+					preview.executionBinding.runtimeEpoch !== file.executionBinding.runtimeEpoch ||
+					preview.executionBinding.runtimeGeneration !== file.executionBinding.runtimeGeneration ||
+					fileChangeIdentityKey(preview.identity) !== fileChangeIdentityKey(file.identity) ||
+					preview.identity.scopeId !== file.identity.scopeId
+				)
+					throw fail("PLAN_STALE");
+				const scope = this.db
+					.select()
+					.from(fileChangeScopes)
+					.where(eq(fileChangeScopes.id, file.identity.scopeId))
+					.get();
+				// The lease below owns CURRENT admission. A fence from the read-only
+				// preview is not a dependency on every other file in this workspace.
+				if (!scope || scope.status !== "active") throw fail("SCOPE_STALE");
+				this.scopeIdentity(scope, file);
+				if ((await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object)
+					throw fail("ROOT_STALE");
+				scopes.set(scope.id, scope);
+				const fixed = rows.find((row) => row.sequence === file.sequence);
+				if (!fixed) throw fail("INCOMPLETE_FILES");
+				run.files.push({ manifest: file, fixed, scope, objectIdentity: null });
+			}
+			run.worktreePaths = [...new Set([...scopes.values()].map((scope) => scope.canonicalRoot))];
+			bound(scopes.size, WORKSPACE_WRITE_COORDINATOR_LIMITS.batchScopes);
+			for (const scope of scopes.values()) {
+				// Reserve independent compensation IDs too; never auto-split one fixed transaction.
+				bound(
+					run.files.filter((file) => file.scope.id === scope.id).length * 2,
+					WORKSPACE_WRITE_COORDINATOR_LIMITS.mutationsPerLease,
+				);
+			}
+			return { operation, manifest, scopes };
+		}, run.signal);
+		if (preflight.outcome) return preflight.outcome;
+		const { operation, manifest, scopes } = preflight;
+		const perform = (batch?: WorkspaceWriteBatch) =>
+			this.options.runtime.tryWithNamespaceAccess(async () => {
+				run.leases = batch?.leases ?? [];
+				run.signal.throwIfAborted();
+				// Waiting permits reset/expiry/journal changes, including for history-only
+				// plans. Revalidate before even observing a target or claiming execution.
+				await this.namespace(run.signal);
+				const current = this.journal.getOperation(run.ctx as RevertJournalContext);
+				await this.verifyEntrypoint(run.request, current, run.signal);
+				if (current.status !== "prepared") return this.outcome(run, current);
+				if (this.plans.getSummary((run.ctx as RevertJournalContext).owner, current.id).expired)
+					throw fail("EXPIRED");
+				for (const file of run.files) {
+					const lease = this.lease(run, file);
+					if (
+						lease.executionBinding.runtimeEpoch !== file.manifest.executionBinding.runtimeEpoch ||
+						lease.executionBinding.runtimeGeneration !==
+							file.manifest.executionBinding.runtimeGeneration
+					)
+						throw fail("WAITING_PLAN_STALE");
+					await this.guard(run, file, lease, run.signal);
+					// This first read only captures the inode. The full restore preflight below
+					// repeats typed/raw/permissions/path checks for every ORIGINAL expected/desired.
+					file.objectIdentity = await currentObjectIdentity(
+						file.manifest.identity.canonicalPath,
+						run.signal,
+					);
+					const result = await preflightLocalFileRestore(
+						this.restoreInput(run, file, lease, run.signal),
+					);
+					await result.whenSettled;
+					if (result.status !== "not_dispatched" || result.reason !== "preflight_verified")
+						throw fail(`FILE_PREFLIGHT_${result.reason.toUpperCase()}`);
+				}
+				// Validate history SQL/COW/cascade support before any target IO, not only at commit.
+				if (operation.kind !== "revert")
+					await this.history.prepare({
+						principal: run.request.principal,
+						fixedSelection: manifest.selection,
+						signal: run.signal,
+					});
+				await this.authorizeOwner(run, run.signal);
+				await this.freshSelection(run, manifest);
+				run.signal.throwIfAborted();
+				try {
+					const admission = await this.journal.startExecution(
+						run.ctx as RevertJournalContext,
+						manifest.proof,
+						{ signal: run.signal },
+					);
+					if (!admission.started) return this.outcome(run, admission.operation);
+					run.started = true;
+					// startExecution validates paginated plan metadata. Catch history writes
+					// during those awaits before the first target can be dispatched.
+					await this.freshSelection(run, manifest);
+					for (const file of run.files) {
+						run.signal.throwIfAborted();
+						const lease = this.lease(run, file);
+						const apply = () => this.mutate(run, file, lease, "apply", run.signal);
+						const result = batch ? await batch.runInScope(lease.token, apply) : await apply();
+						if (
+							!result.confirmed ||
+							(result.outcome !== "applied" &&
+								!fileChangeStatesEqual(file.manifest.expected, file.manifest.desired))
+						)
+							throw fail("FILE_NOT_APPLIED");
+					}
+					// Current state AND original after inode must still match before history can commit.
+					for (const file of run.files) await this.verifyDesired(run, file, run.signal);
+					await this.freshSelection(run, manifest);
+					const finished = await this.journal.finishFiles(run.ctx as RevertJournalContext, {
+						signal: run.signal,
+					});
+					if (finished.status !== "files_verified") throw fail("FILES_UNVERIFIED");
+					await this.authorizeOwner(run, run.signal);
+					// No journal/coordinator/catalog writes after this preparation until commit.
+					const prepared =
+						operation.kind === "revert"
+							? null
+							: await this.history.prepare({
+									principal: run.request.principal,
+									fixedSelection: manifest.selection,
+									signal: run.signal,
+								});
+					// Last read-only file sweep AFTER every history/owner preparation await.
+					// No publication/receipt/lease mutation here: preserve the prepared history
+					// stamp while detecting external changes during the worker/ACL window.
+					for (const file of run.files) await this.verifyDesired(run, file, run.signal);
+					run.signal.throwIfAborted();
+					const committed = this.journal.commit(run.ctx as RevertJournalContext, {
+						db: this.db,
+						apply: (tx) => {
+							if (prepared) run.historyResult = this.history.applyToTransaction(tx, prepared);
+						},
+					});
+					return this.outcome(run, committed);
+				} catch (error) {
+					const live = this.safeOperation(run);
+					if (live?.status === "committed") return this.outcome(run, live);
+					if (!run.started) {
+						if (live?.status === "prepared") throw error;
+						this.quarantine(run);
+						return this.outcome(run, live, false, "ADMISSION_RESULT_UNKNOWN");
+					}
+					if (!live || this.db.$client.inTransaction) {
+						this.quarantine(run);
+						return this.outcome(run, live, false, "COMMIT_RESULT_UNKNOWN");
+					}
+					logger.warn("Revert execution failed; compensating target files", {
+						planId: run.request.planId,
+						error: String(error),
+					});
+					// Return-await keeps namespace ownership through compensation and its
+					// real IO settlement, even after the bounded HTTP result has returned.
+					return await this.compensate(run, batch);
+				}
+			}, run.signal);
+		for (;;) {
+			// Legacy hot-loaded callers may still own namespace before requesting coordinator.
+			// Drain outside workspace admission, then atomically try namespace without waiting.
+			await this.options.runtime.waitForNamespaceDrain(run.signal);
+			try {
+				// No fabricated scope for positive no_dispatch / history-only selections.
+				if (!scopes.size) return await perform();
+				return await this.options.runtime.coordinator.withRollbackMany(
+					{
+						scopes: [...scopes.values()].map((scope) => ({
+							scope,
+							runtime: this.runtimeBinding(scope.deviceId),
+							activityPolicy: "strict" as const,
+							ranges: buildRevertScopeRanges(
+								scope,
+								run.files
+									.filter((file) => file.scope.id === scope.id)
+									.map((file) => file.manifest.identity.canonicalPath),
+							),
+							// This service exclusively awaits native restoreLocalFile IO; it
+							// does not launch Bash or delegate mutations to remote processes.
+							executionClass: "local_file_io" as const,
+						})),
+						signal: run.signal,
+					},
+					perform,
+				);
+			} catch (error) {
+				// withRollbackMany has released every lease before this retry. Cleanup errors
+				// wrap the body failure and must never be unwrapped into a retryable busy.
+				if (error instanceof FileChangeNamespaceBusyError && !run.started) continue;
+				// A failed lease-release SQL write after commit cannot turn committed history
+				// into a reported preflight rejection or trigger compensation after release.
+				if (!run.started) throw error;
+				return this.outcome(run, this.safeOperation(run), false, "COORDINATOR_RECOVERY_REQUIRED");
+			}
 		}
 	}
 
@@ -882,11 +950,13 @@ export class RevertTransactionService {
 		});
 		if (current.projectId !== run.ctx?.owner.projectId) throw fail("OWNER_STALE");
 	}
-	private async namespace(signal: AbortSignal) {
+	private async namespace(signal: AbortSignal, allowRecoveredNamespace = false) {
 		const namespace = await this.options.runtime.verifyNamespace(signal);
 		const budget = namespace.catalog.getBudget();
 		if (
-			namespace !== this.options.namespace ||
+			(allowRecoveredNamespace
+				? namespace.generation !== this.options.namespace.generation
+				: namespace !== this.options.namespace) ||
 			budget?.status !== "ready" ||
 			budget.namespaceKey !== this.options.planOptions.namespaceKey ||
 			budget.generation !== namespace.generation
@@ -894,16 +964,20 @@ export class RevertTransactionService {
 			throw fail("NAMESPACE_STALE");
 		return namespace;
 	}
-	private async readBlob(ref: FileChangeBlobRef, signal: AbortSignal) {
+	private async readBlob(
+		ref: FileChangeBlobRef,
+		signal: AbortSignal,
+		allowRecoveredNamespace = false,
+	) {
 		bound(ref.sizeBytes, FILE_CHANGE_LIMITS.blobBytes);
-		const namespace = await this.namespace(signal);
+		const namespace = await this.namespace(signal, allowRecoveredNamespace);
 		const row = namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref });
 		if (row?.status !== "ready" || row.sizeBytes !== ref.sizeBytes) throw fail("RAW_UNAVAILABLE");
 		const bytes = await namespace.store.readBytes(ref, {
 			signal,
 			maxBytes: FILE_CHANGE_LIMITS.blobBytes,
 		});
-		await this.namespace(signal);
+		await this.namespace(signal, allowRecoveredNamespace);
 		return bytes;
 	}
 	private async observeForReceipt(
@@ -1086,7 +1160,16 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 	if (
 		!input ||
 		Object.keys(input).some(
-			(key) => !["principal", "narratorId", "planId", "planHash", "action", "signal"].includes(key),
+			(key) =>
+				![
+					"principal",
+					"narratorId",
+					"planId",
+					"planHash",
+					"action",
+					"acceptSnapshotRestore",
+					"signal",
+				].includes(key),
 		)
 	)
 		throw fail("INVALID_REQUEST");
@@ -1109,6 +1192,8 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 		!["revert_files", "rollback_to_block", "delete_tool_block"].includes(input.action)
 	)
 		throw fail("INVALID_REQUEST");
+	if (input.acceptSnapshotRestore !== undefined && input.acceptSnapshotRestore !== true)
+		throw fail("INVALID_REQUEST");
 	if (typeof input.planHash !== "string" || !/^[a-f0-9]{64}$/.test(input.planHash))
 		throw fail("INVALID_PLAN_HASH");
 	return Object.freeze({
@@ -1117,6 +1202,9 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 		planId: input.planId,
 		planHash: input.planHash,
 		...(input.action === undefined ? {} : { action: input.action }),
+		...(input.acceptSnapshotRestore === undefined
+			? {}
+			: { acceptSnapshotRestore: input.acceptSnapshotRestore }),
 	});
 }
 function bound(value: number, max: number, min = 0) {

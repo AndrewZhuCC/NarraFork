@@ -24,6 +24,126 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("narrator detail forwards optional cancellation signals while legacy callers stay compatible", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const signals: Array<AbortSignal | null | undefined> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: string, init?: RequestInit) => {
+				signals.push(init?.signal);
+				return Response.json({ id: "n" });
+			},
+		});
+		const controller = new AbortController();
+		await api.getNarrator("n", controller.signal);
+		await api.getNarrator("n");
+		expect(signals).toEqual([controller.signal, undefined]);
+	});
+
+	test("snapshot preview and apply forward explicit consent while default requests omit recovery fields", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string, init?: RequestInit) => {
+				calls.push({ url, body: JSON.parse(String(init?.body)) });
+				return Response.json({});
+			},
+		});
+		const target = { messageId: "m", blockIndex: 2, action: "rollback_to_block" as const };
+		await api.previewRevertAction("n", { ...target, idempotencyKey: "selective-key" });
+		await api.previewRevertAction("n", {
+			...target,
+			idempotencyKey: "snapshot-key",
+			recoveryMode: "snapshot",
+		});
+		const plan = { planId: "p", planHash: "h", action: target.action };
+		await api.applyRevertPlan("n", plan);
+		await api.applyRevertPlan("n", { ...plan, acceptSnapshotRestore: true });
+		expect(calls[0]?.body).toEqual({ ...target, idempotencyKey: "selective-key" });
+		expect(calls[1]?.body).toEqual({
+			...target,
+			idempotencyKey: "snapshot-key",
+			recoveryMode: "snapshot",
+		});
+		expect(calls[2]?.body).toEqual({ planHash: "h", action: target.action });
+		expect(calls[3]?.body).toEqual({
+			planHash: "h",
+			action: target.action,
+			acceptSnapshotRestore: true,
+		});
+	});
+
+	test("historical ensure sends exact row/message/attempt without asking for full tool detail", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: string[] = [];
+		const ref = {
+			id: "regenerated",
+			epoch: "fresh",
+			revision: 1,
+			length: 50000,
+			complete: true,
+			originKnown: true,
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string) => {
+				calls.push(url);
+				return Response.json(ref);
+			},
+		});
+		expect(
+			await api.ensureWriteDocumentSource("reader", "provider:call", {
+				toolCallId: "exact-row",
+				messageId: "exact-message",
+				executionAttempt: 2,
+			}),
+		).toEqual(ref);
+		expect(calls).toEqual([
+			"/api/narrators/reader/tool-calls/provider%3Acall/input-document?toolCallId=exact-row&messageId=exact-message&executionAttempt=2",
+		]);
+	});
+
+	test("complete source reader routes by exact narrator/ref and bounds raw Unicode response bytes", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: string[] = [];
+		const ref = {
+			id: "source-id",
+			epoch: "epoch",
+			revision: 1,
+			length: 8,
+			complete: true,
+			originKnown: true,
+			source: { narratorId: "child-id", toolUseId: "provider-id", field: "content" },
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string) => {
+				calls.push(url);
+				return Response.json({ ref, offset: 2, text: "\ud800\r\n" });
+			},
+		});
+		expect((await api.readTextDocumentRange(ref, 2, 999999)).text).toBe("\ud800\r\n");
+		expect(calls).toEqual(["/api/narrators/child-id/text-documents/source-id?offset=2&limit=8192"]);
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => new Response(`{"text":"${"a".repeat(65536)}"}`),
+		});
+		await expect(api.readTextDocumentRange(ref, 0, 8192)).rejects.toThrow("packet limit");
+	});
+
 	test("bounded document reads enforce streamed bytes without relying on Content-Length", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },
@@ -103,6 +223,42 @@ describe("narrators API", () => {
 		const resolved = await api.askInPassing("n", { question: "why", pendingMessageId: "ask" });
 		expect(resolved.id).toBe("target");
 		expect(resolved.message).toEqual(message);
+	});
+
+	test("detaches Bash with an encoded tool endpoint and no request body", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		let receivedUrl = "";
+		let receivedInit: RequestInit | undefined;
+		Object.defineProperty(g, "fetch", {
+			value: async (url: string, init: RequestInit) => {
+				receivedUrl = url;
+				receivedInit = init;
+				return Response.json({ detached: true, taskId: "task-1", alias: "build" });
+			},
+			configurable: true,
+		});
+		expect(await api.detachBash("n/1", "tu/1")).toEqual({
+			detached: true,
+			taskId: "task-1",
+			alias: "build",
+		});
+		expect(receivedUrl).toEndWith("/narrators/n%2F1/tools/tu%2F1/detach");
+		expect(receivedInit?.method).toBe("POST");
+		expect(receivedInit?.body).toBeUndefined();
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ error: "Already finished" }, { status: 409 }),
+			configurable: true,
+		});
+		try {
+			await api.detachBash("n", "tu");
+			throw new Error("Expected a conflict");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApiError);
+			expect((error as ApiError).status).toBe(409);
+		}
 	});
 
 	test("interrupt can wait for the old loop to finish before replacement input", async () => {

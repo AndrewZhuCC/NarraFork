@@ -11,8 +11,10 @@ import type {
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
+import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
@@ -36,6 +38,7 @@ export interface NarratorListStateSnapshotItem {
 	status: string;
 	substatus?: string[];
 	turnStartedAt?: string;
+	activeBackgroundTaskCount?: number;
 }
 
 /** Reflection gate families that report live progress. */
@@ -58,6 +61,8 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/workspace-context").WorkspaceContextChangedEvent
+	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
 	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
@@ -128,7 +133,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 	  }
 	| {
@@ -164,7 +169,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 			nextSteps?: string;
 	  }
@@ -547,6 +552,8 @@ export type NarratorServerMessage =
 	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			narratorId: string;
 			percentage: number;
 			isSubagent?: boolean;
@@ -625,12 +632,14 @@ export type NarratorServerMessage =
 	  }
 	| {
 			type: "tool_started";
+			streamingEditOrigin?: StreamingEditOrigin;
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
 			subagentNarratorId?: string;
 			toolName: string;
 			input?: unknown;
+			inputDocument?: TextDocumentStreamUpdate;
 			streamStartedAt?: number;
 			streamCompletedAt?: number;
 			parentToolUseId?: string;
@@ -655,7 +664,14 @@ export type NarratorServerMessage =
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field */
-			streamingField?: { name: string; delta: string; startsField?: boolean };
+			streamingField?: {
+				name: string;
+				delta: string;
+				startsField?: boolean;
+				offset?: number;
+				complete?: boolean;
+			};
+			inputDocument?: TextDocumentStreamUpdate;
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Built from the
 			 * fields the streaming JSON parser has already extracted, so the row can be
@@ -745,7 +761,8 @@ export type NarratorServerMessage =
 	| {
 			type: "git_status";
 			narratorId: string;
-			chapterId: string;
+			/** Null for chapter-less narrators, whose tools still touch a local Git repo. */
+			chapterId: string | null;
 			toolUseId: string;
 			status: GitStatusSummary;
 			commitsAhead?: number;
@@ -853,6 +870,17 @@ export type NarratorServerMessage =
 			activeTerminalCount: number;
 	  }
 	| {
+			/**
+			 * Lightweight counterpart to `background_task_list_delta` for list-level
+			 * consumers (RecentTabs sidebar, narrator list) that only need the active
+			 * count and must not parse full delta payloads. Emitted alongside every
+			 * list delta, so it changes exactly when the delta's `activeCount` does.
+			 */
+			type: "background_task_count_changed";
+			narratorId: string;
+			activeBackgroundTaskCount: number;
+	  }
+	| {
 			type: "browser_session_count";
 			narratorId: string;
 			activeBrowserSessions: number;
@@ -882,8 +910,17 @@ export type NarratorServerMessage =
 			queueMessage?: string;
 	  }
 	| {
+			type: "streaming_identity";
+			narratorId: string;
+			model: string;
+			provider: string;
+			parentToolUseId?: string;
+	  }
+	| {
 			type: "streaming_snapshot";
 			narratorId: string;
+			model?: string;
+			provider?: string;
 			streamingBlocks: Array<
 				| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 				| {

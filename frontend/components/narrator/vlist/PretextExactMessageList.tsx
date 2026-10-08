@@ -13,8 +13,9 @@
 
 import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
+import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
-import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
+import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
@@ -27,14 +28,12 @@ import {
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	createSmoothFollower,
 	type SmoothFollower,
 	shouldSmoothFollow,
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
-import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
@@ -58,6 +57,17 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { recoveringDocumentRangeReader } from "../content/document-range-recovery";
+import {
+	bindWriteDocumentReader,
+	documentSourceInput,
+	documentWriteInput,
+} from "../content/document-source";
+import {
+	isExactWriteDocumentPin,
+	useWriteDocumentSources,
+	type WriteDocumentSourceEnsurer,
+} from "../content/useWriteDocumentSources";
 import { HistoryRecoveryPanel } from "../HistoryRecoveryPanel";
 import { ManualOlderHistoryLoad } from "../history/ManualOlderHistoryLoad";
 import {
@@ -71,6 +81,7 @@ import type { MessageListHandle, MessageListTailMeta } from "../message/message-
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
+import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
 import {
 	getCategory,
@@ -85,13 +96,14 @@ import {
 	clearCompactProgressAliases,
 	setCompactProgress,
 } from "./compact-progress-store";
-import { ExactRow } from "./ExactRow";
+import type { ExactRowProps } from "./ExactRow";
 import type { InlinePermissionData } from "./measure/measure-permission";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { resolveRenderExtra } from "./render-registry";
+import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
@@ -104,6 +116,7 @@ import {
 	type VListToolDetailRequest,
 } from "./useVListToolDetails";
 import { useVListTraceBindings } from "./useVListTraceBindings";
+import { useVListWindowRows } from "./useVListWindowRows";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
@@ -112,9 +125,9 @@ import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-tar
 import { useVListCompactActions } from "./vlist-compact-bridge";
 import type { VListViewOwner, VListViewTarget } from "./vlist-content-view-target";
 import { installVListCopyHandler } from "./vlist-copy-text";
+import type { VListDataSource } from "./vlist-data-source";
 import {
 	buildDrillSnapshots,
-	DRILL_MORPH_X_OFFSET,
 	type DrillRowSnapshot,
 	diffDrillSnapshots,
 } from "./vlist-drill-morph";
@@ -164,6 +177,7 @@ import {
 	getDistanceFromBottom,
 	getScrollBottomTarget,
 	isBottomLostToContentGrowth,
+	isBottomLostToViewportResize,
 	isSuppressedScrollEcho,
 	isUpwardHistoryScroll,
 } from "./vlist-exact-scroll";
@@ -192,26 +206,26 @@ import {
 	TRIM_FILL_COOLDOWN_MS,
 	trimClockNow,
 } from "./vlist-head-trim";
-import {
-	hasEffectiveHeightOverride,
-	layoutItemsWithOverrides,
-	pruneHeightOverrides,
-} from "./vlist-height-overrides";
+import { pruneHeightOverrides } from "./vlist-height-overrides";
 import { createHighlightController } from "./vlist-highlight";
 import {
 	resolveInterruptGuardActions,
 	useInterruptGuardActions,
 } from "./vlist-injection-guard-actions";
 import type { InjectionNavigation } from "./vlist-injection-header";
+import { createVListInteractionAdmission } from "./vlist-interaction-admission";
+import { VListInteractionAdmissionContext } from "./vlist-interaction-admission-context";
 import {
 	createVListInteractionState,
 	isFileChangesOpenRow,
 	isFullPayloadRequestedRow,
 	isPromptOpenRow,
 	isTraceRowExpanded,
+	isVListTextExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
+	setVListTextExpanded,
 	toggleVListFileChangesOpen,
 	toggleVListLodUserOverride,
 	toggleVListPromptOpen,
@@ -235,6 +249,7 @@ import {
 	type LifecycleSnapshot,
 	planLifecycleMotion,
 } from "./vlist-lifecycle-motion";
+import { createVListResizeController, type VListResizeController } from "./vlist-live-resize";
 import {
 	createLodFocusPoint,
 	createLodStepThrottle,
@@ -245,27 +260,16 @@ import {
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
-import {
-	buildLodSnapshots,
-	diffLodSnapshots,
-	type LodElementSnapshot,
-	type LodElementSource,
-} from "./vlist-lod-morph";
-import { lodMorphKeyframesFrom } from "./vlist-lod-morph-motion";
+import { commitLodMorph, resetLodMorphPlayback } from "./vlist-lod-morph-commit";
+import type { createLodMorphFrameBaseline } from "./vlist-lod-morph-frame";
+import type { createLodMorphGeometryCache } from "./vlist-lod-morph-geometry";
 import { createMorphDriver, type MorphDriver } from "./vlist-morph-driver";
-import {
-	admitPair,
-	initialStateFor,
-	type MorphElement,
-	planMorphTargets,
-} from "./vlist-morph-plan";
+import { createVListMorphScrollOrigin } from "./vlist-morph-scroll-origin";
 import {
 	createMotionScheduler,
 	drillScope,
 	frameScope,
-	LOD_MOTION_DURATION_MS,
 	lifecycleScope,
-	lodScope,
 	type MotionOp,
 	prefersReducedMotion,
 	rowScope,
@@ -284,6 +288,7 @@ import {
 	resolveReloadDelayMs,
 	shouldSurfaceDeferredReload,
 } from "./vlist-reload-policy";
+import { indexWithHeightOverrides } from "./vlist-resize-preview";
 import {
 	resolveReviewFeedbackActions,
 	useReviewFeedbackActions,
@@ -319,42 +324,19 @@ import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
 import {
-	collectVListCompactMarkers,
-	collectVListUserMarkers,
+	collectVListCompactMarkerSemantics,
+	collectVListUserMarkerSemantics,
+	projectVListCompactMarkers,
+	projectVListUserMarkers,
 	resolveVListUserMarkerScrollTop,
 	type VListCompactMarker,
 	type VListUserMarker,
 } from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
+import { createVListVisibleViewport } from "./vlist-visible-viewport";
 import { createVisualStateStore } from "./vlist-visual-state";
-
-/**
- * Reuse the keyframe path's element list for the unified planner.
- *
- * Only the unit-box field name differs (`groupBox` → `unitBox`); `MorphElement` needs no
- * `unitAnchored` flag because it always prefers a unit box when one is present. Module-level
- * so the per-frame roll-forward does not re-allocate a closure on every commit.
- */
-function toMorphElements(src: readonly LodElementSource[]): MorphElement[] {
-	return src.map((el) => ({
-		unitId: el.unitId,
-		key: el.key,
-		kind: el.kind,
-		top: el.top,
-		height: el.height,
-		clip: el.clip ?? null,
-		nested: el.nested,
-		unitBox: el.groupBox ?? null,
-	}));
-}
-
-import {
-	bucketViewportHeight,
-	isExternalGeometryChange,
-	pushCommittedWidth,
-	resolveWidthSettle,
-	type WidthSettleTrigger,
-} from "./vlist-width-settle";
+import { bucketViewportHeight } from "./vlist-width-settle";
+import type { WindowRowProjection } from "./vlist-window-row-reuse";
 
 // Editing chrome is lazy: a list that is only being read never pays for the
 // editor's module graph (attachment thumbs, upload flow) or the modal.
@@ -409,6 +391,8 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
+	deferInteractions?: boolean;
 	isSubagent?: boolean;
 	/** Narrator is working/waiting → render the live streaming tail overlay. */
 	isActive?: boolean;
@@ -441,6 +425,25 @@ type PretextExactMessageListProps = {
 	/** A new request repeats the jump while retaining this list's loaded window. */
 	highlightRequestId?: string;
 	tailFooter?: ReactNode;
+	/**
+	 * Pluggable data boundary for surfaces rendering the same document through a
+	 * different credential (the anonymous public share page). Absent → every seam
+	 * falls back to the authenticated narrator APIs and the path is unchanged.
+	 * Realtime is NOT part of this object: share-auth rides the same /ws/narrator
+	 * manager (setNarratorWSShareAuth), so the existing subscriptions keep working.
+	 */
+	dataSource?: VListDataSource;
+	/**
+	 * Message-level selection (chat rooms): the outlined message ids, and the
+	 * modifier-click toggle (shift/ctrl/cmd). Absent → no selection chrome.
+	 */
+	selectedMessageIds?: ReadonlySet<string>;
+	onToggleMessageSelect?: (messageId: string, opts: { shiftKey: boolean }) => void;
+	/**
+	 * Read-watermark seam (chat rooms): called with the last STRICTLY-visible
+	 * source message id + seq whenever it changes.
+	 */
+	onVisibleMessagesChange?: (last: { id: string; seq: number | null } | null) => void;
 };
 
 /**
@@ -504,11 +507,20 @@ function isStreamingRowKey(key: string): boolean {
 	return key.startsWith(STREAMING_PLACEHOLDER_ID);
 }
 
+// Cached document readers outlive the pane. Keeping this transport at module
+// scope prevents its closure from retaining React's shared render Context (and
+// therefore setViewportNode, the old Fiber tree and the whole Dockview surface).
+const ensureNarratorWriteSource: WriteDocumentSourceEnsurer = (owner, toolUseId, pin, signal) => {
+	if (!isExactWriteDocumentPin(pin))
+		return Promise.reject(new Error("Exact Write document source identity is missing"));
+	return narratorsApi.ensureWriteDocumentSource(owner, toolUseId, pin, signal);
+};
 export const PretextExactMessageList = memo(
 	forwardRef<MessageListHandle, PretextExactMessageListProps>(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				deferInteractions = true,
 				isSubagent,
 				isActive = false,
 				scrollRef,
@@ -524,6 +536,10 @@ export const PretextExactMessageList = memo(
 				highlightMessageId,
 				highlightRequestId,
 				tailFooter,
+				dataSource,
+				selectedMessageIds: messageSelectedIds,
+				onToggleMessageSelect,
+				onVisibleMessagesChange,
 			} = props;
 			const lod = useRenderLod() as RenderLod;
 			// Advanced-animation preference (same key AppRootLayout writes to <html>);
@@ -582,7 +598,22 @@ export const PretextExactMessageList = memo(
 			 * every COW alias when the event does name replacement identities.
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
+			const panelVisible = useNarratorPanelVisible();
+			const interactionOwner = useMemo(
+				() => ({
+					narratorId,
+					admission: deferInteractions ? createVListInteractionAdmission() : null,
+				}),
+				[narratorId, deferInteractions],
+			);
+			const interactionAdmission = interactionOwner.admission;
+			const interactionAdmissionRef = useRef(interactionAdmission);
+			useLayoutEffect(() => {
+				interactionAdmissionRef.current = interactionAdmission;
+			}, [interactionAdmission]);
 			const pinnedToBottomRef = useRef(true);
+			// Explicit full-text reading is not a request to chase newly streamed text.
+			const textReadingDetachedRef = useRef(false);
 			const suppressScrollStateRef = useRef(false);
 			/**
 			 * The scrollTop our own last programmatic write settled on, while its suppression
@@ -596,7 +627,12 @@ export const PretextExactMessageList = memo(
 			// on every scroll pixel. React state (scrollTop) only advances when the
 			// mounted window actually changes.
 			const scrollTopRef = useRef(0);
+			// Sample height with scrollTop; observer/state updates must not consume a resize
+			// before its browser-generated scroll event has been classified.
+			const scrollViewportHeightRef = useRef<number | null>(null);
 			const scrollRafRef = useRef(0);
+			// Lifetime holder only: recording a scroll sample never schedules React work.
+			const [morphScrollOrigin] = useState(createVListMorphScrollOrigin);
 			// Where the in-flight LOD gesture is pointing (mouse / pinch center), captured
 			// by the gesture handlers and read back by readCurrentView when the rebuild
 			// captures its anchor. Expires (LOD_FOCUS_TTL_MS) so an unrelated later rebuild
@@ -605,6 +641,20 @@ export const PretextExactMessageList = memo(
 			const [viewportHeight, setViewportHeight] = useState(0);
 			const viewportHeightRef = useRef(0);
 			viewportHeightRef.current = viewportHeight;
+			const visibleViewportRef = useRef(createVListVisibleViewport());
+			const readViewportView = useCallback(
+				() =>
+					visibleViewportRef.current.read(
+						viewportRef.current,
+						{
+							scrollTop: scrollTopRef.current,
+							viewportHeight: viewportHeightRef.current,
+							pinnedToBottom: pinnedToBottomRef.current,
+						},
+						smoothFollowerRef.current?.isActive() === true,
+					),
+				[],
+			);
 			// 0 = NOT YET MEASURED, and it is a sentinel rather than a plausible width on
 			// purpose.
 			//
@@ -616,7 +666,16 @@ export const PretextExactMessageList = memo(
 			// (narratorColumnPlaceholderStyle) and the rows only render once
 			// `hasRenderableLayout` is true, by which time the layout effect below has
 			// committed the measured width.
+			const isMobileViewport = useMobileViewport();
+			const mobileViewportRef = useRef(isMobileViewport);
+			mobileViewportRef.current = isMobileViewport;
+			const [layoutCompactUsageLines, setLayoutCompactUsageLines] = useState(isMobileViewport);
+			const committedCompactUsageLinesRef = useRef(isMobileViewport);
 			const [contentWidth, setContentWidth] = useState(0);
+			const [widthCommitEpoch, setWidthCommitEpoch] = useState(0);
+			// Exact viewport height can change live; only the finished height reaches the full build.
+			const [layoutHeight, setLayoutHeight] = useState(0);
+			const resizeControllerRef = useRef<VListResizeController | null>(null);
 			// The width the LAYOUT was last built with. Distinct from `contentWidth` state
 			// only for one frame (the setter is async), but the resize handler runs outside
 			// render and must compare against the committed value synchronously — reading
@@ -628,10 +687,36 @@ export const PretextExactMessageList = memo(
 			const footerHeightRef = useRef(0);
 			footerHeightRef.current = footerHeight;
 			pinnedToBottomRef.current = pinnedToBottom;
+			useEffect(() => {
+				if (!interactionAdmission) return;
+				const syncAdmissionVisibility = () => {
+					if (!panelVisible || document.hidden) interactionAdmission.suspend();
+					else
+						interactionAdmission.resume(
+							pinnedToBottomRef.current && !textReadingDetachedRef.current,
+						);
+				};
+				syncAdmissionVisibility();
+				document.addEventListener("visibilitychange", syncAdmissionVisibility);
+				return () => {
+					document.removeEventListener("visibilitychange", syncAdmissionVisibility);
+					interactionAdmission.suspend();
+				};
+			}, [interactionAdmission, panelVisible]);
+			useEffect(() => {
+				if (!interactionAdmission || !viewportNode) return;
+				const onScrollEnd = (event: Event) => {
+					if (event.target === viewportNode) interactionAdmission.finishScroll();
+				};
+				viewportNode.addEventListener("scrollend", onScrollEnd);
+				return () => viewportNode.removeEventListener("scrollend", onScrollEnd);
+			}, [interactionAdmission, viewportNode]);
 
 			const assignViewport = useCallback(
 				(node: HTMLDivElement | null) => {
+					morphScrollOrigin.invalidate();
 					viewportRef.current = node;
+					scrollViewportHeightRef.current = node?.clientHeight ?? null;
 					// Mirror into state so the ResizeObserver effect re-runs when the node is
 					// replaced (see viewportNode). Written unconditionally: React calls this
 					// with null on detach and the real node on attach, and a state write with
@@ -640,7 +725,7 @@ export const PretextExactMessageList = memo(
 					if (typeof scrollRef === "function") scrollRef(node);
 					else setExternalRef(scrollRef, node);
 				},
-				[scrollRef],
+				[scrollRef, morphScrollOrigin],
 			);
 			const assignContent = useCallback(
 				(node: HTMLDivElement | null) => {
@@ -669,23 +754,40 @@ export const PretextExactMessageList = memo(
 			 * of once per animation frame; the chase's exact landing still uses the full
 			 * write so state converges to the true position.
 			 */
-			const writeScrollTopCore = useCallback((nextTop: number, advanceState: boolean) => {
-				const node = viewportRef.current;
-				if (!node) return;
-				const target = Math.max(0, nextTop);
-				node.scrollTop = target;
-				// Read back: the container clamps, so the settled value is what future scroll
-				// events will report for this write.
-				const settled = node.scrollTop;
-				suppressScrollStateRef.current = true;
-				suppressedScrollTopRef.current = settled;
-				scrollTopRef.current = settled;
-				if (advanceState) setScrollTop(settled);
-				requestAnimationFrame(() => {
-					suppressScrollStateRef.current = false;
-					suppressedScrollTopRef.current = null;
-				});
-			}, []);
+			const writeScrollTopCore = useCallback(
+				(nextTop: number, advanceState: boolean) => {
+					morphScrollOrigin.invalidate();
+					const node = viewportRef.current;
+					if (!node || !visibleViewportRef.current.isVisible(node)) {
+						smoothFollowerRef.current?.cancel();
+						return;
+					}
+					const target = Math.max(0, nextTop);
+					node.scrollTop = target;
+					// Read back: the container clamps, so the settled value is what future scroll
+					// events will report for this write.
+					const settled = node.scrollTop;
+					suppressScrollStateRef.current = true;
+					suppressedScrollTopRef.current = settled;
+					scrollTopRef.current = settled;
+					scrollViewportHeightRef.current = node.clientHeight;
+					visibleViewportRef.current.recordScrollTop(settled);
+					// Cache committed corrections for admission priority without mistaking
+					// anchoring/follow echoes for another reader gesture.
+					interactionAdmissionRef.current?.observeScroll({
+						scrollTop: settled,
+						viewportHeight: scrollViewportHeightRef.current,
+						atBottom: pinnedToBottomRef.current && !textReadingDetachedRef.current,
+						activity: false,
+					});
+					if (advanceState) setScrollTop(settled);
+					requestAnimationFrame(() => {
+						suppressScrollStateRef.current = false;
+						suppressedScrollTopRef.current = null;
+					});
+				},
+				[morphScrollOrigin],
+			);
 			const writeScrollTop = useCallback(
 				(nextTop: number) => writeScrollTopCore(nextTop, true),
 				[writeScrollTopCore],
@@ -708,9 +810,14 @@ export const PretextExactMessageList = memo(
 				let follower = smoothFollowerRef.current;
 				if (!follower) {
 					follower = createSmoothFollower({
-						readCurrent: () => viewportRef.current?.scrollTop ?? 0,
-						readTarget: () => getScrollBottomTarget(viewportRef.current),
-						getViewportHeight: () => viewportRef.current?.clientHeight ?? 0,
+						readCurrent: () => readViewportView().scrollTop,
+						readTarget: () => {
+							const node = viewportRef.current;
+							return visibleViewportRef.current.isVisible(node)
+								? getScrollBottomTarget(node)
+								: readViewportView().scrollTop;
+						},
+						getViewportHeight: () => readViewportView().viewportHeight,
 						writeInstant: (value) => writeScrollTop(value),
 						writeChase: (value) => writeChaseScrollTop(value),
 						canAnimate: shouldSmoothFollow,
@@ -718,12 +825,25 @@ export const PretextExactMessageList = memo(
 					smoothFollowerRef.current = follower;
 				}
 				return follower;
-			}, [writeScrollTop, writeChaseScrollTop]);
+			}, [readViewportView, writeScrollTop, writeChaseScrollTop]);
 			// A chase in flight never survives the shell going away.
 			useEffect(() => () => smoothFollowerRef.current?.cancel(), []);
 
 			const onScrollTopCorrection = useCallback(
 				(nextTop: number, anchorKind: "bottom" | "item", smoothFollow?: boolean) => {
+					if (!visibleViewportRef.current.isVisible(viewportRef.current)) {
+						getSmoothFollower().cancel();
+						visibleViewportRef.current.deferCorrection(
+							applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current),
+							anchorKind,
+							readViewportView(),
+						);
+						return;
+					}
+					const node = viewportRef.current;
+					if (node) {
+						visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
+					}
 					// A bottom correction stamped smooth answers TAIL GROWTH (streaming row,
 					// appended message, live patch at the tail): glide the pinned viewport to
 					// the live bottom instead of snapping every committed row up a delta per
@@ -738,7 +858,7 @@ export const PretextExactMessageList = memo(
 					getSmoothFollower().cancel();
 					writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));
 				},
-				[getSmoothFollower, writeScrollTop],
+				[getSmoothFollower, readViewportView, writeScrollTop],
 			);
 			const [interaction, setInteraction] = useState<VListInteractionState>(() =>
 				createVListInteractionState(lod),
@@ -773,15 +893,23 @@ export const PretextExactMessageList = memo(
 			// its row already reverted to the pure-arithmetic form cannot re-introduce a
 			// stale override.
 			const dynamicRowKeysRef = useRef<ReadonlySet<string>>(new Set<string>());
+			const rowWidthsRef = useRef<Pick<ReadonlyMap<string, number>, "get">>(new Map());
+			const heightOverrideWidthsRef = useRef(new Map<string, number>());
+			const heightOverridesForResizeRef = useRef<ReadonlyMap<string, number>>(new Map());
+			const readHeightOverrides = useCallback(() => heightOverridesForResizeRef.current, []);
 			// Sub-pixel jitter guard: ignore reports within 1px of the recorded value so a
 			// ResizeObserver settling animation cannot loop the layout.
 			const setHeightOverride = useCallback((key: string, height: number) => {
 				if (!dynamicRowKeysRef.current.has(key)) return;
 				if (!Number.isFinite(height) || height < 0) return;
 				const rounded = Math.round(height);
+				const width = rowWidthsRef.current.get(key) ?? 0;
+				const previousWidth = heightOverrideWidthsRef.current.get(key);
+				heightOverrideWidthsRef.current.set(key, width);
 				setHeightOverrides((prev) => {
 					const current = prev.get(key);
-					if (current !== undefined && Math.abs(current - rounded) <= 1) return prev;
+					if (previousWidth === width && current !== undefined && Math.abs(current - rounded) <= 1)
+						return prev;
 					const next = new Map(prev);
 					next.set(key, rounded);
 					return next;
@@ -789,21 +917,24 @@ export const PretextExactMessageList = memo(
 			}, []);
 			// Stable per-key height reporter so a dynamic row keeps a referentially stable
 			// onUnknownHeight prop and the ExactRow memo skips it during scroll.
-			const unknownHeightReporterCacheRef = useRef<Map<string, (height: number) => void>>(
-				new Map(),
+			const unknownHeightReporterCacheRef = useRef(
+				new Map<string, { width: number; report: (height: number) => void }>(),
 			);
 			const getUnknownHeightReporter = useCallback(
-				(key: string): ((height: number) => void) => {
+				(key: string, width: number): ((height: number) => void) => {
 					const cached = unknownHeightReporterCacheRef.current.get(key);
-					if (cached) return cached;
-					const reporter = (height: number) => setHeightOverride(key, height);
-					unknownHeightReporterCacheRef.current.set(key, reporter);
-					return reporter;
+					if (cached?.width === width) return cached.report;
+					const report = (height: number) => {
+						// Retire a late report from the previous width's observer.
+						if (rowWidthsRef.current.get(key) === width) setHeightOverride(key, height);
+					};
+					unknownHeightReporterCacheRef.current.set(key, { width, report });
+					return report;
 				},
 				[setHeightOverride],
 			);
 			const activeInteraction =
-				interaction.lod === lod ? interaction : createVListInteractionState(lod);
+				interaction.lod === lod ? interaction : resetVListInteractionStateForLod(interaction, lod);
 			// Latest-value refs for the two callbacks that are handed to EVERY mounted row.
 			// The ExactRow memo compares those callbacks identity-wise, so they must not be
 			// rebuilt per render; they read the current interaction / narrator id from here
@@ -835,6 +966,10 @@ export const PretextExactMessageList = memo(
 					isTraceRowExpanded(activeInteraction, traceKey, rowKey),
 				[activeInteraction],
 			);
+			const resolveTextExpanded = useCallback(
+				(key: string, bodyKey?: string) => isVListTextExpanded(activeInteraction, key, bodyKey),
+				[activeInteraction],
+			);
 			const resolveShowOriginal = useCallback(
 				(key: string) => activeInteraction.showOriginal.has(key),
 				[activeInteraction],
@@ -858,6 +993,12 @@ export const PretextExactMessageList = memo(
 			// Edit/Read rows showed just the tool name while their expanded detail (which
 			// fetches the full payload) looked fine.
 			const { t, i18n } = useTranslation("narrator");
+			// Every localized string the vlist paints comes from one place (the vlist
+			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
+			// the pure adapter's measured card / trace text and exact tool summaries;
+			// `renderLabels` supplies each RenderXxx's chrome. Reuse the memoized labels
+			// without translating every historical tool again on each streaming frame.
+			const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
 			const resolveExactToolSummary = useCallback(
 				(tc: unknown) => {
 					const call = (tc ?? {}) as {
@@ -904,22 +1045,9 @@ export const PretextExactMessageList = memo(
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
 							: baseMetadata;
-					return getSummary(call.toolName, call.inputJson, summaryMetadata, {
-						communicationRunning: t("communicationRunning"),
-						communicationNoRecipients: t("communicationNoRecipients"),
-						communicationSuccess: t("communicationSuccess"),
-						communicationReceived: t("communicationReceived"),
-						communicationWaiting: t("communicationWaiting"),
-						communicationReplyReceived: t("communicationReplyReceived"),
-						communicationTimeout: t("communicationTimeout"),
-						communicationCancelled: t("communicationCancelled"),
-						communicationError: t("communicationError"),
-						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
-						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
-						contextAskStatusSummary: t("contextAskStatusSummary"),
-					});
+					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
-				[t],
+				[vlistLabels],
 			);
 			// A subagent recent-call row's label detail. Same shared helper the chunked
 			// `SubagentActivityRow` calls, so one child call is worded identically in both
@@ -935,31 +1063,28 @@ export const PretextExactMessageList = memo(
 				[],
 			);
 			const readCurrentView = useCallback(() => {
-				const node = viewportRef.current;
-				const scrollTop = node?.scrollTop ?? scrollTopRef.current;
+				// A parked display:none node has no reading geometry. Semantic patches
+				// keep the last visible view (plus deferred anchored corrections).
+				// An active chase still counts as pinned while its visible box lags.
+				const view = readViewportView();
 				return {
-					scrollTop,
-					viewportHeight: node?.clientHeight ?? viewportHeightRef.current,
-					// Mid-chase the viewport lags BEHIND the bottom by the glide residual, so
-					// the raw geometric reading would report "not pinned" while the reader is
-					// in fact following — every streaming commit would then capture an ITEM
-					// anchor, and its correction would cancel the chase it should feed. An
-					// active chase IS the bottom pin in motion.
-					pinnedToBottom: node
-						? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON ||
-							smoothFollowerRef.current?.isActive() === true
-						: pinnedToBottomRef.current,
+					...view,
+					// Reading expanded text stays detached even if a shorter viewport
+					// happens to place its preserved position at the geometric bottom.
+					pinnedToBottom: !textReadingDetachedRef.current && view.pinnedToBottom,
 					// Document offset of the point the LOD gesture is centered on, so the
 					// rebuild anchors THAT content instead of the viewport top. Stale points
 					// are dropped by resolveLodFocusOffset (see the gesture wiring below).
-					focusOffset: resolveLodFocusOffset(lodFocusRef.current, Date.now(), scrollTop),
+					focusOffset: resolveLodFocusOffset(lodFocusRef.current, Date.now(), view.scrollTop),
 				};
-			}, []);
+			}, [readViewportView]);
 
 			// Per-key measured lookup so stable toggle callbacks can read current state at
 			// click time without depending on render-time closures. Populated below from
 			// the current render items.
-			const measuredByKeyRef = useRef<Map<string, VListItem["measured"]>>(new Map());
+			const measuredByKeyRef = useRef<Pick<ReadonlyMap<string, VListItem["measured"]>, "get">>(
+				new Map(),
+			);
 			const collapsesByLodByKeyRef = useRef<Map<string, boolean>>(new Map());
 			/**
 			 * Fold transition (see vlist-fold-animation.ts).
@@ -1001,26 +1126,10 @@ export const PretextExactMessageList = memo(
 			const visualStateRef = useRef(createVisualStateStore());
 			/** Identities the driver should write this frame; refreshed by the morph effect. */
 			const morphIdentitiesRef = useRef<Set<string>>(new Set());
-			/**
-			 * Previous admitted frame for the UNIFIED path.
-			 *
-			 * Deliberately separate from `lodMorphPrevRef`: while the flag can be toggled at
-			 * runtime, sharing one ref would let a frame recorded by one path be diffed by the
-			 * other, whose admission rules differ — a silent mispairing rather than an error.
-			 */
-			const unifiedPrevRef = useRef<MorphElement[] | null>(null);
-			/**
-			 * `scrollTop` of the frame `unifiedPrevRef` was captured in.
-			 *
-			 * Element geometry is DOCUMENT px, so turning it into screen space needs the scroll
-			 * origin of ITS OWN frame. A gesture-driven LOD switch rewrites `scrollTop` (the LOD
-			 * anchor keeps the pointed-at content at a fixed screen position), so using the new
-			 * frame's origin for the old frame's geometry charges the entire scroll correction to
-			 * every element as travel it never made — the anchored content is displaced by the
-			 * correction and animates back from it, which reads as the zoom being centred on the
-			 * wrong place.
-			 */
-			const unifiedPrevScrollTopRef = useRef(0);
+			/** Reuse only the latest committed document-space geometry, never admitted maps. */
+			const lodMorphGeometryRef = useRef<ReturnType<typeof createLodMorphGeometryCache> | null>(
+				null,
+			);
 			/**
 			 * THE ONE TIMING OWNER for unified morphs.
 			 *
@@ -1086,8 +1195,7 @@ export const PretextExactMessageList = memo(
 				// what stops the linter from "simplifying" the dep list to `[]` — which would make
 				// this run on mount only and miss every mid-session flip, i.e. the entire case.
 				void unifiedMorph;
-				morphIdentitiesRef.current = new Set();
-				morphDriverRef.current?.stop();
+				resetLodMorphPlayback(morphIdentitiesRef, morphDriverRef.current);
 			}, [unifiedMorph]);
 
 			const foldCaptureRef = useRef<{
@@ -1224,14 +1332,11 @@ export const PretextExactMessageList = memo(
 			 */
 			const drillMorphRevisionRef = useRef<number>(-1);
 			/**
-			 * LOD-switch morph (see vlist-lod-morph.ts). Diff-driven off the committed layout,
-			 * keyed by `unitId` — the one identity that survives a level switch. The snapshot
-			 * rolls forward every commit so the next diff has a clean baseline; a morph only
-			 * plays when the document revision is unchanged AND the lod moved (pure re-theme).
+			 * Latest committed world frame for BOTH LOD paths. Each selected planner derives
+			 * its own admitted maps only on a real switch; no viewport-space Map is shared.
+			 * Origins/heights still advance on scroll/rebuild/reduced-motion commits.
 			 */
-			const lodMorphPrevRef = useRef<Map<string, LodElementSnapshot> | null>(null);
-			const lodMorphLodRef = useRef<number>(-1);
-			const lodMorphDocRevRef = useRef<number>(-1);
+			const lodMorphFramesRef = useRef<ReturnType<typeof createLodMorphFrameBaseline> | null>(null);
 			/**
 			 * LIFECYCLE transition (see vlist-lifecycle-motion.ts): the previous committed
 			 * frame of the mounted window, and the frame context it was taken under. Pure
@@ -1241,6 +1346,7 @@ export const PretextExactMessageList = memo(
 			const lifecyclePrevContextRef = useRef<{
 				lod: number;
 				widthBucket: string;
+				resizing: boolean;
 				scrollTop: number;
 			} | null>(null);
 			/**
@@ -1384,6 +1490,36 @@ export const PretextExactMessageList = memo(
 							}
 							setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
 						},
+						onToggleTextExpanded: (bodyKey?: string) => {
+							// Stop in place, not snapToTarget: a growing tail must not move the
+							// clicked control before the item anchor is captured.
+							smoothFollowerRef.current?.cancel();
+							textReadingDetachedRef.current = true;
+							interactionAdmissionRef.current?.markHistoryIntent();
+							pinnedToBottomRef.current = false;
+							visibleViewportRef.current.setPinned(false);
+							setPinnedToBottom(false);
+							captureFoldBefore(key);
+							setInteraction((prev) => {
+								const item = renderItemsRef.current.find((candidate) => candidate.spec.key === key);
+								const preference = resolveTextExpansionPreference(item?.spec ?? { key }, bodyKey);
+								const expanded = !isVListTextExpanded(prev, preference.specKey, preference.bodyKey);
+								const next = setVListTextExpanded(
+									prev,
+									key,
+									expanded,
+									bodyKey,
+									preference.specKey,
+									preference.bodyKey ?? null,
+								);
+								if (bodyKey !== undefined || !expanded) return next;
+								const source = item?.spec.data as { messageBody?: ToolCappedDetail } | undefined;
+								return item?.spec.kind === "communication-bubble" &&
+									source?.messageBody?.textTruncated
+									? markVListFullPayloadRequested(next, key)
+									: next;
+							});
+						},
 						onToggleTranslation: () => {
 							// A fold, despite the name. The two texts wrap to different line counts at
 							// the same width (`measureReasoning` measures `displayText`, and
@@ -1488,11 +1624,6 @@ export const PretextExactMessageList = memo(
 			// content fixed while the reserved space changes off-screen above it.
 			const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
 			const { t: tCommon } = useTranslation("common");
-			// Every localized string the vlist paints comes from one place (the vlist
-			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
-			// the pure adapter's measured card / trace text; `renderLabels` supplies each
-			// RenderXxx's chrome (buttons, badges, section titles, placeholders).
-			const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
 			// Tooltip / aria label for a clickable text-file attachment. Height-neutral
 			// chrome, so it does NOT participate in the measurement cache key.
 			const openAttachmentLabel = t("contextMenu_openFilePanel");
@@ -1516,8 +1647,13 @@ export const PretextExactMessageList = memo(
 			// Who is reading. Decides whether a user bubble is drawn as the reader's own turn
 			// or a teammate's — this is a shared deployment, so `role: "user"` alone does not
 			// mean "you". Height-neutral, so it stays out of the measurement cache key.
+			//
+			// A dataSource may fix the viewer identity explicitly (the anonymous share page
+			// has no session: every bubble is somebody else's — or, for the discussion pane,
+			// resolved by the projection from `author.isSelf`).
 			const { data: currentUser } = useCurrentUser();
-			const currentUserId = currentUser?.id ?? null;
+			const currentUserId =
+				dataSource?.viewerId !== undefined ? dataSource.viewerId : (currentUser?.id ?? null);
 			// Language identity for the measurement cache: localized text is baked into
 			// measured content, so a switch must invalidate cached heights (see
 			// buildPretextDocumentLayout's labelsRevision).
@@ -1613,8 +1749,45 @@ export const PretextExactMessageList = memo(
 			// its first frame must start from the prediction rather than the previous form's
 			// reading. Entries for requests that are gone are dropped with the list.
 			const [permissionFormHeights, setPermissionFormHeights] = useState<
-				ReadonlyMap<string, { requestId: string; height: number }>
+				ReadonlyMap<string, { requestId: string; height: number; width: number }>
 			>(() => new Map());
+			const resizeFormHeightsRef = useRef(
+				new Map<string, { requestId: string; height: number; width: number }>(),
+			);
+			const resizeDirtyKeysRef = useRef(new Set<string>());
+			const pendingPermissionsByToolUseId = useMemo(
+				() => new Map((permCb?.pendingPermissions ?? []).map((perm) => [perm.toolUseId, perm])),
+				[permCb?.pendingPermissions],
+			);
+			const pendingPermissionsByToolUseIdRef = useRef(pendingPermissionsByToolUseId);
+			pendingPermissionsByToolUseIdRef.current = pendingPermissionsByToolUseId;
+			const canDecidePermissionsRef = useRef(canDecidePermissions);
+			canDecidePermissionsRef.current = canDecidePermissions;
+			const getResizeInputs = useCallback(
+				() => ({
+					dirtyKeys: resizeDirtyKeysRef.current,
+					resolvePermissionForm: (toolUseId: string, width: number) => {
+						const perm = pendingPermissionsByToolUseIdRef.current.get(toolUseId);
+						if (!perm) return undefined;
+						const prediction = predictInlinePermission(perm, {
+							innerWidth: toolCardInnerWidth(width, false),
+							canDecide: canDecidePermissionsRef.current,
+						});
+						if (!prediction) return undefined;
+						const painted = resizeFormHeightsRef.current.get(toolUseId);
+						return {
+							prediction,
+							...(painted?.requestId === perm.id && painted.width === width
+								? { height: painted.height }
+								: {}),
+						};
+					},
+					onMeasuredKeys: (keys: ReadonlySet<string>) => {
+						for (const key of keys) resizeDirtyKeysRef.current.delete(key);
+					},
+				}),
+				[],
+			);
 			const pendingRequestIdByToolUseId = useMemo(() => {
 				const map = new Map<string, string>();
 				for (const perm of permCb?.pendingPermissions ?? []) {
@@ -1625,30 +1798,57 @@ export const PretextExactMessageList = memo(
 			// Read by the (stable) reporter, which must not change identity per request.
 			const pendingRequestIdByToolUseIdRef = useRef(pendingRequestIdByToolUseId);
 			pendingRequestIdByToolUseIdRef.current = pendingRequestIdByToolUseId;
-			const reportPermissionFormHeight = useCallback((toolUseId: string, height: number) => {
-				const requestId = pendingRequestIdByToolUseIdRef.current.get(toolUseId);
-				if (!requestId || !Number.isFinite(height) || height <= 0) return;
-				const rounded = Math.round(height);
-				setPermissionFormHeights((prev) => {
-					const current = prev.get(toolUseId);
-					if (current && current.requestId === requestId && Math.abs(current.height - rounded) <= 1)
-						return prev;
-					const next = new Map(prev);
-					next.set(toolUseId, { requestId, height: rounded });
-					return next;
-				});
-			}, []);
+			const reportPermissionFormHeight = useCallback(
+				(toolUseId: string, height: number, width: number, rowKey: string) => {
+					const requestId = pendingRequestIdByToolUseIdRef.current.get(toolUseId);
+					if (!requestId || !Number.isFinite(height) || height <= 0) return;
+					if (rowWidthsRef.current.get(rowKey) !== width) return;
+					const rounded = Math.round(height);
+					const current = resizeFormHeightsRef.current.get(toolUseId);
+					if (
+						current?.requestId === requestId &&
+						current.width === width &&
+						Math.abs(current.height - rounded) <= 1
+					)
+						return;
+					const entry = { requestId, height: rounded, width };
+					resizeFormHeightsRef.current.set(toolUseId, entry);
+					// Resize freezes wrapping, not permission content. Publish fixed-width
+					// height changes through the normal anchored document rebuild even pending.
+					setPermissionFormHeights((prev) => {
+						const next = new Map(prev);
+						next.set(toolUseId, entry);
+						return next;
+					});
+				},
+				[],
+			);
+			const permissionHeightReportersRef = useRef(
+				new Map<string, { width: number; report: (toolUseId: string, height: number) => void }>(),
+			);
+			const getPermissionHeightReporter = useCallback(
+				(key: string, width: number) => {
+					const cached = permissionHeightReportersRef.current.get(key);
+					if (cached?.width === width) return cached.report;
+					const report = (toolUseId: string, height: number) =>
+						reportPermissionFormHeight(toolUseId, height, width, key);
+					permissionHeightReportersRef.current.set(key, { width, report });
+					return report;
+				},
+				[reportPermissionFormHeight],
+			);
 			const resolvePermissionFormHeight = useCallback(
 				(toolUseId: string | undefined) => {
 					if (!toolUseId) return undefined;
-					const entry = permissionFormHeights.get(toolUseId);
-					if (!entry) return undefined;
-					// A reading from a previous request for the same call is not this form's.
+					const local = resizeFormHeightsRef.current.get(toolUseId);
+					const entry =
+						local?.width === contentWidth ? local : permissionFormHeights.get(toolUseId);
+					if (!entry || entry.width !== contentWidth) return undefined;
 					return pendingRequestIdByToolUseId.get(toolUseId) === entry.requestId
 						? entry.height
 						: undefined;
 				},
-				[permissionFormHeights, pendingRequestIdByToolUseId],
+				[permissionFormHeights, pendingRequestIdByToolUseId, contentWidth],
 			);
 			// Drop readings whose request is gone, so the map cannot grow for the session.
 			useEffect(() => {
@@ -1664,6 +1864,10 @@ export const PretextExactMessageList = memo(
 					}
 					return changed ? next : prev;
 				});
+				for (const [toolUseId, entry] of resizeFormHeightsRef.current) {
+					if (pendingRequestIdByToolUseId.get(toolUseId) !== entry.requestId)
+						resizeFormHeightsRef.current.delete(toolUseId);
+				}
 			}, [pendingRequestIdByToolUseId]);
 			// Truncated payloads on expanded cards, fetched in full on demand (the chunked
 			// path's LazyDetailRenderer equivalent). The id list is published by an effect
@@ -1673,9 +1877,76 @@ export const PretextExactMessageList = memo(
 				narratorId: string;
 				requests: readonly VListToolDetailRequest[];
 			}>({ narratorId, requests: [] });
-			const { resolveFullToolInput, resolveFullToolOutput } = useVListToolDetails(
+			const [visibleWriteSourceRequests, setVisibleWriteSourceRequests] = useState<{
+				narratorId: string;
+				requests: readonly VListToolDetailRequest[];
+			}>({ narratorId, requests: [] });
+			const rawTextDocumentRangeReader =
+				dataSource?.fetchTextDocumentRange ?? narratorsApi.readTextDocumentRange;
+
+			const ensureWriteSource =
+				dataSource?.ensureWriteDocumentSource ??
+				(dataSource?.fetchToolDetail ? undefined : ensureNarratorWriteSource);
+			const textDocumentRangeReader = useMemo(
+				() => recoveringDocumentRangeReader(rawTextDocumentRangeReader, ensureWriteSource),
+				[rawTextDocumentRangeReader, ensureWriteSource],
+			);
+			const writeSourceRequests = useMemo(
+				() => [
+					...(visibleWriteSourceRequests.narratorId === narratorId
+						? visibleWriteSourceRequests.requests
+						: []),
+					...(truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : []),
+				],
+				[narratorId, visibleWriteSourceRequests, truncatedToolCalls],
+			);
+			const writeSources = useWriteDocumentSources(
 				narratorId,
-				truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : [],
+				writeSourceRequests,
+				ensureWriteSource,
+				textDocumentRangeReader,
+			);
+			const fullDetailRequests = useMemo(
+				() =>
+					truncatedToolCalls.narratorId === narratorId
+						? truncatedToolCalls.requests.filter(
+								(request) =>
+									!ensureWriteSource ||
+									!isExactWriteDocumentPin(request) ||
+									!writeSources.isWrite(request.toolUseId, request),
+							)
+						: [],
+				[narratorId, truncatedToolCalls, ensureWriteSource, writeSources.isWrite],
+			);
+			const { resolveFullToolInput, resolveFullToolOutput, resolveToolDetailStatus } =
+				useVListToolDetails(narratorId, fullDetailRequests, dataSource?.fetchToolDetail);
+			const resolveDocumentToolInput = useCallback(
+				(
+					toolUseId: string | undefined,
+					ref?: import("./vlist-data-source").VListToolDetailRef,
+					writeInput?: unknown,
+				) => {
+					const full = resolveFullToolInput(toolUseId, ref);
+					if (writeInput === undefined || !toolUseId) return full;
+					writeSources.noteWrite(toolUseId, ref);
+					const source = writeSources.resolve(toolUseId, ref);
+					if (source) return documentSourceInput(writeInput, source);
+					const projected = bindWriteDocumentReader(
+						documentWriteInput(narratorId, toolUseId, full ?? writeInput, ref),
+						textDocumentRangeReader,
+					);
+					return writeSources.hasError(toolUseId, ref) && projected && typeof projected === "object"
+						? { ...projected, textDocumentError: true }
+						: projected;
+				},
+				[
+					narratorId,
+					resolveFullToolInput,
+					writeSources.noteWrite,
+					writeSources.resolve,
+					writeSources.hasError,
+					textDocumentRangeReader,
+				],
 			);
 			// Header terminate control: interrupting the narrator is what actually stops a
 			// running shell / MCP tool (the chunked control does the same).
@@ -1780,13 +2051,11 @@ export const PretextExactMessageList = memo(
 				isFetched: userPrefsFetched,
 			} = useUserPreferences();
 			const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-			// The chunked path splits the trailing usage summary with CSS breakpoints, which
-			// a zero-DOM height model cannot see — so the breakpoint is resolved here and
-			// becomes an explicit measure input (one line vs two).
-			const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+			// During a resize, the live breakpoint selects visible usage specs locally.
+			// Only the settled breakpoint reaches the full document build below.
 			// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
 			// so the value handed to the document hook only changes at bucket boundaries.
-			const layoutViewportHeight = bucketViewportHeight(viewportHeight);
+			const layoutViewportHeight = bucketViewportHeight(layoutHeight);
 			// FOLD-ORDER MARKER — must stay ABOVE the fold-play layout effect.
 			//
 			// This hook owns the anchored rebuild's scroll correction, and it applies it in a
@@ -1796,12 +2065,28 @@ export const PretextExactMessageList = memo(
 			// call below the fold effect would silently plan every fold from an uncorrected
 			// scroll position (rows sliding by the anchor's own Δ), with nothing throwing.
 			// vlist-fold-wiring.test.ts asserts this marker precedes the play effect.
+			// The data boundary: a share-credentialed fetchPage/locateMessage pair
+			// replaces the narrator API defaults; absent, nothing changes. Memoized:
+			// the document effect keys on this object, so an inline literal would
+			// reload the document on every render.
+			const loadOptions = useMemo(
+				() => ({
+					...(dataSource?.fetchPage ? { fetchPage: dataSource.fetchPage } : {}),
+					...(dataSource?.locateMessage ? { locateMessage: dataSource.locateMessage } : {}),
+				}),
+				[dataSource?.fetchPage, dataSource?.locateMessage],
+			);
 			const pretextDocument = usePretextDocument(narratorId, {
 				lod,
+				keepEmptyReasoningLive: isActive,
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),
 				contentWidth,
+				loadOptions,
+				widthCommitEpoch,
+				getHeightOverrides: readHeightOverrides,
+				getResizeInputs,
 				// BUCKETED on purpose. Height reaches the build for exactly one reason (the
 				// plan-detail cap), but at pixel resolution it made every frame of a sash drag
 				// re-measure the whole document — bypassing the width gate entirely, which is
@@ -1821,6 +2106,7 @@ export const PretextExactMessageList = memo(
 				showEarlier: resolveShowEarlier,
 				expandedRows: resolveExpandedRows,
 				isRowExpanded: resolveTraceRowExpanded,
+				isTextExpanded: resolveTextExpanded,
 				showOriginal: resolveShowOriginal,
 				isPromptOpen: resolvePromptOpen,
 				isFileChangesOpen: resolveFileChangesOpen,
@@ -1839,10 +2125,10 @@ export const PretextExactMessageList = memo(
 				resolvePermissionFormHeight,
 				resolvePendingPlan,
 				resolvePendingPermissionSuggestions,
-				resolveFullToolInput,
+				resolveFullToolInput: resolveDocumentToolInput,
 				resolveFullToolOutput,
 				showTokenUsage,
-				compactUsageLines: isMobileViewport,
+				compactUsageLines: layoutCompactUsageLines,
 				formatUsageNumber: formatLocaleNumber,
 				onScrollTopCorrection,
 				isSubagent,
@@ -1905,6 +2191,7 @@ export const PretextExactMessageList = memo(
 				void narratorId;
 				appliedMessageRevisionRef.current = 0;
 				initialRevisionSyncRef.current = true;
+				textReadingDetachedRef.current = false;
 				setMessageRevision(0);
 				// The shell is NOT remounted per narrator (no `key={narratorId}`), so the
 				// per-row handler caches keyed by spec.key would otherwise accumulate every
@@ -1913,6 +2200,9 @@ export const PretextExactMessageList = memo(
 				unknownHeightReporterCacheRef.current.clear();
 				togglesCacheRef.current.clear();
 				reflectionTakeOverCacheRef.current.clear();
+				permissionHeightReportersRef.current.clear();
+				heightOverrideWidthsRef.current.clear();
+				resizeDirtyKeysRef.current.clear();
 				// Closing rows are released by `MotionOp.onDone`, which only runs for
 				// animations this shell still owns. A narrator switch is not an unmount, so
 				// `cancel()` does not fire and a fold interrupted by the switch leaves its
@@ -2059,120 +2349,151 @@ export const PretextExactMessageList = memo(
 			// The exact shell is stable-state only. Subscribe to the existing message
 			// control stream once a complete document exists. Realtime mutations reload
 			// the full exact input; reconnect catch-up reloads only when it reports data.
-			useNarratorWS(
-				revisionSubscriptionId,
-				{
-					onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
-						upsertOrReload(wsData.message),
-					onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
-						upsertOrReload(wsData.message),
-					onMessageUpdated: replaceOrReload,
-					onMessagesDeleted: removeOrReload,
-					// A segment compact hides its compressed messages through this dedicated
-					// event rather than `messages_deleted` (they are not gone — their summary
-					// lives behind the marker). The ids arrive in the event, so the in-place
-					// removal applies exactly as a deletion does: the run the reader just
-					// selected collapses immediately, wherever they are scrolled.
-					onSegmentCompactHide: (hiddenMessageIds: string[]) => {
-						if (removeMessagesRef.current(hiddenMessageIds)) {
-							appliedMessageRevisionRef.current += 1;
-						}
-						bumpMessageRevision();
-					},
-					// Completion (and failure — the dispatcher folds `compact_failed` into this
-					// callback) carries no message body: the content already arrived via
-					// `message` / `message_updated`, both applied in place above. It is kept
-					// for two things the in-place paths cannot cover:
-					//
-					//   1. Paths that broadcast a BARE compact_done with no preceding message
-					//      frame (narrator-recovery does, in several places). Without this
-					//      handler the document had no signal at all and stayed stale until the
-					//      reader reloaded the page — the reported bug's second half.
-					//   2. Converging the local seq numbering. `insertMessage` deliberately
-					//      does not shift the following seqs (see vlist-message-insert), and
-					//      this reload adopts the server's.
-					//
-					// It does NOT exist to shrink the window: the document page filters only on
-					// `segmentCompactId` (server-side), so a full-history compact leaves every
-					// older message readable and a segment compact's hidden rows are already
-					// gone via `onSegmentCompactHide` above.
-					onCompactDone: (_contextPercentAfter, isSegment, _mode, replacement) => {
-						// COW retries may name old and/or new marker ids; the non-retry
-						// path often names none. Always clear aliases when present, then
-						// every key this panel wrote (progress is keyed by the id that
-						// `compact_progress` broadcast, which is not always on the done
-						// payload). Do not clearAll here — another narrator may still be
-						// compacting.
-						clearCompactProgressAliases(replacement, isSegment);
-						const observed = compactProgressKeysRef.current;
-						for (const [messageId, wasSegment] of observed) {
-							if (isSegment != null && wasSegment !== isSegment) continue;
-							clearCompactProgress(messageId, wasSegment);
-							observed.delete(messageId);
-						}
-						bumpMessageRevision();
-					},
-					onCompactFailed: (_error, _mode, messageId) => {
-						clearCompactProgress(messageId);
-						if (messageId) compactProgressKeysRef.current.delete(messageId);
-					},
-					onFullReload: () => {
-						clearAllCompactProgress();
-						compactProgressKeysRef.current.clear();
-						bumpMessageRevision();
-					},
-					// Live compact-progress ticks repaint only the mounted fixed-height marker.
-					// They never enter the pretext document or its measurement cache.
-					onCompactProgress: ({
-						messageId,
-						isSegment,
+			const externalSubscribeMessages = dataSource?.subscribeMessages;
+			const messageWsCallbacks: NarratorWSCallbacks = {
+				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
+					upsertOrReload(wsData.message),
+				onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
+					upsertOrReload(wsData.message),
+				onMessageUpdated: replaceOrReload,
+				onMessagesDeleted: removeOrReload,
+				// A segment compact hides its compressed messages through this dedicated
+				// event rather than `messages_deleted` (they are not gone — their summary
+				// lives behind the marker). The ids arrive in the event, so the in-place
+				// removal applies exactly as a deletion does: the run the reader just
+				// selected collapses immediately, wherever they are scrolled.
+				onSegmentCompactHide: (hiddenMessageIds: string[]) => {
+					if (removeMessagesRef.current(hiddenMessageIds)) {
+						appliedMessageRevisionRef.current += 1;
+					}
+					bumpMessageRevision();
+				},
+				// Completion (and failure — the dispatcher folds `compact_failed` into this
+				// callback) carries no message body: the content already arrived via
+				// `message` / `message_updated`, both applied in place above. It is kept
+				// for two things the in-place paths cannot cover:
+				//
+				//   1. Paths that broadcast a BARE compact_done with no preceding message
+				//      frame (narrator-recovery does, in several places). Without this
+				//      handler the document had no signal at all and stayed stale until the
+				//      reader reloaded the page — the reported bug's second half.
+				//   2. Converging the local seq numbering. `insertMessage` deliberately
+				//      does not shift the following seqs (see vlist-message-insert), and
+				//      this reload adopts the server's.
+				//
+				// It does NOT exist to shrink the window: the document page filters only on
+				// `segmentCompactId` (server-side), so a full-history compact leaves every
+				// older message readable and a segment compact's hidden rows are already
+				// gone via `onSegmentCompactHide` above.
+				onCompactDone: (_contextPercentAfter, isSegment, _mode, replacement) => {
+					// COW retries may name old and/or new marker ids; the non-retry
+					// path often names none. Always clear aliases when present, then
+					// every key this panel wrote (progress is keyed by the id that
+					// `compact_progress` broadcast, which is not always on the done
+					// payload). Do not clearAll here — another narrator may still be
+					// compacting.
+					clearCompactProgressAliases(replacement, isSegment);
+					const observed = compactProgressKeysRef.current;
+					for (const [messageId, wasSegment] of observed) {
+						if (isSegment != null && wasSegment !== isSegment) continue;
+						clearCompactProgress(messageId, wasSegment);
+						observed.delete(messageId);
+					}
+					bumpMessageRevision();
+				},
+				onCompactFailed: (_error, _mode, messageId) => {
+					clearCompactProgress(messageId);
+					if (messageId) compactProgressKeysRef.current.delete(messageId);
+				},
+				onFullReload: () => {
+					clearAllCompactProgress();
+					compactProgressKeysRef.current.clear();
+					bumpMessageRevision();
+				},
+				// Live compact-progress ticks repaint only the mounted fixed-height marker.
+				// They never enter the pretext document or its measurement cache.
+				onCompactProgress: ({
+					messageId,
+					isSegment,
+					phase,
+					thinkingChars,
+					outputChars,
+					retryCount,
+				}) => {
+					if (!messageId) return;
+					const segment = !!isSegment;
+					setCompactProgress(messageId, segment, {
 						phase,
 						thinkingChars,
 						outputChars,
 						retryCount,
-					}) => {
-						if (!messageId) return;
-						const segment = !!isSegment;
-						setCompactProgress(messageId, segment, {
-							phase,
-							thinkingChars,
-							outputChars,
-							retryCount,
-						});
-						compactProgressKeysRef.current.set(messageId, segment);
-					},
-					onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
-						const initialSync = initialRevisionSyncRef.current;
-						initialRevisionSyncRef.current = false;
-						let applied = false;
-						for (const message of topLevel) {
-							if (upsertMessageRef.current(message)) applied = true;
-						}
-						const revisionDelta = resolveExactCatchUpRevisionDelta({
-							initialSync,
-							topLevelCount: topLevel.length,
-							applied,
-							orphanChildrenCount: orphanChildren.length,
-							subagentActivitiesCount: subagentActivities.length,
-						});
-						appliedMessageRevisionRef.current += revisionDelta.appliedRevisionDelta;
-						if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
-					},
-					onSyncOk: () => {
-						initialRevisionSyncRef.current = false;
-					},
-					// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
-					// pending initial sync so the view stops waiting on a stream it will never
-					// receive, and refetch — the REST call now answers 404 and the surrounding
-					// route renders its "not found" state instead of an endless spinner.
-					onSubscribeDenied: () => {
-						initialRevisionSyncRef.current = false;
-						bumpMessageRevision();
-					},
+					});
+					compactProgressKeysRef.current.set(messageId, segment);
 				},
+				onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
+					const initialSync = initialRevisionSyncRef.current;
+					initialRevisionSyncRef.current = false;
+					let applied = false;
+					for (const message of topLevel) {
+						if (upsertMessageRef.current(message)) applied = true;
+					}
+					const revisionDelta = resolveExactCatchUpRevisionDelta({
+						initialSync,
+						topLevelCount: topLevel.length,
+						applied,
+						orphanChildrenCount: orphanChildren.length,
+						subagentActivitiesCount: subagentActivities.length,
+					});
+					appliedMessageRevisionRef.current += revisionDelta.appliedRevisionDelta;
+					if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
+				},
+				onSyncOk: () => {
+					initialRevisionSyncRef.current = false;
+				},
+				// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
+				// pending initial sync so the view stops waiting on a stream it will never
+				// receive, and refetch — the REST call now answers 404 and the surrounding
+				// route renders its "not found" state instead of an endless spinner.
+				onSubscribeDenied: () => {
+					initialRevisionSyncRef.current = false;
+					bumpMessageRevision();
+				},
+			};
+			// An external data source (a chat room, the share page's own wiring) drives
+			// the same handler set instead of the narrator WS subscription.
+			useNarratorWS(
+				externalSubscribeMessages ? undefined : revisionSubscriptionId,
+				messageWsCallbacks,
 				exactMessageSnapshot,
 				{ kind: "messages" },
 			);
+			const messageWsCallbacksRef = useRef(messageWsCallbacks);
+			messageWsCallbacksRef.current = messageWsCallbacks;
+			const stableExternalHandlers = useMemo<NarratorWSCallbacks>(() => {
+				const forward = <K extends keyof NarratorWSCallbacks>(key: K) =>
+					((...args: unknown[]) => {
+						const handler = messageWsCallbacksRef.current[key];
+						if (typeof handler === "function") (handler as (...a: unknown[]) => void)(...args);
+					}) as never;
+				return {
+					onMessage: forward("onMessage"),
+					onUserMessage: forward("onUserMessage"),
+					onMessageUpdated: forward("onMessageUpdated"),
+					onMessagesDeleted: forward("onMessagesDeleted"),
+					onSegmentCompactHide: forward("onSegmentCompactHide"),
+					onCompactDone: forward("onCompactDone"),
+					onCompactFailed: forward("onCompactFailed"),
+					onFullReload: forward("onFullReload"),
+					onCompactProgress: forward("onCompactProgress"),
+					onCatchUp: forward("onCatchUp"),
+					onSyncOk: forward("onSyncOk"),
+					onSubscribeDenied: forward("onSubscribeDenied"),
+				};
+			}, []);
+			useEffect(() => {
+				if (!externalSubscribeMessages) return;
+				return externalSubscribeMessages(stableExternalHandlers);
+			}, [externalSubscribeMessages, stableExternalHandlers]);
 			// Live LIFECYCLE updates (tool started/completed, reflection gates, permission
 			// decisions, background terminals, subagent activity). These mutate an
 			// already-loaded message in place, so they are applied as anchor-preserving
@@ -2247,6 +2568,25 @@ export const PretextExactMessageList = memo(
 			}, [reloadDecision.reload, messageRevision]);
 
 			const renderItems = pretextDocument.items;
+			// Width previews replace geometry, not the committed content/spec metadata.
+			const semanticItems = pretextDocument.semanticItems;
+			const semanticManifestItems = pretextDocument.semanticManifest?.items ?? [];
+			const displayContentWidth = pretextDocument.resizeWidth ?? contentWidth;
+			// Only dynamic rows query widths; do not index the entire history per preview.
+			rowWidthsRef.current = {
+				get: (key) => {
+					const index = pretextDocument.index?.itemByKey(key)?.index;
+					return index == null ? undefined : (renderItems[index]?.contentWidth ?? contentWidth);
+				},
+			};
+			// Toggle/animation callbacks must read the CURRENT measured geometry, never
+			// the semantic baseline retained during a width preview.
+			measuredByKeyRef.current = {
+				get: (key) => {
+					const index = pretextDocument.index?.itemByKey(key)?.index;
+					return index == null ? undefined : renderItems[index]?.measured;
+				},
+			};
 			// Read by the fold capture (a click handler), which must see the committed items
 			// without being rebuilt on every document change.
 			const renderItemsRef = useRef(renderItems);
@@ -2282,7 +2622,7 @@ export const PretextExactMessageList = memo(
 			// are looking at holds its screen position and nothing below it appears to move.
 			const truncatedExpandedToolUseIds = useMemo(() => {
 				const ids: VListToolDetailRequest[] = [];
-				for (const item of renderItems) {
+				for (const item of semanticItems) {
 					if (!item) continue;
 					if (item.spec.kind === "communication-bubble") {
 						const source = item.spec.data as { toolUseId?: string; messageBody?: ToolCappedDetail };
@@ -2370,7 +2710,7 @@ export const PretextExactMessageList = memo(
 					}
 				}
 				return ids;
-			}, [renderItems, activeInteraction]);
+			}, [semanticItems, activeInteraction]);
 			useEffect(() => {
 				setTruncatedToolCalls((prev) =>
 					prev.narratorId === narratorId &&
@@ -2384,9 +2724,13 @@ export const PretextExactMessageList = memo(
 			// SYNCHRONOUSLY: the channel below treats `requestFullPayload` as fire-and-
 			// forget, so handing it a thunk factory (as the removed per-row notice-line
 			// prop once consumed) marks nothing and the fetch never starts.
-			const requestRowFullPayload = useCallback((owner: VListViewOwner) => {
-				setInteraction((prev) => markVListFullPayloadRequested(prev, ownerRequestKey(owner)));
-			}, []);
+			const requestRowFullPayload = useCallback(
+				(owner: VListViewOwner) => {
+					writeSources.retryErrors();
+					setInteraction((prev) => markVListFullPayloadRequested(prev, ownerRequestKey(owner)));
+				},
+				[writeSources.retryErrors],
+			);
 
 			// Fullscreen content viewer: per-body wrap / source state plus the single open
 			// target. Deliberately NOT part of `VListInteractionState` — that object feeds
@@ -2422,12 +2766,12 @@ export const PretextExactMessageList = memo(
 					return targets.find((candidate) => candidate.id === openTarget.id);
 				};
 				const owner = openTarget.owner;
-				const item = renderItems.find((candidate) => candidate?.spec.key === owner.specKey);
+				const item = semanticItems.find((candidate) => candidate?.spec.key === owner.specKey);
 				let target = item ? match(item, owner.traceItemIndex) : undefined;
 				// Location can change at an LOD/trace transition; content identity cannot.
 				// This fallback only runs for the ONE open modal after its old owner moved.
 				if (!target) {
-					for (const candidate of renderItems) {
+					for (const candidate of semanticItems) {
 						if (!candidate) continue;
 						target = match(candidate);
 						if (!target && TRACE_ROW_INTERACTION_KINDS.has(candidate.spec.kind)) {
@@ -2446,7 +2790,7 @@ export const PretextExactMessageList = memo(
 						target?.truncated === true &&
 						isFullPayloadRequestedRow(activeInteraction, ownerRequestKey(target.owner)),
 				};
-			}, [openTarget, renderItems, renderLabels, activeInteraction]);
+			}, [openTarget, semanticItems, renderLabels, activeInteraction]);
 			const refreshOpenTarget = contentView.refreshOpenTarget;
 			const refreshedTarget = openTargetState.target;
 			useEffect(() => {
@@ -2474,7 +2818,7 @@ export const PretextExactMessageList = memo(
 				[pretextDocument.messages],
 			);
 			const permissionSlotByKey = usePermissionSlots({
-				renderItems,
+				renderItems: semanticItems,
 				tools: rowToolMetaIndex,
 				permCb,
 				reflections: reflectionIndex,
@@ -2482,7 +2826,10 @@ export const PretextExactMessageList = memo(
 			});
 			// The same forms for calls that stayed a row of their L1/L2 activity trace and
 			// were drilled open onto their card (see useTracePermissionSlots).
-			const tracePermissionSlotsByKey = useTracePermissionSlots({ renderItems, permCb });
+			const tracePermissionSlotsByKey = useTracePermissionSlots({
+				renderItems: semanticItems,
+				permCb,
+			});
 			/**
 			 * Keep an ANSWERED form's card painted while its drilled block closes.
 			 *
@@ -2556,7 +2903,7 @@ export const PretextExactMessageList = memo(
 			// ResizeObserver move a committed row's height with no user action behind it.
 			const dynamicRowKeys = useMemo(() => {
 				const keys = new Set<string>();
-				for (const item of renderItems) {
+				for (const item of semanticItems) {
 					if (!item) continue;
 					// A card that RESERVED its form arithmetically stays a fixed, clipped row: the
 					// form reports its own height through `permissionFormHeight`. Only a form the
@@ -2581,7 +2928,7 @@ export const PretextExactMessageList = memo(
 				}
 				if (editingRow) keys.add(editingRow.key);
 				return keys;
-			}, [renderItems, permissionSlotByKey, editingRow]);
+			}, [semanticItems, permissionSlotByKey, editingRow]);
 			dynamicRowKeysRef.current = dynamicRowKeys;
 
 			// Drop overrides that must no longer apply. The decisive case is a RESOLVED
@@ -2595,9 +2942,20 @@ export const PretextExactMessageList = memo(
 			// the same commit the form disappears; an effect-based prune would paint one
 			// frame with the stale height first.
 			const effectiveHeightOverrides = useMemo(() => {
-				if (heightOverrides.size === 0) return heightOverrides;
-				return pruneHeightOverrides(heightOverrides, dynamicRowKeys) ?? heightOverrides;
-			}, [heightOverrides, dynamicRowKeys]);
+				const active = pruneHeightOverrides(heightOverrides, dynamicRowKeys) ?? heightOverrides;
+				let next: Map<string, number> | undefined;
+				for (const key of active.keys()) {
+					const index = pretextDocument.index?.itemByKey(key)?.index;
+					const width =
+						index == null ? undefined : (renderItems[index]?.contentWidth ?? contentWidth);
+					if (heightOverrideWidthsRef.current.get(key) !== width) {
+						next ??= new Map(active);
+						next.delete(key);
+					}
+				}
+				return next ?? active;
+			}, [heightOverrides, dynamicRowKeys, renderItems, pretextDocument.index, contentWidth]);
+			heightOverridesForResizeRef.current = effectiveHeightOverrides;
 			// Commit the pruned map back to state so stale entries do not linger in memory
 			// and later reports compare against the current value.
 			useEffect(() => {
@@ -2606,23 +2964,9 @@ export const PretextExactMessageList = memo(
 			}, [effectiveHeightOverrides, heightOverrides]);
 
 			const exactLayout = useMemo(() => {
-				const base = buildExactListLayout(pretextDocument.index);
 				const index = pretextDocument.index;
-				if (!base || !index) return base;
-				const manifestItems = index.manifest.items;
-				const keys = manifestItems.map((m) => m.itemKey);
-				const heights = manifestItems.map((m) => m.height);
-				// Skip the correction pass entirely when no override changes geometry.
-				if (!hasEffectiveHeightOverride(keys, heights, effectiveHeightOverrides)) return base;
-				return layoutItemsWithOverrides(
-					{
-						heights,
-						keys,
-						gap: index.manifest.metrics.itemGap,
-						topPadding: index.manifest.metrics.topPadding,
-						bottomPadding: index.manifest.metrics.bottomPadding,
-					},
-					effectiveHeightOverrides,
+				return buildExactListLayout(
+					index ? indexWithHeightOverrides(index, effectiveHeightOverrides) : undefined,
 				);
 			}, [pretextDocument.index, effectiveHeightOverrides]);
 			// The mounted window is derived from scrollTop, but scrollTop only advances
@@ -2637,8 +2981,90 @@ export const PretextExactMessageList = memo(
 			);
 			const visibleRef = useRef(visible);
 			visibleRef.current = visible;
+			// Descriptor-only hydration is bounded to mounted Write bodies. It does not
+			// change the explicit engagement gate of legacy full-payload downloads.
+			useEffect(() => {
+				if (!ensureWriteSource) return;
+				const requests: VListToolDetailRequest[] = [];
+				const consider = (card: MeasuredToolCall, data: unknown) => {
+					if (
+						card.toolName !== "Write" ||
+						!card.toolUseId ||
+						!card.detail?.sections.some(
+							(section) =>
+								section.measuredBody.model.kind === "capped" &&
+								!section.measuredBody.model.textDocument,
+						)
+					)
+						return;
+					requests.push(toolDetailRequestFromData(card.toolUseId, data));
+				};
+				for (let index = visible.start; index < visible.end; index++) {
+					const item = renderItems[index];
+					if (!item) continue;
+					if (item.spec.kind === "tool-call")
+						consider(item.measured as MeasuredToolCall, item.spec.data);
+					else if (TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind))
+						for (const row of (item.measured as MeasuredCollapsibleTrace).rows)
+							if (row.cardMeasured && row.cardKind !== "subagent-card")
+								consider(
+									row.cardMeasured as MeasuredToolCall,
+									resolveTraceRowCardData(item, row.itemIndex),
+								);
+				}
+				setVisibleWriteSourceRequests((previous) =>
+					previous.narratorId === narratorId && sameToolDetailRequests(previous.requests, requests)
+						? previous
+						: { narratorId, requests },
+				);
+			}, [ensureWriteSource, narratorId, visible.start, visible.end, renderItems]);
 			const exactLayoutRef = useRef(exactLayout);
 			exactLayoutRef.current = exactLayout;
+			const readMorphScrollTop = useCallback(() => {
+				const node = viewportRef.current;
+				const layout = exactLayoutRef.current;
+				if (!node || !layout) return scrollTopRef.current;
+				return morphScrollOrigin.read(
+					{
+						narratorId,
+						viewport: node,
+						items: renderItemsRef.current,
+						layout,
+						viewportHeight: viewportHeightRef.current,
+						footerHeight: footerHeightRef.current,
+						footer: tailFooter,
+					},
+					() => node.scrollTop,
+				);
+			}, [morphScrollOrigin, narratorId, tailFooter]);
+
+			// Read watermark seam: the STRICTLY visible window (no overscan) mapped to
+			// its last source message id. Chat rooms translate that id back into a seq
+			// to advance their read cursor; absent the prop, this is inert.
+			const seenWindow = useMemo(
+				() =>
+					exactLayout
+						? resolveVisibleWindow(exactLayout, scrollTop, viewportHeight, 0)
+						: { start: 0, end: 0, topSpacer: 0, bottomSpacer: 0 },
+				[exactLayout, scrollTop, viewportHeight],
+			);
+			const onVisibleMessagesChangeRef = useRef(onVisibleMessagesChange);
+			onVisibleMessagesChangeRef.current = onVisibleMessagesChange;
+			useEffect(() => {
+				const callback = onVisibleMessagesChangeRef.current;
+				if (!callback) return;
+				const manifestItems = pretextDocument.manifest?.items ?? [];
+				const lastItem = manifestItems[seenWindow.end - 1];
+				const lastId = lastItem?.sourceMessageIds.at(-1) ?? null;
+				callback(
+					lastId
+						? {
+								id: lastId,
+								seq: typeof lastItem?.lastSeq === "number" ? lastItem.lastSeq : null,
+							}
+						: null,
+				);
+			}, [seenWindow.end, pretextDocument.manifest]);
 
 			/**
 			 * Identity of the currently committed DOCUMENT (not its geometry).
@@ -3001,7 +3427,7 @@ export const PretextExactMessageList = memo(
 						})),
 					});
 				}
-				const next = buildDrillSnapshots(traces, node.scrollTop);
+				const next = buildDrillSnapshots(traces, readMorphScrollTop());
 				const prev = drillMorphPrevRef.current;
 				// Only morph across a USER-driven fold: if the document revision moved, a live
 				// patch / page / reload rebuilt the window and the diff would mix the reader's
@@ -3122,9 +3548,9 @@ export const PretextExactMessageList = memo(
 			 *
 			 * An LOD switch re-themes elements into different components (a card folds into a
 			 * trace row, a row expands into a card), so neither the fold nor the drill morph is
-			 * planned across it. This effect snapshots the viewport×3 window, diffs against the
-			 * previous commit, and morphs each pair from its old screen position to its new one
-			 * — all in one frame.
+			 * planned across it. Every commit records a lightweight world-frame descriptor;
+			 * only a playable switch admits the viewport×3 window and diffs the TWO committed
+			 * frames. Each pair morphs from its old screen position — all in one frame.
 			 *
 			 * Pairing covers the WHOLE document, not just the re-themed cards: a tool call pairs
 			 * on the LOD-independent `unitId` the adapter attaches, while everything else
@@ -3137,312 +3563,35 @@ export const PretextExactMessageList = memo(
 			 * Gate: the morph only plays when the document revision is UNCHANGED and the lod
 			 * MOVED (a pure re-theme). A revision move means a live patch / page / reload
 			 * rebuilt the window; diffing across it would animate a change the reader did not
-			 * make. The snapshot rolls forward either way so the next diff has a clean
-			 * baseline. Pure layout arithmetic throughout — no DOM measurement, no React state.
+			 * make. The frame rolls forward either way, including reduced motion, so the next
+			 * diff has a clean baseline without unused snapshots. Pure layout arithmetic
+			 * throughout — no DOM measurement, no React state.
 			 */
 			useLayoutEffect(() => {
 				const node = viewportRef.current;
 				const layout = exactLayoutRef.current;
 				if (!node || !layout) return;
-				const items = renderItemsRef.current;
-				const scrollTop = node.scrollTop;
-				const vh = viewportHeightRef.current;
-				// Assemble the unitId-bearing elements straight from the layout + specs. The
-				// whole committed document is read here (geometry is O(n) plain numbers, cheap);
-				// the viewport×3 crop happens inside buildLodSnapshots.
-				const elements: LodElementSource[] = [];
-				/**
-				 * Box of the render-UNIT each item belongs to, spanning all of its specs.
-				 *
-				 * The admission window has to judge one unit's content the same way at both levels,
-				 * and the two forms differ enormously: at L1/L2 an activity unit is a single short
-				 * fold, at L3+ it is a stack of full cards spanning thousands of pixels. Judged on
-				 * their own boxes, the unit's later CARDS fall outside the window in the expanded
-				 * frame while its ROWS all sit inside it in the folded one — so those members have
-				 * no counterpart and are planned nothing, silently.
-				 *
-				 * Grouping comes from `spec.morphGroupId`, which the layout assigns from the
-				 * activity grouping that applies at a low LOD — computed at every level, so both
-				 * sides agree on the membership. See the note on the loop below.
-				 */
-				const unitBoxes: Array<{ top: number; height: number } | null> = new Array(
-					items.length,
-				).fill(null);
-				{
-					// One SHARED, mutable box per unit: every index in a unit points at the same
-					// object, so growing it as later specs are seen retroactively widens the box the
-					// earlier ones already reference.
-					//
-					// ⚠️ Grouped by `spec.morphGroupId`, NOT by `spec.unitStart`.
-					//
-					// `unitStart` marks the first spec of each RENDER unit, and at L3+ grouping is
-					// off (`groupRenderUnits(segments, lod <= 2)`), so every spec starts its own
-					// unit and the flag is true for all of them. The box then degenerated to each
-					// element's OWN box — exactly what it exists to avoid. Measured on a 12-tool
-					// group at scrollTop 9500: 3 of 12 members paired with the degenerate box
-					// versus all 12 with the real group box.
-					//
-					// `morphGroupId` is computed from the activity grouping that would apply at a
-					// low LOD regardless of the current level (see buildPretextDocumentLayout), so
-					// the members of one group share it at BOTH levels and the box spans the whole
-					// group on each side. Specs outside any activity group have none and fall back
-					// to their own box, which is correct for them: their two forms are the same
-					// element.
-					const boxes = new Map<string, { top: number; height: number }>();
-					for (let i = 0; i < items.length; i++) {
-						const it = items[i];
-						const g = layout.items[i];
-						if (!it || !g) continue;
-						const groupId = it.spec.morphGroupId;
-						if (!groupId) {
-							unitBoxes[i] = { top: g.top, height: g.height };
-							continue;
-						}
-						const existing = boxes.get(groupId);
-						if (!existing) {
-							const box = { top: g.top, height: g.height };
-							boxes.set(groupId, box);
-							unitBoxes[i] = box;
-							continue;
-						}
-						// Mutated in place so the members already pointing at this box widen with it.
-						existing.height = Math.max(existing.height, g.top + g.height - existing.top);
-						unitBoxes[i] = existing;
-					}
-				}
-				for (let index = 0; index < items.length; index++) {
-					const item = items[index];
-					const geo = layout.items[index];
-					if (!item || !geo) continue;
-					// `key` and `kind` travel with `unitId`: the planner pairs on `unitId ?? key`
-					// (so the document body — markdown, bubbles, system cards — is no longer
-					// skipped for want of a unitId) and reads `kind` to decide whether the morph
-					// is a component swap worth cross-fading. See vlist-lod-morph.ts.
-					elements.push({
-						unitId: item.spec.unitId,
-						key: item.spec.key,
-						kind: item.spec.kind,
-						top: geo.top,
-						height: geo.height,
-						// Anchored to the whole unit, so a tool CARD at L3+ is admitted on the same
-						// basis as the folded ROW it pairs with at L1/L2. Without this the fix on the
-						// folded side alone changes nothing: the card is a top-level element with its
-						// own tall box, so the unit's later cards still prune themselves out of the
-						// expanded frame and still have no counterpart.
-						groupBox: unitBoxes[index],
-						unitAnchored: true,
-					});
-					// The L2/L3 boundary: a tool call is a summary ROW inside this trace at L1/L2
-					// and a top-level CARD at L3+, both carrying the same `unitId`. Without the
-					// nested rows the pairing has an empty intersection exactly at the switch that
-					// changes the most, so nothing animates where it matters.
-					//
-					// `clip` is the item's own painted box: the shell clips a non-dynamic row to
-					// its arithmetic height, so a nested row animated from far outside that box
-					// would be invisible mid-flight. The planner drops the travel (keeping the
-					// fade) for that case — see clipFor.
-					const measured = measuredByKeyRef.current.get(item.spec.key) as
-						| { rows?: { top: number; rowHeight: number; unitId?: string }[] }
-						| undefined;
-					if (!measured?.rows) continue;
-					const clip = { top: geo.top, bottom: geo.top + geo.height };
-					for (const row of measured.rows) {
-						if (!row.unitId) continue;
-						elements.push({
-							unitId: row.unitId,
-							// A row key is scoped to its trace, so it is not a usable cross-level
-							// identity; `nested` tells the builder not to fall back to it.
-							key: row.unitId,
-							// The kind the ROW is, not the trace's: pairing it against the card's
-							// `tool-call` is what marks this morph as a re-theme worth fading.
-							kind: "trace-row",
-							top: geo.top + row.top,
-							// The title LINE, not the row block: a drilled-in row's block is a whole
-							// card tall, and the perceived thing that moves is the summary line.
-							height: row.rowHeight,
-							clip,
-							nested: true,
-							// Admission is decided by the GROUP's box, not this row's. At L3+ the same
-							// content spans an order of magnitude more height (10 rows of 19px become
-							// 10 cards of ~400px), so judged on their own boxes the later members fall
-							// outside the ×3 window in the expanded frame only — no counterpart, no
-							// plan, and the reader sees the first few rows animate while the rest
-							// teleport. The group's box is short and stable at both levels.
-							groupBox: { top: geo.top, height: geo.height },
-						});
-					}
-				}
-				const next = buildLodSnapshots(elements, scrollTop, vh);
-				const prev = lodMorphPrevRef.current;
-				const docRev = foldRevisionOf(foldDocumentRevision);
-				const lod = pretextDocument.manifest?.lod ?? -1;
-				const isLodSwitch =
-					prev != null &&
-					lodMorphDocRevRef.current === docRev &&
-					lodMorphLodRef.current !== -1 &&
-					lodMorphLodRef.current !== lod;
-				// Roll forward BEFORE the early returns, so the next diff compares against this
-				// frame even when the morph is skipped (non-LOD rebuild, reduced motion, first
-				// paint).
-				lodMorphPrevRef.current = next;
-				lodMorphDocRevRef.current = docRev;
-				lodMorphLodRef.current = lod;
-				/**
-				 * The unified baseline must roll forward on EVERY frame, exactly like the keyframe
-				 * path's `prev` above — and for the same reason.
-				 *
-				 * ⚠️ This was originally written inside the `unifiedMorph` branch below, i.e. AFTER the
-				 * `isLodSwitch` guard. That made the baseline unreachable on ordinary frames, so it
-				 * only ever recorded the layout of a frame that was ALREADY mid-switch: every switch
-				 * then diffed against a stale, one-step-late snapshot and most elements failed to pair
-				 * at all. The symptom was a large number of rows losing their animation — the very bug
-				 * the rewrite set out to remove, reintroduced by putting the roll-forward on the wrong
-				 * side of a `return`.
-				 *
-				 * Computed unconditionally rather than lazily: an admitted snapshot is plain numbers
-				 * over the already-built element list, and skipping it on non-switch frames is exactly
-				 * what broke it.
-				 */
-				// Raw element list, not an admitted snapshot: admission needs BOTH frames (see
-				// `admitPair`), so the decision cannot be taken until the next frame arrives.
-				const unifiedElements = toMorphElements(elements);
-				const unifiedPrev = unifiedPrevRef.current;
-				const unifiedPrevScrollTop = unifiedPrevScrollTopRef.current;
-				unifiedPrevRef.current = unifiedElements;
-				// Rolled forward with the elements it describes, on EVERY frame, or the pair would
-				// be converted with mismatched scroll origins (see the ref's note).
-				unifiedPrevScrollTopRef.current = scrollTop;
-				if (!isLodSwitch || prefersReducedMotion()) return;
-				if (unifiedMorph) {
-					// UNIFIED PATH. Targets, not keyframes: the element is already laid out at its new
-					// position, so it is handed the displacement it must travel back from and a resting
-					// target of zero. Nothing here names a START, which is precisely why an interrupted
-					// switch needs no special handling — the store already holds the visual position.
-					if (!unifiedPrev) return;
-					// Admitted as a PAIR: an element visible at either level is kept at both. Judging
-					// each frame on its own geometry drops whole units, because one level's unit box can
-					// miss the window entirely while the other's spans it.
-					const { before: unifiedBefore, after: unifiedAfter } = admitPair(
-						unifiedPrev,
-						unifiedElements,
-						scrollTop,
-						vh,
-						// The baseline frame's own scroll origin. A gesture-driven switch corrects
-						// `scrollTop` to hold the pointed-at content still, so passing only the current
-						// value would turn that correction into travel for every element.
-						unifiedPrevScrollTop,
-					);
-					const targets = planMorphTargets(
-						unifiedBefore,
-						unifiedAfter,
-						// A card is fully "cardness"; every folded form is not. This is the only place
-						// the kind vocabulary is interpreted, keeping the planner generic.
-						(kind) => (kind === "tool-call" || kind === "subagent-card" ? 1 : 0),
-						// The two forms start their content at different offsets; the drill morph already
-						// derives this from the shared row metrics and card padding.
-						() => DRILL_MORPH_X_OFFSET,
-					);
-					const store = visualStateRef.current;
-					const ids = new Set<string>();
-					for (const plan of targets) {
-						ids.add(plan.unitId);
-						// Seed the new displacement UNLESS the element is still moving.
-						//
-						// ⚠️ The predicate is `isMoving`, NOT "does the store know this element". A
-						// settled element is still retained, so keying on existence meant every switch
-						// after the first one applied no displacement at all and the element teleported —
-						// which is exactly the "most rows don't animate" report. It also explains why
-						// interrupting repeatedly appeared to help: an interrupted element IS still
-						// moving, so it happened to take the right branch.
-						//
-						//   moving  → retarget only, continuing from the current visual position;
-						//   settled → seed the fresh displacement, or there is nothing to animate.
-						if (store.isMoving(plan.unitId)) {
-							// Mid-flight: keep the visual position and only change where it is heading. This
-							// is the interruption property — the element continues from where it is.
-							store.setTarget(plan.unitId, plan.target);
-						} else {
-							// Settled (or new): displace it back to where it was and let it travel home.
-							// `startFrom` rather than `setTarget`, because the latter deliberately never
-							// moves an existing element — using it here left every switch after the first
-							// with no displacement at all, i.e. no animation.
-							store.startFrom(plan.unitId, initialStateFor(plan), plan.target);
-						}
-					}
-					morphIdentitiesRef.current = ids;
-					store.retain(ids);
-					morphDriverRef.current?.kick();
-					return;
-				}
-				const plans = diffLodSnapshots(prev, next);
-				if (plans.length === 0) return;
-				motionRef.current.begin();
-				motionRef.current.push(
-					plans.map((plan) => ({
-						scope: lodScope(plan.unitId),
-						resolve: () => {
-							const escaped = cssAttrEscape(plan.unitId);
-							// `data-nf-unit` first, then `data-nf-row-key` — the only attribute an
-							// element paired on its `key` paints. Without the fallback every
-							// key-paired plan would resolve to null and the document body would go
-							// back to teleporting, silently: the plans are still produced, so nothing
-							// looks broken from the planner's side.
-							//
-							// One selector serves both forms of a tool call, because `data-nf-unit` is
-							// painted on the top-level card wrapper AND on the folded trace row, and
-							// the two never coexist: at L3+ only the card is mounted, at L1/L2 only
-							// the row. (A drilled-in card inside a row paints no `data-nf-unit` of its
-							// own, so it cannot shadow its row here.)
-							return (
-								node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
-								node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`)
-							);
-						},
-						// A builder, so a switch re-triggered mid-flight (holding a zoom shortcut, or a
-						// pinch crossing two thresholds) resumes from where the previous motion
-						// visually got to. With `fill: "none"` the plain array restarts from the
-						// committed geometry the cancelled animation snapped back to — a visible jump.
-						keyframes: (previous) => lodMorphKeyframesFrom(plan, previous),
-					})),
-					// A level switch re-themes the whole document at once, so it gets the longer
-					// base. The override is event-level, applied to every op in this batch.
-					LOD_MOTION_DURATION_MS,
-				);
-				// A RE-THEMED element (`plan.fade`) is the same trace-row ↔ tool-call pair a drill
-				// morph handles, so it gets the same two extra fades — the tail cluster, whose
-				// travel distance is unknowable without measuring rendered text, and the border,
-				// which exists in only one of the two forms.
-				//
-				// Only re-themes: an element that merely MOVED keeps its component, so its tail and
-				// border are already correct and animating them would make unchanged chrome blink
-				// once per zoom step.
-				motionRef.current.push(
-					plans.flatMap((plan) => {
-						if (!plan.fade) return [];
-						const escaped = cssAttrEscape(plan.unitId);
-						const host =
-							node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
-							node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`);
-						if (!host) return [];
-						// The card form's kind: fade the border IN when arriving at it, OUT when
-						// leaving. `plan.fade` guarantees the two kinds differ.
-						const kind = plan.toKind === "tool-call" ? "expand" : "collapse";
-						return [
-							{
-								scope: `${lodScope(plan.unitId)}:tail`,
-								resolve: () => host.querySelector<HTMLElement>("[data-nf-card-tail]"),
-								keyframes: (previous: { progress: number } | null) =>
-									drillTailKeyframesFrom(kind, previous),
-							},
-							{
-								scope: `${lodScope(plan.unitId)}:border`,
-								resolve: () => host.querySelector<HTMLElement>("[data-nf-card-surface]"),
-								keyframes: (previous: { progress: number } | null) =>
-									drillBorderKeyframesFrom(kind, previous),
-							},
-						];
-					}),
-					LOD_MOTION_DURATION_MS,
+				commitLodMorph(
+					{
+						narratorId,
+						items: renderItemsRef.current,
+						layout,
+						index: pretextDocument.index,
+						scrollTop: readMorphScrollTop(),
+						viewportHeight: viewportHeightRef.current,
+						documentRevision: foldRevisionOf(foldDocumentRevision),
+						lod: pretextDocument.manifest?.lod ?? -1,
+					},
+					{ geometry: lodMorphGeometryRef, frames: lodMorphFramesRef },
+					{
+						viewport: node,
+						unified: unifiedMorph,
+						prefersReducedMotion,
+						visualState: visualStateRef.current,
+						identities: morphIdentitiesRef,
+						driver: morphDriverRef.current,
+						motion: motionRef.current,
+					},
 				);
 			});
 
@@ -3494,7 +3643,9 @@ export const PretextExactMessageList = memo(
 				const context = {
 					lod: pretextDocument.manifest?.lod ?? -1,
 					widthBucket: String(pretextDocument.manifest?.widthBucket ?? ""),
-					scrollTop: node.scrollTop,
+					resizing:
+						pretextDocument.resizePreview || resizeControllerRef.current?.isPending() === true,
+					scrollTop: readMorphScrollTop(),
 				};
 				const prev = lifecyclePrevRef.current;
 				const prevContext = lifecyclePrevContextRef.current;
@@ -3523,7 +3674,9 @@ export const PretextExactMessageList = memo(
 					foldPlayed ||
 					prefersReducedMotion() ||
 					prevContext.lod !== context.lod ||
-					prevContext.widthBucket !== context.widthBucket
+					prevContext.widthBucket !== context.widthBucket ||
+					prevContext.resizing ||
+					context.resizing
 				) {
 					releaseUnplanned(new Set());
 					return;
@@ -3531,7 +3684,7 @@ export const PretextExactMessageList = memo(
 				// Land a running chase first: the plan's pinned afterScrollTop is the PREDICTED
 				// bottom, and a glide still heading there would move rows under the animation.
 				smoothFollowerRef.current?.snapToTarget();
-				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : node.scrollTop;
+				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : readMorphScrollTop();
 				const plan = planLifecycleMotion({
 					before: prev,
 					after: next,
@@ -3657,6 +3810,7 @@ export const PretextExactMessageList = memo(
 				enabled: isActive,
 				isSubagent,
 				committedMessages: pretextDocument.messages,
+				fetchTextDocumentRange: textDocumentRangeReader,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {
@@ -3779,177 +3933,85 @@ export const PretextExactMessageList = memo(
 				onAtBottomChange?.(pinnedToBottom);
 			}, [onAtBottomChange, pinnedToBottom]);
 
-			// Re-runs when the reading-width preference flips so the column width (and the
-			// layout keyed on it) is recomputed without a reload.
-			//
-			// WIDTH is answered through `resolveWidthSettle` rather than written straight to
-			// state. A width change re-measures EVERY item (the exact list needs a precise
-			// total height), which is O(items) — 102ms at 8000 messages. A pointer drag emits
-			// one observer callback per frame, so on a long session every frame would try to
-			// spend that. When a measured rebuild proves too slow, the new width is held and
-			// committed once the drag settles; the committed geometry keeps painting in the
-			// meantime. HEIGHT is unaffected and always applied immediately: it does not
-			// change wrapping, so it costs nothing to honour.
-			//
-			// Depends on `viewportNode` (state), NOT `viewportRef.current`: a ref read at
-			// mount time silently outlives the node it read. See the viewportNode comment.
+			// Freeze row wrapping during resize; only the outer viewport follows the host.
+			// Commit final geometry once after the gesture/quiet period ends.
+			// The observer follows the actual node, not a ref captured once on mount.
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
-				let settleTimer: ReturnType<typeof setTimeout> | undefined;
-				// Whether a deferral is currently held open, so the pointer-release handler
-				// knows if it has anything to commit. Without it every unrelated click in the
-				// app would run a decision pass.
-				let deferred = false;
-				// The last few committed widths, feeding the settle decision's cycle guard.
-				//
-				// A measurement feedback loop (commit → re-measure → the vertical scrollbar
-				// appears or disappears → clientWidth moves ~15px → commit) alternates between
-				// exactly two widths and never terminates on its own; the guard recognises that
-				// alternation and stops committing. Reset on `gesture-end` because a pointer
-				// drag is EXTERNAL input: dragging the sash back to a previous width must apply
-				// even if feedback had just pinned it.
-				let recentCommittedWidths: readonly number[] = [];
-				/**
-				 * The viewport's OUTER width at the last commit, so a host-driven resize can be
-				 * told apart from scrollbar feedback WITHOUT a pointer gesture.
-				 *
-				 * A vertical scrollbar moves `clientWidth` and leaves `offsetWidth` alone, so a
-				 * changed outer box means something outside this list resized it — a dock panel
-				 * toggled from a button, a restored layout, a window resize. That distinction is
-				 * what keeps the cycle guard from mistaking repeated panel toggles (which flip
-				 * between exactly two widths, the A B A B shape it matches on) for a measurement
-				 * loop and pinning the column from the fifth toggle onwards.
-				 *
-				 * `undefined` until the first commit records one, which reads as "cannot tell"
-				 * and leaves the guard in charge.
-				 */
-				let committedBoxWidth: number | undefined;
-
-				const applyWidth = (trigger: WidthSettleTrigger) => {
-					const nextWidth = resolveNarratorColumnWidth(
-						node.clientWidth,
-						PAGE_PADDING,
-						centeredColumn,
-					);
-					const boxWidth = node.offsetWidth;
-					// FIRST MEASUREMENT — commit immediately, bypassing the settle decision.
-					//
-					// This is not a width CHANGE, it is this list learning how wide it is. Routed
-					// through `resolveWidthSettle` it read as an ordinary observer callback with no
-					// pointer down, so it DEFERRED for WIDTH_SETTLE_DELAY_MS: the placeholder
-					// painted a frame at the sentinel geometry and the column then jumped to its
-					// real width 140ms later. That was the first of the mount-time jumps.
-					//
-					// Running inside the layout effect's synchronous `measure()` means the width is
-					// final before the browser paints, so the first painted frame is already
-					// correct. `recentCommittedWidths` is deliberately NOT touched: the cycle guard
-					// tracks widths that could oscillate, and a first measurement has no prior hop
-					// to alternate with.
-					if (committedContentWidthRef.current === 0) {
-						committedContentWidthRef.current = nextWidth;
-						committedBoxWidth = boxWidth;
-						setContentWidth(nextWidth);
-						return;
-					}
-					const decision = resolveWidthSettle({
-						nextWidth,
-						committedWidth: committedContentWidthRef.current,
-						trigger,
-						// Read LIVE: the gesture may have started or ended between the observer
-						// callback that armed the deferral and this evaluation.
-						pointerDown: pointerTracker.isDown(),
-						recentCommittedWidths,
-						boxWidth,
-						committedBoxWidth,
-					});
-					if (settleTimer !== undefined) {
-						clearTimeout(settleTimer);
-						settleTimer = undefined;
-					}
-					if (decision.commit) {
-						// Release the withheld height with the width, so every commit path (a
-						// gesture end, the quiet period, the backstop) lands one consistent
-						// geometry instead of leaving a stale height behind.
-						if (deferred) setViewportHeight(node.clientHeight);
-						deferred = false;
-						// EXTERNAL INPUT starts the cycle history over, so a width the guard had
-						// pinned can be reached again. Two shapes count, and both must:
-						//  - a gesture: the user may be dragging back to a pinned width.
-						//  - a resized outer box: a dock panel toggle / window resize / layout
-						//    restore, which carries no gesture at all. Without this the ring kept
-						//    the panel's two widths forever (`gesture-end` being its only reset),
-						//    so repeated toggles filled it and the fifth one pinned the column.
-						// Feedback never takes either path: it leaves `offsetWidth` untouched.
-						const externalGeometry = isExternalGeometryChange(boxWidth, committedBoxWidth);
-						recentCommittedWidths =
-							trigger === "gesture-end" || externalGeometry
-								? []
-								: pushCommittedWidth(recentCommittedWidths, nextWidth);
-						committedContentWidthRef.current = nextWidth;
-						committedBoxWidth = boxWidth;
-						setContentWidth(nextWidth);
-						return;
-					}
-					if (!decision.defer) {
-						deferred = false;
-						return;
-					}
-					deferred = true;
-					settleTimer = setTimeout(() => {
-						settleTimer = undefined;
-						applyWidth("timer");
-					}, decision.deferForMs);
-				};
-
-				// A pointer release is the commit point for a drag-held deferral. Created
-				// before the observer so the first callback can already read its state.
-				const pointerTracker = createPointerDragTracker(() => {
-					// `applyWidth` releases the withheld height as part of its commit branch.
-					if (deferred) applyWidth("gesture-end");
+				const pointerTracker = createPointerDragTracker(() => controller.release());
+				const controller = createVListResizeController({
+					previewPolicy: "freeze",
+					readSize: () => ({
+						width: resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn),
+						boxWidth: node.offsetWidth,
+						height: node.clientHeight,
+						presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
+					}),
+					getCommittedWidth: () => committedContentWidthRef.current,
+					getCommittedPresentationKey: () =>
+						committedCompactUsageLinesRef.current ? "mobile" : "desktop",
+					pointerDown: () => pointerTracker.isDown(),
+					onInitial: ({ width, height }) => {
+						committedContentWidthRef.current = width;
+						setContentWidth(width);
+						committedCompactUsageLinesRef.current = mobileViewportRef.current;
+						setLayoutCompactUsageLines(mobileViewportRef.current);
+						setViewportHeight(height);
+						setLayoutHeight(height);
+					},
+					onPreview: () => false,
+					onCommit: ({ width, height }) => {
+						committedContentWidthRef.current = width;
+						setContentWidth(width);
+						committedCompactUsageLinesRef.current = mobileViewportRef.current;
+						setLayoutCompactUsageLines(mobileViewportRef.current);
+						setViewportHeight(height);
+						setLayoutHeight(height);
+						// Width equality is NOT completion: off-screen frames may still be stale.
+						setWidthCommitEpoch((epoch) => epoch + 1);
+					},
 				});
-
-				/**
-				 * Whether this frame's height write must be withheld.
-				 *
-				 * True only while a deferral is actually open AND a pointer is down — i.e.
-				 * exactly during a drag on an expensive document. A cheap document never
-				 * defers, so it keeps its per-frame live height as before; a non-pointer resize
-				 * settles on the short quiet period rather than being frozen.
-				 */
-				const suppressHeightWrite = () => deferred && pointerTracker.isDown();
-
+				resizeControllerRef.current = controller;
 				const measure = () => {
-					// HEIGHT is a React state write, and that is the expensive part — not the
-					// arithmetic. A re-render of the shell re-runs `adaptRenderUnits`, which
-					// mints fresh `{ spec, measured }` objects, so `ExactRow`'s
-					// `prev.item === next.item` fails for EVERY mounted row and their absolutely
-					// positioned spans are all rebuilt (measured: 20 prose rows = 1601 DOM
-					// nodes, 22.3ms to re-render in linkedom, which has no style/layout/paint —
-					// a browser is strictly slower).
-					//
-					// So while a deferral is in force the height write is suppressed too.
-					// Otherwise the width gate would hold back the rebuild while the height
-					// write kept re-rendering the same 1601 nodes every frame, which is the
-					// jank that survived three rounds of measurement-side fixes.
-					//
-					// Nothing is lost by waiting: `viewportHeight` state feeds the mounted
-					// window, bottom-pinning and the plan cap, and all three are recomputed on
-					// the commit. Anything needing the live height mid-drag reads
-					// `node.clientHeight` directly (see readCurrentView).
-					if (!suppressHeightWrite()) setViewportHeight(node.clientHeight);
-					applyWidth("observer");
+					morphScrollOrigin.invalidate();
+					// The stable chat temporarily parks off-layout while a dock slot mounts.
+					// Do not commit a one-pixel reading width or zero plan-detail cap.
+					if (!visibleViewportRef.current.isVisible(node)) return;
+					// Replay hidden anchored commits before the resize coordinator reads
+					// the restored viewport, even when its width/height did not change.
+					visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
+					readViewportView();
+					controller.observe();
+					// Exact height keeps the mounted window live while wrapping stays committed.
+					setViewportHeight(node.clientHeight);
+					if (!controller.isPending()) {
+						setLayoutHeight(node.clientHeight);
+					}
 				};
 				measure();
-				if (typeof ResizeObserver === "undefined") return () => pointerTracker.dispose();
-				const observer = new ResizeObserver(measure);
-				observer.observe(node);
+				const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+				observer?.observe(node);
 				return () => {
-					observer.disconnect();
+					observer?.disconnect();
 					pointerTracker.dispose();
-					if (settleTimer !== undefined) clearTimeout(settleTimer);
+					controller.dispose();
+					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn]);
+			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop, morphScrollOrigin]);
+			// A capped column may keep the same width across a viewport breakpoint.
+			// Notify the controller explicitly rather than relying on ResizeObserver.
+			useLayoutEffect(() => {
+				void isMobileViewport;
+				resizeControllerRef.current?.observe();
+			}, [isMobileViewport]);
+			// Refresh is separate from observing geometry: freeze intentionally ignores it.
+			// Semantic page/font/stream updates still publish normally at committed width.
+			useLayoutEffect(() => {
+				void pretextDocument.resizeRevision;
+				void scrollTop;
+				resizeControllerRef.current?.refresh();
+			}, [pretextDocument.resizeRevision, scrollTop]);
 
 			// Rebuild the copied text from the vlist's own structure instead of letting the
 			// browser serialize the absolute-positioned boxes. Every visual line and every
@@ -3963,18 +4025,23 @@ export const PretextExactMessageList = memo(
 
 			const hasTailFooter = tailFooter != null;
 			useLayoutEffect(() => {
+				morphScrollOrigin.invalidate();
 				const node = footerNodeRef.current;
 				if (!hasTailFooter || !node) {
 					setFooterHeight(0);
 					return;
 				}
-				const measure = () => setFooterHeight(Math.max(0, node.offsetHeight));
+				const measure = () => {
+					morphScrollOrigin.invalidate();
+					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
+					setFooterHeight(Math.max(0, node.offsetHeight));
+				};
 				measure();
 				if (typeof ResizeObserver === "undefined") return;
 				const observer = new ResizeObserver(measure);
 				observer.observe(node);
 				return () => observer.disconnect();
-			}, [hasTailFooter]);
+			}, [hasTailFooter, morphScrollOrigin]);
 
 			// The streaming row now grows `exactLayout.totalHeight` like any other row, so
 			// the geometry revision no longer needs a separate tail-height term.
@@ -4000,6 +4067,7 @@ export const PretextExactMessageList = memo(
 					// frame and cut every streaming glide short. While a chase is active this
 					// yields to it — the chase re-reads the live bottom every frame, so the
 					// growth this effect is answering is already part of its target.
+					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					if (smoothFollowerRef.current?.isActive() === true) return;
 					writeScrollTop(getScrollBottomTarget(viewportRef.current));
 				});
@@ -4068,9 +4136,19 @@ export const PretextExactMessageList = memo(
 			const processScrollFrame = useCallback(() => {
 				scrollRafRef.current = 0;
 				const node = viewportRef.current;
-				if (!node) return;
+				// A queued scroll rAF can run after the host parks in display:none.
+				// Zero geometry must not change pin, unread count, intent or window.
+				if (!node || !visibleViewportRef.current.isVisible(node)) return;
+				visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
 				const previousTop = scrollTopRef.current;
 				const nextTop = node.scrollTop;
+				const liveViewportHeight = node.clientHeight;
+				const viewportResizedWhilePinned = isBottomLostToViewportResize(
+					pinnedToBottomRef.current,
+					scrollViewportHeightRef.current,
+					liveViewportHeight,
+				);
+				scrollViewportHeightRef.current = liveViewportHeight;
 				scrollTopRef.current = nextTop;
 
 				const atBottom = getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON;
@@ -4084,7 +4162,18 @@ export const PretextExactMessageList = memo(
 				// frame must reason about: reporting the raw `atBottom` while staying pinned
 				// would flash the scroll-to-bottom affordance and make the panel count unread
 				// messages for a reader who is being followed.
-				const effectiveAtBottom = atBottom || grewBeneathReader;
+				// An explicit downward reader scroll can opt back into following. Merely
+				// ending up at the bottom after a body fold cannot undo reader intent.
+				if (
+					textReadingDetachedRef.current &&
+					nextTop > previousTop &&
+					!suppressScrollStateRef.current &&
+					atBottom
+				)
+					textReadingDetachedRef.current = false;
+				const effectiveAtBottom =
+					!textReadingDetachedRef.current &&
+					(atBottom || grewBeneathReader || viewportResizedWhilePinned);
 				// Suppress the pinned-state update ONLY for the echo of our own write. A
 				// different value means the reader scrolled, and their intent wins immediately
 				// (see writeScrollTop / isSuppressedScrollEcho).
@@ -4093,10 +4182,21 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
+				// Classify before React mounts a new band. Only optional cold controllers
+				// subscribe to admission; this never invalidates the body/row element cache.
+				interactionAdmissionRef.current?.observeScroll({
+					scrollTop: nextTop,
+					viewportHeight: liveViewportHeight,
+					atBottom: effectiveAtBottom,
+					activity: !isEcho && !viewportResizedWhilePinned,
+				});
 				// Scrollbar drags and keyboard scrolling have no wheel/touch event to arm
 				// the history gate. Record their actual upward travel before testing it.
-				if (isUpwardHistoryScroll(previousTop, nextTop, isEcho)) {
-					olderHistoryIntentAtRef.current = Date.now();
+				// Keyboard resize/focus adjustment is not a request to read older history.
+				if (!viewportResizedWhilePinned) {
+					if (isUpwardHistoryScroll(previousTop, nextTop, isEcho)) {
+						olderHistoryIntentAtRef.current = Date.now();
+					}
 				}
 				if (!isEcho) {
 					// The reader moved during our suppression window: close it so nothing else
@@ -4125,7 +4225,10 @@ export const PretextExactMessageList = memo(
 				// during mount/settle, which is how a narrator switch ended up scrolling down
 				// into place. Yields to an active chase so it cannot cut a streaming glide
 				// short (the chase's live target already covers this growth).
-				if (grewBeneathReader && smoothFollowerRef.current?.isActive() !== true) {
+				if (
+					(grewBeneathReader || viewportResizedWhilePinned) &&
+					smoothFollowerRef.current?.isActive() !== true
+				) {
 					writeScrollTop(getScrollBottomTarget(node));
 				}
 				if (effectiveAtBottom) onUnreadCountChange?.(0);
@@ -4139,15 +4242,45 @@ export const PretextExactMessageList = memo(
 				// have moved the position, and the window must be resolved for where the
 				// viewport now IS (a stale value would mount the band the reader just left).
 				const settledTop = scrollTopRef.current;
+				readViewportView();
+				resizeControllerRef.current?.refresh();
 				const layout = exactLayoutRef.current;
 				if (!layout) return;
+				// This frame sampled the native position before React mounts the new band.
+				// Reuse only for a whole-viewport jump with unchanged document geometry.
+				// Fine scrolling keeps its original pre-paint layout-read order; deferring
+				// that small flush increased its frame-interval tail in browser controls.
+				if (
+					resizeControllerRef.current?.isPending() !== true &&
+					liveViewportHeight === viewportHeightRef.current &&
+					Math.abs(settledTop - previousTop) > liveViewportHeight
+				) {
+					morphScrollOrigin.record(
+						{
+							narratorId,
+							viewport: node,
+							items: renderItemsRef.current,
+							layout,
+							viewportHeight: liveViewportHeight,
+							footerHeight: footerHeightRef.current,
+							footer: tailFooter,
+						},
+						settledTop,
+					);
+				} else {
+					morphScrollOrigin.invalidate();
+				}
 				const nextWindow = resolveVisibleWindow(layout, settledTop, viewportHeight, ITEM_OVERSCAN);
 				const cur = visibleRef.current;
 				if (nextWindow.start !== cur.start || nextWindow.end !== cur.end) {
 					setScrollTop(settledTop);
 				}
 			}, [
+				morphScrollOrigin,
+				narratorId,
+				tailFooter,
 				maybeAutoLoadOlder,
+				readViewportView,
 				onAtBottomChange,
 				onUnreadCountChange,
 				viewportHeight,
@@ -4156,9 +4289,11 @@ export const PretextExactMessageList = memo(
 			]);
 
 			const onScroll = useCallback(() => {
+				// Until the queued native event is classified, an older sample is not live.
+				morphScrollOrigin.invalidate();
 				if (scrollRafRef.current) return;
 				scrollRafRef.current = requestAnimationFrame(processScrollFrame);
-			}, [processScrollFrame]);
+			}, [processScrollFrame, morphScrollOrigin]);
 			useEffect(
 				() => () => {
 					if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
@@ -4171,19 +4306,32 @@ export const PretextExactMessageList = memo(
 					// An explicit jump-to-bottom lands where it was told to, instantly — a
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
+					textReadingDetachedRef.current = false;
+					interactionAdmissionRef.current?.setAtBottom(true);
 					pinnedToBottomRef.current = true;
+					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
-					if (instant) writeScrollTop(getScrollBottomTarget(viewportRef.current));
-					else
-						requestAnimationFrame(() => writeScrollTop(getScrollBottomTarget(viewportRef.current)));
+					const land = () => {
+						const node = viewportRef.current;
+						if (!node || !visibleViewportRef.current.isVisible(node)) {
+							visibleViewportRef.current.deferCorrection(0, "bottom", readViewportView());
+							return;
+						}
+						visibleViewportRef.current.resume(node, true, writeScrollTop);
+						writeScrollTop(getScrollBottomTarget(node));
+					};
+					if (instant) land();
+					else requestAnimationFrame(land);
 				},
-				[getSmoothFollower, writeScrollTop],
+				[getSmoothFollower, readViewportView, writeScrollTop],
 			);
 			const detachFromBottom = useCallback(() => {
 				// Reader intent (wheel-up): the chase must die with the pin, or its next
 				// frame re-writes scrollTop and pulls the reader back down.
 				getSmoothFollower().cancel();
+				interactionAdmissionRef.current?.markHistoryIntent();
 				pinnedToBottomRef.current = false;
+				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
 			}, [getSmoothFollower]);
 
@@ -4195,22 +4343,38 @@ export const PretextExactMessageList = memo(
 			// The fractions are taken against the FULL scrollable height (canvas + tail
 			// footer) so the track shares the scrollbar's coordinate system.
 			const scrollableHeight = (exactLayout?.totalHeight ?? 0) + footerHeight;
+			const userMarkerSemantics = useMemo(
+				() => collectVListUserMarkerSemantics(semanticItems),
+				[semanticItems],
+			);
 			const userMarkers = useMemo(
-				() => collectVListUserMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight),
-				[renderItems, exactLayout?.items, scrollableHeight],
+				() =>
+					projectVListUserMarkers(userMarkerSemantics, exactLayout?.items ?? [], scrollableHeight),
+				[userMarkerSemantics, exactLayout?.items, scrollableHeight],
 			);
 			// Compact indicators ride the same track: a failed compact stays visible
 			// (red) even when the reader has scrolled far away from the marker row.
+			const compactMarkerSemantics = useMemo(
+				() => collectVListCompactMarkerSemantics(semanticItems),
+				[semanticItems],
+			);
 			const compactMarkers = useMemo(
-				() => collectVListCompactMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight),
-				[renderItems, exactLayout?.items, scrollableHeight],
+				() =>
+					projectVListCompactMarkers(
+						compactMarkerSemantics,
+						exactLayout?.items ?? [],
+						scrollableHeight,
+					),
+				[compactMarkerSemantics, exactLayout?.items, scrollableHeight],
 			);
 			const handleUserMarkerJump = useCallback(
 				(marker: VListUserMarker) => {
 					// A jump is an explicit reading action: unpin so streaming output cannot
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
+					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
+					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
 					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
 				},
@@ -4219,7 +4383,9 @@ export const PretextExactMessageList = memo(
 			const handleCompactMarkerJump = useCallback(
 				(marker: VListCompactMarker) => {
 					getSmoothFollower().cancel();
+					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
+					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
 					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
 				},
@@ -4296,7 +4462,10 @@ export const PretextExactMessageList = memo(
 						// A finger dragging downward pulls earlier content into view (scroll
 						// up): treat it as upward intent for the auto-load gate.
 						const y = event.touches[0]?.clientY ?? 0;
-						if (y - lastTouchY > 0) markUpwardIntent();
+						if (y - lastTouchY > 0) {
+							detachFromBottom();
+							markUpwardIntent();
+						}
 						lastTouchY = y;
 						return;
 					}
@@ -4357,7 +4526,9 @@ export const PretextExactMessageList = memo(
 						if (!node) return false;
 						const element = mountedJumpTarget(node, domIds, targetIds);
 						if (!element) return false;
+						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
+						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
 						// Restrict the reveal to this list, including repeated jumps to a mounted
 						// row. Native scrollIntoView can also scroll the panel/page ancestors.
@@ -4377,7 +4548,9 @@ export const PretextExactMessageList = memo(
 							const itemIndex = jumpTargetItemIndex(index, messageId);
 							if (itemIndex == null) continue;
 							const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+							interactionAdmissionRef.current?.markHistoryIntent();
 							pinnedToBottomRef.current = false;
+							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
 							writeScrollTop(targetTop);
 							await waitAnimationFrame();
@@ -4399,11 +4572,23 @@ export const PretextExactMessageList = memo(
 					// target's seq on the server, then page older until the window covers it.
 					const resolved = await resolveJumpTargetSeq(targetIds, {
 						fetchMessageLocation: (messageId) =>
-							narratorsApi.getMessageLocation(narratorId, messageId),
+							dataSource?.locateMessage
+								? dataSource.locateMessage(narratorId, messageId)
+								: narratorsApi.getMessageLocation(narratorId, messageId),
 						fetchToolMessage: async (toolUseId) => {
-							const detail = await narratorsApi.getToolCallDetail(narratorId, toolUseId);
+							const detail = dataSource?.fetchToolDetail
+								? await dataSource.fetchToolDetail(
+										narratorId,
+										toolUseId,
+										{},
+										new AbortController().signal,
+									)
+								: await narratorsApi.getToolCallDetail(narratorId, toolUseId);
 							return {
-								messageId: typeof detail?.messageId === "string" ? detail.messageId : undefined,
+								messageId:
+									typeof (detail as { messageId?: unknown } | null)?.messageId === "string"
+										? (detail as { messageId: string }).messageId
+										: undefined,
 							};
 						},
 					});
@@ -4440,7 +4625,9 @@ export const PretextExactMessageList = memo(
 						// Paging upward while pinned to the bottom would re-snap the canvas to the
 						// tail on every commit (commitPrependLayout's pinned branch), fighting the
 						// jump. A jump is an explicit reading action, so unpin first.
+						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
+						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
 						const added = await loadOlderAsyncRef.current().catch(() => 0);
 						if (cancelled()) return false;
@@ -4457,7 +4644,14 @@ export const PretextExactMessageList = memo(
 					if (cancelled()) return false;
 					return revealByLayout(revealIds);
 				},
-				[narratorId, t, getSmoothFollower, writeScrollTop],
+				[
+					narratorId,
+					t,
+					getSmoothFollower,
+					writeScrollTop,
+					dataSource?.fetchToolDetail,
+					dataSource?.locateMessage,
+				],
 			);
 
 			// UI-driven LOD changes (the indicator's notches / steppers) never pass through
@@ -4533,6 +4727,19 @@ export const PretextExactMessageList = memo(
 				return () => controller.cancel();
 			}, []);
 
+			// Quote-strip jump (chat / discussion rows): page history until the quoted
+			// message is covered, same machinery as a search deep-link.
+			const quoteJump = useCallback(
+				(targetId: string) => {
+					void scrollToMessageTarget({
+						domIds: [`msg-${targetId}`],
+						targetIds: [targetId],
+						highlightId: targetId,
+					});
+				},
+				[scrollToMessageTarget],
+			);
+
 			const manifestItems = pretextDocument.manifest?.items ?? [];
 			const hasRenderableLayout = hasRenderableExactLayout(
 				pretextDocument.index,
@@ -4558,6 +4765,9 @@ export const PretextExactMessageList = memo(
 						unknownHeightReporterCacheRef.current,
 						togglesCacheRef.current,
 						reflectionTakeOverCacheRef.current,
+						permissionHeightReportersRef.current,
+						heightOverrideWidthsRef.current,
+						resizeDirtyKeysRef.current,
 					],
 					liveKeys,
 				);
@@ -4566,7 +4776,7 @@ export const PretextExactMessageList = memo(
 			// Decorative grouping frames for consecutive in-run tool/subagent card runs.
 			// Rebuilt only when the document items change (not on scroll); drawn as
 			// absolute overlays under the rows so the grouped run reads as one container.
-			const toolRunFrames = useMemo(() => computeToolRunFrames(renderItems), [renderItems]);
+			const toolRunFrames = useMemo(() => computeToolRunFrames(semanticItems), [semanticItems]);
 			// Read by the fold capture and its play effect, both of which run outside render.
 			toolRunFramesRef.current = toolRunFrames;
 
@@ -4581,24 +4791,20 @@ export const PretextExactMessageList = memo(
 			// board by its tool-use id — the same pin the fold exemption already derives, so
 			// the spinner and the pinned card can never name different calls.
 			const specTaskLiveGate = useMemo(
-				() => resolveSpecTaskLiveGate(renderItems, isActive, tailMeta.latestSpecTasksToolUseId),
-				[renderItems, isActive, tailMeta.latestSpecTasksToolUseId],
+				() => resolveSpecTaskLiveGate(semanticItems, isActive, tailMeta.latestSpecTasksToolUseId),
+				[semanticItems, isActive, tailMeta.latestSpecTasksToolUseId],
 			);
 
-			// Refresh the per-key measured lookup used by the stable toggle callbacks.
-			// Rebuilt only when the document items change (not on scroll).
+			// Collapse capabilities belong to committed specs, not preview measurements.
 			useMemo(() => {
-				const measuredMap = new Map<string, VListItem["measured"]>();
 				const collapsesMap = new Map<string, boolean>();
-				for (const item of renderItems) {
+				for (const item of semanticItems) {
 					if (!item) continue;
-					measuredMap.set(item.spec.key, item.measured);
 					collapsesMap.set(item.spec.key, item.spec.opts?.collapsesByLod === true);
 				}
-				measuredByKeyRef.current = measuredMap;
 				collapsesByLodByKeyRef.current = collapsesMap;
 				return null;
-			}, [renderItems]);
+			}, [semanticItems]);
 
 			// Full messages by id — the inline editor and the original-content modal need
 			// the raw payload (contentJson / creator / narratorId / editedAt), which the
@@ -4691,7 +4897,7 @@ export const PretextExactMessageList = memo(
 					commitRowPayloadFrame(interactionReuseRef, generation, map);
 					return map;
 				}
-				const manifestByKey = new Map(manifestItems.map((m) => [m.itemKey, m]));
+				const manifestByKey = new Map(semanticManifestItems.map((m) => [m.itemKey, m]));
 				// The shared per-document index (built above) — never rebuilt per memo.
 				const toolMetaIndex = rowToolMetaIndex;
 				const handlers = rowHandlers ?? {};
@@ -4700,7 +4906,7 @@ export const PretextExactMessageList = memo(
 				// onEditAssistantMessage plus an editable text block.
 				const canEditUser = !!handlers.onEditAndRegenerate;
 				const canEditAssistant = !!handlers.onEditAssistantMessage;
-				for (const item of renderItems) {
+				for (const item of semanticItems) {
 					if (!item) continue;
 					const manifestItem = manifestByKey.get(item.spec.key);
 					const sourceIds = manifestItem?.sourceMessageIds ?? [];
@@ -4788,6 +4994,14 @@ export const PretextExactMessageList = memo(
 						toolActions,
 						...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
 						...(inspectContent ? { inspectContent } : {}),
+						// Message-level selection (chat): outline + modifier-click toggle.
+						...(onToggleMessageSelect
+							? {
+									selected: messageSelectedIds?.has(messageId) ?? false,
+									onToggleSelect: (opts: { shiftKey: boolean }) =>
+										onToggleMessageSelect(messageId, opts),
+								}
+							: {}),
 					};
 					map.set(
 						item.spec.key,
@@ -4802,12 +5016,14 @@ export const PretextExactMessageList = memo(
 			}, [
 				narratorId,
 				selectionIndex,
-				renderItems,
-				manifestItems,
+				semanticItems,
+				semanticManifestItems,
 				rowHandlers,
 				rowToolMetaIndex,
 				messagesById,
 				openEditor,
+				messageSelectedIds,
+				onToggleMessageSelect,
 			]);
 
 			// System cards (compact markers included) carry no `-b{n}` suffix in their spec
@@ -4815,22 +5031,26 @@ export const PretextExactMessageList = memo(
 			// once here because the compact bridge resolves markers by spec key.
 			const sourceIdsByKey = useMemo(() => {
 				const map = new Map<string, readonly string[]>();
-				for (const manifestItem of manifestItems) {
+				for (const manifestItem of semanticManifestItems) {
 					map.set(manifestItem.itemKey, manifestItem.sourceMessageIds);
 				}
 				return map;
-			}, [manifestItems]);
+			}, [semanticManifestItems]);
 
 			// Compact-marker interactions (open summary / cancel a running compaction) —
 			// the vlist parity of the chunked CompactIndicator's own click handling. The
 			// dialog is one shell-level instance; rows only carry the bound callbacks.
-			const compact = useVListCompactActions({ narratorId, renderItems, sourceIdsByKey });
+			const compact = useVListCompactActions({
+				narratorId,
+				renderItems: semanticItems,
+				sourceIdsByKey,
+			});
 
 			// List-owned drafts/actions survive virtual row unmounts. Rows receive only
 			// controlled form props; their geometry remains entirely precomputed.
 			const askInPassing = useVListAskInPassing({
 				narratorId,
-				renderItems,
+				renderItems: semanticItems,
 				sourceIdsByKey,
 				messages: pretextDocument.messages,
 			});
@@ -4852,7 +5072,7 @@ export const PretextExactMessageList = memo(
 			// document index must not replace callbacks belonging to unchanged groups.
 			const traceBindingsByKey = useVListTraceBindings({
 				narratorId,
-				renderItems,
+				renderItems: semanticItems,
 				selectionIndex,
 				rowToolMetaIndex,
 				messageMetaById: messagesById,
@@ -4863,9 +5083,9 @@ export const PretextExactMessageList = memo(
 			// window. -1 → not in the loaded document (nothing to pin).
 			const editingRowIndex = useMemo(() => {
 				if (!editingRow) return null;
-				const index = renderItems.findIndex((item) => item?.spec.key === editingRow.key);
+				const index = semanticItems.findIndex((item) => item?.spec.key === editingRow.key);
 				return index >= 0 ? index : null;
-			}, [editingRow, renderItems]);
+			}, [editingRow, semanticItems]);
 
 			/**
 			 * The row holding the touch swipe ANCHOR, so it too can be pinned.
@@ -4892,12 +5112,12 @@ export const PretextExactMessageList = memo(
 				// Scanning the document is gated on an anchor EXISTING, so a plain read /
 				// desktop session never walks the list at all.
 				if (!swipeAnchorBlockId) return null;
-				return resolveSwipeAnchorRowIndex(swipeAnchorBlockId, renderItems.length, (index) => {
-					const item = renderItems[index];
+				return resolveSwipeAnchorRowIndex(swipeAnchorBlockId, semanticItems.length, (index) => {
+					const item = semanticItems[index];
 					if (!item) return null;
 					return rowSelectionBlockIds(item, interactionsByKey.get(item.spec.key)?.blockId);
 				});
-			}, [swipeAnchorBlockId, renderItems, interactionsByKey]);
+			}, [swipeAnchorBlockId, semanticItems, interactionsByKey]);
 
 			/** Mount the shared editor for the row currently in edit mode. */
 			const renderEditorSlot = useCallback(
@@ -4968,6 +5188,115 @@ export const PretextExactMessageList = memo(
 				],
 			);
 
+			// Project ALL draw inputs on every render. Only element construction is
+			// cached: a callback, signature, slot or geometry change must still reach
+			// the row. No second handwritten invalidation/dependency list.
+			const windowRowProjections: WindowRowProjection[] = [];
+			if (hasRenderableLayout && exactLayout) {
+				const mountedIndices = [
+					...range(visible.start, visible.end),
+					// Retain editor drafts and the swipe anchor outside the normal window.
+					// The two pins may name the SAME row: keep its React key unique.
+					...mergePinnedRowIndices(
+						resolvePinnedRowIndices(visible, editingRowIndex),
+						resolvePinnedRowIndices(visible, swipeAnchorRowIndex),
+					),
+				];
+				for (const itemIndex of mountedIndices) {
+					const item = renderItems[itemIndex];
+					const geometry = exactLayout.items[itemIndex];
+					const manifestItem = manifestItems[itemIndex];
+					if (!item || !geometry || !manifestItem) continue;
+					const sourceIds = sourceIdsForItem(item, manifestItem);
+					const itemId = domIdForItem(item, sourceIds);
+					const messageMeta = messagesById.get(sourceIds[0] ?? "");
+					const traceBinding = traceBindingsByKey.get(item.spec.key);
+					const permissionSlot = permissionSlotByKey.get(item.spec.key);
+					const editorSlot =
+						editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
+					const askInPassingPending = askInPassing.pendingByKey.get(item.spec.key);
+					// Same predicate as dynamicRowKeys: reporter and unclipped box agree.
+					const isDynamicRow = dynamicRowKeys.has(item.spec.key);
+					const rowProps: ExactRowProps = {
+						item,
+						top: geometry.top,
+						height: geometry.height,
+						hitHeight: resolveRowHitHeight(exactLayout.items, itemIndex, exactLayout.totalHeight),
+						contentWidth: item.contentWidth ?? contentWidth,
+						itemId,
+						sourceIds,
+						messageSeq: messageMeta?.seq,
+						messageRole: messageMeta?.role,
+						// Height-neutral live tails and closing cards still advance this
+						// signature, even when the measured object is a cache hit.
+						interactionSig: `${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`,
+						toggles: getRowToggles(item.spec.key),
+						resolveToolDetailStatus:
+							item.spec.kind === "communication-bubble" ? resolveToolDetailStatus : undefined,
+						renderLabels,
+						interaction: interactionsByKey.get(item.spec.key),
+						rowInteraction: traceBinding?.rowInteraction,
+						closingRowKeys: closingRows.get(item.spec.key),
+						narratorId,
+						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
+						onFetchAttachment: dataSource?.onFetchAttachment,
+						openAttachmentLabel,
+						injectionNoteLabel,
+						reviewTruncatedLabel,
+						injectionNavigation,
+						currentUserId,
+						permissionSlot,
+						traceRowPermissionSlots: tracePermissionSlotsByKey.get(item.spec.key),
+						onPermissionFormHeight: getPermissionHeightReporter(
+							item.spec.key,
+							item.contentWidth ?? contentWidth,
+						),
+						editorSlot,
+						onTerminate: terminateRunningTool,
+						resolveUpdateTimeout: getUpdateTimeout,
+						onReflectionTakeOver: resolveReflectionTakeOver(item, getReflectionTakeOver),
+						// Drilled-in cards bind their own gate, prompt and tool actions.
+						getReflectionTakeOver,
+						onTogglePromptForKey: togglePromptForKey,
+						resolveRowToolActions: traceBinding?.resolveRowToolActions,
+						onUnknownHeight: isDynamicRow
+							? getUnknownHeightReporter(item.spec.key, item.contentWidth ?? contentWidth)
+							: undefined,
+						onResumeSubagentRecovery: handleResumeSubagentRecovery,
+						specCarryoverActions: resolveSpecCarryoverActions(item, sourceIds, resolveSpecActions),
+						errorNoticeActions: resolveErrorNoticeActions(item, sourceIds, errorNotice.resolve),
+						injectionGuardActions: resolveInterruptGuardActions(
+							item,
+							sourceIds,
+							resolveGuardActions,
+						),
+						reviewFeedbackActions: resolveReviewFeedbackActions(
+							item,
+							sourceIds,
+							resolveReviewActions,
+						),
+						compactActions: compact.byKey.get(item.spec.key),
+						compactCancelTitle: compact.cancelTitle,
+						askInPassingPending,
+						onOpenAskInPassingTarget: askInPassing.openByKey.get(item.spec.key),
+						viewControls: contentView.controls,
+						animateStreaming: animateStreamingRows && isStreamingRowKey(item.spec.key),
+						streamAnimMountEpoch,
+						// Accepted document snapshot, never the potentially newer streamingMsg.
+						streamAnimSnapshotEpoch: isStreamingRowKey(item.spec.key)
+							? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
+							: undefined,
+						specTaskLive: isSpecTaskLiveItem(item, specTaskLiveGate),
+						onQuoteJump: quoteJump,
+					};
+					windowRowProjections.push({
+						props: rowProps,
+						skipReuse: isStreamingRowKey(item.spec.key),
+					});
+				}
+			}
+			const windowRowElements = useVListWindowRows(narratorId, windowRowProjections);
+
 			return (
 				<div
 					ref={assignViewport}
@@ -4975,8 +5304,10 @@ export const PretextExactMessageList = memo(
 					style={{
 						position: "relative",
 						height: "100%",
-						overflow: "auto",
-						// Reserve the vertical scrollbar's track from the very first frame.
+						overflowX: "auto",
+						overflowY: "scroll",
+						// Always show the vertical scrollbar, including while loading or switching
+						// narrators, and reserve its track from the very first frame.
 						//
 						// Without it, `clientWidth` drops ~15px the moment the loaded document
 						// becomes taller than the viewport, so the column was measured once
@@ -5001,6 +5332,9 @@ export const PretextExactMessageList = memo(
 						overflowAnchor: "none",
 					}}
 					data-pretext-exact-message-list
+					data-vlist-resize-preview={pretextDocument.resizePreview || undefined}
+					data-vlist-resize-measured={pretextDocument.resizeMeasuredCount || undefined}
+					data-vlist-resize-revision={pretextDocument.resizeRevision}
 				>
 					{/* User-turn quick index, pinned to the viewport's right edge. A zero-height
 			    sticky box, so it indexes the document without adding to it. Placed
@@ -5076,8 +5410,8 @@ export const PretextExactMessageList = memo(
 												// The canvas is full width now, so the decorative frame centers
 												// itself on the same column the rows draw into.
 												left: "50%",
-												marginLeft: -contentWidth / 2,
-												width: contentWidth,
+												marginLeft: -displayContentWidth / 2,
+												width: displayContentWidth,
 												height: bottomGeom.bottom - topGeom.top,
 												border: TOOL_RUN_FRAME_BORDER,
 												borderRadius: "var(--mantine-radius-sm)",
@@ -5088,142 +5422,9 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								{[
-									...range(visible.start, visible.end),
-									// Rows that must survive scrolling out of the window. Merged (not
-									// spread back to back) because the two reasons can name the SAME
-									// index — the reader may swipe the row they are editing — and that
-									// would mint two children under one key.
-									...mergePinnedRowIndices(
-										// The row being edited: unmounting would destroy the draft.
-										resolvePinnedRowIndices(visible, editingRowIndex),
-										// The swipe anchor's row: unmounting drops the anchor and its
-										// close handler, which is what silently broke touch
-										// range-selection once the first swiped row scrolled away.
-										resolvePinnedRowIndices(visible, swipeAnchorRowIndex),
-									),
-								].map((itemIndex) => {
-									const item = renderItems[itemIndex];
-									const geometry = exactLayout.items[itemIndex];
-									const manifestItem = manifestItems[itemIndex];
-									if (!item || !geometry || !manifestItem) return null;
-									const sourceIds = sourceIdsForItem(item, manifestItem);
-									const itemId = domIdForItem(item, sourceIds);
-									const messageMeta = messagesById.get(sourceIds[0] ?? "");
-									const traceBinding = traceBindingsByKey.get(item.spec.key);
-									const permissionSlot = permissionSlotByKey.get(item.spec.key);
-									const editorSlot =
-										editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
-									const askInPassingPending = askInPassing.pendingByKey.get(item.spec.key);
-									// Must agree with `dynamicRowKeys` above: that set gates which keys may
-									// HOLD an override, this decides which rows get a reporter and the
-									// unclipped box. A row in one but not the other is either clipped with
-									// no way to report, or reports into a set that drops it.
-									const isDynamicRow = dynamicRowKeys.has(item.spec.key);
-									return (
-										<ExactRow
-											key={item.spec.key}
-											item={item}
-											top={geometry.top}
-											height={geometry.height}
-											hitHeight={resolveRowHitHeight(
-												exactLayout.items,
-												itemIndex,
-												exactLayout.totalHeight,
-											)}
-											contentWidth={contentWidth}
-											itemId={itemId}
-											sourceIds={sourceIds}
-											messageSeq={messageMeta?.seq}
-											messageRole={messageMeta?.role}
-											// Layout-affecting interaction state PLUS the viewer's pure render
-											// state, so a wrap / source toggle re-renders just this row.
-											//
-											// The live reasoning tail rides here too. It is read at DRAW time from
-											// `spec.data` (never measured — see reasoning-live-tail), so none of the
-											// three things the memo compares below moves when it advances: a folded
-											// trace's `measured` is the SAME cached object, its key is constant, and
-											// the tail is height-neutral. Without this term the memo skips the
-											// re-render and the newest characters never reach the DOM. Empty string
-											// for every settled row, so scroll-time memo hits are unaffected.
-											// The closing set rides here too: it is read at DRAW time through a ref
-											// (so `measured` and the keys are unchanged), and without a term in
-											// this signature the memo would skip the re-render that mounts — and
-											// later unmounts — a closing card. Empty for every trace with nothing
-											// closing, so scroll-time memo hits are unaffected.
-											interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`}
-											toggles={getRowToggles(item.spec.key)}
-											renderLabels={renderLabels}
-											interaction={interactionsByKey.get(item.spec.key)}
-											rowInteraction={traceBinding?.rowInteraction}
-											closingRowKeys={closingRows.get(item.spec.key)}
-											narratorId={narratorId}
-											onOpenFilePanel={rowHandlers?.onOpenFilePanel}
-											openAttachmentLabel={openAttachmentLabel}
-											injectionNoteLabel={injectionNoteLabel}
-											reviewTruncatedLabel={reviewTruncatedLabel}
-											injectionNavigation={injectionNavigation}
-											currentUserId={currentUserId}
-											permissionSlot={permissionSlot}
-											traceRowPermissionSlots={tracePermissionSlotsByKey.get(item.spec.key)}
-											onPermissionFormHeight={reportPermissionFormHeight}
-											editorSlot={editorSlot}
-											onTerminate={terminateRunningTool}
-											resolveUpdateTimeout={getUpdateTimeout}
-											onReflectionTakeOver={resolveReflectionTakeOver(item, getReflectionTakeOver)}
-											// Unresolved on purpose: a drilled-in card binds its OWN gate (see
-											// rowCard). Referentially stable (useCallback), so the memo is unaffected.
-											getReflectionTakeOver={getReflectionTakeOver}
-											// A drilled-in SUBAGENT card's own controls: the prompt fold (keyed by
-											// the card, not the trace) and the session/lifecycle actions a trace
-											// element has no interaction payload for. Both stable.
-											onTogglePromptForKey={togglePromptForKey}
-											resolveRowToolActions={traceBinding?.resolveRowToolActions}
-											onUnknownHeight={
-												isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
-											}
-											onResumeSubagentRecovery={handleResumeSubagentRecovery}
-											specCarryoverActions={resolveSpecCarryoverActions(
-												item,
-												sourceIds,
-												resolveSpecActions,
-											)}
-											errorNoticeActions={resolveErrorNoticeActions(
-												item,
-												sourceIds,
-												errorNotice.resolve,
-											)}
-											injectionGuardActions={resolveInterruptGuardActions(
-												item,
-												sourceIds,
-												resolveGuardActions,
-											)}
-											reviewFeedbackActions={resolveReviewFeedbackActions(
-												item,
-												sourceIds,
-												resolveReviewActions,
-											)}
-											compactActions={compact.byKey.get(item.spec.key)}
-											compactCancelTitle={compact.cancelTitle}
-											askInPassingPending={askInPassingPending}
-											onOpenAskInPassingTarget={askInPassing.openByKey.get(item.spec.key)}
-											viewControls={contentView.controls}
-											animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
-											streamAnimMountEpoch={streamAnimMountEpoch}
-											// Read from the committed document, NEVER streamingMsg: that hook
-											// can already hold the next snapshot while these items are still old.
-											streamAnimSnapshotEpoch={
-												isStreamingRowKey(item.spec.key)
-													? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
-													: undefined
-											}
-											// The task spinner gate. Two identities, one flag: the newest
-											// framed task bubble (by spec key) and the newest task board (by
-											// tool-use id). Both are null unless the narrator is running.
-											specTaskLive={isSpecTaskLiveItem(item, specTaskLiveGate)}
-										/>
-									);
-								})}
+								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
+									{windowRowElements}
+								</VListInteractionAdmissionContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and
@@ -5272,7 +5473,11 @@ export const PretextExactMessageList = memo(
 						{tailFooter ? (
 							<div
 								ref={footerNodeRef}
-								style={{ paddingBottom: PAGE_PADDING, width: contentWidth, margin: "0 auto" }}
+								style={{
+									paddingBottom: PAGE_PADDING,
+									width: displayContentWidth,
+									margin: "0 auto",
+								}}
 							>
 								{tailFooter}
 							</div>

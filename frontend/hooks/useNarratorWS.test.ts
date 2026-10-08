@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { parseHTML } from "linkedom";
 import { createElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
@@ -206,9 +207,12 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.unsubscribe = (() => {}) as typeof narratorWSManager.unsubscribe;
 		narratorWSManager.joinPresence = (() => {}) as typeof narratorWSManager.joinPresence;
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
-		narratorWSManager.addListener = (() => ({
-			_id: nextHandleId++,
-		})) as typeof narratorWSManager.addListener;
+		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
+		const sourceUpdates: unknown[] = [];
+		narratorWSManager.addListener = ((_opts, listener) => {
+			sourceListeners.push(listener);
+			return { _id: nextHandleId++ };
+		}) as typeof narratorWSManager.addListener;
 		narratorWSManager.removeListener = (() => {}) as typeof narratorWSManager.removeListener;
 		narratorWSManager.onConnectionChange = (() =>
 			() => {}) as typeof narratorWSManager.onConnectionChange;
@@ -225,7 +229,12 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		function Harness(): ReactNode {
 			useNarratorWS(
 				props.narratorId,
-				{},
+				{
+					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
+					onToolStarted: (...args) => sourceUpdates.push(args[8]),
+					onStreamingSnapshot: (snapshot) =>
+						sourceUpdates.push(snapshot.toolChunks[0]?.inputDocument),
+				},
 				props.cursor || props.messageVersion != null
 					? { cursor: props.cursor, messageVersion: props.messageVersion }
 					: undefined,
@@ -246,6 +255,44 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		try {
 			root.render(createElement(Harness));
 			await settle();
+			const inputDocument = {
+				ref: {
+					id: "source",
+					epoch: "epoch",
+					revision: 2,
+					length: 7,
+					complete: true,
+					originKnown: true,
+				},
+				offset: 3,
+			};
+			for (const frame of [
+				{
+					type: "tool_use_chunk",
+					narratorId: "n1",
+					toolUseId: "tool",
+					toolName: "Write",
+					inputCharsTotal: 100,
+					streamingField: { name: "content", delta: "tail", offset: 3, complete: true },
+					inputDocument,
+				},
+				{
+					type: "tool_started",
+					narratorId: "n1",
+					toolUseId: "tool",
+					toolName: "Write",
+					inputDocument,
+				},
+				{
+					type: "streaming_snapshot",
+					narratorId: "n1",
+					toolChunks: [
+						{ toolUseId: "tool", toolName: "Write", inputCharsTotal: 100, inputDocument },
+					],
+				},
+			])
+				for (const listener of sourceListeners) listener(frame);
+			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
 			props = { narratorId: "n2" };
 			root.render(createElement(Harness));
 			await settle();
@@ -356,8 +403,14 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const oldWrites: string[] = [];
 		const newWrites: string[] = [];
 		const receipts: unknown[] = [];
+		const editOrigins: unknown[] = [];
+		const snapshotOrigins: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
+				onToolStarted: (_id, _name, _start, _end, _input, _parent, _meta, origin) =>
+					editOrigins.push(origin),
+				onStreamingSnapshot: (snapshot) =>
+					snapshotOrigins.push(snapshot.toolChunks[0]?.streamingEditOrigin),
 				onSendDeliveryResolved: (
 					toolUseId,
 					targets,
@@ -403,6 +456,57 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			expect(newListener).toBeFunction();
 			newListener?.({ type: "title_updated", narratorId: "n2", title: "fresh-new-frame" });
 			expect(newWrites).toEqual(["fresh-new-frame"]);
+			// Dedicated evidence crosses the raw WS dispatcher; input metadata is not a fallback.
+			const editInput = { file_path: "a.ts", old_string: "h".repeat(20_000), new_string: "new" };
+			const origin = createStreamingEditOrigin("edit", editInput, {
+				startLine: 42,
+				matchStatus: "matched",
+			});
+			if (!origin) throw new Error("missing fixture origin");
+			newListener?.({
+				type: "tool_started",
+				narratorId: "n2",
+				toolUseId: "edit",
+				toolName: "Edit",
+				input: editInput,
+				streamingEditOrigin: origin,
+			});
+			newListener?.({
+				type: "tool_started",
+				narratorId: "n2",
+				toolUseId: "edit",
+				toolName: "Edit",
+				input: {
+					...editInput,
+					_streamingMetadata: { startLine: 999 },
+					streamingEditOrigin: origin,
+				},
+			});
+			newListener?.({
+				type: "tool_started",
+				narratorId: "n2",
+				toolUseId: "edit",
+				toolName: "Edit",
+				input: editInput,
+				streamingEditOrigin: { ...origin, startLine: 0 },
+			});
+			newListener?.({
+				type: "streaming_snapshot",
+				narratorId: "n2",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: "edit",
+						toolName: "Edit",
+						inputCharsTotal: 20_000,
+						started: true,
+						input: editInput,
+						streamingEditOrigin: origin,
+					},
+				],
+			});
+			expect(editOrigins).toEqual([origin, undefined, undefined]);
+			expect(snapshotOrigins).toEqual([origin]);
 			const targets = [
 				{
 					id: "child",

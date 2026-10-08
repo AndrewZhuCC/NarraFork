@@ -95,7 +95,7 @@ describe("diagnostic fetch", () => {
 	test("wraps unsupported proxy protocols without leaking proxy credentials", async () => {
 		let thrown: unknown;
 		try {
-			await fetchWithNetworkDiagnostics("https://nug2.narrafork.dev/v1/responses", undefined, {
+			await fetchWithNetworkDiagnostics("https://nug.example.com/v1/responses", undefined, {
 				proxy: "ftp://user:secret-password@127.0.0.1:21",
 			});
 		} catch (error) {

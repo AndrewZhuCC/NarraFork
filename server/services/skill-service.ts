@@ -12,17 +12,19 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { and, asc, count, eq, inArray, lt } from "drizzle-orm";
 import matter from "gray-matter";
 import { db } from "../db";
 import { chapters, narrators, projects, skillDirectoryCaches } from "../db/schema";
+import { getBuiltinSkillRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotTimer } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
+import { resolveNarratorProjectId } from "./narrator-project";
 
 export type SkillSource = "global" | "project" | "workspace";
 
@@ -885,6 +887,35 @@ async function loadRootSkillSummaries(
 	};
 }
 
+/** Apply project intent after merging cached filesystem roots, also on explicit loads. */
+async function applyProjectRoutineSkillOverrides<T extends { name: string; location: string }>(
+	skills: T[],
+	projectGitPath: string | null | undefined,
+): Promise<T[]> {
+	if (!projectGitPath) return skills;
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.gitPath, projectGitPath),
+		columns: { chapterSettings: true },
+	});
+	let config: unknown = project?.chapterSettings;
+	if (typeof config === "string") {
+		try {
+			config = JSON.parse(config);
+		} catch {
+			return skills;
+		}
+	}
+	const disabled = (config as { routines?: { disabledRoutines?: unknown } } | null)?.routines
+		?.disabledRoutines;
+	if (!Array.isArray(disabled) || disabled.length === 0) return skills;
+	const managed = new Map(
+		getBuiltinSkillRoutines()
+			.filter((routine) => disabled.includes(routine.id))
+			.map((routine) => [`_routine-${routine.id}`, routine.skill?.name]),
+	);
+	return skills.filter((skill) => managed.get(basename(dirname(skill.location))) !== skill.name);
+}
+
 export async function loadSkillSummariesForContext(
 	context: SkillContext,
 	options: { forceRefresh?: boolean } = {},
@@ -903,7 +934,10 @@ export async function loadSkillSummariesForContext(
 	}
 
 	return {
-		skills: Array.from(skillMap.values()),
+		skills: await applyProjectRoutineSkillOverrides(
+			Array.from(skillMap.values()),
+			context.projectGitPath,
+		),
 		roots: rootResults.map((result) => result.meta),
 		scopeKey,
 	};
@@ -933,28 +967,28 @@ export async function loadSkillByNameForContext(
 export async function resolveSkillContextForNarrator(narratorId: string): Promise<SkillContext> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, cwd: true },
+		columns: { chapterId: true, contextProjectId: true, cwd: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
-	if (!narrator.chapterId) {
-		return { projectGitPath: null, cwd: narrator.cwd || homedir() };
-	}
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true, worktreePath: true },
-	});
-	if (!chapter) return { projectGitPath: null, cwd: narrator.cwd || homedir() };
-
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
-		columns: { gitPath: true },
-	});
+	// Use the same explicit project resolution as ACL/traits; cwd never implies membership.
+	const projectId = await resolveNarratorProjectId(narrator);
+	const chapter = narrator.chapterId
+		? await db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				columns: { worktreePath: true },
+			})
+		: null;
+	const project = projectId
+		? await db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { gitPath: true },
+			})
+		: null;
 	const projectGitPath = project?.gitPath ?? null;
 	return {
 		projectGitPath,
-		cwd: narrator.cwd || chapter.worktreePath || projectGitPath || homedir(),
+		cwd: narrator.cwd || chapter?.worktreePath || projectGitPath || homedir(),
 	};
 }
 
@@ -970,7 +1004,7 @@ export async function loadProjectSkills(projectGitPath: string): Promise<SkillIn
 		skillMap.set(skill.name, skill);
 	}
 
-	return Array.from(skillMap.values());
+	return applyProjectRoutineSkillOverrides(Array.from(skillMap.values()), projectGitPath);
 }
 
 /** Load a single project-level skill by name (does not include global skills). */
@@ -1015,7 +1049,7 @@ export async function loadAllSkills(projectGitPath: string | null): Promise<Skil
 		for (const s of projectSkills) skillMap.set(s.name, s);
 	}
 
-	return Array.from(skillMap.values());
+	return applyProjectRoutineSkillOverrides(Array.from(skillMap.values()), projectGitPath);
 }
 
 /**

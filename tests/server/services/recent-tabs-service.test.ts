@@ -569,6 +569,68 @@ describe("recent-tabs capacity and undo", () => {
 		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
 	});
 
+	it("restores a single-tab remove from the bounded undo token", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const removed = await recentTabs.removeRecentTab("user-1", "narrator", "n-2", {
+			storeUndo: true,
+		});
+		expect(removed).toMatchObject({ changed: true, revision: 1, removedCount: 1 });
+		expect(removed.undoToken).toBeString();
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-3"]);
+
+		const restored = await recentTabs.restoreRecentTabs("user-1", {
+			token: removed.undoToken,
+		});
+		expect(restored).toMatchObject({ changed: true, baseRevision: 1, revision: 2 });
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2", "narrator:n-3"]);
+	});
+
+	it("stores no undo token when removing a missing tab", async () => {
+		seedLegacyTabs([makeTab("n-1")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const removed = await recentTabs.removeRecentTab("user-1", "narrator", "ghost", {
+			storeUndo: true,
+		});
+		expect(removed).toMatchObject({ changed: false });
+		expect(removed.undoToken).toBeUndefined();
+	});
+
+	it("stores no undo token for cascade removes or workspace dissolve", async () => {
+		seedLegacyTabs([
+			makeTab("n-1"),
+			makeTab("n-2"),
+			makeTab("ws-1", { type: "workspace", title: "WS" }),
+			makeTab("n-child", { workspaceId: "ws-1" }),
+		]);
+		db.insert(workspaces)
+			.values({
+				id: "ws-1",
+				userId: "user-1",
+				title: "WS",
+				tree: "{}",
+				createdAt: new Date(NOW),
+				updatedAt: new Date(NOW),
+			})
+			.run();
+		await recentTabs.ensureMigrated("user-1");
+
+		// Cascade / internal path (no storeUndo): must not mint an undo token.
+		const cascaded = await recentTabs.removeRecentTab("user-1", "narrator", "n-1");
+		expect(cascaded).toMatchObject({ changed: true, removedCount: 1 });
+		expect(cascaded.undoToken).toBeUndefined();
+
+		// Workspace dissolve never stores undo — the entity and panels are torn down too.
+		const dissolved = await recentTabs.removeRecentTab("user-1", "workspace", "ws-1", {
+			storeUndo: true,
+		});
+		expect(dissolved).toMatchObject({ changed: true });
+		expect(dissolved.undoToken).toBeUndefined();
+		expect(storedKeys()).toEqual(["narrator:n-2", "narrator:n-child"]);
+	});
+
 	it("rejects an undo token after another mutation advances revision", async () => {
 		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
 		const cleared = await recentTabs.clearRecentTabs("user-1", "all");
@@ -700,6 +762,85 @@ describe("recent-tabs capacity and undo", () => {
 			db.select().from(workspaces).where(eq(workspaces.id, "ws-expire")).get(),
 		).toBeUndefined();
 	});
+});
+
+describe("recent-tabs workspace member anchored moves", () => {
+	const memberIds = ["child-a", "child-b", "child-c", "child-d"];
+	const seedWorkspace = async () => {
+		seedLegacyTabs([
+			makeTab("project-1", { type: "project", pinned: true }),
+			makeTab("n-top"),
+			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
+			...memberIds.map((id) => makeTab(id, { workspaceId: "ws-1" })),
+			makeTab("n-tail"),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+	};
+	const storedMembership = () =>
+		db
+			.select({
+				key: userRecentTabs.tabKey,
+				type: userRecentTabs.type,
+				workspaceId: userRecentTabs.workspaceId,
+			})
+			.from(userRecentTabs)
+			.where(eq(userRecentTabs.userId, "user-1"))
+			.orderBy(userRecentTabs.tabKey)
+			.all();
+
+	// Every source/anchor pair covers both directions, including middle positions
+	// and moves whose source originally precedes or follows the target sibling.
+	for (const position of ["before", "after"] as const) {
+		for (const source of memberIds) {
+			for (const anchor of memberIds.filter((id) => id !== source)) {
+				it(`moves ${source} ${position} ${anchor} without changing membership`, async () => {
+					await seedWorkspace();
+					const membership = storedMembership();
+					const expectedMembers = memberIds.filter((id) => id !== source);
+					const target = expectedMembers.indexOf(anchor) + (position === "after" ? 1 : 0);
+					expectedMembers.splice(target, 0, source);
+
+					const result = await recentTabs.moveRecentTab("user-1", {
+						key: `narrator:${source}`,
+						...(position === "before"
+							? { beforeKey: `narrator:${anchor}` }
+							: { afterKey: `narrator:${anchor}` }),
+					});
+
+					expect(storedKeys()).toEqual([
+						"project:project-1",
+						"narrator:n-top",
+						"workspace:ws-1",
+						...expectedMembers.map((id) => `narrator:${id}`),
+						"narrator:n-tail",
+					]);
+					expect(storedMembership()).toEqual(membership);
+					const changed = expectedMembers.some((id, index) => id !== memberIds[index]);
+					expect(result.changed).toBe(changed);
+				});
+			}
+		}
+	}
+
+	for (const position of ["before", "after"] as const) {
+		it(`keeps an external top-level move ${position} a child at the workspace edge`, async () => {
+			await seedWorkspace();
+			const membership = storedMembership();
+			await recentTabs.moveRecentTab("user-1", {
+				key: position === "before" ? "narrator:n-tail" : "narrator:n-top",
+				...(position === "before"
+					? { beforeKey: "narrator:child-b" }
+					: { afterKey: "narrator:child-b" }),
+			});
+			const workspaceKeys = ["workspace:ws-1", ...memberIds.map((id) => `narrator:${id}`)];
+			expect(storedKeys()).toEqual(
+				position === "before"
+					? ["project:project-1", "narrator:n-top", "narrator:n-tail", ...workspaceKeys]
+					: ["project:project-1", ...workspaceKeys, "narrator:n-top", "narrator:n-tail"],
+			);
+			expect(storedMembership()).toEqual(membership);
+		});
+	}
 });
 
 /**

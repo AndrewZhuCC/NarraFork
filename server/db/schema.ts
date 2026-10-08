@@ -1,4 +1,10 @@
 import type {
+	ContextCharCache,
+	ContextCharStats,
+	ContextSegment,
+} from "@shared/context-composition";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
+import type {
 	FileChangeActor,
 	FileChangeExecutionBinding,
 	FileChangeExecutionReceipt,
@@ -10,6 +16,7 @@ import type {
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import type { NotificationLink } from "@shared/notification-center";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
+import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { sql } from "drizzle-orm";
 import {
 	type AnySQLiteColumn,
@@ -23,6 +30,107 @@ import {
 	uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 import type { ToolExecutionPlan, ToolExecutionTarget } from "../lib/agent/types";
+
+/** Attempt-bound permission proposals; authorization is consumed only after a valid decision. */
+export const permissionRuleRequests = sqliteTable(
+	"permission_rule_requests",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		toolCallId: text("tool_call_id")
+			.notNull()
+			.references(() => narratorToolCalls.id, { onDelete: "cascade" }),
+		toolUseId: text("tool_use_id").notNull(),
+		attempt: integer("attempt").notNull(),
+		proposalJson: text("proposal_json", { mode: "json" })
+			.$type<{ input: Record<string, unknown>; rule: Record<string, unknown> }>()
+			.notNull(),
+		proposalHash: text("proposal_hash").notNull(),
+		reason: text("reason").notNull(),
+		scope: text("scope", { enum: ["narrator"] })
+			.notNull()
+			.default("narrator"),
+		deviceId: text("device_id").notNull(),
+		contextRevision: text("context_revision").notNull(),
+		status: text("status", {
+			enum: ["pending", "approved", "denied", "applied", "alreadyExists", "failed", "cancelled"],
+		})
+			.notNull()
+			.default("pending"),
+		ruleId: text("rule_id"),
+		approvalSource: text("approval_source", { enum: ["user", "reflection"] }),
+		approvalUserId: text("approval_user_id"),
+		reflectionConclusion: text("reflection_conclusion"),
+		error: text("error"),
+		createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+		updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+	},
+	(table) => [
+		uniqueIndex("uq_permission_rule_request_attempt").on(table.toolCallId, table.attempt),
+		index("idx_permission_rule_request_narrator_created").on(
+			table.narratorId,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
+
+/** Durable resource inventory, retained even after its owning narrator is deleted. */
+export const narratorWorktreeResources = sqliteTable(
+	"narrator_worktree_resources",
+	{
+		id: text("id").primaryKey(),
+		ownerNarratorId: text("owner_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		/** Historical rows remain unknown; deletion of evidence never broadens this scope. */
+		scopeKind: text("scope_kind", { enum: ["unknown", "standalone", "project"] })
+			.notNull()
+			.default("unknown"),
+		scopeProjectId: text("scope_project_id").references(() => projects.id, {
+			onDelete: "set null",
+		}),
+		scopeOwnerUserId: text("scope_owner_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		ownershipRevision: integer("ownership_revision").notNull().default(0),
+		containerConfig: text("container_config", { mode: "json" }).$type<{
+			composeFile: string;
+			projectName?: string;
+			proxyDomain?: string;
+		}>(),
+		deviceId: text("device_id").notNull(),
+		repositoryKey: text("repository_key").notNull(),
+		/** Canonical backend path; never derive cleanup ownership from chapters alone. */
+		worktreePath: text("worktree_path").notNull(),
+		state: text("state", { enum: ["preparing", "ready", "unknown"] }).notNull(),
+		createRequestId: text("create_request_id").notNull(),
+		createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+		updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+	},
+	(table) => [
+		uniqueIndex("uq_narrator_worktree_resource_path").on(table.deviceId, table.worktreePath),
+		index("idx_narrator_worktree_resource_owner").on(table.ownerNarratorId),
+		index("idx_worktree_resource_scope_project").on(table.scopeProjectId),
+		index("idx_worktree_resource_scope_owner").on(table.scopeOwnerUserId),
+		check(
+			"ck_worktree_resource_scope_kind",
+			sql`${table.scopeKind} in ('unknown', 'standalone', 'project')`,
+		),
+		// Project SET NULL is intentional: project scope with missing evidence must deny, not downgrade.
+		check(
+			"ck_worktree_resource_scope_project",
+			sql`${table.scopeProjectId} is null or ${table.scopeKind} = 'project'`,
+		),
+		check("ck_worktree_resource_revision", sql`${table.ownershipRevision} >= 0`),
+		check(
+			"ck_worktree_resource_config_bytes",
+			sql`${table.containerConfig} is null or length(cast(${table.containerConfig} as blob)) <= 16384`,
+		),
+	],
+);
 
 // === projects ===
 export const projects = sqliteTable("projects", {
@@ -455,6 +563,11 @@ export const narrators = sqliteTable(
 	{
 		id: text("id").primaryKey(),
 		chapterId: text("chapter_id").references(() => chapters.id),
+		/** Creation provenance, never attached when a scheduled task reuses a session. */
+		scheduledTaskId: text("scheduled_task_id").references(
+			(): AnySQLiteColumn => scheduledTasks.id,
+			{ onDelete: "set null" },
+		),
 		apiConversationId: text("api_conversation_id"),
 		/** Durable logical run identity; recovery keeps it, a genuine new start replaces it. */
 		logicalRunId: text("logical_run_id"),
@@ -486,6 +599,16 @@ export const narrators = sqliteTable(
 		/** Explicit creation provenance; NULL means unknown legacy origin. */
 		subagentOriginKind: text("subagent_origin_kind", { enum: ["tool", "standalone"] }),
 		contextSummary: text("context_summary"),
+		contextSummaryChars: integer("context_summary_chars").notNull().default(0),
+		contextSystemChars: integer("context_system_chars").notNull().default(0),
+		contextToolsChars: integer("context_tools_chars").notNull().default(0),
+		contextCharRevision: integer("context_char_revision").notNull().default(0),
+		contextUsageSnapshotJson: text("context_usage_snapshot_json", {
+			mode: "json",
+		}).$type<ContextUsageSnapshot>(),
+		contextCharCacheJson: text("context_char_cache_json", {
+			mode: "json",
+		}).$type<ContextCharCache>(),
 		model: text("model").default("claude-sonnet-4.5"),
 		/** When set, the model should be restored to this value after the current turn completes.
 		 *  Used by temporary model override on slash commands. Cleared after restore. */
@@ -544,6 +667,7 @@ export const narrators = sqliteTable(
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
+		lastStopReason: text("last_stop_reason", { enum: ["user_interrupt", "error", "normal"] }),
 		status: text("status", {
 			enum: ["idle", "working", "waiting", "archived"],
 		})
@@ -553,6 +677,12 @@ export const narrators = sqliteTable(
 		substatus: text("substatus").notNull().default("[]"),
 		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
+		/** Monotonic CAS identity of the narrator's execution workspace (not layout workspace). */
+		workspaceRevision: integer("workspace_revision").notNull().default(0),
+		/** Prepared identity committed atomically with cwd; used to recover failed runtime installation. */
+		workspaceContext: text("workspace_context", { mode: "json" }).$type<
+			import("@shared/workspace-context").WorkspaceContext
+		>(),
 		errorMessage: text("error_message"),
 		/**
 		 * Whether the last failure is worth retrying, when the provider diagnostics said so.
@@ -761,6 +891,11 @@ export const narrators = sqliteTable(
 		// The consequence to know: a future code path that writes these columns without
 		// going through the service layer can create an illegal pair, and nothing will
 		// stop it. `narrator-access-nesting.test.ts` covers the paths that exist today.
+		index("idx_narrators_scheduled_task_created").on(
+			table.scheduledTaskId,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
@@ -1313,6 +1448,22 @@ export const specProtectedTasks = sqliteTable(
 );
 
 // === narrator_messages ===
+export const narratorContextCharPages = sqliteTable(
+	"narrator_context_char_pages",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		generation: text("generation").notNull(),
+		page: integer("page").notNull(),
+		segmentsJson: text("segments_json", { mode: "json" }).$type<ContextSegment[]>().notNull(),
+	},
+	(t) => [
+		uniqueIndex("context_char_pages_generation_page_idx").on(t.narratorId, t.generation, t.page),
+	],
+);
+
 export const narratorMessages = sqliteTable(
 	"narrator_messages",
 	{
@@ -1325,6 +1476,7 @@ export const narratorMessages = sqliteTable(
 		role: text("role", { enum: ["user", "assistant", "system", "sys", "disp"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),
 		contentText: text("content_text"),
+		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
 		/** Null marks an untouched historical record. */
@@ -1469,6 +1621,8 @@ export const narratorToolCalls = sqliteTable(
 		toolName: text("tool_name").notNull(),
 		inputJson: text("input_json", { mode: "json" }),
 		outputJson: text("output_json", { mode: "json" }),
+		inputChars: integer("input_chars").notNull().default(0),
+		outputChars: integer("output_chars").notNull().default(0),
 		/**
 		 * Actual execution target frozen before permission/execution.
 		 * "local" means the NarraFork server; a remote value is remote_devices.id.
@@ -1597,6 +1751,17 @@ export const narratorToolCalls = sqliteTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		// Numeric context keyset paging must not sort the entire message on every batch.
+		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
+		// Latest attempts are scoped to the canonical message, not its current fork holder.
+		index("idx_toolcalls_context_latest").on(
+			table.messageId,
+			table.toolUseId,
+			table.executionAttempt,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
 		index("idx_toolcalls_execution_device").on(table.executionDeviceId, table.createdAt),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
@@ -1662,6 +1827,23 @@ export const narratorQuestions = sqliteTable(
 		toolUseId: text("tool_use_id").notNull(),
 		/** Question definitions, same shape as AskUserQuestion's `questions` input. */
 		questionsJson: text("questions_json", { mode: "json" }).notNull(),
+		context: text("context"),
+		resolutionJson: text("resolution_json", { mode: "json" }).$type<{
+			answerMessageId: string;
+			note: string;
+			resolvedAt: string;
+			actor: string;
+		}>(),
+		withdrawReason: text("withdraw_reason"),
+		/** Small frozen display projection; list APIs never load the snapshot. */
+		summaryJson: text("summary_json", { mode: "json" }).$type<
+			{
+				id: string;
+				header: string;
+				description?: string;
+				options?: { header: string; description?: string }[];
+			}[]
+		>(),
 		/** Trusted execution principal at creation; NULL means unknown legacy provenance. */
 		executionPrincipalJson: text("execution_principal_json", { mode: "json" }).$type<{
 			version: 1;
@@ -1691,6 +1873,37 @@ export const narratorQuestions = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_narrator_questions_tool_call").on(table.toolCallId),
 		index("idx_narrator_questions_narrator_status").on(table.narratorId, table.status),
+		index("idx_narrator_questions_answer_message").on(table.answerMessageId),
+		index("idx_narrator_questions_created").on(table.createdAt, table.id),
+	],
+);
+
+// Structured question/message association survives compact boundaries without scanning content JSON.
+export const narratorQuestionEvents = sqliteTable(
+	"narrator_question_events",
+	{
+		questionId: text("question_id")
+			.notNull()
+			.references(() => narratorQuestions.id, { onDelete: "cascade" }),
+		messageId: text("message_id")
+			.primaryKey()
+			.references(() => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["answer", "dismissal", "supplement"] }).notNull(),
+		resolutionJson: text("resolution_json", { mode: "json" }).$type<{
+			answerMessageId: string;
+			note: string;
+			resolvedAt: string;
+			actor: string;
+		}>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_question_events_question_rowid").on(table.questionId),
+		index("idx_question_events_question_created").on(
+			table.questionId,
+			table.createdAt,
+			table.messageId,
+		),
 	],
 );
 
@@ -1753,6 +1966,10 @@ export const terminals = sqliteTable(
 		 */
 		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		name: text("name").notNull(),
 		cwd: text("cwd"),
 		dtachSocket: text("dtach_socket"),
@@ -1781,6 +1998,11 @@ export const terminals = sqliteTable(
 		index("idx_terminals_chapter").on(table.chapterId, table.status, table.graphOpened),
 		index("idx_terminals_narrator").on(table.narratorId),
 		index("idx_terminals_status").on(table.status),
+		index("idx_terminals_resource_status").on(table.worktreeResourceId, table.status, table.id),
+		check(
+			"ck_terminals_resource_owner",
+			sql`${table.worktreeResourceId} is null or (${table.chapterId} is null and ${table.narratorId} is null)`,
+		),
 	],
 );
 
@@ -1811,6 +2033,10 @@ export const terminalViewState = sqliteTable(
 			.references(() => users.id, { onDelete: "cascade" }),
 		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		layout: text("layout", {
 			enum: ["single", "split-h", "split-v", "triple", "quad"],
 		})
@@ -1829,6 +2055,12 @@ export const terminalViewState = sqliteTable(
 		// chapter-service / narrator-service / projects routes, which would otherwise scan.
 		index("idx_view_state_chapter").on(table.chapterId),
 		index("idx_view_state_narrator").on(table.narratorId),
+		uniqueIndex("idx_view_state_user_resource").on(table.userId, table.worktreeResourceId),
+		index("idx_view_state_resource").on(table.worktreeResourceId),
+		check(
+			"ck_view_state_resource_owner",
+			sql`${table.worktreeResourceId} is null or (${table.chapterId} is null and ${table.narratorId} is null)`,
+		),
 	],
 );
 
@@ -1837,10 +2069,12 @@ export const containerInstances = sqliteTable(
 	"container_instances",
 	{
 		id: text("id").primaryKey(),
-		/** Cascaded for the same reason as `terminals.chapterId`; see there. */
-		chapterId: text("chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
+		/** Legacy chapters still cascade; new resource-domain containers are independent. */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		containerId: text("container_id"),
 		serviceName: text("service_name").notNull(),
 		status: text("status", {
@@ -1861,6 +2095,15 @@ export const containerInstances = sqliteTable(
 		index("idx_container_instances_chapter_service").on(table.chapterId, table.serviceName),
 		index("idx_container_instances_container").on(table.containerId),
 		index("idx_container_instances_status").on(table.chapterId, table.status),
+		index("idx_container_instances_resource_service_status").on(
+			table.worktreeResourceId,
+			table.serviceName,
+			table.status,
+		),
+		check(
+			"ck_container_instances_owner",
+			sql`(${table.chapterId} is null) <> (${table.worktreeResourceId} is null)`,
+		),
 	],
 );
 
@@ -1876,11 +2119,22 @@ export const portAllocations = sqliteTable(
 		 * successfully while leaving a row that then refused the chapter's deletion.
 		 */
 		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		serviceName: text("service_name"),
 		allocatedAt: text("allocated_at").notNull(),
 	},
 	// FK covering index for chapter deletion.
-	(table) => [index("idx_port_allocations_chapter").on(table.chapterId)],
+	(table) => [
+		index("idx_port_allocations_chapter").on(table.chapterId),
+		index("idx_port_allocations_resource").on(table.worktreeResourceId),
+		check(
+			"ck_port_allocations_owner",
+			sql`${table.chapterId} is null or ${table.worktreeResourceId} is null`,
+		),
+	],
 );
 
 // === user_preferences ===
@@ -1891,6 +2145,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	fastModeDefault: integer("fast_mode_default", { mode: "boolean" }).notNull().default(false),
+	/** Explicit user override for server-desktop file manager menus. */
+	treatAsLocalAccess: integer("treat_as_local_access", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	language: text("language").$type<Locale>().notNull().default(DEFAULT_LOCALE),
 	wordWrapMarkdown: integer("word_wrap_markdown", { mode: "boolean" }).notNull().default(true),
 	wordWrapCode: integer("word_wrap_code", { mode: "boolean" }).notNull().default(true),
@@ -2933,6 +3191,11 @@ export const volumeSnapshots = sqliteTable(
 		sourceChapterId: text("source_chapter_id").references(() => chapters.id, {
 			onDelete: "set null",
 		}),
+		// Provenance only: the existing non-null project FK and its cascade remain unchanged.
+		sourceWorktreeResourceId: text("source_worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		serviceName: text("service_name").notNull(),
 		containerPath: text("container_path").notNull(),
 		sizeBytes: integer("size_bytes"),
@@ -2943,6 +3206,7 @@ export const volumeSnapshots = sqliteTable(
 	(table) => [
 		index("idx_volume_snapshots_project").on(table.projectId),
 		index("idx_volume_snapshots_source_chapter").on(table.sourceChapterId),
+		index("idx_volume_snapshots_source_resource").on(table.sourceWorktreeResourceId),
 	],
 );
 
@@ -2954,15 +3218,22 @@ export const volumeSnapshotApplications = sqliteTable(
 		snapshotId: text("snapshot_id")
 			.notNull()
 			.references(() => volumeSnapshots.id, { onDelete: "cascade" }),
-		chapterId: text("chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		targetWorktreeResourceId: text("target_worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		appliedAt: text("applied_at").notNull(),
 		appliedBy: text("applied_by").references(() => users.id, { onDelete: "set null" }),
 	},
 	(table) => [
 		index("idx_snapshot_applications_snapshot").on(table.snapshotId),
 		index("idx_snapshot_applications_chapter").on(table.chapterId),
+		index("idx_snapshot_applications_target_resource").on(table.targetWorktreeResourceId),
+		check(
+			"ck_snapshot_applications_owner",
+			sql`(${table.chapterId} is null) <> (${table.targetWorktreeResourceId} is null)`,
+		),
 	],
 );
 
@@ -3146,6 +3417,10 @@ export const apiRequests = sqliteTable(
 		/** Null marks an untouched historical record. */
 		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
 		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
+		// Occupancy snapshot is separate from billable counters. Old records remain null.
+		contextUsageSnapshotJson: text("context_usage_snapshot_json", {
+			mode: "json",
+		}).$type<ContextUsageSnapshot>(),
 		// 上下文使用率
 		contextPercent: real("context_percent"),
 		// Metering（NUG）
@@ -3371,6 +3646,34 @@ export const runtimePublicationOutbox = sqliteTable(
 		),
 		index("idx_runtime_outbox_recipient").on(table.recipientId),
 		index("idx_runtime_outbox_state").on(table.state, table.id),
+	],
+);
+
+/** Await is a durable terminal-consumption authority, independent of mailbox GC and task cleanup.
+ * No task FK: agent task ids may be reused for later logical runs. Recipient deletion is
+ * the only safe lifetime boundary (late publishers then have no recipient to notify).
+ */
+export const runtimeAwaitedTerminalConsumptions = sqliteTable(
+	"runtime_awaited_terminal_consumptions",
+	{
+		producerKind: text("producer_kind", { enum: ["agent", "bash"] }).notNull(),
+		taskId: text("task_id").notNull(),
+		logicalRunId: text("logical_run_id").notNull(),
+		recipientId: text("recipient_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		consumedAt: text("consumed_at").notNull(),
+		/** Exact source already read by Await; never recomputed from a later actor run. Max 512B. */
+		sourceResultRef: text("source_result_ref"),
+	},
+	(table) => [
+		uniqueIndex("idx_runtime_awaited_terminal_run").on(
+			table.producerKind,
+			table.taskId,
+			table.logicalRunId,
+			table.recipientId,
+		),
+		index("idx_runtime_awaited_terminal_recipient").on(table.recipientId),
 	],
 );
 
@@ -3950,6 +4253,7 @@ export const fileChangeExecutionSegments = sqliteTable(
 		index("idx_fc_segment_source").on(table.sourceToolCallId, table.sourceExecutionAttempt),
 		index("idx_fc_segment_parent").on(table.parentSegmentId),
 		index("idx_fc_segment_narrator").on(table.narratorId),
+		index("idx_fc_segment_input").on(table.narratorId, table.sourceInputId),
 	],
 );
 
@@ -4956,6 +5260,11 @@ export const scheduledTasks = sqliteTable(
 		narratorMode: text("narrator_mode", { enum: ["new", "reuse"] })
 			.notNull()
 			.default("new"),
+		/** Opt-in, task-scoped destructive retention. Existing tasks remain unchanged. */
+		cleanupPolicy: text("cleanup_policy", { mode: "json" })
+			.$type<ScheduledTaskCleanupPolicy>()
+			.notNull()
+			.default({ mode: "none" }),
 		// reuse mode: the narrator remembered across runs.
 		reuseNarratorId: text("reuse_narrator_id").references(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narrators
@@ -4980,6 +5289,7 @@ export const scheduledTasks = sqliteTable(
 		// FK covering indexes for user / narrator / chapter deletion.
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
 		index("idx_scheduled_tasks_chapter").on(table.chapterId),
 	],
 );

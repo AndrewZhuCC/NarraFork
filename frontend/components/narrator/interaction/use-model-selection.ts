@@ -75,6 +75,7 @@ const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] 
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
 	// GPT-6 Astra requires reasoning, so it intentionally omits `none`.
 	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+	"gpt-6.1-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -136,7 +137,7 @@ function hasGatewayReportedEffortLevels(modelOption?: ModelOption): boolean {
 /**
  * Map a gateway-reported effort list onto the UI's unified enum.
  *
- * Applies to every NUG channel type, not just kiro: the gateway reports the real
+ * Applies to every NUG channel type: the gateway reports the real
  * per-model tiers for all of them, and that beats guessing from the model id.
  * Relay ids in particular (k3, GLM-5.1, MiniMax-M2) match no vendor naming rule,
  * so id-based inference produced no menu at all for models that do accept the
@@ -176,10 +177,9 @@ function getGatewayReportedEffortOptions(
  *
  * Kept as an explicit list mirroring the delegate switch in
  * server/lib/agent/nug-provider.ts (createDelegate). Channels absent from it
- * fall through that switch to the kiro native path, which carries the effort as
- * an `X-Kiro-Effort` header and only forwards hints it recognizes (low..max) —
- * so "none" is dropped in transit and a menu entry for it would promise a
- * control that does nothing.
+ * fall through to a native delegate that only forwards effort hints it
+ * recognizes (low..max) — so "none" is dropped in transit and a menu entry
+ * for it would promise a control that does nothing.
  *
  * The delegates listed here do implement it: the Anthropic delegate maps "none"
  * to `thinking: { type: "disabled" }`, and the Codex/Responses path returns

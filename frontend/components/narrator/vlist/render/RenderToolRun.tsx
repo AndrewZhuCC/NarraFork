@@ -51,7 +51,7 @@ import {
 	IconDots,
 	IconTool,
 } from "@tabler/icons-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
@@ -76,12 +76,19 @@ import {
 	type TraceVariant,
 	traceMetrics,
 } from "../measure/measure-tool-run";
+import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
+import {
+	applyTraceUnknownHeights,
+	isExpandedUnknownTraceBody,
+	retainTraceUnknownHeights,
+	type TraceUnknownBodyHeights,
+} from "../vlist-trace-unknown-heights";
 import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
-import { RenderMarkdown } from "./RenderMarkdown";
+import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import {
 	isTerminalToolRowStatus,
@@ -145,6 +152,8 @@ export interface TraceRenderLabels {
 	 * into a line that had given no sign it was about to hold anything.
 	 */
 	reasoningPending?: string;
+	/** A finished reasoning row whose provider supplied no visible summary. */
+	reasoningEmpty?: string;
 	/**
 	 * Timing popover strings for the per-row duration slot. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover, fixed rows).
@@ -237,6 +246,10 @@ export type TraceRowLiveTails = ReadonlyMap<string, { charCount: number; tail: s
 export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
 
 interface RenderToolRunProps {
+	/** Controlled correction for fully expanded unpredictable markdown, including trace chrome. */
+	onUnknownHeight?: (height: number) => void;
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredCollapsibleTrace;
 	labels?: TraceRenderLabels;
 	/** Row icon slot injected by the caller (keeps @tabler category icons out of
@@ -307,7 +320,82 @@ interface RenderToolRunProps {
  * height; the header band, toggle row, and item rows (+ expanded bodies) are
  * absolutely positioned at their measured tops.
  */
-export function RenderToolRun({
+export function RenderToolRun(props: RenderToolRunProps) {
+	// Keep this dispatcher hook-free: ordinary traces are also rendered directly
+	// by pure callers. Only this controlled exception mounts a stateful boundary.
+	return props.measured.rows.some(isExpandedUnknownTraceBody) ? (
+		<UnknownHeightTrace {...props} />
+	) : (
+		RenderMeasuredToolRun(props)
+	);
+}
+
+function UnknownHeightTrace(props: RenderToolRunProps) {
+	const [heights, setHeights] = useState<TraceUnknownBodyHeights>(() => new Map());
+	const committedRef = useRef(props.measured);
+	const observingRef = useRef(true);
+	const callbackCache = useRef(
+		new Map<string, { body: MeasuredElement; report: (height: number) => void }>(),
+	);
+	useLayoutEffect(() => {
+		observingRef.current = true;
+		committedRef.current = props.measured;
+		setHeights((previous) => retainTraceUnknownHeights(props.measured, previous));
+		return () => {
+			observingRef.current = false;
+		};
+	}, [props.measured]);
+	const report = useCallback((key: string, body: MeasuredElement, height: number) => {
+		if (!observingRef.current) return;
+		const current = committedRef.current;
+		const row = current.rows.find((candidate) => candidate.key === key);
+		if (
+			row?.body !== body ||
+			!isExpandedUnknownTraceBody(row) ||
+			!Number.isFinite(height) ||
+			height <= 0
+		)
+			return;
+		const rounded = Math.round(height);
+		setHeights((previous) => {
+			const retained = retainTraceUnknownHeights(current, previous);
+			const old = retained.get(key);
+			if (Math.abs((old?.height ?? body.frame.contentHeight) - rounded) <= 1) return retained;
+			const next = new Map(retained);
+			next.set(key, { originalBodyRef: body, height: rounded });
+			return next;
+		});
+	}, []);
+	const reporters = useMemo(() => {
+		const next = new Map<string, (height: number) => void>();
+		const active = new Set<string>();
+		for (const row of props.measured.rows) {
+			if (!isExpandedUnknownTraceBody(row) || !row.body) continue;
+			const body = row.body;
+			active.add(row.key);
+			let cached = callbackCache.current.get(row.key);
+			if (cached?.body !== body) {
+				cached = { body, report: (height) => report(row.key, body, height) };
+				callbackCache.current.set(row.key, cached);
+			}
+			next.set(row.key, cached.report);
+		}
+		for (const key of callbackCache.current.keys()) {
+			if (!active.has(key)) callbackCache.current.delete(key);
+		}
+		return next;
+	}, [props.measured, report]);
+	const measured = useMemo(
+		() => applyTraceUnknownHeights(props.measured, heights),
+		[props.measured, heights],
+	);
+	useLayoutEffect(() => {
+		props.onUnknownHeight?.(measured.height);
+	}, [measured.height, props.onUnknownHeight]);
+	return RenderMeasuredToolRun({ ...props, measured, bodyHeightReporters: reporters });
+}
+
+function RenderMeasuredToolRun({
 	measured,
 	labels = {},
 	rowIcon,
@@ -321,7 +409,10 @@ export function RenderToolRun({
 	animateStreaming,
 	animKeyBase,
 	animScope,
-}: RenderToolRunProps) {
+	textPreviewLabels,
+	onToggleTextExpanded,
+	bodyHeightReporters,
+}: RenderToolRunProps & { bodyHeightReporters?: ReadonlyMap<string, (height: number) => void> }) {
 	if (measured.itemCount === 0) return null;
 	const { header, toggle, rows, variant } = measured;
 	const headerColor = variantHeaderColor(variant);
@@ -418,6 +509,9 @@ export function RenderToolRun({
 				<TraceRowView
 					key={row.key}
 					row={row}
+					onBodyUnknownHeight={bodyHeightReporters?.get(row.key)}
+					textPreviewLabels={textPreviewLabels}
+					onToggleTextExpanded={onToggleTextExpanded}
 					rowIcon={rowIcon}
 					onToggleRow={onToggleRow}
 					rowInteraction={rowInteraction}
@@ -429,6 +523,7 @@ export function RenderToolRun({
 					liveTail={rowLiveTails?.get(row.key)}
 					liveTailChars={labels.liveTailChars}
 					reasoningPending={labels.reasoningPending}
+					reasoningEmpty={labels.reasoningEmpty}
 					// Only the row still being written may fade. `row.shimmer` is the
 					// adapter's own live marker, so a run that the answer text or a tool
 					// call already followed settles here too — the same moment its shimmer
@@ -722,8 +817,16 @@ function LiveTailText({
 		<>
 			{/* The size readout. `flexShrink: 0` keeps it intact while the tail absorbs
 			    the width pressure — it is the one part of the label that must never be
-			    clipped, since it is what tells the reader the run is still growing. */}
-			<Text size="xs" c="dimmed" className={fade} style={{ flexShrink: 0, opacity: 0.6 }}>
+			    clipped, since it is what tells the reader the run is still growing.
+			    Monospace keeps digit advances equal so a growing count does not shove
+			    the tail on every digit-width change (streaming jitter). */}
+			<Text
+				size="xs"
+				c="dimmed"
+				ff="monospace"
+				className={fade}
+				style={{ flexShrink: 0, opacity: 0.6 }}
+			>
 				{prefix}…
 			</Text>
 			<Text
@@ -778,10 +881,17 @@ function TraceRowView({
 	liveTail,
 	liveTailChars,
 	reasoningPending,
+	reasoningEmpty,
 	animateStreaming,
 	animKeyBase,
 	animScope,
+	textPreviewLabels,
+	onToggleTextExpanded,
+	onBodyUnknownHeight,
 }: {
+	onBodyUnknownHeight?: (height: number) => void;
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number, rowKey: string) => void;
@@ -796,6 +906,8 @@ function TraceRowView({
 	liveTailChars?: (formatted: string) => string;
 	/** Placeholder label for a live reasoning row with no text yet. */
 	reasoningPending?: string;
+	/** Finished reasoning without a visible summary. */
+	reasoningEmpty?: string;
 	/** This row is the live one AND the fade is enabled (see RenderToolRunProps). */
 	animateStreaming?: boolean;
 	animKeyBase?: string;
@@ -851,6 +963,14 @@ function TraceRowView({
 		: row.shimmer && !row.title.trim() && row.status == null
 			? "pending"
 			: "title";
+	// Empty summaries are legitimate (e.g. encrypted Codex reasoning). Keep the
+	// live indicator distinct from a finished row; never animate settled history.
+	const displayRow =
+		labelForm === "pending"
+			? { ...row, title: reasoningPending ?? "Thinking" }
+			: row.status == null && row.iconColor === "grape" && !row.title.trim()
+				? { ...row, title: reasoningEmpty ?? "Thought complete (no visible summary)" }
+				: row;
 	const fadeLabel = useLabelFormFade(labelForm);
 	const interactive = !!row.identity && !!rowInteraction;
 	// A row the SYSTEM drilled open for a live permission form cannot be folded by the
@@ -889,7 +1009,7 @@ function TraceRowView({
 			aria-expanded={togglable ? row.expanded : undefined}
 			// The shimmer's five states are carried by colour alone; this is the only
 			// channel a non-visual reader has for them.
-			aria-label={shimmerLabel ? `${row.title || "…"} — ${shimmerLabel}` : undefined}
+			aria-label={shimmerLabel ? `${displayRow.title || "…"} — ${shimmerLabel}` : undefined}
 			title={shimmerLabel}
 			style={{
 				height: traceMetrics().rowHeight,
@@ -947,13 +1067,14 @@ function TraceRowView({
 					fadeIn={fadeLabel}
 				/>
 			) : labelForm === "pending" ? (
-				<TraceRowTitle
-					key="pending"
-					row={{ ...row, title: reasoningPending ?? "…" }}
-					shimmerClass={shimmerClass}
-				/>
+				<TraceRowTitle key="pending" row={displayRow} shimmerClass={shimmerClass} />
 			) : (
-				<TraceRowTitle key="title" row={row} shimmerClass={shimmerClass} fadeIn={fadeLabel} />
+				<TraceRowTitle
+					key="title"
+					row={displayRow}
+					shimmerClass={shimmerClass}
+					fadeIn={fadeLabel}
+				/>
 			)}
 			{/* Status + duration, adjacent to the label rather than right-aligned: in a
 			    column of rows a far-right number has to be traced back across the gap to
@@ -1059,8 +1180,12 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
-					<RenderMarkdown
+					<RenderTextPreview
+						textPreviewLabels={textPreviewLabels}
+						onToggleTextExpanded={onToggleTextExpanded}
+						bodyKey={row.key ?? String(row.itemIndex)}
 						measured={row.body}
+						onUnknownHeight={onBodyUnknownHeight}
 						animateStreaming={animateStreaming}
 						sealOnMount
 						animKeyBase={animKeyBase}

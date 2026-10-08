@@ -8,9 +8,23 @@ import {
 	usesCodexModel,
 } from "../settings";
 import type { NarraForkSettings } from "../settings/types";
+import { getSearchExecutionScope, matchesSearchExecutionScope } from "./execution-scope";
 import { getNormalizedSearchChannels, SEARCH_NATIVE_CHANNEL_ID } from "./settings";
 
-export function isNativeSearchChannelFirstEnabled(config: NarraForkSettings = settings): boolean {
+export function isNativeSearchChannelFirstEnabled(
+	config: NarraForkSettings = settings,
+	provider?: string,
+	model?: string,
+): boolean {
+	const scope = getSearchExecutionScope();
+	if (scope) {
+		const selectedProvider = provider ?? scope.provider;
+		const selectedModel = model ?? scope.model;
+		return (
+			matchesSearchExecutionScope(selectedProvider, selectedModel) &&
+			supportsNativeSearch(selectedProvider, selectedModel)
+		);
+	}
 	const firstEnabled = getNormalizedSearchChannels(config).find((channel) => channel.enabled);
 	return firstEnabled?.id === SEARCH_NATIVE_CHANNEL_ID;
 }
@@ -113,5 +127,8 @@ export function supportsNativeSearch(provider: string, model: string): boolean {
  * request.
  */
 export function shouldUseNativeSearch(provider: string, model: string): boolean {
-	return isNativeSearchChannelFirstEnabled() && usesInlineNativeSearch(provider, model);
+	return (
+		isNativeSearchChannelFirstEnabled(settings, provider, model) &&
+		usesInlineNativeSearch(provider, model)
+	);
 }

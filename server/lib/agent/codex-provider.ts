@@ -1,3 +1,5 @@
+import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
 // Wraps OpenAIProvider with dynamic credential selection
 // Supports both HTTP (default) and Responses WebSocket modes
@@ -633,6 +635,7 @@ export class CodexProvider implements ProviderAdapter {
 				const request = this.buildResponsesWebSocketRequest(params);
 				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
 
+				await reportInputCharacters(params, request);
 				params.onRequestStart?.({ credentialId: ctx.id, codexTools: request.tools as unknown[] });
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
@@ -891,11 +894,13 @@ export class CodexProvider implements ProviderAdapter {
 			store: false,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
+		if (!instructions) markRuntimeInstructions(request);
 		const tools =
 			params.reflectionParentTools ?? (Array.isArray(params.tools) ? [...params.tools] : []);
 		if (!params.reflectionParentTools) {
 			appendCodexNativeTools(tools, params.model, {
-				webSearch: this.useWebSearch && isNativeSearchChannelFirstEnabled(),
+				webSearch:
+					this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
 				imageGeneration: this.useImageGeneration,
 			});
 		}

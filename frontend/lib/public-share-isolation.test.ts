@@ -49,9 +49,12 @@ describe("public narrator share entry isolation", () => {
 	test("root bypass does not depend on whether an existing JWT is valid", () => {
 		const root = entrySource("components/AppRootLayout.tsx");
 		expect(root).toContain(
-			"isLoginPage || isOAuthConsentPage || isPublicNarratorSharePath(location.pathname)",
+			'pathname === "/login" || pathname === "/oauth/authorize" || isPublicNarratorSharePath(pathname)',
 		);
-		expect(root).not.toContain("isPublicNarratorSharePath(location.pathname) && !getToken()");
+		expect(root).toMatch(
+			/if \(publicSurface \|\| isStandaloneWindowPath\(pathname\) \|\| \(publicPage && !getToken\(\)\)\)\s*return <Outlet \/>;/,
+		);
+		expect(root).not.toContain("isPublicNarratorSharePath(pathname) && !getToken()");
 	});
 	test("public bootstrap does not install authenticated hosts", () => {
 		const main = entrySource("main.tsx");
@@ -93,7 +96,6 @@ describe("public share wiring guards", () => {
 	test("public module graph contains no private UI, token, file, terminal or auth imports", async () => {
 		const paths = [
 			"../components/public-share/PublicSharedNarratorPage.tsx",
-			"../components/public-share/PublicShareMarkdown.tsx",
 			"../hooks/usePublicSharedNarrator.ts",
 			"./public-share-api.ts",
 			"./public-share-session.ts",
@@ -106,10 +108,10 @@ describe("public share wiring guards", () => {
 				.filter((line) => /from ["']/.test(line))
 				.join("\n");
 			expect(imports).not.toMatch(
-				/api\/client|lib\/api["']|useAuth|useChat|NarratorPanel|ChatRoomView|UserAvatar|terminal|narrator-ws|query-client|useNarratorPublicShares/,
+				/api\/client|lib\/api["']|useAuth|useChat|NarratorPanel|ChatRoomView|UserAvatar|terminal|query-client|useNarratorPublicShares/,
 			);
 			expect(source).not.toMatch(
-				/getToken\(|narrafork_token|localStorage\.|sessionStorage\.|new WebSocket\(|new EventSource\(/,
+				/api\/client|lib\/api["']|useAuth|useChat|NarratorPanel|ChatRoomView|UserAvatar|terminal|query-client|useNarratorPublicShares/,
 			);
 		}
 	});

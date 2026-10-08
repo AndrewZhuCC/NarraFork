@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -11,6 +12,26 @@ import (
 	"syscall"
 	"time"
 )
+
+// Serializes executor-managed mutations, including ordinary writes and transfer commits.
+// External editors/processes do not participate; this is NOT an OS-level CAS.
+var fileMutationGate = make(chan struct{}, 1)
+
+func acquireFileMutation(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case fileMutationGate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-fileMutationGate
+			return nil, err
+		}
+		return func() { <-fileMutationGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // FsStat returns existence + type + size for a path.
 func (h *Handlers) FsStat(params map[string]any) (any, error) {
@@ -173,6 +194,16 @@ func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) 
 		}
 		return ctx.Err()
 	}
+	offset := intParam(params, "offset", 0)
+	if raw, exists := params["offset"]; exists {
+		n, ok := raw.(float64)
+		if !ok || n < 0 || n > 9007199254740991 || float64(offset) != n {
+			return nil, fmt.Errorf("invalid read offset")
+		}
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
 	buf, probeTruncated, err := readFileChunks(ctx, f, maxBytes, check)
 	if err != nil {
 		return nil, err
@@ -209,7 +240,7 @@ func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) 
 	}
 	return map[string]any{
 		"dataB64":      base64.StdEncoding.EncodeToString(buf),
-		"truncated":    probeTruncated || totalSize > int64(len(buf)),
+		"truncated":    probeTruncated || totalSize > offset+int64(len(buf)),
 		"totalSize":    totalSize,
 		"resolvedPath": resolvedPath,
 	}, nil
@@ -255,6 +286,15 @@ func readFileChunks(ctx context.Context, reader io.Reader, maxBytes int64, check
 // expectedResolvedPath is present, the lexical path must still resolve to the
 // previously authorized canonical create/existing identity.
 func (h *Handlers) FsWrite(params map[string]any) (any, error) {
+	return h.FsWriteContext(context.Background(), params)
+}
+
+func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (any, error) {
+	release, err := acquireFileMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	rawPath, err := requiredPathParam(params, "path")
 	if err != nil {
 		return nil, err
@@ -290,7 +330,13 @@ func (h *Handlers) FsWrite(params map[string]any) (any, error) {
 	if int64(len(data)) > h.maxRpcBytes {
 		return nil, fmt.Errorf("write exceeds max RPC bytes (%d)", h.maxRpcBytes)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
@@ -299,8 +345,210 @@ func (h *Handlers) FsWrite(params map[string]any) (any, error) {
 	return map[string]any{}, nil
 }
 
+// FsWriteConditional checks content and canonical identity before a platform-native
+// replacement. Windows additionally verifies merged permissions and keeps recovery
+// material if a native replacement cannot be safely rolled back.
+// Rechecks reduce external races but cannot exclude an external writer between the
+// final check and rename. Never advertised as OS CAS. Cancellation after rename
+// may lose the reply; callers must not retry automatically.
+func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any) (any, error) {
+	const limit = 2000000
+	timeoutMs := intParam(params, "timeoutMs", 30000)
+	if timeoutMs <= 0 || timeoutMs > 30000 {
+		return nil, fmt.Errorf("invalid conditional write timeout")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+	release, err := acquireFileMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	decode := func(key string) ([]byte, error) {
+		raw, ok := params[key].(string)
+		if !ok || len(raw) > base64.StdEncoding.EncodedLen(limit) {
+			return nil, fmt.Errorf("invalid or oversized %s", key)
+		}
+		data, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(data) > limit || int64(len(data)) > h.maxRpcBytes {
+			return nil, fmt.Errorf("invalid or oversized %s", key)
+		}
+		return data, nil
+	}
+	data, err := decode("dataB64")
+	if err != nil {
+		return nil, err
+	}
+	var expected []byte
+	expectedMissing := params["expectedDataB64"] == nil
+	if _, present := params["expectedDataB64"]; !present {
+		return nil, fmt.Errorf("expectedDataB64 required")
+	}
+	if !expectedMissing {
+		expected, err = decode("expectedDataB64")
+		if err != nil {
+			return nil, err
+		}
+	}
+	raw, err := requiredPathParam(params, "path")
+	if err != nil {
+		return nil, err
+	}
+	expectedPath, err := requiredPathParam(params, "expectedResolvedPath")
+	if err != nil {
+		return nil, err
+	}
+	expectedPath, err = absolutePath(expectedPath)
+	if err != nil {
+		return nil, err
+	}
+	path, err := h.guard.CheckCreate(raw)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(path, expectedPath) {
+		return map[string]any{"applied": false, "conflict": true}, nil
+	}
+	var originalMetadata conditionalMetadata
+	var originalInfo os.FileInfo
+	conflict := func() (bool, os.FileMode, error) {
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
+		resolved, err := h.guard.CheckCreate(raw)
+		if err != nil {
+			return false, 0, err
+		}
+		if !samePath(resolved, expectedPath) {
+			return true, 0, nil
+		}
+		f, _, err := h.openReadFile(params)
+		if errors.Is(err, os.ErrNotExist) {
+			return !expectedMissing || originalInfo != nil, 0o644, nil
+		}
+		if err != nil {
+			return false, 0, err
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return false, 0, err
+		}
+		if !info.Mode().IsRegular() {
+			return false, 0, fmt.Errorf("conditional write requires regular file")
+		}
+		if expectedMissing || info.Size() > limit {
+			return true, info.Mode(), nil
+		}
+		observed, err := io.ReadAll(io.LimitReader(f, limit+1))
+		if err != nil {
+			return false, 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
+		if !bytes.Equal(observed, expected) {
+			return true, 0, nil
+		}
+		if originalInfo != nil {
+			if !os.SameFile(originalInfo, info) {
+				return true, 0, nil
+			}
+			if err := originalMetadata.matches(f); err != nil {
+				if errors.Is(err, errConditionalMetadataChanged) {
+					return true, 0, nil
+				}
+				return false, 0, err
+			}
+		} else {
+			originalMetadata, err = captureConditionalMetadata(f, ctx)
+			if err != nil {
+				if errors.Is(err, errConditionalMetadataChanged) {
+					return true, 0, nil
+				}
+				return false, 0, err
+			}
+			originalInfo = info
+		}
+		return false, info.Mode().Perm(), nil
+	}
+	changed, mode, err := conflict()
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		return map[string]any{"applied": false, "conflict": true}, nil
+	}
+	// Parent must already exist; implicit mkdir could alter authorization identity.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".nf-conditional-*")
+	if err != nil {
+		return nil, err
+	}
+	var tmpInfo os.FileInfo
+	defer func() {
+		// Windows CreateTemp does not share DELETE. Close before opening the
+		// identity-bound cleanup handle, including on pre-commit failures.
+		tmp.Close()
+		if tmpInfo != nil {
+			// Native commit can consume the pathname; preserve any new occupant.
+			removeConditionalTemporary(tmp.Name(), tmpInfo)
+		}
+	}()
+	tmpInfo, err = tmp.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot bind temporary identity; retained %q: %w", tmp.Name(), err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return nil, err
+	}
+	// Apply metadata only after writing: chown/writes can clear special bits and
+	// security attributes. Unsupported preservation fails before touching path.
+	if originalMetadata != nil {
+		if err := originalMetadata.apply(tmp); err != nil {
+			return nil, err
+		}
+	} else if err := tmp.Chmod(mode); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	changed, _, err = conflict()
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		return map[string]any{"applied": false, "conflict": true}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := commitConditionalReplacement(ctx, path, tmp.Name(), originalInfo, originalMetadata, data); err != nil {
+		if errors.Is(err, errConditionalMetadataChanged) {
+			return map[string]any{"applied": false, "conflict": true}, nil
+		}
+		return nil, err
+	}
+	return map[string]any{"applied": true}, nil
+}
+
 // FsRemove removes one file. Missing paths are a no-op; directories are rejected.
 func (h *Handlers) FsRemove(params map[string]any) (any, error) {
+	return h.FsRemoveContext(context.Background(), params)
+}
+
+func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (any, error) {
+	release, err := acquireFileMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	rawPath, err := requiredPathParam(params, "path")
 	if err != nil {
 		return nil, err
@@ -318,6 +566,9 @@ func (h *Handlers) FsRemove(params map[string]any) (any, error) {
 	}
 	if info.IsDir() {
 		return nil, fmt.Errorf("refusing to remove directory %q", path)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := os.Remove(path); err != nil {
 		return nil, err

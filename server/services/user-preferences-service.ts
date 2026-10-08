@@ -1,4 +1,4 @@
-import { and, count as countFn, eq, inArray } from "drizzle-orm";
+import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, terminals } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
@@ -86,6 +86,17 @@ export async function enrichTabs(
 			}
 		}
 
+		// Active background task counts (subagents + bash + transfers). Lazy import
+		// matches the narrators route: the service pulls in half the agent runtime.
+		const { backgroundTaskService } = await import("./background-task-service");
+		const bgTaskCountMap = await backgroundTaskService.countActiveByParentBatch(narratorIds);
+		for (const tab of tabs) {
+			const nId = getTabNarratorId(tab);
+			if (nId && bgTaskCountMap.has(nId)) {
+				tab.activeBackgroundTaskCount = bgTaskCountMap.get(nId);
+			}
+		}
+
 		// Presence (from in-memory map)
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 		for (const tab of tabs) {
@@ -108,10 +119,16 @@ export async function enrichTabs(
 				status: containerInstances.status,
 			})
 			.from(containerInstances)
-			.where(inArray(containerInstances.chapterId, chapterIds));
+			.where(
+				and(
+					inArray(containerInstances.chapterId, chapterIds),
+					isNull(containerInstances.worktreeResourceId),
+				),
+			);
 
 		const containerStatusMap = new Map<string, string>();
 		for (const row of containerRows) {
+			if (row.chapterId === null) continue;
 			const existing = containerStatusMap.get(row.chapterId);
 			if (
 				!existing ||

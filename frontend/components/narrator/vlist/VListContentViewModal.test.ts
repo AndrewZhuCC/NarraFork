@@ -62,16 +62,18 @@ describe("viewportHeight / contentWidth are document-build inputs", () => {
 	// Anchored on the effect's real boundaries. An earlier version opened the slice at
 	// `const node = viewportRef.current;` and closed it at `}, [centeredColumn]);` —
 	// neither of which is the resize effect any more (the node comes from state, and
-	// the dependency list is `[viewportNode, centeredColumn]`), so `indexOf` returned
+	// the dependency list follows the visible-view scroll helpers), so `indexOf` returned
 	// -1, `slice(0, -1)` kept almost the whole file, and every assertion below passed
 	// on unrelated code.
 	it("the shell measures both from the viewport through a ResizeObserver", () => {
 		const src = read("PretextExactMessageList.tsx");
 		const start = src.indexOf("const node = viewportNode;");
 		expect(start).toBeGreaterThan(-1);
-		const end = src.indexOf("}, [viewportNode, centeredColumn]);", start);
-		expect(end).toBeGreaterThan(start);
-		const measure = src.slice(start, end);
+		const effectStart = src.lastIndexOf("useLayoutEffect(", start);
+		expect(effectStart).toBeGreaterThan(-1);
+		const measure = sliceBracketedRegion(src.slice(effectStart), "useLayoutEffect(");
+		if (!measure) throw new Error("viewport ResizeObserver layout effect not found");
+		expect(measure).toContain("const node = viewportNode;");
 		expect(measure).toContain("setViewportHeight(node.clientHeight)");
 		expect(measure).toContain("node.clientWidth");
 		expect(measure).toContain("new ResizeObserver(measure)");

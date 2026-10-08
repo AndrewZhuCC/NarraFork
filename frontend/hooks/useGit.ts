@@ -6,11 +6,25 @@ import type {
 	FileChangeAttributionGrade,
 	FileChangeProjectionCompleteness,
 } from "../../shared/file-change-protocol";
+import {
+	GIT_COMMIT_PREVIEW_UNSUPPORTED,
+	type GitCommitDetail,
+	type GitCommitPatch,
+} from "../../shared/git-commit-preview";
+import type { GitWorkspaceSummary } from "../../shared/git-workspace";
 import { type ApiError, api } from "../lib/api";
-import { type GitLogEntry, type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
+import {
+	type GitLogEntry,
+	type GitTarget,
+	type GitWorkspace,
+	gitBasePath,
+	gitTargetKey,
+} from "../lib/api/git";
 import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
+import { observePageLifecycle } from "../lib/page-lifecycle";
 import { useNarrator } from "./useNarrator";
+import { useWorkspaceContext } from "./useWorkspaceContext";
 
 export type {
 	CurrentDiffFile,
@@ -127,6 +141,8 @@ export const GIT_FACT_QUERIES = [
 	"gitDiff",
 	"gitLog",
 	"gitStashList",
+	"gitCommitDetail",
+	"gitCommitDiff",
 ];
 
 const GIT_DETECTION_PREF_PREFIX = "narrafork_git_detection_enabled:";
@@ -275,6 +291,15 @@ function useGitWorkspaceSelection(scope: string) {
 	return { workspaceKey, selectWorkspace, clearIfCurrent };
 }
 
+/**
+ * Live facts invalidated by a WS `git_status` push. Derived from
+ * GIT_FACT_QUERIES so a new live fact cannot drift out of the push path;
+ * commit previews are immutable and excluded.
+ */
+export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
+	(prefix) => prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff",
+);
+
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
 	if (workspace?.state !== "ready" || !workspace.capabilities.read || !workspace.workspaceKey)
 		return null;
@@ -313,6 +338,22 @@ export function useGitWorkspaceSubscription(target: GitTarget) {
 }
 
 // One permission subscription per QueryClient, shared by all mounted workspace consumers.
+const deniedGitSummaries = new WeakMap<QueryClient, Set<string>>();
+// Query.reset restores its original initialData snapshot. Mark presentation seeds
+// so a reset cannot mistake that old snapshot for a new authoritative response.
+const gitSummarySeeds = new WeakSet<GitWorkspace>();
+function blockGitSummary(qc: QueryClient, narratorId: string) {
+	let denied = deniedGitSummaries.get(qc);
+	if (!denied) {
+		denied = new Set();
+		deniedGitSummaries.set(qc, denied);
+	}
+	denied.add(narratorId);
+	void qc.cancelQueries({ queryKey: ["narrators", narratorId], exact: true });
+	qc.setQueryData<Record<string, unknown>>(["narrators", narratorId], (detail) =>
+		detail ? { ...detail, gitSummary: null } : detail,
+	);
+}
 const gitAccessSubscriptions = new WeakMap<
 	QueryClient,
 	{ count: number; handle: ListenerHandle }
@@ -323,6 +364,19 @@ function subscribeGitAccess(qc: QueryClient) {
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: "*", types: ["narrator_access_changed"] },
 			() => {
+				// Cancel in-flight detail reads before clearing presentation-only summaries.
+				// A late response must not revive private facts after access changed.
+				const details = {
+					predicate: (q: { queryKey: readonly unknown[] }) =>
+						q.queryKey[0] === "narrators" &&
+						q.queryKey.length === 2 &&
+						typeof q.queryKey[1] === "string",
+				};
+				void qc.cancelQueries(details);
+				qc.setQueriesData<Record<string, unknown>>(details, (detail) =>
+					detail ? { ...detail, gitSummary: null } : detail,
+				);
+				void qc.invalidateQueries(details);
 				qc.resetQueries({ queryKey: ["gitWorkspace"] });
 				qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
 			},
@@ -347,34 +401,93 @@ async function readWorkspace<T>(
 	try {
 		return await read();
 	} catch (error) {
+		const failure = error as ApiError;
+		// An older executor missing preview operations is not a workspace change.
+		// Re-probing here would unmount/reopen its consumer and repeat the same 409.
+		const unsupportedPreview =
+			failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED;
 		if (
 			target &&
 			typeof target !== "string" &&
-			[401, 403, 409, 503].includes((error as ApiError)?.status)
+			!unsupportedPreview &&
+			[401, 403, 409, 503].includes(failure?.status)
 		) {
+			if ([401, 403].includes(failure.status)) blockGitSummary(qc, target.narratorId);
+			void qc.cancelQueries({ queryKey: ["narrators", target.narratorId], exact: true });
+			qc.setQueryData<Record<string, unknown>>(["narrators", target.narratorId], (detail) =>
+				detail ? { ...detail, gitSummary: null } : detail,
+			);
 			qc.resetQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 		}
 		throw error;
 	}
 }
 
-/** The execution-context revision is a cache key, not a client-supplied path. */
+/** Detail summaries are presentation hints only, never authorization for a Git API. */
+export function gitSummaryWorkspace(
+	narrator: Record<string, unknown> | undefined,
+	contextRevision: number,
+): GitWorkspace | undefined {
+	const summary = narrator?.gitSummary as GitWorkspaceSummary | null | undefined;
+	if (!summary || summary.revision !== contextRevision) return undefined;
+	// cwd may be a host path while the executor uses its own defaultCwd, or a
+	// symlink resolved by the probe. Directory switches must advance the revision;
+	// comparing these differently normalized paths would reject valid summaries.
+	if (narrator?.defaultDeviceId && narrator.defaultDeviceId !== summary.workspace.deviceId)
+		return undefined;
+	return { ...summary.workspace, branch: summary.workspace.branch ?? summary.branch };
+}
+
+/** A monotonic revision does not change when execution context first hydrates. */
 export function useGitWorkspace(narratorId: string | null | undefined, revision?: unknown) {
 	const qc = useQueryClient();
-	const { data: narrator } = useNarrator(narratorId ?? "");
+	const {
+		data: narrator,
+		dataUpdatedAt: narratorUpdatedAt,
+		isError: narratorError,
+	} = useNarrator(narratorId ?? "");
+	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	const detection = useGitDetectionPreference(narratorId);
 	useEffect(
 		() => (narratorId && detection.enabled ? subscribeGitAccess(qc) : undefined),
 		[qc, narratorId, detection.enabled],
 	);
-	const context = revision ?? [
-		narrator?.cwd,
-		narrator?.chapterId,
-		narrator?.contextProjectId,
-		narrator?.defaultDeviceId,
-	];
+	const workspaceRevision = Math.max(
+		typeof narrator?.workspaceRevision === "number" ? narrator.workspaceRevision : 0,
+		executionContext?.revision ?? 0,
+	);
+	// Directory/device switches advance this revision. Late hydration of optional
+	// narrator metadata must not replace an already authorized workspace query.
+	const context = revision ?? workspaceRevision;
 	const selectionScope = JSON.stringify([narratorId, context]);
 	const selection = useGitWorkspaceSelection(selectionScope);
+	const eligibleSummary = (workspace: GitWorkspace | undefined) =>
+		detection.enabled &&
+		(!selection.workspaceKey || selection.workspaceKey === workspace?.workspaceKey)
+			? workspace
+			: undefined;
+	const summaryWorkspace = eligibleSummary(gitSummaryWorkspace(narrator, workspaceRevision));
+	// Rotating the revision-keyed query starts the new context empty; carrying
+	// the previous workspace as placeholder keeps the panel layout (and the Git
+	// strip) mounted while the new context is probed. Scoped to this narrator —
+	// switching panels must never borrow another narrator's workspace. Access
+	// resets clear the recorded data before placeholder reads it, and the denied
+	// check below blocks a carried workspace outright, so revoked facts cannot
+	// reappear through the carryover.
+	const carryPreviousWorkspace = useCallback(
+		(
+			previousData: GitWorkspace | undefined,
+			previousQuery: { queryKey: readonly unknown[] } | undefined,
+		): GitWorkspace | undefined =>
+			detection.enabled &&
+			previousQuery?.queryKey[0] === "gitWorkspace" &&
+			previousQuery.queryKey[1] === narratorId &&
+			previousQuery.queryKey[2] === true &&
+			previousQuery.queryKey[4] === selection.workspaceKey
+				? previousData
+				: undefined,
+		[narratorId, detection.enabled, selection.workspaceKey],
+	);
 	const query = useQuery({
 		queryKey: ["gitWorkspace", narratorId, detection.enabled, context, selection.workspaceKey],
 		queryFn: async ({ signal }) => {
@@ -393,7 +506,26 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 				throw error;
 			}
 		},
-		enabled: !!narratorId && detection.enabled,
+		placeholderData: carryPreviousWorkspace,
+		initialData: () => {
+			if (!narratorId || deniedGitSummaries.get(qc)?.has(narratorId)) return undefined;
+			// resetQueries may call this again: re-read the source rather than capture
+			// a summary which an access event has since removed from the detail cache.
+			const detail =
+				qc.getQueryData<Record<string, unknown>>(["narrators", narratorId]) ?? narrator;
+			const seed = eligibleSummary(gitSummaryWorkspace(detail, workspaceRevision));
+			// A base not_git fact does not include the user's opted-in nested discovery.
+			if (seed?.state === "not_git") return undefined;
+			if (seed) gitSummarySeeds.add(seed);
+			return seed;
+		},
+		initialDataUpdatedAt: narratorUpdatedAt || Date.now(),
+		// Keep presentation seeds distinguishable from authoritative responses even
+		// when a successful probe returns exactly the same small facts object.
+		structuralSharing: false,
+		// Wait for detail hydration so an authorized cache summary can seed this query.
+		// Missing summaries and failed detail reads recover only when detection is enabled.
+		enabled: !!narratorId && detection.enabled && (!!narrator || narratorError),
 		retry: false,
 		staleTime: 5_000,
 		// A non-ready workspace has no panel watch yet. Probe only recoverable
@@ -441,17 +573,67 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		void qc.cancelQueries({ predicate: shouldClearQuery });
 		qc.removeQueries({ predicate: shouldClearQuery });
 	}, [qc, narratorId, detection.enabled]);
+	// A carried placeholder may itself be a summary seed object; it is still the
+	// previous context's presentation data, never this revision's seed.
+	const isSummarySeed = !!query.data && !query.isPlaceholderData && gitSummarySeeds.has(query.data);
 	// Do not leave private facts visible after an authorization/capability failure.
 	useEffect(() => {
+		if (narratorId) {
+			if (
+				(query.isError && [401, 403].includes((query.error as ApiError)?.status)) ||
+				query.data?.state === "access_denied"
+			)
+				blockGitSummary(qc, narratorId);
+			// Only an authoritative read clears a known denial — neither a summary
+			// seed nor a carried placeholder proves access on the new context.
+			else if (
+				!isSummarySeed &&
+				!query.isPlaceholderData &&
+				query.isSuccess &&
+				query.data?.capabilities.read
+			)
+				deniedGitSummaries.get(qc)?.delete(narratorId);
+		}
 		if (!query.isError && query.data?.capabilities.read !== false) return;
 		qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
-	}, [qc, query.isError, query.data?.capabilities.read]);
-	const target =
-		detection.enabled && !query.isError
-			? gitWorkspaceTarget(narratorId as string, query.data)
-			: null;
+	}, [
+		qc,
+		narratorId,
+		isSummarySeed,
+		query.isError,
+		query.error,
+		query.isSuccess,
+		query.isPlaceholderData,
+		query.data?.state,
+		query.data?.capabilities.read,
+	]);
+	// Synchronous fallback also works when a pending query already existed before
+	// the detail arrived (initialData cannot seed that existing query).
+	const denied = !!narratorId && !!deniedGitSummaries.get(qc)?.has(narratorId);
+	let data: GitWorkspace | undefined;
+	if (!detection.enabled || query.isError) data = undefined;
+	else if (query.isPending || isSummarySeed) data = denied ? undefined : summaryWorkspace;
+	// Carried over from the previous context: a known denial must not borrow it,
+	// and a summary already matching this revision is fresher than the carryover.
+	else if (query.isPlaceholderData) data = denied ? undefined : (summaryWorkspace ?? query.data);
+	else data = query.data;
+	// Old executors and the authority-only probe may omit branch. Preserve only
+	// the label from a same-version summary of this exact device/worktree.
+	if (
+		data?.state === "ready" &&
+		data.capabilities.read &&
+		data.branch === undefined &&
+		data.workspaceKey &&
+		data.workspaceKey === summaryWorkspace?.workspaceKey &&
+		data.deviceId === summaryWorkspace.deviceId &&
+		data.rootPath === summaryWorkspace.rootPath
+	)
+		data = { ...data, branch: summaryWorkspace.branch };
+	const target = data ? gitWorkspaceTarget(narratorId as string, data) : null;
 	return {
 		...query,
+		data,
+		layoutReady: !narratorId || !detection.enabled || !!data || query.isError,
 		detectionEnabled: detection.enabled,
 		setDetectionEnabled: detection.setEnabled,
 		workspaceKey: target && typeof target !== "string" ? target.workspaceKey : null,
@@ -496,6 +678,32 @@ export function invalidateWorkspaceQueries(
 		qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 }
 
+/**
+ * A WS `git_status` push marks the badge/fact queries stale so active observers
+ * refetch. Unlike {@link invalidateWorkspaceQueries} this never re-probes the
+ * workspace itself: pushes arrive up to ~1/s during tool bursts, and a
+ * discovery probe per push would be pure waste. Commit previews are immutable,
+ * so only the live facts are invalidated.
+ */
+export function invalidateGitStatusPushQueries(
+	qc: ReturnType<typeof useQueryClient>,
+	narratorId: string,
+	chapterId: string | null,
+): void {
+	const keys = new Set<string>();
+	if (chapterId) keys.add(chapterId);
+	for (const [, workspace] of qc.getQueriesData<GitWorkspace>({
+		queryKey: ["gitWorkspace", narratorId],
+	})) {
+		if (workspace?.workspaceKey) keys.add(workspace.workspaceKey);
+		if (workspace?.chapterId) keys.add(workspace.chapterId);
+	}
+	for (const key of keys) {
+		for (const prefix of GIT_LIVE_FACT_QUERIES)
+			void qc.invalidateQueries({ queryKey: [prefix, key] });
+	}
+}
+
 export function useGitStatus(target: GitTarget | undefined | null) {
 	const qc = useQueryClient();
 	return useQuery<GitStatusSummary>({
@@ -506,6 +714,59 @@ export function useGitStatus(target: GitTarget | undefined | null) {
 		retry: false,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
+}
+
+/**
+ * Minimum interval between two badge refreshes (ms). `focus` and
+ * `visibilitychange` co-fire on a single return gesture, and a foreground return
+ * usually also triggers the WS reconnect that raises the second signal
+ * milliseconds later — without the throttle one user action buys two or three
+ * invalidations of the same queries.
+ */
+const GIT_BADGE_REFRESH_MIN_INTERVAL_MS = 2_000;
+
+/**
+ * Foreground/reconnect catch-up for the git status badges (ChapterBar /
+ * NarratorGitBar). Mounted ONCE at the app shell, not per bar.
+ *
+ * The badge queries (`gitStatus`, `chapterGitStatus`) are normally kept fresh by
+ * server pushes routed over the narrator WS. Two gaps leave them stale:
+ *
+ * - **Window focus without a visibility change.** React Query's focus manager
+ *   only listens to `visibilitychange`; clicking between two visible windows
+ *   (or Alt-Tab on a WM that keeps the window "visible") fires no such event,
+ *   so the built-in `refetchOnWindowFocus` never triggers.
+ * - **WS reconnect.** Pushes sent while the socket was down are lost, and the
+ *   server-side git workspace subscription only exists while the Git PANEL is
+ *   open (`useGitWorkspaceSubscription`) — a bar without the panel has no
+ *   catch-up of its own, so the badge would keep pre-disconnect numbers
+ *   indefinitely.
+ *
+ * `invalidateQueries` refetches active observers only, so an app showing no
+ * badge pays nothing. Deliberately limited to the two badge queries: the open
+ * Git panel already gets its facts re-invalidated by the `git_workspace_subscribed`
+ * snapshot that follows its resubscribe on reconnect.
+ */
+export function useGitBadgeRefresh() {
+	const qc = useQueryClient();
+	useEffect(() => {
+		let lastRefreshAt = 0;
+		const refresh = () => {
+			const now = Date.now();
+			if (now - lastRefreshAt < GIT_BADGE_REFRESH_MIN_INTERVAL_MS) return;
+			lastRefreshAt = now;
+			void qc.invalidateQueries({ queryKey: ["gitStatus"] });
+			void qc.invalidateQueries({ queryKey: ["chapterGitStatus"] });
+		};
+		const unobserve = observePageLifecycle({ onForeground: refresh });
+		const offConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
+			if (connected && isReconnect) refresh();
+		});
+		return () => {
+			unobserve();
+			offConnection();
+		};
+	}, [qc]);
 }
 
 export function useGitModifications(target: GitTarget | undefined | null) {
@@ -576,6 +837,50 @@ export function useGitDiff(
 		enabled: !!target && !!file,
 		retry: false,
 		gcTime: 30_000,
+	});
+}
+
+// Commit objects are immutable, but the route granting access is not. Keep the
+// workspace prefix for invalidation, and scope previews to their narrator/chapter.
+export function useGitCommitDetail(target: GitTarget | undefined | null, sha: string | null) {
+	const qc = useQueryClient();
+	return useQuery<GitCommitDetail>({
+		queryKey: ["gitCommitDetail", gitTargetKey(target), sha, target ? gitBasePath(target) : null],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () =>
+				api.getGitCommitDetail(target as GitTarget, sha as string, signal),
+			),
+		enabled: !!target && !!sha,
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useGitCommitDiff(
+	target: GitTarget | undefined | null,
+	sha: string | null,
+	file: string | null,
+	oldPath?: string,
+) {
+	const qc = useQueryClient();
+	return useQuery<GitCommitPatch>({
+		queryKey: [
+			"gitCommitDiff",
+			gitTargetKey(target),
+			sha,
+			file,
+			oldPath ?? null,
+			target ? gitBasePath(target) : null,
+		],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () =>
+				api.getGitCommitDiff(target as GitTarget, sha as string, file as string, oldPath, signal),
+			),
+		enabled: !!target && !!sha && !!file,
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY,
+		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 

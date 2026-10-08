@@ -1,8 +1,13 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narrators } from "../../db/schema";
+import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
 import { settings } from "../../lib/settings";
+import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
 
 const { db, sqlite } = getTestDb();
@@ -59,6 +64,9 @@ function message(
 	};
 }
 
+// Numeric composition/cache tests now live in narrator-context-composition.test.ts.
+// Runtime history semantics remain independently covered below.
+
 test.each([
 	false,
 	true,
@@ -75,7 +83,10 @@ test.each([
 		expect(prepared.trailingUserText).toBeUndefined();
 		expect(prepared.history).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ role: "system", content: "fresh injection" }),
+				expect.objectContaining({
+					role: "system",
+					content: '<sender kind="system" />\nfresh injection',
+				}),
 			]),
 		);
 	} else {
@@ -161,7 +172,7 @@ test("empty prompt recovers the popped user but pure tool results never invent c
 		...options(),
 		sourceMessages: [message("u", "user", "actual accepted text")],
 	});
-	expect(recovered.currentText).toBe("actual accepted text");
+	expect(recovered.currentText).toBe('<sender kind="human" />\nactual accepted text');
 	expect(recovered.history).toEqual([]);
 	const tool = message("tool", "assistant", "");
 	tool.contentJson = [{ type: "tool_use", id: "call", name: "Read", input: { path: "x" } }];
@@ -191,7 +202,9 @@ test("current text stays distinct from extracted sys and source attachment metad
 		sourceMessages: source,
 		currentInput: "new principal input",
 	});
-	expect(prepared.currentText).toBe("pending notice\n\nnew principal input");
+	expect(prepared.currentText).toBe(
+		'<sender kind="system" />\npending notice\n\n<sender kind="system" />\nnew principal input',
+	);
 	expect(prepared.sourceMessages).toBe(source);
 });
 
@@ -253,7 +266,7 @@ test("real loader plus currentRevision adoption retain exact history identity an
 		contentJson: [{ type: "text", text: "edited current" }],
 	});
 	const first = await buildRuntimeHistory(options());
-	expect(first.currentText).toBe("edited current");
+	expect(first.currentText).toBe('<sender kind="human" />\nedited current');
 	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
 	consumeAgentMessageHistory([...first.history], first.currentText);
 	consumeAgentMessageHistory(first.history, "other replacement input");
@@ -270,4 +283,157 @@ test("real loader plus currentRevision adoption retain exact history identity an
 		db.select().from(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, saved.id)).get()
 			?.injectionConsumedAt,
 	).toBeInstanceOf(Date);
+});
+
+test("grouped extracted sys receipts require the exact projected packet before adoption", async () => {
+	const owner = tryClaimExecution("primary", "primary");
+	if (!owner) throw new Error("Missing owner");
+	const store = createMailboxStore(db);
+	const result = store.enqueue({
+		kind: "user_input",
+		narratorId: "primary",
+		text: "one\ntwo",
+		projectedByteSize: 7,
+		requestKey: "grouped-sender-receipt",
+	});
+	if (result.status !== "accepted") throw new Error(result.status);
+	const row = store.claimBatch("primary", { token: "claim", epoch: owner.epoch })[0];
+	await narratorPersistence.persistSystemMessage(
+		"primary",
+		"one\ntwo",
+		[
+			{
+				type: "system_injection",
+				source: "subagent_message",
+				modelText: "one\ntwo",
+				body: {
+					kind: "messages",
+					items: [
+						{ fromId: "agent-a", fromTitle: "A", text: "one" },
+						{ fromId: "agent-b", fromTitle: "B", text: "two" },
+					],
+				},
+			},
+		],
+		undefined,
+		undefined,
+		{
+			mailboxClaim: {
+				id: row.id,
+				narratorId: row.narratorId,
+				token: row.claimToken as string,
+				epoch: row.claimEpoch as string,
+			},
+		},
+	);
+	const prepared = await buildRuntimeHistory(options());
+	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-a" name="A" />\none');
+	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-b" name="B" />\ntwo');
+	consumeAgentMessageHistory(prepared.history, "unrelated replacement input");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	const accepted = await buildRuntimeHistory(options());
+	consumeAgentMessageHistory(accepted.history, accepted.currentText);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).not.toBeNull();
+});
+
+test("an already prepared initial packet is not attributed or extracted twice", async () => {
+	const source = message("sys", "sys", "prepared context");
+	const first = await buildRuntimeHistory({ ...options(), sourceMessages: [source] });
+	const resumed = await buildRuntimeHistory({
+		...options(),
+		sourceMessages: [source],
+		currentInput: first.currentText,
+	});
+	expect(resumed.currentInputText).toBe(first.currentText);
+	expect(resumed.currentInputText.match(/<sender /g)).toHaveLength(1);
+});
+
+// Exercise the real provider adapters, not just the attachment formatter.
+test.each([
+	"relay",
+	"official",
+	"responses",
+	"chat",
+] as const)("%s prepares image/file locators for current input and historical replay", async (mode) => {
+	const root = mkdtempSync(join(tmpdir(), "nf-runtime-attachments-"));
+	const cwd = join(root, "worktree");
+	const oldOpenAI = settings.openaiProviders;
+	try {
+		mkdirSync(cwd);
+		mkdirSync(join(root, "uploads", "primary"), { recursive: true });
+		writeFileSync(
+			join(root, "uploads", "primary", "logo.png"),
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aG1cAAAAASUVORK5CYII=",
+				"base64",
+			),
+		);
+		setUploadsDirForTests(join(root, "uploads"));
+		settings.openaiProviders = [
+			{
+				id: "history-openai",
+				name: "History OpenAI",
+				prefix: "history-openai",
+				apiKey: "isolated-test-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "gpt-5",
+				apiMode: mode === "chat" ? "completions" : "responses",
+			},
+		];
+		const file = { filename: "notes.txt", filePath: join(cwd, "notes.txt"), size: 12 };
+		const user = message("image-user", "user", "use logo");
+		user.createdBy = "alice";
+		user.creator = { username: "Alice" };
+		user.contentJson = [
+			{ type: "image", imageId: "logo", filename: "logo.png", uploadNarratorId: "primary" },
+			{ type: "text_file", ...file },
+			{ type: "text", text: "use logo" },
+		];
+		user.contentText = `use logo${buildLegacyAttachedFilesHint([file])}`;
+		const original = JSON.stringify(user);
+		const runtimeOptions = {
+			...options("primary", mode === "official"),
+			...(mode === "chat" || mode === "responses"
+				? { provider: "history-openai", model: "gpt-5" }
+				: {}),
+			attachmentCwd: cwd,
+		};
+		const current = await buildRuntimeHistory({
+			...runtimeOptions,
+			sourceMessages: [user],
+			currentInput: user.contentText,
+		});
+		expect(current.currentInputText).toContain('<sender kind="human" id="alice" name="Alice" />');
+		expect(current.currentInputText).toContain('image: "logo.png"');
+		expect(current.currentInputText).toContain('file: "notes.txt"');
+		expect(current.currentInputText.match(/<attached_files>/g)).toHaveLength(1);
+		expect(current.currentInputText).not.toContain(join(root, "uploads"));
+		expect(JSON.stringify(user)).toBe(original);
+		const historical = await buildRuntimeHistory({
+			...runtimeOptions,
+			sourceMessages: [user, message("reply", "assistant", "done")],
+		});
+		const history = JSON.stringify(historical.history);
+		expect(history).toContain("logo.png");
+		expect(history).toContain("device: local");
+		expect(history).toContain(join(cwd, ".narrafork", "attached"));
+		expect(history).toContain(mode === "relay" || mode === "official" ? '"type":"image"' : "image");
+		expect(readdirSync(join(cwd, ".narrafork", "attached"))).toHaveLength(1);
+		const recovered = await buildRuntimeHistory({ ...runtimeOptions, sourceMessages: [user] });
+		// Relay builders pop the final user row; locators must survive that recovery.
+		if (mode === "relay") expect(recovered.currentText).toContain('image: "logo.png"');
+		const child = await buildRuntimeHistory({
+			...runtimeOptions,
+			profile: "subagent",
+			sourceMessages: [{ ...user, parentToolUseId: "origin" }],
+			currentInput: user.contentText,
+		});
+		expect(child.currentInputText).toContain('image: "logo.png"');
+	} finally {
+		settings.openaiProviders = oldOpenAI;
+		setUploadsDirForTests(null);
+		rmSync(root, { recursive: true, force: true });
+	}
 });

@@ -23,7 +23,6 @@ import {
 import {
 	IconBaselineDensityMedium,
 	IconDeviceDesktop,
-	IconFileCode,
 	IconFolder,
 	IconFolderPlus,
 	IconGitBranch,
@@ -98,20 +97,13 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		hosts: ["dock", "drawer"],
 		badge: "backgroundTasks",
 	},
-	filemod: {
-		labelKey: "fileMod_title",
-		icon: IconFileCode,
-		hosts: ["dock", "drawer"],
-	},
 	filetree: {
 		labelKey: "fileTree.title",
 		icon: IconFolder,
-		// Dock only, deliberately. `drawer` is not a capability flag but a claim that
-		// `MobileToolPanelHost` can render this kind, and its `MobileToolPanelKind` union
-		// has no `filetree` member — declaring it here would put a row in the mobile
-		// overflow menu that opens nothing, which is precisely the dead-control trap the
-		// notes on `hosts` describe. Add it back together with a mobile host.
-		hosts: ["dock"],
+		// Mobile hosts it in MobileToolPanelHost's full-screen Drawer; opening a
+		// file from the tree closes that drawer and uses the panel's internal
+		// file viewer instead of a dock `file` panel.
+		hosts: ["dock", "drawer"],
 	},
 	subagent: {
 		labelKey: "createSubagent",

@@ -11,6 +11,31 @@ import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./c
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
+export type SearchChannelKind = "native" | "nug-mcp" | "custom-api" | "subagent" | "plugin";
+
+export interface SearchChannelConfig {
+	id: string;
+	kind: SearchChannelKind;
+	enabled: boolean;
+	providerId?: string;
+	model?: string;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	maxTurns?: number;
+	timeoutMs?: number;
+}
+
+export interface CustomSearchProviderConfig {
+	id: string;
+	name: string;
+	disabled?: boolean;
+	protocol: string;
+	baseUrl: string;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	options?: Record<string, unknown>;
+	timeoutMs?: number;
+}
+
 export interface RecentTabsPageResponse {
 	items: PersistedRecentTab[];
 	nextCursor?: string;
@@ -233,7 +258,13 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ model, prompt }),
 		}),
-	testSearchChannel: (data: { channelId?: string; query: string; purpose?: string }) =>
+	testSearchChannel: (data: {
+		channelId?: string;
+		channel?: SearchChannelConfig;
+		customProvider?: CustomSearchProviderConfig;
+		query: string;
+		purpose?: string;
+	}) =>
 		request<{ text: string; channelId: string; channelLabel: string; attempts?: unknown[] }>(
 			"/settings/search/test",
 			{
@@ -256,6 +287,7 @@ export const settingsApi = {
 		request<{
 			autoLoadOlderMessages: boolean;
 			fastModeDefault: boolean;
+			treatAsLocalAccess: boolean;
 			language: Locale;
 			wordWrapMarkdown: boolean;
 			wordWrapCode: boolean;
@@ -318,6 +350,7 @@ export const settingsApi = {
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
 		fastModeDefault?: boolean;
+		treatAsLocalAccess?: boolean;
 		language?: Locale;
 		wordWrapMarkdown?: boolean;
 		wordWrapCode?: boolean;
@@ -420,14 +453,25 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ tabs }),
 		}),
-	removeRecentTab: (type: PersistedRecentTab["type"], id: string) =>
-		request<RecentTabsMutationResponse>(`/user-preferences/recent-tabs/${type}/${id}`, {
-			method: "DELETE",
-		}),
-	moveRecentTab: (key: string, target: RecentTabMoveTarget) =>
+	/**
+	 * Remove one recent tab. `cascade` is for entity-teardown cleanups (chapter deleted,
+	 * narrator archived) — it skips minting an undo token so it cannot clobber a pending
+	 * user undo with a snapshot that points at already-deleted entities.
+	 */
+	removeRecentTab: (
+		type: PersistedRecentTab["type"],
+		id: string,
+		options?: { cascade?: boolean },
+	) =>
+		request<RecentTabsMutationResponse>(
+			`/user-preferences/recent-tabs/${type}/${id}${options?.cascade ? "?cascade=1" : ""}`,
+			{ method: "DELETE" },
+		),
+	moveRecentTab: (key: string, target: RecentTabMoveTarget, signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",
 			body: JSON.stringify({ key, ...target }),
+			signal,
 		}),
 	pinRecentTab: (key: string, pinned: boolean) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
@@ -439,10 +483,11 @@ export const settingsApi = {
 	 * cannot be replaced by a sequence of `moveRecentTab` calls: those rewrite the flat
 	 * recency order, which the `above_idle` auto-promote then overwrites.
 	 */
-	setRecentTabDirectoryOrder: (keys: string[]) =>
+	setRecentTabDirectoryOrder: (keys: string[], signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/dir-order", {
 			method: "PATCH",
 			body: JSON.stringify({ keys }),
+			signal,
 		}),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/clear", {

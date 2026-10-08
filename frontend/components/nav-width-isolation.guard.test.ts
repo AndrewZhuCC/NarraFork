@@ -17,7 +17,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const LAYOUT = join(import.meta.dir, "AppRootLayout.tsx");
+const LAYOUT = join(import.meta.dir, "AuthenticatedAppLayout.tsx");
 
 /**
  * The layout's CODE, with comments stripped.
@@ -37,7 +37,7 @@ function functionBody(source: string, name: string): string {
 	const start = source.indexOf(`function ${name}(`);
 	expect(start).toBeGreaterThan(-1);
 	const rest = source.slice(start + 1);
-	const nextIndex = rest.search(/\nfunction [A-Za-z]/);
+	const nextIndex = rest.search(/\n(?:export )?function [A-Za-z]/);
 	return nextIndex === -1 ? rest : rest.slice(0, nextIndex);
 }
 
@@ -75,6 +75,21 @@ describe("nav width render isolation", () => {
 	// which is what forced one subscription for both rates.
 	it("no longer imports the removed combined hook", () => {
 		expect(layoutSource()).not.toContain("useResizableNav()");
+	});
+
+	it("keeps the mobile navbar breakpoint subscription out of AuthenticatedLayout", () => {
+		const source = layoutSource();
+		const layout = functionBody(source, "AuthenticatedLayout");
+		expect(layout).not.toContain("useMobileViewport()");
+		expect(functionBody(source, "MobileNavbarEffects")).toContain("useMobileViewport()");
+		expect(layout).not.toContain("const isMobile");
+	});
+
+	it("keeps the mobile effects subscriber free of navbar content", () => {
+		const body = functionBody(layoutSource(), "MobileNavbarEffects");
+		for (const forbidden of ["RecentTabList", "NavLink", "Tooltip", "useRecentTabs", "useQuery"]) {
+			expect(body).not.toContain(forbidden);
+		}
 	});
 
 	it("guard self-check: both function bodies are located and non-trivial", () => {

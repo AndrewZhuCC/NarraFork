@@ -14,7 +14,7 @@ import {
 import { ApiError } from "../types";
 
 const UPSTREAM_BODY = JSON.stringify({
-	__type: "com.amazon.runtimeservice#ValidationException",
+	__type: "ValidationException",
 	message: "Improperly formed request.",
 	reason: "REQUEST_BODY_INVALID",
 });
@@ -81,70 +81,56 @@ describe("isMalformedRequestBodyError", () => {
 describe("summarizeRequestBody", () => {
 	test("flags an orphaned toolResult and a toolUse without a result", () => {
 		const summary = summarizeRequestBody({
-			conversationState: {
-				conversationId: "c1",
-				history: [
-					{ userInputMessage: { content: "hi", modelId: "claude-sonnet-4.5" } },
-					{
-						assistantResponseMessage: {
-							content: "",
-							toolUses: [{ toolUseId: "tu-1", name: "Bash", input: {} }],
-						},
-					},
-				],
-				currentMessage: {
-					userInputMessage: {
-						content: "next",
-						modelId: "claude-sonnet-4.5",
-						userInputMessageContext: {
-							toolResults: [{ toolUseId: "tu-orphan", content: [{ text: "x" }] }],
-						},
-					},
+			model: "claude-sonnet-4.5",
+			messages: [
+				{ role: "user", content: "hi" },
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: "tu-1", name: "Bash", input: {} }],
 				},
-			},
+				{
+					role: "user",
+					content: [{ type: "tool_result", tool_use_id: "tu-orphan", content: "x" }],
+				},
+			],
 		});
 
 		expect(summary?.modelId).toBe("claude-sonnet-4.5");
-		expect(summary?.historyLength).toBe(2);
-		expect(summary?.roleSequence).toBe("UAC");
+		expect(summary?.historyLength).toBe(3);
+		expect(summary?.roleSequence).toBe("UAU");
 		expect(summary?.unmatchedToolUseIds).toEqual(["tu-1"]);
 		expect(summary?.unmatchedToolResultIds).toEqual(["tu-orphan"]);
-		expect(summary?.emptyContentIndexes).toEqual([1]);
 		expect(summary?.notes).toContain("toolResult without a matching toolUse (orphaned result)");
 	});
 
 	test("flags reasoning blocks without a signature and empty image bytes", () => {
 		const summary = summarizeRequestBody({
-			conversationState: {
-				conversationId: "c2",
-				history: [
-					{
-						assistantResponseMessage: {
-							content: "thinking done",
-							reasoning_content: { reasoningText: { text: "abc" } },
-						},
-					},
-				],
-				currentMessage: {
-					userInputMessage: {
-						content: "look",
-						modelId: "claude-opus-4.5",
-						images: [{ format: "png", source: { bytes: "" } }],
-					},
+			model: "claude-opus-4.5",
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "thinking", thinking: "abc" }],
 				},
-			},
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "look" },
+						{ type: "image", source: { type: "base64", media_type: "image/png", data: "" } },
+					],
+				},
+			],
 		});
 
 		expect(summary?.reasoningBlocks).toBe(1);
 		expect(summary?.reasoningWithoutSignature).toBe(1);
 		expect(summary?.imageCount).toBe(1);
 		expect(summary?.emptyImageCount).toBe(1);
-		expect(summary?.notes).toContain("image with empty source.bytes present");
+		expect(summary?.notes).toContain("image with empty source data present");
 	});
 
 	test("reports a non-conversational body instead of throwing", () => {
-		const summary = summarizeRequestBody({ messages: [] });
-		expect(summary?.notes?.[0]).toContain("no conversationState");
+		const summary = summarizeRequestBody({ foo: "bar" });
+		expect(summary?.notes?.[0]).toContain("no messages array");
 	});
 
 	test("returns undefined for a non-object body", () => {
@@ -169,12 +155,8 @@ describe("writeMalformedRequestDump", () => {
 					url: "https://nug.example.test/v1/messages",
 					headers: { Authorization: "Bearer super-secret-token", "content-type": "app/json" },
 					body: {
-						conversationState: {
-							conversationId: "c3",
-							currentMessage: {
-								userInputMessage: { content: "hello", modelId: "claude-sonnet-4.5" },
-							},
-						},
+						model: "claude-sonnet-4.5",
+						messages: [{ role: "user", content: "hello" }],
 					},
 				},
 				response: { status: 400, bodyText: UPSTREAM_BODY },
@@ -196,10 +178,8 @@ describe("writeMalformedRequestDump", () => {
 		expect(parsed.trigger).toBe(MALFORMED_REQUEST_CAPTURE_REASON);
 		// The full request body is retained verbatim — that's the whole point of the capture.
 		expect(parsed.request.body).toEqual({
-			conversationState: {
-				conversationId: "c3",
-				currentMessage: { userInputMessage: { content: "hello", modelId: "claude-sonnet-4.5" } },
-			},
+			model: "claude-sonnet-4.5",
+			messages: [{ role: "user", content: "hello" }],
 		});
 		// Credentials are never written to the dump file.
 		expect(JSON.stringify(parsed.request.headers)).not.toContain("super-secret-token");
@@ -297,12 +277,8 @@ describe("buildMalformedCaptureRecord", () => {
 					url: "https://nug.example.test/v1/messages",
 					headers: { Authorization: "Bearer secret-value" },
 					body: {
-						conversationState: {
-							conversationId: "c4",
-							currentMessage: {
-								userInputMessage: { content: bigContent, modelId: "claude-sonnet-4.5" },
-							},
-						},
+						model: "claude-sonnet-4.5",
+						messages: [{ role: "user", content: bigContent }],
 					},
 				},
 				response: { status: 400, bodyText: UPSTREAM_BODY },

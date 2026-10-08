@@ -320,12 +320,10 @@ describe("reference costs use effective catalog metadata", () => {
 		});
 	});
 	test.each([
-		["codex-native", true],
-		["responses-compatible", true],
+		["openai-responses", true],
 		["completions-compatible", true],
 		["gemini-compatible", true],
-		["anthropic-official", false],
-		["anthropic-compatible", false],
+		["anthropic-messages", false],
 	] as const)("custom API cache accounting follows the protocol, even when disabled (%s)", (protocol, inclusive) => {
 		install(allPrices);
 		const previous = settings.customApiProviders;

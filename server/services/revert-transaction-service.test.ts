@@ -14,11 +14,19 @@ import * as relations from "../db/relations";
 import * as schema from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
+import { structSedTool } from "../lib/agent/tools/struct-sed/tool";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
-import { fileChangeLocalIo, localDirectoryIdentity } from "./file-change-local-io";
+import {
+	fileChangeLocalIo,
+	localDirectoryIdentity,
+	localObjectIdentity,
+} from "./file-change-local-io";
+import { restoreLocalFile } from "./file-change-local-restore";
+import { resetFileChangeNamespace } from "./file-change-namespace-reset";
+import { FileChangeReversalCalculator } from "./file-change-reversal";
 import {
 	LocalFileChangeRuntime,
 	localFileChangeRuntimeBinding,
@@ -34,11 +42,18 @@ import {
 	RevertPlannerService,
 } from "./revert-planner-service";
 import type { RevertSelectionResult } from "./revert-selection-service";
+import type {
+	TransactionManifestRequest,
+	ValidatedTransactionManifest,
+} from "./revert-transaction-manifest-worker";
 import {
+	buildRevertScopeRanges,
 	type RevertTransactionOptions,
 	RevertTransactionService,
 } from "./revert-transaction-service";
+import { runRevertManifestWorker } from "./revert-transaction-worker";
 import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
+import { freezeWorkspaceRanges, WORKSPACE_RANGE_LIMITS } from "./workspace-write-ranges";
 
 const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
 const owner = { subjectKey: "human:alice", narratorId: "narrator", projectId: "project" };
@@ -228,33 +243,50 @@ function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
 	if (!user.isAdmin && row.ownerUserId !== user.userId) throw new Error("Narrator denied");
 }
 async function tool(
-	name: "Write" | "Edit",
+	name: "Write" | "Edit" | "StructSed",
 	path: string,
 	input: Record<string, unknown>,
 	cwd = workspace,
 	failure = false,
 	actorNarratorId = "narrator",
+	existingMessageId?: string,
 ) {
 	allowedFiles.add(path);
 	const resolved = await localBackend.resolvePathIdentity(path);
 	const providerId = generateId();
-	const messageId = generateId();
+	const messageId = existingMessageId ?? generateId();
 	const toolCallId = generateId();
-	db.insert(schema.narratorMessages)
-		.values({
-			id: messageId,
-			narratorId: actorNarratorId,
-			role: "assistant",
-			contentJson: [
-				{ type: "text", text: "retain" },
-				{ type: "tool_use", id: providerId, name, input },
-			],
-			createdAt: now(),
-		})
-		.run();
-	db.insert(schema.narratorMessageRefs)
-		.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
-		.run();
+	const block = { type: "tool_use" as const, id: providerId, name, input };
+	if (existingMessageId) {
+		const previous = db
+			.select()
+			.from(schema.narratorMessages)
+			.where(eq(schema.narratorMessages.id, messageId))
+			.get();
+		if (
+			!previous ||
+			previous.narratorId !== actorNarratorId ||
+			!Array.isArray(previous.contentJson)
+		)
+			throw new Error("Missing tool message owned by the same actor");
+		db.update(schema.narratorMessages)
+			.set({ contentJson: [...(previous.contentJson ?? []), block] })
+			.where(eq(schema.narratorMessages.id, messageId))
+			.run();
+	} else {
+		db.insert(schema.narratorMessages)
+			.values({
+				id: messageId,
+				narratorId: actorNarratorId,
+				role: "assistant",
+				contentJson: [{ type: "text", text: "retain" }, block],
+				createdAt: now(),
+			})
+			.run();
+		db.insert(schema.narratorMessageRefs)
+			.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
+			.run();
+	}
 	db.insert(schema.narratorToolCalls)
 		.values({
 			id: toolCallId,
@@ -298,7 +330,10 @@ async function tool(
 		requestPermission: async () => ({ behavior: "allow" }),
 	};
 	const result = await withLocalFileChangeRuntime(runtime, () =>
-		(name === "Write" ? writeTool : editTool).execute(input, ctx),
+		(name === "Write" ? writeTool : name === "StructSed" ? structSedTool : editTool).execute(
+			input,
+			ctx,
+		),
 	);
 	db.update(schema.narratorToolCalls)
 		.set({ status: result.isError ? "fail" : "success" })
@@ -336,11 +371,17 @@ function execution(plan: RevertPlanSummary, signal?: AbortSignal) {
 		signal,
 	});
 }
-function history() {
+async function snapshotConsentRequired(pending: Promise<unknown>) {
+	// Await the real worker lifetime outside Bun's async rejects matcher.
+	const error = await pending.catch((failure: unknown) => failure);
+	expect(error).toBeInstanceOf(Error);
+	expect((error as Error).message).toContain("SNAPSHOT_CONFIRMATION_REQUIRED");
+}
+function history(limit = 100) {
 	return JSON.stringify({
-		messages: db.select().from(schema.narratorMessages).limit(100).all(),
-		refs: db.select().from(schema.narratorMessageRefs).limit(100).all(),
-		tools: db.select().from(schema.narratorToolCalls).limit(100).all(),
+		messages: db.select().from(schema.narratorMessages).limit(limit).all(),
+		refs: db.select().from(schema.narratorMessageRefs).limit(limit).all(),
+		tools: db.select().from(schema.narratorToolCalls).limit(limit).all(),
 	});
 }
 async function twoFiles() {
@@ -370,17 +411,46 @@ function operation(plan: RevertPlanSummary) {
 		.where(eq(schema.revertOperations.id, plan.id))
 		.get();
 }
-function journalFiles(plan: RevertPlanSummary) {
+function journalFiles(plan: RevertPlanSummary, limit = 100) {
 	return db
 		.select()
 		.from(schema.revertOperationFiles)
 		.where(eq(schema.revertOperationFiles.revertOperationId, plan.id))
-		.limit(100)
+		.limit(limit)
 		.all()
 		.sort((a, b) => a.sequence - b.sequence);
 }
+async function manifestRequest(
+	plan: RevertPlanSummary,
+): Promise<Extract<TransactionManifestRequest, { action: "validate" }>> {
+	const row = operation(plan);
+	if (!row) throw new Error("Missing operation");
+	const raw: Extract<TransactionManifestRequest, { action: "validate" }>["raw"] = [];
+	for (const digest of [
+		row.planBlobDigest,
+		row.selectorBlobDigest,
+		row.historyManifestBlobDigest,
+	]) {
+		const blob = db
+			.select()
+			.from(schema.fileChangeBlobs)
+			.where(eq(schema.fileChangeBlobs.digest, digest ?? ""))
+			.get();
+		if (!blob) throw new Error("Missing raw blob");
+		const ref = { algorithm: "sha256" as const, digest: blob.digest, sizeBytes: blob.sizeBytes };
+		raw.push({ ref, bytes: await namespace.store.readBytes(ref) });
+	}
+	return {
+		action: "validate",
+		raw,
+		operation: row,
+		files: journalFiles(plan),
+		userId: principal.userId,
+	};
+}
+
 async function fixedEvidenceBytes(plan: RevertPlanSummary) {
-	let manifests = 0;
+	const refs = new Map<string, number>();
 	let selection: RevertSelectionResult | undefined;
 	for (const digest of Object.values(plan.manifestDigests)) {
 		const row = db
@@ -389,7 +459,7 @@ async function fixedEvidenceBytes(plan: RevertPlanSummary) {
 			.where(eq(schema.fileChangeBlobs.digest, digest ?? ""))
 			.get();
 		if (!row) throw new Error("Missing raw manifest");
-		manifests += row.sizeBytes;
+		refs.set(row.digest, row.sizeBytes);
 		if (digest === plan.manifestDigests.history)
 			selection = JSON.parse(
 				Buffer.from(
@@ -402,29 +472,30 @@ async function fixedEvidenceBytes(plan: RevertPlanSummary) {
 			) as RevertSelectionResult;
 	}
 	if (!selection) throw new Error("Missing fixed history");
-	const size = (state: FileChangeState) => (state.kind === "regular" ? state.blob.sizeBytes : 0);
-	const sourceBytes = selection.effects.reduce(
-		(sum, effect) =>
-			sum +
-			[
-				effect.before,
-				effect.intendedAfter,
-				effect.observedAfter,
-				...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
-			].reduce((total, state) => total + size(state), 0),
-		0,
-	);
-	return (
-		manifests +
-		Math.max(
-			sourceBytes,
-			selection.operations.reduce((sum, operation) => sum + operation.evidenceBytes, 0),
-		) +
-		journalFiles(plan).reduce(
-			(sum, file) => sum + size(file.expectedStateJson) + size(file.desiredStateJson),
-			0,
-		)
-	);
+	const add = (state: FileChangeState) => {
+		const ref =
+			state.kind === "regular" ? state.blob : state.kind === "symlink" ? state.target : null;
+		if (ref) {
+			const previous = refs.get(ref.digest);
+			if (previous !== undefined && previous !== ref.sizeBytes)
+				throw new Error("Conflicting blob size");
+			refs.set(ref.digest, ref.sizeBytes);
+		}
+	};
+	for (const effect of selection.effects) {
+		for (const state of [
+			effect.before,
+			effect.intendedAfter,
+			effect.observedAfter,
+			...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
+		])
+			add(state);
+	}
+	for (const file of journalFiles(plan)) {
+		add(file.expectedStateJson);
+		add(file.desiredStateJson);
+	}
+	return [...refs.values()].reduce((sum, bytes) => sum + bytes, 0);
 }
 function hold() {
 	let release: () => void = () => {};
@@ -433,6 +504,386 @@ function hold() {
 	});
 	return { promise, release };
 }
+
+describe("rollback activity admission and bounded ranges", () => {
+	test.each([
+		256, 257, 1000,
+	])("%s fixed targets keep scope admission within the global range budget", async (count) => {
+		await write(join(workspace, "scope-seed.txt"), "seed");
+		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
+		if (!scope) throw new Error("Missing scope");
+		const paths = Array.from({ length: count }, (_, i) => join(workspace, `range-${i}.txt`));
+		const ranges = buildRevertScopeRanges(scope, paths);
+		expect(ranges).toEqual(
+			count === 256
+				? paths.map((canonicalPath) => ({ kind: "file", canonicalPath }))
+				: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
+		);
+		expect(freezeWorkspaceRanges(scope, ranges)).toEqual(ranges);
+		expect(ranges.length).toBeLessThanOrEqual(WORKSPACE_RANGE_LIMITS.count);
+		expect(Buffer.byteLength(JSON.stringify({ version: 1, ranges }))).toBeLessThanOrEqual(
+			WORKSPACE_RANGE_LIMITS.jsonBytes,
+		);
+		expect(paths).toHaveLength(count);
+		expect(WORKSPACE_RANGE_LIMITS).toMatchObject({ count: 256, jsonBytes: 128 * 1024 });
+	});
+
+	test("serialized UTF-8 bytes include the version wrapper and trigger scope fallback", async () => {
+		await write(join(workspace, "scope-seed.txt"), "seed");
+		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
+		if (!scope) throw new Error("Missing scope");
+		const path = join(workspace, "字".repeat(200));
+		const ranges = Array.from({ length: 180 }, (_, i) => ({
+			kind: "file" as const,
+			canonicalPath: `${path}-${i}`,
+		}));
+		// Stay under the count budget, cross bytes rather than UTF-16 characters.
+		const compact = JSON.stringify({ version: 1, ranges });
+		expect(compact.length).toBeLessThan(WORKSPACE_RANGE_LIMITS.jsonBytes);
+		expect(Buffer.byteLength(compact)).toBeLessThan(WORKSPACE_RANGE_LIMITS.jsonBytes);
+		const padding = "字".repeat(80);
+		const oversized = ranges.map((range) => ({
+			...range,
+			canonicalPath: `${range.canonicalPath}${padding}`,
+		}));
+		expect(oversized.length).toBeLessThan(WORKSPACE_RANGE_LIMITS.count);
+		expect(JSON.stringify({ version: 1, ranges: oversized }).length).toBeLessThan(
+			WORKSPACE_RANGE_LIMITS.jsonBytes,
+		);
+		expect(Buffer.byteLength(JSON.stringify({ version: 1, ranges: oversized }))).toBeGreaterThan(
+			WORKSPACE_RANGE_LIMITS.jsonBytes,
+		);
+		expect(
+			buildRevertScopeRanges(
+				scope,
+				ranges.map((range) => range.canonicalPath),
+			),
+		).toEqual(ranges);
+		const fallback = buildRevertScopeRanges(
+			scope,
+			oversized.map((range) => range.canonicalPath),
+		);
+		expect(fallback).toEqual([{ kind: "subtree", canonicalPath: scope.canonicalRoot }]);
+		expect(freezeWorkspaceRanges(scope, fallback)).toEqual(fallback);
+	});
+
+	test("exact 128 KiB serialized boundary stays precise and one extra byte falls back", async () => {
+		await write(join(workspace, "scope-seed.txt"), "seed");
+		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
+		if (!scope) throw new Error("Missing scope");
+		const ranges = Array.from({ length: 32 }, (_, i) => ({
+			kind: "file" as const,
+			canonicalPath: join(workspace, `long-${i}-`),
+		}));
+		const initialBytes = Buffer.byteLength(JSON.stringify({ version: 1, ranges }));
+		const padding = Math.floor((WORKSPACE_RANGE_LIMITS.jsonBytes - initialBytes) / ranges.length);
+		for (const range of ranges) range.canonicalPath += "x".repeat(padding);
+		ranges[0].canonicalPath += "x".repeat(
+			WORKSPACE_RANGE_LIMITS.jsonBytes - Buffer.byteLength(JSON.stringify({ version: 1, ranges })),
+		);
+		expect(Buffer.byteLength(JSON.stringify({ version: 1, ranges }))).toBe(
+			WORKSPACE_RANGE_LIMITS.jsonBytes,
+		);
+		expect(
+			buildRevertScopeRanges(
+				scope,
+				ranges.map((range) => range.canonicalPath),
+			),
+		).toEqual(ranges);
+		ranges[0].canonicalPath += "x";
+		expect(
+			buildRevertScopeRanges(
+				scope,
+				ranges.map((range) => range.canonicalPath),
+			),
+		).toEqual([{ kind: "subtree", canonicalPath: scope.canonicalRoot }]);
+	});
+
+	test("fallback never masks an invalid target outside its authorized scope", async () => {
+		await write(join(workspace, "scope-seed.txt"), "seed");
+		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
+		if (!scope) throw new Error("Missing scope");
+		const paths = Array.from({ length: 257 }, (_, i) => join(workspace, `range-${i}`));
+		paths[256] = join(root, "outside-scope");
+		expect(() => buildRevertScopeRanges(scope, paths)).toThrow("escapes");
+		expect(coordinatorState.leases.size).toBe(0);
+		expect(runtime.evidence.getScope(scope.id)?.activeLeaseId).toBeNull();
+	});
+
+	test.each([
+		"target",
+		"scope",
+	] as const)("existing %s activity rejects apply without consuming the prepared plan", async (kind) => {
+		const targetRoot = join(workspace, "target");
+		await fs.mkdir(targetRoot);
+		const path = join(targetRoot, "activity.txt");
+		await fs.writeFile(path, "original");
+		await write(path, "changed");
+		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
+		if (!scope) throw new Error("Missing scope");
+		const binding = localFileChangeRuntimeBinding("local");
+		if (!binding) throw new Error("Missing runtime");
+		const activityScope =
+			kind === "target"
+				? {
+						...scope,
+						id: generateId(),
+						workspaceInstanceId: generateId(),
+						canonicalRoot: targetRoot,
+						rootIdentityJson: { object: await localDirectoryIdentity(targetRoot) },
+					}
+				: scope;
+		if (kind === "target") db.insert(schema.fileChangeScopes).values(activityScope).run();
+		const activity = runtime.coordinator.registerActivity({
+			scope: activityScope,
+			runtime: binding,
+		});
+		try {
+			// Preview remains read-only and useful while Bash/unknown execution is active.
+			const plan = await prepare();
+			const before = history();
+			const files = journalFiles(plan);
+			await expect(execution(plan).result).rejects.toMatchObject({
+				code: "uncoordinated_activity",
+			});
+			expect(await fs.readFile(path, "utf8")).toBe("changed");
+			expect(history()).toBe(before);
+			expect(journalFiles(plan)).toEqual(files);
+			expect(operation(plan)?.status).toBe("prepared");
+			expect(coordinatorState.leases.size).toBe(0);
+			expect(runtime.evidence.getScope(scope.id)?.activeMutationCount).toBe(0);
+		} finally {
+			runtime.coordinator.endActivity(activity);
+		}
+	});
+
+	test("a real registered activity in the last dispatch barrier vetoes an observing native restore", async () => {
+		const { a, plan } = await twoFiles();
+		const file = journalFiles(plan)[0];
+		const scope = runtime.evidence.getScope(file.scopeId);
+		const binding = localFileChangeRuntimeBinding("local");
+		const expected = file.expectedStateJson;
+		const desired = file.desiredStateJson;
+		if (!scope || !binding || expected.kind !== "regular" || desired.kind !== "regular")
+			throw new Error("Missing regular-file fixture");
+		const before = history();
+		const files = journalFiles(plan);
+		const mutationId = generateId();
+		await runtime.coordinator.withRollback(
+			{
+				scope,
+				runtime: binding,
+				activityPolicy: "observe",
+				executionClass: "local_file_io",
+				ranges: [{ kind: "file", canonicalPath: a }],
+			},
+			async (lease) => {
+				let activity: ReturnType<typeof runtime.coordinator.registerActivity> | undefined;
+				try {
+					const result = await restoreLocalFile({
+						mutationId,
+						requestDigest: hash("last-dispatch-activity-regression"),
+						backend: localBackend,
+						lease,
+						scope,
+						identity: file.identityJson,
+						executionBinding: lease.executionBinding,
+						rootObjectIdentity: await localDirectoryIdentity(scope.canonicalRoot),
+						expectedObjectIdentity: localObjectIdentity(await fs.lstat(a, { bigint: true })),
+						expected,
+						desired,
+						signal: AbortSignal.timeout(30_000),
+						readRuntime: localFileChangeRuntimeBinding,
+						async authorize(guard) {
+							await access.authorizeFile({
+								principal,
+								owner,
+								identity: file.identityJson,
+								signal: guard.signal,
+							});
+						},
+						assertCurrent: () => lease.assertCurrent(),
+						readBlob: (ref, options) => namespace.store.readBytes(ref, options),
+						onDispatch() {
+							lease.registerMutation(mutationId);
+							activity = runtime.coordinator.registerActivity({ scope, runtime: binding });
+						},
+					});
+					await result.whenSettled;
+					expect(activity).toBeDefined();
+					expect(lease.overlappedUncoordinatedActivity).toBe(true);
+					expect(result).toMatchObject({
+						status: "not_dispatched",
+						reason: "guard_failed",
+						stats: { dispatches: 0, bytesWritten: 0 },
+					});
+					expect(await fs.readFile(a, "utf8")).toBe("changed");
+					expect(history()).toBe(before);
+					expect(journalFiles(plan)).toEqual(files);
+				} finally {
+					if (activity) runtime.coordinator.endActivity(activity);
+					if (lease.pendingMutationCount) lease.settle(mutationId, "not_applied");
+				}
+			},
+		);
+		expect(operation(plan)?.status).toBe("prepared");
+		expect(coordinatorState.leases.size).toBe(0);
+	});
+
+	test("strict rollback rejects new intersecting activity but allows sibling activity", async () => {
+		const { a, plan } = await twoFiles();
+		const fixed = journalFiles(plan)[0];
+		const scope = runtime.evidence.getScope(fixed.scopeId);
+		const binding = localFileChangeRuntimeBinding("local");
+		if (!scope || !binding) throw new Error("Missing scope/runtime");
+		const siblingRoot = join(workspace, "sibling");
+		await fs.mkdir(siblingRoot);
+		const siblingPath = join(siblingRoot, "untouched.txt");
+		await fs.writeFile(siblingPath, "sibling contents");
+		const siblingScope = {
+			...scope,
+			id: generateId(),
+			workspaceInstanceId: generateId(),
+			canonicalRoot: siblingRoot,
+			rootIdentityJson: { object: await localDirectoryIdentity(siblingRoot) },
+		};
+		db.insert(schema.fileChangeScopes).values(siblingScope).run();
+		const sibling = runtime.coordinator.registerActivity({ scope: siblingScope, runtime: binding });
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		let checked = false;
+		const spy = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation((request, body) =>
+			original(request, async (batch) => {
+				expect(batch.leases[0].activityPolicy).toBe("strict");
+				expect(() => runtime.coordinator.registerActivity({ scope, runtime: binding })).toThrow(
+					"rollback",
+				);
+				const brief = runtime.coordinator.registerActivity({
+					scope: siblingScope,
+					runtime: binding,
+				});
+				runtime.coordinator.endActivity(brief);
+				checked = true;
+				return body(batch);
+			}),
+		);
+		restores.push(() => spy.mockRestore());
+		try {
+			expect((await execution(plan).result).status).toBe("committed");
+			expect(checked).toBe(true);
+			expect(await fs.readFile(a, "utf8")).toBe("original");
+			expect(await fs.readFile(siblingPath, "utf8")).toBe("sibling contents");
+		} finally {
+			runtime.coordinator.endActivity(sibling);
+		}
+	});
+
+	test("activity on one member rejects a multi-scope plan without consuming partial leases", async () => {
+		const other = join(root, "other");
+		await fs.mkdir(other);
+		for (const cwd of [workspace, other]) {
+			const path = join(cwd, "file.txt");
+			await fs.writeFile(path, "original");
+			await write(path, "changed", cwd);
+		}
+		const scopes = db.select().from(schema.fileChangeScopes).limit(3).all();
+		expect(scopes).toHaveLength(2);
+		const target = scopes.find((scope) => scope.canonicalRoot === other);
+		const binding = localFileChangeRuntimeBinding("local");
+		if (!target || !binding) throw new Error("Missing scope/runtime");
+		const plan = await prepare();
+		const before = history();
+		const files = journalFiles(plan);
+		const activity = runtime.coordinator.registerActivity({ scope: target, runtime: binding });
+		try {
+			await expect(execution(plan).result).rejects.toMatchObject({
+				code: "uncoordinated_activity",
+			});
+			expect(history()).toBe(before);
+			expect(journalFiles(plan)).toEqual(files);
+			expect(operation(plan)?.status).toBe("prepared");
+			expect(coordinatorState.leases.size).toBe(0);
+			for (const scope of scopes) {
+				expect(runtime.evidence.getScope(scope.id)?.fencingToken).toBe(scope.fencingToken);
+				expect(runtime.evidence.getScope(scope.id)?.activeLeaseId).toBeNull();
+				expect(await fs.readFile(join(scope.canonicalRoot, "file.txt"), "utf8")).toBe("changed");
+			}
+		} finally {
+			runtime.coordinator.endActivity(activity);
+		}
+	});
+
+	test("real 257-file prepared plan applies under one bounded scope subtree lease", async () => {
+		service = new RevertTransactionService(db, { ...options, timeoutMs: 120_000 });
+		const paths = Array.from({ length: 257 }, (_, i) => join(workspace, `budget-${i}.txt`));
+		for (const path of paths) {
+			await fs.writeFile(path, "original");
+			await write(path, "changed");
+		}
+		const siblingRoot = join(workspace, "unselected-sibling");
+		await fs.mkdir(siblingRoot);
+		const siblingPath = join(siblingRoot, "not-in-plan.txt");
+		await fs.writeFile(siblingPath, "keep this content");
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(257);
+		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
+		const binding = localFileChangeRuntimeBinding("local");
+		if (!scope || !binding) throw new Error("Missing scope/runtime");
+		const siblingScope = {
+			...scope,
+			id: generateId(),
+			workspaceInstanceId: generateId(),
+			canonicalRoot: siblingRoot,
+			rootIdentityJson: { object: await localDirectoryIdentity(siblingRoot) },
+		};
+		db.insert(schema.fileChangeScopes).values(siblingScope).run();
+		const activity = runtime.coordinator.registerActivity({
+			scope: siblingScope,
+			runtime: binding,
+		});
+		const before = history(FILE_CHANGE_LIMITS.revertFiles);
+		const files = journalFiles(plan, FILE_CHANGE_LIMITS.revertFiles);
+		expect(files).toHaveLength(257);
+		try {
+			// A large fixed plan tightens admission to its authorized scope, not its mutation set.
+			await expect(execution(plan).result).rejects.toMatchObject({
+				code: "uncoordinated_activity",
+			});
+			expect(history(FILE_CHANGE_LIMITS.revertFiles)).toBe(before);
+			expect(journalFiles(plan, FILE_CHANGE_LIMITS.revertFiles)).toEqual(files);
+			for (const path of paths) expect(await fs.readFile(path, "utf8")).toBe("changed");
+			expect(operation(plan)?.status).toBe("prepared");
+			expect(coordinatorState.leases.size).toBe(0);
+		} finally {
+			runtime.coordinator.endActivity(activity);
+		}
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		let entered = false;
+		const spy = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation((request, body) =>
+			original(request, async (batch) => {
+				expect(batch.leases).toHaveLength(1);
+				expect(batch.leases[0].ranges).toEqual([{ kind: "subtree", canonicalPath: workspace }]);
+				entered = true;
+				return body(batch);
+			}),
+		);
+		restores.push(() => spy.mockRestore());
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(entered).toBe(true);
+		for (const path of paths) expect(await fs.readFile(path, "utf8")).toBe("original");
+		expect(await fs.readFile(siblingPath, "utf8")).toBe("keep this content");
+		expect(db.select().from(schema.narratorMessageRefs).limit(1).all()).toHaveLength(0);
+		expect(
+			db
+				.select()
+				.from(schema.revertOperationFiles)
+				.where(eq(schema.revertOperationFiles.revertOperationId, plan.id))
+				.limit(1000)
+				.all()
+				.every((file) => file.status === "verified"),
+		).toBe(true);
+		expect(coordinatorState.leases.size).toBe(0);
+	}, 120_000);
+});
 
 describe("deterministic actor interleaving model", () => {
 	for (const selectedMask of [1, 3, 6, 9, 12, 15]) {
@@ -580,6 +1031,214 @@ describe("deterministic actor interleaving model", () => {
 });
 
 describe("real tools -> original prepared manifests -> local transaction", () => {
+	test("snapshot conflict recovery requires explicit confirmation before journal or target mutation", async () => {
+		const path = join(workspace, "snapshot-conflict.txt");
+		await fs.writeFile(path, "baseline\r\n", { mode: 0o751 });
+		await write(path, "selected one\n");
+		await fs.writeFile(path, "human between selections\n");
+		await write(path, "selected two\n");
+		await fs.writeFile(path, "human after selections\n");
+		await fs.chmod(path, 0o600);
+		const selectiveFailure = await prepare({ kind: "revert", uiAction: "revert_files" }).catch(
+			(error: unknown) => error,
+		);
+		expect(selectiveFailure).toMatchObject({ code: "REVERT_PLANNER_REVERSAL_REFUSED" });
+		const plan = await prepare({
+			kind: "revert",
+			uiAction: "revert_files",
+			recoveryMode: "snapshot",
+		});
+		const request = {
+			principal,
+			narratorId: "narrator",
+			planId: plan.id,
+			planHash: plan.planHash ?? "",
+			action: "revert_files" as const,
+		};
+		const before = history();
+		const raw = await manifestRequest(plan);
+		await snapshotConsentRequired(runRevertManifestWorker(raw, AbortSignal.timeout(10_000)));
+		const validated = await runRevertManifestWorker<ValidatedTransactionManifest>(
+			{ ...raw, acceptSnapshotRestore: true },
+			AbortSignal.timeout(10_000),
+		);
+		expect(journalFiles(plan)[0].desiredStateJson).toEqual(validated.files[0].desired);
+		await snapshotConsentRequired(service.validateHttpAction(request));
+		await snapshotConsentRequired(service.execute(request).result);
+		await snapshotConsentRequired(execution(plan).result);
+		expect(operation(plan)?.status).toBe("prepared");
+		expect(journalFiles(plan)[0].status).toBe("prepared");
+		expect(await fs.readFile(path, "utf8")).toBe("human after selections\n");
+		expect(history()).toBe(before);
+		await service.validateHttpAction({ ...request, acceptSnapshotRestore: true });
+		expect((await service.execute({ ...request, acceptSnapshotRestore: true }).result).status).toBe(
+			"committed",
+		);
+		expect(await fs.readFile(path, "utf8")).toBe("baseline\r\n");
+		expect((await fs.stat(path)).mode & 0o7777).toBe(0o751);
+		expect(history()).toBe(before);
+		await snapshotConsentRequired(service.execute(request).result);
+		await snapshotConsentRequired(execution(plan).result);
+		expect((await service.execute({ ...request, acceptSnapshotRestore: true }).result).status).toBe(
+			"committed",
+		);
+	});
+
+	test.each([
+		"wrong_snapshot_target",
+		"wrong_snapshot_method",
+		"snapshot_method_on_selective",
+	] as const)("full worker refuses producer's committed %s manifest", async (fault) => {
+		const path = join(workspace, "invalid-snapshot-manifest.txt");
+		await fs.writeFile(path, "earliest selected before\n");
+		await write(path, "selected one\n");
+		await write(path, "selected two\n");
+		const original = FileChangeReversalCalculator.prototype.calculate;
+		const broken = spyOn(FileChangeReversalCalculator.prototype, "calculate").mockImplementation(
+			async function (this: FileChangeReversalCalculator, input) {
+				const result = await original.call(this, input);
+				if (!result.ok) return result;
+				if (fault === "wrong_snapshot_target") {
+					const latest = [...input.effects]
+						.sort((a, b) => b.scopeRevision - a.scopeRevision)
+						.find((effect) => effect.outcome === "changed");
+					if (!latest || latest.before.kind === "unknown" || latest.before.kind === "symlink")
+						throw new Error("Expected real selected before");
+					return { ...result, desired: latest.before };
+				}
+				return {
+					...result,
+					steps: result.steps.map((step) => ({
+						...step,
+						method:
+							fault === "wrong_snapshot_method"
+								? ("restore_before" as const)
+								: ("restore_snapshot" as const),
+					})),
+				};
+			},
+		);
+		restores.push(() => broken.mockRestore());
+		const plan = await prepare({
+			kind: "revert",
+			uiAction: "revert_files",
+			...(fault === "snapshot_method_on_selective" ? {} : { recoveryMode: "snapshot" as const }),
+		});
+		broken.mockRestore();
+		const request = await manifestRequest(plan);
+		const code = fault === "wrong_snapshot_target" ? "SNAPSHOT_TARGET_CONFLICT" : "STEP_METHOD";
+		await expect(
+			runRevertManifestWorker(
+				{ ...request, acceptSnapshotRestore: true },
+				AbortSignal.timeout(10_000),
+			),
+		).rejects.toThrow(code);
+		await expect(
+			service.execute({
+				principal,
+				narratorId: "narrator",
+				planId: plan.id,
+				planHash: plan.planHash ?? "",
+				action: "revert_files",
+				acceptSnapshotRestore: true,
+			}).result,
+		).rejects.toThrow(code);
+		expect(operation(plan)?.status).toBe("prepared");
+		expect(await fs.readFile(path, "utf8")).toBe("selected two\n");
+	});
+
+	test("snapshot never restores a measured no-change effect's unrelated baseline", async () => {
+		const path = join(workspace, "snapshot-no-change.txt");
+		await fs.writeFile(path, "same\n");
+		await write(path, "same\n");
+		await fs.writeFile(path, "human change after no-op\n");
+		const before = history();
+		const plan = await prepare({
+			kind: "revert",
+			uiAction: "revert_files",
+			recoveryMode: "snapshot",
+		});
+		const raw = await manifestRequest(plan);
+		const manifest = await runRevertManifestWorker<ValidatedTransactionManifest>(
+			{ ...raw, acceptSnapshotRestore: true },
+			AbortSignal.timeout(10_000),
+		);
+		expect(manifest.files[0].desired).toEqual(manifest.files[0].expected);
+		expect(
+			(
+				await service.execute({
+					principal,
+					narratorId: "narrator",
+					planId: plan.id,
+					planHash: plan.planHash ?? "",
+					action: "revert_files",
+					acceptSnapshotRestore: true,
+				}).result
+			).status,
+		).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("human change after no-op\n");
+		expect(operation(plan)?.appliedFileCount).toBe(0);
+		expect(history()).toBe(before);
+	});
+
+	test("snapshot confirmation does not permit new content after preview", async () => {
+		const path = join(workspace, "snapshot-stale.txt");
+		await fs.writeFile(path, "baseline\n");
+		await write(path, "selected\n");
+		await fs.writeFile(path, "conflicting before preview\n");
+		const plan = await prepare({
+			kind: "revert",
+			uiAction: "revert_files",
+			recoveryMode: "snapshot",
+		});
+		await fs.writeFile(path, "new content after preview\n");
+		const before = history();
+		await expect(
+			service.execute({
+				principal,
+				narratorId: "narrator",
+				planId: plan.id,
+				planHash: plan.planHash ?? "",
+				action: "revert_files",
+				acceptSnapshotRestore: true,
+			}).result,
+		).rejects.toThrow();
+		expect(await fs.readFile(path, "utf8")).toBe("new content after preview\n");
+		expect(history()).toBe(before);
+		expect(operation(plan)?.status).toBe("prepared");
+	});
+
+	test("confirmation cannot flip selective plan into snapshot and client mode/false confirmation are refused", async () => {
+		const path = join(workspace, "selective-frozen.txt");
+		const base = "A0\n1\n2\n3\n4\nH0\n";
+		await fs.writeFile(path, base);
+		await write(path, base.replace("A0", "A1"));
+		await fs.writeFile(path, base.replace("A0", "A1").replace("H0", "H1"));
+		const plan = await prepare({ kind: "revert", uiAction: "revert_files" });
+		const request = {
+			principal,
+			narratorId: "narrator",
+			planId: plan.id,
+			planHash: plan.planHash ?? "",
+			action: "revert_files" as const,
+		};
+		expect(() =>
+			service.execute({
+				...request,
+				recoveryMode: "snapshot",
+				acceptSnapshotRestore: true,
+			} as Parameters<RevertTransactionService["execute"]>[0]),
+		).toThrow("INVALID_REQUEST");
+		expect(() =>
+			service.execute({ ...request, acceptSnapshotRestore: false } as unknown as Parameters<
+				RevertTransactionService["execute"]
+			>[0]),
+		).toThrow("INVALID_REQUEST");
+		expect((await service.execute({ ...request, acceptSnapshotRestore: true }).result).status).toBe(
+			"committed",
+		);
+		expect(await fs.readFile(path, "utf8")).toBe(base.replace("H0", "H1"));
+	});
 	test("A / authenticated editor / B: reverse A only preserves human and unselected B hunks; file-only history stays", async () => {
 		const path = join(workspace, "hunks.txt");
 		const original = "A0\n1\n2\n3\n4\nH0\n5\n6\n7\n8\nB0\n";
@@ -777,7 +1436,9 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				status: "quarantined",
 				rangesJson: {
 					version: 1,
-					ranges: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
+					ranges: terminalFiles
+						.filter((file) => file.scopeId === scope.id)
+						.map((file) => ({ kind: "file", canonicalPath: file.identityJson.canonicalPath })),
 				},
 				mutationManifestJson: {
 					version: 1,
@@ -797,20 +1458,29 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				quarantinedLeaseCount: 1,
 				active: { retainedRecoveryHolds: 0 },
 			});
-			// A rollback owns the whole subtree, not merely the changed file.
-			for (const name of ["file.txt", "untouched-sibling.txt"])
-				await expect(
-					runtime.coordinator.withWrite(
-						{
-							scope,
-							runtime: binding,
-							ranges: [{ kind: "file", canonicalPath: join(scope.canonicalRoot, name) }],
-						},
-						() => {
-							throw new Error("Quarantined subtree must not admit writes");
-						},
-					),
-				).rejects.toThrow("verification");
+			// Only the actual rollback target remains quarantined.
+			await expect(
+				runtime.coordinator.withWrite(
+					{
+						scope,
+						runtime: binding,
+						ranges: [{ kind: "file", canonicalPath: join(scope.canonicalRoot, "file.txt") }],
+					},
+					() => {
+						throw new Error("Quarantined target must not admit writes");
+					},
+				),
+			).rejects.toThrow("verification");
+			await runtime.coordinator.withWrite(
+				{
+					scope,
+					runtime: binding,
+					ranges: [
+						{ kind: "file", canonicalPath: join(scope.canonicalRoot, "untouched-sibling.txt") },
+					],
+				},
+				() => {},
+			);
 		}
 		expect(history()).toBe(terminalHistory);
 		expect(journalFiles(plan)).toEqual(terminalFiles);
@@ -930,7 +1600,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		false,
 		true,
 	])("compensation refuses third-party %s replacement, pins separate third-state observation", async (sameBytes) => {
-		const { a, plan } = await twoFiles();
+		const { a, b, plan } = await twoFiles();
 		const before = history();
 		failHistoryCommit();
 		const begin = RevertMutationJournal.prototype.beginCompensation;
@@ -972,7 +1642,9 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			status: "quarantined",
 			rangesJson: {
 				version: 1,
-				ranges: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
+				ranges: journalFiles(plan)
+					.filter((file) => file.scopeId === scope.id)
+					.map((file) => ({ kind: "file", canonicalPath: file.identityJson.canonicalPath })),
 			},
 			mutationManifestJson: {
 				version: 1,
@@ -990,7 +1662,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		});
 		const binding = localFileChangeRuntimeBinding("local");
 		if (!binding) throw new Error("Missing local runtime");
-		for (const path of [a, join(scope.canonicalRoot, "untouched-sibling.txt")])
+		for (const path of [a, b])
 			await expect(
 				runtime.coordinator.withWrite(
 					{ scope, runtime: binding, ranges: [{ kind: "file", canonicalPath: path }] },
@@ -999,6 +1671,17 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 					},
 				),
 			).rejects.toThrow("verification");
+		// A failed two-file recovery does not quarantine the entire repository.
+		await runtime.coordinator.withWrite(
+			{
+				scope,
+				runtime: binding,
+				ranges: [
+					{ kind: "file", canonicalPath: join(scope.canonicalRoot, "untouched-sibling.txt") },
+				],
+			},
+			() => {},
+		);
 		expect(await fs.readFile(a, "utf8")).toBe(sameBytes ? "original" : "third-party");
 		expect(history()).toBe(before);
 	});
@@ -1376,6 +2059,50 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			apply: { receipt: { confirmed: true, outcome: "not_applied" } },
 		});
 	});
+	test("bounded response keeps namespace until compensation IO settlement", async () => {
+		const { a, b, plan } = await twoFiles();
+		const before = history();
+		const entered = hold();
+		const release = hold();
+		const controller = new AbortController();
+		let held = false;
+		let namespaceAcquired = false;
+		service = new RevertTransactionService(db, { ...options, cleanupTimeoutMs: 50 });
+		fileHook = async (path) => {
+			if (
+				path === b &&
+				operation(plan)?.status === "applying" &&
+				journalFiles(plan)[1].status === "applying"
+			)
+				controller.abort();
+			if (
+				!held &&
+				path === a &&
+				operation(plan)?.status === "compensating" &&
+				(await fs.readFile(a, "utf8")) === "changed"
+			) {
+				held = true;
+				entered.release();
+				await release.promise;
+			}
+		};
+		const attempt = execution(plan, controller.signal);
+		await entered.promise;
+		const namespaceWait = runtime.withNamespaceAccess(async () => {
+			namespaceAcquired = true;
+		});
+		try {
+			expect(await attempt.result).toMatchObject({ status: "recovery_required", settling: true });
+			expect(namespaceAcquired).toBe(false);
+			expect(operation(plan)?.status).toBe("compensating");
+		} finally {
+			release.release();
+		}
+		expect((await attempt.whenSettled).settling).toBe(false);
+		await namespaceWait;
+		expect(namespaceAcquired).toBe(true);
+		expect(history()).toBe(before);
+	});
 	test("cancel during post-dispatch guard returns bounded response but retains lease until real lifetime settles", async () => {
 		const { a, plan } = await twoFiles();
 		const before = history();
@@ -1398,6 +2125,8 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			}
 		};
 		const attempt = execution(plan, controller.signal);
+		let namespaceAcquired = false;
+		let namespaceWait: Promise<void> | undefined;
 		try {
 			await entered.promise;
 			controller.abort();
@@ -1406,6 +2135,9 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				status: "recovery_required",
 				settling: true,
 				journalStatus: "applying",
+			});
+			namespaceWait = runtime.withNamespaceAccess(async () => {
+				namespaceAcquired = true;
 			});
 			const row = journalFiles(plan)[0];
 			const scope = runtime.evidence.getScope(row.scopeId);
@@ -1425,10 +2157,13 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 					() => {},
 				),
 			).rejects.toThrow();
+			expect(namespaceAcquired).toBe(false);
 		} finally {
 			release.release();
 		}
 		const final = await attempt.whenSettled;
+		await namespaceWait;
+		expect(namespaceAcquired).toBe(true);
 		expect(final).toMatchObject({ status: "recovery_required", settling: false });
 		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
 			apply: { receipt: { confirmed: false, outcome: "unknown" } },
@@ -1457,19 +2192,283 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(history()).toBe(before);
 		expect(operation(plan)?.status).toBe("prepared");
 	});
-	test("lease admission detects intervening real coordinator revision/fence without re-planning", async () => {
+	test("waiting rollback releases namespace so a coordinator-owned writer can finish", async () => {
 		const { a, plan } = await twoFiles();
+		const waiting = hold();
+		const release = hold();
 		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
 		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
 			async (request, body) => {
-				await runtime.coordinator.withWrite(request.scopes[0], () => {});
+				waiting.release();
+				await release.promise;
 				return original(request, body);
 			},
 		);
 		restores.push(() => delay.mockRestore());
-		await expect(execution(plan).result).rejects.toThrow("WAITING_PLAN_STALE");
+		const attempt = execution(plan);
+		try {
+			await waiting.promise;
+			const scope = runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
+			if (!scope) throw new Error("Missing scope");
+			const writer = runtime.coordinator.withWrite(
+				{
+					scope,
+					runtime: localFileChangeRuntimeBinding("local") as NonNullable<
+						ReturnType<typeof localFileChangeRuntimeBinding>
+					>,
+				},
+				() => runtime.withNamespaceAccess(async () => "namespace acquired"),
+			);
+			// The deadline is a deadlock guard, not the sequencing mechanism.
+			await expect(
+				Promise.race([
+					writer,
+					new Promise((_, reject) => {
+						const timer = setTimeout(() => reject(new Error("Lock order deadlock")), 1000);
+						void writer.finally(() => clearTimeout(timer));
+					}),
+				]),
+			).resolves.toBe("namespace acquired");
+		} finally {
+			release.release();
+			await attempt.whenSettled;
+		}
+		expect(operation(plan)?.status).toBe("committed");
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+	});
+	test("hot-loaded namespace-first writer finishes after rollback loses atomic namespace admission", async () => {
+		const { a, plan } = await twoFiles();
+		const entered = hold();
+		const queued = hold();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		let legacy: Promise<void> | undefined;
+		let attempts = 0;
+		const admission = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			(request, body) =>
+				original(request, async (batch) => {
+					if (++attempts === 1) {
+						// Simulate retained HEAD code: namespace first, then coordinator. The
+						// new rollback already owns coordinator, so waiting for namespace deadlocks.
+						legacy = coordinatorState.executionContext.exit(() =>
+							runtime.withNamespaceAccess(async () => {
+								entered.release();
+								const { activityPolicy: _policy, ...target } = request.scopes[0];
+								const write = runtime.coordinator.withWrite(target, () => {});
+								queued.release();
+								await write;
+							}),
+						);
+						await entered.promise;
+						await queued.promise;
+					}
+					return body(batch);
+				}),
+		);
+		const previews = spyOn(access, "resolveFile");
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => admission.mockRestore(),
+			() => previews.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		service = new RevertTransactionService(db, { ...options, timeoutMs: 2000 });
+		const attempt = execution(plan);
+		expect((await attempt.whenSettled).status).toBe("committed");
+		await legacy;
+		expect(attempts).toBe(2);
+		expect(previews).toHaveBeenCalledTimes(journalFiles(plan).length);
+		expect(claims).toHaveBeenCalledTimes(1);
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+		expect(journalFiles(plan)).toHaveLength(2);
+	});
+	test("cancelled namespace drain never acquires rollback leases or interrupts its owner", async () => {
+		const { a, plan } = await twoFiles();
+		const entered = hold();
+		const release = hold();
+		const draining = hold();
+		const controller = new AbortController();
+		const original = runtime.waitForNamespaceDrain.bind(runtime);
+		let holder: Promise<void> | undefined;
+		const drain = spyOn(runtime, "waitForNamespaceDrain").mockImplementation(async (signal) => {
+			holder = runtime.withNamespaceAccess(async () => {
+				entered.release();
+				await release.promise;
+			});
+			await entered.promise;
+			draining.release();
+			return original(signal);
+		});
+		const admission = spyOn(runtime.coordinator, "withRollbackMany");
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => drain.mockRestore(),
+			() => admission.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		const attempt = execution(plan, controller.signal);
+		try {
+			await draining.promise;
+			controller.abort();
+			await expect(attempt.whenSettled).rejects.toThrow("CANCELLED");
+			expect(admission).not.toHaveBeenCalled();
+			expect(claims).not.toHaveBeenCalled();
+			expect(operation(plan)?.status).toBe("prepared");
+		} finally {
+			release.release();
+			await holder;
+		}
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
-		expect(operation(plan)?.status).toBe("prepared");
+	});
+	test("namespace busy with failed coordinator release is not retried through its cause", async () => {
+		const { plan } = await twoFiles();
+		const entered = hold();
+		const release = hold();
+		let holder: Promise<void> | undefined;
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const admission = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			(request, body) =>
+				original(request, async (batch) => {
+					holder = runtime.withNamespaceAccess(async () => {
+						entered.release();
+						await release.promise;
+					});
+					await entered.promise;
+					sqlite.exec(`CREATE TRIGGER reject_busy_scope_release BEFORE UPDATE OF active_lease_id ON file_change_scopes
+					WHEN NEW.active_lease_id IS NULL AND OLD.active_lease_id IS NOT NULL
+					BEGIN SELECT RAISE(ABORT, 'busy-scope-release-failed'); END;`);
+					return body(batch);
+				}),
+		);
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => admission.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		try {
+			await expect(execution(plan).whenSettled).rejects.toThrow(
+				"Durable batch finalization failed",
+			);
+			expect(admission).toHaveBeenCalledTimes(1);
+			expect(claims).not.toHaveBeenCalled();
+			expect(operation(plan)?.status).toBe("prepared");
+			expect(
+				runtime.evidence.getScope(journalFiles(plan)[0].scopeId)?.activeLeaseId,
+			).not.toBeNull();
+		} finally {
+			sqlite.exec("DROP TRIGGER IF EXISTS reject_busy_scope_release");
+			release.release();
+			await holder;
+		}
+	});
+	test("cancelled rollback namespace admission releases its leases but not the current namespace owner", async () => {
+		const { a, plan } = await twoFiles();
+		const waiting = hold();
+		const admit = hold();
+		const namespaceEntered = hold();
+		const namespaceRelease = hold();
+		const callbackEntered = hold();
+		const controller = new AbortController();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			async (request, body) => {
+				waiting.release();
+				await admit.promise;
+				return original(request, (batch) => {
+					callbackEntered.release();
+					return body(batch);
+				});
+			},
+		);
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => delay.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		const attempt = execution(plan, controller.signal);
+		await waiting.promise;
+		const holder = runtime.withNamespaceAccess(async () => {
+			namespaceEntered.release();
+			await namespaceRelease.promise;
+		});
+		let successorEntered = false;
+		let successor: Promise<void> | undefined;
+		try {
+			await namespaceEntered.promise;
+			admit.release();
+			await callbackEntered.promise;
+			controller.abort();
+			await expect(attempt.whenSettled).rejects.toThrow("CANCELLED");
+			const scope = runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
+			expect(scope?.activeLeaseId).toBeNull();
+			expect(claims).not.toHaveBeenCalled();
+			expect(operation(plan)?.status).toBe("prepared");
+			successor = runtime.withNamespaceAccess(async () => {
+				successorEntered = true;
+			});
+			await Promise.resolve();
+			expect(successorEntered).toBe(false);
+		} finally {
+			admit.release();
+			namespaceRelease.release();
+			await holder;
+			await successor;
+		}
+		expect(successorEntered).toBe(true);
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+	});
+	test("namespace reset while rollback waits refuses its old plan before target IO", async () => {
+		const { a, plan } = await twoFiles();
+		const before = history();
+		const waiting = hold();
+		const release = hold();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			async (request, body) => {
+				waiting.release();
+				await release.promise;
+				return original(request, body);
+			},
+		);
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => delay.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		const attempt = execution(plan);
+		await waiting.promise;
+		const reset = runtime.withNamespaceAccess(() =>
+			resetFileChangeNamespace({
+				db,
+				privateRoot: join(root, "private"),
+				assertBoundary: async () => {},
+			}),
+		);
+		// Gate release remains deferred until reset has actually invalidated old facts.
+		await reset;
+		const opens = spyOn(fileChangeLocalIo, "read");
+		restores.push(() => opens.mockRestore());
+		release.release();
+		await expect(attempt.whenSettled).rejects.toThrow();
+		expect(opens).not.toHaveBeenCalled();
+		expect(claims).not.toHaveBeenCalled();
+		expect(operation(plan)?.status).toBe("expired");
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+		expect(history()).toBe(before);
+	});
+	test("lease admission accepts unrelated coordinator revision/fence advancement", async () => {
+		const { a, plan } = await twoFiles();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			async (request, body) => {
+				const { activityPolicy: _activityPolicy, ...writeTarget } = request.scopes[0];
+				await runtime.coordinator.withWrite(writeTarget, () => {});
+				return original(request, body);
+			},
+		);
+		restores.push(() => delay.mockRestore());
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+		expect(operation(plan)?.status).toBe("committed");
 	});
 	test("positive current-invocation no-op is not_applied, never counted as an applied mutation", async () => {
 		const path = join(workspace, "no-op.txt");
@@ -1503,6 +2502,164 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		).rejects.toThrow("Narrator denied");
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
+	});
+	test("a mixed StructSed write, default preview and pre-write refusals can retract as one range", async () => {
+		const path = join(workspace, "structsed-mixed.txt");
+		await fs.writeFile(path, "original\nkeep\n");
+		await tool("StructSed", path, {
+			file_path: path,
+			command: "replace",
+			address: "1",
+			content: "changed",
+			dry_run: false,
+		});
+		await tool("StructSed", path, {
+			file_path: path,
+			command: "replace",
+			address: "1",
+			content: "preview only",
+		});
+		await tool(
+			"StructSed",
+			path,
+			{ file_path: path, operations: [], dry_run: false },
+			workspace,
+			true,
+		);
+		await tool(
+			"StructSed",
+			path,
+			{ file_path: path, command: "delete", address: "/no-such-marker/", dry_run: false },
+			workspace,
+			true,
+		);
+		expect(await fs.readFile(path, "utf8")).toBe("changed\nkeep\n");
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(1);
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("original\nkeep\n");
+		expect(db.select().from(schema.narratorMessageRefs).limit(100).all()).toHaveLength(0);
+	});
+	test("partial rollback within one assistant message includes its failed StructSed safely", async () => {
+		const path = join(workspace, "structsed-same-message.txt");
+		await fs.writeFile(path, "original\n");
+		const written = await write(path, "changed\n");
+		await tool(
+			"StructSed",
+			path,
+			{ file_path: path, operations: [], dry_run: false },
+			workspace,
+			true,
+			"narrator",
+			written.messageId,
+		);
+		const plan = await prepare({
+			kind: "rollback_to_block",
+			selector: { kind: "after_block", messageId: written.messageId, keepThroughBlockIndex: 0 },
+		});
+		expect(plan.expectedFileCount).toBe(1);
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("original\n");
+		const retained = db
+			.select()
+			.from(schema.narratorMessages)
+			.where(eq(schema.narratorMessages.id, written.messageId))
+			.get();
+		expect(retained?.contentJson).toEqual([{ type: "text", text: "retain" }]);
+		expect(db.select().from(schema.narratorToolCalls).limit(100).all()).toHaveLength(0);
+	});
+	test("StructSed previews and invalid stash do not require a fabricated file restore", async () => {
+		const path = join(workspace, "structsed-preview.txt");
+		await fs.writeFile(path, "unchanged\n");
+		await tool("StructSed", path, {
+			file_path: path,
+			command: "delete",
+			address: "1",
+			dry_run: true,
+		});
+		await tool(
+			"StructSed",
+			path,
+			{
+				file_path: path,
+				command: "append",
+				address: "1",
+				from_stash: "stash_missing_handle",
+				dry_run: false,
+			},
+			workspace,
+			true,
+		);
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(0);
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("unchanged\n");
+		expect(db.select().from(schema.fileChangeEffects).limit(100).all()).toHaveLength(0);
+		expect(db.select().from(schema.narratorMessageRefs).limit(100).all()).toHaveLength(0);
+	});
+	test("a legacy failed StructSed without evidence cannot be inferred harmless from its status", async () => {
+		const path = join(workspace, "structsed-unverified.txt");
+		await fs.writeFile(path, "unchanged\n");
+		const call = await tool(
+			"StructSed",
+			path,
+			{ file_path: path, operations: [], dry_run: false },
+			workspace,
+			true,
+		);
+		// Simulate an old record with no authoritative proof, not a safe migration guess.
+		db.update(schema.narratorToolCalls)
+			.set({ fileChangeOperationId: null })
+			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
+			.run();
+		const before = history();
+		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
+		expect(history()).toBe(before);
+		expect(await fs.readFile(path, "utf8")).toBe("unchanged\n");
+	});
+	test("zero-file rollback rechecks namespace after reset queued during preview", async () => {
+		const path = join(workspace, "no-dispatch-reset.txt");
+		await fs.writeFile(path, "unchanged");
+		await edit(path, "missing", "new", true);
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(0);
+		const before = history();
+		const entered = hold();
+		const release = hold();
+		const readBytes = namespace.store.readBytes.bind(namespace.store);
+		let held = false;
+		const reads = spyOn(namespace.store, "readBytes").mockImplementation(async (ref, options) => {
+			if (!held) {
+				held = true;
+				entered.release();
+				await release.promise;
+			}
+			return readBytes(ref, options);
+		});
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		const admission = spyOn(runtime.coordinator, "withRollbackMany");
+		restores.push(
+			() => reads.mockRestore(),
+			() => claims.mockRestore(),
+			() => admission.mockRestore(),
+		);
+		const attempt = execution(plan);
+		await entered.promise;
+		const reset = runtime.withNamespaceAccess(() =>
+			resetFileChangeNamespace({
+				db,
+				privateRoot: join(root, "private"),
+				assertBoundary: async () => {},
+			}),
+		);
+		release.release();
+		await reset;
+		await expect(attempt.whenSettled).rejects.toThrow();
+		expect(claims).not.toHaveBeenCalled();
+		expect(admission).not.toHaveBeenCalled();
+		expect(operation(plan)?.status).toBe("expired");
+		expect(history()).toBe(before);
+		expect(await fs.readFile(path, "utf8")).toBe("unchanged");
 	});
 	test("positive no_dispatch zero-file history deletion uses no fabricated workspace lease", async () => {
 		const path = join(workspace, "no-dispatch.txt");

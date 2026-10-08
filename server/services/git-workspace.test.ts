@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../db";
 import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
@@ -19,10 +19,16 @@ import { compileExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionTargetContext } from "./execution-policy/types";
 import { recordAttribution } from "./file-attribution-service";
+import { gitDiscoveryCache } from "./git-discovery-cache";
 import { gitService, withGitRequestContext } from "./git-service";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { gitPathPolicyAllows } from "./git-workspace-access";
+import { GitAccessScan } from "./git-workspace-access-scan";
+import { getNarratorGitSummary } from "./narrator-git-summary";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
+
+// The singleton starts asynchronously; await it before a fixture captures its handle.
+const { db } = await import("../db");
 
 let root: string, repo: string, owner: string, narratorId: string;
 const scanProjectIds: string[] = [];
@@ -118,6 +124,41 @@ async function project(path: string) {
 	return id;
 }
 
+async function commitPreviewFixture() {
+	const projectId = await project(repo);
+	scanProjectIds.push(projectId);
+	await db.update(projects).set({ visibility: "public" }).where(eq(projects.id, projectId));
+	const chapterId = generateId();
+	scanChapterIds.push(chapterId);
+	await db.insert(chapters).values({
+		id: chapterId,
+		projectId,
+		title: "Commit preview",
+		branch: "main",
+		baseBranch: "main",
+		worktreePath: repo,
+		createdAt: now(),
+		updatedAt: now(),
+	});
+	const reader = generateId();
+	await db
+		.insert(users)
+		.values({ id: reader, username: reader, passwordHash: "fixture", createdAt: now() });
+	await db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId));
+	const response = await request("workspace", undefined, narratorId, reader);
+	expect(response.status).toBe(200);
+	const ws = (await response.json()) as GitWorkspace;
+	expect(ws.capabilities).toEqual({ read: true, write: false });
+	return {
+		reader,
+		projectId,
+		chapterId,
+		workspaceKey: ws.workspaceKey as string,
+		sha: await git(repo, "rev-parse", "HEAD"),
+		bases: [`/narrators/${narratorId}/git`, `/chapters/${chapterId}/git`],
+	};
+}
+
 beforeEach(async () => {
 	root = await mkdtemp(join(await realpath(tmpdir()), "nf-git-workspace-"));
 	repo = await newRepo("repo");
@@ -187,7 +228,9 @@ describe("Git workspace discovery", () => {
 			const status = await request(`status?workspaceKey=${encodeURIComponent(workspaceKey)}`);
 			expect(status.status).toBe(200);
 			expect(((await status.json()) as { hasChanges: boolean }).hasChanges).toBe(true);
-			expect((await request("stage", { all: true, workspaceKey })).status).toBe(200);
+			const staged = await request("stage", { all: true, workspaceKey });
+			if (staged.status !== 200) throw new Error(`Stage failed: ${await staged.text()}`);
+			expect(staged.status).toBe(200);
 			expect(await git(nested, "diff", "--cached", "--name-only")).toBe("seed.txt");
 		} finally {
 			glob.mockRestore();
@@ -268,15 +311,15 @@ describe("Git workspace discovery", () => {
 });
 
 describe("Git workspace project scan pagination", () => {
-	async function fixtures(mode: "unrelated" | "lexical" | "chapter") {
+	async function fixtures(mode: "unrelated" | "lexical" | "chapter", foreign = false) {
 		const unrelated = join(root, "unrelated");
 		await mkdir(unrelated);
 		const values = Array.from({ length: 300 }, (_, index) => ({
 			id: `scan-${owner}-${String(index).padStart(4, "0")}`,
 			name: "Scan fixture",
 			gitPath: mode === "lexical" ? repo : unrelated,
-			ownerUserId: owner,
-			visibility: "private" as const,
+			ownerUserId: foreign ? null : owner,
+			visibility: foreign ? ("public" as const) : ("private" as const),
 			createdAt: now(),
 			updatedAt: now(),
 		}));
@@ -304,27 +347,44 @@ describe("Git workspace project scan pagination", () => {
 		return values[values.length - 1].id;
 	}
 
-	test("more than 256 unrelated registered projects do not deny a workspace", async () => {
+	test("large owner inventories are not canonicalized on first paint or cache hits", async () => {
 		await fixtures("unrelated");
+		await workspace();
+		const canonicalize = spyOn(GitAccessScan.prototype, "canonicalize");
+		try {
+			for (let i = 0; i < 2; i++) {
+				const summary = await getNarratorGitSummary(
+					narratorId,
+					0,
+					{ userId: owner, isAdmin: false },
+					new AbortController().signal,
+				);
+				expect(summary?.workspace.state).toBe("ready");
+			}
+			for (const [rows] of canonicalize.mock.calls)
+				expect(rows.some((row) => row.gitPath === join(root, "unrelated"))).toBe(false);
+		} finally {
+			canonicalize.mockRestore();
+		}
 		expect((await workspace()).state).toBe("ready");
 	});
 
 	test("a private symlink alias after row 256 still denies access", async () => {
-		const lastId = await fixtures("unrelated");
+		const lastId = await fixtures("unrelated", true);
 		const alias = join(root, "private-alias");
 		await symlink(repo, alias);
 		await db
 			.update(projects)
-			.set({ gitPath: alias, ownerUserId: null })
+			.set({ gitPath: alias, ownerUserId: null, visibility: "private" })
 			.where(eq(projects.id, lastId));
 		expect((await workspace()).state).toBe("access_denied");
 	});
 
 	for (const mode of ["lexical", "chapter"] as const) {
 		test(`${mode} associations paginate completely and enforce the final private project`, async () => {
-			const lastId = await fixtures(mode);
+			const lastId = await fixtures(mode, true);
 			expect((await workspace()).state).toBe("ready");
-			await db.update(projects).set({ ownerUserId: null }).where(eq(projects.id, lastId));
+			await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, lastId));
 			expect((await workspace()).state).toBe("access_denied");
 		});
 	}
@@ -497,10 +557,25 @@ describe("authenticated Git management", () => {
 			runtimeGeneration: 1,
 			defaultCwd: "/remote/work",
 			supportsGitWorkspace: true,
-			async gitWorkspace(input: { cwd: string }) {
+			async gitWorkspace(input: {
+				cwd: string;
+				operation: string;
+				maxBytes: number;
+				timeoutMs: number;
+			}) {
 				expect(input.cwd).toBe("/remote/work");
+				expect(input.operation).toBe("probe");
 				probes++;
-				return { state: "ready", rootPath: "/remote/work", repositoryPath: "/remote/work/.git" };
+				if (probes > 1) {
+					expect(input.maxBytes).toBe(32 * 1024);
+					expect(input.timeoutMs).toBe(10_000);
+				}
+				return {
+					state: "ready",
+					rootPath: "/remote/work",
+					repositoryPath: "/remote/work/.git",
+					branch: "remote-main",
+				};
 			},
 			resolvePathIdentity: async (path: string) => ({
 				lexicalPath: path,
@@ -515,10 +590,126 @@ describe("authenticated Git management", () => {
 		expect(ws.cwd).toBe("/remote/work");
 		expect(ws.rootPath).toBe("/remote/work");
 		expect(probes).toBe(1);
+		const summary = () =>
+			getNarratorGitSummary(
+				narratorId,
+				0,
+				{ userId: owner, isAdmin: false },
+				new AbortController().signal,
+			);
+		expect((await summary())?.branch).toBe("remote-main");
+		expect((await summary())?.workspace.cwd).toBe("/remote/work");
+		expect(probes).toBe(1);
 		await db.update(remoteDevices).set({ revokedAt: now() }).where(eq(remoteDevices.id, deviceId));
 		expect((await request("workspace")).status).toBe(403);
+		expect((await summary())?.workspace.state).toBe("access_denied");
+		expect((await summary())?.branch).toBeNull();
 		expect(probes).toBe(1);
 	});
+});
+
+describe("commit preview routes", () => {
+	test("read-only viewers preview both domains without changing HEAD, index bytes or working files", async () => {
+		const f = await commitPreviewFixture();
+		await writeFile(join(repo, "seed.txt"), "staged draft\n");
+		await git(repo, "add", "seed.txt");
+		await writeFile(join(repo, "seed.txt"), "unstaged draft\n");
+		await writeFile(join(repo, "untracked.txt"), "untracked draft\n");
+		const indexBefore = await readFile(join(repo, ".git", "index"));
+		for (const base of f.bases) {
+			// The narrator path is pinned; the chapter adapter retains its keyless contract.
+			const params = new URLSearchParams();
+			if (base.startsWith("/narrators/")) params.set("workspaceKey", f.workspaceKey);
+			const metadata = await app(f.reader).request(`${base}/commits/${f.sha}?${params}`);
+			expect(metadata.status).toBe(200);
+			const detail = (await metadata.json()) as GitCommitDetail;
+			expect(detail).toMatchObject({
+				sha: f.sha,
+				parents: [],
+				comparedTo: null,
+				message: "baseline",
+			});
+			expect(detail.files).toContainEqual({
+				path: "seed.txt",
+				status: "added",
+				linesAdded: 1,
+				linesRemoved: 0,
+				binary: false,
+			});
+			params.set("file", "seed.txt");
+			const response = await app(f.reader).request(`${base}/commits/${f.sha}/diff?${params}`);
+			expect(response.status).toBe(200);
+			const patch = (await response.json()) as GitCommitPatch;
+			expect(patch.diff).toContain("+seed");
+			expect(patch.diff).not.toContain("draft");
+			expect(patch.truncated).toBe(false);
+		}
+		expect(await git(repo, "rev-parse", "HEAD")).toBe(f.sha);
+		expect((await readFile(join(repo, ".git", "index"))).equals(indexBefore)).toBe(true);
+		expect(await readFile(join(repo, "seed.txt"), "utf8")).toBe("unstaged draft\n");
+		expect(await readFile(join(repo, "untracked.txt"), "utf8")).toBe("untracked draft\n");
+	}, 15_000);
+
+	test("wrong workspace pins return 409 for detail and diff in either domain", async () => {
+		const f = await commitPreviewFixture();
+		for (const base of f.bases) {
+			for (const suffix of ["", "/diff"]) {
+				const params = new URLSearchParams({
+					workspaceKey: "different-device:/different-root",
+					file: "seed.txt",
+				});
+				const response = await app(f.reader).request(`${base}/commits/${f.sha}${suffix}?${params}`);
+				expect(response.status).toBe(409);
+				expect(await response.json()).toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+			}
+		}
+	}, 15_000);
+
+	test("revoked narrator and project visibility immediately denies previously readable previews", async () => {
+		const f = await commitPreviewFixture();
+		for (const base of f.bases)
+			expect((await app(f.reader).request(`${base}/commits/${f.sha}`)).status).toBe(200);
+		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId));
+		await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, f.projectId));
+		for (const base of f.bases) {
+			for (const suffix of ["", "/diff?file=seed.txt"]) {
+				const response = await app(f.reader).request(`${base}/commits/${f.sha}${suffix}`);
+				expect(response.status).toBe(404);
+				const body = await response.text();
+				expect(body).not.toContain(f.sha);
+				expect(body).not.toContain("seed.txt");
+			}
+		}
+	}, 15_000);
+
+	test("malicious destination/source paths are rejected and missing objects or files return 404", async () => {
+		const f = await commitPreviewFixture();
+		for (const base of f.bases) {
+			for (const path of [
+				"../outside",
+				"sub\\..\\..\\outside",
+				"C:\\outside",
+				"/outside",
+				".git/config",
+				"seed.txt\0tail",
+			]) {
+				for (const field of ["file", "oldPath"]) {
+					const params = new URLSearchParams({ file: "seed.txt", workspaceKey: f.workspaceKey });
+					params.set(field, path);
+					const response = await app(f.reader).request(`${base}/commits/${f.sha}/diff?${params}`);
+					expect(response.status).toBe(400);
+				}
+			}
+			const missingCommit = await app(f.reader).request(`${base}/commits/${"0".repeat(40)}`);
+			expect(missingCommit.status).toBe(404);
+			expect(await missingCommit.json()).toMatchObject({ code: "GIT_COMMIT_NOT_FOUND" });
+			const missingFile = await app(f.reader).request(
+				`${base}/commits/${f.sha}/diff?file=missing.txt`,
+			);
+			expect(missingFile.status).toBe(404);
+			expect(await missingFile.json()).toMatchObject({ code: "GIT_COMMIT_FILE_NOT_FOUND" });
+		}
+	}, 20_000);
 });
 
 test("execution path policy rejects a remote cwd before any Git probe", async () => {
@@ -987,4 +1178,161 @@ test("a readOnly grant on an ancestor or the root itself never downgrades the wo
 		expect(gitPathPolicyAllows(policy, context, repo, "read")).toBe(true);
 		expect(gitPathPolicyAllows(policy, context, repo, "write")).toBe(true);
 	}
+});
+
+describe("Narrator first-paint Git summary", () => {
+	const summary = (id = narratorId, userId = owner, revision = 0) =>
+		getNarratorGitSummary(id, revision, { userId, isAdmin: false }, new AbortController().signal);
+
+	test("cache misses start no Git, directory, or nested discovery", async () => {
+		const fs = await import("node:fs/promises");
+		const spawnModule = await import("../lib/spawn");
+		const probes = [
+			spyOn(fs, "stat"),
+			spyOn(fs, "realpath"),
+			spyOn(spawnModule, "safeSpawn"),
+			spyOn(localBackend, "glob"),
+			spyOn(localBackend, "resolvePathIdentity"),
+			spyOn(executionPolicyEngine, "compile"),
+			spyOn(gitDiscoveryCache, "get"),
+		];
+		try {
+			expect(await summary()).toBeNull();
+			expect(await summary()).toBeNull();
+			for (const probe of probes) expect(probe).not.toHaveBeenCalled();
+		} finally {
+			for (const probe of probes) probe.mockRestore();
+		}
+	});
+
+	test("inflight discovery never makes a summary wait or start another probe", async () => {
+		let release!: (value: { state: "not_git" }) => void;
+		const wait = new Promise<{ state: "not_git" }>((resolve) => {
+			release = resolve;
+		});
+		const pending = gitDiscoveryCache.get(
+			"local",
+			localBackend.runtimeGeneration,
+			localBackend.paths.identityKey(repo),
+			() => wait,
+		);
+		const load = spyOn(gitDiscoveryCache, "get");
+		try {
+			expect(
+				await getNarratorGitSummary(
+					narratorId,
+					0,
+					{ userId: owner, isAdmin: false },
+					AbortSignal.timeout(1000),
+				),
+			).toBeNull();
+			expect(load).not.toHaveBeenCalled();
+		} finally {
+			release({ state: "not_git" });
+			await pending;
+			load.mockRestore();
+		}
+	});
+
+	test("returns cached branch identity without scanning status, refreshes only through workspace GET", async () => {
+		await workspace();
+		const status = spyOn(gitService, "getStatusSummary");
+		try {
+			const initial = await summary();
+			expect(initial?.workspace.state).toBe("ready");
+			expect(initial?.workspace.rootPath).toBe(repo);
+			expect(initial?.branch).toBe("main");
+			expect(initial?.revision).toBe(0);
+			await git(repo, "checkout", "-b", "next");
+			expect((await summary())?.branch).toBe("main");
+			gitDiscoveryCache.invalidate("local", repo);
+			expect(await summary()).toBeNull();
+			await workspace();
+			expect((await summary())?.branch).toBe("next");
+			expect(status).not.toHaveBeenCalled();
+		} finally {
+			status.mockRestore();
+		}
+	});
+
+	test("non Git and unborn Git are explicit independent states", async () => {
+		const plain = join(root, "plain-summary");
+		await mkdir(plain);
+		const plainId = await newNarrator(plain);
+		await workspace(plainId);
+		expect((await summary(plainId))?.workspace.state).toBe("not_git");
+		const unbornId = await newNarrator(await newRepo("unborn-summary", false));
+		await workspace(unbornId);
+		expect((await summary(unbornId))?.branch).toBe("main");
+		expect((await summary(unbornId))?.workspace.state).toBe("ready");
+	});
+
+	test("cache does not share permissions or leak branch and root to a public reader", async () => {
+		const projectId = await project(repo);
+		scanProjectIds.push(projectId);
+		await db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId));
+		await workspace();
+		expect((await summary())?.branch).toBe("main");
+		const denied = await summary(narratorId, generateId());
+		expect(denied?.workspace.state).toBe("access_denied");
+		expect(denied?.workspace.rootPath).toBeNull();
+		expect(denied?.workspace.workspaceKey).toBeNull();
+		expect(denied?.workspace.cwd).toBe("");
+		expect(denied?.branch).toBeNull();
+		expect(denied?.workspace.branch).toBeUndefined();
+		await db.update(projects).set({ visibility: "public" }).where(eq(projects.id, projectId));
+		const readable = await summary(narratorId, generateId());
+		expect(readable?.workspace.capabilities).toEqual({ read: true, write: false });
+		expect(readable?.branch).toBe("main");
+	});
+
+	test.each([
+		new AppError("Temporary access scan failure", 503, "GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE"),
+		new Error("Temporary discovery failure"),
+	])("temporary summary failure returns no seed and permits an authoritative retry: %s", async (error) => {
+		await workspace();
+		const compile = spyOn(executionPolicyEngine, "compile").mockRejectedValueOnce(error);
+		try {
+			expect(await summary()).toBeNull();
+			const recovered = await workspace();
+			expect(recovered.state).toBe("ready");
+			expect(recovered.capabilities.read).toBe(true);
+			expect((await summary())?.branch).toBe("main");
+		} finally {
+			compile.mockRestore();
+		}
+	});
+
+	test("unsupported worktrees remain explicit on workspace GET but are never cached summary evidence", async () => {
+		const bare = join(root, "bare-summary");
+		await mkdir(bare);
+		await git(bare, "init", "--bare");
+		const id = await newNarrator(bare);
+		expect((await workspace(id)).state).toBe("unsupported");
+		expect(await summary(id)).toBeNull();
+	});
+
+	test("summary authorization does not turn cancellation into a successful seed", async () => {
+		await workspace();
+		const controller = new AbortController();
+		const reason = new Error("Summary request cancelled");
+		const compile = spyOn(executionPolicyEngine, "compile").mockImplementationOnce(async () => {
+			controller.abort(reason);
+			throw reason;
+		});
+		try {
+			await expect(
+				getNarratorGitSummary(narratorId, 0, { userId: owner, isAdmin: false }, controller.signal),
+			).rejects.toBe(reason);
+		} finally {
+			compile.mockRestore();
+		}
+	});
+
+	test("rejects a summary paired with an obsolete workspace revision", async () => {
+		await workspace();
+		await db.update(narrators).set({ workspaceRevision: 1 }).where(eq(narrators.id, narratorId));
+		expect(await summary()).toBeNull();
+		expect((await summary(narratorId, owner, 1))?.revision).toBe(1);
+	});
 });

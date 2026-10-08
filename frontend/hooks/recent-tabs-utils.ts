@@ -1,5 +1,6 @@
 import type { PersistedRecentTab, RecentTabRuntimePatch } from "@shared/recent-tabs";
 import { RECENT_TABS_LIVE_LIMIT } from "@shared/recent-tabs";
+import { getEffectiveNarratorDisplay } from "../lib/status-registry";
 
 export interface RecentTabViewer {
 	userId: string;
@@ -13,6 +14,7 @@ export interface RecentTab extends PersistedRecentTab {
 	substatus?: string[];
 	// Runtime-enriched fields (not persisted to DB)
 	activeTerminalCount?: number;
+	activeBackgroundTaskCount?: number;
 	viewers?: RecentTabViewer[];
 	viewerCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
@@ -24,6 +26,20 @@ export interface RecentTab extends PersistedRecentTab {
 
 export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const RECENT_TAB_VIEWERS_MAX = 20;
+
+/** Idle foreground + background work: half blue, with a hollow or unread-green base. */
+export function isRecentTabBackgroundActive(tab: RecentTab, filledStatus: boolean): boolean {
+	if ((tab.activeBackgroundTaskCount ?? 0) <= 0) return false;
+	if (!filledStatus) return true;
+	// Unread fills the foreground half, but must not hide ongoing background work.
+	// Keep stronger states (errors, planning, approvals) in their existing solid form.
+	const substatus = tab.substatus?.filter((tag) => tag !== "reasoning");
+	return (
+		(tab.status ?? "idle") === "idle" &&
+		getEffectiveNarratorDisplay("idle", substatus) ===
+			getEffectiveNarratorDisplay("idle", ["unread"])
+	);
+}
 
 export function clampRecentTabText(value: string | null | undefined): string | undefined {
 	if (value == null) return undefined;
@@ -82,6 +98,7 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"status",
 	"substatus",
 	"activeTerminalCount",
+	"activeBackgroundTaskCount",
 	"viewers",
 	"viewerCount",
 	"containerStatus",

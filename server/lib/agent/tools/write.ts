@@ -3,11 +3,16 @@ import {
 	fileChangeDiagnosticMetadata,
 	fileChangeDiagnosticSuffix,
 } from "../../../services/file-change-diagnostics";
-import { executeLocalFileChange } from "../../../services/file-change-runtime";
+import {
+	executeLocalFileChange,
+	FileNoDispatchEvidenceError,
+	withFileToolNoDispatch,
+} from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { toolSpecPathError } from "../../spec-uri";
+import { rethrowConfirmedToolDiskError } from "../disk-safety";
 import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { backendDirname, resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -98,7 +103,7 @@ export const writeTool: ToolDefinition = {
 			),
 		content: z.string().describe("The content to write to the file"),
 	}),
-	async execute(args, ctx): Promise<ToolResult> {
+	execute: withFileToolNoDispatch("Write", async (args, ctx, flow): Promise<ToolResult> => {
 		const specError = toolSpecPathError("Write", args);
 		if (specError) return { output: specError, isError: true };
 		const { file_path, content } = args as { file_path: string; content: string };
@@ -116,6 +121,7 @@ export const writeTool: ToolDefinition = {
 				// addition); the read is best-effort because failing to produce a line
 				// count must never fail the write itself.
 				const previousContent = await readSpecContentForStats(ctx.narratorId, file_path);
+				flow.writing();
 				const file = await specVfsService.writeSpecFile(ctx.narratorId, file_path, content, {
 					sourceToolUseId: ctx.currentToolUseId ?? null,
 					allowProtectedTaskMutation: taskReflectionGranted,
@@ -144,6 +150,8 @@ export const writeTool: ToolDefinition = {
 					...(Object.keys(specMetadata).length > 0 && { metadata: specMetadata }),
 				};
 			} catch (err) {
+				if (err instanceof FileNoDispatchEvidenceError) throw err;
+				rethrowConfirmedToolDiskError(err, ctx, true);
 				return {
 					output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
 					isError: true,
@@ -157,6 +165,7 @@ export const writeTool: ToolDefinition = {
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
 		try {
+			flow.writing();
 			const recorded = await executeLocalFileChange({
 				ctx,
 				backend,
@@ -190,6 +199,8 @@ export const writeTool: ToolDefinition = {
 				await trackFileChange(ctx, ioPath, "write", backend, null, { evidenceRecorded: true });
 				return recorded;
 			}
+			// The runtime explicitly declined without performing IO (remote/unbound only).
+			flow.declined();
 			// Legacy/remote compatibility only: no v2 evidence or exact remote capability.
 			// The whole read-modify-write window runs under the workspace write lock, so
 			// a concurrent narrator sharing this worktree cannot interleave between the
@@ -224,6 +235,7 @@ export const writeTool: ToolDefinition = {
 					"required",
 				);
 
+				flow.writing();
 				await backend.mkdirp(backendDirname(backend, ioPath));
 				// A rewrite keeps the file's own line endings, the same way it keeps its
 				// encoding: a model writes LF, so overwriting a CRLF file with the raw
@@ -264,11 +276,13 @@ export const writeTool: ToolDefinition = {
 				};
 			});
 		} catch (err) {
+			if (err instanceof FileNoDispatchEvidenceError) throw err;
+			rethrowConfirmedToolDiskError(err, ctx, true);
 			return {
 				output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,
 				metadata: fileChangeDiagnosticMetadata(err),
 			};
 		}
-	},
+	}),
 };

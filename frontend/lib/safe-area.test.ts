@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "./responsive";
 import {
 	APP_SHELL_CONTENT_HEIGHT,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
@@ -171,6 +172,9 @@ function trackerRealm(html = "<!doctype html><html><body><textarea></textarea></
 		readPublishedBottom() {
 			return domDocument.documentElement.style.getPropertyValue("--app-viewport-bottom") ?? "";
 		},
+		readPublishedOcclusion() {
+			return domDocument.documentElement.style.getPropertyValue("--app-keyboard-occlusion") ?? "";
+		},
 		readPublishedInset() {
 			return domDocument.documentElement.style.getPropertyValue("--app-safe-area-inset-bottom");
 		},
@@ -194,7 +198,7 @@ describe("mobile safe-area layout contract", () => {
 		// `--app-shell-header-height` by hand left the header at 92 while Main's padding
 		// stayed 116 — a 24px hole between them. So the height must arrive via the prop.
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
 		expect(appShell).not.toContain("--app-shell-header-height");
@@ -316,11 +320,9 @@ describe("mobile safe-area layout contract", () => {
 			Bun.file(new URL("../components/ruler/RulerFlow.tsx", import.meta.url)).text(),
 		]);
 
-		const mobileBranch = route.slice(
-			route.indexOf("// Mobile layout"),
-			route.indexOf("// Desktop"),
-		);
-		expect(mobileBranch).toContain("ownsHorizontalSafeArea");
+		// One persistent chat now serves both layouts. Ownership must still be
+		// explicitly gated on mobile, not permanently enabled on its shared host.
+		expect(route).toContain("ownsHorizontalSafeArea={isMobile}");
 		expect(route.match(/ownsHorizontalSafeArea/g)).toHaveLength(1);
 		expect(workspacePanels).not.toContain("ownsHorizontalSafeArea");
 		expect(dockPanels).not.toContain("ownsHorizontalSafeArea");
@@ -361,7 +363,7 @@ describe("mobile safe-area layout contract", () => {
 		// The pairing only holds if AppShell.Navbar actually applies both halves as one
 		// responsive pair; a `top` that drifts from the height is the failure this guards.
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		const navbarProps = appShell.slice(
 			appShell.indexOf("<AppShell.Navbar"),
@@ -408,7 +410,7 @@ describe("mobile safe-area layout contract", () => {
 		expect(APP_SHELL_MAIN_PADDING_BOTTOM).not.toContain("+");
 
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		const navbarProps = appShell.slice(
 			appShell.indexOf("<AppShell.Navbar"),
@@ -707,6 +709,40 @@ describe("mobile safe-area layout contract", () => {
 		expect(opened.viewportBottom).toBe(500);
 	});
 
+	test("keyboard updates never temporarily expand the shell while measuring viewport units", () => {
+		const realm = trackerRealm();
+		realm.focus(realm.document.querySelector("textarea"));
+		realm.visualViewport.height = 500;
+		const overridesDuringMeasurement: string[] = [];
+		const cleanup = installAppViewportTracking(realm.window, realm.document, (unit) => {
+			overridesDuringMeasurement.push(realm.readPublishedBottom());
+			return unit.startsWith("env(") ? 0 : 844;
+		});
+		try {
+			expect(realm.readPublishedBottom()).toBe("500px");
+			overridesDuringMeasurement.length = 0;
+			// A repeated visualViewport event / focus settle callback must not remove
+			// the current height before synchronous layout reads: that expands the
+			// message list, clamps scrollTop, then shrinks it back at the same height.
+			realm.resizeVisualViewport(500);
+			expect(overridesDuringMeasurement).toEqual(["500px", "500px", "500px"]);
+			expect(realm.readPublishedBottom()).toBe("500px");
+
+			overridesDuringMeasurement.length = 0;
+			realm.resizeVisualViewport(420);
+			expect(overridesDuringMeasurement).toEqual(["500px", "500px", "500px"]);
+			expect(realm.readPublishedBottom()).toBe("420px");
+
+			overridesDuringMeasurement.length = 0;
+			realm.focus(null);
+			realm.resizeVisualViewport(844);
+			expect(overridesDuringMeasurement).toEqual(["420px", "420px", "420px"]);
+			expect(realm.readPublishedBottom()).toBe("");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("the root tracker never publishes a fractional shell height", () => {
 		// iPhone 8 Plus (414x736, DPR 3, no safe area) reports fractional
 		// visualViewport heights. Publishing them verbatim left a hairline row at
@@ -756,6 +792,7 @@ describe("mobile safe-area layout contract", () => {
 		// At rest the shell height is left to the engine's `100dvh`, so no override is
 		// published at all — one fewer value that can disagree with `env()`.
 		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedOcclusion()).toBe("");
 		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
 
 		realm.focus(realm.document.querySelector("textarea"));
@@ -763,12 +800,16 @@ describe("mobile safe-area layout contract", () => {
 		// The keyboard is the one occlusion the engine does not fold into `dvh`, so it
 		// is also the only time a height is published.
 		expect(realm.readPublishedBottom()).toBe("500px");
+		// The push-up companion: how much of the 844px dynamic viewport the keyboard
+		// occludes. Surfaces that ride up over the keyboard size and shift by this.
+		expect(realm.readPublishedOcclusion()).toBe("344px");
 		expect(realm.readPublishedInset()).toBe("0px");
 		expect(root.hasAttribute("data-virtual-keyboard-open")).toBe(true);
 
 		realm.focus(null);
 		realm.resizeVisualViewport(844);
 		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedOcclusion()).toBe("");
 		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
 		expect(root.hasAttribute("data-virtual-keyboard-open")).toBe(false);
 
@@ -792,6 +833,7 @@ describe("mobile safe-area layout contract", () => {
 
 		cleanup();
 		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedOcclusion()).toBe("");
 		expect(realm.readPublishedInset() ?? "").toBe("");
 		// Cleanup must actually detach, not just stop publishing: a leaked listener
 		// keeps a torn-down tracker writing to a root it no longer owns.
@@ -965,18 +1007,27 @@ describe("mobile safe-area layout contract", () => {
 		expect(css).toContain("overflow-y: auto");
 		expect(css).toContain("overscroll-behavior-y: contain");
 		expect(css).toContain("-webkit-overflow-scrolling: touch");
-		// One conditional block is allowed, and only one: the installed-PWA height basis.
-		// iOS resolves the viewport units differently per shell — measured on an iPhone 11
-		// (896px panel), `100dvh` is 848 in standalone (the panel minus the 48px top inset,
-		// which iOS excludes from the dynamic viewport) and 714 in Safari. So `dvh` leaves
-		// the shell 48px short of the physical bottom in a PWA, while `lvh` would overflow
-		// behind Safari's toolbar by 82px in the browser. `display-mode` is the only signal
-		// that separates the two cases, so the basis has to be switched rather than picked.
+		// Two conditional blocks are allowed, and only two. The first is the
+		// installed-PWA height basis: iOS resolves the viewport units differently
+		// per shell — measured on an iPhone 11 (896px panel), `100dvh` is 848 in
+		// standalone (the panel minus the 48px top inset, which iOS excludes from
+		// the dynamic viewport) and 714 in Safari. So `dvh` leaves the shell 48px
+		// short of the physical bottom in a PWA, while `lvh` would overflow
+		// behind Safari's toolbar by 82px in the browser. `display-mode` is the
+		// only signal that separates the two cases, so the basis has to be
+		// switched rather than picked.
 		//
-		// The prohibition this replaces still holds in substance: no *width* media query may
-		// re-derive the chain, because that is what let two breakpoints disagree about who
-		// owns the height. Assert the allowed query exactly instead of banning the at-rule.
-		expect(declarations.match(/@media[^{]*/g)).toEqual(["@media (display-mode: standalone) "]);
+		// The prohibition this replaces still holds in substance: no *width* media
+		// query may re-derive the chain, because that is what let two breakpoints
+		// disagree about who owns the height. Assert the allowed queries exactly
+		// instead of banning the at-rule: the display-mode basis switch (WCO is its
+		// own display-mode — the installed-PWA branch must keep matching there),
+		// plus the director lift — which does not touch the chain at all, it only
+		// hands the keyboard occlusion to one opt-in surface.
+		expect(declarations.match(/@media[^{]*/g)).toEqual([
+			"@media (display-mode: standalone), (display-mode: window-controls-overlay) ",
+			`@media ${MOBILE_VIEWPORT_MEDIA_QUERY} `,
+		]);
 		// The shell chain itself never positions; the one `position: fixed` layer in the
 		// app (Mantine's overlay inner) is Mantine's own declaration, and this stylesheet
 		// only re-sizes it.
@@ -1044,6 +1095,38 @@ describe("mobile safe-area layout contract", () => {
 		expect(css.match(/\.mantine-\w+-inner/g)).toEqual([".mantine-Drawer-inner"]);
 	});
 
+	test("the director lift is one gated variable from tracker to surface", async () => {
+		// The push-up contract has three links that must name the same two variables:
+		// the tracker publishes `--app-keyboard-occlusion` and flips
+		// `data-virtual-keyboard-open`; the stylesheet gates the occlusion into
+		// `--nf-director-keyboard-lift` on mobile widths only; DirectorLayout grows
+		// and shifts its own box by the lift. A rename in any link silently restores
+		// the squeeze this exists to remove.
+		const [css, tracker, surface] = await Promise.all([
+			Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text(),
+			Bun.file(new URL("./safe-area.ts", import.meta.url)).text(),
+			Bun.file(
+				new URL("../components/narrator/workspace/DirectorLayout.tsx", import.meta.url),
+			).text(),
+		]);
+		const declarations = stripCssComments(css);
+
+		expect(tracker).toContain('"--app-keyboard-occlusion"');
+		expect(tracker).toContain('"data-virtual-keyboard-open"');
+		// Gated on the open keyboard AND the mobile width — neither condition alone
+		// may lift the surface (desktop keeps the squeeze, rest keeps inset: 0).
+		const gate = declarations.slice(declarations.indexOf(`@media ${MOBILE_VIEWPORT_MEDIA_QUERY}`));
+		expect(gate).toContain("html[data-virtual-keyboard-open] .nf-director-layout");
+		expect(gate).toContain("--nf-director-keyboard-lift: var(--app-keyboard-occlusion, 0px)");
+		// The surface consumes the lift and nothing else: no second guess about the
+		// keyboard's height anywhere else in the tree. The full expression is
+		// asserted — including the `* -1` that makes the lift a push-UP; dropping
+		// the negation would silently grow the surface INTO the keyboard.
+		expect(surface).toContain('className="nf-director-layout"');
+		expect(surface).toContain('top: "calc(var(--nf-director-keyboard-lift, 0px) * -1)"');
+		expect(surface).not.toContain("--app-keyboard-occlusion");
+	});
+
 	test("only authenticated layout conflicts use the dynamic viewport contract", async () => {
 		const [
 			appShell,
@@ -1054,7 +1137,7 @@ describe("mobile safe-area layout contract", () => {
 			providersRoute,
 			loginRoute,
 		] = await Promise.all([
-			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/chapters/$chapterId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
@@ -1093,9 +1176,13 @@ describe("mobile safe-area layout contract", () => {
 			narratorPanel,
 			safeArea,
 		] = await Promise.all([
-			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/narrators/workspace/$workspaceId.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
+		Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
+		// The route file is a thin shell; the workspace surface (and its full-bleed
+		// branches) lives in WorkspacePage so the standalone window route can reuse it.
+		Bun.file(
+			new URL("../components/narrator/workspace/WorkspacePage.tsx", import.meta.url),
+		).text(),
 			Bun.file(new URL("../routes/projects/$projectId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/terminal/TerminalPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/NarratorPanel.tsx", import.meta.url)).text(),
@@ -1132,9 +1219,17 @@ describe("mobile safe-area layout contract", () => {
 		// Full-bleed routes (they cancel Main's padding with negative margins) vs routes
 		// that stay inside Main's content box. Both derive from Main; neither re-derives
 		// the viewport or the insets.
-		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
-		expect(workspaceRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
-		expect(projectRoute).toContain("height: APP_SHELL_CONTENT_HEIGHT");
+		// The responsive narrator keeps a single full-bleed host instead of two
+		// identical mobile/desktop branches; both layouts inherit its height.
+		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(1);
+		expect(narratorRoute).toContain("<FocusChatHost");
+		// The workspace page collapsed its two identical mobile/desktop branches into
+		// one shared `shellBoxProps` when the window chrome variant was added, so the
+		// full-bleed height is named exactly once and both layouts inherit it.
+		expect(workspaceRoute.match(/APP_SHELL_FULL_BLEED_HEIGHT/g)?.length).toBeGreaterThanOrEqual(1);
+		// The compatibility page now uses natural document flow inside Main instead of a fixed canvas.
+		expect(projectRoute).toContain("<ProjectCompatibilityPanel");
+		expect(projectRoute).not.toContain("APP_SHELL_FULL_BLEED_HEIGHT");
 		for (const route of [narratorRoute, workspaceRoute, projectRoute]) {
 			expect(route).not.toContain("APP_SHELL_SAFE_VIEWPORT_HEIGHT");
 			expect(route).not.toContain("APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT");

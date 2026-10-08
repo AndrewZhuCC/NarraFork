@@ -1,8 +1,9 @@
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { formatOriginLabel } from "@shared/message-origin";
+import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
-import { scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
+import { narrators, scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
 import type { ReasoningEffort } from "../lib/agent";
 import { AsyncMutex } from "../lib/async-mutex";
 import { nextCronRun } from "../lib/cron";
@@ -14,6 +15,7 @@ import { chapterCleanup } from "./chapter-cleanup";
 import { canWriteNarrator, type NarratorPrincipal } from "./narrator-acl";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning, sendMessage } from "./narrator-session";
+import { cleanupScheduledTaskNarrators } from "./scheduled-task-cleanup";
 
 type ScheduledTask = typeof scheduledTasks.$inferSelect;
 type ScheduledTaskRun = typeof scheduledTaskRuns.$inferSelect;
@@ -53,6 +55,7 @@ export interface CreateScheduledTaskInput {
 	projectId?: string | null;
 	chapterId?: string | null;
 	narratorMode?: "new" | "reuse";
+	cleanupPolicy?: ScheduledTaskCleanupPolicy;
 	enabled?: boolean;
 	createdBy?: string | null;
 }
@@ -164,6 +167,7 @@ export const scheduledTaskService = {
 			projectId: input.projectId ?? null,
 			chapterId: input.chapterId ?? null,
 			narratorMode: input.narratorMode ?? "new",
+			cleanupPolicy: input.cleanupPolicy ?? { mode: "none" },
 			reuseNarratorId: null,
 			createdBy: input.createdBy ?? null,
 			lastRunAt: null,
@@ -224,6 +228,7 @@ export const scheduledTaskService = {
 			...(input.projectId !== undefined && { projectId: input.projectId }),
 			...(input.chapterId !== undefined && { chapterId: input.chapterId }),
 			...(input.narratorMode !== undefined && { narratorMode: input.narratorMode }),
+			...(input.cleanupPolicy !== undefined && { cleanupPolicy: input.cleanupPolicy }),
 			...(input.enabled !== undefined && { enabled: input.enabled }),
 			nextRunAt,
 			updatedAt: now(),
@@ -241,7 +246,15 @@ export const scheduledTaskService = {
 	async delete(id: string): Promise<void> {
 		const existing = await this.get(id);
 		if (!existing) throw new NotFoundError("ScheduledTask", id);
-		await db.delete(scheduledTasks).where(eq(scheduledTasks.id, id));
+		// Explicit detach also covers SQLite ALTER ADD REFERENCES migrations whose
+		// generator omits ON DELETE SET NULL. Deleting a task never deletes sessions.
+		db.transaction((tx) => {
+			tx.update(narrators)
+				.set({ scheduledTaskId: null })
+				.where(eq(narrators.scheduledTaskId, id))
+				.run();
+			tx.delete(scheduledTasks).where(eq(scheduledTasks.id, id)).run();
+		});
 	},
 
 	/** Tasks that are enabled and due (nextRunAt <= now). */
@@ -378,6 +391,14 @@ export const scheduledTaskService = {
 			} else if (status === "success") {
 				consecutiveFailures.delete(id);
 			}
+
+			// Success means dispatched, not loop-complete. The planner protects in-flight loops.
+			// Failed dispatches still have durable creation provenance and can be retained/cleaned.
+			try {
+				await cleanupScheduledTaskNarrators(id);
+			} catch (err) {
+				logger.warn("Scheduled task narrator cleanup failed", { taskId: id, error: String(err) });
+			}
 		});
 	},
 
@@ -477,6 +498,7 @@ export const scheduledTaskService = {
 					startInPlanMode: false,
 					title: task.name,
 					extraTraits: ["scheduled"],
+					scheduledTaskId: task.id,
 					// Whoever configured the task owns the sessions it spawns — the same id
 					// already used as the run's message author and ACL principal.
 					ownerUserId: task.createdBy ?? null,
@@ -509,6 +531,7 @@ export const scheduledTaskService = {
 					cwd: task.cwd ?? getHome(),
 					title: task.name,
 					extraTraits: ["scheduled"],
+					scheduledTaskId: task.id,
 					ownerUserId: task.createdBy ?? null,
 				});
 				narratorId = created.id;

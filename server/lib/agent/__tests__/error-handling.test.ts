@@ -403,7 +403,7 @@ describe("agent error handling", () => {
 			isRetryableError(
 				new Error(
 					"Network request failed [tls/UNKNOWN_CERTIFICATE_VERIFICATION_ERROR] after 15571 ms: " +
-						"POST https://nug2.narrafork.dev/v1/chat via direct connection. " +
+						"POST https://nug.example.com/v1/chat via direct connection. " +
 						"The TLS handshake or certificate verification failed.",
 				),
 			),

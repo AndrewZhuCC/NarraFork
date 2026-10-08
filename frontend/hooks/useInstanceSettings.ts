@@ -17,6 +17,7 @@ import type {
 	DirectoryWhitelistRuleInput,
 } from "../lib/api/types";
 import { normalizeRuleTargetSelector } from "../lib/api/types";
+import { DEFAULT_GITHUB_REPOSITORY, type UpdateSource } from "../lib/update-source";
 import { normalizeUrlProtocol } from "../lib/url";
 
 export type DefaultNarratorVisibility = "auto" | "private" | "public";
@@ -37,6 +38,8 @@ export interface InstanceSettingsState {
 	tlsPassphrase: string;
 	tlsCaFile: string;
 	// Update
+	updateSource: UpdateSource;
+	updateGithubRepository: string;
 	updateServerUrl: string;
 	updateChannel: "stable" | "beta";
 	updateAutoDownload: boolean;
@@ -68,6 +71,7 @@ export interface InstanceSettingsState {
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	planModeAllowInlinePlan: boolean;
+	permissionRuleAutoApprove: boolean;
 	planReflectionAutoApprove: boolean;
 	planReflectionAllowAutoCompact: boolean;
 	questionReflectionEnabled: boolean;
@@ -158,6 +162,8 @@ function makeDefaults(): InstanceSettingsState {
 		tlsKeyFile: "",
 		tlsPassphrase: "",
 		tlsCaFile: "",
+		updateSource: "github",
+		updateGithubRepository: DEFAULT_GITHUB_REPOSITORY,
 		updateServerUrl: "",
 		updateChannel: "stable",
 		updateAutoDownload: false,
@@ -190,6 +196,7 @@ function makeDefaults(): InstanceSettingsState {
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		planModeAllowInlinePlan: true,
+		permissionRuleAutoApprove: false,
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
@@ -244,6 +251,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 			// Use setQueryData to synchronously update the cache instead of
 			// invalidateQueries which triggers cascading refetches.
 			qc.setQueryData(["settings"], data);
+			// Drop stale recommendations and cancel in-flight checks, not prepared binaries/status.
+			void qc.resetQueries({ queryKey: ["update-check"] });
+			void qc.invalidateQueries({ queryKey: ["update-check"], refetchType: "none" });
 		},
 	});
 
@@ -265,6 +275,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				tlsKeyFile: settings.server?.tls?.keyFile ?? "",
 				tlsPassphrase: "",
 				tlsCaFile: settings.server?.tls?.caFile ?? "",
+				updateSource: settings.update?.source ?? "github",
+				updateGithubRepository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 				updateServerUrl: settings.update?.serverUrl ?? "",
 				updateChannel: settings.update?.channel ?? "stable",
 				updateAutoDownload: settings.update?.autoDownload ?? false,
@@ -304,6 +316,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				cacheDropDumpEnabled: settings.agent?.cacheDropDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
+				permissionRuleAutoApprove: settings.agent?.permissionRuleAutoApprove ?? false,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
 				planReflectionAllowAutoCompact: settings.agent?.planReflectionAllowAutoCompact ?? false,
 				questionReflectionEnabled: settings.agent?.questionReflectionEnabled ?? false,
@@ -384,6 +397,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 			...state,
 			dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
 			updateServerUrl: normalizedUpdateServerUrl,
+			updateGithubRepository: state.updateGithubRepository.trim(),
 		};
 		updateSettings.mutate(
 			{
@@ -437,6 +451,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					planModeAllowInlinePlan: state.planModeAllowInlinePlan,
+					permissionRuleAutoApprove: state.permissionRuleAutoApprove,
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
 					planReflectionAllowAutoCompact: state.planReflectionAllowAutoCompact,
 					questionReflectionEnabled: state.questionReflectionEnabled,
@@ -497,6 +512,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				},
 				editor: { type: "vscode" },
 				update: {
+					source: state.updateSource,
+					githubRepository: state.updateGithubRepository.trim(),
 					// Send "" (not undefined) so clearing the field resets the server
 					// back to the built-in default instead of keeping the old value.
 					serverUrl: normalizedUpdateServerUrl,

@@ -1,5 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
-import type { SQL } from "drizzle-orm";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { eq, type SQL } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { cleanDb } from "../../../tests/setup";
 
@@ -9,6 +12,8 @@ const startCalls: Array<Record<string, unknown>> = [];
 const persistedCalls: Array<Record<string, unknown>> = [];
 const conclusionCalls: Array<Record<string, unknown>> = [];
 const retriedToolCalls: Array<Record<string, unknown>> = [];
+let beforeDeniedRetryIo: (() => Promise<void>) | undefined;
+let deniedRetryShouldContinue = true;
 const editedMessageCalls: Array<Record<string, unknown>> = [];
 const deleteMessagesAfterCalls: Array<Record<string, unknown>> = [];
 const foregroundResolvers = new Map<string, (output: string) => void>();
@@ -102,6 +107,7 @@ beforeAll(async () => {
 		...realDb.query,
 		narratorMessages: {
 			...realDb.query.narratorMessages,
+			findMany: realDb.query.narratorMessages.findMany.bind(realDb.query.narratorMessages),
 			findFirst: mock(async (options?: { columns?: Record<string, boolean> }) =>
 				options?.columns?.parentToolUseId
 					? originResult
@@ -200,7 +206,7 @@ beforeAll(async () => {
 				return narrator;
 			}),
 			getModelHistorySinceLastCompact: mock(async (id: string) =>
-				isEditTestNarrator(id)
+				isEditTestNarrator(id) || databaseNarratorIds.has(id)
 					? realNarratorService.getModelHistorySinceLastCompact(id)
 					: [
 							{
@@ -222,7 +228,7 @@ beforeAll(async () => {
 						messageId: args[1],
 						opts: args[2],
 					});
-					return isEditTestNarrator(args[0])
+					return isEditTestNarrator(args[0]) || databaseNarratorIds.has(args[0])
 						? realNarratorService.deleteMessagesAfter(...args)
 						: Promise.resolve({ deletedMessageIds: [] });
 				},
@@ -468,6 +474,8 @@ beforeAll(async () => {
 				userId: string | null | undefined,
 				options: Record<string, unknown>,
 			) => {
+				await (options.onAdmitted as (() => Promise<void>) | undefined)?.();
+				await beforeDeniedRetryIo?.();
 				retriedToolCalls.push({
 					narratorId,
 					toolUseId,
@@ -476,7 +484,7 @@ beforeAll(async () => {
 					userId,
 					options,
 				});
-				return { ok: true, shouldContinue: true };
+				return { ok: true, shouldContinue: deniedRetryShouldContinue };
 			},
 		),
 		updateToolCallConclusion: mock(async (input: Record<string, unknown>) => {
@@ -621,6 +629,8 @@ describe("resume lifecycle shares the root's file-revert admission", () => {
 });
 
 afterEach(async () => {
+	beforeDeniedRetryIo = undefined;
+	deniedRetryShouldContinue = true;
 	for (const subagentId of [...terminalResolvers.keys()]) {
 		await finishRun(subagentId);
 	}
@@ -1253,6 +1263,37 @@ describe("resumeSubagent", () => {
 
 	test("routes denied-tool result continuation through the same resume service", async () => {
 		const subagentId = "resume-denied-tool";
+		const { db } = await import("../../db");
+		const { narrators } = await import("../../db/schema");
+		const now = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values([
+				{ id: parentNarratorId, createdAt: now, updatedAt: now },
+				{
+					id: subagentId,
+					parentNarratorId,
+					variant: "subagent:general",
+					type: "subagent",
+					logicalRunId: "previous-run",
+					createdAt: now,
+					updatedAt: now,
+				},
+			])
+			.onConflictDoNothing();
+		let runAtIo: string | undefined;
+		beforeDeniedRetryIo = async () => {
+			const { resolveSubagentExecutionSegment } = await import("../subagent-execution-boundary");
+			const run = await db
+				.select({ logicalRunId: narrators.logicalRunId })
+				.from(narrators)
+				.where(eq(narrators.id, subagentId))
+				.get();
+			const segment = await resolveSubagentExecutionSegment(subagentId, run?.logicalRunId);
+			expect(segment?.sourceInputId).toStartWith("subagent-run:");
+			runAtIo = segment?.sourceInputId?.slice("subagent-run:".length);
+			expect(runAtIo).not.toBe("previous-run");
+		};
 		loadedTrailingToolResults = [{ type: "tool_result", toolUseId: "denied-tool-use" }];
 
 		const result = await resumeSubagent({
@@ -1273,7 +1314,7 @@ describe("resumeSubagent", () => {
 				locale: "zh-CN",
 				replyInUserLanguage: true,
 				userId: "user-4",
-				options: { autoContinue: false },
+				options: { autoContinue: false, onAdmitted: expect.any(Function) },
 			},
 		]);
 		expect(startCalls[0]).toMatchObject({
@@ -1282,9 +1323,98 @@ describe("resumeSubagent", () => {
 			initialHistory: [{ role: "user", content: "history" }],
 			initialTrailingToolResults: [{ type: "tool_result", toolUseId: "denied-tool-use" }],
 			newUserInput: false,
+			resumeLogicalRunId: runAtIo,
+			fileChangeStartedAt: expect.any(String),
 		});
 		await finishRun(subagentId);
 	});
+
+	for (const failure of ["stopped", "thrown"] as const) {
+		test(`publishes background denied-tool retry states after persistence (${failure})`, async () => {
+			const subagentId = `resume-background-denied-${failure}`;
+			const { db } = await import("../../db");
+			const { narrators, backgroundTasks } = await import("../../db/schema");
+			const { backgroundTaskService } = await import("../background-task-service");
+			const now = new Date().toISOString();
+			databaseNarratorIds.add(subagentId);
+			await db.insert(narrators).values([
+				{ id: parentNarratorId, createdAt: now, updatedAt: now },
+				{
+					id: subagentId,
+					parentNarratorId,
+					variant: "subagent:general",
+					type: "subagent",
+					isBackground: true,
+					backgroundStatus: "failed",
+					backgroundResult: "old failure",
+					backgroundCompletedAt: now,
+					logicalRunId: "previous-run",
+					createdAt: now,
+					updatedAt: now,
+				},
+			]);
+			await db.insert(backgroundTasks).values({
+				id: subagentId,
+				parentNarratorId,
+				subagentNarratorId: subagentId,
+				type: "agent",
+				status: "failed",
+				output: "old failure",
+				completedAt: now,
+				logicalRunId: "previous-run",
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			});
+			const statuses: string[] = [];
+			const notification = spyOn(
+				backgroundTaskService,
+				"notifyDerivedStatusChanged",
+			).mockImplementation((parentId, taskId) => {
+				expect(parentId).toBe(parentNarratorId);
+				expect(taskId).toBe(subagentId);
+				const narrator = db.select().from(narrators).where(eq(narrators.id, taskId)).get();
+				const task = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
+				expect<string | null | undefined>(task?.status).toBe(narrator?.backgroundStatus);
+				expect(task?.logicalRunId).toBe(narrator?.logicalRunId);
+				expect(task?.logicalRunId).not.toBe("previous-run");
+				expect(task?.output).toBe(narrator?.backgroundResult);
+				expect(task?.completedAt).toBe(narrator?.backgroundCompletedAt);
+				if (task?.status === "running") {
+					expect(task.output).toBeNull();
+					expect(task.completedAt).toBeNull();
+				} else {
+					expect(task?.output).toStartWith("Re-execution failed:");
+					expect(task?.completedAt).toBeString();
+				}
+				statuses.push(task?.status ?? "missing");
+			});
+			beforeDeniedRetryIo = async () => {
+				expect(statuses).toEqual(["running"]);
+				if (failure === "thrown") throw new Error("retry I/O failed");
+			};
+			deniedRetryShouldContinue = false;
+			try {
+				const resume = resumeSubagent({
+					subagentId,
+					intent: "retry_denied_tool",
+					actor: "user",
+					retryToolUseId: "denied-tool-use",
+					locale: "en",
+				});
+				if (failure === "thrown") {
+					await expect(resume).rejects.toThrow("retry I/O failed");
+				} else {
+					expect((await resume).started).toBe(false);
+				}
+				expect(statuses).toEqual(["running", "failed"]);
+				expect(notification).toHaveBeenCalledTimes(2);
+				expect(startCalls).toHaveLength(0);
+			} finally {
+				notification.mockRestore();
+			}
+		});
+	}
 
 	test("edits and regenerates a subagent without creating a generic narrator session", async () => {
 		const subagentId = "resume-edited-message";
@@ -1390,16 +1520,156 @@ describe("resumeSubagent", () => {
 		await finishRun(subagentId);
 	});
 
-	// The default is load-bearing for the other callers of this intent (a plain
-	// retry, the Codex image-generation fix, recharge resume): they never edited
-	// anything, so their truncation must still roll files back.
-	test("a plain retry still reverts the truncated messages' file changes", async () => {
-		const subagentId = "resume-plain-retry-reverts";
+	// Plain retries and automatic recovery must preserve files unless rollback is explicit.
+	test("a plain retry preserves the truncated messages' file changes by default", async () => {
+		const subagentId = "resume-plain-retry-preserves-files";
 
 		const result = await resumeSubagent({
 			subagentId,
 			intent: "retry_last_input",
 			actor: "user",
+			createdBy: "user-8",
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		const truncation = deleteMessagesAfterCalls.at(-1);
+		expect(truncation?.narratorId).toBe(subagentId);
+		expect(truncation?.opts).toMatchObject({ skipRevert: true });
+		await finishRun(subagentId);
+	});
+
+	test("a plain retry after history-only rollback preserves real database checkpoints and files", async () => {
+		const { db } = await import("../../db");
+		const { narrators, narratorMessages, narratorMessageRefs, narratorToolCalls } = await import(
+			"../../db/schema"
+		);
+		const { eq } = await import("drizzle-orm");
+		const { narratorService } = await import("../narrator-service");
+		const subagentId = "resume-database-history-only";
+		const cwd = mkdtempSync(join(tmpdir(), "nf-subagent-retry-"));
+		const path = join(cwd, "kept.txt");
+		const now = new Date().toISOString();
+		databaseNarratorIds.add(subagentId);
+		try {
+			writeFileSync(path, "kept file bytes\n");
+			db.insert(narrators)
+				.values([
+					{ id: parentNarratorId, cwd, createdAt: now, updatedAt: now },
+					{
+						id: subagentId,
+						type: "subagent",
+						variant: "subagent:general",
+						parentNarratorId,
+						cwd,
+						status: "idle",
+						createdAt: now,
+						updatedAt: now,
+					},
+				])
+				.run();
+			const message = (id: string, seq: number, role: "user" | "assistant") => {
+				db.insert(narratorMessages)
+					.values({
+						id,
+						narratorId: subagentId,
+						role,
+						contentText: role === "user" ? "retry my request" : null,
+						contentJson:
+							role === "user"
+								? [{ type: "text", text: "retry my request" }]
+								: [{ type: "tool_use", id: "edit", name: "Edit" }],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorMessageRefs)
+					.values({ id: `ref-${id}`, narratorId: subagentId, messageId: id, seq })
+					.run();
+			};
+			message("retry-user", 0, "user");
+			message("retry-answer", 1, "assistant");
+			db.insert(narratorToolCalls)
+				.values({
+					id: "retry-edit-call",
+					narratorId: subagentId,
+					messageId: "retry-answer",
+					toolUseId: "edit",
+					toolName: "Edit",
+					inputJson: { file_path: path, old_string: "before", new_string: "kept" },
+					status: "success",
+					executionDeviceId: "local",
+					executionCwd: cwd,
+					executionPathFlavor: "posix",
+					resolvedFilePath: path,
+					createdAt: now,
+				})
+				.run();
+			const evidence = () => ({
+				messages: db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.narratorId, subagentId))
+					.all(),
+				refs: db
+					.select()
+					.from(narratorMessageRefs)
+					.where(eq(narratorMessageRefs.narratorId, subagentId))
+					.all(),
+				tools: db
+					.select()
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.narratorId, subagentId))
+					.all(),
+			});
+			const deleted = await narratorService.deleteMessagesAfter(subagentId, "retry-user", {
+				skipRevert: true,
+			});
+			expect(deleted.deletedMessageIds).toEqual(["retry-answer"]);
+			const kept = evidence();
+			expect(kept.messages.filter((row) => row.role === "disp")).toHaveLength(1);
+			expect(kept.refs.filter((row) => row.segmentCompactId !== null)).toHaveLength(1);
+			expect(kept.tools).toHaveLength(1);
+			expect(kept.tools[0]).toMatchObject({
+				isFileHistoryCheckpoint: true,
+				executionOriginToolCallId: "retry-edit-call",
+			});
+			deleteMessagesAfterCalls.length = 0;
+			const result = await resumeSubagent({
+				subagentId,
+				intent: "retry_last_input",
+				actor: "user",
+				locale: "en",
+				// Isolate retry preparation from the unrelated standalone announcement fixture.
+				skipConclusionDelivery: true,
+			});
+			expect(result.started).toBe(true);
+			expect(deleteMessagesAfterCalls).toEqual([
+				{ narratorId: subagentId, messageId: "retry-user", opts: { skipRevert: true } },
+			]);
+			expect(startCalls).toHaveLength(1);
+			expect(startCalls[0]).toMatchObject({
+				subagentId,
+				prompt: "retry my request",
+				persistPrompt: false,
+			});
+			expect(evidence()).toEqual(kept);
+			expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");
+			await finishRun(subagentId);
+			await expect(result.terminalCompletion).resolves.toContain("done");
+		} finally {
+			await finishRun(subagentId);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a plain retry explicitly requesting rollback forwards skipRevert false", async () => {
+		const subagentId = "resume-plain-retry-explicit-revert";
+
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "retry_last_input",
+			actor: "user",
+			retryRevertFiles: true,
 			createdBy: "user-8",
 			locale: "en",
 		});

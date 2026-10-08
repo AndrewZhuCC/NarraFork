@@ -35,10 +35,12 @@ import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
+import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
+import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
@@ -51,7 +53,7 @@ import {
 	registerServerRestart,
 } from "./lib/server-restart";
 import { settings } from "./lib/settings";
-import { ShutdownActivityTracker } from "./lib/shutdown-activity";
+import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import { supportsStableUpdateSignal } from "./lib/stable-update-install";
 import {
@@ -78,6 +80,7 @@ import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
+import { shutdownPrivateArchiveWorkers } from "./services/project-archive/worker-client";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -93,6 +96,7 @@ import {
 import { ensureRootlessEnv } from "./services/container-service";
 import {
 	recoverOnStartup as recoverNarrators,
+	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
@@ -118,6 +122,18 @@ import {
 } from "./services/oauth-ws-ticket-service";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
+import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
+import {
+	type VerifiedPublicShare,
+	verifyPublicShare,
+} from "./services/public-narrator-share-service";
+import {
+	automaticResumeEnabled,
+	mergeStartupProtection,
+	prepareOrdinaryRestartRecovery,
+	prepareSignalRestartRecovery,
+	restoreOrdinaryRestartRecovery,
+} from "./services/restart-recovery-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import {
@@ -295,7 +311,8 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 
 const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
-let currentHost = cliHost || process.env.HOST || settings.server.host;
+let configuredHost = cliHost || process.env.HOST || settings.server.host;
+let currentHost = resolveListenHost(configuredHost);
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
 const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
@@ -842,8 +859,9 @@ function stopHttpListener(): void {
 	});
 }
 
-function startServer(listenPort: number) {
-	const tlsCfg = settings.server.tls;
+let boundTlsConfig = settings.server.tls;
+
+function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 	const tls =
 		tlsCfg?.enabled && tlsCfg.certFile && tlsCfg.keyFile
 			? {
@@ -978,6 +996,48 @@ function startServer(listenPort: number) {
 
 				// WebSocket upgrade for /ws/narrator and /ws/terminal
 				if (url.pathname.startsWith("/ws")) {
+					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
+					// of a session JWT. Verified once at upgrade, scoped at subscribe time
+					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
+					const shareId = url.searchParams.get("share");
+					if (shareId && url.pathname === "/ws/narrator") {
+						const shareToken = url.searchParams.get("token");
+						if (!shareToken) {
+							return new Response("Authentication required", { status: 401 });
+						}
+						let share: VerifiedPublicShare;
+						try {
+							share = verifyPublicShare(shareId, `Share ${shareToken}`);
+						} catch {
+							return new Response("Share link unavailable", { status: 401 });
+						}
+						const wsData = resolveWSData(url, undefined, undefined, undefined, share);
+						if (!wsData) {
+							return new Response("Unknown WebSocket endpoint", { status: 404 });
+						}
+						const ip = resolveClientIp({
+							peerIp: server.requestIP(req)?.address,
+							xForwardedFor: req.headers.get("x-forwarded-for"),
+							xRealIp: req.headers.get("x-real-ip"),
+							trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+						});
+						if (wsData.channel !== "narrator") {
+							return new Response("Unknown WebSocket endpoint", { status: 404 });
+						}
+						const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
+							wsData.publicShareConnectionLease = lease;
+							return server.upgrade(req, { data: wsData });
+						});
+						if (upgraded === null) {
+							return new Response("Too many sharing connections", {
+								status: 429,
+								headers: { "Retry-After": "15" },
+							});
+						}
+						if (upgraded) return undefined;
+						return new Response("WebSocket upgrade failed", { status: 400 });
+					}
+
 					// Verify JWT from query param
 					const token = url.searchParams.get("token");
 					if (!token) {
@@ -1056,6 +1116,7 @@ function startServer(listenPort: number) {
 		websocket: wsHandlers,
 	});
 
+	boundTlsConfig = tlsCfg;
 	clearInheritableHandlesAfterServerBind();
 	return server;
 }
@@ -1075,6 +1136,13 @@ if (supportsStableUpdateSignal()) {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			});
+	});
+}
+
+function startServerWithHostFallback(listenPort: number) {
+	return listenWithLanFallback(configuredHost, currentHost, (host) => {
+		currentHost = host;
+		return startServer(listenPort, settings.server.tls);
 	});
 }
 
@@ -1115,7 +1183,7 @@ if (portExplicit) {
 		process.exit(1);
 	}
 	try {
-		_server = startServer(port);
+		_server = startServerWithHostFallback(port);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
@@ -1136,7 +1204,7 @@ if (portExplicit) {
 		const tryPort: number = candidate;
 		attemptedPorts.push(tryPort);
 		try {
-			_server = startServer(tryPort);
+			_server = startServerWithHostFallback(tryPort);
 			actualPort = tryPort;
 			started = true;
 			if (tryPort !== port) {
@@ -1188,47 +1256,43 @@ logger.info(`NarraFork server running on ${getProtocol()}://${currentHost}:${act
 	metaUrl: import.meta.url,
 });
 
-registerRuntimeAddressGetter(() => ({
-	protocol: getProtocol(),
-	host: currentHost,
-	port: actualPort,
-}));
+function runtimeAddress() {
+	return {
+		protocol: _server.url.protocol === "https:" ? ("https" as const) : ("http" as const),
+		host: currentHost,
+		port: _server.port ?? actualPort,
+	};
+}
+registerRuntimeAddressGetter(runtimeAddress);
 
 // Register server restart handler for hot-reloading host/port from settings
-registerServerRestart(async (newHost: string, newPort: number) => {
+registerServerRestart((newHost: string, newPort: number, options) => {
 	const oldHost = currentHost;
+	const oldConfiguredHost = configuredHost;
 	const oldPort = actualPort;
-	try {
-		// Fire-and-forget: awaiting stop()'s promise would hang forever once any WebSocket was
-		// closed server-side (see stopHttpListener), leaving the server unbound and the user
-		// stranded with no listener at all. The call itself releases the port synchronously, which
-		// is what the rebind below needs.
-		stopHttpListener();
-		currentHost = newHost;
-		_server = startServer(newPort);
-		actualPort = newPort;
-		logger.info(
-			`Server restarted: ${getProtocol()}://${oldHost}:${oldPort} → ${getProtocol()}://${currentHost}:${actualPort}`,
-		);
-	} catch (err) {
-		// Rollback: try to restart on the old address
-		logger.error("Failed to restart server on new address, rolling back", {
-			newHost,
-			newPort,
-			error: String(err),
-		});
-		try {
+	const oldTls = boundTlsConfig;
+	_server = rebindHttpListener(
+		_server,
+		() => {
+			configuredHost = newHost;
+			currentHost = resolveListenHost(configuredHost);
+			const replacement = startServerWithHostFallback(newPort);
+			actualPort = replacement.port ?? newPort;
+			return replacement;
+		},
+		() => {
+			configuredHost = oldConfiguredHost;
 			currentHost = oldHost;
-			_server = startServer(oldPort);
-			actualPort = oldPort;
-			logger.info(`Server rolled back to ${getProtocol()}://${oldHost}:${oldPort}`);
-		} catch (rollbackErr) {
-			logger.error("Rollback also failed — server is down", {
-				error: String(rollbackErr),
-			});
-		}
-		throw err;
-	}
+			// Restore the TLS options actually used by the previous listener, not newly saved settings.
+			const replacement = startServer(oldPort, oldTls);
+			actualPort = replacement.port ?? oldPort;
+			return replacement;
+		},
+		options?.preserveResponse === true,
+	);
+	const address = runtimeAddress();
+	logger.info("Server listener rebound", address);
+	return address;
 });
 
 /** Open a URL in the user's default browser. */
@@ -1392,18 +1456,27 @@ pluginManager
 		logger.error("Plugin manager initialization failed", { error: String(err) });
 	});
 
+function startQuestionAnswerRecovery(): void {
+	if (!automaticResumeEnabled()) return;
+	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
+		logger.error("Pending question answer recovery failed", { error: String(error) });
+	});
+}
+
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
 // the background after that queue is mounted.
-getPlannedUpdateStartupProtection()
+getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled() })
 	.then(async (plannedUpdate) => {
 		// The instance lock is already held. Release only previous-process mailbox claims
 		// before planned recovery mounts owners; hot reload preserves the process marker.
 		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
 			recoverInboxClaimsOnColdStartup(),
 		);
-		await recoverNarrators(plannedUpdate.protection);
+		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection);
+		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
+		await recoverNarrators(protection);
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation
 		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
@@ -1414,14 +1487,21 @@ getPlannedUpdateStartupProtection()
 					error: err instanceof Error ? err.message : String(err),
 				});
 			});
-		const plannedRecovery = await restoreNarratorsAfterPlannedUpdate(plannedUpdate);
-		if (plannedRecovery) startupReadiness.markRecovering();
+		const recoveryHandles = automaticResumeEnabled()
+			? await Promise.all([
+					restoreNarratorsAfterPlannedUpdate(plannedUpdate),
+					restoreOrdinaryRestartRecovery(ordinaryRestart),
+				])
+			: [];
+		const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
+		if (completions.length) startupReadiness.markRecovering();
 		else startupReadiness.markReady();
 		startupReadiness.settle({ ok: true });
-		if (plannedRecovery) {
-			plannedRecovery.completion
+		if (completions.length) {
+			Promise.all(completions)
 				.then(() => {
 					startupReadiness.markReady();
+					startQuestionAnswerRecovery();
 					logger.info("Planned-update background continuation recovery completed");
 				})
 				.catch((err) => {
@@ -1429,6 +1509,8 @@ getPlannedUpdateStartupProtection()
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 				});
+		} else {
+			startQuestionAnswerRecovery();
 		}
 	})
 	.catch((err) => {
@@ -1702,6 +1784,9 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		acceptingHttpRequests = false;
+		if (options.reason === "signal") {
+			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+		}
 		await shutdownStep(
 			tracker,
 			"workspaceReconciliation.stop",
@@ -1754,6 +1839,7 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
+		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
@@ -1763,10 +1849,10 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();
 		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
-		// Seamless-update handoff only: persist active browser sessions and flip the pool into
-		// preserve-on-close mode so the following browserPool.close disconnects (keeps Chrome alive)
-		// instead of killing it. A normal shutdown skips this and closes the browser as usual.
-		if (options.reason === "replacement_started") {
+		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
+		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
+		// for recovery. A normal shutdown skips this and closes the browser as usual.
+		if (preservesRecoveryOnShutdown(options.reason)) {
 			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
 				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
 					persistBrowserSessionsForUpdate(),
@@ -1833,13 +1919,18 @@ registerGracefulShutdownHandler(async (request) => {
  * Administrator-initiated shutdown with no successor process.
  *
  * Unlike the handoff path above, nothing is coming to take over the port: the user asked to stop
- * this version so they can launch the prepared binary themselves. So this runs the full teardown
- * — child processes included — rather than the handoff variant that deliberately leaves Bash
- * processes and the browser alive for a replacement to inherit.
+ * this version so they can launch the prepared binary themselves. Ordinary manual-update
+ * shutdown runs full teardown. Explicit system preparation instead preserves checkpoint-backed
+ * processes and browser sessions for the next manually started server.
  */
 registerOperatorShutdownHandler(async ({ reason }) => {
 	logger.info("Administrator requested shutdown", { reason });
-	const result = await performGracefulShutdown({ reason });
+	const preserveForRecovery = preservesRecoveryOnShutdown(reason);
+	const result = await performGracefulShutdown({
+		reason,
+		skipWindowsProcessTreeKill: preserveForRecovery,
+		skipBashProcessKill: preserveForRecovery,
+	});
 	setTimeout(() => process.exit(0), 250);
 	return result;
 });

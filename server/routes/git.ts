@@ -6,7 +6,9 @@ import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import { requireChapterAccess } from "../lib/project-access";
 import {
+	gitCommitDiffQuerySchema,
 	gitCommitSchema,
+	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,
@@ -22,6 +24,7 @@ import {
 	gitAttributionScopes,
 	gitManagementService,
 	invalidateGitWorkspace,
+	validateFilePaths,
 	validateGitFileTargets,
 } from "../services/git-management-service";
 import { withGitRequestContext } from "../services/git-service";
@@ -32,13 +35,15 @@ import {
 	collectGitAttributionScopes,
 	redactGitModificationView,
 } from "../services/git-workspace-attribution";
+import {
+	withWorkspaceRepositoryLock,
+	workspaceContextService,
+} from "../services/workspace-context-service";
 import { getWorkspaceModificationView } from "../services/workspace-modification-view";
 
 export { validateFilePaths } from "../services/git-management-service";
 
 type GitEnv = { Variables: { gitTarget: GitWorkspaceTarget } };
-// No waiting queue: shared refs/stash mutations fail quickly across linked worktrees.
-const writingRepositories = new Set<string>();
 
 function modificationCursor(c: Context) {
 	const cursorAt = c.req.query("cursorAt");
@@ -145,7 +150,14 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 			(typeof requestedWorkspaceKey !== "string" || requestedWorkspaceKey.length > 256)
 		)
 			throw new ValidationError("Invalid Git workspace key");
-		const target = await authorizeGitTarget(c, origin, need, requestedWorkspaceKey, discoverNested);
+		const target = await authorizeGitTarget(
+			c,
+			origin,
+			need,
+			requestedWorkspaceKey,
+			discoverNested,
+			workspaceRequest,
+		);
 		if (workspaceRequest && requestedWorkspaceKey !== undefined)
 			assertGitWorkspaceKey(target.workspace, requestedWorkspaceKey);
 		if (!workspaceRequest) {
@@ -180,19 +192,24 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 				);
 		};
 		const lockKey = need === "write" ? target.workspace.repositoryKey : null;
-		if (lockKey && writingRepositories.has(lockKey))
-			throw new AppError(
-				"Another Git write is in progress in this repository",
-				409,
-				"GIT_WORKSPACE_BUSY",
-			);
-		if (lockKey) writingRepositories.add(lockKey);
 		c.set("gitTarget", target);
 		const started = performance.now();
+		const run = () => withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
+		const write = () => (lockKey ? withWorkspaceRepositoryLock(lockKey, run) : run());
 		try {
-			await withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
+			if (source === "narrator" && need === "write" && target.workspace.deviceId === "local") {
+				const id = c.req.param("id") ?? "";
+				const context = await workspaceContextService.get(id);
+				// Pin narrator context separately from the selected nested Git repository;
+				// beforeWrite reauthorizes the selected repository inside the write lock.
+				await workspaceContextService.withRevision(
+					id,
+					context.revision,
+					context.git?.workspaceKey ?? undefined,
+					write,
+				);
+			} else await write();
 		} finally {
-			if (lockKey) writingRepositories.delete(lockKey);
 			if (need === "write" || performance.now() - started > 1000)
 				logger.info("Git workspace request", {
 					operation: c.req.path.split("/").pop(),
@@ -358,6 +375,20 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 	routes.get(`${prefix}/log`, async (c) => {
 		const { path, git } = access(c);
 		return c.json(await git.getLog(path, gitLogQuerySchema.parse(c.req.query())));
+	});
+	// Commit preview: read-only, so a read-only workspace may use it too.
+	routes.get(`${prefix}/commits/:sha`, async (c) => {
+		const { path, git } = access(c);
+		const sha = gitCommitShaSchema.parse(c.req.param("sha"));
+		return c.json(await git.getCommitDetail(path, sha));
+	});
+	routes.get(`${prefix}/commits/:sha/diff`, async (c) => {
+		const { path, git } = access(c);
+		const sha = gitCommitShaSchema.parse(c.req.param("sha"));
+		const { file, oldPath } = gitCommitDiffQuerySchema.parse(c.req.query());
+		// Lexical only: a historical path may no longer exist in the working tree.
+		validateFilePaths(oldPath ? [file, oldPath] : [file]);
+		return c.json(await git.getCommitPatch(path, sha, file, oldPath));
 	});
 	routes.post(`${prefix}/reset`, async (c) => {
 		const { target, path, git } = access(c);

@@ -8,6 +8,7 @@ import type { ModelCard } from "@shared/model-card";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
+import type { DiskSafetySettings } from "../disk-safety-config";
 import type { ModelCatalogSettings } from "../model-catalog";
 import type { PermissionMode } from "../permission-modes";
 import type { UserAgentMode } from "../user-agent";
@@ -23,12 +24,22 @@ export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
 
 export type CustomApiProtocol =
-	| "anthropic-official"
-	| "anthropic-compatible"
-	| "codex-native"
-	| "responses-compatible"
+	| "anthropic-messages"
+	| "openai-responses"
 	| "completions-compatible"
 	| "gemini-compatible";
+
+/**
+ * Legacy protocol values accepted from persisted settings and older clients.
+ * normalizeCustomApiProvider migrates them to the current values:
+ *   codex-native / responses-compatible   → openai-responses
+ *   anthropic-official / anthropic-compatible → anthropic-messages
+ */
+export type LegacyCustomApiProtocol =
+	| "codex-native"
+	| "responses-compatible"
+	| "anthropic-official"
+	| "anthropic-compatible";
 
 export interface CustomApiProviderConfig {
 	/** Unique short ID shared across protocol switches. */
@@ -512,6 +523,8 @@ export interface OidcProviderConfig {
 }
 
 export interface NarraForkSettings {
+	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */
+	diskSafety?: DiskSafetySettings;
 	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
 	setupWizardCompleted?: boolean;
 	/**
@@ -537,6 +550,7 @@ export interface NarraForkSettings {
 	};
 	server: {
 		port: number;
+		/** "auto-lan" resolves the first LAN IP on each start, with localhost fallback. */
 		host: string;
 		/** Browser launch behaviour on server start: "off" | "browser" | "app" */
 		openBrowser: "off" | "browser" | "app";
@@ -713,6 +727,8 @@ export interface NarraForkSettings {
 		planReflectionAllowAutoCompact: boolean;
 		/** Let AskUserQuestion auto-answer with reflection after a timeout in bypass-permissions mode. */
 		questionReflectionEnabled: boolean;
+		/** Human-admin opt-in; strict bound reflection is required even when danger reflection is off. */
+		permissionRuleAutoApprove: boolean;
 		/** Timeout in milliseconds before AskUserQuestion auto-answer reflection runs. */
 		questionReflectionTimeoutMs: number;
 		/** Danger reflection policy level for bypass-permissions operations. */
@@ -846,6 +862,10 @@ export interface NarraForkSettings {
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
+		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
+		browserProxy?: ProxyOverride;
+		/** Explicit pre-approval for Notification.send; never overrides read-only mode. */
+		notificationPolicy?: { allowSend?: boolean };
 		/** WebFetch permission policy. */
 		webFetchPolicy?: {
 			/** When true, all URLs are auto-allowed without user approval. */
@@ -854,7 +874,7 @@ export interface NarraForkSettings {
 			whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
 			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
-			/** Optional WebFetch/browser proxy override. Absent/"default" = follow the global policy. */
+			/** Optional WebFetch proxy override. Absent/"default" = follow the global policy. */
 			proxy?: ProxyOverride;
 		};
 		/**
@@ -1018,9 +1038,13 @@ export interface NarraForkSettings {
 	geminiProviders?: GeminiProviderConfig[];
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
-	/** Delta update configuration. */
+	/** Update source and download configuration. */
 	update?: {
-		/** Update server URL. */
+		/** Update source. Optional for legacy settings and mocks; defaults to GitHub. */
+		source?: "github" | "update-server";
+		/** GitHub repository slug (owner/repo), not a URL. */
+		githubRepository?: string;
+		/** Update server URL, retained when switching to GitHub. */
 		serverUrl: string;
 		/** Product ID for multi-product update servers. */
 		product: string;

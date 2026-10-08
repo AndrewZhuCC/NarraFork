@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
 import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
-import { shellSource } from "./guard-source";
+import { shellModule, shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 import {
 	resolvePretextDocumentView,
 	resolveRebuildView,
@@ -53,6 +54,22 @@ function makeManifest(): PretextLayoutManifest {
 }
 
 describe("PretextExactMessageList", () => {
+	it("resolves the current body's canonical owner and slot before a full-text toggle", () => {
+		const toggle = sliceBracketedRegion(
+			shellModule("PretextExactMessageList.tsx"),
+			"onToggleTextExpanded: (bodyKey?: string) => {",
+		);
+		if (!toggle) throw new Error("missing full-text toggle wiring");
+		expect(toggle).toContain("renderItemsRef.current.find");
+		expect(toggle).toContain("resolveTextExpansionPreference(item?.spec ?? { key }, bodyKey)");
+		expect(toggle).toMatch(
+			/isVListTextExpanded\(\s*prev,\s*preference.specKey,\s*preference.bodyKey/,
+		);
+		expect(toggle).toMatch(
+			/setVListTextExpanded\(\s*prev,\s*key,\s*expanded,\s*bodyKey,\s*preference.specKey,\s*preference.bodyKey \?\? null/,
+		);
+	});
+
 	it("projects the shared prefix index into absolute-position geometry without estimates", () => {
 		const index = buildPretextLayoutIndex(makeManifest());
 		const layout = buildExactListLayout(index);
@@ -261,14 +278,27 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("exactLayout.totalHeight");
 		// Rows tile the canvas via an outer hit box and center their own column, so
 		// a drag-selection never crosses a caret-less strip (gaps / side margins).
-		expect(source).toContain("hitHeight={resolveRowHitHeight(");
-		expect(source).toContain("contentWidth={contentWidth}");
+		const rowProps = sliceBracketedRegion(source, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(
+			/hitHeight:\s*resolveRowHitHeight\(\s*exactLayout\.items,\s*itemIndex,\s*exactLayout\.totalHeight,?\s*\)/,
+		);
+		expect(rowProps).toMatch(/contentWidth:\s*item\.contentWidth\s*\?\?\s*contentWidth/);
+		// The projected geometry must reach ExactRow unchanged through the element factory.
+		expect(source).toMatch(/windowRowProjections\.push\(\{\s*props: rowProps,/);
+		expect(source).toContain("useVListWindowRows(narratorId, windowRowProjections)");
+		expect(shellModule("useVListWindowRows.tsx")).toContain("<ExactRow key={key} {...props} />");
 		expect(source).toContain("{ minHeight: hitHeight } : { height: hitHeight }");
 		expect(source).toContain('style={{ position: "relative", width: "100%" }}');
 		expect(source).toContain("const resolveExactToolColor = useCallback");
 		expect(source).toContain("resolveToolColor: resolveExactToolColor");
 		expect(source).toContain("getCurrentView: readCurrentView");
-		expect(source).toContain("const scrollTop = node?.scrollTop ?? scrollTopRef.current");
+		const liveView = sliceBracketedRegion(source, "const readCurrentView = useCallback(");
+		expect(liveView).toContain("const view = readViewportView();");
+		const visibleView = sliceBracketedRegion(source, "const readViewportView = useCallback(");
+		expect(visibleView).toContain("visibleViewportRef.current.read(");
+		expect(visibleView).toContain("viewportRef.current");
+		expect(visibleView).toContain("scrollTop: scrollTopRef.current");
+		expect(visibleView).toContain("viewportHeight: viewportHeightRef.current");
 		// An LOD gesture must report the point it is centered on, so the rebuild
 		// re-anchors THAT content instead of yanking the viewport top into place.
 		expect(source).toContain("focusOffset: resolveLodFocusOffset(");

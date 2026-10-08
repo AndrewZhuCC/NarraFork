@@ -15,8 +15,10 @@
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
+import { QuestionEventAction } from "./QuestionEventAction";
 import type { VListElementKind } from "./registry";
 import {
 	type AskInPassingPendingInteraction,
@@ -294,12 +296,23 @@ export function renderElement(
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onOpenAttachment={extra.onOpenAttachment as ((filePath: string) => void) | undefined}
 					openAttachmentLabel={extra.openAttachmentLabel as string | undefined}
+					onQuoteClick={extra.onQuoteClick as (() => void) | undefined}
+					onFetchAttachment={
+						extra.onFetchAttachment as ((fetchUrl: string, filename: string) => void) | undefined
+					}
 				/>
 			);
 		case "communication-bubble":
 			return (
 				<RenderCommunicationBubble
+					fullTextLoading={extra.fullTextLoading as boolean | undefined}
+					fullTextError={extra.fullTextError as string | undefined}
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m}
+					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					data={extra.data as never}
 					header={extra.header as React.ReactNode}
 					onOpenRecipient={extra.onOpenRecipient as ((id: string) => void) | undefined}
@@ -309,6 +322,10 @@ export function renderElement(
 		case "injection-bubble":
 			return (
 				<RenderInjectionBubble
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m as never}
 					header={extra.header as React.ReactNode}
 					noteText={extra.noteText as string | undefined}
@@ -322,6 +339,10 @@ export function renderElement(
 		case "reasoning":
 			return (
 				<RenderReasoning
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m}
 					labels={extra.labels as never}
 					// Same per-body source toggle as markdown (expanded form only).
@@ -360,7 +381,14 @@ export function renderElement(
 					compactProgressIsSegment={extra.compactProgressIsSegment as boolean | undefined}
 				/>
 			);
-		case "system-text":
+		case "system-text": {
+			const eventData = extra.data as
+				| {
+						questionReference?: { narratorId?: string | null; questionId?: string };
+						questionSnapshot?: Extract<SideCarBody, { kind: "asyncQuestionAnswers" }>;
+				  }
+				| undefined;
+			const reference = eventData?.questionReference;
 			return (
 				<RenderSystemText
 					measured={m}
@@ -369,8 +397,18 @@ export function renderElement(
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
 					injectionGuardActions={extra.injectionGuardActions as never}
+					headerAction={
+						reference?.narratorId && reference.questionId ? (
+							<QuestionEventAction
+								viewingNarratorId={extra.narratorId as string | undefined}
+								reference={{ narratorId: reference.narratorId, questionId: reference.questionId }}
+								snapshot={eventData?.questionSnapshot}
+							/>
+						) : undefined
+					}
 				/>
 			);
+		}
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
 		case "plan-card":
@@ -418,6 +456,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
@@ -451,6 +490,11 @@ export function renderElement(
 		case "reasoning-steps":
 			return (
 				<RenderToolRun
+					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m}
 					labels={extra.labels as never}
 					onToggleItems={extra.onToggleItems as (() => void) | undefined}

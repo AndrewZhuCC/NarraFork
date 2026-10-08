@@ -6,9 +6,12 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
+import { DEFAULT_DISK_SAFETY } from "../disk-safety-config";
 import type { FieldDoc, NarraForkSettings } from "./types";
+import { DEFAULT_UPDATE_SETTINGS } from "./update-source";
 
 export const DEFAULTS: NarraForkSettings = {
+	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
 	// SQLite by default. Selecting "postgres" additionally requires NF_DATABASE_URL /
@@ -43,6 +46,7 @@ export const DEFAULTS: NarraForkSettings = {
 		// wizard makes selecting one a hard gate before anything can run.
 		defaultModel: "",
 		defaultPermissionMode: "acceptEdits",
+		notificationPolicy: { allowSend: false },
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
@@ -89,6 +93,7 @@ export const DEFAULTS: NarraForkSettings = {
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
+		permissionRuleAutoApprove: false,
 		questionReflectionTimeoutMs: 300_000,
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
@@ -189,13 +194,7 @@ export const DEFAULTS: NarraForkSettings = {
 		defaultTimeoutMs: 60_000,
 		maxOutputChars: 24_000,
 	},
-	update: {
-		serverUrl: "https://narrafork-update.b.domexie.cn",
-		product: "narrafork",
-		channel: "stable",
-		checkIntervalMinutes: 60,
-		autoDownload: false,
-	},
+	update: { ...DEFAULT_UPDATE_SETTINGS },
 	vnet: {
 		enabled: true,
 		allowAnonymousRelay: false,
@@ -231,13 +230,46 @@ export const DEFAULTS: NarraForkSettings = {
  * Kept alongside DEFAULTS so changes stay in sync.
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
+	"diskSafety.mode": {
+		desc: "磁盘安全策略：enforce 拒绝危险写入；warn 仅提示；off 关闭。管理员可临时覆盖，普通工具权限不会绕过。",
+		type: "string",
+	},
+	"diskSafety.warningFreeMb": { desc: "剩余空间警告阈值（MiB），默认 1024。", type: "number" },
+	"diskSafety.warningFreePercent": {
+		desc: "剩余空间百分比警告阈值，默认 5；字节或百分比任一命中即警告。",
+		type: "number",
+	},
+	"diskSafety.blockFreeMb": {
+		desc: "拒绝文件写入和不透明命令的剩余空间阈值（MiB），默认 256。",
+		type: "number",
+	},
+	"diskSafety.criticalFreeMb": {
+		desc: "数据目录达到此阈值（MiB）时停止普通工具所在轮次（包括只读工具的历史写入），默认 64；取消后台任务仍放行。",
+		type: "number",
+	},
+	"diskSafety.reserveMb": {
+		desc: "实际写入后留给 WAL/结果记录的预算（MiB），默认 32。",
+		type: "number",
+	},
+	"diskSafety.checkIntervalMs": {
+		desc: "每个磁盘 OS 空间查询最短间隔（毫秒），默认 10000。",
+		type: "number",
+	},
+	"diskSafety.pathCacheTtlMs": {
+		desc: "路径到磁盘映射缓存期限（毫秒），默认 60000。",
+		type: "number",
+	},
+	"diskSafety.probeTimeoutMs": {
+		desc: "单次磁盘检测等待预算（毫秒），默认 1000，最大 2000；超时视为未知。",
+		type: "number",
+	},
 	// ── server ──────────────────────────────────────────────────────────
 	"server.port": {
 		desc: "服务器监听端口。重启后生效。",
 		type: "number",
 	},
 	"server.host": {
-		desc: '服务器监听地址。"localhost" 仅本机访问，"0.0.0.0" 允许局域网访问。重启后生效。',
+		desc: '服务器监听地址。"localhost" 仅本机访问，"auto-lan" 每次启动自动取第一个局域网 IP，失败回退本机；"0.0.0.0" 监听所有 IPv4 网卡。重启后生效。',
 		type: "string",
 	},
 	"server.openBrowser": {
@@ -582,6 +614,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "启用后，AskUserQuestion 在全部允许模式下等待超时仍未回答时，会自动运行 question reflection 并提交答案。",
 		type: "boolean",
 	},
+	"agent.permissionRuleAutoApprove": {
+		desc: "仅人类管理员可开启。全部允许模式的单条叙述者权限规则申请仍须绑定当前工具执行并完成严格危险反思；不受普通反思关闭或宽松档影响。应用授权防护，并非操作系统沙箱。默认关闭。",
+		type: "boolean",
+	},
 	"agent.questionReflectionTimeoutMs": {
 		desc: "AskUserQuestion 自动 question reflection 的等待时间（毫秒）。默认 300000，即 5 分钟。",
 		type: "number",
@@ -677,6 +713,20 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.defaultSystemPrompt": {
 		desc: "默认系统提示词。所有叙述者在自身 systemPrompt 为空时使用此值作为基础提示。",
 		type: "string",
+	},
+	"agent.browserProxy": {
+		desc: "Browser 独立代理覆盖，应用于新会话，不影响已有会话。省略或 default 跟随全局网络代理。",
+		type: "object",
+		valid: "mode: default | direct | system | custom; url: HTTP(S) 代理地址",
+	},
+	"agent.webFetchPolicy.proxy": {
+		desc: "Web Fetch 独立代理覆盖，同时用于 HTTP 抓取与浏览器渲染。省略或 default 跟随全局网络代理。",
+		type: "object",
+		valid: "mode: default | direct | system | custom; url: HTTP(S) 代理地址",
+	},
+	"agent.notificationPolicy.allowSend": {
+		desc: "为 true 时预先允许 Notification 主动发送钉钉/飞书通知，免逐次审批；只读与严格计划模式仍禁止发送。默认关闭。",
+		type: "boolean",
 	},
 	"agent.webFetchPolicy.allowAll": {
 		desc: "为 true 时所有 URL 自动允许抓取，无需用户批准。",
@@ -924,8 +974,18 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── update ──────────────────────────────────────────────────────────
+	"update.source": {
+		desc: '更新来源。默认 "github" 使用 GitHub Release；"update-server" 使用自定义更新服务器。',
+		type: "string",
+		valid: '"github" | "update-server"',
+	},
+	"update.githubRepository": {
+		desc: "GitHub 更新仓库，格式为 owner/repo，默认 NarraFork/NarraFork。切换来源时保留。",
+		type: "string",
+		valid: "owner 最长 39 字符，repo 最长 100 字符；不接受 URL 或 .. 路径",
+	},
 	"update.serverUrl": {
-		desc: "更新服务器 URL。",
+		desc: "自定义更新服务器 URL，仅 update-server 来源使用；切换来源时保留。",
 		type: "string",
 	},
 	"update.product": {

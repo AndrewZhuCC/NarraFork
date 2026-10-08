@@ -35,6 +35,12 @@ import type {
 	BooleanOverride,
 	DangerReflectionOverride,
 } from "../lib/boolean-override";
+import {
+	measureMessageCharacters,
+	measureSerializedCharacters,
+	measureSummaryCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { withDbRetry } from "../lib/db-resilience";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -53,7 +59,11 @@ import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
-import { type PgNarratorRefsTx, persistPgMessageWithRef } from "./narrator-refs/postgres-store";
+import {
+	type PgNarratorRefsTx,
+	persistPgMessageWithRef,
+	resolvePgMessageNarratorLocks,
+} from "./narrator-refs/postgres-store";
 import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import {
 	claimNextRefSeq,
@@ -71,40 +81,13 @@ const executionSegments = createFileChangeExecutionSegmentsService(db);
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-type ExecutionSegmentParent = {
-	id: string;
-	executionAttempt: number;
-	executionSegmentId: string | null;
-};
-
-/** Resolve a parent tool across the child narrator boundary without guessing by provider ID. */
+/** Use the durable current-run receipt; provider IDs and creation origins are not execution authority. */
 async function findExecutionSegmentParent(
 	narratorId: string,
-	parentToolUseId: string | null | undefined,
-): Promise<ExecutionSegmentParent | null> {
-	if (!parentToolUseId) return null;
-	const local = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, parentToolUseId),
-		),
-		columns: { id: true, executionAttempt: true, executionSegmentId: true },
-	});
-	if (local) return local;
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { parentNarratorId: true },
-	});
-	if (!narrator?.parentNarratorId) return null;
-	return (
-		(await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narrator.parentNarratorId),
-				eq(narratorToolCalls.toolUseId, parentToolUseId),
-			),
-			columns: { id: true, executionAttempt: true, executionSegmentId: true },
-		})) ?? null
-	);
+): Promise<{ executionSegmentId: string } | null> {
+	const { resolveSubagentExecutionSegment } = await import("./subagent-execution-boundary");
+	const segment = await resolveSubagentExecutionSegment(narratorId);
+	return segment ? { executionSegmentId: segment.id } : null;
 }
 
 /** Recipient mutation also invalidates source pages, including child cards rendered in a parent. */
@@ -409,6 +392,20 @@ function copyMessageForNarratorTx(
 	overrides: Partial<typeof narratorMessages.$inferInsert> = {},
 	forceCopy = false,
 ): MessageCopyResult {
+	if (Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText")) {
+		const original = tx.query.narratorMessages
+			.findFirst({ where: eq(narratorMessages.id, messageId) })
+			.sync();
+		if (!original) throw new NotFoundError("Message", messageId);
+		overrides = {
+			...overrides,
+			contextCharsJson: measureMessageCharacters(
+				overrides.role ?? original.role,
+				overrides.contentJson !== undefined ? overrides.contentJson : original.contentJson,
+				overrides.contentText !== undefined ? overrides.contentText : original.contentText,
+			),
+		};
+	}
 	const ref = tx.query.narratorMessageRefs
 		.findFirst({
 			where: and(
@@ -766,6 +763,7 @@ export async function recoverStaleCompactingMessages(
 	const failureText = truncateCompactError(error);
 
 	for (const stale of staleMessages) {
+		const affectedNarrators = new Set<string>();
 		try {
 			const action = await withDbRetry(
 				async () =>
@@ -787,6 +785,7 @@ export async function recoverStaleCompactingMessages(
 							.from(narratorMessageRefs)
 							.where(eq(narratorMessageRefs.messageId, stale.id))
 							.all();
+						for (const ref of refs) affectedNarrators.add(ref.narratorId);
 						const blocks = Array.isArray(current.contentJson) ? current.contentJson : [];
 						const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
 						const attempts = normalizeCompactAttempts(compactBlock?.attempts);
@@ -836,6 +835,7 @@ export async function recoverStaleCompactingMessages(
 						};
 						const failedOverrides: Partial<typeof narratorMessages.$inferInsert> = {
 							contentJson: [failedBlock],
+							contextCharsJson: measureMessageCharacters("system", [failedBlock]),
 							contentText: `[Compact Failed] ${failureText.slice(0, 200)}...`,
 							contextPercent: null,
 						};
@@ -877,6 +877,8 @@ export async function recoverStaleCompactingMessages(
 					}),
 				{ label: "recoverStaleCompactingMessage", maxRetries: 5 },
 			);
+			if (action !== "skipped")
+				for (const id of affectedNarrators) queueContextCharacterRefresh(id);
 			if (action === "preserved") preserved++;
 			else if (action === "deleted") deleted++;
 		} catch (recoveryError) {
@@ -1007,6 +1009,8 @@ function persistPlacement(
 export type PgPlacementTx = PgNarratorRefsTx;
 
 export interface PgMessagePlacementHooks {
+	/** All additional narrator rows touched by onPersist, declared before locks are acquired. */
+	narratorIds?: readonly string[];
 	/**
 	 * PG counterpart of {@link MessagePlacementOptions.onPersist}: commits related
 	 * state in the SAME transaction as the message, ref and mailbox materialization.
@@ -1027,7 +1031,15 @@ export function createPgPlacedMessageMaterializer(
 	message: RefMessageInput,
 	hooks?: PgMessagePlacementHooks,
 ): PgMaterializer {
-	return async (tx, row) => {
+	message = {
+		...message,
+		contextCharsJson: measureMessageCharacters(
+			message.role,
+			message.contentJson,
+			message.contentText,
+		),
+	};
+	const materializer: PgMaterializer = async (tx, row) => {
 		if (row.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
 		if (!row.recipientMessageId)
 			throw new Error("Mailbox claim has no reserved recipient identity");
@@ -1037,6 +1049,12 @@ export function createPgPlacedMessageMaterializer(
 		await hooks?.onPersist?.(tx, persisted.messageId, persisted.refId);
 		return { messageId: persisted.messageId, refId: persisted.refId };
 	};
+	materializer.planNarratorLocks = async (tx, claim) => {
+		if (claim.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
+		const { narratorIds } = await resolvePgMessageNarratorLocks(tx, message);
+		return [...narratorIds, ...(hooks?.narratorIds ?? [])];
+	};
+	return materializer;
 }
 
 // ── narratorPersistence object ─────────────────────────────────────────────
@@ -1047,8 +1065,12 @@ async function appendPersistedMessage(
 ): Promise<RefMessage> {
 	const bumpMessageVersion = options?.bumpMessageVersion !== false;
 	const pg = getNarratorMessageRefsPort();
-	if (pg) return pg.append(message, { bumpMessageVersion });
-	return withDbRetry(
+	if (pg) {
+		const created = await pg.append(message, { bumpMessageVersion });
+		if (message.role !== "disp") queueContextCharacterRefresh(message.narratorId, message.id);
+		return created;
+	}
+	const created = await withDbRetry(
 		async () =>
 			db.transaction((tx) => {
 				const created = tx.insert(narratorMessages).values(message).returning().get();
@@ -1057,6 +1079,8 @@ async function appendPersistedMessage(
 			}),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
 	);
+	if (message.role !== "disp") queueContextCharacterRefresh(message.narratorId, message.id);
+	return created;
 }
 
 /**
@@ -1130,6 +1154,11 @@ const sqliteNarratorPersistence = {
 				parentToolUseId,
 				role: "user",
 				contentJson: contentBlocks ?? [{ type: "text", text }],
+				contextCharsJson: measureMessageCharacters(
+					"user",
+					contentBlocks ?? [{ type: "text", text }],
+					text,
+				),
 				contentText: text,
 				commandText: commandText ?? null,
 				createdBy: createdBy ?? null,
@@ -1137,6 +1166,7 @@ const sqliteNarratorPersistence = {
 				originLabel: origin?.originLabel ?? null,
 				createdAt: new Date().toISOString(),
 			});
+			queueContextCharacterRefresh(narratorId, msg.id);
 			const creator =
 				createdBy && !(placement?.messageId && origin?.origin === "assistant")
 					? await pg.creator(createdBy).catch(() => null)
@@ -1156,6 +1186,11 @@ const sqliteNarratorPersistence = {
 							parentToolUseId,
 							role: "user",
 							contentJson: contentBlocks ?? [{ type: "text", text }],
+							contextCharsJson: measureMessageCharacters(
+								"user",
+								contentBlocks ?? [{ type: "text", text }],
+								text,
+							),
 							contentText: text,
 							commandText: commandText ?? null,
 							createdBy: createdBy ?? null,
@@ -1172,6 +1207,7 @@ const sqliteNarratorPersistence = {
 			},
 			{ label: "persistUserMessage", maxRetries: 5 },
 		);
+		queueContextCharacterRefresh(narratorId, msgWithSeq.id);
 
 		// A child row also changes what the PARENT's page shows (the tool card's
 		// activity snapshot), and the parent is a different narrator with its own
@@ -1244,18 +1280,21 @@ const sqliteNarratorPersistence = {
 			const provided = contentBlocks ?? [];
 			const native = provided.some(isNativeModelContextBlock);
 			const blocks = native ? provided : [{ type: "text", text }, ...provided];
-			return pg.append({
+			const created = await pg.append({
 				id: placement?.messageId ?? generateId(),
 				narratorId,
 				parentToolUseId,
 				role: "sys",
 				contentJson: blocks,
+				contextCharsJson: measureMessageCharacters("sys", blocks, text),
 				contentText: native ? modelTextFromContentBlocks(blocks) || text : text,
 				createdBy: createdBy ?? null,
 				origin: origin?.origin ?? "system",
 				originLabel: origin?.originLabel ?? null,
 				createdAt: new Date().toISOString(),
 			});
+			queueContextCharacterRefresh(narratorId, created.id);
+			return created;
 		}
 		const msg = await withDbRetry(
 			async () =>
@@ -1275,6 +1314,7 @@ const sqliteNarratorPersistence = {
 							parentToolUseId,
 							role: "sys",
 							contentJson: blocks,
+							contextCharsJson: measureMessageCharacters("sys", blocks, text),
 							contentText: hasNativeModelContext
 								? modelTextFromContentBlocks(blocks) || text
 								: text,
@@ -1292,6 +1332,7 @@ const sqliteNarratorPersistence = {
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
 		);
+		queueContextCharacterRefresh(narratorId, msg.id);
 		if (placement?.messageId || placement?.mailboxClaim) {
 			await bumpParentNarratorMessageVersion(parentToolUseId).catch((error) => {
 				logger.warn("Committed injection parent-version notification failed", {
@@ -1320,6 +1361,7 @@ const sqliteNarratorPersistence = {
 			narratorId,
 			role: "disp",
 			contentJson: contentBlocks ?? [{ type: "info", message: text }],
+			contextCharsJson: { segments: [] },
 			// Custom-block callers supply already-formatted text; preserve legacy default.
 			contentText: contentBlocks ? text : `[Info] ${text}`,
 			createdAt: new Date().toISOString(),
@@ -1399,6 +1441,7 @@ const sqliteNarratorPersistence = {
 							narratorId,
 							role: "system",
 							contentJson: [compactBlock],
+							contextCharsJson: measureMessageCharacters("system", [compactBlock]),
 							contentText: "[Compacting]",
 							createdAt,
 						})
@@ -1475,6 +1518,7 @@ const sqliteNarratorPersistence = {
 					};
 					const copied = copyMessageForNarratorTx(tx, narratorId, messageId, {
 						contentJson: [retryBlock],
+						contextCharsJson: measureMessageCharacters("system", [retryBlock]),
 						contentText: "[Compacting]",
 						contextPercent: null,
 					});
@@ -1521,6 +1565,9 @@ const sqliteNarratorPersistence = {
 					contentJson: [
 						{ type: "compact", status: "compacted", subtype: "plan", summary: content },
 					],
+					contextCharsJson: measureMessageCharacters("system", [
+						{ type: "compact", status: "compacted", summary: content },
+					]),
 					contentText: `[Plan] ${content.slice(0, 200)}...`,
 					createdAt: now,
 				})
@@ -1540,7 +1587,9 @@ const sqliteNarratorPersistence = {
 			tx.update(narrators)
 				.set({
 					contextSummary: content,
+					contextSummaryChars: measureSummaryCharacters(content),
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1564,6 +1613,7 @@ const sqliteNarratorPersistence = {
 					narratorId,
 					role: "system",
 					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+					contextCharsJson: { segments: [] },
 					contentText: "[Context cleared]",
 					createdAt: now,
 				})
@@ -1583,7 +1633,9 @@ const sqliteNarratorPersistence = {
 			tx.update(narrators)
 				.set({
 					contextSummary: null,
+					contextSummaryChars: 0,
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1623,6 +1675,7 @@ const sqliteNarratorPersistence = {
 					narratorId,
 					role: "system",
 					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+					contextCharsJson: { segments: [] },
 					contentText: "[Context cleared]",
 					createdAt: now,
 				})
@@ -1642,6 +1695,7 @@ const sqliteNarratorPersistence = {
 			tx.update(narrators)
 				.set({
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1776,6 +1830,7 @@ const sqliteNarratorPersistence = {
 				.update(narratorMessages)
 				.set({
 					contentJson: [compactBlock],
+					contextCharsJson: measureMessageCharacters("system", [compactBlock]),
 					contentText,
 					contextPercent: status === "compacted" ? (contextPercent ?? null) : null,
 				})
@@ -1797,7 +1852,14 @@ const sqliteNarratorPersistence = {
 
 			tx.update(narrators)
 				.set({
-					...(status === "compacted" ? { contextSummary: summary, apiConversationId: null } : {}),
+					...(status === "compacted"
+						? {
+								contextSummary: summary,
+								contextSummaryChars: measureSummaryCharacters(summary),
+								apiConversationId: null,
+								contextUsageSnapshotJson: null,
+							}
+						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1854,6 +1916,7 @@ const sqliteNarratorPersistence = {
 			parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
 			role: "assistant",
 			contentJson: content,
+			contextCharsJson: measureMessageCharacters("assistant", content),
 			contentText: contentText || null,
 			tokensIn: usage?.input_tokens,
 			provider: sdkMessage.provider ?? null,
@@ -1879,15 +1942,13 @@ const sqliteNarratorPersistence = {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
 		for (const block of toolUseBlocks) {
-			const parentToolCall = await findExecutionSegmentParent(
-				narratorId,
-				sdkMessage.parent_tool_use_id,
-			);
+			const parentToolCall = await findExecutionSegmentParent(narratorId);
 			const toolCallId = generateId();
 			const segment = await executionSegments.create({
 				narratorId,
 				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
-				sourceInputId: block.id,
+				sourceToolCallId: toolCallId,
+				sourceExecutionAttempt: 1,
 			});
 			await db.insert(narratorToolCalls).values({
 				executionSegmentId: segment.id,
@@ -1896,6 +1957,7 @@ const sqliteNarratorPersistence = {
 				messageId: id,
 				toolUseId: block.id,
 				toolName: block.name,
+				inputChars: measureSerializedCharacters(block.input),
 				inputJson: withGeminiThoughtSignature(
 					block.input,
 					block.thoughtSignature,
@@ -1914,6 +1976,7 @@ const sqliteNarratorPersistence = {
 						: null,
 				createdAt: now,
 			});
+			queueContextCharacterRefresh(narratorId, id);
 		}
 
 		return { ...msg, seq };
@@ -1959,6 +2022,7 @@ const sqliteNarratorPersistence = {
 				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
 				role: "assistant",
 				contentJson: [],
+				contextCharsJson: { segments: [] },
 				contentText: null,
 				tokensIn: sdkMessage.tokensIn ?? null,
 				turnUsageJson: sdkMessage.turnUsage ?? null,
@@ -1997,6 +2061,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 			  }
 			| {
 					type: "reasoning";
@@ -2004,6 +2069,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -2058,6 +2124,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 			  }
 			| {
 					type: "reasoning";
@@ -2065,6 +2132,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -2144,9 +2212,14 @@ const sqliteNarratorPersistence = {
 				.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
 				.join("\n");
 			db.update(narratorMessages)
-				.set({ contentJson: content, contentText: contentText || null })
+				.set({
+					contentJson: content,
+					contextCharsJson: measureMessageCharacters("assistant", content),
+					contentText: contentText || null,
+				})
 				.where(eq(narratorMessages.id, messageId))
 				.run();
+			queueContextCharacterRefresh(narratorId, messageId);
 		}
 
 		/**
@@ -2199,12 +2272,13 @@ const sqliteNarratorPersistence = {
 
 		if (block.type === "tool_use") {
 			const now = new Date().toISOString();
-			const parentToolCall = await findExecutionSegmentParent(narratorId, existing.parentToolUseId);
+			const parentToolCall = await findExecutionSegmentParent(narratorId);
 			const toolCallId = generateId();
 			const segment = await executionSegments.create({
 				narratorId,
 				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
-				sourceInputId: block.id,
+				sourceToolCallId: toolCallId,
+				sourceExecutionAttempt: 1,
 			});
 			await db.insert(narratorToolCalls).values({
 				executionSegmentId: segment.id,
@@ -2213,6 +2287,7 @@ const sqliteNarratorPersistence = {
 				messageId,
 				toolUseId: block.id,
 				toolName: block.name,
+				inputChars: measureSerializedCharacters(block.input),
 				inputJson: withGeminiThoughtSignature(
 					block.input,
 					block.thoughtSignature,
@@ -2231,6 +2306,7 @@ const sqliteNarratorPersistence = {
 						: null,
 				createdAt: now,
 			});
+			queueContextCharacterRefresh(narratorId, messageId);
 			await publishPartial();
 			return toolCallId;
 		}
@@ -2381,7 +2457,10 @@ const sqliteNarratorPersistence = {
 
 	async updateModel(narratorId: string, model: string) {
 		const now = new Date().toISOString();
-		await db.update(narrators).set({ model, updatedAt: now }).where(eq(narrators.id, narratorId));
+		await db
+			.update(narrators)
+			.set({ model, contextUsageSnapshotJson: null, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 
 	async updatePermissionMode(narratorId: string, permissionMode: PermissionMode) {
@@ -2941,7 +3020,7 @@ const sqliteNarratorPersistence = {
 		return Object.freeze({
 			toolCallId,
 			attempt: row.executionAttempt,
-			executionSegmentId: row.executionSegmentId ?? toolCallId,
+			executionSegmentId: row.executionSegmentId ?? undefined,
 		});
 	},
 
@@ -2957,7 +3036,18 @@ const sqliteNarratorPersistence = {
 		});
 		if (!row)
 			throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
-		await this.getToolCallBinding(narratorId, row.messageId, toolUseId, binding.toolCallId);
+		const receipt = await this.getToolCallBinding(
+			narratorId,
+			row.messageId,
+			toolUseId,
+			binding.toolCallId,
+		);
+		if (
+			binding.executionSegmentId !== undefined &&
+			binding.executionSegmentId !== receipt.executionSegmentId
+		) {
+			throw new ValidationError("Tool execution segment does not match its persisted receipt");
+		}
 		return row.messageId;
 	},
 
@@ -2987,12 +3077,26 @@ const sqliteNarratorPersistence = {
 		}
 		const toolCallId = generateId();
 		const toolUseId = `internal_read_${generateId()}`;
+		const parentReceipt = await this.getToolCallBinding(
+			narratorId,
+			messageId,
+			parentToolUseId,
+			parentBinding.toolCallId,
+		);
+		const segment = await executionSegments.create({
+			narratorId,
+			parentSegmentId: parentReceipt.executionSegmentId ?? null,
+			sourceToolCallId: toolCallId,
+			sourceExecutionAttempt: 1,
+		});
 		await db.insert(narratorToolCalls).values({
+			executionSegmentId: segment.id,
 			id: toolCallId,
 			narratorId,
 			messageId,
 			toolUseId,
 			toolName: "Read",
+			inputChars: measureSerializedCharacters(input),
 			inputJson: {
 				...input,
 				__internalRead: {
@@ -3006,7 +3110,11 @@ const sqliteNarratorPersistence = {
 			executionIdentityVersion: 1,
 			createdAt: new Date().toISOString(),
 		});
-		return { toolUseId, binding: Object.freeze({ toolCallId, attempt: 1 }) };
+		queueContextCharacterRefresh(narratorId, messageId);
+		return {
+			toolUseId,
+			binding: Object.freeze({ toolCallId, attempt: 1, executionSegmentId: segment.id }),
+		};
 	},
 
 	async completeInternalRead(
@@ -3051,6 +3159,9 @@ const sqliteNarratorPersistence = {
 					eq(narratorToolCalls.id, binding.toolCallId),
 					eq(narratorToolCalls.executionAttempt, binding.attempt),
 					isNull(narratorToolCalls.executionStartedAt),
+					// A sealed no-dispatch attempt is never executable, even if a legacy
+					// caller resets its visible status without allocating a fresh attempt.
+					isNull(narratorToolCalls.fileChangeOperationId),
 					inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
 				),
 			)
@@ -3195,9 +3306,23 @@ const sqliteNarratorPersistence = {
 					"An already-started tool attempt requires reconciliation, not re-execution",
 				);
 			}
-			if (resume && !shared && source.narratorId === narratorId) {
+			if (resume && source.narratorId === narratorId) {
 				if (!["initializing", "pending", "running"].includes(source.status)) {
 					throw new ValidationError("Only an unstarted pending attempt can resume");
+				}
+				if (shared) {
+					const retainedId = await this.copyOnWriteMessage(
+						narratorId,
+						source.messageId,
+						undefined,
+						{
+							preserveExecutionOwner: true,
+						},
+					);
+					if (retainedId !== source.messageId)
+						throw new ValidationError(
+							"Only the actual execution owner can resume a shared attempt",
+						);
 				}
 				return { toolCall: source, requiresFreshPermission: false };
 			}
@@ -3227,6 +3352,7 @@ const sqliteNarratorPersistence = {
 						toolUseId: source.toolUseId,
 						toolName: source.toolName,
 						inputJson: source.inputJson,
+						inputChars: source.inputChars,
 						executionIdentityVersion: 1,
 						executionAttempt: Math.max(
 							1,
@@ -3240,7 +3366,21 @@ const sqliteNarratorPersistence = {
 					.all();
 				return created;
 			});
-			return { toolCall, requiresFreshPermission: shared || source.narratorId !== narratorId };
+			const parent = await findExecutionSegmentParent(narratorId);
+			const segment = await executionSegments.create({
+				narratorId,
+				parentSegmentId: parent?.executionSegmentId ?? null,
+				sourceToolCallId: toolCall.id,
+				sourceExecutionAttempt: toolCall.executionAttempt,
+			});
+			await db
+				.update(narratorToolCalls)
+				.set({ executionSegmentId: segment.id })
+				.where(eq(narratorToolCalls.id, toolCall.id));
+			return {
+				toolCall: { ...toolCall, executionSegmentId: segment.id },
+				requiresFreshPermission: shared || source.narratorId !== narratorId,
+			};
 		});
 	},
 
@@ -3471,7 +3611,10 @@ const sqliteNarratorPersistence = {
 				.update(narratorToolCalls)
 				.set({
 					outputJson: result.output ?? null,
-					...(result.input !== undefined ? { inputJson: result.input } : {}),
+					outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
+					...(result.input !== undefined
+						? { inputJson: result.input, inputChars: measureSerializedCharacters(result.input) }
+						: {}),
 					status: result.status,
 					errorMessage: result.errorMessage ?? null,
 					permissionStartedAt:
@@ -3514,6 +3657,7 @@ const sqliteNarratorPersistence = {
 		// this they cannot distinguish "the model is thinking" from "a tool has been running for
 		// two minutes". Input/output payloads are deliberately excluded.
 		for (const toolCall of affectedToolCalls) {
+			queueContextCharacterRefresh(toolCall.narratorId, toolCall.messageId ?? undefined);
 			eventBus.emit({
 				type: "narrator:tool_changed",
 				narratorId: toolCall.narratorId,
@@ -3592,15 +3736,10 @@ const sqliteNarratorPersistence = {
 		if (!condition) return false;
 
 		const affectedToolCalls = await db
-			.select({ narratorId: narratorToolCalls.narratorId, messageId: narratorToolCalls.messageId })
-			.from(narratorToolCalls)
-			.where(condition);
-		if (affectedToolCalls.length === 0) return false;
-
-		await db
 			.update(narratorToolCalls)
 			.set({
 				outputJson: result.output ?? null,
+				outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
 				status: result.status,
 				errorMessage: result.errorMessage ?? null,
 				permissionStartedAt:
@@ -3622,9 +3761,15 @@ const sqliteNarratorPersistence = {
 						}),
 				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 			})
-			.where(condition);
-
+			.where(condition)
+			.returning({
+				narratorId: narratorToolCalls.narratorId,
+				messageId: narratorToolCalls.messageId,
+			});
+		if (affectedToolCalls.length === 0) return false;
 		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
+		for (const toolCall of affectedToolCalls)
+			queueContextCharacterRefresh(toolCall.narratorId, toolCall.messageId ?? undefined);
 		await bumpNarratorMessageVersions(affectedNarratorIds);
 		return true;
 	},
@@ -3648,6 +3793,7 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		messageId: string,
 		overrides?: Partial<typeof narratorMessages.$inferInsert>,
+		options: { preserveExecutionOwner?: boolean } = {},
 	): Promise<string> {
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -3656,114 +3802,148 @@ const sqliteNarratorPersistence = {
 			),
 		});
 		if (!ref) throw new NotFoundError("Message", messageId);
-
-		const [refCount] = await db
-			.select({ count: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId));
-		const isShared = (refCount?.count ?? 0) > 1;
 		const semanticEdit =
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
-		if (!isShared) {
-			if (overrides && Object.keys(overrides).length > 0) {
-				db.transaction((tx) => {
+		if (semanticEdit && overrides) {
+			const original = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+			});
+			if (!original) throw new NotFoundError("Message", messageId);
+			overrides = {
+				...overrides,
+				contextCharsJson: measureMessageCharacters(
+					overrides.role ?? original.role,
+					overrides.contentJson !== undefined ? overrides.contentJson : original.contentJson,
+					overrides.contentText !== undefined ? overrides.contentText : original.contentText,
+				),
+			};
+		}
+		const now = new Date().toISOString();
+		const refreshedRecipients: string[] = [];
+		const result = db.transaction((tx) => {
+			const original = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
+			if (!original) throw new NotFoundError("Message", messageId);
+			// Read ref membership atomically with the rewrite, including forks made while the
+			// caller awaited context accounting. Never mutate a newly-shared row in place.
+			const recipients = tx
+				.select({ id: narratorMessageRefs.id, narratorId: narratorMessageRefs.narratorId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.messageId, messageId))
+				.limit(1_001)
+				.all();
+			if (recipients.length > 1_000)
+				throw new ValidationError("Message COW exceeds the 1000-recipient limit");
+			const currentRef = recipients.find((recipient) => recipient.narratorId === narratorId);
+			if (!currentRef) throw new NotFoundError("Message", messageId);
+			const bumpVersion = (recipientId: string, replacementId: string) => {
+				const narrator = tx.query.narrators
+					.findFirst({ where: eq(narrators.id, recipientId), columns: { forkMessageId: true } })
+					.sync();
+				tx.update(narrators)
+					.set({
+						...(narrator?.forkMessageId === messageId ? { forkMessageId: replacementId } : {}),
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, recipientId))
+					.run();
+			};
+			const updateOriginal = () => {
+				if (overrides && Object.keys(overrides).length > 0) {
 					tx.update(narratorMessages)
 						.set(overrides)
 						.where(eq(narratorMessages.id, messageId))
 						.run();
 					if (semanticEdit)
-						updateRecipientMessageRef(tx, narratorId, ref.id, {
+						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",
 							messageId,
 						});
-					tx.update(narrators)
-						.set({
-							messageVersion: sql`${narrators.messageVersion} + 1`,
-							updatedAt: new Date().toISOString(),
-						})
-						.where(eq(narrators.id, narratorId))
-						.run();
-				});
-			}
-			return messageId;
-		}
-
-		const newMessageId = generateId();
-		const now = new Date().toISOString();
-
-		db.transaction((tx) => {
-			const original = tx.query.narratorMessages
-				.findFirst({
-					where: eq(narratorMessages.id, messageId),
-				})
-				.sync();
-			if (!original) throw new NotFoundError("Message", messageId);
-
-			tx.insert(narratorMessages)
-				.values({
-					...original,
-					...overrides,
-					id: newMessageId,
-					narratorId,
-					createdAt: original.createdAt,
-				})
-				.run();
-
-			tx.update(narratorMessageRefs)
-				.set({ messageId: newMessageId })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				)
-				.run();
-
-			updateRecipientMessageRef(tx, narratorId, ref.id, {
-				kind: semanticEdit ? "semantic_edit" : "cow",
-				messageId: newMessageId,
-			});
-
+					bumpVersion(narratorId, messageId);
+				}
+				return messageId;
+			};
+			if (recipients.length === 1) return updateOriginal();
 			const originalToolCalls = tx.query.narratorToolCalls
-				.findMany({
-					where: eq(narratorToolCalls.messageId, messageId),
-				})
+				.findMany({ where: eq(narratorToolCalls.messageId, messageId), limit: 1_001 })
 				.sync();
-			if (originalToolCalls.length > 0) {
-				tx.insert(narratorToolCalls)
-					.values(
-						originalToolCalls.map((tc) => ({
-							...tc,
-							executionOriginToolCallId: tc.executionOriginToolCallId ?? tc.id,
-							id: generateId(),
-							narratorId,
-							messageId: newMessageId,
-							createdAt: now,
-						})),
-					)
+			if (originalToolCalls.length > 1_000)
+				throw new ValidationError("Message COW exceeds the 1000-tool limit");
+			const cloneRecipient = (
+				recipient: { id: string; narratorId: string },
+				changes: Partial<typeof narratorMessages.$inferInsert> | undefined,
+				kind: "semantic_edit" | "cow",
+			) => {
+				const replacementId = generateId();
+				tx.insert(narratorMessages)
+					.values({
+						...original,
+						...changes,
+						id: replacementId,
+						narratorId: recipient.narratorId,
+						createdAt: original.createdAt,
+					})
 					.run();
+				tx.update(narratorMessageRefs)
+					.set({ messageId: replacementId })
+					.where(eq(narratorMessageRefs.id, recipient.id))
+					.run();
+				updateRecipientMessageRef(tx, recipient.narratorId, recipient.id, {
+					kind,
+					messageId: replacementId,
+				});
+				if (originalToolCalls.length)
+					tx.insert(narratorToolCalls)
+						.values(
+							originalToolCalls.map((call) => ({
+								...call,
+								executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
+								id: generateId(),
+								narratorId: recipient.narratorId,
+								messageId: replacementId,
+								createdAt: now,
+							})),
+						)
+						.run();
+				bumpVersion(recipient.narratorId, replacementId);
+				refreshedRecipients.push(recipient.narratorId);
+				return replacementId;
+			};
+			if (
+				options.preserveExecutionOwner &&
+				original.narratorId === narratorId &&
+				originalToolCalls.some(
+					(call) =>
+						call.narratorId === narratorId &&
+						call.executionIdentityVersion === 1 &&
+						call.executionOriginToolCallId === null,
+				)
+			) {
+				// Output cleanup/finalization is not a new tool attempt. Isolate the historical
+				// recipients instead: keep the actual owner's message ID, tool PK, approval,
+				// continuation and Agent origin bindings intact. Copies remain history-only.
+				const copyCount = recipients.length - 1;
+				const snapshotBytes =
+					Buffer.byteLength(JSON.stringify(original)) +
+					Buffer.byteLength(JSON.stringify(originalToolCalls));
+				if (
+					copyCount * (originalToolCalls.length + 1) > 10_000 ||
+					copyCount * snapshotBytes > 8 * 1024 * 1024
+				)
+					throw new ValidationError(
+						"Execution-owner output COW exceeds the bounded snapshot budget",
+					);
+				for (const recipient of recipients)
+					if (recipient.narratorId !== narratorId) cloneRecipient(recipient, undefined, "cow");
+				return updateOriginal();
 			}
-
-			const narrator = tx.query.narrators
-				.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { forkMessageId: true },
-				})
-				.sync();
-			const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
-			if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
-			tx.update(narrators)
-				.set({
-					...narratorUpdates,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
+			return cloneRecipient(currentRef, overrides, semanticEdit ? "semantic_edit" : "cow");
 		});
-
-		return newMessageId;
+		for (const recipient of refreshedRecipients) queueContextCharacterRefresh(recipient);
+		return result;
 	},
 
 	async copyOnWriteToolCallMessage(
@@ -3790,11 +3970,16 @@ const sqliteNarratorPersistence = {
 
 		const existing = await db.query.narratorToolCalls.findFirst({
 			where: condition,
-			columns: { messageId: true, toolName: true, inputJson: true },
+			columns: { messageId: true, toolName: true, inputJson: true, narratorId: true },
 		});
 		const effectiveInput = guardPersistedPlanBody(input, existing, toolUseId);
 
-		await db.update(narratorToolCalls).set({ inputJson: effectiveInput }).where(condition);
+		await db
+			.update(narratorToolCalls)
+			.set({ inputJson: effectiveInput, inputChars: measureSerializedCharacters(effectiveInput) })
+			.where(condition);
+		if (existing)
+			queueContextCharacterRefresh(existing.narratorId, existing.messageId ?? undefined);
 
 		if (existing?.messageId) {
 			const msg = await db.query.narratorMessages.findFirst({
@@ -3873,6 +4058,7 @@ const sqliteNarratorPersistence = {
 							messageCount: refs.length,
 						},
 					],
+					contextCharsJson: { segments: [] },
 					contentText: "[Segment compacting]",
 					createdAt: now,
 				})
@@ -3982,6 +4168,7 @@ const sqliteNarratorPersistence = {
 				.update(narratorMessages)
 				.set({
 					contentJson: [block],
+					contextCharsJson: measureMessageCharacters("user", [block]),
 					contentText: `${prefix}\n${summary}`,
 					contextPercent: contextPercent ?? null,
 				})
@@ -4007,6 +4194,7 @@ const sqliteNarratorPersistence = {
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4094,6 +4282,7 @@ const sqliteNarratorPersistence = {
 			tx.update(narrators)
 				.set({
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -4143,13 +4332,14 @@ const sqliteNarratorPersistence = {
 			tx.update(narratorMessages)
 				.set({
 					contentJson: [newBlock],
+					contextCharsJson: measureMessageCharacters("user", [newBlock]),
 					contentText: `[Segment Compact]\n${summary}`,
 				})
 				.where(eq(narratorMessages.id, messageId))
 				.run();
 
 			tx.update(narrators)
-				.set({ apiConversationId: null, updatedAt: now })
+				.set({ apiConversationId: null, contextUsageSnapshotJson: null, updatedAt: now })
 				.where(eq(narrators.id, narratorId))
 				.run();
 		});
@@ -4191,17 +4381,68 @@ function guardSqliteOnlyPersistenceMethod(
 	};
 }
 
+/** Content writers notify only after their successful commit; status/cost writers are excluded. */
+const CONTEXT_CHARACTER_WRITERS = new Map<string, number>([
+	["persistCompactingMessage", 0],
+	["prepareFailedCompactRetry", 0],
+	["persistPlanMessage", 0],
+	["clearContext", 0],
+	["clearContextBefore", 0],
+	["finalizeCompactingMessage", 1],
+	["prepareToolCallAttempt", 0],
+	["copyOnWriteMessage", 0],
+	["persistSegmentCompactMarker", 0],
+	["finalizeSegmentCompact", 1],
+	["deleteSegmentCompact", 0],
+	["updateSegmentCompactSummary", 0],
+]);
+
+function notifyContextCharacterWriter(key: string, method: (...args: never[]) => unknown) {
+	const narratorArgument = CONTEXT_CHARACTER_WRITERS.get(key);
+	if (narratorArgument == null) return method;
+	return async function contentWriter(this: unknown, ...args: never[]) {
+		const result = await Reflect.apply(method, this, args);
+		const narratorId = args[narratorArgument];
+		const row =
+			result && typeof result === "object" ? (result as Record<string, unknown>) : undefined;
+		const message =
+			row?.message && typeof row.message === "object"
+				? (row.message as Record<string, unknown>)
+				: undefined;
+		const tool =
+			row?.toolCall && typeof row.toolCall === "object"
+				? (row.toolCall as Record<string, unknown>)
+				: undefined;
+		const messageId =
+			typeof result === "string"
+				? result
+				: (row?.id ??
+					message?.id ??
+					tool?.messageId ??
+					(key === "updateSegmentCompactSummary" ? args[1] : undefined));
+		if (result !== null && typeof narratorId === "string")
+			queueContextCharacterRefresh(
+				narratorId,
+				typeof messageId === "string" ? messageId : undefined,
+			);
+		return result;
+	};
+}
+
 export const narratorPersistence: typeof sqliteNarratorPersistence = (() => {
 	const wrapped: Record<PropertyKey, unknown> = {};
 	for (const key of Reflect.ownKeys(sqliteNarratorPersistence)) {
 		const descriptor = Object.getOwnPropertyDescriptor(sqliteNarratorPersistence, key);
 		if (!descriptor) continue;
-		if (typeof descriptor.value === "function" && !PG_MESSAGE_METHODS.has(key))
-			wrapped[key] = guardSqliteOnlyPersistenceMethod(
+		if (typeof descriptor.value === "function") {
+			const method = descriptor.value as (...args: never[]) => unknown;
+			wrapped[key] = notifyContextCharacterWriter(
 				String(key),
-				descriptor.value as (...args: never[]) => unknown,
+				PG_MESSAGE_METHODS.has(key)
+					? method
+					: guardSqliteOnlyPersistenceMethod(String(key), method),
 			);
-		else Object.defineProperty(wrapped, key, descriptor);
+		} else Object.defineProperty(wrapped, key, descriptor);
 	}
 	return wrapped as typeof sqliteNarratorPersistence;
 })();

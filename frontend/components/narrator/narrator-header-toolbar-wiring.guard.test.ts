@@ -17,6 +17,7 @@ const headerTitle = () => read("./header/NarratorPanelHeaderTitle.tsx");
 const overflowMenu = () => read("./header/NarratorToolbarOverflowMenu.tsx");
 const headerToolbar = () => read("./header/HeaderToolbar.tsx");
 const headerToolbarHook = () => read("./header/use-header-toolbar.tsx");
+const headerLayout = () => read("./header/NarratorHeaderLayout.tsx");
 const titleWidth = () => read("./header/header-title-width.ts");
 
 describe("header layout: pretext title width + right-hand tools", () => {
@@ -46,7 +47,12 @@ describe("header layout: pretext title width + right-hand tools", () => {
 		expect(toolbar).toContain("selectHeaderToolbarEntries");
 		expect(toolbar).toContain("unmeasured ? null");
 		const panel = await narratorPanel();
-		expect(panel).toContain("resolveHeaderLayoutAfterTitle");
+		const layout = await headerLayout();
+		expect(layout).toContain("resolveHeaderLayoutAfterTitle");
+		expect(layout).toContain("children(layout)");
+		expect(panel).toContain("<NarratorHeaderLayout");
+		expect(panel).toContain("titleFullWidth={headerTitleFullWidth}");
+		expect(panel).toContain("surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}");
 		expect(panel).toContain("visibleToolCount={headerLayout.visibleToolCount}");
 		expect(panel).toContain("titleFullWidth={headerLayout.titleWidth}");
 		expect(panel).toContain("unmeasured={headerLayout.unmeasured}");
@@ -60,7 +66,24 @@ describe("header layout: pretext title width + right-hand tools", () => {
 		expect(widthSrc).toContain("HEADER_TOOLBAR_GAP_PX = 10");
 		const panel = await narratorPanel();
 		expect(panel).toContain("gap: HEADER_LEADING_GAP_PX");
-		expect(panel).toContain("HEADER_ROW_PADDING_PX");
+		const layout = await headerLayout();
+		expect(layout).toContain("gap: HEADER_LEADING_GAP_PX");
+		expect(layout).toContain("HEADER_ROW_PADDING_PX / 2");
+	});
+
+	it("keeps raw header-width state and observation out of the full panel", async () => {
+		const panel = await narratorPanel();
+		for (const oldBinding of [
+			"headerRowWidth",
+			"setHeaderRowWidth",
+			"headerRowReady",
+			"headerRowRef",
+		]) {
+			expect(panel).not.toContain(oldBinding);
+		}
+		const layout = await headerLayout();
+		expect(layout).toContain("new ResizeObserver(read)");
+		expect(layout).toContain("sameLayout(published.current, next)");
 	});
 
 	it("toolbar slices by arithmetic visibleToolCount; overflow carries the rest", async () => {
@@ -177,22 +200,30 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 	});
 });
 
-describe("the file-tree toolbar entry is wired to Dockview", () => {
-	it("tracks the Dockview panel's active state", async () => {
+describe("the file-tree toolbar entry is wired to Dockview and the mobile drawer", () => {
+	it("tracks the open state on both hosts", async () => {
 		const source = await headerToolbarHook();
 		const start = source.indexOf("const toolbarEntryActive");
 		const end = source.indexOf("/**\n\t * Activate an entry", start);
 		const body = source.slice(start, end);
 		expect(body).toContain('case "filetree":');
-		expect(body).toContain('dock?.openToolTypes.has("filetree")');
+		expect(body).toContain('dock.openToolTypes.has("filetree")');
+		expect(body).toContain('mobileToolPanel === "filetree"');
 	});
 
-	it("activates the file-tree panel instead of falling through", async () => {
+	it("activates the dock panel and falls back to the mobile drawer", async () => {
 		const source = await headerToolbarHook();
 		const start = source.indexOf("const activateToolbarEntry");
 		const end = source.indexOf("/**\n\t * Options the overflow menu", start);
 		const body = source.slice(start, end);
 		expect(body).toContain('case "filetree":');
-		expect(body).toContain('dock?.toggleToolPanel("filetree")');
+		expect(body).toContain("dock.toggleToolPanel(id)");
+		expect(body).toContain("setMobileToolPanel");
+	});
+
+	it("the drawer host can actually render a file tree", async () => {
+		const host = await read("./MobileToolPanelHost.tsx");
+		expect(host).toContain('"filetree"');
+		expect(host).toContain("FileTreePanel");
 	});
 });

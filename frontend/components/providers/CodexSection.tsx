@@ -52,13 +52,14 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useCodexManagerParityCapability,
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import { ApiError } from "../../lib/api/client";
 import type {
 	CodexAuthMode,
 	CodexLoadBalancingMode,
@@ -453,6 +454,25 @@ export const CodexSection = React.memo(function CodexSection({
 		codexManagerParity?.tsCodexManagerEquivalent === false ||
 		codexManagerParity?.usageQueueParity === "partial" ||
 		codexManagerParity?.snapshotPaginationParity === "partial";
+	const [activeTab, setActiveTab] = useState<string | null>("overview");
+	const [browserAuthFailure, setBrowserAuthFailure] = useState<{
+		code?: string;
+		message: string;
+	} | null>(null);
+	const browserAuthErrorMessage = useCallback(
+		(code: string | undefined, fallback: string) => {
+			const keys: Record<string, string> = {
+				region_unsupported: "codexBrowserRegionUnsupported",
+				state_mismatch: "codexBrowserStateMismatch",
+				flow_expired: "codexBrowserFlowExpired",
+				exchange_in_progress: "codexBrowserExchanging",
+				network_error: "codexBrowserNetworkError",
+				token_exchange_failed: "codexBrowserTokenExchangeFailed",
+			};
+			return code && keys[code] ? t(keys[code]) : fallback;
+		},
+		[t],
+	);
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
 	const [browserCallbackUrl, setBrowserCallbackUrl] = useState("");
@@ -681,6 +701,15 @@ export const CodexSection = React.memo(function CodexSection({
 		if (next.localCallbackServer !== undefined) {
 			setBrowserAuthServerDown(next.localCallbackServer === false);
 		}
+		if (
+			browserAuthState?.status === "failed" &&
+			browserAuthState.error &&
+			(browserAuthStartedAtRef.current == null ||
+				browserAuthStateAt >= browserAuthStartedAtRef.current)
+		) {
+			setBrowserAuthFailure({ code: browserAuthState.errorCode, message: browserAuthState.error });
+			setBrowserCallbackUrl("");
+		}
 		if (next.pending === true) setBrowserAuthPending(true);
 		if (next.pending === false) {
 			setBrowserAuthPending(false);
@@ -692,7 +721,13 @@ export const CodexSection = React.memo(function CodexSection({
 
 	// Auto-detect browser auth failure from server-side error
 	useEffect(() => {
-		if (browserAuthPending && lastBrowserAuthError) {
+		if (
+			browserAuthPending &&
+			lastBrowserAuthError &&
+			browserAuthState?.status === "failed" &&
+			(browserAuthStartedAtRef.current == null ||
+				browserAuthStateAt >= browserAuthStartedAtRef.current)
+		) {
 			// Clean up polling
 			if (browserAuthIntervalRef.current) {
 				clearInterval(browserAuthIntervalRef.current);
@@ -707,12 +742,18 @@ export const CodexSection = React.memo(function CodexSection({
 			setBrowserAuthLoading(false);
 			setBrowserAuthServerDown(false);
 			notifications.show({
-				message: lastBrowserAuthError,
+				message: browserAuthErrorMessage(browserAuthState.errorCode, lastBrowserAuthError),
 				color: "red",
 				autoClose: 10_000,
 			});
 		}
-	}, [browserAuthPending, lastBrowserAuthError]);
+	}, [
+		browserAuthPending,
+		lastBrowserAuthError,
+		browserAuthState,
+		browserAuthStateAt,
+		browserAuthErrorMessage,
+	]);
 
 	// Mutations
 	const disableMut = useMutation({
@@ -931,6 +972,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const handleBrowserAuth = async () => {
 		if (!canStartBrowserAuth) return;
 		const initialTotal = status?.total ?? 0;
+		setBrowserAuthFailure(null);
 		browserAuthStartedAtRef.current = Date.now();
 		setBrowserAuthLoading(true);
 		setBrowserAuthPending(true);
@@ -1029,6 +1071,7 @@ export const CodexSection = React.memo(function CodexSection({
 			return api.codexBrowserAuthCallback(url);
 		},
 		onSuccess: (result) => {
+			setBrowserAuthFailure(null);
 			browserCallbackSubmittingRef.current = false;
 			browserAuthStartedAtRef.current = null;
 			if (browserAuthIntervalRef.current) {
@@ -1054,11 +1097,21 @@ export const CodexSection = React.memo(function CodexSection({
 		},
 		onError: (err) => {
 			browserCallbackSubmittingRef.current = false;
-			// The server keeps the flow pending on a failed exchange, so the paste box
-			// stays open for a retry instead of forcing a fresh authorization.
+			const code =
+				err instanceof ApiError && typeof err.data?.code === "string" ? err.data.code : undefined;
+			const message = err instanceof Error ? err.message : String(err);
+			setBrowserAuthFailure({ code, message });
+			if (code === "state_mismatch" || (err instanceof ApiError && err.data?.restartRequired)) {
+				setBrowserCallbackUrl("");
+			}
+			if (err instanceof ApiError && err.data?.restartRequired) {
+				setBrowserAuthPending(false);
+				setBrowserAuthLoading(false);
+				browserAuthStartedAtRef.current = null;
+			}
 			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
 			notifications.show({
-				message: err instanceof Error ? err.message : String(err),
+				message: browserAuthErrorMessage(code, message),
 				color: "red",
 				autoClose: 10_000,
 			});
@@ -1066,7 +1119,12 @@ export const CodexSection = React.memo(function CodexSection({
 	});
 
 	const handleImportBrowserCallback = () => {
-		if (!canImportBrowserCallback) return;
+		if (
+			!canImportBrowserCallback ||
+			browserCallbackSubmittingRef.current ||
+			browserAuthState?.status === "exchanging"
+		)
+			return;
 		const trimmed = browserCallbackUrl.trim();
 		if (!trimmed) return;
 		importBrowserCallbackMut.mutate(trimmed);
@@ -1194,7 +1252,7 @@ export const CodexSection = React.memo(function CodexSection({
 				</Alert>
 			)}
 
-			<Tabs defaultValue="overview" keepMounted={false}>
+			<Tabs value={activeTab} onChange={setActiveTab} keepMounted={false}>
 				<Tabs.List>
 					<Tabs.Tab value="overview" leftSection={<IconGauge size={14} />}>
 						{t("codexTabOverview")}
@@ -1431,12 +1489,31 @@ export const CodexSection = React.memo(function CodexSection({
 							<Text size="sm" fw={500}>
 								{t("codexAddCredentials")}
 							</Text>
+							{browserAuthFailure && (
+								<Alert color="red">
+									<Stack gap="xs">
+										<Text size="sm">
+											{browserAuthErrorMessage(browserAuthFailure.code, browserAuthFailure.message)}
+										</Text>
+										{browserAuthFailure.code === "region_unsupported" && (
+											<Button size="xs" variant="light" onClick={() => setActiveTab("settings")}>
+												{t("codexBrowserConfigureProxy")}
+											</Button>
+										)}
+									</Stack>
+								</Alert>
+							)}
 							{browserAuthPending ? (
 								<Paper withBorder p="sm" bg="blue.0">
 									<Stack gap="xs">
 										<Group gap="xs">
 											<Text size="sm" c="blue">
-												{t("codexBrowserAuthWaiting")}
+												{t(
+													browserAuthState?.status === "exchanging" ||
+														importBrowserCallbackMut.isPending
+														? "codexBrowserExchanging"
+														: "codexBrowserAuthWaiting",
+												)}
 											</Text>
 										</Group>
 										{/* Manual callback URL: the redirect targets localhost on the
@@ -1468,7 +1545,11 @@ export const CodexSection = React.memo(function CodexSection({
 												size="xs"
 												onClick={handleImportBrowserCallback}
 												loading={importBrowserCallbackMut.isPending}
-												disabled={!browserCallbackUrl.trim() || !canImportBrowserCallback}
+												disabled={
+													!browserCallbackUrl.trim() ||
+													!canImportBrowserCallback ||
+													browserAuthState?.status === "exchanging"
+												}
 												title={
 													!canImportBrowserCallback ? providerRouteUnsupportedReason : undefined
 												}

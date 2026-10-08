@@ -30,6 +30,7 @@ import {
 import type { AdapterContext } from "@shared/pretext-layout/segment-adapter";
 import { useQueries } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef } from "react";
+import type { VListDataSource } from "./vlist-data-source";
 
 /** Max detail records fetched concurrently, so one screen cannot storm the API. */
 const MAX_CONCURRENT_FETCHES = 6;
@@ -69,9 +70,17 @@ export function sameToolDetailRequests(
 	);
 }
 
+export interface ToolDetailLoadStatus {
+	loading: boolean;
+	/** Opaque failure marker; the row supplies a localized explanation. */
+	error?: string;
+}
+
 export type UseVListToolDetailsResult = Required<
 	Pick<AdapterContext, "resolveFullToolInput" | "resolveFullToolOutput">
->;
+> & {
+	resolveToolDetailStatus: (toolUseId: string, ref?: ToolCallDetailRef) => ToolDetailLoadStatus;
+};
 
 /** Use the same identity for React Query, retention, and adapter lookups. */
 export function toolDetailIdentityKey(toolUseId: string, ref?: ToolCallDetailRef): string {
@@ -80,7 +89,22 @@ export function toolDetailIdentityKey(toolUseId: string, ref?: ToolCallDetailRef
 
 export type ToolDetailQueryResult = {
 	data?: { inputJson?: unknown; outputJson?: unknown } | undefined;
+	isError?: boolean;
 };
+
+/** A comparable status signal, separate from the settled-payload revision. */
+export function buildToolDetailStatusRevision(
+	identityKeys: readonly string[],
+	results: readonly ToolDetailQueryResult[],
+): string {
+	return JSON.stringify(
+		identityKeys.flatMap((key, index) => {
+			const result = results[index];
+			if (result?.data) return [];
+			return [[key, result?.isError ? "error" : "loading"]];
+		}),
+	);
+}
 
 /**
  * Which exact identity keys currently have a settled payload, as a plain string.
@@ -147,10 +171,14 @@ export function mergeToolDetailPayloads(
 /**
  * Fetch visible + expanded + truncated calls by their exact persisted identity.
  * A missing ref remains a legacy request; never borrow a body from a richer ref.
+ *
+ * `fetchDetail` overrides the transport (the public share page calls its own
+ * share-credentialed endpoint); absent → the narrator API.
  */
 export function useVListToolDetails(
 	narratorId: string,
 	requests: readonly VListToolDetailRequest[],
+	fetchDetail?: VListDataSource["fetchToolDetail"],
 ): UseVListToolDetailsResult {
 	// Dedupe exact identities before applying the cap, not provider tool-use ids.
 	const wanted = useMemo(() => {
@@ -180,16 +208,21 @@ export function useVListToolDetails(
 		(results: readonly ToolDetailQueryResult[]) => {
 			const merged = mergeToolDetailPayloads(payloads.current, wantedKeys, results);
 			payloads.current = merged;
-			return buildToolDetailRevision([...merged.keys()], wantedKeys, results);
+			return {
+				revision: buildToolDetailRevision([...merged.keys()], wantedKeys, results),
+				statusRevision: buildToolDetailStatusRevision(wantedKeys, results),
+			};
 		},
 		[payloads, wantedKeys],
 	);
 
-	const revision = useQueries({
+	const snapshot = useQueries({
 		queries: wanted.map((request) => ({
 			queryKey: toolCallDetailQueryKey(narratorId, request.toolUseId, request),
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
-				narratorsApi.getToolCallDetail(narratorId, request.toolUseId, request, signal),
+				fetchDetail
+					? fetchDetail(narratorId, request.toolUseId, request, signal)
+					: narratorsApi.getToolCallDetail(narratorId, request.toolUseId, request, signal),
 			enabled: !!narratorId && !!request.toolUseId,
 			staleTime: DETAIL_CACHE_MS,
 			gcTime: DETAIL_CACHE_MS,
@@ -197,19 +230,36 @@ export function useVListToolDetails(
 		combine,
 	});
 
-	return useMemo<UseVListToolDetailsResult>(() => {
-		// Retain bodies even after their now-untruncated cards leave the wanted set.
-		// Only a new settled identity (or narrator) changes these resolver functions.
-		void revision;
+	const resolvers = useMemo(() => {
+		// Loading/error updates must not rebuild prepared layout: only settled
+		// payloads change these two adapter-facing function identities.
+		void snapshot.revision;
 		return {
-			resolveFullToolInput: (toolUseId, ref) =>
+			resolveFullToolInput: (toolUseId: string | undefined, ref?: ToolCallDetailRef) =>
 				toolUseId
 					? payloads.current.get(toolDetailIdentityKey(toolUseId, ref))?.inputJson
 					: undefined,
-			resolveFullToolOutput: (toolUseId, ref) =>
+			resolveFullToolOutput: (toolUseId: string | undefined, ref?: ToolCallDetailRef) =>
 				toolUseId
 					? payloads.current.get(toolDetailIdentityKey(toolUseId, ref))?.outputJson
 					: undefined,
 		};
-	}, [payloads, revision]);
+	}, [payloads, snapshot.revision]);
+
+	const resolveToolDetailStatus = useMemo(() => {
+		const status = new Map<string, string>(JSON.parse(snapshot.statusRevision));
+		return (toolUseId: string, ref?: ToolCallDetailRef): ToolDetailLoadStatus => {
+			const key = toolDetailIdentityKey(toolUseId, ref);
+			if (payloads.current.has(key)) return { loading: false };
+			const state = status.get(key);
+			return state === "error"
+				? { loading: false, error: "full-tool-payload-unavailable" }
+				: { loading: state === "loading" };
+		};
+	}, [payloads, snapshot.statusRevision]);
+
+	return useMemo(
+		() => ({ ...resolvers, resolveToolDetailStatus }),
+		[resolvers, resolveToolDetailStatus],
+	);
 }

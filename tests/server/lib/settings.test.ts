@@ -239,19 +239,7 @@ describe("stripObsoleteSettingsKeys", () => {
 		});
 	});
 
-	it("removes legacy NKP settings without touching supported provider settings", () => {
-		const value: Record<string, unknown> = {
-			customApiProviders: [],
-			nugProviders: [],
-			nkpProviders: [{ id: "old-nkp" }],
-			nkpQuotas: { "old-nkp": { quotaBalance: "1" } },
-		};
-
-		expect(stripObsoleteSettingsKeys(value)).toBe(true);
-		expect(value).toEqual({ customApiProviders: [], nugProviders: [] });
-	});
-
-	it("reports unchanged when no obsolete NKP keys are present", () => {
+	it("reports unchanged when no obsolete keys are present", () => {
 		const value: Record<string, unknown> = { customApiProviders: [] };
 
 		expect(stripObsoleteSettingsKeys(value)).toBe(false);

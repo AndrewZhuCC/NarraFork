@@ -14,6 +14,20 @@ import { commandSchema, localeSchema } from "./common";
 /** Repair only the configured directory, after explicit administrator confirmation. */
 export const dataDirectoryRepairSchema = z.object({ confirmed: z.literal(true) }).strict();
 
+export const diskSafetySettingsSchema = z
+	.object({
+		mode: z.enum(["enforce", "warn", "off"]),
+		warningFreeMb: z.number().min(0).max(1_000_000),
+		warningFreePercent: z.number().min(0).max(100),
+		blockFreeMb: z.number().min(0).max(1_000_000),
+		criticalFreeMb: z.number().min(0).max(1_000_000),
+		reserveMb: z.number().min(0).max(1_000_000),
+		checkIntervalMs: z.number().int().min(1000).max(300_000),
+		pathCacheTtlMs: z.number().int().min(1000).max(600_000),
+		probeTimeoutMs: z.number().int().min(50).max(2000),
+	})
+	.partial();
+
 export const defaultNarratorVisibilitySchema = z.enum(["auto", "private", "public"]);
 export const defaultNarratorWriteAudienceSchema = z.enum(["auto", "owner", "project", "public"]);
 
@@ -143,10 +157,12 @@ const narratorToolbarLayoutSchema = z.object({
 	items: z
 		.array(
 			z.object({
-				id: z.enum(PERSISTED_NARRATOR_TOOLBAR_IDS),
+				// Accept only this retired id from older clients, then remove it.
+				id: z.enum([...PERSISTED_NARRATOR_TOOLBAR_IDS, "filemod"]),
 			}),
 		)
-		.max(30),
+		.max(30)
+		.transform((items) => items.filter((item) => item.id !== "filemod")),
 });
 
 export const updateUserPreferencesSchema = z.object({
@@ -190,6 +206,7 @@ export const updateUserPreferencesSchema = z.object({
 		.min(TYPOGRAPHY_RANGE.paragraphScalePercent.min)
 		.max(TYPOGRAPHY_RANGE.paragraphScalePercent.max)
 		.optional(),
+	treatAsLocalAccess: z.boolean().optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences
@@ -300,6 +317,12 @@ export const batchUpsertRecentTabsSchema = z.object({
 export const removeRecentTabSchema = z.object({
 	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
+	/**
+	 * Entity-teardown cleanup (chapter deleted, narrator archived). When set, no undo
+	 * token is minted — a cascade must not overwrite the user's pending undo slot with
+	 * a snapshot that points at entities that are already gone.
+	 */
+	cascade: z.boolean().optional(),
 });
 
 export const moveRecentTabSchema = z

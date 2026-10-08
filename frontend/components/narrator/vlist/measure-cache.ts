@@ -43,12 +43,23 @@ import type { MeasuredElement } from "./prepared-block";
  */
 export const MEASURE_BODY_SOURCE_CHAR_BUDGET = 4_000_000;
 
+/** Bound Map hashing/equality and retained UTF-16 key lengths independently. */
+export const TEXT_SIGNATURE_MAX_TEXT_CHARS = 2048;
+export const TEXT_SIGNATURE_MAX_ENTRIES = 8192;
+export const TEXT_SIGNATURE_CHAR_BUDGET = 1_048_576;
+
 /** Only the measured body's retained payload, never a stringify/deep walk of user input. */
 export function retainedBodySourceChars(value: unknown): number {
 	if (!value || typeof value !== "object") return 0;
 	const item = value as Record<string, unknown>;
 	const model = item.model as Record<string, unknown> | undefined;
 	let chars = 0;
+	// Preview geometry is small, but it intentionally retains the FULL source for
+	// reader expansion. Account for that payload, not just prepared visible blocks.
+	const preview = item.textPreview as { sourceText?: unknown } | undefined;
+	chars += typeof preview?.sourceText === "string" ? preview.sourceText.length : 0;
+	for (const key of ["displayText", "sourceText"] as const)
+		chars += typeof item[key] === "string" ? item[key].length : 0;
 	if (model?.kind === "capped") {
 		chars += typeof model.text === "string" ? model.text.length : 0;
 		const doc = model.diffDocument as
@@ -57,12 +68,15 @@ export function retainedBodySourceChars(value: unknown): number {
 		chars += doc?.oldSource?.text?.length ?? 0;
 		chars += doc?.newSource?.text?.length ?? 0;
 	}
-	for (const key of ["detail", "promptMeasured", "resultMeasured"] as const)
+	for (const key of ["detail", "promptMeasured", "resultMeasured", "body", "bodyMeasured"] as const)
 		chars += retainedBodySourceChars(item[key]);
 	if (Array.isArray(item.sections))
 		for (const section of item.sections) chars += retainedBodySourceChars(section?.measuredBody);
 	if (Array.isArray(item.rows))
-		for (const row of item.rows) chars += retainedBodySourceChars(row?.cardMeasured);
+		for (const row of item.rows) {
+			chars += retainedBodySourceChars(row?.cardMeasured);
+			chars += retainedBodySourceChars(row?.body);
+		}
 	if (Array.isArray(item.children))
 		for (const child of item.children) chars += retainedBodySourceChars(child);
 	return chars;
@@ -74,6 +88,8 @@ export class MeasureCache {
 	private sourceChars = 0;
 	private _hits = 0;
 	private _misses = 0;
+	private textSignatures = new Map<string, string>();
+	private textSignatureChars = 0;
 
 	constructor(
 		private ceiling: number,
@@ -88,6 +104,36 @@ export class MeasureCache {
 		}
 		this._hits++;
 		return entry.value;
+	}
+
+	/**
+	 * Reuse only an immutable STRING value, never a mutable adapter data object.
+	 * Larger keys bypass Map entirely: their hashing/equality could scan the body
+	 * before the original fixed-sample signature algorithm even starts.
+	 */
+	signatureForText(text: string): string {
+		if (text.length > TEXT_SIGNATURE_MAX_TEXT_CHARS) return computeTextSignature(text);
+		const cached = this.textSignatures.get(text);
+		if (cached !== undefined) return cached;
+		const signature = computeTextSignature(text);
+		// Admission, not eviction: a full sequential scan keeps its admitted cohort
+		// hot even when the working set exceeds either limit. Cold strings fall back.
+		if (
+			this.textSignatures.size < TEXT_SIGNATURE_MAX_ENTRIES &&
+			this.textSignatureChars + text.length <= TEXT_SIGNATURE_CHAR_BUDGET
+		) {
+			this.textSignatures.set(text, signature);
+			this.textSignatureChars += text.length;
+		}
+		return signature;
+	}
+
+	get textSignatureEntries(): number {
+		return this.textSignatures.size;
+	}
+
+	get retainedTextSignatureChars(): number {
+		return this.textSignatureChars;
 	}
 
 	private remove(key: string): void {
@@ -118,6 +164,8 @@ export class MeasureCache {
 		this.map.clear();
 		this.families.clear();
 		this.sourceChars = 0;
+		this.textSignatures.clear();
+		this.textSignatureChars = 0;
 	}
 	clear(): void {
 		this.clearStorage();
@@ -149,6 +197,30 @@ export class MeasureCache {
  * Returns true if the spec key represents a streaming/transient item whose
  * content is still changing (height would be stale on next measure).
  */
+function toolTimingRevision(source: Record<string, unknown>): string {
+	let revision = "";
+	for (const key of [
+		"durationMs",
+		"execDurationMs",
+		"streamStartedAt",
+		"streamCompletedAt",
+		"permissionStartedAt",
+		"executionStartedAt",
+		"completedAt",
+		"createdAt",
+		"startedAt",
+	]) {
+		if (typeof source[key] === "number") revision += `|timing:${key}:${source[key]}`;
+	}
+	if (source.fileChangeTiming != null && typeof source.fileChangeTiming === "object") {
+		const file = source.fileChangeTiming as Record<string, unknown>;
+		for (const key of ["waitMs", "executionMs", "totalMs"]) {
+			if (typeof file[key] === "number") revision += `|fileTiming:${key}:${file[key]}`;
+		}
+	}
+	return revision;
+}
+
 export function isStreamingKey(key: string): boolean {
 	return key.includes("__streaming__");
 }
@@ -240,6 +312,8 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-update measured payload and the header keeps showing
 	// the OLD timeout even though the server already applied the new one.
 	if (typeof d.timeoutMs === "number") rev += `|to:${d.timeoutMs}`;
+	// Timing corrections can land on terminal records without changing their body/status.
+	rev += toolTimingRevision(d);
 	// Truncated-payload state. Height-AFFECTING (a non-zero count reserves the
 	// truncation notice row) and, more importantly, the ONLY key component that
 	// moves when a fetched payload lands: `status` is already terminal, and the
@@ -255,6 +329,15 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// copy is keyed by `traceRevision`). Height-affecting, and it is the only component
 	// that moves when the form's painted height is reported.
 	rev += permissionFormRevision(d.permissionForm);
+	// Grouped cards keep their children in a structural toolCalls array. A local
+	// same-width form report must invalidate that group's frame just like a trace's.
+	if (Array.isArray(d.toolCalls)) {
+		rev += `|gpf:${d.toolCalls
+			.map((child) =>
+				permissionFormRevision((child as Record<string, unknown> | null)?.permissionForm),
+			)
+			.join(";")}`;
+	}
 	// Takeover badge. Height-neutral (it rides the fixed header row), and keyed for
 	// exactly the reason `timeoutMs` above is: the takeover patch writes this ONE
 	// field — `status` cannot move, because the whole point is that the call is
@@ -288,10 +371,38 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
 	// O(1) via the sampled signature, same as every other text field here.
 	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
+	// Chat regrouping can add/remove the fixed header without editing the message.
+	// Body format also changes geometry while text/id/document version stay equal.
+	// Normalize the narrator defaults so omitted and explicit defaults share a key.
+	if (d.role === "user") {
+		rev += `|uh:${d.hasHeader === false ? 0 : 1}|bf:${d.bodyFormat === "markdown" ? "markdown" : "plain"}`;
+	}
+	// User-bubble reply quote strip / tombstone form. Both are reserved fixed
+	// blocks inside the measured payload, so a reply target resolve (preview
+	// landing after the page loads), a soft delete, or an edit of the tombstone
+	// label must re-key — otherwise the cached element keeps painting the old
+	// strip / keeps the body that a tombstone replaced.
+	if (d.quote && typeof d.quote === "object") {
+		const quote = d.quote as Record<string, unknown>;
+		rev += `|qu:${String(quote.state ?? "")}:${textSignature(String(quote.text ?? ""))}:${textSignature(String(quote.authorName ?? ""))}`;
+	}
+	if (d.deleted === true) rev += "|del:1";
+	if (typeof d.deletedLabel === "string") rev += `|dl:${textSignature(d.deletedLabel)}`;
+	// Canonical edit stamp of a user/chat message: an in-place edit keeps the
+	// spec.key and usually the role, so without this the measured body stays the
+	// pre-edit one (the gap chat's own measure cache key already closed).
+	if (typeof d.editedAt === "string") rev += `|ea:${d.editedAt}`;
+	if (d.placement === "trailing") {
+		// The same-width breakpoint preview can add/remove the second usage line.
+		rev += `|us:${typeof d.secondaryText === "string" ? textSignature(d.secondaryText) : "-"}`;
+	}
 	// Communication bodies can finish streaming or hydrate without changing status.
 	// Re-key the bounded measured text and both independently reserved footer rows.
 	if (typeof d.message === "string") {
 		rev += `|cm:${textSignature(d.message)}|ct:${d.messageTruncated === true ? 1 : 0}`;
+		const source = d.messageBody as { text?: unknown; textTruncated?: unknown } | undefined;
+		if (typeof source?.text === "string") rev += `|cms:${textSignature(source.text)}`;
+		if (source?.textTruncated === true) rev += "|cmcut:1";
 		if (typeof d.error === "string") rev += `|ce:${textSignature(d.error)}`;
 		if (typeof d.warning === "string") rev += `|cw:${textSignature(d.warning)}`;
 		// ExactRow memoizes by the measured object: navigation-only changes must
@@ -324,6 +435,9 @@ export function extractDataRevision(data: unknown): string | undefined {
 					a.height,
 					a.filePath,
 					a.uploadNarratorId,
+					// Domain-endpoint locator (chat attachments): the id lives in the path,
+					// so this also re-keys a same-filename re-upload.
+					a.fetchUrl,
 				];
 			}),
 		)}`;
@@ -463,8 +577,7 @@ function traceRevision(d: Record<string, unknown>): string {
 		// with it (running → success arrives together with `durationMs`); this keys the
 		// value directly so a duration-only correction cannot serve a stale row.
 		if (r.timing != null && typeof r.timing === "object") {
-			const duration = (r.timing as Record<string, unknown>).durationMs;
-			if (typeof duration === "number") rev += `|tm:${duration}`;
+			rev += toolTimingRevision(r.timing as Record<string, unknown>);
 		}
 		// The figure actually PAINTED, which for bash is the pure execution time rather
 		// than `timing.durationMs` (see `@shared/tool-display-duration`). Keyed
@@ -759,6 +872,11 @@ function detailTextRevision(detail: unknown): string {
 const REVISION_HASH_SAMPLES = 512;
 
 function textSignature(text: string): string {
+	return measureCache.signatureForText(text);
+}
+
+/** Original signature algorithm; cache misses and oversized text take this path. */
+function computeTextSignature(text: string): string {
 	const len = text.length;
 	let hash = 0x811c9dc5;
 	const mix = (code: number) => {
@@ -828,6 +946,10 @@ function sourcePointRevision(value: unknown): string {
 /** Content-signature revision of one NON-composite detail body. */
 function leafTextRevision(d: Record<string, unknown>): string {
 	let rev = "";
+	if (d.textDocument && typeof d.textDocument === "object") {
+		const doc = d.textDocument as Record<string, unknown>;
+		rev += `|doc:${doc.id}:${doc.epoch}:${doc.revision}:${doc.length}:${doc.complete}`;
+	}
 	if (typeof d.text === "string") rev += `|tx:${textSignature(d.text)}`;
 	for (const key of [
 		"id",
@@ -842,6 +964,11 @@ function leafTextRevision(d: Record<string, unknown>): string {
 		"kind",
 	] as const) {
 		if (d[key] != null) rev += `|${key}:${textSignature(String(d[key]))}`;
+	}
+	if (d.textDocumentError === true) rev += "|docError:1";
+	if (d.textDocumentSource && typeof d.textDocumentSource === "object") {
+		const source = d.textDocumentSource as Record<string, unknown>;
+		rev += `|docSource:${source.narratorId}:${source.toolUseId}:${source.toolCallId}:${source.messageId}:${source.executionAttempt}`;
 	}
 	if (d.live === true) rev += "|live:1";
 	if (d.textTruncated === true) rev += "|cut:1";
@@ -953,9 +1080,13 @@ function digestOpts(opts: Record<string, unknown>): string {
 		} else if (typeof v === "number") {
 			result += String(v);
 		} else if (Array.isArray(v)) {
-			// Small sorted array of numbers (expandedIndices, expandedRows)
-			const sorted = (v as number[]).slice().sort((a, b) => a - b);
-			result += sorted.join(",");
+			if (k === "textExpandedKeys") {
+				// String keys may contain commas; preserve boundaries and set semantics.
+				result += JSON.stringify([...new Set(v as string[])].sort());
+			} else {
+				const sorted = (v as number[]).slice().sort((a, b) => a - b);
+				result += sorted.join(",");
+			}
 		} else if (v instanceof Set) {
 			const sorted = [...v].sort();
 			result += sorted.join(",");

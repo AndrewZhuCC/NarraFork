@@ -7,6 +7,7 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
@@ -47,6 +48,8 @@ export class ApiError extends Error {
 export interface ReflectionLoopContext {
 	/** Kind of reflection loop, e.g. "dangerReflection". */
 	kind: string;
+	/** Dedicated authorization workflow: no cached confirm or text fallback. */
+	purpose?: "permissionRuleRequest";
 	/** Optional request/domain ID for the loop. */
 	requestId?: string;
 	/** Optional source toolUseId or target toolUseId that triggered the loop. */
@@ -88,7 +91,21 @@ export interface ToolExecutionLifecycleContext {
 	binding?: ToolCallBinding;
 }
 
+/** Final authorization uses the immutable admitted input/target, never a live cwd hint. */
+export interface ToolFinalStartAuthorizationContext extends ToolExecutionLifecycleContext {
+	executionBackend?: import("./execution/backend").ExecutionBackend;
+	executionPlan?: ToolExecutionPlan;
+	approvedPermission: AllowPermissionResult;
+}
+
+/** Async policy preparation followed by a synchronous fence at the actual call boundary. */
+export interface ToolFinalStartAuthorizationTicket {
+	assertStillCurrent: () => void;
+}
+
 export interface ToolContext {
+	/** Trusted host callback; called only at a proven pre-write control-flow boundary. */
+	recordFileNoDispatch?: (reason: "validation_rejected" | "preview") => Promise<void>;
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
 	recheckAuthorization?: () => Promise<void>;
@@ -195,6 +212,14 @@ export interface ToolContext {
 	 * session cannot be found. Absent for callers without a live session.
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
+	/** Checks at both permission and final execution admission; stale passes fail closed. */
+	assertWorkspaceCurrent?: () => void;
+	/** Frozen workspace identity for this pass; background closures retain it. */
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Commit a strict-serial switch without waiting for the invoking loop. */
+	switchWorkingDirectory?: (
+		request: import("@shared/workspace-context").SwitchWorkingDirectoryRequest,
+	) => Promise<import("@shared/workspace-context").SwitchWorkingDirectoryResult>;
 }
 
 /** Immutable execution identity captured before a routed tool enters permission handling. */
@@ -268,6 +293,8 @@ export type ToolExecutionRouting =
 	  };
 
 export interface PermissionHandlerOptions {
+	/** Per-call preparation cancellation; prefer this over the whole-run signal. */
+	signal?: AbortSignal;
 	/** Exact execution row; never resolve a different row by provider toolUseId. */
 	toolCallBinding?: ToolCallBinding;
 	/** Suppress user-facing attention for an internally resumed permission flow. */
@@ -316,6 +343,8 @@ export interface ToolDefinition {
 	name: string;
 	description: string | ((config: AgentConfig) => string);
 	parameters: z.ZodType;
+	/** Optional bounded, actionable validation feedback; never includes raw tool input. */
+	formatValidationError?: (error: z.ZodError) => string;
 	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
 	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
 	rawJsonSchema?: Record<string, unknown>;
@@ -378,6 +407,8 @@ export type PermissionResult =
 	  }
 	| {
 			behavior: "dangerReflection";
+			/** Dedicated rule-request gate; never cached or approved via text fallback. */
+			purpose?: "permissionRuleRequest";
 			requestId: string;
 			danger: DangerInfo;
 			fingerprint: string;
@@ -401,6 +432,8 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 export type AgentEvent =
 	| {
 			type: "assistant_message";
+			/** False when an errored/truncated response is retained for already-started tools. */
+			outputCompleted?: boolean;
 			text: string;
 			toolUses: AgentToolUse[];
 			/** Internal persistence receipt for tools missing an incremental block. */
@@ -425,6 +458,8 @@ export type AgentEvent =
 			toolUseId: string;
 			toolName: string;
 			input: Record<string, unknown>;
+			/** Server pre-match evidence, never taken from model input. */
+			streamingEditOrigin?: StreamingEditOrigin;
 			streamStartedAt?: number;
 			streamCompletedAt?: number;
 	  }
@@ -489,6 +524,10 @@ export type AgentEvent =
 				delta: string;
 				/** True at the JSON string's start, false for a continuation; absent means unknown. */
 				startsField?: boolean;
+				/** Decoded raw UTF-16 offset before this delta (CRLF is not normalized). */
+				offset?: number;
+				/** True when the JSON string closed, including an empty final delta. */
+				complete?: boolean;
 			};
 	  }
 	| {
@@ -684,6 +723,8 @@ export type AgentEvent =
 	  }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			percentage: number;
 			promptTokens?: number;
 			inputTokens?: number;
@@ -746,6 +787,7 @@ export type AgentEvent =
 	  }
 	| {
 			type: "api_request_end";
+			contextSnapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			requestId: string;
 			credentialId?: string;
 			usage?: {
@@ -787,6 +829,8 @@ export type ContentBlock =
 			/** Display/persistence identity, never an upstream replay credential. */
 			id?: string;
 			revision?: number;
+			/** False for durable checkpoints; true only at a successful completion boundary. */
+			completed?: boolean;
 			/** Raw stream length before citation-marker cleanup. */
 			rawTextLength?: number;
 			/**
@@ -803,6 +847,8 @@ export type ContentBlock =
 			outputIndex?: number;
 			id?: string;
 			revision?: number;
+			/** False for durable checkpoints; true only at a successful completion boundary. */
+			completed?: boolean;
 			/** Raw stream length before citation-marker cleanup. */
 			rawTextLength?: number;
 	  }
@@ -863,6 +909,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Send",
 	"TeamStatus",
 	"AskUserQuestion",
+	"Question",
 	"Skill",
 	"LearningGuide",
 ]);
@@ -932,12 +979,24 @@ export interface AgentLoopExtension {
 }
 
 export interface AgentConfig {
+	/** Prepare and pin numeric classification within a bounded, cancellable pre-transport budget. */
+	freezeContextComposition?: (
+		counts: import("@shared/context-usage").ContextInputCharacters | null,
+		requestId: string,
+		startedAt: string,
+		signal: AbortSignal,
+	) =>
+		| import("@shared/context-composition").ContextCharCache
+		| null
+		| Promise<import("@shared/context-composition").ContextCharCache | null>;
 	narratorId: string;
 	conversationId: string;
 	model: string;
 	provider: string;
 	cwd: string;
 	systemPrompt?: string;
+	/** Host telemetry for the actual provider-formatted tool payload; failures are non-fatal. */
+	onToolsCharacters?: (toolsChars: number) => void | Promise<void>;
 	locale?: string;
 	signal: AbortSignal;
 	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
@@ -1013,6 +1072,14 @@ export interface AgentConfig {
 	 * into ToolContext.setDefaultDevice. Absent → SwitchDevice reports failure.
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
+	/** Checks at both permission and final execution admission; stale passes fail closed. */
+	assertWorkspaceCurrent?: () => void;
+	/** Frozen workspace identity for this pass; background closures retain it. */
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Commit a strict-serial switch without waiting for the invoking loop. */
+	switchWorkingDirectory?: (
+		request: import("@shared/workspace-context").SwitchWorkingDirectoryRequest,
+	) => Promise<import("@shared/workspace-context").SwitchWorkingDirectoryResult>;
 	/**
 	 * Persist the immutable primary execution identity before a routed tool enters permission handling.
 	 * Rejecting this callback prevents execution so audit state cannot silently diverge.
@@ -1060,6 +1127,21 @@ export interface AgentConfig {
 	 * or runs model/context hooks. The host must fence writes by toolCallBinding.
 	 */
 	onDetachedToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void>;
+	/** Capture a live host observation before permission can terminate the unclaimed row. */
+	prepareToolNoDispatch?: (
+		ctx: ToolContext,
+		toolName: "Write" | "Edit" | "StructSed",
+	) => (
+		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
+		claimed: boolean,
+	) => Promise<void>;
+	/** Host evidence persistence (not an observer): failures must reject execution. */
+	recordToolNoDispatch?: (
+		ctx: ToolContext,
+		toolName: "Write" | "Edit" | "StructSed",
+		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
+		claimed: boolean,
+	) => Promise<void>;
 	/** Durable single-start claim immediately before tool.execute, after authorization. */
 	onToolExecutionStarting?: (
 		toolUseId: string,
@@ -1102,6 +1184,11 @@ export interface AgentConfig {
 	allowLocalExecution?: boolean;
 	/** Live authorization check performed immediately before every tool call. */
 	runtimeAuthorizationGuard?: () => Promise<void>;
+	/** Real policy rejudgment after all preparation/slot waits; its synchronous fence
+	 *  is checked immediately before tool.execute, not as an observer. */
+	onToolExecutionFinalAuthorization?: (
+		context: ToolFinalStartAuthorizationContext,
+	) => Promise<ToolFinalStartAuthorizationTicket>;
 	/** Skills blocked by narrator custom traits. `all` hides the Skill tool entirely. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Custom description appended to Agent.model schema when narrator traits restrict subagent models. */
@@ -1153,7 +1240,13 @@ export interface AgentConfig {
 		| string
 		| { text: string; onConsumed?: () => void };
 	/** Exact source history adopted at the provider-input boundary, never during preparation. */
-	onModelInputConsumed?: (sourceHistory: unknown[], content: string) => void;
+	onModelInputConsumed?: (
+		sourceHistory: unknown[],
+		content: string,
+		questionAnswerEventIds?: ReadonlySet<string>,
+	) => void;
+	/** Authenticated receipt candidates, checked against the actual supplied model input. */
+	getQuestionModelReceipts?: () => readonly { id: string; text: string }[];
 	/**
 	 * Persist a reminder the LOOP itself produced as its own message row.
 	 *
@@ -1218,6 +1311,14 @@ export interface AgentConfig {
 	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
+	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
+	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	guidanceSignal?: AbortSignal;
+	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
+	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */
+	urgentGuidanceSignal?: AbortSignal;
+	/** Internal synchronous boundary after the final fences, immediately before tool.execute. */
+	onToolExecutionInvoking?: (toolUse: AgentToolUse) => void;
 	/**
 	 * Disable streaming-time eager tool execution so shouldStop boundaries can
 	 * guarantee that later serial tools have not already started.

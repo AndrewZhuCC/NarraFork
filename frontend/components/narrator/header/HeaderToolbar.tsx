@@ -1,7 +1,8 @@
-import { ActionIcon, Group, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Group, Tooltip } from "@mantine/core";
 import { IconFlask, IconX } from "@tabler/icons-react";
 import { memo, useMemo } from "react";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import { NarratorToolbarItem, type NarratorToolbarItemProps } from "./NarratorToolbarItem";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import {
@@ -16,6 +17,8 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	archiveMutation: { isPending: boolean };
 	dock: NarratorDockContextValue | null;
 	mockStreamEnabled: boolean;
+	/** Opens the compatibility modal, which the caller renders outside the menu. */
+	onOpenCompatibility?: () => void;
 	onClose?: () => void;
 	/**
 	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
@@ -34,6 +37,7 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
  * the remainder stays in the overflow menu. No flex fight with the title.
  */
 export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarProps) {
+	const controls = usePanelHeaderControls();
 	const {
 		headerHostCapabilities,
 		toolbarBadgeCounts,
@@ -99,7 +103,17 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 				renderInlineOptions={renderToolbarInlineOptions}
 				onArchive={openArchiveConfirm}
 				archiveLoading={archiveMutation.isPending}
+				onOpenCompatibility={props.onOpenCompatibility}
 			/>
+			{onClose && controls?.pinAction && (
+				<Box
+					{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
+					className="nodrag"
+					style={{ display: "flex", flexShrink: 0 }}
+				>
+					{controls.pinAction}
+				</Box>
+			)}
 			{onClose && (
 				<Tooltip label={t("closePanel")}>
 					<ActionIcon

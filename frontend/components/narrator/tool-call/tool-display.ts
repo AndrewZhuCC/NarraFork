@@ -5,6 +5,28 @@ import {
 	formatCommunicationState,
 	resolveCommunicationTargets,
 } from "@shared/pretext-layout/communication-state";
+import { workspaceSummary } from "@shared/pretext-layout/workspace-tool-display";
+
+/** Only a live foreground Bash command can be detached; never stop/Agent/Send calls. */
+export function isRunningForegroundBash(
+	toolName: string | undefined,
+	input: unknown,
+	status: string | undefined,
+	metadata?: Record<string, unknown>,
+): boolean {
+	if (toolName !== "Bash" || (status !== "executing" && status !== "running")) return false;
+	if (!input || typeof input !== "object") return false;
+	const args = input as Record<string, unknown>;
+	return (
+		typeof args.command === "string" &&
+		args.command.trim().length > 0 &&
+		!args.stop &&
+		args.background !== true &&
+		args.run_in_background !== true &&
+		!metadata?.background_task_id &&
+		metadata?.detached !== true
+	);
+}
 
 export type ToolCategory =
 	| "read"
@@ -32,6 +54,7 @@ export type ToolCategory =
 	| "knowledge"
 	| "schedule"
 	| "contextAsk"
+	| "workspace"
 	| "generic";
 
 const READ_TOOLS = new Set(["Read"]);
@@ -144,6 +167,18 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
 	if (CONTEXT_ASK_TOOLS.has(name)) return "contextAsk";
+	if (
+		[
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+			"SwitchWorkingDirectory",
+			"SwitchDevice",
+		].includes(name)
+	)
+		return "workspace";
 	return "generic";
 }
 
@@ -399,12 +434,43 @@ export function knowledgeSummary(
 	}
 }
 
+/** Only routing fields belong in a collapsed notification row, never its message body. */
+function notificationSummary(input: unknown): string {
+	const action = extractField(input, "action");
+	const target = extractField(input, "user_id") || extractField(input, "username");
+	const channels = extractStringArrayField(input, "channels");
+	const routingChannels = channels.filter((value) => value === "dingtalk" || value === "feishu");
+	return short(
+		[
+			action === "list_channels" || action === "send" ? action : "Notification",
+			target ? `→ ${short(target, 40)}` : "",
+			...(routingChannels.length > 0
+				? new Set(routingChannels)
+				: action === "send"
+					? ["available channels"]
+					: []),
+		]
+			.filter(Boolean)
+			.join(" · "),
+		100,
+	);
+}
+
 export function getSummary(
 	toolName: string,
 	input: unknown,
 	metadata?: Record<string, unknown>,
 	labels?: Record<string, string>,
 ): string {
+	// Keep the existing generic category/icon and detail renderer. Notification is not
+	// inter-agent Send: sharing its category would render the wrong communication card.
+	if (toolName === "Notification") {
+		const fields =
+			input && typeof input === "object"
+				? (input as Record<string, unknown>)._streamingFields
+				: undefined;
+		return notificationSummary(fields && typeof fields === "object" ? fields : input);
+	}
 	if (
 		typeof input === "object" &&
 		input &&
@@ -430,6 +496,8 @@ export function getSummary(
 	}
 	const cat = getCategory(toolName, input);
 	switch (cat) {
+		case "workspace":
+			return short(workspaceSummary(toolName, input, labels), 80);
 		case "read": {
 			const fp = getFilePath(input);
 			if (!fp) return "";

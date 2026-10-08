@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	mkdirSync,
 	mkdtempSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	truncateSync,
@@ -17,7 +18,7 @@ import { LocalBackend } from "../local-backend";
 const roots: string[] = [];
 
 function tempRoot(): string {
-	const root = mkdtempSync(join(tmpdir(), "narrafork-local-read-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "narrafork-local-read-")));
 	roots.push(root);
 	return root;
 }
@@ -71,6 +72,26 @@ describe("LocalBackend atomic bounded reads", () => {
 		}
 	});
 
+	test("bounded offset reads return only the requested range and preserve total size", async () => {
+		const path = join(tempRoot(), "range.txt");
+		writeFileSync(path, "0123456789");
+		const backend = new LocalBackend();
+		const middle = await backend.readFileBytes(path, {
+			offset: 3,
+			maxBytes: 4,
+			expectedResolvedPath: path,
+		});
+		expect(new TextDecoder().decode(middle.bytes)).toBe("3456");
+		expect(middle.totalSize).toBe(10);
+		expect(middle.truncated).toBe(true);
+		const end = await backend.readFileBytes(path, { offset: 8, maxBytes: 4 });
+		expect(new TextDecoder().decode(end.bytes)).toBe("89");
+		expect(end.truncated).toBe(false);
+		await expect(backend.readFileBytes(path, { offset: -1, maxBytes: 4 })).rejects.toThrow(
+			RangeError,
+		);
+		await expect(backend.readFileBytes(path, { offset: 1 })).rejects.toThrow(RangeError);
+	});
 	test("keeps POSIX backslashes as filename characters in canonical identity", async () => {
 		if (process.platform === "win32") return;
 		const root = tempRoot();

@@ -32,11 +32,24 @@ const FeatureGlobBoundedV1 = "glob.bounded.v1"
 // bounded chunks and revalidates canonical identity and file size before returning.
 const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
 
+// Positional bounded reads; callers must negotiate this before sending offset.
+const FeatureFsReadOffsetV1 = "fs.read.offset.v1"
+
+// Executor-serialized check-and-replace; not an OS-level CAS against external writers.
+const FeatureFsConditionalWriteV1 = "fs.write.conditional.v1"
+
 // FeatureGitWorkspaceV1 covers structured, bounded, cancellable full Git management.
 const FeatureGitWorkspaceV1 = "git.workspace.v1"
 
 // FeatureGitWorkspaceWatchV1 adds bounded metadata-only workspace fingerprints.
 const FeatureGitWorkspaceWatchV1 = "git.workspace.watch.v1"
+
+// FeatureGitCommitPreviewV1 adds read-only git.workspace operations commitDetail
+// and commitDiff. They read only the object database, never the working tree.
+// Preview maxBytes includes metadata and JSON escaping. CommitDiff reports
+// outputs.fileStatus=ok/not_found/too_large/invalid; outputs.found=0 is reserved
+// for missing commits. Historical file names must be UTF-8.
+const FeatureGitCommitPreviewV1 = "git.workspace.commit-preview.v1"
 
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
@@ -100,8 +113,11 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureFsReadOffsetV1,
+		FeatureFsConditionalWriteV1,
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
+		FeatureGitCommitPreviewV1,
 	} {
 		seen := false
 		for _, feature := range features {

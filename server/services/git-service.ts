@@ -4,17 +4,45 @@ import { lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
+	GIT_COMMIT_SHA_PATTERN,
+	type GitCommitDetail,
+	type GitCommitPatch,
+} from "@shared/git-commit-preview";
+import {
 	GIT_WORKSPACE_MAX_BYTES,
+	GIT_WORKSPACE_TIMEOUT_MS,
 	GIT_WORKSPACE_WRITE_TIMEOUT_MS,
 } from "../lib/agent/execution/git-workspace-rpc";
 import { worktreeLock } from "../lib/async-mutex";
-import { AppError, GitAuthError, GitError } from "../lib/errors";
+import { AppError, GitAuthError, GitError, ValidationError } from "../lib/errors";
 import type { GitIdentityEnv } from "../lib/git-identity";
 import { mergeGitTrees, requireCompleteMergeTree } from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
+import {
+	assertSingleFilePatch,
+	buildCommitDetail,
+	COMMIT_META_FORMAT,
+	COMMIT_META_MAX_BYTES,
+	type CommitMeta,
+	commitListArgs,
+	commitNotFound,
+	commitPatchArgs,
+	parseCommitMeta,
+	parseNameStatusRecords,
+	requireCommitFile,
+} from "./git-commit-preview-parse";
+import {
+	captureLifecycleContextPath,
+	confirmLifecyclePathCreated,
+	confirmLifecyclePathRemoved,
+	lifecycleCreationPath,
+	revalidateLifecycleTarget,
+	withProtectionReservation,
+} from "./worktree-lifecycle-guard";
 import { WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
 
 const gitRequestContext = new AsyncLocalStorage<{
@@ -336,6 +364,9 @@ async function exec(
 	cwd: string,
 	options: boolean | ExecOptions = {},
 ): Promise<ExecResult> {
+	// Lifecycle writes/read probes dispatch against the frozen backend cwd, never a
+	// mutable raw chapter alias after an await. Outside retirement this is unchanged.
+	cwd = await lifecycleCreationPath(cwd);
 	const { silent, optionalLocks, timeout, maxOutputBytes, identity } =
 		normalizeExecOptions(options);
 	const request = gitRequestContext.getStore();
@@ -721,6 +752,51 @@ function parsePorcelainStatusZ(
  */
 const PORCELAIN_UNTRACKED_ALL = ["status", "--porcelain", "-uall"];
 
+/** One deadline covers all subprocesses in a preview, not 60s per command. */
+async function withCommitPreviewRead<T>(run: () => Promise<T>): Promise<T> {
+	const current = gitRequestContext.getStore();
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() =>
+			controller.abort(
+				new AppError("Git commit preview timed out", 504, "GIT_COMMIT_PREVIEW_TIMEOUT"),
+			),
+		GIT_WORKSPACE_TIMEOUT_MS,
+	);
+	const signal = current?.signal
+		? AbortSignal.any([current.signal, controller.signal])
+		: controller.signal;
+	try {
+		return await withGitRequestContext(signal, run, current?.beforeWrite);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+/** Verify `sha` names a commit, then read its bounded metadata. */
+async function readCommitMeta(repoPath: string, sha: string): Promise<CommitMeta> {
+	if (!GIT_COMMIT_SHA_PATTERN.test(sha)) throw new ValidationError("Invalid commit SHA");
+	const verify = await execRead(
+		["rev-parse", "--verify", "--quiet", `${sha}^{commit}`],
+		repoPath,
+		true,
+		{
+			maxOutputBytes: 256,
+		},
+	);
+	if (verify.exitCode === 1) throw commitNotFound(sha);
+	if (verify.exitCode !== 0)
+		throw new GitError(gitFailureMessage("Git commit lookup failed", verify));
+	const result = await execRead(
+		["log", "-1", "--no-show-signature", COMMIT_META_FORMAT, sha, "--"],
+		repoPath,
+		false,
+		{ maxOutputBytes: COMMIT_META_MAX_BYTES },
+	);
+	if (result.exitCode !== 0)
+		throw new GitError(gitFailureMessage("Git commit metadata failed", result));
+	return parseCommitMeta(result.stdout, result.truncated === true);
+}
+
 export const gitService = {
 	async getCurrentBranch(repoPath: string): Promise<string> {
 		const result = await execRead(["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
@@ -738,7 +814,8 @@ export const gitService = {
 	},
 
 	async createWorktree(repoPath: string, worktreePath: string, branchName: string): Promise<void> {
-		const result = await exec(["worktree", "add", worktreePath, branchName], repoPath);
+		const frozenPath = await lifecycleCreationPath(worktreePath);
+		const result = await exec(["worktree", "add", frozenPath, branchName], repoPath);
 		if (result.exitCode !== 0) {
 			// Detect shallow clone as a likely cause of "unable to read tree" errors
 			if (result.stderr.includes("unable to read tree")) {
@@ -753,11 +830,17 @@ export const gitService = {
 			}
 			throw new Error(`Failed to create worktree: ${result.stderr}`);
 		}
+		await confirmLifecyclePathCreated(frozenPath);
 	},
 
 	async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
-		const result = await exec(["worktree", "remove", worktreePath, "--force"], repoPath);
-		if (result.exitCode !== 0) throw new GitError(`Failed to remove worktree: ${result.stderr}`);
+		return withProtectionReservation([{ path: worktreePath }], "git worktree remove", async () => {
+			const frozenRepository = await captureLifecycleContextPath(repoPath);
+			const frozenPath = await revalidateLifecycleTarget(worktreePath);
+			const result = await exec(["worktree", "remove", frozenPath, "--force"], frozenRepository);
+			if (result.exitCode !== 0) throw new GitError(`Failed to remove worktree: ${result.stderr}`);
+			await confirmLifecyclePathRemoved(frozenPath);
+		});
 	},
 
 	async pruneWorktrees(repoPath: string): Promise<void> {
@@ -1466,6 +1549,83 @@ export const gitService = {
 			truncated = true;
 		}
 		return { diff, truncated };
+	},
+
+	/**
+	 * Commit preview: metadata plus the changed-file list against the FIRST parent
+	 * (root commits against the empty tree). Reads only the object database.
+	 */
+	async getCommitDetail(repoPath: string, sha: string): Promise<GitCommitDetail> {
+		return withCommitPreviewRead(async () => {
+			const meta = await readCommitMeta(repoPath, sha);
+			const base = meta.parents[0] ?? null;
+			const [numstat, nameStatus] = await Promise.all([
+				execRead(commitListArgs("numstat", sha, base), repoPath),
+				execRead(commitListArgs("name-status", sha, base), repoPath),
+			]);
+			for (const result of [numstat, nameStatus])
+				if (result.exitCode !== 0)
+					throw new GitError(gitFailureMessage("Git commit file list failed", result));
+			return buildCommitDetail(meta, {
+				numstat: numstat.stdout,
+				numstatTruncated: numstat.truncated === true,
+				nameStatus: nameStatus.stdout,
+				nameStatusTruncated: nameStatus.truncated === true,
+			});
+		});
+	},
+
+	/** Patch of one file within a commit, capped at the process output. */
+	async getCommitPatch(
+		repoPath: string,
+		sha: string,
+		file: string,
+		oldPath?: string,
+	): Promise<GitCommitPatch> {
+		return withCommitPreviewRead(async () => {
+			const meta = await readCommitMeta(repoPath, sha);
+			const base = meta.parents[0] ?? null;
+			const names = await execRead(commitListArgs("name-status", sha, base), repoPath);
+			if (names.exitCode !== 0)
+				throw new GitError(gitFailureMessage("Git commit file list failed", names));
+			const entry = requireCommitFile(names.stdout, names.truncated === true, file, oldPath);
+			const paths = entry.oldPath ? [entry.oldPath, entry.path] : [entry.path];
+			// Literal pathspecs still match descendants. A rename source may have become
+			// a directory in the new tree, so validate the *scoped* list before truncating
+			// a patch, rather than counting headers after later files have been discarded.
+			const scoped = await execRead(
+				[...commitListArgs("name-status", sha, base), ...paths],
+				repoPath,
+				false,
+				{ maxOutputBytes: 64 * 1024 },
+			);
+			if (scoped.exitCode !== 0)
+				throw new GitError(gitFailureMessage("Git commit file lookup failed", scoped));
+			if (scoped.truncated)
+				throw new AppError(
+					"Commit path exceeds the preview budget",
+					413,
+					"GIT_COMMIT_PREVIEW_TOO_LARGE",
+				);
+			const records = parseNameStatusRecords(scoped.stdout);
+			if (
+				records.length !== 1 ||
+				records[0]?.path !== entry.path ||
+				records[0]?.oldPath !== entry.oldPath ||
+				records[0]?.status !== entry.status
+			)
+				throw new ValidationError("Commit preview path must name a single changed file");
+			const result = await execRead(
+				commitPatchArgs(sha, base, file, entry.oldPath),
+				repoPath,
+				false,
+				{ maxOutputBytes: GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES },
+			);
+			if (result.exitCode !== 0)
+				throw new GitError(gitFailureMessage("Git commit patch failed", result));
+			assertSingleFilePatch(result.stdout, file, records[0]);
+			return { diff: result.stdout, truncated: result.truncated === true };
+		});
 	},
 
 	async copyFiles(srcDir: string, destDir: string, files: string[]): Promise<void> {

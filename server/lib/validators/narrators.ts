@@ -10,6 +10,7 @@ import {
 	MIN_HANDLE_LENGTH,
 } from "@shared/narrator-handle";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
+import { QUESTION_ANSWER_MAX_BYTES, questionBytes } from "@shared/question-protocol";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -154,11 +155,15 @@ export const codexFingerprintSchema = z.object({
 	extraHeaders: z.record(z.string(), z.string().max(2048)).optional(),
 });
 
+export const bufferQueueModeSchema = z.enum(["turn", "tool", "interrupt"]);
+export const updateBufferedMessageModeSchema = z.object({ mode: bufferQueueModeSchema }).strict();
+
 export const sendMessageSchema = z
 	.object({
 		message: z.string().default(""),
 		priority: z.boolean().optional(),
 		interrupt: z.boolean().optional(),
+		queueMode: bufferQueueModeSchema.optional(),
 		fileReferences: fileReferencesSchema.optional(),
 	})
 	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {
@@ -258,6 +263,7 @@ export const createRevertActionPreviewSchema = z
 			.max(FILE_CHANGE_LIMITS.historyToolRelatedChanges)
 			.optional(),
 		idempotencyKey: revertPlanIdentifierSchema,
+		recoveryMode: z.literal("snapshot").optional(),
 	})
 	.strict()
 	.refine(
@@ -268,7 +274,11 @@ export const createRevertActionPreviewSchema = z
 		"The action requires an exact message/block boundary",
 	);
 export const applyRevertPlanSchema = z
-	.object({ planHash: z.string().regex(/^[a-f0-9]{64}$/), action: revertActionSchema })
+	.object({
+		planHash: z.string().regex(/^[a-f0-9]{64}$/),
+		action: revertActionSchema,
+		acceptSnapshotRestore: z.literal(true).optional(),
+	})
 	.strict();
 
 export const revertPlanFilesQuerySchema = z
@@ -308,20 +318,27 @@ export const permissionDecisionSchema = z.object({
  * and that has its own endpoint. Accepting it here would record a question as answered
  * while telling the agent nothing.
  */
-export const asyncQuestionAnswerSchema = z.object({
-	answers: z
-		.record(z.string(), z.string().max(10_000))
-		.refine((value) => Object.keys(value).length > 0, "Provide at least one answer"),
-	annotations: z
-		.record(
-			z.string(),
-			z.object({
-				preview: z.string().max(10_000).optional(),
-				notes: z.string().max(10_000).optional(),
-			}),
-		)
-		.optional(),
-});
+export const asyncQuestionAnswerSchema = z
+	.object({
+		answers: z
+			.record(z.string(), z.string().max(10_000))
+			.refine((value) => Object.keys(value).length > 0, "Provide at least one answer"),
+		annotations: z
+			.record(
+				z.string(),
+				z.object({
+					preview: z.string().max(10_000).optional(),
+					notes: z.string().max(10_000).optional(),
+				}),
+			)
+			.optional(),
+	})
+	.refine(
+		(value) =>
+			questionBytes({ answers: value.answers, annotations: value.annotations ?? null }) <=
+			QUESTION_ANSWER_MAX_BYTES,
+		`Question answer exceeds ${QUESTION_ANSWER_MAX_BYTES} UTF-8 bytes`,
+	);
 
 export const humanAttentionListQuerySchema = z.object({
 	cursor: z.string().min(1).max(2048).optional(),
@@ -335,8 +352,32 @@ export const humanAttentionListQuerySchema = z.object({
 
 export const asyncQuestionListQuerySchema = z.object({
 	status: z.enum(["open", "answered", "dismissed", "withdrawn"]).optional(),
-	cursor: z.string().max(200).optional(),
-	limit: z.coerce.number().int().min(1).max(100).optional(),
+	filter: z.enum(["all", "open", "pending", "history"]).optional(),
+	cursor: z.string().min(1).max(2048).optional(),
+	limit: z.coerce.number().int().min(1).max(32).optional(),
+});
+
+export const asyncQuestionDetailQuerySchema = z.object({
+	cursor: z
+		.string()
+		.min(1)
+		.max(16)
+		.regex(/^\d+$/)
+		.refine((cursor) => Number.isSafeInteger(Number(cursor)), "Invalid question event cursor")
+		.optional(),
+	limit: z.coerce.number().int().min(1).max(32).optional(),
+});
+
+export const asyncQuestionSupplementSchema = z.object({
+	text: z
+		.string()
+		.max(16_384)
+		.refine((text) => text.trim().length > 0, "Provide a supplement")
+		.refine(
+			(text) => questionBytes(text) <= QUESTION_ANSWER_MAX_BYTES,
+			`Question supplement exceeds ${QUESTION_ANSWER_MAX_BYTES} UTF-8 bytes`,
+		),
+	answerMessageId: z.string().min(1).max(200).optional(),
 });
 
 const ruleTargetFields = {

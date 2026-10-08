@@ -41,7 +41,24 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
-import { resolveToolDisplayDurationMs } from "../tool-display-duration";
+import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
+
+type ToolTimingRecord = Partial<
+	Record<
+		| "startedAt"
+		| "streamStartedAt"
+		| "streamCompletedAt"
+		| "permissionStartedAt"
+		| "executionStartedAt"
+		| "completedAt"
+		| "createdAt"
+		| "durationMs"
+		| "execDurationMs",
+		number
+	>
+> & { fileChangeTiming?: FileChangeTiming };
+
+import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
 	type CommunicationState,
@@ -60,8 +77,12 @@ import {
 	hasStructuredReasoning,
 	parseReasoningSegments,
 	type ReasoningSegment,
+	usesStructuredReasoning,
 } from "./reasoning-segments";
-import { parseStreamingReasoningTitles } from "./reasoning-segments-cache";
+import {
+	parseStreamingReasoningSegments,
+	parseStreamingReasoningTitles,
+} from "./reasoning-segments-cache";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -70,12 +91,14 @@ import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
 } from "./reflection";
+import { classifyReflectionReasonSummary } from "./reflection-reason";
 import { reconcileSourceText } from "./source-text";
 import {
 	isLiveStreamingBlock,
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
+import { TEXT_PREVIEW_MAX_CHARS } from "./text-preview";
 import {
 	type ClassifyToolDetailInput,
 	classifyToolDetail,
@@ -175,6 +198,9 @@ export interface AdapterContentBlock {
 }
 
 export interface AdapterMessage {
+	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
+	model?: string | null;
+	provider?: string | null;
 	id?: string;
 	role: string;
 	contentJson: AdapterContentBlock[];
@@ -209,6 +235,8 @@ export interface AdapterMessage {
 		username: string;
 		avatarColor?: string | null;
 		avatarImageId?: string | null;
+		/** Share-guest author (chat rooms): initial-avatar + badge instead of a profile. */
+		isGuest?: boolean;
 	} | null;
 	/**
 	 * Who authored the content, independent of `role`. System- and AI-injected
@@ -232,6 +260,27 @@ export interface AdapterMessage {
 	deliveryId?: string | null;
 	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
+	/**
+	 * Reply quote strip (chat-style surfaces). Projected verbatim into the user
+	 * bubble's data: the strip is one clamped line, so it never changes what the
+	 * bubble's own text would have measured. See measure-message-bubble's
+	 * MeasureQuoteLine (frontend side; this shape is its structural twin).
+	 */
+	replyQuote?: {
+		authorName: string | null;
+		text: string;
+		state: "quoted" | "deleted" | "unavailable";
+		targetId?: string | null;
+		targetSeq?: number | null;
+	} | null;
+	/**
+	 * Tombstone form: the user bubble's body collapses to this localized label
+	 * (chat soft-delete). Height-affecting — it replaces the body's measured wrap.
+	 */
+	deletedLabel?: string;
+	/** Grouped follow-up (same author, close in time): omit the bubble header row. */
+	omitHeader?: boolean;
+	bodyFormat?: "plain" | "markdown";
 }
 
 function deliveryProjection(message?: AdapterMessage): Record<string, unknown> {
@@ -580,7 +629,7 @@ interface AdapterTraceItem {
 	 * is a single truncation-free span in the row's fixed-height flex line and the
 	 * popover is portaled.
 	 */
-	timing?: Record<string, number>;
+	timing?: ToolTimingRecord;
 	/**
 	 * The duration the row PAINTS, when it differs from `timing.durationMs`.
 	 *
@@ -736,6 +785,13 @@ export interface ElementSpec {
 	 * part of `data`/`opts`: height- and cache-neutral.
 	 */
 	lifecycleId?: string;
+	/** Body-only aliases for folded reasoning rows. Never replaces visual/selection identities. */
+	textBodyPreferences?: Readonly<Record<string, TextBodyPreference>>;
+}
+
+export interface TextBodyPreference {
+	specKey: string;
+	bodyKey?: string;
 }
 
 /**
@@ -751,10 +807,39 @@ function contentBlockLifecycleId(block: AdapterContentBlock | undefined): string
 	return `blk:${id}`;
 }
 
+/** Stable body preference identity across a live block's persisted message hand-off. */
+export function textExpansionStateKey(specKey: string, lifecycleId?: string): string {
+	return lifecycleId ? `text-lifecycle:${lifecycleId}` : specKey;
+}
+
+/** Resolve only the body preference; a folded row keeps its existing trace/row keys. */
+export function resolveTextExpansionPreference(
+	spec: Pick<ElementSpec, "key" | "lifecycleId" | "textBodyPreferences">,
+	bodyKey?: string,
+): TextBodyPreference {
+	return (
+		(bodyKey !== undefined ? spec.textBodyPreferences?.[bodyKey] : undefined) ?? {
+			specKey: textExpansionStateKey(spec.key, spec.lifecycleId),
+			bodyKey,
+		}
+	);
+}
+
+function adapterTextExpanded(
+	ctx: AdapterContext,
+	specKey: string,
+	bodyKey?: string,
+	lifecycleId?: string,
+): boolean {
+	return ctx.isTextExpanded?.(textExpansionStateKey(specKey, lifecycleId), bodyKey) ?? false;
+}
+
 export interface AdapterContext {
 	lod: RenderLod;
 	/** Explicit interaction override; undefined preserves the measure's default. */
 	isExpanded?: (key: string) => boolean | undefined;
+	/** Full body expansion; separate from the surrounding card's fold. */
+	isTextExpanded?: (specKey: string, bodyKey?: string) => boolean;
 	/** L3 / L4 explicit click override, separate from normal opened state. */
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
@@ -917,7 +1002,11 @@ export interface AdapterContext {
 	 * the document (the measure cache keys on the body length, so the taller card is
 	 * re-measured rather than served stale).
 	 */
-	resolveFullToolInput?: (toolUseId: string | undefined, ref?: AdapterToolDetailRef) => unknown;
+	resolveFullToolInput?: (
+		toolUseId: string | undefined,
+		ref?: AdapterToolDetailRef,
+		writeInput?: unknown,
+	) => unknown;
 	resolveFullToolOutput?: (toolUseId: string | undefined, ref?: AdapterToolDetailRef) => unknown;
 	/**
 	 * A LIVE pending permission's `suggestions`, which win over the tool call's
@@ -1268,6 +1357,9 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		// row height (measure keeps TEXT_FILE_HEIGHT), so adding it cannot shift
 		// any predicted geometry.
 		filePath: readNonEmptyString(block, "filePath") ?? null,
+		// HEIGHT-NEUTRAL: an authenticated endpoint serving the bytes (chat
+		// attachments) — resolved by VListImage's fetchUrl lane, never measured.
+		fetchUrl: readNonEmptyString(block, "fetchUrl") ?? null,
 	};
 }
 
@@ -1373,10 +1465,108 @@ function adaptContextBlocks(
 export function adaptSegment(seg: AdapterSegment, ctx: AdapterContext): ElementSpec[] {
 	switch (seg.kind) {
 		case "message":
-			return adaptMessage(seg.msg, seg.visibleBlockIndices, ctx);
+			return adaptMessage(seg.msg, seg.visibleBlockIndices, ctx).map((spec) => {
+				if (spec.kind === "injection-bubble") {
+					spec.opts = {
+						...spec.opts,
+						textExpanded: adapterTextExpanded(ctx, spec.key, undefined, spec.lifecycleId),
+					};
+				}
+				return spec;
+			});
 		case "tool-run":
 			return adaptToolRun(seg.items, ctx);
 	}
+}
+
+/**
+ * A long unstructured run does not need step parsing at all. Probe only appended
+ * bytes after the first frame; importantly, the preview budget is applied BEFORE
+ * the paragraph parser could allocate a full-size growing body. The original text
+ * stays in reasoningData for the measure's bounded preview / explicit expansion.
+ * A bold marker anywhere falls back to the exact parser, preserving step identity.
+ */
+// Probe entries retain source strings too. Count AND per-entry byte-like character
+// budgets keep these classification caches from bypassing the measurement budget.
+const REASONING_PROBE_MAX_SOURCE_CHARS = 1_000_000;
+const plainReasoningProbes = new Map<string, { text: string; hasBold: boolean }>();
+
+function isLongPlainReasoning(key: string, text: string): boolean {
+	if (text.length <= TEXT_PREVIEW_MAX_CHARS) return false;
+	const previous = plainReasoningProbes.get(key);
+	const appendOnly = previous && text.startsWith(previous.text);
+	const hasBold = appendOnly
+		? previous.hasBold || text.indexOf("**", Math.max(0, previous.text.length - 1)) >= 0
+		: text.includes("**");
+	if (plainReasoningProbes.size >= 4 && !plainReasoningProbes.has(key)) {
+		const oldest = plainReasoningProbes.keys().next().value;
+		if (oldest !== undefined) plainReasoningProbes.delete(oldest);
+	}
+	if (text.length <= REASONING_PROBE_MAX_SOURCE_CHARS) {
+		plainReasoningProbes.set(key, { text, hasBold });
+	} else plainReasoningProbes.delete(key);
+	return !hasBold;
+}
+
+/** One titled, still-growing paragraph: retain a lazy source range instead of
+ * splitting/rejoining its whole body on every delta. A later blank paragraph
+ * returns to the exact parser, so additional steps keep their existing identity.
+ */
+interface SingleStepProbe {
+	text: string;
+	title: string;
+	bodyStart: number;
+	pendingBlankLine: boolean;
+	multipleParagraphs: boolean;
+}
+const singleStepProbes = new Map<string, SingleStepProbe>();
+
+function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] | null {
+	if (text.length <= TEXT_PREVIEW_MAX_CHARS) return null;
+	let probe = singleStepProbes.get(key);
+	let scanStart: number;
+	if (probe && text.startsWith(probe.text)) {
+		scanStart = probe.text.length;
+	} else {
+		// Classify only the bounded prefix, before full paragraph parsing/preparation.
+		const heading = /^\s*\*\*([^\r\n]*?)\*\*\r?\n[ \t\r\n]*/.exec(
+			text.slice(0, TEXT_PREVIEW_MAX_CHARS),
+		);
+		if (!heading?.[1]?.trim() || heading[1].includes("**")) return null;
+		probe = {
+			text: "",
+			title: heading[1].trim(),
+			bodyStart: heading[0].length,
+			pendingBlankLine: false,
+			multipleParagraphs: false,
+		};
+		scanStart = probe.bodyStart;
+	}
+	// Incremental structural scan. Whitespace after a newline is carried across
+	// chunks, including a split CRLF. Conservative matches merely fall back.
+	if (!probe.multipleParagraphs) {
+		for (let i = scanStart; i < text.length; i++) {
+			const char = text.charCodeAt(i);
+			if (char === 10) {
+				if (probe.pendingBlankLine) {
+					probe.multipleParagraphs = true;
+					break;
+				}
+				probe.pendingBlankLine = true;
+			} else if (char !== 32 && char !== 9 && char !== 13) probe.pendingBlankLine = false;
+		}
+	}
+	probe.text = text;
+	if (singleStepProbes.size >= 4 && !singleStepProbes.has(key)) {
+		const oldest = singleStepProbes.keys().next().value;
+		if (oldest !== undefined) singleStepProbes.delete(oldest);
+	}
+	if (text.length <= REASONING_PROBE_MAX_SOURCE_CHARS) {
+		singleStepProbes.set(key, probe);
+	} else singleStepProbes.delete(key);
+	if (probe.multipleParagraphs) return null;
+	const body = text.slice(probe.bodyStart).trim();
+	return [{ title: probe.title, body, isEmpty: body.length === 0 || body === "<!-- -->" }];
 }
 
 function adaptMessage(
@@ -1395,6 +1585,40 @@ function adaptMessage(
 	// than only the text ones. Dropping them here is what made an image the user
 	// sent silently disappear in the virtual list.
 	if (msg.role === "user") {
+		// New structured answer receipts are human events, not full model prompts.
+		// A legacy body without an ID keeps the historical verbatim fallback.
+		const answerBody = blocks
+			.map((block) => readSideCarBody(block))
+			.find((body) => body?.kind === "asyncQuestionAnswers" && body.questionId);
+		if (answerBody?.kind === "asyncQuestionAnswers" && answerBody.questionId) {
+			const label = answerBody.supplement
+				? "asyncQuestionSupplementEvent"
+				: "asyncQuestionAnswerEvent";
+			return [
+				{
+					kind: "system-text",
+					key: `${idBase}-question-event`,
+					data: {
+						kind: "origin_notice",
+						origin: "user",
+						originLabel: "async_question_answer",
+						title: `${msg.creator?.username ?? ctx.labels?.asyncQuestionUser ?? "User"} · ${(
+							ctx.labels?.[label] ??
+								(answerBody.supplement ? "Supplemented question {id}" : "Answered question {id}")
+						).replace("{id}", answerBody.questionId)}`,
+						text: answerBody.items.map((item) => item.header).join(" · ") || answerBody.questionId,
+						timeLabel: formatOriginNoticeTime(msg.createdAt),
+						questionReference: {
+							questionId: answerBody.questionId,
+							narratorId: msg.narratorId ?? null,
+						},
+						// Frozen message data, never the current mutable question record. A
+						// fork's subject cannot read the original owner's future answers.
+						questionSnapshot: answerBody,
+					},
+				},
+			];
+		}
 		// Self-contained native context blocks are protocol cards, not human chat bubbles.
 		// Keep their physical indexes and render each block independently.
 		if (blocks.some((block) => isNativeModelContextBlock(block))) {
@@ -1537,9 +1761,15 @@ function adaptMessage(
 				data: {
 					role: "user",
 					text,
-					hasHeader: true,
+					// Chat-style surfaces fold a follow-up's header (grouping) and may
+					// carry a reply quote strip or a tombstone; the narrator defaults
+					// remain byte-identical when none of these are set.
+					hasHeader: msg.omitHeader !== true,
+					...(msg.bodyFormat ? { bodyFormat: msg.bodyFormat } : {}),
 					creator: msg.creator ?? null,
 					createdAt: msg.createdAt ?? null,
+					...(msg.replyQuote ? { quote: msg.replyQuote } : {}),
+					...(msg.deletedLabel ? { deleted: true, deletedLabel: msg.deletedLabel } : {}),
 					// Height-neutral attribution: the bubble header already reserves its
 					// row, so origin/originLabel only change what the header paints
 					// (name / avatar / badge), never the measured height or cache key.
@@ -1561,6 +1791,7 @@ function adaptMessage(
 					? {
 							opts: {
 								expanded: ctx.isExpanded?.(key) ?? false,
+
 								...(ctx.labels?.showExpandedPrompt
 									? { showLabel: ctx.labels.showExpandedPrompt }
 									: {}),
@@ -1704,10 +1935,18 @@ function adaptMessage(
 			// the plain card carries the language toggle, so letting the flip change the
 			// element kind could swap in a trace with no way back.
 			const displayText = data.translatedText ?? data.text;
-			const parsed = parseReasoning(displayText);
+			const lifecycleId = contentBlockLifecycleId(block);
+			const textExpanded = adapterTextExpanded(ctx, key, undefined, lifecycleId);
+			const parsed =
+				!usesStructuredReasoning(msg.model) ||
+				(!textExpanded && isLongPlainReasoning(key, displayText))
+					? []
+					: (longSingleReasoningStep(key, displayText) ??
+						(streaming && !ctx.resolveReasoningSegments
+							? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
+							: parseReasoning(displayText)));
 			// A run is identified by its FIRST block, the same block the fold's
 			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
-			const lifecycleId = contentBlockLifecycleId(block);
 			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
@@ -1736,6 +1975,9 @@ function adaptMessage(
 					opts: {
 						showEarlier: ctx.showEarlier?.(key) ?? false,
 						expandedIndices: ctx.expandedRows?.(key) ?? [],
+						textExpandedKeys: parsed.flatMap((_, index) =>
+							adapterTextExpanded(ctx, key, `seg${index}`, lifecycleId) ? [`seg${index}`] : [],
+						),
 					},
 				});
 			} else {
@@ -1746,6 +1988,7 @@ function adaptMessage(
 					data,
 					opts: {
 						expanded: ctx.isExpanded?.(key),
+						textExpanded,
 						showOriginal,
 						// A live reasoning body (synthetic streaming row or checkpoint
 						// projection) must go through the incremental prepared-block path
@@ -1771,6 +2014,7 @@ function adaptMessage(
 					key,
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: markdownData(block),
+
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
 					...(fileReferenceContext || typeof block.revision === "number" || snapshotBody
@@ -1808,29 +2052,31 @@ function adaptMessage(
 				placement: "trailing",
 				text: usageLines.trailing,
 				...(usageLines.trailingSecondary ? { secondaryText: usageLines.trailingSecondary } : {}),
+				responsiveLines: usageLines.responsiveLines,
 			},
 		});
 	}
 	return specs;
 }
 
-/**
- * Resolve the per-turn usage lines for a message, or null when none should be
- * drawn.
- *
- * Gated on the reader's preference FIRST so a disabled toggle costs nothing and,
- * more importantly, emits no specs — keeping the item list identical to a build
- * without the feature. The streaming placeholder is excluded because its usage
- * is not accounted until the turn is persisted; letting a row appear mid-stream
- * would grow the live tail for a reason unrelated to the arriving text.
- */
 function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
-	if (!ctx.showTokenUsage) return null;
-	if (msg.id === "__streaming__") return null;
-	return resolveTurnUsageLines(msg, {
-		mobile: ctx.compactUsageLines,
+	if (!ctx.showTokenUsage || msg.id === "__streaming__") return null;
+	const desktop = resolveTurnUsageLines(msg, { formatNumber: ctx.formatUsageNumber });
+	if (!desktop) return null;
+	const mobile = resolveTurnUsageLines(msg, {
+		mobile: true,
 		formatNumber: ctx.formatUsageNumber,
 	});
+	// Both presentations are short, preformatted strings. The resize preview can
+	// select them without re-adapting this message or touching the historical body.
+	const responsiveLines = {
+		desktop: { text: desktop.trailing ?? "" },
+		mobile: {
+			text: mobile?.trailing ?? "",
+			...(mobile?.trailingSecondary ? { secondaryText: mobile.trailingSecondary } : {}),
+		},
+	};
+	return { ...(ctx.compactUsageLines ? mobile : desktop), responsiveLines };
 }
 
 /**
@@ -1966,6 +2212,22 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	taskReflectionAborted: "Task review interrupted",
 	taskReflectionResolved: "Task review finished",
 	reflectionNextSteps: "Next: {nextSteps}",
+	// Distinct system facts that are NOT status restatements (see
+	// reflection-reason.ts). Measured like every other summary line.
+	reflectionReasonNarratorAborted: "Narrator aborted",
+	reflectionReasonDangerCancelledByUser: "Danger reflection pause cancelled by user",
+	reflectionReasonDangerCancelledByLoop: "Danger reflection pause cancelled by reflection loop",
+	reflectionReasonDangerInterrupted:
+		"Danger reflection was interrupted before manual takeover; no live reflection loop remains",
+	reflectionReasonDangerAlreadyResolved:
+		"The danger reflection pause was already resolved by another decision path.",
+	reflectionReasonTaskApprovedByUser: "User approved the protected task change via takeover.",
+	reflectionReasonTaskRejectedByUser: "User rejected the protected task change.",
+	reflectionReasonTaskDeclinedNextSteps:
+		"The user declined this protected task change. Do not retry it without new instructions.",
+	// Danger assessment copy (summaries / consequences / detail chrome). English
+	// fallbacks come from the shared catalog so measure stays self-contained.
+	...dangerCopyEnglishFallbacks(),
 	// ── sidecar cards (one collapsible card per system injection) ─────────────
 	// The source badge text is measured into the card's single-line header, so it
 	// flows through the adapter like every other composed chrome string. Keys map
@@ -1990,6 +2252,17 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
 function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/** Resolve a chrome label and interpolate `{param}` placeholders. */
+function formatSysLabel(ctx: AdapterContext, key: string, params?: Record<string, string>): string {
+	const template = sysLabel(ctx, key);
+	if (!params) return template;
+	let out = template;
+	for (const [name, value] of Object.entries(params)) {
+		out = out.replaceAll(`{${name}}`, value);
+	}
+	return out;
 }
 
 /** Stable compact labels carried to the renderer for fixed-height live repainting. */
@@ -3334,13 +3607,15 @@ export interface CommunicationBubbleData {
 	broadcast: boolean;
 	message: string;
 	messageTruncated: boolean;
+	/** True upstream truncation, distinct from the bounded inline preview. */
+	sourceTruncated: boolean;
 	messageBody?: ToolCappedDetail;
 	labels?: Record<string, string>;
 	awaitReply: boolean;
 	status: string;
 	error?: string;
 	warning?: string;
-	timing?: Record<string, number>;
+	timing?: ToolTimingRecord;
 	toolDetailRef?: AdapterToolDetailRef;
 }
 
@@ -3385,7 +3660,8 @@ function buildCommunicationBubbleData(
 	const text = readLeafText(input.message) ?? "";
 	const preview = limitCommunicationPreview(text);
 	const message = preview.text;
-	const messageTruncated = hasTruncatedLeaf(input.message) || preview.truncated;
+	const sourceTruncated = hasTruncatedLeaf(input.message);
+	const messageTruncated = sourceTruncated || preview.truncated;
 	const targets = resolveCommunicationTargets(metadata, asObject(item.tc)._sendDeliveryTargets);
 	const awaitReply =
 		item.tc.toolName === "Send" &&
@@ -3427,14 +3703,15 @@ function buildCommunicationBubbleData(
 		broadcast: item.tc.toolName === "TeamStatus" && input.action === "broadcast",
 		message,
 		messageTruncated,
+		sourceTruncated,
 		labels: ctx.labels,
 		messageBody: describeToolBody(
 			{
 				kind: "capped",
 				id: "input.message",
 				source: "input.message",
-				// Viewer-only reference: inline measure/render consumes bounded `message`.
-				// Keeping the source here lets an explicitly loaded payload open in full.
+				// Full available source for both inline text expansion and the viewer.
+				// The measure chooses its bounded preview; never reconstruct from `message`.
 				text,
 				format: "markdown",
 				live: false,
@@ -3473,7 +3750,13 @@ function adaptCommunicationBubble(item: AdapterToolItem, ctx: AdapterContext): E
 		key,
 		unitId: key,
 		data: buildCommunicationBubbleData(item, ctx),
-		opts: { opened: true, forceExpanded: true, inRun: false, isLast: true },
+		opts: {
+			opened: true,
+			forceExpanded: true,
+			inRun: false,
+			isLast: true,
+			textExpanded: ctx.isTextExpanded?.(key) ?? false,
+		},
 	};
 }
 
@@ -3986,10 +4269,36 @@ function toolTimingStamps(source: Record<string, unknown>): Record<string, numbe
  * duration (explicit, else derived from the start/complete pair — same fallback
  * the tool header uses).
  */
-function cardTiming(tc: AdapterToolItem["tc"]): Record<string, number> {
+function toolTimingMetadata(
+	metadata: unknown,
+): Pick<ToolTimingRecord, "execDurationMs" | "fileChangeTiming"> {
+	const meta = asObject(metadata);
+	const execDurationMs = readFiniteNumber(meta.execDurationMs);
+	const file = asObject(meta.fileChangeTiming);
+	const waitMs = readFiniteNumber(file.waitMs);
+	const executionMs = readFiniteNumber(file.executionMs);
+	const totalMs = readFiniteNumber(file.totalMs);
+	return {
+		...(execDurationMs != null && execDurationMs >= 0 ? { execDurationMs } : {}),
+		...(waitMs != null &&
+		waitMs >= 0 &&
+		executionMs != null &&
+		executionMs >= 0 &&
+		totalMs != null &&
+		totalMs >= 0
+			? { fileChangeTiming: { waitMs, executionMs, totalMs } }
+			: {}),
+	};
+}
+
+function cardTiming(tc: AdapterToolItem["tc"]): ToolTimingRecord {
 	const stamps = toolTimingStamps(tc);
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
-	return durationMs != null ? { ...stamps, durationMs } : stamps;
+	return {
+		...stamps,
+		...(durationMs != null ? { durationMs } : {}),
+		...toolTimingMetadata(resolveToolMetadata(tc)),
+	};
 }
 
 /**
@@ -4018,18 +4327,18 @@ function toolTimingFields(
 	tc: AdapterToolItem["tc"],
 	category: string,
 	metadata: unknown,
-): Record<string, number | undefined> {
-	const meta = asObject(metadata);
+): ToolTimingRecord & { timeoutMs?: number } {
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
-	const execDurationMs = readFiniteNumber(meta.execDurationMs);
 	const stamps = toolTimingStamps(tc);
 	// `startedAt` keeps its historical precedence (explicit → execution → created)
 	// so the live elapsed counter is unaffected by the new stamp passthrough.
 	const startedAt = stamps.startedAt ?? stamps.executionStartedAt ?? stamps.createdAt;
 	const timeoutMs = effectiveTimeoutMs(tc, category);
-	const out: Record<string, number | undefined> = { ...stamps };
+	const out: ToolTimingRecord & { timeoutMs?: number } = {
+		...stamps,
+		...toolTimingMetadata(metadata),
+	};
 	if (durationMs != null) out.durationMs = durationMs;
-	if (execDurationMs != null) out.execDurationMs = execDurationMs;
 	if (startedAt != null) out.startedAt = startedAt;
 	if (timeoutMs != null) out.timeoutMs = timeoutMs;
 	return out;
@@ -4238,6 +4547,26 @@ function resolveToolReflection(
 		// id, exactly like the chunked notice's fallback chain.
 		readNonEmptyString(item.tc, "tcId") ?? readNonEmptyString(item.tc, "id"),
 	);
+	// System defaults written by the gate are English chrome that would otherwise
+	// sit under the localized title. Classify them: omit status restatements,
+	// re-label distinct system facts, pass custom content through.
+	if (data.summary) {
+		const classified = classifyReflectionReasonSummary(data.summary);
+		if (classified?.kind === "omit") {
+			delete data.summary;
+		} else if (classified?.kind === "label") {
+			data.summary = formatSysLabel(ctx, classified.key, classified.params);
+			if (classified.nextSteps && !data.nextSteps) {
+				data.nextSteps = classified.nextSteps;
+			}
+		} else if (classified?.kind === "content") {
+			if (classified.text) data.summary = classified.text;
+			else delete data.summary;
+			if (classified.nextSteps && !data.nextSteps) {
+				data.nextSteps = classified.nextSteps;
+			}
+		}
+	}
 	// The advisory line is a template with a {nextSteps} placeholder.
 	if (data.nextSteps) {
 		data.nextSteps = sysLabel(ctx, "reflectionNextSteps").replace("{nextSteps}", data.nextSteps);
@@ -4279,8 +4608,16 @@ const completedEditInputs = new WeakMap<
 >();
 
 function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
-	if (!ctx.resolveFullToolInput || !hasTruncatedLeaf(item.tc.inputJson)) return item.tc.inputJson;
-	const full = ctx.resolveFullToolInput(item.tc.toolUseId, resolveToolDetailRef(item));
+	if (
+		!ctx.resolveFullToolInput ||
+		(item.tc.toolName !== "Write" && !hasTruncatedLeaf(item.tc.inputJson))
+	)
+		return item.tc.inputJson;
+	const full = ctx.resolveFullToolInput(
+		item.tc.toolUseId,
+		resolveToolDetailRef(item),
+		item.tc.toolName === "Write" ? item.tc.inputJson : undefined,
+	);
 	if (full == null) return item.tc.inputJson;
 	const original = item.tc.inputJson;
 	if (
@@ -4428,11 +4765,8 @@ function toolTraceItem(
 	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
 	// that waited 19s on a gate read as a 20s command. Same shared rule the card
 	// header uses — the two must not disagree about one call. Height-neutral.
-	const displayDurationMs = resolveToolDisplayDurationMs({
-		category,
-		execDurationMs: readFiniteNumber(asObject(resolveToolMetadata(item.tc)).execDurationMs),
-		durationMs: readFiniteNumber(item.tc.durationMs) ?? deriveDuration(item.tc),
-	});
+	const timing = cardTiming(item.tc);
+	const displayDurationMs = resolveToolDisplayDurationMs({ category, ...timing });
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
@@ -4457,7 +4791,7 @@ function toolTraceItem(
 		...(reflectionStatus ? { reflectionStatus } : {}),
 		// Same stamp record a subagent card's header uses, so the row's timing popover
 		// reports the same phase breakdown the full card would. Height-neutral.
-		timing: cardTiming(item.tc),
+		timing,
 		...(displayDurationMs != null ? { displayDurationMs } : {}),
 		identity: toolRowIdentity(item),
 		// Same value the standalone card carries, so the two renderings of this tool
@@ -4684,6 +5018,7 @@ function adaptActivityItems(
 	traceKey: string,
 ): {
 	traceItems: AdapterTraceItem[];
+	textBodyPreferences: Record<string, TextBodyPreference>;
 	reasoningCount: number;
 	toolCount: number;
 	/** Indices (into `traceItems`) of the rows drilled open for a live permission form. */
@@ -4697,6 +5032,7 @@ function adaptActivityItems(
 	let reasoningCount = 0;
 	let toolCount = 0;
 	const traceItems: AdapterTraceItem[] = [];
+	const textBodyPreferences: Record<string, TextBodyPreference> = {};
 	// ⚠️ Expansion is decided per ROW KEY, and the index is recorded as the row is
 	// emitted. Both halves of that matter:
 	//
@@ -4764,9 +5100,17 @@ function adaptActivityItems(
 			// `liveTail`, and the row keeps its key across the hand-off — so the instant
 			// the turn persists the SAME row gains its chevron.
 			const isLiveParse = isStreamingReasoningItem(item);
-			const parsed = isLiveParse
-				? parseStreamingReasoningTitles(`${traceKey}|${reasoningRowKeyBase(item)}`, text)
-				: (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
+			const parsed: ReasoningSegment[] = !usesStructuredReasoning(item.msg?.model)
+				? [
+						{
+							title: null,
+							body: isLiveParse ? text.slice(0, TITLE_MAX_CHARS) : text,
+							isEmpty: text.length === 0,
+						},
+					]
+				: isLiveParse
+					? parseStreamingReasoningTitles(`${traceKey}|${reasoningRowKeyBase(item)}`, text)
+					: (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
 			const rows =
 				parsed.length > 0
 					? parsed
@@ -4774,6 +5118,10 @@ function adaptActivityItems(
 			reasoningCount += rows.length;
 			const identity = reasoningRowIdentity(item);
 			const keyBase = reasoningRowKeyBase(item);
+			// Match the high-LOD run's FIRST block and seg ordinal, not the trace's
+			// lifecycle: one trace may contain several independent reasoning runs.
+			const bodyLifecycleId = contentBlockLifecycleId(item.block);
+			const structuredBody = hasStructuredReasoning(parsed);
 			// Visual live state is per BLOCK, not per message: a reasoning run that the
 			// answer text or a tool call already followed is finished, and must settle
 			// immediately rather than shimmer until the turn persists.
@@ -4791,6 +5139,12 @@ function adaptActivityItems(
 			for (const [index, row] of rows.entries()) {
 				const isLast = index === rows.length - 1;
 				const rowKey = `${keyBase}-step-${index}`;
+				if (bodyLifecycleId) {
+					textBodyPreferences[rowKey] = {
+						specKey: textExpansionStateKey(traceKey, bodyLifecycleId),
+						bodyKey: structuredBody ? `seg${index}` : undefined,
+					};
+				}
 				// A step with real content gets an expandable markdown body, so the reader
 				// can open ONE step of a folded run instead of choosing between a bare
 				// title list and the whole reply. Live rows carry no body (see above), and
@@ -4885,7 +5239,14 @@ function adaptActivityItems(
 		}
 		traceItems.push(toolRow);
 	}
-	return { traceItems, reasoningCount, toolCount, expandedIndices, pinnedRowIndices };
+	return {
+		traceItems,
+		textBodyPreferences,
+		reasoningCount,
+		toolCount,
+		expandedIndices,
+		pinnedRowIndices,
+	};
 }
 
 /**
@@ -4938,6 +5299,9 @@ export function adaptActivityUnit(
 	return {
 		kind: "activity-trace",
 		key,
+		...(Object.keys(activity.textBodyPreferences).length > 0
+			? { textBodyPreferences: activity.textBodyPreferences }
+			: {}),
 		data: {
 			items: activity.traceItems,
 			headerLabel: sysLabel(ctx, "activityTraceLabel"),
@@ -4954,6 +5318,14 @@ export function adaptActivityUnit(
 			// Derived while the rows were emitted, never resolved a second time — see
 			// adaptActivityItems on why a stored index cannot survive a live run.
 			expandedIndices: activity.expandedIndices,
+			textExpandedKeys: activity.traceItems.flatMap((row, index) => {
+				const bodyKey = row.key ?? String(index);
+				const preference = resolveTextExpansionPreference(
+					{ key, textBodyPreferences: activity.textBodyPreferences },
+					bodyKey,
+				);
+				return ctx.isTextExpanded?.(preference.specKey, preference.bodyKey) ? [bodyKey] : [];
+			}),
 			// A drilled-in row nests a real tool card, whose `plan` detail caps at
 			// 0.85 × viewport — so the trace needs the viewport height a standalone
 			// card already gets through its own opts.
@@ -4968,30 +5340,92 @@ function markUnitStart(specs: ElementSpec[], unitFirstIndex: number): void {
 	if (first) first.unitStart = true;
 }
 
-/** Adapt a whole render-unit list to a flat element-spec list. */
+/** Only assistant action cards share a continuous surface; attachments never do. */
+export function isConnectableCardSpec(spec: ElementSpec): boolean {
+	return (
+		spec.kind === "tool-call" ||
+		spec.kind === "subagent-card" ||
+		spec.kind === "web-search" ||
+		(spec.kind === "media" && (spec.data as { type?: unknown } | null)?.type === "image_generation")
+	);
+}
+
+/** Update only the two geometry flags, never a group array or group-wide cache key. */
+function setCardRunContext(spec: ElementSpec, inRun: boolean, isLast: boolean): void {
+	spec.opts ??= {};
+	const opts = spec.opts;
+	if (opts.inRun !== inRun) opts.inRun = inRun;
+	if (opts.isLast !== isLast) opts.isLast = isLast;
+	// Tool measures consume run chrome from data; subagents/native cards use opts.
+	if (spec.kind === "tool-call") {
+		const data = spec.data as { inRun?: boolean; isLast?: boolean };
+		if (data.inRun !== inRun) data.inRun = inRun;
+		if (data.isLast !== isLast) data.isLast = isLast;
+	}
+}
+
+/**
+ * Append in display order, stitching only adjacent action cards. This replaces
+ * the old per-tool-segment boundary with a visual boundary, without a second
+ * full-list scan. An append changes only the previous tail and the new card.
+ */
+function appendCardSpecs(
+	out: ElementSpec[],
+	specs: ElementSpec[],
+	previousCard: ElementSpec | undefined,
+): ElementSpec | undefined {
+	for (const spec of specs) {
+		if (isConnectableCardSpec(spec)) {
+			setCardRunContext(spec, previousCard !== undefined, true);
+			if (previousCard) setCardRunContext(previousCard, true, false);
+			previousCard = spec;
+		} else {
+			previousCard = undefined;
+		}
+		out.push(spec);
+	}
+	return previousCard;
+}
+
+function isAssistantCardSegment(seg: AdapterSegment): boolean {
+	return seg.kind === "tool-run" || seg.msg.role === "assistant";
+}
 export function adaptRenderUnits(
 	units: readonly AdapterRenderUnit[],
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const out: ElementSpec[] = [];
+	let previousCard: ElementSpec | undefined;
 	for (const unit of units) {
 		const unitFirstIndex = out.length;
-		if (unit.kind === "activity") out.push(adaptActivityUnit(unit.items, unit.key, ctx));
-		else out.push(...adaptSegment(unit.seg, ctx));
+		if (unit.kind === "activity") {
+			out.push(adaptActivityUnit(unit.items, unit.key, ctx));
+			previousCard = undefined;
+		} else if (isAssistantCardSegment(unit.seg)) {
+			previousCard = appendCardSpecs(out, adaptSegment(unit.seg, ctx), previousCard);
+		} else {
+			out.push(...adaptSegment(unit.seg, ctx));
+			previousCard = undefined;
+		}
 		markUnitStart(out, unitFirstIndex);
 	}
 	return out;
 }
 
-/** Adapt a plain segment list (used by unit tests and compatibility callers). */
 export function adaptSegments(
 	segments: readonly AdapterSegment[],
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const out: ElementSpec[] = [];
+	let previousCard: ElementSpec | undefined;
 	for (const seg of segments) {
 		const unitFirstIndex = out.length;
-		out.push(...adaptSegment(seg, ctx));
+		if (isAssistantCardSegment(seg)) {
+			previousCard = appendCardSpecs(out, adaptSegment(seg, ctx), previousCard);
+		} else {
+			out.push(...adaptSegment(seg, ctx));
+			previousCard = undefined;
+		}
 		markUnitStart(out, unitFirstIndex);
 	}
 	return out;

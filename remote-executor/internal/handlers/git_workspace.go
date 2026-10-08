@@ -410,7 +410,13 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		return nil, fmt.Errorf("Git repository identity exceeds metadata budget")
 	}
 	if op == "probe" {
-		return map[string]any{"state": "ready", "rootPath": root, "repositoryPath": common}, nil
+		// HEAD only: keep discovery independent of the potentially large status scan.
+		branch, _, branchErr := g.run("symbolic-ref", "--quiet", "--short", "HEAD")
+		var label any
+		if branchErr == nil && !g.truncated {
+			label = strings.TrimSpace(branch)
+		}
+		return map[string]any{"state": "ready", "rootPath": root, "repositoryPath": common, "branch": label}, nil
 	}
 	if expected := stringParam(params, "expectedRoot"); expected == "" || !samePath(expected, root) {
 		return nil, fmt.Errorf("Git workspace changed; refresh before retrying")
@@ -419,6 +425,17 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	// Watch is whole-worktree only; do not let supplied file actions add per-file processes.
 	if _, present := params["files"]; op == "watch" && present {
 		return nil, fmt.Errorf("watch does not accept files")
+	}
+	if op == "commitDetail" || op == "commitDiff" {
+		// Historical paths are validated lexically only: they may no longer exist,
+		// and these operations read the object database, never the working tree.
+		if _, present := params["files"]; present {
+			return nil, fmt.Errorf("commit preview does not accept files")
+		}
+		if err := h.checkGitHelpers(g, false); err != nil {
+			return nil, err
+		}
+		return h.workspaceCommitPreview(g, op, params, maxBytes)
 	}
 	files, err := h.gitFilePaths(g, root, params)
 	if err != nil {

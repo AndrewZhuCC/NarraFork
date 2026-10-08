@@ -25,12 +25,15 @@ import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
+import { notificationTool } from "./notification";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { pluginInstallTool } from "./plugin-install";
+import { questionTool } from "./question";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
+import { requestPermissionRuleTool } from "./request-permission-rule";
 import { scheduledTaskTool } from "./scheduled-task";
 import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
@@ -39,6 +42,7 @@ import { skillTool } from "./skill";
 import { structSedTool } from "./struct-sed";
 import { structViewTool } from "./struct-view";
 import { switchDeviceTool } from "./switch-device";
+import { switchWorkingDirectoryTool } from "./switch-working-directory";
 import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
@@ -46,6 +50,7 @@ import { terminalTool } from "./terminal";
 import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
+import { agentWorktreeTools, worktreeTool } from "./worktree";
 import { writeTool } from "./write";
 
 /**
@@ -59,6 +64,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
@@ -133,11 +139,16 @@ const coreProvider: ToolProvider = {
 			sendTool,
 			teamStatusTool,
 			askUserQuestionTool,
+			questionTool,
 			skillTool,
 			knowledgeSearchTool,
 			knowledgeReadTool,
 			knowledgeLibraryTool,
 			switchDeviceTool,
+			switchWorkingDirectoryTool,
+			worktreeTool,
+			...agentWorktreeTools,
+			requestPermissionRuleTool,
 			transferFileTool,
 			dangerConfirmTool,
 			dangerCancelTool,

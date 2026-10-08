@@ -35,6 +35,7 @@ import { shellSource } from "./guard-source";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import { renderElement, resolveRenderExtra } from "./render-registry";
+import { sliceBracketedRegion } from "./source-slice";
 import { resolveVListCompactTarget } from "./vlist-compact-target";
 
 const CONTENT_WIDTH = 800;
@@ -401,13 +402,17 @@ describe("shell wiring — the compact callbacks reach the row", () => {
 		expect(shell).toContain("extra.onCancelCompact = compactActions.onCancelCompact");
 		// Bound per row from the bridge, and part of the memo signature so a marker
 		// transitioning compacting → compacted re-renders with the new affordance.
-		expect(shell).toContain("compactActions={compact.byKey.get(item.spec.key)}");
+		const rowProps = sliceBracketedRegion(shell, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toContain("compactActions: compact.byKey.get(item.spec.key)");
 		expect(shell).toContain("prev.compactActions === next.compactActions");
 	});
 
 	it("the shell hosts one shared cancel dialog", async () => {
 		const shell = await SHELL;
-		expect(shell).toContain("useVListCompactActions({ narratorId, renderItems, sourceIdsByKey })");
+		const bridge = sliceBracketedRegion(shell, "useVListCompactActions({");
+		expect(bridge).toContain("narratorId,");
+		expect(bridge).toContain("renderItems: semanticItems,");
+		expect(bridge).toContain("sourceIdsByKey,");
 		expect(shell).toContain("{compact.cancelDialog}");
 	});
 

@@ -34,6 +34,7 @@ import {
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { DocumentCopyButton } from "../content/DocumentCopyButton";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { isMarkdownTarget } from "./vlist-content-view-body";
 import type { VListViewTarget } from "./vlist-content-view-target";
@@ -75,6 +76,11 @@ const overlayStyle: CSSProperties = {
  *
  * Being fixed and portaled also takes it out of the row's `overflow:hidden`, so
  * it cannot be clipped either.
+ *
+ * Z-INDEX: `Z.stickyHeader`, not `Z.popover`. This strip is content-edge chrome,
+ * not a selection popover — it must not cover body-level `<Menu>`s the reader
+ * opens (toolbar overflow, context menus). `Z.popover` (3000) would; 100 does
+ * not. Same tier as `VListTouchScrollTopButton`, its touch counterpart.
  */
 function fixedBarStyle(top: number, right: number, zIndex: number): CSSProperties {
 	return {
@@ -153,7 +159,7 @@ export function VListContentViewActions({
 		// element. The handlers only keep the bar alive while the pointer is on it —
 		// every action inside is a real, keyboard-reachable button.
 		<Box
-			style={float ? fixedBarStyle(float.top, float.right, Z.popover) : overlayStyle}
+			style={float ? fixedBarStyle(float.top, float.right, Z.stickyHeader) : overlayStyle}
 			data-vlist-view-actions={float ? "floating" : "parked"}
 			onMouseEnter={onPointerOverChange ? () => onPointerOverChange(true) : undefined}
 			onMouseLeave={onPointerOverChange ? () => onPointerOverChange(false) : undefined}
@@ -208,22 +214,43 @@ export function VListContentViewActions({
 						</ActionIcon>
 					</Tooltip>
 				) : null}
-				<CopyButton value={target.text}>
-					{({ copied, copy }) => (
-						<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
-							<ActionIcon
-								size={BUTTON_SIZE}
-								variant="filled"
-								color={copied ? "teal" : "gray"}
-								onClick={copy}
-								aria-label={copied ? t("copied") : t("copy")}
-								style={buttonStyle}
-							>
-								<IconCopy size={ICON_SIZE} />
-							</ActionIcon>
-						</Tooltip>
-					)}
-				</CopyButton>
+				{target.textDocument ? (
+					<DocumentCopyButton document={target.textDocument} />
+				) : target.model?.textDocumentSource ? (
+					<Tooltip
+						label={tNarrator(
+							target.model.textDocumentError ? "documentLoadFailed" : "documentLoading",
+						)}
+						withArrow
+						position="top"
+					>
+						<ActionIcon
+							size={BUTTON_SIZE}
+							disabled
+							aria-label={tNarrator("documentLoading")}
+							style={buttonStyle}
+						>
+							<IconCopy size={ICON_SIZE} />
+						</ActionIcon>
+					</Tooltip>
+				) : (
+					<CopyButton value={target.text}>
+						{({ copied, copy }) => (
+							<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
+								<ActionIcon
+									size={BUTTON_SIZE}
+									variant="filled"
+									color={copied ? "teal" : "gray"}
+									onClick={copy}
+									aria-label={copied ? t("copied") : t("copy")}
+									style={buttonStyle}
+								>
+									<IconCopy size={ICON_SIZE} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+					</CopyButton>
+				)}
 				<Tooltip label={t("fullscreen")} withArrow position="top">
 					<ActionIcon
 						size={BUTTON_SIZE}

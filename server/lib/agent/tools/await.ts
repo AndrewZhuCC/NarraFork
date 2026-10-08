@@ -1,13 +1,47 @@
+import { logger } from "@server/lib/logger";
 import {
 	type RuntimeAwaitTarget,
 	runtimeAwaitTargets,
 	runtimePolicyForContext,
 } from "@server/services/agent-runtime/policy";
+import {
+	getRuntimePublicationService,
+	type PublicationRun,
+} from "@server/services/agent-runtime/publication";
 import { SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
+
+async function consumeTerminalResult(result: {
+	status: string;
+	terminalResultReceived?: boolean;
+	publicationRun?: PublicationRun;
+	sourceResultRef?: string;
+}): Promise<void> {
+	if (
+		!result.terminalResultReceived ||
+		!result.publicationRun ||
+		["timeout", "aborted", "running", "taken_over"].includes(result.status)
+	)
+		return;
+	try {
+		const publication = await getRuntimePublicationService();
+		if (result.sourceResultRef !== undefined) {
+			await publication.consumeAwaitedTerminal(result.publicationRun, {
+				sourceResultRef: result.sourceResultRef,
+			});
+		} else {
+			await publication.consumeAwaitedTerminal(result.publicationRun);
+		}
+	} catch (error) {
+		logger.warn("Failed to consume Await terminal notification; preserving result", {
+			run: result.publicationRun,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const MAX_AWAIT_TIMEOUT_MS = 86_400_000; // 24h — matches the update_timeout WS validator cap
@@ -253,6 +287,7 @@ export const awaitTool: ToolDefinition = {
 						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
 					},
 				});
+				if (!combinedSignal.aborted) await consumeTerminalResult(result);
 				return {
 					output: result.formatted,
 					metadata: {
@@ -288,8 +323,28 @@ export const awaitTool: ToolDefinition = {
 						isError: true,
 					};
 				}
+				const { isQuestionAnswerDeliveryReady, registerQuestionAnswerFallback } = await import(
+					"@server/services/narrator-session"
+				);
+				const receiptReady =
+					!!result.record.answerMessageId &&
+					isQuestionAnswerDeliveryReady(ctx.narratorId, result.record.answerMessageId);
+				let output = formatQuestionResult(id, result.status, result.record, receiptReady);
+				if (result.status === "answered" && !receiptReady && result.record.answerMessageId) {
+					const { getQuestionAnswerFallbackText } = await import(
+						"@server/services/narrator-session"
+					);
+					const receipt = await getQuestionAnswerFallbackText(
+						ctx.narratorId,
+						result.record.answerMessageId,
+					);
+					if (receipt) {
+						registerQuestionAnswerFallback(ctx.narratorId, result.record.answerMessageId);
+						output = `<question_answer_fallback event="${result.record.answerMessageId}">\n${receipt}\n</question_answer_fallback>`;
+					}
+				}
 				return {
-					output: formatQuestionResult(id, result.status, result.record),
+					output,
 					metadata: {
 						kind: "await",
 						awaitType: "question",
@@ -373,6 +428,7 @@ export const awaitTool: ToolDefinition = {
 						combinedSignal,
 					);
 			const status = relabel(result.status);
+			if (type === "bash" && !combinedSignal.aborted) await consumeTerminalResult(result);
 			// A bash task id is a nanoid too, so the alias is the readable handle. Bash
 			// always registers one; if a row somehow lacks it, keep the full id rather
 			// than inventing a prefix — unlike a subagent id, a task id is looked up by
@@ -407,10 +463,9 @@ export const awaitTool: ToolDefinition = {
 /**
  * Wording for a `type: "question"` Await.
  *
- * The answers are ALSO delivered as a message row (that is how the async path works at
- * all), so this text is deliberately a restatement rather than the only copy: an agent
- * that awaited should not have to wait for its next history rebuild to see what it was
- * told. The duplication is bounded — at most four question/answer pairs.
+ * A reliable inbox receipt is supplied at the next safe model turn, so Await returns
+ * its reference rather than a second answer body. Legacy or failed scheduling keeps
+ * the bounded answer fallback until that delivery contract has been established.
  */
 export function formatQuestionResult(
 	questionId: string,
@@ -418,10 +473,14 @@ export function formatQuestionResult(
 	record: {
 		questions: { id?: string; question?: string; header: string }[];
 		answers: Record<string, string> | null;
+		answerMessageId?: string | null;
 	},
+	receiptReady = false,
 ): string {
 	switch (status) {
 		case "answered": {
+			if (receiptReady && record.answerMessageId)
+				return `Question ${questionId} was answered. Answer event: ${record.answerMessageId}. The complete user receipt is supplied at the next safe model turn; use Question action=get to read it and Question action=resolve to confirm how it applies.`;
 			const lines = record.questions.map((q) => {
 				// Model-facing key is header; internal id / legacy question still appear
 				// in older stored rows.
@@ -431,28 +490,22 @@ export function formatQuestionResult(
 					(q.question ? record.answers?.[q.question] : undefined);
 				return `- ${q.header}\n  ${answer ?? "(no answer recorded)"}`;
 			});
-			return `The user answered question ${questionId}:\n\n${lines.join("\n")}`;
+			return `The user answered question ${questionId}:\n\n${lines.join("\n")}\n\nAnswer event: ${record.answerMessageId ?? "unavailable"}. This is a fallback excerpt, not the complete receipt. Receipt delivery is not confirmed; use Question action=get with id="${questionId}" to read the original context, options and full answer before deciding how it applies, then Question action=resolve to confirm handling.`;
 		}
 		case "dismissed":
-			return (
-				`The user declined to answer question ${questionId} — they want you to use your own ` +
-				`best judgement. Decide it yourself and continue; do not ask again.`
-			);
+			return `The user skipped question ${questionId} (dismissed). No answer was selected. Use Question action=get to inspect its context and decide the next step for the current task.`;
 		case "withdrawn":
-			return (
-				`Question ${questionId} was withdrawn, so no answer is coming. ` +
-				`Continue with your own judgement.`
-			);
+			return `Question ${questionId} was withdrawn; no further answer is pending. Use Question action=get to inspect the withdrawal context before deciding the next step.`;
 		case "timeout":
 			return (
 				`The wait for question ${questionId} timed out — only the wait ended, the question is ` +
-				`still open and the user may still answer it. Either continue with your default ` +
-				`(the answer will arrive as a message later) or call Await again with the same id.`
+				`still open and the user may still answer it. Use Question action=get for its current context; ` +
+				`call Await again with the same id when that answer actually blocks your next step.`
 			);
 		case "aborted":
 			return (
-				`The wait for question ${questionId} was interrupted. The question is still open. ` +
-				`Continue with your default, or await it again.`
+				`The wait for question ${questionId} was interrupted; the question remains stored. ` +
+				`Use Question action=get to inspect its current status before deciding the next step.`
 			);
 		default:
 			return `Question ${questionId} status: ${status}`;

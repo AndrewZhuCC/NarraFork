@@ -4,8 +4,15 @@ import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import {
+	TEXT_DOCUMENT_PACKET_BYTES,
+	TEXT_DOCUMENT_PAGE_CHARS,
+	type TextDocumentRange,
+	type TextDocumentRef,
+} from "@shared/pretext-layout/text-document";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -43,6 +50,97 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+/** Bounded source lane: timeout, packet bytes and caller cancellation are independent of document size. */
+async function requestTextDocumentJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+	const controller = new AbortController();
+	const abort = () => controller.abort(signal?.reason);
+	const timer = setTimeout(
+		() => controller.abort(new Error("Text document read timed out")),
+		10_000,
+	);
+	signal?.addEventListener("abort", abort, { once: true });
+	if (signal?.aborted) abort();
+	try {
+		const response = await authorizedFetch(`${apiBase()}${path}`, { signal: controller.signal });
+		if (!response.ok) {
+			const error = await readFetchError(response, "Text document read failed");
+			throw new ApiError(error.message, response.status, error.data);
+		}
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("Text document response has no body");
+		const decoder = new TextDecoder();
+		let bytes = 0;
+		let text = "";
+		try {
+			while (true) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+				bytes += chunk.value.byteLength;
+				if (bytes > TEXT_DOCUMENT_PACKET_BYTES)
+					throw new Error("Text document packet limit exceeded");
+				text += decoder.decode(chunk.value, { stream: true });
+			}
+			return JSON.parse(text + decoder.decode()) as T;
+		} finally {
+			await reader.cancel().catch(() => {});
+			reader.releaseLock();
+		}
+	} finally {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", abort);
+	}
+}
+
+export interface WriteDocumentSourceReference {
+	toolCallId: string;
+	messageId: string;
+	executionAttempt: number;
+}
+
+export function getTextDocumentRange(
+	narratorId: string,
+	refId: string,
+	offset = 0,
+	limit = TEXT_DOCUMENT_PAGE_CHARS,
+	signal?: AbortSignal,
+): Promise<TextDocumentRange> {
+	const query = new URLSearchParams({
+		offset: String(offset),
+		limit: String(Math.min(limit, TEXT_DOCUMENT_PAGE_CHARS)),
+	});
+	return requestTextDocumentJson(
+		`/narrators/${encodeURIComponent(narratorId)}/text-documents/${encodeURIComponent(refId)}?${query}`,
+		signal,
+	);
+}
+
+export function ensureWriteDocumentSource(
+	narratorId: string,
+	toolUseId: string,
+	reference: WriteDocumentSourceReference,
+	signal?: AbortSignal,
+): Promise<TextDocumentRef> {
+	const query = new URLSearchParams({
+		toolCallId: reference.toolCallId,
+		messageId: reference.messageId,
+		executionAttempt: String(reference.executionAttempt),
+	});
+	return requestTextDocumentJson(
+		`/narrators/${encodeURIComponent(narratorId)}/tool-calls/${encodeURIComponent(toolUseId)}/input-document?${query}`,
+		signal,
+	);
+}
+
+export function readTextDocumentRange(
+	ref: TextDocumentRef,
+	offset: number,
+	limit: number,
+	signal?: AbortSignal,
+) {
+	if (!ref.source?.narratorId) return Promise.reject(new Error("Text document owner is missing"));
+	return getTextDocumentRange(ref.source.narratorId, ref.id, offset, limit, signal);
+}
 
 /** Persisted row identity; a provider's tool-use id alone need not be unique. */
 export interface ToolCallDetailRef {
@@ -132,6 +230,8 @@ export type ScopedRevertUnavailableReason =
 	| "execution_unavailable"
 	| "runtime_reload_required"
 	| "incomplete_coverage"
+	| "file_conflict"
+	| "history_changed"
 	| "unsupported_target"
 	| "platform_unsupported"
 	| "pending_operations"
@@ -175,6 +275,7 @@ export interface RevertPlanConfirmation {
 	planId: string;
 	planHash: string;
 	action: RevertAction;
+	acceptSnapshotRestore?: true;
 }
 
 export interface RevertActionConfirmOptions {
@@ -223,12 +324,23 @@ export interface RevertBlocker {
 	detail?: string;
 }
 
+export interface RevertDiagnostic {
+	code: string;
+	reason?: string;
+	filePath?: string;
+	effectId?: string;
+	toolCallId?: string;
+	operationId?: string;
+}
+
 export interface RevertActionPreview {
 	action: RevertAction;
 	plan: RevertActionPlan | null;
 	executable: false;
 	historySummary: RevertHistorySummary | null;
 	unavailable?: ScopedRevertUnavailableReason;
+	diagnostics?: RevertDiagnostic[];
+	recoveryMode?: "snapshot";
 	/** Present when the server could name the running/unfinished holders. */
 	blockers?: RevertBlocker[];
 }
@@ -277,6 +389,7 @@ export interface RevertPlanReview extends Omit<RevertActionPlan, "id"> {
 	action: RevertAction;
 	previewKey: string;
 	filesComplete: boolean;
+	recoveryMode?: "snapshot";
 }
 
 export interface RevertPreviewFile {
@@ -321,6 +434,9 @@ export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreview
 	revertPlan?: RevertPlanReview;
 	previewIssue?: RevertPlanPreviewIssue;
 	previewError?: string;
+	previewErrorKey?: "revertPlanPreviewTimeout";
+	diagnostics?: RevertDiagnostic[];
+	recoveryMode?: "snapshot";
 	blockers?: RevertBlocker[];
 	scope?: RevertScope;
 	affectedFiles: F[];
@@ -446,6 +562,9 @@ export interface NarratorCustomTraits {
 }
 
 export const narratorsApi = {
+	getTextDocumentRange,
+	ensureWriteDocumentSource,
+	readTextDocumentRange,
 	listNarrators: (opts?: {
 		chapterId?: string;
 		standalone?: boolean;
@@ -463,6 +582,7 @@ export const narratorsApi = {
 		return request<ApiEntity[]>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	listNarratorsPaginated: (opts?: {
+		projectId?: string;
 		standalone?: boolean | "all";
 		status?: string;
 		filter?: string;
@@ -476,6 +596,7 @@ export const narratorsApi = {
 		hasViewers?: boolean;
 	}) => {
 		const params = new URLSearchParams();
+		if (opts?.projectId) params.set("projectId", opts.projectId);
 		if (opts?.standalone === "all") params.set("standalone", "all");
 		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
@@ -491,7 +612,8 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
-	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+	getNarrator: (id: string, signal?: AbortSignal) =>
+		request<ApiEntity>(`/narrators/${id}`, { signal }),
 
 	/**
 	 * Upload a custom bitmap avatar for a narrator, replacing any previous one.
@@ -792,6 +914,11 @@ export const narratorsApi = {
 			`/narrators/${id}/interrupt${waitForIdle ? "?waitForIdle=1" : ""}`,
 			{ method: "POST" },
 		),
+	detachBash: (narratorId: string, toolUseId: string) =>
+		request<{ detached: true; taskId: string; alias: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/tools/${encodeURIComponent(toolUseId)}/detach`,
+			{ method: "POST" },
+		),
 	detachSubagent: (id: string) =>
 		request<{ detached: boolean }>(`/narrators/${id}/detach`, { method: "POST" }),
 	takeoverSubagent: (id: string) =>
@@ -908,6 +1035,15 @@ export const narratorsApi = {
 		}
 		return (await res.json()) as { ok: boolean };
 	},
+	setBufferedMessageMode: (
+		narratorId: string,
+		messageId: string,
+		mode: "turn" | "tool" | "interrupt",
+	) =>
+		request<{ ok: true; delivered?: boolean; messageId?: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/mode`,
+			{ method: "PATCH", body: JSON.stringify({ mode }) },
+		),
 	retryBufferedMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: true; resumed: boolean }>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/retry`,
@@ -949,10 +1085,16 @@ export const narratorsApi = {
 		}>("/narrators/questions/all"),
 	getAsyncQuestions: (
 		id: string,
-		params?: { status?: string; cursor?: string; limit?: number },
+		params?: {
+			status?: string;
+			filter?: "all" | "open" | "pending" | "history";
+			cursor?: string;
+			limit?: number;
+		},
 	) => {
 		const query = new URLSearchParams();
 		if (params?.status) query.set("status", params.status);
+		if (params?.filter) query.set("filter", params.filter);
 		if (params?.cursor) query.set("cursor", params.cursor);
 		if (params?.limit !== undefined) query.set("limit", String(params.limit));
 		const suffix = query.size > 0 ? `?${query.toString()}` : "";
@@ -960,6 +1102,46 @@ export const narratorsApi = {
 			`/narrators/${id}/questions${suffix}`,
 		);
 	},
+	getAsyncQuestionDetail: (narratorId: string, questionId: string, cursor?: string) =>
+		request<{
+			question: AsyncQuestion;
+			supplements: {
+				messageId: string;
+				kind?: "answer" | "dismissal" | "supplement";
+				text: string | null;
+				createdAt: string;
+				actor?: string | null;
+			}[];
+			nextCursor?: string | null;
+			tooLarge?: boolean;
+			canAct?: boolean;
+		}>(
+			`/narrators/${narratorId}/questions/${questionId}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+		),
+	getGlobalQuestionPage: (filter: "open" | "pending" | "history", cursor?: string) => {
+		const query = new URLSearchParams({ filter, limit: "30" });
+		if (cursor) query.set("cursor", cursor);
+		return request<{
+			items: (AsyncQuestion & {
+				narratorTitle: string | null;
+				chapterId: string | null;
+				canAct?: boolean;
+			})[];
+			nextCursor: string | null;
+		}>(`/narrators/questions?${query}`);
+	},
+	supplementAsyncQuestion: (
+		narratorId: string,
+		questionId: string,
+		payload: { text: string; answerMessageId?: string },
+	) =>
+		request<{ ok: boolean; question: AsyncQuestion }>(
+			`/narrators/${narratorId}/questions/${questionId}/supplement`,
+			{
+				method: "POST",
+				body: JSON.stringify(payload),
+			},
+		),
 	answerAsyncQuestion: (
 		narratorId: string,
 		questionId: string,
@@ -975,6 +1157,11 @@ export const narratorsApi = {
 	dismissAsyncQuestion: (narratorId: string, questionId: string) =>
 		request<{ ok: boolean; question: AsyncQuestion }>(
 			`/narrators/${narratorId}/questions/${questionId}/dismiss`,
+			{ method: "POST" },
+		),
+	ignoreAsyncQuestion: (narratorId: string, questionId: string) =>
+		request<{ ok: boolean; question: AsyncQuestion }>(
+			`/narrators/${narratorId}/questions/${questionId}/ignore`,
 			{ method: "POST" },
 		),
 	approvePermission: (requestId: string, payload?: PermissionDecisionPayload) =>
@@ -1128,10 +1315,13 @@ export const narratorsApi = {
 		return request<RemoteDirectoryListing>(`/narrators/${id}/device-browse?${params}`);
 	},
 	updateNarratorDefaultDevice: (id: string, deviceId: string | null) =>
-		request<{ defaultDeviceId: string | null }>(`/narrators/${id}/default-device`, {
-			method: "PATCH",
-			body: JSON.stringify({ deviceId }),
-		}),
+		request<{ defaultDeviceId: string | null; current?: WorkspaceContext }>(
+			`/narrators/${id}/default-device`,
+			{
+				method: "PATCH",
+				body: JSON.stringify({ deviceId }),
+			},
+		),
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",
@@ -1308,7 +1498,12 @@ export const narratorsApi = {
 		signal?: AbortSignal,
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
+		queueMode?: "turn" | "tool" | "interrupt",
 	) => {
+		if (queueMode !== undefined) {
+			priority = queueMode !== "turn";
+			interrupt = queueMode === "interrupt";
+		}
 		// Interrupt-and-insert is one request; its replacement always has queue priority.
 		if (interrupt) priority = true;
 		const headers: Record<string, string> = {};
@@ -1328,6 +1523,7 @@ export const narratorsApi = {
 			}
 			if (priority) formData.append("priority", "true");
 			if (interrupt) formData.append("interrupt", "true");
+			if (queueMode !== undefined) formData.append("queueMode", queueMode);
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
 			}
@@ -1346,6 +1542,7 @@ export const narratorsApi = {
 					message,
 					...(priority ? { priority: true } : {}),
 					...(interrupt ? { interrupt: true } : {}),
+					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
 				}),
 				signal,
@@ -1393,7 +1590,11 @@ export const narratorsApi = {
 		),
 	previewRevertAction: (
 		narratorId: string,
-		body: RevertActionTarget & { action: RevertAction; idempotencyKey: string },
+		body: RevertActionTarget & {
+			action: RevertAction;
+			idempotencyKey: string;
+			recoveryMode?: "snapshot";
+		},
 		signal?: AbortSignal,
 	) =>
 		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
@@ -1419,7 +1620,11 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(plan.planId)}/apply`,
 			{
 				method: "POST",
-				body: JSON.stringify({ planHash: plan.planHash, action: plan.action }),
+				body: JSON.stringify({
+					planHash: plan.planHash,
+					action: plan.action,
+					...(plan.acceptSnapshotRestore === true ? { acceptSnapshotRestore: true } : {}),
+				}),
 			},
 		),
 	rollbackToBlock: (
@@ -1699,80 +1904,7 @@ export const narratorsApi = {
 			{ signal },
 		),
 
-	// File modifications
-	getFileModifications: (narratorId: string, upToMessageId?: string, fromMessageId?: string) => {
-		const params = new URLSearchParams();
-		if (upToMessageId) params.set("upToMessageId", upToMessageId);
-		if (fromMessageId) params.set("fromMessageId", fromMessageId);
-		const qs = params.toString();
-		return request<{
-			files: Array<{
-				deviceId: string;
-				filePath: string;
-				snapshotId: string;
-				originalExists: boolean;
-				editCount: number;
-				lastModifiedAt: string;
-				operations: Array<{
-					toolUseId: string;
-					toolName: string;
-					messageId: string;
-					createdAt: string;
-				}>;
-			}>;
-			/** Newest window only; see `timelineTruncated`. */
-			timeline: Array<{
-				messageId: string;
-				createdAt: string;
-				seq: number;
-				role: string;
-				hasEdits: boolean;
-			}>;
-			/** True when older messages exist outside the returned timeline window. */
-			timelineTruncated?: boolean;
-		}>(`/narrators/${narratorId}/file-modifications${qs ? `?${qs}` : ""}`);
-	},
-	getFileDiff: (
-		narratorId: string,
-		snapshotId: string,
-		upToMessageId?: string,
-		fromMessageId?: string,
-	) => {
-		const params = new URLSearchParams();
-		if (upToMessageId) params.set("upToMessageId", upToMessageId);
-		if (fromMessageId) params.set("fromMessageId", fromMessageId);
-		const qs = params.toString();
-		return request<{
-			deviceId: string;
-			filePath: string;
-			original: string | null;
-			current: string | null;
-		}>(`/narrators/${narratorId}/patches/${snapshotId}/diff${qs ? `?${qs}` : ""}`);
-	},
-	revertFile: (narratorId: string, target: { deviceId: string; filePath: string }) =>
-		request<{ success: boolean; originalExists: boolean }>(`/narrators/${narratorId}/revert-file`, {
-			method: "POST",
-			body: JSON.stringify(target),
-		}),
-	revertAllFiles: (narratorId: string, opts?: { scope?: RevertScope }) =>
-		request<{ fileCount: number; files: string[]; warnings?: RevertWarning[] }>(
-			`/narrators/${narratorId}/revert`,
-			{
-				method: "POST",
-				body: JSON.stringify({
-					messageId: "__all__",
-					...(opts?.scope ? { scope: opts.scope } : {}),
-				}),
-			},
-		),
-	unrevertAll: (narratorId: string) =>
-		request<{ success: boolean }>(`/narrators/${narratorId}/unrevert`, { method: "POST" }),
-	getDeletePreview: (narratorId: string, messageId: string) =>
-		request<
-			RevertScopePreviews<RevertPreviewFileWithContent> & {
-				toolCallCount: number;
-			}
-		>(`/narrators/${narratorId}/delete-preview?messageId=${encodeURIComponent(messageId)}`),
+	// File rollback previews
 	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<
 			RevertScopePreviews<RevertPreviewFile> & {
@@ -1821,7 +1953,7 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Narrator Fork (standalone sessions only).
+	// Ordinary conversation fork (standalone output, including legacy chapter sources).
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.
@@ -1862,7 +1994,7 @@ export const narratorsApi = {
 			method: "DELETE",
 		}),
 	promoteNarrator: (narratorId: string) =>
-		request<{ type: "unlocked" | "forked"; narrator?: ApiEntity; chapter?: ApiEntity }>(
+		request<{ type: "unlocked" | "forked"; narratorId: string; narrator?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),

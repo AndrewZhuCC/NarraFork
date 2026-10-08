@@ -15,6 +15,7 @@ import {
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
 import { trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
+import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
 import type { ContentBlock } from "../narrator-panel-types";
 import type { BooleanOverride, DangerReflectionOverride } from "./reflection-types";
@@ -103,6 +104,16 @@ export interface UseNarratorSendOptions {
 	setNarratorWorking: () => void;
 	navigateToNarrator: (narratorId: string) => void;
 
+	/**
+	 * Client-side slash commands mirroring the manual controls: `/fork` forks
+	 * from the latest message (its right-click fork action), `/compact` triggers
+	 * a compaction (the context-ring "compact now" action). The panel supplies
+	 * both because chapter-bound forks need the host's git-aware handler; an
+	 * absent handler turns the command into a no-op.
+	 */
+	onForkCommand?: () => void;
+	onCompactCommand?: () => void;
+
 	normalizeBooleanOverride: (value: unknown) => BooleanOverride;
 	normalizeDangerReflectionOverride: (value: unknown) => DangerReflectionOverride;
 	t: TFunction<"narrator">;
@@ -130,7 +141,8 @@ export interface UseNarratorSendResult {
  * in-flight sending state + upload-progress throttle + cancel, the buffered-send
  * reconciliation (`applyBufferedSendResult`), the optimistic `submitMessage`, the
  * `doSendBuffered` composer path, the mode-aware `handleSendWithMode` (with its
- * `/new` spawn and compact-queue branches), the dock-bridge `forwardTextToNarrator`,
+ * `/new` spawn, `/fork` and `/compact` control commands, and compact-queue
+ * branches), the dock-bridge `forwardTextToNarrator`,
  * and the retry/continue actions.
  *
  * Kept lifted (called from the panel) rather than pushed into a single child:
@@ -155,8 +167,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		reconcileBufferedMessages,
 		scrollToBottom,
 		isActive,
-		isSubagent,
-		isTakenOver,
 		showCompactQueueChoice,
 		canRetryLastUserMessage,
 		canContinueNarrator,
@@ -170,6 +180,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		registerSubmitToNarrator,
 		setNarratorWorking,
 		navigateToNarrator,
+		onForkCommand,
+		onCompactCommand,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
@@ -198,6 +210,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			imageCount: number,
 			priority?: boolean,
 			fileReferences?: FileReference[],
+			queueMode: QueueMode = priority ? "tool" : "turn",
 		) => {
 			if (!result?.buffered || !result.id) return false;
 
@@ -217,11 +230,18 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 							}
 						: null,
 				priority: priority || undefined,
+				queueMode,
 			};
 
 			setQueuedMessages((prev) => {
 				if (prev.some((m) => m.id === queuedMessage.id)) return prev;
-				return priority ? [queuedMessage, ...prev] : [...prev, queuedMessage];
+				if (!priority) return [...prev, queuedMessage];
+				// Guidance is FIFO within the priority lane, not a prepend stack.
+				const nextStepIndex = prev.findIndex(
+					(m) => (m.queueMode ?? (m.priority ? "tool" : "turn")) === "turn",
+				);
+				const index = nextStepIndex < 0 ? prev.length : nextStepIndex;
+				return [...prev.slice(0, index), queuedMessage, ...prev.slice(index)];
 			});
 
 			// A busy `/goal` is queued rather than applied immediately; tell the user
@@ -263,6 +283,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		priority?: boolean,
 		fileReferences: FileReference[] = [],
 		interrupt?: boolean,
+		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 	) => {
 		if (interrupt) priority = true;
 		const optimisticBlocks: ContentBlock[] = [
@@ -292,6 +313,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				signal,
 				fileReferences,
 				interrupt,
+				queueMode,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -323,7 +345,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				// Message was buffered — show it in the queue immediately.
 				// The WS buffer_set event can be missed when the subscription is not
 				// fully caught up, so also reconcile with REST.
-				applyBufferedSendResult(result, msg, images.length, priority, fileReferences);
+				applyBufferedSendResult(result, msg, images.length, priority, fileReferences, queueMode);
 				scrollToBottom(true);
 			} else if (result?.id) {
 				// Normal message — set narrator status to "working" optimistically.
@@ -354,6 +376,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		references?: FileReference[],
 		includeCommentDrafts = true,
 		interrupt?: boolean,
+		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 	): Promise<boolean> => {
 		if (interrupt) priority = true;
 		const draft = trimFileReferenceInput({
@@ -382,6 +405,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				signal,
 				fileReferences,
 				interrupt,
+				queueMode,
 			);
 			const buffered = applyBufferedSendResult(
 				result,
@@ -389,6 +413,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				images.length,
 				priority,
 				fileReferences,
+				queueMode,
 			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
@@ -477,6 +502,21 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		try {
 			composerRef.current?.noteSent(msg, fileReferences);
 
+			// /fork and /compact are client-side control commands mirroring the
+			// manual actions (fork from the latest message; compact now). They are
+			// not model input and never queue: clear just the text and run the
+			// action immediately, keeping any staged attachments for the next
+			// message. File references still cannot attach to a control command.
+			const controlCommand = msg.trim();
+			if (controlCommand === "/fork" || controlCommand === "/compact") {
+				if (fileReferences.length) throw new Error(t("fileReferences.controlCommand"));
+				composerRef.current?.hideTextForSend();
+				composerRef.current?.commitDraftAfterSend();
+				if (controlCommand === "/fork") onForkCommand?.();
+				else onCompactCommand?.();
+				return;
+			}
+
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {
 				if (fileReferences.length) throw new Error(t("fileReferences.newSessionFirst"));
@@ -539,30 +579,17 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			}
 
 			if (isActive) {
-				// A subagent that is still controlled by its parent must receive user input
-				// at the next safe post-tool boundary. Never wait for its whole task turn,
-				// and never use the generic interrupt route (which hard-stops subagents).
-				if (isSubagent && !isTakenOver) {
-					await doSendBuffered(msg, true, abortController.signal);
-					return;
-				}
-				// A taken-over subagent queues without a soft stop, so the "interrupt"
-				// mode's follow-up interrupt has nothing to hand over — and the generic
-				// interrupt route hard-stops subagents, which would end the takeover.
-				// Queue plainly; the runner drains the message when the turn suspends.
-				if (isSubagent) {
-					await doSendBuffered(msg, mode !== "turn", abortController.signal);
-					return;
-				}
-				if (mode === "turn") {
-					await doSendBuffered(msg, false, abortController.signal);
-				} else if (mode === "tool") {
-					await doSendBuffered(msg, true, abortController.signal);
-				} else {
-					// The server accepts the replacement before interrupting the old loop.
-					// One request preserves priority and avoids a stop/send race window.
-					await doSendBuffered(msg, true, abortController.signal, fileReferences, true, true);
-				}
+				// The server owns admission and runner identity for both primary and
+				// child narrators. All modes travel in the same durable send request.
+				await doSendBuffered(
+					msg,
+					mode !== "turn",
+					abortController.signal,
+					fileReferences,
+					true,
+					mode === "interrupt" ? true : undefined,
+					mode,
+				);
 				return;
 			}
 			// Idle but compacting: the server decides queue-or-send, so this only has to
@@ -586,6 +613,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					abortController.signal,
 					mode !== "turn",
 					fileReferences,
+					undefined,
+					mode,
 				);
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
@@ -609,7 +638,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				abortController.signal,
 				mode !== "turn",
 				fileReferences,
-				!isSubagent && mode === "interrupt" ? true : undefined,
+				mode === "interrupt" ? true : undefined,
+				mode,
 			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();

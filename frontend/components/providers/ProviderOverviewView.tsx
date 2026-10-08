@@ -1,103 +1,17 @@
-import {
-	Badge,
-	Box,
-	Button,
-	Card,
-	Grid,
-	Group,
-	Modal,
-	Paper,
-	SimpleGrid,
-	Stack,
-	Text,
-	Title,
-} from "@mantine/core";
+import { Box, Button, Grid, Group, Paper, Stack, Text, Title } from "@mantine/core";
 import { IconPlus } from "@tabler/icons-react";
-import React, { useMemo, useState } from "react";
+import { Link } from "@tanstack/react-router";
+import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { ProviderGroup } from "./ModelOverviewTab";
 import { ProviderCard } from "./ProviderCard";
 import type { ProviderStatus } from "./ProviderStatusBadge";
-import type { CustomApiProtocol } from "./types";
-
-export type AddProviderType = "nug" | CustomApiProtocol;
-
-const ADD_PROVIDER_OPTIONS: Array<{
-	type: AddProviderType;
-	labelKey: string;
-	badgeKey: string;
-	descriptionKey: string;
-	hintKey: string;
-	color: string;
-	recommendKey?: string;
-	transportKey?: string;
-}> = [
-	{
-		type: "anthropic-compatible",
-		labelKey: "addProviderAnthropicCompatible",
-		badgeKey: "addProviderBadgeAnthropic",
-		descriptionKey: "addProviderAnthropicCompatibleDesc",
-		hintKey: "addProviderAnthropicCompatibleHint",
-		color: "green",
-		recommendKey: "addProviderRecommendedChineseModels",
-	},
-	{
-		type: "codex-native",
-		labelKey: "addProviderCodex",
-		badgeKey: "addProviderBadgeCodex",
-		descriptionKey: "addProviderCodexDesc",
-		hintKey: "addProviderCodexHint",
-		color: "violet",
-	},
-	{
-		type: "responses-compatible",
-		labelKey: "addProviderResponses",
-		badgeKey: "addProviderBadgeOpenAI",
-		descriptionKey: "addProviderResponsesDesc",
-		hintKey: "addProviderResponsesHint",
-		color: "cyan",
-	},
-	{
-		type: "anthropic-official",
-		labelKey: "addProviderClaudeCode",
-		badgeKey: "addProviderBadgeClaudeCode",
-		descriptionKey: "addProviderClaudeCodeDesc",
-		hintKey: "addProviderClaudeCodeHint",
-		color: "orange",
-	},
-	{
-		type: "completions-compatible",
-		labelKey: "addProviderCompletions",
-		badgeKey: "addProviderBadgeOpenAI",
-		descriptionKey: "addProviderCompletionsDesc",
-		hintKey: "addProviderCompletionsHint",
-		color: "blue",
-	},
-	{
-		type: "nug",
-		labelKey: "addProviderNug",
-		badgeKey: "addProviderBadgeGateway",
-		descriptionKey: "addProviderNugDesc",
-		hintKey: "addProviderNugHint",
-		color: "indigo",
-	},
-	{
-		type: "gemini-compatible",
-		labelKey: "addProviderGemini",
-		badgeKey: "addProviderBadgeGemini",
-		descriptionKey: "addProviderGeminiDesc",
-		hintKey: "addProviderGeminiHint",
-		transportKey: "addProviderGeminiTransportNote",
-		color: "grape",
-	},
-];
 
 export interface ProviderOverviewViewProps {
 	groups: ProviderGroup[];
 	hiddenModels: Set<string>;
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
-	onAddProvider: (type: AddProviderType) => void;
 	selectedProvider: string | null;
 }
 
@@ -106,11 +20,9 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	hiddenModels,
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
-	onAddProvider,
 	selectedProvider,
 }: ProviderOverviewViewProps) {
 	const { t } = useTranslation("settings");
-	const [addProviderOpened, setAddProviderOpened] = useState(false);
 
 	const stats = useMemo(() => {
 		const total = groups.length;
@@ -130,11 +42,6 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 		if (group.disabled) return "disabled";
 		if (group.models.length === 0) return "unverified";
 		return "connected";
-	};
-
-	const handleSelectProviderType = (type: AddProviderType) => {
-		setAddProviderOpened(false);
-		onAddProvider(type);
 	};
 
 	const renderProviderCard = (group: ProviderGroup) => {
@@ -203,9 +110,10 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 						</Box>
 					</Group>
 					<Button
+						component={Link}
+						to="/settings/providers/add"
 						variant="light"
 						leftSection={<IconPlus size={16} />}
-						onClick={() => setAddProviderOpened(true)}
 					>
 						{t("addProvider")}
 					</Button>
@@ -239,92 +147,6 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					</Text>
 				</Paper>
 			)}
-
-			<Modal
-				opened={addProviderOpened}
-				onClose={() => setAddProviderOpened(false)}
-				title={t("addProviderModalTitle")}
-				size="xl"
-				centered
-			>
-				<Stack gap="md">
-					<Text size="sm" c="dimmed">
-						{t("addProviderModalDesc")}
-					</Text>
-					<SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
-						{ADD_PROVIDER_OPTIONS.map((option) => (
-							<Card
-								key={option.type}
-								className="provider-add-card"
-								withBorder
-								padding="sm"
-								radius="md"
-								onClick={() => handleSelectProviderType(option.type)}
-								onKeyDown={(event) => {
-									if (event.key === "Enter" || event.key === " ") {
-										event.preventDefault();
-										handleSelectProviderType(option.type);
-									}
-								}}
-								role="button"
-								tabIndex={0}
-								style={{
-									height: "100%",
-									cursor: "pointer",
-									transition: "border-color 150ms ease, box-shadow 150ms ease",
-								}}
-							>
-								<Stack gap="xs" style={{ height: "100%" }}>
-									<Group justify="space-between" align="flex-start" gap="xs" wrap="nowrap">
-										<Box style={{ minWidth: 0 }}>
-											<Text fw={600} size="sm" truncate>
-												{t(option.labelKey)}
-											</Text>
-										</Box>
-										<Badge size="xs" variant="light" color={option.color} style={{ flexShrink: 0 }}>
-											{t(option.badgeKey)}
-										</Badge>
-									</Group>
-									{option.recommendKey && (
-										<Badge
-											size="xs"
-											variant="outline"
-											color="green"
-											style={{ alignSelf: "flex-start" }}
-										>
-											{t(option.recommendKey)}
-										</Badge>
-									)}
-									<Text size="xs" c="dimmed" style={{ lineHeight: 1.45 }}>
-										{t(option.descriptionKey)}
-									</Text>
-									{option.transportKey && (
-										<Badge
-											size="xs"
-											variant="light"
-											color="grape"
-											style={{ alignSelf: "flex-start" }}
-										>
-											{t(option.transportKey)}
-										</Badge>
-									)}
-									<Text size="xs" c="dimmed" fs="italic" style={{ marginTop: "auto" }}>
-										{t(option.hintKey)}
-									</Text>
-								</Stack>
-							</Card>
-						))}
-					</SimpleGrid>
-				</Stack>
-			</Modal>
-
-			<style>{`
-				.provider-add-card:hover,
-				.provider-add-card:focus-visible {
-					border-color: var(--mantine-color-indigo-5);
-					box-shadow: 0 0 0 1px var(--mantine-color-indigo-5);
-				}
-			`}</style>
 		</Stack>
 	);
 });

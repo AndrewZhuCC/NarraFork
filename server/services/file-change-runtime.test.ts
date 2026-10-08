@@ -24,14 +24,22 @@ import { FILE_CHANGE_LIMITS, type FileChangeState } from "../../shared/file-chan
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
+import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
+import { executeTool } from "../lib/agent/tool-executor";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import { editTool } from "../lib/agent/tools/edit";
 import { decodeFileBytes } from "../lib/agent/tools/encoding";
-import { structSedTool } from "../lib/agent/tools/struct-sed";
+import { previewStructSedChange, structSedTool } from "../lib/agent/tools/struct-sed";
 import { MAX_BATCH_OPERATIONS } from "../lib/agent/tools/struct-sed/commands";
 import { writeTool } from "../lib/agent/tools/write";
-import { withBashWriteLock, withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
-import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
+import { withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
+import type {
+	AgentConfig,
+	AgentToolUse,
+	ToolContext,
+	ToolExecutionTarget,
+} from "../lib/agent/types";
 import { worktreeWriteLock } from "../lib/async-mutex";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -44,6 +52,7 @@ import {
 	type FileChangeLocalIo,
 	fileChangeLocalIo,
 } from "./file-change-local-io";
+import { FileChangeNamespaceBusyError } from "./file-change-namespace-reset";
 import {
 	FileChangeReversalCalculator,
 	type FileChangeReversalEffect,
@@ -55,7 +64,10 @@ import {
 	localFileChangeRuntimeBinding,
 	withLocalFileChangeRuntime,
 } from "./file-change-runtime";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
+import {
+	acquireFileHistoryCapture,
+	createWorkspaceWriteCoordinatorState,
+} from "./workspace-write-coordinator";
 
 let root: string;
 let workspace: string;
@@ -285,6 +297,469 @@ function referenceRequestDigest(parts: string[], input: Record<string, unknown>)
 		digest.update(`${Buffer.byteLength(text)}:`).update(text);
 	return digest.digest("hex");
 }
+
+async function executorFileCall(
+	toolName: "Write" | "Edit" | "StructSed",
+	input: Record<string, unknown>,
+	patch: Partial<AgentConfig> = {},
+) {
+	const ctx = await callContext(toolName, input.file_path as string);
+	const binding = ctx.toolCallBinding;
+	if (!binding || !ctx.currentToolUseId) throw new Error("Missing fixture tool binding");
+	db.update(schema.narratorToolCalls)
+		.set({ status: "pending", executionStartedAt: null })
+		.where(eq(schema.narratorToolCalls.id, binding.toolCallId))
+		.run();
+	const tu: AgentToolUse = { name: toolName, toolUseId: ctx.currentToolUseId, input };
+	toolRegistry.register(
+		toolName === "Write" ? writeTool : toolName === "Edit" ? editTool : structSedTool,
+	);
+	const config: AgentConfig = {
+		narratorId,
+		conversationId: "host-proof-test",
+		model: "test",
+		provider: "test",
+		cwd: workspace,
+		signal: ctx.signal,
+		permissionHandler: async () => ({ behavior: "allow" }),
+		requireToolCallBinding: true,
+		toolExecutionBindings: new WeakMap([[tu, binding]]),
+		onExecutionTargetResolved: async (_toolUseId, target) => {
+			db.update(schema.narratorToolCalls)
+				.set({
+					executionDeviceId: target.deviceId,
+					executionCwd: target.cwd,
+					executionPathFlavor: target.pathFlavor,
+					resolvedFilePath: target.lexicalPath ?? null,
+					canonicalFilePath: target.canonicalPath ?? null,
+					runtimeGeneration: target.runtimeGeneration ?? null,
+				})
+				.where(eq(schema.narratorToolCalls.id, binding.toolCallId))
+				.run();
+		},
+		prepareToolNoDispatch: (proofCtx, name) => runtime.prepareHostNoDispatch(proofCtx, name),
+		onToolExecutionStarting: async (_toolUseId, attempt, startedAt) => {
+			const rows = sqlite
+				.query(
+					"UPDATE narrator_tool_calls SET status='running',execution_started_at=? WHERE id=? AND execution_attempt=? AND execution_started_at IS NULL AND status IN ('initializing','pending','running') RETURNING id",
+				)
+				.all(new Date(startedAt).toISOString(), attempt.toolCallId, attempt.attempt);
+			if (rows.length !== 1) throw new Error("Attempt was not claimed");
+			return attempt;
+		},
+		onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
+		...patch,
+	};
+	return { ctx, run: () => withLocalFileChangeRuntime(runtime, () => executeTool(tu, config)) };
+}
+
+function expectZeroDispatch(reason: string, executionOutcome: string) {
+	expect(operations()).toHaveLength(1);
+	expect(operations()[0]).toMatchObject({
+		reason: `no_dispatch:${reason}`,
+		executionOutcome,
+		effectOutcome: "no_change",
+		expectedEffectCount: 0,
+		preparedEffectCount: 0,
+		settledEffectCount: 0,
+		unresolvedEffectCount: 0,
+		evidenceBytes: 0,
+		coverage: "complete",
+	});
+	expect(effects()).toHaveLength(0);
+	expect(attributions()).toHaveLength(0);
+}
+
+describe("trusted host no-dispatch boundaries", () => {
+	test.each([
+		{ command: "unknown", address: "1" },
+		{ command: "replace", address: "1" },
+		{ command: "delete", from_stash: "missing" },
+		{ command: "delete", address: "/not-found/" },
+	])("actual StructSed validation/stash/address rejection records no writes: %j", async (input) => {
+		const path = join(workspace, "struct.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute({ file_path: path, dry_run: false, ...input }, ctx),
+		);
+		expect(result.isError).toBe(true);
+		expectZeroDispatch("validation_rejected", "failed");
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test.each([
+		undefined,
+		false,
+	])("actual StructSed preview/identical content is succeeded (dryRun=%s)", async (dryRun) => {
+		const path = join(workspace, "preview.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute(
+				{
+					file_path: path,
+					command: "replace",
+					address: "1",
+					content: dryRun === false ? "original" : "next",
+					...(dryRun === false ? { dry_run: false } : {}),
+				},
+				ctx,
+			),
+		);
+		expect(result.isError).not.toBe(true);
+		expectZeroDispatch("preview", "succeeded");
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("permission rejection records actual never-invoked body without claiming execution", async () => {
+		const path = join(workspace, "deny.txt");
+		const { ctx, run } = await executorFileCall(
+			"Write",
+			{ file_path: path, content: "next" },
+			{
+				permissionHandler: async () => ({ behavior: "deny" }),
+			},
+		);
+		const result = await run();
+		expect(result.isError).toBe(true);
+		expect(result.executionStartedAt).toBeUndefined();
+		expectZeroDispatch("invocation_rejected", "failed");
+		expect(
+			db
+				.select()
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+				.get(),
+		).toMatchObject({ status: "fail", executionStartedAt: null, executionAttempt: 1 });
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test.each([
+		"deny",
+		"abort",
+	] as const)("live pre-permission ticket survives handler's early terminal row (%s)", async (mode) => {
+		const path = join(workspace, "terminated.txt");
+		const controller = new AbortController();
+		const { run } = await executorFileCall(
+			"Write",
+			{ file_path: path, content: "next" },
+			{
+				signal: controller.signal,
+				permissionHandler: async (_name, _input, _toolUseId, options) => {
+					db.update(schema.narratorToolCalls)
+						.set({ status: "fail" })
+						.where(eq(schema.narratorToolCalls.id, options?.toolCallBinding?.toolCallId ?? ""))
+						.run();
+					if (mode === "abort") {
+						controller.abort();
+						throw new Error("Cancelled while pending");
+					}
+					return { behavior: "deny" };
+				},
+			},
+		);
+		expect((await run()).isError).toBe(true);
+		expectZeroDispatch(
+			mode === "abort" ? "cancelled_before_dispatch" : "invocation_rejected",
+			mode === "abort" ? "interrupted" : "failed",
+		);
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test.each([
+		"Write",
+		"Edit",
+		"StructSed",
+	] as const)("safeParse refusal for %s never claims the row", async (name) => {
+		const path = join(workspace, "invalid.txt");
+		const { ctx, run } = await executorFileCall(name, {
+			file_path: path,
+			...(name === "StructSed" ? { command: "invalid" } : {}),
+		});
+		const result = await run();
+		expect(result.isError).toBe(true);
+		expect(result.executionStartedAt).toBeUndefined();
+		expectZeroDispatch("invocation_rejected", "failed");
+		expect(
+			db
+				.select()
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+				.get()?.executionStartedAt,
+		).toBeNull();
+	});
+
+	test("an executor dry-run really invokes StructSed and records succeeded preview", async () => {
+		const path = join(workspace, "executor-preview.txt");
+		await writeFile(path, "original\n");
+		const { run } = await executorFileCall("StructSed", {
+			file_path: path,
+			command: "delete",
+			address: "1",
+		});
+		const result = await run();
+		expect(result.isError).not.toBe(true);
+		expect(result.executionStartedAt).toBeNumber();
+		expectZeroDispatch("preview", "succeeded");
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("proof persistence failure rejects instead of returning a successful preview", async () => {
+		const path = join(workspace, "journal-failure.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		sqlite.exec(
+			"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'proof persistence rejected'); END;",
+		);
+		await expect(
+			withLocalFileChangeRuntime(runtime, () =>
+				structSedTool.execute({ file_path: path, command: "delete", address: "1" }, ctx),
+			),
+		).rejects.toThrow("persist trusted no-dispatch evidence");
+		expect(operations()).toHaveLength(0);
+		expect(effects()).toHaveLength(0);
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("approval UI preview does not seal the actual pending write attempt", async () => {
+		const path = join(workspace, "approval-preview.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		const input = { file_path: path, command: "delete", address: "1", dry_run: false };
+		const preview = await withLocalFileChangeRuntime(runtime, () =>
+			previewStructSedChange(input, ctx),
+		);
+		expect("preview" in preview).toBe(true);
+		expect(operations()).toHaveLength(0);
+		const applied = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute(input, ctx),
+		);
+		expect(applied.isError).not.toBe(true);
+		expect(effects()[0]?.outcome).toBe("changed");
+	});
+
+	test.each([
+		false,
+		true,
+	])("executor oversize rejection persists proof or rejects failed proof (failJournal=%s)", async (failJournal) => {
+		const path = join(workspace, "oversize.txt");
+		const { run } = await executorFileCall("Write", {
+			file_path: path,
+			content: "x".repeat(FILE_CHANGE_LIMITS.fileToolRequestBytes + 1),
+		});
+		if (failJournal)
+			sqlite.exec(
+				"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'normalization proof rejected'); END;",
+			);
+		if (failJournal) {
+			await expect(run()).rejects.toThrow("normalization proof rejected");
+			expect(operations()).toHaveLength(0);
+		} else {
+			expect((await run()).isError).toBe(true);
+			expectZeroDispatch("validation_rejected", "failed");
+		}
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test.each([
+		false,
+		true,
+	])("JSON escape budget rejection is proven at hash_request (failJournal=%s)", async (failJournal) => {
+		const path = join(workspace, "escaped-budget.txt");
+		const apply = spyOn(io, "apply");
+		const read = spyOn(io, "read");
+		// Each NUL is six JSON bytes, despite occupying only one JS character.
+		// The field itself passes snapshotFileToolInput's length ceiling.
+		const { run } = await executorFileCall("Write", {
+			file_path: path,
+			content: "\0".repeat(FILE_CHANGE_LIMITS.fileToolRequestBytes / 6),
+		});
+		if (failJournal)
+			sqlite.exec(
+				"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'escaped request proof rejected'); END;",
+			);
+		if (failJournal) {
+			await expect(run()).rejects.toThrow("escaped request proof rejected");
+			expect(operations()).toHaveLength(0);
+		} else {
+			const result = await run();
+			expect(result.isError).toBe(true);
+			expectZeroDispatch("validation_rejected", "failed");
+		}
+		expect(apply).not.toHaveBeenCalled();
+		expect(read).not.toHaveBeenCalled();
+		expect(effects()).toHaveLength(0);
+		expect(await Bun.file(path).exists()).toBe(false);
+		apply.mockRestore();
+		read.mockRestore();
+	});
+
+	test("aggregate scalar budget rejection records proof before construction or IO", async () => {
+		const path = join(workspace, "aggregate-budget.txt");
+		const ctx = await callContext("Write", path);
+		const value = "a".repeat(FILE_CHANGE_LIMITS.fileToolRequestBytes / 2);
+		const apply = spyOn(io, "apply");
+		await expect(
+			runtime.execute({
+				ctx,
+				backend: localBackend,
+				toolName: "Write",
+				filePath: path,
+				input: { first: value, second: value },
+				construct() {
+					throw new Error("must not construct");
+				},
+			}),
+		).rejects.toThrow("bounded input budget");
+		expectZeroDispatch("validation_rejected", "failed");
+		expect(apply).not.toHaveBeenCalled();
+		expect(await Bun.file(path).exists()).toBe(false);
+		apply.mockRestore();
+	});
+
+	test("executor construct rejection cannot swallow a failed evidence commit", async () => {
+		const path = join(workspace, "construct-proof.txt");
+		await writeFile(path, "original\n");
+		const { run } = await executorFileCall("Edit", {
+			file_path: path,
+			old_string: "not-found",
+			new_string: "next",
+		});
+		sqlite.exec(
+			"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'construct proof rejected'); END;",
+		);
+		await expect(run()).rejects.toThrow("construct proof rejected");
+		expect(operations()).toHaveLength(0);
+		expect(effects()).toHaveLength(0);
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("executor successful preview cannot swallow failed proof persistence", async () => {
+		const path = join(workspace, "executor-proof.txt");
+		await writeFile(path, "original\n");
+		const { run } = await executorFileCall("StructSed", {
+			file_path: path,
+			command: "delete",
+			address: "1",
+		});
+		sqlite.exec(
+			"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'preview proof rejected'); END;",
+		);
+		await expect(run()).rejects.toThrow("preview proof rejected");
+		expect(operations()).toHaveLength(0);
+		expect(effects()).toHaveLength(0);
+	});
+
+	test("frozen target drift after the ticket cannot be rebound by a denial", async () => {
+		const path = join(workspace, "frozen-proof.txt");
+		const { run } = await executorFileCall(
+			"Write",
+			{ file_path: path, content: "next" },
+			{
+				permissionHandler: async (_name, _input, _id, options) => {
+					db.update(schema.narratorToolCalls)
+						.set({ canonicalFilePath: `${path}.drift` })
+						.where(eq(schema.narratorToolCalls.id, options?.toolCallBinding?.toolCallId ?? ""))
+						.run();
+					return { behavior: "deny" };
+				},
+			},
+		);
+		await expect(run()).rejects.toThrow("live host attempt");
+		expect(operations()).toHaveLength(0);
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test("remote preview records only host flow, without remote file states or receipt", async () => {
+		const localPath = join(workspace, "host-must-not-touch.txt");
+		const ctx = await callContext("StructSed", localPath);
+		const remotePath = "/remote/proof.txt";
+		ctx.cwd = "/remote";
+		ctx.executionTarget = Object.freeze({
+			deviceId: "proof-device",
+			backendKind: "remote",
+			cwd: "/remote",
+			pathFlavor: "posix",
+			lexicalPath: remotePath,
+			canonicalPath: remotePath,
+			runtimeGeneration: 7,
+			selectionSource: "explicit",
+		});
+		const writes: string[] = [];
+		ctx.resolveBackend = () =>
+			Object.assign(Object.create(localBackend) as ExecutionBackend, {
+				kind: "remote" as const,
+				deviceId: "proof-device",
+				runtimeGeneration: 7,
+				statFile: async () => ({ isFile: true, isDirectory: false, size: 9 }),
+				readFileBytes: async () => ({
+					bytes: Buffer.from("original\n"),
+					truncated: false,
+					totalSize: 9,
+				}),
+				writeFileBytes: async () => {
+					writes.push("write");
+				},
+				mkdirp: async () => {
+					writes.push("mkdir");
+				},
+			});
+		db.update(schema.narratorToolCalls)
+			.set({
+				executionDeviceId: "proof-device",
+				executionCwd: "/remote",
+				executionPathFlavor: "posix",
+				resolvedFilePath: remotePath,
+				canonicalFilePath: remotePath,
+				runtimeGeneration: 7,
+			})
+			.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+			.run();
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute({ file_path: remotePath, command: "delete", address: "1" }, ctx),
+		);
+		expect(result.isError).not.toBe(true);
+		expectZeroDispatch("preview", "succeeded");
+		expect(operations()[0]?.executionBindingJson).toMatchObject({
+			deviceId: "proof-device",
+			runtimeGeneration: 7,
+			runtimeEpoch: localFileChangeRuntimeBinding()?.runtimeEpoch,
+			fencingToken: 0,
+		});
+		expect(writes).toEqual([]);
+		expect(await Bun.file(localPath).exists()).toBe(false);
+	});
+
+	test("after an actual write, an opaque failure does not generate host no-dispatch evidence", async () => {
+		const path = join(workspace, "write-then-fail.txt");
+		await writeFile(path, "original\n");
+		io.apply = async () => {
+			await writeFile(path, "unknown\n");
+			throw new Error("Opaque failure after write");
+		};
+		const { run } = await executorFileCall("Write", { file_path: path, content: "next" });
+		expect((await run()).isError).toBe(true);
+		expect(operations()).toHaveLength(1);
+		expect(operations()[0]?.reason?.startsWith("no_dispatch:")).not.toBe(true);
+		expect(effects()[0]?.outcome).toBe("unknown");
+		expect(await readFile(path, "utf8")).toBe("unknown\n");
+	});
+
+	test("a terminal old attempt cannot obtain a live observation ticket", async () => {
+		const path = join(workspace, "stale.txt");
+		const ctx = await callContext("Write", path);
+		db.update(schema.narratorToolCalls)
+			.set({ status: "fail", executionStartedAt: null })
+			.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+			.run();
+		expect(() => runtime.prepareHostNoDispatch(ctx, "Write")).toThrow("precede");
+		await expect(
+			runtime.recordHostNoDispatch(ctx, "Write", "invocation_rejected", false),
+		).rejects.toThrow("live host");
+		expect(operations()).toHaveLength(0);
+	});
+});
 
 describe("bounded immutable request digest", () => {
 	test("matches existing JSON digest including escaping and surrogate chunk boundaries", async () => {
@@ -656,9 +1131,10 @@ describe("fail closed before writes and after uncertain IO", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_zero BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'zero-journal-fault'); END",
 		);
-		const result = await edit(path, "missing", "replacement");
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("zero-journal-fault");
+		await expect(edit(path, "missing", "replacement")).rejects.toMatchObject({
+			name: "FileNoDispatchEvidenceError",
+			cause: { message: "zero-journal-fault" },
+		});
 		expect(operations()).toHaveLength(0);
 		expect(await readFile(path, "utf8")).toBe("same");
 	});
@@ -1573,7 +2049,7 @@ describe("application data directory compatibility", () => {
 });
 
 describe("legacy workspace lock interoperability", () => {
-	function bashInput() {
+	function legacyInput() {
 		return {
 			cwd: `${workspace}/./`,
 			filePaths: [],
@@ -1583,6 +2059,394 @@ describe("legacy workspace lock interoperability", () => {
 		};
 	}
 
+	async function withLegacyWriteLock<T>(
+		backend: typeof localBackend,
+		input: { cwd: string },
+		body: () => Promise<T>,
+	) {
+		return { value: await withWorkspaceWriteLock(backend, input.cwd, body), serialized: true };
+	}
+
+	test("workspace admission never holds the global namespace or blocks another workspace", async () => {
+		const path = join(workspace, "queued.txt");
+		const other = join(root, "other-workspace");
+		await mkdir(other);
+		await runtime.initialize();
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "queued");
+		try {
+			await Promise.race([
+				waiter.requested,
+				pending.then(() => {
+					throw new Error("write bypassed holder");
+				}),
+			]);
+			const otherPath = join(other, "free.txt");
+			const result = await write(otherPath, "free", await callContext("Write", otherPath, other));
+			expect(result.isError).toBeUndefined();
+			expect(await readFile(otherPath, "utf8")).toBe("free");
+			await runtime.verifyNamespace();
+			expect(await readFile(path, "utf8").catch(() => null)).toBeNull();
+		} finally {
+			waiter.restore();
+			gate.resolve();
+			await Promise.all([holder, pending]);
+		}
+		const timing = (await pending).metadata?.fileChangeTiming as {
+			waitMs: number;
+			executionMs: number;
+			totalMs: number;
+		};
+		expect(timing.waitMs).toBeGreaterThan(0);
+		expect(timing.waitMs + timing.executionMs).toBe(timing.totalMs);
+	});
+
+	test("namespace admission cancellation drains its slot without releasing its predecessor", async () => {
+		const gate = deferred();
+		const entered = deferred();
+		const holder = runtime.withNamespaceAccess(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const controller = new AbortController();
+		let cancelledEntered = false;
+		const cancelled = runtime.withNamespaceAccess(async () => {
+			cancelledEntered = true;
+		}, controller.signal);
+		controller.abort(new Error("cancel admission"));
+		await expect(cancelled).rejects.toThrow("cancel admission");
+		let followerEntered = false;
+		const follower = runtime.withNamespaceAccess(async () => {
+			followerEntered = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(cancelledEntered).toBe(false);
+			expect(followerEntered).toBe(false);
+		} finally {
+			gate.resolve();
+			await Promise.all([holder, follower]);
+		}
+		expect(followerEntered).toBe(true);
+	});
+
+	test("Bash dispatch does not wait for the blob namespace even when it is unavailable", async () => {
+		await runtime.initialize();
+		const gate = deferred();
+		const entered = deferred();
+		const holder = runtime.withNamespaceAccess(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		try {
+			const activity = await runtime.registerBashActivity({
+				backend: localBackend,
+				cwd: workspace,
+				signal: new AbortController().signal,
+			});
+			activity.end("finished");
+		} finally {
+			gate.resolve();
+			await holder;
+		}
+	});
+	test("history admission does not hold the namespace while another workspace writes", async () => {
+		const path = join(workspace, "history-queued.txt");
+		const other = join(root, "history-other");
+		await mkdir(other);
+		await runtime.initialize();
+		const release = await acquireFileHistoryCapture({
+			deviceId: "local",
+			pathFlavor: localBackend.pathFlavor as "posix" | "windows",
+			canonicalPath: path,
+		});
+		const requested = deferred();
+		const original = runtime.coordinator.withWrite.bind(runtime.coordinator);
+		const spy = spyOn(runtime.coordinator, "withWrite").mockImplementation((input, body) => {
+			requested.resolve();
+			return original(input, body);
+		});
+		const pending = write(path, "queued");
+		try {
+			await requested.promise;
+			const otherPath = join(other, "independent.txt");
+			expect(
+				(await write(otherPath, "independent", await callContext("Write", otherPath, other)))
+					.isError,
+			).toBeUndefined();
+			await runtime.verifyNamespace();
+			expect(operations()).toHaveLength(1);
+		} finally {
+			spy.mockRestore();
+			release();
+			await pending;
+		}
+		expect((await pending).isError).toBeUndefined();
+	});
+
+	test("queued write revalidates a namespace reset rather than using stale blob references", async () => {
+		const oldPath = join(workspace, "prior-generation.txt");
+		await write(oldPath, "old generation");
+		const generation = (await runtime.initialize()).generation;
+		const path = join(workspace, "after-reset.txt");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "new generation");
+		try {
+			await waiter.requested;
+			await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+			// A fresh cache consumer detects and resets the missing namespace while
+			// this writer is still waiting outside the global fence.
+			expect((await makeRuntime().initialize()).generation).toBeGreaterThan(generation);
+		} finally {
+			waiter.restore();
+			gate.resolve();
+			await Promise.all([holder, pending]);
+		}
+		expect((await pending).isError).toBeUndefined();
+		const effect = effects().find((row) => row.identityJson.canonicalPath === path);
+		expect(effect).toBeDefined();
+		if (!effect) throw new Error("Queued write did not settle a new-generation effect");
+		expect(await bytesFor(effect.observedAfterStateJson)).toEqual(Buffer.from("new generation"));
+	});
+	test("coordinator admission never holds namespace while an independent workspace executes", async () => {
+		const path = join(workspace, "coordinator-queued.txt");
+		await write(path, "original");
+		const scope = pendingScope();
+		if (!scope) throw new Error("Missing admitted workspace");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = runtime.coordinator.withWrite(
+			{ scope, runtime: processRuntime(), executionClass: "local_file_io" },
+			async () => {
+				entered.resolve();
+				await gate.promise;
+			},
+		);
+		await entered.promise;
+		const requested = deferred();
+		const original = runtime.coordinator.withWrite.bind(runtime.coordinator);
+		const spy = spyOn(runtime.coordinator, "withWrite").mockImplementation((input, body) => {
+			requested.resolve();
+			return original(input, body);
+		});
+		const pending = edit(path, "original", "queued");
+		try {
+			await requested.promise;
+			const other = join(root, "coordinator-other");
+			await mkdir(other);
+			const otherPath = join(other, "free.txt");
+			expect(
+				(await write(otherPath, "free", await callContext("Write", otherPath, other))).isError,
+			).toBeUndefined();
+			await runtime.verifyNamespace();
+			expect(await readFile(path, "utf8")).toBe("original");
+		} finally {
+			spy.mockRestore();
+			gate.resolve();
+			await Promise.all([holder, pending]);
+		}
+		expect((await pending).isError).toBeUndefined();
+	});
+	test("retained namespace-first consumer drains before a new write takes coordinator", async () => {
+		const path = join(workspace, "legacy-namespace.txt");
+		await write(path, "before");
+		const scope = pendingScope();
+		if (!scope) throw new Error("Missing scope");
+		const gate = deferred();
+		const entered = deferred();
+		// Retained HEAD executeBound ordering: namespace, async preparation, coordinator.
+		const legacyClosure = () =>
+			runtime.withNamespaceAccess(async () => {
+				entered.resolve();
+				await gate.promise;
+				return runtime.coordinator.withWrite(
+					{ scope, runtime: processRuntime(), executionClass: "local_file_io", waitTimeoutMs: 500 },
+					async () => {},
+				);
+			});
+		const legacy = legacyClosure();
+		await entered.promise;
+		const draining = deferred();
+		const originalDrain = runtime.waitForNamespaceDrain.bind(runtime);
+		const drain = spyOn(runtime, "waitForNamespaceDrain").mockImplementation((signal) => {
+			draining.resolve();
+			return originalDrain(signal);
+		});
+		const grant = spyOn(runtime.coordinator, "withWrite");
+		const pending = write(path, "after");
+		try {
+			await draining.promise;
+			expect(grant).not.toHaveBeenCalled();
+			expect(operations()).toHaveLength(1);
+		} finally {
+			gate.resolve();
+			await Promise.all([legacy, pending]);
+			drain.mockRestore();
+			grant.mockRestore();
+		}
+		expect((await pending).isError).toBeUndefined();
+		expect(await readFile(path, "utf8")).toBe("after");
+		expect(operations()).toHaveLength(2);
+	});
+
+	test("legacy consumer racing after drain cannot deadlock a coordinator-first write", async () => {
+		const path = join(workspace, "legacy-race.txt");
+		await write(path, "before");
+		const scope = pendingScope();
+		if (!scope) throw new Error("Missing scope");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "after");
+		await waiter.requested; // New caller drained namespace and owns coordinator already.
+		const legacyEntered = deferred();
+		const legacy = runtime.withNamespaceAccess(async () => {
+			legacyEntered.resolve();
+			return runtime.coordinator.withWrite(
+				{ scope, runtime: processRuntime(), executionClass: "local_file_io", waitTimeoutMs: 500 },
+				async () => {},
+			);
+		});
+		await legacyEntered.promise;
+		let busy = 0;
+		const originalTry = runtime.tryWithNamespaceAccess.bind(runtime);
+		const attempt = spyOn(runtime, "tryWithNamespaceAccess").mockImplementation((body, signal) =>
+			originalTry(body, signal).catch((error) => {
+				if (error instanceof FileChangeNamespaceBusyError) busy++;
+				throw error;
+			}),
+		);
+		try {
+			gate.resolve();
+			await Promise.all([holder, legacy, pending]);
+		} finally {
+			gate.resolve();
+			waiter.restore();
+			attempt.mockRestore();
+		}
+		expect(busy).toBe(1);
+		expect((await pending).isError).toBeUndefined();
+		expect(operations()).toHaveLength(2); // busy admission never begins an intent.
+		expect(await readFile(path, "utf8")).toBe("after");
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.all()
+				.every((row) => row.status === "settled"),
+		).toBe(true);
+	});
+
+	test("cancelling compatibility drain creates no new lease and leaves the old consumer intact", async () => {
+		await write(join(workspace, "seed.txt"), "seed");
+		const gate = deferred();
+		const entered = deferred();
+		const legacy = runtime.withNamespaceAccess(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const ctx = await callContext("Write", join(workspace, "cancel-drain.txt"));
+		const controller = new AbortController();
+		ctx.signal = controller.signal;
+		const draining = deferred();
+		const original = runtime.waitForNamespaceDrain.bind(runtime);
+		const spy = spyOn(runtime, "waitForNamespaceDrain").mockImplementation((signal) => {
+			draining.resolve();
+			return original(signal);
+		});
+		const pending = write(join(workspace, "cancel-drain.txt"), "cancelled", ctx);
+		try {
+			await draining.promise;
+			controller.abort(new Error("cancel drain"));
+			expect((await pending).isError).toBe(true);
+			expect(operations()).toHaveLength(1);
+			expect(db.select().from(schema.workspaceWriteLeases).all()).toHaveLength(1);
+			await expect(runtime.tryWithNamespaceAccess(async () => {})).rejects.toBeInstanceOf(
+				FileChangeNamespaceBusyError,
+			);
+		} finally {
+			spy.mockRestore();
+			gate.resolve();
+			await legacy;
+			await pending;
+		}
+	});
+	test("namespace busy never retries when coordinator lease cleanup cannot be persisted", async () => {
+		const path = join(workspace, "cleanup-busy.txt");
+		await write(path, "before");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "must not write");
+		await waiter.requested;
+		const legacyGate = deferred();
+		const legacyEntered = deferred();
+		const legacy = runtime.withNamespaceAccess(async () => {
+			legacyEntered.resolve();
+			await legacyGate.promise;
+		});
+		await legacyEntered.promise;
+		let attempts = 0;
+		const originalTry = runtime.tryWithNamespaceAccess.bind(runtime);
+		const spy = spyOn(runtime, "tryWithNamespaceAccess").mockImplementation((body, signal) => {
+			attempts++;
+			return originalTry(body, signal);
+		});
+		sqlite.exec(
+			"CREATE TRIGGER fail_busy_cleanup BEFORE UPDATE ON workspace_write_leases WHEN NEW.status = 'settled' BEGIN SELECT RAISE(ABORT, 'busy cleanup rejected'); END",
+		);
+		try {
+			gate.resolve();
+			const result = await pending;
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Durable finalization failed");
+			expect(attempts).toBe(1);
+			expect(operations()).toHaveLength(1);
+			expect(await readFile(path, "utf8")).toBe("before");
+			expect(
+				db
+					.select()
+					.from(schema.workspaceWriteLeases)
+					.all()
+					.some((row) => row.status !== "settled"),
+			).toBe(true);
+		} finally {
+			sqlite.exec("DROP TRIGGER fail_busy_cleanup");
+			spy.mockRestore();
+			waiter.restore();
+			gate.resolve();
+			legacyGate.resolve();
+			await Promise.all([holder, legacy, pending]);
+		}
+	});
 	function observeLegacyWaiter() {
 		const requested = deferred();
 		const acquire = worktreeWriteLock.acquire.bind(worktreeWriteLock);
@@ -1594,12 +2458,12 @@ describe("legacy workspace lock interoperability", () => {
 	}
 
 	for (const tool of ["Write", "Edit"] as const) {
-		test(`Bash's old lock blocks v2 ${tool} before capture, including normalized cwd`, async () => {
+		test(`the legacy writer lock blocks v2 ${tool} before capture, including normalized cwd`, async () => {
 			const path = join(workspace, "shared.txt");
 			await writeFile(path, "original");
 			const gate = deferred();
 			const entered = deferred();
-			const bash = withBashWriteLock(localBackend, bashInput(), async () => {
+			const bash = withLegacyWriteLock(localBackend, legacyInput(), async () => {
 				entered.resolve();
 				await gate.promise;
 				await writeFile(path, "bash");
@@ -1632,7 +2496,7 @@ describe("legacy workspace lock interoperability", () => {
 	}
 
 	for (const outcome of ["success", "error", "abort"] as const) {
-		test(`v2 holds Bash's old lock through receipt settlement and releases on ${outcome}`, async () => {
+		test(`v2 holds the legacy writer lock through receipt settlement and releases on ${outcome}`, async () => {
 			const path = join(workspace, "reverse.txt");
 			await writeFile(path, "original");
 			const gate = deferred();
@@ -1659,7 +2523,7 @@ describe("legacy workspace lock interoperability", () => {
 			await entered.promise;
 			if (outcome === "abort") controller.abort(new Error("cancel during IO"));
 			let bashEntered = false;
-			const bash = withBashWriteLock(localBackend, bashInput(), async () => {
+			const bash = withLegacyWriteLock(localBackend, legacyInput(), async () => {
 				bashEntered = true;
 				expect(effects()[0].settlement).toBe("settled");
 				await writeFile(path, `${await readFile(path, "utf8")}+bash`);
@@ -1680,12 +2544,12 @@ describe("legacy workspace lock interoperability", () => {
 		});
 	}
 
-	test("cancelled v2 admission drains without IO and never unlocks the Bash holder early", async () => {
+	test("cancelled v2 admission drains without IO and never unlocks the legacy writer holder early", async () => {
 		const path = join(workspace, "cancel-legacy.txt");
 		await writeFile(path, "original");
 		const gate = deferred();
 		const entered = deferred();
-		const bash = withBashWriteLock(localBackend, bashInput(), async () => {
+		const bash = withLegacyWriteLock(localBackend, legacyInput(), async () => {
 			entered.resolve();
 			await gate.promise;
 		});
@@ -1741,7 +2605,7 @@ describe("legacy workspace lock interoperability", () => {
 			.run();
 		const gate = deferred();
 		const entered = deferred();
-		const bash = withBashWriteLock(localBackend, { ...bashInput(), cwd: alias }, async () => {
+		const bash = withLegacyWriteLock(localBackend, { ...legacyInput(), cwd: alias }, async () => {
 			entered.resolve();
 			await gate.promise;
 			await writeFile(path, "bash");
@@ -1958,7 +2822,15 @@ describe("lazy namespace, coordination and cancellation", () => {
 		expect(await readFile(path, "utf8")).toBe("new");
 		expect(operations()[0].executionOutcome).toBe("interrupted");
 		expect(effects()).toHaveLength(0);
-		expect(db.select().from(schema.workspaceWriteLeases).get()).toMatchObject({
+		const binding = failed.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
+		expect(binding.leaseId).toBeDefined();
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.leaseId, binding?.leaseId ?? "missing"))
+				.get(),
+		).toMatchObject({
 			status: "settled",
 			executionClass: "local_file_io",
 			mutationManifestJson: { mutations: [{ outcome: "applied" }] },

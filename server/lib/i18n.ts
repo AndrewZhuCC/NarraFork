@@ -32,8 +32,9 @@ const messages: Messages = {
 		"zh-CN": "用户在此工具调用执行前中断了会话。",
 	},
 	"tool.interruptedByServerRestart": {
-		en: "Tool execution was interrupted by a server restart.",
-		"zh-CN": "工具执行因服务器重启而中断。",
+		en: "The server restarted before this tool's final result was saved. If execution had started, its outcome is unknown and side effects may already have occurred. The tool was not automatically retried; inspect the actual state before retrying.",
+		"zh-CN":
+			"服务器重启时，此工具的最终结果尚未保存。如果执行已经开始，结果未知，可能已产生副作用。此工具未自动重执行，请先检查实际状态再决定是否重试。",
 	},
 	"tool.browserSessionLostAfterUpdate": {
 		en: "Your browser session(s) {ids} were lost while switching to the new version and could not be restored ({reason}). Please launch a new browser session if you still need one.",
@@ -252,31 +253,21 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	},
 	"tool.brokenToolCallReminder": {
-		en: `[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context.
+		en: `[SYSTEM: Your previous {toolNames} call(s) had invalid or missing input and were not executed. The broken calls and their results have been removed from model history to save context. Invalid input alone does not establish that an output/token limit was reached.
 
-STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
-1. Each tool call's TOTAL input must be under 10,000 characters (including file_path, old_string, new_string, content — everything).
-2. SKELETON-FIRST approach for new files: Use Write to create the file with a SKELETON — include the real opening code, then place numbered splice markers where large sections will go, then the real closing code. The skeleton itself must be under 10,000 chars. Use the file type's comment syntax for markers (e.g. // SPLICE_1 for JS/TS, {# SPLICE_1 #} for Jinja, <!-- SPLICE_1 --> for HTML). Number markers sequentially: SPLICE_1, SPLICE_2, SPLICE_3, etc.
-3. FILL via Edit: For each marker, call Edit with old_string="// SPLICE_1" (just the marker, nothing more) and new_string=<the real content for that section>. If a section is still too large, replace the marker with partial content + a new sub-marker (e.g. SPLICE_1a, SPLICE_1b).
-4. NEVER write/edit more than 10,000 characters in a single tool call. NEVER use Write to overwrite a file that already exists with content.
-5. For large replacements in existing files: split into multiple small Edit calls with different unique short anchors as old_string.]`,
-		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。
+Retry with complete, valid JSON containing all required parameters. If a large input may have exceeded the output budget, split it into smaller calls (aim for under 10,000 characters per call). For a new large file, use a skeleton-first approach: Write the opening and closing code with numbered SPLICE markers (SPLICE_1, SPLICE_2, etc.) using the file type's comment syntax, then use Edit to fill each marker with a manageable section. Do not overwrite an existing file with Write.]`,
+		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用参数无效或缺失，因此未执行。损坏的调用及其结果已从模型历史中移除以节省上下文。仅凭参数无效，无法认定触及输出或 token 上限。
 
-严格规则——你必须严格遵守以下规则，避免重复截断：
-1. 每次工具调用的总输入必须小于 10,000 字符（包括 file_path、old_string、new_string、content 等所有字段）。
-2. 骨架优先策略（新文件）：用 Write 创建文件骨架——包含真实的开头代码，然后在需要大段内容的位置放置编号的拼接标记，最后是真实的结尾代码。骨架本身必须小于 10,000 字符。根据文件类型使用对应注释语法（如 JS/TS 用 // SPLICE_1，Jinja 用 {# SPLICE_1 #}，HTML 用 <!-- SPLICE_1 -->）。标记按顺序编号：SPLICE_1、SPLICE_2、SPLICE_3 等。
-3. 用 Edit 填充：对每个标记，调用 Edit，old_string="// SPLICE_1"（只写标记本身，不要多写），new_string=<该段的真实内容>。如果某段仍然过大，将标记替换为部分内容 + 新的子标记（如 SPLICE_1a、SPLICE_1b）。
-4. 绝对不要在单次调用中写入/编辑超过 10,000 字符。绝对不要用 Write 覆盖已有内容的文件。
-5. 大范围替换已有文件：拆分为多个小 Edit，用不同的唯一短锚点作为 old_string。]`,
+请使用完整、有效的 JSON 重试，并提供全部必填参数。如果大输入可能超出输出预算，请拆分为更小的调用（建议每次小于 10,000 字符）。对于大型新文件，采用骨架优先策略：先用 Write 写入开头、结尾及编号的 SPLICE 标记（如 SPLICE_1、SPLICE_2，使用对应文件类型的注释语法），再用 Edit 逐个填充大小适中的片段。不要用 Write 覆盖已有文件。]`,
 	},
 	"tool.brokenToolCallInputPlaceholder": {
-		en: "[Content too large for single output — output was truncated]",
-		"zh-CN": "[过长的单次输出，输出被截断]",
+		en: "[Tool input invalid or missing — not executed]",
+		"zh-CN": "[工具参数无效或缺失，未执行]",
 	},
 	"tool.brokenToolCallResult": {
-		en: "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use skeleton-first approach: Write a skeleton with SPLICE markers, then Edit to fill each marker.",
+		en: "Tool input is invalid or missing — not executed. Retry with complete, valid JSON and all required parameters. This does not necessarily indicate an output/token limit; split large inputs into smaller calls if needed.",
 		"zh-CN":
-			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。",
+			"工具参数无效或缺失，未执行。请提供完整、有效的 JSON 及全部必填参数后重试。这不一定是输出或 token 上限导致；必要时将大输入拆分为更小的调用。",
 	},
 	"tool.skippedForSoftStop": {
 		en: "Tool not executed because queued user feedback requested a safe stop after the previous tool.",
@@ -690,6 +681,29 @@ Result preview: {preview}`,
 		en: "[System] The user answered your asynchronous question(s). Adjust your work accordingly — do not ask again:",
 		"zh-CN": "[系统] 用户回答了你此前异步提交的问题。请据此调整工作，不要重复提问：",
 	},
+	"sidecar.asyncQuestionReceiptHeading": {
+		en: "The user answered a historical question. The original situation and the new user answer are recorded below:",
+		"zh-CN": "用户回答了一个历史问题。以下分别记录提问时的情况与用户的新回答：",
+	},
+	"sidecar.asyncQuestionSupplementHeading": {
+		en: "The user supplied a new supplement or correction. The frozen first answers below are historical background, not a re-submission. Read earlier supplement events via Question action=get (paginated) before confirming the current decision.",
+		"zh-CN":
+			"用户提供了新的补充或纠正。下列首次答案是历史背景，并未重新提交；请通过 Question action=get 分页读取此前补充，再确认当前处理结果。",
+	},
+	"sidecar.asyncQuestionReceiptHint": {
+		en: "Historical context describes the situation at question time. Preview artifacts are omitted: Question.get returns complete previews. Treat answers and supplements as normal user requests. Judge applicability against the current task; confirm handling with Question action=resolve and the latest answerMessageId. If unclear, explain what needs clarification.",
+		"zh-CN":
+			"背景描述的是提问时的情况。回执省略预览原文，使用 Question action=get 读取完整预览。答案和补充是正常用户请求，请结合当前任务判断适用性，通过 Question action=resolve 与最新 answerMessageId 确认处理结果；需要澄清时说明缺少的信息。",
+	},
+	"sidecar.asyncQuestionDismissedReceiptHint": {
+		en: "The user skipped this item. Use your own judgement and continue; no Question action=resolve is needed. Question action=get can retrieve omitted previews when necessary.",
+		"zh-CN":
+			"用户已跳过此事项，请自行判断并继续；无需调用 Question action=resolve。需要完整预览时可通过 Question action=get 读取。",
+	},
+	"sidecar.asyncQuestionUnknownContext": {
+		en: "Question-time context is unknown.",
+		"zh-CN": "提问时背景未知。",
+	},
 	"sidecar.asyncQuestionEntry": {
 		en: "Q: {header}\nA: {answer}",
 		"zh-CN": "问：{header}\n答：{answer}",
@@ -702,6 +716,10 @@ Result preview: {preview}`,
 		en: "[System] The user chose not to answer your asynchronous question(s) — use your own best judgement and continue. Do not ask again:",
 		"zh-CN":
 			"[系统] 用户选择不回答你此前异步提交的问题 —— 请按你自己的最佳判断继续，不要重复提问：",
+	},
+	"sidecar.asyncQuestionIgnoreReason": {
+		en: "Ignored by the user; the narrator was not notified.",
+		"zh-CN": "用户已忽略此问题，未通知叙述者。",
 	},
 };
 

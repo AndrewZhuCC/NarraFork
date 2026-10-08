@@ -107,23 +107,37 @@ describe("data-only model directory adapter", () => {
 			catalogFromArchive(gzipSync(Buffer.alloc(MAX_CATALOG_BYTES + 1)), version, date),
 		).rejects.toThrow();
 	});
-	test("pins a Git SHA and rejects paths in place of revisions", () => {
-		const commit = { sha: version, commit: { committer: { date } } };
-		const url = new URL(CATALOG_REVISION_URL);
-		expect(url.pathname).toBe("/repos/NarraFork/narrafork-model-catalog/commits");
-		expect(url.searchParams.get("sha")).toBe("main");
-		expect(url.searchParams.get("per_page")).toBe("1");
-		expect(parseCatalogRevision([commit])).toEqual({ version, publishedAt: date });
-		expect(parseCatalogRevision(commit)).toEqual({ version, publishedAt: date });
+test("pins the branch head SHA and rejects malformed revisions", () => {
+	const revision = (sha: unknown, publishedAt: unknown) => ({
+		name: "main",
+		commit: { sha, commit: { committer: { date: publishedAt } } },
+	});
+	expect(new URL(CATALOG_REVISION_URL).pathname).toBe(
+		"/repos/NarraFork/narrafork-model-catalog/branches/main",
+	);
+	expect(parseCatalogRevision(revision(version, date))).toEqual({
+		version,
+		publishedAt: date,
+	});
 		for (const value of [
-			[],
-			[commit, commit],
 			null,
 			{},
-			{ sha: "../../evil" },
-			{ sha: version, commit: { committer: { date: "invalid" } } },
+			[],
+			"main",
+			{ commit: null },
+			{ commit: { sha: version } },
+			{ commit: { sha: version, commit: {} } },
+			{ sha: version, commit: { committer: { date } } },
+			revision("../../evil", date),
+			revision("a".repeat(39), date),
+			revision("A".repeat(40), date),
+			revision(123, date),
+			revision(version, "invalid"),
+			revision(version, "2026-01-01"),
+			revision(version, "2026-13-01T00:00:00Z"),
+			revision(version, null),
 		]) {
-			expect(() => parseCatalogRevision(value)).toThrow();
+			expect(() => parseCatalogRevision(value)).toThrow("Invalid catalog Git revision");
 		}
 	});
 });

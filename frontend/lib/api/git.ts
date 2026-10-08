@@ -1,4 +1,13 @@
+import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitWorkspace } from "@shared/git-workspace";
+import type {
+	WorktreeCreateRequest,
+	WorktreeCreateResult,
+	WorktreeListResult,
+	WorktreePrepareRequest,
+	WorktreePrepareResult,
+	WorktreeReconcileRequest,
+} from "@shared/narrator-worktrees";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
@@ -68,6 +77,27 @@ function gitRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 // Reads are cancellable by React Query; writes are never retried automatically.
 export const gitApi = {
+	listNarratorWorktrees: (id: string, workspaceKey: string, signal?: AbortSignal) =>
+		gitRequest<WorktreeListResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees?workspaceKey=${encodeURIComponent(workspaceKey)}`,
+			{ signal },
+		),
+	prepareNarratorWorktree: (id: string, input: WorktreePrepareRequest) =>
+		gitRequest<WorktreePrepareResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/prepare`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
+	createNarratorWorktree: (id: string, input: WorktreeCreateRequest) =>
+		gitRequest<WorktreeCreateResult>(`/narrators/${encodeURIComponent(id)}/git/worktrees`, {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/** Read-only receipt verification: POST is a bounded query, not another creation. */
+	reconcileNarratorWorktree: (id: string, input: WorktreeReconcileRequest) =>
+		gitRequest<WorktreeCreateResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/reconcile`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
 	getGitWorkspace: (
 		narratorId: string,
 		signal?: AbortSignal,
@@ -140,6 +170,24 @@ export const gitApi = {
 		}),
 	getGitLog: (target: GitTarget, limit = 50, skip = 0, signal?: AbortSignal) =>
 		gitRequest<GitLogEntry[]>(gitReadPath(target, `/log?limit=${limit}&skip=${skip}`), { signal }),
+	getGitCommitDetail: (target: GitTarget, sha: string, signal?: AbortSignal) =>
+		gitRequest<GitCommitDetail>(gitReadPath(target, `/commits/${encodeURIComponent(sha)}`), {
+			signal,
+		}),
+	getGitCommitDiff: (
+		target: GitTarget,
+		sha: string,
+		file: string,
+		oldPath?: string,
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams({ file });
+		if (oldPath) params.set("oldPath", oldPath);
+		return gitRequest<GitCommitPatch>(
+			gitReadPath(target, `/commits/${encodeURIComponent(sha)}/diff?${params}`),
+			{ signal },
+		);
+	},
 	gitReset: (target: GitTarget, commit: string, mode: "soft" | "hard") =>
 		gitRequest<ApiEntity>(`${gitBasePath(target)}/reset`, {
 			method: "POST",

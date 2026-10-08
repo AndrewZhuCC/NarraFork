@@ -22,6 +22,10 @@
  */
 
 import type { SubagentToolCallHeader } from "@frontend/lib/api";
+import {
+	handoffStreamingEditOrigin,
+	type StreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	type LivePatch,
@@ -40,7 +44,7 @@ export type ReflectionKind =
 	| "question_reflection";
 
 /** A reflection decision as delivered by `*_reflection_resolved`. */
-export type ReflectionDecision = "allow" | "deny" | "aborted" | (string & {});
+export type ReflectionDecision = "allow" | "deny" | "aborted" | "failed" | (string & {});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool lifecycle
@@ -59,6 +63,7 @@ export type ReflectionDecision = "allow" | "deny" | "aborted" | (string & {});
  * is demonstrably executing.
  */
 export function toolStartedPatch(opts: {
+	streamingEditOrigin?: StreamingEditOrigin;
 	toolUseId: string;
 	streamStartedAt?: number;
 	streamCompletedAt?: number;
@@ -69,7 +74,15 @@ export function toolStartedPatch(opts: {
 		startedAt: opts.streamStartedAt ?? Date.now(),
 		...(opts.streamStartedAt != null ? { streamStartedAt: opts.streamStartedAt } : {}),
 		...(opts.streamCompletedAt != null ? { streamCompletedAt: opts.streamCompletedAt } : {}),
-		...(opts.input ? { inputJson: opts.input } : {}),
+		...(opts.input
+			? {
+					inputJson: handoffStreamingEditOrigin(
+						opts.toolUseId,
+						opts.input,
+						opts.streamingEditOrigin,
+					),
+				}
+			: {}),
 	};
 	// Await-style tools carry their own timeout on the input; the header shows it.
 	if (typeof opts.input?.timeout === "number") fields._timeoutMs = opts.input.timeout;
@@ -395,7 +408,8 @@ export function reflectionStoppedPatch(opts: {
 export function reflectionResolvedStatus(
 	kind: ReflectionKind,
 	decision: ReflectionDecision,
-): "confirmed" | "aborted" | "cancelled" | "awaiting_user" {
+): "confirmed" | "aborted" | "cancelled" | "awaiting_user" | "failed" {
+	if (decision === "failed") return "failed";
 	if (decision === "allow") return "confirmed";
 	if (decision === "aborted") return kind === "question_reflection" ? "awaiting_user" : "aborted";
 	return "cancelled";

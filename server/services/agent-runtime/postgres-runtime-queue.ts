@@ -79,12 +79,18 @@
  * queue's earlier scratch-schema tests remain supplementary, not migration proof.
  */
 
+import {
+	type BufferQueueMode,
+	bufferedModePatch,
+	ordinaryBufferReorder,
+} from "@shared/buffer-queue-mode";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { WriteConflictError } from "../../db/backend/write-port";
 import { withPgRetry } from "../../db/pg-retry";
 import {
 	backgroundTasks,
+	runtimeAwaitedTerminalConsumptions as consumptions,
 	narratorBufferedMessages as mailbox,
 	narratorMessageRefs,
 	narrators,
@@ -94,8 +100,15 @@ import {
 } from "../../db/postgres-schema";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { lockPgNarratorRefs, restrictPgNarratorLocks } from "../narrator-refs/postgres-store";
 import { MAILBOX_LIMITS as L } from "./limits";
-import { boundedError, boundedJson, mailboxDedupeKey, pointer } from "./mailbox-shared";
+import {
+	AWAITED_TERMINAL_CONSUMED_REASON,
+	boundedError,
+	boundedJson,
+	mailboxDedupeKey,
+	pointer,
+} from "./mailbox-shared";
 import type {
 	MailboxClaim,
 	MailboxInput,
@@ -116,6 +129,7 @@ import {
 	type PublicationRun,
 	publicationDedupeKey,
 } from "./publication-outbox";
+import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
 import {
 	bindRuntimeQueue,
 	getRuntimeQueuePort,
@@ -226,10 +240,13 @@ export interface PgClaimOwner {
  * recipient message + ref through the SAME `tx`, and it must still use the reserved
  * message identity.
  */
-export type PgMaterializer = (
+export type PgMaterializer = ((
 	tx: PgRuntimeTx,
 	row: PgMailboxRow,
-) => MaterializedBinding | Promise<MaterializedBinding>;
+) => MaterializedBinding | Promise<MaterializedBinding>) & {
+	/** Read-only planning before any narrator/claim locks. Omission means recipient-only. */
+	planNarratorLocks?: (tx: PgRuntimeTx, claim: MailboxClaim) => Promise<readonly string[]>;
+};
 
 /**
  * Fail-closed verdict for the schema-dependent legacy surface. Raised by the
@@ -425,7 +442,7 @@ function claimWhere(claim: MailboxClaim) {
 }
 
 async function requireClaim(tx: PgRuntimeTx, claim: MailboxClaim): Promise<PgMailboxRow> {
-	const rows = await tx.select().from(mailbox).where(claimWhere(claim));
+	const rows = await tx.select().from(mailbox).where(claimWhere(claim)).for("update");
 	const row = rows[0];
 	if (!row) throw new Error("Stale mailbox claim");
 	return row;
@@ -712,9 +729,7 @@ export function createPostgresRuntimeQueue(
 				dedupeKey,
 				deliveryId: generateId(),
 				recipientMessageId:
-					input.kind === "agent_message"
-						? (input.recipientMessageId ?? generateId())
-						: generateId(),
+					input.kind !== "user_input" ? (input.recipientMessageId ?? generateId()) : generateId(),
 				sourceNarratorId: input.kind === "agent_message" ? input.sourceNarratorId : null,
 				sourceToolCallId: input.kind === "agent_message" ? input.sourceToolCallId : null,
 				sourceAttempt: input.kind === "agent_message" ? input.sourceAttempt : null,
@@ -827,6 +842,11 @@ export function createPostgresRuntimeQueue(
 		input: MailboxInput & { kind: "user_input" },
 		ordering: PgBufferedOrdering,
 	): Promise<PgEnqueueResult> {
+		await tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.id, input.narratorId))
+			.for("update");
 		const rows = await tx
 			.select({ id: mailbox.id, seq: mailbox.seq, priority: mailbox.priority })
 			.from(mailbox)
@@ -1072,11 +1092,104 @@ export function createPostgresRuntimeQueue(
 		return claimed;
 	}
 
+	/** One lock order for Await/commit/transfer/materialize: recipient BEFORE outbox/mailbox.
+	 * Held until transaction commit, including an async materializer's history writes. */
+	async function lockPublicationRecipient(tx: PgRuntimeTx, recipientId: string): Promise<boolean> {
+		// Bound lock waits; withPgRetry replays the whole atomic section on 55P03.
+		await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
+		const rows = await tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.id, recipientId))
+			.for("update");
+		return !!rows[0];
+	}
+	async function isAwaitedTerminal(tx: PgRuntimeTx, run: PublicationRun): Promise<boolean> {
+		const rows = await tx
+			.select({ taskId: consumptions.taskId })
+			.from(consumptions)
+			.where(
+				and(
+					eq(consumptions.producerKind, run.producerKind),
+					eq(consumptions.taskId, run.taskId),
+					eq(consumptions.logicalRunId, run.logicalRunId),
+					eq(consumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1);
+		return !!rows[0];
+	}
+	async function consumeAwaitedTerminalSection(
+		tx: PgRuntimeTx,
+		run: PublicationRun,
+		options: AwaitedTerminalConsumeOptions = {},
+	): Promise<void> {
+		assertPgRun(run);
+		if (!(await lockPublicationRecipient(tx, run.recipientId))) return;
+		const sourceResultRef = agentSourceResultRef(options.sourceResultRef);
+		if (options.sourceResultRef !== undefined && !sourceResultRef)
+			throw new Error("Invalid awaited result source reference");
+		await tx
+			.insert(consumptions)
+			.values({ ...run, consumedAt: now(), sourceResultRef: sourceResultRef ?? null })
+			.onConflictDoUpdate({
+				target: [
+					consumptions.producerKind,
+					consumptions.taskId,
+					consumptions.logicalRunId,
+					consumptions.recipientId,
+				],
+				set: {
+					sourceResultRef: sql`COALESCE(${consumptions.sourceResultRef}, ${sourceResultRef ?? null})`,
+				},
+			});
+		await tx
+			.delete(outbox)
+			.where(
+				and(
+					runWhere(run),
+					inArray(outbox.eventKind, ["terminal", "completed", "failed", "timed_out", "cancelled"]),
+				),
+			);
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		await tx
+			.update(mailbox)
+			.set({
+				state: "cancelled",
+				...releasedPayload,
+				claimToken: null,
+				claimEpoch: null,
+				claimedAt: null,
+				lastError: AWAITED_TERMINAL_CONSUMED_REASON,
+				updatedAt: now(),
+			})
+			.where(
+				and(
+					eq(mailbox.narratorId, run.recipientId),
+					eq(mailbox.kind, "task_notice"),
+					eq(mailbox.noticeKind, run.producerKind),
+					inArray(mailbox.dedupeKey, keys),
+					inArray(mailbox.state, ["queued", "claimed", "failed"]),
+					isNull(mailbox.recipientRefId),
+					isNull(mailbox.currentMessageId),
+				),
+			);
+	}
 	async function materializeSection(
 		tx: PgRuntimeTx,
 		claim: MailboxClaim,
 		materializer: PgMaterializer,
 	): Promise<PgMailboxRow> {
+		const dependencies = (await materializer.planNarratorLocks?.(tx, claim)) ?? [];
+		if (dependencies.length > L.pageSize)
+			throw new Error("Materializer narrator lock budget exceeded");
+		const narratorIds = [...new Set([claim.narratorId, ...dependencies])].sort();
+		await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
+		await lockPgNarratorRefs(tx, narratorIds);
+		restrictPgNarratorLocks(tx, narratorIds);
+		// Revalidate state/token/epoch under the claim row lock, AFTER all narrator locks.
 		const row = await requireClaim(tx, claim);
 		const binding = await materializer(tx, row);
 		if (binding.messageId !== row.recipientMessageId)
@@ -1249,7 +1362,14 @@ export function createPostgresRuntimeQueue(
 			throw new Error("Unknown legacy source can only use its failure slot");
 		if (run.logicalRunId.startsWith("legacy:completed:"))
 			throw new Error("Legacy completion can only use its captured event slot");
-		const events = options.started ? (["started", "terminal"] as const) : (["terminal"] as const);
+		await lockPublicationRecipient(tx, run.recipientId);
+		const events = (await isAwaitedTerminal(tx, run))
+			? options.started
+				? (["started"] as const)
+				: []
+			: options.started
+				? (["started", "terminal"] as const)
+				: (["terminal"] as const);
 		const existing = await tx
 			.select({ event: outbox.eventKind })
 			.from(outbox)
@@ -1332,6 +1452,9 @@ export function createPostgresRuntimeQueue(
 			throw new Error("Unknown legacy source can only publish failed outcome");
 		if (!["started", "completed", "failed", "timed_out", "cancelled"].includes(intent.eventKind))
 			throw new Error("Invalid publication event identity");
+		await lockPublicationRecipient(tx, intent.recipientId);
+		if (intent.eventKind !== "started" && (await isAwaitedTerminal(tx, intent)))
+			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
 		const dedupeKey = publicationDedupeKey(intent, intent.eventKind);
 		const delivered = await tx
 			.select({ deliveryId: mailbox.deliveryId, arrivalSeq: mailbox.arrivalSeq })
@@ -1365,12 +1488,16 @@ export function createPostgresRuntimeQueue(
 						and(runWhere(intent), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved")),
 					)
 			)[0];
-		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
-			throw new Error("Publication requires a startup reservation");
 		const recipient = await tx
 			.select({ id: narrators.id })
 			.from(narrators)
 			.where(eq(narrators.id, intent.recipientId));
+		// Await receipts cascade with their recipient; delayed terminal commits remain
+		// harmless after deletion, while existing reservations retain failed receipts.
+		if (!slot && !recipient[0] && intent.eventKind !== "started")
+			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
+		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
+			throw new Error("Publication requires a startup reservation");
 		// A reserved slot can be marked undeliverable without revoking the running producer's
 		// right to commit its terminal result. lastError on a reservation is only set by failRecipient.
 		const recipientFailure =
@@ -1411,9 +1538,10 @@ export function createPostgresRuntimeQueue(
 		status: "empty" | "full" | "transferred" | "recipient_failed";
 		deliveryId?: string;
 	}> {
-		// FOR UPDATE SKIP LOCKED: two consumers draining the same recipient never block on
-		// each other's head — the loser takes the next pending event. The row lock then
-		// carries the INSERT…DELETE pair below.
+		await lockPublicationRecipient(tx, recipientId);
+		// The recipient lock serializes consumption and transfer; retain SKIP LOCKED
+		// for unrelated maintenance owners of outbox rows. The row lock then carries
+		// the INSERT…DELETE pair below.
 		const heads = await tx
 			.select()
 			.from(outbox)
@@ -1622,6 +1750,22 @@ export function createPostgresRuntimeQueue(
 				.limit(1);
 			return rows.length > 0;
 		},
+		/** Broadcasts are consumable, but cannot authorize a new execution. */
+		async hasWakeEligibleInput(narratorId: string): Promise<boolean> {
+			pointer(narratorId);
+			const rows = await db
+				.select({ id: mailbox.id })
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.state, "queued"),
+						sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(${mailbox.metadataJson}::jsonb -> 'isBroadcast', 'false'::jsonb) != 'true'::jsonb))`,
+					),
+				)
+				.limit(1);
+			return rows.length > 0;
+		},
 		/** Single-row read for the buffered-message write paths. */
 		async getById(id: string): Promise<PgMailboxRow | undefined> {
 			pointer(id);
@@ -1658,6 +1802,8 @@ export function createPostgresRuntimeQueue(
 					state: string;
 					currentMessageId: string | null;
 					recipientMessageId: string | null;
+					kind: string;
+					lastError: string | null;
 			  }
 			| undefined
 		> {
@@ -1668,6 +1814,8 @@ export function createPostgresRuntimeQueue(
 					state: mailbox.state,
 					currentMessageId: mailbox.currentMessageId,
 					recipientMessageId: mailbox.recipientMessageId,
+					kind: mailbox.kind,
+					lastError: mailbox.lastError,
 				})
 				.from(mailbox)
 				.where(and(eq(mailbox.id, id), eq(mailbox.narratorId, narratorId)));
@@ -1694,6 +1842,31 @@ export function createPostgresRuntimeQueue(
 				.limit(1);
 			return rows.length > 0;
 		},
+		/** Named, indexed four-column receipt read; never load payloads while polling. */
+		async readUserBufferedDeliveryReceipt(
+			narratorId: string,
+			id: string,
+		): Promise<import("./runtime-queue-port").RuntimeBufferedDeliveryReceipt | undefined> {
+			pointer(narratorId);
+			pointer(id);
+			const rows = await db
+				.select({
+					id: mailbox.id,
+					state: mailbox.state,
+					recipientMessageId: mailbox.recipientMessageId,
+					lastError: mailbox.lastError,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.id, id),
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+					),
+				)
+				.limit(1);
+			return rows[0];
+		},
 		/** Wake routing/archived probe on the recipient narrator row. */
 		async readRecipientRoute(
 			narratorId: string,
@@ -1710,6 +1883,52 @@ export function createPostgresRuntimeQueue(
 		 * the FULL text size even when the body lives behind `payloadRefJson` (the
 		 * stored text is "" then) — the caller computes it from the pre-split text.
 		 */
+		updateUserBufferedMode(
+			narratorId: string,
+			id: string,
+			mode: BufferQueueMode,
+		): Promise<boolean> {
+			pointer(narratorId);
+			pointer(id);
+			return runSection("mailbox.updateUserBufferedMode", async (tx) => {
+				// Serialize admission, mode changes and reorders for this recipient.
+				await tx
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.for("update");
+				const rows = await tx
+					.select()
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							inArray(mailbox.state, ["queued", "failed"]),
+						),
+					)
+					.limit(L.userPending)
+					.for("update");
+				const row = rows.find((row) => row.id === id);
+				if (!row) return false;
+				const updated = await tx
+					.update(mailbox)
+					.set({
+						...bufferedModePatch(row, rows, mode),
+						contentRevision: row.contentRevision + 1,
+						updatedAt: now(),
+					})
+					.where(
+						and(
+							eq(mailbox.id, id),
+							inArray(mailbox.state, ["queued", "failed"]),
+							eq(mailbox.contentRevision, row.contentRevision),
+						),
+					)
+					.returning({ id: mailbox.id });
+				return updated.length === 1;
+			});
+		},
 		updateUserBuffered(
 			id: string,
 			narratorId: string,
@@ -1760,16 +1979,21 @@ export function createPostgresRuntimeQueue(
 			});
 		},
 		/**
-		 * Full-set reorder of the pending user queue: `ids` must be exactly the
-		 * current pending set, then seq=index and priority=false are written in
-		 * order. Anything else returns false with no writes (the section rolls back).
+		 * Reorder only ordinary pending inputs. Complete legacy lists are accepted
+		 * if the immutable guidance prefix is unchanged; ordinary-only lists are
+		 * accepted too. Guidance metadata, priority and FIFO order remain untouched.
 		 */
 		reorderUserPending(narratorId: string, ids: readonly string[]): Promise<boolean> {
 			pointer(narratorId);
 			for (const id of ids) pointer(id);
 			return runSection("mailbox.reorderUserPending", async (tx) => {
+				await tx
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.for("update");
 				const rows = await tx
-					.select({ id: mailbox.id })
+					.select()
 					.from(mailbox)
 					.where(
 						and(
@@ -1778,18 +2002,12 @@ export function createPostgresRuntimeQueue(
 							inArray(mailbox.state, ["queued", "failed"]),
 						),
 					)
-					.limit(L.userPending);
-				if (
-					!rows.length ||
-					ids.length !== rows.length ||
-					new Set(ids).size !== ids.length ||
-					rows.some((row) => !ids.includes(row.id))
-				)
-					return false;
-				// Explicit user ordering supersedes front-insertion priority. Clear the
-				// badge too, so display, peek and claim agree without changing other kinds.
-				for (const [seq, id] of ids.entries())
-					await tx.update(mailbox).set({ seq, priority: false }).where(eq(mailbox.id, id));
+					.limit(L.userPending)
+					.for("update");
+				const ordinary = ordinaryBufferReorder(rows, ids);
+				if (!rows.length || !ordinary) return false;
+				for (const [seq, id] of ordinary.entries())
+					await tx.update(mailbox).set({ seq }).where(eq(mailbox.id, id));
 				return true;
 			});
 		},
@@ -2301,6 +2519,14 @@ export function createPostgresRuntimeQueue(
 	};
 
 	const outboxStore = {
+		consumeAwaitedTerminal(
+			run: PublicationRun,
+			options: AwaitedTerminalConsumeOptions = {},
+		): Promise<void> {
+			return runSection("outbox.consumeAwaitedTerminal", (tx) =>
+				consumeAwaitedTerminalSection(tx, run, options),
+			);
+		},
 		reserveRunSlots(
 			run: PublicationRun,
 			options: { started?: boolean } = {},
@@ -3228,6 +3454,7 @@ export function createPostgresRuntimeQueue(
 		): Promise<{ status: "reserved"; logicalRunId: string } | { status: "full" }> =>
 			reserveRunSlotsSection(tx, run, options),
 		commitIntent: (tx: PgRuntimeTx, intent: PublicationIntent) => commitIntentSection(tx, intent),
+		consumeAwaitedTerminal: consumeAwaitedTerminalSection,
 		registerLegacyRunningRunSlots: (
 			tx: PgRuntimeTx,
 			source: LegacyPublicationSource,

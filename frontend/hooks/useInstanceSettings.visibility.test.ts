@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
-import { DEFAULT_CONTEXT_THRESHOLDS_DRAFT } from "../components/narrator/context-management/types";
+import {
+	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
+	normalizeContextManagementDraft,
+} from "../components/narrator/context-management/types";
 import en from "../locales/en/settings.json";
 import zh from "../locales/zh-CN/settings.json";
 
@@ -11,6 +14,27 @@ const section = readFileSync(
 	new URL("../components/settings/AgentSection.tsx", import.meta.url),
 	"utf8",
 );
+
+describe("permission rule auto-approval settings wiring", () => {
+	test("defaults off, forwards the administrator boundary, and persists independently of danger reflection", () => {
+		expect(hook).toContain("permissionRuleAutoApprove: false");
+		expect(hook).toContain(
+			"permissionRuleAutoApprove: settings.agent?.permissionRuleAutoApprove ?? false",
+		);
+		expect(hook).toContain("permissionRuleAutoApprove: state.permissionRuleAutoApprove");
+		expect(page).toContain('isAdmin={currentUser?.role === "admin"}');
+		expect(page).toContain("permissionRuleAutoApprove={is.permissionRuleAutoApprove}");
+		expect(page).toContain("setPermissionRuleAutoApprove={is.setPermissionRuleAutoApprove}");
+		const control = section.slice(
+			section.indexOf('label={t("permissionRuleAutoApprove")}'),
+			section.indexOf('label={t("dangerReflectionLevel")}'),
+		);
+		expect(control).toContain("checked={props.permissionRuleAutoApprove}");
+		expect(control).toContain("disabled={!props.isAdmin}");
+		expect(control).toContain("props.setPermissionRuleAutoApprove(e.currentTarget.checked)");
+		expect(control).not.toContain("setDangerReflectionLevel");
+	});
+});
 
 describe("default narrator write audience settings wiring", () => {
 	test("has an independent type and defaults missing settings to auto", () => {
@@ -99,6 +123,12 @@ describe("compaction-only context settings", () => {
 		expect(draftTypes).toContain(
 			"export const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = DEFAULT_CONTEXT_THRESHOLDS",
 		);
+		expect(
+			normalizeContextManagementDraft({
+				contextThresholds: DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
+				autoCompactKeepPairs: 2,
+			}).contextThresholds,
+		).toEqual(DEFAULT_CONTEXT_THRESHOLDS);
 		expect(hook).toContain("cloneDefaultContextThresholds()");
 		expect(panel).toContain(
 			"settingsData?.agent?.contextThresholds ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT",
@@ -106,10 +136,7 @@ describe("compaction-only context settings", () => {
 		expect(panel).toContain("current={contextThresholdSettings}");
 		for (const size of ["standard", "large"] as const) {
 			expect(section).toContain(`DEFAULT_CONTEXT_THRESHOLDS.${size}.compactStart`);
-			expect(
-				panel.includes(`DEFAULT_CONTEXT_THRESHOLDS_DRAFT.${size}.compactStart`),
-				`panel ${size} fallback must use the shared draft default`,
-			).toBe(true);
+			expect(panel).toContain(`DEFAULT_CONTEXT_THRESHOLDS_DRAFT.${size}.compactStart`);
 			expect(modal).toContain(`value={draft.contextThresholds.${size}.compactStart}`);
 			expect(modal).toContain(`DEFAULT_CONTEXT_THRESHOLDS_DRAFT.${size}.compactStart`);
 		}

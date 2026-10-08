@@ -30,12 +30,11 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconEyeOff,
-	IconFile,
-	IconFolder,
 	IconRefresh,
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { FileTreeIcon } from "./file-icons";
 import { TREE_ROOT_KEY } from "./tree-patch";
 import type { TreeEntry, TreeLineStats, TreeState } from "./tree-store";
 import { useFileTree } from "./useFileTree";
@@ -60,6 +59,8 @@ const TRUNCATED_PREFIX = "\u0000truncated:";
 export interface FileTreeContentProps {
 	/** Absolute path of the tree root — the narrator's cwd. */
 	root: string;
+	/** Frozen device/revision/context identity supplied by the narrator-bound host. */
+	contextKey?: string;
 	showHidden: boolean;
 	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
@@ -111,6 +112,7 @@ function buildNodes(
 
 export function FileTreeContent({
 	root,
+	contextKey,
 	showHidden,
 	lineStats,
 	lineStatsTruncated = false,
@@ -119,7 +121,11 @@ export function FileTreeContent({
 	registerIngest,
 }: FileTreeContentProps) {
 	const { t } = useTranslation("narrator");
-	const { state, loading, errors, load, reload, reloadAll, ingest } = useFileTree(root, showHidden);
+	const { state, loading, errors, load, reload, reloadAll, ingest } = useFileTree(
+		root,
+		showHidden,
+		contextKey,
+	);
 
 	// Hand the patch entry point to the panel, which owns the WS subscription. In an
 	// effect rather than the render body: publishing a callback is a side effect, and
@@ -314,12 +320,12 @@ function FileTreeRow({
 					) : (
 						<IconChevronRight size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
 					)}
-					<IconFolder size={14} style={{ flexShrink: 0, opacity: 0.75 }} />
+					<FileTreeIcon name={entry.name} isDirectory expanded={expanded} />
 				</>
 			) : (
 				<>
 					<Box style={{ width: 14, flexShrink: 0 }} />
-					<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+					<FileTreeIcon name={entry.name} isDirectory={false} />
 				</>
 			)}
 			<Text

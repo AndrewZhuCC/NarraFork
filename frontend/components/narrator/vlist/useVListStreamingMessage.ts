@@ -21,8 +21,11 @@
  * error.
  */
 
+import { textDocumentStore } from "@frontend/lib/text-document-store";
+import type { TextDocumentRangeReader } from "@shared/pretext-layout/text-document";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
+import { documentWriteInput, receiveWriteDocument } from "../content/document-source";
 import {
 	buildStreamingMsg,
 	type StreamingBlock,
@@ -40,7 +43,6 @@ import {
 	applyExactStreamingSnapshotUpdate,
 	type StreamDeltaEvent,
 } from "./exact-streaming-accumulator";
-import { resetStreamingBlockCache } from "./streaming-block-cache";
 import { type HandoffMessage, projectStreamingMessage } from "./streaming-handoff";
 import {
 	applyStreamingSendDelivery,
@@ -51,10 +53,13 @@ import {
 	applyStreamingToolOutput,
 	applyStreamingToolProgress,
 	applyStreamingToolStarted,
+	collectPersistedDocumentPins,
 	collectPersistedToolUseIds,
 	createStreamingToolStore,
 	dropDiscardedStreamingTools,
 	dropPersistedStreamingTools,
+	isRetiredStreamingDocument,
+	isTextDocumentPersisted,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
@@ -68,6 +73,7 @@ export interface UseVListStreamingMessageOptions {
 	isSubagent?: boolean;
 	/** Actual loaded document: the sole evidence that a block is visible elsewhere. */
 	committedMessages?: readonly HandoffMessage[];
+	fetchTextDocumentRange?: TextDocumentRangeReader;
 }
 
 /**
@@ -90,9 +96,20 @@ export function useVListStreamingMessage(
 	// Raw text never takes a committed (citation-cleaned) value as its seed. A
 	// checkpoint only removes the display copy; later deltas still append here.
 	const blocksRef = useRef<StreamingBlock[]>([]);
+	const identityRef = useRef<{ model?: string; provider?: string }>({});
 	const ownerRef = useRef(narratorId);
 	const finalizedRef = useRef(new Map<string, number>());
 	const toolStoreRef = useRef(createStreamingToolStore());
+	const documentOwnersRef = useRef(
+		new Map<
+			string,
+			{
+				id: string;
+				epoch: string;
+				release: (discard?: boolean) => void;
+			}
+		>(),
+	);
 	/** Pending output throttle state per tool (latest preview + its timer). */
 	const outputThrottleRef = useRef<
 		Map<
@@ -117,6 +134,36 @@ export function useVListStreamingMessage(
 		});
 	}, []);
 
+	// Pins belong to this streaming surface, not to a mounted body row: a Write
+	// can be collapsed/offscreen while its only source is still arriving.
+	const syncDocumentOwner = useCallback((toolUseId: string, discard = false) => {
+		const previous = documentOwnersRef.current.get(toolUseId);
+		const document = toolStoreRef.current.get(toolUseId)?.textDocument;
+		if (!document) {
+			documentOwnersRef.current.delete(toolUseId);
+			previous?.release(discard);
+			return;
+		}
+		if (previous?.id === document.id && previous.epoch === document.epoch) return;
+		const known = textDocumentStore.getSnapshot(document.id);
+		if (known?.epoch !== document.epoch) return;
+		const release = textDocumentStore.retainSource(document.id);
+		documentOwnersRef.current.set(toolUseId, { id: document.id, epoch: document.epoch, release });
+		previous?.release();
+	}, []);
+	const retireMissingDocuments = useCallback(
+		(discard = false) => {
+			for (const toolUseId of documentOwnersRef.current.keys()) {
+				if (!toolStoreRef.current.has(toolUseId)) syncDocumentOwner(toolUseId, discard);
+			}
+		},
+		[syncDocumentOwner],
+	);
+	const releaseDocuments = useCallback((discard = false) => {
+		for (const owner of documentOwnersRef.current.values()) owner.release(discard);
+		documentOwnersRef.current.clear();
+	}, []);
+
 	const clearOutputTimers = useCallback(() => {
 		for (const state of outputThrottleRef.current.values()) {
 			if (state.timer) clearTimeout(state.timer);
@@ -124,23 +171,28 @@ export function useVListStreamingMessage(
 		outputThrottleRef.current.clear();
 	}, []);
 
-	const clearBlocks = useCallback(() => {
-		if (rafRef.current) {
-			cancelAnimationFrame(rafRef.current);
-			rafRef.current = 0;
-		}
-		clearOutputTimers();
-		finalizedRef.current.clear();
-		liveBlockRef.current = null;
-		snapshotEpochRef.current = undefined;
-		snapshotBlocksRef.current = new WeakSet();
-		const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
-		if (hadContent) {
-			blocksRef.current = [];
-			toolStoreRef.current = createStreamingToolStore();
-			setVersion((value) => value + 1);
-		}
-	}, [clearOutputTimers]);
+	const clearBlocks = useCallback(
+		(discardDocuments = false) => {
+			if (rafRef.current) {
+				cancelAnimationFrame(rafRef.current);
+				rafRef.current = 0;
+			}
+			clearOutputTimers();
+			releaseDocuments(discardDocuments);
+			finalizedRef.current.clear();
+			identityRef.current = {};
+			liveBlockRef.current = null;
+			snapshotEpochRef.current = undefined;
+			snapshotBlocksRef.current = new WeakSet();
+			const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
+			if (hadContent) {
+				blocksRef.current = [];
+				toolStoreRef.current = createStreamingToolStore();
+				setVersion((value) => value + 1);
+			}
+		},
+		[clearOutputTimers, releaseDocuments],
+	);
 
 	// Reset accumulation whenever the target narrator changes or streaming is
 	// disabled (the narrator left the active state, or unmount).
@@ -153,13 +205,6 @@ export function useVListStreamingMessage(
 		clearBlocks();
 	}, [narratorId, clearBlocks]);
 
-	// Release the incremental markdown prefixes tied to this narrator's streaming
-	// rows, so a long session does not retain prepared blocks per turn.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator-scoped cache reset
-	useEffect(() => {
-		return () => resetStreamingBlockCache();
-	}, [narratorId]);
-
 	// Per-tool hand-off: retire each synthetic card exactly when a persisted message
 	// carrying its tool-use id lands. Independent of the row-level hand-off because a
 	// turn persists its tools progressively — an early tool's real card can exist
@@ -168,11 +213,24 @@ export function useVListStreamingMessage(
 		() => collectPersistedToolUseIds(committedMessages),
 		[committedMessages],
 	);
+	const persistedDocumentPins = useMemo(
+		() => collectPersistedDocumentPins(committedMessages),
+		[committedMessages],
+	);
 	useEffect(() => {
-		if (dropPersistedStreamingTools(toolStoreRef.current, persistedToolUseIds)) {
+		if (
+			dropPersistedStreamingTools(
+				toolStoreRef.current,
+				persistedToolUseIds,
+				(chunk) =>
+					!!chunk.textDocument &&
+					isTextDocumentPersisted(chunk.textDocument, persistedDocumentPins),
+			)
+		) {
+			retireMissingDocuments();
 			setVersion((value) => value + 1);
 		}
-	}, [persistedToolUseIds]);
+	}, [persistedToolUseIds, persistedDocumentPins, retireMissingDocuments]);
 
 	// Final message events seal ids, but only the actual document may release their
 	// raw bodies. A late final/checkpoint cannot clear a newer revision or NEW id.
@@ -300,19 +358,74 @@ export function useVListStreamingMessage(
 					flush();
 				}
 			},
+			onStreamingIdentity: (identity) => {
+				if (!isSubagent && identity.parentToolUseId) return;
+				if (
+					identityRef.current.model !== identity.model ||
+					identityRef.current.provider !== identity.provider
+				) {
+					identityRef.current = { model: identity.model, provider: identity.provider };
+					flush();
+				}
+			},
 			onStreamingSnapshot: (snapshot) => {
+				// Old-server snapshots omit identity; never erase a newer live identity.
+				const identity = {
+					model: snapshot.model ?? identityRef.current.model,
+					provider: snapshot.provider ?? identityRef.current.provider,
+				};
+				if (
+					identityRef.current.model !== identity.model ||
+					identityRef.current.provider !== identity.provider
+				) {
+					identityRef.current = identity;
+					flush();
+				}
 				let toolsChanged = false;
 				for (const chunk of snapshot.toolChunks) {
 					if (!isSubagent && chunk.parentToolUseId) continue;
-					if (persistedToolUseIds.has(chunk.toolUseId)) continue;
+					if (
+						chunk.inputDocument
+							? isTextDocumentPersisted(chunk.inputDocument.ref, persistedDocumentPins)
+							: persistedToolUseIds.has(chunk.toolUseId)
+					)
+						continue;
+					if (
+						chunk.inputDocument &&
+						isRetiredStreamingDocument(
+							toolStoreRef.current,
+							chunk.toolUseId,
+							chunk.inputDocument.ref,
+						)
+					)
+						continue;
+					const inputDocument = chunk.inputDocument
+						? {
+								...chunk.inputDocument,
+								ref: receiveWriteDocument(
+									chunk.inputDocument,
+									undefined,
+									options.fetchTextDocumentRange,
+								),
+							}
+						: undefined;
 					// A name-only tool may receive no more deltas for a long time.
 					// Restore it from the subscription snapshot, not the next live event.
-					toolsChanged = applyStreamingToolChunk(toolStoreRef.current, chunk) || toolsChanged;
+					toolsChanged =
+						applyStreamingToolChunk(toolStoreRef.current, { ...chunk, inputDocument }) ||
+						toolsChanged;
 					if (chunk.started) {
 						toolsChanged =
 							applyStreamingToolStarted(toolStoreRef.current, {
 								...chunk,
-								input: chunk.input as Record<string, unknown> | undefined,
+								input: (chunk.toolName === "Write" && narratorId
+									? documentWriteInput(
+											narratorId,
+											chunk.toolUseId,
+											chunk.input,
+											chunk.inputDocument?.ref.source,
+										)
+									: chunk.input) as Record<string, unknown> | undefined,
 							}) || toolsChanged;
 					}
 					if (chunk.executing) {
@@ -334,6 +447,7 @@ export function useVListStreamingMessage(
 								chunk.structuredProgress,
 							) || toolsChanged;
 					}
+					syncDocumentOwner(chunk.toolUseId);
 				}
 				const applied = applyExactStreamingSnapshotUpdate(
 					blocksRef.current,
@@ -368,14 +482,17 @@ export function useVListStreamingMessage(
 				// The owning page receives the reset without a parentToolUseId; the
 				// parent-page duplicate keeps it set and must be ignored here.
 				if (parentToolUseId) return;
-				clearBlocks();
+				clearBlocks(true);
 			},
 			// A replayed attempt abandoned these tool ids mid-arguments. They never
 			// persisted, so the structural hand-off has no replacement to wait for and
 			// would keep the cards spinning forever.
 			onToolUseDiscarded: (toolUseIds, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;
-				if (dropDiscardedStreamingTools(toolStoreRef.current, toolUseIds)) flush();
+				if (dropDiscardedStreamingTools(toolStoreRef.current, toolUseIds)) {
+					retireMissingDocuments(true);
+					flush();
+				}
 			},
 
 			// ── Native provider blocks ──────────────────────────────────────────
@@ -459,8 +576,24 @@ export function useVListStreamingMessage(
 				extractedFields,
 				metadata,
 				streamingField,
+				_meta,
+				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
+				if (
+					inputDocument &&
+					isRetiredStreamingDocument(toolStoreRef.current, toolUseId, inputDocument.ref)
+				)
+					return;
+				if (inputDocument)
+					inputDocument = {
+						...inputDocument,
+						ref: receiveWriteDocument(
+							inputDocument,
+							streamingField?.delta,
+							options.fetchTextDocumentRange,
+						),
+					};
 				// The model is writing tool arguments, so no text lane is open: whatever
 				// reasoning or text preceded this is finished and must settle now instead of
 				// waiting for the turn to persist.
@@ -475,9 +608,11 @@ export function useVListStreamingMessage(
 						...(extractedFields !== undefined ? { extractedFields } : {}),
 						...(metadata !== undefined ? { metadata } : {}),
 						...(streamingField ? { streamingField } : {}),
+						...(inputDocument ? { inputDocument } : {}),
 					})
 				)
 					flush();
+				syncDocumentOwner(toolUseId);
 			},
 			onToolStarted: (
 				toolUseId,
@@ -487,19 +622,42 @@ export function useVListStreamingMessage(
 				input,
 				rawParentToolUseId,
 				meta,
+				streamingEditOrigin,
+				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
+				if (
+					inputDocument &&
+					isRetiredStreamingDocument(toolStoreRef.current, toolUseId, inputDocument.ref)
+				)
+					return;
+				if (inputDocument)
+					receiveWriteDocument(inputDocument, undefined, options.fetchTextDocumentRange);
 				if (
 					applyStreamingToolStarted(toolStoreRef.current, {
 						toolUseId,
 						toolName,
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
-						...(input ? { input } : {}),
+						...(input
+							? {
+									input: (toolName === "Write" && narratorId
+										? documentWriteInput(
+												narratorId,
+												toolUseId,
+												input,
+												inputDocument?.ref.source ??
+													(meta?.toolCallId ? { toolCallId: meta.toolCallId } : undefined),
+											)
+										: input) as Record<string, unknown>,
+								}
+							: {}),
 						...(meta ? { metadata: meta as Record<string, unknown> } : {}),
+						...(streamingEditOrigin ? { streamingEditOrigin } : {}),
 					})
 				)
 					flush();
+				syncDocumentOwner(toolUseId);
 			},
 			// Execution actually began (permission granted). Separate from onToolStarted,
 			// which only means the input finished parsing — see streaming-tool-chunks.ts.
@@ -524,11 +682,19 @@ export function useVListStreamingMessage(
 						status,
 						...(output !== undefined ? { output } : {}),
 						...(durationMs != null ? { durationMs } : {}),
-						...(updatedInput ? { updatedInput } : {}),
+						...(updatedInput
+							? {
+									updatedInput: (toolStoreRef.current.get(toolUseId)?.toolName === "Write" &&
+									narratorId
+										? documentWriteInput(narratorId, toolUseId, updatedInput)
+										: updatedInput) as Record<string, unknown>,
+								}
+							: {}),
 						...(metadata ? { metadata } : {}),
 					})
 				)
 					flush();
+				syncDocumentOwner(toolUseId);
 			},
 			// Live stdout of a running command. Throttled per tool: a build emitting
 			// megabytes would otherwise re-render the row on every socket frame.
@@ -568,6 +734,7 @@ export function useVListStreamingMessage(
 		const toolChunksMsg =
 			chunks.length > 0 ? buildTopLevelStreamingChunksMsg(chunks, narratorId, null) : null;
 		const streaming = buildStreamingMsg({
+			...identityRef.current,
 			streamingBlocks: blocksRef.current,
 			toolChunksMsg,
 			narratorId,

@@ -1,13 +1,17 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
+import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import {
+	apiRequests,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import type { TokenUsageSnapshot } from "../narrator-event-handler";
 
 // Functional in-memory test db (not empty stubs): Bun's mock.module is global
 // and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
@@ -52,7 +56,224 @@ const PARENT_NARRATOR_ID = "parent-narrator";
 const SUBAGENT_NARRATOR_ID = "subagent-narrator";
 const PARENT_TOOL_USE_ID = "parent-tool-use";
 
+describe("Write complete input source routing", () => {
+	test("child source and descriptor go only to self; parent remains a bounded summary", async () => {
+		const ctx = makeSubagentContext();
+		await processEvent(
+			{
+				type: "tool_use_chunk",
+				toolUseId: "write-private",
+				toolName: "Write",
+				inputCharsTotal: 20,
+				streamingField: {
+					name: "content",
+					delta: "private\r\n\ud800",
+					startsField: true,
+					offset: 0,
+				},
+			},
+			ctx,
+		);
+		const messages = broadcastMessages as Array<Record<string, unknown>>;
+		const parent = messages[broadcastTargets.indexOf(PARENT_NARRATOR_ID)];
+		const self = messages[broadcastTargets.indexOf(SUBAGENT_NARRATOR_ID)];
+		expect(parent).not.toHaveProperty("inputDocument");
+		expect(parent).not.toHaveProperty("streamingField");
+		expect(self.inputDocument).toBeDefined();
+		const descriptor =
+			getStreamingSnapshot(SUBAGENT_NARRATOR_ID)?.toolChunks.get("write-private")?.inputDocument;
+		expect(descriptor?.ref.length).toBe(10);
+		expect(descriptor?.ref.source?.narratorId).toBe(SUBAGENT_NARRATOR_ID);
+		expect(
+			JSON.stringify(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("write-private")),
+		).not.toContain("private\\r");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!descriptor) throw new Error("missing descriptor");
+		expect(
+			(await toolInputStreamSource.getTextDocumentRange(SUBAGENT_NARRATOR_ID, descriptor.ref.id))
+				.text,
+		).toBe("private\r\n\ud800");
+		await expect(
+			toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, descriptor.ref.id),
+		).rejects.toMatchObject({ statusCode: 404 });
+	});
+
+	test("field closure before persistence stays readable without putting complete content in started/snapshot", async () => {
+		const ctx = makeMainContext();
+		await processEvent(
+			{
+				type: "tool_use_chunk",
+				toolUseId: "write-seal",
+				toolName: "Write",
+				inputCharsTotal: 7,
+				streamingField: { name: "content", delta: "before", offset: 0, startsField: true },
+			},
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "write-seal",
+				toolName: "Write",
+				input: { file_path: "file.txt", content: "beforeafter" },
+			},
+			ctx,
+		);
+		const started = (broadcastMessages as Array<Record<string, unknown>>).find(
+			(message) => message.type === "tool_started",
+		);
+		expect(started?.input).toEqual({ file_path: "file.txt" });
+		const descriptor =
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("write-seal")?.inputDocument;
+		expect(descriptor?.ref.complete).toBe(true);
+		expect(
+			JSON.stringify(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("write-seal")),
+		).not.toContain("beforeafter");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!descriptor) throw new Error("missing descriptor");
+		expect(
+			(await toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, descriptor.ref.id))
+				.text,
+		).toBe("beforeafter");
+	});
+
+	test("startsField restart explicitly switches epoch instead of appending into an old decoded field", async () => {
+		const ctx = makeMainContext();
+		const chunk = {
+			type: "tool_use_chunk" as const,
+			toolUseId: "restarted-field",
+			toolName: "Write",
+			inputCharsTotal: 5,
+			streamingField: { name: "content", delta: "first", offset: 0, startsField: true },
+		};
+		await processEvent(chunk, ctx);
+		const first = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		await processEvent(
+			{ ...chunk, streamingField: { ...chunk.streamingField, delta: "replacement" } },
+			ctx,
+		);
+		const next = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		expect(next?.epoch).not.toBe(first?.epoch);
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!next) throw new Error("missing descriptor");
+		expect(
+			(await toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, next.id)).text,
+		).toBe("replacement");
+	});
+
+	test("discarded provider id retry changes source identity and retires the abandoned source", async () => {
+		const ctx = makeMainContext();
+		const chunk = {
+			type: "tool_use_chunk" as const,
+			toolUseId: "same-provider-id",
+			toolName: "Write",
+			inputCharsTotal: 5,
+			streamingField: { name: "content", delta: "first", offset: 0, startsField: true },
+		};
+		await processEvent(chunk, ctx);
+		const first = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		await processEvent({ type: "tool_use_discarded", toolUseIds: [chunk.toolUseId] }, ctx);
+		await processEvent(
+			{ ...chunk, streamingField: { ...chunk.streamingField, delta: "retry" } },
+			ctx,
+		);
+		const next = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		expect(first?.id).not.toBe(next?.id);
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!first) throw new Error("missing descriptor");
+		await expect(
+			toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, first.id),
+		).rejects.toMatchObject({ statusCode: 404 });
+	});
+});
+
 describe("request attribution", () => {
+	test("persists the actual request identity on the first content checkpoint", async () => {
+		const id = "request-checkpoint-identity";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			model: "__default__",
+			provider: "configured-provider",
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		try {
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: "checkpoint-request",
+					model: "gpt-resolved",
+					provider: "openai",
+				},
+				ctx,
+			);
+			expect(ctx).toMatchObject({ model: "gpt-resolved", provider: "openai" });
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason-checkpoint", text: "Actual reasoning" },
+				},
+				ctx,
+			);
+			expect(partialId).toBeDefined();
+			const persisted = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId as string),
+			});
+			expect(persisted).toMatchObject({ model: "gpt-resolved", provider: "openai" });
+			expect(persisted?.contentJson).toMatchObject([
+				{ type: "reasoning", text: "Actual reasoning" },
+			]);
+		} finally {
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+	test("publishes actual request identity to live clients and author reconnect snapshots", async () => {
+		for (const child of [false, true]) {
+			const ctx = child ? makeSubagentContext() : makeMainContext();
+			ctx.model = "configured-default";
+			ctx.provider = "configured-provider";
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: `identity-${child}`,
+					model: child ? "gpt-child" : "gpt-actual",
+					provider: "actual-provider",
+				},
+				ctx,
+			);
+			expect(getStreamingSnapshot(ctx.narratorId)).toMatchObject({
+				model: child ? "gpt-child" : "gpt-actual",
+				provider: "actual-provider",
+			});
+			const identities = (broadcastMessages as Array<Record<string, unknown>>).filter(
+				(message) => message.type === "streaming_identity",
+			);
+			expect(identities.at(-1)).toMatchObject({
+				model: child ? "gpt-child" : "gpt-actual",
+				provider: "actual-provider",
+			});
+			if (child) {
+				expect(identities.at(-2)).toMatchObject({ parentToolUseId: PARENT_TOOL_USE_ID });
+				expect(identities.at(-1)).not.toHaveProperty("parentToolUseId");
+				expect(broadcastTargets.at(-1)).toBe(SUBAGENT_NARRATOR_ID);
+				expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.model).toBe("gpt-actual");
+			}
+		}
+	});
 	test("subagent request keeps its event owner rather than the later pass owner", async () => {
 		const ctx = makeSubagentContext();
 		ctx.userId = "later-user";
@@ -138,6 +359,149 @@ async function cleanupFileContextNarrator(id: string) {
 		sqlite.run("PRAGMA foreign_keys = ON");
 	}
 }
+
+describe("request occupancy is independent from billing and historical usage", () => {
+	test("real usage explicitly clears sticky estimate state in memory, WS and SSE", async () => {
+		let usage: TokenUsageSnapshot = { promptTokens: 42, inputTokens: 42, isEstimated: true };
+		const sse = new EventEmitter();
+		const sseEvents: Array<{ data: Record<string, unknown> }> = [];
+		sse.on("event", (event) => sseEvents.push(event));
+		const ctx = {
+			...makeMainContext(sse),
+			getTokenUsage: () => usage,
+			setTokenUsage: (next: TokenUsageSnapshot | undefined) => {
+				usage = next ?? {};
+			},
+		};
+		await processEvent(
+			{
+				type: "context_usage",
+				source: "upstream",
+				percentage: 92.6,
+				promptTokens: 926000,
+				contextWindow: 1_000_000,
+				isEstimated: true,
+			},
+			ctx,
+		);
+		expect(usage.promptTokens).toBe(42);
+		await processEvent(
+			{
+				type: "context_usage",
+				source: "usage",
+				percentage: 51.08,
+				promptTokens: 510800,
+				inputTokens: 510800,
+				contextWindow: 1_000_000,
+				isEstimated: false,
+			},
+			ctx,
+		);
+		expect(usage).toMatchObject({ promptTokens: 510800, inputTokens: 510800, isEstimated: false });
+		expect((broadcastMessages.at(-1) as { isEstimated?: boolean }).isEstimated).toBe(false);
+		expect(sseEvents.at(-1)?.data.isEstimated).toBe(false);
+	});
+	test("request end stores one snapshot in narrator, API row and assistant turn metadata", async () => {
+		const id = "occupancy-history-narrator";
+		const now = "2026-10-05T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		let usage: TokenUsageSnapshot | undefined;
+		let pct: number | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			provider: "anthropic",
+			model: "claude-sonnet-4-20250514",
+			getTokenUsage: () => usage,
+			setTokenUsage: (next) => {
+				usage = next;
+			},
+			getContextUsagePct: () => pct,
+			setContextUsagePct: (next) => {
+				pct = next;
+			},
+		};
+		const snapshot: ContextUsageSnapshot = {
+			requestId: "logical-occupancy-history",
+			startedAt: now,
+			source: "upstream",
+			percentage: 92.6,
+			contextWindow: 1_000_000,
+			occupiedTokens: 926000,
+			inputCharacters: { totalChars: 1_000_000, systemChars: 0, toolsChars: 0 },
+			composition: null,
+		};
+		try {
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: snapshot.requestId,
+					provider: "anthropic",
+					model: "claude-sonnet-4-20250514",
+				},
+				ctx,
+			);
+			await processEvent(
+				{
+					type: "context_usage",
+					source: "upstream",
+					percentage: 92.6,
+					promptTokens: 926000,
+					contextWindow: 1_000_000,
+					isEstimated: true,
+					snapshot,
+				},
+				ctx,
+			);
+			await processEvent(
+				{
+					type: "api_request_end",
+					requestId: snapshot.requestId,
+					contextPercent: 92.6,
+					contextSnapshot: snapshot,
+					usage: { promptTokens: 510800, inputTokens: 510800, completionTokens: 12 },
+				},
+				ctx,
+			);
+			expect(usage).toMatchObject({
+				promptTokens: 510800,
+				inputTokens: 510800,
+				isEstimated: false,
+				contextSnapshot: snapshot,
+			});
+			expect(
+				db
+					.select({ snapshot: narrators.contextUsageSnapshotJson })
+					.from(narrators)
+					.where(eq(narrators.id, id))
+					.get()?.snapshot,
+			).toEqual(snapshot);
+			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
+			expect(request?.inputTokens).toBe(510800);
+			expect(request?.contextUsageSnapshotJson).toEqual(snapshot);
+			expect(broadcastMessages.at(-1)).toMatchObject({
+				type: "context_usage",
+				promptTokens: 926000,
+				snapshot,
+			});
+			await processEvent({ type: "assistant_message", text: "answer", toolUses: [] }, ctx);
+			const message = db
+				.select({ usage: narratorMessages.turnUsageJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.usage).toMatchObject({
+				input_tokens: 510800,
+				prompt_tokens: 510800,
+				context_snapshot: snapshot,
+			});
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+});
 
 describe("streaming snapshot author isolation", () => {
 	for (const event of [
@@ -425,6 +789,44 @@ describe("assistant file-reference provenance", () => {
 });
 
 describe("narrator event handler streaming snapshot", () => {
+	test("trusted Edit origin travels in tool_started and reconnect snapshot, never model metadata", async () => {
+		const ctx = makeMainContext();
+		const input = {
+			file_path: "a.ts",
+			old_string: "h".repeat(20_000),
+			new_string: "new",
+			_streamingMetadata: { startLine: 999 },
+		};
+		const streamingEditOrigin = createStreamingEditOrigin("edit-origin", input, {
+			startLine: 42,
+			matchStatus: "matched",
+		});
+		if (!streamingEditOrigin) throw new Error("missing fixture origin");
+		await processEvent(
+			{ type: "tool_call", toolUseId: "edit-origin", toolName: "Edit", input, streamingEditOrigin },
+			ctx,
+		);
+		const frame = broadcastMessages.find(
+			(value) => (value as Record<string, unknown>).type === "tool_started",
+		) as Record<string, unknown>;
+		expect(frame.streamingEditOrigin).toEqual(streamingEditOrigin);
+		expect(
+			getStreamingSnapshot(ctx.narratorId)?.toolChunks.get("edit-origin")?.streamingEditOrigin,
+		).toEqual(streamingEditOrigin);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "model-only",
+				toolName: "Edit",
+				input: { ...input, streamingEditOrigin },
+			},
+			ctx,
+		);
+		expect(
+			getStreamingSnapshot(ctx.narratorId)?.toolChunks.get("model-only")?.streamingEditOrigin,
+		).toBeUndefined();
+		clearStreamingSnapshot(ctx.narratorId);
+	});
 	test("子代理直接 tool_call 向父级发送精简路由身份，self 保留完整 input", async () => {
 		const ctx = makeSubagentContext();
 		ctx.toolCallIdsMap?.set("direct-tool-call", "tc-direct");
@@ -1337,6 +1739,95 @@ describe("narrator event handler persistence", () => {
 		expect(discards).toEqual(["tool-row-atomic-failure"]);
 		expect(ctx.preparedPlanModeToolCalls.size).toBe(0);
 	});
+});
+
+test.each([
+	false,
+	true,
+])("discarded restart reasoning preserves fork (created after COW=%s)", async (lateFork) => {
+	const owner = `restart-owner-${Date.now()}`;
+	const fork = `${owner}-fork`;
+	const now = new Date().toISOString();
+	await db.insert(narrators).values([
+		{ id: owner, createdAt: now, updatedAt: now },
+		{ id: fork, createdAt: now, updatedAt: now },
+	]);
+	let partialId: string | undefined;
+	const ctx: EventHandlerContext = {
+		...makeMainContext(),
+		narratorId: owner,
+		broadcastTargetId: owner,
+		conversationId: owner,
+		provider: "test",
+		model: "test",
+		getPartialMessageId: () => partialId,
+		setPartialMessageId: (id) => {
+			partialId = id;
+		},
+	};
+	try {
+		await processEvent(
+			{ type: "block_complete", block: { type: "text", text: "historical prefix" } },
+			ctx,
+		);
+		await processEvent(
+			{ type: "api_request_start", requestId: "restart-attempt", provider: "test", model: "test" },
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "block_complete",
+				block: { type: "reasoning", text: "current thought", completed: true },
+			},
+			ctx,
+		);
+		if (!partialId) throw new Error("Missing persisted partial");
+		const sharedId = partialId;
+		const createFork = () =>
+			db.insert(narratorMessageRefs).values({
+				id: `${fork}-ref`,
+				narratorId: fork,
+				messageId: sharedId,
+				seq: 1,
+			});
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const originalCOW = narratorPersistence.copyOnWriteMessage.bind(narratorPersistence);
+		let forkCreated = false;
+		const cowSpy = lateFork
+			? spyOn(narratorPersistence, "copyOnWriteMessage").mockImplementation(async (...args) => {
+					const result = await originalCOW(...args);
+					if (!forkCreated) {
+						forkCreated = true;
+						await createFork();
+					}
+					return result;
+				})
+			: undefined;
+		try {
+			if (!lateFork) await createFork();
+			await processEvent({ type: "attempt_discarded", requestId: "restart-attempt" }, ctx);
+		} finally {
+			cowSpy?.mockRestore();
+		}
+		const current = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialId),
+		});
+		const snapshot = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, sharedId),
+		});
+		expect(current?.contentJson).toEqual([{ type: "text", text: "historical prefix" }]);
+		expect(JSON.stringify(snapshot?.contentJson)).toContain("current thought");
+		expect(partialId).not.toBe(sharedId);
+		expect(
+			broadcastMessages.some((message) => (message as { type: string }).type === "streaming_reset"),
+		).toBe(true);
+		expect(
+			broadcastMessages.some((message) => (message as { type: string }).type === "message_updated"),
+		).toBe(true);
+	} finally {
+		await cleanupFileContextNarrator(fork);
+		await cleanupFileContextNarrator(owner);
+	}
 });
 
 /**

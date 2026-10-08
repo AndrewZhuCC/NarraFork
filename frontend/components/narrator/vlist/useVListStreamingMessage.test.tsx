@@ -1,6 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { MantineProvider } from "@mantine/core";
+import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { act, useEffect, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -61,14 +63,24 @@ async function withStream(
 		raf: () => Promise<void>;
 		text: () => string;
 		animationCount: () => number;
+		thinkingShimmerCount: () => number;
 		animationText: () => string;
 		showOnlyKeys: (keys: readonly string[] | null) => Promise<void>;
 		coordinator: PretextLayoutCoordinator;
 		switchNarrator: (id: string, subagent?: boolean) => Promise<void>;
 		live: () => TreeMessage | null;
 	}) => Promise<void>,
-	{ animateStreaming = false }: { animateStreaming?: boolean } = {},
+	{
+		animateStreaming = false,
+		textExpanded = false,
+		keepEmptyReasoningLive = false,
+	}: {
+		animateStreaming?: boolean;
+		textExpanded?: boolean;
+		keepEmptyReasoningLive?: boolean;
+	} = {},
 ) {
+	const build = { ...BUILD, keepEmptyReasoningLive, isTextExpanded: () => textExpanded };
 	let mountEpoch = ++nextMountEpoch;
 	// Keep active tokens alive while measuring/rendering the large snapshot fixture.
 	const clock = animateStreaming ? spyOn(Date, "now").mockReturnValue(Date.now()) : null;
@@ -121,7 +133,7 @@ async function withStream(
 	const coordinator = new PretextLayoutCoordinator();
 	await coordinator.load(
 		"handoff-n",
-		BUILD,
+		build,
 		{
 			fetchPage: async () => ({
 				messages: [],
@@ -212,6 +224,7 @@ async function withStream(
 			coordinator,
 			text: () => container.textContent ?? "",
 			animationCount: () => container.querySelectorAll("span.vlist-anim-token").length,
+			thinkingShimmerCount: () => container.querySelectorAll(".nf-trace-shimmer--stream").length,
 			animationText: () =>
 				Array.from(container.querySelectorAll("span.vlist-anim-token"))
 					.map((span) => span.textContent ?? "")
@@ -231,7 +244,7 @@ async function withStream(
 					coordinator.reset();
 					await coordinator.load(
 						id,
-						BUILD,
+						build,
 						{
 							fetchPage: async () => ({
 								messages: [],
@@ -320,10 +333,36 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 					await h.raf();
 					expect(h.animationText()).toContain("新段落首批");
 				},
-				{ animateStreaming: true },
+				// Full-history animation is tested after opting out of the tail preview.
+				{ animateStreaming: true, textExpanded: true },
 			);
 		});
 	}
+
+	it("the default long reasoning preview keeps new tails visible without mounting its history", async () => {
+		await withStream(async (h) => {
+			const body = `HIDDEN_HEAD\n\n${"long historical reasoning text。\n".repeat(1500)}VISIBLE_TAIL`;
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [content("reasoning", "bounded-body", body, 1, 0)],
+				toolChunks: [],
+			});
+			await h.raf();
+			const first = h.coordinator.getSnapshot().items?.[0]?.measured;
+			expect(first?.textPreview?.sourceText).toBe(body);
+			expect(first?.textPreview?.direction).toBe("tail");
+			expect(first?.height).toBeLessThan(350);
+			expect(h.text()).toContain("VISIBLE_TAIL");
+			expect(h.text()).not.toContain("HIDDEN_HEAD");
+			await h.delta(content("reasoning", "bounded-body", "最新尾部", 2, body.length));
+			await h.raf();
+			const updated = h.coordinator.getSnapshot().items?.[0]?.measured;
+			expect(updated?.height).toBe(first?.height);
+			expect(updated?.textPreview?.sourceText).toBe(`${body}最新尾部`);
+			expect(h.text()).toContain("最新尾部");
+			expect(h.text().length).toBeLessThan(5000);
+		});
+	});
 
 	it("seals an offscreen snapshot block on late mount but animates a genuinely new live block", async () => {
 		await withStream(
@@ -495,6 +534,58 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 });
 
 describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
+	it("keeps actual request identity through live deltas and checkpoint projection", async () => {
+		await withStream(async (h) => {
+			await h.frame({ type: "streaming_identity", model: "gpt-actual", provider: "openai" });
+			await h.delta(content("reasoning", "r", "Reasoning"));
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-actual", provider: "openai" });
+			await h.commit([content("reasoning", "r", "Reasoning")]);
+			await h.delta(content("text", "t", "Next"));
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-actual", provider: "openai" });
+			await h.frame({
+				type: "streaming_identity",
+				model: "child-model",
+				provider: "anthropic",
+				parentToolUseId: "child-tool",
+			});
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-actual", provider: "openai" });
+		});
+	});
+
+	it("restores request identity from snapshots and refreshes unchanged text on identity change", async () => {
+		await withStream(async (h) => {
+			const streamingBlocks = [content("reasoning", "r", "Reasoning")];
+			await h.frame({
+				type: "streaming_snapshot",
+				model: "gpt-reconnected",
+				provider: "openai",
+				streamingBlocks,
+				toolChunks: [],
+			});
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-reconnected", provider: "openai" });
+			await h.frame({
+				type: "streaming_snapshot",
+				model: "claude-reconnected",
+				provider: "anthropic",
+				streamingBlocks,
+				toolChunks: [],
+			});
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "claude-reconnected", provider: "anthropic" });
+			await h.frame({ type: "streaming_snapshot", streamingBlocks, toolChunks: [] });
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "claude-reconnected", provider: "anthropic" });
+			await h.frame({ type: "streaming_reset" });
+			await h.delta(content("text", "fresh", "Fresh"));
+			await h.raf();
+			expect(h.live()?.model).toBeUndefined();
+			expect(h.live()?.provider).toBeUndefined();
+		});
+	});
 	it("restores a name-only tool after switching back without another live event", async () => {
 		await withStream(async (h) => {
 			const chunk = { toolUseId: "quiet-write", toolName: "Write", inputCharsTotal: 0 };
@@ -863,6 +954,118 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			await h.frame({ type: "status_change", status: "idle" });
 			await h.raf();
 			expect(h.live()).toBeNull();
+		});
+	});
+});
+
+describe("hidden reasoning waiting shimmer through WS / coordinator / DOM", () => {
+	it("keeps a sealed empty block thinking until answer text actually starts", async () => {
+		await withStream(
+			async (h) => {
+				const empty = content("reasoning", "hidden-r", "");
+				await h.commit([empty], true);
+				await h.raf();
+				expect(h.live()).toBeNull();
+				expect(h.text()).toContain("thinking");
+				expect(h.thinkingShimmerCount()).toBe(1);
+				await h.raf();
+				expect(h.thinkingShimmerCount()).toBe(1);
+				await h.delta(content("text", "answer", "Answer started"));
+				await h.raf();
+				expect(h.text()).toContain("Answer started");
+				expect(h.thinkingShimmerCount()).toBe(0);
+			},
+			{ keepEmptyReasoningLive: true },
+		);
+	});
+
+	it("stops the waiting shimmer as soon as tool arguments start", async () => {
+		await withStream(
+			async (h) => {
+				await h.commit([content("reasoning", "hidden-r", "")], true);
+				await h.raf();
+				expect(h.text()).toContain("thinking");
+				await h.frame({
+					type: "tool_use_chunk",
+					toolUseId: "new-tool",
+					toolName: "Read",
+					inputCharsTotal: 1,
+				});
+				await h.raf();
+				expect(h.text()).not.toContain("thinking");
+			},
+			{ keepEmptyReasoningLive: true },
+		);
+	});
+
+	it("stops the waiting shimmer on the active-to-idle rebuild without a new message", async () => {
+		await withStream(
+			async (h) => {
+				await h.commit([content("reasoning", "hidden-r", "")], true);
+				await h.raf();
+				expect(h.thinkingShimmerCount()).toBe(1);
+				await act(async () => {
+					h.coordinator.rebuild({ ...BUILD, keepEmptyReasoningLive: false });
+				});
+				expect(h.thinkingShimmerCount()).toBe(0);
+				expect(h.text()).not.toContain("thinking");
+			},
+			{ keepEmptyReasoningLive: true },
+		);
+	});
+});
+describe("streaming Write source ownership", () => {
+	it("retires a complete local Write on reset without switching narrators", async () => {
+		await withStream(async (h) => {
+			const body = `FIRST${"source-row\n".repeat(5000)}LAST`;
+			await h.frame({
+				type: "tool_started",
+				toolCallId: null,
+				toolUseId: "memory-reset-write",
+				toolName: "Write",
+				input: { file_path: "memory-reset.ts", content: body },
+			});
+			await h.raf();
+			const input = h.live()?.toolCalls?.find((call) => call.toolUseId === "memory-reset-write")
+				?.inputJson as { textDocument?: unknown } | undefined;
+			if (!isTextDocumentRef(input?.textDocument)) throw new Error("Write source missing");
+			const document = input.textDocument;
+			expect(await textDocumentStore.readAll(document.id)).toBe(body);
+			expect(textDocumentStore.stats().sourceOwners).toBeGreaterThan(0);
+			await h.frame({ type: "streaming_reset" });
+			await h.raf();
+			expect(h.live()).toBeNull();
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
+		});
+	});
+
+	it("keeps an offscreen incomplete source pinned until an explicit tool discard", async () => {
+		await withStream(async (h) => {
+			const body = "still-streaming-source\n".repeat(500);
+			const document = {
+				id: "memory-offscreen-write",
+				epoch: "memory-offscreen-epoch",
+				revision: 1,
+				length: body.length,
+				complete: false,
+				originKnown: true,
+				source: { narratorId: "handoff-n", toolUseId: "memory-offscreen-tool", field: "content" },
+			};
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: "memory-offscreen-tool",
+				toolName: "Write",
+				inputCharsTotal: body.length,
+				streamingField: { name: "content", delta: body, startsField: true },
+				inputDocument: { ref: document, offset: 0 },
+			});
+			await h.raf();
+			await h.showOnlyKeys([]);
+			textDocumentStore.discard(document.id, document.epoch);
+			expect(await textDocumentStore.readAll(document.id)).toBe(body);
+			await h.frame({ type: "tool_use_discarded", toolUseIds: ["memory-offscreen-tool"] });
+			await h.raf();
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
 		});
 	});
 });

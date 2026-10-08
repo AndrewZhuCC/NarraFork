@@ -64,6 +64,7 @@ const PLATFORMS = [
 	{ target: "bun-linux-arm64", platformId: "linux-arm64", name: `narrafork-${VERSION}-linux-arm64` },
 	{ target: "bun-windows-x64", platformId: "win-x64", name: `narrafork-${VERSION}-windows-x64.exe` },
 	{ target: "bun-windows-x64-baseline", platformId: "win-x64-baseline", name: `narrafork-${VERSION}-windows-x64-baseline.exe` },
+	{ target: "bun-windows-arm64", platformId: "win-arm64", name: `narrafork-${VERSION}-windows-arm64.exe` },
 ];
 
 const selectedPlatforms = platformArg
@@ -305,7 +306,7 @@ console.log(
 		}
 		console.error(
 			"   Fix these, or declare the component in licenses/extra/entries.json. " +
-				"See the license section in CLAUDE.md.",
+				"See docs/LICENSES.md.",
 		);
 		process.exit(1);
 	}
@@ -374,8 +375,15 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"./server/lib/db-worker/worker-entry.ts",
 			// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 			"./server/services/editor-document-worker.ts",
+			"./server/lib/browser/memory-snapshot-worker.ts",
+			"./server/lib/browser/memory-profile-worker.ts",
+			// Share HTML cleaning runs off-thread, including in compiled distributions.
+			"./server/lib/share-preview-worker.ts",
 			// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
 			"./server/services/revert-transaction-manifest-worker.ts",
+			// Private archive scans/copies/imports must remain off-thread in released binaries.
+			"./server/services/project-archive/legacy-sync-worker.ts",
+			"./server/services/project-archive/legacy-import-worker.ts",
 			"--compile",
 			"--minify",
 			"--target",

@@ -19,6 +19,7 @@ export type PlanReflectionStatus =
 	| "awaiting_user"
 	| "confirmed"
 	| "cancelled"
+	| "failed"
 	| "aborted";
 
 export type ExitPlanReflectionDecision =
@@ -35,6 +36,8 @@ interface ExitPlanReflectionMeta {
 	inputJson: Record<string, unknown>;
 	toolCallId?: string;
 	abortController?: AbortController;
+	/** Original persisted start time when restoring this gate. */
+	restoredStartedAt?: string;
 }
 
 interface ExitPlanReflectionPending extends ExitPlanReflectionMeta {
@@ -97,7 +100,10 @@ function planReflectionSuggestions(
 			status,
 			requestId: pending.requestId,
 			startedAt: new Date(pending.startedAt).toISOString(),
-			...(status === "confirmed" || status === "cancelled" || status === "aborted"
+			...(status === "confirmed" ||
+			status === "cancelled" ||
+			status === "failed" ||
+			status === "aborted"
 				? { resolvedAt: new Date().toISOString() }
 				: {}),
 			...(reason ? { reason } : {}),
@@ -117,6 +123,8 @@ function statusReason(status: PlanReflectionStatus, reason?: string): string {
 			return "Plan reflection confirmed the plan";
 		case "cancelled":
 			return "Plan reflection requested revision";
+		case "failed":
+			return "Plan reflection failed before reaching a decision";
 		case "aborted":
 			return "Plan reflection aborted";
 	}
@@ -171,14 +179,22 @@ async function markExitPlanReflectionStatus(
 								: "fail",
 					inputJson: pending.inputJson,
 					permissionDecisionReason: message,
-					permissionSuggestions: planReflectionSuggestions(pending, status, message, compactAfter),
+					// Only the custom reflection text goes into `reason`. Status defaults
+					// stay in `permissionDecisionReason` for details/logs; the notice
+					// classifies and localizes them at display time (reflection-reason.ts).
+					permissionSuggestions: planReflectionSuggestions(pending, status, reason, compactAfter),
+					// A confirmed reflection skips the normal permission handler. Persist its
+					// approval source too, so the final-start gate can verify the receipt.
+					...(status === "confirmed" ? { permissionDecidedBy: "reflection" } : {}),
 					...(status !== "running" && status !== "awaiting_user"
 						? {
 								permissionDecidedAt: new Date().toISOString(),
 								permissionDecidedBy: status === "aborted" ? "aborted" : "reflection",
 							}
 						: {}),
-					...(status === "cancelled" || status === "aborted" ? { errorMessage: message } : {}),
+					...(status === "cancelled" || status === "failed" || status === "aborted"
+						? { errorMessage: message }
+						: {}),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
 		}
@@ -225,7 +241,14 @@ async function markExitPlanReflectionStatus(
 				type: "plan_reflection_resolved",
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
-				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",
+				decision:
+					status === "confirmed"
+						? "allow"
+						: status === "failed"
+							? "failed"
+							: status === "aborted"
+								? "aborted"
+								: "deny",
 				reason: message,
 			});
 		}
@@ -244,7 +267,10 @@ export function createExitPlanReflectionDecision(
 		requestId,
 		resolve,
 		resolved: false,
-		startedAt: Date.now(),
+		startedAt:
+			meta.restoredStartedAt && Number.isFinite(Date.parse(meta.restoredStartedAt))
+				? Date.parse(meta.restoredStartedAt)
+				: Date.now(),
 	});
 	notifyHumanAttentionChanged();
 	return promise;
@@ -307,11 +333,12 @@ export async function confirmAndCompactExitPlanReflection(
 export async function cancelExitPlanReflection(
 	requestId: string,
 	feedback: string,
+	options?: { failed?: boolean },
 ): Promise<boolean> {
 	return resolveExitPlanReflection(
 		requestId,
 		{ action: "revise", feedback },
-		"cancelled",
+		options?.failed ? "failed" : "cancelled",
 		feedback,
 	);
 }
