@@ -112,6 +112,21 @@ describe("stable update handoff", () => {
 		expect(existsSync(f.markerPath)).toBe(false);
 	});
 
+	test("matches full target hashes to valid short build identities", async () => {
+		for (const [gitCommit, accepted] of [
+			["abcdef012", true],
+			["abcdef013", false],
+			["abcdef0", false],
+		] as const) {
+			const f = fixture();
+			f.overrides.gitCommit = gitCommit;
+			writeClaim(f, { targetCommit: `abcdef012${"3".repeat(31)}` });
+			const result = await consumeStableUpdateHandoff(f.overrides);
+			expect(result).toEqual(accepted ? { markerNonce: f.nonce } : null);
+			if (!accepted) expect(invalidFiles(f)).toHaveLength(1);
+		}
+	});
+
 	test("allows at most one concurrent consumer", async () => {
 		const f = fixture();
 		writeClaim(f);

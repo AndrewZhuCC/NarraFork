@@ -339,10 +339,18 @@ export async function consumeStableUpdateHandoff(
 		) {
 			throw new Error("executable path or permissions are invalid");
 		}
+		const runningCommit = overrides?.gitCommit ?? GIT_COMMIT;
+		// Installers use a full hash for older servers that only accept 8 or 40 chars.
+		// The built-in identity can still be Git's variable-length short hash.
+		const targetCommitMatches =
+			claim.targetCommit === runningCommit ||
+			(/^[a-f\d]{40}$/.test(claim.targetCommit) &&
+				/^[a-f\d]{8,40}$/.test(runningCommit) &&
+				claim.targetCommit.startsWith(runningCommit));
 		if (
 			claim.targetCommit === claim.sourceCommit ||
 			claim.targetVersion !== (overrides?.appVersion ?? APP_VERSION) ||
-			claim.targetCommit !== (overrides?.gitCommit ?? GIT_COMMIT)
+			!targetCommitMatches
 		) {
 			throw new Error("target build mismatch");
 		}

@@ -272,7 +272,7 @@ def main():
     stable_install = None
     if prepare_update:
         stable_install = {'launchdLabel': launchd_label, 'fromCommit': health['commit'],
-                          'toCommit': metadata['commit'], 'certificateSha1': fingerprint}
+                          'toCommit': head, 'certificateSha1': fingerprint}
         updated['stablePathInstall'] = stable_install
         updated['fromVersion'] = health['version'].split('+')[0]
     else:

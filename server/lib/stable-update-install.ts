@@ -79,8 +79,8 @@ export async function verifyStablePathInstall(
 			context.parentPid !== 1 ||
 			!isValidLaunchdLabel(context.service) ||
 			install.launchdLabel !== context.service ||
-			!/^([a-f\d]{8}|[a-f\d]{40})$/.test(install.fromCommit) ||
-			!/^([a-f\d]{8}|[a-f\d]{40})$/.test(install.toCommit) ||
+			!/^[a-f\d]{8,40}$/.test(install.fromCommit) ||
+			!/^[a-f\d]{8,40}$/.test(install.toCommit) ||
 			!context.commit ||
 			!install.fromCommit.startsWith(context.commit) ||
 			install.toCommit.startsWith(context.commit) ||

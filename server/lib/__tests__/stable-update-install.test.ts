@@ -44,6 +44,17 @@ test("accepts only a pinned signature at the fixed launchd executable path", asy
 	expect(await verifyStablePathInstall(binary, install, context)).toBe(true);
 	expect(calls).toBe(1);
 });
+test("accepts variable-length Git abbreviations with the same signature checks", async () => {
+	const commit = "a".repeat(9);
+	expect(
+		await verifyStablePathInstall(
+			binary,
+			{ ...install, fromCommit: commit, toCommit: "b".repeat(9) },
+			{ ...context, commit },
+		),
+	).toBe(true);
+	expect(calls).toBe(1);
+});
 for (const [name, patch] of [
 	["other OS", { platform: "linux" }],
 	["manual process", { parentPid: 42 }],
