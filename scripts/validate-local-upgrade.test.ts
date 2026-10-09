@@ -40,13 +40,7 @@ describe("validate-local-upgrade", () => {
 			db.exec("ALTER TABLE narrators ADD COLUMN turn_ended_at text");
 			db.run(
 				"INSERT INTO narrators (id, created_at, updated_at, traits, next_seq) VALUES (?, ?, ?, ?, ?)",
-				[
-					"narrator-fixture",
-					"2026-09-21T00:00:00Z",
-					"2026-09-21T00:00:00Z",
-					'["standalone"]',
-					0,
-				],
+				["narrator-fixture", "2026-09-21T00:00:00Z", "2026-09-21T00:00:00Z", '["standalone"]', 0],
 			);
 			db.run(
 				"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -91,9 +85,11 @@ describe("validate-local-upgrade", () => {
 				],
 			);
 			expect(
-				(db.query("PRAGMA table_info(file_change_scope_recoveries)").all() as Array<{
-					name: string;
-				}>).some((column) => column.name === "workspace_lease_id"),
+				(
+					db.query("PRAGMA table_info(file_change_scope_recoveries)").all() as Array<{
+						name: string;
+					}>
+				).some((column) => column.name === "workspace_lease_id"),
 			).toBe(false);
 			db.close();
 
@@ -168,7 +164,9 @@ describe("validate-local-upgrade", () => {
 					)
 					.get() as { workspace_lease_id: string | null };
 				expect(recovery.workspace_lease_id).toBeNull();
-				const leases = validated.query("SELECT count(*) AS count FROM workspace_write_leases").get() as {
+				const leases = validated
+					.query("SELECT count(*) AS count FROM workspace_write_leases")
+					.get() as {
 					count: number;
 				};
 				expect(leases.count).toBe(0);
@@ -226,14 +224,22 @@ describe("validate-local-upgrade", () => {
 				cmd: [
 					process.execPath,
 					join(ROOT, "scripts/validate-local-upgrade.ts"),
-					"--database", validation,
-					"--migrations", migrations,
-					"--online-database", online,
-					"--backup-original", original,
-					"--backup-sha256", originalHash,
-					"--source-sha256", "1".repeat(64),
-					"--commit", "a".repeat(40),
-					"--version", "0.7.8",
+					"--database",
+					validation,
+					"--migrations",
+					migrations,
+					"--online-database",
+					online,
+					"--backup-original",
+					original,
+					"--backup-sha256",
+					originalHash,
+					"--source-sha256",
+					"1".repeat(64),
+					"--commit",
+					"a".repeat(40),
+					"--version",
+					"0.7.8",
 				],
 				cwd: ROOT,
 				env: { ...Bun.env, NARRAFORK_HOME: join(root, "home"), NARRAFORK_LOG_LEVEL: "error" },
@@ -250,9 +256,13 @@ describe("validate-local-upgrade", () => {
 			expect(sha256(original)).toBe(originalHash);
 			const upgraded = new Database(validation, { readonly: true });
 			try {
-				expect(upgraded.query("SELECT id FROM narrator_messages").all()).toContainEqual({ id: "message-0014" });
+				expect(upgraded.query("SELECT id FROM narrator_messages").all()).toContainEqual({
+					id: "message-0014",
+				});
 				for (const table of ["notifications", "user_usage_totals", "workspace_execution_owners"]) {
-					expect(upgraded.query("SELECT 1 FROM sqlite_master WHERE name=?").get(table)).not.toBeNull();
+					expect(
+						upgraded.query("SELECT 1 FROM sqlite_master WHERE name=?").get(table),
+					).not.toBeNull();
 				}
 			} finally {
 				upgraded.close();
@@ -262,7 +272,9 @@ describe("validate-local-upgrade", () => {
 		}
 	}, 300_000);
 
-	async function validateTailMigration(targetTag: "0015_nifty_magma" | "0016_high_shiva") {
+	async function validateTailMigration(
+		targetTag: "0015_nifty_magma" | "0016_high_shiva" | "0017_merge_opensource_083",
+	) {
 		const root = mkdtempSync(join(tmpdir(), `nf-local-upgrade-${targetTag.slice(0, 4)}-`));
 		try {
 			const migrations = join(root, "drizzle");
@@ -308,6 +320,19 @@ describe("validate-local-upgrade", () => {
 				);
 			}
 			const beforeRef = db.query("SELECT * FROM narrator_message_refs WHERE id='ref-0016'").get();
+			if (targetTag === "0017_merge_opensource_083") {
+				db.run(
+					"INSERT INTO terminals (id, narrator_id, name, cwd, created_at) VALUES (?, ?, ?, ?, ?)",
+					["terminal-0017", narratorId, "keep terminal", root, "2026-10-08T00:00:00Z"],
+				);
+			}
+			const beforeTerminal =
+				targetTag === "0017_merge_opensource_083"
+					? (db.query("SELECT * FROM terminals WHERE id='terminal-0017'").get() as Record<
+							string,
+							unknown
+						>)
+					: undefined;
 			db.close();
 
 			journal.entries.push(target);
@@ -320,7 +345,7 @@ describe("validate-local-upgrade", () => {
 			const originalHash = sha256(original);
 			const sourceHash = "1".repeat(64);
 			const commit = "a".repeat(40);
-			const version = "0.7.9";
+			const version = targetTag === "0017_merge_opensource_083" ? "0.8.3" : "0.7.9";
 			const child = Bun.spawnSync({
 				cmd: [
 					process.execPath,
@@ -394,6 +419,17 @@ describe("validate-local-upgrade", () => {
 						upgraded.query("SELECT * FROM narrator_message_refs WHERE id='ref-0016'").get(),
 					).toEqual(beforeRef);
 				} else {
+					if (targetTag === "0017_merge_opensource_083") {
+						expect(
+							upgraded.query("SELECT * FROM terminals WHERE id='terminal-0017'").get(),
+						).toEqual({
+							...beforeTerminal,
+							worktree_resource_id: null,
+						});
+						expect(
+							upgraded.query("SELECT count(*) AS count FROM narrator_worktree_resources").get(),
+						).toEqual({ count: 0 });
+					}
 					expect(
 						upgraded
 							.query(
@@ -417,6 +453,11 @@ describe("validate-local-upgrade", () => {
 	test(
 		"validates migration 0016 without changing existing refs",
 		() => validateTailMigration("0016_high_shiva"),
+		300_000,
+	);
+	test(
+		"validates migration 0017 while preserving rebuilt tables and existing data",
+		() => validateTailMigration("0017_merge_opensource_083"),
 		300_000,
 	);
 });

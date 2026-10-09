@@ -13,14 +13,49 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0014_blue_tomorrow_man",
 	"0015_nifty_magma",
 	"0016_high_shiva",
+	"0017_merge_opensource_083",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
 	"0014_blue_tomorrow_man",
 	"0015_nifty_magma",
 	"0016_high_shiva",
+	"0017_merge_opensource_083",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_083_NEW_TABLES = [
+	"narrator_context_char_pages",
+	"narrator_question_events",
+	"narrator_worktree_resources",
+	"permission_rule_requests",
+	"runtime_awaited_terminal_consumptions",
+];
+const MERGE_083_ADDED_COLUMNS: Record<string, string[]> = {
+	api_requests: ["context_usage_snapshot_json"],
+	narrator_messages: ["context_chars_json"],
+	narrator_questions: ["context", "resolution_json", "withdraw_reason", "summary_json"],
+	narrator_tool_calls: ["input_chars", "output_chars"],
+	narrators: [
+		"scheduled_task_id",
+		"context_summary_chars",
+		"context_system_chars",
+		"context_tools_chars",
+		"context_char_revision",
+		"context_usage_snapshot_json",
+		"context_char_cache_json",
+		"last_stop_reason",
+		"workspace_revision",
+		"workspace_context",
+	],
+	scheduled_tasks: ["cleanup_policy"],
+	user_preferences: ["treat_as_local_access"],
+	volume_snapshots: ["source_worktree_resource_id"],
+	container_instances: ["worktree_resource_id"],
+	volume_snapshot_applications: ["target_worktree_resource_id"],
+	port_allocations: ["worktree_resource_id"],
+	terminal_view_state: ["worktree_resource_id"],
+	terminals: ["worktree_resource_id"],
+};
 
 type Args = {
 	database: string;
@@ -131,6 +166,19 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0017_merge_opensource_083") {
+		return Object.fromEntries(
+			Object.entries(MERGE_083_ADDED_COLUMNS).map(([table, added]) => [
+				table,
+				tableDigest(
+					db,
+					table,
+					excludeNew ? new Set(added) : new Set(),
+					table === "port_allocations" ? "port" : "id",
+				),
+			]),
+		);
+	}
 	if (targetTag === "0016_high_shiva") {
 		return { narrator_message_refs: tableDigest(db, "narrator_message_refs") };
 	}
@@ -150,7 +198,7 @@ function affectedSummary(
 						is0014
 							? ["cost_status", "cost_missing_fields"]
 							: ["stream_completed_at", "cost_status", "cost_missing_fields"],
-						)
+					)
 				: new Set(),
 		),
 	};
@@ -163,7 +211,7 @@ function affectedSummary(
 						is0014
 							? ["resolution_authority", "maintenance_evidence_json"]
 							: ["workspace_lease_id", "resolution_authority", "maintenance_evidence_json"],
-						)
+					)
 				: new Set(),
 		);
 	}
@@ -239,6 +287,38 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0017_merge_opensource_083") {
+		for (const table of [
+			...MERGE_083_NEW_TABLES,
+			"container_instances",
+			"volume_snapshot_applications",
+			"port_allocations",
+			"terminal_view_state",
+			"terminals",
+		]) {
+			shape[table] = tableSchemaShape(db, table);
+		}
+		for (const [table, added] of Object.entries(MERGE_083_ADDED_COLUMNS)) {
+			for (const column of added) shape[`${table}.${column}`] = columnShape(db, table, column);
+		}
+		for (const name of [
+			"idx_narrator_questions_answer_message",
+			"idx_narrator_questions_created",
+			"idx_toolcalls_context_id",
+			"idx_toolcalls_context_order",
+			"idx_toolcalls_context_latest",
+			"idx_narrators_scheduled_task_created",
+			"idx_scheduled_tasks_last_narrator",
+			"idx_volume_snapshots_source_resource",
+			"idx_fc_segment_input",
+		]) {
+			const index = db
+				.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?")
+				.get(name) as { sql: string } | null;
+			if (!index) throw new Error(`Missing index: ${name}`);
+			shape[name] = index.sql;
+		}
+	}
 	if (targetTag === "0016_high_shiva") {
 		shape["narrator_message_refs.idx_narrator_refs_narrator_id"] = narratorRefsIndexShape(db);
 	}
@@ -253,7 +333,8 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 			"api_requests",
 			"credential_usage_totals",
 			"narrator_tool_calls",
-		]) shape[table] = tableSchemaShape(db, table);
+		])
+			shape[table] = tableSchemaShape(db, table);
 		// Legacy message migrations arrange existing columns differently; compare the
 		// two added fields by definition, not their physical cid/index positions.
 		for (const column of ["cost_status", "cost_missing_fields"]) {
@@ -362,7 +443,9 @@ async function main() {
 					? ["workspace_write_leases"]
 					: target.tag === "0014_blue_tomorrow_man"
 						? ["notifications", "user_usage_totals", "workspace_execution_owners"]
-						: [];
+						: target.tag === "0017_merge_opensource_083"
+							? MERGE_083_NEW_TABLES
+							: [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");
@@ -399,7 +482,9 @@ async function main() {
 			}
 		}
 		// Historical gaps are repaired on the first claim, not during startup migration.
-		const badNextSeq = db.query("SELECT count(*) AS count FROM narrators WHERE next_seq < 0").get() as {
+		const badNextSeq = db
+			.query("SELECT count(*) AS count FROM narrators WHERE next_seq < 0")
+			.get() as {
 			count: number;
 		};
 		if (Number(badNextSeq.count) !== 0) throw new Error("next_seq cannot be negative");
