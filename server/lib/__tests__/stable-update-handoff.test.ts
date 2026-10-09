@@ -157,6 +157,7 @@ describe("stable update handoff", () => {
 			await consumeStableUpdateHandoff({ ...f.overrides, xpcServiceName: "other.service" }),
 		).toBeNull();
 		expect(existsSync(f.claimPath)).toBe(true);
+		expect(await consumeStableUpdateHandoff(f.overrides)).toEqual({ markerNonce: f.nonce });
 	});
 
 	test("quarantines expired claims so they cannot trigger a restart loop", async () => {

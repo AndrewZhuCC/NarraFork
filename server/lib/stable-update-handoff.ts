@@ -311,8 +311,10 @@ export async function consumeStableUpdateHandoff(
 			throw new Error("invalid claim file");
 		}
 		const claim = parseClaim(readFileSync(consumedPath, "utf8"));
-		if (claim.launchdLabel && claim.launchdLabel !== launchdLabel)
-			throw new Error("launchd service mismatch");
+		if (claim.launchdLabel && claim.launchdLabel !== launchdLabel) {
+			restoreClaim(path, consumedPath);
+			return null;
+		}
 		const now = overrides?.now ?? Date.now();
 		if (claim.createdAt > now || now - claim.createdAt > STABLE_UPDATE_HANDOFF_MAX_AGE_MS) {
 			throw new Error("expired claim");
