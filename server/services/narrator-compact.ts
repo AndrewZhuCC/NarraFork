@@ -978,6 +978,7 @@ async function doRunCustomCompact({
 			parentNarratorId: true,
 			subagentType: true,
 			reasoningEffort: true,
+			apiConversationId: true,
 		},
 	});
 	const active = activeNarrators.get(narratorId);
@@ -1182,7 +1183,8 @@ async function doRunCustomCompact({
 					resolvedCompact.adapter as import("../lib/agent/provider").RemoteCompactCapableProvider
 				).compactRemote(built.history, resolvedCompact.model, {
 					signal,
-					conversationId: narratorId,
+					conversationId:
+						(active?.alive ? active.conversationId : narrator?.apiConversationId) || narratorId,
 					trailingToolResults: built.trailingToolResults,
 					onActivity: hooks?.beat,
 					reasoningEffort: remoteEffort ?? undefined,

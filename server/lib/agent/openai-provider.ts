@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
@@ -18,7 +19,12 @@ import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
 import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
-import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
+import {
+	applyCodexStableRequestFields,
+	createCodexRequestIdentity,
+	getCodexCompactPrefix,
+	rememberCodexCompactPrefix,
+} from "./codex-request";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -616,7 +622,11 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** Reasoning-source identity override (NUG injects its channel identity). */
 	private reasoningSourceOverride?: string;
 
-	constructor(config: OpenAIProviderConfig, proxy?: string) {
+	constructor(
+		config: OpenAIProviderConfig,
+		proxy?: string,
+		private readonly compactCredentialId?: string,
+	) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
 		this.proxy = proxy;
@@ -664,6 +674,32 @@ export class OpenAIProvider implements ProviderAdapter {
 		return this.apiMode === "codex" && this.codexRemoteCompactEnabled;
 	}
 
+	private compactRequestKey(model: string, conversationId?: string): string | undefined {
+		if (!conversationId?.trim()) return undefined;
+		const credential =
+			this.compactCredentialId ??
+			createHash("sha256")
+				.update(this.config.authorizationHeader?.trim() || this.config.apiKey)
+				.digest("hex");
+		return JSON.stringify([
+			this.config.id,
+			(this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, ""),
+			this.config.codexAccountId,
+			credential,
+			parseModelId(model).model,
+			conversationId.trim(),
+		]);
+	}
+
+	/** Also used by the official Codex WS path, which bypasses chat() on this delegate. */
+	rememberCompactRequest(
+		params: Pick<ChatParams, "model" | "conversationId" | "reflectionParentTools">,
+		body: Record<string, unknown>,
+	): void {
+		if (this.apiMode !== "codex" || params.reflectionParentTools !== undefined) return;
+		rememberCodexCompactPrefix(this.compactRequestKey(params.model, params.conversationId), body);
+	}
+
 	async compactRemote(
 		input: unknown[],
 		model: string,
@@ -673,6 +709,8 @@ export class OpenAIProvider implements ProviderAdapter {
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
 			onActivity?: () => void;
+			/** Official Codex selects its transport outside this delegate. */
+			useWebSocket?: boolean;
 		},
 	): Promise<{ items: unknown[]; retainedUsers?: CodexRetainedUserMessage[] }> {
 		if (this.apiMode !== "codex") {
@@ -689,37 +727,84 @@ export class OpenAIProvider implements ProviderAdapter {
 			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
 		}
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
-		// Official Desktop 0.147 remote compact: POST {baseUrl}/responses
-		// (baseUrl already includes /v1 or /backend-api/codex). The model
-		// returns a compaction item with encrypted_content in the SSE stream.
-		const prepared = prepareCodexCompactInput(input, options?.trailingToolResults);
-		const body: Record<string, unknown> = {
-			model: parseModelId(model).model,
-			input: prepared,
-			stream: true,
-			store: false,
-		};
 		const conversationId = options?.conversationId?.trim();
-		const reasoningEffort = resolveCodexRequestReasoningEffort(model, options?.reasoningEffort);
-		applyCodexStableRequestFields(body, {
-			identity: createCodexRequestIdentity(conversationId),
-			reasoningEffort,
+		const prefix = getCodexCompactPrefix(this.compactRequestKey(model, conversationId));
+		const prepared = prepareCodexCompactInput(input, options?.trailingToolResults, {
+			preserveIds: !!prefix,
 		});
-		body.reasoning = {
-			effort: reasoningEffort,
-			summary: "detailed",
-			context: "all_turns",
-		};
-		body.stream_options = { reasoning_summary_delivery: "sequential_cutoff" };
-		const headers = this.buildHeaders(apiKey, options?.conversationId);
-		headers.Accept = "text/event-stream";
-		const response = await this.pfetch(`${baseUrl}/responses`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-		const items = await readCompactOutputItems(response, options);
+		const body: Record<string, unknown> = prefix
+			? { ...prefix, input: prepared }
+			: { model: parseModelId(model).model, input: prepared, stream: true, store: false };
+		if (prefix) {
+			// Explicit live effort changes still take effect; otherwise retain the actual
+			// ordinary request's resolved defaults rather than re-guessing them while idle.
+			if (options?.reasoningEffort !== undefined && isRecord(body.reasoning)) {
+				body.reasoning = {
+					...body.reasoning,
+					effort: resolveCodexRequestReasoningEffort(model, options.reasoningEffort),
+				};
+			}
+		} else {
+			const reasoningEffort = resolveCodexRequestReasoningEffort(model, options?.reasoningEffort);
+			applyCodexStableRequestFields(body, {
+				identity: createCodexRequestIdentity(conversationId),
+				reasoningEffort,
+			});
+			body.reasoning = { effort: reasoningEffort, summary: "detailed", context: "all_turns" };
+			body.stream_options = { reasoning_summary_delivery: "sequential_cutoff" };
+		}
+		// Historical hosted search requires its declaration even with no retained template.
+		if (prepared.some((item) => compactItemType(item) === "web_search_call")) {
+			const tools = Array.isArray(body.tools) ? body.tools : [];
+			if (!hasNativeTool(tools, "web_search")) body.tools = [...tools, { type: "web_search" }];
+		}
+		const headers = this.buildHeaders(apiKey, conversationId);
+		let items: unknown[] | undefined;
+		if (prefix && conversationId && (options?.useWebSocket ?? this.useWebSocket)) {
+			const collector = createCompactOutputCollector();
+			const budget = new StreamByteBudget(16 * 1024 * 1024, "Codex remote compact response");
+			try {
+				for await (const _event of streamCodexResponsesWebSocket({
+					baseUrl,
+					apiKey,
+					authorization: this.config.authorizationHeader,
+					accountId: this.config.codexAccountId,
+					proxy: this.proxy
+						? applyProxyExemptions(this.proxy, baseUrl)
+						: resolveProxyForUrl(baseUrl, this.config.proxy),
+					sessionKey: conversationId,
+					conversationId,
+					credentialId: this.compactCredentialId ?? this.config.id,
+					model,
+					request: body as CodexResponsesRequestBody,
+					signal: options?.signal ?? new AbortController().signal,
+					ephemeral: true,
+					extraHeaders: headers,
+					onResponseFrame: (frame) => {
+						budget.add(Buffer.byteLength(frame, "utf8"));
+						options?.onActivity?.();
+						options?.signal?.throwIfAborted();
+						collector.acceptFrame(frame);
+					},
+				})) {
+					/* The compact collector, not ordinary chat events, owns the result. */
+				}
+				items = collector.finish();
+			} catch (error) {
+				// Only unsupported handshakes fall back; never replay a failed/aborted compaction.
+				if (!(error instanceof CodexWebSocketFallbackError)) throw error;
+			}
+		}
+		if (!items) {
+			headers.Accept = "text/event-stream";
+			const response = await this.pfetch(`${baseUrl}/responses`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			});
+			items = await readCompactOutputItems(response, options);
+		}
 		const retainedUsers = retainCompactUsers(input);
 		return { items, ...(retainedUsers.length ? { retainedUsers } : {}) };
 	}
@@ -1029,6 +1114,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			params.onRequestStart?.(
 				this.apiMode === "codex" ? { codexTools: body.tools as unknown[] } : undefined,
 			);
+			this.rememberCompactRequest(params, body);
 			const response = await this.pfetch(endpoint, {
 				method: "POST",
 				headers: requestHeaders,
@@ -1741,6 +1827,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				credentialId: this.config.id,
 				codexTools: request.tools as unknown[],
 			});
+			this.rememberCompactRequest(params, request);
 			for await (const event of streamCodexResponsesWebSocket({
 				baseUrl,
 				apiKey,
@@ -1964,11 +2051,7 @@ function parseResponsesJson(raw: string): {
 	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 
-/** Consume only this compact response; ordinary chat parsing is intentionally unchanged. */
-async function readCompactOutputItems(
-	response: Response,
-	options?: { signal?: AbortSignal; onActivity?: () => void },
-): Promise<unknown[]> {
+function createCompactOutputCollector() {
 	const fail = (reason: string): never => {
 		throw new Error(`Codex remote compact ${reason}`);
 	};
@@ -1987,9 +2070,8 @@ async function readCompactOutputItems(
 			(item.status !== undefined && item.status !== "completed") ||
 			typeof item.encrypted_content !== "string" ||
 			!item.encrypted_content.trim()
-		) {
+		)
 			fail("received an unfinished or empty compaction item");
-		}
 		return items;
 	};
 	const parseJson = (text: string): Record<string, unknown> => {
@@ -2001,8 +2083,62 @@ async function readCompactOutputItems(
 		}
 		return isRecord(value) ? value : fail("expected a JSON object");
 	};
-	let compactItems: Record<string, unknown>[] = [];
+	let items: Record<string, unknown>[] = [];
 	let completed = false;
+	return {
+		get completed() {
+			return completed;
+		},
+		acceptFrame(text: string, eventType?: string) {
+			if (text === "[DONE]") fail("stream ended before response.completed");
+			const event = parseJson(text);
+			const type = event.type ?? eventType;
+			if (type === "error" || type === "response.failed" || type === "response.incomplete")
+				fail(`received ${type}`);
+			if (type === "response.output_item.done") {
+				items.push(...fromJson({ output: [event.item] }));
+				if (items.length) validate(items);
+			}
+			if (type === "response.completed") {
+				validate(items);
+				if (
+					!isRecord(event.response) ||
+					(event.response.status !== undefined && event.response.status !== "completed")
+				)
+					fail("response was not completed");
+				const finalItems = fromJson(event.response);
+				if (finalItems.length) {
+					validate(finalItems);
+					if (
+						finalItems[0].encrypted_content !== items[0].encrypted_content ||
+						(finalItems[0].id !== undefined &&
+							items[0].id !== undefined &&
+							finalItems[0].id !== items[0].id)
+					)
+						fail("completed output disagreed with the finished compaction item");
+				}
+				completed = true;
+			}
+		},
+		acceptJson(text: string) {
+			const value = parseJson(text);
+			items = validate(fromJson(value));
+			if (value.status !== "completed") fail("JSON response was not completed");
+			completed = true;
+		},
+		finish() {
+			if (!completed) fail("stream closed before response.completed");
+			return items;
+		},
+	};
+}
+
+/** Consume only this compact response; ordinary chat parsing is intentionally unchanged. */
+async function readCompactOutputItems(
+	response: Response,
+	options?: { signal?: AbortSignal; onActivity?: () => void },
+): Promise<unknown[]> {
+	const collector = createCompactOutputCollector();
 	const parseFrame = (frame: string) => {
 		const lines = frame.split(/\r?\n/);
 		const data = lines
@@ -2010,50 +2146,18 @@ async function readCompactOutputItems(
 			.map((line) => line.slice(5).trimStart())
 			.join("\n")
 			.trim();
-		if (!data) return;
-		if (data === "[DONE]") return fail("stream ended before response.completed");
-		const event = parseJson(data);
-		const type =
-			event.type ??
-			lines
-				.find((line) => line.startsWith("event:"))
-				?.slice(6)
-				.trim();
-		if (type === "error" || type === "response.failed" || type === "response.incomplete") {
-			fail(`received ${type}`);
-		}
-		if (type === "response.output_item.done") {
-			compactItems.push(...fromJson({ output: [event.item] }));
-			if (compactItems.length) validate(compactItems);
-		}
-		if (type === "response.completed") {
-			validate(compactItems);
-			if (
-				!isRecord(event.response) ||
-				(event.response.status !== undefined && event.response.status !== "completed")
-			) {
-				fail("response was not completed");
-			}
-			// The final output is a snapshot, not a second output_item.done event.
-			const finalItems = fromJson(event.response);
-			if (finalItems.length) {
-				validate(finalItems);
-				if (
-					finalItems[0].encrypted_content !== compactItems[0].encrypted_content ||
-					(finalItems[0].id !== undefined &&
-						compactItems[0].id !== undefined &&
-						finalItems[0].id !== compactItems[0].id)
-				) {
-					fail("completed output disagreed with the finished compaction item");
-				}
-			}
-			completed = true;
-		}
+		if (data)
+			collector.acceptFrame(
+				data,
+				lines
+					.find((line) => line.startsWith("event:"))
+					?.slice(6)
+					.trim(),
+			);
 	};
-
 	if (!response.body) {
 		if (!response.ok) throw createOpenAIApiError(response, "");
-		return fail("response had no body");
+		throw new Error("Codex remote compact response had no body");
 	}
 	const reader = response.body.getReader();
 	const signal = options?.signal;
@@ -2072,7 +2176,7 @@ async function readCompactOutputItems(
 	let json: boolean | undefined;
 	try {
 		signal?.throwIfAborted();
-		while (!completed) {
+		while (!collector.completed) {
 			const { done, value } = await readWithTimeout(reader);
 			signal?.throwIfAborted();
 			if (value?.byteLength) {
@@ -2083,32 +2187,26 @@ async function readCompactOutputItems(
 			}
 			if (done) buffer += decoder.decode();
 			if (response.ok) {
-				// Preserve JSON relay support even if its content-type is inaccurate.
 				const first = buffer.trimStart()[0];
 				if (json === undefined && first) json = first === "{" || first === "[";
 				if (json === false) {
 					let boundary = /\r?\n\r?\n/.exec(buffer);
-					while (boundary && !completed) {
+					while (boundary && !collector.completed) {
 						const frame = buffer.slice(0, boundary.index);
 						buffer = buffer.slice(boundary.index + boundary[0].length);
 						parseFrame(frame);
 						boundary = /\r?\n\r?\n/.exec(buffer);
 					}
-					if (done && !completed && buffer.trim()) parseFrame(buffer);
+					if (done && !collector.completed && buffer.trim()) parseFrame(buffer);
 				}
 			}
 			if (done) break;
 		}
 		if (!response.ok) throw createOpenAIApiError(response, buffer);
-		if (json) {
-			const result = parseJson(buffer);
-			compactItems = validate(fromJson(result));
-			if (result.status !== "completed") fail("JSON response was not completed");
-		} else if (!completed) fail("stream closed before response.completed");
-		return compactItems;
+		if (json) collector.acceptJson(buffer);
+		return collector.finish();
 	} finally {
 		signal?.removeEventListener("abort", abort);
-		// Do not wait for an upstream socket to close after its terminal event.
 		void reader.cancel().catch(() => {});
 		reader.releaseLock();
 	}
@@ -2195,6 +2293,7 @@ function normalizeTrailingCompactOutput(item: unknown): unknown | null {
 function mergeCodexCompactHistory(
 	history: unknown[],
 	trailingToolResults: unknown[] = [],
+	preserveIds = false,
 ): unknown[] {
 	const withoutTrigger = (Array.isArray(history) ? history : []).filter(
 		(item) => compactItemType(item) !== "compaction_trigger",
@@ -2202,7 +2301,8 @@ function mergeCodexCompactHistory(
 	const extras = trailingToolResults
 		.map(normalizeTrailingCompactOutput)
 		.filter((item): item is Record<string, unknown> => item != null);
-	return rewriteCompactIds([...withoutTrigger, ...extras]);
+	const merged = [...withoutTrigger, ...extras];
+	return preserveIds ? merged : rewriteCompactIds(merged);
 }
 
 function compactOutputCallIds(items: unknown[]): Set<string> {
@@ -2276,8 +2376,9 @@ export function clipMessagesBeforeUnpairedToolCalls<T extends DbMessage>(
 export function prepareCodexCompactInput(
 	history: unknown[],
 	trailingToolResults: unknown[] = [],
+	options: { preserveIds?: boolean } = {},
 ): unknown[] {
-	const merged = mergeCodexCompactHistory(history, trailingToolResults);
+	const merged = mergeCodexCompactHistory(history, trailingToolResults, options.preserveIds);
 	const outputIds = compactOutputCallIds(merged);
 	const closed = merged.filter((item) => {
 		if (compactItemType(item) !== "function_call") return true;

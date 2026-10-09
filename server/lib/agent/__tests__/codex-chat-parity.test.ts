@@ -459,3 +459,162 @@ for (const apiMode of ["responses", "completions"] as const) {
 		expect(reported).toBeUndefined();
 	});
 }
+
+for (const transport of ["http", "ws", "native-ws"] as const) {
+	test(`Codex compact reuses the last ordinary ${transport} prefix across provider instances`, async () => {
+		const conversationId = `compact-prefix-${transport}`;
+		const normal = await captureChat(
+			{
+				conversationId,
+				history: [
+					{ role: "developer", content: "stable project instructions" },
+					{ role: "user", content: "shared history" },
+				],
+				tools: [parentFunction, { type: "web_search" }, { type: "image_generation" }],
+				reflectionTools: decisionTools,
+				serviceTier: "priority",
+			},
+			"codex",
+			transport,
+		);
+		await captureChat(
+			{
+				conversationId,
+				history: [{ role: "developer", content: "reflection-only instructions" }],
+				tools: decisionTools,
+				reflectionParentTools: normal.body.tools as unknown[],
+			},
+			"codex",
+			transport,
+		);
+
+		const provider = new OpenAIProvider(
+			{
+				id: "codex",
+				name: "Codex",
+				prefix: "codex",
+				apiKey: "sk-test-key",
+				baseUrl: "https://chatgpt.com/backend-api/codex",
+				defaultModel: "gpt-5.3-codex",
+				apiMode: "codex",
+				codexRemoteCompact: true,
+				codexWebSocket: transport !== "http",
+				codexAccountId: transport === "native-ws" ? "test-account" : undefined,
+			},
+			undefined,
+			transport === "native-ws" ? "test-credential" : undefined,
+		);
+		const history = [
+			...(normal.body.input as unknown[]),
+			{ type: "reasoning", id: "rs_original", encrypted_content: "original-cipher", summary: [] },
+			{
+				type: "function_call",
+				id: "fc_original",
+				call_id: "original-call",
+				name: "Read",
+				arguments: "{}",
+			},
+			{ type: "function_call_output", call_id: "original-call", output: "file contents" },
+		];
+		const requests: Record<string, unknown>[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+			requests.push(JSON.parse(String(init?.body)));
+			return new Response(
+				JSON.stringify({
+					status: "completed",
+					output: [{ type: "compaction", encrypted_content: "compacted" }],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+		const ws = spyOn(codexWebSocket, "streamCodexResponsesWebSocket").mockImplementation(
+			async function* (options) {
+				expect(options.ephemeral).toBe(true);
+				expect(options.conversationId).toBe(conversationId);
+				requests.push(structuredClone(options.request));
+				options.onResponseFrame?.(
+					JSON.stringify({
+						type: "response.output_item.done",
+						item: { type: "compaction", encrypted_content: "compacted" },
+					}),
+				);
+				options.onResponseFrame?.(
+					JSON.stringify({
+						type: "response.completed",
+						response: { status: "completed", output: [] },
+					}),
+				);
+				yield { text: "" };
+			},
+		);
+		try {
+			const result = await provider.compactRemote(history, "codex:gpt-5.3-codex", {
+				conversationId,
+			});
+			expect(result.items).toEqual([{ type: "compaction", encrypted_content: "compacted" }]);
+			const { input, ...prefix } = normal.body;
+			expect(requests[0]).toEqual({
+				...prefix,
+				input: [...history, { type: "compaction_trigger" }],
+			});
+			expect(requests[0].tool_choice).toMatchObject({ type: "allowed_tools", mode: "auto" });
+			expect(requests[0].service_tier).toBe("priority");
+			await provider.compactRemote(history, "codex:gpt-5.3-codex", {
+				conversationId,
+				reasoningEffort: "low",
+			});
+			expect(requests[1].reasoning).toEqual({ ...(prefix.reasoning as object), effort: "low" });
+			expect(ws).toHaveBeenCalledTimes(transport === "http" ? 0 : 2);
+		} finally {
+			globalThis.fetch = realFetch;
+			ws.mockRestore();
+		}
+	});
+}
+
+test("Codex compact templates cannot cross conversations, models or credentials", async () => {
+	const conversationId = "compact-prefix-isolation";
+	await captureChat({
+		conversationId,
+		history: [{ role: "developer", content: "private prefix" }],
+	});
+	const requests: Record<string, unknown>[] = [];
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+		requests.push(JSON.parse(String(init?.body)));
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [{ type: "compaction", encrypted_content: "compacted" }],
+			}),
+			{ headers: { "Content-Type": "application/json" } },
+		);
+	}) as typeof fetch;
+	try {
+		for (const changed of ["conversation", "model", "credential", "provider"] as const) {
+			const provider = new OpenAIProvider({
+				id: changed === "provider" ? "other-provider" : "codex",
+				name: "Codex",
+				prefix: "codex",
+				apiKey: changed === "credential" ? "another-key" : "sk-test-key",
+				baseUrl: "https://chatgpt.com/backend-api/codex",
+				defaultModel: "gpt-5.3-codex",
+				apiMode: "codex",
+				codexRemoteCompact: true,
+			});
+			await provider.compactRemote(
+				[{ role: "user", content: "history" }],
+				changed === "model" ? "codex:gpt-5.4" : "codex:gpt-5.3-codex",
+				{ conversationId: changed === "conversation" ? "other-conversation" : conversationId },
+			);
+			expect(requests.at(-1)?.instructions).toBeUndefined();
+			expect(requests.at(-1)?.reasoning).toMatchObject({
+				summary: "detailed",
+				context: "all_turns",
+			});
+		}
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});

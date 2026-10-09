@@ -135,6 +135,22 @@ describe("OpenAIProvider.compactRemote", () => {
 			expect(result.items).toEqual([
 				{ type: "compaction", id: "cmp_test", encrypted_content: "enc" },
 			]);
+			expect(capturedBody.tools).toBeUndefined();
+			// Keep the protection-unavailable fix even when no ordinary prefix is retained.
+			await provider.compactRemote(
+				[
+					{ type: "message", role: "user", content: "search history" },
+					{
+						type: "web_search_call",
+						id: "ws_history",
+						status: "completed",
+						action: { type: "search", query: "NarraFork" },
+					},
+				],
+				"relay:gpt-5.3-codex",
+				{ conversationId: "no-prefix-search" },
+			);
+			expect(capturedBody.tools).toEqual([{ type: "web_search" }]);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

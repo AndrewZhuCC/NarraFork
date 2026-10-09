@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getInstallationId } from "../installation-id";
+import { boundedJsonCopy } from "./request-dump";
 
 /**
  * Stable identity fields the real client puts in `client_metadata`.
@@ -97,4 +98,56 @@ export function applyCodexStableRequestFields(
 	body.include = ["reasoning.encrypted_content"];
 	body.text = { verbosity: "low" };
 	body.client_metadata = options.identity.clientMetadata;
+}
+
+const MAX_COMPACT_PREFIX_BYTES = 512 * 1024;
+const MAX_COMPACT_PREFIX_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_COMPACT_PREFIX_ENTRIES = 64;
+const compactPrefixes = new Map<string, { body: Record<string, unknown>; bytes: number }>();
+let compactPrefixBytes = 0;
+
+function forgetCompactPrefix(key: string): void {
+	const previous = compactPrefixes.get(key);
+	if (previous) compactPrefixBytes -= previous.bytes;
+	compactPrefixes.delete(key);
+}
+
+/**
+ * Retain only the final ordinary request's non-history fields, never its input or headers.
+ * ponytail: bounded process-local LRU survives idle sessions, not restarts; cache misses
+ * keep the existing compact path. Persist templates only if restart reuse is required.
+ */
+export function rememberCodexCompactPrefix(
+	key: string | undefined,
+	request: Record<string, unknown>,
+): void {
+	if (!key) return;
+	// An oversized replacement must not leave an obsolete template eligible for reuse.
+	forgetCompactPrefix(key);
+	const { input: _input, previous_response_id: _previous, type: _type, ...prefix } = request;
+	const copied = boundedJsonCopy(prefix, MAX_COMPACT_PREFIX_BYTES);
+	if (copied.truncated) return;
+	const bytes = Buffer.byteLength(JSON.stringify(copied.value), "utf8");
+	if (bytes > MAX_COMPACT_PREFIX_BYTES) return;
+	while (
+		compactPrefixes.size >= MAX_COMPACT_PREFIX_ENTRIES ||
+		compactPrefixBytes + bytes > MAX_COMPACT_PREFIX_CACHE_BYTES
+	) {
+		const oldest = compactPrefixes.keys().next().value;
+		if (oldest === undefined) break;
+		forgetCompactPrefix(oldest);
+	}
+	compactPrefixes.set(key, { body: copied.value, bytes });
+	compactPrefixBytes += bytes;
+}
+
+export function getCodexCompactPrefix(
+	key: string | undefined,
+): Record<string, unknown> | undefined {
+	if (!key) return undefined;
+	const entry = compactPrefixes.get(key);
+	if (!entry) return undefined;
+	compactPrefixes.delete(key);
+	compactPrefixes.set(key, entry);
+	return structuredClone(entry.body);
 }

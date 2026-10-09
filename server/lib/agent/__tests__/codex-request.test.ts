@@ -10,6 +10,8 @@ import {
 	applyCodexStableRequestFields,
 	createCodexRequestIdentity,
 	deriveCodexWindowId,
+	getCodexCompactPrefix,
+	rememberCodexCompactPrefix,
 } from "../codex-request";
 
 describe("createCodexRequestIdentity", () => {
@@ -126,5 +128,56 @@ describe("applyCodexStableRequestFields", () => {
 		expect(body.window_id).toBeUndefined();
 		expect(body.sandbox).toBeUndefined();
 		expect(body.workspace).toBeUndefined();
+	});
+});
+
+describe("Codex compact request prefixes", () => {
+	test("keeps isolated non-history fields without traversing the history", () => {
+		const request = {
+			model: "gpt-6-luna",
+			instructions: "stable instructions",
+			tools: [{ type: "function", name: "Read" }],
+			input: ["history".repeat(100_000)],
+			type: "response.create",
+			previous_response_id: "do-not-reuse",
+		};
+		rememberCodexCompactPrefix("prefix-copy", request);
+		request.tools[0].name = "changed";
+		const first = getCodexCompactPrefix("prefix-copy");
+		expect(first).toEqual({
+			model: "gpt-6-luna",
+			instructions: "stable instructions",
+			tools: [{ type: "function", name: "Read" }],
+		});
+		(first?.tools as Array<{ name: string }>)[0].name = "changed again";
+		expect(getCodexCompactPrefix("prefix-copy")?.tools).toEqual([
+			{ type: "function", name: "Read" },
+		]);
+		expect(getCodexCompactPrefix("another-scope")).toBeUndefined();
+		expect(getCodexCompactPrefix(undefined)).toBeUndefined();
+	});
+
+	test("oversized replacement drops the old template instead of reusing stale fields", () => {
+		rememberCodexCompactPrefix("prefix-oversize", { instructions: "old" });
+		rememberCodexCompactPrefix("prefix-oversize", { instructions: "x".repeat(1024 * 1024) });
+		expect(getCodexCompactPrefix("prefix-oversize")).toBeUndefined();
+	});
+
+	test("bounds entry count and evicts least recently used templates", () => {
+		for (let i = 0; i < 64; i++) {
+			rememberCodexCompactPrefix(`prefix-lru-${i}`, { instructions: `entry ${i}` });
+		}
+		expect(getCodexCompactPrefix("prefix-lru-0")).toBeDefined();
+		rememberCodexCompactPrefix("prefix-lru-64", { instructions: "newest" });
+		expect(getCodexCompactPrefix("prefix-lru-1")).toBeUndefined();
+		expect(getCodexCompactPrefix("prefix-lru-0")).toBeDefined();
+	});
+
+	test("bounds retained bytes before reaching the entry limit", () => {
+		for (let i = 0; i < 60; i++) {
+			rememberCodexCompactPrefix(`prefix-bytes-${i}`, { instructions: "x".repeat(300_000) });
+		}
+		expect(getCodexCompactPrefix("prefix-bytes-0")).toBeUndefined();
+		expect(getCodexCompactPrefix("prefix-bytes-59")).toBeDefined();
 	});
 });

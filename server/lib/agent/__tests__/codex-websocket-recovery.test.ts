@@ -1034,7 +1034,8 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 		for (const frame of completedFrames(`resp-${requestIndex}`, `echo:${text}`)) send(frame);
 	});
 	const server = activeServer;
-	const stream = (input: string[]) =>
+	const privateFrames: Array<{ type: string }> = [];
+	const stream = (input: string[], ephemeral = false) =>
 		streamCodexResponsesWebSocket({
 			baseUrl: server.baseUrl,
 			apiKey: "sk-test",
@@ -1047,6 +1048,10 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 				input: input.map(userMessage) as never,
 				stream: true,
 				instructions: "base",
+			},
+			ephemeral,
+			onResponseFrame: (frame) => {
+				if (ephemeral) privateFrames.push(JSON.parse(frame));
 			},
 			signal: new AbortController().signal,
 		});
@@ -1074,11 +1079,19 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 	}
 	expect(collectText([...firstParentEvents, ...restParentEvents])).toBe("echo:hello");
 
-	// The parent's cached chain survived: the next turn continues on socket 0.
+	// Explicitly private requests must also avoid an idle parent's cached connection.
+	for await (const _event of stream(["compact"], true)) {
+		/* drain */
+	}
+	expect(server.requests[2]?.connectionIndex).toBe(2);
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(privateFrames.some((frame) => frame.type === "response.completed")).toBe(true);
+
+	// The parent's cached chain survived both private requests.
 	const follow: ParsedStreamEvent[] = [];
 	for await (const event of stream(["hello", "again"])) follow.push(event);
 	expect(collectText(follow)).toBe("echo:again");
-	expect(server.requests[2]?.connectionIndex).toBe(0);
-	expect(server.requests[2]?.body.previous_response_id).toBe("resp-0");
-	expect(server.connectionCount()).toBe(2);
+	expect(server.requests[3]?.connectionIndex).toBe(0);
+	expect(server.requests[3]?.body.previous_response_id).toBe("resp-0");
+	expect(server.connectionCount()).toBe(3);
 });

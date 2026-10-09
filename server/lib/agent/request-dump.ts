@@ -208,7 +208,7 @@ export function sanitizeHeaders(
 export const CACHE_DIAGNOSTIC_DUMP_MAX_BYTES = 4 * 1024 * 1024;
 
 /** Copy only a bounded JSON prefix, without first serializing the unbounded source. */
-function boundedJsonCopy<T>(value: T, maxBytes: number): { value: T; truncated: boolean } {
+export function boundedJsonCopy<T>(value: T, maxBytes: number): { value: T; truncated: boolean } {
 	let remaining = Math.max(0, maxBytes - 128);
 	let nodes = 50_000;
 	let truncated = false;

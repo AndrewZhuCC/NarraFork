@@ -17,8 +17,10 @@ const { narratorService } = await import("../narrator-service");
 const { narratorContext } = await import("../narrator-context");
 const originalSummary = narratorContext.generateCompactSummary;
 const agent = await import("../../lib/agent");
+const { OpenAIProvider } = await import("../../lib/agent/openai-provider");
 // Observe both builders without replacing their implementation or inputs.
 const historyBuild = spyOn(agent, "buildHistory");
+const compactRemote = spyOn(OpenAIProvider.prototype, "compactRemote");
 const { runCustomCompact, retryFailedCompact, __setCompactWatchdogTimingsForTests } = await import(
 	"../narrator-compact"
 );
@@ -105,6 +107,7 @@ beforeEach(() => {
 	requests = [];
 	localInputs = [];
 	historyBuild.mockClear();
+	compactRemote.mockClear();
 	settings.openaiProviders = [
 		{
 			id: "test-relay",
@@ -159,10 +162,14 @@ for (const model of [null, "", "   ", "__default__", "test-relay:gpt-5.3-codex"]
 }
 
 for (const kind of ["primary", "subagent", "stale-primary"] as const) {
-	test(`remote compact follows ${kind} runtime model and effort`, async () => {
+	test(`remote compact follows ${kind} runtime model, effort and conversation`, async () => {
 		const { activeNarrators, activeSubagentSettings } = await import("../narrator-session-state");
 		const { getSettingsRevision } = await import("../../lib/settings");
 		await seedNarrator();
+		await db
+			.update(narrators)
+			.set({ apiConversationId: "persisted-api-conversation" })
+			.where(eq(narrators.id, "n1"));
 		await message("new", 1);
 		settings.agent.defaultModel = "test-relay:gpt-5.4";
 		settings.agent.defaultReasoningEffort = "high";
@@ -171,6 +178,7 @@ for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 		} else {
 			activeNarrators.set("n1", {
 				narratorId: "n1",
+				conversationId: "live-api-conversation",
 				alive: true,
 				model: kind === "stale-primary" ? "test-relay:gpt-5.3-codex" : "test-relay:gpt-5.4",
 				provider: "openai",
@@ -186,12 +194,31 @@ for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 			expect(await runCustomCompact("n1", "en", undefined, { mode: "background" })).toBe(true);
 			expect(requests[0].model).toBe("gpt-5.4");
 			expect(requests[0].reasoning.effort).toBe(kind === "stale-primary" ? "medium" : "low");
+			expect(compactRemote).toHaveBeenCalledTimes(1);
+			expect(compactRemote.mock.calls[0][2]?.conversationId).toBe(
+				kind === "subagent" ? "persisted-api-conversation" : "live-api-conversation",
+			);
 		} finally {
 			activeNarrators.delete("n1");
 			activeSubagentSettings.delete("n1");
 		}
 	});
 }
+
+test("idle remote compact reuses the persisted API conversation id", async () => {
+	const { activeNarrators } = await import("../narrator-session-state");
+	await seedNarrator();
+	await db
+		.update(narrators)
+		.set({ apiConversationId: "persisted-api-conversation" })
+		.where(eq(narrators.id, "n1"));
+	await message("new", 1);
+	expect(activeNarrators.has("n1")).toBe(false);
+	expect(await runCustomCompact("n1", "en", undefined, { mode: "blocking" })).toBe(true);
+	expect(compactRemote).toHaveBeenCalledTimes(1);
+	expect(compactRemote.mock.calls[0][2]?.conversationId).toBe("persisted-api-conversation");
+	expect(localInputs).toEqual([]);
+});
 
 test("second and third bounded compacts replay only the immediate encrypted predecessor", async () => {
 	await seedNarrator();
@@ -358,6 +385,7 @@ test("unbounded manual compact includes its predecessor exactly once", async () 
 	await message("new", 2);
 	expect(await runCustomCompact("n1", "en", undefined, { mode: "blocking" })).toBe(true);
 	expect(requests[0].input.filter((entry) => entry.type === "compaction")).toEqual([item(7)]);
+	expect(compactRemote.mock.calls[0][2]?.conversationId).toBe("n1");
 });
 
 for (const summary of ["local summary", ""]) {

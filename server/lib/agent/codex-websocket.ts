@@ -181,6 +181,10 @@ export interface StreamCodexResponsesWebSocketOptions {
 	model: string;
 	request: CodexResponsesRequestBody;
 	signal: AbortSignal;
+	/** Use a private uncached connection, closed on completion (e.g. remote compaction). */
+	ephemeral?: boolean;
+	/** Request-scoped raw frames, before ordinary chat parsing. */
+	onResponseFrame?: (frame: string) => void;
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
 	resetSessionBeforeRequest?: boolean;
 	/** New user work starts fresh routing; absent means a continuation of the cached turn. */
@@ -1136,8 +1140,8 @@ export async function* streamCodexResponsesWebSocket(
 	options: StreamCodexResponsesWebSocketOptions,
 ): AsyncGenerator<ParsedStreamEvent> {
 	const cacheKey = buildSessionCacheKey(options);
-	const cachedSession = getOrCreateSession(cacheKey);
-	if (cachedSession.disabled) {
+	const cachedSession = options.ephemeral ? undefined : getOrCreateSession(cacheKey);
+	if (cachedSession?.disabled) {
 		throw new CodexWebSocketFallbackError("Codex Responses WebSocket is disabled for this session");
 	}
 	// A nested request under the same sticky key (a danger/plan/task reflection runs while
@@ -1146,9 +1150,9 @@ export async function* streamCodexResponsesWebSocket(
 	// socket carries one in-flight response, and touching the parent's response chain would
 	// corrupt its `previous_response_id` continuation. Run it on a private, uncached session
 	// instead: a fresh socket, full request, closed when this call ends.
-	const ephemeral = cachedSession.busy;
-	const session = ephemeral ? createSessionState() : cachedSession;
-	if (ephemeral) {
+	const ephemeral = !cachedSession || cachedSession.busy;
+	const session = cachedSession && !ephemeral ? cachedSession : createSessionState();
+	if (cachedSession?.busy) {
 		logger.info("Codex Responses WebSocket session busy; using an ephemeral connection", {
 			sessionKey: options.sessionKey,
 			credentialId: options.credentialId,
@@ -1667,6 +1671,7 @@ export async function* streamCodexResponsesWebSocket(
 				throw error;
 			}
 
+			options.onResponseFrame?.(frame.text);
 			let chunk: ResponsesAPIChunk;
 			try {
 				chunk = JSON.parse(frame.text) as ResponsesAPIChunk;

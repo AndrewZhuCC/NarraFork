@@ -239,6 +239,7 @@ export class CodexProvider implements ProviderAdapter {
 				...codexFingerprintConfig(),
 			},
 			proxy,
+			ctx.id,
 		);
 	}
 
@@ -494,7 +495,7 @@ export class CodexProvider implements ProviderAdapter {
 			throw new Error("Codex remote compact is disabled");
 		}
 		return this.runWithFailover("compact", (provider) =>
-			provider.compactRemote(input, model, options),
+			provider.compactRemote(input, model, { ...options, useWebSocket: this.useWebSocket }),
 		);
 	}
 
@@ -637,6 +638,7 @@ export class CodexProvider implements ProviderAdapter {
 
 				await reportInputCharacters(params, request);
 				params.onRequestStart?.({ credentialId: ctx.id, codexTools: request.tools as unknown[] });
+				provider.rememberCompactRequest(params, request);
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
