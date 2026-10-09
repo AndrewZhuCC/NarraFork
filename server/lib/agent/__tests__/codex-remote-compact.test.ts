@@ -111,14 +111,14 @@ describe("OpenAIProvider.compactRemote", () => {
 		}) as typeof fetch;
 		try {
 			const result = await provider.compactRemote(
-				[{ type: "message", role: "user" }],
+				[{ type: "message", role: "user", content: "hello" }],
 				"relay:gpt-5.3-codex",
 				{ conversationId: "conv-compact" },
 			);
 			expect(capturedUrl).toBe("https://example.invalid/v1/responses");
 			expect(capturedBody.model).toBe("gpt-5.3-codex");
 			expect(capturedBody.input).toEqual([
-				{ type: "message", role: "user" },
+				{ role: "user", content: [{ type: "input_text", text: "hello" }] },
 				{ type: "compaction_trigger" },
 			]);
 			expect(capturedBody.stream).toBe(true);
@@ -182,7 +182,7 @@ describe("OpenAIProvider.compactRemote", () => {
 		try {
 			await provider.compactRemote(
 				[
-					{ type: "message", role: "user", id: "abc123" },
+					{ type: "message", role: "user", id: "abc123", content: "hello" },
 					{ type: "reasoning", id: "rs1" },
 					{ type: "function_call", id: "fc1", call_id: "c1" },
 					{ type: "function_call_output", call_id: "c1", output: "ok" },
@@ -190,7 +190,7 @@ describe("OpenAIProvider.compactRemote", () => {
 				"relay:gpt-5.3-codex",
 			);
 			const input = capturedBody.input as Array<Record<string, unknown>>;
-			expect(input[0].id).toBe("msg_abc123");
+			expect(input[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "hello" }] });
 			expect(input[1].id).toBe("rs_rs1");
 			expect(input[2].id).toBe("fc_fc1");
 			expect(input[2].call_id).toBe("call_c1");

@@ -463,13 +463,40 @@ for (const apiMode of ["responses", "completions"] as const) {
 for (const transport of ["http", "ws", "native-ws"] as const) {
 	test(`Codex compact reuses the last ordinary ${transport} prefix across provider instances`, async () => {
 		const conversationId = `compact-prefix-${transport}`;
+		const history = [
+			{ role: "user", content: "shared history" },
+			{
+				type: "message",
+				id: "8f0834db-a8ff-4256-ba6e-3c2d67075577",
+				role: "assistant",
+				status: "completed",
+				phase: "final_answer",
+				content: [{ type: "output_text", text: "legacy reply" }],
+			},
+			{ role: "assistant", content: "" },
+			{ type: "reasoning", id: "rs_original", encrypted_content: "original-cipher", summary: [] },
+			{
+				type: "function_call",
+				id: "fc_original",
+				call_id: "original-call",
+				name: "Read",
+				arguments: "{}",
+			},
+		];
+		const trailingToolResults = [
+			{
+				type: "function_call_output",
+				call_id: "original-call",
+				output: "file contents",
+				_images: [{ format: "png", base64: "AA==" }],
+			},
+		];
 		const normal = await captureChat(
 			{
 				conversationId,
-				history: [
-					{ role: "developer", content: "stable project instructions" },
-					{ role: "user", content: "shared history" },
-				],
+				content: "",
+				history: [{ role: "developer", content: "stable project instructions" }, ...history],
+				toolResults: trailingToolResults,
 				tools: [parentFunction, { type: "web_search" }, { type: "image_generation" }],
 				reflectionTools: decisionTools,
 				serviceTier: "priority",
@@ -504,18 +531,6 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			undefined,
 			transport === "native-ws" ? "test-credential" : undefined,
 		);
-		const history = [
-			...(normal.body.input as unknown[]),
-			{ type: "reasoning", id: "rs_original", encrypted_content: "original-cipher", summary: [] },
-			{
-				type: "function_call",
-				id: "fc_original",
-				call_id: "original-call",
-				name: "Read",
-				arguments: "{}",
-			},
-			{ type: "function_call_output", call_id: "original-call", output: "file contents" },
-		];
 		const requests: Record<string, unknown>[] = [];
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
@@ -551,18 +566,29 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 		try {
 			const result = await provider.compactRemote(history, "codex:gpt-5.3-codex", {
 				conversationId,
+				trailingToolResults,
 			});
 			expect(result.items).toEqual([{ type: "compaction", encrypted_content: "compacted" }]);
 			const { input, ...prefix } = normal.body;
 			expect(requests[0]).toEqual({
 				...prefix,
-				input: [...history, { type: "compaction_trigger" }],
+				input: [...(input as unknown[]), { type: "compaction_trigger" }],
+			});
+			expect(
+				(requests[0].input as Array<{ role?: string; id?: string }>).filter(
+					(item) => item.role === "assistant",
+				),
+			).toEqual([{ role: "assistant", content: [{ type: "output_text", text: "legacy reply" }] }]);
+			expect(requests[0].input).toContainEqual({
+				role: "user",
+				content: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }],
 			});
 			expect(requests[0].tool_choice).toMatchObject({ type: "allowed_tools", mode: "auto" });
 			expect(requests[0].service_tier).toBe("priority");
 			await provider.compactRemote(history, "codex:gpt-5.3-codex", {
 				conversationId,
 				reasoningEffort: "low",
+				trailingToolResults,
 			});
 			expect(requests[1].reasoning).toEqual({ ...(prefix.reasoning as object), effort: "low" });
 			expect(ws).toHaveBeenCalledTimes(transport === "http" ? 0 : 2);

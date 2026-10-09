@@ -729,9 +729,14 @@ export class OpenAIProvider implements ProviderAdapter {
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 		const conversationId = options?.conversationId?.trim();
 		const prefix = getCodexCompactPrefix(this.compactRequestKey(model, conversationId));
-		const prepared = prepareCodexCompactInput(input, options?.trailingToolResults, {
-			preserveIds: !!prefix,
-		});
+		const prepared = prepareCodexCompactInput(
+			prepareResponsesInput(input as OAIMessage[], {
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: this.getActiveReasoningSource(),
+			}),
+			options?.trailingToolResults,
+			{ preserveIds: !!prefix },
+		);
 		const body: Record<string, unknown> = prefix
 			? { ...prefix, input: prepared }
 			: { model: parseModelId(model).model, input: prepared, stream: true, store: false };
@@ -986,16 +991,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				}
 			}
 
-			const sanitizedInputMessages = inputMessages.filter((msg) => {
-				if (msg.role !== "assistant") return true;
-				// Responses API rejects assistant role messages with null/empty content and no tool calls.
-				const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-				if (hasToolCalls) return true;
-				if (typeof msg.content === "string") return msg.content.length > 0;
-				if (Array.isArray(msg.content)) return msg.content.length > 0;
-				return false;
-			});
-			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages, {
+			const responsesInput = prepareResponsesInput(inputMessages, {
 				strict: hasCredentialBoundReasoning(model),
 				currentSource: this.getActiveReasoningSource(),
 			});
@@ -1913,18 +1909,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			inputMessages.push(msg);
 		}
 
-		const sanitizedInputMessages = inputMessages.filter((msg) => {
-			if (msg.role !== "assistant") return true;
-			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-			if (hasToolCalls) return true;
-			if (typeof msg.content === "string") return msg.content.length > 0;
-			if (Array.isArray(msg.content)) return msg.content.length > 0;
-			return false;
-		});
-
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
+			input: prepareResponsesInput(inputMessages, {
 				strict: hasCredentialBoundReasoning(model),
 				currentSource: this.getActiveReasoningSource(),
 			}),
@@ -2271,23 +2258,17 @@ function compactCallId(item: unknown): string {
 	return isRecord(item) && typeof item.call_id === "string" ? item.call_id : "";
 }
 
-function normalizeTrailingCompactOutput(item: unknown): unknown | null {
-	if (!isRecord(item)) return null;
-	if (item.type === "function_call_output" && typeof item.call_id === "string") {
-		return {
-			type: "function_call_output",
-			call_id: item.call_id,
-			output: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
-		};
+function normalizeTrailingCompactOutput(item: unknown): OAIMessage[] {
+	if (!isRecord(item) || typeof item.call_id !== "string") return [];
+	if (item.type !== "function_call_output" && !(item.type == null && item.output != null)) {
+		return [];
 	}
-	if (typeof item.call_id === "string" && item.output != null && item.type == null) {
-		return {
-			type: "function_call_output",
-			call_id: item.call_id,
-			output: typeof item.output === "string" ? item.output : JSON.stringify(item.output),
-		};
-	}
-	return null;
+	return expandResponsesToolResultMessage({
+		type: "function_call_output",
+		call_id: item.call_id,
+		output: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+		...(Array.isArray(item._images) ? { _images: item._images as ResponsesToolImage[] } : {}),
+	});
 }
 
 function mergeCodexCompactHistory(
@@ -2298,9 +2279,7 @@ function mergeCodexCompactHistory(
 	const withoutTrigger = (Array.isArray(history) ? history : []).filter(
 		(item) => compactItemType(item) !== "compaction_trigger",
 	);
-	const extras = trailingToolResults
-		.map(normalizeTrailingCompactOutput)
-		.filter((item): item is Record<string, unknown> => item != null);
+	const extras = trailingToolResults.flatMap(normalizeTrailingCompactOutput);
 	const merged = [...withoutTrigger, ...extras];
 	return preserveIds ? merged : rewriteCompactIds(merged);
 }
@@ -4966,6 +4945,18 @@ function buildReasoningTextFallback(
 
 // === Responses API history converter ===
 
+function prepareResponsesInput(
+	messages: OAIMessage[],
+	options: ReasoningReplayOptions,
+): OAIMessage[] {
+	const sanitized = messages.filter((msg) => {
+		if (msg.role !== "assistant") return true;
+		if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+		if (typeof msg.content === "string") return msg.content.length > 0;
+		return Array.isArray(msg.content) && msg.content.length > 0;
+	});
+	return convertHistoryToResponsesApi(sanitized, options);
+}
 /**
  * Convert standard Chat Completions history to Responses API format.
  * Transforms:
