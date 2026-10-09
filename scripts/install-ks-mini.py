@@ -255,7 +255,9 @@ def main():
         assert [item['name'] for item in pending_files] in (
             ['0012_curved_bloodstorm.sql'], ['0013_omniscient_dormammu.sql'],
             ['0014_blue_tomorrow_man.sql'], ['0015_nifty_magma.sql'],
-        ), ('Validation is limited to a single reviewed migration (0012, 0013, 0014 or 0015)',
+            ['0016_high_shiva.sql'], ['0017_merge_opensource_083.sql'],
+            ['0016_high_shiva.sql', '0017_merge_opensource_083.sql'],
+        ), ('Validation is limited to reviewed migrations (0012 through 0017, or 0016 + 0017)',
             [item['name'] for item in pending_files])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
@@ -311,8 +313,12 @@ def main():
 
     stable_install = None
     if prepare_update:
-        stable_install = {'launchdLabel': launchd_label, 'fromCommit': health['commit'],
-                          'toCommit': meta['commit'], 'certificateSha1': fingerprint}
+        source_commit = config.get('sourceCommit', health['commit'])
+        target_commit = config.get('targetCommit', meta['commit'])
+        assert re.fullmatch(r'[a-f0-9]{8,40}', source_commit) and source_commit.startswith(health['commit'])
+        assert re.fullmatch(r'[a-f0-9]{8,40}', target_commit) and target_commit.startswith(meta['commit'])
+        stable_install = {'launchdLabel': launchd_label, 'fromCommit': source_commit,
+                          'toCommit': target_commit, 'certificateSha1': fingerprint}
     result = {'backup': str(backup), 'installed': str(target), 'sha256': meta['sha256'],
               'version': meta['version'], 'commit': meta['commit'], 'oldBinary': str(old_binary),
               'oldSha256': old_sha, 'migrationCountBefore': len(hashes),

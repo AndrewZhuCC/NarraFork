@@ -319,7 +319,7 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 			shape[name] = index.sql;
 		}
 	}
-	if (targetTag === "0016_high_shiva") {
+	if (targetTag === "0016_high_shiva" || targetTag === "0017_merge_opensource_083") {
 		shape["narrator_message_refs.idx_narrator_refs_narrator_id"] = narratorRefsIndexShape(db);
 	}
 	if (targetTag === "0015_nifty_magma") {
@@ -418,12 +418,20 @@ async function main() {
 	try {
 		const beforeLedger = new Set(ledger(db));
 		const pending = migrationsWithTags.filter((migration) => !beforeLedger.has(migration.hash));
-		const target = pending[0];
-		if (pending.length !== 1 || !target?.tag || !ALLOWED_TARGET_TAGS.has(target.tag)) {
-			throw new Error("Validation is limited to a single explicitly allowed migration");
+		const target = pending.at(-1);
+		const merge083Pair =
+			pending.length === 2 &&
+			pending[0].tag === "0016_high_shiva" &&
+			target?.tag === "0017_merge_opensource_083";
+		if ((!merge083Pair && pending.length !== 1) || !target?.tag || !ALLOWED_TARGET_TAGS.has(target.tag)) {
+			throw new Error("Validation requires an allowed single migration or the 0016 + 0017 pair");
 		}
+		const affectedForUpgrade = (excludeNew: boolean) => ({
+			...affectedSummary(db, target.tag, excludeNew),
+			...(merge083Pair ? affectedSummary(db, "0016_high_shiva", excludeNew) : {}),
+		});
 		const beforeCounts = rowCounts(db);
-		const beforeAffected = affectedSummary(db, target.tag, true);
+		const beforeAffected = affectedForUpgrade(true);
 		const hadNextSeq = columns(db, "narrators").includes("next_seq");
 		if (hadNextSeq) {
 			db.exec("CREATE TEMP TABLE validation_next_seq_before AS SELECT id, next_seq FROM narrators");
@@ -450,7 +458,7 @@ async function main() {
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");
 		}
-		const afterAffected = affectedSummary(db, target.tag, true);
+		const afterAffected = affectedForUpgrade(true);
 		if (canonical(afterAffected) !== canonical(beforeAffected)) {
 			const changed = Object.keys(beforeAffected).filter(
 				(table) => canonical(beforeAffected[table]) !== canonical(afterAffected[table]),
@@ -511,7 +519,7 @@ async function main() {
 		const firstState = canonical({
 			ledger: ledger(db),
 			counts: rowCounts(db),
-			affected: affectedSummary(db, target.tag, false),
+			affected: affectedForUpgrade(false),
 			schema: schemaShape(db, target.tag),
 		});
 		await runUpgrade(db);
@@ -519,7 +527,7 @@ async function main() {
 		const secondState = canonical({
 			ledger: ledger(db),
 			counts: rowCounts(db),
-			affected: affectedSummary(db, target.tag, false),
+			affected: affectedForUpgrade(false),
 			schema: schemaShape(db, target.tag),
 		});
 		if (firstState !== secondState) throw new Error("Upgrade is not idempotent");
