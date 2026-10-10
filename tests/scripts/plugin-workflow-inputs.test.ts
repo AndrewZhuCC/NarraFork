@@ -6,7 +6,10 @@ import { panelMovePreservesState } from "../../scripts/smoke-narrator-dock";
 import { isolatedSmokeEnvironment } from "../../scripts/smoke-plugin-ui";
 
 type Step = { run?: string; if?: string; "continue-on-error"?: boolean };
-type Workflow = { jobs: Record<string, { steps: Step[] }> };
+type Workflow = {
+	on: { push: { paths: string[] }; pull_request: { paths: string[] } };
+	jobs: Record<string, { steps: Step[] }>;
+};
 const root = resolve(import.meta.dir, "../..");
 const workflow = Bun.YAML.parse(
 	readFileSync(join(root, ".github/workflows/plugin-platform-acceptance.yml"), "utf8"),
@@ -44,6 +47,22 @@ function directDependencies(script: string): string[] {
 }
 
 describe("plugin acceptance workflow inputs", () => {
+	test("local read security code and fixtures trigger their consuming platform lane", () => {
+		for (const event of ["push", "pull_request"] as const) {
+			for (const path of [
+				"server/lib/agent/execution/local-backend.ts",
+				"server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+			]) {
+				expect(workflow.on[event].paths).toContain(path);
+			}
+		}
+		expect(
+			steps.some((step) =>
+				step.run?.includes("server/lib/agent/execution/__tests__/local-backend-read.test.ts"),
+			),
+		).toBe(true);
+	});
+
 	test("a no-op panel drag cannot pass just because its textarea sentinel survived", () => {
 		const moved = {
 			from: { left: 420, top: 200 },

@@ -7,6 +7,8 @@ on:
     paths:
       - "server/lib/plugins/**"
       - "server/lib/platform-path.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/agent/execution/__tests__/local-backend-read.test.ts"
       - "server/services/plugin-*.ts"
       - "server/services/__tests__/plugin-*.test.ts"
       - "server/routes/plugin-ui.ts"
@@ -31,6 +33,8 @@ on:
     paths:
       - "server/lib/plugins/**"
       - "server/lib/platform-path.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/agent/execution/__tests__/local-backend-read.test.ts"
       - "server/services/plugin-*.ts"
       - "server/services/__tests__/plugin-*.test.ts"
       - "server/routes/plugin-ui.ts"
