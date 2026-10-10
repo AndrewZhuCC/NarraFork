@@ -236,7 +236,9 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	for (const restore of restores.reverse()) restore();
-	sqlite.close();
+	// Finalize Drizzle's prepared statements instead of deferring SQLite's native
+	// connection disposal to GC, which leaves fixture files locked on Windows.
+	sqlite.close(true);
 	await fs.rm(root, { recursive: true, force: true });
 });
 function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
@@ -506,6 +508,23 @@ function hold() {
 }
 
 describe("rollback activity admission and bounded ranges", () => {
+	test("strict fixture close releases retained prepared statements before directory removal", async () => {
+		const directory = await fs.mkdtemp(join(root, "close-probe-"));
+		const client = new Database(join(directory, "owned.sqlite"));
+		client.exec("PRAGMA journal_mode=WAL; CREATE TABLE owned(value TEXT);");
+		const retained = client.prepare("SELECT value FROM owned");
+		try {
+			expect(retained.all()).toEqual([]);
+			client.close(true);
+			expect(() => retained.all()).toThrow("Database has closed");
+			await fs.rm(directory, { recursive: true, force: true });
+			await expect(fs.access(directory)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			retained.finalize();
+			client.close(true);
+		}
+	});
+
 	test.each([
 		256, 257, 1000,
 	])("%s fixed targets keep scope admission within the global range budget", async (count) => {
@@ -1695,7 +1714,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(history()).toBe(before);
 		expect(journalFiles(plan)[0].receiptJson).toMatchObject({ apply: { receipt: null } });
 		await fs.writeFile(a, "human after unknown write");
-		sqlite.close();
+		sqlite.close(true);
 		sqlite = new Database(join(root, "isolated.sqlite"));
 		sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
 		db = database(sqlite);
