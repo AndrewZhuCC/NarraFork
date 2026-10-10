@@ -391,6 +391,8 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Omitted by read-only/public transcripts. */
+	onOpenUISend?: (message: string) => Promise<unknown>;
 	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
 	deferInteractions?: boolean;
 	isSubagent?: boolean;
@@ -520,6 +522,7 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				onOpenUISend,
 				deferInteractions = true,
 				isSubagent,
 				isActive = false,
@@ -5238,6 +5241,7 @@ export const PretextExactMessageList = memo(
 						rowInteraction: traceBinding?.rowInteraction,
 						closingRowKeys: closingRows.get(item.spec.key),
 						narratorId,
+						onOpenUISend,
 						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
 						onFetchAttachment: dataSource?.onFetchAttachment,
 						openAttachmentLabel,

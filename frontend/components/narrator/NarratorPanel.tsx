@@ -1698,6 +1698,10 @@ function NarratorPanelBody({
 		retryRecoveryAllowsContinue;
 
 	const hasChapter = !!narrator?.chapterId;
+	const handleOpenUISend = useCallback(
+		(message: string) => api.sendNarratorMessage(narratorId, `[OpenUI]\n${message}`),
+		[narratorId],
+	);
 
 	// --- Fork + ask-in-passing handlers ---
 	// Kept lifted here: the resolved handlers feed the trace-row action context
@@ -3178,6 +3182,7 @@ function NarratorPanelBody({
 															onTailMetaChange={handleMessageListTailMetaChange}
 															onLodStep={handleLodStep}
 															onSelectionResolverChange={setChunkSelectionResolver}
+															onOpenUISend={handleOpenUISend}
 															rowHandlers={vlistRowHandlers}
 															permCb={permCbWithAsyncQuestions}
 															hasChapter={hasChapter}

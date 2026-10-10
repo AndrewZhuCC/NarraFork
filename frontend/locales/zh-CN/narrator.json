@@ -1,5 +1,25 @@
 {
 	"you": "你",
+	"openui": {
+		"title": "交互界面",
+		"preview": "预览",
+		"source": "源码",
+		"expand": "展开",
+		"copySource": "复制源码",
+		"copied": "已复制",
+		"copyFailed": "复制失败，请手动选中并复制文字。",
+		"readOnly": "只读：此处无法发送消息。",
+		"streaming": "正在生成…",
+		"sending": "正在发送…",
+		"sent": "已发送",
+		"renderError": "无法渲染此界面，可查看源码。",
+		"sourceTooLarge": "OpenUI 源码超过 64 KiB，已禁用预览。",
+		"sourceTruncated": "源码已截断至 64 KiB，复制也仅包含此片段。",
+		"actionBlocked": "不允许执行此操作。",
+		"messageTooLarge": "表单提交内容超过大小限制。",
+		"sendFailed": "发送失败，请重试。",
+		"unsupportedForm": "部分表单字段无法安全提交，请改用文字发送这些值。"
+	},
 	"largeFile": {
 		"size": "文件大小：{{size}}（{{bytes}} 字节）",
 		"deferred": "文件超过 1 MiB，尚未加载内容。确认后将以只读分页方式查看；该选择仅对当前窗格保存。",

@@ -500,6 +500,23 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 			}
 			case "code": {
 				const lang = (token.lang ?? "").trim().toLowerCase();
+				if (lang === "openui-lang" || lang === "openui") {
+					const fence = token.raw.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+					const closed =
+						!fence ||
+						new RegExp(`\\n {0,3}${fence[0]}{${fence.length},}[ \\t]*(?:\\n)?$`).test(token.raw);
+					appendGroup(
+						blocks,
+						[
+							buildUnknownBlock("openui", 240, ctx, {
+								source: token.text,
+								isStreaming: !closed,
+							}),
+						],
+						typographyMetrics().margin.code,
+					);
+					continue;
+				}
 				// Mermaid diagrams have intrinsic SVG height that cannot be predicted
 				// from the source text; emit an unknown placeholder (not a code block).
 				if (lang === "mermaid") {

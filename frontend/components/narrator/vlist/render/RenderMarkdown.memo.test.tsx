@@ -126,6 +126,8 @@ function inputs(): Required<Inputs> {
 		sealOnMount: false,
 		animKeyBase: "same-body",
 		animScope: "memo-test-narrator",
+		onOpenUISend: async () => {},
+		openUIStateKey: "memo-test:openui",
 		typographyRevision: typography.getTypographyRevision(),
 	};
 }
@@ -140,6 +142,8 @@ function changedInputs(a: Inputs): Required<Inputs> {
 		sealOnMount: true,
 		animKeyBase: "different-body-key",
 		animScope: "different-narrator-scope",
+		onOpenUISend: async () => {},
+		openUIStateKey: "different-openui-state",
 		typographyRevision: a.typographyRevision + 1,
 	};
 }
@@ -152,6 +156,8 @@ const inputKeys = [
 	"sealOnMount",
 	"animKeyBase",
 	"animScope",
+	"onOpenUISend",
+	"openUIStateKey",
 	"typographyRevision",
 ] as const satisfies readonly (keyof Inputs)[];
 const measuredKeys = ["height", "blocks", "frame", "contentWidth", "usedWidth"] as const;

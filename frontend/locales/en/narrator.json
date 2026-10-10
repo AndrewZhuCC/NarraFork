@@ -1,5 +1,25 @@
 {
 	"you": "You",
+	"openui": {
+		"title": "OpenUI",
+		"preview": "Preview",
+		"source": "Source",
+		"expand": "Expand",
+		"copySource": "Copy source",
+		"copied": "Copied",
+		"copyFailed": "Copy failed. Please select and copy the text manually.",
+		"readOnly": "Read-only: sending is unavailable here.",
+		"streaming": "Generating…",
+		"sending": "Sending…",
+		"sent": "Sent",
+		"renderError": "Unable to render this UI. View the source for details.",
+		"sourceTooLarge": "OpenUI source exceeds 64 KiB; preview is disabled.",
+		"sourceTruncated": "Source is truncated to 64 KiB; copying also uses this excerpt.",
+		"actionBlocked": "This action is not allowed.",
+		"messageTooLarge": "Form submission exceeds the size limit.",
+		"sendFailed": "Sending failed. Please try again.",
+		"unsupportedForm": "Some form fields cannot be safely submitted here. Please send their values as text."
+	},
 	"largeFile": {
 		"size": "File size: {{size}} ({{bytes}} bytes)",
 		"deferred": "This file exceeds 1 MiB. Content has not been loaded. Continue to view it in read-only pages; your choice is saved for this pane only.",

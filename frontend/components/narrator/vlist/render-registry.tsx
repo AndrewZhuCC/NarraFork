@@ -280,6 +280,8 @@ export function renderElement(
 						sealOnMount={extra.sealOnMount as boolean | undefined}
 						animKeyBase={extra.animKeyBase as string | undefined}
 						animScope={extra.animScope as string | undefined}
+						onOpenUISend={extra.onOpenUISend as ((message: string) => Promise<unknown>) | undefined}
+						openUIStateKey={extra.openUIStateKey as string | undefined}
 					/>
 				</FileReferenceScopeProvider>
 			);

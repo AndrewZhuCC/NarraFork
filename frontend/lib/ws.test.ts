@@ -25,6 +25,7 @@ function withBrowserLocation(
 	location: { protocol: string; hostname: string; host: string; port: string },
 	baseURI: string,
 	fn: () => void,
+	viteHost = "0.0.0.0",
 ): void {
 	const patches = [
 		patchGlobal("window", { location }),
@@ -32,6 +33,7 @@ function withBrowserLocation(
 		patchGlobal("document", { baseURI }),
 		patchGlobal("__DEV_VITE_PORT__", "41221"),
 		patchGlobal("__DEV_BACKEND_PORT__", "7778"),
+		patchGlobal("__DEV_VITE_HOST__", viteHost),
 	];
 	resetAppBaseForTest();
 	try {
@@ -72,6 +74,37 @@ describe("buildWsUrl", () => {
 			() => {
 				expect(buildWsUrl("/ws/terminal")).toBe("ws://localhost:7778/ws/terminal");
 			},
+		);
+	});
+
+	test("uses the backend port for the explicitly configured LAN Vite host", () => {
+		withBrowserLocation(
+			{
+				protocol: "http:",
+				hostname: "192.168.119.105",
+				host: "192.168.119.105:41221",
+				port: "41221",
+			},
+			"http://192.168.119.105:41221/",
+			() =>
+				expect(buildWsUrl("/ws/narrator", "token=test")).toBe(
+					"ws://192.168.119.105:7778/ws/narrator?token=test",
+				),
+			"192.168.119.105",
+		);
+	});
+
+	test("does not turn arbitrary LAN hosts into direct-backend connections", () => {
+		withBrowserLocation(
+			{
+				protocol: "http:",
+				hostname: "192.168.119.104",
+				host: "192.168.119.104:41221",
+				port: "41221",
+			},
+			"http://192.168.119.104:41221/nf/",
+			() => expect(buildWsUrl("/ws/narrator")).toBe("ws://192.168.119.104:41221/nf/ws/narrator"),
+			"192.168.119.105",
 		);
 	});
 });

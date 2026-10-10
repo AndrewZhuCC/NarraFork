@@ -140,6 +140,7 @@ function mathBaseFontSize(): number {
 const LazyMermaidDiagram = lazy(() =>
 	import("../../markdown/MermaidDiagram").then((m) => ({ default: m.MermaidDiagram })),
 );
+const LazyOpenUIBlock = lazy(() => import("../../openui/OpenUIBlock"));
 
 export interface RenderMarkdownProps {
 	measured: MeasuredElement;
@@ -182,6 +183,9 @@ export interface RenderMarkdownProps {
 	 * whether a new paragraph faded in or popped.
 	 */
 	animScope?: string;
+	/** Only the writable narrator surface supplies this; other renders stay read-only. */
+	onOpenUISend?: (message: string) => Promise<unknown>;
+	openUIStateKey?: string;
 }
 
 interface MarkdownBodyProps extends RenderMarkdownProps {
@@ -221,6 +225,8 @@ function RenderMarkdownBody({
 	sealOnMount,
 	animKeyBase,
 	animScope,
+	onOpenUISend,
+	openUIStateKey,
 }: MarkdownBodyProps) {
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
@@ -357,6 +363,8 @@ function RenderMarkdownBody({
 								animScope={animScope}
 								sealAnimation={sealAnimation}
 								codeCopyPlacement={copyPlacements.get(index)}
+								onOpenUISend={onOpenUISend}
+								openUIStateKey={openUIStateKey ? `${openUIStateKey}:${index}` : ""}
 							/>
 						</div>
 					);
@@ -395,6 +403,8 @@ function RenderMarkdownBody({
 							animScope={animScope}
 							sealAnimation={sealAnimation}
 							codeCopyPlacement={copyPlacements.get(index)}
+							onOpenUISend={onOpenUISend}
+							openUIStateKey={openUIStateKey ? `${openUIStateKey}:${index}` : ""}
 						/>
 					</Fragment>
 				);
@@ -546,6 +556,8 @@ function BlockView({
 	animScope,
 	sealAnimation,
 	codeCopyPlacement,
+	onOpenUISend,
+	openUIStateKey,
 }: {
 	block: PreparedBlock;
 	frame: BlockFrame;
@@ -559,6 +571,8 @@ function BlockView({
 	sealAnimation?: boolean;
 	/** Non-default corner for a fenced panel's copy button; absent → top-right. */
 	codeCopyPlacement?: CodeCopyPlacement;
+	onOpenUISend?: (message: string) => Promise<unknown>;
+	openUIStateKey?: string;
 }) {
 	switch (block.kind) {
 		case "inline":
@@ -588,7 +602,15 @@ function BlockView({
 		case "fixed":
 			return null; // rendered by the owning element's renderer via block.tag
 		case "unknown":
-			return <UnknownBlockView block={block} frame={frame} flowing={flowing} />;
+			return (
+				<UnknownBlockView
+					block={block}
+					frame={frame}
+					flowing={flowing}
+					onOpenUISend={onOpenUISend}
+					openUIStateKey={openUIStateKey}
+				/>
+			);
 	}
 }
 
@@ -1532,10 +1554,14 @@ function UnknownBlockView({
 	block,
 	frame,
 	flowing,
+	onOpenUISend,
+	openUIStateKey,
 }: {
 	block: PreparedUnknownBlock;
 	frame: BlockFrame;
 	flowing: boolean;
+	onOpenUISend?: (message: string) => Promise<unknown>;
+	openUIStateKey?: string;
 }) {
 	const source =
 		typeof block.data?.source === "string"
@@ -1546,6 +1572,23 @@ function UnknownBlockView({
 
 	const body = (() => {
 		switch (block.tag) {
+			case "openui":
+				return (
+					<Suspense
+						fallback={
+							<pre style={{ margin: 0, padding: 8, maxHeight: 240, overflow: "auto" }}>
+								{source.slice(0, 65_536)}
+							</pre>
+						}
+					>
+						<LazyOpenUIBlock
+							source={source}
+							isStreaming={block.data?.isStreaming === true}
+							stateKey={openUIStateKey ?? ""}
+							onSend={onOpenUISend}
+						/>
+					</Suspense>
+				);
 			case "mermaid":
 				return source ? (
 					<Suspense

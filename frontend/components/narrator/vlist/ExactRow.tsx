@@ -164,6 +164,7 @@ export interface ExactRowProps {
 	closingRowKeys?: ReadonlySet<string>;
 	/** Panel narrator id — injected into extra so media/tool details load images. */
 	narratorId: string;
+	onOpenUISend?: (message: string) => Promise<unknown>;
 	/**
 	 * Open a text-file attachment in a read-only file panel. Injected into the
 	 * render extra (the pure render layer owns no dock knowledge); absent → user
@@ -375,6 +376,7 @@ export const ExactRow = memo(
 		injectionNavigation,
 		currentUserId,
 		narratorId,
+		onOpenUISend,
 		permissionSlot,
 		traceRowPermissionSlots,
 		onPermissionFormHeight,
@@ -404,6 +406,10 @@ export const ExactRow = memo(
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
+		if (kind === "markdown") {
+			extra.openUIStateKey = `${currentUserId ?? "public"}:${narratorId}:${item.spec.key}`;
+			if (messageRole === "assistant") extra.onOpenUISend = onOpenUISend;
+		}
 		// Read-only shares retain this reader-owned fold without enabling mutation/menu actions.
 		extra.textPreviewLabels = renderLabels.textPreview;
 		extra.onToggleTextExpanded = toggles.onToggleTextExpanded;
@@ -1059,6 +1065,7 @@ export const ExactRow = memo(
 		prev.interaction === next.interaction &&
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
+		prev.onOpenUISend === next.onOpenUISend &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.onFetchAttachment === next.onFetchAttachment &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&

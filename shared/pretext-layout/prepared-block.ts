@@ -231,7 +231,7 @@ export interface PreparedUnknownBlock extends PreparedBlockBase {
 	/** Conservative placeholder height (px) used until refined. */
 	placeholderHeight: number;
 	/** What kind of unpredictable content this is. */
-	tag: "mermaid" | "katex" | "image-unknown";
+	tag: "mermaid" | "katex" | "image-unknown" | "openui";
 	/**
 	 * Known rendered width (px), when the content's geometry IS predictable.
 	 * Display formulas measured via katex-geometry set this; mermaid and

@@ -20,6 +20,7 @@ import { assetUrl } from "@frontend/lib/base-path";
 
 declare const __DEV_VITE_PORT__: string | undefined;
 declare const __DEV_BACKEND_PORT__: string | undefined;
+declare const __DEV_VITE_HOST__: string | undefined;
 
 export function buildWsUrl(path: string, query?: string): string {
 	const suffix = query ? `?${query}` : "";
@@ -53,7 +54,11 @@ export function buildWsUrl(path: string, query?: string): string {
 function isLocalViteDirect(vitePort: string): boolean {
 	const { hostname, port } = window.location;
 	const isLocal = hostname === "localhost" || hostname === "127.0.0.1";
-	return isLocal && port === vitePort;
+	const isExplicitDevHost =
+		typeof __DEV_VITE_HOST__ === "string" &&
+		__DEV_VITE_HOST__ !== "0.0.0.0" &&
+		hostname === __DEV_VITE_HOST__;
+	return (isLocal || isExplicitDevHost) && port === vitePort;
 }
 
 /**

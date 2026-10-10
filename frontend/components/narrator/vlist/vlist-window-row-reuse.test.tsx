@@ -100,6 +100,7 @@ const PROP_KEYS = {
 	specTaskLive: true,
 	onQuoteJump: true,
 	onFetchAttachment: true,
+	onOpenUISend: true,
 	resolveToolDetailStatus: true,
 } satisfies Record<keyof ExactRowProps, true>;
 

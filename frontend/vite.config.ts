@@ -25,6 +25,8 @@ import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 
 const vitePort = Number(process.env.VITE_PORT) || 7778;
 const backendPort = Number(process.env.BACKEND_PORT) || 7779;
+const viteHost = process.env.VITE_HOST || "0.0.0.0";
+const backendHost = process.env.BACKEND_HOST || "localhost";
 const frontendOutDir = resolve(__dirname, "..", "dist", "frontend");
 /**
  * Path of the module `shikiLanguageAliases()` substitutes, normalized to forward
@@ -517,8 +519,9 @@ export default defineConfig(({ mode, command }) => {
 		define: {
 			// Inject dev ports whenever running the dev server (regardless of mode)
 			// so that WS URL rewriting works in start:dev (production mode + vite serve)
-			__DEV_VITE_PORT__: isServe ? JSON.stringify(vitePort) : "undefined",
-			__DEV_BACKEND_PORT__: isServe ? JSON.stringify(backendPort) : "undefined",
+			__DEV_VITE_PORT__: isServe ? JSON.stringify(String(vitePort)) : "undefined",
+			__DEV_BACKEND_PORT__: isServe ? JSON.stringify(String(backendPort)) : "undefined",
+			__DEV_VITE_HOST__: isServe ? JSON.stringify(viteHost) : "undefined",
 			__APP_VERSION__: JSON.stringify(appVersion),
 		},
 		plugins: [
@@ -683,7 +686,7 @@ export default defineConfig(({ mode, command }) => {
 			// client-side port without falling back to its wildcard-host target
 			// (which Vite resolves to localhost when host is 0.0.0.0).
 			strictPort: true,
-			host: "0.0.0.0",
+			host: viteHost,
 			// A non-null clientPort disables Vite's direct HMR fallback. The initial
 			// connection still uses the page's host/protocol and the configured base,
 			// so a reverse proxy never gets a localhost fallback URL.
@@ -695,7 +698,7 @@ export default defineConfig(({ mode, command }) => {
 			],
 			proxy: {
 				"/api": {
-					target: `http://localhost:${backendPort}`,
+					target: `http://${backendHost}:${backendPort}`,
 					changeOrigin: true,
 				},
 				// NOTE: WS proxy via Vite does NOT work when Vite runs under
@@ -705,7 +708,7 @@ export default defineConfig(({ mode, command }) => {
 				// The entry below is kept so that if Vite is ever run with real
 				// Node.js, the proxy will work out of the box.
 				"/ws": {
-					target: `http://localhost:${backendPort}`,
+					target: `http://${backendHost}:${backendPort}`,
 					ws: true,
 					changeOrigin: true,
 				},

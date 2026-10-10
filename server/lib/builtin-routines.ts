@@ -5,6 +5,8 @@
  * materialize a `SKILL.md` when enabled (see `routine-service`).
  */
 
+import { OPENUI_SKILL_CONTENT } from "../generated/openui-skill";
+
 export interface BuiltinCommandDef {
 	name: string;
 	prompt: string;
@@ -387,6 +389,20 @@ When testing is warranted, verify observable behavior rather than wording. Prefe
 - Unrelated permissions, product decisions, or scope expansions
 - Empty directories, placeholder examples, or docs nobody will read
 `,
+		},
+	},
+	{
+		id: "nf-openui",
+		type: "skill",
+		category: "workflow",
+		defaultEnabled: false,
+		skill: {
+			name: "nf-openui",
+			descriptionEn:
+				"Show interactive charts, cards, tables, or forms inside NarraFork chat when requested; not for ordinary answers or code development",
+			descriptionZh:
+				"仅在用户要求于 NarraFork 聊天内展示交互图表、卡片、表格或表单时使用；普通回答和代码开发无需加载",
+			content: OPENUI_SKILL_CONTENT,
 		},
 	},
 ];
