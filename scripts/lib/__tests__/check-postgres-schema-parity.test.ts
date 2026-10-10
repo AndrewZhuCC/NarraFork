@@ -404,10 +404,20 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 116 tables and 1672 columns including question events and background kind", () => {
-		expect(target.tables.length).toBe(116);
-		// 1669 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1672);
+	test("covers 118 tables and 1683 columns including reusable Git identities", () => {
+		expect(target.tables.length).toBe(118);
+		// 1680 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1683);
+		expect(
+			target.tables
+				.find((table) => table.name === "user_git_identities")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "userId", "name", "email", "isDefault", "createdAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_git_identity_bindings")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "narratorId", "userId", "identityId", "updatedAt"]);
 		expect(
 			target.tables
 				.find((table) => table.name === "background_tasks")

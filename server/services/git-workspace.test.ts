@@ -6,7 +6,14 @@ import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
+import {
+	chapters,
+	narrators,
+	projects,
+	remoteDevices,
+	userGitIdentities,
+	users,
+} from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
@@ -169,6 +176,16 @@ beforeEach(async () => {
 		passwordHash: "fixture",
 		gitUsername: "Acting User",
 		gitEmail: "acting@example.invalid",
+		createdAt: now(),
+	});
+	// The reusable identity table is authoritative; legacy profile fields are
+	// only startup migration input and this user is created after startup.
+	await db.insert(userGitIdentities).values({
+		id: generateId(),
+		userId: owner,
+		name: "Acting User",
+		email: "acting@example.invalid",
+		isDefault: true,
 		createdAt: now(),
 	});
 	narratorId = await newNarrator(repo);
