@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"unsafe"
@@ -122,7 +123,9 @@ func TestWindowsConditionalNativeReplacement(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				f, err := openConditionalWindowsFile(target, windows.WRITE_OWNER)
+				// LABEL_SECURITY_INFORMATION is merged with the current SACL by
+				// SetSecurityInfo, so the handle also needs READ_CONTROL.
+				f, err := openConditionalWindowsFile(target, windows.WRITE_OWNER|windows.READ_CONTROL)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -238,6 +241,65 @@ func TestWindowsConditionalVerificationRollbackAndCancellation(t *testing.T) {
 	}
 }
 
+func TestWindowsConditionalRestoredOriginalReverified(t *testing.T) {
+	for _, kind := range []string{"content", "metadata"} {
+		t.Run(kind, func(t *testing.T) {
+			target, tmp, info, metadata := windowsReplacementFixture(t)
+			// The transaction pins a DELETE-capable handle. os.WriteFile omits
+			// FILE_SHARE_DELETE and would fail before reaching the verification
+			// branch; use the shared native opener for this controlled writer.
+			overwrite := func(path string, content []byte) error {
+				file, err := openConditionalWindowsFile(path, windows.GENERIC_WRITE)
+				if err != nil {
+					return err
+				}
+				defer file.Close()
+				if err := file.Truncate(0); err != nil {
+					return err
+				}
+				_, err = file.WriteAt(content, 0)
+				return err
+			}
+			native, rename := conditionalReplaceFile, conditionalRenameHandle
+			conditionalReplaceFile = func(target, replacement, backup string) error {
+				if err := native(target, replacement, backup); err != nil {
+					return err
+				}
+				return overwrite(target, []byte("corrupt"))
+			}
+			conditionalRenameHandle = func(f *os.File, destination string) error {
+				if err := rename(f, destination); err != nil {
+					return err
+				}
+				if destination == target {
+					if kind == "content" {
+						return overwrite(target, []byte("external"))
+					}
+					testSetWindowsDACL(t, target, "D:P(A;;FA;;;"+testWindowsUserSID(t)+")", true)
+				}
+				return nil
+			}
+			t.Cleanup(func() { conditionalReplaceFile, conditionalRenameHandle = native, rename })
+			err := commitConditionalReplacement(context.Background(), target, tmp, info, metadata, []byte("next"))
+			if err == nil || !strings.Contains(err.Error(), "restore verification failed") || !strings.Contains(err.Error(), "state uncertain") || strings.Contains(err.Error(), "original restored") {
+				t.Fatalf("post-restore interference must not be reported as restored: %v", err)
+			}
+			got, e := os.ReadFile(target)
+			want := "original"
+			if kind == "content" {
+				want = "external"
+			}
+			if e != nil || string(got) != want {
+				t.Fatalf("interference was overwritten: %q %v", got, e)
+			}
+			recovery, e := filepath.Glob(filepath.Join(filepath.Dir(target), ".nf-transaction-*", "replacement"))
+			if e != nil || len(recovery) != 1 {
+				t.Fatalf("uncertain restore lost recovery evidence: %v %v", recovery, e)
+			}
+		})
+	}
+}
+
 func TestWindowsConditionalRecoveryFailureRetainsBackup(t *testing.T) {
 	target, tmp, info, metadata := windowsReplacementFixture(t)
 	native, rename := conditionalReplaceFile, conditionalRenameHandle
@@ -252,8 +314,8 @@ func TestWindowsConditionalRecoveryFailureRetainsBackup(t *testing.T) {
 	conditionalRenameHandle = func(*os.File, string) error { return windows.ERROR_ACCESS_DENIED }
 	t.Cleanup(func() { conditionalReplaceFile, conditionalRenameHandle = native, rename })
 	err := commitConditionalReplacement(context.Background(), target, tmp, info, metadata, []byte("next"))
-	if err == nil || !strings.Contains(err.Error(), backup) {
-		t.Fatalf("recovery error must identify backup: %v", err)
+	if backup == "" || err == nil || !strings.Contains(err.Error(), strconv.Quote(backup)) {
+		t.Fatalf("recovery error must identify quoted backup %q: %v", backup, err)
 	}
 	got, e := os.ReadFile(backup)
 	if e != nil || string(got) != "original" {
@@ -354,7 +416,10 @@ func TestWindowsConditionalRestrictedTokenCustomDACL(t *testing.T) {
 			t.Fatal("administrator SID still enabled")
 		}
 	}
-	var privileges [4096]byte
+	// GetTokenInformation writes TOKEN_PRIVILEGES, not an arbitrarily aligned
+	// byte array. Keep the original fixed budget with typed, aligned storage.
+	var privilegeBacking [4096 / 8]uint64
+	privileges := unsafe.Slice((*byte)(unsafe.Pointer(&privilegeBacking[0])), 4096)
 	var returned uint32
 	if err := windows.GetTokenInformation(impersonation, windows.TokenPrivileges, &privileges[0], uint32(len(privileges)), &returned); err != nil {
 		t.Fatal(err)

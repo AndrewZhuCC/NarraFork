@@ -3,13 +3,13 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type securityNopSender struct{}
@@ -646,6 +646,14 @@ func TestPathGuardRejectsEscapingWindowsJunctions(t *testing.T) {
 	if got, err := guard.CheckExisting(filepath.Join(root, "inside-junction", "safe.txt")); err != nil || !samePath(got, canonicalFixturePath(t, insideFile)) {
 		t.Fatalf("internal junction rejected: got=%q err=%v", got, err)
 	}
+	insideCreate := filepath.Join(canonicalFixturePath(t, inside), "new", "created.txt")
+	if got, err := guard.CheckCreate(filepath.Join(root, "inside-junction", "new", "created.txt")); err != nil || !samePath(got, insideCreate) {
+		t.Fatalf("internal junction create rejected: got=%q err=%v", got, err)
+	}
+	junctionRoot := NewPathGuard([]string{filepath.Join(root, "inside-junction")})
+	if got, err := junctionRoot.CheckCreate(filepath.Join(inside, "new", "created.txt")); err != nil || !samePath(got, insideCreate) {
+		t.Fatalf("configured junction root was not canonicalized: got=%q err=%v", got, err)
+	}
 
 	h := New(guard, 1024*1024)
 	if _, err := h.FsRead(map[string]any{"path": outsideSecret}); err == nil {
@@ -657,10 +665,19 @@ func TestPathGuardRejectsEscapingWindowsJunctions(t *testing.T) {
 	}
 }
 
+// Installed by the Windows-only fixture helper, so non-Windows builds need no
+// Windows SysProcAttr fields and never invoke a placeholder shell implementation.
+var windowsJunctionCommand func(context.Context, string, string) *exec.Cmd
+
 func requireWindowsJunction(t *testing.T, target, link string) {
 	t.Helper()
-	command := fmt.Sprintf(`mklink /J "%s" "%s"`, link, target)
-	if output, err := exec.Command("cmd.exe", "/d", "/s", "/c", command).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if windowsJunctionCommand == nil {
+		t.Fatal("native Windows junction command is unavailable")
+	}
+	command := windowsJunctionCommand(ctx, link, target)
+	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("create junction %q -> %q: %v (%s)", link, target, err, output)
 	}
 }

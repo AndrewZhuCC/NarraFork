@@ -106,7 +106,14 @@ func newWindowsRecoveryDirectory(target string) (string, *os.File, error) {
 		return "", nil, err
 	}
 	sid := user.User.Sid.String()
-	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;SY)")
+	acl := "(A;OICI;FA;;;" + sid + ")"
+	// When the caller is SYSTEM these are the same trustee. Windows merges
+	// identical ACEs at directory creation; construct that exact ACL up front
+	// so the strict post-creation owner/protection/byte verification remains valid.
+	if sid != "S-1-5-18" {
+		acl += "(A;OICI;FA;;;SY)"
+	}
+	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P" + acl)
 	if err != nil {
 		return "", nil, err
 	}
@@ -393,6 +400,14 @@ func commitConditionalReplacement(ctx context.Context, target, tmpPath string, o
 	// No overwrite: an external creation in this interval wins, backup survives.
 	if e := conditionalRenameHandle(backupFile, target); e != nil {
 		return fmt.Errorf("restore failed; original backup %q and replacement recovery %q retained: %v; cause: %w", backup, recovery, e, cause)
+	}
+	// Rename completion alone is not proof of restoration. Recheck the bound
+	// original's identity, bytes and strict metadata after the move as well.
+	if _, e := backupFile.Seek(0, io.SeekStart); e != nil {
+		return fmt.Errorf("restore verification failed; inspect %q and recovery %q; state uncertain: %v; cause: %w", target, recovery, e, cause)
+	}
+	if e := verifyWindowsCommitted(backupFile, originalInfo, metadata, oldContent); e != nil {
+		return fmt.Errorf("restore verification failed; inspect %q and recovery %q; state uncertain: %v; cause: %w", target, recovery, e, cause)
 	}
 	if !conditionalFileIdentity(target, originalInfo) {
 		return fmt.Errorf("restore path changed; inspect %q and recovery %q: %w", target, recovery, cause)
