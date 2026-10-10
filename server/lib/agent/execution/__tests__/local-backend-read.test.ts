@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	mkdirSync,
 	mkdtempSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	truncateSync,
@@ -15,10 +16,11 @@ import { LocalBackend } from "../local-backend";
 
 const roots: string[] = [];
 
-function tempRoot(): string {
-	const root = mkdtempSync(join(tmpdir(), "narrafork-local-read-"));
+function tempRoot(base = tmpdir()): string {
+	const root = mkdtempSync(join(base, "narrafork-local-read-"));
 	roots.push(root);
-	return root;
+	// Expected identities use the physical path, not /var or Windows 8.3 TEMP aliases.
+	return realpathSync(root);
 }
 
 function createSymlink(target: string, link: string, type?: "dir" | "file"): boolean {
@@ -36,6 +38,30 @@ afterEach(() => {
 });
 
 describe("LocalBackend atomic bounded reads", () => {
+	test("canonicalizes an aliased temporary parent without weakening identity checks", async () => {
+		const parent = tempRoot();
+		const actual = join(parent, "actual");
+		const alias = join(parent, "alias");
+		mkdirSync(actual);
+		symlinkSync(actual, alias, process.platform === "win32" ? "junction" : "dir");
+		const root = tempRoot(alias);
+		expect(root).toBe(realpathSync(root));
+		expect(root.startsWith(actual)).toBe(true);
+		const path = join(root, "range.txt");
+		writeFileSync(path, "0123456789");
+		const backend = new LocalBackend();
+		const result = await backend.readFileBytes(path, {
+			offset: 3,
+			maxBytes: 4,
+			expectedResolvedPath: path,
+		});
+		expect(new TextDecoder().decode(result.bytes)).toBe("3456");
+		expect(result.resolvedPath).toBe(path);
+		await expect(
+			backend.readFileBytes(path, { maxBytes: 4, expectedResolvedPath: join(root, "other.txt") }),
+		).rejects.toThrow(/resolved path identity mismatch/i);
+	});
+
 	test("bounded offset reads return only the requested range and preserve total size", async () => {
 		const path = join(tempRoot(), "range.txt");
 		writeFileSync(path, "0123456789");

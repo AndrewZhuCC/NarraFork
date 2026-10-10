@@ -137,6 +137,20 @@ func TestWindowsConditionalNativeReplacement(t *testing.T) {
 			}
 			target, tmp, originalInfo, metadata := windowsPreparedReplacement(t, target)
 			if err := commitConditionalReplacement(context.Background(), target, tmp, originalInfo, metadata, []byte("next")); err != nil {
+				// Passing probes are hidden by go test without -v. Emit the
+				// original captured contract and both native outcomes on failure
+				// so hosted-runner differences cannot be mistaken for SYSTEM tests.
+				if captured, ok := metadata.(*windowsConditionalMetadata); ok {
+					logCapturedWindowsMetadataProbe(t, "expected-before-native", captured)
+				}
+				logWindowsMetadataProbe(t, "committed-after-native", target)
+				backups, globErr := filepath.Glob(filepath.Join(dir, ".nf-transaction-*", "original"))
+				if globErr != nil {
+					t.Logf("locate owned native backup: %v", globErr)
+				}
+				for _, backup := range backups {
+					logWindowsMetadataProbe(t, "backup-after-native", backup)
+				}
 				t.Fatal(err)
 			}
 			got, err := os.ReadFile(target)

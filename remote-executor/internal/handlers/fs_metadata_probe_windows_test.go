@@ -29,7 +29,16 @@ func logWindowsMetadataProbe(t *testing.T, label, path string) {
 		t.Logf("%s capture: %v", label, err)
 		return
 	}
-	t.Logf("%s owner=%s group=%s control=%#x dacl=%x label=%x auditReadable=%v auditControl=%#x audit=%x", label, m.owner.String(), m.group.String(), m.control, m.dacl, m.labelACL, m.audit != nil, m.auditControl, m.auditACL)
+	logCapturedWindowsMetadataProbe(t, label, m)
+}
+
+func logCapturedWindowsMetadataProbe(t *testing.T, label string, m *windowsConditionalMetadata) {
+	t.Helper()
+	// Generated fixture ACLs are small, but keep diagnostics bounded even if a
+	// runner supplies a larger inherited descriptor. Full lengths remain visible.
+	head := func(data []byte) []byte { return data[:min(len(data), 256)] }
+	t.Logf("%s owner=%s group=%s control=%#x daclBytes=%d dacl=%x labelBytes=%d label=%x auditReadable=%v auditControl=%#x auditBytes=%d audit=%x",
+		label, m.owner.String(), m.group.String(), m.control, len(m.dacl), head(m.dacl), len(m.labelACL), head(m.labelACL), m.audit != nil, m.auditControl, len(m.auditACL), head(m.auditACL))
 }
 
 func TestWindowsNativeMetadataProbe(t *testing.T) {
