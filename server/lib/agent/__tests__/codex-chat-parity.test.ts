@@ -575,7 +575,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				input: [...(input as unknown[]), { type: "compaction_trigger" }],
 			});
 			expect(
-				(requests[0].input as Array<{ role?: string; id?: string }>).filter(
+				(requests[0].input as Array<{ role?: string; id?: string; content?: unknown }>).filter(
 					(item) => item.role === "assistant",
 				),
 			).toEqual([{ role: "assistant", content: [{ type: "output_text", text: "legacy reply" }] }]);
