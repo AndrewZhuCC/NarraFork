@@ -12,6 +12,7 @@ import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { getHome } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
 import { gitRoutes, narratorGitRoutes } from "../routes/git";
 import { commitSyncService } from "./commit-sync-service";
@@ -184,6 +185,39 @@ afterEach(async () => {
 });
 
 describe("Git workspace discovery", () => {
+	test("an unconfigured local cwd does not scan the implicit home directory", async () => {
+		await db
+			.update(narrators)
+			.set({ cwd: null, permissionMode: "bypassPermissions" })
+			.where(eq(narrators.id, narratorId));
+		const glob = spyOn(localBackend, "glob");
+		try {
+			const response = await request("workspace?discover=1");
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				state: "unsupported",
+				rootPath: null,
+				capabilities: { read: false, write: false },
+			});
+			expect(glob).not.toHaveBeenCalled();
+			await db
+				.update(narrators)
+				.set({ cwd: repo, workspaceRevision: 1 })
+				.where(eq(narrators.id, narratorId));
+			expect((await workspace()).rootPath).toBe(repo);
+		} finally {
+			glob.mockRestore();
+		}
+	});
+	test("an explicitly selected home directory still cannot expose private Git paths", async () => {
+		await db
+			.update(narrators)
+			.set({ cwd: getHome(), permissionMode: "bypassPermissions" })
+			.where(eq(narrators.id, narratorId));
+		const response = await request("workspace?discover=1");
+		expect(response.status).toBe(403);
+		expect(await response.json()).toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+	});
 	test("subdirectories share their actual nearest root and device identity", async () => {
 		await mkdir(join(repo, "sub"));
 		const child = await newNarrator(join(repo, "sub"));

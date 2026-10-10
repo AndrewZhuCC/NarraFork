@@ -633,7 +633,14 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	return {
 		...query,
 		data,
-		layoutReady: !narratorId || !detection.enabled || !!data || query.isError,
+		// Denied discovery is finished too: keep the panel mounted without revealing Git facts.
+		layoutReady:
+			!narratorId ||
+			!detection.enabled ||
+			!!data ||
+			query.isError ||
+			denied ||
+			query.data?.state === "access_denied",
 		detectionEnabled: detection.enabled,
 		setDetectionEnabled: detection.setEnabled,
 		workspaceKey: target && typeof target !== "string" ? target.workspaceKey : null,

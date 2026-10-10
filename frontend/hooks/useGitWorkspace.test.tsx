@@ -21,7 +21,9 @@ Object.assign(globalThis, {
 	document: window.document,
 	navigator: window.navigator,
 	// This suite tests recovery after discovery is explicitly enabled; the UI defaults it off.
-	localStorage: { getItem: (key: string) => (key.endsWith(":narrator") ? "1" : null) },
+	localStorage: {
+		getItem: (key: string) => (key.startsWith("narrafork_git_detection_enabled:") ? "1" : null),
+	},
 	IS_REACT_ACT_ENVIRONMENT: false,
 });
 mock.module("./useNarrator", () => ({
@@ -170,6 +172,31 @@ function deferred<T>() {
 }
 
 describe("Git summary layout readiness", () => {
+	test("a 403 keeps the nested Git consumer mounted instead of retrying in a loop", async () => {
+		const stalled = deferred<GitWorkspace>();
+		let reads = 0;
+		// Bound the pre-fix remount loop so a regression cannot starve the test timers.
+		const request = spyOn(api, "getGitWorkspace").mockImplementation(() =>
+			++reads <= 2 ? Promise.reject(new ApiError("denied", 403)) : stalled.promise,
+		);
+		function Panel() {
+			const query = useGitWorkspace("narrator");
+			return query.layoutReady ? <Probe /> : <span>loading</span>;
+		}
+		root = createRoot(container);
+		root.render(
+			<QueryClientProvider client={client}>
+				<Panel />
+			</QueryClientProvider>,
+		);
+		await flush();
+		await flush();
+		expect(request).toHaveBeenCalledTimes(2);
+		expect(container.textContent).toBe("error");
+		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
+		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
+		expect(intervals.size).toBe(0);
+	});
 	test("cold detail discovery waits and its late summary never triggers a duplicate workspace GET", async () => {
 		client.removeQueries({ queryKey: ["narrators", "narrator"], exact: true });
 		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready"));

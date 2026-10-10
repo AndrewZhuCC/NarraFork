@@ -236,6 +236,20 @@ export async function resolveNarratorGitTarget(
 		contextProjectId: projectId,
 		configuredCwd: localCwd,
 	};
+	// Legacy standalone chats may only inherit Home as the agent's execution fallback.
+	// That is not a selected Git workspace: probing it would hit the private-path guard.
+	if (
+		backend.kind === "local" &&
+		!committedContext?.cwd &&
+		!narrator.cwd &&
+		!chapter?.worktreePath &&
+		!project?.gitPath &&
+		backend.paths.equals(workspace.cwd, getHome())
+	) {
+		workspace.state = "unsupported";
+		workspace.reason = "Select a working directory to enable Git discovery";
+		return target;
+	}
 	if (!workspace.cwd || !backend.paths.isAbsolute(workspace.cwd)) {
 		workspace.state = "missing_directory";
 		workspace.reason = "Execution device has no absolute working directory";
