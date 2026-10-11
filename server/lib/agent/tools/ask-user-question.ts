@@ -136,34 +136,6 @@ export const askUserQuestionTool: ToolDefinition = {
 					additionalProperties: false,
 				},
 			},
-			answers: {
-				description:
-					"User answers collected by the permission component, keyed by the question header (uniquified when titles collide)",
-				type: "object",
-				propertyNames: { type: "string" },
-				additionalProperties: { type: "string" },
-			},
-			annotations: {
-				description:
-					"Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question header.",
-				type: "object",
-				propertyNames: { type: "string" },
-				additionalProperties: {
-					type: "object",
-					properties: {
-						preview: {
-							description:
-								"The preview content of the selected option, if the question used previews.",
-							type: "string",
-						},
-						notes: {
-							description: "Free-text notes the user added to their selection.",
-							type: "string",
-						},
-					},
-					additionalProperties: false,
-				},
-			},
 			context: {
 				type: "string",
 				description:

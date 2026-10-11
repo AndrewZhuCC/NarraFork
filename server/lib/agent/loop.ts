@@ -65,7 +65,7 @@ import {
 } from "./malformed-request-dump";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
-import { projectQuestionModelInput } from "./question-model-input";
+import { projectAskUserQuestionInput, projectQuestionModelInput } from "./question-model-input";
 import {
 	bindPermissionRecovery,
 	isRecoveredHumanPermission,
@@ -3670,7 +3670,8 @@ async function* agentLoopInMetadataSnapshot(
 					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
 					yieldedToolResults.add(tu.toolUseId);
 					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
-					if (settled.updatedInput) tu.input = settled.updatedInput;
+					if (settled.updatedInput && tu.name !== "AskUserQuestion")
+						tu.input = settled.updatedInput;
 					await processToolResultInjections(tu, settled);
 					yield earlyToolResultEvent(tu, settled);
 				}
@@ -5139,7 +5140,8 @@ async function* agentLoopInMetadataSnapshot(
 											if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
 											yieldedToolResults.add(prevTu.toolUseId);
 											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
-											if (sr.updatedInput) prevTu.input = sr.updatedInput;
+											if (sr.updatedInput && prevTu.name !== "AskUserQuestion")
+												prevTu.input = sr.updatedInput;
 											const brokenOverride = sr.broken
 												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
 												: undefined;
@@ -6887,7 +6889,14 @@ async function* agentLoopInMetadataSnapshot(
 			}
 			/** Tool uses with history-safe ids, for provider.pushAssistantTurn. */
 			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
-				applyToolUseIdRemap(list, turnToolUseIdRemap);
+				applyToolUseIdRemap(
+					list.map((toolUse) => {
+						if (toolUse.name !== "AskUserQuestion") return toolUse;
+						const input = projectAskUserQuestionInput(toolUse.input);
+						return input === toolUse.input ? toolUse : { ...toolUse, input };
+					}),
+					turnToolUseIdRemap,
+				);
 
 			// No fabricated billing counters: occupancy estimates live only in contextSnapshot.
 
@@ -6930,7 +6939,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
-				if (sr.updatedInput) tu.input = sr.updatedInput;
+				if (sr.updatedInput && tu.name !== "AskUserQuestion") tu.input = sr.updatedInput;
 				const brokenOverride = sr.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
@@ -7205,7 +7214,7 @@ async function* agentLoopInMetadataSnapshot(
 					// When the permission handler redirected the input (e.g. the plan file),
 					// update the in-memory tool_use so pushAssistantTurn writes the correct
 					// input into history — otherwise the model sees the original (wrong) path.
-					if (result.updatedInput) tu.input = result.updatedInput;
+					if (result.updatedInput && tu.name !== "AskUserQuestion") tu.input = result.updatedInput;
 					await processToolResultInjections(tu, result);
 					const isLastTool = toolIndex === toolUses.length - 1;
 					// The turn nudge is still appended inline: it is about THIS being the last
@@ -7341,7 +7350,8 @@ async function* agentLoopInMetadataSnapshot(
 						const tu = group[i];
 						const effectiveResult = result;
 						if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
-						if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
+						if (effectiveResult.updatedInput && tu.name !== "AskUserQuestion")
+							tu.input = effectiveResult.updatedInput;
 						await processToolResultInjections(tu, effectiveResult);
 
 						// Persist and broadcast every completed result immediately in completion order.
@@ -7457,7 +7467,8 @@ async function* agentLoopInMetadataSnapshot(
 							return;
 						}
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
-						if (result.updatedInput) remainingTool.input = result.updatedInput;
+						if (result.updatedInput && remainingTool.name !== "AskUserQuestion")
+							remainingTool.input = result.updatedInput;
 						await processToolResultInjections(remainingTool, result);
 						pendingToolResults.push(
 							provider.formatToolResult(

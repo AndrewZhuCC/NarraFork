@@ -3964,7 +3964,8 @@ const sqliteNarratorPersistence = {
 		if (existing)
 			queueContextCharacterRefresh(existing.narratorId, existing.messageId ?? undefined);
 
-		if (existing?.messageId) {
+		// Question responses belong to the execution receipt, never the authored SDK call.
+		if (existing?.messageId && existing.toolName !== "AskUserQuestion") {
 			const msg = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, existing.messageId),
 				columns: { contentJson: true },

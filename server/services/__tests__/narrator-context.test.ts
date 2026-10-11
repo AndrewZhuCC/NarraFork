@@ -1,6 +1,8 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as agent from "../../lib/agent";
 import { estimateTokens } from "../../lib/agent/estimate-tokens";
+import * as provider from "../../lib/agent/provider";
+import * as requestTracker from "../../lib/api-request-tracker";
 import * as prompts from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { narratorService } from "../narrator-service";
@@ -125,6 +127,204 @@ describe("narrator compact summary", () => {
 		expect(summaryCalls).toEqual([2, 1, 1]);
 		expect(result.summary).toContain("PART_ONE");
 		expect(result.summary).toContain("PART_TWO");
+	});
+});
+
+describe("question inputs in actual summary provider requests", () => {
+	const canary = "USER_ANSWER_CANARY_compact_fork_7231";
+	const originalInput = { questions: [{ question: "Which option?" }], async: false };
+	const normalInput = { answers: { keep: "NORMAL_TOOL_ANSWER" }, annotations: "keep", async: true };
+	const normalOutput = { text: `NORMAL_OUTPUT_START${"x".repeat(50_000)}NORMAL_OUTPUT_END` };
+	const model = "anthropic:claude-haiku-4-5";
+	const originalSummary = settings.agent.summaryModel;
+	const originalWindows = settings.agent.modelContextWindows;
+	const originalCatalog = settings.agent.modelCatalog;
+	const generateText = mock(async (_text: string, _model: string, _system?: string) => ({
+		text: "Saved summary",
+	}));
+	let getNarrator: ReturnType<typeof spyOn<typeof narratorService, "getById">>;
+	let history: ReturnType<typeof spyOn<typeof narratorService, "getModelHistorySinceLastCompact">>;
+	let resolve: ReturnType<typeof spyOn<typeof provider, "resolveProviderAndModel">>;
+	let tracking: ReturnType<typeof spyOn<typeof requestTracker, "trackApiRequest">>;
+	let spec: ReturnType<typeof spyOn<typeof specReminder, "buildSpecCompactContext">>;
+
+	function sourceRows(sdkOriginal: boolean, legacyString = false) {
+		const executionInput = {
+			...originalInput,
+			async: true,
+			answers: { choice: canary },
+			annotations: { choice: canary },
+			deferredByUser: true,
+		};
+		return [
+			{
+				id: "question-call",
+				role: "assistant" as const,
+				contentText: "",
+				contentJson: sdkOriginal
+					? [
+							{
+								type: "tool_use",
+								id: "question-tool",
+								name: "AskUserQuestion",
+								input: { ...originalInput, answers: { choice: canary }, annotations: canary },
+							},
+							{ type: "tool_use", id: "normal-tool", name: "Read", input: normalInput },
+						]
+					: [],
+				toolCalls: [
+					{
+						toolUseId: "question-tool",
+						toolName: "AskUserQuestion",
+						status: "done",
+						inputJson: legacyString ? JSON.stringify(executionInput) : executionInput,
+						outputJson: { status: "UserAnswered", answers: { choice: canary } },
+					},
+					{
+						toolUseId: "normal-tool",
+						toolName: "Read",
+						status: "done",
+						inputJson: normalInput,
+						outputJson: normalOutput,
+					},
+				],
+			},
+			{
+				id: "sdk-result",
+				role: "user" as const,
+				contentText: "",
+				contentJson: [
+					{ type: "tool_result", tool_use_id: "question-tool", content: `SDK_RESULT ${canary}` },
+				],
+				toolCalls: [],
+			},
+			{
+				id: "human-answer",
+				role: "user" as const,
+				contentText: `REAL_USER_REPLY ${canary}`,
+				contentJson: [{ type: "text", text: `REAL_USER_REPLY ${canary}` }],
+				toolCalls: [],
+			},
+		];
+	}
+
+	beforeEach(() => {
+		generateText.mockClear();
+		settings.agent.summaryModel = model;
+		settings.agent.modelCatalog = undefined;
+		settings.agent.modelContextWindows = { [model]: 40_000 };
+		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
+			id: "n-question-summary",
+			contextSummary: "",
+		})) as never);
+		history = spyOn(narratorService, "getModelHistorySinceLastCompact");
+		resolve = spyOn(provider, "resolveProviderAndModel").mockReturnValue({
+			provider: "anthropic",
+			model: "summary-test",
+			adapter: { generateWithMeta: generateText },
+		} as never);
+		tracking = spyOn(requestTracker, "trackApiRequest").mockImplementation(async (_options, fn) =>
+			fn(),
+		);
+		spec = spyOn(specReminder, "buildSpecCompactContext").mockResolvedValue("");
+	});
+
+	afterEach(() => {
+		getNarrator.mockRestore();
+		history.mockRestore();
+		resolve.mockRestore();
+		tracking.mockRestore();
+		spec.mockRestore();
+		settings.agent.summaryModel = originalSummary;
+		settings.agent.modelContextWindows = originalWindows;
+		settings.agent.modelCatalog = originalCatalog;
+	});
+
+	for (const kind of ["compact", "fork"] as const) {
+		for (const { sdkOriginal, legacyString, label } of [
+			{ sdkOriginal: true, legacyString: false, label: "SDK original" },
+			{ sdkOriginal: false, legacyString: false, label: "legacy object" },
+			{ sdkOriginal: false, legacyString: true, label: "legacy JSON string" },
+		]) {
+			test(`${kind} preserves answers as results/user text, not question inputs (${label})`, async () => {
+				const rows = sourceRows(sdkOriginal, legacyString);
+				const before = structuredClone(rows);
+				history.mockResolvedValue(rows as never);
+				if (kind === "compact") {
+					await narratorContext.generateCompactSummary("n-question-summary", "en", rows);
+				} else {
+					await narratorContext.generateContextSummary("n-question-summary", "en", {
+						throwOnFailure: true,
+					});
+				}
+
+				expect(generateText).toHaveBeenCalledTimes(1);
+				const text = generateText.mock.calls[0][0];
+				const inputText = text.match(/AskUserQuestion: input=(.*?) → output=/)?.[1];
+				expect(inputText).toBeDefined();
+				expect(inputText).not.toContain(canary);
+				const input = JSON.parse(inputText ?? "null");
+				const projectedInput = typeof input === "string" ? JSON.parse(input) : input;
+				expect(projectedInput).toEqual({ ...originalInput, async: !sdkOriginal });
+				expect(text).toContain(`output={"status":"UserAnswered","answers":{"choice":"${canary}"}}`);
+				expect(text).toContain(`SDK_RESULT ${canary}`);
+				expect(text).toContain(`[User]: <sender kind="human" />\nREAL_USER_REPLY ${canary}`);
+				if (kind === "fork" && sdkOriginal) {
+					const sdkInput = text.match(
+						/"name":"AskUserQuestion","input":(.*?)\},\{"type":"tool_use"/,
+					)?.[1];
+					expect(sdkInput).toBe(JSON.stringify(originalInput));
+				}
+				if (kind === "compact") {
+					expect(text).toContain(`Read: input=${JSON.stringify(normalInput)} → output=`);
+					expect(text).toContain("NORMAL_OUTPUT_START");
+				} else {
+					expect(text).not.toContain("NORMAL_OUTPUT_START");
+				}
+				expect(text).not.toContain("NORMAL_OUTPUT_END");
+				expect(rows).toEqual(before);
+				expect(rows[0].toolCalls[1].inputJson).toBe(normalInput);
+				expect(rows[0].toolCalls[1].outputJson).toBe(normalOutput);
+			});
+		}
+
+		test(`${kind} does not invent a missing async field for legacy questions`, async () => {
+			const rows = sourceRows(false, true);
+			rows[0].toolCalls[0].inputJson = JSON.stringify({
+				questions: originalInput.questions,
+				answers: { choice: canary },
+			});
+			const before = structuredClone(rows);
+			history.mockResolvedValue(rows as never);
+			if (kind === "compact") {
+				await narratorContext.generateCompactSummary("n-question-summary", "en", rows);
+			} else {
+				await narratorContext.generateContextSummary("n-question-summary", "en", {
+					throwOnFailure: true,
+				});
+			}
+			const inputText = generateText.mock.calls[0][0].match(
+				/AskUserQuestion: input=(.*?) → output=/,
+			)?.[1];
+			expect(JSON.parse(inputText ?? "null")).toEqual({ questions: originalInput.questions });
+			expect(rows).toEqual(before);
+		});
+	}
+
+	test("fork with assistant prose still includes the synchronous question answer", async () => {
+		const rows = sourceRows(true);
+		rows[0].contentText = "The assistant asked a question.";
+		const before = structuredClone(rows);
+		history.mockResolvedValue(rows as never);
+		await narratorContext.generateContextSummary("n-question-summary", "en", {
+			throwOnFailure: true,
+		});
+		const text = generateText.mock.calls[0][0];
+		expect(text).toContain("[Assistant]: The assistant asked a question.");
+		expect(text).toContain(`input=${JSON.stringify(originalInput)} → output=`);
+		expect(text).toContain(`"status":"UserAnswered","answers":{"choice":"${canary}"}`);
+		expect(text).not.toContain("NORMAL_OUTPUT_START");
+		expect(rows).toEqual(before);
 	});
 });
 
