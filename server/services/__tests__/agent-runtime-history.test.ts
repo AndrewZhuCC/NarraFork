@@ -33,28 +33,26 @@ beforeEach(() => {
 		defaultModel: "claude-sonnet-4",
 		officialApi,
 	}));
-	settings.openaiProviders = [
-		{
-			id: "question-responses",
-			name: "Question Responses history",
-			prefix: "question-responses",
-			apiKey: "isolated-test-no-network",
-			baseUrl: "https://example.invalid/v1",
-			defaultModel: "gpt-5",
-			apiMode: "responses",
-		},
-	];
-	settings.geminiProviders = [
-		{
-			id: "question-gemini",
+	settings.openaiProviders = (["responses", "completions"] as const).map((apiMode) => ({
+		id: `question-${apiMode}`,
+		name: "Question OpenAI history",
+		prefix: `question-${apiMode}`,
+		apiKey: "isolated-test-no-network",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "gpt-5",
+		apiMode,
+	}));
+	settings.geminiProviders = (["generate-content", "interactions"] as const).map(
+		(geminiTransport) => ({
+			id: geminiTransport === "generate-content" ? "question-gemini" : "question-interactions",
 			name: "Question Gemini history",
-			prefix: "question-gemini",
+			prefix: geminiTransport === "generate-content" ? "question-gemini" : "question-interactions",
 			apiKey: "isolated-test-no-network",
 			baseUrl: "https://example.invalid/v1",
 			defaultModel: "gemini-2.5-pro",
-			geminiTransport: "generate-content",
-		},
-	];
+			geminiTransport,
+		}),
+	);
 	for (const id of ["primary", "child", "fork"])
 		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
 });
@@ -391,6 +389,124 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 		expect(JSON.stringify(prepared.history)).not.toContain(HUMAN_QUESTION_CANARY);
 		expect(prepared.trailingToolResults).toEqual([]);
 		expect(source).toEqual(before);
+	});
+}
+
+function injectionMessage(id: string, role: "sys" | "user", text: string) {
+	return {
+		...message(id, role, text),
+		contentJson: [{ type: "system_injection", source: "bg_agent", modelText: text }],
+	};
+}
+
+for (const entry of [
+	{
+		label: "Anthropic relay",
+		model: "claude-sonnet-4",
+		provider: "history-relay",
+		liftsTail: true,
+	},
+	{
+		label: "Anthropic official",
+		model: "claude-sonnet-4",
+		provider: "history-official",
+		liftsTail: false,
+	},
+	{ label: "Responses", model: "gpt-5", provider: "question-responses", liftsTail: false },
+	{ label: "Completions", model: "gpt-5", provider: "question-completions", liftsTail: false },
+	{ label: "Gemini", model: "gemini-2.5-pro", provider: "question-gemini", liftsTail: false },
+	{
+		label: "Gemini interactions",
+		model: "gemini-2.5-pro",
+		provider: "question-interactions",
+		liftsTail: false,
+	},
+]) {
+	test(`${entry.label} reports native source IDs retained in history, not its extracted tail`, async () => {
+		const source = [
+			message("u", "user", "earlier"),
+			injectionMessage("historical-notice", "sys", "same-notice-body"),
+			message("a", "assistant", "answer"),
+			injectionMessage("tail-notice", "sys", "same-notice-body"),
+			{
+				...injectionMessage("hidden-notice", "sys", "hidden-child-body"),
+				parentToolUseId: "child-origin",
+			},
+			{ ...injectionMessage("display-notice", "sys", "display-only-body"), role: "disp" as const },
+		];
+		const before = structuredClone(source);
+		const prepared = await buildRuntimeHistory({ ...options(), ...entry, sourceMessages: source });
+		expect(prepared.replayedInjectionMessageIds).toEqual(
+			entry.liftsTail ? ["u", "historical-notice"] : ["u", "historical-notice", "tail-notice"],
+		);
+		const historyText = JSON.stringify(prepared.history);
+		expect(historyText.split("same-notice-body").length - 1).toBe(entry.liftsTail ? 1 : 2);
+		expect(historyText).not.toContain("hidden-child-body");
+		expect(historyText).not.toContain("display-only-body");
+		if (entry.liftsTail) expect(prepared.currentText).toContain("same-notice-body");
+		expect(source).toEqual(before);
+	});
+
+	for (const legacyMetadata of [false, true]) {
+		test(`${entry.label} reports buffered plain input before a hint (legacy=${legacyMetadata})`, async () => {
+			const buffered = message("buffered-user", "user", "buffered-plain-body");
+			if (legacyMetadata)
+				(buffered.contentJson as unknown[]).push({
+					type: "system_injection",
+					source: "subagent_message",
+				});
+			const prepared = await buildRuntimeHistory({
+				...options(),
+				...entry,
+				sourceMessages: [
+					message("a", "assistant", "answer"),
+					buffered,
+					injectionMessage("buffered-knowledge-hint", "sys", "buffered-knowledge-body"),
+				],
+			});
+			expect(prepared.replayedInjectionMessageIds).toEqual(
+				entry.liftsTail ? [] : ["buffered-user", "buffered-knowledge-hint"],
+			);
+			const historyText = JSON.stringify(prepared.history);
+			if (entry.liftsTail) {
+				expect(historyText).not.toContain("buffered-plain-body");
+				expect(prepared.currentText).toContain("buffered-knowledge-body");
+			} else {
+				expect(historyText).toContain("buffered-plain-body");
+				expect(historyText).toContain("buffered-knowledge-body");
+			}
+		});
+	}
+
+	test(`${entry.label} never reports a native current-user row as replayed history`, async () => {
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			...entry,
+			sourceMessages: [
+				message("a", "assistant", "answer"),
+				injectionMessage("current-user-notice", "user", "current-native-body"),
+			],
+		});
+		expect(prepared.replayedInjectionMessageIds).toEqual([]);
+		expect(JSON.stringify(prepared.history)).not.toContain("current-native-body");
+	});
+
+	test(`${entry.label} handles an empty extracted sys tail without guessing from trailing text`, async () => {
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			...entry,
+			sourceMessages: [
+				message("a", "assistant", "answer"),
+				injectionMessage("user-before-empty-tail", "user", "before-empty-tail-body"),
+				injectionMessage("empty-sys-tail", "sys", ""),
+			],
+		});
+		expect(prepared.replayedInjectionMessageIds).toEqual(
+			entry.liftsTail ? [] : ["user-before-empty-tail"],
+		);
+		const historyText = JSON.stringify(prepared.history);
+		if (entry.liftsTail) expect(historyText).not.toContain("before-empty-tail-body");
+		else expect(historyText).toContain("before-empty-tail-body");
 	});
 }
 

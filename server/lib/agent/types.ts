@@ -921,10 +921,25 @@ export interface RuntimeSettingsOverride {
 	reasoningEffort?: ReasoningEffort | null;
 }
 
+/** One pending model-input fragment; an ID identifies its already-persisted message row. */
+export interface AgentInputPart {
+	text: string;
+	messageId?: string;
+}
+
+export interface AgentAfterToolsInput {
+	text: string;
+	/** Ordered fragments covering text, so a rebuild can replace only the rows it actually replayed. */
+	parts?: readonly AgentInputPart[];
+	onConsumed?: () => void;
+}
+
 export interface AgentHistoryReplacement {
 	history: unknown[];
 	pendingToolResults: unknown[];
 	systemPrompt?: string;
+	/** Persisted input rows retained in history, excluding rows lifted into current input. */
+	replayedInjectionMessageIds?: readonly string[];
 }
 
 export interface AgentConfig {
@@ -1179,9 +1194,9 @@ export interface AgentConfig {
 	 * Called once per turn, after tool results are settled.
 	 */
 	getAfterToolsInjections?: () =>
-		| Promise<string | { text: string; onConsumed?: () => void }>
+		| Promise<string | AgentAfterToolsInput>
 		| string
-		| { text: string; onConsumed?: () => void };
+		| AgentAfterToolsInput;
 	/** Exact source history adopted at the provider-input boundary, never during preparation. */
 	onModelInputConsumed?: (
 		sourceHistory: unknown[],
@@ -1199,7 +1214,7 @@ export interface AgentConfig {
 	 * producers that still appended their text INSIDE a tool result's string; with this
 	 * they become rows like every other injection.
 	 *
-	 * Returns the text to fold into the current turn, or "" when the host declined
+	 * Returns a text fragment with its message ID (or legacy text), or "" when the host declined
 	 * (missing hook, write failure). Callers must treat a failure as "not delivered"
 	 * rather than falling back to a side-car, or the content would arrive twice.
 	 */
@@ -1225,7 +1240,7 @@ export interface AgentConfig {
 		 * flag for a warning the model never received.
 		 */
 		pipelineExitConfirmationStateId?: string;
-	}) => Promise<string> | string;
+	}) => Promise<string | AgentInputPart> | string | AgentInputPart;
 	/**
 	 * Completed-tool count to resume from, persisted by the caller across loop runs.
 	 *

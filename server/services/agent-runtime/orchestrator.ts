@@ -1563,7 +1563,7 @@ export async function runAgentLoopUnlocked(
 							});
 						}
 					}
-					return turnText ?? "";
+					return { text: turnText ?? "", messageId: messageId ?? undefined };
 				},
 				getRuntimeSettingsOverride: async () => {
 					await settleNarratorRuntimeModel(active);

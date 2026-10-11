@@ -12,6 +12,7 @@ import type {
 	ProviderOperation,
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
+import { historyInputMessageIds } from "@shared/native-injection";
 import { settings } from "../settings";
 import type {
 	BuiltHistory,
@@ -139,6 +140,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		_narratorId?: string,
 	): Promise<BuiltHistory> {
 		const history: ProviderMessage[] = [];
+		const replayedInjectionMessageIds: string[] = [];
 		let pendingToolResults: ProviderContentBlock[] = [];
 
 		for (const message of dbMessages) {
@@ -166,12 +168,19 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			}
 
 			const content = canonicalMessageContent(message, role, this.activeReasoningSource);
-			if (content.length > 0) history.push({ role, content });
+			if (content.length > 0) {
+				history.push({ role, content });
+				const texts = content.flatMap((block) =>
+					block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+				);
+				replayedInjectionMessageIds.push(...historyInputMessageIds([message], texts));
+			}
 		}
 
 		return {
 			history,
 			trailingToolResults: pendingToolResults,
+			replayedInjectionMessageIds,
 		};
 	}
 

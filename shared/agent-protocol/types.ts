@@ -187,6 +187,8 @@ export interface BuiltHistory {
 	history: unknown[];
 	trailingToolResults: unknown[];
 	trailingUserText?: string;
+	/** Persisted input rows actually emitted into history, not lifted into current input. */
+	replayedInjectionMessageIds?: readonly string[];
 }
 
 // === Stream event emitted by provider.chat() ===

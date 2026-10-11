@@ -39,6 +39,7 @@ import {
 	stampReasoningSource,
 } from "./openai-provider";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -476,7 +477,7 @@ export class CodexProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+	): Promise<BuiltHistory> {
 		const ctx = await this.getContext();
 		const provider = this.createProvider(ctx);
 		return provider.buildHistory(dbMessages, model, narratorId);

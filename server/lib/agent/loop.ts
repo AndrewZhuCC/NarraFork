@@ -130,6 +130,7 @@ import type {
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentInputPart,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
@@ -2865,22 +2866,16 @@ async function* agentLoopInMetadataSnapshot(
 		pendingLoopInjections.push(injection);
 	}
 
-	/**
-	 * Persist the queued reminders and return the text for the current turn.
-	 *
-	 * A host without the hook gets "" and the reminders are dropped rather than falling
-	 * back to a side-car: delivering both ways is how the same words end up in the
-	 * conversation twice.
-	 */
-	async function flushLoopInjections(): Promise<string> {
-		if (pendingLoopInjections.length === 0) return "";
+	/** Persist reminders once, retaining their source IDs until input is actually assembled. */
+	async function flushLoopInjections(): Promise<void> {
+		if (pendingLoopInjections.length === 0) return;
 		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
-		if (!config.deliverInjectionRow) return "";
-		const parts: string[] = [];
+		if (!config.deliverInjectionRow) return;
 		for (const injection of queued) {
 			try {
-				const text = await config.deliverInjectionRow(injection);
-				if (text?.trim()) parts.push(text);
+				const delivered = await config.deliverInjectionRow(injection);
+				const part = typeof delivered === "string" ? { text: delivered } : delivered;
+				if (part.text.trim()) pendingInputParts.push(part);
 			} catch (err) {
 				logger.warn("Failed to deliver loop injection row", {
 					narratorId: config.narratorId,
@@ -2889,7 +2884,6 @@ async function* agentLoopInMetadataSnapshot(
 				});
 			}
 		}
-		return parts.join("\n\n");
 	}
 
 	/**
@@ -3035,22 +3029,37 @@ async function* agentLoopInMetadataSnapshot(
 	 * pass start: a row written mid-turn is invisible until the next pass, and a
 	 * finished background task should not have to wait that long to be mentioned.
 	 */
+	const pendingInputParts: AgentInputPart[] = [];
+	let replayedInjectionMessageIds = new Set<string>();
 	const pendingInputConsumptions: Array<() => void> = [];
-	async function collectAfterToolsInjectionText(): Promise<string> {
-		if (!config.getAfterToolsInjections) return "";
+	async function collectAfterToolsInjections(): Promise<void> {
+		if (!config.getAfterToolsInjections) return;
 		try {
 			const injection = await config.getAfterToolsInjections();
 			const text = (typeof injection === "string" ? injection : injection.text).trim();
-			if (text && typeof injection !== "string" && injection.onConsumed) {
+			if (!text) return;
+			const parts = typeof injection === "string" ? undefined : injection.parts;
+			// Legacy hosts return one opaque string. Never lose input if a host supplies
+			// incomplete provenance: without an exact partition it cannot be de-duplicated.
+			if (
+				parts &&
+				parts
+					.map((part) => part.text)
+					.join("\n\n")
+					.trim() === text
+			) {
+				pendingInputParts.push(...parts);
+			} else {
+				pendingInputParts.push({ text });
+			}
+			if (typeof injection !== "string" && injection.onConsumed) {
 				pendingInputConsumptions.push(injection.onConsumed);
 			}
-			return text;
 		} catch (err) {
 			logger.warn("Failed to collect after-tools injections", {
 				narratorId: config.narratorId,
 				error: String(err),
 			});
-			return "";
 		}
 	}
 
@@ -3068,6 +3077,19 @@ async function* agentLoopInMetadataSnapshot(
 	// Extra content to prepend to the next turn's user message (e.g. broken-tool reminder).
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
+
+	function pendingInputText(parts: readonly AgentInputPart[]): string {
+		return parts
+			.filter((part) => !part.messageId || !replayedInjectionMessageIds.has(part.messageId))
+			.map((part) => part.text)
+			.join("\n\n")
+			.trim();
+	}
+
+	function combinePendingInput(base: string, parts: readonly AgentInputPart[]): string {
+		const text = pendingInputText(parts);
+		return text ? (base ? `${base}\n\n${text}` : text) : base;
+	}
 
 	// Retries for "reasoning-only" dead turns (model produced only reasoning, no text
 	// and no tool calls). Declared at function scope so the ceiling is shared across
@@ -3096,6 +3118,7 @@ async function* agentLoopInMetadataSnapshot(
 		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
 		sourceInputHistory = replacement.history;
+		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
 		}
@@ -3222,7 +3245,7 @@ async function* agentLoopInMetadataSnapshot(
 			const isFirstTurn = turnIndex === 0;
 			provider.pushUserTurn(
 				history,
-				isFirstTurn ? userText : nextTurnContent,
+				isFirstTurn ? userText : combinePendingInput(nextTurnContent, pendingInputParts),
 				effectiveModel,
 				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
 				isFirstTurn ? images : undefined,
@@ -3269,7 +3292,9 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
-			const content = isFirstTurn ? userText : nextTurnContent;
+			const baseContent = isFirstTurn ? userText : nextTurnContent;
+			const currentInputParts = pendingInputParts.splice(0);
+			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
 			getPermissionHistory = () => {
 				const reflectionHistory = [...history];
@@ -4555,6 +4580,10 @@ async function* agentLoopInMetadataSnapshot(
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
+					// A retry may switch providers and rebuild again. Re-project from the
+					// original fragments, not a previously filtered string, so both newly
+					// replayed and newly lifted-out rows are represented exactly once.
+					content = combinePendingInput(baseContent, currentInputParts);
 					const questionInput = projectQuestionModelInput(
 						history,
 						content,
@@ -7085,9 +7114,11 @@ async function* agentLoopInMetadataSnapshot(
 							initialToolResults ?? [],
 							images,
 						);
-					} else if (pendingToolResults.length > 0) {
-						provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+					} else if (content || pendingToolResults.length > 0) {
+						provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					}
+					// These results are now in history, not pending input for the recovery request.
+					pendingToolResults = [];
 					provider.pushAssistantTurn(
 						history,
 						assistantText,
@@ -7141,10 +7172,12 @@ async function* agentLoopInMetadataSnapshot(
 			// Push the current user turn into history for the next turn.
 			// This must happen AFTER the API call (not before), because
 			// chat() references the history array directly.
+			// After-tools injections are already consumed; retain their actual content
+			// in memory too, or later requests lose them until a full history rebuild.
 			if (isFirstTurn) {
 				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
-			} else if (pendingToolResults.length > 0) {
-				provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+			} else if (content || pendingToolResults.length > 0) {
+				provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 			}
 
 			// The current input now lives in history; pending permissions must not
@@ -7586,19 +7619,12 @@ async function* agentLoopInMetadataSnapshot(
 			// tool_use with no matching result (and an orphaned result for the old id).
 			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
 
-			// Producers that persist their own message row contribute text only — see
-			// `collectAfterToolsInjectionText` on why nothing is yielded for them.
-			// Loop-raised reminders are flushed first so they read in the order they were
-			// raised, before anything the host drained at this same boundary.
-			for (const injectionText of [
-				await flushLoopInjections(),
-				await collectAfterToolsInjectionText(),
-			]) {
-				if (!injectionText) continue;
-				nextTurnContent = nextTurnContent
-					? `${nextTurnContent}\n\n${injectionText}`
-					: injectionText;
-			}
+			// Persisted rows contribute pending input, not another persistence event.
+			// Keep their identities until the actual request: a compact/model switch
+			// may already replay some of them before this input is sent.
+			// Loop reminders precede host-drained notifications, preserving arrival order.
+			await flushLoopInjections();
+			await collectAfterToolsInjections();
 
 			// Close the small race between the final group boundary and the next provider
 			// request: direct user feedback may arrive while after-tools injections are drained.
