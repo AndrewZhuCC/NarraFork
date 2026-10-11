@@ -1,7 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { listGitHubReleaseSummaries } from "../../scripts/lib/github-release-summary";
+import {
+	listGitHubReleaseSummaries,
+	listGitHubRestReleaseSummaries,
+} from "../../scripts/lib/github-release-summary";
 
 const repository = "Example/Custom";
+function restPage(start = 1, length = 1) {
+	return Array.from({ length }, (_, index) => ({
+		id: start + index,
+		url: `https://api.github.com/repos/${repository}/releases/${start + index}`,
+		tagName: `v1.${start + index}.0`,
+		draft: true,
+		prerelease: false,
+		publishedAt: null as string | null,
+		assetCount: 0,
+	}));
+}
 function page(start = 1, length = 1, hasNextPage = false, endCursor: string | null = null) {
 	return {
 		data: {
@@ -22,6 +36,110 @@ function page(start = 1, length = 1, hasNextPage = false, endCursor: string | nu
 		},
 	};
 }
+
+describe("bounded authenticated REST release summaries", () => {
+	test("requests REST pages with jq output projection, including drafts invisible to GraphQL", async () => {
+		const calls: string[][] = [];
+		const result = await listGitHubRestReleaseSummaries((args) => {
+			calls.push(args);
+			return JSON.stringify(restPage());
+		}, repository);
+		expect(result).toEqual([
+			{
+				id: 1,
+				tagName: "v1.1.0",
+				draft: true,
+				prerelease: false,
+				publishedAt: null,
+				assetCount: 0,
+			},
+		]);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.slice(0, 3)).toEqual([
+			"api",
+			`repos/${repository}/releases?per_page=100&page=1`,
+			"--jq",
+		]);
+		const projection = calls[0]?.[3] ?? "";
+		expect(projection).toContain("assetCount:(.assets|length)");
+		expect(projection).toContain("publishedAt:.published_at");
+		expect(projection).not.toContain("body");
+		expect(calls.flat()).not.toContain("--paginate");
+	});
+	test("full pages are followed until a short page, including an empty terminal page", async () => {
+		let calls = 0;
+		const result = await listGitHubRestReleaseSummaries((args) => {
+			calls++;
+			expect(args[1]).toBe(`repos/${repository}/releases?per_page=100&page=${calls}`);
+			return JSON.stringify(calls === 1 ? restPage(1, 100) : []);
+		}, repository);
+		expect(result).toHaveLength(100);
+		expect(calls).toBe(2);
+	});
+	test("ten full pages fail closed, even when a wanted release was on page one", async () => {
+		let calls = 0;
+		await expect(
+			listGitHubRestReleaseSummaries(
+				() => JSON.stringify(restPage(++calls * 100, 100)),
+				repository,
+			),
+		).rejects.toThrow("pagination limit");
+		expect(calls).toBe(10);
+	});
+	for (const duplicate of ["id", "tag"])
+		test(`rejects cross-page duplicate ${duplicate}`, async () => {
+			let calls = 0;
+			await expect(
+				listGitHubRestReleaseSummaries(() => {
+					if (++calls === 1) return JSON.stringify(restPage(1, 100));
+					const node = restPage(101)[0] as ReturnType<typeof restPage>[number];
+					if (duplicate === "id") {
+						node.id = 1;
+						node.url = `https://api.github.com/repos/${repository}/releases/1`;
+					} else node.tagName = "v1.1.0";
+					return JSON.stringify([node]);
+				}, repository),
+			).rejects.toThrow(duplicate === "id" ? "Duplicate" : "Ambiguous");
+		});
+	test("invalid JSON, repository/ID identity, state and fields never prove absence", async () => {
+		const node = restPage()[0] as ReturnType<typeof restPage>[number];
+		const invalid: unknown[] = [
+			null,
+			{},
+			[null],
+			restPage(1, 101),
+			[{ ...node, id: 0 }],
+			[{ ...node, id: Number.MAX_SAFE_INTEGER + 1 }],
+			[{ ...node, assetCount: -1 }],
+			[{ ...node, draft: "true" }],
+			[{ ...node, prerelease: null }],
+			[{ ...node, tagName: "" }],
+			[{ ...node, publishedAt: "2026-10-09T00:00:00Z" }],
+			[{ ...node, draft: false }],
+			[{ ...node, publishedAt: "not-a-date" }],
+			[{ ...node, url: "https://api.github.com/repos/Other/repo/releases/1" }],
+			[{ ...node, url: `https://api.github.com/repos/${repository}/releases/2` }],
+			[{ ...node, url: `${node.url}?repo=other` }],
+			[{ ...node, url: node.url.replace("api.github.com", "api.github.com.evil.test") }],
+		];
+		for (const value of invalid)
+			await expect(
+				listGitHubRestReleaseSummaries(() => JSON.stringify(value), repository),
+			).rejects.toThrow();
+		await expect(listGitHubRestReleaseSummaries(() => "{", repository)).rejects.toThrow();
+		await expect(
+			listGitHubRestReleaseSummaries(() => " ".repeat(128 * 1024 + 1), repository),
+		).rejects.toThrow("limit");
+	});
+	test("403, 401 and transport errors propagate instead of an empty history", async () => {
+		for (const message of ["HTTP 403", "HTTP 401", "network timeout"])
+			await expect(
+				listGitHubRestReleaseSummaries(() => {
+					throw new Error(message);
+				}, repository),
+			).rejects.toThrow(message);
+	});
+});
 
 describe("bounded GitHub release summaries", () => {
 	test("requests only lightweight GraphQL fields and maps releases", async () => {

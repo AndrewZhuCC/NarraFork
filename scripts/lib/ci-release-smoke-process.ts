@@ -13,6 +13,7 @@ export class SmokeProcessScope {
 	private readonly timer: ReturnType<typeof setTimeout>;
 	private outputBytes = 0;
 	private closing = false;
+	private closePromise: Promise<void> | undefined;
 	private readonly externalAbort: () => void;
 
 	constructor(
@@ -102,38 +103,51 @@ export class SmokeProcessScope {
 
 	get diagnostic(): string {
 		return this.children
-			.map((child) => `[pid ${child.process.pid}] ${child.diagnostic}`)
+			.map(
+				(child) =>
+					`[pid ${child.process.pid}; exit=${child.status ?? "running"}; closed=${child.closed}] ${child.diagnostic}`,
+			)
 			.join("\n")
 			.slice(-TAIL_LIMIT);
 	}
 
 	/** Cleanup ignores the aborted test signal, but has its own finite subprocess budgets. */
-	async close(): Promise<void> {
-		if (this.closing) return;
+	/** Cleanup ignores the aborted test signal, but has its own finite subprocess budgets. */
+	close(): Promise<void> {
+		if (this.closePromise) return this.closePromise;
 		this.closing = true;
 		clearTimeout(this.timer);
 		this.options.signal?.removeEventListener("abort", this.externalAbort);
-		const failures: unknown[] = [];
-		for (const child of this.children.toReversed()) {
-			try {
-				await terminateOwnedTree(child);
-			} catch (error) {
-				failures.push(error);
+		this.closePromise = (async () => {
+			const failures: unknown[] = [];
+			for (const child of this.children.toReversed()) {
+				try {
+					await terminateOwnedTree(child);
+				} catch (error) {
+					failures.push(error);
+				} finally {
+					child.process.stdin.destroy();
+					child.process.stdout.destroy();
+					child.process.stderr.destroy();
+				}
 			}
-			child.process.stdin.destroy();
-			child.process.stdout.destroy();
-			child.process.stderr.destroy();
-		}
-		if (failures.length) throw new AggregateError(failures, "Smoke child cleanup failed");
+			if (failures.length) throw new AggregateError(failures, "Smoke child cleanup failed");
+		})();
+		return this.closePromise;
 	}
 }
 
 export class SmokeChild {
 	status: number | undefined;
+	closed = false;
 	private tail = Buffer.alloc(0);
 	constructor(readonly process: ChildProcessWithoutNullStreams) {
 		process.once("exit", (code) => {
 			this.status = code ?? 1;
+		});
+		process.once("close", (code) => {
+			this.status ??= code ?? 1;
+			this.closed = true;
 		});
 		process.once("error", (error) => {
 			this.append(Buffer.from(String(error)));
@@ -220,10 +234,10 @@ export function descendantPids(table: string, root: number): number[] {
 }
 
 async function terminateOwnedTree(child: SmokeChild): Promise<void> {
+	if (child.closed) return;
 	const pid = child.process.pid;
-	if (!pid) return;
 	let failure: unknown;
-	if (process.platform === "win32") {
+	if (pid && process.platform === "win32") {
 		// No /IM, wildcards or blanket kills: this exact still-owned PID and its children only.
 		if (child.status === undefined) {
 			try {
@@ -235,24 +249,26 @@ async function terminateOwnedTree(child: SmokeChild): Promise<void> {
 				child.process.kill("SIGKILL");
 			}
 		}
-	} else {
+	} else if (pid && child.status === undefined) {
 		// PTY shells can create a separate session, so the root's process group alone is insufficient.
 		try {
-			if (child.status === undefined) {
-				const table = await cleanupCommand(["ps", "-ax", "-o", "pid=,ppid="]);
-				if (table.code !== 0) throw new Error(`Cannot enumerate own descendants: ${table.output}`);
-				for (const descendant of descendantPids(table.output, pid))
-					signalPid(descendant, "SIGKILL");
-			}
+			const table = await cleanupCommand(["ps", "-ax", "-o", "pid=,ppid="]);
+			if (table.code !== 0) throw new Error(`Cannot enumerate own descendants: ${table.output}`);
+			for (const descendant of descendantPids(table.output, pid)) signalPid(descendant, "SIGKILL");
 		} catch (error) {
 			failure = error;
 		}
 		// Still terminate the owned root/group when process-table inspection failed.
 		signalPid(-pid, "SIGKILL");
 	}
+	// `exit` does not attest that stdio and the executable's OS handles have closed.
+	// Release our streams after signalling, then wait for `close` before deleting its directory.
+	child.process.stdin.destroy();
+	child.process.stdout.destroy();
+	child.process.stderr.destroy();
 	const deadline = performance.now() + 5_000;
-	while (child.status === undefined && performance.now() < deadline) await delay(25);
-	if (child.status === undefined)
-		throw new Error(`Owned process ${pid} did not exit after cleanup`);
+	while (!child.closed && performance.now() < deadline) await delay(25);
+	if (!child.closed)
+		throw new Error(`Owned process ${pid ?? "spawn failure"} did not close after cleanup`);
 	if (failure) throw failure;
 }

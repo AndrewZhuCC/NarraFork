@@ -85,7 +85,11 @@ if (s.mode === "diagnostic") {
    state: "uploaded", digest: "sha256:" + createHash("sha256").update(bytes).digest("hex") });
   s.contents[name] = bytes.toString("utf8");
   out(null);
- } else if (args[1] === "edit") { s.release.draft = false; out(null); }
+ } else if (args[1] === "edit") {
+  s.release.draft = false;
+  s.release.published_at = "2026-10-09T00:00:00.000Z";
+  out(null);
+ }
  else throw new Error("Unexpected fixture release operation");
 } else if (args[0] === "api") {
  const endpoint = args[1];
@@ -97,7 +101,15 @@ if (s.mode === "diagnostic") {
  else if (p.startsWith("git/ref/tags/")) out({ ref: "refs/tags/" + s.release.tag_name, object: { type: "commit", sha: s.commit } });
  else if (p.startsWith("releases/tags/")) {
   if (!s.present || s.release.draft || s.blockLookup) fail(); else out(s.release);
- } else if (p.startsWith("releases?")) out(s.present ? [{ id: 1, tag_name: s.release.tag_name }] : []);
+ } else if (p.startsWith("releases?")) {
+  const summary = args.some((a) => a.includes("assetCount"));
+  out(!s.present ? [] : summary ? [{
+   id: 1, tagName: s.release.tag_name, draft: s.release.draft,
+   prerelease: s.release.prerelease, publishedAt: s.release.published_at,
+   assetCount: s.release.assets.length,
+   url: "https://api.github.com/repos/" + s.repository + "/releases/1",
+  }] : [{ id: 1, tag_name: s.release.tag_name }]);
+ }
  else if (p === "releases/1") out(s.release);
  else if (p.startsWith("releases/1/assets?")) out(s.release.assets);
  else if (p.startsWith("releases/assets/")) {
@@ -137,7 +149,7 @@ interface ShimState {
 		draft: boolean;
 		prerelease: boolean;
 		body: string;
-		published_at: string;
+		published_at: string | null;
 		assets: { id: number; name: string; size: number; state: string; digest: string }[];
 	};
 	contents: Record<string, string>;
@@ -172,7 +184,7 @@ async function fixture(overrides: Partial<ShimState> = {}) {
 			draft: true,
 			prerelease: false,
 			body: "",
-			published_at: publishedAt,
+			published_at: null,
 			assets: [],
 		},
 		contents: {},
@@ -292,7 +304,8 @@ describe("real async gh runner publication contract", () => {
 			const state = await f.read();
 			expect(state.release.draft).toBe(false);
 			expect(state.calls.filter((args) => args[1] === "create")).toHaveLength(existing ? 0 : 1);
-			expect(state.calls.some((args) => args[1] === "graphql")).toBe(true);
+			expect(state.calls.some((args) => args[1]?.includes("releases?"))).toBe(true);
+			expect(state.calls.some((args) => args[1] === "graphql")).toBe(false);
 		});
 	}
 	test("first update index 404 creates fixed metadata ref and verifies generation readback", async () => {
@@ -333,6 +346,7 @@ describe("real async gh runner publication contract", () => {
 						// Seed only fixture public assets; runner is still the actual spawned gh shim.
 						f.state.present = true;
 						f.state.release.draft = false;
+						f.state.release.published_at = publishedAt;
 						for (const asset of [
 							`narrafork-${version}-linux-x64`,
 							`narrafork-${version}-linux-x64.metadata.json`,

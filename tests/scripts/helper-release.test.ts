@@ -75,6 +75,7 @@ type Remote = {
 	tag_name: string;
 	draft: boolean;
 	prerelease: boolean;
+	published_at: string | null;
 	assets: { id: number; name: string; size: number; state: string; digest: string | null }[];
 };
 function fixture() {
@@ -97,6 +98,7 @@ function fixture() {
 		tag_name: HELPER_RELEASE_TAG,
 		draft: false,
 		prerelease: false,
+		published_at: "2026-10-09T00:00:00Z",
 		assets: [
 			...helper.files,
 			...helper.licenses,
@@ -108,6 +110,7 @@ function fixture() {
 		tag_name: `executor-v${version}`,
 		draft: false,
 		prerelease: false,
+		published_at: "2026-10-09T00:00:00Z",
 		assets: [
 			...Object.values(executor.manifest.platforms).map((entry) => ({
 				name: entry.filename,
@@ -126,6 +129,8 @@ function fixture() {
 			return JSON.stringify({ object: { type: "commit", sha: commit } });
 		if (args[1]?.endsWith(`/tags/${HELPER_RELEASE_TAG}`)) return JSON.stringify(helperRelease);
 		if (args[1]?.endsWith(`/tags/executor-v${version}`)) return JSON.stringify(executorRelease);
+		if (args[1] === `repos/${repository}/releases/1`) return JSON.stringify(helperRelease);
+		if (args[1] === `repos/${repository}/releases/2`) return JSON.stringify(executorRelease);
 		const all = [...helperRelease.assets, ...executorRelease.assets];
 		const found = all.find((entry) => args[1]?.endsWith(`/assets/${entry.id}`));
 		if (found && raws.has(found.name)) return raws.get(found.name) as string;
@@ -140,48 +145,53 @@ function fixture() {
 	};
 	return { helper, executor, raws, helperRelease, executorRelease, options, calls, asset };
 }
-function draftFixture(existing = true) {
+function draftFixture(existing = true, kind: "helpers" | "executor" = "helpers") {
 	const f = fixture();
-	f.helperRelease.draft = true;
-	if (!existing) f.helperRelease.assets = [];
+	const release = kind === "helpers" ? f.helperRelease : f.executorRelease;
+	release.draft = true;
+	release.published_at = null;
+	if (!existing) release.assets = [];
 	const state = {
 		present: existing,
 		calls: [] as string[][],
-		graphOverride: undefined as unknown,
+		restOverride: undefined as unknown,
 		idOverride: undefined as Remote | undefined,
 	};
-	const graph = () => ({
-		data: {
-			repository: {
-				nameWithOwner: repository,
-				releases: {
-					nodes: state.present
-						? [
-								{
-									databaseId: f.helperRelease.id,
-									tagName: HELPER_RELEASE_TAG,
-									isDraft: f.helperRelease.draft,
-									isPrerelease: f.helperRelease.prerelease,
-									publishedAt: f.helperRelease.draft ? null : "2026-10-09T00:00:00Z",
-									releaseAssets: { totalCount: f.helperRelease.assets.length },
-								},
-							]
-						: [],
-					pageInfo: { hasNextPage: false, endCursor: null as string | null },
-				},
-			},
-		},
-	});
+	const summaries = () =>
+		state.present
+			? [
+					{
+						id: release.id,
+						url: `https://api.github.com/repos/${repository}/releases/${release.id}`,
+						tagName: release.tag_name,
+						draft: release.draft,
+						prerelease: release.prerelease,
+						publishedAt: release.published_at,
+						assetCount: release.assets.length,
+					},
+				]
+			: [];
 	const run: GhRunner = async (args) => {
 		state.calls.push(args);
 		if (args[0] === "api") {
-			if (args[1] === `repos/${repository}/releases/tags/${HELPER_RELEASE_TAG}`) {
-				if (!state.present || f.helperRelease.draft) throw new Error("gh: Not Found (HTTP 404)");
-				return JSON.stringify(f.helperRelease);
+			if (args[1] === `repos/${repository}/releases/tags/${release.tag_name}`) {
+				if (!state.present || release.draft) throw new Error("gh: Not Found (HTTP 404)");
+				return JSON.stringify(release);
 			}
-			if (args[1] === "graphql") return JSON.stringify(state.graphOverride ?? graph());
-			if (args[1] === `repos/${repository}/releases/${f.helperRelease.id}`)
-				return JSON.stringify(state.idOverride ?? f.helperRelease);
+			// Model the observed visibility problem: GraphQL never sees the draft.
+			if (args[1] === "graphql")
+				return JSON.stringify({
+					data: {
+						repository: {
+							nameWithOwner: repository,
+							releases: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+						},
+					},
+				});
+			if (args[1]?.startsWith(`repos/${repository}/releases?`))
+				return JSON.stringify(state.restOverride === undefined ? summaries() : state.restOverride);
+			if (args[1] === `repos/${repository}/releases/${release.id}`)
+				return JSON.stringify(state.idOverride ?? release);
 			return f.options.run(args);
 		}
 		if (args[0] !== "release") throw new Error("Unexpected mutation");
@@ -193,7 +203,7 @@ function draftFixture(existing = true) {
 		if (args[1] === "upload") {
 			const path = args[3] as string;
 			const bytes = await readFile(path);
-			f.helperRelease.assets.push(
+			release.assets.push(
 				f.asset({
 					name: basename(path),
 					size: bytes.length,
@@ -203,12 +213,13 @@ function draftFixture(existing = true) {
 			return "";
 		}
 		if (args[1] === "edit") {
-			f.helperRelease.draft = false;
+			release.draft = false;
+			release.published_at = "2026-10-09T00:00:00Z";
 			return "";
 		}
 		throw new Error("Unexpected release operation");
 	};
-	return { ...f, state, run, graph };
+	return { ...f, state, run, summaries, release };
 }
 const dirs: string[] = [];
 afterEach(async () => {
@@ -453,6 +464,268 @@ describe("read-only auxiliary dependency readiness", () => {
 	});
 });
 describe("authenticated draft lookup", () => {
+	for (const existing of [false, true])
+		test(`executor ${existing ? "existing partial" : "new"} draft publishes using REST, not invisible GraphQL`, async () => {
+			const f = draftFixture(existing, "executor");
+			if (existing) f.executorRelease.assets.splice(0, 2);
+			const dir = await mkdtemp(join(import.meta.dir, "../../.narrafork/executor-release-test-"));
+			dirs.push(dir);
+			for (const entry of Object.values(f.executor.manifest.platforms))
+				await writeFile(join(dir, entry.filename), "binary");
+			for (const entry of f.executor.licenses) await writeFile(join(dir, entry.name), "license");
+			await writeFile(
+				join(dir, EXECUTOR_MANIFEST_FILENAME),
+				f.raws.get(EXECUTOR_MANIFEST_FILENAME) as string,
+			);
+			await publishHelperRelease({
+				repository,
+				kind: "executor",
+				version,
+				protocolVersion: 1,
+				commit,
+				bundleDir: dir,
+				run: f.run,
+			});
+			expect(f.executorRelease.draft).toBe(false);
+			expect(f.state.calls.filter((args) => args[1] === "create").length).toBe(existing ? 0 : 1);
+			expect(f.state.calls.filter((args) => args[1] === "upload").length).toBe(
+				existing ? 2 : 7 + EXECUTOR_LICENSE_FILES.length,
+			);
+			expect(f.state.calls.some((args) => args[1] === "graphql")).toBe(false);
+			expect(
+				f.state.calls.filter((args) => args[1]?.includes("releases?per_page=100")).length,
+			).toBe(existing ? 1 : 2);
+			expect(
+				f.state.calls.filter((args) => args[1] === `repos/${repository}/releases/2`).length,
+			).toBe(2);
+			expect(JSON.stringify(f.state.calls)).not.toContain("clobber");
+		});
+	test("a public release discovered through REST remains immutable with zero writes", async () => {
+		const f = draftFixture();
+		f.helperRelease.draft = false;
+		f.helperRelease.published_at = "2026-10-09T00:00:00Z";
+		const dir = await bundle();
+		const run: GhRunner = (args) => {
+			if (args[1] === `repos/${repository}/releases/tags/${HELPER_RELEASE_TAG}`)
+				throw new Error("HTTP 404");
+			return f.run(args);
+		};
+		await expect(
+			publishHelperRelease({
+				repository,
+				kind: "helpers",
+				version: "1.0.0",
+				protocolVersion: 1,
+				commit,
+				bundleDir: dir,
+				run,
+			}),
+		).rejects.toThrow("immutable");
+		expect(f.state.calls.every((args) => args[0] === "api")).toBe(true);
+	});
+	test("REST absence after creation is an explicit failure and never retries create", async () => {
+		const f = draftFixture(false);
+		f.state.restOverride = [];
+		const dir = await bundle();
+		await expect(
+			publishHelperRelease({
+				repository,
+				kind: "helpers",
+				version: "1.0.0",
+				protocolVersion: 1,
+				commit,
+				bundleDir: dir,
+				run: f.run,
+			}),
+		).rejects.toThrow("Created helper draft not visible in authenticated REST lookup");
+		expect(f.state.calls.filter((args) => args[0] === "release").map((args) => args[1])).toEqual([
+			"create",
+		]);
+	});
+	for (const endpoint of ["tag", "list"])
+		for (const message of ["HTTP 403", "HTTP 401", "network failure", "invalid JSON"])
+			test(`${endpoint} ${message} is not absence and causes zero writes`, async () => {
+				const f = draftFixture(false);
+				const calls: string[][] = [];
+				const run: GhRunner = (args) => {
+					calls.push(args);
+					if (
+						endpoint === "tag"
+							? args[1]?.includes("/releases/tags/")
+							: args[1]?.includes("/releases?")
+					) {
+						if (message === "invalid JSON") return "{";
+						throw new Error(message);
+					}
+					return f.run(args);
+				};
+				const dir = await bundle();
+				await expect(
+					publishHelperRelease({
+						repository,
+						kind: "helpers",
+						version: "1.0.0",
+						protocolVersion: 1,
+						commit,
+						bundleDir: dir,
+						run,
+					}),
+				).rejects.toThrow();
+				expect(calls.every((args) => args[0] === "api")).toBe(true);
+				if (endpoint === "tag")
+					expect(calls.some((args) => args[1]?.includes("/releases?"))).toBe(false);
+			});
+	for (const mode of ["complete", "duplicate-tag", "duplicate-id", "403", "full-limit"])
+		test(`a first-page draft requires complete REST pagination: ${mode}`, async () => {
+			const f = draftFixture();
+			const calls: string[][] = [];
+			let pages = 0;
+			const run: GhRunner = (args) => {
+				calls.push(args);
+				if (!args[1]?.includes("/releases?")) return f.run(args);
+				pages++;
+				const node = f.summaries()[0] as ReturnType<typeof f.summaries>[number];
+				if (pages > 1 && mode !== "full-limit") {
+					if (mode === "403") throw new Error("HTTP 403");
+					if (mode === "duplicate-id") return JSON.stringify([{ ...node, tagName: "other" }]);
+					if (mode === "duplicate-tag")
+						return JSON.stringify([
+							{ ...node, id: 2, url: `https://api.github.com/repos/${repository}/releases/2` },
+						]);
+					return "[]";
+				}
+				const nodes = Array.from({ length: 100 }, (_, index) => {
+					const id = pages * 100 + index;
+					return {
+						...node,
+						id,
+						tagName: `other-${id}`,
+						url: `https://api.github.com/repos/${repository}/releases/${id}`,
+					};
+				});
+				if (pages === 1) nodes[0] = node;
+				return JSON.stringify(nodes);
+			};
+			const dir = await bundle();
+			const task = publishHelperRelease({
+				repository,
+				kind: "helpers",
+				version: "1.0.0",
+				protocolVersion: 1,
+				commit,
+				bundleDir: dir,
+				run,
+			});
+			if (mode === "complete") {
+				await task;
+				expect(f.helperRelease.draft).toBe(false);
+				expect(calls.filter((args) => args[0] === "release").map((args) => args[1])).toEqual([
+					"edit",
+				]);
+			} else {
+				await expect(task).rejects.toThrow();
+				expect(calls.every((args) => args[0] === "api")).toBe(true);
+				expect(f.helperRelease.draft).toBe(true);
+			}
+			expect(pages).toBe(mode === "full-limit" ? 10 : 2);
+		});
+	test("parent cancellation during REST enumeration stops all subsequent API and writes", async () => {
+		const f = draftFixture(false);
+		const controller = new AbortController();
+		const calls: string[][] = [];
+		const run: GhRunner = (args) => {
+			calls.push(args);
+			if (args[1]?.includes("/releases?")) controller.abort(new Error("parent deadline"));
+			return f.run(args);
+		};
+		const dir = await bundle();
+		await expect(
+			publishHelperRelease({
+				repository,
+				kind: "helpers",
+				version: "1.0.0",
+				protocolVersion: 1,
+				commit,
+				bundleDir: dir,
+				run,
+				signal: controller.signal,
+			}),
+		).rejects.toThrow("parent deadline");
+		expect(calls.at(-1)?.[1]).toContain("/releases?");
+		expect(calls.every((args) => args[0] === "api")).toBe(true);
+	});
+	for (const field of ["id", "tag", "draft", "prerelease", "published", "assets", "metadata-limit"])
+		test(`REST summary/ID ${field} mismatch fails before any write`, async () => {
+			const f = draftFixture();
+			f.state.idOverride = { ...f.helperRelease };
+			if (field === "id") f.state.idOverride.id = 2;
+			if (field === "tag") f.state.idOverride.tag_name = "other";
+			if (field === "draft") f.state.idOverride.draft = false;
+			if (field === "prerelease") f.state.idOverride.prerelease = true;
+			if (field === "published") f.state.idOverride.published_at = "2026-10-09T00:00:00Z";
+			if (field === "assets")
+				f.state.idOverride.assets = Array.from(
+					{ length: 46 },
+					() => f.helperRelease.assets[0] as Remote["assets"][number],
+				);
+			const run: GhRunner = (args) =>
+				field === "metadata-limit" && args[1] === `repos/${repository}/releases/1`
+					? " ".repeat(128 * 1024 + 1)
+					: f.run(args);
+			const dir = await bundle();
+			await expect(
+				publishHelperRelease({
+					repository,
+					kind: "helpers",
+					version: "1.0.0",
+					protocolVersion: 1,
+					commit,
+					bundleDir: dir,
+					run,
+				}),
+			).rejects.toThrow();
+			expect(f.state.calls.every((args) => args[0] === "api")).toBe(true);
+		});
+	for (const field of ["id", "tag", "draft", "prerelease", "published", "digest", "missing-asset"])
+		test(`known-ID ${field} change after upload cannot publish`, async () => {
+			const f = draftFixture();
+			f.helperRelease.assets.splice(0, 1);
+			let idReads = 0;
+			const run: GhRunner = (args) => {
+				if (args[1] === `repos/${repository}/releases/1` && ++idReads === 2) {
+					const value = {
+						...f.helperRelease,
+						assets: f.helperRelease.assets.map((asset) => ({ ...asset })),
+					};
+					if (field === "id") value.id = 2;
+					if (field === "tag") value.tag_name = "other";
+					if (field === "draft") value.draft = false;
+					if (field === "prerelease") value.prerelease = true;
+					if (field === "published") value.published_at = "2026-10-09T00:00:00Z";
+					if (field === "digest")
+						(value.assets[0] as Remote["assets"][number]).digest = `sha256:${"0".repeat(64)}`;
+					if (field === "missing-asset") value.assets.pop();
+					return JSON.stringify(value);
+				}
+				return f.run(args);
+			};
+			const dir = await bundle();
+			await expect(
+				publishHelperRelease({
+					repository,
+					kind: "helpers",
+					version: "1.0.0",
+					protocolVersion: 1,
+					commit,
+					bundleDir: dir,
+					run,
+				}),
+			).rejects.toThrow();
+			expect(f.state.calls.filter((args) => args[0] === "release").map((args) => args[1])).toEqual([
+				"upload",
+			]);
+			expect(f.helperRelease.draft).toBe(true);
+		});
 	test("new create survives the tag endpoint's real draft 404 and reads the draft by ID", async () => {
 		const f = draftFixture(false);
 		const dir = await bundle();
@@ -468,7 +741,10 @@ describe("authenticated draft lookup", () => {
 		expect(
 			f.state.calls.filter((args) => args[0] === "release" && args[1] === "create").length,
 		).toBe(1);
-		expect(f.state.calls.some((args) => args[1] === "graphql")).toBe(true);
+		expect(f.state.calls.some((args) => args[1] === "graphql")).toBe(false);
+		expect(f.state.calls.filter((args) => args[1]?.includes("releases?per_page=100")).length).toBe(
+			2,
+		);
 		expect(f.state.calls.some((args) => args[1] === `repos/${repository}/releases/1`)).toBe(true);
 		expect(f.state.calls.filter((args) => args[1] === "upload").length).toBe(
 			13 + HELPER_LICENSE_FILES.length,
@@ -503,39 +779,33 @@ describe("authenticated draft lookup", () => {
 		"malformed",
 		"errors",
 		"foreign",
-		"incomplete",
+		"duplicate-id",
 		"duplicate-tag",
+		"state",
+		"prerelease",
 		"too-many-assets",
 	])
 		test(`invalid ${mode} summary cannot prove absence or create a release`, async () => {
-			const f = draftFixture(mode === "duplicate-tag" || mode === "too-many-assets");
-			const value = f.graph();
-			if (mode === "malformed") f.state.graphOverride = { data: null };
-			if (mode === "errors") f.state.graphOverride = { ...value, errors: [{ message: "denied" }] };
-			if (mode === "foreign") {
-				value.data.repository.nameWithOwner = "Other/repo";
-				f.state.graphOverride = value;
+			const f = draftFixture();
+			const value = f.summaries();
+			const node = value[0] as (typeof value)[number];
+			if (mode === "malformed") f.state.restOverride = null;
+			if (mode === "errors") f.state.restOverride = { message: "denied" };
+			if (mode === "foreign") node.url = "https://api.github.com/repos/Other/repo/releases/1";
+			if (mode === "duplicate-id") value.push({ ...node, tagName: "other" });
+			if (mode === "duplicate-tag")
+				value.push({
+					...node,
+					id: 2,
+					url: `https://api.github.com/repos/${repository}/releases/2`,
+				});
+			if (mode === "state") node.publishedAt = "2026-10-09T00:00:00Z";
+			if (mode === "prerelease") {
+				node.prerelease = true;
+				f.helperRelease.prerelease = true;
 			}
-			if (mode === "incomplete") {
-				value.data.repository.releases.pageInfo = {
-					hasNextPage: true,
-					endCursor: "next",
-				} as typeof value.data.repository.releases.pageInfo;
-				f.state.graphOverride = value;
-			}
-			if (mode === "duplicate-tag") {
-				const node = value.data.repository.releases
-					.nodes[0] as (typeof value.data.repository.releases.nodes)[number];
-				value.data.repository.releases.nodes.push({ ...node, databaseId: 2 });
-				f.state.graphOverride = value;
-			}
-			if (mode === "too-many-assets") {
-				(
-					value.data.repository.releases
-						.nodes[0] as (typeof value.data.repository.releases.nodes)[number]
-				).releaseAssets.totalCount = 46;
-				f.state.graphOverride = value;
-			}
+			if (mode === "too-many-assets") node.assetCount = 46;
+			if (mode !== "malformed" && mode !== "errors") f.state.restOverride = value;
 			const dir = await bundle();
 			await expect(
 				publishHelperRelease({

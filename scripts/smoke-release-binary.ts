@@ -413,12 +413,40 @@ export function hasPtyMarker(output: string, marker: string): boolean {
 	return clean.split(/[\r\n]/).some((line) => line.trim() === marker);
 }
 
-async function pty(origin: string, token: string, scope: SmokeProcessScope): Promise<void> {
-	// dtach deliberately escapes the server tree to survive restarts. A smoke crash must
-	// not leave that daemon behind; standard hosted runners exercise the direct native PTY.
-	if (process.platform !== "win32" && Bun.which("dtach", { PATH: scope.env.PATH })) {
+export function smokeFailure(label: string, errors: readonly unknown[]): Error {
+	const describe = (error: unknown, depth = 0): string => {
+		const text = String(error).slice(0, 4_096);
+		if (!(error instanceof Error)) return text;
+		const system = error as NodeJS.ErrnoException;
+		const fields = [system.code, system.syscall, system.path]
+			.filter((value) => value !== undefined)
+			.map((value) => String(value).slice(0, 512));
+		const nested =
+			error instanceof AggregateError && depth < 2
+				? error.errors
+						.slice(0, 4)
+						.map((value: unknown) => describe(value, depth + 1))
+						.join("; ")
+				: "";
+		return `${text}${fields.length ? ` [${fields.join("; ")}]` : ""}${nested ? ` (${nested})` : ""}`;
+	};
+	return new Error(
+		`${label}: ${errors
+			.slice(0, 4)
+			.map((error) => describe(error))
+			.join("; ")}`.slice(0, 16_384),
+		{ cause: errors.length === 1 ? errors[0] : new AggregateError(errors, label) },
+	);
+}
+
+export async function smokePty(
+	origin: string,
+	token: string,
+	scope: SmokeProcessScope,
+): Promise<void> {
+	// Exercise the direct native PTY; never leave a dtach daemon outside the owned process tree.
+	if (process.platform !== "win32" && Bun.which("dtach", { PATH: scope.env.PATH }))
 		throw new Error("Native release smoke requires dtach absent from runner PATH");
-	}
 	const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 	const terminal = JSON.parse(
 		(
@@ -431,42 +459,64 @@ async function pty(origin: string, token: string, scope: SmokeProcessScope): Pro
 	) as { id?: string };
 	if (!terminal.id) throw new Error("Terminal create returned no ID");
 	let socket: WebSocket | undefined;
+	let closing = false;
+	let stage = "connect";
+	let output = "";
+	let replay = "";
+	let outputBytes = 0;
+	const messages = new Map<string, number>();
+	const errors: unknown[] = [];
 	try {
 		socket = new WebSocket(
 			`${origin.replace("http:", "ws:")}/ws/terminal?token=${encodeURIComponent(token)}`,
 		);
 		const ws = socket;
 		let opened = false;
-		let output = "";
+		let subscribed = false;
 		let failure: Error | undefined;
 		const marker = `NF_RELEASE_PTY_${randomUUID().replaceAll("-", "")}`;
+		const resize = () =>
+			ws.send(JSON.stringify({ type: "resize", terminalId: terminal.id, cols: 100, rows: 30 }));
 		ws.addEventListener("open", () => {
 			opened = true;
 		});
 		ws.addEventListener("error", () => {
 			failure = new Error("Terminal WebSocket failed");
 		});
-		ws.addEventListener("close", () => {
-			failure ??= new Error("Terminal WebSocket closed before marker");
+		ws.addEventListener("close", (event) => {
+			if (!closing)
+				failure ??= new Error(`Terminal WebSocket closed before marker (${event.code})`);
 		});
 		ws.addEventListener("message", (event) => {
+			if (closing) return;
 			try {
 				if (typeof event.data !== "string" || Buffer.byteLength(event.data) > MAX_MESSAGE)
 					throw new Error("Terminal WS message exceeds budget");
 				const message = JSON.parse(event.data);
+				if (!message || typeof message.type !== "string")
+					throw new Error("Invalid terminal WS message");
+				const type = message.type.slice(0, 64);
+				if (messages.has(type) || messages.size < 16)
+					messages.set(type, (messages.get(type) ?? 0) + 1);
 				if (message.type === "ping") {
 					ws.send(JSON.stringify({ type: "pong" }));
 					return;
 				}
-				if (message.type === "error") throw new Error(`PTY error: ${message.message}`);
+				if (message.type === "error")
+					throw new Error(`PTY error: ${String(message.message).slice(0, 2_048)}`);
+				if (message.terminalId !== terminal.id) return;
+				if (message.type === "bufferState") subscribed = true;
+				if (message.type === "requestResize") resize();
+				if (message.type === "exit" || message.type === "killed")
+					throw new Error(`PTY exited before marker (${String(message.code).slice(0, 64)})`);
 				if (
-					message.type === "output" &&
-					message.terminalId === terminal.id &&
+					(message.type === "output" || message.type === "scrollback") &&
 					typeof message.data === "string"
 				) {
-					output += message.data;
-					if (Buffer.byteLength(output) > 1024 * 1024)
-						throw new Error("PTY output budget exceeded");
+					outputBytes += Buffer.byteLength(message.data);
+					if (outputBytes > 1024 * 1024) throw new Error("PTY output budget exceeded");
+					if (message.type === "output") output += message.data;
+					else replay = message.data.slice(-8_192);
 				}
 			} catch (error) {
 				failure = error instanceof Error ? error : new Error(String(error));
@@ -476,24 +526,46 @@ async function pty(origin: string, token: string, scope: SmokeProcessScope): Pro
 			if (failure) throw failure;
 			return opened ? true : undefined;
 		});
+		stage = "subscribe";
 		ws.send(JSON.stringify({ type: "subscribe", terminalIds: [terminal.id] }));
-		ws.send(JSON.stringify({ type: "resize", terminalId: terminal.id, cols: 100, rows: 30 }));
+		// The existing server sends bufferState after scrollback replay; do not race that replay.
+		await scope.until("PTY subscription", () => {
+			if (failure) throw failure;
+			return subscribed ? true : undefined;
+		});
+		stage = "round-trip";
+		resize();
+		output = "";
 		ws.send(JSON.stringify({ type: "input", terminalId: terminal.id, data: `echo ${marker}\r` }));
 		await scope.until("PTY shell round trip", () => {
 			if (failure) throw failure;
 			return hasPtyMarker(output, marker) ? true : undefined;
 		});
+	} catch (error) {
+		errors.push(
+			new Error(
+				`${smokeFailure("PTY validation failed", [error]).message}\nPTY stage=${stage}; messages=${JSON.stringify(Object.fromEntries(messages))}; bytes=${outputBytes}\nlive=${JSON.stringify(output.slice(-8_192))}\nscrollback=${JSON.stringify(replay)}`,
+				{ cause: error },
+			),
+		);
 	} finally {
+		closing = true;
 		socket?.close();
-		// Delete only this terminal even on cancellation, using an independent short cleanup budget.
-		const response = await fetch(`${origin}/api/terminals/${encodeURIComponent(terminal.id)}`, {
-			method: "DELETE",
-			headers,
-			signal: AbortSignal.timeout(5_000),
-		});
-		await boundedBody(response, MAX_MESSAGE);
-		if (!response.ok) scope.fail(new Error(`Failed to delete owned smoke PTY: ${response.status}`));
+		try {
+			// Delete only this terminal, even on cancellation, within an independent cleanup budget.
+			const response = await fetch(`${origin}/api/terminals/${encodeURIComponent(terminal.id)}`, {
+				method: "DELETE",
+				headers,
+				signal: AbortSignal.timeout(5_000),
+			});
+			await boundedBody(response, MAX_MESSAGE);
+			if (!response.ok)
+				errors.push(new Error(`Failed to delete owned smoke PTY: ${response.status}`));
+		} catch (error) {
+			errors.push(smokeFailure("PTY cleanup failed", [error]));
+		}
 	}
+	if (errors.length) throw smokeFailure("PTY smoke failed", errors);
 }
 
 /** Runs only a byte-identical copy of the downloaded binary, with no repository dependencies nearby. */
@@ -527,6 +599,8 @@ export async function smokeReleaseBinary(
 	]);
 	const scope = new SmokeProcessScope(cwd, env, { signal: deadlineSignal });
 	let result: CiReleaseSmokeResult | undefined;
+	let stage = "binary preparation";
+	const errors: unknown[] = [];
 	try {
 		for (const directory of [
 			cwd,
@@ -582,8 +656,11 @@ export async function smokeReleaseBinary(
 			`--port=${port}`,
 			"--no-auto-resume",
 		]);
+		stage = "startup";
 		await startup(origin, child, scope, options);
+		stage = "frontend";
 		await frontend(origin, scope);
+		stage = "bootstrap registration";
 		const username = `ci_${randomUUID().replaceAll("-", "").slice(0, 20)}`;
 		const registration = JSON.parse(
 			(
@@ -609,12 +686,19 @@ export async function smokeReleaseBinary(
 			)
 				throw new Error("Compiled default update repository does not match the release repository");
 		}
+		stage = "database";
 		assertMigratedDatabase(join(env.NARRAFORK_HOME, "narrafork.db"), username);
+		stage = "watcher";
 		await watcher(executable, root, scope);
-		await pty(origin, registration.token, scope);
+		stage = "PTY";
+		await smokePty(origin, registration.token, scope);
 		child.assertRunning();
 		assertHealthIdentity(JSON.parse((await request(origin, "/api/health", scope)).text), options);
+		stage = "process shutdown";
 		await scope.close();
+		// Cleanup can observe late output-limit/stream failures independently of the parent deadline.
+		scope.signal.throwIfAborted();
+		stage = "post-run integrity";
 		const after = await hashReleaseFile(binary, MAX_BINARY, deadlineSignal);
 		const afterRun = await hashReleaseFile(executable, MAX_BINARY, deadlineSignal);
 		for (const hash of [after, afterRun])
@@ -643,19 +727,31 @@ export async function smokeReleaseBinary(
 			},
 		};
 	} catch (error) {
-		throw new Error(`Release smoke failed: ${String(error)}\n${scope.diagnostic}`, {
-			cause: error,
-		});
+		errors.push(
+			new Error(
+				`${smokeFailure(`Release smoke failed during ${stage}`, [error]).message}\n${scope.diagnostic}`,
+				{ cause: error },
+			),
+		);
 	} finally {
 		try {
 			await scope.close();
-		} finally {
+		} catch (error) {
+			errors.push(smokeFailure("Smoke process cleanup failed", [error]));
+		}
+		try {
 			await rm(root, { recursive: true, force: true, maxRetries: 3 });
+		} catch (error) {
+			errors.push(smokeFailure("Smoke directory cleanup failed", [error]));
 		}
 	}
+	if (errors.length) throw smokeFailure("Release smoke failed", errors);
 	if (!result) throw new Error("Smoke result missing");
 	deadlineSignal.throwIfAborted();
+	scope.signal.throwIfAborted();
 	await mkdir(dirname(output), { recursive: true });
+	deadlineSignal.throwIfAborted();
+	scope.signal.throwIfAborted();
 	await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, { flag: "wx", mode: 0o600 });
 	if (options.target.endsWith("-baseline"))
 		console.log(

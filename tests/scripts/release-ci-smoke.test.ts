@@ -14,6 +14,8 @@ import {
 	resolveFrontendAssetPath,
 	type SmokeOptions,
 	smokeEnvironment,
+	smokeFailure,
+	smokePty,
 	smokeReleaseBinary,
 	validateSmokeMetadata,
 	WatcherInbox,
@@ -395,3 +397,190 @@ test("failed real executable smoke never writes a success artifact", async () =>
 	await expect(readFile(fixtureOptions.output)).rejects.toThrow();
 	expect(await hashReleaseFile(binary)).toEqual(measured);
 }, 60_000);
+
+async function ptyFixture(
+	mode: "pass" | "echo" | "replay" | "exit" | "oversize",
+	deleteStatus = 200,
+) {
+	let deleted = 0;
+	let inputs = 0;
+	let resized = 0;
+	let ready = false;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, server) {
+			const path = new URL(request.url).pathname;
+			if (path === "/ws/terminal" && server.upgrade(request)) return;
+			if (request.method === "POST" && path === "/api/terminals")
+				return Response.json({ id: "owned-terminal" });
+			if (request.method === "DELETE" && path === "/api/terminals/owned-terminal") {
+				deleted++;
+				return new Response("{}", { status: deleteStatus });
+			}
+			return new Response("not found", { status: 404 });
+		},
+		websocket: {
+			message(ws, raw) {
+				const message = JSON.parse(String(raw));
+				const send = (type: string, extra: Record<string, unknown> = {}) =>
+					ws.send(JSON.stringify({ type, terminalId: "owned-terminal", ...extra }));
+				if (message.type === "subscribe") {
+					timers.push(
+						setTimeout(() => {
+							ready = true;
+							send("scrollback", { data: "initial shell prompt\r\n" });
+							send("bufferState", { activeBuffer: "normal" });
+						}, 30),
+					);
+				} else if (message.type === "resize") resized++;
+				else if (message.type === "input") {
+					inputs++;
+					if (!ready) {
+						send("error", { message: "input raced subscription" });
+						return;
+					}
+					const marker = /^echo (NF_RELEASE_PTY_[a-f0-9]+)\r$/.exec(message.data)?.[1];
+					if (!marker) {
+						send("error", { message: "invalid marker command" });
+						return;
+					}
+					send("requestResize");
+					if (mode === "oversize") {
+						send("output", { data: "x".repeat(65_537) });
+						return;
+					}
+					send("output", { data: `$ ${message.data}\n` });
+					if (mode === "exit") {
+						send("exit", { code: 37 });
+						return;
+					}
+					if (mode === "replay") {
+						send("scrollback", { data: `${marker}\r\n` });
+						return;
+					}
+					if (mode === "pass") {
+						send("output", { terminalId: "other-terminal", data: "foreign-output\r\n" });
+						send("output", { data: marker.slice(0, 12) });
+						send("output", { data: `${marker.slice(12)}\r\n` });
+					}
+				}
+			},
+		},
+	});
+	return {
+		origin: server.url.origin,
+		get deleted() {
+			return deleted;
+		},
+		get inputs() {
+			return inputs;
+		},
+		get resized() {
+			return resized;
+		},
+		close() {
+			for (const timer of timers) clearTimeout(timer);
+			server.stop(true);
+		},
+	};
+}
+
+describe("PTY subscription and cleanup regression", () => {
+	test("waits for subscription replay, handles resize and requires the live split marker", async () => {
+		const fixture = await ptyFixture("pass");
+		const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+		try {
+			await smokePty(fixture.origin, "isolated-token", scope);
+			expect(fixture.inputs).toBe(1);
+			expect(fixture.resized).toBeGreaterThanOrEqual(2);
+			expect(fixture.deleted).toBe(1);
+		} finally {
+			await scope.close();
+			fixture.close();
+		}
+	});
+	for (const mode of ["echo", "replay"] as const) {
+		test(`${mode} alone never attests a completed live shell round trip`, async () => {
+			const fixture = await ptyFixture(mode);
+			const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 300 });
+			try {
+				await expect(smokePty(fixture.origin, "isolated-token", scope)).rejects.toThrow(
+					"PTY stage=round-trip",
+				);
+				expect(fixture.inputs).toBe(1);
+				expect(fixture.deleted).toBe(1);
+			} finally {
+				await scope.close();
+				fixture.close();
+			}
+		});
+	}
+	test("preserves a native exit and its diagnostics when terminal deletion also fails", async () => {
+		const fixture = await ptyFixture("exit", 500);
+		const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+		try {
+			let failure: unknown;
+			try {
+				await smokePty(fixture.origin, "isolated-token", scope);
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(Error);
+			expect(String(failure)).toContain("PTY exited before marker (37)");
+			expect(String(failure)).toContain("PTY stage=round-trip");
+			expect(String(failure)).toContain("Failed to delete owned smoke PTY: 500");
+			expect(fixture.deleted).toBe(1);
+		} finally {
+			await scope.close();
+			fixture.close();
+		}
+	});
+	test("oversize live output fails instead of collecting an unbounded transcript", async () => {
+		const fixture = await ptyFixture("oversize");
+		const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+		try {
+			await expect(smokePty(fixture.origin, "isolated-token", scope)).rejects.toThrow(
+				"message exceeds budget",
+			);
+			expect(fixture.deleted).toBe(1);
+		} finally {
+			await scope.close();
+			fixture.close();
+		}
+	});
+});
+
+describe("smoke close and error aggregation", () => {
+	test("concurrent cleanup callers wait for one close and actual stdio release", async () => {
+		const scope = new SmokeProcessScope(await temporary(), process.env);
+		const child = scope.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"]);
+		const first = scope.close();
+		const second = scope.close();
+		expect(second).toBe(first);
+		await Promise.all([first, second]);
+		expect(child.closed).toBe(true);
+		expect(child.status).not.toBeUndefined();
+		expect(child.process.stdin.destroyed).toBe(true);
+		expect(child.process.stdout.destroyed).toBe(true);
+		expect(child.process.stderr.destroyed).toBe(true);
+		expect(scope.close()).toBe(first);
+	});
+	test("cleanup cannot hide the primary failure and filesystem error fields", () => {
+		const primary = new Error("native validation failed");
+		const cleanup = Object.assign(new Error("resource busy"), {
+			code: "EBUSY",
+			syscall: "rm",
+			path: "/isolated/run/executable",
+		});
+		const failure = smokeFailure("Release smoke failed", [primary, cleanup]);
+		expect(failure.message).toContain(primary.message);
+		expect(failure.message).toContain("EBUSY; rm; /isolated/run/executable");
+		expect(failure.cause).toBeInstanceOf(AggregateError);
+		expect((failure.cause as AggregateError).errors).toEqual([primary, cleanup]);
+		expect(
+			smokeFailure("bounded", [new Error("x".repeat(100_000))]).message.length,
+		).toBeLessThanOrEqual(16_384);
+	});
+});
