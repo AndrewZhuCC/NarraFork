@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -41,6 +41,7 @@ import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from 
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -1508,7 +1509,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
+	): Promise<BuiltHistory> {
 		// narratorId is required to resolve history images: an uploaded image is
 		// stored per narrator and the row only carries its id, so without the owner
 		// the bytes cannot be found. It used to be ignored here, which silently
@@ -3129,6 +3130,7 @@ async function buildAnthropicHistory(
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
 	trailingUserText?: string;
+	replayedInjectionMessageIds: string[];
 }> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -3167,6 +3169,7 @@ async function buildAnthropicHistory(
 	}
 
 	const history: AnthropicMessage[] = [];
+	const emittedMessages: DbMessage[] = [];
 	let pendingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }> = [];
 
 	for (const msg of topLevel) {
@@ -3404,8 +3407,10 @@ async function buildAnthropicHistory(
 				const parts: AnthropicContentPart[] = [...images];
 				if (text) parts.unshift({ type: "text", text });
 				history.push({ role: "user", content: parts });
+				emittedMessages.push(msg);
 			} else if (text) {
 				history.push({ role, content: text });
+				emittedMessages.push(msg);
 			}
 		}
 	}
@@ -3414,6 +3419,7 @@ async function buildAnthropicHistory(
 		history,
 		trailingToolResults: pendingToolResults,
 		trailingUserText: trailingSysText || undefined,
+		replayedInjectionMessageIds: historyInputMessageIds(emittedMessages),
 	};
 }
 

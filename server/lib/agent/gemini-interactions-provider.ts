@@ -1,5 +1,5 @@
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -11,6 +11,7 @@ import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -248,7 +249,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		_model: string,
 		_narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
+	): Promise<BuiltHistory> {
 		return this.buildGeminiHistory(dbMessages);
 	}
 
@@ -675,6 +676,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		history: GeminiHistoryItem[];
 		trailingToolResults: GeminiFunctionResultStep[];
 		trailingUserText?: string;
+		replayedInjectionMessageIds: string[];
 	} {
 		const topLevel = dbMessages.filter(
 			(message) =>
@@ -684,6 +686,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		if (topLevel.at(-1)?.role === "user") topLevel.pop();
 
 		const history: GeminiHistoryItem[] = [];
+		const replayedInjectionMessageIds: string[] = [];
 		let pendingToolResults: GeminiFunctionResultStep[] = [];
 		const flushToolResults = () => {
 			if (pendingToolResults.length > 0) {
@@ -800,18 +803,24 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			} else if (message.role === "user") {
 				flushToolResults();
 				const text = message.contentText || "";
-				if (text) history.push({ type: "user_input", content: text });
+				if (text) {
+					history.push({ type: "user_input", content: text });
+					replayedInjectionMessageIds.push(...historyInputMessageIds([message], [text]));
+				}
 			} else {
 				flushToolResults();
 				const blocks = Array.isArray(message.contentJson)
 					? (message.contentJson as Array<{ type?: string; text?: string }>)
 					: [];
 				const text = modelTextFromContentBlocks(blocks) || message.contentText || "";
-				if (text) history.push({ type: "user_input", content: text });
+				if (text) {
+					history.push({ type: "user_input", content: text });
+					replayedInjectionMessageIds.push(...historyInputMessageIds([message], [text]));
+				}
 			}
 		}
 
-		return { history, trailingToolResults: pendingToolResults };
+		return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 	}
 
 	private async *parseSSEStream(

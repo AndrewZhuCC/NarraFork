@@ -6,6 +6,7 @@ import { db } from "../db";
 import { chapters, narratorBufferedMessages as mailbox, narrators } from "../db/schema";
 import { projectFileReferenceText } from "../lib/agent/file-reference-projection";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
+import type { AgentInputPart } from "../lib/agent/types";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -1012,7 +1013,7 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 	toolUseId: string;
 	cwd: string;
 	currentUserId?: string | null;
-}): Promise<{ buffered: SubagentBufferedMessage; text: string } | null> {
+}): Promise<{ buffered: SubagentBufferedMessage; text: string; parts: AgentInputPart[] } | null> {
 	try {
 		const claimed = await withNarratorMutationAdmission(opts.narratorId, async () => {
 			const buffered = await peekSubagentBufferedMessage(opts.narratorId);
@@ -1041,7 +1042,9 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 			{ ...claimed.userMsg, messageUuid: null },
 			projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences),
 		);
-		return { buffered: claimed.buffered, text: hint ? `${text}\n\n${hint}` : text };
+		const parts: AgentInputPart[] = [{ text, messageId: claimed.userMsg.id }];
+		if (hint?.text) parts.push(hint);
+		return { buffered: claimed.buffered, text: parts.map((part) => part.text).join("\n\n"), parts };
 	} catch (error) {
 		logger.error("Failed to persist injected subagent user message; retained for retry", {
 			narratorId: opts.narratorId,
@@ -1192,7 +1195,7 @@ async function deliverBufferedKnowledgeHint(input: {
 	turnUserId: string | null | undefined;
 	locale?: string;
 	inPass?: boolean;
-}): Promise<string | undefined> {
+}): Promise<AgentInputPart | undefined> {
 	const { narratorId, parentNarratorId, toolUseId, text, turnUserId } = input;
 	try {
 		// A failed scope lookup must SKIP the scan, not proceed with an absent project:
@@ -1216,8 +1219,8 @@ async function deliverBufferedKnowledgeHint(input: {
 			content: scan.content,
 			body: scan.body,
 			source: "knowledge_base_hint",
-			// The caller rebuilds history right after this, so the row is picked up from the
-			// database; asking for `onNextTurn` text nobody would fold in would be a lie.
+			// Resumed passes rebuild history; in-pass delivery also needs the returned
+			// durable hint part in the running loop's in-memory history.
 			schedule: input.inPass ? "onNextTurn" : "none",
 			locale: (input.locale ?? "en") as Locale,
 			subagent: { parentToolUseId: toolUseId, parentNarratorId },
@@ -1231,7 +1234,9 @@ async function deliverBufferedKnowledgeHint(input: {
 				hits: scan.record.hits,
 			});
 		}
-		return input.inPass ? (turnText ?? scan.content) : undefined;
+		return input.inPass
+			? { text: turnText ?? scan.content, messageId: messageId ?? undefined }
+			: undefined;
 	} catch (err) {
 		logger.warn("Failed to deliver knowledge hint for a drained subagent message", {
 			narratorId,

@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
-import type { ProviderAdapter } from "../provider";
+import { AnthropicProvider } from "../anthropic-provider";
+import { OpenAIProvider } from "../openai-provider";
+import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
-import type { AgentConfig, AgentEvent } from "../types";
+import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 /**
  * A cut-in ("插队 · 下次请求时发送") queued while a tool is already running must be
@@ -87,12 +89,12 @@ const testProvider: ProviderAdapter = {
 const realProviderModule = { ...(await import("../provider")) };
 mock.module("../provider", () => ({
 	getProvider: () => testProvider,
-	resolveProviderAndModel: () => ({
+	resolveProviderAndModel: (model: string) => ({
 		requestedProvider: "test",
-		requestedModel: "test:model",
+		requestedModel: model,
 		provider: "test",
 		adapter: testProvider,
-		model: "test:model",
+		model,
 	}),
 }));
 
@@ -205,6 +207,367 @@ describe("model input adoption boundary", () => {
 		}
 	}
 
+	const historyFormats = ["responses", "completions", "anthropic"] as const;
+	const completionNotice =
+		"[System] Background agent history-probe completed; no task agents remain.";
+	type HistoryRequest = Pick<ChatParams, "content" | "history" | "toolResults">;
+
+	function historyProvider(format: (typeof historyFormats)[number]): ProviderAdapter {
+		const config = {
+			id: "history-probe",
+			name: "History probe",
+			prefix: "test",
+			apiKey: "unused",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "history-probe-model",
+		};
+		return format === "anthropic"
+			? new AnthropicProvider(config)
+			: new OpenAIProvider({ ...config, apiMode: format });
+	}
+
+	function modelStrings(value: unknown): string[] {
+		if (typeof value === "string") return [value];
+		if (Array.isArray(value)) return value.flatMap(modelStrings);
+		if (value && typeof value === "object") return Object.values(value).flatMap(modelStrings);
+		return [];
+	}
+
+	function occurrences(value: unknown, text: string): number {
+		return modelStrings(value).reduce((count, part) => count + part.split(text).length - 1, 0);
+	}
+
+	function historyTool(id: string, value: string): ParsedStreamEvent {
+		return { toolUses: [{ toolUseId: id, name: FAST, input: { value } }] };
+	}
+
+	async function runHistoryInput(
+		format: (typeof historyFormats)[number],
+		script: Array<ParsedStreamEvent[] | Error>,
+		overrides: Partial<AgentConfig> = {},
+	): Promise<HistoryRequest[]> {
+		const provider = historyProvider(format);
+		const requests: HistoryRequest[] = [];
+		// Keep real provider history/result projections. Only upstream output is scripted;
+		// the suite's default no-op pushUserTurn would hide this cross-request regression.
+		const userTurn = spyOn(testProvider, "pushUserTurn").mockImplementation(
+			provider.pushUserTurn.bind(provider),
+		);
+		const assistantTurn = spyOn(testProvider, "pushAssistantTurn").mockImplementation(
+			provider.pushAssistantTurn.bind(provider),
+		);
+		const toolResult = spyOn(testProvider, "formatToolResult").mockImplementation(
+			provider.formatToolResult.bind(provider),
+		);
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
+			params.onRequestStart?.();
+			const requestIndex = requests.length;
+			requests.push(
+				structuredClone({
+					content: params.content,
+					history: params.history,
+					toolResults: params.toolResults ?? [],
+				}),
+			);
+			const response = script[requestIndex];
+			if (!response) throw new Error("Unexpected history probe request");
+			if (response instanceof Error) throw response;
+			for (const event of response) yield event;
+		});
+		try {
+			await runInput({ maxTurns: 8, maxTransientRetries: 0, ...overrides });
+			return requests;
+		} finally {
+			chat.mockRestore();
+			toolResult.mockRestore();
+			assistantTurn.mockRestore();
+			userTurn.mockRestore();
+		}
+	}
+
+	test.each([
+		...historyFormats,
+	])("%s retains adopted completion input across later tool requests", async (format) => {
+		let supplied = false;
+		let consumed = 0;
+		const requests = await runHistoryInput(
+			format,
+			[
+				[historyTool("history-first", "first")],
+				[historyTool("history-second", "second")],
+				[historyTool("history-third", "third")],
+				[{ text: "finished after adopting the completion" }],
+			],
+			{
+				getAfterToolsInjections: () => {
+					if (supplied) return "";
+					supplied = true;
+					return {
+						text: completionNotice,
+						onConsumed: () => {
+							consumed++;
+						},
+					};
+				},
+			},
+		);
+		expect(requests).toHaveLength(4);
+		expect(occurrences(requests[0], completionNotice)).toBe(0);
+		expect(requests[1].content).toBe(completionNotice);
+		expect(consumed).toBe(1);
+		for (const request of requests.slice(1)) {
+			expect(occurrences(request, completionNotice)).toBe(1);
+			expect(occurrences(request, "done:first")).toBe(1);
+		}
+		for (const request of requests.slice(2)) {
+			expect(request.content).toBe("");
+			expect(occurrences(request.history, completionNotice)).toBe(1);
+			expect(occurrences(request, "done:second")).toBe(1);
+		}
+	});
+
+	async function rebuiltCompletionHistory(format: (typeof historyFormats)[number]) {
+		const rows: DbMessage[] = [
+			{
+				id: "initial-row",
+				role: "user",
+				contentJson: [{ type: "text", text: "initial" }],
+				contentText: "initial",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			{
+				id: "tool-row",
+				role: "assistant",
+				contentJson: [
+					{ type: "tool_use", id: "history-first", name: FAST, input: { value: "first" } },
+				],
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [
+					{
+						toolUseId: "history-first",
+						toolName: FAST,
+						inputJson: { value: "first" },
+						outputJson: "done:first",
+						status: "success",
+					},
+				],
+			},
+			{
+				id: "completion-row",
+				role: "sys",
+				contentJson: [
+					{ type: "system_injection", source: "bg_agent", modelText: completionNotice },
+				],
+				contentText: completionNotice,
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		];
+		const built = await historyProvider(format).buildHistory(rows, "history-probe-model");
+		return {
+			history: built.history,
+			pendingToolResults: built.trailingToolResults,
+			// Use provenance from the real builder, not an assumption about source rows.
+			replayedInjectionMessageIds: built.replayedInjectionMessageIds ?? [],
+		};
+	}
+
+	test.each([...historyFormats])("%s sends a rebuilt completion row only once", async (format) => {
+		let supplied = false;
+		let consumed = 0;
+		const replacement = await rebuiltCompletionHistory(format);
+		const requests = await runHistoryInput(
+			format,
+			[
+				[historyTool("history-first", "first")],
+				[historyTool("history-second", "second")],
+				[historyTool("history-third", "third")],
+				[{ text: "finished" }],
+			],
+			{
+				onBeforeTurn: async (turn) => (turn === 1 ? replacement : null),
+				getAfterToolsInjections: () => {
+					if (supplied) return "";
+					supplied = true;
+					return {
+						text: completionNotice,
+						parts: [{ messageId: "completion-row", text: completionNotice }],
+						onConsumed: () => {
+							consumed++;
+						},
+					};
+				},
+			},
+		);
+		expect(consumed).toBe(1);
+		expect(requests).toHaveLength(4);
+		for (const request of requests.slice(1)) {
+			expect(occurrences(request, completionNotice)).toBe(1);
+			expect(occurrences(request, "done:first")).toBe(1);
+		}
+	});
+
+	test.each([
+		...historyFormats,
+	])("%s retains uncovered and same-text distinct input rows after rebuild", async (format) => {
+		let supplied = false;
+		const replacement = await rebuiltCompletionHistory(format);
+		const newNotice = "A second background completion arrived after the rebuild snapshot.";
+		const requests = await runHistoryInput(
+			format,
+			[
+				[historyTool("history-first", "first")],
+				[historyTool("history-second", "second")],
+				[{ text: "finished" }],
+			],
+			{
+				onBeforeTurn: async (turn) => (turn === 1 ? replacement : null),
+				getAfterToolsInjections: () => {
+					if (supplied) return "";
+					supplied = true;
+					const parts = [
+						{ messageId: "completion-row", text: completionNotice },
+						{ messageId: "distinct-completion-row", text: completionNotice },
+						{ messageId: "new-completion-row", text: newNotice },
+						{ text: "An unpersisted question hint remains pending." },
+					];
+					return { text: parts.map((part) => part.text).join("\n\n"), parts };
+				},
+			},
+		);
+		for (const request of requests.slice(1)) {
+			expect(occurrences(request, completionNotice)).toBe(2);
+			expect(occurrences(request, newNotice)).toBe(1);
+			expect(occurrences(request, "An unpersisted question hint remains pending.")).toBe(1);
+			expect(occurrences(request, "done:first")).toBe(1);
+		}
+	});
+
+	test.each([
+		...historyFormats,
+	])("%s reprojects adopted input after a retry rebuild without another receipt", async (format) => {
+		let supplied = false;
+		let consumed = 0;
+		let attempts = 0;
+		let switchQueued = false;
+		let rebuilt = 0;
+		const replacement = await rebuiltCompletionHistory(format);
+		const requests = await runHistoryInput(
+			format,
+			[
+				[historyTool("history-first", "first")],
+				new ApiError(502, "temporary upstream failure"),
+				[historyTool("history-second", "second")],
+				[{ text: "finished" }],
+			],
+			{
+				maxTransientRetries: 1,
+				retryBackoffCeilMs: 1,
+				onModelInputConsumed: () => {
+					if (++attempts === 2) switchQueued = true;
+				},
+				getModelOverride: () => (switchQueued ? "test:retry-model" : null),
+				onBeforeTurn: async (_turn, reason) => {
+					if (!reason?.force) return null;
+					switchQueued = false;
+					rebuilt++;
+					return replacement;
+				},
+				getAfterToolsInjections: () => {
+					if (supplied) return "";
+					supplied = true;
+					return {
+						text: completionNotice,
+						parts: [{ messageId: "completion-row", text: completionNotice }],
+						onConsumed: () => {
+							consumed++;
+						},
+					};
+				},
+			},
+		);
+		expect(rebuilt).toBe(1);
+		expect(consumed).toBe(1);
+		expect(requests).toHaveLength(4);
+		for (const request of requests.slice(1)) {
+			expect(occurrences(request, completionNotice)).toBe(1);
+			expect(occurrences(request, "done:first")).toBe(1);
+		}
+	});
+
+	test.each([
+		...historyFormats,
+	])("%s retains completion input while recovering truncated tool arguments", async (format) => {
+		let supplied = false;
+		let consumed = 0;
+		const requests = await runHistoryInput(
+			format,
+			[
+				[historyTool("truncated-first", "first")],
+				[
+					{ text: "starting another tool" },
+					{
+						toolUseChunk: {
+							toolUseId: "truncated-ghost",
+							name: FAST,
+							input: '{"value":"unfinished',
+						},
+					},
+				],
+				[historyTool("truncated-third", "third")],
+				[{ text: "finished after recovery" }],
+			],
+			{
+				getAfterToolsInjections: () => {
+					if (supplied) return "";
+					supplied = true;
+					return {
+						text: completionNotice,
+						onConsumed: () => {
+							consumed++;
+						},
+					};
+				},
+			},
+		);
+		expect(requests).toHaveLength(4);
+		expect(consumed).toBe(1);
+		for (const request of requests.slice(1)) {
+			expect(occurrences(request, completionNotice)).toBe(1);
+			expect(occurrences(request, "done:first")).toBe(1);
+		}
+		expect(requests[2].content).toContain(FAST);
+		// The first tool result was already appended during orphan recovery.
+		expect(requests[2].toolResults).toEqual([]);
+		expect(occurrences(requests[3].history, requests[2].content)).toBe(1);
+	});
+
+	test.each([
+		...historyFormats,
+	])("%s retains content-only recovery input without pending tool results", async (format) => {
+		const requests = await runHistoryInput(format, [
+			[
+				{ text: "starting a tool" },
+				{
+					toolUseChunk: {
+						toolUseId: "content-only-ghost",
+						name: FAST,
+						input: '{"value":"unfinished',
+					},
+				},
+			],
+			[historyTool("content-only-second", "second")],
+			[{ text: "finished after content-only input" }],
+		]);
+		expect(requests).toHaveLength(3);
+		expect(requests[1].content).toContain(FAST);
+		expect(requests[1].toolResults).toEqual([]);
+		expect(occurrences(requests[2].history, requests[1].content)).toBe(1);
+	});
+
 	test("aborted initial input is not acknowledged", async () => {
 		const abort = new AbortController();
 		abort.abort();
@@ -293,6 +656,7 @@ describe("model input adoption boundary", () => {
 					abort.abort();
 					return {
 						text: "persisted but never adopted",
+						parts: [{ text: "persisted but never adopted", messageId: "interrupted-row" }],
 						onConsumed: () => {
 							consumed++;
 						},

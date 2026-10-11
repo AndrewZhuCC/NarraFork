@@ -38,9 +38,11 @@ export type {
 export { getProvider, resolveProviderAndModel } from "./provider";
 export { toolRegistry } from "./tool-registry";
 export type {
+	AgentAfterToolsInput,
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentInputPart,
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,

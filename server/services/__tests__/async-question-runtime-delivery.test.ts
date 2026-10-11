@@ -256,10 +256,20 @@ describe("async question receipt runtime adoption", () => {
 		const first = await drainInjectionsIntoHistory(active(), "en");
 		expect(first.text).toContain(text);
 		expect(first.text).toContain('kind="human"');
+		expect(first.parts).toEqual([{ text: first.text, messageId: "answer" }]);
+		expect(first.parts.map((part) => part.text).join("\n\n")).toBe(first.text);
 		const second = await drainInjectionsIntoHistory(active(), "en");
 		expect(second.text).not.toContain(text);
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 		expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("materialized");
+	});
+	test("dynamic pending-question hints remain unpersisted identity-free parts", async () => {
+		await seedQuestion();
+		const projected = await drainInjectionsIntoHistory(active(), "en");
+		expect(projected.text).toContain("Pick a cache");
+		expect(projected.parts).toEqual([{ text: projected.text }]);
+		expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	});
 	test("answer received during final generation is materialized for a fresh history pass", async () => {
 		const text = persistAnswer();
