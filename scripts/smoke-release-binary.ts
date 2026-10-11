@@ -1,6 +1,16 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	lstat,
+	mkdir,
+	mkdtemp,
+	opendir,
+	rm,
+	rmdir,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -413,6 +423,58 @@ export function hasPtyMarker(output: string, marker: string): boolean {
 	return clean.split(/[\r\n]/).some((line) => line.trim() === marker);
 }
 
+/** Remove an owned temporary tree without traversing Windows cache junctions. */
+export async function removeSmokeDirectory(
+	root: string,
+	windows = process.platform === "win32",
+): Promise<void> {
+	if (!windows) {
+		await rm(root, { recursive: true, force: true, maxRetries: 3 });
+		return;
+	}
+	const deadline = performance.now() + 5_000;
+	let entries = 0;
+	const check = (depth: number) => {
+		if (++entries > 10_000 || depth > 32 || performance.now() >= deadline)
+			throw new Error("Owned smoke directory cleanup budget exceeded");
+	};
+	const visit = async (path: string, depth: number): Promise<void> => {
+		check(depth);
+		const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (!info) return;
+		if (info.isSymbolicLink()) {
+			// Bun's recursive rm treats an INetCache directory junction like a file.
+			// Both operations below remove only the link; never stat/recurse into its target.
+			try {
+				await unlink(path);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code !== "EPERM" && code !== "EISDIR" && code !== "EACCES") throw error;
+				await rmdir(path);
+			}
+			return;
+		}
+		if (info.isDirectory()) {
+			const directory = await opendir(path);
+			for await (const entry of directory) await visit(join(path, entry.name), depth + 1);
+			check(depth);
+			await rmdir(path);
+			return;
+		}
+		await unlink(path);
+	};
+	const info = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (!info) return;
+	if (info.isSymbolicLink() || !info.isDirectory())
+		throw new Error("Owned smoke cleanup root is not a real directory");
+	await visit(root, 0);
+}
 /** Names only, two levels and at most 32 entries; never follow a symlink or read file contents. */
 export async function remainingSmokePaths(root: string): Promise<string[]> {
 	const paths: string[] = [];
@@ -786,7 +848,7 @@ export async function smokeReleaseBinary(
 			errors.push(smokeFailure("Smoke process cleanup failed", [error]));
 		}
 		try {
-			await rm(root, { recursive: true, force: true, maxRetries: 3 });
+			await removeSmokeDirectory(root);
 		} catch (error) {
 			errors.push(
 				new Error(

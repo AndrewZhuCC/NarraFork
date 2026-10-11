@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hashReleaseFile } from "../../scripts/lib/ci-release-io";
@@ -11,6 +11,7 @@ import {
 	assertMigratedDatabase,
 	hasPtyMarker,
 	parseSmokeArgs,
+	removeSmokeDirectory,
 	resolveFrontendAssetPath,
 	type SmokeOptions,
 	smokeEnvironment,
@@ -609,5 +610,36 @@ describe("smoke close and error aggregation", () => {
 		expect(
 			smokeFailure("bounded", [new Error("x".repeat(100_000))]).message.length,
 		).toBeLessThanOrEqual(16_384);
+	});
+});
+
+describe("owned Windows junction cleanup regression", () => {
+	test("removes nested links without deleting an outside target or sentinel", async () => {
+		const root = await temporary();
+		const outside = await temporary();
+		const sentinel = join(outside, "sentinel.txt");
+		await writeFile(sentinel, "outside-owned-cleanup");
+		await mkdir(join(root, "home", "AppData", "cache"), { recursive: true });
+		await writeFile(join(root, "owned.txt"), "owned");
+		const link = join(root, "home", "AppData", "cache", "Content.IE5");
+		await symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
+		await removeSmokeDirectory(root, true);
+		await expect(lstat(root)).rejects.toThrow();
+		expect(await readFile(sentinel, "utf8")).toBe("outside-owned-cleanup");
+		await removeSmokeDirectory(root, true); // Already absent is idempotent.
+	});
+	test("a cleanup-root link is refused rather than traversed", async () => {
+		const directory = await temporary();
+		const target = await temporary();
+		await writeFile(join(target, "sentinel.txt"), "keep");
+		const link = join(directory, "root-link");
+		await symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+		await expect(removeSmokeDirectory(link, true)).rejects.toThrow("not a real directory");
+		expect(await readFile(join(target, "sentinel.txt"), "utf8")).toBe("keep");
+	});
+	test("depth overflow fails closed rather than walking an unbounded tree", async () => {
+		const root = await temporary();
+		await mkdir(join(root, ...Array.from({ length: 34 }, () => "d")), { recursive: true });
+		await expect(removeSmokeDirectory(root, true)).rejects.toThrow("cleanup budget exceeded");
 	});
 });
