@@ -638,3 +638,50 @@ func TestWindowsConditionalNewFileNoOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWindowsConditionalHandleRenameAliasedParent(t *testing.T) {
+	base := t.TempDir()
+	actual := filepath.Join(base, "actual")
+	if err := os.Mkdir(actual, 0700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "directory-alias")
+	requireWindowsJunction(t, actual, alias)
+	source := filepath.Join(actual, "source.txt")
+	if err := os.WriteFile(source, []byte("owned-original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openConditionalWindowsFile(source, windows.GENERIC_READ|windows.DELETE|windows.READ_CONTROL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renameConditionalHandle(file, filepath.Join(alias, "目标.txt")); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(actual, "目标.txt")
+	after, err := os.Stat(target)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("handle rename lost source identity: %v", err)
+	}
+	occupied := filepath.Join(actual, "occupied.txt")
+	if err := os.WriteFile(occupied, []byte("keep-other"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameConditionalHandle(file, filepath.Join(alias, "occupied.txt")); err == nil {
+		t.Fatal("handle rename overwrote an occupied destination")
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{target: "owned-original", occupied: "keep-other"} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatalf("rename changed owned data: path=%q bytes=%q err=%v", path, got, err)
+		}
+	}
+}

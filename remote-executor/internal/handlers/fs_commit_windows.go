@@ -65,9 +65,19 @@ func renameConditionalHandle(f *os.File, destination string) error {
 	if err != nil {
 		return err
 	}
+	// Resolve the existing parent, not the absent leaf. Avoid feeding profile
+	// short-name/junction spellings to the handle-based rename API.
+	parent, err := canonicalGuardPath(filepath.Dir(destination))
+	if err != nil {
+		return err
+	}
+	destination = filepath.Join(parent, filepath.Base(destination))
 	name, err := windows.UTF16FromString(destination)
 	if err != nil {
 		return err
+	}
+	if len(name) > 32768 {
+		return fmt.Errorf("rename destination exceeds Windows path limit")
 	}
 	name = name[:len(name)-1]
 	type renameInfo struct {
@@ -77,7 +87,10 @@ func renameConditionalHandle(f *os.File, destination string) error {
 		Name    uint16
 	}
 	offset := int(unsafe.Offsetof(renameInfo{}.Name))
-	buf := make([]byte, offset+len(name)*2)
+	size := offset + len(name)*2
+	// FILE_RENAME_INFO contains a native HANDLE and needs native alignment.
+	backing := make([]uint64, (size+7)/8)
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), size)
 	info := (*renameInfo)(unsafe.Pointer(&buf[0]))
 	info.Length = uint32(len(name) * 2)
 	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[offset])), len(name)), name)
