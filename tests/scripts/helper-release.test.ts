@@ -468,6 +468,15 @@ describe("authenticated draft lookup", () => {
 		test(`executor ${existing ? "existing partial" : "new"} draft publishes using REST, not invisible GraphQL`, async () => {
 			const f = draftFixture(existing, "executor");
 			if (existing) f.executorRelease.assets.splice(0, 2);
+			let postCreateReads = 0;
+			const run: GhRunner = async (args) => {
+				const result = await f.run(args);
+				if (!existing && f.state.present && args[1]?.includes("/releases?")) {
+					postCreateReads++;
+					if (postCreateReads === 1) return "[]";
+				}
+				return result;
+			};
 			const dir = await mkdtemp(join(import.meta.dir, "../../.narrafork/executor-release-test-"));
 			dirs.push(dir);
 			for (const entry of Object.values(f.executor.manifest.platforms))
@@ -484,7 +493,7 @@ describe("authenticated draft lookup", () => {
 				protocolVersion: 1,
 				commit,
 				bundleDir: dir,
-				run: f.run,
+				run,
 			});
 			expect(f.executorRelease.draft).toBe(false);
 			expect(f.state.calls.filter((args) => args[1] === "create").length).toBe(existing ? 0 : 1);
@@ -494,7 +503,8 @@ describe("authenticated draft lookup", () => {
 			expect(f.state.calls.some((args) => args[1] === "graphql")).toBe(false);
 			expect(
 				f.state.calls.filter((args) => args[1]?.includes("releases?per_page=100")).length,
-			).toBe(existing ? 1 : 2);
+			).toBe(existing ? 1 : 3);
+			expect(postCreateReads).toBe(existing ? 0 : 2);
 			expect(
 				f.state.calls.filter((args) => args[1] === `repos/${repository}/releases/2`).length,
 			).toBe(2);
@@ -541,7 +551,155 @@ describe("authenticated draft lookup", () => {
 		expect(f.state.calls.filter((args) => args[0] === "release").map((args) => args[1])).toEqual([
 			"create",
 		]);
+		// One pre-create listing, then exactly four bounded post-create reads.
+		expect(f.state.calls.filter((args) => args[1]?.includes("/releases?")).length).toBe(5);
+		expect(f.state.calls.filter((args) => args[1]?.includes("/releases/tags/")).length).toBe(5);
+		expect(f.helperRelease.draft).toBe(true);
+		expect(f.helperRelease.assets).toHaveLength(0);
 	});
+	test("a newly created draft missing on the first REST read becomes visible on a read-only retry", async () => {
+		const f = draftFixture(false);
+		let postCreateReads = 0;
+		const run: GhRunner = async (args) => {
+			const result = await f.run(args);
+			if (f.state.present && args[1]?.includes("/releases?")) {
+				postCreateReads++;
+				if (postCreateReads === 1) return "[]";
+			}
+			return result;
+		};
+		const dir = await bundle();
+		await publishHelperRelease({
+			repository,
+			kind: "helpers",
+			version: "1.0.0",
+			protocolVersion: 1,
+			commit,
+			bundleDir: dir,
+			run,
+		});
+		expect(postCreateReads).toBe(2);
+		expect(f.state.calls.filter((args) => args[1] === "create")).toHaveLength(1);
+		expect(f.state.calls.filter((args) => args[1] === "upload")).toHaveLength(
+			13 + HELPER_LICENSE_FILES.length,
+		);
+		expect(f.state.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+		expect(f.helperRelease.draft).toBe(false);
+		expect(JSON.stringify(f.state.calls)).not.toContain("clobber");
+	});
+	test("first complete post-create read is missing, then AbortController cancels the 250ms delay before a second read", async () => {
+		const f = draftFixture(false);
+		const controller = new AbortController();
+		const reason = new Error("parent deadline while waiting for REST visibility");
+		const phases: string[] = [];
+		let postCreateReads = 0;
+		let abortTimer: ReturnType<typeof setTimeout> | undefined;
+		const run: GhRunner = async (args) => {
+			const result = await f.run(args);
+			if (args[0] === "release" && args[1] === "create") phases.push("created");
+			if (f.state.present && args[1]?.includes("/releases?")) {
+				postCreateReads++;
+				phases.push("complete authenticated read: missing");
+				abortTimer = setTimeout(() => {
+					phases.push("aborted during 250ms delay");
+					controller.abort(reason);
+				}, 25);
+				// A short, valid page proves absence, rather than a transport error.
+				return "[]";
+			}
+			return result;
+		};
+		const dir = await bundle();
+		try {
+			await expect(
+				publishHelperRelease({
+					repository,
+					kind: "helpers",
+					version: "1.0.0",
+					protocolVersion: 1,
+					commit,
+					bundleDir: dir,
+					run,
+					signal: controller.signal,
+				}),
+			).rejects.toMatchObject({ name: "AbortError", cause: reason });
+		} finally {
+			clearTimeout(abortTimer);
+		}
+		expect(phases).toEqual([
+			"created",
+			"complete authenticated read: missing",
+			"aborted during 250ms delay",
+		]);
+		expect(controller.signal.aborted).toBe(true);
+		expect(postCreateReads).toBe(1);
+		// Pre-create + first post-create listing only; never a second post-create read.
+		expect(f.state.calls.filter((args) => args[1]?.includes("/releases?")).length).toBe(2);
+		expect(f.state.calls.filter((args) => args[1]?.includes("/releases/tags/")).length).toBe(2);
+		expect(f.state.calls.at(-1)?.[1]).toBe(`repos/${repository}/releases?per_page=100&page=1`);
+		expect(f.state.calls.filter((args) => args[0] === "release").map((args) => args[1])).toEqual([
+			"create",
+		]);
+		expect(f.helperRelease.draft).toBe(true);
+		expect(f.helperRelease.assets).toHaveLength(0);
+	});
+	for (const mode of [
+		"401",
+		"403",
+		"network",
+		"invalid-json",
+		"metadata-limit",
+		"invalid-state",
+		"duplicate",
+		"asset-mismatch",
+		"public",
+		"prerelease",
+	])
+		test(`post-create ${mode} fails immediately instead of retrying a read or create`, async () => {
+			const f = draftFixture(false);
+			const calls: string[][] = [];
+			let postCreateReads = 0;
+			const run: GhRunner = async (args) => {
+				calls.push(args);
+				if (f.state.present && args[1]?.includes("/releases?")) {
+					postCreateReads++;
+					if (mode === "401" || mode === "403") throw new Error(`HTTP ${mode}`);
+					if (mode === "network") throw new Error("network failure");
+					if (mode === "invalid-json") return "{";
+					if (mode === "metadata-limit") return " ".repeat(128 * 1024 + 1);
+					if (mode === "public") {
+						f.helperRelease.draft = false;
+						f.helperRelease.published_at = "2026-10-09T00:00:00Z";
+					}
+					if (mode === "prerelease") f.helperRelease.prerelease = true;
+					const nodes = f.summaries();
+					const node = nodes[0] as (typeof nodes)[number];
+					if (mode === "invalid-state") node.publishedAt = "2026-10-09T00:00:00Z";
+					if (mode === "duplicate") nodes.push({ ...node });
+					if (mode === "asset-mismatch") node.assetCount = 1;
+					return JSON.stringify(nodes);
+				}
+				return f.run(args);
+			};
+			const dir = await bundle();
+			await expect(
+				publishHelperRelease({
+					repository,
+					kind: "helpers",
+					version: "1.0.0",
+					protocolVersion: 1,
+					commit,
+					bundleDir: dir,
+					run,
+				}),
+			).rejects.toThrow();
+			expect(postCreateReads).toBe(1);
+			expect(calls.filter((args) => args[0] === "release").map((args) => args[1])).toEqual([
+				"create",
+			]);
+			expect(f.helperRelease.draft).toBe(mode !== "public");
+			expect(f.helperRelease.assets).toHaveLength(0);
+		});
 	for (const endpoint of ["tag", "list"])
 		for (const message of ["HTTP 403", "HTTP 401", "network failure", "invalid JSON"])
 			test(`${endpoint} ${message} is not absence and causes zero writes`, async () => {

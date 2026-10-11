@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -413,6 +413,31 @@ export function hasPtyMarker(output: string, marker: string): boolean {
 	return clean.split(/[\r\n]/).some((line) => line.trim() === marker);
 }
 
+/** Names only, two levels and at most 32 entries; never follow a symlink or read file contents. */
+export async function remainingSmokePaths(root: string): Promise<string[]> {
+	const paths: string[] = [];
+	const queue = [{ path: root, prefix: "", depth: 0 }];
+	for (const node of queue) {
+		if (paths.length >= 32) break;
+		try {
+			const directory = await opendir(node.path);
+			for await (const entry of directory) {
+				if (paths.length >= 32) break;
+				const name = `${node.prefix}${entry.name}`;
+				paths.push(name);
+				if (entry.isDirectory() && node.depth < 1)
+					queue.push({
+						path: join(node.path, entry.name),
+						prefix: `${name}/`,
+						depth: node.depth + 1,
+					});
+			}
+		} catch {
+			paths.push(`${node.prefix}<unavailable>`);
+		}
+	}
+	return paths.slice(0, 32);
+}
 export function smokeFailure(label: string, errors: readonly unknown[]): Error {
 	const describe = (error: unknown, depth = 0): string => {
 		const text = String(error).slice(0, 4_096);
@@ -473,6 +498,8 @@ export async function smokePty(
 		const ws = socket;
 		let opened = false;
 		let subscribed = false;
+		let exitRequested = false;
+		let exited = false;
 		let failure: Error | undefined;
 		const marker = `NF_RELEASE_PTY_${randomUUID().replaceAll("-", "")}`;
 		const resize = () =>
@@ -507,6 +534,12 @@ export async function smokePty(
 				if (message.terminalId !== terminal.id) return;
 				if (message.type === "bufferState") subscribed = true;
 				if (message.type === "requestResize") resize();
+				if (message.type === "exit" && exitRequested) {
+					if (message.code !== 0)
+						throw new Error(`PTY shutdown failed (${String(message.code).slice(0, 64)})`);
+					exited = true;
+					return;
+				}
 				if (message.type === "exit" || message.type === "killed")
 					throw new Error(`PTY exited before marker (${String(message.code).slice(0, 64)})`);
 				if (
@@ -541,6 +574,19 @@ export async function smokePty(
 			if (failure) throw failure;
 			return hasPtyMarker(output, marker) ? true : undefined;
 		});
+		// Let the owned shell exit before deleting its terminal. Force-killing first
+		// can orphan a Windows console child holding the isolated working directory.
+		stage = "shell shutdown";
+		exitRequested = true;
+		ws.send(JSON.stringify({ type: "input", terminalId: terminal.id, data: "exit\r" }));
+		await scope.until(
+			"PTY shell shutdown",
+			() => {
+				if (failure) throw failure;
+				return exited ? true : undefined;
+			},
+			5_000,
+		);
 	} catch (error) {
 		errors.push(
 			new Error(
@@ -742,7 +788,12 @@ export async function smokeReleaseBinary(
 		try {
 			await rm(root, { recursive: true, force: true, maxRetries: 3 });
 		} catch (error) {
-			errors.push(smokeFailure("Smoke directory cleanup failed", [error]));
+			errors.push(
+				new Error(
+					`${smokeFailure("Smoke directory cleanup failed", [error]).message}\nRemaining owned paths: ${JSON.stringify(await remainingSmokePaths(root))}\n${scope.diagnostic}`,
+					{ cause: error },
+				),
+			);
 		}
 	}
 	if (errors.length) throw smokeFailure("Release smoke failed", errors);

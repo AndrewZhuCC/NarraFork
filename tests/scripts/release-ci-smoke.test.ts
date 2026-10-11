@@ -399,11 +399,12 @@ test("failed real executable smoke never writes a success artifact", async () =>
 }, 60_000);
 
 async function ptyFixture(
-	mode: "pass" | "echo" | "replay" | "exit" | "oversize",
+	mode: "pass" | "echo" | "replay" | "exit" | "oversize" | "hang-exit" | "bad-exit",
 	deleteStatus = 200,
 ) {
 	let deleted = 0;
 	let inputs = 0;
+	let exits = 0;
 	let resized = 0;
 	let ready = false;
 	const timers: ReturnType<typeof setTimeout>[] = [];
@@ -436,6 +437,11 @@ async function ptyFixture(
 					);
 				} else if (message.type === "resize") resized++;
 				else if (message.type === "input") {
+					if (message.data === "exit\r") {
+						exits++;
+						if (mode !== "hang-exit") send("exit", { code: mode === "bad-exit" ? 37 : 0 });
+						return;
+					}
 					inputs++;
 					if (!ready) {
 						send("error", { message: "input raced subscription" });
@@ -460,7 +466,7 @@ async function ptyFixture(
 						send("scrollback", { data: `${marker}\r\n` });
 						return;
 					}
-					if (mode === "pass") {
+					if (mode === "pass" || mode === "hang-exit" || mode === "bad-exit") {
 						send("output", { terminalId: "other-terminal", data: "foreign-output\r\n" });
 						send("output", { data: marker.slice(0, 12) });
 						send("output", { data: `${marker.slice(12)}\r\n` });
@@ -476,6 +482,9 @@ async function ptyFixture(
 		},
 		get inputs() {
 			return inputs;
+		},
+		get exits() {
+			return exits;
 		},
 		get resized() {
 			return resized;
@@ -494,6 +503,7 @@ describe("PTY subscription and cleanup regression", () => {
 		try {
 			await smokePty(fixture.origin, "isolated-token", scope);
 			expect(fixture.inputs).toBe(1);
+			expect(fixture.exits).toBe(1);
 			expect(fixture.resized).toBeGreaterThanOrEqual(2);
 			expect(fixture.deleted).toBe(1);
 		} finally {
@@ -501,6 +511,23 @@ describe("PTY subscription and cleanup regression", () => {
 			fixture.close();
 		}
 	});
+	for (const mode of ["hang-exit", "bad-exit"] as const) {
+		test(`${mode} never passes cleanup just because the marker was received`, async () => {
+			const fixture = await ptyFixture(mode);
+			const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 400 });
+			try {
+				await expect(smokePty(fixture.origin, "isolated-token", scope)).rejects.toThrow(
+					"PTY stage=shell shutdown",
+				);
+				expect(fixture.inputs).toBe(1);
+				expect(fixture.exits).toBe(1);
+				expect(fixture.deleted).toBe(1);
+			} finally {
+				await scope.close();
+				fixture.close();
+			}
+		});
+	}
 	for (const mode of ["echo", "replay"] as const) {
 		test(`${mode} alone never attests a completed live shell round trip`, async () => {
 			const fixture = await ptyFixture(mode);

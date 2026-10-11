@@ -251,7 +251,13 @@ async function fixture(kind: "helpers" | "executor") {
 			return JSON.stringify({ object: { type: "commit", sha: commit } });
 		if (path.includes("/compare/"))
 			return JSON.stringify({ status: "identical", merge_base_commit: { sha: commit } });
-		if (path.includes("/releases/tags/")) return JSON.stringify(release);
+		if (path === `repos/${plan.repository}/releases/${release.id}`) {
+			// The publisher binds the uploaded asset set to this known draft ID before publication.
+			expect(publicRelease).toBe(false);
+			return JSON.stringify(release);
+		}
+		if (path === `repos/${plan.repository}/releases/tags/${plan.tag}`)
+			return JSON.stringify(release);
 		if (path.includes("/releases/assets/")) {
 			const id = Number(path.split("/").at(-1));
 			const asset = release.assets.find((entry) => entry.id === id);

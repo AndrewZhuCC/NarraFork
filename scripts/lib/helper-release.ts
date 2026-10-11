@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
 	type DistributionLicense,
 	HELPER_BINARY_MAX_BYTES,
@@ -409,7 +410,14 @@ export async function publishHelperRelease(
 			"--notes",
 			"Immutable auxiliary binaries and license materials. Linux ARM64 ripgrep requires glibc; Alpine/Termux are not supported.",
 		]);
-		release = await getRelease(options, description.tag, true);
+		// Retry reads only after a complete authenticated listing proves absence.
+		// Four post-create reads at most; API/validation errors escape immediately.
+		// The parent signal/deadline also cancels these asynchronous delays.
+		for (const milliseconds of [0, 250, 1000, 2000]) {
+			if (milliseconds > 0) await delay(milliseconds, undefined, { signal: options.signal });
+			release = await getRelease(options, description.tag, true);
+			if (release) break;
+		}
 		if (!release) throw new Error("Created helper draft not visible in authenticated REST lookup");
 	}
 	if (!release?.draft || release.prerelease) throw new Error("Expected stable helper draft");
