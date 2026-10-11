@@ -9,7 +9,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
-import { DEV_NULL, getHome, IS_WINDOWS } from "../lib/platform";
+import { getHome, IS_WINDOWS } from "../lib/platform";
 import { BufferManager } from "../terminal/buffer-manager";
 import {
 	dtachService,
@@ -372,7 +372,9 @@ export const terminalService = {
 				// blanks for its own fetch, so the user's tools behave as they do
 				// outside NarraFork.
 				env: envWithAmbientProxy({
-					HISTFILE: DEV_NULL,
+					// Empty disables Bash history on every platform. "NUL" is an ordinary
+					// filename to Git Bash and creates a Windows-reserved file in the terminal CWD.
+					HISTFILE: "",
 					TERM: "xterm-256color",
 				}),
 				cols,

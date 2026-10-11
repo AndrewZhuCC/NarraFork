@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { IS_WINDOWS } from "../lib/platform";
 import { spawnBunTerminal } from "./runtime-bun";
 
@@ -129,4 +132,57 @@ describe.skipIf(IS_WINDOWS)("spawnBunTerminal controlling terminal", () => {
 		expect(out).not.toContain("no job control");
 		expect(out).not.toContain("cannot set terminal process group");
 	});
+});
+
+// A literal Windows device name is not a shell history sink. Reproduce its
+// creation in a real Bash PTY, then verify the portable disabled-history value.
+describe.skipIf(IS_WINDOWS)("terminal history file regression", () => {
+	for (const history of ["NUL", ""])
+		test(`HISTFILE=${JSON.stringify(history)} has the expected on-disk effect`, async () => {
+			const root = await mkdtemp(join(tmpdir(), "nf-pty-history-"));
+			let output = "";
+			const runtime = spawnBunTerminal({
+				cmd: ["/bin/bash", "--noprofile", "--norc", "-i"],
+				cwd: root,
+				env: {
+					PATH: process.env.PATH ?? "/usr/bin:/bin",
+					HOME: root,
+					TERM: "xterm-256color",
+					PS1: "NF_HISTORY_READY> ",
+					HISTFILE: history,
+				},
+				cols: 100,
+				rows: 30,
+				onData: (data) => {
+					output += data;
+				},
+			});
+			try {
+				const deadline = performance.now() + 2_500;
+				while (!output.includes("NF_HISTORY_READY> ") && performance.now() < deadline)
+					await Bun.sleep(10);
+				expect(output).toContain("NF_HISTORY_READY> ");
+				runtime.write("echo NF_HISTORY_ROUNDTRIP\nexit\n");
+				const status = await Promise.race([runtime.exited, Bun.sleep(2_500).then(() => "timeout")]);
+				expect(status).toBe(0);
+				const files = await readdir(root);
+				if (history) {
+					expect(files).toContain("NUL");
+					expect(await readFile(join(root, "NUL"), "utf8")).toContain("NF_HISTORY_ROUNDTRIP");
+				} else expect(files).toEqual([]);
+			} finally {
+				runtime.kill();
+				runtime.close();
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+});
+
+test("standalone terminal creation disables history without platform device filenames", async () => {
+	const source = await readFile(
+		new URL("../services/terminal-service.ts", import.meta.url),
+		"utf8",
+	);
+	expect(source).toContain('HISTFILE: ""');
+	expect(source).not.toContain("HISTFILE: DEV_NULL");
 });

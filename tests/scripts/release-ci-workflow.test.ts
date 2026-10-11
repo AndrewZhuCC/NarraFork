@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -200,6 +200,47 @@ describe("release workflow safety", () => {
 		);
 		expect(smoke?.run).toContain("smoke-release-binary.ts");
 		expect(smoke?.run).not.toContain("build-cross-platform");
+	});
+	test("Node 24 artifact consumption requires both complete platform files before smoke", async () => {
+		for (const job of Object.values(release.jobs))
+			for (const step of job.steps ?? [])
+				if (step.uses?.startsWith("actions/download-artifact@"))
+					expect(step.uses).toBe(
+						"actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+					);
+		const steps = release.jobs.smoke?.steps ?? [];
+		const downloadIndex = steps.findIndex((step) =>
+			step.uses?.startsWith("actions/download-artifact@"),
+		);
+		const checkIndex = steps.findIndex(
+			(step) => step.name === "Verify complete downloaded platform inputs",
+		);
+		const smokeIndex = steps.findIndex(
+			(step) => step.name === "Run the downloaded binary on its native platform",
+		);
+		expect(downloadIndex).toBeGreaterThanOrEqual(0);
+		expect(checkIndex).toBeGreaterThan(downloadIndex);
+		expect(smokeIndex).toBeGreaterThan(checkIndex);
+		expect(steps[downloadIndex]?.with?.["digest-mismatch"]).toBe("error");
+		const directory = await mkdtemp(join(tmpdir(), "nf-platform-inputs-"));
+		temporary.push(directory);
+		const platform = join(directory, ".ci-release", "platform");
+		await mkdir(platform, { recursive: true });
+		const name = "narrafork-0.9.0-macos-x64";
+		const check = () =>
+			spawnSync("bash", ["-e", "-c", steps[checkIndex]?.run ?? "exit 99"], {
+				cwd: directory,
+				env: { ...process.env, BINARY: name },
+				timeout: 5_000,
+				maxBuffer: 16_384,
+			}).status;
+		expect(check()).toBe(1);
+		await writeFile(join(platform, name), "binary");
+		expect(check()).toBe(1);
+		await writeFile(join(platform, `${name}.metadata.json`), "");
+		expect(check()).toBe(1);
+		await writeFile(join(platform, `${name}.metadata.json`), "metadata");
+		expect(check()).toBe(0);
 	});
 	test("artifact identity is attempt-scoped, and assembly does not overwrite flattened files", () => {
 		for (const job of Object.values(release.jobs))
