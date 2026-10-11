@@ -5,6 +5,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -179,12 +180,78 @@ func (m *windowsConditionalMetadata) apply(f *os.File) error {
 	return nil
 }
 
+// Windows may duplicate/reorder Allow ACEs and relabel inheritance during a
+// native replacement. Availability takes priority over byte-identical bookkeeping,
+// but a different trustee, access mask, meaningful flag or protected state is not
+// an equivalent grant. Unsupported ACL forms retain the original strict check.
+func windowsDACLCompatible(left, right []byte, leftControl, rightControl windows.SECURITY_DESCRIPTOR_CONTROL) bool {
+	if (left == nil) != (right == nil) {
+		return false
+	}
+	if bytes.Equal(left, right) && leftControl&daclControlMask == rightControl&daclControlMask {
+		return true
+	}
+	a, ok := windowsAllowGrants(left)
+	if !ok {
+		return false
+	}
+	b, ok := windowsAllowGrants(right)
+	if !ok || len(a) != len(b) {
+		return false
+	}
+	mask := windows.SECURITY_DESCRIPTOR_CONTROL(daclControlMask &^ windows.SE_DACL_AUTO_INHERITED)
+	if leftControl&mask != rightControl&mask {
+		return false
+	}
+	for grant := range a {
+		if _, exists := b[grant]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func windowsAllowGrants(acl []byte) (map[string]struct{}, bool) {
+	// Native ACL size is uint16. Parse every ACE or decline compatibility.
+	if len(acl) < 8 || len(acl) > 65535 || acl[0] != 2 || acl[1] != 0 || binary.LittleEndian.Uint16(acl[2:4]) != uint16(len(acl)) || binary.LittleEndian.Uint16(acl[6:8]) != 0 {
+		return nil, false
+	}
+	count := int(binary.LittleEndian.Uint16(acl[4:6]))
+	if count == 0 || count > (len(acl)-8)/16 {
+		return nil, false
+	}
+	grants := make(map[string]struct{}, count)
+	offset := 8
+	for i := 0; i < count; i++ {
+		if offset+4 > len(acl) {
+			return nil, false
+		}
+		size := int(binary.LittleEndian.Uint16(acl[offset+2 : offset+4]))
+		if size < 16 || size%4 != 0 || size > len(acl)-offset {
+			return nil, false
+		}
+		ace := acl[offset : offset+size]
+		// ACCESS_ALLOWED_ACE only; retain all flags except INHERITED_ACE.
+		if ace[0] != 0 || ace[1]&^byte(0x1f) != 0 {
+			return nil, false
+		}
+		sid := ace[8:]
+		if sid[0] != 1 || sid[1] > 15 || len(sid) != 8+4*int(sid[1]) {
+			return nil, false
+		}
+		key := append([]byte{ace[1] &^ 0x10}, ace[4:]...)
+		grants[string(key)] = struct{}{}
+		offset += size
+	}
+	return grants, offset == len(acl)
+}
+
 func (m *windowsConditionalMetadata) matches(f *os.File) error {
 	current, err := captureWindowsMetadata(f, m.audit != nil)
 	if err != nil {
 		return err
 	}
-	if !m.owner.Equals(current.owner) || !m.group.Equals(current.group) || m.control&daclControlMask != current.control&daclControlMask || !bytes.Equal(m.dacl, current.dacl) || (m.dacl == nil) != (current.dacl == nil) || !bytes.Equal(m.labelACL, current.labelACL) {
+	if !m.owner.Equals(current.owner) || !m.group.Equals(current.group) || !windowsDACLCompatible(m.dacl, current.dacl, m.control, current.control) || !bytes.Equal(m.labelACL, current.labelACL) {
 		return errConditionalMetadataChanged
 	}
 	if m.audit != nil && (current.audit == nil || !bytes.Equal(m.auditACL, current.auditACL) || m.auditControl&saclControlMask != current.auditControl&saclControlMask) {
