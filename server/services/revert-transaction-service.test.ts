@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test as nativeTest, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -84,8 +84,46 @@ let fileHook: ((path: string, signal: AbortSignal) => void | Promise<void>) | un
 let restores: (() => void)[];
 let fixtureAbort: AbortController;
 let ownedWork: Set<Promise<unknown>>;
-let ownedHolds: Set<() => void>;
 let fixtureSetupMs: number;
+type FixtureLifetime = {
+	controller: AbortController;
+	work: Set<Promise<unknown>>;
+	holds: Set<() => void>;
+	restores: (() => void)[];
+	root?: string;
+	sqlite?: Database;
+	closing?: Promise<void>;
+};
+let lifetime: FixtureLifetime | undefined;
+const ownedTest: ProxyHandler<typeof nativeTest> = {
+	apply(register, thisArg, [label, body, options]) {
+		return Reflect.apply(register, thisArg, [
+			label,
+			(...args: unknown[]) => {
+				if (!lifetime) throw new Error("Missing transaction fixture lifetime");
+				const pending = lifetime.work;
+				const result = body(...args);
+				return result instanceof Promise ? own(result, pending) : result;
+			},
+			options,
+		]);
+	},
+	get(register, key) {
+		// Bun's chainable accessors must receive the original native registration object.
+		const value = Reflect.get(register, key, register);
+		if (key === "each" || key === "skipIf" || key === "todoIf" || key === "failingIf")
+			return (...args: unknown[]) =>
+				new Proxy(Reflect.apply(value, register, args) as typeof nativeTest, ownedTest);
+		if (
+			typeof value === "function" &&
+			["skip", "only", "todo", "failing", "concurrent", "serial"].includes(String(key))
+		)
+			return new Proxy(value as typeof nativeTest, ownedTest);
+		return value;
+	},
+};
+// Keep native registration/deadlines and return the body's original Promise unchanged.
+const test = new Proxy(nativeTest, ownedTest);
 
 // Observe the original lifetime promises, without releasing production locks or
 // replacing any IO/receipt behavior. Teardown must not race an early HTTP result.
@@ -127,18 +165,43 @@ function makeFixtureTransaction(...args: ConstructorParameters<typeof RevertTran
 }
 
 beforeEach(async () => {
+	// A timed-out native hook cannot let another fixture replace globals still in use
+	// by the previous original test body. The native hook deadline remains unchanged.
+	await lifetime?.closing;
+	const owner: FixtureLifetime = {
+		controller: new AbortController(),
+		work: new Set(),
+		holds: new Set(),
+		restores: [],
+	};
+	lifetime = owner;
+	fixtureAbort = owner.controller;
+	ownedWork = owner.work;
+	restores = owner.restores;
+	await own(seedFixture(owner), owner.work);
+});
+async function seedFixture(owner: FixtureLifetime) {
 	const setupStarted = performance.now();
-	fixtureAbort = new AbortController();
-	ownedWork = new Set();
-	ownedHolds = new Set();
-	restores = [];
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	root = await fs.mkdtemp(join(await fs.realpath(tmpdir()), "revert-transaction-test-"));
+	owner.root = root;
 	workspace = join(root, "workspace");
 	await fs.mkdir(workspace);
 	sqlite = new Database(join(root, "isolated.sqlite"));
-	sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL;");
+	owner.sqlite = sqlite;
+	// Match production's file-backed WAL/NORMAL durability, not SQLite's default FULL.
+	// Retain zero lock waiting so a fixture never hides an unexpected competing writer.
+	sqlite.exec(
+		"PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+	);
+	expect(sqlite.query<{ synchronous: number }, []>("PRAGMA synchronous").get()?.synchronous).toBe(
+		1,
+	);
+	expect(
+		sqlite.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode,
+	).toBe("wal");
+	expect(sqlite.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout).toBe(0);
 	const definitions = isolatedTemplate
 		.query<{ sql: string }, []>(
 			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
@@ -154,33 +217,35 @@ beforeEach(async () => {
 	serial = 0;
 	allowedFiles = new Set();
 	fileHook = undefined;
-	restores = [];
-	for (const id of ["alice", "bob"])
-		db.insert(schema.users)
-			.values({ id, username: id, passwordHash: "isolated-not-a-credential", createdAt: now() })
-			.run();
-	db.insert(schema.projects)
-		.values({
-			id: "project",
-			name: "Isolated",
-			ownerUserId: "alice",
-			gitPath: workspace,
-			createdAt: now(),
-			updatedAt: now(),
-		})
-		.run();
-	for (const id of ["narrator", "fork"])
-		db.insert(schema.narrators)
+	// Only synchronous fixture rows belong in this transaction; real tool IO stays outside.
+	sqlite.transaction(() => {
+		for (const id of ["alice", "bob"])
+			db.insert(schema.users)
+				.values({ id, username: id, passwordHash: "isolated-not-a-credential", createdAt: now() })
+				.run();
+		db.insert(schema.projects)
 			.values({
-				id,
+				id: "project",
+				name: "Isolated",
 				ownerUserId: "alice",
-				contextProjectId: "project",
-				cwd: workspace,
-				messageVersion: 7,
+				gitPath: workspace,
 				createdAt: now(),
 				updatedAt: now(),
 			})
 			.run();
+		for (const id of ["narrator", "fork"])
+			db.insert(schema.narrators)
+				.values({
+					id,
+					ownerUserId: "alice",
+					contextProjectId: "project",
+					cwd: workspace,
+					messageVersion: 7,
+					createdAt: now(),
+					updatedAt: now(),
+				})
+				.run();
+	})();
 	coordinatorState = createWorkspaceWriteCoordinatorState();
 	runtime = makeFixtureRuntime({
 		db,
@@ -290,21 +355,31 @@ beforeEach(async () => {
 	options = { access, runtime, namespace, planOptions, onSlow: () => {} };
 	service = makeFixtureTransaction(db, options);
 	fixtureSetupMs = performance.now() - setupStarted;
+}
+afterEach(() => {
+	// Capture the entire owner before any await; repeated timeout hooks must share
+	// one closing promise and never fetch the next fixture's root/database/globals.
+	const closing = lifetime;
+	if (!closing) return;
+	closing.closing ??= closeFixture(closing);
+	return closing.closing;
 });
-afterEach(async () => {
-	for (const restore of restores.reverse()) restore();
-	fixtureAbort.abort(new Error("Owned test fixture is closing"));
+async function closeFixture(closing: FixtureLifetime) {
+	closing.controller.abort(new Error("Owned test fixture is closing"));
 	// A failed assertion/timeout must also release test-owned fault barriers that
 	// the test body never reached its finally block to release.
-	for (const release of ownedHolds) release();
-	while (ownedWork.size) await Promise.allSettled([...ownedWork]);
-	expect(ownedHolds.size).toBe(0);
-	expect(ownedWork.size).toBe(0);
+	for (const release of closing.holds) release();
+	// Include the original body and setup promise, not just the response/worker.
+	// Partial setup can still publish its own root/database to this fixed owner.
+	while (closing.work.size) await Promise.allSettled([...closing.work]);
+	expect(closing.holds.size).toBe(0);
+	expect(closing.work.size).toBe(0);
+	for (const restore of closing.restores.splice(0).reverse()) restore();
 	// Finalize Drizzle's prepared statements instead of deferring SQLite's native
 	// connection disposal to GC, which leaves fixture files locked on Windows.
-	sqlite.close(true);
-	await fs.rm(root, { recursive: true, force: true });
-});
+	closing.sqlite?.close(true);
+	if (closing.root) await fs.rm(closing.root, { recursive: true, force: true });
+}
 function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
 	if (!user.isAdmin && row.ownerUserId !== user.userId) throw new Error("Narrator denied");
 }
@@ -323,57 +398,61 @@ async function tool(
 	const messageId = existingMessageId ?? generateId();
 	const toolCallId = generateId();
 	const block = { type: "tool_use" as const, id: providerId, name, input };
-	if (existingMessageId) {
-		const previous = db
-			.select()
-			.from(schema.narratorMessages)
-			.where(eq(schema.narratorMessages.id, messageId))
-			.get();
-		if (
-			!previous ||
-			previous.narratorId !== actorNarratorId ||
-			!Array.isArray(previous.contentJson)
-		)
-			throw new Error("Missing tool message owned by the same actor");
-		db.update(schema.narratorMessages)
-			.set({ contentJson: [...(previous.contentJson ?? []), block] })
-			.where(eq(schema.narratorMessages.id, messageId))
-			.run();
-	} else {
-		db.insert(schema.narratorMessages)
+	// Seed only fixture history synchronously; never hold this SQL transaction
+	// across path resolution, permission checks or the actual tool/evidence IO.
+	sqlite.transaction(() => {
+		if (existingMessageId) {
+			const previous = db
+				.select()
+				.from(schema.narratorMessages)
+				.where(eq(schema.narratorMessages.id, messageId))
+				.get();
+			if (
+				!previous ||
+				previous.narratorId !== actorNarratorId ||
+				!Array.isArray(previous.contentJson)
+			)
+				throw new Error("Missing tool message owned by the same actor");
+			db.update(schema.narratorMessages)
+				.set({ contentJson: [...(previous.contentJson ?? []), block] })
+				.where(eq(schema.narratorMessages.id, messageId))
+				.run();
+		} else {
+			db.insert(schema.narratorMessages)
+				.values({
+					id: messageId,
+					narratorId: actorNarratorId,
+					role: "assistant",
+					contentJson: [{ type: "text", text: "retain" }, block],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
+				.run();
+		}
+		db.insert(schema.narratorToolCalls)
 			.values({
-				id: messageId,
+				id: toolCallId,
 				narratorId: actorNarratorId,
-				role: "assistant",
-				contentJson: [{ type: "text", text: "retain" }, block],
+				messageId,
+				toolUseId: providerId,
+				toolName: name,
+				inputJson: input,
+				status: "running",
+				executionIdentityVersion: 1,
+				executionAttempt: 1,
+				executionStartedAt: now(),
+				executionDeviceId: "local",
+				executionCwd: cwd,
+				executionPathFlavor: localBackend.pathFlavor,
+				resolvedFilePath: resolved.lexicalPath,
+				canonicalFilePath: resolved.canonicalPath,
+				runtimeGeneration: 0,
 				createdAt: now(),
 			})
 			.run();
-		db.insert(schema.narratorMessageRefs)
-			.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
-			.run();
-	}
-	db.insert(schema.narratorToolCalls)
-		.values({
-			id: toolCallId,
-			narratorId: actorNarratorId,
-			messageId,
-			toolUseId: providerId,
-			toolName: name,
-			inputJson: input,
-			status: "running",
-			executionIdentityVersion: 1,
-			executionAttempt: 1,
-			executionStartedAt: now(),
-			executionDeviceId: "local",
-			executionCwd: cwd,
-			executionPathFlavor: localBackend.pathFlavor,
-			resolvedFilePath: resolved.lexicalPath,
-			canonicalFilePath: resolved.canonicalPath,
-			runtimeGeneration: 0,
-			createdAt: now(),
-		})
-		.run();
+	})();
 	const target: ToolExecutionTarget = {
 		deviceId: "local",
 		backendKind: "local",
@@ -564,15 +643,26 @@ async function fixedEvidenceBytes(plan: RevertPlanSummary) {
 	return [...refs.values()].reduce((sum, bytes) => sum + bytes, 0);
 }
 function hold() {
-	const holds = ownedHolds;
+	const owner = lifetime;
+	if (!owner) throw new Error("Missing transaction fault-barrier owner");
+	const holds = owner.holds;
+	const signal = owner.controller.signal;
 	let release: () => void = () => {};
 	const promise = new Promise<void>((resolve) => {
+		let released = false;
 		release = () => {
+			if (released) return;
+			released = true;
 			holds.delete(release);
+			signal.removeEventListener("abort", release);
 			resolve();
 		};
+		holds.add(release);
+		signal.addEventListener("abort", release, { once: true });
+		// A late body can create another test fault gate after teardown starts.
+		// It belongs to this already-aborted owner and must never block its closing.
+		if (signal.aborted) release();
 	});
-	holds.add(release);
 	return { promise, release };
 }
 
@@ -1825,6 +1915,8 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(history()).toBe(before);
 	});
 	test("receipt SQL fault retains applying intent/quarantine; reopened DB never repeats IO", async () => {
+		const owner = lifetime;
+		if (!owner) throw new Error("Missing reopened transaction fixture owner");
 		const { a, plan } = await twoFiles();
 		const before = history();
 		sqlite.exec(
@@ -1836,7 +1928,11 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		await fs.writeFile(a, "human after unknown write");
 		sqlite.close(true);
 		sqlite = new Database(join(root, "isolated.sqlite"));
-		sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
+		owner.sqlite = sqlite;
+		sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA synchronous=NORMAL;");
+		expect(sqlite.query<{ synchronous: number }, []>("PRAGMA synchronous").get()?.synchronous).toBe(
+			1,
+		);
 		db = database(sqlite);
 		runtime = makeFixtureRuntime({
 			db,
