@@ -101,6 +101,15 @@ export interface WorktreeServicePorts<Principal> {
 		need: "read" | "write",
 		signal: AbortSignal,
 	): Promise<WorktreeTarget>;
+	/** Explicit path-scope authorization; repository identity alone never grants sibling access. */
+	authorizeDestination?(
+		principal: Principal,
+		narratorId: string,
+		target: WorktreeTarget,
+		destination: string,
+		need: "read" | "write",
+		signal: AbortSignal,
+	): Promise<void>;
 	/** Shared with directory switching; holds revision admission for the entire mutation. */
 	withRevision<T>(narratorId: string, expectedRevision: number, fn: () => Promise<T>): Promise<T>;
 	/** Shared with ALL existing Git writes, fail-fast rather than an unbounded queue. */
@@ -1009,7 +1018,10 @@ export class NarratorWorktreeService<Principal> {
 				worktreeName = backend.paths.basename(destinationPath);
 			} else {
 				worktreeName = worktreeDirectoryName(branchName);
-				const parent = backend.paths.resolve(root, ".worktrees");
+				const repositoryRoot = this.ports.authorizeDestination
+					? await this.repositoryRoot(target, signal)
+					: root;
+				const parent = backend.paths.resolve(repositoryRoot, ".worktrees");
 				const parentStat = await lstat(parent).catch((cause) => {
 					if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
 					throw cause;
@@ -1017,22 +1029,59 @@ export class NarratorWorktreeService<Principal> {
 				if (parentStat?.isSymbolicLink())
 					error("WORKTREE_SYMLINK_PATH", "Default worktree parent is a symlink");
 				destinationPath = backend.paths.resolve(
-					parentStat?.isDirectory() ? parent : root,
+					parentStat?.isDirectory() ? parent : repositoryRoot,
 					parentStat?.isDirectory() ? worktreeName : `nf-worktree-${worktreeName}`,
 				);
 			}
-			await this.requireDestination(target, destinationPath, signal);
+			await this.requireDestination(principal, narratorId, target, destinationPath, signal);
 			return { branchName, worktreeName, destinationPath };
 		});
 	}
 
+	/** Discover the main checkout through Git, not by interpreting a .git path as a grant. */
+	private async repositoryRoot(target: WorktreeTarget, signal: AbortSignal): Promise<string> {
+		await this.verifyIdentity(target, signal);
+		const backend = target.backend;
+		if (!backend || !target.repositoryPath)
+			error("GIT_WORKSPACE_CHANGED", "Repository identity unavailable", 409);
+		const candidate = backend.paths.dirname(target.repositoryPath);
+		const result = await this.run(
+			{ ...target, workspace: { ...target.workspace, rootPath: candidate } },
+			["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+			signal,
+		);
+		const lines = result.stdout.trim().split("\n");
+		if (
+			result.exitCode !== 0 ||
+			result.stdoutTruncated ||
+			result.stderrTruncated ||
+			lines.length !== 2 ||
+			!backend.paths.equals(lines[0], candidate) ||
+			!backend.paths.equals(lines[1], target.repositoryPath)
+		)
+			error("GIT_WORKSPACE_CHANGED", "Cannot verify the main repository checkout", 409);
+		const identity = await backend.resolvePathIdentity(candidate, {
+			signal,
+			timeoutMs: WORKTREE_READ_TIMEOUT_MS,
+		});
+		if (
+			!backend.paths.equals(identity.canonicalPath, candidate) ||
+			identity.runtimeGeneration !== backend.runtimeGeneration
+		)
+			error("WORKTREE_SYMLINK_PATH", "Main repository identity is not canonical");
+		return candidate;
+	}
+
 	private async requireDestination(
+		principal: Principal,
+		narratorId: string,
 		target: WorktreeTarget,
 		destination: string,
 		signal: AbortSignal,
+		recovery = false,
 	) {
 		const backend = target.backend;
-		const root = target.workspace.rootPath;
+		let root = target.workspace.rootPath;
 		if (!backend || !root)
 			error("GIT_WORKSPACE_UNAVAILABLE", "Workspace identity unavailable", 409);
 		const paths = backend.paths;
@@ -1042,11 +1091,13 @@ export class NarratorWorktreeService<Principal> {
 			paths.normalize(destination) !== destination
 		)
 			error("WORKTREE_INVALID_PATH", "Destination must be an absolute normalized path");
-		// Existing Git authorization checks the WHOLE root for nested blacklist/ACL restrictions.
-		// Do not widen that grant to a sibling path just because the client supplies one.
+		// Sibling access requires both Git identity evidence and a fresh destination grant.
+		const sibling = !paths.contains(root, destination);
+		if (sibling && this.ports.authorizeDestination)
+			root = await this.repositoryRoot(target, signal);
 		if (
 			!paths.contains(root, destination) ||
-			paths.equals(root, destination) ||
+			(!recovery && paths.equals(root, destination)) ||
 			(target.repositoryPath && paths.contains(target.repositoryPath, destination))
 		)
 			error(
@@ -1063,6 +1114,14 @@ export class NarratorWorktreeService<Principal> {
 			identity.runtimeGeneration !== backend.runtimeGeneration
 		)
 			error("WORKTREE_SYMLINK_PATH", "Symlink/junction destination identities are not supported");
+		await this.ports.authorizeDestination?.(
+			principal,
+			narratorId,
+			target,
+			identity.canonicalPath,
+			recovery ? "read" : "write",
+			signal,
+		);
 		let cursor = destination;
 		let first = true;
 		while (!paths.equals(cursor, root)) {
@@ -1076,13 +1135,36 @@ export class NarratorWorktreeService<Principal> {
 			}
 			if (entry?.isSymbolicLink())
 				error("WORKTREE_SYMLINK_PATH", "Symlink destinations are not supported");
-			if (first && entry) error("WORKTREE_DESTINATION_EXISTS", "Destination already exists", 409);
+			if (first && entry && !recovery)
+				error("WORKTREE_DESTINATION_EXISTS", "Destination already exists", 409);
+			if (first && entry && recovery && !entry.isDirectory())
+				error("WORKTREE_INVALID_PATH", "Recovery destination is not a directory");
 			if (!first && !entry?.isDirectory())
 				error("WORKTREE_INVALID_PATH", "Destination parent is not a directory");
 			first = false;
 			cursor = paths.dirname(cursor);
 		}
-		await access(paths.dirname(destination), constants.W_OK | constants.X_OK);
+		if (sibling) {
+			// A nested unrelated checkout under the main directory is not the same repository.
+			const parent = paths.dirname(destination);
+			const result = await this.run(
+				{ ...target, workspace: { ...target.workspace, rootPath: parent } },
+				["rev-parse", "--path-format=absolute", "--git-common-dir"],
+				signal,
+			);
+			if (
+				result.exitCode !== 0 ||
+				result.stdoutTruncated ||
+				result.stderrTruncated ||
+				!paths.equals(result.stdout.trim(), target.repositoryPath ?? "")
+			)
+				error(
+					"WORKTREE_DESTINATION_DENIED",
+					"Destination parent belongs to a different repository",
+					403,
+				);
+		}
+		if (!recovery) await access(paths.dirname(destination), constants.W_OK | constants.X_OK);
 		return identity.canonicalPath;
 	}
 
@@ -1339,8 +1421,17 @@ export class NarratorWorktreeService<Principal> {
 				target.backend?.runtimeGeneration !== initial.backend?.runtimeGeneration
 			)
 				error("WORKTREE_RECOVERY_DENIED", "Recovery repository or execution device changed", 403);
-			// The old request cannot turn a narrow current-tree grant into a sibling-directory grant.
-			if (
+			// Runtime supplies a separate destination grant; legacy ports remain current-tree-only.
+			if (this.ports.authorizeDestination) {
+				await this.requireDestination(
+					principal,
+					narratorId,
+					target,
+					receipt.destination,
+					signal,
+					true,
+				);
+			} else if (
 				!target.backend ||
 				!target.workspace.rootPath ||
 				!target.backend.paths.isAbsolute(receipt.destination) ||
@@ -1441,6 +1532,8 @@ export class NarratorWorktreeService<Principal> {
 				let result: WorktreeCreateResult;
 				try {
 					record.destination = await this.requireDestination(
+						principal,
+						narratorId,
 						target,
 						request.destinationPath,
 						signal,
@@ -1471,7 +1564,7 @@ export class NarratorWorktreeService<Principal> {
 					)
 						error("GIT_WORKSPACE_CHANGED", "Repository or backend changed before write", 409);
 					await this.verifyIdentity(fresh, signal);
-					await this.requireDestination(fresh, record.destination, signal);
+					await this.requireDestination(principal, narratorId, fresh, record.destination, signal);
 					// Durable protection is admitted under the same lock used by storage cleanup.
 					// Failure to register means no Git dispatch; uncertain/failed adds stay protected.
 					await this.ports.resources?.register({

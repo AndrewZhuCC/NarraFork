@@ -17,7 +17,7 @@ import {
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
 import { useNarratorPanelCompact } from "./panels/compact-context";
-import { PermissionRuleResultNotice } from "./permission/PermissionRuleResultNotice";
+import { PermissionRulePolicySync } from "./permission/PermissionRuleResultNotice";
 
 /**
  * Context shared by several of the interaction area's sub-regions (status bar,
@@ -188,9 +188,9 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				</Box>
 			)}
 
-			{/* Policy activation is shown only after a successful execution receipt. */}
+			{/* Keep existing permission lists current without taking up composer space. */}
 			{!props.common.isWorkspacePreview && (
-				<PermissionRuleResultNotice
+				<PermissionRulePolicySync
 					key={props.common.narratorId}
 					narratorId={props.common.narratorId}
 				/>

@@ -1987,6 +1987,125 @@ describe("local worktree list/create fixtures", () => {
 		expect(writes).toBe(1);
 	});
 
+	test("linked checkout prepares and creates a sibling with an explicit destination grant", async () => {
+		const linked = join(source, ".worktrees", "current");
+		await git(["worktree", "add", "-b", "current", linked]);
+		target.workspace = { ...target.workspace, rootPath: linked, cwd: linked };
+		const grants: string[] = [];
+		ports.authorizeDestination = async (_actor, _id, _target, path, need) => {
+			grants.push(`${need}:${path}`);
+		};
+		const prepared = await service.prepare(
+			"actor",
+			"narrator",
+			{
+				expectedRevision: 4,
+				workspaceKey: "workspace",
+				branchName: "linked-feature",
+			},
+			signal(),
+		);
+		expect(prepared.destinationPath).toBe(
+			join(source, ".worktrees", worktreeDirectoryName("linked-feature")),
+		);
+		const request = {
+			...proposal("linked-create", "linked-feature"),
+			destinationPath: prepared.destinationPath,
+		};
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("created");
+		expect(grants.filter((grant) => grant === `write:${request.destinationPath}`).length).toBe(3);
+		target.workspace.capabilities.write = false;
+		revision = 8;
+		const before = await ports.journal.read("narrator", request.requestId);
+		expect((await service.reconcileRequest("actor", "narrator", request, signal())).outcome).toBe(
+			"created",
+		);
+		expect(grants.at(-1)).toBe(`read:${request.destinationPath}`);
+		expect(await ports.journal.read("narrator", request.requestId)).toEqual(before);
+		expect(writes).toBe(1);
+	});
+
+	test("linked checkout recovers unknown sibling operation read-only without re-adding", async () => {
+		const linked = join(source, ".worktrees", "current");
+		await git(["worktree", "add", "-b", "current", linked]);
+		target.workspace = { ...target.workspace, rootPath: linked, cwd: linked };
+		ports.authorizeDestination = async () => {};
+		const request = proposal(`wt1_${"b".repeat(64)}`);
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("created");
+		const record = await ports.journal.read("narrator", request.requestId);
+		if (!record) throw new Error("Missing receipt");
+		delete record.result;
+		await ports.journal.save("narrator", request.requestId, record);
+		target.workspace.capabilities.write = false;
+		expect(
+			(await service.getOperation("actor", "narrator", request.requestId, signal())).outcome,
+		).toBe("created");
+		expect(writes).toBe(1);
+	});
+
+	test("linked sibling grants are rechecked and cannot bypass path or repository identity checks", async () => {
+		const request = proposal();
+		await service.create("actor", "narrator", request, signal());
+		const linked = join(source, ".worktrees", "current");
+		await git(["worktree", "add", "-b", "current", linked]);
+		target.workspace = { ...target.workspace, rootPath: linked, cwd: linked };
+		ports.authorizeDestination = async () => {
+			throw new AppError("Denied target", 403, "TARGET_DENIED");
+		};
+		expect(
+			(await service.create("actor", "narrator", proposal("denied", "denied"), signal())).error
+				?.code,
+		).toBe("TARGET_DENIED");
+		await expect(
+			service.reconcileRequest("actor", "narrator", request, signal()),
+		).rejects.toMatchObject({ code: "TARGET_DENIED" });
+		ports.authorizeDestination = async () => {};
+		const alias = join(source, ".worktrees", "alias");
+		await symlink(linked, alias);
+		expect(
+			(
+				await service.create(
+					"actor",
+					"narrator",
+					{ ...proposal("alias", "alias"), destinationPath: join(alias, "child") },
+					signal(),
+				)
+			).error?.code,
+		).toBe("WORKTREE_SYMLINK_PATH");
+		expect(
+			(
+				await service.create(
+					"actor",
+					"narrator",
+					{ ...proposal("outside", "outside"), destinationPath: join(temporary, "other") },
+					signal(),
+				)
+			).error?.code,
+		).toBe("WORKTREE_DESTINATION_DENIED");
+		const foreign = join(source, "nested-foreign");
+		await mkdir(foreign);
+		await git(["init", "-b", "main"], foreign);
+		expect(
+			(
+				await service.create(
+					"actor",
+					"narrator",
+					{
+						...proposal("nested-foreign", "nested-foreign"),
+						destinationPath: join(foreign, "new"),
+					},
+					signal(),
+				)
+			).error?.code,
+		).toBe("WORKTREE_DESTINATION_DENIED");
+		target.repositoryPath = join(temporary, "foreign", ".git");
+		expect(
+			(await service.create("actor", "narrator", proposal("foreign", "foreign"), signal())).error
+				?.code,
+		).toBe("GIT_WORKSPACE_CHANGED");
+		expect(writes).toBe(1);
+	});
+
 	test("recovery cannot widen a narrow sibling-worktree directory grant", async () => {
 		const request = proposal();
 		await service.create("actor", "narrator", request, signal());
