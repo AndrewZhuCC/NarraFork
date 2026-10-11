@@ -22,6 +22,8 @@ import {
 import { ThemeProvider } from "@openuidev/react-ui";
 import { narratorOpenUIChatLibrary as openuiChatLibrary } from "./openui-library";
 import "@openuidev/react-ui/layered/styles/index.css";
+import { typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { onTypographyChange } from "@shared/pretext-layout/typography";
 import {
 	Component,
 	memo,
@@ -49,6 +51,7 @@ import {
 	truncateUtf8,
 	withinUtf8Limit,
 } from "./openui-helpers";
+import { openUITypographyTheme } from "./openui-typography";
 
 export interface OpenUIBlockProps {
 	source: string;
@@ -241,6 +244,8 @@ const OpenUIPreview = memo(function OpenUIPreview({
 function OpenUIBlockContent({ source, isStreaming, stateKey, onSend }: OpenUIBlockProps) {
 	const { t } = useTranslation("narrator");
 	const colorScheme = useComputedColorScheme("dark");
+	const typography = useSyncExternalStore(onTypographyChange, typographyMetrics, typographyMetrics);
+	const typographyTheme = useMemo(() => openUITypographyTheme(typography), [typography]);
 	const themeId = useId().replace(/[^a-zA-Z0-9_-]/g, "");
 	const [view, setView] = useState("preview");
 	const [expanded, setExpanded] = useState(false);
@@ -469,7 +474,11 @@ function OpenUIBlockContent({ source, isStreaming, stateKey, onSend }: OpenUIBlo
 		</Box>
 	);
 	return (
-		<ThemeProvider mode={colorScheme} cssSelector={`[data-nf-openui="${themeId}"]`}>
+		<ThemeProvider
+			mode={colorScheme}
+			lightTheme={typographyTheme}
+			cssSelector={`[data-nf-openui="${themeId}"]`}
+		>
 			<Box data-nf-openui={themeId} style={{ minWidth: 0, maxWidth: "100%" }}>
 				{expanded ? <Box h={inlineHeight} /> : content}
 				<Modal

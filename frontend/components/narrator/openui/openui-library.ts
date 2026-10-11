@@ -1,5 +1,6 @@
 import { generatePrompt } from "@openuidev/react-lang";
-import { openuiChatLibrary } from "@openuidev/react-ui/genui-lib";
+// Share ThemeContext with OpenUIBlock's ThemeProvider, including portalled controls.
+import { openuiChatLibrary } from "@openuidev/react-ui";
 
 // ponytail: 0.17.0 registers SwitchGroup but omits it from FormControl's union.
 // Correct the public spec rather than rebuilding the SDK's shared Zod references;
