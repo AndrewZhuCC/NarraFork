@@ -134,6 +134,8 @@ function assertIdentity(
 }
 
 function validateBaselines(plan: CiReleasePlan): void {
+	if (plan.buildSource && plan.buildSource.platforms.length !== CI_RELEASE_TARGETS.length)
+		throw new Error("Single-platform diagnostics cannot become a release bundle");
 	if (plan.baselines.length > 16) throw new Error("Baseline count limit exceeded");
 	const seen = new Set<string>();
 	const counts = new Map<string, number>();
@@ -287,6 +289,7 @@ async function verifyBundle(
 			"runId",
 			"runAttempt",
 			"baselines",
+			"buildSource",
 		] as const) {
 			if (!isDeepStrictEqual(plan[key], expected[key]))
 				throw new Error(`Bundle expected target identity mismatch: ${key}`);

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hashReleaseFile } from "../../scripts/lib/ci-release-io";
@@ -13,6 +13,7 @@ import {
 	parseSmokeArgs,
 	removeSmokeDirectory,
 	resolveFrontendAssetPath,
+	SmokeDiagnostic,
 	type SmokeOptions,
 	smokeEnvironment,
 	smokeFailure,
@@ -355,16 +356,16 @@ describe("native protocol and database assertions", () => {
 	});
 });
 
-test("failed real executable smoke never writes a success artifact", async () => {
-	const root = await temporary();
+async function executableFixture(sourceText: string, directory?: string) {
+	const root = directory ?? (await temporary());
 	const platform = process.platform === "win32" ? "windows" : process.platform;
 	const binary = join(
 		root,
 		`narrafork-1.2.3-${platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`,
 	);
-	// Compile a genuine standalone fixture which fails immediately; not a mocked spawn/result.
+	// Compile a genuine standalone fixture; not a mocked spawn/result.
 	const source = join(root, "fixture.ts");
-	await writeFile(source, 'console.error("intentional binary fixture failure"); process.exit(37);');
+	await writeFile(source, sourceText);
 	const builder = new SmokeProcessScope(root, process.env);
 	try {
 		await builder.command(
@@ -392,12 +393,371 @@ test("failed real executable smoke never writes a success artifact", async () =>
 			platform: fixtureOptions.target.replace("windows-", "win-"),
 		}),
 	);
+	return { root, binary, measured, fixtureOptions };
+}
+
+test("failed real executable smoke never writes a success artifact", async () => {
+	const { root, binary, measured, fixtureOptions } = await executableFixture(
+		'console.error("intentional binary fixture failure"); process.exit(37);',
+	);
 	await expect(smokeReleaseBinary(fixtureOptions)).rejects.toThrow(
 		"intentional binary fixture failure",
 	);
 	await expect(readFile(fixtureOptions.output)).rejects.toThrow();
 	expect(await hashReleaseFile(binary)).toEqual(measured);
+	const diagnostic = JSON.parse(await readFile(join(root, "smoke-diagnostic.json"), "utf8"));
+	expect(diagnostic.kind).toBe("release-smoke-diagnostic");
+	expect(diagnostic.identity).toEqual({
+		target: fixtureOptions.target,
+		commit,
+		version: options.version,
+	});
+	expect(diagnostic.firstFailureStage).toBe("startup");
+	expect(diagnostic.stages.product).toBe("failed");
+	expect(diagnostic.stages["directory-cleanup"]).toBe("passed");
+	expect(diagnostic.completedStages).toContain("binary-preparation");
+	expect(diagnostic.processLog).toContain("intentional binary fixture failure");
+	expect(diagnostic.checks).toBeUndefined();
 }, 60_000);
+
+test("diagnostic filesystem fault preserves primary executable failure", async () => {
+	const root = await temporary();
+	const blocked = join(root, "smoke-diagnostic.json");
+	const fixture = await executableFixture(
+		`import { mkdirSync, writeFileSync } from "node:fs";
+		mkdirSync(${JSON.stringify(blocked)});
+		writeFileSync(${JSON.stringify(join(blocked, "sentinel"))}, "sentinel");
+		console.error("primary fixture failure"); process.exit(37);`,
+		root,
+	);
+	let failure: unknown;
+	try {
+		await smokeReleaseBinary(fixture.fixtureOptions);
+	} catch (error) {
+		failure = error;
+	}
+	expect(String(failure)).toContain("primary fixture failure");
+	expect(String(failure)).toContain("Smoke diagnostic output failed");
+	expect(await readFile(join(blocked, "sentinel"), "utf8")).toBe("sentinel");
+	await expect(readFile(fixture.fixtureOptions.output)).rejects.toThrow();
+}, 60_000);
+
+test("preflight refuses existing success or diagnostic without writes", async () => {
+	const root = await temporary();
+	const platform = process.platform === "win32" ? "windows" : process.platform;
+	const nativeOptions = { ...options, target: `${platform}-${process.arch}` };
+	for (const name of ["smoke.json", "smoke-diagnostic.json"]) {
+		const directory = join(root, name);
+		await mkdir(directory);
+		const existing = join(directory, name);
+		await writeFile(existing, "existing-result");
+		const output = join(directory, "smoke.json");
+		await expect(smokeReleaseBinary({ ...nativeOptions, output })).rejects.toThrow("overwrite");
+		expect(await readFile(existing, "utf8")).toBe("existing-result");
+		const absent = join(directory, name === "smoke.json" ? "smoke-diagnostic.json" : "smoke.json");
+		await expect(readFile(absent)).rejects.toThrow();
+	}
+	const output = join(root, "invalid", "smoke.json");
+	await expect(smokeReleaseBinary({ ...nativeOptions, output, commit: "bad" })).rejects.toThrow(
+		"commit",
+	);
+	await expect(lstat(join(root, "invalid"))).rejects.toThrow();
+	await expect(smokeReleaseBinary({ ...nativeOptions, output: "" })).rejects.toThrow("output");
+	const alias = join(root, "rejected", "smoke-diagnostic.json");
+	await expect(smokeReleaseBinary({ ...nativeOptions, output: alias })).rejects.toThrow(
+		"diagnostic path",
+	);
+	await expect(lstat(join(root, "rejected"))).rejects.toThrow();
+});
+
+test("diagnostic text, filesystem names and real child logs are bounded and credential-free", async () => {
+	const root = await temporary();
+	const scope = new SmokeProcessScope(root, process.env);
+	try {
+		const child = scope.spawn([
+			process.execPath,
+			"-e",
+			'console.log("x".repeat(100000) + " token: fixturesecret password: passwordvalue");',
+		]);
+		await scope.until("diagnostic fixture exit", () => (child.closed ? true : undefined));
+		await scope.close();
+		const diagnostic = new SmokeDiagnostic({ ...options, output: join(root, "smoke.json") });
+		diagnostic.secrets.push("fixturesecret", "passwordvalue");
+		diagnostic.passed("product");
+		diagnostic.failed("directory cleanup", new Error("HTTP response token=fixturesecret"));
+		const lockedPath = "C:\\owned\\fixturesecret\\passwordvalue\\AppData\\Edge\\Cache\\database";
+		diagnostic.failed(
+			"directory cleanup",
+			Object.assign(new Error("never persist fixturesecret"), {
+				code: "EBUSY",
+				syscall: "unlink",
+				path: lockedPath,
+			}),
+		);
+		diagnostic.failed(
+			"directory cleanup",
+			Object.assign(new Error("never persist passwordvalue"), {
+				code: "EBUSY",
+				syscall: "unlink",
+				path: `${"x".repeat(5_000)}/passwordvalue/Edge/database`,
+			}),
+		);
+		diagnostic.passed("directory cleanup"); // A later retry cannot erase the recorded failure.
+		diagnostic.remainingPaths = Array.from({ length: 40 }, () => "f".repeat(2000));
+		for (let index = 0; index < 20; index++)
+			diagnostic.failed("directory cleanup", new Error("fixturesecret"));
+		await diagnostic.write(scope.diagnostic);
+		const text = await readFile(join(root, "smoke-diagnostic.json"), "utf8");
+		const value = JSON.parse(text);
+		expect(value.firstFailureStage).toBe("directory-cleanup");
+		expect(value.stages.product).toBe("passed");
+		expect(value.stages["directory-cleanup"]).toBe("failed");
+		expect(value.processLog.length).toBeLessThanOrEqual(32 * 1024);
+		expect(value.remainingPaths.length).toBe(32);
+		expect(value.remainingPaths.every((path: string) => path.length <= 512)).toBe(true);
+		expect(value.failures.length).toBe(8);
+		expect(value.failures[0].path).toBeUndefined();
+		expect(value.failures[1]).toMatchObject({
+			code: "EBUSY",
+			syscall: "unlink",
+			path: lockedPath
+				.replaceAll("fixturesecret", "[REDACTED]")
+				.replaceAll("passwordvalue", "[REDACTED]"),
+		});
+		expect(value.failures[2].path.length).toBe(2_048);
+		expect(value.failures[2].path.endsWith("/[REDACTED]/Edge/database")).toBe(true);
+		expect(
+			value.failures.every(
+				(failure: { path?: string }) => !failure.path || failure.path.length <= 2_048,
+			),
+		).toBe(true);
+		expect(text).not.toContain("never persist");
+		expect(text.length).toBeLessThan(64 * 1024);
+		expect(text).not.toContain("fixturesecret");
+		expect(text).not.toContain("passwordvalue");
+		expect(text).not.toContain("HTTP response");
+		await expect(diagnostic.write(scope.diagnostic)).rejects.toThrow("EEXIST");
+		expect(await readFile(join(root, "smoke-diagnostic.json"), "utf8")).toBe(text);
+	} finally {
+		await scope.close();
+	}
+});
+
+test("signal cancellation records a failure and cleans up without a success artifact", async () => {
+	const fixture = await executableFixture("setInterval(() => {}, 1000);");
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(new Error("fixturesecret cancellation")), 1000);
+	try {
+		await expect(smokeReleaseBinary(fixture.fixtureOptions, controller.signal)).rejects.toThrow();
+		expect(controller.signal.aborted).toBe(true);
+		await expect(readFile(fixture.fixtureOptions.output)).rejects.toThrow();
+		const text = await readFile(join(fixture.root, "smoke-diagnostic.json"), "utf8");
+		const diagnostic = JSON.parse(text);
+		expect(["binary-preparation", "startup"]).toContain(diagnostic.firstFailureStage);
+		expect(diagnostic.stages.product).toBe("failed");
+		expect(diagnostic.stages["process-shutdown"]).toBe("passed");
+		expect(diagnostic.stages["directory-cleanup"]).toBe("passed");
+		expect(text).not.toContain("fixturesecret");
+	} finally {
+		clearTimeout(timeout);
+	}
+}, 60_000);
+
+function nativeSmokeFixture(configuration: string, evidence: string): string {
+	return `
+import { Database } from "bun:sqlite";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+const mode = readFileSync(${JSON.stringify(configuration)}, "utf8");
+const root = dirname(process.cwd());
+if (process.argv.includes("--narrafork-watcher-worker")) {
+  const send = value => console.log(JSON.stringify(value));
+  const backend = process.platform === "win32" ? "windows" : process.platform === "darwin" ? "fs-events" : "inotify";
+  send({ type: "ready", pid: process.pid, backend });
+  let handle;
+  for await (const line of console) {
+    const message = JSON.parse(line);
+    if (message.type === "watch") {
+      handle = watch(message.path, (_, name) => {
+        const file = join(message.path, String(name));
+        send({ type: "events", id: message.id, path: message.path, events: [{ path: file, type: existsSync(file) ? 1 : 3 }] });
+      });
+      send({ type: "watch_ack", requestId: message.requestId, id: message.id });
+    } else if (message.type === "unwatch") {
+      handle.close();
+      send({ type: "unwatch_ack", requestId: message.requestId });
+    } else if (message.type === "shutdown") process.exit(0);
+  }
+} else {
+  writeFileSync(${JSON.stringify(evidence)}, root);
+  const settings = JSON.parse(readFileSync(join(process.env.NARRAFORK_HOME, "settings.json"), "utf8"));
+  if (settings.server?.openBrowser !== "off") throw new Error("Fixture requires a headless isolated configuration");
+  const port = Number(process.argv.find(value => value.startsWith("--port=")).split("=")[1]);
+  const database = new Database(join(process.env.NARRAFORK_HOME, "narrafork.db"));
+  database.exec("CREATE TABLE __drizzle_migrations (id INTEGER, hash TEXT, created_at INTEGER); CREATE TABLE users (username TEXT, role TEXT); CREATE TABLE narrators (id TEXT); CREATE TABLE narrator_messages (id TEXT); CREATE TABLE terminals (id TEXT)");
+  database.query("INSERT INTO __drizzle_migrations VALUES (1, ?, 1)").run("a".repeat(64));
+  Bun.serve({ hostname: "127.0.0.1", port,
+    async fetch(request, server) {
+      const path = new URL(request.url).pathname;
+      if (path === "/ws/terminal" && server.upgrade(request)) return;
+      if (path === "/api/health") return Response.json({ status: "ok", readiness: "ready", commit: ${JSON.stringify(commit.slice(0, 8))}, version: ${JSON.stringify(`1.2.3+${commit.slice(0, 8)}`)}, gitAvailable: true });
+      if (path === "/") return new Response('<div id="root"></div><script type="module" src="/assets/index-fixture.js"></script>', { headers: { "Content-Type": "text/html" } });
+      if (path === "/assets/index-fixture.js") return new Response("export const fixture = true;" + "/* fixture */".repeat(20), { headers: { "Content-Type": "application/javascript" } });
+      if (path === "/api/auth/register") {
+        const body = await request.json();
+        if (mode === "product") return Response.json({ token: "fixturesecret", password: body.password }, { status: 500 });
+        database.query("INSERT INTO users VALUES (?, 'admin')").run(body.username);
+        console.log("token: fixturesecret password: " + body.password);
+        return Response.json({ token: "fixturesecret" });
+      }
+      if (path === "/api/settings") return Response.json({ server: { openBrowser: mode === "browser" ? "browser" : settings.server.openBrowser }, update: { source: "github", githubRepository: "fixture/repository" } });
+      if (request.method === "POST" && path === "/api/terminals") return Response.json({ id: "owned-terminal" });
+      if (request.method === "DELETE" && path === "/api/terminals/owned-terminal") {
+        if (mode === "cleanup") chmodSync(root, 0o500);
+        if (mode === "diagnostic-fault") {
+          const blocked = join(dirname(${JSON.stringify(configuration)}), mode, "smoke-diagnostic.json");
+          mkdirSync(blocked, { recursive: true });
+          writeFileSync(join(blocked, "sentinel"), "keep");
+        }
+        if (mode === "integrity") {
+          const platform = process.platform === "win32" ? "windows" : process.platform;
+          const binary = join(dirname(${JSON.stringify(configuration)}), "narrafork-1.2.3-" + platform + "-" + process.arch + (process.platform === "win32" ? ".exe" : ""));
+          appendFileSync(binary, "tampered-original-package");
+        }
+        return Response.json({});
+      }
+      return new Response("fixturesecret", { status: 404 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const message = JSON.parse(String(raw));
+        const send = (type, fields = {}) => ws.send(JSON.stringify({ type, terminalId: "owned-terminal", ...fields }));
+        if (message.type === "subscribe") {
+          send("scrollback", { data: "fixture shell prompt" });
+          send("bufferState", { activeBuffer: "normal" });
+        } else if (message.type === "input") {
+          if (message.data === "exit\\r") { send("exit", { code: 0 }); return; }
+          const marker = /^echo (NF_RELEASE_PTY_[a-f0-9]+)\\r$/.exec(message.data)?.[1];
+          send("output", { data: marker + "\\r\\n" });
+        }
+      }
+    }
+  });
+}
+`;
+}
+
+test("native fixture separates complete smoke, product failure and cleanup-only failure", async () => {
+	const root = await temporary();
+	const configuration = join(root, "mode.txt");
+	const evidence = join(root, "owned-root.txt");
+	const fixture = await executableFixture(nativeSmokeFixture(configuration, evidence), root);
+	const fixturePath = join(root, "fixture-path");
+	await mkdir(fixturePath);
+	if (process.platform !== "win32") {
+		const ps = Bun.which("ps");
+		if (!ps) throw new Error("Native fixture needs the existing process-table command");
+		await symlink(ps, join(fixturePath, "ps"));
+	}
+	await writeFile(
+		fixture.fixtureOptions.metadata,
+		JSON.stringify({
+			...JSON.parse(await readFile(fixture.fixtureOptions.metadata, "utf8")),
+			repository: "fixture/repository",
+		}),
+	);
+	for (const mode of [
+		"pass",
+		"browser",
+		"product",
+		"cleanup",
+		"diagnostic-fault",
+		"integrity",
+	] as const) {
+		// Windows directory permissions do not create the POSIX EACCES fault used here.
+		if (mode === "cleanup" && (process.platform === "win32" || process.getuid?.() === 0)) continue;
+		await writeFile(configuration, mode);
+		const output = join(root, mode, "smoke.json");
+		const originalPath = process.env.PATH;
+		// The protocol fixture needs no optional dtach daemon; keep real owned-process cleanup.
+		if (process.platform !== "win32") process.env.PATH = fixturePath;
+		const run = smokeReleaseBinary({
+			...fixture.fixtureOptions,
+			repository: "fixture/repository",
+			output,
+		});
+		let ownedRoot: string | undefined;
+		try {
+			if (mode === "pass") {
+				const result = await run;
+				expect(JSON.parse(await readFile(output, "utf8"))).toEqual(result);
+				expect(result.checks.pty).toBe(true);
+			} else
+				await expect(run).rejects.toThrow(
+					mode === "cleanup"
+						? "directory cleanup"
+						: mode === "diagnostic-fault"
+							? "Smoke diagnostic output failed"
+							: mode === "integrity"
+								? "Binary was modified"
+								: mode === "browser"
+									? "disable automatic browser startup"
+									: "HTTP /api/auth/register: 500",
+				);
+			ownedRoot = await readFile(evidence, "utf8");
+			if (mode === "diagnostic-fault") {
+				await expect(readFile(output)).rejects.toThrow();
+				expect(await readFile(join(root, mode, "smoke-diagnostic.json", "sentinel"), "utf8")).toBe(
+					"keep",
+				);
+				await expect(lstat(ownedRoot)).rejects.toThrow();
+				continue;
+			}
+			const text = await readFile(join(root, mode, "smoke-diagnostic.json"), "utf8");
+			const diagnostic = JSON.parse(text);
+			expect(diagnostic.identity.repository).toBe("fixture/repository");
+			expect(text).not.toContain("fixturesecret");
+			expect(text).not.toContain("NARRAFORK_HOME");
+			if (mode !== "product") expect(diagnostic.processLog).toContain("password: [REDACTED]");
+			expect(diagnostic.stages.product).toBe(
+				mode === "product" || mode === "browser" ? "failed" : "passed",
+			);
+			expect(diagnostic.firstFailureStage).toBe(
+				mode === "pass"
+					? null
+					: mode === "cleanup"
+						? "directory-cleanup"
+						: mode === "integrity"
+							? "post-run-integrity"
+							: "bootstrap-registration",
+			);
+			expect(diagnostic.stages["process-shutdown"]).toBe("passed");
+			if (mode !== "pass") await expect(readFile(output)).rejects.toThrow();
+			if (mode === "cleanup") {
+				expect(diagnostic.stages["post-run-integrity"]).toBe("passed");
+				expect(diagnostic.stages["directory-cleanup"]).toBe("failed");
+				expect(diagnostic.failures[0].code).toBe("EACCES");
+				expect(diagnostic.remainingPaths.length).toBeGreaterThan(0);
+			} else {
+				expect(diagnostic.stages["directory-cleanup"]).toBe("passed");
+				await expect(lstat(ownedRoot)).rejects.toThrow();
+			}
+			if (mode === "pass") expect(diagnostic.stages["final-integrity"]).toBe("passed");
+			if (mode === "integrity") {
+				expect(diagnostic.stages["post-run-integrity"]).toBe("failed");
+				expect(await hashReleaseFile(fixture.binary)).not.toEqual(fixture.measured);
+			}
+		} finally {
+			if (originalPath === undefined) delete process.env.PATH;
+			else process.env.PATH = originalPath;
+			ownedRoot ??= await readFile(evidence, "utf8").catch(() => undefined);
+			if (ownedRoot) {
+				await chmod(ownedRoot, 0o700).catch(() => {});
+				await rm(ownedRoot, { recursive: true, force: true });
+			}
+		}
+	}
+}, 90_000);
 
 async function ptyFixture(
 	mode: "pass" | "echo" | "replay" | "exit" | "oversize" | "hang-exit" | "bad-exit",

@@ -374,3 +374,48 @@ describe("CI release plan trust boundary", () => {
 		);
 	});
 });
+
+describe("original build provenance plan contract", () => {
+	test("separates product, build and re-verification identities without allowing ambiguous target sets", async () => {
+		const state = fixture();
+		const base = await createCiReleasePlan({
+			root: "/unused",
+			tag: "v1.2.0",
+			publish: false,
+			env,
+			run: state.run,
+		});
+		const source = {
+			runId: 100,
+			runAttempt: 2,
+			workflowCommit: "d".repeat(40),
+			controlArtifact: { id: 900, digest: `sha256:${"a".repeat(64)}`, size: 100 },
+			platforms: [
+				{
+					target: "windows-x64",
+					artifact: { id: 901, digest: `sha256:${"b".repeat(64)}`, size: 100 },
+				},
+			],
+		};
+		expect(validateCiReleasePlan({ ...base, buildSource: source })).toMatchObject({
+			commit,
+			workflowCommit,
+			buildSource: source,
+		});
+		for (const changed of [
+			{ runId: base.runId },
+			{ runAttempt: 0 },
+			{ workflowCommit: "d".repeat(8) },
+			{ controlArtifact: { ...source.controlArtifact, size: 4 * 1024 * 1024 + 1 } },
+			{ controlArtifact: { ...source.controlArtifact, digest: "a".repeat(64) } },
+			{ platforms: [] },
+			{ platforms: [source.platforms[0], source.platforms[0]] },
+			{ platforms: [{ target: "windows-x86", artifact: source.platforms[0]?.artifact }] },
+			{ platforms: [{ ...source.platforms[0], artifact: source.controlArtifact }] },
+			{ extra: true },
+		])
+			expect(() =>
+				validateCiReleasePlan({ ...base, buildSource: { ...source, ...changed } }),
+			).toThrow();
+	});
+});

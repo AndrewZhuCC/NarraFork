@@ -48,6 +48,32 @@ const changelogSchema = z
 			.max(256 * 1024),
 	})
 	.strict();
+const artifactIdentitySchema = z
+	.object({
+		id,
+		digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+		size: id.max(2 * 1024 ** 3),
+	})
+	.strict();
+const buildSourceSchema = z
+	.object({
+		runId: id,
+		runAttempt: id,
+		workflowCommit: sha,
+		controlArtifact: artifactIdentitySchema,
+		platforms: z
+			.array(
+				z
+					.object({
+						target: z.enum(CI_RELEASE_TARGETS.map(({ target }) => target)),
+						artifact: artifactIdentitySchema,
+					})
+					.strict(),
+			)
+			.min(1)
+			.max(8),
+	})
+	.strict();
 const planSchema = z
 	.object({
 		schemaVersion: z.literal(1),
@@ -62,6 +88,7 @@ const planSchema = z
 		changelog: changelogSchema,
 		runId: id,
 		runAttempt: id,
+		buildSource: buildSourceSchema.optional(),
 		baselines: z
 			.array(
 				z
@@ -185,6 +212,20 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 		plan.channel !== releaseChannel(plan.version)
 	)
 		throw new Error("Release plan version/channel mismatch");
+	if (plan.buildSource) {
+		const source = plan.buildSource;
+		const targets = new Set(source.platforms.map(({ target }) => target));
+		const artifactIds = new Set(source.platforms.map(({ artifact }) => artifact.id));
+		if (
+			source.runId === plan.runId ||
+			![1, CI_RELEASE_TARGETS.length].includes(source.platforms.length) ||
+			targets.size !== source.platforms.length ||
+			artifactIds.size !== source.platforms.length ||
+			artifactIds.has(source.controlArtifact.id) ||
+			source.controlArtifact.size > 4 * 1024 * 1024
+		)
+			throw new Error("Invalid original build provenance or target set");
+	}
 	const seen = new Set<string>();
 	const count = new Map<string, number>();
 	for (const base of plan.baselines) {

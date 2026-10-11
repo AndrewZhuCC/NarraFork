@@ -19,6 +19,7 @@ import {
 	formatSha256Sums,
 } from "../../scripts/lib/binary-metadata";
 import {
+	REQUIRED_RELEASE_REVERIFY_JOBS,
 	REQUIRED_RELEASE_SOURCE_JOBS,
 	restoreCiReleaseBundle,
 } from "../../scripts/lib/ci-release-restore";
@@ -487,5 +488,180 @@ describe("CI immutable release bundle restoration", () => {
 		mkdirSync(options(state).destination);
 		await expect(restoreCiReleaseBundle(options(state))).rejects.toThrow("already exists");
 		expect(state.downloads).toBe(0);
+	});
+});
+
+/** Three distinct runs: original build 51, full re-verification 101, publisher 102. */
+function reverifiedFixture() {
+	const state = fixture();
+	const originalPlan: CiReleasePlan = {
+		...plan,
+		runId: 51,
+		runAttempt: 3,
+		workflowCommit: "d".repeat(40),
+	};
+	const controlPath = join(state.root, "original-control.zip");
+	execFileSync(
+		"python3",
+		[
+			"-I",
+			"-c",
+			"import sys,zipfile\nwith zipfile.ZipFile(sys.argv[1],'w',zipfile.ZIP_DEFLATED) as z:\n z.writestr('plan.json',sys.argv[2]); z.writestr('control.js',b'throw new Error(\"never execute original control\")')",
+			controlPath,
+			JSON.stringify(originalPlan),
+		],
+		{ timeout: 5000, maxBuffer: 16384 },
+	);
+	const controlBytes = readFileSync(controlPath);
+	const originalSource = {
+		...state.source,
+		id: 51,
+		run_attempt: 3,
+		head_sha: originalPlan.workflowCommit,
+	};
+	const artifact = (id: number, name: string, size: number, digest: string) => ({
+		...state.artifact,
+		id,
+		name,
+		size_in_bytes: size,
+		digest,
+		workflow_run: { ...state.artifact.workflow_run, id: 51, head_sha: originalPlan.workflowCommit },
+	});
+	const controlArtifact = artifact(
+		800,
+		"release-control-51-3",
+		controlBytes.length,
+		`sha256:${createHash("sha256").update(controlBytes).digest("hex")}`,
+	);
+	const platforms = CI_RELEASE_TARGETS.map(({ target }, index) =>
+		artifact(801 + index, `release-platform-${target}-51-3`, 256, `sha256:${"a".repeat(64)}`),
+	);
+	const originalJobs = [
+		"Release preflight",
+		...REQUIRED_RELEASE_SOURCE_JOBS.filter(
+			(name) => name.startsWith("Verify release source / ") || name.startsWith("Build ("),
+		),
+	].map((name, index) => ({
+		id: 100 + index,
+		run_id: 51,
+		run_attempt: 3,
+		head_sha: originalPlan.workflowCommit,
+		name,
+		status: "completed",
+		conclusion: "success",
+		steps: [
+			{
+				name: "Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+				status: "completed",
+				conclusion: "success",
+			},
+		],
+	}));
+	state.jobs = REQUIRED_RELEASE_REVERIFY_JOBS.map((name, index) => ({
+		id: 200 + index,
+		run_id: 101,
+		run_attempt: 2,
+		name,
+		status: "completed",
+		conclusion: "success",
+		head_sha: workflowCommit,
+	}));
+	state.manifest.plan.buildSource = {
+		runId: 51,
+		runAttempt: 3,
+		workflowCommit: originalPlan.workflowCommit,
+		controlArtifact: {
+			id: controlArtifact.id,
+			digest: controlArtifact.digest,
+			size: controlArtifact.size_in_bytes,
+		},
+		platforms: CI_RELEASE_TARGETS.map(({ target }, index) => {
+			const value = platforms[index];
+			if (!value) throw new Error("Missing fixture platform artifact");
+			return {
+				target,
+				artifact: { id: value.id, digest: value.digest, size: value.size_in_bytes },
+			};
+		}),
+	};
+	state.repack();
+	const run = async (args: string[]) => {
+		const path = args[1]?.replace(`repos/${plan.repository}/`, "") ?? "";
+		if (path === "actions/runs/51/attempts/3") return JSON.stringify(originalSource);
+		if (path.startsWith("actions/runs/51/attempts/3/jobs"))
+			return JSON.stringify({ total_count: originalJobs.length, jobs: originalJobs });
+		if (path.startsWith("actions/runs/51/artifacts?"))
+			return JSON.stringify({ total_count: 9, artifacts: [controlArtifact, ...platforms] });
+		const item = [controlArtifact, ...platforms].find(
+			(value) => path === `actions/artifacts/${value.id}`,
+		);
+		if (item) return JSON.stringify(item);
+		return state.run(args);
+	};
+	const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+		if (String(url).endsWith("/actions/artifacts/800/zip")) {
+			init?.signal?.throwIfAborted();
+			return new Response(controlBytes, {
+				headers: { "content-length": String(controlBytes.length) },
+			});
+		}
+		if (/\/actions\/artifacts\/80[1-8]\/zip$/.test(String(url)))
+			throw new Error("Publisher must not download original large platform archives");
+		return state.fetch(url, init);
+	}) as typeof globalThis.fetch;
+	return { state, originalPlan, originalJobs, options: { ...options(state), run, fetch } };
+}
+
+describe("publication proof for re-verified original builds", () => {
+	test("a later publisher restores a fully re-verified bundle without rerunning original tests or downloading original binaries", async () => {
+		const f = reverifiedFixture();
+		const restored = await restoreCiReleaseBundle(f.options);
+		expect(restored.plan.buildSource).toEqual(f.state.manifest.plan.buildSource);
+		expect(restored.plan.runId).toBe(101);
+		expect(restored.plan.buildSource?.runId).toBe(51);
+		for (const file of f.state.manifest.files)
+			expect(readFileSync(join(restored.destination, "dist", file.name))).toEqual(
+				readFileSync(join(f.state.bundle, "dist", file.name)),
+			);
+	});
+
+	for (const name of [
+		"Release preflight",
+		"Restore original platform (windows-arm64)",
+		"Smoke (windows-x64)",
+		"Assemble release bundle",
+	])
+		test(`refuses incomplete re-verification proof: ${name}`, async () => {
+			const f = reverifiedFixture();
+			const job = f.state.jobs.find((job) => job.name === name);
+			if (!job) throw new Error("Missing fixture job");
+			job.conclusion = "skipped";
+			await expect(restoreCiReleaseBundle(f.options)).rejects.toThrow("Source job");
+			expect(f.state.downloads).toBe(0);
+		});
+
+	test("requires original successful source tests even though every re-verification job succeeded", async () => {
+		const f = reverifiedFixture();
+		const job = f.originalJobs.find((job) => job.name.includes("Tests (2/4)"));
+		if (!job) throw new Error("Missing fixture test shard");
+		job.conclusion = "failure";
+		await expect(restoreCiReleaseBundle(f.options)).rejects.toThrow("Original source job");
+		expect(existsSync(f.options.destination)).toBe(false);
+	});
+
+	test("rejects re-verification jobs attached to a manifest that omits original build provenance", async () => {
+		const f = reverifiedFixture();
+		delete f.state.manifest.plan.buildSource;
+		f.state.repack();
+		await expect(restoreCiReleaseBundle(f.options)).rejects.toThrow("source CI and build proof");
+	});
+
+	test("rejects single-platform provenance despite unrelated all-eight successful job names", async () => {
+		const f = reverifiedFixture();
+		const source = f.state.manifest.plan.buildSource;
+		if (!source) throw new Error("Missing fixture build origin");
+		source.platforms = source.platforms.slice(0, 1);
+		f.state.repack();
+		await expect(restoreCiReleaseBundle(f.options)).rejects.toThrow("complete native proof");
 	});
 });
