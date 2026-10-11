@@ -67,7 +67,42 @@ jobs:
       - name: Check TypeScript
         run: bunx tsgo --noEmit
 
+      - name: Verify Windows scratch volumes
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($path in @($env:TEMP, $env:RUNNER_TEMP)) {
+            $volume = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($path))
+            if ($volume.DriveFormat -ne 'NTFS' -or $volume.DriveType -ne 'Fixed') {
+              throw "File revert scratch must remain on a fixed NTFS volume: $path"
+            }
+            [pscustomobject]@{ Path = $path; Volume = $volume.Name; FileSystem = $volume.DriveFormat; DriveType = $volume.DriveType.ToString() } | ConvertTo-Json -Compress
+          }
+
+      # Keep the default profile-temp canonicalization/alias coverage separate.
+      - name: Check profile temp path isolation
+        if: runner.os == 'Windows'
+        run: >-
+          bun test --isolate
+          ./tests/preload-isolation.test.ts
+          ./server/lib/agent/execution/__tests__/local-backend-read.test.ts
+
+      - name: Record file revert scratch location
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: >-
+          bun -e 'import { tmpdir } from "node:os"; import { realpath, statfs } from "node:fs/promises";
+          const path = await realpath(tmpdir()); const volume = await statfs(path);
+          console.log(JSON.stringify({ platform: process.platform, scratch: path, filesystemType: volume.type }));'
+
       - name: Run file revert tests
+        # Use runner-owned scratch; do not change IO, fsync, test selection or deadlines.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: >-
           bun test --isolate
           ./server/services/file-change-platform-capability.test.ts

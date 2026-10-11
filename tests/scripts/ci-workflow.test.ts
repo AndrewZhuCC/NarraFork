@@ -182,6 +182,62 @@ describe("generic CI workflow", () => {
 		}
 	});
 
+	test("file revert keeps profile aliases covered and uses runner-owned scratch without relaxed tests", () => {
+		const workflow = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/file-revert-cross-platform.yml"), "utf8"),
+		) as Workflow;
+		const fileRevert = workflow.jobs["file-revert"];
+		const steps = fileRevert.steps;
+		const volumes = steps.find((step) => step.name === "Verify Windows scratch volumes");
+		const profile = steps.find((step) => step.name === "Check profile temp path isolation");
+		const record = steps.find((step) => step.name === "Record file revert scratch location");
+		const tests = steps.find((step) => step.name === "Run file revert tests");
+		if (!volumes || !profile || !record || !tests)
+			throw new Error("Missing file revert scratch checks");
+		expect(volumes.if).toBe("runner.os == 'Windows'");
+		expect(volumes.run).toContain("$env:TEMP, $env:RUNNER_TEMP");
+		expect(volumes.run).toContain("$volume.DriveFormat -ne 'NTFS'");
+		expect(volumes.run).toContain("$volume.DriveType -ne 'Fixed'");
+		expect(profile.if).toBe("runner.os == 'Windows'");
+		expect(record.if).toBeUndefined();
+		expect(tests.if).toBeUndefined();
+		expect(profile.run?.trim().split(/\s+/)).toEqual([
+			"bun",
+			"test",
+			"--isolate",
+			"./tests/preload-isolation.test.ts",
+			"./server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+		]);
+		for (const key of ["TEMP", "TMP", "TMPDIR", "NARRAFORK_HOME"])
+			expect(profile.env?.[key] ?? fileRevert.env?.[key] ?? workflow.env?.[key]).toBeUndefined();
+		const scratch = {
+			TEMP: "${{ runner.temp }}",
+			TMP: "${{ runner.temp }}",
+			TMPDIR: "${{ runner.temp }}",
+		};
+		expect(record.env).toEqual(scratch);
+		expect(tests.env).toEqual(scratch);
+		expect(record.run).toContain("statfs(path)");
+		expect(tests.run?.trim().split(/\s+/)).toEqual([
+			"bun",
+			"test",
+			"--isolate",
+			"./server/services/file-change-platform-capability.test.ts",
+			"./server/services/file-change-local-restore.test.ts",
+			"./server/services/file-change-runtime.test.ts",
+			"./server/services/revert-transaction-service.test.ts",
+			"./server/services/revert-planner-local-access.test.ts",
+			"./server/services/revert-mutation-journal.test.ts",
+			"./server/services/narrator-scoped-revert.test.ts",
+			"./server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts",
+		]);
+		expect(steps.indexOf(volumes)).toBeLessThan(steps.indexOf(profile));
+		expect(steps.indexOf(profile)).toBeLessThan(steps.indexOf(record));
+		expect(steps.indexOf(record)).toBeLessThan(steps.indexOf(tests));
+		for (const step of [volumes, profile, record, tests])
+			expect(step["continue-on-error"]).toBeUndefined();
+	});
+
 	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
 		let checked = 0;
 		for (const name of [
