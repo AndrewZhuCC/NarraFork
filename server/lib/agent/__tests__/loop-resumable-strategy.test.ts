@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { ProviderInvalidStateError } from "../error-handling";
 import type { ParsedStreamEvent, ProviderAdapter } from "../provider";
 import type { AgentConfig, AgentEvent, ApiRequestDiagnostics } from "../types";
 
@@ -10,7 +11,9 @@ import type { AgentConfig, AgentEvent, ApiRequestDiagnostics } from "../types";
  *  - visible answer text   → flush it and let the caller append a continuation
  *  - half-written tool input → finish the turn and inject the skeleton-first
  *                            reminder; replaying would hit the same size ceiling
- *  - only reasoning        → drop the truncated reasoning and replay the request
+ *  - only reasoning        → drop the truncated reasoning and hand off for a
+ *                            continuation pass (the next request is assembled
+ *                            from the latest state, without it)
  *
  * These tests drive the loop through a scripted provider adapter so each shape
  * can be produced exactly, including a tool call whose input was cut off.
@@ -44,6 +47,11 @@ let attemptCount = 0;
 /** `content` (the user-side turn text) seen by each provider.chat() call, in order. */
 let sentContents: string[] = [];
 
+/** Sentinel entry: makes the scripted provider throw mid-stream instead of yielding. */
+function throwMarker(err: unknown): ParsedStreamEvent {
+	return { __throw: err } as unknown as ParsedStreamEvent;
+}
+
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
@@ -54,6 +62,8 @@ const testProvider: ProviderAdapter = {
 		const script = attempts[attemptCount++];
 		if (!script) throw new Error(`Unexpected provider.chat() call ${attemptCount}`);
 		for (const event of script) {
+			const marker = event as unknown as { __throw?: unknown };
+			if (marker.__throw !== undefined) throw marker.__throw;
 			yield event;
 		}
 	},
@@ -141,47 +151,41 @@ afterAll(() => {
 	mock.restore();
 });
 
-describe("resumable interruption: reasoning-only → drop and replay the request", () => {
-	test("discards truncated reasoning, emits stream_reset + retrying, and replays in place", async () => {
+describe("resumable interruption: reasoning-only → discard and hand off for continuation", () => {
+	test("discards truncated reasoning, emits stream_reset, and yields resumable_error instead of replaying", async () => {
 		const events = await runLoop([
 			[{ reasoning: "half a thought before the stream br" }, resumableErrorEvent()],
 			[{ text: "recovered answer" }],
 		]);
 
-		// The request was replayed rather than continued from a truncated thought.
-		expect(providerCalls()).toBe(2);
-		// Not surfaced as a resumable continuation nor as a terminal failure.
-		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
+		// No in-place replay: the pass ends and the caller assembles the next
+		// request from the latest state (which no longer contains the reasoning).
+		expect(providerCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
 		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
 		// The frontend is told to drop the live reasoning it was showing.
 		expect(events.some((event) => event.type === "stream_reset")).toBe(true);
-		expect(events.find((event) => event.type === "retrying")).toMatchObject({
-			type: "retrying",
-			message: RESUMABLE_MESSAGE,
-			attempt: 1,
-		});
 		// The truncated reasoning must NOT be persisted as a block.
 		const reasoningBlocks = events.filter(
 			(event) => event.type === "block_complete" && event.block.type === "reasoning",
 		);
 		expect(reasoningBlocks).toHaveLength(0);
-		// The replay produced the real answer.
-		expect(events.find((event) => event.type === "assistant_message")).toMatchObject({
-			type: "assistant_message",
-			text: "recovered answer",
+		// The handoff is a resumable continuation, not a terminal failure.
+		expect(events.at(-1)).toMatchObject({
+			type: "resumable_error",
+			message: RESUMABLE_MESSAGE,
+			diagnostics: { resumable: true, retryable: false },
 		});
-		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
-	test("falls back to a textual continuation when the replay budget is spent", async () => {
+	test("the continuation handoff does not consult the transient retry budget", async () => {
 		const events = await runLoop([[{ reasoning: "truncated thought" }, resumableErrorEvent()]], {
 			overrides: { maxTransientRetries: 0 },
 		});
 
-		// No replay attempted.
+		// Same outcome with a zero budget: the handoff is not a retry.
 		expect(providerCalls()).toBe(1);
 		expect(events.some((event) => event.type === "retrying")).toBe(false);
-		// Degrades to a resumable continuation, NOT a hard failure.
 		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
 		expect(events.at(-1)).toMatchObject({
 			type: "resumable_error",
@@ -255,8 +259,8 @@ describe("resumable interruption: complete tool call → run the tool and contin
 		);
 
 		expect(providerCalls()).toBe(1);
-		// A complete tool call outranks the reasoning-only replay path: nothing is
-		// discarded and no request is replayed, because the tool may have side effects.
+		// A complete tool call outranks the reasoning-only discard path: nothing is
+		// discarded and the turn finishes normally, because the tool may have side effects.
 		expect(events.some((event) => event.type === "stream_reset")).toBe(false);
 		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
 		expect(events.find((event) => event.type === "resumable_recovered")).toMatchObject({
@@ -334,6 +338,44 @@ describe("resumable interruption: truncated tool input → skeleton-first remind
 		expect(events.find((event) => event.type === "tool_use_discarded")).toMatchObject({
 			type: "tool_use_discarded",
 			toolUseIds: ["tu_ghost"],
+		});
+	});
+});
+
+describe("resumable interruption: thrown provider error (no SSE error event)", () => {
+	// The two resumable branches (invalidState event vs thrown error) are mirrored
+	// copies in the loop. These tests pin the thrown-error path: a provider that
+	// throws a resumable ProviderInvalidStateError must get the same handoff.
+	test("thrown resumable error after partial text flushes and hands off via resumable_error", async () => {
+		const thrown = new ProviderInvalidStateError("stream_read_error", RESUMABLE_MESSAGE, {
+			diagnostics: RESUMABLE_DIAGNOSTICS,
+		});
+		const events = await runLoop([[{ text: "partial before throw" }, throwMarker(thrown)]]);
+
+		expect(providerCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(
+			events.find((event) => event.type === "block_complete" && event.block.type === "text"),
+		).toMatchObject({ block: { type: "text", text: "partial before throw" } });
+		expect(events.at(-1)).toMatchObject({
+			type: "resumable_error",
+			diagnostics: { resumable: true },
+		});
+	});
+
+	test("thrown resumable error with no local output still hands off instead of failing", async () => {
+		const thrown = new ProviderInvalidStateError("stream_read_error", RESUMABLE_MESSAGE, {
+			diagnostics: RESUMABLE_DIAGNOSTICS,
+		});
+		const events = await runLoop([[throwMarker(thrown)]]);
+
+		expect(providerCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(events.at(-1)).toMatchObject({
+			type: "resumable_error",
+			diagnostics: { resumable: true },
 		});
 	});
 });

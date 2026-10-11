@@ -118,7 +118,9 @@ call——JSON.parse 直接失败，且这个失败离真正的原因已经很�
 和上游那句"请新建连接继续"的指示恰好相反。
 
 `resumable` 字段区分两种恢复语义：已经有输出流给调用方时（调用方已持久化该部分轮次）
-重发会重复输出，必须由 agent loop 从部分轮次续跑；没有输出时才可以整体重放。
+重发会重复输出，必须由 agent loop 从部分轮次续跑；没有输出时也**不是**整体重放——
+loop 统一结束当前 pass，由调用方按最新状态重新组装下一趟请求（`resumable_error` 续跑），
+半截 reasoning 会先丢弃再交接。
 
 对应地，`codex-provider.ts` 收到这个类型会**原样抛出**，不走 failover 分支——那条路会
 `reportFailure()` 惩罚一个完全健康的 credential，累积到 `too_many_failures` 甚至把它禁用。

@@ -4061,10 +4061,9 @@ async function* agentLoopInMetadataSnapshot(
 			/**
 			 * Whether this attempt has produced any client-visible, persistable
 			 * content so far (text/tool calls/reasoning/web search/image
-			 * generation). Used both by the empty-response guard below and by the
-			 * resumable-error path: a "resumable" error is only meaningful when
-			 * there is actually partial output to continue from — otherwise it
-			 * degrades to an ordinary retryable/non-retryable error.
+			 * generation). Used by the empty-response guard below and by
+			 * canReplayMalformedRequest; the resumable strategy classification
+			 * inspects the same accumulators directly.
 			 */
 			/**
 			 * Names of tool calls the model had STARTED writing arguments for when the
@@ -4129,10 +4128,11 @@ async function* agentLoopInMetadataSnapshot(
 
 			/**
 			 * Pick the recovery strategy for a resumable interruption (a transient
-			 * upstream failure that hit AFTER partial output was already produced,
-			 * e.g. the NUG gateway reporting `diagnostics.resumable`).
+			 * upstream failure reported via `diagnostics.resumable`).
 			 *
-			 * The right recovery depends on what the partial output actually is:
+			 * Recovery is NEVER an in-place replay of the identical request: the pass
+			 * ends and the caller assembles the next request from the LATEST state.
+			 * What that means depends on what the partial output actually is:
 			 * - `tool_continuation`: at least one complete tool call landed. Highest
 			 *   priority because tool calls may already have side effects; the model
 			 *   must see their results. The turn finishes normally (tools execute,
@@ -4148,18 +4148,22 @@ async function* agentLoopInMetadataSnapshot(
 			 *   truncation until the retry budget dies. Finish the turn through the
 			 *   normal path instead, where the orphaned-tool detector injects the
 			 *   skeleton-first reminder and the model can switch to smaller calls.
-			 * - `reasoning_only_retry`: only reasoning exists. Nothing client-facing was
-			 *   committed and no side effect occurred, so the safest recovery is to DROP
-			 *   the partial reasoning and re-send the identical request in place. Keeping
-			 *   truncated reasoning would pollute the history and degrade the continuation.
-			 * - `none`: nothing to resume from; fall through to ordinary
-			 *   retryable/terminal error handling.
+			 * - `reasoning_only`: only reasoning exists. The truncated thought must not
+			 *   enter history (for stateful providers an incomplete reasoning item is
+			 *   not even replayable upstream), so it is discarded and the pass ends;
+			 *   the continuation request is then assembled from the latest state,
+			 *   which no longer contains it.
+			 * - `none`: nothing landed locally at all (the gateway's "forwarded"
+			 *   notion is broader than ours — lifecycle frames count there but leave
+			 *   nothing persistable here). Still hand off for a continuation pass:
+			 *   the reassembled request carries the latest state, and the alternative
+			 *   is dying on a transient transport fault.
 			 */
 			const classifyResumeStrategy = ():
 				| "tool_continuation"
 				| "text_continuation"
 				| "truncated_tool_input"
-				| "reasoning_only_retry"
+				| "reasoning_only"
 				| "none" => {
 				if (toolUses.length > 0) return "tool_continuation";
 				if (
@@ -4172,33 +4176,9 @@ async function* agentLoopInMetadataSnapshot(
 				// Ranked above reasoning: a model that thinks and THEN gets cut off writing
 				// a tool call must be told to write smaller calls, not asked to try again.
 				if (orphanedToolInputNames().length > 0) return "truncated_tool_input";
-				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only_retry";
+				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only";
 				return "none";
 			};
-
-			/**
-			 * Whether a "resumable" failure can simply be replayed in place because
-			 * nothing landed on our side.
-			 *
-			 * A gateway sets `resumable` once it has forwarded client-visible SSE
-			 * payload — that is why it simultaneously refuses a wholesale retry
-			 * (`retryable: false`): replaying could duplicate visible output or tool
-			 * side effects. But its notion of "client-visible" is broader than ours:
-			 * queue notices, a `toolUseChunk` carrying only an id, and other non-content
-			 * events count as forwarded upstream while leaving nothing persistable here.
-			 *
-			 * When that happens the turn is stuck between both recovery paths: there is
-			 * nothing to continue from (so no continuation prompt makes sense) and the
-			 * error is flagged non-retryable (so the turn dies as a hard failure) even
-			 * though the local state is indistinguishable from "the request never
-			 * produced anything". Since no visible content and no tool side effect
-			 * exists locally, replaying the identical request is safe and is the only
-			 * recovery that does not surface a hard failure for a transient transport
-			 * fault. The replay reuses the ordinary transient-retry budget and backoff,
-			 * so this cannot loop unbounded.
-			 */
-			const canReplayResumableInPlace = (resumable: boolean): boolean =>
-				resumable && !hasAnyPersistableOutput() && !hasStartedEarlyToolExecution();
 
 			/**
 			 * Replays granted to an upstream "malformed request body" rejection.
@@ -5553,57 +5533,16 @@ async function* agentLoopInMetadataSnapshot(
 									return;
 								}
 							}
-							// Resumable but nothing landed locally: the gateway counted some
-							// non-content event as forwarded payload, so it refuses a wholesale
-							// retry, yet we have no visible output and no tool side effect to
-							// resume from. Replay the identical request instead of dying on a
-							// transient transport fault. See canReplayResumableInPlace.
-							if (canReplayResumableInPlace(classification.resumable)) {
-								if (
-									(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-									!config.signal.aborted
-								) {
-									chatRetryCount++;
-									lastRetryErrorMessage = message;
-									lastRetryDiagnostics = requestDiagnostics;
-									const delayMs = Math.min(
-										TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-										backoffCeil,
-									);
-									logger.warn("Resumable stream interruption with no local output, replaying", {
-										narratorId: config.narratorId,
-										provider: effectiveProvider,
-										model: effectiveModel,
-										requestId,
-										reason,
-										attempt: chatRetryCount,
-										maxRetries: getMaxChatRetries(),
-									});
-									yield {
-										type: "retrying",
-										message,
-										attempt: chatRetryCount,
-										maxRetries: getMaxChatRetries(),
-										delayMs,
-										diagnostics: requestDiagnostics,
-									};
-									yield* abandonAttemptForReplay(message);
-									await abortableSleep(delayMs, config.signal);
-									if (config.signal.aborted) {
-										yield { type: "error", message: "Aborted" };
-										return;
-									}
-									continue chatRetryLoop;
-								}
-								// Replay budget spent (or a stateful provider that cannot replay):
-								// fall through to the ordinary terminal handling below.
-							}
-							// Resumable: a transient failure occurred after client-visible partial
-							// output was already produced this attempt (NUG/gateway told us so via
-							// diagnostics.resumable). Retrying the whole request wholesale could
-							// repeat visible output, so recover according to what the partial output
-							// actually is (see classifyResumeStrategy).
-							if (classification.resumable && hasAnyPersistableOutput()) {
+							// Resumable: a transient failure the gateway flagged as safe to
+							// continue from (diagnostics.resumable). Recovery is NEVER an
+							// in-place replay of the identical request — the pass ends here and
+							// the caller assembles the next request from the LATEST state (per
+							// classifyResumeStrategy). This also covers "nothing landed
+							// locally": the gateway's notion of forwarded payload is broader
+							// than ours (lifecycle frames count there but persist nothing
+							// here), and a freshly assembled continuation request is the only
+							// recovery that cannot duplicate visible output.
+							if (classification.resumable) {
 								const strategy = classifyResumeStrategy();
 								if (strategy === "tool_continuation") {
 									// A complete tool call landed before the stream broke. Finish the
@@ -5654,48 +5593,25 @@ async function* agentLoopInMetadataSnapshot(
 									};
 									break;
 								}
-								if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
-									// Only reasoning was produced. Drop it and re-send the identical
-									// request instead of continuing from a truncated thought.
-									if (
-										(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-										!config.signal.aborted
-									) {
-										chatRetryCount++;
-										lastRetryErrorMessage = message;
-										lastRetryDiagnostics = requestDiagnostics;
-										const delayMs = Math.min(
-											TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-											backoffCeil,
-										);
-										logger.warn("Resumable stream interruption with reasoning only, retrying", {
-											narratorId: config.narratorId,
-											provider: effectiveProvider,
-											model: effectiveModel,
-											requestId,
-											reason,
-											attempt: chatRetryCount,
-											maxRetries: getMaxChatRetries(),
-										});
-										yield* discardReasoningOnlyPartialOutput();
-										yield {
-											type: "retrying",
-											message,
-											attempt: chatRetryCount,
-											maxRetries: getMaxChatRetries(),
-											delayMs,
-											diagnostics: requestDiagnostics,
-										};
-										yield* abandonAttemptForReplay(message);
-										await abortableSleep(delayMs, config.signal);
-										if (config.signal.aborted) {
-											yield { type: "error", message: "Aborted" };
-											return;
-										}
-										continue chatRetryLoop;
-									}
-									// Retry budget spent (or a stateful provider that cannot replay the
-									// request): fall back to a textual continuation rather than failing.
+								if (strategy === "reasoning_only") {
+									// Only truncated reasoning was produced. Drop it so the
+									// half-written thought never enters history (for stateful
+									// providers an incomplete reasoning item is not even
+									// replayable upstream), then hand off below: the
+									// continuation pass reassembles the request without it.
+									logger.warn("Resumable stream interruption with reasoning only, discarding", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+									});
+									yield* discardReasoningOnlyPartialOutput();
+									// Reasoning lane blocks persist as they stream, so memory-only
+									// cleanup is not enough: retract whatever this attempt already
+									// wrote, or the continuation pass would rebuild history WITH
+									// the truncated thought we just discarded.
+									yield* discardAttemptPersistence();
 								}
 								yield* outputContent.flush();
 								yield* finishRequest(message);
@@ -6154,52 +6070,12 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "context_length_exceeded", message: msg };
 						return;
 					}
-					// Resumable but nothing landed locally — replay the identical request
-					// rather than failing the turn. See canReplayResumableInPlace and the
-					// matching invalidState branch above.
-					if (canReplayResumableInPlace(isResumableError(err))) {
-						if (
-							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-							!config.signal.aborted
-						) {
-							chatRetryCount++;
-							lastRetryErrorMessage = msg;
-							lastRetryDiagnostics = requestDiagnostics;
-							const delayMs = Math.min(
-								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-								backoffCeil,
-							);
-							logger.warn("Resumable stream interruption with no local output, replaying", {
-								narratorId: config.narratorId,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								requestId,
-								attempt: chatRetryCount,
-								maxRetries: getMaxChatRetries(),
-							});
-							yield {
-								type: "retrying",
-								message: msg,
-								attempt: chatRetryCount,
-								maxRetries: getMaxChatRetries(),
-								delayMs,
-								diagnostics: requestDiagnostics,
-							};
-							yield* abandonAttemptForReplay(msg);
-							await abortableSleep(delayMs, config.signal);
-							if (config.signal.aborted) {
-								yield { type: "error", message: "Aborted" };
-								return;
-							}
-							continue; // retry provider.chat() with the identical request
-						}
-						// Replay budget spent (or a stateful provider that cannot replay):
-						// fall through to the ordinary handling below.
-					}
-					// Resumable: a transient failure occurred after client-visible partial
-					// output was already produced this attempt. See the matching invalidState
-					// branch above for the full rationale and the per-strategy recovery.
-					if (isResumableError(err) && hasAnyPersistableOutput()) {
+					// Resumable: a transient failure the gateway flagged as safe to
+					// continue from. Never replay the request in place — the pass ends
+					// here and the caller assembles the next request from the latest
+					// state. See the matching invalidState branch above for the full
+					// rationale and the per-strategy recovery.
+					if (isResumableError(err)) {
 						const strategy = classifyResumeStrategy();
 						if (strategy === "tool_continuation") {
 							logger.warn("Resumable stream interruption after a complete tool call", {
@@ -6241,45 +6117,23 @@ async function* agentLoopInMetadataSnapshot(
 							};
 							break;
 						}
-						if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
-							if (
-								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-								!config.signal.aborted
-							) {
-								chatRetryCount++;
-								lastRetryErrorMessage = msg;
-								lastRetryDiagnostics = requestDiagnostics;
-								const delayMs = Math.min(
-									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-									backoffCeil,
-								);
-								logger.warn("Resumable stream interruption with reasoning only, retrying", {
-									narratorId: config.narratorId,
-									provider: effectiveProvider,
-									model: effectiveModel,
-									requestId,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-								});
-								yield* discardReasoningOnlyPartialOutput();
-								yield {
-									type: "retrying",
-									message: msg,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-									delayMs,
-									diagnostics: requestDiagnostics,
-								};
-								yield* abandonAttemptForReplay(msg);
-								await abortableSleep(delayMs, config.signal);
-								if (config.signal.aborted) {
-									yield { type: "error", message: "Aborted" };
-									return;
-								}
-								continue; // retry provider.chat() with the identical request
-							}
-							// Retry budget spent (or a stateful provider that cannot replay the
-							// request): fall back to a textual continuation rather than failing.
+						if (strategy === "reasoning_only") {
+							// Only truncated reasoning was produced. Drop it so the
+							// half-written thought never enters history, then hand off
+							// below: the continuation pass reassembles the request
+							// without it.
+							logger.warn("Resumable stream interruption with reasoning only, discarding", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+							});
+							yield* discardReasoningOnlyPartialOutput();
+							// Reasoning lane blocks persist as they stream, so memory-only
+							// cleanup is not enough: retract whatever this attempt already
+							// wrote, or the continuation pass would rebuild history WITH
+							// the truncated thought we just discarded.
+							yield* discardAttemptPersistence();
 						}
 						yield* outputContent.flush();
 						yield* finishRequest(msg);
