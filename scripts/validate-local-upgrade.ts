@@ -14,6 +14,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0015_nifty_magma",
 	"0016_high_shiva",
 	"0017_merge_opensource_083",
+	"0018_merge_upstream_090",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -21,8 +22,10 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0015_nifty_magma",
 	"0016_high_shiva",
 	"0017_merge_opensource_083",
+	"0018_merge_upstream_090",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
 const MERGE_083_NEW_TABLES = [
 	"narrator_context_char_pages",
 	"narrator_question_events",
@@ -166,6 +169,15 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0018_merge_upstream_090") {
+		return {
+			background_tasks: tableDigest(
+				db,
+				"background_tasks",
+				excludeNew ? new Set(["background_kind"]) : new Set(),
+			),
+		};
+	}
 	if (targetTag === "0017_merge_opensource_083") {
 		return Object.fromEntries(
 			Object.entries(MERGE_083_ADDED_COLUMNS).map(([table, added]) => [
@@ -287,6 +299,14 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0018_merge_upstream_090") {
+		for (const table of MERGE_090_NEW_TABLES) shape[table] = tableSchemaShape(db, table);
+		shape["background_tasks.background_kind"] = columnShape(
+			db,
+			"background_tasks",
+			"background_kind",
+		);
+	}
 	if (targetTag === "0017_merge_opensource_083") {
 		for (const table of [
 			...MERGE_083_NEW_TABLES,
@@ -423,7 +443,11 @@ async function main() {
 			pending.length === 2 &&
 			pending[0].tag === "0016_high_shiva" &&
 			target?.tag === "0017_merge_opensource_083";
-		if ((!merge083Pair && pending.length !== 1) || !target?.tag || !ALLOWED_TARGET_TAGS.has(target.tag)) {
+		if (
+			(!merge083Pair && pending.length !== 1) ||
+			!target?.tag ||
+			!ALLOWED_TARGET_TAGS.has(target.tag)
+		) {
 			throw new Error("Validation requires an allowed single migration or the 0016 + 0017 pair");
 		}
 		const affectedForUpgrade = (excludeNew: boolean) => ({
@@ -453,7 +477,9 @@ async function main() {
 						? ["notifications", "user_usage_totals", "workspace_execution_owners"]
 						: target.tag === "0017_merge_opensource_083"
 							? MERGE_083_NEW_TABLES
-							: [];
+							: target.tag === "0018_merge_upstream_090"
+								? MERGE_090_NEW_TABLES
+								: [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");

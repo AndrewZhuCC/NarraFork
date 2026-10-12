@@ -273,7 +273,11 @@ describe("validate-local-upgrade", () => {
 	}, 300_000);
 
 	async function validateTailMigration(
-		targetTag: "0015_nifty_magma" | "0016_high_shiva" | "0017_merge_opensource_083",
+		targetTag:
+			| "0015_nifty_magma"
+			| "0016_high_shiva"
+			| "0017_merge_opensource_083"
+			| "0018_merge_upstream_090",
 	) {
 		const root = mkdtempSync(join(tmpdir(), `nf-local-upgrade-${targetTag.slice(0, 4)}-`));
 		try {
@@ -333,6 +337,29 @@ describe("validate-local-upgrade", () => {
 							unknown
 						>)
 					: undefined;
+			if (targetTag === "0018_merge_upstream_090") {
+				db.run(
+					"INSERT INTO background_tasks (id, parent_narrator_id, type, status, command, output, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					[
+						"background-0018",
+						narratorId,
+						"bash",
+						"completed",
+						"git status",
+						"keep output",
+						"2026-10-12T00:00:00Z",
+						"2026-10-12T00:00:00Z",
+						"2026-10-12T00:00:01Z",
+					],
+				);
+			}
+			const beforeBackground =
+				targetTag === "0018_merge_upstream_090"
+					? (db.query("SELECT * FROM background_tasks WHERE id='background-0018'").get() as Record<
+							string,
+							unknown
+						>)
+					: undefined;
 			db.close();
 
 			journal.entries.push(target);
@@ -345,7 +372,12 @@ describe("validate-local-upgrade", () => {
 			const originalHash = sha256(original);
 			const sourceHash = "1".repeat(64);
 			const commit = "a".repeat(40);
-			const version = targetTag === "0017_merge_opensource_083" ? "0.8.3" : "0.7.9";
+			const version =
+				targetTag === "0018_merge_upstream_090"
+					? "0.9.0"
+					: targetTag === "0017_merge_opensource_083"
+						? "0.8.3"
+						: "0.7.9";
 			const child = Bun.spawnSync({
 				cmd: [
 					process.execPath,
@@ -419,6 +451,19 @@ describe("validate-local-upgrade", () => {
 						upgraded.query("SELECT * FROM narrator_message_refs WHERE id='ref-0016'").get(),
 					).toEqual(beforeRef);
 				} else {
+					if (targetTag === "0018_merge_upstream_090") {
+						expect(
+							upgraded.query("SELECT * FROM background_tasks WHERE id='background-0018'").get(),
+						).toEqual({
+							...beforeBackground,
+							background_kind: "task",
+						});
+						for (const table of ["user_git_identities", "narrator_git_identity_bindings"]) {
+							expect(upgraded.query(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({
+								count: 0,
+							});
+						}
+					}
 					if (targetTag === "0017_merge_opensource_083") {
 						expect(
 							upgraded.query("SELECT * FROM terminals WHERE id='terminal-0017'").get(),
@@ -458,6 +503,11 @@ describe("validate-local-upgrade", () => {
 	test(
 		"validates migration 0017 while preserving rebuilt tables and existing data",
 		() => validateTailMigration("0017_merge_opensource_083"),
+		300_000,
+	);
+	test(
+		"validates migration 0018 while preserving background tasks and adding Git identities",
+		() => validateTailMigration("0018_merge_upstream_090"),
 		300_000,
 	);
 });
