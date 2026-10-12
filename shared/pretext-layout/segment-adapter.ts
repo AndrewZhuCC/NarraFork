@@ -431,7 +431,21 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 	// field is present on the item and never looked at, so a running transfer
 	// renders with no bar.
 	const liveProgress = (tc as { _structuredProgress?: unknown })._structuredProgress;
-	if (liveOutput === undefined && liveProgress === undefined) return persisted;
+	// The running Await's resolved target id + session title also live on the call
+	// record (the message loader's `_awaitAgentNarratorId` patch and the
+	// `await_agent_resolved` frame). Lifting them here lets classifyAwait draw the
+	// identity row and headline the title while the wait is still in flight. The
+	// row's arrival mid-wait is an intentional grow (it replaced the old badge
+	// row), keyed by the meta-rows component in `leafTextRevision`.
+	const awaitAgentId = (tc as { _awaitAgentNarratorId?: unknown })._awaitAgentNarratorId;
+	const awaitAgentTitle = (tc as { _awaitAgentTitle?: unknown })._awaitAgentTitle;
+	if (
+		liveOutput === undefined &&
+		liveProgress === undefined &&
+		awaitAgentId === undefined &&
+		awaitAgentTitle === undefined
+	)
+		return persisted;
 	const base = persisted && typeof persisted === "object" ? (persisted as object) : {};
 	const out: Record<string, unknown> = { ...base };
 	if (
@@ -445,6 +459,18 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 		(base as { _structuredProgress?: unknown })._structuredProgress === undefined
 	) {
 		out._structuredProgress = liveProgress;
+	}
+	if (
+		typeof awaitAgentId === "string" &&
+		(base as { _awaitAgentNarratorId?: unknown })._awaitAgentNarratorId === undefined
+	) {
+		out._awaitAgentNarratorId = awaitAgentId;
+	}
+	if (
+		typeof awaitAgentTitle === "string" &&
+		(base as { _awaitAgentTitle?: unknown })._awaitAgentTitle === undefined
+	) {
+		out._awaitAgentTitle = awaitAgentTitle;
 	}
 	return out;
 }

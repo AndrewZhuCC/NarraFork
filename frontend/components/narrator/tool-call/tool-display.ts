@@ -615,12 +615,19 @@ export function getSummary(
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";
-			// Prefer the server-resolved alias; a bare nanoid selector is truncated.
+			// Prefer the session TITLE (what the child's own tab shows) over the slug:
+			// `targetTitle` lands with the tool's returned metadata, while
+			// `_awaitAgentTitle` is the live transport field for a wait in flight.
+			// A bare nanoid selector is truncated.
+			const title =
+				extractField(metadata, "targetTitle") || extractField(metadata, "_awaitAgentTitle");
 			const id =
+				(title ? short(title, 60) : "") ||
 				agentTargetDisplay(
 					metadata?.targetLabel as string | undefined,
 					extractField(input, "id"),
-				) || "unknown";
+				) ||
+				"unknown";
 			const waitForText = extractField(input, "wait_for_text");
 			const base = waitForText
 				? `${awaitType}: ${id} · wait "${short(waitForText, 24)}"`

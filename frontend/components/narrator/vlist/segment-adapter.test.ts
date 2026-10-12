@@ -8,6 +8,7 @@ import {
 	type AdapterContentBlock,
 	type AdapterContext,
 	type AdapterSegment,
+	type AdapterToolItem,
 	adaptRenderUnits,
 	adaptSegment,
 	adaptSegments,
@@ -2093,6 +2094,44 @@ describe("adaptActivityUnit", () => {
 		const noResolver = adaptActivityUnit([toolItem("x")], "act-4", { lod: 1 });
 		expect(collapsedOf(noResolver)).toBe(false);
 	});
+
+	it("an Await row headlines the awaited session's title from the shared summary", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const { getCategory, getSummary } = await import("../tool-call/tool-display");
+		const unit = adaptActivityUnit(
+			[
+				{
+					kind: "tool",
+					tc: {
+						toolUseId: "tu-await",
+						toolName: "Await",
+						status: "running",
+						inputJson: { type: "agent", id: "worker" },
+						_awaitAgentNarratorId: "sub-live",
+						_awaitAgentTitle: "Plan story retirement",
+					} as AdapterToolItem["tc"],
+				},
+			],
+			"act-await",
+			{
+				lod: 2,
+				recentMessageIds: new Set<string>(),
+				resolveToolCategory: (name, input) => getCategory(name, input),
+				// Same bridge as PretextExactMessageList's resolveExactToolSummary: the
+				// folded row and the expanded card read the SAME summary, so the title
+				// the card headlines is the title the folded row shows.
+				resolveToolSummary: (tc) => {
+					const call = (tc ?? {}) as Record<string, unknown>;
+					return getSummary(call.toolName as string, call.inputJson, {
+						_awaitAgentTitle: call._awaitAgentTitle as string | undefined,
+					});
+				},
+			},
+		);
+		expect(unit.kind).toBe("activity-trace");
+		const items = (unit.data as { items: Array<{ title: string }> }).items;
+		expect(items[0]?.title).toBe("Await · agent: Plan story retirement");
+	});
 });
 
 /**
@@ -3270,6 +3309,38 @@ describe("adaptSegment — header timing passthrough", () => {
 	it("carries the error message so a failed card can show it", () => {
 		const d = data(bashSeg({ status: "fail", errorMessage: "exit 127" }));
 		expect(d.errorMessage).toBe("exit 127");
+	});
+
+	it("lifts the running Await's transport id/title into the identity row", () => {
+		const awaitSeg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: {
+						toolName: "Await",
+						toolUseId: "tu-1",
+						status: "running",
+						inputJson: { type: "agent", id: "worker" },
+						_awaitAgentNarratorId: "g2GQj-mTWJqSPaaAqG_Ud",
+						_awaitAgentTitle: "Plan story retirement",
+					} as AdapterToolItem["tc"],
+				},
+			],
+		};
+		const d = data(awaitSeg, { lod: 5, resolveToolCategory: () => "await" }) as {
+			detail?: { sections?: Array<{ body?: unknown }> };
+		};
+		const rows = (
+			d.detail?.sections?.find(
+				(s) => (s.body as { kind?: string } | undefined)?.kind === "meta-rows",
+			)?.body as { rows?: Array<{ identity?: string }> } | undefined
+		)?.rows;
+		// The transport title differs from the selector, so the header shows the
+		// title and the identity row carries just the id (no label was resolved).
+		expect(rows?.map((row) => row.identity)).toEqual(["g2GQj-mTWJqSPaaAqG_Ud"]);
 	});
 
 	it("falls back to the per-tool DEFAULT timeout when none is declared", () => {

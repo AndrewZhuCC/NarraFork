@@ -51,6 +51,7 @@ beforeEach(async () => {
 			variant: "subagent:general",
 			type: "subagent",
 			parentNarratorId: parent,
+			title: "Receipt child",
 			status: "idle",
 			logicalRunId: agentRun.logicalRunId,
 			createdAt: now,
@@ -352,12 +353,23 @@ test("foreground fast result carries its narrator run, and Await consumes it", a
 		getRuntimePublicationService(),
 		"consumeAwaitedTerminal",
 	).mockResolvedValue();
+	// The foreground path resolves the target row first, so both the early notice
+	// and the returned metadata carry the session title without an extra query.
+	let notifiedTitle: string | null | undefined;
 	const result = await awaitAgentResultDetailed({
 		callerNarratorId: parent,
 		id: child,
 		signal: new AbortController().signal,
+		onTargetResolved: (_id, title) => {
+			notifiedTitle = title;
+		},
 	});
-	expect(result).toMatchObject({ terminalResultReceived: true, publicationRun: agentRun });
+	expect(notifiedTitle).toBe("Receipt child");
+	expect(result).toMatchObject({
+		terminalResultReceived: true,
+		publicationRun: agentRun,
+		title: "Receipt child",
+	});
 	await awaitTool.execute({ type: "agent", id: child }, ctx());
 	expect(consume.mock.calls[0]?.[0]).toEqual(agentRun);
 });

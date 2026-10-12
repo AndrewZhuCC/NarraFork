@@ -97,6 +97,13 @@ function metaTexts(detail: ToolDetailData | null): string[] {
 		.filter((t) => t.length > 0);
 }
 
+/** Every meta row identity line, flattened (an Await card's resolved child). */
+function metaIdentities(detail: ToolDetailData | null): string[] {
+	return metaRowsOf(detail)
+		.rows.map((r) => r.identity)
+		.filter((t): t is string => typeof t === "string" && t.length > 0);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -773,7 +780,7 @@ describe("protocol receipts stay out of displayed tool output", () => {
 		expect(body.text).toContain(
 			text.includes("Still running") ? "Still running" : "# Result\nDone",
 		);
-		expect(metaTexts(d)).toContain("subagent: real-id");
+		expect(metaIdentities(d)).toEqual(["real-id"]);
 	});
 
 	it("does not strip tags quoted in reports or shell stdout", () => {
@@ -868,7 +875,7 @@ describe("classifyToolDetail — await", () => {
 		expect(body.cap).toBe("code");
 		expect(body.format).toBe("markdown");
 	});
-	it("surfaces the badge row plus waitFor / subagent rows", () => {
+	it("keeps one identity row plus the wait_for line, dropping the redundant badges", () => {
 		const d = classifyToolDetail({
 			previewId: "classifier-fixture",
 			toolName: "Await",
@@ -876,8 +883,55 @@ describe("classifyToolDetail — await", () => {
 			inputJson: { type: "agent", id: "t-9", timeout: 600000, wait_for_text: "done" },
 			metadata: { resolvedId: "n-1", status: "completed", subagentId: "sa-1" },
 		});
-		expect(metaBadgeLabels(d)).toEqual(["agent", "t-9", "→ n-1", "completed", "timeout: 10m"]);
-		expect(metaTexts(d)).toEqual(['wait_for: "done"', "subagent: sa-1"]);
+		// Type / target / status / timeout all live on the card's header line
+		// already — the old badge row repeated them, so it is gone entirely.
+		expect(metaBadgeLabels(d)).toEqual([]);
+		expect(metaIdentities(d)).toEqual(["sa-1"]);
+		expect(metaTexts(d)).toEqual(['wait_for: "done"']);
+	});
+	it("prefixes the slug on the identity row only when it differs from the title", () => {
+		const withDistinctSlug = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9" },
+			metadata: {
+				subagentId: "sa-1",
+				targetLabel: "plan-sdk-review",
+				targetTitle: "SDK review 修复方案",
+			},
+		});
+		expect(metaIdentities(withDistinctSlug)).toEqual(["plan-sdk-review · sa-1"]);
+		// A title equal to the slug (or no title at all) shows the id alone — the
+		// header already displays that same text.
+		const sameTitle = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9" },
+			metadata: { subagentId: "sa-1", targetLabel: "worker", targetTitle: "worker" },
+		});
+		expect(metaIdentities(sameTitle)).toEqual(["sa-1"]);
+		const noTitle = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9" },
+			metadata: { subagentId: "sa-1", targetLabel: "worker" },
+		});
+		expect(metaIdentities(noTitle)).toEqual(["sa-1"]);
+	});
+	it("falls back to the live transport id while the wait is running", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			status: "running",
+			inputJson: { type: "agent", id: "worker-1" },
+			outputJson: undefined,
+			metadata: { _awaitAgentNarratorId: "live-id", _awaitAgentTitle: "Worker" },
+		});
+		expect(metaIdentities(d)).toEqual(["live-id"]);
 	});
 	it("shows the awaited child's live output counter while running", () => {
 		const d = classifyToolDetail({

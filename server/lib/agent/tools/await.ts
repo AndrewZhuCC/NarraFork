@@ -147,6 +147,7 @@ export async function broadcastAwaitAgentResolved(
 	narratorId: string,
 	toolUseId: string,
 	subagentNarratorId: string,
+	subagentTitle?: string | null,
 ): Promise<void> {
 	try {
 		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
@@ -155,6 +156,7 @@ export async function broadcastAwaitAgentResolved(
 			narratorId,
 			toolUseId,
 			subagentNarratorId,
+			...(subagentTitle ? { subagentTitle } : {}),
 		});
 	} catch {
 		// Best-effort only; a reload picks the same fact up from the message loader.
@@ -307,13 +309,18 @@ export const awaitTool: ToolDefinition = {
 					// (which is what normally carries `subagentId`) only lands when it
 					// ends. Publishing the id here is what lets the card offer "open
 					// session" while the child is still working.
-					onTargetResolved: (subagentNarratorId) => {
+					onTargetResolved: (subagentNarratorId, subagentTitle) => {
 						if (!toolUseId) return;
 						// Publish the resolved target onto the registry entry too: the event
 						// handler reads it to forward the child's live output char count.
 						const entry = runningAwaits.get(toolUseId);
 						if (entry) entry.resolvedSubagentNarratorId = subagentNarratorId;
-						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
+						void broadcastAwaitAgentResolved(
+							ctx.narratorId,
+							toolUseId,
+							subagentNarratorId,
+							subagentTitle,
+						);
 					},
 				});
 				if (!combinedSignal.aborted) await consumeTerminalResult(result);
@@ -326,6 +333,8 @@ export const awaitTool: ToolDefinition = {
 						// Readable name for the header/badges; `subagentId` stays the real
 						// narrator id so the card can still open its session.
 						targetLabel: result.label,
+						// The session's display name; the card headlines this over the slug.
+						...(result.title ? { targetTitle: result.title } : {}),
 						resolvedId: result.id,
 						subagentId: result.id,
 						status: result.status,

@@ -376,6 +376,12 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseId: string;
 			subagentNarratorId: string;
+			/**
+			 * The session's display name when the resolver held the narrator row.
+			 * Lets the running card headline the title without waiting for the
+			 * tool's returned metadata.
+			 */
+			subagentTitle?: string;
 			parentToolUseId?: string;
 	  }
 	/** Navigation receipts only: queued deliveryMessageIds may not yet exist in the DB. */

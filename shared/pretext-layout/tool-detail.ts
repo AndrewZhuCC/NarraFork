@@ -445,6 +445,13 @@ export interface ToolMetaRow {
 	mono?: boolean;
 	/** Turns the text into an external link. Height-neutral. */
 	href?: string;
+	/**
+	 * Identity line (an Await card's resolved child session): one reserved row of
+	 * monospace text, drawn by the render layer with its "open session" button.
+	 * Never wraps — the content is a bounded `slug · id` pair, so a fixed-height
+	 * block keeps it out of the text measurer entirely.
+	 */
+	identity?: string;
 	/** Badge chips on this row (mode, action, size, expiry). */
 	badges?: ToolStructuredBadge[];
 	/** Interactive controls on this row (download / copy link). */
@@ -1051,6 +1058,7 @@ function metaRows(rows: Array<ToolMetaRow | null>): ToolMetaRowsDetail | null {
 		(r): r is ToolMetaRow =>
 			r !== null &&
 			(r.text.length > 0 ||
+				(r.identity?.length ?? 0) > 0 ||
 				(r.badges?.length ?? 0) > 0 ||
 				(r.actions?.length ?? 0) > 0 ||
 				r.progress != null),
@@ -2140,24 +2148,25 @@ function classifyAwait(
 	const streamPayload = readLeafText(metadata?._streamingOutput);
 	const outputIsLiveCount =
 		liveChars != null && streamPayload !== undefined && output === streamPayload;
-	// Badge row + waitFor / subagent lines (the chunked AwaitDetail header).
-	const targetId = extractField(inputJson, "id", "task_id", "taskId");
+	// Identity row (the ONLY meta row an agent wait keeps): the resolved child
+	// narrator id in copyable monospace. The badge row it replaces repeated the
+	// type, target, status and timeout — every one of them already on the header
+	// line — and Mantine's uppercase badge text corrupted the mixed-case id.
 	const resolvedId = metadata ? readLeafText(metadata.resolvedId) : undefined;
-	const awaitStatus = metadata ? readLeafText(metadata.status) : undefined;
 	const subagentId = metadata ? readLeafText(metadata.subagentId) : undefined;
+	const transportId = metadata ? readLeafText(metadata._awaitAgentNarratorId) : undefined;
+	const title = metadata
+		? (readLeafText(metadata.targetTitle) ?? readLeafText(metadata._awaitAgentTitle))
+		: undefined;
+	const label = metadata ? readLeafText(metadata.targetLabel) : undefined;
+	// The slug joins only when it says something the header does not: the header
+	// already headlines the title (or the slug itself when no title exists yet).
+	const slugPart = title && label && label !== title ? `${label} · ` : "";
+	const identityId = subagentId ?? resolvedId ?? transportId;
 	const waitForText = extractField(inputJson, "wait_for_text");
 	const header = metaRows([
-		badgeRow(
-			chips([
-				chip(awaitType, "indigo"),
-				chip(targetId, "gray"),
-				chip(resolvedId ? `→ ${resolvedId}` : undefined, "blue"),
-				chip(awaitStatus, awaitStatus === "failed" ? "red" : "green"),
-				chip(formatTimeoutLabel(extractNumericField(inputJson, "timeout")), "gray"),
-			]),
-		),
+		identityId ? { text: "", identity: `${slugPart}${identityId}` } : null,
 		waitForText ? { text: `wait_for: "${waitForText}"`, mono: true, dimmed: true } : null,
-		subagentId ? pathRow(`subagent: ${subagentId}`) : null,
 	]);
 	return sections([
 		section("meta.await", undefined, header),
