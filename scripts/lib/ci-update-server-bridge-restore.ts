@@ -171,9 +171,46 @@ export async function runBridgeProcess(
 				!spawnFailed && !closed.value.signal && closed.value.code !== null
 					? failedGhApiStatus(command, args, stderr.value)
 					: undefined;
-			throw new Error(
-				`GitHub publication subprocess failed${status === undefined ? "" : ` (HTTP ${status})`}`,
-			);
+			// Log fixed categories and numbers only, never argv, URLs, or diagnostic payloads.
+			const apiOperations = [
+				[/\/releases\/assets\//, "release-asset"],
+				[/\/releases(?:\/|\?)/, "release-read"],
+				[/\/git\/(?:ref\/tags|tags)\//, "tag-read"],
+				[/^graphql$/, "graphql"],
+			] as const;
+			const apiOperation =
+				command === "gh" && args[0] === "api"
+					? apiOperations.find(([pattern]) => pattern.test(args[1] ?? ""))?.[1]
+					: undefined;
+			const operation =
+				command === "gh" &&
+				args[0] === "release" &&
+				["create", "upload", "download", "edit", "view"].includes(args[1] ?? "")
+					? `gh release ${args[1]}`
+					: apiOperation
+						? `gh api ${apiOperation}`
+						: undefined;
+			const line = stderr.value.slice(0, 4096).split(/\r?\n/, 1)[0] ?? "";
+			// Non-authoritative diagnostics deliberately use status=, never HTTP 404.
+			// They cannot turn a failed API lookup into permission to create anything.
+			const diagnosticStatus =
+				operation && !closed.value.signal
+					? /^(?:failed to create release: )?HTTP ([45]\d{2}):/.exec(line)?.[1]
+					: undefined;
+			const cause =
+				!closed.value.signal &&
+				/^(?:HTTP 403: |GraphQL: )Resource not accessible by integration\b/.test(line)
+					? "integration-permission-denied"
+					: !closed.value.signal && /^unknown flag:/.test(line)
+						? "unsupported-option"
+						: undefined;
+			const detail =
+				status !== undefined
+					? ` (HTTP ${status})`
+					: operation
+						? ` (${operation}; exit=${closed.value.code ?? "signal"}${diagnosticStatus ? `; status=${diagnosticStatus}` : ""}${cause ? `; cause=${cause}` : ""})`
+						: "";
+			throw new Error(`GitHub publication subprocess failed${detail}`);
 		}
 		return stdout.value;
 	} finally {

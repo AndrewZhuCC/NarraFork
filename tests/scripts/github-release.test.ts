@@ -250,7 +250,8 @@ function fakeGitHub(options: GitHubReleaseOptions) {
 			if (args[1] === "create") {
 				expect(args).toContain("--draft");
 				expect(args).toContain("--verify-tag");
-				expect(args[args.indexOf("--target") + 1]).toBe(commit);
+				// Existing verified tags must not request extra workflow-writing permission.
+				expect(args).not.toContain("--target");
 				server.release = {
 					id: 1,
 					tag_name: `v${options.version}`,
@@ -443,6 +444,28 @@ describe("GitHub release assets and lifecycle", () => {
 		expect(gh.release?.body).toContain(changelog.en);
 		expect(gh.release?.body).toContain(changelog["zh-CN"]);
 	});
+
+	for (const phase of ["before-create", "before-publish"] as const)
+		test(`tag SHA mismatch ${phase} still stops release writes without target_commitish`, async () => {
+			const { options } = fixture();
+			const gh = fakeGitHub(options);
+			if (phase === "before-create") gh.tagCommit = "b".repeat(40);
+			const run = async (args: string[]) => {
+				const result = await gh.run(args);
+				if (phase === "before-publish" && args[0] === "release" && args[1] === "upload")
+					gh.tagCommit = "b".repeat(40);
+				return result;
+			};
+			await expect(publishGitHubRelease({ ...options, run })).rejects.toThrow("tag");
+			expect(gh.calls.some((args) => args[0] === "release" && args[1] === "edit")).toBe(false);
+			if (phase === "before-create") {
+				expect(gh.release).toBeNull();
+				expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+			} else {
+				expect(gh.release?.draft).toBe(true);
+				expect(gh.calls.find((args) => args[1] === "create")).not.toContain("--target");
+			}
+		});
 
 	test("uploads every requested platform including Windows .exe to an explicit repository", async () => {
 		const { options } = fixture("1.2.0", true);

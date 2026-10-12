@@ -401,6 +401,64 @@ describe("real async gh runner diagnostic bounds and cancellation", () => {
 		expect(String(error)).toBe("Error: GitHub publication subprocess failed (HTTP 404)");
 		expect(JSON.stringify(error)).not.toContain("fixture-");
 	});
+	for (const operation of ["create", "upload", "download", "edit", "view"])
+		test(`release ${operation} failure exposes only fixed labels and numeric status`, async () => {
+			const f = await fixture({
+				mode: "diagnostic",
+				exitCode: 7,
+				stderr: "HTTP 403: fixture-gh-secret https://fixture.invalid?token=fixture-nf-secret\n",
+				stdout: "gh: Not Found (HTTP 404) fixture-gh-secret",
+			});
+			const error = await f
+				.run(["release", operation, "fixture-gh-secret", "--notes", "fixture-nf-secret"])
+				.catch((error: unknown) => error);
+			expect(String(error)).toBe(
+				`Error: GitHub publication subprocess failed (gh release ${operation}; exit=7; status=403)`,
+			);
+			expect(String(error)).not.toContain("fixture-");
+			expect(String(error)).not.toContain("HTTP");
+		});
+	for (const [stderr, detail] of [
+		[
+			"HTTP 403: Resource not accessible by integration (fixture-gh-secret)",
+			"; status=403; cause=integration-permission-denied",
+		],
+		[
+			"GraphQL: Resource not accessible by integration (fixture-gh-secret)",
+			"; cause=integration-permission-denied",
+		],
+		["unknown flag: fixture-gh-secret", "; cause=unsupported-option"],
+	])
+		test(`release failure preserves a fixed category: ${detail}`, async () => {
+			const f = await fixture({ mode: "diagnostic", stderr });
+			const error = await f
+				.run(["release", "create", "fixture-nf-secret"])
+				.catch((error: unknown) => error);
+			expect(String(error)).toBe(
+				`Error: GitHub publication subprocess failed (gh release create; exit=1${detail})`,
+			);
+			expect(String(error)).not.toContain("fixture-");
+		});
+	for (const [endpoint, operation] of [
+		["repos/fixture-gh-secret/repo/releases/assets/123", "release-asset"],
+		["repos/fixture-gh-secret/repo/releases/tags/fixture-nf-secret", "release-read"],
+		["repos/fixture-gh-secret/repo/git/ref/tags/fixture-nf-secret", "tag-read"],
+		["graphql", "graphql"],
+	])
+		test(`unknown API failure identifies only ${operation}, never authorizes missing`, async () => {
+			const f = await fixture({ mode: "diagnostic", stderr: "HTTP 404: fixture-gh-secret" });
+			const error = await f.run(["api", endpoint]).catch((error: unknown) => error);
+			expect(String(error)).toBe(
+				`Error: GitHub publication subprocess failed (gh api ${operation}; exit=1; status=404)`,
+			);
+			expect(String(error)).not.toContain("fixture-");
+			expect(String(error)).not.toContain("HTTP 404");
+		});
+	test("unrecognized operations never echo an arbitrary subcommand", async () => {
+		const f = await fixture({ mode: "diagnostic", stderr: "gh: Not Found (HTTP 404)\n" });
+		const error = await f.run(["release", "fixture-gh-secret"]).catch((error: unknown) => error);
+		expect(String(error)).toBe("Error: GitHub publication subprocess failed");
+	});
 	for (const status of [401, 403, 429, 500, 503])
 		test(`HTTP ${status} retains only its numeric status despite secret diagnostic text`, async () => {
 			const f = await fixture({

@@ -562,8 +562,8 @@ export async function publishGitHubRelease(
 				"--repo",
 				repository,
 				"--verify-tag",
-				"--target",
-				options.commit,
+				// Existing tag SHA is checked before creation and before publication.
+				// A redundant target_commitish can require workflows:write in Actions.
 				"--draft",
 				"--title",
 				`NarraFork ${tag}`,
