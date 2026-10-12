@@ -25,6 +25,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { handleLength, MIN_HANDLE_LENGTH } from "@shared/narrator-handle";
 import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
@@ -37,6 +38,7 @@ import {
 	useFavoriteDirectories,
 	useReorderFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
+import { useGitIdentities } from "../../hooks/useGitIdentities";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
 import { api } from "../../lib/api";
@@ -50,6 +52,9 @@ import {
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
+/** 选择它表示不写绑定，跟随本人的默认身份（与会话详情面板的哨兵值一致）。 */
+const FOLLOW_DEFAULT_GIT_IDENTITY = "__follow_default__";
 
 export interface CreateNarratorResult {
 	id: string;
@@ -184,6 +189,11 @@ export function CreateNarratorModal({
 	const planModeSettingsKnown = settings != null;
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
+	// 提交身份只对当前用户生效（服务端按 用户 × 会话 保存），默认跟随本人默认身份。
+	const [gitIdentityId, setGitIdentityId] = useState(FOLLOW_DEFAULT_GIT_IDENTITY);
+	const { data: gitIdentityList } = useGitIdentities();
+	const gitIdentities = gitIdentityList ?? [];
+	const defaultGitIdentity = gitIdentities.find((identity) => identity.isDefault);
 	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
 
@@ -347,6 +357,16 @@ export function CreateNarratorModal({
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				onSuccess: (data: any) => {
+					// 身份绑定是第二个请求：创建本身已经成功，写失败只提示、不回滚也不阻塞进入会话。
+					if (gitIdentityId !== FOLLOW_DEFAULT_GIT_IDENTITY) {
+						void api.setNarratorGitIdentity(data.id, gitIdentityId).catch((error: unknown) => {
+							notifications.show({
+								color: "red",
+								title: tc("operationFailed"),
+								message: error instanceof Error ? error.message : tc("unknownError"),
+							});
+						});
+					}
 					handleClose();
 					onCreated?.({
 						id: data.id,
@@ -509,6 +529,32 @@ export function CreateNarratorModal({
 					zIndex: 320,
 				}}
 			/>
+
+			<Select
+				label={t("narrator:details.gitIdentity")}
+				description={t("narrator:details.gitIdentityDescription")}
+				data={[
+					{
+						value: FOLLOW_DEFAULT_GIT_IDENTITY,
+						label: defaultGitIdentity
+							? t("narrator:details.gitIdentityFollowDefault", { name: defaultGitIdentity.name })
+							: t("narrator:details.gitIdentityFollowDefaultPlain"),
+					},
+					...gitIdentities.map((identity) => ({
+						value: identity.id,
+						label: `${identity.name} <${identity.email}>`,
+					})),
+				]}
+				value={gitIdentityId}
+				onChange={(value) => setGitIdentityId(value ?? FOLLOW_DEFAULT_GIT_IDENTITY)}
+				disabled={gitIdentities.length === 0}
+				comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+			/>
+			{gitIdentities.length === 0 && (
+				<Text size="xs" c="dimmed">
+					{t("narrator:details.gitIdentityUnconfigured")}
+				</Text>
+			)}
 
 			<Checkbox
 				label={t("startInPlanMode")}
