@@ -1469,6 +1469,7 @@
 	"addPluginPanel": "添加插件面板",
 	"moreActions": "更多操作",
 	"lastTurnDuration": "上轮耗时 {{duration}}",
+	"lastTurnEndedAgo": "上轮结束距今 {{duration}}",
 	"queuePosition": "排队中 第{{position}}位",
 	"queuePositionWithDepth": "排队中 第{{position}}位 / 共{{queueDepth}}个",
 	"fileMod_willBeDeleted": "将被删除",

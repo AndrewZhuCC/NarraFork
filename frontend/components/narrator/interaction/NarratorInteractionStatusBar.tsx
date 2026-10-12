@@ -113,6 +113,7 @@ export interface NarratorInteractionStatusBarProps {
 		quotaWaitText: string;
 		turnElapsedText: string | null;
 		turnStartedAtLabel: string | null;
+		turnEndedAt?: string | null;
 		onOpenSpecTool: () => void;
 		onScrollToMessageTarget: (opts: {
 			domIds: string[];
@@ -457,6 +458,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 							{workIndicator.turnElapsedText && !isWorkspacePreview && (
 								<TurnElapsedTime
 									text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
+									endAt={workIndicator.turnEndedAt}
 									startedAtLabel={workIndicator.turnStartedAtLabel}
 									isMobile={isMobileViewport}
 								/>

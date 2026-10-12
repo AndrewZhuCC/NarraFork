@@ -1470,6 +1470,7 @@
 	"addPluginPanel": "Add plugin panel",
 	"moreActions": "More actions",
 	"lastTurnDuration": "last turn {{duration}}",
+	"lastTurnEndedAgo": "ended {{duration}} ago",
 	"queuePosition": "queued #{{position}}",
 	"queuePositionWithDepth": "queued #{{position}} of {{queueDepth}}",
 	"fileMod_willBeDeleted": "will be deleted",

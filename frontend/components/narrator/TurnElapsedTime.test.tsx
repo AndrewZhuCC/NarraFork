@@ -78,14 +78,16 @@ async function render(node: ReactNode) {
 	await act(async () =>
 		root.render(
 			<I18nextProvider i18n={i18n}>
-				<MantineProvider env="test">{node}</MantineProvider>
+				<MantineProvider env="test">
+					<div data-testid="clock-content">{node}</div>
+				</MantineProvider>
 			</I18nextProvider>,
 		),
 	);
 }
 
 function text() {
-	return container.textContent ?? "";
+	return container.querySelector('[data-testid="clock-content"]')?.textContent ?? "";
 }
 
 describe("TurnElapsedTime", () => {
@@ -124,6 +126,56 @@ describe("TurnElapsedTime", () => {
 		expect(text()).toMatch(/0:0[234]/);
 	});
 
+	test("a preformatted finished duration shows a live end age without refreshing siblings", async () => {
+		let siblingRenders = 0;
+		const SiblingProbe = () => {
+			siblingRenders++;
+			return <span>idle</span>;
+		};
+		await render(
+			<div>
+				<TurnElapsedTime
+					text="· last turn 0:30"
+					endAt={new Date(Date.now() - 1500).toISOString()}
+					isMobile={false}
+				/>
+				<SiblingProbe />
+			</div>,
+		);
+		expect(text()).toContain("last turn 0:30 · ended 0:01 ago");
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 1200));
+		});
+		expect(text()).toContain("last turn 0:30");
+		expect(text()).toMatch(/ended 0:0[234] ago/);
+		expect(siblingRenders).toBe(1);
+
+		await render(
+			<TurnElapsedTime
+				text="0:02"
+				endAt={new Date(Date.now() - 30_000).toISOString()}
+				running
+				isMobile={false}
+			/>,
+		);
+		expect(text()).toBe("0:02");
+	});
+
+	test("missing or invalid ends hide the age, and a future end does not go negative", async () => {
+		for (const endAt of [undefined, null, "invalid"]) {
+			await render(<TurnElapsedTime text="last turn 0:30" endAt={endAt} isMobile={false} />);
+			expect(text()).toBe("last turn 0:30");
+		}
+		await render(
+			<TurnElapsedTime
+				text="last turn 0:30"
+				endAt={new Date(Date.now() + 60_000).toISOString()}
+				isMobile={false}
+			/>,
+		);
+		expect(text()).toBe("last turn 0:30 · ended 0:00 ago");
+	});
+
 	test("stopping freezes at turnEndedAt even after re-render; another turn resets", async () => {
 		const startedAt = new Date(Date.now() - 60_000).toISOString();
 		const turnEndedAt = new Date(Date.now() - 30_000).toISOString();
@@ -137,14 +189,14 @@ describe("TurnElapsedTime", () => {
 			/>
 		);
 		await render(finishedTurn());
-		expect(text()).toContain("0:30");
+		expect(text()).toContain("last turn 0:30");
 
 		await act(async () => {
 			await new Promise((resolve) => setTimeout(resolve, 1200));
 		});
 		// A later render must still use the fixed end, never the wall clock.
 		await render(finishedTurn());
-		expect(text()).toContain("0:30");
+		expect(text()).toContain("last turn 0:30");
 
 		// A new turn must not show the previous turn's elapsed value for a commit.
 		await render(

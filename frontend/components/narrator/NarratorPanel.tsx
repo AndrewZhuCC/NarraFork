@@ -3382,6 +3382,7 @@ function NarratorPanelBody({
 								quotaWaitText,
 								turnElapsedText,
 								turnStartedAtLabel,
+								turnEndedAt: isTurnRunning ? null : validTurnEndedAt,
 								onOpenSpecTool: openSpecTool,
 								onScrollToMessageTarget: scrollToMessageTarget,
 							},

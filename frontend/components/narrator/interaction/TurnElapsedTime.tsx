@@ -42,16 +42,20 @@ export const TurnElapsedTime = memo(function TurnElapsedTime({
 	// Derive from current props during render: switching narrator/turn or stopping
 	// must not display the previous turn's cached elapsed value for one commit.
 	const validEndAt = endAt && Number.isFinite(Date.parse(endAt)) ? endAt : null;
+	const nowMs = Date.now();
 	const elapsedMs =
 		turnStartedAt != null && (running || validEndAt)
 			? calculateEffectiveTurnElapsedMs({
 					turnStartedAt,
 					endAt: running ? undefined : validEndAt,
-					nowMs: Date.now(),
+					nowMs,
 					substatus,
 				})
 			: null;
-	useDisplayClock(running === true && elapsedMs != null);
+	useDisplayClock(
+		(running === true && elapsedMs != null) ||
+			(running !== true && validEndAt !== null && (propText != null || elapsedMs != null)),
+	);
 	const [opened, setOpened] = useState(false);
 	const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const cancelClose = useCallback(() => {
@@ -81,6 +85,11 @@ export const TurnElapsedTime = memo(function TurnElapsedTime({
 		text = running ? duration : `· ${t("lastTurnDuration", { duration })}`;
 		const startedAt = turnStartedAt ? formatFullLocaleDateTime(turnStartedAt, i18n.language) : null;
 		startedAtLabel = startedAt ? t("toolStartedAt", { time: startedAt }) : null;
+	}
+
+	if (running !== true && validEndAt) {
+		const duration = formatColonDuration((nowMs - Date.parse(validEndAt)) / 1000);
+		text += ` · ${t("lastTurnEndedAgo", { duration })}`;
 	}
 
 	// Without a popover, TruncatedText supplies the overflow reveal affordance.
