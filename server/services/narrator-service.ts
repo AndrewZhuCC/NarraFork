@@ -349,7 +349,7 @@ export interface CreateNarratorInput {
 	locale?: Locale;
 	/** Extra permanent trait tags to attach (merged with derived traits, deduped). */
 	extraTraits?: NarratorTrait[];
-	/** Explicit project context for an externally provisioned standalone narrator. */
+	/** Explicit project context for a chapterless narrator; independent of its cwd. */
 	contextProjectId?: string | null;
 	/** Frozen OAuth client policy applied at provisioning time. */
 	oauthPolicySnapshotJson?: Record<string, unknown> | null;
@@ -1831,6 +1831,7 @@ export const narratorService = {
 						subagentOriginKind:
 							input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
 						cwd: creationWorkspace.cwd,
+						contextProjectId: creationWorkspace.contextProjectId,
 						defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
 						// A subagent is part of its parent's work, so its access is DELEGATED to the
 						// root rather than copied: `acl_root_narrator_id` is the only thing consulted

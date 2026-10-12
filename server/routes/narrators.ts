@@ -106,6 +106,7 @@ import {
 	requireNarratorAccess,
 	requireOwningNarratorAccess,
 } from "../lib/narrator-access";
+import { resolveNarratorAudiences } from "../lib/narrator-audiences";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	buildCustomTraitsResponse,
@@ -1202,10 +1203,17 @@ narratorRoutes.get("/", async (c) => {
  * expand, a configured directory that cannot be created) are unit-testable without a
  * disk.
  */
-function standaloneNarratorCwd(input: {
-	cwd?: string;
-	chapterId?: string | null;
-}): string | undefined {
+function standaloneNarratorCwd(
+	input: {
+		cwd?: string;
+		chapterId?: string | null;
+	},
+	projectDir?: string | null,
+): string | undefined {
+	// Project paths are metadata, not an invitation to create or validate a repository.
+	const explicit = input.cwd?.trim();
+	if (explicit) return explicit;
+	if (projectDir) return projectDir;
 	return resolveStandaloneNarratorCwd(input, {
 		home: getHome(),
 		configuredDir: settings.paths.defaultProjectDir,
@@ -1232,7 +1240,10 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	// Explicit project context selects an ordinary, chapterless session. A deprecated
+	// chapter field in the same request must not create a second, conflicting binding.
+	// Legacy chapter-only callers and internal service callers retain their semantics.
+	const input = parsed.data.contextProjectId ? { ...parsed.data, chapterId: null } : parsed.data;
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -1241,13 +1252,34 @@ narratorRoutes.post("/", async (c) => {
 	// Ownership always comes from the authenticated session, never from the body:
 	// a client must not be able to create a narrator on someone else's behalf.
 	const ownerUserId = c.get("user").sub;
-	const resolvedCwd = standaloneNarratorCwd(input);
+	let projectDir: string | undefined;
+	if (input.contextProjectId) {
+		await requireProjectAccess(c, input.contextProjectId, "write");
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, input.contextProjectId),
+			columns: { gitPath: true },
+		});
+		projectDir = project?.gitPath ?? undefined;
+	}
+	const resolvedCwd = standaloneNarratorCwd(input, projectDir);
+	// Only ordinary HTTP project sessions adopt the legacy project defaults. External
+	// provisioning still uses the service's private default and frozen OAuth policy.
+	const audiences = input.contextProjectId
+		? resolveNarratorAudiences(
+				undefined,
+				undefined,
+				input.contextProjectId,
+				settings.agent.defaultNarratorVisibility,
+				settings.agent.defaultNarratorWriteAudience,
+			)
+		: {};
 
 	if (input.kind) {
 		const user = c.get("user");
 		const locale = await getUserLanguage(user.sub);
 		const narrator = await narratorService.create({
 			...input,
+			...audiences,
 			cwd: resolvedCwd,
 			ownerUserId,
 			creatorIsAdmin: user.role === "admin",
@@ -1258,6 +1290,7 @@ narratorRoutes.post("/", async (c) => {
 
 	const narrator = await narratorService.create({
 		...input,
+		...audiences,
 		cwd: resolvedCwd,
 		ownerUserId,
 	});

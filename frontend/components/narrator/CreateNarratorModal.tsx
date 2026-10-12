@@ -64,6 +64,8 @@ interface CreateNarratorModalProps {
 	onCreated?: (narrator: CreateNarratorResult) => void;
 	/** Pre-fill the working directory (e.g. "new narrator in this directory" entry points). */
 	initialCwd?: string;
+	/** Explicit project membership; a directory alone never implies a project. */
+	contextProjectId?: string;
 }
 
 function FavoriteItemContent({
@@ -150,6 +152,7 @@ export function CreateNarratorModal({
 	onClose,
 	onCreated,
 	initialCwd,
+	contextProjectId,
 }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
@@ -335,6 +338,7 @@ export function CreateNarratorModal({
 		createNarrator.mutate(
 			{
 				...(cwd ? { cwd } : {}),
+				...(contextProjectId ? { contextProjectId } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(sendPlanMode ? { startInPlanMode } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),

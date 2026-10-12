@@ -21,7 +21,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { broadcastToUser } from "../websocket/narrator-ws";
 import { recordAclEvent } from "./acl/acl-audit";
-import { canManageProject, type ProjectPrincipal } from "./project-acl";
+import { canManageProject, canWriteProject, type ProjectPrincipal } from "./project-acl";
 import { getRecentTabUserIds, pruneUnreadableProjectTabs } from "./recent-tabs-service";
 
 /** The three membership tiers, mirroring the generic capabilities. */
@@ -47,6 +47,8 @@ export interface ProjectAccessView {
 		avatarImageId: string | null;
 	} | null;
 	members: ProjectMemberView[];
+	/** Current project write access, including role grants; not inferred from the member list. */
+	canWrite: boolean;
 	/** Whether the requesting user may change any of the above. */
 	canManage: boolean;
 }
@@ -147,6 +149,7 @@ export async function getProjectAccess(
 				}
 			: null,
 		members: [...byUser.values()],
+		canWrite: await canWriteProject(row, principal),
 		canManage: await canManageProject(row, principal),
 	};
 }

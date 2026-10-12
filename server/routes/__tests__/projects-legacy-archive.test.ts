@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +15,7 @@ import { gitService } from "../../services/git-service";
 import { narratorService } from "../../services/narrator-service";
 import { importLegacyProjectOnWorker } from "../../services/project-archive/legacy-import-job";
 import { exportLegacyProjectOnWorker } from "../../services/project-archive/legacy-sync-job";
-import { __testing } from "../../services/project-db-sync";
+import { __testing, syncProject } from "../../services/project-db-sync";
 import { projectRoutes } from "../projects";
 
 const dirs: string[] = [];
@@ -101,13 +102,16 @@ async function target(dir: string) {
 	return { path, connection };
 }
 for (const mode of ["existing", "clone"] as const) {
-	test(`HTTP ${mode} creation without chapters writes a project row before completion; incremental archive imports independently`, async () => {
+	test(`HTTP ${mode} creation is metadata-only; an explicit archive still imports independently`, async () => {
 		const created = await create(mode);
 		expect(sqlite.prepare("SELECT id FROM chapters WHERE project_id=?").all(created.id)).toEqual(
 			[],
 		);
+		expect(existsSync(join(created.gitPath, ".narrafork", "project.db"))).toBe(false);
+		expect(existsSync(join(created.gitPath, ".gitignore"))).toBe(false);
+		await syncProject(created.id);
 		const archive = await projectDbManager.getDb(created.id);
-		if (!archive) throw new Error("Project archive missing");
+		if (!archive) throw new Error("Explicit project archive missing");
 		expect(archive.prepare("SELECT id FROM projects").all()).toEqual([{ id: created.id }]);
 		const narratorId = generateId(),
 			messageId = generateId();
@@ -148,7 +152,7 @@ for (const mode of ["existing", "clone"] as const) {
 	});
 }
 
-test("production createSubagent leaves contextProjectId null, but project worker includes its real transcript", async () => {
+test("production createSubagent inherits project context and explicit backup includes its real transcript", async () => {
 	const created = await create("existing");
 	const rootId = generateId();
 	await db.insert(narrators).values({
@@ -165,7 +169,7 @@ test("production createSubagent leaves contextProjectId null, but project worker
 		cwd: created.gitPath,
 		title: "real contextless child",
 	});
-	expect(child.contextProjectId).toBeNull();
+	expect(child.contextProjectId).toBe(created.id);
 	expect(child.chapterId).toBeNull();
 	const messageId = generateId();
 	sqlite
@@ -181,6 +185,7 @@ test("production createSubagent leaves contextProjectId null, but project worker
 			"INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,tool_name,status,created_at) VALUES(?,?,?,?,?,?,?)",
 		)
 		.run(generateId(), child.id, messageId, "read", "Read", "success", now);
+	await syncProject(created.id);
 	projectDbManager.close(created.id);
 	await exportLegacyProjectOnWorker({
 		backend: "sqlite",
@@ -214,4 +219,95 @@ test("production createSubagent leaves contextProjectId null, but project worker
 	// No chapter was created by either HTTP or subagent creation.
 	expect(await db.query.projects.findFirst({ where: eq(projects.id, created.id) })).toBeDefined();
 	expect(sqlite.prepare("SELECT id FROM chapters").all()).toEqual([]);
+});
+
+test("ordinary project registration accepts an unavailable directory without Git probes or writes", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "nf-project-metadata-"));
+	dirs.push(dir);
+	const gitPath = join(dir, "not-present");
+	const probe = spyOn(gitService, "isGitRepo").mockResolvedValue(false);
+	const branch = spyOn(gitService, "getCurrentBranch").mockResolvedValue("not-needed");
+	const commit = spyOn(gitService, "commitGitignoreIfDirty").mockResolvedValue(undefined);
+	try {
+		const response = await app.request("/projects", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: "Directory project", gitPath }),
+		});
+		expect(response.status).toBe(201);
+		const created = await response.json();
+		ids.push(created.id);
+		expect(created.gitPath).toBe(gitPath);
+		expect(created.ownerUserId).toBe(userId);
+		expect(probe).not.toHaveBeenCalled();
+		expect(branch).not.toHaveBeenCalled();
+		expect(commit).not.toHaveBeenCalled();
+		expect(existsSync(gitPath)).toBe(false);
+		expect(sqlite.prepare("SELECT id FROM chapters WHERE project_id=?").all(created.id)).toEqual(
+			[],
+		);
+		const access = await app.request(`/projects/${created.id}/access`);
+		expect(access.status).toBe(200);
+		expect((await access.json()).canWrite).toBe(true);
+	} finally {
+		probe.mockRestore();
+		branch.mockRestore();
+		commit.mockRestore();
+	}
+});
+
+test("editing the project directory changes defaults, not existing session paths or history", async () => {
+	const created = await create("existing");
+	const narratorId = generateId();
+	const messageId = generateId();
+	await db.insert(narrators).values({
+		id: narratorId,
+		contextProjectId: created.id,
+		ownerUserId: userId,
+		cwd: created.gitPath,
+		createdAt: now,
+		updatedAt: now,
+	});
+	sqlite
+		.prepare(
+			"INSERT INTO narrator_messages(id,narrator_id,role,content_json,created_at) VALUES(?,?,?,?,?)",
+		)
+		.run(messageId, narratorId, "assistant", "[]", now);
+	// Another editor updates non-form settings after the metadata form was opened.
+	const concurrentSettings = {
+		commands: [{ name: "updated-command", prompt: "new prompt" }],
+		routines: { toolModes: { example: "manual" } },
+		futureSetting: { version: 2 },
+	};
+	sqlite
+		.prepare("UPDATE projects SET chapter_settings=? WHERE id=?")
+		.run(JSON.stringify(concurrentSettings), created.id);
+	const nextPath = join(created.dir, "another-missing-directory");
+	const response = await app.request(`/projects/${created.id}`, {
+		method: "PATCH",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			name: "Updated project",
+			description: "Metadata only",
+			gitPath: ` ${nextPath} `,
+			chapterSettings: { whitelistDirs: [], requireReviewBeforeMerge: false },
+		}),
+	});
+	expect(response.status).toBe(200);
+	const updated = await response.json();
+	expect(updated.gitPath).toBe(nextPath);
+	expect(updated.name).toBe("Updated project");
+	expect(updated.chapterSettings).toEqual({
+		...concurrentSettings,
+		whitelistDirs: [],
+		requireReviewBeforeMerge: false,
+	});
+	expect(existsSync(nextPath)).toBe(false);
+	const session = sqlite
+		.prepare("SELECT cwd,context_project_id FROM narrators WHERE id=?")
+		.get(narratorId);
+	expect(session).toEqual({ cwd: created.gitPath, context_project_id: created.id });
+	expect(sqlite.prepare("SELECT id FROM narrator_messages WHERE id=?").get(messageId)).toEqual({
+		id: messageId,
+	});
 });

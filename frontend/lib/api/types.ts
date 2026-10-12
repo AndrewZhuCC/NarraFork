@@ -1291,6 +1291,8 @@ export interface ProjectAccess {
 		avatarImageId: string | null;
 	} | null;
 	members: ProjectMember[];
+	/** Server-authoritative permission to create project sessions and write project resources. */
+	canWrite?: boolean;
 	/** Whether the current user may change visibility, members or ownership. */
 	canManage: boolean;
 }

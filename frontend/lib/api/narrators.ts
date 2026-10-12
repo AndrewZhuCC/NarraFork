@@ -737,6 +737,7 @@ export const narratorsApi = {
 	},
 	createNarrator: (data: {
 		chapterId?: string | null;
+		contextProjectId?: string;
 		type?: string;
 		model?: string;
 		systemPrompt?: string;
