@@ -409,12 +409,19 @@ export function validateDistributionPlan(plan: DistributionPlan): void {
 export type RcloneRunner = (
 	args: string[],
 	options: { signal: AbortSignal; maxOutputBytes: number },
-) => Promise<{ code: number; stdout: string }>;
+) => Promise<{ code: number; stdout: string; stderr?: string }>;
+function rcloneDiagnostic(result: { code: number; stderr?: string }): string {
+	const detail = (result.stderr ?? "")
+		.replace(/[\r\n\t ]+/g, " ")
+		.trim()
+		.slice(0, 240);
+	return detail ? ` (rclone ${result.code}: ${detail})` : ` (rclone ${result.code})`;
+}
 export const runRclone: RcloneRunner = async (args, options) => {
 	options.signal.throwIfAborted();
 	const process = Bun.spawn(["rclone", ...args], {
 		stdout: "pipe",
-		stderr: "ignore",
+		stderr: "pipe",
 		env: { PATH: Bun.env.PATH, HOME: Bun.env.HOME },
 	});
 	const abort = () => process.kill();
@@ -422,8 +429,19 @@ export const runRclone: RcloneRunner = async (args, options) => {
 	try {
 		options.signal.throwIfAborted();
 		const reader = process.stdout.getReader();
+		const errorReader = process.stderr.getReader();
 		const chunks: Uint8Array[] = [];
+		const errorChunks: Uint8Array[] = [];
 		let size = 0;
+		let errorSize = 0;
+		const readErrors = (async () => {
+			for (;;) {
+				const result = await errorReader.read();
+				if (result.done) break;
+				errorSize += result.value.length;
+				if (errorSize <= options.maxOutputBytes) errorChunks.push(result.value);
+			}
+		})();
 		for (;;) {
 			const result = await reader.read();
 			if (result.done) break;
@@ -435,8 +453,13 @@ export const runRclone: RcloneRunner = async (args, options) => {
 			chunks.push(result.value);
 		}
 		const code = await process.exited;
+		await readErrors;
 		options.signal.throwIfAborted();
-		return { code, stdout: Buffer.concat(chunks).toString("utf8") };
+		return {
+			code,
+			stdout: Buffer.concat(chunks).toString("utf8"),
+			stderr: Buffer.concat(errorChunks).toString("utf8"),
+		};
 	} catch {
 		process.kill();
 		await process.exited;
@@ -517,36 +540,30 @@ export async function uploadDistribution(
 			signal.throwIfAborted();
 			const probe = await invoke(["lsjson", file.remote, "--stat"]);
 			if (probe.code !== 0 && probe.code !== 3 && probe.code !== 4)
-				throw new Error("Remote probe failed");
+				throw new Error(`Remote probe failed${rcloneDiagnostic(probe)}`);
 			if (probe.code === 0) {
 				const entry = JSON.parse(probe.stdout);
 				check(entry.IsDir === false && entry.Size === file.size, "Remote conflict");
 			} else {
-				check(
-					(await invoke(["copyto", file.local, file.remote, "--immutable"])).code === 0,
-					"Upload failed",
-				);
+				const upload = await invoke(["copyto", file.local, file.remote, "--immutable"]);
+				check(upload.code === 0, `Upload failed${rcloneDiagnostic(upload)}`);
 			}
 			const readback = join(
 				readbackRoot,
 				file.remote.startsWith("nf_update:0.9.1/") ? "full" : "patches",
 				file.name,
 			);
-			check(
-				(
-					await invoke([
-						"copyto",
-						file.remote,
-						readback,
-						"--immutable",
-						"--max-transfer",
-						String(file.size + 1),
-						"--cutoff-mode",
-						"immediate",
-					])
-				).code === 0,
-				"Readback failed",
-			);
+			const readbackResult = await invoke([
+				"copyto",
+				file.remote,
+				readback,
+				"--immutable",
+				"--max-transfer",
+				String(file.size + 1),
+				"--cutoff-mode",
+				"immediate",
+			]);
+			check(readbackResult.code === 0, `Readback failed${rcloneDiagnostic(readbackResult)}`);
 			const actual = await fileIdentity(readback, signal);
 			check(actual.size === file.size && actual.sha256 === file.sha256, "Remote digest conflict");
 			receipts.push({
