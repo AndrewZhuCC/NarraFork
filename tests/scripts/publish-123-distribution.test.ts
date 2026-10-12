@@ -40,7 +40,7 @@ async function fixture() {
 			commit: "05a12a3148b8d985a78e24ffe2d1570ae6bbf970",
 			workflowCommit: "b".repeat(40),
 			bunVersion: "1.4.2",
-			channel: "stable",
+			channel: "beta",
 			changelog: { version: "0.9.1", date: "2026-10-09", en: "release", "zh-CN": "发布" },
 			runId: 38238815855,
 			runAttempt: 1,
@@ -58,7 +58,7 @@ async function fixture() {
 		workflowCommit: source.plan.workflowCommit,
 		tag: source.plan.tag,
 		version: source.plan.version,
-		channel: "stable",
+		channel: "beta",
 		runId: source.plan.runId,
 		runAttempt: 1,
 		manifestSha256: "",
@@ -163,6 +163,50 @@ function fakeCloud(initial = new Map<string, Buffer>()) {
 	return { remote, run, calls };
 }
 describe("123 patch-only distribution", () => {
+	test("promoted stable distribution preserves the pinned original beta seal and bytes", async () => {
+		const original = await fixture();
+		const sealPath = join(original.options.bridgeDir, "prepared-main-mirror.json");
+		// Match the actual original: eight platforms, both 0.8.3 and 0.9.0 NF baselines.
+		for (const platform of original.seal.platforms) {
+			const historical = structuredClone(platform.patches[0]);
+			historical.source.version = "0.8.3";
+			historical.source.filename = historical.source.filename.replace("0.9.0", "0.8.3");
+			historical.file = historical.file.replace("from-0.9.0", "from-0.8.3");
+			historical.metadataFile = `${historical.file}.meta.json`;
+			historical.metadata.fromVersion = "0.8.3";
+			await writeFile(join(original.options.bridgeDir, historical.file), "patch");
+			await writeFile(
+				join(original.options.bridgeDir, historical.metadataFile),
+				JSON.stringify(historical.metadata),
+			);
+			historical.metadataIdentity = await hashReleaseFile(
+				join(original.options.bridgeDir, historical.metadataFile),
+			);
+			platform.patches.unshift(historical);
+		}
+		await writeFile(sealPath, JSON.stringify(original.seal));
+		const before = await readFile(sealPath);
+		original.options.sealSha256 = sha256(before);
+		expect(original.source.plan.channel).toBe("beta");
+		expect(original.seal.channel).toBe("beta");
+		const plan = await prepareDistribution(original.options);
+		expect(plan.manifest.channel).toBe("stable");
+		expect(plan.manifest.release.channel).toBe("stable");
+		expect(plan.files).toHaveLength(50);
+		expect(plan.manifest.release.platforms["linux-x64"].zstdPatchFromVersions).toEqual([
+			"0.8.3",
+			"0.9.0",
+		]);
+		expect(await readFile(sealPath)).toEqual(before);
+		expect(sha256(before)).toBe(original.options.sealSha256);
+		const altered = await fixture();
+		altered.seal.channel = "stable";
+		const text = JSON.stringify(altered.seal);
+		await writeFile(join(altered.options.bridgeDir, "prepared-main-mirror.json"), text);
+		await expect(
+			prepareDistribution({ ...altered.options, sealSha256: sha256(text) }),
+		).rejects.toThrow("Unapproved source identity");
+	});
 	test("patch digest, sidecar bytes and sealed baseline mismatch fail before staging", async () => {
 		const patch = await fixture();
 		await writeFile(

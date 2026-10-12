@@ -116,7 +116,9 @@ export async function prepareDistribution(options: PrepareOptions): Promise<Dist
 	check(
 		seal.version === options.version &&
 			seal.repository === "NarraFork/NarraFork" &&
-			seal.channel === "stable" &&
+			// The pinned original was built as beta and subsequently promoted to stable.
+			// Validate its immutable source identity, not the current distribution channel.
+			seal.channel === "beta" &&
 			seal.runId === 38238815855 &&
 			seal.runAttempt === 1 &&
 			seal.commit === "05a12a3148b8d985a78e24ffe2d1570ae6bbf970",
@@ -269,7 +271,9 @@ export function buildImportManifest(
 	artifact: Pick<PrepareOptions, "bridgeArtifactId" | "bridgeArtifactSha256">,
 ): ImportManifest {
 	check(
-		seal.repository === "NarraFork/NarraFork" && seal.channel === "stable",
+		seal.repository === "NarraFork/NarraFork" &&
+			seal.channel === "beta" &&
+			release.channel === "stable",
 		"Invalid manifest source",
 	);
 	return {
