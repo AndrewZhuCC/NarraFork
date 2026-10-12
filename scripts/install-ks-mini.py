@@ -256,8 +256,9 @@ def main():
             ['0012_curved_bloodstorm.sql'], ['0013_omniscient_dormammu.sql'],
             ['0014_blue_tomorrow_man.sql'], ['0015_nifty_magma.sql'],
             ['0016_high_shiva.sql'], ['0017_merge_opensource_083.sql'],
+            ['0018_merge_upstream_090.sql'],
             ['0016_high_shiva.sql', '0017_merge_opensource_083.sql'],
-        ), ('Validation is limited to reviewed migrations (0012 through 0017, or 0016 + 0017)',
+        ), ('Validation is limited to reviewed migrations (0012 through 0018, or 0016 + 0017)',
             [item['name'] for item in pending_files])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
