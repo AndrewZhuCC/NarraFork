@@ -918,7 +918,7 @@ function buildSettingsResponse(
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
-		codexAvailable: codexManager.snapshot().available > 0,
+		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
@@ -1339,8 +1339,10 @@ settingsRoutes.get("/search/protocols", (c) => {
 	return c.json(PROTOCOL_REGISTRY);
 });
 
-settingsRoutes.patch("/", requireAdmin, async (c) =>
-	settingsUpdateLock.acquire("settings", async () => {
+settingsRoutes.patch("/", requireAdmin, async (c) => {
+	const requestStartedAt = performance.now();
+	return settingsUpdateLock.acquire("settings", async () => {
+		const lockAcquiredAt = performance.now();
 		const body = normalizeLegacySettingsPatch(await c.req.json());
 		const parsed = updateSettingsSchema.safeParse(body);
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -1648,11 +1650,13 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		let migratedNarrators: Awaited<
 			ReturnType<typeof planProviderPrefixNarratorMigration>
 		>["narrators"] = [];
+		const persistStartedAt = performance.now();
 		if (prefixChanges.length > 0) {
 			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
 		}
+		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
 		// configs: new local-egress providers connect immediately, removed or
 		// reverted providers are torn down (docs/CODEX_CLIENT_RELAY.md).
@@ -1713,14 +1717,28 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			});
 		}
 
-		return c.json(
+		const responseStartedAt = performance.now();
+		const response = c.json(
 			buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
 			}),
 		);
-	}),
-);
+		const finishedAt = performance.now();
+		if (finishedAt - requestStartedAt >= 500) {
+			// Timings only: never log settings contents or provider credentials.
+			logger.warn("Slow settings PATCH", {
+				totalMs: Math.round(finishedAt - requestStartedAt),
+				lockWaitMs: Math.round(lockAcquiredAt - requestStartedAt),
+				prepareMs: Math.round(persistStartedAt - lockAcquiredAt),
+				persistMs: Math.round(persistFinishedAt - persistStartedAt),
+				runtimeMs: Math.round(responseStartedAt - persistFinishedAt),
+				responseMs: Math.round(finishedAt - responseStartedAt),
+			});
+		}
+		return response;
+	});
+});
 
 // Generate a TLS certificate and enable HTTPS.
 //

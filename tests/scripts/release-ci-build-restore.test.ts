@@ -109,71 +109,42 @@ function contents(value: unknown) {
 		content: bytes.toString("base64"),
 	};
 }
-function fixture(original: CiReleasePlan = structuredClone(basePlan)) {
-	const root = mkdtempSync(join(tmpdir(), "narrafork-build-restore-"));
-	roots.push(root);
-	const branch = original.defaultBranch ?? "main";
-	const repositoryName = original.repository;
-	const repository = { id: 55, full_name: repositoryName };
-	const env = {
-		GH_TOKEN: "fixture-only",
-		GITHUB_REPOSITORY: original.repository,
-		GITHUB_EVENT_NAME: "workflow_dispatch",
-		GITHUB_REF: `refs/heads/${branch}`,
-		GITHUB_WORKFLOW_REF: `${original.repository}/${CI_RELEASE_WORKFLOW}@refs/heads/${branch}`,
-		GITHUB_WORKFLOW_SHA: currentCommit,
-		GITHUB_SHA: currentCommit,
-		GITHUB_RUN_ID: "102",
-		GITHUB_RUN_ATTEMPT: "1",
-	};
+function createArtifactTemplate(root: string, original: CiReleasePlan) {
 	const workflowRun = {
 		id: 101,
 		repository_id: 55,
 		head_repository_id: 55,
-		head_branch: branch,
+		head_branch: original.defaultBranch ?? "main",
 		head_sha: workflowCommit,
 	};
-	const artifacts: {
-		id: number;
-		name: string;
-		expired: boolean;
-		size_in_bytes: number;
-		digest: string;
-		workflow_run: typeof workflowRun;
+	const template: {
+		artifact: {
+			id: number;
+			name: string;
+			expired: boolean;
+			size_in_bytes: number;
+			digest: string;
+			workflow_run: typeof workflowRun;
+		};
+		archive: Buffer;
+		entries: ZipEntry[];
 	}[] = [];
-	const archives = new Map<number, Buffer>();
-	const entries = new Map<number, ZipEntry[]>();
-	const jobs = [
-		"Release preflight",
-		...REQUIRED_RELEASE_BUILD_SOURCE_CHECKS,
-		...CI_RELEASE_TARGETS.map(({ target }) => `Build (${target})`),
-		"Smoke (windows-arm64)",
-	].map((name, index) => ({
-		id: index + 1,
-		run_id: 101,
-		run_attempt: 2,
-		head_sha: workflowCommit,
-		name,
-		status: "completed",
-		conclusion: name.startsWith("Smoke") ? "failure" : "success",
-		steps:
-			name === "Release preflight" || name.startsWith("Build (")
-				? [{ name: upload, status: "completed", conclusion: "success" }]
-				: [],
-	}));
-	function addArtifact(name: string, values: ZipEntry[]) {
-		const artifactId = 900 + artifacts.length;
-		const archive = pack(root, `${artifactId}.zip`, values);
-		archives.set(artifactId, archive);
-		entries.set(artifactId, values);
-		artifacts.push({
+	function addArtifact(name: string, entries: ZipEntry[]) {
+		const artifactId = 900 + template.length;
+		const archive = pack(root, `${artifactId}.zip`, entries);
+		const artifact = {
 			id: artifactId,
 			name,
 			expired: false,
 			size_in_bytes: archive.length,
 			digest: `sha256:${createHash("sha256").update(archive).digest("hex")}`,
 			workflow_run: { ...workflowRun },
-		});
+		};
+		Object.freeze(artifact.workflow_run);
+		Object.freeze(artifact);
+		for (const entry of entries) Object.freeze(entry);
+		Object.freeze(entries);
+		template.push(Object.freeze({ artifact, archive, entries }));
 	}
 	addArtifact("release-control-101-2", [
 		{ name: "plan.json", bytes: Buffer.from(JSON.stringify(original)) },
@@ -198,6 +169,63 @@ function fixture(original: CiReleasePlan = structuredClone(basePlan)) {
 			{ name: `${name}.metadata.json`, bytes: Buffer.from(formatMetadataJson(metadata)) },
 		]);
 	}
+	return Object.freeze(template);
+}
+const defaultArtifactTemplate = (() => {
+	let template: ReturnType<typeof createArtifactTemplate> | undefined;
+	// Build all nine real ZIPs once. Retain only private in-memory bytes, never paths or fixture state.
+	// Buffers cannot be frozen: callers must copy them, along with every nested mutable value.
+	return (root: string) => (template ??= createArtifactTemplate(root, basePlan));
+})();
+function fixture(supplied?: CiReleasePlan) {
+	const original = structuredClone(supplied ?? basePlan);
+	const root = mkdtempSync(join(tmpdir(), "narrafork-build-restore-"));
+	roots.push(root);
+	const branch = original.defaultBranch ?? "main";
+	const repositoryName = original.repository;
+	const repository = { id: 55, full_name: repositoryName };
+	const env = {
+		GH_TOKEN: "fixture-only",
+		GITHUB_REPOSITORY: original.repository,
+		GITHUB_EVENT_NAME: "workflow_dispatch",
+		GITHUB_REF: `refs/heads/${branch}`,
+		GITHUB_WORKFLOW_REF: `${original.repository}/${CI_RELEASE_WORKFLOW}@refs/heads/${branch}`,
+		GITHUB_WORKFLOW_SHA: currentCommit,
+		GITHUB_SHA: currentCommit,
+		GITHUB_RUN_ID: "102",
+		GITHUB_RUN_ATTEMPT: "1",
+	};
+	// Explicit plans (including repository/branch/legacy variants) always use real Python packing.
+	const template =
+		supplied === undefined ? defaultArtifactTemplate(root) : createArtifactTemplate(root, original);
+	const artifacts = template.map(({ artifact }) => structuredClone(artifact));
+	const archives = new Map<number, Buffer>(
+		template.map(({ artifact, archive }) => [artifact.id, Buffer.from(archive)]),
+	);
+	const entries = new Map<number, ZipEntry[]>(
+		template.map(({ artifact, entries }) => [
+			artifact.id,
+			entries.map((entry) => ({ ...entry, bytes: Buffer.from(entry.bytes) })),
+		]),
+	);
+	const jobs = [
+		"Release preflight",
+		...REQUIRED_RELEASE_BUILD_SOURCE_CHECKS,
+		...CI_RELEASE_TARGETS.map(({ target }) => `Build (${target})`),
+		"Smoke (windows-arm64)",
+	].map((name, index) => ({
+		id: index + 1,
+		run_id: 101,
+		run_attempt: 2,
+		head_sha: workflowCommit,
+		name,
+		status: "completed",
+		conclusion: name.startsWith("Smoke") ? "failure" : "success",
+		steps:
+			name === "Release preflight" || name.startsWith("Build (")
+				? [{ name: upload, status: "completed", conclusion: "success" }]
+				: [],
+	}));
 	const state = {
 		root,
 		env,
@@ -331,6 +359,89 @@ function noOwnedTemps(state: ReturnType<typeof fixture>) {
 		),
 	).toEqual([]);
 }
+
+describe("default artifact template isolation", () => {
+	test("copies all mutable state and bytes and survives removal of its original directory", async () => {
+		const left = fixture();
+		const right = fixture();
+		expect(left.root).not.toBe(right.root);
+		expect(left.original).not.toBe(right.original);
+		expect(left.original.baselines).not.toBe(right.original.baselines);
+		expect(left.original.changelog).not.toBe(right.original.changelog);
+		expect(left.archives).not.toBe(right.archives);
+		expect(left.entries).not.toBe(right.entries);
+		expect(left.run).not.toBe(right.run);
+		expect(left.fetch).not.toBe(right.fetch);
+		for (const artifact of left.artifacts) {
+			const other = right.artifacts.find((item) => item.id === artifact.id);
+			const archive = left.archives.get(artifact.id);
+			const values = left.entries.get(artifact.id);
+			if (!other || !archive || !values) throw new Error("fixture archive missing");
+			expect(artifact).not.toBe(other);
+			expect(artifact.workflow_run).not.toBe(other.workflow_run);
+			expect(archive).not.toBe(right.archives.get(artifact.id));
+			expect(values).not.toBe(right.entries.get(artifact.id));
+			for (const [index, entry] of values.entries()) {
+				expect(entry).not.toBe(right.entries.get(artifact.id)?.[index]);
+				expect(entry.bytes).not.toBe(right.entries.get(artifact.id)?.[index].bytes);
+				entry.bytes.fill(0);
+				entry.name = "mutated";
+			}
+			archive.fill(0);
+			values.pop();
+			artifact.workflow_run.head_sha = currentCommit;
+			artifact.digest = "mutated";
+		}
+		left.original.changelog.en = "mutated";
+		left.original.baselines.length = 1;
+		left.env.GITHUB_RUN_ID = "999";
+		left.source.head_repository.full_name = "attacker/fork";
+		left.jobs[0].steps[0].name = "mutated";
+		left.jobs[0].conclusion = "failure";
+		left.jobs.pop();
+		left.artifacts.pop();
+		await left.run(["api", `repos/${CI_RELEASE_REPOSITORY}/actions/runs/101/attempts/2`]);
+		await left.fetch(`https://fixture.invalid/actions/artifacts/900/zip`);
+		expect(left.calls).toHaveLength(1);
+		expect(left.downloads).toEqual([900]);
+		expect(right.calls).toEqual([]);
+		expect(right.downloads).toEqual([]);
+		rmSync(left.root, { recursive: true, force: true });
+		const fresh = fixture();
+		for (const state of [right, fresh]) {
+			expect(existsSync(state.root)).toBe(true);
+			expect(state.original).toEqual(basePlan);
+			expect(state.artifacts).toHaveLength(9);
+			expect([...state.archives.keys()]).toEqual([900, 901, 902, 903, 904, 905, 906, 907, 908]);
+			expect([...state.entries.keys()]).toEqual([...state.archives.keys()]);
+			for (const artifact of state.artifacts) {
+				const archive = state.archives.get(artifact.id);
+				if (!archive) throw new Error("fixture archive missing");
+				expect(Buffer.isBuffer(archive)).toBe(true);
+				expect(artifact.size_in_bytes).toBe(archive.length);
+				expect(artifact.digest).toBe(
+					`sha256:${createHash("sha256").update(archive).digest("hex")}`,
+				);
+				for (const entry of state.entries.get(artifact.id) ?? [])
+					expect(Buffer.isBuffer(entry.bytes)).toBe(true);
+			}
+		}
+		const plan = await prepare(right, "all");
+		expect(plan.buildSource?.platforms).toHaveLength(8);
+		await restore(right, plan, "windows-arm64");
+		expect(right.downloads).toEqual([900, 900, 906]);
+		for (const entry of right.entries.get(906) ?? [])
+			expect(readFileSync(join(right.root, "restored", entry.name))).toEqual(
+				Buffer.from(entry.bytes),
+			);
+		expect(fresh.calls).toEqual([]);
+		expect(fresh.downloads).toEqual([]);
+		await prepare(fresh);
+		expect(fresh.downloads).toEqual([900]);
+		noOwnedTemps(right);
+		noOwnedTemps(fresh);
+	});
+});
 
 describe("original build recovery", () => {
 	test("recovers failed original smoke without compile/new baseline and preserves exact original binary/sidecar bytes", async () => {

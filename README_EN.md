@@ -174,7 +174,11 @@ Issues with bug reports, reproduction steps, and user feedback are welcome, as a
 - When fixing a bug, provide reproduction steps and relevant tests whenever possible.
 - When changing UI text, update both the English and Simplified Chinese translations.
 - Remove API keys, access tokens, and other sensitive information before submitting logs, screenshots, or reproduction materials.
-- Before a contribution can be merged, complete the signing and confirmation process in the [Contributor License Agreement (CLA)](CLA.md). Please read the full agreement first.
+- Before a contribution can be merged, complete private signing, identity verification, and Maintainer acceptance under the [Contributor License Agreement (CLA), English reference](CLA.md#english-reference). Please read the full agreement first; the Chinese text is the basis for interpretation if the texts differ.
+
+**The CLA signing channel is pending configuration and is not yet open.** Once open, the process is: submit a PR → request signing through the published dedicated email → the Maintainer privately discloses the grant recipient's identity and fixed agreement version → sign privately (expressly including the current PR on first signing) → the Maintainer confirms acceptance and posts a verification result without identity information in the PR. For now, You may request a signing channel in a PR without attaching personal identity materials; contributions should not be merged before verification and acceptance confirmation.
+
+Do not post legal names, signatures, email bodies, or employer authorization documents in public Issues, PRs, Gists, or the repository. Automated signing status does not replace manual Maintainer confirmation. This notice does not mean CLA Assistant or mandatory merge checks have been enabled.
 
 ## Documentation
 

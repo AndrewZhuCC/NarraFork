@@ -1,6 +1,8 @@
 # NarraFork 贡献者许可协议（CLA）
 
-协议版本：1.0
+协议版本：1.1
+
+[English reference](#english-reference)。本协议提供英文对照；中英文出现歧义时，以中文文本为解释基准。
 
 NarraFork 当前以 Mozilla Public License 2.0（SPDX：`MPL-2.0`）发布，全文见 [LICENSE](LICENSE)。除另有明确许可声明的第三方材料外，本仓库的项目原创源代码和配套材料适用该许可证。本协议是贡献者向项目维护方授予的独立授权，不修改 MPL-2.0 正文，也不要求仅使用或分发项目的用户签署。
 
@@ -68,35 +70,186 @@ NarraFork 当前以 Mozilla Public License 2.0（SPDX：`MPL-2.0`）发布，全
 
 ## 7. 签署、生效与贡献接收流程
 
-本协议必须经贡献者明确同意，并由项目维护方确认接收后生效。仅提交 PR、提交记录中的 `Signed-off-by`、使用或下载项目，均不等同于签署本 CLA。
+本协议必须经贡献者明确同意，并由项目维护方确认接收后生效。仅提交 PR、提交记录中的 `Signed-off-by`、使用或下载项目，均不等同于签署本 CLA。CLA Assistant 等工具的自动签署状态仅作为贡献者表达同意的辅助记录，不能替代双方身份核验、实际权利人授权及维护方的接收确认。
 
-签署流程：
+### 7.1 公开标识与私下身份披露
 
-1. 贡献者阅读全文，使用下面的声明，在自己的 PR 中评论或通过维护方确认的私下渠道提供签署记录。签署记录必须包含双方的可识别身份、协议版本及对应的 `CLA.md` 提交哈希，不能只指向可能变化的默认分支内容。
-2. 企业贡献由有权代表实际权利人的人签署，记录企业法定名称、代表身份以及被授权提交贡献的账号。新增未被授权的提交者须补充确认。
-3. 项目维护方核对贡献者与实际作者/权利人，确认签署信息完整并明确回复接收。在涉及多名权利人的 PR 中，必须分别获得相应授权。未完成确认的贡献不应合并。
-4. 维护方保存完整协议版本、签署声明、主体身份、授权范围、日期、对应 PR/提交及确认接收记录。为保护隐私，法定姓名、联系方式和雇主授权证明可以通过双方约定的私下渠道保存，不应要求在公开 PR 中披露不必要的个人资料。
+项目采用“公开账号 + 专用邮箱 + 私下实名签署 + 维护方人工确认”的流程。公开账号用于联系和关联记录，不替代第 1 条定义的签约主体。维护方必须在贡献者同意协议之前，通过双方约定的私下渠道提供接收授权主体的法定姓名或法人法定名称，并说明其与公开账号的对应关系。贡献者也通过该渠道提供必要的身份及代表权限信息。
 
-签署声明模板（填写方括号内容后提交；公开记录与私下身份核验记录可以相互引用）：
+**签署入口状态：待配置。** 项目尚未在本文指定接收授权主体的公开账号、专用签署邮箱及其对应的私下身份记录。正式开放签署前，维护方须确认这些信息，公布公开账号和专用邮箱，并完成一次私下签署及公开脱敏确认演练。请勿把法定姓名、签名、邮件正文或雇主授权证明发送到公开 Issue、PR、Gist 或代码仓库；入口未开放时，可在 PR 中请求维护方提供签署渠道，但不要附带个人身份材料。
+
+身份不向公众公开，不等于对签约对方匿名，也不构成身份信息绝不会泄露的承诺。正式启用前应完成所需的法律专业审阅；自动签署工具和强制合并门禁是否配置，须单独核验，不因本文发布而被视为已经启用。
+
+### 7.2 签署与接收步骤
+
+1. 贡献者阅读协议，通过已公布的专用邮箱发送 GitHub 账号、当前 PR 链接和签署申请。维护方先回复接收授权主体的法定身份及对应公开账号、完整固定版本协议、协议版本及对应的 `CLA.md` 完整提交哈希，不能只提供可能变化的默认分支链接。
+2. 贡献者通过私下渠道提交下方签署声明。企业贡献由有权代表实际权利人的人签署，记录企业法定名称、代表身份与权限以及获授权提交贡献的账号；新增未被授权的提交者须补充确认。
+3. **首次签署必须明确列入当前 PR 及签署时拟纳入的提交。** 当前 PR 可能在协议生效前提交，应与其他历史贡献一并明确列出，不能只依靠“签署生效后的贡献”覆盖。未明确列出的其他历史贡献不自动纳入授权。
+4. 维护方核对贡献者、实际作者和权利人，确认签署信息及授权范围完整后，通过私下渠道明确回复接收，并分配不含身份信息的记录编号。涉及多名权利人的 PR 须分别获得相应授权；仅核验 PR 发起人不足以替代其他权利人的授权。
+5. 维护方在公开 PR 中仅发布脱敏确认，例如：“CLA 已核验；协议版本：1.1；记录编号：[编号]；本次 PR 已纳入授权。”公开记录不得包含法定姓名、私下邮件正文、签名或授权证明。记录编号用于关联私下档案，不是法律效力保证。
+6. 完成上述核验与接收确认后才能合并。后续 PR 可复用同一协议版本、同一签约主体且代表权限仍有效的签署，但维护方仍须核对本次实际作者、权利人及授权范围；需要另行授权的企业贡献、历史贡献或第三方材料不能仅凭已有自动签署状态通过。
+
+### 7.3 私下签署声明模板
+
+以下内容仅通过双方确认的私下渠道提交。双方身份可引用该渠道中已披露、双方可核验的身份记录，不能只填写 GitHub 昵称或仓库名称。
 
 ```text
-我已阅读并同意 NarraFork 贡献者许可协议（CLA）1.0。
-协议文本的提交哈希：[包含本次 CLA.md 文本的完整提交哈希]
+我已阅读并同意 NarraFork 贡献者许可协议（CLA）1.1。
+协议文本的完整提交哈希：[包含本次 CLA.md 文本的完整提交哈希]
 我特别同意第 3 条：项目维护方可在无需再次征求我同意的情况下，
 将我有权许可的贡献改用 MIT、Apache-2.0、BSD-3-Clause，
 或该条定义的其他宽松开源许可证发布。
-贡献者姓名 / 法人法定名称：[填写，或引用私下身份核验记录]
+贡献者法定姓名 / 法人法定名称：[填写，或引用双方已核验的私下身份记录]
 签署人及代表权限：[本人 / 法人授权代表及其权限]
-贡献者账号：[填写；法人签署时列出获授权的贡献者账号]
-项目维护方法定姓名 / 法人法定名称：[填写，或引用双方确认的身份记录]
-适用范围：签署生效后的贡献，以及下列明确列出的历史贡献。
-历史贡献：[PR 链接 / 完整提交哈希；如无则填写“无”]
+贡献者 GitHub 账号：[填写；法人签署时列出获授权的贡献者账号]
+项目维护方法定姓名 / 法人法定名称：[填写，或引用双方已核验的私下身份记录]
+项目维护方公开账号：[与上述接收授权主体关联的 GitHub 账号]
+适用范围：签署生效后的贡献，以及下列明确列出的当前 PR 和其他历史贡献。
+当前 PR 及拟纳入的提交：[PR 链接及完整提交哈希]
+其他历史贡献：[PR 链接 / 完整提交哈希；如无则填写“无”]
 签署日期：[YYYY-MM-DD]
 签署确认：[姓名或双方认可的电子签署方式]
 ```
 
-对本协议的后续修改不自动扩大已签署贡献者的授权；需要扩大范围时，应对新文本重新取得明确同意。历史贡献未经权利人明确补签，不能被视为已经获得本协议的再许可授权。
+维护方通过私下渠道回复接收确认，明确协议版本、完整提交哈希、接收授权主体、签署人及贡献者账号、被接收的授权范围、接收日期和记录编号。贡献者声明与接收确认共同构成签署档案，不得用公开脱敏评论替代完整记录。
+
+### 7.4 档案、隐私与协议更新
+
+双方各自保存完整固定版本协议、签署声明、双方身份及关联账号、代表权限和必要的企业授权依据、授权范围、日期、对应 PR/提交与接收确认。维护方使用受限邮箱或受限存储保存档案，不将其放入公开仓库、Gist、PR 或普通 CI 产物。只收集签署和核验所必要的资料，不默认要求身份证扫描件、住址或电话号码；如使用第三方签署服务，应在使用前明确其数据处理方式和访问权限。上述公开脱敏要求针对签署与身份核验材料，不要求删除第 2、5 条所需保留的版权、署名及第三方声明。
+
+第三方材料仍按第 5 条单独审查。机器人账号白名单只表示特定流程豁免，不表示机器人已签署协议或其贡献已经取得额外再许可授权，维护方仍须审查材料来源和许可依据。
+
+本次 1.1 版本完善签署流程并提供英文对照，不扩大第 1—6 条的实质授权范围。已有签署仍按其实际同意的文本及授权范围处理，不因版本更新而自动替换、补签或扩大。对本协议的后续修改不自动扩大已签署贡献者的授权；需要扩大范围时，应对新文本重新取得明确同意。历史贡献未经权利人明确补签，不能被视为已经获得本协议的再许可授权。
 
 ---
 
 本协议为项目贡献治理文本，不替代针对具体权利归属和适用法律的法律意见。正式启用及实施整体许可证变更前，建议由合格法律专业人士审阅。
+
+## English reference
+
+**NarraFork Contributor License Agreement (CLA)**
+
+Agreement version: 1.1
+
+This is an English reference translation of the Chinese agreement above. If the texts are ambiguous or inconsistent, the Chinese text is the basis for interpretation.
+
+NarraFork is currently released under the Mozilla Public License 2.0 (SPDX: `MPL-2.0`); see [LICENSE](LICENSE) for the full text. Except for third-party materials with an explicit separate license notice, the project's original source code and accompanying materials in this repository are covered by that license. This agreement grants separate rights from the Contributor to the Project Maintainer. It does not modify the MPL-2.0 text and does not require people who only use or distribute the project to sign.
+
+This agreement permits future releases of authorized contributions under permissive open-source licenses such as MIT, Apache-2.0, and BSD-3-Clause. Read the complete agreement before signing, particularly Section 3.
+
+### 1. Parties and scope of Contributions
+
+- **“You” or “Contributor”** means the individual or legal entity signing this agreement and holding the relevant rights. A person signing on behalf of a legal entity must have valid authorization from that entity.
+- **“Project”** means the NarraFork project in the official repository `NarraFork/narrafork`.
+- **“Project Maintainer”** means the individual or legal entity confirmed by the official repository maintainers and expressly identified in the signing record as responsible for maintaining the Project and receiving the contribution grants. A repository name, account name, or the description “maintenance team” does not by itself identify the contracting party.
+- **“Contribution”** means original code, patches, documentation, tests, and other materials You intentionally submit to the Project for inclusion or improvement, including materials submitted through Pull Requests, commits, Issue attachments, or other channels agreed with the Project Maintainer. Materials explicitly marked “非贡献 / Not a Contribution” are excluded.
+
+This agreement covers Contributions You submit after it takes effect, and historical Contributions expressly listed in Your signing record using PR links, commit hashes, or other verifiable references. Unlisted historical Contributions are not automatically covered by signing.
+
+### 2. Copyright license and retained rights
+
+You retain copyright in Your Contributions and all other rights not expressly granted. This agreement is not a copyright assignment and does not restrict Your own use or licensing of Your Contributions.
+
+For Contributions You have the right to license, You grant the Project Maintainer a worldwide, non-exclusive, perpetual, license-fee-free, royalty-free copyright license, irrevocable to the extent permitted by applicable law, to reproduce, use, modify, create derivative works of, publicly display, publicly perform, and distribute the Contributions, and to sublicense them under Section 3.
+
+The Project Maintainer must retain copyright, attribution, license, and disclaimer notices required by the applicable licenses. Within the authorization in Section 3, the Project Maintainer may update license notices for new releases, but must not falsely claim ownership of Your copyright or remove required third-party notices. This agreement does not grant rights to use Your trademarks, trade names, or logos for endorsement or promotion.
+
+### 3. Express authorization for permissive open-source relicensing
+
+You expressly agree and authorize the Project Maintainer, without seeking Your consent again for each change within this Section, to:
+
+1. Incorporate and release Your Contributions under `MPL-2.0` at present;
+2. In the future, relicense, sublicense, or dual-/multi-license Your Contributions, separately or as part of the Project or derivative works, under **MIT, Apache License 2.0 (`Apache-2.0`), or BSD 3-Clause License (`BSD-3-Clause`)**, including replacing MPL-2.0 with one of these licenses in new releases;
+3. Use other licenses approved by the Open Source Initiative (OSI) that are permissive in the same sense as the licenses above, such as `BSD-2-Clause` or `ISC`. Here, “permissive” means a license allowing use, modification, and redistribution, including commercial use, without requiring disclosure of modified source code or licensing modifications or derivative works under the same license. Attribution, retention of notices, disclaimers, prohibitions on endorsement, or patent provisions do not by themselves put a license outside this scope.
+
+This authorization includes providing the copyright sublicenses and patent sublicenses within Section 4 necessary for recipients to exercise rights under the selected license. The Project Maintainer may also continue releasing under MPL-2.0; this agreement is not a commitment to change licenses in the future.
+
+**This agreement does not authorize relicensing Contributions under exclusively proprietary, closed-source, or other non-open-source licenses, or license changes outside this Section.** Changes outside this scope require separate express authorization from the relevant rights holders. Permissive open-source licenses may allow downstream recipients to use Contributions in closed-source products; that is a use permitted by the selected open-source license, not an unrestricted proprietary sublicensing right for the Project Maintainer.
+
+This Section applies only to Contributions You have the right to license and that are covered by this agreement. It does not cover other contributors' works or third-party dependencies. Before changing the license of the entire Project, the Project Maintainer must confirm sufficient authorization for the relevant materials, or retain and clearly mark their original licenses, remove them, or replace them.
+
+MPL-2.0 licenses already validly granted to recipients are not withdrawn by a future change of license. Rights obtained solely under MPL-2.0 by third parties who have not signed this agreement do not include the additional relicensing rights granted to the Project Maintainer by this agreement.
+
+### 4. Patent license
+
+For patent claims You own or have the right to license that are necessarily practiced by Your Contributions alone, or by the combination of Your Contributions with the Project as it existed when they were submitted, You grant the Project Maintainer and recipients of Contributions it distributes a worldwide, non-exclusive, perpetual, license-fee-free, royalty-free patent license, sublicensable under Section 3, to make, have made, use, offer to sell, sell, import, and transfer the Contributions and that combination.
+
+Except for the termination described below, this license is irrevocable to the extent permitted by applicable law. It does not cover patent claims practiced only because of subsequent modifications or other combinations.
+
+If any recipient, including the Project Maintainer, institutes patent litigation, including a counterclaim or cross-claim, alleging that Your Contributions or the combination described above in the Project constitute direct or indirect patent infringement, the patent license You grant under this agreement to that recipient terminates as of the date the litigation is filed. This does not terminate Your licenses to other recipients or change patent provisions in independently applicable open-source licenses.
+
+### 5. Contributor representations and third-party materials
+
+You represent that:
+
+1. You have the capacity and authority to sign this agreement and grant the copyright and patent licenses above. If Contributions belong to an employer, client, or other party, You have authorization from the actual rights holder, or that rights holder signs directly. An individual's signature does not replace the rights holder's authorization.
+2. The Contributions are Your original works, or You have obtained sufficient rights to make the grants in this agreement. When submitting third-party materials, You must expressly identify their source, rights holders, licenses, and relicensing restrictions, and retain required notices. You must not grant third-party rights as if they were Your own.
+3. To Your knowledge, submitting the Contributions does not breach confidentiality obligations to others or include unauthorized disclosures of trade secrets, credentials, or other protected information.
+4. You will promptly notify the Project Maintainer if You discover facts or changes in rights ownership affecting the grants in this agreement.
+
+Third-party materials You cannot license under this agreement are outside its grant scope. The Project Maintainer must separately review whether to accept those materials and record the basis for their licensing.
+
+### 6. Unpaid Contributions, disclaimers, and Maintainer obligations
+
+Submitting Contributions does not obligate You to provide support, maintenance, updates, or fixes, and this agreement does not by itself entitle You to compensation, Project governance rights, or acceptance of Contributions. Except for the express representations in Section 5, Contributions are provided “as is,” without other express or implied warranties to the extent permitted by applicable law.
+
+The Project Maintainer is responsible for license changes, release compliance, and its own external support or warranty commitments, and must not promise additional obligations on Your behalf. This agreement does not exclude or limit liabilities that cannot legally be excluded or limited.
+
+The Project Maintainer may have a successor Project maintenance individual or legal entity, confirmed in writing, assume the grants under this agreement, but only to continue maintaining this Project. The successor must assume the same obligations and relicensing boundaries. Such succession does not expand this agreement's grant scope.
+
+### 7. Signing, effectiveness, and contribution acceptance
+
+This agreement takes effect only after the Contributor expressly agrees and the Project Maintainer confirms acceptance. Submitting a PR, a `Signed-off-by` in a commit, or using or downloading the Project does not by itself constitute signing this CLA. Automated signing status from CLA Assistant or similar tools is only supporting evidence of the Contributor's expressed consent. It does not replace identity verification, authorization from the actual rights holders, or the Maintainer's acceptance confirmation.
+
+#### 7.1 Public identifier and private identity disclosure
+
+The Project uses a process of “public account + dedicated email + private signing with legal identities + manual Maintainer confirmation.” The public account is a contact and record-linking identifier, not a substitute for the contracting party defined in Section 1. Before the Contributor agrees, the Maintainer must disclose the legal name of the individual or legal entity receiving the grants through a mutually agreed private channel, and explain its association with the public account. The Contributor provides necessary identity and representative-authority information through that channel as well.
+
+**Signing channel status: pending configuration.** This document does not yet specify the public account of the grant recipient, the dedicated signing email, or the corresponding private identity record. Before opening signing, the Maintainer must confirm this information, publish the public account and dedicated email, and complete a trial of private signing and redacted public confirmation. Do not send legal names, signatures, email bodies, or employer authorization documents to public Issues, PRs, Gists, or the code repository. While the channel is not open, You may request a signing channel from the Maintainer in a PR, without attaching personal identity materials.
+
+Keeping identities private from the public does not mean anonymity toward the other contracting party, and does not guarantee that identity information will never be disclosed. Required professional legal review should be completed before formal activation. Configuration of automated signing tools and mandatory merge checks must be verified separately; publication of this document does not mean they have been enabled.
+
+#### 7.2 Signing and acceptance steps
+
+1. The Contributor reads the agreement and sends a GitHub account, current PR link, and signing request to the published dedicated email. The Maintainer first replies with the grant recipient's legal identity and corresponding public account, the complete fixed agreement text, its version, and the corresponding full `CLA.md` commit hash, not merely a link to a changing default branch.
+2. The Contributor submits the signing statement below privately. Corporate Contributions must be signed by a person authorized to represent the actual rights holder, recording the entity's legal name, the representative's identity and authority, and the accounts authorized to submit Contributions. Newly added submitters without authorization require additional confirmation.
+3. **The first signing must expressly list the current PR and the commits intended to be covered at signing.** The current PR may have been submitted before this agreement takes effect and must be expressly listed alongside other historical Contributions, rather than relying solely on coverage of “Contributions after effectiveness.” Other unlisted historical Contributions are not automatically covered.
+4. The Maintainer verifies the Contributor, actual authors, and rights holders. After confirming complete signing information and grant scope, the Maintainer expressly confirms acceptance privately and assigns a record identifier containing no identity information. PRs involving multiple rights holders require authorization from each relevant holder; verifying only the PR author is not a substitute.
+5. The Maintainer posts only redacted confirmation in the public PR, for example: “CLA verified; agreement version: 1.1; record ID: [ID]; this PR is covered by the grant.” Public records must not include legal names, private email bodies, signatures, or authorization documents. The record ID links to the private archive; it is not a guarantee of legal validity.
+6. Merge only after verification and acceptance confirmation. Later PRs may reuse a signing for the same agreement version and contracting parties with representative authority still valid, but the Maintainer must still check the actual authors, rights holders, and grant scope for each PR. Corporate Contributions, historical Contributions, or third-party materials requiring separate authorization cannot pass solely on an existing automated signing status.
+
+#### 7.3 Private signing statement template
+
+Submit the following only through the mutually confirmed private channel. The parties' identities may refer to previously disclosed identity records verifiable by both parties in that channel, but not solely to GitHub nicknames or repository names.
+
+```text
+I have read and agree to the NarraFork Contributor License Agreement (CLA) 1.1.
+Full commit hash of the agreement text: [full commit hash containing this CLA.md text]
+I expressly agree to Section 3: without seeking my consent again, the Project Maintainer
+may release Contributions I have the right to license under MIT, Apache-2.0,
+BSD-3-Clause, or other permissive open-source licenses defined in that Section.
+Contributor's legal name / entity's legal name: [name or reference to a private identity record verified by both parties]
+Signatory and representative authority: [self / authorized entity representative and authority]
+Contributor's GitHub account(s): [account; for an entity, list authorized contributor accounts]
+Project Maintainer's legal name / entity's legal name: [name or reference to a private identity record verified by both parties]
+Project Maintainer's public account: [GitHub account associated with the grant recipient above]
+Scope: Contributions after this agreement takes effect and the current PR and other historical Contributions expressly listed below.
+Current PR and commits to be covered: [PR link and full commit hashes]
+Other historical Contributions: [PR links / full commit hashes; "none" if not applicable]
+Signing date: [YYYY-MM-DD]
+Signing confirmation: [name or mutually accepted electronic signing method]
+```
+
+The Maintainer replies privately with acceptance confirmation identifying the agreement version, full commit hash, grant recipient, signatory and Contributor accounts, accepted grant scope, acceptance date, and record ID. The Contributor's statement and acceptance confirmation together form the signing archive. A redacted public comment must not replace the complete record.
+
+#### 7.4 Archives, privacy, and agreement updates
+
+Each party retains the complete fixed agreement text, signing statement, both parties' identities and associated accounts, representative authority and necessary corporate authorization evidence, grant scope, dates, corresponding PRs/commits, and acceptance confirmation. The Maintainer stores the archive in restricted email or restricted storage, not in public repositories, Gists, PRs, or ordinary CI artifacts. Collect only information necessary for signing and verification; do not require identity-document scans, residential addresses, or phone numbers by default. Before using a third-party signing service, clarify its data processing and access permissions. The public-redaction requirements above apply to signing and identity-verification materials; they do not require removing copyright, attribution, or third-party notices that must be retained under Sections 2 and 5.
+
+Third-party materials remain subject to separate review under Section 5. A bot-account allowlist indicates only a particular process exemption, not that the bot has signed the agreement or that its Contributions have additional relicensing authorization. The Maintainer must still review material sources and licensing grounds.
+
+Version 1.1 improves the signing process and adds an English reference without expanding the substantive grants in Sections 1–6. Existing signings remain governed by the text and scope actually agreed; an update does not automatically replace them, constitute an additional signing, or expand them. Later amendments do not automatically expand the authorization of Contributors who have already signed. Expanded scope requires renewed express consent to the new text. Historical Contributions without explicit additional signing by the rights holder must not be treated as having this agreement's relicensing authorization.
+
+---
+
+This agreement is a Project contribution-governance document, not a substitute for legal advice on specific rights ownership and applicable law. Review by a qualified legal professional is recommended before formal activation and before changing the license of the entire Project.
