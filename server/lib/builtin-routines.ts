@@ -400,9 +400,9 @@ When testing is warranted, verify observable behavior rather than wording. Prefe
 		skill: {
 			name: "nf-openui",
 			descriptionEn:
-				"Show interactive charts, cards, tables, or forms inside NarraFork chat when requested; not for ordinary answers or code development",
+				"Use interactive charts, cards, tables, and forms in NarraFork chat to visualize data, compare options, organize explanations, and collect input.",
 			descriptionZh:
-				"仅在用户要求于 NarraFork 聊天内展示交互图表、卡片、表格或表单时使用；普通回答和代码开发无需加载",
+				"在 NarraFork 聊天中使用交互图表、卡片、表格和表单，可视化数据、比较方案、组织信息和收集输入。",
 			content: OPENUI_SKILL_CONTENT,
 		},
 	},

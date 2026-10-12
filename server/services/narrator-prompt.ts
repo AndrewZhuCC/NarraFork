@@ -139,6 +139,16 @@ export async function buildEffectiveSystemPrompt(
 		prompt = `${base}${base ? "\n\n" : ""}## Message Senders\n\n${rules}`;
 	}
 
+	// Stable capability hint only; component rules stay in the on-demand Skill result.
+	{
+		const base = prompt ?? "";
+		const rules =
+			locale === "zh-CN"
+				? "NarraFork 聊天支持 Markdown 和交互组件，包括图表、卡片、表格、可展开步骤与表单。使用组件呈现数据、组织信息和收集输入；组件语法通过可用的 nf-openui 技能按需加载。"
+				: "NarraFork chat supports Markdown and interactive components: charts, cards, tables, expandable steps, and forms. Use components to present data, organize information, and collect input. Load component syntax on demand through the available nf-openui skill.";
+		prompt = `${base}${base ? "\n\n" : ""}## Chat UI\n\n${rules}`;
+	}
+
 	// 2. Inject current working directory + shell type info
 	{
 		const base = prompt ?? "";

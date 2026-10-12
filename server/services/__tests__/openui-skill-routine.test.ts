@@ -6,6 +6,7 @@ import { OPENUI_SKILL_CONTENT } from "../../generated/openui-skill";
 import { getBuiltinRoutine, getBuiltinSkillRoutines } from "../../lib/builtin-routines";
 import { getNarraforkHome } from "../../lib/narrafork-home";
 import { settings } from "../../lib/settings";
+import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 import {
 	disableRoutineGlobal,
 	enableRoutineGlobal,
@@ -55,9 +56,9 @@ describe("nf-openui builtin skill routine", () => {
 		expect(getGlobalRoutineStatuses().find((entry) => entry.id === ROUTINE_ID)?.enabled).toBe(true);
 		const skill = openuiSkill();
 		expect(skill.name).toBe(ROUTINE_ID);
-		expect(skill.descriptionEn).toContain("inside NarraFork chat when requested");
-		expect(skill.descriptionEn).toContain("not for ordinary answers or code development");
-		expect(skill.descriptionZh).toContain("普通回答和代码开发无需加载");
+		expect(skill.descriptionEn).toContain("visualize data, compare options");
+		expect(skill.descriptionEn).toContain("collect input");
+		expect(skill.descriptionZh).toContain("可视化数据、比较方案、组织信息和收集输入");
 		expect(skill.descriptionEn.length).toBeLessThan(200);
 		expect(skill.descriptionZh.length).toBeLessThan(100);
 	});
@@ -73,7 +74,12 @@ describe("nf-openui builtin skill routine", () => {
 		expect(content).toContain(
 			"`inlineMode: true`, `bindings: true`, `tools: []`, and `toolCalls: false`",
 		);
-		expect(content).toContain("Ordinary answers remain Markdown");
+		expect(content).toContain("charts for patterns and trends");
+		expect(content).toContain("Combine UI with Markdown narration");
+		expect(content).not.toContain("only for explicitly requested");
+		expect(content).not.toContain("unless the user explicitly requests");
+		expect(content).not.toContain("when the user asks a QUESTION");
+		expect(content).not.toContain("respond with text only — NO code");
 		expect(content).not.toContain("Your ENTIRE response must be valid openui-lang");
 		expect(content).not.toContain("## Query");
 		expect(content).not.toContain("## Mutation");
@@ -82,6 +88,24 @@ describe("nf-openui builtin skill routine", () => {
 		expect(content).toContain("Never emit @OpenUrl, open_url");
 		expect(content).toContain("unknown action types");
 		expect(content).toContain("do not install anything for it");
+	});
+
+	test("built-in capability hints describe chat UI capabilities without embedding component docs", async () => {
+		for (const locale of ["en", "zh-CN"] as const) {
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: "Test narrator",
+				cwd: getNarraforkHome(),
+				locale,
+			});
+			expect(prompt).toContain("## Chat UI");
+			expect(prompt).toContain("nf-openui");
+			expect(prompt).toContain(
+				locale === "zh-CN"
+					? "呈现数据、组织信息和收集输入"
+					: "present data, organize information, and collect input",
+			);
+			expect(prompt).not.toContain("## Component Signatures");
+		}
 	});
 
 	test("materializes on enable, keeps discovery brief, and loads the body only on demand", async () => {

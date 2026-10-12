@@ -2,13 +2,13 @@
 // @openuidev/react-ui@0.17.0 / @openuidev/react-lang@0.3.2
 export const OPENUI_SKILL_CONTENT = `# nf-openui
 
-Show interactive charts, cards, tables, and forms only when the user asks for them inside NarraFork chat.
+Use interactive charts, cards, tables, and forms in NarraFork chat to visualize data, compare options, organize explanations, and collect input.
 
 ## Loading and context
 
 - Before generating UI, load this skill with the existing Skill tool using name \`nf-openui\` unless its full rules and component reference are already present in the current context.
 - Do not reload while these rules are available. After compaction, if the rules or component reference are missing and UI is needed again, reload \`nf-openui\` or reread its SKILL.md before generating; do not guess component signatures from memory.
-- Ordinary answers and code development continue as Markdown and do not require this skill. UI code belongs in \`\`\`openui-lang fences inside the chat reply, with Markdown allowed before and after.
+- Combine Markdown narration and copyable text or code with component blocks for visualization, structure, and interaction. UI code belongs in \`\`\`openui-lang fences inside the chat reply, with Markdown allowed before and after.
 
 ## NarraFork renderer boundary
 
@@ -18,7 +18,7 @@ The library prompt is generated with \`inlineMode: true\`, \`bindings: true\`, \
 
 Generated from @openuidev/react-ui@0.17.0 / @openuidev/react-lang@0.3.2; 84 registered components. This fixed reference is loaded only with the skill, not injected into every ordinary conversation.
 
-Use openui-lang only for explicitly requested interactive UI inside NarraFork chat. Ordinary answers remain Markdown. The NarraFork output and execution rules take precedence over generic library examples.
+The following component reference describes NarraFork's in-chat UI. The NarraFork output and execution rules take precedence over generic library examples.
 
 ## Syntax Rules
 
@@ -251,30 +251,6 @@ During streaming, the output is re-parsed on every chunk. Undefined references a
 
 Always write the root = Card(...) statement first so the UI shell appears immediately, even before child data has streamed in.
 
-## Inline Mode
-
-You are in inline mode. You can respond in two ways:
-
-### 1. Code response (when the user wants to CREATE or CHANGE the UI)
-Wrap openui-lang code in triple-backtick fences. You can include explanatory text before/after:
-
-Here's your dashboard:
-
-\`\`\`openui-lang
-root = RootComp([header, content])
-header = SomeHeader("Title")
-content = SomeContent("Hello world")
-\`\`\`
-
-I created a simple layout with a header.
-
-### 2. Text-only response (when the user asks a QUESTION)
-If the user asks "what is this?", "explain the chart", "how does this work", etc. — respond with plain text. Do NOT output any openui-lang code. The existing dashboard stays unchanged.
-
-### Rules
-- When the user asks for changes, output ONLY the changed/new statements in a fenced block
-- When the user asks a question, respond with text only — NO code. The dashboard stays unchanged.
-- The parser extracts code from fences automatically. Text outside fences is shown as chat.
 ## Important Rules
 - Choose components that best represent the content (tables for comparisons, charts for trends, forms for input, etc.)
 
@@ -284,7 +260,7 @@ Before finishing, walk your output and verify:
 2. Every referenced name is defined. Every defined name (other than root) is reachable from root.
 3. Every $binding appears in at least one component or expression.
 
-- Ordinary answers, explanations, and code development remain Markdown; do not turn them into UI unless the user explicitly requests an interactive chart, card, table, or form inside NarraFork chat.
+- Choose components for the information and interaction: charts for patterns and trends, tables for comparisons, cards or expandable steps for structured explanations, and forms for collecting input or choices. Combine UI with Markdown narration as useful.
 - Wrap every UI program in a triple-backtick openui-lang code block. Each block must be self-contained: root = Card(...) first, then all referenced statements and local data. For changes, emit the complete updated program, not a partial patch; other chat blocks do not supply definitions.
 - Use only the registered components and declarative language below. Do not generate a webpage, HTML/JSX, executable JavaScript, a frontend application, or user files to display this UI; do not install anything for it.
 - NarraFork supplies no renderer tool provider: never emit Query(), Mutation(), @Run, MCP calls, network requests, shell commands, file operations, or invented execution actions. Available renderer tools are empty; UI is not an execution permission.
