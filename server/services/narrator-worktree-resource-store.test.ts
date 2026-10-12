@@ -17,8 +17,9 @@ const root = resolve(import.meta.dir, "../..");
 const journal = JSON.parse(readFileSync(join(root, "drizzle/meta/_journal.json"), "utf8")) as {
 	entries: { idx: number; tag: string }[];
 };
-const target = journal.entries.find((entry) => entry.idx === 189);
+const target = journal.entries.find((entry) => entry.tag === "0017_merge_opensource_083");
 if (!target) throw new Error("Missing generated resource migration");
+const targetIndex = target.idx;
 const migration = readFileSync(join(root, `drizzle/${target.tag}.sql`), "utf8");
 const fixtures: Database[] = [];
 const registration = {
@@ -34,7 +35,7 @@ function fixture(upgraded = true) {
 	const folder = mkdtempSync(join(tmpdir(), "nf-resource-schema-fixture-"));
 	try {
 		mkdirSync(join(folder, "meta"));
-		const entries = journal.entries.filter((entry) => entry.idx < 189);
+		const entries = journal.entries.filter((entry) => entry.idx < targetIndex);
 		writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify({ ...journal, entries }));
 		for (const entry of entries)
 			writeFileSync(
@@ -63,17 +64,21 @@ afterEach(() => {
 });
 
 describe("resource schema real old-chain upgrade", () => {
-	test("0188 populated legacy data is preserved byte-for-byte; old inventory stays unknown", () => {
+	test("selfuse legacy data survives; new resource inventory starts empty with unknown defaults", () => {
 		const { sqlite } = fixture(false);
-		sqlite.exec(`INSERT INTO narrator_worktree_resources(id,owner_narrator_id,device_id,repository_key,worktree_path,state,create_request_id) VALUES ('historic','n','local','repo','/fixture/old','ready','old');
-			INSERT INTO container_instances(id,chapter_id,service_name,volume_name,created_at,updated_at) VALUES ('legacy-container','c','web','persistent-volume','now','now');
+		// Unlike upstream 0190, the selfuse predecessor has no resource registry yet.
+		expect(
+			sqlite
+				.query("SELECT name FROM sqlite_master WHERE name = 'narrator_worktree_resources'")
+				.get(),
+		).toBeNull();
+		sqlite.exec(`INSERT INTO container_instances(id,chapter_id,service_name,volume_name,created_at,updated_at) VALUES ('legacy-container','c','web','persistent-volume','now','now');
 			INSERT INTO terminals(id,chapter_id,name,created_at) VALUES ('legacy-terminal','c','fixture','now');
 			INSERT INTO port_allocations(port,chapter_id,service_name,allocated_at) VALUES (11000,'c','web','now');
 			INSERT INTO terminal_view_state(id,user_id,chapter_id,layout,panel_assignments,updated_at) VALUES ('layout','viewer','c','quad','{"slots":["legacy-terminal"],"raw":"保留"}','now');
 			INSERT INTO volume_snapshots(id,project_id,name,source_chapter_id,service_name,container_path,created_at,updated_at) VALUES ('snapshot','p','fixture','c','web','/data','now','now');
 			INSERT INTO volume_snapshot_applications(id,snapshot_id,chapter_id,applied_at,applied_by) VALUES ('application','snapshot','c','now','viewer');`);
 		const tables = [
-			"narrator_worktree_resources",
 			"container_instances",
 			"terminals",
 			"port_allocations",
@@ -88,6 +93,13 @@ describe("resource schema real old-chain upgrade", () => {
 		upgrade(sqlite);
 		for (const { table, row } of before)
 			expect(sqlite.prepare(`SELECT * FROM ${table}`).get()).toMatchObject(row);
+		expect(sqlite.query("SELECT count(*) AS count FROM narrator_worktree_resources").get()).toEqual(
+			{ count: 0 },
+		);
+		// Legacy-format registrations must not invent verified ownership after the upgrade.
+		sqlite.exec(
+			"INSERT INTO narrator_worktree_resources(id,owner_narrator_id,device_id,repository_key,worktree_path,state,create_request_id) VALUES ('historic','n','local','repo','/fixture/old','ready','old')",
+		);
 		expect(
 			sqlite
 				.query(

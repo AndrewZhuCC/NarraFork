@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narratorMessageRefs, narrators } from "../../db/schema";
+import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
 import { settings } from "../../lib/settings";
 import { setUploadsDirForTests } from "../../lib/uploads";
@@ -19,6 +19,8 @@ const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { consumeAgentMessageHistory } = await import("../agent-message-delivery");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const originalProviders = settings.anthropicProviders;
+const originalOpenAIProviders = settings.openaiProviders;
+const originalGeminiProviders = settings.geminiProviders;
 const time = "2026-09-09T00:00:00.000Z";
 beforeEach(() => {
 	cleanDb(sqlite);
@@ -31,12 +33,34 @@ beforeEach(() => {
 		defaultModel: "claude-sonnet-4",
 		officialApi,
 	}));
+	settings.openaiProviders = (["responses", "completions"] as const).map((apiMode) => ({
+		id: `question-${apiMode}`,
+		name: "Question OpenAI history",
+		prefix: `question-${apiMode}`,
+		apiKey: "isolated-test-no-network",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "gpt-5",
+		apiMode,
+	}));
+	settings.geminiProviders = (["generate-content", "interactions"] as const).map(
+		(geminiTransport) => ({
+			id: geminiTransport === "generate-content" ? "question-gemini" : "question-interactions",
+			name: "Question Gemini history",
+			prefix: geminiTransport === "generate-content" ? "question-gemini" : "question-interactions",
+			apiKey: "isolated-test-no-network",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "gemini-2.5-pro",
+			geminiTransport,
+		}),
+	);
 	for (const id of ["primary", "child", "fork"])
 		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
 });
 afterEach(() => {
 	for (const id of ["primary", "child", "fork"]) getExecutionOwner(id)?.release();
 	settings.anthropicProviders = originalProviders;
+	settings.openaiProviders = originalOpenAIProviders;
+	settings.geminiProviders = originalGeminiProviders;
 });
 afterAll(() => sqlite.close());
 function options(profile: "primary" | "subagent" = "primary", official = false) {
@@ -62,6 +86,428 @@ function message(
 		parentToolUseId,
 		messageUuid: null,
 	};
+}
+
+const HUMAN_QUESTION_CANARY = "human-answer-only-7c970c41";
+const questionInput = {
+	questions: [
+		{
+			question: "Which rollout should we use?",
+			header: "Rollout",
+			options: [
+				{ label: "Small", description: "Start with a limited rollout" },
+				{ label: "Full", description: "Roll out to everyone" },
+			],
+			multiSelect: false,
+		},
+	],
+	async: false,
+};
+const questionReply = {
+	answers: { "Which rollout should we use?": HUMAN_QUESTION_CANARY },
+	annotations: { "Which rollout should we use?": "human-annotation-only-62590eaa" },
+	deferredByUser: true,
+};
+type QuestionProvider = "anthropic" | "responses" | "gemini";
+function questionProviderOptions(provider: QuestionProvider) {
+	return provider === "anthropic"
+		? { model: "claude-sonnet-4", provider: "history-relay" }
+		: provider === "responses"
+			? { model: "gpt-5", provider: "question-responses" }
+			: { model: "gemini-2.5-pro", provider: "question-gemini" };
+}
+
+// Inspect concrete native provider items, not the DB/modelMessages projection.
+function nativeToolArguments(history: unknown[], toolName = "AskUserQuestion"): unknown[] {
+	const inputs: unknown[] = [];
+	const visit = (value: unknown): void => {
+		if (Array.isArray(value)) {
+			for (const entry of value) visit(entry);
+		} else if (value && typeof value === "object") {
+			const row = value as Record<string, unknown>;
+			if (row.type === "tool_use" && row.name === toolName) inputs.push(row.input);
+			if (row.type === "function_call" && row.name === toolName) {
+				if (typeof row.arguments !== "string")
+					throw new Error("Responses function_call.arguments must be native JSON text");
+				// One parse must recover the object; a second parse would hide a wire bug.
+				inputs.push(JSON.parse(row.arguments));
+			}
+			if (row.functionCall && typeof row.functionCall === "object") {
+				const call = row.functionCall as Record<string, unknown>;
+				if (call.name === toolName) inputs.push(call.args);
+			}
+			for (const entry of Object.values(row)) visit(entry);
+		}
+	};
+	visit(history);
+	return inputs;
+}
+function nativeQuestionResults(payload: unknown): unknown[] {
+	const outputs: unknown[] = [];
+	const visit = (value: unknown): void => {
+		if (Array.isArray(value)) {
+			for (const entry of value) visit(entry);
+		} else if (value && typeof value === "object") {
+			const row = value as Record<string, unknown>;
+			if (row.tool_use_id === "question-use") outputs.push(row.content);
+			if (row.type === "function_call_output" && row.call_id === "question-use")
+				outputs.push(row.output);
+			if (row.name === "AskUserQuestion" && row.response) outputs.push(row.response);
+			for (const entry of Object.values(row)) visit(entry);
+		}
+	};
+	visit(payload);
+	return outputs;
+}
+
+for (const provider of ["anthropic", "responses", "gemini"] as const) {
+	for (const profile of ["primary", "subagent"] as const) {
+		test.each([
+			"current",
+			"legacy-sdk",
+			"sdk-input-only",
+			"row-only",
+			"legacy-string-row",
+		] as const)(`${provider} ${profile} keeps %s question arguments authored and receipts human`, async (layout) => {
+			const tool = message(
+				"question-message",
+				"assistant",
+				"",
+				profile === "subagent" ? "origin" : null,
+			);
+			const audit = { ...questionInput, async: true, ...questionReply };
+			tool.contentJson =
+				layout === "row-only" || layout === "legacy-string-row"
+					? []
+					: [
+							{
+								type: "tool_use",
+								id: "question-use",
+								name: "AskUserQuestion",
+								input:
+									layout === "legacy-sdk" ? { ...questionInput, ...questionReply } : questionInput,
+							},
+						];
+			tool.toolCalls = [
+				{
+					toolUseId: "question-use",
+					toolName: "AskUserQuestion",
+					inputJson:
+						layout === "sdk-input-only"
+							? null
+							: layout === "legacy-string-row"
+								? JSON.stringify(audit)
+								: audit,
+					outputJson: `The user answered: ${HUMAN_QUESTION_CANARY}`,
+					status: "success",
+				},
+			];
+			const expected =
+				layout === "row-only" || layout === "legacy-string-row"
+					? { ...questionInput, async: true }
+					: questionInput;
+			for (const placement of ["trailing", "history", "user-event"] as const) {
+				const source = [tool];
+				if (placement === "user-event")
+					source.push(
+						message(
+							"question-answer-event",
+							"user",
+							`Human answer event: ${HUMAN_QUESTION_CANARY}`,
+						),
+					);
+				if (placement !== "trailing")
+					source.push(message("after-question", "assistant", "Acknowledged"));
+				const before = structuredClone(source);
+				const prepared = await buildRuntimeHistory({
+					...options(profile),
+					...questionProviderOptions(provider),
+					sourceMessages: source,
+				});
+				const arguments_ = nativeToolArguments(prepared.history);
+				expect(arguments_).toEqual([expected]);
+				expect(JSON.stringify(arguments_)).not.toContain(HUMAN_QUESTION_CANARY);
+				expect(JSON.stringify(arguments_)).not.toContain(
+					questionReply.annotations["Which rollout should we use?"],
+				);
+				const results = nativeQuestionResults(
+					placement === "trailing" ? prepared.trailingToolResults : prepared.history,
+				);
+				expect(results).toHaveLength(1);
+				expect(JSON.stringify(results)).toContain(HUMAN_QUESTION_CANARY);
+				if (placement === "user-event") {
+					const humanTurn = prepared.history.find((item) => {
+						const row = item as { role?: string };
+						return row.role === "user" && JSON.stringify(row).includes("Human answer event:");
+					});
+					expect(JSON.stringify(humanTurn)).toContain(HUMAN_QUESTION_CANARY);
+				}
+				expect(prepared.sourceMessages).toBe(source);
+				expect(source).toEqual(before);
+				expect(tool.toolCalls[0].inputJson).toEqual(before[0].toolCalls?.[0].inputJson);
+			}
+		});
+	}
+
+	test(`${provider} matches each original question by tool use ID and preserves other tool fields`, async () => {
+		const secondQuestion = {
+			...questionInput,
+			questions: [
+				{ ...questionInput.questions[0], question: "When should the second rollout start?" },
+			],
+			async: true,
+		};
+		const readInput = {
+			file_path: "/authored/file.ts",
+			answers: "ordinary-read-data-not-question-answer",
+			annotations: { author: "ordinary-read-data" },
+			deferredByUser: true,
+		};
+		const tool = message("multiple-question-message", "assistant", "");
+		tool.contentJson = [
+			{ type: "tool_use", id: "question-use", name: "AskUserQuestion", input: questionInput },
+			{
+				type: "tool_use",
+				id: "second-question-use",
+				name: "AskUserQuestion",
+				input: secondQuestion,
+			},
+			{ type: "tool_use", id: "ordinary-read", name: "Read", input: readInput },
+		];
+		// Reverse row order so a projection by name/position cannot accidentally pass.
+		tool.toolCalls = [
+			{
+				toolUseId: "second-question-use",
+				toolName: "AskUserQuestion",
+				inputJson: { ...secondQuestion, async: false, ...questionReply },
+				outputJson: "second answer",
+				status: "success",
+			},
+			{
+				toolUseId: "question-use",
+				toolName: "AskUserQuestion",
+				inputJson: { ...questionInput, async: true, ...questionReply },
+				outputJson: HUMAN_QUESTION_CANARY,
+				status: "success",
+			},
+			{
+				toolUseId: "ordinary-read",
+				toolName: "Read",
+				inputJson: readInput,
+				outputJson: "file contents",
+				status: "success",
+			},
+		];
+		const source = [tool];
+		const before = structuredClone(source);
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			...questionProviderOptions(provider),
+			sourceMessages: source,
+		});
+		expect(nativeToolArguments(prepared.history)).toEqual([questionInput, secondQuestion]);
+		expect(nativeToolArguments(prepared.history, "Read")).toEqual([readInput]);
+		expect(source).toEqual(before);
+	});
+
+	test(`${provider} full fork replays shared persisted questions without modifying audit or SDK rows`, async () => {
+		const saved = await narratorPersistence.persistAssistantMessage("primary", {
+			uuid: "persisted-question",
+			session_id: "question-session",
+			message: {
+				content: [
+					{ type: "tool_use", id: "question-use", name: "AskUserQuestion", input: questionInput },
+				],
+			},
+		});
+		const call = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.messageId, saved.id),
+		});
+		if (!call) throw new Error("Missing persisted question call");
+		const audit = { ...questionInput, async: true, ...questionReply };
+		await narratorPersistence.overwriteToolCallInput("question-use", audit, call.id);
+		await narratorPersistence.updateToolCallResult(
+			"question-use",
+			{ output: HUMAN_QUESTION_CANARY, status: "success" },
+			saved.id,
+			call.id,
+		);
+		db.insert(narratorMessageRefs)
+			.values({ id: "full-fork-question-ref", narratorId: "fork", messageId: saved.id, seq: 0 })
+			.run();
+		const before = await db.query.narratorMessages.findFirst({
+			where: (messages, { eq }) => eq(messages.id, saved.id),
+		});
+		const auditBefore = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, call.id),
+		});
+		expect(auditBefore?.inputJson).toEqual(audit);
+		expect(before?.contentJson).toEqual([
+			{ type: "tool_use", id: "question-use", name: "AskUserQuestion", input: questionInput },
+		]);
+		for (const narratorId of ["primary", "fork"]) {
+			const prepared = await buildRuntimeHistory({
+				...options(),
+				...questionProviderOptions(provider),
+				narratorId,
+			});
+			expect(nativeToolArguments(prepared.history)).toEqual([questionInput]);
+			expect(JSON.stringify(nativeQuestionResults(prepared.trailingToolResults))).toContain(
+				HUMAN_QUESTION_CANARY,
+			);
+			expect(prepared.sourceMessages[0].id).toBe(saved.id);
+			expect(prepared.sourceMessages[0].toolCalls?.[0].inputJson).toEqual(audit);
+		}
+		expect(
+			await db.query.narratorMessages.findFirst({
+				where: (messages, { eq }) => eq(messages.id, saved.id),
+			}),
+		).toEqual(before);
+		expect(
+			await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, call.id) }),
+		).toEqual(auditBefore);
+	});
+
+	test(`${provider} legacy orphan SDK question does not leak human fields or invent a completed call`, async () => {
+		const orphan = message("orphan-question", "assistant", "");
+		orphan.contentJson = [
+			{
+				type: "tool_use",
+				id: "question-use",
+				name: "AskUserQuestion",
+				input: { ...questionInput, ...questionReply },
+			},
+		];
+		const source = [orphan];
+		const before = structuredClone(source);
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			...questionProviderOptions(provider),
+			sourceMessages: source,
+		});
+		expect(nativeToolArguments(prepared.history)).toEqual([]);
+		expect(JSON.stringify(prepared.history)).not.toContain(HUMAN_QUESTION_CANARY);
+		expect(prepared.trailingToolResults).toEqual([]);
+		expect(source).toEqual(before);
+	});
+}
+
+function injectionMessage(id: string, role: "sys" | "user", text: string) {
+	return {
+		...message(id, role, text),
+		contentJson: [{ type: "system_injection", source: "bg_agent", modelText: text }],
+	};
+}
+
+for (const entry of [
+	{
+		label: "Anthropic relay",
+		model: "claude-sonnet-4",
+		provider: "history-relay",
+		liftsTail: true,
+	},
+	{
+		label: "Anthropic official",
+		model: "claude-sonnet-4",
+		provider: "history-official",
+		liftsTail: false,
+	},
+	{ label: "Responses", model: "gpt-5", provider: "question-responses", liftsTail: false },
+	{ label: "Completions", model: "gpt-5", provider: "question-completions", liftsTail: false },
+	{ label: "Gemini", model: "gemini-2.5-pro", provider: "question-gemini", liftsTail: false },
+	{
+		label: "Gemini interactions",
+		model: "gemini-2.5-pro",
+		provider: "question-interactions",
+		liftsTail: false,
+	},
+]) {
+	test(`${entry.label} reports native source IDs retained in history, not its extracted tail`, async () => {
+		const source = [
+			message("u", "user", "earlier"),
+			injectionMessage("historical-notice", "sys", "same-notice-body"),
+			message("a", "assistant", "answer"),
+			injectionMessage("tail-notice", "sys", "same-notice-body"),
+			{
+				...injectionMessage("hidden-notice", "sys", "hidden-child-body"),
+				parentToolUseId: "child-origin",
+			},
+			{ ...injectionMessage("display-notice", "sys", "display-only-body"), role: "disp" as const },
+		];
+		const before = structuredClone(source);
+		const prepared = await buildRuntimeHistory({ ...options(), ...entry, sourceMessages: source });
+		expect(prepared.replayedInjectionMessageIds).toEqual(
+			entry.liftsTail ? ["u", "historical-notice"] : ["u", "historical-notice", "tail-notice"],
+		);
+		const historyText = JSON.stringify(prepared.history);
+		expect(historyText.split("same-notice-body").length - 1).toBe(entry.liftsTail ? 1 : 2);
+		expect(historyText).not.toContain("hidden-child-body");
+		expect(historyText).not.toContain("display-only-body");
+		if (entry.liftsTail) expect(prepared.currentText).toContain("same-notice-body");
+		expect(source).toEqual(before);
+	});
+
+	for (const legacyMetadata of [false, true]) {
+		test(`${entry.label} reports buffered plain input before a hint (legacy=${legacyMetadata})`, async () => {
+			const buffered = message("buffered-user", "user", "buffered-plain-body");
+			if (legacyMetadata)
+				(buffered.contentJson as unknown[]).push({
+					type: "system_injection",
+					source: "subagent_message",
+				});
+			const prepared = await buildRuntimeHistory({
+				...options(),
+				...entry,
+				sourceMessages: [
+					message("a", "assistant", "answer"),
+					buffered,
+					injectionMessage("buffered-knowledge-hint", "sys", "buffered-knowledge-body"),
+				],
+			});
+			expect(prepared.replayedInjectionMessageIds).toEqual(
+				entry.liftsTail ? [] : ["buffered-user", "buffered-knowledge-hint"],
+			);
+			const historyText = JSON.stringify(prepared.history);
+			if (entry.liftsTail) {
+				expect(historyText).not.toContain("buffered-plain-body");
+				expect(prepared.currentText).toContain("buffered-knowledge-body");
+			} else {
+				expect(historyText).toContain("buffered-plain-body");
+				expect(historyText).toContain("buffered-knowledge-body");
+			}
+		});
+	}
+
+	test(`${entry.label} never reports a native current-user row as replayed history`, async () => {
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			...entry,
+			sourceMessages: [
+				message("a", "assistant", "answer"),
+				injectionMessage("current-user-notice", "user", "current-native-body"),
+			],
+		});
+		expect(prepared.replayedInjectionMessageIds).toEqual([]);
+		expect(JSON.stringify(prepared.history)).not.toContain("current-native-body");
+	});
+
+	test(`${entry.label} handles an empty extracted sys tail without guessing from trailing text`, async () => {
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			...entry,
+			sourceMessages: [
+				message("a", "assistant", "answer"),
+				injectionMessage("user-before-empty-tail", "user", "before-empty-tail-body"),
+				injectionMessage("empty-sys-tail", "sys", ""),
+			],
+		});
+		expect(prepared.replayedInjectionMessageIds).toEqual(
+			entry.liftsTail ? [] : ["user-before-empty-tail"],
+		);
+		const historyText = JSON.stringify(prepared.history);
+		if (entry.liftsTail) expect(historyText).not.toContain("before-empty-tail-body");
+		else expect(historyText).toContain("before-empty-tail-body");
+	});
 }
 
 // Numeric composition/cache tests now live in narrator-context-composition.test.ts.

@@ -20,6 +20,7 @@
  * Images and PDFs use bounded blob previews; images also open the fullscreen viewer.
  */
 
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import {
 	ActionIcon,
 	Box,
@@ -30,7 +31,6 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
-import { useClipboard } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
 	FILE_REFERENCE_READ_TIMEOUT_MS,
@@ -451,7 +451,7 @@ export function FileViewerContent({
 				<TruncatedPath path={displayPath ?? filePath} fw={600} />
 			) : (
 				<TruncatedText
-					text={fileName}
+					text={filePath}
 					tooltipLabel={filePath}
 					size="xs"
 					fw={600}

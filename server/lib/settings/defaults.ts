@@ -11,6 +11,7 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 import { DEFAULT_UPDATE_SETTINGS } from "./update-source";
 
 export const DEFAULTS: NarraForkSettings = {
+	tokendance: { apiKey: "", disabled: false, generation: 0 },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
@@ -230,6 +231,28 @@ export const DEFAULTS: NarraForkSettings = {
  * Kept alongside DEFAULTS so changes stay in sync.
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
+	customApiProviders: {
+		desc: "通过自定义提供商面板维护的结构化 API 提供商配置。密钥由对应面板管理，不作为普通文本设置展示。",
+		type: "array",
+	},
+	openaiProviders: {
+		desc: "通过 OpenAI 兼容提供商面板维护的结构化配置，包括模型、协议和连接设置。",
+		type: "array",
+	},
+	anthropicProviders: {
+		desc: "通过 Anthropic 兼容提供商面板维护的结构化配置。",
+		type: "array",
+	},
+	geminiProviders: {
+		desc: "通过 Gemini 提供商面板维护的结构化配置。",
+		type: "array",
+	},
+	"tokendance.apiKey": {
+		desc: "TokenDance 后端专用凭证，仅通过平台授权写入，不在设置 API 返回。",
+		type: "string",
+	},
+	"tokendance.disabled": { desc: "暂停 TokenDance 模型使用但保留连接。", type: "boolean" },
+	"tokendance.generation": { desc: "TokenDance 连接版本，用于取消旧代请求。", type: "number" },
 	"diskSafety.mode": {
 		desc: "磁盘安全策略：enforce 拒绝危险写入；warn 仅提示；off 关闭。管理员可临时覆盖，普通工具权限不会绕过。",
 		type: "string",
@@ -974,13 +997,23 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── update ──────────────────────────────────────────────────────────
+	"update.proxy.mode": {
+		desc: "软件更新、版本说明及 rg/zstd/远程执行器清单与二进制请求的代理策略。缺省或 default 继承全局 proxy；不改变更新来源或 TLS 校验。",
+		type: "string",
+		valid: '"default" | "direct" | "system" | "custom"',
+	},
+	"update.proxy.url": {
+		desc: "更新代理地址，仅 custom 模式必填。支持 HTTP/HTTPS，host:port 自动补 http://；不支持 SOCKS。",
+		type: "string",
+		valid: "有效 HTTP/HTTPS URL，最长 500 字符",
+	},
 	"update.source": {
 		desc: '更新来源。默认 "github" 使用 GitHub Release；"update-server" 使用自定义更新服务器。',
 		type: "string",
 		valid: '"github" | "update-server"',
 	},
 	"update.githubRepository": {
-		desc: "GitHub 更新仓库，格式为 owner/repo，默认 NarraFork/NarraFork。切换来源时保留。",
+		desc: "GitHub 更新仓库，格式为 owner/repo，默认使用构建仓库。切换来源时保留。",
 		type: "string",
 		valid: "owner 最长 39 字符，repo 最长 100 字符；不接受 URL 或 .. 路径",
 	},
@@ -1017,8 +1050,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 };
 
-// Development-time completeness check: warn if SETTING_DOCS misses any DEFAULTS leaf
-if (process.env.NODE_ENV !== "production") {
+// Generated authentication material is intentionally not an editable/documented setting.
+// Keep this exception exact: new authentication fields must still receive documentation.
+const INTERNAL_SETTING_DOC_PATHS = new Set(["auth.jwtSecret"]);
+
+export function getMissingSettingDocPaths(
+	defaults: Record<string, unknown> = DEFAULTS as unknown as Record<string, unknown>,
+	docs: Record<string, FieldDoc> = SETTING_DOCS,
+): string[] {
 	function collectLeafPaths(obj: Record<string, unknown>, prefix = ""): string[] {
 		const paths: string[] = [];
 		for (const key of Object.keys(obj)) {
@@ -1037,9 +1076,14 @@ if (process.env.NODE_ENV !== "production") {
 		}
 		return paths;
 	}
-	const defaultLeaves = collectLeafPaths(DEFAULTS as unknown as Record<string, unknown>);
-	const docKeys = new Set(Object.keys(SETTING_DOCS));
-	const missing = defaultLeaves.filter((p) => !docKeys.has(p));
+	return collectLeafPaths(defaults).filter(
+		(path) => !INTERNAL_SETTING_DOC_PATHS.has(path) && !Object.hasOwn(docs, path),
+	);
+}
+
+// Report genuine documentation gaps without warning about generated secret material.
+if (process.env.NODE_ENV !== "production") {
+	const missing = getMissingSettingDocPaths();
 	if (missing.length > 0) {
 		console.warn(`[settings] SETTING_DOCS missing entries for: ${missing.join(", ")}`);
 	}

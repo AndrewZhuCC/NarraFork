@@ -1,5 +1,5 @@
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -11,6 +11,7 @@ import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -24,6 +25,7 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { captureDumpResponse, DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
@@ -162,14 +164,22 @@ function truncateUtf8ToBytes(
 export class GeminiProvider implements ProviderAdapter {
 	private config: GeminiProviderConfig;
 
-	constructor(config: GeminiProviderConfig) {
+	constructor(
+		config: GeminiProviderConfig,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
 	}
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, { proxy });
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+			}),
+		);
 	}
 
 	private getApiKey(): string {
@@ -209,7 +219,7 @@ export class GeminiProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		_model: string,
 		_narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
+	): Promise<BuiltHistory> {
 		return this.buildGeminiHistory(dbMessages);
 	}
 
@@ -226,8 +236,14 @@ export class GeminiProvider implements ProviderAdapter {
 		h.unshift({ role: "system", text });
 	}
 
+	private reasoningSourceOverride?: string;
+
+	setReasoningSourceOverride(source: string | undefined): void {
+		this.reasoningSourceOverride = source;
+	}
+
 	getActiveReasoningSource(): string | undefined {
-		return `gemini:${this.config.prefix}:generate-content`;
+		return this.reasoningSourceOverride ?? `gemini:${this.config.prefix}:generate-content`;
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -662,6 +678,7 @@ export class GeminiProvider implements ProviderAdapter {
 	private buildGeminiHistory(dbMessages: DbMessage[]): {
 		history: GeminiHistoryItem[];
 		trailingToolResults: GeminiToolResult[];
+		replayedInjectionMessageIds: string[];
 	} {
 		const topLevel = dbMessages.filter(
 			(m) =>
@@ -674,6 +691,7 @@ export class GeminiProvider implements ProviderAdapter {
 		}
 
 		const history: GeminiHistoryItem[] = [];
+		const replayedInjectionMessageIds: string[] = [];
 		let pendingToolResults: GeminiToolResult[] = [];
 
 		const flushToolResults = () => {
@@ -801,18 +819,24 @@ export class GeminiProvider implements ProviderAdapter {
 			} else if (msg.role === "user") {
 				flushToolResults();
 				const text = msg.contentText || "";
-				if (text) history.push({ role: "user", parts: [{ text }] });
+				if (text) {
+					history.push({ role: "user", parts: [{ text }] });
+					replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
+				}
 			} else if (msg.role === "sys") {
 				flushToolResults();
 
 				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 				const text = modelTextFromContentBlocks(content) || msg.contentText || "";
 				// Gemini has no system role in contents; fold as a user turn.
-				if (text) history.push({ role: "user", parts: [{ text }] });
+				if (text) {
+					history.push({ role: "user", parts: [{ text }] });
+					replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
+				}
 			}
 		}
 
-		return { history, trailingToolResults: pendingToolResults };
+		return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 	}
 
 	private async *parseSSEStream(

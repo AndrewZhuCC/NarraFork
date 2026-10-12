@@ -7,11 +7,13 @@ import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { ModelCard } from "@shared/model-card";
 import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { AppError, ValidationError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { getEffectiveModelMetadata } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
@@ -126,6 +128,17 @@ function resolveExtraProvider(bareModel: string): string | undefined {
 	}
 	return undefined;
 }
+
+registerExtraModelSource("tokendance", {
+	listModels: () => {
+		const config = getTokenDanceRuntimeConfig();
+		return config && !config.disabled
+			? getTokenDanceCatalogModels()
+					.filter((m) => selectTokenDanceProtocol(m.supported_protocols))
+					.map((m) => `tokendance:${m.id}`)
+			: [];
+	},
+});
 
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
@@ -261,6 +274,8 @@ export function getAggregation(aggId: string): ModelAggregation | undefined {
 
 function getDisabledProviderPrefixes(): Set<string> {
 	const disabled = new Set(s().agent.disabledProviders ?? []);
+	const tokenDance = getTokenDanceRuntimeConfig();
+	if (tokenDance?.disabled) disabled.add("tokendance");
 	for (const provider of [
 		...(s().customApiProviders ?? []),
 		...(s().openaiProviders ?? []),
@@ -701,6 +716,13 @@ export function usesStatefulApi(prefix?: string): boolean {
 }
 
 export function usesStatefulModel(prefix?: string, model?: string): boolean {
+	if (prefix === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const rawModel = model?.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
+		const catalog = getTokenDanceCatalogModels().find((m) => m.id === rawModel);
+		return (
+			!!catalog && selectTokenDanceProtocol(catalog.supported_protocols) === "openai-responses"
+		);
+	}
 	if (usesStatefulApi(prefix)) return true;
 	if (usesCodexModel(prefix, model)) return true;
 	// NUG "responses" channel models use the stateful /responses endpoint too.
@@ -845,6 +867,8 @@ export function getFirstNugProvider(): NUGProviderConfig | undefined {
 
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
+	const tokenDance = getTokenDanceRuntimeConfig();
+	if (tokenDance && !tokenDance.disabled) available.add("tokendance");
 	if (hasConfiguredOpenaiProvider()) {
 		for (const p of s().openaiProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "openai");
@@ -1105,8 +1129,22 @@ export function resolveModelContextWindow(
 		}
 	}
 
-	const bareModel = parseModelId(model).model;
+	const bareModel =
+		provider === "tokendance" && getTokenDanceRuntimeConfig()
+			? model.startsWith("tokendance:")
+				? model.slice("tokendance:".length)
+				: model
+			: parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
+
+	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const userWindow = s().agent.modelContextWindows?.[fullModelValue];
+		if (userWindow && userWindow > 0) return { contextWindow: userWindow, source: "user" };
+		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
+		if (catalog && catalog.context_length > 0)
+			return { contextWindow: catalog.context_length, source: "catalog" };
+		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	}
 
 	if (s().agent.modelCatalog) {
 		const metadataModel =
@@ -1213,6 +1251,21 @@ export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
  * configured" to the generate call that actually needs one.
  */
 export function getSummaryModelContextWindow(modelOverride?: string): number {
+	return getSummaryModelContextWindowDetail(modelOverride).contextWindow;
+}
+
+/**
+ * Resolve the summary model's context window WITH its provenance, so compact can
+ * tell "user filled this in" apart from "nothing matched, using the tier default".
+ *
+ * Compact packing must be more conservative on `fallback`: a custom model with an
+ * empty window would otherwise be packed as if it had `DEFAULT_CONTEXT_WINDOW`
+ * and the summary request hangs with zero streamed chars until the stall watchdog.
+ */
+export function getSummaryModelContextWindowDetail(modelOverride?: string): {
+	contextWindow: number;
+	source: ModelContextWindowSource;
+} {
 	const configured = s().agent.summaryModel?.trim();
 	const summaryRef =
 		!configured || isFollowSummaryModelValue(configured) ? FOLLOW_DEFAULT_MODEL : configured;
@@ -1223,11 +1276,14 @@ export function getSummaryModelContextWindow(modelOverride?: string): number {
 	// A broken/empty aggregation falls back to the default model, mirroring
 	// `resolveEffectiveModel` / `resolveConfiguredSummaryModel`.
 	if (isMetaModelReference(concrete)) concrete = resolveMetaModelForLookup(FOLLOW_DEFAULT_MODEL);
-	if (!concrete || isMetaModelReference(concrete)) return DEFAULT_CONTEXT_WINDOW;
+	if (!concrete || isMetaModelReference(concrete)) {
+		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	}
 
 	const parsed = parseModelId(concrete);
 	const prov = parsed.provider ?? "anthropic";
-	return getModelContextWindow(parsed.model, prov) ?? DEFAULT_CONTEXT_WINDOW;
+	const resolved = resolveModelContextWindow(parsed.model, prov);
+	return { contextWindow: resolved.contextWindow, source: resolved.source };
 }
 
 export function getContextThresholds(model: string, provider: string): { compactStart: number } {

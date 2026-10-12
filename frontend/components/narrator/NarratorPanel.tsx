@@ -83,6 +83,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	useUpdateExecutionDevice,
@@ -106,6 +107,7 @@ import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
 } from "../../lib/safe-area";
+import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { type SelectionCommentPayload, SelectionPopover } from "../common/SelectionPopover";
@@ -131,8 +133,6 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
-import { getFilePreviewType } from "./file-panel/FilePreviewModal";
-import { LargeFileGate } from "./file-panel/LargeFileGate";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -180,6 +180,7 @@ import {
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
@@ -223,12 +224,10 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
-// Body of the read-only file viewer. Shared with the `file` dock panel — the
-// drawer below is just the off-dock (mobile) host for the same content, so both
-// surfaces show the same viewer instead of the drawer growing its own.
-const FileViewerContent = lazy(() =>
-	import("./file-viewer/FileViewerContent").then((module) => ({
-		default: module.FileViewerContent,
+// The drawer and dock use the same editor / binary-preview entry.
+const FilePanelContent = lazy(() =>
+	import("./file-panel/FilePanelContent").then((module) => ({
+		default: module.FilePanelContent,
 	})),
 );
 
@@ -666,6 +665,21 @@ function NarratorPanelBody({
 	// derived provider info). Kept lifted here because the derived info feeds the
 	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
 	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const tokenDanceConnection = settingsData?.tokendance;
+	const tokenDanceGeneration =
+		resolvedModel?.startsWith("tokendance:") &&
+		tokenDanceConnection?.connected &&
+		!tokenDanceConnection.disabled &&
+		Number.isSafeInteger(tokenDanceConnection.generation)
+			? (tokenDanceConnection.generation as number)
+			: undefined;
+	const tokenDanceBalanceQuery = useTokenDanceBalance(tokenDanceGeneration);
+	const tokenDanceQuota = tokenDanceQuotaView(
+		tokenDanceBalanceQuery.data,
+		tokenDanceGeneration,
+		currentUser?.role === "admin",
+		t,
+	);
 
 	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
 	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
@@ -1357,10 +1371,12 @@ function NarratorPanelBody({
 	// for pushed subagent views so the badge and opened panel never disagree.
 	const tasksPanelMatchesCurrentNarrator = !dock || dock.narratorId === narratorId;
 	const tasksButtonEnabled = !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
-	const { supported: tasksSupported, runningCount: tasksRunningCount } = useBackgroundTasksButton(
-		narratorId,
-		tasksButtonEnabled,
-	);
+	const {
+		supported: tasksSupported,
+		runningCount: tasksRunningCount,
+		workCount: tasksWorkCount,
+		serviceCount: tasksServiceCount,
+	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled);
 	// Open state and toggling for the tasks entry now live in the registry-driven
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
@@ -1864,6 +1880,8 @@ function NarratorPanelBody({
 	const {
 		internalFileViewerPath,
 		setInternalFileViewerPath,
+		onFileEditorDirtyChange,
+		canExitFileEditor,
 		internalFileViewerTarget,
 		handleOpenFilePanel,
 		handleOpenReferencedFile,
@@ -1882,7 +1900,11 @@ function NarratorPanelBody({
 					fileReferenceContext,
 				)
 			: undefined;
-	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
+	useMobileDrawerHistory(
+		!!internalFileViewerPath,
+		() => setInternalFileViewerPath(null),
+		canExitFileEditor,
+	);
 	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
 		null,
 	);
@@ -2583,11 +2605,20 @@ function NarratorPanelBody({
 	const toolbarBadgeCounts = useMemo<NarratorToolbarBadgeCounts>(
 		() => ({
 			backgroundTasks: tasksRunningCount,
+			backgroundWork: tasksWorkCount,
+			backgroundServices: tasksServiceCount,
 			browserSessions: wsState.browserSessionCount,
 			userChatUnread,
 			terminals: activeTerminalCount,
 		}),
-		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
+		[
+			tasksRunningCount,
+			tasksWorkCount,
+			tasksServiceCount,
+			wsState.browserSessionCount,
+			userChatUnread,
+			activeTerminalCount,
+		],
 	);
 
 	const createSubagentMutation = useMutation({
@@ -2891,6 +2922,8 @@ function NarratorPanelBody({
 	const mobileToolbarMeasurementKey = [
 		i18n.resolvedLanguage,
 		toolbarBadgeCounts.backgroundTasks,
+		toolbarBadgeCounts.backgroundWork,
+		toolbarBadgeCounts.backgroundServices,
 		toolbarBadgeCounts.browserSessions,
 		toolbarBadgeCounts.userChatUnread,
 		toolbarBadgeCounts.terminals,
@@ -3395,6 +3428,8 @@ function NarratorPanelBody({
 								supported: tasksSupported,
 								buttonEnabled: tasksButtonEnabled,
 								runningCount: tasksRunningCount,
+								workCount: tasksWorkCount,
+								serviceCount: tasksServiceCount,
 								onOpenPanel: () => {
 									if (dock) dock.openToolPanel("tasks");
 									else setMobileTasksOpen(true);
@@ -3414,12 +3449,21 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: quotaBalance,
-								detailsText: quotaDetailsText,
-								hasDetailsPopover: hasQuotaDetailsPopover,
+								balance: tokenDanceQuota?.balance ?? quotaBalance,
+								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
+								...(tokenDanceQuota
+									? {
+											recharge: {
+												showButton: tokenDanceQuota.showRechargeButton,
+												showInDetails: tokenDanceQuota.showRechargeInDetails,
+												onOpen: openTokenDanceRecharge,
+											},
+										}
+									: {}),
 							},
 							relaxedPlan: {
 								enabled: relaxedPlanEnabled,
@@ -3611,28 +3655,19 @@ function NarratorPanelBody({
 									</Center>
 								}
 							>
-								<LargeFileGate
+								<FilePanelContent
+									filePath={internalFileViewerPath}
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
-									legacyViewer
-									filePath={internalFileViewerPath}
-									enabled={getFilePreviewType(internalFileViewerPath) === "text"}
+									selection={internalFileViewerTarget?.selection}
+									navigationRequestId={internalFileViewerTarget?.highlightRequestId}
+									onOpenFileTarget={handleOpenReferencedFile}
+									onDirtyChange={onFileEditorDirtyChange}
 									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
-								>
-									<FileViewerContent
-										key={internalFileViewerPath}
-										filePath={internalFileViewerPath}
-										narratorId={narratorId}
-										commentNarratorId={narratorId}
-										deviceId={internalFileViewerTarget?.deviceId ?? "local"}
-										referenceOrigin={!!internalFileViewerTarget}
-										displayPath={internalViewerDisplayPath}
-										selection={internalFileViewerTarget?.selection}
-										highlightRequestId={internalFileViewerTarget?.highlightRequestId}
-										onOpenFileTarget={handleOpenReferencedFile}
-									/>
-								</LargeFileGate>
+									commentNarratorId={narratorId}
+									displayPath={internalViewerDisplayPath}
+								/>
 							</Suspense>
 						</Drawer>
 					)}

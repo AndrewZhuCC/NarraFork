@@ -17,6 +17,7 @@ import {
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
+import { projectAskUserQuestionMessagesForModel } from "./question-model-input";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
 import type { ApiRequestDumpCollector } from "./request-dump";
 import { projectMessageSenderForModel } from "./sender-projection";
@@ -55,9 +56,11 @@ export type {
 export { getProvider, resolveProviderAndModel } from "./provider";
 export { toolRegistry } from "./tool-registry";
 export type {
+	AgentAfterToolsInput,
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentInputPart,
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,
@@ -98,7 +101,7 @@ export async function buildHistory(
 	// the model history does not carry the full plan text on every rebuild. The
 	// persisted DB rows keep the full plan for the UI; this only mutates the
 	// in-memory copy passed to the provider adapter.
-	const modelMessages = stripPlanBodyForModel(dbMessages);
+	const modelMessages = stripPlanBodyForModel(projectAskUserQuestionMessagesForModel(dbMessages));
 	// Historical rows may still embed provider-internal citation markers. Replaying
 	// them teaches the model the markers are part of its output format, so it keeps
 	// producing them; strip on the in-memory copy only.

@@ -8,6 +8,7 @@ let checks: Array<{ force?: boolean } | undefined> = [];
 let downloads: ReleaseInfo[] = [];
 let checkResult: UpdateCheckResult;
 let currentSource = true;
+let notesRequests: unknown[] = [];
 const requireAuth: MiddlewareHandler = async (c, next) => {
 	if (!role) return c.json({ error: "Unauthenticated" }, 401);
 	await next();
@@ -18,6 +19,10 @@ const requireAdmin: MiddlewareHandler = async (c, next) => {
 };
 mock.module("../../middleware/auth", () => ({ requireAuth, requireAdmin }));
 mock.module("../../services/update-service", () => ({
+	getUpdateNotes: async (identity: unknown) => {
+		notesRequests.push(identity);
+		return { notes: "Verified notes" };
+	},
 	isUpdateSourceCurrent: () => currentSource,
 	checkForUpdate: async (options?: { force?: boolean }) => {
 		checks.push(options);
@@ -40,14 +45,22 @@ mock.module("../../services/update-service", () => ({
 }));
 const { updateRoutes } = await import("../update");
 const app = new Hono().route("/update", updateRoutes);
+const trustedHash = new Bun.CryptoHasher("sha512").update("trusted").digest("base64");
+const sourceIdentity = {
+	source: "github" as const,
+	repository: "narrafork/narrafork",
+	channel: "stable" as const,
+	platform: "linux-x64",
+};
 const release: ReleaseInfo = {
+	sourceIdentity,
 	source: "github",
 	repository: "NarraFork/NarraFork",
 	version: "2.0.0",
 	releaseDate: "2026-10-06",
 	path: "narrafork-2.0.0-linux-x64",
-	sha512: "trusted",
-	files: [{ url: "trusted", size: 1000, sha512: "trusted" }],
+	sha512: trustedHash,
+	files: [{ url: "trusted", size: 1000, sha512: trustedHash }],
 	_github: { repository: "NarraFork/NarraFork", downloadUrl: "https://github.com/trusted/asset" },
 };
 const post = (body: unknown) =>
@@ -59,6 +72,7 @@ const post = (body: unknown) =>
 beforeEach(() => {
 	role = "admin";
 	currentSource = true;
+	notesRequests = [];
 	checks = [];
 	downloads = [];
 	checkResult = {
@@ -69,6 +83,40 @@ beforeEach(() => {
 		updateAvailable: true,
 		releaseInfo: structuredClone(release),
 	};
+});
+
+describe("notes administrator identity boundary", () => {
+	const notes = (body: unknown) =>
+		app.request("/update/notes", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	const identity = () => ({ version: release.version, sha512: trustedHash, sourceIdentity });
+	test("only an administrator can fetch notes", async () => {
+		for (const [user, status] of [
+			["", 401],
+			["user", 403],
+		] as const) {
+			role = user;
+			expect((await notes(identity())).status).toBe(status);
+		}
+		expect(notesRequests).toHaveLength(0);
+	});
+	test("accepts only version, hash and source identity", async () => {
+		expect((await notes(identity())).status).toBe(200);
+		expect(notesRequests).toEqual([identity()]);
+		for (const body of [
+			{ ...identity(), url: "https://evil.example/notes" },
+			{ ...identity(), sha512: "bad" },
+			{ ...identity(), sourceIdentity: null },
+			{ ...identity(), version: "../../bad" },
+		])
+			expect((await notes(body)).status).toBe(400);
+		expect(notesRequests).toHaveLength(1);
+		expect(checks).toHaveLength(0);
+		expect(downloads).toHaveLength(0);
+	});
 });
 
 describe("update source download boundary", () => {
@@ -91,7 +139,6 @@ describe("update source download boundary", () => {
 			repository: "narrafork/narrafork",
 			releaseInfo: {
 				...release,
-				sha512: "attacker",
 				_github: { downloadUrl: "https://evil.example/payload" },
 			},
 		});
@@ -102,6 +149,45 @@ describe("update source download boundary", () => {
 		expect(events).toContain("event: complete");
 		expect(events.match(/event: progress/g)?.length).toBeLessThan(10);
 		expect(events).toContain('"percent":100');
+	});
+	test("malformed expected digest is refused before detection rather than forwarded", async () => {
+		const response = await post({
+			releaseInfo: {
+				...release,
+				sha512: "attacker",
+				_github: { downloadUrl: "https://evil.example/payload" },
+			},
+		});
+		expect(response.status).toBe(400);
+		expect(checks).toEqual([]);
+		expect(downloads).toEqual([]);
+	});
+	test("same version with a changed hash requires explicit rechecking", async () => {
+		const otherHash = new Bun.CryptoHasher("sha512").update("other").digest("base64");
+		const response = await post({
+			releaseInfo: { version: release.version, sha512: otherHash, sourceIdentity },
+		});
+		expect(response.status).toBe(409);
+		expect((await response.json()).errorCode).toBe("UPDATE_ARTIFACT_CHANGED");
+		expect(downloads).toEqual([]);
+	});
+	test.each([
+		{ ...sourceIdentity, channel: "beta" },
+		{ ...sourceIdentity, platform: "linux-arm64" },
+		{
+			source: "update-server",
+			serverUrl: "https://updates.example",
+			product: "other",
+			channel: "stable",
+			platform: "linux-x64",
+		},
+	])("the request must still match the complete checked policy %j", async (identity) => {
+		const response = await post({
+			releaseInfo: { version: release.version, sourceIdentity: identity },
+		});
+		expect(response.status).toBe(409);
+		expect((await response.json()).errorCode).toBe("UPDATE_SOURCE_CHANGED");
+		expect(downloads).toEqual([]);
 	});
 	test("settings changed during the outbound check fail with JSON 409 before SSE", async () => {
 		currentSource = false;

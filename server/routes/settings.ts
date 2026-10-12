@@ -1,6 +1,10 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
+import {
+	proxyOverrideSchema,
+	proxyUrlSchema as webFetchProxyUrlSchema,
+} from "@shared/proxy-settings";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -8,7 +12,6 @@ import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
-import { AsyncMutex } from "../lib/async-mutex";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
@@ -50,13 +53,14 @@ import {
 	type NarraForkSettings,
 	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
-	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
 	saveSettings,
 	settings,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
+import { settingsUpdateLock } from "../lib/settings/write-lock";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -85,6 +89,7 @@ import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
 } from "../services/provider-prefix-migration-service";
+import { getTokenDanceConnection } from "../services/tokendance-service";
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
@@ -98,8 +103,6 @@ import {
 	purgeOpenaiProviderCache,
 } from "./openai";
 
-const settingsUpdateLock = new AsyncMutex();
-
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
 	label: z.string().min(1),
@@ -109,36 +112,6 @@ const modelOptionSchema = z.object({
 });
 
 const dangerReflectionLevelSchema = z.enum(["off", "light", "standard", "strict"]);
-
-const webFetchProxyUrlSchema = z.preprocess(
-	(value) => {
-		if (typeof value !== "string") return value;
-		const trimmed = value.trim();
-		if (!trimmed) return undefined;
-		return normalizeProxyUrl(trimmed) ?? trimmed;
-	},
-	z
-		.string()
-		.regex(/^https?:\/\//)
-		.optional(),
-);
-
-/** Per-location proxy override: default (inherit global) / direct / system / custom. */
-const proxyOverrideSchema = z
-	.object({
-		mode: z.enum(["default", "direct", "system", "custom"]),
-		url: webFetchProxyUrlSchema,
-	})
-	.superRefine((value, ctx) => {
-		if (value.mode === "custom" && !value.url) {
-			ctx.addIssue({
-				code: "custom",
-				path: ["url"],
-				message: "Custom proxy mode requires a valid HTTP or HTTPS URL",
-			});
-		}
-	})
-	.optional();
 
 // Accepts the current 4 protocols plus the 4 removed legacy values; inbound
 // payloads are normalized (legacy → current) before persistence/derivation.
@@ -535,7 +508,7 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
+				modelContextWindows: z.record(z.string(), z.number().int().min(256).max(10_000_000)),
 				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
@@ -903,6 +876,8 @@ function buildSettingsResponse(
 	stripObsoleteSettingsKeys(safeSource);
 	return {
 		...safeSource,
+		// Explicit override prevents backend credentials leaking through the spread.
+		tokendance: getTokenDanceConnection(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1406,19 +1381,42 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex"]);
-			const allPrefixes: Array<{ prefix: string; source: string }> = [];
+			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
+			const previousCustomProviders = [
+				...(current.customApiProviders ?? []),
+				...(current.openaiProviders ?? []),
+				...(current.anthropicProviders ?? []),
+				...(current.geminiProviders ?? []),
+			];
 			for (const p of effectiveCustomApiProviders) {
 				if (p.prefix) {
-					allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
+					allPrefixes.push({
+						prefix: p.prefix,
+						source: `Custom API "${p.name || p.id}"`,
+						legacyTokenDance: isLegacyTokenDancePrefixAllowed(
+							p,
+							previousCustomProviders,
+							!!current.tokendance?.apiKey,
+						),
+					});
 				}
 			}
 			for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
-				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
+				if (p.prefix)
+					allPrefixes.push({
+						prefix: p.prefix,
+						source: `NUG "${p.name || p.id}"`,
+						legacyTokenDance: isLegacyTokenDancePrefixAllowed(
+							p,
+							current.nugProviders ?? [],
+							!!current.tokendance?.apiKey,
+						),
+					});
 			}
 			// Check reserved prefix conflicts
-			for (const { prefix, source } of allPrefixes) {
-				if (RESERVED_PREFIXES.has(prefix)) {
+			for (const { prefix, source, legacyTokenDance } of allPrefixes) {
+				if (RESERVED_PREFIXES.has(prefix) && !legacyTokenDance) {
 					throw new ValidationError(
 						`Provider prefix "${prefix}" is reserved (built-in provider). ` +
 							`Please choose a different prefix for ${source}.`,

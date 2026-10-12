@@ -32,9 +32,12 @@ const originalStorageHealthApi = {
 	health: api.health,
 	getSettings: api.getSettings,
 	getCachedStorage: api.getCachedStorage,
+	me: api.me,
+	getWorkspaceBarriers: api.getWorkspaceBarriers,
 };
 const STORAGE_DOM_GLOBALS = [
 	"window",
+	"localStorage",
 	"document",
 	"navigator",
 	"Event",
@@ -50,7 +53,6 @@ const STORAGE_DOM_GLOBALS = [
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
 	"getComputedStyle",
-	"localStorage",
 	"IS_REACT_ACT_ENVIRONMENT",
 ] as const;
 
@@ -91,9 +93,13 @@ function installStorageTestDom() {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
-	// No stored token: useCurrentUser stays disabled and the admin-only card stays gated.
-	const localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
-
+	const values = new Map([["narrafork_token", "storage-test-session"]]);
+	const localStorage = {
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => values.set(key, value),
+		removeItem: (key: string) => values.delete(key),
+		clear: () => values.clear(),
+	};
 	Object.assign(window, {
 		localStorage,
 		ResizeObserver: StorageTestResizeObserver,
@@ -103,9 +109,9 @@ function installStorageTestDom() {
 	});
 	Object.assign(globalThis, {
 		window,
+		localStorage,
 		document: window.document,
 		navigator: window.navigator,
-		localStorage,
 		Event: window.Event,
 		Document: window.Document,
 		ShadowRoot: window.ShadowRoot,
@@ -205,6 +211,11 @@ describe("StorageSection health states", () => {
 		api.getSettings = async () =>
 			({}) as Awaited<ReturnType<typeof originalStorageHealthApi.getSettings>>;
 		api.getCachedStorage = async () => ({ cached: false });
+		api.me = async () =>
+			({ id: "storage-admin", username: "admin", role: "admin" }) as Awaited<
+				ReturnType<typeof api.me>
+			>;
+		api.getWorkspaceBarriers = async () => ({ items: [], nextCursor: null });
 		storageContainer = document.createElement("div");
 		document.body.appendChild(storageContainer);
 		storageRoot = createRoot(storageContainer);
@@ -223,6 +234,8 @@ describe("StorageSection health states", () => {
 		api.health = originalStorageHealthApi.health;
 		api.getSettings = originalStorageHealthApi.getSettings;
 		api.getCachedStorage = originalStorageHealthApi.getCachedStorage;
+		api.me = originalStorageHealthApi.me;
+		api.getWorkspaceBarriers = originalStorageHealthApi.getWorkspaceBarriers;
 		restoreStorageTestDom();
 	});
 
@@ -273,7 +286,7 @@ describe("StorageSection health states", () => {
 		expect(text).toContain("Click Scan to analyze storage usage");
 		expect(text).not.toContain("Loading storage capabilities");
 		expect(text).not.toContain("Storage status unavailable");
-		expect(text).not.toContain("Workspace write barriers");
+		expect(text).toContain("Workspace write barriers");
 		expect(findStorageButton("Scan").disabled).toBe(false);
 	});
 

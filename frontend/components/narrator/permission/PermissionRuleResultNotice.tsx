@@ -1,10 +1,10 @@
 import { usePermissions } from "@frontend/hooks/usePermissions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
-import { Alert, Badge, Group, Stack, Text } from "@mantine/core";
+import { Badge, Group, Stack, Text } from "@mantine/core";
 import type { PermissionPolicyChangedEvent } from "@shared/permission-policy-events";
 import type { PermissionRuleRequestResult } from "@shared/permission-rule-request";
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
 export type PermissionRuleReceiptView = Pick<
@@ -102,12 +102,8 @@ export function PermissionRuleReceiptDetails({
 	);
 }
 
-/** Existing tool events suffice; do not invent an approval event that says a pending rule is live. */
-export function PermissionRuleResultNotice({ narratorId }: { narratorId: string }) {
-	const [receipt, setReceipt] = useState<{
-		view: PermissionRuleReceiptView;
-		ownerId: string;
-	} | null>(null);
+/** Refresh the existing permission lists without adding a persistent notice above the composer. */
+export function PermissionRulePolicySync({ narratorId }: { narratorId: string }) {
 	const qc = useQueryClient();
 	const { data: pending } = usePermissions(narratorId);
 	const requestedRef = useRef(new Set<string>());
@@ -167,15 +163,10 @@ export function PermissionRuleResultNotice({ narratorId }: { narratorId: string 
 				if (!completed || event.status !== "success") return;
 				const ownerId =
 					typeof event.subagentNarratorId === "string" ? event.subagentNarratorId : narratorId;
-				setReceipt({ view: completed, ownerId });
 				refresh(ownerId);
 			},
 		);
 		return () => narratorWSManager.removeListener(handle);
 	}, [qc, narratorId]);
-	return receipt ? (
-		<Alert color="green" withCloseButton onClose={() => setReceipt(null)} mx="md" my={4}>
-			<PermissionRuleReceiptDetails receipt={receipt.view} narratorId={receipt.ownerId} />
-		</Alert>
-	) : null;
+	return null;
 }

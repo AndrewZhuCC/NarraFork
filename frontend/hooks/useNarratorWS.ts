@@ -317,6 +317,11 @@ export interface CompactProgressEvent extends ProgressSnapshot {
 	retryCount: number;
 	/** Error that triggered the current retry, when retryCount > 0. */
 	retryError?: string;
+	/**
+	 * Provenance of the summary model's context window. `fallback` means packing
+	 * used the tier default because nothing user/catalog/provider configured one.
+	 */
+	contextWindowSource?: string;
 }
 
 export function coerceCompactProgressEvent(
@@ -343,6 +348,9 @@ export function coerceCompactProgressEvent(
 		// Older servers never broadcast retry state, which normalizes to "not
 		// retrying" — exactly their pre-existing behaviour.
 		retryCount,
+		...(typeof data.contextWindowSource === "string" && data.contextWindowSource
+			? { contextWindowSource: data.contextWindowSource }
+			: {}),
 		...(retryCount > 0 && typeof data.retryError === "string" && data.retryError
 			? { retryError: data.retryError }
 			: {}),
@@ -1773,6 +1781,8 @@ export function useNarratorWS(
 								listEpoch: data.listEpoch as string,
 								version: data.version as number,
 								activeCount: data.activeCount as number,
+								activeWorkCount: data.activeWorkCount as number | undefined,
+								activeServiceCount: data.activeServiceCount as number | undefined,
 								upsert: data.upsert as BackgroundTaskListDelta["upsert"],
 								removeIds: data.removeIds as string[] | undefined,
 								invalidate: data.invalidate as boolean | undefined,
@@ -1986,6 +1996,8 @@ export interface NarratorListWSEvent {
 	}>;
 	activeTerminalCount?: number;
 	activeBackgroundTaskCount?: number;
+	activeBackgroundWorkCount?: number;
+	activeBackgroundServiceCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
 	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */

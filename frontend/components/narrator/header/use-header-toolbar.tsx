@@ -12,6 +12,7 @@ import {
 	PluginContributionOptions,
 	type PluginContributionPick,
 } from "../../plugins/PluginContributionPicker";
+import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { NarratorLodOptions } from "../lod/NarratorLodMenu";
@@ -95,6 +96,7 @@ export interface UseHeaderToolbarResult {
  * Dialogs opened from menus live in `toolbarOverlays`, mounted outside those menus.
  */
 export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToolbarResult {
+	const hostSurface = usePluginUiSurface()?.hostContext.surface ?? "focus";
 	const {
 		narratorId,
 		headerHostCapabilities,
@@ -332,6 +334,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "plugins":
 					return (
 						<PluginContributionOptions
+							surface={hostSurface}
 							onPick={(pick) => {
 								close();
 								openPluginPanel(pick);
@@ -344,6 +347,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		},
 		[
 			t,
+			hostSurface,
 			executionDevicesQuery.data,
 			updateExecutionDeviceMutation,
 			renderLod,

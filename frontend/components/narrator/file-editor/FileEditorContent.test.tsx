@@ -9,9 +9,11 @@ import { act, StrictMode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
+import * as viewport from "../../../hooks/useMobileViewport";
 import { ApiError, api } from "../../../lib/api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
+import * as fileDownload from "../../../lib/file-download";
 import en from "../../../locales/en/narrator.json";
 import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
 import {
@@ -441,7 +443,21 @@ for (const surface of ["focus", "workspace"] as const)
 				if (!input.path.startsWith(cwd)) throw new ApiError("Forbidden outside cwd", 403);
 				return { ...descriptor, target: { deviceId: "local", path: input.path } };
 			});
-			const panels = new Map<string, { id: string; params: FilePanelParams; api: object }>();
+			const panels = new Map<
+				string,
+				{
+					id: string;
+					params: FilePanelParams | { panelType: "narrator"; narratorId: string };
+					api: object;
+				}
+			>();
+			if (surface === "workspace")
+				panels.set("parent-host", {
+					id: "parent-host",
+					params: { panelType: "narrator", narratorId: "parent" },
+					api: { location: { type: "grid" }, setActive() {} },
+				});
+			const hostCount = panels.size;
 			const apiRef = {
 				current: {
 					getPanel: (id: string) => panels.get(id),
@@ -498,14 +514,17 @@ for (const surface of ["focus", "workspace"] as const)
 			}
 			renderToString(<Child />);
 			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
-			const panel = [...panels.values()][0];
+			const panel = [...panels.values()].find(
+				(candidate) =>
+					candidate.params.panelType === "file" && candidate.params.fileNarratorId === "child",
+			);
 			if (!panel) throw new Error("Missing child file panel");
 			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
-			expect(panels.size).toBe(1);
+			expect(panels.size).toBe(hostCount + 1);
 			open(filePath, undefined, { referenceOrigin: true });
-			expect(panels.size).toBe(2);
+			expect(panels.size).toBe(hostCount + 2);
 			expect(panel.params).toMatchObject({ hostNarratorId: "parent", fileNarratorId: "child" });
-			let params = panel.params;
+			let params = panel.params as unknown as FilePanelParams;
 			if (lifecycle === "restored") {
 				const layout = { panels: { file: { params } } } as unknown as SerializedDockview;
 				params = JSON.parse(
@@ -568,6 +587,11 @@ for (const surface of ["focus", "workspace"] as const)
 					</I18nextProvider>,
 				),
 			);
+			// The shared entry adds one lazy boundary; flush its resolved import before
+			// asserting the actual child-authorized editor session was opened.
+			await act(async () => {
+				await import("../file-panel/FilePanelContent");
+			});
 			expect(create).toHaveBeenCalledWith(
 				"child",
 				{ deviceId: "local", path: filePath, origin: "reference" },
@@ -898,6 +922,85 @@ test("reference CRLF loads clean with raw hash/encoding, preserving source narra
 	expectClean("saved-byte-hash");
 });
 
+test("ordinary editor toolbar shows the full path and truncates its right end", async () => {
+	await mount({ referenceOrigin: false });
+	const path = host.querySelector<HTMLElement>(`[title="${source.target.path}"]`);
+	expect(path?.textContent).toBe(source.target.path);
+	expect(path?.getAttribute("data-truncate")).toBe("end");
+	expect(path?.style.minWidth).toBe("0");
+	expect(path?.style.flex).toBe("1");
+});
+
+test("mobile toolbar puts the path on its own row and keeps all actions scrollable", async () => {
+	const mobileViewport = spyOn(viewport, "useMobileViewport").mockReturnValue(true);
+	restores.push(() => mobileViewport.mockRestore());
+	await mount({ referenceOrigin: false });
+	const path = host.querySelector<HTMLElement>(`[title="${source.target.path}"]`);
+	expect(path?.parentElement?.style.flexBasis).toBe("100%");
+	const actions = iconButton("copy").parentElement;
+	expect(actions?.style.width).toBe("max-content");
+	expect(actions?.parentElement?.style.overflowX).toBe("auto");
+	for (const icon of [
+		"download",
+		"device-floppy",
+		"arrow-back-up",
+		"arrow-forward-up",
+		"search",
+		"text-wrap",
+		"refresh",
+	])
+		expect(iconButton(icon)).not.toBeNull();
+});
+
+test("typing publishes the exit guard before React commits the updated toolbar", async () => {
+	const model = await mount();
+	await act(async () => {
+		model.edit("new unsaved draft");
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+	});
+});
+
+test("editor toolbar copies the complete file path with feedback", async () => {
+	const writeText = mock(async (_text: string) => {});
+	const previous = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+	Object.defineProperty(navigator, "clipboard", {
+		configurable: true,
+		value: { writeText },
+	});
+	restores.push(() => {
+		if (previous) Object.defineProperty(navigator, "clipboard", previous);
+		else Reflect.deleteProperty(navigator, "clipboard");
+	});
+	await mount();
+	await click(iconButton("copy"));
+	expect(writeText.mock.calls).toEqual([[source.target.path]]);
+	expect(host.querySelector(".tabler-icon-check")).not.toBeNull();
+});
+
+test("editor downloads disk bytes without saving or changing the unsaved draft", async () => {
+	const blob = new Blob(["complete disk bytes"]);
+	const download = spyOn(api, "fsDownload").mockResolvedValue({ blob, fileName: "served.txt" });
+	const saveBlob = spyOn(fileDownload, "saveBlobAsFile").mockImplementation(() => {});
+	restores.push(
+		() => download.mockRestore(),
+		() => saveBlob.mockRestore(),
+	);
+	const model = await mount({ referenceOrigin: false });
+	await edit(model, "unsaved draft");
+	await click(iconButton("download"));
+	expect(download.mock.calls).toEqual([[source.target.path]]);
+	expect(saveBlob.mock.calls).toEqual([[blob, "served.txt"]]);
+	expect(model.getValue()).toBe("unsaved draft");
+	expect(commit).not.toHaveBeenCalled();
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+});
+
+test("scoped editor keeps path copying but does not expose broad local downloads", async () => {
+	await mount();
+	expect(iconButton("copy")).not.toBeNull();
+	expect(host.querySelector(".tabler-icon-download")).toBeNull();
+});
+
 test("local legacy-origin narrator files still use the authorized large-file session", async () => {
 	await mount({ referenceOrigin: false });
 	expect(create.mock.calls[0]?.[1].origin).toBe("legacy");
@@ -1016,7 +1119,7 @@ test("split mode keeps the editor interactive beside a live-updating preview", a
 test.each([
 	"split",
 	"preview",
-] as const)("saved %s default survives unchanged navigation", async (defaultMode) => {
+] as const)("saved %s default survives file and range navigation", async (defaultMode) => {
 	const store = new Map<string, string>();
 	const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 	restores.push(() => {
@@ -1062,7 +1165,11 @@ test.each([
 	// A fresh editor may open at a range without overriding the saved default.
 	await act(async () => root?.unmount());
 	root = createRoot(host);
-	await mount({ filePath: "/work/c.md", selection, navigationRequestId: "range-first" });
+	const model = await mount({
+		filePath: "/work/c.md",
+		selection,
+		navigationRequestId: "range-first",
+	});
 	expectDefault();
 	await mount({
 		filePath: "/work/c.md",
@@ -1070,14 +1177,17 @@ test.each([
 		navigationRequestId: "range-again",
 	});
 	expectDefault();
-	// A genuinely different source range still reveals the editor without changing the default.
-	await mount({
-		filePath: "/work/c.md",
-		selection: { ...selection, endColumn: selection.endColumn + 1 },
-		navigationRequestId: "range-changed",
-	});
-	expect(host.querySelector("[data-file-editor-source]")?.hasAttribute("inert")).toBe(false);
-	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	// A different range updates the highlight without overriding the current or saved mode.
+	const changedSelection = { ...selection, endColumn: selection.endColumn + 1 };
+	expect(
+		await mount({
+			filePath: "/work/c.md",
+			selection: changedSelection,
+			navigationRequestId: "range-changed",
+		}),
+	).toBe(model);
+	expectDefault();
+	expect(model.navigation).toEqual(changedSelection);
 	expect(store.get("narrafork_file_editor_mode")).toBe(defaultMode);
 });
 
@@ -1225,7 +1335,7 @@ test("invalid JSON can be fixed without dropping the model", async () => {
 	expect(create).toHaveBeenCalledTimes(1);
 });
 
-test("line references preserve preview until the selected range changes", async () => {
+test("line references update highlights without replacing preview or draft", async () => {
 	const model = await mount({ filePath: "/work/a.md", navigationRequestId: "first" });
 	await edit(model, "# draft");
 	const history = model.undoEntries;
@@ -1241,14 +1351,16 @@ test("line references preserve preview until the selected range changes", async 
 		}),
 	).toBe(model);
 	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	const changedSelection = { ...selection, endColumn: selection.endColumn + 1 };
 	expect(
 		await mount({
 			filePath: "/work/a.md",
-			selection: { ...selection, endColumn: selection.endColumn + 1 },
+			selection: changedSelection,
 			navigationRequestId: "fourth",
 		}),
 	).toBe(model);
-	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	expect(model.navigation).toEqual(changedSelection);
 	expect(model.text).toBe("# draft");
 	expect(model.undoEntries).toBe(history);
 	expect(create).toHaveBeenCalledTimes(1);

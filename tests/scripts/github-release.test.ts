@@ -27,6 +27,7 @@ import {
 	releaseChannel,
 	validateGitHubRepository,
 } from "../../scripts/lib/github-release";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 import { MAX_RELEASE_PATCH_BYTES, type ReleasePatchMetadata } from "../../shared/release-patch";
 
 const roots: string[] = [];
@@ -116,6 +117,84 @@ function addPatch(
 	writeFileSync(metadataPath, JSON.stringify(meta));
 	return { name, path, metadataPath, meta, bytes, base };
 }
+
+describe("CI stable latest rollback guard", () => {
+	test("refuses older stable before creating a draft", async () => {
+		const { options } = fixture("1.2.0");
+		const gh = fakeGitHub(options);
+		const run = (args: string[]) =>
+			args.includes("[.[] | {tag_name, draft, prerelease}]")
+				? JSON.stringify([{ tag_name: "v1.10.0", draft: false, prerelease: false }])
+				: gh.run(args);
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).rejects.toThrow("rollback");
+		expect(gh.calls.some((args) => args[1] === "create")).toBe(false);
+	});
+	test("checks again immediately before publishing", async () => {
+		const { options } = fixture("1.2.0");
+		const gh = fakeGitHub(options);
+		let checks = 0;
+		const run = (args: string[]) => {
+			if (args.includes("[.[] | {tag_name, draft, prerelease}]")) {
+				checks++;
+				return JSON.stringify(
+					checks === 1 ? [] : [{ tag_name: "v2.0.0", draft: false, prerelease: false }],
+				);
+			}
+			return gh.run(args);
+		};
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).rejects.toThrow("rollback");
+		expect(checks).toBe(2);
+		expect(gh.release?.draft).toBe(true);
+		expect(gh.calls.some((args) => args[1] === "edit")).toBe(false);
+	});
+	test("ignores drafts, betas and semantically lower stable versions", async () => {
+		const { options } = fixture("1.10.0");
+		const gh = fakeGitHub(options);
+		const run = (args: string[]) =>
+			args.includes("[.[] | {tag_name, draft, prerelease}]")
+				? JSON.stringify([
+						{ tag_name: "v9.0.0", draft: true, prerelease: false },
+						{ tag_name: "v2.0.1", draft: false, prerelease: true },
+						{ tag_name: "v1.9.0", draft: false, prerelease: false },
+					])
+				: gh.run(args);
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).resolves.toMatchObject({ alreadyPublished: false });
+	});
+	test("identical public version is read-only even when a newer stable exists", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		await publishGitHubRelease({ ...options, run: gh.run });
+		gh.calls.length = 0;
+		await expect(
+			publishGitHubRelease({ ...options, run: gh.run, preventStableLatestRollback: true }),
+		).resolves.toMatchObject({ alreadyPublished: true });
+		expect(gh.calls.some((args) => ["create", "upload", "edit"].includes(args[1]))).toBe(false);
+	});
+	test("guard pagination failure is not interpreted as no newer stable", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		let pages = 0;
+		const run = (args: string[]) => {
+			if (args.includes("[.[] | {tag_name, draft, prerelease}]")) {
+				pages++;
+				return JSON.stringify(
+					Array(100).fill({ tag_name: "v1.0.0", draft: false, prerelease: false }),
+				);
+			}
+			return gh.run(args);
+		};
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).rejects.toThrow("pagination");
+		expect(pages).toBe(10);
+	});
+});
 
 interface FakeAsset {
 	name: string;
@@ -221,6 +300,102 @@ function fakeGitHub(options: GitHubReleaseOptions) {
 	};
 	return server;
 }
+
+describe("read-only repair after beta promotion", () => {
+	test("accepts remote stable announcement without writes; normal publication still rejects it", async () => {
+		const { options } = fixture("1.2.1");
+		const gh = fakeGitHub(options);
+		await publishGitHubRelease({ ...options, run: gh.run });
+		const release = gh.release;
+		if (!release) throw new Error("Missing fixture release");
+		expect(release.prerelease).toBe(true);
+		release.prerelease = false;
+		gh.calls.length = 0;
+		await expect(
+			publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true }),
+		).resolves.toMatchObject({ alreadyPublished: true, dryRun: false });
+		expect(gh.calls.length).toBeGreaterThan(0);
+		expect(
+			gh.calls.every(
+				(args) => args[0] === "api" && !args.includes("--method") && !args.includes("-X"),
+			),
+		).toBe(true);
+		expect(release.prerelease).toBe(false);
+		gh.calls.length = 0;
+		await expect(publishGitHubRelease({ ...options, run: gh.run })).rejects.toThrow(
+			"channel/notes mismatch",
+		);
+		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+	});
+	for (const mutation of [
+		"notes",
+		"missing",
+		"extra",
+		"size",
+		"digest",
+		"commit",
+		"draft",
+	] as const) {
+		test(`promoted repair still rejects ${mutation} without mutation`, async () => {
+			const { options } = fixture("1.2.1");
+			const gh = fakeGitHub(options);
+			await publishGitHubRelease({ ...options, run: gh.run });
+			const release = gh.release;
+			if (!release) throw new Error("Missing fixture release");
+			release.prerelease = false;
+			if (mutation === "notes") release.body += "changed";
+			if (mutation === "missing") release.assets.pop();
+			if (mutation === "extra")
+				release.assets.push({ name: "foreign", size: 1, state: "uploaded" });
+			if (mutation === "size") release.assets[0].size++;
+			if (mutation === "digest") release.assets[0].digest = `sha256:${"0".repeat(64)}`;
+			if (mutation === "commit") gh.tagCommit = "b".repeat(40);
+			if (mutation === "draft") release.draft = true;
+			gh.calls.length = 0;
+			await expect(
+				publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true }),
+			).rejects.toThrow();
+			expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+		});
+	}
+	for (const mutation of ["channel", "notes", "digest"] as const) {
+		test(`rejects promoted ${mutation} changing during second readback`, async () => {
+			const { options } = fixture("1.2.1");
+			const gh = fakeGitHub(options);
+			await publishGitHubRelease({ ...options, run: gh.run });
+			const release = gh.release;
+			if (!release) throw new Error("Missing fixture release");
+			release.prerelease = false;
+			gh.calls.length = 0;
+			let reads = 0;
+			await expect(
+				publishGitHubRelease({
+					...options,
+					requireAlreadyPublished: true,
+					run: (args) => {
+						if (args[1].includes("/releases/tags/") && ++reads === 2) {
+							if (mutation === "channel") release.prerelease = true;
+							if (mutation === "notes") release.body += "changed";
+							if (mutation === "digest") release.assets[0].digest = `sha256:${"0".repeat(64)}`;
+						}
+						return gh.run(args);
+					},
+				}),
+			).rejects.toThrow();
+			expect(reads).toBe(2);
+			expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+		});
+	}
+	test("missing public release never becomes a newly created draft", async () => {
+		const { options } = fixture("1.2.1");
+		const gh = fakeGitHub(options);
+		await expect(
+			publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true }),
+		).rejects.toThrow("already-public");
+		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+		expect(gh.release).toBeNull();
+	});
+});
 
 describe("GitHub release assets and lifecycle", () => {
 	test.each([
@@ -769,7 +944,10 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 		);
 		const output = `${result.stdout.toString()}${result.stderr.toString()}`;
 		expect(output).not.toContain("FORBIDDEN_");
-		expect(output).not.toContain("baseline");
+		// An author's checkout directory may be named ci-baseline. Only diagnostics,
+		// not the project-path prefix, can indicate an attempted legacy baseline query.
+		const diagnostics = output.replaceAll(join(import.meta.dir, "../.."), "<project>");
+		expect(diagnostics).not.toContain("baseline");
 		expect(output).toMatch(/GitHub release failed|Dry run complete/);
 	});
 
@@ -814,7 +992,8 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 		});
 		const output = `${github.stdout.toString()}${github.stderr.toString()}`;
 		expect(github.exitCode).not.toBe(0);
-		expect(output).toContain("No valid release platforms selected");
+		// Index preparation validates the selected platform set before publisher staging.
+		expect(output).toContain("Invalid platform count");
 		expect(output).not.toContain("Update server token not found");
 		expect(output).not.toContain("baseline verification");
 		const legacy = Bun.spawnSync(args, {
@@ -824,5 +1003,67 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 			stderr: "pipe",
 		});
 		expect(legacy.stderr.toString()).toContain("Update server token not found");
+	});
+});
+
+describe("declared GitHub helper dependencies", () => {
+	function declare(data: ReturnType<typeof fixture>) {
+		for (const meta of data.metadata) {
+			meta.helperDistribution = createHelperDistributionDependencies(data.options.version);
+			writeFileSync(join(data.root, `${meta.name}.metadata.json`), formatMetadataJson(meta));
+		}
+	}
+	test("offline preview validates new declarations without checking remote helper releases", async () => {
+		const data = fixture();
+		declare(data);
+		const gh = fakeGitHub(data.options);
+		await publishGitHubRelease({ ...data.options, dryRun: true, run: gh.run });
+		expect(gh.calls).toEqual([]);
+	});
+	test("missing published helpers prevents any main Release mutation", async () => {
+		const data = fixture();
+		declare(data);
+		const calls: string[][] = [];
+		await expect(
+			publishGitHubRelease({
+				...data.options,
+				run: async (args) => {
+					calls.push(args);
+					throw new Error("HTTP 404: required helper Release is unavailable");
+				},
+			}),
+		).rejects.toThrow("404");
+		expect(calls.length).toBeGreaterThan(0);
+		expect(
+			calls.every((args) => args[0] === "api" && !args.includes("POST") && !args.includes("PATCH")),
+		).toBe(true);
+		expect(calls.some((args) => args[1]?.includes("helpers-v1.0.0"))).toBe(true);
+	});
+	test("mixed new and legacy platform declarations cannot bypass readiness", async () => {
+		const data = fixture("1.2.0", "all-platforms");
+		declare(data);
+		delete data.metadata[0]!.helperDistribution;
+		writeFileSync(
+			join(data.root, `${data.metadata[0]!.name}.metadata.json`),
+			formatMetadataJson(data.metadata[0]!),
+		);
+		const gh = fakeGitHub(data.options);
+		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow(
+			"Inconsistent",
+		);
+		expect(gh.calls).toEqual([]);
+	});
+	test("dependency versions cannot be invented by a sidecar", async () => {
+		const data = fixture();
+		declare(data);
+		const meta = data.metadata[0]!;
+		const dependencies = createHelperDistributionDependencies("9.0.0");
+		writeFileSync(
+			join(data.root, `${meta.name}.metadata.json`),
+			JSON.stringify({ ...meta, helperDistribution: dependencies }),
+		);
+		const gh = fakeGitHub(data.options);
+		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow();
+		expect(gh.calls).toEqual([]);
 	});
 });

@@ -68,6 +68,52 @@ describe("isRecentTabBackgroundActive", () => {
 	const tab = (activeBackgroundTaskCount?: number): RecentTab =>
 		({ type: "narrator", id: "n1", activeBackgroundTaskCount }) as RecentTab;
 
+	test("services do not paint idle or unread tabs blue, mixed work still does", () => {
+		const service: RecentTab = {
+			...tab(2),
+			status: "idle",
+			substatus: ["unread"],
+			activeBackgroundWorkCount: 0,
+			activeBackgroundServiceCount: 2,
+		};
+		expect(isRecentTabBackgroundActive(service, true)).toBeFalse();
+		expect(isRecentTabBackgroundActive(service, false)).toBeFalse();
+		expect(
+			isRecentTabBackgroundActive({ ...service, activeBackgroundWorkCount: 1 }, true),
+		).toBeTrue();
+	});
+
+	test("classification survives persisted merges and stale HTTP responses", () => {
+		const service: RecentTab = {
+			...tab(2),
+			activeBackgroundWorkCount: 0,
+			activeBackgroundServiceCount: 2,
+		};
+		expect(mergeRecentTabRuntime(tab(), service)).toMatchObject(service);
+		const versions = new Map<string, Map<string, number>>();
+		const before = snapshotRecentTabRuntimeVersions(versions, ["n1"]);
+		bumpRecentTabRuntimeVersions(versions, "n1", [
+			"activeBackgroundWorkCount",
+			"activeBackgroundServiceCount",
+		]);
+		const patches = reconcileRecentTabsRuntimePatches(
+			[
+				{
+					key: "narrator:n1",
+					patch: {
+						activeBackgroundWorkCount: 9,
+						activeBackgroundServiceCount: 0,
+						activeTerminalCount: 3,
+					},
+				},
+			],
+			new Map([["narrator:n1", "n1"]]),
+			before,
+			versions,
+		);
+		expect(patches).toEqual([{ key: "narrator:n1", patch: { activeTerminalCount: 3 } }]);
+	});
+
 	test("hollow tab with running background tasks renders half-filled", () => {
 		expect(isRecentTabBackgroundActive(tab(2), false)).toBeTrue();
 		expect(isRecentTabBackgroundActive(tab(1), false)).toBeTrue();
@@ -406,6 +452,214 @@ describe("recent tabs delta reducer", () => {
 				.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
 				?.pages[0].items.map((tab) => tab.id),
 		).toEqual(["narrator-2", "narrator-1"]);
+	});
+
+	test("keeps a boundary tab in place when its next neighbor is outside the loaded window", () => {
+		const qc = new QueryClient();
+		const loaded: RecentTab[] = Array.from({ length: 50 }, (_, index) => ({
+			type: "narrator",
+			id: `n${index}`,
+			title: `N${index}`,
+			lastVisitedAt: index,
+		}));
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData(loaded, 1, true));
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{
+					type: "upsert",
+					key: "narrator:n49",
+					tab: { ...loaded[49], title: "Renamed" },
+					beforeKey: "narrator:n50",
+					afterKey: "narrator:n48",
+				},
+			],
+		});
+
+		const items = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+			?.pages[0].items;
+		expect(items?.map((tab) => tab.id)).toEqual(loaded.map((tab) => tab.id));
+		expect(items?.[49]?.title).toBe("Renamed");
+	});
+
+	test("uses the loaded predecessor when the next neighbor belongs to the other section", () => {
+		const qc = new QueryClient();
+		const loaded: RecentTab[] = ["first", "second", "third"].map((id) => ({
+			type: "narrator",
+			id,
+			title: id,
+			lastVisitedAt: 1,
+		}));
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData(loaded, 1));
+		qc.setQueryData(
+			recentTabsSectionQueryKey("projects"),
+			pageData([{ type: "project", id: "p1", title: "Project", lastVisitedAt: 1 }], 1),
+		);
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{
+					type: "upsert",
+					key: "narrator:second",
+					tab: { ...loaded[1], title: "Renamed" },
+					beforeKey: "project:p1",
+					afterKey: "narrator:first",
+				},
+			],
+		});
+
+		expect(
+			qc
+				.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+				?.pages[0].items.map((tab) => tab.id),
+		).toEqual(["first", "second", "third"]);
+	});
+
+	test("does not pull an unloaded tab to the top when both neighbors are unloaded", () => {
+		const qc = new QueryClient();
+		const loaded: RecentTab[] = ["first", "second"].map((id) => ({
+			type: "narrator",
+			id,
+			title: id,
+			lastVisitedAt: 1,
+		}));
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData(loaded, 1, true));
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{
+					type: "upsert",
+					key: "narrator:unloaded",
+					tab: { type: "narrator", id: "unloaded", title: "Renamed", lastVisitedAt: 1 },
+					beforeKey: "narrator:unloaded-next",
+					afterKey: "narrator:unloaded-previous",
+				},
+			],
+		});
+
+		expect(
+			qc
+				.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+				?.pages[0].items.map((tab) => tab.id),
+		).toEqual(["first", "second"]);
+	});
+
+	test("replays predecessor-based moves without undoing an already positioned block", () => {
+		const qc = new QueryClient();
+		const loaded: RecentTab[] = ["a", "b", "c", "d"].map((id) => ({
+			type: "narrator",
+			id,
+			title: id,
+			lastVisitedAt: 1,
+		}));
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData(loaded, 1));
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{ type: "move", key: "narrator:c", beforeKey: "narrator:d", afterKey: null },
+				{ type: "move", key: "narrator:d", beforeKey: "narrator:a", afterKey: "narrator:c" },
+			],
+		});
+
+		expect(
+			qc
+				.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+				?.pages[0].items.map((tab) => tab.id),
+		).toEqual(["c", "d", "a", "b"]);
+	});
+
+	test("does not move a workspace back to the top using its own child as an anchor", () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData(
+				[
+					{ type: "workspace", id: "w2", title: "W2", lastVisitedAt: 1 },
+					{ type: "narrator", id: "c2", title: "C2", workspaceId: "w2", lastVisitedAt: 1 },
+					{ type: "workspace", id: "w1", title: "W1", lastVisitedAt: 1 },
+					{ type: "narrator", id: "c1", title: "C1", workspaceId: "w1", lastVisitedAt: 1 },
+				],
+				1,
+			),
+		);
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{ type: "move", key: "workspace:w1", beforeKey: "narrator:c1", afterKey: null },
+				{
+					type: "move",
+					key: "workspace:w2",
+					beforeKey: "narrator:c2",
+					afterKey: "narrator:c1",
+				},
+			],
+		});
+
+		expect(
+			qc
+				.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+				?.pages[0].items.map((tab) => tab.id),
+		).toEqual(["w1", "c1", "w2", "c2"]);
+	});
+
+	test("backfills a tab moved into the window when the delta has no tab payload", () => {
+		const qc = new QueryClient();
+		const loaded: RecentTab[] = [
+			{ type: "narrator", id: "first", title: "First", lastVisitedAt: 1 },
+		];
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData(loaded, 1, true));
+
+		expect(
+			applyRecentTabsDelta(qc, {
+				baseRevision: 1,
+				revision: 2,
+				operations: [
+					{ type: "move", key: "narrator:unloaded", beforeKey: "narrator:first", afterKey: null },
+				],
+			}),
+		).toEqual({ gaps: [], backfill: ["work"] });
+		expect(
+			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0].items,
+		).toEqual(loaded);
+	});
+
+	test("backfills after a loaded tab moves outside the visible prefix", () => {
+		const qc = new QueryClient();
+		const loaded: RecentTab[] = ["first", "second"].map((id) => ({
+			type: "narrator",
+			id,
+			title: id,
+			lastVisitedAt: 1,
+		}));
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData(loaded, 1, true));
+
+		expect(
+			applyRecentTabsDelta(qc, {
+				baseRevision: 1,
+				revision: 2,
+				operations: [
+					{
+						type: "move",
+						key: "narrator:second",
+						beforeKey: "narrator:unloaded-next",
+						afterKey: "narrator:unloaded-previous",
+					},
+				],
+			}),
+		).toEqual({ gaps: [], backfill: ["work"] });
+		expect(
+			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0].items,
+		).toEqual([loaded[0]]);
 	});
 
 	test("keeps optimistic inserts bounded to the loaded page window", () => {

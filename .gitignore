@@ -4,12 +4,15 @@ dist/
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*
 !shared/model-catalog/dist/catalog.json
-# Includes read-only migration-directory symlinks used by development worktrees.
-drizzle
-# NOTE: `drizzle-postgres/` is deliberately NOT ignored. The generated PG migration and its
-# meta/ snapshot are tracked so the PostgreSQL test suite runs in a fresh clone without a
-# generation step, matching the `!**/drizzle-postgres/**` entries in biome.json. The rule
-# above is scoped to the SQLite `drizzle/` directory only; do not widen it to a prefix glob.
+# SQLite migration history is required by fresh-clone tests and production upgrades.
+# Keep generated SQL, snapshots and journal; never publish local generation receipts/locks.
+drizzle/*
+!drizzle/*.sql
+!drizzle/meta/
+drizzle/meta/*
+!drizzle/meta/_journal.json
+!drizzle/meta/*_snapshot.json
+# PostgreSQL keeps its incremental SQL, journal and single current snapshot tracked too.
 
 frontend/routeTree.gen.ts
 server/generated/*
@@ -45,6 +48,20 @@ scripts/lib/*
 !scripts/lib/release-git.ts
 # GitHub Release publisher imported by the release entry point and behavioral tests.
 !scripts/lib/github-release.ts
+# Release CI control, immutable bundles, strict native inputs and native smoke.
+!scripts/ci-release.ts
+!scripts/smoke-release-binary.ts
+!scripts/lib/ci-release-*.ts
+!scripts/lib/ci-build-*.ts
+!scripts/lib/github-release-baseline.ts
+!scripts/lib/github-release-summary.ts
+!scripts/lib/build-repository.ts
+!scripts/lib/update-index*.ts
+# Protected CI update-server bridge and immutable mirror restoration.
+!scripts/lib/update-server-bridge-*.ts
+!scripts/lib/update-server-*-mirror.ts
+!scripts/lib/ci-update-server-bridge-*.ts
+.ci-release/
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.
 !scripts/lib/stable-baseline-patch.ts
@@ -57,6 +74,13 @@ scripts/lib/*
 !scripts/prepare-ripgrep-helpers.ts
 !scripts/build-zstd-static.sh
 !scripts/lib/helper-assets.ts
+!scripts/prepare-helper-assets.ts
+!scripts/release-helpers.ts
+!scripts/lib/helper-build.ts
+!scripts/lib/helper-artifact.ts
+!scripts/lib/helper-release.ts
+!scripts/lib/helper-release-control.ts
+.helper-release/
 !scripts/lib/zstd-windows-arm64.ts
 !scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/
@@ -95,6 +119,7 @@ drizzle-postgres/meta/_generation.lock/
 drizzle-postgres/meta/_generation_pending.json
 # Canonical SQLite schema generation must be reproducible in fresh clones.
 !scripts/generate-sqlite-migrations.ts
+!scripts/check-sqlite-migration-assets.ts
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts
 !scripts/lib/__tests__/generate-sqlite-migrations.test.ts
@@ -107,6 +132,10 @@ drizzle-postgres/meta/_generation_pending.json
 # tests/scripts/test-database-regression.test.ts. Its `artifacts/` reports are separate.
 !scripts/test-database-regression.ts
 !scripts/validate-plugin-release.ts
+# Required inputs for the plugin platform acceptance workflow.
+!scripts/drill-plugin-rollback.ts
+!scripts/smoke-plugin-ui.ts
+!scripts/smoke-narrator-dock.ts
 # Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
 # `bun test` fails on a missing module in a fresh clone.
 !scripts/build-plugin.ts

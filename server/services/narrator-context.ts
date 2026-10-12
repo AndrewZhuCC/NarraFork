@@ -4,10 +4,14 @@ import {
 	isContextWindowExceededError,
 } from "../lib/agent/error-handling";
 import { estimateTokens } from "../lib/agent/estimate-tokens";
+import { projectAskUserQuestionMessagesForModel } from "../lib/agent/question-model-input";
 import { projectMessageSenderText, type SenderMessage } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
-import { getSummaryModelContextWindow } from "../lib/settings/provider";
+import {
+	getSummaryModelContextWindowDetail,
+	type ModelContextWindowSource,
+} from "../lib/settings/provider";
 import { narratorService } from "./narrator-service";
 import { buildSpecCompactContext } from "./spec-reminder";
 
@@ -27,10 +31,19 @@ const IN_FLIGHT_STATUSES = new Set(["initializing", "pending", "running"]);
  * Leaves 20% headroom for the model's output and safety margin.
  */
 const COMPACT_TARGET_RATIO = 0.8;
+/**
+ * Extra shrink factor when the summary model's context window is only the tier
+ * fallback (nothing user/catalog/provider configured). Packing as if a custom
+ * model had `DEFAULT_CONTEXT_WINDOW` produced one oversized request that hung
+ * with zero streamed chars until the stall watchdog — a wrong window must not
+ * look like "compact made no progress".
+ */
+const COMPACT_FALLBACK_BUDGET_RATIO = 0.5;
 
 // ── Message → text conversion ─────────────────────────────────────────────────
 
 type CompactToolCall = {
+	toolUseId?: string;
 	status: string;
 	toolName: string;
 	inputJson: unknown;
@@ -113,11 +126,39 @@ function stripTodoReminderBlocks(value: unknown): unknown {
 	return value;
 }
 
+function questionToolUseIds(messages: readonly CompactMessage[]): Set<string> {
+	const ids = new Set<string>();
+	for (const message of messages) {
+		for (const tc of message.toolCalls ?? []) {
+			if (tc.toolName === "AskUserQuestion" && tc.toolUseId) ids.add(tc.toolUseId);
+		}
+		if (!Array.isArray(message.contentJson)) continue;
+		for (const block of message.contentJson) {
+			if (
+				block?.type === "tool_use" &&
+				block.name === "AskUserQuestion" &&
+				typeof block.id === "string"
+			) {
+				ids.add(block.id);
+			}
+		}
+	}
+	return ids;
+}
+
+function questionResultText(message: CompactMessage, ids: ReadonlySet<string>): string {
+	if (!Array.isArray(message.contentJson)) return "";
+	return message.contentJson
+		.filter((block) => block?.type === "tool_result" && ids.has(block.tool_use_id))
+		.map((block) => `[AskUserQuestion result]: ${summarizeJson(block, 500)}`)
+		.join("\n");
+}
+
 /**
- * Convert a single message to its compact text representation.
+ * Convert a projected message to its compact text representation.
  * Returns null for messages that produce no text (e.g. empty content, in-flight tools).
  */
-function messageToCompactText(m: CompactMessage): string | null {
+function messageToCompactText(m: CompactMessage, questionIds: ReadonlySet<string>): string | null {
 	// Only user and assistant messages
 	if (m.role !== "user" && m.role !== "assistant") return null;
 
@@ -127,6 +168,8 @@ function messageToCompactText(m: CompactMessage): string | null {
 
 	const role = m.role === "assistant" ? "Assistant" : "User";
 	let text = (stripTodoReminderBlocks(m.contentText || "") as string) || "";
+	const questionResults = questionResultText(m, questionIds);
+	if (questionResults) text = [text, questionResults].filter(Boolean).join("\n");
 
 	// For assistant messages, enrich with tool call details
 	if (m.role === "assistant" && tcs?.length) {
@@ -189,17 +232,30 @@ export const narratorContext = {
 		options?: { throwOnFailure?: boolean; userId?: string | null },
 	): Promise<string> {
 		const narrator = await narratorService.getById(narratorId);
-		const messages = await narratorService.getModelHistorySinceLastCompact(
-			narratorId,
-			SUMMARY_MAX_MESSAGES,
+		const messages = projectAskUserQuestionMessagesForModel(
+			await narratorService.getModelHistorySinceLastCompact(narratorId, SUMMARY_MAX_MESSAGES),
 		);
 
 		if (messages.length === 0 && !narrator.contextSummary) return "No conversation history.";
 
+		const questionIds = questionToolUseIds(messages);
 		let conversationText = messages
 			.map((m) => {
 				const role = m.role === "assistant" ? "Assistant" : m.role === "sys" ? "System" : "User";
-				const text = m.contentText || JSON.stringify(m.contentJson);
+				let text = m.contentText || JSON.stringify(m.contentJson);
+				// Fork summaries otherwise omit persisted outputs. Preserve synchronous
+				// question answers without adding raw output from unrelated tools.
+				const questions = (m.toolCalls ?? [])
+					.filter((tc) => tc.toolName === "AskUserQuestion" && !IN_FLIGHT_STATUSES.has(tc.status))
+					.map(
+						(tc) =>
+							`  - AskUserQuestion: input=${summarizeJson(tc.inputJson, 300)} → output=${summarizeJson(tc.outputJson, 500)}`,
+					);
+				if (questions.length) text += `\n[Tool calls]\n${questions.join("\n")}`;
+				if (m.contentText) {
+					const results = questionResultText(m, questionIds);
+					if (results) text += `\n${results}`;
+				}
 				return `[${role}]: ${compactSenderText(m, text)}`;
 			})
 			.join("\n\n");
@@ -254,9 +310,15 @@ export const narratorContext = {
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
-	): Promise<{ summary: string; contextPercent?: number }> {
-		const messages =
-			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
+	): Promise<{
+		summary: string;
+		contextPercent?: number;
+		contextWindowSource?: ModelContextWindowSource;
+	}> {
+		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
+		const messages = projectAskUserQuestionMessagesForModel(
+			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId)),
+		);
 
 		// Fetch narrator early — needed for contextSummary chaining
 		const narrator = await narratorService.getById(narratorId);
@@ -267,10 +329,11 @@ export const narratorContext = {
 
 		// ── Build per-message compact text entries ──
 		const entries: CompactEntry[] = [];
+		const questionIds = questionToolUseIds(messages);
 
 		for (let i = 0; i < messages.length; i++) {
 			const m = messages[i];
-			const text = messageToCompactText(m);
+			const text = messageToCompactText(m, questionIds);
 			if (text == null) continue;
 			entries.push({ message: m, text });
 		}
@@ -289,8 +352,13 @@ export const narratorContext = {
 			.filter(Boolean)
 			.join("\n\n");
 
-		const summaryCtxWindow = getSummaryModelContextWindow(modelOverride);
-		const tokenBudget = Math.floor(summaryCtxWindow * COMPACT_TARGET_RATIO);
+		const { contextWindow: summaryCtxWindow, source: contextWindowSource } =
+			getSummaryModelContextWindowDetail(modelOverride);
+		const budgetRatio =
+			contextWindowSource === "fallback"
+				? COMPACT_TARGET_RATIO * COMPACT_FALLBACK_BUDGET_RATIO
+				: COMPACT_TARGET_RATIO;
+		const tokenBudget = Math.floor(summaryCtxWindow * budgetRatio);
 
 		// Fixed tokens that are always present (system prompt + wrapper).
 		// The previous-summary prefix is variable per chunk, computed below.
@@ -306,6 +374,18 @@ export const narratorContext = {
 			: 0;
 		const contentBudget = tokenBudget - baseFixedTokens - previousSummaryTokens;
 
+		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
+		// Reject impossible overhead, not small requests that genuinely fit. The
+		// chunk-level strict check still rejects oversized entries and accounts for
+		// each actual rolling summary; splitting never discards conversation evidence.
+		if (contentBudget < 0 || (contentBudget === 0 && totalTokens > 0)) {
+			throw new Error(
+				`Compact cannot fit the conversation: summary model context window ${summaryCtxWindow} ` +
+					`(source: ${contextWindowSource}) leaves only ${contentBudget} tokens after fixed overhead. ` +
+					"Set the summary model's context window in Settings → Models to its real value.",
+			);
+		}
+
 		const chunks =
 			totalTokens <= contentBudget
 				? [cloneCompactEntries(entries)]
@@ -317,11 +397,24 @@ export const narratorContext = {
 				totalEntries: entries.length,
 				totalTokens,
 				summaryModelCtx: summaryCtxWindow,
+				contextWindowSource,
+				tokenBudget,
 				chunks: chunks.length,
 			});
 		}
+		if (contextWindowSource === "fallback") {
+			logger.warn(
+				"Compact packing used the fallback context window; fill in the summary model's real window",
+				{
+					narratorId,
+					model: modelOverride,
+					summaryModelCtx: summaryCtxWindow,
+					tokenBudget,
+				},
+			);
+		}
 
-		return this._summarizeChunkSequence(
+		const result = await this._summarizeChunkSequence(
 			narratorId,
 			chunks,
 			previousSummary,
@@ -338,6 +431,7 @@ export const narratorContext = {
 			onRetryScheduled,
 			userId,
 		);
+		return { ...result, contextWindowSource };
 	},
 
 	async _summarizeChunkSequence(

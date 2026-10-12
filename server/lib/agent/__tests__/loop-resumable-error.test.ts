@@ -1,5 +1,6 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { AnthropicProviderConfig } from "../../settings";
+import { settings, usesStatefulModel } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
 import type { ProviderAdapter } from "../provider";
 import type { AgentConfig, AgentEvent } from "../types";
@@ -80,6 +81,38 @@ function installResponses(responses: Response[]): () => number {
 		return response;
 	}) as unknown as typeof fetch;
 	return () => calls;
+}
+
+/**
+ * The gateway sets `resumable` once it forwarded any client-visible SSE
+ * payload, but its notion of "visible" includes non-content events (queue
+ * notices, a tool chunk carrying only an id, lifecycle frames). Those leave
+ * nothing persistable on our side. The pass must still hand off for a
+ * continuation (the next request is assembled from the latest state) rather
+ * than dying on a transient transport fault or replaying in place.
+ */
+function emptyThenResumableError(): Response {
+	const events = [
+		'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","usage":{"input_tokens":2}}}\n\n',
+		`event: error\ndata: ${JSON.stringify({
+			type: "error",
+			code: 502,
+			message: "upstream stream error",
+			error: { type: "error", code: 502, message: "upstream stream error" },
+			diagnostics: {
+				source: "channel",
+				phase: "upstream_error",
+				reason: "stream_read_error",
+				statusCode: 502,
+				retryable: false,
+				resumable: true,
+			},
+		})}\n\n`,
+	];
+	return new Response(events.join(""), {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
 }
 
 function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -165,70 +198,33 @@ describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-p
 		});
 	});
 
-	/**
-	 * The gateway sets `resumable` once it forwarded any client-visible SSE
-	 * payload, but its notion of "visible" includes non-content events (queue
-	 * notices, a tool chunk carrying only an id). Those leave nothing persistable
-	 * on our side, so the turn would otherwise be stuck: nothing to continue from,
-	 * and `retryable: false` forbidding a wholesale retry. Since no visible output
-	 * and no tool side effect exists locally, the identical request is replayed.
-	 */
-	function emptyThenResumableError(): Response {
-		const events = [
-			'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","usage":{"input_tokens":2}}}\n\n',
-			`event: error\ndata: ${JSON.stringify({
-				type: "error",
-				code: 502,
-				message: "upstream stream error",
-				error: { type: "error", code: 502, message: "upstream stream error" },
-				diagnostics: {
-					source: "channel",
-					phase: "upstream_error",
-					reason: "stream_read_error",
-					statusCode: 502,
-					retryable: false,
-					resumable: true,
-				},
-			})}\n\n`,
-		];
-		return new Response(events.join(""), {
-			status: 200,
-			headers: { "content-type": "text/event-stream" },
-		});
-	}
-
-	test("resumable=true with no local output replays the request instead of failing", async () => {
-		const fetchCalls = installResponses([
-			emptyThenResumableError(),
-			partialTextThenResumableError({ text: "recovered answer", resumable: false }),
-		]);
+	test("resumable=true with no local output hands off via resumable_error instead of failing", async () => {
+		const fetchCalls = installResponses([emptyThenResumableError()]);
 
 		const events = await runLoop({ maxTransientRetries: 1 });
 
-		// Replayed in place rather than surfaced as a hard failure.
-		expect(fetchCalls()).toBe(2);
-		expect(events.find((event) => event.type === "retrying")).toMatchObject({
-			type: "retrying",
-			attempt: 1,
+		// No in-place replay: the pass ends and the caller assembles the next
+		// request from the latest state.
+		expect(fetchCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(events.at(-1)).toMatchObject({
+			type: "resumable_error",
+			message: "upstream stream error",
 			diagnostics: { resumable: true, retryable: false },
 		});
-		// Not a continuation prompt — there was nothing to continue from.
-		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
-		// The replay produced real content.
-		expect(
-			events.find((event) => event.type === "block_complete" && event.block.type === "text"),
-		).toMatchObject({ block: { type: "text", text: "recovered answer" } });
 	});
 
-	test("resumable=true with no local output and no replay budget falls back to invalid_state", async () => {
+	test("resumable=true with no local output hands off regardless of the transient retry budget", async () => {
 		const fetchCalls = installResponses([emptyThenResumableError()]);
 
 		const events = await runLoop({ maxTransientRetries: 0 });
 
+		// The handoff is not a retry, so a zero budget must not turn it into a
+		// terminal failure.
 		expect(fetchCalls()).toBe(1);
 		expect(events.some((event) => event.type === "retrying")).toBe(false);
-		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
-		expect(events.at(-1)).toMatchObject({ type: "invalid_state" });
+		expect(events.at(-1)).toMatchObject({ type: "resumable_error" });
 	});
 
 	test("hard non-retryable quota text vetoes an optimistic resumable=true even with partial output", async () => {
@@ -271,5 +267,57 @@ describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-p
 		expect(fetchCalls()).toBe(1);
 		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
 		expect(events.at(-1)).toMatchObject({ type: "invalid_state" });
+	});
+});
+
+describe("agentLoop resumable handoff on stateful (responses/codex) models", () => {
+	// Registering the mocked provider's prefix with apiMode "responses" flips
+	// usesStatefulModel() for the loop, reproducing the production state of NUG
+	// codex channels. The resumable handoff must not depend on the in-place
+	// retry budget at all — that budget is 0 for stateful models, which is what
+	// used to turn this interruption into a hard failure ("Error: 上游连接错误").
+	const savedOpenaiProviders = settings.openaiProviders;
+	beforeEach(() => {
+		settings.openaiProviders = [
+			{
+				id: "loop-resumable-openai",
+				name: "Loop Resumable OpenAI",
+				prefix: "loop-resumable",
+				apiKey: "test-key",
+				baseUrl: "https://example.com/v1",
+				defaultModel: "claude-test",
+				apiMode: "responses",
+			},
+		];
+		// Pin that the registration actually flips the stateful classification —
+		// otherwise the tests below would pass vacuously.
+		expect(usesStatefulModel("loop-resumable", "loop-resumable:claude-test")).toBe(true);
+	});
+	afterEach(() => {
+		settings.openaiProviders = savedOpenaiProviders;
+	});
+
+	test("resumable=true with no local output hands off for continuation on a stateful model", async () => {
+		const fetchCalls = installResponses([emptyThenResumableError()]);
+
+		const events = await runLoop({ maxTransientRetries: 1 });
+
+		expect(fetchCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(events.some((event) => event.type === "invalid_state")).toBe(false);
+		expect(events.at(-1)).toMatchObject({
+			type: "resumable_error",
+			diagnostics: { resumable: true, retryable: false },
+		});
+	});
+
+	test("maxTransientRetries=0 does not turn the stateful resumable handoff into invalid_state", async () => {
+		const fetchCalls = installResponses([emptyThenResumableError()]);
+
+		const events = await runLoop({ maxTransientRetries: 0 });
+
+		expect(fetchCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(events.at(-1)).toMatchObject({ type: "resumable_error" });
 	});
 });

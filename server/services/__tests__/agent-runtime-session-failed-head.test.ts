@@ -5,7 +5,7 @@ import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite, activeDatabaseBackend: "sqlite" }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 mock.module("../agent-runtime/orchestrator", () => ({

@@ -153,6 +153,7 @@ const { toolRegistry } = await import("../../lib/agent/tool-registry");
 const { agentLoop } = await import("../../lib/agent/loop");
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
+const { handlePermission } = await import("../narrator-permission");
 const {
 	processEvent,
 	clearStreamingSnapshot,
@@ -160,7 +161,6 @@ const {
 	CriticalEventPersistenceError,
 } = await import("../narrator-event-handler");
 const { executeAgentLoop } = await import("../narrator-executor");
-const { handlePermission } = await import("../narrator-permission");
 toolRegistry.register({
 	name: "PublicationHold",
 	description: "Hold the first actual execution while the second tool is streamed",

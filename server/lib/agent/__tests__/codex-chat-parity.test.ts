@@ -529,6 +529,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				codexAccountId: transport === "native-ws" ? "test-account" : undefined,
 			},
 			undefined,
+			undefined,
 			transport === "native-ws" ? "test-credential" : undefined,
 		);
 		const requests: Record<string, unknown>[] = [];

@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import { backgroundTasks, narratorBufferedMessages, narrators } from "../../db/schema";
+import { wakeInboxIfEligible } from "../agent-runtime/inbox";
 import { flushRuntimePublications, runtimePublication } from "../agent-runtime/publication";
 import { discardBackgroundBashResult } from "../background-bash-result";
 import { backgroundTaskService } from "../background-task-service";
@@ -11,10 +12,22 @@ import { projectPendingInjection } from "../parent-injection-queue";
 
 const PARENT = "bash-notice-result-parent";
 const paths = new Set<string>();
+const wakes: string[] = [];
 runtimePublication.stop();
+afterAll(() => {
+	runtimePublication.setWake(async (recipientId) => {
+		await wakeInboxIfEligible(recipientId);
+	});
+});
 backgroundTaskService.setBroadcastFnForTests(() => {});
 
 beforeEach(() => {
+	// Keep real durable delivery and observe its wake seam, without starting an
+	// unconfigured AI loop that consumes/replaces this fixture's notice rows.
+	wakes.length = 0;
+	runtimePublication.setWake((recipientId) => {
+		wakes.push(recipientId);
+	});
 	const now = new Date().toISOString();
 	db.insert(narrators)
 		.values({ id: PARENT, variant: "primary", status: "idle", createdAt: now, updatedAt: now })
@@ -92,6 +105,7 @@ describe("real Bash terminal publication result", () => {
 			}
 			const delivered = await notices();
 			expect(delivered).toHaveLength(1);
+			expect(wakes).toEqual(terminal === "cancelled" ? [] : [PARENT]);
 			expect(delivered[0].status).toBe(terminal);
 			const content = delivered[0].outputPreview;
 			const path = outputPath(content);

@@ -1,3 +1,10 @@
+import { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
+import {
+	parseUpdateSourceIdentity,
+	sameUpdateSourceIdentity,
+	type UpdateSourceIdentity,
+} from "@shared/update-identity";
+
 export type UpdateSource = "github" | "update-server";
 
 export interface UpdateSourceSettings {
@@ -8,7 +15,7 @@ export interface UpdateSourceSettings {
 	channel?: "stable" | "beta";
 }
 
-export const DEFAULT_GITHUB_REPOSITORY = "NarraFork/NarraFork";
+export { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
 
 const LEGACY_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
 
@@ -35,10 +42,28 @@ export function updateSettingsKey(update?: UpdateSourceSettings): string {
 	]);
 }
 
+export function settingsSourceIdentity(
+	update: UpdateSourceSettings | undefined,
+	platform: string,
+): UpdateSourceIdentity | null {
+	return parseUpdateSourceIdentity({
+		source: update?.source ?? "github",
+		repository: update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
+		serverUrl: normalizeServerUrl(update?.serverUrl),
+		product: update?.product ?? "narrafork",
+		channel: update?.channel ?? "stable",
+		platform,
+	});
+}
+
 export function sameUpdateSource(
-	previous: { source?: UpdateSource; repository?: string },
-	next: { source?: UpdateSource; repository?: string },
+	previous: { source?: UpdateSource; repository?: string; sourceIdentity?: UpdateSourceIdentity },
+	next: { source?: UpdateSource; repository?: string; sourceIdentity?: UpdateSourceIdentity },
 ): boolean {
+	// Partial evidence must never override a complete identity (including channel/product/platform).
+	if (previous.sourceIdentity || next.sourceIdentity) {
+		return sameUpdateSourceIdentity(previous.sourceIdentity, next.sourceIdentity);
+	}
 	// Older responses without a source came only from the update server.
 	const source = previous.source ?? "update-server";
 	return (
@@ -77,6 +102,8 @@ export function updateCheckErrorKey(code?: string): string {
 			return "updateCheckScanLimit";
 		case "UPDATE_SOURCE_CHANGED":
 			return "updateSourceChanged";
+		case "UPDATE_ARTIFACT_CHANGED":
+			return "updateArtifactChanged";
 		default:
 			return "updateCheckFailed";
 	}

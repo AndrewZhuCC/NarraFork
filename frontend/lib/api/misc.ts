@@ -6,7 +6,14 @@ import type { ResolvedBranding } from "@shared/branding";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
-import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
+import {
+	ApiError,
+	apiBase,
+	authorizedFetch,
+	pickRequestOptions,
+	readFetchError,
+	request,
+} from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
@@ -304,13 +311,16 @@ export const miscApi = {
 			"/openai/models/refresh",
 			{ method: "POST" },
 		),
-	openaiRefreshProviderModels: (providerId: string) =>
+	openaiRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{ id: string; owned_by?: string }>;
 			fromCache: boolean;
 			resolvedBaseUrl?: string;
 			resolvedModelsUrl?: string;
-		}>(`/openai/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/openai/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 
 	// External MCP server management
 	mcpListServers: () =>
@@ -643,12 +653,15 @@ export const miscApi = {
 		request<{ ok: boolean }>("/codex/usage-queue/clear", { method: "POST" }),
 
 	// Anthropic models
-	anthropicRefreshProviderModels: (providerId: string) =>
+	anthropicRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{ id: string; display_name?: string }>;
 			fromCache: boolean;
 			resolvedBaseUrl?: string;
-		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/anthropic/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 
 	// NUG
 	nugLogin: (providerId: string, body: { username: string; password: string }) =>
@@ -821,7 +834,7 @@ export const miscApi = {
 			refreshed: boolean;
 			cooldownMs: number;
 		}>("/nug/models/refresh-if-stale", { method: "POST" }),
-	nugRefreshProviderModels: (providerId: string) =>
+	nugRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{
 				id: string;
@@ -832,7 +845,10 @@ export const miscApi = {
 			fromCache: boolean;
 			modelHash?: string;
 			modelContextWindows?: Record<string, number>;
-		}>(`/nug/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/nug/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 	nugOAuthStart: (providerId: string) =>
 		request<{ authorizeUrl: string; state: string }>(`/nug/providers/${providerId}/oauth/start`),
 
@@ -846,13 +862,16 @@ export const miscApi = {
 	// Gemini (Google Generative Language API) — per-provider model refresh.
 	// Gemini is configured via the unified custom-API protocol ("gemini-compatible");
 	// this refresh endpoint mirrors the openai/anthropic per-provider refresh.
-	geminiRefreshProviderModels: (providerId: string) =>
+	geminiRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{ id: string; name?: string; contextLength?: number }>;
 			count: number;
 			fromCache: boolean;
 			modelContextWindows?: Record<string, number>;
-		}>(`/gemini/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/gemini/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 
 	// Health / platform
 	health: () =>
@@ -1139,22 +1158,41 @@ export const miscApi = {
 		}),
 
 	// Update
+	getUpdateNotes: (
+		identity: {
+			version: string;
+			sha512: string;
+			sourceIdentity: import("@shared/update-identity").UpdateSourceIdentity;
+		},
+		signal?: AbortSignal,
+	) =>
+		request<{ notes: string | Record<string, string> | null }>("/update/notes", {
+			method: "POST",
+			body: JSON.stringify(identity),
+			signal,
+		}),
 	checkUpdate: () =>
 		request<{
 			updateAvailable: boolean;
 			currentVersion: string;
+			sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
 			source?: "github" | "update-server";
 			repository?: string;
 			error?: string;
 			errorCode?: string;
 			retryAfter?: number;
 			latestVersion?: string;
+			notesDeferred?: boolean;
+			notesAvailable?: boolean;
 			releaseInfo?: {
+				sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
 				source?: "github" | "update-server";
 				repository?: string;
 				version: string;
 				releaseDate: string;
 				releaseNotes?: string | Record<string, string>;
+				notesDeferred?: boolean;
+				notesAvailable?: boolean;
 				path: string;
 				sha512: string;
 				files: Array<{ url: string; size: number; sha512: string }>;
@@ -1208,7 +1246,7 @@ export const miscApi = {
 			cancelledSchedule: boolean;
 			newBinaryPath?: string;
 		}>("/update/shutdown", { method: "POST" }),
-	applyUpdate: (version?: string) =>
+	applyUpdate: (version?: string, preparedId?: string) =>
 		request<{
 			success: boolean;
 			error?: string;
@@ -1227,7 +1265,7 @@ export const miscApi = {
 			replacementPid?: number;
 		}>("/update/apply", {
 			method: "POST",
-			body: version ? JSON.stringify({ version }) : undefined,
+			body: JSON.stringify({ version, preparedId }),
 		}),
 
 	// Workspaces

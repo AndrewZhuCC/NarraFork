@@ -31,6 +31,8 @@ export type ApiRequestDiagnosticSource =
 	| "parser";
 
 export interface ApiRequestDiagnostics {
+	/** Present only for the first-party TokenDance connection, never inferred from model names. */
+	tokendanceRecoveryAction?: import("../tokendance").TokenDanceRecoveryAction;
 	schema: "narrafork.error-diagnostics.v1";
 	source?: ApiRequestDiagnosticSource | string;
 	phase?: string;
@@ -185,6 +187,8 @@ export interface BuiltHistory {
 	history: unknown[];
 	trailingToolResults: unknown[];
 	trailingUserText?: string;
+	/** Persisted input rows actually emitted into history, not lifted into current input. */
+	replayedInjectionMessageIds?: readonly string[];
 }
 
 // === Stream event emitted by provider.chat() ===

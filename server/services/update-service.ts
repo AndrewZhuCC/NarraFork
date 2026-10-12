@@ -9,10 +9,12 @@ import {
 	createReadStream,
 	existsSync,
 	constants as fsConstants,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
@@ -21,13 +23,29 @@ import { open } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
 import type { GithubPatchStep } from "../../shared/release-patch";
+import {
+	type PreparedUpdateIdentity,
+	parseUpdateSourceIdentity,
+	sameUpdateSourceIdentity,
+	type UpdateSourceIdentity,
+} from "../../shared/update-identity";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
-import { downloadHelperBinary, getCachedHelperBinaryPath } from "../lib/helper-binaries";
+import { downloadHelperBinary } from "../lib/helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "../lib/helper-binary-platform";
+import {
+	createDistributionContext,
+	type DistributionContext,
+} from "../lib/helper-distribution-runtime";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
+import {
+	createUpdateFetchContext,
+	fetchUpdateWithTimeout,
+	readUpdateJson,
+	type UpdateFetchContext,
+} from "../lib/net/update-fetch";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -36,6 +54,7 @@ import {
 	scheduleOperatorShutdown,
 } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { DEFAULT_GITHUB_REPOSITORY } from "../lib/settings/update-source";
 import { removeStableUpdateHandoff, writeStableUpdateHandoff } from "../lib/stable-update-handoff";
 import { type StablePathInstall, verifyStablePathInstall } from "../lib/stable-update-install";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
@@ -48,7 +67,9 @@ import {
 import {
 	downloadGithubBinaryToFile,
 	downloadGithubPatchToFile,
+	GithubUpdateError,
 	githubReleaseUpdater,
+	type UpdateNotesRequest,
 } from "./github-release-update";
 import { toolContinuationService } from "./tool-continuation-service";
 import {
@@ -107,55 +128,34 @@ async function zstdCliResponds(binary: string, signal?: AbortSignal): Promise<bo
 	}
 }
 
-/**
- * Find or download the zstd CLI binary.
- * - Checks system PATH first.
- * - Falls back to a NarraFork-managed helper binary cached under ~/.narrafork/bin.
- * Returns the path to zstd binary, or null if unavailable.
- *
- * Nothing here installs software. A package-manager install (the former macOS
- * `brew install zstd`) can block for minutes and has no business running inside an HTTP
- * request; the client surfaces an install hint instead when this returns null.
- *
- * When `forceDownload` is true (explicit user retry), the recent-failure cache
- * is bypassed so a previous network timeout does not short-circuit the attempt.
- * GitHub passes `allowDownload=false`: only PATH / the existing local cache may be used,
- * and a missing CLI triggers a GitHub full download, never an old-server helper request.
- */
+/** Resolve system zstd first, then prepare a verified helper from the frozen effective source. */
 async function getZstdCliPath(
 	forceDownload = false,
 	allowDownload = true,
 	signal?: AbortSignal,
+	context?: DistributionContext,
 ): Promise<string | null> {
-	// Resolving first lets ARM64 reject an emulated x64 PATH executable.
+	signal?.throwIfAborted();
 	const system = Bun.which("zstd");
 	if (system && isNativeCliHelper(system) && (await zstdCliResponds(system, signal))) return system;
-
-	if (process.platform === "darwin") {
-		// No prebuilt helper binary is published for macOS, and installing one from a request
-		// handler is not acceptable. The client shows the `brew install zstd` hint.
-		return null;
-	}
-
 	const spec = getCliHelperSpec("zstd");
 	if (!spec) return null;
-	if (!allowDownload) {
-		const cached = getCachedHelperBinaryPath(spec.cachedName, spec.windowsArch);
-		return cached && isNativeCliHelper(cached) && (await zstdCliResponds(cached, signal))
-			? cached
-			: null;
-	}
-	return downloadHelperBinary(spec, { bypassFailureCache: forceDownload });
+	if (!allowDownload) return null;
+	return downloadHelperBinary(spec, { bypassFailureCache: forceDownload, signal, context });
 }
 
 export interface ReleaseInfo {
 	/** Selected delivery origin, re-resolved server-side before downloading. */
 	source?: "github" | "update-server";
 	repository?: string;
+	/** Effective source policy captured before the check starts, never inferred at download time. */
+	sourceIdentity?: UpdateSourceIdentity;
 	_github?: { repository: string; downloadUrl: string; patchChain?: GithubPatchStep[] };
 	version: string;
 	releaseDate: string;
 	releaseNotes?: string | Record<string, string>;
+	notesDeferred?: boolean;
+	notesAvailable?: boolean;
 	path: string;
 	sha512: string;
 	files: Array<{
@@ -188,6 +188,7 @@ export interface ReleaseInfo {
 export interface UpdateCheckResult {
 	source?: "github" | "update-server";
 	repository?: string;
+	sourceIdentity?: UpdateSourceIdentity;
 	error?: string;
 	errorCode?: string;
 	retryAfter?: number;
@@ -195,6 +196,8 @@ export interface UpdateCheckResult {
 	currentVersion: string;
 	latestVersion?: string;
 	releaseInfo?: ReleaseInfo;
+	notesDeferred?: boolean;
+	notesAvailable?: boolean;
 	/** Actual download size based on chosen strategy */
 	downloadSize?: number;
 	totalSize?: number;
@@ -254,6 +257,8 @@ interface PlacedUpdateInfo {
 	sizeBytes: number;
 	/** Opt-in written only by the fixed-signature local installer. */
 	stablePathInstall?: StablePathInstall;
+	/** Absent on legacy metadata; never backfilled from the current source settings. */
+	sourceIdentity?: UpdateSourceIdentity;
 }
 
 /**
@@ -302,27 +307,11 @@ function isPathInsideDirectory(childPath: string, parentPath: string): boolean {
 	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
 }
 
-/**
- * Fetch with a hard deadline.
- *
- * Every update-server request needs one: without it a hung server keeps the SSE stream and
- * the whole download call pending forever, and the client-side cancel only aborts the
- * client's own fetch.
- */
 async function fetchWithTimeout(
 	url: string,
-	options: { timeoutMs: number; signal?: AbortSignal },
+	options: { timeoutMs: number; signal?: AbortSignal; transport?: UpdateFetchContext },
 ): Promise<Response> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), Math.max(1, options.timeoutMs));
-	const onAbort = () => controller.abort();
-	options.signal?.addEventListener("abort", onAbort, { once: true });
-	try {
-		return await fetch(url, { signal: controller.signal });
-	} finally {
-		clearTimeout(timer);
-		options.signal?.removeEventListener("abort", onAbort);
-	}
+	return fetchUpdateWithTimeout(url, options);
 }
 
 /**
@@ -649,12 +638,17 @@ async function checkChannel(
 	product: string,
 	channel: string,
 	platform: string,
+	transport: UpdateFetchContext,
 ): Promise<UpdateCheckResult> {
 	const checkUrl = `${serverUrl}/api/v2/products/${product}/releases/latest?channel=${channel}&platform=${platform}&version=${APP_VERSION}`;
 	logger.debug("Checking for updates", { url: checkUrl, channel });
 
-	const response = await fetchWithTimeout(checkUrl, { timeoutMs: METADATA_FETCH_TIMEOUT_MS });
+	const response = await fetchWithTimeout(checkUrl, {
+		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
+		transport,
+	});
 	if (!response.ok) {
+		void response.body?.cancel().catch(() => {});
 		logger.warn("Update check failed", { status: response.status, channel });
 		return {
 			updateAvailable: false,
@@ -664,7 +658,7 @@ async function checkChannel(
 		};
 	}
 
-	const data = (await response.json()) as V2CheckResponse;
+	const data = (await readUpdateJson(response)) as V2CheckResponse;
 
 	if (!data.updateAvailable || !data.version || !data.file) {
 		return {
@@ -735,21 +729,27 @@ async function checkChannel(
 	};
 }
 
-/**
- * Check for updates from the update server (v2 API).
- * When on the beta channel, also checks stable — if a newer stable version exists,
- * it takes priority so beta users can upgrade to the next stable release.
- */
+/** Capture source policy before any asynchronous detection; cached results stay immutable. */
 export async function checkForUpdate(
-	options: { force?: boolean } = {},
+	options: { force?: boolean; transport?: UpdateFetchContext } = {},
 ): Promise<UpdateCheckResult> {
-	if ((settings.update?.source ?? "github") === "github") {
+	const identity = getCurrentUpdateSourceIdentity();
+	if (!identity)
+		return {
+			updateAvailable: false,
+			currentVersion: APP_VERSION,
+			errorCode: "INVALID_CONFIGURATION",
+			error: "Invalid update source configuration",
+		};
+	const sourceIdentity = Object.freeze(identity);
+	let result: UpdateCheckResult;
+	if (sourceIdentity.source === "github") {
 		const startedAt = Date.now();
-		const result = await githubReleaseUpdater.check(
+		result = await githubReleaseUpdater.check(
 			{
-				repository: settings.update?.githubRepository ?? "NarraFork/NarraFork",
-				channel: settings.update?.channel ?? "stable",
-				platform: getPlatform(),
+				repository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
+				channel: sourceIdentity.channel,
+				platform: sourceIdentity.platform,
 				currentVersion: APP_VERSION,
 			},
 			options,
@@ -761,25 +761,77 @@ export async function checkForUpdate(
 				durationMs: Date.now() - startedAt,
 			});
 		}
-		return result;
+	} else {
+		result = {
+			...(await checkForServerUpdate(sourceIdentity, options.transport)),
+			source: "update-server",
+		};
 	}
-	return { ...(await checkForServerUpdate()), source: "update-server" };
+	return {
+		...result,
+		sourceIdentity,
+		...(result.releaseInfo ? { releaseInfo: { ...result.releaseInfo, sourceIdentity } } : {}),
+	};
+}
+
+/** Notes are optional, but must never cross a configuration or artifact identity boundary. */
+export async function getUpdateNotes(request: UpdateNotesRequest, signal?: AbortSignal) {
+	const captured = getCurrentUpdateSourceIdentity();
+	if (captured?.source !== "github" || !sameUpdateSourceIdentity(request.sourceIdentity, captured))
+		throw new GithubUpdateError("UPDATE_SOURCE_CHANGED", "Update source changed; check again");
+	const result = await githubReleaseUpdater.getNotes(
+		{ ...request, sourceIdentity: captured },
+		signal,
+	);
+	if (!sameUpdateSourceIdentity(captured, getCurrentUpdateSourceIdentity()))
+		throw new GithubUpdateError(
+			"UPDATE_SOURCE_CHANGED",
+			"Update source changed while loading notes",
+		);
+	signal?.throwIfAborted();
+	return result;
+}
+
+export function getCurrentUpdateSourceIdentity(): UpdateSourceIdentity | null {
+	const common = { channel: settings.update?.channel ?? "stable", platform: getPlatform() };
+	return parseUpdateSourceIdentity(
+		(settings.update?.source ?? "github") === "github"
+			? {
+					...common,
+					source: "github",
+					repository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
+				}
+			: {
+					...common,
+					source: "update-server",
+					serverUrl: getServerBaseUrl(),
+					product: settings.update?.product ?? "narrafork",
+				},
+	);
 }
 
 export function isUpdateSourceCurrent(releaseInfo: ReleaseInfo): boolean {
-	const source = settings.update?.source ?? "github";
-	if (source !== (releaseInfo.source ?? "update-server")) return false;
-	if (source === "github") {
-		return (
-			releaseInfo.repository?.toLowerCase() ===
-			(settings.update?.githubRepository ?? "NarraFork/NarraFork").toLowerCase()
-		);
+	const captured = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
+	if (!captured || !sameUpdateSourceIdentity(captured, getCurrentUpdateSourceIdentity()))
+		return false;
+	if (captured.source !== (releaseInfo.source ?? "update-server")) return false;
+	if (captured.source === "github") {
+		return releaseInfo.repository?.trim().toLowerCase() === captured.repository;
 	}
-	return !releaseInfo._v2?.serverUrl || releaseInfo._v2.serverUrl === getServerBaseUrl();
+	return (
+		!releaseInfo._v2?.serverUrl ||
+		sameUpdateSourceIdentity(captured, {
+			...captured,
+			serverUrl: releaseInfo._v2.serverUrl,
+		})
+	);
 }
 
-async function checkForServerUpdate(): Promise<UpdateCheckResult> {
-	const serverUrl = getServerBaseUrl();
+async function checkForServerUpdate(
+	sourceIdentity: Extract<UpdateSourceIdentity, { source: "update-server" }>,
+	transport?: UpdateFetchContext,
+): Promise<UpdateCheckResult> {
+	const { serverUrl } = sourceIdentity;
 	if (!serverUrl) {
 		return {
 			updateAvailable: false,
@@ -789,16 +841,15 @@ async function checkForServerUpdate(): Promise<UpdateCheckResult> {
 		};
 	}
 
-	const channel = settings.update?.channel ?? "stable";
-	const platform = getPlatform();
-	const product = settings.update?.product ?? "narrafork";
+	const { channel, platform, product } = sourceIdentity;
 
 	try {
+		const context = transport ?? createUpdateFetchContext();
 		if (channel === "beta") {
 			// Check both channels in parallel
 			const [betaResult, stableResult] = await Promise.all([
-				checkChannel(serverUrl, product, "beta", platform),
-				checkChannel(serverUrl, product, "stable", platform),
+				checkChannel(serverUrl, product, "beta", platform, context),
+				checkChannel(serverUrl, product, "stable", platform, context),
 			]);
 
 			// Pick the higher version between the two channels
@@ -812,7 +863,7 @@ async function checkForServerUpdate(): Promise<UpdateCheckResult> {
 			return betaResult.errorCode ? betaResult : stableResult.errorCode ? stableResult : betaResult;
 		}
 
-		return await checkChannel(serverUrl, product, channel, platform);
+		return await checkChannel(serverUrl, product, channel, platform, context);
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
 		return {
@@ -834,6 +885,8 @@ interface PatchApplicationContext {
 	declaredPatchSize: number;
 	forceDownload: boolean;
 	signal?: AbortSignal;
+	transport: UpdateFetchContext;
+	helperContext: DistributionContext;
 	onProgress?: (progress: UpdateProgress) => void;
 	progressBase: number;
 	progressSpan: number;
@@ -849,15 +902,18 @@ class ZstdCliMissingError extends Error {
 async function fetchPatchMeta(
 	metaUrl: string,
 	signal: AbortSignal | undefined,
+	transport: UpdateFetchContext,
 ): Promise<ZstdPatchMeta> {
 	const metaResp = await fetchWithTimeout(metaUrl, {
 		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
 		signal,
+		transport,
 	});
 	if (!metaResp.ok) {
+		void metaResp.body?.cancel().catch(() => {});
 		throw new Error(`Failed to fetch patch meta: ${metaResp.status}`);
 	}
-	return (await metaResp.json()) as ZstdPatchMeta;
+	return (await readUpdateJson(metaResp, 64 * 1024)) as ZstdPatchMeta;
 }
 
 /**
@@ -881,8 +937,10 @@ async function downloadAndApplyPatchStep(context: PatchApplicationContext): Prom
 		const patchResp = await fetchWithTimeout(context.stepUrl, {
 			timeoutMs: PAYLOAD_FETCH_TIMEOUT_MS,
 			signal: context.signal,
+			transport: context.transport,
 		});
 		if (!patchResp.ok) {
+			void patchResp.body?.cancel().catch(() => {});
 			throw new Error(`Failed to fetch patch: ${patchResp.status}`);
 		}
 		// Trust the smaller of the two announced sizes, with slack for header/framing drift.
@@ -908,7 +966,12 @@ async function downloadAndApplyPatchStep(context: PatchApplicationContext): Prom
 
 		let zstdCliPath: string | undefined;
 		if (meta.mode === "patch-from") {
-			const cli = await getZstdCliPath(context.forceDownload);
+			const cli = await getZstdCliPath(
+				context.forceDownload,
+				true,
+				context.signal,
+				context.helperContext,
+			);
 			if (!cli) throw new ZstdCliMissingError();
 			zstdCliPath = cli;
 		}
@@ -947,6 +1010,15 @@ async function downloadAndApplyPatchStep(context: PatchApplicationContext): Prom
 	}
 }
 
+function assertPreparedUpdateCanBeReplaced(releaseInfo: ReleaseInfo): void {
+	if (!isUpdateSourceCurrent(releaseInfo))
+		throw new Error("Update source changed during download; check for updates again");
+	if (getUpdateCoordinationStatus().scheduled)
+		throw new Error(
+			"A restart is already scheduled; keep its prepared update until it finishes or is cancelled",
+		);
+}
+
 /**
  * Download and apply an update using zstd patches.
  *
@@ -966,11 +1038,21 @@ export async function downloadUpdate(
 	updatePath?: string;
 	newBinaryPath?: string;
 	placed?: boolean;
+	preparedIdentity?: PreparedUpdateIdentity;
 }> {
 	const forceDownload = options.forceDownload ?? false;
+	const sourceIdentity = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
+	releaseInfo = { ...releaseInfo, sourceIdentity: sourceIdentity ?? undefined };
 	const isGithub = releaseInfo.source === "github";
-	if (!isUpdateSourceCurrent(releaseInfo)) {
+	if (!sourceIdentity || !isUpdateSourceCurrent(releaseInfo)) {
 		return { success: false, error: "Update source changed; check for updates again" };
+	}
+	if (getUpdateCoordinationStatus().scheduled) {
+		return {
+			success: false,
+			error:
+				"A restart is already scheduled; keep its prepared update until it finishes or is cancelled",
+		};
 	}
 	if (!isGithub && !getServerBaseUrl()) {
 		return { success: false, error: "Update server not configured" };
@@ -1011,6 +1093,8 @@ export async function downloadUpdate(
 	};
 	try {
 		signal?.throwIfAborted();
+		const transport = createUpdateFetchContext();
+		const helperContext = createDistributionContext(sourceIdentity, undefined, transport);
 		emitProgress({
 			phase: "downloading",
 			bytesDownloaded: 0,
@@ -1037,9 +1121,15 @@ export async function downloadUpdate(
 					},
 				},
 				{
-					downloadPatch: downloadGithubPatchToFile,
-					downloadFull: downloadGithubBinaryToFile,
-					resolveZstd: (patchSignal) => getZstdCliPath(false, false, patchSignal),
+					downloadPatch: (step, path, downloadOptions) =>
+						downloadGithubPatchToFile(step, path, { ...downloadOptions, fetcher: transport.fetch }),
+					downloadFull: (release, path, downloadOptions) =>
+						downloadGithubBinaryToFile(release, path, {
+							...downloadOptions,
+							fetcher: transport.fetch,
+						}),
+					resolveZstd: (patchSignal) =>
+						getZstdCliPath(forceDownload, true, patchSignal, helperContext),
 					onFallback: (error) =>
 						logger.warn("GitHub delta unavailable; downloading GitHub full binary", {
 							source: "github",
@@ -1066,7 +1156,7 @@ export async function downloadUpdate(
 			if (zstdMetaUrl && zstdPatchUrl) {
 				try {
 					// Check the base version before spending a payload download on an unusable patch.
-					const meta = await fetchPatchMeta(zstdMetaUrl, signal);
+					const meta = await fetchPatchMeta(zstdMetaUrl, signal, transport);
 					if (meta.fromVersion !== APP_VERSION) {
 						logger.debug("Zstd patch version mismatch", {
 							patchFrom: meta.fromVersion,
@@ -1081,6 +1171,8 @@ export async function downloadUpdate(
 							declaredPatchSize: meta.patchSize,
 							forceDownload,
 							signal,
+							transport,
+							helperContext,
 							onProgress,
 							progressBase: 0,
 							progressSpan: 100,
@@ -1109,7 +1201,7 @@ export async function downloadUpdate(
 						const step = chain[i];
 						const isLast = i === chain.length - 1;
 						const outputPath = isLast ? tempPath : intermediatePaths[i % 2];
-						const meta = await fetchPatchMeta(step.metaUrl, signal);
+						const meta = await fetchPatchMeta(step.metaUrl, signal, transport);
 						await downloadAndApplyPatchStep({
 							sourcePath,
 							outputPath,
@@ -1118,6 +1210,8 @@ export async function downloadUpdate(
 							declaredPatchSize: step.patchSize,
 							forceDownload,
 							signal,
+							transport,
+							helperContext,
 							onProgress,
 							progressBase: (i / chain.length) * 100,
 							progressSpan: (1 / chain.length) * 100,
@@ -1180,6 +1274,7 @@ export async function downloadUpdate(
 		if (execPath) {
 			const destination = await resolvePreparedBinaryDestination(execPath, releaseInfo);
 			signal?.throwIfAborted();
+			assertPreparedUpdateCanBeReplaced(releaseInfo);
 			newBinaryPath = destination.path;
 			finalFileName = destination.fileName;
 			if (destination.alreadyPresent) {
@@ -1201,6 +1296,7 @@ export async function downloadUpdate(
 			// Development mode fallback: keep the rebuilt binary in the update cache.
 			const destination = await resolveUpdateCacheDestination(releaseInfo);
 			signal?.throwIfAborted();
+			assertPreparedUpdateCanBeReplaced(releaseInfo);
 			finalUpdatePath = destination.path;
 			finalFileName = destination.fileName;
 			if (destination.alreadyPresent) {
@@ -1211,7 +1307,8 @@ export async function downloadUpdate(
 		}
 
 		const finalSize = statSync(finalUpdatePath).size;
-		writePlacedUpdateInfo({
+		const preparedInfo: PlacedUpdateInfo = {
+			sourceIdentity,
 			version: releaseInfo.version,
 			fromVersion: APP_VERSION,
 			fileName: finalFileName,
@@ -1221,7 +1318,9 @@ export async function downloadUpdate(
 			placedAt: new Date().toISOString(),
 			sha512: releaseInfo.sha512,
 			sizeBytes: finalSize,
-		});
+		};
+		writePlacedUpdateInfo(preparedInfo);
+		const preparedIdentity = preparedUpdateIdentity(preparedInfo);
 
 		emitProgress({
 			phase: "complete",
@@ -1236,6 +1335,7 @@ export async function downloadUpdate(
 			updatePath: finalUpdatePath,
 			newBinaryPath,
 			placed,
+			preparedIdentity,
 		};
 	} catch (err) {
 		// The full-download helper owns cleanup on failure, including exclusive-create conflicts.
@@ -1363,22 +1463,88 @@ async function verifyFileSha512Cached(
 	return (await promise) === expectedSha512;
 }
 
+function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity {
+	const sourceIdentity = parseUpdateSourceIdentity(info.sourceIdentity);
+	const id = createHash("sha256")
+		.update(
+			JSON.stringify([
+				"prepared-update-v1",
+				info.version,
+				info.fromVersion,
+				info.fileName,
+				info.newBinaryPath ? resolve(info.newBinaryPath) : null,
+				info.updatePath ? resolve(info.updatePath) : null,
+				info.placed,
+				info.placedAt,
+				info.sha512,
+				info.sizeBytes,
+				sourceIdentity,
+			]),
+		)
+		.digest("hex");
+	return {
+		id,
+		version: info.version,
+		sha512: info.sha512,
+		sizeBytes: info.sizeBytes,
+		sourceIdentity,
+	};
+}
+
+function readPlacedUpdateRecord(): PlacedUpdateInfo | null {
+	try {
+		const stat = lstatSync(PLACED_UPDATE_INFO_PATH);
+		if (!stat.isFile() || stat.size <= 0 || stat.size > 64 * 1024) return null;
+		const info = JSON.parse(readFileSync(PLACED_UPDATE_INFO_PATH, "utf8")) as PlacedUpdateInfo;
+		if (
+			!info ||
+			typeof info !== "object" ||
+			Array.isArray(info) ||
+			typeof info.version !== "string" ||
+			!info.version ||
+			info.version.length > 128 ||
+			typeof info.fileName !== "string" ||
+			typeof info.placed !== "boolean" ||
+			typeof info.placedAt !== "string" ||
+			info.fromVersion !== APP_VERSION ||
+			typeof info.sha512 !== "string" ||
+			!/^[A-Za-z0-9+/]{86}==$/.test(info.sha512) ||
+			!Number.isSafeInteger(info.sizeBytes) ||
+			info.sizeBytes <= 0 ||
+			info.sizeBytes > MAX_BINARY_BYTES ||
+			(info.newBinaryPath !== undefined && typeof info.newBinaryPath !== "string") ||
+			(info.updatePath !== undefined && typeof info.updatePath !== "string") ||
+			(info.sourceIdentity != null && !parseUpdateSourceIdentity(info.sourceIdentity))
+		)
+			return null;
+		return info;
+	} catch {
+		return null;
+	}
+}
+
+function isPreparedRecordCurrent(info: PlacedUpdateInfo): boolean {
+	const current = readPlacedUpdateRecord();
+	return current !== null && preparedUpdateIdentity(current).id === preparedUpdateIdentity(info).id;
+}
+
 function writePlacedUpdateInfo(info: PlacedUpdateInfo): void {
 	mkdirSync(UPDATE_DIR, { recursive: true });
-	writeFileSync(PLACED_UPDATE_INFO_PATH, JSON.stringify(info, null, 2));
+	const temporary = `${PLACED_UPDATE_INFO_PATH}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(temporary, JSON.stringify(info, null, 2), { flag: "wx", mode: 0o600 });
+		renameSync(temporary, PLACED_UPDATE_INFO_PATH);
+	} finally {
+		safeUnlink(temporary);
+	}
 }
 
 async function readPlacedUpdateInfo(
 	options: { targetVersion?: string } = {},
 ): Promise<PlacedUpdateInfo | null> {
-	if (!existsSync(PLACED_UPDATE_INFO_PATH)) return null;
 	try {
-		if (statSync(PLACED_UPDATE_INFO_PATH).size > 64 * 1024) return null;
-		const info = JSON.parse(readFileSync(PLACED_UPDATE_INFO_PATH, "utf8")) as PlacedUpdateInfo;
-		if (options.targetVersion && info.version !== options.targetVersion) return null;
-		if (info.fromVersion !== APP_VERSION) return null;
-		if (typeof info.sha512 !== "string" || !info.sha512) return null;
-		if (typeof info.sizeBytes !== "number" || !Number.isFinite(info.sizeBytes)) return null;
+		const info = readPlacedUpdateRecord();
+		if (!info || (options.targetVersion && info.version !== options.targetVersion)) return null;
 
 		const candidatePath = info.newBinaryPath ?? info.updatePath;
 		if (!candidatePath) return null;
@@ -1405,6 +1571,7 @@ async function readPlacedUpdateInfo(
 		const stat = statSync(resolvedCandidatePath);
 		if (!stat.isFile() || stat.size !== info.sizeBytes) return null;
 		if (!(await verifyFileSha512Cached(resolvedCandidatePath, stat, info.sha512))) return null;
+		if (!isPreparedRecordCurrent(info)) return null;
 
 		return {
 			...info,
@@ -1507,6 +1674,7 @@ export async function getUpdateStatus(targetVersion?: string): Promise<
 		updatePath?: string;
 		placed?: boolean;
 		version?: string;
+		preparedIdentity?: PreparedUpdateIdentity;
 		instructions?: ReturnType<typeof getUpdateInstructions>;
 	}
 > {
@@ -1520,6 +1688,7 @@ export async function getUpdateStatus(targetVersion?: string): Promise<
 		updatePath: placedInfo?.updatePath,
 		placed: placedInfo?.placed,
 		version: placedInfo?.version,
+		...(placedInfo ? { preparedIdentity: preparedUpdateIdentity(placedInfo) } : {}),
 		...(artifactPath
 			? { instructions: getUpdateInstructions(artifactPath, placedInfo?.newBinaryPath) }
 			: {}),
@@ -1542,11 +1711,18 @@ function moveFileNoOverwriteSync(src: string, dst: string): void {
  * The replacement process is spawned after background Bash drains, ordinary tools
  * quiesce, and the recovery snapshot is persisted.
  */
-export async function applyUpdate(options: { targetVersion?: string } = {}): Promise<{
+export async function applyUpdate(
+	options: { targetVersion?: string; preparedId?: string } = {},
+): Promise<{
 	success: boolean;
 	error?: string;
 	/** Stable code for the fixed pre-flight failures so clients can localize them. */
-	code?: "NOT_COMPILED_BINARY" | "NO_PREPARED_UPDATE" | "PREPARED_UPDATE_NOT_PLACED";
+	code?:
+		| "NOT_COMPILED_BINARY"
+		| "NO_PREPARED_UPDATE"
+		| "PREPARED_UPDATE_NOT_PLACED"
+		| "PREPARED_UPDATE_IDENTITY_REQUIRED"
+		| "PREPARED_UPDATE_CHANGED";
 	newBinaryPath?: string;
 	restarting?: boolean;
 	scheduled?: boolean;
@@ -1560,19 +1736,46 @@ export async function applyUpdate(options: { targetVersion?: string } = {}): Pro
 	replacementPid?: number;
 	drainStartedAt?: string;
 }> {
-	const execPath = getCurrentExecutablePath();
-	if (!execPath) {
-		return { success: false, error: "Not running as compiled binary", code: "NOT_COMPILED_BINARY" };
+	if (!options.preparedId || !/^[a-f0-9]{64}$/.test(options.preparedId)) {
+		return {
+			success: false,
+			error: "Read the prepared update identity before applying",
+			code: "PREPARED_UPDATE_IDENTITY_REQUIRED",
+		};
 	}
-
+	const changed = () => ({
+		success: false as const,
+		error: "Prepared update changed; inspect it again before applying",
+		code: "PREPARED_UPDATE_CHANGED" as const,
+	});
+	const beforeVerification = readPlacedUpdateRecord();
+	if (beforeVerification && preparedUpdateIdentity(beforeVerification).id !== options.preparedId)
+		return changed();
 	const placedInfo = await readPlacedUpdateInfo({ targetVersion: options.targetVersion });
 	const newExecPath = placedInfo?.newBinaryPath ?? placedInfo?.updatePath;
 	if (!placedInfo || !newExecPath) {
+		if (
+			beforeVerification &&
+			(!isPreparedRecordCurrent(beforeVerification) ||
+				(options.targetVersion && options.targetVersion !== beforeVerification.version))
+		)
+			return changed();
 		return {
 			success: false,
 			error: "No verified prepared update file found",
 			code: "NO_PREPARED_UPDATE",
 		};
+	}
+	// The hash check awaited I/O. Recheck the record in this turn before admitting
+	// a schedule; another download must not retarget this request to the same version.
+	if (
+		!isPreparedRecordCurrent(placedInfo) ||
+		preparedUpdateIdentity(placedInfo).id !== options.preparedId
+	)
+		return changed();
+	const execPath = getCurrentExecutablePath();
+	if (!execPath) {
+		return { success: false, error: "Not running as compiled binary", code: "NOT_COMPILED_BINARY" };
 	}
 	if (!placedInfo.placed) {
 		return {

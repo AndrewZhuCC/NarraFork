@@ -140,6 +140,8 @@ interface InitialMessageStatus {
 export interface CompactProgressState extends ProgressSnapshot {
 	retryCount: number;
 	retryError?: string;
+	/** Provenance of the summary model's context window (`fallback` = unset). */
+	contextWindowSource?: string;
 }
 
 export interface UseNarratorPanelWSOptions {
@@ -1389,7 +1391,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					},
 				});
 			},
-			onCompactProgress: ({ phase, thinkingChars, outputChars, retryCount, retryError }) => {
+			onCompactProgress: ({
+				phase,
+				thinkingChars,
+				outputChars,
+				retryCount,
+				retryError,
+				contextWindowSource,
+			}) => {
 				dispatchStatus({
 					type: "patch",
 					payload: {
@@ -1399,6 +1408,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							outputChars,
 							retryCount,
 							...(retryError ? { retryError } : {}),
+							...(contextWindowSource ? { contextWindowSource } : {}),
 						},
 					},
 				});

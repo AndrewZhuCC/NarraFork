@@ -16,11 +16,15 @@ let script: ProviderAdapter["chat"];
 let attempts = 0;
 const started: string[] = [];
 const replayed: unknown[][] = [];
+const requests: Array<{ history: unknown[]; toolResults?: unknown[] }> = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
+		requests.push(
+			structuredClone({ history: params.history ?? [], toolResults: params.toolResults }),
+		);
 		params.onRequestStart?.();
 		if (++attempts > 1) {
 			yield { text: "收尾" };
@@ -64,6 +68,7 @@ beforeEach(() => {
 	attempts = 0;
 	started.length = 0;
 	replayed.length = 0;
+	requests.length = 0;
 });
 afterAll(() => {
 	mock.module("../provider", () => realProvider);
@@ -71,7 +76,10 @@ afterAll(() => {
 	mock.restore();
 });
 
-async function run(onEvent?: (event: AgentEvent) => Promise<void> | void) {
+async function run(
+	onEvent?: (event: AgentEvent) => Promise<void> | void,
+	permissionHandler: AgentConfig["permissionHandler"] = async () => ({ behavior: "allow" }),
+) {
 	const config: AgentConfig = {
 		narratorId: "n-content-persistence",
 		conversationId: "content-persistence",
@@ -79,7 +87,7 @@ async function run(onEvent?: (event: AgentEvent) => Promise<void> | void) {
 		model: "test:model",
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
-		permissionHandler: async () => ({ behavior: "allow" }),
+		permissionHandler,
 	};
 	const events: AgentEvent[] = [];
 	for await (const event of agentLoop(config, "test content ordering", [])) {
@@ -269,5 +277,87 @@ describe("content publication precedes tools", () => {
 		expect(reasoningWrites.at(-1)?.providerMetadata?.openai?.reasoningEncryptedContent).toBe(
 			"encrypted",
 		);
+	});
+});
+
+describe("question reply ownership during real loop execution", () => {
+	test.each([
+		false,
+		true,
+	])("permission reply never becomes the assistant's arguments (deferred=%s)", async (deferred) => {
+		const originalTool = toolRegistry.get("AskUserQuestion");
+		const originalPush = provider.pushAssistantTurn;
+		const authored = {
+			questions: [{ header: "Direction", options: [{ header: "A" }, { header: "B" }] }],
+			async: false,
+		};
+		const reply = deferred
+			? { ...authored, async: true, deferredByUser: true }
+			: {
+					...authored,
+					answers: { Direction: "UNIQUE_HUMAN_PERMISSION_REPLY" },
+					annotations: { Direction: { notes: "human note" } },
+				};
+		let executionInput: unknown;
+		toolRegistry.register({
+			name: "AskUserQuestion",
+			description: "Question execution observer",
+			parameters: z.object({ questions: z.array(z.unknown()), async: z.boolean().optional() }),
+			execute: async (input) => {
+				executionInput = structuredClone(input);
+				return {
+					output: deferred
+						? "Question accepted asynchronously."
+						: "User answered: UNIQUE_HUMAN_PERMISSION_REPLY",
+				};
+			},
+		});
+		provider.pushAssistantTurn = (history, text, uses, ...rest) => {
+			replayed.push([history, text, structuredClone(uses), ...rest]);
+			history.push({
+				role: "assistant",
+				content: uses.map((use) => ({
+					type: "tool_use",
+					id: use.toolUseId,
+					name: use.name,
+					input: structuredClone(use.input),
+				})),
+			});
+		};
+		script = async function* () {
+			yield {
+				toolUses: [
+					{
+						toolUseId: "question-authored",
+						name: "AskUserQuestion",
+						input: structuredClone(authored),
+					},
+				],
+			};
+		};
+		try {
+			const events = await run(undefined, async () => ({ behavior: "allow", updatedInput: reply }));
+			expect(executionInput).toEqual(reply);
+			const sent = requests[1]?.history as Array<{
+				role: string;
+				content: Array<{ type: string; name: string; input: unknown }>;
+			}>;
+			const call = sent
+				.flatMap((message) => message.content)
+				.find((block) => block.name === "AskUserQuestion");
+			expect(call?.input).toEqual(authored);
+			expect(JSON.stringify(requests[1]?.history)).not.toContain("UNIQUE_HUMAN_PERMISSION_REPLY");
+			expect(events.find((event) => event.type === "tool_result")).toMatchObject({
+				updatedInput: reply,
+			});
+			expect(JSON.stringify(requests[1]?.toolResults)).toContain(
+				deferred ? "Question accepted asynchronously." : "UNIQUE_HUMAN_PERMISSION_REPLY",
+			);
+			expect(authored.async).toBe(false);
+		} finally {
+			provider.pushAssistantTurn = originalPush;
+			if (originalTool) toolRegistry.register(originalTool);
+			else toolRegistry.unregister("AskUserQuestion");
+		}
 	});
 });

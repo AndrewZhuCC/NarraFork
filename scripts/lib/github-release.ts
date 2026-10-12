@@ -1,17 +1,25 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { copyFile, lstat, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, opendir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isValidGitHubRepository } from "../../server/lib/settings/update-source";
+import {
+	isValidGitHubRepository,
+	OFFICIAL_GITHUB_REPOSITORY,
+} from "../../shared/github-repository";
+import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../../shared/helper-distribution";
 import {
 	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
 	parseReleasePatchName,
 	validateReleasePatchMetadata,
 } from "../../shared/release-patch";
-import { isValidReleaseVersion } from "../../shared/release-version";
+import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
 
 const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
@@ -22,7 +30,7 @@ const MAX_PATCH_PAIRS = 64;
 const MAX_DIST_ENTRIES = 4096;
 export const GH_TIMEOUT_MS = 300_000;
 export const GH_MAX_OUTPUT_BYTES = 1024 * 1024;
-export const DEFAULT_GITHUB_REPOSITORY = "NarraFork/NarraFork";
+export const DEFAULT_GITHUB_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
 
 export type GhRunner = (args: string[]) => string | Promise<string>;
 
@@ -34,7 +42,7 @@ export const runGh: GhRunner = (args) => {
 			timeout: GH_TIMEOUT_MS,
 			maxBuffer: GH_MAX_OUTPUT_BYTES,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+			env: { ...updateServerChildEnvironment(), GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
 		});
 	} catch (error) {
 		const detail = error as { stderr?: string | Buffer; message?: string };
@@ -88,6 +96,12 @@ export interface GitHubReleaseOptions {
 	commit: string;
 	changelog?: string | Record<string, string>;
 	dryRun?: boolean;
+	/** CI opt-in; local publishing keeps its existing behavior. */
+	preventStableLatestRollback?: boolean;
+	/** New fork releases must not silently ship an upstream-default binary. */
+	requireBuildRepository?: boolean;
+	/** Recovery mode may verify an already-public release, never create/upload/publish one. */
+	requireAlreadyPublished?: boolean;
 	run?: GhRunner;
 }
 
@@ -242,6 +256,16 @@ async function stageAssets(options: GitHubReleaseOptions, directory: string): Pr
 		const metadataName = `${name}.metadata.json`;
 		const raw = await readText(join(options.distDir, metadataName), MAX_METADATA_BYTES);
 		const metadata = JSON.parse(raw) as BinaryMetadata;
+		const expectedRepository = options.repository ?? DEFAULT_GITHUB_REPOSITORY;
+		if (
+			(metadata.repository !== undefined &&
+				(!isValidGitHubRepository(metadata.repository) ||
+					metadata.repository.toLowerCase() !== expectedRepository.toLowerCase())) ||
+			(options.requireBuildRepository &&
+				metadata.repository === undefined &&
+				expectedRepository.toLowerCase() !== OFFICIAL_GITHUB_REPOSITORY.toLowerCase())
+		)
+			throw new Error(`Binary build repository does not match release target: ${metadataName}`);
 		const target = `bun-${platform.replace(/^win-/, "windows-")}`;
 		if (
 			metadata.name !== name ||
@@ -430,6 +454,55 @@ async function verifyAsset(
 	await rm(path);
 }
 
+/** Run immediately before draft creation and again before changing latest. */
+async function assertStableLatestDoesNotRegress(
+	run: GhRunner,
+	repository: string,
+	version: string,
+): Promise<void> {
+	for (let page = 1; page <= 10; page++) {
+		const output = await run([
+			"api",
+			`repos/${repository}/releases?per_page=100&page=${page}`,
+			"--jq",
+			"[.[] | {tag_name, draft, prerelease}]",
+		]);
+		if (Buffer.byteLength(output) > GH_MAX_OUTPUT_BYTES)
+			throw new Error("Release listing exceeds output limit");
+		const releases = JSON.parse(output) as {
+			tag_name: string;
+			draft: boolean;
+			prerelease: boolean;
+		}[];
+		if (
+			!Array.isArray(releases) ||
+			releases.length > 100 ||
+			releases.some(
+				(release) =>
+					typeof release?.tag_name !== "string" ||
+					typeof release.draft !== "boolean" ||
+					typeof release.prerelease !== "boolean",
+			)
+		) {
+			throw new Error("Invalid release listing for stable latest guard");
+		}
+		for (const release of releases) {
+			const previous = release.tag_name.startsWith("v") ? release.tag_name.slice(1) : "";
+			if (
+				!release.draft &&
+				!release.prerelease &&
+				isValidReleaseVersion(previous) &&
+				releaseChannel(previous) === "stable" &&
+				compareReleaseVersions(previous, version) > 0
+			) {
+				throw new Error(`Refusing stable latest rollback from ${previous} to ${version}`);
+			}
+		}
+		if (releases.length < 100) return;
+	}
+	throw new Error("Stable latest guard pagination limit reached");
+}
+
 /** Drafts remain on any failure; public releases are immutable and must match exactly. */
 export async function publishGitHubRelease(
 	options: GitHubReleaseOptions,
@@ -440,15 +513,45 @@ export async function publishGitHubRelease(
 	const tag = `v${options.version}`;
 	const body = githubReleaseBody(options.changelog);
 	if (Buffer.byteLength(body) > MAX_TEXT_BYTES) throw new Error("Release notes exceed size limit");
-	const prerelease = releaseChannel(options.version) === "beta";
+	let prerelease = releaseChannel(options.version) === "beta";
 	const directory = await mkdtemp(join(tmpdir(), "narrafork-github-release-"));
 	try {
 		const assets = await stageAssets(options, directory);
 		const names = assets.map((asset) => asset.name);
+		const declarations: Array<HelperDistributionDependencies | undefined> = [];
+		for (const asset of assets.filter((entry) => entry.name.endsWith(".metadata.json"))) {
+			const sidecar = JSON.parse(await readFile(asset.path, "utf8"));
+			declarations.push(
+				sidecar.helperDistribution === undefined
+					? undefined
+					: parseHelperDistributionDependencies(sidecar.helperDistribution, options.version),
+			);
+		}
+		const dependencies = declarations[0];
+		if (declarations.some((entry) => JSON.stringify(entry) !== JSON.stringify(dependencies)))
+			throw new Error("Inconsistent release helper dependencies across platforms");
 		if (options.dryRun) return { dryRun: true, alreadyPublished: false, assets: names };
+		if (dependencies && !options.requireAlreadyPublished) {
+			const { verifyPublishedHelperDependencies } = await import("./helper-release");
+			await verifyPublishedHelperDependencies({
+				repository,
+				helpersTag: dependencies.helpers.tag,
+				executorVersion: dependencies.executor.version,
+				protocolVersion: dependencies.executor.protocolVersion,
+				run,
+			});
+		}
 		// Require an explicitly pushed tag rather than silently using GitHub's default branch.
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		let release = await getRelease(run, repository, tag);
+		if (options.requireAlreadyPublished && (!release || release.draft))
+			throw new Error("Index repair requires an already-public release");
+		// Read-only repair follows an explicit remote promotion, but freezes that
+		// announcement state for all subsequent checks and never mutates assets.
+		if (options.requireAlreadyPublished && release) prerelease = release.prerelease;
+		if (options.preventStableLatestRollback && !prerelease && (!release || release.draft)) {
+			await assertStableLatestDoesNotRegress(run, repository, options.version);
+		}
 		if (!release) {
 			const notesPath = join(directory, "release-notes.txt");
 			await writeFile(notesPath, body);
@@ -504,6 +607,9 @@ export async function publishGitHubRelease(
 		}
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		if (!alreadyPublished) {
+			if (options.preventStableLatestRollback && !prerelease) {
+				await assertStableLatestDoesNotRegress(run, repository, options.version);
+			}
 			await run([
 				"release",
 				"edit",

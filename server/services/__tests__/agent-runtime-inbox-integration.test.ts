@@ -2,6 +2,7 @@ import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	backgroundTasks,
 	fileChangeExecutionSegments,
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -9,6 +10,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 
 const { db, sqlite } = getTestDb();
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
@@ -452,11 +454,23 @@ test("parent real delivery commits history/ref/materialization together and keep
 	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
 	await inbox.withInboxOwner("parent", async () => {
 		const row = required(await inbox.claimInboxHead("parent", () => true));
-		await deliverPendingInjection("parent", "en", "busy", "onNextTurn", {
-			...projectPendingInjection(row),
-			mailboxClaim: inbox.inboxClaim(row),
-			recipientMessageId: required(row.recipientMessageId),
-		});
+		const deliveredParts: Array<{ text: string; messageId?: string }> = [];
+		const text = await deliverPendingInjection(
+			"parent",
+			"en",
+			"busy",
+			"onNextTurn",
+			{
+				...projectPendingInjection(row),
+				mailboxClaim: inbox.inboxClaim(row),
+				recipientMessageId: required(row.recipientMessageId),
+			},
+			undefined,
+			(part) => deliveredParts.push(part),
+		);
+		expect(deliveredParts).toEqual([
+			{ text: required(text), messageId: required(state(row.id)?.currentMessageId) },
+		]);
 		expect(state(row.id)).toMatchObject({
 			state: "materialized",
 			text: "",
@@ -521,8 +535,90 @@ test("after-tools consumer preserves principal barrier and only materializes on 
 			currentUserId: "other",
 		});
 		expect(result?.text).toBe('<sender kind="agent" id="sender" name="Sender" />\nnew principal');
+		expect(result?.parts).toEqual([
+			{ text: required(result).text, messageId: required(childMessages()[0]?.id) },
+		]);
+		expect(result?.parts[0]?.messageId).not.toBe(accepted.id);
 		expect(state(accepted.id)?.adoptedAt).toBeNull();
 	});
+});
+
+test("child after-tools parts separate the durable buffered input and its knowledge hint", async () => {
+	const knowledge = await import("../subagent-knowledge-injection");
+	const scan = spyOn(knowledge, "scanSubagentTextForKnowledge").mockResolvedValue({
+		content: "knowledge for the buffered message",
+		body: { kind: "knowledge", hits: [] },
+		record: { narratorId: "child", compactSeq: 0, hits: [] },
+	});
+	try {
+		const value = delivery("child", "buffered message");
+		const accepted = await pushSubagentBufferedMessage("child", value.text, { delivery: value });
+		const projected = await inbox.withInboxOwner("child", () =>
+			drainInjectionsIntoHistory(
+				{
+					narratorId: "child",
+					cwd: ".",
+					_tasksReminderInterval: -1,
+					_fenceInterval: -1,
+				} as Parameters<typeof drainInjectionsIntoHistory>[0],
+				"en",
+				{ parentNarratorId: "parent", parentToolUseId: "origin" },
+			),
+		);
+		const userMessage = required(childMessages().find((message) => message.role === "user"));
+		const hintMessage = required(childMessages().find((message) => message.role === "sys"));
+		expect(projected.parts).toEqual(
+			[userMessage, hintMessage].map((message) => ({
+				text: projectMessageSenderText(message, message.contentText ?? ""),
+				messageId: message.id,
+			})),
+		);
+		expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+		expect(projected.parts[0]?.messageId).not.toBe(accepted.id);
+		expect(projected.parts[0]?.messageId).not.toBe(projected.parts[1]?.messageId);
+		expect(userMessage.parentToolUseId).toBe("origin");
+		expect(hintMessage.parentToolUseId).toBe("origin");
+		expect(state(accepted.id)?.adoptedAt).toBeNull();
+
+		const { settings } = await import("../../lib/settings");
+		const originalProviders = settings.openaiProviders;
+		const agentModule = await import("../../lib/agent");
+		const realBuilder = spyOn(agentModule, "buildHistory").mockImplementation(agent.buildHistory);
+		try {
+			settings.openaiProviders = (["responses", "completions"] as const).map((apiMode) => ({
+				id: `buffered-replay-${apiMode}`,
+				name: "Buffered replay fixture",
+				prefix: `buffered-replay-${apiMode}`,
+				apiKey: "isolated-test-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "gpt-5",
+				apiMode,
+			}));
+			const { buildRuntimeHistory } = await import("../agent-runtime/history");
+			for (const apiMode of ["responses", "completions"] as const) {
+				const rebuilt = await buildRuntimeHistory({
+					narratorId: "child",
+					profile: "subagent",
+					model: "gpt-5",
+					provider: `buffered-replay-${apiMode}`,
+					sourceMessages: childMessages(),
+				});
+				const historyText = JSON.stringify(rebuilt.history);
+				expect(historyText).toContain(value.text);
+				expect(historyText).toContain("knowledge for the buffered message");
+				expect(rebuilt.replayedInjectionMessageIds).toEqual([userMessage.id, hintMessage.id]);
+				const replayed = new Set(rebuilt.replayedInjectionMessageIds);
+				expect(projected.parts.filter((part) => !replayed.has(required(part.messageId)))).toEqual(
+					[],
+				);
+			}
+		} finally {
+			realBuilder.mockRestore();
+			settings.openaiProviders = originalProviders;
+		}
+	} finally {
+		scan.mockRestore();
+	}
 });
 
 test("completion outbox notices share the ordered consumer and restore only bounded immutable result", async () => {
@@ -622,12 +718,208 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	failBroadcast = false;
 	expect(projected.text).toContain("This notice could not load the result.");
 	expect(projected.text).toContain("Await(");
+	expect(projected.parts).toEqual([
+		{ text: projected.text, messageId: required(state(row.id)?.currentMessageId) },
+	]);
+	expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
 	expect(state(row.id)).toMatchObject({ state: "materialized", adoptedAt: null });
 	projected.onConsumed();
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	expect(state(row.id)?.adoptedAt).not.toBeNull();
 	expect(state(row.id)?.adoptedRevision).toBe(1);
 });
+
+test("after-tools parts keep equal Send bodies as distinct ordered durable messages", async () => {
+	const first = delivery("parent", "identical reports");
+	const second = delivery("parent", "identical reports");
+	await inbox.enqueueInboxAgent(first, first.text, { channel: "parent" });
+	await inbox.enqueueInboxAgent(second, second.text, { channel: "parent" });
+	const rows = await inbox.listInboxRows("parent");
+	const projected = await drainInjectionsIntoHistory(
+		{
+			narratorId: "parent",
+			_tasksReminderInterval: -1,
+			_fenceInterval: -1,
+		} as Parameters<typeof drainInjectionsIntoHistory>[0],
+		"en",
+	);
+	expect(projected.parts).toHaveLength(2);
+	expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+	expect(projected.parts.map((part) => part.messageId)).toEqual(
+		rows.map((row) => required(state(row.id)?.currentMessageId)),
+	);
+	expect(projected.parts[0]?.messageId).not.toBe(projected.parts[1]?.messageId);
+	expect(projected.parts[0]?.text).toBe(projected.parts[1]?.text);
+	for (const row of rows) expect(state(row.id)?.adoptedAt).toBeNull();
+});
+
+for (const narratorId of ["parent", "child"] as const) {
+	test(`${narratorId} task, fence and spec-update parts retain each persisted source`, async () => {
+		const { specVfsService } = await import("../spec-vfs-service");
+		const { pushSpecUpdateForNarrator } = await import("../spec-update-queue");
+		await specVfsService.writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			JSON.stringify({ tasks: [{ text: "current fixture task", status: "doing" }] }),
+		);
+		await specVfsService.writeSpecFile(narratorId, "spec://behavior_fence", "fixture constraint", {
+			actor: "user",
+		});
+		pushSpecUpdateForNarrator(narratorId, {
+			uri: "spec://notes.txt",
+			path: "notes.txt",
+			revisionId: null,
+			updatedBy: "user",
+			preview: "updated fixture note",
+			taskSummary: null,
+			timestamp: time,
+		});
+		const subagent =
+			narratorId === "child"
+				? { parentNarratorId: "parent", parentToolUseId: "origin" }
+				: undefined;
+		const projected = await drainInjectionsIntoHistory(
+			{
+				narratorId,
+				cwd: ".",
+				_todoReminderCompletedToolCount: 1,
+				_lastTasksReminderCompletedToolCount: 0,
+				_lastFenceCompletedToolCount: 0,
+				_tasksReminderInterval: 1,
+				_fenceInterval: 1,
+			} as Parameters<typeof drainInjectionsIntoHistory>[0],
+			"en",
+			subagent,
+		);
+		expect(projected.parts).toHaveLength(3);
+		expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+		const sources = projected.parts.map((part) => {
+			const message = required(
+				db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.id, required(part.messageId)))
+					.get(),
+			);
+			expect(message.narratorId).toBe(narratorId);
+			expect(message.parentToolUseId).toBe(subagent?.parentToolUseId ?? null);
+			expect(part.text).toBe(projectMessageSenderText(message, message.contentText ?? ""));
+			return (message.contentJson as Array<{ type: string; source?: string }>).find(
+				(block) => block.type === "system_injection",
+			)?.source;
+		});
+		expect(sources).toEqual(["living_work_spec", "behavior_fence", "spec_update"]);
+	});
+}
+
+for (const kind of ["bg_agent", "bg_bash"] as const) {
+	for (const mode of ["busy", "idle"] as const) {
+		test(`${kind} ${mode} completion hints only when task work is exhausted`, async () => {
+			const { t } = await import("../../lib/i18n");
+			const hint = t("sidecar.noActiveBackgroundTasks", "en");
+			const entry = {
+				kind,
+				task: {
+					id: "finished",
+					type: "bash" as const,
+					alias: "finished",
+					title: "Finished work",
+					status: "completed",
+					result: "saved result",
+					resultPreview: "saved result",
+					outputPreview: "saved result",
+				},
+			};
+			const deliver = (locale: "en" | "zh-CN" = "en") =>
+				deliverPendingInjection("parent", locale, mode, "none", entry);
+			const seed = (id: string, parentNarratorId: string, backgroundKind: "task" | "service") =>
+				db
+					.insert(backgroundTasks)
+					.values({
+						id,
+						parentNarratorId,
+						backgroundKind,
+						type: "bash",
+						status: "running",
+						startedAt: time,
+						createdAt: time,
+						updatedAt: time,
+					})
+					.run();
+
+			// A different session's task and this session's long-lived service do not block it.
+			db.insert(narrators)
+				.values({ id: "unrelated", variant: "primary", createdAt: time, updatedAt: time })
+				.run();
+			seed("other-task", "unrelated", "task");
+			seed("dev-server", "parent", "service");
+			expect((await deliver())?.endsWith(hint)).toBe(true);
+			expect(
+				(await deliver("zh-CN"))?.endsWith(t("sidecar.noActiveBackgroundTasks", "zh-CN")),
+			).toBe(true);
+			const persisted = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, "parent"))
+				.all();
+			expect(persisted.some((row) => row.contentText?.endsWith(hint))).toBe(true);
+
+			seed("remaining-task", "parent", "task");
+			expect(await deliver()).not.toContain(hint);
+			db.update(backgroundTasks)
+				.set({ status: "completed" })
+				.where(eq(backgroundTasks.id, "remaining-task"))
+				.run();
+			expect((await deliver())?.endsWith(hint)).toBe(true);
+			// A still-running subagent blocks the hint too, including legacy agents without task rows.
+			db.update(narrators)
+				.set({ status: "working", isBackground: true, backgroundStatus: "running" })
+				.where(eq(narrators.id, "child"))
+				.run();
+			expect(await deliver()).not.toContain(hint);
+			db.update(narrators)
+				.set({ status: "idle", backgroundStatus: "completed" })
+				.where(eq(narrators.id, "child"))
+				.run();
+			expect((await deliver())?.endsWith(hint)).toBe(true);
+			// Taken-over agents remain outstanding even when parked idle and their
+			// historical task row is terminal. Cover legacy and registered agents.
+			for (const registered of [false, true]) {
+				if (registered) {
+					db.insert(backgroundTasks)
+						.values({
+							id: "child-task",
+							parentNarratorId: "parent",
+							type: "agent",
+							subagentNarratorId: "child",
+							status: "completed",
+							startedAt: time,
+							createdAt: time,
+							updatedAt: time,
+						})
+						.run();
+				}
+				for (const status of ["idle", "working", "waiting"] as const) {
+					db.update(narrators)
+						.set({ status, isBackground: false, substatus: JSON.stringify(["taken_over"]) })
+						.where(eq(narrators.id, "child"))
+						.run();
+					expect(await deliver()).not.toContain(hint);
+				}
+				// Releasing takeover and returning the result finally exhausts the work.
+				db.update(narrators)
+					.set({ status: "idle", substatus: "[]", backgroundStatus: "completed" })
+					.where(eq(narrators.id, "child"))
+					.run();
+				expect((await deliver())?.endsWith(hint)).toBe(true);
+			}
+			for (const status of ["started", "running", "failed", "cancelled", "timeout"]) {
+				entry.task.status = status;
+				expect(await deliver()).not.toContain(hint);
+			}
+		});
+	}
+}
 
 test("immutable bounded notice snapshot ignores later edits and never parses oversized originals", async () => {
 	const store = createPublicationOutbox(db);
@@ -701,7 +993,19 @@ test("Await-revoked terminal claim is a benign empty projection and does not blo
 			recipientMessageId: row.recipientMessageId ?? undefined,
 		};
 		store.consumeAwaitedTerminal(run);
-		expect(await deliverPendingInjection("parent", "en", "busy", "onNextTurn", projected)).toBe("");
+		const deliveredParts: Array<{ text: string; messageId?: string }> = [];
+		expect(
+			await deliverPendingInjection(
+				"parent",
+				"en",
+				"busy",
+				"onNextTurn",
+				projected,
+				undefined,
+				(part) => deliveredParts.push(part),
+			),
+		).toBe("");
+		expect(deliveredParts).toEqual([{ text: "", messageId: undefined }]);
 		expect(state(row.id)?.state).toBe("cancelled");
 		expect(
 			db

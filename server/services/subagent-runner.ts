@@ -1966,7 +1966,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		);
 	const systemPrompt = await rebuildSystemPrompt();
 
-	// Resolve model: explicit param > per-type setting / custom default > parent model > global default
+	// Resolve model: explicit param > configured pool > per-type/custom preference > parent/default.
 	let subagentPref: string | undefined;
 	if (
 		subagentType === "explore" ||
@@ -1990,19 +1990,20 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		actingUserId: userId ?? null,
 	});
 	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
-	// No global-default step: a pooled fallback must be the pool's own first entry,
-	// matching resolveSubagentModelInheritance so creation and later runs agree.
-	const candidateModels = [subagentPref, parent.model || FOLLOW_DEFAULT_MODEL];
+	// A configured pool owns the default choice, even when the parent's model or
+	// a type preference is allowed later in the pool. Only an explicit model overrides it.
+	const candidateModels =
+		modelPolicy.source === "none" ? [subagentPref, parent.model || FOLLOW_DEFAULT_MODEL] : [];
 	const modelSelection = resolveSubagentModelSelectionFromPolicy({
 		policy: modelPolicy,
 		explicitModel,
 		candidates: candidateModels,
 	});
 	const resolvedModelInput = modelSelection?.model;
-	// A preference only pins the child if it actually won selection. A preference
-	// rejected by the pool must not turn a parent/pool fallback into a frozen pin.
+	// Type preferences apply only without a pool. Pin a pool selection so later
+	// runs cannot replace the chosen default by following the parent's model.
 	const preferenceSelection =
-		!explicitModel && subagentPref
+		modelPolicy.source === "none" && !explicitModel && subagentPref
 			? resolveSubagentModelSelectionFromPolicy({
 					policy: modelPolicy,
 					explicitModel: subagentPref,
@@ -2010,7 +2011,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				})
 			: undefined;
 	const storedModelInput = subagentStoredModelReference({
-		explicitModel,
+		explicitModel: modelPolicy.source !== "none" ? resolvedModelInput : explicitModel,
 		preferenceSelection,
 		selection: modelSelection,
 	});
@@ -2529,6 +2530,9 @@ async function startContinuedSubagentUnlocked(
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
+	// Like a newly created subagent, the continued loop is checkpointable. Holding
+	// an ordinary lease for the whole run would deadlock maintenance when one of
+	// its tools pauses at the update gate; real tools retain their own leases.
 	const updateLease = claimSubagentUpdateExecutionLease(
 		input.updateExecutionLease,
 		"resumable",

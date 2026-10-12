@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { type GitStatusSummary, invalidateWorkspaceQueries } from "../../hooks/useGit";
@@ -810,7 +812,9 @@ describe("GitPanel", () => {
 		await flushRender();
 
 		expect(calls).toEqual([{ name: "stage", body: { all: true } }, { name: "ai" }]);
-		expect(container.querySelector("input")?.value).toBe("fix: update file");
+		expect(
+			container.querySelector<HTMLInputElement>('input[placeholder="Commit message..."]')?.value,
+		).toBe("fix: update file");
 
 		queryClient.clear();
 	});
@@ -1053,13 +1057,7 @@ describe("GitPanel", () => {
 			chapterId: null,
 			contextProjectId: "project-context",
 		});
-		const workspaceQueryKey = [
-			"gitWorkspace",
-			narratorId,
-			true,
-			["/repo/sub", null, "project-context", undefined],
-			null,
-		];
+		const workspaceQueryKey = ["gitWorkspace", narratorId, true, 0, null];
 		queryClient.setQueryData(workspaceQueryKey, readyWorkspace(), { updatedAt: 0 });
 		queryClient.setQueryData(["gitStatus", "local:/repo"], makeStatus());
 		const fileTreeQueryKey = [
@@ -1116,11 +1114,55 @@ describe("GitPanel", () => {
 		queryClient.clear();
 	});
 
+	async function workspaceAct(work: () => void | Promise<void>) {
+		const previous = Object.getOwnPropertyDescriptor(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+		Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
+			configurable: true,
+			writable: true,
+			value: true,
+		});
+		try {
+			await act(work);
+		} finally {
+			if (previous) Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", previous);
+			else Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+		}
+	}
+
+	async function waitForWorkspace(predicate: () => boolean) {
+		const deadline = performance.now() + 1500;
+		while (!predicate()) {
+			if (performance.now() > deadline) throw new Error("Workspace UI did not settle");
+			await workspaceAct(async () => {
+				await flushRender();
+			});
+		}
+	}
+
 	async function renderNarratorWorkspace(initial: GitWorkspace) {
 		let workspace = initial;
+		let revision = 1;
+		const context = (): WorkspaceContext => ({
+			contextKey: `context-${revision}`,
+			revision,
+			deviceId: workspace.deviceId,
+			cwd: workspace.cwd,
+			pathFlavor: "posix",
+			capabilities: { switchDirectory: true },
+			...(workspace.workspaceKey && workspace.repositoryKey && workspace.rootPath
+				? {
+						git: {
+							workspaceKey: workspace.workspaceKey,
+							repositoryKey: workspace.repositoryKey,
+							rootPath: workspace.rootPath,
+						},
+					}
+				: {}),
+		});
 		const calls: Array<{ name: string; target?: GitTarget }> = [];
 		const original = {
 			getGitWorkspace: api.getGitWorkspace,
+			getWorkspaceContext: api.getWorkspaceContext,
 			getGitStatus: api.getGitStatus,
 			getGitModifications: api.getGitModifications,
 			getGitDiff: api.getGitDiff,
@@ -1131,6 +1173,7 @@ describe("GitPanel", () => {
 			getGitStashList: api.getGitStashList,
 		};
 		api.getGitWorkspace = async () => workspace;
+		api.getWorkspaceContext = async () => context();
 		api.getGitStatus = async () => makeStatus();
 		api.getGitModifications = async () => ({ byFile: [], actors: [], hasMore: false });
 		api.getGitDiff = async () => ({ diff: "", truncated: false });
@@ -1162,42 +1205,51 @@ describe("GitPanel", () => {
 			cwd: "/repo/sub",
 			chapterId: null,
 			contextProjectId: "project-context",
+			workspaceRevision: revision,
 		});
-		const workspaceQueryKey = [
-			"gitWorkspace",
-			narratorId,
-			true,
-			["/repo/sub", null, "project-context", undefined],
-			null,
-		];
+		queryClient.setQueryData(["workspaceContext", narratorId], context());
+		const workspaceQueryKey = ["gitWorkspace", narratorId, true, revision, null];
 		queryClient.setQueryData(workspaceQueryKey, workspace);
 		if (workspace.workspaceKey)
 			queryClient.setQueryData(["gitStatus", workspace.workspaceKey], makeStatus());
 		const container = document.createElement("div");
 		document.body.appendChild(container);
 		root = createRoot(container);
-		root.render(
-			<I18nextProvider i18n={i18n}>
-				<MantineProvider env="test">
-					<QueryClientProvider client={queryClient}>
-						<ConfirmDialogProvider>
-							<GitPanel narratorId={narratorId} />
-						</ConfirmDialogProvider>
-					</QueryClientProvider>
-				</MantineProvider>
-			</I18nextProvider>,
+		await workspaceAct(async () =>
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<QueryClientProvider client={queryClient}>
+							<ConfirmDialogProvider>
+								<GitPanel narratorId={narratorId} />
+							</ConfirmDialogProvider>
+						</QueryClientProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
 		);
-		await flushRender();
-		await flushRender();
+		await waitForWorkspace(() =>
+			initial.state === "ready"
+				? container.textContent?.includes("Changes") === true
+				: container.textContent?.includes(i18n.t(`git:workspace.${initial.state}`)) === true,
+		);
 		return {
 			container,
 			queryClient,
 			calls,
-			update(next: GitWorkspace) {
-				workspace = next;
-				if (next.workspaceKey)
-					queryClient.setQueryData(["gitStatus", next.workspaceKey], makeStatus());
-				queryClient.setQueryData(workspaceQueryKey, next);
+			async update(next: GitWorkspace) {
+				await workspaceAct(async () => {
+					workspace = next;
+					revision++;
+					if (next.workspaceKey)
+						queryClient.setQueryData(["gitStatus", next.workspaceKey], makeStatus());
+					queryClient.setQueryData(["gitWorkspace", narratorId, true, revision, null], next);
+					queryClient.setQueryData(["workspaceContext", narratorId], context());
+					queryClient.setQueryData(
+						["narrators", narratorId],
+						(old: Record<string, unknown> | undefined) => ({ ...old, workspaceRevision: revision }),
+					);
+				});
 			},
 		};
 	}
@@ -1229,8 +1281,8 @@ describe("GitPanel", () => {
 		expect(container.textContent).toContain("Changes");
 		expect(container.textContent).toContain("Tree");
 		expect(container.textContent).toContain("List");
-		buttonByText(container, "Stage All").click();
-		await flushRender();
+		await workspaceAct(async () => buttonByText(container, "Stage All").click());
+		await waitForWorkspace(() => calls.some((call) => call.name === "stage"));
 		expect(calls[0]?.target).toMatchObject({
 			narratorId: "standalone-workspace",
 			workspaceKey: "local:/repo",
@@ -1284,23 +1336,24 @@ describe("GitPanel", () => {
 		const { container, queryClient, calls, update } = await renderNarratorWorkspace(
 			readyWorkspace(),
 		);
-		buttonByLabel(container, "AI Generate").click();
-		await flushRender();
-		await flushRender();
-		expect(
-			container.querySelector<HTMLInputElement>('input[placeholder="Commit message..."]')?.value,
-		).toBe("old workspace draft");
-		buttonByText(container, "Discard All").click();
-		await flushRender();
-		await flushRender();
-		await flushRender();
+		const commitInput = () =>
+			container.querySelector<HTMLInputElement>('input[placeholder="Commit message..."]');
+		await workspaceAct(async () => buttonByLabel(container, "AI Generate").click());
+		await waitForWorkspace(() => commitInput()?.value === "old workspace draft");
+		expect(commitInput()?.value).toBe("old workspace draft");
+		await workspaceAct(async () => buttonByText(container, "Discard All").click());
+		await waitForWorkspace(
+			() => document.body.textContent?.includes("permanently discard") === true,
+		);
 		expect(document.body.textContent).toContain("permanently discard");
-		update(readyWorkspace({ workspaceKey: "remote:/repo", deviceId: "remote", rootPath: "/repo" }));
-		await flushRender();
-		await flushRender();
-		expect(
-			container.querySelector<HTMLInputElement>('input[placeholder="Commit message..."]')?.value,
-		).toBe("");
+		await update(
+			readyWorkspace({ workspaceKey: "remote:/repo", deviceId: "remote", rootPath: "/repo" }),
+		);
+		await waitForWorkspace(
+			() =>
+				commitInput()?.value === "" && !document.body.textContent?.includes("permanently discard"),
+		);
+		expect(commitInput()?.value).toBe("");
 		expect(document.body.textContent).not.toContain("permanently discard");
 		expect(calls.filter((call) => call.name === "discard")).toHaveLength(0);
 		queryClient.clear();
@@ -1317,10 +1370,10 @@ describe("GitPanel", () => {
 			expect(subscription).toBeDefined();
 			api.getGitWorkspace = async () =>
 				readyWorkspace({ state: "access_denied", capabilities: { read: false, write: false } });
-			subscription?.[1]({ type: "narrator_access_changed", narratorId: "standalone-workspace" });
-			await flushRender();
-			await flushRender();
-			await flushRender();
+			await workspaceAct(async () => {
+				subscription?.[1]({ type: "narrator_access_changed", narratorId: "standalone-workspace" });
+			});
+			await waitForWorkspace(() => container.textContent?.includes("do not have access") === true);
 			expect(container.textContent).toContain("do not have access");
 			expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
 			root?.unmount();
@@ -1352,7 +1405,9 @@ describe("GitPanel", () => {
 		});
 		buttonByLabel(container, "Clear filter").click();
 		await flushRender();
-		update(readyWorkspace({ chapterId: "legacy", capabilities: { read: true, write: false } }));
+		await update(
+			readyWorkspace({ chapterId: "legacy", capabilities: { read: true, write: false } }),
+		);
 		await flushRender();
 		await flushRender();
 		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({});

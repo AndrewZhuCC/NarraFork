@@ -5,10 +5,14 @@ import { join } from "node:path";
 import type { GithubPatchStep } from "../../../shared/release-patch";
 import { settings } from "../../lib/settings";
 import { APP_VERSION } from "../../lib/version";
+import { githubReleaseUpdater } from "../github-release-update";
+import { resetUpdateCoordinationForTests, scheduleUpdate } from "../update-coordinator";
 import {
 	checkForUpdate,
 	downloadUpdate,
+	getCurrentUpdateSourceIdentity,
 	getUpdateDirectory,
+	getUpdateNotes,
 	getUpdateStatus,
 	isUpdateSourceCurrent,
 	type ReleaseInfo,
@@ -17,6 +21,9 @@ import {
 
 const originalFetch = globalThis.fetch;
 let requested: string[] = [];
+let requestOptions: (RequestInit & { proxy?: string })[] = [];
+const originalProxy = structuredClone(settings.proxy);
+const originalUpdate = structuredClone(settings.update);
 const version = `${Number(APP_VERSION.split(".")[0]) + 1}.0.0`;
 const payload = Buffer.from("integration test binary (never executed)");
 const sha512 = createHash("sha512").update(payload).digest("base64");
@@ -61,6 +68,7 @@ const release = {
 function fixtureReleaseInfo(patchChain?: GithubPatchStep[]): ReleaseInfo {
 	return {
 		source: "github",
+		sourceIdentity: getCurrentUpdateSourceIdentity() ?? undefined,
 		repository,
 		version,
 		path: filename,
@@ -81,6 +89,7 @@ function selectGithub() {
 		checkIntervalMinutes: 60,
 		autoDownload: false,
 	};
+	return settings.update;
 }
 function expectNoTemporaryArtifacts() {
 	expect(
@@ -95,6 +104,10 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
 		async (...args: Parameters<typeof fetch>) => {
 			const url = String(args[0]);
 			requested.push(url);
+			requestOptions.push(args[1] ?? {});
+			// Legacy fixtures explicitly advertise that the new metadata branch is absent.
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			return handler(url);
 		},
 		{ preconnect: originalFetch.preconnect },
@@ -102,12 +115,146 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
 }
 beforeEach(() => {
 	requested = [];
+	requestOptions = [];
+	resetUpdateCoordinationForTests();
 });
 afterEach(() => {
 	globalThis.fetch = originalFetch;
+	settings.proxy = structuredClone(originalProxy);
+	settings.update = structuredClone(originalUpdate);
+	resetUpdateCoordinationForTests();
+});
+
+describe("release notes source snapshots", () => {
+	test("mismatched old prepared source makes no notes request", async () => {
+		selectGithub();
+		const sourceIdentity = getCurrentUpdateSourceIdentity();
+		if (!sourceIdentity || sourceIdentity.source !== "github") throw new Error("Expected GitHub");
+		await expect(
+			getUpdateNotes({
+				version,
+				sha512,
+				sourceIdentity: { ...sourceIdentity, repository: "old/repo" },
+			}),
+		).rejects.toThrow("source changed");
+		expect(requested).toHaveLength(0);
+	});
+	test.each([
+		"repository",
+		"channel",
+		"source",
+	])("a %s change during notes read discards the result", async (field) => {
+		const update = selectGithub();
+		const sourceIdentity = getCurrentUpdateSourceIdentity();
+		if (!sourceIdentity) throw new Error("Expected source");
+		const original = githubReleaseUpdater.getNotes;
+		try {
+			githubReleaseUpdater.getNotes = async () => {
+				if (field === "repository") update.githubRepository = "changed/repo";
+				else if (field === "channel") update.channel = "beta";
+				else update.source = "update-server";
+				return { notes: "Must never reach the old artifact" };
+			};
+			await expect(getUpdateNotes({ version, sha512, sourceIdentity })).rejects.toThrow(
+				"source changed",
+			);
+		} finally {
+			githubReleaseUpdater.getNotes = original;
+		}
+	});
 });
 
 describe("selected update source integration", () => {
+	test.each([
+		undefined,
+		{ mode: "default" as const },
+	])("legacy update detection inherits global proxy with override %j and proxy edits preserve provenance", async (proxy) => {
+		const serverUrl = "https://updates.proxy-fixture.example";
+		settings.proxy = { mode: "custom", url: "http://global.proxy-fixture.example:8080" };
+		settings.update = {
+			source: "update-server",
+			serverUrl,
+			product: "private-product",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+			proxy,
+		};
+		const identity = getCurrentUpdateSourceIdentity();
+		installFetch((url) => {
+			expect(url).toContain(`${serverUrl}/api/v2/products/private-product/releases/latest`);
+			return Response.json({
+				updateAvailable: true,
+				version,
+				releaseDate: "2026-10-06",
+				file: { filename, size: payload.length, sha512 },
+			});
+		});
+		const checked = await checkForUpdate({ force: true });
+		expect(checked.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
+		expect(requestOptions[0]?.proxy).toBe("http://global.proxy-fixture.example:8080/");
+		if (!checked.releaseInfo) throw new Error("Expected legacy update descriptor");
+		settings.update.proxy = { mode: "custom", url: "http://dedicated.proxy-fixture.example:3128" };
+		const after = await checkForUpdate({ force: true });
+		expect(requestOptions[1]?.proxy).toBe("http://dedicated.proxy-fixture.example:3128/");
+		expect(after.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
+		expect(getCurrentUpdateSourceIdentity()).toEqual(identity);
+		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(true);
+		expect(requested.every((url) => url.startsWith(serverUrl))).toBe(true);
+	});
+
+	test("beta-to-stable change during forced GitHub detection refuses the captured result", async () => {
+		const update = selectGithub();
+		update.channel = "beta";
+		installFetch((url) => {
+			if (url.startsWith(`https://api.github.com/repos/${repository}/`)) {
+				update.channel = "stable";
+				return Response.json([{ ...release, prerelease: true }]);
+			}
+			if (url === sidecarUrl) return new Response(metadata);
+			throw new Error(`Unexpected payload download after settings change: ${url}`);
+		});
+		const checked = await checkForUpdate({ force: true });
+		if (!checked.releaseInfo) throw new Error("Missing checked beta release");
+		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(false);
+		const before = [...requested];
+		expect((await downloadUpdate(checked.releaseInfo)).success).toBe(false);
+		expect(requested).toEqual(before);
+	});
+
+	test.each([
+		"product",
+		"channel",
+	] as const)("legacy %s change during detection refuses the captured result", async (field) => {
+		const serverUrl = "https://updates.integration.example";
+		settings.update = {
+			...settings.update,
+			source: "update-server",
+			serverUrl,
+			product: "first",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+		};
+		const update = settings.update;
+		installFetch((url) => {
+			expect(url).toContain(`${serverUrl}/api/v2/products/first/releases/latest`);
+			if (field === "product") update.product = "second";
+			else update.channel = "beta";
+			return Response.json({
+				updateAvailable: true,
+				version,
+				releaseDate: "2026-10-06",
+				file: { filename, size: payload.length, sha512 },
+			});
+		});
+		const checked = await checkForUpdate({ force: true });
+		if (!checked.releaseInfo) throw new Error("Missing checked legacy release");
+		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(false);
+		const before = [...requested];
+		expect((await downloadUpdate(checked.releaseInfo)).success).toBe(false);
+		expect(requested).toEqual(before);
+	});
 	test("GitHub prepares a verified full binary without contacting update-server or helpers", async () => {
 		settings.update = {
 			...settings.update,
@@ -142,7 +289,7 @@ describe("selected update source integration", () => {
 		if (!downloaded.updatePath) throw new Error("No prepared binary");
 		expect(readFileSync(downloaded.updatePath)).toEqual(payload);
 		expect((await getUpdateStatus(version)).ready).toBe(true);
-		expect(requested).toHaveLength(3);
+		expect(requested).toHaveLength(4);
 		expect(requested.some((url) => url.includes("/api/v2/"))).toBe(false);
 	});
 	test("GitHub delta without a compiled base falls back to GitHub full, ignoring legacy descriptors", async () => {
@@ -301,6 +448,32 @@ describe("selected update source integration", () => {
 		settings.update.serverUrl = "https://other.integration.example";
 		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(false);
 	});
+	test.each([
+		"source-policy",
+		"scheduled",
+	] as const)("a %s change during payload transfer cannot replace the prepared artifact", async (change) => {
+		const update = selectGithub();
+		installFetch(() => new Response(payload));
+		const initial = await downloadUpdate(fixtureReleaseInfo());
+		expect(initial.success).toBe(true);
+		if (!initial.preparedIdentity) throw new Error("Missing original prepared selector");
+		const manifest = join(getUpdateDirectory(), "placed-update.json");
+		const originalMetadata = readFileSync(manifest, "utf8");
+		let changed = false;
+		const next = await downloadUpdate(fixtureReleaseInfo(), (progress) => {
+			if (!changed && progress.phase === "downloading" && progress.bytesDownloaded > 0) {
+				changed = true;
+				if (change === "source-policy") update.channel = "beta";
+				else scheduleUpdate(version);
+			}
+		});
+		expect(changed).toBe(true);
+		expect(next.success).toBe(false);
+		expect(readFileSync(manifest, "utf8")).toBe(originalMetadata);
+		expect((await getUpdateStatus(version)).preparedIdentity?.id).toBe(initial.preparedIdentity.id);
+		expect(readFileSync(initial.updatePath as string)).toEqual(payload);
+		expectNoTemporaryArtifacts();
+	});
 	test("failed GitHub checks never fall back to the configured legacy server", async () => {
 		settings.update = {
 			...settings.update,
@@ -315,7 +488,8 @@ describe("selected update source integration", () => {
 		installFetch(() => new Response(null, { status: 404 }));
 		const result = await checkForUpdate({ force: true });
 		expect(result.errorCode).toBe("REPOSITORY_UNAVAILABLE");
-		expect(requested).toHaveLength(1);
-		expect(requested[0]).toContain("api.github.com");
+		expect(requested).toHaveLength(2);
+		expect(requested[0]).toContain("raw.githubusercontent.com");
+		expect(requested[1]).toContain("api.github.com");
 	});
 });

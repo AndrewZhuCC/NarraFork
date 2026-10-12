@@ -25,6 +25,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../settings";
+import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
@@ -34,6 +35,7 @@ import { GrokProvider } from "./grok-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
+import { TokenDanceProvider } from "./tokendance-provider";
 
 // === Provider stream protocol types ===
 //
@@ -341,6 +343,21 @@ export function createGeminiProvider(
 }
 
 function createProviderByName(provider: string): ProviderAdapter | null {
+	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const legacy = [
+			...(settings.customApiProviders ?? []),
+			...(settings.openaiProviders ?? []),
+			...(settings.anthropicProviders ?? []),
+			...(settings.geminiProviders ?? []),
+			...(settings.nugProviders ?? []),
+		];
+		if (legacy.some((entry) => entry.prefix === "tokendance")) {
+			throw new Error(
+				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
+			);
+		}
+		return new TokenDanceProvider();
+	}
 	// Keep the retired prefix reserved: old sessions must fail locally, never be
 	// claimed by a configured provider or plugin and sent to a billable upstream.
 	if (provider === "tutorial") {
@@ -399,6 +416,10 @@ function prefixProviderModel(provider: string, model: string | undefined): strin
 }
 
 function defaultModelForProvider(provider: string): string | null {
+	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const model = getTokenDanceCatalogModels()[0];
+		return model ? `tokendance:${model.id}` : null;
+	}
 	if (provider === "codex") {
 		const custom = settings.agent.customModels ?? [];
 		const codexCustom = custom.find((m) => m.provider === "codex")?.value;
@@ -472,7 +493,7 @@ function buildResolution(
 		provider === requestedProvider
 			? requestedModel
 			: (defaultModelForProvider(provider) ?? `${provider}:${bareRequestedModel || "default"}`);
-	if (adapter instanceof NugProvider) {
+	if (adapter instanceof NugProvider || adapter instanceof TokenDanceProvider) {
 		adapter.prepareForModel(model);
 	}
 	return {

@@ -5,8 +5,17 @@
  * because this index re-exports everything from the sub-modules.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { resolve } from "node:path";
+import { normalizeProxyUrl } from "@shared/proxy-settings";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
@@ -28,9 +37,11 @@ import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
+import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
 import { normalizeUpdateSourceSettings } from "./update-source";
 
+export { normalizeProxyUrl } from "@shared/proxy-settings";
 export {
 	customApiProtocolFromAnthropic,
 	customApiProtocolFromOpenAI,
@@ -81,6 +92,7 @@ export {
 	getRouterModels,
 	getSubagentVisibleModels,
 	getSummaryModelContextWindow,
+	getSummaryModelContextWindowDetail,
 	getVisibleModels,
 	grokProviderPrefix,
 	hasConfiguredGeminiProvider,
@@ -253,6 +265,7 @@ export function reloadSettings(): NarraForkSettings {
 
 function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	if (!existsSync(settingsPath)) {
 		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
 	}
@@ -479,6 +492,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const b of ["codex"]) activePrefixes.add(b);
+	if (merged.tokendance?.apiKey) activePrefixes.add("tokendance");
 
 	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
 		needsSave = true;
@@ -499,6 +513,8 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (normalizeSearchSettings(merged, raw)) {
 		needsSave = true;
 	}
+
+	if (initializeTokenDanceModelCollection(merged)) needsSave = true;
 
 	if (needsSave) saveSettings(merged);
 
@@ -655,24 +671,6 @@ export function getSettingsRevision(): number {
 	return settingsRevision;
 }
 
-const URL_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
-
-/**
- * Normalize user-entered proxy addresses.
- * If a user enters only host:port, assume an HTTP proxy by default.
- */
-export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-	const normalized = URL_PROTOCOL_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
-	try {
-		const protocol = new URL(normalized).protocol;
-		return protocol === "http:" || protocol === "https:" ? normalized : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 /** Preserve the formerly shared Browser/WebFetch override once, on settings load. */
 export function migrateBrowserProxy(settings: NarraForkSettings): boolean {
 	if (settings.agent.browserProxy !== undefined) return false;
@@ -690,6 +688,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 		settings.proxy,
 		settings.agent?.webFetchPolicy?.proxy,
 		settings.agent?.browserProxy,
+		settings.update?.proxy,
 	]) {
 		if (!proxy) continue;
 		if (proxy.mode !== "custom") {
@@ -797,8 +796,10 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
+	initializeTokenDanceModelCollection(newSettings);
 	reconcileLegacyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
 		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {

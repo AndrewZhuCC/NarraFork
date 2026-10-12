@@ -4,10 +4,13 @@ import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-viol
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { CodexRetainedUserMessage } from "@shared/compact-message";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
-import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
+import {
+	mapGenericReasoningEffort,
+	modelAcceptsReasoningEffort,
+} from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
@@ -46,6 +49,7 @@ import {
 } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -60,6 +64,7 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import {
 	type ApiRequestDumpCollector,
 	BoundedUtf8Capture,
@@ -351,6 +356,7 @@ function applyGenericReasoningEffort(
 	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort) return;
 	const bareModel = parseModelId(model).model;
+	const acceptsEffort = modelAcceptsReasoningEffort(bareModel, getReasoningEffortBlocklist());
 
 	// DeepSeek keeps its own wire shape (thinking block + two effective tiers).
 	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(bareModel)) {
@@ -360,10 +366,11 @@ function applyGenericReasoningEffort(
 		}
 		body.thinking = { type: "enabled" };
 		const effort = mapDeepSeekEffort(reasoningEffort);
-		if (effort) body.reasoning_effort = effort;
+		if (effort && acceptsEffort) body.reasoning_effort = effort;
 		return;
 	}
 
+	if (!acceptsEffort) return;
 	const effort = metadata.reasoning?.levels?.length
 		? reasoningEffort
 		: mapGenericReasoningEffort(bareModel, reasoningEffort, getReasoningEffortBlocklist());
@@ -631,6 +638,7 @@ export class OpenAIProvider implements ProviderAdapter {
 	constructor(
 		config: OpenAIProviderConfig,
 		proxy?: string,
+		private transport?: ProviderTransport,
 		private readonly compactCredentialId?: string,
 	) {
 		this.config = config;
@@ -844,7 +852,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		const proxy = this.proxy
 			? applyProxyExemptions(this.proxy, target)
 			: resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, { proxy });
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+			}),
+		);
 	}
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {
@@ -874,7 +887,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+	): Promise<BuiltHistory> {
 		if (this.responsesFormat) {
 			return await buildResponsesHistory(dbMessages, narratorId, {
 				strict: hasCredentialBoundReasoning(model),
@@ -4698,6 +4711,7 @@ async function buildResponsesHistory(
 ): Promise<{
 	history: OAIMessage[];
 	trailingToolResults: ResponsesFunctionCallOutputMessage[];
+	replayedInjectionMessageIds: string[];
 }> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -4710,6 +4724,7 @@ async function buildResponsesHistory(
 	}
 
 	const history: OAIMessage[] = [];
+	const replayedInjectionMessageIds: string[] = [];
 	let pendingToolResults: ResponsesFunctionCallOutputMessage[] = [];
 
 	for (const msg of topLevel) {
@@ -4736,7 +4751,16 @@ async function buildResponsesHistory(
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 			const userMessage = await buildResponsesUserMessageFromDbMessage(msg, narratorId);
-			if (userMessage) history.push(userMessage);
+			if (userMessage) {
+				history.push(userMessage);
+				const texts =
+					typeof userMessage.content === "string"
+						? [userMessage.content]
+						: (userMessage.content ?? []).flatMap((part) =>
+								part.type === "input_text" ? [part.text] : [],
+							);
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], texts));
+			}
 		} else if (msg.role === "sys") {
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
@@ -4750,16 +4774,18 @@ async function buildResponsesHistory(
 			// continuation). Keeping it as a user turn guarantees non-empty input.
 			if (text) {
 				history.push(buildResponsesUserMessage(text));
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 }
 
 function buildOAIHistory(dbMessages: DbMessage[]): {
 	history: OAIMessage[];
 	trailingToolResults: OAIToolResult[];
+	replayedInjectionMessageIds: string[];
 } {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -4773,6 +4799,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 	}
 
 	const history: OAIMessage[] = [];
+	const replayedInjectionMessageIds: string[] = [];
 	let pendingToolResults: OAIToolResult[] = [];
 
 	for (const msg of topLevel) {
@@ -4894,6 +4921,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			const text = msg.contentText || "";
 			if (text) {
 				history.push({ role: "user", content: text });
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		} else if (msg.role === "sys") {
 			history.push(...expandCompletionsToolResults(pendingToolResults));
@@ -4912,11 +4940,12 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			// the model while guaranteeing non-empty conversation content.
 			if (text) {
 				history.push({ role: "user", content: text });
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 }
 
 /**

@@ -404,10 +404,25 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 116 tables and 1673 columns including selfuse and upstream additions", () => {
-		expect(target.tables.length).toBe(116);
-		// 1670 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1673);
+	test("covers 118 tables and 1685 columns including reusable Git identities", () => {
+		expect(target.tables.length).toBe(118);
+		// 1682 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1685);
+		expect(
+			target.tables
+				.find((table) => table.name === "user_git_identities")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "userId", "name", "email", "isDefault", "createdAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_git_identity_bindings")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "narratorId", "userId", "identityId", "updatedAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "background_tasks")
+				?.columns.find((column) => column.property === "backgroundKind"),
+		).toMatchObject({ name: "background_kind", notNull: true, defaultExpression: '"task"' });
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
 				target.tables
@@ -420,6 +435,23 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrator_worktree_resources")
 				?.columns.map((column) => column.property),
 		).toContain("scopeOwnerUserId");
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_question_events")
+				?.columns.map((column) => column.property),
+		).toEqual(["questionId", "messageId", "kind", "resolutionJson", "createdAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_questions")
+				?.columns.map((column) => column.property),
+		).toEqual(
+			expect.arrayContaining(["context", "resolutionJson", "withdrawReason", "summaryJson"]),
+		);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrators")
+				?.columns.map((column) => column.property),
+		).toContain("lastStopReason");
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

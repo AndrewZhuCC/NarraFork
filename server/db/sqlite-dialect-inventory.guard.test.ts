@@ -468,7 +468,17 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
-	"server/db/run-migrations.ts": ["driver", "pragma", "pragmaFn", "sqliteCatalog", "insertOr"],
+	"server/db/run-migrations.ts": [
+		"driver",
+		"pragma",
+		"pragmaFn",
+		"sqliteCatalog",
+		"insertOr",
+		// The `user_git_identities` backfill generates ids inside its INSERT…SELECT, the same
+		// way `narrator-service.ts` does for forked transcripts, rather than round-tripping
+		// every user row through JS during startup.
+		"blobFn",
+	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.
@@ -514,7 +524,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
-	"server/services/file-state-rebuild.ts": ["json1"],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["json1", "glob"],
@@ -522,7 +531,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],
-	"server/services/narrator-session.ts": ["handle"],
+	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	"server/services/parent-injection-queue.ts": ["json1"],
@@ -537,18 +546,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
-	"server/services/project-db-sync.ts": ["driver", "pragma", "json1"],
+	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",
 		"drizzleDialect",
 		"pragma",
 		"pragmaFn",
-		"sqliteCatalog",
 		"rowid",
 		"indexHint",
-		"fts5",
-		"insertOr",
 		"sessionFn",
 	],
 	"server/services/revert-mutation-journal.ts": [
@@ -566,15 +572,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"json1",
 	],
 	"server/services/revert-planner-local-access.ts": ["json1"],
-	"server/services/revert-planner-service.ts": ["nativeClient", "pragma", "sessionFn"],
-	"server/services/revert-selection-service.ts": [
-		"driver",
-		"nativeClient",
-		"pragma",
-		"rowid",
-		"indexHint",
-		"sessionFn",
-	],
+	"server/services/revert-planner-service.ts": ["nativeClient"],
+	"server/services/revert-selection-service.ts": ["driver", "nativeClient", "rowid", "indexHint"],
 	"server/services/revert-transaction-service.ts": ["nativeClient", "pragma", "sessionFn"],
 	"server/services/routine-service.ts": ["handle"],
 	// The whole search surface, in one file behind `services/search/port.ts`. NOT SQLite-only: a
@@ -601,7 +600,36 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/workspace-metadata-retry.ts": ["errorCode"],
 	"server/services/workspace-modification-view.ts": ["rowid"],
 	"server/services/workspace-write-coordinator.ts": ["nativeClient", "drizzleDialect", "pragma"],
+	// New main-database read/write surfaces remain migration inventory, NOT permanent
+	// SQLite-only exemptions. Mixed archive workers also support PG main stores; only
+	// their portable archive file uses SQLite. Fixture detach uses a private memory DB,
+	// not the main database, but stays explicitly registered rather than widening the scan.
+	"server/lib/disk-safety.ts": ["driver", "errorCode"],
+	"server/services/context-composition-history.ts": ["driver"],
+	"server/services/file-change-diagnostics.ts": ["errorCode"],
+	"server/services/local-session-detach/store.ts": ["driver"],
+	"server/services/narrator-context-composition.ts": ["driver", "handle", "json1"],
+	"server/services/narrator-permission.ts": ["json1"],
+	"server/services/narrator-question-history.ts": [
+		"driver",
+		"drizzleDialect",
+		"rowid",
+		"indexHint",
+	],
+	"server/services/narrator-question-service.ts": ["rowid", "json1"],
+	"server/services/narrator-worktree-resources.ts": ["json1"],
+	"server/services/project-archive/legacy-import-worker.ts": [
+		"driver",
+		"connectionModule",
+		"pragma",
+		"sqliteCatalog",
+	],
+	"server/services/project-archive/legacy-sync-worker.ts": ["driver", "pragma", "insertOr"],
+	"server/services/project-import.ts": ["connectionModule"],
+	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
 	"server/services/workspace-write-lease-store.ts": ["json1"],
+	"server/services/worktree-lifecycle-guard.ts": ["json1"],
+	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 

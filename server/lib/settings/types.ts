@@ -6,6 +6,7 @@
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
+import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { DiskSafetySettings } from "../disk-safety-config";
@@ -522,7 +523,19 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
+export interface TokenDanceSettings {
+	apiKey: string;
+	disabled: boolean;
+	generation: number;
+	/** Bounded last successful catalog; available after service restart. */
+	models?: TokenDanceCatalogModel[];
+	/** Initial fixed model collection was applied; manual visibility choices now win. */
+	modelCollectionInitialized?: boolean;
+}
+
 export interface NarraForkSettings {
+	/** Backend-only singleton credentials; never return this object to clients. */
+	tokendance?: TokenDanceSettings;
 	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */
 	diskSafety?: DiskSafetySettings;
 	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
@@ -1040,6 +1053,8 @@ export interface NarraForkSettings {
 	mcpServers?: McpServerConfig[];
 	/** Update source and download configuration. */
 	update?: {
+		/** Updates, release notes and helper downloads. Absent/default inherits the global proxy. */
+		proxy?: ProxyOverride;
 		/** Update source. Optional for legacy settings and mocks; defaults to GitHub. */
 		source?: "github" | "update-server";
 		/** GitHub repository slug (owner/repo), not a URL. */

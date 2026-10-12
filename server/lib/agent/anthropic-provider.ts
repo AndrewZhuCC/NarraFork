@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -41,6 +41,7 @@ import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from 
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -54,6 +55,7 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import {
 	type ApiRequestDumpCollector,
@@ -64,6 +66,7 @@ import {
 import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
+import { flattenTopLevelUnion } from "./tool-schema-compat";
 import {
 	type AgentToolUse,
 	ApiError,
@@ -131,8 +134,8 @@ function buildAnthropicBetaFlags(model: string): string {
 	flags.push("prompt-caching-scope-2026-01-05");
 	// `mRn(e)` — see supportsMidConversationSystem (Opus 4.7 is excluded).
 	if (supportsMidConversationSystem(model)) flags.push("mid-conversation-system-2026-04-07");
-	// `EZb` — pushed only for models that accept `output_config.effort`, which now
-	// means only the user's own blocklist can withhold it.
+	// `EZb` — pushed only for models that accept `output_config.effort`; built-in
+	// family exclusions and the user's blocklist can both withhold it.
 	if (supportsEffort(model)) flags.push("effort-2025-11-24");
 	return flags.join(",");
 }
@@ -479,8 +482,8 @@ export function supportsThinking(model: string): boolean {
  * Whether a model accepts the effort parameter (`output_config.effort`).
  *
  * Blacklist, not whitelist: effort is near-universal now, so every model gets
- * it unless it is known to reject it. Exclusions are the built-in pre-4.6
- * Claude rule (the official API 400s there) plus the user's
+ * it unless it is known to reject it. Exclusions are the built-in Claude family
+ * rules (Opus before 4.5, Sonnet before 4.6, Haiku 3.x) plus the user's
  * `agent.reasoningEffortBlocklist`.
  *
  * The old whitelist ("is this a Claude 4.6+ id") also silently excluded every
@@ -647,6 +650,8 @@ const ANTHROPIC_EFFORT_TIERS_WITH_XHIGH: readonly ReasoningEffort[] = [
 ];
 /** Effort tiers accepted by 4.6-era models, which have no `xhigh`. */
 const ANTHROPIC_EFFORT_TIERS: readonly ReasoningEffort[] = ["low", "medium", "high", "max"];
+/** Opus 4.5 predates the four-tier ladder introduced with Opus 4.6. */
+const OPUS_45_EFFORT_TIERS: readonly ReasoningEffort[] = ["low", "medium", "high"];
 
 /**
  * Map reasoning effort to the Anthropic `output_config.effort` value.
@@ -655,7 +660,9 @@ const ANTHROPIC_EFFORT_TIERS: readonly ReasoningEffort[] = ["low", "medium", "hi
  * "none" is not mapped (thinking is disabled, so effort is irrelevant).
  * Models with the xhigh tier (Claude 4.7+) pass low/medium/high/xhigh/max
  * through unchanged. On 4.6-era Claude there is no xhigh tier, so the shared
- * clamp (就近、并列偏高) sends xhigh → max.
+ * clamp (就近、并列偏高) sends xhigh → max. Opus 4.5 has only the
+ * low/medium/high fallback ladder, so xhigh and max clamp to high. Explicit
+ * catalog levels take precedence over these version-derived fallbacks.
  *
  * A non-Claude model (unparseable id) keeps the full ladder: we have no tier
  * table for it, and dropping xhigh would silently rewrite a tier the upstream
@@ -666,16 +673,20 @@ export function mapEffortParam(
 	model: string,
 	reasoningEffort: string | undefined,
 ): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
+	// Explicit exclusions take precedence over catalog capability and tier metadata.
+	if (!supportsEffort(parseModelId(model).model)) return undefined;
 	const metadata = effectiveProviderMetadata(model);
 	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
 	if (metadata.reasoning?.levels?.length)
 		return reasoningEffort as "low" | "medium" | "high" | "xhigh" | "max";
-	const isKnownClaude = parseClaudeModel(model) != null;
+	const parsed = parseClaudeModel(model);
 	const supported =
-		!isKnownClaude || supportsXhighEffort(model)
-			? ANTHROPIC_EFFORT_TIERS_WITH_XHIGH
-			: ANTHROPIC_EFFORT_TIERS;
+		parsed?.family === "opus" && !atLeastVersion(parsed, 4, 6)
+			? OPUS_45_EFFORT_TIERS
+			: !parsed || supportsXhighEffort(model)
+				? ANTHROPIC_EFFORT_TIERS_WITH_XHIGH
+				: ANTHROPIC_EFFORT_TIERS;
 	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported) as
 		| "low"
 		| "medium"
@@ -1125,7 +1136,10 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * `nug:anthropic`) rather than a bare `anthropic`.
 	 */
 	private reasoningSourceOverride?: string;
-	constructor(config: AnthropicProviderConfig) {
+	constructor(
+		config: AnthropicProviderConfig,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
 		this.tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
 	}
@@ -1144,10 +1158,13 @@ export class AnthropicProvider implements ProviderAdapter {
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, {
-			proxy,
-			tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
-		});
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+				tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+			}),
+		);
 	}
 
 	/**
@@ -1207,7 +1224,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		} else {
 			headers["x-api-key"] = apiKey;
 			headers["user-agent"] = this.resolveUserAgent(false);
-			if (declaresEffortBetaFlags(model)) {
+			if (supportsEffort(model) && declaresEffortBetaFlags(model)) {
 				headers["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
 			}
 		}
@@ -1507,7 +1524,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				description: tool.description,
 				input_schema: {
 					$schema: "https://json-schema.org/draft/2020-12/schema",
-					...resolveToolJsonSchema(tool),
+					...flattenTopLevelUnion(resolveToolJsonSchema(tool)),
 				},
 			}),
 		);
@@ -1517,7 +1534,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
+	): Promise<BuiltHistory> {
 		// narratorId is required to resolve history images: an uploaded image is
 		// stored per narrator and the row only carries its id, so without the owner
 		// the bytes cannot be found. It used to be ignored here, which silently
@@ -1688,11 +1705,12 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		// Use the unified Anthropic Messages output token ceiling. Every model in
 		// the supported range caps at or above it.
-		const maxTokens = resolveOutputTokenLimit(
-			effectiveProviderMetadata(params.model),
-			params.maxOutputTokens,
-			DEFAULT_MAX_TOKENS,
-		)!;
+		const maxTokens =
+			resolveOutputTokenLimit(
+				effectiveProviderMetadata(params.model),
+				params.maxOutputTokens,
+				DEFAULT_MAX_TOKENS,
+			) ?? DEFAULT_MAX_TOKENS;
 
 		// Build thinking configuration
 		const thinkingConfig = buildThinkingConfig(params.model, params.reasoningEffort, maxTokens);
@@ -1817,17 +1835,14 @@ export class AnthropicProvider implements ProviderAdapter {
 		// (the session path always resolves a tier), but under the blacklist policy
 		// it would impose a tier on every third-party model whose caller left it
 		// unset. The OpenAI path already sends nothing in that case.
-		if (
-			supportsEffort(model) ||
-			effectiveProviderMetadata(params.model).reasoning?.supported === true
-		) {
+		if (supportsEffort(model)) {
 			const effort = mapEffortParam(params.model, params.reasoningEffort);
 			if (effort) body.output_config = { effort };
 		}
 
 		// DeepSeek effort: output_config.effort controls thinking intensity
 		// (DeepSeek supports "high" and "max"; low/medium map to high)
-		if (isDeepSeek && thinkingEnabled) {
+		if (isDeepSeek && thinkingEnabled && supportsEffort(model)) {
 			const effort = mapDeepSeekEffort(
 				resolveMetadataReasoning(effectiveProviderMetadata(params.model), params.reasoningEffort),
 			);
@@ -2200,11 +2215,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
-			max_tokens: resolveOutputTokenLimit(
-				effectiveProviderMetadata(model),
-				options?.maxOutputTokens,
-				DEFAULT_GENERATE_MAX_TOKENS,
-			)!,
+			max_tokens:
+				resolveOutputTokenLimit(
+					effectiveProviderMetadata(model),
+					options?.maxOutputTokens,
+					DEFAULT_GENERATE_MAX_TOKENS,
+				) ?? DEFAULT_GENERATE_MAX_TOKENS,
 			messages,
 			stream: true,
 		};
@@ -2218,11 +2234,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 			const effort = mapEffortParam(model, reasoningEffort);
-			if (
-				effort &&
-				(supportsEffort(bareModel) ||
-					effectiveProviderMetadata(model).reasoning?.supported === true)
-			) {
+			if (effort) {
 				body.output_config = {
 					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
 				};
@@ -2303,11 +2315,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
-			max_tokens: resolveOutputTokenLimit(
-				effectiveProviderMetadata(model),
-				options?.maxOutputTokens,
-				DEFAULT_GENERATE_MAX_TOKENS,
-			)!,
+			max_tokens:
+				resolveOutputTokenLimit(
+					effectiveProviderMetadata(model),
+					options?.maxOutputTokens,
+					DEFAULT_GENERATE_MAX_TOKENS,
+				) ?? DEFAULT_GENERATE_MAX_TOKENS,
 			messages,
 			stream: true,
 		};
@@ -2321,11 +2334,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			const thinkingConfig = buildThinkingConfig(model, reasoningEffort, body.max_tokens);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 			const effort = mapEffortParam(model, reasoningEffort);
-			if (
-				effort &&
-				(supportsEffort(bareModel) ||
-					effectiveProviderMetadata(model).reasoning?.supported === true)
-			) {
+			if (effort) {
 				body.output_config = {
 					effort: isDeepSeekModel(bareModel) ? (mapDeepSeekEffort(effort) ?? effort) : effort,
 				};
@@ -2400,11 +2409,12 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const body: Record<string, unknown> = {
 			model: bareModel,
-			max_tokens: resolveOutputTokenLimit(
-				effectiveProviderMetadata(metadataModel),
-				undefined,
-				WEB_SEARCH_MAX_TOKENS,
-			)!,
+			max_tokens:
+				resolveOutputTokenLimit(
+					effectiveProviderMetadata(metadataModel),
+					undefined,
+					WEB_SEARCH_MAX_TOKENS,
+				) ?? WEB_SEARCH_MAX_TOKENS,
 			messages,
 			stream: true,
 			tools: [searchTool],
@@ -3165,6 +3175,7 @@ async function buildAnthropicHistory(
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
 	trailingUserText?: string;
+	replayedInjectionMessageIds: string[];
 }> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -3203,6 +3214,7 @@ async function buildAnthropicHistory(
 	}
 
 	const history: AnthropicMessage[] = [];
+	const emittedMessages: DbMessage[] = [];
 	let pendingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }> = [];
 
 	for (const msg of topLevel) {
@@ -3440,8 +3452,10 @@ async function buildAnthropicHistory(
 				const parts: AnthropicContentPart[] = [...images];
 				if (text) parts.unshift({ type: "text", text });
 				history.push({ role: "user", content: parts });
+				emittedMessages.push(msg);
 			} else if (text) {
 				history.push({ role, content: text });
+				emittedMessages.push(msg);
 			}
 		}
 	}
@@ -3450,6 +3464,7 @@ async function buildAnthropicHistory(
 		history,
 		trailingToolResults: pendingToolResults,
 		trailingUserText: trailingSysText || undefined,
+		replayedInjectionMessageIds: historyInputMessageIds(emittedMessages),
 	};
 }
 

@@ -1,0 +1,613 @@
+import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { hashReleaseFile } from "../../scripts/lib/ci-release-io";
+import { descendantPids, SmokeProcessScope } from "../../scripts/lib/ci-release-smoke-process";
+import {
+	assertFrontendJavaScript,
+	assertHealthIdentity,
+	assertMigratedDatabase,
+	hasPtyMarker,
+	parseSmokeArgs,
+	resolveFrontendAssetPath,
+	type SmokeOptions,
+	smokeEnvironment,
+	smokeFailure,
+	smokePty,
+	smokeReleaseBinary,
+	validateSmokeMetadata,
+	WatcherInbox,
+} from "../../scripts/smoke-release-binary";
+
+const roots: string[] = [];
+async function temporary(): Promise<string> {
+	const root = await mkdtemp(join(tmpdir(), "nf-ci-smoke-test-"));
+	roots.push(root);
+	return root;
+}
+afterEach(async () => {
+	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+});
+const commit = "0123456789abcdef0123456789abcdef01234567";
+const options: SmokeOptions = {
+	target: "linux-x64",
+	binary: "narrafork-1.2.3-linux-x64",
+	metadata: "binary.metadata.json",
+	commit,
+	version: "1.2.3",
+	output: "smoke.json",
+};
+const args = Object.entries(options).map(([key, value]) => `--${key}=${value}`);
+const hash = { size: 100, sha256: "a".repeat(64), sha512: Buffer.alloc(64, 4).toString("base64") };
+const metadata = {
+	name: options.binary,
+	target: "bun-linux-x64",
+	platform: "linux-x64",
+	version: options.version,
+	commit: commit.slice(0, 8),
+	buildDate: "2026-10-08T00:00:00Z",
+	...hash,
+};
+
+describe("release smoke input and identity", () => {
+	test("requires exact CLI contract and full commit", () => {
+		expect(parseSmokeArgs(args)).toEqual(options);
+		for (const invalid of [
+			args.slice(1),
+			[...args, "--target=linux-x64"],
+			[...args, "--skip-pty=true"],
+			args.map((arg) => (arg.startsWith("--commit=") ? "--commit=1234567" : arg)),
+			args.map((arg) => (arg.startsWith("--target=") ? "--target=linux-arm" : arg)),
+		]) {
+			expect(() => parseSmokeArgs(invalid)).toThrow();
+		}
+	});
+	test("binds name, platform, version, commit, size and both hashes", () => {
+		expect(validateSmokeMetadata(metadata, options, hash)).toEqual(metadata);
+		for (const changed of [
+			{ name: "another" },
+			{ platform: "linux-x64-baseline" },
+			{ target: "bun-windows-x64" },
+			{ version: "1.2.4" },
+			{ commit: "abc" },
+			{ commit: "f".repeat(8) },
+			{ size: 99 },
+			{ sha256: "b".repeat(64) },
+			{ sha512: "bad" },
+		]) {
+			expect(() => validateSmokeMetadata({ ...metadata, ...changed }, options, hash)).toThrow();
+		}
+	});
+	test("health must attest a ready build, not merely return HTTP 200", () => {
+		const health = {
+			status: "ok",
+			readiness: "ready",
+			commit: commit.slice(0, 8),
+			version: `1.2.3+${commit.slice(0, 8)}`,
+			gitAvailable: true,
+		};
+		expect(() => assertHealthIdentity(health, options)).not.toThrow();
+		for (const changed of [
+			{ readiness: "recovering" },
+			{ status: "failed" },
+			{ commit: "f".repeat(8) },
+			{ version: "1.2.3" },
+			{ gitAvailable: false },
+		])
+			expect(() => assertHealthIdentity({ ...health, ...changed }, options)).toThrow();
+	});
+	test("does not inherit credentials, source resolution or production data configuration", () => {
+		const env = smokeEnvironment("/isolated", {
+			PATH: "/usr/bin:/checkout/node_modules/.bin",
+			NODE_PATH: "/checkout/node_modules",
+			NODE_OPTIONS: "--preload=evil",
+			GH_TOKEN: "secret",
+			ANTHROPIC_API_KEY: "secret",
+			NARRAFORK_HOME: "/real",
+			NF_DATABASE_URL: "postgres://real",
+			HOME: "/real",
+			PORT: "7779",
+		});
+		expect(env.HOME).toBe(join("/isolated", "home"));
+		expect(env.NARRAFORK_HOME).toBe(join("/isolated", "data"));
+		expect(env.NF_DATABASE_BACKEND).toBe("sqlite");
+		for (const key of [
+			"GH_TOKEN",
+			"NODE_PATH",
+			"NODE_OPTIONS",
+			"NF_DATABASE_URL",
+			"ANTHROPIC_API_KEY",
+			"PORT",
+		])
+			expect(env[key]).toBeUndefined();
+		expect(env.PATH).not.toContain("node_modules");
+	});
+});
+
+describe("embedded frontend entry resolution", () => {
+	const origin = "http://127.0.0.1:54321";
+	test("resolves Vite relative entry and same-origin injected base", () => {
+		for (const src of [
+			"./assets/index-Ab_12.js",
+			"assets/index-Ab_12.js",
+			"/assets/index-Ab_12.js",
+		]) {
+			expect(
+				resolveFrontendAssetPath(
+					`<base href="/"><script type="module" crossorigin src="${src}"></script>`,
+					origin,
+				),
+			).toBe("/assets/index-Ab_12.js");
+		}
+		expect(
+			resolveFrontendAssetPath(
+				`<!-- <base href="https://bad.example/"> --><script src = './assets/index.js' type = 'module'></script>`,
+				origin,
+			),
+		).toBe("/assets/index.js");
+	});
+	test("rejects HTML fallback or empty content even if HTTP status is 200", () => {
+		const script = 'console.log("real bundled frontend entry");'.repeat(4);
+		expect(() =>
+			assertFrontendJavaScript("application/javascript; charset=utf-8", script),
+		).not.toThrow();
+		expect(() => assertFrontendJavaScript("text/html", script)).toThrow();
+		expect(() =>
+			assertFrontendJavaScript("application/javascript", `<html>${"fallback".repeat(30)}</html>`),
+		).toThrow();
+		expect(() => assertFrontendJavaScript("application/javascript", "")).toThrow();
+	});
+	test("uses the actual built frontend relative entry format", async () => {
+		const html = await readFile(new URL("../../dist/frontend/index.html", import.meta.url), "utf8");
+		expect(resolveFrontendAssetPath(html, origin)).toMatch(/^\/assets\/index-[A-Za-z0-9_-]+\.js$/);
+	});
+	test("rejects missing, remote, escaping and non-JavaScript module entries", () => {
+		for (const src of [
+			"https://bad.example/assets/index.js",
+			"//bad.example/assets/index.js",
+			"./assets/../assets/index.js",
+			"./assets/%2e%2e/assets/index.js",
+			"./assets/index.css",
+			"./api/health",
+			"./assets/index.js?remote=1",
+			"./assets/index.js#entry",
+			"./assets\\index.js",
+		]) {
+			expect(() =>
+				resolveFrontendAssetPath(`<script type="module" src="${src}"></script>`, origin),
+			).toThrow();
+		}
+		expect(() =>
+			resolveFrontendAssetPath('<script src="./assets/index.js"></script>', origin),
+		).toThrow();
+		expect(() =>
+			resolveFrontendAssetPath(
+				'<base href="https://bad.example/"><script type="module" src="./assets/index.js"></script>',
+				origin,
+			),
+		).toThrow("same-origin");
+		expect(() =>
+			resolveFrontendAssetPath(
+				'<!-- <script type="module" src="./assets/index.js"></script> -->',
+				origin,
+			),
+		).toThrow();
+	});
+});
+
+describe("real process lifecycle", () => {
+	test("handles actual child input/output and successful exit", async () => {
+		const root = await temporary();
+		const scope = new SmokeProcessScope(root, process.env);
+		let output = "";
+		try {
+			const child = scope.spawn(
+				[
+					process.execPath,
+					"-e",
+					'process.stdin.once("data", d => { console.log(JSON.parse(d).value); process.exit(0); });',
+				],
+				(chunk) => {
+					output += chunk.toString();
+				},
+			);
+			child.send({ value: "real-roundtrip" });
+			expect(await scope.until("child exit", () => child.status)).toBe(0);
+			expect(output).toContain("real-roundtrip");
+		} finally {
+			await scope.close();
+		}
+	});
+	test("kills owned process after deadline and preserves unrelated live process", async () => {
+		const root = await temporary();
+		const control = new SmokeProcessScope(root, process.env);
+		const scope = new SmokeProcessScope(root, process.env, { timeoutMs: 200 });
+		const unrelated = control.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"]);
+		const owned = scope.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"]);
+		try {
+			await expect(scope.until("never ready", () => undefined)).rejects.toThrow();
+			await scope.close();
+			expect(owned.status).not.toBeUndefined();
+			expect(unrelated.status).toBeUndefined();
+			const pid = unrelated.process.pid;
+			if (!pid) throw new Error("Missing control PID");
+			expect(() => process.kill(pid, 0)).not.toThrow();
+		} finally {
+			await scope.close();
+			await control.close();
+		}
+	});
+	test("honors cancellation and refuses pre-aborted spawn", async () => {
+		const root = await temporary();
+		const controller = new AbortController();
+		const scope = new SmokeProcessScope(root, process.env, { signal: controller.signal });
+		const child = scope.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"]);
+		try {
+			controller.abort(new Error("fixture cancelled"));
+			await expect(scope.until("never", () => undefined)).rejects.toThrow("fixture cancelled");
+			expect(() => scope.spawn([process.execPath])).toThrow("fixture cancelled");
+		} finally {
+			await scope.close();
+		}
+		expect(child.status).not.toBeUndefined();
+	});
+	test("bounds noisy child output before collecting it", async () => {
+		const root = await temporary();
+		const scope = new SmokeProcessScope(root, process.env, { maxOutputBytes: 1024 });
+		const child = scope.spawn([
+			process.execPath,
+			"-e",
+			'setInterval(() => process.stdout.write("x".repeat(2048)), 5)',
+		]);
+		try {
+			await expect(scope.until("never", () => undefined)).rejects.toThrow();
+			expect(scope.signal.aborted).toBe(true);
+			expect(scope.diagnostic.length).toBeLessThan(32769);
+		} finally {
+			await scope.close();
+		}
+		expect(child.status).not.toBeUndefined();
+	});
+	test("reclaims a real descendant in a separate PTY-like session", async () => {
+		const root = await temporary();
+		const heartbeat = join(root, "heartbeat");
+		const scope = new SmokeProcessScope(root, process.env);
+		const worker = `const fs = require("node:fs"); setInterval(() => fs.writeFileSync(${JSON.stringify(heartbeat)}, String(Date.now())), 10);`;
+		const parent = `const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(worker)}], { detached: ${process.platform !== "win32"}, stdio: "ignore" }); setInterval(() => {}, 1000);`;
+		const child = scope.spawn([process.execPath, "-e", parent]);
+		try {
+			let ready = false;
+			const timer = setInterval(() => {
+				void readFile(heartbeat).then(
+					() => {
+						ready = true;
+					},
+					() => {},
+				);
+			}, 10);
+			try {
+				await scope.until("descendant heartbeat", () => (ready ? true : undefined));
+			} finally {
+				clearInterval(timer);
+			}
+			await scope.close();
+			expect(child.status).not.toBeUndefined();
+			const stopped = await readFile(heartbeat, "utf8");
+			await new Promise((done) => setTimeout(done, 100));
+			expect(await readFile(heartbeat, "utf8")).toBe(stopped);
+		} finally {
+			await scope.close();
+		}
+	});
+	test("follows only root descendants even across process groups", () => {
+		expect(descendantPids("20 10\n30 20\n10 1\n40 1\n50 40\n", 10)).toEqual([30, 20]);
+	});
+	test("observes spawn failure instead of hanging until global timeout", async () => {
+		const root = await temporary();
+		const scope = new SmokeProcessScope(root, process.env);
+		try {
+			const child = scope.spawn([join(root, "absent-executable")]);
+			expect(await scope.until("failed spawn", () => child.status)).toBe(1);
+			expect(() => child.assertRunning()).toThrow("exited");
+		} finally {
+			await scope.close();
+		}
+	});
+});
+
+describe("native protocol and database assertions", () => {
+	test("assembles split JSONL messages and rejects native errors/oversize input", () => {
+		const inbox = new WatcherInbox();
+		inbox.push(Buffer.from('{"type":"ready",'));
+		expect(inbox.take(() => true)).toBeUndefined();
+		inbox.push(Buffer.from('"pid":123}\n{"type":"watch_ack","requestId":"a"}\n'));
+		expect(inbox.take((message) => message.type === "watch_ack")?.requestId).toBe("a");
+		expect(inbox.take((message) => message.type === "ready")?.pid).toBe(123);
+		expect(() =>
+			inbox.push(Buffer.from('{"type":"error","error":"missing native binding"}\n')),
+		).toThrow("missing native binding");
+		expect(() => new WatcherInbox().push(Buffer.alloc(65537, 120))).toThrow("budget");
+	});
+	test("does not accept echoed PTY input as a completed shell round trip", () => {
+		expect(hasPtyMarker("$ echo NF_MARKER\r\n", "NF_MARKER")).toBe(false);
+		expect(hasPtyMarker("echo NF_MARKER\r\n\u001b[32mNF_MARKER\u001b[0m\r\n$ ", "NF_MARKER")).toBe(
+			true,
+		);
+		expect(hasPtyMarker("echo NF_MARKER\r\nNF_MARK", "NF_MARKER")).toBe(false);
+	});
+	test("checks real SQLite migration evidence and persisted bootstrap user read-only", async () => {
+		const root = await temporary();
+		const file = join(root, "fixture.db");
+		const db = new Database(file);
+		db.exec(
+			"CREATE TABLE __drizzle_migrations (id INTEGER PRIMARY KEY, hash TEXT, created_at INTEGER); CREATE TABLE users (username TEXT, role TEXT); CREATE TABLE narrators (id TEXT); CREATE TABLE narrator_messages (id TEXT); CREATE TABLE terminals (id TEXT);",
+		);
+		db.query("INSERT INTO __drizzle_migrations VALUES (1, ?, 1780000000000)").run("a".repeat(64));
+		db.query("INSERT INTO users VALUES (?, 'admin')").run("smoke-user");
+		db.close();
+		const before = await readFile(file);
+		expect(() => assertMigratedDatabase(file, "smoke-user")).not.toThrow();
+		expect(() => assertMigratedDatabase(file, "other-user")).toThrow("persisted");
+		expect(await readFile(file)).toEqual(before);
+	});
+});
+
+test("failed real executable smoke never writes a success artifact", async () => {
+	const root = await temporary();
+	const platform = process.platform === "win32" ? "windows" : process.platform;
+	const binary = join(
+		root,
+		`narrafork-1.2.3-${platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`,
+	);
+	// Compile a genuine standalone fixture which fails immediately; not a mocked spawn/result.
+	const source = join(root, "fixture.ts");
+	await writeFile(source, 'console.error("intentional binary fixture failure"); process.exit(37);');
+	const builder = new SmokeProcessScope(root, process.env);
+	try {
+		await builder.command(
+			[process.execPath, "build", source, "--compile", `--outfile=${binary}`],
+			30_000,
+		);
+	} finally {
+		await builder.close();
+	}
+	const measured = await hashReleaseFile(binary);
+	const fixtureOptions = {
+		...options,
+		target: `${platform}-${process.arch}`,
+		binary,
+		metadata: `${binary}.metadata.json`,
+		output: join(root, "smoke.json"),
+	};
+	await writeFile(
+		fixtureOptions.metadata,
+		JSON.stringify({
+			...metadata,
+			...measured,
+			name: binary.split(/[\\/]/).pop(),
+			target: `bun-${fixtureOptions.target}`,
+			platform: fixtureOptions.target.replace("windows-", "win-"),
+		}),
+	);
+	await expect(smokeReleaseBinary(fixtureOptions)).rejects.toThrow(
+		"intentional binary fixture failure",
+	);
+	await expect(readFile(fixtureOptions.output)).rejects.toThrow();
+	expect(await hashReleaseFile(binary)).toEqual(measured);
+}, 60_000);
+
+async function ptyFixture(
+	mode: "pass" | "echo" | "replay" | "exit" | "oversize" | "hang-exit" | "bad-exit",
+	deleteStatus = 200,
+) {
+	let deleted = 0;
+	let inputs = 0;
+	let exits = 0;
+	let resized = 0;
+	let ready = false;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, server) {
+			const path = new URL(request.url).pathname;
+			if (path === "/ws/terminal" && server.upgrade(request)) return;
+			if (request.method === "POST" && path === "/api/terminals")
+				return Response.json({ id: "owned-terminal" });
+			if (request.method === "DELETE" && path === "/api/terminals/owned-terminal") {
+				deleted++;
+				return new Response("{}", { status: deleteStatus });
+			}
+			return new Response("not found", { status: 404 });
+		},
+		websocket: {
+			message(ws, raw) {
+				const message = JSON.parse(String(raw));
+				const send = (type: string, extra: Record<string, unknown> = {}) =>
+					ws.send(JSON.stringify({ type, terminalId: "owned-terminal", ...extra }));
+				if (message.type === "subscribe") {
+					timers.push(
+						setTimeout(() => {
+							ready = true;
+							send("scrollback", { data: "initial shell prompt\r\n" });
+							send("bufferState", { activeBuffer: "normal" });
+						}, 30),
+					);
+				} else if (message.type === "resize") resized++;
+				else if (message.type === "input") {
+					if (message.data === "exit\r") {
+						exits++;
+						if (mode !== "hang-exit") send("exit", { code: mode === "bad-exit" ? 37 : 0 });
+						return;
+					}
+					inputs++;
+					if (!ready) {
+						send("error", { message: "input raced subscription" });
+						return;
+					}
+					const marker = /^echo (NF_RELEASE_PTY_[a-f0-9]+)\r$/.exec(message.data)?.[1];
+					if (!marker) {
+						send("error", { message: "invalid marker command" });
+						return;
+					}
+					send("requestResize");
+					if (mode === "oversize") {
+						send("output", { data: "x".repeat(65_537) });
+						return;
+					}
+					send("output", { data: `$ ${message.data}\n` });
+					if (mode === "exit") {
+						send("exit", { code: 37 });
+						return;
+					}
+					if (mode === "replay") {
+						send("scrollback", { data: `${marker}\r\n` });
+						return;
+					}
+					if (mode === "pass" || mode === "hang-exit" || mode === "bad-exit") {
+						send("output", { terminalId: "other-terminal", data: "foreign-output\r\n" });
+						send("output", { data: marker.slice(0, 12) });
+						send("output", { data: `${marker.slice(12)}\r\n` });
+					}
+				}
+			},
+		},
+	});
+	return {
+		origin: server.url.origin,
+		get deleted() {
+			return deleted;
+		},
+		get inputs() {
+			return inputs;
+		},
+		get exits() {
+			return exits;
+		},
+		get resized() {
+			return resized;
+		},
+		close() {
+			for (const timer of timers) clearTimeout(timer);
+			server.stop(true);
+		},
+	};
+}
+
+describe("PTY subscription and cleanup regression", () => {
+	test("waits for subscription replay, handles resize and requires the live split marker", async () => {
+		const fixture = await ptyFixture("pass");
+		const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+		try {
+			await smokePty(fixture.origin, "isolated-token", scope);
+			expect(fixture.inputs).toBe(1);
+			expect(fixture.exits).toBe(1);
+			expect(fixture.resized).toBeGreaterThanOrEqual(2);
+			expect(fixture.deleted).toBe(1);
+		} finally {
+			await scope.close();
+			fixture.close();
+		}
+	});
+	for (const mode of ["hang-exit", "bad-exit"] as const) {
+		test(`${mode} never passes cleanup just because the marker was received`, async () => {
+			const fixture = await ptyFixture(mode);
+			const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 400 });
+			try {
+				await expect(smokePty(fixture.origin, "isolated-token", scope)).rejects.toThrow(
+					"PTY stage=shell shutdown",
+				);
+				expect(fixture.inputs).toBe(1);
+				expect(fixture.exits).toBe(1);
+				expect(fixture.deleted).toBe(1);
+			} finally {
+				await scope.close();
+				fixture.close();
+			}
+		});
+	}
+	for (const mode of ["echo", "replay"] as const) {
+		test(`${mode} alone never attests a completed live shell round trip`, async () => {
+			const fixture = await ptyFixture(mode);
+			const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 300 });
+			try {
+				await expect(smokePty(fixture.origin, "isolated-token", scope)).rejects.toThrow(
+					"PTY stage=round-trip",
+				);
+				expect(fixture.inputs).toBe(1);
+				expect(fixture.deleted).toBe(1);
+			} finally {
+				await scope.close();
+				fixture.close();
+			}
+		});
+	}
+	test("preserves a native exit and its diagnostics when terminal deletion also fails", async () => {
+		const fixture = await ptyFixture("exit", 500);
+		const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+		try {
+			let failure: unknown;
+			try {
+				await smokePty(fixture.origin, "isolated-token", scope);
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(Error);
+			expect(String(failure)).toContain("PTY exited before marker (37)");
+			expect(String(failure)).toContain("PTY stage=round-trip");
+			expect(String(failure)).toContain("Failed to delete owned smoke PTY: 500");
+			expect(fixture.deleted).toBe(1);
+		} finally {
+			await scope.close();
+			fixture.close();
+		}
+	});
+	test("oversize live output fails instead of collecting an unbounded transcript", async () => {
+		const fixture = await ptyFixture("oversize");
+		const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+		try {
+			await expect(smokePty(fixture.origin, "isolated-token", scope)).rejects.toThrow(
+				"message exceeds budget",
+			);
+			expect(fixture.deleted).toBe(1);
+		} finally {
+			await scope.close();
+			fixture.close();
+		}
+	});
+});
+
+describe("smoke close and error aggregation", () => {
+	test("concurrent cleanup callers wait for one close and actual stdio release", async () => {
+		const scope = new SmokeProcessScope(await temporary(), process.env);
+		const child = scope.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"]);
+		const first = scope.close();
+		const second = scope.close();
+		expect(second).toBe(first);
+		await Promise.all([first, second]);
+		expect(child.closed).toBe(true);
+		expect(child.status).not.toBeUndefined();
+		expect(child.process.stdin.destroyed).toBe(true);
+		expect(child.process.stdout.destroyed).toBe(true);
+		expect(child.process.stderr.destroyed).toBe(true);
+		expect(scope.close()).toBe(first);
+	});
+	test("cleanup cannot hide the primary failure and filesystem error fields", () => {
+		const primary = new Error("native validation failed");
+		const cleanup = Object.assign(new Error("resource busy"), {
+			code: "EBUSY",
+			syscall: "rm",
+			path: "/isolated/run/executable",
+		});
+		const failure = smokeFailure("Release smoke failed", [primary, cleanup]);
+		expect(failure.message).toContain(primary.message);
+		expect(failure.message).toContain("EBUSY; rm; /isolated/run/executable");
+		expect(failure.cause).toBeInstanceOf(AggregateError);
+		expect((failure.cause as AggregateError).errors).toEqual([primary, cleanup]);
+		expect(
+			smokeFailure("bounded", [new Error("x".repeat(100_000))]).message.length,
+		).toBeLessThanOrEqual(16_384);
+	});
+});

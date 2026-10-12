@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test as nativeTest, spyOn } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -65,55 +65,142 @@ let token: string;
 let otherToken: string;
 let runtime: LocalFileChangeRuntime;
 let sequence: number;
-const restorers: (() => void | Promise<void>)[] = [];
+let restorers: (() => void | Promise<void>)[] = [];
+type HttpFixtureLifetime = {
+	controller: AbortController;
+	pending: Set<Promise<unknown>>;
+	restorers: typeof restorers;
+	workspace?: string;
+	runtime?: LocalFileChangeRuntime;
+	closing?: Promise<void>;
+};
+let lifetime: HttpFixtureLifetime | undefined;
+function track<T>(owner: HttpFixtureLifetime, pending: Promise<T>): Promise<T> {
+	owner.pending.add(pending);
+	// Observe completion without replacing the promise delivered to bun:test or callers.
+	void pending.then(
+		() => owner.pending.delete(pending),
+		() => owner.pending.delete(pending),
+	);
+	return pending;
+}
+const ownedTest: ProxyHandler<typeof nativeTest> = {
+	apply(register, thisArg, [label, body, options]) {
+		return Reflect.apply(register, thisArg, [
+			label,
+			(...args: unknown[]) => {
+				if (!lifetime) throw new Error("Missing HTTP fixture lifetime");
+				const result = body(...args);
+				return result instanceof Promise ? track(lifetime, result) : result;
+			},
+			options,
+		]);
+	},
+	get(register, key, receiver) {
+		if (key === "each")
+			return (...tables: unknown[]) =>
+				new Proxy(Reflect.apply(register.each, register, tables), ownedTest);
+		if (key === "skipIf")
+			return (condition: boolean) => new Proxy(register.skipIf(condition), ownedTest);
+		return Reflect.get(register, key, receiver);
+	},
+};
+// Native registration, names, table arguments, body promises and deadlines stay unchanged.
+const test = new Proxy(nativeTest, ownedTest);
+async function closeFixture(owner: HttpFixtureLifetime) {
+	owner.controller.abort(new Error("HTTP test fixture finished"));
+	while (owner.pending.size) await Promise.allSettled([...owner.pending]);
+	// Preview cancellation may return before its real namespace work finishes.
+	await owner.runtime?.waitForNamespaceDrain();
+	while (owner.pending.size) await Promise.allSettled([...owner.pending]);
+	for (const restore of owner.restorers.splice(0).reverse()) await restore();
+	// Retain durable journals/pins. Remove only this fixture's workspace, after IO settles.
+	if (owner.workspace) await rm(owner.workspace, { recursive: true, force: true });
+}
 const now = () => new Date().toISOString();
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 
 beforeEach(async () => {
+	// A timed-out native hook must not let another fixture replace shared test globals.
+	await lifetime?.closing;
+	const owner: HttpFixtureLifetime = {
+		controller: new AbortController(),
+		pending: new Set(),
+		restorers: [],
+	};
+	lifetime = owner;
+	restorers = owner.restorers;
+	await track(owner, seedFixture(owner));
+});
+async function seedFixture(owner: HttpFixtureLifetime) {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(getNarraforkHome()).toBe(testEnvironment.narraforkHome);
 	workspace = await mkdtemp(join(testEnvironment.isolatedHome, "revert-http-"));
+	owner.workspace = workspace;
 	userId = generateId();
 	otherId = generateId();
 	narratorId = generateId();
 	projectId = generateId();
 	sequence = 0;
-	for (const id of [userId, otherId])
-		db.insert(schema.users)
-			.values({ id, username: id, passwordHash: "test", role: "user", createdAt: now() })
+	// Only synchronous fixture rows are batched, never real route/tool/evidence work.
+	db.transaction(() => {
+		for (const id of [userId, otherId])
+			db.insert(schema.users)
+				.values({ id, username: id, passwordHash: "test", role: "user", createdAt: now() })
+				.run();
+		db.insert(schema.projects)
+			.values({
+				id: projectId,
+				name: "preview fixture",
+				ownerUserId: userId,
+				gitPath: workspace,
+				createdAt: now(),
+				updatedAt: now(),
+			})
 			.run();
-	db.insert(schema.projects)
-		.values({
-			id: projectId,
-			name: "preview fixture",
-			ownerUserId: userId,
-			gitPath: workspace,
-			createdAt: now(),
-			updatedAt: now(),
-		})
-		.run();
-	db.insert(schema.narrators)
-		.values({
-			id: narratorId,
-			title: "preview fixture",
-			cwd: workspace,
-			ownerUserId: userId,
-			contextProjectId: projectId,
-			messageVersion: 7,
-			createdAt: now(),
-			updatedAt: now(),
-		})
-		.run();
+		db.insert(schema.narrators)
+			.values({
+				id: narratorId,
+				title: "preview fixture",
+				cwd: workspace,
+				ownerUserId: userId,
+				contextProjectId: projectId,
+				messageVersion: 7,
+				createdAt: now(),
+				updatedAt: now(),
+			})
+			.run();
+	});
 	token = await createToken(userId, "user");
 	otherToken = await createToken(otherId, "user");
 	settings.chapters.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
-});
-afterEach(async () => {
-	for (const restore of restorers.splice(0).reverse()) await restore();
-	// Preserve every journal/plan pin in the disposable test DB. Never reset the
-	// default runtime, coordinator state, unknown records or production directory.
-	await rm(workspace, { recursive: true, force: true });
+	owner.runtime = runtime;
+	const namespaceAccess = runtime.withNamespaceAccess;
+	// Transparent lifetime observers, not Bun spies: fault-injection cases may spy
+	// on these same methods and must retain their original forwarding target.
+	runtime.withNamespaceAccess = function <T>(body: () => Promise<T>, signal?: AbortSignal) {
+		return track(owner, namespaceAccess.bind(this)(body, signal));
+	};
+	const execute = RevertTransactionService.prototype.execute;
+	RevertTransactionService.prototype.execute = function (input) {
+		const execution = execute.call(this, input);
+		track(owner, execution.whenSettled);
+		return execution;
+	};
+	owner.restorers.push(
+		() => {
+			if (owner.runtime) owner.runtime.withNamespaceAccess = namespaceAccess;
+		},
+		() => {
+			RevertTransactionService.prototype.execute = execute;
+		},
+	);
+}
+afterEach(() => {
+	if (!lifetime) return;
+	lifetime.closing ??= closeFixture(lifetime);
+	return lifetime.closing;
 });
 function request(extra: Record<string, unknown> = {}) {
 	return {
@@ -125,6 +212,21 @@ function request(extra: Record<string, unknown> = {}) {
 		...extra,
 	};
 }
+function fixtureRequest(url: string, init: RequestInit) {
+	if (!lifetime) throw new Error("Missing HTTP fixture lifetime");
+	const owner = lifetime;
+	return track(
+		owner,
+		Promise.resolve(
+			app.request(url, {
+				...init,
+				signal: init.signal
+					? AbortSignal.any([owner.controller.signal, init.signal])
+					: owner.controller.signal,
+			}),
+		),
+	);
+}
 async function http(
 	endpoint: string,
 	method = "GET",
@@ -132,7 +234,7 @@ async function http(
 	bearer = token,
 	signal?: AbortSignal,
 ) {
-	return app.request(`http://localhost/api/narrators/${narratorId}/${endpoint}`, {
+	return fixtureRequest(`http://localhost/api/narrators/${narratorId}/${endpoint}`, {
 		method,
 		headers: {
 			...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
@@ -157,12 +259,14 @@ async function prepared(extra: Record<string, unknown> = {}) {
 }
 function message(role: "user" | "assistant", blocks: unknown[]) {
 	const messageId = generateId();
-	db.insert(schema.narratorMessages)
-		.values({ id: messageId, narratorId, role, contentJson: blocks, createdAt: now() })
-		.run();
-	db.insert(schema.narratorMessageRefs)
-		.values({ id: generateId(), narratorId, messageId, seq: ++sequence })
-		.run();
+	db.transaction(() => {
+		db.insert(schema.narratorMessages)
+			.values({ id: messageId, narratorId, role, contentJson: blocks, createdAt: now() })
+			.run();
+		db.insert(schema.narratorMessageRefs)
+			.values({ id: generateId(), narratorId, messageId, seq: ++sequence })
+			.run();
+	});
 	return messageId;
 }
 function messageRow(messageId: string) {
@@ -194,6 +298,8 @@ async function toolContext(
 	input: Record<string, unknown>,
 	existingMessageId?: string,
 ) {
+	if (!lifetime) throw new Error("Missing HTTP fixture lifetime");
+	const signal = lifetime.controller.signal;
 	const targetPath = await localBackend.resolvePathIdentity(path);
 	const target: ToolExecutionTarget = {
 		deviceId: "local",
@@ -208,41 +314,44 @@ async function toolContext(
 	const toolCallId = generateId();
 	const toolUseId = generateId();
 	const block = { type: "tool_use", id: toolUseId, name, input };
-	const messageId = existingMessageId ?? message("assistant", [{ type: "text", text: "keep" }]);
-	const previous = messageRow(messageId)?.contentJson;
-	if (!Array.isArray(previous)) throw new Error("Missing tool message blocks");
-	const blockIndex = previous.length;
-	db.update(schema.narratorMessages)
-		.set({ contentJson: [...previous, block] })
-		.where(eq(schema.narratorMessages.id, messageId))
-		.run();
-	db.insert(schema.narratorToolCalls)
-		.values({
-			id: toolCallId,
-			narratorId,
-			messageId,
-			toolUseId,
-			toolName: name,
-			inputJson: input,
-			status: "running",
-			executionIdentityVersion: 1,
-			executionAttempt: 1,
-			executionStartedAt: now(),
-			executionDeviceId: "local",
-			executionCwd: workspace,
-			executionPathFlavor: target.pathFlavor,
-			resolvedFilePath: target.lexicalPath,
-			canonicalFilePath: target.canonicalPath,
-			runtimeGeneration: target.runtimeGeneration,
-			createdAt: now(),
-		})
-		.run();
+	const { messageId, blockIndex } = db.transaction(() => {
+		const messageId = existingMessageId ?? message("assistant", [{ type: "text", text: "keep" }]);
+		const previous = messageRow(messageId)?.contentJson;
+		if (!Array.isArray(previous)) throw new Error("Missing tool message blocks");
+		const blockIndex = previous.length;
+		db.update(schema.narratorMessages)
+			.set({ contentJson: [...previous, block] })
+			.where(eq(schema.narratorMessages.id, messageId))
+			.run();
+		db.insert(schema.narratorToolCalls)
+			.values({
+				id: toolCallId,
+				narratorId,
+				messageId,
+				toolUseId,
+				toolName: name,
+				inputJson: input,
+				status: "running",
+				executionIdentityVersion: 1,
+				executionAttempt: 1,
+				executionStartedAt: now(),
+				executionDeviceId: "local",
+				executionCwd: workspace,
+				executionPathFlavor: target.pathFlavor,
+				resolvedFilePath: target.lexicalPath,
+				canonicalFilePath: target.canonicalPath,
+				runtimeGeneration: target.runtimeGeneration,
+				createdAt: now(),
+			})
+			.run();
+		return { messageId, blockIndex };
+	});
 	const ctx: ToolContext = {
 		narratorId,
 		userId,
 		cwd: workspace,
 		locale: "en",
-		signal: new AbortController().signal,
+		signal,
 		currentToolUseId: toolUseId,
 		toolCallBinding: { toolCallId, attempt: 1 },
 		executionTarget: target,
@@ -274,7 +383,7 @@ async function edit(path: string, old_string: string, new_string: string, messag
 }
 async function human(path: string, content: string) {
 	const original = await readFile(path, "utf8");
-	const response = await app.request("http://localhost/api/fs/write", {
+	const response = await fixtureRequest("http://localhost/api/fs/write", {
 		method: "POST",
 		headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
 		body: JSON.stringify({ narratorId, path, content, baseHash: hash(original) }),
@@ -599,6 +708,7 @@ function startLiveWorkAfterPreview() {
 	// If admission wrongly interrupts this later work, let its real busy check
 	// settle immediately so the test fails on the abort, rather than on a timeout.
 	active.abortController.signal.addEventListener("abort", finish, { once: true });
+	lifetime?.controller.signal.addEventListener("abort", finish, { once: true });
 	restorers.push(finish);
 	return active;
 }
@@ -1689,6 +1799,7 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
+		lifetime?.controller.signal.addEventListener("abort", release, { once: true });
 		const started = new Promise<void>((resolve) => {
 			entered = resolve;
 		});
@@ -1800,7 +1911,7 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		])
 			await boundedJson(await http(`revert-plans/${plan.id}/apply`, "POST", body), 400);
 		for (const endpoint of ["revert-action-preview", `revert-plans/${plan.id}/apply`]) {
-			const response = await app.request(
+			const response = await fixtureRequest(
 				`http://localhost/api/narrators/${narratorId}/${endpoint}`,
 				{
 					method: "POST",
@@ -2115,7 +2226,12 @@ describe("backend scope and namespace guards", () => {
 		await switchWorkspace(other, 0);
 		await switchWorkspace(workspace, 1);
 		const before = history();
-		expect((await prepared()).expectedFileCount).toBe(1);
+		// Workspace switches publish history; an old selection must stay stale.
+		expect(messageVersion()).toBeGreaterThan(7);
+		await refused(await prepare(), "REVERT_SELECTION_STALE");
+		expect((await prepared({ expectedMessageVersion: messageVersion() })).expectedFileCount).toBe(
+			1,
+		);
 		const plan = await actionPrepared("revert_files");
 		const response = await http(`revert-plans/${plan.id}/files`);
 		expect(response.status).toBe(200);
@@ -2157,7 +2273,12 @@ describe("backend scope and namespace guards", () => {
 		await writeFile(sameName, "different workspace\n");
 		await switchWorkspace(other, 0);
 		const before = history();
-		await refused(await prepare(), "REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(messageVersion()).toBeGreaterThan(7);
+		await refused(await prepare(), "REVERT_SELECTION_STALE");
+		await refused(
+			await prepare({ expectedMessageVersion: messageVersion() }),
+			"REVERT_PREVIEW_FILE_ACCESS_DENIED",
+		);
 		const response = await actionPreview("revert_files");
 		expect(response.status).toBe(403);
 		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");
@@ -2387,6 +2508,7 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
+		lifetime?.controller.signal.addEventListener("abort", release, { once: true });
 		const started = new Promise<void>((resolve) => {
 			entered = resolve;
 		});

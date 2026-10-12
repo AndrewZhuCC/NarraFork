@@ -16,13 +16,16 @@ import {
 	writeProfileJson,
 } from "./memory-profile-io";
 import { MemoryProfileTransport } from "./memory-profile-transport";
-import type {
-	HeapTrendPoint,
-	MemoryProfileArtifact,
-	MemoryProfileRequest,
-	MemoryProfileSummary,
-	MemoryProfileWorkerCommand,
-	MemoryProfileWorkerReply,
+import {
+	type HeapTrendPoint,
+	MEMORY_PROFILE_TRACE_CATEGORIES,
+	type MemoryProfileArtifact,
+	type MemoryProfileFailureDiagnostic,
+	type MemoryProfileRequest,
+	type MemoryProfileSummary,
+	type MemoryProfileWorkerCommand,
+	type MemoryProfileWorkerReply,
+	profileDiagnosticBrowserVersion,
 } from "./memory-profile-types";
 import { definiteTraceStartRejection } from "./tracing-lease";
 
@@ -146,6 +149,7 @@ export class MemoryProfileRecorder {
 	private startedAt = "";
 	private startedClock = 0;
 	private browserVersion = "unavailable";
+	private failureDiagnostic?: MemoryProfileFailureDiagnostic;
 	private readonly heapTrend: HeapTrendPoint[] = [];
 	private readonly warnings: string[] = [];
 	private readonly listeners: Array<[string | symbol, Listener]> = [];
@@ -273,16 +277,33 @@ export class MemoryProfileRecorder {
 		this.browserVersion = version.product.slice(0, PROFILE_LIMITS.functionChars);
 		this.warn("Allocation sampling and renderer GC event semantics vary by browser version.");
 		if (opts.config.mode !== "allocation") {
-			const { categories } = await this.send<{ categories: string[] }>("Tracing.getCategories");
-			const required = [
-				"devtools.timeline",
-				"v8",
-				"disabled-by-default-v8.gc",
-				"blink.user_timing",
-			];
-			if (required.some((category) => !categories.includes(category))) {
-				throw new MemoryProfileError("trace_capability");
+			const required = [...MEMORY_PROFILE_TRACE_CATEGORIES];
+			let missingCategories: MemoryProfileFailureDiagnostic["missingCategories"] = [];
+			try {
+				const enumeration = await this.send<{ categories?: unknown } | null>(
+					"Tracing.getCategories",
+				);
+				if (Array.isArray(enumeration?.categories)) {
+					const categories = enumeration.categories;
+					missingCategories = required.filter((category) => !categories.includes(category));
+					if (missingCategories.length > 0)
+						this.warn(
+							"Tracing category enumeration is incomplete; capabilities are verified by the trace protocol and recorded events.",
+						);
+				} else {
+					this.warn(
+						"Tracing category enumeration is unavailable; capabilities are verified by the trace protocol and recorded events.",
+					);
+				}
+			} catch {
+				checkProfileAbort(signal);
+				this.warn(
+					"Tracing category enumeration is unavailable; capabilities are verified by the trace protocol and recorded events.",
+				);
 			}
+			// Chrome 154 can omit every requested category yet emit scoped GC spans,
+			// heap endpoints, user markers and timeline events. Enumeration is not
+			// a capability gate: retain the exact request and analyze actual evidence.
 			checkProfileAbort(signal);
 			// Unknown outcome must not be mistaken for a safely stopped browser trace.
 			this.traceStopped = false;
@@ -302,7 +323,12 @@ export class MemoryProfileRecorder {
 				// A definite protocol rejection means OUR trace never started. Do not end
 				// a foreign/DevTools trace, and do not strand our lease as uncertain.
 				if (definiteTraceStartRejection(error)) this.traceStopped = true;
-				throw error;
+				this.failureDiagnostic = {
+					diagnosticStage: "trace_capability",
+					browserVersion: profileDiagnosticBrowserVersion(this.browserVersion),
+					missingCategories,
+				};
+				throw new MemoryProfileError("trace_capability");
 			}
 			this.tracingStarted = true;
 			checkProfileAbort(signal);
@@ -664,6 +690,9 @@ export class MemoryProfileRecorder {
 					profileId: opts.profileId,
 					stage: failedStage,
 					traceStopped: this.traceStopped,
+					...(!cancelled && failedStage === "trace_capability" && this.failureDiagnostic
+						? { diagnostic: this.failureDiagnostic }
+						: {}),
 				});
 			}
 		}

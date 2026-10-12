@@ -4,19 +4,20 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/narrafork/remote-executor/internal/testgit"
 )
 
 func gitTestRun(t *testing.T, cwd string, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := testgit.CommandContext(ctx, args...)
 	cmd.Dir = cwd
 	cmd.Env = gitWorkspaceEnv(map[string]any{"GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.test"})
 	out, err := cmd.CombinedOutput()
@@ -32,7 +33,7 @@ func gitTestIdentity() map[string]any {
 
 func newGitFixture(t *testing.T) (string, *Handlers) {
 	t.Helper()
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	gitTestRun(t, root, "init", "-b", "main")
 	return root, NewWithOptions(NewPathGuard([]string{root}), gitWorkspaceMaxBytes, true)
 }
@@ -52,6 +53,12 @@ func gitCall(t *testing.T, h *Handlers, root, operation string, extra map[string
 
 func TestGitWorkspaceLifecycle(t *testing.T) {
 	root, h := newGitFixture(t)
+	name := "hello\tthere.txt"
+	if runtime.GOOS == "windows" {
+		// Win32 rejects tab characters in filenames; retain real whitespace
+		// and Unicode path coverage without skipping any lifecycle operations.
+		name = "hello 空格 there.txt"
+	}
 	write := func(path, content string) {
 		t.Helper()
 		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0600); err != nil {
@@ -63,13 +70,13 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 		t.Fatalf("probe: %v", probe)
 	}
 	gitCall(t, h, root, "status", nil)
-	write("hello\tthere.txt", "initial\n")
+	write(name, "initial\n")
 	gitCall(t, h, root, "stage", map[string]any{"all": true})
 	gitCall(t, h, root, "unstage", map[string]any{"all": true})
 	if gitTestRun(t, root, "ls-files") != "" {
 		t.Fatal("unborn unstage left index entries")
 	}
-	gitCall(t, h, root, "stage", map[string]any{"files": []any{"hello\tthere.txt"}})
+	gitCall(t, h, root, "stage", map[string]any{"files": []any{name}})
 	commit := gitCall(t, h, root, "commit", map[string]any{"message": "initial", "identity": gitTestIdentity()})
 	first := strings.TrimSpace(commit["stdout"].(string))
 	if len(first) != 40 {
@@ -78,15 +85,15 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	if got := gitTestRun(t, root, "show", "-s", "--format=%an <%ae> %cn <%ce>"); got != "Acting User <acting@example.test> Acting User <acting@example.test>" {
 		t.Fatalf("identity: %s", got)
 	}
-	write("hello\tthere.txt", "initial\nsecond\n")
-	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{"hello\tthere.txt"}})["stdout"].(string); !strings.Contains(diff, "+second") {
+	write(name, "initial\nsecond\n")
+	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{name}})["stdout"].(string); !strings.Contains(diff, "+second") {
 		t.Fatalf("diff %q", diff)
 	}
 	gitCall(t, h, root, "stage", map[string]any{"all": true})
-	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{"hello\tthere.txt"}, "staged": true})["stdout"].(string); !strings.Contains(diff, "+second") {
+	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{name}, "staged": true})["stdout"].(string); !strings.Contains(diff, "+second") {
 		t.Fatalf("staged diff %q", diff)
 	}
-	gitCall(t, h, root, "unstage", map[string]any{"files": []any{"hello\tthere.txt"}})
+	gitCall(t, h, root, "unstage", map[string]any{"files": []any{name}})
 	gitCall(t, h, root, "stashPush", map[string]any{"message": "shelved", "identity": gitTestIdentity()})
 	if !strings.Contains(gitCall(t, h, root, "stashList", nil)["stdout"].(string), "shelved") {
 		t.Fatal("stash missing")
@@ -94,7 +101,7 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	gitCall(t, h, root, "stashPop", nil)
 	gitCall(t, h, root, "stashPush", map[string]any{"identity": gitTestIdentity()})
 	gitCall(t, h, root, "stashDrop", map[string]any{"index": 0})
-	write("hello\tthere.txt", "changed\n")
+	write(name, "changed\n")
 	write("new.txt", "new\n")
 	if full := gitCall(t, h, root, "fullDiff", nil)["stdout"].(string); !strings.Contains(full, "+new") {
 		t.Fatalf("full diff omitted untracked: %q", full)
@@ -107,7 +114,7 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	if got := gitTestRun(t, root, "status", "--porcelain"); got != "" {
 		t.Fatalf("discard: %s", got)
 	}
-	write("hello\tthere.txt", "third\n")
+	write(name, "third\n")
 	gitCall(t, h, root, "stage", map[string]any{"all": true})
 	gitCall(t, h, root, "commit", map[string]any{"message": "second", "identity": gitTestIdentity()})
 	log := gitCall(t, h, root, "log", map[string]any{"limit": 1, "skip": 1})["stdout"].(string)
@@ -411,7 +418,7 @@ func TestGitWorkspaceDisableShellReadFilters(t *testing.T) {
 }
 
 func TestGitWorkspaceDisableShellLinkedWorktreeHooks(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(parent, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
@@ -504,7 +511,7 @@ func TestGitWorkspaceUnavailableStatesAndNestedRepository(t *testing.T) {
 }
 
 func TestGitWorkspaceSubmodule(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	source := filepath.Join(parent, "source")
 	root := filepath.Join(parent, "root")
 	for _, path := range []string{source, root} {
@@ -549,7 +556,7 @@ func TestGitWorkspaceSubmodule(t *testing.T) {
 }
 
 func TestGitWorkspaceWorktreeAndDetached(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(parent, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)

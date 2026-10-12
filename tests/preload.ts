@@ -10,6 +10,7 @@
 
 import { afterAll, afterEach, beforeEach } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -48,7 +49,8 @@ if (requestedNarraforkHome && !allowExplicitTestHome) {
 // Keep HOME isolated for child processes and code that consults the environment.
 // Core NarraFork paths use NARRAFORK_HOME explicitly because Bun's os.homedir()
 // is resolved from the host account rather than being changed at runtime.
-const isolatedHome = mkdtempSync(resolve(realpathSync(tmpdir()), "narrafork-test-"));
+// Canonicalize the new private root using the runtime's async API (also resolves Windows aliases).
+const isolatedHome = await realpath(mkdtempSync(resolve(tmpdir(), "narrafork-test-")));
 const isolatedNarraforkHome = requestedNarraforkHome
 	? resolve(requestedNarraforkHome)
 	: resolve(isolatedHome, ".narrafork");

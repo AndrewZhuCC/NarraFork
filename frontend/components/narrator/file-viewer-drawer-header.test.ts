@@ -39,10 +39,12 @@ describe("internal file viewer drawer header", () => {
 		expect(DRAWER).toContain('title: { minWidth: 0, flex: 1, overflow: "hidden" }');
 	});
 
-	// A right-clipped path keeps the directories and drops the filename — the one part
-	// that says which file this is. TruncatedPath ellipsizes from the left instead.
-	it("clips the path from the left so the filename stays visible", () => {
-		expect(DRAWER).toContain("<TruncatedPath path={internalFileViewerPath}");
+	it("keeps reference display paths without changing the shared panel's file identity", () => {
+		expect(DRAWER).toContain("<TruncatedPath");
+		expect(DRAWER).toContain("path={internalViewerDisplayPath ?? internalFileViewerPath}");
+		expect(DRAWER).toContain("<FilePanelContent");
+		expect(DRAWER).toContain("filePath={internalFileViewerPath}");
+		expect(DRAWER).toContain("displayPath={internalViewerDisplayPath}");
 	});
 
 	it("no longer right-truncates the raw path in a plain Text", () => {

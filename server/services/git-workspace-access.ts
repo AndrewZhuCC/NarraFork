@@ -509,6 +509,89 @@ export async function authorizeGitTargetForPrincipal(
 	return target;
 }
 
+/** Check the exact destination independently of the narrator's current checkout grant. */
+export async function authorizeGitDestinationForPrincipal(
+	principal: NarratorPrincipal,
+	narratorId: string,
+	destination: string,
+	need: "read" | "write",
+	signal: AbortSignal,
+): Promise<GitWorkspaceTarget> {
+	const target = await authorizeGitTargetForPrincipal(principal, { narratorId }, need, signal);
+	requireReadyGitTarget(target, need);
+	const backend = target.backend;
+	if (backend.kind !== "local") throw denied();
+	const identity = await backend.resolvePathIdentity(destination, { signal, timeoutMs: 5000 });
+	if (
+		!backend.paths.equals(identity.canonicalPath, destination) ||
+		identity.runtimeGeneration !== backend.runtimeGeneration
+	)
+		throw denied();
+	await requireSafeLocalGitPath(target, destination);
+	const policy = await resolveOAuthNarratorRuntimePolicy(narratorId);
+	const context: ExecutionTargetContext = {
+		backend,
+		paths: backend.paths,
+		deviceClass: policy ? "host" : null,
+		target: {
+			deviceId: target.workspace.deviceId,
+			backendKind: backend.kind,
+			cwd: target.workspace.cwd,
+			lexicalPath: destination,
+			canonicalPath: destination,
+			pathFlavor: backend.pathFlavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: "session_default",
+		},
+	};
+	const compiled = await executionPolicyEngine.compile(
+		narratorId,
+		context,
+		policy?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+	);
+	if (!gitPathPolicyAllows(compiled, context, destination, need)) throw denied();
+	const decision = compiled.evaluatePath({ path: destination, operation: need }).decision;
+	const paths = backend.paths;
+	const repositoryRoot = target.repositoryPath ? paths.dirname(target.repositoryPath) : null;
+	// Preserve explicit narrower grants: a current-checkout whitelist is not a sibling grant.
+	if (
+		decision !== "allow" &&
+		compiled.directoryWhitelist.some(
+			(rule) =>
+				paths.contains(rule.path, destination) ||
+				(repositoryRoot &&
+					target.workspace.rootPath &&
+					!paths.contains(target.workspace.rootPath, destination) &&
+					paths.contains(repositoryRoot, rule.path)),
+		)
+	)
+		throw denied();
+	// OAuth ask is not an implicit grant outside its current directory, even for reads.
+	if (
+		policy &&
+		policy.permissionMode !== "bypassPermissions" &&
+		compiled.evaluatePath({ path: destination, operation: need }).decision !== "allow"
+	)
+		throw denied();
+	const scopedTarget = {
+		...target,
+		workspace: { ...target.workspace, rootPath: destination, cwd: destination },
+		// The source common directory was already authorized; don't treat it as a destination grant.
+		repositoryPath: undefined,
+	};
+	const scan = new GitAccessScan(signal);
+	try {
+		for (const project of await relatedProjects(scopedTarget, scan, principal)) {
+			if (!(await scan.run(() => hasProjectAccess(project, principal, need)))) throw denied();
+		}
+		scan.check();
+	} finally {
+		scan.dispose();
+	}
+	signal.throwIfAborted();
+	return target;
+}
+
 export function requireReadyGitTarget(
 	target: GitWorkspaceTarget,
 	need: "read" | "write",

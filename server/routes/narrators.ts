@@ -189,6 +189,7 @@ import {
 	narratorExportQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
+	narratorTransferOwnerSchema,
 	narratorVisibilitySchema,
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
@@ -199,6 +200,7 @@ import {
 	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	setNarratorGitIdentitySchema,
 	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
@@ -269,6 +271,11 @@ import {
 	rebuildDeviceFileState,
 	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
+import {
+	getNarratorGitIdentityPick,
+	listUserGitIdentities,
+	setNarratorGitIdentityPick,
+} from "../services/git-identities";
 import { gitManagementService } from "../services/git-management-service";
 import { withGitRequestContext } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
@@ -411,6 +418,7 @@ import {
 	revokeNarratorGrant,
 	setNarratorVisibility,
 	setNarratorWriteAudience,
+	transferNarratorOwner,
 	updateNarratorGrant,
 } from "../services/narrator-sharing";
 import {
@@ -1153,14 +1161,17 @@ narratorRoutes.get("/", async (c) => {
 		// Batch fetch active background task counts (subagents + bash + transfers).
 		// Lazy import matches the other background-task routes in this file.
 		const { backgroundTaskService } = await import("../services/background-task-service");
-		const backgroundTaskCounts = await backgroundTaskService.countActiveByParentBatch(narratorIds);
+		const backgroundTaskCounts =
+			await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
 
 		const items = rawItems.map((n) => ({
 			...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
 			messageCount: messageCounts.get(n.id) ?? 0,
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
-			activeBackgroundTaskCount: backgroundTaskCounts.get(n.id) ?? 0,
+			activeBackgroundTaskCount: backgroundTaskCounts.get(n.id)?.activeCount ?? 0,
+			activeBackgroundWorkCount: backgroundTaskCounts.get(n.id)?.activeWorkCount ?? 0,
+			activeBackgroundServiceCount: backgroundTaskCounts.get(n.id)?.activeServiceCount ?? 0,
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
 			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
 			viewers: presenceMap.get(n.id) ?? [],
@@ -1682,6 +1693,15 @@ narratorRoutes.patch("/:id/grants/:grantId", async (c) => {
 narratorRoutes.delete("/:id/grants/:grantId", async (c) => {
 	await revokeNarratorGrant(c.req.param("id"), c.req.param("grantId"), narratorPrincipalOf(c));
 	return c.json({ ok: true });
+});
+
+// Owner-or-admin is enforced by the sharing service, including legacy ownerless rows.
+narratorRoutes.post("/:id/transfer-owner", async (c) => {
+	const parsed = narratorTransferOwnerSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await transferNarratorOwner(c.req.param("id"), parsed.data.userId, narratorPrincipalOf(c)),
+	);
 });
 
 /**
@@ -4833,6 +4853,28 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 			userId: c.get("user").sub,
 		}),
 	);
+});
+
+// Which of MY git identities this narrator commits under. Personal by design:
+// several people driving one narrator each keep their own pick, so both routes
+// act on the caller's row only — another user's pick is never returned, and its
+// identity id is not selectable from here.
+narratorRoutes.get("/:id/git-identity", async (c) => {
+	const userId = c.get("user").sub;
+	const narratorId = c.req.param("id");
+	const [identities, selectedId] = await Promise.all([
+		listUserGitIdentities(userId),
+		getNarratorGitIdentityPick(userId, narratorId),
+	]);
+	return c.json({ identities, selectedId });
+});
+
+narratorRoutes.put("/:id/git-identity", async (c) => {
+	const parsed = setNarratorGitIdentitySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	await setNarratorGitIdentityPick(userId, c.req.param("id"), parsed.data.identityId);
+	return c.json({ ok: true });
 });
 
 // Update model

@@ -132,6 +132,8 @@ export interface NarratorInteractionStatusBarProps {
 		supported: boolean;
 		buttonEnabled: boolean;
 		runningCount: number;
+		workCount?: number;
+		serviceCount?: number;
 		onOpenPanel: () => void;
 	};
 
@@ -210,6 +212,12 @@ export interface NarratorInteractionStatusBarProps {
 		shouldShowNugRechargeButton: boolean;
 		shouldShowNugRechargeInQuotaDetails: boolean;
 		onOpenNugRecharge: () => void;
+		/** Provider-neutral recharge entry; legacy NUG callers keep their existing fields. */
+		recharge?: {
+			showButton: boolean;
+			showInDetails: boolean;
+			onOpen: () => void;
+		};
 	};
 
 	relaxedPlan: {
@@ -273,6 +281,12 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 		contextIndicator,
 		t,
 	} = props;
+
+	const recharge = quota.recharge ?? {
+		showButton: quota.shouldShowNugRechargeButton,
+		showInDetails: quota.shouldShowNugRechargeInQuotaDetails,
+		onOpen: quota.onOpenNugRecharge,
+	};
 
 	// Model price popup state. Kept here (a stable ancestor rendered outside the
 	// Menu.Dropdown, as a portal Modal) so opening the popup is not unmounted when
@@ -442,6 +456,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 							{tasks.supported && tasks.buttonEnabled && (
 								<BackgroundTasksStatusButton
 									runningCount={tasks.runningCount}
+									workCount={tasks.workCount}
+									serviceCount={tasks.serviceCount}
 									onOpen={tasks.onOpenPanel}
 								/>
 							)}
@@ -573,13 +589,13 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 														{quota.detailsText}
 													</Text>
 												)}
-												{quota.shouldShowNugRechargeInQuotaDetails && (
+												{recharge.showInDetails && (
 													<Button
 														size="compact-xs"
 														variant="light"
 														onClick={() => {
 															setQuotaDetailsOpened(false);
-															quota.onOpenNugRecharge();
+															recharge.onOpen();
 														}}
 													>
 														{t("recharge.open")}
@@ -598,8 +614,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 										style={{ flexShrink: 0, maxWidth: 120 }}
 									/>
 								))}
-							{quota.shouldShowNugRechargeButton && (
-								<Button size="compact-xs" variant="subtle" onClick={quota.onOpenNugRecharge}>
+							{recharge.showButton && (
+								<Button size="compact-xs" variant="subtle" onClick={recharge.onOpen}>
 									{t("recharge.open")}
 								</Button>
 							)}

@@ -35,6 +35,8 @@ export interface RuntimeHistoryOptions {
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
+	/** Provenance reported by the actual provider builder, never inferred from DB row presence. */
+	replayedInjectionMessageIds: readonly string[];
 	/** Original rows for audit/context consumers; never mutated by provider projection. */
 	sourceMessages: readonly RuntimeHistoryMessage[];
 	/** Detached rows that entered this particular provider build and receipt candidate registration. */
@@ -221,6 +223,7 @@ export async function buildRuntimeHistory(
 			: recoveredTrailingUserText;
 	return {
 		...built,
+		replayedInjectionMessageIds: built.replayedInjectionMessageIds ?? [],
 		sourceMessages,
 		modelMessages,
 		currentInputText: input,

@@ -65,7 +65,7 @@ mock.module("./composer/NarratorComposerRow", () => ({
 	NarratorComposerRow: () => <div data-region="composer" />,
 }));
 mock.module("./permission/PermissionRuleResultNotice", () => ({
-	PermissionRuleResultNotice: () => null,
+	PermissionRulePolicySync: () => null,
 }));
 const { NarratorInteractionArea } = await import("./NarratorInteractionArea");
 

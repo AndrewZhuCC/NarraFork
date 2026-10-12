@@ -2422,6 +2422,7 @@ export const PretextExactMessageList = memo(
 					thinkingChars,
 					outputChars,
 					retryCount,
+					contextWindowSource,
 				}) => {
 					if (!messageId) return;
 					const segment = !!isSegment;
@@ -2430,6 +2431,7 @@ export const PretextExactMessageList = memo(
 						thinkingChars,
 						outputChars,
 						retryCount,
+						...(contextWindowSource ? { contextWindowSource } : {}),
 					});
 					compactProgressKeysRef.current.set(messageId, segment);
 				},

@@ -233,5 +233,47 @@ export function contextBlockViews(blocks: readonly unknown[]): ContextBlockView[
 	return views;
 }
 
+/**
+ * Identify persisted user/sys input rows actually emitted by a history builder.
+ * Includes legacy/plain-text input, not just native cards: buffered inputs can be
+ * ordinary user rows. Pass retained rows AFTER extracting the current-input tail,
+ * and the actual text parts when the provider emits only a subset of a row.
+ * De-duplication uses message identity, never similarity of reminder text.
+ */
+export function historyInputMessageIds(
+	messages: readonly {
+		id: string;
+		role: string;
+		contentJson: unknown;
+		contentText?: string | null;
+	}[],
+	emittedTexts?: readonly string[],
+): string[] {
+	return messages
+		.filter((message) => {
+			if (message.role !== "user" && message.role !== "sys") return false;
+			const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+			const projections = blocks.flatMap((block) => {
+				const text = isTextBlock(block)
+					? block.text
+					: isNativeModelContextBlock(block)
+						? block.modelText
+						: "";
+				return text.trim() ? [text] : [];
+			});
+			const expected = projections.length
+				? projections
+				: message.contentText?.trim()
+					? [message.contentText]
+					: [];
+			return (
+				expected.length > 0 &&
+				(!emittedTexts ||
+					expected.every((part) => emittedTexts.some((text) => text.includes(part))))
+			);
+		})
+		.map((message) => message.id);
+}
+
 /** Alias emphasizing that this is a coercion of untrusted persisted JSON. */
 export const coerceNativeInjectionBlock = normalizeNativeInjectionBlock;
