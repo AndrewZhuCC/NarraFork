@@ -48,7 +48,6 @@ import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
-import { TruncatedPath } from "../../common/TruncatedPath";
 import { addCommentDraft } from "../comment-draft-store";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import type { DiffLine } from "../diff/DiffView";
@@ -109,8 +108,6 @@ export interface FileEditorContentProps {
 	commentNarratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
-	/** Display label only; filePath remains the absolute file identity. */
-	displayPath?: string;
 	selection?: FileSelection;
 	navigationRequestId?: string;
 	onFileReferenceSelectionChange?: (
@@ -152,7 +149,6 @@ function FileEditorDocument({
 	commentNarratorId,
 	deviceId = "local",
 	referenceOrigin = false,
-	displayPath,
 	selection,
 	navigationRequestId,
 	onFileReferenceSelectionChange,
@@ -801,19 +797,15 @@ function FileEditorDocument({
 					wrap="nowrap"
 					style={{ minWidth: 0, flex: 1, flexBasis: isMobileViewport ? "100%" : undefined }}
 				>
-					{referenceOrigin ? (
-						<TruncatedPath path={displayPath ?? filePath} />
-					) : (
-						<Text
-							size="xs"
-							c="dimmed"
-							truncate="end"
-							title={filePath}
-							style={{ minWidth: 0, flex: 1 }}
-						>
-							{filePath}
-						</Text>
-					)}
+					<Text
+						size="xs"
+						c="dimmed"
+						truncate="end"
+						title={filePath}
+						style={{ minWidth: 0, flex: 1 }}
+					>
+						{filePath}
+					</Text>
 					{readOnly && (
 						<Badge size="xs" color="gray">
 							{t("fileEditor.readOnly")}

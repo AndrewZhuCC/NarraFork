@@ -96,7 +96,6 @@ import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
 	calculateEffectiveTurnElapsedMs,
-	filePathRelativeToWorkspace,
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
@@ -198,6 +197,7 @@ import {
 	RevertActionConfirmModal,
 	SetGlobalModelModal,
 } from "./panels/memoized-dialogs";
+import { filePanelBaseName } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -1889,17 +1889,8 @@ function NarratorPanelBody({
 	} = useInternalFileViewer({
 		narratorId,
 		isWorkspacePreview,
-		workspaceContext: fileReferenceContext,
 		t,
 	});
-	const internalViewerDisplayPath =
-		internalFileViewerPath && internalFileViewerTarget
-			? filePathRelativeToWorkspace(
-					internalFileViewerPath,
-					internalFileViewerTarget.deviceId,
-					fileReferenceContext,
-				)
-			: undefined;
 	useMobileDrawerHistory(
 		!!internalFileViewerPath,
 		() => setInternalFileViewerPath(null),
@@ -3618,18 +3609,8 @@ function NarratorPanelBody({
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
-							// The title adds the workspace-relative path for references; files
-							// outside that workspace retain their full path.
-							//
-							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
-							// so a deep path keeps the filename — the part that identifies the file —
-							// visible instead of clipping it and leaving only directories.
-							title={
-								<TruncatedPath
-									path={internalViewerDisplayPath ?? internalFileViewerPath}
-									fw={600}
-								/>
-							}
+							// The shared toolbar displays the full path; the host title names the file.
+							title={<TruncatedPath path={filePanelBaseName(internalFileViewerPath)} fw={600} />}
 							closeButtonProps={{ size: "sm" }}
 							styles={{
 								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -3666,7 +3647,6 @@ function NarratorPanelBody({
 									onDirtyChange={onFileEditorDirtyChange}
 									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
 									commentNarratorId={narratorId}
-									displayPath={internalViewerDisplayPath}
 								/>
 							</Suspense>
 						</Drawer>

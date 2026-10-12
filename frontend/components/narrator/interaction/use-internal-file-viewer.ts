@@ -1,6 +1,6 @@
 import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { notifications } from "@mantine/notifications";
-import type { FileReferenceContext, FileTarget } from "@shared/file-reference";
+import type { FileTarget } from "@shared/file-reference";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFilePanelNavigation } from "../file-panel/file-panel-navigation";
 import { nextHighlightRequestId } from "../panels/panel-kind";
@@ -8,7 +8,6 @@ import { nextHighlightRequestId } from "../panels/panel-kind";
 export interface UseInternalFileViewerOptions {
 	narratorId: string;
 	isWorkspacePreview: boolean;
-	workspaceContext: FileReferenceContext | null;
 	t: (key: string) => string;
 }
 
@@ -43,7 +42,7 @@ export interface UseInternalFileViewerResult {
 export function useInternalFileViewer(
 	options: UseInternalFileViewerOptions,
 ): UseInternalFileViewerResult {
-	const { narratorId, isWorkspacePreview, workspaceContext, t } = options;
+	const { narratorId, isWorkspacePreview, t } = options;
 
 	const [internalFileViewerPath, setViewerPath] = useState<string | null>(null);
 	const currentFileRef = useRef<{ path: string; deviceId: string } | null>(null);
@@ -124,8 +123,6 @@ export function useInternalFileViewer(
 					dockOpenFilePanel(resolved.path, undefined, {
 						fileNarratorId: narratorId,
 						deviceId: resolved.deviceId,
-						workspaceCwd:
-							workspaceContext?.deviceId === resolved.deviceId ? workspaceContext.cwd : undefined,
 						selection: resolved.selection,
 						highlightRequestId,
 						referenceOrigin: true,
@@ -145,7 +142,7 @@ export function useInternalFileViewer(
 					});
 			}
 		},
-		[narratorId, dockOpenFilePanel, useInternalViewer, workspaceContext, canReplaceFile, t],
+		[narratorId, dockOpenFilePanel, useInternalViewer, canReplaceFile, t],
 	);
 
 	const canOpenReferencedFile = !isWorkspacePreview && (!!dockOpenFilePanel || useInternalViewer);

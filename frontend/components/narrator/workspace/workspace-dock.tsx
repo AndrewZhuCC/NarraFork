@@ -987,7 +987,6 @@ export class WorkspaceDockStore {
 			hostNarratorId,
 			filePath,
 			deviceId,
-			...(options.workspaceCwd ? { workspaceCwd: options.workspaceCwd } : {}),
 			fileNarratorId,
 			toolEdit: options.toolEdit,
 			selection: options.selection,

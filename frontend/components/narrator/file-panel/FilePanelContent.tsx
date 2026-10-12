@@ -17,7 +17,6 @@ export interface FilePanelContentProps {
 	narratorId?: string;
 	commentNarratorId?: string;
 	deviceId?: string;
-	displayPath?: string;
 	referenceOrigin?: boolean;
 	selection?: FileSelection;
 	navigationRequestId?: string;
@@ -35,7 +34,6 @@ export function FilePanelContent({
 	narratorId,
 	commentNarratorId,
 	deviceId,
-	displayPath,
 	referenceOrigin,
 	selection,
 	navigationRequestId,
@@ -72,7 +70,6 @@ export function FilePanelContent({
 						narratorId={narratorId}
 						commentNarratorId={commentNarratorId}
 						deviceId={deviceId}
-						displayPath={displayPath}
 						referenceOrigin={referenceOrigin}
 						selection={selection}
 						navigationRequestId={navigationRequestId}
@@ -87,7 +84,6 @@ export function FilePanelContent({
 					narratorId={narratorId}
 					commentNarratorId={commentNarratorId}
 					deviceId={deviceId}
-					displayPath={displayPath}
 					referenceOrigin={referenceOrigin}
 					selection={selection}
 					highlightRequestId={navigationRequestId}

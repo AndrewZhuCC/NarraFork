@@ -39,12 +39,12 @@ describe("internal file viewer drawer header", () => {
 		expect(DRAWER).toContain('title: { minWidth: 0, flex: 1, overflow: "hidden" }');
 	});
 
-	it("keeps reference display paths without changing the shared panel's file identity", () => {
+	it("uses the filename as title while preserving the full file identity", () => {
 		expect(DRAWER).toContain("<TruncatedPath");
-		expect(DRAWER).toContain("path={internalViewerDisplayPath ?? internalFileViewerPath}");
+		expect(DRAWER).toContain("path={filePanelBaseName(internalFileViewerPath)}");
 		expect(DRAWER).toContain("<FilePanelContent");
 		expect(DRAWER).toContain("filePath={internalFileViewerPath}");
-		expect(DRAWER).toContain("displayPath={internalViewerDisplayPath}");
+		expect(DRAWER).not.toContain("displayPath=");
 	});
 
 	it("no longer right-truncates the raw path in a plain Text", () => {

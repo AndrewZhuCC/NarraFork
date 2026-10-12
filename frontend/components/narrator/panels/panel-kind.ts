@@ -134,8 +134,6 @@ export interface FileOpenOptions {
 	/** Transient placement hint: keep the originating file browser visible. */
 	sourcePanelId?: string;
 	deviceId?: string;
-	/** Display-only workspace root for this device; never used as file authority. */
-	workspaceCwd?: string;
 	/** Historical edit identity; never replace this resource with the current disk file. */
 	toolEdit?: ToolEditReference;
 	/** Sticky read boundary: references cannot fall back to legacy filesystem routes. */

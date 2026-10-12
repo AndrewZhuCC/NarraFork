@@ -28,7 +28,6 @@ function Probe({ preview = false }: { preview?: boolean }) {
 	viewer = useInternalFileViewer({
 		narratorId: "source-narrator",
 		isWorkspacePreview: preview,
-		workspaceContext: { deviceId: "local", cwd: "/work" },
 		t,
 	});
 	return <output>{viewer.internalFileViewerPath}</output>;
@@ -176,7 +175,6 @@ test("dock navigation retains source authority and remains independent of drawer
 	expect(open).toHaveBeenCalledWith(local.path, undefined, {
 		fileNarratorId: "source-narrator",
 		deviceId: "local",
-		workspaceCwd: "/work",
 		selection,
 		highlightRequestId: expect.any(String),
 		referenceOrigin: true,
@@ -184,7 +182,6 @@ test("dock navigation retains source authority and remains independent of drawer
 	await openReference({ deviceId: "remote", path: "/other/b.txt" });
 	expect(open.mock.calls.at(-1)?.[2]).toMatchObject({
 		deviceId: "remote",
-		workspaceCwd: undefined,
 	});
 	expect(viewer.internalFileViewerPath).toBeNull();
 	expect(notify).not.toHaveBeenCalled();

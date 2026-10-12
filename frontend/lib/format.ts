@@ -1,5 +1,3 @@
-import type { FileReferenceContext } from "@shared/file-reference";
-import { resolveLocalFilePath } from "@shared/markdown-file-path";
 import { type DateInput, formatLocaleDateTime, resolveIntlLocale } from "./intl-format";
 
 const FULL_DATE_TIME_OPTIONS: Readonly<Intl.DateTimeFormatOptions> = Object.freeze({
@@ -100,22 +98,6 @@ export function toRelativePath(filePath: string, basePath: string | null | undef
 		? filePath.toLowerCase().startsWith(base.toLowerCase())
 		: filePath.startsWith(base);
 	return withinBase ? filePath.slice(base.length) : filePath;
-}
-
-/** Display-only: never replace the absolute target used for reading or writing files. */
-export function filePathRelativeToWorkspace(
-	filePath: string,
-	deviceId: string,
-	context: FileReferenceContext | null | undefined,
-): string {
-	if (!context || context.deviceId !== deviceId) return filePath;
-	const windows = /^[A-Za-z]:[\\/]/.test(context.cwd);
-	const cwd = context.cwd.replace(windows ? /[\\/]+$/ : /\/+$/, "");
-	const root = cwd === "" ? "/" : /^[A-Za-z]:$/.test(cwd) ? `${cwd}/` : resolveLocalFilePath(cwd);
-	const target = resolveLocalFilePath(filePath);
-	if (!root || !target) return filePath;
-	const relative = toRelativePath(target, root);
-	return relative === target ? filePath : relative;
 }
 
 /**

@@ -40,7 +40,6 @@ import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
-import { filePathRelativeToWorkspace } from "../../../lib/format";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import {
@@ -939,7 +938,6 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 		filePath,
 		fileName,
 		deviceId = "local",
-		workspaceCwd,
 		selection,
 		highlightRequestId,
 		referenceOrigin,
@@ -953,23 +951,13 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 			openFilePanel?.(target.path, undefined, {
 				...target,
 				fileNarratorId,
-				workspaceCwd: target.deviceId === deviceId ? workspaceCwd : undefined,
 				referenceOrigin: true,
 			}),
-		[openFilePanel, fileNarratorId, deviceId, workspaceCwd],
+		[openFilePanel, fileNarratorId],
 	);
 	// Selections still belong to the receiving chat, not the file-operation session.
 	const publishSelection = useFilePanelSelectionPublisher();
-	const referenceDisplayPath = referenceOrigin
-		? filePathRelativeToWorkspace(
-				filePath,
-				deviceId,
-				workspaceCwd ? { deviceId, cwd: workspaceCwd } : null,
-			)
-		: undefined;
-	const title =
-		(referenceOrigin ? referenceDisplayPath : fileName?.trim() || filePanelBaseName(filePath)) ||
-		t("fileViewer.title");
+	const title = fileName?.trim() || filePanelBaseName(filePath) || t("fileViewer.title");
 	const [editorDirty, setEditorDirty] = useState(false);
 	const dirtyRef = useRef(false);
 	const onDirtyChange = useCallback((dirty: boolean) => {
@@ -1061,7 +1049,6 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							commentNarratorId={hostNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
-							displayPath={referenceDisplayPath}
 							selection={selection}
 							navigationRequestId={highlightRequestId}
 							onDirtyChange={onDirtyChange}

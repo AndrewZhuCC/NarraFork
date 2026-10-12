@@ -135,7 +135,6 @@ test("text routes through the real gate and forwards source scope and editor cal
 	await render({
 		deviceId: "remote",
 		referenceOrigin: true,
-		displayPath: "docs/file.txt",
 		commentNarratorId: "host",
 		selection,
 		navigationRequestId: "nav1",
@@ -149,7 +148,6 @@ test("text routes through the real gate and forwards source scope and editor cal
 		narratorId: "source",
 		deviceId: "remote",
 		referenceOrigin: true,
-		displayPath: "docs/file.txt",
 		commentNarratorId: "host",
 		selection,
 		navigationRequestId: "nav1",
@@ -174,7 +172,6 @@ for (const filePath of ["/image.PNG", "/document.pdf"]) {
 			narratorId: "origin",
 			deviceId: "remote",
 			referenceOrigin: true,
-			displayPath: "assets/file",
 			commentNarratorId: "host",
 			selection,
 			navigationRequestId: "nav2",
@@ -189,7 +186,6 @@ for (const filePath of ["/image.PNG", "/document.pdf"]) {
 			narratorId: "origin",
 			deviceId: "remote",
 			referenceOrigin: true,
-			displayPath: "assets/file",
 			commentNarratorId: "host",
 			selection,
 			highlightRequestId: "nav2",
@@ -214,12 +210,10 @@ test("navigation and reference-origin upgrades preserve editor identity; source 
 	await render({
 		referenceOrigin: true,
 		navigationRequestId: "third",
-		displayPath: "relative/file.txt",
 		commentNarratorId: "receiving-chat",
 	});
 	expect(editorMounts).toBe(1);
 	expect(editorProps?.narratorId).toBe("source");
-	expect(editorProps?.displayPath).toBe("relative/file.txt");
 	expect(editorProps?.commentNarratorId).toBe("receiving-chat");
 	await render({ narratorId: "other" });
 	expect(editorMounts).toBe(2);
