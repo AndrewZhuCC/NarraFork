@@ -288,8 +288,12 @@ describe("file tab context menu", () => {
 	it("opens the containing directory, closes the menu and retains close actions", async () => {
 		revealSpy = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
 		await mountTab();
-		// openInWindow + reveal + the four close actions.
-		expect(document.querySelectorAll("[role=menuitem]").length).toBe(6);
+		// openInWindow + reveal + the five close actions.
+		const items = Array.from(document.querySelectorAll("[role=menuitem]"));
+		expect(items).toHaveLength(7);
+		expect(items.some((item) => item.textContent?.trim() === commonLocale.dockTabs.others)).toBe(
+			true,
+		);
 		expect(revealItem()).toBeDefined();
 		await act(async () => {
 			revealItem()?.dispatchEvent(new Event("click", { bubbles: true }));
@@ -351,15 +355,15 @@ describe("file tab context menu", () => {
 
 	it.each([
 		// reveal hidden; the file/chat panel still opens in a window (+1 item)…
-		{ options: { hostname: "example.com" }, items: 5 },
-		{ options: { platform: "unknown" }, items: 5 },
+		{ options: { hostname: "example.com" }, items: 6 },
+		{ options: { platform: "unknown" }, items: 6 },
 		{
 			options: { params: { panelType: "file", filePath: "C:/file.ts", deviceId: "remote" } },
-			items: 5,
+			items: 6,
 		},
 		// …except a panel whose params carry no identity (chat without narratorId).
-		{ options: { params: { panelType: "chat" } }, items: 4 },
-		{ options: { params: { panelType: "file", filePath: "spec://tasks.json" } }, items: 5 },
+		{ options: { params: { panelType: "chat" } }, items: 5 },
+		{ options: { params: { panelType: "file", filePath: "spec://tasks.json" } }, items: 6 },
 	])("hides the action when unavailable: %j", async ({ options, items }) => {
 		revealSpy = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
 		await mountTab(options);

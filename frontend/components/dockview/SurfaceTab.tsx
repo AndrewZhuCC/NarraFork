@@ -16,7 +16,7 @@ import {
 } from "../window/panel-window";
 import { closeSurfaceTabs, getTabCloseTargets, type TabCloseAction } from "./tab-close";
 
-const actions: TabCloseAction[] = ["all", "left", "right", "auxiliary"];
+const actions: TabCloseAction[] = ["all", "others", "left", "right", "auxiliary"];
 const wrappers = new WeakMap<
 	FunctionComponent<IDockviewPanelHeaderProps>,
 	FunctionComponent<IDockviewPanelHeaderProps>

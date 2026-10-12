@@ -61,6 +61,16 @@ describe("surface tab closing", () => {
 		expect(closed).toEqual(["a", "current", "s1", "b", "s2"]);
 		expect(ids(api.panels)).toEqual(["chat", "n1", "n2"]);
 	});
+	for (const panelId of ["current", "s1"]) {
+		it(`close others retains the clicked ${panelId} tab and protected narrators across groups`, () => {
+			const { api, closed } = fixture();
+			Object.defineProperty(api, "activePanel", { value: api.getPanel("a") });
+			closeSurfaceTabs(api, panelId, "others");
+			expect(closed).toEqual(["a", "current", "s1", "b", "s2"].filter((id) => id !== panelId));
+			expect(ids(api.panels).sort()).toEqual(["chat", panelId, "n1", "n2"].sort());
+			expect(getTabCloseTargets(api, panelId, "others")).toEqual([]);
+		});
+	}
 	it("close auxiliary retains subagents too, even when invoked from protected chat", () => {
 		const { api, closed } = fixture();
 		closeSurfaceTabs(api, "chat", "auxiliary");

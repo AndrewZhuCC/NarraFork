@@ -29,6 +29,7 @@
 		"revealFailed": "无法打开资源管理器",
 		"openInWindow": "在外部窗口打开",
 		"all": "关闭全部（保留主叙述者）",
+		"others": "关闭其他",
 		"left": "关闭左侧",
 		"right": "关闭右侧",
 		"auxiliary": "关闭辅助（保留所有叙述者）"

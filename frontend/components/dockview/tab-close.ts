@@ -1,6 +1,6 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
 
-export type TabCloseAction = "all" | "left" | "right" | "auxiliary";
+export type TabCloseAction = "all" | "others" | "left" | "right" | "auxiliary";
 
 /** Workspace has no unique protagonist: conservatively retain every narrator member. */
 export function getTabCloseTargets(
@@ -23,6 +23,7 @@ export function getTabCloseTargets(
 					: siblings.slice(index + 1)
 				: api.panels;
 	return candidates.filter((panel) => {
+		if (action === "others" && panel.id === panelId) return false;
 		const component = panel.api.component;
 		// Chat is deliberately close-less, including via directional commands.
 		if (component === "chat") return false;
