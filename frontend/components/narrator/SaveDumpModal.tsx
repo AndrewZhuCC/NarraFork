@@ -16,6 +16,7 @@ import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-q
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, isAbortError } from "../../lib/api";
+import { copyTextToClipboard } from "../../lib/clipboard";
 import { saveBlobAsFile } from "../../lib/file-download";
 
 export interface SaveDumpModalProps {
@@ -204,7 +205,7 @@ export function SaveDumpModal({
 	};
 	const copy = async (recording: SavedRecording) => {
 		try {
-			await navigator.clipboard.writeText(
+			await copyTextToClipboard(
 				[
 					`saveId: ${recording.id}`,
 					`narratorId: ${recording.narratorId}`,
