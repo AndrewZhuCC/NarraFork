@@ -117,7 +117,6 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
@@ -1619,9 +1618,6 @@ dissolveOrphanWorkspaces()
 	.catch((err) => {
 		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
 	});
-
-// Register project DB backup sync (event-driven dual-write)
-registerProjectDbSync();
 
 // Register review event handler (inject feedback into source narrator on conclude)
 initReviewEventHandler();

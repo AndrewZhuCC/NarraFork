@@ -145,7 +145,7 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
@@ -1136,27 +1136,35 @@ async function createNarrator(
 		projectGitPath = project?.gitPath ?? null;
 		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
 		narratorProjectId = ch.projectId;
-		if (ch.worktreePath) {
-			// A saved narrator cwd is an explicit user override (for example, after
-			// recovering from a missing workdir). Keep the chapter worktree as the
-			// default only when no override has been chosen.
-			narratorCwd = resolveNarratorSessionCwd(
-				narrator.cwd,
-				ch.worktreePath,
-				projectGitPath,
-				getHome(),
+		const executionDeviceId =
+			initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? "local";
+		const committedLocalCwd =
+			narrator.workspaceContext?.revision === narrator.workspaceRevision &&
+			narrator.workspaceContext.deviceId === "local"
+				? narrator.workspaceContext.cwd
+				: null;
+		const chapterCwd = resolveLegacyNarratorCwd(
+			committedLocalCwd ?? narrator.cwd,
+			ch.worktreePath,
+			projectGitPath,
+			ch.isRoot === 1,
+		);
+		if (!chapterCwd && executionDeviceId === "local") {
+			throw new AppError(
+				"This legacy workspace has no directory. Choose a working directory to continue.",
+				409,
+				"WORKSPACE_DIRECTORY_REQUIRED",
 			);
+		}
+		// Remote tools use their executor/committed workspace cwd. This host cwd is
+		// only the pre-existing prompt/skill context, not a fallback execution target.
+		narratorCwd =
+			chapterCwd ?? resolveNarratorSessionCwd(narrator.cwd, null, projectGitPath, getHome());
+		if (ch.worktreePath) {
 			narratorChapterId = ch.id;
 			narratorChapterRole = ch.role;
 			narratorWorktreePath = ch.worktreePath;
 			narratorBaseBranch = ch.baseBranch;
-		} else {
-			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project?.gitPath, getHome());
-			logger.info("Chapter dormant, using fallback CWD", {
-				chapterId: narrator.chapterId,
-				narratorCwd,
-			});
 		}
 	} else if (narrator.contextProjectId) {
 		const project = await db.query.projects.findFirst({

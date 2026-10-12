@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects, userPreferences } from "../db/schema";
+import { narrators, projects, userPreferences } from "../db/schema";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
@@ -158,21 +158,16 @@ async function getUserCommands(userId: string): Promise<Command[]> {
 
 /** Load project-level commands from project.chapterSettings. */
 async function getProjectCommandsForNarrator(narratorId: string): Promise<Command[]> {
-	// narrator → chapter → project
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
+		columns: { chapterId: true, contextProjectId: true },
 	});
-	if (!narrator?.chapterId) return [];
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true },
-	});
-	if (!chapter) return [];
+	if (!narrator) return [];
+	const projectId = await resolveNarratorProjectId(narrator);
+	if (!projectId) return [];
 
 	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
+		where: eq(projects.id, projectId),
 		columns: { chapterSettings: true },
 	});
 	if (!project?.chapterSettings) return [];

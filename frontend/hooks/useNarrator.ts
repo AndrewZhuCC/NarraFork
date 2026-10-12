@@ -795,6 +795,7 @@ export function useCreateNarrator() {
 	return useMutation({
 		mutationFn: (data: {
 			chapterId?: string | null;
+			contextProjectId?: string;
 			type?: string;
 			model?: string;
 			systemPrompt?: string;

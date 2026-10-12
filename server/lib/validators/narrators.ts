@@ -57,6 +57,7 @@ export const narratorHandleSchema = z
 
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
+	contextProjectId: z.string().min(1).max(128).nullish(),
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
