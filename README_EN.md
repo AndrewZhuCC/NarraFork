@@ -174,11 +174,11 @@ Issues with bug reports, reproduction steps, and user feedback are welcome, as a
 - When fixing a bug, provide reproduction steps and relevant tests whenever possible.
 - When changing UI text, update both the English and Simplified Chinese translations.
 - Remove API keys, access tokens, and other sensitive information before submitting logs, screenshots, or reproduction materials.
-- Before a contribution can be merged, complete private signing, identity verification, and Maintainer acceptance under the [Contributor License Agreement (CLA), English reference](CLA.md#english-reference). Please read the full agreement first; the Chinese text is the basis for interpretation if the texts differ.
+- Contributions must be covered by a signed [Contributor License Agreement (CLA)](CLA.md#english-reference) before merging. The CLA authorizes future relicensing under permissive open-source licenses; the Chinese text prevails if the versions differ.
 
-**The CLA signing channel is pending configuration and is not yet open.** Once open, the process is: submit a PR → request signing through the published dedicated email → the Maintainer privately discloses the grant recipient's identity and fixed agreement version → sign privately (expressly including the current PR on first signing) → the Maintainer confirms acceptance and posts a verification result without identity information in the PR. For now, You may request a signing channel in a PR without attaching personal identity materials; contributions should not be merged before verification and acceptance confirmation.
+Signing uses CLA Assistant and your GitHub account by default; no legal name is required. The flow is: open a PR → follow the bot prompt → sign in and accept → the PR's CLA status updates. While the agreement version is unchanged, later contributions rely on your existing signature. Corporate authorization, third-party materials, and historical contributions follow the agreement.
 
-Do not post legal names, signatures, email bodies, or employer authorization documents in public Issues, PRs, Gists, or the repository. Automated signing status does not replace manual Maintainer confirmation. This notice does not mean CLA Assistant or mandatory merge checks have been enabled.
+**CLA Assistant is pending configuration.** Signing opens after the agreement is linked and tested; mandatory merge checks are configured separately.
 
 ## Documentation
 
