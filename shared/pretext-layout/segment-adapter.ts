@@ -104,6 +104,7 @@ import {
 	classifyToolDetail,
 	describeToolBody,
 	isTruncated,
+	parseLiveOutputChars,
 	resolveFileDiffStats,
 	type ToolCappedDetail,
 	toolInputFieldRange,
@@ -3881,9 +3882,25 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const metadata = resolveToolMetadata(item.tc);
 	const outputJson = toolOutputValue(withFullOutput(item, ctx), metadata);
 	const resultValue = readLeafText(outputJson) ?? readLeafText(asObject(outputJson)._text);
-	const resultContent = resultValue === undefined ? undefined : subagentResultText(outputJson);
-	const resultText = resultContent || undefined;
 	const isActive = !isTerminalStatus(item.tc.status);
+	// The subagent's live reply length, streamed by the server as a bare numeric
+	// `tool_output` payload (the ContextAsk convention) and bridged onto the
+	// metadata by resolveToolMetadata. Height-neutral: painted as a badge on the
+	// fixed header row, so it is keyed in `subagentRevision` instead of measured.
+	const liveOutputChars = isActive
+		? parseLiveOutputChars(asObject(metadata)?._streamingOutput)
+		: null;
+	// A running card's "output" can BE that bare counter — `toolOutputValue` folds
+	// `_streamingOutput` in when no real output exists. The count rides the header
+	// badge, so it must never become the conclusion body (a lone number reading
+	// as the child's result).
+	const resultIsLiveCount =
+		liveOutputChars != null &&
+		resultValue !== undefined &&
+		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
+	const resultContent =
+		resultValue === undefined || resultIsLiveCount ? undefined : subagentResultText(outputJson);
+	const resultText = resultContent || undefined;
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 	// derivations). prompt/isBackground/agentType live on inputJson.
 	// Send is conversation content and never reaches this subagent constructor.
@@ -3962,6 +3979,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? { modelInheritance: activity.modelInheritance }
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+		...(liveOutputChars != null ? { liveOutputChars } : {}),
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is

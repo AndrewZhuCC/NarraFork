@@ -983,7 +983,7 @@ function classifyByCategory(
 			]);
 		}
 		case "await":
-			return classifyAwait(inputJson, outputJson, metadata);
+			return classifyAwait(inputJson, outputJson, metadata, status);
 		case "send":
 			return classifySend(inputJson, outputJson, metadata, input.labels, status);
 		case "ask":
@@ -2122,11 +2122,24 @@ function classifyAwait(
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	status?: string | null,
 ): ToolDetailData | null {
 	const rawOutput = resolveDisplayText(outputJson);
 	const awaitType = extractField(inputJson, "type") || (metadata?.awaitType as string) || "task";
 	const output = awaitType === "agent" ? stripAwaitAgentEnvelope(rawOutput) : rawOutput;
 	const isBash = awaitType === "bash";
+	// While waiting on an agent, the server forwards the child's live output char
+	// count as a bare numeric `_streamingOutput` (the ContextAsk convention). It
+	// also arrives AS the output body — `toolOutputValue` folds the stream payload
+	// in when no real output exists — so detect exactly that fold and paint the
+	// counter instead of a lone number. A real (terminal) result never matches:
+	// `liveChars` is gated to non-terminal statuses.
+	const liveChars = isTerminalToolStatus(status)
+		? null
+		: parseLiveOutputChars(metadata?._streamingOutput);
+	const streamPayload = readLeafText(metadata?._streamingOutput);
+	const outputIsLiveCount =
+		liveChars != null && streamPayload !== undefined && output === streamPayload;
 	// Badge row + waitFor / subagent lines (the chunked AwaitDetail header).
 	const targetId = extractField(inputJson, "id", "task_id", "taskId");
 	const resolvedId = metadata ? readLeafText(metadata.resolvedId) : undefined;
@@ -2148,13 +2161,19 @@ function classifyAwait(
 	]);
 	return sections([
 		section("meta.await", undefined, header),
-		textSection("output.main", outputJson, isBash ? "output" : "result", {
-			cap: isBash ? "term" : "code",
-			contentLines: countLines(output),
-			text: output,
-			// Non-bash await results are markdown in the chunked card.
-			...(isBash ? {} : { format: "markdown" as const }),
-		}),
+		outputIsLiveCount
+			? section("output.main", "result", {
+					kind: "structured",
+					badgeRows: 0,
+					bodyLines: [`${liveChars} chars`],
+				})
+			: textSection("output.main", outputJson, isBash ? "output" : "result", {
+					cap: isBash ? "term" : "code",
+					contentLines: countLines(output),
+					text: output,
+					// Non-bash await results are markdown in the chunked card.
+					...(isBash ? {} : { format: "markdown" as const }),
+				}),
 	]);
 }
 
@@ -3195,20 +3214,29 @@ function knowledgeEntryHref(entryId: string): string {
 }
 
 /**
- * ContextAsk's tool_output while the summary model is still streaming is a bare
- * cumulative character count (`onProgress` → `emitOutput(String(n))`), not a body.
- * Readers want that as a counter; painting it as markdown would show a lone number.
+ * The `tool_output` live-count convention: a running tool whose streamed
+ * "output" is a bare cumulative character count (ContextAsk's answer so far, a
+ * subagent's reply so far, an awaited child's reply so far) sends plain digits
+ * instead of a body. Readers want that as a counter; painting it as markdown
+ * would show a lone number.
  */
-function contextAskLiveOutputChars(
-	metadata: Record<string, unknown> | null,
-	outputJson: unknown,
-): number | null {
-	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+export function parseLiveOutputChars(value: unknown): number | null {
+	const raw = readLeafText(value);
 	if (raw === undefined) return null;
 	const trimmed = raw.trim();
 	if (!/^\d+$/.test(trimmed)) return null;
 	const n = Number(trimmed);
 	return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function contextAskLiveOutputChars(
+	metadata: Record<string, unknown> | null,
+	outputJson: unknown,
+): number | null {
+	// "First defined source wins", even when it is not numeric (a non-numeric
+	// streaming body must not fall through to the answer text).
+	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+	return parseLiveOutputChars(raw);
 }
 
 /**

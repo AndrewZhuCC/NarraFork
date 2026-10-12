@@ -120,6 +120,8 @@ export interface SubagentLabels {
 	backgroundBadge?: string;
 	/** "Taken over by user" badge label. */
 	takenOverBadge?: string;
+	/** Live output counter badge: `{count}` chars written so far. */
+	liveOutputChars?: string;
 	/** The model follows the parent's live selection, not a concrete snapshot. */
 	followParent?: string;
 	/** Tooltip on a followed-parent badge. */
@@ -175,6 +177,7 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
+	liveOutputChars: "{count} chars",
 	followParent: "Follow parent",
 	followTooltip: "Following the parent model",
 	fallbackReason: "The parent's {parentModel} is not in the {pool} pool",
@@ -249,6 +252,8 @@ interface RenderSubagentProps {
 	 * on — so the badge is what says the session is waiting on a PERSON.
 	 */
 	isTakenOver?: boolean;
+	/** The child's live reply char count — a badge on the fixed header row. */
+	liveOutputChars?: number;
 	/** Extra model badge. */
 	model?: string;
 	/** Follow/fallback decision when `model` is `__parent__`. */
@@ -537,6 +542,7 @@ function SubagentInner({
 	agentType = "agent",
 	isBackground,
 	isTakenOver,
+	liveOutputChars,
 	model,
 	modelInheritance,
 	reasoningEffort,
@@ -609,6 +615,13 @@ function SubagentInner({
 				{reasoningEffort ? (
 					<Badge data-testid="subagent-reasoning-effort" size="xs" variant="light" color="cyan">
 						{reasoningEffort}
+					</Badge>
+				) : null}
+				{/* Live reply counter (grey, same fixed badge row): the child's streamed
+				    output char count, ticking while it works. */}
+				{active && typeof liveOutputChars === "number" ? (
+					<Badge data-testid="subagent-output-chars" size="xs" variant="light" color="gray">
+						{withCount(labels.liveOutputChars, liveOutputChars)}
 					</Badge>
 				) : null}
 				<Box style={{ flex: 1, minWidth: 0 }} />

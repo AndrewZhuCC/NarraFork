@@ -112,6 +112,7 @@ import {
 	type EventHooks,
 	persistDetachedToolResult,
 	processEvent,
+	retireSubagentOutputCharCount,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
 import { deliverInjection } from "../narrator-injection";
@@ -3318,6 +3319,7 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
+			retireSubagentOutputCharCount(narratorId);
 			// Finalization cancels leftover resources, not the completed user turn.
 			// Preserve real cancellation before the internal cleanup abort changes the signal.
 			abortedBeforeCleanup = active.abortController.signal.aborted;

@@ -150,6 +150,7 @@ import {
 	clearStreamingSnapshot,
 	type EventHooks,
 	persistDetachedToolResult,
+	retireSubagentOutputCharCount,
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
 import { deliverInjection } from "./narrator-injection";
@@ -1101,6 +1102,7 @@ async function createNarrator(
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
+		retireSubagentOutputCharCount(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -5252,6 +5254,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
+	retireSubagentOutputCharCount(narratorId);
 	active.abortController.abort();
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();
@@ -7263,6 +7266,7 @@ export function closeNarrator(narratorId: string): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
 	clearStreamingSnapshot(narratorId);
+	retireSubagentOutputCharCount(narratorId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,

@@ -66,6 +66,12 @@ interface RunningAwaitEntry {
 	awaitType: AwaitTargetType;
 	targetId: string;
 	narratorId: string;
+	/**
+	 * Set once an agent wait resolves its target. Drives the live output-count
+	 * forwarding to the waiting card (see narrator-event-handler's
+	 * `noteSubagentOutputText`).
+	 */
+	resolvedSubagentNarratorId?: string;
 	/** Reschedule the timeout to fire `newMs` after the wait started. */
 	reschedule: (newMs: number) => void;
 }
@@ -90,6 +96,25 @@ export function listRunningAwaits(): RunningAwaitSnapshot[] {
 		targetId: entry.targetId,
 		narratorId: entry.narratorId,
 	}));
+}
+
+/**
+ * In-flight `type: "agent"` waits whose resolved target is `subagentNarratorId`.
+ *
+ * The event handler forwards the subagent's live output char count to these
+ * cards too, so a parent waiting on a child sees the same growing counter on
+ * the Await card as on the (long-completed) spawn card.
+ */
+export function listRunningAgentAwaitsForSubagent(
+	subagentNarratorId: string,
+): Array<{ narratorId: string; toolUseId: string }> {
+	const out: Array<{ narratorId: string; toolUseId: string }> = [];
+	for (const [toolUseId, entry] of runningAwaits) {
+		if (entry.awaitType === "agent" && entry.resolvedSubagentNarratorId === subagentNarratorId) {
+			out.push({ narratorId: entry.narratorId, toolUseId });
+		}
+	}
+	return out;
 }
 
 const runningAwaits = hotSafe(
@@ -284,6 +309,10 @@ export const awaitTool: ToolDefinition = {
 					// session" while the child is still working.
 					onTargetResolved: (subagentNarratorId) => {
 						if (!toolUseId) return;
+						// Publish the resolved target onto the registry entry too: the event
+						// handler reads it to forward the child's live output char count.
+						const entry = runningAwaits.get(toolUseId);
+						if (entry) entry.resolvedSubagentNarratorId = subagentNarratorId;
 						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
 					},
 				});
