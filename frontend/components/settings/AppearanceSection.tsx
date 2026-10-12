@@ -7,6 +7,7 @@ import {
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import {
 	pluginThemeKey,
 	usePluginAvailableThemes,
@@ -130,6 +131,9 @@ export function AppearanceSection({
 	setLodAltGesture,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
+	const [bottomSpacingResize, setBottomSpacingResize] = useLocalPref(
+		"narrafork_narrator_bottom_spacing_resize",
+	);
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
 	const [localBlurInMs, setLocalBlurInMs] = useState<number | null>(null);
 	const [localStreamTokenMs, setLocalStreamTokenMs] = useState<number | null>(null);
@@ -195,6 +199,12 @@ export function AppearanceSection({
 						document.exitFullscreen?.().catch(() => {});
 					}
 				}}
+			/>
+			<Switch
+				label={t("bottomSpacingResize")}
+				description={t("bottomSpacingResizeDesc")}
+				checked={bottomSpacingResize}
+				onChange={(e) => setBottomSpacingResize(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("wakeLock")}
