@@ -422,6 +422,8 @@ export function useVListLabels(): VListLabels {
 			// Also an adapter label, and for the same reason: it shares the fix's
 			// conditional button row, so the card's height depends on it existing.
 			testCurrentModel: t("testCurrentModel"),
+			viewErrorRequest: t("errorRequest.view"),
+			downloadErrorDump: t("errorRequest.download"),
 			specViewTasks: t("specGoalViewTasks"),
 			specClearTasks: t("specForkClearTasks"),
 			specResetTasks: t("specForkResetSpec"),

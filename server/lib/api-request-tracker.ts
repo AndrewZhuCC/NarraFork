@@ -22,6 +22,7 @@ import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/er
 import type { ApiRequestDiagnostics } from "./agent/types";
 import { boundedContextSnapshot } from "./context-usage-snapshot";
 import { captureReferencePricingSnapshot, cloneReferencePricingSnapshot } from "./model-pricing";
+import { bindRecordingRequest } from "./request-recorder";
 
 export type ApiRequestKind =
 	| "narrator"
@@ -42,6 +43,8 @@ export type ApiRequestKind =
 	| "internal";
 
 export interface ApiRequestStartOptions {
+	/** Loop attempt id, distinct from the durable api_requests row id. */
+	recordingRequestId?: string;
 	/** Actual initiating user; unknown/system requests remain unattributed. */
 	userId?: string | null;
 	narratorId?: string | null;
@@ -95,7 +98,7 @@ export interface ApiRequestFinishOptions {
 }
 
 export function startApiRequest(options: ApiRequestStartOptions): ApiRequestHandle {
-	return {
+	const handle: ApiRequestHandle = {
 		...options,
 		referencePricingSnapshot:
 			options.referencePricingSnapshot === undefined
@@ -106,6 +109,8 @@ export function startApiRequest(options: ApiRequestStartOptions): ApiRequestHand
 		kind: options.kind ?? "internal",
 		startTime: Date.now(),
 	};
+	if (options.recordingRequestId) bindRecordingRequest(options.recordingRequestId, handle.id);
+	return handle;
 }
 
 function hasErrorMessage(errorMessage: string | null | undefined): boolean {

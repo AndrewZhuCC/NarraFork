@@ -79,6 +79,10 @@ export const testEnvironment = Object.freeze({
 // is evaluated before this module body and would load the real settings first.
 const { getDefaults, settings } = await import("@server/lib/settings");
 
+// Ordinary agent tests must not spawn a real recording worker for every isolated file.
+// Recording tests opt in explicitly; the shipped DEFAULTS remain enabled.
+settings.agent.requestDumpRecordingEnabled = false;
+
 // Capture the isolated live settings at preload time. This is the authoritative
 // state that other modules (e.g. auth.ts) will read from.
 const snapshot = structuredClone(settings);

@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { notifications } from "@mantine/notifications";
-import type { TFunction } from "i18next";
+import type { SavedRecording } from "@shared/request-recording";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { createInstance, type TFunction } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
+import { useNarratorCommands } from "../../../hooks/useCommands";
 import { api, type BufferMessageSummary } from "../../../lib/api";
+import type { CommandItem } from "../composer/CommandPopover";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import {
 	type UseNarratorSendOptions,
@@ -297,6 +302,281 @@ describe("narrator retry without file rollback", () => {
 		} finally {
 			retryFetch.mockRestore();
 		}
+	});
+});
+
+describe("save_dump command discovery", () => {
+	test.each([
+		"en",
+		"zh-CN",
+	])("offers one localized immediate command while preserving public command and skill entries in %s", async (language) => {
+		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		client.setQueryData(["narrator-commands", "n"], {
+			commands: [
+				{ name: "save_dump", prompt: "old implementation", source: "builtin" },
+				{
+					name: "existing",
+					prompt: "existing prompt",
+					source: "project",
+					runBashFirst: true,
+					bashCommand: "git status --short",
+				},
+			],
+			skills: [
+				{ name: "visible", source: "project", description: "Visible skill" },
+				{ name: "blocked", source: "project", description: "Blocked skill", blocked: true },
+			],
+		});
+		const i18n = createInstance();
+		await i18n.init({ lng: language, resources: {} });
+		let commands: CommandItem[] = [];
+		function CommandProbe() {
+			commands = useNarratorCommands("n").data ?? [];
+			return null;
+		}
+		try {
+			await act(async () => {
+				root.render(
+					<I18nextProvider i18n={i18n}>
+						<QueryClientProvider client={client}>
+							<CommandProbe />
+						</QueryClientProvider>
+					</I18nextProvider>,
+				);
+			});
+			const saves = commands.filter((command) => command.name === "save_dump");
+			expect(saves).toHaveLength(1);
+			expect(saves[0]).toMatchObject({
+				name: "save_dump",
+				source: "builtin",
+				prompt: "",
+				type: "command",
+			});
+			expect(saves[0].description).toBe(
+				language === "en"
+					? "Save recent request and response recordings immediately without interrupting the session"
+					: "立即保存近期请求与响应录制，不中断会话",
+			);
+			expect(commands.find((command) => command.name === "existing")).toMatchObject({
+				prompt: "existing prompt",
+				source: "project",
+				runBashFirst: true,
+				bashCommand: "git status --short",
+			});
+			expect(commands.find((command) => command.name === "visible")).toMatchObject({
+				type: "skill",
+			});
+			expect(commands.some((command) => command.name === "blocked")).toBeFalse();
+			for (const name of ["new", "fork", "compact", "load skill blocked", "unload skill visible"])
+				expect(commands.some((command) => command.name === name)).toBeTrue();
+		} finally {
+			await act(async () => root.render(null));
+			client.clear();
+		}
+	});
+});
+
+describe("save_dump immediate control", () => {
+	const recording: SavedRecording = {
+		id: "save-1",
+		narratorId: "n",
+		createdAt: "2026-10-07T00:00:00Z",
+		requestIds: ["req-1"],
+		apiRequestIds: ["upstream-1"],
+		requestCount: 1,
+		bytes: 1234,
+		partial: true,
+		truncated: false,
+	};
+	let save: ReturnType<typeof spyOn<typeof api, "saveRequestRecording">>;
+	beforeEach(() => {
+		save = spyOn(api, "saveRequestRecording").mockResolvedValue(recording);
+	});
+	afterEach(() => save.mockRestore());
+	const modes: Array<"turn" | "tool" | "interrupt"> = ["turn", "tool", "interrupt"];
+	const commands = ["/save_dump", "/SAVE_DUMP", "/SaVe_DuMp"];
+	const commandModes = commands.flatMap((command) => modes.map((mode) => ({ command, mode })));
+	const activeCommandModes = (["working", "compacting"] as const).flatMap((state) =>
+		commandModes.map((entry) => ({ ...entry, state })),
+	);
+	for (const state of ["working", "compacting", "idle"] as const) {
+		test.each(
+			commandModes,
+		)(`${state} $command $mode saves directly and preserves staged attachments`, async ({
+			command,
+			mode,
+		}) => {
+			const image = new File(["image"], "image.png", { type: "image/png" });
+			const textFile = new File(["note"], "note.txt");
+			const onSaved = mock(() => {});
+			await render({
+				isActive: state === "working",
+				showCompactQueueChoice: state === "compacting",
+				attachedImages: [image],
+				attachedTextFiles: [textFile],
+				attachedImagesRef: { current: [image] },
+				attachedTextFilesRef: { current: [textFile] },
+				onRequestRecordingSaved: onSaved,
+			});
+			const composer = options.composerRef.current as NarratorComposerHandle;
+			composer.getText = () => ` ${command} `;
+			composer.getFileReferences = () => [];
+			await act(async () => {
+				await actions.handleSendWithModeRef.current(mode);
+			});
+			expect(save).toHaveBeenCalledTimes(1);
+			expect(save.mock.calls[0]).toEqual(["n", expect.any(AbortSignal)]);
+			expect(send).not.toHaveBeenCalled();
+			expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+			expect(options.setNarratorWorking).not.toHaveBeenCalled();
+			expect(options.reconcileBufferedMessages).not.toHaveBeenCalled();
+			expect(queue.map((message) => message.id)).toEqual(["existing"]);
+			expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+			expect(options.updateAttachedImages).not.toHaveBeenCalled();
+			expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
+			expect(composer.clearTextAndDraft).toHaveBeenCalledTimes(1);
+			expect(composer.noteSent).not.toHaveBeenCalled();
+			expect(onSaved).toHaveBeenCalledWith(recording);
+			expect(options.sendingRef.current).toBe(false);
+		});
+	}
+	test.each(modes)("failure in %s mode leaves draft and attachments untouched", async (mode) => {
+		save.mockRejectedValue(new Error("recording unavailable"));
+		const textFile = new File(["note"], "note.txt");
+		await render({ attachedTextFiles: [textFile], showCompactQueueChoice: true });
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getText = () => "/save_dump";
+		composer.getFileReferences = () => [];
+		await act(async () => {
+			await actions.handleSendWithModeRef.current(mode);
+		});
+		expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
+		expect(composer.hideTextForSend).not.toHaveBeenCalled();
+		expect(composer.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(composer.restoreInput).not.toHaveBeenCalled();
+		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(queue.map((message) => message.id)).toEqual(["existing"]);
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({ message: "recording unavailable", color: "red" }),
+		);
+		expect(options.sendingRef.current).toBe(false);
+	});
+	test.each(
+		commands,
+	)("pending %s suppresses duplicates and leaves newer input untouched", async (command) => {
+		const pending = Promise.withResolvers<SavedRecording>();
+		save.mockReturnValue(pending.promise);
+		await render();
+		let text = command;
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getText = () => text;
+		composer.getFileReferences = () => [];
+		let saving: Promise<void> | void;
+		await act(async () => {
+			saving = actions.handleSendWithModeRef.current("turn");
+			await actions.handleSendWithModeRef.current("interrupt");
+		});
+		expect(save).toHaveBeenCalledTimes(1);
+		expect(actions.sendingState).toEqual({ attachmentCount: 0, progress: null, canCancel: false });
+		expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
+		text = "newer draft";
+		await act(async () => {
+			pending.resolve(recording);
+			await saving;
+		});
+		expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+	});
+	test.each(
+		activeCommandModes,
+	)("$state $command $mode preserves inline references and staged files", async ({
+		command,
+		mode,
+		state,
+	}) => {
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const textFile = new File(["note"], "note.txt");
+		await render({
+			isActive: state === "working",
+			showCompactQueueChoice: state === "compacting",
+			attachedImages: [image],
+			attachedTextFiles: [textFile],
+		});
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getText = () => `${command} #file:a.ts`;
+		composer.getFileReferences = () => [{ ...reference, inputRange: [11, 21] }];
+		await act(async () => actions.handleSendWithModeRef.current(mode));
+		expect(save).toHaveBeenCalledTimes(1);
+		expect(composer.restoreInput).toHaveBeenCalledWith("#file:a.ts", [
+			{ ...reference, inputRange: [0, 10] },
+		]);
+		expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(options.updateAttachedImages).not.toHaveBeenCalled();
+		expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
+		expect(queue.map((message) => message.id)).toEqual(["existing"]);
+	});
+	test.each(
+		commands,
+	)("forwarded %s bypasses queue and never edits the current draft", async (command) => {
+		const onSaved = mock(() => {});
+		await render({ onRequestRecordingSaved: onSaved });
+		await act(async () => actions.forwardTextToNarrator(command));
+		expect(save).toHaveBeenCalledTimes(1);
+		expect(send).not.toHaveBeenCalled();
+		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(options.updateAttachedImages).not.toHaveBeenCalled();
+		expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
+		expect(onSaved).toHaveBeenCalledWith(recording);
+	});
+	for (const state of ["working", "compacting"] as const) {
+		test.each(
+			commandModes,
+		)(`${state} $command $mode rejects arguments without losing attachments`, async ({
+			command,
+			mode,
+		}) => {
+			await render({
+				isActive: state === "working",
+				showCompactQueueChoice: state === "compacting",
+				attachedImages: [new File(["image"], "image.png")],
+				attachedTextFiles: [new File(["note"], "note.txt")],
+			});
+			const composer = options.composerRef.current as NarratorComposerHandle;
+			composer.getText = () => `${command} extra #file:a.ts`;
+			composer.getFileReferences = () => [{ ...reference, inputRange: [17, 27] }];
+			await act(async () => actions.handleSendWithModeRef.current(mode));
+			expect(save).not.toHaveBeenCalled();
+			expect(send).not.toHaveBeenCalled();
+			expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+			expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+			expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
+			expect(composer.restoreInput).not.toHaveBeenCalled();
+			expect(queue.map((message) => message.id)).toEqual(["existing"]);
+			expect(notify).toHaveBeenCalledWith(expect.objectContaining({ message: "saveDump.usage" }));
+		});
+	}
+	test.each(
+		commands,
+	)("forwarded %s rejects arguments without touching the composer", async (command) => {
+		await render();
+		await act(async () => actions.forwardTextToNarrator(`${command} extra`));
+		expect(save).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(queue.map((message) => message.id)).toEqual(["existing"]);
+		expect(notify).toHaveBeenCalledWith(expect.objectContaining({ message: "saveDump.usage" }));
 	});
 });
 

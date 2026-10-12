@@ -2407,13 +2407,30 @@ export async function runAgentLoopUnlocked(
 					"primary",
 				);
 				if (interruptionPlan.action === "stop") {
-					// Retry budget spent. Deliberately falls THROUGH rather than breaking: the
-					// pass produced real partial output, so the rest of the turn-end handling
-					// (title, queued input, idle transition) still applies.
+					// Completion-limit exhaustion still falls through with its real partial
+					// output. A resumable upstream failure must instead retain the last failed
+					// attempt's diagnostics in a durable error card when continuation is spent.
 					logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
 						narratorId,
 						retries: interruptionPlan.retries,
 					});
+					if (interruptionPlan.reason === "resumable_error" && result.interruptionError) {
+						await narratorService.updateStatus(narratorId, "idle", {
+							substatus: ["error"],
+							errorMessage: result.interruptionError,
+							diagnostics: result.interruptionDiagnostics,
+						});
+						active.events.emit("event", {
+							type: "error",
+							data: {
+								message: result.interruptionError,
+								diagnostics: result.interruptionDiagnostics,
+							},
+						});
+						runState.finalText = result.interruptionError;
+						runState.hadError = true;
+						break;
+					}
 				} else if (interruptionPlan.action === "replay") {
 					logger.info(`${continuationLogLabel}: replaying interrupted tool-result turn`, {
 						narratorId,

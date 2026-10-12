@@ -25,6 +25,7 @@ import type {
 	FileReferenceContext,
 	FileReferenceEditorSelection,
 } from "@shared/file-reference";
+import type { SavedRecording } from "@shared/request-recording";
 import {
 	IconArrowDown,
 	IconArrowLeft,
@@ -212,6 +213,10 @@ import { useNarratorPanelWS } from "./useNarratorPanelWS";
 import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
+
+const SaveDumpModal = lazy(() =>
+	import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })),
+);
 
 const NarratorDetailsPanel = lazy(() =>
 	import("./details/NarratorDetailsPanel").then((module) => ({
@@ -2425,6 +2430,17 @@ function NarratorPanelBody({
 	// Kept lifted here: its inputs (composerRef, attachments, scroll, sendingRef)
 	// and the stable send refs it returns are shared with the composer, the queue
 	// actions below, and the dock bridge.
+	const [savedRecording, setSavedRecording] = useState<SavedRecording | null>(null);
+	const [saveDumpOpened, setSaveDumpOpened] = useState(false);
+	// A command actively opens the result; an in-modal save only updates its result.
+	const handleRecordingSaved = useCallback(
+		(recording: SavedRecording) => {
+			setSavedRecording(recording);
+			setSaveDumpOpened(true);
+			void qc.invalidateQueries({ queryKey: ["request-recordings", recording.narratorId] });
+		},
+		[qc],
+	);
 	const {
 		sendingState,
 		isSending,
@@ -2472,6 +2488,7 @@ function NarratorPanelBody({
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
+		onRequestRecordingSaved: handleRecordingSaved,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
@@ -3002,6 +3019,7 @@ function NarratorPanelBody({
 								</div>
 								{!isWorkspacePreview && (
 									<HeaderToolbar
+										onOpenSavedRecordings={() => setSaveDumpOpened(true)}
 										narratorId={narratorId}
 										controller={toolbarController}
 										inlineControls={toolbarInlineControls}
@@ -3064,6 +3082,21 @@ function NarratorPanelBody({
 						</Stack>
 					</Modal>
 
+					{saveDumpOpened && (
+						<Suspense fallback={null}>
+							<SaveDumpModal
+								key={narratorId}
+								narratorId={narratorId}
+								opened={saveDumpOpened}
+								onClose={() => setSaveDumpOpened(false)}
+								saved={savedRecording?.narratorId === narratorId ? savedRecording : null}
+								onSaved={setSavedRecording}
+								onDeleted={(id) =>
+									setSavedRecording((previous) => (previous?.id === id ? null : previous))
+								}
+							/>
+						</Suspense>
+					)}
 					<CompactSummaryModal
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}

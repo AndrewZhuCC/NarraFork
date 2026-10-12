@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, userPreferences } from "../db/schema";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
 import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
@@ -110,6 +111,12 @@ export interface BashCommandResult {
 	rawCommand: string;
 }
 
+export interface SaveDumpCommandResult {
+	resolved: true;
+	saveDump: true;
+	rawCommand: string;
+}
+
 export interface SpecGoalCommandResult {
 	resolved: true;
 	specGoal: true;
@@ -130,6 +137,7 @@ export type ResolveResult =
 	| UnblockSkillResult
 	| UnblockAllSkillsResult
 	| BashCommandResult
+	| SaveDumpCommandResult
 	| SpecGoalCommandResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
@@ -292,6 +300,12 @@ export async function resolveCommand(
 ): Promise<ResolveResult> {
 	const parsed = parseCommandInput(prompt);
 	if (!parsed) return { resolved: false };
+
+	// This local control must never expand into a model prompt, even with invalid arguments.
+	if (parsed.name.toLowerCase() === "save_dump") {
+		if (parsed.input) throw new ValidationError("/save_dump does not accept arguments");
+		return { resolved: true, saveDump: true, rawCommand: prompt };
+	}
 
 	// Handle /load <toolName> — load an optional tool into the session
 	if (parsed.name.toLowerCase() === "load") {

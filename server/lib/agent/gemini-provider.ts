@@ -27,7 +27,7 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { captureResponseStream, responseDumpBudget, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -128,30 +128,6 @@ function assertByteLimit(value: string, limit: number, label: string): void {
 	if (size > limit) {
 		throw new ApiError(413, `Gemini ${label} exceeded hard limit (${size} > ${limit} bytes)`);
 	}
-}
-
-function resolveDumpLimit(configured: number | undefined): number {
-	if (configured == null) return DEFAULT_DUMP_MAX_BYTES;
-	if (configured < 0) return GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES;
-	return Math.min(configured, GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES);
-}
-
-function truncateUtf8ToBytes(
-	text: string,
-	maxBytes: number,
-): { text: string; bytes: number; truncated: boolean } {
-	const fullBytes = byteLength(text);
-	if (fullBytes <= maxBytes) return { text, bytes: fullBytes, truncated: false };
-	let low = 0;
-	let high = text.length;
-	while (low < high) {
-		const mid = Math.ceil((low + high) / 2);
-		if (byteLength(text.slice(0, mid)) <= maxBytes) low = mid;
-		else high = mid - 1;
-	}
-	if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
-	const accepted = text.slice(0, low);
-	return { text: accepted, bytes: byteLength(accepted), truncated: true };
 }
 
 /**
@@ -310,12 +286,6 @@ export class GeminiProvider implements ProviderAdapter {
 			"x-goog-api-key": apiKey,
 		};
 
-		params.requestDump?.setRequest({
-			transport: "http",
-			url,
-			headers: sanitizeHeaders(headers),
-			body,
-		});
 		logger.debug("Gemini chat request", {
 			model,
 			baseUrl,
@@ -328,63 +298,45 @@ export class GeminiProvider implements ProviderAdapter {
 		await reportInputCharacters(params, body);
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		params.requestDump?.beginResponseAttempt(
+			{ transport: "http", method: "POST", url, headers: sanitizeHeaders(headers), bodyText },
+			Math.min(
+				responseDumpBudget(settings.agent?.requestDumpMaxSize),
+				GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES,
+			),
+		);
 		params.onRequestStart?.();
 		const response = await this.pfetch(url, {
 			method: "POST",
 			headers,
 			body: bodyText,
 			signal: params.signal,
+		}).catch((error) => {
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		});
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
-		const dumpLimit = resolveDumpLimit(settings.agent?.requestDumpMaxSize);
-		if (!response.ok) {
-			const errText = await readResponseTextWithLimit(
-				response,
-				GEMINI_GENERATE_MAX_SSE_EVENT_BYTES,
-			).catch(() => "");
-			params.requestDump?.setResponseBodyText(truncateUtf8ToBytes(errText, dumpLimit).text);
-			throw new ApiError(response.status, `Gemini API error ${response.status}: ${errText}`);
-		}
-		if (!response.body) {
-			throw new Error("Gemini API returned no body");
-		}
-
-		let dumpText = "";
-		let dumpedBytes = 0;
-		let dumpTruncated = false;
-		const onRawChunk = params.requestDump
-			? (chunk: string) => {
-					if (dumpTruncated) return;
-					const remaining = dumpLimit - dumpedBytes;
-					if (remaining <= 0) {
-						dumpTruncated = true;
-						return;
-					}
-					const accepted = truncateUtf8ToBytes(chunk, remaining);
-					dumpText += accepted.text;
-					dumpedBytes += accepted.bytes;
-					dumpTruncated = accepted.truncated || dumpedBytes >= dumpLimit;
-					params.requestDump?.setResponseBodyText(dumpText);
-				}
-			: undefined;
+		if (!response.body) throw new Error("Gemini API returned no body");
+		const tap = captureResponseStream(response.body, params.requestDump);
 		try {
-			yield* this.parseSSEStream(response.body, onRawChunk);
+			if (!response.ok) {
+				const errText = await readResponseTextWithLimit(
+					new Response(tap.stream),
+					GEMINI_GENERATE_MAX_SSE_EVENT_BYTES,
+				).catch(() => "");
+				throw new ApiError(response.status, `Gemini API error ${response.status}: ${errText}`);
+			}
+			yield* this.parseSSEStream(tap.stream);
 		} catch (error) {
 			params.requestDump?.setResponseError(error);
 			throw error;
 		} finally {
-			if (params.requestDump && dumpTruncated) {
-				const marker = "\n\n[... response dump truncated]";
-				const prefix = truncateUtf8ToBytes(
-					dumpText,
-					Math.max(0, dumpLimit - byteLength(marker)),
-				).text;
-				params.requestDump.setResponseBodyText(`${prefix}${marker}`);
-			}
+			tap.finish();
 		}
 	}
 

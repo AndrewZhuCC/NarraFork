@@ -12,6 +12,7 @@
  * `response.created` → optional content → `response.completed`.
  */
 import { afterEach, expect, spyOn, test } from "bun:test";
+import type { RecordingFrame, RequestRecording } from "@shared/request-recording";
 import type { ServerWebSocket } from "bun";
 import {
 	CodexWebSocketRetryableError,
@@ -172,6 +173,111 @@ async function runStream(
 	}
 	return events;
 }
+
+function liveRecording(frames: RecordingFrame[]): RequestRecording {
+	return {
+		requestId: "ws-recording",
+		request: () => {},
+		responseMeta: () => {},
+		responseChunk: () => {},
+		frame: (frame) => frames.push(frame),
+		finish: () => {},
+	};
+}
+
+test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incoming message boundaries", async () => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`live-${requestIndex}`, "ok中")) send(frame);
+	});
+	const firstFrames: RecordingFrame[] = [];
+	const first = new ApiRequestDumpCollector(undefined, liveRecording(firstFrames));
+	await runStream(activeServer, { requestDump: first, input: ["hello"] });
+	const upgrade = firstFrames.find((frame) => frame.type === "websocket.upgrade");
+	expect(upgrade?.metadata?.status).toBe(101);
+	const responseMessages = firstFrames.filter(
+		(frame) => frame.direction === "response" && frame.type === "websocket.message",
+	);
+	expect(responseMessages.map((frame) => frame.text)).toEqual(completedFrames("live-0", "ok中"));
+	const secondFrames: RecordingFrame[] = [];
+	await runStream(activeServer, {
+		requestDump: new ApiRequestDumpCollector(undefined, liveRecording(secondFrames)),
+		input: ["hello", "again"],
+	});
+	const reused = secondFrames.find((frame) => frame.type === "websocket.connection");
+	expect(reused?.metadata).toMatchObject({
+		reused: true,
+		connectionId: upgrade?.metadata?.connectionId,
+	});
+	expect(secondFrames.some((frame) => frame.type === "websocket.upgrade")).toBe(false);
+	const outgoing = secondFrames.find(
+		(frame) => frame.direction === "request" && frame.type === "websocket.message",
+	);
+	expect(JSON.parse(String(outgoing?.text))).toEqual(activeServer.requests[1].body);
+	expect(JSON.parse(String(outgoing?.text)).previous_response_id).toBe("live-0");
+	expect(outgoing?.metadata?.boundary).toBe("websocket-message-not-network-frame");
+	expect(activeServer.connectionCount()).toBe(1);
+});
+
+test("WS rejection records actual HTTP status and sanitized headers before fallback", async () => {
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: () =>
+			new Response("denied", {
+				status: 403,
+				headers: { "x-upstream-test": "denial", "set-cookie": "secret-cookie-value" },
+			}),
+	});
+	const frames: RecordingFrame[] = [];
+	try {
+		await expect(
+			runStream(
+				{
+					baseUrl: `http://127.0.0.1:${server.port}`,
+					requests: [],
+					handshakes: [],
+					connectionCount: () => 0,
+					stop: () => {},
+				},
+				{ requestDump: new ApiRequestDumpCollector(undefined, liveRecording(frames)) },
+			),
+		).rejects.toThrow("403");
+		const rejected = frames.find((frame) => frame.type === "websocket.upgrade_rejected");
+		expect(rejected?.metadata?.status).toBe(403);
+		expect(rejected?.metadata?.headers).toMatchObject({ "x-upstream-test": "denial" });
+		expect(JSON.stringify(rejected)).not.toContain("secret-cookie-value");
+	} finally {
+		server.stop(true);
+	}
+});
+
+test("consumer cancellation captures the actual close and leaves no live WS collector", async () => {
+	activeServer = startServer(({ send }) => {
+		send(JSON.stringify({ type: "response.output_text.delta", delta: "partial", output_index: 0 }));
+	});
+	const frames: RecordingFrame[] = [];
+	const dump = new ApiRequestDumpCollector(undefined, liveRecording(frames));
+	const stream = streamCodexResponsesWebSocket({
+		baseUrl: activeServer.baseUrl,
+		apiKey: "sk-test",
+		requestDump: dump,
+		sessionKey: "cancel-live",
+		conversationId: "conv-1",
+		credentialId: "cred-1",
+		model: "gpt-5.3-codex",
+		request: {
+			model: "gpt-5.3-codex",
+			input: [userMessage("hello")] as never,
+			stream: true,
+			instructions: "base",
+		},
+		signal: new AbortController().signal,
+	});
+	expect((await stream.next()).value?.text).toBe("partial");
+	await stream.return(undefined);
+	expect(frames.some((frame) => frame.type === "websocket.close")).toBe(true);
+	expect(dump.snapshot().response?.bodyIncomplete).toBe(true);
+});
 
 test("raw malformed frames and close reasons survive retries without mixing attempts", async () => {
 	activeServer = startServer(({ requestIndex, send, close }) => {

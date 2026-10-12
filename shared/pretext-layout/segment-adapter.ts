@@ -2107,6 +2107,8 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// icon: an icon-only control hides its meaning behind a hover tooltip, which
 	// touch users never see at all.
 	disableImageGen: "Turn off image generation and retry",
+	viewErrorRequest: "View request details",
+	downloadErrorDump: "Download Dump",
 	// The error card's conditional model probe (admin-only, network errors only).
 	// Carried over from the deleted chunked card's icon-only action; a label for the
 	// same reason as above.
@@ -3397,6 +3399,13 @@ function adaptSystemTextData(
 			const offerModelTest = ctx.canOfferModelTest?.(errorText) === true;
 			const buttons: string[] = [];
 			const buttonIds: string[] = [];
+			const diagnostics = asObject(block.diagnostics);
+			const requestId = readNonEmptyString(diagnostics, "recordingRequestId");
+			const hasRequest = requestId != null && /^req_[A-Za-z0-9_-]{1,160}$/.test(requestId);
+			if (hasRequest) {
+				buttons.push(sysLabel(ctx, "viewErrorRequest"), sysLabel(ctx, "downloadErrorDump"));
+				buttonIds.push("viewErrorRequest", "downloadErrorDump");
+			}
 			if (offerFix) {
 				buttons.push(sysLabel(ctx, "disableImageGen"));
 				buttonIds.push("disableImageGen");
@@ -3410,6 +3419,7 @@ function adaptSystemTextData(
 				text: errorText,
 				color: "red",
 				actions: true,
+				...(hasRequest ? { diagnostics } : {}),
 				...(buttons.length > 0 ? { buttons, buttonIds } : {}),
 			};
 		}

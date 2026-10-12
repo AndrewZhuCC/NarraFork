@@ -459,17 +459,64 @@ describe("real shared orchestrator profile contract", () => {
 		});
 
 		test(`${profile.kind}: exhausted stateless provider retry cannot multiply into outer model calls`, async () => {
+			const diagnostics = {
+				schema: "narrafork.error-diagnostics.v1" as const,
+				recordingRequestId: "exhausted-attempt",
+				apiRequestId: "exhausted-row",
+				requestId: "upstream-exhausted",
+			};
 			const h = fixture(profile, [
 				{
 					...finished,
 					completedNaturally: false,
 					retryableError: "fixture exhausted provider retries",
+					retryableDiagnostics: diagnostics,
 				},
 			]);
 			const result = await h.run();
 			expect(result).toMatchObject({ started: true, hasError: true });
 			expect(h.calls).toHaveLength(1);
 			expect(result.lastPass?.retryableError).toBe("fixture exhausted provider retries");
+			const rows = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, h.session.narratorId))
+				.all();
+			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+				{ type: "error", message: "fixture exhausted provider retries", diagnostics },
+			]);
+		});
+
+		test(`${profile.kind}: resumable continuation exhaustion persists the last failure's exact request`, async () => {
+			const attempts = Array.from({ length: 4 }, (_, index) => ({
+				...finished,
+				completedNaturally: false,
+				interrupted: true,
+				interruptedReason: "resumable_error" as const,
+				interruptionError: `upstream failure ${index}`,
+				interruptionDiagnostics: {
+					schema: "narrafork.error-diagnostics.v1" as const,
+					recordingRequestId: `resume-attempt-${index}`,
+					apiRequestId: `resume-row-${index}`,
+					requestId: `upstream-resume-${index}`,
+				},
+			}));
+			const h = fixture(profile, attempts);
+			const result = await h.run();
+			expect(result).toMatchObject({ hasError: true, finalText: "upstream failure 3" });
+			expect(h.calls).toHaveLength(4);
+			const rows = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, h.session.narratorId))
+				.all();
+			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+				{
+					type: "error",
+					message: "upstream failure 3",
+					diagnostics: attempts[3].interruptionDiagnostics,
+				},
+			]);
 		});
 
 		for (const naturallyDone of [true, false]) {

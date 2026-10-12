@@ -26,7 +26,7 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { captureResponseStream, responseDumpBudget, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -175,31 +175,6 @@ function byteLength(text: string): number {
 	return new TextEncoder().encode(text).byteLength;
 }
 
-function resolveDumpLimit(configured: number | undefined): number {
-	if (configured == null) return DEFAULT_DUMP_MAX_BYTES;
-	if (configured < 0) return GEMINI_MAX_REQUEST_DUMP_BYTES;
-	return Math.min(configured, GEMINI_MAX_REQUEST_DUMP_BYTES);
-}
-
-function truncateUtf8ToBytes(
-	text: string,
-	maxBytes: number,
-): { text: string; bytes: number; truncated: boolean } {
-	const fullBytes = byteLength(text);
-	if (fullBytes <= maxBytes) return { text, bytes: fullBytes, truncated: false };
-	let low = 0;
-	let high = text.length;
-	while (low < high) {
-		const mid = Math.ceil((low + high) / 2);
-		if (byteLength(text.slice(0, mid)) <= maxBytes) low = mid;
-		else high = mid - 1;
-	}
-	// Avoid persisting a dangling high surrogate if the byte boundary split a pair.
-	if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
-	const accepted = text.slice(0, low);
-	return { text: accepted, bytes: byteLength(accepted), truncated: true };
-}
-
 function assertByteLimit(value: string, limit: number, label: string): void {
 	const size = byteLength(value);
 	if (size > limit) {
@@ -292,12 +267,19 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 		const url = `${this.baseUrl()}/interactions`;
 		const headers = this.headers(true);
-		params.requestDump?.setRequest({
-			transport: "http",
-			url,
-			headers: sanitizeHeaders(headers),
-			body,
-		});
+		params.requestDump?.beginResponseAttempt(
+			{
+				transport: "http",
+				method: "POST",
+				url,
+				headers: sanitizeHeaders(headers),
+				bodyText,
+			},
+			Math.min(
+				responseDumpBudget(settings.agent?.requestDumpMaxSize),
+				GEMINI_MAX_REQUEST_DUMP_BYTES,
+			),
+		);
 		logger.debug("Gemini Interactions request", {
 			model,
 			baseUrl: this.baseUrl(),
@@ -312,53 +294,32 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			headers,
 			body: bodyText,
 			signal: params.signal,
+		}).catch((error) => {
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		});
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
-		const dumpLimit = resolveDumpLimit(settings.agent?.requestDumpMaxSize);
-		if (!response.ok) {
-			const errorText = await readResponseTextWithLimit(response, GEMINI_MAX_SSE_EVENT_BYTES);
-			params.requestDump?.setResponseBodyText(truncateUtf8ToBytes(errorText, dumpLimit).text);
-			throw interactionHttpError(response.status, errorText);
-		}
 		if (!response.body) throw new Error("Gemini Interactions API returned no body");
-
-		let dumpText = "";
-		let dumpedBytes = 0;
-		let dumpTruncated = false;
-		const onRawChunk = params.requestDump
-			? (chunk: string) => {
-					if (dumpTruncated) return;
-					const remaining = dumpLimit - dumpedBytes;
-					if (remaining <= 0) {
-						dumpTruncated = true;
-						return;
-					}
-					const accepted = truncateUtf8ToBytes(chunk, remaining);
-					dumpText += accepted.text;
-					dumpedBytes += accepted.bytes;
-					if (accepted.truncated) dumpTruncated = true;
-					params.requestDump?.setResponseBodyText(dumpText);
-				}
-			: undefined;
-
+		const tap = captureResponseStream(response.body, params.requestDump);
 		try {
-			yield* this.parseSSEStream(response.body, onRawChunk);
+			if (!response.ok) {
+				const errorText = await readResponseTextWithLimit(
+					new Response(tap.stream),
+					GEMINI_MAX_SSE_EVENT_BYTES,
+				);
+				throw interactionHttpError(response.status, errorText);
+			}
+			yield* this.parseSSEStream(tap.stream);
 		} catch (error) {
 			params.requestDump?.setResponseError(error);
 			throw error;
 		} finally {
-			if (params.requestDump && dumpTruncated) {
-				const marker = "\n\n[... response dump truncated]";
-				const prefix = truncateUtf8ToBytes(
-					dumpText,
-					Math.max(0, dumpLimit - byteLength(marker)),
-				).text;
-				params.requestDump.setResponseBodyText(`${prefix}${marker}`);
-			}
+			tap.finish();
 		}
 	}
 
@@ -620,7 +581,6 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
 	}): Promise<GenerateMetaResult> {
-		const model = parseModelId(options.model).model;
 		const body = this.buildRequestBody({
 			model: options.model,
 			maxOutputTokens: options.maxOutputTokens,

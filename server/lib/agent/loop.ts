@@ -31,6 +31,7 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { createRequestRecording } from "../request-recorder";
 import {
 	consumeSearchExecutionTurn,
 	getSearchExecutionScope,
@@ -72,7 +73,7 @@ import {
 	type PersistedRecoveryGate,
 	recoveryReflection,
 } from "./recovery-gate";
-import { ApiRequestDumpCollector } from "./request-dump";
+import { ApiRequestDumpCollector, RING_DIAGNOSTIC_PREFIX_BYTES } from "./request-dump";
 import { detectShell } from "./shell";
 import {
 	groupToolExecutions,
@@ -1391,8 +1392,9 @@ export async function runReflectionLoop(
 				pendingApiRequests.set(
 					event.requestId,
 					startApiRequest({
+						recordingRequestId: event.requestId,
 						narratorId: parentConfig.narratorId,
-						userId: parentConfig.userId,
+						userId: event.userId ?? null,
 						provider: event.provider,
 						model: event.model,
 						credentialId: event.credentialId,
@@ -3258,6 +3260,10 @@ async function* agentLoopInMetadataSnapshot(
 		let responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
 			isReflection: !!config.reflectionLoop,
 		});
+		// The transport ending is not the final attempt verdict: empty/malformed tool
+		// responses are classified afterwards. Keep the unfinished handle for that verdict,
+		// while this turn's outer finally covers consumer return and unexpected exits.
+		let activeRequestDump: ApiRequestDumpCollector | undefined;
 		try {
 			// Delivery is de-duplicated only within one model turn. If persistence failed,
 			// the still-pending state may be attached again on the next turn.
@@ -3892,6 +3898,7 @@ async function* agentLoopInMetadataSnapshot(
 			let malformedSpillReuseToken: string | undefined;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
+			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
@@ -3988,8 +3995,19 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+				// A failed/no-op settings switch can reach teardown twice for one attempt.
+				// Do not re-emit its end or erase the durable association added by the consumer.
+				if (requestFinished) return;
+				requestFinished = true;
 				streamExecutionOpen = false;
-				if (!requestStarted) return;
+				if (!requestStarted) {
+					requestDump?.finish({
+						error: errorMessage,
+						status: errorMessage ? "error" : "completed",
+					});
+					if (activeRequestDump === requestDump) activeRequestDump = undefined;
+					return;
+				}
 				// Retract the live tool cards this request published but never completed.
 				//
 				// This sits in the request teardown rather than at each retry site because
@@ -4004,15 +4022,35 @@ async function* agentLoopInMetadataSnapshot(
 				// accumulator, so only genuinely truncated ids are ever named.
 				yield* retractStreamingToolCards();
 				yield* flushRequestStart();
-				const diagnostics = requestDiagnostics
-					? normalizeApiRequestDiagnostics({
-							...requestDiagnostics,
-							provider: requestDiagnostics.provider ?? effectiveProvider,
-							model: requestDiagnostics.model ?? effectiveModel,
-							message: requestDiagnostics.message ?? errorMessage,
-						})
-					: undefined;
+				// Keep the diagnostic object's identity: lastRetryDiagnostics and deferred
+				// resumable errors can still refer to this attempt after the next one starts.
+				// The consumer enriches this SAME object with the durable API row ID at end.
+				const normalizedDiagnostics =
+					requestDiagnostics || errorMessage
+						? normalizeApiRequestDiagnostics({
+								...requestDiagnostics,
+								provider: requestDiagnostics?.provider ?? effectiveProvider,
+								model: requestDiagnostics?.model ?? effectiveModel,
+								message: requestDiagnostics?.message ?? errorMessage,
+								recordingRequestId: requestId,
+								// Never accept a provider-supplied local database association.
+								apiRequestId: undefined,
+							})
+						: undefined;
+				if (normalizedDiagnostics) {
+					if (requestDiagnostics) {
+						for (const field of Object.keys(requestDiagnostics)) {
+							Reflect.deleteProperty(requestDiagnostics, field);
+						}
+						Object.assign(requestDiagnostics, normalizedDiagnostics);
+					} else requestDiagnostics = normalizedDiagnostics;
+				}
+				const diagnostics = requestDiagnostics;
 				requestDump?.setDiagnostics(diagnostics);
+				// Start is lazy. Let the consumer create/bind its durable API row, and
+				// attach bounded diagnostics, before automatic errors-only saving fires.
+				requestDump?.finish({ error: errorMessage, status: errorMessage ? "error" : "completed" });
+				if (activeRequestDump === requestDump) activeRequestDump = undefined;
 				if (!contextSnapshot) {
 					const window = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (window && inputCharacters) {
@@ -4052,7 +4090,10 @@ async function* agentLoopInMetadataSnapshot(
 					meterUnit: requestMeterUnit,
 					// The dump wins whenever one exists: `malformedRequestRecord` is only set on
 					// the no-collector path, where it is the sole record of the rejection.
-					rawDump: requestDump?.snapshot() ?? malformedRequestRecord,
+					rawDump:
+						settings.agent.requestDumpEnabled || forceDumpPersist
+							? (requestDump?.snapshot() ?? malformedRequestRecord)
+							: undefined,
 					errorMessage,
 					diagnostics,
 					forceDumpPersist,
@@ -4443,6 +4484,7 @@ async function* agentLoopInMetadataSnapshot(
 				requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 				requestStartTime = 0;
 				requestStarted = false;
+				requestFinished = false;
 				requestStartPending = false;
 				requestTtftMs = undefined;
 				requestUsage = undefined;
@@ -4462,12 +4504,29 @@ async function* agentLoopInMetadataSnapshot(
 				// calls so leaked-tool diagnostics always have a bounded raw dump.
 				// Providers write bodyText/events through the *WithLimit helpers, so collection
 				// stays bounded even when force-enabled here.
-				requestDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls)
-					? new ApiRequestDumpCollector({
-							provider: effectiveProvider,
-							model: effectiveModel,
-						})
-					: undefined;
+				activeRequestDump?.finish({
+					status: "interrupted",
+					error: "Attempt replaced before final response classification",
+				});
+				activeRequestDump = undefined;
+				const recording = createRequestRecording({
+					requestId,
+					narratorId: config.narratorId,
+					userId: requestUserId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					kind: config.reflectionLoop ? "reflection" : "narrator",
+				});
+				const collectLegacyDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls);
+				requestDump =
+					recording || collectLegacyDump
+						? new ApiRequestDumpCollector(
+								{ provider: effectiveProvider, model: effectiveModel },
+								recording,
+								collectLegacyDump ? undefined : RING_DIAGNOSTIC_PREFIX_BYTES,
+							)
+						: undefined;
+				activeRequestDump = requestDump;
 
 				const attemptAbort = new AbortController();
 				let updateReasoningInterrupted = false;
@@ -5452,6 +5511,8 @@ async function* agentLoopInMetadataSnapshot(
 							const message = String(parsed.invalidState.message ?? "Unknown provider error");
 							requestDiagnostics = normalizeApiRequestDiagnostics({
 								...parsed.invalidState.diagnostics,
+								recordingRequestId: undefined,
+								apiRequestId: undefined,
 								source: parsed.invalidState.diagnostics?.source ?? "provider",
 								phase: parsed.invalidState.diagnostics?.phase ?? "invalid_state",
 								reason,
@@ -5973,6 +6034,8 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						...diagnosticsFromError(err),
+						recordingRequestId: undefined,
+						apiRequestId: undefined,
 						message: msg,
 						provider: effectiveProvider,
 						model: effectiveModel,
@@ -6252,6 +6315,8 @@ async function* agentLoopInMetadataSnapshot(
 					return;
 				} finally {
 					responseActivity.setReasoningAbort(null);
+					// Close transport resources here, but do not seal recording until the
+					// post-stream empty/tool-response checks have determined this attempt's result.
 					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();
@@ -6499,6 +6564,7 @@ async function* agentLoopInMetadataSnapshot(
 						const message =
 							`${effectiveProvider}: Provider finished without starting an API request. ` +
 							"This indicates the request was not assembled or dispatched; check provider setup and local request-building errors.";
+						yield* finishRequest(message);
 						logger.warn("Provider produced no events before starting a request", {
 							narratorId: config.narratorId,
 							provider: effectiveProvider,
@@ -6799,6 +6865,9 @@ async function* agentLoopInMetadataSnapshot(
 							reason: "reasoning_only_exhausted",
 							message,
 							diagnostics: normalizeApiRequestDiagnostics({
+								// This attempt has already ended. Preserve its exact recorder/API
+								// association while refining the terminal exhaustion evidence.
+								...requestDiagnostics,
 								source: "agent",
 								phase: "response",
 								reason: "reasoning_only_exhausted",
@@ -7644,7 +7713,17 @@ async function* agentLoopInMetadataSnapshot(
 
 			yield { type: "turn_complete", turnIndex };
 			turnIndex++;
+		} catch (error) {
+			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });
+			activeRequestDump = undefined;
+			throw error;
 		} finally {
+			activeRequestDump?.finish({
+				status: config.signal.aborted ? "cancelled" : "interrupted",
+				error: config.signal.aborted
+					? String(config.signal.reason ?? "Aborted")
+					: "Attempt exited before final response classification",
+			});
 			responseActivity.release();
 		}
 	}

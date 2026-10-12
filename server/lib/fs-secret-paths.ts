@@ -1,5 +1,5 @@
 /**
- * fs-secret-paths.ts — refuse to serve credential-bearing files over `/api/fs/*`.
+ * fs-secret-paths.ts — refuse platform secrets and private state over generic file APIs.
  *
  * ## Why a deny-list rather than an allow-list
  *
@@ -13,7 +13,8 @@
  * layout.
  *
  * So this bounds the blast radius instead: the files whose disclosure escalates a
- * logged-in reader into the platform's own credentials. Those DO have a small,
+ * logged-in reader into the platform's own credentials, plus platform-managed
+ * private state whose dedicated routes enforce narrator ACLs. These have a small,
  * stable, enumerable shape, because this repo writes them.
  *
  * ## What this is not
@@ -23,14 +24,17 @@
  * trust model of the file browser — `/api/fs/browse` has always listed the whole
  * filesystem. This only ensures that "read any file" cannot be turned into "become
  * the platform": tokens, the JWT signing secret, and the database that holds every
- * user's password hash.
+ * user's password hash. Private request recordings are also denied: serving them
+ * through a generic path would bypass the owning narrator's ACL.
  *
  * Applied to preview AND download. Preview's 1MB text cap is not a mitigation —
  * `settings.json` and a credentials file are a few KB.
  */
 
+import { realpathSync } from "node:fs";
 import { relative as relativePath, resolve } from "node:path";
 import { isInsidePath } from "./platform-path";
+import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "./request-recorder-protocol";
 import { narraforkDir } from "./settings";
 
 /**
@@ -51,10 +55,45 @@ const SECRET_HOME_FILES: readonly string[] = [
 	"narrafork.lock",
 ];
 
+/** Recorder contents span private narrators; only the narrator-ACL download API may serve them. */
+const PRIVATE_RECORDING_DIRS: readonly string[] = [
+	REQUEST_RECORDING_DIR,
+	REQUEST_RECORDING_SAVED_DIR,
+];
+
 /** Private protocol state must not be exposed or rewritten through generic file APIs.
  * Editor transfers include other users' immutable documents and durable recovery metadata;
- * the dedicated authenticated/versioned routes are their only browser entry. */
-const SECRET_HOME_DIRS: readonly string[] = ["editor-transfers"];
+ * recording directories contain private conversations across the whole instance. */
+const SECRET_HOME_DIRS: readonly string[] = ["editor-transfers", ...PRIVATE_RECORDING_DIRS];
+
+function physicalOrLexicalPath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
+
+/** Also checks physical targets, so a symlink outside the home cannot bypass the recording ACL.
+ * Sharing an ancestor directory must be refused too, because its archive includes private data. */
+export function isPrivateRequestRecordingPath(
+	absPath: string,
+	dir: string = narraforkDir,
+	includeAncestors = false,
+): boolean {
+	const target = resolve(absPath);
+	const physicalTarget = physicalOrLexicalPath(target);
+	return PRIVATE_RECORDING_DIRS.some((name) => {
+		const root = resolve(dir, name);
+		const physicalRoot = physicalOrLexicalPath(root);
+		return (
+			isInsidePath(root, target) ||
+			isInsidePath(physicalRoot, physicalTarget) ||
+			(includeAncestors &&
+				(isInsidePath(target, root) || isInsidePath(physicalTarget, physicalRoot)))
+		);
+	});
+}
 
 /** Home-relative prefixes: the database and every sidecar spelling of it. */
 const SECRET_HOME_PREFIXES: readonly string[] = ["narrafork.db"];
@@ -65,6 +104,7 @@ const SECRET_HOME_PREFIXES: readonly string[] = ["narrafork.db"];
  * `dir` is injectable so the tests do not depend on the runner's real home.
  */
 export function isSecretPlatformPath(absPath: string, dir: string = narraforkDir): boolean {
+	if (isPrivateRequestRecordingPath(absPath, dir)) return true;
 	const home = resolve(dir);
 	const target = resolve(absPath);
 	// Outside the NarraFork home there is nothing this module claims to know about.

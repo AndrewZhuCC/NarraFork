@@ -57,7 +57,12 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { sanitizeHeaders } from "./request-dump";
+import {
+	type ApiRequestDumpCollector,
+	captureResponseStream,
+	readResponsePrefix,
+	sanitizeHeaders,
+} from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1381,12 +1386,45 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * On a successful fallback the resolved base URL is cached (instance- and
 	 * process-wide) and a fix suggestion is broadcast to clients.
 	 */
-	private async fetchWithV1Fallback(path: string, init: RequestInit): Promise<Response> {
+	private async fetchWithV1Fallback(
+		path: string,
+		init: RequestInit,
+		collector?: ApiRequestDumpCollector,
+	): Promise<Response> {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
 		// All requests go through the proxy-aware fetch so streaming and auxiliary
 		// calls uniformly follow the global outbound proxy policy.
-		const doFetch = this.pfetch.bind(this);
+		const doFetch = async (actualUrl: string, requestInit: RequestInit): Promise<Response> => {
+			collector?.beginResponseAttempt(
+				{
+					transport: "http",
+					url: actualUrl,
+					method: requestInit.method ?? "POST",
+					headers: sanitizeHeaders(requestInit.headers as Record<string, string>),
+					bodyText: typeof requestInit.body === "string" ? requestInit.body : undefined,
+				},
+				settings.agent?.requestDumpMaxSize,
+			);
+			try {
+				const response = await this.pfetch(actualUrl, requestInit);
+				collector?.setResponseMeta({
+					status: response.status,
+					headers: sanitizeHeaders(response.headers),
+				});
+				if (!collector || !response.body) return response;
+				const tap = captureResponseStream(response.body, collector);
+				return new Response(tap.stream, {
+					status: response.status,
+					statusText: response.statusText,
+					headers: response.headers,
+				});
+			} catch (error) {
+				collector?.setResponseError(error);
+				collector?.finishResponseCapture(false);
+				throw error;
+			}
+		};
 		const canFallback = !AnthropicProvider.hasV1Suffix(baseUrl);
 
 		let response: Response;
@@ -1400,7 +1438,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			// retry's outcome (even a non-ok status) — re-throwing the original
 			// retryable connection error would make the agent loop retry the wrong
 			// path forever (observed as 0% success on long sessions).
-			if (canFallback && isConnectionClosedError(err)) {
+			if (canFallback && !init.signal?.aborted && isConnectionClosedError(err)) {
 				const retryBase = `${baseUrl}/v1`;
 				const retryUrl = `${retryBase}${path}`;
 				logger.debug("Anthropic request connection closed, retrying with /v1 suffix", {
@@ -1439,7 +1477,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		const originalStatus = response.status;
 		const originalStatusText = response.statusText;
 		const originalContentType = response.headers.get("content-type");
-		const originalBody = await response.text().catch(() => "");
+		const originalBody = await readResponsePrefix(response).catch(() => "");
+		init.signal?.throwIfAborted();
 
 		logger.debug("Anthropic request failed, retrying with /v1 suffix", {
 			originalUrl: url,
@@ -1464,6 +1503,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		try {
 			retryResponse = await doFetch(retryUrl, init);
 		} catch (retryErr) {
+			if (init.signal?.aborted) throw retryErr;
 			// Fallback path dropped the connection (e.g. WAF). Surface the original
 			// endpoint's real error instead of the fallback transport failure.
 			logger.debug("Anthropic /v1 fallback threw; surfacing original error", {
@@ -1488,7 +1528,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			return retryResponse;
 		}
 		// Drain the retry body to free the connection, then surface the original.
-		await retryResponse.text().catch(() => {});
+		await readResponsePrefix(retryResponse).catch(() => {});
 		return rebuildOriginal();
 	}
 
@@ -1858,13 +1898,6 @@ export class AnthropicProvider implements ProviderAdapter {
 			params.conversationId,
 		);
 
-		params.requestDump?.setRequest({
-			transport: "http",
-			url: `${this.getBaseUrl()}${reqPath}`,
-			headers: sanitizeHeaders(reqHeaders),
-			body,
-		});
-
 		logger.debug("Anthropic chat request", {
 			model,
 			endpoint: `${this.getBaseUrl()}${reqPath}`,
@@ -1880,44 +1913,33 @@ export class AnthropicProvider implements ProviderAdapter {
 		const bodyStr = JSON.stringify(body);
 
 		params.onRequestStart?.();
-		const response = await this.fetchWithV1Fallback(reqPath, {
-			method: "POST",
-			headers: reqHeaders,
-			body: bodyStr,
-			signal: params.signal,
-		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
-		params.requestDump?.setResponseMeta({
-			status: response.status,
-			headers: sanitizeHeaders(response.headers),
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
-			throw createAnthropicApiError(response, errText);
-		}
-
-		if (!response.body) {
-			throw new Error("Anthropic API returned no body");
-		}
-
-		yield* parseAnthropicSSEStream(
-			response.body,
-			getAnthropicEffectiveContextWindow(model, this.config),
+		const response = await this.fetchWithV1Fallback(
+			reqPath,
+			{
+				method: "POST",
+				headers: reqHeaders,
+				body: bodyStr,
+				signal: params.signal,
+			},
+			params.requestDump,
 		);
-		if (responseTextPromise) {
-			const bodyText = await responseTextPromise;
-			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
-			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+		try {
+			if (!response.ok) {
+				const errText = await readResponsePrefix(response).catch(() => "");
+				throw createAnthropicApiError(response, errText);
+			}
+			if (!response.body) throw new Error("Anthropic API returned no body");
+			yield* parseAnthropicSSEStream(
+				response.body,
+				getAnthropicEffectiveContextWindow(model, this.config),
+			);
+		} catch (error) {
+			params.requestDump?.setResponseError(error);
+			throw error;
+		} finally {
+			// The parser releases its reader on early return. Cancel the observational tap
+			// too, so abandoning an async generator never leaves a background drain.
+			if (response.body && !response.body.locked) void response.body.cancel().catch(() => {});
 		}
 	}
 

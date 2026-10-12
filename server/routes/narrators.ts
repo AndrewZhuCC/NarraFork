@@ -150,6 +150,7 @@ import {
 	getPromptOptimizeInstruction,
 	type PromptOptimizeStyle,
 } from "../lib/prompts/prompt-optimize";
+import { saveRequestRecording } from "../lib/request-recorder";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
@@ -475,6 +476,7 @@ import {
 } from "../websocket/narrator-ws";
 import { fileReferenceRoutes } from "./narrator-file-references";
 import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
+import { requestRecordingRoutes } from "./request-recordings";
 
 function parseNewCommand(message: string): { rawCommand: string; initialMessage: string } | null {
 	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
@@ -772,6 +774,7 @@ narratorRoutes.use("/:id", async (c, next) => {
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
+narratorRoutes.route("/:id/request-recordings", requestRecordingRoutes);
 
 // The /:id/* middleware above enforces requireNarratorAccess(..., "read").
 narratorRoutes.get("/:id/context-composition", async (c) => {
@@ -2068,6 +2071,11 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			!("loadSkill" in cmdResult)
 		) {
 			throw new ValidationError("File references require a model message, not a control command");
+		}
+		// Save the current recording immediately, even while the narrator is working.
+		// It is a local inspection control: never queue, interrupt or invoke the model.
+		if (cmdResult.resolved && "saveDump" in cmdResult) {
+			return c.json(await saveRequestRecording(id), 200);
 		}
 		// Interrupting controls use the same durable admission as ordinary input: never
 		// abort an owner until the replacement is safely queued. Non-interrupt controls

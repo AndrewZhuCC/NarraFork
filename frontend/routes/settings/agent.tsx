@@ -47,6 +47,12 @@ function SettingsAgentPage() {
 				setFreshShellEnv={is.setFreshShellEnv}
 				translateReasoning={is.translateReasoning}
 				setTranslateReasoning={is.setTranslateReasoning}
+				requestDumpRecordingEnabled={is.requestDumpRecordingEnabled}
+				setRequestDumpRecordingEnabled={is.setRequestDumpRecordingEnabled}
+				requestDumpRequestBytes={is.requestDumpRequestBytes}
+				setRequestDumpRequestBytes={is.setRequestDumpRequestBytes}
+				requestDumpResponseBytes={is.requestDumpResponseBytes}
+				setRequestDumpResponseBytes={is.setRequestDumpResponseBytes}
 				requestDumpEnabled={is.requestDumpEnabled}
 				setRequestDumpEnabled={is.setRequestDumpEnabled}
 				requestDumpErrorsOnly={is.requestDumpErrorsOnly}

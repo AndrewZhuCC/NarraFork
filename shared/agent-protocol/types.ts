@@ -42,8 +42,13 @@ export interface ApiRequestDiagnostics {
 	errorType?: string;
 	message?: string;
 	responseSnippet?: string;
+	/** Upstream correlation ID; never an internal attempt or database ID. */
 	requestId?: string;
 	providerRequestId?: string;
+	/** Exact loop attempt ID used by the local request recorder. */
+	recordingRequestId?: string;
+	/** Persisted api_requests.id for this exact attempt. */
+	apiRequestId?: string;
 	provider?: string;
 	model?: string;
 	channelName?: string;

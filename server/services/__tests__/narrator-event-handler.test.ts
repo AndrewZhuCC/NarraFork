@@ -508,6 +508,115 @@ describe("request occupancy is independent from billing and historical usage", (
 	});
 });
 
+describe("durable API error association", () => {
+	test("completed request enriches the exact diagnostic object before error persistence and refresh", async () => {
+		const id = "error-association-narrator";
+		const now = "2026-10-08T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		const ctx = { ...makeMainContext(), narratorId: id, broadcastTargetId: id };
+		const diagnostics = {
+			schema: "narrafork.error-diagnostics.v1" as const,
+			recordingRequestId: "exact-attempt",
+			requestId: "upstream-id",
+			providerRequestId: "provider-id",
+			statusCode: 503,
+			message: "界😀".repeat(8192),
+		};
+		try {
+			// A different, later request must not become this error's association.
+			for (const requestId of ["exact-attempt", "other-attempt"]) {
+				await processEvent(
+					{ type: "api_request_start", requestId, provider: "anthropic", model: "test" },
+					ctx,
+				);
+			}
+			await processEvent(
+				{
+					type: "api_request_end",
+					requestId: "exact-attempt",
+					errorMessage: "upstream failed",
+					diagnostics,
+				},
+				ctx,
+			);
+			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
+			expect(request).toBeDefined();
+			expect(diagnostics).toMatchObject({
+				apiRequestId: request?.id,
+				recordingRequestId: "exact-attempt",
+				requestId: "upstream-id",
+			});
+			expect(ctx.apiRequestsMap?.has("exact-attempt")).toBe(false);
+			const { narratorPersistence } = await import("../narrator-persistence");
+			await processEvent({ type: "error", message: "upstream failed", diagnostics }, ctx, {
+				onErrorCleanup: async (message, errorDiagnostics) => {
+					await narratorPersistence.updateStatus(id, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+						diagnostics: errorDiagnostics,
+					});
+				},
+			});
+			// Re-read backing storage (the path used after refresh), not a live broadcast.
+			const message = db
+				.select({ content: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.content).toEqual([
+				{ type: "error", message: "upstream failed", diagnostics },
+			]);
+			expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThanOrEqual(16 * 1024);
+			const ref = db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, id))
+				.get();
+			expect(ref).toBeDefined();
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("legacy errors and internal errors never acquire a nearby API association", async () => {
+		const id = "legacy-error-association-narrator";
+		const now = "2026-10-08T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		try {
+			const { narratorPersistence } = await import("../narrator-persistence");
+			await narratorPersistence.updateStatus(id, "idle", {
+				substatus: ["error"],
+				errorMessage: "internal failure",
+			});
+			const message = db
+				.select({ content: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.content).toEqual([{ type: "error", message: "internal failure" }]);
+			const diagnostics = {
+				schema: "narrafork.error-diagnostics.v1" as const,
+				requestId: "untrusted-upstream-only",
+				recordingRequestId: "different-attempt",
+			};
+			const ctx = { ...makeMainContext(), narratorId: id, broadcastTargetId: id };
+			await processEvent(
+				{ type: "api_request_start", requestId: "current", provider: "anthropic", model: "test" },
+				ctx,
+			);
+			await processEvent(
+				{ type: "api_request_end", requestId: "current", errorMessage: "failed", diagnostics },
+				ctx,
+			);
+			expect(diagnostics).not.toHaveProperty("apiRequestId");
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+});
+
 describe("streaming snapshot author isolation", () => {
 	for (const event of [
 		{ type: "stream_reset" as const },

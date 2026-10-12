@@ -184,7 +184,13 @@ describe("executeAgentLoop result handling", () => {
 					{
 						type: "resumable_error",
 						message: "upstream stream error",
-						diagnostics: { schema: "narrafork.error-diagnostics.v1", resumable: true },
+						diagnostics: {
+							schema: "narrafork.error-diagnostics.v1",
+							resumable: true,
+							recordingRequestId: "interrupted-attempt",
+							apiRequestId: "interrupted-row",
+							requestId: "upstream-interrupted",
+						},
 					},
 				]),
 				processEventFn: async () => null,
@@ -193,6 +199,12 @@ describe("executeAgentLoop result handling", () => {
 
 		expect(result.interrupted).toBe(true);
 		expect(result.interruptedReason).toBe("resumable_error");
+		expect(result.interruptionError).toBe("upstream stream error");
+		expect(result.interruptionDiagnostics).toMatchObject({
+			recordingRequestId: "interrupted-attempt",
+			apiRequestId: "interrupted-row",
+			requestId: "upstream-interrupted",
+		});
 		expect(result.hasError).toBe(false);
 		expect(result.shouldReplayInterruptedToolResultTurn).toBe(false);
 	});

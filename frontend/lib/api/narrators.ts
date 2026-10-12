@@ -10,6 +10,7 @@ import {
 	type TextDocumentRange,
 	type TextDocumentRef,
 } from "@shared/pretext-layout/text-document";
+import type { RequestRecordingDetail, SavedRecording } from "@shared/request-recording";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
@@ -563,6 +564,52 @@ export interface NarratorCustomTraits {
 }
 
 export const narratorsApi = {
+	getRequestRecordingDetail: (narratorId: string, requestId: string, signal?: AbortSignal) =>
+		request<RequestRecordingDetail>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
+			{ signal },
+		),
+	saveSpecificRequestRecording: (narratorId: string, requestId: string, signal?: AbortSignal) =>
+		request<SavedRecording>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
+			{ method: "POST", signal },
+		),
+	saveRequestRecording: (narratorId: string, signal?: AbortSignal) =>
+		request<SavedRecording>(`/narrators/${encodeURIComponent(narratorId)}/request-recordings`, {
+			method: "POST",
+			signal,
+		}),
+	listRequestRecordings: (narratorId: string, cursor?: string, signal?: AbortSignal) => {
+		const params = new URLSearchParams({ limit: "50" });
+		if (cursor) params.set("cursor", cursor);
+		return request<{ items: SavedRecording[]; nextCursor: string | null }>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings?${params}`,
+			{ signal },
+		);
+	},
+	deleteRequestRecording: (narratorId: string, saveId: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/${encodeURIComponent(saveId)}`,
+			{ method: "DELETE" },
+		),
+	async downloadRequestRecording(
+		narratorId: string,
+		saveId: string,
+		signal?: AbortSignal,
+	): Promise<{ blob: Blob; fileName: string | null }> {
+		const res = await authorizedFetch(
+			`${apiBase()}/narrators/${encodeURIComponent(narratorId)}/request-recordings/${encodeURIComponent(saveId)}/download`,
+			{ signal },
+		);
+		if (!res.ok) {
+			const error = await readFetchError(res, `HTTP ${res.status}`);
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return {
+			blob: await res.blob(),
+			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
+		};
+	},
 	getTextDocumentRange,
 	ensureWriteDocumentSource,
 	readTextDocumentRange,

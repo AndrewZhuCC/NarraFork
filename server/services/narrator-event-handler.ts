@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
@@ -3366,6 +3367,7 @@ export async function processEvent(
 			ctx.apiRequestsMap.set(
 				event.requestId,
 				startApiRequest({
+					recordingRequestId: event.requestId,
 					narratorId,
 					// Event owner only. Falling back to ctx.userId would re-attribute a
 					// request that arrived without a user to whoever owns the context later
@@ -3491,6 +3493,19 @@ export async function processEvent(
 					// a near-identical multi-MB copy that prunes other captures away.
 					dumpSpillReuseToken: event.dumpSpillReuseToken,
 				});
+				// The loop retains this attempt's diagnostic object across deferred errors
+				// and retries. Enrich only an exact local attempt match; upstream requestId
+				// is a different namespace. No completed-request cache is necessary.
+				if (event.diagnostics?.recordingRequestId === event.requestId) {
+					const diagnostics = normalizeApiRequestDiagnostics({
+						...event.diagnostics,
+						apiRequestId,
+					});
+					for (const field of Object.keys(event.diagnostics)) {
+						Reflect.deleteProperty(event.diagnostics, field);
+					}
+					Object.assign(event.diagnostics, diagnostics);
+				}
 				if (!event.errorMessage) {
 					if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];
 					ctx.pendingApiRequestIds.push(apiRequestId);

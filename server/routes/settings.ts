@@ -5,6 +5,11 @@ import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
+import {
+	MAX_RECORDING_REQUEST_BYTES,
+	MAX_RECORDING_RESPONSE_BYTES,
+	MIN_RECORDING_WINDOW_BYTES,
+} from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -400,6 +405,25 @@ export const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
+				requestDumpRecordingEnabled: z.boolean(),
+				requestDumpRequestBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_REQUEST_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				requestDumpResponseBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_RESPONSE_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
 				requestDumpEnabled: z.boolean(),
 				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
