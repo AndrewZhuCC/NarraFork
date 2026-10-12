@@ -338,6 +338,16 @@ describe("validate-local-upgrade", () => {
 						>)
 					: undefined;
 			if (targetTag === "0018_merge_upstream_090") {
+				for (const [id, name, email] of [
+					["git-user", " Git User ", " dev@example.com "],
+					["git-empty", " ", "empty@example.com"],
+					["git-invalid", "<bad>", "bad@example.com"],
+				]) {
+					db.run(
+						"INSERT INTO users (id, username, password_hash, created_at, git_username, git_email) VALUES (?, ?, ?, ?, ?, ?)",
+						[id, id, "unused", "2026-10-12T00:00:00Z", name, email],
+					);
+				}
 				db.run(
 					"INSERT INTO background_tasks (id, parent_narrator_id, type, status, command, output, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 					[
@@ -458,11 +468,16 @@ describe("validate-local-upgrade", () => {
 							...beforeBackground,
 							background_kind: "task",
 						});
-						for (const table of ["user_git_identities", "narrator_git_identity_bindings"]) {
-							expect(upgraded.query(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({
-								count: 0,
-							});
-						}
+						expect(
+							upgraded
+								.query("SELECT user_id, name, email, is_default FROM user_git_identities")
+								.all(),
+						).toEqual([
+							{ user_id: "git-user", name: "Git User", email: "dev@example.com", is_default: 1 },
+						]);
+						expect(
+							upgraded.query("SELECT count(*) AS count FROM narrator_git_identity_bindings").get(),
+						).toEqual({ count: 0 });
 					}
 					if (targetTag === "0017_merge_opensource_083") {
 						expect(

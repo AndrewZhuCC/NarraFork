@@ -26,6 +26,10 @@ const JOURNAL_TAIL_TAGS = new Set([
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
 const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
+const LEGACY_GIT_IDENTITY_FILTER = `u.git_username IS NOT NULL AND trim(u.git_username) <> ''
+	AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
+	AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
+	AND instr(u.git_email, '<') = 0 AND instr(u.git_email, '>') = 0`;
 const MERGE_083_NEW_TABLES = [
 	"narrator_context_char_pages",
 	"narrator_question_events",
@@ -171,11 +175,15 @@ function affectedSummary(
 ): Record<string, unknown> {
 	if (targetTag === "0018_merge_upstream_090") {
 		return {
+			users: tableDigest(db, "users"),
 			background_tasks: tableDigest(
 				db,
 				"background_tasks",
 				excludeNew ? new Set(["background_kind"]) : new Set(),
 			),
+			...(excludeNew
+				? {}
+				: Object.fromEntries(MERGE_090_NEW_TABLES.map((table) => [table, tableDigest(db, table)]))),
 		};
 	}
 	if (targetTag === "0017_merge_opensource_083") {
@@ -455,6 +463,16 @@ async function main() {
 			...(merge083Pair ? affectedSummary(db, "0016_high_shiva", excludeNew) : {}),
 		});
 		const beforeCounts = rowCounts(db);
+		const legacyGitIdentityCount =
+			target.tag === "0018_merge_upstream_090" && !("user_git_identities" in beforeCounts)
+				? Number(
+						(
+							db
+								.query(`SELECT count(*) AS count FROM users u WHERE ${LEGACY_GIT_IDENTITY_FILTER}`)
+								.get() as { count: number }
+						).count,
+					)
+				: null;
 		const beforeAffected = affectedForUpgrade(true);
 		const hadNextSeq = columns(db, "narrators").includes("next_seq");
 		if (hadNextSeq) {
@@ -481,6 +499,17 @@ async function main() {
 								? MERGE_090_NEW_TABLES
 								: [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
+		if (legacyGitIdentityCount !== null) {
+			expectedCounts.user_git_identities = legacyGitIdentityCount;
+			const missingIdentity = db
+				.query(`SELECT u.id FROM users u
+				WHERE ${LEGACY_GIT_IDENTITY_FILTER} AND NOT EXISTS (
+					SELECT 1 FROM user_git_identities i WHERE i.user_id = u.id
+					AND i.name = trim(u.git_username) AND i.email = trim(u.git_email) AND i.is_default = 1
+				) LIMIT 1`)
+				.get();
+			if (missingIdentity) throw new Error("Legacy Git identity was not preserved");
+		}
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");
 		}
