@@ -39,6 +39,7 @@ import {
 	useReorderFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
 import { useGitIdentities } from "../../hooks/useGitIdentities";
+import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
 import { api } from "../../lib/api";
@@ -192,6 +193,7 @@ export function CreateNarratorModal({
 	// 提交身份只对当前用户生效（服务端按 用户 × 会话 保存），默认跟随本人默认身份。
 	const [gitIdentityId, setGitIdentityId] = useState(FOLLOW_DEFAULT_GIT_IDENTITY);
 	const { data: gitIdentityList } = useGitIdentities();
+	const gitIdentityVisibility = useGitIdentityVisibility();
 	const gitIdentities = gitIdentityList ?? [];
 	const defaultGitIdentity = gitIdentities.find((identity) => identity.isDefault);
 	const [handle, setHandle] = useState("");
@@ -530,30 +532,36 @@ export function CreateNarratorModal({
 				}}
 			/>
 
-			<Select
-				label={t("narrator:details.gitIdentity")}
-				description={t("narrator:details.gitIdentityDescription")}
-				data={[
-					{
-						value: FOLLOW_DEFAULT_GIT_IDENTITY,
-						label: defaultGitIdentity
-							? t("narrator:details.gitIdentityFollowDefault", { name: defaultGitIdentity.name })
-							: t("narrator:details.gitIdentityFollowDefaultPlain"),
-					},
-					...gitIdentities.map((identity) => ({
-						value: identity.id,
-						label: `${identity.name} <${identity.email}>`,
-					})),
-				]}
-				value={gitIdentityId}
-				onChange={(value) => setGitIdentityId(value ?? FOLLOW_DEFAULT_GIT_IDENTITY)}
-				disabled={gitIdentities.length === 0}
-				comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
-			/>
-			{gitIdentities.length === 0 && (
-				<Text size="xs" c="dimmed">
-					{t("narrator:details.gitIdentityUnconfigured")}
-				</Text>
+			{gitIdentityVisibility.createModal && (
+				<>
+					<Select
+						label={t("narrator:details.gitIdentity")}
+						description={t("narrator:details.gitIdentityDescription")}
+						data={[
+							{
+								value: FOLLOW_DEFAULT_GIT_IDENTITY,
+								label: defaultGitIdentity
+									? t("narrator:details.gitIdentityFollowDefault", {
+											name: defaultGitIdentity.name,
+										})
+									: t("narrator:details.gitIdentityFollowDefaultPlain"),
+							},
+							...gitIdentities.map((identity) => ({
+								value: identity.id,
+								label: `${identity.name} <${identity.email}>`,
+							})),
+						]}
+						value={gitIdentityId}
+						onChange={(value) => setGitIdentityId(value ?? FOLLOW_DEFAULT_GIT_IDENTITY)}
+						disabled={gitIdentities.length === 0}
+						comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+					/>
+					{gitIdentities.length === 0 && (
+						<Text size="xs" c="dimmed">
+							{t("narrator:details.gitIdentityUnconfigured")}
+						</Text>
+					)}
+				</>
 			)}
 
 			<Checkbox
