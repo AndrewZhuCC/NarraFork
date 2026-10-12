@@ -780,6 +780,11 @@ function killOwnWindowsChildProcesses(): void {
 	}
 }
 
+// Materialize built-in skills before requests or narrator recovery can discover them.
+import { syncBuiltinSkillRoutines } from "./services/routine-service";
+
+await syncBuiltinSkillRoutines();
+
 const startupReadiness = createStartupReadinessGate();
 
 // Try to start the server, with automatic port fallback when the default port is busy.

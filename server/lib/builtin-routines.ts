@@ -395,7 +395,8 @@ When testing is warranted, verify observable behavior rather than wording. Prefe
 		id: "nf-openui",
 		type: "skill",
 		category: "workflow",
-		defaultEnabled: false,
+		// Discoverable by default; the full component reference is still loaded on demand.
+		defaultEnabled: true,
 		skill: {
 			name: "nf-openui",
 			descriptionEn:

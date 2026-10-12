@@ -787,6 +787,11 @@ async function invalidateRootCache(rootKind: SkillSource, rootPath: string): Pro
 	}
 }
 
+/** A managed global skill changed; do not reuse summaries persisted before installation. */
+export function invalidateGlobalSkillDirectoryCache(): Promise<void> {
+	return invalidateRootCache("global", homedir());
+}
+
 async function loadRootSkillSummaries(
 	root: SkillRootInfo,
 	options: { forceRefresh?: boolean } = {},

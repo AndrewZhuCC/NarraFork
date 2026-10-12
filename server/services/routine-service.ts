@@ -36,6 +36,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import type { Command } from "./chapter-service";
+import { invalidateGlobalSkillDirectoryCache } from "./skill-service";
 
 // ---------------------------------------------------------------------------
 // Marker used to identify routine-managed entries
@@ -134,6 +135,32 @@ export function getGlobalRoutineStatuses(): RoutineStatus[] {
 		const mode = resolveToolRoutineMode(r, config);
 		return routineToStatus(r, isPreloadedMode(mode), mode);
 	});
+}
+
+/** Refresh enabled built-in skills before accepting requests, without changing user settings. */
+export async function syncBuiltinSkillRoutines(): Promise<void> {
+	const config = globalRoutineConfig();
+	let synced = false;
+	for (const routine of getAllBuiltinRoutines()) {
+		if (routine.type !== "skill" || !isPreloadedMode(resolveToolRoutineMode(routine, config)))
+			continue;
+		try {
+			// The Skills page disables a skill by renaming its file, independently of routine settings.
+			const disabledPath = join(
+				getGlobalSkillsDir(),
+				routineSkillDirName(routine.id),
+				"SKILL.md.disabled",
+			);
+			await addGlobalSkill(routine, await Bun.file(disabledPath).exists());
+			synced = true;
+		} catch (error) {
+			logger.warn("Failed to synchronize built-in skill", {
+				routineId: routine.id,
+				error: String(error),
+			});
+		}
+	}
+	if (synced) await invalidateGlobalSkillDirectoryCache();
 }
 
 /** Get all routines with their effective status for a project. */
@@ -592,12 +619,12 @@ async function removeProjectCommand(
 // Internal: skill materialization
 // ---------------------------------------------------------------------------
 
-async function addGlobalSkill(routine: BuiltinRoutine): Promise<void> {
+async function addGlobalSkill(routine: BuiltinRoutine, disabled = false): Promise<void> {
 	const skill = routine.skill;
 	if (!skill) return;
 	const dirName = routineSkillDirName(routine.id);
 	const skillDir = join(getGlobalSkillsDir(), dirName);
-	const skillFile = join(skillDir, "SKILL.md");
+	const skillFile = join(skillDir, disabled ? "SKILL.md.disabled" : "SKILL.md");
 
 	await mkdir(skillDir, { recursive: true });
 	await writeFile(skillFile, buildSkillMd(skill.name, skill.descriptionEn, skill.content), "utf-8");
