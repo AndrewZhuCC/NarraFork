@@ -7,6 +7,7 @@ import {
 	computeBinaryMetadataFromBuffer,
 	formatMetadataJson,
 } from "../../scripts/lib/binary-metadata";
+import { githubReleaseBody } from "../../scripts/lib/github-release";
 import {
 	type PreparedUpdateNotes,
 	prepareUpdateIndexRelease,
@@ -25,7 +26,11 @@ const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-async function fixture(version = "1.2.0", patch = false, changelog = "更新日志") {
+async function fixture(
+	version = "1.2.0",
+	patch = false,
+	changelog: string | Record<string, string> = "更新日志",
+) {
 	const root = mkdtempSync(join(tmpdir(), "narrafork-update-index-test-"));
 	roots.push(root);
 	const name = `narrafork-${version}-linux-x64`;
@@ -113,7 +118,7 @@ function fakeGitHub(fixtures: Fixture[]) {
 			draft: false,
 			prerelease: fixture.release.prerelease,
 			published_at: fixture.release.publishedAt,
-			body: fixture.options.changelog,
+			body: githubReleaseBody(fixture.options.changelog),
 			commit: fixture.release.commit,
 			assets,
 			sidecars,
@@ -391,6 +396,39 @@ describe("published Release index-only repair", () => {
 		const result = await publishUpdateIndex({ repository, ...prepared, run: gh.run });
 		expect(result.unchanged).toBe(false);
 		expect(gh.writes().filter((call) => call.args[1].endsWith("git/blobs"))).toHaveLength(1);
+	});
+	test("repair accepts Chinese-first downloads and historical layout without changing note identity", async () => {
+		const changelog = { en: "English release notes", "zh-CN": "中文发布说明" };
+		const f = await fixture("1.2.0", true, changelog);
+		const gh = fakeGitHub([f]);
+		const remote = gh.releases.get("v1.2.0");
+		if (!remote) throw new Error("Missing fixture release");
+		const downloads = { repository, version: "1.2.0", filenames: [f.name] };
+		for (const body of [
+			`## English\n\n${changelog.en}\n\n## 简体中文\n\n${changelog["zh-CN"]}\n`,
+			githubReleaseBody(changelog, downloads),
+		]) {
+			remote.body = body;
+			const prepared = await preparePublishedUpdateIndexRelease({
+				repository,
+				version: "1.2.0",
+				commit,
+				changelog,
+				run: gh.run,
+			});
+			expect(prepared.notes).toEqual(f.notes);
+		}
+		remote.body = githubReleaseBody(changelog, downloads).replace("github.com", "evil.invalid");
+		await expect(
+			preparePublishedUpdateIndexRelease({
+				repository,
+				version: "1.2.0",
+				commit,
+				changelog,
+				run: gh.run,
+			}),
+		).rejects.toThrow("published body");
+		expect(gh.writes()).toHaveLength(0);
 	});
 	test("repair preserves existing notes and remains idempotent; provided notes require published body equality", async () => {
 		const f = await fixture("1.2.0", true);

@@ -23,6 +23,7 @@ import {
 	GH_TIMEOUT_MS,
 	type GitHubReleaseOptions,
 	githubReleaseBody,
+	matchesGitHubReleaseBody,
 	publishGitHubRelease,
 	releaseChannel,
 	validateGitHubRepository,
@@ -921,6 +922,94 @@ describe("GitHub optional incremental patch assets", () => {
 		if (kind === "added") addPatch(data, "1.0.0", true);
 		gh.calls.length = 0;
 		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow();
+		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+	});
+});
+
+describe("Chinese-first release notes and executable download links", () => {
+	const suffixes = [
+		"linux-x64",
+		"linux-x64-baseline",
+		"linux-arm64",
+		"windows-x64.exe",
+		"windows-x64-baseline.exe",
+		"windows-arm64.exe",
+		"macos-x64",
+		"macos-arm64",
+	];
+	const downloads = {
+		repository: "Fork-Owner/Fork-Repo",
+		version: "1.2.0",
+		filenames: suffixes.map((suffix) => `narrafork-1.2.0-${suffix}`),
+	};
+	test("puts Chinese ahead of English and all eight verified executables at the top", () => {
+		const body = githubReleaseBody(changelog, downloads);
+		expect(body.startsWith("## 快速下载")).toBe(true);
+		expect(body.indexOf("## 简体中文")).toBeLessThan(body.indexOf("## English"));
+		expect(body.match(/\[直接下载\]\(/g)).toHaveLength(8);
+		for (const name of downloads.filenames)
+			expect(body).toContain(
+				`https://github.com/fork-owner/fork-repo/releases/download/v1.2.0/${name}`,
+			);
+		expect(body).toContain(changelog.en);
+		expect(body).toContain(changelog["zh-CN"]);
+	});
+	test("selected-platform notes never link missing executables, patches, or sidecars", () => {
+		const selected = {
+			...downloads,
+			filenames: [
+				"narrafork-1.2.0-windows-x64.exe",
+				"narrafork-1.2.0-windows-x64.exe.metadata.json",
+				"narrafork-1.2.0-windows-x64.exe.from-1.1.0.zstd-patch",
+				"narrafork-1.2.0-SHA256SUMS",
+			],
+		};
+		const body = githubReleaseBody(changelog, selected);
+		expect(body.match(/\[直接下载\]\(/g)).toHaveLength(1);
+		for (const excluded of [
+			"linux-x64",
+			"macos",
+			"windows-arm64",
+			".metadata.json",
+			".zstd-patch",
+			"SHA256SUMS",
+		])
+			expect(body).not.toContain(excluded);
+	});
+	test("layout compatibility preserves content and exact trusted download destinations", () => {
+		const legacy = `## English\n\n${changelog.en}\n\n## 简体中文\n\n${changelog["zh-CN"]}\n`;
+		const body = githubReleaseBody(changelog, downloads);
+		for (const variant of [legacy, githubReleaseBody(changelog), body])
+			expect(matchesGitHubReleaseBody(variant, changelog, downloads)).toBe(true);
+		for (const changed of [
+			`${body}\nunauthorized addition`,
+			body.replace("github.com/fork-owner/fork-repo", "evil.invalid/fork-owner/fork-repo"),
+			body.replace("/download/v1.2.0/", "/download/v1.3.0/"),
+			body.replace(changelog["zh-CN"], "different release notes"),
+		])
+			expect(matchesGitHubReleaseBody(changed, changelog, downloads)).toBe(false);
+	});
+	test("even a supported layout change during uploading stops publication", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		const run = async (args: string[]) => {
+			const result = await gh.run(args);
+			if (args[0] === "release" && args[1] === "upload" && gh.release)
+				gh.release.body = githubReleaseBody(changelog);
+			return result;
+		};
+		await expect(publishGitHubRelease({ ...options, run })).rejects.toThrow("changed");
+		expect(gh.release?.draft).toBe(true);
+		expect(gh.calls.some((args) => args[1] === "edit")).toBe(false);
+	});
+	test("read-only recovery accepts historical English-first notes without rewriting assets", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		await publishGitHubRelease({ ...options, run: gh.run });
+		if (!gh.release) throw new Error("Missing fixture release");
+		gh.release.body = `## English\n\n${changelog.en}\n\n## 简体中文\n\n${changelog["zh-CN"]}\n`;
+		gh.calls.length = 0;
+		await publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true });
 		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
 	});
 });

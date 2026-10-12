@@ -19,7 +19,7 @@ import {
 	type UpdateIndexRelease,
 	type UpdateIndexV1,
 } from "../../shared/update-index";
-import { type GhRunner, githubReleaseBody } from "./github-release";
+import { type GhRunner, matchesGitHubReleaseBody } from "./github-release";
 import { type GitHubReleaseSummary, listGitHubReleaseSummaries } from "./github-release-summary";
 import { type PreparedUpdateNotes, prepareUpdateNotes, textIdentity } from "./update-index";
 
@@ -415,7 +415,11 @@ export async function preparePublishedUpdateIndexRelease(options: {
 		if (
 			typeof body !== "string" ||
 			Buffer.byteLength(body) > MAX_UPDATE_NOTES_BYTES ||
-			body !== githubReleaseBody(options.changelog)
+			!matchesGitHubReleaseBody(body, options.changelog, {
+				repository,
+				version: options.version,
+				filenames: release.files.map((file) => file.name),
+			})
 		)
 			throw new Error("Public Release repair changelog does not match published body");
 		release.notes = { path: notes.path, size: notes.size, sha256: notes.sha256 };

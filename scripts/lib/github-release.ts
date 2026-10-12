@@ -60,9 +60,63 @@ export function releaseChannel(version: string): "stable" | "beta" {
 	return /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
 }
 
-export function githubReleaseBody(changelog?: string | Record<string, string>): string {
-	if (typeof changelog === "string") return changelog;
-	return `## English\n\n${changelog?.en ?? "No release notes provided."}\n\n## 简体中文\n\n${changelog?.["zh-CN"] ?? "未提供更新日志。"}\n`;
+export interface GitHubReleaseDownloads {
+	repository: string;
+	version: string;
+	filenames: readonly string[];
+}
+
+/** Human-facing links include full executables only, never sidecars or patches. */
+export function githubReleaseBody(
+	changelog?: string | Record<string, string>,
+	downloads?: GitHubReleaseDownloads,
+): string {
+	const notes =
+		typeof changelog === "string"
+			? changelog
+			: `## 简体中文\n\n${changelog?.["zh-CN"] ?? "未提供更新日志。"}\n\n## English\n\n${changelog?.en ?? "No release notes provided."}\n`;
+	if (!downloads) return notes;
+	validateGitHubRepository(downloads.repository);
+	if (!isValidReleaseVersion(downloads.version)) throw new Error("Invalid release version");
+	const available = new Set(downloads.filenames);
+	const platforms = [
+		["Windows", "x64", "windows-x64.exe"],
+		["Windows", "x64（baseline 兼容版）", "windows-x64-baseline.exe"],
+		["Windows", "ARM64", "windows-arm64.exe"],
+		["macOS", "Apple Silicon（ARM64）", "macos-arm64"],
+		["macOS", "Intel（x64）", "macos-x64"],
+		["Linux", "x64", "linux-x64"],
+		["Linux", "x64（baseline 兼容版）", "linux-x64-baseline"],
+		["Linux", "ARM64", "linux-arm64"],
+	];
+	// Repository identity is case-insensitive; one URL spelling keeps repair deterministic.
+	const root = `https://github.com/${downloads.repository.toLowerCase()}/releases/download/v${downloads.version}`;
+	const rows = platforms.flatMap(([system, architecture, suffix]) => {
+		const name = `narrafork-${downloads.version}-${suffix}`;
+		return available.has(name)
+			? [`| ${system} | ${architecture} | [直接下载](${root}/${encodeURIComponent(name)}) |`]
+			: [];
+	});
+	if (!rows.length) return notes;
+	return `## 快速下载\n\n选择对应系统与处理器的完整程序，无需在下方资产列表中查找。补丁和元数据供自动更新使用，不必手动下载。\n\n| 系统 | 处理器 | 下载 |\n| --- | --- | --- |\n${rows.join("\n")}\n\n${notes}`;
+}
+
+/** Accept only exact supported layouts of the same changelog and verified download set. */
+export function matchesGitHubReleaseBody(
+	body: unknown,
+	changelog?: string | Record<string, string>,
+	downloads?: GitHubReleaseDownloads,
+): boolean {
+	if (typeof body !== "string" || Buffer.byteLength(body) > MAX_TEXT_BYTES) return false;
+	const legacy =
+		typeof changelog === "string"
+			? changelog
+			: `## English\n\n${changelog?.en ?? "No release notes provided."}\n\n## 简体中文\n\n${changelog?.["zh-CN"] ?? "未提供更新日志。"}\n`;
+	return (
+		body === legacy ||
+		body === githubReleaseBody(changelog) ||
+		(downloads !== undefined && body === githubReleaseBody(changelog, downloads))
+	);
 }
 
 interface Asset {
@@ -511,7 +565,14 @@ export async function publishGitHubRelease(
 	validateGitHubRepository(repository);
 	const run = options.run ?? runGh;
 	const tag = `v${options.version}`;
-	const body = githubReleaseBody(options.changelog);
+	const downloads = {
+		repository,
+		version: options.version,
+		filenames: [...options.platformSuffixes.values()].map(
+			(suffix) => `narrafork-${options.version}-${suffix}`,
+		),
+	};
+	const body = githubReleaseBody(options.changelog, downloads);
 	if (Buffer.byteLength(body) > MAX_TEXT_BYTES) throw new Error("Release notes exceed size limit");
 	let prerelease = releaseChannel(options.version) === "beta";
 	const directory = await mkdtemp(join(tmpdir(), "narrafork-github-release-"));
@@ -574,8 +635,13 @@ export async function publishGitHubRelease(
 			release = await getRelease(run, repository, tag);
 			if (!release?.draft) throw new Error("Expected a newly created draft release");
 		}
-		if (release.prerelease !== prerelease || release.body !== body)
+		if (
+			release.prerelease !== prerelease ||
+			!matchesGitHubReleaseBody(release.body, options.changelog, downloads)
+		)
 			throw new Error("Existing release channel/notes mismatch");
+		// Layout compatibility never allows notes to change during this publication.
+		const verifiedBody = release.body;
 		const alreadyPublished = !release.draft;
 		const existing = new Map<string, RemoteAsset>();
 		for (const remote of release.assets) {
@@ -596,7 +662,7 @@ export async function publishGitHubRelease(
 			!release ||
 			release.draft === alreadyPublished ||
 			release.prerelease !== prerelease ||
-			release.body !== body ||
+			release.body !== verifiedBody ||
 			release.assets.length !== assets.length
 		)
 			throw new Error("Release changed or assets incomplete during verification");
@@ -624,7 +690,7 @@ export async function publishGitHubRelease(
 				!published ||
 				published.draft ||
 				published.prerelease !== prerelease ||
-				published.body !== body ||
+				published.body !== verifiedBody ||
 				published.assets.length !== assets.length
 			)
 				throw new Error("GitHub did not confirm publication");
