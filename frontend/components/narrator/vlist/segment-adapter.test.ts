@@ -1834,6 +1834,48 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect("isTakenOver" in subagentData({ toolName: "Task", status: "running" })).toBe(false);
 	});
 
+	/**
+	 * The live output counter: the server streams the child's reply length as a
+	 * bare numeric `tool_output` payload (the ContextAsk convention), bridged onto
+	 * the card's metadata by `resolveToolMetadata`. It is a header BADGE — painted
+	 * from the cached payload — so the adapter must surface it (and
+	 * `subagentRevision` must key it) only while the child is still working.
+	 */
+	it("carries the child's live output counter while running", () => {
+		const data = subagentData({
+			toolName: "Agent",
+			status: "running",
+			inputJson: { subagent_type: "explore", description: "dig" },
+			_streamingOutput: "1240",
+		});
+		expect(data.liveOutputChars).toBe(1240);
+		// The count rides the header badge — `toolOutputValue` folds the same payload
+		// into the output slot, and it must never become the conclusion body.
+		expect(data.resultText).toBeUndefined();
+		expect(data.resultBody).toBeUndefined();
+	});
+
+	it("omits the counter on a terminal card or a non-numeric stream", () => {
+		expect(
+			"liveOutputChars" in
+				subagentData({
+					toolName: "Agent",
+					status: "success",
+					inputJson: {},
+					_streamingOutput: "1240",
+				}),
+		).toBe(false);
+		expect(
+			"liveOutputChars" in
+				subagentData({
+					toolName: "Agent",
+					status: "running",
+					inputJson: {},
+					_streamingOutput: "thinking…",
+				}),
+		).toBe(false);
+	});
+
 	it("omits prompt when inputJson carries none (no fabrication)", () => {
 		const data = subagentData({
 			toolName: "Task",

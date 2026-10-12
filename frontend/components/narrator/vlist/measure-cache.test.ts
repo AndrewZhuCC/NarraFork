@@ -1428,6 +1428,17 @@ describe("extractDataRevision", () => {
 			expect(after).toContain("gn:2");
 		});
 
+		it("a subagent card's live output counter re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			// Height-neutral but PAINTED from the cached payload: the streaming channel
+			// advances the count alone, so without the key component the badge would
+			// freeze at whatever the first measure saw.
+			const before = extractDataRevision(traceWith(agentCard()));
+			const after = extractDataRevision(traceWith(agentCard({ liveOutputChars: 1240 })));
+			expect(after).not.toBe(before);
+			expect(after).toContain("gl:1240");
+		});
+
 		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {
 			const { extractDataRevision } = await import("./measure-cache");
 			expect(

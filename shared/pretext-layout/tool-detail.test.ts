@@ -9,6 +9,7 @@ import {
 	extractNumericField,
 	isTruncated,
 	MEDIA_IMAGE_CONTENT_PX,
+	parseLiveOutputChars,
 	resolveDisplayText,
 	resolveFileDiffStats,
 	type ToolAskDetail,
@@ -828,6 +829,22 @@ describe("protocol receipts stay out of displayed tool output", () => {
 	});
 });
 
+describe("parseLiveOutputChars", () => {
+	it("parses the bare cumulative-count payload", () => {
+		expect(parseLiveOutputChars("1240")).toBe(1240);
+		expect(parseLiveOutputChars(" 7 ")).toBe(7);
+		expect(parseLiveOutputChars("0")).toBe(0);
+	});
+	it("rejects bodies that are not a bare count", () => {
+		expect(parseLiveOutputChars("thinking…")).toBeNull();
+		expect(parseLiveOutputChars("12 lines")).toBeNull();
+		expect(parseLiveOutputChars("")).toBeNull();
+		expect(parseLiveOutputChars(undefined)).toBeNull();
+		expect(parseLiveOutputChars(null)).toBeNull();
+		expect(parseLiveOutputChars(42)).toBeNull();
+	});
+});
+
 describe("classifyToolDetail — await", () => {
 	it("uses a term-capped output section for bash await", () => {
 		const d = classifyToolDetail({
@@ -861,6 +878,34 @@ describe("classifyToolDetail — await", () => {
 		});
 		expect(metaBadgeLabels(d)).toEqual(["agent", "t-9", "→ n-1", "completed", "timeout: 10m"]);
 		expect(metaTexts(d)).toEqual(['wait_for: "done"', "subagent: sa-1"]);
+	});
+	it("shows the awaited child's live output counter while running", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			status: "running",
+			inputJson: { type: "agent", id: "worker-1" },
+			outputJson: undefined,
+			metadata: { _streamingOutput: "512" },
+		});
+		const body = sectionBody(d, "result") as ToolStructuredDetail;
+		expect(body.kind).toBe("structured");
+		expect(body.bodyLines).toEqual(["512 chars"]);
+	});
+	it("never paints the counter once the wait is terminal", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			status: "success",
+			inputJson: { type: "agent", id: "worker-1" },
+			outputJson: "done",
+			metadata: { _streamingOutput: "512" },
+		});
+		const body = sectionBody(d, "result") as ToolCappedDetail;
+		expect(body.kind).toBe("capped");
+		expect(body.text).toBe("done");
 	});
 });
 
