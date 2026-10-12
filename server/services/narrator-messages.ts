@@ -66,6 +66,7 @@ import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	AWAIT_AGENT_RESOLVED_FIELD,
+	type AwaitAgentResolution,
 	attachAwaitAgentNarratorIds,
 	attachTakenOverFlags,
 	resolveAwaitAgentIdsForToolCalls,
@@ -2801,7 +2802,7 @@ async function buildTreeFromTopLevelRefs(
  */
 function collectTakenOverToolUseIds(
 	activities: ReadonlyMap<string, SubagentActivity>,
-	awaitAgentIds: ReadonlyMap<string, string>,
+	awaitAgentIds: ReadonlyMap<string, AwaitAgentResolution>,
 ): Set<string> {
 	const flagged = new Set<string>();
 	const takenOver = new Set(listDisplayTakenOverSubagents());
@@ -2811,7 +2812,7 @@ function collectTakenOverToolUseIds(
 		if (child && takenOver.has(child)) flagged.add(toolUseId);
 	}
 	for (const [toolUseId, child] of awaitAgentIds) {
-		if (takenOver.has(child)) flagged.add(toolUseId);
+		if (takenOver.has(child.id)) flagged.add(toolUseId);
 	}
 	return flagged;
 }
@@ -2827,7 +2828,7 @@ function collectTakenOverToolUseIds(
 async function resolveAwaitAgentIdsForMessages(
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	messages: any[],
-): Promise<Map<string, string>> {
+): Promise<Map<string, AwaitAgentResolution>> {
 	const candidates: Array<{
 		toolUseId: string;
 		toolName: string;

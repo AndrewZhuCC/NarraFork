@@ -196,6 +196,10 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			_awaitAgentNarratorId:
 				// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 				block._awaitAgentNarratorId ?? (tc as any)?._awaitAgentNarratorId,
+			// Companion of the id above: the session's display title, so the running
+			// card can headline it before the tool's metadata exists.
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+			_awaitAgentTitle: block._awaitAgentTitle ?? (tc as any)?._awaitAgentTitle,
 			// Same contract: an explicit field list, so a missing entry here silently
 			// drops the takeover badge and the card goes back to looking merely busy.
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields

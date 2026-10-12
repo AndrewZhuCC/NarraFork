@@ -955,6 +955,24 @@ function leafTextRevision(d: Record<string, unknown>): string {
 		rev += `|doc:${doc.id}:${doc.epoch}:${doc.revision}:${doc.length}:${doc.complete}`;
 	}
 	if (typeof d.text === "string") rev += `|tx:${textSignature(d.text)}`;
+	// Meta rows (an Await card's identity line / wait_for row, a Share card's
+	// actions): each row reserves its own block, so a row appearing — the awaited
+	// child's resolved id landing mid-wait — changes the measured height. Key the
+	// text-bearing fields plus the fixed-slot counts (badge/action rows reserve
+	// one block each); the badge/action payloads themselves are render-only.
+	if (Array.isArray(d.rows)) {
+		rev += `|rows:${d.rows
+			.map((r) => {
+				const row = r as Record<string, unknown> | null;
+				if (!row) return "-";
+				const text = typeof row.text === "string" ? textSignature(row.text) : "";
+				const identity = typeof row.identity === "string" ? textSignature(row.identity) : "";
+				return `${text}:${identity}:${Array.isArray(row.badges) ? row.badges.length : 0}:${
+					Array.isArray(row.actions) ? row.actions.length : 0
+				}`;
+			})
+			.join(";")}`;
+	}
 	for (const key of [
 		"id",
 		"source",

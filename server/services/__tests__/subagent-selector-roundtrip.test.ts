@@ -143,14 +143,24 @@ describe("recovered subagents retain their original selectors", () => {
 				id: "normal-stage-audit",
 			});
 			expect(targets.map((target) => target.id)).toEqual([NANOID]);
+			// The early target-resolved notice carries the title too, so a running
+			// card can headline the session name before the wait returns.
+			let notifiedTitle: string | null | undefined;
 			const result = await awaitAgentResultDetailed({
 				callerNarratorId: PARENT,
 				id: "normal-stage-audit",
 				signal: new AbortController().signal,
+				onTargetResolved: (_id, title) => {
+					notifiedTitle = title;
+				},
 			});
+			expect(notifiedTitle).toBe("核实法线实际调用阶段");
 			expect(result).toMatchObject({
 				id: NANOID,
 				label: "normal-stage-audit",
+				// The session's display title rides the result so the card can
+				// headline the name rather than the slug.
+				title: "核实法线实际调用阶段",
 				status: "completed",
 				output: "audit result",
 			});

@@ -56,3 +56,34 @@ describe("Await header summary live output counter", () => {
 		expect(getSummary("Await", input, { _streamingOutput: "waiting" })).toBe("agent: worker-1");
 	});
 });
+
+describe("Await header summary target naming", () => {
+	const input = { type: "agent", id: "worker-1" };
+
+	it("headlines the session title when the returned metadata carries one", () => {
+		expect(
+			getSummary("Await", input, {
+				targetTitle: "SDK review 修复方案",
+				targetLabel: "sdk-review",
+			}),
+		).toBe("agent: SDK review 修复方案");
+	});
+
+	it("prefers the live transport title while the wait is still running", () => {
+		expect(getSummary("Await", input, { _awaitAgentTitle: "Plan story retirement" })).toBe(
+			"agent: Plan story retirement",
+		);
+		// The persisted title wins once the tool has returned.
+		expect(
+			getSummary("Await", input, {
+				targetTitle: "Final name",
+				_awaitAgentTitle: "Live name",
+			}),
+		).toBe("agent: Final name");
+	});
+
+	it("falls back to the resolved alias, then the raw selector", () => {
+		expect(getSummary("Await", input, { targetLabel: "sdk-review" })).toBe("agent: sdk-review");
+		expect(getSummary("Await", input)).toBe("agent: worker-1");
+	});
+});
