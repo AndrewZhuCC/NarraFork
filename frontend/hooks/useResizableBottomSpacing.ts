@@ -6,7 +6,8 @@
  * (input area + bottom spacing).
  */
 
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+import { readLocalPref, useLocalPref } from "./useLocalPref";
 
 const STORAGE_KEY = "narrafork_narrator_bottom_spacing";
 const DEFAULT_SPACING = 0;
@@ -86,6 +87,10 @@ let drag: DragState | null = null;
 
 function onPointerMove(event: PointerEvent): void {
 	if (!drag || event.pointerId !== drag.pointerId) return;
+	if (!readLocalPref("narrafork_narrator_bottom_spacing_resize")) {
+		endDrag();
+		return;
+	}
 	// Dragging UP (negative delta) increases spacing, DOWN decreases.
 	const raw = drag.startSpacing + (drag.startY - event.clientY);
 	const clamped = Math.min(MAX_SPACING, Math.max(MIN_SPACING, raw));
@@ -129,6 +134,7 @@ export function startBottomSpacingResize(event: {
 	pointerId: number;
 	preventDefault: () => void;
 }): void {
+	if (!readLocalPref("narrafork_narrator_bottom_spacing_resize")) return;
 	event.preventDefault();
 	if (drag) endDrag();
 	drag = {
@@ -154,7 +160,13 @@ export function startBottomSpacingResize(event: {
  * The current bottom spacing in px.
  */
 export function useBottomSpacing(): number {
-	return useSyncExternalStore(subscribe, getSpacing, getSpacing);
+	const [resizeEnabled] = useLocalPref("narrafork_narrator_bottom_spacing_resize");
+	const spacing = useSyncExternalStore(subscribe, getSpacing, getSpacing);
+	useEffect(() => {
+		if (!resizeEnabled) endDrag();
+	}, [resizeEnabled]);
+	// Ignore legacy saved spacing while fixed, but retain it for manual opt-in.
+	return resizeEnabled ? spacing : MIN_SPACING;
 }
 
 /** Whether the resize handle is currently being dragged. */

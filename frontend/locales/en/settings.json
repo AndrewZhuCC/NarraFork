@@ -1183,6 +1183,8 @@
 	"displaySection": "Display",
 	"ignoreSafeArea": "Fullscreen Mode",
 	"ignoreSafeAreaDesc": "Hide the system status bar and use the entire screen. Turn off to show the status bar.",
+	"bottomSpacingResize": "Allow Dragging the Input Area",
+	"bottomSpacingResizeDesc": "Drag the top edge of the narrator input area to adjust bottom spacing. Off by default to keep the input area at the bottom.",
 	"wakeLock": "Keep Screen Awake",
 	"wakeLockDesc": "Prevent the screen from dimming or locking while NarraFork is open",
 	"advancedAnimation": "Advanced Animation",
