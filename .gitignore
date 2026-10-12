@@ -48,6 +48,10 @@ scripts/lib/*
 # Release CI control, immutable bundles, strict native inputs and native smoke.
 !scripts/ci-release.ts
 !scripts/smoke-release-binary.ts
+# Explicit 123 distribution operators; old server receives patches/metadata only.
+!scripts/publish-123-distribution.ts
+!scripts/import-123-patches.py
+!scripts/restore-123-originals.ts
 !scripts/lib/ci-release-*.ts
 !scripts/lib/ci-build-*.ts
 !scripts/lib/github-release-baseline.ts
