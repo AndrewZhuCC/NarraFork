@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { isValidGitHubRepository } from "../../shared/github-repository";
+import { parseHelperDistributionDependencies } from "../../shared/helper-distribution";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import {
@@ -111,6 +112,10 @@ const planSchema = z
 								size: id.max(1024 ** 3),
 								sha256: z.string().regex(/^[a-f0-9]{64}$/),
 								sha512: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
+								helperDistribution: z
+									.unknown()
+									.transform((value) => parseHelperDistributionDependencies(value))
+									.optional(),
 							})
 							.strict(),
 					})
@@ -229,6 +234,8 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 	const seen = new Set<string>();
 	const count = new Map<string, number>();
 	for (const base of plan.baselines) {
+		if (base.metadata.helperDistribution !== undefined)
+			parseHelperDistributionDependencies(base.metadata.helperDistribution, base.version);
 		const target = CI_RELEASE_TARGETS.find((item) => item.platform === base.platform);
 		const key = `${base.platform}/${base.version}`;
 		if (
