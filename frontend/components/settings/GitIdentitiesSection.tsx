@@ -85,8 +85,16 @@ export function GitIdentitiesSection() {
 			<Group justify="space-between">
 				<Text fw={500}>{t("gitIdentitiesTitle")}</Text>
 				<Group gap="xs">
+					<Button
+						size="xs"
+						variant="light"
+						leftSection={<IconPlus size={14} />}
+						onClick={openCreate}
+					>
+						{t("gitIdentityAdd")}
+					</Button>
 					{/* 默认只在外部点击或 Esc 时关闭：点开关本身不关闭，方便连续改两个。 */}
-					<Popover width={300} position="bottom-end" shadow="md">
+					<Popover width="max-content" position="bottom-end" shadow="md">
 						<Popover.Target>
 							<Button size="xs" variant="default" leftSection={<IconSettings size={14} />}>
 								{t("gitIdentitiesDisplaySettings")}
@@ -113,14 +121,6 @@ export function GitIdentitiesSection() {
 							</Stack>
 						</Popover.Dropdown>
 					</Popover>
-					<Button
-						size="xs"
-						variant="light"
-						leftSection={<IconPlus size={14} />}
-						onClick={openCreate}
-					>
-						{t("gitIdentityAdd")}
-					</Button>
 				</Group>
 			</Group>
 			<Text size="xs" c="dimmed">
