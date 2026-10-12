@@ -19,6 +19,7 @@ import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { eq } from "drizzle-orm";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
+import { ApiRequestDumpCollector, responseDumpBudget } from "./agent/request-dump";
 import type { ApiRequestDiagnostics } from "./agent/types";
 import { boundedContextSnapshot } from "./context-usage-snapshot";
 import { captureReferencePricingSnapshot, cloneReferencePricingSnapshot } from "./model-pricing";
@@ -571,7 +572,7 @@ export interface TrackApiRequestOptions extends ApiRequestStartOptions {}
 
 export async function trackApiRequest<T>(
 	options: TrackApiRequestOptions,
-	fn: () => Promise<T>,
+	fn: (requestDump?: ApiRequestDumpCollector) => Promise<T>,
 ): Promise<T> {
 	return withModelMetadataSnapshot(() => {
 		// Capture discovered metadata as well as catalog/local revisions before any
@@ -583,11 +584,18 @@ export async function trackApiRequest<T>(
 
 async function trackApiRequestInSnapshot<T>(
 	options: TrackApiRequestOptions,
-	fn: () => Promise<T>,
+	fn: (requestDump?: ApiRequestDumpCollector) => Promise<T>,
 ): Promise<T> {
 	const handle = startApiRequest(options);
+	const requestDump =
+		options.kind === "compact" && isRequestDumpEnabled()
+			? new ApiRequestDumpCollector(
+					{ provider: options.provider, model: options.model },
+					responseDumpBudget(settings.agent.requestDumpMaxSize),
+				)
+			: undefined;
 	try {
-		const result = await fn();
+		const result = await fn(requestDump);
 		const resultMeta = typeof result === "object" && result !== null ? result : null;
 		const contextPercent =
 			resultMeta && "contextPercent" in resultMeta
@@ -616,6 +624,10 @@ async function trackApiRequestInSnapshot<T>(
 				usage: usage ?? null,
 				meterUsage: meterUsage ?? null,
 				meterUnit: meterUnit ?? null,
+				rawDump:
+					isRequestDumpEnabled() && !isRequestDumpErrorsOnly()
+						? requestDump?.snapshot()
+						: undefined,
 			});
 		} catch (error) {
 			logger.warn("Failed to record API request", { requestId: handle.id, error });
@@ -623,9 +635,11 @@ async function trackApiRequestInSnapshot<T>(
 		return result;
 	} catch (error) {
 		try {
+			requestDump?.setResponseError(error);
 			await finishApiRequest(handle, {
 				errorMessage: error instanceof Error ? error.message : String(error),
 				diagnostics: diagnosticsFromError(error),
+				rawDump: isRequestDumpEnabled() ? requestDump?.snapshot() : undefined,
 			});
 		} catch (recordError) {
 			logger.warn("Failed to record failed API request", {

@@ -16,6 +16,7 @@ import {
 	findUnpairedCodexFunctionCallIds,
 } from "../lib/agent/openai-provider";
 import { isCodexRemoteCompactEnabled, resolveProviderAndModel } from "../lib/agent/provider";
+import { trackApiRequest } from "../lib/api-request-tracker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -1179,16 +1180,27 @@ async function doRunCustomCompact({
 					historyCount: built.history.length,
 					trailingToolResultCount: built.trailingToolResults.length,
 				});
-				const remote = await (
-					resolvedCompact.adapter as import("../lib/agent/provider").RemoteCompactCapableProvider
-				).compactRemote(built.history, resolvedCompact.model, {
-					signal,
-					conversationId:
-						(active?.alive ? active.conversationId : narrator?.apiConversationId) || narratorId,
-					trailingToolResults: built.trailingToolResults,
-					onActivity: hooks?.beat,
-					reasoningEffort: remoteEffort ?? undefined,
-				});
+				const remote = await trackApiRequest(
+					{
+						kind: "compact",
+						narratorId,
+						userId: summaryUserId,
+						provider: resolvedCompact.provider,
+						model: resolvedCompact.model,
+					},
+					(requestDump) =>
+						(
+							resolvedCompact.adapter as import("../lib/agent/provider").RemoteCompactCapableProvider
+						).compactRemote(built.history, resolvedCompact.model, {
+							signal,
+							conversationId:
+								(active?.alive ? active.conversationId : narrator?.apiConversationId) || narratorId,
+							trailingToolResults: built.trailingToolResults,
+							onActivity: hooks?.beat,
+							reasoningEffort: remoteEffort ?? undefined,
+							requestDump,
+						}),
+				);
 				remoteCompact = {
 					provider: "codex",
 					version: 1,

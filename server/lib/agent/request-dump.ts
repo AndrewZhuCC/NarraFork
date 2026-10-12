@@ -146,6 +146,26 @@ export function captureResponseStream(
 	return { stream, finish };
 }
 
+/** Capture HTTP bodies as the existing parser consumes them, without teeing or draining ahead. */
+export function captureDumpResponse(
+	response: Response,
+	collector?: ApiRequestDumpCollector,
+): Response {
+	if (!collector) return response;
+	collector.setResponseMeta({
+		status: response.status,
+		headers: sanitizeHeaders(response.headers),
+	});
+	if (!response.body) return response;
+	const captured = new Response(captureResponseStream(response.body, collector).stream, response);
+	Object.defineProperties(captured, {
+		url: { value: response.url },
+		redirected: { value: response.redirected },
+		type: { value: response.type },
+	});
+	return captured;
+}
+
 const SENSITIVE_HEADER_PATTERNS = [
 	/^authorization$/i,
 	/^x-api-key$/i,

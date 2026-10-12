@@ -28,7 +28,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { captureDumpResponse, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -403,17 +403,22 @@ export class GrokProvider implements ProviderAdapter {
 		}
 		messages.push({ role: "user", content: text });
 
-		const response = await this.pfetch(`${baseUrl}/responses`, {
-			method: "POST",
-			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify({
-				model: bareModel,
-				input: messages,
-				stream: true,
-				store: false,
+		const url = `${baseUrl}/responses`;
+		const headers = this.buildHeaders(apiKey);
+		const body = { model: bareModel, input: messages, stream: true, store: false };
+		options?.requestDump?.beginResponseAttempt(
+			{ transport: "http", url, headers, body },
+			settings.agent.requestDumpMaxSize,
+		);
+		const response = captureDumpResponse(
+			await this.pfetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: options?.signal,
 			}),
-			signal: options?.signal,
-		});
+			options?.requestDump,
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");

@@ -60,7 +60,13 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
-import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
+import {
+	type ApiRequestDumpCollector,
+	BoundedUtf8Capture,
+	captureDumpResponse,
+	captureResponseStream,
+	sanitizeHeaders,
+} from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -709,6 +715,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
 			onActivity?: () => void;
+			requestDump?: ApiRequestDumpCollector;
 			/** Official Codex selects its transport outside this delegate. */
 			useWebSocket?: boolean;
 		},
@@ -785,6 +792,8 @@ export class OpenAIProvider implements ProviderAdapter {
 					signal: options?.signal ?? new AbortController().signal,
 					ephemeral: true,
 					extraHeaders: headers,
+					requestDump: options?.requestDump,
+					requestDumpMaxBytes: settings.agent.requestDumpMaxSize,
 					onResponseFrame: (frame) => {
 						budget.add(Buffer.byteLength(frame, "utf8"));
 						options?.onActivity?.();
@@ -802,12 +811,20 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 		if (!items) {
 			headers.Accept = "text/event-stream";
-			const response = await this.pfetch(`${baseUrl}/responses`, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-				signal: options?.signal,
-			});
+			const url = `${baseUrl}/responses`;
+			options?.requestDump?.beginResponseAttempt(
+				{ transport: "http", url, headers, body },
+				settings.agent.requestDumpMaxSize,
+			);
+			const response = captureDumpResponse(
+				await this.pfetch(url, {
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+					signal: options?.signal,
+				}),
+				options?.requestDump,
+			);
 			items = await readCompactOutputItems(response, options);
 		}
 		const retainedUsers = retainCompactUsers(input);
@@ -1561,12 +1578,20 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (turnState?.value && this.apiMode === "codex") {
 			headers["x-codex-turn-state"] = turnState.value;
 		}
-		const response = await this.pfetch(`${baseUrl}/responses`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify(body),
-			signal,
-		});
+		const url = `${baseUrl}/responses`;
+		options?.requestDump?.beginResponseAttempt(
+			{ transport: "http", url, headers, body },
+			settings.agent.requestDumpMaxSize,
+		);
+		const response = captureDumpResponse(
+			await this.pfetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal,
+			}),
+			options?.requestDump,
+		);
 		// Capture the turn's sticky-routing token before status handling so even
 		// a non-2xx first response can seed the retried request.
 		if (turnState && this.apiMode === "codex" && !turnState.value) {
@@ -1640,12 +1665,21 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Chat Completions generation requires stream=true");
 		}
-		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
-			method: "POST",
-			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify(body),
-			signal,
-		});
+		const url = `${baseUrl}/chat/completions`;
+		const headers = this.buildHeaders(apiKey);
+		options?.requestDump?.beginResponseAttempt(
+			{ transport: "http", url, headers, body },
+			settings.agent.requestDumpMaxSize,
+		);
+		const response = captureDumpResponse(
+			await this.pfetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal,
+			}),
+			options?.requestDump,
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");

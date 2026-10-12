@@ -25,7 +25,7 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { captureDumpResponse, DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -520,6 +520,7 @@ export class GeminiProvider implements ProviderAdapter {
 			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
+			requestDump: options?.requestDump,
 		});
 	}
 
@@ -557,6 +558,7 @@ export class GeminiProvider implements ProviderAdapter {
 			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
+			requestDump: options?.requestDump,
 		});
 	}
 
@@ -571,6 +573,7 @@ export class GeminiProvider implements ProviderAdapter {
 		maxOutputTokens?: number;
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
+		requestDump?: GenerateOptions["requestDump"];
 	}): Promise<GenerateMetaResult> {
 		const apiKey = this.getApiKey();
 		const baseUrl = this.baseUrl();
@@ -597,16 +600,24 @@ export class GeminiProvider implements ProviderAdapter {
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-		const response = await this.pfetch(url, {
-			method: "POST",
-			headers: {
-				Accept: "text/event-stream",
-				"Content-Type": "application/json",
-				"x-goog-api-key": apiKey,
-			},
-			body: bodyText,
-			signal: opts.signal,
-		});
+		const headers = {
+			Accept: "text/event-stream",
+			"Content-Type": "application/json",
+			"x-goog-api-key": apiKey,
+		};
+		opts.requestDump?.beginResponseAttempt(
+			{ transport: "http", url, headers, body },
+			settings.agent.requestDumpMaxSize,
+		);
+		const response = captureDumpResponse(
+			await this.pfetch(url, {
+				method: "POST",
+				headers,
+				body: bodyText,
+				signal: opts.signal,
+			}),
+			opts.requestDump,
+		);
 		if (!response.ok) {
 			const responseText = await readResponseTextWithLimit(
 				response,

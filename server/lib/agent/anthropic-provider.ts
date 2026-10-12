@@ -55,7 +55,12 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import {
+	type ApiRequestDumpCollector,
+	captureDumpResponse,
+	captureResponseStream,
+	sanitizeHeaders,
+} from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1364,12 +1369,32 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * On a successful fallback the resolved base URL is cached (instance- and
 	 * process-wide) and a fix suggestion is broadcast to clients.
 	 */
-	private async fetchWithV1Fallback(path: string, init: RequestInit): Promise<Response> {
+	private async fetchWithV1Fallback(
+		path: string,
+		init: RequestInit,
+		capture?: { collector: ApiRequestDumpCollector; body: unknown },
+	): Promise<Response> {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
 		// All requests go through the proxy-aware fetch so streaming and auxiliary
 		// calls uniformly follow the global outbound proxy policy.
-		const doFetch = this.pfetch.bind(this);
+		const doFetch = async (target: string, request: RequestInit) => {
+			capture?.collector.beginResponseAttempt(
+				{
+					transport: "http",
+					url: target,
+					headers: sanitizeHeaders(new Headers(request.headers)),
+					body: capture.body,
+				},
+				settings.agent.requestDumpMaxSize,
+			);
+			try {
+				return captureDumpResponse(await this.pfetch(target, request), capture?.collector);
+			} catch (error) {
+				capture?.collector.setResponseError(error);
+				throw error;
+			}
+		};
 		const canFallback = !AnthropicProvider.hasV1Suffix(baseUrl);
 
 		let response: Response;
@@ -2216,6 +2241,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				body: JSON.stringify(body),
 				signal: options?.signal,
 			},
+			options?.requestDump ? { collector: options.requestDump, body } : undefined,
 		);
 
 		if (!response.ok) {

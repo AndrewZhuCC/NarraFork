@@ -489,6 +489,7 @@ export class CodexProvider implements ProviderAdapter {
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
 			onActivity?: () => void;
+			requestDump?: ChatParams["requestDump"];
 		},
 	): Promise<{ items: unknown[] }> {
 		if (!this.useRemoteCompact) {

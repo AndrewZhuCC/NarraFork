@@ -18,6 +18,7 @@ import {
 	resolveProviderAndModel,
 } from "./provider";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
+import type { ApiRequestDumpCollector } from "./request-dump";
 import { projectMessageSenderForModel } from "./sender-projection";
 import { stripCitationMarkersForModel } from "./strip-citation-markers";
 import { stripPlanBodyForModel } from "./strip-plan-body";
@@ -194,10 +195,10 @@ export async function agentGenerateWithMetaResolved(
 	options?: GenerateOptions,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<import("./provider").GenerateMetaResult> {
-	const generate = () =>
-		withReasoningMandatoryFallback(
+	const generate = async (requestDump?: ApiRequestDumpCollector) => {
+		const result = await withReasoningMandatoryFallback(
 			`${resolved.provider}:${resolved.model}`,
-			options,
+			requestDump ? { ...options, requestDump } : options,
 			(effectiveOptions) =>
 				resolved.adapter.generateWithMeta(
 					text,
@@ -206,6 +207,12 @@ export async function agentGenerateWithMetaResolved(
 					effectiveOptions,
 				),
 		);
+		// Validate inside the tracked attempt so an empty compact keeps its failed dump too.
+		if (tracking?.kind === "compact" && !result.text?.trim()) {
+			throw new Error("Compact summary model returned empty output");
+		}
+		return result;
+	};
 	if (!tracking) return generate();
 	return trackApiRequest(
 		{

@@ -25,7 +25,7 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { captureDumpResponse, DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -516,6 +516,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
+			requestDump: options?.requestDump,
 		});
 	}
 
@@ -548,6 +549,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
+			requestDump: options?.requestDump,
 		});
 	}
 
@@ -618,6 +620,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		maxOutputTokens?: number;
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
+		requestDump?: GenerateOptions["requestDump"];
 	}): Promise<GenerateMetaResult> {
 		const model = parseModelId(options.model).model;
 		const body = this.buildRequestBody({
@@ -630,12 +633,21 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
-		const response = await this.pfetch(`${this.baseUrl()}/interactions`, {
-			method: "POST",
-			headers: this.headers(true),
-			body: bodyText,
-			signal: options.signal,
-		});
+		const url = `${this.baseUrl()}/interactions`;
+		const headers = this.headers(true);
+		options.requestDump?.beginResponseAttempt(
+			{ transport: "http", url, headers, body },
+			settings.agent.requestDumpMaxSize,
+		);
+		const response = captureDumpResponse(
+			await this.pfetch(url, {
+				method: "POST",
+				headers,
+				body: bodyText,
+				signal: options.signal,
+			}),
+			options.requestDump,
+		);
 		if (!response.ok) {
 			const responseText = await readResponseTextWithLimit(response, GEMINI_MAX_STREAM_BYTES);
 			throw interactionHttpError(response.status, responseText);

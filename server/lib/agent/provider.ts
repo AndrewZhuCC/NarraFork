@@ -110,6 +110,8 @@ export interface ChatParams extends ProtocolChatParams {
 }
 
 export interface GenerateOptions {
+	/** Optional collector supplied by tracked compression requests; never sent upstream. */
+	requestDump?: ApiRequestDumpCollector;
 	/** Optional reasoning/thinking effort for lightweight generation helpers. */
 	reasoningEffort?: ChatParams["reasoningEffort"];
 	/** Optional provider output-token ceiling for lightweight generation helpers. */
@@ -163,6 +165,7 @@ export interface RemoteCompactCapableProvider {
 			reasoningEffort?: ChatParams["reasoningEffort"];
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
+			requestDump?: ApiRequestDumpCollector;
 			/** Lightweight liveness notification for each non-empty response chunk. */
 			onActivity?: () => void;
 		},
