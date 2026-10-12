@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { clearPwaCacheAndReload } from "../lib/pwa";
+import { appVersionsMatch } from "../lib/version-match";
 import { createVersionRefreshMonitor } from "../lib/version-refresh";
 import { hasDisconnected, onWSStatusChange } from "../lib/ws-status";
 
@@ -8,7 +9,8 @@ export function useVersionCheck(intervalMs = 60_000) {
 	const [dismissed, setDismissed] = useState(false);
 	const [serverVersion, setServerVersion] = useState<string>();
 	const appVersion = __APP_VERSION__.replace(/^v/, "");
-	const updateAvailable = !dismissed && !!serverVersion && serverVersion !== appVersion;
+	const updateAvailable =
+		!dismissed && !!serverVersion && !appVersionsMatch(serverVersion, appVersion);
 
 	useEffect(() => {
 		const monitor = createVersionRefreshMonitor(appVersion, setServerVersion);
