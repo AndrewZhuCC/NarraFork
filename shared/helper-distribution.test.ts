@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+	COMPONENT_VERSIONS,
 	createHelperDistributionDependencies,
+	EXECUTOR_RELEASE_VERSION,
 	getHelperAssetName,
 	HELPER_BINARY_MAX_BYTES,
 	HELPER_CATALOG_VERSION,
@@ -10,6 +12,7 @@ import {
 	HELPER_TOOLS,
 	helperSourceIdentity,
 	normalizeHelperSource,
+	parseComponentVersions,
 	parseExecutorReleaseManifest,
 	parseHelperDistributionDependencies,
 	parseHelperManifest,
@@ -42,7 +45,10 @@ describe("pure helper distribution contract", () => {
 		expect(parseHelperDistributionDependencies(value, "0.8.3")).toEqual(value);
 		expect(() => parseHelperDistributionDependencies(value, "0.8.4")).toThrow();
 		expect(() => createHelperDistributionDependencies("latest")).toThrow();
-		expect(() => createHelperDistributionDependencies("0.8.3", 2)).toThrow();
+		// Structural parsing preserves historical protocols; runtime compatibility is separate.
+		expect(createHelperDistributionDependencies("0.8.3", 2).executor.protocolVersion).toBe(2);
+		for (const protocol of [0, -1, 1.5, Number.NaN, 2 ** 31])
+			expect(() => createHelperDistributionDependencies("0.8.3", protocol)).toThrow();
 		expect(() =>
 			parseHelperDistributionDependencies({ ...value, url: "https://evil.test" }),
 		).toThrow();
@@ -52,6 +58,37 @@ describe("pure helper distribution contract", () => {
 				executor: { ...value.executor, tag: "executor-latest" },
 			}),
 		).toThrow();
+	});
+	test("default component selection is frozen and independent of application release versions", () => {
+		const pinned = createHelperDistributionDependencies();
+		expect(EXECUTOR_RELEASE_VERSION).toBe("0.9.1");
+		expect(pinned.executor).toEqual({
+			version: "0.9.1",
+			protocolVersion: 1,
+			tag: "executor-v0.9.1",
+		});
+		for (const appVersion of ["0.9.2", "0.9.3", "1.0.0"])
+			expect({
+				version: appVersion,
+				helperDistribution: createHelperDistributionDependencies(),
+			}).toHaveProperty("helperDistribution", pinned);
+		expect(Object.isFrozen(COMPONENT_VERSIONS)).toBe(true);
+		expect(Object.isFrozen(COMPONENT_VERSIONS.executor)).toBe(true);
+		pinned.executor.version = "0.9.2";
+		expect(createHelperDistributionDependencies().executor.version).toBe("0.9.1");
+	});
+	test("component configuration accepts an independent version and rejects ambiguous pins", () => {
+		expect(parseComponentVersions({ executor: { version: "0.9.1", protocolVersion: 1 } })).toEqual({
+			executor: { version: "0.9.1", protocolVersion: 1 },
+		});
+		for (const value of [
+			{},
+			{ executor: { version: "latest", protocolVersion: 1 } },
+			{ executor: { version: "0.9.1", protocolVersion: 0 } },
+			{ executor: { version: "0.9.1", protocolVersion: 1, tag: "executor-latest" } },
+			{ executor: { version: "0.9.1", protocolVersion: 1 }, repository: "foreign/repo" },
+		])
+			expect(() => parseComponentVersions(value)).toThrow();
 	});
 	test("fixed catalog has exactly twelve original filenames", () => {
 		expect(parseHelperManifest(catalog(), { repository: "fork/repo" }).files).toHaveLength(12);

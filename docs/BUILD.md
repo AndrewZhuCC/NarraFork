@@ -73,7 +73,7 @@ bun scripts/build-cross-platform.ts --platform=linux-arm64
 
 ### 辅助分发依赖
 
-新构建在生成的 build-info 和 sidecar 中声明 `helperDistribution`：固定 helpers catalog/tag，加应用版本对应的 executor tag/protocol。严格构建和八平台 bundle 核对同一声明；旧无声明产物保持兼容。构建与 dry-run 不要求远端已经有辅助 Release，真正主程序发布前才做只读就绪检查。
+新构建在生成的 build-info 和 sidecar 中声明 `helperDistribution`：固定 helpers catalog/tag，加 `shared/component-versions.json` 锁定的独立 executor version/tag/protocol，不按应用版本重新选择。构建开始冻结同一声明并传入所有后处理 worker，严格构建和八平台 bundle 核对它；旧无声明产物保持兼容。构建与 dry-run 不要求远端已经有辅助 Release，真正主程序发布前才做只读资产就绪与组件构建输入一致性检查。主程序 0.9.2 可以直接复用未变化的 executor 0.9.1；组件实际变化时才显式升组件版本并独立发布。
 
 辅助工具通过独立 `.github/workflows/helpers-release.yml` 构建并原生 smoke，不加入主程序资产。rg/zstd 各覆盖六平台；Linux zstd 使用固定 Alpine 镜像摘要及源码摘要的 musl 静态 recipe，Windows ARM64 复用固定 llvm-mingw recipe，macOS 原生构建。不要恢复 `Alpine latest`、未经摘要校验的 musl.cc 工具链或 `-march=native`。发布细节、许可附件和显式触发步骤见 [RELEASE.md](RELEASE.md)。
 

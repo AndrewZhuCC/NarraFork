@@ -13,7 +13,9 @@ import {
 import { HELPER_BIN_DIR } from "../helper-binaries";
 import { DISTRIBUTION_CACHE_DIR, distributionPath } from "../helper-distribution-runtime";
 import { settings } from "../settings";
-import { APP_VERSION } from "../version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 const originalFetch = globalThis.fetch;
 const LINUX_BINARY = Buffer.alloc(256);
@@ -30,16 +32,16 @@ const ORIGINAL_UPDATE = settings.update ?? {
 	autoDownload: false,
 };
 const SOURCE = { source: "update-server", serverUrl: "https://legacy.example" } as const;
-const MANIFEST_PATH = distributionPath(SOURCE, `legacy-tools\0${APP_VERSION}\0${1}\0manifest`);
+const MANIFEST_PATH = distributionPath(SOURCE, `legacy-tools\0${EXECUTOR_VERSION}\0${1}\0manifest`);
 
 function manifest(overrides: Partial<ExecutorManifest> = {}): ExecutorManifest {
 	return {
-		version: APP_VERSION,
+		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: "2026-08-15T00:00:00.000Z",
 		platforms: {
 			"linux-amd64": {
-				filename: `narrafork-executor-${APP_VERSION}-linux-amd64`,
+				filename: `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`,
 				size: LINUX_BINARY.byteLength,
 				sha256: LINUX_SHA256,
 			},
@@ -100,18 +102,18 @@ describe("getExecutorManifest", () => {
 	test("fetches, validates and persists the published manifest", async () => {
 		mockFetch({ manifest: () => jsonResponse(manifest()) });
 		const resolved = await getExecutorManifest();
-		expect(resolved?.version).toBe(APP_VERSION);
+		expect(resolved?.version).toBe(EXECUTOR_VERSION);
 		expect(resolved?.protocolVersion).toBe(1);
 		// Persisted so a later offline start can still enroll devices.
 		expect(existsSync(MANIFEST_PATH)).toBe(true);
-		expect(JSON.parse(readFileSync(MANIFEST_PATH, "utf-8")).version).toBe(APP_VERSION);
+		expect(JSON.parse(readFileSync(MANIFEST_PATH, "utf-8")).version).toBe(EXECUTOR_VERSION);
 	});
 
 	test("caches within the freshness window and coalesces concurrent fetches", async () => {
 		const { calls } = mockFetch({ manifest: () => jsonResponse(manifest()) });
 		const [first, second] = await Promise.all([getExecutorManifest(), getExecutorManifest()]);
-		expect(first?.version).toBe(APP_VERSION);
-		expect(second?.version).toBe(APP_VERSION);
+		expect(first?.version).toBe(EXECUTOR_VERSION);
+		expect(second?.version).toBe(EXECUTOR_VERSION);
 		await getExecutorManifest();
 		expect(calls.length).toBe(1);
 	});
@@ -125,7 +127,7 @@ describe("getExecutorManifest", () => {
 			},
 		});
 		const resolved = await getExecutorManifest();
-		expect(resolved?.version).toBe(APP_VERSION);
+		expect(resolved?.version).toBe(EXECUTOR_VERSION);
 	});
 
 	test("returns null when neither the server nor the cache has a manifest", async () => {
@@ -137,7 +139,7 @@ describe("getExecutorManifest", () => {
 		mockFetch({
 			manifest: () =>
 				jsonResponse({
-					version: APP_VERSION,
+					version: EXECUTOR_VERSION,
 					protocolVersion: 1,
 					releasedAt: "2026-08-15T00:00:00.000Z",
 					platforms: {
@@ -160,7 +162,7 @@ describe("getExecutorManifest", () => {
 		expect(await getExecutorManifest()).toBeNull();
 		expect(existsSync(MANIFEST_PATH)).toBe(false);
 	});
-	test("rejects another application version even with internally valid filenames", async () => {
+	test("rejects another executor version even with internally valid filenames", async () => {
 		const old = manifest({
 			version: "0.0.1",
 			platforms: {
@@ -201,7 +203,7 @@ describe("ensureExecutorBinary", () => {
 			binary: () => binaryResponse(LINUX_BINARY),
 		});
 		const artifact = await ensureExecutorBinary("linux-amd64");
-		expect(artifact.version).toBe(APP_VERSION);
+		expect(artifact.version).toBe(EXECUTOR_VERSION);
 		expect(artifact.sha256).toBe(LINUX_SHA256);
 		expect(readFileSync(artifact.path)).toEqual(LINUX_BINARY);
 		// Cache name is version-scoped so platforms and releases never collide.
@@ -223,7 +225,7 @@ describe("ensureExecutorBinary", () => {
 
 	test("re-downloads when the cached file no longer matches the manifest digest", async () => {
 		mkdirSync(DISTRIBUTION_CACHE_DIR, { recursive: true });
-		const cachedPath = join(HELPER_BIN_DIR, `narrafork-executor-${APP_VERSION}-linux-amd64`);
+		const cachedPath = join(HELPER_BIN_DIR, `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`);
 		writeFileSync(cachedPath, "tampered-or-truncated");
 		const { calls } = mockFetch({
 			manifest: () => jsonResponse(manifest()),
@@ -231,9 +233,9 @@ describe("ensureExecutorBinary", () => {
 		});
 		const artifact = await ensureExecutorBinary("linux-amd64");
 		expect(readFileSync(artifact.path)).toEqual(LINUX_BINARY);
-		expect(calls.some((url) => url.endsWith(`narrafork-executor-${APP_VERSION}-linux-amd64`))).toBe(
-			true,
-		);
+		expect(
+			calls.some((url) => url.endsWith(`narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`)),
+		).toBe(true);
 	});
 
 	test("refuses a download whose digest does not match the manifest", async () => {
@@ -242,9 +244,9 @@ describe("ensureExecutorBinary", () => {
 			binary: () => binaryResponse(Buffer.from("substituted-payload")),
 		});
 		await expect(ensureExecutorBinary("linux-amd64")).rejects.toThrow(ExecutorDistributionError);
-		expect(existsSync(join(HELPER_BIN_DIR, `narrafork-executor-${APP_VERSION}-linux-amd64`))).toBe(
-			false,
-		);
+		expect(
+			existsSync(join(HELPER_BIN_DIR, `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`)),
+		).toBe(false);
 	});
 
 	test("reports a clear error for a platform the release does not publish", async () => {

@@ -24,6 +24,7 @@ import {
 	HELPER_TOOL_VERSIONS,
 	HELPER_TOOLS,
 	type HelperPlatform,
+	parseComponentVersions,
 	parseExecutorReleaseManifest,
 	parseHelperManifest,
 } from "../../shared/helper-distribution";
@@ -42,6 +43,7 @@ import {
 	runBridgeProcess,
 	writeBridgeEnvelope,
 } from "./ci-update-server-bridge-restore";
+import { compareExecutorRecipeIdentity } from "./component-release-inputs";
 import { buildExecutorManifest } from "./executor-manifest";
 import { type GhRunner, runGh, validateGitHubRepository } from "./github-release";
 import { validateHelperArtifactZip } from "./helper-artifact";
@@ -91,6 +93,8 @@ interface HelperControlOptions {
 	run?: GhRunner;
 	environment?: NodeJS.ProcessEnv;
 	git?: (root: string, args: string[]) => string;
+	signal?: AbortSignal;
+	deadline?: number;
 }
 async function resolveHelperRepositoryContext(
 	repository: string,
@@ -192,16 +196,44 @@ export async function planHelperRelease(
 	readGit(root, ["merge-base", "--is-ancestor", commit, `refs/remotes/origin/${defaultBranch}`]);
 	await assertCiMainAncestor(run, commit, repository, defaultBranch);
 	const version = kind === "executor" ? tag.slice("executor-v".length) : HELPER_CATALOG_VERSION;
-	if (
-		kind === "executor" &&
-		JSON.parse(readGit(root, ["show", `${commit}:package.json`])).version !== version
-	)
-		throw new Error("Executor tag must match the source application version");
 	const protocol = readGit(root, [
 		"show",
 		`${commit}:remote-executor/internal/rpc/protocol.go`,
 	]).match(/\bProtocolVersion\s*=\s*(\d+)/);
 	if (!protocol) throw new Error("Missing executor protocol version");
+	const protocolVersion = Number(protocol[1]);
+	if (!Number.isSafeInteger(protocolVersion) || protocolVersion <= 0)
+		throw new Error("Invalid executor protocol version");
+	if (kind === "executor") {
+		// Check the exact path in the target tree. Only proven absence is legacy;
+		// corrupt JSON, failed git reads and malformed tree output must fail closed.
+		const componentPath = "shared/component-versions.json";
+		const entry = readGit(root, ["ls-tree", "--name-only", commit, "--", componentPath]);
+		if (entry !== "" && entry !== componentPath)
+			throw new Error("Unexpected component configuration tree entry");
+		if (entry === componentPath) {
+			const components = parseComponentVersions(
+				JSON.parse(readGit(root, ["show", `${commit}:${componentPath}`])),
+			);
+			if (components.executor.version !== version)
+				throw new Error("Executor tag must match the source component version");
+			if (components.executor.protocolVersion !== protocolVersion)
+				throw new Error("Executor component protocol must match the source wire protocol");
+			// The workflow bundles trusted control code, but checks out target Go sources.
+			// A new envelope may attribute that recipe to the tag only after proving parity.
+			// Restores consume their original sealed bundle and must never reselect a recipe.
+			if (!sourceRunId)
+				await compareExecutorRecipeIdentity({
+					commit,
+					controlCommit: environment.GITHUB_SHA as string,
+					readSource: (sourceCommit, path) => readGit(root, ["show", `${sourceCommit}:${path}`]),
+					signal: options.signal,
+					deadline: options.deadline,
+				});
+		} else if (JSON.parse(readGit(root, ["show", `${commit}:package.json`])).version !== version) {
+			throw new Error("Legacy executor tag must match the source application version");
+		}
+	}
 	return {
 		schemaVersion: 1,
 		repository,
@@ -211,7 +243,7 @@ export async function planHelperRelease(
 		controlCommit: environment.GITHUB_SHA as string,
 		kind,
 		version,
-		protocolVersion: Number(protocol[1]),
+		protocolVersion,
 		sourceRunId,
 		publish: options.publish === true,
 		mirrorOnly: options.mirrorOnly === true,

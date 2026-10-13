@@ -31,7 +31,8 @@ const BUILD_REPOSITORY = resolveBuildGitHubRepository({ root: ROOT });
 process.env.NF_BUILD_GITHUB_REPOSITORY = BUILD_REPOSITORY;
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
 const VERSION: string = pkg.version ?? "0.0.0";
-const HELPER_DISTRIBUTION = createHelperDistributionDependencies(VERSION);
+// Freeze component pins once; application releases do not select new executors.
+const HELPER_DISTRIBUTION = createHelperDistributionDependencies();
 const FRONTEND_DIR = join(ROOT, "dist", "frontend");
 const DRIZZLE_DIR = join(ROOT, "drizzle");
 const DRIZZLE_JOURNAL_PATH = join(DRIZZLE_DIR, "meta", "_journal.json");

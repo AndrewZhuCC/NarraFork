@@ -66,7 +66,7 @@ async function fixture(declareHelpers = false) {
 			commit: plan.commit.slice(0, 12),
 			buildDate: "2026-10-08T00:00:00.000Z",
 			...(declareHelpers
-				? { helperDistribution: createHelperDistributionDependencies(plan.version) }
+				? { helperDistribution: createHelperDistributionDependencies("0.9.1") }
 				: {}),
 		});
 		await writeFile(join(directory, name), bytes);
@@ -90,7 +90,15 @@ async function fixture(declareHelpers = false) {
 		};
 		await writeFile(join(smokeDirectory, "smoke.json"), JSON.stringify(smoke));
 	}
-	const options: AssembleReleaseBundleOptions = { plan, platformsDir, smokeDir, bundleDir };
+	const options: AssembleReleaseBundleOptions = {
+		plan,
+		platformsDir,
+		smokeDir,
+		bundleDir,
+		...(declareHelpers
+			? { targetHelperDistribution: createHelperDistributionDependencies("0.9.1") }
+			: {}),
+	};
 	return { root, options, plan, name: `narrafork-${plan.version}-linux-x64` };
 }
 
@@ -497,10 +505,57 @@ describe("immutable helper dependencies in release bundles", () => {
 	test("all eight new sidecars seal and restore the same declaration without network readiness", async () => {
 		const f = await fixture(true);
 		const sealed = await assembleReleaseBundle(f.options);
-		expect(sealed.helperDistribution).toEqual(createHelperDistributionDependencies(f.plan.version));
+		expect(sealed.helperDistribution).toEqual(createHelperDistributionDependencies("0.9.1"));
 		expect((await verifyReleaseBundle(f.options.bundleDir)).helperDistribution).toEqual(
 			sealed.helperDistribution,
 		);
+	});
+	test("different component pins or protocols cannot be mixed across platforms", async () => {
+		for (const helperDistribution of [
+			createHelperDistributionDependencies("0.9.2"),
+			createHelperDistributionDependencies("0.9.1", 2),
+		]) {
+			const f = await fixture(true);
+			const path = join(f.options.platformsDir, "linux-x64", `${f.name}.metadata.json`);
+			const metadata = JSON.parse(await readFile(path, "utf8"));
+			await writeFile(path, JSON.stringify({ ...metadata, helperDistribution }));
+			await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Inconsistent");
+		}
+	});
+	test("eight agreeing sidecars must still match target JSON rather than current control pin", async () => {
+		const f = await fixture(true);
+		f.options.targetHelperDistribution = createHelperDistributionDependencies("0.9.2");
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow(
+			"target component configuration",
+		);
+		f.options.targetHelperDistribution = undefined;
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Legacy target");
+		f.options.targetHelperDistribution = createHelperDistributionDependencies("0.9.1");
+		expect((await assembleReleaseBundle(f.options)).helperDistribution?.executor.version).toBe(
+			"0.9.1",
+		);
+	});
+	test("component evidence must match all sidecars and its original expected plan", async () => {
+		const f = await fixture(true);
+		f.plan.componentEvidence = {
+			executor: {
+				version: "0.9.1",
+				protocolVersion: 1,
+				tag: "executor-v0.9.1",
+				commit: "d".repeat(40),
+				manifestSha256: "e".repeat(64),
+				buildInputsSha256: "f".repeat(64),
+			},
+		};
+		await assembleReleaseBundle(f.options);
+		await expect(
+			verifyReleaseBundle(f.options.bundleDir, { ...f.plan, componentEvidence: undefined }),
+		).rejects.toThrow("componentEvidence");
+		await changeManifest(f, (manifest) => {
+			if (!manifest.plan.componentEvidence) throw new Error("fixture");
+			manifest.plan.componentEvidence.executor.protocolVersion = 2;
+		});
+		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("evidence/dependency");
 	});
 	test("legacy bundles do not invent dependencies from the current control code", async () => {
 		const f = await fixture();

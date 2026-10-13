@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -26,6 +27,7 @@ import {
 	matchesGitHubReleaseBody,
 	publishGitHubRelease,
 	releaseChannel,
+	runGh,
 	validateGitHubRepository,
 } from "../../scripts/lib/github-release";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
@@ -118,6 +120,34 @@ function addPatch(
 	writeFileSync(metadataPath, JSON.stringify(meta));
 	return { name, path, metadataPath, meta, bytes, base };
 }
+
+describe("bounded component GitHub transport", () => {
+	test("controlled gh reads enforce native stdout budget, parent abort and request timeout without network", async () => {
+		const root = mkdtempSync(join(tmpdir(), "narrafork-gh-read-test-"));
+		roots.push(root);
+		const executable = join(root, "gh");
+		const path = process.env.PATH;
+		writeFileSync(
+			executable,
+			"#!/usr/bin/env bun\nif (process.argv.includes('large')) process.stdout.write('x'.repeat(65536)); else setInterval(() => {}, 1000);\n",
+		);
+		chmodSync(executable, 0o755);
+		process.env.PATH = `${root}:${path}`;
+		try {
+			await expect(
+				runGh(["api", "large"], { timeoutMs: 1000, maxOutputBytes: 32 }),
+			).rejects.toThrow("output exceeds");
+			const controller = new AbortController();
+			const pending = runGh(["api", "wait"], { signal: controller.signal, timeoutMs: 1000 });
+			controller.abort(new Error("cancelled bounded gh child"));
+			await expect(pending).rejects.toThrow("cancelled bounded gh child");
+			await expect(runGh(["api", "wait"], { timeoutMs: 20 })).rejects.toThrow();
+		} finally {
+			if (path === undefined) delete process.env.PATH;
+			else process.env.PATH = path;
+		}
+	});
+});
 
 describe("CI stable latest rollback guard", () => {
 	test("refuses older stable before creating a draft", async () => {
@@ -238,6 +268,9 @@ function fakeGitHub(options: GitHubReleaseOptions) {
 		authFailure: false,
 		async run(args: string[]) {
 			calls.push(args);
+			if (args[0] === "api" && args[1].includes("/git/trees/")) {
+				return JSON.stringify({ truncated: false, tree: [] }); // historical fixture source
+			}
 			if (args[0] === "api" && args[1].includes("/git/ref/tags/")) {
 				return JSON.stringify({
 					object: { type: server.annotated ? "tag" : "commit", sha: server.tagCommit },
@@ -1306,6 +1339,8 @@ describe("declared GitHub helper dependencies", () => {
 				...data.options,
 				run: async (args) => {
 					calls.push(args);
+					if (args[1]?.includes("/git/trees/"))
+						return JSON.stringify({ truncated: false, tree: [] });
 					throw new Error("HTTP 404: required helper Release is unavailable");
 				},
 			}),
@@ -1319,11 +1354,10 @@ describe("declared GitHub helper dependencies", () => {
 	test("mixed new and legacy platform declarations cannot bypass readiness", async () => {
 		const data = fixture("1.2.0", "all-platforms");
 		declare(data);
-		delete data.metadata[0]!.helperDistribution;
-		writeFileSync(
-			join(data.root, `${data.metadata[0]!.name}.metadata.json`),
-			formatMetadataJson(data.metadata[0]!),
-		);
+		const legacy = data.metadata[0];
+		if (!legacy) throw new Error("Missing fixture metadata");
+		delete legacy.helperDistribution;
+		writeFileSync(join(data.root, `${legacy.name}.metadata.json`), formatMetadataJson(legacy));
 		const gh = fakeGitHub(data.options);
 		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow(
 			"Inconsistent",
@@ -1333,7 +1367,8 @@ describe("declared GitHub helper dependencies", () => {
 	test("dependency versions cannot be invented by a sidecar", async () => {
 		const data = fixture();
 		declare(data);
-		const meta = data.metadata[0]!;
+		const meta = data.metadata[0];
+		if (!meta) throw new Error("Missing fixture metadata");
 		const dependencies = createHelperDistributionDependencies("9.0.0");
 		writeFileSync(
 			join(data.root, `${meta.name}.metadata.json`),
@@ -1341,6 +1376,7 @@ describe("declared GitHub helper dependencies", () => {
 		);
 		const gh = fakeGitHub(data.options);
 		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow();
-		expect(gh.calls).toEqual([]);
+		expect(gh.calls).toHaveLength(1);
+		expect(gh.calls[0]?.[1]).toContain("/git/trees/");
 	});
 });

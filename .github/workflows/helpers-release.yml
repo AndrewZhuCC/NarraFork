@@ -10,7 +10,7 @@ on:
         options: [helpers, executor]
         default: helpers
       tag:
-        description: Existing helpers-v1.0.0 or executor-vX.Y.Z tag on default-branch ancestry
+        description: Existing helpers-v1.0.0 or executor-vX.Y.Z tag (component version, not app version) on default-branch ancestry
         required: true
         type: string
       publish:

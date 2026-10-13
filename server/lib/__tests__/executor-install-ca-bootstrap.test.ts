@@ -10,7 +10,9 @@ import {
 	buildExecutorInstallScript,
 	type ExecutorInstallScriptInput,
 } from "../executor-install-script";
-import { APP_VERSION } from "../version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 // Bootstrap and a sandboxed installer prefix execute; service setup is never run.
 // Fixtures and HOME/TMPDIR stay under this test directory; no real device or service is touched.
@@ -165,9 +167,12 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 		deviceName: "CA bootstrap fixture",
 		connectionMode: "reverse",
 		disableShell: false,
-		artifactFilename: executorPublishedFilename(APP_VERSION, overrides.platform ?? "linux-amd64"),
+		artifactFilename: executorPublishedFilename(
+			EXECUTOR_VERSION,
+			overrides.platform ?? "linux-amd64",
+		),
 		expectedSha256: "a".repeat(64),
-		executorVersion: APP_VERSION,
+		executorVersion: EXECUTOR_VERSION,
 		ticket: TICKET,
 		tokenDelivery: "enroll",
 		caCertPem: trusted.cert,

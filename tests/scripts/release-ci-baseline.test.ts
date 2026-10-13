@@ -10,7 +10,11 @@ import {
 	type CiReleasePlan,
 } from "../../scripts/lib/ci-release-types";
 import type { GhRunner } from "../../scripts/lib/github-release";
-import { selectGitHubBaselines } from "../../scripts/lib/github-release-baseline";
+import {
+	selectGitHubBaselines,
+	validateBaselineMetadata,
+} from "../../scripts/lib/github-release-baseline";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 function plan(version = "2.0.0"): Omit<CiReleasePlan, "baselines"> {
 	return {
@@ -97,6 +101,45 @@ function fixture(repository = "NarraFork/NarraFork") {
 }
 
 describe("CI GitHub baseline selection", () => {
+	test("historical APP identity is independent from its declared component pin", () => {
+		const dependencies = createHelperDistributionDependencies("0.9.1", 2);
+		const metadata = computeBinaryMetadataFromBuffer(
+			"narrafork-1.2.0-linux-x64",
+			Buffer.from("fixture"),
+			{
+				version: "1.2.0",
+				platformId: "linux-x64",
+				target: "bun-linux-x64",
+				commit: "a".repeat(40),
+				buildDate: "2026-10-08T00:00:00.000Z",
+				helperDistribution: dependencies,
+			},
+		);
+		const expected = {
+			version: "1.2.0",
+			platform: "linux-x64",
+			name: metadata.name,
+			size: metadata.size,
+		};
+		expect(validateBaselineMetadata(metadata, expected).helperDistribution).toEqual(dependencies);
+		expect(() => validateBaselineMetadata({ ...metadata, version: "1.2.1" }, expected)).toThrow();
+		expect(() =>
+			validateBaselineMetadata(
+				{
+					...metadata,
+					helperDistribution: {
+						...dependencies,
+						executor: { ...dependencies.executor, tag: "executor-v0.9.2" },
+					},
+				},
+				expected,
+			),
+		).toThrow();
+		expect(
+			validateBaselineMetadata({ ...metadata, helperDistribution: undefined }, expected)
+				.helperDistribution,
+		).toBeUndefined();
+	});
 	test("fork baseline paths and metadata stay within the selected repository", async () => {
 		const repository = "Example/Custom";
 		const f = fixture(repository);

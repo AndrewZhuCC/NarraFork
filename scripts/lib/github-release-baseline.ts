@@ -66,7 +66,7 @@ export function validateBaselineMetadata(
 	)
 		throw new Error(`Invalid binary metadata/provenance: ${expected.name}`);
 	if (meta.helperDistribution !== undefined)
-		parseHelperDistributionDependencies(meta.helperDistribution, expected.version);
+		parseHelperDistributionDependencies(meta.helperDistribution);
 	return meta;
 }
 

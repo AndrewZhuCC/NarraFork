@@ -8,10 +8,12 @@
  * whitelist does not model, and because it has no delta-patch upgrade path.
  *
  * Usage:
- *   bun scripts/release-executor.ts 0.5.24                      # build + publish all platforms
- *   bun scripts/release-executor.ts 0.5.24 --platform=linux-amd64
- *   bun scripts/release-executor.ts 0.5.24 --dry-run             # build + digest, no upload
- *   bun scripts/release-executor.ts 0.5.24 --upload-only         # publish existing dist/
+ *   bun scripts/release-executor.ts                           # build + publish pinned component
+ *   bun scripts/release-executor.ts --platform=linux-amd64
+ *   bun scripts/release-executor.ts --dry-run                  # build + digest, no upload
+ *   bun scripts/release-executor.ts --upload-only              # publish existing dist/
+ *   Explicit versions must match shared/component-versions.json. GitHub bundle
+ *   restores instead retain the version frozen in their immutable plan.
  *
  * Environment:
  *   NF_UPDATE_SERVER  — update server URL (default: https://narrafork-update.b.domexie.cn)
@@ -21,6 +23,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { COMPONENT_VERSIONS, EXECUTOR_RELEASE_VERSION } from "../shared/helper-distribution";
 import {
 	EXECUTOR_MANIFEST_FILENAME,
 	EXECUTOR_PLATFORMS,
@@ -39,7 +42,6 @@ import {
 const ROOT = join(import.meta.dir, "..");
 const EXECUTOR_DIR = join(ROOT, "remote-executor");
 const EXECUTOR_DIST = join(EXECUTOR_DIR, "dist");
-const PKG_PATH = join(ROOT, "package.json");
 
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9._-]+)?$/;
 /** Guard against publishing a build whose binary is implausibly large or empty. */
@@ -97,7 +99,9 @@ if (target === "github") {
 	await runHelperReleaseController(forwarded);
 	process.exit(0);
 }
-const version = args.find((a) => !a.startsWith("--")) ?? readPackageVersion();
+const version = args.find((a) => !a.startsWith("--")) ?? EXECUTOR_RELEASE_VERSION;
+if (version !== EXECUTOR_RELEASE_VERSION)
+	throw new Error("Executor version must match shared/component-versions.json");
 const dryRun = args.includes("--dry-run");
 const uploadOnly = args.includes("--upload-only");
 const platformArg = args
@@ -105,10 +109,6 @@ const platformArg = args
 	?.split("=")
 	.slice(1)
 	.join("=");
-
-function readPackageVersion(): string {
-	return (JSON.parse(readFileSync(PKG_PATH, "utf-8")) as { version: string }).version;
-}
 
 function fail(message: string): never {
 	console.error(`❌ ${message}`);
@@ -237,6 +237,8 @@ console.log(`   Platforms: ${targetPlatforms.join(", ")}`);
 console.log(`   Server: ${dryRun ? "(dry run)" : SERVER}\n`);
 
 const protocolVersion = resolveProtocolVersion();
+if (protocolVersion !== COMPONENT_VERSIONS.executor.protocolVersion)
+	fail("Executor component protocol must match the source wire protocol");
 console.log(`📡 Device protocol version: ${protocolVersion}`);
 
 if (!uploadOnly) {

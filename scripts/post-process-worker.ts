@@ -11,7 +11,10 @@ import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { generateZstdPatch } from "../server/lib/zstd-patch";
-import { createHelperDistributionDependencies } from "../shared/helper-distribution";
+import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../shared/helper-distribution";
 import {
 	type BinaryMetadata,
 	computeBinaryMetadata,
@@ -26,6 +29,7 @@ interface WorkerInput {
 	version: string;
 	commit: string;
 	repository: string;
+	helperDistribution: HelperDistributionDependencies;
 	releaseCi?: boolean;
 }
 
@@ -36,6 +40,7 @@ const {
 	version,
 	commit,
 	repository,
+	helperDistribution,
 	releaseCi = false,
 } = workerData as WorkerInput;
 
@@ -178,7 +183,7 @@ const metadataInput = {
 	target: platform.target,
 	commit,
 	repository,
-	helperDistribution: createHelperDistributionDependencies(version),
+	helperDistribution: parseHelperDistributionDependencies(helperDistribution),
 	buildDate,
 };
 const strictMetadata = releaseCi

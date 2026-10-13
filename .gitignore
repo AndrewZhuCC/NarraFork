@@ -81,6 +81,8 @@ scripts/lib/*
 !scripts/lib/helper-artifact.ts
 !scripts/lib/helper-release.ts
 !scripts/lib/helper-release-control.ts
+# Shared read-only component pin/source verification must survive a fresh clone.
+!scripts/lib/component-release-inputs.ts
 .helper-release/
 !scripts/lib/zstd-windows-arm64.ts
 !scripts/lib/executor-manifest.ts

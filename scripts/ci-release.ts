@@ -27,7 +27,8 @@ import {
 	restoreUpdateServerBridgeArtifact,
 	writeBridgeEnvelope,
 } from "./lib/ci-update-server-bridge-restore";
-import { publishGitHubRelease, runGh } from "./lib/github-release";
+import { readTargetComponentDependencies } from "./lib/component-release-inputs";
+import { type GhRunner, publishGitHubRelease, runGh } from "./lib/github-release";
 import { selectGitHubBaselines } from "./lib/github-release-baseline";
 import { prepareUpdateIndexRelease } from "./lib/update-index";
 import { preparePublishedUpdateIndexRelease, publishUpdateIndex } from "./lib/update-index-github";
@@ -271,6 +272,7 @@ function githubOptions(plan: CiReleasePlan, distDir: string) {
 		commit: plan.commit,
 		changelog: { ...plan.changelog },
 		requireBuildRepository: true,
+		componentEvidence: plan.componentEvidence,
 		platformSuffixes: new Map(CI_RELEASE_TARGETS.map((entry) => [entry.platform, entry.suffix])),
 	};
 }
@@ -303,23 +305,35 @@ async function writeIndexPreview(
 	}
 }
 
+/** Preserve ordinary upload windows while component reads own shorter budgets and cancellation. */
+export function createCiReleaseGhRunner(
+	signal: AbortSignal,
+	commandRunner: GhRunner,
+	readRunner: GhRunner = runGh,
+): GhRunner {
+	return async (args, controls) => {
+		const requestSignal = controls?.signal ? AbortSignal.any([signal, controls.signal]) : signal;
+		await setImmediate(undefined, { signal: requestSignal });
+		if (controls) return readRunner(args, { ...controls, signal: requestSignal });
+		return commandRunner(args);
+	};
+}
+
 export async function runCiRelease(argv: string[]) {
 	const { command, values } = parseCiReleaseArgs(argv);
 	const root = process.cwd();
 	const abort = new AbortController();
-	const signal = ["prepare-bridge", "publish", "mirror"].includes(command)
+	const onlinePublication =
+		["prepare-bridge", "publish", "mirror"].includes(command) ||
+		(command === "index" && values.publish === "true");
+	const signal = onlinePublication
 		? ciBridgeDeadlineSignal(process.env, abort.signal)
 		: abort.signal;
 	const cancel = () => abort.abort(new Error("CI release cancelled"));
 	process.once("SIGINT", cancel);
 	process.once("SIGTERM", cancel);
-	const gh = ["prepare-bridge", "publish", "mirror"].includes(command)
-		? createBridgeGhRunner(signal)
-		: runGh;
-	const run = async (args: string[]) => {
-		await setImmediate(undefined, { signal });
-		return gh(args);
-	};
+	const gh = onlinePublication ? createBridgeGhRunner(signal) : runGh;
+	const run = createCiReleaseGhRunner(signal, gh);
 	try {
 		if (command === "gate") {
 			assertReleaseGate(process.env);
@@ -363,6 +377,8 @@ export async function runCiRelease(argv: string[]) {
 						publish: publish === "true",
 						sourceRunId,
 						indexOnly: indexOnly === "true",
+						mirrorOnly: mirrorOnly === "true",
+						signal,
 					});
 			if (!recovery.buildRunId && !sourceRunId && indexOnly === "false")
 				plan.baselines = await selectGitHubBaselines(plan, { signal });
@@ -412,8 +428,15 @@ export async function runCiRelease(argv: string[]) {
 			const bundleDir = resolve(required(values, "bundle-dir"));
 			await normalizeMatrixArtifacts(platformsDir, "platform", plan);
 			await normalizeMatrixArtifacts(smokeDir, "smoke", plan);
+			// Only target source data is read here; build-only never queries component tags/assets.
+			const targetHelperDistribution = await readTargetComponentDependencies({
+				repository: plan.repository,
+				targetCommit: plan.commit,
+				signal,
+			});
 			const manifest = await assembleReleaseBundle({
 				plan,
+				targetHelperDistribution,
 				platformsDir,
 				smokeDir,
 				bundleDir,
@@ -433,7 +456,7 @@ export async function runCiRelease(argv: string[]) {
 			return;
 		}
 		if (command === "index") {
-			const plan = await readPlan(required(values, "plan"));
+			let plan = await readPlan(required(values, "plan"));
 			const shouldPublish = required(values, "publish");
 			if (!["true", "false"].includes(shouldPublish))
 				throw new Error("publish must be true or false");
@@ -442,7 +465,13 @@ export async function runCiRelease(argv: string[]) {
 					throw new Error("Index publication requires an explicit publish request");
 				assertPrimaryReleaseCheckout(root);
 			}
-			await revalidateCiReleasePlan(plan, { root, publish: shouldPublish === "true" });
+			plan = await revalidateCiReleasePlan(plan, {
+				root,
+				publish: shouldPublish === "true",
+				requireAlreadyPublished: true,
+				run,
+				signal,
+			});
 			let prepared: Awaited<ReturnType<typeof preparePublishedUpdateIndexRelease>>;
 			if (values["source-run-id"]) {
 				const destination = resolve(required(values, "bundle-dir"));
@@ -460,7 +489,7 @@ export async function runCiRelease(argv: string[]) {
 				)
 					throw new Error("Repair bundle target mismatch");
 				const options = githubOptions(manifest.plan, join(destination, "dist"));
-				await publishGitHubRelease({ ...options, requireAlreadyPublished: true, run });
+				await publishGitHubRelease({ ...options, requireAlreadyPublished: true, run, signal });
 			}
 			// Bundle verification proves immutable bytes; the public reader supplies
 			// the approved announcement state for both preview and actual repair.
@@ -483,7 +512,13 @@ export async function runCiRelease(argv: string[]) {
 				);
 				return;
 			}
-			await revalidateCiReleasePlan(plan, { root, publish: true, run });
+			plan = await revalidateCiReleasePlan(plan, {
+				root,
+				publish: true,
+				requireAlreadyPublished: true,
+				run,
+				signal,
+			});
 			const receipt = await publishUpdateIndex({
 				repository: plan.repository,
 				...prepared,
@@ -564,9 +599,25 @@ export async function runCiRelease(argv: string[]) {
 		if (process.env.PUBLISH_REQUESTED !== "true")
 			throw new Error("Publication requires an explicit publish request");
 		assertPrimaryReleaseCheckout(root);
-		await revalidateCiReleasePlan(manifest.plan, { root, publish: true, run });
+		// Build-only bundles remain byte-identical: new online evidence belongs to control state.
+		const publisherPlan = await revalidateCiReleasePlan(manifest.plan, {
+			root,
+			publish: true,
+			requireAlreadyPublished: command === "mirror",
+			run,
+			signal,
+			helperDistribution: manifest.helperDistribution,
+		});
+		if (publisherPlan.componentEvidence) {
+			const controlDir = resolve(".ci-release/control");
+			await mkdir(controlDir, { recursive: true });
+			await writeFile(
+				join(controlDir, "publisher-plan.json"),
+				`${JSON.stringify(publisherPlan, null, 2)}\n`,
+			);
+		}
 		signal.throwIfAborted();
-		const options = githubOptions(manifest.plan, join(destination, "dist"));
+		const options = githubOptions(publisherPlan, join(destination, "dist"));
 		if (command === "prepare-bridge") {
 			await output({ "mirror-required": String(!!config), "publication-status": "BUILD_COMPLETE" });
 			if (!config) {
@@ -656,7 +707,7 @@ export async function runCiRelease(argv: string[]) {
 			};
 			if (command === "mirror") {
 				// Independent retries prove the Release is public, without any mutator.
-				await publishGitHubRelease({ ...options, requireAlreadyPublished: true, run });
+				await publishGitHubRelease({ ...options, requireAlreadyPublished: true, run, signal });
 				await mirrorAccepted();
 				return;
 			}
@@ -668,6 +719,7 @@ export async function runCiRelease(argv: string[]) {
 			...options,
 			preventStableLatestRollback: true,
 			run,
+			signal,
 		});
 		await output({ "publication-status": "PUBLISHED" });
 		try {

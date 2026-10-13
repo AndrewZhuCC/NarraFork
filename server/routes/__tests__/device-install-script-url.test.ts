@@ -18,7 +18,9 @@ import { db } from "../../db";
 import { remoteDevices } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { getExecutorManifest, resetExecutorManifestCache } from "../../lib/executor-binaries";
-import { APP_VERSION } from "../../lib/version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 const originalFetch = globalThis.fetch;
 const originalUpdate = settings.update ?? {
@@ -50,12 +52,12 @@ beforeEach(async () => {
 	globalThis.fetch = (async (url: RequestInfo | URL) =>
 		String(url).endsWith(EXECUTOR_MANIFEST_FILENAME)
 			? Response.json({
-					version: APP_VERSION,
+					version: EXECUTOR_VERSION,
 					protocolVersion: 1,
 					releasedAt: "2026-01-01T00:00:00Z",
 					platforms: {
 						"linux-amd64": {
-							filename: executorPublishedFilename(APP_VERSION, "linux-amd64"),
+							filename: executorPublishedFilename(EXECUTOR_VERSION, "linux-amd64"),
 							size: 256,
 							sha256: "a".repeat(64),
 						},

@@ -393,8 +393,16 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		} else if (!originalBuildJobs) {
 			throw new Error("Original release bundle lacks complete source CI and build proof");
 		}
-		await revalidateCiReleasePlan(plan, { root: options.root, publish: false, run, env });
-		await verifyReleaseBundle(extracted, plan);
+		const verified = await verifyReleaseBundle(extracted, plan);
+		await revalidateCiReleasePlan(plan, {
+			root: options.root,
+			publish: false,
+			run,
+			env,
+			signal: options.signal,
+			helperDistribution: verified.helperDistribution,
+			componentRun: options.run,
+		});
 		await rename(extracted, destination);
 		return {
 			plan,

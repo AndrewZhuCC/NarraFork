@@ -21,6 +21,7 @@ import {
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
+import type { ComponentReleaseEvidence } from "./component-release-inputs";
 
 const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
 const MAX_TEXT_BYTES = 1024 * 1024;
@@ -32,10 +33,69 @@ export const GH_TIMEOUT_MS = 300_000;
 export const GH_MAX_OUTPUT_BYTES = 1024 * 1024;
 export const DEFAULT_GITHUB_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
 
-export type GhRunner = (args: string[]) => string | Promise<string>;
+export interface GhReadControls {
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	maxOutputBytes?: number;
+}
+export type GhRunner = (args: string[], controls?: GhReadControls) => string | Promise<string>;
+
+/** Source reads opt into an async bounded transport; ordinary publication keeps its own budget. */
+async function runControlledGh(args: string[], controls: GhReadControls): Promise<string> {
+	const timeoutMs = Math.min(controls.timeoutMs ?? 30_000, 30_000);
+	const maximum = Math.min(controls.maxOutputBytes ?? GH_MAX_OUTPUT_BYTES, GH_MAX_OUTPUT_BYTES);
+	if (
+		!Number.isSafeInteger(timeoutMs) ||
+		timeoutMs < 1 ||
+		!Number.isSafeInteger(maximum) ||
+		maximum < 1
+	)
+		throw new Error("Invalid bounded GitHub read controls");
+	const signal = AbortSignal.any([
+		...(controls.signal ? [controls.signal] : []),
+		AbortSignal.timeout(timeoutMs),
+	]);
+	signal.throwIfAborted();
+	const proc = Bun.spawn(["gh", ...args], {
+		stdout: "pipe",
+		stderr: "pipe",
+		stdin: "ignore",
+		env: { ...updateServerChildEnvironment(), GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+	});
+	const cancel = () => proc.kill();
+	signal.addEventListener("abort", cancel, { once: true });
+	if (signal.aborted) cancel();
+	const consume = async (stream: ReadableStream<Uint8Array>, maximum: number) => {
+		const chunks: Uint8Array[] = [];
+		let size = 0;
+		for await (const chunk of stream) {
+			size += chunk.length;
+			if (size > maximum) {
+				proc.kill();
+				throw new Error("GitHub read output exceeds limit");
+			}
+			chunks.push(chunk);
+		}
+		return Buffer.concat(chunks, size).toString("utf8");
+	};
+	try {
+		const [stdout, stderr, exit] = await Promise.all([
+			consume(proc.stdout, maximum),
+			consume(proc.stderr, 8192),
+			proc.exited,
+		]);
+		signal.throwIfAborted();
+		if (exit !== 0) throw new Error(`gh failed: ${stderr}`);
+		return stdout;
+	} finally {
+		signal.removeEventListener("abort", cancel);
+		if (proc.exitCode === null) proc.kill();
+	}
+}
 
 /** No shell interpolation, bounded output and timeout; authentication belongs to gh. */
-export const runGh: GhRunner = (args) => {
+export const runGh: GhRunner = (args, controls) => {
+	if (controls) return runControlledGh(args, controls);
 	try {
 		return execFileSync("gh", args, {
 			encoding: "utf8",
@@ -156,6 +216,9 @@ export interface GitHubReleaseOptions {
 	requireBuildRepository?: boolean;
 	/** Recovery mode may verify an already-public release, never create/upload/publish one. */
 	requireAlreadyPublished?: boolean;
+	componentEvidence?: ComponentReleaseEvidence;
+	signal?: AbortSignal;
+	deadline?: number;
 	run?: GhRunner;
 }
 
@@ -585,7 +648,18 @@ export async function publishGitHubRelease(
 ): Promise<{ dryRun: boolean; alreadyPublished: boolean; assets: string[] }> {
 	const repository = options.repository ?? DEFAULT_GITHUB_REPOSITORY;
 	validateGitHubRepository(repository);
-	const run = options.run ?? runGh;
+	const baseRun = options.run ?? runGh;
+	const checkBoundary = () => {
+		options.signal?.throwIfAborted();
+		if (options.deadline !== undefined && options.deadline <= Date.now())
+			throw new Error("GitHub publication deadline exceeded");
+	};
+	const run: GhRunner = async (args, controls) => {
+		checkBoundary();
+		const result = await baseRun(args, controls);
+		checkBoundary();
+		return result;
+	};
 	const tag = `v${options.version}`;
 	const downloads = {
 		repository,
@@ -607,22 +681,40 @@ export async function publishGitHubRelease(
 			declarations.push(
 				sidecar.helperDistribution === undefined
 					? undefined
-					: parseHelperDistributionDependencies(sidecar.helperDistribution, options.version),
+					: parseHelperDistributionDependencies(sidecar.helperDistribution),
 			);
 		}
 		const dependencies = declarations[0];
 		if (declarations.some((entry) => JSON.stringify(entry) !== JSON.stringify(dependencies)))
 			throw new Error("Inconsistent release helper dependencies across platforms");
 		if (options.dryRun) return { dryRun: true, alreadyPublished: false, assets: names };
-		if (dependencies && !options.requireAlreadyPublished) {
-			const { verifyPublishedHelperDependencies } = await import("./helper-release");
-			await verifyPublishedHelperDependencies({
+		let componentEvidence: ComponentReleaseEvidence | undefined;
+		if (!options.requireAlreadyPublished) {
+			const { verifyComponentReleaseEvidence } = await import("./component-release-inputs");
+			const evidence = await verifyComponentReleaseEvidence({
 				repository,
-				helpersTag: dependencies.helpers.tag,
-				executorVersion: dependencies.executor.version,
-				protocolVersion: dependencies.executor.protocolVersion,
-				run,
+				targetCommit: options.commit,
+				dependencies,
+				evidence: options.componentEvidence,
+				// Native source reads use their own asynchronous bounded 30s transport.
+				run: options.run,
+				signal: options.signal,
+				deadline: options.deadline,
 			});
+			componentEvidence = evidence;
+			if (!evidence && dependencies) {
+				// Historical source without a component configuration retains its original path.
+				parseHelperDistributionDependencies(dependencies, options.version);
+				const { verifyPublishedHelperDependencies } = await import("./helper-release");
+				await verifyPublishedHelperDependencies({
+					repository,
+					helpersTag: dependencies.helpers.tag,
+					executorVersion: dependencies.executor.version,
+					protocolVersion: dependencies.executor.protocolVersion,
+					run,
+					signal: options.signal,
+				});
+			}
 		}
 		// Require an explicitly pushed tag rather than silently using GitHub's default branch.
 		await verifyRemoteTag(run, repository, tag, options.commit);
@@ -696,6 +788,21 @@ export async function publishGitHubRelease(
 		}
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		if (!alreadyPublished) {
+			// Uploads can take minutes. Recheck the frozen component identities before public promotion.
+			if (componentEvidence) {
+				const { verifyComponentReleaseEvidence } = await import("./component-release-inputs");
+				await verifyComponentReleaseEvidence({
+					repository,
+					targetCommit: options.commit,
+					dependencies,
+					evidence: componentEvidence,
+					run: options.run,
+					signal: options.signal,
+					deadline: options.deadline,
+				});
+			}
+			options.signal?.throwIfAborted();
+			if (componentEvidence) await verifyRemoteTag(run, repository, tag, options.commit);
 			if (options.preventStableLatestRollback && !prerelease) {
 				await assertStableLatestDoesNotRegress(run, repository, options.version);
 			}

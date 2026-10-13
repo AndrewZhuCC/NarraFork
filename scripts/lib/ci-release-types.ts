@@ -93,6 +93,16 @@ export interface CiReleaseBuildSource {
 	controlArtifact: CiReleaseArtifactIdentity;
 	platforms: { target: CiReleaseTarget; artifact: CiReleaseArtifactIdentity }[];
 }
+export interface CiReleaseComponentEvidence {
+	executor: {
+		version: string;
+		protocolVersion: number;
+		tag: string;
+		commit: string;
+		manifestSha256: string;
+		buildInputsSha256: string;
+	};
+}
 export interface CiReleasePlan {
 	schemaVersion: 1;
 	repository: string;
@@ -108,6 +118,8 @@ export interface CiReleasePlan {
 	runId: number;
 	runAttempt: number;
 	baselines: CiReleaseBaseline[];
+	/** Read-only component identities, collected only by an online publisher control plan. */
+	componentEvidence?: CiReleaseComponentEvidence;
 	/** Present only for native re-verification of byte-identical original builds. */
 	buildSource?: CiReleaseBuildSource;
 }

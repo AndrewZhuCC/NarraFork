@@ -27,7 +27,7 @@ import {
 	type ReleaseAssetDownloader,
 	readReleaseText,
 } from "./ci-release-io";
-import { validateCiReleasePlan } from "./ci-release-plan";
+import { validateCiComponentDependencies, validateCiReleasePlan } from "./ci-release-plan";
 import {
 	CI_RELEASE_TARGETS,
 	type CiReleaseBaseline,
@@ -91,6 +91,8 @@ const manifestSchema = z
 
 export interface AssembleReleaseBundleOptions {
 	plan: CiReleasePlan;
+	/** Target-commit JSON pin, not the control checkout's current configuration. */
+	targetHelperDistribution?: BinaryMetadata["helperDistribution"];
 	platformsDir: string;
 	smokeDir: string;
 	bundleDir: string;
@@ -239,12 +241,11 @@ function assetLimit(name: string): number {
 /** Never infer dependencies from the control script: legacy bytes retain their old contract. */
 export function validateBundleHelperDistribution(
 	binaries: readonly BinaryMetadata[],
-	version: string,
 ): BinaryMetadata["helperDistribution"] {
 	const declared = binaries.map((binary) =>
 		binary.helperDistribution === undefined
 			? undefined
-			: parseHelperDistributionDependencies(binary.helperDistribution, version),
+			: parseHelperDistributionDependencies(binary.helperDistribution),
 	);
 	const first = declared[0];
 	if (declared.some((value) => !isDeepStrictEqual(value, first)))
@@ -290,6 +291,7 @@ async function verifyBundle(
 			"runAttempt",
 			"baselines",
 			"buildSource",
+			"componentEvidence",
 		] as const) {
 			if (!isDeepStrictEqual(plan[key], expected[key]))
 				throw new Error(`Bundle expected target identity mismatch: ${key}`);
@@ -333,11 +335,12 @@ async function verifyBundle(
 			),
 		);
 	}
-	const helperDistribution = validateBundleHelperDistribution(binaries, plan.version);
+	const helperDistribution = validateBundleHelperDistribution(binaries);
+	validateCiComponentDependencies(plan, helperDistribution);
 	const recordedDependencies =
 		parsed.helperDistribution === undefined
 			? undefined
-			: parseHelperDistributionDependencies(parsed.helperDistribution, plan.version);
+			: parseHelperDistributionDependencies(parsed.helperDistribution);
 	if (!isDeepStrictEqual(helperDistribution, recordedDependencies))
 		throw new Error("Bundle helper dependency declaration mismatch");
 	const sums = `narrafork-${plan.version}-SHA256SUMS`;
@@ -560,7 +563,23 @@ export async function assembleReleaseBundle(
 			),
 		);
 	}
-	const helperDistribution = validateBundleHelperDistribution(binaries, plan.version);
+	const helperDistribution = validateBundleHelperDistribution(binaries);
+	validateCiComponentDependencies(plan, helperDistribution);
+	if (Object.hasOwn(options, "targetHelperDistribution")) {
+		const expected = options.targetHelperDistribution;
+		if (expected === undefined && plan.componentEvidence !== undefined)
+			throw new Error("Legacy target cannot declare component evidence");
+		if (expected !== undefined) {
+			if (!isDeepStrictEqual(helperDistribution, parseHelperDistributionDependencies(expected)))
+				throw new Error("Release helper dependencies do not match target component configuration");
+		} else if (
+			helperDistribution !== undefined &&
+			(helperDistribution.executor.version !== plan.version ||
+				helperDistribution.executor.protocolVersion !== 1)
+		) {
+			throw new Error("Legacy target helper dependency version/protocol mismatch");
+		}
+	}
 	const fullBytes = binaries.reduce((sum, entry) => sum + entry.size, 0);
 	const maxBase = Math.max(0, ...plan.baselines.map((entry) => entry.metadata.size));
 	const maxFull = Math.max(...binaries.map((entry) => entry.size));

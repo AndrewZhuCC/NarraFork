@@ -156,10 +156,7 @@ export async function computeCiBinaryMetadata(
 		...(input.helperDistribution === undefined
 			? {}
 			: {
-					helperDistribution: parseHelperDistributionDependencies(
-						input.helperDistribution,
-						input.version,
-					),
+					helperDistribution: parseHelperDistributionDependencies(input.helperDistribution),
 				}),
 		buildDate: input.buildDate,
 		size,
@@ -202,13 +199,11 @@ export function validateCiMetadata(
 	const dependencies =
 		metadata.helperDistribution === undefined
 			? undefined
-			: parseHelperDistributionDependencies(metadata.helperDistribution, expected.version);
+			: parseHelperDistributionDependencies(metadata.helperDistribution);
 	if (
 		expected.helperDistribution !== undefined &&
 		JSON.stringify(dependencies) !==
-			JSON.stringify(
-				parseHelperDistributionDependencies(expected.helperDistribution, expected.version),
-			)
+			JSON.stringify(parseHelperDistributionDependencies(expected.helperDistribution))
 	)
 		throw new Error(`Release helper dependencies mismatch: ${expected.name}`);
 }

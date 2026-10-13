@@ -28,7 +28,13 @@ import {
 	withDeadline,
 	writeDistributionJson,
 } from "./helper-distribution-runtime";
-import { APP_VERSION } from "./version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "./version";
+
+const {
+	version: executorVersion,
+	protocolVersion: executorProtocol,
+	tag: executorTag,
+} = BUILD_EXECUTOR_DISTRIBUTION;
 
 const cache = new Map<string, { manifest: ExecutorManifest; fetchedAt: number }>();
 const inflight = new Map<string, Promise<ExecutorManifest | null>>();
@@ -44,7 +50,11 @@ export function resetExecutorManifestCache(): void {
 	inflight.clear();
 }
 function assertCompatibility(manifest: ExecutorManifest): void {
-	if (manifest.version !== APP_VERSION || manifest.protocolVersion !== DEVICE_PROTOCOL_VERSION)
+	if (
+		manifest.version !== executorVersion ||
+		manifest.protocolVersion !== executorProtocol ||
+		manifest.protocolVersion !== DEVICE_PROTOCOL_VERSION
+	)
 		throw new ExecutorDistributionError(
 			"Executor version/protocol does not match this NarraFork build",
 		);
@@ -57,8 +67,8 @@ function parseManifest(value: unknown, source: HelperSource, tag: string): Execu
 			? parseExecutorReleaseManifest(value, {
 					repository: source.repository,
 					tag,
-					version: APP_VERSION,
-					protocolVersion: DEVICE_PROTOCOL_VERSION,
+					version: executorVersion,
+					protocolVersion: executorProtocol,
 				}).manifest
 			: parseExecutorManifest(value);
 	assertCompatibility(manifest);
@@ -72,7 +82,7 @@ async function fetchManifest(
 ): Promise<ExecutorManifest | null> {
 	const path = distributionPath(
 		context.source,
-		`${tag}\0${APP_VERSION}\0${DEVICE_PROTOCOL_VERSION}\0manifest`,
+		`${tag}\0${executorVersion}\0${executorProtocol}\0manifest`,
 	);
 	const deadline = withDeadline(signal, 10_000);
 	try {
@@ -112,8 +122,8 @@ export async function getExecutorManifest(
 		options.source ?? captureHelperSource(),
 		options.fetcher,
 	);
-	const tag = context.source.source === "github" ? `executor-v${APP_VERSION}` : "legacy-tools";
-	const key = `${context.key}\0${tag}\0${APP_VERSION}\0${DEVICE_PROTOCOL_VERSION}`;
+	const tag = context.source.source === "github" ? executorTag : "legacy-tools";
+	const key = `${context.key}\0${tag}\0${executorVersion}\0${executorProtocol}`;
 	options.signal?.throwIfAborted();
 	if (!context.isCurrent()) return null;
 	const cached = cache.get(key);
@@ -175,8 +185,7 @@ export function freezeExecutorArtifact(
 	}
 	return {
 		source: { ...source },
-		tag:
-			origin?.tag ?? (source.source === "github" ? `executor-v${parsed.version}` : "legacy-tools"),
+		tag: origin?.tag ?? (source.source === "github" ? executorTag : "legacy-tools"),
 		version: parsed.version,
 		protocolVersion: parsed.protocolVersion,
 		platform,
@@ -225,8 +234,7 @@ export async function ensureExecutorBinary(
 	assertCompatibility(check);
 	if (
 		binding.platform !== platform ||
-		binding.tag !==
-			(binding.source.source === "github" ? `executor-v${binding.version}` : "legacy-tools")
+		binding.tag !== (binding.source.source === "github" ? executorTag : "legacy-tools")
 	)
 		throw new ExecutorDistributionError("Executor binding mismatch");
 	const downloaded = await downloadHelperBinary(

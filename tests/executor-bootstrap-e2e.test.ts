@@ -29,7 +29,10 @@ import {
 import { buildExecutorInstallScript } from "../server/lib/executor-install-script";
 import { HELPER_BIN_DIR } from "../server/lib/helper-binaries";
 import { settings } from "../server/lib/settings";
-import { APP_VERSION } from "../server/lib/version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../server/lib/version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
+
 import {
 	executorBootstrapRoutes,
 	resetExecutorBootstrapRateLimit,
@@ -67,7 +70,7 @@ beforeAll(async () => {
 
 	// Publish through the real HTTP upload path, not by writing files directly.
 	const manifest = buildExecutorManifest({
-		version: APP_VERSION,
+		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: new Date().toISOString(),
 		artifacts: [{ platform: "linux-amd64", bytes: new Uint8Array(BINARY) }],
@@ -81,7 +84,7 @@ beforeAll(async () => {
 		expect(response.status).toBe(200);
 	};
 	await put(
-		`narrafork-executor-${APP_VERSION}-linux-amd64`,
+		`narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`,
 		new Uint8Array(BINARY),
 		"application/octet-stream",
 	);
@@ -143,7 +146,7 @@ function bootstrapApp() {
 
 test("NarraFork mirrors the published release and serves it against a ticket", async () => {
 	const manifest = await getExecutorManifest({ forceRefresh: true });
-	expect(manifest?.version).toBe(APP_VERSION);
+	expect(manifest?.version).toBe(EXECUTOR_VERSION);
 	expect(manifest?.platforms["linux-amd64"]?.sha256).toBe(SHA256);
 
 	// Mirrors into the local cache with digest verification.

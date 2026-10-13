@@ -30,7 +30,9 @@ import { generateId } from "../id";
 import { setOutboundFetchOverrideForTest } from "../net/outbound-fetch";
 import { settings } from "../settings";
 import { DEFAULT_UPDATE_SETTINGS } from "../settings/update-source";
-import { APP_VERSION } from "../version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -41,14 +43,14 @@ function deferred<T>() {
 }
 function manifest() {
 	return {
-		version: APP_VERSION,
+		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: "2026-01-01T00:00:00Z",
 		platforms: Object.fromEntries(
 			EXECUTOR_PLATFORMS.map((platform) => [
 				platform,
 				{
-					filename: executorPublishedFilename(APP_VERSION, platform),
+					filename: executorPublishedFilename(EXECUTOR_VERSION, platform),
 					size: 256,
 					sha256: "a".repeat(64),
 				},
@@ -80,7 +82,7 @@ function sourceB(kind: "github" | "update-server"): HelperSource {
 		: { source: "update-server", serverUrl: "https://server-b.example" };
 }
 function offlineFixture(source: HelperSource) {
-	const tag = source.source === "github" ? `executor-v${APP_VERSION}` : "legacy-tools";
+	const tag = source.source === "github" ? `executor-v${EXECUTOR_VERSION}` : "legacy-tools";
 	const value =
 		source.source === "github"
 			? {
@@ -92,7 +94,7 @@ function offlineFixture(source: HelperSource) {
 					licenses: [{ name: "LICENSE.txt", size: 10, sha256: "a".repeat(64) }],
 				}
 			: manifest();
-	const path = distribution.distributionPath(source, `${tag}\0${APP_VERSION}\0${1}\0manifest`);
+	const path = distribution.distributionPath(source, `${tag}\0${EXECUTOR_VERSION}\0${1}\0manifest`);
 	writeFileSync(path, JSON.stringify(value));
 	return path;
 }

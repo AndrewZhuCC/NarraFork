@@ -20,6 +20,7 @@ import {
 	verifyCiSidecar,
 	writeBuildAggregates,
 } from "../../scripts/lib/ci-build-strict";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const dirs: string[] = [];
 function temp() {
@@ -56,6 +57,7 @@ async function worker(
 				version: identity.version,
 				commit: identity.commit,
 				repository: identity.repository,
+				helperDistribution: createHelperDistributionDependencies("0.9.1"),
 				releaseCi,
 			},
 		});
@@ -127,6 +129,27 @@ describe("strict CI builds fail closed without compiling or publishing", () => {
 		await expect(verifyCiSidecar(join(dist, platform.name), identity)).resolves.toEqual(
 			result.metadata,
 		);
+	});
+	test("APP and executor versions differ while frozen component pin remains strict", async () => {
+		const path = join(temp(), platform.name);
+		writeFileSync(path, "fixture executable");
+		const dependencies = createHelperDistributionDependencies("0.9.1");
+		const metadata = await computeCiBinaryMetadata(path, {
+			...input,
+			helperDistribution: dependencies,
+		});
+		const expected = { ...identity, helperDistribution: dependencies };
+		validateCiMetadata(metadata, expected);
+		expect(metadata.version).toBe("1.2.3");
+		expect(metadata.helperDistribution).toEqual(dependencies);
+		for (const helperDistribution of [
+			undefined,
+			createHelperDistributionDependencies("0.9.2"),
+			createHelperDistributionDependencies("0.9.1", 2),
+			{ ...dependencies, executor: { ...dependencies.executor, tag: "executor-v0.9.2" } },
+		]) {
+			expect(() => validateCiMetadata({ ...metadata, helperDistribution }, expected)).toThrow();
+		}
 	});
 	test("metadata write failure fails strict worker but local mode remains best effort", async () => {
 		const dist = temp();

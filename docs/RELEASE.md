@@ -41,7 +41,7 @@
 
 一次检查/下载冻结传输策略，重定向每跳重新应用 NO_PROXY/loopback 豁免。代理变更后可以立即重试，不复用旧失败或 in-flight；不改来源身份或 preparedId，不删除已准备包，也不取消已调度更新。TLS 验证不能关闭，代理凭据不写入产物、票据、来源身份或诊断日志。旧更新服务器的响应体也受请求 deadline/父取消约束；检查 JSON 限 1 MiB、patch metadata 限 64 KiB，只允许同 origin 的有界重定向。
 
-公开仓库应**先发布 GitHub，再桥接旧更新服务器**，确保新客户端默认来源有版本可用。新构建先发布下节的辅助依赖，再发布主程序。示例（版本、平台按实际替换）：
+公开仓库应**先发布 GitHub，再桥接旧更新服务器**，确保新客户端默认来源有版本可用。辅助组件使用独立版本：只有依赖 pin 变化且对应组件尚未公开时，才先发布下节的辅助依赖；普通主程序版本复用并只读验证已发布组件，不重复构建或发布。示例（版本、平台按实际替换）：
 
 ```bash
 # 主仓库中准备好版本提交、构建和本地 tag；仅显式推送已经核对的 tag
@@ -135,13 +135,13 @@ gh workflow run helpers-release.yml --ref main -f kind=helpers -f tag=helpers-v1
 ## GitHub 辅助工具与 executor
 
 - rg 15.1.0 与 zstd 1.5.7 的六平台原始可执行文件、`helper-manifest-v1.json` 和许可附件放在同仓库不可变 `helpers-v1.0.0` Release。rg 由固定官方归档及归档/二进制双摘要制备；zstd 使用受控源码与工具链构建。新增 macOS zstd，Windows ARM64 使用原有确定性 recipe。Linux zstd 为 musl 静态包；rg Linux ARM64 是 glibc 包，不代表支持 Alpine/Termux。
-- executor 使用独立 `executor-v<应用版本>` Release 和 `narrafork-executor-manifest.json`，校验外层仓库/tag/commit、应用版本、RPC 协议及六种 Go 平台；不通过 GitHub latest 选择工具。两类辅助 Release 都不标记 latest、不写主 update-index、不占主程序资产预算。
+- executor 使用独立 `executor-v<组件版本>` Release 和 `narrafork-executor-manifest.json`。组件版本与协议由 `shared/component-versions.json` 显式锁定，不跟随主程序版本增长；例如主程序 0.9.2 或后续版本可以继续依赖 executor 0.9.1。仍校验外层仓库/tag/commit、组件版本、RPC 协议及六种 Go 平台，不通过 GitHub latest 选择工具，也不接受任意“同协议最新版”。两类辅助 Release 都不标记 latest、不写主 update-index、不占主程序资产预算。
 - GitHub 模式只访问生效仓库，不访问保留的个人更新服务器、不默默转用上游仓库；显式 update-server 模式保持旧 tools 接口。fork 自动取得仓库名，但必须自行发布对应辅助 Release，仓库需公开供匿名客户端下载。
 - 系统 PATH 优先；托管缓存按来源/tag/版本/平台/摘要隔离，使用前核对 size/SHA256/架构。旧缓存仅可信摘要吻合才复制迁移，不删除旧文件。manifest 流式硬限 64 KiB/10 秒；helper 二进制 32 MiB/60 秒，executor 32 MiB/120 秒，父取消与独占 temp 清理贯穿下载。
 - executor 安装票据绑定选中的来源/tag/版本/平台/size/digest，下载不重新用最新 manifest 选包。目标机器从 NarraFork 获取验证后的产物，不接收服务端代理凭据。不安装系统包、不修改 PATH、不 sudo、不启动守护进程。
-- 新 build-info/sidecar/bundle 带 `helperDistribution` 依赖声明，八平台必须一致；正常主程序 publisher 在远端写入前只读核验对应 helpers 和 executor 公开资产的完整集合、hash/size、许可及版本/协议。build-only/dry-run 不因此联网或发布，旧 bundle 无声明时不凭当前代码编造新依赖。
+- 新 build-info/sidecar/bundle 带 `helperDistribution` 依赖声明，构建开始时冻结，八平台必须一致；正常主程序 publisher 在远端写入前只读核验对应 helpers 和 executor 公开资产的完整集合、hash/size、许可及组件版本/协议。含独立组件配置的新目标还要比较实际 executor 构建输入，源码、依赖、生产嵌入资源、构建参数或固定 Go 工具链发生变化但未升级组件 pin 时拒绝复用；仅主程序、文档或纯测试变化不触发组件发布。build-only/dry-run 不因此联网或发布，旧 bundle 无声明时不凭当前代码编造新依赖；恢复原始 bundle 不采用控制脚本的当前 pin 改写旧产物。
 
-`.github/workflows/helpers-release.yml` 独立、手动运行。维护者先创建并推送精确源码 tag：helpers 使用 `helpers-v1.0.0`，executor 使用 `executor-v<version>`；tag 须在当前仓库真实默认分支祖先链。默认 `publish=false` 完成六平台 native build/smoke 后只上传不可变 Actions bundle；`publish=true` 仍需 `release` Environment 审批，只有 publisher 有写权限。不会因为 push main/tag 自动发布。
+`.github/workflows/helpers-release.yml` 独立、手动运行。维护者在组件实际变化时先显式升级组件配置，再创建并推送精确源码 tag：helpers 使用 `helpers-v1.0.0`，executor 使用与该提交组件配置一致的 `executor-v<组件版本>`，不要求与该提交的应用版本相等；tag 须在当前仓库真实默认分支祖先链。无新配置的历史 tag/封存包保留原身份校验与恢复规则。默认 `publish=false` 完成六平台 native build/smoke 后只上传不可变 Actions bundle；`publish=true` 仍需 `release` Environment 审批，只有 publisher 有写权限。不会因为 push main/tag 或应用版本增长自动发布。
 
 示例（`main` 替换为实际默认分支；这些命令会触发远端任务，需维护者显式执行）：
 
@@ -149,9 +149,10 @@ gh workflow run helpers-release.yml --ref main -f kind=helpers -f tag=helpers-v1
 # 辅助工具：先原生验收，再用原 run bundle 发布，不重建
 gh workflow run helpers-release.yml --ref main -f kind=helpers -f tag=helpers-v1.0.0 -F publish=false
 gh workflow run helpers-release.yml --ref main -f kind=helpers -f tag=helpers-v1.0.0 -F publish=true -f source_run_id=123456789
-# executor：使用与客户端相同的应用版本
-gh workflow run helpers-release.yml --ref main -f kind=executor -f tag=executor-v0.9.0 -F publish=false
-gh workflow run helpers-release.yml --ref main -f kind=executor -f tag=executor-v0.9.0 -F publish=true -f source_run_id=234567890
+# executor：仅组件变化、升级独立 pin 且尚未公开时执行（tag 按组件配置替换）
+# 普通主程序 0.9.2 可以复用已公开 executor-v0.9.1，无须执行这些命令
+gh workflow run helpers-release.yml --ref main -f kind=executor -f tag=executor-v0.9.2 -F publish=false
+gh workflow run helpers-release.yml --ref main -f kind=executor -f tag=executor-v0.9.2 -F publish=true -f source_run_id=234567890
 ```
 
 本地 `scripts/release-helpers.ts preview --plan=<plan> --output=<bundle>` 校验原产物、不写 Release；`scripts/release-executor.ts` 提供显式 `--target=github`，默认旧服务器目标不变。公开辅助资产不能 clobber、补传或覆盖，变更需新 tag；失败 draft 可恢复，但恢复必须核对原 run/attempt/artifact 和全部 native smoke，不用新的重编结果替代。checksum 只证明同源传输/缓存完整性，不宣称独立发布者签名。mock 不能代替托管 runner native smoke 或真实资产上线。

@@ -301,7 +301,11 @@ describe("actual helper tag refs", () => {
 describe("read-only auxiliary dependency readiness", () => {
 	test("checks same-repository fixed tags, exact twelve helpers and six executors", async () => {
 		const f = fixture();
-		await verifyPublishedHelperDependencies(f.options);
+		const verified = await verifyPublishedHelperDependencies(f.options);
+		expect(verified.executor).toEqual({
+			commit,
+			manifestSha256: digest(f.raws.get(EXECUTOR_MANIFEST_FILENAME) as string),
+		});
 		expect(f.calls.length).toBe(6);
 		expect(
 			f.calls.every((args) => args[0] === "api" && args[1]?.startsWith(`repos/${repository}/`)),

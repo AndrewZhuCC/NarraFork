@@ -7,6 +7,8 @@ import {
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
 
+import { DEVICE_PROTOCOL_VERSION } from "./agent/execution/rpc-types";
+
 export { BUILD_GITHUB_REPOSITORY } from "../../shared/build-repository";
 
 let version = "0.0.0";
@@ -20,7 +22,7 @@ const pkgPath = resolve(import.meta.dir, "../../package.json");
 if (existsSync(pkgPath)) {
 	const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 	version = pkg.version ?? "0.0.0";
-	helperDistribution = createHelperDistributionDependencies(version);
+	helperDistribution = createHelperDistributionDependencies();
 
 	try {
 		commitHash = execSync("git rev-parse --short HEAD", {
@@ -50,7 +52,7 @@ if (existsSync(pkgPath)) {
 
 // An explicit but malformed declaration is not a legacy build: fail closed.
 if (embeddedHelperDistribution !== undefined)
-	helperDistribution = parseHelperDistributionDependencies(embeddedHelperDistribution, version);
+	helperDistribution = parseHelperDistributionDependencies(embeddedHelperDistribution);
 
 export const APP_VERSION: string = version;
 export const GIT_COMMIT: string = commitHash;
@@ -58,3 +60,11 @@ export const GIT_COMMIT: string = commitHash;
 export const BUILD_PLATFORM: string = platform;
 /** Undefined only for a compiled legacy build which never advertised helper dependencies. */
 export const BUILD_HELPER_DISTRIBUTION = helperDistribution;
+/** Exact component identity; only undeclared legacy binaries track the application version. */
+export const BUILD_EXECUTOR_DISTRIBUTION = Object.freeze(
+	helperDistribution?.executor ?? {
+		version: APP_VERSION,
+		protocolVersion: DEVICE_PROTOCOL_VERSION,
+		tag: `executor-v${APP_VERSION}`,
+	},
+);

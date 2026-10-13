@@ -1,4 +1,5 @@
 import { BUILD_GITHUB_REPOSITORY } from "./build-repository";
+import componentVersions from "./component-versions.json";
 import { isValidGitHubRepository } from "./github-repository";
 import { isValidReleaseVersion } from "./release-version";
 import { EXECUTOR_PLATFORMS, type ExecutorManifest } from "./remote-executor";
@@ -53,11 +54,39 @@ export interface HelperDistributionDependencies {
 	helpers: { catalogVersion: typeof HELPER_CATALOG_VERSION; tag: typeof HELPER_RELEASE_TAG };
 	executor: { version: string; protocolVersion: number; tag: string };
 }
-/** Matches the existing device wire protocol; no runtime/server dependency here. */
-export const HELPER_EXECUTOR_PROTOCOL_VERSION = 1;
+export interface ComponentVersions {
+	executor: { version: string; protocolVersion: number };
+}
+
+function validProtocolVersion(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= 2 ** 31 - 1;
+}
+
+/** Read a target commit's pin as data, never by executing that commit's code. */
+export function parseComponentVersions(value: unknown): ComponentVersions {
+	const record = object(value, ["executor"]);
+	const executor = object(record.executor, ["version", "protocolVersion"]);
+	if (
+		typeof executor.version !== "string" ||
+		!isValidReleaseVersion(executor.version) ||
+		!EXECUTOR_VERSION_RE.test(executor.version) ||
+		!validProtocolVersion(executor.protocolVersion)
+	)
+		throw new Error("Invalid component version configuration");
+	return {
+		executor: { version: executor.version, protocolVersion: executor.protocolVersion },
+	};
+}
+
+const componentPin = parseComponentVersions(componentVersions);
+export const COMPONENT_VERSIONS: Readonly<{ executor: Readonly<ComponentVersions["executor"]> }> =
+	Object.freeze({ executor: Object.freeze(componentPin.executor) });
+export const EXECUTOR_RELEASE_VERSION = COMPONENT_VERSIONS.executor.version;
+export const HELPER_EXECUTOR_PROTOCOL_VERSION = COMPONENT_VERSIONS.executor.protocolVersion;
+
 export function parseHelperDistributionDependencies(
 	value: unknown,
-	expectedVersion?: string,
+	expectedExecutorVersion?: string,
 ): HelperDistributionDependencies {
 	const record = object(value, ["helpers", "executor"]);
 	const helpers = object(record.helpers, ["catalogVersion", "tag"]);
@@ -68,31 +97,29 @@ export function parseHelperDistributionDependencies(
 		typeof executor.version !== "string" ||
 		!isValidReleaseVersion(executor.version) ||
 		!EXECUTOR_VERSION_RE.test(executor.version) ||
-		(expectedVersion !== undefined && executor.version !== expectedVersion) ||
+		(expectedExecutorVersion !== undefined && executor.version !== expectedExecutorVersion) ||
 		executor.tag !== `executor-v${executor.version}` ||
-		executor.protocolVersion !== HELPER_EXECUTOR_PROTOCOL_VERSION
+		!validProtocolVersion(executor.protocolVersion)
 	)
 		throw new Error("Invalid helper distribution dependencies");
 	return {
 		helpers: { catalogVersion: HELPER_CATALOG_VERSION, tag: HELPER_RELEASE_TAG },
 		executor: {
 			version: executor.version,
-			protocolVersion: HELPER_EXECUTOR_PROTOCOL_VERSION,
+			protocolVersion: executor.protocolVersion,
 			tag: `executor-v${executor.version}`,
 		},
 	};
 }
+
 export function createHelperDistributionDependencies(
-	version: string,
+	version = EXECUTOR_RELEASE_VERSION,
 	protocolVersion = HELPER_EXECUTOR_PROTOCOL_VERSION,
 ): HelperDistributionDependencies {
-	return parseHelperDistributionDependencies(
-		{
-			helpers: { catalogVersion: HELPER_CATALOG_VERSION, tag: HELPER_RELEASE_TAG },
-			executor: { version, protocolVersion, tag: `executor-v${version}` },
-		},
-		version,
-	);
+	return parseHelperDistributionDependencies({
+		helpers: { catalogVersion: HELPER_CATALOG_VERSION, tag: HELPER_RELEASE_TAG },
+		executor: { version, protocolVersion, tag: `executor-v${version}` },
+	});
 }
 export type HelperSource =
 	| { source: "github"; repository: string }

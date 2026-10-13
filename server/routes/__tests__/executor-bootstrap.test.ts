@@ -13,7 +13,9 @@ import {
 	resetExecutorTickets,
 } from "../../lib/executor-bootstrap-ticket";
 import { settings } from "../../lib/settings";
-import { APP_VERSION } from "../../lib/version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 function issueExecutorTicket(platform: ExecutorPlatform, options: IssueExecutorTicketOptions = {}) {
 	return issueRawTicket(platform, {
@@ -44,12 +46,12 @@ const SHA256 = createHash("sha256").update(BINARY).digest("hex");
 
 function manifest(): ExecutorManifest {
 	return {
-		version: APP_VERSION,
+		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: "2026-08-15T00:00:00.000Z",
 		platforms: {
 			"linux-amd64": {
-				filename: `narrafork-executor-${APP_VERSION}-linux-amd64`,
+				filename: `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`,
 				size: BINARY.byteLength,
 				sha256: SHA256,
 			},
@@ -66,7 +68,7 @@ function mockUpdateServer(): void {
 				headers: { "content-type": "application/json" },
 			});
 		}
-		if (url.endsWith(`narrafork-executor-${APP_VERSION}-linux-amd64`)) {
+		if (url.endsWith(`narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`)) {
 			return new Response(new Blob([Uint8Array.from(BINARY)]), { status: 200 });
 		}
 		return new Response("not found", { status: 404 });
@@ -115,7 +117,7 @@ describe("GET /api/executor/download/:platform", () => {
 			`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
 		);
 		expect(response.status).toBe(200);
-		expect(response.headers.get("x-executor-version")).toBe(APP_VERSION);
+		expect(response.headers.get("x-executor-version")).toBe(EXECUTOR_VERSION);
 		expect(response.headers.get("x-executor-sha256")).toBe(SHA256);
 		expect(response.headers.get("cache-control")).toBe("no-store");
 		expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array(BINARY));
@@ -199,7 +201,7 @@ describe("GET /api/executor/download/:platform", () => {
 		// Pre-seed the cache with a tampered file; the digest check must reject it and
 		// the honest re-download must also fail because the mock serves bad bytes.
 		writeFileSync(
-			join(HELPER_BIN_DIR, `narrafork-executor-${APP_VERSION}-linux-amd64`),
+			join(HELPER_BIN_DIR, `narrafork-executor-${EXECUTOR_VERSION}-linux-amd64`),
 			"tampered",
 		);
 		globalThis.fetch = (async (input: RequestInfo | URL) => {
