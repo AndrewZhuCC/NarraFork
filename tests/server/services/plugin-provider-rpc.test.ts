@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import type { JsonRpcNotification, ProviderStreamEvent } from "@server/lib/plugins/protocol";
+import {
+	isHostTruncatedDump,
+	type JsonRpcNotification,
+	type ProviderStreamEvent,
+} from "@server/lib/plugins/protocol";
 import {
 	PluginProviderRpcClient,
 	type ProviderOperation,
@@ -1039,8 +1043,8 @@ describe("provider dump events", () => {
 		expect(transport.killed).toHaveLength(0);
 	});
 
-	it("cancels the operation when dump output exceeds the advertised budget", async () => {
-		const { client, transport } = await setup();
+	it("soft-truncates UTF8 diagnostic overflow and still completes business output", async () => {
+		const { client, transport } = await setup({ limits: { maxOperationOutputBytes: 1000 } });
 		clients.push(client);
 		const operation = await client.chat(dumpChatParams(4));
 		const stream = operation.events();
@@ -1048,31 +1052,40 @@ describe("provider dump events", () => {
 			notification(operation.operationId, 1, {
 				type: "dump.response",
 				status: 200,
-				bodyChunk: "toolong",
+				bodyChunk: `中😀${"x".repeat(10000)}`,
 			}),
 		);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		const cancellations = transport.requests.filter((item) => item.method === "provider.cancel");
-		expect(cancellations).toHaveLength(1);
-		expect(cancellations[0].params).toMatchObject({
-			operationId: operation.operationId,
-			reason: "output_limit",
-		});
+		const hostClipped = (await stream.next()).value;
+		expect(hostClipped).toMatchObject({ type: "dump.response", bodyChunk: "中", truncated: true });
+		if (!hostClipped) throw new Error("No truncated diagnostic event");
+		expect(isHostTruncatedDump(hostClipped)).toBe(true);
+		expect(JSON.stringify(hostClipped)).not.toContain("sourceTruncated");
 		transport.emit(
 			notification(operation.operationId, 2, {
-				type: "error",
-				error: { classification: "cancelled", code: "OUTPUT_LIMIT", message: "limited" },
+				type: "dump.response",
+				bodyChunk: "ignored",
+				final: true,
 			}),
 		);
+		await expect(stream.next()).resolves.toMatchObject({
+			value: { type: "dump.response", bodyChunk: "", truncated: true, final: true },
+		});
+		transport.emit(notification(operation.operationId, 3, { type: "text.delta", text: "ok" }));
 		transport.emit(
-			notification(operation.operationId, 3, {
+			notification(operation.operationId, 4, {
 				type: "done",
-				status: "failed",
-				stopReason: "error",
+				status: "completed",
+				stopReason: "end_turn",
 			}),
 		);
-		await expect(stream.next()).resolves.toMatchObject({ value: { type: "error" } });
-		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
-		await expect(stream.next()).rejects.toMatchObject({ code: "OUTPUT_LIMIT" });
+		await expect(stream.next()).resolves.toMatchObject({
+			value: { type: "text.delta", text: "ok" },
+		});
+		await expect(stream.next()).resolves.toMatchObject({
+			value: { type: "done", status: "completed" },
+		});
+		await expect(stream.next()).resolves.toMatchObject({ done: true });
+		expect(transport.requests.filter((item) => item.method === "provider.cancel")).toHaveLength(0);
+		expect(transport.killed).toHaveLength(0);
 	});
 });

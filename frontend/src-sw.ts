@@ -10,6 +10,7 @@ import { NavigationRoute, registerRoute } from "workbox-routing";
 import { CacheFirst, StaleWhileRevalidate } from "workbox-strategies";
 import { setBaseHref } from "../server/lib/spa-base-href";
 import { API_WS_PREFIXES, isApiOrWsRelativePath } from "./lib/app-path-classify";
+import { appVersionsMatch } from "./lib/version-match";
 
 declare let self: ServiceWorkerGlobalScope;
 
@@ -190,10 +191,6 @@ registerRoute(
 const APP_VERSION = __APP_VERSION__;
 const VERSION_CHECK_TIMEOUT_MS = 2500;
 
-function normalizeVersion(version: string | undefined): string | undefined {
-	return version?.replace(/^v/, "");
-}
-
 async function fetchServerVersion(): Promise<string | undefined> {
 	const controller = new AbortController();
 	const timeout = self.setTimeout(() => controller.abort(), VERSION_CHECK_TIMEOUT_MS);
@@ -236,7 +233,9 @@ async function checkVersionAndMaybeUnregister(): Promise<boolean> {
 	const serverVersion = await fetchServerVersion();
 	if (!serverVersion) return false;
 
-	if (normalizeVersion(serverVersion) !== normalizeVersion(APP_VERSION)) {
+	// Prefix-tolerant: release-CI server binaries embed the full commit while
+	// this bundle carries the short one (see lib/version-match.ts).
+	if (!appVersionsMatch(serverVersion, APP_VERSION)) {
 		await notifyVersionMismatch(serverVersion);
 		await self.registration.unregister();
 		return true;

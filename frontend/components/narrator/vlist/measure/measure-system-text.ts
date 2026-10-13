@@ -349,12 +349,14 @@ export function resolveBodyText(kind: SystemTextKind, data: SystemTextData): str
  */
 export function resolveSystemTextChrome(kind: SystemTextKind, data: SystemTextData): KindChrome {
 	const chrome = KIND_CHROME[kind];
-	// One row regardless of how many buttons qualify: the error card lays them out
-	// in a single `Group`, so the second button costs width, not height. (The card is
-	// full-width and the labels are short; a wrap would need a viewport far narrower
-	// than the list's own minimum.)
 	if (kind !== "error" || !data.buttons?.length) return chrome;
-	return { ...chrome, postBody: STACK_GAP + BUTTON_COMPACT_XS };
+	// Request shortcuts get their own bounded-width row. Provider fix / model probe
+	// retain their existing row; reserve both when present, including on mobile.
+	const ids = data.buttonIds ?? ["disableImageGen"];
+	const requestIds = new Set(["viewErrorRequest", "downloadErrorDump"]);
+	const rows =
+		Number(ids.some((id) => requestIds.has(id))) + Number(ids.some((id) => !requestIds.has(id)));
+	return { ...chrome, postBody: Math.max(1, rows) * (STACK_GAP + BUTTON_COMPACT_XS) };
 }
 
 /**

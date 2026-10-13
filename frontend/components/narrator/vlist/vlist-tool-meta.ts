@@ -199,6 +199,12 @@ export function deriveSendTargetNarratorId(
  * the `<subagent_id>` tag in its output, and only then the server's live
  * resolution of the selector — which is the only source that exists while the wait
  * is still running.
+ *
+ * ⚠️ The tag is wider than the card's identity row: it holds a LABEL (a valid
+ * selector), not the real narrator id. A legacy row whose metadata lacks the id
+ * (predating its introduction) still offers the menu jump through this fallback,
+ * but its card shows no identity row — classifyAwait deliberately refuses the tag,
+ * since printing a selector as if it were the id would mislead copy-paste.
  */
 export function deriveAwaitAgentNarratorId(
 	block: ContentBlock,

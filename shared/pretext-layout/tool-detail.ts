@@ -445,6 +445,13 @@ export interface ToolMetaRow {
 	mono?: boolean;
 	/** Turns the text into an external link. Height-neutral. */
 	href?: string;
+	/**
+	 * Identity line (an Await card's resolved child session): one reserved row of
+	 * monospace text, drawn by the render layer with its "open session" button.
+	 * Never wraps — the content is a bounded `slug · id` pair, so a fixed-height
+	 * block keeps it out of the text measurer entirely.
+	 */
+	identity?: string;
 	/** Badge chips on this row (mode, action, size, expiry). */
 	badges?: ToolStructuredBadge[];
 	/** Interactive controls on this row (download / copy link). */
@@ -983,7 +990,7 @@ function classifyByCategory(
 			]);
 		}
 		case "await":
-			return classifyAwait(inputJson, outputJson, metadata);
+			return classifyAwait(inputJson, outputJson, metadata, status);
 		case "send":
 			return classifySend(inputJson, outputJson, metadata, input.labels, status);
 		case "ask":
@@ -1051,6 +1058,7 @@ function metaRows(rows: Array<ToolMetaRow | null>): ToolMetaRowsDetail | null {
 		(r): r is ToolMetaRow =>
 			r !== null &&
 			(r.text.length > 0 ||
+				(r.identity?.length ?? 0) > 0 ||
 				(r.badges?.length ?? 0) > 0 ||
 				(r.actions?.length ?? 0) > 0 ||
 				r.progress != null),
@@ -2122,39 +2130,59 @@ function classifyAwait(
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	status?: string | null,
 ): ToolDetailData | null {
 	const rawOutput = resolveDisplayText(outputJson);
 	const awaitType = extractField(inputJson, "type") || (metadata?.awaitType as string) || "task";
 	const output = awaitType === "agent" ? stripAwaitAgentEnvelope(rawOutput) : rawOutput;
 	const isBash = awaitType === "bash";
-	// Badge row + waitFor / subagent lines (the chunked AwaitDetail header).
-	const targetId = extractField(inputJson, "id", "task_id", "taskId");
+	// While waiting on an agent, the server forwards the child's live output char
+	// count as a bare numeric `_streamingOutput` (the ContextAsk convention). It
+	// also arrives AS the output body — `toolOutputValue` folds the stream payload
+	// in when no real output exists — so detect exactly that fold and paint the
+	// counter instead of a lone number. A real (terminal) result never matches:
+	// `liveChars` is gated to non-terminal statuses.
+	const liveChars = isTerminalToolStatus(status)
+		? null
+		: parseLiveOutputChars(metadata?._streamingOutput);
+	const streamPayload = readLeafText(metadata?._streamingOutput);
+	const outputIsLiveCount =
+		liveChars != null && streamPayload !== undefined && output === streamPayload;
+	// Identity row (the ONLY meta row an agent wait keeps): the resolved child
+	// narrator id in copyable monospace. The badge row it replaces repeated the
+	// type, target, status and timeout — every one of them already on the header
+	// line — and Mantine's uppercase badge text corrupted the mixed-case id.
 	const resolvedId = metadata ? readLeafText(metadata.resolvedId) : undefined;
-	const awaitStatus = metadata ? readLeafText(metadata.status) : undefined;
 	const subagentId = metadata ? readLeafText(metadata.subagentId) : undefined;
+	const transportId = metadata ? readLeafText(metadata._awaitAgentNarratorId) : undefined;
+	const title = metadata
+		? (readLeafText(metadata.targetTitle) ?? readLeafText(metadata._awaitAgentTitle))
+		: undefined;
+	const label = metadata ? readLeafText(metadata.targetLabel) : undefined;
+	// The slug joins only when it says something the header does not: the header
+	// already headlines the title (or the slug itself when no title exists yet).
+	const slugPart = title && label && label !== title ? `${label} · ` : "";
+	const identityId = subagentId ?? resolvedId ?? transportId;
 	const waitForText = extractField(inputJson, "wait_for_text");
 	const header = metaRows([
-		badgeRow(
-			chips([
-				chip(awaitType, "indigo"),
-				chip(targetId, "gray"),
-				chip(resolvedId ? `→ ${resolvedId}` : undefined, "blue"),
-				chip(awaitStatus, awaitStatus === "failed" ? "red" : "green"),
-				chip(formatTimeoutLabel(extractNumericField(inputJson, "timeout")), "gray"),
-			]),
-		),
+		identityId ? { text: "", identity: `${slugPart}${identityId}` } : null,
 		waitForText ? { text: `wait_for: "${waitForText}"`, mono: true, dimmed: true } : null,
-		subagentId ? pathRow(`subagent: ${subagentId}`) : null,
 	]);
 	return sections([
 		section("meta.await", undefined, header),
-		textSection("output.main", outputJson, isBash ? "output" : "result", {
-			cap: isBash ? "term" : "code",
-			contentLines: countLines(output),
-			text: output,
-			// Non-bash await results are markdown in the chunked card.
-			...(isBash ? {} : { format: "markdown" as const }),
-		}),
+		outputIsLiveCount
+			? section("output.main", "result", {
+					kind: "structured",
+					badgeRows: 0,
+					bodyLines: [`${liveChars} chars`],
+				})
+			: textSection("output.main", outputJson, isBash ? "output" : "result", {
+					cap: isBash ? "term" : "code",
+					contentLines: countLines(output),
+					text: output,
+					// Non-bash await results are markdown in the chunked card.
+					...(isBash ? {} : { format: "markdown" as const }),
+				}),
 	]);
 }
 
@@ -3195,20 +3223,29 @@ function knowledgeEntryHref(entryId: string): string {
 }
 
 /**
- * ContextAsk's tool_output while the summary model is still streaming is a bare
- * cumulative character count (`onProgress` → `emitOutput(String(n))`), not a body.
- * Readers want that as a counter; painting it as markdown would show a lone number.
+ * The `tool_output` live-count convention: a running tool whose streamed
+ * "output" is a bare cumulative character count (ContextAsk's answer so far, a
+ * subagent's reply so far, an awaited child's reply so far) sends plain digits
+ * instead of a body. Readers want that as a counter; painting it as markdown
+ * would show a lone number.
  */
-function contextAskLiveOutputChars(
-	metadata: Record<string, unknown> | null,
-	outputJson: unknown,
-): number | null {
-	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+export function parseLiveOutputChars(value: unknown): number | null {
+	const raw = readLeafText(value);
 	if (raw === undefined) return null;
 	const trimmed = raw.trim();
 	if (!/^\d+$/.test(trimmed)) return null;
 	const n = Number(trimmed);
 	return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function contextAskLiveOutputChars(
+	metadata: Record<string, unknown> | null,
+	outputJson: unknown,
+): number | null {
+	// "First defined source wins", even when it is not numeric (a non-numeric
+	// streaming body must not fall through to the answer text).
+	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+	return parseLiveOutputChars(raw);
 }
 
 /**

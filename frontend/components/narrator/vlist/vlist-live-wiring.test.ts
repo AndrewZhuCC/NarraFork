@@ -1134,15 +1134,18 @@ describe("live event → patch field mapping", () => {
 
 	it("await_agent_resolved writes the child id without touching the lifecycle", async () => {
 		// The field name is the contract with `deriveAwaitAgentNarratorId`; writing it
-		// as `_metadata.subagentId` instead would ALSO grow the card (see the
-		// height-neutrality cases in live-patch-measure-audit.test.ts).
+		// as `_metadata.subagentId` instead would blur provenance (the value is
+		// server-derived, not tool-reported) — the identity row's grow on arrival is
+		// intentional (see live-patch-measure-audit.test.ts).
 		const { awaitAgentResolvedPatch } = await import("./vlist-live-events");
 		const result = awaitAgentResolvedPatch({
 			toolUseId: "tu-1",
 			subagentNarratorId: "sub-live",
+			subagentTitle: "Live Worker",
 		})(toolDoc("tu-1", "running"));
 		expect(result.changed).toBe(true);
 		expect(block(result.messages)._awaitAgentNarratorId).toBe("sub-live");
+		expect(block(result.messages)._awaitAgentTitle).toBe("Live Worker");
 		expect(block(result.messages).status).toBe("running");
 		const metadata = block(result.messages)._metadata as Record<string, unknown> | undefined;
 		expect(metadata?.subagentId).toBeUndefined();

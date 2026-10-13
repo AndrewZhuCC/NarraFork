@@ -1039,15 +1039,23 @@ export const PretextExactMessageList = memo(
 										: {}),
 								}
 							: undefined;
+					// The running Await's session title also lives on the call record
+					// (`_awaitAgentTitle`, server-resolved): lift it so the header can name
+					// the session before the tool's own metadata exists.
+					const awaitTitle = (call as { _awaitAgentTitle?: unknown })._awaitAgentTitle;
+					const summaryInputMetadata =
+						typeof awaitTitle === "string" && awaitTitle
+							? { ...baseMetadata, _awaitAgentTitle: awaitTitle }
+							: baseMetadata;
 					const summaryMetadata =
 						call.toolName === "Send"
 							? {
-									...baseMetadata,
+									...summaryInputMetadata,
 									status: call.status,
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: baseMetadata;
+							: summaryInputMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
 				[vlistLabels],

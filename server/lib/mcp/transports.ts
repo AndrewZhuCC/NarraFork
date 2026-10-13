@@ -36,13 +36,18 @@ function createStdioTransport(config: McpServerConfig): Transport {
 		env = { ...base, ...config.env };
 	}
 
-	return new StdioClientTransport({
+	const transport = new StdioClientTransport({
 		command: config.command,
 		args: config.args,
 		cwd: config.cwd,
 		env,
 		stderr: "pipe",
 	});
+	// The SDK exposes a PassThrough before start(). Consume it immediately:
+	// otherwise accumulated logs backpressure the child and stall MCP responses.
+	// Discard rather than buffer or forward potentially large/sensitive logs.
+	transport.stderr?.on("data", () => undefined);
+	return transport;
 }
 
 function createStreamableHttpTransport(config: McpServerConfig): Transport {

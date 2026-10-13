@@ -10,7 +10,7 @@ afterEach(() => {
 	else Reflect.deleteProperty(globalThis, "sessionStorage");
 });
 
-function setup(version: string | null) {
+function setup(version: string | null, appVersion = "1.0.0") {
 	const fetchHealth = mock(async () => (version ? { status: "ok", version } : null));
 	const reload = mock(async () => {});
 	const claim = mock(() => true);
@@ -20,7 +20,7 @@ function setup(version: string | null) {
 		reload,
 		claim,
 		onVersion,
-		monitor: createVersionRefreshMonitor("1.0.0", onVersion, { fetchHealth, reload, claim }),
+		monitor: createVersionRefreshMonitor(appVersion, onVersion, { fetchHealth, reload, claim }),
 	};
 }
 
@@ -32,6 +32,19 @@ describe("live version refresh", () => {
 			expect(reload).not.toHaveBeenCalled();
 			expect(claim).not.toHaveBeenCalled();
 		}
+	});
+	test("full-length server commit matches the short one baked into the build", async () => {
+		// 0.9.0 regression: release-CI server binaries report the full 40-char
+		// commit while the frontend bundle embeds `git rev-parse --short HEAD`.
+		// Strict equality made every page load believe an update was available.
+		const { monitor, reload, claim, onVersion } = setup(
+			"0.9.0+fe6657f5a48086b931639c1a03bebdc61c87e9b4",
+			"0.9.0+fe6657f",
+		);
+		await monitor.check();
+		expect(onVersion).toHaveBeenCalledWith("0.9.0+fe6657f5a48086b931639c1a03bebdc61c87e9b4");
+		expect(claim).not.toHaveBeenCalled();
+		expect(reload).not.toHaveBeenCalled();
 	});
 	test("different version refreshes once even with concurrent and later checks", async () => {
 		const { monitor, reload, fetchHealth, onVersion } = setup("v2.0.0");

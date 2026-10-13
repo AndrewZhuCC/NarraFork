@@ -112,6 +112,7 @@ import {
 	type EventHooks,
 	persistDetachedToolResult,
 	processEvent,
+	retireSubagentOutputCharCount,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
 import { deliverInjection } from "../narrator-injection";
@@ -2413,13 +2414,30 @@ export async function runAgentLoopUnlocked(
 					"primary",
 				);
 				if (interruptionPlan.action === "stop") {
-					// Retry budget spent. Deliberately falls THROUGH rather than breaking: the
-					// pass produced real partial output, so the rest of the turn-end handling
-					// (title, queued input, idle transition) still applies.
+					// Completion-limit exhaustion still falls through with its real partial
+					// output. A resumable upstream failure must instead retain the last failed
+					// attempt's diagnostics in a durable error card when continuation is spent.
 					logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
 						narratorId,
 						retries: interruptionPlan.retries,
 					});
+					if (interruptionPlan.reason === "resumable_error" && result.interruptionError) {
+						await narratorService.updateStatus(narratorId, "idle", {
+							substatus: ["error"],
+							errorMessage: result.interruptionError,
+							diagnostics: result.interruptionDiagnostics,
+						});
+						active.events.emit("event", {
+							type: "error",
+							data: {
+								message: result.interruptionError,
+								diagnostics: result.interruptionDiagnostics,
+							},
+						});
+						runState.finalText = result.interruptionError;
+						runState.hadError = true;
+						break;
+					}
 				} else if (interruptionPlan.action === "replay") {
 					logger.info(`${continuationLogLabel}: replaying interrupted tool-result turn`, {
 						narratorId,
@@ -3334,6 +3352,7 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
+			retireSubagentOutputCharCount(narratorId);
 			// Finalization cancels leftover resources, not the completed user turn.
 			// Preserve real cancellation before the internal cleanup abort changes the signal.
 			abortedBeforeCleanup = active.abortController.signal.aborted;

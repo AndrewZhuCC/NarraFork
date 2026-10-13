@@ -19,6 +19,7 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	mockStreamEnabled: boolean;
 	/** Opens the compatibility modal, which the caller renders outside the menu. */
 	onOpenCompatibility?: () => void;
+	onOpenSavedRecordings?: () => void;
 	onClose?: () => void;
 	/**
 	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
@@ -104,6 +105,7 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 				onArchive={openArchiveConfirm}
 				archiveLoading={archiveMutation.isPending}
 				onOpenCompatibility={props.onOpenCompatibility}
+				onOpenSavedRecordings={props.onOpenSavedRecordings}
 			/>
 			{onClose && controls?.pinAction && (
 				<Box

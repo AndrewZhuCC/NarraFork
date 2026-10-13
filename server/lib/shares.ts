@@ -1,5 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { AppError } from "./errors";
+import { isPrivateRequestRecordingPath, SECRET_PATH_REFUSAL } from "./fs-secret-paths";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
 import { settings } from "./settings";
@@ -71,6 +73,8 @@ export interface CreateShareOpts {
 }
 
 export function createShare(opts: CreateShareOpts): ShareRecord {
+	if (isPrivateRequestRecordingPath(opts.storagePath))
+		throw new AppError(SECRET_PATH_REFUSAL, 403, "FORBIDDEN_PATH");
 	const id = opts.id;
 	const expiryHours = opts.expiryHours ?? settings.shares?.defaultExpiryHours ?? 24;
 	const expiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000);
@@ -107,7 +111,7 @@ export function createShare(opts: CreateShareOpts): ShareRecord {
 
 export function getShare(id: string): ShareRecord | null {
 	const record = shares.get(id);
-	if (!record) return null;
+	if (!record || isPrivateRequestRecordingPath(record.storagePath)) return null;
 	if (record.expiresAt.getTime() < Date.now()) {
 		deleteShare(id);
 		return null;

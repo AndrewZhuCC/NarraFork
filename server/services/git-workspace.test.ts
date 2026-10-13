@@ -491,6 +491,30 @@ describe("Git workspace discovery", () => {
 		const legacy = await app().request(`/chapters/${chapterId}/git/workspace`);
 		expect(((await legacy.json()) as GitWorkspace).rootPath).toBe(repo);
 	});
+	test("old branch with no directory is unavailable, while a known root keeps the project directory", async () => {
+		const projectId = await project(repo);
+		const chapterId = generateId();
+		await db.insert(chapters).values({
+			id: chapterId,
+			projectId,
+			title: "Old branch",
+			branch: "old-branch",
+			baseBranch: "main",
+			status: "dormant",
+			worktreePath: null,
+			isRoot: 0,
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		await db.update(narrators).set({ chapterId, cwd: null }).where(eq(narrators.id, narratorId));
+		const missing = await workspace();
+		expect(missing.state).toBe("missing_directory");
+		expect(missing.rootPath).toBeNull();
+		expect(missing.cwd).toBe("");
+		expect(missing.capabilities).toEqual({ read: false, write: false });
+		await db.update(chapters).set({ isRoot: 1 }).where(eq(chapters.id, chapterId));
+		expect((await workspace()).rootPath).toBe(repo);
+	});
 	test("running local session cwd wins over stale persisted configuration", async () => {
 		const other = await newRepo("active");
 		activeNarrators.set(narratorId, { cwd: other, _defaultDeviceId: "local" } as ActiveNarrator);

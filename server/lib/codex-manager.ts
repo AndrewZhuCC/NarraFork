@@ -2445,6 +2445,13 @@ export class CodexManager {
 
 	// ==================== Accessors ====================
 
+	/** Lightweight availability check without building account snapshots or quota forecasts. */
+	get hasAvailableCredentials(): boolean {
+		this.reviveQuotaResetCredentials();
+		this.applyCachedQuotaStates();
+		return this.entries.some((entry) => !isArchivedCodexCredential(entry) && !entry.disabled);
+	}
+
 	/** Enabled, non-archived credentials — i.e. what can actually serve a request. */
 	get availableCount(): number {
 		return this.poolEntries.filter((e) => !e.disabled).length;

@@ -1,5 +1,6 @@
 import { notifications } from "@mantine/notifications";
 import type { FileReference } from "@shared/file-reference";
+import type { SavedRecording } from "@shared/request-recording";
 import type { TFunction } from "i18next";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -13,7 +14,7 @@ import {
 	setCommentDrafts,
 } from "../comment-draft-store";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
-import { trimFileReferenceInput } from "../composer/file-reference-input";
+import { editFileReferenceInput, trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
@@ -113,6 +114,7 @@ export interface UseNarratorSendOptions {
 	 */
 	onForkCommand?: () => void;
 	onCompactCommand?: () => void;
+	onRequestRecordingSaved?: (recording: SavedRecording) => void;
 
 	normalizeBooleanOverride: (value: unknown) => BooleanOverride;
 	normalizeDangerReflectionOverride: (value: unknown) => DangerReflectionOverride;
@@ -187,6 +189,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		t,
 	} = options;
 
+	const recordingSavedRef = useRef(options.onRequestRecordingSaved);
+	recordingSavedRef.current = options.onRequestRecordingSaved;
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
 	const isSending = sendingState !== null;
 	// AbortController for the in-flight send request; used by the cancel button.
@@ -500,6 +504,39 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			comments: CommentDraft[];
 		} | null = null;
 		try {
+			// This diagnostic control is never model input, queued guidance or an interrupt,
+			// including while working/compacting. Leave drafts untouched until acceptance.
+			if (/^\/save_dump(?:\s|$)/i.test(msg)) {
+				let commandText = msg;
+				for (const ref of [...fileReferences].sort(
+					(a, b) => (b.inputRange?.[0] ?? 0) - (a.inputRange?.[0] ?? 0),
+				)) {
+					if (ref.inputRange) {
+						commandText =
+							commandText.slice(0, ref.inputRange[0]) + commandText.slice(ref.inputRange[1]);
+					}
+				}
+				if (commandText.trim().toLowerCase() !== "/save_dump") throw new Error(t("saveDump.usage"));
+				setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
+				const recording = await api.saveRequestRecording(
+					narratorId,
+					AbortSignal.any([abortController.signal, AbortSignal.timeout(30_000)]),
+				);
+				// Do not erase a newer draft typed while the save was pending. Preserve file
+				// reference tokens as well as staged images/text files for the next message.
+				if (composerRef.current?.getText() === composerText) {
+					const remaining = trimFileReferenceInput(
+						editFileReferenceInput({ text: msg, fileReferences }, msg.slice("/save_dump".length)),
+					);
+					if (remaining.text || remaining.fileReferences.length) {
+						composerRef.current.restoreInput(remaining.text, remaining.fileReferences);
+					} else {
+						composerRef.current.clearTextAndDraft();
+					}
+				}
+				recordingSavedRef.current?.(recording);
+				return;
+			}
 			composerRef.current?.noteSent(msg, fileReferences);
 
 			// /fork and /compact are client-side control commands mirroring the
@@ -708,6 +745,31 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		(text: string) => {
 			const trimmed = text.trim();
 			if (!trimmed) return;
+			// Forwarded controls have the same immediate admission as composer controls,
+			// without ever replacing the operator's draft or staging attachments.
+			if (/^\/save_dump(?:\s|$)/i.test(trimmed)) {
+				if (sendingRef.current) return;
+				sendingRef.current = true;
+				void (async () => {
+					try {
+						if (trimmed.toLowerCase() !== "/save_dump") throw new Error(t("saveDump.usage"));
+						const recording = await api.saveRequestRecording(
+							narratorId,
+							AbortSignal.timeout(30_000),
+						);
+						recordingSavedRef.current?.(recording);
+					} catch (err) {
+						notifications.show({
+							title: t("saveDump.failed"),
+							message: err instanceof Error ? err.message : String(err),
+							color: "red",
+						});
+					} finally {
+						sendingRef.current = false;
+					}
+				})();
+				return;
+			}
 			void (async () => {
 				const preservedDraft = composerRef.current?.getText() ?? "";
 				const preservedFileReferences = composerRef.current?.getFileReferences() ?? [];
@@ -733,7 +795,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				}
 			})();
 		},
-		[t, updateAttachedImages, updateAttachedTextFiles],
+		[narratorId, t, updateAttachedImages, updateAttachedTextFiles],
 	);
 
 	useEffect(() => {

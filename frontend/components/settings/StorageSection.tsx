@@ -114,6 +114,8 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	worktrees: <IconGitBranch size={18} />,
 	treeSnapshots: <IconCamera size={18} />,
 	requestDumps: <IconFileCode size={18} />,
+	requestRecordings: <IconFileCode size={18} />,
+	savedRequestRecordings: <IconFileCode size={18} />,
 	dormantIgnored: <IconLock size={18} />,
 	containers: <IconBox size={18} />,
 };
@@ -126,6 +128,8 @@ const CATEGORY_COLORS: Record<string, string> = {
 	worktrees: "orange",
 	treeSnapshots: "violet",
 	requestDumps: "indigo",
+	requestRecordings: "blue",
+	savedRequestRecordings: "grape",
 	dormantIgnored: "yellow",
 	containers: "cyan",
 };
@@ -142,6 +146,8 @@ const DISPLAYED_CATEGORY_KEYS = [
 	"worktrees",
 	"treeSnapshots",
 	"requestDumps",
+	"requestRecordings",
+	"savedRequestRecordings",
 	"dormantIgnored",
 	"containers",
 ] as const;
@@ -724,6 +730,8 @@ export function StorageSection() {
 				return t("storageWorktreeCount", { count: Number(d.worktreeCount ?? 0) });
 			case "treeSnapshots":
 				return t("storageTreeSnapshotRepoCount", { count: Number(d.repoCount ?? 0) });
+			case "requestRecordings":
+			case "savedRequestRecordings":
 			case "requestDumps":
 				return t("storageRequestDumpFileCount", { count: Number(d.fileCount ?? 0) });
 			case "dormantIgnored": {
@@ -970,7 +978,7 @@ export function StorageSection() {
 							const isDatabase = key === "database";
 
 							return (
-								<Paper key={key} p="sm" radius="sm" withBorder>
+								<Paper key={key} data-storage-category={key} p="sm" radius="sm" withBorder>
 									<Stack gap="sm">
 										<Group justify="space-between" align="center" wrap="nowrap">
 											<Group gap="sm" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>

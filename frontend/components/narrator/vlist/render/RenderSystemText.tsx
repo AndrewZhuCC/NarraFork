@@ -30,7 +30,9 @@ import {
 } from "@mantine/core";
 import {
 	IconAlertTriangle,
+	IconDownload,
 	IconEraser,
+	IconFileSearch,
 	IconGitFork,
 	IconListCheck,
 	IconLock,
@@ -42,6 +44,7 @@ import {
 } from "@tabler/icons-react";
 import { type ReactNode, useMemo } from "react";
 import {
+	BUTTON_COMPACT_XS,
 	CARD_PADDING,
 	GROUP_GAP,
 	ICON_16,
@@ -114,6 +117,12 @@ export interface ErrorNoticeActions {
 	 * shell, which is also what hosts the dialog.
 	 */
 	onTestModel?: () => void;
+	/** Open details for the exact failed request, never the latest narrator request. */
+	onViewRequest?: () => void;
+	onDownloadDump?: () => void;
+	downloadingDump?: boolean;
+	/** Another error request is currently being downloaded in this narrator. */
+	downloadDumpDisabled?: boolean;
 }
 
 /**
@@ -346,6 +355,8 @@ function ErrorCard({
 	};
 	const fixLabel = labelFor("disableImageGen");
 	const modelTestLabel = labelFor("testCurrentModel");
+	const viewRequestLabel = labelFor("viewErrorRequest");
+	const downloadDumpLabel = labelFor("downloadErrorDump");
 	return (
 		<Paper
 			p="xs"
@@ -385,6 +396,43 @@ function ErrorCard({
 						</>
 					) : null}
 				</Group>
+				{showActions && (viewRequestLabel || downloadDumpLabel) ? (
+					<Group gap={GROUP_GAP} wrap="nowrap">
+						{viewRequestLabel ? (
+							<Tooltip label={viewRequestLabel}>
+								<Button
+									size="compact-xs"
+									h={BUTTON_COMPACT_XS}
+									variant="light"
+									color="blue"
+									style={{ flex: 1, minWidth: 0 }}
+									leftSection={<IconFileSearch size={12} />}
+									disabled={!actions?.onViewRequest}
+									onClick={actions?.onViewRequest}
+								>
+									{viewRequestLabel}
+								</Button>
+							</Tooltip>
+						) : null}
+						{downloadDumpLabel ? (
+							<Tooltip label={downloadDumpLabel}>
+								<Button
+									size="compact-xs"
+									h={BUTTON_COMPACT_XS}
+									variant="light"
+									color="blue"
+									style={{ flex: 1, minWidth: 0 }}
+									leftSection={<IconDownload size={12} />}
+									loading={actions?.downloadingDump === true}
+									disabled={!actions?.onDownloadDump || actions.downloadDumpDisabled === true}
+									onClick={actions?.onDownloadDump}
+								>
+									{downloadDumpLabel}
+								</Button>
+							</Tooltip>
+						) : null}
+					</Group>
+				) : null}
 				{showActions && (fixLabel || modelTestLabel) ? (
 					// One row for both: the measure layer reserves a single
 					// BUTTON_COMPACT_XS row whenever any button qualifies, so a second
@@ -393,6 +441,7 @@ function ErrorCard({
 						{fixLabel ? (
 							<Button
 								size="compact-xs"
+								h={BUTTON_COMPACT_XS}
 								variant="light"
 								color="red"
 								leftSection={<IconPhotoOff size={12} />}
@@ -406,6 +455,7 @@ function ErrorCard({
 						{modelTestLabel ? (
 							<Button
 								size="compact-xs"
+								h={BUTTON_COMPACT_XS}
 								variant="light"
 								color="blue"
 								leftSection={<IconNetwork size={12} />}

@@ -17,6 +17,7 @@ type Key =
 	| "narrafork_advanced_anim"
 	| "narrafork_expand_reasoning"
 	| "narrafork_narrator_centered_column"
+	| "narrafork_narrator_bottom_spacing_resize"
 	// Alt+wheel / pinch stepping of the render LOD, plus the Alt-held indicator.
 	// Default ON; can be turned off because Alt+wheel collides with OS/browser
 	// gestures on some setups (window drag, horizontal scroll, IME) and an
@@ -140,16 +141,20 @@ export function localPrefDefault(key: Key): boolean {
 	return DEFAULT_TRUE.has(key);
 }
 
-function getSnapshot(key: Key): boolean {
-	const raw = localStorage.getItem(key);
-	if (raw === null) return localPrefDefault(key);
-	return raw === "true";
+export function readLocalPref(key: Key): boolean {
+	try {
+		const raw = localStorage.getItem(key);
+		if (raw === null) return localPrefDefault(key);
+		return raw === "true";
+	} catch {
+		return localPrefDefault(key);
+	}
 }
 
 export function useLocalPref(key: Key): [boolean, (v: boolean) => void] {
 	const value = useSyncExternalStore(
 		subscribe,
-		() => getSnapshot(key),
+		() => readLocalPref(key),
 		() => localPrefDefault(key),
 	);
 	const setValue = useCallback(

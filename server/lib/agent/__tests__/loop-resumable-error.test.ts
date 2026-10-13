@@ -1,8 +1,9 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { AnthropicProviderConfig } from "../../settings";
 import { settings, usesStatefulModel } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
 import type { ProviderAdapter } from "../provider";
+import { ApiRequestDumpCollector } from "../request-dump";
 import type { AgentConfig, AgentEvent } from "../types";
 
 const provider = new AnthropicProvider({
@@ -151,6 +152,37 @@ afterAll(() => {
 });
 
 describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-payload)", () => {
+	test("attaches correlated diagnostics before ending the recording", async () => {
+		const originalEnabled = settings.agent.requestDumpEnabled;
+		settings.agent.requestDumpEnabled = true;
+		const calls: string[] = [];
+		const originalDiagnostics = ApiRequestDumpCollector.prototype.setDiagnostics;
+		const originalFinish = ApiRequestDumpCollector.prototype.finish;
+		const diagnostics = spyOn(
+			ApiRequestDumpCollector.prototype,
+			"setDiagnostics",
+		).mockImplementation(function (this: ApiRequestDumpCollector, value) {
+			if (value?.recordingRequestId) calls.push("diagnostics");
+			return originalDiagnostics.call(this, value);
+		});
+		const finish = spyOn(ApiRequestDumpCollector.prototype, "finish").mockImplementation(function (
+			this: ApiRequestDumpCollector,
+			value,
+		) {
+			calls.push("finish");
+			return originalFinish.call(this, value);
+		});
+		try {
+			installResponses([partialTextThenResumableError({ text: "partial", resumable: true })]);
+			await runLoop();
+			expect(calls).toEqual(["diagnostics", "finish"]);
+		} finally {
+			settings.agent.requestDumpEnabled = originalEnabled;
+			diagnostics.mockRestore();
+			finish.mockRestore();
+		}
+	});
+
 	test("resumable=true with partial text yields resumable_error instead of retrying or terminating", async () => {
 		const fetchCalls = installResponses([
 			partialTextThenResumableError({ text: "partial answer before disconnect", resumable: true }),
@@ -180,6 +212,13 @@ describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-p
 		// resumable_error is a terminal yield for this loop pass — the caller
 		// (narrator-session) is responsible for injecting a continuation turn.
 		expect(events.at(-1)).toBe(resumableEvent);
+		const end = events.find((event) => event.type === "api_request_end");
+		if (!end || !resumableEvent) throw new Error("missing resumable request events");
+		expect(resumableEvent.diagnostics).toBe(end.diagnostics);
+		expect(resumableEvent.diagnostics?.recordingRequestId).toBe(end.requestId);
+		if (!end.diagnostics) throw new Error("missing request diagnostics");
+		end.diagnostics.apiRequestId = "resumable-durable-row";
+		expect(resumableEvent.diagnostics?.apiRequestId).toBe("resumable-durable-row");
 	});
 
 	test("resumable=false (no NUG signal) with partial text falls back to invalid_state (terminal)", async () => {

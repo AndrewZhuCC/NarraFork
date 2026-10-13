@@ -617,12 +617,14 @@ export interface NarratorWSCallbacks {
 	/**
 	 * A running Await-agent call learned which child narrator it is waiting on.
 	 * Lets the card offer "open session" before the wait returns (the id is not in
-	 * the persisted row until then).
+	 * the persisted row until then). `subagentTitle` is the session's display
+	 * name when the server had the narrator row in hand.
 	 */
 	onAwaitAgentResolved?: (
 		toolUseId: string,
 		subagentNarratorId: string,
 		parentToolUseId?: string,
+		subagentTitle?: string,
 	) => void;
 	/** Accepted Send receipts; their reserved message IDs may still be queued. */
 	onSendDeliveryResolved?: (
@@ -1316,6 +1318,7 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.subagentNarratorId as string,
 							data.parentToolUseId as string | undefined,
+							data.subagentTitle as string | undefined,
 						);
 						break;
 					case "send_delivery_resolved":

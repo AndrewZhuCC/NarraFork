@@ -79,9 +79,6 @@ function limitDiagnosticJsonSize(result: ApiRequestDiagnostics): ApiRequestDiagn
 		"responseSnippet",
 		"cause",
 		"message",
-		"source",
-		"requestId",
-		"providerRequestId",
 		"endpoint",
 		"channelName",
 		"channelType",
@@ -92,6 +89,9 @@ function limitDiagnosticJsonSize(result: ApiRequestDiagnostics): ApiRequestDiagn
 		"reason",
 		"errorType",
 		"code",
+		"source",
+		"requestId",
+		"providerRequestId",
 	] as const;
 	for (const field of preferredFields) {
 		let value = result[field];
@@ -147,6 +147,13 @@ export function normalizeApiRequestDiagnostics(
 	for (const field of stringFields) {
 		const value = stringValue(input[field]);
 		if (value !== undefined) result[field] = value;
+	}
+
+	// Association IDs must survive diagnostic text trimming, but must never be
+	// truncated into a different identity. Reject oversized/untrusted IDs instead.
+	for (const field of ["recordingRequestId", "apiRequestId"] as const) {
+		const value = typeof input[field] === "string" ? input[field]?.trim() : undefined;
+		if (value && Buffer.byteLength(value, "utf8") <= 256) result[field] = value;
 	}
 
 	if (typeof input.code === "string" || typeof input.code === "number") {

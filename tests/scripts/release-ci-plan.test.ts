@@ -10,6 +10,7 @@ import {
 	CI_RELEASE_REPOSITORY,
 	CI_RELEASE_WORKFLOW,
 } from "../../scripts/lib/ci-release-types";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const commit = "a".repeat(40);
 const workflowCommit = "b".repeat(40);
@@ -115,6 +116,63 @@ function options(state: ReturnType<typeof fixture>) {
 }
 
 describe("CI release plan trust boundary", () => {
+	test("retains validated helper dependencies from published baseline metadata", async () => {
+		const plan = await createCiReleasePlan(options(fixture()));
+		const dependencies = createHelperDistributionDependencies("1.1.0");
+		const name = "narrafork-1.1.0-linux-x64";
+		const baseline = {
+			releaseId: 100,
+			version: "1.1.0",
+			platform: "linux-x64",
+			binaryAsset: { id: 101, name, size: 128 },
+			metadataAsset: { id: 102, name: `${name}.metadata.json`, size: 512 },
+			metadataSha256: "d".repeat(64),
+			metadata: {
+				name,
+				platform: "linux-x64",
+				target: "bun-linux-x64",
+				version: "1.1.0",
+				commit,
+				repository: CI_RELEASE_REPOSITORY,
+				buildDate: "2026-10-01T00:00:00.000Z",
+				size: 128,
+				sha256: "e".repeat(64),
+				sha512: Buffer.alloc(64, 1).toString("base64"),
+				helperDistribution: dependencies,
+			},
+		};
+		const input = { ...plan, baselines: [baseline] };
+		expect(validateCiReleasePlan(input).baselines[0]?.metadata.helperDistribution).toEqual(
+			dependencies,
+		);
+		const { helperDistribution: _dependencies, ...legacy } = baseline.metadata;
+		expect(
+			validateCiReleasePlan({ ...plan, baselines: [{ ...baseline, metadata: legacy }] })
+				.baselines[0]?.metadata.helperDistribution,
+		).toBeUndefined();
+		for (const dependency of [
+			createHelperDistributionDependencies("1.1.1"),
+			{ ...dependencies, executor: { ...dependencies.executor, protocolVersion: 2 } },
+			{ ...dependencies, helpers: { ...dependencies.helpers, extra: true } },
+			{ ...dependencies, executor: { ...dependencies.executor, tag: "executor-v9.9.9" } },
+			null,
+		]) {
+			expect(() =>
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{ ...baseline, metadata: { ...baseline.metadata, helperDistribution: dependency } },
+					],
+				}),
+			).toThrow();
+		}
+		expect(() =>
+			validateCiReleasePlan({
+				...plan,
+				baselines: [{ ...baseline, metadata: { ...baseline.metadata, unknown: true } }],
+			}),
+		).toThrow();
+	});
 	test("fork dispatch pins API default branch and refuses official plans", async () => {
 		const repository = "Example/Custom";
 		const defaultBranch = "release/trunk";
@@ -372,5 +430,50 @@ describe("CI release plan trust boundary", () => {
 		await expect(ciApiList(async () => " ".repeat(1024 * 1024 + 1), "releases")).rejects.toThrow(
 			"output limit",
 		);
+	});
+});
+
+describe("original build provenance plan contract", () => {
+	test("separates product, build and re-verification identities without allowing ambiguous target sets", async () => {
+		const state = fixture();
+		const base = await createCiReleasePlan({
+			root: "/unused",
+			tag: "v1.2.0",
+			publish: false,
+			env,
+			run: state.run,
+		});
+		const source = {
+			runId: 100,
+			runAttempt: 2,
+			workflowCommit: "d".repeat(40),
+			controlArtifact: { id: 900, digest: `sha256:${"a".repeat(64)}`, size: 100 },
+			platforms: [
+				{
+					target: "windows-x64",
+					artifact: { id: 901, digest: `sha256:${"b".repeat(64)}`, size: 100 },
+				},
+			],
+		};
+		expect(validateCiReleasePlan({ ...base, buildSource: source })).toMatchObject({
+			commit,
+			workflowCommit,
+			buildSource: source,
+		});
+		for (const changed of [
+			{ runId: base.runId },
+			{ runAttempt: 0 },
+			{ workflowCommit: "d".repeat(8) },
+			{ controlArtifact: { ...source.controlArtifact, size: 4 * 1024 * 1024 + 1 } },
+			{ controlArtifact: { ...source.controlArtifact, digest: "a".repeat(64) } },
+			{ platforms: [] },
+			{ platforms: [source.platforms[0], source.platforms[0]] },
+			{ platforms: [{ target: "windows-x86", artifact: source.platforms[0]?.artifact }] },
+			{ platforms: [{ ...source.platforms[0], artifact: source.controlArtifact }] },
+			{ extra: true },
+		])
+			expect(() =>
+				validateCiReleasePlan({ ...base, buildSource: { ...source, ...changed } }),
+			).toThrow();
 	});
 });

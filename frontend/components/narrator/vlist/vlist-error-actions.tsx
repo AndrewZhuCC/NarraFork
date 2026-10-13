@@ -31,14 +31,17 @@
 
 import { api } from "@frontend/lib/api";
 import { notifications } from "@mantine/notifications";
+import type { ApiRequestDiagnostics } from "@shared/agent-protocol/types";
 import { useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useCallback, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelTestDialog } from "../../providers/ModelTestDialog";
+import { ErrorRequestModal, type ErrorRequestTarget } from "../ErrorRequestModal";
 import { removeMessagesFromCache } from "../message/messages-query-cache";
 import { useCodexImageGenerationFix } from "../model/useCodexImageGenerationFix";
 import { useNarratorModelTest } from "../model/useNarratorModelTest";
 import { RetryRuleModal } from "../permission/RetryRuleModal";
+import { errorRequestDownloadState, useErrorRequestDump } from "../useErrorRequestDump";
 import type { ErrorNoticeActions } from "./render/RenderSystemText";
 import type { VListItem } from "./vlist-pipeline";
 
@@ -46,6 +49,7 @@ import type { VListItem } from "./vlist-pipeline";
 export type ErrorNoticeActionsResolver = (
 	messageId: string | undefined,
 	errorText: string,
+	diagnostics?: ApiRequestDiagnostics,
 ) => ErrorNoticeActions | undefined;
 
 /**
@@ -78,7 +82,9 @@ export function resolveErrorNoticeActions(
 	resolve: ErrorNoticeActionsResolver,
 ): ErrorNoticeActions | undefined {
 	if (!isErrorNoticeItem(item)) return undefined;
-	return resolve(sourceIds[0], errorNoticeText(item));
+	const diagnostics = (item.spec.data as { diagnostics?: ApiRequestDiagnostics } | null)
+		?.diagnostics;
+	return resolve(sourceIds[0], errorNoticeText(item), diagnostics);
 }
 
 export interface VListErrorNoticeActions {
@@ -117,6 +123,22 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 	// The error text the rule dialog is currently open for (null → closed).
 	const [ruleTarget, setRuleTarget] = useState<string | null>(null);
 	const [dismissingId, setDismissingId] = useState<string | null>(null);
+	const [requestTarget, setRequestTarget] = useState<
+		(ErrorRequestTarget & { narratorId: string }) | null
+	>(null);
+	const dump = useErrorRequestDump(narratorId);
+	const closeRequestModal = useCallback(() => {
+		dump.cancel();
+		setRequestTarget(null);
+	}, [dump.cancel]);
+	const visibleRequestTarget = requestTarget?.narratorId === narratorId ? requestTarget : null;
+	const modalDownload = errorRequestDownloadState(
+		visibleRequestTarget?.requestId,
+		dump.downloadingRequestId,
+	);
+	useEffect(() => {
+		setRequestTarget((target) => (target?.narratorId === narratorId ? target : null));
+	}, [narratorId]);
 	// The provider-settings fix is per-narrator (it disables the tool for the
 	// provider this narrator resolved to and retries its last turn), but whether a
 	// given ROW may offer it depends on that row's error text, hence `canFix`.
@@ -159,7 +181,11 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 
 	const resolve = useMemo<ErrorNoticeActionsResolver>(() => {
 		const cache = new Map<string, ErrorNoticeActions>();
-		return (messageId: string | undefined, errorText: string) => {
+		return (
+			messageId: string | undefined,
+			errorText: string,
+			diagnostics?: ApiRequestDiagnostics,
+		) => {
 			if (!messageId) return undefined;
 			const cached = cache.get(messageId);
 			if (cached) return cached;
@@ -168,7 +194,19 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 			// the rows that carry it.
 			const offerImageGenFix = imageGenFix.canFix(errorText);
 			const offerModelTest = modelTest.canTest(errorText);
+			const requestId = diagnostics?.recordingRequestId;
+			const target =
+				requestId && /^req_[A-Za-z0-9_-]{1,160}$/.test(requestId)
+					? { narratorId, requestId, errorText, diagnostics }
+					: null;
 			const actions: ErrorNoticeActions = {
+				...(target
+					? {
+							onViewRequest: () => setRequestTarget(target),
+							onDownloadDump: () => void dump.download(target.requestId),
+							...errorRequestDownloadState(target.requestId, dump.downloadingRequestId),
+						}
+					: {}),
 				onMarkRetryable: () => setRuleTarget(errorText),
 				onDismiss: () => void dismiss(messageId),
 				dismissing: dismissingId === messageId,
@@ -195,12 +233,25 @@ export function useVListErrorNoticeActions(narratorId: string): VListErrorNotice
 		imageGenFix.busy,
 		modelTest.canTest,
 		modelTest.open,
+		narratorId,
+		dump.download,
+		dump.downloadingRequestId,
 	]);
 
 	const closeRuleModal = useCallback(() => setRuleTarget(null), []);
 
 	const ruleModal = (
 		<>
+			<ErrorRequestModal
+				narratorId={narratorId}
+				target={visibleRequestTarget}
+				onClose={closeRequestModal}
+				onDownload={() =>
+					visibleRequestTarget && void dump.download(visibleRequestTarget.requestId)
+				}
+				downloading={modalDownload.downloadingDump}
+				downloadBlocked={modalDownload.downloadDumpDisabled}
+			/>
 			{ruleTarget === null ? null : (
 				<RetryRuleModal opened onClose={closeRuleModal} errorMessage={ruleTarget} />
 			)}

@@ -1,12 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { DEFAULTS, deepMerge } from "@server/lib/settings";
+import { updateSettingsSchema } from "@server/routes/settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import {
+	DEFAULT_RECORDING_REQUEST_BYTES,
+	DEFAULT_RECORDING_RESPONSE_BYTES,
+	MAX_RECORDING_REQUEST_BYTES,
+	MAX_RECORDING_RESPONSE_BYTES,
+	MIN_RECORDING_WINDOW_BYTES,
+} from "@shared/request-recording";
 import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 	normalizeContextManagementDraft,
 } from "../components/narrator/context-management/types";
 import en from "../locales/en/settings.json";
 import zh from "../locales/zh-CN/settings.json";
+import { readRequestRecordingSettings } from "./useInstanceSettings";
 
 const hook = readFileSync(new URL("./useInstanceSettings.ts", import.meta.url), "utf8");
 const page = readFileSync(new URL("../routes/settings/agent.tsx", import.meta.url), "utf8");
@@ -14,6 +24,90 @@ const section = readFileSync(
 	new URL("../components/settings/AgentSection.tsx", import.meta.url),
 	"utf8",
 );
+
+describe("request recording settings compatibility", () => {
+	test("old configurations and missing agent settings use bounded recording defaults", () => {
+		const expected = {
+			requestDumpRecordingEnabled: true,
+			requestDumpRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
+			requestDumpResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
+			requestDumpEnabled: false,
+			requestDumpErrorsOnly: false,
+		};
+		expect(readRequestRecordingSettings()).toEqual(expected);
+		expect(readRequestRecordingSettings({ requestDumpEnabled: false })).toEqual(expected);
+		const merged = deepMerge(DEFAULTS, { agent: { requestDumpEnabled: false } });
+		expect(readRequestRecordingSettings(merged.agent)).toEqual(expected);
+	});
+	test("false, zero and old continuous-retention switches remain explicit independent values", () => {
+		const config = {
+			requestDumpRecordingEnabled: false,
+			requestDumpRequestBytes: 0,
+			requestDumpResponseBytes: 0,
+			requestDumpEnabled: true,
+			requestDumpErrorsOnly: true,
+		};
+		expect(readRequestRecordingSettings(config)).toEqual(config);
+		expect(readRequestRecordingSettings(deepMerge(DEFAULTS, { agent: config }).agent)).toEqual(
+			config,
+		);
+		expect(
+			readRequestRecordingSettings({ requestDumpEnabled: true, requestDumpErrorsOnly: true })
+				.requestDumpRecordingEnabled,
+		).toBe(true);
+	});
+	test("PATCH accepts independent zero/full byte capacities and booleans", () => {
+		for (const [requestDumpRequestBytes, requestDumpResponseBytes] of [
+			[0, 0],
+			[MIN_RECORDING_WINDOW_BYTES, MIN_RECORDING_WINDOW_BYTES],
+			[MAX_RECORDING_REQUEST_BYTES, MAX_RECORDING_RESPONSE_BYTES],
+		]) {
+			const agent = {
+				requestDumpRequestBytes,
+				requestDumpResponseBytes,
+				requestDumpRecordingEnabled: false,
+				requestDumpEnabled: true,
+				requestDumpErrorsOnly: true,
+			};
+			expect(updateSettingsSchema.parse({ agent }).agent).toEqual(agent);
+		}
+	});
+	test("PATCH rejects negative, fractional, oversized and non-number byte capacities", () => {
+		for (const [field, max] of [
+			["requestDumpRequestBytes", MAX_RECORDING_REQUEST_BYTES],
+			["requestDumpResponseBytes", MAX_RECORDING_RESPONSE_BYTES],
+		] as const) {
+			for (const value of [-1, 0.5, 1, MIN_RECORDING_WINDOW_BYTES - 1, max + 1, "16", null]) {
+				expect(updateSettingsSchema.safeParse({ agent: { [field]: value } }).success).toBe(false);
+			}
+		}
+		expect(
+			updateSettingsSchema.safeParse({ agent: { requestDumpRecordingEnabled: "true" } }).success,
+		).toBe(false);
+	});
+	test("all recording fields roundtrip through controlled settings and bilingual labels", () => {
+		for (const field of [
+			"requestDumpRecordingEnabled",
+			"requestDumpRequestBytes",
+			"requestDumpResponseBytes",
+		]) {
+			expect(hook).toContain(`${field}: state.${field}`);
+			expect(page).toContain(`${field}={is.${field}}`);
+			const setter = `set${field[0].toUpperCase()}${field.slice(1)}`;
+			expect(page).toContain(`${setter}={is.${setter}}`);
+			expect(section).toContain(`props.${setter}`);
+		}
+		for (const locale of [en, zh]) {
+			expect(locale.requestDumpRecordingEnabled).toBeTruthy();
+			expect(locale.requestDumpRecordingEnabledDesc).toContain("/save_dump");
+			expect(locale.requestDumpRequestCapacity).toBeTruthy();
+			expect(locale.requestDumpResponseCapacity).toBeTruthy();
+			expect(locale.requestDumpCapacityDesc).toContain("0");
+			expect(locale.requestDumpEnabledDesc).toContain("512MiB");
+			expect(locale.requestDumpErrorsOnlyDesc).toContain("/save_dump");
+		}
+	});
+});
 
 describe("permission rule auto-approval settings wiring", () => {
 	test("defaults off, forwards the administrator boundary, and persists independently of danger reflection", () => {

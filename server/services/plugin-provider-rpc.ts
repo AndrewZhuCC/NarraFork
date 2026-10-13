@@ -2,6 +2,7 @@ import { generateId } from "@server/lib/id";
 import {
 	type JsonRpcNotification,
 	type JsonValue,
+	markHostTruncatedDump,
 	PROVIDER_PROTOCOL_VERSION,
 	PROVIDER_REQUEST_MAX_BYTES,
 	PROVIDER_SEARCH_METHOD,
@@ -1229,13 +1230,14 @@ export class PluginProviderRpcClient {
 		}
 		if (!this.consumeCredit(record, terminal ? "terminal" : "normal", bodyBytes)) return;
 		if (!this.validateEventSemantics(record, event)) return;
-		record.eventCount += 1;
+		const diagnostic = event.type === "dump.request" || event.type === "dump.response";
+		if (!diagnostic) record.eventCount += 1;
 		if (record.eventCount > this.limits.maxEventsPerOperation) {
 			this.releaseCredit(record, terminal ? "terminal" : "normal", bodyBytes);
 			this.outputLimit(record, "Provider operation exceeded its event limit");
 			return;
 		}
-		if (!terminal) {
+		if (!terminal && !diagnostic) {
 			record.operationOutputBytes += bodyBytes;
 			if (record.operationOutputBytes > this.limits.maxOperationOutputBytes) {
 				this.releaseCredit(record, "normal", bodyBytes);
@@ -1394,10 +1396,17 @@ export class PluginProviderRpcClient {
 				return false;
 			}
 			const bytes = event.bodyChunk ? utf8Bytes(event.bodyChunk) : 0;
-			record.dumpBytes += bytes;
-			if (record.dumpBytes > record.dumpMaxBytes) {
-				this.outputLimit(record, "Provider dump output exceeded the advertised budget");
-				return false;
+			const remaining = Math.max(0, record.dumpMaxBytes - record.dumpBytes);
+			record.dumpBytes = Math.min(record.dumpMaxBytes, record.dumpBytes + bytes);
+			if (bytes > remaining) {
+				// Diagnostic retention is not business output admission. Keep a UTF-8 prefix
+				// and an explicit marker while still processing done/text/tool events normally.
+				event.bodyChunk = new TextDecoder().decode(
+					textEncoder.encode(event.bodyChunk ?? "").subarray(0, remaining),
+					{ stream: true },
+				);
+				event.truncated = true;
+				markHostTruncatedDump(event);
 			}
 		}
 		return true;

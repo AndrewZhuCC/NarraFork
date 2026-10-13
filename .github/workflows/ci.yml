@@ -190,6 +190,7 @@ jobs:
       - name: Run repository tests
         run: >-
           bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${{ matrix.shard }}/4
+          --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings
           --reporter=junit --reporter-outfile=artifacts/ci-tests.xml
       - name: Verify test report
         run: test -s artifacts/ci-tests.xml
@@ -200,6 +201,7 @@ jobs:
           name: ci-test-results-${{ matrix.shard }}
           path: |
             artifacts/ci-tests.xml
+            artifacts/ci-test-timings.json
             artifacts/native-tests*.log
           if-no-files-found: error
           retention-days: 7

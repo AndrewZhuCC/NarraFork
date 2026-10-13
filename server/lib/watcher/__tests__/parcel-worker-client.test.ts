@@ -10,7 +10,7 @@
  * on send failure, ACK timeout without unhandled rejection, and a single
  * fallback after the coordinator's retry budget.
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { ParcelRecursiveWatcher } from "../parcel-watcher";
 import {
 	asWorkerStdinSink,
@@ -22,7 +22,27 @@ import {
 	writeFileSinkCommand,
 } from "../parcel-worker-client";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const timers = new Map<number, { callback: () => void; delay: number }>();
+const fakeProcs: FakeProc[] = [];
+const rejectionCollectors: ReturnType<typeof collectUnhandledRejections>[] = [];
+let nextTimer: number;
+let timeoutSpy: ReturnType<typeof spyOn<typeof globalThis, "setTimeout">>;
+let clearTimeoutSpy: ReturnType<typeof spyOn<typeof globalThis, "clearTimeout">>;
+
+// A real event-loop boundary drains stream/Promise continuations and lets Bun
+// report unhandled rejections; it does not wait for an arbitrary elapsed delay.
+const drainEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+async function fireTimeout(delay: number) {
+	const matches = Array.from(timers).filter(([, timer]) => timer.delay === delay);
+	expect(matches).toHaveLength(1);
+	const entry = matches[0];
+	if (!entry) throw new Error(`expected a registered ${delay}ms timeout`);
+	const [id, timer] = entry;
+	timers.delete(id);
+	timer.callback();
+	await drainEventLoop();
+}
 
 interface FakeFileSink extends WorkerStdinSink {
 	writes: Uint8Array[];
@@ -108,10 +128,13 @@ function createFakeProc(stdin: WorkerStdinSink | { getWriter(): never }): FakePr
 			proc.emitLine(JSON.stringify({ type: "ready", pid: proc.pid, backend: "inotify" }));
 		},
 		kill() {
+			if (proc.killed) return;
 			proc.killed = true;
+			controller.close();
 			exitResolve(1);
 		},
 	};
+	fakeProcs.push(proc);
 	return proc;
 }
 
@@ -177,30 +200,68 @@ function collectUnhandledRejections(): {
 		rejections.push(reason);
 	};
 	process.on("unhandledRejection", handler);
-	return {
+	const collector = {
 		rejections,
 		stop: () => {
 			process.off("unhandledRejection", handler);
 		},
 	};
+	rejectionCollectors.push(collector);
+	return collector;
 }
 
 const previousEnv = process.env.NARRAFORK_ENABLE_NATIVE_WATCHER;
 
+beforeEach(() => {
+	nextTimer = 1;
+	timers.clear();
+	fakeProcs.length = 0;
+	rejectionCollectors.length = 0;
+	timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: (...args: unknown[]) => void,
+		delay = 0,
+		...args: unknown[]
+	) => {
+		const id = nextTimer++;
+		timers.set(id, { callback: () => callback(...args), delay });
+		return id;
+	}) as typeof setTimeout);
+	clearTimeoutSpy = spyOn(globalThis, "clearTimeout").mockImplementation(((id: number) => {
+		timers.delete(id);
+	}) as typeof clearTimeout);
+});
+
 afterEach(async () => {
-	if (previousEnv === undefined) {
-		delete process.env.NARRAFORK_ENABLE_NATIVE_WATCHER;
-	} else {
-		process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = previousEnv;
-	}
-	// Restore any spies installed via spyOn(Bun, "spawn").
 	try {
-		const maybe = Bun.spawn as unknown as { mockRestore?: () => void };
-		maybe.mockRestore?.();
-	} catch {
-		// ignore
+		// Execute shutdown's actual deferred kill before restoring any globals.
+		// Multiple shutdown calls may register more than one such callback.
+		for (const [id, timer] of timers) {
+			if (timer.delay !== 500) continue;
+			timers.delete(id);
+			timer.callback();
+		}
+		for (const proc of fakeProcs) proc.kill();
+		await drainEventLoop();
+		// Every fake process has exited and its stdout reader released the lock;
+		// no pending ACK/retry callback is left to run after this test.
+		expect(fakeProcs.every((proc) => !proc.stdout.locked)).toBe(true);
+		expect(timers.size).toBe(0);
+		for (const collector of rejectionCollectors) expect(collector.rejections).toEqual([]);
+	} finally {
+		for (const collector of rejectionCollectors) collector.stop();
+		rejectionCollectors.length = 0;
+		fakeProcs.length = 0;
+		timers.clear();
+		clearTimeoutSpy.mockRestore();
+		timeoutSpy.mockRestore();
+		const spawn = Bun.spawn as unknown as { mockRestore?: () => void };
+		spawn.mockRestore?.();
+		if (previousEnv === undefined) {
+			delete process.env.NARRAFORK_ENABLE_NATIVE_WATCHER;
+		} else {
+			process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = previousEnv;
+		}
 	}
-	await sleep(10);
 });
 
 describe("FileSink write protocol", () => {
@@ -294,6 +355,8 @@ describe("FileSink write protocol", () => {
 
 		try {
 			const sub = await client.watch("/tmp/nf-watcher-test", [".git"]);
+			expect(pendingMapOf(client).size).toBe(0);
+			expect(timers.size).toBe(0);
 			expect(sink.getWriterCalls).toBe(0);
 			expect(sink.flushCount).toBeGreaterThan(0);
 			expect(sink.writes.length).toBeGreaterThan(0);
@@ -309,7 +372,7 @@ describe("FileSink write protocol", () => {
 
 			await client.shutdown();
 			// shutdown command then end() on the sink
-			await sleep(20);
+			await fireTimeout(500);
 			expect(sink.endCount).toBeGreaterThan(0);
 			await sub.unsubscribe().catch(() => {});
 			expect(proc.killed || sink.endCount > 0).toBe(true);
@@ -339,21 +402,20 @@ describe("pending ACK lifecycle", () => {
 			expect(pending.size).toBe(0);
 			expect(sink.flushCount).toBe(0);
 
-			// Long enough that an orphaned 5s timer would not fire yet; the point
-			// is that pending is already empty and nothing is scheduled under our
-			// control. Also verify a shorter private path leaves nothing behind.
-			await sleep(30);
+			// An empty pending map alone could hide an orphaned ACK callback.
+			// Check the actual registered timers and drain the rejection boundary.
+			expect(timers.size).toBe(0);
+			await drainEventLoop();
 			expect(pending.size).toBe(0);
 
-			// Drive a short-timeout request against the broken sink via the same
-			// public send path: unwatch also creates a pending then send fails.
+			// The public unwatch path also creates a pending before send fails.
 			await client.unwatch("/tmp/nf-pending").catch(() => {});
 			expect(pending.size).toBe(0);
+			expect(timers.size).toBe(0);
 		} finally {
-			collector.stop();
 			spawn.mockRestore();
 			await client.shutdown().catch(() => {});
-			await sleep(20);
+			await drainEventLoop();
 			expect(collector.rejections).toEqual([]);
 			expect(sink.getWriterCalls).toBe(0);
 		}
@@ -375,22 +437,29 @@ describe("pending ACK lifecycle", () => {
 				sendWatch: (path: string, ignore: string[], timeoutMs: number) => Promise<void>;
 				ensureStarted: () => Promise<void>;
 			};
-			// Public watch() hardcodes the 5s ACK timeout; start the fake worker
-			// first, then drive sendWatch with a short timeout so the test stays fast.
+			// Use the full production ACK deadline and fire its registered callback;
+			// no smaller timeout or wall-clock wait is needed.
 			await internals.ensureStarted();
-			await expect(internals.sendWatch("/tmp/nf-timeout", [], 40)).rejects.toThrow(/timed out/);
+			const request = internals.sendWatch("/tmp/nf-timeout", [], 5000);
+			// Handle the outer async request immediately, but assert only after
+			// firing: Bun's rejects matcher may synchronously wait for settlement.
+			request.catch(() => {});
+			await drainEventLoop();
+			expect(pendingMapOf(client).size).toBe(1);
+			expect(sink.writes.length).toBeGreaterThan(0);
+			await fireTimeout(5000);
+			await expect(request).rejects.toThrow(/timed out/);
 
 			const pending = pendingMapOf(client);
 			expect(pending.size).toBe(0);
 			// Timed-out watch disables the session (existing coordinator contract).
 			expect(unavailable.length).toBeGreaterThan(0);
 
-			await sleep(30);
+			await drainEventLoop();
 			expect(collector.rejections).toEqual([]);
 			expect(sink.writes.length).toBeGreaterThan(0);
 			expect(sink.getWriterCalls).toBe(0);
 		} finally {
-			collector.stop();
 			spawn.mockRestore();
 			await client.shutdown().catch(() => {});
 		}
@@ -413,18 +482,20 @@ describe("pending ACK lifecycle", () => {
 			await sendWatch.ensureStarted();
 			// Leave an in-flight ACK pending, then shutdown.
 			const inflight = sendWatch.sendWatch("/tmp/nf-shutdown", [], 5000);
-			await sleep(5);
+			inflight.catch(() => {});
+			await drainEventLoop();
 			expect(pendingMapOf(client).size).toBe(1);
+			expect(Array.from(timers.values(), (timer) => timer.delay)).toEqual([5000]);
 
 			await client.shutdown();
 			expect(pendingMapOf(client).size).toBe(0);
 			expect(sink.endCount).toBeGreaterThan(0);
 			await expect(inflight).rejects.toThrow(/shutting down|timed out|exited/);
-			await sleep(20);
+			await fireTimeout(500);
+			expect(timers.size).toBe(0);
 			expect(collector.rejections).toEqual([]);
 			expect(proc.killed || sink.endCount > 0).toBe(true);
 		} finally {
-			collector.stop();
 			spawn.mockRestore();
 			await client.shutdown().catch(() => {});
 		}
@@ -437,6 +508,7 @@ describe("coordinator fallback after retries", () => {
 		expect(isNativeWatcherEnabled()).toBe(true);
 
 		const unavailable: string[] = [];
+		const collector = collectUnhandledRejections();
 		const watcher = new ParcelRecursiveWatcher(
 			() => {},
 			(reason) => unavailable.push(reason),
@@ -455,14 +527,26 @@ describe("coordinator fallback after retries", () => {
 
 		try {
 			await watcher.watch("/tmp/nf-fallback-once");
-			// parcel-watcher onError waits 800ms between restarts; 3 retries → ~2.4s.
-			await sleep(800 * 3 + 600);
+			expect(attempts).toBe(1);
+			expect(unavailable).toEqual([]);
+			// Advance only the three 800ms callbacks registered by the real
+			// coordinator. Drain each async restart before firing the next timer.
+			for (let retry = 1; retry <= 3; retry++) {
+				await fireTimeout(800);
+				expect(attempts).toBe(1 + retry);
+				if (retry < 3) expect(unavailable).toEqual([]);
+			}
 
 			// 1 initial + 3 retries
 			expect(attempts).toBe(4);
 			// Fallback notification exactly once for this watch sequence.
 			expect(unavailable.length).toBe(1);
 			expect(unavailable[0]).toContain("getWriter");
+			expect(timers.size).toBe(0);
+			await drainEventLoop();
+			expect(attempts).toBe(4);
+			expect(unavailable).toHaveLength(1);
+			expect(collector.rejections).toEqual([]);
 		} finally {
 			await watcher.shutdown().catch(() => {});
 		}
@@ -484,10 +568,9 @@ describe("coordinator fallback after retries", () => {
 			// The bug signature must not reappear.
 			expect(sink.getWriterCalls).toBe(0);
 			expect(pendingMapOf(client).size).toBe(0);
-			await sleep(20);
+			await drainEventLoop();
 			expect(collector.rejections).toEqual([]);
 		} finally {
-			collector.stop();
 			spawn.mockRestore();
 			await client.shutdown().catch(() => {});
 		}

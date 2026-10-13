@@ -1125,18 +1125,19 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
 			}
+			await reportInputCharacters(params, body);
+			const bodyText = JSON.stringify(body);
 			params.requestDump?.beginResponseAttempt(
 				{
 					transport: "http",
+					method: "POST",
 					url: endpoint,
 					headers: sanitizeHeaders(requestHeaders),
-					body,
+					bodyText,
 				},
 				settings.agent?.requestDumpMaxSize,
 			);
 
-			await reportInputCharacters(params, body);
-			const bodyText = JSON.stringify(body);
 			params.onRequestStart?.(
 				this.apiMode === "codex" ? { codexTools: body.tools as unknown[] } : undefined,
 			);

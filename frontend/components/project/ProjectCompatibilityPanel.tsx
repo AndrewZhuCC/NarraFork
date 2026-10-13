@@ -40,9 +40,6 @@ export function ProjectCompatibilityPanel({ projectId }: { projectId: string }) 
 					<Title order={4}>{t("compatibility.title")}</Title>
 					<Text>{t("compatibility.source", { name: source.name })}</Text>
 					<Text size="sm" c="dimmed">
-						{t("compatibility.storageUnchanged")}
-					</Text>
-					<Text size="sm" c="dimmed">
 						{t(canManage ? "compatibility.manage" : "compatibility.readOnly")}
 					</Text>
 					{access.isError && <Alert color="red">{t("compatibility.accessUnavailable")}</Alert>}

@@ -653,6 +653,12 @@ export interface BaseContentBlock {
 	 * for why it is kept out of `_metadata`.
 	 */
 	_awaitAgentNarratorId?: string;
+	/**
+	 * Display title of the awaited child session, shipped with the id above
+	 * (`AWAIT_AGENT_TITLE_FIELD`). Declared explicitly for the same reason:
+	 * the running card headlines it before the tool's metadata exists.
+	 */
+	_awaitAgentTitle?: string;
 	/** Accepted/queued Send receipts; message location must confirm persistence. */
 	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
 	_sendDeliveryTargetCount?: number;
@@ -1291,6 +1297,8 @@ export interface ProjectAccess {
 		avatarImageId: string | null;
 	} | null;
 	members: ProjectMember[];
+	/** Server-authoritative permission to create project sessions and write project resources. */
+	canWrite?: boolean;
 	/** Whether the current user may change visibility, members or ownership. */
 	canManage: boolean;
 }

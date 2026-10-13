@@ -22,7 +22,9 @@ const { awaitAgentResultDetailed, waitForSubagentResult } = await import("../age
 const { getRuntimePublicationService, runtimePublication } = await import(
 	"../agent-runtime/publication"
 );
-const { awaitTool, listRunningAwaits } = await import("../../lib/agent/tools/await");
+const { awaitTool, listRunningAgentAwaitsForSubagent, listRunningAwaits } = await import(
+	"../../lib/agent/tools/await"
+);
 const { markTakenOver, clearTakenOver } = await import("../subagent-takeover");
 const parent = "await-receipt-parent";
 const child = "await-receipt-child";
@@ -49,6 +51,7 @@ beforeEach(async () => {
 			variant: "subagent:general",
 			type: "subagent",
 			parentNarratorId: parent,
+			title: "Receipt child",
 			status: "idle",
 			logicalRunId: agentRun.logicalRunId,
 			createdAt: now,
@@ -259,6 +262,39 @@ for (const cause of ["timeout", "parent"] as const) {
 	});
 }
 
+test("agent wait publishes its resolved target for live output forwarding", async () => {
+	const now = new Date().toISOString();
+	await db.update(narrators).set({ isBackground: true }).where(eq(narrators.id, child));
+	await db.insert(backgroundTasks).values({
+		id: child,
+		type: "agent",
+		subagentNarratorId: child,
+		parentNarratorId: parent,
+		status: "running",
+		output: null,
+		logicalRunId: agentRun.logicalRunId,
+		startedAt: now,
+		createdAt: now,
+		updatedAt: now,
+	});
+	const toolUseId = "await-live-output";
+	const pending = awaitTool.execute(
+		{ type: "agent", id: child, timeout: 1000 },
+		{ ...ctx(), currentToolUseId: toolUseId },
+	);
+	// The target resolves as soon as the wait starts; this registry entry is what
+	// the event handler reads to forward the child's live output char count.
+	const deadline = Date.now() + 2_000;
+	while (listRunningAgentAwaitsForSubagent(child).length === 0 && Date.now() < deadline)
+		await Bun.sleep(10);
+	expect(listRunningAgentAwaitsForSubagent(child)).toEqual([{ narratorId: parent, toolUseId }]);
+	// The running task never finishes, so the wait ends on its own timeout…
+	const result = await pending;
+	expect(result.metadata?.status).toBe("timeout");
+	// …and the registry entry leaves with it.
+	expect(listRunningAgentAwaitsForSubagent(child)).toEqual([]);
+});
+
 test("running text match and aborted/deadline waits have no terminal receipt", async () => {
 	await db.update(backgroundTasks).set({ status: "running" }).where(eq(backgroundTasks.id, taskId));
 	spyOn(backgroundTaskService, "getOutputBuffer").mockReturnValue("needle");
@@ -317,12 +353,23 @@ test("foreground fast result carries its narrator run, and Await consumes it", a
 		getRuntimePublicationService(),
 		"consumeAwaitedTerminal",
 	).mockResolvedValue();
+	// The foreground path resolves the target row first, so both the early notice
+	// and the returned metadata carry the session title without an extra query.
+	let notifiedTitle: string | null | undefined;
 	const result = await awaitAgentResultDetailed({
 		callerNarratorId: parent,
 		id: child,
 		signal: new AbortController().signal,
+		onTargetResolved: (_id, title) => {
+			notifiedTitle = title;
+		},
 	});
-	expect(result).toMatchObject({ terminalResultReceived: true, publicationRun: agentRun });
+	expect(notifiedTitle).toBe("Receipt child");
+	expect(result).toMatchObject({
+		terminalResultReceived: true,
+		publicationRun: agentRun,
+		title: "Receipt child",
+	});
 	await awaitTool.execute({ type: "agent", id: child }, ctx());
 	expect(consume.mock.calls[0]?.[0]).toEqual(agentRun);
 });

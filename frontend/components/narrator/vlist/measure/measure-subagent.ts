@@ -344,6 +344,14 @@ export interface SubagentCardData {
 	model?: string;
 	/** Extra thinking-effort badge label. Height-neutral (same row). */
 	reasoningEffort?: string;
+	/**
+	 * The child's live reply character count, streamed while it works. Painted as
+	 * a badge on the SAME fixed badge row as the model/effort badges, so it is
+	 * height-neutral — but it is painted from the cached payload and the live
+	 * channel writes it alone (status, opts and messageVersion all unmoved), so
+	 * `subagentRevision` must key it or the number freezes at its first value.
+	 */
+	liveOutputChars?: number;
 	/** Description line (collapsed: truncated single line; expanded: wraps). */
 	description: string;
 	/** Prompt text — presence enables the prompt toggle block. */

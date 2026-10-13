@@ -139,7 +139,7 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 				{ highWaterMark: 0 },
 			),
 		);
-		const dump = new ApiRequestDumpCollector({}, 4096);
+		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
 		expect(await run(dump)).toEqual(baseline);
 		expect(baseline.some((event) => event.text === "hello")).toBe(true);
 		expect(baseline.some((event) => event.usage?.inputTokens === 30)).toBe(true);
@@ -173,7 +173,7 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 				{ highWaterMark: 0 },
 			),
 		);
-		const dump = new ApiRequestDumpCollector({}, 4096);
+		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
 		const stream = provider.chat({ ...chatParams(), requestDump: dump });
 		expect((await stream.next()).value).toMatchObject({ text: "hello" });
 		await stream.return(undefined);
@@ -195,7 +195,7 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 				{ highWaterMark: 0 },
 			),
 		);
-		const dump = new ApiRequestDumpCollector({}, 4096);
+		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
 		const stream = provider.chat({ ...chatParams(), requestDump: dump });
 		expect((await stream.next()).value).toMatchObject({ text: "hello" });
 		await expect(stream.next()).rejects.toThrow("broken transport");
@@ -211,7 +211,7 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 		install(body);
 		const baseline = await run();
 		install(body);
-		const dump = new ApiRequestDumpCollector({}, 4096);
+		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
 		expect(await run(dump)).toEqual(baseline);
 		expect(baseline.some((event) => event.invalidState?.message === "retry later")).toBe(true);
 		expect(dump.snapshot().response?.bodyText).toBe(body);
@@ -220,7 +220,7 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 	test("HTTP errors retain their original status and body without cloning", async () => {
 		const body = '{"error":{"type":"overloaded_error","message":"retry later"}}';
 		install(body, 503);
-		const dump = new ApiRequestDumpCollector({}, 4096);
+		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
 		await expect(run(dump)).rejects.toMatchObject({ status: 503 });
 		expect(dump.snapshot().response).toMatchObject({ status: 503, bodyText: body });
 	});

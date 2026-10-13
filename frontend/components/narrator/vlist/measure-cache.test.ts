@@ -486,6 +486,25 @@ describe("canonical body revision", () => {
 		}
 	});
 
+	it("re-keys when an Await meta-rows identity line appears mid-wait", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const detail = (rows: unknown[]) => ({
+			detail: {
+				kind: "sections",
+				sections: [{ key: "meta.await", body: { kind: "meta-rows", rows } }],
+			},
+		});
+		// The row APPEARING changes the card's height, so the key must move even
+		// though the call's status is still `running`.
+		expect(extractDataRevision(detail([]))).not.toBe(
+			extractDataRevision(detail([{ text: "", identity: "g2GQj-mTWJqSPaaAqG_Ud" }])),
+		);
+		// A same-length id swap repaints the cached payload, so it re-keys too.
+		expect(extractDataRevision(detail([{ text: "", identity: "g2GQj-mTWJqSPaaAqG_Ud" }]))).not.toBe(
+			extractDataRevision(detail([{ text: "", identity: "h3HRk-nUXKrTBpBhR_Ve" }])),
+		);
+	});
+
 	it("keys source focus, never a viewport projection or reading state", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const { createDiffDocument } = await import("@shared/pretext-layout/diff-core");
@@ -1426,6 +1445,17 @@ describe("extractDataRevision", () => {
 			);
 			expect(after).not.toBe(before);
 			expect(after).toContain("gn:2");
+		});
+
+		it("a subagent card's live output counter re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			// Height-neutral but PAINTED from the cached payload: the streaming channel
+			// advances the count alone, so without the key component the badge would
+			// freeze at whatever the first measure saw.
+			const before = extractDataRevision(traceWith(agentCard()));
+			const after = extractDataRevision(traceWith(agentCard({ liveOutputChars: 1240 })));
+			expect(after).not.toBe(before);
+			expect(after).toContain("gl:1240");
 		});
 
 		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {

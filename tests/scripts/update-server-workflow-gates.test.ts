@@ -61,7 +61,10 @@ describe("protected CI bridge wiring", () => {
 					"cancelled",
 					"inputs",
 					"needs",
-					`return (${condition.slice(3, -2).replaceAll("outputs.restore-mode", "outputs['restore-mode']")});`,
+					`return (${condition
+						.slice(3, -2)
+						.replace(/needs\.([a-z-]+)\.outputs\.([a-z-]+)/g, 'needs["$1"].outputs["$2"]')
+						.replace(/needs\.([a-z-]+)\.result/g, 'needs["$1"].result')});`,
 				) as (
 					always: () => boolean,
 					cancelled: () => boolean,
@@ -70,7 +73,14 @@ describe("protected CI bridge wiring", () => {
 				) => boolean;
 				for (const restoring of [false, true]) {
 					const needs = {
-						preflight: { result: "success", outputs: { "restore-mode": String(restoring) } },
+						preflight: {
+							result: "success",
+							outputs: {
+								"restore-mode": String(restoring),
+								"build-reuse-mode": "false",
+								"smoke-only": "false",
+							},
+						},
 						verify: { result: restoring ? "skipped" : "success" },
 						build: { result: restoring ? "skipped" : "success" },
 						smoke: { result: restoring ? "skipped" : "success" },

@@ -12,8 +12,8 @@ export const createProjectSchema = z.object({
 	name: z.string().min(1).max(200),
 	description: z.string().max(2000).optional(),
 	// Repository mode: "existing" (default), "init", "clone"
-	repoMode: z.enum(["existing", "init", "clone"]),
-	gitPath: z.string().min(1),
+	repoMode: z.enum(["existing", "init", "clone"]).default("existing"),
+	gitPath: z.string().trim().min(1).max(4096),
 	// Clone-specific fields
 	cloneUrl: z.string().min(1).optional(),
 	cloneBranch: gitBranchName.optional(),
@@ -47,6 +47,7 @@ export const projectChapterSettingsSchema = z.object({
 export const updateProjectSchema = z.object({
 	name: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
+	gitPath: z.string().trim().min(1).max(4096).optional(),
 	status: z.enum(["active", "archived"]).optional(),
 	/**
 	 * Which canvas the project's story network renders in.

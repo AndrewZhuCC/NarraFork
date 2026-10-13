@@ -9,6 +9,7 @@ import { SAFE_AREA_INSET_LEFT, SAFE_AREA_INSET_RIGHT } from "../../../lib/safe-a
 import enNarrator from "../../../locales/en/narrator.json";
 import zhNarrator from "../../../locales/zh-CN/narrator.json";
 import { createPlanReflectionStatusAction } from "../interaction/PlanReflectionStatusControl";
+import { HeaderToolbar } from "./HeaderToolbar";
 import {
 	BackgroundTasksStatusButton,
 	NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX,
@@ -557,6 +558,107 @@ afterEach(async () => {
 	TestResizeObserver.instances.clear();
 	restoreGlobals?.();
 	restoreGlobals = undefined;
+});
+
+describe("HeaderToolbar saved recordings entry", () => {
+	test.each([
+		"en",
+		"zh-CN",
+	])("opens the shared recording host after closing overflow and preserves compatibility in %s", async (language) => {
+		const i18n = createInstance();
+		await i18n.init({
+			lng: language,
+			fallbackLng: "en",
+			resources: { en: { narrator: enNarrator }, "zh-CN": { narrator: zhNarrator } },
+		});
+		const onOpen = mock(() => {});
+		const onCompatibility = mock(() => {});
+		const onArchive = mock(() => {});
+		function Harness() {
+			const [opened, setOpened] = useState(false);
+			return (
+				<>
+					<HeaderToolbar
+						narratorId="narrator-a"
+						headerHostCapabilities={[]}
+						visibleToolCount={0}
+						mockStreamEnabled={false}
+						dock={null}
+						archiveMutation={{ isPending: false }}
+						openArchiveConfirm={onArchive}
+						onOpenCompatibility={onCompatibility}
+						onOpenSavedRecordings={() => {
+							onOpen();
+							setOpened(true);
+						}}
+						t={i18n.getFixedT(language, "narrator")}
+						toolbarBadgeCounts={{
+							backgroundTasks: 0,
+							browserSessions: 0,
+							userChatUnread: 0,
+							terminals: 0,
+						}}
+						controller={{
+							toolbarOverlays: null,
+							toolbarEntries: [],
+							toolbarSurfacedDefs: [],
+							toolbarTuckedDefs: [],
+							toolbarBottomDefs: [],
+							saveToolbarLayout: () => {},
+							toolbarEntryActive: () => false,
+							activateToolbarEntry: () => {},
+							renderToolbarInlineOptions: () => null,
+						}}
+						inlineControls={{
+							executionDevicesQuery: { data: { devices: [] } },
+							updateExecutionDeviceMutation: { isPending: false, mutate: () => {} },
+							renderLod: 4,
+							renderLodIsDefault: true,
+							handleSelectLod: () => {},
+							setAsDefault: () => {},
+							openPluginPanel: () => {},
+						}}
+					/>
+					{opened && <div data-recording-host>Saved recording host</div>}
+				</>
+			);
+		}
+		await act(async () => {
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<Harness />
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		});
+		const openMenu = async () => {
+			const more = document.querySelector<HTMLButtonElement>(
+				'[data-testid="narrator-toolbar-more"]',
+			);
+			expect(more).not.toBeNull();
+			await act(async () => more?.click());
+		};
+		const clickEntry = async (label: string) => {
+			const entry = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(
+				(node) => node.textContent === label,
+			);
+			expect(entry).toBeDefined();
+			await act(async () => entry?.click());
+		};
+		await openMenu();
+		await clickEntry(i18n.t("saveDump.history", { ns: "narrator" }));
+		expect(onOpen).toHaveBeenCalledTimes(1);
+		expect(document.querySelector("[data-recording-host]")).not.toBeNull();
+		expect(document.querySelector('[role="menu"]')).toBeNull();
+		await openMenu();
+		await clickEntry("compatibility.title");
+		expect(onCompatibility).toHaveBeenCalledTimes(1);
+		await openMenu();
+		await clickEntry(i18n.t("archiveNarrator", { ns: "narrator" }));
+		expect(onArchive).toHaveBeenCalledTimes(1);
+		expect(document.querySelector("[data-recording-host]")).not.toBeNull();
+	});
 });
 
 describe("NarratorStatusBar", () => {

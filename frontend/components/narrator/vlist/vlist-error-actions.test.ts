@@ -87,6 +87,19 @@ describe("error notice actions — row resolution", () => {
 		expect(seen).toEqual([["msg-1", "ECONNRESET"]]);
 	});
 
+	it("passes the row's frozen request diagnostics, not the latest narrator request", () => {
+		const diagnostics = { recordingRequestId: "req_failed", apiRequestId: "api-failed" };
+		let received: unknown;
+		resolveErrorNoticeActions(
+			item("system-text", { kind: "error", text: "old error", diagnostics }),
+			["old-message"],
+			(_id, _text, value) => {
+				received = value;
+				return {};
+			},
+		);
+		expect(received).toBe(diagnostics);
+	});
 	it("returns undefined for a non-error row without consulting the resolver", () => {
 		let called = false;
 		const resolve = () => {

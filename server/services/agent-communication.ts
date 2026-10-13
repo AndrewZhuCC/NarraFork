@@ -104,8 +104,12 @@ export interface AwaitAgentInput {
 	 * metadata carries this id only in its RETURN value, which for a 30-minute wait
 	 * is 30 minutes too late. Must never throw and must never block; the caller
 	 * treats it as fire-and-forget notification.
+	 *
+	 * `title` carries the narrator's current display name when the resolver already
+	 * holds the row (the common case), so the running card can headline the session
+	 * name rather than the slug. Null when the resolver never loaded it.
 	 */
-	onTargetResolved?: (subagentNarratorId: string) => void;
+	onTargetResolved?: (subagentNarratorId: string, title?: string | null) => void;
 }
 
 export interface AwaitAgentResult {
@@ -116,6 +120,12 @@ export interface AwaitAgentResult {
 	 * can hand the frontend something it can navigate to.
 	 */
 	label: string;
+	/**
+	 * The subagent session's current title (the Agent call's `description`, or a
+	 * generated title) when the producing path already had the narrator row in
+	 * hand. Null when it did not — the frontend falls back to `label`.
+	 */
+	title?: string | null;
 	status: string;
 	output: string;
 	formatted: string;
@@ -728,6 +738,7 @@ async function buildAwaitAgentResult(
 	output: string | null | undefined,
 	knownLabel?: string,
 	receipt?: Pick<AwaitAgentResult, "terminalResultReceived" | "publicationRun" | "sourceResultRef">,
+	knownTitle?: string | null,
 ): Promise<AwaitAgentResult> {
 	let recentActivity: string | undefined;
 	if (status === "timeout" || status === "running") {
@@ -744,6 +755,7 @@ async function buildAwaitAgentResult(
 	return {
 		id,
 		label,
+		...(knownTitle ? { title: knownTitle } : {}),
 		status,
 		output: output ?? "(no output)",
 		formatted: formatAgentAwaitResult(label, status, output ?? null, recentActivity),
@@ -1027,10 +1039,14 @@ function buildAwaitTimeoutContext(opts: AwaitAgentInput): {
  * wait. The callback only drives a UI affordance, so a throwing listener must not
  * turn a working Await into a failed tool call.
  */
-function notifyTargetResolved(opts: AwaitAgentInput, subagentNarratorId: string): void {
+function notifyTargetResolved(
+	opts: AwaitAgentInput,
+	subagentNarratorId: string,
+	title?: string | null,
+): void {
 	if (!opts.onTargetResolved || !subagentNarratorId) return;
 	try {
-		opts.onTargetResolved(subagentNarratorId);
+		opts.onTargetResolved(subagentNarratorId, title);
 	} catch (err) {
 		logger.warn("Await target-resolved notification failed", {
 			subagentId: subagentNarratorId,
@@ -1054,8 +1070,8 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	}
 
 	const subagentId = task.subagentNarratorId ?? task.id;
-	notifyTargetResolved(opts, subagentId);
 	const current = await narratorService.getById(subagentId).catch(() => null);
+	notifyTargetResolved(opts, subagentId, current?.title);
 	if (current && isTakenOver(subagentId)) return null;
 	if (current && task.status !== "running" && !current.isBackground) {
 		// The background task row is from a previous run. The same subagent may have
@@ -1071,7 +1087,12 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 		opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 		signal,
 	);
-	return { id: subagentId, ...waited, status: relabel(waited.status) };
+	return {
+		id: subagentId,
+		...waited,
+		status: relabel(waited.status),
+		title: current?.title ?? null,
+	};
 }
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
@@ -1087,13 +1108,14 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			background.output,
 			undefined,
 			background,
+			background.title,
 		);
 	}
 
 	const target = await resolveOneTarget(opts.id, scope);
 	// Announce the target before waiting: every branch below may block for the full
 	// timeout, and the UI needs this id to offer "open session" meanwhile.
-	notifyTargetResolved(opts, target.id);
+	notifyTargetResolved(opts, target.id, target.title);
 	// The narrator row is in hand, so the label needs no extra query.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
 	const build = (
@@ -1103,7 +1125,16 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			AwaitAgentResult,
 			"terminalResultReceived" | "publicationRun" | "sourceResultRef"
 		>,
-	) => buildAwaitAgentResult(scope.teamParentId, target.id, status, output, label, receipt);
+	) =>
+		buildAwaitAgentResult(
+			scope.teamParentId,
+			target.id,
+			status,
+			output,
+			label,
+			receipt,
+			target.title,
+		);
 	if (target.isBackground && target.backgroundStatus === "running") {
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForBackgroundTask(

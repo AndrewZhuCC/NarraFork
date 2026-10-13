@@ -1,6 +1,11 @@
 import { notifications } from "@mantine/notifications";
 import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import {
+	DEFAULT_RECORDING_REQUEST_BYTES,
+	DEFAULT_RECORDING_RESPONSE_BYTES,
+	type RecordingSettings,
+} from "@shared/request-recording";
 import type {
 	SubagentAllowedModels,
 	SubagentModelReasoningEfforts,
@@ -63,6 +68,9 @@ export interface InstanceSettingsState {
 	legacyEncoding: boolean;
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
+	requestDumpRecordingEnabled: boolean;
+	requestDumpRequestBytes: number;
+	requestDumpResponseBytes: number;
 	requestDumpEnabled: boolean;
 	requestDumpErrorsOnly: boolean;
 	cacheDropDumpEnabled: boolean;
@@ -151,6 +159,19 @@ function normalizeSharedRules<
 	})) as T[];
 }
 
+/** Older servers/configurations omit these fields; zero and false are explicit settings. */
+export function readRequestRecordingSettings(
+	agent?: Partial<RecordingSettings>,
+): RecordingSettings {
+	return {
+		requestDumpRecordingEnabled: agent?.requestDumpRecordingEnabled ?? true,
+		requestDumpRequestBytes: agent?.requestDumpRequestBytes ?? DEFAULT_RECORDING_REQUEST_BYTES,
+		requestDumpResponseBytes: agent?.requestDumpResponseBytes ?? DEFAULT_RECORDING_RESPONSE_BYTES,
+		requestDumpEnabled: agent?.requestDumpEnabled ?? false,
+		requestDumpErrorsOnly: agent?.requestDumpErrorsOnly ?? false,
+	};
+}
+
 function makeDefaults(): InstanceSettingsState {
 	return {
 		port: 7778,
@@ -188,8 +209,7 @@ function makeDefaults(): InstanceSettingsState {
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
+		...readRequestRecordingSettings(),
 		cacheDropDumpEnabled: false,
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",
@@ -311,8 +331,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
-				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
-				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
+				...readRequestRecordingSettings(settings.agent),
 				cacheDropDumpEnabled: settings.agent?.cacheDropDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
@@ -443,6 +462,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					legacyEncoding: state.legacyEncoding,
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,
+					requestDumpRecordingEnabled: state.requestDumpRecordingEnabled,
+					requestDumpRequestBytes: state.requestDumpRequestBytes,
+					requestDumpResponseBytes: state.requestDumpResponseBytes,
 					requestDumpEnabled: state.requestDumpEnabled,
 					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
 					cacheDropDumpEnabled: state.cacheDropDumpEnabled,

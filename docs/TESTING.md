@@ -60,7 +60,7 @@ bun server/index.ts --no-auto-resume
 
 - **Static checks**：SQLite 迁移资产检查、全仓 Biome、i18n 检查。
 - **Build and typecheck**：先构建前端（Vite 自动生成 `routeTree.gen.ts`），再运行 TypeScript。根目录测试导入 VS Code 扩展的类型接口，因此还需按 `vscode-extension/bun.lock` 安装该子项目的类型依赖。
-- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate`。`scripts/run-ci-tests.ts` 原样转交 native 参数，仅将测试进程 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，避免固定 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的运行时缺陷；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志和唯一命名的 JUnit 报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
+- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate` 和固定的 `--parallel=2`。Bun 按 `.github/test-timings.json` 中的历史文件耗时均衡分片、优先调度慢文件；它只是调度提示，不是文件清单，新增或缺少提示的测试仍由 Bun 自动发现。`scripts/run-ci-tests.ts` 有界校验后将提示独占复制到 `artifacts/ci-test-timings.json`，`--update-timings` 仅更新该片的 artifact；不写回仓库基线，不执行自建文件过滤，也不使用共享同文件状态的 `--concurrent`/`--no-isolate`。runner 原样转交白名单内 native 参数（仍兼容旧五参数），将 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，避免固定 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的运行时缺陷；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志、唯一命名的 JUnit 和耗时报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
 - **CI Gate**：只有以上任务全部成功才成功；失败、取消或跳过都不能变成通过。启用合并保护时选择该检查；仅增加 workflow 不会自动修改仓库保护规则。
 
 ### SQLite 历史资产
@@ -76,6 +76,14 @@ bun server/index.ts --no-auto-resume
 - 浏览器必须实际能够启动。设置 `NF_TEST_CHROMIUM_PATH`（前端 browser suites）和 `PUPPETEER_EXECUTABLE_PATH`（后端 browser pool），CI 启动 headless Chrome 探针，不能仅因浏览器缺失而算通过。
 - `dist/frontend/index.html` 必须存在，防止构建后 PWA/品牌测试因为没有产物而跳过。
 - 通用 CI 不启用 `PG_INTEGRATION`、`NF_PG_HARNESS_INTEGRATION`、`NF_REFERENCE_COST_PG_URL`、`NF_PROGRAMMATIC_TEST_IMAGE` 或 `NF_TASK_CHALLENGES_PODMAN` 等现有 opt-in。它们有独立的数据库/专用镜像前提，不代表已由默认门禁验收。无 opt-in 的真实 PG baseline 仍运行，不排除 `pg-*`、`integration`、`browser` 或 `e2e` 文件。
+
+### 测试耗时与准备复用
+
+- 优先比较同机器、同参数的**文件总 wall time**，同时核对退出码、用例/断言、fixture 调用次数和峰值内存；不能仅把成本转移到 `beforeAll` 后拿单例时间宣布提速。历史 CI 报告用于定位热点，不冒充同机 A/B。
+- preload 只缓存默认配置的固定顶层键，避免每例为取键而深拷贝全部 DEFAULTS；`afterEach` 仍完整恢复隔离 snapshot，缺失分支也从 snapshot 修复，不改成浅恢复。
+- 归档恢复测试可复用一次真实构造的合法 ZIP 输入；每例的 Buffer、entries、元数据、闭包和输出目录仍独立。恶意 ZIP 与特殊 plan 必须按原路径真实构造，不能 hardlink、共享可写状态或减少负向覆盖。
+- 已模拟的计时场景可推进实际注册的 callbacks，避免固定 sleep；必须同步控制需要的时间源，保留 React `act`、重试次数、fallback 和 timer/spy 清理。真实浏览器、数据库、持久化与大型边界场景不能为提速伪装为纯 mock。
+- 原生计时基线格式为 `{ "version": 1, "files": { "relative/file.test.ts": 1200 } }`，单位毫秒。四片报告中的更新结果可以合并校准；过期、缺失提示不改变测试发现。不要将某一片的结果直接覆盖为全仓文件白名单。
 
 ### 从干净检出验证
 

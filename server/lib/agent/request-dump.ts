@@ -1,3 +1,5 @@
+import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
+import { readWithTimeout } from "../stream-timeout";
 import { sliceToUtf8Budget, utf8Bytes } from "../utf8-budget";
 import type { ApiRequestDiagnostics } from "./types";
 
@@ -49,6 +51,8 @@ export const MAX_DUMP_EVENT_COUNT = 2000;
 
 /** Negative/unlimited settings still obey this in-memory safety ceiling. */
 export const HARD_DUMP_MAX_BYTES = 32 * 1024 * 1024;
+/** Ring-only requests keep just a small local error-diagnostic prefix; bytes stream to the worker. */
+export const RING_DIAGNOSTIC_PREFIX_BYTES = 64 * 1024;
 export function responseDumpBudget(value = DEFAULT_DUMP_MAX_BYTES): number {
 	return Number.isFinite(value) && value >= 0
 		? Math.min(Math.floor(value), HARD_DUMP_MAX_BYTES)
@@ -164,6 +168,26 @@ export function captureDumpResponse(
 		type: { value: response.type },
 	});
 	return captured;
+}
+/** Bounded error-body read; also cancels the pull tap when the prefix cap is reached. */
+export async function readResponsePrefix(
+	response: Response,
+	maxBytes = DEFAULT_DUMP_MAX_BYTES,
+): Promise<string> {
+	if (!response.body) return "";
+	const capture = new BoundedUtf8Capture(maxBytes);
+	const reader = response.body.getReader();
+	try {
+		while (capture.received < capture.limit) {
+			const { done, value } = await readWithTimeout(reader);
+			if (done) break;
+			capture.append(value);
+		}
+		return capture.text();
+	} finally {
+		void reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
 }
 
 const SENSITIVE_HEADER_PATTERNS = [
@@ -402,19 +426,64 @@ export class ApiRequestDumpCollector {
 		this.captureTruncated ||= bounded.truncated;
 		return bounded.value;
 	}
+	private requestBodyText?: string;
+	private initialRequestBodyText?: string;
+	private recordingFinished = false;
+
+	/** Diagnostics must never interrupt the provider's business stream. */
+	private record(action: (recording: RequestRecording) => void): void {
+		if (!this.recording || this.recordingFinished) return;
+		try {
+			action(this.recording);
+		} catch {
+			// A failed recorder is observational only.
+		}
+	}
+
+	frame(frame: RecordingFrame): void {
+		this.record((recording) => recording.frame(frame));
+	}
+
+	finish(result?: { error?: string; status?: string }): void {
+		this.record((recording) => recording.finish(result));
+		this.recordingFinished = true;
+	}
+
+	private materializeRequest(): void {
+		if (this.initialRequestBodyText !== undefined && this.dump.initialRequest) {
+			try {
+				this.dump.initialRequest.body = JSON.parse(this.initialRequestBodyText);
+			} catch {
+				this.dump.initialRequest.body = this.initialRequestBodyText;
+			}
+			this.initialRequestBodyText = undefined;
+		}
+		if (this.requestBodyText === undefined || !this.dump.request) return;
+		try {
+			this.dump.request.body = JSON.parse(this.requestBodyText);
+		} catch {
+			this.dump.request.body = this.requestBodyText;
+		}
+		this.requestBodyText = undefined;
+	}
 
 	beginResponseAttempt(
-		request: NonNullable<ApiRequestDump["request"]>,
+		request: NonNullable<ApiRequestDump["request"]> & RecordingRequest,
 		maxBytes = DEFAULT_DUMP_MAX_BYTES,
+		recordBody = true,
 	): void {
 		this.flushResponseCapture();
 		if (this.dump.request) {
-			this.dump.initialRequest ??= this.dump.request;
+			if (!this.dump.initialRequest) {
+				this.dump.initialRequest = this.dump.request;
+				this.initialRequestBodyText = this.requestBodyText;
+			}
 			this.dump.attempts ??= [];
 			const attempts = this.dump.attempts;
 			if (attempts.length < 16) {
 				const preview = new BoundedUtf8Capture(64 * 1024);
 				preview.append(JSON.stringify(this.dump.request));
+				if (this.requestBodyText !== undefined) preview.append(this.requestBodyText);
 				attempts.push({
 					requestText:
 						preview.text() +
@@ -427,15 +496,19 @@ export class ApiRequestDumpCollector {
 		this.responseCapture = new BoundedUtf8Capture(
 			Math.max(
 				0,
-				Math.min(responseDumpBudget(maxBytes), this.maxCaptureBytes ?? HARD_DUMP_MAX_BYTES) -
-					this.responseBudgetUsed,
+				Math.min(
+					responseDumpBudget(maxBytes),
+					this.legacyResponseMaxBytes,
+					this.maxCaptureBytes ?? HARD_DUMP_MAX_BYTES,
+				) - this.responseBudgetUsed,
 			),
 		);
 		this.dump.response = { bodyIncomplete: true };
-		this.setRequest(request);
+		this.setRequest(request, recordBody);
 	}
 
-	appendResponseText(value: string | Uint8Array): void {
+	appendResponseText(value: string | Uint8Array, record = true): void {
+		if (record) this.record((recording) => recording.responseChunk(value));
 		this.responseCapture?.append(value);
 	}
 
@@ -457,27 +530,61 @@ export class ApiRequestDumpCollector {
 
 	constructor(
 		initial?: ApiRequestDump,
+		private readonly recording?: RequestRecording,
+		private readonly legacyResponseMaxBytes = HARD_DUMP_MAX_BYTES,
 		readonly maxCaptureBytes?: number,
-		private readonly retainInitialRequest = maxCaptureBytes !== undefined,
+		readonly retainInitialRequest = maxCaptureBytes !== undefined,
 	) {
 		this.dump = this.copy(initial ?? {});
 	}
 
-	setRequest(request: NonNullable<ApiRequestDump["request"]>): void {
-		// Only a WS delta needs its prepared full history alongside the actual frame.
-		// A full frame already contains that history; duplicating it crowds out the response.
-		const body = request.body as { previous_response_id?: unknown } | null | undefined;
+	setRequest(
+		request: NonNullable<ApiRequestDump["request"]> & RecordingRequest,
+		recordBody = true,
+	): void {
+		const { body, bodyText, ...meta } = request;
+		let serialized = bodyText;
+		this.record((recording) => {
+			if (recordBody && serialized === undefined && body !== undefined) {
+				serialized = JSON.stringify(body, jsonReplacer);
+			}
+			recording.request({ ...meta, bodyText: recordBody ? serialized : undefined });
+		});
+		// Preserve the full logical history only when the actual WS frame is a delta.
 		if (
 			this.retainInitialRequest &&
 			this.dump.request &&
-			typeof body?.previous_response_id === "string"
+			!this.dump.initialRequest &&
+			typeof (body as { previous_response_id?: unknown } | undefined)?.previous_response_id ===
+				"string"
 		) {
-			this.dump.initialRequest ??= this.dump.request;
+			this.dump.initialRequest = this.dump.request;
+			this.initialRequestBodyText = this.requestBodyText;
 		}
-		this.dump.request = this.copy({ ...request, headers: sanitizeHeaders(request.headers) });
+		this.dump.request = this.copy({ ...meta, headers: sanitizeHeaders(meta.headers) });
+		this.requestBodyText = undefined;
+		if (this.maxCaptureBytes !== undefined && bodyText === undefined) {
+			this.dump.request.body = this.copy(body);
+			return;
+		}
+		serialized ??= body === undefined ? undefined : JSON.stringify(body, jsonReplacer);
+		if (serialized !== undefined) {
+			const maxBytes = this.maxCaptureBytes ?? HARD_DUMP_MAX_BYTES;
+			if (serialized.length <= maxBytes / 3 || Buffer.byteLength(serialized) <= maxBytes) {
+				this.requestBodyText = serialized;
+			} else {
+				const marker = "\n[legacy request dump truncated]";
+				const capture = new BoundedUtf8Capture(Math.max(0, maxBytes - Buffer.byteLength(marker)));
+				capture.append(serialized);
+				this.requestBodyText = `${capture.text()}${marker}`;
+				this.captureTruncated = true;
+			}
+		}
 	}
 
 	setResponseMeta(response: Partial<NonNullable<ApiRequestDump["response"]>>): void {
+		const { bodyText: _bodyText, events: _events, ...meta } = response;
+		if (Object.keys(meta).length) this.record((recording) => recording.responseMeta(meta));
 		this.dump.response = {
 			...(this.dump.response ?? {}),
 			...this.copy(response),
@@ -485,11 +592,14 @@ export class ApiRequestDumpCollector {
 	}
 
 	setResponseBodyText(bodyText: string): void {
-		this.setResponseMeta({ bodyText });
+		this.setResponseBodyTextWithLimit(bodyText, DEFAULT_DUMP_MAX_BYTES);
 	}
 
 	setResponseBodyTextWithLimit(bodyText: string, maxSize: number): void {
-		const capture = new BoundedUtf8Capture(maxSize);
+		this.record((recording) => recording.responseChunk(bodyText));
+		const capture = new BoundedUtf8Capture(
+			Math.min(responseDumpBudget(maxSize), this.legacyResponseMaxBytes),
+		);
 		capture.append(bodyText);
 		this.setResponseMeta({
 			bodyText: capture.text(),
@@ -569,6 +679,7 @@ export class ApiRequestDumpCollector {
 
 	snapshot(maxBytes = this.maxCaptureBytes): ApiRequestDump {
 		this.flushResponseCapture();
+		this.materializeRequest();
 		if (maxBytes === undefined) return toJsonSafe(this.dump);
 		const { initialRequest, request, response, attempts, ...metadata } = this.dump;
 		const complete = boundedJsonCopy(

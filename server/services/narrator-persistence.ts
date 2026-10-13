@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
 import {
 	type CodexRemoteCompactPayload,
 	type CompactMessageMode,
@@ -2572,7 +2573,7 @@ const sqliteNarratorPersistence = {
 	) {
 		const errorMessage = options?.errorMessage;
 		const errorCode = options?.errorCode;
-		const diagnostics = options?.diagnostics;
+		const diagnostics = normalizeApiRequestDiagnostics(options?.diagnostics);
 		const setTurnStart = options?.setTurnStart;
 		// When transitioning to an active status without explicit substatus,
 		// auto-clear stale tags (e.g. leftover "unread"/"error"/"interrupted"),
@@ -2698,7 +2699,9 @@ const sqliteNarratorPersistence = {
 				try {
 					const errText = normalizedErrorMessage ?? "Unknown error";
 					const msgId = generateId();
-					const contentJson = [{ type: "error", message: errText }];
+					const contentJson = [
+						{ type: "error", message: errText, ...(diagnostics ? { diagnostics } : {}) },
+					];
 					const contentText = `[Error] ${errText}`;
 					// Insert the message and its ref atomically. We MUST use a
 					// SYNCHRONOUS transaction here: bun:sqlite +
@@ -2804,7 +2807,7 @@ const sqliteNarratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (newStatus === "working" || newStatus === "waiting" ? [] : undefined);
 		const errorMessage = options?.errorMessage;
-		const diagnostics = options?.diagnostics;
+		const diagnostics = normalizeApiRequestDiagnostics(options?.diagnostics);
 		const isError = requestedSubstatus?.includes("error");
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();

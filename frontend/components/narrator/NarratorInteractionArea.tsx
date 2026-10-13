@@ -2,6 +2,7 @@ import { Box, Text } from "@mantine/core";
 import type React from "react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import { useSpecFiles } from "../../hooks/useSpec";
 import { CommentDraftChips } from "./CommentDraftChips";
@@ -107,6 +108,7 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		for (const file of specFiles ?? []) revisions.set(file.uri, file.revisionId);
 		return revisions;
 	}, [specFiles]);
+	const [resizeEnabled] = useLocalPref("narrafork_narrator_bottom_spacing_resize");
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
 	const compact = useNarratorPanelCompact();
@@ -139,18 +141,19 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		<Box style={{ position: "relative", flexShrink: 0 }}>
 			{/* Resize boundary; the queue draws its own top border when present. */}
 			<Box
-				onPointerDown={startBottomSpacingResize}
-				role="separator"
-				aria-orientation="horizontal"
-				aria-label={t("resizeBottomSpacing")}
+				onPointerDown={resizeEnabled ? startBottomSpacingResize : undefined}
+				role={resizeEnabled ? "separator" : undefined}
+				aria-orientation={resizeEnabled ? "horizontal" : undefined}
+				aria-label={resizeEnabled ? t("resizeBottomSpacing") : undefined}
 				style={{
 					position: "absolute",
 					top: -1,
 					left: 0,
 					right: 0,
-					height: 3,
-					cursor: "ns-resize",
-					touchAction: "none",
+					height: resizeEnabled ? 3 : 1,
+					cursor: resizeEnabled ? "ns-resize" : undefined,
+					touchAction: resizeEnabled ? "none" : undefined,
+					pointerEvents: resizeEnabled ? undefined : "none",
 					zIndex: 100,
 					borderTop:
 						props.queueDeps.queuedMessages.length > 0

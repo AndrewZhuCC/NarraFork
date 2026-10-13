@@ -539,7 +539,7 @@ describe("RulerFlow", () => {
 		expect(notice?.textContent).toContain("deprecated");
 
 		const switchButton = Array.from(notice?.querySelectorAll("button") ?? []).find((el) =>
-			el.textContent?.includes("Switch to NarraFlow"),
+			el.textContent?.includes(projectsLocale.rulerDeprecatedSwitch),
 		);
 		expect(switchButton).toBeDefined();
 		switchButton?.dispatchEvent(new Event("click", { bubbles: true }));

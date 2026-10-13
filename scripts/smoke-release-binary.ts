@@ -1,6 +1,17 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	lstat,
+	mkdir,
+	mkdtemp,
+	open,
+	opendir,
+	rm,
+	rmdir,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -28,6 +39,113 @@ export interface SmokeOptions {
 }
 const MAX_BINARY = 1024 ** 3;
 const MAX_MESSAGE = 64 * 1024;
+
+async function writeSmokeArtifact(
+	path: string,
+	value: unknown,
+	signal?: AbortSignal,
+): Promise<void> {
+	signal?.throwIfAborted();
+	const file = await open(path, "wx", 0o600);
+	try {
+		await file.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+		await file.close();
+		signal?.throwIfAborted();
+	} catch (error) {
+		await file.close().catch(() => {});
+		// Only remove a file exclusively created by this attempt, never an existing result.
+		await rm(path, { force: true }).catch(() => {});
+		throw error;
+	}
+}
+
+/** Diagnostic evidence is deliberately not a CiReleaseSmokeResult or publication proof. */
+export class SmokeDiagnostic {
+	readonly completedStages: string[] = [];
+	readonly stages: Record<string, "pending" | "passed" | "failed"> = {
+		product: "pending",
+		"process-shutdown": "pending",
+		"post-run-integrity": "pending",
+		"directory-cleanup": "pending",
+		"final-integrity": "pending",
+	};
+	firstFailureStage: string | null = null;
+	readonly failures: {
+		stage: string;
+		name: string;
+		code?: string;
+		syscall?: string;
+		path?: string;
+	}[] = [];
+	readonly secrets: string[] = [];
+	remainingPaths: string[] = [];
+	repository: string | undefined;
+
+	constructor(readonly options: SmokeOptions) {
+		this.repository = options.repository;
+	}
+
+	private key(stage: string): string {
+		return stage.toLowerCase().replaceAll(" ", "-");
+	}
+
+	passed(stage: string): void {
+		const key = this.key(stage);
+		// A cleanup retry must never erase an earlier failure.
+		if (this.stages[key] === "failed") return;
+		this.stages[key] = "passed";
+		if (!this.completedStages.includes(key)) this.completedStages.push(key);
+	}
+
+	failed(stage: string, error: unknown): void {
+		const key = this.key(stage);
+		this.firstFailureStage ??= key;
+		this.stages[key] = "failed";
+		if (this.failures.length >= 8) return;
+		const system = error instanceof Error ? (error as NodeJS.ErrnoException) : undefined;
+		// Never serialize raw error messages: HTTP failures may contain credentials/response bodies.
+		this.failures.push({
+			stage: key,
+			name: system?.name === "AbortError" ? "AbortError" : "Error",
+			...(system?.code ? { code: this.text(system.code, 128) } : {}),
+			...(system?.syscall ? { syscall: this.text(system.syscall, 128) } : {}),
+			// Retain the leaf filename for deep Windows cache locks without a full filesystem dump.
+			...(typeof system?.path === "string" ? { path: this.text(system.path, 2_048) } : {}),
+		});
+	}
+
+	private text(value: string, maximum: number): string {
+		for (const secret of this.secrets) if (secret) value = value.replaceAll(secret, "[REDACTED]");
+		value = value.replace(
+			/(\b(?:authorization|bearer|token|password|[\w]*secret|[\w]*api[_-]?key)\b[\s"':=]+)[^\s,;"'}]+/gi,
+			"$1[REDACTED]",
+		);
+		return value.slice(-maximum);
+	}
+
+	async write(processLog: string): Promise<void> {
+		const path = join(dirname(resolve(this.options.output)), "smoke-diagnostic.json");
+		const diagnostic = {
+			schemaVersion: 1,
+			kind: "release-smoke-diagnostic",
+			identity: {
+				target: this.options.target,
+				commit: this.options.commit,
+				version: this.options.version,
+				...(this.repository ? { repository: this.repository } : {}),
+			},
+			completedStages: this.completedStages,
+			stages: this.stages,
+			firstFailureStage: this.firstFailureStage,
+			failures: this.failures,
+			remainingPaths: this.remainingPaths.slice(0, 32).map((path) => this.text(path, 512)),
+			// Only the existing, bounded managed-child diagnostic is accepted; no env/request dump.
+			processLog: this.text(processLog, 32 * 1024),
+		};
+		await mkdir(dirname(path), { recursive: true });
+		await writeSmokeArtifact(path, diagnostic);
+	}
+}
 
 export function parseSmokeArgs(args: readonly string[]): SmokeOptions {
 	const keys = ["target", "binary", "metadata", "commit", "version", "output"] as const;
@@ -413,6 +531,58 @@ export function hasPtyMarker(output: string, marker: string): boolean {
 	return clean.split(/[\r\n]/).some((line) => line.trim() === marker);
 }
 
+/** Remove an owned temporary tree without traversing Windows cache junctions. */
+export async function removeSmokeDirectory(
+	root: string,
+	windows = process.platform === "win32",
+): Promise<void> {
+	if (!windows) {
+		await rm(root, { recursive: true, force: true, maxRetries: 3 });
+		return;
+	}
+	const deadline = performance.now() + 5_000;
+	let entries = 0;
+	const check = (depth: number) => {
+		if (++entries > 10_000 || depth > 32 || performance.now() >= deadline)
+			throw new Error("Owned smoke directory cleanup budget exceeded");
+	};
+	const visit = async (path: string, depth: number): Promise<void> => {
+		check(depth);
+		const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (!info) return;
+		if (info.isSymbolicLink()) {
+			// Bun's recursive rm treats an INetCache directory junction like a file.
+			// Both operations below remove only the link; never stat/recurse into its target.
+			try {
+				await unlink(path);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code !== "EPERM" && code !== "EISDIR" && code !== "EACCES") throw error;
+				await rmdir(path);
+			}
+			return;
+		}
+		if (info.isDirectory()) {
+			const directory = await opendir(path);
+			for await (const entry of directory) await visit(join(path, entry.name), depth + 1);
+			check(depth);
+			await rmdir(path);
+			return;
+		}
+		await unlink(path);
+	};
+	const info = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (!info) return;
+	if (info.isSymbolicLink() || !info.isDirectory())
+		throw new Error("Owned smoke cleanup root is not a real directory");
+	await visit(root, 0);
+}
 /** Names only, two levels and at most 32 entries; never follow a symlink or read file contents. */
 export async function remainingSmokePaths(root: string): Promise<string[]> {
 	const paths: string[] = [];
@@ -626,16 +796,19 @@ export async function smokeReleaseBinary(
 		throw new Error("Smoke target does not match native runner OS/architecture");
 	const binary = resolve(options.binary);
 	const output = resolve(options.output);
-	if (
-		await lstat(output).then(
-			() => true,
-			(error: NodeJS.ErrnoException) => {
-				if (error.code === "ENOENT") return false;
-				throw error;
-			},
+	const diagnosticOutput = join(dirname(output), "smoke-diagnostic.json");
+	if (output === diagnosticOutput) throw new Error("Smoke output cannot be the diagnostic path");
+	for (const path of [output, diagnosticOutput])
+		if (
+			await lstat(path).then(
+				() => true,
+				(error: NodeJS.ErrnoException) => {
+					if (error.code === "ENOENT") return false;
+					throw error;
+				},
+			)
 		)
-	)
-		throw new Error("Refusing to overwrite an existing smoke result");
+			throw new Error("Refusing to overwrite an existing smoke result or diagnostic");
 	const root = await mkdtemp(join(tmpdir(), "narrafork-release-smoke-"));
 	const cwd = join(root, "run");
 	const env = smokeEnvironment(root);
@@ -645,7 +818,9 @@ export async function smokeReleaseBinary(
 	]);
 	const scope = new SmokeProcessScope(cwd, env, { signal: deadlineSignal });
 	let result: CiReleaseSmokeResult | undefined;
+	let metadataText: string | undefined;
 	let stage = "binary preparation";
+	const diagnostic = new SmokeDiagnostic(options);
 	const errors: unknown[] = [];
 	try {
 		for (const directory of [
@@ -669,9 +844,10 @@ export async function smokeReleaseBinary(
 			if (dirname(parent) === parent) break;
 		}
 		const before = await hashReleaseFile(binary, MAX_BINARY, scope.signal);
-		const metadataText = await readReleaseText(resolve(options.metadata), MAX_MESSAGE);
+		metadataText = await readReleaseText(resolve(options.metadata), MAX_MESSAGE);
 		const metadata = validateSmokeMetadata(JSON.parse(metadataText), options, before);
 		const repository = options.repository ?? metadata.repository;
+		diagnostic.repository = repository;
 		const executable = join(cwd, basename(binary));
 		await copyReleaseFile(binary, executable, MAX_BINARY, scope.signal);
 		if (process.platform !== "win32") await chmod(executable, 0o700);
@@ -690,6 +866,8 @@ export async function smokeReleaseBinary(
 		await writeFile(
 			join(env.NARRAFORK_HOME, "settings.json"),
 			JSON.stringify({
+				// Startup reads this setting, not BROWSER; detached desktop browsers escape smoke ownership.
+				server: { openBrowser: "off" },
 				vnet: { enabled: false, udp: { enabled: false, host: "127.0.0.1", port: 0 } },
 			}),
 			{ flag: "wx", mode: 0o600 },
@@ -702,48 +880,66 @@ export async function smokeReleaseBinary(
 			`--port=${port}`,
 			"--no-auto-resume",
 		]);
+		diagnostic.passed(stage);
 		stage = "startup";
 		await startup(origin, child, scope, options);
+		diagnostic.passed(stage);
 		stage = "frontend";
 		await frontend(origin, scope);
+		diagnostic.passed(stage);
 		stage = "bootstrap registration";
 		const username = `ci_${randomUUID().replaceAll("-", "").slice(0, 20)}`;
+		const password = randomUUID();
+		diagnostic.secrets.push(password);
 		const registration = JSON.parse(
 			(
 				await request(origin, "/api/auth/register", scope, {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ username, password: randomUUID(), language: "en" }),
+					body: JSON.stringify({ username, password, language: "en" }),
 				})
 			).text,
 		) as { token?: string };
 		if (!registration.token) throw new Error("Isolated bootstrap registration did not issue token");
-		if (repository) {
+		diagnostic.secrets.push(registration.token);
+		{
 			const actual = JSON.parse(
 				(
 					await request(origin, "/api/settings", scope, {
 						headers: { Authorization: `Bearer ${registration.token}` },
 					})
 				).text,
-			) as { update?: { source?: string; githubRepository?: string } };
+			) as {
+				server?: { openBrowser?: string };
+				update?: { source?: string; githubRepository?: string };
+			};
+			if (actual.server?.openBrowser !== "off")
+				throw new Error("Isolated smoke must disable automatic browser startup");
 			if (
-				actual.update?.source !== "github" ||
-				actual.update.githubRepository?.toLowerCase() !== repository.toLowerCase()
+				repository &&
+				(actual.update?.source !== "github" ||
+					actual.update.githubRepository?.toLowerCase() !== repository.toLowerCase())
 			)
 				throw new Error("Compiled default update repository does not match the release repository");
 		}
+		diagnostic.passed(stage);
 		stage = "database";
 		assertMigratedDatabase(join(env.NARRAFORK_HOME, "narrafork.db"), username);
+		diagnostic.passed(stage);
 		stage = "watcher";
 		await watcher(executable, root, scope);
+		diagnostic.passed(stage);
 		stage = "PTY";
 		await smokePty(origin, registration.token, scope);
 		child.assertRunning();
 		assertHealthIdentity(JSON.parse((await request(origin, "/api/health", scope)).text), options);
+		diagnostic.passed(stage);
+		diagnostic.passed("product");
 		stage = "process shutdown";
 		await scope.close();
 		// Cleanup can observe late output-limit/stream failures independently of the parent deadline.
 		scope.signal.throwIfAborted();
+		diagnostic.passed(stage);
 		stage = "post-run integrity";
 		const after = await hashReleaseFile(binary, MAX_BINARY, deadlineSignal);
 		const afterRun = await hashReleaseFile(executable, MAX_BINARY, deadlineSignal);
@@ -756,6 +952,7 @@ export async function smokeReleaseBinary(
 				throw new Error("Binary was modified during smoke");
 		if ((await readReleaseText(resolve(options.metadata), MAX_MESSAGE)) !== metadataText)
 			throw new Error("Metadata changed during smoke");
+		diagnostic.passed(stage);
 		result = {
 			schemaVersion: 1,
 			...(repository ? { repository } : {}),
@@ -773,6 +970,8 @@ export async function smokeReleaseBinary(
 			},
 		};
 	} catch (error) {
+		diagnostic.failed(stage, error);
+		if (diagnostic.stages.product !== "passed") diagnostic.stages.product = "failed";
 		errors.push(
 			new Error(
 				`${smokeFailure(`Release smoke failed during ${stage}`, [error]).message}\n${scope.diagnostic}`,
@@ -782,28 +981,58 @@ export async function smokeReleaseBinary(
 	} finally {
 		try {
 			await scope.close();
+			diagnostic.passed("process shutdown");
 		} catch (error) {
+			diagnostic.failed("process shutdown", error);
 			errors.push(smokeFailure("Smoke process cleanup failed", [error]));
 		}
 		try {
-			await rm(root, { recursive: true, force: true, maxRetries: 3 });
+			await removeSmokeDirectory(root);
+			diagnostic.passed("directory cleanup");
 		} catch (error) {
+			diagnostic.failed("directory cleanup", error);
+			diagnostic.remainingPaths = await remainingSmokePaths(root);
 			errors.push(
 				new Error(
-					`${smokeFailure("Smoke directory cleanup failed", [error]).message}\nRemaining owned paths: ${JSON.stringify(await remainingSmokePaths(root))}\n${scope.diagnostic}`,
+					`${smokeFailure("Smoke directory cleanup failed", [error]).message}\nRemaining owned paths: ${JSON.stringify(diagnostic.remainingPaths)}\n${scope.diagnostic}`,
 					{ cause: error },
 				),
 			);
 		}
 	}
+	if (!errors.length) {
+		try {
+			if (!result) throw new Error("Smoke result missing");
+			deadlineSignal.throwIfAborted();
+			scope.signal.throwIfAborted();
+			// Recheck the source package after all cleanup, not just the executable before removal.
+			const finalHash = await hashReleaseFile(binary, MAX_BINARY, deadlineSignal);
+			if (
+				finalHash.size !== result.size ||
+				finalHash.sha256 !== result.sha256 ||
+				finalHash.sha512 !== result.sha512 ||
+				(await readReleaseText(resolve(options.metadata), MAX_MESSAGE)) !== metadataText
+			)
+				throw new Error("Release package changed during cleanup");
+			deadlineSignal.throwIfAborted();
+			scope.signal.throwIfAborted();
+			diagnostic.passed("final integrity");
+		} catch (error) {
+			diagnostic.failed("final integrity", error);
+			errors.push(smokeFailure("Smoke final integrity failed", [error]));
+		}
+	}
+	try {
+		await diagnostic.write(scope.diagnostic);
+	} catch (error) {
+		// Failure evidence is best effort; failure to write it must not replace the primary error.
+		errors.push(smokeFailure("Smoke diagnostic output failed", [error]));
+	}
 	if (errors.length) throw smokeFailure("Release smoke failed", errors);
 	if (!result) throw new Error("Smoke result missing");
 	deadlineSignal.throwIfAborted();
 	scope.signal.throwIfAborted();
-	await mkdir(dirname(output), { recursive: true });
-	deadlineSignal.throwIfAborted();
-	scope.signal.throwIfAborted();
-	await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+	await writeSmokeArtifact(output, result, AbortSignal.any([deadlineSignal, scope.signal]));
 	if (options.target.endsWith("-baseline"))
 		console.log(
 			"Baseline smoke on a modern x64 runner does not prove compatibility with a CPU lacking AVX2.",

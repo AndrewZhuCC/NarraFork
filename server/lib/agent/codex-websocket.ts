@@ -9,6 +9,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
+import { generateId } from "../id";
 import { logger } from "../logger";
 import {
 	getHttpCodexUserAgent,
@@ -861,7 +862,36 @@ function isCodexWebSocketAbortError(error: unknown): boolean {
 	return error instanceof Error && error.message === "Codex WebSocket request aborted";
 }
 
+function recordWebSocketMessage(
+	collector: ApiRequestDumpCollector | undefined,
+	connectionId: string,
+	incoming: PendingFrame,
+): void {
+	collector?.frame({
+		direction: "response",
+		type: `websocket.${incoming.type}`,
+		text: incoming.type === "message" ? incoming.text : undefined,
+		metadata: {
+			connectionId,
+			boundary: "websocket-message-not-network-frame",
+			...(incoming.type === "close" ? { code: incoming.code, reason: incoming.reason } : {}),
+			...(incoming.type === "error" ? { error: incoming.error.message } : {}),
+		},
+	});
+	if (incoming.type === "message") {
+		collector?.appendResponseText(incoming.text, false);
+		collector?.appendResponseText("\n", false);
+	} else if (incoming.type === "close") {
+		collector?.appendResponseText(
+			`\n[websocket close ${incoming.code}] ${incoming.reason}\n`,
+			false,
+		);
+	} else collector?.setResponseError(incoming.error);
+}
+
 class ReusableWebSocketConnection {
+	readonly id = generateId();
+	handshakeMeta?: { status?: number; headers?: Record<string, string> };
 	onFrame?: (frame: PendingFrame) => void;
 	private ws: WebSocket | null = null;
 	private queue: PendingFrame[] = [];
@@ -947,6 +977,7 @@ class ReusableWebSocketConnection {
 				this.onUpgrade?.(response);
 			});
 			ws.once("unexpected-response", (_request, response) => {
+				this.onUpgrade?.(response);
 				const status = response.statusCode;
 				const message = `Codex WebSocket upgrade failed with status ${status ?? "unknown"}`;
 				finishReject(
@@ -1056,8 +1087,10 @@ class ReusableWebSocketConnection {
 	}
 
 	async close(): Promise<void> {
-		this.onFrame = undefined;
-		if (!this.ws) return;
+		if (!this.ws) {
+			this.onFrame = undefined;
+			return;
+		}
 		const ws = this.ws;
 		this.ws = null;
 		if (ws.readyState === ws.CLOSED) return;
@@ -1071,6 +1104,7 @@ class ReusableWebSocketConnection {
 			}
 			setTimeout(resolve, 1000);
 		});
+		this.onFrame = undefined;
 	}
 
 	private push(frame: PendingFrame): void {
@@ -1097,7 +1131,15 @@ async function ensureConnection(
 		!session.connection.isExpiring() &&
 		!session.connection.hasPendingFrames()
 	) {
-		return session.connection;
+		const connection = session.connection;
+		connection.onFrame = (incoming) =>
+			recordWebSocketMessage(options.requestDump, connection.id, incoming);
+		options.requestDump?.frame({
+			direction: "response",
+			type: "websocket.connection",
+			metadata: { connectionId: connection.id, reused: true, ...connection.handshakeMeta },
+		});
+		return connection;
 	}
 	// Any new socket invalidates the response chain. `previous_response_id` is
 	// connection-scoped upstream, which is precisely what `previous_response_not_found`
@@ -1115,12 +1157,24 @@ async function ensureConnection(
 		handshakeHeaders ?? buildHandshakeHeaders(options),
 		options.proxy,
 		(response) => {
+			connection.handshakeMeta = {
+				status: response.statusCode,
+				headers: sanitizeHeaders(response.headers),
+			};
+			options.requestDump?.setResponseMeta(connection.handshakeMeta);
+			options.requestDump?.frame({
+				direction: "response",
+				type: response.statusCode === 101 ? "websocket.upgrade" : "websocket.upgrade_rejected",
+				metadata: { connectionId: connection.id, reused: false, ...connection.handshakeMeta },
+			});
 			const turnState = response.headers[TURN_STATE_HEADER];
-			if (typeof turnState === "string" && turnState) {
+			if (response.statusCode === 101 && typeof turnState === "string" && turnState) {
 				session.turnState ??= turnState;
 			}
 		},
 	);
+	connection.onFrame = (incoming) =>
+		recordWebSocketMessage(options.requestDump, connection.id, incoming);
 	await connection.connect(options.signal);
 	if (options.signal.aborted) {
 		await connection.close();
@@ -1198,9 +1252,13 @@ export async function* streamCodexResponsesWebSocket(
 					transport: "websocket",
 					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
 					headers: sanitizeHeaders(handshakeHeaders),
-					body: { type: "response.create", ...request },
+					method: "GET",
+					...(options.requestDump?.retainInitialRequest
+						? { body: { type: "response.create", ...request } }
+						: {}),
 				},
 				options.requestDumpMaxBytes,
+				false,
 			);
 		beginAttempt();
 
@@ -1226,23 +1284,22 @@ export async function* streamCodexResponsesWebSocket(
 
 		const dispatchRequest = async (): Promise<void> => {
 			const frame = buildRequestFrame();
-			options.requestDump?.setRequest({
-				transport: "websocket",
-				url: buildCodexResponsesWebSocketUrl(options.baseUrl),
-				headers: sanitizeHeaders(handshakeHeaders),
-				body: frame.body,
+			options.requestDump?.setRequest(
+				{
+					transport: "websocket",
+					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+					headers: sanitizeHeaders(handshakeHeaders),
+					body: frame.body,
+					bodyText: frame.text,
+				},
+				false,
+			);
+			options.requestDump?.frame({
+				direction: "request",
+				type: "websocket.message",
+				text: frame.text,
+				metadata: { connectionId: connection?.id, boundary: "websocket-message-not-network-frame" },
 			});
-			if (connection)
-				connection.onFrame = (incoming) => {
-					if (incoming.type === "message") {
-						options.requestDump?.appendResponseText(incoming.text);
-						options.requestDump?.appendResponseText("\n");
-					} else if (incoming.type === "close") {
-						options.requestDump?.appendResponseText(
-							`\n[websocket close ${incoming.code}] ${incoming.reason}\n`,
-						);
-					} else options.requestDump?.setResponseError(incoming.error);
-				};
 			// Preserve the legacy first-dispatch observer contract. The collector above
 			// separately records every attempt, including recovery resends.
 			if (!requestReported) {
@@ -1269,7 +1326,6 @@ export async function* streamCodexResponsesWebSocket(
 		 * ends the stream instead of sending into a socket nobody is reading.
 		 */
 		const reconnectAndResend = async (): Promise<boolean> => {
-			if (connection) connection.onFrame = undefined;
 			options.requestDump?.finishResponseCapture(false);
 			await discardResponseChain(session);
 			beginAttempt();
@@ -1744,7 +1800,7 @@ export async function* streamCodexResponsesWebSocket(
 		await discardResponseChain(session);
 		throw error;
 	} finally {
-		if (connection) connection.onFrame = undefined;
+		const recordedConnection = connection;
 		options.requestDump?.finishResponseCapture(completed);
 		// An early-returning consumer must not leave unread frames for the next request.
 		if (!completed && connection) await discardResponseChain(session);
@@ -1771,5 +1827,6 @@ export async function* streamCodexResponsesWebSocket(
 				stopSessionCleanupTimerIfIdle();
 			}
 		}
+		if (recordedConnection) recordedConnection.onFrame = undefined;
 	}
 }

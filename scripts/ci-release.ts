@@ -5,6 +5,10 @@ import { setImmediate } from "node:timers/promises";
 import { mergeUpdateIndex } from "../shared/update-index";
 import { UPDATE_INDEX_FILE, type UpdateIndexRelease } from "../shared/update-index-types";
 import { updateServerChildEnvironment } from "../shared/update-server-child-env";
+import {
+	prepareCiReleaseBuild,
+	restoreCiReleaseBuildPlatform,
+} from "./lib/ci-release-build-restore";
 import { assembleReleaseBundle, verifyReleaseBundle } from "./lib/ci-release-bundle";
 import { hashReleaseFile } from "./lib/ci-release-io";
 import {
@@ -45,7 +49,11 @@ const FLAGS: Record<string, readonly string[]> = {
 		"mirror-only",
 		"bridge-run-id",
 		"bridge-run-attempt",
+		"build-run-id",
+		"build-run-attempt",
+		"smoke-target",
 	],
+	"restore-platform": ["plan", "target", "platform-dir"],
 	assemble: ["plan", "platforms-dir", "smoke-dir", "bundle-dir", "preview-dir"],
 	restore: ["tag", "source-run-id", "bundle-dir"],
 	"prepare-bridge": ["tag", "source-run-id", "bundle-dir", "bridge-dir"],
@@ -96,11 +104,40 @@ function positiveId(value: string): number {
 	return Number(value);
 }
 export function releaseMatrix(plan: CiReleasePlan) {
+	const selected = plan.buildSource?.platforms.map(({ target }) => target);
 	return {
-		include: CI_RELEASE_TARGETS.map((entry) => ({
-			...entry,
-			binary: `narrafork-${plan.version}-${entry.suffix}`,
-		})),
+		include: CI_RELEASE_TARGETS.filter((entry) => !selected || selected.includes(entry.target)).map(
+			(entry) => ({ ...entry, binary: `narrafork-${plan.version}-${entry.suffix}` }),
+		),
+	};
+}
+
+/** Validate recovery combinations before performing any network or filesystem operation. */
+export function validateBuildRecoveryArgs(values: Record<string, string>) {
+	const buildRun = values["build-run-id"];
+	const buildAttempt = values["build-run-attempt"];
+	const smokeTarget = values["smoke-target"] || undefined;
+	if (Boolean(buildRun) !== Boolean(buildAttempt))
+		throw new Error("Original build recovery requires both run ID and explicit attempt");
+	if (smokeTarget && !CI_RELEASE_TARGETS.some(({ target }) => target === smokeTarget))
+		throw new Error("Unknown native smoke target");
+	if (smokeTarget && !buildRun) throw new Error("Single-platform smoke requires an original build");
+	if (buildRun) {
+		if (
+			values["source-run-id"] ||
+			values["index-only"] === "true" ||
+			values["mirror-only"] === "true" ||
+			values["bridge-run-id"] ||
+			values["bridge-run-attempt"]
+		)
+			throw new Error("Original build recovery cannot mix bundle, index or bridge recovery");
+		if (smokeTarget && values.publish !== "false")
+			throw new Error("Single-platform diagnostics cannot publish");
+	}
+	return {
+		buildRunId: buildRun ? positiveId(buildRun) : undefined,
+		buildRunAttempt: buildAttempt ? positiveId(buildAttempt) : undefined,
+		smokeTarget,
 	};
 }
 
@@ -111,10 +148,29 @@ export function assertReleaseGate(env: NodeJS.ProcessEnv) {
 	if (env.PUBLISH_REQUESTED !== "true" && env.PUBLISH_REQUESTED !== "false")
 		throw new Error("Invalid publish mode");
 	const restoring = env.RESTORE_MODE === "true";
-	for (const key of ["VERIFY_RESULT", "BUILD_RESULT", "SMOKE_RESULT", "ASSEMBLE_RESULT"]) {
-		if (env[key] !== (restoring ? "skipped" : "success"))
-			throw new Error(`Unexpected ${key}: ${env[key]}`);
-	}
+	const reverify = env.BUILD_REUSE_MODE === "true";
+	const diagnostic = env.SMOKE_ONLY === "true";
+	const recoveryGate = env.BUILD_REUSE_MODE !== undefined || env.SMOKE_ONLY !== undefined;
+	for (const key of ["BUILD_REUSE_MODE", "SMOKE_ONLY"])
+		if (recoveryGate && !["true", "false"].includes(env[key] ?? ""))
+			throw new Error(`Invalid ${key}`);
+	if ((restoring && reverify) || (diagnostic && (!reverify || env.PUBLISH_REQUESTED !== "false")))
+		throw new Error("Invalid build recovery gate mode");
+	const expectedResults = {
+		VERIFY_RESULT: restoring || reverify ? "skipped" : "success",
+		BUILD_RESULT: restoring || reverify ? "skipped" : "success",
+		SMOKE_RESULT: restoring ? "skipped" : "success",
+		ASSEMBLE_RESULT: restoring || diagnostic ? "skipped" : "success",
+	};
+	for (const [key, expected] of Object.entries(expectedResults))
+		if (env[key] !== expected) throw new Error(`Unexpected ${key}: ${env[key]}`);
+	if (
+		(reverify && env.RESTORE_PLATFORMS_RESULT !== "success") ||
+		(!reverify &&
+			(recoveryGate || env.RESTORE_PLATFORMS_RESULT !== undefined) &&
+			env.RESTORE_PLATFORMS_RESULT !== "skipped")
+	)
+		throw new Error("Unexpected original platform restore result");
 	if (env.RESTORE_RESULT !== (restoring ? "success" : "skipped"))
 		throw new Error("Unexpected restore result");
 	if (env.PUBLISH_RESULT !== (env.PUBLISH_REQUESTED === "true" ? "success" : "skipped"))
@@ -268,7 +324,9 @@ export async function runCiRelease(argv: string[]) {
 		if (command === "gate") {
 			assertReleaseGate(process.env);
 			await summary(
-				"Release gate passed; build-only runs have not published a Release or update index.",
+				process.env.SMOKE_ONLY === "true"
+					? "Single-platform diagnostic passed; no release bundle or publication qualification was created."
+					: "Release gate passed; build-only runs have not published a Release or update index.",
 			);
 			return;
 		}
@@ -286,16 +344,28 @@ export async function runCiRelease(argv: string[]) {
 				bridgeRunId: values["bridge-run-id"],
 			});
 			if (values["bridge-run-attempt"]) positiveId(values["bridge-run-attempt"]);
+			const recovery = validateBuildRecoveryArgs(values);
 			const sourceRunId = values["source-run-id"] ? positiveId(values["source-run-id"]) : undefined;
-			const plan = await createCiReleasePlan({
-				root,
-				tag: required(values, "tag"),
-				publish: publish === "true",
-				sourceRunId,
-				indexOnly: indexOnly === "true",
-			});
-			if (!sourceRunId && indexOnly === "false")
-				plan.baselines = await selectGitHubBaselines(plan, { signal: signal });
+			const tag = required(values, "tag");
+			const plan = recovery.buildRunId
+				? await prepareCiReleaseBuild({
+						root,
+						tag,
+						publish: publish === "true",
+						sourceRunId: recovery.buildRunId,
+						sourceRunAttempt: recovery.buildRunAttempt as number,
+						target: recovery.smokeTarget,
+						signal,
+					})
+				: await createCiReleasePlan({
+						root,
+						tag,
+						publish: publish === "true",
+						sourceRunId,
+						indexOnly: indexOnly === "true",
+					});
+			if (!recovery.buildRunId && !sourceRunId && indexOnly === "false")
+				plan.baselines = await selectGitHubBaselines(plan, { signal });
 			validateCiReleasePlan(plan);
 			const path = resolve(required(values, "plan"));
 			await mkdir(dirname(path), { recursive: true });
@@ -308,6 +378,8 @@ export async function runCiRelease(argv: string[]) {
 				matrix: JSON.stringify(releaseMatrix(plan)),
 				"index-only": indexOnly,
 				"restore-mode": String(!!sourceRunId || indexOnly === "true"),
+				"build-reuse-mode": String(!!plan.buildSource),
+				"smoke-only": String(!!recovery.smokeTarget),
 				"source-run-id": sourceRunId
 					? String(sourceRunId)
 					: indexOnly === "true"
@@ -319,8 +391,22 @@ export async function runCiRelease(argv: string[]) {
 			);
 			return;
 		}
+		if (command === "restore-platform") {
+			const plan = await readPlan(required(values, "plan"));
+			await restoreCiReleaseBuildPlatform({
+				plan,
+				target: required(values, "target"),
+				root,
+				destination: resolve(required(values, "platform-dir")),
+				signal,
+			});
+			await summary(`Restored byte-identical original platform for ${plan.tag}; no product build.`);
+			return;
+		}
 		if (command === "assemble") {
 			const plan = await readPlan(required(values, "plan"));
+			if (plan.buildSource && plan.buildSource.platforms.length !== CI_RELEASE_TARGETS.length)
+				throw new Error("Single-platform diagnostics cannot assemble a release bundle");
 			const platformsDir = resolve(required(values, "platforms-dir"));
 			const smokeDir = resolve(required(values, "smoke-dir"));
 			const bundleDir = resolve(required(values, "bundle-dir"));

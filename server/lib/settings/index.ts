@@ -477,26 +477,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// Clean up agent fields that reference models from providers no longer in settings
-	const activePrefixes = new Set<string>();
-	for (const prov of merged.openaiProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.anthropicProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.nugProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.geminiProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const b of ["codex"]) activePrefixes.add(b);
-	if (merged.tokendance?.apiKey) activePrefixes.add("tokendance");
-
-	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
-		needsSave = true;
-	}
+	// Loading settings must not destructively purge model references. Custom API
+	// providers, aggregations and plugin providers are not all represented by the
+	// legacy provider arrays (plugins may not even be registered yet at startup).
+	// Explicit provider removal cleans up references in the settings PATCH route.
 
 	if (migrateGlobalProxy(merged, raw)) {
 		needsSave = true;
