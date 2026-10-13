@@ -47,6 +47,15 @@ const MAX_SPAWN_FAILURES = 2;
 
 const REAPER_TIMER_KEY = "narrafork.dbWorkerPool.reaper";
 
+/** Only pool-owned queue/execution watchdogs use this code; native failures remain unclassified. */
+export class DbReadTaskTimeoutError extends Error {
+	readonly code = "DB_READ_TASK_TIMEOUT";
+	constructor(message: string) {
+		super(message);
+		this.name = "DbReadTaskTimeoutError";
+	}
+}
+
 export interface RunReadTaskOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
@@ -539,7 +548,11 @@ function waitForCapacity(deadlineAt: number, signal: AbortSignal | undefined): P
 		const timer = setTimeout(() => {
 			dequeue();
 			finish();
-			reject(new Error(`database read task timed out after ${remaining}ms waiting for a worker`));
+			reject(
+				new DbReadTaskTimeoutError(
+					`database read task timed out after ${remaining}ms waiting for a worker`,
+				),
+			);
 		}, remaining);
 
 		const onAbort = () => {
@@ -648,7 +661,7 @@ async function dispatch(
 		};
 		const timer = setTimeout(() => {
 			requestCancellation(
-				new Error(`database read task timed out after ${remaining}ms`),
+				new DbReadTaskTimeoutError(`database read task timed out after ${remaining}ms`),
 				"task timeout",
 			);
 		}, remaining);

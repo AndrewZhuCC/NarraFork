@@ -11,6 +11,7 @@ import {
 	readDisplayFixtureMessages,
 	readNarratorDisplayMessages,
 } from "../../../services/narrator-display-page-reader";
+import { AppError } from "../../errors";
 import {
 	DISPLAY_PAGE_LIMITS,
 	type DisplayPageMessagesParams,
@@ -28,6 +29,7 @@ import {
 	runReadTask,
 	shutdownDbWorkerPool,
 } from "../pool";
+import type { DbWorkerInbound, DbWorkerOutbound } from "../protocol";
 
 const NUMERIC_MESSAGE_FIELDS = new Set(
 	`bodyRevision tokensIn costUsd outputTokens cachedInputTokens
@@ -186,6 +188,301 @@ const request = (ids = ["message-1"]): DisplayPageMessagesParams => ({
 	messageIds: ids,
 	ioBudget: 8192,
 	deadlineAt: Date.now() + 10_000,
+});
+
+function boundedDisplayResult(): DisplayPageMessagesResult {
+	const messages = [
+		{
+			id: "message-1",
+			narratorId: "owner",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [],
+			createdAt: "now",
+			toolCalls: [],
+			creator: null,
+		},
+	];
+	return { messages, rawBytes: 0, outputBytes: Buffer.byteLength(JSON.stringify(messages)) };
+}
+
+/** Deterministic scheduling only; never evaluates worker SQL or weakens the real cancellation tests. */
+function controlledDisplaySettlement() {
+	const originalNow = Date.now;
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const OriginalWorker = globalThis.Worker;
+	let now = 10_000;
+	type ManualTimer = { callback: () => void; delay: number; cleared: boolean };
+	const timers: ManualTimer[] = [];
+	let resolveTask: (worker: ControlledWorker) => void = () => {};
+	const task = new Promise<ControlledWorker>((resolve) => {
+		resolveTask = resolve;
+	});
+	class ControlledWorker extends EventTarget {
+		onmessage: ((event: MessageEvent<DbWorkerOutbound>) => unknown) | null = null;
+		onerror: ((event: ErrorEvent) => unknown) | null = null;
+		requestId = "";
+		terminated = false;
+		constructor() {
+			super();
+			queueMicrotask(() => this.emit({ type: "ready" }));
+		}
+		emit(data: DbWorkerOutbound): void {
+			const event = new MessageEvent("message", { data });
+			this.dispatchEvent(event);
+			this.onmessage?.(event);
+		}
+		postMessage(message: DbWorkerInbound): void {
+			if (message.type === "task") {
+				this.requestId = message.requestId;
+				resolveTask(this);
+			}
+		}
+		terminate(): void {
+			this.terminated = true;
+		}
+	}
+	Date.now = () => now;
+	globalThis.setTimeout = ((
+		callback: (...args: unknown[]) => void,
+		delay = 0,
+		...args: unknown[]
+	) => {
+		const timer: ManualTimer = { callback: () => callback(...args), delay, cleared: false };
+		timers.push(timer);
+		return timer as unknown as ReturnType<typeof setTimeout>;
+	}) as typeof setTimeout;
+	globalThis.clearTimeout = ((handle: ReturnType<typeof setTimeout> | number | undefined) => {
+		const timer = timers.find((entry) => entry === (handle as unknown));
+		if (timer) timer.cleared = true;
+		else originalClearTimeout(handle);
+	}) as typeof clearTimeout;
+	globalThis.Worker = ControlledWorker as unknown as typeof Worker;
+	return {
+		task,
+		advance: (milliseconds: number) => {
+			now += milliseconds;
+		},
+		activeTimers: () => timers.filter((timer) => !timer.cleared),
+		fire: (timer: ManualTimer) => {
+			if (timer.cleared) throw new Error("Controlled deadline timer already cleared");
+			timer.cleared = true;
+			timer.callback();
+		},
+		restore: () => {
+			// Pool-owned fake handles must be cleared while our clearTimeout still knows them.
+			shutdownDbWorkerPool();
+			Date.now = originalNow;
+			globalThis.setTimeout = originalSetTimeout;
+			globalThis.clearTimeout = originalClearTimeout;
+			globalThis.Worker = OriginalWorker;
+		},
+	};
+}
+
+function deferredDisplayPort() {
+	let resolveResult: (result: DisplayPageMessagesResult) => void = () => {};
+	let rejectResult: (error: unknown) => void = () => {};
+	let captureSignal: (signal: AbortSignal) => void = () => {};
+	const requested = new Promise<AbortSignal>((resolve) => {
+		captureSignal = resolve;
+	});
+	const result = new Promise<DisplayPageMessagesResult>((resolve, reject) => {
+		resolveResult = resolve;
+		rejectResult = reject;
+	});
+	const port: NarratorDisplayPagePort = {
+		execution: "off-main",
+		readMessages: (_request, { signal }) => {
+			captureSignal(signal);
+			return result;
+		},
+	};
+	return { port, requested, resolve: resolveResult, reject: rejectResult };
+}
+
+// Fixed callback/clock order proves the contract independently of native timer scheduling load.
+test("display settlement maps the pool watchdog winning before the outer timer to a deadline", async () => {
+	const clock = controlledDisplaySettlement();
+	try {
+		const failure = failureOf(read(["message-1"], 8192, { timeoutMs: 50 }));
+		const worker = await clock.task;
+		const deadlines = clock.activeTimers().filter((timer) => timer.delay === 50);
+		expect(deadlines).toHaveLength(2); // public timer registered first, pool watchdog second.
+		clock.advance(50);
+		clock.fire(deadlines[1]);
+		expect(await failure).toMatchObject({ statusCode: 504, code: "DISPLAY_PAGE_DEADLINE" });
+		expect(worker.terminated).toBe(true);
+		expect(getDbWorkerPoolStats().busy).toBe(0);
+		expect(getDbWorkerPoolStats().queued).toBe(0);
+		expect(clock.activeTimers()).toHaveLength(0);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("display settlement rejects late success even when the public timer callback has not run", async () => {
+	const clock = controlledDisplaySettlement();
+	const deferred = deferredDisplayPort();
+	try {
+		const failure = failureOf(
+			readNarratorDisplayMessages({ backend: "postgres", port: deferred.port }, ["message-1"], {
+				ioBudget: 32,
+				timeoutMs: 50,
+			}),
+		);
+		const signal = await deferred.requested;
+		clock.advance(51);
+		deferred.resolve(boundedDisplayResult());
+		expect(await failure).toMatchObject({ statusCode: 504, code: "DISPLAY_PAGE_DEADLINE" });
+		expect(signal.aborted).toBe(true);
+		expect(signal.reason).toMatchObject({ statusCode: 504, code: "DISPLAY_PAGE_DEADLINE" });
+		expect(clock.activeTimers()).toHaveLength(0);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("display settlement accepts success before the absolute cutoff and removes its timer", async () => {
+	const clock = controlledDisplaySettlement();
+	const deferred = deferredDisplayPort();
+	try {
+		const response = readNarratorDisplayMessages(
+			{ backend: "postgres", port: deferred.port },
+			["message-1"],
+			{ ioBudget: 32, timeoutMs: 50 },
+		);
+		const signal = await deferred.requested;
+		clock.advance(49);
+		const result = boundedDisplayResult();
+		deferred.resolve(result);
+		expect(await response).toEqual(result.messages);
+		expect(signal.aborted).toBe(false);
+		expect(clock.activeTimers()).toHaveLength(0);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("display settlement rechecks the deadline after result validation crosses the cutoff", async () => {
+	const clock = controlledDisplaySettlement();
+	const deferred = deferredDisplayPort();
+	try {
+		const failure = failureOf(
+			readNarratorDisplayMessages({ backend: "postgres", port: deferred.port }, ["message-1"], {
+				ioBudget: 32,
+				timeoutMs: 50,
+			}),
+		);
+		const signal = await deferred.requested;
+		const result = boundedDisplayResult();
+		const messages = result.messages;
+		let first = true;
+		Object.defineProperty(result, "messages", {
+			get: () => {
+				if (first) {
+					first = false;
+					clock.advance(51);
+				}
+				return messages;
+			},
+		});
+		deferred.resolve(result);
+		expect(await failure).toMatchObject({ statusCode: 504, code: "DISPLAY_PAGE_DEADLINE" });
+		expect(signal.aborted).toBe(true);
+		expect(clock.activeTimers()).toHaveLength(0);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("display settlement preserves a cancellation that happened before the late result or deadline callback", async () => {
+	const clock = controlledDisplaySettlement();
+	const deferred = deferredDisplayPort();
+	const controller = new AbortController();
+	try {
+		const failure = failureOf(
+			readNarratorDisplayMessages({ backend: "postgres", port: deferred.port }, ["message-1"], {
+				ioBudget: 32,
+				timeoutMs: 50,
+				signal: controller.signal,
+			}),
+		);
+		const signal = await deferred.requested;
+		const deadline = clock.activeTimers()[0];
+		controller.abort();
+		clock.advance(51);
+		clock.fire(deadline);
+		deferred.resolve(boundedDisplayResult());
+		expect(await failure).toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
+		expect(signal.reason).toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
+		expect(clock.activeTimers()).toHaveLength(0);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("display settlement keeps real early and late failure codes instead of clock-normalizing unrelated errors", async () => {
+	const cases = [
+		{
+			error: Object.assign(new Error("pool watchdog PRIVATE_DRIVER_SENTINEL"), {
+				code: "DB_READ_TASK_TIMEOUT",
+			}),
+			statusCode: 504,
+			code: "DISPLAY_PAGE_DEADLINE",
+		},
+		{
+			error: new Error("native failure PRIVATE_DRIVER_SENTINEL"),
+			statusCode: 503,
+			code: "DISPLAY_PAGE_READER_UNAVAILABLE",
+		},
+		{
+			error: Object.assign(new Error("refs changed"), { code: "DISPLAY_PAGE_REFERENCES_CHANGED" }),
+			statusCode: 409,
+			code: "DISPLAY_PAGE_REFERENCES_CHANGED",
+		},
+		{
+			error: Object.assign(new Error("byte budget"), { code: "DISPLAY_PAGE_BUDGET_EXCEEDED" }),
+			statusCode: 413,
+			code: "DISPLAY_PAGE_BUDGET_EXCEEDED",
+		},
+		{
+			error: Object.assign(new Error("invalid JSON"), { code: "DISPLAY_PAGE_INVALID_JSON" }),
+			statusCode: 500,
+			code: "DISPLAY_PAGE_INVALID_JSON",
+		},
+		{
+			error: Object.assign(new Error("invalid input"), { code: "DISPLAY_PAGE_INVALID_INPUT" }),
+			statusCode: 400,
+			code: "DISPLAY_PAGE_INVALID_INPUT",
+		},
+		{ error: new AppError("auth denied", 403, "FORBIDDEN"), statusCode: 403, code: "FORBIDDEN" },
+	];
+	for (const elapsed of [10, 51]) {
+		for (const entry of cases) {
+			const clock = controlledDisplaySettlement();
+			const deferred = deferredDisplayPort();
+			try {
+				const failure = failureOf(
+					readNarratorDisplayMessages({ backend: "postgres", port: deferred.port }, ["message-1"], {
+						ioBudget: 32,
+						timeoutMs: 50,
+					}),
+				);
+				await deferred.requested;
+				clock.advance(elapsed);
+				deferred.reject(entry.error);
+				const actual = await failure;
+				expect(actual).toMatchObject({ statusCode: entry.statusCode, code: entry.code });
+				expect((actual as Error).message).not.toContain("PRIVATE_DRIVER_SENTINEL");
+				if (entry.error instanceof AppError) expect(actual).toBe(entry.error);
+				expect(clock.activeTimers()).toHaveLength(0);
+			} finally {
+				clock.restore();
+			}
+		}
+	}
 });
 
 describe("real readonly display page worker", () => {

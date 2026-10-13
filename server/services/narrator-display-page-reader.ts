@@ -164,6 +164,12 @@ function mapReadError(error: unknown): Error {
 	const code = error && typeof error === "object" && "code" in error ? error.code : null;
 	const message = error instanceof Error ? error.message : "History display read failed";
 	switch (code) {
+		case "DB_READ_TASK_TIMEOUT":
+			return new AppError(
+				"History display read exceeded its total deadline",
+				504,
+				"DISPLAY_PAGE_DEADLINE",
+			);
 		case "DISPLAY_PAGE_BUDGET_EXCEEDED":
 			return new AppError(message, 413, code);
 		case "DISPLAY_PAGE_REFERENCES_CHANGED":
@@ -222,17 +228,23 @@ export async function readNarratorDisplayMessages(
 			new AppError("History display read was cancelled", 499, "DISPLAY_PAGE_CANCELLED"),
 		);
 	options.signal?.addEventListener("abort", onAbort, { once: true });
-	const timer = setTimeout(
-		() =>
-			controller.abort(
-				new AppError(
-					"History display read exceeded its total deadline",
-					504,
-					"DISPLAY_PAGE_DEADLINE",
-				),
+	const abortDeadline = () =>
+		controller.abort(
+			new AppError(
+				"History display read exceeded its total deadline",
+				504,
+				"DISPLAY_PAGE_DEADLINE",
 			),
-		request.deadlineAt - Date.now(),
-	);
+		);
+	const assertSuccessfulSettlement = () => {
+		// AbortController keeps the FIRST reason: an earlier explicit cancel stays 499.
+		controller.signal.throwIfAborted();
+		if (Date.now() >= request.deadlineAt) {
+			abortDeadline();
+			controller.signal.throwIfAborted();
+		}
+	};
+	const timer = setTimeout(abortDeadline, request.deadlineAt - Date.now());
 	const cancelled = new Promise<never>((_resolve, reject) => {
 		controller.signal.addEventListener("abort", () => reject(controller.signal.reason), {
 			once: true,
@@ -260,12 +272,16 @@ export async function readNarratorDisplayMessages(
 				const { runDisplayPageQuery } = await import("../lib/db-worker/display-page-query");
 				result = runDisplayPageQuery(source.sqlite, request, DISPLAY_FIXTURE_LIMITS);
 			}
+			assertSuccessfulSettlement();
 			validatePortResult(result, request);
 			rawBytes = result.rawBytes;
 			outputBytes = result.outputBytes;
 			return result.messages;
 		});
-		return await Promise.race([execution, cancelled]);
+		const messages = await Promise.race([execution, cancelled]);
+		// Timer callbacks can be delayed; successful delivery still obeys the absolute cutoff.
+		assertSuccessfulSettlement();
+		return messages;
 	} catch (error) {
 		throw mapReadError(controller.signal.aborted ? controller.signal.reason : error);
 	} finally {
