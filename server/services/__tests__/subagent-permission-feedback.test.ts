@@ -51,9 +51,10 @@ const stubAdapter = {
 
 const TEST_PROVIDER = "subagentfeedbackstub";
 const TEST_MODEL = `${TEST_PROVIDER}:stub`;
-const unregisterStubProvider = registerExternalProviderResolver((requestedProvider) =>
-	requestedProvider === TEST_PROVIDER ? stubAdapter : null,
-);
+const unregisterStubProvider = registerExternalProviderResolver({
+	resolve: (requestedProvider) => (requestedProvider === TEST_PROVIDER ? stubAdapter : null),
+	listReadiness: () => [],
+});
 
 const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };

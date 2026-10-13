@@ -53,6 +53,7 @@ import { askUserQuestionTool } from "../tools/ask-user-question";
 import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import { EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME } from "../tools/exit-plan-reflection";
+import { knowledgeCreateTool } from "../tools/knowledge-edit";
 import {
 	type AgentConfig,
 	type AgentToolUse,
@@ -136,6 +137,43 @@ function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void
 		return input as never;
 	}) as typeof toolContinuationService.upsert;
 }
+
+describe("knowledge tool internal permission feedback", () => {
+	test("preserves the internal denial after outer approval and keeps both approval inputs intact", async () => {
+		const previous = toolRegistry.get("KnowledgeCreate");
+		toolRegistry.register(knowledgeCreateTool);
+		const input = {
+			title: "Knowledge approval regression",
+			collectionId: "test-collection",
+			content: "The complete proposed body",
+			keywords: ["permission-regression"],
+			tags: ["docs"],
+			direct: true,
+		};
+		const reason = "Danger reflection rejected this body; revise it before publishing.";
+		const calls: Array<{ toolName: string; input: Record<string, unknown>; toolUseId: string }> =
+			[];
+		const config = makeConfig(async (toolName, approvalInput, toolUseId) => {
+			calls.push({ toolName, input: approvalInput, toolUseId });
+			return calls.length === 1 ? { behavior: "allow" } : { behavior: "deny", message: reason };
+		});
+		try {
+			const result = await executeTool(
+				{ toolUseId: "knowledge-denial", name: "KnowledgeCreate", input },
+				config,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toBe(reason);
+			expect(calls).toEqual([
+				{ toolName: "KnowledgeCreate", input, toolUseId: "knowledge-denial" },
+				{ toolName: "KnowledgeCreate", input, toolUseId: "knowledge-denial" },
+			]);
+		} finally {
+			if (previous) toolRegistry.register(previous);
+			else toolRegistry.unregister("KnowledgeCreate");
+		}
+	});
+});
 
 describe("reflection tool early rejection", () => {
 	for (const locale of ["en", "zh-CN"] as const) {

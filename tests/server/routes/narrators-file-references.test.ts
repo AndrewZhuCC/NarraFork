@@ -223,6 +223,7 @@ function fixture(
 	const bindings = {
 		narratorRoutes: routes,
 		fileReferenceRoutes: child,
+		requestRecordingRoutes: new Hono(),
 		requireNarratorAccess: acl,
 		ValidationError,
 		NotFoundError,

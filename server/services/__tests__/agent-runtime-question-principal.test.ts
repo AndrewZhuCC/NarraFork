@@ -44,9 +44,10 @@ const adapter = {
 	pushAssistantTurn: () => {},
 	generate: async () => "",
 } as unknown as ProviderAdapter;
-const unregister = provider.registerExternalProviderResolver((name) =>
-	name === "questionprincipal" ? adapter : null,
-);
+const unregister = provider.registerExternalProviderResolver({
+	resolve: (name) => (name === "questionprincipal" ? adapter : null),
+	listReadiness: () => [],
+});
 const PARENT = "principal-parent";
 const CHILD = "principal-child";
 const A = "question-owner-A";

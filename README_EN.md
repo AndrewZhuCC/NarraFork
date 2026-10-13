@@ -174,7 +174,11 @@ Issues with bug reports, reproduction steps, and user feedback are welcome, as a
 - When fixing a bug, provide reproduction steps and relevant tests whenever possible.
 - When changing UI text, update both the English and Simplified Chinese translations.
 - Remove API keys, access tokens, and other sensitive information before submitting logs, screenshots, or reproduction materials.
-- Before a contribution can be merged, complete the signing and confirmation process in the [Contributor License Agreement (CLA)](CLA.md). Please read the full agreement first.
+- Contributions must be covered by a signed [Contributor License Agreement (CLA)](CLA.md#english-reference) before merging. The CLA authorizes future relicensing under permissive open-source licenses; the Chinese text prevails if the versions differ.
+
+Signing uses CLA Assistant and your GitHub account by default; no legal name is required. The flow is: open a PR → follow the bot prompt → sign in and accept → the PR's CLA status updates. While the agreement version is unchanged, later contributions rely on your existing signature. Corporate authorization, third-party materials, and historical contributions follow the agreement.
+
+**CLA Assistant is pending configuration.** Signing opens after the agreement is linked and tested; mandatory merge checks are configured separately.
 
 ## Documentation
 
