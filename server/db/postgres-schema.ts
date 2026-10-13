@@ -777,11 +777,11 @@ export const narratorMessages = pgTable(
 		treeHashAfter: text("tree_hash_after"),
 		snapshotCommitSha: text("snapshot_commit_sha"),
 		commandText: text("command_text"),
-		createdBy: text("created_by").references((): PgColumn => users.id, { onDelete: "set null" }),
+		createdBy: text("created_by").references((): PgColumn => users.id, {}),
 		origin: text("origin"),
 		originLabel: text("origin_label"),
 		editedAt: text("edited_at"),
-		editedBy: text("edited_by").references((): PgColumn => users.id, { onDelete: "set null" }),
+		editedBy: text("edited_by").references((): PgColumn => users.id, {}),
 		originalContentJson: jsonText("original_content_json"),
 		compactPending: integer("compact_pending").generatedAlwaysAs(
 			sql.raw(
@@ -1221,7 +1221,7 @@ export const userPluginThemes = pgTable(
 		id: text("id").primaryKey().notNull(),
 		userId: text("user_id")
 			.notNull()
-			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+			.references((): PgColumn => users.id, {}),
 		pluginId: text("plugin_id").notNull(),
 		themeId: text("theme_id").notNull(),
 		enabled: boolean("enabled").notNull().default(true),
@@ -8494,7 +8494,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "references": {
             "table": "users",
             "column": "id",
-            "onDelete": "set null",
             "constraintName": "narrator_messages_created_by_users_id_fk"
           },
           "emitAsTableConstraint": false
@@ -8537,7 +8536,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "references": {
             "table": "users",
             "column": "id",
-            "onDelete": "set null",
             "constraintName": "narrator_messages_edited_by_users_id_fk"
           },
           "emitAsTableConstraint": false
@@ -11254,7 +11252,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "references": {
             "table": "users",
             "column": "id",
-            "onDelete": "cascade",
             "constraintName": "user_plugin_themes_user_id_users_id_fk"
           },
           "emitAsTableConstraint": false
