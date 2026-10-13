@@ -1128,11 +1128,19 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 if (supportsStableUpdateSignal()) {
 	process.on("SIGUSR2", () => {
 		void import("./services/update-service")
-			.then(({ applyUpdate }) => applyUpdate())
+			.then(async ({ getUpdateStatus, applyUpdate }) => {
+				const status = await getUpdateStatus();
+				return applyUpdate({
+					targetVersion: status.version,
+					preparedId: status.preparedIdentity?.id,
+				});
+			})
 			.then((result) => {
 				logger.info("Stable update signal handled", {
 					success: result.success,
 					phase: result.phase,
+					code: result.code,
+					error: result.error,
 				});
 			})
 			.catch((error) => {

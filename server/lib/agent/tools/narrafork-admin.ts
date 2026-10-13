@@ -173,6 +173,7 @@ export const narraforkAdminTool: ToolDefinition = {
 		"update_settings (partial merge, requires approval), " +
 		"reset_setting (revert to default, requires approval), " +
 		"get_update_status (read-only), apply_update and cancel_update (require approval). " +
+		"For apply_update, first read get_update_status and pass its preparedIdentity.id as preparedId. " +
 		"Update actions only delegate to the existing update service: apply waits for background Bash, " +
 		"ordinary tool safety points, and the recovery checkpoint, may interrupt this connection, must not " +
 		"be retried in a loop, and creates no launchd jobs. No JWT, browser token, or password is needed.",
@@ -208,9 +209,14 @@ export const narraforkAdminTool: ToolDefinition = {
 			.min(1)
 			.optional()
 			.describe("Optional prepared version selector for get_update_status and apply_update."),
+		preparedId: z
+			.string()
+			.regex(/^[a-f0-9]{64}$/)
+			.optional()
+			.describe("Required for apply_update: preparedIdentity.id returned by get_update_status."),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { action, path, value, targetVersion } = args as {
+		const { action, path, value, targetVersion, preparedId } = args as {
 			action:
 				| "get_settings"
 				| "get_setting"
@@ -222,6 +228,7 @@ export const narraforkAdminTool: ToolDefinition = {
 			path?: string;
 			value?: Record<string, unknown>;
 			targetVersion?: string;
+			preparedId?: string;
 		};
 
 		if (action === "get_update_status" || action === "apply_update" || action === "cancel_update") {
@@ -233,10 +240,18 @@ export const narraforkAdminTool: ToolDefinition = {
 				};
 			}
 
+			if (action === "apply_update" && !preparedId) {
+				return {
+					output: "Read get_update_status and pass its preparedIdentity.id as preparedId.",
+					isError: true,
+				};
+			}
+
 			if (action !== "get_update_status") {
 				const permissionError = await requestWritePermission(ctx, "NarraForkAdmin", {
 					action,
 					...(targetVersion ? { targetVersion } : {}),
+					...(preparedId ? { preparedId } : {}),
 				});
 				if (permissionError) return { output: permissionError, isError: true };
 			}
@@ -251,7 +266,7 @@ export const narraforkAdminTool: ToolDefinition = {
 					};
 				}
 				if (action === "apply_update") {
-					const result = await updateService.applyUpdate({ targetVersion });
+					const result = await updateService.applyUpdate({ targetVersion, preparedId });
 					return {
 						output: JSON.stringify(result, null, 2),
 						title: result.success ? "Update scheduled" : "Update scheduling failed",

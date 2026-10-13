@@ -1,18 +1,22 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import type { PermissionResult, ToolContext } from "../../types";
 
 let adminAllowed = true;
 let permission: PermissionResult = { behavior: "allow" };
 
+const preparedId = "a".repeat(64);
 const getUpdateStatus = mock(async (targetVersion?: string) => ({
 	ready: true,
 	canAutoRestart: true,
 	version: targetVersion ?? "1.4.2",
 	phase: "idle" as const,
+	preparedIdentity: { id: preparedId },
 }));
 const applyUpdate = mock(
 	async (options: {
 		targetVersion?: string;
+		preparedId?: string;
 	}): Promise<{
 		success: boolean;
 		scheduled?: boolean;
@@ -89,7 +93,7 @@ describe("NarraForkAdmin update actions", () => {
 	test("does not schedule an update without approval", async () => {
 		permission = { behavior: "deny", message: "Not approved" };
 		const result = await narraforkAdminTool.execute(
-			{ action: "apply_update", targetVersion: "1.4.2" },
+			{ action: "apply_update", targetVersion: "1.4.2", preparedId },
 			context(),
 		);
 
@@ -97,15 +101,26 @@ describe("NarraForkAdmin update actions", () => {
 		expect(applyUpdate).not.toHaveBeenCalled();
 	});
 
-	test("schedules an approved update exactly once", async () => {
-		const result = await narraforkAdminTool.execute(
-			{ action: "apply_update", targetVersion: "1.4.2" },
-			context(),
-		);
+	test("schedules the approved prepared identity exactly once", async () => {
+		const ctx = context();
+		const status = await narraforkAdminTool.execute({ action: "get_update_status" }, ctx);
+		const selected = JSON.parse(status.output).preparedIdentity.id;
+		const args = narraforkAdminTool.parameters.parse({
+			action: "apply_update",
+			targetVersion: "1.4.2",
+			preparedId: selected,
+		});
+		expect(args).toMatchObject({ preparedId });
+		const result = await narraforkAdminTool.execute(args as Record<string, unknown>, ctx);
 
 		expect(result.isError).toBeFalsy();
 		expect(applyUpdate).toHaveBeenCalledTimes(1);
-		expect(applyUpdate).toHaveBeenCalledWith({ targetVersion: "1.4.2" });
+		expect(applyUpdate).toHaveBeenCalledWith({ targetVersion: "1.4.2", preparedId });
+		expect(ctx.requestPermission).toHaveBeenCalledWith(
+			"NarraForkAdmin",
+			{ action: "apply_update", targetVersion: "1.4.2", preparedId },
+			"tool-use-1",
+		);
 	});
 
 	test("reports update-service scheduling failures", async () => {
@@ -114,7 +129,10 @@ describe("NarraForkAdmin update actions", () => {
 			error: "No verified prepared update file found",
 		}));
 
-		const result = await narraforkAdminTool.execute({ action: "apply_update" }, context());
+		const result = await narraforkAdminTool.execute(
+			{ action: "apply_update", preparedId },
+			context(),
+		);
 
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("No verified prepared update file found");
@@ -130,6 +148,7 @@ describe("NarraForkAdmin update actions", () => {
 
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain('"version": "1.4.2"');
+		expect(result.output).toContain(preparedId);
 		expect(ctx.requestPermission).not.toHaveBeenCalled();
 		expect(getUpdateStatus).toHaveBeenCalledWith("1.4.2");
 	});
@@ -140,5 +159,34 @@ describe("NarraForkAdmin update actions", () => {
 		expect(result.isError).toBeFalsy();
 		expect(cancelPreparedUpdate).toHaveBeenCalledTimes(1);
 		expect(cancelPreparedUpdate).toHaveBeenCalledWith("Cancelled by NarraForkAdmin");
+	});
+
+	test("missing identity fails before approval or scheduling", async () => {
+		const ctx = context();
+		const result = await narraforkAdminTool.execute({ action: "apply_update" }, ctx);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("preparedIdentity.id");
+		expect(ctx.requestPermission).not.toHaveBeenCalled();
+		expect(applyUpdate).not.toHaveBeenCalled();
+	});
+
+	test("the tool schema rejects malformed prepared identities", () => {
+		for (const id of ["", "0.9.1", "g".repeat(64), "a".repeat(63)]) {
+			expect(
+				narraforkAdminTool.parameters.safeParse({ action: "apply_update", preparedId: id }).success,
+			).toBe(false);
+		}
+	});
+
+	test("SIGUSR2 entry point reads and forwards the verified prepared identity", () => {
+		// Main starts the server; check its registration without starting another instance.
+		const main = readFileSync(new URL("../../../../main.ts", import.meta.url), "utf8");
+		const start = main.indexOf('process.on("SIGUSR2"');
+		expect(start).toBeGreaterThan(0);
+		const signal = main.slice(start, main.indexOf("\nfunction startServerWithHostFallback", start));
+		expect(signal).toContain("const status = await getUpdateStatus()");
+		expect(signal).toContain("preparedId: status.preparedIdentity?.id");
+		expect(signal).toContain("targetVersion: status.version");
+		expect(signal).not.toMatch(/applyUpdate\(\s*\)/);
 	});
 });
