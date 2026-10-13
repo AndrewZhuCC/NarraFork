@@ -72,7 +72,9 @@ mock.module("../narrator-service", () => ({
 	},
 }));
 
+const { knowledgeCreateTool } = await import("../../lib/agent/tools/knowledge-edit");
 const {
+	cancelDangerReflection,
 	classifyDanger,
 	confirmDangerReflection,
 	createDangerFingerprint,
@@ -370,6 +372,93 @@ describe("confirmDangerReflection ordering", () => {
 		expect(row?.status).toBe("running");
 		expect((row?.permissionSuggestions as Array<{ status?: string }>)[0]?.status).toBe("confirmed");
 	});
+});
+
+describe("KnowledgeCreate approval payload identity", () => {
+	for (const scenario of ["full", "minimal", "changed-content"] as const) {
+		test(`${scenario}: internal approval respects the confirmed payload fingerprint`, async () => {
+			const id = `knowledge-payload-${scenario}`;
+			const callId = `${id}-call`;
+			const useId = `${id}-use`;
+			const input =
+				scenario === "minimal"
+					? { title: "Personal note", content: "approved body" }
+					: {
+							title: "Global note",
+							content: "approved body",
+							collectionId: "knowledge-collection",
+							direct: true,
+							fallbackToPersonal: false,
+							tags: ["docs"],
+							keywords: ["approval-payload"],
+							changeNote: "Initial entry",
+						};
+			await seedPermissionRequest({
+				narratorId: id,
+				messageId: `${id}-message`,
+				toolCallId: callId,
+				toolUseId: useId,
+				toolName: "KnowledgeCreate",
+				input,
+				permissionMode: "bypassPermissions",
+			});
+			await db
+				.update(narrators)
+				.set({ dangerReflectionOverride: "standard" })
+				.where(eq(narrators.id, id));
+			const signal = new AbortController().signal;
+			const outer = await handlePermission(
+				id,
+				signal,
+				"KnowledgeCreate",
+				input,
+				useId,
+				"/workspace",
+				"en",
+			);
+			expect(outer.behavior).toBe("dangerReflection");
+			if (outer.behavior !== "dangerReflection") throw new Error("Expected outer reflection");
+			expect(await confirmDangerReflection(callId, "Verified the complete payload")).toBe(true);
+			expect((await outer.decision).behavior).toBe("allow");
+
+			const actualInput =
+				scenario === "changed-content" ? { ...input, content: "unapproved body" } : input;
+			let internalBehavior: PermissionResult["behavior"] | undefined;
+			const reason = "Stop after approval inspection without creating knowledge.";
+			const result = await knowledgeCreateTool.execute(actualInput, {
+				narratorId: id,
+				cwd: "/workspace",
+				signal,
+				locale: "en",
+				currentToolUseId: useId,
+				requestPermission: async (toolName, approvalInput, approvalUseId) => {
+					const decision = await handlePermission(
+						id,
+						signal,
+						toolName,
+						approvalInput,
+						approvalUseId,
+						"/workspace",
+						"en",
+					);
+					internalBehavior = decision.behavior;
+					if (decision.behavior === "dangerReflection") {
+						await cancelDangerReflection(decision.requestId, reason);
+						return decision.decision;
+					}
+					// This test probes the real gate, not knowledge persistence.
+					return { behavior: "deny", message: reason };
+				},
+			});
+			expect(internalBehavior).toBe(scenario === "changed-content" ? "dangerReflection" : "allow");
+			expect(result.isError).toBe(true);
+			expect(result.output).toBe(reason);
+			expect(
+				(await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, callId) }))
+					?.inputJson,
+			).toEqual(actualInput);
+		});
+	}
 });
 
 describe("working-directory switch danger reflection", () => {
