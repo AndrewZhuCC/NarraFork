@@ -56,9 +56,9 @@ describe("nf-openui builtin skill routine", () => {
 		expect(getGlobalRoutineStatuses().find((entry) => entry.id === ROUTINE_ID)?.enabled).toBe(true);
 		const skill = openuiSkill();
 		expect(skill.name).toBe(ROUTINE_ID);
-		expect(skill.descriptionEn).toContain("visualize data, compare options");
+		expect(skill.descriptionEn).toContain("Prefer NarraFork chat components");
 		expect(skill.descriptionEn).toContain("collect input");
-		expect(skill.descriptionZh).toContain("可视化数据、比较方案、组织信息和收集输入");
+		expect(skill.descriptionZh).toContain("优先用 NarraFork 聊天组件");
 		expect(skill.descriptionEn.length).toBeLessThan(200);
 		expect(skill.descriptionZh.length).toBeLessThan(100);
 	});
@@ -75,7 +75,9 @@ describe("nf-openui builtin skill routine", () => {
 			"`inlineMode: true`, `bindings: true`, `tools: []`, and `toolCalls: false`",
 		);
 		expect(content).toContain("charts for patterns and trends");
-		expect(content).toContain("Combine UI with Markdown narration");
+		expect(content).toContain(
+			"Use Markdown for brief answers, connective prose, and copyable code",
+		);
 		expect(content).not.toContain("only for explicitly requested");
 		expect(content).not.toContain("unless the user explicitly requests");
 		expect(content).not.toContain("when the user asks a QUESTION");
@@ -101,8 +103,8 @@ describe("nf-openui builtin skill routine", () => {
 			expect(prompt).toContain("nf-openui");
 			expect(prompt).toContain(
 				locale === "zh-CN"
-					? "呈现数据、组织信息和收集输入"
-					: "present data, organize information, and collect input",
+					? "优先用组件组织并列信息、对比、步骤和数据"
+					: "Prefer components for parallel information, comparisons, steps, and data",
 			);
 			expect(prompt).not.toContain("## Component Signatures");
 		}

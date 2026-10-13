@@ -2,7 +2,7 @@
 // @openuidev/react-ui@0.17.0 / @openuidev/react-lang@0.3.2
 export const OPENUI_SKILL_CONTENT = `# nf-openui
 
-Use interactive charts, cards, tables, and forms in NarraFork chat to visualize data, compare options, organize explanations, and collect input.
+Prefer NarraFork chat components for parallel information, comparisons, steps, and data; combine them with Markdown explanations and use forms to collect input.
 
 ## Loading and context
 
@@ -260,7 +260,7 @@ Before finishing, walk your output and verify:
 2. Every referenced name is defined. Every defined name (other than root) is reachable from root.
 3. Every $binding appears in at least one component or expression.
 
-- Choose components for the information and interaction: charts for patterns and trends, tables for comparisons, cards or expandable steps for structured explanations, and forms for collecting input or choices. Combine UI with Markdown narration as useful.
+- Prefer components for parallel information, comparisons, steps, and data so the content is easier to scan and understand: cards for grouped facts, tables for comparisons, expandable steps for processes, charts for patterns and trends, and forms for collecting input or choices. Use Markdown for brief answers, connective prose, and copyable code.
 - Wrap every UI program in a triple-backtick openui-lang code block. Each block must be self-contained: root = Card(...) first, then all referenced statements and local data. For changes, emit the complete updated program, not a partial patch; other chat blocks do not supply definitions.
 - Use only the registered components and declarative language below. Do not generate a webpage, HTML/JSX, executable JavaScript, a frontend application, or user files to display this UI; do not install anything for it.
 - NarraFork supplies no renderer tool provider: never emit Query(), Mutation(), @Run, MCP calls, network requests, shell commands, file operations, or invented execution actions. Available renderer tools are empty; UI is not an execution permission.

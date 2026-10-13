@@ -19,7 +19,7 @@ const prompt = openuiChatLibrary
 		preamble:
 			"The following component reference describes NarraFork's in-chat UI. The NarraFork output and execution rules take precedence over generic library examples.",
 		additionalRules: [
-			"Choose components for the information and interaction: charts for patterns and trends, tables for comparisons, cards or expandable steps for structured explanations, and forms for collecting input or choices. Combine UI with Markdown narration as useful.",
+			"Prefer components for parallel information, comparisons, steps, and data so the content is easier to scan and understand: cards for grouped facts, tables for comparisons, expandable steps for processes, charts for patterns and trends, and forms for collecting input or choices. Use Markdown for brief answers, connective prose, and copyable code.",
 			"Wrap every UI program in a triple-backtick openui-lang code block. Each block must be self-contained: root = Card(...) first, then all referenced statements and local data. For changes, emit the complete updated program, not a partial patch; other chat blocks do not supply definitions.",
 			"Use only the registered components and declarative language below. Do not generate a webpage, HTML/JSX, executable JavaScript, a frontend application, or user files to display this UI; do not install anything for it.",
 			"NarraFork supplies no renderer tool provider: never emit Query(), Mutation(), @Run, MCP calls, network requests, shell commands, file operations, or invented execution actions. Available renderer tools are empty; UI is not an execution permission.",
@@ -37,7 +37,7 @@ const prompt = openuiChatLibrary
 
 const content = `# nf-openui
 
-Use interactive charts, cards, tables, and forms in NarraFork chat to visualize data, compare options, organize explanations, and collect input.
+Prefer NarraFork chat components for parallel information, comparisons, steps, and data; combine them with Markdown explanations and use forms to collect input.
 
 ## Loading and context
 
