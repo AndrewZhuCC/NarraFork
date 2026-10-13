@@ -153,5 +153,8 @@
 	"trustedDependencies": [
 		"@parcel/watcher",
 		"tree-sitter-bash"
-	]
+	],
+	"patchedDependencies": {
+		"@openuidev/react-ui@0.17.0": "patches/@openuidev%2Freact-ui@0.17.0.patch"
+	}
 }

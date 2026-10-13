@@ -51,6 +51,7 @@ import {
 	truncateUtf8,
 	withinUtf8Limit,
 } from "./openui-helpers";
+import { OpenUIMarkdownProvider } from "./openui-markdown";
 import { openUITypographyTheme } from "./openui-typography";
 
 export interface OpenUIBlockProps {
@@ -224,7 +225,7 @@ const OpenUIPreview = memo(function OpenUIPreview({
 }) {
 	const [initialState] = useState(() => stateCache.load(stateKey));
 	return (
-		<div ref={rootRef}>
+		<OpenUIMarkdownProvider rootRef={rootRef}>
 			<Renderer
 				response={source}
 				isStreaming={isStreaming}
@@ -237,7 +238,7 @@ const OpenUIPreview = memo(function OpenUIPreview({
 				toolProvider={null}
 				publishObservability={false}
 			/>
-		</div>
+		</OpenUIMarkdownProvider>
 	);
 });
 

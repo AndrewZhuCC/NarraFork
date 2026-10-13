@@ -115,6 +115,9 @@
     "tree-sitter-bash",
     "@parcel/watcher",
   ],
+  "patchedDependencies": {
+    "@openuidev/react-ui@0.17.0": "patches/@openuidev%2Freact-ui@0.17.0.patch",
+  },
   "packages": {
     "@ag-ui/core": ["@ag-ui/core@0.0.53", "", { "dependencies": { "zod": "^3.22.4" } }, "sha512-11UocR7fFdMWw503bWCX2IOK15vbWfxT11Mn9xOiPBVO/UVcn57ywGrlLL4UaBlPgmUTvuzr2yYR2ElSqiN2wQ=="],
 
