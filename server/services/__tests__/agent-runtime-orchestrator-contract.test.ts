@@ -78,9 +78,10 @@ const adapter: ProviderAdapter = {
 		throw new Error("Contract must not generate history");
 	},
 };
-const unregister = provider.registerExternalProviderResolver((name) =>
-	name === "orchestratorfixture" ? adapter : null,
-);
+const unregister = provider.registerExternalProviderResolver({
+	resolve: (name) => (name === "orchestratorfixture" ? adapter : null),
+	listReadiness: () => [],
+});
 const ids = ["contract-parent", "contract-primary", "contract-child"];
 beforeEach(() => {
 	cleanDb(sqlite);

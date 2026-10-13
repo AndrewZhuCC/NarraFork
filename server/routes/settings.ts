@@ -15,7 +15,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
-import { resolveProviderAndModel } from "../lib/agent/provider";
+import { listProviderReadiness, resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
@@ -854,7 +854,7 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
-function buildSettingsResponse(
+async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
 ) {
@@ -863,6 +863,7 @@ function buildSettingsResponse(
 	stripObsoleteSettingsKeys(safeSource);
 	return {
 		...safeSource,
+		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
 		// Mask TLS passphrase
@@ -1148,8 +1149,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 }
 
-settingsRoutes.get("/", (c) => {
-	return c.json(buildSettingsResponse(settings));
+settingsRoutes.get("/", async (c) => {
+	return c.json(await buildSettingsResponse(settings));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -1719,7 +1720,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 
 		const responseStartedAt = performance.now();
 		const response = c.json(
-			buildSettingsResponse(merged, {
+			await buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
 			}),

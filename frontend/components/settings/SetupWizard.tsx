@@ -14,6 +14,7 @@ import {
 } from "@mantine/core";
 import { useDebouncedCallback } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import type { ProviderReadiness } from "@shared/provider-readiness";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -42,41 +43,13 @@ type ModelComboboxItem = string | { value: string; label: string };
 type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
 
 export function countConfiguredProviders(
-	settingsData: Record<string, unknown> | undefined,
+	settingsData: { providerReadiness?: readonly ProviderReadiness[] } | undefined,
 ): number {
-	if (!settingsData) return 0;
-	// biome-ignore lint/suspicious/noExplicitAny: settings response is a dynamic API entity
-	const settings = settingsData as any;
-	const disabledPrefixes = new Set<string>(settings.agent?.disabledProviders ?? []);
-	const configured = new Set<string>();
-	const addCredentialProviders = (
-		kind: string,
-		providers: Array<Record<string, unknown>>,
-		credentialKey: "apiKey" | "accessToken",
-		requireBaseUrl = false,
-	) => {
-		for (const provider of providers) {
-			const prefix = String(provider.prefix ?? "");
-			if (provider.disabled || disabledPrefixes.has(prefix)) continue;
-			if (!String(provider[credentialKey] ?? "").trim()) continue;
-			if (requireBaseUrl && !String(provider.baseUrl ?? "").trim()) continue;
-			configured.add(`${kind}:${String(provider.id ?? prefix)}`);
-		}
-	};
-
-	const customApiProviders = Array.isArray(settings.customApiProviders)
-		? settings.customApiProviders
-		: [];
-	if (customApiProviders.length > 0) {
-		addCredentialProviders("custom", customApiProviders, "apiKey");
-	} else {
-		addCredentialProviders("openai", settings.openaiProviders ?? [], "apiKey");
-		addCredentialProviders("anthropic", settings.anthropicProviders ?? [], "apiKey");
-		addCredentialProviders("gemini", settings.geminiProviders ?? [], "apiKey");
-	}
-	addCredentialProviders("nug", settings.nugProviders ?? [], "apiKey", true);
-	if (settings.codexAvailable && !disabledPrefixes.has("codex")) configured.add("codex");
-	return configured.size;
+	return new Set(
+		(settingsData?.providerReadiness ?? [])
+			.filter((provider) => provider.ready === true)
+			.map((provider) => provider.id),
+	).size;
 }
 
 /**
@@ -214,13 +187,10 @@ export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 	};
 
 	// --- Provider readiness (shared between ProviderStep gate and BasicSettingsStep gate) ---
-	// Credentials are the source of truth. A configured provider must count even before
-	// its model catalog has ever been refreshed (or when the cache is temporarily empty).
+	// Readiness comes from actual backend registrations, not a second provider list
+	// or model catalog (which may not have been refreshed yet).
 	const { settingsData } = useAllModels();
-	const providerCount = useMemo(
-		() => countConfiguredProviders(settingsData as Record<string, unknown> | undefined),
-		[settingsData],
-	);
+	const providerCount = useMemo(() => countConfiguredProviders(settingsData), [settingsData]);
 
 	// Track whether both models are set in BasicSettingsStep
 	const [basicStepValid, setBasicStepValid] = useState(false);

@@ -311,19 +311,21 @@ test("hot-adopted suspended runner receives HTTP user input on its original cont
 			updatedAt: now,
 		},
 	]);
-	const unregister = registerExternalProviderResolver((provider) =>
-		provider === "hotresume"
-			? ({
-					formatTools: () => [],
-					buildHistory: async () => ({ history: [], trailingToolResults: [] }),
-					injectSystemPrompt: () => {},
-					chat: () => {
-						throw new Error("must not start a new model request");
-					},
-					formatToolResult: () => ({}),
-				} as unknown as import("../../lib/agent/provider").ProviderAdapter)
-			: null,
-	);
+	const unregister = registerExternalProviderResolver({
+		resolve: (provider) =>
+			provider === "hotresume"
+				? ({
+						formatTools: () => [],
+						buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+						injectSystemPrompt: () => {},
+						chat: () => {
+							throw new Error("must not start a new model request");
+						},
+						formatToolResult: () => ({}),
+					} as unknown as import("../../lib/agent/provider").ProviderAdapter)
+				: null,
+		listReadiness: () => [],
+	});
 	const app = new Hono();
 	app.use("*", async (c, next) => {
 		c.set("user", { sub: userId, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
