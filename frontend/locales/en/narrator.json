@@ -1564,6 +1564,8 @@
 	"details.session": "Session settings",
 	"details.gitIdentity": "Git commit identity",
 	"details.gitIdentityDescription": "Choose the identity for your turns in this session. This only affects you, not other participants. Changes are saved immediately.",
+	"details.gitIdentityCreateDescription": "Choose the identity for your turns in this session. This only affects you, not other participants. Saved when the session is created.",
+	"details.gitIdentityCreateLoadFailed": "Could not load Git identities. Close this dialog and try again.",
 	"details.gitIdentityFollowDefault": "Follow default identity ({{name}})",
 	"details.gitIdentityFollowDefaultPlain": "Follow default identity",
 	"details.gitIdentityUnconfigured": "No Git identities configured. Add one in Settings → Profile; until then, commits use the execution environment's Git configuration.",

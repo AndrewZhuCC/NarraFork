@@ -22,10 +22,7 @@ import {
 	useGitIdentities,
 	useUpdateGitIdentity,
 } from "../../hooks/useGitIdentities";
-import {
-	setGitIdentityVisibility,
-	useGitIdentityVisibility,
-} from "../../hooks/useGitIdentityVisibility";
+import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 /**
@@ -106,17 +103,13 @@ export function GitIdentitiesSection() {
 									size="sm"
 									label={t("gitIdentitiesDisplayContextMenu")}
 									checked={visibility.contextMenu}
-									onChange={(e) =>
-										setGitIdentityVisibility({ contextMenu: e.currentTarget.checked })
-									}
+									onChange={(e) => visibility.setContextMenu(e.currentTarget.checked)}
 								/>
 								<Switch
 									size="sm"
 									label={t("gitIdentitiesDisplayCreateModal")}
 									checked={visibility.createModal}
-									onChange={(e) =>
-										setGitIdentityVisibility({ createModal: e.currentTarget.checked })
-									}
+									onChange={(e) => visibility.setCreateModal(e.currentTarget.checked)}
 								/>
 							</Stack>
 						</Popover.Dropdown>

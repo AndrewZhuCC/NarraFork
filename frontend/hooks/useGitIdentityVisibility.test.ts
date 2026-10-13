@@ -1,33 +1,71 @@
-import { describe, expect, test } from "bun:test";
-import { parseGitIdentityVisibility } from "./useGitIdentityVisibility";
+import { afterEach, describe, expect, test } from "bun:test";
+import { readLocalPref } from "./useLocalPref";
 
-describe("parseGitIdentityVisibility", () => {
-	test("缺失或损坏的存储值都回落到全部关闭", () => {
-		const off = { contextMenu: false, createModal: false };
-		expect(parseGitIdentityVisibility(null)).toEqual(off);
-		expect(parseGitIdentityVisibility("")).toEqual(off);
-		expect(parseGitIdentityVisibility("{")).toEqual(off);
+const CONTEXT_MENU_KEY = "narrafork_git_identity_context_menu" as const;
+const CREATE_MODAL_KEY = "narrafork_git_identity_create_modal" as const;
+
+describe("git identity visibility prefs", () => {
+	const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+
+	afterEach(() => {
+		if (previous) Object.defineProperty(globalThis, "localStorage", previous);
+		else Reflect.deleteProperty(globalThis, "localStorage");
+	});
+
+	function install(store: Map<string, string>) {
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem: (key: string) => store.get(key) ?? null,
+				setItem: (key: string, value: string) => {
+					store.set(key, value);
+				},
+				removeItem: (key: string) => {
+					store.delete(key);
+				},
+			},
+		});
+	}
+
+	test("缺失、损坏和非 true 的值都按关闭处理", () => {
+		const store = new Map<string, string>();
+		install(store);
+		expect(readLocalPref(CONTEXT_MENU_KEY)).toBe(false);
+		expect(readLocalPref(CREATE_MODAL_KEY)).toBe(false);
+
+		store.set(CONTEXT_MENU_KEY, "");
+		store.set(CREATE_MODAL_KEY, "{");
+		expect(readLocalPref(CONTEXT_MENU_KEY)).toBe(false);
+		expect(readLocalPref(CREATE_MODAL_KEY)).toBe(false);
+
+		store.set(CONTEXT_MENU_KEY, "yes");
+		store.set(CREATE_MODAL_KEY, "1");
+		expect(readLocalPref(CONTEXT_MENU_KEY)).toBe(false);
+		expect(readLocalPref(CREATE_MODAL_KEY)).toBe(false);
 	});
 
 	test("两个开关互相独立，可以同时开启", () => {
-		expect(parseGitIdentityVisibility('{"contextMenu":true}')).toEqual({
-			contextMenu: true,
-			createModal: false,
-		});
-		expect(parseGitIdentityVisibility('{"createModal":true}')).toEqual({
-			contextMenu: false,
-			createModal: true,
-		});
-		expect(parseGitIdentityVisibility('{"contextMenu":true,"createModal":true}')).toEqual({
-			contextMenu: true,
-			createModal: true,
-		});
+		const store = new Map<string, string>();
+		install(store);
+		store.set(CONTEXT_MENU_KEY, "true");
+		expect(readLocalPref(CONTEXT_MENU_KEY)).toBe(true);
+		expect(readLocalPref(CREATE_MODAL_KEY)).toBe(false);
+
+		store.set(CREATE_MODAL_KEY, "true");
+		expect(readLocalPref(CONTEXT_MENU_KEY)).toBe(true);
+		expect(readLocalPref(CREATE_MODAL_KEY)).toBe(true);
 	});
 
-	test("非布尔值一律按关闭处理", () => {
-		expect(parseGitIdentityVisibility('{"contextMenu":"yes","createModal":1}')).toEqual({
-			contextMenu: false,
-			createModal: false,
+	test("存储不可用时按关闭处理", () => {
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem() {
+					throw new Error("blocked");
+				},
+			},
 		});
+		expect(readLocalPref(CONTEXT_MENU_KEY)).toBe(false);
+		expect(readLocalPref(CREATE_MODAL_KEY)).toBe(false);
 	});
 });
