@@ -30,6 +30,10 @@ export interface RemoteDevice {
 	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
+	/** Owner axis: a private device is usable only by the user who registered it. */
+	ownerScope?: "private" | "shared";
+	/** User id of the registrar. */
+	createdBy?: string | null;
 	/**
 	 * Set when the key was collected by the one-line installer rather than pasted by
 	 * hand. Attribution only; never used to authorize anything.
