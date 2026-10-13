@@ -128,10 +128,13 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 	});
 
 	it("threads node.offsetWidth through readSize into the controller settle decision", () => {
-		const readSize = region(resizeOptions(), "readSize: () => ({");
-		expect(readSize).toMatch(/width:\s*resolveNarratorColumnWidth\(node\.clientWidth,/);
-		expect(readSize).toMatch(/boxWidth:\s*node\.offsetWidth\b/);
-		expect(readSize).not.toMatch(/boxWidth:\s*node\.clientWidth\b/);
+		const readSize = region(resizeOptions(), "readSize: () => {");
+		expect(readSize).toContain("const ready = canMeasure()");
+		expect(readSize).toMatch(
+			/width:\s*ready\s*\?\s*resolveNarratorColumnWidth\(node\.clientWidth,/,
+		);
+		expect(readSize).toMatch(/boxWidth:\s*ready\s*\?\s*node\.offsetWidth\s*:\s*0/);
+		expect(readSize).not.toMatch(/boxWidth:\s*(?:ready\s*\?\s*)?node\.clientWidth\b/);
 		const evaluate = region(controller(), "function evaluate(trigger: WidthSettleTrigger): void {");
 		expect(evaluate).toMatch(/const\s+size\s*=\s*options\.readSize\(\)/);
 		const call = region(evaluate, "resolveWidthSettle({");
@@ -233,7 +236,7 @@ it("commits the usage breakpoint only alongside final geometry and previews its 
 			"setLayoutCompactUsageLines(mobileViewportRef.current)",
 		);
 	}
-	expect(region(resizeOptions(), "readSize: () => ({")).toContain("presentationKey:");
+	expect(region(resizeOptions(), "readSize: () => {")).toContain("presentationKey:");
 	// The capped-column case may not get an observer notification at all.
 	expect(shellModule("PretextExactMessageList.tsx")).toMatch(
 		/resizeControllerRef\.current\?\.observe\(\);\s*},\s*\[isMobileViewport\]\)/,

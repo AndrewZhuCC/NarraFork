@@ -49,7 +49,32 @@ export async function requireNarratorAccess(
 	narratorId: string,
 	need: NarratorAccessNeed,
 ) {
-	return await loadNarratorForAccess(narratorId, narratorPrincipalOf(c), need);
+	const row = await loadNarratorForAccess(narratorId, narratorPrincipalOf(c), need);
+	// Only explicit synchronous-phase consumers may reuse this snapshot. Calling
+	// requireNarratorAccess again always reloads: writes and post-await guards rely on it.
+	c.set("authorizedNarrator", { row, need, principal: narratorPrincipalOf(c) });
+	return row;
+}
+
+/** Request-local snapshot only: do not use after a write or asynchronous work. */
+export function getAuthorizedNarrator(c: Context, narratorId: string, need: NarratorAccessNeed) {
+	const cached = c.get("authorizedNarrator") as
+		| {
+				row: Awaited<ReturnType<typeof loadNarratorForAccess>>;
+				need: NarratorAccessNeed;
+				principal: NarratorPrincipal;
+		  }
+		| undefined;
+	const principal = narratorPrincipalOf(c);
+	if (
+		!cached ||
+		cached.row.id !== narratorId ||
+		cached.principal.userId !== principal.userId ||
+		cached.principal.isAdmin !== principal.isAdmin ||
+		(need === "write" && cached.need !== "write")
+	)
+		return undefined;
+	return cached.row;
 }
 
 /** Same as requireNarratorAccess but for a row the handler already loaded. */

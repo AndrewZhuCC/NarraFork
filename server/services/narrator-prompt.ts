@@ -4,6 +4,7 @@ import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
+import { readInstructionFileCached } from "../lib/instruction-file-cache";
 import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
 import { IS_WINDOWS } from "../lib/platform";
 import {
@@ -12,7 +13,7 @@ import {
 	getReplyLanguageInstruction,
 	type Locale,
 } from "../lib/prompt-i18n";
-import { MAX_PROJECT_INSTRUCTIONS_BYTES, readFileCapped } from "../lib/read-file-capped";
+import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../lib/read-file-capped";
 
 export interface BuildPromptOptions {
 	/** Base system prompt (narrator's custom prompt or subagent type prompt) */
@@ -250,7 +251,7 @@ export async function buildEffectiveSystemPrompt(
 	{
 		let result: { content: string; truncated: boolean } | null = null;
 		for (const filename of PROJECT_PROMPT_FILENAMES) {
-			result = await readFileCapped(join(cwd, filename), MAX_PROJECT_INSTRUCTIONS_BYTES);
+			result = await readInstructionFileCached(join(cwd, filename), MAX_PROJECT_INSTRUCTIONS_BYTES);
 			if (result) break;
 		}
 		if (result) {
@@ -268,7 +269,7 @@ export async function buildEffectiveSystemPrompt(
 	{
 		let result: { content: string; truncated: boolean } | null = null;
 		for (const candidate of getGlobalPromptCandidates()) {
-			result = await readFileCapped(candidate, MAX_PROJECT_INSTRUCTIONS_BYTES);
+			result = await readInstructionFileCached(candidate, MAX_PROJECT_INSTRUCTIONS_BYTES);
 			if (result) break;
 		}
 		if (result) {

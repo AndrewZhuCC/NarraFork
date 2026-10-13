@@ -7,7 +7,7 @@ import { logger } from "../lib/logger";
 import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
 import type { NarratorPrincipal } from "./narrator-acl";
 
-/** Lightweight, authorized first-paint facts. Never scan status/diff here. */
+/** Opt-in authorized discovery, independent of detail first paint. Never scan status/diff here. */
 export async function getNarratorGitSummary(
 	id: string,
 	revision: number,

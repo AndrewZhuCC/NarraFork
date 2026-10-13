@@ -96,6 +96,14 @@
 			"prevId": "392deb77-0f97-42e8-a021-b68bd6a75a2b",
 			"version": "7",
 			"snapshotDigest": "180964d6821bdcc6988b0844fefef14b30e7d29b22b706a15b733698e8c09fc1"
+		},
+		{
+			"idx": 12,
+			"tag": "0012_narrator_model_history_revision",
+			"id": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
+			"prevId": "0f4d42ec-ba53-46e5-98e0-63c2c30c1f3e",
+			"version": "7",
+			"snapshotDigest": "ec351b52ce7817ff55fa50c22fbff0a4d16a47bc42d271bec9868b1e4687e967"
 		}
 	]
 }

@@ -16,6 +16,8 @@ import {
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import type { RuntimeProfile } from "../agent-runtime/input";
+import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
+import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { deferred } from "./agent-runtime-contract.harness";
@@ -192,6 +194,83 @@ describe("Bash Git command detection for status refresh", () => {
 		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
+
+describe("subagent signed source projection", () => {
+	function seed() {
+		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.
+		// Restore only that private fixture row so these tests exercise a trusted production guard.
+		sqlite
+			.query(
+				"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
+			)
+			.run(MODEL_HISTORY_REVISION_CONTRACT);
+		expect(readSqliteModelHistorySignature(sqlite, "contract-child").trusted).toBe(true);
+		const now = new Date().toISOString();
+		db.insert(narratorMessages)
+			.values({
+				id: "signed-subagent-history",
+				narratorId: "contract-child",
+				parentToolUseId: "origin-agent",
+				role: "assistant",
+				contentJson: [{ type: "text", text: "signed original" }],
+				contentText: "signed original",
+				createdAt: now,
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({
+				id: "signed-subagent-ref",
+				narratorId: "contract-child",
+				messageId: "signed-subagent-history",
+				seq: 0,
+			})
+			.run();
+	}
+	test("retains trusted raw rows while clearing placement only in detached provider rows", async () => {
+		seed();
+		const build = adapter.buildHistory;
+		let projected = false;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			const row = args[0].find((message) => message.id === "signed-subagent-history");
+			expect(row?.parentToolUseId).toBeNull();
+			projected = true;
+			return build(...args);
+		});
+		const h = fixture(profiles[1], [finished]);
+		expect((await h.run()).hasError).toBe(false);
+		expect(projected).toBe(true);
+		expect(h.calls).toHaveLength(1);
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, "signed-subagent-history"))
+				.get()?.parentToolUseId,
+		).toBe("origin-agent");
+	});
+	test("a body edit during detached provider projection is refused before a model pass", async () => {
+		seed();
+		const build = adapter.buildHistory;
+		let projected = false;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			expect(
+				args[0].find((message) => message.id === "signed-subagent-history")?.parentToolUseId,
+			).toBeNull();
+			projected = true;
+			db.update(narratorMessages)
+				.set({ contentJson: [{ type: "text", text: "late body edit" }] })
+				.where(eq(narratorMessages.id, "signed-subagent-history"))
+				.run();
+			return build(...args);
+		});
+		const h = fixture(profiles[1], [finished]);
+		const result = await h.run();
+		expect(result.hasError).toBe(true);
+		expect(projected).toBe(true);
+		expect(h.calls).toHaveLength(0);
+		expect(result.finalText).toContain("changed after provider preparation");
 	});
 });
 

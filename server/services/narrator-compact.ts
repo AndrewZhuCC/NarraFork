@@ -647,6 +647,7 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 ): Promise<{ message: T; contextPercent?: number }> {
 	try {
 		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale);
+		if (!estimate) return { message };
 		const updated = await narratorService.updateMessageHistoryTokenEstimate(
 			message.id,
 			narratorId,

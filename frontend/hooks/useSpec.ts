@@ -75,7 +75,7 @@ export function useSpecFile(narratorId: string, uri: string) {
 }
 
 /** Read and compile tasks.json. */
-export function useSpecTasks(narratorId: string) {
+export function useSpecTasks(narratorId: string, enabled = true) {
 	const qc = useQueryClient();
 
 	useEffect(() => {
@@ -94,7 +94,7 @@ export function useSpecTasks(narratorId: string) {
 	return useQuery<SpecTasksResponse>({
 		queryKey: specTasksKey(narratorId),
 		queryFn: () => api.readSpecTasks(narratorId),
-		enabled: !!narratorId,
+		enabled: enabled && !!narratorId,
 		gcTime: SPEC_GC_TIME_MS,
 	});
 }

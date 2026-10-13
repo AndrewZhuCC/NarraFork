@@ -46,6 +46,7 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
@@ -70,7 +71,7 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
-import { useNarratorLod } from "../../hooks/useNarratorLod";
+import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -197,6 +198,7 @@ import {
 	SetGlobalModelModal,
 } from "./panels/memoized-dialogs";
 import { filePanelBaseName } from "./panels/panel-kind";
+import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -287,6 +289,8 @@ function NarratorPanelBody({
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
+	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
+	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
 	const narrator = narratorProp ?? fetchedNarrator;
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
@@ -316,6 +320,19 @@ function NarratorPanelBody({
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
+	useEffect(() => {
+		if (isWorkspacePreview) return;
+		const controller = new AbortController();
+		void import("./vlist/PretextExactMessageList").catch(() => {});
+		void preloadPendingPanelTail({
+			narratorId,
+			signal: controller.signal,
+			readOpeningLod: () => readOpeningLod(narratorId),
+			getCurrent: () => preloadStateRef.current,
+			loadModule: () => import("./vlist/pretext-document-loader"),
+		}).catch(() => {});
+		return () => controller.abort();
+	}, [narratorId, isWorkspacePreview]);
 	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
@@ -326,6 +343,10 @@ function NarratorPanelBody({
 	useEffect(() => {
 		setMessageListTailMeta({ lastRealMessage: null });
 	}, [narratorId]);
+	const firstScreenActivity = useFirstScreenActivity(
+		narratorId,
+		chunkTailMeta.statusReady === true,
+	);
 	const handleMessageListTailMetaChange = useCallback((meta: MessageListTailMeta) => {
 		setMessageListTailMeta((prev) => {
 			if (
@@ -447,8 +468,11 @@ function NarratorPanelBody({
 	 * Still skipped for workspace previews, which stay lightweight and offer no
 	 * tool entries at all.
 	 */
-	const userChatRoomQuery = useNarratorChatRoom(narratorId, !isWorkspacePreview);
-	const chatUnreadQuery = useChatUnread();
+	const userChatRoomQuery = useNarratorChatRoom(
+		narratorId,
+		!isWorkspacePreview && firstScreenActivity,
+	);
+	const chatUnreadQuery = useChatUnread(firstScreenActivity);
 	const userChatRoomId = userChatRoomQuery.data?.id;
 	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
 	const qc = useQueryClient();
@@ -666,7 +690,11 @@ function NarratorPanelBody({
 	// NUG quota data layer (provider config + quota queries + cache writeback +
 	// derived provider info). Kept lifted here because the derived info feeds the
 	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
-	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const nugProviderInfo = useNugQuota(
+		resolvedModel,
+		settingsData?.nugProviders,
+		firstScreenActivity,
+	);
 	const tokenDanceConnection = settingsData?.tokendance;
 	const tokenDanceGeneration =
 		resolvedModel?.startsWith("tokendance:") &&
@@ -703,7 +731,7 @@ function NarratorPanelBody({
 	const { data: kimiUsagesData } = useQuery({
 		queryKey: ["kimi", "usages"],
 		queryFn: api.kimiGetUsages,
-		enabled: currentKimiProviderId != null,
+		enabled: currentKimiProviderId != null && firstScreenActivity,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
@@ -1355,13 +1383,13 @@ function NarratorPanelBody({
 		runningCount: tasksRunningCount,
 		workCount: tasksWorkCount,
 		serviceCount: tasksServiceCount,
-	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled);
+	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled && firstScreenActivity);
 	// Open state and toggling for the tasks entry now live in the registry-driven
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
 	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId);
+	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
 	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
@@ -1448,7 +1476,11 @@ function NarratorPanelBody({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, true, isWorkspacePreview);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(
+		narratorId,
+		firstScreenActivity || substatus.includes("waiting"),
+		isWorkspacePreview,
+	);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
@@ -2591,8 +2623,8 @@ function NarratorPanelBody({
 		dock,
 		gitWorkspaceAvailable:
 			!gitWorkspaceQuery.isError &&
-			gitWorkspaceQuery.data?.state === "ready" &&
-			gitWorkspaceQuery.data.capabilities.read,
+			gitWorkspaceQuery.authoritativeData?.state === "ready" &&
+			gitWorkspaceQuery.authoritativeData.capabilities.read,
 		tasksSupported,
 		tasksButtonEnabled,
 		specToolAvailable,
@@ -2670,13 +2702,9 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	// List props are not detail readiness: wait until the workspace shape is known
-	// before exposing messages, otherwise a late Git strip shifts the whole panel.
-	if (
-		!narrator ||
-		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
-	)
-		return <NarratorPanelSkeleton />;
+	// The detail determines variant and operation permissions. Git discovery does
+	// not determine message readiness: its fixed-height slot owns the transition.
+	if (!narrator || (!isWorkspacePreview && !fetchedNarrator)) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,

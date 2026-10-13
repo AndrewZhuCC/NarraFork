@@ -101,6 +101,7 @@ import {
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
+	getAuthorizedNarrator,
 	narratorPrincipalOf,
 	requireAccessToNarratorRow,
 	requireNarratorAccess,
@@ -308,6 +309,8 @@ import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
 } from "../services/narrator-message-count";
+import { getNarratorNavigationSummary } from "../services/narrator-navigation-summary";
+import { getNarratorPanelState } from "../services/narrator-panel-state";
 import {
 	deferPendingQuestion,
 	disarmQuestionReflection,
@@ -1492,18 +1495,16 @@ narratorRoutes.post("/broken-models/undo", requireAdmin, async (c) => {
 
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
+	const started = performance.now();
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	const [hasDraft, gitSummary] = await Promise.all([
+	const narrator =
+		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const [hasDraft, navigationSummary, messageCount] = await Promise.all([
 		narratorHasDraft(c.get("user").sub, id),
-		getNarratorGitSummary(id, narrator.workspaceRevision, narratorPrincipalOf(c), c.req.raw.signal),
+		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c)),
+		countNarratorMessageRefs(id, narrator.messageVersion),
 	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
-	// The stored counter is only refreshed when a turn ends, so a narrator that has
-	// not run since the turn-count → message-count change would still report the old
-	// value here. One narrator's refs are cheap to count exactly (an indexed count(*)),
-	// unlike the list endpoint where it would mean one subquery per row.
-	const messageCount = await countNarratorMessageRefs(id);
 	// Policy decision only (no routing, so balanced aggregations do not advance).
 	// A resolution failure just leaves the plain "follow parent" label.
 	const modelInheritance =
@@ -1512,9 +1513,15 @@ narratorRoutes.get("/:id", async (c) => {
 					.then((result) => result.inheritance)
 					.catch(() => undefined)
 			: undefined;
+	await requireNarratorAccess(c, id, "read");
+	const elapsedMs = Math.round(performance.now() - started);
+	if (elapsedMs >= 250)
+		logger.warn("Slow narrator detail hydration", { narratorId: id, elapsedMs, messageCount });
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
-		gitSummary,
+		// Legacy clients remain compatible; Git facts are loaded by the opt-in endpoint.
+		gitSummary: null,
+		navigationSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
 		...(runtimeModel && {
@@ -1525,6 +1532,30 @@ narratorRoutes.get("/:id", async (c) => {
 			},
 		}),
 	});
+});
+
+narratorRoutes.get("/:id/git/summary", async (c) => {
+	const id = c.req.param("id");
+	const narrator =
+		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const summary = await getNarratorGitSummary(
+		id,
+		narrator.workspaceRevision,
+		narratorPrincipalOf(c),
+		c.req.raw.signal,
+	);
+	await requireNarratorAccess(c, id, "read");
+	return c.json(summary);
+});
+
+narratorRoutes.get("/:id/panel-state", async (c) => {
+	const id = c.req.param("id");
+	const result = await getNarratorPanelState(id, c.get("user").sub, {
+		permissionsCursor: c.req.query("permissionsCursor"),
+		bufferCursor: c.req.query("bufferCursor"),
+	});
+	await requireNarratorAccess(c, id, "read");
+	return c.json(result);
 });
 
 // Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
@@ -3481,6 +3512,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
 		beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
 		limit,
+		signal: c.req.raw.signal,
 		messageVersion:
 			expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
 				? expectedMessageVersion
@@ -3496,6 +3528,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// place the backfill actually copies anything. Sequenced, both sides observe
 	// the same post-backfill version, and the check goes back to meaning what it
 	// says: another writer changed the narrator underneath us.
+	await requireNarratorAccess(c, id, "read");
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
 		columns: { messageVersion: true },

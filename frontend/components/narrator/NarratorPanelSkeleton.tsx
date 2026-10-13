@@ -22,6 +22,7 @@ export function NarratorPanelSkeleton() {
 				px="md"
 				style={{
 					borderBottom: "1px solid var(--mantine-color-default-border)",
+					height: 45,
 					flexShrink: 0,
 				}}
 			>
@@ -42,6 +43,12 @@ export function NarratorPanelSkeleton() {
 					<NarratorMessageListSkeleton />
 				</Box>
 			</Box>
+
+			{/* Status bar skeleton: includes the fixed workspace chrome. */}
+			{/* Unknown workspaces already own the Git/cwd chrome height. */}
+			<Group data-git-slot px="md" style={{ height: 30, flexShrink: 0, overflow: "hidden" }}>
+				<Skeleton height={12} width={140} radius="sm" />
+			</Group>
 
 			{/* Status bar skeleton */}
 			<Group

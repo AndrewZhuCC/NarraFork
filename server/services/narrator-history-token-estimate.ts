@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
 import { buildHistory, resolveProviderAndModel } from "../lib/agent";
-import { estimateTokens } from "../lib/agent/estimate-tokens";
+import { estimateJsonTokens } from "../lib/agent/estimate-json-tokens";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
 import type { Locale } from "../lib/prompt-i18n";
@@ -64,9 +64,17 @@ async function resolvePromptCwd(narrator: {
 export async function estimateNarratorBuildHistoryTokens(
 	narratorId: string,
 	locale: Locale,
-): Promise<NarratorHistoryTokenEstimate> {
+	options: { signal?: AbortSignal; deadline?: number } = {},
+): Promise<NarratorHistoryTokenEstimate | null> {
+	const deadline = Math.min(options.deadline ?? Number.POSITIVE_INFINITY, Date.now() + 10_000);
+	options.signal?.throwIfAborted();
 	const narrator = await narratorService.getById(narratorId);
-	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
+	// This is compact-after display work, not a per-pass request statistic. Reuse only
+	// immutable, signed source rows; never cache provider packets/current input/attachments.
+	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+		...options,
+		deadline,
+	});
 	const isSubagentNarrator = isSubagentVariant(narrator.variant);
 	const dbMessages = isSubagentNarrator
 		? rawMessages.map((message) => ({ ...message, parentToolUseId: null }))
@@ -95,7 +103,9 @@ export async function estimateNarratorBuildHistoryTokens(
 		resolved.adapter.injectSystemPrompt(historyWithSystem, systemPrompt, resolved.model, locale);
 	}
 
-	const promptTokens = estimateTokens(JSON.stringify(historyWithSystem));
+	const promptTokens = await estimateJsonTokens(historyWithSystem, { ...options, deadline });
+	// Unknown is not zero or a partial estimate; keep prior real usage untouched.
+	if (promptTokens == null) return null;
 	const contextWindow = getModelContextWindow(resolved.model, resolved.provider) ?? undefined;
 	const contextPercent = contextWindow
 		? Math.min((promptTokens / contextWindow) * 100, 100)

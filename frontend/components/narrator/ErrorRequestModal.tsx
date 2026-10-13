@@ -15,6 +15,7 @@ import type { RequestRecordingDetail } from "@shared/request-recording";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, api } from "../../lib/api";
+import { copyTextToClipboard } from "../../lib/clipboard";
 
 export interface ErrorRequestTarget {
 	requestId: string;
@@ -158,7 +159,7 @@ export function ErrorRequestModal({
 		if (!target) return;
 		const session = generation.current;
 		try {
-			await navigator.clipboard.writeText(
+			await copyTextToClipboard(
 				[
 					`narratorId: ${narratorId}`,
 					`requestId: ${target.requestId}`,

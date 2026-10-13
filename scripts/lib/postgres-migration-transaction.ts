@@ -13,6 +13,14 @@ import {
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, stripVTControlCharacters } from "node:util";
+import {
+	appendGeneratedModelHistoryTriggers,
+	generatedModelHistoryTriggerSuffix,
+	MODEL_HISTORY_REVISION_CONTRACT,
+	modelHistoryTriggerSuffix,
+	renderModelHistoryRevisionSql,
+	splitGeneratedModelHistoryTriggers,
+} from "./generated-model-history-triggers";
 import { runPostgresKit } from "./postgres-kit";
 import {
 	CURRENT_SNAPSHOT,
@@ -58,6 +66,7 @@ interface Receipt {
 	newFiles: Record<string, string>;
 	deletions: string[];
 	schema?: { path: string; digest: string };
+	modelHistoryTriggers?: { contract: string; sqlDigest: string };
 }
 const MAX_METADATA_BYTES = 1024 * 1024;
 const MAX_SQL_BYTES = 1024 * 1024;
@@ -364,7 +373,10 @@ function parseReceipt(meta: string): Receipt {
 		throw new Error("Incomplete PostgreSQL receipt");
 	if (
 		value.operation === "baseline" &&
-		(value.newFiles[journalPath] || Object.keys(value.newFiles).length !== 2 || value.schema)
+		(value.newFiles[journalPath] ||
+			Object.keys(value.newFiles).length !== 2 ||
+			value.schema ||
+			value.modelHistoryTriggers)
 	)
 		throw new Error("Invalid PostgreSQL baseline receipt");
 	if (
@@ -393,6 +405,13 @@ function parseReceipt(meta: string): Receipt {
 			!SHA.test(value.schema.digest))
 	)
 		throw new Error("Invalid PostgreSQL receipt schema");
+	if (
+		value.modelHistoryTriggers &&
+		(typeof value.modelHistoryTriggers.contract !== "string" ||
+			typeof value.modelHistoryTriggers.sqlDigest !== "string" ||
+			!SHA.test(value.modelHistoryTriggers.sqlDigest))
+	)
+		throw new Error("Invalid PostgreSQL receipt model-history triggers");
 	return value;
 }
 function validateReceiptPayload(root: string, receipt: Receipt): string {
@@ -424,6 +443,17 @@ function validateReceiptPayload(root: string, receipt: Receipt): string {
 		const latest = journal.entries.at(-1);
 		if (!latest || !receipt.newFiles[`${latest.tag}.sql`] || receipt.oldFiles[`${latest.tag}.sql`])
 			throw new Error("Invalid PostgreSQL new SQL receipt");
+		if (receipt.modelHistoryTriggers) {
+			if (
+				receipt.modelHistoryTriggers.contract !== MODEL_HISTORY_REVISION_CONTRACT ||
+				receipt.modelHistoryTriggers.sqlDigest !== digest(renderModelHistoryRevisionSql("postgres"))
+			)
+				throw new Error("PostgreSQL pending model-history trigger renderer changed");
+			splitGeneratedModelHistoryTriggers(
+				readBounded(join(stage, "publish", `${latest.tag}.sql`), MAX_SQL_BYTES),
+				modelHistoryTriggerSuffix("postgres"),
+			);
+		}
 	}
 	return stage;
 }
@@ -635,6 +665,7 @@ export async function executePostgresMigrations(
 		owned = makeStage(root);
 		let files: Record<string, string | Uint8Array>;
 		let schema: Receipt["schema"];
+		let modelHistoryTriggers: Receipt["modelHistoryTriggers"];
 		if (operation === "baseline") {
 			files = { [currentPath]: before.snapshotText, [historyPath]: before.historyText };
 		} else {
@@ -766,8 +797,26 @@ export async function executePostgresMigrations(
 			};
 			const preservedJournal = appendJournal(before.journalText, entry);
 			validateHistory(parseJournal(preservedJournal), history, snapshotText);
+			// Append only to this freshly generated schema transition, after native
+			// snapshot convergence but BEFORE any durable receipt/hash is produced.
+			const triggerSuffix = generatedModelHistoryTriggerSuffix(
+				{ tables: before.snapshot.tables },
+				{ tables: snapshot.tables },
+				"postgres",
+			);
+			const generatedSql = appendGeneratedModelHistoryTriggers(
+				readBounded(join(owned.stage, sqlPath), MAX_SQL_BYTES),
+				triggerSuffix,
+			);
+			if (Buffer.byteLength(generatedSql) > MAX_SQL_BYTES)
+				throw new Error("PostgreSQL generated SQL with triggers exceeds byte budget");
+			if (triggerSuffix)
+				modelHistoryTriggers = {
+					contract: MODEL_HISTORY_REVISION_CONTRACT,
+					sqlDigest: digest(renderModelHistoryRevisionSql("postgres")),
+				};
 			files = {
-				[sqlPath]: readBounded(join(owned.stage, sqlPath), MAX_SQL_BYTES),
+				[sqlPath]: generatedSql,
 				[currentPath]: snapshotText,
 				[historyPath]: `${JSON.stringify(history, null, "\t")}\n`,
 				[journalPath]: preservedJournal,
@@ -783,6 +832,7 @@ export async function executePostgresMigrations(
 			newFiles: payload(owned.stage, files),
 			deletions: before.legacySnapshots,
 			...(schema ? { schema } : {}),
+			...(modelHistoryTriggers ? { modelHistoryTriggers } : {}),
 		};
 		writeFileSync(join(owned.stage, ".transaction.json"), receiptProposal(receipt), { flag: "wx" });
 		await options.beforePublish?.();

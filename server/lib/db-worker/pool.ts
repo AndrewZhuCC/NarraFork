@@ -65,6 +65,8 @@ interface PendingTask {
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
 	onProgress?: RunReadTaskOptions["onProgress"];
+	/** PG cancellation keeps the slot until native cancel/connection close acknowledges. */
+	cancellingError?: Error;
 }
 
 /**
@@ -106,6 +108,8 @@ interface PooledWorker {
 	claimed: boolean;
 	idleSince: number;
 	terminated: boolean;
+	/** Native Worker ErrorEvent text must not expose a private PG connection URL. */
+	privatePgTask: boolean;
 }
 
 interface PoolState {
@@ -223,10 +227,12 @@ function handleWorkerMessage(pooled: PooledWorker, message: DbWorkerOutbound): v
 	s.pending.delete(message.requestId);
 	releaseWorker(pooled);
 
-	if (message.type === "result") {
+	if (pending.cancellingError) {
+		pending.reject(pending.cancellingError);
+	} else if (message.type === "result") {
 		pending.resolve(message.result);
 	} else {
-		pending.reject(new Error(message.message));
+		pending.reject(Object.assign(new Error(message.message), { code: message.code }));
 	}
 	drainQueue();
 }
@@ -316,6 +322,7 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
 		claimed: false,
 		idleSince: Date.now(),
 		terminated: false,
+		privatePgTask: false,
 		readySignal: { state: "pending", error: null, waiters: [] },
 	};
 
@@ -341,7 +348,10 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
 	worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) =>
 		handleWorkerMessage(pooled, event.data);
 	worker.onerror = (event: ErrorEvent) => {
-		retireWorker(pooled, event?.message ?? "worker error");
+		retireWorker(
+			pooled,
+			pooled.privatePgTask ? "PostgreSQL read worker failed" : (event?.message ?? "worker error"),
+		);
 	};
 	// Bun fires this when the worker thread exits (including our own shutdown request).
 	worker.addEventListener("close", (() => retireWorker(pooled, "closed")) as EventListener);
@@ -591,6 +601,7 @@ async function dispatch(
 	s.requestCounter += 1;
 	const requestId = `dbr-${Date.now().toString(36)}-${s.requestCounter.toString(36)}`;
 	worker.busyWith = requestId;
+	worker.privatePgTask = params.kind === "displayPageMessagesPostgres";
 
 	return new Promise<unknown>((resolve, reject) => {
 		// Local cancellation scope: aborting it detaches the caller's abort listener once the task
@@ -607,11 +618,39 @@ async function dispatch(
 			resolve(value);
 		};
 
+		const requestCancellation = (error: Error, reason: string) => {
+			const pending = s.pending.get(requestId);
+			if (!pending || pending.cancellingError) return;
+			if (params.kind === "displayPageMessagesPostgres") {
+				// PG SQL is async: let native Query.cancel() stop the remote statement and
+				// close its connection BEFORE releasing/reusing this pool slot. The outer
+				// display deadline already responds immediately to HTTP cancellation.
+				pending.cancellingError = error;
+				scope.abort();
+				pending.timer = setTimeout(() => {
+					s.pending.delete(requestId);
+					retireWorker(worker, "PG cancellation acknowledgement timeout");
+					settleReject(error);
+				}, 1000);
+				try {
+					worker.worker.postMessage({ type: "cancel", requestId });
+				} catch {
+					clearTimeout(pending.timer);
+					s.pending.delete(requestId);
+					retireWorker(worker, "PG cancellation message failed");
+					settleReject(error);
+				}
+			} else {
+				s.pending.delete(requestId);
+				retireWorker(worker, reason);
+				settleReject(error);
+			}
+		};
 		const timer = setTimeout(() => {
-			s.pending.delete(requestId);
-			// A timed-out worker may still be mid-scan; retire it rather than reusing a busy thread.
-			retireWorker(worker, "task timeout");
-			settleReject(new Error(`database read task timed out after ${remaining}ms`));
+			requestCancellation(
+				new Error(`database read task timed out after ${remaining}ms`),
+				"task timeout",
+			);
 		}, remaining);
 		scope.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
 
@@ -635,13 +674,7 @@ async function dispatch(
 			}
 			options.signal.addEventListener(
 				"abort",
-				() => {
-					const pending = s.pending.get(requestId);
-					if (!pending) return;
-					s.pending.delete(requestId);
-					retireWorker(worker, "aborted");
-					settleReject(new Error("database read task aborted"));
-				},
+				() => requestCancellation(new Error("database read task aborted"), "aborted"),
 				{ once: true, signal: scope.signal },
 			);
 		}

@@ -21,13 +21,15 @@ import {
 	measureTable,
 	type ScanTableRef,
 } from "../../services/storage-scan-queries";
+import { DisplayPageReadError } from "./display-page-protocol";
+import { runDisplayPageQuery } from "./display-page-query";
+import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
 	DbWorkerOutbound,
 	StorageScanContextResult,
 	StorageScanTablesResult,
 } from "./protocol";
-
 import { runSearchQuery } from "./search-query";
 import { runUsageHistoryQuery } from "./usage-history-query";
 
@@ -100,10 +102,15 @@ function runStorageScanTables(
 	return { tables };
 }
 
-self.onmessage = (event: MessageEvent<DbWorkerInbound>) => {
+const activeTasks = new Map<string, AbortController>();
+self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const message = event.data;
 	if (!message || typeof message !== "object") return;
 
+	if (message.type === "cancel") {
+		activeTasks.get(message.requestId)?.abort();
+		return;
+	}
 	if (message.type === "shutdown") {
 		for (const db of connections.values()) {
 			try {
@@ -119,15 +126,29 @@ self.onmessage = (event: MessageEvent<DbWorkerInbound>) => {
 	if (message.type !== "task") return;
 
 	const startedAt = Date.now();
+	const controller = new AbortController();
+	activeTasks.set(message.requestId, controller);
 	try {
 		const result =
-			message.params.kind === "searchQuery"
-				? runSearchQuery(getConnection(message.dbPath), message.params)
-				: message.params.kind === "usageHistoryQuery"
-					? runUsageHistoryQuery(getConnection(message.dbPath), message.params)
-					: message.params.kind === "storageScanContext"
-						? runStorageScanContext(message.dbPath)
-						: runStorageScanTables(message.dbPath, message.requestId, message.params.tableNames);
+			message.params.kind === "displayPageMessagesPostgres"
+				? await runPostgresDisplayPageQuery(
+						message.dbPath,
+						{ ...message.params, kind: "displayPageMessages" },
+						controller.signal,
+					)
+				: message.params.kind === "displayPageMessages"
+					? runDisplayPageQuery(getConnection(message.dbPath), message.params)
+					: message.params.kind === "searchQuery"
+						? runSearchQuery(getConnection(message.dbPath), message.params)
+						: message.params.kind === "usageHistoryQuery"
+							? runUsageHistoryQuery(getConnection(message.dbPath), message.params)
+							: message.params.kind === "storageScanContext"
+								? runStorageScanContext(message.dbPath)
+								: runStorageScanTables(
+										message.dbPath,
+										message.requestId,
+										message.params.tableNames,
+									);
 		post({
 			type: "result",
 			requestId: message.requestId,
@@ -135,11 +156,25 @@ self.onmessage = (event: MessageEvent<DbWorkerInbound>) => {
 			durationMs: Date.now() - startedAt,
 		});
 	} catch (err) {
+		const unknownPgError =
+			message.params.kind === "displayPageMessagesPostgres" &&
+			!(err instanceof DisplayPageReadError);
 		post({
 			type: "error",
 			requestId: message.requestId,
-			message: err instanceof Error ? err.message : String(err),
+			message: unknownPgError
+				? "PostgreSQL read-only display worker failed"
+				: err instanceof Error
+					? err.message
+					: String(err),
+			...(unknownPgError
+				? { code: "DISPLAY_PAGE_READER_UNAVAILABLE" }
+				: err && typeof err === "object" && "code" in err && typeof err.code === "string"
+					? { code: err.code }
+					: {}),
 		});
+	} finally {
+		activeTasks.delete(message.requestId);
 	}
 };
 
