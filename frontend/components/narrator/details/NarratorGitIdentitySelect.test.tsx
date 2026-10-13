@@ -135,16 +135,21 @@ describe("session details Git identity", () => {
 		expect(container.textContent).toContain("Settings → Profile");
 	});
 
-	it("integrates in searchable session settings, not either tab menu", () => {
+	it("integrates in searchable session settings and behind the display switches, not both tab menus", () => {
 		const details = readFileSync(new URL("./NarratorDetailsPanel.tsx", import.meta.url), "utf8");
 		expect(details).toContain("<NarratorGitIdentitySelect narratorId={narratorId} />");
 		expect(details).toContain(
 			'searchableText={[...sessionSearchableText, t("details.gitIdentity")]}',
 		);
-		for (const path of ["../../nav/RecentTabs.tsx", "../../dockview/SurfaceTab.tsx"]) {
-			const source = readFileSync(new URL(path, import.meta.url), "utf8");
-			expect(source).not.toContain("GitIdentityMenu");
-			expect(source).not.toContain("gitIdentityNarratorId");
-		}
+		// 侧边栏标签右键菜单重新提供该入口，但只在"显示设置"打开时才出现。
+		const tabs = readFileSync(new URL("../../nav/RecentTabs.tsx", import.meta.url), "utf8");
+		expect(tabs).toContain("gitIdentityNarratorId && gitIdentityVisibility.contextMenu");
+		// 新建会话弹窗同样只受开关控制。
+		const modal = readFileSync(new URL("../CreateNarratorModal.tsx", import.meta.url), "utf8");
+		expect(modal).toContain("gitIdentityVisibility.createModal &&");
+		// dockview 的标签菜单仍不提供：显示偏好只覆盖侧边栏与新建会话两处。
+		const surface = readFileSync(new URL("../../dockview/SurfaceTab.tsx", import.meta.url), "utf8");
+		expect(surface).not.toContain("GitIdentityMenu");
+		expect(surface).not.toContain("gitIdentityNarratorId");
 	});
 });
