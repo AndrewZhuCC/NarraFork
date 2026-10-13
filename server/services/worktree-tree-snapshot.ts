@@ -1172,6 +1172,14 @@ export function resetHotPathCaptureStateForTests(): void {
 	warmupCooldownUntil.clear();
 }
 
+/** Whether a background warm-up is registered for this worktree. Test-only observation. */
+export function hasHotPathWarmupForTests(
+	worktreePath: string,
+	deviceId: string = LOCAL_DEVICE_ID,
+): boolean {
+	return warmupInFlight.has(shadowDir(deviceId, worktreePath));
+}
+
 /** Preserve conflict completeness across the snapshot adapter; names alone are not safety. */
 export type TreeMergeResult = GitTreeMergeResult;
 

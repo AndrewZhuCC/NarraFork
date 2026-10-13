@@ -515,14 +515,22 @@ describe("subagent snapshot hooks never block the loop", () => {
 					);
 				}),
 		);
+		// Same real budget path, shorter budget: the production 4 s budget elapses twice (before
+		// and after hooks), which made this case ~8 s of waiting. Only "the hook returns once its
+		// budget expires instead of waiting for the hung scan" is under test.
+		const realHot = worktreeTreeSnapshot.tryCaptureHot.bind(worktreeTreeSnapshot);
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot").mockImplementation(
+			(path, deviceId, hotOpts) => realHot(path, deviceId, { ...hotOpts, budgetMs: 400 }),
+		);
 		try {
 			const startedAt = Date.now();
-			// The real budget is 4s; the hook must return well inside it and NOT wait
-			// for the hung scan. Asserting the elapsed time is the whole point — a
-			// version that awaited the capture would sit here for 30s.
+			// The hook must return at its budget and NOT wait for the hung scan. Asserting
+			// the elapsed time is the whole point — a version that awaited the capture would
+			// sit here for 30 s.
 			await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
 			const elapsed = Date.now() - startedAt;
 			expect(elapsed).toBeLessThan(10_000);
+			expect(hot).toHaveBeenCalled();
 
 			// The tool proceeds and its result hook also returns, with no boundary
 			// recorded: degraded to per-file replay, which is the designed fallback.
@@ -533,6 +541,7 @@ describe("subagent snapshot hooks never block the loop", () => {
 			expect(row?.treeHashBefore).toBeNull();
 			expect(row?.treeHashAfter).toBeNull();
 		} finally {
+			hot.mockRestore();
 			spy.mockRestore();
 			// Kill the promoted background warm-up so the hung mock cannot outlive this
 			// test; destroy() aborts an in-flight warm-up by contract.

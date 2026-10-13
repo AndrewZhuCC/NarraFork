@@ -13,6 +13,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { safeSpawn } from "../lib/spawn";
 import { resolveUncommittedScope } from "../routes/git";
 import { clearBoundaryCache } from "./git-commit-boundary-cache";
 import { gitService } from "./git-service";
@@ -29,11 +30,18 @@ afterEach(() => {
 	for (const dir of repos.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A git identity is required for `commit` to work in a clean environment. */
-function run(cwd: string, args: string[], date?: string): void {
-	const proc = Bun.spawnSync({
+/**
+ * A git identity is required for `commit` to work in a clean environment.
+ *
+ * Asynchronous with its own deadline. This used to be `Bun.spawnSync`: on a loaded 4-vCPU
+ * runner a synchronous child that never returned blocked the whole worker, and every
+ * remaining test in the file then timed out with "killed 1 dangling process".
+ */
+async function run(cwd: string, args: string[], date?: string): Promise<void> {
+	const result = await safeSpawn({
 		cmd: ["git", ...args],
 		cwd,
+		timeout: 15_000,
 		env: {
 			...process.env,
 			GIT_AUTHOR_NAME: "Test",
@@ -43,15 +51,15 @@ function run(cwd: string, args: string[], date?: string): void {
 			...(date ? { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : {}),
 		},
 	});
-	if (proc.exitCode !== 0) {
-		throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
+	if (result.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
 	}
 }
 
-function makeRepo(): string {
+async function makeRepo(): Promise<string> {
 	const dir = mkdtempSync(join(tmpdir(), "nf-boundary-"));
 	repos.push(dir);
-	run(dir, ["init", "-q", "-b", "main"]);
+	await run(dir, ["init", "-q", "-b", "main"]);
 	return dir;
 }
 
@@ -67,20 +75,25 @@ function rename(dir: string, from: string, to: string): void {
  * one-second precision, so two commits made in the same second are indistinguishable
  * and an ordering assertion would fail for reasons unrelated to the code.
  */
-function commit(dir: string, files: Record<string, string>, message: string, date?: string): void {
+async function commit(
+	dir: string,
+	files: Record<string, string>,
+	message: string,
+	date?: string,
+): Promise<void> {
 	for (const [path, content] of Object.entries(files)) {
 		writeFileSync(join(dir, path), content);
 	}
-	run(dir, ["add", "-A"]);
-	run(dir, ["commit", "-q", "-m", message], date);
+	await run(dir, ["add", "-A"]);
+	await run(dir, ["commit", "-q", "-m", message], date);
 }
 
 describe("getLastCommitTimes", () => {
 	test("reports each path's own last commit, not a single repository boundary", async () => {
-		const dir = makeRepo();
-		commit(dir, { "old.txt": "v1", "new.txt": "v1" }, "both", "2026-01-01T00:00:00+00:00");
+		const dir = await makeRepo();
+		await commit(dir, { "old.txt": "v1", "new.txt": "v1" }, "both", "2026-01-01T00:00:00+00:00");
 		// A later commit touching only one file: the other's boundary must stay behind.
-		commit(dir, { "new.txt": "v2" }, "only new", "2026-06-01T00:00:00+00:00");
+		await commit(dir, { "new.txt": "v2" }, "only new", "2026-06-01T00:00:00+00:00");
 
 		const { byPath } = await gitService.getLastCommitTimes(dir, ["old.txt", "new.txt"]);
 
@@ -97,8 +110,8 @@ describe("getLastCommitTimes", () => {
 		// `%cI` emits a local offset; `file_attributions.changedAt` is UTC with `Z`.
 		// Compared as strings, "2026-08-14T18:19:20+08:00" sorts AFTER
 		// "2026-08-14T11:00:00Z" despite being two hours earlier.
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "one");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "one");
 
 		const { byPath, oldestInWindow } = await gitService.getLastCommitTimes(dir, ["a.txt"]);
 
@@ -107,8 +120,8 @@ describe("getLastCommitTimes", () => {
 	});
 
 	test("omits a path that was never committed", async () => {
-		const dir = makeRepo();
-		commit(dir, { "tracked.txt": "v1" }, "one");
+		const dir = await makeRepo();
+		await commit(dir, { "tracked.txt": "v1" }, "one");
 		writeFileSync(join(dir, "untracked.txt"), "fresh");
 
 		const { byPath } = await gitService.getLastCommitTimes(dir, ["tracked.txt", "untracked.txt"]);
@@ -120,9 +133,9 @@ describe("getLastCommitTimes", () => {
 	});
 
 	test("oldestInWindow is the walk's oldest commit, usable as a fallback boundary", async () => {
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "first", "2026-01-01T00:00:00+00:00");
-		commit(dir, { "a.txt": "v2" }, "second", "2026-06-01T00:00:00+00:00");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "first", "2026-01-01T00:00:00+00:00");
+		await commit(dir, { "a.txt": "v2" }, "second", "2026-06-01T00:00:00+00:00");
 
 		const { byPath, oldestInWindow } = await gitService.getLastCommitTimes(dir, ["a.txt"]);
 
@@ -137,7 +150,7 @@ describe("getLastCommitTimes", () => {
 
 	test("an unborn HEAD yields no boundaries instead of failing", async () => {
 		// A fresh chapter worktree can legitimately have zero commits.
-		const dir = makeRepo();
+		const dir = await makeRepo();
 		writeFileSync(join(dir, "a.txt"), "v1");
 
 		const result = await gitService.getLastCommitTimes(dir, ["a.txt"]);
@@ -147,8 +160,8 @@ describe("getLastCommitTimes", () => {
 	});
 
 	test("an empty path list does no git work", async () => {
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "one");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "one");
 
 		const result = await gitService.getLastCommitTimes(dir, []);
 
@@ -157,10 +170,10 @@ describe("getLastCommitTimes", () => {
 	});
 
 	test("paths beyond the cap are omitted rather than truncating the argument vector", async () => {
-		const dir = makeRepo();
+		const dir = await makeRepo();
 		const files: Record<string, string> = {};
 		for (let i = 0; i < 5; i++) files[`f${i}.txt`] = "v1";
-		commit(dir, files, "many");
+		await commit(dir, files, "many");
 
 		// Far more paths than the 200 cap; the call must still succeed and resolve the
 		// ones it kept.
@@ -172,8 +185,8 @@ describe("getLastCommitTimes", () => {
 	});
 
 	test("a path containing spaces is matched exactly", async () => {
-		const dir = makeRepo();
-		commit(dir, { "with space.txt": "v1" }, "spaced");
+		const dir = await makeRepo();
+		await commit(dir, { "with space.txt": "v1" }, "spaced");
 
 		const { byPath } = await gitService.getLastCommitTimes(dir, ["with space.txt"]);
 
@@ -186,8 +199,8 @@ describe("getLastCommitTimes", () => {
 		// Attribution rows carry the path that existed when the write happened, so a
 		// renamed file's whole recorded history sits under a path that is no longer in the
 		// tree. The boundary walk must be able to bound those rows.
-		const dir = makeRepo();
-		commit(dir, { "old.txt": "v1" }, "create", "2026-01-01T00:00:00+00:00");
+		const dir = await makeRepo();
+		await commit(dir, { "old.txt": "v1" }, "create", "2026-01-01T00:00:00+00:00");
 		rename(dir, "old.txt", "new.txt");
 
 		const { byPath } = await gitService.getLastCommitTimes(dir, ["old.txt", "new.txt"]);
@@ -207,11 +220,11 @@ describe("resolveUncommittedScope", () => {
 		// recorded before the rename — under the old path — was neither in the path list
 		// nor attachable to the new path's row. It fell through to the `oldestInWindow`
 		// fallback, i.e. the "Unknown" badge in another shape.
-		const dir = makeRepo();
-		commit(dir, { "old.txt": "some content that stays identical\n" }, "create");
+		const dir = await makeRepo();
+		await commit(dir, { "old.txt": "some content that stays identical\n" }, "create");
 		rename(dir, "old.txt", "new.txt");
 		// Staged, so porcelain reports `R` rather than a delete plus an untracked add.
-		run(dir, ["add", "-A"]);
+		await run(dir, ["add", "-A"]);
 
 		const scope = await resolveUncommittedScope(dir);
 
@@ -221,8 +234,8 @@ describe("resolveUncommittedScope", () => {
 	});
 
 	test("a plain modification produces no aliases", async () => {
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "create");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "create");
 		writeFileSync(join(dir, "a.txt"), "v2");
 
 		const scope = await resolveUncommittedScope(dir);
@@ -236,8 +249,8 @@ describe("resolveUncommittedScope", () => {
 		// been committed, so every attribution recorded for it belongs to the current
 		// change; bounding it at the walk's oldest commit would discard contributors for a
 		// file whose entire history IS the current change.
-		const dir = makeRepo();
-		commit(dir, { "tracked.txt": "v1" }, "create", "2026-01-01T00:00:00+00:00");
+		const dir = await makeRepo();
+		await commit(dir, { "tracked.txt": "v1" }, "create", "2026-01-01T00:00:00+00:00");
 		writeFileSync(join(dir, "tracked.txt"), "v2");
 		writeFileSync(join(dir, "fresh.txt"), "brand new");
 
@@ -251,12 +264,12 @@ describe("resolveUncommittedScope", () => {
 	});
 
 	test("a tracked path the walk did not reach falls back to the window boundary", async () => {
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "create", "2026-01-01T00:00:00+00:00");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "create", "2026-01-01T00:00:00+00:00");
 		// A second commit so the walk has an `oldestInWindow` distinct from nothing, then a
 		// tracked-but-unreached path: `b.txt` is committed, so it is not untracked, but the
 		// pathspec-limited walk resolves it too.
-		commit(dir, { "b.txt": "v1" }, "second", "2026-06-01T00:00:00+00:00");
+		await commit(dir, { "b.txt": "v1" }, "second", "2026-06-01T00:00:00+00:00");
 		writeFileSync(join(dir, "a.txt"), "v2");
 		writeFileSync(join(dir, "b.txt"), "v2");
 
@@ -269,8 +282,8 @@ describe("resolveUncommittedScope", () => {
 	});
 
 	test("a clean worktree asks for nothing", async () => {
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "create");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "create");
 
 		const scope = await resolveUncommittedScope(dir);
 
@@ -285,8 +298,8 @@ describe("resolveUncommittedScope", () => {
 
 describe("findCommitLogIndex prefix matching", () => {
 	test("a full 40-char SHA matches exactly", async () => {
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "first");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "first");
 		const log = await gitService.getLog(dir, { limit: 1 });
 		const fullSha = log[0]?.sha ?? "";
 		expect(fullSha).not.toBe("");
@@ -298,8 +311,8 @@ describe("findCommitLogIndex prefix matching", () => {
 	test("an unambiguous abbreviated sha resolves, however short", async () => {
 		// Short shas stay supported: correctness comes from rejecting ambiguity, not
 		// from guessing a prefix length at which collisions become unlikely.
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "first");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "first");
 		const log = await gitService.getLog(dir, { limit: 1 });
 		const fullSha = log[0]?.sha ?? "";
 		expect(fullSha).not.toBe("");
@@ -312,9 +325,9 @@ describe("findCommitLogIndex prefix matching", () => {
 	test("a prefix matching two commits resolves to null, not to the first one", async () => {
 		// The failure this guards against is silent: Ruler pages from the returned
 		// index, so a wrong hit shifts the page and drops the commits in between.
-		const dir = makeRepo();
-		commit(dir, { "a.txt": "v1" }, "first");
-		commit(dir, { "b.txt": "v1" }, "second");
+		const dir = await makeRepo();
+		await commit(dir, { "a.txt": "v1" }, "first");
+		await commit(dir, { "b.txt": "v1" }, "second");
 		const log = await gitService.getLog(dir, { limit: 2 });
 		const shas = log.map((c) => c.sha);
 		expect(shas).toHaveLength(2);

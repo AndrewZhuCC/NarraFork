@@ -211,7 +211,9 @@ describe("extractSubagentToPrimary", () => {
 		for (const msg of copied) {
 			expect(msg.parentToolUseId).toBeNull();
 			expect(msg.messageUuid).toBeNull();
-			expect(msg.id.startsWith("m")).toBe(false);
+			// A fresh copy, never the source row. (Checking a letter prefix was flaky: random
+			// nanoids start with "m" about once in 64 extractions.)
+			expect(["m0", "m1"]).not.toContain(msg.id);
 		}
 		const texts = copied.map((m) => m.contentText).sort();
 		expect(texts).toEqual(["found route A", "found route B"]);

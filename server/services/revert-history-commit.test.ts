@@ -6,6 +6,7 @@ import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as schema from "../db/schema";
 import { measureMessageCharacters } from "../lib/context-characters";
@@ -42,15 +43,17 @@ function query<T>(text: string, ...params: SQLQueryBindings[]) {
 function scalar(text: string, ...params: SQLQueryBindings[]) {
 	return query<{ n: number }>(text, ...params)[0].n;
 }
-function seedSchema(client: Database) {
+function seedSchema(client: Database, options: { schemaAlreadyCopied?: boolean } = {}) {
 	client.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
-	const definitions = isolatedTemplate
-		.query<{ sql: string }, []>(
-			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
-		)
-		.all();
-	expect(definitions.length).toBeLessThan(2048);
-	for (const row of definitions) client.exec(row.sql);
+	if (!options.schemaAlreadyCopied) {
+		const definitions = isolatedTemplate
+			.query<{ sql: string }, []>(
+				"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
+			)
+			.all();
+		expect(definitions.length).toBeLessThan(2048);
+		for (const row of definitions) client.exec(row.sql);
+	}
 	// Pending schema changes are exercised without generating/running a migration.
 	const columns = new Set(
 		client
@@ -78,9 +81,11 @@ function seedSchema(client: Database) {
 beforeEach(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
-	sqlite = new Database(":memory:");
+	// Byte copy of the same schema, built once per process (see tests/sqlite-schema-image.ts);
+	// replaying ~550 DDL statements per case dominated this file's runtime.
+	sqlite = openSchemaCopyInMemory(isolatedTemplate);
 	connections = [sqlite];
-	seedSchema(sqlite);
+	seedSchema(sqlite, { schemaAlreadyCopied: true });
 	db = database(sqlite);
 	serial = 0;
 	authorized = [];

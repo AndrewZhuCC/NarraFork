@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { openSchemaCopyAt } from "../../tests/sqlite-schema-image";
 import { db as appDb, sqlite as template } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -65,18 +66,11 @@ beforeEach(async () => {
 		timeout: 5000,
 	});
 	expect(initialized.exitCode).toBe(0);
-	sqlite = new Database(join(root, "evidence.db"));
-	sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	// Copy schema only from bunfig/preload's isolated template, never migrate a live DB.
-	const definitions = template
-		.query<{ sql: string }, []>(
-			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
-		)
-		.all();
-	expect(definitions.length).toBeLessThan(2048);
-	sqlite.transaction(() => {
-		for (const definition of definitions) sqlite.exec(definition.sql);
-	})();
+	// The file starts as a byte image of that schema (built once per process) instead of
+	// replaying ~550 DDL statements per case; the connection PRAGMAs are unchanged.
+	sqlite = openSchemaCopyAt(template, join(root, "evidence.db"));
+	sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	db = database(sqlite);
 	narratorId = generateId();
 	userId = generateId();

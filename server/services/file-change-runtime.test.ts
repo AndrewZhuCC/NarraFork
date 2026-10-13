@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
@@ -21,6 +21,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "../../shared/file-change-protocol";
+import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -88,17 +89,11 @@ beforeEach(async () => {
 	workspace = join(root, "workspace");
 	privateRoot = join(root, "private");
 	await mkdir(workspace);
-	sqlite = new Database(":memory:");
-	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	// Schema-only copy from the preload's isolated database. No rows, production
 	// directory, migration file or application connection settings are changed.
-	const definitions = isolatedTemplate
-		.query<{ sql: string }, []>(
-			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
-		)
-		.all();
-	expect(definitions.length).toBeLessThan(2048);
-	for (const definition of definitions) sqlite.exec(definition.sql);
+	// A byte image built once per process replaces replaying ~550 DDL statements per case.
+	sqlite = openSchemaCopyInMemory(isolatedTemplate);
+	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	db = database(sqlite);
 	narratorId = generateId();
 	db.insert(schema.narrators)

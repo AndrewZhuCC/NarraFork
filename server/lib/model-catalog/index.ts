@@ -12,7 +12,6 @@ import {
 	legacyMetadataToRaw,
 	type RawLocalState,
 } from "@shared/model-catalog/card-resolver";
-import bundledJSON from "@shared/model-catalog/dist/catalog.json";
 import type {
 	CatalogUpdateStatus,
 	ModelCatalogMutation,
@@ -49,6 +48,7 @@ import {
 	catalogFromArchive,
 	catalogSourceVersion,
 	catalogToRaw,
+	decodeBundledCatalog,
 	decodeCatalog,
 	encodeCatalog,
 	MAX_CATALOG_BYTES,
@@ -69,7 +69,7 @@ export interface ModelCatalogSettings {
 		pricingOverrides: unknown;
 	};
 }
-const bundled = decodeCatalog(bundledJSON);
+const bundled = decodeBundledCatalog();
 const directory = resolve(getNarraforkHome(), "model-catalog");
 const cachePath = resolve(directory, "snapshots.json");
 let active = bundled;
