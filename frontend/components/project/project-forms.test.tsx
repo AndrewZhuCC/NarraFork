@@ -77,6 +77,19 @@ mock.module("@mantine/hooks", () => ({
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 mock.module("@tanstack/react-query", () => ({
 	useQuery: () => ({ data: { paths: { defaultProjectDir: "/instance" }, agent: {} } }),
+	useQueryClient: () => ({ invalidateQueries: () => {} }),
+}));
+mock.module("@mantine/notifications", () => ({
+	notifications: { show: () => {} },
+}));
+mock.module("../../hooks/useGitIdentities", () => ({
+	useGitIdentities: () => ({ data: [], isLoading: false, isError: false }),
+	narratorGitIdentityQueryKey: (narratorId: string) => [
+		"auth",
+		"git-identities",
+		"narrator",
+		narratorId,
+	],
 }));
 mock.module("@tanstack/react-router", () => ({
 	createFileRoute: () => (options: unknown) => ({ options }),

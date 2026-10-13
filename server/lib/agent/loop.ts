@@ -4108,9 +4108,11 @@ async function* agentLoopInMetadataSnapshot(
 			// Stateful providers (responses/codex) cannot retry here because the
 			// server already consumed the request.
 			const maxConfiguredRetries = config.maxTransientRetries ?? 0;
+			// Watchdog timeouts must use the same retry owner as other transport errors:
+			// stateful providers replay in the outer runtime, stateless providers retry
+			// here. Giving both layers a full budget multiplies the configured limit.
 			const getMaxChatRetries = () =>
 				usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
-			const maxFirstTokenRetries = maxConfiguredRetries;
 			const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 			const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
 			let chatRetryCount = 0;
@@ -5875,7 +5877,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -5891,14 +5893,14 @@ async function* agentLoopInMetadataSnapshot(
 								model: effectiveModel,
 								requestId,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								firstTokenTimeoutMs,
 							});
 							yield {
 								type: "retrying",
 								message: firstTokenTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -5938,7 +5940,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -5952,7 +5954,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "retrying",
 								message: streamIdleTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -6339,7 +6341,7 @@ async function* agentLoopInMetadataSnapshot(
 						model: effectiveModel,
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6353,7 +6355,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: firstTokenTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6394,7 +6396,7 @@ async function* agentLoopInMetadataSnapshot(
 						model: effectiveModel,
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6408,7 +6410,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: streamIdleTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};

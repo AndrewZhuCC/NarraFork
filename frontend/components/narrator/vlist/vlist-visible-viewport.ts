@@ -9,7 +9,14 @@ type View = Omit<PretextDocumentView, "focusOffset">;
 
 /** display:none parking is not a zero-sized reading viewport. */
 export function hasVisibleVListGeometry(node: ViewportNode | null): node is ViewportNode {
-	return node != null && node.offsetWidth > 0 && node.clientHeight > 0;
+	if (!node) return false;
+	const { offsetWidth, clientHeight } = node;
+	return (
+		Number.isFinite(offsetWidth) &&
+		offsetWidth > 0 &&
+		Number.isFinite(clientHeight) &&
+		clientHeight > 0
+	);
 }
 
 /**

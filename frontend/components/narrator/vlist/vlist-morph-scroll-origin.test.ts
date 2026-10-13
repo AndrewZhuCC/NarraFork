@@ -245,15 +245,23 @@ describe("production animation-origin wiring", () => {
 			source.indexOf("const hasTailFooter ="),
 			source.indexOf("const scrollGeometryRevision ="),
 		);
-		for (const part of [resize, footer]) {
-			const measure = sliceBracketedRegion(part, "const measure = () => {");
-			if (!measure) throw new Error("Missing observer callback");
-			before(
-				measure,
-				"morphScrollOrigin.invalidate()",
-				"if (!visibleViewportRef.current.isVisible(",
-			);
-		}
+		const viewportMeasure = sliceBracketedRegion(resize, "const measure = () => {");
+		if (!viewportMeasure) throw new Error("Missing viewport observer callback");
+		before(viewportMeasure, "morphScrollOrigin.invalidate()", "if (!canMeasure())");
+		const readiness = region("const canMeasure = () => {");
+		before(
+			readiness,
+			"visibleViewportRef.current.isVisible(node)",
+			"Number.isFinite(node.clientWidth)",
+		);
+		before(readiness, "Number.isFinite(node.clientWidth)", "node.clientWidth > PAGE_PADDING * 2");
+		const footerMeasure = sliceBracketedRegion(footer, "const measure = () => {");
+		if (!footerMeasure) throw new Error("Missing footer observer callback");
+		before(
+			footerMeasure,
+			"morphScrollOrigin.invalidate()",
+			"if (!visibleViewportRef.current.isVisible(",
+		);
 	});
 
 	test("all three baselines still roll before their play gates", () => {

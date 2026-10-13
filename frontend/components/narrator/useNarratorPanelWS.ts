@@ -5,11 +5,20 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { invalidateGitStatusPushQueries, invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
+import {
+	createPanelReconcileRestartScheduler,
+	type PanelConnectionState,
+	type PanelReconcileRestartScheduler,
+	panelConnectionRead,
+	reconcilePanelStatePages,
+	shouldFallbackPanelState,
+} from "../../lib/narrator-panel-state";
 import { statusRegistry } from "../../lib/status-registry";
 import {
 	contextSnapshotFields,
@@ -335,6 +344,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	} = opts;
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
+	const { data: currentUser } = useCurrentUser();
+	const panelScope = JSON.stringify([currentUser?.id ?? null, narratorId]);
+	const connectionReconcileRef = useRef<PanelConnectionState | null>(null);
+	const activeReconcileRef = useRef<{
+		controller: AbortController;
+		promise: Promise<void>;
+		generation: number;
+		lifecycle: number;
+		bufferEpoch: number;
+	} | null>(null);
+	const reconcileRestartSchedulerRef = useRef<PanelReconcileRestartScheduler | null>(null);
+	const reconcilePanelStateRef = useRef<(fresh?: boolean) => Promise<void>>(async () => {});
+	const requestPanelReconcileRef = useRef<() => void>(() => {});
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const permissionDecisionsSupported =
 		narratorPermissionsCapability.supported && narratorPermissionsCapability.approveDeny;
@@ -358,6 +380,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	const bumpPermissionGeneration = useCallback(() => {
 		permissionGenerationRef.current += 1;
+		if (activeReconcileRef.current) requestPanelReconcileRef.current();
 	}, []);
 
 	// Writes pushed async-question transitions into the query cache that owns them.
@@ -388,11 +411,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	);
 
 	const replacePendingPermissions = useCallback(
-		(perms: PendingPermission[], generation: number, lifecycle: number) => {
+		(
+			perms: PendingPermission[],
+			generation: number,
+			lifecycle: number,
+			complete = true,
+			onDiscard?: () => void,
+		) => {
 			if (
 				permissionGenerationRef.current !== generation ||
 				permissionLifecycleRef.current !== lifecycle
 			) {
+				onDiscard?.();
 				return false;
 			}
 			setPendingPermsByRequestId((prev) => {
@@ -401,23 +431,52 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					permissionGenerationRef.current !== generation ||
 					permissionLifecycleRef.current !== lifecycle
 				) {
+					onDiscard?.();
 					return prev;
 				}
-				return reconcilePendingPermissions(prev, perms, resolvedPermissionIdsRef.current);
+				// A partial page must not erase permissions whose next page is still in flight.
+				const snapshot = complete
+					? perms
+					: [...new Map([...prev, ...perms.map((perm) => [perm.id, perm] as const)]).values()];
+				return reconcilePendingPermissions(prev, snapshot, resolvedPermissionIdsRef.current);
 			});
 			return true;
 		},
 		[],
 	);
 
-	// Reset the permission lifecycle when a Dockview panel is reused for another narrator.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId defines the lifecycle boundary.
+	// Reset the permission lifecycle when a Dockview panel changes narrator or account.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: panelScope defines the lifecycle boundary.
 	useEffect(() => {
+		connectionReconcileRef.current = null;
+		activeReconcileRef.current?.controller.abort();
+		activeReconcileRef.current = null;
 		permissionLifecycleRef.current += 1;
 		permissionGenerationRef.current += 1;
+		bufferEpochRef.current += 1;
 		resolvedPermissionIdsRef.current = new Set();
+		reconcileRestartSchedulerRef.current?.dispose();
+		const lifecycle = permissionLifecycleRef.current;
+		const userId = currentUser?.id ?? null;
+		reconcileRestartSchedulerRef.current = createPanelReconcileRestartScheduler(
+			() => {
+				void reconcilePanelStateRef.current(true);
+			},
+			() =>
+				permissionLifecycleRef.current === lifecycle &&
+				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) === userId,
+		);
 		setPendingPermsByRequestId(new Map());
-	}, [narratorId]);
+		setQueuedMessages([]);
+		return () => {
+			permissionLifecycleRef.current += 1;
+			bufferEpochRef.current += 1;
+			reconcileRestartSchedulerRef.current?.dispose();
+			reconcileRestartSchedulerRef.current = null;
+			activeReconcileRef.current?.controller.abort();
+			activeReconcileRef.current = null;
+		};
+	}, [panelScope]);
 
 	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
@@ -431,19 +490,30 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const bufferEpochRef = useRef(0);
 	const bumpBufferEpoch = useCallback(() => {
 		bufferEpochRef.current += 1;
+		if (activeReconcileRef.current) requestPanelReconcileRef.current();
 	}, []);
 	// Fetch the authoritative queue but only apply it when no WS buffer event
 	// superseded this request in the meantime.
 	const reconcileBufferedMessages = useCallback(() => {
 		const epochAtRequest = bufferEpochRef.current;
+		const lifecycle = permissionLifecycleRef.current;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 10_000);
+		const alive = () =>
+			!controller.signal.aborted &&
+			permissionLifecycleRef.current === lifecycle &&
+			(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) === (currentUser?.id ?? null);
 		api
-			.getBufferedMessages(narratorId)
+			.getBufferedMessages(narratorId, controller.signal)
 			.then((msgs) => {
-				if (bufferEpochRef.current !== epochAtRequest) return;
-				setQueuedMessages(msgs ?? []);
+				if (bufferEpochRef.current !== epochAtRequest || !alive()) return;
+				setQueuedMessages((previous) =>
+					bufferEpochRef.current === epochAtRequest && alive() ? (msgs ?? []) : previous,
+				);
 			})
-			.catch(() => {});
-	}, [narratorId]);
+			.catch(() => {})
+			.finally(() => clearTimeout(timer));
+	}, [narratorId, qc, currentUser?.id]);
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
 		substatus: [],
 		contextSnapshot: null,
@@ -1544,49 +1614,117 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// Keep refs in sync
 	sendPermissionDecisionRef.current = sendPermissionDecision;
 
-	// --- Load pending permissions on mount/reconnect ---
-	const prevConnectedRef = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: fetch on mount and reconnect
-	useEffect(() => {
-		if (!connected && prevConnectedRef.current) {
-			prevConnectedRef.current = false;
+	// --- Initial REST is shared with the composer; every WS connection edge closes its event gap. ---
+	const reconcilePanelState = useCallback(
+		(fresh = false) => {
+			if (!fresh && activeReconcileRef.current) return activeReconcileRef.current.promise;
+			reconcileRestartSchedulerRef.current?.cancel();
+			if (fresh) activeReconcileRef.current?.controller.abort();
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), 15_000);
+			const generation = permissionGenerationRef.current;
+			const lifecycle = permissionLifecycleRef.current;
+			const bufferEpoch = bufferEpochRef.current;
+			const alive = () =>
+				!controller.signal.aborted &&
+				permissionLifecycleRef.current === lifecycle &&
+				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) ===
+					(currentUser?.id ?? null);
+			const onDiscard = () => {
+				if (alive()) requestPanelReconcileRef.current();
+			};
+			const applyBuffer = (messages: BufferMessageSummary[], complete = true) => {
+				if (!alive() || bufferEpochRef.current !== bufferEpoch) {
+					onDiscard();
+					return;
+				}
+				setQueuedMessages((previous) => {
+					if (!alive() || bufferEpochRef.current !== bufferEpoch) {
+						onDiscard();
+						return previous;
+					}
+					return complete
+						? messages
+						: [
+								...new Map(
+									[...previous, ...messages].map((message) => [message.id, message]),
+								).values(),
+							];
+				});
+			};
+			const promise = reconcilePanelStatePages(
+				(options) => api.getNarratorPanelState(narratorId, options),
+				(snapshot) => {
+					if (!alive()) return;
+					replacePendingPermissions(
+						snapshot.permissions,
+						generation,
+						lifecycle,
+						!snapshot.hasMore.permissions,
+						onDiscard,
+					);
+					applyBuffer(snapshot.buffer, !snapshot.hasMore.buffer);
+				},
+				{ signal: controller.signal, fresh },
+			)
+				.catch(async (error) => {
+					if (!alive() || !shouldFallbackPanelState(error)) return;
+					// Independent fallbacks: a draft/network failure must never hide safety permissions.
+					await Promise.allSettled([
+						api.getPendingPermissions(narratorId, controller.signal).then((permissions) => {
+							if (alive())
+								replacePendingPermissions(permissions, generation, lifecycle, true, onDiscard);
+						}),
+						api
+							.getBufferedMessages(narratorId, controller.signal)
+							.then((messages) => applyBuffer(messages ?? [])),
+					]);
+				})
+				.finally(() => {
+					clearTimeout(timer);
+					if (activeReconcileRef.current?.controller === controller)
+						activeReconcileRef.current = null;
+				});
+			activeReconcileRef.current = { controller, promise, generation, lifecycle, bufferEpoch };
+			return promise;
+		},
+		[narratorId, replacePendingPermissions, qc, currentUser?.id],
+	);
+	reconcilePanelStateRef.current = reconcilePanelState;
+	requestPanelReconcileRef.current = () => {
+		const active = activeReconcileRef.current;
+		// A newer read already covers an older queued React updater's rejection.
+		if (
+			active &&
+			active.generation === permissionGenerationRef.current &&
+			active.lifecycle === permissionLifecycleRef.current &&
+			active.bufferEpoch === bufferEpochRef.current
+		)
 			return;
-		}
-		if (connected) prevConnectedRef.current = true;
+		reconcileRestartSchedulerRef.current?.schedule();
+	};
 
-		const permissionGeneration = permissionGenerationRef.current;
-		const permissionLifecycle = permissionLifecycleRef.current;
-		api
-			.getPendingPermissions(narratorId)
-			.then((perms) => {
-				replacePendingPermissions(perms, permissionGeneration, permissionLifecycle);
-			})
-			.catch(() => {});
-		reconcileBufferedMessages();
-	}, [narratorId, connected, reconcileBufferedMessages]);
+	useEffect(() => {
+		const transition = panelConnectionRead(connectionReconcileRef.current, panelScope, connected);
+		connectionReconcileRef.current = transition.state;
+		if (!transition.read) return;
+		if (transition.read === "fresh") {
+			bumpPermissionGeneration();
+			bumpBufferEpoch();
+		}
+		void reconcilePanelState(transition.read === "fresh");
+	}, [panelScope, connected, reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch]);
 
 	// --- Fallback polling for permissions ---
 	useEffect(() => {
 		if (narratorStatus !== "waiting" || pendingPermissions.length > 0) return;
-		let cancelled = false;
 		const poll = () => {
-			const permissionGeneration = permissionGenerationRef.current;
-			const permissionLifecycle = permissionLifecycleRef.current;
-			api
-				.getPendingPermissions(narratorId)
-				.then((perms) => {
-					if (cancelled) return;
-					replacePendingPermissions(perms, permissionGeneration, permissionLifecycle);
-				})
-				.catch(() => {});
+			void reconcilePanelState();
 		};
 		poll();
 		const timer = setInterval(poll, 5000);
-		return () => {
-			cancelled = true;
-			clearInterval(timer);
-		};
-	}, [narratorId, narratorStatus, pendingPermissions.length, replacePendingPermissions]);
+		return () => clearInterval(timer);
+	}, [narratorStatus, pendingPermissions.length, reconcilePanelState]);
 
 	// --- Mark "done" narrator as read ---
 	const hasUnreadSubstatus = substatus.includes("unread");

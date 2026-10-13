@@ -752,6 +752,8 @@ export const narrators = sqliteTable(
 		turnStartedAt: text("turn_started_at"),
 		/** Monotonically increasing counter bumped on every message add/delete/update */
 		messageVersion: integer("message_version").notNull().default(0),
+		/** Durable model-source invalidation, independent of display/WS versions and usage. */
+		modelHistoryRevision: integer("model_history_revision").notNull().default(0),
 		/** Monotonically increasing counter bumped when the visible timeline structure changes. */
 		messageStructureVersion: integer("message_structure_version").notNull().default(0),
 		/**
@@ -1444,6 +1446,12 @@ export const specProtectedTasks = sqliteTable(
 	],
 );
 
+// === model history revision contract (published by the generated trigger migration) ===
+export const modelHistoryRevisionContracts = sqliteTable("model_history_revision_contracts", {
+	id: text("id").primaryKey(),
+	installedVersion: text("installed_version").notNull(),
+});
+
 // === narrator_messages ===
 export const narratorContextCharPages = sqliteTable(
 	"narrator_context_char_pages",
@@ -1472,6 +1480,8 @@ export const narratorMessages = sqliteTable(
 		parentToolUseId: text("parent_tool_use_id"),
 		role: text("role", { enum: ["user", "assistant", "system", "sys", "disp"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),
+		/** Incremented transactionally when model-visible body/identity changes. */
+		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
 		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
@@ -1616,6 +1626,8 @@ export const narratorToolCalls = sqliteTable(
 			.references(() => narratorMessages.id),
 		toolUseId: text("tool_use_id").notNull(),
 		toolName: text("tool_name").notNull(),
+		/** Incremented transactionally for input/output/status/attempt ordering changes. */
+		modelRevision: integer("model_revision").notNull().default(0),
 		inputJson: text("input_json", { mode: "json" }),
 		outputJson: text("output_json", { mode: "json" }),
 		inputChars: integer("input_chars").notNull().default(0),

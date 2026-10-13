@@ -9,11 +9,13 @@ import type { FileReference } from "@shared/file-reference";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
 import { insertFileReference } from "./file-reference-input";
 import {
+	canHydrateNarratorDraftFromMeta,
 	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
 	getNarratorDraftStorageId,
 	getNarratorInputDraftKey,
 	getNarratorInputHistoryKey,
+	isAcknowledgedNarratorDraft,
 	MAX_LOCAL_DRAFT_MIRROR_CHARS,
 	persistNarratorInputDraft,
 	purgeLegacyNarratorInputStorage,
@@ -264,6 +266,80 @@ describe("narrator draft revision conflict classification", () => {
 				currentSourceId: "source-b",
 			}),
 		).toBe("conflict");
+	});
+});
+
+describe("acknowledged draft revision metadata", () => {
+	test("only a valid matching revision without dirty state is an acknowledged baseline", () => {
+		const local = { text: "", serverRevision: 0, syncedRevision: 0, serverUpdatedAt: null };
+		expect(isAcknowledgedNarratorDraft(local)).toBe(true);
+		expect(isAcknowledgedNarratorDraft({ ...local, unsynced: true })).toBe(false);
+		expect(isAcknowledgedNarratorDraft({ ...local, syncedRevision: undefined })).toBe(false);
+		expect(isAcknowledgedNarratorDraft({ ...local, serverRevision: null })).toBe(false);
+		for (const revision of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(
+				isAcknowledgedNarratorDraft({
+					...local,
+					serverRevision: revision,
+					syncedRevision: revision,
+				}),
+			).toBe(false);
+		}
+	});
+
+	test("an explicitly unknown dirty baseline retains an unsynced empty tombstone", () => {
+		persistNarratorInputDraft("user-a", "n1", "", 4, "t4", [], null);
+		const local = readNarratorInputDraft("user-a", "n1");
+		expect(local.unsynced).toBe(true);
+		expect(local.syncedRevision).toBeUndefined();
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: false, revision: 4 })).toBe(false);
+	});
+
+	test("edits before a server revision is known remain explicitly unsynced", () => {
+		persistNarratorInputDraft("user-a", "n1", "", null, null, [], {
+			text: "cleared locally",
+			fileReferences: [],
+		});
+		expect(readNarratorInputDraft("user-a", "n1").unsynced).toBe(true);
+		expect(readNarratorInputDraft("user-a", "n1").syncedRevision).toBeUndefined();
+	});
+
+	test("only an exact acknowledged text/reference snapshot skips a body read", () => {
+		const synced = { text: "ack", fileReferences: [] };
+		persistNarratorInputDraft("user-a", "n1", "ack", 4, "t4", [], synced);
+		const local = readNarratorInputDraft("user-a", "n1");
+		expect(local.syncedRevision).toBe(4);
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: true, revision: 4 })).toBe(true);
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: true, revision: 5 })).toBe(false);
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: false, revision: 4 })).toBe(false);
+		persistNarratorInputDraft("user-a", "n1", "dirty", 4, "t4", [], synced);
+		const dirty = readNarratorInputDraft("user-a", "n1");
+		expect(dirty.syncedRevision).toBeUndefined();
+		expect(dirty.unsynced).toBe(true);
+		expect(canHydrateNarratorDraftFromMeta(dirty, { hasDraft: true, revision: 4 })).toBe(false);
+	});
+
+	test("legacy base revisions without an acknowledgement cannot skip the body", () => {
+		persistNarratorInputDraft("user-a", "n1", "legacy", 4, "t4");
+		expect(
+			canHydrateNarratorDraftFromMeta(readNarratorInputDraft("user-a", "n1"), {
+				hasDraft: true,
+				revision: 4,
+			}),
+		).toBe(false);
+	});
+
+	test("unsynced clears are preserved as conflicts when another client advanced the revision", () => {
+		const local = { text: "", serverRevision: 4, serverUpdatedAt: "t4", unsynced: true as const };
+		expect(
+			resolveHydratedNarratorDraft({
+				local,
+				serverText: "new elsewhere",
+				serverRevision: 5,
+				currentInput: "",
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "", conflict: true });
 	});
 });
 

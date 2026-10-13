@@ -71,9 +71,21 @@ describe("createPretextDocumentCache", () => {
 		expect(cache.peek("n1")).toBeNull();
 	});
 
-	it("refuses a zero messageVersion (never-committed document)", () => {
+	it("accepts a real non-empty loaded window at server version zero", () => {
 		const cache = createPretextDocumentCache();
-		cache.write({ narratorId: "n1", input: input([1], { messageVersion: 0 }) });
+		const zero = input([1, 2], { messageVersion: 0 });
+		cache.write({ narratorId: "n1", input: zero });
+		expect(cache.peek("n1")).toBe(zero);
+	});
+
+	it("rejects empty and invalid-version snapshots without leaving stale data behind", () => {
+		const cache = createPretextDocumentCache();
+		for (const version of [-1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+			cache.write({ narratorId: "n1", input: input([1, 2]) });
+			cache.write({ narratorId: "n1", input: input([1], { messageVersion: version }) });
+			expect(cache.peek("n1")).toBeNull();
+		}
+		cache.write({ narratorId: "n1", input: input([], { messageVersion: 0 }) });
 		expect(cache.peek("n1")).toBeNull();
 	});
 

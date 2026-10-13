@@ -92,7 +92,7 @@ import {
 	touchSessionVisual,
 } from "../lib/browser/session";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
-import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import {
 	parseFileReferenceInput,
@@ -101,6 +101,7 @@ import {
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
+	getAuthorizedNarrator,
 	narratorPrincipalOf,
 	requireAccessToNarratorRow,
 	requireNarratorAccess,
@@ -201,6 +202,8 @@ import {
 	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	sessionExportDownloadQuerySchema,
+	sessionExportToSchema,
 	setNarratorGitIdentitySchema,
 	subagentRecoverySchema,
 	suggestAnswersSchema,
@@ -308,6 +311,8 @@ import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
 } from "../services/narrator-message-count";
+import { getNarratorNavigationSummary } from "../services/narrator-navigation-summary";
+import { getNarratorPanelState } from "../services/narrator-panel-state";
 import {
 	deferPendingQuestion,
 	disarmQuestionReflection,
@@ -435,6 +440,9 @@ import {
 	prepareLocalRevertPlan,
 } from "../services/revert-planner-local-access";
 import { searchService } from "../services/search-service";
+import { exportNarratorSession } from "../services/session-interchange/export";
+import { resolveSessionLocation } from "../services/session-interchange/locations";
+import { buildSessionDownload, writeSessionExport } from "../services/session-interchange/sinks";
 import { skillService } from "../services/skill-service";
 import {
 	buildImpreciseRevertWarnings,
@@ -702,7 +710,9 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
  * downgrade nobody chose, and the resulting hole looks exactly like correct code.
  */
 // Resolving a target reads metadata only; it still requires this narrator's read ACL.
-const READ_ONLY_WRITE_SUBPATHS = new Set(["leave", "file-references/resolve"]);
+// `session-export-to` writes files on another machine but only reads the narrator;
+// its target is authorized separately in `resolveSessionLocation`.
+const READ_ONLY_WRITE_SUBPATHS = new Set(["leave", "file-references/resolve", "session-export-to"]);
 
 // Search traverses lazy inherited refs. Keep the refusal ahead of the general ACL/work admission
 // middleware so PG never reaches the legacy SQLite lineage query first. The pretext tail page is
@@ -1492,18 +1502,16 @@ narratorRoutes.post("/broken-models/undo", requireAdmin, async (c) => {
 
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
+	const started = performance.now();
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	const [hasDraft, gitSummary] = await Promise.all([
+	const narrator =
+		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const [hasDraft, navigationSummary, messageCount] = await Promise.all([
 		narratorHasDraft(c.get("user").sub, id),
-		getNarratorGitSummary(id, narrator.workspaceRevision, narratorPrincipalOf(c), c.req.raw.signal),
+		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c)),
+		countNarratorMessageRefs(id, narrator.messageVersion),
 	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
-	// The stored counter is only refreshed when a turn ends, so a narrator that has
-	// not run since the turn-count → message-count change would still report the old
-	// value here. One narrator's refs are cheap to count exactly (an indexed count(*)),
-	// unlike the list endpoint where it would mean one subquery per row.
-	const messageCount = await countNarratorMessageRefs(id);
 	// Policy decision only (no routing, so balanced aggregations do not advance).
 	// A resolution failure just leaves the plain "follow parent" label.
 	const modelInheritance =
@@ -1512,9 +1520,15 @@ narratorRoutes.get("/:id", async (c) => {
 					.then((result) => result.inheritance)
 					.catch(() => undefined)
 			: undefined;
+	await requireNarratorAccess(c, id, "read");
+	const elapsedMs = Math.round(performance.now() - started);
+	if (elapsedMs >= 250)
+		logger.warn("Slow narrator detail hydration", { narratorId: id, elapsedMs, messageCount });
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
-		gitSummary,
+		// Legacy clients remain compatible; Git facts are loaded by the opt-in endpoint.
+		gitSummary: null,
+		navigationSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
 		...(runtimeModel && {
@@ -1525,6 +1539,30 @@ narratorRoutes.get("/:id", async (c) => {
 			},
 		}),
 	});
+});
+
+narratorRoutes.get("/:id/git/summary", async (c) => {
+	const id = c.req.param("id");
+	const narrator =
+		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const summary = await getNarratorGitSummary(
+		id,
+		narrator.workspaceRevision,
+		narratorPrincipalOf(c),
+		c.req.raw.signal,
+	);
+	await requireNarratorAccess(c, id, "read");
+	return c.json(summary);
+});
+
+narratorRoutes.get("/:id/panel-state", async (c) => {
+	const id = c.req.param("id");
+	const result = await getNarratorPanelState(id, c.get("user").sub, {
+		permissionsCursor: c.req.query("permissionsCursor"),
+		bufferCursor: c.req.query("bufferCursor"),
+	});
+	await requireNarratorAccess(c, id, "read");
+	return c.json(result);
 });
 
 // Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
@@ -3481,6 +3519,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
 		beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
 		limit,
+		signal: c.req.raw.signal,
 		messageVersion:
 			expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
 				? expectedMessageVersion
@@ -3496,6 +3535,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// place the backfill actually copies anything. Sequenced, both sides observe
 	// the same post-backfill version, and the check goes back to meaning what it
 	// says: another writer changed the narrator underneath us.
+	await requireNarratorAccess(c, id, "read");
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
 		columns: { messageVersion: true },
@@ -3621,6 +3661,73 @@ narratorRoutes.get("/:id/export", async (c) => {
 	});
 });
 
+/**
+ * Download this narrator as a resumable Claude Code / Codex session.
+ *
+ * Read access is enough (the `/:id/*` gate enforces it): the files contain nothing
+ * the caller cannot already read through the transcript export. A single file is
+ * returned as-is; a session with subagents comes back as a zip laid out like the
+ * CLI's config dir.
+ */
+narratorRoutes.get("/:id/session-export", async (c) => {
+	const id = c.req.param("id");
+	const parsed = sessionExportDownloadQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const result = await exportNarratorSession(id, parsed.data, c.req.raw.signal);
+	const download = buildSessionDownload(result);
+	return new Response(download.body, {
+		headers: {
+			"Content-Type": download.contentType,
+			"Content-Disposition": `attachment; filename="${download.fileName.replace(/[^\x20-\x7e]|"/g, "_")}"; filename*=UTF-8''${encodeURIComponent(download.fileName)}`,
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
+			// The client shows these next to the download; headers keep the body a plain file.
+			"X-Session-Id": result.sessionId,
+			"X-Resume-Command": encodeURIComponent(result.resumeCommand),
+			"X-Session-Warnings": encodeURIComponent(JSON.stringify(result.warnings)),
+			// Single file only: where it belongs under the CLI's config dir.
+			...(download.placement ? { "X-Session-Path": encodeURIComponent(download.placement) } : {}),
+		},
+	});
+});
+
+/**
+ * Write this narrator as a resumable session into a CLI's config dir on the
+ * server or a device.
+ *
+ * POST, but it only READS the narrator (listed in READ_ONLY_WRITE_SUBPATHS), so
+ * read access suffices and no session work admission is taken. The target side
+ * is authorized separately: the server needs an admin, a device needs its
+ * manager, and a project-scoped device must belong to this narrator's project.
+ */
+narratorRoutes.post("/:id/session-export-to", async (c) => {
+	const id = c.req.param("id");
+	const parsed = sessionExportToSchema.safeParse(await c.req.json().catch(() => null));
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const { location, ...options } = parsed.data;
+	const user = c.get("user");
+	const narrator = await requireNarratorAccess(c, id, "read");
+	const { resolveNarratorProjectId } = await import("../services/narrator-project");
+	const resolved = await resolveSessionLocation(
+		location,
+		options.format,
+		{ userId: user.sub, isAdmin: user.role === "admin" },
+		{ signal: c.req.raw.signal, projectId: await resolveNarratorProjectId(narrator) },
+	);
+	const result = await exportNarratorSession(id, options, c.req.raw.signal);
+	const written = await writeSessionExport(resolved.fs, resolved.root, result);
+	return c.json({
+		format: result.format,
+		sessionId: result.sessionId,
+		cwd: result.cwd,
+		title: result.title,
+		root: written.root,
+		paths: written.paths,
+		cwdExists: written.cwdExists,
+		resumeCommand: result.resumeCommand,
+		warnings: written.warnings,
+	});
+});
 // Exact historical file bodies, authorized by the same ref/COW/child selector as detail.
 narratorRoutes.get("/:id/tool-calls/:toolUseId/file-edit-preview", async (c) => {
 	const row = await narratorService.getToolCallPreviewMetadata(

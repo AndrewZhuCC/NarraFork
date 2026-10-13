@@ -1,4 +1,4 @@
-import { ActionIcon, Box, Button, Group, Stack, Text, Textarea, Tooltip } from "@mantine/core";
+import { Box, Button, Group, Stack, Text, Textarea } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { FileReference, FileReferenceCandidate } from "@shared/file-reference";
@@ -21,8 +21,8 @@ import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInp
 import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { ApiError, api } from "../../../lib/api";
-import { narratorsApi } from "../../../lib/api/narrators";
 import { formatLocaleNumber } from "../../../lib/intl-format";
+import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -42,9 +42,11 @@ import {
 } from "./file-reference-input";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import {
+	canHydrateNarratorDraftFromMeta,
 	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
 	getNarratorDraftStorageId,
+	isAcknowledgedNarratorDraft,
 	persistNarratorInputDraft,
 	purgeLegacyNarratorInputStorage,
 	readNarratorInputDraft,
@@ -160,6 +162,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const qc = useQueryClient();
 		const { data: currentUser } = useCurrentUser();
 		const currentUserId = currentUser?.id ? String(currentUser.id) : null;
+		const currentDraftScope = currentUserId
+			? getNarratorDraftStorageId(currentUserId, narratorId)
+			: null;
 		const dock = useNarratorDockContext();
 		const fileScope = useFileReferenceScope();
 		const fileCacheScope =
@@ -190,12 +195,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
 		const inputRef = useRef(input);
 		const draftSourceIdRef = useRef(createDraftSourceId());
-		const lastSyncedDraftRef = useRef<FileReferenceInput>({ text: "", fileReferences: [] });
+		const lastSyncedDraftRef = useRef<FileReferenceInput | null>(null);
+		// Unknown local snapshots can detect edits, but cannot serve as acknowledged baselines.
+		const unacknowledgedDraftRef = useRef<{
+			input: FileReferenceInput;
+			unsynced: boolean;
+		} | null>(null);
 		const lastDraftRevisionRef = useRef<number | null>(null);
 		const lastDraftUpdatedAtRef = useRef<string | null>(null);
 		const draftConflictRef = useRef<NarratorRemoteDraft | null>(null);
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
+		const draftReadEpochRef = useRef(0);
+		const draftOwnerScopeRef = useRef<string | null>(null);
 		const textareaRef = useRef<HTMLTextAreaElement>(null);
 		// null until the user is known: recall is keyed per `(user, narrator)`, and a
 		// placeholder key would both consume a slot in the bounded history namespace and
@@ -267,7 +279,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		});
 
 		useEffect(() => {
-			if (!currentUserId || !draftHydrated || sendingRef.current) return;
+			if (
+				!currentUserId ||
+				!draftHydrated ||
+				sendingRef.current ||
+				draftOwnerScopeRef.current !== currentDraftScope
+			)
+				return;
+			const unknown = unacknowledgedDraftRef.current;
+			const unknownEdited =
+				unknown &&
+				(unknown.unsynced || !sameFileReferenceInput(inputStateRef.current, unknown.input));
+			// Without a trusted server baseline, reverting to the restored value cannot acknowledge edits.
+			if (unknownEdited) unknown.unsynced = true;
 			persistNarratorInputDraft(
 				currentUserId,
 				narratorId,
@@ -275,8 +299,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				lastDraftRevisionRef.current,
 				lastDraftUpdatedAtRef.current,
 				fileReferences,
+				lastSyncedDraftRef.current ?? (unknownEdited ? null : undefined),
 			);
-		}, [currentUserId, draftHydrated, input, fileReferences, narratorId, sendingRef]);
+		}, [
+			currentUserId,
+			currentDraftScope,
+			draftHydrated,
+			input,
+			fileReferences,
+			narratorId,
+			sendingRef,
+		]);
 
 		const syncDraftNow = useCallback(
 			async (
@@ -286,6 +319,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			) => {
 				const refs = copyFileReferences(references, text);
 				if (!currentUserId) throw new Error("Current user is unavailable");
+				if (draftOwnerScopeRef.current !== currentDraftScope)
+					throw new Error("Draft belongs to a previous account or narrator");
 				if (baseRevision == null) throw new Error("Draft has not been loaded from the server");
 				if (!isDraftWithinSyncLimit(text)) {
 					throw new Error(`Draft exceeds the ${MAX_NARRATOR_DRAFT_CHARS} character sync limit`);
@@ -307,7 +342,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							sourceId,
 							refs,
 						);
-						if (seq === draftSyncSeqRef.current) {
+						if (
+							seq === draftSyncSeqRef.current &&
+							qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
+						) {
 							const newerConflict = draftConflictRef.current;
 							if (newerConflict && newerConflict.revision > result.revision) return result;
 							lastSyncedDraftRef.current = {
@@ -325,6 +363,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								result.revision,
 								result.updatedAt,
 								inputStateRef.current.fileReferences,
+								lastSyncedDraftRef.current,
 							);
 							qc.setQueryData(
 								["narrators", narratorId],
@@ -334,6 +373,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						}
 						return result;
 					} catch (err) {
+						if (
+							seq !== draftSyncSeqRef.current ||
+							qc.getQueryData<{ id?: string }>(["auth", "me"])?.id !== currentUserId
+						)
+							return;
 						const current =
 							err instanceof ApiError && err.status === 409
 								? (err.data?.current as
@@ -382,7 +426,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					}
 				}
 			},
-			[currentUserId, narratorId, qc],
+			[currentUserId, currentDraftScope, narratorId, qc],
 		);
 
 		const clearTextAndDraft = useCallback(() => {
@@ -412,16 +456,30 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			void draftLoadAttempt;
 			// An old account/narrator's in-flight CAS must not overwrite the newly hydrated pair.
 			draftSyncSeqRef.current++;
+			const readEpoch = ++draftReadEpochRef.current;
+			draftOwnerScopeRef.current = null;
 			if (!currentUserId) {
+				restoreInput("", []);
+				lastDraftRevisionRef.current = null;
+				lastDraftUpdatedAtRef.current = null;
+				lastSyncedDraftRef.current = null;
+				unacknowledgedDraftRef.current = null;
 				setDraftHydrated(false);
 				setDraftSyncState("loading");
 				return;
 			}
 			let cancelled = false;
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), 15_000);
+			const alive = () =>
+				!cancelled &&
+				draftReadEpochRef.current === readEpoch &&
+				qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId;
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
 			draftConflictRef.current = null;
-			lastSyncedDraftRef.current = { text: "", fileReferences: [] };
+			lastSyncedDraftRef.current = null;
+			unacknowledgedDraftRef.current = null;
 			lastDraftRevisionRef.current = null;
 			if (draftSyncTimerRef.current) {
 				clearTimeout(draftSyncTimerRef.current);
@@ -432,13 +490,56 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			lastDraftRevisionRef.current = localDraft.serverRevision;
 			lastDraftUpdatedAtRef.current = localDraft.serverUpdatedAt;
 			restoreInput(localDraft.text, localDraft.fileReferences ?? []);
-			setDraftHydrated(true);
 			const localDraftAtRequest = inputStateRef.current;
+			// Restore trusted text AND references before the persist effect is enabled.
+			// A dirty clear or a legacy/unknown CAS base must not be stamped synchronized.
+			if (isAcknowledgedNarratorDraft(localDraft)) {
+				lastSyncedDraftRef.current = localDraftAtRequest;
+			} else {
+				unacknowledgedDraftRef.current = {
+					input: localDraftAtRequest,
+					unsynced: !!localDraft.unsynced,
+				};
+			}
+			draftOwnerScopeRef.current = currentDraftScope;
+			setDraftHydrated(true);
 
-			api
-				.getNarratorDraft(narratorId)
+			const loadDraft = async () => {
+				try {
+					const panel = await api.getNarratorPanelState(narratorId, {
+						signal: controller.signal,
+						fresh: draftLoadAttempt > 0,
+					});
+					if (!alive()) return;
+					if (canHydrateNarratorDraftFromMeta(localDraft, panel.draft)) {
+						// The local snapshot is acknowledged. Keep any text/references typed while metadata loaded.
+						lastSyncedDraftRef.current = {
+							text: localDraft.text,
+							fileReferences: readFileReferences(localDraft.fileReferences, localDraft.text),
+						};
+						lastDraftRevisionRef.current = panel.draft.revision;
+						lastDraftUpdatedAtRef.current = panel.draft.updatedAt;
+						setDraftSyncState("ready");
+						persistNarratorInputDraft(
+							currentUserId,
+							narratorId,
+							inputRef.current,
+							panel.draft.revision,
+							panel.draft.updatedAt,
+							inputStateRef.current.fileReferences,
+							lastSyncedDraftRef.current,
+						);
+						return;
+					}
+				} catch (error) {
+					if (!alive() || !shouldFallbackPanelState(error)) throw error;
+				}
+				return api.getNarratorDraft(narratorId, controller.signal);
+			};
+
+			loadDraft()
 				.then((draft) => {
-					if (cancelled) return;
+					if (!alive() || !draft) return;
 					const serverText = draft.hasDraft ? draft.text : "";
 					const serverFileReferences = draft.hasDraft
 						? readFileReferences(draft.fileReferences, serverText)
@@ -451,10 +552,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						serverRevision: draft.revision,
 						currentInput,
 						currentFileReferences: inputStateRef.current.fileReferences,
-						localChangedSinceRequest: !sameFileReferenceInput(
-							inputStateRef.current,
-							localDraftAtRequest,
-						),
+						localChangedSinceRequest:
+							!sameFileReferenceInput(inputStateRef.current, localDraftAtRequest) ||
+							(!!unacknowledgedDraftRef.current?.unsynced && !localDraft.unsynced),
 					});
 					lastSyncedDraftRef.current = { text: serverText, fileReferences: serverFileReferences };
 					lastDraftRevisionRef.current = resolved.conflict
@@ -471,6 +571,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						resolved.conflict ? localDraft.serverRevision : draft.revision,
 						resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
 						resolved.fileReferences ?? [],
+						lastSyncedDraftRef.current,
 					);
 					if (resolved.conflict) {
 						draftConflictRef.current = draft;
@@ -480,18 +581,26 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					}
 				})
 				.catch(() => {
-					if (!cancelled) setDraftSyncState("error");
-				});
+					if (alive()) setDraftSyncState("error");
+				})
+				.finally(() => clearTimeout(timer));
 			return () => {
 				cancelled = true;
+				clearTimeout(timer);
+				draftSyncSeqRef.current++;
+				controller.abort();
 			};
-		}, [currentUserId, draftLoadAttempt, narratorId, restoreInput]);
+		}, [currentUserId, currentDraftScope, draftLoadAttempt, narratorId, restoreInput, qc]);
 
 		useEffect(() => {
 			if (!draftHydrated || !currentUserId || draftSyncState !== "ready" || sendingRef.current)
 				return;
 			if (!isDraftWithinSyncLimit(input)) return;
-			if (sameFileReferenceInput(inputState, lastSyncedDraftRef.current)) return;
+			if (
+				lastSyncedDraftRef.current &&
+				sameFileReferenceInput(inputState, lastSyncedDraftRef.current)
+			)
+				return;
 			if (draftSyncTimerRef.current) clearTimeout(draftSyncTimerRef.current);
 			draftSyncTimerRef.current = setTimeout(() => {
 				draftSyncTimerRef.current = null;
@@ -529,6 +638,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				remote.revision,
 				remote.updatedAt,
 				refs,
+				lastSyncedDraftRef.current,
 			);
 		}, [currentUserId, narratorId, restoreInput]);
 
@@ -559,15 +669,21 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			(draft: NarratorRemoteDraft) => {
 				const currentRevision = lastDraftRevisionRef.current;
 				if (currentRevision != null && draft.revision < currentRevision) return;
+				draftReadEpochRef.current++;
 				const remoteText = draft.hasDraft ? draft.text : "";
 				const remoteRefs = draft.hasDraft
 					? readFileReferences(draft.fileReferences, remoteText)
 					: [];
 				const remoteInput = { text: remoteText, fileReferences: remoteRefs };
-				const hasLocalUnsyncedChanges = !sameFileReferenceInput(
-					inputStateRef.current,
-					lastSyncedDraftRef.current,
-				);
+				const unknown = unacknowledgedDraftRef.current;
+				const hasLocalUnsyncedChanges = lastSyncedDraftRef.current
+					? !sameFileReferenceInput(inputStateRef.current, lastSyncedDraftRef.current)
+					: !!(
+							inputRef.current ||
+							inputStateRef.current.fileReferences.length ||
+							unknown?.unsynced ||
+							(unknown && !sameFileReferenceInput(inputStateRef.current, unknown.input))
+						);
 				if (
 					draft.sourceId !== draftSourceIdRef.current &&
 					hasLocalUnsyncedChanges &&
@@ -592,6 +708,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						draft.revision,
 						draft.updatedAt,
 						nextInput.fileReferences,
+						lastSyncedDraftRef.current,
 					);
 				}
 				if (shouldApplyRemote) restoreInput(remoteText, remoteRefs);

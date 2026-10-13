@@ -14,6 +14,7 @@ import {
 	type SenderMessage,
 } from "../../lib/agent/sender-projection";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
+import { verifyModelHistoryRowsCurrent } from "./model-history-source";
 
 export type RuntimeHistoryMessage = SenderMessage & {
 	injectionConsumedAt?: Date | string | null;
@@ -32,6 +33,8 @@ export interface RuntimeHistoryOptions {
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
+	/** Shared deadline, including source reads and provider projection. */
+	deadline?: number;
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
@@ -153,11 +156,21 @@ export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessa
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
 ): Promise<PreparedRuntimeHistory> {
+	const deadline = Math.min(options.deadline ?? Number.POSITIVE_INFINITY, Date.now() + 10_000);
+	const checkBudget = () => {
+		options.attachmentSignal?.throwIfAborted();
+		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
+	};
+	checkBudget();
 	const sourceMessages =
 		options.sourceMessages ??
 		(await (
 			await import("../narrator-service")
-		).narratorService.getModelHistorySinceLastCompact(options.narratorId));
+		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
+			signal: options.attachmentSignal,
+			deadline,
+		}));
+	checkBudget();
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
 	let modelMessages = sourceMessages
@@ -183,6 +196,7 @@ export async function buildRuntimeHistory(
 		modelMessages = prepared.messages;
 		currentInput = prepared.currentInput;
 	}
+	checkBudget();
 	// Full Await outputs remain intact until the actual provider-input boundary.
 	// A builder may omit/move a user receipt (or a prebuilt child may replace
 	// this history), so row presence alone is not a safe deduplication decision.
@@ -195,6 +209,7 @@ export async function buildRuntimeHistory(
 			currentInput,
 		},
 	);
+	checkBudget();
 	// The WeakMap key MUST stay the builder's actual history array. A copied array loses
 	// the exact sourceHistory/adoption boundary, including edited currentRevision candidates.
 	await trackAgentMessageHistory(
@@ -205,6 +220,11 @@ export async function buildRuntimeHistory(
 		modelMessages.map(projectMessageSenderForModel),
 		built.trailingUserText,
 	);
+	await verifyModelHistoryRowsCurrent(sourceMessages, {
+		signal: options.attachmentSignal,
+		deadline,
+	});
+	checkBudget();
 	const input = projectCurrentInput(modelMessages, currentInput ?? "");
 	const combined = built.trailingUserText?.trim()
 		? input.trim()

@@ -551,6 +551,20 @@ test("child after-tools parts separate the durable buffered input and its knowle
 		record: { narratorId: "child", compactSeq: 0, hits: [] },
 	});
 	try {
+		// cleanDb clears the installation marker, not the shipped revision triggers. Restore
+		// this private fixture row so replay uses the real loader's trusted source contract.
+		const { MODEL_HISTORY_REVISION_CONTRACT } = await import(
+			"../agent-runtime/model-history-revision-sql"
+		);
+		const { readSqliteModelHistorySignature } = await import(
+			"../agent-runtime/model-history-revision"
+		);
+		sqlite
+			.query(
+				"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
+			)
+			.run(MODEL_HISTORY_REVISION_CONTRACT);
+		expect(readSqliteModelHistorySignature(sqlite, "child").trusted).toBe(true);
 		const value = delivery("child", "buffered message");
 		const accepted = await pushSubagentBufferedMessage("child", value.text, { delivery: value });
 		const projected = await inbox.withInboxOwner("child", () =>
@@ -601,7 +615,6 @@ test("child after-tools parts separate the durable buffered input and its knowle
 					profile: "subagent",
 					model: "gpt-5",
 					provider: `buffered-replay-${apiMode}`,
-					sourceMessages: childMessages(),
 				});
 				const historyText = JSON.stringify(rebuilt.history);
 				expect(historyText).toContain(value.text);

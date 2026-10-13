@@ -38,6 +38,7 @@ export interface NugProviderInfo {
 export function useNugQuota(
 	resolvedModel: string | undefined,
 	nugProviders: NugProviderSetting[] | undefined,
+	enabled = true,
 ): NugProviderInfo | null {
 	const qc = useQueryClient();
 
@@ -51,7 +52,7 @@ export function useNugQuota(
 	const { data: nugQuotasData } = useQuery({
 		queryKey: ["nug", "quotas"],
 		queryFn: api.nugGetQuotas,
-		enabled: hasNugProviders,
+		enabled: enabled && hasNugProviders,
 		staleTime: 30_000,
 	});
 	const missingCurrentNugQuota = Boolean(
@@ -60,7 +61,7 @@ export function useNugQuota(
 	const { data: currentNugQuotaData } = useQuery({
 		queryKey: ["nug", "quota", nugProviderConfig?.id],
 		queryFn: () => api.nugGetQuota(nugProviderConfig?.id ?? ""),
-		enabled: missingCurrentNugQuota,
+		enabled: enabled && missingCurrentNugQuota,
 		staleTime: 30_000,
 	});
 

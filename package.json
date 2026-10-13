@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.9.1",
+	"version": "0.9.2",
 	"private": true,
 	"license": "MPL-2.0",
 	"packageManager": "bun@1.4.2",
@@ -150,5 +150,8 @@
 	"trustedDependencies": [
 		"@parcel/watcher",
 		"tree-sitter-bash"
-	]
+	],
+	"patchedDependencies": {
+		"@cypress/request-promise@5.0.0": "patches/@cypress%2Frequest-promise@5.0.0.patch"
+	}
 }

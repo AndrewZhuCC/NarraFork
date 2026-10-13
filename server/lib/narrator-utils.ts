@@ -67,7 +67,11 @@ export type NarratorTrait =
 	| "background"
 	| "plan"
 	| "knowledge-steward"
-	| "scheduled";
+	| "scheduled"
+	| "imported";
+
+/** Trait marking a narrator whose history was imported from Claude Code or Codex. */
+export const IMPORTED_TRAIT = "imported";
 
 /** Trait marking a Knowledge Steward narrator (a standalone knowledge-base management session). */
 export const KNOWLEDGE_KIND_TRAIT = "knowledge-steward";

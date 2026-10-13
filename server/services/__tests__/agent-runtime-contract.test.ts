@@ -148,6 +148,123 @@ for (const scenario of runtimeContractScenarios) {
 	});
 }
 
+describe("CriticalEventPersistenceError surfaces its cause", () => {
+	// The narrator's `errorMessage`, the WebSocket `narrator_error` and the
+	// `narrator_error` on the narrator event stream all render `String(err)`, which
+	// prints `message` and nothing else. A cause parked on `Error.cause` is therefore
+	// invisible to the reader who has to decide whether to retry — which is the whole
+	// point of stopping the loop instead of warning and continuing.
+	//
+	// Scope note: these assert the CONSTRUCTOR contract. That the folded message then
+	// reaches the reader is the job of the executor/orchestrator seams, which this
+	// file does not drive.
+	test("includes the underlying cause in the message", () => {
+		const cause = new Error("SQLITE_BUSY: database is locked");
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause,
+		});
+		expect(error.message).toBe(
+			"Tool result could not be persisted: SQLITE_BUSY: database is locked",
+		);
+		// The cause stays reachable structurally too; the message duplication is
+		// additive, not a replacement.
+		expect((error.cause as Error).message).toBe(cause.message);
+	});
+
+	test("handles a cause that is a plain string", () => {
+		const error = new CriticalEventPersistenceError("Write source exceeds final content", {
+			cause: "length went backwards",
+		});
+		expect(error.message).toBe("Write source exceeds final content: length went backwards");
+	});
+
+	test("leaves the message alone when there is no cause", () => {
+		const error = new CriticalEventPersistenceError(
+			"Detached tool result has no execution receipt",
+		);
+		expect(error.message).toBe("Detached tool result has no execution receipt");
+	});
+
+	test("does not repeat a message the cause already contains", () => {
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause: new Error("Tool result could not be persisted"),
+		});
+		expect(error.message).toBe("Tool result could not be persisted");
+	});
+
+	test("keeps a short cause that merely occurs inside the summary", () => {
+		// `includes` used to drop this: the whole cause text is the word "failed",
+		// which already occurs in the summary. The diagnosis is still distinct.
+		const error = new CriticalEventPersistenceError(
+			"Assistant content persistence barrier failed",
+			{ cause: new Error("failed") },
+		);
+		expect(error.message).toBe("Assistant content persistence barrier failed: failed");
+	});
+
+	test("survives a cause that cannot be stringified", () => {
+		// `String()` throws "No default value" on a null-prototype object. This
+		// constructor runs inside the executor's catch block, so throwing here would
+		// replace the persistence diagnosis with a TypeError and hide the real failure
+		// — the reader must still get the barrier message.
+		const cause = Object.create(null) as object;
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause,
+		});
+		expect(error.message).toBe("Tool result could not be persisted");
+	});
+
+	test("caps a huge cause instead of publishing it whole", () => {
+		// No nested driver error: the dump itself is the only text, so it is kept
+		// and the published string — prefix, dump, and marker — stays within 1 KiB.
+		const cause = new Error(`Failed query: UPDATE t SET x = ?\nparams: ${"p".repeat(5_000)}`);
+		const error = new CriticalEventPersistenceError(
+			"Assistant content persistence barrier failed",
+			{
+				cause,
+			},
+		);
+		expect(error.message.length).toBeLessThanOrEqual(1_000);
+		expect(error.message).toContain("truncated");
+		expect(error.message).toContain("Failed query: UPDATE t SET x = ?");
+		expect(error.message).not.toContain("p".repeat(5_000));
+	});
+
+	test("publishes the driver error behind a query dump, not the statement", () => {
+		const driver = new Error("SQLITE_BUSY: database is locked");
+		const wrapped = new Error(
+			`Failed query: UPDATE t SET secret = ?\nparams: ${"p".repeat(5_000)}`,
+			{ cause: driver },
+		);
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause: wrapped,
+		});
+		expect(error.message).toBe(
+			"Tool result could not be persisted: SQLITE_BUSY: database is locked",
+		);
+		expect(error.message).not.toContain("params:");
+		expect(error.message).not.toContain("secret");
+		// The wrapper stays on `cause` for logs. Readers see `message` only.
+		expect((error.cause as Error).message.startsWith("Failed query:")).toBe(true);
+	});
+
+	test("strips a query dump the caller already interpolated into the summary", () => {
+		const driver = new Error("SQLITE_BUSY: database is locked");
+		const wrapped = new Error("Failed query: UPDATE t SET secret = ?\nparams: sekret", {
+			cause: driver,
+		});
+		const error = new CriticalEventPersistenceError(
+			`Failed to atomically commit EnterPlanMode: ${String(wrapped)}`,
+			{ cause: wrapped },
+		);
+		expect(error.message).toBe(
+			"Failed to atomically commit EnterPlanMode: SQLITE_BUSY: database is locked",
+		);
+		expect(error.message).not.toContain("params:");
+		expect(error.message).not.toContain("sekret");
+	});
+});
+
 describe("runtime contract fixture controls", () => {
 	test("clock honors deadline ordering, cancellation and nested scheduling without global timers", () => {
 		const clock = createContractClock();

@@ -25,6 +25,10 @@
 		"repairFailed": "Repair did not complete successfully. Check again or handle the directory manually."
 	},
 	"dockTabs": {
+		"gitIdentity": "Git commit identity",
+		"gitIdentityUnconfigured": "No git identity configured — add one in Settings → Profile",
+		"gitIdentityFollowDefault": "Follow the default identity ({{name}})",
+		"gitIdentityFollowDefaultPlain": "Follow the default identity",
 		"revealInExplorer": "Show in File Manager",
 		"revealFailed": "Could not open the file manager",
 		"openInWindow": "Open in window",

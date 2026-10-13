@@ -62,8 +62,11 @@ describe("api cross-origin policy", () => {
 		// The sliding-renewal token rides on a custom response header, which a
 		// cross-origin caller cannot read unless it is listed in `exposeHeaders`. Without
 		// it an embedded front end would keep using a token until it expires outright,
-		// then appear to log the user out at random.
-		expect(APP_TS).toContain("exposeHeaders: [SESSION_RENEWAL_HEADER]");
+		// then appear to log the user out at random. Other headers may share the list
+		// (the session export download exposes its own), so this pins membership.
+		expect(withoutComments(APP_TS)).toMatch(
+			/exposeHeaders:\s*\[[^\]]*\bSESSION_RENEWAL_HEADER\b[^\]]*\]/,
+		);
 	});
 
 	test("responses declare that they vary by Origin", () => {

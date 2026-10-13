@@ -54,11 +54,7 @@ export function buildNativeTestCommand(args: readonly string[]): string[] {
 		"--reporter=junit",
 		"--reporter-outfile=artifacts/ci-tests.xml",
 	];
-	const balanced = [
-		"--parallel=2",
-		`--timings=${CI_TEST_TIMINGS_PATH}`,
-		"--update-timings",
-	];
+	const balanced = ["--parallel=2", `--timings=${CI_TEST_TIMINGS_PATH}`, "--update-timings"];
 	const usesBalanced = balanced.some((flag) => args.includes(flag));
 	const required = usesBalanced ? [...fixed, ...balanced] : fixed;
 	if (
@@ -138,7 +134,9 @@ export async function prepareNativeTestTimings(
 		}
 		if (length > CI_TEST_TIMINGS_MAX_BYTES)
 			throw new Error("Native test timings input byte limit exceeded");
-		content = JSON.stringify(validateNativeTestTimings(JSON.parse(bytes.subarray(0, length).toString("utf8"))));
+		content = JSON.stringify(
+			validateNativeTestTimings(JSON.parse(bytes.subarray(0, length).toString("utf8"))),
+		);
 	} finally {
 		await source.close();
 	}
