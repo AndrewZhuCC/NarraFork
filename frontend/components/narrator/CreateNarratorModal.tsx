@@ -10,6 +10,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import {
 	ActionIcon,
 	Button,
@@ -418,6 +419,7 @@ export function CreateNarratorModal({
 		<DndContext
 			sensors={sensors}
 			collisionDetection={closestCenter}
+			modifiers={[restrictToVerticalAxis]}
 			onDragStart={handleDragStart}
 			onDragEnd={handleDragEnd}
 			onDragCancel={handleDragCancel}
