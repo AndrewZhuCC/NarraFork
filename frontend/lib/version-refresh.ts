@@ -1,4 +1,5 @@
 import { clearPwaCacheAndReload, fetchServerHealth, stashStartupRecoveryFailure } from "./pwa";
+import { appVersionsMatch } from "./version-match";
 
 const RELOAD_KEY = "narrafork_version_reload";
 
@@ -35,7 +36,7 @@ export function createVersionRefreshMonitor(
 			if (controller.signal.aborted || !health?.version) return;
 			const version = health.version.replace(/^v/, "");
 			onVersion(version);
-			if (version === appVersion.replace(/^v/, "")) return;
+			if (appVersionsMatch(version, appVersion)) return;
 			if (!dependencies.claim(appVersion, version)) return;
 			reloadStarted = true;
 			if (health.readiness === "failed" || health.status === "failed") {

@@ -1,5 +1,6 @@
 import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import type { Locale } from "@shared/i18n-locales";
+import type { ProviderReadiness } from "@shared/provider-readiness";
 import type {
 	PersistedRecentTab,
 	RecentTabsMutationResult,
@@ -158,13 +159,17 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ confirmed: true }),
 		}),
-	getSettings: (options?: object) => request<ApiEntity>("/settings", pickRequestOptions(options)),
+	getSettings: (options?: object) =>
+		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>(
+			"/settings",
+			pickRequestOptions(options),
+		),
 	getContextThresholds: (model: string, provider: string) =>
 		request<{ compactStart: number }>(
 			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
 		),
 	updateSettings: (data: Record<string, unknown>, options?: object) =>
-		request<ApiEntity>("/settings", {
+		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>("/settings", {
 			method: "PATCH",
 			body: JSON.stringify(data),
 			...pickRequestOptions(options),

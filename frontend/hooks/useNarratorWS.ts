@@ -317,6 +317,11 @@ export interface CompactProgressEvent extends ProgressSnapshot {
 	retryCount: number;
 	/** Error that triggered the current retry, when retryCount > 0. */
 	retryError?: string;
+	/**
+	 * Provenance of the summary model's context window. `fallback` means packing
+	 * used the tier default because nothing user/catalog/provider configured one.
+	 */
+	contextWindowSource?: string;
 }
 
 export function coerceCompactProgressEvent(
@@ -343,6 +348,9 @@ export function coerceCompactProgressEvent(
 		// Older servers never broadcast retry state, which normalizes to "not
 		// retrying" — exactly their pre-existing behaviour.
 		retryCount,
+		...(typeof data.contextWindowSource === "string" && data.contextWindowSource
+			? { contextWindowSource: data.contextWindowSource }
+			: {}),
 		...(retryCount > 0 && typeof data.retryError === "string" && data.retryError
 			? { retryError: data.retryError }
 			: {}),
@@ -609,12 +617,14 @@ export interface NarratorWSCallbacks {
 	/**
 	 * A running Await-agent call learned which child narrator it is waiting on.
 	 * Lets the card offer "open session" before the wait returns (the id is not in
-	 * the persisted row until then).
+	 * the persisted row until then). `subagentTitle` is the session's display
+	 * name when the server had the narrator row in hand.
 	 */
 	onAwaitAgentResolved?: (
 		toolUseId: string,
 		subagentNarratorId: string,
 		parentToolUseId?: string,
+		subagentTitle?: string,
 	) => void;
 	/** Accepted Send receipts; their reserved message IDs may still be queued. */
 	onSendDeliveryResolved?: (
@@ -1308,6 +1318,7 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.subagentNarratorId as string,
 							data.parentToolUseId as string | undefined,
+							data.subagentTitle as string | undefined,
 						);
 						break;
 					case "send_delivery_resolved":

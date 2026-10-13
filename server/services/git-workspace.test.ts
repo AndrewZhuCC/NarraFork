@@ -6,12 +6,20 @@ import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
+import {
+	chapters,
+	narrators,
+	projects,
+	remoteDevices,
+	userGitIdentities,
+	users,
+} from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { getHome } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
 import { gitRoutes, narratorGitRoutes } from "../routes/git";
 import { commitSyncService } from "./commit-sync-service";
@@ -22,7 +30,7 @@ import { recordAttribution } from "./file-attribution-service";
 import { gitDiscoveryCache } from "./git-discovery-cache";
 import { gitService, withGitRequestContext } from "./git-service";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
-import { gitPathPolicyAllows } from "./git-workspace-access";
+import { authorizeGitDestinationForPrincipal, gitPathPolicyAllows } from "./git-workspace-access";
 import { GitAccessScan } from "./git-workspace-access-scan";
 import { getNarratorGitSummary } from "./narrator-git-summary";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
@@ -124,6 +132,155 @@ async function project(path: string) {
 	return id;
 }
 
+describe("worktree destination authorization", () => {
+	async function linkedSource() {
+		await mkdir(join(repo, ".worktrees"));
+		const current = join(repo, ".worktrees", "current");
+		await git(repo, "worktree", "add", "-b", "current", current);
+		await db.update(narrators).set({ cwd: current }).where(eq(narrators.id, narratorId));
+		return { current, destination: join(repo, ".worktrees", "next") };
+	}
+
+	test("checks a sibling target's policy, including narrower grants and read-only access", async () => {
+		const { current, destination } = await linkedSource();
+		const actor = { userId: owner, isAdmin: false };
+		await authorizeGitDestinationForPrincipal(
+			actor,
+			narratorId,
+			destination,
+			"write",
+			new AbortController().signal,
+		);
+		for (const mode of ["blacklist", "nested-blacklist", "narrow", "readonly"] as const) {
+			const compile = spyOn(executionPolicyEngine, "compile").mockImplementation(
+				async (id, context) => ({
+					...compileExecutionPolicy(
+						{
+							directoryWhitelist:
+								mode === "narrow" || mode === "readonly"
+									? [
+											{
+												ruleType: "directoryWhitelist",
+												enabled: true,
+												selector: { kind: "host" },
+												source: "narrator",
+												path: mode === "narrow" ? current : destination,
+												pathKey: mode === "narrow" ? current : destination,
+												pathFlavor: "posix",
+												accessLevel: mode === "narrow" ? "readWrite" : "readOnly",
+											},
+										]
+									: [],
+							directoryBlacklist:
+								mode === "blacklist" || mode === "nested-blacklist"
+									? [
+											{
+												ruleType: "directoryBlacklist",
+												enabled: true,
+												selector: { kind: "host" },
+												source: "narrator",
+												path: mode === "blacklist" ? destination : join(destination, "secret"),
+												pathKey: destination,
+												pathFlavor: "posix",
+												denyLevel: "denyWrite",
+											},
+										]
+									: [],
+							commandWhitelist: [],
+							commandBlacklist: [],
+						},
+						context,
+					),
+					narratorId: id,
+					ownerNarratorId: id,
+					projectId: null,
+					projectGitPath: null,
+					revision: "test",
+				}),
+			);
+			try {
+				await expect(
+					authorizeGitDestinationForPrincipal(
+						actor,
+						narratorId,
+						destination,
+						"write",
+						new AbortController().signal,
+					),
+				).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+				if (mode === "readonly")
+					await authorizeGitDestinationForPrincipal(
+						actor,
+						narratorId,
+						destination,
+						"read",
+						new AbortController().signal,
+					);
+			} finally {
+				compile.mockRestore();
+			}
+		}
+	});
+
+	test("does not inherit source permission over another protected project's target", async () => {
+		const { destination } = await linkedSource();
+		const projectId = await project(destination);
+		scanProjectIds.push(projectId);
+		await db.update(projects).set({ ownerUserId: null }).where(eq(projects.id, projectId));
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				{ userId: owner, isAdmin: false },
+				narratorId,
+				destination,
+				"read",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+	});
+
+	test("preserves secret-directory and fail-closed OAuth provenance checks", async () => {
+		const { destination } = await linkedSource();
+		const actor = { userId: owner, isAdmin: false };
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				actor,
+				narratorId,
+				join(getHome(), ".ssh", "new"),
+				"read",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+		await db
+			.update(narrators)
+			.set({ oauthPolicySnapshotJson: {} })
+			.where(eq(narrators.id, narratorId));
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				actor,
+				narratorId,
+				destination,
+				"read",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "OAUTH_RUNTIME_FORBIDDEN" });
+	});
+
+	test("rejects canonical aliases rather than granting their symlink target", async () => {
+		const { destination } = await linkedSource();
+		await symlink(join(repo, ".worktrees"), join(repo, "alias"));
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				{ userId: owner, isAdmin: false },
+				narratorId,
+				join(repo, "alias", "next"),
+				"write",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+		expect(destination).toContain(".worktrees");
+	});
+});
+
 async function commitPreviewFixture() {
 	const projectId = await project(repo);
 	scanProjectIds.push(projectId);
@@ -169,6 +326,16 @@ beforeEach(async () => {
 		passwordHash: "fixture",
 		gitUsername: "Acting User",
 		gitEmail: "acting@example.invalid",
+		createdAt: now(),
+	});
+	// The reusable identity table is authoritative; legacy profile fields are
+	// only startup migration input and this user is created after startup.
+	await db.insert(userGitIdentities).values({
+		id: generateId(),
+		userId: owner,
+		name: "Acting User",
+		email: "acting@example.invalid",
+		isDefault: true,
 		createdAt: now(),
 	});
 	narratorId = await newNarrator(repo);
@@ -240,6 +407,30 @@ describe("Git workspace discovery", () => {
 		record.mockRestore();
 		const legacy = await app().request(`/chapters/${chapterId}/git/workspace`);
 		expect(((await legacy.json()) as GitWorkspace).rootPath).toBe(repo);
+	});
+	test("old branch with no directory is unavailable, while a known root keeps the project directory", async () => {
+		const projectId = await project(repo);
+		const chapterId = generateId();
+		await db.insert(chapters).values({
+			id: chapterId,
+			projectId,
+			title: "Old branch",
+			branch: "old-branch",
+			baseBranch: "main",
+			status: "dormant",
+			worktreePath: null,
+			isRoot: 0,
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		await db.update(narrators).set({ chapterId, cwd: null }).where(eq(narrators.id, narratorId));
+		const missing = await workspace();
+		expect(missing.state).toBe("missing_directory");
+		expect(missing.rootPath).toBeNull();
+		expect(missing.cwd).toBe("");
+		expect(missing.capabilities).toEqual({ read: false, write: false });
+		await db.update(chapters).set({ isRoot: 1 }).where(eq(chapters.id, chapterId));
+		expect((await workspace()).rootPath).toBe(repo);
 	});
 	test("running local session cwd wins over stale persisted configuration", async () => {
 		const other = await newRepo("active");

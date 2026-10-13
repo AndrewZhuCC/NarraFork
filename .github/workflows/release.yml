@@ -22,6 +22,36 @@ on:
         required: false
         type: string
         default: ""
+      build_run_id:
+        description: Original build run to re-verify without source tests or product compilation
+        required: false
+        type: string
+        default: ""
+      build_run_attempt:
+        description: Explicit attempt of the original build run (required with build_run_id)
+        required: false
+        type: string
+        default: ""
+      smoke_target:
+        description: Optional single target for diagnostic-only re-verification (cannot publish or assemble)
+        required: false
+        type: string
+        default: ""
+      mirror_only:
+        description: Retry only the legacy mirror from an original sealed bridge (requires publish)
+        required: true
+        type: boolean
+        default: false
+      bridge_run_id:
+        description: Original publisher run containing the immutable bridge artifact (may differ from source_run_id)
+        required: false
+        type: string
+        default: ""
+      bridge_run_attempt:
+        description: Original bridge attempt if that publisher run has been rerun
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -52,6 +82,8 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       restore-mode: ${{ steps.plan.outputs.restore-mode }}
       source-run-id: ${{ steps.plan.outputs.source-run-id }}
+      build-reuse-mode: ${{ steps.plan.outputs.build-reuse-mode }}
+      smoke-only: ${{ steps.plan.outputs.smoke-only }}
     steps:
       - name: Require the trusted dispatch entry
         env:
@@ -82,9 +114,17 @@ jobs:
           PUBLISH_REQUESTED: ${{ inputs.publish }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           INDEX_ONLY: ${{ inputs.index_only }}
+          MIRROR_ONLY: ${{ inputs.mirror_only }}
+          BRIDGE_RUN_ID: ${{ inputs.bridge_run_id }}
+          BRIDGE_RUN_ATTEMPT: ${{ inputs.bridge_run_attempt }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          SMOKE_TARGET: ${{ inputs.smoke_target }}
         run: >-
           bun scripts/ci-release.ts preflight --tag="$RELEASE_TAG"
           --publish="$PUBLISH_REQUESTED" --source-run-id="$SOURCE_RUN_ID" --index-only="$INDEX_ONLY"
+          --mirror-only="$MIRROR_ONLY" --bridge-run-id="$BRIDGE_RUN_ID" --bridge-run-attempt="$BRIDGE_RUN_ATTEMPT"
+          --build-run-id="$BUILD_RUN_ID" --build-run-attempt="$BUILD_RUN_ATTEMPT" --smoke-target="$SMOKE_TARGET"
           --plan=.ci-release/control/plan.json
       - name: Bundle trusted control code for jobs without dependency installation
         run: bun build scripts/ci-release.ts --target=bun --outfile=.ci-release/control/control.js
@@ -98,7 +138,7 @@ jobs:
   verify:
     name: Verify release source
     needs: [preflight]
-    if: ${{ needs.preflight.outputs.restore-mode == 'false' }}
+    if: ${{ needs.preflight.outputs.restore-mode == 'false' && needs.preflight.outputs.build-reuse-mode == 'false' }}
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
@@ -108,6 +148,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: [preflight, verify]
+    if: ${{ needs.preflight.outputs.restore-mode == 'false' && needs.preflight.outputs.build-reuse-mode == 'false' }}
     runs-on: ${{ matrix.buildRunner }}
     timeout-minutes: 30
     strategy:
@@ -123,7 +164,7 @@ jobs:
           bun-version: 1.4.2
       - name: Install dependencies
         run: bun install --frozen-lockfile
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           name: ci-frontend
           path: dist/frontend/
@@ -144,9 +185,55 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  restore-platform:
+    name: Restore original platform (${{ matrix.target }})
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.build-reuse-mode == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+          digest-mismatch: error
+      - name: Restore exact original platform bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: >-
+          bun .ci-release/control/control.js restore-platform --plan=.ci-release/control/plan.json
+          --target="$TARGET" --platform-dir=.ci-release/platform
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-platform-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ci-release/platform/${{ matrix.binary }}
+            .ci-release/platform/${{ matrix.binary }}.metadata.json
+          if-no-files-found: error
+          retention-days: 30
+
   smoke:
     name: Smoke (${{ matrix.target }})
-    needs: [preflight, build]
+    needs: [preflight, build, restore-platform]
+    if: >-
+      ${{ always() && !cancelled() && needs.preflight.result == 'success' &&
+      needs.preflight.outputs.restore-mode == 'false' &&
+      ((needs.preflight.outputs.build-reuse-mode == 'false' && needs.build.result == 'success') ||
+      (needs.preflight.outputs.build-reuse-mode == 'true' && needs.restore-platform.result == 'success')) }}
     runs-on: ${{ matrix.smokeRunner }}
     timeout-minutes: 10
     strategy:
@@ -160,10 +247,17 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           name: release-platform-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/platform/
+          digest-mismatch: error
+      - name: Verify complete downloaded platform inputs
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          test -s ".ci-release/platform/$BINARY"
+          test -s ".ci-release/platform/$BINARY.metadata.json"
       - name: Run the downloaded binary on its native platform
         env:
           TARGET: ${{ matrix.target }}
@@ -185,7 +279,13 @@ jobs:
 
   assemble:
     name: Assemble release bundle
-    needs: [preflight, verify, build, smoke]
+    needs: [preflight, verify, build, restore-platform, smoke]
+    if: >-
+      ${{ always() && !cancelled() && needs.preflight.result == 'success' &&
+      needs.preflight.outputs.restore-mode == 'false' && needs.preflight.outputs.smoke-only == 'false' &&
+      needs.smoke.result == 'success' &&
+      ((needs.preflight.outputs.build-reuse-mode == 'false' && needs.verify.result == 'success' && needs.build.result == 'success') ||
+      (needs.preflight.outputs.build-reuse-mode == 'true' && needs.restore-platform.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -196,15 +296,15 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           pattern: release-platform-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/platforms/
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           pattern: release-smoke-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/smoke-results/
@@ -262,7 +362,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
@@ -289,22 +389,35 @@ jobs:
 
   publish:
     name: Publish verified release
-    needs: [preflight, verify, build, smoke, assemble, restore]
+    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore]
     if: >-
       ${{ always() && !cancelled() && inputs.publish && needs.preflight.result == 'success' &&
+      needs.preflight.outputs.smoke-only == 'false' &&
       ((needs.preflight.outputs.restore-mode == 'true' && needs.restore.result == 'success') ||
-      (needs.preflight.outputs.restore-mode == 'false' && needs.verify.result == 'success' &&
-      needs.build.result == 'success' && needs.smoke.result == 'success' && needs.assemble.result == 'success')) }}
+      (needs.preflight.outputs.restore-mode == 'false' && needs.smoke.result == 'success' && needs.assemble.result == 'success' &&
+      ((needs.preflight.outputs.build-reuse-mode == 'false' && needs.verify.result == 'success' && needs.build.result == 'success') ||
+      (needs.preflight.outputs.build-reuse-mode == 'true' && needs.restore-platform.result == 'success')))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
+    # Distinct from both workflow-level groups: no nested-lock deadlock.
+    concurrency:
+      group: update-server-publish
+      cancel-in-progress: false
+    env:
+      NF_UPDATE_SERVER: ${{ vars.NF_UPDATE_SERVER }}
+      NF_UPDATE_TOKEN: ${{ secrets.NF_UPDATE_TOKEN }}
     outputs:
+      mirror-required: ${{ steps.prepare-bridge.outputs.mirror-required || steps.mirror.outputs.mirror-required }}
+      mirror-status: ${{ steps.publish.outputs.mirror-status || steps.mirror.outputs.mirror-status }}
       index-commit: ${{ steps.publish.outputs.index-commit }}
       index-generation: ${{ steps.publish.outputs.index-generation }}
     permissions:
       contents: write
       actions: read
     steps:
+      - name: Freeze one publication deadline with cleanup reserve
+        run: printf 'NF_RELEASE_DEADLINE_MS=%s\n' "$(( $(date +%s) * 1000 + 25 * 60 * 1000 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -313,11 +426,37 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
+      - name: Prepare patch tool after approval
+        if: ${{ !inputs.index_only && !inputs.mirror_only }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zstd
+      - name: Prepare immutable update server bridge
+        id: prepare-bridge
+        if: ${{ !inputs.index_only && !inputs.mirror_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: >-
+          bun .ci-release/control/control.js prepare-bridge --source-run-id="$SOURCE_RUN_ID"
+          --tag="$RELEASE_TAG" --bundle-dir=.ci-release/prepare-bundle --bridge-dir=.ci-release/bridge
+      - name: Seal immutable update server bridge artifact
+        id: bridge-artifact
+        if: ${{ steps.prepare-bridge.outputs.mirror-required == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: update-server-bridge-main-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/bridge/
+          if-no-files-found: error
+          retention-days: 30
       - name: Publish verified release and index, or repair only the index
+        if: ${{ !inputs.mirror_only }}
         id: publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -325,17 +464,44 @@ jobs:
           SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
           RELEASE_TAG: ${{ inputs.tag }}
           INDEX_ONLY: ${{ inputs.index_only }}
+          BRIDGE_ARTIFACT_ID: ${{ steps.bridge-artifact.outputs.artifact-id }}
+          BRIDGE_ARTIFACT_DIGEST: ${{ steps.bridge-artifact.outputs.artifact-digest }}
         run: |
           if [[ "$INDEX_ONLY" == true ]]; then
             bun .ci-release/control/control.js index --plan=.ci-release/control/plan.json --source-run-id="$SOURCE_RUN_ID" --bundle-dir=.ci-release/publish-bundle --publish=true
           else
-            bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle
+            bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle --bridge-dir=.ci-release/publish-bridge --bridge-artifact-id="$BRIDGE_ARTIFACT_ID" --bridge-artifact-digest="$BRIDGE_ARTIFACT_DIGEST"
           fi
+      - name: Mirror accepted bytes and verify legacy publication
+        id: mirror
+        if: ${{ inputs.mirror_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          BRIDGE_RUN_ID: ${{ inputs.bridge_run_id || github.run_id }}
+          BRIDGE_RUN_ATTEMPT: ${{ inputs.bridge_run_attempt }}
+          MIRROR_ONLY: ${{ inputs.mirror_only }}
+        run: >-
+          bun .ci-release/control/control.js mirror --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG"
+          --bundle-dir=.ci-release/mirror-bundle --bridge-dir=.ci-release/mirror-bridge
+          --bridge-run-id="$BRIDGE_RUN_ID" --bridge-run-attempt="$BRIDGE_RUN_ATTEMPT" --mirror-only="$MIRROR_ONLY"
+      - name: Preserve partial publication receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: update-server-main-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ci-release/publish-bridge/receipt-main-mirror.json
+            .ci-release/mirror-bridge/receipt-main-mirror.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   gate:
     name: Release Gate
     if: ${{ always() }}
-    needs: [preflight, verify, build, smoke, assemble, restore, publish]
+    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -346,7 +512,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, native Node 24
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
@@ -354,6 +520,9 @@ jobs:
         env:
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           RESTORE_MODE: ${{ needs.preflight.outputs.restore-mode }}
+          BUILD_REUSE_MODE: ${{ needs.preflight.outputs.build-reuse-mode }}
+          SMOKE_ONLY: ${{ needs.preflight.outputs.smoke-only }}
+          RESTORE_PLATFORMS_RESULT: ${{ needs.restore-platform.result }}
           PUBLISH_REQUESTED: ${{ inputs.publish }}
           VERIFY_RESULT: ${{ needs.verify.result }}
           BUILD_RESULT: ${{ needs.build.result }}
@@ -364,4 +533,7 @@ jobs:
           INDEX_ONLY: ${{ inputs.index_only }}
           INDEX_COMMIT: ${{ needs.publish.outputs.index-commit }}
           INDEX_GENERATION: ${{ needs.publish.outputs.index-generation }}
+          MIRROR_ONLY: ${{ inputs.mirror_only }}
+          MIRROR_REQUIRED: ${{ needs.publish.outputs.mirror-required }}
+          MIRROR_STATUS: ${{ needs.publish.outputs.mirror-status }}
         run: bun .ci-release/control/control.js gate

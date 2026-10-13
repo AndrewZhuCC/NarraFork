@@ -192,6 +192,22 @@ describe("measureToolDetail — meta-rows", () => {
 		expect(many.height).toBe(few.height);
 	});
 
+	it("an identity row reserves the same fixed slot as a badge row", async () => {
+		const m = await mod();
+		const bare = await measureMeta([{ text: 'wait_for: "x"' }]);
+		const withIdentity = await measureMeta([
+			{ text: "", identity: "worker · g2GQj-mTWJqSPaaAqG_Ud" },
+			{ text: 'wait_for: "x"' },
+		]);
+		expect(withIdentity.height - bare.height).toBe(m.META_ROW_GAP + m.META_BADGE_ROW);
+		const identityBlock = withIdentity.blocks.find(
+			(b) => b.kind === "fixed" && b.tag === "detail-meta-identity",
+		);
+		expect(identityBlock?.kind === "fixed" && identityBlock.data?.identity).toBe(
+			"worker · g2GQj-mTWJqSPaaAqG_Ud",
+		);
+	});
+
 	it("long row text wraps: a narrower width is taller", async () => {
 		const text = "x".repeat(400);
 		const wide = await measureMeta([{ text }], 800);

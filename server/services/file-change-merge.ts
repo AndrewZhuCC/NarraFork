@@ -1,5 +1,5 @@
 import { chmod, mkdtemp, open, realpath, rm } from "node:fs/promises";
-import { devNull, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 
@@ -111,6 +111,11 @@ export async function mergeFileChangeBytes(
 				await handle.close();
 			}
 		}
+		// Git for Windows rejects node:os.devNull (\\\\.\\nul) as a config
+		// filename. A private, exclusively-created empty file works on every host.
+		const gitConfig = join(directory, "empty.gitconfig");
+		const configHandle = await open(gitConfig, "wx", 0o600);
+		await configHandle.close();
 		check();
 		processHandle = Bun.spawn(
 			[
@@ -148,7 +153,7 @@ export async function mergeFileChangeBytes(
 					USERPROFILE: directory,
 					XDG_CONFIG_HOME: directory,
 					GIT_CONFIG_NOSYSTEM: "1",
-					GIT_CONFIG_GLOBAL: devNull,
+					GIT_CONFIG_GLOBAL: gitConfig,
 					GIT_CEILING_DIRECTORIES: directory,
 					LC_ALL: "C",
 				},

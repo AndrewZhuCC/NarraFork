@@ -68,10 +68,11 @@ export function useChatRooms() {
 	});
 }
 
-export function useChatUnread() {
+export function useChatUnread(enabled = true) {
 	return useQuery({
 		queryKey: chatKeys.unread(),
 		queryFn: () => api.getChatUnread(),
+		enabled,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: CHAT_SUMMARY_STALE_TIME_MS,
 	});

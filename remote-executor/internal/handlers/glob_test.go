@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -106,7 +107,11 @@ func TestGlobLeadingCurrentDirectoryBoundsAndValidation(t *testing.T) {
 		}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("prefix %q: no-match walk ignored cancellation: %v", prefix, err)
 		}
-		for _, invalid := range []string{"[", "/**/*.go"} {
+		invalidPatterns := []string{"[", "/**/*.go", "//server/share/**/*.go"}
+		if runtime.GOOS == "windows" {
+			invalidPatterns = append(invalidPatterns, "C:*.go", "C:/root/**/*.go", `\\server\share\**\*.go`)
+		}
+		for _, invalid := range invalidPatterns {
 			if _, err := h.GlobContext(context.Background(), map[string]any{
 				"cwd": root, "pattern": prefix + invalid,
 			}); err == nil {

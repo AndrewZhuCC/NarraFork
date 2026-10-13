@@ -44,7 +44,7 @@ function fixture(
 		subagent?: boolean;
 		compact?: boolean;
 		modelOverride?: boolean;
-		control?: "bash" | "load" | "unload" | "block" | "unblock";
+		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
 	} = {},
 ) {
@@ -88,8 +88,14 @@ function fixture(
 	const restoreModel = mock(async () => {});
 	const awaitCompact = mock(async () => {});
 	const broadcast = mock(() => {});
+	const saveRecording = mock(async (_id: string) => ({
+		id: "saved-recording",
+		narratorId: "session",
+		partial: true,
+	}));
 	const routes = new Hono();
 	const bindings = {
+		saveRequestRecording: saveRecording,
 		narratorRoutes: routes,
 		ValidationError,
 		parseFileReferenceInput,
@@ -140,6 +146,7 @@ function fixture(
 							unload: { unloadTool: "Read" },
 							block: { blockAllSkills: true },
 							unblock: { unblockAllSkills: true },
+							save: { saveDump: true },
 						}[options.control],
 					}
 				: message.startsWith("/goal")
@@ -198,6 +205,7 @@ function fixture(
 	);
 	app.route("/narrators", routes);
 	return {
+		saveRecording,
 		accept,
 		legacySend,
 		legacyPush,
@@ -227,6 +235,51 @@ function multipart(interrupt?: string) {
 	if (interrupt !== undefined) body.set("interrupt", interrupt);
 	return body;
 }
+
+describe("save_dump immediate HTTP control", () => {
+	test.each([
+		false,
+		true,
+	])("save does not admit or interrupt a model turn (subagent=%s)", async (subagent) => {
+		const f = fixture({ control: "save", busy: true, status: "working", subagent, compact: true });
+		const response = await f.post({
+			message: "/save_dump",
+			interrupt: true,
+			queueMode: "interrupt",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			id: "saved-recording",
+			narratorId: "session",
+			partial: true,
+		});
+		expect(f.saveRecording).toHaveBeenCalledWith("session");
+		expect(f.accept).not.toHaveBeenCalled();
+		expect(f.legacySend).not.toHaveBeenCalled();
+		expect(f.legacyPush).not.toHaveBeenCalled();
+		expect(f.pushSub).not.toHaveBeenCalled();
+		expect(f.resume).not.toHaveBeenCalled();
+		expect(f.awaitCompact).not.toHaveBeenCalled();
+		expect(f.broadcast).not.toHaveBeenCalled();
+	});
+	test("save cleans up unused multipart uploads", async () => {
+		const f = fixture({ control: "save", busy: true, status: "working" });
+		const body = multipart("true");
+		body.set("message", "/save_dump");
+		expect((await f.post(body)).status).toBe(200);
+		expect(f.deletedImages).toEqual(["saved-image"]);
+	});
+	test("file references cannot silently disappear into a save control", async () => {
+		const f = fixture({ control: "save" });
+		const response = await f.post({
+			message: "/save_dump",
+			fileReferences: [{ id: "ref", deviceId: "local", path: "/test/file", label: "file" }],
+		});
+		expect(response.status).toBe(400);
+		expect(f.saveRecording).not.toHaveBeenCalled();
+		expect(f.accept).not.toHaveBeenCalled();
+	});
+});
 
 describe("primary HTTP message admission", () => {
 	test.each([

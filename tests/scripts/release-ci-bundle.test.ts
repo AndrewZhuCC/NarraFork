@@ -25,13 +25,14 @@ import {
 	type CiReleasePlan,
 	type CiReleaseSmokeResult,
 } from "../../scripts/lib/ci-release-types";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const roots: string[] = [];
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture() {
+async function fixture(declareHelpers = false) {
 	const root = await mkdtemp(join(tmpdir(), "nf-ci-bundle-test-"));
 	roots.push(root);
 	const plan: CiReleasePlan = {
@@ -64,6 +65,9 @@ async function fixture() {
 			target: `bun-${target.target}`,
 			commit: plan.commit.slice(0, 12),
 			buildDate: "2026-10-08T00:00:00.000Z",
+			...(declareHelpers
+				? { helperDistribution: createHelperDistributionDependencies(plan.version) }
+				: {}),
 		});
 		await writeFile(join(directory, name), bytes);
 		await writeFile(join(directory, `${name}.metadata.json`), formatMetadataJson(metadata));
@@ -486,5 +490,84 @@ describe("immutable eight-platform CI bundle", () => {
 		await writeFile(path, JSON.stringify(meta));
 		await refreshFileRecord(f, name);
 		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("baseline identity");
+	});
+});
+
+describe("immutable helper dependencies in release bundles", () => {
+	test("all eight new sidecars seal and restore the same declaration without network readiness", async () => {
+		const f = await fixture(true);
+		const sealed = await assembleReleaseBundle(f.options);
+		expect(sealed.helperDistribution).toEqual(createHelperDistributionDependencies(f.plan.version));
+		expect((await verifyReleaseBundle(f.options.bundleDir)).helperDistribution).toEqual(
+			sealed.helperDistribution,
+		);
+	});
+	test("legacy bundles do not invent dependencies from the current control code", async () => {
+		const f = await fixture();
+		expect((await assembleReleaseBundle(f.options)).helperDistribution).toBeUndefined();
+		expect((await verifyReleaseBundle(f.options.bundleDir)).helperDistribution).toBeUndefined();
+	});
+	test("one missing platform declaration cannot silently create a legacy bundle", async () => {
+		const f = await fixture(true);
+		const path = join(f.options.platformsDir, "linux-x64", `${f.name}.metadata.json`);
+		const metadata = JSON.parse(await readFile(path, "utf8"));
+		delete metadata.helperDistribution;
+		await writeFile(path, JSON.stringify(metadata));
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Inconsistent");
+	});
+	test("removing the sealed dependency record is detected during restore", async () => {
+		const f = await fixture(true);
+		await assembleReleaseBundle(f.options);
+		await changeManifest(f, (manifest) => {
+			delete manifest.helperDistribution;
+		});
+		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("declaration mismatch");
+	});
+});
+
+describe("re-verified release bundle provenance", () => {
+	function buildSource(single = false) {
+		return {
+			runId: 20,
+			runAttempt: 3,
+			workflowCommit: "c".repeat(40),
+			controlArtifact: { id: 900, digest: `sha256:${"d".repeat(64)}`, size: 1000 },
+			platforms: CI_RELEASE_TARGETS.slice(0, single ? 1 : undefined).map(({ target }, index) => ({
+				target,
+				artifact: { id: 901 + index, digest: `sha256:${"e".repeat(64)}`, size: 1000 },
+			})),
+		};
+	}
+	test("refuses to assemble a single-platform diagnostic even when eight old result files exist", async () => {
+		const f = await fixture();
+		f.plan.buildSource = buildSource(true);
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Single-platform");
+		await expect(readdir(f.options.bundleDir)).rejects.toThrow();
+	});
+	test("seals all eight re-verified original binaries and binds the exact build origin", async () => {
+		const f = await fixture();
+		f.plan.buildSource = buildSource();
+		const sealed = await assembleReleaseBundle(f.options);
+		expect(sealed.plan.buildSource).toEqual(f.plan.buildSource);
+		for (const { target, suffix } of CI_RELEASE_TARGETS) {
+			const name = `narrafork-${f.plan.version}-${suffix}`;
+			expect(sealed.files.find((file) => file.name === name)).toBeDefined();
+			expect(await readFile(join(f.options.bundleDir, "dist", name))).toEqual(
+				await readFile(join(f.options.platformsDir, target, name)),
+			);
+		}
+		await expect(
+			verifyReleaseBundle(f.options.bundleDir, {
+				...f.plan,
+				buildSource: { ...f.plan.buildSource, runAttempt: 2 },
+			}),
+		).rejects.toThrow("buildSource");
+		await expect(
+			verifyReleaseBundle(f.options.bundleDir, { ...f.plan, buildSource: undefined }),
+		).rejects.toThrow("buildSource");
+		await changeManifest(f, (manifest) => {
+			manifest.plan.buildSource = buildSource(true);
+		});
+		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("Single-platform");
 	});
 });

@@ -11,7 +11,7 @@ const MenuStub = Object.assign(({ children }: { children?: ReactNode }) => <div>
 mock.module("@mantine/core", () => ({
 	Menu: MenuStub,
 	ActionIcon: ({ children }: { children?: ReactNode }) => <button type="button">{children}</button>,
-	Box: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+	Box: ({ children, ...props }: React.ComponentProps<"div">) => <div {...props}>{children}</div>,
 	Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 	Stack: ({ children, style }: { children?: ReactNode; style?: CSSProperties }) => (
 		<div data-region="queue" style={style}>
@@ -23,6 +23,10 @@ mock.module("@mantine/core", () => ({
 	Button: ({ children }: { children?: ReactNode }) => <button type="button">{children}</button>,
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+let resizeEnabled = false;
+mock.module("../../hooks/useLocalPref", () => ({
+	useLocalPref: () => [resizeEnabled, () => {}],
+}));
 mock.module("../../hooks/useResizableBottomSpacing", () => ({
 	useBottomSpacing: () => 0,
 	startBottomSpacingResize: () => {},
@@ -65,7 +69,7 @@ mock.module("./composer/NarratorComposerRow", () => ({
 	NarratorComposerRow: () => <div data-region="composer" />,
 }));
 mock.module("./permission/PermissionRuleResultNotice", () => ({
-	PermissionRuleResultNotice: () => null,
+	PermissionRulePolicySync: () => null,
 }));
 const { NarratorInteractionArea } = await import("./NarratorInteractionArea");
 
@@ -87,6 +91,17 @@ for (const chapterId of ["chapter", null]) {
 		const html = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
 		const regions = [...html.matchAll(/data-region="([^"]+)"/g)].map((match) => match[1]);
 		expect(regions).toEqual(["queue", "git", "status", "attachments", "upload", "composer"]);
+		expect(html).not.toContain('role="separator"');
+		expect(html).not.toContain("ns-resize");
+		expect(html).toContain("pointer-events:none");
+		resizeEnabled = true;
+		try {
+			const enabledHtml = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
+			expect(enabledHtml).toContain('role="separator"');
+			expect(enabledHtml).toContain("cursor:ns-resize");
+		} finally {
+			resizeEnabled = false;
+		}
 		expect(html).toContain('data-images="1"');
 		expect(html).toContain('data-files="1"');
 		expect(html).toContain(

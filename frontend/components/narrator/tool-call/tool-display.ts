@@ -298,7 +298,12 @@ export {
 
 // Local aliases so the summary builders below can call these directly (a
 // re-export does not bind the names in this module's scope).
-import { extractField, extractNumericField, isTruncated } from "@shared/pretext-layout/tool-detail";
+import {
+	extractField,
+	extractNumericField,
+	isTruncated,
+	parseLiveOutputChars,
+} from "@shared/pretext-layout/tool-detail";
 import { readLeafText } from "@shared/pretext-layout/tool-io-projection";
 import {
 	hasSubagentToolInputSummary,
@@ -325,11 +330,6 @@ function extractStringArrayField(val: unknown, key: string): string[] {
 	return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
 }
 
-/** True when `value` is the cumulative-char payload ContextAsk streams via emitOutput. */
-function isNumericOutputString(value: unknown): value is string {
-	return typeof value === "string" && /^\d+$/.test(value.trim());
-}
-
 /**
  * Live character count for a running ContextAsk, or null.
  *
@@ -338,10 +338,31 @@ function isNumericOutputString(value: unknown): value is string {
  * streaming body of digits.
  */
 function contextAskLiveOutputChars(metadata: Record<string, unknown> | undefined): number | null {
-	const raw = metadata?._streamingOutput;
-	if (!isNumericOutputString(raw)) return null;
-	const n = Number(raw.trim());
-	return Number.isFinite(n) && n >= 0 ? n : null;
+	return parseLiveOutputChars(metadata?._streamingOutput);
+}
+
+/**
+ * Live output char count for a running Agent/Await card, or null.
+ *
+ * Same bare-count convention as ContextAsk (`_streamingOutput` carries plain
+ * digits), but sourced from the SHARED parser so every tool reads the payload
+ * identically. The server streams it from the subagent's `stream_text` deltas
+ * (see narrator-event-handler's `noteSubagentOutputText`).
+ *
+ * Deliberately NOT gated on terminal status here: a summary has no status
+ * input, and the streaming entry's residual count is replaced by the persisted
+ * card within a frame of completion — the same trade ContextAsk already makes.
+ * (The detail body in `classifyAwait` IS gated, because it receives `status`.)
+ */
+function liveOutputChars(metadata: Record<string, unknown> | undefined): number | null {
+	return parseLiveOutputChars(metadata?._streamingOutput);
+}
+
+/** Localized "N chars" fragment for a live output counter, with English fallback. */
+function liveOutputCharsLabel(labels: Record<string, string> | undefined, chars: number): string {
+	return labels?.liveOutputChars
+		? labels.liveOutputChars.replace("{count}", String(chars))
+		: `${chars} chars`;
 }
 
 /** Resolved target label for a ContextAsk call (metadata title wins over input.id). */
@@ -587,22 +608,38 @@ export function getSummary(
 				extractField(input, "subagent_type"),
 				extractField(input, "description"),
 			].filter(Boolean);
-			return parts.length > 0 ? parts.join(": ") : toolName;
+			const base = parts.length > 0 ? parts.join(": ") : toolName;
+			// A running subagent's reply length, ticking on the folded row too.
+			const live = liveOutputChars(metadata);
+			return live != null ? `${base} · ${liveOutputCharsLabel(labels, live)}` : base;
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";
-			// Prefer the server-resolved alias; a bare nanoid selector is truncated.
+			// Prefer the session TITLE (what the child's own tab shows) over the slug:
+			// `targetTitle` lands with the tool's returned metadata, while
+			// `_awaitAgentTitle` is the live transport field for a wait in flight.
+			// A bare nanoid selector is truncated.
+			const title =
+				extractField(metadata, "targetTitle") || extractField(metadata, "_awaitAgentTitle");
 			const id =
+				(title ? short(title, 60) : "") ||
 				agentTargetDisplay(
 					metadata?.targetLabel as string | undefined,
 					extractField(input, "id"),
-				) || "unknown";
+				) ||
+				"unknown";
 			const waitForText = extractField(input, "wait_for_text");
-			return waitForText
+			const base = waitForText
 				? `${awaitType}: ${id} · wait "${short(waitForText, 24)}"`
 				: `${awaitType}: ${id}`;
+			// The awaited child's live output length, same bare-count convention.
+			const live = liveOutputChars(metadata);
+			return live != null ? `${base} · ${liveOutputCharsLabel(labels, live)}` : base;
 		}
 		case "send": {
+			// No live output counter here by design: a Send's result is the REPLY the
+			// other side writes, not text this call streams — the count would measure
+			// someone else's output, which the child's own Agent card already shows.
 			const selectors = communicationSelectors(input);
 			const targets = resolveCommunicationTargets(metadata, metadata?._sendDeliveryTargets);
 			const targetLabels =

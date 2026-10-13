@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import {
 	mapGenericReasoningEffort,
@@ -41,6 +41,7 @@ import {
 } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -664,7 +665,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+	): Promise<BuiltHistory> {
 		if (this.responsesFormat) {
 			return await buildResponsesHistory(dbMessages, narratorId, {
 				strict: hasCredentialBoundReasoning(model),
@@ -913,18 +914,19 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
 			}
+			await reportInputCharacters(params, body);
+			const bodyText = JSON.stringify(body);
 			params.requestDump?.beginResponseAttempt(
 				{
 					transport: "http",
+					method: "POST",
 					url: endpoint,
 					headers: sanitizeHeaders(requestHeaders),
-					body,
+					bodyText,
 				},
 				settings.agent?.requestDumpMaxSize,
 			);
 
-			await reportInputCharacters(params, body);
-			const bodyText = JSON.stringify(body);
 			params.onRequestStart?.();
 			const response = await this.pfetch(endpoint, {
 				method: "POST",
@@ -4034,6 +4036,7 @@ async function buildResponsesHistory(
 ): Promise<{
 	history: OAIMessage[];
 	trailingToolResults: ResponsesFunctionCallOutputMessage[];
+	replayedInjectionMessageIds: string[];
 }> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -4046,6 +4049,7 @@ async function buildResponsesHistory(
 	}
 
 	const history: OAIMessage[] = [];
+	const replayedInjectionMessageIds: string[] = [];
 	let pendingToolResults: ResponsesFunctionCallOutputMessage[] = [];
 
 	for (const msg of topLevel) {
@@ -4072,7 +4076,16 @@ async function buildResponsesHistory(
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 			const userMessage = await buildResponsesUserMessageFromDbMessage(msg, narratorId);
-			if (userMessage) history.push(userMessage);
+			if (userMessage) {
+				history.push(userMessage);
+				const texts =
+					typeof userMessage.content === "string"
+						? [userMessage.content]
+						: (userMessage.content ?? []).flatMap((part) =>
+								part.type === "input_text" ? [part.text] : [],
+							);
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], texts));
+			}
 		} else if (msg.role === "sys") {
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
@@ -4086,16 +4099,18 @@ async function buildResponsesHistory(
 			// continuation). Keeping it as a user turn guarantees non-empty input.
 			if (text) {
 				history.push(buildResponsesUserMessage(text));
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 }
 
 function buildOAIHistory(dbMessages: DbMessage[]): {
 	history: OAIMessage[];
 	trailingToolResults: OAIToolResult[];
+	replayedInjectionMessageIds: string[];
 } {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -4109,6 +4124,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 	}
 
 	const history: OAIMessage[] = [];
+	const replayedInjectionMessageIds: string[] = [];
 	let pendingToolResults: OAIToolResult[] = [];
 
 	for (const msg of topLevel) {
@@ -4234,6 +4250,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			const text = msg.contentText || "";
 			if (text) {
 				history.push({ role: "user", content: text });
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		} else if (msg.role === "sys") {
 			for (const tr of pendingToolResults) {
@@ -4254,11 +4271,12 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			// the model while guaranteeing non-empty conversation content.
 			if (text) {
 				history.push({ role: "user", content: text });
+				replayedInjectionMessageIds.push(...historyInputMessageIds([msg], [text]));
 			}
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return { history, trailingToolResults: pendingToolResults, replayedInjectionMessageIds };
 }
 
 /**

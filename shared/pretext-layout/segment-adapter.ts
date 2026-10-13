@@ -104,6 +104,7 @@ import {
 	classifyToolDetail,
 	describeToolBody,
 	isTruncated,
+	parseLiveOutputChars,
 	resolveFileDiffStats,
 	type ToolCappedDetail,
 	toolInputFieldRange,
@@ -430,7 +431,21 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 	// field is present on the item and never looked at, so a running transfer
 	// renders with no bar.
 	const liveProgress = (tc as { _structuredProgress?: unknown })._structuredProgress;
-	if (liveOutput === undefined && liveProgress === undefined) return persisted;
+	// The running Await's resolved target id + session title also live on the call
+	// record (the message loader's `_awaitAgentNarratorId` patch and the
+	// `await_agent_resolved` frame). Lifting them here lets classifyAwait draw the
+	// identity row and headline the title while the wait is still in flight. The
+	// row's arrival mid-wait is an intentional grow (it replaced the old badge
+	// row), keyed by the meta-rows component in `leafTextRevision`.
+	const awaitAgentId = (tc as { _awaitAgentNarratorId?: unknown })._awaitAgentNarratorId;
+	const awaitAgentTitle = (tc as { _awaitAgentTitle?: unknown })._awaitAgentTitle;
+	if (
+		liveOutput === undefined &&
+		liveProgress === undefined &&
+		awaitAgentId === undefined &&
+		awaitAgentTitle === undefined
+	)
+		return persisted;
 	const base = persisted && typeof persisted === "object" ? (persisted as object) : {};
 	const out: Record<string, unknown> = { ...base };
 	if (
@@ -444,6 +459,18 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 		(base as { _structuredProgress?: unknown })._structuredProgress === undefined
 	) {
 		out._structuredProgress = liveProgress;
+	}
+	if (
+		typeof awaitAgentId === "string" &&
+		(base as { _awaitAgentNarratorId?: unknown })._awaitAgentNarratorId === undefined
+	) {
+		out._awaitAgentNarratorId = awaitAgentId;
+	}
+	if (
+		typeof awaitAgentTitle === "string" &&
+		(base as { _awaitAgentTitle?: unknown })._awaitAgentTitle === undefined
+	) {
+		out._awaitAgentTitle = awaitAgentTitle;
 	}
 	return out;
 }
@@ -2106,6 +2133,8 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// icon: an icon-only control hides its meaning behind a hover tooltip, which
 	// touch users never see at all.
 	disableImageGen: "Turn off image generation and retry",
+	viewErrorRequest: "View request details",
+	downloadErrorDump: "Download Dump",
 	// The error card's conditional model probe (admin-only, network errors only).
 	// Carried over from the deleted chunked card's icon-only action; a label for the
 	// same reason as above.
@@ -3396,6 +3425,13 @@ function adaptSystemTextData(
 			const offerModelTest = ctx.canOfferModelTest?.(errorText) === true;
 			const buttons: string[] = [];
 			const buttonIds: string[] = [];
+			const diagnostics = asObject(block.diagnostics);
+			const requestId = readNonEmptyString(diagnostics, "recordingRequestId");
+			const hasRequest = requestId != null && /^req_[A-Za-z0-9_-]{1,160}$/.test(requestId);
+			if (hasRequest) {
+				buttons.push(sysLabel(ctx, "viewErrorRequest"), sysLabel(ctx, "downloadErrorDump"));
+				buttonIds.push("viewErrorRequest", "downloadErrorDump");
+			}
 			if (offerFix) {
 				buttons.push(sysLabel(ctx, "disableImageGen"));
 				buttonIds.push("disableImageGen");
@@ -3409,6 +3445,7 @@ function adaptSystemTextData(
 				text: errorText,
 				color: "red",
 				actions: true,
+				...(hasRequest ? { diagnostics } : {}),
 				...(buttons.length > 0 ? { buttons, buttonIds } : {}),
 			};
 		}
@@ -3881,9 +3918,25 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const metadata = resolveToolMetadata(item.tc);
 	const outputJson = toolOutputValue(withFullOutput(item, ctx), metadata);
 	const resultValue = readLeafText(outputJson) ?? readLeafText(asObject(outputJson)._text);
-	const resultContent = resultValue === undefined ? undefined : subagentResultText(outputJson);
-	const resultText = resultContent || undefined;
 	const isActive = !isTerminalStatus(item.tc.status);
+	// The subagent's live reply length, streamed by the server as a bare numeric
+	// `tool_output` payload (the ContextAsk convention) and bridged onto the
+	// metadata by resolveToolMetadata. Height-neutral: painted as a badge on the
+	// fixed header row, so it is keyed in `subagentRevision` instead of measured.
+	const liveOutputChars = isActive
+		? parseLiveOutputChars(asObject(metadata)?._streamingOutput)
+		: null;
+	// A running card's "output" can BE that bare counter — `toolOutputValue` folds
+	// `_streamingOutput` in when no real output exists. The count rides the header
+	// badge, so it must never become the conclusion body (a lone number reading
+	// as the child's result).
+	const resultIsLiveCount =
+		liveOutputChars != null &&
+		resultValue !== undefined &&
+		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
+	const resultContent =
+		resultValue === undefined || resultIsLiveCount ? undefined : subagentResultText(outputJson);
+	const resultText = resultContent || undefined;
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 	// derivations). prompt/isBackground/agentType live on inputJson.
 	// Send is conversation content and never reaches this subagent constructor.
@@ -3962,6 +4015,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? { modelInheritance: activity.modelInheritance }
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+		...(liveOutputChars != null ? { liveOutputChars } : {}),
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is

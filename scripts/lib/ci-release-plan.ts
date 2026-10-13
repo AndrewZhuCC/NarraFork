@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { isValidGitHubRepository } from "../../shared/github-repository";
+import { parseHelperDistributionDependencies } from "../../shared/helper-distribution";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import {
 	CI_RELEASE_BUN,
 	CI_RELEASE_REPOSITORY,
@@ -47,6 +49,32 @@ const changelogSchema = z
 			.max(256 * 1024),
 	})
 	.strict();
+const artifactIdentitySchema = z
+	.object({
+		id,
+		digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+		size: id.max(2 * 1024 ** 3),
+	})
+	.strict();
+const buildSourceSchema = z
+	.object({
+		runId: id,
+		runAttempt: id,
+		workflowCommit: sha,
+		controlArtifact: artifactIdentitySchema,
+		platforms: z
+			.array(
+				z
+					.object({
+						target: z.enum(CI_RELEASE_TARGETS.map(({ target }) => target)),
+						artifact: artifactIdentitySchema,
+					})
+					.strict(),
+			)
+			.min(1)
+			.max(8),
+	})
+	.strict();
 const planSchema = z
 	.object({
 		schemaVersion: z.literal(1),
@@ -61,6 +89,7 @@ const planSchema = z
 		changelog: changelogSchema,
 		runId: id,
 		runAttempt: id,
+		buildSource: buildSourceSchema.optional(),
 		baselines: z
 			.array(
 				z
@@ -83,6 +112,10 @@ const planSchema = z
 								size: id.max(1024 ** 3),
 								sha256: z.string().regex(/^[a-f0-9]{64}$/),
 								sha512: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
+								helperDistribution: z
+									.unknown()
+									.transform((value) => parseHelperDistributionDependencies(value))
+									.optional(),
 							})
 							.strict(),
 					})
@@ -101,7 +134,11 @@ export function ciGhRunner(env: NodeJS.ProcessEnv = process.env): GhRunner {
 				timeout: CI_API_TIMEOUT_MS,
 				maxBuffer: CI_API_MAX_BYTES,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+				env: {
+					...updateServerChildEnvironment(env),
+					GH_HOST: "github.com",
+					GH_PROMPT_DISABLED: "1",
+				},
 			});
 		} catch (error) {
 			const detail = error as { stderr?: string | Buffer; message?: string };
@@ -180,9 +217,25 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 		plan.channel !== releaseChannel(plan.version)
 	)
 		throw new Error("Release plan version/channel mismatch");
+	if (plan.buildSource) {
+		const source = plan.buildSource;
+		const targets = new Set(source.platforms.map(({ target }) => target));
+		const artifactIds = new Set(source.platforms.map(({ artifact }) => artifact.id));
+		if (
+			source.runId === plan.runId ||
+			![1, CI_RELEASE_TARGETS.length].includes(source.platforms.length) ||
+			targets.size !== source.platforms.length ||
+			artifactIds.size !== source.platforms.length ||
+			artifactIds.has(source.controlArtifact.id) ||
+			source.controlArtifact.size > 4 * 1024 * 1024
+		)
+			throw new Error("Invalid original build provenance or target set");
+	}
 	const seen = new Set<string>();
 	const count = new Map<string, number>();
 	for (const base of plan.baselines) {
+		if (base.metadata.helperDistribution !== undefined)
+			parseHelperDistributionDependencies(base.metadata.helperDistribution, base.version);
 		const target = CI_RELEASE_TARGETS.find((item) => item.platform === base.platform);
 		const key = `${base.platform}/${base.version}`;
 		if (

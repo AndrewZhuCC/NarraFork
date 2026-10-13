@@ -6,8 +6,19 @@ import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { useWorkspaceContext } from "@frontend/hooks/useWorkspaceContext";
 import { type ApiError, api } from "@frontend/lib/api";
 import { statusRegistry } from "@frontend/lib/constants";
-import { ActionIcon, Badge, Drawer, Group, Menu, Stack, Text, Tooltip } from "@mantine/core";
 import {
+	ActionIcon,
+	Badge,
+	Drawer,
+	Group,
+	Menu,
+	Skeleton,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
+import {
+	IconFolder,
 	IconGitBranch,
 	IconGitCommit,
 	IconGitFork,
@@ -19,7 +30,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type React from "react";
-import { lazy, Suspense, useCallback, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NarratorCompatibilityModal } from "../../project/NarratorCompatibilityEntry";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
@@ -57,11 +68,9 @@ const PodmanInstallModal = lazy(() =>
 /**
  * Git strip for standalone narrators (no chapter worktree).
  *
- * Non-git working directories render nothing: a row that only says "not a Git
- * tree" is pure vertical noise. Pending probe is also hidden so a non-git cwd
- * does not flash a loading line before vanishing. Discovery failures and other
- * unusable-environment states stay visible so they can still be retried from
- * the panel.
+ * Every workspace reserves 30px immediately: skeleton, ordinary cwd or Git facts
+ * replace each other in place. A cached non-Git result must not permanently hide
+ * Git features after git init or a directory switch.
  */
 export function NarratorGitBar({
 	narratorId,
@@ -78,35 +87,36 @@ export function NarratorGitBar({
 	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
 	const status = useGitStatus(target);
 	const workspaceState = workspace.data?.state;
-	if (
-		!workspace.isError &&
-		((workspace.isPending && !workspace.data) || workspaceState === "not_git")
-	) {
-		return null;
-	}
+	useEffect(() => {
+		if (status.data) workspace.rememberCounts?.(status.data);
+	}, [status.data, workspace.rememberCounts]);
+	const counts = status.data ?? workspace.displayCounts;
+	const canOpen = !!target;
+	const WorkspaceIcon = workspaceState === "not_git" ? IconFolder : IconGitBranch;
 	return (
 		<Group
 			px="md"
 			py={4}
 			gap={6}
 			wrap="nowrap"
-			role="button"
-			tabIndex={0}
+			data-git-slot
+			role={canOpen ? "button" : undefined}
+			tabIndex={canOpen ? 0 : undefined}
 			aria-label={t("panel.title")}
 			style={{
 				height: 30,
 				flexShrink: 0,
 				overflow: "hidden",
-				cursor: "pointer",
+				cursor: canOpen ? "pointer" : undefined,
 				userSelect: "text",
 			}}
 			onClick={(event) => {
 				// Portal events bubble through React, even when outside this DOM row.
-				if (!event.currentTarget.contains(event.target as Node)) return;
+				if (!canOpen || !event.currentTarget.contains(event.target as Node)) return;
 				if (!isTextSelectionGesture(window.getSelection())) onOpenGitPanel();
 			}}
 			onKeyDown={(event) => {
-				if (!event.currentTarget.contains(event.target as Node)) return;
+				if (!canOpen || !event.currentTarget.contains(event.target as Node)) return;
 				if (isActivationKey(event.key)) {
 					event.preventDefault();
 					onOpenGitPanel();
@@ -114,35 +124,39 @@ export function NarratorGitBar({
 			}}
 		>
 			<Group gap={6} wrap="nowrap">
-				<IconGitBranch size={14} color="var(--mantine-color-dimmed)" aria-hidden="true" />
-				<Text
-					size="xs"
-					c="dimmed"
-					ff="monospace"
-					truncate
-					title={
-						executionContext ? `${executionContext.deviceId}: ${executionContext.cwd}` : undefined
-					}
-				>
-					{target
-						? status.data?.branch || workspace.data?.branch || t("workspace.ready")
-						: t(
-								`workspace.${workspace.isPending && !workspace.data ? "loading" : workspace.isError ? "error" : (workspace.data?.state ?? "error")}`,
-							)}
-				</Text>
+				<WorkspaceIcon size={14} color="var(--mantine-color-dimmed)" aria-hidden="true" />
+				{workspace.isPending && !workspace.data ? (
+					<Skeleton height={12} width={140} radius="sm" />
+				) : (
+					<Text
+						size="xs"
+						c="dimmed"
+						ff="monospace"
+						truncate
+						title={
+							executionContext ? `${executionContext.deviceId}: ${executionContext.cwd}` : undefined
+						}
+					>
+						{workspaceState === "not_git"
+							? executionContext?.cwd
+							: workspaceState === "ready"
+								? status.data?.branch || workspace.data?.branch || t("workspace.ready")
+								: t(`workspace.${workspace.isError ? "error" : (workspaceState ?? "error")}`)}
+					</Text>
+				)}
 			</Group>
-			{status.data && (
+			{counts && (
 				<Tooltip label={t("panel.changes")}>
 					<Badge size="xs" variant="light">
 						<Group gap={5} wrap="nowrap">
 							<Text span size="xs" fw={600}>
-								{status.data.totalFiles}
+								{counts.totalFiles}
 							</Text>
 							<Text span size="xs" c="green" fw={600}>
-								+{status.data.linesAdded}
+								+{counts.linesAdded}
 							</Text>
 							<Text span size="xs" c="red" fw={600}>
-								-{status.data.linesRemoved}
+								-{counts.linesRemoved}
 							</Text>
 						</Group>
 					</Badge>
@@ -188,11 +202,11 @@ export function ChapterBar({
 	const { data: chapter } = useChapter(chapterId);
 	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	const workspaceQuery = useGitWorkspace(narratorId);
-	const { data: workspaceStatus } = useGitStatus(
+	const workspaceTarget =
 		narratorId && !workspaceQuery.isError
 			? gitWorkspaceTarget(narratorId, workspaceQuery.data)
-			: null,
-	);
+			: null;
+	const { data: workspaceStatus } = useGitStatus(workspaceTarget);
 	const { data: chapterStatus } = useChapterGitStatus(narratorId ? null : chapterId);
 	const gitStatus = narratorId
 		? workspaceStatus
@@ -203,7 +217,10 @@ export function ChapterBar({
 	// bar. The prop wins because the caller knows the mobile Drawer host; the raw
 	// dock context is only a fallback for surfaces that render the bar standalone.
 	const dock = useNarratorDockContext();
-	const openGitPanel = onOpenGitPanel ?? (dock ? () => dock.openToolPanel("git") : undefined);
+	const requestedGitPanel = onOpenGitPanel ?? (dock ? () => dock.openToolPanel("git") : undefined);
+	// Narrator summaries/cwd rows are presentation only. Legacy chapter-only
+	// callers keep their existing chapter-scoped Git entry.
+	const openGitPanel = narratorId && !workspaceTarget ? undefined : requestedGitPanel;
 	const containerCapability = useChapterContainersCapability();
 	const containerUnsupportedReason =
 		containerCapability.reason ?? tn("chapterBar.containersUnsupported");
@@ -266,7 +283,14 @@ export function ChapterBar({
 		[openGitPanel],
 	);
 
-	if (!chapter) return null;
+	if (!chapter)
+		return (
+			<Group data-git-slot px="md" style={{ height: 30, flexShrink: 0, overflow: "hidden" }}>
+				<Text size="xs" c="dimmed" truncate>
+					{executionContext?.cwd ?? "Git"}
+				</Text>
+			</Group>
+		);
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
 	const runningContainers = containers?.filter((c: any) => c.status === "running") ?? [];
@@ -281,6 +305,7 @@ export function ChapterBar({
 	return (
 		<>
 			<Group
+				data-git-slot
 				px="md"
 				py={4}
 				gap="xs"
@@ -325,7 +350,9 @@ export function ChapterBar({
 						}
 					>
 						{narratorId
-							? workspaceStatus?.branch || workspaceQuery.data?.branch || "Git"
+							? workspaceQuery.data?.state === "not_git"
+								? (executionContext?.cwd ?? workspaceQuery.data.cwd)
+								: workspaceStatus?.branch || workspaceQuery.data?.branch || "Git"
 							: chapter.branch}
 					</Text>
 					{gitStatus &&

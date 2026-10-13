@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,6 +43,72 @@ function appForRole(role: "admin" | "user") {
 	app.route("/tls", tlsRoutes);
 	return app;
 }
+
+describe("settings availability stays lightweight", () => {
+	test("GET and PATCH expose readiness from an unknown registered provider", async () => {
+		const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
+		const original = structuredClone(settings);
+		const descriptor = { id: "future:instance", prefix: "future-api", name: "Future", ready: true };
+		let adapterCalls = 0;
+		const unregister = registerExternalProviderResolver({
+			resolve: () => {
+				adapterCalls++;
+				throw new Error("Readiness must not create adapters");
+			},
+			listReadiness: () => [descriptor],
+		});
+		try {
+			settings.agent.summaryModel = "";
+			const app = appForRole("admin");
+			const response = await app.request("http://localhost/settings");
+			expect(response.status).toBe(200);
+			expect((await response.json()).providerReadiness).toContainEqual(descriptor);
+			const saved = await app.request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ agent: { disabledProviders: [descriptor.prefix] } }),
+			});
+			expect(saved.status).toBe(200);
+			expect((await saved.json()).providerReadiness).toContainEqual({
+				...descriptor,
+				ready: false,
+			});
+			expect(adapterCalls).toBe(0);
+			unregister();
+			const removed = await app.request("http://localhost/settings");
+			expect((await removed.json()).providerReadiness).not.toContainEqual(descriptor);
+		} finally {
+			unregister();
+			saveSettings(original);
+		}
+	});
+
+	test("GET and summary-model PATCH never build a full Codex quota snapshot", async () => {
+		const { getCodexManager } = await import("../../lib/codex-manager");
+		const manager = getCodexManager();
+		const original = structuredClone(settings);
+		const snapshot = spyOn(manager, "snapshot").mockImplementation(() => {
+			throw new Error("Settings must not compute full account forecasts");
+		});
+		try {
+			const app = appForRole("admin");
+			const response = await app.request("http://localhost/settings");
+			expect(response.status).toBe(200);
+			expect((await response.json()).codexAvailable).toBe(manager.hasAvailableCredentials);
+			const saved = await app.request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ agent: { summaryModel: "tokendance:mimo-v2.6-flash" } }),
+			});
+			expect(saved.status).toBe(200);
+			expect((await saved.json()).agent.summaryModel).toBe("tokendance:mimo-v2.6-flash");
+			expect(snapshot).not.toHaveBeenCalled();
+		} finally {
+			snapshot.mockRestore();
+			saveSettings(original);
+		}
+	});
+});
 
 describe("per-response tool-call limit settings", () => {
 	test("defaults to 32 and preserves legacy partial updates", () => {

@@ -15,6 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
+import { normalizeProxyUrl } from "@shared/proxy-settings";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
@@ -40,6 +41,7 @@ import { initializeTokenDanceModelCollection } from "./tokendance-model-collecti
 import type { NarraForkSettings } from "./types";
 import { normalizeUpdateSourceSettings } from "./update-source";
 
+export { normalizeProxyUrl } from "@shared/proxy-settings";
 export {
 	customApiProtocolFromAnthropic,
 	customApiProtocolFromOpenAI,
@@ -88,6 +90,7 @@ export {
 	getReasoningEffortBlocklist,
 	getSubagentVisibleModels,
 	getSummaryModelContextWindow,
+	getSummaryModelContextWindowDetail,
 	getVisibleModels,
 	hasConfiguredGeminiProvider,
 	hasConfiguredNugProvider,
@@ -467,26 +470,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// Clean up agent fields that reference models from providers no longer in settings
-	const activePrefixes = new Set<string>();
-	for (const prov of merged.openaiProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.anthropicProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.nugProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.geminiProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const b of ["codex"]) activePrefixes.add(b);
-	if (merged.tokendance?.apiKey) activePrefixes.add("tokendance");
-
-	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
-		needsSave = true;
-	}
+	// Loading settings must not destructively purge model references. Custom API
+	// providers, aggregations and plugin providers are not all represented by the
+	// legacy provider arrays (plugins may not even be registered yet at startup).
+	// Explicit provider removal cleans up references in the settings PATCH route.
 
 	if (migrateGlobalProxy(merged, raw)) {
 		needsSave = true;
@@ -661,24 +648,6 @@ export function getSettingsRevision(): number {
 	return settingsRevision;
 }
 
-const URL_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
-
-/**
- * Normalize user-entered proxy addresses.
- * If a user enters only host:port, assume an HTTP proxy by default.
- */
-export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-	const normalized = URL_PROTOCOL_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
-	try {
-		const protocol = new URL(normalized).protocol;
-		return protocol === "http:" || protocol === "https:" ? normalized : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 /** Preserve the formerly shared Browser/WebFetch override once, on settings load. */
 export function migrateBrowserProxy(settings: NarraForkSettings): boolean {
 	if (settings.agent.browserProxy !== undefined) return false;
@@ -696,6 +665,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 		settings.proxy,
 		settings.agent?.webFetchPolicy?.proxy,
 		settings.agent?.browserProxy,
+		settings.update?.proxy,
 	]) {
 		if (!proxy) continue;
 		if (proxy.mode !== "custom") {

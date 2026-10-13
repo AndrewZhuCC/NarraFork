@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { lstatSync, readFileSync } from "node:fs";
 import {
 	chmod,
 	mkdir,
@@ -57,6 +58,36 @@ describe("bounded private raw merge-file", () => {
 		const output = await mergeFileChangeBytes(current, base, incoming, { temporaryRoot });
 		expect(Buffer.from(output)).toEqual(bytes("original", "human"));
 		expect(current).toEqual(bytes("selected", "human"));
+	});
+
+	test("Git receives an empty regular config owned by the private merge directory", async () => {
+		const spawn = Bun.spawn;
+		let inspected = false;
+		const observe = ((command: string[], options: NonNullable<Parameters<typeof Bun.spawn>[1]>) => {
+			const config = options.env?.GIT_CONFIG_GLOBAL;
+			if (typeof config !== "string" || typeof options.cwd !== "string") {
+				throw new Error("Expected the controlled merge subprocess");
+			}
+			expect(config).toBe(join(options.cwd, "empty.gitconfig"));
+			expect(lstatSync(config).isFile()).toBe(true);
+			expect(readFileSync(config).byteLength).toBe(0);
+			expect(options.env?.GIT_CONFIG_NOSYSTEM).toBe("1");
+			inspected = true;
+			return spawn(command, options);
+		}) as typeof Bun.spawn;
+		const observer = spyOn(Bun, "spawn").mockImplementation(observe);
+		try {
+			const output = await mergeFileChangeBytes(
+				bytes("selected", "human"),
+				bytes("selected", "base"),
+				bytes("original", "base"),
+				{ temporaryRoot },
+			);
+			expect(inspected).toBe(true);
+			expect(Buffer.from(output)).toEqual(bytes("original", "human"));
+		} finally {
+			observer.mockRestore();
+		}
 	});
 
 	test("real Git conflicts return no conflict-marker bytes or partial success", async () => {

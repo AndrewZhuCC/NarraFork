@@ -10,6 +10,7 @@
 
 import { afterAll, afterEach, beforeEach } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -48,7 +49,10 @@ if (requestedNarraforkHome && !allowExplicitTestHome) {
 // Keep HOME isolated for child processes and code that consults the environment.
 // Core NarraFork paths use NARRAFORK_HOME explicitly because Bun's os.homedir()
 // is resolved from the host account rather than being changed at runtime.
-const isolatedHome = mkdtempSync(resolve(tmpdir(), "narrafork-test-"));
+// Windows tmpdir() can contain an 8.3 profile alias (RUNNER~1). Test consumers
+// require canonical private roots; resolve only this newly-created, owned directory.
+// Use the same async API as the runtime: Bun Windows realpathSync can retain aliases.
+const isolatedHome = await realpath(mkdtempSync(resolve(tmpdir(), "narrafork-test-")));
 const isolatedNarraforkHome = requestedNarraforkHome
 	? resolve(requestedNarraforkHome)
 	: resolve(isolatedHome, ".narrafork");
@@ -75,21 +79,29 @@ export const testEnvironment = Object.freeze({
 // is evaluated before this module body and would load the real settings first.
 const { getDefaults, settings } = await import("@server/lib/settings");
 
+// Ordinary agent tests must not spawn a real recording worker for every isolated file.
+// Recording tests opt in explicitly; the shipped DEFAULTS remain enabled.
+settings.agent.requestDumpRecordingEnabled = false;
+
 // Capture the isolated live settings at preload time. This is the authoritative
 // state that other modules (e.g. auth.ts) will read from.
 const snapshot = structuredClone(settings);
+// getDefaults() deep-clones the entire configuration; its fixed top-level keys
+// do not need to be rediscovered for every individual test.
+const defaultKeys = Object.keys(getDefaults()) as Array<keyof typeof settings>;
 
-beforeEach(() => {
+export function repairMissingSettingsBranches(): void {
 	// Restore any sub-objects that may have been wiped by a previous test.
-	const defaults = getDefaults();
-	for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) {
+	for (const key of defaultKeys) {
 		if (settings[key] === undefined || settings[key] === null) {
 			// Use snapshot value (preserves runtime-generated secrets like jwtSecret)
 			// biome-ignore lint/suspicious/noExplicitAny: restoring dynamic settings keys
 			(settings as any)[key] = structuredClone((snapshot as any)[key]);
 		}
 	}
-});
+}
+
+beforeEach(repairMissingSettingsBranches);
 
 afterEach(() => {
 	// Full restore from the original snapshot taken at module load time.

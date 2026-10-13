@@ -16,7 +16,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { AWAIT_AGENT_RESOLVED_FIELD, attachAwaitAgentNarratorIds } from "../await-agent-resolution";
+import {
+	AWAIT_AGENT_RESOLVED_FIELD,
+	AWAIT_AGENT_TITLE_FIELD,
+	attachAwaitAgentNarratorIds,
+} from "../await-agent-resolution";
 
 function awaitMessage(toolUseId: string, extra: Record<string, unknown> = {}) {
 	return {
@@ -39,9 +43,14 @@ function awaitMessage(toolUseId: string, extra: Record<string, unknown> = {}) {
 describe("attachAwaitAgentNarratorIds", () => {
 	test("writes the resolved id onto the matching tool_use block", () => {
 		const tree = [awaitMessage("tu-1")];
-		const out = attachAwaitAgentNarratorIds(tree, new Map([["tu-1", "sub-live"]]));
+		const out = attachAwaitAgentNarratorIds(
+			tree,
+			new Map([["tu-1", { id: "sub-live", title: "Live Worker" }]]),
+		);
 		const block = out[0].contentJson[1];
 		expect(block[AWAIT_AGENT_RESOLVED_FIELD]).toBe("sub-live");
+		// The title rides along so the running card can headline the session name.
+		expect(block[AWAIT_AGENT_TITLE_FIELD]).toBe("Live Worker");
 		// The field name is part of the wire contract with the frontend readers.
 		expect(AWAIT_AGENT_RESOLVED_FIELD).toBe("_awaitAgentNarratorId");
 	});
@@ -52,15 +61,23 @@ describe("attachAwaitAgentNarratorIds", () => {
 	 */
 	test("never touches _metadata", () => {
 		const tree = [awaitMessage("tu-1", { _metadata: { awaitType: "agent" } })];
-		const out = attachAwaitAgentNarratorIds(tree, new Map([["tu-1", "sub-live"]]));
+		const out = attachAwaitAgentNarratorIds(
+			tree,
+			new Map([["tu-1", { id: "sub-live", title: null }]]),
+		);
 		const block = out[0].contentJson[1];
 		expect(block._metadata).toEqual({ awaitType: "agent" });
 		expect(block._metadata.subagentId).toBeUndefined();
+		// A title-less resolution writes no title field, keeping legacy rows identical.
+		expect(block[AWAIT_AGENT_TITLE_FIELD]).toBeUndefined();
 	});
 
 	test("leaves other blocks and other tool calls alone", () => {
 		const tree = [awaitMessage("tu-1")];
-		const out = attachAwaitAgentNarratorIds(tree, new Map([["tu-other", "sub-live"]]));
+		const out = attachAwaitAgentNarratorIds(
+			tree,
+			new Map([["tu-other", { id: "sub-live", title: null }]]),
+		);
 		// Nothing resolved for this page → identical reference, no copy.
 		expect(out).toBe(tree);
 		expect(out[0].contentJson[1][AWAIT_AGENT_RESOLVED_FIELD]).toBeUndefined();
@@ -80,12 +97,17 @@ describe("attachAwaitAgentNarratorIds", () => {
 				children: [awaitMessage("tu-child")],
 			},
 		];
-		const out = attachAwaitAgentNarratorIds(tree, new Map([["tu-child", "sub-nested"]]));
+		const out = attachAwaitAgentNarratorIds(
+			tree,
+			new Map([["tu-child", { id: "sub-nested", title: null }]]),
+		);
 		expect(out[0].children[0].contentJson[1][AWAIT_AGENT_RESOLVED_FIELD]).toBe("sub-nested");
 	});
 
 	test("tolerates messages without contentJson", () => {
 		const tree = [{ id: "m-1", role: "user", contentText: "hi" }];
-		expect(attachAwaitAgentNarratorIds(tree, new Map([["tu-1", "sub-live"]]))).toBe(tree);
+		expect(
+			attachAwaitAgentNarratorIds(tree, new Map([["tu-1", { id: "sub-live", title: null }]])),
+		).toBe(tree);
 	});
 });

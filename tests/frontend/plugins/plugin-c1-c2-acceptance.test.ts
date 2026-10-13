@@ -273,6 +273,14 @@ function renderProductionIframe(shell: string): HTMLIFrameElement {
 }
 
 function chromiumExecutable(): string {
+	for (const key of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"] as const) {
+		const configured = process.env[key];
+		if (configured === undefined) continue;
+		if (!configured || !existsSync(configured)) {
+			throw new Error(`Configured Chromium path does not exist: ${key}`);
+		}
+		return configured;
+	}
 	const cache = join(homedir(), ".cache/puppeteer");
 	const cached = existsSync(cache)
 		? Array.from(
@@ -280,18 +288,41 @@ function chromiumExecutable(): string {
 				(path) => join(cache, path),
 			)
 		: [];
-	const path = [
-		process.env.NF_TEST_CHROMIUM_PATH,
-		process.env.PUPPETEER_EXECUTABLE_PATH,
-		"/usr/bin/chromium",
-		"/usr/bin/google-chrome",
-		...cached,
-	].find((candidate): candidate is string => !!candidate && existsSync(candidate));
+	const path = ["/usr/bin/chromium", "/usr/bin/google-chrome", ...cached].find(
+		(candidate): candidate is string => !!candidate && existsSync(candidate),
+	);
 	if (!path) throw new Error("Chromium is required to verify plugin sandbox enforcement");
 	return path;
 }
 
 describe("hostile iframe acceptance fixture", () => {
+	test.each([
+		"NF_TEST_CHROMIUM_PATH",
+		"PUPPETEER_EXECUTABLE_PATH",
+	] as const)("invalid explicit %s never falls back to another browser", (key) => {
+		const saved = {
+			NF_TEST_CHROMIUM_PATH: process.env.NF_TEST_CHROMIUM_PATH,
+			PUPPETEER_EXECUTABLE_PATH: process.env.PUPPETEER_EXECUTABLE_PATH,
+		};
+		try {
+			delete process.env.NF_TEST_CHROMIUM_PATH;
+			delete process.env.PUPPETEER_EXECUTABLE_PATH;
+			if (key === "NF_TEST_CHROMIUM_PATH") {
+				// This existing alternative must not hide the invalid authoritative path.
+				process.env.PUPPETEER_EXECUTABLE_PATH = import.meta.filename;
+			}
+			process.env[key] = join(hostileFixture, "missing-chromium-executable");
+			expect(() => chromiumExecutable()).toThrow("Configured Chromium path does not exist");
+			process.env[key] = "";
+			expect(() => chromiumExecutable()).toThrow("Configured Chromium path does not exist");
+		} finally {
+			for (const name of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"] as const) {
+				if (saved[name] === undefined) delete process.env[name];
+				else process.env[name] = saved[name];
+			}
+		}
+	});
+
 	test("is a strict self-contained view package with distinct per-view assets", async () => {
 		const manifest = parseManifest(
 			JSON.parse(await readFile(join(hostileFixture, "manifest.json"), "utf8")),
@@ -430,7 +461,7 @@ test("Chromium enforces the production iframe's opaque origin against parent, st
 		browser = await puppeteer.launch({
 			executablePath: chromiumExecutable(),
 			headless: true,
-			args: ["--no-sandbox"],
+			args: ["--no-sandbox", "--disable-setuid-sandbox"],
 			timeout: 15_000,
 		});
 		const page = await browser.newPage();

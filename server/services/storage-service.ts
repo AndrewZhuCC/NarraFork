@@ -23,6 +23,7 @@ import {
 } from "../lib/chat-attachments";
 import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
+import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "../lib/request-recorder";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { dropRecentlyAttributed } from "./file-attribution-service";
@@ -423,6 +424,18 @@ async function scanRequestDumps(): Promise<StorageCategoryResult> {
 	};
 }
 
+/** Saved bundles have their own category and are never reclaimed by rolling-buffer cleanup. */
+export async function scanRequestRecordings(saved = false): Promise<StorageCategoryResult> {
+	const directory = saved ? REQUEST_RECORDING_SAVED_DIR : REQUEST_RECORDING_DIR;
+	const measured = await measureDirSize(resolve(NARRAFORK_DIR, directory));
+	return {
+		key: saved ? "savedRequestRecordings" : "requestRecordings",
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
+		details: { retention: saved ? "manual" : "rolling" },
+	};
+}
+
 async function scanShares(): Promise<StorageCategoryResult> {
 	const measured = await measureDirSize(SHARES_DIR);
 	let fileCount = 0;
@@ -739,6 +752,18 @@ export async function* scanStorage(
 	const requestDumpsResult = await scanRequestDumps();
 	categories.push(requestDumpsResult);
 	yield { type: "category", data: requestDumpsResult };
+
+	throwIfAborted(signal);
+	yield { type: "progress", message: "scanning_request_recordings" };
+	const requestRecordingsResult = await scanRequestRecordings();
+	categories.push(requestRecordingsResult);
+	yield { type: "category", data: requestRecordingsResult };
+
+	throwIfAborted(signal);
+	yield { type: "progress", message: "scanning_saved_request_recordings" };
+	const savedRequestRecordingsResult = await scanRequestRecordings(true);
+	categories.push(savedRequestRecordingsResult);
+	yield { type: "category", data: savedRequestRecordingsResult };
 
 	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_worktrees" };

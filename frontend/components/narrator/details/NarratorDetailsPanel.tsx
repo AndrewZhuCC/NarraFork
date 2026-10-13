@@ -105,6 +105,7 @@ import { localizeNarratorError } from "../error-localization";
 import { NarratorAvatar } from "../header/NarratorAvatar";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { SubagentModelPoolEditor } from "../model/SubagentModelPoolEditor";
+import { SessionExportFields } from "../session-interchange/SessionExportFields";
 import type { ViewerInfo } from "../useNarratorPanelWS";
 import {
 	type AdvancedRowInput,
@@ -123,6 +124,7 @@ import {
 	shouldRenderAdvancedSubsection,
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
+import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
 
 export interface NarratorDetailsPanelProps {
 	opened: boolean;
@@ -524,7 +526,10 @@ function NarratorDetailsContent({
 	const { value: blockAllSkills, setValue: setBlockAllSkills } = blockAllDraft;
 	const blockedSkillsDraft = useDetailsDraft(customTraits?.blockedSkills?.names ?? EMPTY_SELECTION);
 	const { value: blockedSkillSelection, setValue: setBlockedSkillSelection } = blockedSkillsDraft;
-	const [exportFormat, setExportFormat] = useState<"markdown" | "json">("markdown");
+	const [exportFormat, setExportFormat] = useState<"markdown" | "json" | "claude-code" | "codex">(
+		"markdown",
+	);
+	const isSessionExport = exportFormat === "claude-code" || exportFormat === "codex";
 	const [exportIncludeToolIO, setExportIncludeToolIO] = useState(true);
 	// Unchecked by default: the export matches what the panel currently shows. The
 	// exported file states when this left earlier history out, so the narrower
@@ -677,12 +682,12 @@ function NarratorDetailsContent({
 	};
 
 	const handleExport = async () => {
-		if (exporting) return;
+		if (exporting || isSessionExport) return;
 		setExporting(true);
 		let objectUrl: string | null = null;
 		try {
 			const { blob, fileName } = await api.exportNarratorMessages(narratorId, {
-				format: exportFormat,
+				format: exportFormat === "json" ? "json" : "markdown",
 				scope: exportFullHistory ? "full" : "visible",
 				includeToolIO: exportIncludeToolIO,
 				lang: i18n.language,
@@ -1307,8 +1312,9 @@ function NarratorDetailsContent({
 				<DetailsPanelSection
 					id="session"
 					title={t("details.session")}
-					searchableText={sessionSearchableText}
+					searchableText={[...sessionSearchableText, t("details.gitIdentity")]}
 				>
+					<NarratorGitIdentitySelect narratorId={narratorId} />
 					<DetailRow
 						label={t("details.model")}
 						value={
@@ -1541,49 +1547,85 @@ function NarratorDetailsContent({
 						t("details.exportFormat"),
 						t("details.exportFormatMarkdown"),
 						t("details.exportFormatJson"),
+						t("details.exportFormatClaudeCode"),
+						t("details.exportFormatCodex"),
 						t("details.exportIncludeToolIO"),
 						t("details.exportFullHistory"),
 						t("details.exportAction"),
 					]}
 				>
-					<Text size="xs" c="dimmed">
-						{t("details.exportDescription")}
-					</Text>
+					{!isSessionExport ? (
+						<Text size="xs" c="dimmed">
+							{t("details.exportDescription")}
+						</Text>
+					) : null}
 					<Select
 						label={t("details.exportFormat")}
 						data={[
 							{ value: "markdown", label: t("details.exportFormatMarkdown") },
 							{ value: "json", label: t("details.exportFormatJson") },
+							{ value: "claude-code", label: t("details.exportFormatClaudeCode") },
+							{ value: "codex", label: t("details.exportFormatCodex") },
 						]}
 						value={exportFormat}
-						onChange={(value) => setExportFormat(value === "json" ? "json" : "markdown")}
+						onChange={(value) =>
+							setExportFormat(
+								value === "json" || value === "claude-code" || value === "codex"
+									? value
+									: "markdown",
+							)
+						}
 						allowDeselect={false}
 						disabled={exporting}
 					/>
-					<Checkbox
-						label={t("details.exportIncludeToolIO")}
-						description={t("details.exportIncludeToolIODescription")}
-						checked={exportIncludeToolIO}
-						onChange={(event) => setExportIncludeToolIO(event.currentTarget.checked)}
-						disabled={exporting}
-					/>
-					<Checkbox
-						label={t("details.exportFullHistory")}
-						description={t("details.exportFullHistoryDescription")}
-						checked={exportFullHistory}
-						onChange={(event) => setExportFullHistory(event.currentTarget.checked)}
-						disabled={exporting}
-					/>
-					<Group justify="flex-end">
-						<Button
-							size="xs"
-							leftSection={<IconDownload size={14} />}
-							loading={exporting}
-							onClick={handleExport}
-						>
-							{t("details.exportAction")}
-						</Button>
-					</Group>
+					{isSessionExport ? (
+						<SessionExportFields
+							// Remounted per format so the destination result never shows a stale
+							// resume command from the other CLI.
+							key={exportFormat}
+							narratorId={narratorId}
+							format={exportFormat}
+							narratorCwd={typeof narrator?.cwd === "string" ? narrator.cwd : null}
+							// Mirrors resolveNarratorProjectId: the chapter's project, else the context
+							// project. Decides which project-scoped devices can be offered.
+							projectId={
+								chapterId
+									? typeof chapter?.projectId === "string"
+										? chapter.projectId
+										: null
+									: typeof narrator?.contextProjectId === "string"
+										? narrator.contextProjectId
+										: null
+							}
+						/>
+					) : (
+						<>
+							<Checkbox
+								label={t("details.exportIncludeToolIO")}
+								description={t("details.exportIncludeToolIODescription")}
+								checked={exportIncludeToolIO}
+								onChange={(event) => setExportIncludeToolIO(event.currentTarget.checked)}
+								disabled={exporting}
+							/>
+							<Checkbox
+								label={t("details.exportFullHistory")}
+								description={t("details.exportFullHistoryDescription")}
+								checked={exportFullHistory}
+								onChange={(event) => setExportFullHistory(event.currentTarget.checked)}
+								disabled={exporting}
+							/>
+							<Group justify="flex-end">
+								<Button
+									size="xs"
+									leftSection={<IconDownload size={14} />}
+									loading={exporting}
+									onClick={handleExport}
+								>
+									{t("details.exportAction")}
+								</Button>
+							</Group>
+						</>
+					)}
 				</DetailsPanelSection>
 
 				<DetailsPanelSection

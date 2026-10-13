@@ -5,6 +5,10 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import {
+	DEFAULT_RECORDING_REQUEST_BYTES,
+	DEFAULT_RECORDING_RESPONSE_BYTES,
+} from "@shared/request-recording";
 import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import { DEFAULT_DISK_SAFETY } from "../disk-safety-config";
 import type { FieldDoc, NarraForkSettings } from "./types";
@@ -78,6 +82,9 @@ export const DEFAULTS: NarraForkSettings = {
 		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
+		requestDumpRecordingEnabled: true,
+		requestDumpRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
+		requestDumpResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
 		// 32MB. Enabling dumping is an explicit, warned, high-risk opt-in made to capture
@@ -583,12 +590,24 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "启用后 Bash 工具通过 login shell 加载最新环境变量，而非继承服务器进程环境。适用于服务器启动后修改了 shell 配置的场景。",
 		type: "boolean",
 	},
+	"agent.requestDumpRecordingEnabled": {
+		desc: "循环录制近期模型/API 请求与响应，默认开启。使用 /save_dump 保存当前证据，不打断会话。设置立即生效。",
+		type: "boolean",
+	},
+	"agent.requestDumpRequestBytes": {
+		desc: "循环录制请求侧容量（字节），默认 16MiB，范围 0 或 1KiB..512MiB。0 关闭该侧循环录制，不限制强制持续保留。",
+		type: "number",
+	},
+	"agent.requestDumpResponseBytes": {
+		desc: "循环录制响应侧容量（字节），默认 128MiB，范围 0 或 1KiB..2GiB。0 关闭该侧循环录制，不限制强制持续保留。",
+		type: "number",
+	},
 	"agent.requestDumpEnabled": {
-		desc: "启用后为每次模型/API 请求持久化原始请求与响应 dump，可在管理员请求历史中查看完整原始数据。保存后对当前会话的后续请求立即生效，无需重启叙述者。",
+		desc: "强制持续保留模型/API 请求与响应 dump，不受循环容量限制。单份持续录制和保存包各有 512MiB 安全上限，超限截断证据，不影响业务请求。保存后即时生效，无需重启叙述者。",
 		type: "boolean",
 	},
 	"agent.requestDumpErrorsOnly": {
-		desc: "启用后仅为报错的模型/API 请求持久化原始请求与响应 dump，成功请求不会保存 dump。保存后同样对后续请求立即生效。",
+		desc: "强制持续保留开启时，仅持久保留报错请求。不会过滤循环录制中的成功请求。保存后即时生效。",
 		type: "boolean",
 	},
 	"agent.requestDumpMaxSize": {
@@ -979,6 +998,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── update ──────────────────────────────────────────────────────────
+	"update.proxy.mode": {
+		desc: "软件更新、版本说明及 rg/zstd/远程执行器清单与二进制请求的代理策略。缺省或 default 继承全局 proxy；不改变更新来源或 TLS 校验。",
+		type: "string",
+		valid: '"default" | "direct" | "system" | "custom"',
+	},
+	"update.proxy.url": {
+		desc: "更新代理地址，仅 custom 模式必填。支持 HTTP/HTTPS，host:port 自动补 http://；不支持 SOCKS。",
+		type: "string",
+		valid: "有效 HTTP/HTTPS URL，最长 500 字符",
+	},
 	"update.source": {
 		desc: '更新来源。默认 "github" 使用 GitHub Release；"update-server" 使用自定义更新服务器。',
 		type: "string",

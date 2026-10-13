@@ -60,7 +60,7 @@ bun server/index.ts --no-auto-resume
 
 - **Static checks**：SQLite 迁移资产检查、全仓 Biome、i18n 检查。
 - **Build and typecheck**：先构建前端（Vite 自动生成 `routeTree.gen.ts`），再运行 TypeScript。根目录测试导入 VS Code 扩展的类型接口，因此还需按 `vscode-extension/bun.lock` 安装该子项目的类型依赖。
-- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate`。`scripts/run-ci-tests.ts` 原样转交 native 参数，仅将测试进程 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，避免固定 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的运行时缺陷；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志和唯一命名的 JUnit 报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
+- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate` 和固定的 `--parallel=2`。Bun 按 `.github/test-timings.json` 中的历史文件耗时均衡分片、优先调度慢文件；它只是调度提示，不是文件清单，新增或缺少提示的测试仍由 Bun 自动发现。`scripts/run-ci-tests.ts` 有界校验后将提示独占复制到 `artifacts/ci-test-timings.json`，`--update-timings` 仅更新该片的 artifact；不写回仓库基线，不执行自建文件过滤，也不使用共享同文件状态的 `--concurrent`/`--no-isolate`。runner 原样转交白名单内 native 参数（仍兼容旧五参数），将 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，避免固定 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的运行时缺陷；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志、唯一命名的 JUnit 和耗时报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
 - **CI Gate**：只有以上任务全部成功才成功；失败、取消或跳过都不能变成通过。启用合并保护时选择该检查；仅增加 workflow 不会自动修改仓库保护规则。
 
 ### SQLite 历史资产
@@ -77,6 +77,14 @@ bun server/index.ts --no-auto-resume
 - `dist/frontend/index.html` 必须存在，防止构建后 PWA/品牌测试因为没有产物而跳过。
 - 通用 CI 不启用 `PG_INTEGRATION`、`NF_PG_HARNESS_INTEGRATION`、`NF_REFERENCE_COST_PG_URL`、`NF_PROGRAMMATIC_TEST_IMAGE` 或 `NF_TASK_CHALLENGES_PODMAN` 等现有 opt-in。它们有独立的数据库/专用镜像前提，不代表已由默认门禁验收。无 opt-in 的真实 PG baseline 仍运行，不排除 `pg-*`、`integration`、`browser` 或 `e2e` 文件。
 
+### 测试耗时与准备复用
+
+- 优先比较同机器、同参数的**文件总 wall time**，同时核对退出码、用例/断言、fixture 调用次数和峰值内存；不能仅把成本转移到 `beforeAll` 后拿单例时间宣布提速。历史 CI 报告用于定位热点，不冒充同机 A/B。
+- preload 只缓存默认配置的固定顶层键，避免每例为取键而深拷贝全部 DEFAULTS；`afterEach` 仍完整恢复隔离 snapshot，缺失分支也从 snapshot 修复，不改成浅恢复。
+- 归档恢复测试可复用一次真实构造的合法 ZIP 输入；每例的 Buffer、entries、元数据、闭包和输出目录仍独立。恶意 ZIP 与特殊 plan 必须按原路径真实构造，不能 hardlink、共享可写状态或减少负向覆盖。
+- 已模拟的计时场景可推进实际注册的 callbacks，避免固定 sleep；必须同步控制需要的时间源，保留 React `act`、重试次数、fallback 和 timer/spy 清理。真实浏览器、数据库、持久化与大型边界场景不能为提速伪装为纯 mock。
+- 原生计时基线格式为 `{ "version": 1, "files": { "relative/file.test.ts": 1200 } }`，单位毫秒。四片报告中的更新结果可以合并校准；过期、缺失提示不改变测试发现。不要将某一片的结果直接覆盖为全仓文件白名单。
+
 ### 从干净检出验证
 
 依次执行冻结安装、资产检查、Biome、i18n、前端构建、扩展子项目冻结安装、`bunx tsgo --noEmit`、测试 preload 守卫和全仓隔离测试。不要从个人工作区复制 `node_modules`、`dist`、`routeTree.gen.ts`、迁移软链接或设置文件补齐缺失项。
@@ -84,6 +92,13 @@ bun server/index.ts --no-auto-resume
 在绝对路径包含 `.worktrees` 的本地 worktree 中，Biome 的 `!**/.worktrees` 排除可能使根目录检查处理 0 文件，不能把它当作通过。本地验证可使用临时配置，仅移除该路径排除并关闭 VCS 忽略，保留全部代码检查规则和其余排除；必须核对实际处理文件数大于零。正式 CI 的普通 checkout 使用原配置。
 
 如果在工作区内建立临时干净检出，先完成外层全仓测试，副本存在期间只从副本根目录运行测试，清理本次创建的副本后再运行外层测试，避免递归发现重复测试。存量检查/测试失败必须记录并修复，不能靠自动重试、缩小扫描范围或跳过断言把门禁染绿。
+
+## 更新代理与辅助分发回归
+
+- 更新代理覆盖复用 `default/direct/system/custom`，测试必须实际检查传输选项、逐跳 NO_PROXY、非法配置不直连、代理变化立即重试、响应体 deadline 和父取消；不能只断言 UI 有一个字段。`sourceIdentity`、preparedId 和已调度 epoch 在代理变化后保持不变。
+- helper tests 使用 fixture/mock 或测试专属 loopback，不访问真实 GitHub工具或个人更新服务器。覆盖 manifest 64KiB、binary32MiB、流式无限 body、size/hash/架构、缓存来源/tag/摘要隔离、同次准备切源迟到、并发取消及临时文件清理。版本探测只能执行已核验托管工具，或用户管理的 PATH 工具；不能用自动安装掩盖缺资产。
+- executor tests 验证票据冻结精确来源/版本/协议/平台/digest，下载不刷新 manifest；安装脚本不携带代理凭据。独立 helpers-release 默认 build-only、publisher 经 Environment、公开不可变，主发布就绪检查只读取新产物自身的依赖声明，旧 bundle 不编造依赖。
+- 定向入口包括 `server/lib/net/__tests__/update-fetch.test.ts`、`shared/helper-distribution.test.ts`、`server/lib/__tests__/helper-distribution-runtime.test.ts`、`server/services/__tests__/update-helper-transport.test.ts` 和 `tests/scripts/helper-release*.test.ts`。全部加 `--isolate`；本地模拟不等于六平台托管 runner native smoke，更不等于辅助资产已公开上线。
 
 ## Release CI 与默认 CI 的区别
 

@@ -31,6 +31,7 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { createRequestRecording } from "../request-recorder";
 import {
 	consumeSearchExecutionTurn,
 	getSearchExecutionScope,
@@ -65,14 +66,14 @@ import {
 } from "./malformed-request-dump";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
-import { projectQuestionModelInput } from "./question-model-input";
+import { projectAskUserQuestionInput, projectQuestionModelInput } from "./question-model-input";
 import {
 	bindPermissionRecovery,
 	isRecoveredHumanPermission,
 	type PersistedRecoveryGate,
 	recoveryReflection,
 } from "./recovery-gate";
-import { ApiRequestDumpCollector } from "./request-dump";
+import { ApiRequestDumpCollector, RING_DIAGNOSTIC_PREFIX_BYTES } from "./request-dump";
 import { detectShell } from "./shell";
 import {
 	groupToolExecutions,
@@ -130,6 +131,7 @@ import type {
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentInputPart,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
@@ -1390,8 +1392,9 @@ export async function runReflectionLoop(
 				pendingApiRequests.set(
 					event.requestId,
 					startApiRequest({
+						recordingRequestId: event.requestId,
 						narratorId: parentConfig.narratorId,
-						userId: parentConfig.userId,
+						userId: event.userId ?? null,
 						provider: event.provider,
 						model: event.model,
 						credentialId: event.credentialId,
@@ -2865,22 +2868,16 @@ async function* agentLoopInMetadataSnapshot(
 		pendingLoopInjections.push(injection);
 	}
 
-	/**
-	 * Persist the queued reminders and return the text for the current turn.
-	 *
-	 * A host without the hook gets "" and the reminders are dropped rather than falling
-	 * back to a side-car: delivering both ways is how the same words end up in the
-	 * conversation twice.
-	 */
-	async function flushLoopInjections(): Promise<string> {
-		if (pendingLoopInjections.length === 0) return "";
+	/** Persist reminders once, retaining their source IDs until input is actually assembled. */
+	async function flushLoopInjections(): Promise<void> {
+		if (pendingLoopInjections.length === 0) return;
 		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
-		if (!config.deliverInjectionRow) return "";
-		const parts: string[] = [];
+		if (!config.deliverInjectionRow) return;
 		for (const injection of queued) {
 			try {
-				const text = await config.deliverInjectionRow(injection);
-				if (text?.trim()) parts.push(text);
+				const delivered = await config.deliverInjectionRow(injection);
+				const part = typeof delivered === "string" ? { text: delivered } : delivered;
+				if (part.text.trim()) pendingInputParts.push(part);
 			} catch (err) {
 				logger.warn("Failed to deliver loop injection row", {
 					narratorId: config.narratorId,
@@ -2889,7 +2886,6 @@ async function* agentLoopInMetadataSnapshot(
 				});
 			}
 		}
-		return parts.join("\n\n");
 	}
 
 	/**
@@ -3035,22 +3031,37 @@ async function* agentLoopInMetadataSnapshot(
 	 * pass start: a row written mid-turn is invisible until the next pass, and a
 	 * finished background task should not have to wait that long to be mentioned.
 	 */
+	const pendingInputParts: AgentInputPart[] = [];
+	let replayedInjectionMessageIds = new Set<string>();
 	const pendingInputConsumptions: Array<() => void> = [];
-	async function collectAfterToolsInjectionText(): Promise<string> {
-		if (!config.getAfterToolsInjections) return "";
+	async function collectAfterToolsInjections(): Promise<void> {
+		if (!config.getAfterToolsInjections) return;
 		try {
 			const injection = await config.getAfterToolsInjections();
 			const text = (typeof injection === "string" ? injection : injection.text).trim();
-			if (text && typeof injection !== "string" && injection.onConsumed) {
+			if (!text) return;
+			const parts = typeof injection === "string" ? undefined : injection.parts;
+			// Legacy hosts return one opaque string. Never lose input if a host supplies
+			// incomplete provenance: without an exact partition it cannot be de-duplicated.
+			if (
+				parts &&
+				parts
+					.map((part) => part.text)
+					.join("\n\n")
+					.trim() === text
+			) {
+				pendingInputParts.push(...parts);
+			} else {
+				pendingInputParts.push({ text });
+			}
+			if (typeof injection !== "string" && injection.onConsumed) {
 				pendingInputConsumptions.push(injection.onConsumed);
 			}
-			return text;
 		} catch (err) {
 			logger.warn("Failed to collect after-tools injections", {
 				narratorId: config.narratorId,
 				error: String(err),
 			});
-			return "";
 		}
 	}
 
@@ -3068,6 +3079,19 @@ async function* agentLoopInMetadataSnapshot(
 	// Extra content to prepend to the next turn's user message (e.g. broken-tool reminder).
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
+
+	function pendingInputText(parts: readonly AgentInputPart[]): string {
+		return parts
+			.filter((part) => !part.messageId || !replayedInjectionMessageIds.has(part.messageId))
+			.map((part) => part.text)
+			.join("\n\n")
+			.trim();
+	}
+
+	function combinePendingInput(base: string, parts: readonly AgentInputPart[]): string {
+		const text = pendingInputText(parts);
+		return text ? (base ? `${base}\n\n${text}` : text) : base;
+	}
 
 	// Retries for "reasoning-only" dead turns (model produced only reasoning, no text
 	// and no tool calls). Declared at function scope so the ceiling is shared across
@@ -3096,6 +3120,7 @@ async function* agentLoopInMetadataSnapshot(
 		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
 		sourceInputHistory = replacement.history;
+		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
 		}
@@ -3222,7 +3247,7 @@ async function* agentLoopInMetadataSnapshot(
 			const isFirstTurn = turnIndex === 0;
 			provider.pushUserTurn(
 				history,
-				isFirstTurn ? userText : nextTurnContent,
+				isFirstTurn ? userText : combinePendingInput(nextTurnContent, pendingInputParts),
 				effectiveModel,
 				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
 				isFirstTurn ? images : undefined,
@@ -3235,6 +3260,10 @@ async function* agentLoopInMetadataSnapshot(
 		let responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
 			isReflection: !!config.reflectionLoop,
 		});
+		// The transport ending is not the final attempt verdict: empty/malformed tool
+		// responses are classified afterwards. Keep the unfinished handle for that verdict,
+		// while this turn's outer finally covers consumer return and unexpected exits.
+		let activeRequestDump: ApiRequestDumpCollector | undefined;
 		try {
 			// Delivery is de-duplicated only within one model turn. If persistence failed,
 			// the still-pending state may be attached again on the next turn.
@@ -3269,7 +3298,9 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
-			const content = isFirstTurn ? userText : nextTurnContent;
+			const baseContent = isFirstTurn ? userText : nextTurnContent;
+			const currentInputParts = pendingInputParts.splice(0);
+			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
 			getPermissionHistory = () => {
 				const reflectionHistory = [...history];
@@ -3670,7 +3701,8 @@ async function* agentLoopInMetadataSnapshot(
 					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
 					yieldedToolResults.add(tu.toolUseId);
 					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
-					if (settled.updatedInput) tu.input = settled.updatedInput;
+					if (settled.updatedInput && tu.name !== "AskUserQuestion")
+						tu.input = settled.updatedInput;
 					await processToolResultInjections(tu, settled);
 					yield earlyToolResultEvent(tu, settled);
 				}
@@ -3866,6 +3898,7 @@ async function* agentLoopInMetadataSnapshot(
 			let malformedSpillReuseToken: string | undefined;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
+			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
@@ -3962,8 +3995,19 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+				// A failed/no-op settings switch can reach teardown twice for one attempt.
+				// Do not re-emit its end or erase the durable association added by the consumer.
+				if (requestFinished) return;
+				requestFinished = true;
 				streamExecutionOpen = false;
-				if (!requestStarted) return;
+				if (!requestStarted) {
+					requestDump?.finish({
+						error: errorMessage,
+						status: errorMessage ? "error" : "completed",
+					});
+					if (activeRequestDump === requestDump) activeRequestDump = undefined;
+					return;
+				}
 				// Retract the live tool cards this request published but never completed.
 				//
 				// This sits in the request teardown rather than at each retry site because
@@ -3978,15 +4022,35 @@ async function* agentLoopInMetadataSnapshot(
 				// accumulator, so only genuinely truncated ids are ever named.
 				yield* retractStreamingToolCards();
 				yield* flushRequestStart();
-				const diagnostics = requestDiagnostics
-					? normalizeApiRequestDiagnostics({
-							...requestDiagnostics,
-							provider: requestDiagnostics.provider ?? effectiveProvider,
-							model: requestDiagnostics.model ?? effectiveModel,
-							message: requestDiagnostics.message ?? errorMessage,
-						})
-					: undefined;
+				// Keep the diagnostic object's identity: lastRetryDiagnostics and deferred
+				// resumable errors can still refer to this attempt after the next one starts.
+				// The consumer enriches this SAME object with the durable API row ID at end.
+				const normalizedDiagnostics =
+					requestDiagnostics || errorMessage
+						? normalizeApiRequestDiagnostics({
+								...requestDiagnostics,
+								provider: requestDiagnostics?.provider ?? effectiveProvider,
+								model: requestDiagnostics?.model ?? effectiveModel,
+								message: requestDiagnostics?.message ?? errorMessage,
+								recordingRequestId: requestId,
+								// Never accept a provider-supplied local database association.
+								apiRequestId: undefined,
+							})
+						: undefined;
+				if (normalizedDiagnostics) {
+					if (requestDiagnostics) {
+						for (const field of Object.keys(requestDiagnostics)) {
+							Reflect.deleteProperty(requestDiagnostics, field);
+						}
+						Object.assign(requestDiagnostics, normalizedDiagnostics);
+					} else requestDiagnostics = normalizedDiagnostics;
+				}
+				const diagnostics = requestDiagnostics;
 				requestDump?.setDiagnostics(diagnostics);
+				// Start is lazy. Let the consumer create/bind its durable API row, and
+				// attach bounded diagnostics, before automatic errors-only saving fires.
+				requestDump?.finish({ error: errorMessage, status: errorMessage ? "error" : "completed" });
+				if (activeRequestDump === requestDump) activeRequestDump = undefined;
 				if (!contextSnapshot) {
 					const window = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (window && inputCharacters) {
@@ -4026,7 +4090,10 @@ async function* agentLoopInMetadataSnapshot(
 					meterUnit: requestMeterUnit,
 					// The dump wins whenever one exists: `malformedRequestRecord` is only set on
 					// the no-collector path, where it is the sole record of the rejection.
-					rawDump: requestDump?.snapshot() ?? malformedRequestRecord,
+					rawDump:
+						settings.agent.requestDumpEnabled || forceDumpPersist
+							? (requestDump?.snapshot() ?? malformedRequestRecord)
+							: undefined,
 					errorMessage,
 					diagnostics,
 					forceDumpPersist,
@@ -4041,9 +4108,11 @@ async function* agentLoopInMetadataSnapshot(
 			// Stateful providers (responses/codex) cannot retry here because the
 			// server already consumed the request.
 			const maxConfiguredRetries = config.maxTransientRetries ?? 0;
+			// Watchdog timeouts must use the same retry owner as other transport errors:
+			// stateful providers replay in the outer runtime, stateless providers retry
+			// here. Giving both layers a full budget multiplies the configured limit.
 			const getMaxChatRetries = () =>
 				usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
-			const maxFirstTokenRetries = maxConfiguredRetries;
 			const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 			const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
 			let chatRetryCount = 0;
@@ -4061,10 +4130,9 @@ async function* agentLoopInMetadataSnapshot(
 			/**
 			 * Whether this attempt has produced any client-visible, persistable
 			 * content so far (text/tool calls/reasoning/web search/image
-			 * generation). Used both by the empty-response guard below and by the
-			 * resumable-error path: a "resumable" error is only meaningful when
-			 * there is actually partial output to continue from — otherwise it
-			 * degrades to an ordinary retryable/non-retryable error.
+			 * generation). Used by the empty-response guard below and by
+			 * canReplayMalformedRequest; the resumable strategy classification
+			 * inspects the same accumulators directly.
 			 */
 			/**
 			 * Names of tool calls the model had STARTED writing arguments for when the
@@ -4129,10 +4197,11 @@ async function* agentLoopInMetadataSnapshot(
 
 			/**
 			 * Pick the recovery strategy for a resumable interruption (a transient
-			 * upstream failure that hit AFTER partial output was already produced,
-			 * e.g. the NUG gateway reporting `diagnostics.resumable`).
+			 * upstream failure reported via `diagnostics.resumable`).
 			 *
-			 * The right recovery depends on what the partial output actually is:
+			 * Recovery is NEVER an in-place replay of the identical request: the pass
+			 * ends and the caller assembles the next request from the LATEST state.
+			 * What that means depends on what the partial output actually is:
 			 * - `tool_continuation`: at least one complete tool call landed. Highest
 			 *   priority because tool calls may already have side effects; the model
 			 *   must see their results. The turn finishes normally (tools execute,
@@ -4148,18 +4217,22 @@ async function* agentLoopInMetadataSnapshot(
 			 *   truncation until the retry budget dies. Finish the turn through the
 			 *   normal path instead, where the orphaned-tool detector injects the
 			 *   skeleton-first reminder and the model can switch to smaller calls.
-			 * - `reasoning_only_retry`: only reasoning exists. Nothing client-facing was
-			 *   committed and no side effect occurred, so the safest recovery is to DROP
-			 *   the partial reasoning and re-send the identical request in place. Keeping
-			 *   truncated reasoning would pollute the history and degrade the continuation.
-			 * - `none`: nothing to resume from; fall through to ordinary
-			 *   retryable/terminal error handling.
+			 * - `reasoning_only`: only reasoning exists. The truncated thought must not
+			 *   enter history (for stateful providers an incomplete reasoning item is
+			 *   not even replayable upstream), so it is discarded and the pass ends;
+			 *   the continuation request is then assembled from the latest state,
+			 *   which no longer contains it.
+			 * - `none`: nothing landed locally at all (the gateway's "forwarded"
+			 *   notion is broader than ours — lifecycle frames count there but leave
+			 *   nothing persistable here). Still hand off for a continuation pass:
+			 *   the reassembled request carries the latest state, and the alternative
+			 *   is dying on a transient transport fault.
 			 */
 			const classifyResumeStrategy = ():
 				| "tool_continuation"
 				| "text_continuation"
 				| "truncated_tool_input"
-				| "reasoning_only_retry"
+				| "reasoning_only"
 				| "none" => {
 				if (toolUses.length > 0) return "tool_continuation";
 				if (
@@ -4172,33 +4245,9 @@ async function* agentLoopInMetadataSnapshot(
 				// Ranked above reasoning: a model that thinks and THEN gets cut off writing
 				// a tool call must be told to write smaller calls, not asked to try again.
 				if (orphanedToolInputNames().length > 0) return "truncated_tool_input";
-				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only_retry";
+				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only";
 				return "none";
 			};
-
-			/**
-			 * Whether a "resumable" failure can simply be replayed in place because
-			 * nothing landed on our side.
-			 *
-			 * A gateway sets `resumable` once it has forwarded client-visible SSE
-			 * payload — that is why it simultaneously refuses a wholesale retry
-			 * (`retryable: false`): replaying could duplicate visible output or tool
-			 * side effects. But its notion of "client-visible" is broader than ours:
-			 * queue notices, a `toolUseChunk` carrying only an id, and other non-content
-			 * events count as forwarded upstream while leaving nothing persistable here.
-			 *
-			 * When that happens the turn is stuck between both recovery paths: there is
-			 * nothing to continue from (so no continuation prompt makes sense) and the
-			 * error is flagged non-retryable (so the turn dies as a hard failure) even
-			 * though the local state is indistinguishable from "the request never
-			 * produced anything". Since no visible content and no tool side effect
-			 * exists locally, replaying the identical request is safe and is the only
-			 * recovery that does not surface a hard failure for a transient transport
-			 * fault. The replay reuses the ordinary transient-retry budget and backoff,
-			 * so this cannot loop unbounded.
-			 */
-			const canReplayResumableInPlace = (resumable: boolean): boolean =>
-				resumable && !hasAnyPersistableOutput() && !hasStartedEarlyToolExecution();
 
 			/**
 			 * Replays granted to an upstream "malformed request body" rejection.
@@ -4437,6 +4486,7 @@ async function* agentLoopInMetadataSnapshot(
 				requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 				requestStartTime = 0;
 				requestStarted = false;
+				requestFinished = false;
 				requestStartPending = false;
 				requestTtftMs = undefined;
 				requestUsage = undefined;
@@ -4456,12 +4506,29 @@ async function* agentLoopInMetadataSnapshot(
 				// calls so leaked-tool diagnostics always have a bounded raw dump.
 				// Providers write bodyText/events through the *WithLimit helpers, so collection
 				// stays bounded even when force-enabled here.
-				requestDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls)
-					? new ApiRequestDumpCollector({
-							provider: effectiveProvider,
-							model: effectiveModel,
-						})
-					: undefined;
+				activeRequestDump?.finish({
+					status: "interrupted",
+					error: "Attempt replaced before final response classification",
+				});
+				activeRequestDump = undefined;
+				const recording = createRequestRecording({
+					requestId,
+					narratorId: config.narratorId,
+					userId: requestUserId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					kind: config.reflectionLoop ? "reflection" : "narrator",
+				});
+				const collectLegacyDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls);
+				requestDump =
+					recording || collectLegacyDump
+						? new ApiRequestDumpCollector(
+								{ provider: effectiveProvider, model: effectiveModel },
+								recording,
+								collectLegacyDump ? undefined : RING_DIAGNOSTIC_PREFIX_BYTES,
+							)
+						: undefined;
+				activeRequestDump = requestDump;
 
 				const attemptAbort = new AbortController();
 				let updateReasoningInterrupted = false;
@@ -4574,6 +4641,10 @@ async function* agentLoopInMetadataSnapshot(
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
+					// A retry may switch providers and rebuild again. Re-project from the
+					// original fragments, not a previously filtered string, so both newly
+					// replayed and newly lifted-out rows are represented exactly once.
+					content = combinePendingInput(baseContent, currentInputParts);
 					const questionInput = projectQuestionModelInput(
 						history,
 						content,
@@ -5159,7 +5230,8 @@ async function* agentLoopInMetadataSnapshot(
 											if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
 											yieldedToolResults.add(prevTu.toolUseId);
 											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
-											if (sr.updatedInput) prevTu.input = sr.updatedInput;
+											if (sr.updatedInput && prevTu.name !== "AskUserQuestion")
+												prevTu.input = sr.updatedInput;
 											const brokenOverride = sr.broken
 												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
 												: undefined;
@@ -5441,6 +5513,8 @@ async function* agentLoopInMetadataSnapshot(
 							const message = String(parsed.invalidState.message ?? "Unknown provider error");
 							requestDiagnostics = normalizeApiRequestDiagnostics({
 								...parsed.invalidState.diagnostics,
+								recordingRequestId: undefined,
+								apiRequestId: undefined,
 								source: parsed.invalidState.diagnostics?.source ?? "provider",
 								phase: parsed.invalidState.diagnostics?.phase ?? "invalid_state",
 								reason,
@@ -5553,57 +5627,16 @@ async function* agentLoopInMetadataSnapshot(
 									return;
 								}
 							}
-							// Resumable but nothing landed locally: the gateway counted some
-							// non-content event as forwarded payload, so it refuses a wholesale
-							// retry, yet we have no visible output and no tool side effect to
-							// resume from. Replay the identical request instead of dying on a
-							// transient transport fault. See canReplayResumableInPlace.
-							if (canReplayResumableInPlace(classification.resumable)) {
-								if (
-									(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-									!config.signal.aborted
-								) {
-									chatRetryCount++;
-									lastRetryErrorMessage = message;
-									lastRetryDiagnostics = requestDiagnostics;
-									const delayMs = Math.min(
-										TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-										backoffCeil,
-									);
-									logger.warn("Resumable stream interruption with no local output, replaying", {
-										narratorId: config.narratorId,
-										provider: effectiveProvider,
-										model: effectiveModel,
-										requestId,
-										reason,
-										attempt: chatRetryCount,
-										maxRetries: getMaxChatRetries(),
-									});
-									yield {
-										type: "retrying",
-										message,
-										attempt: chatRetryCount,
-										maxRetries: getMaxChatRetries(),
-										delayMs,
-										diagnostics: requestDiagnostics,
-									};
-									yield* abandonAttemptForReplay(message);
-									await abortableSleep(delayMs, config.signal);
-									if (config.signal.aborted) {
-										yield { type: "error", message: "Aborted" };
-										return;
-									}
-									continue chatRetryLoop;
-								}
-								// Replay budget spent (or a stateful provider that cannot replay):
-								// fall through to the ordinary terminal handling below.
-							}
-							// Resumable: a transient failure occurred after client-visible partial
-							// output was already produced this attempt (NUG/gateway told us so via
-							// diagnostics.resumable). Retrying the whole request wholesale could
-							// repeat visible output, so recover according to what the partial output
-							// actually is (see classifyResumeStrategy).
-							if (classification.resumable && hasAnyPersistableOutput()) {
+							// Resumable: a transient failure the gateway flagged as safe to
+							// continue from (diagnostics.resumable). Recovery is NEVER an
+							// in-place replay of the identical request — the pass ends here and
+							// the caller assembles the next request from the LATEST state (per
+							// classifyResumeStrategy). This also covers "nothing landed
+							// locally": the gateway's notion of forwarded payload is broader
+							// than ours (lifecycle frames count there but persist nothing
+							// here), and a freshly assembled continuation request is the only
+							// recovery that cannot duplicate visible output.
+							if (classification.resumable) {
 								const strategy = classifyResumeStrategy();
 								if (strategy === "tool_continuation") {
 									// A complete tool call landed before the stream broke. Finish the
@@ -5654,48 +5687,25 @@ async function* agentLoopInMetadataSnapshot(
 									};
 									break;
 								}
-								if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
-									// Only reasoning was produced. Drop it and re-send the identical
-									// request instead of continuing from a truncated thought.
-									if (
-										(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-										!config.signal.aborted
-									) {
-										chatRetryCount++;
-										lastRetryErrorMessage = message;
-										lastRetryDiagnostics = requestDiagnostics;
-										const delayMs = Math.min(
-											TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-											backoffCeil,
-										);
-										logger.warn("Resumable stream interruption with reasoning only, retrying", {
-											narratorId: config.narratorId,
-											provider: effectiveProvider,
-											model: effectiveModel,
-											requestId,
-											reason,
-											attempt: chatRetryCount,
-											maxRetries: getMaxChatRetries(),
-										});
-										yield* discardReasoningOnlyPartialOutput();
-										yield {
-											type: "retrying",
-											message,
-											attempt: chatRetryCount,
-											maxRetries: getMaxChatRetries(),
-											delayMs,
-											diagnostics: requestDiagnostics,
-										};
-										yield* abandonAttemptForReplay(message);
-										await abortableSleep(delayMs, config.signal);
-										if (config.signal.aborted) {
-											yield { type: "error", message: "Aborted" };
-											return;
-										}
-										continue chatRetryLoop;
-									}
-									// Retry budget spent (or a stateful provider that cannot replay the
-									// request): fall back to a textual continuation rather than failing.
+								if (strategy === "reasoning_only") {
+									// Only truncated reasoning was produced. Drop it so the
+									// half-written thought never enters history (for stateful
+									// providers an incomplete reasoning item is not even
+									// replayable upstream), then hand off below: the
+									// continuation pass reassembles the request without it.
+									logger.warn("Resumable stream interruption with reasoning only, discarding", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+									});
+									yield* discardReasoningOnlyPartialOutput();
+									// Reasoning lane blocks persist as they stream, so memory-only
+									// cleanup is not enough: retract whatever this attempt already
+									// wrote, or the continuation pass would rebuild history WITH
+									// the truncated thought we just discarded.
+									yield* discardAttemptPersistence();
 								}
 								yield* outputContent.flush();
 								yield* finishRequest(message);
@@ -5867,7 +5877,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -5883,14 +5893,14 @@ async function* agentLoopInMetadataSnapshot(
 								model: effectiveModel,
 								requestId,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								firstTokenTimeoutMs,
 							});
 							yield {
 								type: "retrying",
 								message: firstTokenTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -5930,7 +5940,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -5944,7 +5954,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "retrying",
 								message: streamIdleTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -6026,6 +6036,8 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						...diagnosticsFromError(err),
+						recordingRequestId: undefined,
+						apiRequestId: undefined,
 						message: msg,
 						provider: effectiveProvider,
 						model: effectiveModel,
@@ -6154,52 +6166,12 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "context_length_exceeded", message: msg };
 						return;
 					}
-					// Resumable but nothing landed locally — replay the identical request
-					// rather than failing the turn. See canReplayResumableInPlace and the
-					// matching invalidState branch above.
-					if (canReplayResumableInPlace(isResumableError(err))) {
-						if (
-							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-							!config.signal.aborted
-						) {
-							chatRetryCount++;
-							lastRetryErrorMessage = msg;
-							lastRetryDiagnostics = requestDiagnostics;
-							const delayMs = Math.min(
-								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-								backoffCeil,
-							);
-							logger.warn("Resumable stream interruption with no local output, replaying", {
-								narratorId: config.narratorId,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								requestId,
-								attempt: chatRetryCount,
-								maxRetries: getMaxChatRetries(),
-							});
-							yield {
-								type: "retrying",
-								message: msg,
-								attempt: chatRetryCount,
-								maxRetries: getMaxChatRetries(),
-								delayMs,
-								diagnostics: requestDiagnostics,
-							};
-							yield* abandonAttemptForReplay(msg);
-							await abortableSleep(delayMs, config.signal);
-							if (config.signal.aborted) {
-								yield { type: "error", message: "Aborted" };
-								return;
-							}
-							continue; // retry provider.chat() with the identical request
-						}
-						// Replay budget spent (or a stateful provider that cannot replay):
-						// fall through to the ordinary handling below.
-					}
-					// Resumable: a transient failure occurred after client-visible partial
-					// output was already produced this attempt. See the matching invalidState
-					// branch above for the full rationale and the per-strategy recovery.
-					if (isResumableError(err) && hasAnyPersistableOutput()) {
+					// Resumable: a transient failure the gateway flagged as safe to
+					// continue from. Never replay the request in place — the pass ends
+					// here and the caller assembles the next request from the latest
+					// state. See the matching invalidState branch above for the full
+					// rationale and the per-strategy recovery.
+					if (isResumableError(err)) {
 						const strategy = classifyResumeStrategy();
 						if (strategy === "tool_continuation") {
 							logger.warn("Resumable stream interruption after a complete tool call", {
@@ -6241,45 +6213,23 @@ async function* agentLoopInMetadataSnapshot(
 							};
 							break;
 						}
-						if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
-							if (
-								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-								!config.signal.aborted
-							) {
-								chatRetryCount++;
-								lastRetryErrorMessage = msg;
-								lastRetryDiagnostics = requestDiagnostics;
-								const delayMs = Math.min(
-									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-									backoffCeil,
-								);
-								logger.warn("Resumable stream interruption with reasoning only, retrying", {
-									narratorId: config.narratorId,
-									provider: effectiveProvider,
-									model: effectiveModel,
-									requestId,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-								});
-								yield* discardReasoningOnlyPartialOutput();
-								yield {
-									type: "retrying",
-									message: msg,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-									delayMs,
-									diagnostics: requestDiagnostics,
-								};
-								yield* abandonAttemptForReplay(msg);
-								await abortableSleep(delayMs, config.signal);
-								if (config.signal.aborted) {
-									yield { type: "error", message: "Aborted" };
-									return;
-								}
-								continue; // retry provider.chat() with the identical request
-							}
-							// Retry budget spent (or a stateful provider that cannot replay the
-							// request): fall back to a textual continuation rather than failing.
+						if (strategy === "reasoning_only") {
+							// Only truncated reasoning was produced. Drop it so the
+							// half-written thought never enters history, then hand off
+							// below: the continuation pass reassembles the request
+							// without it.
+							logger.warn("Resumable stream interruption with reasoning only, discarding", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+							});
+							yield* discardReasoningOnlyPartialOutput();
+							// Reasoning lane blocks persist as they stream, so memory-only
+							// cleanup is not enough: retract whatever this attempt already
+							// wrote, or the continuation pass would rebuild history WITH
+							// the truncated thought we just discarded.
+							yield* discardAttemptPersistence();
 						}
 						yield* outputContent.flush();
 						yield* finishRequest(msg);
@@ -6367,6 +6317,8 @@ async function* agentLoopInMetadataSnapshot(
 					return;
 				} finally {
 					responseActivity.setReasoningAbort(null);
+					// Close transport resources here, but do not seal recording until the
+					// post-stream empty/tool-response checks have determined this attempt's result.
 					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();
@@ -6389,7 +6341,7 @@ async function* agentLoopInMetadataSnapshot(
 						model: effectiveModel,
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6403,7 +6355,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: firstTokenTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6444,7 +6396,7 @@ async function* agentLoopInMetadataSnapshot(
 						model: effectiveModel,
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6458,7 +6410,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: streamIdleTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6614,6 +6566,7 @@ async function* agentLoopInMetadataSnapshot(
 						const message =
 							`${effectiveProvider}: Provider finished without starting an API request. ` +
 							"This indicates the request was not assembled or dispatched; check provider setup and local request-building errors.";
+						yield* finishRequest(message);
 						logger.warn("Provider produced no events before starting a request", {
 							narratorId: config.narratorId,
 							provider: effectiveProvider,
@@ -6914,6 +6867,9 @@ async function* agentLoopInMetadataSnapshot(
 							reason: "reasoning_only_exhausted",
 							message,
 							diagnostics: normalizeApiRequestDiagnostics({
+								// This attempt has already ended. Preserve its exact recorder/API
+								// association while refining the terminal exhaustion evidence.
+								...requestDiagnostics,
 								source: "agent",
 								phase: "response",
 								reason: "reasoning_only_exhausted",
@@ -7033,7 +6989,14 @@ async function* agentLoopInMetadataSnapshot(
 			}
 			/** Tool uses with history-safe ids, for provider.pushAssistantTurn. */
 			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
-				applyToolUseIdRemap(list, turnToolUseIdRemap);
+				applyToolUseIdRemap(
+					list.map((toolUse) => {
+						if (toolUse.name !== "AskUserQuestion") return toolUse;
+						const input = projectAskUserQuestionInput(toolUse.input);
+						return input === toolUse.input ? toolUse : { ...toolUse, input };
+					}),
+					turnToolUseIdRemap,
+				);
 
 			// No fabricated billing counters: occupancy estimates live only in contextSnapshot.
 
@@ -7076,7 +7039,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
-				if (sr.updatedInput) tu.input = sr.updatedInput;
+				if (sr.updatedInput && tu.name !== "AskUserQuestion") tu.input = sr.updatedInput;
 				const brokenOverride = sr.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
@@ -7222,9 +7185,11 @@ async function* agentLoopInMetadataSnapshot(
 							initialToolResults ?? [],
 							images,
 						);
-					} else if (pendingToolResults.length > 0) {
-						provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+					} else if (content || pendingToolResults.length > 0) {
+						provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					}
+					// These results are now in history, not pending input for the recovery request.
+					pendingToolResults = [];
 					provider.pushAssistantTurn(
 						history,
 						assistantText,
@@ -7278,10 +7243,12 @@ async function* agentLoopInMetadataSnapshot(
 			// Push the current user turn into history for the next turn.
 			// This must happen AFTER the API call (not before), because
 			// chat() references the history array directly.
+			// After-tools injections are already consumed; retain their actual content
+			// in memory too, or later requests lose them until a full history rebuild.
 			if (isFirstTurn) {
 				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
-			} else if (pendingToolResults.length > 0) {
-				provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+			} else if (content || pendingToolResults.length > 0) {
+				provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 			}
 
 			// The current input now lives in history; pending permissions must not
@@ -7351,7 +7318,7 @@ async function* agentLoopInMetadataSnapshot(
 					// When the permission handler redirected the input (e.g. the plan file),
 					// update the in-memory tool_use so pushAssistantTurn writes the correct
 					// input into history — otherwise the model sees the original (wrong) path.
-					if (result.updatedInput) tu.input = result.updatedInput;
+					if (result.updatedInput && tu.name !== "AskUserQuestion") tu.input = result.updatedInput;
 					await processToolResultInjections(tu, result);
 					const isLastTool = toolIndex === toolUses.length - 1;
 					// The turn nudge is still appended inline: it is about THIS being the last
@@ -7487,7 +7454,8 @@ async function* agentLoopInMetadataSnapshot(
 						const tu = group[i];
 						const effectiveResult = result;
 						if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
-						if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
+						if (effectiveResult.updatedInput && tu.name !== "AskUserQuestion")
+							tu.input = effectiveResult.updatedInput;
 						await processToolResultInjections(tu, effectiveResult);
 
 						// Persist and broadcast every completed result immediately in completion order.
@@ -7603,7 +7571,8 @@ async function* agentLoopInMetadataSnapshot(
 							return;
 						}
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
-						if (result.updatedInput) remainingTool.input = result.updatedInput;
+						if (result.updatedInput && remainingTool.name !== "AskUserQuestion")
+							remainingTool.input = result.updatedInput;
 						await processToolResultInjections(remainingTool, result);
 						pendingToolResults.push(
 							provider.formatToolResult(
@@ -7721,19 +7690,12 @@ async function* agentLoopInMetadataSnapshot(
 			// tool_use with no matching result (and an orphaned result for the old id).
 			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
 
-			// Producers that persist their own message row contribute text only — see
-			// `collectAfterToolsInjectionText` on why nothing is yielded for them.
-			// Loop-raised reminders are flushed first so they read in the order they were
-			// raised, before anything the host drained at this same boundary.
-			for (const injectionText of [
-				await flushLoopInjections(),
-				await collectAfterToolsInjectionText(),
-			]) {
-				if (!injectionText) continue;
-				nextTurnContent = nextTurnContent
-					? `${nextTurnContent}\n\n${injectionText}`
-					: injectionText;
-			}
+			// Persisted rows contribute pending input, not another persistence event.
+			// Keep their identities until the actual request: a compact/model switch
+			// may already replay some of them before this input is sent.
+			// Loop reminders precede host-drained notifications, preserving arrival order.
+			await flushLoopInjections();
+			await collectAfterToolsInjections();
 
 			// Close the small race between the final group boundary and the next provider
 			// request: direct user feedback may arrive while after-tools injections are drained.
@@ -7753,7 +7715,17 @@ async function* agentLoopInMetadataSnapshot(
 
 			yield { type: "turn_complete", turnIndex };
 			turnIndex++;
+		} catch (error) {
+			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });
+			activeRequestDump = undefined;
+			throw error;
 		} finally {
+			activeRequestDump?.finish({
+				status: config.signal.aborted ? "cancelled" : "interrupted",
+				error: config.signal.aborted
+					? String(config.signal.reason ?? "Aborted")
+					: "Attempt exited before final response classification",
+			});
 			responseActivity.release();
 		}
 	}

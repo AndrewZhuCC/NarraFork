@@ -7,6 +7,8 @@ on:
     paths:
       - "server/lib/plugins/**"
       - "server/lib/platform-path.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/agent/execution/__tests__/local-backend-read.test.ts"
       - "server/services/plugin-*.ts"
       - "server/services/__tests__/plugin-*.test.ts"
       - "server/routes/plugin-ui.ts"
@@ -31,6 +33,8 @@ on:
     paths:
       - "server/lib/plugins/**"
       - "server/lib/platform-path.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/agent/execution/__tests__/local-backend-read.test.ts"
       - "server/services/plugin-*.ts"
       - "server/services/__tests__/plugin-*.test.ts"
       - "server/routes/plugin-ui.ts"
@@ -94,8 +98,43 @@ jobs:
           scripts/smoke-narrator-dock.ts
           scripts/validate-plugin-release.ts
 
+      - name: Build frontend
+        run: bun run build
+
+      - name: Install VS Code extension type dependencies
+        run: bun install --cwd vscode-extension --frozen-lockfile
+
       - name: Check TypeScript
         run: bunx tsgo --noEmit
+
+      - name: Locate and verify Chrome
+        shell: bash
+        run: |
+          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
+          test -n "$CHROME_PATH"
+          "$CHROME_PATH" --version
+          printf 'NF_TEST_CHROMIUM_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+          printf 'PUPPETEER_EXECUTABLE_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+
+      - name: Probe headless Chrome
+        shell: bash
+        run: |
+          bun --eval '
+            import puppeteer from "puppeteer-core";
+            const browser = await puppeteer.launch({
+              executablePath: process.env.NF_TEST_CHROMIUM_PATH,
+              headless: true,
+              args: ["--no-sandbox", "--disable-setuid-sandbox"],
+              timeout: 15000,
+            });
+            try {
+              const page = await browser.newPage();
+              await page.goto("data:text/html,<title>Plugin CI Chrome probe</title>");
+              if (await page.title() !== "Plugin CI Chrome probe") throw new Error("Chrome probe failed");
+            } finally {
+              await browser.close();
+            }
+          '
 
       - name: Run plugin acceptance tests
         run: >-
@@ -158,6 +197,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build frontend
+        run: bun run build
+
+      - name: Install VS Code extension type dependencies
+        run: bun install --cwd vscode-extension --frozen-lockfile
+
       - name: Check TypeScript
         run: bunx tsgo --noEmit
 
@@ -214,12 +259,34 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Locate Chrome
+      - name: Locate and verify Chrome
         shell: bash
         run: |
-          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)"
+          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
           test -n "$CHROME_PATH"
-          echo "PUPPETEER_EXECUTABLE_PATH=$CHROME_PATH" >> "$GITHUB_ENV"
+          "$CHROME_PATH" --version
+          printf 'NF_TEST_CHROMIUM_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+          printf 'PUPPETEER_EXECUTABLE_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+
+      - name: Probe headless Chrome
+        shell: bash
+        run: |
+          bun --eval '
+            import puppeteer from "puppeteer-core";
+            const browser = await puppeteer.launch({
+              executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+              headless: true,
+              args: ["--no-sandbox", "--disable-setuid-sandbox"],
+              timeout: 15000,
+            });
+            try {
+              const page = await browser.newPage();
+              await page.goto("data:text/html,<title>Plugin CI Chrome probe</title>");
+              if (await page.title() !== "Plugin CI Chrome probe") throw new Error("Chrome probe failed");
+            } finally {
+              await browser.close();
+            }
+          '
 
       - name: Build frontend
         run: bun run build

@@ -25,6 +25,7 @@ import { type AgentConfig, type AgentEvent, ApiError } from "../types";
  */
 let providerScenario:
 	| "error_then_usage_only"
+	| "local_failure"
 	| "error_then_queue_only"
 	| "usage_only_forever"
 	| "no_events_forever"
@@ -60,6 +61,14 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		providerAttempts++;
 		sentContents.push(params.content ?? "");
+		if (providerScenario === "local_failure") {
+			throw new ApiError(400, "Local request assembly failed", {
+				schema: "narrafork.error-diagnostics.v1",
+				recordingRequestId: "spoof-attempt",
+				apiRequestId: "spoof-row",
+				requestId: "upstream-local",
+			});
+		}
 		params.onRequestStart?.();
 
 		if (usesAnthropicRecovery()) {
@@ -272,6 +281,39 @@ describe("Anthropic broken tool recovery", () => {
 });
 
 describe("空响应归因链", () => {
+	test("前次 503 的诊断精确关联前次 attempt，不被当前空响应覆盖", async () => {
+		providerScenario = "error_then_usage_only";
+		providerAttempts = 0;
+		const events = await runLoop({ maxTransientRetries: 1 });
+		const ends = events.filter((event) => event.type === "api_request_end");
+		const terminal = events.at(-1);
+		expect(ends).toHaveLength(2);
+		if (terminal?.type !== "retryable_error") throw new Error("missing terminal error");
+		expect(terminal.diagnostics).toBe(ends[0].diagnostics);
+		expect(terminal.diagnostics?.recordingRequestId).toBe(ends[0].requestId);
+		expect(terminal.diagnostics?.recordingRequestId).not.toBe(ends[1].requestId);
+		expect(terminal.diagnostics?.requestId).toBe("req-503");
+		expect(ends[1].diagnostics?.recordingRequestId).toBe(ends[1].requestId);
+		// The consumer enriches the original object after row persistence, even
+		// though this error will surface after another attempt has already ended.
+		if (!ends[0].diagnostics) throw new Error("missing diagnostics");
+		ends[0].diagnostics.apiRequestId = "first-durable-row";
+		expect(terminal.diagnostics?.apiRequestId).toBe("first-durable-row");
+	});
+
+	test("未发出 API 的本地错误不接受伪造的本地关联", async () => {
+		providerScenario = "local_failure";
+		providerAttempts = 0;
+		const events = await runLoop({ maxTransientRetries: 0 });
+		expect(events.some((event) => event.type === "api_request_start")).toBe(false);
+		expect(events.some((event) => event.type === "api_request_end")).toBe(false);
+		const terminal = events.at(-1);
+		if (terminal?.type !== "error") throw new Error("missing local error");
+		expect(terminal.diagnostics?.requestId).toBe("upstream-local");
+		expect(terminal.diagnostics).not.toHaveProperty("recordingRequestId");
+		expect(terminal.diagnostics).not.toHaveProperty("apiRequestId");
+	});
+
 	test("上游 503 后仅收到 usage 事件时，仍报告 503 而非空响应", async () => {
 		providerScenario = "error_then_usage_only";
 		providerAttempts = 0;

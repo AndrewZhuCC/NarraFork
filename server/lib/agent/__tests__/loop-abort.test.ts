@@ -1273,11 +1273,20 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(textBlock?.block).toMatchObject({ type: "text", text: "partial codex output" });
 		const lastEvent = events.at(-1);
+		const requestEnd = events.find((event) => event.type === "api_request_end");
+		if (lastEvent?.type !== "retryable_error" || !requestEnd?.diagnostics) {
+			throw new Error("missing correlated Codex failover events");
+		}
+		expect(lastEvent.diagnostics).toBe(requestEnd.diagnostics);
+		expect(lastEvent.diagnostics?.recordingRequestId).toBe(requestEnd.requestId);
+		// This fixture has no API consumer: the loop must not invent a durable row ID.
+		expect(lastEvent.diagnostics?.apiRequestId).toBeUndefined();
 		expect(lastEvent).toEqual({
 			type: "retryable_error",
 			message: "The usage limit has been reached",
 			code: CODEX_REBUILD_HISTORY_RETRY_CODE,
 			bypassRetryLimit: true,
+			diagnostics: requestEnd.diagnostics,
 		});
 	});
 
@@ -1302,11 +1311,20 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults).toHaveLength(2);
 		expect(toolResults.map((event) => event.output)).toEqual(["completed:one", "completed:two"]);
 		const lastEvent = events.at(-1);
+		const requestEnd = events.find((event) => event.type === "api_request_end");
+		if (lastEvent?.type !== "retryable_error" || !requestEnd?.diagnostics) {
+			throw new Error("missing correlated Codex failover events");
+		}
+		expect(lastEvent.diagnostics).toBe(requestEnd.diagnostics);
+		expect(lastEvent.diagnostics?.recordingRequestId).toBe(requestEnd.requestId);
+		// This fixture has no API consumer: the loop must not invent a durable row ID.
+		expect(lastEvent.diagnostics?.apiRequestId).toBeUndefined();
 		expect(lastEvent).toEqual({
 			type: "retryable_error",
 			message: "The usage limit has been reached",
 			code: CODEX_REBUILD_HISTORY_RETRY_CODE,
 			bypassRetryLimit: true,
+			diagnostics: requestEnd.diagnostics,
 		});
 	});
 });

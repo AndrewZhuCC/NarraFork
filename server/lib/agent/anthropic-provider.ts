@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -32,15 +32,12 @@ import {
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
-import {
-	isCompletionLimitReason,
-	isConnectionClosedError,
-	ProviderInvalidStateError,
-} from "./error-handling";
+import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -56,7 +53,12 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { sanitizeHeaders } from "./request-dump";
+import {
+	type ApiRequestDumpCollector,
+	captureResponseStream,
+	readResponsePrefix,
+	sanitizeHeaders,
+} from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1367,61 +1369,55 @@ export class AnthropicProvider implements ProviderAdapter {
 	/**
 	 * Fetch with automatic /v1 suffix fallback.
 	 *
-	 * Triggers the `/v1` retry in two cases when the base URL lacks `/v1`:
-	 *   1. The initial request returns a non-ok HTTP response (e.g. 404). This
-	 *      is what small requests hit — the gateway answers quickly.
-	 *   2. The initial request THROWS a connection-closed error (ECONNRESET /
-	 *      "socket connection was closed unexpectedly"). Large request bodies on
-	 *      a wrong path can make the gateway RST the connection before sending
-	 *      any response, so case 1 never fires. Without this branch the error
-	 *      propagates as a retryable error and the agent loop retries forever
-	 *      against the same wrong path (observed as 0% success on long sessions).
+	 * Only HTTP responses trigger the `/v1` compatibility retry when the base
+	 * URL lacks that suffix. A connection reset is not evidence of a wrong path:
+	 * propagate transport errors so the agent loop can retry the configured URL.
 	 *
 	 * On a successful fallback the resolved base URL is cached (instance- and
 	 * process-wide) and a fix suggestion is broadcast to clients.
 	 */
-	private async fetchWithV1Fallback(path: string, init: RequestInit): Promise<Response> {
+	private async fetchWithV1Fallback(
+		path: string,
+		init: RequestInit,
+		collector?: ApiRequestDumpCollector,
+	): Promise<Response> {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
 		// All requests go through the proxy-aware fetch so streaming and auxiliary
 		// calls uniformly follow the global outbound proxy policy.
-		const doFetch = this.pfetch.bind(this);
+		const doFetch = async (actualUrl: string, requestInit: RequestInit): Promise<Response> => {
+			collector?.beginResponseAttempt(
+				{
+					transport: "http",
+					url: actualUrl,
+					method: requestInit.method ?? "POST",
+					headers: sanitizeHeaders(requestInit.headers as Record<string, string>),
+					bodyText: typeof requestInit.body === "string" ? requestInit.body : undefined,
+				},
+				settings.agent?.requestDumpMaxSize,
+			);
+			try {
+				const response = await this.pfetch(actualUrl, requestInit);
+				collector?.setResponseMeta({
+					status: response.status,
+					headers: sanitizeHeaders(response.headers),
+				});
+				if (!collector || !response.body) return response;
+				const tap = captureResponseStream(response.body, collector);
+				return new Response(tap.stream, {
+					status: response.status,
+					statusText: response.statusText,
+					headers: response.headers,
+				});
+			} catch (error) {
+				collector?.setResponseError(error);
+				collector?.finishResponseCapture(false);
+				throw error;
+			}
+		};
 		const canFallback = !AnthropicProvider.hasV1Suffix(baseUrl);
 
-		let response: Response;
-		try {
-			response = await doFetch(url, init);
-		} catch (err) {
-			// Connection reset before any response. Under this branch's design
-			// assumption, a thrown connection error means the ORIGINAL path was
-			// wrong: gateways RST large request bodies on wrong paths before
-			// answering, so `/v1` is the corrected path. We therefore surface the
-			// retry's outcome (even a non-ok status) — re-throwing the original
-			// retryable connection error would make the agent loop retry the wrong
-			// path forever (observed as 0% success on long sessions).
-			if (canFallback && isConnectionClosedError(err)) {
-				const retryBase = `${baseUrl}/v1`;
-				const retryUrl = `${retryBase}${path}`;
-				logger.debug("Anthropic request connection closed, retrying with /v1 suffix", {
-					originalUrl: url,
-					retryUrl,
-					error: err instanceof Error ? err.message : String(err),
-				});
-				let retryResponse: Response;
-				try {
-					retryResponse = await doFetch(retryUrl, init);
-				} catch {
-					// Both paths dropped the connection — surface the ORIGINAL
-					// (user-configured) URL's error, which is the one they control.
-					throw err;
-				}
-				if (retryResponse.ok) {
-					this.recordV1Fallback(baseUrl, retryBase);
-				}
-				return retryResponse;
-			}
-			throw err;
-		}
+		const response = await doFetch(url, init);
 
 		if (response.ok || !canFallback) {
 			return response;
@@ -1438,7 +1434,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		const originalStatus = response.status;
 		const originalStatusText = response.statusText;
 		const originalContentType = response.headers.get("content-type");
-		const originalBody = await response.text().catch(() => "");
+		const originalBody = await readResponsePrefix(response).catch(() => "");
+		init.signal?.throwIfAborted();
 
 		logger.debug("Anthropic request failed, retrying with /v1 suffix", {
 			originalUrl: url,
@@ -1463,6 +1460,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		try {
 			retryResponse = await doFetch(retryUrl, init);
 		} catch (retryErr) {
+			if (init.signal?.aborted) throw retryErr;
 			// Fallback path dropped the connection (e.g. WAF). Surface the original
 			// endpoint's real error instead of the fallback transport failure.
 			logger.debug("Anthropic /v1 fallback threw; surfacing original error", {
@@ -1487,7 +1485,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			return retryResponse;
 		}
 		// Drain the retry body to free the connection, then surface the original.
-		await retryResponse.text().catch(() => {});
+		await readResponsePrefix(retryResponse).catch(() => {});
 		return rebuildOriginal();
 	}
 
@@ -1508,7 +1506,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
+	): Promise<BuiltHistory> {
 		// narratorId is required to resolve history images: an uploaded image is
 		// stored per narrator and the row only carries its id, so without the owner
 		// the bytes cannot be found. It used to be ignored here, which silently
@@ -1857,13 +1855,6 @@ export class AnthropicProvider implements ProviderAdapter {
 			params.conversationId,
 		);
 
-		params.requestDump?.setRequest({
-			transport: "http",
-			url: `${this.getBaseUrl()}${reqPath}`,
-			headers: sanitizeHeaders(reqHeaders),
-			body,
-		});
-
 		logger.debug("Anthropic chat request", {
 			model,
 			endpoint: `${this.getBaseUrl()}${reqPath}`,
@@ -1879,44 +1870,33 @@ export class AnthropicProvider implements ProviderAdapter {
 		const bodyStr = JSON.stringify(body);
 
 		params.onRequestStart?.();
-		const response = await this.fetchWithV1Fallback(reqPath, {
-			method: "POST",
-			headers: reqHeaders,
-			body: bodyStr,
-			signal: params.signal,
-		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
-		params.requestDump?.setResponseMeta({
-			status: response.status,
-			headers: sanitizeHeaders(response.headers),
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
-			throw createAnthropicApiError(response, errText);
-		}
-
-		if (!response.body) {
-			throw new Error("Anthropic API returned no body");
-		}
-
-		yield* parseAnthropicSSEStream(
-			response.body,
-			getAnthropicEffectiveContextWindow(model, this.config),
+		const response = await this.fetchWithV1Fallback(
+			reqPath,
+			{
+				method: "POST",
+				headers: reqHeaders,
+				body: bodyStr,
+				signal: params.signal,
+			},
+			params.requestDump,
 		);
-		if (responseTextPromise) {
-			const bodyText = await responseTextPromise;
-			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
-			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+		try {
+			if (!response.ok) {
+				const errText = await readResponsePrefix(response).catch(() => "");
+				throw createAnthropicApiError(response, errText);
+			}
+			if (!response.body) throw new Error("Anthropic API returned no body");
+			yield* parseAnthropicSSEStream(
+				response.body,
+				getAnthropicEffectiveContextWindow(model, this.config),
+			);
+		} catch (error) {
+			params.requestDump?.setResponseError(error);
+			throw error;
+		} finally {
+			// The parser releases its reader on early return. Cancel the observational tap
+			// too, so abandoning an async generator never leaves a background drain.
+			if (response.body && !response.body.locked) void response.body.cancel().catch(() => {});
 		}
 	}
 
@@ -3129,6 +3109,7 @@ async function buildAnthropicHistory(
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
 	trailingUserText?: string;
+	replayedInjectionMessageIds: string[];
 }> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -3167,6 +3148,7 @@ async function buildAnthropicHistory(
 	}
 
 	const history: AnthropicMessage[] = [];
+	const emittedMessages: DbMessage[] = [];
 	let pendingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }> = [];
 
 	for (const msg of topLevel) {
@@ -3404,8 +3386,10 @@ async function buildAnthropicHistory(
 				const parts: AnthropicContentPart[] = [...images];
 				if (text) parts.unshift({ type: "text", text });
 				history.push({ role: "user", content: parts });
+				emittedMessages.push(msg);
 			} else if (text) {
 				history.push({ role, content: text });
+				emittedMessages.push(msg);
 			}
 		}
 	}
@@ -3414,6 +3398,7 @@ async function buildAnthropicHistory(
 		history,
 		trailingToolResults: pendingToolResults,
 		trailingUserText: trailingSysText || undefined,
+		replayedInjectionMessageIds: historyInputMessageIds(emittedMessages),
 	};
 }
 

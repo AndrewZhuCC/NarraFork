@@ -8,6 +8,7 @@ import {
 	isValidGitHubRepository,
 	OFFICIAL_GITHUB_REPOSITORY,
 } from "../../shared/github-repository";
+import { parseHelperDistributionDependencies } from "../../shared/helper-distribution";
 import {
 	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
@@ -66,6 +67,7 @@ const manifestSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		plan: z.unknown(),
+		helperDistribution: z.unknown().optional(),
 		files: z
 			.array(
 				z
@@ -132,6 +134,8 @@ function assertIdentity(
 }
 
 function validateBaselines(plan: CiReleasePlan): void {
+	if (plan.buildSource && plan.buildSource.platforms.length !== CI_RELEASE_TARGETS.length)
+		throw new Error("Single-platform diagnostics cannot become a release bundle");
 	if (plan.baselines.length > 16) throw new Error("Baseline count limit exceeded");
 	const seen = new Set<string>();
 	const counts = new Map<string, number>();
@@ -232,6 +236,21 @@ function assetLimit(name: string): number {
 	return MAX_RELEASE_BINARY_BYTES;
 }
 
+/** Never infer dependencies from the control script: legacy bytes retain their old contract. */
+export function validateBundleHelperDistribution(
+	binaries: readonly BinaryMetadata[],
+	version: string,
+): BinaryMetadata["helperDistribution"] {
+	const declared = binaries.map((binary) =>
+		binary.helperDistribution === undefined
+			? undefined
+			: parseHelperDistributionDependencies(binary.helperDistribution, version),
+	);
+	const first = declared[0];
+	if (declared.some((value) => !isDeepStrictEqual(value, first)))
+		throw new Error("Inconsistent release helper dependencies across platforms");
+	return first;
+}
 /** Validation does not execute binaries, download bases, regenerate checksums or repair a bundle. */
 export async function verifyReleaseBundle(
 	bundleDir: string,
@@ -270,6 +289,7 @@ async function verifyBundle(
 			"runId",
 			"runAttempt",
 			"baselines",
+			"buildSource",
 		] as const) {
 			if (!isDeepStrictEqual(plan[key], expected[key]))
 				throw new Error(`Bundle expected target identity mismatch: ${key}`);
@@ -313,6 +333,13 @@ async function verifyBundle(
 			),
 		);
 	}
+	const helperDistribution = validateBundleHelperDistribution(binaries, plan.version);
+	const recordedDependencies =
+		parsed.helperDistribution === undefined
+			? undefined
+			: parseHelperDistributionDependencies(parsed.helperDistribution, plan.version);
+	if (!isDeepStrictEqual(helperDistribution, recordedDependencies))
+		throw new Error("Bundle helper dependency declaration mismatch");
 	const sums = `narrafork-${plan.version}-SHA256SUMS`;
 	const report = `narrafork-${plan.version}-checksums.txt`;
 	allowed.add(sums);
@@ -367,7 +394,13 @@ async function verifyBundle(
 	});
 	signal.throwIfAborted();
 	assertSameNames(sealed.assets, names, "publisher dry-run assets");
-	return { schemaVersion: 1, plan, files: parsed.files, smoke };
+	return {
+		schemaVersion: 1,
+		plan,
+		files: parsed.files,
+		smoke,
+		...(helperDistribution === undefined ? {} : { helperDistribution }),
+	};
 }
 
 async function addPatch(
@@ -527,6 +560,7 @@ export async function assembleReleaseBundle(
 			),
 		);
 	}
+	const helperDistribution = validateBundleHelperDistribution(binaries, plan.version);
 	const fullBytes = binaries.reduce((sum, entry) => sum + entry.size, 0);
 	const maxBase = Math.max(0, ...plan.baselines.map((entry) => entry.metadata.size));
 	const maxFull = Math.max(...binaries.map((entry) => entry.size));
@@ -583,7 +617,13 @@ export async function assembleReleaseBundle(
 		const files = [];
 		for (const name of await directoryEntries(dist, 51))
 			files.push({ name, ...(await hashReleaseFile(join(dist, name), assetLimit(name), signal)) });
-		const manifest: CiReleaseManifest = { schemaVersion: 1, plan, files, smoke };
+		const manifest: CiReleaseManifest = {
+			schemaVersion: 1,
+			plan,
+			files,
+			smoke,
+			...(helperDistribution === undefined ? {} : { helperDistribution }),
+		};
 		await writeFile(join(staging, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
 			flag: "wx",
 		});

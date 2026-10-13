@@ -1,9 +1,20 @@
-import { Button, Divider, Modal, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
+import {
+	Alert,
+	Button,
+	Divider,
+	Modal,
+	Stack,
+	Switch,
+	Text,
+	Textarea,
+	TextInput,
+	Title,
+} from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
-import { useUpdateProject } from "../../hooks/useProjects";
+import { useProject, useUpdateProject } from "../../hooks/useProjects";
 import { api } from "../../lib/api";
 import type {
 	CommandBlacklistRuleInput,
@@ -46,6 +57,17 @@ export function ProjectSettingsModal({
 	const { t: ts } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
 	const update = useUpdateProject();
+	const project = useProject(projectId);
+	const [name, setName] = useState("");
+	const [description, setDescription] = useState("");
+	const [gitPath, setGitPath] = useState("");
+	useEffect(() => {
+		if (opened && project.data) {
+			setName(project.data.name ?? "");
+			setDescription(project.data.description ?? "");
+			setGitPath(project.data.gitPath ?? "");
+		}
+	}, [opened, project.data]);
 	const platform = usePlatform();
 	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
 	const { data: permissionDevices = [] } = useQuery({
@@ -116,11 +138,14 @@ export function ProjectSettingsModal({
 	}, [opened, proxyDomain, chapterSettings]);
 
 	const handleSave = () => {
-		if (domainError) return;
+		if (domainError || !name.trim() || !gitPath.trim() || project.isError) return;
 		update.mutate(
 			{
 				id: projectId,
 				data: {
+					name: name.trim(),
+					description: description.trim(),
+					gitPath: gitPath.trim(),
 					proxyDomain: normalized || null,
 					chapterSettings: {
 						whitelistDirs,
@@ -138,6 +163,25 @@ export function ProjectSettingsModal({
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("settingsTitle")} size="lg">
 			<Stack>
+				{project.isError && <Alert color="red">{t("compatibility.unavailable")}</Alert>}
+				<TextInput
+					label={t("projectName")}
+					value={name}
+					required
+					onChange={(event) => setName(event.currentTarget.value)}
+				/>
+				<Textarea
+					label={t("projectDescription")}
+					value={description}
+					onChange={(event) => setDescription(event.currentTarget.value)}
+				/>
+				<TextInput
+					label={t("repositoryPath")}
+					description={t("defaultDirectoryHint")}
+					value={gitPath}
+					required
+					onChange={(event) => setGitPath(event.currentTarget.value)}
+				/>
 				<TextInput
 					label={t("proxyDomain")}
 					description={t("proxyDomainDesc")}
@@ -271,7 +315,14 @@ export function ProjectSettingsModal({
 					onChange={(e) => setRequireReview(e.currentTarget.checked)}
 				/>
 
-				<Button onClick={handleSave} loading={update.isPending} disabled={!!domainError}>
+				{update.isError && <Alert color="red">{update.error.message}</Alert>}
+				<Button
+					onClick={handleSave}
+					loading={update.isPending}
+					disabled={
+						!!domainError || !name.trim() || !gitPath.trim() || project.isError || project.isLoading
+					}
+				>
 					{tc("save")}
 				</Button>
 

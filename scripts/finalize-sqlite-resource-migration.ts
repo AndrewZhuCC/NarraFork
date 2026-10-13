@@ -1,4 +1,10 @@
 import { Database } from "bun:sqlite";
+import {
+	generatedModelHistoryTriggerSuffix,
+	hasModelHistoryRevisionSchema,
+	MODEL_HISTORY_TRIGGER_TABLES,
+	splitGeneratedModelHistoryTriggers,
+} from "./lib/generated-model-history-triggers";
 
 interface SnapshotTable {
 	columns: Record<
@@ -459,6 +465,7 @@ function validateTargetDDL(
 	statements: Statement[],
 	before: ResourceMigrationSnapshot,
 	after: ResourceMigrationSnapshot,
+	triggerSql: string,
 ): void {
 	const actual = new Database(":memory:");
 	let expected: Database | undefined;
@@ -510,6 +517,26 @@ function validateTargetDDL(
 					`Target DDL differs from generated snapshot: ${name} (${differences.join(", ")})`,
 				);
 		}
+		if (triggerSql) {
+			// Only the byte-exact renderer suffix reaches this seam. Compile each event in
+			// private databases to reject unresolved trigger columns without running DML.
+			for (const db of [actual, expected]) {
+				db.exec(triggerSql);
+				for (const name of MODEL_HISTORY_TRIGGER_TABLES) {
+					const table = after.tables[name];
+					if (!table) throw new Error(`Missing generated trigger table ${name}`);
+					const columns = Object.keys(table.columns).filter(
+						(column) => !table.columns[column].generated,
+					);
+					for (const ddl of [
+						`INSERT INTO ${quote(name)} DEFAULT VALUES`,
+						`UPDATE ${quote(name)} SET ${columns.map((column) => `${quote(column)}=${quote(column)}`).join(", ")}`,
+						`DELETE FROM ${quote(name)}`,
+					])
+						db.query(`EXPLAIN ${ddl}`).all();
+				}
+			}
+		}
 	} finally {
 		expected?.close();
 		actual.close();
@@ -526,7 +553,9 @@ export function finalizeResourceMigration(
 	after: ResourceMigrationSnapshot,
 ): string {
 	if (Buffer.byteLength(sql) > 1024 * 1024) throw new Error("Migration exceeds generator budget");
-	const statements = statementsOf(sql);
+	const triggerSuffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
+	const { schemaSql, triggerSql } = splitGeneratedModelHistoryTriggers(sql, triggerSuffix);
+	const statements = statementsOf(schemaSql);
 	const tables = new Map(
 		Object.entries(before.tables).map(([name, table]) => [
 			key(name),
@@ -653,7 +682,15 @@ export function finalizeResourceMigration(
 				throw new Error("CREATE TABLE differs from generated snapshot");
 			tables.set(key(table), new Set(columns.map(key)));
 		} else if (keyword(t[0], "DROP") && keyword(t[1], "TABLE") && t.length === 3) {
-			if (!tables.delete(key(identifier(t[2])))) throw new Error("Unknown dropped table");
+			const name = key(identifier(t[2]));
+			if (
+				hasModelHistoryRevisionSchema(before, "sqlite") &&
+				MODEL_HISTORY_TRIGGER_TABLES.some((table) => table === name)
+			)
+				throw new Error(
+					"Model-history trigger table rebuild requires a versioned reinstall migration",
+				);
+			if (!tables.delete(name)) throw new Error("Unknown dropped table");
 		} else if (keyword(t[0], "INSERT")) {
 			if (!keyword(t[1], "INTO")) throw new Error("Unexpected generated copy expressions");
 			const target = identifier(t[2]);
@@ -727,10 +764,11 @@ export function finalizeResourceMigration(
 		else throw new Error(`Unsupported migration SQL: ${t[0]?.value}`);
 		output.push(rendered);
 	}
-	const finalized = `${["PRAGMA foreign_keys=OFF;", ...output, "PRAGMA foreign_keys=ON;"].join("\n--> statement-breakpoint\n")}\n`;
+	const finalizedSchema = `${["PRAGMA foreign_keys=OFF;", ...output, "PRAGMA foreign_keys=ON;"].join("\n--> statement-breakpoint\n")}\n`;
+	const finalized = triggerSql ? `${finalizedSchema.trimEnd()}${triggerSql}` : finalizedSchema;
 	if (Buffer.byteLength(finalized) > 1024 * 1024)
 		throw new Error("Finalized migration exceeds byte budget");
-	validateTargetDDL(statementsOf(finalized), before, after);
+	validateTargetDDL(statementsOf(finalizedSchema), before, after, triggerSql);
 	return finalized;
 }
 /** Existing history is never repaired implicitly. A missing generation receipt may be
@@ -741,9 +779,10 @@ export function assertResourceMigrationValidated(
 	after: ResourceMigrationSnapshot,
 ): void {
 	const finalized = finalizeResourceMigration(sql, before, after);
+	const suffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
 	const signature = (source: string) =>
 		JSON.stringify(
-			statementsOf(source).map(({ tokens }) =>
+			statementsOf(splitGeneratedModelHistoryTriggers(source, suffix).schemaSql).map(({ tokens }) =>
 				tokens.map((token) => [
 					token.kind,
 					token.kind === "word" ? token.value.toUpperCase() : token.value,

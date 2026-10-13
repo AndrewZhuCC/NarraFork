@@ -17,9 +17,14 @@ import {
 	CI_TEST_KILL_GRACE_MS,
 	CI_TEST_OUTPUT_LIMIT_BYTES,
 	CI_TEST_TIMEOUT_MS,
+	CI_TEST_TIMINGS_MAX_BYTES,
+	CI_TEST_TIMINGS_PATH,
+	CI_TEST_TIMINGS_SOURCE,
 	type FileStdioOptions,
 	type FileStdioResult,
+	prepareNativeTestTimings,
 	runWithFileStdio,
+	validateNativeTestTimings,
 } from "../../scripts/run-ci-tests";
 
 type Step = {
@@ -182,6 +187,97 @@ describe("generic CI workflow", () => {
 		}
 	});
 
+	test("file revert keeps profile aliases covered and uses runner-owned scratch without relaxed tests", () => {
+		const workflow = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/file-revert-cross-platform.yml"), "utf8"),
+		) as Workflow;
+		const fileRevert = workflow.jobs["file-revert"];
+		const steps = fileRevert.steps;
+		const volumes = steps.find((step) => step.name === "Verify Windows scratch volumes");
+		const profile = steps.find((step) => step.name === "Check profile temp path isolation");
+		const record = steps.find((step) => step.name === "Record file revert scratch location");
+		const tests = steps.find((step) => step.name === "Run file revert tests");
+		if (!volumes || !profile || !record || !tests)
+			throw new Error("Missing file revert scratch checks");
+		expect(volumes.if).toBe("runner.os == 'Windows'");
+		expect(volumes.run).toContain("$env:TEMP, $env:RUNNER_TEMP");
+		expect(volumes.run).toContain("$volume.DriveFormat -ne 'NTFS'");
+		expect(volumes.run).toContain("$volume.DriveType -ne 'Fixed'");
+		expect(profile.if).toBe("runner.os == 'Windows'");
+		expect(record.if).toBeUndefined();
+		expect(tests.if).toBeUndefined();
+		expect(profile.run?.trim().split(/\s+/)).toEqual([
+			"bun",
+			"test",
+			"--isolate",
+			"./tests/preload-isolation.test.ts",
+			"./server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+		]);
+		for (const key of ["TEMP", "TMP", "TMPDIR", "NARRAFORK_HOME"])
+			expect(profile.env?.[key] ?? fileRevert.env?.[key] ?? workflow.env?.[key]).toBeUndefined();
+		const scratch = {
+			TEMP: "${{ runner.temp }}",
+			TMP: "${{ runner.temp }}",
+			TMPDIR: "${{ runner.temp }}",
+		};
+		expect(record.env).toEqual(scratch);
+		expect(tests.env).toEqual(scratch);
+		expect(record.run).toContain("statfs(path)");
+		expect(tests.run?.trim().split(/\s+/)).toEqual([
+			"bun",
+			"test",
+			"--isolate",
+			"./server/services/file-change-platform-capability.test.ts",
+			"./server/services/file-change-local-restore.test.ts",
+			"./server/services/file-change-runtime.test.ts",
+			"./server/services/revert-transaction-service.test.ts",
+			"./server/services/revert-planner-local-access.test.ts",
+			"./server/services/revert-mutation-journal.test.ts",
+			"./server/services/narrator-scoped-revert.test.ts",
+			"./server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts",
+		]);
+		expect(steps.indexOf(volumes)).toBeLessThan(steps.indexOf(profile));
+		expect(steps.indexOf(profile)).toBeLessThan(steps.indexOf(record));
+		expect(steps.indexOf(record)).toBeLessThan(steps.indexOf(tests));
+		for (const step of [volumes, profile, record, tests])
+			expect(step["continue-on-error"]).toBeUndefined();
+	});
+
+	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
+		let checked = 0;
+		for (const name of [
+			"remote-executor.yml",
+			"file-revert-cross-platform.yml",
+			"plugin-platform-acceptance.yml",
+		]) {
+			const auxiliary = Bun.YAML.parse(
+				readFileSync(join(repository, ".github/workflows", name), "utf8"),
+			) as Workflow;
+			for (const [id, value] of Object.entries(auxiliary.jobs)) {
+				const typecheck = value.steps.findIndex(
+					(entry) => entry.run?.trim() === "bunx tsgo --noEmit",
+				);
+				if (typecheck < 0) continue;
+				checked++;
+				const before = value.steps.slice(0, typecheck);
+				const install = before.findIndex(
+					(entry) => entry.run?.trim() === "bun install --frozen-lockfile",
+				);
+				const build = before.findIndex((entry) => entry.run?.trim() === "bun run build");
+				const extension = before.findIndex(
+					(entry) => entry.run?.trim() === "bun install --cwd vscode-extension --frozen-lockfile",
+				);
+				expect(install, `${name}:${id} installs root dependencies`).toBeGreaterThanOrEqual(0);
+				expect(build, `${name}:${id} generates routes after installation`).toBeGreaterThan(install);
+				expect(extension, `${name}:${id} installs extension types`).toBeGreaterThan(install);
+				for (const entry of [before[build], before[extension]]) {
+					expect(entry.if).toBeUndefined();
+					expect(entry["continue-on-error"]).not.toBe(true);
+				}
+			}
+		}
+		expect(checked).toBe(4);
+	});
 	test("enforces migration assets, whole-repository lint and translation checks", () => {
 		for (const run of [
 			"bun scripts/check-sqlite-migration-assets.ts",
@@ -312,7 +408,7 @@ describe("generic CI workflow", () => {
 		const isolation = command("tests", "bun test --isolate tests/preload-isolation.test.ts");
 		const run = command(
 			"tests",
-			`bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${expression("matrix.shard")}/4 --reporter=junit --reporter-outfile=artifacts/ci-tests.xml`,
+			`bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${expression("matrix.shard")}/4 --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings --reporter=junit --reporter-outfile=artifacts/ci-tests.xml`,
 		);
 		expect(isolation.if).toBeUndefined();
 		expect(run.if).toBeUndefined();
@@ -321,6 +417,7 @@ describe("generic CI workflow", () => {
 		expect(report.if).toBe(expression("always()"));
 		expect(String(report.with?.path).trim().split(/\r?\n/)).toEqual([
 			"artifacts/ci-tests.xml",
+			"artifacts/ci-test-timings.json",
 			"artifacts/native-tests*.log",
 		]);
 		// Logs alone satisfy upload-artifact; a separate normal step must require JUnit.
@@ -341,6 +438,9 @@ describe("generic CI workflow", () => {
 				"--isolate",
 				"--only-failures",
 				`--shard=${shard}/4`,
+				"--parallel=2",
+				"--timings=artifacts/ci-test-timings.json",
+				"--update-timings",
 				"--reporter=junit",
 				"--reporter-outfile=artifacts/ci-tests.xml",
 			]);
@@ -350,7 +450,7 @@ describe("generic CI workflow", () => {
 		}
 		for (const value of job("tests").steps) {
 			expect(value.run ?? "").not.toMatch(
-				/PG_INTEGRATION|--retr(?:y|ies)|--bail|--path-ignore-patterns|--parallel|--timeout|--(?:exclude|filter|test-name-pattern|rerun-each)/,
+				/PG_INTEGRATION|--retr(?:y|ies)|--bail|--path-ignore-patterns|--parallel(?![=]2(?:\s|$))|--concurrent|--no-isolate|--timeout|--(?:exclude|filter|test-name-pattern|rerun-each)/,
 			);
 		}
 	});
@@ -469,7 +569,102 @@ function nativeArgs(shard = 1): string[] {
 	];
 }
 
+function balancedArgs(shard = 1): string[] {
+	return [
+		...nativeArgs(shard),
+		"--parallel=2",
+		`--timings=${CI_TEST_TIMINGS_PATH}`,
+		"--update-timings",
+	];
+}
+
+function timingsFixture(value: unknown) {
+	const root = privateRunnerRoot();
+	mkdirSync(join(root, ".github"));
+	writeFileSync(join(root, CI_TEST_TIMINGS_SOURCE), JSON.stringify(value));
+	return root;
+}
+
+const validTimings = {
+	version: 1 as const,
+	files: { "fixtures/slow.test.ts": 1200, "fixtures/fast.spec.ts": 0 },
+};
+
 describe("CI runner argument contract", () => {
+	test("forwards fixed native timing balance and two isolated workers without changing discovery", () => {
+		for (const shard of [1, 2, 3, 4]) {
+			const args = balancedArgs(shard);
+			expect(buildNativeTestCommand(args)).toEqual([process.execPath, "test", ...args]);
+			expect(buildNativeTestCommand([...args].reverse())).toEqual([
+				process.execPath,
+				"test",
+				...[...args].reverse(),
+			]);
+		}
+		for (const args of [
+			balancedArgs().slice(0, -1),
+			balancedArgs().map((flag) => flag.replace("--parallel=2", "--parallel=8")),
+			balancedArgs().map((flag) => flag.replace(CI_TEST_TIMINGS_PATH, "../elsewhere.json")),
+			[...balancedArgs(), "--concurrent"],
+			[...balancedArgs(), "--no-isolate"],
+			[...balancedArgs(), "--retry=1"],
+			[...balancedArgs(), "--test-name-pattern=fast"],
+		])
+			expect(() => buildNativeTestCommand(args)).toThrow("Expected --isolate");
+	});
+
+	test("validates scheduling hints without making them a discovery manifest", () => {
+		expect(validateNativeTestTimings(validTimings)).toEqual(validTimings);
+		expect(validateNativeTestTimings({ version: 1, files: {} })).toEqual({ version: 1, files: {} });
+		for (const value of [
+			null,
+			[],
+			{ ...validTimings, version: 2 },
+			{ ...validTimings, extra: true },
+			{ version: 1, files: [] },
+			{ version: 1, files: { "../outside.test.ts": 1 } },
+			{ version: 1, files: { "/outside.test.ts": 1 } },
+			{ version: 1, files: { "dir\\outside.test.ts": 1 } },
+			{ version: 1, files: { "README.md": 1 } },
+			{ version: 1, files: { "a.test.ts": -1 } },
+			{ version: 1, files: { "a.test.ts": Number.POSITIVE_INFINITY } },
+			{ version: 1, files: { "a.test.ts": "100" } },
+		])
+			expect(() => validateNativeTestTimings(value)).toThrow();
+	});
+
+	test("seeds only private timing output and never rewrites checked-in calibration", async () => {
+		const root = timingsFixture(validTimings);
+		const source = join(root, CI_TEST_TIMINGS_SOURCE);
+		const original = readFileSync(source, "utf8");
+		await prepareNativeTestTimings(balancedArgs(), root);
+		const output = join(root, CI_TEST_TIMINGS_PATH);
+		expect(JSON.parse(readFileSync(output, "utf8"))).toEqual(validTimings);
+		expect(readFileSync(source, "utf8")).toBe(original);
+		writeFileSync(output, "native-run-output");
+		await expect(prepareNativeTestTimings(balancedArgs(), root)).rejects.toThrow();
+		expect(readFileSync(output, "utf8")).toBe("native-run-output");
+		expect(readFileSync(source, "utf8")).toBe(original);
+	});
+
+	test("rejects corrupt, oversized and cancelled hints before creating timing output", async () => {
+		for (const content of ["{", " ".repeat(CI_TEST_TIMINGS_MAX_BYTES + 1)]) {
+			const root = timingsFixture(validTimings);
+			writeFileSync(join(root, CI_TEST_TIMINGS_SOURCE), content);
+			await expect(prepareNativeTestTimings(balancedArgs(), root)).rejects.toThrow();
+			expect(existsSync(join(root, CI_TEST_TIMINGS_PATH))).toBe(false);
+		}
+		const root = timingsFixture(validTimings);
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			prepareNativeTestTimings(balancedArgs(), root, controller.signal),
+		).rejects.toThrow();
+		expect(existsSync(join(root, CI_TEST_TIMINGS_PATH))).toBe(false);
+		await prepareNativeTestTimings(nativeArgs(), root);
+		expect(existsSync(join(root, CI_TEST_TIMINGS_PATH))).toBe(false);
+	});
+
 	test("preserves every native argument and its order without altering the per-test timeout", () => {
 		for (const shard of [1, 2, 3, 4]) {
 			const args = nativeArgs(shard);
@@ -507,6 +702,45 @@ describe("CI runner argument contract", () => {
 });
 
 describe.skipIf(process.platform === "win32")("CI regular-file stdio runner", () => {
+	test("native balanced shards run every discovered file exactly once with worker isolation", async () => {
+		const seen: number[] = [];
+		for (const shard of [1, 2, 3, 4]) {
+			const root = timingsFixture({
+				version: 1,
+				files: Object.fromEntries(
+					Array.from({ length: 6 }, (_, i) => [`fixture-${i}.test.ts`, (6 - i) * 100]),
+				),
+			});
+			const marker = join(root, "observed.jsonl");
+			for (let i = 0; i < 8; i++) {
+				writeFileSync(
+					join(root, `fixture-${i}.test.ts`),
+					`import { expect, test } from "bun:test";
+import { appendFileSync } from "node:fs";
+test("discovered file ${i} has a fresh global", () => {
+  expect(globalThis.__ciFixtureLeak).toBeUndefined();
+  globalThis.__ciFixtureLeak = ${i};
+  appendFileSync(${JSON.stringify(marker)}, "${i}\\n");
+});\n`,
+				);
+			}
+			const original = readFileSync(join(root, CI_TEST_TIMINGS_SOURCE), "utf8");
+			const args = balancedArgs(shard);
+			await prepareNativeTestTimings(args, root);
+			const result = await runWithFileStdio({
+				command: buildNativeTestCommand(args),
+				cwd: root,
+				timeoutMs: 10_000,
+			});
+			expectReleased(result);
+			expect(result.exitCode, readFileSync(result.stderrLog, "utf8")).toBe(0);
+			expect(readFileSync(join(root, CI_TEST_TIMINGS_SOURCE), "utf8")).toBe(original);
+			if (existsSync(marker))
+				seen.push(...readFileSync(marker, "utf8").trim().split("\n").map(Number));
+			expect(readFileSync(join(root, "artifacts/ci-tests.xml"), "utf8")).toContain('failures="0"');
+		}
+		expect(seen.sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+	}, 20_000);
 	test("child fds are real private regular files and raw stdout/stderr plus nonzero exit survive", async () => {
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];

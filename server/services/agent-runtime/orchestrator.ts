@@ -112,6 +112,7 @@ import {
 	type EventHooks,
 	persistDetachedToolResult,
 	processEvent,
+	retireSubagentOutputCharCount,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
 import { deliverInjection } from "../narrator-injection";
@@ -240,6 +241,7 @@ import {
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import { verifyModelHistoryRowsCurrent } from "./model-history-source";
 import { resolveRuntimePolicy } from "./policy";
 import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
@@ -595,7 +597,15 @@ export async function runAgentLoopUnlocked(
 			// request exactly once through normal history adoption (including subagents).
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, subagentPlacement);
-			const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
+			const historyDeadline = Date.now() + 10_000;
+			const rawMessages = await narratorService.getModelHistorySinceLastCompact(
+				narratorId,
+				undefined,
+				{
+					signal: active.abortController.signal,
+					deadline: historyDeadline,
+				},
+			);
 			// History below is rebuilt from the latest post-compact messages, so any
 			// pending-compact guard set by a background compact can be released here.
 			clearActiveHistoryCompactPending(narratorId);
@@ -627,12 +637,9 @@ export async function runAgentLoopUnlocked(
 				? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
 				: resolvedTurnSessionDevices;
 
-			// Subagent messages all have parentToolUseId set — clear it so
-			// buildHistory treats them as top-level (same as loadSubagentHistory).
+			// Preserve the original signed array. buildRuntimeHistory clears subagent placement
+			// on its detached model projection, while both freshness guards use these raw rows.
 			const isSubagentNarrator = isSubagentVariant(freshNarrator.variant);
-			const dbMessages = isSubagentNarrator
-				? rawMessages.map((m) => ({ ...m, parentToolUseId: null }))
-				: rawMessages;
 
 			// The row is authoritative, including a pin made after the executor built
 			// its one-time snapshot. initialModel only identifies the initial history.
@@ -708,10 +715,17 @@ export async function runAgentLoopUnlocked(
 				model: resolved.model,
 				provider: resolved.provider,
 				profile: isSubagentNarrator ? "subagent" : "primary",
-				sourceMessages: dbMessages,
+				sourceMessages: rawMessages,
 				currentInput: runState.input.text,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
+				deadline: historyDeadline,
+			});
+			// The subagent view is detached, but freshness belongs to the original signed rows.
+			// Fail explicitly rather than sending a mixed revision or re-registering receipts forever.
+			await verifyModelHistoryRowsCurrent(rawMessages, {
+				signal: active.abortController.signal,
+				deadline: historyDeadline,
 			});
 			let { history, trailingToolResults } = preparedHistory;
 			let initialQuestionReceiptText = "";
@@ -1563,7 +1577,7 @@ export async function runAgentLoopUnlocked(
 							});
 						}
 					}
-					return turnText ?? "";
+					return { text: turnText ?? "", messageId: messageId ?? undefined };
 				},
 				getRuntimeSettingsOverride: async () => {
 					await settleNarratorRuntimeModel(active);
@@ -2406,13 +2420,30 @@ export async function runAgentLoopUnlocked(
 					"primary",
 				);
 				if (interruptionPlan.action === "stop") {
-					// Retry budget spent. Deliberately falls THROUGH rather than breaking: the
-					// pass produced real partial output, so the rest of the turn-end handling
-					// (title, queued input, idle transition) still applies.
+					// Completion-limit exhaustion still falls through with its real partial
+					// output. A resumable upstream failure must instead retain the last failed
+					// attempt's diagnostics in a durable error card when continuation is spent.
 					logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
 						narratorId,
 						retries: interruptionPlan.retries,
 					});
+					if (interruptionPlan.reason === "resumable_error" && result.interruptionError) {
+						await narratorService.updateStatus(narratorId, "idle", {
+							substatus: ["error"],
+							errorMessage: result.interruptionError,
+							diagnostics: result.interruptionDiagnostics,
+						});
+						active.events.emit("event", {
+							type: "error",
+							data: {
+								message: result.interruptionError,
+								diagnostics: result.interruptionDiagnostics,
+							},
+						});
+						runState.finalText = result.interruptionError;
+						runState.hadError = true;
+						break;
+					}
 				} else if (interruptionPlan.action === "replay") {
 					logger.info(`${continuationLogLabel}: replaying interrupted tool-result turn`, {
 						narratorId,
@@ -3318,6 +3349,7 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
+			retireSubagentOutputCharCount(narratorId);
 			// Finalization cancels leftover resources, not the completed user turn.
 			// Preserve real cancellation before the internal cleanup abort changes the signal.
 			abortedBeforeCleanup = active.abortController.signal.aborted;

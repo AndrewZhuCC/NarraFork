@@ -8,6 +8,70 @@ import {
 	type ResourceMigrationSnapshot,
 } from "../../finalize-sqlite-resource-migration";
 import { generatePostgresSchema } from "../../generate-postgres-schema";
+import {
+	appendGeneratedModelHistoryTriggers,
+	generatedModelHistoryTriggerSuffix,
+} from "../generated-model-history-triggers";
+import { modelHistorySnapshots, revisionMigrationSql } from "./model-history-migration-fixture";
+
+test("only the exact generated trigger suffix is allowed, installed and validated read-only", () => {
+	const { before, after, previousDDL } = modelHistorySnapshots();
+	const suffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
+	const input = appendGeneratedModelHistoryTriggers(revisionMigrationSql, suffix);
+	const finalized = finalizeResourceMigration(input, before, after);
+	expect(finalized.endsWith(suffix)).toBe(true);
+	expect(finalizeResourceMigration(finalized, before, after)).toBe(finalized);
+	expect(() => assertResourceMigrationValidated(finalized, before, after)).not.toThrow();
+	const db = new Database(":memory:");
+	try {
+		db.exec(previousDDL);
+		db.exec(finalized);
+		expect(db.query("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger'").get()).toEqual({
+			n: 11,
+		});
+		expect(db.query("SELECT * FROM model_history_revision_contracts").get()).toEqual({
+			id: "model-history",
+			installed_version: "model-history-v1",
+		});
+		db.exec(
+			"INSERT INTO narrators(id) VALUES('owner'); INSERT INTO narrator_messages(id,narrator_id,content_json) VALUES('message','owner','[]');",
+		);
+		expect(db.query("SELECT body_revision FROM narrator_messages").get()).toEqual({
+			body_revision: 1,
+		});
+		expect(db.query("SELECT model_history_revision FROM narrators").get()).toEqual({
+			model_history_revision: 1,
+		});
+	} finally {
+		db.close();
+	}
+	for (const changed of [
+		revisionMigrationSql,
+		input.replace("model_history_revision + 1", "model_history_revision + 2"),
+		`${input}ATTACH DATABASE 'user.db' AS victim;`,
+		appendGeneratedModelHistoryTriggers(
+			`${revisionMigrationSql}\nCREATE TRIGGER untrusted AFTER UPDATE ON narrators BEGIN DELETE FROM users; END;`,
+			suffix,
+		),
+	])
+		expect(() => finalizeResourceMigration(changed, before, after)).toThrow();
+});
+
+test("machine triggers are compiled against every target column and later destructive rebuilds fail closed", () => {
+	const { before, after } = modelHistorySnapshots();
+	const brokenBefore = structuredClone(before),
+		brokenAfter = structuredClone(after);
+	delete brokenBefore.tables.narrator_messages.columns.origin_label;
+	delete brokenAfter.tables.narrator_messages.columns.origin_label;
+	const input = appendGeneratedModelHistoryTriggers(
+		revisionMigrationSql,
+		generatedModelHistoryTriggerSuffix(brokenBefore, brokenAfter, "sqlite"),
+	);
+	expect(() => finalizeResourceMigration(input, brokenBefore, brokenAfter)).toThrow("origin_label");
+	expect(() => finalizeResourceMigration("DROP TABLE narrator_messages;", after, after)).toThrow(
+		"versioned reinstall",
+	);
+});
 
 const before: ResourceMigrationSnapshot = {
 	tables: {

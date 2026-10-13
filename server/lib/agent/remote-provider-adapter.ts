@@ -1,5 +1,5 @@
 import type { JsonValue, ProviderStreamEvent } from "@server/lib/plugins/protocol";
-import { PLUGIN_REQUEST_DUMP_MAX_BYTES } from "@server/lib/plugins/protocol";
+import { isHostTruncatedDump, PLUGIN_REQUEST_DUMP_MAX_BYTES } from "@server/lib/plugins/protocol";
 import type {
 	ModelCatalog,
 	PluginProviderRpcClient,
@@ -12,6 +12,8 @@ import type {
 	ProviderOperation,
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
+import { historyInputMessageIds } from "@shared/native-injection";
+import type { RecordingRequest } from "@shared/request-recording";
 import { settings } from "../settings";
 import type {
 	BuiltHistory,
@@ -139,6 +141,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		_narratorId?: string,
 	): Promise<BuiltHistory> {
 		const history: ProviderMessage[] = [];
+		const replayedInjectionMessageIds: string[] = [];
 		let pendingToolResults: ProviderContentBlock[] = [];
 
 		for (const message of dbMessages) {
@@ -166,12 +169,19 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			}
 
 			const content = canonicalMessageContent(message, role, this.activeReasoningSource);
-			if (content.length > 0) history.push({ role, content });
+			if (content.length > 0) {
+				history.push({ role, content });
+				const texts = content.flatMap((block) =>
+					block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+				);
+				replayedInjectionMessageIds.push(...historyInputMessageIds([message], texts));
+			}
 		}
 
 		return {
 			history,
 			trailingToolResults: pendingToolResults,
+			replayedInjectionMessageIds,
 		};
 	}
 
@@ -556,9 +566,33 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		let pendingRequest: PendingRequest | null = null;
 		let responseOpen = false;
 		let responseFailed = false;
+		let responseTruncated = false;
 		let responseBody: BoundedUtf8Capture | null = null;
+		// Delay only a bounded suffix so credentials split across arbitrary plugin
+		// chunks are still masked. All other reported bytes reach the worker live.
+		const secretTail = Math.min(
+			maxBytes,
+			Math.max(0, ...secrets.map((secret) => secret.length * 12 + 16)),
+		);
+		let requestTail = "";
+		let responseTail = "";
+		const emitBody = (direction: "request" | "response", chunk: string, final = false): void => {
+			const pending = mask((direction === "request" ? requestTail : responseTail) + chunk);
+			let cut = final ? pending.length : Math.max(0, pending.length - secretTail);
+			if (!final && cut > 0 && /[\uD800-\uDBFF]/.test(pending[cut - 1])) cut--;
+			const text = pending.slice(0, cut);
+			if (direction === "request") requestTail = pending.slice(cut);
+			else responseTail = pending.slice(cut);
+			if (text)
+				collector.frame({
+					direction,
+					type: "plugin.reported_body",
+					text,
+					metadata: { source: "plugin-reported", boundary: "sanitized-chunks" },
+				});
+		};
 
-		const buildRequest = (): NonNullable<ApiRequestDump["request"]> => {
+		const buildRequest = (): NonNullable<ApiRequestDump["request"]> & RecordingRequest => {
 			const pending = pendingRequest;
 			const sanitizedBody = new BoundedUtf8Capture(maxBytes);
 			sanitizedBody.append(mask(pending?.body.text() ?? ""));
@@ -570,19 +604,11 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			) {
 				bodyText += "\n[request body truncated by plugin to fit the dump budget]";
 			}
-			let body: unknown = bodyText;
-			if (bodyText) {
-				try {
-					body = JSON.parse(bodyText);
-				} catch {
-					// Non-JSON bodies stay as raw text; the dump exists to show what was sent.
-				}
-			}
 			return {
 				transport: pending?.transport ?? "plugin",
 				...(pending?.url ? { url: pending.url } : {}),
 				...(pending?.headers ? { headers: pending.headers } : {}),
-				body,
+				bodyText,
 			};
 		};
 		const closeResponse = (complete: boolean): void => {
@@ -590,24 +616,44 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			responseOpen = false;
 			// Mask the bounded concatenation, not each chunk: plugins choose arbitrary
 			// boundaries (including inside escaped secrets). Reset for EVERY retry.
-			if (responseBody) collector.appendResponseText(mask(responseBody.text()));
-			collector.finishResponseCapture(complete && !responseFailed);
+			emitBody("response", "", true);
+			if (responseBody) collector.appendResponseText(mask(responseBody.text()), false);
+			collector.finishResponseCapture(complete && !responseFailed && !responseTruncated);
 			if (responseBody)
 				collector.setResponseMeta({
 					bodyBytesReceived: responseBody.received,
-					...(responseBody.received > responseBody.kept ? { bodyTruncated: true } : {}),
+					...(responseTruncated || responseBody.received > responseBody.kept
+						? { bodyTruncated: true }
+						: {}),
 				});
 			responseBody = null;
 			responseFailed = false;
+			responseTruncated = false;
 		};
 		/** Preserve a request whose response never arrived before starting the next attempt. */
 		const preservePendingRequest = (): void => {
 			if (!pendingRequest) return;
-			collector.setRequest(buildRequest());
+			emitBody("request", "", true);
+			collector.setRequest(buildRequest(), false);
 			pendingRequest = null;
 		};
 
 		const tap = ((event: DumpStreamEvent): void => {
+			collector.frame({
+				direction: event.type === "dump.request" ? "request" : "response",
+				type: `plugin.${event.type}`,
+				...(event.truncated
+					? {
+							sourceTruncated: isHostTruncatedDump(event) ? ("host" as const) : ("plugin" as const),
+						}
+					: {}),
+				metadata: {
+					source: "plugin-reported",
+					...(event.type === "dump.request" && event.url ? { url: mask(event.url) } : {}),
+					...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
+					...(event.truncated ? { truncated: true } : {}),
+				},
+			});
 			if (event.type === "dump.request") {
 				const opensAttempt =
 					event.transport !== undefined || event.url !== undefined || event.headers !== undefined;
@@ -622,7 +668,10 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						truncated: false,
 					};
 				}
-				if (event.bodyChunk) pendingRequest?.body.append(event.bodyChunk);
+				if (event.bodyChunk) {
+					pendingRequest?.body.append(event.bodyChunk);
+					emitBody("request", event.bodyChunk);
+				}
 				if (event.truncated && pendingRequest) pendingRequest.truncated = true;
 				return;
 			}
@@ -631,14 +680,19 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				responseOpen = true;
 				responseFailed = false;
 				responseBody = new BoundedUtf8Capture(maxBytes);
-				collector.beginResponseAttempt(buildRequest(), maxBytes);
+				emitBody("request", "", true);
+				collector.beginResponseAttempt(buildRequest(), maxBytes, false);
 				pendingRequest = null;
 				collector.setResponseMeta({
 					...(event.status !== undefined ? { status: event.status } : {}),
 					...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
 				});
 			}
-			if (event.bodyChunk) responseBody?.append(event.bodyChunk);
+			if (event.bodyChunk) {
+				responseBody?.append(event.bodyChunk);
+				emitBody("response", event.bodyChunk);
+			}
+			if (event.truncated) responseTruncated = true;
 			if (event.error) {
 				responseFailed = true;
 				collector.setResponseError(mask(event.error));
@@ -666,8 +720,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			},
 			// The hint's presence doubles as protocol negotiation: a plugin may emit
 			// dump.request/dump.response events only for calls that carry it, so hosts
-			// predating those event types never receive one. `maxBytes` stays well below
-			// the per-operation RPC output budget that dump events share with real output.
+			// predating those event types never receive one. `maxBytes` is a separate
+			// diagnostic retention ceiling, never model-output admission.
 			...(params.requestDump
 				? {
 						requestDump: {

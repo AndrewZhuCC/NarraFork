@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { isRuntimeToolAllowed, resolveRuntimePolicy } from "@server/services/agent-runtime/policy";
 import {
+	projectAskUserQuestionInput,
+	projectAskUserQuestionMessagesForModel,
+} from "../../question-model-input";
+import {
 	askUserQuestionTool,
 	isAsyncAskRequest,
 	isWithdrawOnlyAskRequest,
@@ -36,6 +40,11 @@ describe("Question lifecycle capability", () => {
 });
 
 describe("AskUserQuestion", () => {
+	test("does not advertise permission-collected replies as model arguments", () => {
+		const schema = askUserQuestionTool.rawJsonSchema as { properties: Record<string, unknown> };
+		expect(schema.properties).not.toHaveProperty("answers");
+		expect(schema.properties).not.toHaveProperty("annotations");
+	});
 	test("advertises only header/description on questions and options", () => {
 		const schema = askUserQuestionTool.rawJsonSchema as {
 			properties?: {
@@ -174,5 +183,99 @@ describe("AskUserQuestion — async mode predicates", () => {
 		expect(askUserQuestionTool.description).toContain("SHORT title");
 		expect(askUserQuestionTool.description).toContain("FULL prompt");
 		expect(askUserQuestionTool.description).toContain("Do not cram the long prompt into `header`");
+	});
+});
+
+describe("AskUserQuestion model input provenance", () => {
+	test("removes only top-level response fields without changing the source or nested authored data", () => {
+		const authored = {
+			questions: [{ header: "Direction", options: [{ header: "A", preview: "answers are data" }] }],
+			async: false,
+			context: "context",
+			metadata: { answers: "authored nested data" },
+		};
+		const input = Object.freeze({
+			...authored,
+			answers: { Direction: "HUMAN_REPLY_CANARY" },
+			annotations: { Direction: { notes: "human note" } },
+			deferredByUser: true,
+		});
+		expect(projectAskUserQuestionInput(input) as unknown).toEqual(authored);
+		expect(input.answers.Direction).toBe("HUMAN_REPLY_CANARY");
+		expect(projectAskUserQuestionInput(authored)).toBe(authored);
+	});
+
+	test("projects legacy JSON strings once and bounds oversized parsing", () => {
+		const input = JSON.stringify({
+			questions: [{ header: "Legacy", options: [] }],
+			answers: { Legacy: "HUMAN_REPLY_CANARY" },
+		});
+		expect(JSON.parse(projectAskUserQuestionInput(input))).toEqual({
+			questions: [{ header: "Legacy", options: [] }],
+		});
+		const literal = JSON.stringify(input);
+		expect(projectAskUserQuestionInput(literal)).toBe(literal);
+		expect(projectAskUserQuestionInput("not JSON")).toBe("not JSON");
+		expect(projectAskUserQuestionInput(" ".repeat(1024 * 1024 + 1))).toBe("{}");
+	});
+
+	test("original SDK questions win over answered or deferred audit input while results and other tools stay intact", () => {
+		const authored = { questions: [{ header: "Direction", options: [] }], async: false };
+		const effective = {
+			...authored,
+			async: true,
+			answers: { Direction: "HUMAN_REPLY_CANARY" },
+			deferredByUser: true,
+		};
+		const readInput = { answers: "ordinary tool data", file_path: "example.txt" };
+		const source = [
+			{
+				contentJson: [
+					{ type: "tool_use", id: "ask", name: "AskUserQuestion", input: authored },
+					{ type: "tool_use", id: "read", name: "Read", input: readInput },
+					{ type: "tool_result", tool_use_id: "ask", content: "User answered: HUMAN_REPLY_CANARY" },
+				],
+				toolCalls: [
+					{
+						toolUseId: "ask",
+						toolName: "AskUserQuestion",
+						inputJson: effective,
+						outputJson: "User answered: HUMAN_REPLY_CANARY",
+					},
+					{ toolUseId: "read", toolName: "Read", inputJson: readInput, outputJson: "unchanged" },
+				],
+			},
+		];
+		const snapshot = structuredClone(source);
+		const projected = projectAskUserQuestionMessagesForModel(source);
+		expect(projected[0].toolCalls[0].inputJson as unknown).toEqual(authored);
+		expect(projected[0].toolCalls[0].outputJson).toBe("User answered: HUMAN_REPLY_CANARY");
+		expect(projected[0].toolCalls[1]).toBe(source[0].toolCalls[1]);
+		expect(projected[0].contentJson[1]).toBe(source[0].contentJson[1]);
+		expect(projected[0].contentJson[2]).toBe(source[0].contentJson[2]);
+		expect(source).toEqual(snapshot);
+	});
+
+	test("supports block-only and row-only legacy inputs without conflating nameless other tools", () => {
+		const input = {
+			questions: [{ header: "Legacy", options: [] }],
+			answers: { Legacy: "HUMAN_REPLY_CANARY" },
+		};
+		const block = { type: "tool_use", id: "ask", name: "AskUserQuestion", input };
+		const projected = projectAskUserQuestionMessagesForModel([
+			{ contentJson: [block] },
+			{ toolCalls: [{ toolName: "AskUserQuestion", inputJson: JSON.stringify(input) }] },
+		]);
+		expect(projected[0].contentJson?.[0].input as unknown).toEqual({ questions: input.questions });
+		expect(projected[1].toolCalls?.[0].inputJson as unknown).toEqual({
+			questions: input.questions,
+		});
+		const other = { type: "tool_use", name: "Read", input: { answers: "keep" } };
+		const unrelated = {
+			contentJson: [other],
+			toolCalls: [{ toolName: "AskUserQuestion", inputJson: input }],
+		};
+		expect(projectAskUserQuestionMessagesForModel([unrelated])[0].contentJson[0]).toBe(other);
+		expect(block.input).toBe(input);
 	});
 });

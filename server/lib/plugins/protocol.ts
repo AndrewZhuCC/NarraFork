@@ -20,12 +20,20 @@ export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
  * Ceiling on the dump budget the host advertises to a plugin in
  * `ProviderChatParams.requestDump.maxBytes`. The operator-configured
  * `agent.requestDumpMaxSize` is a retention ceiling and may be far larger; what crosses
- * the RPC boundary must stay well below the per-operation output budget (24 MiB) that
- * dump events share with the model's actual output.
+ * the RPC boundary remains bounded independently from model output. Exceeding this
+ * diagnostic budget truncates evidence, never terminates the business operation.
  */
 export const PLUGIN_REQUEST_DUMP_MAX_BYTES = 4 * 1024 * 1024;
 /** Maximum size of a single `dump.request`/`dump.response` body chunk. */
 export const PLUGIN_DUMP_CHUNK_MAX_CHARS = 64 * 1024;
+// Host-only provenance stays off the RPC wire and cannot be forged by a plugin.
+const hostTruncatedDumpEvents = new WeakSet<object>();
+export function markHostTruncatedDump(event: object): void {
+	hostTruncatedDumpEvents.add(event);
+}
+export function isHostTruncatedDump(event: object): boolean {
+	return hostTruncatedDumpEvents.has(event);
+}
 /** MessageChannel UI bridge protocol. */
 export const NARRAFORK_UI_PROTOCOL = "narrafork.ui/1" as const;
 

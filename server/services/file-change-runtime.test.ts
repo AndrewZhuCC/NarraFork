@@ -115,7 +115,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await runtime.initialize().catch(() => {});
-	sqlite.close();
+	// Drizzle prepares uncached statements; close() alone defers native disposal until GC.
+	// Strict close finalizes them before Windows removes this fixture's directory.
+	sqlite.close(true);
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -961,10 +963,18 @@ describe("actual Write/Edit local evidence", () => {
 		expect(attributions()[1].workspacePath).toBe(join(root, "outside"));
 	});
 
-	test("POSIX backslash remains filename data", async () => {
+	test("backslash is filename data on POSIX and a directory separator on Windows", async () => {
 		const path = join(workspace, "literal\\name.txt");
 		expect((await write(path, "content")).isError).toBeUndefined();
-		expect(effects()[0].identityJson.displayPath).toBe("literal\\name.txt");
+		expect(effects()[0].identityJson.displayPath).toBe(
+			process.platform === "win32" ? "literal/name.txt" : "literal\\name.txt",
+		);
+		if (process.platform === "win32") {
+			expect((await lstat(join(workspace, "literal"))).isDirectory()).toBe(true);
+			expect(await readFile(join(workspace, "literal", "name.txt"), "utf8")).toBe("content");
+		} else {
+			await expect(lstat(join(workspace, "literal"))).rejects.toMatchObject({ code: "ENOENT" });
+		}
 		expect(await readFile(path, "utf8")).toBe("content");
 	});
 

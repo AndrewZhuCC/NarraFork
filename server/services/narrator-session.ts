@@ -37,6 +37,7 @@ import {
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
 import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
+import type { AgentInputPart } from "../lib/agent/types";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
@@ -144,11 +145,12 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
 	persistDetachedToolResult,
+	retireSubagentOutputCharCount,
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
 import { deliverInjection } from "./narrator-injection";
@@ -1100,6 +1102,7 @@ async function createNarrator(
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
+		retireSubagentOutputCharCount(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -1133,27 +1136,35 @@ async function createNarrator(
 		projectGitPath = project?.gitPath ?? null;
 		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
 		narratorProjectId = ch.projectId;
-		if (ch.worktreePath) {
-			// A saved narrator cwd is an explicit user override (for example, after
-			// recovering from a missing workdir). Keep the chapter worktree as the
-			// default only when no override has been chosen.
-			narratorCwd = resolveNarratorSessionCwd(
-				narrator.cwd,
-				ch.worktreePath,
-				projectGitPath,
-				getHome(),
+		const executionDeviceId =
+			initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? "local";
+		const committedLocalCwd =
+			narrator.workspaceContext?.revision === narrator.workspaceRevision &&
+			narrator.workspaceContext.deviceId === "local"
+				? narrator.workspaceContext.cwd
+				: null;
+		const chapterCwd = resolveLegacyNarratorCwd(
+			committedLocalCwd ?? narrator.cwd,
+			ch.worktreePath,
+			projectGitPath,
+			ch.isRoot === 1,
+		);
+		if (!chapterCwd && executionDeviceId === "local") {
+			throw new AppError(
+				"This legacy workspace has no directory. Choose a working directory to continue.",
+				409,
+				"WORKSPACE_DIRECTORY_REQUIRED",
 			);
+		}
+		// Remote tools use their executor/committed workspace cwd. This host cwd is
+		// only the pre-existing prompt/skill context, not a fallback execution target.
+		narratorCwd =
+			chapterCwd ?? resolveNarratorSessionCwd(narrator.cwd, null, projectGitPath, getHome());
+		if (ch.worktreePath) {
 			narratorChapterId = ch.id;
 			narratorChapterRole = ch.role;
 			narratorWorktreePath = ch.worktreePath;
 			narratorBaseBranch = ch.baseBranch;
-		} else {
-			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project?.gitPath, getHome());
-			logger.info("Chapter dormant, using fallback CWD", {
-				chapterId: narrator.chapterId,
-				narratorCwd,
-			});
 		}
 	} else if (narrator.contextProjectId) {
 		const project = await db.query.projects.findFirst({
@@ -1953,8 +1964,7 @@ function resolveCadence(
  *            it is about to send (its in-memory history was built at pass start).
  *   `idle` — `schedule: "none"`, because the caller holds `continuationStartLock` and
  *            starts the loop itself; asking `deliverInjection` to wake would re-enter
- *            that lock and deadlock. Completions also carry their FULL result here, since
- *            a turn is being started specifically to deal with them.
+ *            that lock and deadlock. Both modes carry the full bounded completion result.
  *
  * Returns the concatenated model-facing text, or null when nothing was queued — the idle
  * callers use that as their "is a turn worth starting" signal.
@@ -1967,11 +1977,12 @@ async function deliverPendingInjectionsInOrder(
 	adoptedMailbox?: MailboxDeliveryConsumption[],
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
 	active?: ActiveNarrator,
+	inputParts?: AgentInputPart[],
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
 		await migrateLegacyParentInjections(narratorId);
 		const schedule = mode === "busy" ? "onNextTurn" : "none";
-		const parts: string[] = [];
+		const parts: AgentInputPart[] = [];
 		const { pendingInjectionUserId } = await import("./parent-injection-queue");
 		let principalSet = false;
 
@@ -2041,7 +2052,7 @@ async function deliverPendingInjectionsInOrder(
 						active._questionAnswerModelReceipts ??= new Map();
 						active._questionAnswerModelReceipts.set(questionAnswer.messageId, row.text);
 					}
-					parts.push(row.text);
+					parts.push({ text: row.text, messageId: questionAnswer.messageId });
 					projectedBytes += row.projectedByteSize;
 					continue;
 				}
@@ -2064,10 +2075,10 @@ async function deliverPendingInjectionsInOrder(
 					schedule,
 					entry,
 					subagent,
+					(part) => parts.push(part),
 				);
 				if (text) {
 					projectedBytes += Buffer.byteLength(text);
-					parts.push(text);
 					if (row.kind !== "agent_message") adoptedMailbox?.push(inboxConsumption(row));
 					if (entry.kind === "subagent_message" && entry.message.delivery) {
 						adoptedDeliveries?.push(entry.message.delivery);
@@ -2088,14 +2099,14 @@ async function deliverPendingInjectionsInOrder(
 		const retried = !active?.abortController?.signal.aborted
 			? await retryDeferredQuestionAnswerDeliveries(narratorId, locale)
 			: 0;
-		const joined = parts.filter((part) => part.trim().length > 0).join("\n\n");
+		const projectedParts = parts.filter((part) => part.text.trim().length > 0);
 		// A just-accepted receipt may sit behind this bounded batch. Keep a pass
 		// alive so normal history rebuilding supplies its full persisted event.
-		return joined.length > 0
-			? joined
-			: retried
-				? "Pending question receipts were accepted for delivery."
-				: null;
+		if (projectedParts.length === 0 && retried) {
+			projectedParts.push({ text: "Pending question receipts were accepted for delivery." });
+		}
+		inputParts?.push(...projectedParts);
+		return projectedParts.length > 0 ? projectedParts.map((part) => part.text).join("\n\n") : null;
 	});
 }
 
@@ -2114,11 +2125,19 @@ export async function deliverPendingInjection(
 	schedule: "onNextTurn" | "none",
 	entry: PendingInjection,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
+	onDelivered?: (part: AgentInputPart) => void,
 ): Promise<string | null> {
-	const deliverInjection = (
+	const deliverInjection = async (
 		id: string,
 		options: import("./narrator-injection").DeliverInjectionOptions,
-	) => deliverInboxInjection(id, options, entry.mailboxClaim);
+	) => {
+		const result = await deliverInboxInjection(id, options, entry.mailboxClaim);
+		onDelivered?.({
+			text: result.turnText ?? options.content,
+			messageId: result.messageId ?? undefined,
+		});
+		return result;
+	};
 	const withBackgroundCompletionHint = async (content: string, status: string) => {
 		if (status !== "completed") return content;
 		// Read at delivery time, not publication time: other work may have finished
@@ -2312,27 +2331,26 @@ export async function drainAndPersistPendingInjections(
  * now write a real message row through `deliverInjection`; they differ only in what
  * happens next, which is the whole point of separating `role` from `schedule`:
  *
- *   idle → `wakeIfIdle`, because nothing is running to notice the row
+ *   idle → `none`, because the caller starts a pass that rebuilds history
  *   busy → `onNextTurn`, because the loop is mid-flight and its in-memory history was
  *          built at pass start, so the row alone would go unseen until the next pass
  *
  * The returned text is what the loop folds into the turn it is about to send. Nothing
  * is yielded for persistence: the row is already written.
  *
- * `includeResult: false` keeps the busy path's existing economy — a preview here, the
- * full output on demand via `Await`. The idle path passes `true` because it is
- * starting a turn specifically to deal with the result.
+ * Both busy and idle paths carry the full bounded completion result, so a tool
+ * boundary gives the model the same completion context as a fresh pass.
  */
 export async function drainInjectionsIntoHistory(
 	active: ActiveNarrator,
 	locale: Locale,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
-): Promise<{ text: string; onConsumed: () => void }> {
+): Promise<{ text: string; parts: AgentInputPart[]; onConsumed: () => void }> {
 	const narratorId = active.narratorId;
-	const parts: string[] = [];
+	const parts: AgentInputPart[] = [];
 	const { buildPendingQuestionHint } = await import("./narrator-question-service");
 	const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
-	if (pendingQuestionHint) parts.push(pendingQuestionHint);
+	if (pendingQuestionHint) parts.push({ text: pendingQuestionHint });
 	const adoptedDeliveries: AgentMessageDelivery[] = [];
 	const adoptedMailbox: MailboxDeliveryConsumption[] = [];
 
@@ -2374,7 +2392,7 @@ export async function drainInjectionsIntoHistory(
 			tasksBody.cadenceInterval = active._tasksReminderInterval ?? 15;
 		}
 		const { body, content } = sideCarBodyWithText("living_work_spec", tasksBody, locale);
-		const { turnText } = await deliverInjection(narratorId, {
+		const { messageId, turnText } = await deliverInjection(narratorId, {
 			subagent,
 			content,
 			body,
@@ -2382,7 +2400,7 @@ export async function drainInjectionsIntoHistory(
 			schedule: "onNextTurn",
 			locale,
 		});
-		if (turnText) parts.push(turnText);
+		if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 	}
 
 	// The fence goes out on its own cadence, or alongside a tasks reminder when the
@@ -2391,7 +2409,7 @@ export async function drainInjectionsIntoHistory(
 		const fenceBody = await buildBehaviorFenceBody(narratorId);
 		if (fenceBody) {
 			const { body, content } = sideCarBodyWithText("behavior_fence", fenceBody, locale);
-			const { turnText } = await deliverInjection(narratorId, {
+			const { messageId, turnText } = await deliverInjection(narratorId, {
 				subagent,
 				content,
 				body,
@@ -2399,13 +2417,13 @@ export async function drainInjectionsIntoHistory(
 				schedule: "onNextTurn",
 				locale,
 			});
-			if (turnText) parts.push(turnText);
+			if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 		}
 	}
 
 	// Background completions + `Send({ id: "parent" })` reports, in the order they
 	// actually happened. See `deliverPendingInjectionsInOrder`.
-	const eventText = await deliverPendingInjectionsInOrder(
+	await deliverPendingInjectionsInOrder(
 		narratorId,
 		locale,
 		"busy",
@@ -2413,8 +2431,8 @@ export async function drainInjectionsIntoHistory(
 		adoptedMailbox,
 		subagent,
 		active,
+		parts,
 	);
-	if (eventText) parts.push(eventText);
 	if (subagent) {
 		const { consumeBufferedSubagentMessageInPass } = await import("./subagent-executor");
 		const consumed = await consumeBufferedSubagentMessageInPass({
@@ -2425,7 +2443,7 @@ export async function drainInjectionsIntoHistory(
 			currentUserId: active._currentUserId,
 		});
 		if (consumed) {
-			parts.push(consumed.text);
+			parts.push(...consumed.parts);
 			if (consumed.buffered.delivery) adoptedDeliveries.push(consumed.buffered.delivery);
 			if (consumed.buffered._mailboxConsumption)
 				adoptedMailbox.push(consumed.buffered._mailboxConsumption);
@@ -2454,7 +2472,7 @@ export async function drainInjectionsIntoHistory(
 			},
 			locale,
 		);
-		const { turnText } = await deliverInjection(narratorId, {
+		const { messageId, turnText } = await deliverInjection(narratorId, {
 			subagent,
 			content,
 			body,
@@ -2462,11 +2480,12 @@ export async function drainInjectionsIntoHistory(
 			schedule: "onNextTurn",
 			locale,
 		});
-		if (turnText) parts.push(turnText);
+		if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 	}
 
 	return {
-		text: parts.join("\n\n"),
+		text: parts.map((part) => part.text).join("\n\n"),
+		parts,
 		onConsumed: () => {
 			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
 			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
@@ -2699,7 +2718,13 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
-		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+		const deadline = Date.now() + 10_000;
+		const signal = opts.attachmentSignal;
+		signal?.throwIfAborted();
+		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+			signal,
+			deadline,
+		});
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -2710,14 +2735,20 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			profile: isSubagentNarrator ? "subagent" : "primary",
 			sourceMessages: rawMsgs,
 			attachmentCwd: opts.getAttachmentCwd?.(),
-			attachmentSignal: opts.attachmentSignal,
+			attachmentSignal: signal,
+			deadline,
 		});
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
 			: undefined;
+		const { verifyModelHistoryRowsCurrent } = await import("./agent-runtime/model-history-source");
+		await verifyModelHistoryRowsCurrent(rawMsgs, { signal, deadline });
+		signal?.throwIfAborted();
+		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {
 			history: result.history,
 			pendingToolResults: result.trailingToolResults,
+			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
 	};
@@ -5242,6 +5273,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
+	retireSubagentOutputCharCount(narratorId);
 	active.abortController.abort();
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();
@@ -7253,6 +7285,7 @@ export function closeNarrator(narratorId: string): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
 	clearStreamingSnapshot(narratorId);
+	retireSubagentOutputCharCount(narratorId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,

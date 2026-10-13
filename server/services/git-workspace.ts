@@ -11,7 +11,7 @@ import { getHome } from "../lib/platform";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { gitDiscoveryCache } from "./git-discovery-cache";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { activeNarrators } from "./narrator-session-state";
 import { createRemoteGitService, supportsRemoteGitWorkspace } from "./remote-git-service";
 
@@ -141,7 +141,7 @@ export async function resolveNarratorGitTarget(
 	const chapter = narrator.chapterId
 		? await db.query.chapters.findFirst({
 				where: eq(chapters.id, narrator.chapterId),
-				columns: { id: true, projectId: true, worktreePath: true },
+				columns: { id: true, projectId: true, worktreePath: true, isRoot: true },
 			})
 		: undefined;
 	if (narrator.chapterId && !chapter) throw new NotFoundError("Chapter", narrator.chapterId);
@@ -162,7 +162,14 @@ export async function resolveNarratorGitTarget(
 	const localCwd =
 		committedContext?.cwd ??
 		active?.cwd ??
-		resolveNarratorSessionCwd(narrator.cwd, chapter?.worktreePath, project?.gitPath, getHome());
+		(chapter
+			? resolveLegacyNarratorCwd(
+					narrator.cwd,
+					chapter.worktreePath,
+					project?.gitPath,
+					chapter.isRoot === 1,
+				) || ""
+			: resolveNarratorSessionCwd(narrator.cwd, null, project?.gitPath, getHome()));
 	const deviceId = active
 		? (active._defaultDeviceId ?? "local")
 		: (narrator.defaultDeviceId ?? "local");

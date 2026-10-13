@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test as nativeTest, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -52,7 +52,11 @@ import {
 	RevertTransactionService,
 } from "./revert-transaction-service";
 import { runRevertManifestWorker } from "./revert-transaction-worker";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
+import {
+	createWorkspaceWriteCoordinatorState,
+	type WorkspaceWriteLease,
+	type WorkspaceWriteRequest,
+} from "./workspace-write-coordinator";
 import { freezeWorkspaceRanges, WORKSPACE_RANGE_LIMITS } from "./workspace-write-ranges";
 
 const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
@@ -76,57 +80,174 @@ let service: RevertTransactionService;
 let options: RevertTransactionOptions;
 let serial: number;
 let allowedFiles: Set<string>;
-let fileHook: ((path: string) => void | Promise<void>) | undefined;
+let fileHook: ((path: string, signal: AbortSignal) => void | Promise<void>) | undefined;
 let restores: (() => void)[];
+let fixtureAbort: AbortController;
+let ownedWork: Set<Promise<unknown>>;
+let fixtureSetupMs: number;
+type FixtureLifetime = {
+	controller: AbortController;
+	work: Set<Promise<unknown>>;
+	holds: Set<() => void>;
+	restores: (() => void)[];
+	root?: string;
+	sqlite?: Database;
+	closing?: Promise<void>;
+};
+let lifetime: FixtureLifetime | undefined;
+const ownedTest: ProxyHandler<typeof nativeTest> = {
+	apply(register, thisArg, [label, body, options]) {
+		return Reflect.apply(register, thisArg, [
+			label,
+			(...args: unknown[]) => {
+				if (!lifetime) throw new Error("Missing transaction fixture lifetime");
+				const pending = lifetime.work;
+				const result = body(...args);
+				return result instanceof Promise ? own(result, pending) : result;
+			},
+			options,
+		]);
+	},
+	get(register, key) {
+		// Bun's chainable accessors must receive the original native registration object.
+		const value = Reflect.get(register, key, register);
+		if (key === "each" || key === "skipIf" || key === "todoIf" || key === "failingIf")
+			return (...args: unknown[]) =>
+				new Proxy(Reflect.apply(value, register, args) as typeof nativeTest, ownedTest);
+		if (
+			typeof value === "function" &&
+			["skip", "only", "todo", "failing", "concurrent", "serial"].includes(String(key))
+		)
+			return new Proxy(value as typeof nativeTest, ownedTest);
+		return value;
+	},
+};
+// Keep native registration/deadlines and return the body's original Promise unchanged.
+const test = new Proxy(nativeTest, ownedTest);
+
+// Observe the original lifetime promises, without releasing production locks or
+// replacing any IO/receipt behavior. Teardown must not race an early HTTP result.
+function own<T>(work: Promise<T>, pending = ownedWork): Promise<T> {
+	pending.add(work);
+	void work.then(
+		() => pending.delete(work),
+		() => pending.delete(work),
+	);
+	return work;
+}
+function makeFixtureRuntime(...args: ConstructorParameters<typeof LocalFileChangeRuntime>) {
+	const instance = new LocalFileChangeRuntime(...args);
+	const pending = ownedWork;
+	const namespaceAccess = instance.withNamespaceAccess.bind(instance);
+	instance.withNamespaceAccess = <T>(body: () => Promise<T>, signal?: AbortSignal) =>
+		own(namespaceAccess(body, signal), pending);
+	const write = instance.coordinator.withWrite.bind(instance.coordinator);
+	instance.coordinator.withWrite = <T>(
+		request: WorkspaceWriteRequest,
+		body: (lease: WorkspaceWriteLease) => T | Promise<T>,
+	) => own(write(request, body), pending);
+	return instance;
+}
+function makeFixtureTransaction(...args: ConstructorParameters<typeof RevertTransactionService>) {
+	const instance = new RevertTransactionService(...args);
+	const pending = ownedWork;
+	const controller = fixtureAbort;
+	const execute = instance.execute.bind(instance);
+	instance.execute = (input) => {
+		const signal = input.signal
+			? AbortSignal.any([input.signal, controller.signal])
+			: controller.signal;
+		const attempt = execute({ ...input, signal });
+		own(attempt.whenSettled, pending);
+		return attempt;
+	};
+	return instance;
+}
 
 beforeEach(async () => {
+	// A timed-out native hook cannot let another fixture replace globals still in use
+	// by the previous original test body. The native hook deadline remains unchanged.
+	await lifetime?.closing;
+	const owner: FixtureLifetime = {
+		controller: new AbortController(),
+		work: new Set(),
+		holds: new Set(),
+		restores: [],
+	};
+	lifetime = owner;
+	fixtureAbort = owner.controller;
+	ownedWork = owner.work;
+	restores = owner.restores;
+	await own(seedFixture(owner), owner.work);
+});
+async function seedFixture(owner: FixtureLifetime) {
+	const setupStarted = performance.now();
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	root = await fs.mkdtemp(join(await fs.realpath(tmpdir()), "revert-transaction-test-"));
+	owner.root = root;
 	workspace = join(root, "workspace");
 	await fs.mkdir(workspace);
 	sqlite = new Database(join(root, "isolated.sqlite"));
-	sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL;");
+	owner.sqlite = sqlite;
+	// Match production's file-backed WAL/NORMAL durability, not SQLite's default FULL.
+	// Retain zero lock waiting so a fixture never hides an unexpected competing writer.
+	sqlite.exec(
+		"PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+	);
+	expect(sqlite.query<{ synchronous: number }, []>("PRAGMA synchronous").get()?.synchronous).toBe(
+		1,
+	);
+	expect(
+		sqlite.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode,
+	).toBe("wal");
+	expect(sqlite.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout).toBe(0);
 	const definitions = isolatedTemplate
 		.query<{ sql: string }, []>(
 			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
 		)
 		.all();
 	expect(definitions.length).toBeLessThan(2048);
-	for (const row of definitions) sqlite.exec(row.sql);
+	// Fixture-only DDL: retain the same file-backed WAL database and full schema,
+	// but avoid hundreds of separate durable commits during each Windows hook.
+	sqlite.transaction(() => {
+		for (const row of definitions) sqlite.exec(row.sql);
+	})();
 	db = database(sqlite);
 	serial = 0;
 	allowedFiles = new Set();
 	fileHook = undefined;
-	restores = [];
-	for (const id of ["alice", "bob"])
-		db.insert(schema.users)
-			.values({ id, username: id, passwordHash: "isolated-not-a-credential", createdAt: now() })
-			.run();
-	db.insert(schema.projects)
-		.values({
-			id: "project",
-			name: "Isolated",
-			ownerUserId: "alice",
-			gitPath: workspace,
-			createdAt: now(),
-			updatedAt: now(),
-		})
-		.run();
-	for (const id of ["narrator", "fork"])
-		db.insert(schema.narrators)
+	// Only synchronous fixture rows belong in this transaction; real tool IO stays outside.
+	sqlite.transaction(() => {
+		for (const id of ["alice", "bob"])
+			db.insert(schema.users)
+				.values({ id, username: id, passwordHash: "isolated-not-a-credential", createdAt: now() })
+				.run();
+		db.insert(schema.projects)
 			.values({
-				id,
+				id: "project",
+				name: "Isolated",
 				ownerUserId: "alice",
-				contextProjectId: "project",
-				cwd: workspace,
-				messageVersion: 7,
+				gitPath: workspace,
 				createdAt: now(),
 				updatedAt: now(),
 			})
 			.run();
+		for (const id of ["narrator", "fork"])
+			db.insert(schema.narrators)
+				.values({
+					id,
+					ownerUserId: "alice",
+					contextProjectId: "project",
+					cwd: workspace,
+					messageVersion: 7,
+					createdAt: now(),
+					updatedAt: now(),
+				})
+				.run();
+	})();
 	coordinatorState = createWorkspaceWriteCoordinatorState();
-	runtime = new LocalFileChangeRuntime({
+	runtime = makeFixtureRuntime({
 		db,
 		privateRoot: join(root, "private"),
 		coordinatorState,
@@ -172,7 +293,7 @@ beforeEach(async () => {
 				!allowedFiles.has(identity.canonicalPath)
 			)
 				throw new Error("File denied");
-			await fileHook?.(identity.canonicalPath);
+			await fileHook?.(identity.canonicalPath, signal);
 		},
 		async resolveFile({ identity, signal }) {
 			signal.throwIfAborted();
@@ -232,13 +353,33 @@ beforeEach(async () => {
 	});
 	plans = new RevertPlanService(db, planOptions);
 	options = { access, runtime, namespace, planOptions, onSlow: () => {} };
-	service = new RevertTransactionService(db, options);
+	service = makeFixtureTransaction(db, options);
+	fixtureSetupMs = performance.now() - setupStarted;
+}
+afterEach(() => {
+	// Capture the entire owner before any await; repeated timeout hooks must share
+	// one closing promise and never fetch the next fixture's root/database/globals.
+	const closing = lifetime;
+	if (!closing) return;
+	closing.closing ??= closeFixture(closing);
+	return closing.closing;
 });
-afterEach(async () => {
-	for (const restore of restores.reverse()) restore();
-	sqlite.close();
-	await fs.rm(root, { recursive: true, force: true });
-});
+async function closeFixture(closing: FixtureLifetime) {
+	closing.controller.abort(new Error("Owned test fixture is closing"));
+	// A failed assertion/timeout must also release test-owned fault barriers that
+	// the test body never reached its finally block to release.
+	for (const release of closing.holds) release();
+	// Include the original body and setup promise, not just the response/worker.
+	// Partial setup can still publish its own root/database to this fixed owner.
+	while (closing.work.size) await Promise.allSettled([...closing.work]);
+	expect(closing.holds.size).toBe(0);
+	expect(closing.work.size).toBe(0);
+	for (const restore of closing.restores.splice(0).reverse()) restore();
+	// Finalize Drizzle's prepared statements instead of deferring SQLite's native
+	// connection disposal to GC, which leaves fixture files locked on Windows.
+	closing.sqlite?.close(true);
+	if (closing.root) await fs.rm(closing.root, { recursive: true, force: true });
+}
 function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
 	if (!user.isAdmin && row.ownerUserId !== user.userId) throw new Error("Narrator denied");
 }
@@ -257,57 +398,61 @@ async function tool(
 	const messageId = existingMessageId ?? generateId();
 	const toolCallId = generateId();
 	const block = { type: "tool_use" as const, id: providerId, name, input };
-	if (existingMessageId) {
-		const previous = db
-			.select()
-			.from(schema.narratorMessages)
-			.where(eq(schema.narratorMessages.id, messageId))
-			.get();
-		if (
-			!previous ||
-			previous.narratorId !== actorNarratorId ||
-			!Array.isArray(previous.contentJson)
-		)
-			throw new Error("Missing tool message owned by the same actor");
-		db.update(schema.narratorMessages)
-			.set({ contentJson: [...(previous.contentJson ?? []), block] })
-			.where(eq(schema.narratorMessages.id, messageId))
-			.run();
-	} else {
-		db.insert(schema.narratorMessages)
+	// Seed only fixture history synchronously; never hold this SQL transaction
+	// across path resolution, permission checks or the actual tool/evidence IO.
+	sqlite.transaction(() => {
+		if (existingMessageId) {
+			const previous = db
+				.select()
+				.from(schema.narratorMessages)
+				.where(eq(schema.narratorMessages.id, messageId))
+				.get();
+			if (
+				!previous ||
+				previous.narratorId !== actorNarratorId ||
+				!Array.isArray(previous.contentJson)
+			)
+				throw new Error("Missing tool message owned by the same actor");
+			db.update(schema.narratorMessages)
+				.set({ contentJson: [...(previous.contentJson ?? []), block] })
+				.where(eq(schema.narratorMessages.id, messageId))
+				.run();
+		} else {
+			db.insert(schema.narratorMessages)
+				.values({
+					id: messageId,
+					narratorId: actorNarratorId,
+					role: "assistant",
+					contentJson: [{ type: "text", text: "retain" }, block],
+					createdAt: now(),
+				})
+				.run();
+			db.insert(schema.narratorMessageRefs)
+				.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
+				.run();
+		}
+		db.insert(schema.narratorToolCalls)
 			.values({
-				id: messageId,
+				id: toolCallId,
 				narratorId: actorNarratorId,
-				role: "assistant",
-				contentJson: [{ type: "text", text: "retain" }, block],
+				messageId,
+				toolUseId: providerId,
+				toolName: name,
+				inputJson: input,
+				status: "running",
+				executionIdentityVersion: 1,
+				executionAttempt: 1,
+				executionStartedAt: now(),
+				executionDeviceId: "local",
+				executionCwd: cwd,
+				executionPathFlavor: localBackend.pathFlavor,
+				resolvedFilePath: resolved.lexicalPath,
+				canonicalFilePath: resolved.canonicalPath,
+				runtimeGeneration: 0,
 				createdAt: now(),
 			})
 			.run();
-		db.insert(schema.narratorMessageRefs)
-			.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
-			.run();
-	}
-	db.insert(schema.narratorToolCalls)
-		.values({
-			id: toolCallId,
-			narratorId: actorNarratorId,
-			messageId,
-			toolUseId: providerId,
-			toolName: name,
-			inputJson: input,
-			status: "running",
-			executionIdentityVersion: 1,
-			executionAttempt: 1,
-			executionStartedAt: now(),
-			executionDeviceId: "local",
-			executionCwd: cwd,
-			executionPathFlavor: localBackend.pathFlavor,
-			resolvedFilePath: resolved.lexicalPath,
-			canonicalFilePath: resolved.canonicalPath,
-			runtimeGeneration: 0,
-			createdAt: now(),
-		})
-		.run();
+	})();
 	const target: ToolExecutionTarget = {
 		deviceId: "local",
 		backendKind: "local",
@@ -498,14 +643,47 @@ async function fixedEvidenceBytes(plan: RevertPlanSummary) {
 	return [...refs.values()].reduce((sum, bytes) => sum + bytes, 0);
 }
 function hold() {
+	const owner = lifetime;
+	if (!owner) throw new Error("Missing transaction fault-barrier owner");
+	const holds = owner.holds;
+	const signal = owner.controller.signal;
 	let release: () => void = () => {};
 	const promise = new Promise<void>((resolve) => {
-		release = resolve;
+		let released = false;
+		release = () => {
+			if (released) return;
+			released = true;
+			holds.delete(release);
+			signal.removeEventListener("abort", release);
+			resolve();
+		};
+		holds.add(release);
+		signal.addEventListener("abort", release, { once: true });
+		// A late body can create another test fault gate after teardown starts.
+		// It belongs to this already-aborted owner and must never block its closing.
+		if (signal.aborted) release();
 	});
 	return { promise, release };
 }
 
 describe("rollback activity admission and bounded ranges", () => {
+	test("strict fixture close releases retained prepared statements before directory removal", async () => {
+		const directory = await fs.mkdtemp(join(root, "close-probe-"));
+		const client = new Database(join(directory, "owned.sqlite"));
+		client.exec("PRAGMA journal_mode=WAL; CREATE TABLE owned(value TEXT);");
+		const retained = client.prepare("SELECT value FROM owned");
+		try {
+			expect(retained.all()).toEqual([]);
+			client.close(true);
+			expect(() => retained.all()).toThrow("Database has closed");
+			await fs.rm(directory, { recursive: true, force: true });
+			await expect(fs.access(directory)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			retained.finalize();
+			client.close(true);
+		}
+	});
+
 	test.each([
 		256, 257, 1000,
 	])("%s fixed targets keep scope admission within the global range budget", async (count) => {
@@ -533,15 +711,38 @@ describe("rollback activity admission and bounded ranges", () => {
 		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
 		if (!scope) throw new Error("Missing scope");
 		const path = join(workspace, "字".repeat(200));
-		const ranges = Array.from({ length: 180 }, (_, i) => ({
-			kind: "file" as const,
-			canonicalPath: `${path}-${i}`,
-		}));
+		const padding = "字".repeat(80);
+		let ranges: { kind: "file"; canonicalPath: string }[] | undefined;
+		// Account for the actual canonical temporary prefix, without changing any
+		// count/byte/padding limit or deriving expectations from production output.
+		for (let count = 180; count > 0; count--) {
+			const candidate = Array.from({ length: count }, (_, i) => ({
+				kind: "file" as const,
+				canonicalPath: `${path}-${i}`,
+			}));
+			const compactJson = JSON.stringify({ version: 1, ranges: candidate });
+			const paddedJson = JSON.stringify({
+				version: 1,
+				ranges: candidate.map((range) => ({
+					...range,
+					canonicalPath: `${range.canonicalPath}${padding}`,
+				})),
+			});
+			if (
+				compactJson.length < WORKSPACE_RANGE_LIMITS.jsonBytes &&
+				Buffer.byteLength(compactJson) < WORKSPACE_RANGE_LIMITS.jsonBytes &&
+				paddedJson.length < WORKSPACE_RANGE_LIMITS.jsonBytes &&
+				Buffer.byteLength(paddedJson) > WORKSPACE_RANGE_LIMITS.jsonBytes
+			) {
+				ranges = candidate;
+				break;
+			}
+		}
+		if (!ranges) throw new Error("Cannot construct the UTF-8 range-boundary fixture");
 		// Stay under the count budget, cross bytes rather than UTF-16 characters.
 		const compact = JSON.stringify({ version: 1, ranges });
 		expect(compact.length).toBeLessThan(WORKSPACE_RANGE_LIMITS.jsonBytes);
 		expect(Buffer.byteLength(compact)).toBeLessThan(WORKSPACE_RANGE_LIMITS.jsonBytes);
-		const padding = "字".repeat(80);
 		const oversized = ranges.map((range) => ({
 			...range,
 			canonicalPath: `${range.canonicalPath}${padding}`,
@@ -813,17 +1014,36 @@ describe("rollback activity admission and bounded ranges", () => {
 	});
 
 	test("real 257-file prepared plan applies under one bounded scope subtree lease", async () => {
-		service = new RevertTransactionService(db, { ...options, timeoutMs: 120_000 });
+		const started = performance.now();
+		let previous = started;
+		const mark = (stage: string, result?: Awaited<ReturnType<typeof execution>["result"]>) => {
+			if (process.env.NF_REVERT_FIXTURE_TIMINGS !== "1") return;
+			const now = performance.now();
+			console.info("[fixture-257]", {
+				stage,
+				elapsedMs: Math.round(now - started),
+				stageMs: Math.round(now - previous),
+				fixtureSetupMs: Math.round(fixtureSetupMs),
+				...(result
+					? { status: result.status, reason: result.reason, settling: result.settling }
+					: {}),
+			});
+			previous = now;
+		};
+		mark("fixture_ready");
+		service = makeFixtureTransaction(db, { ...options, timeoutMs: 120_000 });
 		const paths = Array.from({ length: 257 }, (_, i) => join(workspace, `budget-${i}.txt`));
 		for (const path of paths) {
 			await fs.writeFile(path, "original");
 			await write(path, "changed");
 		}
+		mark("actual_tool_evidence_ready");
 		const siblingRoot = join(workspace, "unselected-sibling");
 		await fs.mkdir(siblingRoot);
 		const siblingPath = join(siblingRoot, "not-in-plan.txt");
 		await fs.writeFile(siblingPath, "keep this content");
 		const plan = await prepare();
+		mark("manifest_prepared");
 		expect(plan.expectedFileCount).toBe(257);
 		const scope = db.select().from(schema.fileChangeScopes).limit(1).get();
 		const binding = localFileChangeRuntimeBinding("local");
@@ -867,7 +1087,10 @@ describe("rollback activity admission and bounded ranges", () => {
 			}),
 		);
 		restores.push(() => spy.mockRestore());
-		expect((await execution(plan).result).status).toBe("committed");
+		mark("activity_rejection_verified");
+		const result = await execution(plan).result;
+		mark("apply_response", result);
+		expect(result.status).toBe("committed");
 		expect(entered).toBe(true);
 		for (const path of paths) expect(await fs.readFile(path, "utf8")).toBe("original");
 		expect(await fs.readFile(siblingPath, "utf8")).toBe("keep this content");
@@ -882,6 +1105,7 @@ describe("rollback activity admission and bounded ranges", () => {
 				.every((file) => file.status === "verified"),
 		).toBe(true);
 		expect(coordinatorState.leases.size).toBe(0);
+		mark("all_original_assertions_passed");
 	}, 120_000);
 });
 
@@ -898,10 +1122,13 @@ describe("deterministic actor interleaving model", () => {
 			);
 			const model = initial.map((lines) => [...lines]);
 			const bytes = (lines: string[]) => Buffer.from(`${lines.join(ending)}${ending}`);
+			const originalModes: number[] = [];
 			for (const [file, path] of paths.entries()) {
 				allowedFiles.add(path);
 				await fs.writeFile(path, bytes(model[file]));
 				await fs.chmod(path, file ? 0o600 : 0o644);
+				// Windows exposes DOS writable/read-only mode, not POSIX group/execute bits.
+				originalModes.push((await fs.lstat(path)).mode & 0o7777);
 			}
 			const actions: {
 				actor: "selected" | "other" | "human";
@@ -999,7 +1226,7 @@ describe("deterministic actor interleaving model", () => {
 			});
 			for (const [file, path] of paths.entries()) {
 				expect((await fs.readFile(path)).equals(bytes(expected[file]))).toBe(true);
-				expect((await fs.lstat(path)).mode & 0o777).toBe(file ? 0o600 : 0o644);
+				expect((await fs.lstat(path)).mode & 0o7777).toBe(originalModes[file]);
 			}
 			expect(
 				db
@@ -1034,6 +1261,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 	test("snapshot conflict recovery requires explicit confirmation before journal or target mutation", async () => {
 		const path = join(workspace, "snapshot-conflict.txt");
 		await fs.writeFile(path, "baseline\r\n", { mode: 0o751 });
+		const originalMode = (await fs.stat(path)).mode & 0o7777;
 		await write(path, "selected one\n");
 		await fs.writeFile(path, "human between selections\n");
 		await write(path, "selected two\n");
@@ -1075,7 +1303,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			"committed",
 		);
 		expect(await fs.readFile(path, "utf8")).toBe("baseline\r\n");
-		expect((await fs.stat(path)).mode & 0o7777).toBe(0o751);
+		expect((await fs.stat(path)).mode & 0o7777).toBe(originalMode);
 		expect(history()).toBe(before);
 		await snapshotConsentRequired(service.execute(request).result);
 		await snapshotConsentRequired(execution(plan).result);
@@ -1296,6 +1524,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const created = join(workspace, "created.txt");
 		const original = iconv.encode("原始内容\r\n保留\r\n", "gbk");
 		await fs.writeFile(path, original, { mode: 0o751 });
+		const originalMode = (await fs.stat(path)).mode & 0o7777;
 		settings.agent.legacyEncoding = true;
 		await write(path, "修改内容\n保留\n");
 		await write(created, "temporary\n");
@@ -1303,7 +1532,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const plan = await prepare();
 		expect((await execution(plan).result).status).toBe("committed");
 		expect((await fs.readFile(path)).equals(original)).toBe(true);
-		expect((await fs.stat(path)).mode & 0o7777).toBe(0o751);
+		expect((await fs.stat(path)).mode & 0o7777).toBe(originalMode);
 		expect(await fs.exists(created)).toBe(false);
 		expect(db.select().from(schema.narratorMessageRefs).limit(100).all()).toHaveLength(0);
 	});
@@ -1686,6 +1915,8 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(history()).toBe(before);
 	});
 	test("receipt SQL fault retains applying intent/quarantine; reopened DB never repeats IO", async () => {
+		const owner = lifetime;
+		if (!owner) throw new Error("Missing reopened transaction fixture owner");
 		const { a, plan } = await twoFiles();
 		const before = history();
 		sqlite.exec(
@@ -1695,17 +1926,21 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(history()).toBe(before);
 		expect(journalFiles(plan)[0].receiptJson).toMatchObject({ apply: { receipt: null } });
 		await fs.writeFile(a, "human after unknown write");
-		sqlite.close();
+		sqlite.close(true);
 		sqlite = new Database(join(root, "isolated.sqlite"));
-		sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
+		owner.sqlite = sqlite;
+		sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA synchronous=NORMAL;");
+		expect(sqlite.query<{ synchronous: number }, []>("PRAGMA synchronous").get()?.synchronous).toBe(
+			1,
+		);
 		db = database(sqlite);
-		runtime = new LocalFileChangeRuntime({
+		runtime = makeFixtureRuntime({
 			db,
 			privateRoot: join(root, "private"),
 			coordinatorState: createWorkspaceWriteCoordinatorState(),
 			blobStoreOptions: { minimumFreeBytes: 0 },
 		});
-		service = new RevertTransactionService(db, { ...options, runtime });
+		service = makeFixtureTransaction(db, { ...options, runtime });
 		expect((await execution(plan).result).status).toBe("recovery_required");
 		expect(await fs.readFile(a, "utf8")).toBe("human after unknown write");
 		expect(history()).toBe(before);
@@ -1914,7 +2149,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const { a, b, plan } = await twoFiles();
 		const before = history();
 		const bytes = await fixedEvidenceBytes(plan);
-		service = new RevertTransactionService(db, { ...options, maxEvidenceBytes: bytes });
+		service = makeFixtureTransaction(db, { ...options, maxEvidenceBytes: bytes });
 		if (sqlFailure) failHistoryCommit();
 		expect((await execution(plan).result).status).toBe(sqlFailure ? "compensated" : "committed");
 		for (const path of [a, b])
@@ -1929,7 +2164,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const before = history();
 		const third = "third party observed after dispatch";
 		const bytes = await fixedEvidenceBytes(plan);
-		service = new RevertTransactionService(db, {
+		service = makeFixtureTransaction(db, {
 			...options,
 			maxEvidenceBytes: bytes + Buffer.byteLength(third) - (overLimit ? 1 : 0),
 		});
@@ -1973,14 +2208,13 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 	});
 	test("trusted transaction budget cannot raise shared ceiling or admit an over-budget fixed plan", async () => {
 		const { a, plan } = await twoFiles();
-		expect(
-			() =>
-				new RevertTransactionService(db, {
-					...options,
-					maxEvidenceBytes: FILE_CHANGE_LIMITS.operationEvidenceBytes + 1,
-				}),
+		expect(() =>
+			makeFixtureTransaction(db, {
+				...options,
+				maxEvidenceBytes: FILE_CHANGE_LIMITS.operationEvidenceBytes + 1,
+			}),
 		).toThrow("BUDGET_EXCEEDED");
-		service = new RevertTransactionService(db, {
+		service = makeFixtureTransaction(db, {
 			...options,
 			maxEvidenceBytes: (await fixedEvidenceBytes(plan)) - 1,
 		});
@@ -2059,22 +2293,88 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			apply: { receipt: { confirmed: true, outcome: "not_applied" } },
 		});
 	});
-	test("bounded response keeps namespace until compensation IO settlement", async () => {
+	test("real 50ms cleanup expiry retains recovery-required without blind compensation", async () => {
 		const { a, b, plan } = await twoFiles();
 		const before = history();
-		const entered = hold();
-		const release = hold();
 		const controller = new AbortController();
-		let held = false;
-		let namespaceAcquired = false;
-		service = new RevertTransactionService(db, { ...options, cleanupTimeoutMs: 50 });
-		fileHook = async (path) => {
+		let cleanupExpired = false;
+		service = makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 50 });
+		fileHook = async (path, signal) => {
 			if (
 				path === b &&
 				operation(plan)?.status === "applying" &&
 				journalFiles(plan)[1].status === "applying"
 			)
 				controller.abort();
+			if (!cleanupExpired && path === a && operation(plan)?.status === "compensating") {
+				await new Promise<void>((resolve) => {
+					if (signal.aborted) resolve();
+					else signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				cleanupExpired = signal.aborted;
+				// Resume the original authorization/namespace path with its REAL aborted
+				// cleanup signal. No timer replacement or fabricated receipt is involved.
+			}
+		};
+		const attempt = execution(plan, controller.signal);
+		const final = await attempt.whenSettled;
+		expect(cleanupExpired).toBe(true);
+		expect(final).toMatchObject({
+			status: "recovery_required",
+			journalStatus: "compensating",
+			settling: false,
+		});
+		// The expired cleanup cannot pretend its final durable transition completed.
+		expect(operation(plan)?.status).toBe("compensating");
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+		expect(await fs.readFile(b, "utf8")).toBe("changed");
+		expect(history()).toBe(before);
+		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
+			apply: { receipt: { confirmed: true, outcome: "applied" } },
+			compensate: { receipt: { confirmed: true, outcome: "not_applied" } },
+		});
+	});
+
+	test("bounded response keeps namespace until compensation IO settlement", async () => {
+		const { a, b, plan } = await twoFiles();
+		const before = history();
+		const modes = await Promise.all(
+			[a, b].map(async (path) => (await fs.stat(path)).mode & 0o7777),
+		);
+		const entered = hold();
+		const release = hold();
+		const controller = new AbortController();
+		let held = false;
+		let namespaceAcquired = false;
+		let response: (() => void) | undefined;
+		// Use the existing production cleanup bound. Control ONLY the response timer
+		// queued synchronously by abort; real IO, guards and AbortSignal timers run normally.
+		service = makeFixtureTransaction(db, options);
+		fileHook = async (path) => {
+			if (
+				path === b &&
+				operation(plan)?.status === "applying" &&
+				journalFiles(plan)[1].status === "applying"
+			) {
+				const schedule = globalThis.setTimeout;
+				const callbacks: (() => void)[] = [];
+				const observe = ((
+					callback: (...args: unknown[]) => void,
+					delay?: number,
+					...args: unknown[]
+				) => {
+					if (delay === 30_000) callbacks.push(() => callback(...args));
+					return schedule(callback, delay, ...args);
+				}) as typeof globalThis.setTimeout;
+				const spy = spyOn(globalThis, "setTimeout").mockImplementation(observe);
+				try {
+					controller.abort();
+				} finally {
+					spy.mockRestore();
+				}
+				expect(callbacks).toHaveLength(1);
+				response = callbacks[0];
+			}
 			if (
 				!held &&
 				path === a &&
@@ -2092,16 +2392,26 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			namespaceAcquired = true;
 		});
 		try {
+			if (!response) throw new Error("Real bounded-response timer was not captured");
+			response();
 			expect(await attempt.result).toMatchObject({ status: "recovery_required", settling: true });
 			expect(namespaceAcquired).toBe(false);
 			expect(operation(plan)?.status).toBe("compensating");
 		} finally {
 			release.release();
 		}
-		expect((await attempt.whenSettled).settling).toBe(false);
+		expect(await attempt.whenSettled).toMatchObject({ status: "compensated", settling: false });
 		await namespaceWait;
 		expect(namespaceAcquired).toBe(true);
 		expect(history()).toBe(before);
+		for (const [index, path] of [a, b].entries()) {
+			expect(await fs.readFile(path, "utf8")).toBe("changed");
+			expect((await fs.stat(path)).mode & 0o7777).toBe(modes[index]);
+		}
+		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
+			apply: { receipt: { confirmed: true, outcome: "applied" } },
+			compensate: { receipt: { confirmed: true, outcome: "applied" } },
+		});
 	});
 	test("cancel during post-dispatch guard returns bounded response but retains lease until real lifetime settles", async () => {
 		const { a, plan } = await twoFiles();
@@ -2110,7 +2420,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const release = hold();
 		const controller = new AbortController();
 		let held = false;
-		service = new RevertTransactionService(db, { ...options, cleanupTimeoutMs: 50 });
+		service = makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 50 });
 		fileHook = async (path) => {
 			if (
 				!held &&
@@ -2271,7 +2581,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			() => previews.mockRestore(),
 			() => claims.mockRestore(),
 		);
-		service = new RevertTransactionService(db, { ...options, timeoutMs: 2000 });
+		service = makeFixtureTransaction(db, { ...options, timeoutMs: 2000 });
 		const attempt = execution(plan);
 		expect((await attempt.whenSettled).status).toBe("committed");
 		await legacy;

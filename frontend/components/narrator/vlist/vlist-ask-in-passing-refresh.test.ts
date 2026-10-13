@@ -144,3 +144,82 @@ test("refresh rejects a locate/fetch race and an oversized existing window", asy
 	).toBeUndefined();
 	expect(located).toBe(false);
 });
+
+test("a pre-aborted window never calls either transport", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	let reads = 0;
+	await expect(
+		refreshPretextDocumentWindow("n", previous, {
+			signal: controller.signal,
+			locateMessage: async () => {
+				reads++;
+				return { seq: 1 };
+			},
+			fetchPage: async () => {
+				reads++;
+				return page();
+			},
+		}),
+	).rejects.toHaveProperty("name", "AbortError");
+	expect(reads).toBe(0);
+});
+
+test("parent abort settles a window even when its custom transport ignores the signal", async () => {
+	const controller = new AbortController();
+	let opened = () => {};
+	let signal: AbortSignal | undefined;
+	const started = new Promise<void>((resolve) => {
+		opened = resolve;
+	});
+	const result = refreshPretextDocumentWindow("n", previous, {
+		signal: controller.signal,
+		locateMessage: async () => ({ seq: 1 }),
+		fetchPage: async (_id, options) => {
+			signal = options.signal;
+			opened();
+			return new Promise<PretextDocumentPageResult>(() => {});
+		},
+	});
+	const outcome = result.catch((error: Error) => error);
+	await started;
+	controller.abort();
+	expect(((await outcome) as Error).name).toBe("AbortError");
+	expect(signal?.aborted).toBe(true);
+});
+
+test("a shared window deadline rejects an abort-ignoring transport", async () => {
+	await expect(
+		refreshPretextDocumentWindow("n", previous, {
+			windowTimeoutMs: 10,
+			locateMessage: async () => ({ seq: 1 }),
+			fetchPage: async () => new Promise<PretextDocumentPageResult>(() => {}),
+		}),
+	).rejects.toHaveProperty("name", "TimeoutError");
+});
+
+test("overlapping pages and malformed stable locations fail closed", async () => {
+	let reads = 0;
+	expect(
+		await refreshPretextDocumentWindow("n", previous, {
+			locateMessage: async () => ({ seq: 1 }),
+			fetchPage: async () => {
+				reads++;
+				return reads === 1
+					? page([row("source", 1), row("duplicate", 2)], 9, true)
+					: page([row("duplicate", 3), row("tail", 4)]);
+			},
+		}),
+	).toBeUndefined();
+	expect(reads).toBe(2);
+	for (const seq of [NaN, Infinity, -1, 1.5]) {
+		expect(
+			await refreshPretextDocumentWindow("n", previous, {
+				locateMessage: async () => ({ seq }),
+				fetchPage: async () => {
+					throw new Error("invalid locations must not fetch pages");
+				},
+			}),
+		).toBeUndefined();
+	}
+});

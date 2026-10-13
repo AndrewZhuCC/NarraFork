@@ -21,12 +21,19 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type {
+	DisplayPageMessagesParams,
+	PostgresDisplayPageMessagesParams,
+} from "./display-page-protocol";
+
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
 	| "storageScanContext"
 	| "storageScanTables"
 	| "usageHistoryQuery"
-	| "searchQuery";
+	| "searchQuery"
+	| "displayPageMessages"
+	| "displayPageMessagesPostgres";
 
 /** Shared search budgets; importing these must never bootstrap a database. */
 export const SEARCH_QUERY_MAX_SQL_BYTES = 64 * 1024;
@@ -106,7 +113,9 @@ export type DbReadTaskParams =
 	| StorageScanContextParams
 	| StorageScanTablesParams
 	| UsageHistoryQueryParams
-	| SearchQueryParams;
+	| SearchQueryParams
+	| DisplayPageMessagesParams
+	| PostgresDisplayPageMessagesParams;
 
 export interface DbWorkerRequest {
 	type: "task";
@@ -119,7 +128,12 @@ export interface DbWorkerShutdown {
 	type: "shutdown";
 }
 
-export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown;
+export interface DbWorkerCancel {
+	type: "cancel";
+	requestId: string;
+}
+
+export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown | DbWorkerCancel;
 
 export interface DbWorkerReady {
 	type: "ready";
@@ -146,6 +160,8 @@ export interface DbWorkerFailure {
 	type: "error";
 	requestId: string;
 	message: string;
+	/** Task-specific fail-closed diagnostics; never contains raw JSON. */
+	code?: string;
 }
 
 export type DbWorkerOutbound = DbWorkerReady | DbWorkerProgress | DbWorkerSuccess | DbWorkerFailure;

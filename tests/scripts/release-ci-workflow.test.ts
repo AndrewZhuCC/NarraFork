@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { runInNewContext } from "node:vm";
 import {
 	assertReleaseGate,
 	normalizeMatrixArtifacts,
 	parseCiReleaseArgs,
 	releaseMatrix,
+	validateBuildRecoveryArgs,
 } from "../../scripts/ci-release";
 import { CI_RELEASE_TARGETS, type CiReleasePlan } from "../../scripts/lib/ci-release-types";
 
@@ -63,6 +65,9 @@ function gateEnv(restore: boolean, publish: boolean): NodeJS.ProcessEnv {
 	return {
 		PREFLIGHT_RESULT: "success",
 		RESTORE_MODE: String(restore),
+		BUILD_REUSE_MODE: "false",
+		SMOKE_ONLY: "false",
+		RESTORE_PLATFORMS_RESULT: "skipped",
 		PUBLISH_REQUESTED: String(publish),
 		VERIFY_RESULT: restore ? "skipped" : "success",
 		BUILD_RESULT: restore ? "skipped" : "success",
@@ -106,8 +111,14 @@ describe("release workflow safety", () => {
 			default: false,
 		});
 		expect(Object.keys(release.on.workflow_dispatch?.inputs ?? {}).sort()).toEqual([
+			"bridge_run_attempt",
+			"bridge_run_id",
+			"build_run_attempt",
+			"build_run_id",
 			"index_only",
+			"mirror_only",
 			"publish",
+			"smoke_target",
 			"source_run_id",
 			"tag",
 		]);
@@ -198,6 +209,47 @@ describe("release workflow safety", () => {
 		expect(smoke?.run).toContain("smoke-release-binary.ts");
 		expect(smoke?.run).not.toContain("build-cross-platform");
 	});
+	test("Node 24 artifact consumption requires both complete platform files before smoke", async () => {
+		for (const job of Object.values(release.jobs))
+			for (const step of job.steps ?? [])
+				if (step.uses?.startsWith("actions/download-artifact@"))
+					expect(step.uses).toBe(
+						"actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+					);
+		const steps = release.jobs.smoke?.steps ?? [];
+		const downloadIndex = steps.findIndex((step) =>
+			step.uses?.startsWith("actions/download-artifact@"),
+		);
+		const checkIndex = steps.findIndex(
+			(step) => step.name === "Verify complete downloaded platform inputs",
+		);
+		const smokeIndex = steps.findIndex(
+			(step) => step.name === "Run the downloaded binary on its native platform",
+		);
+		expect(downloadIndex).toBeGreaterThanOrEqual(0);
+		expect(checkIndex).toBeGreaterThan(downloadIndex);
+		expect(smokeIndex).toBeGreaterThan(checkIndex);
+		expect(steps[downloadIndex]?.with?.["digest-mismatch"]).toBe("error");
+		const directory = await mkdtemp(join(tmpdir(), "nf-platform-inputs-"));
+		temporary.push(directory);
+		const platform = join(directory, ".ci-release", "platform");
+		await mkdir(platform, { recursive: true });
+		const name = "narrafork-0.9.0-macos-x64";
+		const check = () =>
+			spawnSync("bash", ["-e", "-c", steps[checkIndex]?.run ?? "exit 99"], {
+				cwd: directory,
+				env: { ...process.env, BINARY: name },
+				timeout: 5_000,
+				maxBuffer: 16_384,
+			}).status;
+		expect(check()).toBe(1);
+		await writeFile(join(platform, name), "binary");
+		expect(check()).toBe(1);
+		await writeFile(join(platform, `${name}.metadata.json`), "");
+		expect(check()).toBe(1);
+		await writeFile(join(platform, `${name}.metadata.json`), "metadata");
+		expect(check()).toBe(0);
+	});
 	test("artifact identity is attempt-scoped, and assembly does not overwrite flattened files", () => {
 		for (const job of Object.values(release.jobs))
 			for (const step of job.steps ?? []) {
@@ -206,7 +258,9 @@ describe("release workflow safety", () => {
 						`${expression("github.run_id")}-${expression("github.run_attempt")}`,
 					);
 					expect(step.with?.overwrite).toBeUndefined();
-					expect(step.with?.["if-no-files-found"]).toBe("error");
+					expect(step.with?.["if-no-files-found"]).toBe(
+						step.name === "Preserve partial publication receipts" ? "ignore" : "error",
+					);
 				}
 				if (step.uses?.startsWith("actions/download-artifact@"))
 					expect(step.with?.["merge-multiple"]).toBeUndefined();
@@ -216,7 +270,11 @@ describe("release workflow safety", () => {
 				(step) => step.name === "Verify original bundle or prepare read-only index repair",
 			)?.run,
 		).toContain("control.js restore");
-		expect(release.jobs.publish?.steps?.at(-1)?.run).toContain("control.js publish");
+		expect(
+			release.jobs.publish?.steps?.find(
+				(step) => step.name === "Publish verified release and index, or repair only the index",
+			)?.run,
+		).toContain("control.js publish");
 		expect(release.jobs.publish?.if).toContain("!cancelled()");
 		expect(release.jobs.gate?.if).toBe(expression("always()"));
 	});
@@ -293,4 +351,193 @@ test("matrix normalization refuses missing, foreign-attempt and symlink director
 		}
 		await expect(normalizeMatrixArtifacts(dir, "platform", plan)).rejects.toThrow();
 	}
+});
+
+function originalBuildPlan(single = false): CiReleasePlan {
+	return {
+		...plan,
+		buildSource: {
+			runId: 12,
+			runAttempt: 3,
+			workflowCommit: "a".repeat(40),
+			controlArtifact: { id: 200, digest: `sha256:${"b".repeat(64)}`, size: 1000 },
+			platforms: CI_RELEASE_TARGETS.slice(0, single ? 1 : undefined).map(({ target }, index) => ({
+				target,
+				artifact: { id: 201 + index, digest: `sha256:${"c".repeat(64)}`, size: 1000 },
+			})),
+		},
+	};
+}
+
+describe("original build native re-verification", () => {
+	test("selects one platform only for diagnostics and preserves the full default matrix", () => {
+		expect(releaseMatrix(originalBuildPlan(true)).include.map(({ target }) => target)).toEqual([
+			"linux-x64",
+		]);
+		expect(releaseMatrix(originalBuildPlan()).include).toEqual(releaseMatrix(plan).include);
+		const values = {
+			"build-run-id": "12",
+			"build-run-attempt": "3",
+			"smoke-target": "windows-x64",
+			publish: "false",
+		};
+		expect(validateBuildRecoveryArgs(values)).toEqual({
+			buildRunId: 12,
+			buildRunAttempt: 3,
+			smokeTarget: "windows-x64",
+		});
+		const invalidChanges: Record<string, string>[] = [
+			{ "build-run-attempt": "" },
+			{ "build-run-id": "" },
+			{ "build-run-attempt": "0" },
+			{ "build-run-id": "9007199254740992" },
+			{ "source-run-id": "34" },
+			{ "index-only": "true" },
+			{ "mirror-only": "true" },
+			{ "bridge-run-id": "34" },
+			{ "bridge-run-attempt": "1" },
+			{ publish: "true" },
+			{ "smoke-target": "windows-x86" },
+		];
+		for (const change of invalidChanges)
+			expect(() => validateBuildRecoveryArgs({ ...values, ...change })).toThrow();
+		expect(() => validateBuildRecoveryArgs({ "smoke-target": "windows-x64" })).toThrow();
+		expect(validateBuildRecoveryArgs({})).toEqual({
+			buildRunId: undefined,
+			buildRunAttempt: undefined,
+			smokeTarget: undefined,
+		});
+	});
+
+	test("restores original bytes without installing or compiling a product in the restore job", () => {
+		const job = release.jobs["restore-platform"];
+		expect(job?.if).toContain("build-reuse-mode == 'true'");
+		expect(job?.permissions).toEqual({ contents: "read", actions: "read" });
+		expect(job?.["runs-on"]).toBe("ubuntu-24.04");
+		expect(job?.strategy).toEqual({
+			"fail-fast": false,
+			matrix: expression("fromJSON(needs.preflight.outputs.matrix)"),
+		});
+		expect(JSON.stringify(job)).not.toMatch(/bun install|build-cross-platform|bun run build/);
+		expect(
+			job?.steps?.find(({ name }) => name === "Restore exact original platform bytes")?.run,
+		).toContain("control.js restore-platform");
+		for (const name of ["verify", "build"])
+			expect(release.jobs[name]?.if).toContain("build-reuse-mode == 'false'");
+		for (const name of ["smoke", "assemble", "publish"])
+			expect(release.jobs[name]?.if).toContain("needs.restore-platform.result == 'success'");
+		for (const name of ["assemble", "publish"])
+			expect(release.jobs[name]?.if).toContain("smoke-only == 'false'");
+		expect(release.jobs.gate?.needs).toContain("restore-platform");
+	});
+
+	for (const diagnostic of [false, true])
+		for (const publish of diagnostic ? [false] : [false, true])
+			test(`requires restore and native evidence without source CI or rebuilding (${diagnostic}, ${publish})`, () => {
+				const env = {
+					...gateEnv(false, publish),
+					BUILD_REUSE_MODE: "true",
+					SMOKE_ONLY: String(diagnostic),
+					RESTORE_PLATFORMS_RESULT: "success",
+					VERIFY_RESULT: "skipped",
+					BUILD_RESULT: "skipped",
+					ASSEMBLE_RESULT: diagnostic ? "skipped" : "success",
+				};
+				expect(() => assertReleaseGate(env)).not.toThrow();
+				for (const key of Object.keys(env).filter((key) => key.endsWith("_RESULT")))
+					for (const value of [undefined, "", "success", "skipped", "cancelled", "failure"])
+						if (value !== env[key as keyof typeof env])
+							expect(() => assertReleaseGate({ ...env, [key]: value })).toThrow();
+				for (const key of ["BUILD_REUSE_MODE", "SMOKE_ONLY"])
+					for (const value of [undefined, "", "yes"])
+						expect(() => assertReleaseGate({ ...env, [key]: value })).toThrow();
+				if (diagnostic)
+					expect(() => assertReleaseGate({ ...env, PUBLISH_REQUESTED: "true" })).toThrow(
+						"gate mode",
+					);
+				expect(() => assertReleaseGate({ ...env, RESTORE_MODE: "true" })).toThrow("gate mode");
+			});
+});
+
+type ReleaseJobContext = { result: string; outputs: Record<string, string> };
+function eligibleJob(
+	name: string,
+	needs: Record<string, ReleaseJobContext>,
+	publish: boolean,
+	cancelled = false,
+): boolean {
+	const job = release.jobs[name];
+	if (!job?.if) throw new Error(`Missing explicit release condition: ${name}`);
+	// GitHub implicitly requires successful dependencies unless a status function is present.
+	if (
+		!job.if.includes("always()") &&
+		(cancelled || (job.needs ?? []).some((dependency) => needs[dependency]?.result !== "success"))
+	)
+		return false;
+	const expression = job.if
+		.trim()
+		.slice(3, -2)
+		.replace(/needs\.([a-z-]+)\.outputs\.([a-z-]+)/g, 'needs["$1"].outputs["$2"]')
+		.replace(/needs\.([a-z-]+)\.result/g, 'needs["$1"].result');
+	// Only checked-in boolean job expressions are evaluated, in a bounded sandbox with no I/O.
+	return Boolean(
+		runInNewContext(
+			expression,
+			{ needs, inputs: { publish }, always: () => true, cancelled: () => cancelled },
+			{ timeout: 100 },
+		),
+	);
+}
+
+describe("release dependency graph conditions execute against each recovery mode", () => {
+	function context(mode: "fresh" | "single" | "all" | "bundle") {
+		const reuse = mode === "single" || mode === "all";
+		const needs: Record<string, ReleaseJobContext> = {
+			preflight: {
+				result: "success",
+				outputs: {
+					"restore-mode": String(mode === "bundle"),
+					"build-reuse-mode": String(reuse),
+					"smoke-only": String(mode === "single"),
+				},
+			},
+		};
+		for (const [name, result] of Object.entries({
+			verify: mode === "fresh" ? "success" : "skipped",
+			build: mode === "fresh" ? "success" : "skipped",
+			"restore-platform": reuse ? "success" : "skipped",
+			smoke: mode === "bundle" ? "skipped" : "success",
+			assemble: mode === "fresh" || mode === "all" ? "success" : "skipped",
+			restore: mode === "bundle" ? "success" : "skipped",
+			publish: "skipped",
+		}))
+			needs[name] = { result, outputs: {} };
+		return needs;
+	}
+	for (const mode of ["fresh", "single", "all", "bundle"] as const)
+		test(`skipped job propagation and publisher eligibility are correct for ${mode}`, () => {
+			const needs = context(mode);
+			expect(eligibleJob("verify", needs, false)).toBe(mode === "fresh");
+			expect(eligibleJob("build", needs, false)).toBe(mode === "fresh");
+			expect(eligibleJob("restore-platform", needs, false)).toBe(
+				mode === "single" || mode === "all",
+			);
+			expect(eligibleJob("smoke", needs, false)).toBe(mode !== "bundle");
+			expect(eligibleJob("assemble", needs, false)).toBe(mode === "fresh" || mode === "all");
+			expect(eligibleJob("restore", needs, false)).toBe(mode === "bundle");
+			expect(eligibleJob("publish", needs, false)).toBe(false);
+			expect(eligibleJob("publish", needs, true)).toBe(mode !== "single");
+			expect(eligibleJob("publish", needs, true, true)).toBe(false);
+			for (const result of ["failure", "cancelled", "skipped"])
+				for (const dependency of mode === "fresh"
+					? ["preflight", "verify", "build", "smoke", "assemble"]
+					: mode === "all"
+						? ["preflight", "restore-platform", "smoke", "assemble"]
+						: mode === "bundle"
+							? ["preflight", "restore"]
+							: ["preflight", "restore-platform", "smoke"]) {
+					const failed = { ...needs, [dependency]: { ...needs[dependency], result } };
+					expect(eligibleJob("publish", failed, true)).toBe(false);
+				}
+		});
 });

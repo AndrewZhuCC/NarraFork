@@ -218,6 +218,14 @@ describe("agentLoop provider invalidState classification", () => {
 			message: "I cannot assist with that request",
 			diagnostics: { statusCode: 503 },
 		});
+		const end = events.find((event) => event.type === "api_request_end");
+		const terminal = events.at(-1);
+		if (!end || terminal?.type !== "invalid_state") throw new Error("missing error events");
+		expect(terminal.diagnostics).toBe(end.diagnostics);
+		expect(terminal.diagnostics?.recordingRequestId).toBe(end.requestId);
+		if (!end.diagnostics) throw new Error("missing diagnostics");
+		end.diagnostics.apiRequestId = "refusal-durable-row";
+		expect(terminal.diagnostics?.apiRequestId).toBe("refusal-durable-row");
 	});
 
 	test("max_tokens 含部分文本时保留截断终态并继续消费 usage", async () => {

@@ -48,12 +48,20 @@ scripts/lib/*
 # Release CI control, immutable bundles, strict native inputs and native smoke.
 !scripts/ci-release.ts
 !scripts/smoke-release-binary.ts
+# Explicit 123 distribution operators; old server receives patches/metadata only.
+!scripts/publish-123-distribution.ts
+!scripts/import-123-patches.py
+!scripts/restore-123-originals.ts
 !scripts/lib/ci-release-*.ts
 !scripts/lib/ci-build-*.ts
 !scripts/lib/github-release-baseline.ts
 !scripts/lib/github-release-summary.ts
 !scripts/lib/build-repository.ts
 !scripts/lib/update-index*.ts
+# Protected CI update-server bridge and immutable mirror restoration.
+!scripts/lib/update-server-bridge-*.ts
+!scripts/lib/update-server-*-mirror.ts
+!scripts/lib/ci-update-server-bridge-*.ts
 .ci-release/
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.
@@ -67,6 +75,13 @@ scripts/lib/*
 !scripts/prepare-ripgrep-helpers.ts
 !scripts/build-zstd-static.sh
 !scripts/lib/helper-assets.ts
+!scripts/prepare-helper-assets.ts
+!scripts/release-helpers.ts
+!scripts/lib/helper-build.ts
+!scripts/lib/helper-artifact.ts
+!scripts/lib/helper-release.ts
+!scripts/lib/helper-release-control.ts
+.helper-release/
 !scripts/lib/zstd-windows-arm64.ts
 !scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/
@@ -103,6 +118,12 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts
 !scripts/lib/__tests__/generate-sqlite-migrations.test.ts
+# Generated model-history trigger contracts and their migration fixtures must ship with the generators.
+!scripts/lib/generated-model-history-triggers.ts
+!scripts/lib/__tests__/model-history-migration-fixture.ts
+!scripts/lib/__tests__/model-history-trigger-generators.test.ts
+# Full application loading/layout smoke is referenced by the browser regression tests.
+!scripts/smoke-narrator-loading.ts
 !scripts/lib/sqlite-generation-lock.ts
 !scripts/lib/__tests__/sqlite-generation-lock.test.ts
 !scripts/lib/__tests__/generate-postgres-schema.test.ts
@@ -112,6 +133,10 @@ drizzle-postgres/meta/_generation_pending.json
 # tests/scripts/test-database-regression.test.ts. Its `artifacts/` reports are separate.
 !scripts/test-database-regression.ts
 !scripts/validate-plugin-release.ts
+# Required inputs for the plugin platform acceptance workflow.
+!scripts/drill-plugin-rollback.ts
+!scripts/smoke-plugin-ui.ts
+!scripts/smoke-narrator-dock.ts
 # Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
 # `bun test` fails on a missing module in a fresh clone.
 !scripts/build-plugin.ts

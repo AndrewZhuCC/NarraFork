@@ -7,6 +7,12 @@ import {
 	finalizeResourceMigration,
 	type ResourceMigrationSnapshot,
 } from "./finalize-sqlite-resource-migration";
+import {
+	appendGeneratedModelHistoryTriggers,
+	generatedModelHistoryTriggerSuffix,
+	MODEL_HISTORY_REVISION_CONTRACT,
+	renderModelHistoryRevisionSql,
+} from "./lib/generated-model-history-triggers";
 import { acquireSqliteGenerationLock } from "./lib/sqlite-generation-lock";
 
 interface Entry {
@@ -29,6 +35,7 @@ interface Pending {
 	phase: "started" | "generated" | "validated";
 	args: string[];
 	schemaDigest: string;
+	modelHistoryTriggers: { contract: string; sqlDigest: string };
 	baseline: Journal;
 	baselineSnapshotDigest: string;
 	baselineSqlDigest: string;
@@ -121,6 +128,10 @@ async function generateLocked(
 	const sqlPath = (tag: string) => resolve(folder, `${tag}.sql`);
 	const save = (state: Pending) => writeFileSync(pendingPath, JSON.stringify(state));
 	const schemaDigest = digest(readBounded(schemaPath, 1024 * 1024));
+	const modelHistoryTriggers = {
+		contract: MODEL_HISTORY_REVISION_CONTRACT,
+		sqlDigest: digest(renderModelHistoryRevisionSql("sqlite")),
+	};
 	let pending: Pending;
 	if (existsSync(pendingPath)) {
 		pending = JSON.parse(readBounded(pendingPath, 2 * 1024 * 1024)) as Pending;
@@ -130,6 +141,8 @@ async function generateLocked(
 			typeof pending.baselineSqlDigests !== "object" ||
 			!["started", "generated", "validated"].includes(pending.phase) ||
 			pending.schemaDigest !== schemaDigest ||
+			pending.modelHistoryTriggers?.contract !== modelHistoryTriggers.contract ||
+			pending.modelHistoryTriggers?.sqlDigest !== modelHistoryTriggers.sqlDigest ||
 			JSON.stringify(pending.args) !== JSON.stringify(args)
 		)
 			throw new Error("Pending generation source/arguments changed; refusing history rewrite");
@@ -151,6 +164,7 @@ async function generateLocked(
 			phase: "started",
 			args: [...args],
 			schemaDigest,
+			modelHistoryTriggers,
 			baseline,
 			baselineSqlDigests,
 			baselineSnapshotDigest: digest(readBounded(snapshotPath(latest.idx), 8 * 1024 * 1024)),
@@ -262,10 +276,13 @@ async function generateLocked(
 			!(pending.phase === "validated" && identity.rawDigest === pending.finalDigest))
 	)
 		throw new Error("Pending generated SQL/snapshot digest changed; refusing history rewrite");
+	const before = snapshot(baselineLast.idx);
+	const after = snapshot(latest.idx);
+	const triggerSuffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
 	const finalized = (options.finalize ?? finalizeResourceMigration)(
-		original,
-		snapshot(baselineLast.idx),
-		snapshot(latest.idx),
+		appendGeneratedModelHistoryTriggers(original, triggerSuffix),
+		before,
+		after,
 	);
 	const finalDigest = digest(finalized);
 	if (pending.phase === "validated" && pending.finalDigest !== finalDigest)
@@ -295,6 +312,7 @@ async function generateLocked(
 		receiptPath,
 		JSON.stringify({
 			tag: latest.tag,
+			modelHistoryTriggers,
 			sqlDigest: finalDigest,
 			snapshotDigest: expected.snapshotDigest,
 			journalDigest: expected.journalDigest,

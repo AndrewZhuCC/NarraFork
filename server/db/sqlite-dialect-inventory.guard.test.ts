@@ -468,7 +468,19 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
-	"server/db/run-migrations.ts": ["driver", "pragma", "pragmaFn", "sqliteCatalog", "insertOr"],
+	"server/db/run-migrations.ts": [
+		"driver",
+		"pragma",
+		"pragmaFn",
+		"sqliteCatalog",
+		"insertOr",
+		// Bound the migration proof to the published trigger namespace; other triggers remain valid.
+		"glob",
+		// The `user_git_identities` backfill generates ids inside its INSERT…SELECT, the same
+		// way `narrator-service.ts` does for forked transcripts, rather than round-tripping
+		// every user row through JS during startup.
+		"blobFn",
+	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.
@@ -482,6 +494,14 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/routes/storage.ts": ["vacuum"],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
+	// History/display ports also have PG implementations. Register the SQLite branches
+	// and Database types without claiming these main-database modules are SQLite-only.
+	"server/services/agent-runtime/model-history-revision.ts": ["driver", "sqliteCatalog"],
+	"server/services/agent-runtime/model-history-source.ts": ["driver"],
+	"server/services/agent-runtime/model-history-query.ts": ["driver"],
+	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
+	"server/services/narrator-display-page-reader.ts": ["driver"],
+	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
@@ -514,7 +534,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
-	"server/services/narrator-messages.ts": ["json1", "glob"],
+	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
+	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "json1"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-scoped-revert.ts": ["json1"],

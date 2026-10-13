@@ -12,6 +12,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
+import {
+	MODEL_HISTORY_REVISION_CONTRACT,
+	renderModelHistoryRevisionSql,
+} from "../services/agent-runtime/model-history-revision-sql";
 
 const FILESYSTEM_MIGRATIONS_FOLDER = "./drizzle";
 
@@ -694,6 +698,96 @@ function isRetiredIndexCreateError(
 	});
 }
 
+// Only outer whitespace and SQLite's omitted final semicolon are interchangeable. In
+// particular, never normalize whitespace/case inside a trigger body or a SQL literal.
+function normalizeModelHistorySql(sql: string): string {
+	return sql.trim().replace(/;$/, "").trimEnd();
+}
+
+// The official SQLite v1 schema prelude, followed by the generator's pure trigger SQL.
+// A filename, timestamp, marker or trigger count alone cannot establish this milestone.
+const MODEL_HISTORY_MIGRATION_SQL = [
+	"PRAGMA foreign_keys=OFF;",
+	"CREATE TABLE `model_history_revision_contracts` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`installed_version` text NOT NULL\n);",
+	"ALTER TABLE `narrator_messages` ADD `body_revision` integer DEFAULT 0 NOT NULL;",
+	"ALTER TABLE `narrator_tool_calls` ADD `model_revision` integer DEFAULT 0 NOT NULL;",
+	"ALTER TABLE `narrators` ADD `model_history_revision` integer DEFAULT 0 NOT NULL;",
+	"PRAGMA foreign_keys=ON;",
+	...renderModelHistoryRevisionSql("sqlite").split("--> statement-breakpoint"),
+].map(normalizeModelHistorySql);
+const MODEL_HISTORY_TRIGGERS = MODEL_HISTORY_MIGRATION_SQL.slice(6, -1).map((sql) => {
+	const match = /^CREATE TRIGGER (\w+) (?:BEFORE|AFTER) (?:INSERT|UPDATE|DELETE) ON (\w+)\b/.exec(
+		sql,
+	);
+	if (!match) throw new Error("Invalid canonical model-history SQLite trigger");
+	return { name: match[1], table: match[2], sql };
+});
+
+function isOfficialModelHistoryMigration(statements: readonly string[]): boolean {
+	return (
+		statements.length === MODEL_HISTORY_MIGRATION_SQL.length &&
+		statements.every(
+			(statement, index) =>
+				normalizeModelHistorySql(statement) === MODEL_HISTORY_MIGRATION_SQL[index],
+		)
+	);
+}
+
+/** Bounded catalog proof only; this never installs or repairs live DDL. */
+function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
+	const catalogSql = sqlite.prepare(
+		"SELECT sql FROM sqlite_schema WHERE type = ? AND name = ? AND tbl_name = ? AND length(sql) <= ? LIMIT 1",
+	);
+	const matchesCatalogSql = (type: string, name: string, table: string, expected: string) => {
+		const row = catalogSql.get(type, name, table, expected.length + 1) as { sql: string } | null;
+		return row !== null && normalizeModelHistorySql(row.sql) === expected;
+	};
+	if (
+		!matchesCatalogSql(
+			"table",
+			"model_history_revision_contracts",
+			"model_history_revision_contracts",
+			MODEL_HISTORY_MIGRATION_SQL[1],
+		)
+	) {
+		return false;
+	}
+	const columnShape = sqlite.prepare(
+		`SELECT 1 FROM pragma_table_xinfo(?) WHERE name = ? AND type = ?
+		 AND "notnull" = 1 AND dflt_value IS ? AND pk = ? AND hidden = 0 LIMIT 1`,
+	);
+	for (const [table, column, type, defaultSql, primaryKey] of [
+		["model_history_revision_contracts", "id", "TEXT", null, 1],
+		["model_history_revision_contracts", "installed_version", "TEXT", null, 0],
+		["narrator_messages", "body_revision", "INTEGER", "0", 0],
+		["narrator_tool_calls", "model_revision", "INTEGER", "0", 0],
+		["narrators", "model_history_revision", "INTEGER", "0", 0],
+	] as const) {
+		if (!columnShape.get(table, column, type, defaultSql, primaryKey)) return false;
+	}
+	if (
+		!sqlite
+			.prepare(
+				"SELECT 1 FROM model_history_revision_contracts WHERE id = 'model-history' AND installed_version = ? LIMIT 1",
+			)
+			.get(MODEL_HISTORY_REVISION_CONTRACT)
+	) {
+		return false;
+	}
+	for (const trigger of MODEL_HISTORY_TRIGGERS) {
+		if (!matchesCatalogSql("trigger", trigger.name, trigger.table, trigger.sql)) return false;
+	}
+	// Other business triggers are unrelated, but an unknown v1-contract trigger is not.
+	return (
+		sqlite
+			.prepare(
+				`SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'model_history_v1_*'
+				 AND name NOT IN (${MODEL_HISTORY_TRIGGERS.map(() => "?").join(",")}) LIMIT 1`,
+			)
+			.get(...MODEL_HISTORY_TRIGGERS.map((trigger) => trigger.name)) === null
+	);
+}
+
 /**
  * Apply pending migrations by hash-membership instead of Drizzle's `MAX(created_at)`
  * high-water mark. This replaces `migrate()` on the main path because the built-in SQLite
@@ -705,9 +799,10 @@ function isRetiredIndexCreateError(
  *
  * Behavior:
  * - A migration whose hash is already recorded is skipped (idempotent no-op).
- * - A destructive migration (drops a real table) whose target table already exists is treated
- *   as "already effective but unstamped": its SQL is NOT re-run, only its hash is recorded.
- *   This protects live data on a dirty database from a needless DROP/rebuild.
+ * - A destructive migration in a hole below the applied journal high-water mark, whose
+ *   dropped tables all exist, is "already effective but unstamped": only record its hash.
+ * - The exact official model-history v1 migration, proven fully installed in this transaction,
+ *   also establishes an in-memory high-water mark and is stamped without replaying its SQL.
  * - Every other pending migration is executed statement-by-statement, tolerating
  *   "already exists"/"duplicate column" (safe re-create) and a `DROP TABLE` of a table this
  *   database never had. "no such table" from any other statement is fatal.
@@ -767,6 +862,17 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	let stampedWithoutRun = 0;
 	try {
 		const apply = sqlite.transaction(() => {
+			// Source-built databases can have a fully installed v1 contract but no matching
+			// journal hashes. Prove that exact supplied migration in this transaction before
+			// treating preceding destructive migrations as holes. No ledger row is pre-written.
+			const modelHistoryCandidate = pending.find(({ migration }) =>
+				isOfficialModelHistoryMigration(migration.sql),
+			);
+			const installedModelHistoryIndex =
+				modelHistoryCandidate && isModelHistoryRevisionInstalled(sqlite)
+					? modelHistoryCandidate.index
+					: -1;
+			const effectiveLastAppliedIndex = Math.max(lastAppliedIndex, installedModelHistoryIndex);
 			for (const { migration, index } of pending) {
 				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
 				const droppedTables = migrationDropsRealTables(statements);
@@ -777,13 +883,23 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 				// migration at or above the high-water mark is a normal forward step and must run
 				// (e.g. a fresh database applying the whole journal, where the target table was
 				// created by an earlier migration in the very same run).
-				const isUnstampedHole = index < lastAppliedIndex;
+				const isUnstampedHole = index < effectiveLastAppliedIndex;
 				const alreadyEffective =
 					isDestructive &&
 					isUnstampedHole &&
 					droppedTables.every((table) => tableExists(sqlite, table));
 
-				if (alreadyEffective) {
+				if (index === installedModelHistoryIndex) {
+					// Earlier pending SQL must not invalidate the proof. Both this check and
+					// the stamp share the apply transaction, including any later failure.
+					if (!isModelHistoryRevisionInstalled(sqlite)) {
+						throw new Error("Installed model-history migration proof changed during replay");
+					}
+					stampedWithoutRun++;
+					logger.warn("Stamping exactly proven installed model-history migration", {
+						folderMillis: migration.folderMillis,
+					});
+				} else if (alreadyEffective) {
 					// The rebuild already happened on a prior run; the hash just never got stamped.
 					// Re-running the DROP/rebuild would risk live data, so only record the hash.
 					stampedWithoutRun++;
@@ -1570,6 +1686,7 @@ export async function runMigrations(sqlite: Database): Promise<{
 		"inherit_project_gate",
 	);
 	const hadAclGrantsTable = tableExists(sqlite, "acl_grants");
+	const hadUserGitIdentitiesTable = tableExists(sqlite, "user_git_identities");
 
 	const resolved = await resolveMigrationsFolder();
 	try {
@@ -1604,6 +1721,9 @@ export async function runMigrations(sqlite: Database): Promise<{
 		backfillSubagentAclRoot(sqlite);
 		if (!hadAclGrantsTable) {
 			migrateGrantsToUnifiedAcl(sqlite);
+		}
+		if (!hadUserGitIdentitiesTable) {
+			backfillUserGitIdentities(sqlite);
 		}
 		return { source: resolved.source, folder: resolved.folder };
 	} finally {
@@ -2012,6 +2132,41 @@ function migrateGrantsToUnifiedAcl(sqlite: Database): void {
 		// the legacy tables authoritative, and the domain layers still read them until
 		// their own cut-over step. Logged loudly because it needs attention.
 		logger.error("unified ACL grant migration failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * Move the legacy single git identity (`users.git_username`/`git_email`) into the
+ * multi-identity table, as each user's first and therefore default identity.
+ *
+ * Runs only on the upgrade that introduces `user_git_identities` (gated on the
+ * pre-migration snapshot), and is idempotent besides: the `NOT EXISTS` guard
+ * means a user who already has an identity keeps it, so a second run cannot
+ * duplicate or overwrite anything. The legacy columns stay put — they are simply
+ * no longer read as an identity source — which keeps this additive.
+ */
+function backfillUserGitIdentities(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare(
+				`INSERT INTO user_git_identities (id, user_id, name, email, is_default, created_at)
+				 SELECT lower(hex(randomblob(16))), u.id, trim(u.git_username), trim(u.git_email), 1, ?
+				 FROM users u
+				 WHERE u.git_username IS NOT NULL AND trim(u.git_username) <> ''
+				   AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
+				   AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
+				   AND instr(u.git_email, '<') = 0 AND instr(u.git_email, '>') = 0
+				   AND NOT EXISTS (SELECT 1 FROM user_git_identities i WHERE i.user_id = u.id)`,
+			)
+			.run(new Date().toISOString());
+		if (result.changes > 0) {
+			logger.info("Backfilled git identities from the legacy profile columns", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("git identity backfill failed (non-fatal)", { error: String(err) });
 	}
 }
 

@@ -737,7 +737,13 @@ export interface NarraForkSettings {
 		reasoningEffortBlocklist?: Array<{ pattern: string; enabled?: boolean }>;
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
-		/** Persist raw request/response dumps for each provider call into usage history. */
+		/** Enable bounded circular recording; settings are read live for each request. */
+		requestDumpRecordingEnabled: boolean;
+		/** Circular request-side capacity in bytes. 0 disables circular capture on this side, not continuous retention. */
+		requestDumpRequestBytes: number;
+		/** Circular response-side capacity in bytes. 0 disables circular capture on this side, not continuous retention. */
+		requestDumpResponseBytes: number;
+		/** Force continuous retention of raw provider request/response dumps. */
 		requestDumpEnabled: boolean;
 		/** When request dumps are enabled, only persist raw dumps for failed provider calls. */
 		requestDumpErrorsOnly: boolean;
@@ -1004,6 +1010,8 @@ export interface NarraForkSettings {
 	mcpServers?: McpServerConfig[];
 	/** Update source and download configuration. */
 	update?: {
+		/** Updates, release notes and helper downloads. Absent/default inherits the global proxy. */
+		proxy?: ProxyOverride;
 		/** Update source. Optional for legacy settings and mocks; defaults to GitHub. */
 		source?: "github" | "update-server";
 		/** GitHub repository slug (owner/repo), not a URL. */

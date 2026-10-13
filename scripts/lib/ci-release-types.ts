@@ -80,6 +80,19 @@ export interface CiReleaseBaseline {
 	metadataSha256: string;
 	metadata: BinaryMetadata;
 }
+export interface CiReleaseArtifactIdentity {
+	id: number;
+	digest: string;
+	size: number;
+}
+/** Original build inputs; never a chain of re-verification runs. */
+export interface CiReleaseBuildSource {
+	runId: number;
+	runAttempt: number;
+	workflowCommit: string;
+	controlArtifact: CiReleaseArtifactIdentity;
+	platforms: { target: CiReleaseTarget; artifact: CiReleaseArtifactIdentity }[];
+}
 export interface CiReleasePlan {
 	schemaVersion: 1;
 	repository: string;
@@ -95,6 +108,8 @@ export interface CiReleasePlan {
 	runId: number;
 	runAttempt: number;
 	baselines: CiReleaseBaseline[];
+	/** Present only for native re-verification of byte-identical original builds. */
+	buildSource?: CiReleaseBuildSource;
 }
 export interface CiReleaseSmokeResult {
 	schemaVersion: 1;
@@ -126,4 +141,6 @@ export interface CiReleaseManifest {
 	plan: CiReleasePlan;
 	files: CiReleaseFile[];
 	smoke: CiReleaseSmokeResult[];
+	/** Optional for legacy bundles; exactly matches all eight sidecars when declared. */
+	helperDistribution?: BinaryMetadata["helperDistribution"];
 }

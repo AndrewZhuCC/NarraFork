@@ -72,6 +72,8 @@ import {
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
 import { pluginManager } from "./services/plugin-manager";
+import { pluginPlatformServices } from "./services/plugin-platform-services";
+import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
 	activatePostgresRuntimeQueue,
@@ -117,7 +119,6 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
@@ -152,9 +153,15 @@ import {
 
 // Builtin/compatible-API providers are resolved first. Only an unregistered plugin
 // prefix may decline here; preserve registered providers' actual failure reasons.
-const unregisterExternalProviderResolver = registerExternalProviderResolver((provider, model) =>
-	pluginProviderRegistry.resolveExternalProvider(provider, model),
-);
+const unregisterExternalProviderResolver = registerExternalProviderResolver({
+	resolve: (provider, model) => pluginProviderRegistry.resolveExternalProvider(provider, model),
+	listReadiness: (signal) =>
+		listPluginProviderReadiness(
+			pluginProviderRegistry,
+			pluginPlatformServices.providerConfigService,
+			signal,
+		),
+});
 
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
@@ -1619,9 +1626,6 @@ dissolveOrphanWorkspaces()
 	.catch((err) => {
 		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
 	});
-
-// Register project DB backup sync (event-driven dual-write)
-registerProjectDbSync();
 
 // Register review event handler (inject feedback into source narrator on conclude)
 initReviewEventHandler();

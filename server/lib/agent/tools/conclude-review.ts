@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
 import { chapters, reviewConclusions } from "../../../db/schema";
@@ -124,17 +124,33 @@ export const concludeReviewTool: ToolDefinition = {
 			};
 		}
 
-		const now = new Date().toISOString();
-
-		// Appended, not overwritten: `review_conclusions` is read newest-first, so a new
-		// row IS the current conclusion while the superseded one stays auditable.
-		await db.insert(reviewConclusions).values({
-			id: generateId(),
-			reviewChapterId: ctx.chapterId,
-			sourceChapterId: chapter.reviewSourceChapterId,
-			verdict,
-			findingsJson: findings,
-			createdAt: now,
+		const reviewChapterId = ctx.chapterId;
+		const sourceChapterId = chapter.reviewSourceChapterId;
+		// Readers order by createdAt. Two submissions in one millisecond must still
+		// produce a strictly newer row, including conclusions from another review
+		// of this source. Keep the indexed LIMIT 1 read and insert atomic and synchronous.
+		db.transaction((tx) => {
+			const previous = tx
+				.select({ createdAt: reviewConclusions.createdAt })
+				.from(reviewConclusions)
+				.where(eq(reviewConclusions.sourceChapterId, sourceChapterId))
+				.orderBy(desc(reviewConclusions.createdAt))
+				.limit(1)
+				.get();
+			const previousTime = previous ? Date.parse(previous.createdAt) : Number.NEGATIVE_INFINITY;
+			if (previous && !Number.isFinite(previousTime))
+				throw new Error("Previous review conclusion has an invalid timestamp");
+			const now = new Date(Math.max(Date.now(), previousTime + 1)).toISOString();
+			tx.insert(reviewConclusions)
+				.values({
+					id: generateId(),
+					reviewChapterId,
+					sourceChapterId,
+					verdict,
+					findingsJson: findings,
+					createdAt: now,
+				})
+				.run();
 		});
 
 		// Import lazily to avoid a startup cycle through narrator-session -> agent index.
