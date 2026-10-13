@@ -386,58 +386,108 @@ export interface EventHandlerContext {
  * A persistence barrier failed: the event cannot be recovered without operator
  * attention, so the loop stops rather than continuing past a broken checkpoint.
  *
- * The underlying cause is folded into `message` here, not left only on
- * `Error.cause`. Everything downstream — the narrator's `errorMessage`, the
- * WebSocket `narrator_error`, and the `narrator_error` emitted on the narrator
- * event stream — surfaces `String(err)`, and `String()` renders `message` only,
- * so a cause parked on `options.cause` never reaches the reader who has to act
- * on it. Duplicating it into the message is what makes "Tool result could not be
- * persisted" actionable instead of a dead end.
+ * The underlying cause is folded into `message`. Downstream — the narrator's
+ * `errorMessage`, the WebSocket `narrator_error`, and the narrator event stream —
+ * surfaces `String(err)`, and `String()` renders `message` only.
  *
- * This class is thrown BY the executor that consumes the agent loop (see
- * `narrator-executor`), so it never becomes one of the loop's own
- * `yield { type: "error" }` events — those carry provider/API failures.
- */
-/**
- * Cap on the cause text folded into the message.
+ * Drizzle's wrapper is the wrong text to fold. Its `message` is
+ * `Failed query: <SQL>\nparams: [...]`, and the driver error (`SQLITE_BUSY`, a
+ * constraint name) sits on `.cause`. Publishing the query leaks the statement
+ * and still hides the diagnosis, so a wrapper of that shape is skipped.
  *
- * The folded message is published: it lands in the narrator's `errorMessage`
- * column (an unbounded `text` with no clamp on the write path) and goes out over
- * the WebSocket. A PostgreSQL driver failure is rendered by drizzle as
- * `Failed query: <full SQL>\nparams: [...]`, so an uncapped fold would put
- * complete statements and their parameter values in front of every reader.
- * 1 KiB keeps the diagnosis actionable while cutting that off; same order of
- * magnitude as `EXPORT_TOOL_ERROR_LIMIT` in `narrator-export`.
+ * The final message, not only the appended cause, is capped. A caller that
+ * already interpolated `String(err)` into `message` would otherwise keep the
+ * full statement: the cap never rewrites text it did not append. Dedup is exact
+ * equality. `includes` would drop a short cause that merely occurs inside the
+ * summary ("failed" inside "barrier failed").
+ *
+ * Thrown by the executor that consumes the agent loop (`narrator-executor`), so
+ * it never becomes one of the loop's own `yield { type: "error" }` events.
  */
-const MAX_CAUSE_CHARS = 1_000;
+const MAX_PUBLISHED_ERROR_CHARS = 1_000;
 
-/** Render an arbitrary cause as text, never throwing on hostile input. */
-function causeToText(cause: unknown): string {
-	if (cause instanceof Error) return cause.message;
-	if (typeof cause === "string") return cause;
-	if (cause == null) return "";
+/** Drizzle puts the statement and its parameters in `Error.message`. */
+function isDrizzleQueryDump(message: string): boolean {
+	return message.startsWith("Failed query:");
+}
+
+/** Render an arbitrary value as text, never throwing on hostile input. */
+function safeErrorText(value: unknown): string {
+	if (value instanceof Error) return value.message;
+	if (typeof value === "string") return value;
+	if (value == null) return "";
 	// `String()` throws on a null-prototype object ("No default value"). This runs
 	// inside a catch block, so letting it throw would replace the persistence
 	// diagnosis with a TypeError and hide the real failure.
 	try {
-		return String(cause);
+		return String(value);
 	} catch {
 		return "";
 	}
 }
 
+/**
+ * The cause text a reader can act on.
+ *
+ * Walks past Drizzle query wrappers to the nested driver error. A dump with no
+ * nested cause is the only text available, so it is kept and capped later.
+ */
+function persistenceCauseText(cause: unknown): string {
+	const seen = new Set<unknown>();
+	let current: unknown = cause;
+	while (current instanceof Error && !seen.has(current)) {
+		seen.add(current);
+		if (isDrizzleQueryDump(current.message) && current.cause != null) {
+			current = current.cause;
+			continue;
+		}
+		break;
+	}
+	return safeErrorText(current);
+}
+
+/**
+ * Drop a query dump a caller already interpolated into the summary.
+ *
+ * `String(new DrizzleQueryError(...))` is `Error: Failed query: ...`. Keeping
+ * that prefix and appending the driver error would still publish the statement,
+ * and a front-weighted cap would cut the driver error off the end.
+ */
+function withoutEmbeddedQueryDump(message: string): string {
+	const dumpAt = message.indexOf("Failed query:");
+	if (dumpAt < 0) return message;
+	let prefix = message.slice(0, dumpAt).trimEnd();
+	prefix = prefix.replace(/(?::\s*)?Error:\s*$/, "");
+	prefix = prefix.replace(/[:\s]+$/, "");
+	return prefix.length > 0 ? prefix : "Persistence failed";
+}
+
+/** Bound the string that is stored and broadcast. The marker fits inside the cap. */
+function capPublished(text: string): string {
+	if (text.length <= MAX_PUBLISHED_ERROR_CHARS) return text;
+	let head = MAX_PUBLISHED_ERROR_CHARS;
+	let suffix = "";
+	for (let pass = 0; pass < 4; pass++) {
+		const omitted = text.length - head;
+		suffix = `…(truncated ${omitted} chars)`;
+		const nextHead = Math.max(0, MAX_PUBLISHED_ERROR_CHARS - suffix.length);
+		if (nextHead === head) break;
+		head = nextHead;
+	}
+	return `${text.slice(0, head)}${suffix}`;
+}
+
 export class CriticalEventPersistenceError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
-		let causeText = causeToText(options?.cause);
-		if (causeText.length > MAX_CAUSE_CHARS) {
-			causeText = `${causeText.slice(0, MAX_CAUSE_CHARS)}…(truncated ${
-				causeText.length - MAX_CAUSE_CHARS
-			} chars)`;
-		}
-		// Only append when it adds something: a cause may be an empty string, and
-		// repeating the message verbatim reads as noise.
-		const detail = causeText && !message.includes(causeText) ? `: ${causeText}` : "";
-		super(detail ? `${message}${detail}` : message, options);
+		const detail = persistenceCauseText(options?.cause);
+		const summary =
+			detail && !isDrizzleQueryDump(detail) && message.includes("Failed query:")
+				? withoutEmbeddedQueryDump(message)
+				: message;
+		// Exact equality only. A short cause that occurs inside the summary is
+		// still a distinct diagnosis and must be kept.
+		const folded = detail && detail !== summary ? `${summary}: ${detail}` : summary;
+		super(capPublished(folded), options);
 		this.name = "CriticalEventPersistenceError";
 	}
 }
@@ -2377,7 +2427,20 @@ export async function processEvent(
 							error: String(cleanupError),
 						});
 					}
-					const message = `Failed to atomically commit EnterPlanMode: ${String(commitError)}`;
+					// Server logs keep the wrapper. The stored and broadcast text is the
+					// capped driver error: interpolating String(commitError) here would
+					// put the full statement in the tool row before the constructor
+					// could strip it.
+					logger.error("EnterPlanMode atomic commit failed", {
+						narratorId,
+						toolUseId: event.toolUseId,
+						error: String(commitError),
+					});
+					const failure = new CriticalEventPersistenceError(
+						"Failed to atomically commit EnterPlanMode",
+						{ cause: commitError },
+					);
+					const message = failure.message;
 					try {
 						await narratorService.updateToolCallResult(
 							event.toolUseId,
@@ -2401,7 +2464,7 @@ export async function processEvent(
 						status: "fail",
 						output: truncateJson(message, 2000),
 					});
-					throw new CriticalEventPersistenceError(message, { cause: commitError });
+					throw failure;
 				}
 			}
 
