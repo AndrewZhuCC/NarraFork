@@ -1,5 +1,5 @@
 import type { FileReference } from "@shared/file-reference";
-import { and, eq, inArray, isNotNull, ne, or } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorDrafts } from "../db/schema";
 import { copyFileReference } from "../lib/agent/file-reference-projection";
@@ -110,6 +110,28 @@ export async function getNarratorDraft(
 		.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
 		.get();
 	return rowToDraftState(row, userId);
+}
+
+/** First-paint metadata never materializes draft text or reference JSON. */
+export async function getNarratorDraftMetadata(
+	userId: string,
+	narratorId: string,
+): Promise<Pick<NarratorDraftState, "hasDraft" | "revision" | "updatedAt">> {
+	const row = await db
+		.select({
+			hasDraft: sql<number>`CASE WHEN length(trim(${narratorDrafts.text})) > 0 OR
+			(${narratorDrafts.fileReferencesJson} IS NOT NULL AND ${narratorDrafts.fileReferencesJson} <> '[]') THEN 1 ELSE 0 END`,
+			revision: narratorDrafts.revision,
+			updatedAt: narratorDrafts.updatedAt,
+		})
+		.from(narratorDrafts)
+		.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
+		.get();
+	return {
+		hasDraft: !!row?.hasDraft,
+		revision: row?.revision ?? 0,
+		updatedAt: row?.updatedAt ?? null,
+	};
 }
 
 export async function updateNarratorDraft(

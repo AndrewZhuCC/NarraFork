@@ -375,6 +375,7 @@ export const narrators = pgTable(
 		isAskInPassing: boolean("is_ask_in_passing").notNull().default(false),
 		turnStartedAt: text("turn_started_at"),
 		messageVersion: integer("message_version").notNull().default(0),
+		modelHistoryRevision: integer("model_history_revision").notNull().default(0),
 		messageStructureVersion: integer("message_structure_version").notNull().default(0),
 		defaultDeviceId: text("default_device_id"),
 		oauthOwnerGrantId: text("oauth_owner_grant_id").references((): PgColumn => oauthGrants.id, {
@@ -714,6 +715,11 @@ export const specProtectedTasks = pgTable(
 	],
 );
 
+export const modelHistoryRevisionContracts = pgTable("model_history_revision_contracts", {
+	id: text("id").primaryKey().notNull(),
+	installedVersion: text("installed_version").notNull(),
+});
+
 export const narratorContextCharPages = pgTable(
 	"narrator_context_char_pages",
 	{
@@ -745,6 +751,7 @@ export const narratorMessages = pgTable(
 		parentToolUseId: text("parent_tool_use_id"),
 		role: text("role").notNull(),
 		contentJson: jsonText("content_json").notNull(),
+		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
 		contextCharsJson: jsonText("context_chars_json"),
 		tokensIn: integer("tokens_in"),
@@ -833,6 +840,7 @@ export const narratorToolCalls = pgTable(
 			.references((): PgColumn => narratorMessages.id, {}),
 		toolUseId: text("tool_use_id").notNull(),
 		toolName: text("tool_name").notNull(),
+		modelRevision: integer("model_revision").notNull().default(0),
 		inputJson: jsonText("input_json"),
 		outputJson: jsonText("output_json"),
 		inputChars: integer("input_chars").notNull().default(0),
@@ -3758,8 +3766,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 118,
-  "columnCount": 1683,
+  "tableCount": 119,
+  "columnCount": 1688,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6191,6 +6199,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "0"
         },
         {
+          "property": "modelHistoryRevision",
+          "name": "model_history_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "messageStructureVersion",
           "name": "message_structure_version",
           "kind": "integer",
@@ -8056,6 +8075,36 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "modelHistoryRevisionContracts",
+      "name": "model_history_revision_contracts",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "installedVersion",
+          "name": "installed_version",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "narratorContextCharPages",
       "name": "narrator_context_char_pages",
       "columns": [
@@ -8194,6 +8243,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "bodyRevision",
+          "name": "body_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         },
         {
           "property": "contentText",
@@ -8775,6 +8835,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "modelRevision",
+          "name": "model_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         },
         {
           "property": "inputJson",

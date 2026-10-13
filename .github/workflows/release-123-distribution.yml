@@ -1,0 +1,110 @@
+name: Verified 0.9.1 originals to 123
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: verified-123-distribution-0.9.1
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  distribute:
+    name: Protected original-byte 123 distribution
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: release
+    steps:
+      - name: Require trusted default-branch entry
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$EVENT" = workflow_dispatch
+          test "$REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$REPOSITORY" = NarraFork/NarraFork
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.2
+      - name: Install frozen control dependencies only
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install CI-only rclone from signed package sources
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends rclone
+      - name: Prepare private approved 123 configuration
+        env:
+          NF_RELAY_RCLONE_CONFIG: ${{ secrets.NF_RELAY_RCLONE_CONFIG }}
+        run: |
+          python3 - <<'PY'
+          import configparser, os, pathlib, urllib.parse
+          secret = os.environ.pop("NF_RELAY_RCLONE_CONFIG", "")
+          if not secret or len(secret.encode()) > 16384:
+              raise SystemExit("Missing bounded relay configuration")
+          c = configparser.ConfigParser(interpolation=None)
+          try:
+              c.read_string(secret)
+          except configparser.Error:
+              raise SystemExit("Invalid relay configuration") from None
+          if c.sections() != ["nf_update"] or c.defaults():
+              raise SystemExit("Unexpected relay remote")
+          entry = c["nf_update"]
+          u = urllib.parse.urlsplit(entry.get("url", ""))
+          if (set(entry) - {"type", "url", "vendor", "user", "pass"}
+              or entry.get("type") != "webdav" or u.scheme != "https"
+              or u.hostname != "webdav.123pan.cn" or u.username or u.password
+              or u.port not in (None, 443) or u.query or u.fragment):
+              raise SystemExit("Relay configuration identity mismatch")
+          os.umask(0o077)
+          root = pathlib.Path(".ci-release")
+          root.mkdir(exist_ok=True)
+          with open(root / "123-rclone.conf", "x", opener=lambda p, f: os.open(p, f, 0o600)) as target:
+              target.write(secret)
+          del secret
+          PY
+      - name: Restore exact original artifacts without product compilation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/restore-123-originals.ts --output-dir=.ci-release/123-originals
+      - name: Publish immutable version binaries and temporary patch metadata
+        run: >-
+          bun scripts/publish-123-distribution.ts
+          --bundle-dir .ci-release/123-originals/bundle
+          --bridge-dir .ci-release/123-originals/bridge
+          --output-dir .ci-release/123-distribution
+          --version 0.9.1 --remote nf_update
+          --seal-sha256 6effd788d034477ae1bc33f3c2be5e976ce96056f0d9d0f5e8f6133823e07f7a
+          --bridge-artifact-id 11746942787
+          --bridge-artifact-sha256 920b6ccec156febcb170b243136daddecb3f22c5c275738b40a85f8a6fe0735f
+          --config .ci-release/123-rclone.conf --upload
+      - name: Retain public-only distribution proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: distribution-123-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ci-release/123-distribution/receipt-*.json
+            .ci-release/123-distribution/patches/import-manifest.json
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Remove only this job private credentials
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path(".ci-release/123-rclone.conf").unlink(missing_ok=True)
+          PY

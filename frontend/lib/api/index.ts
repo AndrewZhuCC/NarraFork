@@ -16,6 +16,7 @@ import { oauthGrantsApi } from "./oauth-grants";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
 import { scheduledTasksApi } from "./scheduled-tasks";
+import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
 import { systemLifecycleApi } from "./system-lifecycle";
@@ -53,6 +54,7 @@ export const api = {
 	...oauthGrantsApi,
 	...scheduledTasksApi,
 	...pluginsApi,
+	...sessionInterchangeApi,
 };
 
 export {

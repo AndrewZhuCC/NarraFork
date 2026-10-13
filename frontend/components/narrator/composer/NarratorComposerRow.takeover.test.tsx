@@ -207,6 +207,55 @@ describe("NarratorComposerRow idle send label", () => {
 	});
 });
 
+describe("idle action intrinsic envelope semantics", () => {
+	for (const { language, common, narrator } of [
+		{ language: "en", common: enCommon, narrator: enNarrator },
+		{ language: "zh-CN", common: zhCommon, narrator: zhNarrator },
+	]) {
+		test(`${language}: hidden public candidates do not change disabled state, DOM label or handlers`, async () => {
+			await act(async () => {
+				await instance.changeLanguage(language);
+			});
+			const send = mock(() => {});
+			const retry = mock(() => {});
+			const proceed = mock(() => {});
+			const props = baseProps({
+				isActive: false,
+				canCutInLine: false,
+				onSend: send,
+				onRetry: retry,
+				onContinue: proceed,
+			});
+			await renderRow(props);
+			const label = host.querySelector("[data-stable-action-label]");
+			expect(label?.textContent).toBe(common.send);
+			expect(
+				[...(label?.querySelectorAll("[data-label]") ?? [])].map((node) =>
+					node.getAttribute("data-label"),
+				),
+			).toEqual([common.send, narrator.retry, narrator.continue]);
+			for (const candidate of label?.querySelectorAll("[data-label]") ?? []) {
+				expect(candidate.textContent).toBe("");
+				expect(candidate.getAttribute("aria-hidden")).toBe("true");
+			}
+			expect(label?.closest("button")?.disabled).toBe(true);
+			await renderRow({ ...props, canRetryLastUserMessage: true });
+			const retryButton = host.querySelector("[data-stable-action-label]")?.closest("button");
+			expect(retryButton?.textContent).toBe(narrator.retry);
+			await act(async () => retryButton?.click());
+			expect(retry).toHaveBeenCalledTimes(1);
+			await renderRow({ ...props, canContinueNarrator: true });
+			const continueButton = host.querySelector("[data-stable-action-label]")?.closest("button");
+			expect(continueButton?.textContent).toBe(narrator.continue);
+			await act(async () => continueButton?.click());
+			expect(proceed).toHaveBeenCalledTimes(1);
+			expect(send).not.toHaveBeenCalled();
+			await renderRow({ ...props, isActive: true, composerHasText: true });
+			expect(host.querySelector("[data-stable-action-label]")).toBeNull();
+		});
+	}
+});
+
 describe("NarratorComposerRow production language resources", () => {
 	for (const { language, common, narrator } of [
 		{ language: "en", common: enCommon, narrator: enNarrator },

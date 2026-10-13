@@ -394,16 +394,46 @@ async function stageAssets(options: GitHubReleaseOptions, directory: string): Pr
 	return assets;
 }
 
+function parseRemoteRelease(output: string, tag: string, knownReleaseId?: number): RemoteRelease {
+	const result = JSON.parse(output) as RemoteRelease;
+	if (
+		!result ||
+		!Number.isSafeInteger(result.id) ||
+		result.id <= 0 ||
+		(knownReleaseId !== undefined && result.id !== knownReleaseId) ||
+		result.tag_name !== tag ||
+		typeof result.draft !== "boolean" ||
+		typeof result.prerelease !== "boolean" ||
+		!Array.isArray(result.assets) ||
+		result.assets.length > MAX_ASSETS
+	) {
+		throw new Error("Invalid GitHub release response");
+	}
+	return result;
+}
+
 async function getRelease(
 	run: GhRunner,
 	repository: string,
 	tag: string,
+	knownReleaseId?: number,
 ): Promise<RemoteRelease | null> {
 	let output: string;
 	try {
-		output = await run(["api", `repos/${repository}/releases/tags/${tag}`]);
+		output = await run([
+			"api",
+			knownReleaseId === undefined
+				? `repos/${repository}/releases/tags/${tag}`
+				: `repos/${repository}/releases/${knownReleaseId}`,
+		]);
 	} catch (error) {
-		if (!(error instanceof Error) || !/\bHTTP 404\b/.test(error.message)) throw error;
+		// A pinned release disappearing must not become a new draft lookup.
+		if (
+			knownReleaseId !== undefined ||
+			!(error instanceof Error) ||
+			!/\bHTTP 404\b/.test(error.message)
+		)
+			throw error;
 		// The tag endpoint is for published releases. Authenticated listing also sees drafts.
 		let releaseId: number | undefined;
 		for (let page = 1; page <= 10; page++) {
@@ -420,7 +450,9 @@ async function getRelease(
 				candidates.length > 100 ||
 				candidates.some(
 					(candidate) =>
-						!Number.isSafeInteger(candidate.id) || typeof candidate.tag_name !== "string",
+						!Number.isSafeInteger(candidate.id) ||
+						candidate.id <= 0 ||
+						typeof candidate.tag_name !== "string",
 				)
 			) {
 				throw new Error("Invalid GitHub release listing");
@@ -436,19 +468,9 @@ async function getRelease(
 				throw new Error("Release lookup page limit reached; cannot safely create a draft");
 		}
 		output = await run(["api", `repos/${repository}/releases/${releaseId}`]);
+		knownReleaseId = releaseId;
 	}
-	const result = JSON.parse(output) as RemoteRelease;
-	if (
-		!Number.isSafeInteger(result.id) ||
-		result.tag_name !== tag ||
-		typeof result.draft !== "boolean" ||
-		typeof result.prerelease !== "boolean" ||
-		!Array.isArray(result.assets) ||
-		result.assets.length > MAX_ASSETS
-	) {
-		throw new Error("Invalid GitHub release response");
-	}
-	return result;
+	return parseRemoteRelease(output, tag, knownReleaseId);
 }
 
 async function verifyRemoteTag(
@@ -614,26 +636,27 @@ export async function publishGitHubRelease(
 			await assertStableLatestDoesNotRegress(run, repository, options.version);
 		}
 		if (!release) {
-			const notesPath = join(directory, "release-notes.txt");
-			await writeFile(notesPath, body);
-			await run([
-				"release",
-				"create",
+			// Creation returns the authoritative ID; a just-created draft may not
+			// yet appear in tag/list lookups. Never re-create or guess its identity.
+			// Existing tag SHA is checked before creation and before publication;
+			// omit target_commitish, which can require extra workflows:write access.
+			const requestPath = join(directory, "create-release.json");
+			await writeFile(
+				requestPath,
+				JSON.stringify({ tag_name: tag, name: `NarraFork ${tag}`, body, draft: true, prerelease }),
+			);
+			release = parseRemoteRelease(
+				await run([
+					"api",
+					`repos/${repository}/releases`,
+					"--method",
+					"POST",
+					"--input",
+					requestPath,
+				]),
 				tag,
-				"--repo",
-				repository,
-				"--verify-tag",
-				// Existing tag SHA is checked before creation and before publication.
-				// A redundant target_commitish can require workflows:write in Actions.
-				"--draft",
-				"--title",
-				`NarraFork ${tag}`,
-				"--notes-file",
-				notesPath,
-				...(prerelease ? ["--prerelease"] : []),
-			]);
-			release = await getRelease(run, repository, tag);
-			if (!release?.draft) throw new Error("Expected a newly created draft release");
+			);
+			if (!release.draft) throw new Error("Expected a newly created draft release");
 		}
 		if (
 			release.prerelease !== prerelease ||
@@ -657,7 +680,7 @@ export async function publishGitHubRelease(
 				await run(["release", "upload", tag, asset.path, "--repo", repository]);
 			}
 		}
-		release = await getRelease(run, repository, tag);
+		release = await getRelease(run, repository, tag, release.id);
 		if (
 			!release ||
 			release.draft === alreadyPublished ||
@@ -685,7 +708,7 @@ export async function publishGitHubRelease(
 				"--draft=false",
 				`--latest=${!prerelease}`,
 			]);
-			const published = await getRelease(run, repository, tag);
+			const published = await getRelease(run, repository, tag, release.id);
 			if (
 				!published ||
 				published.draft ||

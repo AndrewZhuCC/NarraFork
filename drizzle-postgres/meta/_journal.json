@@ -85,6 +85,13 @@
 			"when": 1791646120425,
 			"tag": "0011_git_identities",
 			"breakpoints": true
+		},
+		{
+			"idx": 12,
+			"version": "7",
+			"when": 1791798367499,
+			"tag": "0012_narrator_model_history_revision",
+			"breakpoints": true
 		}
   ]
 }

@@ -19,6 +19,7 @@ describe("useLocalPref — defaults", () => {
 		expect(localPrefDefault("narrafork_expand_reasoning")).toBe(false);
 		// The reading-width cap is opt-in: by default the message list fills the viewport.
 		expect(localPrefDefault("narrafork_narrator_centered_column")).toBe(false);
+		expect(localPrefDefault("narrafork_narrator_bottom_spacing_resize")).toBe(false);
 		// The Alt LOD gesture is existing behavior, so it must stay default-ON:
 		// nothing stored (a fresh browser) keeps alt+wheel and the Alt-held
 		// indicator working; the switch exists to opt OUT.

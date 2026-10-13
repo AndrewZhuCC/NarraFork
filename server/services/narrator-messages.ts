@@ -39,6 +39,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import * as modelHistoryDatabase from "../db";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -56,6 +57,7 @@ import {
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -65,6 +67,11 @@ import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-proje
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	type LoadModelHistoryOptions,
+	loadModelHistorySource,
+	markModelHistoryRows,
+} from "./agent-runtime/model-history-source";
+import {
 	AWAIT_AGENT_RESOLVED_FIELD,
 	type AwaitAgentResolution,
 	attachAwaitAgentNarratorIds,
@@ -73,6 +80,11 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import {
+	createPostgresNarratorDisplayPagePort,
+	readDisplayFixtureMessages,
+	readNarratorDisplayMessages,
+} from "./narrator-display-page-reader";
 import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
@@ -2113,13 +2125,18 @@ export function stripProviderMetadata(tree: any[]): any[] {
 	const stripBlock = (block: any) => {
 		const providerMetadata = block?.providerMetadata;
 		if (!providerMetadata || typeof providerMetadata !== "object") return block;
-		const hadEncrypted = Object.values(providerMetadata as Record<string, unknown>).some(
-			(metadata) => {
+		if (
+			providerMetadata.hasEncryptedReasoning === true &&
+			Object.keys(providerMetadata).length === 1
+		)
+			return block;
+		const hadEncrypted =
+			providerMetadata.hasEncryptedReasoning === true ||
+			Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
 				if (!metadata || typeof metadata !== "object") return false;
 				const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
 				return typeof encrypted === "string" && encrypted.length > 0;
-			},
-		);
+			});
 		const { providerMetadata: _dropped, ...rest } = block;
 		return hadEncrypted ? { ...rest, providerMetadata: { hasEncryptedReasoning: true } } : rest;
 	};
@@ -2621,7 +2638,7 @@ function loadAggregateRefMessagesTx(tx: MessageTx, narratorId: string, messageId
 	assertAggregateBudget(ids.length);
 	if (ids.length === 0) return [];
 	const refs = tx
-		.select({ messageId: narratorMessageRefs.messageId })
+		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 		.from(narratorMessageRefs)
 		.where(
 			and(
@@ -2630,6 +2647,7 @@ function loadAggregateRefMessagesTx(tx: MessageTx, narratorId: string, messageId
 				isNull(narratorMessageRefs.segmentCompactId),
 			),
 		)
+		.orderBy(narratorMessageRefs.messageId)
 		.limit(AGGREGATE_METADATA_LIMIT + 1)
 		.all();
 	if (refs.length !== ids.length)
@@ -2638,63 +2656,138 @@ function loadAggregateRefMessagesTx(tx: MessageTx, narratorId: string, messageId
 			409,
 			"HISTORY_AGGREGATE_UNAVAILABLE",
 		);
-	const messages = tx
-		.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))) })
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.id, ids))
-		.limit(AGGREGATE_METADATA_LIMIT + 1)
-		.all();
-	const tools = tx
-		.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))) })
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.messageId, ids))
-		.limit(AGGREGATE_METADATA_LIMIT + 1)
-		.all();
-	assertAggregateBudget(
-		messages.length + tools.length,
-		[...messages, ...tools].reduce((sum, row) => sum + row.bytes, 0),
-	);
-	return tx.query.narratorMessages
-		.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true, creator: true },
-			orderBy: (m, { asc }) => [asc(m.createdAt)],
-			limit: AGGREGATE_METADATA_LIMIT,
-		})
-		.sync();
+	// Payload/attempt byte limits are checked by the off-main reader before decoding.
+	return refs;
 }
 
-function loadAggregateInlineMessages(narratorId: string, toolUseIds: string[]) {
-	return db.transaction((tx) => {
-		const scope = resolveAggregateScopeTx(tx, narratorId, toolUseIds);
-		return loadAggregateRefMessagesTx(
-			tx,
-			narratorId,
-			scope.inlineRows.map((row) => row.id),
+function assertDisplayReadActive(signal?: AbortSignal, deadlineAt?: number): void {
+	if (signal?.aborted)
+		throw new AppError("History display read was cancelled", 499, "DISPLAY_PAGE_CANCELLED");
+	if (deadlineAt !== undefined && deadlineAt <= Date.now())
+		throw new AppError(
+			"History display read exceeded its total deadline",
+			504,
+			"DISPLAY_PAGE_DEADLINE",
+		);
+}
+
+async function loadAggregateRefMessages(
+	narratorId: string,
+	messageIds: string[],
+	ioBudget = DEFAULT_TOOL_IO_BUDGET,
+	signal?: AbortSignal,
+	deadlineAt?: number,
+	maxRawBytes = AGGREGATE_BODY_BYTE_LIMIT,
+) {
+	assertDisplayReadActive(signal, deadlineAt);
+	const refs = db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	const options = {
+		ioBudget,
+		signal,
+		maxRawBytes,
+		timeoutMs: deadlineAt === undefined ? undefined : Math.max(1, deadlineAt - Date.now()),
+	};
+	const displayDatabase = modelHistoryDatabase;
+	const read =
+		displayDatabase.activeDatabaseBackend === "postgres"
+			? readNarratorDisplayMessages(
+					{
+						backend: "postgres",
+						port: displayDatabase.activePostgresReadUrl
+							? createPostgresNarratorDisplayPagePort(displayDatabase.activePostgresReadUrl)
+							: undefined,
+					},
+					messageIds,
+					options,
+				)
+			: process.env.NODE_ENV === "test" && displayDatabase.sqlite.filename === ":memory:"
+				? readDisplayFixtureMessages(displayDatabase.sqlite, messageIds, options)
+				: readNarratorDisplayMessages(
+						{ backend: "sqlite", dbPath: displayDatabase.sqlite.filename },
+						messageIds,
+						options,
+					);
+	const messages = await read.catch((error: unknown) => {
+		if (error instanceof AppError && error.code === "DISPLAY_PAGE_BUDGET_EXCEEDED")
+			throw new AppError(
+				"History aggregation exceeds its bounded metadata/body budget; open an explicit detail instead.",
+				409,
+				"HISTORY_AGGREGATE_UNAVAILABLE",
+			);
+		throw error;
+	});
+	assertDisplayReadActive(signal, deadlineAt);
+	const current = db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	if (!sameAggregateRows(refs, current))
+		throw new AppError(
+			"History aggregation references changed; reload the history window.",
+			409,
+			"HISTORY_AGGREGATE_UNAVAILABLE",
+		);
+	return messages;
+}
+
+async function loadAggregateInlineMessages(narratorId: string, toolUseIds: string[]) {
+	const scope = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
+	const messages = await loadAggregateRefMessages(
+		narratorId,
+		scope.inlineRows.map((row) => row.id),
+	);
+	assertAggregateScopeUnchanged(
+		scope,
+		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds)),
+	);
+	return messages;
+}
+
+function sameAggregateRows<T extends object>(left: readonly T[], right: readonly T[]): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((row, index) => {
+		const other = right[index];
+		const keys = Object.keys(row) as Array<keyof T>;
+		return (
+			keys.length === Object.keys(other).length && keys.every((key) => row[key] === other[key])
 		);
 	});
 }
 
-async function loadSubagentActivitiesForToolUseIds(
-	narratorId: string,
-	toolUseIds: string[],
-): Promise<Map<string, SubagentActivity>> {
-	if (toolUseIds.length === 0) return new Map();
-	const scope = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
-	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
-	// Summary/file aggregation can await other services. A removed caller/child
-	// ref must revoke this response too, rather than publishing a stale owner.
-	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
+function assertAggregateScopeUnchanged(
+	scope: ReturnType<typeof resolveAggregateScopeTx>,
+	current: ReturnType<typeof resolveAggregateScopeTx>,
+): void {
+	const sortedParents = (value: typeof scope) =>
+		[...value.parents].sort(([a], [b]) => a.localeCompare(b)).map(([, row]) => row);
+	const sortedOwners = (value: typeof scope) =>
+		[...value.owners].sort((a, b) => a.subagentNarratorId.localeCompare(b.subagentNarratorId));
+	const sortedInline = (value: typeof scope) =>
+		[...value.inlineRows].sort((a, b) => a.id.localeCompare(b.id));
 	if (
-		JSON.stringify(current.owners) !== JSON.stringify(scope.owners) ||
-		JSON.stringify([...current.parents]) !== JSON.stringify([...scope.parents])
-	) {
+		!sameAggregateRows(sortedOwners(current), sortedOwners(scope)) ||
+		!sameAggregateRows(sortedParents(current), sortedParents(scope)) ||
+		!sameAggregateRows(sortedInline(current), sortedInline(scope))
+	)
 		throw new AppError(
 			"History aggregation scope changed; reload the history window.",
 			409,
 			"HISTORY_AGGREGATE_UNAVAILABLE",
 		);
-	}
+}
+
+async function loadSubagentActivitiesForToolUseIds(
+	narratorId: string,
+	toolUseIds: string[],
+	initialScope?: ReturnType<typeof resolveAggregateScopeTx>,
+	scopeToolUseIds = toolUseIds,
+): Promise<Map<string, SubagentActivity>> {
+	if (toolUseIds.length === 0 && !initialScope) return new Map();
+	const scope =
+		initialScope ??
+		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
+	// Summary/file aggregation can await other services. A removed caller/child
+	// ref must revoke this response too, rather than publishing a stale owner.
+	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+	assertAggregateScopeUnchanged(scope, current);
 	return activities;
 }
 
@@ -2744,15 +2837,22 @@ async function buildTreeFromTopLevelRefs(
 	refRows: Array<{ messageId: string; seq: number }>,
 	isSubagent: boolean,
 	ioBudget: number,
+	signal?: AbortSignal,
+	deadlineAt = Date.now() + 10_000,
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 ): Promise<any[]> {
 	if (refRows.length === 0) return [];
 
+	const started = performance.now();
 	const messageIds = refRows.map((r) => r.messageId);
-	const topMessages = await db.query.narratorMessages.findMany({
-		where: inArray(narratorMessages.id, messageIds),
-		with: { toolCalls: true, creator: true },
-	});
+	const topMessages = await loadAggregateRefMessages(
+		narratorId,
+		messageIds,
+		ioBudget,
+		signal,
+		deadlineAt,
+		DISPLAY_PAGE_LIMITS.maxRawBytes,
+	);
 	const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 	topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 	attachMessageSeqs(topMessages, seqMap);
@@ -2765,10 +2865,27 @@ async function buildTreeFromTopLevelRefs(
 	const inlineToolUseIds = collectToolUseIds(topMessages).filter(
 		(toolUseId) => !subagentToolUseIdSet.has(toolUseId),
 	);
-	const [activities, childMessages] = await Promise.all([
-		loadSubagentActivitiesForToolUseIds(narratorId, subagentToolUseIds),
-		loadAggregateInlineMessages(narratorId, inlineToolUseIds),
-	]);
+	const hydratedAt = performance.now();
+	const aggregateToolUseIds = [...subagentToolUseIds, ...inlineToolUseIds];
+	const scope = db.transaction((tx) =>
+		resolveAggregateScopeTx(tx, narratorId, aggregateToolUseIds),
+	);
+	const childMessages = await loadAggregateRefMessages(
+		narratorId,
+		scope.inlineRows.map((row) => row.id),
+		ioBudget,
+		signal,
+		deadlineAt,
+	);
+	const scopedAt = performance.now();
+	const activities = await loadSubagentActivitiesForToolUseIds(
+		narratorId,
+		subagentToolUseIds,
+		scope,
+		aggregateToolUseIds,
+	);
+	assertDisplayReadActive(signal, deadlineAt);
+	const summarizedAt = performance.now();
 	attachSubagentActivities(topMessages, activities);
 	const enriched = enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
@@ -2778,12 +2895,27 @@ async function buildTreeFromTopLevelRefs(
 	// A still-waiting Await knows its target only as a selector; resolve it so the
 	// row can open the child's session before the wait returns.
 	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
-	return attachTakenOverFlags(
+	const result = attachTakenOverFlags(
 		await attachSendTargetDetails(
 			attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
 		),
 		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
+	assertDisplayReadActive(signal, deadlineAt);
+	const elapsedMs = Math.round(performance.now() - started);
+	if (elapsedMs >= 250)
+		logger.warn("Slow narrator display page hydration", {
+			narratorId,
+			elapsedMs,
+			topRows: topMessages.length,
+			inlineRows: childMessages.length,
+			aggregateGroups: aggregateToolUseIds.length,
+			hydrateMs: Math.round(hydratedAt - started),
+			scopeMs: Math.round(scopedAt - hydratedAt),
+			summaryMs: Math.round(summarizedAt - scopedAt),
+			projectionMs: Math.round(performance.now() - summarizedAt),
+		});
+	return result;
 }
 
 /**
@@ -3318,83 +3450,39 @@ const narratorMessageQueriesUnlocked = {
 	 * remains the complete row shape used by display/compatibility paths, while the
 	 * agent loop does not need audit, billing, permission timeline, or UI metadata.
 	 */
-	async getModelHistorySinceLastCompact(narratorId: string, limit?: number) {
-		const compactSeq = await this.getLatestCompactSeq(narratorId);
-		const refQuery = db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					ne(narratorMessages.role, "disp"),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
+	async getModelHistorySinceLastCompact(
+		narratorId: string,
+		limit?: number,
+		options: Omit<LoadModelHistoryOptions, "limit"> = {},
+	) {
+		const postgres = modelHistoryDatabase.postgresRuntime;
+		if (
+			modelHistoryDatabase.activeDatabaseBackend === "postgres" &&
+			(!postgres || !modelHistoryDatabase.activePostgresReadUrl)
+		)
+			throw new Error("Model history PostgreSQL read source is unavailable");
+		const backend =
+			modelHistoryDatabase.activeDatabaseBackend === "postgres" && postgres
+				? {
+						backend: "postgres" as const,
+						sql: postgres.client.sql,
+						url: modelHistoryDatabase.activePostgresReadUrl ?? "",
+					}
+				: { backend: "sqlite" as const, sqlite: modelHistoryDatabase.sqlite };
+		const source = await loadModelHistorySource(backend, narratorId, { ...options, limit });
+		// Lifecycle/metadata-only rows are control-plane data, never provider boundaries.
+		const messages = source.messages
+			.filter(
+				(message) =>
+					!isCompactLifecycleMessage(message) &&
+					!isMetadataOnlyEmptyReasoningAssistantMessage(message),
 			)
-			.orderBy(narratorMessageRefs.seq);
-		const refRows = await (limit == null
-			? refQuery
-			: refQuery.limit(Math.min(Math.max(Math.trunc(limit), 1), 2000)));
-		if (refRows.length === 0) return [];
-
-		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			columns: {
-				id: true,
-				narratorId: true,
-				role: true,
-				contentJson: true,
-				contentText: true,
-				parentToolUseId: true,
-				messageUuid: true,
-				createdBy: true,
-				origin: true,
-				originLabel: true,
-			},
-			with: {
-				// Only public identity fields, never credentials or the complete user row.
-				creator: { columns: { username: true } },
-				narrator: { columns: { title: true } },
-				toolCalls: {
-					columns: {
-						id: true,
-						executionAttempt: true,
-						createdAt: true,
-						toolUseId: true,
-						toolName: true,
-						inputJson: true,
-						outputJson: true,
-						status: true,
-					},
-				},
-			},
-		});
-		if (messages.length !== refRows.length) {
-			const foundIds = new Set(messages.map((message) => message.id));
-			const missingMessageIds = messageIds.filter((id) => !foundIds.has(id)).slice(0, 20);
-			logger.warn("Narrator model history refs point to missing messages", {
-				narratorId,
-				refCount: refRows.length,
-				messageCount: messages.length,
-				missingMessageIds,
-			});
-		}
-		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
-		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		// Compact lifecycle markers and metadata-only empty reasoning records are
-		// UI/control-plane data. They remain in the database and display history,
-		// but must not become model-history boundaries or hide trailing tool results.
-		const modelMessages = messages.filter(
-			(message) =>
-				!isCompactLifecycleMessage(message) &&
-				!isMetadataOnlyEmptyReasoningAssistantMessage(message),
-		);
-		return modelMessages.map((message) => ({
-			...message,
-			toolCalls: latestToolCallAttempts(message.toolCalls),
-		}));
+			.map((message) => ({
+				...message,
+				toolCalls: latestToolCallAttempts(message.toolCalls),
+			}));
+		markModelHistoryRows(messages, source);
+		return messages;
 	},
 
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
@@ -3860,8 +3948,16 @@ const narratorMessageQueriesUnlocked = {
 	 */
 	async getPretextDocumentPage(
 		narratorId: string,
-		opts: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number } = {},
+		opts: {
+			afterSeq?: number;
+			beforeSeq?: number;
+			limit?: number;
+			messageVersion?: number;
+			signal?: AbortSignal;
+		} = {},
 	) {
+		const deadlineAt = Date.now() + 10_000;
+		assertDisplayReadActive(opts.signal, deadlineAt);
 		const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 100);
 		// A lazy fork only materialized the refs after its parent's last compact.
 		// Reading older than `beforeSeq` means reading rows BELOW it, so the backfill
@@ -3872,8 +3968,12 @@ const narratorMessageQueriesUnlocked = {
 		if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
 			await ensureRefsCoverSeq(narratorId, Math.trunc(opts.beforeSeq as number) - limit);
 		}
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-		const messageVersion = await this.getMessageVersion(narratorId);
+		const narratorMeta = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { variant: true, messageVersion: true },
+		});
+		const isSubagent = narratorMeta != null && isSubagentVariant(narratorMeta.variant);
+		const messageVersion = narratorMeta?.messageVersion ?? 0;
 		if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
 			throw new AppError(
 				"Narrator document changed before the exact-layout page was built",
@@ -3881,6 +3981,7 @@ const narratorMessageQueriesUnlocked = {
 				"PRETEXT_DOCUMENT_CHANGED",
 			);
 		const assertDocumentUnchanged = async () => {
+			assertDisplayReadActive(opts.signal, deadlineAt);
 			if ((await this.getMessageVersion(narratorId)) !== messageVersion)
 				throw new AppError(
 					"Narrator document changed while the exact-layout page was being built",
@@ -3985,6 +4086,8 @@ const narratorMessageQueriesUnlocked = {
 					// The ONLY path whose bodies are measured for the exact layout: the budget
 					// must fill the detail caps, or a card reserves a box it cannot fill.
 					EXACT_TOOL_IO_BUDGET,
+					opts.signal,
+					deadlineAt,
 				),
 			),
 		);
@@ -4184,9 +4287,7 @@ const narratorMessageQueriesUnlocked = {
 
 		const allRefRows = [...refRows, ...childRefRows];
 		const messageIds = [...new Set(allRefRows.map((r) => r.messageId))];
-		const allMessages = db.transaction((tx) =>
-			loadAggregateRefMessagesTx(tx, narratorId, messageIds),
-		);
+		const allMessages = await loadAggregateRefMessages(narratorId, messageIds);
 
 		const seqMap = new Map(allRefRows.map((r) => [r.messageId, r.seq]));
 		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -4212,7 +4313,7 @@ const narratorMessageQueriesUnlocked = {
 		);
 		const existingChildIds = new Set(childMsgs.map((m) => m.id));
 		if (inlineTopToolUseIds.length > 0) {
-			const extraChildren = loadAggregateInlineMessages(narratorId, inlineTopToolUseIds);
+			const extraChildren = await loadAggregateInlineMessages(narratorId, inlineTopToolUseIds);
 			for (const child of extraChildren) {
 				if (!existingChildIds.has(child.id)) childMsgs.push(child);
 			}

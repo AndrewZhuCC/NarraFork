@@ -48,6 +48,10 @@ scripts/lib/*
 # Release CI control, immutable bundles, strict native inputs and native smoke.
 !scripts/ci-release.ts
 !scripts/smoke-release-binary.ts
+# Explicit 123 distribution operators; old server receives patches/metadata only.
+!scripts/publish-123-distribution.ts
+!scripts/import-123-patches.py
+!scripts/restore-123-originals.ts
 !scripts/lib/ci-release-*.ts
 !scripts/lib/ci-build-*.ts
 !scripts/lib/github-release-baseline.ts
@@ -114,6 +118,12 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts
 !scripts/lib/__tests__/generate-sqlite-migrations.test.ts
+# Generated model-history trigger contracts and their migration fixtures must ship with the generators.
+!scripts/lib/generated-model-history-triggers.ts
+!scripts/lib/__tests__/model-history-migration-fixture.ts
+!scripts/lib/__tests__/model-history-trigger-generators.test.ts
+# Full application loading/layout smoke is referenced by the browser regression tests.
+!scripts/smoke-narrator-loading.ts
 !scripts/lib/sqlite-generation-lock.ts
 !scripts/lib/__tests__/sqlite-generation-lock.test.ts
 !scripts/lib/__tests__/generate-postgres-schema.test.ts

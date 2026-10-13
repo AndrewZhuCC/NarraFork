@@ -74,6 +74,7 @@ import { rulerRoutes } from "./routes/ruler";
 import { runtimeRoutes } from "./routes/runtime";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks";
 import { searchRoutes } from "./routes/search";
+import { sessionInterchangeRoutes } from "./routes/session-interchange";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
@@ -174,7 +175,16 @@ app.use(
 		},
 		// The sliding-renewal token rides on a custom response header, which is
 		// invisible to cross-origin readers unless explicitly exposed.
-		exposeHeaders: [SESSION_RENEWAL_HEADER],
+		// The session export download carries its resume command and warnings in
+		// headers so the body stays a plain file.
+		exposeHeaders: [
+			SESSION_RENEWAL_HEADER,
+			"Content-Disposition",
+			"X-Session-Id",
+			"X-Resume-Command",
+			"X-Session-Warnings",
+			"X-Session-Path",
+		],
 	}),
 );
 
@@ -383,6 +393,7 @@ app.route("/api/learning", learningRoutes);
 app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
+app.route("/api/session-interchange", sessionInterchangeRoutes);
 app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-cards", modelCardRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);

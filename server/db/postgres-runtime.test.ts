@@ -14,14 +14,18 @@
  * A real connection-refused case runs here too: classifying it needs no PostgreSQL server,
  * only a closed loopback port.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { logger } from "../lib/logger";
 import type { PostgresClient } from "./postgres-client";
 import {
 	AMBIENT_DATABASE_URL_ENV,
+	closePostgresRuntime,
 	DATABASE_BACKEND_ENV,
 	DATABASE_URL_ENV,
 	DatabaseConfigError,
 	describeDatabaseConfig,
+	getOrStartPostgresRuntime,
+	logPostgresStartup,
 	PostgresRuntimeClosedError,
 	PostgresStartupError,
 	resolveDatabaseBackendConfig,
@@ -345,6 +349,111 @@ describe("startPostgresRuntime stage classification", () => {
 		await expect(runtime.executor.unsafe("SELECT 1")).rejects.toBeInstanceOf(
 			PostgresRuntimeClosedError,
 		);
+	});
+});
+
+describe("hot runtime connection identity", () => {
+	const pinKey = Symbol.for("narrafork.postgresRuntime");
+	const globals = globalThis as unknown as Record<symbol, unknown>;
+	function injected() {
+		const fake = fakeClient();
+		let clients = 0;
+		let migrations = 0;
+		return {
+			fake,
+			counts: () => ({ clients, migrations }),
+			deps: {
+				createClient: () => {
+					clients++;
+					return fake.client;
+				},
+				runMigrations: async () => {
+					migrations++;
+				},
+				ensureFts: async () => {},
+			},
+		};
+	}
+	test("module reevaluation reuses one client and exports its confirmed read URL", async () => {
+		const io = injected();
+		try {
+			const first = await getOrStartPostgresRuntime(CONFIG, io.deps);
+			const reloaded = await import(`./postgres-runtime.ts?hot=same-${Date.now()}`);
+			const second = await reloaded.getOrStartPostgresRuntime({ ...CONFIG, pool: {} }, io.deps);
+			expect(second.runtime).toBe(first.runtime);
+			expect(second.isHotReload).toBe(true);
+			expect(second.readUrl).toBe(CONFIG.url);
+			expect(io.counts()).toEqual({ clients: 1, migrations: 1 });
+		} finally {
+			await closePostgresRuntime();
+		}
+	});
+	test("startup snapshots configuration before asynchronous work and ignores later caller mutations", async () => {
+		const io = injected();
+		const config = { ...CONFIG, url: PG_URL, pool: { max: 2 } };
+		try {
+			const pending = getOrStartPostgresRuntime(config, io.deps);
+			config.url = "postgres://other:MUTATED_PASSWORD@127.0.0.1:5432/other";
+			config.pool.max = 3;
+			const first = await pending;
+			expect(first.readUrl).toBe(PG_URL);
+			const same = await getOrStartPostgresRuntime({ ...CONFIG, pool: { max: 2 } }, io.deps);
+			expect(same.runtime).toBe(first.runtime);
+			await expect(getOrStartPostgresRuntime(config, io.deps)).rejects.toThrow(/restart/i);
+			expect(io.counts()).toEqual({ clients: 1, migrations: 1 });
+		} finally {
+			await closePostgresRuntime();
+		}
+	});
+	test("URL A to B and pool changes fail closed without leaking secrets or closing A", async () => {
+		const io = injected();
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const warnings = spyOn(logger, "warn").mockImplementation(() => {});
+		const errors = spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const first = await getOrStartPostgresRuntime(CONFIG, io.deps);
+			logPostgresStartup(first.runtime, CONFIG);
+			const urlB = "postgres://other:URL_B_PASSWORD_SENTINEL@127.0.0.1:5432/other";
+			for (const changed of [
+				{ ...CONFIG, url: urlB },
+				{ ...CONFIG, pool: { max: 7 } },
+			]) {
+				await expect(getOrStartPostgresRuntime(changed, io.deps)).rejects.toThrow(/restart/i);
+				try {
+					await getOrStartPostgresRuntime(changed, io.deps);
+				} catch (error) {
+					expect(String(error)).not.toContain(PG_URL);
+					expect(String(error)).not.toContain("topsecret");
+					expect(String(error)).not.toContain(urlB);
+					expect(String(error)).not.toContain("URL_B_PASSWORD_SENTINEL");
+				}
+			}
+			const logs = JSON.stringify([info.mock.calls, warnings.mock.calls, errors.mock.calls]);
+			expect(logs).not.toContain("topsecret");
+			expect(logs).not.toContain("URL_B_PASSWORD_SENTINEL");
+			expect(logs).not.toContain(PG_URL);
+			expect(io.counts()).toEqual({ clients: 1, migrations: 1 });
+			expect(io.fake.closedCount()).toBe(0);
+		} finally {
+			info.mockRestore();
+			warnings.mockRestore();
+			errors.mockRestore();
+			await closePostgresRuntime();
+		}
+	});
+	test("legacy pin without private identity is rejected and never automatically closed", async () => {
+		const io = injected();
+		const runtime = await startPostgresRuntime(CONFIG, io.deps);
+		const legacy = { runtime };
+		globals[pinKey] = legacy;
+		try {
+			await expect(getOrStartPostgresRuntime(CONFIG, io.deps)).rejects.toThrow(/restart/i);
+			expect(globals[pinKey]).toBe(legacy);
+			expect(io.fake.closedCount()).toBe(0);
+			expect(io.counts()).toEqual({ clients: 1, migrations: 1 });
+		} finally {
+			await closePostgresRuntime();
+		}
 	});
 });
 

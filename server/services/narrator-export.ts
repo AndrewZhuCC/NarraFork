@@ -436,6 +436,105 @@ async function loadRefPage(
 	}));
 }
 
+/**
+ * A narrator's paging scope, resolved once before the first page is read.
+ *
+ * Kept as a value rather than recomputed per page because two readers share it:
+ * the Markdown/JSON stream needs `earlierHistoryOmitted` before it writes its
+ * header, and the Claude Code / Codex exporter walks the same refs to build an
+ * interchange session.
+ */
+export interface TranscriptScope {
+	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
+	clause: any;
+	latestCompactSeq: number | null;
+	isSubagent: boolean;
+	/** True only when `visible` genuinely hides messages older than the last compact. */
+	earlierHistoryOmitted: boolean;
+}
+
+export async function resolveTranscriptScope(
+	narratorId: string,
+	scope: NarratorExportScope,
+	isSubagent: boolean,
+): Promise<TranscriptScope> {
+	const clause = await buildRefScope(narratorId, scope);
+	const latestCompactSeq = scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
+	const earlierHistoryOmitted =
+		latestCompactSeq != null ? await hasHistoryBelow(clause, latestCompactSeq, isSubagent) : false;
+	return { clause, latestCompactSeq, isSubagent, earlierHistoryOmitted };
+}
+
+export interface TranscriptRefPage {
+	/**
+	 * Refs seen for the first time, in `(seq, refId)` order. Can be empty when a
+	 * page held only second copies of messages reachable through two lineages.
+	 */
+	refs: ExportRefRow[];
+	/** Seq of the last raw row read, for error reports. */
+	lastSeq: number;
+}
+
+/**
+ * Walk a narrator's top-level refs one bounded page at a time, read-only.
+ *
+ * Owns the three things every reader of a transcript must get right: the total
+ * `(seq, refId)` cursor, deduplication by message id across pages (see
+ * `loadRefPage`), and handing the event loop back between pages. Consumers load
+ * whatever they need for each page's message ids.
+ *
+ * An aborted signal ends the walk before the next query; the consumer decides
+ * what an abort means for its own output.
+ */
+export async function* iterateNarratorTranscript(
+	narratorId: string,
+	scope: TranscriptScope,
+	signal?: AbortSignal,
+): AsyncGenerator<TranscriptRefPage> {
+	const seenMessageIds = new Set<string>();
+	let cursor: { seq: number; refId: string } | null = null;
+
+	for (;;) {
+		if (signal?.aborted) return;
+		const pageStart = Date.now();
+
+		const refs = await loadRefPage(scope.clause, cursor, scope.latestCompactSeq, scope.isSubagent);
+		if (refs.length === 0) return;
+		const lastRef = refs[refs.length - 1];
+		cursor = { seq: lastRef.seq, refId: lastRef.refId };
+
+		// The same message can be reachable through both the narrator's own ref
+		// and an ancestor's, and an inherited ref keeps the ancestor's original
+		// seq — so the two copies can land in the SAME page with equal seq. The
+		// seen-set therefore has to be updated as we walk, not after filtering:
+		// a batch filter would let both copies through on their first page.
+		const fresh: ExportRefRow[] = [];
+		for (const ref of refs) {
+			if (seenMessageIds.has(ref.messageId)) continue;
+			seenMessageIds.add(ref.messageId);
+			fresh.push(ref);
+		}
+
+		yield { refs: fresh, lastSeq: lastRef.seq };
+
+		// Measured across the yield on purpose: the consumer's per-page reads are
+		// part of what makes a page slow.
+		const elapsed = Date.now() - pageStart;
+		if (elapsed > SLOW_PAGE_MS) {
+			logger.warn("Slow narrator export page", {
+				narratorId,
+				untilSeq: lastRef.seq,
+				refs: refs.length,
+				elapsedMs: elapsed,
+			});
+		}
+
+		if (refs.length < EXPORT_PAGE_REFS) return;
+		// Hand the event loop back so a long export cannot stall other requests.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
+
 const MESSAGE_COLUMNS = {
 	id: narratorMessages.id,
 	role: narratorMessages.role,
@@ -1394,19 +1493,10 @@ export async function* streamNarratorExport(
 	// error escape here would abandon the response before a single byte, so the
 	// client would get a truncated file with no explanation instead of the
 	// parseable "incomplete" document the failure contract promises.
-	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
-	let scopeClause: any = null;
-	let latestCompactSeq: number | null = null;
+	let scope: TranscriptScope | null = null;
 	try {
-		scopeClause = await buildRefScope(narratorId, options.scope);
-		latestCompactSeq = options.scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
-		if (latestCompactSeq != null) {
-			stats.earlierHistoryOmitted = await hasHistoryBelow(
-				scopeClause,
-				latestCompactSeq,
-				header.isSubagent,
-			);
-		}
+		scope = await resolveTranscriptScope(narratorId, options.scope, header.isSubagent);
+		stats.earlierHistoryOmitted = scope.earlierHistoryOmitted;
 	} catch (error) {
 		failure = error instanceof Error ? error.message : String(error);
 		logger.error("Narrator export failed while resolving scope", {
@@ -1438,83 +1528,50 @@ export async function* streamNarratorExport(
 	try {
 		// A scope that failed to resolve has no usable predicate; skip paging and let
 		// the tail report the failure rather than querying with a null clause.
-		if (failure != null) throw new Error(failure);
+		if (failure != null || !scope) throw new Error(failure ?? "Export scope unavailable");
 
-		const seenMessageIds = new Set<string>();
-		let cursor: { seq: number; refId: string } | null = null;
 		let first = true;
+		for await (const page of iterateNarratorTranscript(narratorId, scope, signal)) {
+			lastSeq = page.lastSeq;
+			const fresh = page.refs;
+			if (fresh.length === 0) continue;
 
-		for (;;) {
-			if (signal?.aborted) return;
-			const pageStart = Date.now();
-
-			const refs = await loadRefPage(scopeClause, cursor, latestCompactSeq, header.isSubagent);
-			if (refs.length === 0) break;
-			const lastRef = refs[refs.length - 1];
-			cursor = { seq: lastRef.seq, refId: lastRef.refId };
-			lastSeq = lastRef.seq;
-
-			// The same message can be reachable through both the narrator's own ref
-			// and an ancestor's, and an inherited ref keeps the ancestor's original
-			// seq — so the two copies can land in the SAME page with equal seq. The
-			// seen-set therefore has to be updated as we walk, not after filtering:
-			// a batch filter would let both copies through on their first page.
-			const fresh: ExportRefRow[] = [];
-			for (const ref of refs) {
-				if (seenMessageIds.has(ref.messageId)) continue;
-				seenMessageIds.add(ref.messageId);
-				fresh.push(ref);
+			const messageIds = fresh.map((ref) => ref.messageId);
+			const [messages, toolRows] = await Promise.all([
+				loadMessages(messageIds),
+				loadToolCalls(messageIds, options.includeToolIO),
+			]);
+			const toolUseIds = toolRows.map((row) => row.toolUseId).filter(Boolean);
+			// A subagent transcript is already the child level; descending again
+			// would recurse without bound.
+			const childRows = header.isSubagent ? [] : await loadChildMessages(toolUseIds);
+			if (childRows.length > EXPORT_CHILD_MESSAGES_PER_PAGE) {
+				stats.childMessagesOmitted += childRows.length - EXPORT_CHILD_MESSAGES_PER_PAGE;
+				childRows.length = EXPORT_CHILD_MESSAGES_PER_PAGE;
 			}
 
-			if (fresh.length > 0) {
-				const messageIds = fresh.map((ref) => ref.messageId);
-				const [messages, toolRows] = await Promise.all([
-					loadMessages(messageIds),
-					loadToolCalls(messageIds, options.includeToolIO),
-				]);
-				const toolUseIds = toolRows.map((row) => row.toolUseId).filter(Boolean);
-				// A subagent transcript is already the child level; descending again
-				// would recurse without bound.
-				const childRows = header.isSubagent ? [] : await loadChildMessages(toolUseIds);
-				if (childRows.length > EXPORT_CHILD_MESSAGES_PER_PAGE) {
-					stats.childMessagesOmitted += childRows.length - EXPORT_CHILD_MESSAGES_PER_PAGE;
-					childRows.length = EXPORT_CHILD_MESSAGES_PER_PAGE;
+			const assembled = assemblePage(
+				fresh,
+				messages,
+				toolRows,
+				childRows,
+				options.includeToolIO,
+				stats,
+			);
+
+			for (const message of assembled) {
+				if (isJson) {
+					yield `${first ? "\n" : ",\n"}${JSON.stringify(jsonMessage(message, options.includeToolIO))}`;
+					first = false;
+				} else {
+					yield renderMessage(message, options.lang);
 				}
-
-				const page = assemblePage(
-					fresh,
-					messages,
-					toolRows,
-					childRows,
-					options.includeToolIO,
-					stats,
-				);
-
-				for (const message of page) {
-					if (isJson) {
-						yield `${first ? "\n" : ",\n"}${JSON.stringify(jsonMessage(message, options.includeToolIO))}`;
-						first = false;
-					} else {
-						yield renderMessage(message, options.lang);
-					}
-					messageCount += 1;
-				}
+				messageCount += 1;
 			}
-
-			const elapsed = Date.now() - pageStart;
-			if (elapsed > SLOW_PAGE_MS) {
-				logger.warn("Slow narrator export page", {
-					narratorId,
-					untilSeq: lastSeq,
-					refs: refs.length,
-					elapsedMs: elapsed,
-				});
-			}
-
-			if (refs.length < EXPORT_PAGE_REFS) break;
-			// Hand the event loop back so a long export cannot stall other requests.
-			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
+		// A disconnect ends the walk early. Nothing further can reach a closed
+		// connection, and the missing tail is what marks the file as partial.
+		if (signal?.aborted) return;
 	} catch (error) {
 		failure = error instanceof Error ? error.message : String(error);
 		logger.error("Narrator export failed mid-stream", {

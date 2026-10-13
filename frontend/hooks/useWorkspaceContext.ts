@@ -91,6 +91,8 @@ export function useWorkspaceContext(narratorId: string) {
 			return latestWorkspaceContext(qc.getQueryData(workspaceContextKey(narratorId)), incoming);
 		},
 		enabled: !!narratorId && !transition.data,
+		// Context switches still cancel reads and invalidate immediately; duplicate observers reuse a recent revision.
+		staleTime: 5_000,
 	});
 	return {
 		...query,

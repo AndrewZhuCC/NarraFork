@@ -48,9 +48,10 @@ const adapter: ProviderAdapter = {
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
 };
-const unregister = registerExternalProviderResolver((name) =>
-	name === "asyncfixture" ? adapter : null,
-);
+const unregister = registerExternalProviderResolver({
+	resolve: (name) => (name === "asyncfixture" ? adapter : null),
+	listReadiness: () => [],
+});
 toolRegistry.register({
 	name: TOOL,
 	description: "Drive one safe test-only turn boundary",

@@ -2718,7 +2718,13 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
-		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+		const deadline = Date.now() + 10_000;
+		const signal = opts.attachmentSignal;
+		signal?.throwIfAborted();
+		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+			signal,
+			deadline,
+		});
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -2729,11 +2735,16 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			profile: isSubagentNarrator ? "subagent" : "primary",
 			sourceMessages: rawMsgs,
 			attachmentCwd: opts.getAttachmentCwd?.(),
-			attachmentSignal: opts.attachmentSignal,
+			attachmentSignal: signal,
+			deadline,
 		});
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
 			: undefined;
+		const { verifyModelHistoryRowsCurrent } = await import("./agent-runtime/model-history-source");
+		await verifyModelHistoryRowsCurrent(rawMsgs, { signal, deadline });
+		signal?.throwIfAborted();
+		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {
 			history: result.history,
 			pendingToolResults: result.trailingToolResults,

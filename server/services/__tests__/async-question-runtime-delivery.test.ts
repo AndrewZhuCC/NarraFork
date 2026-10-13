@@ -88,9 +88,10 @@ async function captureAwaitRequests(
 		},
 		generate: async () => "",
 	} as unknown as import("../../lib/agent/provider").ProviderAdapter;
-	const unregister = registerExternalProviderResolver((name) =>
-		name === "questionruntime" ? adapter : null,
-	);
+	const unregister = registerExternalProviderResolver({
+		resolve: (name) => (name === "questionruntime" ? adapter : null),
+		listReadiness: () => [],
+	});
 	toolRegistry.register(awaitTool);
 	try {
 		for await (const event of agentLoop(

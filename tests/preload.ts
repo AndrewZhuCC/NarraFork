@@ -86,18 +86,22 @@ settings.agent.requestDumpRecordingEnabled = false;
 // Capture the isolated live settings at preload time. This is the authoritative
 // state that other modules (e.g. auth.ts) will read from.
 const snapshot = structuredClone(settings);
+// getDefaults() deep-clones the entire configuration; its fixed top-level keys
+// do not need to be rediscovered for every individual test.
+const defaultKeys = Object.keys(getDefaults()) as Array<keyof typeof settings>;
 
-beforeEach(() => {
+export function repairMissingSettingsBranches(): void {
 	// Restore any sub-objects that may have been wiped by a previous test.
-	const defaults = getDefaults();
-	for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) {
+	for (const key of defaultKeys) {
 		if (settings[key] === undefined || settings[key] === null) {
 			// Use snapshot value (preserves runtime-generated secrets like jwtSecret)
 			// biome-ignore lint/suspicious/noExplicitAny: restoring dynamic settings keys
 			(settings as any)[key] = structuredClone((snapshot as any)[key]);
 		}
 	}
-});
+}
+
+beforeEach(repairMissingSettingsBranches);
 
 afterEach(() => {
 	// Full restore from the original snapshot taken at module load time.

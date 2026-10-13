@@ -3,6 +3,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readMigrationFiles } from "drizzle-orm/migrator";
+import { renderModelHistoryRevisionSql } from "../services/agent-runtime/model-history-revision-sql";
 import {
 	applyPendingMigrationsByHash,
 	repairMissingSpecTables,
@@ -1288,6 +1290,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		tag: string,
 		statements: readonly string[],
 		laterStatements: readonly string[] = [],
+		finalStatements: readonly string[] = [],
 	): string {
 		const root = mkdtempSync(join(tmpdir(), "narrafork-drop-tolerance-"));
 		tempFolders.push(root);
@@ -1311,6 +1314,17 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 								},
 							]
 						: []),
+					...(finalStatements.length
+						? [
+								{
+									idx: 2,
+									version: "6",
+									when: 1_700_000_000_002,
+									tag: `${tag}_suffix`,
+									breakpoints: true,
+								},
+							]
+						: []),
 				],
 			}),
 		);
@@ -1319,6 +1333,12 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			writeFileSync(
 				join(folder, `${tag}_retirement.sql`),
 				laterStatements.join("\n--> statement-breakpoint\n"),
+			);
+		}
+		if (finalStatements.length) {
+			writeFileSync(
+				join(folder, `${tag}_suffix.sql`),
+				finalStatements.join("\n--> statement-breakpoint\n"),
 			);
 		}
 		return folder;
@@ -1336,6 +1356,57 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		return (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
 			(row) => row.name,
 		);
+	}
+
+	const officialModelHistoryStatements = readFileSync(
+		join(import.meta.dir, "../../drizzle/0196_narrator_model_history_revision.sql"),
+		"utf8",
+	).split("--> statement-breakpoint");
+	const proofProbeStatements = [
+		"INSERT INTO missing_model_history_replay_table (id) VALUES ('must-not-run');",
+		"DROP TABLE model_history_probe;",
+	];
+	function normalizedTriggerSql(database: Database): Array<{ name: string; sql: string }> {
+		return (
+			database
+				.prepare(
+					"SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND name GLOB 'model_history_v1_*' ORDER BY name LIMIT 12",
+				)
+				.all() as Array<{ name: string; sql: string }>
+		).map(({ name, sql }) => ({ name, sql: sql.trim().replace(/;$/, "").trimEnd() }));
+	}
+	const canonicalTriggers = renderModelHistoryRevisionSql("sqlite")
+		.split("--> statement-breakpoint")
+		.filter((statement) => statement.trim().startsWith("CREATE TRIGGER"))
+		.map((statement) => {
+			const match = /^CREATE TRIGGER (\w+)/.exec(statement.trim());
+			if (!match) throw new Error("Invalid canonical SQLite trigger in migration fixture");
+			return {
+				name: match[1],
+				sql: statement.trim().replace(/;$/, "").trimEnd(),
+			};
+		})
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	function createInstalledModelHistoryDatabase(
+		statements: readonly string[] = officialModelHistoryStatements,
+	): Database {
+		const database = new Database(":memory:");
+		database.run("PRAGMA foreign_keys=ON");
+		database.run("CREATE TABLE narrators (id text PRIMARY KEY, title text, context_summary text)");
+		database.run("CREATE TABLE users (id text PRIMARY KEY, username text)");
+		database.run(`CREATE TABLE narrator_messages (id text PRIMARY KEY, narrator_id text,
+		 sdk_message_uuid text, parent_tool_use_id text, role text, content_json text, content_text text,
+		 created_by text, origin text, origin_label text)`);
+		database.run(`CREATE TABLE narrator_tool_calls (id text PRIMARY KEY, message_id text,
+		 narrator_id text, tool_use_id text, tool_name text, input_json text, output_json text, status text,
+		 execution_attempt integer, created_at text)`);
+		database.run(`CREATE TABLE narrator_message_refs (id text PRIMARY KEY, narrator_id text,
+		 message_id text, seq integer, is_compact integer, segment_compact_id text)`);
+		for (const statement of statements) database.run(statement);
+		database.run("CREATE TABLE model_history_probe (id text PRIMARY KEY, payload text)");
+		database.run("INSERT INTO model_history_probe VALUES ('kept', 'original')");
+		return database;
 	}
 
 	// folderMillis of 0103_redundant_valkyrie — the migration from the reported incident: it
@@ -1371,20 +1442,86 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 	test("replays the entire journal against an already-final schema without failing", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
+		sqlite.run("PRAGMA foreign_keys=ON");
 
 		sqlite.run(
-			"INSERT INTO narrators (id,title,created_at,updated_at) VALUES ('preserved','keep-title','now','now')",
+			"INSERT INTO narrators (id,title,created_at,updated_at) VALUES ('preserved','keep-title','now','now'),('holder','fork','now','now')",
 		);
+		sqlite.run(
+			`INSERT INTO narrator_messages (id,narrator_id,sdk_message_uuid,role,content_json,content_text,created_at)
+			 VALUES ('kept-message','preserved','kept-uuid','assistant','[{"type":"text","text":"body"}]','body','now')`,
+		);
+		sqlite.run(
+			`INSERT INTO narrator_tool_calls (id,narrator_id,message_id,tool_use_id,tool_name,input_json,output_json,status,execution_attempt,created_at)
+			 VALUES ('kept-tool','preserved','kept-message','kept-use','Read','{}','"tool-result"','success',2,'now')`,
+		);
+		sqlite.run(
+			`INSERT INTO narrator_message_refs (id,narrator_id,message_id,seq)
+			 VALUES ('kept-owner-ref','preserved','kept-message',0),('kept-holder-ref','holder','kept-message',0)`,
+		);
+		// 0003 can resurrect an unrelated retired nullable tool column. Compare every
+		// pre-existing tool field, not a stronger claim that old replay adds no columns.
+		const toolProjection = columnNames(sqlite, "narrator_tool_calls")
+			.map((column) => `"${column}"`)
+			.join(", ");
+		const stableHistory = () => ({
+			narrators: sqlite
+				?.prepare("SELECT id, title, model_history_revision FROM narrators ORDER BY id")
+				.all(),
+			messages: sqlite?.prepare("SELECT * FROM narrator_messages ORDER BY id").all(),
+			tools: sqlite?.prepare(`SELECT ${toolProjection} FROM narrator_tool_calls ORDER BY id`).all(),
+			refs: sqlite?.prepare("SELECT * FROM narrator_message_refs ORDER BY id").all(),
+		});
+		const historyBefore = stableHistory();
+		for (const [table, revision] of [
+			["narrators", "model_history_revision"],
+			["narrator_messages", "body_revision"],
+			["narrator_tool_calls", "model_revision"],
+		]) {
+			expect(
+				sqlite.prepare(`SELECT 1 FROM ${table} WHERE ${revision} > 0 LIMIT 1`).get(),
+			).toBeTruthy();
+		}
+		const foreignKeys = (table: string) =>
+			sqlite
+				?.prepare(
+					'SELECT "table", "from", "to", on_update, on_delete, match, seq FROM pragma_foreign_key_list(?)',
+				)
+				.all(table) ?? [];
+		const foreignKeysBefore = new Map(
+			["narrators", "narrator_messages", "narrator_tool_calls", "narrator_message_refs"].map(
+				(table) => [table, foreignKeys(table)],
+			),
+		);
+		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
 		// Worst case for a source-built machine: not a single recorded hash matches the
 		// released files, so every migration is replayed against its own end state.
 		sqlite.run("DELETE FROM __drizzle_migrations");
 
 		await runMigrations(sqlite);
 
-		expect(stampedHashes(sqlite)).toBeGreaterThan(0);
-		expect(sqlite.prepare("SELECT title FROM narrators WHERE id='preserved'").get()).toEqual({
-			title: "keep-title",
-		});
+		const folder = join(import.meta.dir, "../../drizzle");
+		const realHashes = readMigrationFiles({ migrationsFolder: folder }).map(({ hash }) => ({
+			hash,
+		}));
+		expect(sqlite.prepare("SELECT hash FROM __drizzle_migrations ORDER BY rowid").all()).toEqual(
+			realHashes,
+		);
+		expect(stableHistory()).toEqual(historyBefore);
+		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		for (const [table, constraints] of foreignKeysBefore) {
+			expect(foreignKeys(table)).toEqual(expect.arrayContaining(constraints));
+		}
+		expect(sqlite.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+		expect(sqlite.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+		expect(sqlite.prepare("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 0 });
+		const changesBefore = sqlite.prepare("SELECT total_changes() AS changes").get();
+		applyPendingMigrationsByHash(sqlite, folder);
+		expect(sqlite.prepare("SELECT total_changes() AS changes").get()).toEqual(changesBefore);
+		expect(sqlite.prepare("SELECT hash FROM __drizzle_migrations ORDER BY rowid").all()).toEqual(
+			realHashes,
+		);
+		expect(stableHistory()).toEqual(historyBefore);
 		expect(columnNames(sqlite, "narrators")).not.toContain("prune_boundary_message_id");
 		expect(
 			sqlite
@@ -1394,6 +1531,276 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		expect(
 			sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='narrators'").get(),
 		).toBeTruthy();
+	});
+
+	test("proves canonical SQL under a private journal tag and leaves unrelated triggers alone", () => {
+		sqlite = createInstalledModelHistoryDatabase();
+		sqlite.run(
+			"CREATE TRIGGER unrelated_business_trigger AFTER UPDATE ON users BEGIN SELECT 1; END;",
+		);
+		const folder = migrationsFolderWith(
+			"0000_private_model_history_proof",
+			proofProbeStatements,
+			officialModelHistoryStatements.map(
+				(statement) => `\n${statement.trim().replace(/;$/, "")}\n`,
+			),
+		);
+		applyPendingMigrationsByHash(sqlite, folder);
+		expect(stampedHashes(sqlite)).toBe(2);
+		expect(sqlite.prepare("SELECT * FROM model_history_probe").all()).toEqual([
+			{ id: "kept", payload: "original" },
+		]);
+		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(
+			sqlite.prepare("SELECT 1 FROM sqlite_schema WHERE name='unrelated_business_trigger'").get(),
+		).toBeTruthy();
+		expect(sqlite.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+	});
+
+	const installedContractDrifts: Array<{ name: string; statements: string[] }> = [
+		{
+			name: "same-name fake trigger with the same count",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 6
+					? "CREATE TRIGGER model_history_v1_message_insert AFTER INSERT ON narrator_messages BEGIN SELECT 1; END;"
+					: sql,
+			),
+		},
+		{
+			name: "same-name altered trigger body",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 6 ? sql.replace("NEW.body_revision + 1", "NEW.body_revision + 7") : sql,
+			),
+		},
+		{
+			name: "same-name trigger on the wrong table",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 6 ? sql.replace("ON narrator_messages", "ON users") : sql,
+			),
+		},
+		{
+			name: "oversized same-name trigger SQL",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 6
+					? `CREATE TRIGGER model_history_v1_message_insert AFTER INSERT ON narrator_messages BEGIN SELECT '${"x".repeat(16 * 1024)}'; END;`
+					: sql,
+			),
+		},
+		{
+			name: "missing trigger",
+			statements: officialModelHistoryStatements.filter((_, index) => index !== 6),
+		},
+		{
+			name: "extra v1-contract trigger",
+			statements: [
+				...officialModelHistoryStatements,
+				"CREATE TRIGGER model_history_v1_unknown AFTER UPDATE ON users BEGIN SELECT 1; END;",
+			],
+		},
+		{
+			name: "missing marker",
+			statements: officialModelHistoryStatements.slice(0, -1),
+		},
+		{
+			name: "wrong marker id",
+			statements: officialModelHistoryStatements.map((sql) =>
+				sql.replace("('model-history',", "('wrong-history',"),
+			),
+		},
+		{
+			name: "wrong installed version",
+			statements: officialModelHistoryStatements.map((sql) =>
+				sql.replace("'model-history-v1'", "'model-history-v2'"),
+			),
+		},
+		{
+			name: "missing contract table",
+			statements: officialModelHistoryStatements.filter(
+				(_, index) => index !== 1 && index !== officialModelHistoryStatements.length - 1,
+			),
+		},
+		{
+			name: "contract id is not a primary key",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 1 ? sql.replace(" PRIMARY KEY", "") : sql,
+			),
+		},
+		{
+			name: "contract id has the wrong type",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 1 ? sql.replace("`id` text", "`id` blob") : sql,
+			),
+		},
+		{
+			name: "contract version is nullable",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 1
+					? sql.replace("`installed_version` text NOT NULL", "`installed_version` text")
+					: sql,
+			),
+		},
+		{
+			name: "contract version has an unexpected default",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 1
+					? sql.replace(
+							"`installed_version` text",
+							"`installed_version` text DEFAULT 'model-history-v1'",
+						)
+					: sql,
+			),
+		},
+	];
+	for (const [index, column] of [
+		[2, "body_revision"],
+		[3, "model_revision"],
+		[4, "model_history_revision"],
+	] as const) {
+		for (const [name, replace] of [
+			["wrong type", (sql: string) => sql.replace(" integer ", " text ")],
+			["nullable", (sql: string) => sql.replace(" NOT NULL", "")],
+			["wrong default", (sql: string) => sql.replace("DEFAULT 0", "DEFAULT 1")],
+		] as const) {
+			installedContractDrifts.push({
+				name: `${column}: ${name}`,
+				statements: officialModelHistoryStatements.map((sql, position) =>
+					position === index ? replace(sql) : sql,
+				),
+			});
+		}
+		installedContractDrifts.push({
+			name: `${column}: missing column`,
+			statements: officialModelHistoryStatements.filter((_, position) => position !== index),
+		});
+	}
+	for (const { name, statements } of installedContractDrifts) {
+		test(`does not prove an installed model-history milestone with ${name}`, () => {
+			sqlite = createInstalledModelHistoryDatabase(statements);
+			const triggersBefore = normalizedTriggerSql(sqlite);
+			const folder = migrationsFolderWith(
+				"0000_unproven_model_history",
+				proofProbeStatements,
+				officialModelHistoryStatements,
+			);
+			expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+				/no such table: missing_model_history_replay_table/,
+			);
+			expect(stampedHashes(sqlite)).toBe(0);
+			expect(normalizedTriggerSql(sqlite)).toEqual(triggersBefore);
+			expect(sqlite.prepare("SELECT * FROM model_history_probe").all()).toEqual([
+				{ id: "kept", payload: "original" },
+			]);
+		});
+	}
+
+	const unrecognizedCandidateSql = [
+		{
+			name: "an added unknown statement",
+			statements: [
+				...officialModelHistoryStatements,
+				"INSERT INTO unknown_migration_target (id) VALUES ('not-approved');",
+			],
+		},
+		{
+			name: "an unknown statement within a canonical statement chunk",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 0 ? `${sql}\nDELETE FROM model_history_probe;` : sql,
+			),
+		},
+		{
+			name: "a changed trigger body",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 6 ? sql.replace("NEW.body_revision + 1", "NEW.body_revision + 2") : sql,
+			),
+		},
+		{
+			name: "a different contract version literal",
+			statements: officialModelHistoryStatements.map((sql) =>
+				sql.replace("'model-history-v1'", "'model-history-v2'"),
+			),
+		},
+		{
+			name: "a different contract table shape",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 1 ? sql.replace(" PRIMARY KEY", "") : sql,
+			),
+		},
+		{
+			name: "a different revision default",
+			statements: officialModelHistoryStatements.map((sql, index) =>
+				index === 2 ? sql.replace("DEFAULT 0", "DEFAULT 1") : sql,
+			),
+		},
+		{
+			name: "a reordered canonical statement sequence",
+			statements: [
+				...officialModelHistoryStatements.slice(0, 6),
+				officialModelHistoryStatements[7],
+				officialModelHistoryStatements[6],
+				...officialModelHistoryStatements.slice(8),
+			],
+		},
+	];
+	for (const { name, statements } of unrecognizedCandidateSql) {
+		test(`does not prove a journal candidate with ${name}`, () => {
+			sqlite = createInstalledModelHistoryDatabase();
+			const folder = migrationsFolderWith(
+				"0196_narrator_model_history_revision",
+				proofProbeStatements,
+				statements,
+			);
+			expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+				/no such table: missing_model_history_replay_table/,
+			);
+			expect(stampedHashes(sqlite)).toBe(0);
+			expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		});
+	}
+
+	test("rolls back all milestone hashes, DDL and data when a later pending migration fails", () => {
+		sqlite = createInstalledModelHistoryDatabase();
+		const folder = migrationsFolderWith(
+			"0000_model_history_rollback",
+			proofProbeStatements,
+			officialModelHistoryStatements,
+			[
+				"CREATE TABLE model_history_suffix_scratch (id text);",
+				"UPDATE model_history_probe SET payload='must-rollback';",
+				"INSERT INTO missing_model_history_suffix (id) VALUES ('fail');",
+			],
+		);
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+			/no such table: missing_model_history_suffix/,
+		);
+		expect(stampedHashes(sqlite)).toBe(0);
+		expect(sqlite.prepare("SELECT * FROM model_history_probe").all()).toEqual([
+			{ id: "kept", payload: "original" },
+		]);
+		expect(
+			sqlite.prepare("SELECT 1 FROM sqlite_schema WHERE name='model_history_suffix_scratch'").get(),
+		).toBeNull();
+		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(sqlite.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+	});
+
+	test("rechecks the installed proof before stamping and rolls back earlier proof-invalidating SQL", () => {
+		sqlite = createInstalledModelHistoryDatabase();
+		const folder = migrationsFolderWith(
+			"0000_model_history_invalidated",
+			["UPDATE model_history_revision_contracts SET installed_version='wrong-version';"],
+			officialModelHistoryStatements,
+		);
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+			/Installed model-history migration proof changed during replay/,
+		);
+		expect(stampedHashes(sqlite)).toBe(0);
+		expect(
+			sqlite.prepare("SELECT installed_version FROM model_history_revision_contracts").get(),
+		).toEqual({
+			installed_version: "model-history-v1",
+		});
+		expect(normalizedTriggerSql(sqlite)).toEqual(canonicalTriggers);
+		expect(sqlite.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
 	});
 
 	const retiredIndexSql =

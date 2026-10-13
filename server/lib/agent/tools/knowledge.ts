@@ -3,6 +3,8 @@ import type { Principal } from "../../../services/knowledge-acl";
 import { knowledgeAcl } from "../../../services/knowledge-acl";
 import { knowledgeBranchService } from "../../../services/knowledge-branch-service";
 import { knowledgeService } from "../../../services/knowledge-service";
+import { ForbiddenError, NotFoundError } from "../../errors";
+import { logger } from "../../logger";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
@@ -137,6 +139,13 @@ export const knowledgeSearchTool: ToolDefinition = {
 /** Max characters of entry body returned to the model — guards the context window. */
 const KNOWLEDGE_READ_MAX_CHARS = 24_000;
 
+type KnowledgeReadStage = "principal" | "entry" | "draft_drift" | "draft_diff" | "draft";
+
+/** Only log bounded NarraFork IDs, never arbitrary input or exception text. */
+function knowledgeReadLogId(value: string): string {
+	return /^[A-Za-z0-9_-]{21}$/.test(value) ? value : "[invalid-id]";
+}
+
 export const knowledgeReadTool: ToolDefinition = {
 	name: "KnowledgeRead",
 	description:
@@ -152,8 +161,11 @@ export const knowledgeReadTool: ToolDefinition = {
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { entryId, useDraft } = args as { entryId: string; useDraft?: boolean };
+		// Advanced as the read progresses so a failure can name the hop that broke. Never rendered.
+		let stage: KnowledgeReadStage = "principal";
 		try {
 			const principal = await principalOf(ctx);
+			stage = "entry";
 			// getEntry enforces ACL when principal is supplied; no access → NotFoundError.
 			const entry = (await knowledgeService.getEntry(entryId, {
 				withContent: true,
@@ -180,12 +192,14 @@ export const knowledgeReadTool: ToolDefinition = {
 			let drifted = false;
 			let versionsBehind = 0;
 			if (useDraft !== false && principal.userId) {
+				stage = "draft_drift";
 				const drift = await knowledgeBranchService.getDraftDrift(principal, entryId);
 				if (drift.hasDraft) {
 					if (drift.drifted) {
 						// Show main; surface the personal version as a diff + rebase hint.
 						drifted = true;
 						versionsBehind = drift.versionsBehind;
+						stage = "draft_diff";
 						const diff = await knowledgeBranchService.getDraftDiff(principal, drift.draftId, {
 							against: "current",
 						});
@@ -203,6 +217,7 @@ export const knowledgeReadTool: ToolDefinition = {
 						body = mainBody;
 					} else {
 						// Not drifted → keep shadowing the personal version (the intended working-copy view).
+						stage = "draft";
 						const draft = await knowledgeBranchService.getMyDraft(principal, entryId);
 						body = draft?.content ?? mainBody;
 						isDraft = true;
@@ -230,15 +245,30 @@ export const knowledgeReadTool: ToolDefinition = {
 					drift: { drifted, versionsBehind },
 				},
 			};
-		} catch {
-			// Deliberately does NOT distinguish "no such id" from "no permission" — telling the
-			// caller which one it is leaks the existence of entries they may not see. But name
-			// both possibilities and the way forward, or the agent has no next move.
+		} catch (err) {
+			// Deliberately does NOT distinguish "no such id" from "no permission": telling the caller
+			// which one it is leaks the existence of entries they may not see.
+			if (err instanceof NotFoundError || err instanceof ForbiddenError) {
+				return {
+					output:
+						`Knowledge entry not found or not accessible: ${entryId}. ` +
+						`Either the id is wrong or your clearance/tags do not cover it. ` +
+						`Use KnowledgeSearch to get valid ids, or ask an admin for access.`,
+					isError: true,
+				};
+			}
+			// Driver errors may embed SQL, parameters or content. Log only fixed classifications.
+			logger.error("KnowledgeRead failed", {
+				stage,
+				entryId: knowledgeReadLogId(entryId),
+				narratorId: knowledgeReadLogId(ctx.narratorId),
+				errorType: err instanceof Error ? "Error" : "NonError",
+			});
 			return {
 				output:
-					`Knowledge entry not found or not accessible: ${entryId}. ` +
-					`Either the id is wrong or your clearance/tags do not cover it. ` +
-					`Use KnowledgeSearch to get valid ids, or ask an admin for access.`,
+					"Knowledge read failed [KNOWLEDGE_READ_FAILED] because of a server-side error. " +
+					"This does not establish whether the entry exists or is accessible. " +
+					"Retry shortly; if it keeps failing, ask an administrator to check the server log.",
 				isError: true,
 			};
 		}

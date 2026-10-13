@@ -95,6 +95,7 @@ function unavailableSqliteHandle<T>(handle: string): T {
 }
 
 let postgresRuntimeValue: PostgresRuntime | null = null;
+let postgresReadUrlValue: string | null = null;
 let sqliteLifecycle: SqliteLifecycle | null = null;
 let db: MainDb;
 let sqlite: Database;
@@ -111,6 +112,7 @@ if (databaseConfig.backend === "postgres") {
 	// runtime keeps the second evaluation from leaking a client and re-running DDL.
 	const started = await getOrStartPostgresRuntime(databaseConfig);
 	postgresRuntimeValue = started.runtime;
+	postgresReadUrlValue = started.readUrl;
 	if (!started.isHotReload) logPostgresStartup(started.runtime, databaseConfig);
 	// "Cannot skip verification" — never wasClean: true. PostgreSQL has no clean-shutdown
 	// marker to consume, and reporting one would retire the integrity story silently.
@@ -181,6 +183,11 @@ if (databaseConfig.backend === "postgres") {
  * into every PostgreSQL-capable store, and what the graceful shutdown closes.
  */
 export const postgresRuntime = postgresRuntimeValue;
+/** Internal credential-bearing URL confirmed by the SAME pinned runtime as signature queries.
+ * Never expose this value in API responses, logs or worker errors. Mutable environment
+ * configuration cannot replace it: a mismatched/legacy runtime fails before this export.
+ */
+export const activePostgresReadUrl = postgresReadUrlValue;
 
 // `sqlite` is exported in its own statement at the END of this module on purpose: the
 // dialect-inventory guard pins that exact spelling to prove the native handle still has

@@ -13,6 +13,11 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import {
+	MODEL_HISTORY_REVISION_CONTRACT,
+	modelHistoryTriggerSuffix,
+	renderModelHistoryRevisionSql,
+} from "../generated-model-history-triggers";
 import type { runPostgresKit } from "../postgres-kit";
 import {
 	CURRENT_SNAPSHOT,
@@ -25,6 +30,7 @@ import {
 	executePostgresMigrations,
 	type PostgresMigrationOptions,
 } from "../postgres-migration-transaction";
+import { modelHistorySnapshots, revisionMigrationSql } from "./model-history-migration-fixture";
 
 const roots: string[] = [];
 const ZERO = "00000000-0000-0000-0000-000000000000";
@@ -137,6 +143,102 @@ function savePending(f: { meta: string }, value: unknown) {
 }
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function generatedRevision(): typeof runPostgresKit {
+	return generated((stage) => {
+		const journal = JSON.parse(readFileSync(join(stage, "meta/_journal.json"), "utf8"));
+		const entry = journal.entries.at(-1);
+		const path = join(stage, `meta/${String(entry.idx).padStart(4, "0")}_snapshot.json`);
+		const snapshot = JSON.parse(readFileSync(path, "utf8"));
+		snapshot.tables = Object.fromEntries(
+			Object.entries(modelHistorySnapshots().after.tables).map(([name, table]) => [
+				`public.${name}`,
+				{ ...table, name, schema: "public" },
+			]),
+		);
+		writeFileSync(path, JSON.stringify(snapshot));
+		writeFileSync(join(stage, `${entry.tag}.sql`), revisionMigrationSql);
+	});
+}
+
+test("PG revision triggers join the generated schema batch before durable receipt and resume without rewriting history", async () => {
+	const f = await baseline();
+	const old = hashes(f.folder);
+	let kitCalls = 0;
+	const run = generatedRevision();
+	await expect(
+		executePostgresMigrations("generate", ["--name", "model_history_revision"], {
+			root: f.root,
+			runKit: async (input) => {
+				kitCalls++;
+				const result = await run(input);
+				if (kitCalls === 2)
+					expect(readFileSync(join(input.root, input.stageOut, "0002_generated.sql"), "utf8")).toBe(
+						revisionMigrationSql,
+					);
+				return result;
+			},
+			faultInject: (phase) => {
+				if (phase === "receipt") throw new Error("receipt interrupted");
+			},
+		}),
+	).rejects.toThrow("receipt interrupted");
+	expect(kitCalls).toBe(2);
+	const receipt = pending(f);
+	expect(receipt.modelHistoryTriggers).toEqual({
+		contract: MODEL_HISTORY_REVISION_CONTRACT,
+		sqlDigest: digest(renderModelHistoryRevisionSql("postgres")),
+	});
+	const staged = readFileSync(join(f.root, receipt.stage, "publish/0002_generated.sql"), "utf8");
+	expect(staged.endsWith(modelHistoryTriggerSuffix("postgres"))).toBe(true);
+	expect(receipt.newFiles["0002_generated.sql"]).toBe(digest(staged));
+	expect(readPgMetadata(f.folder, { allowPending: true }).files).toEqual(old);
+	await executePostgresMigrations("resume", [], {
+		root: f.root,
+		runKit: async () => {
+			throw new Error("resume must not invoke Kit");
+		},
+	});
+	const after = hashes(f.folder);
+	for (const [path, sha] of Object.entries(old))
+		if (path.endsWith(".sql")) expect(after[path]).toBe(sha);
+	expect(readFileSync(join(f.folder, "0002_generated.sql"), "utf8")).toBe(staged);
+	expect((await readPgMetadata(f.folder)).journal.entries).toHaveLength(3);
+	expect(
+		await executePostgresMigrations("generate", [], { root: f.root, runKit: noop }),
+	).toMatchObject({ changed: false });
+});
+
+test.each([
+	"renderer",
+	"suffix",
+])("PG receipt-bound trigger %s tampering fails even with internally matching hashes", async (mode) => {
+	const f = await baseline();
+	const old = hashes(f.folder);
+	await expect(
+		executePostgresMigrations("generate", [], {
+			root: f.root,
+			runKit: generatedRevision(),
+			faultInject: (phase) => {
+				if (phase === "receipt") throw new Error("interrupted");
+			},
+		}),
+	).rejects.toThrow("interrupted");
+	const receipt = pending(f);
+	if (mode === "renderer") receipt.modelHistoryTriggers.sqlDigest = "0".repeat(64);
+	else {
+		const path = join(f.root, receipt.stage, "publish/0002_generated.sql");
+		writeFileSync(path, revisionMigrationSql);
+		receipt.newFiles["0002_generated.sql"] = digest(revisionMigrationSql);
+	}
+	savePending(f, receipt);
+	const { phase: _phase, ...proposal } = receipt;
+	writeFileSync(join(f.root, receipt.stage, ".transaction.json"), JSON.stringify(proposal));
+	await expect(executePostgresMigrations("resume", [], { root: f.root })).rejects.toThrow(
+		mode === "renderer" ? "renderer changed" : "noncanonical",
+	);
+	expect(readPgMetadata(f.folder, { allowPending: true }).files).toEqual(old);
 });
 
 describe("PostgreSQL baseline convergence and generation", () => {
