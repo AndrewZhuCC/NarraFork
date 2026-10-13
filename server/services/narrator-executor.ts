@@ -102,6 +102,9 @@ export interface ExecuteLoopResult {
 	 * `interrupted`.
 	 */
 	interruptedReason?: "completion_limit" | "resumable_error";
+	/** Original upstream failure retained for bounded continuation exhaustion. */
+	interruptionError?: string;
+	interruptionDiagnostics?: ApiRequestDiagnostics;
 	/** Set when the agent loop exhausted its configured max-turn budget. */
 	maxTurnsExceeded?: boolean;
 	/** Replay the tool-result request packet instead of sending a textual continue prompt. */
@@ -150,6 +153,8 @@ export async function executeAgentLoop(
 	let aborted = false;
 	let interrupted = false;
 	let interruptedReason: ExecuteLoopResult["interruptedReason"];
+	let interruptionError: string | undefined;
+	let interruptionDiagnostics: ApiRequestDiagnostics | undefined;
 	let maxTurnsExceeded = false;
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
@@ -279,6 +284,8 @@ export async function executeAgentLoop(
 				// output_truncated) so the caller can append a continuation turn.
 				interrupted = true;
 				interruptedReason = "resumable_error";
+				interruptionError = event.message;
+				interruptionDiagnostics = event.diagnostics;
 				break;
 			}
 			if (event.type === "max_turns_exceeded") {
@@ -348,6 +355,8 @@ export async function executeAgentLoop(
 		completedNaturally: completedNaturally && !aborted,
 		interrupted,
 		interruptedReason,
+		interruptionError,
+		interruptionDiagnostics,
 		maxTurnsExceeded,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),

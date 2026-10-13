@@ -1480,6 +1480,15 @@ function metaRowBlocks(row: ToolMetaRow, marginTop: number): PreparedBlock[] {
 		);
 		nextMargin = META_ROW_GAP;
 	}
+	// An identity line (Await's resolved child session) reserves the SAME fixed
+	// row the badge row used: bounded monospace content + the open-session button,
+	// none of it ever reaching the text measurer.
+	if (row.identity) {
+		out.push(
+			makeFixed(META_BADGE_ROW, "detail-meta-identity", nextMargin, { identity: row.identity }),
+		);
+		nextMargin = META_ROW_GAP;
+	}
 	if ((row.badges?.length ?? 0) > 0) {
 		out.push(makeFixed(META_BADGE_ROW, "detail-meta-badges", nextMargin, { badges: row.badges }));
 		nextMargin = META_ROW_GAP;

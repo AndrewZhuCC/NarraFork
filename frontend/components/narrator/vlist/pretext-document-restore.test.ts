@@ -16,12 +16,17 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { installCanvasStub } from "./measure/test-canvas-stub";
-import { clearPretextDocumentCache } from "./pretext-document-cache";
+import { clearPretextDocumentCache, peekCachedPretextDocument } from "./pretext-document-cache";
+import {
+	type PretextDocumentFetchPage,
+	preloadPretextDocumentTail,
+} from "./pretext-document-loader";
 import type { PretextDocumentView, UsePretextDocumentResult } from "./usePretextDocument";
 import { usePretextDocument } from "./usePretextDocument";
 
@@ -124,6 +129,9 @@ function page(seqs: readonly number[], messageVersion = 3): PretextDocumentPageR
 
 /** Controllable transport: counts calls and can be held open to observe first paint. */
 let fetchCalls = 0;
+let fetchQueries: Parameters<PretextDocumentFetchPage>[1][] = [];
+let locateCalls: string[] = [];
+let locateFailure: Error | null = null;
 let nextPage: () => PretextDocumentPageResult = () => page([0, 1]);
 let gate: { promise: Promise<void>; release: () => void } | null = null;
 
@@ -136,8 +144,14 @@ function openGate() {
 }
 
 const LOAD_OPTIONS = {
-	fetchPage: async () => {
+	locateMessage: async (_narratorId: string, messageId: string) => {
+		locateCalls.push(messageId);
+		if (locateFailure) throw locateFailure;
+		return { messageId, topLevelMessageId: messageId, seq: Number(messageId.slice(2)) };
+	},
+	fetchPage: async (_narratorId: string, options: Parameters<PretextDocumentFetchPage>[1]) => {
 		fetchCalls++;
+		fetchQueries.push(options);
 		if (gate) await gate.promise;
 		return nextPage();
 	},
@@ -148,14 +162,17 @@ function readCurrentView(): PretextDocumentView {
 }
 
 let renders: UsePretextDocumentResult[] = [];
+let contentWidth = 860;
+let layoutReady = true;
 
 function makeHarness(narratorId: string) {
 	return function Harness() {
 		renders.push(
 			usePretextDocument(narratorId, {
 				lod: 5,
-				widthBucket: "860",
-				contentWidth: 860,
+				widthBucket: String(contentWidth),
+				contentWidth,
+				layoutReady,
 				viewportHeight: 720,
 				scrollTop: 0,
 				pinnedToBottom: true,
@@ -172,13 +189,13 @@ let restoreCanvas: (() => void) | null = null;
 let roots: Root[] = [];
 let containers: HTMLDivElement[] = [];
 
-async function mount(narratorId: string): Promise<Root> {
+async function mount(narratorId: string, Harness = makeHarness(narratorId)): Promise<Root> {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	const root = createRoot(container);
 	containers.push(container);
 	roots.push(root);
-	root.render(createElement(makeHarness(narratorId), {}));
+	root.render(createElement(Harness, {}));
 	await settle();
 	return root;
 }
@@ -201,6 +218,11 @@ beforeEach(() => {
 	roots = [];
 	containers = [];
 	fetchCalls = 0;
+	fetchQueries = [];
+	locateCalls = [];
+	locateFailure = null;
+	contentWidth = 860;
+	layoutReady = true;
 	gate = null;
 	nextPage = () => page([0, 1]);
 	clearPretextDocumentCache();
@@ -220,6 +242,259 @@ afterEach(async () => {
 });
 
 describe("pretext document restore across a narrator switch", () => {
+	test("a warm server-version-zero window revalidates canonically with no tail transport", async () => {
+		nextPage = () => page([0, 1], 0);
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		expect(peekCachedPretextDocument("n1")?.messageVersion).toBe(0);
+		fetchCalls = 0;
+		fetchQueries = [];
+		locateCalls = [];
+		nextPage = () => ({
+			...page([0, 1, 2], 1),
+			messages: [message(0, "edited head"), message(1, "unchanged"), message(2, "appended")],
+		});
+		await mount("n1");
+		expect(locateCalls).toEqual(["m-0"]);
+		expect(fetchCalls).toBe(1);
+		expect(fetchQueries.map(({ afterSeq, limit }) => ({ afterSeq, limit }))).toEqual([
+			{ afterSeq: -1, limit: 100 },
+		]);
+		expect(latest().messages.map((entry) => entry.contentText)).toEqual([
+			"edited head",
+			"unchanged",
+			"appended",
+		]);
+		expect(latest().messageVersion).toBe(1);
+	});
+
+	test("a deleted stable head falls back to precisely one canonical tail", async () => {
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		fetchCalls = 0;
+		fetchQueries = [];
+		nextPage = () => page([1, 2], 4);
+		await mount("n1");
+		expect(fetchCalls).toBe(2);
+		expect(fetchQueries.filter((query) => query.afterSeq === undefined)).toHaveLength(1);
+		expect(latest().messages.map((entry) => entry.id)).toEqual(["m-1", "m-2"]);
+		expect(latest().messageVersion).toBe(4);
+	});
+
+	test("a 409 during stable-head lookup uses one fresh tail and does not pretend cache is current", async () => {
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		fetchCalls = 0;
+		fetchQueries = [];
+		locateFailure = Object.assign(new Error("canonical window changed"), { status: 409 });
+		nextPage = () => page([7, 8], 5);
+		await mount("n1");
+		expect(fetchCalls).toBe(1);
+		expect(fetchQueries[0]?.afterSeq).toBeUndefined();
+		expect(latest().messages.map((entry) => entry.id)).toEqual(["m-7", "m-8"]);
+	});
+
+	for (const status of [401, 403]) {
+		test(`warm ${status} clears visible text/cache and never falls back to a tail`, async () => {
+			const first = await mount("n1");
+			unmount(first);
+			await settle();
+			fetchCalls = 0;
+			locateFailure = Object.assign(new Error("access denied"), { status });
+			const second = await mount("n1");
+			expect(latest().status).toBe("error");
+			expect(latest().messages).toEqual([]);
+			expect(latest().index).toBeUndefined();
+			expect(latest().error).toBe(locateFailure);
+			expect(peekCachedPretextDocument("n1")).toBeNull();
+			expect(fetchCalls).toBe(0);
+			unmount(second);
+			await settle();
+			expect(peekCachedPretextDocument("n1")).toBeNull();
+		});
+	}
+
+	test("a layout-generation change retries within the canonical path, never with an extra tail", async () => {
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		fetchCalls = 0;
+		fetchQueries = [];
+		openGate();
+		const Harness = makeHarness("n1");
+		const second = await mount("n1", Harness);
+		contentWidth = 920;
+		second.render(createElement(Harness, {}));
+		await settle();
+		nextPage = () => page([0, 1, 2], 4);
+		gate?.release();
+		await settle();
+		expect(latest().messageVersion).toBe(4);
+		expect(latest().messages).toHaveLength(3);
+		expect(fetchCalls).toBe(2);
+		expect(fetchQueries.every((query) => query.afterSeq === -1)).toBe(true);
+	});
+
+	test("unmount cancellation aborts a warm read and never commits or starts a fallback", async () => {
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		fetchCalls = 0;
+		fetchQueries = [];
+		openGate();
+		const second = await mount("n1");
+		const signal = fetchQueries[0]?.signal;
+		expect(signal?.aborted).toBe(false);
+		unmount(second);
+		await settle();
+		expect(signal?.aborted).toBe(true);
+		nextPage = () => page([0, 1, 2], 4);
+		gate?.release();
+		await settle();
+		expect(fetchCalls).toBe(1);
+		expect(peekCachedPretextDocument("n1")?.messageVersion).toBe(3);
+	});
+	for (const width of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+		test(`unusable width ${width} preserves a warm snapshot until a real width is available`, async () => {
+			const first = await mount("n1");
+			unmount(first);
+			await settle();
+			const cached = peekCachedPretextDocument("n1");
+			expect(cached).not.toBeNull();
+			fetchCalls = 0;
+			contentWidth = width;
+			openGate();
+			const Harness = makeHarness("n1");
+			const root = await mount("n1", Harness);
+			expect(latest().status).toBe("idle");
+			expect(latest().error).toBeUndefined();
+			expect(fetchCalls).toBe(0);
+			expect(peekCachedPretextDocument("n1")).toBe(cached);
+			contentWidth = 860;
+			root.render(createElement(Harness, {}));
+			await settle();
+			expect(latest().index).toBeDefined();
+			expect(latest().messages.map((item) => item.seq)).toEqual([0, 1]);
+			expect(fetchCalls).toBe(1);
+			gate?.release();
+			gate = null;
+			await settle();
+			expect(latest().status).toBe("ready");
+		});
+	}
+
+	test("a positive-width parked pane defers cache adoption without destroying its coordinator", async () => {
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		const cached = peekCachedPretextDocument("n1");
+		fetchCalls = 0;
+		layoutReady = false;
+		openGate();
+		const Harness = makeHarness("n1");
+		const root = await mount("n1", Harness);
+		expect(latest().index).toBeUndefined();
+		expect(fetchCalls).toBe(0);
+		expect(peekCachedPretextDocument("n1")).toBe(cached);
+		layoutReady = true;
+		root.render(createElement(Harness, {}));
+		await settle();
+		expect(latest().messages.map((item) => item.seq)).toEqual([0, 1]);
+		expect(latest().index).toBeDefined();
+		expect(fetchCalls).toBe(1);
+		gate?.release();
+		gate = null;
+		await settle();
+	});
+
+	test("a completed route preload waits for the first usable geometry without a second tail", async () => {
+		contentWidth = 0;
+		layoutReady = false;
+		openGate();
+		const preloaded = preloadPretextDocumentTail("n1", LOAD_OPTIONS);
+		const Harness = makeHarness("n1");
+		const root = await mount("n1", Harness);
+		expect(fetchCalls).toBe(1);
+		expect(latest().index).toBeUndefined();
+		gate?.release();
+		gate = null;
+		await preloaded;
+		await settle();
+		expect(latest().status).toBe("idle");
+		expect(latest().error).toBeUndefined();
+		contentWidth = 860;
+		layoutReady = true;
+		root.render(createElement(Harness, {}));
+		await settle();
+		expect(latest().status).toBe("ready");
+		expect(fetchCalls).toBe(1);
+	});
+
+	test("a mounted coordinator adopts the route's pending preload without a second tail", async () => {
+		openGate();
+		const preloaded = preloadPretextDocumentTail("n1", {
+			...LOAD_OPTIONS,
+			firstScreenPageSize: 40,
+		});
+		await mount("n1");
+		expect(fetchCalls).toBe(1);
+		gate?.release();
+		gate = null;
+		await preloaded;
+		await settle();
+		expect(latest().status).toBe("ready");
+		expect(fetchCalls).toBe(1);
+	});
+
+	test("cached restoration revalidates from a completed route preload only once", async () => {
+		const first = await mount("n1");
+		unmount(first);
+		await settle();
+		fetchCalls = 0;
+		nextPage = () => page([0, 1, 2], 4);
+		await preloadPretextDocumentTail("n1", LOAD_OPTIONS);
+		await mount("n1");
+		await settle();
+		expect(latest().messageVersion).toBe(4);
+		expect(fetchCalls).toBe(1);
+	});
+
+	test("an in-page authentication switch retires the previous principal's coordinator", async () => {
+		const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+		const store = new Map<string, string>();
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem: (key: string) => store.get(key) ?? null,
+				setItem: (key: string, value: string) => store.set(key, value),
+				removeItem: (key: string) => store.delete(key),
+			},
+		});
+		let first: Root | undefined;
+		try {
+			setToken("principal-a");
+			first = await mount("n1");
+			expect(latest().messages.map((item) => item.seq)).toEqual([0, 1]);
+			openGate();
+			nextPage = () => page([7, 8], 5);
+			setToken("principal-b");
+			await settle();
+			expect(latest().messages).toHaveLength(0);
+			gate?.release();
+			gate = null;
+			await settle();
+			expect(latest().messages.map((item) => item.seq)).toEqual([7, 8]);
+		} finally {
+			if (first) unmount(first);
+			clearToken();
+			if (originalStorage) Object.defineProperty(globalThis, "localStorage", originalStorage);
+			else Reflect.deleteProperty(globalThis, "localStorage");
+		}
+	});
+
 	test("a first visit has nothing to restore and loads normally", async () => {
 		await mount("n1");
 		expect(latest().status).toBe("ready");

@@ -12,7 +12,7 @@
  * one, and the source chapter hears about it. `converted` / `dismissed` stay closed —
  * those reviews have had their worktree and narrator torn down.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { asc, desc, eq } from "drizzle-orm";
 import { db } from "../../db";
 import { chapters, projects, reviewConclusions } from "../../db/schema";
@@ -131,6 +131,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	setSystemTime();
 	eventBus.off("review:concluded", recordConcluded);
 	for (const id of createdChapterIds.splice(0)) {
 		await db.delete(chapters).where(eq(chapters.id, id));
@@ -167,6 +168,8 @@ describe("resubmitting after the workspace guard asked for a re-examination", ()
 	});
 
 	test("the new conclusion becomes the current one, and the old one is kept", async () => {
+		// CI exposed two submissions in one millisecond. Keep that case deterministic.
+		setSystemTime(new Date("2026-10-11T00:00:00.000Z"));
 		const { reviewChapterId, sourceChapterId } = await seedReview("reviewing");
 		await submit(reviewChapterId, "request_changes", ["stale finding"]);
 		await submit(reviewChapterId, "approve", ["verified against the real source"]);
@@ -178,6 +181,7 @@ describe("resubmitting after the workspace guard asked for a re-examination", ()
 		});
 		expect(all).toHaveLength(2);
 		expect(all[0]?.verdict).toBe("request_changes");
+		expect(Date.parse(all[1]?.createdAt ?? "")).toBe(Date.parse(all[0]?.createdAt ?? "") + 1);
 
 		// …while every "what does the reviewer say" reader sees only the newest.
 		const latestForReview = await db.query.reviewConclusions.findFirst({
@@ -189,6 +193,41 @@ describe("resubmitting after the workspace guard asked for a re-examination", ()
 		expect(latestForSource?.verdict).toBe("approve");
 	});
 
+	test("same-clock concurrent submissions remain strictly ordered without losing history", async () => {
+		setSystemTime(new Date("2026-10-11T00:00:00.000Z"));
+		const { reviewChapterId, sourceChapterId } = await seedReview("reviewing");
+		const results = await Promise.all(
+			Array.from({ length: 8 }, (_, i) =>
+				submit(reviewChapterId, "comment_only", [`revision ${i}`]),
+			),
+		);
+		for (const result of results) expect(result.isError).toBeUndefined();
+		const all = await db.query.reviewConclusions.findMany({
+			where: eq(reviewConclusions.reviewChapterId, reviewChapterId),
+			orderBy: [asc(reviewConclusions.createdAt)],
+		});
+		expect(all).toHaveLength(8);
+		for (let i = 0; i < all.length; i++) {
+			expect(all[i]?.findingsJson?.[0]?.message).toBe(`revision ${i}`);
+			expect(Date.parse(all[i]?.createdAt ?? "")).toBe(Date.now() + i);
+		}
+		expect(
+			(await reviewService.getLatestConclusionForSource(sourceChapterId))?.findingsJson?.[0]
+				?.message,
+		).toBe("revision 7");
+	});
+
+	test("a backwards wall clock cannot make the superseded conclusion current again", async () => {
+		const instant = Date.parse("2026-10-11T00:00:00.000Z");
+		setSystemTime(new Date(instant));
+		const { reviewChapterId, sourceChapterId } = await seedReview("reviewing");
+		await submit(reviewChapterId, "request_changes", ["old"]);
+		setSystemTime(new Date(instant - 60_000));
+		await submit(reviewChapterId, "approve", ["new"]);
+		const latest = await reviewService.getLatestConclusionForSource(sourceChapterId);
+		expect(latest?.verdict).toBe("approve");
+		expect(latest?.createdAt).toBe(new Date(instant + 1).toISOString());
+	});
 	test("the source chapter is told again, marked as a revision", async () => {
 		// Gating the announcement on the status transition made the second submission
 		// silently go nowhere: the row was written and nobody was informed.

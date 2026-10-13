@@ -57,6 +57,7 @@ export const narratorHandleSchema = z
 
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
+	contextProjectId: z.string().min(1).max(128).nullish(),
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
@@ -546,6 +547,17 @@ export const askInPassingStartSchema = z.object({
 
 export const updateNarratorModelSchema = z.object({
 	model: z.union([z.literal("__default__"), z.string().min(1).max(200)]),
+});
+
+// === Git commit identity pick ===
+
+/**
+ * Which of MY git identities this narrator commits under; null clears the pick so
+ * the default identity applies again. The service validates that the id belongs
+ * to the caller — one user cannot select (or even see) another's identity.
+ */
+export const setNarratorGitIdentitySchema = z.object({
+	identityId: z.string().min(1).max(64).nullable(),
 });
 
 // === Narrator transcript export ===

@@ -9,10 +9,12 @@
  * standalone card and a drilled-in trace row), so it appears exactly when a
  * session can actually be opened.
  *
- * Placement: the button rides the meta header's BADGES ROW (the card's second
- * line, next to the type/target/timeout chips) — never the toggleable header
- * row, whose timing indicator keeps its right-edge position. These tests pin
- * both the placement and the keyboard behaviour.
+ * Placement: the button rides the card's IDENTITY ROW — the one meta row an
+ * Await card keeps, carrying the resolved child's `slug · id` in copyable
+ * monospace — never the toggleable header row, whose timing indicator keeps its
+ * right-edge position. (It replaced the old badges row, which repeated the
+ * header's type/target/status/timeout.) These tests pin both the placement and
+ * the keyboard behaviour.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -39,7 +41,7 @@ beforeAll(async () => {
 const WIDTH = 600;
 const LOD = 5;
 
-/** The real adapter chain, so the card's detail carries the actual Await badges row. */
+/** The real adapter chain, so the card's detail carries the actual Await identity row. */
 function awaitCardData(status: "running" | "success" = "running"): ToolCallData {
 	const item: AdapterToolItem = {
 		blockIndex: 0,
@@ -50,12 +52,16 @@ function awaitCardData(status: "running" | "success" = "running"): ToolCallData 
 			status,
 			inputJson: { type: "agent", id: "plan-story-retirement" },
 			outputJson: "done",
-		},
+			// The running wait's server-resolved target: what puts the identity row
+			// (and therefore the open-session button's host) on the card.
+			_awaitAgentNarratorId: "g2GQj-mTWJqSPaaAqG_Ud",
+			_awaitAgentTitle: "Plan story retirement",
+		} as AdapterToolItem["tc"],
 	};
 	const specs = adaptSegments([{ kind: "tool-run", items: [item], sourceMessages: [] }], {
 		lod: LOD,
 		// Without the real categorizer the adapter files the call under "generic",
-		// whose detail has no badges row — the very row this suite is about.
+		// whose detail has no identity row — the very row this suite is about.
 		resolveToolCategory: (name, input) => getCategory(name, input),
 	});
 	const spec = specs[0];
@@ -91,16 +97,18 @@ function awaitCard(opts: {
 }
 
 describe("RenderToolCall — Await card open-session button", () => {
-	it("draws a real button on the badges row of an expanded card", () => {
+	it("draws a real button on the identity row of an expanded card", () => {
 		const root = awaitCard({ onOpenSession: () => {} });
 		const button = root.querySelector('[data-testid="tool-open-session"]');
 		if (!button) throw new Error("open-session button not found");
 		expect(button.tagName.toLowerCase()).toBe("button");
 		// The default label matches the subagent card's own affordance.
 		expect(button.textContent).toBe("Open full session");
-		// It sits beside the meta badges (AGENT / target / TIMEOUT chips)…
+		// It sits beside the resolved child's identity text (the copyable id)…
 		const row = button.parentElement;
-		expect(row?.querySelector(".mantine-Badge-root")).not.toBeNull();
+		expect(row?.textContent).toContain("g2GQj-mTWJqSPaaAqG_Ud");
+		// …and the old badge row is gone entirely: no Badge anywhere on the card.
+		expect(root.querySelector(".mantine-Badge-root")).toBeNull();
 		// …and never in the toggleable header row: the timing indicator keeps its
 		// right-edge position whether or not the button exists.
 		expect(button.closest("[data-nf-card-header]")).toBeNull();
@@ -119,6 +127,43 @@ describe("RenderToolCall — Await card open-session button", () => {
 	it("draws nothing when no session can be opened", () => {
 		const root = awaitCard({});
 		expect(root.querySelector('[data-testid="tool-open-session"]')).toBeNull();
+	});
+
+	it("a Send card keeps the button on its target badges row (no identity row there)", () => {
+		// The identity row belongs to Await. A single-target Send has no such row,
+		// so the button falls back to the first badges row — the target chips that
+		// name the same session. (A Send renders as a tool card only while its
+		// permission is pending; the settled form is the communication bubble.)
+		const item: AdapterToolItem = {
+			blockIndex: 0,
+			isSubagent: false,
+			tc: {
+				toolUseId: "send-call",
+				toolName: "Send",
+				status: "pending",
+				inputJson: { id: "worker", message: "hi", await: true },
+				outputJson: "done",
+			},
+		};
+		const specs = adaptSegments([{ kind: "tool-run", items: [item], sourceMessages: [] }], {
+			lod: LOD,
+			resolveToolCategory: (name, input) => getCategory(name, input),
+			// A pending permission keeps Send on the generic tool card (otherwise it
+			// becomes the communication bubble, which has its own recipient button).
+			resolveHasPendingPermission: () => true,
+		});
+		const spec = specs[0];
+		if (!spec || spec.kind !== "tool-call") throw new Error("send tool-call spec not found");
+		const root = render(
+			<RenderToolCall
+				measured={measureToolCall(spec.data as ToolCallData, WIDTH, LOD, { opened: true })}
+				onOpenSession={() => {}}
+			/>,
+		);
+		const button = root.querySelector('[data-testid="tool-open-session"]');
+		if (!button) throw new Error("open-session button not found on the Send card");
+		// The host row carries the target chips, and there is no identity text.
+		expect(button.parentElement?.querySelector(".mantine-Badge-root")).not.toBeNull();
 	});
 
 	it("folds away with the detail on a collapsed card", () => {

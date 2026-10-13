@@ -278,6 +278,77 @@ describe("live-patch audit: fields that DO change height are in the cache key", 
 			extractDataRevision({ items: [{ ...row, timing: { durationMs: 9_000 } }] }),
 		);
 	});
+	/**
+	 * `awaitAgentResolvedPatch` writes the resolved child's id + title onto a
+	 * RUNNING Await — and the card GROWS by design: the id surfaces as the
+	 * identity row (the one meta row the deduplicated Await card keeps), and the
+	 * title headlines the card. This is the opposite of the old badge-row layout,
+	 * where the patch was height-neutral because the badge row existed from the
+	 * first frame.
+	 *
+	 * So the audit must walk the REAL chain (patch fields → adapter → classifyAwait
+	 * → measured height + revision key): constructing a ToolCallData directly would
+	 * prove nothing, because these fields are consumed by the adapter, not the
+	 * measurer. If the rows component ever leaves `leafTextRevision`, the rebuild
+	 * serves the pre-patch geometry and the card clips its new identity row.
+	 */
+	it("the resolved await-agent id/title grows the card AND re-keys the measurement", async () => {
+		const { measureToolCall } = await measureMod();
+		const { extractDataRevision } = await cacheMod();
+		const { adaptSegments } = await import("./segment-adapter");
+		const { getCategory, getSummary } = await import("../tool-call/tool-display");
+		const awaitData = (extra: Record<string, unknown>): ToolCallData => {
+			const specs = adaptSegments(
+				[
+					{
+						kind: "tool-run",
+						sourceMessages: [],
+						items: [
+							{
+								blockIndex: 0,
+								isSubagent: false,
+								tc: {
+									toolUseId: "await-call",
+									toolName: "Await",
+									status: "running",
+									inputJson: { type: "agent", id: "worker" },
+									...extra,
+								} as never,
+							},
+						],
+					},
+				],
+				{
+					lod: LOD,
+					resolveToolCategory: (name, input) => getCategory(name, input),
+					// Mirror PretextExactMessageList's resolveExactToolSummary: the live
+					// transport title is lifted so the header can name the session.
+					resolveToolSummary: (tc) => {
+						const call = (tc ?? {}) as Record<string, unknown>;
+						return getSummary(call.toolName as string, call.inputJson, {
+							_awaitAgentTitle: call._awaitAgentTitle as string | undefined,
+						});
+					},
+				},
+			);
+			const spec = specs[0];
+			if (!spec || spec.kind !== "tool-call") throw new Error("await tool-call spec not found");
+			return spec.data as ToolCallData;
+		};
+		const waiting = awaitData({});
+		const resolved = awaitData({
+			_awaitAgentNarratorId: "g2GQj-mTWJqSPaaAqG_Ud",
+			_awaitAgentTitle: "Worker",
+		});
+		// The identity row appeared: the measured card is taller…
+		expect(measureToolCall(resolved, WIDTH, LOD, OPENED).height).toBeGreaterThan(
+			measureToolCall(waiting, WIDTH, LOD, OPENED).height,
+		);
+		// …and the cache key moved with it (the meta-rows identity component).
+		expect(extractDataRevision(resolved)).not.toBe(extractDataRevision(waiting));
+		// The header headlines the session title, and the detail carries the id row.
+		expect(resolved.summary).toBe("agent: Worker");
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -865,32 +936,6 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		expect(identified.height).toBe(base.height);
 	});
 
-	/**
-	 * `awaitAgentResolvedPatch` writes the child narrator id of a RUNNING Await so
-	 * the row's "open session" item appears during the wait.
-	 *
-	 * It is NOT in the exhaustive audit above, which requires a height change: this
-	 * patch must have none. That is the whole reason it writes its own field instead
-	 * of `_metadata.subagentId` — `classifyAwait` renders a `subagent:` row from the
-	 * latter, so the obvious implementation would have grown every running Await
-	 * card. This case is what would fail if someone "simplified" it back.
-	 *
-	 * No revision component is needed either (unlike `timeoutMs`): the menu reads the
-	 * MESSAGE TREE, not the cached measured payload, so a retained entry stays correct.
-	 */
-	it("the resolved await-agent narrator id does not change the measured height", async () => {
-		const { measureToolCall } = await measureMod();
-		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
-		expect(base.height).toBeGreaterThan(base.collapsedHeight);
-		const resolved = measureToolCall(
-			expandedCard({ _awaitAgentNarratorId: "sub-live" } as Partial<ToolCallData>),
-			WIDTH,
-			LOD,
-			OPENED,
-		);
-		expect(resolved.height).toBe(base.height);
-	});
-
 	it("the takeover badge does not change the measured height", async () => {
 		// The badge joins the card's ALREADY-FIXED header row, which is what makes it
 		// safe to flip mid-wait: an Agent card suspended for the whole takeover, and an
@@ -910,10 +955,13 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		expect(base.isTakenOver).toBe(false);
 	});
 
-	it("writing the await id into _metadata WOULD change the height (why it does not)", async () => {
-		// Pins the alternative this design rejects: `classifyAwait` emits a
-		// `subagent: …` row for `metadata.subagentId`, so routing the derived id
-		// through metadata is a layout change caused by a context-menu affordance.
+	it("writing the await id into _metadata DOES change the classified detail (by design)", async () => {
+		// Pins what the identity row is made of: `classifyAwait` reads
+		// `metadata.subagentId` (and the bridged `_awaitAgentNarratorId` transport
+		// field) into the card's one identity row. The patch still must not write
+		// `_metadata.subagentId` itself — not for height (the identity row's arrival
+		// is an intentional grow, audited above) but for PROVENANCE: `_metadata` is
+		// the tool's own returned payload, while the derived id is server-resolved.
 		const { classifyToolDetail } = await import("@shared/pretext-layout/tool-detail");
 		const base = {
 			toolName: "Await",

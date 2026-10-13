@@ -48,6 +48,7 @@ const {
 	getStreamingSnapshot,
 	isSameReasoningBlock,
 	processEvent,
+	retireSubagentOutputCharCount,
 } = await import("../narrator-event-handler");
 
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
@@ -335,6 +336,10 @@ function makeMainContext(sseEmitter?: EventEmitter): EventHandlerContext {
 afterEach(() => {
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);
 	clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
+	// The counters are run-scoped, not snapshot-scoped: clearStreamingSnapshot no
+	// longer retires them, so tests retire them explicitly to stay isolated.
+	retireSubagentOutputCharCount(PARENT_NARRATOR_ID);
+	retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
 	broadcastMessages.length = 0;
 	broadcastTargets.length = 0;
 });
@@ -496,6 +501,115 @@ describe("request occupancy is independent from billing and historical usage", (
 				prompt_tokens: 510800,
 				context_snapshot: snapshot,
 			});
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+});
+
+describe("durable API error association", () => {
+	test("completed request enriches the exact diagnostic object before error persistence and refresh", async () => {
+		const id = "error-association-narrator";
+		const now = "2026-10-08T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		const ctx = { ...makeMainContext(), narratorId: id, broadcastTargetId: id };
+		const diagnostics = {
+			schema: "narrafork.error-diagnostics.v1" as const,
+			recordingRequestId: "exact-attempt",
+			requestId: "upstream-id",
+			providerRequestId: "provider-id",
+			statusCode: 503,
+			message: "界😀".repeat(8192),
+		};
+		try {
+			// A different, later request must not become this error's association.
+			for (const requestId of ["exact-attempt", "other-attempt"]) {
+				await processEvent(
+					{ type: "api_request_start", requestId, provider: "anthropic", model: "test" },
+					ctx,
+				);
+			}
+			await processEvent(
+				{
+					type: "api_request_end",
+					requestId: "exact-attempt",
+					errorMessage: "upstream failed",
+					diagnostics,
+				},
+				ctx,
+			);
+			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
+			expect(request).toBeDefined();
+			expect(diagnostics).toMatchObject({
+				apiRequestId: request?.id,
+				recordingRequestId: "exact-attempt",
+				requestId: "upstream-id",
+			});
+			expect(ctx.apiRequestsMap?.has("exact-attempt")).toBe(false);
+			const { narratorPersistence } = await import("../narrator-persistence");
+			await processEvent({ type: "error", message: "upstream failed", diagnostics }, ctx, {
+				onErrorCleanup: async (message, errorDiagnostics) => {
+					await narratorPersistence.updateStatus(id, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+						diagnostics: errorDiagnostics,
+					});
+				},
+			});
+			// Re-read backing storage (the path used after refresh), not a live broadcast.
+			const message = db
+				.select({ content: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.content).toEqual([
+				{ type: "error", message: "upstream failed", diagnostics },
+			]);
+			expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThanOrEqual(16 * 1024);
+			const ref = db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, id))
+				.get();
+			expect(ref).toBeDefined();
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("legacy errors and internal errors never acquire a nearby API association", async () => {
+		const id = "legacy-error-association-narrator";
+		const now = "2026-10-08T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		try {
+			const { narratorPersistence } = await import("../narrator-persistence");
+			await narratorPersistence.updateStatus(id, "idle", {
+				substatus: ["error"],
+				errorMessage: "internal failure",
+			});
+			const message = db
+				.select({ content: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.content).toEqual([{ type: "error", message: "internal failure" }]);
+			const diagnostics = {
+				schema: "narrafork.error-diagnostics.v1" as const,
+				requestId: "untrusted-upstream-only",
+				recordingRequestId: "different-attempt",
+			};
+			const ctx = { ...makeMainContext(), narratorId: id, broadcastTargetId: id };
+			await processEvent(
+				{ type: "api_request_start", requestId: "current", provider: "anthropic", model: "test" },
+				ctx,
+			);
+			await processEvent(
+				{ type: "api_request_end", requestId: "current", errorMessage: "failed", diagnostics },
+				ctx,
+			);
+			expect(diagnostics).not.toHaveProperty("apiRequestId");
 		} finally {
 			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
 			await cleanupFileContextNarrator(id);
@@ -1859,5 +1973,151 @@ describe("isSameReasoningBlock — the translation write-back guard", () => {
 	test("an empty translated text is still matched exactly, not treated as absent", () => {
 		expect(isSameReasoningBlock({ type: "reasoning", text: "" }, "")).toBe(true);
 		expect(isSameReasoningBlock({ type: "reasoning" }, "")).toBe(false);
+	});
+});
+
+describe("subagent live output char count", () => {
+	/** The parent's own Agent call owns a snapshot chunk once `tool_call` ran. */
+	async function parentAgentChunk(toolUseId = PARENT_TOOL_USE_ID) {
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId,
+				toolName: "Agent",
+				input: { prompt: "go" },
+			},
+			makeMainContext(),
+		);
+	}
+
+	function toolOutputFrames() {
+		return (broadcastMessages as Array<Record<string, unknown>>).filter(
+			(message) => message.type === "tool_output",
+		);
+	}
+
+	/** Wait for the throttled trailing flush to land a given cumulative count. */
+	async function untilOutput(count: string) {
+		const deadline = Date.now() + 2_000;
+		while (Date.now() < deadline) {
+			if (toolOutputFrames().at(-1)?.output === count) return;
+			await Bun.sleep(10);
+		}
+		expect(toolOutputFrames().at(-1)?.output).toBe(count);
+	}
+
+	test("counts a subagent's streamed text and ticks the parent's Agent card", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		const frames = toolOutputFrames();
+		expect(frames.at(-1)).toMatchObject({
+			type: "tool_output",
+			narratorId: PARENT_NARRATOR_ID,
+			toolUseId: PARENT_TOOL_USE_ID,
+			output: "5",
+		});
+		// Not a child-tool frame: the parent page must fold this into its OWN card.
+		expect(frames.at(-1)).not.toHaveProperty("parentToolUseId");
+		// The snapshot carries the same count so a reconnecting client restores it.
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(PARENT_TOOL_USE_ID)?.streamingOutput,
+		).toBe("5");
+	});
+
+	test("throttled frames keep only the latest cumulative total", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		// Inside the throttle window this only arms the trailing flush.
+		await processEvent({ type: "stream_text", text: ", world", blockId: "blk-1" }, sub);
+		expect(toolOutputFrames()).toHaveLength(1);
+		// The trailing flush lands the FULL accumulated count ("Hello, world"), not
+		// the last delta.
+		await untilOutput("12");
+	});
+
+	test("an overlapping replay does not double-count", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		// A resend with an absolute offset overlapping the streamed prefix (resume).
+		await processEvent(
+			{ type: "stream_text", text: "Hello, world", blockId: "blk-1", blockTextOffset: 0 },
+			sub,
+		);
+		// "Hello, world".length — never 5 + 12.
+		await untilOutput("12");
+	});
+
+	test("a primary narrator's own text never enters the subagent counter", async () => {
+		await processEvent({ type: "stream_text", text: "mine", blockId: "blk-1" }, makeMainContext());
+		expect(toolOutputFrames()).toHaveLength(0);
+	});
+
+	test("skips the broadcast while no card tracks the tool, resuming with the full total", async () => {
+		const sub = makeSubagentContext();
+		// No Agent chunk yet: nothing to show the count on, so nothing is sent…
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		expect(toolOutputFrames()).toHaveLength(0);
+		// …but the counter keeps accumulating, so a card appearing later resumes
+		// from the true total rather than zero.
+		await parentAgentChunk();
+		await processEvent({ type: "stream_text", text: "!", blockId: "blk-1" }, sub);
+		await untilOutput("6");
+	});
+
+	test("iteration-level snapshot resets do NOT retire the counter (run-scoped total)", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		// A child with no subagents of its own hits `clearStreamingSnapshot` via
+		// `clearAuthorStreamingSnapshot` on EVERY `assistant_message` — the counter
+		// must survive it, or the badge would restart from zero between iterations.
+		clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
+		await processEvent({ type: "stream_text", text: ", world", blockId: "blk-2" }, sub);
+		await untilOutput("12");
+	});
+
+	test("a discarded attempt restarts the count with the replayed stream", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await untilOutput("5");
+		// The dead-turn reset retracts the streamed text; the count starts over.
+		await processEvent({ type: "stream_reset" }, sub);
+		await processEvent({ type: "stream_text", text: "Hi", blockId: "blk-1" }, sub);
+		await untilOutput("2");
+	});
+
+	test("a replay fully inside the streamed span never shrinks the count", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{ type: "stream_text", text: "x".repeat(100), blockId: "blk-1", blockTextOffset: 0 },
+			sub,
+		);
+		await untilOutput("100");
+		// A resend covering [20, 50) — entirely inside the existing span.
+		await processEvent(
+			{ type: "stream_text", text: "y".repeat(30), blockId: "blk-1", blockTextOffset: 20 },
+			sub,
+		);
+		await processEvent(
+			{ type: "stream_text", text: "z", blockId: "blk-1", blockTextOffset: 100 },
+			sub,
+		);
+		await untilOutput("101");
+	});
+
+	test("run end flushes the final count and retires the counter", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		// Inside the throttle window; the flush happens synchronously on retire.
+		await processEvent({ type: "stream_text", text: "!!", blockId: "blk-1" }, sub);
+		expect(toolOutputFrames()).toHaveLength(1);
+		retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
+		expect(toolOutputFrames().at(-1)?.output).toBe("7");
 	});
 });

@@ -62,8 +62,9 @@ export function SummaryModelPickerModal({
 
 	const save = useMutation({
 		mutationFn: (summaryModel: string) => api.updateSettings({ agent: { summaryModel } }),
-		onSuccess: async () => {
-			await qc.invalidateQueries({ queryKey: ["settings"] });
+		onSuccess: (data) => {
+			// PATCH returns the updated settings; avoid an extra GET before closing.
+			qc.setQueryData(["settings"], data);
 			setSelected(null);
 			onSaved();
 		},

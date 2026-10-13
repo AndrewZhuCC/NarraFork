@@ -50,10 +50,13 @@ describe("resolveProviderAndModel", () => {
 
 	test("delegates unknown provider prefixes to the registered plugin resolver", () => {
 		const adapter = {} as never;
-		const unregister = registerExternalProviderResolver((provider, model) => {
-			expect(provider).toBe("acme");
-			expect(model).toBe("acme:chat:large");
-			return adapter as never;
+		const unregister = registerExternalProviderResolver({
+			resolve: (provider, model) => {
+				expect(provider).toBe("acme");
+				expect(model).toBe("acme:chat:large");
+				return adapter as never;
+			},
+			listReadiness: () => [],
 		});
 
 		try {
@@ -67,7 +70,10 @@ describe("resolveProviderAndModel", () => {
 	});
 
 	test("preserves the existing error semantics when the plugin resolver declines", () => {
-		const unregister = registerExternalProviderResolver(() => null);
+		const unregister = registerExternalProviderResolver({
+			resolve: () => null,
+			listReadiness: () => [],
+		});
 		try {
 			expect(() => resolveProviderAndModel("acme:chat:large")).toThrow(
 				/Provider "acme" is not configured/,
@@ -89,9 +95,10 @@ describe("resolveProviderAndModel", () => {
 			displayName: "Cline",
 			createAdapter: () => adapter,
 		});
-		const unregister = registerExternalProviderResolver((provider, model) =>
-			registry.resolveExternalProvider(provider, model),
-		);
+		const unregister = registerExternalProviderResolver({
+			resolve: (provider, model) => registry.resolveExternalProvider(provider, model),
+			listReadiness: () => [],
+		});
 		try {
 			expect(resolveProviderAndModel("cline-ext:chat:large").adapter).toBe(adapter);
 			registry.markUnavailable("cline-instance", "runtime-generation-changed");
@@ -150,9 +157,10 @@ describe("resolveProviderAndModel", () => {
 			configSchema: { type: "object", required: ["token"] },
 			config: { token: "fixture" },
 		});
-		const unregister = registerExternalProviderResolver((provider, model) =>
-			registry.resolveExternalProvider(provider, model),
-		);
+		const unregister = registerExternalProviderResolver({
+			resolve: (provider, model) => registry.resolveExternalProvider(provider, model),
+			listReadiness: () => [],
+		});
 		try {
 			expect(() => resolveProviderAndModel("config-plugin:chat")).toThrow(
 				expect.objectContaining({ code: "PROVIDER_CONFIG_INVALID" }),
@@ -168,9 +176,12 @@ describe("resolveProviderAndModel", () => {
 
 	test("builtin providers are consulted before the plugin resolver for their own prefix", () => {
 		let pluginResolverCalls = 0;
-		const unregister = registerExternalProviderResolver(() => {
-			pluginResolverCalls += 1;
-			return null;
+		const unregister = registerExternalProviderResolver({
+			resolve: () => {
+				pluginResolverCalls += 1;
+				return null;
+			},
+			listReadiness: () => [],
 		});
 		try {
 			// codex is a builtin provider resolved before the external resolver hook.

@@ -39,7 +39,7 @@ import { containerService } from "../services/container-service";
 import { gitService } from "../services/git-service";
 import { integrationResourceBindingService } from "../services/integration-resource-binding-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
-import { ensureGitignoreEntry, syncProject } from "../services/project-db-sync";
+import { canWriteProject, type ProjectAclRow } from "../services/project-acl";
 import {
 	getProjectAccess,
 	removeProjectMember,
@@ -73,6 +73,12 @@ export function requireSqliteProjectMutation(
 			"POSTGRES_UNSUPPORTED",
 		);
 	}
+}
+
+function resolveProjectDirectory(path: string): string {
+	const trimmed = path.trim();
+	if (trimmed === "~") return getHome();
+	return resolve(trimmed.startsWith("~/") ? resolve(getHome(), trimmed.slice(2)) : trimmed);
 }
 
 const validStatuses = ["active", "archived"] as const;
@@ -152,16 +158,7 @@ projectRoutes.post("/", async (c) => {
 	const projectId = generateId();
 	// A project is context only; ordinary narrators are created explicitly, without a root chapter.
 	const createdByUserId = c.get("user").sub;
-	// The setup commits below (initial commit, .gitignore) are authored by whoever
-	// created the project rather than by the host machine's global git config.
-	const gitIdentity = await resolveUserGitIdentityEnv(createdByUserId);
-
-	let gitPath = body.gitPath.trim();
-	// Expand ~ and resolve to absolute path so worktreePath / terminal cwd are correct
-	if (gitPath.startsWith("~/") || gitPath === "~") {
-		gitPath = gitPath.replace("~", getHome());
-	}
-	gitPath = resolve(gitPath);
+	const gitPath = resolveProjectDirectory(body.gitPath);
 
 	let remoteUrl: string | null = null;
 	let defaultBranch = "main";
@@ -230,18 +227,6 @@ projectRoutes.post("/", async (c) => {
 					});
 				}
 
-				try {
-					projectDbManager.openForGitPath(projectId, gitPath);
-					await syncProject(projectId);
-					ensureGitignoreEntry(gitPath);
-					await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
-				} catch (err) {
-					logger.warn("Failed to initialize project backup DB", {
-						projectId,
-						error: String(err),
-					});
-				}
-
 				await stream.writeSSE({
 					id: String(sseId++),
 					event: "complete",
@@ -274,20 +259,13 @@ projectRoutes.post("/", async (c) => {
 		});
 	}
 
-	if (mode === "existing") {
-		if (!(await gitService.isGitRepo(gitPath))) {
-			throw new ValidationError(`Path is not a git repository: ${gitPath}`);
-		}
-		const detectedBranch = await gitService.getCurrentBranch(gitPath);
-		defaultBranch = detectedBranch ?? "main";
-	} else if (mode === "init") {
+	// Associating an existing directory is metadata-only. Git is consulted only for
+	// explicit initialization/cloning or a later Git operation, not as an admission gate.
+	if (mode === "init") {
+		const gitIdentity = await resolveUserGitIdentityEnv(createdByUserId);
 		await gitService.initRepo(gitPath, gitIdentity);
 		const detectedBranch = await gitService.getCurrentBranch(gitPath);
 		defaultBranch = detectedBranch ?? "main";
-
-		// Commit .gitignore as part of initial repo setup so fork branches inherit it
-		ensureGitignoreEntry(gitPath);
-		await gitService.stageAndCommit(gitPath, [".gitignore"], "Add .gitignore", gitIdentity);
 	}
 
 	const [project] = await db
@@ -313,19 +291,6 @@ projectRoutes.post("/", async (c) => {
 				projectId,
 				error: String(err),
 			});
-		});
-	}
-
-	// Initialize project backup DB + .gitignore
-	try {
-		projectDbManager.openForGitPath(projectId, gitPath);
-		await syncProject(projectId);
-		ensureGitignoreEntry(gitPath);
-		await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
-	} catch (err) {
-		logger.warn("Failed to initialize project backup DB", {
-			projectId,
-			error: String(err),
 		});
 	}
 
@@ -388,9 +353,13 @@ projectRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	// Denial and absence are both NotFoundError, so this cannot be used to discover
 	// which project ids exist.
-	const project = await projectReadAdapter().getProject(id, projectPrincipalOf(c));
+	const principal = projectPrincipalOf(c);
+	const project = await projectReadAdapter().getProject(id, principal);
 	if (!project) throw new NotFoundError("Project", id);
-	return c.json(project);
+	return c.json({
+		...project,
+		canWrite: await canWriteProject(project as ProjectAclRow, principal),
+	});
 });
 
 projectRoutes.patch("/:id", async (c) => {
@@ -431,6 +400,7 @@ projectRoutes.patch("/:id", async (c) => {
 		.update(projects)
 		.set({
 			...rest,
+			...(rest.gitPath !== undefined ? { gitPath: resolveProjectDirectory(rest.gitPath) } : {}),
 			...(mergedSettings !== undefined ? { chapterSettings: mergedSettings } : {}),
 			updatedAt: now,
 		})
@@ -645,6 +615,7 @@ projectRoutes.delete("/:id", async (c) => {
 				})
 				.where(eq(remoteDevices.projectId, id));
 			await db.delete(projects).where(eq(projects.id, id));
+			projectDbManager.close(id);
 			removeTabFromAllUsers("project", id).catch((err) => {
 				logger.warn("Failed to remove project tab from users", {
 					projectId: id,

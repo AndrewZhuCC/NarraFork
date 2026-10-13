@@ -53,7 +53,7 @@ func (h *Handlers) GlobContext(parent context.Context, params map[string]any) (a
 	for strings.HasPrefix(pattern, "./") {
 		pattern = strings.TrimPrefix(pattern, "./")
 	}
-	if !doublestar.ValidatePattern(pattern) || filepath.IsAbs(pattern) {
+	if !doublestar.ValidatePattern(pattern) || strings.HasPrefix(pattern, "/") || filepath.IsAbs(pattern) || filepath.VolumeName(pattern) != "" {
 		return nil, fmt.Errorf("invalid glob pattern")
 	}
 	cwd, err := h.guardedExistingPath(params, "cwd")

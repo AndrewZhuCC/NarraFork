@@ -84,7 +84,7 @@ func NewPathGuardWithRules(rules []PathRule) *PathGuard {
 			}
 			continue
 		}
-		resolved, err := filepath.EvalSymlinks(abs)
+		resolved, err := canonicalGuardPath(abs)
 		if err != nil {
 			if rule.Action == RuleDeny {
 				guard.rules = append(guard.rules, resolvedRule{
@@ -124,7 +124,7 @@ func (g *PathGuard) CheckExisting(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resolved, err := filepath.EvalSymlinks(abs)
+	resolved, err := canonicalGuardPath(abs)
 	if err != nil {
 		return "", fmt.Errorf("resolve path %q: %w", abs, err)
 	}
@@ -141,7 +141,7 @@ func (g *PathGuard) CheckCreate(path string) (string, error) {
 		return "", err
 	}
 
-	if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+	if resolved, evalErr := canonicalGuardPath(abs); evalErr == nil {
 		return g.checkResolved(filepath.Clean(resolved))
 	} else if !errors.Is(evalErr, fs.ErrNotExist) {
 		return "", fmt.Errorf("resolve path %q: %w", abs, evalErr)
@@ -151,7 +151,7 @@ func (g *PathGuard) CheckCreate(path string) (string, error) {
 	missing := make([]string, 0, 4)
 	for {
 		if _, statErr := os.Lstat(ancestor); statErr == nil {
-			resolved, resolveErr := filepath.EvalSymlinks(ancestor)
+			resolved, resolveErr := canonicalGuardPath(ancestor)
 			if resolveErr != nil {
 				return "", fmt.Errorf("resolve path ancestor %q: %w", ancestor, resolveErr)
 			}

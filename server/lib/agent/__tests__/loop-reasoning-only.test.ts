@@ -205,7 +205,15 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
+		const endedRequests: Array<Extract<AgentEvent, { type: "api_request_end" }>> = [];
 		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", [])) {
+			if (event.type === "api_request_end") {
+				// Match the real consumer's successful end persistence boundary: enrich
+				// this exact attempt before the generator resumes and builds invalid_state.
+				endedRequests.push(event);
+				if (!event.diagnostics) throw new Error("missing ended-attempt diagnostics");
+				event.diagnostics.apiRequestId = `persisted-reasoning-row-${endedRequests.length}`;
+			}
 			events.push(event);
 		}
 
@@ -230,5 +238,18 @@ describe("agentLoop reasoning-only dead turn", () => {
 		expect((last as { diagnostics?: { reason?: string } }).diagnostics?.reason).toBe(
 			"reasoning_only_exhausted",
 		);
+		if (last?.type !== "invalid_state") throw new Error("missing exhausted terminal error");
+		expect(endedRequests).toHaveLength(4);
+		const failedAttempt = endedRequests.at(-1);
+		expect(last.diagnostics).toMatchObject({
+			recordingRequestId: failedAttempt?.requestId,
+			apiRequestId: "persisted-reasoning-row-4",
+			source: "agent",
+			phase: "response",
+			reason: "reasoning_only_exhausted",
+			message: last.message,
+			responseSnippet: "retries=3",
+		});
+		expect(last.diagnostics?.recordingRequestId).not.toBe(endedRequests[0].requestId);
 	});
 });

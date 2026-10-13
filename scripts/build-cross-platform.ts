@@ -436,10 +436,14 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		"./server/lib/db-worker/worker-entry.ts",
 		// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 		"./server/services/editor-document-worker.ts",
+		// Model history JSON decoding stays off-thread in compiled distributions too.
+		"./server/services/agent-runtime/model-history-worker.ts",
 		"./server/lib/browser/memory-snapshot-worker.ts",
 		"./server/lib/browser/memory-profile-worker.ts",
 		// Share HTML cleaning runs off-thread, including in compiled distributions.
 		"./server/lib/share-preview-worker.ts",
+		// Default request recording and ZIP jobs stay off the HTTP/agent thread.
+		"./server/lib/request-recorder-worker.ts",
 		// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
 		"./server/services/revert-transaction-manifest-worker.ts",
 		// Private archive scans/copies/imports must remain off-thread in released binaries.

@@ -5,12 +5,17 @@ import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
+import {
+	MAX_RECORDING_REQUEST_BYTES,
+	MAX_RECORDING_RESPONSE_BYTES,
+	MIN_RECORDING_WINDOW_BYTES,
+} from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
-import { resolveProviderAndModel } from "../lib/agent/provider";
+import { listProviderReadiness, resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
@@ -400,6 +405,25 @@ export const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
+				requestDumpRecordingEnabled: z.boolean(),
+				requestDumpRequestBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_REQUEST_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				requestDumpResponseBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_RESPONSE_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
 				requestDumpEnabled: z.boolean(),
 				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
@@ -473,7 +497,7 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
+				modelContextWindows: z.record(z.string(), z.number().int().min(256).max(10_000_000)),
 				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
@@ -830,7 +854,7 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
-function buildSettingsResponse(
+async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
 ) {
@@ -839,6 +863,7 @@ function buildSettingsResponse(
 	stripObsoleteSettingsKeys(safeSource);
 	return {
 		...safeSource,
+		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
 		// Mask TLS passphrase
@@ -894,7 +919,7 @@ function buildSettingsResponse(
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
-		codexAvailable: codexManager.snapshot().available > 0,
+		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
@@ -1124,8 +1149,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 }
 
-settingsRoutes.get("/", (c) => {
-	return c.json(buildSettingsResponse(settings));
+settingsRoutes.get("/", async (c) => {
+	return c.json(await buildSettingsResponse(settings));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -1315,8 +1340,10 @@ settingsRoutes.get("/search/protocols", (c) => {
 	return c.json(PROTOCOL_REGISTRY);
 });
 
-settingsRoutes.patch("/", requireAdmin, async (c) =>
-	settingsUpdateLock.acquire("settings", async () => {
+settingsRoutes.patch("/", requireAdmin, async (c) => {
+	const requestStartedAt = performance.now();
+	return settingsUpdateLock.acquire("settings", async () => {
+		const lockAcquiredAt = performance.now();
 		const body = normalizeLegacySettingsPatch(await c.req.json());
 		const parsed = updateSettingsSchema.safeParse(body);
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -1624,11 +1651,13 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		let migratedNarrators: Awaited<
 			ReturnType<typeof planProviderPrefixNarratorMigration>
 		>["narrators"] = [];
+		const persistStartedAt = performance.now();
 		if (prefixChanges.length > 0) {
 			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
 		}
+		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
 		// configs: new local-egress providers connect immediately, removed or
 		// reverted providers are torn down (docs/CODEX_CLIENT_RELAY.md).
@@ -1689,14 +1718,28 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			});
 		}
 
-		return c.json(
-			buildSettingsResponse(merged, {
+		const responseStartedAt = performance.now();
+		const response = c.json(
+			await buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
 			}),
 		);
-	}),
-);
+		const finishedAt = performance.now();
+		if (finishedAt - requestStartedAt >= 500) {
+			// Timings only: never log settings contents or provider credentials.
+			logger.warn("Slow settings PATCH", {
+				totalMs: Math.round(finishedAt - requestStartedAt),
+				lockWaitMs: Math.round(lockAcquiredAt - requestStartedAt),
+				prepareMs: Math.round(persistStartedAt - lockAcquiredAt),
+				persistMs: Math.round(persistFinishedAt - persistStartedAt),
+				runtimeMs: Math.round(responseStartedAt - persistFinishedAt),
+				responseMs: Math.round(finishedAt - responseStartedAt),
+			});
+		}
+		return response;
+	});
+});
 
 // Generate a TLS certificate and enable HTTPS.
 //

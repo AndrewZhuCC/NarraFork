@@ -14,9 +14,12 @@ import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
+import { NarratorPanelSkeleton } from "../../components/narrator/NarratorPanelSkeleton";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 import { legacyRouteErrorKey } from "../../components/project/legacy-chapter-redirect";
+import { readOpeningLod } from "../../hooks/useNarratorLod";
+import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
@@ -106,6 +109,23 @@ const MOBILE_DRAWER_STYLES = {
 
 function NarratorDetailPage() {
 	const { narratorId } = Route.useParams();
+	// Detail determines the variant and permissions, but transport and lazy code
+	// can start as soon as the ID is known. Both paths use the loader's handoff.
+	useEffect(() => {
+		narratorLoadingMetrics.start(narratorId);
+		const controller = new AbortController();
+		void import("../../components/narrator/NarratorPanel").catch(() => {});
+		void import("../../components/narrator/vlist/PretextExactMessageList").catch(() => {});
+		void import("../../components/narrator/vlist/pretext-document-loader")
+			.then(({ preloadPretextDocumentTail, firstScreenPageSizeForLod }) =>
+				preloadPretextDocumentTail(narratorId, {
+					firstScreenPageSize: firstScreenPageSizeForLod(readOpeningLod(narratorId)),
+					signal: controller.signal,
+				}),
+			)
+			.catch(() => {});
+		return () => controller.abort();
+	}, [narratorId]);
 	const router = useRouter();
 	// biome-ignore lint/suspicious/noExplicitAny: loose search params
 	const search = useSearch({ strict: false }) as any;
@@ -134,22 +154,28 @@ function NarratorDetailPage() {
 			((narrator as any).traits as string[]).includes("scheduled")
 		: false;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const parentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
+	const legacyParentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = isSubagent ? null : ((narrator as any)?.chapterId as string | null | undefined);
 	const { data: chapter } = useChapter(chapterId ?? "");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const projectId = (chapter as any)?.projectId as string | undefined;
 
-	// For subagents: fetch parent narrator to resolve chapter/project for graph navigation
-	const { data: parentNarrator } = useNarrator(
-		isSubagent && parentNarratorId ? parentNarratorId : "",
-	);
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const parentChapterId = (parentNarrator as any)?.chapterId as string | null | undefined;
-	const { data: parentChapter } = useChapter(parentChapterId ?? "");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const parentProjectId = (parentChapter as any)?.projectId as string | undefined;
+	// Authorized navigation-only metadata never triggers parent detail/Git discovery.
+	const navigationSummary = narrator?.navigationSummary as
+		| {
+				parentNarratorId: string | null;
+				parentNarratorTitle: string | null;
+				chapterId: string | null;
+				chapterTitle: string | null;
+				projectId: string | null;
+		  }
+		| undefined;
+	const parentNarratorId = navigationSummary
+		? navigationSummary.parentNarratorId
+		: legacyParentNarratorId;
+	const parentChapterId = isSubagent ? navigationSummary?.chapterId : null;
+	const parentProjectId = isSubagent ? navigationSummary?.projectId : null;
 
 	// Record recent tab visit (skip for subagent narrators)
 	const narratorTitle = narrator?.title;
@@ -458,9 +484,9 @@ function NarratorDetailPage() {
 
 	if (narratorLoading)
 		return (
-			<Center h={APP_SHELL_CONTENT_HEIGHT}>
-				<Loader />
-			</Center>
+			<Box h={APP_SHELL_CONTENT_HEIGHT}>
+				<NarratorPanelSkeleton />
+			</Box>
 		);
 	if (narratorError || !narrator)
 		return (
@@ -497,13 +523,7 @@ function NarratorDetailPage() {
 					narratorId={narratorId}
 					isMobile={isMobile}
 					renderChat={({ compact, onHeaderPointerDown, onViewSubagentSession }) => (
-						<Suspense
-							fallback={
-								<Center h="100%">
-									<Loader size="sm" />
-								</Center>
-							}
-						>
+						<Suspense fallback={<NarratorPanelSkeleton />}>
 							<NarratorPanel
 								narratorId={narratorId}
 								narrator={narrator}

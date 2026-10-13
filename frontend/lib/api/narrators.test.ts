@@ -24,6 +24,80 @@ describe("narrators API", () => {
 		}
 	});
 
+	describe("request recordings", () => {
+		test("save/list/delete use encoded endpoints and explicit bounded cursor pages", async () => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => "recording-token" },
+				configurable: true,
+			});
+			const calls: Array<{ url: string; init?: RequestInit }> = [];
+			Object.defineProperty(g, "fetch", {
+				configurable: true,
+				value: async (url: string, init?: RequestInit) => {
+					calls.push({ url, init });
+					return Response.json({ id: "s", narratorId: "n", items: [], nextCursor: null, ok: true });
+				},
+			});
+			const controller = new AbortController();
+			const result = await api.saveRequestRecording("n/a", controller.signal);
+			await api.listRequestRecordings("n/a", "before/one", controller.signal);
+			await api.deleteRequestRecording("n/a", "save/one");
+			expect(result.id).toBe("s");
+			expect(calls.map((call) => call.url)).toEqual([
+				"/api/narrators/n%2Fa/request-recordings",
+				"/api/narrators/n%2Fa/request-recordings?limit=50&cursor=before%2Fone",
+				"/api/narrators/n%2Fa/request-recordings/save%2Fone",
+			]);
+			expect(calls.map((call) => call.init?.method)).toEqual(["POST", undefined, "DELETE"]);
+			expect(calls[0]?.init?.signal).toBe(controller.signal);
+			expect(calls[1]?.init?.signal).toBe(controller.signal);
+			for (const call of calls)
+				expect(new Headers(call.init?.headers).get("Authorization")).toBe("Bearer recording-token");
+		});
+		test("ZIP download is authenticated, cancelable and honors server filenames", async () => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => "recording-token" },
+				configurable: true,
+			});
+			const calls: Array<{ url: string; init?: RequestInit }> = [];
+			Object.defineProperty(g, "fetch", {
+				configurable: true,
+				value: async (url: string, init?: RequestInit) => {
+					calls.push({ url, init });
+					return new Response("zip-body", {
+						headers: {
+							"content-type": "application/zip",
+							"content-disposition": 'attachment; filename="evidence.zip"',
+						},
+					});
+				},
+			});
+			const controller = new AbortController();
+			const result = await api.downloadRequestRecording("n/a", "s/a", controller.signal);
+			expect(result.fileName).toBe("evidence.zip");
+			expect(await result.blob.text()).toBe("zip-body");
+			expect(calls[0]?.url).toBe("/api/narrators/n%2Fa/request-recordings/s%2Fa/download");
+			expect(calls[0]?.init?.signal).toBe(controller.signal);
+			expect(new Headers(calls[0]?.init?.headers).get("Authorization")).toBe(
+				"Bearer recording-token",
+			);
+		});
+		test("failed ZIP download raises API error rather than saving an error body", async () => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null },
+				configurable: true,
+			});
+			Object.defineProperty(g, "fetch", {
+				configurable: true,
+				value: async () => Response.json({ error: "Forbidden" }, { status: 403 }),
+			});
+			await expect(api.downloadRequestRecording("n", "s")).rejects.toMatchObject({
+				status: 403,
+				message: "Forbidden",
+			});
+		});
+	});
+
 	test("narrator detail forwards optional cancellation signals while legacy callers stay compatible", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

@@ -72,6 +72,15 @@ const historyView: PretextDocumentView = {
 };
 
 describe("parked vlist viewport", () => {
+	test("non-finite and zero boxes are not usable reading geometry", () => {
+		const base = { offsetWidth: 800, clientHeight: 400, scrollTop: 0, scrollHeight: 800 };
+		for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(hasVisibleVListGeometry({ ...base, offsetWidth: value })).toBe(false);
+			expect(hasVisibleVListGeometry({ ...base, clientHeight: value })).toBe(false);
+		}
+		expect(hasVisibleVListGeometry(base)).toBe(true);
+	});
+
 	test("production gates scroll classification and writes, and resumes before resize preview", async () => {
 		const source = await Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url)).text();
 		const region = (anchor: string) => {
@@ -91,10 +100,16 @@ describe("parked vlist viewport", () => {
 		const correction = region("const onScrollTopCorrection = useCallback(");
 		expect(correction).toContain("visibleViewportRef.current.deferCorrection(");
 		expect(correction).toContain("readViewportView()");
+		const readiness = region("const canMeasure = () => {");
+		expect(readiness).toContain("panelVisible");
+		expect(readiness).toContain("visibleViewportRef.current.isVisible(node)");
+		expect(readiness).toContain("Number.isFinite(node.clientWidth)");
+		expect(readiness).toContain("node.clientWidth > PAGE_PADDING * 2");
 		const measure = region("const measure = () => {");
-		expect(measure).toContain("visibleViewportRef.current.isVisible(node)");
+		const guard = measure.indexOf("!canMeasure()");
+		expect(guard).toBeGreaterThan(-1);
 		const replay = measure.indexOf("visibleViewportRef.current.resume(");
-		expect(replay).toBeGreaterThan(-1);
+		expect(replay).toBeGreaterThan(guard);
 		expect(measure.indexOf("controller.observe()")).toBeGreaterThan(replay);
 	});
 

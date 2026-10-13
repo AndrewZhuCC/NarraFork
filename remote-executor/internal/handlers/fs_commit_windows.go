@@ -65,9 +65,19 @@ func renameConditionalHandle(f *os.File, destination string) error {
 	if err != nil {
 		return err
 	}
+	// Resolve the existing parent, not the absent leaf. Avoid feeding profile
+	// short-name/junction spellings to the handle-based rename API.
+	parent, err := canonicalGuardPath(filepath.Dir(destination))
+	if err != nil {
+		return err
+	}
+	destination = filepath.Join(parent, filepath.Base(destination))
 	name, err := windows.UTF16FromString(destination)
 	if err != nil {
 		return err
+	}
+	if len(name) > 32768 {
+		return fmt.Errorf("rename destination exceeds Windows path limit")
 	}
 	name = name[:len(name)-1]
 	type renameInfo struct {
@@ -77,7 +87,10 @@ func renameConditionalHandle(f *os.File, destination string) error {
 		Name    uint16
 	}
 	offset := int(unsafe.Offsetof(renameInfo{}.Name))
-	buf := make([]byte, offset+len(name)*2)
+	size := offset + len(name)*2
+	// FILE_RENAME_INFO contains a native HANDLE and needs native alignment.
+	backing := make([]uint64, (size+7)/8)
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), size)
 	info := (*renameInfo)(unsafe.Pointer(&buf[0]))
 	info.Length = uint32(len(name) * 2)
 	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[offset])), len(name)), name)
@@ -106,7 +119,14 @@ func newWindowsRecoveryDirectory(target string) (string, *os.File, error) {
 		return "", nil, err
 	}
 	sid := user.User.Sid.String()
-	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;SY)")
+	acl := "(A;OICI;FA;;;" + sid + ")"
+	// When the caller is SYSTEM these are the same trustee. Windows merges
+	// identical ACEs at directory creation; construct that exact ACL up front
+	// so the strict post-creation owner/protection/byte verification remains valid.
+	if sid != "S-1-5-18" {
+		acl += "(A;OICI;FA;;;SY)"
+	}
+	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P" + acl)
 	if err != nil {
 		return "", nil, err
 	}
@@ -393,6 +413,14 @@ func commitConditionalReplacement(ctx context.Context, target, tmpPath string, o
 	// No overwrite: an external creation in this interval wins, backup survives.
 	if e := conditionalRenameHandle(backupFile, target); e != nil {
 		return fmt.Errorf("restore failed; original backup %q and replacement recovery %q retained: %v; cause: %w", backup, recovery, e, cause)
+	}
+	// Rename completion alone is not proof of restoration. Recheck the bound
+	// original's identity, bytes and strict metadata after the move as well.
+	if _, e := backupFile.Seek(0, io.SeekStart); e != nil {
+		return fmt.Errorf("restore verification failed; inspect %q and recovery %q; state uncertain: %v; cause: %w", target, recovery, e, cause)
+	}
+	if e := verifyWindowsCommitted(backupFile, originalInfo, metadata, oldContent); e != nil {
+		return fmt.Errorf("restore verification failed; inspect %q and recovery %q; state uncertain: %v; cause: %w", target, recovery, e, cause)
 	}
 	if !conditionalFileIdentity(target, originalInfo) {
 		return fmt.Errorf("restore path changed; inspect %q and recovery %q: %w", target, recovery, cause)

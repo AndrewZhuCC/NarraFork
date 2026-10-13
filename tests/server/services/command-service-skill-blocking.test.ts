@@ -6,6 +6,24 @@ import { resolveCommand } from "../../../server/services/command-service";
 const NARRATOR = "narrator-test";
 const USER = "user-test";
 
+describe("resolveCommand save_dump", () => {
+	test.each([
+		"/save_dump",
+		" /SAVE_DUMP \n",
+	])("%s resolves locally without database access", async (prompt) => {
+		expect(await resolveCommand(prompt, NARRATOR, USER)).toEqual({
+			resolved: true,
+			saveDump: true,
+			rawCommand: prompt,
+		});
+	});
+	test("arguments are rejected instead of becoming a model prompt", async () => {
+		await expect(resolveCommand("/save_dump extra", NARRATOR, USER)).rejects.toThrow(
+			"/save_dump does not accept arguments",
+		);
+	});
+});
+
 describe("resolveCommand skill blocking", () => {
 	test("/load pipeline resolves to both Pipeline tools", async () => {
 		const result = await resolveCommand("/load pipeline", NARRATOR, USER);

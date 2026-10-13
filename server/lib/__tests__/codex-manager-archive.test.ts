@@ -74,6 +74,37 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
+describe("CodexManager lightweight availability", () => {
+	const cases: Array<{ name: string; creds: SeedCredential[]; available: boolean }> = [
+		{ name: "empty pool", creds: [], available: false },
+		{ name: "enabled credential", creds: [{ id: "active" }], available: true },
+		{ name: "disabled credential", creds: [{ id: "disabled", disabled: true }], available: false },
+		{ name: "archived credential", creds: [{ id: "archived", archivedAt: 1 }], available: false },
+		{
+			name: "reset quota credential",
+			creds: [{ id: "reset", disabled: true, disabledReason: "quota_exhausted", quotaResetsAt: 1 }],
+			available: true,
+		},
+		{
+			name: "cached exhausted quota",
+			creds: [{ id: "exhausted", planType: "plus", remainingPercent: 0 }],
+			available: false,
+		},
+	];
+	for (const { name, creds, available } of cases) {
+		test(name, () => {
+			const { manager, tmpHome } = createManager(creds);
+			tempHomes.push(tmpHome);
+			try {
+				expect(manager.hasAvailableCredentials).toBe(available);
+				expect(manager.snapshot().available > 0).toBe(available);
+			} finally {
+				manager.dispose();
+			}
+		});
+	}
+});
+
 describe("CodexManager credential archiving", () => {
 	test("归档的凭据不会被选中，可用凭据只算活跃池", async () => {
 		const { manager, tmpHome } = createManager([{ id: "cred-a" }, { id: "cred-b" }]);

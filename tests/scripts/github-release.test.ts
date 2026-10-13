@@ -23,6 +23,7 @@ import {
 	GH_TIMEOUT_MS,
 	type GitHubReleaseOptions,
 	githubReleaseBody,
+	matchesGitHubReleaseBody,
 	publishGitHubRelease,
 	releaseChannel,
 	validateGitHubRepository,
@@ -129,7 +130,7 @@ describe("CI stable latest rollback guard", () => {
 		await expect(
 			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
 		).rejects.toThrow("rollback");
-		expect(gh.calls.some((args) => args[1] === "create")).toBe(false);
+		expect(gh.calls.some(isReleaseCreate)).toBe(false);
 	});
 	test("checks again immediately before publishing", async () => {
 		const { options } = fixture("1.2.0");
@@ -174,7 +175,9 @@ describe("CI stable latest rollback guard", () => {
 		await expect(
 			publishGitHubRelease({ ...options, run: gh.run, preventStableLatestRollback: true }),
 		).resolves.toMatchObject({ alreadyPublished: true });
-		expect(gh.calls.some((args) => ["create", "upload", "edit"].includes(args[1]))).toBe(false);
+		expect(
+			gh.calls.some((args) => isReleaseCreate(args) || ["upload", "edit"].includes(args[1])),
+		).toBe(false);
 	});
 	test("guard pagination failure is not interpreted as no newer stable", async () => {
 		const { options } = fixture();
@@ -211,6 +214,14 @@ interface FakeRelease {
 	assets: FakeAsset[];
 }
 
+function isReleaseCreate(args: string[]) {
+	return (
+		args[0] === "api" &&
+		args[1].endsWith("/releases") &&
+		args[args.indexOf("--method") + 1] === "POST"
+	);
+}
+
 function fakeGitHub(options: GitHubReleaseOptions) {
 	const calls: string[][] = [];
 	const contents = new Map<string, Buffer>();
@@ -235,6 +246,47 @@ function fakeGitHub(options: GitHubReleaseOptions) {
 			if (args[0] === "api" && args[1].includes("/git/tags/")) {
 				return JSON.stringify({ object: { type: "commit", sha: server.tagCommit } });
 			}
+			if (isReleaseCreate(args)) {
+				const tag = `v${options.version}`;
+				const repository = options.repository ?? DEFAULT_GITHUB_REPOSITORY;
+				const prerelease = releaseChannel(options.version) === "beta";
+				const body = githubReleaseBody(options.changelog, {
+					repository,
+					version: options.version,
+					filenames: [...options.platformSuffixes.values()].map(
+						(suffix) => `narrafork-${options.version}-${suffix}`,
+					),
+				});
+				const requestPath = args[args.indexOf("--input") + 1];
+				expect(args).toEqual([
+					"api",
+					`repos/${repository}/releases`,
+					"--method",
+					"POST",
+					"--input",
+					requestPath,
+				]);
+				const request = JSON.parse(readFileSync(requestPath, "utf8"));
+				expect(request).toEqual({
+					tag_name: tag,
+					name: `NarraFork ${tag}`,
+					body,
+					draft: true,
+					prerelease,
+				});
+				expect(request).not.toHaveProperty("target_commitish");
+				expect(args.some((arg) => arg.includes("target_commitish"))).toBe(false);
+				if (server.release) throw new Error("Duplicate fixture draft creation");
+				server.release = {
+					id: 1,
+					tag_name: tag,
+					draft: true,
+					prerelease,
+					body,
+					assets: [],
+				};
+				return JSON.stringify(server.release);
+			}
 			if (args[0] === "api") {
 				if (server.authFailure) throw new Error("gh failed: HTTP 401");
 				if (args[1].includes("/releases?")) {
@@ -246,20 +298,6 @@ function fakeGitHub(options: GitHubReleaseOptions) {
 					throw new Error("gh failed: HTTP 404");
 				}
 				return JSON.stringify(server.release);
-			}
-			if (args[1] === "create") {
-				expect(args).toContain("--draft");
-				expect(args).toContain("--verify-tag");
-				expect(args[args.indexOf("--target") + 1]).toBe(commit);
-				server.release = {
-					id: 1,
-					tag_name: `v${options.version}`,
-					draft: true,
-					prerelease: args.includes("--prerelease"),
-					body: readFileSync(args[args.indexOf("--notes-file") + 1], "utf8"),
-					assets: [],
-				};
-				return "";
 			}
 			if (args[1] === "upload") {
 				if (server.failUpload) throw new Error("simulated upload failure");
@@ -373,7 +411,9 @@ describe("read-only repair after beta promotion", () => {
 					...options,
 					requireAlreadyPublished: true,
 					run: (args) => {
-						if (args[1].includes("/releases/tags/") && ++reads === 2) {
+						const pinnedEndpoint = `repos/${options.repository ?? DEFAULT_GITHUB_REPOSITORY}/releases/${release.id}`;
+						if (args[1].includes("/releases/tags/") || args[1] === pinnedEndpoint) reads++;
+						if (args[1] === pinnedEndpoint && reads === 2) {
 							if (mutation === "channel") release.prerelease = true;
 							if (mutation === "notes") release.body += "changed";
 							if (mutation === "digest") release.assets[0].digest = `sha256:${"0".repeat(64)}`;
@@ -431,8 +471,10 @@ describe("GitHub release assets and lifecycle", () => {
 		expect(gh.contents.get("narrafork-1.2.0-SHA256SUMS")?.toString()).not.toContain("windows");
 		expect(gh.contents.get("narrafork-1.2.0-checksums.txt")?.toString()).not.toContain("windows");
 		expect(gh.calls.filter((args) => args[1] === "upload")).toHaveLength(4);
-		const createIndex = gh.calls.findIndex((args) => args[1] === "create");
+		const createIndex = gh.calls.findIndex(isReleaseCreate);
 		const publishIndex = gh.calls.findIndex((args) => args[1] === "edit");
+		expect(createIndex).toBeGreaterThanOrEqual(0);
+		expect(gh.calls.filter(isReleaseCreate)).toHaveLength(1);
 		expect(createIndex).toBeLessThan(publishIndex);
 		expect(
 			gh.calls.slice(createIndex + 1, publishIndex).filter((args) => args[1] === "upload"),
@@ -443,6 +485,28 @@ describe("GitHub release assets and lifecycle", () => {
 		expect(gh.release?.body).toContain(changelog.en);
 		expect(gh.release?.body).toContain(changelog["zh-CN"]);
 	});
+
+	for (const phase of ["before-create", "before-publish"] as const)
+		test(`tag SHA mismatch ${phase} still stops release writes without target_commitish`, async () => {
+			const { options } = fixture();
+			const gh = fakeGitHub(options);
+			if (phase === "before-create") gh.tagCommit = "b".repeat(40);
+			const run = async (args: string[]) => {
+				const result = await gh.run(args);
+				if (phase === "before-publish" && args[0] === "release" && args[1] === "upload")
+					gh.tagCommit = "b".repeat(40);
+				return result;
+			};
+			await expect(publishGitHubRelease({ ...options, run })).rejects.toThrow("tag");
+			expect(gh.calls.some((args) => args[0] === "release" && args[1] === "edit")).toBe(false);
+			if (phase === "before-create") {
+				expect(gh.release).toBeNull();
+				expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+			} else {
+				expect(gh.release?.draft).toBe(true);
+				expect(gh.calls.find(isReleaseCreate)).not.toContain("--target");
+			}
+		});
 
 	test("uploads every requested platform including Windows .exe to an explicit repository", async () => {
 		const { options } = fixture("1.2.0", true);
@@ -460,7 +524,7 @@ describe("GitHub release assets and lifecycle", () => {
 				.filter((args) => args[0] === "api")
 				.every((args) => args[1].startsWith("repos/example/releases/")),
 		).toBe(true);
-		expect(gh.calls.find((args) => args[1] === "create")).toContain("example/releases");
+		expect(gh.calls.find(isReleaseCreate)?.[1]).toBe("repos/example/releases/releases");
 	});
 
 	test("dry run validates assets but makes no gh calls", async () => {
@@ -530,7 +594,7 @@ describe("GitHub release assets and lifecycle", () => {
 		expect(gh.calls.some((args) => args[1] === "edit")).toBe(false);
 		gh.failUpload = false;
 		await publishGitHubRelease({ ...options, run: gh.run });
-		expect(gh.calls.filter((args) => args[1] === "create")).toHaveLength(1);
+		expect(gh.calls.filter(isReleaseCreate)).toHaveLength(1);
 		expect(gh.calls.some((args) => args.includes("--clobber"))).toBe(false);
 	});
 
@@ -554,10 +618,135 @@ describe("GitHub release assets and lifecycle", () => {
 				(args) => args[1] === "upload" && basename(args[3]) === "narrafork-1.2.0-linux-x64",
 			),
 		).toHaveLength(1);
-		expect(gh.calls.filter((args) => args[1] === "create")).toHaveLength(1);
+		expect(gh.calls.filter(isReleaseCreate)).toHaveLength(1);
 		expect(gh.calls.some((args) => args[1].includes("/releases?per_page=100&page=1"))).toBe(true);
 		expect(gh.calls.some((args) => args[1].endsWith("/releases/1"))).toBe(true);
 	});
+
+	test("creation response pins the draft when tag and list never expose it", async () => {
+		const { options } = fixture();
+		options.repository = "example/releases";
+		const gh = fakeGitHub(options);
+		const calls: string[][] = [];
+		await expect(
+			publishGitHubRelease({
+				...options,
+				run: async (args) => {
+					calls.push(args);
+					if (args[1].includes("/releases/tags/")) throw new Error("gh failed: HTTP 404");
+					if (args[1].includes("/releases?")) return "[]";
+					const output = await gh.run(args);
+					if (isReleaseCreate(args) && gh.release) {
+						gh.release.id = 410548707;
+						return JSON.stringify(gh.release);
+					}
+					return output;
+				},
+			}),
+		).resolves.toMatchObject({ alreadyPublished: false, dryRun: false });
+		const createIndex = calls.findIndex(isReleaseCreate);
+		expect(calls.filter(isReleaseCreate)).toHaveLength(1);
+		expect(calls.filter((args) => args[1].includes("/releases/tags/"))).toHaveLength(1);
+		expect(calls.filter((args) => args[1].includes("/releases?"))).toHaveLength(1);
+		expect(calls.findIndex((args) => args[1].includes("/releases?"))).toBeLessThan(createIndex);
+		expect(
+			calls
+				.slice(createIndex + 1)
+				.filter(
+					(args) => args[0] === "api" && args[1].startsWith("repos/example/releases/releases/"),
+				),
+		).toEqual([
+			["api", "repos/example/releases/releases/410548707"],
+			["api", "repos/example/releases/releases/410548707"],
+		]);
+		expect(calls.filter((args) => args[1] === "upload")).toHaveLength(4);
+		expect(calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+		expect(
+			calls
+				.filter((args) => args[0] === "release")
+				.every((args) => args.includes("example/releases")),
+		).toBe(true);
+		expect(calls.some((args) => args.includes("--clobber"))).toBe(false);
+		expect(gh.release?.id).toBe(410548707);
+		expect(gh.release?.draft).toBe(false);
+	});
+
+	for (const malformed of [
+		"invalid-json",
+		"null",
+		"missing-id",
+		"zero-id",
+		"unsafe-id",
+		"wrong-tag",
+		"not-draft",
+		"invalid-prerelease",
+		"missing-assets",
+	] as const) {
+		test(`malformed created response ${malformed} fails before asset writes`, async () => {
+			const { options } = fixture();
+			const gh = fakeGitHub(options);
+			await expect(
+				publishGitHubRelease({
+					...options,
+					run: async (args) => {
+						const output = await gh.run(args);
+						if (!isReleaseCreate(args)) return output;
+						if (malformed === "invalid-json") return "{";
+						if (malformed === "null") return "null";
+						const response = JSON.parse(output);
+						if (malformed === "missing-id") delete response.id;
+						if (malformed === "zero-id") response.id = 0;
+						if (malformed === "unsafe-id") response.id = Number.MAX_SAFE_INTEGER + 1;
+						if (malformed === "wrong-tag") response.tag_name = "v9.9.9";
+						if (malformed === "not-draft") response.draft = false;
+						if (malformed === "invalid-prerelease") response.prerelease = "false";
+						if (malformed === "missing-assets") delete response.assets;
+						return JSON.stringify(response);
+					},
+				}),
+			).rejects.toThrow();
+			expect(gh.calls.filter(isReleaseCreate)).toHaveLength(1);
+			expect(gh.calls.some((args) => ["upload", "edit"].includes(args[1]))).toBe(false);
+			expect(gh.release?.draft).toBe(true);
+		});
+	}
+
+	for (const phase of ["before-publish", "after-publish"] as const) {
+		for (const mutation of ["404", "wrong-tag", "wrong-id"] as const) {
+			test(`pinned release ${mutation} ${phase} fails closed without rediscovery`, async () => {
+				const { options } = fixture();
+				const gh = fakeGitHub(options);
+				const calls: string[][] = [];
+				const pinnedEndpoint = `repos/${options.repository ?? DEFAULT_GITHUB_REPOSITORY}/releases/1`;
+				let reads = 0;
+				await expect(
+					publishGitHubRelease({
+						...options,
+						run: async (args) => {
+							calls.push(args);
+							if (args[1] === pinnedEndpoint && ++reads === (phase === "before-publish" ? 1 : 2)) {
+								if (mutation === "404") throw new Error("gh failed: HTTP 404");
+								const response = JSON.parse(await gh.run(args));
+								if (mutation === "wrong-tag") response.tag_name = "v9.9.9";
+								if (mutation === "wrong-id") response.id = 2;
+								return JSON.stringify(response);
+							}
+							return gh.run(args);
+						},
+					}),
+				).rejects.toThrow();
+				expect(calls.filter(isReleaseCreate)).toHaveLength(1);
+				expect(calls.filter((args) => args[1] === "upload")).toHaveLength(4);
+				expect(calls.filter((args) => args[1] === "edit")).toHaveLength(
+					phase === "before-publish" ? 0 : 1,
+				);
+				expect(calls.filter((args) => args[1].includes("/releases/tags/"))).toHaveLength(1);
+				expect(calls.filter((args) => args[1].includes("/releases?"))).toHaveLength(1);
+				expect(reads).toBe(phase === "before-publish" ? 1 : 2);
+				expect(gh.release?.draft).toBe(phase === "before-publish");
+			});
+		}
+	}
 
 	test("draft discovery is bounded and never creates when the lookup is incomplete", async () => {
 		const { options } = fixture();
@@ -580,7 +769,7 @@ describe("GitHub release assets and lifecycle", () => {
 			}),
 		).rejects.toThrow("page limit reached");
 		expect(pages).toBe(10);
-		expect(gh.calls.some((args) => args[1] === "create")).toBe(false);
+		expect(gh.calls.some(isReleaseCreate)).toBe(false);
 	});
 
 	test("remote hash verification must succeed before publishing", async () => {
@@ -646,7 +835,7 @@ describe("GitHub release assets and lifecycle", () => {
 		const gh = fakeGitHub(options);
 		gh.authFailure = true;
 		await expect(publishGitHubRelease({ ...options, run: gh.run })).rejects.toThrow("HTTP 401");
-		expect(gh.calls.some((args) => args[1] === "create")).toBe(false);
+		expect(gh.calls.some(isReleaseCreate)).toBe(false);
 	});
 
 	test("checks annotated tags and marks non-x.y.0 as prerelease", async () => {
@@ -710,7 +899,7 @@ describe("GitHub optional incremental patch assets", () => {
 		await publishGitHubRelease({
 			...data.options,
 			run: (args) => {
-				if (args[1] === "create") {
+				if (isReleaseCreate(args)) {
 					writeFileSync(patch.path, Buffer.alloc(patch.bytes.length));
 					writeFileSync(patch.metadataPath, "invalid after staging");
 				}
@@ -858,7 +1047,7 @@ describe("GitHub optional incremental patch assets", () => {
 		expect(
 			gh.calls.filter((args) => args[1] === "upload" && basename(args[3]) === patch.name),
 		).toHaveLength(1);
-		expect(gh.calls.filter((args) => args[1] === "create")).toHaveLength(1);
+		expect(gh.calls.filter(isReleaseCreate)).toHaveLength(1);
 		expect(gh.calls.some((args) => args.includes("--clobber"))).toBe(false);
 	});
 
@@ -898,6 +1087,94 @@ describe("GitHub optional incremental patch assets", () => {
 		if (kind === "added") addPatch(data, "1.0.0", true);
 		gh.calls.length = 0;
 		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow();
+		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+	});
+});
+
+describe("Chinese-first release notes and executable download links", () => {
+	const suffixes = [
+		"linux-x64",
+		"linux-x64-baseline",
+		"linux-arm64",
+		"windows-x64.exe",
+		"windows-x64-baseline.exe",
+		"windows-arm64.exe",
+		"macos-x64",
+		"macos-arm64",
+	];
+	const downloads = {
+		repository: "Fork-Owner/Fork-Repo",
+		version: "1.2.0",
+		filenames: suffixes.map((suffix) => `narrafork-1.2.0-${suffix}`),
+	};
+	test("puts Chinese ahead of English and all eight verified executables at the top", () => {
+		const body = githubReleaseBody(changelog, downloads);
+		expect(body.startsWith("## 快速下载")).toBe(true);
+		expect(body.indexOf("## 简体中文")).toBeLessThan(body.indexOf("## English"));
+		expect(body.match(/\[直接下载\]\(/g)).toHaveLength(8);
+		for (const name of downloads.filenames)
+			expect(body).toContain(
+				`https://github.com/fork-owner/fork-repo/releases/download/v1.2.0/${name}`,
+			);
+		expect(body).toContain(changelog.en);
+		expect(body).toContain(changelog["zh-CN"]);
+	});
+	test("selected-platform notes never link missing executables, patches, or sidecars", () => {
+		const selected = {
+			...downloads,
+			filenames: [
+				"narrafork-1.2.0-windows-x64.exe",
+				"narrafork-1.2.0-windows-x64.exe.metadata.json",
+				"narrafork-1.2.0-windows-x64.exe.from-1.1.0.zstd-patch",
+				"narrafork-1.2.0-SHA256SUMS",
+			],
+		};
+		const body = githubReleaseBody(changelog, selected);
+		expect(body.match(/\[直接下载\]\(/g)).toHaveLength(1);
+		for (const excluded of [
+			"linux-x64",
+			"macos",
+			"windows-arm64",
+			".metadata.json",
+			".zstd-patch",
+			"SHA256SUMS",
+		])
+			expect(body).not.toContain(excluded);
+	});
+	test("layout compatibility preserves content and exact trusted download destinations", () => {
+		const legacy = `## English\n\n${changelog.en}\n\n## 简体中文\n\n${changelog["zh-CN"]}\n`;
+		const body = githubReleaseBody(changelog, downloads);
+		for (const variant of [legacy, githubReleaseBody(changelog), body])
+			expect(matchesGitHubReleaseBody(variant, changelog, downloads)).toBe(true);
+		for (const changed of [
+			`${body}\nunauthorized addition`,
+			body.replace("github.com/fork-owner/fork-repo", "evil.invalid/fork-owner/fork-repo"),
+			body.replace("/download/v1.2.0/", "/download/v1.3.0/"),
+			body.replace(changelog["zh-CN"], "different release notes"),
+		])
+			expect(matchesGitHubReleaseBody(changed, changelog, downloads)).toBe(false);
+	});
+	test("even a supported layout change during uploading stops publication", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		const run = async (args: string[]) => {
+			const result = await gh.run(args);
+			if (args[0] === "release" && args[1] === "upload" && gh.release)
+				gh.release.body = githubReleaseBody(changelog);
+			return result;
+		};
+		await expect(publishGitHubRelease({ ...options, run })).rejects.toThrow("changed");
+		expect(gh.release?.draft).toBe(true);
+		expect(gh.calls.some((args) => args[1] === "edit")).toBe(false);
+	});
+	test("read-only recovery accepts historical English-first notes without rewriting assets", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		await publishGitHubRelease({ ...options, run: gh.run });
+		if (!gh.release) throw new Error("Missing fixture release");
+		gh.release.body = `## English\n\n${changelog.en}\n\n## 简体中文\n\n${changelog["zh-CN"]}\n`;
+		gh.calls.length = 0;
+		await publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true });
 		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
 	});
 });

@@ -672,6 +672,7 @@ export const PretextExactMessageList = memo(
 			const [layoutCompactUsageLines, setLayoutCompactUsageLines] = useState(isMobileViewport);
 			const committedCompactUsageLinesRef = useRef(isMobileViewport);
 			const [contentWidth, setContentWidth] = useState(0);
+			const [layoutGeometryNode, setLayoutGeometryNode] = useState<HTMLDivElement | null>(null);
 			const [widthCommitEpoch, setWidthCommitEpoch] = useState(0);
 			// Exact viewport height can change live; only the finished height reaches the full build.
 			const [layoutHeight, setLayoutHeight] = useState(0);
@@ -1036,15 +1037,23 @@ export const PretextExactMessageList = memo(
 										: {}),
 								}
 							: undefined;
+					// The running Await's session title also lives on the call record
+					// (`_awaitAgentTitle`, server-resolved): lift it so the header can name
+					// the session before the tool's own metadata exists.
+					const awaitTitle = (call as { _awaitAgentTitle?: unknown })._awaitAgentTitle;
+					const summaryInputMetadata =
+						typeof awaitTitle === "string" && awaitTitle
+							? { ...baseMetadata, _awaitAgentTitle: awaitTitle }
+							: baseMetadata;
 					const summaryMetadata =
 						call.toolName === "Send"
 							? {
-									...baseMetadata,
+									...summaryInputMetadata,
 									status: call.status,
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: baseMetadata;
+							: summaryInputMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
 				[vlistLabels],
@@ -2077,6 +2086,7 @@ export const PretextExactMessageList = memo(
 				[dataSource?.fetchPage, dataSource?.locateMessage],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
 				keepEmptyReasoningLive: isActive,
 				labels: vlistLabels,
@@ -2419,6 +2429,7 @@ export const PretextExactMessageList = memo(
 					thinkingChars,
 					outputChars,
 					retryCount,
+					contextWindowSource,
 				}) => {
 					if (!messageId) return;
 					const segment = !!isSegment;
@@ -2427,6 +2438,7 @@ export const PretextExactMessageList = memo(
 						thinkingChars,
 						outputChars,
 						retryCount,
+						...(contextWindowSource ? { contextWindowSource } : {}),
 					});
 					compactProgressKeysRef.current.set(messageId, segment);
 				},
@@ -3940,14 +3952,27 @@ export const PretextExactMessageList = memo(
 				const node = viewportNode;
 				if (!node) return;
 				const pointerTracker = createPointerDragTracker(() => controller.release());
+				const canMeasure = () => {
+					return (
+						panelVisible &&
+						visibleViewportRef.current.isVisible(node) &&
+						Number.isFinite(node.clientWidth) &&
+						node.clientWidth > PAGE_PADDING * 2
+					);
+				};
 				const controller = createVListResizeController({
 					previewPolicy: "freeze",
-					readSize: () => ({
-						width: resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn),
-						boxWidth: node.offsetWidth,
-						height: node.clientHeight,
-						presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
-					}),
+					readSize: () => {
+						const ready = canMeasure();
+						return {
+							width: ready
+								? resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn)
+								: 0,
+							boxWidth: ready ? node.offsetWidth : 0,
+							height: ready ? node.clientHeight : 0,
+							presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
+						};
+					},
 					getCommittedWidth: () => committedContentWidthRef.current,
 					getCommittedPresentationKey: () =>
 						committedCompactUsageLinesRef.current ? "mobile" : "desktop",
@@ -3977,7 +4002,11 @@ export const PretextExactMessageList = memo(
 					morphScrollOrigin.invalidate();
 					// The stable chat temporarily parks off-layout while a dock slot mounts.
 					// Do not commit a one-pixel reading width or zero plan-detail cap.
-					if (!visibleViewportRef.current.isVisible(node)) return;
+					if (!canMeasure()) {
+						setLayoutGeometryNode(null);
+						return;
+					}
+					setLayoutGeometryNode(node);
 					// Replay hidden anchored commits before the resize coordinator reads
 					// the restored viewport, even when its width/height did not change.
 					visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
@@ -3998,7 +4027,14 @@ export const PretextExactMessageList = memo(
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop, morphScrollOrigin]);
+			}, [
+				viewportNode,
+				centeredColumn,
+				panelVisible,
+				readViewportView,
+				writeScrollTop,
+				morphScrollOrigin,
+			]);
 			// A capped column may keep the same width across a viewport breakpoint.
 			// Notify the controller explicitly rather than relying on ResizeObserver.
 			useLayoutEffect(() => {

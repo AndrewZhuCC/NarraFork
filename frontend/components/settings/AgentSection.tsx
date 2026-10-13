@@ -62,6 +62,12 @@ export interface AgentSectionProps {
 	setFreshShellEnv: (v: boolean) => void;
 	translateReasoning: boolean;
 	setTranslateReasoning: (v: boolean) => void;
+	requestDumpRecordingEnabled: boolean;
+	setRequestDumpRecordingEnabled: (v: boolean) => void;
+	requestDumpRequestBytes: number;
+	setRequestDumpRequestBytes: (v: number) => void;
+	requestDumpResponseBytes: number;
+	setRequestDumpResponseBytes: (v: number) => void;
 	requestDumpEnabled: boolean;
 	setRequestDumpEnabled: (v: boolean) => void;
 	requestDumpErrorsOnly: boolean;
@@ -255,6 +261,34 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(e) => props.setTranslateReasoning(e.currentTarget.checked)}
 			/>
 			<Stack id="request-dump-enabled" gap={4}>
+				<Switch
+					label={t("requestDumpRecordingEnabled")}
+					description={t("requestDumpRecordingEnabledDesc")}
+					checked={props.requestDumpRecordingEnabled}
+					onChange={(e) => props.setRequestDumpRecordingEnabled(e.currentTarget.checked)}
+				/>
+				<Group grow>
+					<NumberInput
+						label={t("requestDumpRequestCapacity")}
+						description={t("requestDumpCapacityDesc")}
+						value={props.requestDumpRequestBytes / (1024 * 1024)}
+						min={0}
+						max={512}
+						suffix=" MiB"
+						decimalScale={2}
+						onChange={(v) => props.setRequestDumpRequestBytes(Math.round(Number(v) * 1024 * 1024))}
+					/>
+					<NumberInput
+						label={t("requestDumpResponseCapacity")}
+						description={t("requestDumpCapacityDesc")}
+						value={props.requestDumpResponseBytes / (1024 * 1024)}
+						min={0}
+						max={2048}
+						suffix=" MiB"
+						decimalScale={2}
+						onChange={(v) => props.setRequestDumpResponseBytes(Math.round(Number(v) * 1024 * 1024))}
+					/>
+				</Group>
 				<Switch
 					label={t("requestDumpEnabled")}
 					description={t("requestDumpEnabledDesc")}

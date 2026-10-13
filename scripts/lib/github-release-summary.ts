@@ -93,3 +93,55 @@ export async function listGitHubReleaseSummaries(
 	}
 	throw new Error("GitHub release summary pagination limit reached");
 }
+
+const restSummaryProjection =
+	"map({id,url,tagName:.tag_name,draft,prerelease,publishedAt:.published_at,assetCount:(.assets|length)})";
+const restSummarySchema = z.object({
+	id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+	url: z.string().max(2048),
+	tagName: z.string().min(1).max(255),
+	draft: z.boolean(),
+	prerelease: z.boolean(),
+	publishedAt: z.string().datetime().nullable(),
+	assetCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+
+/**
+ * Authenticated draft lookup for the auxiliary publisher only. REST itself returns
+ * full release bodies/assets; --jq bounds child-process output to summaries, not
+ * the upstream response. A short page proves completion; ten full pages do not.
+ */
+export async function listGitHubRestReleaseSummaries(
+	run: GhRunner,
+	repository: string,
+): Promise<GitHubReleaseSummary[]> {
+	if (!isValidGitHubRepository(repository)) throw new Error("Invalid GitHub repository");
+	const releases: GitHubReleaseSummary[] = [];
+	const ids = new Set<number>();
+	const tags = new Set<string>();
+	for (let page = 1; page <= 10; page++) {
+		const raw = await run([
+			"api",
+			`repos/${repository}/releases?per_page=100&page=${page}`,
+			"--jq",
+			restSummaryProjection,
+		]);
+		if (Buffer.byteLength(raw) > 128 * 1024) throw new Error("GitHub API output limit");
+		const nodes = z.array(restSummarySchema).max(100).parse(JSON.parse(raw));
+		for (const node of nodes) {
+			const expectedUrl = `https://api.github.com/repos/${repository}/releases/${node.id}`;
+			if (node.url.toLowerCase() !== expectedUrl.toLowerCase())
+				throw new Error("GitHub REST release summary repository/ID mismatch");
+			if (node.draft !== (node.publishedAt === null))
+				throw new Error("Invalid GitHub REST release summary state");
+			if (ids.has(node.id)) throw new Error("Duplicate GitHub REST release summary ID");
+			if (tags.has(node.tagName)) throw new Error("Ambiguous GitHub REST release summary tag");
+			ids.add(node.id);
+			tags.add(node.tagName);
+			const { url: _url, ...summary } = node;
+			releases.push(summary);
+		}
+		if (nodes.length < 100) return releases;
+	}
+	throw new Error("GitHub REST release summary pagination limit reached");
+}

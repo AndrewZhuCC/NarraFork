@@ -34,6 +34,8 @@ export function useAsyncQuestions(narratorId: string, enabled = true) {
 		queryKey: asyncQuestionsQueryKey(narratorId),
 		queryFn: () => api.getAsyncQuestions(narratorId, { filter: "all", limit: 32 }),
 		enabled: !!narratorId && enabled,
+		// Pushed question changes invalidate this bounded summary domain immediately.
+		staleTime: 10_000,
 	});
 }
 
@@ -50,6 +52,7 @@ export function useOlderAsyncQuestions(
 			api.getAsyncQuestions(narratorId, { filter: "all", cursor: pageParam, limit: 32 }),
 		getNextPageParam: (page) => page.nextCursor ?? undefined,
 		enabled: !!narratorId && !!cursor && enabled,
+		staleTime: 10_000,
 	});
 }
 

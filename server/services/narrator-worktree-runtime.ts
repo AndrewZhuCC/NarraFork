@@ -5,7 +5,10 @@ import { isAdminUser } from "../lib/agent/tools/admin-common";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
 import { narraforkDir } from "../lib/settings";
-import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
+import {
+	authorizeGitDestinationForPrincipal,
+	authorizeGitTargetForPrincipal,
+} from "./git-workspace-access";
 import type { NarratorPrincipal } from "./narrator-acl";
 import { loadNarratorForAccess, resolveAclRootId } from "./narrator-acl";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
@@ -40,6 +43,25 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 					}
 				: unknownWorktreeScope,
 		};
+	},
+	authorizeDestination: async (principal, narratorId, source, destination, need, signal) => {
+		const target = await authorizeGitDestinationForPrincipal(
+			principal,
+			narratorId,
+			destination,
+			need,
+			signal,
+		);
+		if (
+			target.workspace.repositoryKey !== source.workspace.repositoryKey ||
+			target.workspace.deviceId !== source.workspace.deviceId ||
+			target.backend?.runtimeGeneration !== source.backend?.runtimeGeneration
+		)
+			throw new AppError(
+				"Destination authorization identity changed",
+				409,
+				"GIT_WORKSPACE_CHANGED",
+			);
 	},
 	withRevision: (narratorId, revision, action) =>
 		workspaceContextService.withRevision(narratorId, revision, undefined, async (context) => {

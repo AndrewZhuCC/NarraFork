@@ -426,13 +426,14 @@ describe("worker pool", () => {
 	}, 60_000);
 
 	test("times out a task and stays usable afterwards", async () => {
-		await expect(
-			runReadTask(
-				dbPath,
-				{ kind: "storageScanTables", tableNames: ["narrator_messages"] },
-				{ timeoutMs: 1 },
-			),
-		).rejects.toThrow(/timed out/);
+		const failure = await runReadTask(
+			dbPath,
+			{ kind: "storageScanTables", tableNames: ["narrator_messages"] },
+			{ timeoutMs: 1 },
+		).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toMatch(/timed out/);
+		expect(failure).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
 		const ok = await runReadTask<StorageScanContextResult>(dbPath, {
 			kind: "storageScanContext",
 		});
@@ -572,6 +573,7 @@ describe("worker pool", () => {
 			writeWorkerFixture(home, "hanging-worker.ts", HANGING_WORKER_BODY),
 		]);
 		const blocker = runReadTask(dbPath, { kind: "storageScanContext" }, { timeoutMs: 10_000 });
+		blocker.catch(() => {}); // Keep fixture cleanup handled even when a later assertion fails.
 		await new Promise((resolve) => setTimeout(resolve, 150));
 		expect(getDbWorkerPoolStats().busy).toBe(1);
 
@@ -581,7 +583,10 @@ describe("worker pool", () => {
 			{ kind: "storageScanTables", tableNames: ["narrators"] },
 			{ timeoutMs: 500 },
 		);
-		await expect(queued).rejects.toThrow(/timed out/);
+		const failure = await queued.catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toMatch(/timed out/);
+		expect(failure).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
 		const elapsed = Date.now() - startedAt;
 		expect(elapsed).toBeGreaterThanOrEqual(400);
 		expect(elapsed).toBeLessThan(4_000);

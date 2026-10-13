@@ -8,6 +8,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathsEqualForOS } from "../../../platform-path";
@@ -15,10 +16,12 @@ import { LocalBackend } from "../local-backend";
 
 const roots: string[] = [];
 
-function tempRoot(): string {
-	const root = mkdtempSync(join(tmpdir(), "narrafork-local-read-"));
+async function tempRoot(base = tmpdir()): Promise<string> {
+	const root = mkdtempSync(join(base, "narrafork-local-read-"));
 	roots.push(root);
-	return root;
+	// Match the backend's async realpath: Bun's synchronous Windows variant can
+	// retain an 8.3 spelling even though async realpath resolves the long name.
+	return realpath(root);
 }
 
 function createSymlink(target: string, link: string, type?: "dir" | "file"): boolean {
@@ -36,8 +39,32 @@ afterEach(() => {
 });
 
 describe("LocalBackend atomic bounded reads", () => {
+	test("canonicalizes an aliased temporary parent without weakening identity checks", async () => {
+		const parent = await tempRoot();
+		const actual = join(parent, "actual");
+		const alias = join(parent, "alias");
+		mkdirSync(actual);
+		symlinkSync(actual, alias, process.platform === "win32" ? "junction" : "dir");
+		const root = await tempRoot(alias);
+		expect(root).toBe(await realpath(root));
+		expect(root.startsWith(actual)).toBe(true);
+		const path = join(root, "range.txt");
+		writeFileSync(path, "0123456789");
+		const backend = new LocalBackend();
+		const result = await backend.readFileBytes(path, {
+			offset: 3,
+			maxBytes: 4,
+			expectedResolvedPath: path,
+		});
+		expect(new TextDecoder().decode(result.bytes)).toBe("3456");
+		expect(result.resolvedPath).toBe(path);
+		await expect(
+			backend.readFileBytes(path, { maxBytes: 4, expectedResolvedPath: join(root, "other.txt") }),
+		).rejects.toThrow(/resolved path identity mismatch/i);
+	});
+
 	test("bounded offset reads return only the requested range and preserve total size", async () => {
-		const path = join(tempRoot(), "range.txt");
+		const path = join(await tempRoot(), "range.txt");
 		writeFileSync(path, "0123456789");
 		const backend = new LocalBackend();
 		const middle = await backend.readFileBytes(path, {
@@ -58,7 +85,7 @@ describe("LocalBackend atomic bounded reads", () => {
 	});
 	test("keeps POSIX backslashes as filename characters in canonical identity", async () => {
 		if (process.platform === "win32") return;
-		const root = tempRoot();
+		const root = await tempRoot();
 		const literalBackslashPath = join(root, "a\\b");
 		const slashPath = join(root, "a", "b");
 		writeFileSync(literalBackslashPath, "literal backslash");
@@ -87,7 +114,7 @@ describe("LocalBackend atomic bounded reads", () => {
 	});
 
 	test("rejects a final symlink replaced after stat", async () => {
-		const root = tempRoot();
+		const root = await tempRoot();
 		const first = join(root, "first.md");
 		const second = join(root, "second.md");
 		const link = join(root, "plan.md");
@@ -112,7 +139,7 @@ describe("LocalBackend atomic bounded reads", () => {
 	});
 
 	test("rejects a parent symlink replaced after stat", async () => {
-		const root = tempRoot();
+		const root = await tempRoot();
 		const firstDir = join(root, "first");
 		const secondDir = join(root, "second");
 		const currentDir = join(root, "current");
@@ -139,7 +166,7 @@ describe("LocalBackend atomic bounded reads", () => {
 	});
 
 	test("reads only maxBytes plus one probe byte from a huge sparse file", async () => {
-		const root = tempRoot();
+		const root = await tempRoot();
 		const filePath = join(root, "huge-plan.md");
 		const totalSize = 256 * 1024 * 1024 + 17;
 		const maxBytes = 64 * 1024;

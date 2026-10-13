@@ -1,10 +1,8 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { z } from "zod";
-import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
+import { validateCiReleaseBuildSource } from "./ci-release-build-restore";
 import { verifyReleaseBundle } from "./ci-release-bundle";
 import { readReleaseText } from "./ci-release-io";
 import {
@@ -19,6 +17,7 @@ import {
 	validateCiReleaseTag,
 } from "./ci-release-plan";
 import { CI_RELEASE_TARGETS, CI_RELEASE_WORKFLOW } from "./ci-release-types";
+import { runBridgeProcess } from "./ci-update-server-bridge-restore";
 import type { GhRunner } from "./github-release";
 
 export const MAX_RELEASE_BUNDLE_BYTES = 24 * 1024 ** 3;
@@ -66,6 +65,28 @@ export const REQUIRED_RELEASE_SOURCE_JOBS = [
 	...CI_RELEASE_TARGETS.map(({ target }) => `Smoke (${target})`),
 	"Assemble release bundle",
 ];
+export const REQUIRED_RELEASE_REVERIFY_JOBS = [
+	"Release preflight",
+	...CI_RELEASE_TARGETS.map(({ target }) => `Restore original platform (${target})`),
+	...CI_RELEASE_TARGETS.map(({ target }) => `Smoke (${target})`),
+	"Assemble release bundle",
+];
+
+type SourceJob = {
+	name: string;
+	status: string;
+	conclusion: string | null;
+};
+function successfulSourceJobs(jobs: readonly SourceJob[], required: readonly string[]): boolean {
+	return required.every((name) => {
+		const matches = jobs.filter((job) => job.name === name);
+		return (
+			matches.length === 1 &&
+			matches[0]?.status === "completed" &&
+			matches[0].conclusion === "success"
+		);
+	});
+}
 
 /** Python's ZIP64 reader streams entries; never let an archive choose a filesystem path. */
 const EXTRACT_BUNDLE = `
@@ -114,7 +135,7 @@ with zipfile.ZipFile(archive) as bundle:
         if count != entry.file_size: raise ValueError('bundle size mismatch')
 `;
 
-async function downloadArchive(
+export async function downloadArchive(
 	artifact: z.infer<typeof artifactSchema>,
 	repository: string,
 	path: string,
@@ -169,12 +190,18 @@ async function downloadArchive(
 	}
 	const handle = await open(path, "wx", 0o600);
 	const reader = response.body.getReader();
+	const abortReader = () => {
+		void reader.cancel(signal.reason).catch(() => {});
+	};
+	signal.addEventListener("abort", abortReader, { once: true });
+	if (signal.aborted) abortReader();
 	const hash = createHash("sha256");
 	let size = 0;
 	try {
 		while (true) {
 			signal.throwIfAborted();
 			const result = await reader.read();
+			signal.throwIfAborted();
 			if (result.done) break;
 			size += result.value.byteLength;
 			if (size > artifact.size_in_bytes || size > MAX_RELEASE_BUNDLE_BYTES)
@@ -191,8 +218,12 @@ async function downloadArchive(
 			throw new Error("Artifact digest/size mismatch");
 		}
 	} finally {
-		await reader.cancel();
-		await handle.close();
+		signal.removeEventListener("abort", abortReader);
+		try {
+			await reader.cancel();
+		} finally {
+			await handle.close();
+		}
 	}
 }
 
@@ -264,16 +295,10 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		}
 		jobIds.add(job.id);
 	}
-	for (const name of REQUIRED_RELEASE_SOURCE_JOBS) {
-		const matches = jobs.filter((job) => job.name === name);
-		if (
-			matches.length !== 1 ||
-			matches[0].status !== "completed" ||
-			matches[0].conclusion !== "success"
-		) {
-			throw new Error(`Source job missing, duplicate or unsuccessful: ${name}`);
-		}
-	}
+	const originalBuildJobs = successfulSourceJobs(jobs, REQUIRED_RELEASE_SOURCE_JOBS);
+	const reverifyJobs = successfulSourceJobs(jobs, REQUIRED_RELEASE_REVERIFY_JOBS);
+	if (!originalBuildJobs && !reverifyJobs)
+		throw new Error("Source job missing, duplicate or unsuccessful; no complete release proof");
 	const name = `release-bundle-${sourceRunId}-${source.run_attempt}`;
 	const artifacts = await ciApiList(
 		run,
@@ -331,14 +356,16 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 			options.signal,
 		);
 		await mkdir(extracted);
-		await promisify(execFile)(
+		// execFile's abort callback can precede close. Keep extraction files owned until
+		// our child is reaped and both bounded output readers have closed, even on abort.
+		await runBridgeProcess(
 			"python3",
 			["-I", "-c", EXTRACT_BUNDLE, archive, extracted, String(MAX_RELEASE_BUNDLE_BYTES)],
 			{
-				timeout: RESTORE_TIMEOUT_MS,
-				maxBuffer: 1024 * 1024,
+				timeoutMs: RESTORE_TIMEOUT_MS,
+				maximumOutputBytes: 1024 * 1024,
 				signal: options.signal,
-				env: updateServerChildEnvironment(env),
+				environment: env,
 			},
 		);
 		const manifestValue = JSON.parse(await readReleaseText(join(extracted, "manifest.json")));
@@ -352,6 +379,19 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 			plan.tag !== options.tag
 		) {
 			throw new Error("Bundle manifest does not match source run provenance");
+		}
+		if (plan.buildSource) {
+			if (!reverifyJobs || plan.buildSource.platforms.length !== CI_RELEASE_TARGETS.length)
+				throw new Error("Re-verification bundle lacks this attempt's complete native proof");
+			await validateCiReleaseBuildSource(plan, {
+				root: options.root,
+				run,
+				env,
+				fetch: options.fetch,
+				signal: options.signal,
+			});
+		} else if (!originalBuildJobs) {
+			throw new Error("Original release bundle lacks complete source CI and build proof");
 		}
 		await revalidateCiReleasePlan(plan, { root: options.root, publish: false, run, env });
 		await verifyReleaseBundle(extracted, plan);

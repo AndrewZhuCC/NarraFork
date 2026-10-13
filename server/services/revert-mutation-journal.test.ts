@@ -140,7 +140,7 @@ beforeEach(() => {
 		.get();
 });
 afterEach(() => {
-	conn.close();
+	conn.close(true);
 	if (temp) {
 		rmSync(temp, { recursive: true, force: true });
 		temp = undefined;
@@ -1130,13 +1130,13 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 			first = service.claimApply(p.ctx, file, lease);
 		});
 		const snapshot = conn.serialize();
-		conn.close();
+		conn.close(true);
 		temp = mkdtempSync(join(tmpdir(), "narrafork-revert-journal-"));
 		const path = join(temp, "journal.db");
 		writeFileSync(path, snapshot);
 		conn = new Database(path);
 		connect();
-		conn.close();
+		conn.close(true);
 		conn = new Database(path);
 		connect();
 		clock += FILE_CHANGE_LIMITS.planLifetimeMs * 10;

@@ -1,6 +1,6 @@
 {
-  "id": "392deb77-0f97-42e8-a021-b68bd6a75a2b",
-  "prevId": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
+  "id": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
+  "prevId": "0f4d42ec-ba53-46e5-98e0-63c2c30c1f3e",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10320,6 +10320,31 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.model_history_revision_contracts": {
+      "name": "model_history_revision_contracts",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "installed_version": {
+          "name": "installed_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.narrator_blacklist_cmds": {
       "name": "narrator_blacklist_cmds",
       "schema": "",
@@ -11516,6 +11541,126 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_git_identity_bindings": {
+      "name": "narrator_git_identity_bindings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "identity_id": {
+          "name": "identity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_narrator_git_identity_unique": {
+          "name": "idx_narrator_git_identity_unique",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_git_identity_user": {
+          "name": "idx_narrator_git_identity_user",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_git_identity_bindings_narrator_id_narrators_id_fk": {
+          "name": "narrator_git_identity_bindings_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_git_identity_bindings",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_git_identity_bindings_user_id_users_id_fk": {
+          "name": "narrator_git_identity_bindings_user_id_users_id_fk",
+          "tableFrom": "narrator_git_identity_bindings",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_git_identity_bindings_identity_id_user_g_d1b761527c_fk": {
+          "name": "narrator_git_identity_bindings_identity_id_user_g_d1b761527c_fk",
+          "tableFrom": "narrator_git_identity_bindings",
+          "tableTo": "user_git_identities",
+          "columnsFrom": [
+            "identity_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.narrator_grants": {
       "name": "narrator_grants",
       "schema": "",
@@ -11921,6 +12066,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "body_revision": {
+          "name": "body_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "content_text": {
           "name": "content_text",
@@ -12965,6 +13117,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "model_revision": {
+          "name": "model_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "input_json": {
           "name": "input_json",
@@ -14783,6 +14942,13 @@
         },
         "message_version": {
           "name": "message_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "model_history_revision": {
+          "name": "model_history_revision",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
@@ -21028,6 +21194,92 @@
         "user_favorite_directories_user_id_users_id_fk": {
           "name": "user_favorite_directories_user_id_users_id_fk",
           "tableFrom": "user_favorite_directories",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.user_git_identities": {
+      "name": "user_git_identities",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "email": {
+          "name": "email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "is_default": {
+          "name": "is_default",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_user_git_identities_user": {
+          "name": "idx_user_git_identities_user",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "user_git_identities_user_id_users_id_fk": {
+          "name": "user_git_identities_user_id_users_id_fk",
+          "tableFrom": "user_git_identities",
           "tableTo": "users",
           "columnsFrom": [
             "user_id"

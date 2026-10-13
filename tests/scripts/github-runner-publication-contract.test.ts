@@ -13,7 +13,7 @@ import {
 	createBridgeGhRunner,
 	runBridgeProcess,
 } from "../../scripts/lib/ci-update-server-bridge-restore";
-import { publishGitHubRelease } from "../../scripts/lib/github-release";
+import { githubReleaseBody, publishGitHubRelease } from "../../scripts/lib/github-release";
 import { HELPER_LICENSE_FILES, publishHelperRelease } from "../../scripts/lib/helper-release";
 import { prepareUpdateIndexRelease } from "../../scripts/lib/update-index";
 import { publishUpdateIndex } from "../../scripts/lib/update-index-github";
@@ -78,6 +78,7 @@ if (s.mode === "diagnostic") {
   if (notes >= 0) s.release.body = readFileSync(args[notes + 1], "utf8");
   out(null);
  } else if (args[1] === "upload") {
+  if (!s.present || !s.release.draft || args.includes("--clobber")) throw new Error("Unsafe fixture upload");
   const bytes = readFileSync(args[3]);
   const name = basename(args[3]);
   if (s.release.assets.some((a) => a.name === name)) throw new Error("Duplicate upload");
@@ -85,7 +86,11 @@ if (s.mode === "diagnostic") {
    state: "uploaded", digest: "sha256:" + createHash("sha256").update(bytes).digest("hex") });
   s.contents[name] = bytes.toString("utf8");
   out(null);
- } else if (args[1] === "edit") { s.release.draft = false; out(null); }
+ } else if (args[1] === "edit") {
+  s.release.draft = false;
+  s.release.published_at = "2026-10-09T00:00:00.000Z";
+  out(null);
+ }
  else throw new Error("Unexpected fixture release operation");
 } else if (args[0] === "api") {
  const endpoint = args[1];
@@ -95,10 +100,29 @@ if (s.mode === "diagnostic") {
  if (endpoint === "graphql") out(graph());
  else if (endpoint === "repos/" + s.repository) out({ full_name: s.repository, default_branch: "main" });
  else if (p.startsWith("git/ref/tags/")) out({ ref: "refs/tags/" + s.release.tag_name, object: { type: "commit", sha: s.commit } });
- else if (p.startsWith("releases/tags/")) {
-  if (!s.present || s.release.draft || s.blockLookup) fail(); else out(s.release);
- } else if (p.startsWith("releases?")) out(s.present ? [{ id: 1, tag_name: s.release.tag_name }] : []);
- else if (p === "releases/1") out(s.release);
+ else if (p === "releases" && args[args.indexOf("--method") + 1] === "POST") {
+  if (s.present) throw new Error("Duplicate fixture draft creation");
+  if (!body || body.tag_name !== s.release.tag_name || body.name !== "NarraFork " + s.release.tag_name ||
+   typeof body.body !== "string" || body.draft !== true || body.prerelease !== s.release.prerelease ||
+   Object.keys(body).sort().join(",") !== "body,draft,name,prerelease,tag_name") throw new Error("Invalid fixture draft request");
+  s.createRequest = body;
+  s.present = true;
+  s.release.body = body.body;
+  out(s.release);
+ } else if (p.startsWith("releases/tags/")) {
+  if (!s.present || s.release.draft || s.blockLookup || s.hideDiscovery) fail(); else out(s.release);
+ } else if (p.startsWith("releases?")) {
+  const summary = args.some((a) => a.includes("assetCount"));
+  out(!s.present || s.hideDiscovery ? [] : summary ? [{
+   id: 1, tagName: s.release.tag_name, draft: s.release.draft,
+   prerelease: s.release.prerelease, publishedAt: s.release.published_at,
+   assetCount: s.release.assets.length,
+   url: "https://api.github.com/repos/" + s.repository + "/releases/1",
+  }] : [{ id: 1, tag_name: s.release.tag_name }]);
+ }
+ else if (p === "releases/" + s.release.id) {
+  if (!s.present || s.blockPinned) fail(); else out(s.release);
+ }
  else if (p.startsWith("releases/1/assets?")) out(s.release.assets);
  else if (p.startsWith("releases/assets/")) {
   const a = s.release.assets.find((a) => a.id === Number(p.slice(16)));
@@ -137,7 +161,7 @@ interface ShimState {
 		draft: boolean;
 		prerelease: boolean;
 		body: string;
-		published_at: string;
+		published_at: string | null;
 		assets: { id: number; name: string; size: number; state: string; digest: string }[];
 	};
 	contents: Record<string, string>;
@@ -149,6 +173,15 @@ interface ShimState {
 	commits: Record<string, unknown>;
 	stderr?: string;
 	stdout?: string;
+	createRequest?: {
+		tag_name: string;
+		name: string;
+		body: string;
+		draft: boolean;
+		prerelease: boolean;
+	};
+	hideDiscovery?: boolean;
+	blockPinned?: boolean;
 	blockLookup?: boolean;
 	blockRef?: boolean;
 	cap?: "stdout" | "stderr";
@@ -172,7 +205,7 @@ async function fixture(overrides: Partial<ShimState> = {}) {
 			draft: true,
 			prerelease: false,
 			body: "",
-			published_at: publishedAt,
+			published_at: null,
 			assets: [],
 		},
 		contents: {},
@@ -270,6 +303,10 @@ async function helperBundle(f: Awaited<ReturnType<typeof fixture>>) {
 		run: f.run,
 	};
 }
+const isMainReleaseCreate = (args: string[]) =>
+	args[0] === "api" &&
+	args[1] === `repos/${repository}/releases` &&
+	args[args.indexOf("--method") + 1] === "POST";
 const mutations = (state: ShimState) =>
 	state.calls.filter((args) => args[0] === "release" || args.includes("--method"));
 
@@ -283,8 +320,26 @@ describe("real async gh runner publication contract", () => {
 			});
 			const state = await f.read();
 			expect(state.release.draft).toBe(false);
-			expect(state.calls.filter((args) => args[1] === "create")).toHaveLength(existing ? 0 : 1);
+			expect(state.calls.filter(isMainReleaseCreate)).toHaveLength(existing ? 0 : 1);
+			expect(state.calls.filter((args) => args[1] === "create")).toHaveLength(0);
 			expect(state.calls.some((args) => args[1]?.includes("releases?"))).toBe(true);
+			expect(
+				state.calls.filter((args) => args[1] === `repos/${repository}/releases/1`),
+			).toHaveLength(existing ? 3 : 2);
+			if (!existing) {
+				expect(state.createRequest).toEqual({
+					tag_name: `v${version}`,
+					name: `NarraFork v${version}`,
+					body: githubReleaseBody(options.changelog, {
+						repository,
+						version,
+						filenames: [`narrafork-${version}-linux-x64`],
+					}),
+					draft: true,
+					prerelease: false,
+				});
+				expect(state.createRequest).not.toHaveProperty("target_commitish");
+			}
 		});
 		test(`helper publisher ${existing ? "recovers existing draft" : "creates first draft"} after tag 404`, async () => {
 			const f = await fixture({ present: existing });
@@ -292,9 +347,65 @@ describe("real async gh runner publication contract", () => {
 			const state = await f.read();
 			expect(state.release.draft).toBe(false);
 			expect(state.calls.filter((args) => args[1] === "create")).toHaveLength(existing ? 0 : 1);
-			expect(state.calls.some((args) => args[1] === "graphql")).toBe(true);
+			expect(state.calls.some((args) => args[1]?.includes("releases?"))).toBe(true);
+			expect(state.calls.some((args) => args[1] === "graphql")).toBe(false);
 		});
 	}
+	test("main creation succeeds with permanently invisible tag/list and pins both readbacks", async () => {
+		const f = await fixture({ hideDiscovery: true });
+		f.state.release.id = 410548707;
+		await writeFile(f.statePath, JSON.stringify(f.state));
+		await expect(publishGitHubRelease(await mainBundle(f))).resolves.toMatchObject({
+			alreadyPublished: false,
+		});
+		const state = await f.read();
+		const createIndex = state.calls.findIndex(isMainReleaseCreate);
+		const publishIndex = state.calls.findIndex((args) => args[1] === "edit");
+		expect(state.calls.filter(isMainReleaseCreate)).toHaveLength(1);
+		expect(createIndex).toBeGreaterThanOrEqual(0);
+		expect(createIndex).toBeLessThan(publishIndex);
+		expect(state.calls.filter((args) => args[1]?.includes("releases/tags/"))).toHaveLength(1);
+		expect(state.calls.filter((args) => args[1]?.includes("releases?"))).toHaveLength(1);
+		expect(
+			state.calls
+				.slice(createIndex + 1)
+				.filter((args) => args[0] === "api" && args[1]?.includes("/releases/")),
+		).toEqual([
+			["api", `repos/${repository}/releases/410548707`],
+			["api", `repos/${repository}/releases/410548707`],
+		]);
+		expect(
+			state.calls.slice(createIndex + 1, publishIndex).filter((args) => args[1] === "upload"),
+		).toHaveLength(4);
+		expect(state.calls[publishIndex - 1][1]).toBe(`repos/${repository}/git/ref/tags/v${version}`);
+		expect(state.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+		expect(
+			state.calls
+				.filter((args) => args[0] === "release")
+				.every((args) => args.includes(repository)),
+		).toBe(true);
+		expect(
+			state.calls.some(
+				(args) =>
+					args.includes("--clobber") || args.some((arg) => arg.includes("target_commitish")),
+			),
+		).toBe(false);
+		expect(state.release.id).toBe(410548707);
+		expect(state.release.assets).toHaveLength(4);
+		expect(state.release.draft).toBe(false);
+	});
+	test("main known-ID 404 fails closed without creating a replacement or publishing", async () => {
+		const f = await fixture({ hideDiscovery: true, blockPinned: true });
+		await expect(publishGitHubRelease(await mainBundle(f))).rejects.toThrow();
+		const state = await f.read();
+		expect(state.calls.filter(isMainReleaseCreate)).toHaveLength(1);
+		expect(state.calls.filter((args) => args[1] === "upload")).toHaveLength(4);
+		expect(state.calls.filter((args) => args[1] === "edit")).toHaveLength(0);
+		expect(state.calls.filter((args) => args[1]?.includes("releases/tags/"))).toHaveLength(1);
+		expect(state.calls.filter((args) => args[1]?.includes("releases?"))).toHaveLength(1);
+		expect(state.calls.at(-1)?.[1]).toBe(`repos/${repository}/releases/1`);
+		expect(state.release.draft).toBe(true);
+	});
 	test("first update index 404 creates fixed metadata ref and verifies generation readback", async () => {
 		const f = await fixture();
 		const options = await mainBundle(f);
@@ -333,6 +444,7 @@ describe("real async gh runner publication contract", () => {
 						// Seed only fixture public assets; runner is still the actual spawned gh shim.
 						f.state.present = true;
 						f.state.release.draft = false;
+						f.state.release.published_at = publishedAt;
 						for (const asset of [
 							`narrafork-${version}-linux-x64`,
 							`narrafork-${version}-linux-x64.metadata.json`,
@@ -386,6 +498,64 @@ describe("real async gh runner diagnostic bounds and cancellation", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect(String(error)).toBe("Error: GitHub publication subprocess failed (HTTP 404)");
 		expect(JSON.stringify(error)).not.toContain("fixture-");
+	});
+	for (const operation of ["create", "upload", "download", "edit", "view"])
+		test(`release ${operation} failure exposes only fixed labels and numeric status`, async () => {
+			const f = await fixture({
+				mode: "diagnostic",
+				exitCode: 7,
+				stderr: "HTTP 403: fixture-gh-secret https://fixture.invalid?token=fixture-nf-secret\n",
+				stdout: "gh: Not Found (HTTP 404) fixture-gh-secret",
+			});
+			const error = await f
+				.run(["release", operation, "fixture-gh-secret", "--notes", "fixture-nf-secret"])
+				.catch((error: unknown) => error);
+			expect(String(error)).toBe(
+				`Error: GitHub publication subprocess failed (gh release ${operation}; exit=7; status=403)`,
+			);
+			expect(String(error)).not.toContain("fixture-");
+			expect(String(error)).not.toContain("HTTP");
+		});
+	for (const [stderr, detail] of [
+		[
+			"HTTP 403: Resource not accessible by integration (fixture-gh-secret)",
+			"; status=403; cause=integration-permission-denied",
+		],
+		[
+			"GraphQL: Resource not accessible by integration (fixture-gh-secret)",
+			"; cause=integration-permission-denied",
+		],
+		["unknown flag: fixture-gh-secret", "; cause=unsupported-option"],
+	])
+		test(`release failure preserves a fixed category: ${detail}`, async () => {
+			const f = await fixture({ mode: "diagnostic", stderr });
+			const error = await f
+				.run(["release", "create", "fixture-nf-secret"])
+				.catch((error: unknown) => error);
+			expect(String(error)).toBe(
+				`Error: GitHub publication subprocess failed (gh release create; exit=1${detail})`,
+			);
+			expect(String(error)).not.toContain("fixture-");
+		});
+	for (const [endpoint, operation] of [
+		["repos/fixture-gh-secret/repo/releases/assets/123", "release-asset"],
+		["repos/fixture-gh-secret/repo/releases/tags/fixture-nf-secret", "release-read"],
+		["repos/fixture-gh-secret/repo/git/ref/tags/fixture-nf-secret", "tag-read"],
+		["graphql", "graphql"],
+	])
+		test(`unknown API failure identifies only ${operation}, never authorizes missing`, async () => {
+			const f = await fixture({ mode: "diagnostic", stderr: "HTTP 404: fixture-gh-secret" });
+			const error = await f.run(["api", endpoint]).catch((error: unknown) => error);
+			expect(String(error)).toBe(
+				`Error: GitHub publication subprocess failed (gh api ${operation}; exit=1; status=404)`,
+			);
+			expect(String(error)).not.toContain("fixture-");
+			expect(String(error)).not.toContain("HTTP 404");
+		});
+	test("unrecognized operations never echo an arbitrary subcommand", async () => {
+		const f = await fixture({ mode: "diagnostic", stderr: "gh: Not Found (HTTP 404)\n" });
+		const error = await f.run(["release", "fixture-gh-secret"]).catch((error: unknown) => error);
+		expect(String(error)).toBe("Error: GitHub publication subprocess failed");
 	});
 	for (const status of [401, 403, 429, 500, 503])
 		test(`HTTP ${status} retains only its numeric status despite secret diagnostic text`, async () => {

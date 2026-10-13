@@ -1208,9 +1208,119 @@ export class PluginProviderRegistry {
 			.map((entry) => publicEntry(entry, this.adapterFactoryAccessor));
 	}
 
+	/** Pure local probe: never constructs an adapter or activates a plugin. */
+	hasAdapterFactory(reference: string): boolean {
+		const entry = this.requireInternal(reference);
+		return !!(entry.createAdapter || entry.adapterFactory || this.remoteProviderAdapterFactory);
+	}
+
 	validateConfig(reference: string, config: unknown): ProviderConfigValidationResult {
 		const entry = this.requireInternal(reference);
 		return validateConfigValue(config, entry.configSchema);
+	}
+
+	/** Secrets required by any schema branch validating the top-level config object. */
+	requiredConfigSecretFields(reference: string, secretFields: ReadonlySet<string>): string[] {
+		const entry = this.requireInternal(reference);
+		const fields = new Set<string>();
+		const visit = (node: unknown, refs = new Set<string>()): void => {
+			if (!isRecord(node)) return;
+			if (typeof node.$ref === "string") {
+				if (!refs.has(node.$ref)) {
+					visit(resolveJsonPointer(entry.configSchema, node.$ref), new Set(refs).add(node.$ref));
+				}
+				return;
+			}
+			if (Array.isArray(node.required)) {
+				for (const field of node.required) {
+					if (typeof field === "string" && secretFields.has(field)) fields.add(field);
+				}
+			}
+			for (const keyword of ["allOf", "anyOf", "oneOf"]) {
+				const children = node[keyword];
+				if (Array.isArray(children)) {
+					for (const child of children) visit(child, refs);
+				}
+			}
+		};
+		visit(entry.configSchema);
+		return [...fields];
+	}
+
+	/** Validate local presence markers without treating them as actual secret values. */
+	validateConfigPresence(
+		reference: string,
+		config: unknown,
+		secretFields: ReadonlySet<string>,
+	): ProviderConfigValidationResult {
+		const entry = this.requireInternal(reference);
+		// Project only schema nodes that validate the same top-level config object.
+		// Nested ordinary objects keep their constraints, even for similarly named fields.
+		const constrainsSecretValue = (node: unknown, refs = new Set<string>()): boolean => {
+			if (!isRecord(node)) return node === false;
+			if (typeof node.$ref === "string") {
+				return (
+					!refs.has(node.$ref) &&
+					constrainsSecretValue(
+						resolveJsonPointer(entry.configSchema, node.$ref),
+						new Set(refs).add(node.$ref),
+					)
+				);
+			}
+			if (["const", "enum", "pattern", "minLength", "maxLength"].some((key) => key in node)) {
+				return true;
+			}
+			return ["allOf", "anyOf", "oneOf"].some((keyword) => {
+				const children = node[keyword];
+				return (
+					Array.isArray(children) && children.some((child) => constrainsSecretValue(child, refs))
+				);
+			});
+		};
+		const project = (
+			node: unknown,
+			refs = new Set<string>(),
+		): { schema: unknown; relaxed: boolean } => {
+			if (!isRecord(node)) return { schema: node, relaxed: false };
+			if (typeof node.$ref === "string" && !refs.has(node.$ref)) {
+				const target = resolveJsonPointer(entry.configSchema, node.$ref);
+				if (target !== undefined) {
+					return project(clone(target), new Set(refs).add(node.$ref));
+				}
+			}
+			let relaxed = false;
+			if (isRecord(node.properties)) {
+				for (const field of secretFields) {
+					if (Object.hasOwn(node.properties, field)) {
+						// Only removed content constraints can destroy oneOf exclusivity.
+						relaxed ||= constrainsSecretValue(node.properties[field]);
+						node.properties[field] = { type: "string" };
+					}
+				}
+			}
+			for (const keyword of ["allOf", "anyOf", "oneOf"]) {
+				const children = node[keyword];
+				if (!Array.isArray(children)) continue;
+				const projected = children.map((child) => project(child, refs));
+				const branches = projected.map((child) => child.schema);
+				const branchRelaxed = projected.some((child) => child.relaxed);
+				relaxed ||= branchRelaxed;
+				if (keyword === "oneOf" && branchRelaxed) {
+					delete node.oneOf;
+					if (Array.isArray(node.anyOf)) {
+						const allOf = Array.isArray(node.allOf) ? node.allOf : [];
+						node.allOf = [...allOf, { anyOf: branches }];
+					} else {
+						node.anyOf = branches;
+					}
+				} else {
+					node[keyword] = branches;
+				}
+			}
+			return { schema: node, relaxed };
+		};
+		const schema = project(clone(entry.configSchema)).schema as Record<string, JsonValue> | boolean;
+		return validateConfigValue(config, schema);
 	}
 
 	/**

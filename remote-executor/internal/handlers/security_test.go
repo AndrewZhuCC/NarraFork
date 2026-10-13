@@ -3,13 +3,13 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type securityNopSender struct{}
@@ -45,7 +45,7 @@ func TestRequiredPathParamRejectsNulBytes(t *testing.T) {
 }
 
 func TestPathGuardBoundariesRelativeAndMultipleRoots(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(base, "root")
 	root2 := filepath.Join(base, "root2")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -118,7 +118,7 @@ func TestPathGuardInvalidConfiguredRootFailsClosed(t *testing.T) {
 }
 
 func TestPathGuardCanonicalizesSymlinkRoot(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	realRoot := filepath.Join(base, "real")
 	linkedRoot := filepath.Join(base, "linked")
 	if err := os.MkdirAll(realRoot, 0o755); err != nil {
@@ -144,7 +144,7 @@ func TestPathGuardCanonicalizesSymlinkRoot(t *testing.T) {
 }
 
 func TestFsStatReturnsCanonicalResolvedPath(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(base, "root")
 	realDir := filepath.Join(root, "real")
 	if err := os.MkdirAll(realDir, 0o755); err != nil {
@@ -176,7 +176,7 @@ func TestFsStatReturnsCanonicalResolvedPath(t *testing.T) {
 }
 
 func TestFsStatReturnsCanonicalCreatePathWhenMissing(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	realRoot := filepath.Join(base, "real")
 	linkedRoot := filepath.Join(base, "linked")
 	if err := os.MkdirAll(realRoot, 0o755); err != nil {
@@ -202,7 +202,7 @@ func TestFsStatReturnsCanonicalCreatePathWhenMissing(t *testing.T) {
 
 func TestFsReadAtomicallyVerifiesExpectedResolvedPath(t *testing.T) {
 	t.Run("stable identity reads the authorized file", func(t *testing.T) {
-		root := t.TempDir()
+		root := canonicalFixturePath(t, t.TempDir())
 		target := filepath.Join(root, "plan.md")
 		if err := os.WriteFile(target, []byte("# stable plan"), 0o644); err != nil {
 			t.Fatal(err)
@@ -350,7 +350,7 @@ func TestFsWriteVerifiesExpectedResolvedPath(t *testing.T) {
 }
 
 func TestPathGuardRejectsEscapingSymlinksAndAllowsInternalSymlinks(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(base, "root")
 	inside := filepath.Join(root, "inside")
 	outside := filepath.Join(base, "outside")
@@ -378,7 +378,7 @@ func TestPathGuardRejectsEscapingSymlinksAndAllowsInternalSymlinks(t *testing.T)
 	if err := os.WriteFile(insideFile, []byte("inside"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := guard.CheckExisting(filepath.Join(root, "inside-link", "existing.txt")); err != nil || !samePath(got, insideFile) {
+	if got, err := guard.CheckExisting(filepath.Join(root, "inside-link", "existing.txt")); err != nil || !samePath(got, canonicalFixturePath(t, insideFile)) {
 		t.Fatalf("internal symlink rejected: got=%q err=%v", got, err)
 	}
 
@@ -643,8 +643,16 @@ func TestPathGuardRejectsEscapingWindowsJunctions(t *testing.T) {
 	}
 
 	insideFile := filepath.Join(inside, "safe.txt")
-	if got, err := guard.CheckExisting(filepath.Join(root, "inside-junction", "safe.txt")); err != nil || !samePath(got, insideFile) {
+	if got, err := guard.CheckExisting(filepath.Join(root, "inside-junction", "safe.txt")); err != nil || !samePath(got, canonicalFixturePath(t, insideFile)) {
 		t.Fatalf("internal junction rejected: got=%q err=%v", got, err)
+	}
+	insideCreate := filepath.Join(canonicalFixturePath(t, inside), "new", "created.txt")
+	if got, err := guard.CheckCreate(filepath.Join(root, "inside-junction", "new", "created.txt")); err != nil || !samePath(got, insideCreate) {
+		t.Fatalf("internal junction create rejected: got=%q err=%v", got, err)
+	}
+	junctionRoot := NewPathGuard([]string{filepath.Join(root, "inside-junction")})
+	if got, err := junctionRoot.CheckCreate(filepath.Join(inside, "new", "created.txt")); err != nil || !samePath(got, insideCreate) {
+		t.Fatalf("configured junction root was not canonicalized: got=%q err=%v", got, err)
 	}
 
 	h := New(guard, 1024*1024)
@@ -657,10 +665,19 @@ func TestPathGuardRejectsEscapingWindowsJunctions(t *testing.T) {
 	}
 }
 
+// Installed by the Windows-only fixture helper, so non-Windows builds need no
+// Windows SysProcAttr fields and never invoke a placeholder shell implementation.
+var windowsJunctionCommand func(context.Context, string, string) *exec.Cmd
+
 func requireWindowsJunction(t *testing.T, target, link string) {
 	t.Helper()
-	command := fmt.Sprintf(`mklink /J "%s" "%s"`, link, target)
-	if output, err := exec.Command("cmd.exe", "/d", "/s", "/c", command).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if windowsJunctionCommand == nil {
+		t.Fatal("native Windows junction command is unavailable")
+	}
+	command := windowsJunctionCommand(ctx, link, target)
+	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("create junction %q -> %q: %v (%s)", link, target, err, output)
 	}
 }

@@ -1,9 +1,16 @@
+import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators, users } from "../../db/schema";
 import { settings } from "../../lib/settings";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
+import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
+import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
+import {
+	loadModelHistorySource,
+	markModelHistoryRows,
+} from "../agent-runtime/model-history-source";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -360,12 +367,25 @@ test("pure tool-result replay leaves currentText empty rather than inventing a s
 		],
 	};
 	const before = JSON.stringify(tool);
-	const prepared = await buildRuntimeHistory({ ...options(), sourceMessages: [tool] });
-	expect(prepared.isPureToolResultReplay).toBe(true);
-	expect(prepared.currentText).toBe("");
-	expect(prepared.trailingToolResults).toHaveLength(1);
-	expect(textOf(prepared.trailingToolResults)).toContain("tool result");
-	expect(JSON.stringify(tool)).toBe(before);
+	// This tool row is synthetic, not a snapshot of the persisted primary history. Obtain
+	// explicit unversioned provenance from a private legacy fixture without bypassing guards.
+	const legacy = new Database(":memory:");
+	try {
+		legacy.run(modelHistoryFixtureSql);
+		legacy.run("INSERT INTO narrators (id,title) VALUES ('synthetic','Synthetic')");
+		expect(readSqliteModelHistorySignature(legacy, "synthetic").trusted).toBe(false);
+		const source = await loadModelHistorySource({ backend: "sqlite", sqlite: legacy }, "synthetic");
+		const sourceMessages = [tool];
+		markModelHistoryRows(sourceMessages, source);
+		const prepared = await buildRuntimeHistory({ ...options(), sourceMessages });
+		expect(prepared.isPureToolResultReplay).toBe(true);
+		expect(prepared.currentText).toBe("");
+		expect(prepared.trailingToolResults).toHaveLength(1);
+		expect(textOf(prepared.trailingToolResults)).toContain("tool result");
+		expect(JSON.stringify(tool)).toBe(before);
+	} finally {
+		legacy.close();
+	}
 });
 
 test("compact input retains human and agent authorship without changing stored rows", async () => {

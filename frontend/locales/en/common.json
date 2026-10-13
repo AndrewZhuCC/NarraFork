@@ -25,6 +25,10 @@
 		"repairFailed": "Repair did not complete successfully. Check again or handle the directory manually."
 	},
 	"dockTabs": {
+		"gitIdentity": "Git commit identity",
+		"gitIdentityUnconfigured": "No git identity configured — add one in Settings → Profile",
+		"gitIdentityFollowDefault": "Follow the default identity ({{name}})",
+		"gitIdentityFollowDefaultPlain": "Follow the default identity",
 		"revealInExplorer": "Show in File Manager",
 		"revealFailed": "Could not open the file manager",
 		"openInWindow": "Open in window",
@@ -33,6 +37,7 @@
 		"right": "Close tabs to the right",
 		"auxiliary": "Close auxiliary tabs (keep all narrators)"
 	},
+	"loading": "Loading…",
 	"scrollbar": {
 		"vertical": "Vertical scrollbar",
 		"horizontal": "Horizontal scrollbar"
@@ -757,6 +762,7 @@
 	"imageViewer_close": "Close",
 	"imageViewer_fullscreen": "Fullscreen",
 	"imageViewer_copySuccess": "Image copied to clipboard",
+	"imageViewer_copyUnavailableDownloaded": "Clipboard is unavailable in this environment; image downloaded instead",
 	"imageViewer_copyFailed": "Failed to copy image",
 	"imageViewer_downloadFailed": "Failed to download image"
 }

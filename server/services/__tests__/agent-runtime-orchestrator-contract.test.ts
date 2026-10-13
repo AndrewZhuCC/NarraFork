@@ -16,6 +16,8 @@ import {
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import type { RuntimeProfile } from "../agent-runtime/input";
+import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
+import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { deferred } from "./agent-runtime-contract.harness";
@@ -78,9 +80,10 @@ const adapter: ProviderAdapter = {
 		throw new Error("Contract must not generate history");
 	},
 };
-const unregister = provider.registerExternalProviderResolver((name) =>
-	name === "orchestratorfixture" ? adapter : null,
-);
+const unregister = provider.registerExternalProviderResolver({
+	resolve: (name) => (name === "orchestratorfixture" ? adapter : null),
+	listReadiness: () => [],
+});
 const ids = ["contract-parent", "contract-primary", "contract-child"];
 beforeEach(() => {
 	cleanDb(sqlite);
@@ -192,6 +195,83 @@ describe("Bash Git command detection for status refresh", () => {
 		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
+
+describe("subagent signed source projection", () => {
+	function seed() {
+		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.
+		// Restore only that private fixture row so these tests exercise a trusted production guard.
+		sqlite
+			.query(
+				"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
+			)
+			.run(MODEL_HISTORY_REVISION_CONTRACT);
+		expect(readSqliteModelHistorySignature(sqlite, "contract-child").trusted).toBe(true);
+		const now = new Date().toISOString();
+		db.insert(narratorMessages)
+			.values({
+				id: "signed-subagent-history",
+				narratorId: "contract-child",
+				parentToolUseId: "origin-agent",
+				role: "assistant",
+				contentJson: [{ type: "text", text: "signed original" }],
+				contentText: "signed original",
+				createdAt: now,
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({
+				id: "signed-subagent-ref",
+				narratorId: "contract-child",
+				messageId: "signed-subagent-history",
+				seq: 0,
+			})
+			.run();
+	}
+	test("retains trusted raw rows while clearing placement only in detached provider rows", async () => {
+		seed();
+		const build = adapter.buildHistory;
+		let projected = false;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			const row = args[0].find((message) => message.id === "signed-subagent-history");
+			expect(row?.parentToolUseId).toBeNull();
+			projected = true;
+			return build(...args);
+		});
+		const h = fixture(profiles[1], [finished]);
+		expect((await h.run()).hasError).toBe(false);
+		expect(projected).toBe(true);
+		expect(h.calls).toHaveLength(1);
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, "signed-subagent-history"))
+				.get()?.parentToolUseId,
+		).toBe("origin-agent");
+	});
+	test("a body edit during detached provider projection is refused before a model pass", async () => {
+		seed();
+		const build = adapter.buildHistory;
+		let projected = false;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			expect(
+				args[0].find((message) => message.id === "signed-subagent-history")?.parentToolUseId,
+			).toBeNull();
+			projected = true;
+			db.update(narratorMessages)
+				.set({ contentJson: [{ type: "text", text: "late body edit" }] })
+				.where(eq(narratorMessages.id, "signed-subagent-history"))
+				.run();
+			return build(...args);
+		});
+		const h = fixture(profiles[1], [finished]);
+		const result = await h.run();
+		expect(result.hasError).toBe(true);
+		expect(projected).toBe(true);
+		expect(h.calls).toHaveLength(0);
+		expect(result.finalText).toContain("changed after provider preparation");
 	});
 });
 
@@ -459,17 +539,64 @@ describe("real shared orchestrator profile contract", () => {
 		});
 
 		test(`${profile.kind}: exhausted stateless provider retry cannot multiply into outer model calls`, async () => {
+			const diagnostics = {
+				schema: "narrafork.error-diagnostics.v1" as const,
+				recordingRequestId: "exhausted-attempt",
+				apiRequestId: "exhausted-row",
+				requestId: "upstream-exhausted",
+			};
 			const h = fixture(profile, [
 				{
 					...finished,
 					completedNaturally: false,
 					retryableError: "fixture exhausted provider retries",
+					retryableDiagnostics: diagnostics,
 				},
 			]);
 			const result = await h.run();
 			expect(result).toMatchObject({ started: true, hasError: true });
 			expect(h.calls).toHaveLength(1);
 			expect(result.lastPass?.retryableError).toBe("fixture exhausted provider retries");
+			const rows = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, h.session.narratorId))
+				.all();
+			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+				{ type: "error", message: "fixture exhausted provider retries", diagnostics },
+			]);
+		});
+
+		test(`${profile.kind}: resumable continuation exhaustion persists the last failure's exact request`, async () => {
+			const attempts = Array.from({ length: 4 }, (_, index) => ({
+				...finished,
+				completedNaturally: false,
+				interrupted: true,
+				interruptedReason: "resumable_error" as const,
+				interruptionError: `upstream failure ${index}`,
+				interruptionDiagnostics: {
+					schema: "narrafork.error-diagnostics.v1" as const,
+					recordingRequestId: `resume-attempt-${index}`,
+					apiRequestId: `resume-row-${index}`,
+					requestId: `upstream-resume-${index}`,
+				},
+			}));
+			const h = fixture(profile, attempts);
+			const result = await h.run();
+			expect(result).toMatchObject({ hasError: true, finalText: "upstream failure 3" });
+			expect(h.calls).toHaveLength(4);
+			const rows = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, h.session.narratorId))
+				.all();
+			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+				{
+					type: "error",
+					message: "upstream failure 3",
+					diagnostics: attempts[3].interruptionDiagnostics,
+				},
+			]);
 		});
 
 		for (const naturallyDone of [true, false]) {

@@ -290,6 +290,7 @@ export interface NarratorToolbarOverflowMenuProps {
 	 * sit under the open dropdown on a phone.
 	 */
 	onOpenCompatibility?: () => void;
+	onOpenSavedRecordings?: () => void;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -304,6 +305,7 @@ export function NarratorToolbarOverflowMenu({
 	onArchive,
 	archiveLoading,
 	onOpenCompatibility,
+	onOpenSavedRecordings,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tp } = useTranslation("projects");
@@ -516,6 +518,16 @@ export function NarratorToolbarOverflowMenu({
 							{tp("compatibility.title")}
 						</Menu.Item>
 					</>
+				)}
+				{onOpenSavedRecordings && (
+					<Menu.Item
+						onClick={() => {
+							closeMenu();
+							onOpenSavedRecordings();
+						}}
+					>
+						{t("saveDump.history")}
+					</Menu.Item>
 				)}
 				{onArchive ? (
 					<>

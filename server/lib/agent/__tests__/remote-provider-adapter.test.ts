@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
+	markHostTruncatedDump,
 	PLUGIN_REQUEST_DUMP_MAX_BYTES,
 	type ProviderStreamEvent,
 	providerStreamEventSchema,
@@ -9,6 +10,10 @@ import {
 	type ProviderOperationKind,
 	ProviderRpcError,
 } from "@server/services/plugin-provider-rpc";
+import type { RecordingFrame, RequestRecording } from "@shared/request-recording";
+import { createRequestRecording, RequestRecorderClient } from "../../request-recorder";
+import type { RecorderOperation } from "../../request-recorder-protocol";
+import { settings } from "../../settings";
 import type { ChatParams, DbMessage } from "../provider";
 import { RemoteProviderAdapter, type RemoteProviderRpcClient } from "../remote-provider-adapter";
 import { ApiRequestDumpCollector } from "../request-dump";
@@ -868,7 +873,147 @@ describe("RemoteProviderAdapter", () => {
 });
 
 describe("RemoteProviderAdapter request dump", () => {
+	test("plugin evidence is delivered live before done and masks split secrets", async () => {
+		const frames: RecordingFrame[] = [];
+		const recording: RequestRecording = {
+			requestId: "plugin-live",
+			request: () => {},
+			responseMeta: () => {},
+			responseChunk: () => {},
+			frame: (frame) => frames.push(frame),
+			finish: () => {},
+		};
+		const rpc = makeRpc(async function* () {
+			yield { type: "dump.request", url: "https://upstream.test", bodyChunk: '{"secret":"secret-' };
+			yield { type: "dump.request", bodyChunk: 'value"}', final: true };
+			yield { type: "dump.response", status: 200, bodyChunk: `${"public".repeat(200)}secret-` };
+			yield { type: "dump.response", bodyChunk: `value${" tail".repeat(200)}` };
+			yield { type: "text.delta", text: "business output" };
+			yield { type: "done", status: "completed", stopReason: "end_turn" };
+		});
+		const stream = makeAdapter(rpc).chat(
+			chatParams({ requestDump: new ApiRequestDumpCollector(undefined, recording) }),
+		);
+		while (!(await stream.next()).value?.text) {}
+		const evidence = frames
+			.filter((frame) => frame.type === "plugin.reported_body")
+			.map((frame) => frame.text)
+			.join("");
+		expect(evidence).toContain("public");
+		expect(evidence).not.toContain("secret-value");
+		expect(frames.some((frame) => frame.type === "plugin.dump.request")).toBe(true);
+		await stream.return(undefined);
+		expect(
+			frames
+				.filter((frame) => frame.type === "plugin.reported_body")
+				.map((frame) => frame.text)
+				.join(""),
+		).not.toContain("secret-value");
+	});
 	const done = () => event("done", { status: "completed", stopReason: "end_turn" });
+
+	test("plugin truncation is explicit source loss on both request and response without interrupting output", async () => {
+		const frames: RecordingFrame[] = [];
+		const recording: RequestRecording = {
+			requestId: "plugin-truncated",
+			request: () => {},
+			responseMeta: () => {},
+			responseChunk: () => {},
+			frame: (frame) => frames.push(frame),
+			finish: () => {},
+		};
+		const rpc = makeRpc([
+			event("dump.request", {
+				url: "https://upstream.test?key=secret-value",
+				bodyChunk: "request prefix secret-value",
+				truncated: true,
+				final: true,
+			}),
+			event("dump.response", {
+				status: 200,
+				bodyChunk: "response prefix secret-value",
+				truncated: true,
+				final: true,
+			}),
+			event("text.delta", { text: "business output" }),
+			done(),
+		]);
+		const previous = settings.agent.requestDumpRecordingEnabled;
+		settings.agent.requestDumpRecordingEnabled = true;
+		const operations: RecorderOperation[] = [];
+		const configure = spyOn(RequestRecorderClient.prototype, "configure").mockImplementation(
+			() => {},
+		);
+		const capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation(
+			(operation) => {
+				operations.push(operation);
+				return true;
+			},
+		);
+		try {
+			const coreRecording = createRequestRecording({
+				requestId: recording.requestId,
+				narratorId: "plugin-test",
+				provider: "remote",
+				model: MODEL.id,
+			});
+			if (!coreRecording) throw new Error("Recording fixture must be enabled");
+			recording.frame = (frame) => {
+				frames.push(frame);
+				coreRecording.frame(frame);
+			};
+			const events = await collect(
+				makeAdapter(rpc).chat(
+					chatParams({ requestDump: new ApiRequestDumpCollector(undefined, recording) }),
+				),
+			);
+			coreRecording.finish({ status: "completed" });
+			expect(events[0].text).toBe("business output");
+			expect(frames.filter((frame) => frame.sourceTruncated)).toMatchObject([
+				{ direction: "request", sourceTruncated: "plugin" },
+				{ direction: "response", sourceTruncated: "plugin" },
+			]);
+			expect(operations.filter((operation) => operation.type === "gap")).toMatchObject([
+				{ side: "request", bytes: 0, reason: "plugin source truncated" },
+				{ side: "response", bytes: 0, reason: "plugin source truncated" },
+			]);
+			expect(JSON.stringify(frames)).not.toContain("secret-value");
+		} finally {
+			capture.mockRestore();
+			configure.mockRestore();
+			settings.agent.requestDumpRecordingEnabled = previous;
+		}
+	});
+
+	test("host diagnostic clipping is distinguished from plugin-declared clipping without changing the wire", async () => {
+		const clipped = event("dump.response", {
+			status: 200,
+			bodyChunk: "prefix",
+			truncated: true,
+			final: true,
+		});
+		markHostTruncatedDump(clipped);
+		const frames: RecordingFrame[] = [];
+		const recording: RequestRecording = {
+			requestId: "host-truncated",
+			request: () => {},
+			responseMeta: () => {},
+			responseChunk: () => {},
+			frame: (frame) => frames.push(frame),
+			finish: () => {},
+		};
+		const rpc = makeRpc([clipped, event("text.delta", { text: "business output" }), done()]);
+		const output = await collect(
+			makeAdapter(rpc).chat(
+				chatParams({ requestDump: new ApiRequestDumpCollector(undefined, recording) }),
+			),
+		);
+		expect(output[0].text).toBe("business output");
+		expect(frames.filter((frame) => frame.sourceTruncated)).toMatchObject([
+			{ direction: "response", sourceTruncated: "host" },
+		]);
+		expect(JSON.stringify(clipped)).not.toContain("sourceTruncated");
+	});
 
 	test("chat params carry the requestDump hint only when a collector is attached", async () => {
 		const withDump = makeRpc([done()]);

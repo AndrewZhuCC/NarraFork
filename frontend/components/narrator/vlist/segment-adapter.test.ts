@@ -8,6 +8,7 @@ import {
 	type AdapterContentBlock,
 	type AdapterContext,
 	type AdapterSegment,
+	type AdapterToolItem,
 	adaptRenderUnits,
 	adaptSegment,
 	adaptSegments,
@@ -1834,6 +1835,48 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect("isTakenOver" in subagentData({ toolName: "Task", status: "running" })).toBe(false);
 	});
 
+	/**
+	 * The live output counter: the server streams the child's reply length as a
+	 * bare numeric `tool_output` payload (the ContextAsk convention), bridged onto
+	 * the card's metadata by `resolveToolMetadata`. It is a header BADGE — painted
+	 * from the cached payload — so the adapter must surface it (and
+	 * `subagentRevision` must key it) only while the child is still working.
+	 */
+	it("carries the child's live output counter while running", () => {
+		const data = subagentData({
+			toolName: "Agent",
+			status: "running",
+			inputJson: { subagent_type: "explore", description: "dig" },
+			_streamingOutput: "1240",
+		});
+		expect(data.liveOutputChars).toBe(1240);
+		// The count rides the header badge — `toolOutputValue` folds the same payload
+		// into the output slot, and it must never become the conclusion body.
+		expect(data.resultText).toBeUndefined();
+		expect(data.resultBody).toBeUndefined();
+	});
+
+	it("omits the counter on a terminal card or a non-numeric stream", () => {
+		expect(
+			"liveOutputChars" in
+				subagentData({
+					toolName: "Agent",
+					status: "success",
+					inputJson: {},
+					_streamingOutput: "1240",
+				}),
+		).toBe(false);
+		expect(
+			"liveOutputChars" in
+				subagentData({
+					toolName: "Agent",
+					status: "running",
+					inputJson: {},
+					_streamingOutput: "thinking…",
+				}),
+		).toBe(false);
+	});
+
 	it("omits prompt when inputJson carries none (no fabrication)", () => {
 		const data = subagentData({
 			toolName: "Task",
@@ -2050,6 +2093,44 @@ describe("adaptActivityUnit", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const noResolver = adaptActivityUnit([toolItem("x")], "act-4", { lod: 1 });
 		expect(collapsedOf(noResolver)).toBe(false);
+	});
+
+	it("an Await row headlines the awaited session's title from the shared summary", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const { getCategory, getSummary } = await import("../tool-call/tool-display");
+		const unit = adaptActivityUnit(
+			[
+				{
+					kind: "tool",
+					tc: {
+						toolUseId: "tu-await",
+						toolName: "Await",
+						status: "running",
+						inputJson: { type: "agent", id: "worker" },
+						_awaitAgentNarratorId: "sub-live",
+						_awaitAgentTitle: "Plan story retirement",
+					} as AdapterToolItem["tc"],
+				},
+			],
+			"act-await",
+			{
+				lod: 2,
+				recentMessageIds: new Set<string>(),
+				resolveToolCategory: (name, input) => getCategory(name, input),
+				// Same bridge as PretextExactMessageList's resolveExactToolSummary: the
+				// folded row and the expanded card read the SAME summary, so the title
+				// the card headlines is the title the folded row shows.
+				resolveToolSummary: (tc) => {
+					const call = (tc ?? {}) as Record<string, unknown>;
+					return getSummary(call.toolName as string, call.inputJson, {
+						_awaitAgentTitle: call._awaitAgentTitle as string | undefined,
+					});
+				},
+			},
+		);
+		expect(unit.kind).toBe("activity-trace");
+		const items = (unit.data as { items: Array<{ title: string }> }).items;
+		expect(items[0]?.title).toBe("Await · agent: Plan story retirement");
 	});
 });
 
@@ -3228,6 +3309,38 @@ describe("adaptSegment — header timing passthrough", () => {
 	it("carries the error message so a failed card can show it", () => {
 		const d = data(bashSeg({ status: "fail", errorMessage: "exit 127" }));
 		expect(d.errorMessage).toBe("exit 127");
+	});
+
+	it("lifts the running Await's transport id/title into the identity row", () => {
+		const awaitSeg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: {
+						toolName: "Await",
+						toolUseId: "tu-1",
+						status: "running",
+						inputJson: { type: "agent", id: "worker" },
+						_awaitAgentNarratorId: "g2GQj-mTWJqSPaaAqG_Ud",
+						_awaitAgentTitle: "Plan story retirement",
+					} as AdapterToolItem["tc"],
+				},
+			],
+		};
+		const d = data(awaitSeg, { lod: 5, resolveToolCategory: () => "await" }) as {
+			detail?: { sections?: Array<{ body?: unknown }> };
+		};
+		const rows = (
+			d.detail?.sections?.find(
+				(s) => (s.body as { kind?: string } | undefined)?.kind === "meta-rows",
+			)?.body as { rows?: Array<{ identity?: string }> } | undefined
+		)?.rows;
+		// The transport title differs from the selector, so the header shows the
+		// title and the identity row carries just the id (no label was resolved).
+		expect(rows?.map((row) => row.identity)).toEqual(["g2GQj-mTWJqSPaaAqG_Ud"]);
 	});
 
 	it("falls back to the per-tool DEFAULT timeout when none is declared", () => {

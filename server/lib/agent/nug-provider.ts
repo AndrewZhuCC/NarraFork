@@ -27,6 +27,7 @@ import {
 } from "./nug-image-dedup";
 import { OpenAIProvider } from "./openai-provider";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -383,7 +384,7 @@ export class NugProvider implements ProviderAdapter {
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+	): Promise<BuiltHistory> {
 		const meta = this.resolveMeta(model);
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;

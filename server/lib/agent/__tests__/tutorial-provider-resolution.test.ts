@@ -46,9 +46,12 @@ describe("retired tutorial provider", () => {
 
 	test("a plugin never receives retired model requests", () => {
 		let pluginResolverCalls = 0;
-		const unregister = registerExternalProviderResolver(() => {
-			pluginResolverCalls++;
-			return {} as never;
+		const unregister = registerExternalProviderResolver({
+			resolve: () => {
+				pluginResolverCalls++;
+				return {} as never;
+			},
+			listReadiness: () => [],
 		});
 		try {
 			expect(() => resolveProviderAndModel("tutorial:guide/first-turn/en")).toThrow(
@@ -63,9 +66,10 @@ describe("retired tutorial provider", () => {
 
 	test("a distinct provider whose name starts with tutorial is unaffected", () => {
 		const adapter = {} as never;
-		const unregister = registerExternalProviderResolver((provider) =>
-			provider === "tutorial-mirror" ? adapter : null,
-		);
+		const unregister = registerExternalProviderResolver({
+			resolve: (provider) => (provider === "tutorial-mirror" ? adapter : null),
+			listReadiness: () => [],
+		});
 		try {
 			const resolved = resolveProviderAndModel("tutorial-mirror:chat");
 			expect(resolved.adapter).toBe(adapter);

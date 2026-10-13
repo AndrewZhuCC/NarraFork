@@ -54,6 +54,7 @@ import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectories";
+import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
@@ -116,6 +117,7 @@ import {
 	isTabActive,
 	SWIPE_THRESHOLD,
 } from "./recent-tabs-logic";
+import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
 
@@ -1247,6 +1249,7 @@ export function RecentTabList({
 								) === 0
 							}
 							isWorkspace={ctxMenu.tab.type === "workspace"}
+							gitIdentityNarratorId={ctxMenu.tab.type === "narrator" ? ctxMenu.tab.id : null}
 							t={t}
 						/>
 					)}
@@ -2198,6 +2201,8 @@ interface TabContextMenuProps {
 	canArchive: boolean;
 	isFirst: boolean;
 	isWorkspace: boolean;
+	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
+	gitIdentityNarratorId: string | null;
 	t: (key: string) => string;
 }
 
@@ -2223,8 +2228,10 @@ function TabContextMenu({
 	canArchive,
 	isFirst,
 	isWorkspace,
+	gitIdentityNarratorId,
 	t,
 }: TabContextMenuProps) {
+	const gitIdentityVisibility = useGitIdentityVisibility();
 	return (
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
@@ -2303,6 +2310,9 @@ function TabContextMenu({
 							</Group>
 						</UnstyledButton>
 					)}
+					{gitIdentityNarratorId && gitIdentityVisibility.contextMenu && (
+						<TabGitIdentityMenu narratorId={gitIdentityNarratorId} onClose={onClose} />
+					)}
 					{canReveal && (
 						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">
@@ -2310,7 +2320,7 @@ function TabContextMenu({
 								<Text size="sm">{t("revealInExplorer")}</Text>
 							</Group>
 						</UnstyledButton>
-					)}
+					)}{" "}
 					{canNewNarratorHere && (
 						<UnstyledButton px="xs" py={4} onClick={onNewNarratorHere} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">

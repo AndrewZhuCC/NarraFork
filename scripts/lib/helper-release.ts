@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
 	type DistributionLicense,
 	HELPER_BINARY_MAX_BYTES,
@@ -14,7 +15,10 @@ import {
 import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { type GhRunner, validateGitHubRepository } from "./github-release";
-import { listGitHubReleaseSummaries } from "./github-release-summary";
+import {
+	type GitHubReleaseSummary,
+	listGitHubRestReleaseSummaries,
+} from "./github-release-summary";
 
 export const HELPER_LICENSE_FILES = [
 	"ripgrep.txt",
@@ -56,6 +60,7 @@ interface RemoteRelease {
 	tag_name: string;
 	draft: boolean;
 	prerelease: boolean;
+	published_at?: string | null;
 	assets: RemoteAsset[];
 }
 interface ReleaseDescription {
@@ -208,25 +213,30 @@ async function getRelease(
 	options: { repository: string; run?: GhRunner; signal?: AbortSignal },
 	tag: string,
 	allowDraftLookup = false,
+	knownRelease?: RemoteRelease,
 ): Promise<RemoteRelease | undefined> {
 	let text: string;
-	let summary: Awaited<ReturnType<typeof listGitHubReleaseSummaries>>[number] | undefined;
-	try {
-		text = await call(options, ["api", `repos/${options.repository}/releases/tags/${tag}`]);
-	} catch (error) {
-		if (!allowDraftLookup || !/HTTP 404\b/.test(String(error))) throw error;
-		// /releases/tags excludes drafts. Enumerate authenticated, bounded summaries
-		// to completion before declaring absence; never enumerate bodies/assets.
-		const releases = await listGitHubReleaseSummaries(
-			(args) => call(options, args, 1024 * 1024),
-			options.repository,
-		);
-		const matches = releases.filter((release) => release.tagName === tag);
-		if (matches.length > 1) throw new Error("Ambiguous helper release tag");
-		summary = matches[0];
-		if (!summary) return undefined;
-		if (summary.assetCount > 45) throw new Error("Helper release asset count exceeds limit");
-		text = await call(options, ["api", `repos/${options.repository}/releases/${summary.id}`]);
+	let summary: GitHubReleaseSummary | undefined;
+	if (knownRelease) {
+		// Upload changes the asset count; bind identity/state, then verify the exact
+		// new file set below. Do not re-enumerate a known draft after uploading.
+		text = await call(options, ["api", `repos/${options.repository}/releases/${knownRelease.id}`]);
+	} else {
+		try {
+			text = await call(options, ["api", `repos/${options.repository}/releases/tags/${tag}`]);
+		} catch (error) {
+			if (!allowDraftLookup || !/HTTP 404\b/.test(String(error))) throw error;
+			const releases = await listGitHubRestReleaseSummaries(
+				(args) => call(options, args),
+				options.repository,
+			);
+			const matches = releases.filter((release) => release.tagName === tag);
+			if (matches.length > 1) throw new Error("Ambiguous helper release tag");
+			summary = matches[0];
+			if (!summary) return undefined;
+			if (summary.assetCount > 45) throw new Error("Helper release asset count exceeds limit");
+			text = await call(options, ["api", `repos/${options.repository}/releases/${summary.id}`]);
+		}
 	}
 	if (Buffer.byteLength(text) > 128 * 1024) throw new Error("Release metadata exceeds limit");
 	const value = JSON.parse(text) as RemoteRelease;
@@ -245,9 +255,18 @@ async function getRelease(
 		(value.id !== summary.id ||
 			value.draft !== summary.draft ||
 			value.prerelease !== summary.prerelease ||
+			value.published_at !== summary.publishedAt ||
 			value.assets.length !== summary.assetCount)
 	)
 		throw new Error("Helper release summary/ID/asset completeness mismatch");
+	if (
+		knownRelease &&
+		(value.id !== knownRelease.id ||
+			value.draft !== knownRelease.draft ||
+			value.prerelease !== knownRelease.prerelease ||
+			value.published_at !== knownRelease.published_at)
+	)
+		throw new Error("Helper draft changed before publication");
 	const names = new Set<string>();
 	for (const asset of value.assets) {
 		if (
@@ -391,7 +410,15 @@ export async function publishHelperRelease(
 			"--notes",
 			"Immutable auxiliary binaries and license materials. Linux ARM64 ripgrep requires glibc; Alpine/Termux are not supported.",
 		]);
-		release = await getRelease(options, description.tag, true);
+		// Retry reads only after a complete authenticated listing proves absence.
+		// Four post-create reads at most; API/validation errors escape immediately.
+		// The parent signal/deadline also cancels these asynchronous delays.
+		for (const milliseconds of [0, 250, 1000, 2000]) {
+			if (milliseconds > 0) await delay(milliseconds, undefined, { signal: options.signal });
+			release = await getRelease(options, description.tag, true);
+			if (release) break;
+		}
+		if (!release) throw new Error("Created helper draft not visible in authenticated REST lookup");
 	}
 	if (!release?.draft || release.prerelease) throw new Error("Expected stable helper draft");
 	assertRemoteFiles(release, description.files, false);
@@ -409,7 +436,7 @@ export async function publishHelperRelease(
 			options.repository,
 		]);
 	}
-	const uploaded = await getRelease(options, description.tag, true);
+	const uploaded = await getRelease(options, description.tag, false, release);
 	if (!uploaded?.draft || uploaded.id !== release.id)
 		throw new Error("Helper draft changed before publication");
 	assertRemoteFiles(uploaded, description.files);

@@ -17,7 +17,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
-import { MantineProvider } from "@mantine/core";
+import { MantineProvider, rem } from "@mantine/core";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -450,5 +450,107 @@ describe("error notice card — the model probe shares the fix's button row", ()
 		const probe = buttons.find((b) => b.textContent?.includes(TEST_LABEL));
 		expect(probe?.hasAttribute("disabled")).toBe(true);
 		unmount();
+	});
+});
+
+describe("error notice card — exact request shortcuts", () => {
+	const block = {
+		type: "error",
+		message: ERROR_TEXT,
+		diagnostics: { recordingRequestId: "req_failed", requestId: "upstream-id" },
+	};
+	const labels = { viewErrorRequest: "查看请求详情", downloadErrorDump: "下载 Dump" };
+	it("adapts, measures and binds both shortcuts to their own handlers", () => {
+		const calls: string[] = [];
+		const { buttons, measured, unmount } = renderErrorCard(
+			{
+				onViewRequest: () => calls.push("view"),
+				onDownloadDump: () => calls.push("download"),
+			},
+			block,
+			{ labels },
+		);
+		const view = buttons.find((button) => button.textContent === labels.viewErrorRequest);
+		const download = buttons.find((button) => button.textContent === labels.downloadErrorDump);
+		expect(view).toBeDefined();
+		expect(download).toBeDefined();
+		expect(view?.style.height).toBe(rem(MEASURE_SYSTEM_TEXT_CONSTANTS.BUTTON_COMPACT_XS));
+		expect(download?.style.height).toBe(rem(MEASURE_SYSTEM_TEXT_CONSTANTS.BUTTON_COMPACT_XS));
+		act(() => {
+			view?.click();
+			download?.click();
+		});
+		expect(calls).toEqual(["view", "download"]);
+		const baseline = measureSystemTextCard("error", { text: ERROR_TEXT }, CONTENT_WIDTH);
+		expect(measured.height - baseline.height).toBe(
+			MEASURE_SYSTEM_TEXT_CONSTANTS.STACK_GAP + MEASURE_SYSTEM_TEXT_CONSTANTS.BUTTON_COMPACT_XS,
+		);
+		unmount();
+	});
+	it("disables this card's download while another request transfers without disabling details", () => {
+		let downloads = 0;
+		let views = 0;
+		const { buttons, unmount } = renderErrorCard(
+			{
+				onDownloadDump: () => downloads++,
+				downloadDumpDisabled: true,
+				onViewRequest: () => views++,
+			},
+			block,
+			{ labels },
+		);
+		const download = buttons.find((button) => button.textContent === labels.downloadErrorDump);
+		const view = buttons.find((button) => button.textContent === labels.viewErrorRequest);
+		expect(download?.disabled).toBe(true);
+		expect(download?.hasAttribute("data-loading")).toBe(false);
+		act(() => {
+			download?.click();
+			view?.click();
+		});
+		expect(downloads).toBe(0);
+		expect(views).toBe(1);
+		unmount();
+	});
+	it("does not invent request links for old errors or upstream-only IDs", () => {
+		for (const diagnostics of [
+			undefined,
+			{ requestId: "req_upstream" },
+			{ recordingRequestId: "../../other" },
+		]) {
+			const { buttons, unmount } = renderErrorCard(
+				undefined,
+				{ ...block, diagnostics },
+				{ labels },
+			);
+			expect(buttons).toHaveLength(2);
+			unmount();
+		}
+	});
+	it("reserves a separate row when request shortcuts and provider actions coexist", () => {
+		const { measured, unmount } = renderErrorCard(undefined, block, {
+			labels: { ...labels, testCurrentModel: "Test" },
+			canOfferModelTest: () => true,
+		});
+		const baseline = measureSystemTextCard("error", { text: ERROR_TEXT }, CONTENT_WIDTH);
+		expect(measured.height - baseline.height).toBe(
+			2 *
+				(MEASURE_SYSTEM_TEXT_CONSTANTS.STACK_GAP + MEASURE_SYSTEM_TEXT_CONSTANTS.BUTTON_COMPACT_XS),
+		);
+		unmount();
+	});
+	it("keeps the same explicit two-row model at narrow widths", () => {
+		const data = {
+			text: ERROR_TEXT,
+			buttons: ["查看请求详情", "下载 Dump", "Test"],
+			buttonIds: ["viewErrorRequest", "downloadErrorDump", "testCurrentModel"],
+		};
+		for (const width of [180, 280, 800]) {
+			const baseline = measureSystemTextCard("error", { text: ERROR_TEXT }, width);
+			expect(measureSystemTextCard("error", data, width).height - baseline.height).toBe(
+				2 *
+					(MEASURE_SYSTEM_TEXT_CONSTANTS.STACK_GAP +
+						MEASURE_SYSTEM_TEXT_CONSTANTS.BUTTON_COMPACT_XS),
+			);
+		}
 	});
 });

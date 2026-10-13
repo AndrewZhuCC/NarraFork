@@ -165,10 +165,14 @@ export function sendDeliveryResolvedPatch(opts: {
 export function awaitAgentResolvedPatch(opts: {
 	toolUseId: string;
 	subagentNarratorId: string;
+	subagentTitle?: string;
 }): LivePatch {
 	return (messages) =>
 		patchToolCallFields(messages, opts.toolUseId, {
 			_awaitAgentNarratorId: opts.subagentNarratorId,
+			// Cosmetic companion of the id: headlines the running card with the
+			// session's display name. Absent when the resolver had no title.
+			...(opts.subagentTitle ? { _awaitAgentTitle: opts.subagentTitle } : {}),
 		});
 }
 

@@ -14,7 +14,7 @@
  * refactor that moves the check cannot pass while dropping it.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -155,6 +155,27 @@ describe("GET /api/fs/download", () => {
 		writeFileSync(db, "hashes");
 
 		expect((await app.request(url(db))).status).toBe(403);
+	});
+
+	test.each([
+		"request-recordings",
+		"saved-request-recordings",
+	])("generic file routes cannot serve %s, directly or via symlink", async (directory) => {
+		const root = join(narraforkDir, directory, "owner-recording");
+		mkdirSync(root, { recursive: true });
+		const recording = join(root, "stream.jsonl");
+		writeFileSync(recording, "private-recording-marker");
+		const link = join(dir, `${directory}-alias.jsonl`);
+		symlinkSync(recording, link, "file");
+		for (const endpoint of ["preview", "download", "edit-source"]) {
+			for (const path of [recording, link, join(root, "missing.jsonl")]) {
+				const res = await app.request(
+					`http://localhost/fs/${endpoint}?path=${encodeURIComponent(path)}`,
+				);
+				expect(res.status).toBe(403);
+				expect(await res.text()).not.toContain("private-recording-marker");
+			}
+		}
 	});
 
 	test("still serves a request dump under the same home", async () => {

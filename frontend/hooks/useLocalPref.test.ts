@@ -19,6 +19,7 @@ describe("useLocalPref — defaults", () => {
 		expect(localPrefDefault("narrafork_expand_reasoning")).toBe(false);
 		// The reading-width cap is opt-in: by default the message list fills the viewport.
 		expect(localPrefDefault("narrafork_narrator_centered_column")).toBe(false);
+		expect(localPrefDefault("narrafork_narrator_bottom_spacing_resize")).toBe(false);
 		// The Alt LOD gesture is existing behavior, so it must stay default-ON:
 		// nothing stored (a fresh browser) keeps alt+wheel and the Alt-held
 		// indicator working; the switch exists to opt OUT.
@@ -28,6 +29,10 @@ describe("useLocalPref — defaults", () => {
 		// planners that lose a whole group's animation when the two levels' geometries
 		// disagree. The switch remains only as an opt-OUT.
 		expect(localPrefDefault("narrafork_unified_morph")).toBe(true);
+		// Identity entry points stay hidden until the user opts in. Session details
+		// remains available either way.
+		expect(localPrefDefault("narrafork_git_identity_context_menu")).toBe(false);
+		expect(localPrefDefault("narrafork_git_identity_create_modal")).toBe(false);
 	});
 });
 

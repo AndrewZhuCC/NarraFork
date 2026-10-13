@@ -173,6 +173,89 @@ describe("character statistics at actual persistence boundaries", () => {
 		});
 	});
 
+	test.each([
+		"exact-row",
+		"tool-use-id",
+	] as const)("%s question reply overwrites audit only; Read permission redirects still rewrite SDK input", async (lookup) => {
+		const original = {
+			questions: [
+				{
+					question: "Where should the rollout start?",
+					header: "Rollout",
+					options: [{ label: "Small", description: "A small pilot" }],
+				},
+			],
+			async: false,
+		};
+		const content = [
+			{ type: "tool_use", id: "question-overwrite", name: "AskUserQuestion", input: original },
+			{
+				type: "tool_use",
+				id: "read-redirect",
+				name: "Read",
+				input: { file_path: "/old/location.ts" },
+			},
+		];
+		const assistant = await narratorPersistence.persistAssistantMessage("n1", {
+			uuid: `question-audit-${lookup}`,
+			session_id: "question-session",
+			message: { content },
+		});
+		const calls = sqlite
+			.prepare("SELECT id, tool_use_id AS toolUseId FROM narrator_tool_calls WHERE message_id = ?")
+			.all(assistant.id) as Array<{ id: string; toolUseId: string }>;
+		const question = calls.find((call) => call.toolUseId === "question-overwrite");
+		const read = calls.find((call) => call.toolUseId === "read-redirect");
+		if (!question || !read) throw new Error("Missing real persisted tool rows");
+		const readContent = () => {
+			const row = sqlite
+				.prepare("SELECT content_json AS content FROM narrator_messages WHERE id = ?")
+				.get(assistant.id) as { content: string };
+			return JSON.parse(row.content);
+		};
+		const readAudit = (id: string) => {
+			const row = sqlite
+				.prepare("SELECT input_json AS input FROM narrator_tool_calls WHERE id = ?")
+				.get(id) as { input: string };
+			return JSON.parse(row.input);
+		};
+		const before = structuredClone(readContent());
+		const fullReply = {
+			...original,
+			async: true,
+			answers: { "Where should the rollout start?": "human-audit-canary-372d9f63" },
+			annotations: { "Where should the rollout start?": "human-note-canary-495f69a2" },
+			deferredByUser: true,
+		};
+		await narratorPersistence.updateToolCallResult(
+			"question-overwrite",
+			{ output: "human-audit-canary-372d9f63", status: "success" },
+			assistant.id,
+			question.id,
+		);
+		const outputBefore = toolOf(question.id).body;
+		await narratorPersistence.overwriteToolCallInput(
+			"question-overwrite",
+			fullReply,
+			lookup === "exact-row" ? question.id : undefined,
+		);
+		expect(readAudit(question.id)).toEqual(fullReply);
+		expect(toolOf(question.id).input).toBe(measureSerializedCharacters(fullReply));
+		expect(toolOf(question.id).body).toBe(outputBefore);
+		expect(readContent()).toEqual(before);
+		expect(readContent()[0].input).toEqual(original);
+		expect(readContent()[0].input.async).toBe(false);
+		const redirected = { file_path: "/permission-approved/location.ts" };
+		await narratorPersistence.overwriteToolCallInput(
+			"read-redirect",
+			redirected,
+			lookup === "exact-row" ? read.id : undefined,
+		);
+		expect(readAudit(read.id)).toEqual(redirected);
+		expect(readContent()).toEqual([before[0], { ...before[1], input: redirected }]);
+		expect(readAudit(question.id)).toEqual(fullReply);
+	});
+
 	test("shared tool updates and streaming edits notify with their actual message identity", async () => {
 		seedNarrator("n2");
 		const msg = await narratorPersistence.persistAssistantMessage("n1", {

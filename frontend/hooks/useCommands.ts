@@ -48,16 +48,28 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					source: "builtin",
 					type: "command" as const,
 				},
-				...(data.commands ?? []).map((c) => ({
-					name: c.name,
-					prompt: c.prompt,
-					description: c.description,
-					source: c.source,
+				{
+					name: "save_dump",
+					prompt: "",
+					description: localize(
+						"Save recent request and response recordings immediately without interrupting the session",
+						"立即保存近期请求与响应录制，不中断会话",
+					),
+					source: "builtin",
 					type: "command" as const,
-					runBashFirst: c.runBashFirst,
-					bashCommand: c.bashCommand,
-					params: c.params,
-				})),
+				},
+				...(data.commands ?? [])
+					.filter((c) => c.name !== "save_dump")
+					.map((c) => ({
+						name: c.name,
+						prompt: c.prompt,
+						description: c.description,
+						source: c.source,
+						type: "command" as const,
+						runBashFirst: c.runBashFirst,
+						bashCommand: c.bashCommand,
+						params: c.params,
+					})),
 			];
 			const skillList = data.skills ?? [];
 			const skills: CommandItem[] = skillList

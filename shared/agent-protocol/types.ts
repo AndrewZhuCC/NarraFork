@@ -42,8 +42,13 @@ export interface ApiRequestDiagnostics {
 	errorType?: string;
 	message?: string;
 	responseSnippet?: string;
+	/** Upstream correlation ID; never an internal attempt or database ID. */
 	requestId?: string;
 	providerRequestId?: string;
+	/** Exact loop attempt ID used by the local request recorder. */
+	recordingRequestId?: string;
+	/** Persisted api_requests.id for this exact attempt. */
+	apiRequestId?: string;
 	provider?: string;
 	model?: string;
 	channelName?: string;
@@ -187,6 +192,8 @@ export interface BuiltHistory {
 	history: unknown[];
 	trailingToolResults: unknown[];
 	trailingUserText?: string;
+	/** Persisted input rows actually emitted into history, not lifted into current input. */
+	replayedInjectionMessageIds?: readonly string[];
 }
 
 // === Stream event emitted by provider.chat() ===

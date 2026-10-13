@@ -59,20 +59,55 @@ describe("local glob worker budgets", () => {
 			mkdirSync(path);
 			for (let file = 0; file < 50; file++) writeFileSync(join(path, `file-${file}.ts`), "");
 		}
+		const realSetTimeout = globalThis.setTimeout;
+		const realClearTimeout = globalThis.clearTimeout;
+		let fireDeadline: (() => void) | undefined;
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		// A fast no-match scan may legitimately finish before 1ms. Control only
+		// watchdog delivery; the worker, filesystem scan and termination stay real.
+		const schedule = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: (...args: unknown[]) => void,
+			delay = 0,
+			...args: unknown[]
+		) => {
+			if (delay !== 1) return realSetTimeout(callback, delay, ...args);
+			fireDeadline = () => callback(...args);
+			deadlineTimer = realSetTimeout(callback, 60_000, ...args);
+			return deadlineTimer;
+		}) as typeof setTimeout);
+		const clear = spyOn(globalThis, "clearTimeout");
 		const terminate = spyOn(Worker.prototype, "terminate");
 		try {
-			await expect(
-				new LocalBackend().glob("**/never-present-*.xyz", {
-					cwd: root,
-					maxResults: 50,
-					maxBytes: 1024,
-					timeoutMs: 1,
-				}),
-			).rejects.toThrow(/timed out/i);
-			expect(terminate).toHaveBeenCalled();
+			const pending = new LocalBackend().glob("**/never-present-*.xyz", {
+				cwd: root,
+				maxResults: 50,
+				maxBytes: 1024,
+				timeoutMs: 1,
+			});
+			expect(fireDeadline).toBeDefined();
+			if (!fireDeadline) throw new Error("Glob did not register its deadline");
+			fireDeadline();
+			// Assert at the deadline, before the Promise's finally cleanup can mask
+			// a watchdog that rejects but leaves its worker running.
+			expect(terminate).toHaveBeenCalledTimes(1);
+			await expect(pending).rejects.toThrow("Glob scan timed out after 1ms");
+			expect(clear).toHaveBeenCalledWith(deadlineTimer);
 		} finally {
+			if (deadlineTimer) realClearTimeout(deadlineTimer);
 			terminate.mockRestore();
+			clear.mockRestore();
+			schedule.mockRestore();
 		}
+	});
+	test("a no-match scan can complete before its deadline", async () => {
+		const root = tempRoot();
+		writeFileSync(join(root, "present.ts"), "");
+		const result = await new LocalBackend().glob("**/never-present-*.xyz", {
+			cwd: root,
+			timeoutMs: 2000,
+		});
+		expect([...result]).toEqual([]);
+		expect(result.truncated).toBe(false);
 	});
 	test("abort terminates its worker and a later request works normally", async () => {
 		const root = tempRoot();

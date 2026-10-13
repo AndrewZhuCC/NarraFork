@@ -25,6 +25,7 @@ import type {
 	FileReferenceContext,
 	FileReferenceEditorSelection,
 } from "@shared/file-reference";
+import type { SavedRecording } from "@shared/request-recording";
 import {
 	IconArrowDown,
 	IconArrowLeft,
@@ -45,6 +46,7 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
@@ -69,7 +71,7 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
-import { useNarratorLod } from "../../hooks/useNarratorLod";
+import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -130,8 +132,6 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
-import { getFilePreviewType } from "./file-panel/FilePreviewModal";
-import { LargeFileGate } from "./file-panel/LargeFileGate";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -197,6 +197,8 @@ import {
 	RevertActionConfirmModal,
 	SetGlobalModelModal,
 } from "./panels/memoized-dialogs";
+import { filePanelBaseName } from "./panels/panel-kind";
+import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -214,6 +216,10 @@ import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
+const SaveDumpModal = lazy(() =>
+	import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })),
+);
+
 const NarratorDetailsPanel = lazy(() =>
 	import("./details/NarratorDetailsPanel").then((module) => ({
 		default: module.NarratorDetailsPanel,
@@ -223,12 +229,10 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
-// Body of the read-only file viewer. Shared with the `file` dock panel — the
-// drawer below is just the off-dock (mobile) host for the same content, so both
-// surfaces show the same viewer instead of the drawer growing its own.
-const FileViewerContent = lazy(() =>
-	import("./file-viewer/FileViewerContent").then((module) => ({
-		default: module.FileViewerContent,
+// The drawer and dock use the same editor / binary-preview entry.
+const FilePanelContent = lazy(() =>
+	import("./file-panel/FilePanelContent").then((module) => ({
+		default: module.FilePanelContent,
 	})),
 );
 
@@ -285,6 +289,8 @@ function NarratorPanelBody({
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
+	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
+	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
 	const narrator = narratorProp ?? fetchedNarrator;
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
@@ -314,6 +320,19 @@ function NarratorPanelBody({
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
+	useEffect(() => {
+		if (isWorkspacePreview) return;
+		const controller = new AbortController();
+		void import("./vlist/PretextExactMessageList").catch(() => {});
+		void preloadPendingPanelTail({
+			narratorId,
+			signal: controller.signal,
+			readOpeningLod: () => readOpeningLod(narratorId),
+			getCurrent: () => preloadStateRef.current,
+			loadModule: () => import("./vlist/pretext-document-loader"),
+		}).catch(() => {});
+		return () => controller.abort();
+	}, [narratorId, isWorkspacePreview]);
 	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
@@ -324,6 +343,10 @@ function NarratorPanelBody({
 	useEffect(() => {
 		setMessageListTailMeta({ lastRealMessage: null });
 	}, [narratorId]);
+	const firstScreenActivity = useFirstScreenActivity(
+		narratorId,
+		chunkTailMeta.statusReady === true,
+	);
 	const handleMessageListTailMetaChange = useCallback((meta: MessageListTailMeta) => {
 		setMessageListTailMeta((prev) => {
 			if (
@@ -445,8 +468,11 @@ function NarratorPanelBody({
 	 * Still skipped for workspace previews, which stay lightweight and offer no
 	 * tool entries at all.
 	 */
-	const userChatRoomQuery = useNarratorChatRoom(narratorId, !isWorkspacePreview);
-	const chatUnreadQuery = useChatUnread();
+	const userChatRoomQuery = useNarratorChatRoom(
+		narratorId,
+		!isWorkspacePreview && firstScreenActivity,
+	);
+	const chatUnreadQuery = useChatUnread(firstScreenActivity);
 	const userChatRoomId = userChatRoomQuery.data?.id;
 	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
 	const qc = useQueryClient();
@@ -664,7 +690,11 @@ function NarratorPanelBody({
 	// NUG quota data layer (provider config + quota queries + cache writeback +
 	// derived provider info). Kept lifted here because the derived info feeds the
 	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
-	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const nugProviderInfo = useNugQuota(
+		resolvedModel,
+		settingsData?.nugProviders,
+		firstScreenActivity,
+	);
 	const tokenDanceConnection = settingsData?.tokendance;
 	const tokenDanceGeneration =
 		resolvedModel?.startsWith("tokendance:") &&
@@ -701,7 +731,7 @@ function NarratorPanelBody({
 	const { data: kimiUsagesData } = useQuery({
 		queryKey: ["kimi", "usages"],
 		queryFn: api.kimiGetUsages,
-		enabled: currentKimiProviderId != null,
+		enabled: currentKimiProviderId != null && firstScreenActivity,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
@@ -1353,13 +1383,13 @@ function NarratorPanelBody({
 		runningCount: tasksRunningCount,
 		workCount: tasksWorkCount,
 		serviceCount: tasksServiceCount,
-	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled);
+	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled && firstScreenActivity);
 	// Open state and toggling for the tasks entry now live in the registry-driven
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
 	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId);
+	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
 	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
@@ -1446,7 +1476,11 @@ function NarratorPanelBody({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, true, isWorkspacePreview);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(
+		narratorId,
+		firstScreenActivity || substatus.includes("waiting"),
+		isWorkspacePreview,
+	);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
@@ -1837,12 +1871,18 @@ function NarratorPanelBody({
 	const {
 		internalFileViewerPath,
 		setInternalFileViewerPath,
+		onFileEditorDirtyChange,
+		canExitFileEditor,
 		internalFileViewerTarget,
 		handleOpenFilePanel,
 		handleOpenReferencedFile,
 		canOpenReferencedFile,
 	} = useInternalFileViewer({ narratorId, isWorkspacePreview, t });
-	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
+	useMobileDrawerHistory(
+		!!internalFileViewerPath,
+		() => setInternalFileViewerPath(null),
+		canExitFileEditor,
+	);
 	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
 		null,
 	);
@@ -2422,6 +2462,17 @@ function NarratorPanelBody({
 	// Kept lifted here: its inputs (composerRef, attachments, scroll, sendingRef)
 	// and the stable send refs it returns are shared with the composer, the queue
 	// actions below, and the dock bridge.
+	const [savedRecording, setSavedRecording] = useState<SavedRecording | null>(null);
+	const [saveDumpOpened, setSaveDumpOpened] = useState(false);
+	// A command actively opens the result; an in-modal save only updates its result.
+	const handleRecordingSaved = useCallback(
+		(recording: SavedRecording) => {
+			setSavedRecording(recording);
+			setSaveDumpOpened(true);
+			void qc.invalidateQueries({ queryKey: ["request-recordings", recording.narratorId] });
+		},
+		[qc],
+	);
 	const {
 		sendingState,
 		isSending,
@@ -2469,6 +2520,7 @@ function NarratorPanelBody({
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
+		onRequestRecordingSaved: handleRecordingSaved,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
@@ -2571,8 +2623,8 @@ function NarratorPanelBody({
 		dock,
 		gitWorkspaceAvailable:
 			!gitWorkspaceQuery.isError &&
-			gitWorkspaceQuery.data?.state === "ready" &&
-			gitWorkspaceQuery.data.capabilities.read,
+			gitWorkspaceQuery.authoritativeData?.state === "ready" &&
+			gitWorkspaceQuery.authoritativeData.capabilities.read,
 		tasksSupported,
 		tasksButtonEnabled,
 		specToolAvailable,
@@ -2650,13 +2702,9 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	// List props are not detail readiness: wait until the workspace shape is known
-	// before exposing messages, otherwise a late Git strip shifts the whole panel.
-	if (
-		!narrator ||
-		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
-	)
-		return <NarratorPanelSkeleton />;
+	// The detail determines variant and operation permissions. Git discovery does
+	// not determine message readiness: its fixed-height slot owns the transition.
+	if (!narrator || (!isWorkspacePreview && !fetchedNarrator)) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,
@@ -2999,6 +3047,7 @@ function NarratorPanelBody({
 								</div>
 								{!isWorkspacePreview && (
 									<HeaderToolbar
+										onOpenSavedRecordings={() => setSaveDumpOpened(true)}
 										narratorId={narratorId}
 										controller={toolbarController}
 										inlineControls={toolbarInlineControls}
@@ -3061,6 +3110,21 @@ function NarratorPanelBody({
 						</Stack>
 					</Modal>
 
+					{saveDumpOpened && (
+						<Suspense fallback={null}>
+							<SaveDumpModal
+								key={narratorId}
+								narratorId={narratorId}
+								opened={saveDumpOpened}
+								onClose={() => setSaveDumpOpened(false)}
+								saved={savedRecording?.narratorId === narratorId ? savedRecording : null}
+								onSaved={setSavedRecording}
+								onDeleted={(id) =>
+									setSavedRecording((previous) => (previous?.id === id ? null : previous))
+								}
+							/>
+						</Suspense>
+					)}
 					<CompactSummaryModal
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}
@@ -3552,13 +3616,8 @@ function NarratorPanelBody({
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
-							// The viewer body already shows the base name; the title carries the
-							// full path so the drawer adds information rather than repeating it.
-							//
-							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
-							// so a deep path keeps the filename — the part that identifies the file —
-							// visible instead of clipping it and leaving only directories.
-							title={<TruncatedPath path={internalFileViewerPath} fw={600} />}
+							// The shared toolbar displays the full path; the host title names the file.
+							title={<TruncatedPath path={filePanelBaseName(internalFileViewerPath)} fw={600} />}
 							closeButtonProps={{ size: "sm" }}
 							styles={{
 								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -3584,26 +3643,17 @@ function NarratorPanelBody({
 									</Center>
 								}
 							>
-								<LargeFileGate
+								<FilePanelContent
+									filePath={internalFileViewerPath}
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
-									legacyViewer
-									filePath={internalFileViewerPath}
-									enabled={getFilePreviewType(internalFileViewerPath) === "text"}
+									selection={internalFileViewerTarget?.selection}
+									navigationRequestId={internalFileViewerTarget?.highlightRequestId}
+									onOpenFileTarget={handleOpenReferencedFile}
+									onDirtyChange={onFileEditorDirtyChange}
 									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
-								>
-									<FileViewerContent
-										key={internalFileViewerPath}
-										filePath={internalFileViewerPath}
-										narratorId={narratorId}
-										deviceId={internalFileViewerTarget?.deviceId ?? "local"}
-										referenceOrigin={!!internalFileViewerTarget}
-										selection={internalFileViewerTarget?.selection}
-										highlightRequestId={internalFileViewerTarget?.highlightRequestId}
-										onOpenFileTarget={handleOpenReferencedFile}
-									/>
-								</LargeFileGate>
+								/>
 							</Suspense>
 						</Drawer>
 					)}

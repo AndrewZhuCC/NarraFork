@@ -17,8 +17,14 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isSecretPlatformPath, isSecretUserPath } from "../fs-secret-paths";
+import {
+	isPrivateRequestRecordingPath,
+	isSecretPlatformPath,
+	isSecretUserPath,
+} from "../fs-secret-paths";
 
 const HOME = "/home/tester/.narrafork";
 const USER_HOME = "/home/tester";
@@ -51,9 +57,57 @@ describe("platform credential files", () => {
 	});
 });
 
+describe("private request recording directories", () => {
+	test.each([
+		"request-recordings",
+		"saved-request-recordings",
+	])("refuses %s root and every descendant", (name) => {
+		for (const suffix of [
+			"",
+			"request/record.json",
+			"narrator/save/chunks/stream.jsonl",
+			".exports/capture.zip",
+		]) {
+			expect(isSecretPlatformPath(join(HOME, name, suffix), HOME)).toBe(true);
+		}
+		expect(isSecretPlatformPath(join(HOME, `${name}-other`, "notes.json"), HOME)).toBe(false);
+		expect(isSecretPlatformPath(join("/tmp/project", name, "notes.json"), HOME)).toBe(false);
+	});
+	test("sharing ancestor directories is refused without blocking ordinary sibling files", () => {
+		expect(isPrivateRequestRecordingPath(HOME, HOME, true)).toBe(true);
+		expect(isPrivateRequestRecordingPath(USER_HOME, HOME, true)).toBe(true);
+		expect(
+			isPrivateRequestRecordingPath(join(HOME, "malformed-request-dumps", "dump.json"), HOME, true),
+		).toBe(false);
+	});
+	test("file and directory symlinks outside the home cannot reveal private recordings", () => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-private-recording-path-"));
+		const home = join(temporary, "platform");
+		const root = join(home, "saved-request-recordings");
+		mkdirSync(root, { recursive: true });
+		const file = join(root, "manifest.json");
+		writeFileSync(file, "private recording");
+		const fileLink = join(temporary, "ordinary.json");
+		const directoryLink = join(temporary, "ordinary-dir");
+		const homeLink = join(temporary, "home-alias");
+		try {
+			symlinkSync(file, fileLink, "file");
+			symlinkSync(root, directoryLink, "dir");
+			symlinkSync(home, homeLink, "dir");
+			expect(isSecretPlatformPath(fileLink, home)).toBe(true);
+			expect(isSecretPlatformPath(join(directoryLink, "manifest.json"), home)).toBe(true);
+			expect(isSecretPlatformPath(file, homeLink)).toBe(true);
+			expect(isPrivateRequestRecordingPath(homeLink, home, true)).toBe(true);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("platform files the viewer must keep opening", () => {
 	test.each([
 		["malformed-request-dumps/dump.json", "a request dump the viewer links to"],
+		["request-dumps/spill.json", "a legacy usage-history dump"],
 		["provider-dumps/capture.json", "a provider capture"],
 		["conclusions/abc.md", "a subagent conclusion"],
 		["model-cache.json", "a non-secret cache"],

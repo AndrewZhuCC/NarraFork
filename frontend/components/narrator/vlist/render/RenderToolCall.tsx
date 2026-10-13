@@ -42,7 +42,6 @@ import {
 	Badge,
 	Box,
 	Button,
-	CopyButton,
 	Divider,
 	Group,
 	NumberInput,
@@ -88,6 +87,7 @@ import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { resolveToolCallTiming } from "@shared/tool-display-duration";
+import { CopyButton } from "../../../common/CopyButton";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";
@@ -1567,8 +1567,9 @@ function DetailBlocks({
 	narratorId?: string;
 	/**
 	 * "Open full session" affordance for a call waiting on a subagent
-	 * (Await-agent / single-target Send). Painted on the FIRST badges row — the
-	 * meta header — where the call's type/target/timeout chips already live.
+	 * (Await-agent / single-target Send). Painted on the identity row when the
+	 * card has one (Await), otherwise on the FIRST badges row (Send's target
+	 * chips) — each is the row that names the session being opened.
 	 */
 	openSession?: { onOpen: () => void; label: string };
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
@@ -1579,11 +1580,46 @@ function DetailBlocks({
 	const color = kind === "error" ? "var(--mantine-color-red-text)" : undefined;
 	const isSpecTasks = kind === "spec-tasks";
 	const isError = kind === "error";
-	// The open-session button rides the FIRST badges row (the meta header), so a
-	// card whose detail has several badge rows paints it exactly once.
+	// The open-session button rides the identity row when one exists (an Await
+	// card), else the first badges row (a Send card's target chips), so a card
+	// whose detail has several such rows paints it exactly once.
 	const openSessionIndex = openSession
-		? blocks.findIndex((b) => b.kind === "fixed" && b.tag === "detail-meta-badges")
+		? (() => {
+				const identityIndex = blocks.findIndex(
+					(b) => b.kind === "fixed" && b.tag === "detail-meta-identity",
+				);
+				return identityIndex >= 0
+					? identityIndex
+					: blocks.findIndex((b) => b.kind === "fixed" && b.tag === "detail-meta-badges");
+			})()
 		: -1;
+	// One shared button for both host rows. The rows are measured at
+	// META_BADGE_ROW and their boxes are overflow-hidden, so the button resets the
+	// compact-xs root's fixed 22px height to fit the same lane as the content
+	// beside it — nothing here can move the measured geometry.
+	const openSessionButton = openSession ? (
+		<Button
+			data-testid="tool-open-session"
+			size="compact-xs"
+			variant="subtle"
+			styles={{
+				root: {
+					height: "auto",
+					minHeight: 0,
+					padding: "0 6px",
+					fontSize: typographyMetrics().size.xs,
+					lineHeight: `${META_BADGE_ROW - 2}px`,
+					flexShrink: 0,
+				},
+			}}
+			onClick={(e: React.MouseEvent) => {
+				e.stopPropagation();
+				openSession.onOpen();
+			}}
+		>
+			{openSession.label}
+		</Button>
+	) : null;
 	return (
 		<div style={{ position: "relative", width: availableWidth, height }}>
 			{blocks.map((block, index) => {
@@ -1665,6 +1701,15 @@ function DetailBlocks({
 					typeof data.text === "string"
 						? data.text
 						: null;
+				// The Await identity row: the resolved child's slug · id in copyable
+				// monospace, with the open-session button at its right. Fixed-height
+				// block, so the text truncates rather than ever wrapping.
+				const identity =
+					block.kind === "fixed" &&
+					block.tag === "detail-meta-identity" &&
+					typeof data.identity === "string"
+						? data.identity
+						: null;
 				return (
 					<div
 						// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
@@ -1678,6 +1723,14 @@ function DetailBlocks({
 							overflow: "hidden",
 						}}
 					>
+						{identity != null ? (
+							<Group gap={6} wrap="nowrap" style={{ alignItems: "center", height: "100%" }}>
+								<Text size="xs" c="dimmed" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }}>
+									{identity}
+								</Text>
+								{index === openSessionIndex ? openSessionButton : null}
+							</Group>
+						) : null}
 						{badges.length > 0 ? (
 							<Group gap={4} wrap="wrap" style={{ alignItems: "center" }}>
 								{badges.map((b, i) => (
@@ -1691,35 +1744,10 @@ function DetailBlocks({
 										{b.label}
 									</Badge>
 								))}
-								{/* "Open full session" rides the meta header's badges row (the
-							    card's second line). The row is measured at META_BADGE_ROW
-							    (16px) and its box is overflow-hidden, so the button resets
-							    the compact-xs root's fixed 22px height to fit the same
-							    lane as the size-xs badges beside it — nothing here can
-							    move the measured geometry. */}
-								{openSession && index === openSessionIndex ? (
-									<Button
-										data-testid="tool-open-session"
-										size="compact-xs"
-										variant="subtle"
-										styles={{
-											root: {
-												height: "auto",
-												minHeight: 0,
-												padding: "0 6px",
-												fontSize: typographyMetrics().size.xs,
-												lineHeight: `${META_BADGE_ROW - 2}px`,
-												flexShrink: 0,
-											},
-										}}
-										onClick={(e: React.MouseEvent) => {
-											e.stopPropagation();
-											openSession.onOpen();
-										}}
-									>
-										{openSession.label}
-									</Button>
-								) : null}
+								{/* "Open full session" on a Send card rides the target badges row
+							    (an Await card hosts it on the identity row instead). The index is
+							    unique per block, so the two rows can never both draw it. */}
+								{index === openSessionIndex ? openSessionButton : null}
 							</Group>
 						) : null}
 						{progress ? <MetaProgress progress={progress} /> : null}
@@ -1869,7 +1897,7 @@ function DetailRegion({
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
-	/** "Open full session" affordance for an Await-agent card's badges row. */
+	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
@@ -1936,7 +1964,7 @@ export function RenderToolBody({
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
 	narratorId?: string;
-	/** "Open full session" affordance for an Await-agent card's badges row. */
+	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
@@ -2464,9 +2492,8 @@ export function RenderToolCall({
 							availableWidth={contentWidth}
 							labels={merged}
 							narratorId={narratorId}
-							// The "open full session" button lives on the badges row of the
-							// card's meta header (the second line), not the toggleable header
-							// row — see DetailBlocks.
+							// The "open full session" button lives on the identity row of the
+							// card's meta area, not the toggleable header row — see DetailBlocks.
 							openSession={
 								onOpenSession ? { onOpen: onOpenSession, label: merged.openSession } : undefined
 							}

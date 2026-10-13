@@ -130,13 +130,19 @@ export const knowledgeCreateTool: ToolDefinition = {
 			fallbackToPersonal?: boolean;
 			changeNote?: string;
 		};
+		// Pass the exact tool input: danger reflection, approval fingerprints and recovery all
+		// compare against it, and the reviewer must see the content that will be written.
 		const decision = await ctx.requestPermission(
 			"KnowledgeCreate",
-			{ title: a.title, collectionId: a.collectionId ?? "", direct: !!a.direct },
+			{ ...a },
 			ctx.currentToolUseId ?? "",
 		);
 		if (decision.behavior !== "allow") {
-			return deny("KnowledgeCreate was denied by the user.");
+			return deny(
+				decision.behavior === "deny" && decision.message
+					? decision.message
+					: "KnowledgeCreate was denied by the user.",
+			);
 		}
 		try {
 			const principal = await principalOf(ctx);

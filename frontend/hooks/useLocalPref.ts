@@ -17,6 +17,7 @@ type Key =
 	| "narrafork_advanced_anim"
 	| "narrafork_expand_reasoning"
 	| "narrafork_narrator_centered_column"
+	| "narrafork_narrator_bottom_spacing_resize"
 	// Alt+wheel / pinch stepping of the render LOD, plus the Alt-held indicator.
 	// Default ON; can be turned off because Alt+wheel collides with OS/browser
 	// gestures on some setups (window drag, horizontal scroll, IME) and an
@@ -39,7 +40,12 @@ type Key =
 	// keeps their stored value either way.
 	| "narrafork_unified_morph"
 	// TEMPORARY debug surface — see components/narrator/mock/README-REMOVAL.md.
-	| "narrafork_mock_stream";
+	| "narrafork_mock_stream"
+	// Git commit identity entry points. Default off: session details always offers
+	// the pick; these only add the sidebar context menu and the create-session dialog.
+	// Separate keys so one window cannot overwrite the other switch from a stale snapshot.
+	| "narrafork_git_identity_context_menu"
+	| "narrafork_git_identity_create_modal";
 
 /**
  * Numeric preference keys. Kept in this module (rather than a separate hook) so
@@ -113,16 +119,20 @@ export function localPrefDefault(key: Key): boolean {
 	return DEFAULT_TRUE.has(key);
 }
 
-function getSnapshot(key: Key): boolean {
-	const raw = localStorage.getItem(key);
-	if (raw === null) return localPrefDefault(key);
-	return raw === "true";
+export function readLocalPref(key: Key): boolean {
+	try {
+		const raw = localStorage.getItem(key);
+		if (raw === null) return localPrefDefault(key);
+		return raw === "true";
+	} catch {
+		return localPrefDefault(key);
+	}
 }
 
 export function useLocalPref(key: Key): [boolean, (v: boolean) => void] {
 	const value = useSyncExternalStore(
 		subscribe,
-		() => getSnapshot(key),
+		() => readLocalPref(key),
 		() => localPrefDefault(key),
 	);
 	const setValue = useCallback(

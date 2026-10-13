@@ -6,6 +6,7 @@ export {
 	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
+	createGitIdentitySchema,
 	loginSchema,
 	mfaToggleSchema,
 	mfaVerifySchema,
@@ -19,6 +20,7 @@ export {
 	registerSchema,
 	totpActivateSchema,
 	totpDisableSchema,
+	updateGitIdentitySchema,
 	updateProfileSchema,
 } from "./auth";
 export {
@@ -181,6 +183,7 @@ export {
 	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	setNarratorGitIdentitySchema,
 	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
@@ -222,6 +225,15 @@ export {
 	toggleScheduledTaskSchema,
 	updateScheduledTaskSchema,
 } from "./scheduled-tasks";
+export {
+	type SessionLocationInput,
+	sessionExportDownloadQuerySchema,
+	sessionExportToSchema,
+	sessionImportFromPathSchema,
+	sessionImportUploadFieldsSchema,
+	sessionInterchangeFormatSchema,
+	sessionScanQuerySchema,
+} from "./session-interchange";
 export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,

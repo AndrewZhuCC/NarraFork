@@ -1,6 +1,7 @@
 import { Box, Text } from "@mantine/core";
 import type React from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { ChapterBar, NarratorGitBar } from "./header/ChapterBar";
@@ -17,7 +18,7 @@ import {
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
 import { useNarratorPanelCompact } from "./panels/compact-context";
-import { PermissionRuleResultNotice } from "./permission/PermissionRuleResultNotice";
+import { PermissionRulePolicySync } from "./permission/PermissionRuleResultNotice";
 
 /**
  * Context shared by several of the interaction area's sub-regions (status bar,
@@ -96,6 +97,7 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const retainWorktreeRequirement = (text: string) =>
 		props.composerRowProps.composerRef.current?.appendText(text);
 	const bottomSpacing = useBottomSpacing();
+	const [resizeEnabled] = useLocalPref("narrafork_narrator_bottom_spacing_resize");
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
 	const compact = useNarratorPanelCompact();
@@ -128,18 +130,19 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		<Box style={{ position: "relative", flexShrink: 0 }}>
 			{/* Resize boundary; the queue draws its own top border when present. */}
 			<Box
-				onPointerDown={startBottomSpacingResize}
-				role="separator"
-				aria-orientation="horizontal"
-				aria-label={t("resizeBottomSpacing")}
+				onPointerDown={resizeEnabled ? startBottomSpacingResize : undefined}
+				role={resizeEnabled ? "separator" : undefined}
+				aria-orientation={resizeEnabled ? "horizontal" : undefined}
+				aria-label={resizeEnabled ? t("resizeBottomSpacing") : undefined}
 				style={{
 					position: "absolute",
 					top: -1,
 					left: 0,
 					right: 0,
-					height: 3,
-					cursor: "ns-resize",
-					touchAction: "none",
+					height: resizeEnabled ? 3 : 1,
+					cursor: resizeEnabled ? "ns-resize" : undefined,
+					touchAction: resizeEnabled ? "none" : undefined,
+					pointerEvents: resizeEnabled ? undefined : "none",
 					zIndex: 100,
 					borderTop:
 						props.queueDeps.queuedMessages.length > 0
@@ -188,9 +191,9 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				</Box>
 			)}
 
-			{/* Policy activation is shown only after a successful execution receipt. */}
+			{/* Keep existing permission lists current without taking up composer space. */}
 			{!props.common.isWorkspacePreview && (
-				<PermissionRuleResultNotice
+				<PermissionRulePolicySync
 					key={props.common.narratorId}
 					narratorId={props.common.narratorId}
 				/>
