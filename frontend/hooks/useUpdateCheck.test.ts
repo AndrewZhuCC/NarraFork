@@ -314,7 +314,7 @@ describe("update source behavior", () => {
 		};
 		queryClient?.setQueryData(["update-check"], { updateAvailable: true, latestVersion: "1.1.0" });
 		const prepared = { ready: true, version: "1.1.0", canAutoRestart: true };
-		queryClient?.setQueryData<typeof prepared>(["update-status", "1.1.0"], prepared);
+		queryClient?.setQueryData<typeof prepared>(["update-status"], prepared);
 		await mountHarness(SettingsHarness);
 		expect(settingsState?.updateSource).toBe("github");
 		expect(settingsState?.updateGithubRepository).toBe("NarraFork/NarraFork");
@@ -334,9 +334,7 @@ describe("update source behavior", () => {
 			autoDownload: true,
 		});
 		expect(queryClient?.getQueryData(["update-check"])).toBeUndefined();
-		expect(queryClient?.getQueryData<typeof prepared>(["update-status", "1.1.0"])).toEqual(
-			prepared,
-		);
+		expect(queryClient?.getQueryData<typeof prepared>(["update-status"])).toEqual(prepared);
 	});
 
 	const releaseInfo: NonNullable<CheckUpdateResult["releaseInfo"]> = {

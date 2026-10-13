@@ -5,7 +5,7 @@ import { type PreparedUpdateStatus, resolveUpdateStatusPollInterval } from "../l
 export const UPDATE_STATUS_QUERY_KEY = "update-status";
 
 /**
- * Poll the prepared-update status for one target version.
+ * Poll the current prepared-update status independently of release recommendations.
  *
  * The header pill and the update dialog share this query so a scheduled update stays visible
  * while the dialog is closed without doubling the request rate. An active schedule is polled
@@ -16,18 +16,17 @@ export const UPDATE_STATUS_QUERY_KEY = "update-status";
  * predictable 403s for regular users.
  */
 export function useUpdateScheduleStatus(options: {
-	targetVersion?: string;
 	enabled: boolean;
 	/** Ignore a stale coordination error recorded before this timestamp. */
 	errorSinceMs?: number | null;
 	/** Keep polling because a local apply call just reported a scheduled update. */
 	assumeScheduled?: boolean;
 }) {
-	const { targetVersion, enabled, errorSinceMs = null, assumeScheduled = false } = options;
+	const { enabled, errorSinceMs = null, assumeScheduled = false } = options;
 	return useQuery({
-		queryKey: [UPDATE_STATUS_QUERY_KEY, targetVersion],
-		queryFn: () => api.getUpdateStatus(targetVersion),
-		enabled: enabled && !!targetVersion,
+		queryKey: [UPDATE_STATUS_QUERY_KEY],
+		queryFn: () => api.getUpdateStatus(),
+		enabled,
 		staleTime: 0,
 		refetchInterval: (query) =>
 			resolveUpdateStatusPollInterval({

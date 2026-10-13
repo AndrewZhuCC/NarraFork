@@ -232,7 +232,6 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		isLoading: isCheckingPreparedStatus,
 		refetch: refetchPreparedStatus,
 	} = useUpdateScheduleStatus({
-		targetVersion,
 		// Once this server has been told to stop, polling it can only produce failures. Keeping the
 		// query alive would turn an intentional shutdown into a stream of errors in the dialog.
 		//
@@ -247,7 +246,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		assumeScheduled,
 	});
 
-	if (!selectedPrepared.current.status && preparedStatus?.ready) {
+	if (
+		!selectedPrepared.current.status &&
+		preparedStatus?.ready &&
+		(!targetVersion || preparedStatus.version === targetVersion)
+	) {
 		selectedPrepared.current.status = preparedStatus;
 	}
 

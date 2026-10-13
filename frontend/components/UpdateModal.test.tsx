@@ -279,6 +279,70 @@ function successfulCheck() {
 	};
 }
 
+describe("UpdateBadge prepared discovery", () => {
+	test.each([
+		false,
+		true,
+	])("discovers a same-version prepared build without cached status (offline=%s)", async (offline) => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		api.checkUpdate = async () => {
+			if (offline) throw new Error("offline");
+			return { updateAvailable: false, currentVersion: "1.1.0" };
+		};
+		const targets: Array<string | undefined> = [];
+		const readStatus = api.getUpdateStatus;
+		api.getUpdateStatus = async (target) => {
+			targets.push(target);
+			return readStatus(target);
+		};
+		expect(client.getQueryData(["update-status"])).toBeUndefined();
+		await renderBadge();
+		expect(targets.length).toBeGreaterThan(0);
+		expect(targets.every((target) => target === undefined)).toBe(true);
+		expect(container.textContent).toContain("1.1.0");
+		await openBadge();
+		expect(findButton(common.updateSchedule)).toBeDefined();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe(originalIdentity.id);
+		expect(appliedVersion).toBe("1.1.0");
+	});
+
+	test("a manual prepared build is not filtered by the remote recommendation's version", async () => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		api.checkUpdate = async () => ({
+			updateAvailable: false,
+			currentVersion: "1.0.0",
+			latestVersion: "1.0.0",
+		});
+		await renderBadge();
+		expect(container.textContent).toContain("1.1.0");
+		await openBadge();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedVersion).toBe("1.1.0");
+		expect(appliedPreparedId).toBe(originalIdentity.id);
+	});
+
+	test("non-admins neither query nor expose a cached prepared build", async () => {
+		client.setQueryData(["auth", "me"], { id: "viewer", username: "viewer", role: "user" });
+		client.setQueryData(["update-status"], {
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: originalIdentity,
+		});
+		let calls = 0;
+		api.getUpdateStatus = async () => {
+			calls++;
+			return { ready: true, canAutoRestart: true };
+		};
+		await renderBadge();
+		expect(calls).toBe(0);
+		expect(container.querySelector(".mantine-Badge-root")).toBeNull();
+		expect(container.textContent).not.toContain("1.1.0");
+	});
+});
 describe("UpdateModal deferred release notes", () => {
 	function recommendation() {
 		return {
@@ -364,7 +428,7 @@ describe("UpdateModal deferred release notes", () => {
 		if (change === "source") await changeSavedSource();
 		else {
 			await act(async () =>
-				client.setQueryData(["update-status", "1.1.0"], {
+				client.setQueryData(["update-status"], {
 					ready: true,
 					version: "1.1.0",
 					canAutoRestart: true,
@@ -431,7 +495,7 @@ describe("UpdateModal saved source changes", () => {
 		};
 		api.getUpdateStatus = async () => status;
 		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
-		client.setQueryData(["update-status", "1.1.0"], status);
+		client.setQueryData(["update-status"], status);
 		const recommendation = successfulCheck();
 		api.checkUpdate = async () => ({
 			...recommendation,
@@ -451,7 +515,7 @@ describe("UpdateModal saved source changes", () => {
 		await settle();
 		expect(document.body.textContent).toContain(common.updatePillWaiting);
 		expect(document.body.textContent).toContain("hash-a");
-		expect(client.getQueryData(["update-status", "1.1.0"])).toMatchObject({
+		expect(client.getQueryData(["update-status"])).toMatchObject({
 			scheduled: true,
 			preparedIdentity: originalIdentity,
 		});
@@ -501,7 +565,7 @@ describe("UpdateModal saved source changes", () => {
 		ready = true;
 		await render();
 		await act(async () => {
-			client.setQueryData(["update-status", "1.1.0"], {
+			client.setQueryData(["update-status"], {
 				ready: true,
 				version: "1.1.0",
 				canAutoRestart: true,
@@ -543,7 +607,7 @@ describe("UpdateModal saved source changes", () => {
 		};
 		api.getUpdateStatus = async () => replacement;
 		await act(async () => {
-			client.setQueryData(["update-status", "1.1.0"], replacement);
+			client.setQueryData(["update-status"], replacement);
 		});
 		await settle();
 		await act(async () => findButton(common.updateSchedule)?.click());
