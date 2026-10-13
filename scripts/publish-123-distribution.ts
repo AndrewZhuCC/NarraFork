@@ -411,11 +411,21 @@ export type RcloneRunner = (
 	options: { signal: AbortSignal; maxOutputBytes: number },
 ) => Promise<{ code: number; stdout: string; stderr?: string }>;
 function rcloneDiagnostic(result: { code: number; stderr?: string }): string {
-	const detail = (result.stderr ?? "")
-		.replace(/[\r\n\t ]+/g, " ")
-		.trim()
-		.slice(0, 240);
-	return detail ? ` (rclone ${result.code}: ${detail})` : ` (rclone ${result.code})`;
+	const stderr = result.stderr ?? "";
+	const category = /401|unauthori[sz]ed/i.test(stderr)
+		? "authentication"
+		: /403|forbidden/i.test(stderr)
+			? "forbidden"
+			: /timeout|deadline|max duration/i.test(stderr)
+				? "timeout"
+				: /quota|insufficient|no space/i.test(stderr)
+					? "quota"
+					: /not found|404/i.test(stderr)
+						? "not-found"
+						: /certificate|tls/i.test(stderr)
+							? "tls"
+							: "unclassified";
+	return ` (rclone ${result.code}: ${category})`;
 }
 export const runRclone: RcloneRunner = async (args, options) => {
 	options.signal.throwIfAborted();
