@@ -79,6 +79,33 @@ describe("disk monitor", () => {
 		expect((await monitor.assess("/a", config)).level).toBe("unknown");
 		expect((await monitor.assess("/b", config)).level).toBe("unknown");
 		expect(stats).toHaveBeenCalledTimes(1);
+		// The throttled (cached) failure still explains itself for diagnostics.
+		expect(monitor.failureReason("/a")).toBe("statfs /: unsupported");
+		expect(monitor.failureReason("/b")).toBe("statfs /: unsupported");
+	});
+
+	test("failure reasons cover resolve errors and invalid statfs, and clear on success", async () => {
+		let healthy = false;
+		const monitor = new DiskSpaceMonitor({
+			resolveVolume: async (path) => {
+				if (path === "/missing")
+					throw Object.assign(new Error("Windows volume identity unavailable"), {});
+				return { key: "disk", mountPath: "/" };
+			},
+			statVolume: async () =>
+				healthy ? { freeBytes: 10 * MB, totalBytes: 100 * MB } : { freeBytes: 0, totalBytes: 0 },
+			now: Date.now,
+		});
+		const fast = { ...config, checkIntervalMs: 0 };
+		await monitor.assess("/missing", fast);
+		expect(monitor.failureReason("/missing")).toBe(
+			"resolve volume: Windows volume identity unavailable",
+		);
+		await monitor.assess("/ok", fast);
+		expect(monitor.failureReason("/ok")).toContain("invalid statfs result (free=0, total=0)");
+		healthy = true;
+		expect((await monitor.assess("/ok", fast)).space).not.toBeNull();
+		expect(monitor.failureReason("/ok")).toBeUndefined();
 	});
 
 	test("deadline and in-flight cap bound a hung network filesystem without repeated probes", async () => {
@@ -94,6 +121,8 @@ describe("disk monitor", () => {
 			Array.from({ length: 40 }, (_, i) => monitor.assess(`/hang/${i}`, short)),
 		);
 		expect(results.every((r) => r.level === "unknown")).toBe(true);
+		expect(monitor.failureReason("/hang/0")).toBe("probe timed out after 5ms");
+		expect(monitor.failureReason("/hang/39")).toBe("too many disk probes in flight");
 		expect(resolver).toHaveBeenCalledTimes(16);
 		await monitor.assess("/hang/0", short);
 		expect(resolver).toHaveBeenCalledTimes(16);

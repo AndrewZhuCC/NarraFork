@@ -7,6 +7,7 @@ import * as localFileChangeRuntime from "../../../services/file-change-runtime";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { type DiskAssessment, DiskSpaceMonitor, diskSpaceMonitor } from "../../disk-safety";
 import { DEFAULT_DISK_SAFETY } from "../../disk-safety-config";
+import { logger } from "../../logger";
 import { getNarraforkHome } from "../../narrafork-home";
 import { settings } from "../../settings";
 import { checkToolDiskSafety, diskToolError } from "../disk-safety";
@@ -244,21 +245,93 @@ describe("tool path coverage and error consistency", () => {
 			statVolume: async () => ({ freeBytes: 2048 * MB, totalBytes: 10000 * MB }),
 			now: Date.now,
 		});
-		const result = await checkToolDiskSafety(
-			"Read",
-			{},
-			{
-				narratorId: "remote-check",
-				cwd: "/remote",
-				locale: "zh-CN",
-				executionTarget: { ...local, backendKind: "remote", deviceId: "device" },
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		const run = () =>
+			checkToolDiskSafety(
+				"Read",
+				{},
+				{
+					narratorId: "remote-check",
+					cwd: "/remote",
+					locale: "zh-CN",
+					executionTarget: { ...local, backendKind: "remote", deviceId: "device" },
+				},
+				monitor,
+				DEFAULT_DISK_SAFETY,
+				"/home",
+			);
+		try {
+			const result = await run();
+			expect(resolveVolume.mock.calls.map((c) => c[0])).toEqual(["/home"]);
+			// Operator-only coverage gap: never appended to the model-visible result.
+			expect(result.notice).toBe("");
+			await run();
+			// Logged at most once per TTL host-wide (an earlier test may already own the slot).
+			const remoteLogs = info.mock.calls.filter((c) => String(c[0]).includes("remote devices"));
+			expect(remoteLogs.length).toBeLessThanOrEqual(1);
+		} finally {
+			info.mockRestore();
+		}
+	});
+
+	test("an unavailable probe is logged with its reason, not injected into the result", async () => {
+		const monitor = new DiskSpaceMonitor({
+			// One volume, as files under one HOME/worktree really share their mount.
+			resolveVolume: async () => ({ key: "vol", mountPath: "/probe-unknown" }),
+			statVolume: async () => {
+				throw Object.assign(new Error("statfs failed"), { code: "EPERM" });
 			},
+			now: Date.now,
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const home = "/probe-unknown-home";
+			const result = await checkToolDiskSafety(
+				"Grep",
+				{},
+				{ narratorId: "probe-unknown", cwd: "/probe-unknown-work", locale: "zh-CN" },
+				monitor,
+				DEFAULT_DISK_SAFETY,
+				home,
+			);
+			expect(result.notice).toBe("");
+			expect(result.assessments.every((a) => a.level === "unknown")).toBe(true);
+			const homeLog = warn.mock.calls.find((call) => call[1]?.path === home);
+			expect(homeLog?.[1]).toMatchObject({ isHome: true });
+			expect(String(homeLog?.[1]?.reason)).toContain("EPERM statfs failed");
+			// Throttled by cause, not by file: many more paths in the TTL log nothing new.
+			const logged = warn.mock.calls.length;
+			for (let i = 0; i < 20; i++)
+				await checkToolDiskSafety(
+					"Read",
+					{ file_path: `/probe-unknown-work/file-${i}.ts` },
+					{ narratorId: `probe-unknown-${i}`, cwd: "/probe-unknown-work", locale: "en" },
+					monitor,
+					DEFAULT_DISK_SAFETY,
+					home,
+				);
+			expect(warn.mock.calls.length).toBe(logged);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("warn mode with a real low-space reading still tells the agent, without operator text", async () => {
+		const monitor = new DiskSpaceMonitor({
+			resolveVolume: async () => ({ key: "shared", mountPath: "/vol" }),
+			statVolume: async () => ({ freeBytes: 100 * MB, totalBytes: 10000 * MB }),
+			now: Date.now,
+		});
+		const result = await checkToolDiskSafety(
+			"Write",
+			{},
+			{ narratorId: "warn-mode-notice", cwd: "/work", locale: "en" },
 			monitor,
-			DEFAULT_DISK_SAFETY,
-			"/home",
+			{ ...DEFAULT_DISK_SAFETY, mode: "warn" },
+			"/home-warn",
 		);
-		expect(resolveVolume.mock.calls.map((c) => c[0])).toEqual(["/home"]);
-		expect(result.notice).toContain("远程设备磁盘空间尚不能探测");
+		expect(result.notice).toContain("Disk space warning: /vol has only 100 MiB free");
+		expect(result.notice).not.toContain("diskSafety.mode");
 	});
 
 	test("failed Bash output cannot inject disk errors, poison the cache or stop the narrator", async () => {
