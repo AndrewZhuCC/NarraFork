@@ -14,9 +14,10 @@ describe("copyGeneratedImageToClipboard", () => {
 		fetch: typeof fetch;
 	};
 	const descriptors = new Map(
-		["fetch", "navigator", "ClipboardItem", "localStorage", "window", "document", "FileReader"].map(
-			(key) => [key, Object.getOwnPropertyDescriptor(g, key)],
-		),
+		["fetch", "navigator", "ClipboardItem", "localStorage", "window"].map((key) => [
+			key,
+			Object.getOwnPropertyDescriptor(g, key),
+		]),
 	);
 
 	afterEach(() => {
@@ -58,7 +59,7 @@ describe("copyGeneratedImageToClipboard", () => {
 		expect(await result.text()).toBe("png");
 	});
 
-	test("capability guard still marks unavailability when the selection fallback cannot run", async () => {
+	test("only the capability guard creates a marked error before any fetch", async () => {
 		const fetch = mock(async () => new Response());
 		Object.defineProperty(g, "fetch", { value: fetch, configurable: true });
 		Object.defineProperty(g, "window", { value: { isSecureContext: false }, configurable: true });
@@ -79,71 +80,7 @@ describe("copyGeneratedImageToClipboard", () => {
 		expect(isImageClipboardUnavailableError(new DOMException("Denied", "NotAllowedError"))).toBe(
 			false,
 		);
-		// 选区接口不具备时不取字节，保持"先判能力、再动网络"的原语义。
 		expect(fetch).not.toHaveBeenCalled();
-	});
-
-	test("selection fallback puts self-contained pixels in the selection", async () => {
-		const execCommand = mock(() => true);
-		const write = mock(async () => {});
-		let assignedSource = "";
-		const image = { src: "", onload: undefined as (() => void) | undefined };
-		Object.defineProperty(image, "src", {
-			// 让选中的图片同步"加载完成"，回退就不必依赖真实解码。
-			set(value: string) {
-				assignedSource = value;
-				image.onload?.();
-			},
-			get: () => assignedSource,
-		});
-		const holder = {
-			contentEditable: "",
-			style: { cssText: "" },
-			appendChild() {},
-			remove() {},
-		};
-		Object.defineProperty(g, "document", {
-			configurable: true,
-			value: {
-				execCommand,
-				createElement: (tag: string) => (tag === "img" ? image : holder),
-				createRange: () => ({ selectNodeContents() {} }),
-				body: { appendChild() {} },
-			},
-		});
-		Object.defineProperty(g, "window", {
-			configurable: true,
-			value: {
-				isSecureContext: false,
-				getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
-			},
-		});
-		Object.defineProperty(g, "FileReader", {
-			configurable: true,
-			value: class {
-				result: string | null = null;
-				onload: (() => void) | null = null;
-				onerror: (() => void) | null = null;
-				readAsDataURL(blob: Blob) {
-					this.result = `data:${blob.type};base64,cG5n`;
-					this.onload?.();
-				}
-			},
-		});
-		Object.defineProperty(g, "navigator", { value: { clipboard: { write } }, configurable: true });
-		Object.defineProperty(g, "ClipboardItem", { value: class {}, configurable: true });
-		Object.defineProperty(g, "fetch", {
-			value: mock(async () => new Response(new Blob(["png"], { type: "image/png" }))),
-			configurable: true,
-		});
-
-		await copyGeneratedImageToClipboard({ imageSrc: "blob:image" });
-
-		expect(execCommand).toHaveBeenCalledWith("copy");
-		expect(write).not.toHaveBeenCalled();
-		// 选区里必须是自包含像素：粘出需鉴权的地址只会得到一张坏图。
-		expect(assignedSource.startsWith("data:image/png;base64,")).toBe(true);
-		expect(g.fetch).toHaveBeenCalledTimes(1);
 	});
 
 	test("preserves the actual clipboard rejection, not a capability error", async () => {
