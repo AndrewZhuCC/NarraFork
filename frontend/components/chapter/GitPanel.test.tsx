@@ -840,7 +840,8 @@ describe("GitPanel", () => {
 	async function waitForWorkspace(predicate: () => boolean) {
 		const deadline = performance.now() + 1500;
 		while (!predicate()) {
-			if (performance.now() > deadline) throw new Error("Workspace UI did not settle");
+			if (performance.now() > deadline)
+				throw new Error(`Workspace UI did not settle: ${document.body.textContent?.slice(0, 300)}`);
 			await workspaceAct(async () => {
 				await flushRender();
 			});
@@ -879,7 +880,12 @@ describe("GitPanel", () => {
 			gitAiCommitMessage: api.gitAiCommitMessage,
 			getGitLog: api.getGitLog,
 			getGitStashList: api.getGitStashList,
+			getNarratorGitSummary: api.getNarratorGitSummary,
 		};
+		// The panel also asks for a lightweight summary first. Answer it like a server that has
+		// no summary yet, so the authoritative workspace probe below decides the state. Left
+		// unmocked it is a real network request to a server that does not exist in this test.
+		api.getNarratorGitSummary = async () => null;
 		api.getGitWorkspace = async () => workspace;
 		api.getWorkspaceContext = async () => context();
 		api.getGitStatus = async () => makeStatus();

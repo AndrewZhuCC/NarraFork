@@ -272,6 +272,21 @@ function storeGitDisplay(
 		if (key !== undefined) cache.entries.delete(key);
 	}
 }
+// Monotonic count of authoritative grants (non-denied probe results) per narrator. A refusal
+// observed by a render may only be applied if no newer grant has arrived since that render.
+const gitAccessGrants = new WeakMap<QueryClient, Map<string, number>>();
+function gitAccessGrantCount(qc: QueryClient, narratorId: string): number {
+	return gitAccessGrants.get(qc)?.get(narratorId) ?? 0;
+}
+function recordGitAccessGrant(qc: QueryClient, narratorId: string) {
+	let grants = gitAccessGrants.get(qc);
+	if (!grants) {
+		grants = new Map();
+		gitAccessGrants.set(qc, grants);
+	}
+	grants.set(narratorId, gitAccessGrantCount(qc, narratorId) + 1);
+}
+
 function blockGitSummary(qc: QueryClient, narratorId: string) {
 	let denied = deniedGitSummaries.get(qc);
 	if (!denied) {
@@ -426,8 +441,37 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		? gitSummaryWorkspace({ ...narrator, gitSummary: incoming }, workspaceRevision)
 		: legacySummary;
 	if (summaryWorkspace) gitSummarySeeds.add(summaryWorkspace);
-	const query = useQuery({
+	// Late narrator metadata only COMPLETES the scope (cwd/device go from unknown to known at the
+	// same revision); that is hydration, not a switch. Keep showing the previous authoritative
+	// probe result of this narrator while the completed scope is re-probed, so visible content is
+	// not torn down. A revision change or a known value changing to another one is a real switch
+	// and is never carried. Refusals are never carried either.
+	const carryHydratedScope = useCallback(
+		(
+			previousData: GitWorkspace | undefined,
+			previousQuery: { queryKey: readonly unknown[] } | undefined,
+		): GitWorkspace | undefined => {
+			// Re-read the refusal set: an access event may have landed since this render.
+			if (!narratorId || deniedGitSummaries.get(qc)?.has(narratorId)) return undefined;
+			if (!previousData || previousData.state === "access_denied") return undefined;
+			// A presentation seed is never an authoritative probe result; do not carry it.
+			if (gitSummarySeeds.has(previousData)) return undefined;
+			const key = previousQuery?.queryKey;
+			if (key?.[0] !== "gitWorkspace" || key[1] !== narratorId) return undefined;
+			if (JSON.stringify(key[2]) !== JSON.stringify(context)) return undefined;
+			const previous = JSON.parse(String(key[3])) as unknown[];
+			const current = JSON.parse(scope) as unknown[];
+			// Element 0 is the revision context (already equal above); the rest may only fill nulls.
+			const completes = current.every(
+				(value, index) => previous[index] === null || previous[index] === value,
+			);
+			return completes ? previousData : undefined;
+		},
+		[qc, narratorId, context, scope],
+	);
+	const query = useQuery<GitWorkspace>({
 		queryKey: ["gitWorkspace", narratorId, context, scope],
+		placeholderData: carryHydratedScope,
 		queryFn: async ({ signal }) => {
 			const epoch = cache.epoch;
 			const result = await api.getGitWorkspace(narratorId as string, signal);
@@ -435,6 +479,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 				throw new DOMException("Git workspace superseded", "AbortError");
 			if (result.state !== "access_denied") {
 				deniedGitSummaries.get(qc)?.delete(narratorId as string);
+				recordGitAccessGrant(qc, narratorId as string);
 				storeGitDisplay(qc, narratorId as string, scope, result);
 			}
 			return result;
@@ -463,13 +508,17 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		(summary.isError && [401, 403].includes((summary.error as ApiError)?.status)) ||
 		query.data?.state === "access_denied" ||
 		summaryWorkspace?.state === "access_denied";
+	// The refusal below is applied in a passive effect, which can run after a newer probe has
+	// already granted access (e.g. a retry resolving before the effect of the refused render).
+	// Remember which grant this render observed so a stale refusal cannot re-block a newer grant.
+	const grantsAtRender = narratorId ? gitAccessGrantCount(qc, narratorId) : 0;
 	useEffect(() => {
-		if (narratorId && accessFailure) {
+		if (narratorId && accessFailure && gitAccessGrantCount(qc, narratorId) === grantsAtRender) {
 			blockGitSummary(qc, narratorId);
 			void qc.cancelQueries({ queryKey: ["gitWorkspace", narratorId] });
 			qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
 		}
-	}, [qc, narratorId, accessFailure]);
+	}, [qc, narratorId, accessFailure, grantsAtRender]);
 	let data =
 		accessFailure || denied ? undefined : (query.data ?? summaryWorkspace ?? snapshot?.workspace);
 	if (
@@ -495,6 +544,12 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	return {
 		...query,
 		data,
+		/**
+		 * True once the server has refused this principal. `data` is then withheld (no branch,
+		 * path or counts may leak), so consumers need this to explain the refusal instead of
+		 * rendering an empty or generic state.
+		 */
+		accessDenied: accessFailure || denied,
 		authoritativeData: accessFailure || denied ? undefined : query.data,
 		displayCounts: accessFailure || denied ? undefined : snapshot?.counts,
 		rememberCounts,

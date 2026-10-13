@@ -206,6 +206,29 @@ describe("SQL-derived physical column order", () => {
 		expect(result.problems.length).toBeGreaterThan(0);
 	});
 
+	test("reviewed procedural statements are admitted only by exact text", () => {
+		const folder = join(import.meta.dir, "../../drizzle-postgres");
+		const sql = readBounded(join(folder, "0012_narrator_model_history_revision.sql"), 1024 * 1024);
+		const statements = sql
+			.split("--> statement-breakpoint")
+			.map((part) => part.trim())
+			.filter((part) => /^(CREATE (FUNCTION|TRIGGER)|INSERT INTO)/.test(part));
+		// The real reviewed statements pass on their own (no table needed for these).
+		expect(statements).toHaveLength(11);
+		for (const statement of statements) expect(run(statement, {}).problems).toEqual([]);
+		const fn = statements.find((statement) => statement.startsWith("CREATE FUNCTION"));
+		if (!fn) throw new Error("fixture");
+		// One character inside the opaque body, or a dynamic-DDL payload, is a new statement.
+		for (const tampered of [
+			fn.replace("RETURN NEW;", "RETURN NEW; "),
+			fn.replace("BEGIN", "BEGIN EXECUTE 'ALTER TABLE narrators ADD COLUMN x text';"),
+			fn.replace("model_history_v1_", "model_history_v2_"),
+		]) {
+			expect(tampered).not.toBe(fn);
+			expect(run(tampered, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+		}
+	});
+
 	test.each([
 		"CREATE TABLE t(a text,a text);",
 		"CREATE TABLE t(a text); CREATE TABLE t(b text);",
@@ -351,12 +374,14 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			);
 		}
 		const narrators = result.order.get("narrators");
-		// 0010 appends stop reason after both context columns; schema declaration order
-		// cannot substitute for physical order reconstructed from the full journal.
-		expect(narrators?.slice(-3)).toEqual([
+		// 0010 appends stop reason after both context columns, then 0012 appends the model-history
+		// revision; schema declaration order cannot substitute for physical order reconstructed
+		// from the full journal.
+		expect(narrators?.slice(-4)).toEqual([
 			"context_char_cache_json",
 			"context_usage_snapshot_json",
 			"last_stop_reason",
+			"model_history_revision",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		// The main-branch 0010 migration appends background_kind after insert_seq.

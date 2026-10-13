@@ -321,6 +321,9 @@ beforeEach(async () => {
 		capabilities: { switchDirectory: true },
 	});
 	spyOn(api, "getGitWorkspace").mockResolvedValue(workspace());
+	// The workspace hook also asks for a lightweight summary once narrator metadata arrives.
+	// Answer it like a server with no summary yet; left unmocked it is a real network request.
+	spyOn(api, "getNarratorGitSummary").mockResolvedValue(null);
 	spyOn(api, "getGitCommitDetail").mockImplementation(async (_target, sha) => detail(sha));
 	spyOn(api, "getGitCommitDiff").mockResolvedValue({
 		diff: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+PRIVATE_PATCH\n",

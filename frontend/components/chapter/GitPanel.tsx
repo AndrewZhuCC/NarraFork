@@ -38,11 +38,13 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 		[narratorId, workspace, workspaceQuery.isError],
 	);
 
-	if (workspaceQuery.isPending) return <Loader size="sm" />;
+	// A refusal withholds `data` and may drop the query entirely; explain it rather than spin or
+	// render nothing. No workspace facts are shown, only the refusal and a retry.
+	if (workspaceQuery.isPending && !workspaceQuery.accessDenied) return <Loader size="sm" />;
 
 	return (
 		<Stack gap={4} style={{ height: "100%", minHeight: 0 }}>
-			{!target ? (
+			{!target || workspaceQuery.accessDenied ? (
 				<Stack gap={4} p="xs">
 					<Group justify="flex-end">
 						<Button
@@ -58,10 +60,18 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 					<Alert
 						color="yellow"
 						title={t(
-							`workspace.${workspaceQuery.isError ? "error" : (workspace?.state ?? "error")}`,
+							`workspace.${
+								workspaceQuery.accessDenied
+									? "access_denied"
+									: workspaceQuery.isError
+										? "error"
+										: (workspace?.state ?? "error")
+							}`,
 						)}
 					>
-						{workspaceQuery.error?.message || workspace?.reason}
+						{workspaceQuery.accessDenied
+							? null
+							: workspaceQuery.error?.message || workspace?.reason}
 					</Alert>
 				</Stack>
 			) : (
