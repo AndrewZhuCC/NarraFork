@@ -520,16 +520,8 @@ export function AuthenticatedLayout() {
 
 						<SystemMaintenanceBadge />
 						<UpdateBadge />
-						{requestDumpEnabled && (
-							<Tooltip
-								label={t(
-									requestDumpErrorsOnly
-										? "requestDumpErrorsOnlyTooltip"
-										: "requestDumpEnabledTooltip",
-								)}
-								position="bottom"
-								withArrow
-							>
+						{requestDumpEnabled && !requestDumpErrorsOnly && (
+							<Tooltip label={t("requestDumpEnabledTooltip")} position="bottom" withArrow>
 								<Button
 									variant="light"
 									color="orange"
