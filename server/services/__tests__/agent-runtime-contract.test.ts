@@ -192,6 +192,16 @@ describe("CriticalEventPersistenceError surfaces its cause", () => {
 		expect(error.message).toBe("Tool result could not be persisted");
 	});
 
+	test("keeps a short cause that merely occurs inside the summary", () => {
+		// `includes` used to drop this: the whole cause text is the word "failed",
+		// which already occurs in the summary. The diagnosis is still distinct.
+		const error = new CriticalEventPersistenceError(
+			"Assistant content persistence barrier failed",
+			{ cause: new Error("failed") },
+		);
+		expect(error.message).toBe("Assistant content persistence barrier failed: failed");
+	});
+
 	test("survives a cause that cannot be stringified", () => {
 		// `String()` throws "No default value" on a null-prototype object. This
 		// constructor runs inside the executor's catch block, so throwing here would
@@ -205,10 +215,8 @@ describe("CriticalEventPersistenceError surfaces its cause", () => {
 	});
 
 	test("caps a huge cause instead of publishing it whole", () => {
-		// The folded message is persisted to `narrators.error_message` (an unbounded
-		// `text`) and broadcast over the WebSocket. A PostgreSQL failure renders as
-		// `Failed query: <full SQL>\nparams: [...]`, so an uncapped fold would surface
-		// complete statements and their parameter values to every reader.
+		// No nested driver error: the dump itself is the only text, so it is kept
+		// and the published string — prefix, dump, and marker — stays within 1 KiB.
 		const cause = new Error(`Failed query: UPDATE t SET x = ?\nparams: ${"p".repeat(5_000)}`);
 		const error = new CriticalEventPersistenceError(
 			"Assistant content persistence barrier failed",
@@ -216,10 +224,44 @@ describe("CriticalEventPersistenceError surfaces its cause", () => {
 				cause,
 			},
 		);
-		// Bound is the cap plus the fixed prefix/suffix, not the original size.
-		expect(error.message.length).toBeLessThan(1_200);
-		expect(error.message).toContain("truncated 4");
+		expect(error.message.length).toBeLessThanOrEqual(1_000);
+		expect(error.message).toContain("truncated");
 		expect(error.message).toContain("Failed query: UPDATE t SET x = ?");
+		expect(error.message).not.toContain("p".repeat(5_000));
+	});
+
+	test("publishes the driver error behind a query dump, not the statement", () => {
+		const driver = new Error("SQLITE_BUSY: database is locked");
+		const wrapped = new Error(
+			`Failed query: UPDATE t SET secret = ?\nparams: ${"p".repeat(5_000)}`,
+			{ cause: driver },
+		);
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause: wrapped,
+		});
+		expect(error.message).toBe(
+			"Tool result could not be persisted: SQLITE_BUSY: database is locked",
+		);
+		expect(error.message).not.toContain("params:");
+		expect(error.message).not.toContain("secret");
+		// The wrapper stays on `cause` for logs. Readers see `message` only.
+		expect((error.cause as Error).message.startsWith("Failed query:")).toBe(true);
+	});
+
+	test("strips a query dump the caller already interpolated into the summary", () => {
+		const driver = new Error("SQLITE_BUSY: database is locked");
+		const wrapped = new Error("Failed query: UPDATE t SET secret = ?\nparams: sekret", {
+			cause: driver,
+		});
+		const error = new CriticalEventPersistenceError(
+			`Failed to atomically commit EnterPlanMode: ${String(wrapped)}`,
+			{ cause: wrapped },
+		);
+		expect(error.message).toBe(
+			"Failed to atomically commit EnterPlanMode: SQLITE_BUSY: database is locked",
+		);
+		expect(error.message).not.toContain("params:");
+		expect(error.message).not.toContain("sekret");
 	});
 });
 

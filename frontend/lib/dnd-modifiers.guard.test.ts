@@ -77,6 +77,29 @@ function walkFiles(dir: string, out: string[] = []): string[] {
 }
 
 /**
+ * The expression inside `modifiers={...}` on one opening tag.
+ *
+ * Brace depth, not a lazy match up to the next `}`: the JSX expression's closing
+ * brace is the one that brings the depth back to zero.
+ */
+function modifiersExpression(tag: string): string | null {
+	const marker = "modifiers={";
+	const start = tag.indexOf(marker);
+	if (start < 0) return null;
+	let depth = 1;
+	const begin = start + marker.length;
+	let i = begin;
+	while (i < tag.length && depth > 0) {
+		const ch = tag[i];
+		if (ch === "{") depth++;
+		else if (ch === "}") depth--;
+		i++;
+	}
+	if (depth !== 0) return null;
+	return tag.slice(begin, i - 1);
+}
+
+/**
  * Find `<DndContext ...>` tags and, for each, the strategy used within the same
  * file's following `SortableContext`.
  *
@@ -91,14 +114,16 @@ function findViolations(source: string, file: string): Violation[] {
 
 	for (const tag of tags) {
 		const after = source.slice(tag.index + tag[0].length);
-		const hasModifiers = /modifiers=\{/.test(tag[0]);
 		for (const [strategy, required] of STRATEGY_MODIFIERS) {
 			// Only the SortableContext that belongs to this DndContext: the nearest one
 			// after it, before the next DndContext opens.
 			const nextContext = after.indexOf("<DndContext");
 			const scope = nextContext < 0 ? after : after.slice(0, nextContext);
 			if (!scope.includes(strategy)) continue;
-			if (hasModifiers && (tag[0].includes(required) || scope.includes(required))) continue;
+			// The name has to appear inside this tag's `modifiers={...}` expression.
+			// A comment later in the file, or `modifiers={[]}`, does not count.
+			const expr = modifiersExpression(tag[0]);
+			if (expr?.includes(required)) continue;
 			violations.push({ file, strategy, required });
 		}
 	}
@@ -122,6 +147,29 @@ describe("dnd sortable lists carry an axis-restriction modifier", () => {
 			.map((v) => `${v.file}: ${v.strategy} without ${v.required}`)
 			.join("\n");
 		expect(violations, message).toHaveLength(0);
+	});
+
+	it("does not treat a comment mentioning the modifier as the modifiers prop", () => {
+		const source = `
+<DndContext modifiers={[]}>
+	{/* restrictToVerticalAxis */}
+	<SortableContext strategy={verticalListSortingStrategy} />
+</DndContext>`;
+		expect(findViolations(source, "fake.tsx")).toEqual([
+			{
+				file: "fake.tsx",
+				strategy: "verticalListSortingStrategy",
+				required: "restrictToVerticalAxis",
+			},
+		]);
+	});
+
+	it("accepts the modifier when it is inside the modifiers expression", () => {
+		const source = `
+<DndContext modifiers={[restrictToVerticalAxis]}>
+	<SortableContext strategy={verticalListSortingStrategy} />
+</DndContext>`;
+		expect(findViolations(source, "ok.tsx")).toEqual([]);
 	});
 
 	it("finds the sortable lists it is meant to guard", () => {
