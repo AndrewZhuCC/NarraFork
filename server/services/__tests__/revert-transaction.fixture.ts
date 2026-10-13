@@ -365,7 +365,11 @@ export async function closeFixture(closing: FixtureLifetime) {
 	// Finalize Drizzle's prepared statements instead of deferring SQLite's native
 	// connection disposal to GC, which leaves fixture files locked on Windows.
 	closing.sqlite?.close(true);
-	if (closing.root) await fs.rm(closing.root, { recursive: true, force: true });
+	// Windows may still report EBUSY/EPERM for a moment after the last handle closes (indexer,
+	// AV, a just-settled background read). Node retries those codes with linear backoff; the
+	// directory is still removed for real, and a persistent lock still fails the hook.
+	if (closing.root)
+		await fs.rm(closing.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 export function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
 	if (!user.isAdmin && row.ownerUserId !== user.userId) throw new Error("Narrator denied");
