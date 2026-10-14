@@ -88,7 +88,14 @@ import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { resolveToolCallTiming } from "@shared/tool-display-duration";
 import { CopyButton } from "../../../common/CopyButton";
-import { QUOTE_TOOL_ATTR, QUOTE_TOOL_SUMMARY_ATTR } from "../../composer/quote-source-attrs";
+import {
+	QUOTE_FILE_ATTR,
+	QUOTE_PART_ATTR,
+	QUOTE_TOOL_ATTR,
+	QUOTE_TOOL_ID_ATTR,
+	QUOTE_TOOL_SUMMARY_ATTR,
+	quoteSectionPart,
+} from "../../composer/quote-source-attrs";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";
@@ -1884,6 +1891,19 @@ function askRoleColor(role: string, selected: boolean): string | undefined {
 	}
 }
 
+/** The path row of a file tool card. Edit appends `:line`; the quote reader strips that. */
+function quoteFilePath(detail: MeasuredToolDetail | null): string | undefined {
+	if (!detail) return undefined;
+	for (const section of detail.sections) {
+		if (section.key !== "meta.file" && section.key !== "meta.target") continue;
+		const model = section.measuredBody.model;
+		if (model.kind !== "meta-rows") continue;
+		const text = model.rows.map((row) => row.text.trim()).find((row) => row.length > 0);
+		if (text) return text;
+	}
+	return undefined;
+}
+
 function DetailRegion({
 	detail,
 	availableWidth,
@@ -1906,48 +1926,52 @@ function DetailRegion({
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-			{detail.sections.map((section) => (
-				<Fragment key={section.key}>
-					{section.label ? (
-						<Text
-							size="xs"
-							fw={500}
+			{detail.sections.map((section) => {
+				const part = quoteSectionPart(section.key);
+				return (
+					<Fragment key={section.key}>
+						{section.label ? (
+							<Text
+								size="xs"
+								fw={500}
+								style={{
+									position: "absolute",
+									top: section.top,
+									left: 0,
+									width: availableWidth,
+									height: typographyMetrics().line.xs,
+								}}
+							>
+								{sectionLabelText(labels, section.label)}
+							</Text>
+						) : null}
+						<div
+							{...(part ? { [QUOTE_PART_ATTR]: part } : {})}
 							style={{
 								position: "absolute",
-								top: section.top,
+								top: section.bodyTop,
 								left: 0,
 								width: availableWidth,
-								height: typographyMetrics().line.xs,
+								height: section.bodyHeight,
 							}}
 						>
-							{sectionLabelText(labels, section.label)}
-						</Text>
-					) : null}
-					<div
-						style={{
-							position: "absolute",
-							top: section.bodyTop,
-							left: 0,
-							width: availableWidth,
-							height: section.bodyHeight,
-						}}
-					>
-						<RenderToolBody
-							measured={section.measuredBody}
-							labels={labels}
-							narratorId={narratorId}
-							openSession={openSession}
-							viewTarget={
-								section.measuredBody.model.kind === "capped"
-									? findViewTarget(viewTargets, section.measuredBody.model.source)
-									: undefined
-							}
-							viewControls={viewControls}
-							specTasksLive={specTasksLive}
-						/>
-					</div>
-				</Fragment>
-			))}
+							<RenderToolBody
+								measured={section.measuredBody}
+								labels={labels}
+								narratorId={narratorId}
+								openSession={openSession}
+								viewTarget={
+									section.measuredBody.model.kind === "capped"
+										? findViewTarget(viewTargets, section.measuredBody.model.source)
+										: undefined
+								}
+								viewControls={viewControls}
+								specTasksLive={specTasksLive}
+							/>
+						</div>
+					</Fragment>
+				);
+			})}
 		</div>
 	);
 }
@@ -2512,9 +2536,12 @@ export function RenderToolCall({
 			{liveSlot}
 		</>
 	);
+	const quoteFile = quoteFilePath(measured.detail);
 	const quoteSource = {
 		[QUOTE_TOOL_ATTR]: measured.toolName,
 		[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
+		...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
+		...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
 	};
 
 	// In a run: no border, a trailing divider unless last. The shimmer overlay

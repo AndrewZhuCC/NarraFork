@@ -338,7 +338,8 @@
 		"limit": "每条消息最多引用 {{count}} 段内容。",
 		"fileUnsaved": "保存文件后才能引用该选区",
 		"addFailed": "无法添加引用",
-		"placeholder": "针对引用内容提问…"
+		"placeholder": "针对引用内容提问…",
+		"open": "定位到引用内容"
 	},
 	"fileReferences": {
 		"title": "文件引用",

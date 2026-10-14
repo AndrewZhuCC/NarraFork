@@ -20,6 +20,7 @@ import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import { quoteDisplayText } from "../../composer/composer-quotes";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -388,6 +389,8 @@ function attachmentBlock(
 
 // ── user: plain pre-wrap body inside a shrink-wrapping bubble ─────────────────
 function measureUserMessage(input: MeasureMessageInput, contentWidth: number): MeasuredElement {
+	const presented = quoteDisplayText(input.text);
+	const bodyText = presented.text;
 	const innerWidth = Math.max(1, contentWidth - USER_BUBBLE_PADDING * 2);
 	const blocks: PreparedBlock[] = [];
 	// True when the bubble holds at least one attachment block (used for the
@@ -454,8 +457,8 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 		// User body text is PLAIN pre-wrap (not markdown): a single pre-wrap block.
 		// An attachment-only message has no text block at all (an empty pre-wrap block
 		// would still reserve one line, leaving a blank gap under the image).
-		if (input.bodyFormat === "markdown" && input.text.length > 0) {
-			let body = measureMarkdown(input.text, innerWidth);
+		if (input.bodyFormat === "markdown" && bodyText.length > 0) {
+			let body = measureMarkdown(bodyText, innerWidth);
 			// Paragraph-only chat messages should hug their content, like plain user
 			// turns. A full-column bubble makes self/other alignment indistinguishable.
 			// Keep structural Markdown (tables, code, media, etc.) at the column width.
@@ -472,7 +475,7 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 				);
 				// Re-measure at the width we actually paint. Rounding a natural width
 				// down can otherwise introduce an extra line outside the reserved box.
-				body = measureMarkdown(input.text, bodyWidth, { preparedBlocks: body.blocks });
+				body = measureMarkdown(bodyText, bodyWidth, { preparedBlocks: body.blocks });
 			}
 			blocks.push({
 				kind: "fixed",
@@ -487,16 +490,12 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 				markerLeft: null,
 				markerClassName: null,
 			});
-		} else if (input.text.length > 0 || !hasAttachments) {
+		} else if (bodyText.length > 0 || !hasAttachments) {
 			const bodyBlock: PreparedCodeBlock = {
 				kind: "code",
 				// Cross-width memo (see prepared-markdown-cache): the segment precompute is
 				// width-independent and is the dominant cost of a user bubble.
-				prepared: getPreparedTextWithSegments(
-					input.text,
-					typographyMetrics().font.body,
-					"pre-wrap",
-				),
+				prepared: getPreparedTextWithSegments(bodyText, typographyMetrics().font.body, "pre-wrap"),
 				lineHeight: typographyMetrics().line.body,
 				lang: null,
 				marginTop: blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
@@ -535,7 +534,14 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 	);
 	const usedWidth = Math.min(contentWidth, USER_BUBBLE_PADDING * 2 + innerUsed);
 
-	return { height, blocks, frame, contentWidth: innerWidth, usedWidth };
+	return {
+		height,
+		blocks,
+		frame,
+		contentWidth: innerWidth,
+		usedWidth,
+		...(presented.jumps.length ? { quoteJumps: presented.jumps } : {}),
+	};
 }
 
 // ── user + slash command: command line, folded expansion ─────────────────────

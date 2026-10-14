@@ -338,7 +338,8 @@
 		"limit": "You can quote up to {{count}} excerpts per message.",
 		"fileUnsaved": "Save the file to quote this selection",
 		"addFailed": "Could not add quote",
-		"placeholder": "Ask about the quoted content…"
+		"placeholder": "Ask about the quoted content…",
+		"open": "Show quoted text"
 	},
 	"fileReferences": {
 		"title": "File references",

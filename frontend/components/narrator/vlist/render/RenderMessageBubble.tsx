@@ -17,12 +17,15 @@
 import { layoutWithLines } from "@chenglou/pretext";
 import type { FileReference } from "@shared/file-reference";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
-import { useId, useMemo } from "react";
+import { type CSSProperties, useId, useMemo } from "react";
+import type { QuoteDisplayJump } from "../../composer/composer-quotes";
 import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
 } from "../../composer/FileReferenceScope";
+import { revealComposerQuote, revealQuotedFile } from "../../composer/quote-jump";
 import { QUOTE_ROLE_ATTR } from "../../composer/quote-source-attrs";
+import { useNarratorDockContext } from "../../dock/NarratorDockContext";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
 	ASSISTANT_PAD_X,
@@ -369,6 +372,25 @@ function CommandBubble({
 	);
 }
 
+function quoteJumpForLine(
+	lines: readonly { text: string }[],
+	index: number,
+	jumps: readonly QuoteDisplayJump[] | undefined,
+): QuoteDisplayJump | undefined {
+	if (!jumps?.length) return undefined;
+	let cursor = index;
+	while (
+		cursor > 0 &&
+		!lines[cursor]?.text.startsWith("> [quote] ") &&
+		(lines[cursor]?.text.startsWith(">") ?? false)
+	) {
+		cursor -= 1;
+	}
+	const headerLine = lines[cursor]?.text ?? "";
+	if (!headerLine.startsWith("> [quote] ")) return undefined;
+	return jumps.find((jump) => jump.header === headerLine || jump.header.startsWith(headerLine));
+}
+
 function UserBubble({
 	measured,
 	header,
@@ -403,6 +425,8 @@ function UserBubble({
 	const headerBlock = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
 	const contentTop = USER_BUBBLE_PADDING + headerBlock;
 	const lineHeight = bodyBlock?.lineHeight ?? 20;
+	const quoteJumps = (measured as { quoteJumps?: QuoteDisplayJump[] }).quoteJumps;
+	const dock = useNarratorDockContext();
 
 	const surface = bubbleSurface(isSelf);
 
@@ -493,23 +517,62 @@ function UserBubble({
 							left: USER_BUBBLE_PADDING,
 						}}
 					>
-						{lines.map((line, i) => (
-							<div
-								// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
-								key={i}
-								style={{
-									position: "absolute",
-									top: i * lineHeight,
-									left: 0,
-									height: lineHeight,
-									whiteSpace: "pre",
-									font: typographyMetrics().font.body,
-									color: "var(--mantine-color-text)",
-								}}
-							>
-								{line.text}
-							</div>
-						))}
+						{lines.map((line, i) => {
+							const jump = quoteJumpForLine(lines, i, quoteJumps);
+							const lineStyle: CSSProperties = {
+								position: "absolute",
+								top: i * lineHeight,
+								left: 0,
+								height: lineHeight,
+								whiteSpace: "pre",
+								font: typographyMetrics().font.body,
+								color: "var(--mantine-color-text)",
+							};
+							if (!jump) {
+								return (
+									<div
+										// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
+										key={i}
+										style={lineStyle}
+									>
+										{line.text}
+									</div>
+								);
+							}
+							return (
+								<button
+									// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
+									key={i}
+									type="button"
+									onClick={(event) => {
+										if (window.getSelection()?.isCollapsed === false) return;
+										event.stopPropagation();
+										revealComposerQuote(dock, {
+											label: jump.header,
+											text: jump.highlight,
+											anchor: jump.anchor,
+										});
+									}}
+									style={{
+										...lineStyle,
+										display: "block",
+										boxSizing: "border-box",
+										lineHeight: `${lineHeight}px`,
+										overflow: "hidden",
+										padding: 0,
+										border: "none",
+										cursor: "pointer",
+										textAlign: "left",
+										background: line.text.startsWith("> [quote] ")
+											? "var(--mantine-color-default-hover)"
+											: "transparent",
+										borderRadius: 4,
+									}}
+								>
+									{line.text}
+								</button>
+							);
+						})}
 					</div>
 				) : null}
 			</div>
@@ -659,6 +722,7 @@ function UserAttachmentView({
 	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }) {
 	const scope = useFileReferenceScope();
+	const dock = useNarratorDockContext();
 	const data = block.data ?? {};
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 	if (block.tag === "user-text-file" || block.tag === "user-file-reference") {
@@ -670,8 +734,12 @@ function UserAttachmentView({
 		const reference = data.reference as FileReference | undefined;
 		const openFile =
 			block.tag === "user-file-reference"
-				? reference && scope.openFile
-					? () => scope.openFile?.(reference)
+				? reference
+					? scope.openFile
+						? () => scope.openFile?.(reference)
+						: dock
+							? () => revealQuotedFile(dock, reference)
+							: undefined
 					: undefined
 				: fetchUrl && onFetchAttachment
 					? () => onFetchAttachment(fetchUrl, filename)

@@ -2,11 +2,7 @@ import type { FileReference, FileReferenceEditorSelection } from "@shared/file-r
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import type { ComposerQuote } from "./composer-quotes";
 import { fileReferenceToken, savedSelectionReference } from "./file-reference-input";
-import {
-	NARRATOR_PANEL_SELECTOR,
-	type QuoteSourceLabels,
-	readPanelQuoteSelection,
-} from "./quote-selection";
+import { NARRATOR_PANEL_SELECTOR, readPanelQuoteSelection } from "./quote-selection";
 
 /** Long enough to skip intermediate drag states, short enough to feel immediate. */
 export const QUOTE_SELECTION_SETTLE_MS = 120;
@@ -80,19 +76,15 @@ export function editorSelectionCandidate(
 export function useQuoteCandidate({
 	textareaRef,
 	editorSelection,
-	labels,
 	onShortcut,
 }: {
 	textareaRef: RefObject<HTMLTextAreaElement | null>;
 	editorSelection: FileReferenceEditorSelection | null | undefined;
-	labels: QuoteSourceLabels;
 	onShortcut: (candidate: QuoteCandidate) => void;
 }) {
 	const [candidate, setCandidate] = useState<QuoteCandidate | null>(null);
 	const candidateRef = useRef(candidate);
 	candidateRef.current = candidate;
-	const labelsRef = useRef(labels);
-	labelsRef.current = labels;
 	const onShortcutRef = useRef(onShortcut);
 	onShortcutRef.current = onShortcut;
 	const ownerRef = useRef(0);
@@ -114,9 +106,7 @@ export function useQuoteCandidate({
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const check = () => {
 			const panel = textarea.closest(NARRATOR_PANEL_SELECTOR);
-			const quote = panel
-				? readPanelQuoteSelection(panel, doc.getSelection(), labelsRef.current)
-				: null;
+			const quote = panel ? readPanelQuoteSelection(panel, doc.getSelection()) : null;
 			if (!quote) {
 				hiddenKeysRef.current.text = null;
 				setCandidate((current) => (current?.kind === "text" ? null : current));

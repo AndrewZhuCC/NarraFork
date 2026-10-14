@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseHTML } from "linkedom";
+import { NodeFilter, parseHTML } from "linkedom";
 import {
 	describeQuoteEndpoint,
 	type QuoteSourceLabels,
@@ -61,17 +61,95 @@ describe("describeQuoteEndpoint", () => {
 });
 
 describe("readPanelQuoteSelection", () => {
+	test("names a quote from its text and a file tool from the file", () => {
+		const { document: doc, window } = parseHTML(`<!doctype html><html><body>
+			<div data-narrator-panel id="a">
+				<div data-message-id="m9abcd" data-quote-role="assistant">
+					<div data-content-block><span id="para">Hello there friend</span></div>
+				</div>
+				<div data-message-id="m1" data-quote-tool="Read" data-quote-tool-id="tool1234" data-quote-file="/work/biome.json">
+					<div data-content-block data-quote-part="result"><span id="out">"formatter": true</span></div>
+				</div>
+				<div data-message-id="m2" data-quote-tool="Write" data-quote-tool-id="tool5678" data-quote-file="src/app.ts:4">
+					<div data-content-block data-quote-part="input"><span id="inp">const answer = 1</span></div>
+				</div>
+			</div>
+		</body></html>`);
+		const globals = globalThis as {
+			window?: unknown;
+			Node?: unknown;
+			NodeFilter?: unknown;
+		};
+		const previous = {
+			document: globalThis.document,
+			window: globals.window,
+			Node: globals.Node,
+			NodeFilter: globals.NodeFilter,
+		};
+		window.getComputedStyle = () =>
+			({ display: "block", visibility: "visible" }) as unknown as CSSStyleDeclaration;
+		Object.defineProperty(globalThis, "document", { configurable: true, value: doc });
+		Object.defineProperty(globalThis, "window", { configurable: true, value: window });
+		Object.defineProperty(globalThis, "Node", { configurable: true, value: window.Node });
+		Object.defineProperty(globalThis, "NodeFilter", { configurable: true, value: NodeFilter });
+		try {
+			const select = (id: string) => {
+				const node = doc.getElementById(id)?.firstChild;
+				if (!node) throw new Error(id);
+				const range = doc.createRange();
+				range.selectNodeContents(node);
+				return {
+					anchorNode: node,
+					focusNode: node,
+					isCollapsed: false,
+					rangeCount: 1,
+					getRangeAt: () => range,
+				} as unknown as Selection;
+			};
+			const panel = doc.getElementById("a");
+			if (!panel) throw new Error("panel");
+			const message = readPanelQuoteSelection(panel, select("para"));
+			expect(message?.label).toBe("Hello there friend");
+			expect(message?.anchor).toBe("m:m9abcd");
+			expect(message?.text).toBe("Hello there friend");
+			const result = readPanelQuoteSelection(panel, select("out"));
+			expect(result?.label.startsWith("biome.json · ")).toBe(true);
+			expect(result?.text.startsWith('biome.json\n"formatter"')).toBe(true);
+			expect(result?.anchor).toBe("t:tool1234");
+			const input = readPanelQuoteSelection(panel, select("inp"));
+			expect(input?.label.startsWith("app.ts · ")).toBe(true);
+			expect(input?.anchor).toBe("t:tool5678");
+		} finally {
+			Object.defineProperty(globalThis, "document", {
+				configurable: true,
+				value: previous.document,
+			});
+			if (previous.window)
+				Object.defineProperty(globalThis, "window", { configurable: true, value: previous.window });
+			else Reflect.deleteProperty(globalThis, "window");
+			if (previous.Node)
+				Object.defineProperty(globalThis, "Node", { configurable: true, value: previous.Node });
+			else Reflect.deleteProperty(globalThis, "Node");
+			if (previous.NodeFilter)
+				Object.defineProperty(globalThis, "NodeFilter", {
+					configurable: true,
+					value: previous.NodeFilter,
+				});
+			else Reflect.deleteProperty(globalThis, "NodeFilter");
+		}
+	});
+
 	test("rejects collapsed, foreign-panel and editable selections", () => {
 		const document = dom();
 		const panel = document.getElementById("a")!;
 		const para = document.getElementById("para")!.firstChild;
 		const other = document.getElementById("other")!.firstChild;
 		const input = document.getElementById("input");
-		expect(readPanelQuoteSelection(panel, null, labels)).toBeNull();
-		expect(readPanelQuoteSelection(panel, fakeSelection(para, para, true), labels)).toBeNull();
-		expect(readPanelQuoteSelection(panel, fakeSelection(other, other), labels)).toBeNull();
-		expect(readPanelQuoteSelection(panel, fakeSelection(para, other), labels)).toBeNull();
-		expect(readPanelQuoteSelection(panel, fakeSelection(input, input), labels)).toBeNull();
+		expect(readPanelQuoteSelection(panel, null)).toBeNull();
+		expect(readPanelQuoteSelection(panel, fakeSelection(para, para, true))).toBeNull();
+		expect(readPanelQuoteSelection(panel, fakeSelection(other, other))).toBeNull();
+		expect(readPanelQuoteSelection(panel, fakeSelection(para, other))).toBeNull();
+		expect(readPanelQuoteSelection(panel, fakeSelection(input, input))).toBeNull();
 	});
 });
 

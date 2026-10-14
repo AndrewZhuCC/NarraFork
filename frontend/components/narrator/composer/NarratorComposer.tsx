@@ -59,6 +59,7 @@ import {
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
+import { revealComposerQuote, revealQuotedFile } from "./quote-jump";
 import {
 	TextareaOptimizeControls,
 	textareaOptimizeControlsWidth,
@@ -907,15 +908,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// === Selection quotes ======================================================
 		const editorSelection =
 			fileScope.selection !== undefined ? fileScope.selection : dock?.fileReferenceSelection;
-		const quoteLabels = useMemo(
-			() => ({
-				assistant: t("quote.source.assistant"),
-				user: t("quote.source.user"),
-				message: t("quote.source.message"),
-				merged: (count: number) => t("quote.source.merged", { count }),
-			}),
-			[t],
-		);
 		const focusBodyEnd = useCallback(() => {
 			requestAnimationFrame(() => {
 				const ta = textareaRef.current;
@@ -928,7 +920,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const quoteCandidate = useQuoteCandidate({
 			textareaRef,
 			editorSelection,
-			labels: quoteLabels,
 			onShortcut: (candidate) => acceptQuoteRef.current(candidate),
 		});
 		const hideQuoteCandidate = quoteCandidate.hide;
@@ -1318,6 +1309,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onDismiss={hideQuoteCandidate}
 					onRemoveQuote={removeQuote}
 					onRemoveFileReference={removeDetachedFileReference}
+					onOpenQuote={(quote) => revealComposerQuote(dock, quote)}
+					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
 				/>
 				<Textarea
 					ref={textareaRef}

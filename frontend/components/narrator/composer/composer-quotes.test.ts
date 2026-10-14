@@ -6,6 +6,8 @@ import {
 	MAX_COMPOSER_QUOTE_LABEL_CHARS,
 	normalizeComposerQuote,
 	parseComposerQuotePrefix,
+	quoteDisplayText,
+	quotePreviewLabel,
 	serializeComposerQuotes,
 	splitQuotedComposerInput,
 } from "./composer-quotes";
@@ -62,6 +64,34 @@ describe("quote prefix serialization", () => {
 		const parsed = parseComposerQuotePrefix(text);
 		expect(parsed.quotes).toEqual(quotes);
 		expect(text.slice(parsed.prefixLength)).toBe("what does this mean?");
+	});
+
+	test("round-trips a jump anchor without showing it in the chip label", () => {
+		const quote = normalizeComposerQuote(
+			quotePreviewLabel("Selecting text in a message shows a dashed chip", "biome.json"),
+			"biome.json\nSelecting text in a message shows a dashed chip",
+			"m:msg1234",
+		);
+		if (!quote) throw new Error("quote");
+		expect(quote.label.startsWith("biome.json · Selecting text")).toBe(true);
+		expect(quote.anchor).toBe("m:msg1234");
+		const text = serializeComposerQuotes([quote]);
+		expect(text).toContain("@@m:msg1234");
+		expect(parseComposerQuotePrefix(text).quotes).toEqual([quote]);
+		const display = quoteDisplayText(`${text}and then?`);
+		expect(display.text.includes("@@")).toBe(false);
+		expect(display.jumps).toEqual([
+			{
+				header: `> [quote] ${quote.label}`,
+				anchor: "m:msg1234",
+				highlight: "Selecting text in a message shows a dashed chip",
+			},
+		]);
+		expect(display.text.endsWith("and then?")).toBe(true);
+	});
+
+	test("ignores an anchor that is too short to be an id", () => {
+		expect(normalizeComposerQuote("Label", "text", "m:ab")?.anchor).toBeUndefined();
 	});
 
 	test("accepts a prefix without a body, as left behind by send trimming", () => {

@@ -66,6 +66,10 @@ export interface ComposerQuoteChipsProps {
 	onDismiss: (candidate: QuoteCandidate) => void;
 	onRemoveQuote: (index: number) => void;
 	onRemoveFileReference: (id: string) => void;
+	/** Scroll to the quoted source and highlight it. */
+	onOpenQuote?: (quote: ComposerQuote) => void;
+	/** Open the quoted file on its line range. */
+	onOpenFile?: (reference: FileReference) => void;
 }
 
 export function ComposerQuoteChips({
@@ -76,6 +80,8 @@ export function ComposerQuoteChips({
 	onDismiss,
 	onRemoveQuote,
 	onRemoveFileReference,
+	onOpenQuote,
+	onOpenFile,
 }: ComposerQuoteChipsProps) {
 	const { t } = useTranslation("narrator");
 	if (!quotes.length && !fileReferences.length && !candidate) return null;
@@ -93,8 +99,23 @@ export function ComposerQuoteChips({
 					withinPortal
 				>
 					<span style={solidChipStyle} data-composer-quote>
-						<IconQuote size={12} style={{ flexShrink: 0 }} />
-						<ChipLabel>{quote.label}</ChipLabel>
+						<UnstyledButton
+							aria-label={t("quote.open")}
+							disabled={!quote.anchor}
+							onClick={() => onOpenQuote?.(quote)}
+							style={{
+								display: "inline-flex",
+								alignItems: "center",
+								gap: 4,
+								minWidth: 0,
+								color: "inherit",
+								fontSize: "inherit",
+								cursor: quote.anchor ? "pointer" : "default",
+							}}
+						>
+							<IconQuote size={12} style={{ flexShrink: 0 }} />
+							<ChipLabel>{quote.label}</ChipLabel>
+						</UnstyledButton>
 						<CloseButton
 							size="xs"
 							aria-label={t("quote.remove")}
@@ -110,11 +131,26 @@ export function ComposerQuoteChips({
 					style={solidChipStyle}
 					title={`${reference.deviceId} · ${reference.path}`}
 				>
-					<IconFileText size={12} style={{ flexShrink: 0 }} />
-					<ChipLabel>
-						{reference.deviceId === "local" ? "" : `${reference.deviceId} · `}
-						{fileReferenceToken(reference).replace(/^#file:/, "")}
-					</ChipLabel>
+					<UnstyledButton
+						aria-label={t("quote.open")}
+						disabled={!onOpenFile}
+						onClick={() => onOpenFile?.(reference)}
+						style={{
+							display: "inline-flex",
+							alignItems: "center",
+							gap: 4,
+							minWidth: 0,
+							color: "inherit",
+							fontSize: "inherit",
+							cursor: onOpenFile ? "pointer" : "default",
+						}}
+					>
+						<IconFileText size={12} style={{ flexShrink: 0 }} />
+						<ChipLabel>
+							{reference.deviceId === "local" ? "" : `${reference.deviceId} · `}
+							{fileReferenceToken(reference).replace(/^#file:/, "")}
+						</ChipLabel>
+					</UnstyledButton>
 					<CloseButton
 						size="xs"
 						aria-label={t("fileReferences.remove")}

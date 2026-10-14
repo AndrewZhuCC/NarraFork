@@ -1,10 +1,24 @@
 import { collectSelectionTextPreview } from "@frontend/lib/dom-text";
 import {
 	type ComposerQuote,
+	fileQuoteName,
 	MAX_COMPOSER_QUOTE_CHARS,
 	normalizeComposerQuote,
+	quotePreviewLabel,
 } from "./composer-quotes";
-import { QUOTE_ROLE_ATTR, QUOTE_TOOL_ATTR, QUOTE_TOOL_SUMMARY_ATTR } from "./quote-source-attrs";
+import {
+	QUOTE_FILE_ATTR,
+	QUOTE_PART_ATTR,
+	QUOTE_ROLE_ATTR,
+	QUOTE_TOOL_ATTR,
+	QUOTE_TOOL_ID_ATTR,
+	QUOTE_TOOL_SUMMARY_ATTR,
+} from "./quote-source-attrs";
+
+/** Result text of these tools is a file's contents, so the quote names the file. */
+const RESULT_FILE_TOOLS = new Set(["Read", "StructView", "StructSed"]);
+/** Input text of these tools is the file being written, so the quote names the file. */
+const INPUT_FILE_TOOLS = new Set(["Write", "Edit", "StructSed"]);
 
 export const NARRATOR_PANEL_SELECTOR = "[data-narrator-panel]";
 const CONTENT_BLOCK_SELECTOR = "[data-content-block]";
@@ -49,25 +63,49 @@ export function describeQuoteEndpoint(element: Element, labels: QuoteSourceLabel
 	return labels.message;
 }
 
-function isTopLevelBlock(block: Element): boolean {
-	return !block.parentElement?.closest(CONTENT_BLOCK_SELECTOR);
+interface ToolQuoteContext {
+	tool: string;
+	part: string;
+	file: string;
+	toolId?: string;
 }
 
-/** Selections spanning several blocks become ONE merged quote labelled with the count. */
-function countSelectedBlocks(panel: Element, range: Range, anchor: Element, focus: Element) {
-	if (anchor === focus) return 1;
-	let count = 0;
-	for (const block of panel.querySelectorAll(CONTENT_BLOCK_SELECTOR)) {
-		if (isTopLevelBlock(block) && range.intersectsNode(block)) count++;
-	}
-	return Math.max(2, count);
+function toolContext(element: Element | null): ToolQuoteContext | null {
+	if (!element) return null;
+	const toolEl = element.closest(`[${QUOTE_TOOL_ATTR}]`);
+	if (!toolEl) return null;
+	return {
+		tool: toolEl.getAttribute(QUOTE_TOOL_ATTR)?.trim() ?? "",
+		part: element.closest(`[${QUOTE_PART_ATTR}]`)?.getAttribute(QUOTE_PART_ATTR) ?? "",
+		file: toolEl.getAttribute(QUOTE_FILE_ATTR)?.trim() ?? "",
+		toolId: toolEl.getAttribute(QUOTE_TOOL_ID_ATTR)?.trim() || undefined,
+	};
+}
+
+/** File name when this endpoint is a Read/StructView result or a Write/Edit/StructSed input. */
+function quotedFileName(info: ToolQuoteContext | null): string | undefined {
+	if (!info?.file) return undefined;
+	const named =
+		(info.part === "result" && RESULT_FILE_TOOLS.has(info.tool)) ||
+		(info.part === "input" && INPUT_FILE_TOOLS.has(info.tool));
+	return named ? fileQuoteName(info.file) : undefined;
+}
+
+function quoteAnchor(element: Element | null): string | undefined {
+	if (!element) return undefined;
+	const toolId = element
+		.closest(`[${QUOTE_TOOL_ID_ATTR}]`)
+		?.getAttribute(QUOTE_TOOL_ID_ATTR)
+		?.trim();
+	if (toolId) return `t:${toolId}`;
+	const messageId = element.closest("[data-message-id]")?.getAttribute("data-message-id")?.trim();
+	return messageId ? `m:${messageId}` : undefined;
 }
 
 /** Resolve a document selection inside `panel`'s message list into a quote candidate. */
 export function readPanelQuoteSelection(
 	panel: Element,
 	selection: Selection | null,
-	labels: QuoteSourceLabels,
 ): ComposerQuote | null {
 	if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
 	const anchorElement = elementOf(selection.anchorNode);
@@ -77,7 +115,12 @@ export function readPanelQuoteSelection(
 	if (!anchor || !focus || !anchorElement) return null;
 	const text = collectSelectionTextPreview(selection, MAX_COMPOSER_QUOTE_CHARS + 1);
 	if (!text.trim()) return null;
-	const count = countSelectedBlocks(panel, selection.getRangeAt(0), anchor, focus);
-	const label = count > 1 ? labels.merged(count) : describeQuoteEndpoint(anchorElement, labels);
-	return normalizeComposerQuote(label, text);
+	const fileName =
+		quotedFileName(toolContext(anchorElement)) ?? quotedFileName(toolContext(focusElement));
+	const quoted = fileName && !text.startsWith(fileName) ? `${fileName}\n${text}` : text;
+	return normalizeComposerQuote(
+		quotePreviewLabel(text, fileName),
+		quoted,
+		quoteAnchor(anchorElement),
+	);
 }
