@@ -1,5 +1,4 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -14,18 +13,29 @@ import {
 // Bun module mocks are process-global. Keep the fixture in a bounded child so a
 // whole-directory test run never inherits this tiny database or its closed handle.
 if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
-	test("isolated file reference storage suite", () => {
-		const env: NodeJS.ProcessEnv = { ...process.env, NARRAFORK_FILE_REFERENCE_FIXTURE: "storage" };
+	test("isolated file reference storage suite", async () => {
+		// Asynchronous and bounded: a child that finishes its tests but stalls on exit must
+		// fail this case with its output, not block the worker in a synchronous wait.
+		const { safeSpawn } = await import("../../lib/spawn");
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			NARRAFORK_FILE_REFERENCE_FIXTURE: "storage",
+		};
 		delete env.NARRAFORK_HOME;
-		const result = spawnSync(process.execPath, ["test", import.meta.path], {
+		const result = await safeSpawn({
+			cmd: [process.execPath, "test", import.meta.path],
 			env,
-			encoding: "utf8",
 			timeout: 60_000,
-			maxBuffer: 512 * 1024,
+			maxOutputBytes: 512 * 1024,
+			killProcessTree: true,
 		});
-		if (result.error || result.status !== 0)
-			throw new Error(`${result.error ?? "Fixture failed"}\n${result.stdout}\n${result.stderr}`);
-		expect(result.status).toBe(0);
+		if (result.exitCode !== 0)
+			throw new Error(
+				`Fixture failed (exit ${result.exitCode})\n${result.stdout}\n${result.stderr}`,
+			);
+		// The child really ran the suite (not an empty filter match).
+		expect(`${result.stdout}\n${result.stderr}`).toMatch(/\b10 pass\b/);
+		expect(`${result.stdout}\n${result.stderr}`).toMatch(/\b0 fail\b/);
 	}, 65_000);
 } else {
 	// Isolated in-memory schema includes the durable mailbox identity columns.

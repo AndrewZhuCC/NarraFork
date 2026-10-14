@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type { CodexUsageForecast, PublicCodexQuotaOverview } from "../../lib/api/types";
@@ -25,7 +26,7 @@ function installDom() {
 		Node: window.Node,
 		Text: window.Text,
 		getComputedStyle: () => ({ getPropertyValue: () => "" }),
-		IS_REACT_ACT_ENVIRONMENT: false,
+		IS_REACT_ACT_ENVIRONMENT: true,
 	});
 }
 
@@ -35,14 +36,18 @@ function formatDuration(minutes: number, language = "en"): string {
 }
 
 async function renderTrend(trend: CodexUsageForecast | PublicCodexQuotaOverview["trend"]) {
-	root.render(
-		<I18nextProvider i18n={testI18n}>
-			<MantineProvider>
-				<CodexQuotaTrendChart trend={trend} />
-			</MantineProvider>
-		</I18nextProvider>,
-	);
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	// act() flushes the concurrent root's commit and effects deterministically. A single
+	// setTimeout(0) does not: on a loaded runner the scheduler can still be mid-render, and the
+	// assertions then read an empty container.
+	await act(async () => {
+		root.render(
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					<CodexQuotaTrendChart trend={trend} />
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+	});
 }
 
 beforeEach(async () => {
@@ -65,7 +70,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-	root.unmount();
+	act(() => root.unmount());
 	container.remove();
 });
 
