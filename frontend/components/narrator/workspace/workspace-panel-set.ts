@@ -344,26 +344,33 @@ export type SurfaceRefreshDecision = "rebuild" | "adopt-baseline" | "ignore";
  * Decide what a mounted surface should do when the workspace query delivers a
  * DIFFERENT layout than the one the surface was built from.
  *
- * This is the guard that was missing when the query cache went stale: a refetch
- * can deliver a layout written by another session (or by this one before a
- * cache-less save), and blindly honouring it would either clobber the user's
- * in-progress arrangement or — worse — let the stale arrangement be persisted
- * back over the newer one on the next layout change.
+ * With `workspace_changed` events pushing cross-device changes into a refetch,
+ * this decision runs on every remote edit, not just on stale-cache mounts:
  *
  *   - "ignore": the incoming tree IS the surface's baseline (our own save echoed
- *     back through the cache) — nothing to do.
- *   - "adopt-baseline": the user has local edits; the surface keeps them and the
- *     next persist will make the server agree. The baseline still advances so a
- *     later identical refetch is "ignore".
- *   - "rebuild": no local edits, so the server layout is strictly newer
- *     information — rebuild the surface from it.
+ *     back through the cache), or the read is STALE — its revision is not newer
+ *     than the baseline's, so it cannot carry anything we have not seen.
+ *   - "adopt-baseline": the user has UNSAVED local edits; the surface keeps them
+ *     and the pending persist will make the server agree (last-writer-wins). The
+ *     baseline still advances so a later identical refetch is "ignore".
+ *   - "rebuild": the server layout is strictly newer and nothing local is
+ *     unsaved — rebuild the surface from it.
+ *
+ * The revision guard is what replaced the old sticky "any local edit since
+ * mount" flag: a read that started before our own save can deliver an older
+ * tree with a higher-looking tree string, and only the revision tells it apart
+ * from a genuinely newer remote layout. A null baseline has no revision to
+ * compare against, so a real incoming tree always rebuilds there.
  */
 export function decideSurfaceRefresh(input: {
-	localEdit: boolean;
+	unsaved: boolean;
 	builtTree: string | null;
+	builtRevision: number;
 	incomingTree: string | null | undefined;
+	incomingRevision: number;
 }): SurfaceRefreshDecision {
 	const incoming = input.incomingTree ?? null;
 	if (incoming === input.builtTree) return "ignore";
-	return input.localEdit ? "adopt-baseline" : "rebuild";
+	if (input.builtTree !== null && input.incomingRevision <= input.builtRevision) return "ignore";
+	return input.unsaved ? "adopt-baseline" : "rebuild";
 }

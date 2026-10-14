@@ -28,7 +28,13 @@ mock.module("../../websocket/narrator-ws", () => ({
 const { dissolveOrphanWorkspaces, workspaceRoutes } = await import("../workspaces");
 const { WORKSPACE_TREE_MAX_BYTES } = await import("../../lib/validators/workspaces");
 const { buildAppErrorResponse } = await import("../../lib/app-error-response");
-const { applyWorkspaceMembershipProjection } = await import("../../services/recent-tabs-service");
+const {
+	applyWorkspaceMembershipProjection,
+	clearRecentTabs,
+	removeRecentTab,
+	restoreRecentTabs,
+	runExpiredRecentTabsWorkspaceCleanup,
+} = await import("../../services/recent-tabs-service");
 const NOW = "2026-07-19T00:00:00.000Z";
 const app = new Hono();
 app.use("*", async (c, next) => {
@@ -650,5 +656,407 @@ describe("layout arrangement is guarded by a revision", () => {
 		});
 
 		expect(response.status).toBe(400);
+	});
+});
+
+// Cross-device sync: every workspace write must announce itself so a second
+// device holding the same workspace open re-fetches immediately instead of
+// waiting for a window refocus. The frame is an invalidation signal — it carries
+// ids and the layout revision, never the layout blob.
+describe("workspace change broadcasts", () => {
+	function workspaceChangedEvents(): Array<Record<string, unknown>> {
+		return broadcasts
+			.map(({ event }) => event)
+			.filter((event) => event.type === "workspace_changed");
+	}
+
+	it("announces a saved layout with the new revision", async () => {
+		seedUser();
+		seedWorkspace("ws");
+
+		const response = await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				layout: JSON.stringify({ kind: "dockview", marker: "v1" }),
+				expectedRevision: 0,
+			}),
+		});
+
+		expect(response.status).toBe(200);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "layout", layoutRevision: 1 },
+		]);
+	});
+
+	it("does not announce a layout save that lost the revision race", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ layout: JSON.stringify({ kind: "dockview" }), expectedRevision: 0 }),
+		});
+		broadcasts.length = 0;
+
+		const response = await app.request("/workspaces/ws/layout", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ layout: JSON.stringify({ kind: "dockview" }), expectedRevision: 0 }),
+		});
+
+		expect(response.status).toBe(409);
+		expect(workspaceChangedEvents()).toEqual([]);
+	});
+
+	it("announces a created panel, but not an idempotent replay", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		db.insert(narrators).values({ id: "n1", title: "n1", createdAt: NOW, updatedAt: NOW }).run();
+
+		const first = await app.request("/workspaces/ws/panels", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+		});
+		expect(first.status).toBe(201);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
+		]);
+
+		broadcasts.length = 0;
+		const replay = await app.request("/workspaces/ws/panels", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+		});
+		expect(replay.status).toBe(200);
+		// Nothing changed, so nothing is announced.
+		expect(workspaceChangedEvents()).toEqual([]);
+	});
+
+	it("announces a removed panel", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		db.insert(narrators).values({ id: "n1", title: "n1", createdAt: NOW, updatedAt: NOW }).run();
+		const created = (await (
+			await app.request("/workspaces/ws/panels", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ kind: "narrator", narratorId: "n1" }),
+			})
+		).json()) as { panel: { id: string } };
+		broadcasts.length = 0;
+
+		const response = await app.request(`/workspaces/ws/panels/${created.panel.id}`, {
+			method: "DELETE",
+		});
+
+		expect(response.status).toBe(200);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
+		]);
+	});
+
+	it("announces a rename and a deletion", async () => {
+		seedUser();
+		seedWorkspace("ws");
+
+		const renamed = await app.request("/workspaces/ws", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "renamed" }),
+		});
+		expect(renamed.status).toBe(200);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "title" },
+		]);
+
+		broadcasts.length = 0;
+		const deleted = await app.request("/workspaces/ws", { method: "DELETE" });
+		expect(deleted.status).toBe(200);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
+		]);
+	});
+});
+
+// Closing a workspace child's own narrator tab from the sidebar must remove its
+// membership row: the row is the authority, and leaving it behind would re-add
+// the panel to every open view of that workspace.
+describe("sidebar tab close cascades to workspace membership", () => {
+	function seedNarrator(id: string): void {
+		db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
+	}
+
+	function panelRow(id: string, workspaceId: string, narratorId: string) {
+		return {
+			id,
+			workspaceId,
+			kind: "narrator" as const,
+			narratorId,
+			configJson: null,
+			sortOrder: 1000,
+			createdAt: new Date(NOW),
+			updatedAt: new Date(NOW),
+		};
+	}
+
+	function workspaceChangedEvents(): Array<Record<string, unknown>> {
+		return broadcasts
+			.map(({ event }) => event)
+			.filter((event) => event.type === "workspace_changed");
+	}
+
+	function seedGroupedWorkspaceWithNarrator(): void {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 1,
+			workspaceId: "ws",
+			representedNarratorId: "n1",
+		});
+		db.insert(workspacePanels)
+			.values(panelRow("panel-n1", "ws", "n1"))
+			.run();
+	}
+
+	it("closing a grouped narrator tab removes its panel membership and announces it", async () => {
+		seedGroupedWorkspaceWithNarrator();
+		// A chapter tab grouped under the workspace via its narrator: it must be
+		// released to the top level with the narrator's membership, matching what
+		// `removeWorkspacePanel`'s projection does in the reverse direction.
+		db.insert(userRecentTabs)
+			.values({
+				id: "tab-ch1",
+				userId: "workspace-user",
+				tabKey: "chapter:ch1",
+				section: "work",
+				type: "chapter",
+				entityId: "ch1",
+				narratorId: "n1",
+				workspaceId: "ws",
+				title: "ch1",
+				lastVisitedAt: 99,
+				sortOrder: 2,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		broadcasts.length = 0;
+
+		const result = await removeRecentTab("workspace-user", "narrator", "n1");
+
+		expect(result.changed).toBe(true);
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(0);
+		expect(
+			db.select().from(userRecentTabs).where(eq(userRecentTabs.tabKey, "narrator:n1")).all(),
+		).toHaveLength(0);
+		// The chapter tab survives but is released from the group.
+		expect(
+			db
+				.select({ workspaceId: userRecentTabs.workspaceId })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.tabKey, "chapter:ch1"))
+				.get()?.workspaceId,
+		).toBe(null);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
+		]);
+	});
+
+	it("closing a grouped CHAPTER tab keeps its narrator's membership", async () => {
+		seedGroupedWorkspaceWithNarrator();
+		// A chapter tab groups with the workspace only because its narrator is a
+		// member (`getTabNarratorId` maps it); the chapter itself is not a panel.
+		db.insert(userRecentTabs)
+			.values({
+				id: "tab-ch1",
+				userId: "workspace-user",
+				tabKey: "chapter:ch1",
+				section: "work",
+				type: "chapter",
+				entityId: "ch1",
+				narratorId: "n1",
+				workspaceId: "ws",
+				title: "ch1",
+				lastVisitedAt: 99,
+				sortOrder: 2,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		broadcasts.length = 0;
+
+		await removeRecentTab("workspace-user", "chapter", "ch1");
+
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(1);
+		expect(workspaceChangedEvents()).toEqual([]);
+	});
+
+	it("closing an UNGROUPED narrator tab announces nothing", async () => {
+		seedUser();
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 0,
+		});
+		broadcasts.length = 0;
+
+		await removeRecentTab("workspace-user", "narrator", "n1");
+
+		expect(workspaceChangedEvents()).toEqual([]);
+	});
+
+	// Undo restores the tab rows; the cascaded membership row must come back in
+	// the same transaction, or the restored tab would group under a workspace
+	// that no longer contains the narrator.
+	it("undoing a grouped narrator close restores the membership row and announces it", async () => {
+		seedGroupedWorkspaceWithNarrator();
+		broadcasts.length = 0;
+
+		const closed = await removeRecentTab("workspace-user", "narrator", "n1", {
+			storeUndo: true,
+		});
+		expect(closed.undoToken).toBeDefined();
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(0);
+		broadcasts.length = 0;
+
+		const restored = await restoreRecentTabs("workspace-user", { token: closed.undoToken });
+
+		expect(restored.changed).toBe(true);
+		const rows = db
+			.select()
+			.from(workspacePanels)
+			.where(eq(workspacePanels.workspaceId, "ws"))
+			.all();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.narratorId).toBe("n1");
+		// The tab is back in the group.
+		expect(
+			db
+				.select({ workspaceId: userRecentTabs.workspaceId })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
+				.get()?.workspaceId,
+		).toBe("ws");
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "membership" },
+		]);
+	});
+});
+
+// Every path that deletes a workspaces row must announce it, or a device holding
+// that workspace open refetches into a 404 and sits on its loader forever.
+describe("workspace deletion announcements beyond the route", () => {
+	function workspaceChangedEvents(): Array<Record<string, unknown>> {
+		return broadcasts
+			.map(({ event }) => event)
+			.filter((event) => event.type === "workspace_changed");
+	}
+
+	it("closing the workspace HEADER tab deletes the row and announces it", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		broadcasts.length = 0;
+
+		// The route DELETE normally removes the row first; this covers the path
+		// where it did not (its failure is swallowed client-side) and the
+		// recent-tabs mutation is the one that actually deletes.
+		await removeRecentTab("workspace-user", "workspace", "ws");
+
+		expect(
+			db.select({ id: workspaces.id }).from(workspaces).where(eq(workspaces.id, "ws")).get(),
+		).toBe(undefined);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
+		]);
+	});
+
+	it("the deferred cleanup announces workspaces it deletes", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		// A workspace unit with no active narrators is dropped by this scope; its
+		// deletion is deferred past the undo window.
+		const cleared = await clearRecentTabs("workspace-user", "inactive_narrators");
+		expect(cleared.removedCount).toBe(1);
+		expect(
+			db.select({ id: workspaces.id }).from(workspaces).where(eq(workspaces.id, "ws")).get(),
+		).toEqual({ id: "ws" });
+		broadcasts.length = 0;
+
+		const removed = await runExpiredRecentTabsWorkspaceCleanup(Date.now() + 60_000);
+
+		expect(removed).toBe(1);
+		expect(
+			db.select({ id: workspaces.id }).from(workspaces).where(eq(workspaces.id, "ws")).get(),
+		).toBe(undefined);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
+		]);
+	});
+
+	// The route DELETE and the recent-tabs mutation both delete the row and both
+	// announce it; with a header tab present the mutation wins, so the route must
+	// stay silent rather than emit a second frame.
+	it("route DELETE with a header tab announces exactly once", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		broadcasts.length = 0;
+
+		const response = await app.request("/workspaces/ws", { method: "DELETE" });
+
+		expect(response.status).toBe(200);
+		expect(workspaceChangedEvents()).toEqual([
+			{ type: "workspace_changed", workspaceId: "ws", reason: "deleted" },
+		]);
 	});
 });

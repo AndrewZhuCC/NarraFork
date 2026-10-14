@@ -28,6 +28,7 @@
  * - Membership never silently exceeds `WORKSPACE_PANEL_MAX`.
  */
 
+import type { WorkspaceChangeReason } from "@shared/workspace-events";
 import {
 	isWorkspacePanelKind,
 	WORKSPACE_PANEL_CONFIG_MAX_BYTES,
@@ -42,12 +43,36 @@ import { userRecentTabs, workspacePanels, workspaces } from "../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { broadcastToUser } from "../websocket/narrator-ws";
 import { applyWorkspaceMembershipProjection } from "./recent-tabs-service";
 
 type WorkspacePanelRow = typeof workspacePanels.$inferSelect;
 
 /** Gap between sort orders so a later insert can land between two panels. */
 const SORT_ORDER_GAP = 1_000;
+
+/**
+ * Tell this user's OTHER connected devices that a workspace they may have open
+ * changed, so they re-fetch instead of waiting for a window refocus.
+ *
+ * The frame is an invalidation signal (ids + revision only); the arrangement
+ * blob stays on the HTTP read path. Membership writes do not bump
+ * `layoutRevision`, so it is only carried for layout saves.
+ */
+function broadcastWorkspaceChanged(
+	userId: string,
+	workspaceId: string,
+	reason: WorkspaceChangeReason,
+	layoutRevision?: number,
+): void {
+	try {
+		broadcastToUser(userId, { type: "workspace_changed", workspaceId, reason, layoutRevision });
+	} catch (error) {
+		// A broadcast must never fail the write it announces: the mutation already
+		// committed, and the next focus/refetch still converges the other devices.
+		logger.warn("workspace change broadcast failed", { workspaceId, reason, error });
+	}
+}
 
 /**
  * Whether a stored row is still a membership kind.
@@ -420,6 +445,8 @@ export async function addWorkspacePanel(
 		db.insert(workspacePanels).values(row).run();
 	}
 
+	broadcastWorkspaceChanged(userId, workspaceId, "membership");
+
 	return {
 		panel: {
 			id,
@@ -457,9 +484,10 @@ export async function removeWorkspacePanel(
 			workspaceId: null,
 			panelMembership: { action: "remove", panelId: row.id },
 		});
-		return;
+	} else {
+		db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
 	}
-	db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
+	broadcastWorkspaceChanged(userId, workspaceId, "membership");
 }
 
 /** Rejection code for a layout save that raced another client. */
@@ -515,7 +543,9 @@ export async function saveWorkspaceLayout(
 		});
 		throw new WorkspaceLayoutConflictError(current?.layoutRevision ?? 0);
 	}
-	return { layoutRevision: updated[0].layoutRevision };
+	const layoutRevision = updated[0].layoutRevision;
+	broadcastWorkspaceChanged(userId, workspaceId, "layout", layoutRevision);
+	return { layoutRevision };
 }
 
 /**

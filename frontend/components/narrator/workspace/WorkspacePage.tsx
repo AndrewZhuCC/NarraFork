@@ -21,7 +21,7 @@ import {
 	IconPencil,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -29,7 +29,12 @@ import {
 	refreshRecentTabsLoadedWindow,
 	updateRecentTabLocal,
 } from "../../../hooks/useRecentTabs";
-import { useUpdateWorkspace, useWorkspace, workspaceQueryKey } from "../../../hooks/useWorkspace";
+import {
+	useUpdateWorkspace,
+	useWorkspace,
+	useWorkspaceChangeSync,
+	workspaceQueryKey,
+} from "../../../hooks/useWorkspace";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "../../../lib/safe-area";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { WebviewLeafConfig } from "../split-tree";
@@ -58,10 +63,32 @@ export function WorkspacePage({
 }) {
 	const qc = useQueryClient();
 	const { t } = useTranslation("narrators");
+	const navigate = useNavigate();
 	const { data: workspace, isLoading } = useWorkspace(workspaceId);
 	const updateWorkspace = useUpdateWorkspace();
 	const updateRef = useRef(updateWorkspace);
 	updateRef.current = updateWorkspace;
+
+	/**
+	 * The workspace was deleted on another device. Leave rather than invalidate:
+	 * the re-fetch would 404 and strand the page on its loading spinner. The
+	 * sidebar tab is released separately by the recent-tabs delta.
+	 */
+	const handleWorkspaceDeleted = useCallback(() => {
+		if (chrome === "window") {
+			// Workspace windows are script-opened, so this works; if a browser ever
+			// refuses (window not script-opened), the page stays on its loader and
+			// the user closes it — an accepted fallback.
+			window.close();
+			return;
+		}
+		void navigate({ to: "/narrators" });
+	}, [chrome, navigate]);
+
+	// Cross-device sync: another device's layout save / membership change / rename
+	// invalidates this view's query; deletion navigates away. Without this the view
+	// only converged on a window refocus.
+	useWorkspaceChangeSync(workspaceId, handleWorkspaceDeleted);
 
 	// ── Editable title ──
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
