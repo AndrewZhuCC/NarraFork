@@ -357,7 +357,30 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						}
 					});
 					await bounded(page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }));
-					await bounded(page.waitForFunction(() => window.__editorRealIo?.state().ready));
+					// waitForFunction holds a CDP call until ready, longer than the 15s
+					// protocol budget. Short observations preserve the page's 20s ready budget.
+					const readyBudgetMs = page.getDefaultTimeout();
+					const readyDeadline = performance.now() + readyBudgetMs;
+					let readyTimer: ReturnType<typeof setTimeout> | undefined;
+					const readyExpired = new Promise<never>((_, reject) => {
+						readyTimer = setTimeout(
+							() => reject(new Error("Editor readiness timed out")),
+							readyBudgetMs,
+						);
+					});
+					try {
+						while (true) {
+							const ready = await Promise.race([
+								bounded(page.evaluate(() => !!window.__editorRealIo?.state().ready)),
+								readyExpired,
+							]);
+							if (performance.now() >= readyDeadline) throw new Error("Editor readiness timed out");
+							if (ready) break;
+							await Promise.race([delay(50, undefined, { signal: deadline.signal }), readyExpired]);
+						}
+					} finally {
+						clearTimeout(readyTimer);
+					}
 					const initial = await page.evaluate(() => window.__editorRealIo.state());
 					expect(initial.dirty).toBe(false);
 					expect(initial.length).toBe(originalText.length);

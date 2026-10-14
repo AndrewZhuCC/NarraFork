@@ -75,6 +75,28 @@ describe("buildPluginDockPanelOpenRequest", () => {
 		expect(parsePluginDockPanelParams(request.params)?.contributionId).toBe("dashboard");
 	});
 
+	test("keeps generated host IDs valid from the workspace picker through panel parsing", () => {
+		const workspaceId = "_ABCDEFGHIJKLMNOPQRST";
+		const narratorId = "-ABCDEFGHIJKLMNOPQRST";
+		const request = buildPluginDockPanelOpenRequest({
+			pick: {
+				pluginId: "com.example.review",
+				contributionId: "dashboard",
+				title: "Review",
+				version: "1.0.0",
+				hash: "a".repeat(64),
+				scope: "global",
+			},
+			hostContext: { surface: "workspace", workspaceId, narratorId },
+			panels: [{ id: "chat-1", params: { panelType: "chat" } }],
+		});
+		expect(parsePluginDockPanelParams(request.params)?.binding).toEqual({
+			kind: "workspace-narrator",
+			workspaceId,
+			ownerNarratorId: narratorId,
+		});
+	});
+
 	test("keeps workspace surface binding for a narrator-scope view", () => {
 		const request = buildPluginDockPanelOpenRequest({
 			pick: {

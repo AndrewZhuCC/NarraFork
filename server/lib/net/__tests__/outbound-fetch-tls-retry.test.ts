@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createServer as createHttpsServer } from "node:https";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { generate } from "selfsigned";
@@ -23,9 +23,9 @@ afterEach(async () => {
 
 /**
  * A TLS listener that swallows the ClientHello and drops the connection without
- * ever answering. Bun reports this as UNKNOWN_CERTIFICATE_VERIFICATION_ERROR:
- * the handshake was disturbed and no X509 verify code explains why — exactly the
- * shape produced by a relay/VPN/interception box interfering mid-handshake.
+ * ever answering. Bun 1.4.3 reports ECONNRESET, indistinguishable from a reset
+ * after sending HTTP request bytes. Even though this fixture knows no request
+ * reached the server, production cannot assume that for an arbitrary POST.
  */
 async function startHandshakeDroppingServer(): Promise<{
 	url: string;
@@ -83,7 +83,7 @@ async function startSelfSignedServer(): Promise<{ url: string; connections: () =
 }
 
 describe("outbound fetch TLS handshake replay", () => {
-	test("replays a disturbed handshake even for a non-idempotent POST", async () => {
+	test("does not replay a POST when a disturbed handshake reports ambiguous ECONNRESET", async () => {
 		const { url, connections } = await startHandshakeDroppingServer();
 
 		let thrown: unknown;
@@ -97,10 +97,45 @@ describe("outbound fetch TLS handshake replay", () => {
 			thrown = error;
 		}
 
-		// The handshake never delivered a request byte, so the replay cannot
-		// duplicate a side effect — POST is replayed despite the idempotent-only policy.
-		expect((thrown as { code?: string })?.code).toBe("UNKNOWN_CERTIFICATE_VERIFICATION_ERROR");
+		// ECONNRESET alone cannot prove the handshake failed before request delivery.
+		// Keep the non-idempotent POST at exactly one attempt.
+		expect((thrown as { code?: string })?.code).toBe("ECONNRESET");
+		expect(connections()).toBe(1);
+	});
+
+	test("replays a disturbed-handshake ECONNRESET once for an idempotent GET", async () => {
+		const { url, connections } = await startHandshakeDroppingServer();
+		let thrown: unknown;
+		try {
+			await outboundFetch(url, { method: "GET" }, { retryPolicy: "idempotent-only" });
+		} catch (error) {
+			thrown = error;
+		}
+		expect((thrown as { code?: string })?.code).toBe("ECONNRESET");
 		expect(connections()).toBe(2);
+	});
+
+	test("retains POST replay for the explicit legacy handshake error code", async () => {
+		// Unlike ECONNRESET, this legacy code is explicit handshake evidence. Keep that
+		// existing classification without reclassifying ordinary resets as TLS failures.
+		const fetchSpy = spyOn(globalThis, "fetch")
+			.mockRejectedValueOnce(
+				Object.assign(new TypeError("unknown certificate verification error"), {
+					code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
+				}),
+			)
+			.mockResolvedValueOnce(new Response("recovered"));
+		try {
+			const response = await outboundFetch(
+				"https://example.invalid/legacy",
+				{ method: "POST", body: "{}" },
+				{ retryPolicy: "idempotent-only" },
+			);
+			expect(await response.text()).toBe("recovered");
+			expect(fetchSpy).toHaveBeenCalledTimes(2);
+		} finally {
+			fetchSpy.mockRestore();
+		}
 	});
 
 	test("does not replay when the caller opted out of retries", async () => {
@@ -134,7 +169,7 @@ describe("outbound fetch TLS handshake replay", () => {
 		expect(thrown).toBeInstanceOf(Error);
 	});
 
-	test("succeeds on the replay when the handshake recovers", async () => {
+	test("succeeds on an idempotent GET replay when the handshake recovers", async () => {
 		const generated = await generate([{ name: "commonName", value: "localhost" }], {
 			keySize: 2048,
 			algorithm: "sha256",
@@ -187,7 +222,7 @@ describe("outbound fetch TLS handshake replay", () => {
 
 		const response = await outboundFetch(
 			`https://127.0.0.1:${address.port}/v1/chat`,
-			{ method: "POST", body: "{}" },
+			{ method: "GET" },
 			{ retryPolicy: "idempotent-only", tlsRejectUnauthorized: false },
 		);
 

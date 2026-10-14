@@ -85,11 +85,11 @@ async function worker(
 
 describe("strict CI builds fail closed without compiling or publishing", () => {
 	test("requires exact pinned Bun and a complete commit", () => {
-		validateCiBuildIdentity("bun@1.4.2", "1.4.2", identity.commit);
-		for (const pin of [undefined, "bun@latest", "bun@^1.4.2", "bun@1.4.1"]) {
-			expect(() => validateCiBuildIdentity(pin, "1.4.2", identity.commit)).toThrow("Bun");
+		validateCiBuildIdentity("bun@1.4.3", "1.4.3", identity.commit);
+		for (const pin of [undefined, "bun@latest", "bun@^1.4.3", "bun@1.4.2"]) {
+			expect(() => validateCiBuildIdentity(pin, "1.4.3", identity.commit)).toThrow("Bun");
 		}
-		expect(() => validateCiBuildIdentity("bun@1.4.2", "1.4.2", "a123456")).toThrow("commit");
+		expect(() => validateCiBuildIdentity("bun@1.4.3", "1.4.3", "a123456")).toThrow("commit");
 	});
 	test("macOS uses system codesign, verifies, and propagates sign/verify failures", async () => {
 		const commands: string[][] = [];

@@ -7,6 +7,8 @@
  * omitting the key entirely are all still routed through the ambient proxy.
  * Verified behaviour on Bun 1.3.14 for an `https://` target with `HTTPS_PROXY`
  * exported: every one of those forms produced a CONNECT to the proxy.
+ * Bun 1.4.3 adds `proxy: false`, now used by outbound-fetch for direct requests.
+ * Keep startup neutralization as defence in depth for other native fetch call sites.
  *
  * That silently breaks NarraFork's proxy policy. A user who selects "direct"
  * globally, or "direct" as a per-provider override, still has their traffic sent

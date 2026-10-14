@@ -79,7 +79,7 @@ async function fixture(channels: ("stable" | "beta")[] = ["beta"]) {
 			version: "2.0.0",
 			commit: "a".repeat(40),
 			workflowCommit: "b".repeat(40),
-			bunVersion: "1.4.2",
+			bunVersion: "1.4.3",
 			channel: "stable",
 			changelog: { version: "2.0.0", date: "2026-10-09", en: "Release", "zh-CN": "发布" },
 			runId: 12,

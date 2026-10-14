@@ -39,7 +39,7 @@ async function fixture() {
 			tag: "v0.9.1",
 			commit: "05a12a3148b8d985a78e24ffe2d1570ae6bbf970",
 			workflowCommit: "b".repeat(40),
-			bunVersion: "1.4.2",
+			bunVersion: "1.4.3",
 			channel: "beta",
 			changelog: { version: "0.9.1", date: "2026-10-09", en: "release", "zh-CN": "发布" },
 			runId: 38238815855,
