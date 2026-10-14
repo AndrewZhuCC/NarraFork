@@ -185,6 +185,7 @@ export const DEFAULTS: NarraForkSettings = {
 		useWebSearch: true,
 		useImageGeneration: true,
 		useRemoteCompact: false,
+		useComposer: false,
 		// Present the built-in Codex adapter as the real Codex CLI by default.
 		userAgentMode: "codex",
 	},
@@ -968,6 +969,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"codex.useImageGeneration": {
 		desc: "是否向 Codex 请求注入原生 image_generation 图像生成工具。关闭后不再发送该工具。默认开启。",
 		type: "boolean",
+	},
+	"codex.useComposer": {
+		desc: "主叙述者正常结束后，用当前 Codex 模型生成下一条输入建议。默认关闭；仅显示为空输入框占位文字，不自动发送。",
+		type: "boolean",
+	},
+	"codex.composerPrompt": {
+		desc: "Codex 输入建议提示词，最多 16000 字符；留空使用内置 v5 提示词。",
+		type: "string",
 	},
 	"codex.userAgentMode": {
 		desc: "内置 Codex 适配器出站请求呈现的 User-Agent 模式（narrafork / claude-code / codex / custom）。默认 codex，仿真真实 Codex CLI。",

@@ -99,6 +99,7 @@
 		"pageNumber": "页码",
 		"go": "跳转"
 	},
+	"composerAcceptSuggestion": "采用建议",
 	"asyncQuestionResolved": "Agent 已回应",
 	"asyncQuestionPending": "已回答，待 Agent 回应",
 	"asyncQuestionLater": "可稍后回答",

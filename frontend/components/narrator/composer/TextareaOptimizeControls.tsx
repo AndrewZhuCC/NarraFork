@@ -50,6 +50,8 @@ export interface TextareaOptimizeControlsProps {
 	onOptimize: (style: OptimizeStyle) => void;
 	onCancelOptimize: () => void;
 	onExpand?: () => void;
+	/** Reuse the unavailable optimize slot while an empty composer shows a suggestion. */
+	onAcceptSuggestion?: () => void;
 	/** Number of context messages (for display in hint), default 10 */
 	contextMessageCount?: number;
 	/** Allow user to change context message count in dropdown */
@@ -72,6 +74,17 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 						onClick={props.onCancelOptimize}
 					>
 						<IconX size={16} />
+					</ActionIcon>
+				</Tooltip>
+			) : props.onAcceptSuggestion ? (
+				<Tooltip label={t("composerAcceptSuggestion")} position="top">
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						aria-label={t("composerAcceptSuggestion")}
+						onClick={props.onAcceptSuggestion}
+					>
+						<IconCheck size={16} />
 					</ActionIcon>
 				</Tooltip>
 			) : (

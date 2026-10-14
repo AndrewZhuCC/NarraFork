@@ -18,6 +18,11 @@ import {
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
+export interface CodexComposerSettings {
+	useComposer: boolean;
+	composerPrompt: string;
+}
+
 export type SearchChannelKind = "native" | "nug-mcp" | "custom-api" | "subagent" | "plugin";
 
 export interface SearchChannelConfig {

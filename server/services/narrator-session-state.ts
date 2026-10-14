@@ -187,6 +187,8 @@ export interface ActiveNarrator {
 	_loopRunning?: boolean;
 	/** Queued input is only restarted after the complete loop finalizer released admission. */
 	_resumeBufferedAfterLoop?: boolean;
+	/** Ephemeral primary-run identity for optional Composer work after owner release. */
+	_composerGeneration?: string;
 	/**
 	 * The user who triggered the current loop turn (set on each runAgentLoop / message feed).
 	 * Flows into ToolContext.userId for per-turn knowledge-base ACL. null when triggered by

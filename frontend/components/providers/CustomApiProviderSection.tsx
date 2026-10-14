@@ -11,9 +11,14 @@ import {
 	Stack,
 	Switch,
 	Text,
+	Textarea,
 	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import {
+	CODEX_COMPOSER_MAX_PROMPT_CHARS,
+	DEFAULT_CODEX_COMPOSER_PROMPT,
+} from "@shared/codex-composer";
 import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -575,6 +580,50 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 							checked={provider.codexRemoteCompact === true}
 							onChange={(e) => updateProvider("codexRemoteCompact", e.currentTarget.checked)}
 						/>
+						<Switch
+							label={t("codexUseComposer")}
+							description={t("codexUseComposerDesc")}
+							size="xs"
+							checked={provider.codexComposerEnabled === true}
+							onChange={(e) => updateProvider("codexComposerEnabled", e.currentTarget.checked)}
+						/>
+						{provider.codexComposerEnabled && (
+							<Stack gap="xs">
+								<Textarea
+									label={t("codexComposerPrompt")}
+									description={t("codexComposerPromptDesc", {
+										max: CODEX_COMPOSER_MAX_PROMPT_CHARS,
+									})}
+									value={provider.codexComposerPrompt || DEFAULT_CODEX_COMPOSER_PROMPT}
+									maxLength={CODEX_COMPOSER_MAX_PROMPT_CHARS}
+									minRows={5}
+									maxRows={12}
+									autosize
+									size="xs"
+									onChange={(e) =>
+										updateProvider(
+											"codexComposerPrompt",
+											e.currentTarget.value.slice(0, CODEX_COMPOSER_MAX_PROMPT_CHARS),
+										)
+									}
+									onBlur={(e) => {
+										if (!e.currentTarget.value.trim())
+											updateProvider("codexComposerPrompt", DEFAULT_CODEX_COMPOSER_PROMPT);
+									}}
+								/>
+								<Group justify="flex-end">
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										onClick={() =>
+											updateProvider("codexComposerPrompt", DEFAULT_CODEX_COMPOSER_PROMPT)
+										}
+									>
+										{t("codexComposerRestoreDefault")}
+									</Button>
+								</Group>
+							</Stack>
+						)}
 					</>
 				)}
 

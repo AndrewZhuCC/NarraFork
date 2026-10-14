@@ -52,7 +52,7 @@ import {
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
-import { settings } from "./lib/settings";
+import { settings, subscribeSettingsChanges } from "./lib/settings";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import { supportsStableUpdateSignal } from "./lib/stable-update-install";
@@ -74,6 +74,10 @@ import {
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
 import { activateSqliteRuntimePublication } from "./services/agent-runtime/publication";
+import {
+	invalidateChangedComposerSettings,
+	shutdownComposerSuggestions,
+} from "./services/narrator-composer";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
@@ -215,6 +219,7 @@ if (activeDatabaseBackend === "sqlite") {
 
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
 startEventLoopMonitor();
+subscribeSettingsChanges(invalidateChangedComposerSettings);
 
 // Diagnose old-install permissions before the first tool call, without blocking
 // HTTP/login or the administrator's repair UI. This reads directory metadata only.
@@ -1829,6 +1834,7 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
+		await shutdownStep(tracker, "composer.cancel", shutdownComposerSuggestions, 3_000);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);

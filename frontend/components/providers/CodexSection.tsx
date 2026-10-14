@@ -33,9 +33,12 @@ import {
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
-
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import {
+	CODEX_COMPOSER_MAX_PROMPT_CHARS,
+	DEFAULT_CODEX_COMPOSER_PROMPT,
+} from "@shared/codex-composer";
 import {
 	IconArchive,
 	IconArchiveOff,
@@ -60,6 +63,7 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/api/client";
+import type { CodexComposerSettings } from "../../lib/api/settings";
 import type {
 	CodexAuthMode,
 	CodexLoadBalancingMode,
@@ -498,6 +502,18 @@ export const CodexSection = React.memo(function CodexSection({
 	const [useImageGenerationInitialized, setUseImageGenerationInitialized] = useState(false);
 	const [useRemoteCompact, setUseRemoteCompact] = useState(false);
 	const [useRemoteCompactInitialized, setUseRemoteCompactInitialized] = useState(false);
+	const [useComposer, setUseComposer] = useState(false);
+	const [composerPrompt, setComposerPrompt] = useState(DEFAULT_CODEX_COMPOSER_PROMPT);
+	const [composerInitialized, setComposerInitialized] = useState(false);
+	useEffect(() => {
+		if (!codexSettingsData || composerInitialized) return;
+		const composer = codexSettingsData.codex as Partial<CodexComposerSettings> | undefined;
+		setUseComposer(composer?.useComposer === true);
+		setComposerPrompt(
+			composer?.composerPrompt?.trim() ? composer.composerPrompt : DEFAULT_CODEX_COMPOSER_PROMPT,
+		);
+		setComposerInitialized(true);
+	}, [codexSettingsData, composerInitialized]);
 	const [tierOrder, setTierOrder] = useState<CodexPlanTier[]>(CODEX_DEFAULT_TIER_ORDER);
 	const [fingerprint, setFingerprint] = useState<{
 		userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
@@ -843,6 +859,16 @@ export const CodexSection = React.memo(function CodexSection({
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			notifications.show({ message: t("codexRemoteCompactUpdated"), color: "green" });
+		},
+	});
+	const composerMut = useMutation({
+		mutationFn: (composer: CodexComposerSettings) => api.updateSettings({ codex: composer }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("codexComposerUpdated"), color: "green" });
+		},
+		onError: (err: Error) => {
+			notifications.show({ message: err.message, color: "red" });
 		},
 	});
 	const tierOrderMut = useMutation({
@@ -1444,6 +1470,73 @@ export const CodexSection = React.memo(function CodexSection({
 									{t("codexSave")}
 								</Button>
 							</Group>
+							<Group align="flex-end">
+								<Stack gap={4} style={{ flex: 1 }}>
+									<Text size="xs" fw={500}>
+										{t("codexUseComposer")}
+									</Text>
+									<Text size="xs" c="dimmed">
+										{t("codexUseComposerDesc")}
+									</Text>
+								</Stack>
+								<Switch
+									size="sm"
+									checked={useComposer}
+									aria-label={t("codexUseComposer")}
+									onChange={(e) => setUseComposer(e.currentTarget.checked)}
+									disabled={!canReadCodexStatus || !composerInitialized}
+								/>
+								<Button
+									size="xs"
+									onClick={() =>
+										composerMut.mutate({
+											useComposer,
+											composerPrompt: composerPrompt.trim() || DEFAULT_CODEX_COMPOSER_PROMPT,
+										})
+									}
+									loading={composerMut.isPending}
+									disabled={
+										!canReadCodexStatus ||
+										!composerInitialized ||
+										composerPrompt.length > CODEX_COMPOSER_MAX_PROMPT_CHARS
+									}
+								>
+									{t("codexSave")}
+								</Button>
+							</Group>
+							{useComposer && (
+								<Stack gap="xs">
+									<Textarea
+										label={t("codexComposerPrompt")}
+										description={t("codexComposerPromptDesc", {
+											max: CODEX_COMPOSER_MAX_PROMPT_CHARS,
+										})}
+										value={composerPrompt}
+										placeholder={DEFAULT_CODEX_COMPOSER_PROMPT}
+										maxLength={CODEX_COMPOSER_MAX_PROMPT_CHARS}
+										minRows={5}
+										maxRows={12}
+										autosize
+										size="xs"
+										disabled={!canReadCodexStatus}
+										onChange={(e) =>
+											setComposerPrompt(
+												e.currentTarget.value.slice(0, CODEX_COMPOSER_MAX_PROMPT_CHARS),
+											)
+										}
+									/>
+									<Group justify="flex-end">
+										<Button
+											size="compact-xs"
+											variant="subtle"
+											disabled={!canReadCodexStatus}
+											onClick={() => setComposerPrompt(DEFAULT_CODEX_COMPOSER_PROMPT)}
+										>
+											{t("codexComposerRestoreDefault")}
+										</Button>
+									</Group>
+								</Stack>
+							)}
 						</Stack>
 
 						{/* Client fingerprint */}

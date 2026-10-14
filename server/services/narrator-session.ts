@@ -146,6 +146,11 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
+import {
+	beginComposerRun,
+	invalidateComposerSuggestion,
+	startComposerPrediction,
+} from "./narrator-composer";
 import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
@@ -2885,35 +2890,57 @@ export async function runAgentLoop(
 	}
 	try {
 		const launch = await withNarratorStartAdmission(narratorId, async () => {
-			if (
-				narratorLoopAdmissions.has(narratorId) ||
-				narratorToolExecutionAdmissions.has(narratorId)
-			) {
+			if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId))
 				return null;
-			}
 			const owner = tryClaimExecution(narratorId, "primary");
 			if (!owner) return null;
-			// Release and the final mailbox check form one synchronous owner transition.
+			let composerGeneration = beginComposerRun(narratorId);
+			active._composerGeneration = composerGeneration;
 			let allowInboxWake = false;
+			let allowComposer = false;
 			const completion = withNarratorWorkAdmission(narratorId, () =>
 				runAgentLoopUnlocked(active, owner, text, images, { kind: "primary", reasoningEffort }),
 			)
 				.then((result) => {
 					allowInboxWake = result.allowInboxWake ?? false;
+					allowComposer = result.started && !result.hasError && !result.aborted;
 					return { started: result.started };
 				})
 				.finally(() => {
-					if (owner.release() && allowInboxWake)
+					if (owner.isCurrent())
+						composerGeneration = active._composerGeneration ?? composerGeneration;
+					if (!allowComposer) invalidateComposerSuggestion(narratorId, composerGeneration);
+					// Release foreground ownership before considering this optional request.
+					if (owner.release() && allowInboxWake) {
 						void (async () => {
 							await retryDeferredQuestionAnswerDeliveries(narratorId, active.locale);
-							if (await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"]))
+							if (await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) {
+								invalidateComposerSuggestion(narratorId, composerGeneration);
 								await wakeInboxIfEligible(narratorId, active.locale);
+							} else if (allowComposer && !getExecutionOwner(narratorId)) {
+								const current = await db.query.narrators.findFirst({
+									where: eq(narrators.id, narratorId),
+									columns: { type: true, variant: true, status: true },
+								});
+								if (
+									current?.type === "primary" &&
+									!isSubagentVariant(current.variant) &&
+									current.status === "idle" &&
+									!getExecutionOwner(narratorId)
+								) {
+									startComposerPrediction(narratorId, composerGeneration);
+								} else {
+									invalidateComposerSuggestion(narratorId, composerGeneration);
+								}
+							}
 						})().catch((error) => {
+							invalidateComposerSuggestion(narratorId, composerGeneration);
 							logger.warn("Inbox wake check deferred after loop release", {
 								narratorId,
 								error: String(error),
 							});
 						});
+					}
 				});
 			return { completion };
 		});
@@ -3641,6 +3668,7 @@ export async function acceptUserMessage(
 					queueMode,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
+				invalidateComposerSuggestion(narratorId);
 				const queued = {
 					buffered: true as const,
 					id: accepted.id,

@@ -125,6 +125,8 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		codexWebSearch: legacyPlainResponses(provider) ? false : provider.codexWebSearch,
 		codexImageGeneration: legacyPlainResponses(provider) ? false : provider.codexImageGeneration,
 		codexRemoteCompact: provider.codexRemoteCompact,
+		codexComposerEnabled: provider.codexComposerEnabled,
+		codexComposerPrompt: provider.codexComposerPrompt,
 		userAgentMode:
 			provider.userAgentMode ?? (legacyPlainResponses(provider) ? "narrafork" : undefined),
 		customUserAgent: provider.customUserAgent,
@@ -201,6 +203,8 @@ export function deriveCustomApiProvidersFromLegacy(
 				codexWebSearch: existing.codexWebSearch,
 				codexImageGeneration: existing.codexImageGeneration,
 				codexRemoteCompact: existing.codexRemoteCompact,
+				codexComposerEnabled: existing.codexComposerEnabled,
+				codexComposerPrompt: existing.codexComposerPrompt,
 			});
 			continue;
 		}
@@ -234,6 +238,8 @@ export function customApiProviderToOpenAI(
 		codexWebSearch: provider.codexWebSearch,
 		codexImageGeneration: provider.codexImageGeneration,
 		codexRemoteCompact: provider.codexRemoteCompact,
+		codexComposerEnabled: provider.codexComposerEnabled,
+		codexComposerPrompt: provider.codexComposerPrompt,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -361,6 +367,8 @@ export function normalizeCustomApiProvider(
 		codexImageGeneration:
 			migratedDefaults.codexImageGeneration ?? provider.codexImageGeneration ?? true,
 		codexRemoteCompact: provider.codexRemoteCompact ?? false,
+		codexComposerEnabled: provider.codexComposerEnabled ?? false,
+		codexComposerPrompt: provider.codexComposerPrompt,
 		nativeSearch: migratedDefaults.nativeSearch ?? provider.nativeSearch,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		// Materialize the protocol default so UI display, storage, and the wire

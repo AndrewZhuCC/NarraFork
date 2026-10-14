@@ -1196,6 +1196,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId, "custom-traits"] });
 			},
+			onComposerSuggestionChanged: () => {
+				if (isSubagent) return;
+				const filters = { queryKey: ["narrators", narratorId, "composer-suggestion"], exact: true };
+				// Cancel even an initial GET so its old cache snapshot cannot win after this event.
+				void qc.cancelQueries(filters).then(() => qc.invalidateQueries(filters));
+			},
 			onDraftChanged: (draft) => {
 				onDraftChanged?.(draft);
 			},

@@ -3553,6 +3553,11 @@ function NarratorPanelBody({
 							appendInputRef,
 							interruptBtnRef,
 							isActive,
+							isPrimary: !!fetchedNarrator && !isSubagent,
+							composerSuggestionAvailable:
+								!isActive &&
+								!isCompacting &&
+								(narrator?.status === "idle" || narrator?.status === "done"),
 							composerHasText,
 							composerHasAttachments,
 							setComposerHasText,

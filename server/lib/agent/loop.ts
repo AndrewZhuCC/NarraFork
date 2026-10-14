@@ -4034,8 +4034,13 @@ async function* agentLoopInMetadataSnapshot(
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
+			let composerCapture: import("./codex-composer").CodexComposerCapture | undefined;
 
 			const markRequestStarted: NonNullable<ChatParams["onRequestStart"]> = (info) => {
+				if (!config.reflectionLoop) {
+					composerCapture = info?.codexComposerCapture;
+					config.onCodexComposerSeed?.(undefined, requestUserId);
+				}
 				if (!config.reflectionLoop && info?.codexTools) {
 					config.lastCodexTools = {
 						provider: effectiveProvider,
@@ -4931,6 +4936,7 @@ async function* agentLoopInMetadataSnapshot(
 						requestDump,
 						resetUpstreamSession,
 						onRequestStart: markRequestStarted,
+						captureComposerSeed: !!config.onCodexComposerSeed && !config.reflectionLoop,
 						onInputCharacters: async (counts) => {
 							inputCharacters = validInputCharacters(counts);
 							try {
@@ -7455,6 +7461,31 @@ async function* agentLoopInMetadataSnapshot(
 
 			// No tool calls → we're done
 			if (toolUses.length === 0) {
+				if (composerCapture && config.onCodexComposerSeed && assistantText.trim()) {
+					try {
+						// Encode only this final answer with the same adapter as ordinary history.
+						// Do not append the auxiliary prompt or result to the actual conversation.
+						const assistantTurn: unknown[] = [];
+						provider.pushAssistantTurn(
+							assistantTurn,
+							assistantText,
+							[],
+							collectReasoningBlocks(reasoningBlockMap),
+							collectCompletedWebSearches(webSearchAccum),
+							messageId,
+							collectCompletedImageGenerations(imageGenAccum),
+							textOutputIndex,
+							redactedThinkingBlocks,
+							orderedAssistantContent([]),
+						);
+						config.onCodexComposerSeed(composerCapture.finalize(assistantTurn), requestUserId);
+					} catch (error) {
+						logger.warn("Could not capture optional Composer request", {
+							narratorId: config.narratorId,
+							error: String(error),
+						});
+					}
+				}
 				yield { type: "done" };
 				return;
 			}

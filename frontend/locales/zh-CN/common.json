@@ -656,6 +656,7 @@
 	"usageHistoryKind_external": "外部",
 	"usageHistoryKind_narrator": "叙述者",
 	"usageHistoryKind_compact": "压缩",
+	"usageHistoryKind_composer": "输入建议",
 	"usageHistoryKind_context_ask": "上下文问答",
 	"usageHistoryKind_fork_summary": "Fork 摘要",
 	"usageHistoryKind_title": "标题",

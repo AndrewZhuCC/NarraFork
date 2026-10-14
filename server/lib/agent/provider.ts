@@ -96,8 +96,11 @@ export interface ChatParams extends ProtocolChatParams {
 	 * to distinguish a real empty upstream response from local request preparation
 	 * paths that completed without ever contacting the API.
 	 */
+	/** Host-only opt-in, installed exclusively by a primary runtime. */
+	captureComposerSeed?: boolean;
 	onRequestStart?: (info?: {
 		credentialId?: string;
+		codexComposerCapture?: import("./codex-composer").CodexComposerCapture;
 		/** Actual Codex tools on HTTP or WebSocket, including hosted tools, for a reflection to reuse. */
 		codexTools?: unknown[];
 	}) => void;

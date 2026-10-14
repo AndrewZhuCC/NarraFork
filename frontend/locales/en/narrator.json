@@ -99,6 +99,7 @@
 		"pageNumber": "Page number",
 		"go": "Go"
 	},
+	"composerAcceptSuggestion": "Use suggestion",
 	"asyncQuestionResolved": "Agent responded",
 	"asyncQuestionPending": "Answered · awaiting Agent response",
 	"asyncQuestionLater": "You can answer later",

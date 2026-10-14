@@ -12,8 +12,10 @@
  * `response.created` → optional content → `response.completed`.
  */
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { saveSettings, settings } from "@server/lib/settings";
 import type { RecordingFrame, RequestRecording } from "@shared/request-recording";
 import type { ServerWebSocket } from "bun";
+import type { CodexComposerCapture } from "../codex-composer";
 import {
 	CodexWebSocketRetryableError,
 	clearCodexResponsesWebSocketSessions,
@@ -368,6 +370,76 @@ async function runChat(
 	return { events, error };
 }
 
+test("Composer reuses the primary socket without leaking its prediction into a continuation", async () => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		const text = requestIndex === 1 ? '{"suggestion":"next"}' : "ok";
+		for (const frame of completedFrames(`composer-${requestIndex}`, text)) send(frame);
+	});
+	saveSettings({
+		...settings,
+		customApiProviders: [
+			{
+				id: "codex-ws-recovery",
+				name: "Composer test",
+				prefix: "codex-ws-recovery",
+				apiKey: "sk-local-test-only",
+				baseUrl: activeServer.baseUrl,
+				defaultModel: "gpt-5.3-codex",
+				protocol: "openai-responses",
+				codexWebSocket: true,
+				codexComposerEnabled: true,
+			},
+		],
+	});
+	const provider = createChatProvider(activeServer);
+	let capture: CodexComposerCapture | undefined;
+	const context = { stickySessionKey: "main-narrator", workTurnId: "work-one" };
+	const main = await runChat(provider, {
+		...context,
+		captureComposerSeed: true,
+		onRequestStart: (info) => {
+			capture = info?.codexComposerCapture;
+		},
+	});
+	expect(main.error).toBeUndefined();
+	const seed = capture?.finalize([
+		{ role: "assistant", content: [{ type: "output_text", text: "ok" }] },
+	]);
+	if (!seed) throw new Error("Expected primary request capture");
+
+	// An already-cancelled old turn must not reset the reusable foreground socket.
+	const stale = new AbortController();
+	stale.abort();
+	const stopped = streamCodexResponsesWebSocket({
+		baseUrl: activeServer.baseUrl,
+		apiKey: "sk-local-test-only",
+		credentialId: "codex-ws-recovery",
+		model: "codex-ws-recovery:gpt-5.3-codex",
+		sessionKey: "main-narrator",
+		conversationId: "conv-chat-recovery",
+		workTurnId: "stale-turn",
+		request: { model: "gpt-5.3-codex", input: [], stream: true },
+		signal: stale.signal,
+	});
+	await expect(stopped.next()).rejects.toThrow("aborted");
+	const suggestion = await seed.run({ signal: new AbortController().signal });
+	expect(suggestion.text).toBe('{"suggestion":"next"}');
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests[1]?.connectionIndex).toBe(0);
+	expect(activeServer.requests[1]?.body.previous_response_id).toBeUndefined();
+	expect(activeServer.requests[1]?.body.tool_choice).toBe("none");
+	expect(JSON.stringify(activeServer.requests[1]?.body.client_metadata)).toContain(
+		"composer_predictions",
+	);
+
+	const continued = await runChat(provider, { ...context, content: "actual user message" });
+	expect(continued.error).toBeUndefined();
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(JSON.stringify(activeServer.requests[2]?.body.input)).not.toContain(
+		"composer_predictions",
+	);
+});
 function turnStateFrame(turnState = "sticky-1"): string {
 	return JSON.stringify({
 		type: "response.metadata",

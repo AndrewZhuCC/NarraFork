@@ -226,6 +226,7 @@ function SettingsUsagePage() {
 			[
 				"narrator",
 				"compact",
+				"composer",
 				"context_ask",
 				"fork_summary",
 				"title",

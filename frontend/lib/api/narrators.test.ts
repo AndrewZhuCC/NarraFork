@@ -98,6 +98,34 @@ describe("narrators API", () => {
 		});
 	});
 
+	test("Composer reads use only cancelable GET requests and reject oversized responses", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: Array<{ url: string; init?: RequestInit }> = [];
+		let oversized = false;
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string, init?: RequestInit) => {
+				calls.push({ url, init });
+				return Response.json({ suggestion: oversized ? "x".repeat(5_000) : "next message" });
+			},
+		});
+		const controller = new AbortController();
+		expect(await api.getNarratorComposerSuggestion("n1", controller.signal)).toEqual({
+			suggestion: "next message",
+		});
+		expect(calls[0]?.url).toBe("/api/narrators/n1/composer-suggestion");
+		expect(calls[0]?.init?.method ?? "GET").toBe("GET");
+		expect(calls[0]?.init?.body).toBeUndefined();
+		expect(calls[0]?.init?.signal).toBe(controller.signal);
+		oversized = true;
+		await expect(api.getNarratorComposerSuggestion("n1")).rejects.toMatchObject({
+			status: 413,
+		});
+	});
+
 	test("narrator detail forwards optional cancellation signals while legacy callers stay compatible", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

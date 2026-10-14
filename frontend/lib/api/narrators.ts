@@ -1,6 +1,7 @@
 import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
+import type { CodexComposerSuggestion } from "@shared/codex-composer";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { HumanAttentionPage } from "@shared/human-attention";
@@ -683,6 +684,12 @@ export const narratorsApi = {
 	/** Drop the custom avatar, falling back to the procedural identicon. */
 	deleteNarratorAvatar: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/avatar`, { method: "DELETE" }),
+	/** Read the cached suggestion only; this endpoint never generates one. */
+	getNarratorComposerSuggestion: (id: string, signal?: AbortSignal) =>
+		request<CodexComposerSuggestion>(`/narrators/${id}/composer-suggestion`, {
+			signal,
+			maxResponseBytes: 4_096,
+		}),
 	getNarratorDraft: (id: string) =>
 		request<{
 			hasDraft: boolean;

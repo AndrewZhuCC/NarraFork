@@ -115,6 +115,7 @@ import type {
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
+import { invalidateComposerSuggestion } from "./narrator-composer";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -3139,7 +3140,13 @@ export const narratorService = {
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
 	dismissInterruptTaskGuardMessage:
 		narratorMessageQueries.dismissInterruptTaskGuardMessage.bind(narratorMessageQueries),
-	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
+	async deleteMessagesAfter(
+		...args: Parameters<typeof narratorMessageQueries.deleteMessagesAfter>
+	) {
+		const result = await narratorMessageQueries.deleteMessagesAfter(...args);
+		invalidateComposerSuggestion(args[0]);
+		return result;
+	},
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
 	removeCompactingMessage:
@@ -3156,11 +3163,24 @@ export const narratorService = {
 	prepareFailedCompactRetry:
 		narratorPersistence.prepareFailedCompactRetry.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),
-	clearContext: narratorPersistence.clearContext.bind(narratorPersistence),
-	clearContextBefore: narratorPersistence.clearContextBefore.bind(narratorPersistence),
+	async clearContext(...args: Parameters<typeof narratorPersistence.clearContext>) {
+		const result = await narratorPersistence.clearContext(...args);
+		invalidateComposerSuggestion(args[0]);
+		return result;
+	},
+	async clearContextBefore(...args: Parameters<typeof narratorPersistence.clearContextBefore>) {
+		const result = await narratorPersistence.clearContextBefore(...args);
+		invalidateComposerSuggestion(args[0]);
+		return result;
+	},
 	insertSpecClearedCarryoverCard,
-	finalizeCompactingMessage:
-		narratorPersistence.finalizeCompactingMessage.bind(narratorPersistence),
+	async finalizeCompactingMessage(
+		...args: Parameters<typeof narratorPersistence.finalizeCompactingMessage>
+	) {
+		const result = await narratorPersistence.finalizeCompactingMessage(...args);
+		invalidateComposerSuggestion(args[1]);
+		return result;
+	},
 	persistAssistantMessage: narratorPersistence.persistAssistantMessage.bind(narratorPersistence),
 	createPartialAssistantMessage:
 		narratorPersistence.createPartialAssistantMessage.bind(narratorPersistence),
@@ -3174,9 +3194,19 @@ export const narratorService = {
 		narratorPersistence.updateMessageHistoryTokenEstimate.bind(narratorPersistence),
 	updateTitle: narratorPersistence.updateTitle.bind(narratorPersistence),
 	updateCwd: narratorPersistence.updateCwd.bind(narratorPersistence),
-	updateModel: narratorPersistence.updateModel.bind(narratorPersistence),
+	async updateModel(...args: Parameters<typeof narratorPersistence.updateModel>) {
+		const result = await narratorPersistence.updateModel(...args);
+		invalidateComposerSuggestion(args[0]);
+		return result;
+	},
 	updatePermissionMode: narratorPersistence.updatePermissionMode.bind(narratorPersistence),
-	updateReasoningEffort: narratorPersistence.updateReasoningEffort.bind(narratorPersistence),
+	async updateReasoningEffort(
+		...args: Parameters<typeof narratorPersistence.updateReasoningEffort>
+	) {
+		const result = await narratorPersistence.updateReasoningEffort(...args);
+		invalidateComposerSuggestion(args[0]);
+		return result;
+	},
 	updateFastModeOverride: narratorPersistence.updateFastModeOverride.bind(narratorPersistence),
 	updateRelaxedPlan: narratorPersistence.updateRelaxedPlan.bind(narratorPersistence),
 	updateReflectionOverrides:

@@ -994,6 +994,11 @@ export interface AgentLoopExtension {
 }
 
 export interface AgentConfig {
+	/** Auxiliary Composer capture; absent for children and reflection loops. */
+	onCodexComposerSeed?: (
+		seed: import("./codex-composer").CodexComposerSeed | undefined,
+		userId?: string | null,
+	) => void;
 	/** Prepare and pin numeric classification within a bounded, cancellable pre-transport budget. */
 	freezeContextComposition?: (
 		counts: import("@shared/context-usage").ContextInputCharacters | null,

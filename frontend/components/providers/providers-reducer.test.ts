@@ -85,6 +85,33 @@ describe("providers reducer server synchronization", () => {
 		expect(next.disabledProviders.has("")).toBe(false);
 	});
 
+	test("Composer defaults off and survives unified, legacy and edited provider projection", () => {
+		const defaults = providersStateFromSettings({ customApiProviders: [provider] });
+		expect(defaults.customApiProviders[0]?.codexComposerEnabled).toBe(false);
+		const configured = {
+			...provider,
+			protocol: "openai-responses" as const,
+			codexComposerEnabled: true,
+			codexComposerPrompt: "predict the next request",
+		};
+		const unified = providersStateFromSettings({ customApiProviders: [configured] });
+		expect(unified.customApiProviders[0]).toMatchObject(configured);
+		expect(unified.openaiProviders[0]).toMatchObject({
+			codexComposerEnabled: true,
+			codexComposerPrompt: configured.codexComposerPrompt,
+		});
+		const legacy = providersStateFromSettings({
+			openaiProviders: [{ ...configured, apiMode: "codex" }],
+		});
+		expect(legacy.customApiProviders[0]).toMatchObject(configured);
+		const updated = providersReducer(unified, {
+			type: "SET_CUSTOM_API_PROVIDERS",
+			providers: [{ ...configured, codexComposerPrompt: "new instructions" }],
+		});
+		expect(updated.customApiProviders[0]?.codexComposerPrompt).toBe("new instructions");
+		expect(updated.openaiProviders[0]?.codexComposerPrompt).toBe("new instructions");
+	});
+
 	test("empty settings still produce an initialized state", () => {
 		const state = providersReducer(initialProvidersState, {
 			type: "SYNC_FROM_SETTINGS",

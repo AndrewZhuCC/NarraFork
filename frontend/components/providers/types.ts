@@ -49,6 +49,8 @@ export interface CustomApiProviderState {
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
 	codexRemoteCompact?: boolean;
+	codexComposerEnabled?: boolean;
+	codexComposerPrompt?: string;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
@@ -70,6 +72,8 @@ export interface OpenAIProviderState {
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
 	codexRemoteCompact?: boolean;
+	codexComposerEnabled?: boolean;
+	codexComposerPrompt?: string;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;

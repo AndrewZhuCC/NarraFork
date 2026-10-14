@@ -299,6 +299,7 @@ import {
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
+import { getComposerSuggestion } from "../services/narrator-composer";
 import { getNarratorContextComposition } from "../services/narrator-context-composition";
 import {
 	getNarratorDraft,
@@ -1611,6 +1612,20 @@ narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
 		errorMessage: row.errorMessage,
 		rawDump,
 	});
+});
+
+narratorRoutes.get("/:id/composer-suggestion", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, id),
+		columns: { type: true, variant: true },
+	});
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		narrator?.type === "primary" && !isSubagentVariant(narrator.variant)
+			? getComposerSuggestion(id)
+			: { suggestion: null },
+	);
 });
 
 narratorRoutes.get("/:id/draft", async (c) => {

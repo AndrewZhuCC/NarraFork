@@ -28,6 +28,7 @@ import { bindRecordingRequest } from "./request-recorder";
 export type ApiRequestKind =
 	| "narrator"
 	| "compact"
+	| "composer"
 	| "context_ask"
 	| "fork_summary"
 	| "title"

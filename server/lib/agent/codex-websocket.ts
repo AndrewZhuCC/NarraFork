@@ -1193,6 +1193,8 @@ async function ensureConnection(
 export async function* streamCodexResponsesWebSocket(
 	options: StreamCodexResponsesWebSocketOptions,
 ): AsyncGenerator<ParsedStreamEvent> {
+	// A cancelled background request must not acquire or reset the foreground session.
+	if (options.signal.aborted) throw createCodexWebSocketAbortError();
 	const cacheKey = buildSessionCacheKey(options);
 	const cachedSession = options.ephemeral ? undefined : getOrCreateSession(cacheKey);
 	if (cachedSession?.disabled) {

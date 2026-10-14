@@ -18,6 +18,8 @@ export interface NarratorComposerRowProps {
 	// Narrator state
 	narratorId: string;
 	isActive: boolean;
+	isPrimary?: boolean;
+	composerSuggestionAvailable?: boolean;
 
 	// Composer state
 	composerHasText: boolean;
@@ -326,6 +328,10 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				<NarratorComposer
 					ref={props.composerRef}
 					narratorId={props.narratorId}
+					isPrimary={props.isPrimary}
+					composerSuggestionAvailable={
+						props.composerSuggestionAvailable && !props.isSending && !props.editingMessageState
+					}
 					sendingRef={props.sendingRef}
 					appendInputRef={props.appendInputRef}
 					permEnterActive={props.effectiveFocusIndex != null}

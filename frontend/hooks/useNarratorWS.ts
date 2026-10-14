@@ -643,6 +643,7 @@ export interface NarratorWSCallbacks {
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onPlanModeChanged?: (planMode: boolean, traits?: string[]) => void;
 	onCustomTraitsChanged?: (traits?: string[]) => void;
+	onComposerSuggestionChanged?: () => void;
 	onDraftChanged?: (draft: {
 		hasDraft: boolean;
 		text: string;
@@ -1369,6 +1370,9 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onCustomTraitsChanged?.(
 							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
 						);
+						break;
+					case "composer_suggestion_changed":
+						callbackOwner.callbacks.onComposerSuggestionChanged?.();
 						break;
 					case "draft_changed":
 						callbackOwner.callbacks.onDraftChanged?.({

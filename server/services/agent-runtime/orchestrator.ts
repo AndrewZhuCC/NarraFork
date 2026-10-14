@@ -105,6 +105,7 @@ import {
 	toBufferSummary,
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
+import { beginComposerRun, rememberComposerSeed } from "../narrator-composer";
 import { freezeNarratorContextComposition } from "../narrator-context-composition";
 import {
 	clearStreamingSnapshot,
@@ -1279,7 +1280,13 @@ export async function runAgentLoopUnlocked(
 
 			let toolCallLimitExceeded = false;
 			const passWorkspaceContext = active._workspaceContext;
+			const composerGeneration =
+				profile.kind === "primary" ? beginComposerRun(narratorId) : undefined;
+			if (composerGeneration) active._composerGeneration = composerGeneration;
 			const config: import("../../lib/agent").AgentConfig = {
+				onCodexComposerSeed: composerGeneration
+					? (seed, userId) => rememberComposerSeed(narratorId, composerGeneration, seed, userId)
+					: undefined,
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,

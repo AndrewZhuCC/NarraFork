@@ -23,6 +23,13 @@ import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
 import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import {
+	CODEX_COMPOSER_MAX_RESPONSE_BYTES,
+	type CodexComposerCapture,
+	type CodexComposerRunOptions,
+	createCodexComposerCapture,
+	getCodexComposerSettings,
+} from "./codex-composer";
+import {
 	applyCodexStableRequestFields,
 	createCodexRequestIdentity,
 	getCodexCompactPrefix,
@@ -640,6 +647,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		proxy?: string,
 		private transport?: ProviderTransport,
 		private readonly compactCredentialId?: string,
+		private readonly canUseCredential?: () => boolean,
 	) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
@@ -714,6 +722,130 @@ export class OpenAIProvider implements ProviderAdapter {
 		rememberCodexCompactPrefix(this.compactRequestKey(params.model, params.conversationId), body);
 	}
 
+	createComposerCapture(
+		params: ChatParams,
+		request: Record<string, unknown>,
+		useWebSocket = this.useWebSocket,
+	): CodexComposerCapture | undefined {
+		if (
+			this.apiMode !== "codex" ||
+			!params.captureComposerSeed ||
+			params.reflectionParentTools !== undefined
+		)
+			return undefined;
+		const composer = getCodexComposerSettings(this.config.id);
+		if (!composer) return undefined;
+		const { model, conversationId, stickySessionKey, workTurnId } = params;
+		const context = { model, conversationId, stickySessionKey, workTurnId };
+		const source = this.getActiveReasoningSource();
+		return createCodexComposerCapture({
+			request,
+			providerId: this.config.id,
+			model,
+			conversationId,
+			configSignature: composer.signature,
+			prompt: composer.prompt,
+			serializeAssistant: (items) =>
+				prepareResponsesInput(items as OAIMessage[], {
+					strict: hasCredentialBoundReasoning(model),
+					currentSource: source,
+				}),
+			send: (body, options) => this.requestCodexComposer(body, context, useWebSocket, options),
+		});
+	}
+
+	private async requestCodexComposer(
+		body: Record<string, unknown>,
+		context: Pick<ChatParams, "model" | "conversationId" | "stickySessionKey" | "workTurnId">,
+		useWebSocket: boolean,
+		options: CodexComposerRunOptions,
+	): Promise<GenerateMetaResult> {
+		const { model, conversationId, stickySessionKey, workTurnId } = context;
+		options.signal.throwIfAborted();
+		if (this.canUseCredential?.() === false) {
+			throw new Error("Composer credential is no longer enabled");
+		}
+		const apiKey = await this.getEffectiveApiKey();
+		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
+		const metadata = body.client_metadata as Record<string, string>;
+		const headers = {
+			...this.buildHeaders(apiKey, conversationId),
+			Accept: "text/event-stream",
+			"X-Codex-Turn-Metadata": metadata["x-codex-turn-metadata"],
+			session_id: metadata.session_id,
+			"thread-id": metadata.thread_id,
+		};
+		const credentialId = this.compactCredentialId ?? this.config.id;
+		if (!useWebSocket) {
+			const result = await this.requestResponsesTextWithMeta(
+				baseUrl,
+				apiKey,
+				body,
+				options.signal,
+				{ requestDump: options.requestDump },
+				conversationId,
+				undefined,
+				{ headers, maxResponseBytes: CODEX_COMPOSER_MAX_RESPONSE_BYTES },
+			);
+			return { ...result, credentialId };
+		}
+		const budget = new StreamByteBudget(
+			CODEX_COMPOSER_MAX_RESPONSE_BYTES,
+			"Codex Composer response",
+		);
+		const budgetAbort = new AbortController();
+		const signal = AbortSignal.any([options.signal, budgetAbort.signal]);
+		let text = "";
+		let usage: GenerateMetaResult["usage"] = null;
+		let outputTruncated = false;
+		for await (const event of streamCodexResponsesWebSocket({
+			baseUrl,
+			apiKey,
+			authorization: this.config.authorizationHeader,
+			accountId: this.config.codexAccountId,
+			proxy: this.proxy
+				? applyProxyExemptions(this.proxy, baseUrl)
+				: resolveProxyForUrl(baseUrl, this.config.proxy),
+			// The primary turn has released this session. Reuse its socket; the existing
+			// request-shape/prefix checks keep the prediction out of ordinary continuations.
+			sessionKey: stickySessionKey ?? conversationId,
+			conversationId,
+			narratorId: stickySessionKey,
+			workTurnId,
+			credentialId,
+			model,
+			request: body as CodexResponsesRequestBody,
+			signal,
+			extraHeaders: headers,
+			requestDump: options.requestDump,
+			requestDumpMaxBytes: settings.agent.requestDumpMaxSize,
+			onResponseFrame: (frame) => {
+				try {
+					budget.add(Buffer.byteLength(frame, "utf8"));
+				} catch (error) {
+					budgetAbort.abort(error);
+					throw error;
+				}
+			},
+		})) {
+			if (event.text) text += event.text;
+			if (event.usage) usage = parsedUsageToUsageData(event.usage);
+			if (event.toolUses?.length || event.webSearch || event.imageGeneration) {
+				throw new Error("Composer returned a tool call instead of a suggestion");
+			}
+			if (event.invalidState) {
+				if (text && isCompletionLimitReason(event.invalidState.reason)) {
+					outputTruncated = true;
+				} else {
+					throw new ProviderInvalidStateError(
+						event.invalidState.reason,
+						event.invalidState.message,
+					);
+				}
+			}
+		}
+		return { text, usage, credentialId, ...(outputTruncated && { outputTruncated }) };
+	}
 	async compactRemote(
 		input: unknown[],
 		model: string,
@@ -1139,7 +1271,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			);
 
 			params.onRequestStart?.(
-				this.apiMode === "codex" ? { codexTools: body.tools as unknown[] } : undefined,
+				this.apiMode === "codex"
+					? {
+							codexTools: body.tools as unknown[],
+							codexComposerCapture: this.createComposerCapture(params, body, false),
+						}
+					: undefined,
 			);
 			this.rememberCompactRequest(params, body);
 			const response = await this.pfetch(endpoint, {
@@ -1584,11 +1721,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		options?: GenerateOptions,
 		conversationId?: string,
 		turnState?: { value: string | null },
+		requestOptions?: { headers?: Record<string, string>; maxResponseBytes?: number },
 	): Promise<GenerateMetaResult> {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Responses generation requires stream=true");
 		}
-		const headers = this.buildHeaders(apiKey, conversationId);
+		const headers = { ...this.buildHeaders(apiKey, conversationId), ...requestOptions?.headers };
 		if (turnState?.value && this.apiMode === "codex") {
 			headers["x-codex-turn-state"] = turnState.value;
 		}
@@ -1597,7 +1735,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			{ transport: "http", url, headers, body },
 			settings.agent.requestDumpMaxSize,
 		);
-		const response = captureDumpResponse(
+		let response = captureDumpResponse(
 			await this.pfetch(url, {
 				method: "POST",
 				headers,
@@ -1606,6 +1744,23 @@ export class OpenAIProvider implements ProviderAdapter {
 			}),
 			options?.requestDump,
 		);
+		if (requestOptions?.maxResponseBytes && response.body) {
+			const budget = new StreamByteBudget(
+				requestOptions.maxResponseBytes,
+				"Codex Composer response",
+			);
+			response = new Response(
+				response.body.pipeThrough(
+					new TransformStream<Uint8Array, Uint8Array>({
+						transform(chunk, controller) {
+							budget.add(chunk.byteLength);
+							controller.enqueue(chunk);
+						},
+					}),
+				),
+				{ status: response.status, statusText: response.statusText, headers: response.headers },
+			);
+		}
 		// Capture the turn's sticky-routing token before status handling so even
 		// a non-2xx first response can seed the retried request.
 		if (turnState && this.apiMode === "codex" && !turnState.value) {
@@ -1870,6 +2025,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			params.onRequestStart?.({
 				credentialId: this.config.id,
 				codexTools: request.tools as unknown[],
+				codexComposerCapture: this.createComposerCapture(params, request, true),
 			});
 			this.rememberCompactRequest(params, request);
 			for await (const event of streamCodexResponsesWebSocket({

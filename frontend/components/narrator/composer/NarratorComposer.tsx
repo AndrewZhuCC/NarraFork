@@ -3,7 +3,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { FileReference, FileReferenceCandidate } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	forwardRef,
 	type RefObject,
@@ -23,6 +23,7 @@ import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { useFocusComposerShortcut } from "../../../hooks/useReadFromStartShortcut";
 import { ApiError, api } from "../../../lib/api";
 import { formatLocaleNumber } from "../../../lib/intl-format";
+import { isMobileViewportWidth } from "../../../lib/responsive";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -115,6 +116,8 @@ export interface NarratorComposerHandle {
 
 export interface NarratorComposerProps {
 	narratorId: string;
+	isPrimary?: boolean;
+	composerSuggestionAvailable?: boolean;
 	sendingRef: RefObject<boolean>;
 	appendInputRef?: RefObject<((text: string) => void) | null>;
 	permEnterActive: boolean;
@@ -144,6 +147,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 	function NarratorComposer(
 		{
 			narratorId,
+			isPrimary = false,
+			composerSuggestionAvailable = false,
 			sendingRef,
 			appendInputRef,
 			permEnterActive,
@@ -159,6 +164,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const { t } = useTranslation("narrator");
 		const qc = useQueryClient();
 		const { data: currentUser } = useCurrentUser();
+		const { data: cachedSuggestion } = useQuery({
+			queryKey: ["narrators", narratorId, "composer-suggestion"],
+			queryFn: ({ signal }) => api.getNarratorComposerSuggestion(narratorId, signal),
+			enabled: isPrimary,
+			staleTime: 0,
+			retry: false,
+		});
 		const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 		const dock = useNarratorDockContext();
 		const fileScope = useFileReferenceScope();
@@ -859,7 +871,34 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			return () => doc.defaultView?.removeEventListener("keydown", handler);
 		}, [permEnterActive]);
 
+		const composerSuggestion =
+			isPrimary &&
+			composerSuggestionAvailable &&
+			draftHydrated &&
+			draftSyncState === "ready" &&
+			!hasAttachments &&
+			fileReferences.length === 0 &&
+			!commandPopoverVisible &&
+			!mentionPopoverVisible &&
+			!fileQuery
+				? cachedSuggestion?.suggestion
+				: null;
+		const visibleSuggestion = input === "" ? composerSuggestion : null;
 		const composingRef = useRef(false);
+		const acceptSuggestion = () => {
+			if (
+				!visibleSuggestion ||
+				inputRef.current !== "" ||
+				inputStateRef.current.fileReferences.length > 0 ||
+				sendingRef.current ||
+				composingRef.current ||
+				fullscreenOpened
+			)
+				return;
+			setText(visibleSuggestion);
+			inputHistory.reset();
+			textareaRef.current?.focus();
+		};
 		const beforeEditRef = useRef<{ start: number; end: number } | undefined>(undefined);
 		const handleKeyDown = (e: React.KeyboardEvent) => {
 			if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current)
@@ -877,6 +916,24 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			// Same for the @mention popover: it consumes arrow/tab/escape/enter via a
 			// capture-phase listener; guard here so navigation keys don't double-handle.
 			if (mentionPopoverVisible && e.key !== "Enter") return;
+			if (
+				e.key === "Tab" &&
+				visibleSuggestion &&
+				!sendingRef.current &&
+				!fullscreenOpened &&
+				!e.defaultPrevented &&
+				!e.repeat &&
+				!e.shiftKey &&
+				!e.ctrlKey &&
+				!e.metaKey &&
+				!e.altKey &&
+				e.currentTarget.ownerDocument.activeElement === e.currentTarget &&
+				!isMobileViewportWidth(e.currentTarget.ownerDocument.defaultView?.innerWidth ?? 0)
+			) {
+				e.preventDefault();
+				acceptSuggestion();
+				return;
+			}
 
 			if (e.key === "Enter" && !e.nativeEvent.isComposing) {
 				// Permission shortcut: when the composer holds nothing to send and a
@@ -972,7 +1029,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 
 		return (
-			<Box style={{ position: "relative", flex: 1 }}>
+			<Box style={{ position: "relative", flex: 1, minWidth: 0 }}>
 				<CommandPopover
 					commands={commandsList ?? []}
 					input={input}
@@ -1062,7 +1119,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				<Textarea
 					ref={textareaRef}
 					data-narrator-composer
-					placeholder={t("sendPlaceholder")}
+					placeholder={visibleSuggestion || t("sendPlaceholder")}
 					value={input}
 					onBeforeInput={(e) => {
 						beforeEditRef.current = {
@@ -1097,8 +1154,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					autosize
 					minRows={1}
 					maxRows={6}
+					styles={{ input: { overflowWrap: "anywhere" } }}
 					rightSection={
 						<TextareaOptimizeControls
+							onAcceptSuggestion={
+								visibleSuggestion && !fullscreenOpened ? acceptSuggestion : undefined
+							}
 							disabled={!input.trim() || optimizeHook.loading}
 							loading={optimizeHook.loading}
 							withContext={optimizeHook.withContext}
@@ -1122,6 +1183,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					opened={fullscreenOpened}
 					onClose={closeFullscreen}
 					initialText={input}
+					composerSuggestion={composerSuggestion}
 					onSubmit={(text) => {
 						setText(text);
 						closeFullscreen();

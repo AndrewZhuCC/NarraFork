@@ -14,6 +14,7 @@ import { insertFileReference } from "./file-reference-input";
 import {
 	NarratorComposer,
 	type NarratorComposerHandle,
+	type NarratorComposerProps,
 	type NarratorRemoteDraft,
 } from "./NarratorComposer";
 import { readNarratorInputDraft } from "./narrator-draft-storage";
@@ -41,6 +42,12 @@ let handle = createRef<NarratorComposerHandle>();
 let sendingRef = { current: false };
 let flags: boolean[];
 let renders: number;
+let sendCalls: number;
+let suggestionProps: Pick<
+	NarratorComposerProps,
+	"isPrimary" | "composerSuggestionAvailable" | "hasAttachments"
+>;
+let suggestionSpy: ReturnType<typeof spyOn<typeof api, "getNarratorComposerSuggestion">>;
 let getSpy: ReturnType<typeof spyOn<typeof api, "getNarratorDraft">>;
 let updateSpy: ReturnType<typeof spyOn<typeof api, "updateNarratorDraft">>;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
@@ -53,10 +60,12 @@ function Harness() {
 			narratorId="n1"
 			sendingRef={sendingRef}
 			permEnterActive={false}
-			hasAttachments={false}
+			{...suggestionProps}
 			enterMode="turn"
 			ctrlEnterMode="interrupt"
-			onSendWithMode={() => {}}
+			onSendWithMode={() => {
+				sendCalls++;
+			}}
 			onTextFlagsChange={(value) => flags.push(value)}
 			onPasteImages={() => {}}
 		/>
@@ -65,6 +74,7 @@ function Harness() {
 
 beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	Object.assign(window, { innerWidth: 1_024, innerHeight: 768, getSelection: () => null });
 	Object.defineProperty(window.document, "fonts", {
 		configurable: true,
 		value: { addEventListener() {}, removeEventListener() {} },
@@ -97,6 +107,7 @@ beforeEach(async () => {
 		navigator: window.navigator,
 		HTMLElement: window.HTMLElement,
 		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		HTMLAnchorElement: window.HTMLAnchorElement,
 		Element: window.Element,
 		Node: window.Node,
 		Event: window.Event,
@@ -145,6 +156,9 @@ beforeEach(async () => {
 	qc.setQueryData(["auth", "me"], { id: "u1" });
 	qc.setQueryData(["named-narrators"], []);
 	getSpy = spyOn(api, "getNarratorDraft").mockResolvedValue(initial);
+	suggestionSpy = spyOn(api, "getNarratorComposerSuggestion").mockResolvedValue({
+		suggestion: null,
+	});
 	updateSpy = spyOn(api, "updateNarratorDraft").mockImplementation(
 		async (_id, text, revision, sourceId, fileReferences) => ({
 			...initial,
@@ -164,6 +178,8 @@ beforeEach(async () => {
 	sendingRef = { current: false };
 	flags = [];
 	renders = 0;
+	sendCalls = 0;
+	suggestionProps = { isPrimary: false, composerSuggestionAvailable: false, hasAttachments: false };
 });
 
 afterEach(async () => {
@@ -171,6 +187,7 @@ afterEach(async () => {
 	host.remove();
 	qc.clear();
 	getSpy.mockRestore();
+	suggestionSpy.mockRestore();
 	updateSpy.mockRestore();
 	resetSessionStoreForTest();
 	for (const [key, descriptor] of previousGlobals) {
@@ -274,6 +291,216 @@ describe("composer Enter focus", () => {
 		expect(press(document.body).defaultPrevented).toBe(false);
 		expect(focus).toHaveBeenCalledTimes(1);
 		focus.mockRestore();
+	});
+});
+
+function composerTextarea(): HTMLTextAreaElement {
+	const textarea = host.querySelector("textarea");
+	if (!textarea) throw new Error("Missing composer textarea");
+	Object.assign(textarea, { attachEvent() {}, detachEvent() {} });
+	return textarea;
+}
+
+function focusTextarea(textarea: HTMLTextAreaElement) {
+	Object.assign(textarea, {
+		attachEvent() {},
+		detachEvent() {},
+		selectionStart: 0,
+		selectionEnd: 0,
+	});
+	Object.defineProperty(document, "activeElement", { configurable: true, value: textarea });
+	textarea.dispatchEvent(new Event("focusin", { bubbles: true }));
+}
+
+function keyDown(textarea: HTMLTextAreaElement, extra = {}): Event {
+	const event = new Event("keydown", { bubbles: true, cancelable: true });
+	Object.assign(event, {
+		key: "Tab",
+		code: "Tab",
+		ctrlKey: false,
+		metaKey: false,
+		shiftKey: false,
+		altKey: false,
+		isComposing: false,
+		repeat: false,
+		...extra,
+	});
+	textarea.dispatchEvent(event);
+	return event;
+}
+
+const nextSuggestion = "Run the focused tests and report the result.";
+function enableSuggestions() {
+	suggestionProps = { isPrimary: true, composerSuggestionAvailable: true, hasAttachments: false };
+	suggestionSpy.mockResolvedValue({ suggestion: nextSuggestion });
+}
+
+function suggestionButton(scope: ParentNode = host) {
+	return [...scope.querySelectorAll("button")].find(
+		(button) =>
+			button.textContent === "composerAcceptSuggestion" ||
+			button.getAttribute("aria-label") === "composerAcceptSuggestion",
+	);
+}
+
+describe("Codex Composer cached suggestions", () => {
+	test("subagents never query or display suggestions, even when idle or taken over", async () => {
+		suggestionProps.composerSuggestionAvailable = true;
+		qc.setQueryData(["narrators", "n1", "composer-suggestion"], { suggestion: nextSuggestion });
+		await render();
+		expect(suggestionSpy).not.toHaveBeenCalled();
+		expect(composerTextarea().placeholder).toBe("sendPlaceholder");
+		expect(suggestionButton()).toBeUndefined();
+	});
+
+	test("empty input displays only a placeholder; adoption uses the draft path without sending", async () => {
+		enableSuggestions();
+		await render();
+		expect(composerTextarea().placeholder).toBe(nextSuggestion);
+		expect(handle.current?.getText()).toBe("");
+		expect(readNarratorInputDraft("u1", "n1").text).toBe("");
+		expect(updateSpy).not.toHaveBeenCalled();
+		expect(suggestionSpy).toHaveBeenCalledTimes(1);
+		expect(suggestionButton()).toBeDefined();
+		const controls = suggestionButton()?.closest(".mantine-Textarea-section");
+		expect(controls).not.toBeNull();
+		expect(controls?.querySelectorAll("button").length).toBe(2);
+		await act(async () => suggestionButton()?.click());
+		expect(handle.current?.getText()).toBe(nextSuggestion);
+		expect(readNarratorInputDraft("u1", "n1").text).toBe(nextSuggestion);
+		expect(suggestionButton()).toBeUndefined();
+		expect(sendCalls).toBe(0);
+	});
+
+	test("a hydrated draft and even whitespace win over a cached suggestion", async () => {
+		enableSuggestions();
+		getSpy.mockResolvedValue({ ...initial, hasDraft: true, text: "my real draft" });
+		await render();
+		expect(handle.current?.getText()).toBe("my real draft");
+		expect(composerTextarea().placeholder).toBe("sendPlaceholder");
+		expect(suggestionButton()).toBeUndefined();
+		await act(async () => handle.current?.setText(" "));
+		expect(suggestionButton()).toBeUndefined();
+		await act(async () => handle.current?.setText(""));
+		expect(composerTextarea().placeholder).toBe(nextSuggestion);
+	});
+
+	test("late cache reads never overwrite text typed while the GET was in flight", async () => {
+		enableSuggestions();
+		let resolve!: (value: { suggestion: string }) => void;
+		suggestionSpy.mockImplementationOnce(
+			() =>
+				new Promise((done) => {
+					resolve = done;
+				}),
+		);
+		await render();
+		await act(async () => handle.current?.setText("typed before the response"));
+		await act(async () => {
+			resolve({ suggestion: nextSuggestion });
+			await new Promise((done) => setTimeout(done, 0));
+		});
+		expect(handle.current?.getText()).toBe("typed before the response");
+		expect(readNarratorInputDraft("u1", "n1").text).toBe("typed before the response");
+		expect(suggestionButton()).toBeUndefined();
+		expect(sendCalls).toBe(0);
+	});
+
+	test("working, attachments and references hide it; clearing reveals the current cache, not subagents", async () => {
+		enableSuggestions();
+		await render();
+		suggestionProps.composerSuggestionAvailable = false;
+		await render();
+		expect(suggestionButton()).toBeUndefined();
+		suggestionProps.composerSuggestionAvailable = true;
+		suggestionProps.hasAttachments = true;
+		await render();
+		expect(suggestionButton()).toBeUndefined();
+		suggestionProps.hasAttachments = false;
+		await render();
+		await act(async () => handle.current?.restoreInput("", [reference]));
+		expect(suggestionButton()).toBeUndefined();
+		await act(async () => handle.current?.restoreInput("", []));
+		expect(composerTextarea().placeholder).toBe(nextSuggestion);
+		suggestionProps.isPrimary = false;
+		await render();
+		expect(suggestionButton()).toBeUndefined();
+		expect(suggestionSpy).toHaveBeenCalledTimes(1);
+	});
+
+	test("Tab requires focused desktop input and preserves modifiers, IME and completion ownership", async () => {
+		enableSuggestions();
+		await render();
+		const textarea = composerTextarea();
+		act(() => focusTextarea(textarea));
+		Object.defineProperty(document, "activeElement", { configurable: true, value: document.body });
+		act(() => expect(keyDown(textarea).defaultPrevented).toBe(false));
+		act(() => focusTextarea(textarea));
+		for (const extra of [
+			{ shiftKey: true },
+			{ ctrlKey: true },
+			{ metaKey: true },
+			{ altKey: true },
+			{ isComposing: true },
+		]) {
+			act(() => expect(keyDown(textarea, extra).defaultPrevented).toBe(false));
+			expect(handle.current?.getText()).toBe("");
+		}
+		const completion = (event: Event) => event.preventDefault();
+		textarea.addEventListener("keydown", completion, true);
+		act(() => keyDown(textarea));
+		expect(handle.current?.getText()).toBe("");
+		textarea.removeEventListener("keydown", completion, true);
+		Object.assign(window, { innerWidth: 360 });
+		act(() => expect(keyDown(textarea).defaultPrevented).toBe(false));
+		Object.assign(window, { innerWidth: 1_024 });
+		act(() => expect(keyDown(textarea).defaultPrevented).toBe(true));
+		expect(handle.current?.getText()).toBe(nextSuggestion);
+		await act(async () => handle.current?.setText(""));
+		// 229 starts React's legacy IME fallback in linkedom; exercise it last.
+		act(() => expect(keyDown(textarea, { keyCode: 229 }).defaultPrevented).toBe(false));
+		act(() => expect(keyDown(textarea).defaultPrevented).toBe(false));
+		expect(handle.current?.getText()).toBe("");
+		expect(sendCalls).toBe(0);
+	});
+
+	test("fullscreen adoption stays local; Escape cancels and confirmation alone copies to the draft", async () => {
+		enableSuggestions();
+		await render();
+		const expand = [
+			...host.querySelectorAll<HTMLButtonElement>(".mantine-Textarea-section button"),
+		].at(-1);
+		if (!expand) throw new Error("Missing expand button");
+		await act(async () => expand.click());
+		const dialog = document.querySelector('[role="dialog"]');
+		if (!dialog) throw new Error("Missing fullscreen dialog");
+		const fullscreenInput = dialog.querySelector("textarea");
+		if (!fullscreenInput) throw new Error("Missing fullscreen input");
+		expect(fullscreenInput.placeholder).toBe(nextSuggestion);
+		await act(async () => suggestionButton(dialog)?.click());
+		expect(fullscreenInput.value).toBe(nextSuggestion);
+		expect(handle.current?.getText()).toBe("");
+		expect(readNarratorInputDraft("u1", "n1").text).toBe("");
+		act(() => focusTextarea(fullscreenInput));
+		act(() => keyDown(fullscreenInput, { keyCode: 229 }));
+		await act(async () => keyDown(fullscreenInput, { key: "Escape", code: "Escape" }));
+		expect(handle.current?.getText()).toBe("");
+		await act(async () => expand.click());
+		const reopened = document.querySelector('[role="dialog"]');
+		if (!reopened) throw new Error("Missing reopened dialog");
+		expect(reopened.querySelector("textarea")?.value).toBe("");
+		const reopenedInput = reopened.querySelector("textarea");
+		if (!reopenedInput) throw new Error("Missing reopened textarea");
+		act(() => focusTextarea(reopenedInput));
+		act(() => expect(keyDown(reopenedInput).defaultPrevented).toBe(true));
+		expect(handle.current?.getText()).toBe("");
+		const confirm = [...reopened.querySelectorAll("button")].find(
+			(button) => button.textContent === "confirm",
+		);
+		await act(async () => confirm?.click());
+		expect(handle.current?.getText()).toBe(nextSuggestion);
+		expect(readNarratorInputDraft("u1", "n1").text).toBe(nextSuggestion);
+		expect(sendCalls).toBe(0);
 	});
 });
 

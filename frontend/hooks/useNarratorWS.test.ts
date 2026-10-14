@@ -209,6 +209,7 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
 		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
 		const sourceUpdates: unknown[] = [];
+		let composerChanges = 0;
 		narratorWSManager.addListener = ((_opts, listener) => {
 			sourceListeners.push(listener);
 			return { _id: nextHandleId++ };
@@ -230,6 +231,7 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			useNarratorWS(
 				props.narratorId,
 				{
+					onComposerSuggestionChanged: () => composerChanges++,
 					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
 					onToolStarted: (...args) => sourceUpdates.push(args[8]),
 					onStreamingSnapshot: (snapshot) =>
@@ -293,6 +295,11 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			])
 				for (const listener of sourceListeners) listener(frame);
 			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
+			for (const listener of sourceListeners) {
+				listener({ type: "composer_suggestion_changed", narratorId: "other" });
+				listener({ type: "composer_suggestion_changed", narratorId: "n1" });
+			}
+			expect(composerChanges).toBe(1);
 			props = { narratorId: "n2" };
 			root.render(createElement(Harness));
 			await settle();

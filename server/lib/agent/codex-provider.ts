@@ -242,6 +242,10 @@ export class CodexProvider implements ProviderAdapter {
 			proxy,
 			undefined,
 			ctx.id,
+			() => {
+				const current = this.getCredentialSnapshot(ctx.id);
+				return !!current && !current.disabled;
+			},
 		);
 	}
 
@@ -640,7 +644,11 @@ export class CodexProvider implements ProviderAdapter {
 				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
 
 				await reportInputCharacters(params, request);
-				params.onRequestStart?.({ credentialId: ctx.id, codexTools: request.tools as unknown[] });
+				params.onRequestStart?.({
+					credentialId: ctx.id,
+					codexTools: request.tools as unknown[],
+					codexComposerCapture: provider.createComposerCapture(params, request, true),
+				});
 				provider.rememberCompactRequest(params, request);
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,

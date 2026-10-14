@@ -656,6 +656,7 @@
 	"usageHistoryKind_external": "External",
 	"usageHistoryKind_narrator": "Narrator",
 	"usageHistoryKind_compact": "Compact",
+	"usageHistoryKind_composer": "Composer suggestion",
 	"usageHistoryKind_context_ask": "Context ask",
 	"usageHistoryKind_fork_summary": "Fork summary",
 	"usageHistoryKind_title": "Title",

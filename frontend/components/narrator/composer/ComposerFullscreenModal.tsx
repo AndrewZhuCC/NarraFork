@@ -1,4 +1,5 @@
 import { type UsePromptOptimizeResult, usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
+import { isMobileViewportWidth } from "@frontend/lib/responsive";
 import { Box, Button, Group, Modal, Stack, Text, Textarea } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { useEffect, useRef, useState } from "react";
@@ -13,6 +14,8 @@ export interface ComposerFullscreenModalProps {
 	onClose: () => void;
 	initialText: string;
 	onSubmit: (text: string) => void;
+	/** Cached suggestion only; accepting stays local until confirmation. */
+	composerSuggestion?: string | null;
 	/** Show character/line count */
 	showStats?: boolean;
 	/** Optional optimize hook for prompt optimization */
@@ -28,6 +31,7 @@ export function ComposerFullscreenModal({
 	onClose,
 	initialText,
 	onSubmit,
+	composerSuggestion,
 	showStats = true,
 	optimizeHook,
 	narratorId,
@@ -37,10 +41,18 @@ export function ComposerFullscreenModal({
 	const { t: tc } = useTranslation("common");
 	const [text, setText] = useState(initialText);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	const composingRef = useRef(false);
+	const visibleSuggestion = text === "" ? composerSuggestion : null;
+	const acceptSuggestion = () => {
+		if (!visibleSuggestion || text !== "" || composingRef.current) return;
+		setText(visibleSuggestion);
+		textareaRef.current?.focus();
+	};
 
 	// Sync text with initialText when modal opens
 	useEffect(() => {
 		if (opened) {
+			composingRef.current = false;
 			setText(initialText);
 		}
 	}, [opened, initialText]);
@@ -103,7 +115,33 @@ export function ComposerFullscreenModal({
 					ref={textareaRef}
 					value={text}
 					onChange={(e) => setText(e.currentTarget.value)}
-					placeholder={t("fullscreenComposerPlaceholder")}
+					placeholder={visibleSuggestion || t("fullscreenComposerPlaceholder")}
+					onCompositionStart={() => {
+						composingRef.current = true;
+					}}
+					onCompositionEnd={() => {
+						composingRef.current = false;
+					}}
+					onKeyDown={(e) => {
+						if (
+							e.key !== "Tab" ||
+							!visibleSuggestion ||
+							e.defaultPrevented ||
+							e.repeat ||
+							e.shiftKey ||
+							e.ctrlKey ||
+							e.metaKey ||
+							e.altKey ||
+							e.nativeEvent.isComposing ||
+							e.nativeEvent.keyCode === 229 ||
+							composingRef.current ||
+							e.currentTarget.ownerDocument.activeElement !== e.currentTarget ||
+							isMobileViewportWidth(e.currentTarget.ownerDocument.defaultView?.innerWidth ?? 0)
+						)
+							return;
+						e.preventDefault();
+						acceptSuggestion();
+					}}
 					autoFocus
 					minRows={20}
 					maxRows={30}
@@ -113,6 +151,7 @@ export function ComposerFullscreenModal({
 							fontFamily: "var(--mantine-font-family-monospace)",
 							fontSize: "14px",
 							lineHeight: 1.6,
+							overflowWrap: "anywhere",
 						},
 					}}
 					style={{ flex: 1 }}
@@ -137,6 +176,13 @@ export function ComposerFullscreenModal({
 					rightSectionProps={optimizeHook ? { style: { top: 8 } } : undefined}
 				/>
 				<Stack gap="sm" mt="md">
+					{visibleSuggestion && (
+						<Group gap="xs">
+							<Button size="compact-xs" variant="subtle" onClick={acceptSuggestion}>
+								{t("composerAcceptSuggestion")}
+							</Button>
+						</Group>
+					)}
 					{showStats && text.length > 0 && (
 						<Group gap="md">
 							<Text size="xs" c="dimmed">

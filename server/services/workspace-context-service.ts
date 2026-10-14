@@ -17,6 +17,7 @@ import { narraforkDir } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
+import { invalidateComposerSuggestion } from "./narrator-composer";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	type ActiveNarrator,
@@ -482,13 +483,15 @@ export const workspaceContextService = {
 						active.abortController.abort("Workspace installation failed");
 					}
 				},
-				publish: ({ previous: old, current }) =>
+				publish: ({ previous: old, current }) => {
+					invalidateComposerSuggestion(id);
 					broadcastToNarrator(id, {
 						type: "workspace_context_changed",
 						narratorId: id,
 						previous: old,
 						current,
-					}),
+					});
+				},
 			},
 		);
 	},
@@ -602,13 +605,15 @@ export const workspaceContextService = {
 					active.abortController.abort("Workspace installation failed");
 				}
 			},
-			publish: ({ previous, current }) =>
+			publish: ({ previous, current }) => {
+				invalidateComposerSuggestion(id);
 				broadcastToNarrator(id, {
 					type: "workspace_context_changed",
 					narratorId: id,
 					previous,
 					current,
-				}),
+				});
+			},
 		});
 		// Manual HTTP switch: the UI still promises a history reminder card. Agent-origin
 		// switches skip this — the orchestrator injects the pass-continuation text instead.
