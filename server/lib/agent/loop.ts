@@ -530,6 +530,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"WebSearch",
 	"WebFetch",
 	"Await",
+	"Stop",
 	"ShareFile",
 	"ContextAsk",
 	"LearningGuide",
@@ -652,6 +653,8 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	// registered/running state. Defer them to the ordered post-stream tool phase.
 	"Await",
 	"Send",
+	// Stop can target work launched earlier in the same assistant turn.
+	"Stop",
 	"Browser",
 	"Terminal",
 	"ShareFile",

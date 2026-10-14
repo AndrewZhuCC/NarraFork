@@ -87,72 +87,82 @@ function getModelParameterDescription(config?: AgentConfig): string {
 }
 
 function buildParameters() {
-	return z.object({
-		description: z
-			.string()
-			.optional()
-			.describe("A short (3-5 word) description of the task (required when launching a new agent)"),
-		subagent_type: z
-			.string()
-			.optional()
-			.describe(
-				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
+	return z.preprocess(
+		(input, ctx) => {
+			// Check the original input before unknown object fields can be stripped.
+			if (input && typeof input === "object" && Object.hasOwn(input, "stop")) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["stop"],
+					message: 'Agent no longer accepts stop. Use Stop({ type: "agent", id }) instead.',
+				});
+			}
+			return input;
+		},
+		z.object({
+			description: z
+				.string()
+				.optional()
+				.describe(
+					"A short (3-5 word) description of the task (required when launching a new agent)",
+				),
+			subagent_type: z
+				.string()
+				.optional()
+				.describe(
+					'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
+				),
+			run_in_background: z
+				.boolean()
+				.optional()
+				.describe(
+					"Set to true to run this agent in the background. You will be notified when it completes.",
+				),
+			takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
+			timeout: looseNumber(
+				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
 			),
-		run_in_background: z
-			.boolean()
-			.optional()
-			.describe(
-				"Set to true to run this agent in the background. You will be notified when it completes.",
-			),
-		takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
-		timeout: looseNumber(
-			"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
-		),
-		model: z.string().optional().describe(getModelParameterDescription()),
-		reasoning_effort: z
-			.enum(REASONING_EFFORT_VALUES)
-			.optional()
-			.describe(REASONING_EFFORT_DESCRIPTION),
-		workdir: z
-			.string()
-			.optional()
-			.describe(
-				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
-			),
-		prompt: z
-			.string()
-			.optional()
-			.describe("The task for the agent to perform (required when launching a new agent)"),
-		alias: z
-			.string()
-			.optional()
-			.describe(
-				'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
-					"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-					"Use this alias with Await or Send to reference the task later.",
-			),
-		stop: z
-			.string()
-			.optional()
-			.describe(
-				"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
-			),
-		archive: z
-			.string()
-			.optional()
-			.describe(
-				"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
-					"Running work is stopped first. Archived subagents are excluded from TeamStatus " +
-					"broadcast (@all members) and will not be woken by broadcasts; direct Send to them is also rejected.",
-			),
-		unarchive: z
-			.string()
-			.optional()
-			.describe(
-				"Restore an archived subagent by its ID or alias so it can receive messages and " +
-					"broadcasts again. When provided, no new agent is launched.",
-			),
-	});
+			model: z.string().optional().describe(getModelParameterDescription()),
+			reasoning_effort: z
+				.enum(REASONING_EFFORT_VALUES)
+				.optional()
+				.describe(REASONING_EFFORT_DESCRIPTION),
+			workdir: z
+				.string()
+				.optional()
+				.describe(
+					"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
+				),
+			prompt: z
+				.string()
+				.optional()
+				.describe("The task for the agent to perform (required when launching a new agent)"),
+			alias: z
+				.string()
+				.optional()
+				.describe(
+					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
+						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
+						"Use this alias with Await or Send to reference the task later.",
+				),
+
+			archive: z
+				.string()
+				.optional()
+				.describe(
+					"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
+						"Running work is stopped first. Archived subagents are excluded from TeamStatus " +
+						"broadcast (@all members) and will not be woken by broadcasts; direct Send to them is also rejected.",
+				),
+			unarchive: z
+				.string()
+				.optional()
+				.describe(
+					"Restore an archived subagent by its ID or alias so it can receive messages and " +
+						"broadcasts again. When provided, no new agent is launched.",
+				),
+		}),
+	);
 }
 
 function usesNativeWebSearch(config: AgentConfig): boolean {
@@ -208,11 +218,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 					"Use this alias with Await or Send to reference the task later.",
 				type: "string",
 			},
-			stop: {
-				description:
-					"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
-				type: "string",
-			},
+
 			archive: {
 				description:
 					"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
@@ -239,7 +245,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 /**
  * Resolve an Agent archive/unarchive selector to a narrator id.
  *
- * Order mirrors stop mode, then falls through to the shared Send/Await selector
+ * Resolve a scoped task alias, then fall through to the shared Send/Await selector
  * grammar so a title or slug printed by TeamStatus can be archived directly.
  */
 async function resolveArchiveTargetId(callerNarratorId: string, selector: string): Promise<string> {
@@ -265,10 +271,10 @@ async function resolveArchiveTargetId(callerNarratorId: string, selector: string
 export const agentTool: ToolDefinition = {
 	name: "Agent",
 	description(config: AgentConfig) {
-		if (usesNativeWebSearch(config)) {
-			return baseDescription.replaceAll("WebSearch", "web_search (native)");
-		}
-		return baseDescription;
+		const description = `${baseDescription}\nTo cancel a running background agent, use Stop({ type: "agent", id }). Agent only launches, archives, or unarchives agents; it does not accept stop.`;
+		return usesNativeWebSearch(config)
+			? description.replaceAll("WebSearch", "web_search (native)")
+			: description;
 	},
 	get parameters() {
 		return buildParameters();
@@ -291,19 +297,25 @@ export const agentTool: ToolDefinition = {
 			reasoning_effort?: ReasoningEffort;
 			workdir?: string;
 			alias?: string;
-			stop?: string;
 			archive?: string;
 			unarchive?: string;
 			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
 
+		if (args && typeof args === "object" && Object.hasOwn(args, "stop")) {
+			return {
+				output: 'Agent no longer accepts stop. Use Stop({ type: "agent", id }) instead.',
+				isError: true,
+			};
+		}
+
 		// Lifecycle commands are mutually exclusive with each other and with launch.
-		const lifecycleModes = [raw.stop, raw.archive, raw.unarchive].filter(Boolean);
+		const lifecycleModes = [raw.archive, raw.unarchive].filter(Boolean);
 		if (lifecycleModes.length > 1) {
 			return {
 				output:
-					"Agent tool error: stop, archive, and unarchive are mutually exclusive — provide only one.",
+					"Agent tool error: archive and unarchive are mutually exclusive — provide only one.",
 				isError: true,
 			};
 		}
@@ -410,39 +422,6 @@ export const agentTool: ToolDefinition = {
 			} catch (err) {
 				return {
 					output: `Agent unarchive error: ${err instanceof Error ? err.message : String(err)}`,
-					isError: true,
-				};
-			}
-		}
-
-		// --- Stop mode: cancel a running background agent task ---
-		if (raw.stop) {
-			try {
-				const { resolveTaskAlias, cancelBackgroundTask } = await import(
-					"@server/services/narrator-subagent"
-				);
-				let taskId = resolveTaskAlias(ctx.narratorId, raw.stop);
-
-				// If alias registry didn't resolve (returned raw input), try DB lookup
-				if (taskId === raw.stop) {
-					const { backgroundTaskService } = await import(
-						"@server/services/background-task-service"
-					);
-					const task = await backgroundTaskService.getByAlias(raw.stop, ctx.narratorId);
-					if (task) taskId = task.id;
-				}
-
-				const cancelled = await cancelBackgroundTask(taskId);
-				if (cancelled) {
-					return { output: `Background agent task ${raw.stop} has been cancelled.` };
-				}
-				return {
-					output: `Background agent task ${raw.stop} is not running (may have already completed or does not exist).`,
-					isError: true,
-				};
-			} catch (err) {
-				return {
-					output: `Agent stop error: ${err instanceof Error ? err.message : String(err)}`,
 					isError: true,
 				};
 			}

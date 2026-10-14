@@ -162,6 +162,7 @@ if (migrationScenario) {
 	mock.module("@server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 	const { backgroundTaskService } = await import("@server/services/background-task-service");
 	const { bashTool, detachBashProcess, updateBashTimeout } = await import("../bash");
+	const { stopTool } = await import("../stop");
 	const { writeTool } = await import("../write");
 	const { localBackend } = await import("../../execution/local-backend");
 	const { windowsPathSemantics } = await import("../../execution/path-semantics");
@@ -855,7 +856,7 @@ await Bun.write("bash.txt", "finished");`;
 				if (background) await result;
 				await gate.ready.promise;
 				if (background) {
-					const stopped = await bashTool.execute({ stop: await taskId() }, ctx);
+					const stopped = await stopTool.execute({ type: "bash", id: await taskId() }, ctx);
 					expect(stopped.output).toContain("has been cancelled");
 				} else abort.abort();
 				await killRequested.promise;
@@ -934,7 +935,7 @@ await Bun.write("bash.txt", "finished");`;
 				if (background) await result;
 				await gate.ready.promise;
 				await blocked(scope);
-				if (background) await bashTool.execute({ stop: await taskId() }, ctx);
+				if (background) await stopTool.execute({ type: "bash", id: await taskId() }, ctx);
 				else abort.abort();
 				await result;
 				await finished();

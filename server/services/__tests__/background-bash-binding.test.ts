@@ -72,6 +72,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 
 	const { backgroundTaskService } = await import("../background-task-service");
 	const { bashTool } = await import("../../lib/agent/tools/bash");
+	const { stopTool } = await import("../../lib/agent/tools/stop");
 	const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
 	const { drainPendingInjections } = await import("../parent-injection-queue");
 	const PARENT = "binding-parent";
@@ -581,8 +582,8 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			const ctx = context(binding, { updateExecutionLease });
 			await run(ctx);
 			const row = taskRow();
-			const wrongOwner = await bashTool.execute(
-				{ stop: row.id },
+			const wrongOwner = await stopTool.execute(
+				{ type: "bash", id: row.id },
 				context(undefined, { narratorId: OTHER }),
 			);
 			expect(wrongOwner.isError).toBe(true);
@@ -591,7 +592,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			const listing = await teamStatusTool.execute({ action: "list_bash" }, ctx);
 			expect(listing.output).toContain(`id=${row.id}`);
 			expect(listing.output).toContain("canCancel=true");
-			const result = await bashTool.execute({ stop: row.alias }, ctx);
+			const result = await stopTool.execute({ type: "bash", id: row.alias }, ctx);
 			expect(result.isError).toBeFalsy();
 			expect(result.output).toContain("has been cancelled");
 			expect(executions[0].kill).toHaveBeenCalledTimes(1);

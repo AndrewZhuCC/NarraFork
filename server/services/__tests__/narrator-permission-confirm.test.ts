@@ -1251,6 +1251,7 @@ describe("OAuth remote runtime permission constraints", () => {
 		label: string;
 		toolName:
 			| "Bash"
+			| "Stop"
 			| "Write"
 			| "Edit"
 			| "KnowledgeSearch"
@@ -1375,6 +1376,33 @@ describe("OAuth remote runtime permission constraints", () => {
 		});
 		expect(probes).toBe(0);
 	});
+	test("Stop rejects unknown OAuth tasks and review without remote path probes", async () => {
+		let probes = 0;
+		const backend: ExecutionBackend = {
+			...makeRemoteRuntimeBackend(),
+			resolvePathIdentity: async () => {
+				probes++;
+				throw new Error("metadata unavailable");
+			},
+		};
+		for (const type of ["bash", "agent"]) {
+			for (const reviewReadOnlyBash of [false, true]) {
+				const result = await evaluate({
+					label: `stop-${type}-review-${reviewReadOnlyBash}`,
+					toolName: "Stop",
+					toolInput: { type, id: "owned-task" },
+					backend,
+					directoryRules: ["/restricted"],
+					reviewReadOnlyBash,
+				});
+				expect(result.behavior).toBe("deny");
+				if (result.behavior === "deny")
+					expect(result.message).toContain(reviewReadOnlyBash ? "Review mode" : "does not exist");
+			}
+		}
+		expect(probes).toBe(0);
+	});
+
 	test("real Bash analysis deduplicates repeated operands and bounds large remote batches", async () => {
 		for (const repeated of [true, false]) {
 			const base = makeRemoteRuntimeBackend();

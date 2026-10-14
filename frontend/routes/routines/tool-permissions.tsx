@@ -60,6 +60,7 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "AskUserQuestion", descKey: "tpToolDescAskUserQuestion", category: "always-ask" },
 	{ name: "Skill", descKey: "tpToolDescSkill", category: "always-allow" },
 	{ name: "Await", descKey: "tpToolDescAwait", category: "always-allow" },
+	{ name: "Stop", descKey: "tpToolDescStop", category: "always-allow" },
 	{ name: "Send", descKey: "tpToolDescSend", category: "default" },
 	{ name: "ShareFile", descKey: "tpToolDescShareFile", category: "optional" },
 	{ name: "Notification", descKey: "tpToolDescNotification", category: "optional" },

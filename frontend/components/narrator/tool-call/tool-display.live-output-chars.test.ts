@@ -8,7 +8,47 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { getSummary } from "./tool-display";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
+import { getCategory, getCategoryColor, getSummary, isRunningForegroundBash } from "./tool-display";
+
+describe("Stop display and legacy cancellation history", () => {
+	it("displays Stop type and target, without treating it as a launched agent or Bash", () => {
+		expect(getCategory("Stop")).toBe("stop");
+		expect(getCategoryColor("stop")).toBe("orange");
+		for (const type of ["bash", "agent"]) {
+			const input = { type, id: "owned-task" };
+			expect(getSummary("Stop", input)).toBe(`${type}: owned-task`);
+			expect(isRunningForegroundBash("Stop", input, "running")).toBe(false);
+			expect(
+				classifyToolDetail({
+					toolUseId: "stop-display-test",
+					toolName: "Stop",
+					category: "stop",
+					status: "completed",
+					inputJson: input,
+					outputJson: "Task cancelled",
+				}),
+			).toBeDefined();
+		}
+	});
+
+	it("retains summaries and details for historical Bash/Agent stop cards", () => {
+		for (const toolName of ["Bash", "Agent"]) {
+			const input = { stop: "old-task" };
+			expect(getSummary(toolName, input)).toBe("Stop: old-task");
+			expect(
+				classifyToolDetail({
+					toolUseId: "stop-display-test",
+					toolName,
+					category: getCategory(toolName),
+					status: "completed",
+					inputJson: input,
+					outputJson: "Task cancelled",
+				}),
+			).toBeDefined();
+		}
+	});
+});
 
 describe("Agent header summary live output counter", () => {
 	const input = { subagent_type: "explore", description: "survey auth flow" };

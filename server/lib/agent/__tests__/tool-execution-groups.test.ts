@@ -32,6 +32,19 @@ describe("tool execution grouping", () => {
 			).toEqual([["Read"], [name], ["Grep"]]);
 		}
 	});
+	test("Stop is a serial barrier even with parallel opt-in and waits for preceding admission", () => {
+		for (const type of ["bash", "agent"]) {
+			const stop = tool("Stop", { type, id: "owned-task", parallel: true });
+			expect(isStrictSerialToolExecution(stop)).toBe(true);
+			expect(isParallelSafeToolExecution(stop)).toBe(false);
+			expect(
+				groupToolExecutions([tool("Agent"), stop, tool("Read")]).map((group) =>
+					group.map(({ name }) => name),
+				),
+			).toEqual([["Agent"], ["Stop"], ["Read"]]);
+		}
+	});
+
 	test("matches loop ordering, parallel runs, and serial barriers", () => {
 		const tools = [
 			tool("Write"),

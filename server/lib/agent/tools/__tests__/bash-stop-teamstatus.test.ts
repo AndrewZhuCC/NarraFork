@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import * as oauthRuntime from "@server/services/oauth-narrator-runtime-policy";
 import {
 	getUpdateCoordinationStatus,
 	resetUpdateCoordinationForTests,
@@ -6,13 +7,13 @@ import {
 	tryAcquireFinalUpdateExecution,
 	waitForBackgroundBashDrain,
 } from "@server/services/update-coordinator";
-
 import type { ExecHandle, ExecutionBackend } from "../../execution/backend";
 import { localBackend } from "../../execution/local-backend";
 import { toolRegistry } from "../../tool-registry";
 import { type AgentConfig, PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
 import "../index";
 import { bashTool, resolveBashTimeoutMs } from "../bash";
+import { stopTool } from "../stop";
 import { teamStatusTool } from "../team-status";
 
 // --- Background task service stub (drives list/cancel behaviour) ---
@@ -21,6 +22,7 @@ type FakeTask = {
 	id: string;
 	parentNarratorId: string;
 	type: "bash" | "agent";
+	subagentNarratorId?: string;
 	backgroundKind?: "task" | "service";
 	error?: string;
 	status: string;
@@ -33,6 +35,7 @@ type FakeTask = {
 
 const tasks = new Map<string, FakeTask>();
 const cancelled: string[] = [];
+const cancelledAgents: string[] = [];
 const taskOutput = new Map<string, string>();
 const abortControllers = new Map<string, AbortController>();
 const killHandlers = new Map<string, () => void>();
@@ -274,6 +277,13 @@ const deliveredMessages: DeliveredMessage[] = [];
 let deliveryHook: ((targetId: string) => Promise<string | undefined>) | undefined;
 
 mock.module("@server/services/narrator-subagent", () => ({
+	async cancelBackgroundTask(narratorId: string) {
+		cancelledAgents.push(narratorId);
+		const task = [...tasks.values()].find((task) => task.subagentNarratorId === narratorId);
+		if (!task || task.status !== "running") return false;
+		task.status = "cancelled";
+		return true;
+	},
 	registerTaskAlias(_parentNarratorId: string, _taskId: string, title?: string) {
 		return { alias: title || "background-bash", conflicted: false };
 	},
@@ -319,6 +329,9 @@ mock.module("@server/services/agent-communication", () => ({
 	},
 }));
 
+// These in-memory narrator fixtures are ordinary (non-OAuth) sessions.
+spyOn(oauthRuntime, "assertOAuthNarratorRuntimeActive").mockResolvedValue(null);
+
 afterAll(() => {
 	mock.module("@server/services/background-task-service", () => realBackgroundTaskServiceModule);
 	mock.module("@server/services/narrator-service", () => realNarratorServiceModule);
@@ -344,6 +357,7 @@ function seed() {
 	abortControllers.clear();
 	killHandlers.clear();
 	cancelled.length = 0;
+	cancelledAgents.length = 0;
 	narrators.clear();
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
@@ -377,7 +391,7 @@ describe("Bash background kinds", () => {
 		});
 		expect(properties.background_kind.description).toContain("forbidden");
 		expect(properties.run_in_background.description).toContain("Forbidden");
-		expect(properties.stop.description).toContain("Forbidden");
+		expect(properties).not.toHaveProperty("stop");
 	});
 	test("services do not implicitly opt out of the background timeout", () => {
 		const args = bashTool.parameters.parse({
@@ -630,11 +644,11 @@ describe("Bash background kinds", () => {
 		}
 	});
 
-	test("schema defaults commands to task, but preserves stop without a kind", () => {
+	test("schema defaults commands to task and rejects legacy stop", () => {
 		expect(bashTool.parameters.parse({ command: "true" })).toMatchObject({
 			background_kind: "task",
 		});
-		expect(bashTool.parameters.parse({ stop: "id" })).not.toHaveProperty("background_kind");
+		expect(bashTool.parameters.safeParse({ stop: "id" }).success).toBe(false);
 		expect(
 			bashTool.parameters.safeParse({ command: "true", background_kind: "service" }).success,
 		).toBe(false);
@@ -694,23 +708,43 @@ describe("Bash background kinds", () => {
 		const task = [...tasks.values()][0];
 		const deadline = Date.now() + 2_000;
 		while (!killHandlers.has(task.id) && Date.now() < deadline) await Bun.sleep(1);
-		expect((await bashTool.execute({ stop: task.id }, makeCtx("parent"))).isError).toBeFalsy();
+		expect(
+			(await stopTool.execute({ type: "bash", id: task.id }, makeCtx("parent"))).isError,
+		).toBeFalsy();
 		await Bun.sleep(20);
 		expect(task.status).toBe("cancelled");
 		expect(task.error).toBeUndefined();
 	});
 });
 
-describe("Bash stop mode", () => {
-	test("schema: command is optional and stop is exposed as mutually exclusive", () => {
-		expect(bashTool.parameters.safeParse({ stop: "task-1" }).success).toBe(true);
+describe("Stop tool", () => {
+	test("Bash requires a nonblank command and does not expose legacy stop", () => {
+		for (const args of [{}, { stop: "task-1" }, { command: "" }, { command: " \t\n" }])
+			expect(bashTool.parameters.safeParse(args).success).toBe(false);
 		expect(bashTool.parameters.safeParse({ command: "echo hi" }).success).toBe(true);
 		const raw = bashTool.rawJsonSchema as {
-			properties?: Record<string, { description?: string } | undefined>;
+			properties?: Record<string, unknown>;
 			required?: string[];
 		};
-		expect(raw.required ?? []).toHaveLength(0);
-		expect(raw.properties?.stop?.description).toContain("Mutually exclusive");
+		expect(raw.required).toContain("command");
+		expect(raw.properties).not.toHaveProperty("stop");
+	});
+
+	test("Stop schema requires an explicit type and nonblank trimmed id", () => {
+		for (const args of [
+			{},
+			{ id: "task-1" },
+			{ type: "bash" },
+			{ type: "other", id: "task-1" },
+			{ type: "bash", id: "" },
+			{ type: "agent", id: " \t\n" },
+		])
+			expect(stopTool.parameters.safeParse(args).success).toBe(false);
+		expect(stopTool.parameters.parse({ type: "bash", id: " task-1 " })).toEqual({
+			type: "bash",
+			id: "task-1",
+		});
+		expect(stopTool.rawJsonSchema?.required).toEqual(expect.arrayContaining(["type", "id"]));
 	});
 
 	test("stop without command cancels a running background bash task", async () => {
@@ -725,7 +759,7 @@ describe("Bash stop mode", () => {
 			title: "Long task",
 			canCancelActiveWork: true,
 		});
-		const result = await bashTool.execute({ stop: "my-task" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "my-task" }, makeCtx("parent"));
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("cancelled");
 		expect(cancelled).toEqual(["bash_1"]);
@@ -743,7 +777,7 @@ describe("Bash stop mode", () => {
 			title: null,
 			canCancelActiveWork: false,
 		});
-		const result = await bashTool.execute({ stop: "bash_2" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "bash_2" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("not running");
 	});
@@ -760,12 +794,12 @@ describe("Bash stop mode", () => {
 			title: null,
 			canCancelActiveWork: true,
 		});
-		const result = await bashTool.execute({ stop: "bash_3" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "bash_3" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("does not belong");
 	});
 
-	test("stop rejects agent tasks and points to Agent stop", async () => {
+	test("bash stop rejects agent tasks before cancellation", async () => {
 		seed();
 		tasks.set("agent_1", {
 			id: "agent_1",
@@ -777,23 +811,161 @@ describe("Bash stop mode", () => {
 			title: null,
 			canCancelActiveWork: true,
 		});
-		const result = await bashTool.execute({ stop: "agent_1" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "agent_1" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("agent task");
+		expect(result.output).toContain("agent");
+		expect(cancelled).toEqual([]);
+	});
+
+	for (const selector of ["agent-task", "agent-alias"]) {
+		test(`agent stop resolves ${selector} and cancels the validated child narrator`, async () => {
+			seedAgentTask();
+			const result = await stopTool.execute(
+				{ type: "agent", id: ` ${selector} ` },
+				makeCtx("parent"),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("cancelled");
+			expect(cancelledAgents).toEqual(["child-agent"]);
+			expect(cancelled).toEqual([]);
+			expect(tasks.get("agent-task")?.status).toBe("cancelled");
+		});
+	}
+
+	function seedAgentTask() {
+		seed();
+		tasks.set("agent-task", {
+			id: "agent-task",
+			parentNarratorId: "parent",
+			type: "agent",
+			subagentNarratorId: "child-agent",
+			status: "running",
+			command: null,
+			alias: "agent-alias",
+			title: "Agent task",
+			canCancelActiveWork: true,
+		});
+		narrators.set("child-agent", {
+			id: "child-agent",
+			parentNarratorId: "parent",
+			variant: "subagent:general",
+			status: "working",
+			title: "Child agent",
+		});
+	}
+
+	test("subagents cannot stop their own child agents through Stop", async () => {
+		seedAgentTask();
+		const result = await stopTool.execute(
+			{ type: "agent", id: "agent-task" },
+			makeCtx("parent", "grandparent"),
+		);
+		expect(result.isError).toBe(true);
+		expect(cancelledAgents).toEqual([]);
+		expect(cancelled).toEqual([]);
+	});
+
+	test("subagents can stop only their own Bash tasks", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.type = "bash";
+		const sibling = await stopTool.execute(
+			{ type: "bash", id: task.id },
+			makeCtx("sibling", "grandparent"),
+		);
+		expect(sibling.isError).toBe(true);
+		expect(cancelled).toEqual([]);
+		const own = await stopTool.execute(
+			{ type: "bash", id: task.id },
+			makeCtx("parent", "grandparent"),
+		);
+		expect(own.isError).toBeFalsy();
+		expect(cancelled).toEqual([task.id]);
+		expect(cancelledAgents).toEqual([]);
+	});
+
+	test("agent stop rejects a Bash task before calling either canceller", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.type = "bash";
+		const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("type bash");
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual([]);
+	});
+
+	for (const invalid of ["foreign-task", "foreign-child", "primary-child", "missing-child"]) {
+		test(`agent stop rejects ${invalid} without cancellation`, async () => {
+			seedAgentTask();
+			const task = tasks.get("agent-task") as FakeTask;
+			const child = narrators.get("child-agent") as FakeNarrator;
+			if (invalid === "foreign-task") {
+				task.parentNarratorId = "other-parent";
+				task.type = "bash";
+			}
+			if (invalid === "foreign-child") child.parentNarratorId = "other-parent";
+			if (invalid === "primary-child") child.variant = "primary";
+			if (invalid === "missing-child") narrators.clear();
+			const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain(
+				invalid === "foreign-task" ? "does not belong" : "not a direct child",
+			);
+			expect(cancelled).toEqual([]);
+			expect(cancelledAgents).toEqual([]);
+			expect(task.status).toBe("running");
+		});
+	}
+
+	test("agent stop reports a completed task without changing its terminal status", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.status = "completed";
+		const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not running");
+		expect(task.status).toBe("completed");
+		expect(cancelled).toEqual([]);
+	});
+
+	test("invalid direct Stop calls cannot cancel or infer a target", async () => {
+		seedAgentTask();
+		for (const args of [
+			{},
+			{ id: "agent-task" },
+			{ type: "agent" },
+			{ type: "other", id: "agent-task" },
+			{ type: "agent", id: "" },
+			{ type: "bash", id: " \t\n" },
+		]) {
+			const result = await stopTool.execute(args, makeCtx("parent"));
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Invalid Stop parameters");
+		}
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual([]);
 	});
 
 	test("stop rejects unknown task ids", async () => {
 		seed();
-		const result = await bashTool.execute({ stop: "missing" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "missing" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("does not exist");
 	});
 
-	test("command and stop together are rejected", async () => {
+	test("legacy Bash stop is explicitly rejected before command execution", async () => {
 		seed();
-		const result = await bashTool.execute({ command: "echo hi", stop: "x" }, makeCtx("parent"));
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("not both");
+		const ctx = makeCtx("parent");
+		const requestPermission = mock(async () => ({ behavior: "allow" as const }));
+		ctx.requestPermission = requestPermission;
+		for (const args of [{ stop: "x" }, { command: "echo hi", stop: "x" }]) {
+			const result = await bashTool.execute(args, ctx);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Stop");
+		}
+		expect(requestPermission).not.toHaveBeenCalled();
+		expect(cancelled).toEqual([]);
 	});
 
 	test("neither command nor stop is an error", async () => {

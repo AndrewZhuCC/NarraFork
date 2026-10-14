@@ -900,6 +900,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Bash",
 	"Agent",
 	"Await",
+	"Stop",
 	"Send",
 	"TeamStatus",
 	"AskUserQuestion",
