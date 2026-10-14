@@ -1213,30 +1213,48 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	// promptTokens 含缓存；优先采用上游已扣减的 inputTokens，缺失时才由 promptTokens 扣除。
+	// 直接取 promptTokens 会把 mapUsageStream 的归一结果还原成含缓存口径。
+	const rawInput = usage.inputTokens ?? usage.promptTokens ?? 0;
+	const promptTokens = usage.promptTokens ?? rawInput;
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : rawInput,
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
 }
 
+/**
+ * ⚠️ 新增 provider adapter 前必须先调研其 token 数据组成：input 是否已含缓存、缓存读取/写入
+ * 分别落在哪个字段、数值是「单次值」还是「会话累计值」，再决定换算方式。弄错的代价不会立刻
+ * 显现——错误口径会被静默写入 api_requests，污染用量统计与缓存命中率，事后只能靠数据特征
+ * 反推修补。
+ */
 function mapUsage(usage: GeminiUsageMetadata | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		inputTokens: usage.promptTokenCount ?? 0,
+		// 与 mapUsageStream 保持同一口径：promptTokenCount 含缓存，这里扣掉后才是纯输入；
+		// 若上游已扣过（promptTokens 不大于 cached），跳过以免出现负数。
+		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
 		outputTokens: usage.candidatesTokenCount ?? 0,
-		cachedInputTokens: usage.cachedContentTokenCount ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? 0,
 	};
 }
 
 function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEvent["usage"]> {
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		promptTokens: usage.promptTokenCount ?? 0,
-		inputTokens: (usage.promptTokenCount ?? 0) - (usage.cachedContentTokenCount ?? 0),
+		promptTokens,
+		// 同 mapUsage：只有确认含缓存时才扣减，避免下游已归一的口径被二次扣减。
+		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
 		completionTokens: usage.candidatesTokenCount ?? 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? undefined,
 		cachedInputTokens: usage.cachedContentTokenCount ?? undefined,

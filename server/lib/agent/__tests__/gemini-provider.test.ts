@@ -321,7 +321,8 @@ describe("Gemini transport selection", () => {
 		expect(result).toEqual({
 			text: "generated",
 			usage: {
-				inputTokens: 7,
+				// promptTokenCount 7 含缓存 1，归一到「input 不含缓存」后为 6。
+				inputTokens: 6,
 				outputTokens: 2,
 				cachedInputTokens: 1,
 				cacheCreationInputTokens: 0,
@@ -438,7 +439,8 @@ describe("Gemini lightweight partial output regression", () => {
 						text: partialText,
 						outputTruncated: true,
 						usage: {
-							inputTokens: 11,
+							// promptTokenCount 11 含缓存 3，归一到「input 不含缓存」后为 8。
+							inputTokens: 8,
 							outputTokens: 7,
 							cachedInputTokens: 3,
 							cacheCreationInputTokens: 0,
@@ -886,7 +888,8 @@ describe("Gemini Interactions API provider", () => {
 		expect(result).toEqual({
 			text: "Hello world",
 			usage: {
-				inputTokens: 9,
+				// total_input_tokens 9 含缓存 2，归一到「input 不含缓存」后为 7。
+				inputTokens: 7,
 				outputTokens: 3,
 				cachedInputTokens: 2,
 				cacheCreationInputTokens: 0,

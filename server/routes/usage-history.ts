@@ -99,7 +99,17 @@ const credentialTotalsQuerySchema = z.object({
 
 const breakdownQuerySchema = statsQuerySchema.extend({
 	dimension: z.enum(["provider", "model", "kind", "user"]),
-	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	metric: z.enum([
+		"requests",
+		"tokens",
+		"cost",
+		"inputTokens",
+		"outputTokens",
+		"cachedInputTokens",
+		"cacheCreationTokens",
+		"cacheHitRate",
+		"reasoningTokens",
+	]),
 	cluster: z
 		.enum(["true", "false", "1", "0"])
 		.default("true")
@@ -108,7 +118,17 @@ const breakdownQuerySchema = statsQuerySchema.extend({
 
 const stackedTimeSeriesQuerySchema = statsQuerySchema.extend({
 	dimension: z.enum(["provider", "model", "kind", "user"]),
-	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	metric: z.enum([
+		"requests",
+		"tokens",
+		"cost",
+		"inputTokens",
+		"outputTokens",
+		"cachedInputTokens",
+		"cacheCreationTokens",
+		"cacheHitRate",
+		"reasoningTokens",
+	]),
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
 	topN: z.coerce.number().int().positive().max(10).default(5),
 	cluster: z

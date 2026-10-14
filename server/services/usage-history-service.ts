@@ -123,6 +123,9 @@ export type UsageBreakdownMetric =
 	| "cost"
 	| "inputTokens"
 	| "outputTokens"
+	| "cachedInputTokens"
+	| "cacheCreationTokens"
+	| "cacheHitRate"
 	| "reasoningTokens";
 
 export interface UsageBreakdownEntry {
@@ -1187,6 +1190,15 @@ export class UsageHistoryService {
 				return sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`;
 			case "inputTokens":
 				return sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`;
+			case "cachedInputTokens":
+				return sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`;
+			case "cacheCreationTokens":
+				return sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`;
+			// 缓存命中率 = 缓存读取 ÷ (缓存读取 + 缓存写入 + 纯输入)。
+			// 必须先分别求和再相除：按行求比率再平均会让小请求行获得与百万级请求相同的权重。
+			// 分母为 0（该组无任何输入侧 token）时返回 0，避免 NaN 污染图表。
+			case "cacheHitRate":
+				return sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0) * 1.0 / nullif(coalesce(sum(${apiRequests.cachedInputTokens}), 0) + coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0) + coalesce(sum(${apiRequests.inputTokens}), 0), 0)`;
 			case "outputTokens":
 				return sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`;
 			case "reasoningTokens":

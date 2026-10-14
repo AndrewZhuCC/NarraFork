@@ -113,6 +113,17 @@ export function applyOpenAIModelMetadata(
 	assertModelInputModalities(model, body, metadata);
 }
 
+/**
+ * 把供应商返回的 usage 归一为内部口径：inputTokens 不含缓存，缓存读取/写入独立字段。
+ *
+ * ⚠️ 新增 provider adapter 前必须先调研其 token 数据组成：input 是否已含缓存、缓存读取/写入
+ * 分别落在哪个字段、数值是「单次值」还是「会话累计值」，再决定换算方式。弄错的代价不会立刻
+ * 显现——错误口径会被静默写入 api_requests，污染用量统计与缓存命中率，事后只能靠数据特征
+ * 反推修补。
+ *
+ * OpenAI 的 prompt_tokens 已含缓存部分，因此这里减去 cached 才是纯输入；少数上游已自行
+ * 扣减过，此时 prompt 不会大于 cached，跳过相减避免出现负数。
+ */
 function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
 	if (typeof usage !== "object" || usage === null) return null;
 	const data = usage as Record<string, unknown>;
@@ -131,13 +142,18 @@ function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
 		}
 		return undefined;
 	};
+	const cachedInput =
+		numberValue("cachedInputTokens", "cached_input_tokens") ??
+		(typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : 0);
+	const rawInput =
+		numberValue("inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0;
 	return {
-		inputTokens: numberValue("inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0,
+		// OpenAI 的 prompt_tokens 含缓存部分，统一归一到「input 不含缓存」；
+		// 少数情况下游已扣过缓存，此时 rawInput 不会大于 cached，直接跳过避免出现负数。
+		inputTokens: rawInput > cachedInput ? rawInput - cachedInput : rawInput,
 		outputTokens:
 			numberValue("completionTokens", "outputTokens", "completion_tokens", "output_tokens") ?? 0,
-		cachedInputTokens:
-			numberValue("cachedInputTokens", "cached_input_tokens") ??
-			(typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : 0),
+		cachedInputTokens: cachedInput,
 		cacheCreationInputTokens:
 			numberValue("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0,
 		cacheCreation5mInputTokens:

@@ -1336,10 +1336,15 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	// promptTokens 含缓存；优先采用上游已扣减的 inputTokens，缺失时才由 promptTokens 扣除。
+	// 直接取 promptTokens 会把 mapUsageStream 的归一结果还原成含缓存口径。
+	const rawInput = usage.inputTokens ?? usage.promptTokens ?? 0;
+	const promptTokens = usage.promptTokens ?? rawInput;
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : rawInput,
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
@@ -1347,10 +1352,15 @@ function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): U
 
 function mapUsage(usage: GeminiInteractionUsage | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0;
+	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
-		inputTokens: usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0,
+		// 与 mapUsageStream 同口径：prompt() 含缓存，只有确认大于缓存时才扣除，
+		// 否则说明上游已是「input 不含缓存」，保留原值以免出现负数或误判为 0。
+		inputTokens:
+			promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
 		outputTokens: usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
-		cachedInputTokens: usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens:
 			usage.total_thought_tokens ?? usage.thought_tokens ?? usage.reasoning_tokens ?? 0,
@@ -1362,7 +1372,9 @@ function mapUsageStream(usage: GeminiInteractionUsage): NonNullable<ParsedStream
 	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
 		promptTokens,
-		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
+		// 同 mapUsage：大于才减，避免把已归一的输入二次扣减成 0。
+		inputTokens:
+			promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
 		completionTokens:
 			usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
 		reasoningTokens: usage.total_thought_tokens ?? usage.thought_tokens ?? usage.reasoning_tokens,
