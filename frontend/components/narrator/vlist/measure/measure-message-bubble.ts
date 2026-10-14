@@ -20,7 +20,7 @@ import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
-import { quoteDisplayText } from "../../composer/composer-quotes";
+import { type ComposerQuote, parseComposerQuotePrefix } from "../../composer/composer-quotes";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -69,6 +69,11 @@ export const USER_HEADER_BODY_GAP = 4;
 export const USER_HEADER_MIN_CONTENT_WIDTH = 140;
 /** Stack gap between a user bubble's attachments and its body text (Stack gap={4}). */
 export const USER_ATTACHMENT_GAP = 4;
+/** Sent quote chips match the composer chip: one 24px row, wrapping onto the next. */
+export const USER_QUOTE_CHIP_HEIGHT = 24;
+export const USER_QUOTE_CHIP_GAP = 6;
+/** Horizontal chrome around the label: padding, quote icon, and the gap before the text. */
+const USER_QUOTE_CHIP_CHROME = 6 + 12 + 4 + 6;
 /** Stack gap between the reply quote strip and whatever follows it (Stack gap={4}). */
 export const USER_QUOTE_GAP = 4;
 /** Left rail width of the reply quote strip (the tinted vertical bar). */
@@ -388,9 +393,69 @@ function attachmentBlock(
 }
 
 // ── user: plain pre-wrap body inside a shrink-wrapping bubble ─────────────────
+/** Pack quote chips into rows. Positions are what the bubble paints; nothing is remeasured there. */
+function quoteChipLayout(quotes: readonly ComposerQuote[], innerWidth: number) {
+	const chips: { x: number; y: number; width: number }[] = [];
+	let x = 0;
+	let y = 0;
+	for (const quote of quotes) {
+		const prepared = prepareWithSegments(quote.label, typographyMetrics().font.xs, {
+			whiteSpace: "pre-wrap",
+		});
+		const textWidth = Math.ceil(measureNaturalWidth(prepared));
+		const width = Math.min(
+			innerWidth,
+			Math.max(USER_QUOTE_CHIP_CHROME + 8, USER_QUOTE_CHIP_CHROME + textWidth),
+		);
+		if (x > 0 && x + width > innerWidth) {
+			x = 0;
+			y += USER_QUOTE_CHIP_HEIGHT + USER_QUOTE_CHIP_GAP;
+		}
+		chips.push({ x, y, width });
+		x += width + USER_QUOTE_CHIP_GAP;
+	}
+	const used = chips.reduce((max, chip) => Math.max(max, chip.x + chip.width), 0);
+	return {
+		height: quotes.length ? y + USER_QUOTE_CHIP_HEIGHT : 0,
+		used: Math.min(innerWidth, used),
+		chips,
+	};
+}
+
+function quoteChipBlock(
+	quotes: readonly ComposerQuote[],
+	innerWidth: number,
+	marginTop: number,
+): PreparedFixedBlock {
+	const layout = quoteChipLayout(quotes, innerWidth);
+	return {
+		kind: "fixed",
+		tag: "user-quote-chips",
+		marginTop,
+		height: layout.height,
+		displayWidth: Math.max(1, layout.used),
+		data: {
+			quotes: quotes.map((quote) => ({
+				label: quote.label,
+				text: quote.text,
+				anchor: quote.anchor ?? null,
+			})),
+			chips: layout.chips,
+		},
+		contentLeft: 0,
+		quoteRailLefts: [],
+		markerText: null,
+		markerLeft: null,
+		markerClassName: null,
+	};
+}
+
 function measureUserMessage(input: MeasureMessageInput, contentWidth: number): MeasuredElement {
-	const presented = quoteDisplayText(input.text);
-	const bodyText = presented.text;
+	// The stored text still carries the quote prefix so a click knows its source.
+	// The bubble shows that metadata as chips; the concatenated paragraphs stay out
+	// of the body.
+	const storedQuotes = parseComposerQuotePrefix(input.text);
+	const bodyText = input.text.slice(storedQuotes.prefixLength);
 	const innerWidth = Math.max(1, contentWidth - USER_BUBBLE_PADDING * 2);
 	const blocks: PreparedBlock[] = [];
 	// True when the bubble holds at least one attachment block (used for the
@@ -454,6 +519,15 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 			if (block) blocks.push(block);
 		}
 		hasAttachments = blocks.some((block) => block.kind === "fixed" && block.tag !== "user-quote");
+		if (storedQuotes.quotes.length) {
+			blocks.push(
+				quoteChipBlock(
+					storedQuotes.quotes,
+					innerWidth,
+					blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+				),
+			);
+		}
 		// User body text is PLAIN pre-wrap (not markdown): a single pre-wrap block.
 		// An attachment-only message has no text block at all (an empty pre-wrap block
 		// would still reserve one line, leaving a blank gap under the image).
@@ -490,7 +564,7 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 				markerLeft: null,
 				markerClassName: null,
 			});
-		} else if (bodyText.length > 0 || !hasAttachments) {
+		} else if (bodyText.length > 0 || (!hasAttachments && storedQuotes.quotes.length === 0)) {
 			const bodyBlock: PreparedCodeBlock = {
 				kind: "code",
 				// Cross-width memo (see prepared-markdown-cache): the segment precompute is
@@ -540,7 +614,6 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 		frame,
 		contentWidth: innerWidth,
 		usedWidth,
-		...(presented.jumps.length ? { quoteJumps: presented.jumps } : {}),
 	};
 }
 
@@ -726,6 +799,8 @@ export const MEASURE_MESSAGE_CONSTANTS = {
 	USER_ATTACHMENT_GAP,
 	USER_ATTACHMENT_MIN_CONTENT_WIDTH,
 	USER_QUOTE_GAP,
+	USER_QUOTE_CHIP_HEIGHT,
+	USER_QUOTE_CHIP_GAP,
 	USER_QUOTE_RAIL,
 	USER_IMAGE_HEIGHT: IMAGE_FIXED_HEIGHT,
 	USER_TEXT_FILE_HEIGHT: TEXT_FILE_HEIGHT,

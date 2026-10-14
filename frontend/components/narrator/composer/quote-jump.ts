@@ -78,6 +78,24 @@ function rangeForNeedle(root: Element, needle: string): Range | null {
 	return null;
 }
 
+function highlightCovers(needle: string): boolean {
+	const lists = (
+		globalThis as {
+			CSS?: {
+				highlights?: { get?: (name: string) => Iterable<{ toString: () => string }> | undefined };
+			};
+		}
+	).CSS?.highlights;
+	if (!lists || typeof Highlight === "undefined") return true;
+	const painted = lists.get?.(HIGHLIGHT_NAME);
+	if (!painted) return false;
+	const probe = needle.slice(0, 16);
+	for (const range of painted) {
+		if (range.toString().includes(probe)) return true;
+	}
+	return false;
+}
+
 function paintHighlight(roots: readonly Element[], needle: string): boolean {
 	for (const root of roots) {
 		const range = rangeForNeedle(root, needle);
@@ -139,8 +157,18 @@ export function revealComposerQuote(
 				}
 			}
 		}
-		if (paintHighlight(roots, quoteHighlightNeedle(quote.text)) || attempt >= HIGHLIGHT_ATTEMPTS)
+		const needle = quoteHighlightNeedle(quote.text);
+		if (paintHighlight(roots, needle)) {
+			// Expanding the card replaces its text node on the next commit and can
+			// collapse the range. Confirm the highlight survived before stopping.
+			highlightTimer = setTimeout(() => {
+				attempt += 1;
+				if (highlightCovers(needle) || attempt >= HIGHLIGHT_ATTEMPTS) return;
+				tick();
+			}, HIGHLIGHT_INTERVAL_MS);
 			return;
+		}
+		if (attempt >= HIGHLIGHT_ATTEMPTS) return;
 		highlightTimer = setTimeout(tick, HIGHLIGHT_INTERVAL_MS);
 	};
 	highlightTimer = setTimeout(tick, HIGHLIGHT_INTERVAL_MS);

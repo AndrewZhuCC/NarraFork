@@ -15,10 +15,11 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import { Tooltip } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
-import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
-import { type CSSProperties, useId, useMemo } from "react";
-import { type QuoteDisplayJump, quoteJumpForLine } from "../../composer/composer-quotes";
+import { IconChevronDown, IconChevronRight, IconQuote } from "@tabler/icons-react";
+import { useId, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
@@ -36,6 +37,7 @@ import {
 	USER_BUBBLE_PADDING,
 	USER_HEADER_BODY_GAP,
 	USER_HEADER_HEIGHT,
+	USER_QUOTE_CHIP_HEIGHT,
 } from "../measure/measure-message-bubble";
 import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -406,8 +408,6 @@ function UserBubble({
 	const headerBlock = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
 	const contentTop = USER_BUBBLE_PADDING + headerBlock;
 	const lineHeight = bodyBlock?.lineHeight ?? 20;
-	const quoteJumps = (measured as { quoteJumps?: QuoteDisplayJump[] }).quoteJumps;
-	const dock = useNarratorDockContext();
 
 	const surface = bubbleSurface(isSelf);
 
@@ -476,6 +476,16 @@ function UserBubble({
 					if (block.tag === "user-deleted") {
 						return <TombstoneLine key="user-deleted" block={block} top={top} />;
 					}
+					if (block.tag === "user-quote-chips") {
+						return (
+							<UserQuoteChips
+								key="user-quote-chips"
+								block={block}
+								top={top}
+								left={USER_BUBBLE_PADDING}
+							/>
+						);
+					}
 					return (
 						<UserAttachmentView
 							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message contentJson order)
@@ -498,69 +508,137 @@ function UserBubble({
 							left: USER_BUBBLE_PADDING,
 						}}
 					>
-						{lines.map((line, i) => {
-							const jump = quoteJumpForLine(lines, i, quoteJumps);
-							const lineStyle: CSSProperties = {
-								position: "absolute",
-								top: i * lineHeight,
-								left: 0,
-								height: lineHeight,
-								whiteSpace: "pre",
-								font: typographyMetrics().font.body,
-								color: "var(--mantine-color-text)",
-							};
-							if (!jump) {
-								return (
-									<div
-										// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
-										key={i}
-										style={lineStyle}
-									>
-										{line.text}
-									</div>
-								);
-							}
-							return (
-								<button
-									// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
-									key={i}
-									type="button"
-									onClick={(event) => {
-										if (window.getSelection()?.isCollapsed === false) return;
-										event.stopPropagation();
-										revealComposerQuote(
-											dock,
-											{
-												label: jump.header,
-												text: jump.highlight,
-												anchor: jump.anchor,
-											},
-											event.currentTarget,
-										);
-									}}
-									style={{
-										...lineStyle,
-										display: "block",
-										boxSizing: "border-box",
-										lineHeight: `${lineHeight}px`,
-										overflow: "hidden",
-										padding: 0,
-										border: "none",
-										cursor: "pointer",
-										textAlign: "left",
-										background: line.text.startsWith("> [quote] ")
-											? "var(--mantine-color-default-hover)"
-											: "transparent",
-										borderRadius: 4,
-									}}
-								>
-									{line.text}
-								</button>
-							);
-						})}
+						{lines.map((line, i) => (
+							<div
+								// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
+								key={i}
+								style={{
+									position: "absolute",
+									top: i * lineHeight,
+									left: 0,
+									height: lineHeight,
+									whiteSpace: "pre",
+									font: typographyMetrics().font.body,
+									color: "var(--mantine-color-text)",
+								}}
+							>
+								{line.text}
+							</div>
+						))}
 					</div>
 				) : null}
 			</div>
+		</div>
+	);
+}
+
+interface StoredQuoteChip {
+	label: string;
+	text: string;
+	anchor: string | null;
+}
+
+interface StoredQuoteChipBox {
+	x: number;
+	y: number;
+	width: number;
+}
+
+/**
+ * Quote chips for a sent user message. The measured box already wrapped them;
+ * this only paints those positions. The quoted paragraphs stay in the chip
+ * metadata so a click can highlight the source.
+ */
+function UserQuoteChips({
+	block,
+	top,
+	left,
+}: {
+	block: PreparedFixedBlock;
+	top: number;
+	left: number;
+}) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	const data = block.data ?? {};
+	const quotes = Array.isArray(data.quotes) ? (data.quotes as StoredQuoteChip[]) : [];
+	const chips = Array.isArray(data.chips) ? (data.chips as StoredQuoteChipBox[]) : [];
+	return (
+		<div
+			style={{
+				position: "absolute",
+				top,
+				left,
+				width: block.displayWidth,
+				height: block.height,
+			}}
+		>
+			{quotes.map((quote, index) => {
+				const box = chips[index];
+				if (!box) return null;
+				const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
+				return (
+					<Tooltip
+						// biome-ignore lint/suspicious/noArrayIndexKey: chip order is the stored quote order
+						key={index}
+						label={
+							<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>
+						}
+						multiline
+						w={360}
+						openDelay={300}
+						withinPortal
+					>
+						<button
+							type="button"
+							aria-label={t("quote.open")}
+							disabled={!quote.anchor}
+							onClick={(event) => {
+								if (!quote.anchor) return;
+								if (window.getSelection()?.isCollapsed === false) return;
+								event.stopPropagation();
+								revealComposerQuote(
+									dock,
+									{ label: quote.label, text: quote.text, anchor: quote.anchor },
+									event.currentTarget,
+								);
+							}}
+							style={{
+								position: "absolute",
+								left: box.x,
+								top: box.y,
+								width: box.width,
+								height: USER_QUOTE_CHIP_HEIGHT,
+								boxSizing: "border-box",
+								display: "flex",
+								alignItems: "center",
+								gap: 4,
+								padding: "0 6px",
+								border: "1px solid var(--mantine-color-default-border)",
+								borderRadius: "var(--mantine-radius-sm)",
+								background: "var(--mantine-color-default-hover)",
+								color: "inherit",
+								font: typographyMetrics().font.xs,
+								overflow: "hidden",
+								cursor: quote.anchor ? "pointer" : "default",
+								textAlign: "left",
+							}}
+						>
+							<IconQuote size={12} style={{ flexShrink: 0 }} />
+							<span
+								style={{
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+									whiteSpace: "nowrap",
+									minWidth: 0,
+								}}
+							>
+								{quote.label}
+							</span>
+						</button>
+					</Tooltip>
+				);
+			})}
 		</div>
 	);
 }
