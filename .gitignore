@@ -173,9 +173,10 @@ package-lock.json
 IMPROVEMENT-PLAN.md
 *.log
 
-# Dynamic Spec runtime state (per-narrator task queue / planning notes)
-spec/
-spec:/
+# Dynamic Spec 运行时状态（叙述者任务队列 / 规划笔记）。锚定到仓库根，
+# 避免把源码目录 frontend/components/narrator/spec/ 一并忽略。
+/spec/
+/spec:/
 
 # Dual-database regression reports written by scripts/test-database-regression.ts
 # (ARTIFACT_ROOT). Per-run junit XML, results.json, rerun.txt and logs are reproducible
