@@ -22,6 +22,7 @@ import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
 } from "../../composer/FileReferenceScope";
+import { QUOTE_ROLE_ATTR } from "../../composer/quote-source-attrs";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
 	ASSISTANT_PAD_X,
@@ -128,6 +129,7 @@ export function RenderMessageBubble({
 	if (role === "assistant") {
 		return (
 			<div
+				{...{ [QUOTE_ROLE_ATTR]: "assistant" }}
 				style={{
 					position: "relative",
 					paddingInline: ASSISTANT_PAD_X,
@@ -215,7 +217,10 @@ function CommandBubble({
 	const surface = bubbleSurface(isSelf);
 
 	return (
-		<div style={{ display: "flex", justifyContent: surface.justifyContent }}>
+		<div
+			{...{ [QUOTE_ROLE_ATTR]: "user" }}
+			style={{ display: "flex", justifyContent: surface.justifyContent }}
+		>
 			<div
 				style={{
 					position: "relative",
@@ -402,7 +407,10 @@ function UserBubble({
 	const surface = bubbleSurface(isSelf);
 
 	return (
-		<div style={{ display: "flex", justifyContent: surface.justifyContent }}>
+		<div
+			{...{ [QUOTE_ROLE_ATTR]: "user" }}
+			style={{ display: "flex", justifyContent: surface.justifyContent }}
+		>
 			<div
 				style={{
 					position: "relative",

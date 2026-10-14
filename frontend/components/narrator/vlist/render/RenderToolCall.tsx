@@ -88,6 +88,7 @@ import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { resolveToolCallTiming } from "@shared/tool-display-duration";
 import { CopyButton } from "../../../common/CopyButton";
+import { QUOTE_TOOL_ATTR, QUOTE_TOOL_SUMMARY_ATTR } from "../../composer/quote-source-attrs";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";
@@ -2511,13 +2512,17 @@ export function RenderToolCall({
 			{liveSlot}
 		</>
 	);
+	const quoteSource = {
+		[QUOTE_TOOL_ATTR]: measured.toolName,
+		[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
+	};
 
 	// In a run: no border, a trailing divider unless last. The shimmer overlay
 	// sits on the inner padded box (not the outer wrapper) so the divider stays
 	// outside the `overflow: hidden` sweep — mirrors ToolCallCard :6100.
 	if (inRun) {
 		return (
-			<Box>
+			<Box {...quoteSource}>
 				<Box p="xs" className={shimmerClass} style={{ boxSizing: "border-box" }}>
 					{body}
 				</Box>
@@ -2533,6 +2538,7 @@ export function RenderToolCall({
 			// so it has to arrive and leave rather than travel). Marked rather than found by
 			// tag so the fade cannot silently retarget if the card's markup changes.
 			data-nf-card-surface
+			{...quoteSource}
 			withBorder={hasBorder}
 			radius="sm"
 			p="xs"
