@@ -88,6 +88,17 @@ export interface RevertJournalPendingCursor {
 	id: string;
 }
 type Phase = "apply" | "compensate";
+/**
+ * Running totals that a complete scan proved for ONE exact operation revision. Every journal
+ * write that touches a file row also advances the operation revision in the same transaction,
+ * and namespace reset rewrites the operation row too, so "cached row equals the live row" means
+ * no file row changed through any sanctioned path since these totals were proven.
+ */
+type RunningTotals = { operation: RevertJournalOperation; bytes: number; applied: number };
+/** Operations that may still receive receipts or compensation; anything else is evicted. */
+const LIVE_TOTAL_STATUSES = ["applying", "files_verified", "compensating", "recovery_required"];
+/** Bound on concurrently cached plans per journal; a miss only costs one complete scan. */
+const MAX_CACHED_TOTALS = 64;
 type Scan = {
 	operation: RevertJournalOperation;
 	bytes: number;
@@ -123,6 +134,7 @@ export class RevertMutationJournal {
 	private readonly now: () => string;
 	private readonly namespaceKey: string;
 	private readonly plans: RevertPlanService;
+	private readonly totals = new RunningTotalsCache();
 
 	constructor(
 		private readonly db: RevertJournalDatabase,
@@ -230,71 +242,83 @@ export class RevertMutationJournal {
 		const context = normalizeContext(ctx);
 		metadata(fixed);
 		text(fixed.id);
-		return this.transaction((tx) => {
-			const operation = requireOperation(tx, context);
-			const file = requireFile(tx, operation, fixed.id);
-			assertFixedMetadata(file, fixed);
-			const journal = readJournal(file);
-			const old = journal[phase];
-			const expected = phase === "apply" ? file.expectedStateJson : file.observedAfterStateJson;
-			const desired = phase === "apply" ? file.desiredStateJson : file.expectedStateJson;
-			if (!expected || expected.kind === "unknown")
-				throw fail("UNKNOWN_STATE", "An observed known expected state is required");
-			const mutationId = phaseId(file, phase);
-			const requestDigest = phaseDigest(file, phase);
-			if (old) {
-				// Query/idempotence only, even on another connection epoch. Never replace the binding.
-				return {
-					file,
-					mayExecute: false,
-					mutationId,
-					requestDigest,
-					executionBinding: old.executionBinding,
-					expected,
-					desired,
+		const claimed = this.transaction(
+			(
+				tx,
+			): RevertJournalClaim | { claim: RevertJournalClaim; carried: RunningTotals | undefined } => {
+				const operation = requireOperation(tx, context);
+				const file = requireFile(tx, operation, fixed.id);
+				assertFixedMetadata(file, fixed);
+				const journal = readJournal(file);
+				const old = journal[phase];
+				const expected = phase === "apply" ? file.expectedStateJson : file.observedAfterStateJson;
+				const desired = phase === "apply" ? file.desiredStateJson : file.expectedStateJson;
+				if (!expected || expected.kind === "unknown")
+					throw fail("UNKNOWN_STATE", "An observed known expected state is required");
+				const mutationId = phaseId(file, phase);
+				const requestDigest = phaseDigest(file, phase);
+				if (old) {
+					// Query/idempotence only, even on another connection epoch. Never replace the binding.
+					return {
+						file,
+						mayExecute: false,
+						mutationId,
+						requestDigest,
+						executionBinding: old.executionBinding,
+						expected,
+						desired,
+					};
+				}
+				if (phase === "apply") {
+					if (operation.status !== "applying" || file.status !== "prepared" || journal.compensate)
+						throw fail("INVALID_TRANSITION", "Only an unclaimed applying plan file may dispatch");
+				} else {
+					if (operation.status !== "compensating")
+						throw fail("INVALID_TRANSITION", "The plan must explicitly enter compensation");
+					if (!compensationEligible(file, journal))
+						throw fail(
+							"UNSAFE_COMPENSATION",
+							"Only a confirmed applied desired state can authorize compensation",
+						);
+				}
+				assertLease(tx, lease, file);
+				this.manifests(tx, operation);
+				for (const state of [expected, desired]) readyState(tx, state);
+				const binding = normalizeBinding(lease.executionBinding);
+				journal[phase] = { executionBinding: binding, receipt: null };
+				const updated = {
+					...file,
+					receiptJson: journal,
+					status: phase === "apply" ? ("applying" as const) : ("compensating" as const),
+					updatedAt: this.timestamp(file.updatedAt),
 				};
-			}
-			if (phase === "apply") {
-				if (operation.status !== "applying" || file.status !== "prepared" || journal.compensate)
-					throw fail("INVALID_TRANSITION", "Only an unclaimed applying plan file may dispatch");
-			} else {
-				if (operation.status !== "compensating")
-					throw fail("INVALID_TRANSITION", "The plan must explicitly enter compensation");
-				if (!compensationEligible(file, journal))
-					throw fail(
-						"UNSAFE_COMPENSATION",
-						"Only a confirmed applied desired state can authorize compensation",
-					);
-			}
-			assertLease(tx, lease, file);
-			this.manifests(tx, operation);
-			for (const state of [expected, desired]) readyState(tx, state);
-			const binding = normalizeBinding(lease.executionBinding);
-			journal[phase] = { executionBinding: binding, receipt: null };
-			const updated = {
-				...file,
-				receiptJson: journal,
-				status: phase === "apply" ? ("applying" as const) : ("compensating" as const),
-				updatedAt: this.timestamp(file.updatedAt),
-			};
-			metadata(updated);
-			const result = tx
-				.update(files)
-				.set({ receiptJson: journal, status: updated.status, updatedAt: updated.updatedAt })
-				.where(eq(files.id, file.id))
-				.returning()
-				.get();
-			this.updateOperation(tx, operation, {});
-			return {
-				file: result,
-				mayExecute: true,
-				mutationId,
-				requestDigest,
-				executionBinding: binding,
-				expected,
-				desired,
-			};
-		});
+				metadata(updated);
+				const result = tx
+					.update(files)
+					.set({ receiptJson: journal, status: updated.status, updatedAt: updated.updatedAt })
+					.where(eq(files.id, file.id))
+					.returning()
+					.get();
+				// A claim changes only the binding/status of one row, never evidence bytes or the
+				// applied count, so totals proven for the previous revision carry forward.
+				const carried = this.totals.get(operation);
+				const next = this.updateOperation(tx, operation, {});
+				return {
+					claim: {
+						file: result,
+						mayExecute: true,
+						mutationId,
+						requestDigest,
+						executionBinding: binding,
+						expected,
+						desired,
+					},
+					carried: carried ? { ...carried, operation: next } : undefined,
+				};
+			},
+		);
+		if ("carried" in claimed && claimed.carried) this.totals.set(claimed.carried);
+		return "claim" in claimed ? claimed.claim : claimed;
 	}
 
 	recordApplyReceipt(
@@ -336,16 +360,27 @@ export class RevertMutationJournal {
 			throw fail("INVALID_TRANSITION", "Only an unfinished execution may receive a new receipt");
 		if (phase === "compensate" && !compensationEligible(originalFile, readJournal(originalFile)))
 			throw fail("UNSAFE_COMPENSATION", "Compensation has no confirmed apply baseline");
-		// Total budget is bounded by the fixed plan and counted pagewise; no global SUM.
-		const scan = await this.scan(context);
-		return this.transaction((tx) => {
+		// Total budget is bounded by the fixed plan. The first receipt of a revision proves the
+		// totals with a complete pagewise scan; later receipts carry them forward incrementally and
+		// validate only their own row. Full-set integrity is re-proven by finish/commit regardless.
+		const totals = await this.runningTotals(context);
+		const written = this.transaction((tx) => {
 			const operation = requireOperation(tx, context);
-			assertRevision(original, scan.operation);
+			assertRevision(original, totals.operation);
 			assertRevision(original, operation);
 			const file = requireFile(tx, operation, fileId);
 			if (!equal(file, originalFile))
 				throw fail("CONCURRENT_CHANGE", "The phase changed during receipt admission");
-			this.namespace(tx);
+			// The row checks a complete scan would have applied to THIS file.
+			assertFile(operation, file);
+			this.manifests(tx, operation);
+			for (const state of [
+				file.expectedStateJson,
+				file.desiredStateJson,
+				file.observedAfterStateJson,
+				file.compensationAfterStateJson,
+			])
+				if (state) readyState(tx, state);
 			readyState(tx, receipt.observedAfter);
 			const journal = readJournal(file);
 			assertBoundReceipt(file, journal[phase], receipt, phase);
@@ -381,7 +416,9 @@ export class RevertMutationJournal {
 				updatedAt: this.timestamp(file.updatedAt),
 			};
 			metadata(updated);
-			evidenceBudget(scan.bytes - oldBytes + fileBytes(updated));
+			const bytes = totals.bytes - oldBytes + fileBytes(updated);
+			evidenceBudget(bytes);
+			const appliedCount = totals.applied + (applied ? 1 : 0);
 			const result = tx
 				.update(files)
 				.set({
@@ -394,15 +431,19 @@ export class RevertMutationJournal {
 				.where(eq(files.id, fileId))
 				.returning()
 				.get();
-			this.updateOperation(tx, operation, {
-				appliedFileCount: scan.applied + (applied ? 1 : 0),
+			const next = this.updateOperation(tx, operation, {
+				appliedFileCount: appliedCount,
 				// Preserve a compensation window so other proven files may still be restored.
 				status:
 					!valid && operation.status !== "compensating" ? "recovery_required" : operation.status,
 				reason: valid ? operation.reason : "result_unverified",
 			});
-			return result;
+			return { result, totals: { operation: next, bytes, applied: appliedCount } };
 		});
+		// Seed only after COMMIT returned. A rolled-back write never reaches here, and a cached
+		// revision that is not the live row is simply a miss.
+		this.totals.set(written.totals);
+		return written.result;
 	}
 
 	/** Complete, contiguous, <=32-row pages; counts/statuses alone never prove verification. */
@@ -485,14 +526,19 @@ export class RevertMutationJournal {
 
 	beginCompensation(ctx: RevertJournalContext): RevertJournalOperation {
 		const context = normalizeContext(ctx);
-		return this.transaction((tx) => {
+		const began = this.transaction((tx) => {
 			const operation = requireOperation(tx, context);
-			if (operation.status === "compensating") return operation;
+			if (operation.status === "compensating") return { next: operation, carried: undefined };
 			if (!["applying", "files_verified", "recovery_required"].includes(operation.status))
 				throw fail("INVALID_TRANSITION", "Committed or unstarted plans cannot compensate");
 			this.manifests(tx, operation);
-			return this.updateOperation(tx, operation, { status: "compensating" });
+			// Only the status changes; no file row is touched, so proven totals carry forward.
+			const carried = this.totals.get(operation);
+			const next = this.updateOperation(tx, operation, { status: "compensating" });
+			return { next, carried: carried ? { ...carried, operation: next } : undefined };
 		});
+		if (began.carried) this.totals.set(began.carried);
+		return began.next;
 	}
 
 	/** Unknown apply/compensation is never cleaned away to make this terminal. */
@@ -599,7 +645,23 @@ export class RevertMutationJournal {
 			.returning()
 			.get();
 		if (!result) throw fail("CONCURRENT_CHANGE", "The journal revision changed");
+		// The revision moved; totals proven for `original` no longer describe it. recordReceipt
+		// re-seeds the cache itself after its own write. Eviction is in-memory and idempotent, so
+		// it is harmless if this transaction later rolls back (the next receipt simply rescans).
+		this.totals.evict(original.id);
 		return result;
+	}
+
+	/**
+	 * Totals for the CURRENT revision: reused when the cached revision still equals the live row,
+	 * otherwise proven by a complete scan (which also runs every full-set integrity check).
+	 */
+	private async runningTotals(context: RevertJournalContext): Promise<RunningTotals> {
+		const live = requireOperation(this.db, context);
+		const cached = this.totals.get(live);
+		if (cached) return cached;
+		const scan = await this.scan(context);
+		return { operation: scan.operation, bytes: scan.bytes, applied: scan.applied };
 	}
 
 	private async scan(context: RevertJournalContext, signal?: AbortSignal): Promise<Scan> {
@@ -741,6 +803,41 @@ function requireFile(
 	assertFile(operation, row);
 	return row;
 }
+/**
+ * In-memory, per-journal-instance running totals keyed by plan id. A hit requires the cached
+ * operation row to be deep-equal to the live row (same updatedAt/status/counters), so a write by
+ * another connection or process, a namespace reset, or a rolled-back transaction can only cause
+ * a miss, never a stale hit. Bounded; insertion-ordered eviction.
+ */
+class RunningTotalsCache {
+	private readonly entries = new Map<string, RunningTotals>();
+
+	get(live: RevertJournalOperation): RunningTotals | undefined {
+		const cached = this.entries.get(live.id);
+		if (!cached) return undefined;
+		if (!LIVE_TOTAL_STATUSES.includes(live.status) || !equal(cached.operation, live)) {
+			this.entries.delete(live.id);
+			return undefined;
+		}
+		return cached;
+	}
+
+	set(totals: RunningTotals): void {
+		this.entries.delete(totals.operation.id);
+		if (!LIVE_TOTAL_STATUSES.includes(totals.operation.status)) return;
+		this.entries.set(totals.operation.id, totals);
+		while (this.entries.size > MAX_CACHED_TOTALS) {
+			const oldest = this.entries.keys().next().value;
+			if (oldest === undefined) break;
+			this.entries.delete(oldest);
+		}
+	}
+
+	evict(planId: string): void {
+		this.entries.delete(planId);
+	}
+}
+
 function assertRevision(before: RevertJournalOperation, after: RevertJournalOperation) {
 	if (!equal(before, after))
 		throw fail("CONCURRENT_CHANGE", "The journal changed during a bounded page yield");
@@ -1229,6 +1326,7 @@ function fail(code: string, message: string) {
  * rather than diverging copies of it.
  */
 export const revertJournalInternals = {
+	RunningTotalsCache,
 	normalizeContext,
 	normalizeOwner,
 	assertRevision,
