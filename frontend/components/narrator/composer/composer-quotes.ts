@@ -225,6 +225,8 @@ export interface QuoteDisplayJump {
 	anchor: string;
 	/** Text to look for at the source. The leading file-name line is not part of it. */
 	highlight: string;
+	/** Position of this quote in the prefix. Identical labels stay distinct. */
+	index: number;
 }
 
 /**
@@ -250,14 +252,48 @@ export function quoteDisplayText(text: string): { text: string; jumps: QuoteDisp
 	if (!prefixLength) return { text, jumps: [] };
 	const jumps: QuoteDisplayJump[] = [];
 	let display = "";
-	for (const quote of quotes) {
+	for (const [index, quote] of quotes.entries()) {
 		const header = `${HEADER_PREFIX}${quote.label}`;
 		display += serializeQuote({ label: quote.label, text: quote.text });
 		if (quote.anchor) {
-			jumps.push({ header, anchor: quote.anchor, highlight: quoteHighlightNeedle(quote.text) });
+			jumps.push({
+				header,
+				anchor: quote.anchor,
+				highlight: quoteHighlightNeedle(quote.text),
+				index,
+			});
 		}
 	}
 	return { text: display + text.slice(prefixLength), jumps };
+}
+
+/**
+ * Which stored jump a painted line belongs to.
+ *
+ * Headers are matched by their position in the prefix, not by label text: two
+ * quotes can open with the same words. A `>` continuation walks back to its
+ * header. A quote with no anchor occupies an index and is not clickable.
+ */
+export function quoteJumpForLine(
+	lines: readonly { text: string }[],
+	index: number,
+	jumps: readonly QuoteDisplayJump[] | undefined,
+): QuoteDisplayJump | undefined {
+	if (!jumps?.length || index < 0 || index >= lines.length) return undefined;
+	let headerIndex = index;
+	while (
+		headerIndex > 0 &&
+		!lines[headerIndex]?.text.startsWith(HEADER_PREFIX) &&
+		(lines[headerIndex]?.text.startsWith(">") ?? false)
+	) {
+		headerIndex -= 1;
+	}
+	if (!lines[headerIndex]?.text.startsWith(HEADER_PREFIX)) return undefined;
+	let ordinal = -1;
+	for (let lineIndex = 0; lineIndex <= headerIndex; lineIndex++) {
+		if (lines[lineIndex]?.text.startsWith(HEADER_PREFIX)) ordinal += 1;
+	}
+	return jumps.find((jump) => jump.index === ordinal);
 }
 
 export function joinQuotedComposerInput(

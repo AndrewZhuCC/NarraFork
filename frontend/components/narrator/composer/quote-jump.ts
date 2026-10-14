@@ -2,6 +2,7 @@ import type { FileReference } from "@shared/file-reference";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { nextHighlightRequestId } from "../panels/panel-kind";
 import { type ComposerQuote, quoteHighlightNeedle } from "./composer-quotes";
+import { NARRATOR_PANEL_SELECTOR } from "./quote-selection";
 
 const HIGHLIGHT_NAME = "nf-quote-jump";
 const HIGHLIGHT_ATTEMPTS = 20;
@@ -104,12 +105,23 @@ function quoteRoots(panel: Element, anchor: string): Element[] {
 
 let highlightTimer: ReturnType<typeof setTimeout> | undefined;
 
+/** The narrator panel that contains `source`, never some other open session. */
+export function quoteJumpPanel(source: Node | null): Element | null {
+	if (!source) return null;
+	const element = source.nodeType === 1 ? (source as Element) : source.parentElement;
+	return element?.closest(NARRATOR_PANEL_SELECTOR) ?? null;
+}
+
 /** Scroll the source into view, expand a folded tool card once, and highlight the quoted text. */
-export function revealComposerQuote(dock: NarratorDockContextValue | null, quote: ComposerQuote) {
+export function revealComposerQuote(
+	dock: NarratorDockContextValue | null,
+	quote: ComposerQuote,
+	source: Node | null,
+) {
 	const anchor = quote.anchor;
 	if (!anchor) return;
 	dock?.scrollToMessage?.(anchor.slice(2));
-	const panel = document.querySelector("[data-narrator-panel]");
+	const panel = quoteJumpPanel(source);
 	if (!panel) return;
 	clearTimeout(highlightTimer);
 	let expanded = false;

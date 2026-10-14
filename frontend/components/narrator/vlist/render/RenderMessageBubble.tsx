@@ -18,7 +18,7 @@ import { layoutWithLines } from "@chenglou/pretext";
 import type { FileReference } from "@shared/file-reference";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { type CSSProperties, useId, useMemo } from "react";
-import type { QuoteDisplayJump } from "../../composer/composer-quotes";
+import { type QuoteDisplayJump, quoteJumpForLine } from "../../composer/composer-quotes";
 import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
@@ -372,25 +372,6 @@ function CommandBubble({
 	);
 }
 
-function quoteJumpForLine(
-	lines: readonly { text: string }[],
-	index: number,
-	jumps: readonly QuoteDisplayJump[] | undefined,
-): QuoteDisplayJump | undefined {
-	if (!jumps?.length) return undefined;
-	let cursor = index;
-	while (
-		cursor > 0 &&
-		!lines[cursor]?.text.startsWith("> [quote] ") &&
-		(lines[cursor]?.text.startsWith(">") ?? false)
-	) {
-		cursor -= 1;
-	}
-	const headerLine = lines[cursor]?.text ?? "";
-	if (!headerLine.startsWith("> [quote] ")) return undefined;
-	return jumps.find((jump) => jump.header === headerLine || jump.header.startsWith(headerLine));
-}
-
 function UserBubble({
 	measured,
 	header,
@@ -547,11 +528,15 @@ function UserBubble({
 									onClick={(event) => {
 										if (window.getSelection()?.isCollapsed === false) return;
 										event.stopPropagation();
-										revealComposerQuote(dock, {
-											label: jump.header,
-											text: jump.highlight,
-											anchor: jump.anchor,
-										});
+										revealComposerQuote(
+											dock,
+											{
+												label: jump.header,
+												text: jump.highlight,
+												anchor: jump.anchor,
+											},
+											event.currentTarget,
+										);
 									}}
 									style={{
 										...lineStyle,

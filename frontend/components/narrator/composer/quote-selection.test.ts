@@ -98,6 +98,10 @@ describe("readPanelQuoteSelection", () => {
 				if (!node) throw new Error(id);
 				const range = doc.createRange();
 				range.selectNodeContents(node);
+				Object.defineProperty(range, "startContainer", { value: node });
+				Object.defineProperty(range, "endContainer", { value: node });
+				Object.defineProperty(range, "startOffset", { value: 0 });
+				Object.defineProperty(range, "endOffset", { value: node.textContent?.length ?? 0 });
 				return {
 					anchorNode: node,
 					focusNode: node,
@@ -119,6 +123,85 @@ describe("readPanelQuoteSelection", () => {
 			const input = readPanelQuoteSelection(panel, select("inp"));
 			expect(input?.label.startsWith("app.ts · ")).toBe(true);
 			expect(input?.anchor).toBe("t:tool5678");
+		} finally {
+			Object.defineProperty(globalThis, "document", {
+				configurable: true,
+				value: previous.document,
+			});
+			if (previous.window)
+				Object.defineProperty(globalThis, "window", { configurable: true, value: previous.window });
+			else Reflect.deleteProperty(globalThis, "window");
+			if (previous.Node)
+				Object.defineProperty(globalThis, "Node", { configurable: true, value: previous.Node });
+			else Reflect.deleteProperty(globalThis, "Node");
+			if (previous.NodeFilter)
+				Object.defineProperty(globalThis, "NodeFilter", {
+					configurable: true,
+					value: previous.NodeFilter,
+				});
+			else Reflect.deleteProperty(globalThis, "NodeFilter");
+		}
+	});
+
+	test("anchors a backwards selection at the document-order start", () => {
+		const { document: doc, window } = parseHTML(`<!doctype html><html><body>
+			<div data-narrator-panel id="panel">
+				<div data-message-id="msg-early"><span id="early">alpha sentence starts</span></div>
+				<div data-message-id="msg-later" data-quote-tool="Read" data-quote-tool-id="tool9999" data-quote-file="/work/biome.json">
+					<div data-quote-part="result"><span id="later">omega sentence ends</span></div>
+				</div>
+			</div>
+			<div data-narrator-panel id="file-first">
+				<div data-message-id="msg-tool" data-quote-tool="Read" data-quote-tool-id="tool9999" data-quote-file="/work/biome.json">
+					<div data-quote-part="result"><span id="file">"formatter": true</span></div>
+				</div>
+				<div data-message-id="msg-after"><span id="after">after the file</span></div>
+			</div>
+		</body></html>`);
+		const globals = globalThis as { window?: unknown; Node?: unknown; NodeFilter?: unknown };
+		const previous = {
+			document: globalThis.document,
+			window: globals.window,
+			Node: globals.Node,
+			NodeFilter: globals.NodeFilter,
+		};
+		window.getComputedStyle = () =>
+			({ display: "block", visibility: "visible" }) as unknown as CSSStyleDeclaration;
+		Object.defineProperty(globalThis, "document", { configurable: true, value: doc });
+		Object.defineProperty(globalThis, "window", { configurable: true, value: window });
+		Object.defineProperty(globalThis, "Node", { configurable: true, value: window.Node });
+		Object.defineProperty(globalThis, "NodeFilter", { configurable: true, value: NodeFilter });
+		try {
+			const across = (rootId: string, startId: string, endId: string) => {
+				const start = doc.getElementById(startId)?.firstChild;
+				const end = doc.getElementById(endId)?.firstChild;
+				if (!start || !end) throw new Error(`${startId}/${endId}`);
+				const range = {
+					startContainer: start,
+					endContainer: end,
+					startOffset: 0,
+					endOffset: end.textContent?.length ?? 0,
+					commonAncestorContainer: doc.getElementById(rootId),
+					intersectsNode: () => true,
+				};
+				return {
+					anchorNode: end,
+					focusNode: start,
+					isCollapsed: false,
+					rangeCount: 1,
+					getRangeAt: () => range,
+				} as unknown as Selection;
+			};
+			const panel = doc.getElementById("panel");
+			const filePanel = doc.getElementById("file-first");
+			if (!panel || !filePanel) throw new Error("panel");
+			const messageFirst = readPanelQuoteSelection(panel, across("panel", "early", "later"));
+			expect(messageFirst?.anchor).toBe("m:msg-early");
+			expect(messageFirst?.label.includes("biome.json")).toBe(false);
+			expect(messageFirst?.text.includes("alpha sentence starts")).toBe(true);
+			const fileFirst = readPanelQuoteSelection(filePanel, across("file-first", "file", "after"));
+			expect(fileFirst?.anchor).toBe("t:tool9999");
+			expect(fileFirst?.label.startsWith("biome.json · ")).toBe(true);
 		} finally {
 			Object.defineProperty(globalThis, "document", {
 				configurable: true,

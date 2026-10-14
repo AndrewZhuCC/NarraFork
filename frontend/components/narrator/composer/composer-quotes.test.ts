@@ -7,6 +7,7 @@ import {
 	normalizeComposerQuote,
 	parseComposerQuotePrefix,
 	quoteDisplayText,
+	quoteJumpForLine,
 	quotePreviewLabel,
 	serializeComposerQuotes,
 	splitQuotedComposerInput,
@@ -85,9 +86,31 @@ describe("quote prefix serialization", () => {
 				header: `> [quote] ${quote.label}`,
 				anchor: "m:msg1234",
 				highlight: "Selecting text in a message shows a dashed chip",
+				index: 0,
 			},
 		]);
 		expect(display.text.endsWith("and then?")).toBe(true);
+	});
+
+	test("jumps to the quote in that position when labels match", () => {
+		const text = serializeComposerQuotes([
+			{ label: "same words", text: "same words\nfirst body", anchor: "m:aaaa" },
+			{ label: "same words", text: "same words" },
+			{ label: "same words", text: "same words\nthird body", anchor: "m:cccc" },
+		]);
+		const lines = quoteDisplayText(text)
+			.text.split("\n")
+			.map((line) => ({ text: line }));
+		const jumps = quoteDisplayText(text).jumps;
+		const headers = lines.flatMap((line, index) =>
+			line.text.startsWith("> [quote] ") ? [index] : [],
+		);
+		expect(headers).toHaveLength(3);
+		expect(quoteJumpForLine(lines, headers[0] ?? 0, jumps)?.anchor).toBe("m:aaaa");
+		expect(quoteJumpForLine(lines, headers[1] ?? 0, jumps)).toBeUndefined();
+		expect(quoteJumpForLine(lines, headers[2] ?? 0, jumps)?.anchor).toBe("m:cccc");
+		const thirdBody = lines.findIndex((line) => line.text === "> third body");
+		expect(quoteJumpForLine(lines, thirdBody, jumps)?.anchor).toBe("m:cccc");
 	});
 
 	test("ignores an anchor that is too short to be an id", () => {

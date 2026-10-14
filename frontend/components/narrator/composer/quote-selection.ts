@@ -112,15 +112,19 @@ export function readPanelQuoteSelection(
 	const focusElement = elementOf(selection.focusNode);
 	const anchor = sourceBlock(anchorElement, panel);
 	const focus = sourceBlock(focusElement, panel);
-	if (!anchor || !focus || !anchorElement) return null;
+	if (!anchor || !focus || !anchorElement || !focusElement) return null;
+	// The selection anchor is where the drag started, which may be the later
+	// message. The quoted text and its highlight start at the document-order
+	// boundary, so the jump has to open that block.
+	const startElement = elementOf(selection.getRangeAt(0).startContainer);
+	if (!startElement || !sourceBlock(startElement, panel)) return null;
 	const text = collectSelectionTextPreview(selection, MAX_COMPOSER_QUOTE_CHARS + 1);
 	if (!text.trim()) return null;
-	const fileName =
-		quotedFileName(toolContext(anchorElement)) ?? quotedFileName(toolContext(focusElement));
+	const fileName = quotedFileName(toolContext(startElement));
 	const quoted = fileName && !text.startsWith(fileName) ? `${fileName}\n${text}` : text;
 	return normalizeComposerQuote(
 		quotePreviewLabel(text, fileName),
 		quoted,
-		quoteAnchor(anchorElement),
+		quoteAnchor(startElement),
 	);
 }

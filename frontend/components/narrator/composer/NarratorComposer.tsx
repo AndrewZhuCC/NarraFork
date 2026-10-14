@@ -1309,7 +1309,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onDismiss={hideQuoteCandidate}
 					onRemoveQuote={removeQuote}
 					onRemoveFileReference={removeDetachedFileReference}
-					onOpenQuote={(quote) => revealComposerQuote(dock, quote)}
+					onOpenQuote={(quote) => revealComposerQuote(dock, quote, textareaRef.current)}
 					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
 				/>
 				<Textarea
