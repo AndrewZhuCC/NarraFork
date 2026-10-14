@@ -248,6 +248,7 @@ export {
 	reorderFavoriteDirectoriesSchema,
 	restoreRecentTabsSchema,
 	setRecentTabDirectoryOrderSchema,
+	specTabLayoutPatchSchema,
 	updateFavoriteDirectorySchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,

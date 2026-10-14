@@ -196,6 +196,7 @@ export type ToolCategory =
 	| "taskOutput"
 	| "agent"
 	| "await"
+	| "stop"
 	| "send"
 	| "ask"
 	| "plan"

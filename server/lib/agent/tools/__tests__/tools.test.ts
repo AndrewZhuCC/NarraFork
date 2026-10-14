@@ -891,7 +891,7 @@ describe("Bash", () => {
 		expect(properties.command.description).toContain("exactly one git command");
 		expect(properties.command.description).toContain("environment variable assignments");
 		expect(properties.run_in_background.description).toContain("Forbidden");
-		expect(properties.stop.description).toContain("Forbidden");
+		expect(properties).not.toHaveProperty("stop");
 	});
 
 	test("keeps the normal Bash description for ordinary sessions", () => {
@@ -1149,6 +1149,24 @@ describe("zodToJsonSchema", () => {
 		});
 	});
 
+	test("converts preprocess schemas using the output object", () => {
+		const schema = z.preprocess((input) => input, z.object({ command: z.string() }));
+		expect(zodToJsonSchema(schema)).toMatchObject({
+			type: "object",
+			properties: { command: { type: "string" } },
+			required: ["command"],
+		});
+	});
+
+	test("converts ordinary pipes using the input object", () => {
+		const schema = z.object({ input: z.string() }).transform(({ input }) => ({ output: input }));
+		expect(zodToJsonSchema(schema)).toMatchObject({
+			type: "object",
+			properties: { input: { type: "string" } },
+			required: ["input"],
+		});
+	});
+
 	test("converts enum schema", () => {
 		const schema = z.object({
 			mode: z.enum(["a", "b", "c"]),
@@ -1309,6 +1327,7 @@ import { extractPipelineTool, startPipelineTool } from "../pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
 import { sendTool } from "../send";
 import { skillTool } from "../skill";
+import { stopTool } from "../stop";
 import { teamStatusTool } from "../team-status";
 import { webFetchTool } from "../web-fetch";
 import { webSearchTool } from "../web-search";
@@ -1359,6 +1378,7 @@ const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "ExitPlanMode"]);
 const toolsWithRawJsonSchema = [
 	agentTool,
 	bashTool,
+	stopTool,
 	readTool,
 	writeTool,
 	editTool,

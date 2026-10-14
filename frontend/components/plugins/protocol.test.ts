@@ -52,6 +52,51 @@ describe("plugin UI protocol", () => {
 		expect(validateUiEnvelope(request, PLUGIN_UI_REQUEST_MAX_BYTES)).toBeNull();
 	});
 
+	test.each([
+		"_ABCDEFGHIJKLMNOPQRST",
+		"-ABCDEFGHIJKLMNOPQRST",
+	])("accepts a valid NanoID beginning with punctuation in host bindings: %s", (hostId) => {
+		const params = {
+			panelType: "plugin",
+			schemaVersion: 1,
+			pluginId: "com.example.review",
+			contributionId: "review-dashboard",
+			panelInstanceId: "pui_review",
+		};
+		for (const binding of [
+			{ kind: "focus-current-narrator", narratorId: hostId },
+			{ kind: "workspace", workspaceId: hostId },
+			{ kind: "workspace-narrator", workspaceId: hostId, ownerNarratorId: "n1" },
+			{ kind: "workspace-narrator", workspaceId: "ws1", ownerNarratorId: hostId },
+		] as const) {
+			expect(parsePluginDockPanelParams({ ...params, binding })?.binding).toEqual(binding);
+		}
+		for (const field of ["pluginId", "contributionId", "panelInstanceId"]) {
+			expect(
+				parsePluginDockPanelParams({
+					...params,
+					[field]: hostId,
+					binding: { kind: "workspace", workspaceId: "ws1" },
+				}),
+			).toBeNull();
+		}
+	});
+
+	test("host bindings still reject empty, unsafe and overlong IDs", () => {
+		for (const id of ["", "../escape", "a/b", "a b", "a.b", "a".repeat(129)]) {
+			expect(
+				parsePluginDockPanelParams({
+					panelType: "plugin",
+					schemaVersion: 1,
+					pluginId: "com.example.review",
+					contributionId: "review-dashboard",
+					panelInstanceId: "pui_review",
+					binding: { kind: "workspace", workspaceId: id },
+				}),
+			).toBeNull();
+		}
+	});
+
 	test("validates immutable panel binding and small view state", () => {
 		const valid = parsePluginDockPanelParams({
 			panelType: "plugin",

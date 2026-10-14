@@ -475,6 +475,25 @@ describe("executeTool update admission gate", () => {
 		).toBe("ordinary");
 	});
 
+	test("Stop and historical Agent stop remain ordinary bounded control operations", () => {
+		for (const type of ["bash", "agent"]) {
+			expect(
+				classifyToolUpdateExecution({
+					toolUseId: `classify-stop-${type}`,
+					name: "Stop",
+					input: { type, id: "worker" },
+				}),
+			).toBe("ordinary");
+		}
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "legacy-stop",
+				name: "Agent",
+				input: { stop: "worker" },
+			}),
+		).toBe("ordinary");
+	});
+
 	test("phase 1 pauses background Bash while ordinary tools continue", async () => {
 		const continuationRecords: Array<Record<string, unknown>> = [];
 		stubAdmissionPersistence(continuationRecords);

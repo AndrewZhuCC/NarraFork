@@ -120,6 +120,23 @@ describe("shared capability projections", () => {
 		});
 	}
 
+	test("Stop preserves owned Bash cancellation visibility without enabling review or search control", () => {
+		for (const subagentType of [
+			"general",
+			"explore",
+			"plan",
+			"missing-custom",
+			"review",
+			"search",
+		]) {
+			const policy = resolveRuntimePolicy({ variant: "subagent", subagentType });
+			expect(isRuntimeToolAllowed(policy, "Stop")).toBe(
+				subagentType !== "review" && subagentType !== "search",
+			);
+		}
+		expect(isRuntimeToolAllowed(resolveRuntimePolicy({ variant: "primary" }), "Stop")).toBe(true);
+	});
+
 	test("inherited readOnly narrows custom MCP and file access without widening its allowlist", () => {
 		const policy = resolveRuntimePolicy({
 			variant: "subagent",

@@ -267,6 +267,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	taskOutput: "indigo",
 	agent: "pink",
 	await: "indigo",
+	stop: "orange",
 	contextAsk: "indigo",
 	send: "blue",
 	ask: "blue",

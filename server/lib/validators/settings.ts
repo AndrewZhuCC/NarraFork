@@ -246,6 +246,15 @@ export const updateUserPreferencesSchema = z.object({
 	narratorToolbarLayout: narratorToolbarLayoutSchema.optional(),
 });
 
+/**
+ * 写入某个叙述者的大纲标签排布。数组设上限，避免偏好字段被当作无界存储。
+ */
+export const specTabLayoutPatchSchema = z.object({
+	narratorId: z.string().min(1).max(64),
+	order: z.array(z.string().min(1).max(256)).max(100),
+	pinned: z.array(z.string().min(1).max(256)).max(100),
+});
+
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 
 export const recentTabSchema = z.object({

@@ -187,12 +187,16 @@ describe("guarded PG paths", () => {
 	test("schema permits a root-contained ordinary TS file, no traversal or symlinks", () => {
 		const { root } = fixture();
 		const schema = join(root, "server/db/postgres-schema.ts");
+		// 返回值统一为正斜杠：Kit 把 schema 当 glob 解析，原生反斜杠会被当作转义符。
+		const kitSchema = schema.replaceAll("\\", "/");
 		delete process.env[PG_SCHEMA_ENV];
-		expect(resolvePgSchemaPath(root)).toBe(schema);
+		expect(resolvePgSchemaPath(root)).toBe(kitSchema);
 		process.env[PG_SCHEMA_ENV] = schema;
-		expect(resolvePgSchemaPath(root)).toBe(schema);
+		expect(resolvePgSchemaPath(root)).toBe(kitSchema);
 		writeFileSync(join(root, "small.ts"), "export {};");
-		expect(resolvePgSchemaPath(root, "small.ts")).toBe(join(root, "small.ts"));
+		expect(resolvePgSchemaPath(root, "small.ts")).toBe(
+			join(root, "small.ts").replaceAll("\\", "/"),
+		);
 		for (const path of [
 			helper,
 			"../escape.ts",

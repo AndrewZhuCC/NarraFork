@@ -50,7 +50,10 @@ export function resolvePgSchemaPath(root: string, input?: string): string {
 		"file",
 	);
 	if (!path.endsWith(".ts")) throw new Error("PG schema must be an ordinary TS file");
-	return path;
+	// Same reason as `resolvePgStageOut`: Kit 解析 schema 时把路径当 glob，
+	// Windows 原生反斜杠会被当作转义符（`\n`、`\t` 等），使合法路径解析不到文件。
+	// 正斜杠在 Windows 上同样被 fs 接受。
+	return path.replaceAll("\\", "/");
 }
 
 export interface PostgresKitOptions {

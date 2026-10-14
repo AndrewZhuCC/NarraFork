@@ -237,6 +237,7 @@
 	"tpToolDescAskUserQuestion": "Ask the user a question during execution.",
 	"tpToolDescSkill": "Invoke a skill within the conversation.",
 	"tpToolDescAwait": "Await an asynchronous agent or bash task.",
+	"tpToolDescStop": "Cancel an owned bash or agent task. Unavailable in review mode.",
 	"tpToolDescSend": "Send messages to accessible subagents.",
 	"tpToolDescShareFile": "Share a file by generating a temporary download link.",
 	"tpNotificationAllowSend": "Pre-authorize Notification sends",

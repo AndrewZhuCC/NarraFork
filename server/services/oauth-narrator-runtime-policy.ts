@@ -22,7 +22,8 @@ const BASE_EXTERNAL_TOOLS = [
 	"KnowledgeRead",
 ] as const;
 const KNOWLEDGE_WRITE_TOOLS = ["KnowledgeCreate", "KnowledgeEdit"] as const;
-const REMOTE_SHELL_TOOLS = ["Bash"] as const;
+// Stop retains cancellation under readOnly; its persisted task device is checked separately.
+const REMOTE_SHELL_TOOLS = ["Bash", "Stop"] as const;
 const REMOTE_FILE_WRITE_TOOLS = ["Write", "Edit"] as const;
 /**
  * Decision-only tools for the danger reflection loop. Admitted under bypassPermissions

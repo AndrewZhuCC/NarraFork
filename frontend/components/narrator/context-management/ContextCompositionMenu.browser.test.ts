@@ -183,11 +183,25 @@ const data: ContextComposition = {
 								) as HTMLButtonElement
 							)?.disabled,
 					);
-					await page.click('[data-testid="context-composition-refresh"]');
+					const [refreshResponse] = await Promise.all([
+						page.waitForResponse(
+							(response) =>
+								new URL(response.url()).pathname === "/api/narrators/fixture/context-composition",
+						),
+						page.click('[data-testid="context-composition-refresh"]'),
+					]);
+					expect(refreshResponse.status()).toBe(200);
+					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
 					await page.waitForFunction(
 						() =>
 							document.querySelectorAll('[data-testid="context-composition-bar"] button').length ===
-							4,
+								4 &&
+							!!document.querySelector('[data-testid="context-composition-refresh"]') &&
+							!(
+								document.querySelector(
+									'[data-testid="context-composition-refresh"]',
+								) as HTMLButtonElement
+							)?.disabled,
 					);
 					expect(requests).toBe(before + 2);
 					for (const [tokens, percentage, source, label] of [
@@ -247,7 +261,14 @@ const data: ContextComposition = {
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
 					await page.keyboard.press("Escape");
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { hidden: true });
-					await page.click('[data-testid="context-ring"]');
+					const [reopenResponse] = await Promise.all([
+						page.waitForResponse(
+							(response) =>
+								new URL(response.url()).pathname === "/api/narrators/fixture/context-composition",
+						),
+						page.click('[data-testid="context-ring"]'),
+					]);
+					expect(reopenResponse.status()).toBe(200);
 					await page.waitForSelector('[data-testid="context-composition-bar"]', { visible: true });
 					await page.waitForFunction(
 						() =>

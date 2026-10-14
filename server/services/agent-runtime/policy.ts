@@ -44,6 +44,7 @@ const READ_TOOLS = Object.freeze([
 	BASH_TOOL_NAME,
 	"TeamStatus",
 	"Await",
+	"Stop",
 	"Question",
 	"ContextAsk",
 	"Send",
@@ -78,7 +79,10 @@ export function resolveRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
 				break;
 			case "explore":
 			case "plan":
+				break;
 			case "review":
+				// Review may inspect Git synchronously, never control running tasks.
+				builtin = READ_TOOLS.filter((name) => name !== "Stop");
 				break;
 			default:
 				// Missing/invalid custom definitions fail closed to the read-only profile.

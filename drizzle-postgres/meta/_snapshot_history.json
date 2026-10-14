@@ -104,6 +104,14 @@
 			"prevId": "0f4d42ec-ba53-46e5-98e0-63c2c30c1f3e",
 			"version": "7",
 			"snapshotDigest": "ec351b52ce7817ff55fa50c22fbff0a4d16a47bc42d271bec9868b1e4687e967"
+		},
+		{
+			"idx": 13,
+			"tag": "0013_spec-tab-layout",
+			"id": "6b0f116c-6200-4566-8228-0887c535abaa",
+			"prevId": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
+			"version": "7",
+			"snapshotDigest": "63e497e8370b6a5ed83be0502b59972779d492fa377d465d96db1863daa56b83"
 		}
 	]
 }

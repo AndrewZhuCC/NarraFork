@@ -41,6 +41,7 @@ export type ToolCategory =
 	| "taskOutput"
 	| "agent"
 	| "await"
+	| "stop"
 	| "send"
 	| "ask"
 	| "plan"
@@ -154,6 +155,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
 	if (AWAIT_TOOLS.has(name)) return "await";
+	if (name === "Stop") return "stop";
 	if (SEND_TOOLS.has(name)) return "send";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
@@ -204,6 +206,7 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 		case "file":
 			return "violet";
 		case "bash":
+		case "stop":
 			return "orange";
 		case "search":
 			return "cyan";
@@ -515,8 +518,18 @@ export function getSummary(
 		if (filePath) return `${basename(filePath)} (${chars} chars)`;
 		return chars > 0 ? `${chars} chars` : "";
 	}
+	// Keep old Bash/Agent cancellation cards readable without rewriting stored history.
+	const legacyStop = extractField(input, "stop");
+	if (legacyStop && (BASH_TOOLS.has(toolName) || AGENT_TOOLS.has(toolName))) {
+		return `${labels?.stopTask || "Stop"}: ${short(legacyStop, 60)}`;
+	}
 	const cat = getCategory(toolName, input);
 	switch (cat) {
+		case "stop": {
+			const type = extractField(input, "type");
+			const id = extractField(metadata, "targetLabel") || extractField(input, "id");
+			return short([type, id].filter(Boolean).join(": ") || toolName, 80);
+		}
 		case "workspace":
 			return short(workspaceSummary(toolName, input, labels), 80);
 		case "read": {

@@ -779,6 +779,10 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = specError;
 		return "deny";
 	}
+	if (reviewReadOnlyBash && toolName === "Stop") {
+		if (meta) meta.blacklistReason = "Review mode cannot control running tasks.";
+		return "deny";
+	}
 	if (toolName === "Worktree") {
 		if (input.action !== "list" && input.action !== "create") {
 			if (meta)
@@ -1217,6 +1221,7 @@ const ALWAYS_ALLOW_TOOLS = [
 	"EnterPlanMode",
 	"WebSearch",
 	"Await",
+	"Stop",
 	"Question",
 	"Skill",
 	"LearningGuide",
@@ -4037,7 +4042,9 @@ function finalPermissionDeny(message: string): never {
 		"FINAL_TOOL_PERMISSION_DENIED",
 	);
 }
-function captureFinalOAuthAuthority(check: FinalToolPermissionCheck) {
+function captureFinalOAuthAuthority(
+	check: Pick<FinalToolPermissionCheck, "narratorId" | "runtimeConstraint">,
+) {
 	const constraint = check.runtimeConstraint;
 	if (!constraint) return null;
 	if (!constraint.oauthClientId || !constraint.grantId)
@@ -4206,6 +4213,22 @@ function captureFinalOAuthAuthority(check: FinalToolPermissionCheck) {
 	}
 	return { authority, client, provenance, snapshot, grants, devices, bindings };
 }
+
+/** Task cancellation has no routed context, but must fence live OAuth policy at dispatch. */
+export function createOAuthTaskControlFence(
+	narratorId: string,
+	runtimeConstraint: RuntimePermissionConstraint,
+): FinalToolPermissionFence {
+	const check = { narratorId, runtimeConstraint };
+	const revision = stableJson(captureFinalOAuthAuthority(check));
+	return {
+		assertStillCurrent() {
+			if (stableJson(captureFinalOAuthAuthority(check)) !== revision)
+				finalPermissionDeny("OAuth authorization changed before cancellation");
+		},
+	};
+}
+
 /** Server-owned audit metadata is not execution input, but only real Eval children may omit it. */
 function captureFinalInternalReadAuthority(call: {
 	id: string;
@@ -4519,6 +4542,24 @@ export async function recheckFinalToolExecutionPermission(
 		!primaryInputPath
 	) {
 		finalPermissionDeny("approval input exceeds the bounded identity verification budget");
+	}
+	// Stop controls a persisted task, not the narrator's current filesystem/backend.
+	// Keep this out of path policy compilation and remote canonicalization entirely.
+	if (check.toolName === "Stop") {
+		if (check.reviewReadOnlyBash || before.narrator.variant === "subagent:review")
+			finalPermissionDeny("Review mode cannot control running tasks.");
+		const { authorizeStopTask } = await import("./stop-task-policy");
+		const targetFence = check.runtimeConstraint
+			? await authorizeStopTask(check.narratorId, check.input, check.runtimeConstraint)
+			: undefined;
+		const assertStillCurrent = () => {
+			check.signal?.throwIfAborted();
+			targetFence?.assertStillCurrent();
+			if (finalPermissionSnapshot(check).revision !== before.revision)
+				finalPermissionDeny("authorization changed before the tool body started");
+		};
+		assertStillCurrent();
+		return { assertStillCurrent };
 	}
 	const cwd = context?.target.cwd ?? check.cwd ?? before.narrator.cwd;
 	if (!cwd) finalPermissionDeny("missing execution directory");
@@ -4887,8 +4928,23 @@ export async function handlePermission(
 	// diagnostics must never be classified with the NarraFork host's shell/path semantics.
 	let bashAnalysis: BashAnalysis | undefined;
 	let shellAnalysisError: string | undefined;
+	// Legacy Bash control shapes remain recognized for persisted permission recovery.
 	const isBashControlOp =
 		isBashToolName(toolName) && !input.command && (input.await != null || input.stop != null);
+	const isStopControlOp = toolName === "Stop";
+	if (isStopControlOp && (reviewReadOnlyBash || narrator?.variant === "subagent:review")) {
+		return { behavior: "deny", message: "Review mode cannot control running tasks." };
+	}
+	if (isStopControlOp && runtimeConstraint) {
+		try {
+			const { authorizeStopTask } = await import("./stop-task-policy");
+			const { task } = await authorizeStopTask(narratorId, input, runtimeConstraint);
+			// Freeze an alias to the checked task, so approval cannot cancel a retargeted alias.
+			effectiveInput = { type: task.type, id: task.id };
+		} catch (error) {
+			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
+		}
+	}
 	if (isBashToolName(toolName) && typeof input.command === "string") {
 		try {
 			const shellType = resolvePermissionShellType(executionContext?.backend);
@@ -5087,7 +5143,10 @@ export async function handlePermission(
 	// Deliberately decided BEFORE policy compilation: stop/await run no command and
 	// touch no path, so directory/command policy (and its compile failures) do not
 	// apply. OAuth-denied devices and review read-only mode are rejected above.
-	if (isBashControlOp && !isRecoveredHumanPermission(getPermissionRecovery(options))) {
+	if (
+		(isBashControlOp || isStopControlOp) &&
+		!isRecoveredHumanPermission(getPermissionRecovery(options))
+	) {
 		await options?.onInputResolved?.(effectiveInput);
 		await db
 			.update(narratorToolCalls)

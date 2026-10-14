@@ -170,6 +170,15 @@ describe("disk guard tool admission", () => {
 				{ narratorId: "cancel-under-pressure", cwd: "/work", locale: "en" },
 			),
 		).resolves.toBeDefined();
+		for (const type of ["bash", "agent"]) {
+			await expect(
+				checkToolDiskSafety(
+					"Stop",
+					{ type, id: "background-writer" },
+					{ narratorId: "cancel-under-pressure", cwd: "/work", locale: "en" },
+				),
+			).resolves.toBeDefined();
+		}
 	});
 
 	test("warn mode explicitly lets the tool run; off performs no probes", async () => {

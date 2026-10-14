@@ -97,9 +97,10 @@ export async function checkToolDiskSafety(
 		entries.map(async ([path]) => monitor.assess(path, config)),
 	);
 	const cancelling =
-		["Bash", "bash", "Agent", "Task"].includes(toolName) &&
-		typeof input.stop === "string" &&
-		!input.command;
+		toolName === "Stop" ||
+		(["Bash", "bash", "Agent", "Task"].includes(toolName) &&
+			typeof input.stop === "string" &&
+			!input.command);
 	const readOnly = READ_ONLY_TOOLS.has(toolName) || cancelling;
 	const writeVolumes = new Set(
 		endpoints

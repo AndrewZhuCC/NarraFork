@@ -27,7 +27,7 @@ const plan: CiReleasePlan = {
 	version: "1.2.1",
 	commit,
 	workflowCommit: commit,
-	bunVersion: "1.4.2",
+	bunVersion: "1.4.3",
 	channel: "beta",
 	changelog: { version: "1.2.1", date: "2026-10-10", en: "notes", "zh-CN": "说明" },
 	runId: 9,
@@ -79,8 +79,11 @@ const gh = mock(async (args: string[]) => {
 });
 mock.module("../../scripts/lib/ci-release-plan", () => ({
 	...originalPlan,
-	revalidateCiReleasePlan: async () => {
+	// Real contract: returns the (online-revalidated) publisher plan. This fixture has no
+	// component evidence, so the revalidated plan is the input plan unchanged.
+	revalidateCiReleasePlan: async (input: CiReleasePlan) => {
 		trace.push("revalidate");
+		return input;
 	},
 }));
 mock.module("../../scripts/lib/ci-release-bundle", () => ({

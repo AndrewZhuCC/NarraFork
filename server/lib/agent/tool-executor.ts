@@ -384,6 +384,8 @@ function describeExecutionTargetDrift(
 }
 
 export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKind {
+	// Cancellation is a bounded control operation, not a resumable child execution.
+	if (tu.name === "Stop") return "ordinary";
 	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}

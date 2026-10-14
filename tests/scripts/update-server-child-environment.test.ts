@@ -536,6 +536,10 @@ async function restoreFixture(f: Awaited<ReturnType<typeof sandbox>>) {
 			return contents(manifest.plan.changelog);
 		if (path === `contents/scripts/lib/ci-release-types.ts?ref=${commit}`)
 			return JSON.stringify({ type: "file", size: 100 });
+		// Component source read (publish revalidation): this fixture is a legacy target with no
+		// shared/component-versions.json, so the bounded tree walk finds nothing to pin.
+		if (path === `git/trees/${commit}`)
+			return JSON.stringify({ sha: commit, truncated: false, tree: [] });
 		throw new Error(`Unexpected source fixture API ${path}`);
 	};
 	const env: NodeJS.ProcessEnv = {
