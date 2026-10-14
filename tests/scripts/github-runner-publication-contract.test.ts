@@ -137,6 +137,9 @@ if (s.mode === "diagnostic") {
  else if (p === "git/refs") {
   if (body.ref !== "refs/heads/narrafork-updates" || s.head) throw new Error("Unsafe fixture ref write");
   s.head = body.sha; out({ ref: body.ref, object: { type: "commit", sha: s.head } });
+ } else if (p === "git/trees/" + s.commit) {
+  // Component source read: a legacy target without shared/component-versions.json.
+  out({ sha: s.commit, truncated: false, tree: [] });
  } else if (p.startsWith("git/commits/")) {
   const sha = p.slice(12), c = s.commits[sha];
   out({ sha, tree: { sha: c.tree }, parents: c.parents.map((sha) => ({ sha })) });
