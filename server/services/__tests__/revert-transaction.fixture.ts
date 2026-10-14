@@ -27,6 +27,7 @@ import { writeTool } from "../../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import { fileChangeLocalIo, localDirectoryIdentity } from "../file-change-local-io";
+import { waitForRetiredFileChangeCleanup } from "../file-change-namespace-reset";
 import {
 	LocalFileChangeRuntime,
 	localFileChangeRuntimeBinding,
@@ -359,6 +360,7 @@ export async function closeFixture(closing: FixtureLifetime) {
 	// Include the original body and setup promise, not just the response/worker.
 	// Partial setup can still publish its own root/database to this fixed owner.
 	while (closing.work.size) await Promise.allSettled([...closing.work]);
+	if (closing.root) await waitForRetiredFileChangeCleanup(join(closing.root, "private"));
 	expect(closing.holds.size).toBe(0);
 	expect(closing.work.size).toBe(0);
 	for (const restore of closing.restores.splice(0).reverse()) restore();
