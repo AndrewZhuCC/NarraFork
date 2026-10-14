@@ -74,11 +74,10 @@ export const readTool: ToolDefinition = {
 		"- Omitting offset and limit reads from the beginning; large files may be automatically limited, so do not rely on omitted parameters for complete content.\n" +
 		"- Dynamic Spec examples: spec://tasks.json, spec://index.md, spec://behavior_fence. spec:// paths are virtual and do not need to be absolute.\n" +
 		"- Any lines longer than 2000 characters will be truncated. Results use cat -n format, with line numbers starting at 1.\n" +
-		"- This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.\n" +
+		"- Image files (e.g. PNG, JPG) are returned as visual content.\n" +
 		'- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.\n' +
 		"- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.\n" +
 		"- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n" +
-		"- If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path.\n" +
 		"- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.",
 	rawJsonSchema: {
 		type: "object",
