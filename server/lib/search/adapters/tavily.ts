@@ -1,5 +1,3 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CustomSearchProviderConfig } from "../../settings/types";
 import type { SearchChannelResult, SearchRequest, SearchResultItem } from "../types";
 import type { AdapterContext, SearchProtocolAdapter } from "./shared";
@@ -158,6 +156,12 @@ export function normalizeTavilyMcpResponse(
 
 async function execute(ctx: AdapterContext): Promise<SearchChannelResult> {
 	const { channel, channelLabel, provider, request, signal } = ctx;
+	// Loaded on first use: the settings module imports this adapter registry, and the MCP SDK
+	// (with ajv) would otherwise be evaluated by every process that only reads settings.
+	const [{ Client }, { StreamableHTTPClientTransport }] = await Promise.all([
+		import("@modelcontextprotocol/sdk/client/index.js"),
+		import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
+	]);
 	const client = new Client({ name: "narrafork-search", version: "0.1.0" }, { capabilities: {} });
 	const transport = new StreamableHTTPClientTransport(tavilyMcpUrl(provider), {
 		requestInit: { headers: tavilyHeaders(provider) },

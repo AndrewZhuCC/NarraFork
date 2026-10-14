@@ -20,7 +20,7 @@
  *  - the interrupt reaches a loop parked on a pending permission;
  *  - a loop that refuses to stop is still reported instead of being written over.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -275,9 +275,23 @@ describe("the narrator itself running", () => {
 	});
 
 	test("a loop that ignores the abort is reported, not written over", async () => {
-		registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
-		const error = await admissionError(await del(`/${narratorId}/messages/${generateId()}`));
-		expect(error).toContain("did not stop after being interrupted");
+		// The real wait/report path, with a short idle budget instead of the 15 s production
+		// one: only "the budget expires while the loop is still busy" matters here, and the
+		// full budget made this single case ~15 s of polling.
+		const session = await import("../../services/narrator-session");
+		const realWait = session.interruptAndWaitForIdle;
+		const shortWait = spyOn(session, "interruptAndWaitForIdle").mockImplementation((id, opts) =>
+			realWait(id, { ...opts, timeoutMs: 500 }),
+		);
+		try {
+			registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
+			const error = await admissionError(await del(`/${narratorId}/messages/${generateId()}`));
+			expect(error).toContain("did not stop after being interrupted");
+			// The route really went through the (shortened) real wait, not around it.
+			expect(shortWait).toHaveBeenCalledTimes(1);
+		} finally {
+			shortWait.mockRestore();
+		}
 	}, 30_000);
 });
 

@@ -109,6 +109,8 @@ jobs:
           ./server/services/file-change-local-restore.test.ts
           ./server/services/file-change-runtime.test.ts
           ./server/services/revert-transaction-service.test.ts
+          ./server/services/revert-transaction-interleaving.test.ts
+          ./server/services/revert-transaction-real-tools.test.ts
           ./server/services/revert-planner-local-access.test.ts
           ./server/services/revert-mutation-journal.test.ts
           ./server/services/narrator-scoped-revert.test.ts

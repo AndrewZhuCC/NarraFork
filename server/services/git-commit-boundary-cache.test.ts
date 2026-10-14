@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { safeSpawn } from "../lib/spawn";
 import {
 	boundaryCacheSize,
 	clearBoundaryCache,
@@ -29,10 +30,18 @@ afterEach(() => {
 	for (const dir of repos.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function run(cwd: string, args: string[]): void {
-	const proc = Bun.spawnSync({
+/**
+ * Fixture git, run asynchronously with its own deadline.
+ *
+ * This used to be `Bun.spawnSync`. On a loaded 4-vCPU runner a synchronous child that never
+ * returned blocked the whole worker: every remaining test in the file then hit the 5 s test
+ * timeout with "killed 1 dangling process", which reads like 17 unrelated failures.
+ */
+async function run(cwd: string, args: string[]): Promise<string> {
+	const result = await safeSpawn({
 		cmd: ["git", ...args],
 		cwd,
+		timeout: 15_000,
 		env: {
 			...process.env,
 			GIT_AUTHOR_NAME: "Test",
@@ -41,26 +50,26 @@ function run(cwd: string, args: string[]): void {
 			GIT_COMMITTER_EMAIL: "test@example.com",
 		},
 	});
-	if (proc.exitCode !== 0) {
-		throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
+	if (result.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
 	}
+	return result.stdout.trim();
 }
 
 /** A repository with one commit touching `a.txt`, plus its HEAD sha. */
-function makeRepo(): { dir: string; headSha: string } {
+async function makeRepo(): Promise<{ dir: string; headSha: string }> {
 	const dir = mkdtempSync(join(tmpdir(), "nf-boundary-cache-"));
 	repos.push(dir);
-	run(dir, ["init", "-q", "-b", "main"]);
+	await run(dir, ["init", "-q", "-b", "main"]);
 	writeFileSync(join(dir, "a.txt"), "v1");
-	run(dir, ["add", "-A"]);
-	run(dir, ["commit", "-q", "-m", "one"]);
-	const proc = Bun.spawnSync({ cmd: ["git", "rev-parse", "HEAD"], cwd: dir });
-	return { dir, headSha: proc.stdout.toString().trim() };
+	await run(dir, ["add", "-A"]);
+	await run(dir, ["commit", "-q", "-m", "one"]);
+	return { dir, headSha: await run(dir, ["rev-parse", "HEAD"]) };
 }
 
 describe("getCommitBoundariesCached", () => {
 	test("resolves boundaries and reuses them within the TTL", async () => {
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		const first = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 		const second = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
@@ -73,7 +82,7 @@ describe("getCommitBoundariesCached", () => {
 	});
 
 	test("concurrent callers share one walk", async () => {
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		const [a, b, c] = await Promise.all([
 			getCommitBoundariesCached(dir, headSha, ["a.txt"]),
@@ -90,15 +99,13 @@ describe("getCommitBoundariesCached", () => {
 	test("a new HEAD does not reuse the old boundaries", async () => {
 		// Boundaries are derived FROM HEAD. Serving them across a commit would filter
 		// attributions against a commit that no longer bounds anything.
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 		const before = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 
 		writeFileSync(join(dir, "a.txt"), "v2");
-		run(dir, ["add", "-A"]);
-		run(dir, ["commit", "-q", "-m", "two"]);
-		const newHead = Bun.spawnSync({ cmd: ["git", "rev-parse", "HEAD"], cwd: dir })
-			.stdout.toString()
-			.trim();
+		await run(dir, ["add", "-A"]);
+		await run(dir, ["commit", "-q", "-m", "two"]);
+		const newHead = await run(dir, ["rev-parse", "HEAD"]);
 
 		const after = await getCommitBoundariesCached(dir, newHead, ["a.txt"]);
 
@@ -109,13 +116,11 @@ describe("getCommitBoundariesCached", () => {
 	test("the same path set in a different order hits one entry", async () => {
 		// `git status` ordering is not guaranteed stable, so an order-sensitive key would
 		// silently double the walks.
-		const { dir } = makeRepo();
+		const { dir } = await makeRepo();
 		writeFileSync(join(dir, "b.txt"), "v1");
-		run(dir, ["add", "-A"]);
-		run(dir, ["commit", "-q", "-m", "two"]);
-		const head = Bun.spawnSync({ cmd: ["git", "rev-parse", "HEAD"], cwd: dir })
-			.stdout.toString()
-			.trim();
+		await run(dir, ["add", "-A"]);
+		await run(dir, ["commit", "-q", "-m", "two"]);
+		const head = await run(dir, ["rev-parse", "HEAD"]);
 
 		const first = await getCommitBoundariesCached(dir, head, ["a.txt", "b.txt"]);
 		const second = await getCommitBoundariesCached(dir, head, ["b.txt", "a.txt"]);
@@ -125,7 +130,7 @@ describe("getCommitBoundariesCached", () => {
 	});
 
 	test("different path sets are separate entries", async () => {
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		const one = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 		const two = await getCommitBoundariesCached(dir, headSha, []);
@@ -135,7 +140,7 @@ describe("getCommitBoundariesCached", () => {
 	});
 
 	test("invalidateBoundaries drops a workspace's entries", async () => {
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 		const first = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 
 		invalidateBoundaries(dir);
@@ -148,7 +153,7 @@ describe("getCommitBoundariesCached", () => {
 	test("invalidateStatus also drops boundaries, so the two cannot drift", async () => {
 		// Staging or discarding changes the set of relevant paths; committing moves the
 		// boundaries themselves. Call sites already invalidate status on all of these.
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 		await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 
 		invalidateStatus(dir);
@@ -157,8 +162,8 @@ describe("getCommitBoundariesCached", () => {
 	});
 
 	test("invalidating one workspace leaves another intact", async () => {
-		const first = makeRepo();
-		const second = makeRepo();
+		const first = await makeRepo();
+		const second = await makeRepo();
 		await getCommitBoundariesCached(first.dir, first.headSha, ["a.txt"]);
 		const kept = await getCommitBoundariesCached(second.dir, second.headSha, ["a.txt"]);
 
@@ -171,7 +176,7 @@ describe("getCommitBoundariesCached", () => {
 	test("entries are capped so distinct path sets cannot accumulate forever", async () => {
 		// The key includes the path set, so staging files one at a time produces a new key
 		// each time.
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		for (let i = 0; i < 40; i++) {
 			await getCommitBoundariesCached(dir, headSha, [`f${i}.txt`]);
@@ -181,7 +186,7 @@ describe("getCommitBoundariesCached", () => {
 	});
 
 	test("ttlMs=0 forces a fresh walk", async () => {
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 		const first = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 
 		const second = await getCommitBoundariesCached(dir, headSha, ["a.txt"], { ttlMs: 0 });
@@ -194,7 +199,7 @@ describe("getCommitBoundariesCached", () => {
 		// stream of single-use keys. If an expired-then-recomputed entry kept its original
 		// position in insertion order, the one key that is actually being polled every 30 s
 		// would be the first one evicted.
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 		// Expire it and recompute: this is the path that used to skip the LRU touch.
@@ -213,7 +218,7 @@ describe("getCommitBoundariesCached", () => {
 		// The window that matters: a commit lands while a boundary walk is in flight. The
 		// walk's answer describes the OLD head, and serving it afterwards would filter
 		// attributions against a commit that no longer bounds anything.
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		const inflight = getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 		invalidateBoundaries(dir);
@@ -228,7 +233,7 @@ describe("getCommitBoundariesCached", () => {
 	});
 
 	test("concurrent callers still share one walk across an invalidation", async () => {
-		const { dir, headSha } = makeRepo();
+		const { dir, headSha } = await makeRepo();
 
 		const first = getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 		const second = getCommitBoundariesCached(dir, headSha, ["a.txt"]);
@@ -246,7 +251,7 @@ describe("getCommitBoundariesCached", () => {
 		// no entry every refetch would spawn a walk for a repository that cannot answer.
 		const dir = mkdtempSync(join(tmpdir(), "nf-boundary-cache-unborn-"));
 		repos.push(dir);
-		run(dir, ["init", "-q", "-b", "main"]);
+		await run(dir, ["init", "-q", "-b", "main"]);
 		writeFileSync(join(dir, "a.txt"), "v1");
 
 		const first = await getCommitBoundariesCached(dir, "", ["a.txt"]);
@@ -263,15 +268,13 @@ describe("getCommitBoundariesCached", () => {
 		// `headSha` moves from "" to a real sha, so the key changes by construction.
 		const dir = mkdtempSync(join(tmpdir(), "nf-boundary-cache-born-"));
 		repos.push(dir);
-		run(dir, ["init", "-q", "-b", "main"]);
+		await run(dir, ["init", "-q", "-b", "main"]);
 		writeFileSync(join(dir, "a.txt"), "v1");
 		const unborn = await getCommitBoundariesCached(dir, "", ["a.txt"]);
 
-		run(dir, ["add", "-A"]);
-		run(dir, ["commit", "-q", "-m", "one"]);
-		const headSha = Bun.spawnSync({ cmd: ["git", "rev-parse", "HEAD"], cwd: dir })
-			.stdout.toString()
-			.trim();
+		await run(dir, ["add", "-A"]);
+		await run(dir, ["commit", "-q", "-m", "one"]);
+		const headSha = await run(dir, ["rev-parse", "HEAD"]);
 		const born = await getCommitBoundariesCached(dir, headSha, ["a.txt"]);
 
 		expect(unborn.byPath.size).toBe(0);

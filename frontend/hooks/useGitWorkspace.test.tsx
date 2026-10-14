@@ -260,6 +260,53 @@ describe("non-blocking Git summaries and operation authority", () => {
 		expect(container.textContent).toBe("pending");
 		expect(latest.layoutReady).toBe(true);
 	});
+	test("late metadata that only completes the scope keeps the authorized workspace visible", async () => {
+		// Metadata without device yet: scope [3, "/repo", null].
+		client.setQueryData(["narrators", "narrator"], {
+			id: "narrator",
+			cwd: "/repo",
+			workspaceRevision: 3,
+		});
+		const reprobe = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace")
+			.mockResolvedValueOnce(workspace("ready", "authorized"))
+			.mockReturnValue(reprobe.promise);
+		await mount();
+		expect(branch()).toBe("authorized");
+		expect(gitWorkspaceTarget("narrator", latest.data)).not.toBeNull();
+		// The device arrives at the same revision: a completion, not a switch.
+		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
+			...old,
+			defaultDeviceId: "remote",
+		}));
+		await flush();
+		expect(api.getGitWorkspace).toHaveBeenCalledTimes(2);
+		expect(container.textContent).toBe("ready");
+		expect(branch()).toBe("authorized");
+		reprobe.resolve(workspace("ready", "reprobed"));
+		await flush();
+		expect(branch()).toBe("reprobed");
+	});
+	test("a refusal is never carried into a completed scope", async () => {
+		client.setQueryData(["narrators", "narrator"], {
+			id: "narrator",
+			cwd: "/repo",
+			workspaceRevision: 3,
+		});
+		spyOn(api, "getGitWorkspace")
+			.mockResolvedValueOnce(workspace("access_denied"))
+			.mockReturnValue(deferred<GitWorkspace>().promise);
+		await mount();
+		expect(latest.accessDenied).toBe(true);
+		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
+			...old,
+			defaultDeviceId: "remote",
+		}));
+		await flush();
+		expect(latest.data).toBeUndefined();
+		expect(latest.accessDenied).toBe(true);
+	});
+
 	test("another narrator never inherits the old branch and late response", async () => {
 		detail("first", 3, "ready");
 		detail("second");

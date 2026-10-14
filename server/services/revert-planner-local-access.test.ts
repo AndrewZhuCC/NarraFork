@@ -1805,9 +1805,20 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		});
 		let held = false;
 		let execution: RevertTransactionExecution | undefined;
+		// The settling 409 is produced only after the cleanup budget elapses with IO still
+		// pending. Production's 30 s budget made this one case ~31 s of pure waiting; a 3 s
+		// budget exercises the identical path. The route caches its service across tests, so
+		// the original budget is restored in `finally`.
+		const CLEANUP_BUDGET_MS = 3_000;
+		let budgeted: { service: RevertTransactionService; original: unknown } | undefined;
 		const execute = RevertTransactionService.prototype.execute;
 		const executeObserver = spyOn(RevertTransactionService.prototype, "execute").mockImplementation(
 			function (this: RevertTransactionService, input) {
+				if (!budgeted) {
+					budgeted = { service: this, original: Reflect.get(this, "cleanupMs") };
+					expect(budgeted.original).toBe(30_000);
+					Reflect.set(this, "cleanupMs", CLEANUP_BUDGET_MS);
+				}
 				// Retain the real lifetime capability for cleanup; do not replace any
 				// request, executor, journal, restore operation or returned outcome.
 				execution = execute.call(this, input);
@@ -1858,7 +1869,11 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 			await execution?.whenSettled.catch(() => {});
 			guard.mockRestore();
 			executeObserver.mockRestore();
+			if (budgeted) Reflect.set(budgeted.service, "cleanupMs", budgeted.original);
 		}
+		// The shortened budget must actually have been applied, or this test silently
+		// went back to waiting the production 30 s.
+		expect(budgeted).toBeDefined();
 		const settled = await execution?.whenSettled;
 		expect(settled).toMatchObject({ status: "recovery_required", settling: false });
 		expect(history()).toBe(before);

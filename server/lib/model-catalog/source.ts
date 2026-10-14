@@ -11,6 +11,7 @@ import {
 	validateRawMetadata,
 } from "@shared/model-catalog/card";
 import { legacyMetadataToRaw } from "@shared/model-catalog/card-resolver";
+import bundledCatalogJSON from "@shared/model-catalog/dist/catalog.json";
 import type { CatalogDocument } from "@shared/model-catalog/schema/catalog";
 import { validateCatalog } from "@shared/model-catalog/src/index";
 
@@ -236,6 +237,21 @@ export function decodeCatalog(value: unknown): CatalogDocument {
 	if (value && typeof value === "object" && "schemaVersion" in value && value.schemaVersion === 2)
 		return catalogFromRaw(value as RawCatalog);
 	return validateCatalog(value);
+}
+
+let bundledDecoded: CatalogDocument | undefined;
+/**
+ * The catalog shipped in the binary, decoded once per process.
+ *
+ * Both the model catalog and the legacy built-in card table derive from this same document, and
+ * each used to decode and fully validate it at import time (~35-45 ms apiece) in every process,
+ * including every isolated test file. Only the bundled module object is memoised: catalogs read
+ * from disk or the network keep going through `decodeCatalog` and are validated every time.
+ * Callers must treat the result as read-only, as they already treat any decoded document.
+ */
+export function decodeBundledCatalog(): CatalogDocument {
+	bundledDecoded ??= decodeCatalog(bundledCatalogJSON);
+	return bundledDecoded;
 }
 
 export function encodeCatalog(catalog: CatalogDocument): RawCatalog | CatalogDocument {

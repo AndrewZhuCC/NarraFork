@@ -191,16 +191,21 @@ function NarratorWorkspacePreview({
 			replace: true,
 		});
 	}, [router, mustPin, target, sha, search.file, mode]);
-	if (!checked || workspace.isLoading) return <Loader aria-label={t("workspace.loading")} />;
-	if (workspace.isError)
+	if ((!checked || workspace.isLoading) && !workspace.accessDenied)
+		return <Loader aria-label={t("workspace.loading")} />;
+	if (workspace.isError && !workspace.accessDenied)
 		return <PreviewFailure error={workspace.error} retry={() => void refetch()} />;
 	if (mismatch) return <PreviewFailure error={{ status: 409 }} retry={() => void refetch()} />;
-	if (!target)
+	if (!target || workspace.accessDenied)
 		return (
 			<Alert color="yellow" role="alert">
 				<Stack gap="sm">
 					{t(
-						`workspace.${workspace.data?.state === "ready" ? "access_denied" : (workspace.data?.state ?? "error")}`,
+						`workspace.${
+							workspace.accessDenied || workspace.data?.state === "ready"
+								? "access_denied"
+								: (workspace.data?.state ?? "error")
+						}`,
 					)}
 					<Button variant="light" size="xs" onClick={() => void refetch()}>
 						{t("workspace.retry")}

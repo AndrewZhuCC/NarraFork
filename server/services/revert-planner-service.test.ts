@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
@@ -8,6 +8,7 @@ import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-pr
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
+import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -69,17 +70,11 @@ beforeEach(async () => {
 	root = await mkdtemp(join(await realpath(tmpdir()), "revert-planner-test-"));
 	workspace = join(root, "workspace");
 	await mkdir(workspace);
-	sqlite = new Database(":memory:");
-	sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
 	// Schema ONLY from the test-preload-isolated DB. No production connection/data,
 	// migration edits, fake receipts or mocked selection/reversal/planner services.
-	const definitions = isolatedTemplate
-		.query<{ sql: string }, []>(
-			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
-		)
-		.all();
-	expect(definitions.length).toBeLessThan(2048);
-	for (const definition of definitions) sqlite.exec(definition.sql);
+	// A byte image built once per process replaces replaying ~550 DDL statements per case.
+	sqlite = openSchemaCopyInMemory(isolatedTemplate);
+	sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
 	db = database(sqlite);
 	clock = Date.parse("2026-09-07T12:00:00.000Z");
 	serial = 0;

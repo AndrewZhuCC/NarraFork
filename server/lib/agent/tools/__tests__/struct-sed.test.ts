@@ -594,6 +594,9 @@ describe("truncated outlines never authorize symbol-based edits", () => {
 		expect((await treeSitterProvider.locate(doc, { symbol: "target" })).length).toBe(2);
 	});
 
+	// The first selector pays one cold parse of the ~1.4 MB file (~3.2 s on an idle
+	// workstation; the next two hit the cache in milliseconds). The default 5 s budget
+	// cannot absorb that on a 4-vCPU CI runner shared with a second test worker.
 	test("refuses bare, qualified and numbered selectors, even on the cached outline", async () => {
 		if (!hasGrammar) return;
 		for (const symbol of ["target", "A.target", "target#1"]) {
@@ -603,7 +606,7 @@ describe("truncated outlines never authorize symbol-based edits", () => {
 			expect(result.output).toContain("`address`");
 		}
 		expect(readFileSync(filePath, "utf8")).toBe(source);
-	});
+	}, 20_000);
 
 	test("refuses a symbolic copy/move destination and batch operation", async () => {
 		if (!hasGrammar) return;

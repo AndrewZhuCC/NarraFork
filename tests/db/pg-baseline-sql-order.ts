@@ -12,17 +12,26 @@ const MAX_TABLES = 4096;
 const MAX_COLUMNS = 1600;
 const MAX_PROBLEMS = 128;
 
-type Token = { kind: "word" | "identifier" | "literal" | "symbol"; value: string };
+/** `start`/`end` are source offsets, so a statement's exact text (including the opaque body of a
+ * dollar-quoted literal) can be recovered for the procedural allow-list digest. */
+type Token = {
+	kind: "word" | "identifier" | "literal" | "symbol";
+	value: string;
+	start: number;
+	end: number;
+};
 
 /** A deliberately limited lexer, not a PostgreSQL expression or DDL generator.
  * Literal contents are opaque, so commas/semicolons/DDL words in them cannot affect layout. */
 function lex(sql: string): Token[] {
 	const tokens: Token[] = [];
-	const push = (kind: Token["kind"], value: string) => {
+	let tokenStart = 0;
+	const push = (kind: Token["kind"], value: string, end: number) => {
 		if (tokens.length >= MAX_TOKENS) throw new Error("SQL token limit exceeded");
-		tokens.push({ kind, value });
+		tokens.push({ kind, value, start: tokenStart, end });
 	};
 	for (let i = 0; i < sql.length; ) {
+		tokenStart = i;
 		const char = sql[i];
 		if (/\s/.test(char)) {
 			i++;
@@ -76,7 +85,7 @@ function lex(sql: string): Token[] {
 				i++;
 			}
 			if (!closed) throw new Error("Unterminated quoted identifier/string");
-			push(char === '"' ? "identifier" : "literal", value);
+			push(char === '"' ? "identifier" : "literal", value, i);
 			continue;
 		}
 		if (char === "$") {
@@ -85,17 +94,17 @@ function lex(sql: string): Token[] {
 				const end = sql.indexOf(delimiter, i + delimiter.length);
 				if (end === -1) throw new Error("Unterminated dollar string");
 				i = end + delimiter.length;
-				push("literal", "");
+				push("literal", "", i);
 				continue;
 			}
 		}
 		if (/[A-Za-z_]/.test(char)) {
 			const start = i++;
 			while (i < sql.length && /[A-Za-z0-9_$]/.test(sql[i])) i++;
-			push("word", sql.slice(start, i).toLowerCase());
+			push("word", sql.slice(start, i).toLowerCase(), i);
 			continue;
 		}
-		push("symbol", char);
+		push("symbol", char, i + 1);
 		i++;
 	}
 	return tokens;
@@ -338,7 +347,82 @@ function dataOnly(tokens: readonly Token[]): void {
 	}
 }
 
-function replay(tokens: readonly Token[], order: Map<string, string[]>): void {
+/**
+ * Reviewed procedural statements, admitted by EXACT text only.
+ *
+ * Layout replay cannot see inside a dollar-quoted body, so procedural DDL stays fail-closed in
+ * general. These are the model-history revision triggers of migration 0012: they bump integer
+ * counters and never alter, create or drop a relation or column. Each entry is the SHA-256 of
+ * the statement as written in the SQL file (trimmed, without its terminating semicolon); a single
+ * changed character falls back to the generic rejection and requires a fresh review here.
+ */
+const REVIEWED_PROCEDURAL_STATEMENTS = new Map<string, string>([
+	// 0012_narrator_model_history_revision.sql
+	[
+		"4771573f041a0f54e3ea0665ef68ee93aea8f0be9c027c72de57d693732cce33",
+		"function model_history_v1_message",
+	],
+	[
+		"9dcbda8218ea5783c1bc304ab0d7472816d21a45a0fb4dc0d9b955a8ba113c39",
+		"trigger model_history_v1_message",
+	],
+	[
+		"2a90b0a82ef23a094793b4b8ae322c6725192bcaa2a0f829720cb816c3063f67",
+		"function model_history_v1_tool",
+	],
+	[
+		"135b8ca862703e6c811b7f2e7da3585600201e6d6be1f187b9c297a9edf94446",
+		"trigger model_history_v1_tool",
+	],
+	[
+		"a1e81f82f84ea6999608cba94b3cb28c6d9e46ec1a62c4538a67e42a70feb16f",
+		"function model_history_v1_ref",
+	],
+	[
+		"d59312f6957e2345c014e0f9ea6ec918edf029e7bceb02909bbe8d13220fffcf",
+		"trigger model_history_v1_ref",
+	],
+	[
+		"4a4d437cd8296f4b050c4f812bdfab84876a3dd5090821a8da85f70c7fa6e4d8",
+		"function model_history_v1_sender",
+	],
+	[
+		"f6f18636aabff4b30eb9d592463bb999f5b249322c936328371b9abbdd928798",
+		"trigger model_history_v1_sender",
+	],
+	[
+		"5f257c52cde5633aaee32d32c6afbee74353d707b668edddd38573edea2983bb",
+		"function model_history_v1_narrator",
+	],
+	[
+		"5121c08ad3af983c5dbeb029b7bf4f0a43831fc3d945f9455e0d4596b270f2da",
+		"trigger model_history_v1_narrator",
+	],
+	[
+		"4549dcc98c05b70107eed1856f9687b2ab67795464f97dd8acd77d38b58d73ae",
+		"seed model_history_revision_contracts",
+	],
+]);
+
+/** The exact source text of one statement, as the allow-list digests were computed. */
+function statementText(tokens: readonly Token[], sql: string): string {
+	const first = tokens[0];
+	const last = tokens[tokens.length - 1];
+	return first && last ? sql.slice(first.start, last.end).trim() : "";
+}
+
+function reviewedProcedural(tokens: readonly Token[], sql: string): boolean {
+	const digest = new Bun.CryptoHasher("sha256").update(statementText(tokens, sql)).digest("hex");
+	const label = REVIEWED_PROCEDURAL_STATEMENTS.get(digest);
+	if (!label) return false;
+	// Defence in depth: the digest pins the text, the label pins what kind of statement it is.
+	const cursor = new Cursor(tokens);
+	if (label.startsWith("seed ")) return cursor.keyword("insert") && cursor.keyword("into");
+	return cursor.keyword("create") && cursor.keyword(label.split(" ")[0]);
+}
+
+function replay(tokens: readonly Token[], order: Map<string, string[]>, sql = ""): void {
+	if (sql && reviewedProcedural(tokens, sql)) return;
 	const cursor = new Cursor(tokens);
 	if (cursor.keyword("create")) {
 		if (cursor.keyword("table")) {
@@ -399,7 +483,7 @@ export function physicalColumnOrderFromSql(
 					if (!tokens.length) continue;
 					if (++statements > MAX_STATEMENTS) throw new Error("SQL statement limit exceeded");
 					try {
-						replay(tokens, order);
+						replay(tokens, order, sql);
 					} catch (cause) {
 						problem(`SQL ${file}, statement ${statements}: ${String(cause)}`);
 					}

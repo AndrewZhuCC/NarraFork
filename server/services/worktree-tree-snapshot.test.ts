@@ -26,6 +26,7 @@ import { normalizePathForComparison } from "../lib/platform-path";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
 import {
+	hasHotPathWarmupForTests,
 	planTreeRevertSegments,
 	resetHotPathCaptureStateForTests,
 	TreeRestoreError,
@@ -1793,10 +1794,7 @@ describe("hot-path capture budget", () => {
 
 		// A zero budget expires before the first git process can possibly exit, so
 		// the tool path gets its null and moves on...
-		const timedOut = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
-			budgetMs: 0,
-		});
-		expect(timedOut).toBeNull();
+		await promoteToWarmup(repo);
 
 		// ...while the capture keeps running as the warm-up. A later call shares that
 		// scan instead of queueing a second one, and resolves with its hash.
@@ -1847,11 +1845,28 @@ describe("hot-path capture budget", () => {
 		const repo = await createRepo("nf-tree-hot-shared-");
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
-		const results = await Promise.all([
-			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		]);
+		// Warm only the disk-space probe (its result is cached per path), then return to an EMPTY
+		// warm-up slot. Without this, the zero budget can expire on the probe and no call would
+		// ever reach the slot, so "they share one warm-up" would be vacuous on a loaded runner.
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 30_000 }),
+		).toMatch(/^[0-9a-f]{40}$/);
+		resetHotPathCaptureStateForTests();
+		writeFileSync(join(repo, "a.txt"), "two\n");
+
+		// Three concurrent calls race for the empty slot: exactly one real scan may start.
+		const capture = spyOn(worktreeTreeSnapshot, "capture");
+		let results: (string | null)[];
+		try {
+			results = await Promise.all([
+				worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+				worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+				worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+			]);
+			expect(capture).toHaveBeenCalledTimes(1);
+		} finally {
+			capture.mockRestore();
+		}
 		expect(results).toEqual([null, null, null]);
 
 		// One warm-up completed underneath them all.
@@ -1869,11 +1884,7 @@ describe("hot-path capture budget", () => {
 		tempDirs.push(dir);
 		snapshotPaths.push(normalizePathForComparison(dir));
 
-		const timedOut = await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, {
-			budgetMs: 0,
-			cooldownMs: 1_000,
-		});
-		expect(timedOut).toBeNull();
+		await promoteToWarmup(dir, 1_000);
 		// Sharing the warm-up to its conclusion guarantees the cooldown has engaged
 		// by the time this resolves (the cooldown window came from the first call).
 		expect(
@@ -1924,9 +1935,7 @@ describe("hot-path capture budget", () => {
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
 		// Promote a capture to the background warm-up.
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 
 		// A boundary measured *now* must not come from that older scan (its window
 		// may straddle the writes being measured): the call waits for the stale scan
@@ -1949,9 +1958,7 @@ describe("hot-path capture budget", () => {
 		const repo = await createRepo("nf-tree-hot-share-");
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 
 		// The in-flight scan started after the cutoff, so its result is valid for the
 		// caller and no second scan is started.
@@ -1989,6 +1996,30 @@ describe("hot-path capture budget", () => {
 		return { spy, state };
 	}
 
+	/**
+	 * Promote a capture to the background warm-up slot and PROVE it got there.
+	 *
+	 * `budgetMs: 0` alone is not enough: the same zero budget also races the async disk-space
+	 * probe that runs before any capture starts. On a loaded runner that probe loses, the call
+	 * returns null without registering a warm-up, and every later assertion about "the
+	 * in-flight warm-up" silently tests nothing. Retry the zero-budget call until a warm-up is
+	 * really registered (the disk probe result is cached after its first completion, so this
+	 * converges in a few attempts), then hand control back to the test.
+	 */
+	async function promoteToWarmup(repo: string, cooldownMs?: number): Promise<void> {
+		for (let attempt = 0; attempt < 200; attempt++) {
+			expect(
+				await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+					budgetMs: 0,
+					...(cooldownMs === undefined ? {} : { cooldownMs }),
+				}),
+			).toBeNull();
+			if (hasHotPathWarmupForTests(repo)) return;
+			await Bun.sleep(5);
+		}
+		throw new Error("no warm-up was registered for the zero-budget capture");
+	}
+
 	test("a structural capture preempts an in-flight warm-up instead of queueing behind it", async () => {
 		resetHotPathCaptureStateForTests();
 		const repo = await createRepo("nf-tree-hot-preempt-");
@@ -1996,9 +2027,7 @@ describe("hot-path capture budget", () => {
 
 		const { spy, state } = mockHungCapture();
 		// Promote the hung capture to the warm-up slot.
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 
 		// The structural path must kill the warm-up's scan rather than queue behind
 		// it for the full warm-up timeout.
@@ -2020,9 +2049,7 @@ describe("hot-path capture budget", () => {
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
 		const { spy, state } = mockHungCapture();
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 		spy.mockRestore();
 
 		expect(await worktreeTreeSnapshot.destroy(repo, LOCAL_DEVICE_ID, { force: true })).toBe(true);

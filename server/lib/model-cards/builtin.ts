@@ -4,12 +4,11 @@
  */
 
 import type { ModelCard } from "@shared/model-card";
-import catalog from "@shared/model-catalog/dist/catalog.json";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
-import { decodeCatalog } from "../model-catalog/source";
+import { decodeBundledCatalog } from "../model-catalog/source";
 
 const wireLevels = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
-const models = decodeCatalog(catalog).models;
+const models = decodeBundledCatalog().models;
 const exactKeys = new Set(models.map((model) => model.id.trim().toLowerCase()));
 // Metadata lookup only, not an enumeration of callable provider models.
 export const BUILTIN_MODEL_CARDS: readonly ModelCard[] = models.map((model) => {
