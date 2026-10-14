@@ -642,34 +642,113 @@ describe("decideSurfaceRefresh", () => {
 	// what the next persist wrote back.
 	test("an incoming tree identical to the baseline is ignored", () => {
 		expect(
-			decideSurfaceRefresh({ localEdit: false, builtTree: "tree-a", incomingTree: "tree-a" }),
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: "tree-a",
+				builtRevision: 1,
+				incomingTree: "tree-a",
+				incomingRevision: 1,
+			}),
 		).toBe("ignore");
 	});
 
-	test("a different tree with no local edits rebuilds from the server layout", () => {
+	test("a different tree with a newer revision and no unsaved edits rebuilds", () => {
 		expect(
-			decideSurfaceRefresh({ localEdit: false, builtTree: "tree-a", incomingTree: "tree-b" }),
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: "tree-a",
+				builtRevision: 1,
+				incomingTree: "tree-b",
+				incomingRevision: 2,
+			}),
 		).toBe("rebuild");
 	});
 
-	test("a different tree WITH local edits keeps the surface and only advances the baseline", () => {
+	test("a different tree WITH unsaved edits keeps the surface and only advances the baseline", () => {
 		expect(
-			decideSurfaceRefresh({ localEdit: true, builtTree: "tree-a", incomingTree: "tree-b" }),
+			decideSurfaceRefresh({
+				unsaved: true,
+				builtTree: "tree-a",
+				builtRevision: 1,
+				incomingTree: "tree-b",
+				incomingRevision: 2,
+			}),
 		).toBe("adopt-baseline");
 	});
 
-	test("null/undefined incoming trees compare equal to a null baseline", () => {
-		expect(decideSurfaceRefresh({ localEdit: false, builtTree: null, incomingTree: null })).toBe(
-			"ignore",
-		);
+	// A read that started before our own save can land afterwards with an OLDER
+	// tree; only the revision tells it apart from a genuinely newer remote layout.
+	test("a different tree at an older revision is a stale read and ignored", () => {
 		expect(
-			decideSurfaceRefresh({ localEdit: false, builtTree: null, incomingTree: undefined }),
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: "tree-b",
+				builtRevision: 2,
+				incomingTree: "tree-a",
+				incomingRevision: 1,
+			}),
 		).toBe("ignore");
 	});
 
-	test("an empty baseline with a real incoming tree rebuilds", () => {
+	test("a different tree at the SAME revision is stale (revision only moves with the tree)", () => {
 		expect(
-			decideSurfaceRefresh({ localEdit: false, builtTree: null, incomingTree: "tree-a" }),
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: "tree-a",
+				builtRevision: 1,
+				incomingTree: "tree-b",
+				incomingRevision: 1,
+			}),
+		).toBe("ignore");
+	});
+
+	// The revision guard runs BEFORE the unsaved check: a stale read must be
+	// ignored even with local edits pending, or it would drag the baseline
+	// backwards (adopt-baseline) and make the next identical refetch look new.
+	test("unsaved edits do not rescue a stale read", () => {
+		expect(
+			decideSurfaceRefresh({
+				unsaved: true,
+				builtTree: "tree-b",
+				builtRevision: 2,
+				incomingTree: "tree-a",
+				incomingRevision: 1,
+			}),
+		).toBe("ignore");
+	});
+
+	test("null/undefined incoming trees compare equal to a null baseline", () => {
+		expect(
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: null,
+				builtRevision: 0,
+				incomingTree: null,
+				incomingRevision: 0,
+			}),
+		).toBe("ignore");
+		expect(
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: null,
+				builtRevision: 0,
+				incomingTree: undefined,
+				incomingRevision: 0,
+			}),
+		).toBe("ignore");
+	});
+
+	// A null baseline has no meaningful revision; the guard must not swallow the
+	// first real layout.
+	test("an empty baseline with a real incoming tree rebuilds even at revision 0", () => {
+		expect(
+			decideSurfaceRefresh({
+				unsaved: false,
+				builtTree: null,
+				builtRevision: 0,
+				incomingTree: "tree-a",
+				incomingRevision: 0,
+			}),
 		).toBe("rebuild");
 	});
 });

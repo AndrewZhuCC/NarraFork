@@ -1,6 +1,9 @@
+import type { WorkspaceChangedEvent } from "@shared/workspace-events";
 import type { WorkspacePanelInput } from "@shared/workspace-panels";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { api } from "../lib/api";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const WORKSPACE_QUERY_GC_TIME_MS = 60_000;
 
@@ -21,6 +24,52 @@ export function useWorkspace(id: string) {
 		enabled: !!id,
 		gcTime: WORKSPACE_QUERY_GC_TIME_MS,
 	});
+}
+
+/**
+ * Keep a mounted workspace view in step with writes from OTHER devices.
+ *
+ * The server broadcasts `workspace_changed` after every layout save, membership
+ * change and rename; without this listener the view only converged on a window
+ * refocus. The event is an invalidation signal — the refetch itself decides how
+ * to adopt the new state (see `decideSurfaceRefresh`), so bursts during a drag
+ * cost at most one in-flight GET each.
+ *
+ * Frames missed while the socket was down are recovered by invalidating on
+ * reconnect (the same reconciliation the recent-tabs subscription does).
+ *
+ * `deleted` is handled by the caller (it navigates away), not by an invalidate:
+ * the re-fetch would 404 and strand the page on its loading state. The query is
+ * still dropped here so a remount within `gcTime` cannot resurrect the deleted
+ * workspace from cache; the active observer may fire one 404 refetch in the
+ * meantime, which the navigation makes moot.
+ */
+export function useWorkspaceChangeSync(
+	workspaceId: string,
+	onDeleted?: (workspaceId: string) => void,
+) {
+	const qc = useQueryClient();
+	useEffect(() => {
+		const handle = narratorWSManager.addListener({ types: ["workspace_changed"] }, (frame) => {
+			const event = frame as unknown as WorkspaceChangedEvent;
+			if (event.workspaceId !== workspaceId) return;
+			if (event.reason === "deleted") {
+				qc.removeQueries({ queryKey: workspaceQueryKey(workspaceId) });
+				onDeleted?.(workspaceId);
+				return;
+			}
+			void qc.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId) });
+		});
+		const offConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
+			if (connected && isReconnect) {
+				void qc.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId) });
+			}
+		});
+		return () => {
+			narratorWSManager.removeListener(handle);
+			offConnection();
+		};
+	}, [qc, workspaceId, onDeleted]);
 }
 
 export function useCreateWorkspace() {
