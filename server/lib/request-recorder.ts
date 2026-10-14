@@ -633,8 +633,12 @@ function sendBytes(
 		}
 		while (offset < value.byteLength) {
 			const data = Uint8Array.from(value.subarray(offset, offset + RECORDING_CHUNK_BYTES));
+			// capture() may synchronously transfer data.buffer to the worker, which detaches it
+			// (byteLength becomes 0). Read the length first, or offset never advances and the
+			// same chunk is re-posted until the in-flight window fills.
+			const length = data.byteLength;
 			port.capture({ type: "chunk", requestId, side, kind, data, packet, offset, total, time });
-			offset += data.byteLength;
+			offset += length;
 		}
 	}
 }
