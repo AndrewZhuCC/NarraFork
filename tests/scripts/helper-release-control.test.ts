@@ -740,7 +740,7 @@ describe("protected workflow and pinned recipe guards", () => {
 		expect(uses.length).toBeGreaterThan(0);
 		expect(uses.every((value) => /@[0-9a-f]{40}$/.test(value as string))).toBe(true);
 		expect(workflow).not.toContain("bun-version: latest");
-		expect(workflow).toContain("bun-version: 1.4.2");
+		expect(workflow).toContain("bun-version: 1.4.3");
 	});
 	test("native matrix has all six platform runners and original-bundle recovery", () => {
 		for (const platform of HELPER_PLATFORMS) expect(workflow).toContain(`platform: ${platform}`);

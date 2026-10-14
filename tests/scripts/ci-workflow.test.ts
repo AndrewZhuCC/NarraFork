@@ -153,7 +153,7 @@ describe("generic CI workflow", () => {
 	});
 
 	test("installs the packageManager Bun version with the frozen lockfile before any check", () => {
-		expect(packageManager).toBe("bun@1.4.2");
+		expect(packageManager).toBe("bun@1.4.3");
 		for (const id of ["static-checks", "build", "tests"]) {
 			const steps = job(id).steps;
 			const checkout = step(id, (value) => value.uses === pins.checkout);

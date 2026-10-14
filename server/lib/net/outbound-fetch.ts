@@ -84,7 +84,7 @@ function writeVerboseBlock(lines: string[]): void {
 }
 
 type BunFetchInit = RequestInit & {
-	proxy?: string;
+	proxy?: string | false;
 	tls?: { rejectUnauthorized?: boolean };
 };
 
@@ -195,9 +195,9 @@ function shouldReplayTransportFailure(
 /**
  * Fetch through Bun's native transport so streaming Response bodies and
  * AbortSignal use Bun's supported implementation. Direct requests pass
- * `proxy: ""`; that alone does NOT defeat an ambient HTTP(S)_PROXY on Bun
- * (see `net/proxy-env.ts`, which blanks those variables at startup so this
- * explicit value is authoritative). Configured proxies are limited to the
+ * `proxy: false` (Bun 1.4.3+) to bypass ambient HTTP(S)_PROXY. Startup also
+ * blanks proxy variables via `net/proxy-env.ts` as defence in depth; an empty
+ * string is not a per-request opt-out. Configured proxies are limited to the
  * HTTP(S) protocols supported by Bun fetch.
  */
 export async function outboundFetch(
@@ -239,7 +239,7 @@ export async function outboundFetch(
 	// something both layers already handle.
 	const proxy = options.proxyUrl
 		? normalizeProxyUrl(options.proxyUrl, SUPPORTED_PROXY_PROTOCOLS).toString()
-		: "";
+		: false;
 	const fetchInit: BunFetchInit = {
 		...init,
 		headers: requestHeaders,

@@ -17,7 +17,7 @@ const plan: CiReleasePlan = {
 	channel: "beta",
 	commit: "a".repeat(40),
 	workflowCommit: "b".repeat(40),
-	bunVersion: "1.4.2",
+	bunVersion: "1.4.3",
 	runId: 456,
 	runAttempt: 1,
 	changelog: { version: "1.2.1", date: "2026-01-02", en: "Published notes", "zh-CN": "发布说明" },

@@ -60,7 +60,7 @@ bun server/index.ts --no-auto-resume
 
 - **Static checks**：SQLite 迁移资产检查、全仓 Biome、i18n 检查。
 - **Build and typecheck**：先构建前端（Vite 自动生成 `routeTree.gen.ts`），再运行 TypeScript。根目录测试导入 VS Code 扩展的类型接口，因此还需按 `vscode-extension/bun.lock` 安装该子项目的类型依赖。
-- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate` 和固定的 `--parallel=2`。Bun 按 `.github/test-timings.json` 中的历史文件耗时均衡分片、优先调度慢文件；它只是调度提示，不是文件清单，新增或缺少提示的测试仍由 Bun 自动发现。`scripts/run-ci-tests.ts` 有界校验后将提示独占复制到 `artifacts/ci-test-timings.json`，`--update-timings` 仅更新该片的 artifact；不写回仓库基线，不执行自建文件过滤，也不使用共享同文件状态的 `--concurrent`/`--no-isolate`。runner 原样转交白名单内 native 参数（仍兼容旧五参数），将 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，避免固定 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的运行时缺陷；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志、唯一命名的 JUnit 和耗时报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
+- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate` 和固定的 `--parallel=2`。Bun 按 `.github/test-timings.json` 中的历史文件耗时均衡分片、优先调度慢文件；它只是调度提示，不是文件清单，新增或缺少提示的测试仍由 Bun 自动发现。`scripts/run-ci-tests.ts` 有界校验后将提示独占复制到 `artifacts/ci-test-timings.json`，`--update-timings` 仅更新该片的 artifact；不写回仓库基线，不执行自建文件过滤，也不使用共享同文件状态的 `--concurrent`/`--no-isolate`。runner 原样转交白名单内 native 参数（仍兼容旧五参数），将 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，保留针对 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的规避（当前固定 Bun 1.4.3，不假定升级已修复该缺陷）；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志、唯一命名的 JUnit 和耗时报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
 - **CI Gate**：只有以上任务全部成功才成功；失败、取消或跳过都不能变成通过。启用合并保护时选择该检查；仅增加 workflow 不会自动修改仓库保护规则。
 
 ### SQLite 历史资产

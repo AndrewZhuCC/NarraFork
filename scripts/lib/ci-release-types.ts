@@ -4,7 +4,7 @@ import type { BinaryMetadata } from "./binary-metadata";
 /** Compatibility default only; live CI derives identity from validated GITHUB_REPOSITORY. */
 export const CI_RELEASE_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
 export const CI_RELEASE_WORKFLOW = ".github/workflows/release.yml";
-export const CI_RELEASE_BUN = "1.4.2";
+export const CI_RELEASE_BUN = "1.4.3";
 export const CI_RELEASE_TARGETS = [
 	{
 		target: "linux-x64",
