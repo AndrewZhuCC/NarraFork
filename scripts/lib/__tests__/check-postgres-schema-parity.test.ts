@@ -404,10 +404,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 119 tables and 1688 columns including Git identities and history revisions", () => {
+	test("covers 119 tables and 1689 columns including Git identities and history revisions", () => {
 		expect(target.tables.length).toBe(119);
-		// 1685 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1688);
+		// 1686 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1689);
 		expect(
 			target.tables
 				.find((table) => table.name === "model_history_revision_contracts")

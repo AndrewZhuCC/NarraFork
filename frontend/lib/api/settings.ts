@@ -362,6 +362,8 @@ export const settingsApi = {
 			narratorToolbarLayout: {
 				items: Array<{ id: string }>;
 			};
+			/** 大纲标签排布（JSON: { [narratorId]: { order, pinned } }）。 */
+			specTabLayout: Record<string, unknown>;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -531,5 +533,14 @@ export const settingsApi = {
 		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
 			method: "PATCH",
 			body: JSON.stringify({ projectId, viewport }),
+		}),
+	/**
+	 * 保存某个叙述者的大纲标签排布。服务端按 narratorId 合并写入，
+	 * 不会覆盖其他叙述者的记录。
+	 */
+	saveSpecTabLayout: (narratorId: string, layout: { order: string[]; pinned: string[] }) =>
+		request<{ ok: boolean }>("/user-preferences/spec-tab-layout", {
+			method: "PATCH",
+			body: JSON.stringify({ narratorId, ...layout }),
 		}),
 };

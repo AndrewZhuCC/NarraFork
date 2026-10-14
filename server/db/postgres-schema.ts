@@ -1209,6 +1209,7 @@ export const userPreferences = pgTable("user_preferences", {
 	gatewayConfig: text("gateway_config").notNull().default("{}"),
 	navLayout: text("nav_layout").notNull().default("{}"),
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
+	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
 	createdAt: text("created_at").notNull(),
@@ -3767,7 +3768,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 119,
-  "columnCount": 1688,
+  "columnCount": 1689,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11171,6 +11172,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "narratorToolbarLayout",
           "name": "narrator_toolbar_layout",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"{}\"",
+          "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "specTabLayout",
+          "name": "spec_tab_layout",
           "kind": "text",
           "pgType": "text",
           "notNull": true,
