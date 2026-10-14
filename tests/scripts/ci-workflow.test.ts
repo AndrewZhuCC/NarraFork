@@ -245,6 +245,18 @@ describe("generic CI workflow", () => {
 			expect(step["continue-on-error"]).toBeUndefined();
 	});
 
+	test("executor dry-run uses the shared component pin instead of a fabricated CI version", () => {
+		const auxiliary = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/remote-executor.yml"), "utf8"),
+		) as Workflow;
+		const releaseChecks = Object.values(auxiliary.jobs).flatMap((value) =>
+			value.steps.filter((entry) => entry.name === "Verify executor release pipeline"),
+		);
+		expect(releaseChecks).toHaveLength(1);
+		expect(releaseChecks[0]?.run?.trim()).toBe("bun scripts/release-executor.ts --dry-run");
+		expect(releaseChecks[0]?.["continue-on-error"]).toBeUndefined();
+	});
+
 	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
 		let checked = 0;
 		for (const name of [

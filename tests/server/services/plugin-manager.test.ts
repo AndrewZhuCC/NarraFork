@@ -47,6 +47,7 @@ const fixturePackage = fileURLToPath(
 	new URL("../../fixtures/plugins/packages/valid-package", import.meta.url),
 );
 const tempRoots: string[] = [];
+const drainBeforeCleanup: Array<() => Promise<void>> = [];
 
 async function makeTempRoot(base = tmpdir()): Promise<string> {
 	const created = await mkdtemp(join(base, "narrafork-plugin-manager-"));
@@ -338,6 +339,8 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 }
 
 afterEach(async () => {
+	// Also release and drain held operations when Bun times out a test body.
+	for (const drain of drainBeforeCleanup.splice(0)) await drain();
 	for (const root of tempRoots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -1124,24 +1127,32 @@ describe("PluginManager", () => {
 		const pluginB = await manager.install(await makePackage(root, "com.example.concurrencyb"));
 		await Promise.all([manager.enable(pluginA.pluginId), manager.enable(pluginB.pluginId)]);
 		const gate = supervisor.gate(pluginA.pluginId);
-		const firstA = manager.activate(pluginA.pluginId);
-		await gate.entered;
-		const secondA = manager.activate(pluginA.pluginId);
-		await sleep(10);
-		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
-
-		const statusB = await Promise.race([
-			manager.activate(pluginB.pluginId),
-			sleep(250).then(() => {
-				throw new Error("plugin B was blocked by plugin A");
-			}),
-		]);
-		expect(statusB.runtimeState).toBe("active");
-		gate.release();
-		const [statusA1, statusA2] = await Promise.all([firstA, secondA]);
-		expect(statusA1.runtimeState).toBe("active");
-		expect(statusA2.runtimeState).toBe("active");
-		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+		const activations = [manager.activate(pluginA.pluginId)];
+		let draining: Promise<void> | undefined;
+		const drain = () =>
+			(draining ??= (async () => {
+				gate.release();
+				await Promise.allSettled(activations);
+			})());
+		drainBeforeCleanup.push(drain);
+		try {
+			await gate.entered;
+			activations.push(manager.activate(pluginA.pluginId));
+			expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+			const activatingB = manager.activate(pluginB.pluginId);
+			activations.push(activatingB);
+			// B must finish while A's gate is still held; this tests independence,
+			// not whether real Windows journal IO finishes inside an arbitrary 250ms.
+			const statusB = await activatingB;
+			expect(statusB.runtimeState).toBe("active");
+			gate.release();
+			const [statusA1, statusA2] = await Promise.all(activations.slice(0, 2));
+			expect(statusA1?.runtimeState).toBe("active");
+			expect(statusA2?.runtimeState).toBe("active");
+			expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+		} finally {
+			await drain();
+		}
 	});
 
 	test("isolates a revoked residual plugin during initialization", async () => {
