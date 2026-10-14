@@ -146,6 +146,118 @@ describe("copyGeneratedImageToClipboard", () => {
 		expect(g.fetch).toHaveBeenCalledTimes(1);
 	});
 
+	function installSelectionDom(options: {
+		isSecureContext: boolean;
+		execCommand?: () => boolean;
+		imageEvent?: "load" | "error";
+	}) {
+		let assignedSource = "";
+		const image = {
+			src: "",
+			onload: undefined as (() => void) | undefined,
+			onerror: undefined as (() => void) | undefined,
+		};
+		Object.defineProperty(image, "src", {
+			set(value: string) {
+				assignedSource = value;
+				if (options.imageEvent === "error") image.onerror?.();
+				else image.onload?.();
+			},
+			get: () => assignedSource,
+		});
+		const execCommand = mock(options.execCommand ?? (() => true));
+		Object.defineProperty(g, "document", {
+			configurable: true,
+			value: {
+				execCommand,
+				createElement: (tag: string) =>
+					tag === "img"
+						? image
+						: {
+								contentEditable: "",
+								style: { cssText: "" },
+								appendChild() {},
+								remove() {},
+							},
+				createRange: () => ({ selectNodeContents() {} }),
+				body: { appendChild() {} },
+			},
+		});
+		Object.defineProperty(g, "window", {
+			configurable: true,
+			value: {
+				isSecureContext: options.isSecureContext,
+				getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+			},
+		});
+		Object.defineProperty(g, "FileReader", {
+			configurable: true,
+			value: class {
+				result: string | null = null;
+				onload: (() => void) | null = null;
+				onerror: (() => void) | null = null;
+				readAsDataURL(blob: Blob) {
+					this.result = `data:${blob.type};base64,cG5n`;
+					this.onload?.();
+				}
+			},
+		});
+		return { execCommand, readSource: () => assignedSource };
+	}
+
+	test("selection fallback does not copy a remote url when pixels cannot be read", async () => {
+		const { execCommand } = installSelectionDom({ isSecureContext: false });
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: mock(async () => {
+				throw new TypeError("Failed to fetch");
+			}),
+		});
+
+		let error: unknown;
+		try {
+			await copyGeneratedImageToClipboard({ imageSrc: "https://images.example/photo.png" });
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(isImageClipboardUnavailableError(error)).toBe(true);
+		expect(execCommand).not.toHaveBeenCalled();
+	});
+
+	test("an already inline data url can be selected when the byte fetch fails", async () => {
+		const { execCommand, readSource } = installSelectionDom({ isSecureContext: false });
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: mock(async () => {
+				throw new TypeError("Failed to fetch");
+			}),
+		});
+
+		await copyGeneratedImageToClipboard({ imageSrc: "data:image/png;base64,cG5n" });
+
+		expect(execCommand).toHaveBeenCalledWith("copy");
+		expect(readSource()).toBe("data:image/png;base64,cG5n");
+	});
+
+	test("selection image load failure stays unavailable and does not copy", async () => {
+		const { execCommand } = installSelectionDom({ isSecureContext: false, imageEvent: "error" });
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: mock(async () => new Response(new Blob(["png"], { type: "image/png" }))),
+		});
+
+		let error: unknown;
+		try {
+			await copyGeneratedImageToClipboard({ imageSrc: "blob:image" });
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(isImageClipboardUnavailableError(error)).toBe(true);
+		expect(execCommand).not.toHaveBeenCalled();
+	});
+
 	test("preserves the actual clipboard rejection, not a capability error", async () => {
 		const denied = new DOMException("Denied", "NotAllowedError");
 		Object.defineProperty(g, "window", { value: { isSecureContext: true }, configurable: true });
@@ -166,6 +278,58 @@ describe("copyGeneratedImageToClipboard", () => {
 		});
 		await expect(copyGeneratedImageToClipboard({ imageSrc: "blob:image" })).rejects.toBe(denied);
 		expect(isImageClipboardUnavailableError(denied)).toBe(false);
+	});
+
+	test("a failed selection fallback still preserves the clipboard rejection", async () => {
+		const denied = new DOMException("Denied", "NotAllowedError");
+		const { execCommand } = installSelectionDom({
+			isSecureContext: true,
+			execCommand: () => false,
+		});
+		Object.defineProperty(g, "navigator", {
+			configurable: true,
+			value: {
+				clipboard: {
+					write: async () => {
+						throw denied;
+					},
+				},
+			},
+		});
+		Object.defineProperty(g, "ClipboardItem", { configurable: true, value: class {} });
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => new Response(new Blob(["png"], { type: "image/png" })),
+		});
+
+		await expect(copyGeneratedImageToClipboard({ imageSrc: "blob:image" })).rejects.toBe(denied);
+		expect(isImageClipboardUnavailableError(denied)).toBe(false);
+		expect(execCommand).toHaveBeenCalledWith("copy");
+	});
+
+	test("a data-url selection copy can recover a clipboard rejection", async () => {
+		const denied = new DOMException("Denied", "NotAllowedError");
+		const { execCommand, readSource } = installSelectionDom({ isSecureContext: true });
+		Object.defineProperty(g, "navigator", {
+			configurable: true,
+			value: {
+				clipboard: {
+					write: async () => {
+						throw denied;
+					},
+				},
+			},
+		});
+		Object.defineProperty(g, "ClipboardItem", { configurable: true, value: class {} });
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => new Response(new Blob(["png"], { type: "image/png" })),
+		});
+
+		await copyGeneratedImageToClipboard({ imageSrc: "blob:image" });
+
+		expect(execCommand).toHaveBeenCalledWith("copy");
+		expect(readSource().startsWith("data:image/png;base64,")).toBe(true);
 	});
 
 	test("surfaces structured fs preview errors", async () => {

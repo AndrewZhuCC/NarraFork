@@ -32,11 +32,13 @@ const globalKeys = [
 	"ClipboardItem",
 	"Image",
 	"fetch",
+	"FileReader",
 ] as const;
 let descriptors: Map<string, PropertyDescriptor | undefined>;
 let root: Root;
 let container: HTMLDivElement;
 let canvasEncodingFailure = false;
+let selectionImageFire: "load" | "error" | null = null;
 const anchorClick = mock(() => {});
 const write = mock(async (items: TestClipboardItem[]) => {
 	await Promise.all(Object.values(items[0].data));
@@ -104,6 +106,7 @@ beforeEach(() => {
 	anchorClick.mockReset();
 	anchorClick.mockImplementation(() => {});
 	canvasEncodingFailure = false;
+	selectionImageFire = null;
 	const createElement = document.createElement.bind(document);
 	spyOn(document, "createElement").mockImplementation(
 		(tag: string, options?: ElementCreationOptions) => {
@@ -114,6 +117,18 @@ beforeEach(() => {
 				} as unknown as HTMLCanvasElement;
 			const element = createElement(tag, options);
 			if (tag === "a") element.click = anchorClick;
+			if (tag === "img" && selectionImageFire) {
+				let src = "";
+				Object.defineProperty(element, "src", {
+					configurable: true,
+					get: () => src,
+					set(value: string) {
+						src = value;
+						if (selectionImageFire === "load") element.onload?.(new Event("load"));
+						else element.onerror?.(new Event("error"));
+					},
+				});
+			}
 			return element;
 		},
 	);
@@ -297,5 +312,85 @@ describe("ImageViewer copy with real image helpers", () => {
 			color: "teal",
 			message: "imageViewer_copySuccess",
 		});
+	});
+	test("HTTP selection fallback without inline pixels still downloads", async () => {
+		Object.defineProperty(window, "isSecureContext", { value: false });
+		Object.defineProperty(document, "execCommand", {
+			configurable: true,
+			value: mock(() => true),
+		});
+		Object.defineProperty(window, "getSelection", {
+			configurable: true,
+			value: () => ({ removeAllRanges() {}, addRange() {} }),
+		});
+		await copy();
+		expect(write).not.toHaveBeenCalled();
+		expect(document.execCommand).not.toHaveBeenCalled();
+		expect(anchorClick).toHaveBeenCalledTimes(1);
+		expect(notifications.show).toHaveBeenCalledWith({
+			color: "yellow",
+			message: "imageViewer_copyUnavailableDownloaded",
+		});
+	});
+	test("HTTP data-url selection copy reports success without downloading", async () => {
+		Object.defineProperty(window, "isSecureContext", { value: false });
+		selectionImageFire = "load";
+		Object.defineProperty(document, "execCommand", {
+			configurable: true,
+			value: mock(() => true),
+		});
+		Object.defineProperty(window, "getSelection", {
+			configurable: true,
+			value: () => ({ removeAllRanges() {}, addRange() {} }),
+		});
+		Object.defineProperty(globalThis, "FileReader", {
+			configurable: true,
+			value: class {
+				result: string | null = null;
+				onload: (() => void) | null = null;
+				onerror: (() => void) | null = null;
+				readAsDataURL(blob: Blob) {
+					this.result = `data:${blob.type};base64,cG5n`;
+					this.onload?.();
+				}
+			},
+		});
+		await copy();
+		expect(write).not.toHaveBeenCalled();
+		expect(document.execCommand).toHaveBeenCalledWith("copy");
+		expect(imageActions.downloadImageSource).not.toHaveBeenCalled();
+		expect(notifications.show).toHaveBeenCalledWith({
+			color: "teal",
+			message: "imageViewer_copySuccess",
+		});
+	});
+	test("clipboard rejection stays red when the selection copy command fails", async () => {
+		selectionImageFire = "load";
+		Object.defineProperty(document, "execCommand", {
+			configurable: true,
+			value: mock(() => false),
+		});
+		Object.defineProperty(window, "getSelection", {
+			configurable: true,
+			value: () => ({ removeAllRanges() {}, addRange() {} }),
+		});
+		Object.defineProperty(globalThis, "FileReader", {
+			configurable: true,
+			value: class {
+				result: string | null = null;
+				onload: (() => void) | null = null;
+				onerror: (() => void) | null = null;
+				readAsDataURL(blob: Blob) {
+					this.result = `data:${blob.type};base64,cG5n`;
+					this.onload?.();
+				}
+			},
+		});
+		write.mockImplementation(async () => {
+			throw new DOMException("User denied", "NotAllowedError");
+		});
+		await copy();
+		expect(document.execCommand).toHaveBeenCalledWith("copy");
+		expectFailedWithoutDownload();
 	});
 });
