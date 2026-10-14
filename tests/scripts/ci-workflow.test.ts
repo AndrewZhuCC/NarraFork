@@ -230,6 +230,7 @@ describe("generic CI workflow", () => {
 			"./server/services/file-change-platform-capability.test.ts",
 			"./server/services/file-change-local-restore.test.ts",
 			"./server/services/file-change-runtime.test.ts",
+			"./server/services/file-change-namespace-cleanup.test.ts",
 			"./server/services/revert-transaction-service.test.ts",
 			"./server/services/revert-transaction-interleaving.test.ts",
 			"./server/services/revert-transaction-real-tools.test.ts",
