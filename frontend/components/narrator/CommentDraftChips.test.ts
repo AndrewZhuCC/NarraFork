@@ -8,12 +8,19 @@ import { I18nextProvider } from "react-i18next";
 import { CommentDraftChips, isSpecCommentStale } from "./CommentDraftChips";
 import { createCommentDraft } from "./comment-draft-store";
 
-test("file chips show filename, device/path hover text, unsaved marker and existing remove control", async () => {
+test("file chips show source details with edit and remove controls", async () => {
 	const i18n = createInstance();
 	await i18n.init({
 		lng: "en",
 		resources: {
-			en: { narrator: { commentFileUnsaved: "Unsaved", removeComment: "Remove comment" } },
+			en: {
+				narrator: {
+					commentFileUnsaved: "Unsaved",
+					removeComment: "Remove comment",
+					editComment: "Edit comment",
+				},
+				common: { save: "Save", cancel: "Cancel" },
+			},
 		},
 	});
 	const draft = createCommentDraft({
@@ -30,7 +37,11 @@ test("file chips show filename, device/path hover text, unsaved marker and exist
 			createElement(
 				MantineProvider,
 				{},
-				createElement(CommentDraftChips, { drafts: [draft], onRemove: () => {} }),
+				createElement(CommentDraftChips, {
+					drafts: [draft],
+					onRemove: () => {},
+					onUpdate: () => {},
+				}),
 			),
 		),
 	);
@@ -40,6 +51,8 @@ test("file chips show filename, device/path hover text, unsaved marker and exist
 	expect(label?.textContent).not.toContain("C:");
 	expect(label?.getAttribute("title")).not.toContain(":1");
 	expect(document.querySelector('button[aria-label="Remove comment"]')).not.toBeNull();
+	expect(document.querySelector('button[aria-label="Edit comment"]')).not.toBeNull();
+	expect(document.querySelector('[role="dialog"]')).toBeNull();
 	expect(isSpecCommentStale(draft, new Map([["spec://index.md", "new"]]))).toBe(false);
 });
 

@@ -104,6 +104,19 @@ export function addCommentDraft(narratorId: string, input: CommentDraftInput): C
 	return created;
 }
 
+/** Update only the comment body; preserve its captured source and position. */
+export function updateCommentDraft(narratorId: string, id: string, comment: string): void {
+	const text = comment.trim();
+	if (!narratorId || !id || !text) return;
+	const current = getCommentDrafts(narratorId);
+	const draft = current.find((item) => item.id === id);
+	if (!draft || draft.comment === text) return;
+	write(
+		narratorId,
+		current.map((item) => (item.id === id ? { ...item, comment: text } : item)),
+	);
+}
+
 export function removeCommentDraft(narratorId: string, id: string): void {
 	if (!narratorId || !id) return;
 	const current = getCommentDrafts(narratorId);

@@ -10,6 +10,7 @@ import {
 	getCommentDrafts,
 	removeCommentDraft,
 	setCommentDrafts,
+	updateCommentDraft,
 } from "./comment-draft-store";
 
 function specDraft(overrides: Partial<CommentDraft> = {}): CommentDraft {
@@ -87,6 +88,34 @@ describe("comment draft store", () => {
 		expect(getCommentDrafts("n-a").map((d) => d.id)).toEqual(["a2"]);
 	});
 
+	test("editing only changes the selected narrator's comment and preserves captured sources", () => {
+		clearAllCommentDrafts();
+		const originals = [
+			fileDraft({ id: "file" }),
+			chatDraft({ id: "chat" }),
+			specDraft({ id: "spec" }),
+		];
+		setCommentDrafts("edit-a", originals);
+		setCommentDrafts("edit-b", originals);
+		for (const draft of originals) updateCommentDraft("edit-a", draft.id, `  edited ${draft.id}  `);
+		expect(getCommentDrafts("edit-a")).toEqual(
+			originals.map((draft) => ({ ...draft, comment: `edited ${draft.id}` })),
+		);
+		expect(getCommentDrafts("edit-b")).toEqual(originals);
+		expect(originals[0]?.comment).toBe("change this");
+		expect(formatCommentDraftsForSend(getCommentDrafts("edit-a"))).toContain("edited file");
+	});
+
+	test("empty edits are ignored and editing a removed draft does not recreate it", () => {
+		clearAllCommentDrafts();
+		const draft = chatDraft({ id: "edited" });
+		addCommentDraft("edit", draft);
+		updateCommentDraft("edit", draft.id, " \n ");
+		expect(getCommentDrafts("edit")[0]).toEqual(draft);
+		removeCommentDraft("edit", draft.id);
+		updateCommentDraft("edit", draft.id, "late edit");
+		expect(getCommentDrafts("edit")).toEqual([]);
+	});
 	test("clear returns the previous list so a failed send can restore", () => {
 		clearAllCommentDrafts();
 		const first = addCommentDraft("n-a", specDraft({ id: "a1" }));

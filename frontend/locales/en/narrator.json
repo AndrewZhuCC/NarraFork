@@ -707,6 +707,7 @@
 	"addComment": "Comment",
 	"commentPlaceholder": "Write a comment…",
 	"removeComment": "Remove comment",
+	"editComment": "Edit comment",
 	"commentSourceChanged": "The original text may have changed",
 	"commentFromSpec": "Outline",
 	"commentFromChat": "Chat",

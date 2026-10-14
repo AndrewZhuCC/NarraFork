@@ -706,6 +706,7 @@
 	"addComment": "评论",
 	"commentPlaceholder": "写下评论…",
 	"removeComment": "移除评论",
+	"editComment": "编辑评论",
 	"commentSourceChanged": "原文可能已变化",
 	"commentFromSpec": "大纲",
 	"commentFromChat": "聊天",

@@ -6,7 +6,7 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import { useSpecFiles } from "../../hooks/useSpec";
 import { CommentDraftChips } from "./CommentDraftChips";
-import { removeCommentDraft, useCommentDrafts } from "./comment-draft-store";
+import { removeCommentDraft, updateCommentDraft, useCommentDrafts } from "./comment-draft-store";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { ChapterBar, NarratorGitBar } from "./header/ChapterBar";
 import { AttachmentPreviews } from "./interaction/AttachmentPreviews";
@@ -224,8 +224,10 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			/>
 
 			<CommentDraftChips
+				key={props.common.narratorId}
 				drafts={commentDrafts}
 				onRemove={(id) => removeCommentDraft(props.common.narratorId, id)}
+				onUpdate={(id, comment) => updateCommentDraft(props.common.narratorId, id, comment)}
 				specRevisionByUri={specRevisionByUri}
 				withTopBorder={props.attachedImages.length === 0 && props.attachedTextFiles.length === 0}
 			/>
