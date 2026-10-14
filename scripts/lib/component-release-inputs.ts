@@ -457,6 +457,13 @@ function workflowRecipe(source: string): unknown {
 				)
 					throw new Error("Executor Go toolchain must be fixed");
 				steps.push({ uses: step.uses, with: settings, if: step.if });
+			} else if (step.uses.startsWith("oven-sh/setup-bun@")) {
+				const settings = record(step.with);
+				exactKeys(settings, ["bun-version"]);
+				if (!/^\d+\.\d+\.\d+$/.test(String(settings["bun-version"])))
+					throw new Error("Executor control Bun version must be fixed");
+				// Bun executes the separately verified control recipe; Go compiles the executor.
+				// Updating that control runtime alone does not change the pinned Go artifact.
 			} else if (!step.uses.startsWith("actions/upload-artifact@")) {
 				steps.push({ uses: step.uses, with: step.with, if: step.if });
 			}

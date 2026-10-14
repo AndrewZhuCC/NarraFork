@@ -553,6 +553,40 @@ describe("read-only executor build input reuse", () => {
 		});
 		await expect(collectComponentReleaseEvidence(f.options)).resolves.toBeDefined();
 	});
+	test("Bun control runtime upgrades reuse the unchanged Go executor", async () => {
+		const workflowPath = ".github/workflows/helpers-release.yml";
+		const f = fixture(
+			(files) =>
+				files.set(
+					workflowPath,
+					(files.get(workflowPath) as string).replace(
+						/bun-version: \d+\.\d+\.\d+/g,
+						"bun-version: 1.4.3",
+					),
+				),
+			(files) =>
+				files.set(
+					workflowPath,
+					(files.get(workflowPath) as string).replace(
+						/bun-version: \d+\.\d+\.\d+/g,
+						"bun-version: 1.4.2",
+					),
+				),
+		);
+		await expect(collectComponentReleaseEvidence(f.options)).resolves.toBeDefined();
+		for (const value of ["latest", "1.4.3\n          bun-version-file: attacker.json"]) {
+			const invalid = fixture((files) =>
+				files.set(
+					workflowPath,
+					(files.get(workflowPath) as string).replace(
+						/bun-version: \d+\.\d+\.\d+/g,
+						`bun-version: ${value}`,
+					),
+				),
+			);
+			await expect(collectComponentReleaseEvidence(invalid.options)).rejects.toThrow();
+		}
+	});
 	for (const [name, path, update] of [
 		[
 			"production Go",
