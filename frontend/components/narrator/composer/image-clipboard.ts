@@ -126,7 +126,7 @@ async function imageBlobToPng(blob: Blob): Promise<Blob> {
 	}
 }
 
-/** Binary image copy needs ClipboardItem; plain HTTP and old browsers cannot fall back to execCommand. */
+/** Async clipboard writes image/png. Missing APIs fall back to a data-URL selection copy. */
 export function canUseImageClipboard(): boolean {
 	return (
 		typeof navigator !== "undefined" &&
@@ -136,15 +136,135 @@ export function canUseImageClipboard(): boolean {
 	);
 }
 
+/** 选区回退所需的老接口：execCommand、Selection 与 Range 缺一不可。 */
+function canUseSelectionClipboard(): boolean {
+	return (
+		typeof document !== "undefined" &&
+		typeof document.execCommand === "function" &&
+		typeof window?.getSelection === "function" &&
+		typeof document.createRange === "function"
+	);
+}
+
+/** 选区复制最多等图片加载多久。超时按不可用上报，不能静默卡住，也不能误报复制成功。 */
+const SELECTION_IMAGE_LOAD_TIMEOUT_MS = 5000;
+
+function isInlineImageDataUrl(source: string | null | undefined): source is string {
+	return typeof source === "string" && source.startsWith("data:image/");
+}
+
+/**
+ * 选区回退：把已解码的 data:image 放进选区后 execCommand("copy")。
+ *
+ * 这条老路径在非安全上下文里仍可用，但 Chrome 实际写入的是 text/html，不是
+ * image/png。因此只能复制自包含的 data:image；远程或鉴权地址会粘成坏图，却因为
+ * 命令返回 true 被当成成功。加载失败、超时、没有选区或命令被拒绝都按不可用上报。
+ */
+async function copyViaSelection(imageUrl: string): Promise<void> {
+	const holder = document.createElement("div");
+	holder.contentEditable = "true";
+	// 必须真实渲染才能被选中，所以移出视口而不是隐藏。
+	holder.style.cssText = "position:fixed;left:-10000px;top:0;";
+	const image = document.createElement("img");
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const loaded = new Promise<void>((resolve, reject) => {
+		timer = setTimeout(() => {
+			reject(new ImageClipboardUnavailableError());
+		}, SELECTION_IMAGE_LOAD_TIMEOUT_MS);
+		image.onload = () => resolve();
+		image.onerror = () => reject(new ImageClipboardUnavailableError());
+	});
+	image.src = imageUrl;
+	holder.appendChild(image);
+	document.body.appendChild(holder);
+
+	const selection = window.getSelection();
+	try {
+		await loaded;
+		if (!selection) throw new ImageClipboardUnavailableError();
+		const range = document.createRange();
+		range.selectNodeContents(holder);
+		selection.removeAllRanges();
+		selection.addRange(range);
+		// 焦点落在视口外时不能把查看器滚走。
+		if (typeof holder.focus === "function") {
+			try {
+				holder.focus({ preventScroll: true });
+			} catch {
+				holder.focus();
+			}
+		}
+		if (!document.execCommand("copy")) throw new ImageClipboardUnavailableError();
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+		selection?.removeAllRanges();
+		holder.remove();
+	}
+}
+
+/** 把像素读成 data:image。读不到就返回 null，调用方不能改放远程地址。 */
+function readDataUrl(blob: Blob): Promise<string | null> {
+	if (typeof FileReader !== "function") return Promise.resolve(null);
+	return new Promise((resolve) => {
+		const reader = new FileReader();
+		reader.onload = () => {
+			const result = reader.result;
+			resolve(typeof result === "string" && isInlineImageDataUrl(result) ? result : null);
+		};
+		reader.onerror = () => resolve(null);
+		reader.readAsDataURL(blob);
+	});
+}
+
+/**
+ * 选区只接受 data:image。能转成 PNG 就转，转不动就用原始图片字节。
+ * 取字节失败时，只有页面上已经是 data:image 的地址可以继续用。
+ * blob:、http(s) 和鉴权预览地址都不能进入选区。
+ */
+async function buildSelectionImageSource(
+	options: CopyGeneratedImageOptions,
+): Promise<string | null> {
+	try {
+		const blob = await fetchImageBlob(options);
+		const png = blob.type === "image/png" ? blob : await imageBlobToPng(blob).catch(() => blob);
+		const dataUrl = await readDataUrl(png);
+		if (dataUrl) return dataUrl;
+	} catch {
+		// 取字节失败时再看展示地址是不是已经自包含。
+	}
+	try {
+		const display = normalizeImageSrc(options.imageSrc);
+		if (isInlineImageDataUrl(display)) return display;
+	} catch {
+		// 非法 data URL 不能拿来充选区。
+	}
+	return null;
+}
+
+async function copyWithSelection(options: CopyGeneratedImageOptions): Promise<void> {
+	// 平台连选区接口都没有时先报不可用，避免白白取一次字节。
+	if (!canUseSelectionClipboard()) throw new ImageClipboardUnavailableError();
+	const source = await buildSelectionImageSource(options);
+	if (!source) throw new ImageClipboardUnavailableError();
+	await copyViaSelection(source);
+}
+
 export async function copyGeneratedImageToClipboard(
 	options: CopyGeneratedImageOptions,
 ): Promise<void> {
 	if (!canUseImageClipboard()) {
-		throw new ImageClipboardUnavailableError();
+		// 非安全上下文（局域网 HTTP）下浏览器不提供异步剪贴板，只能走选区复制；
+		// 平台连选区接口都不具备时它按不可用上报，调用方保留降级为下载的原语义。
+		await copyWithSelection(options);
+		return;
 	}
 
-	const clipboardBlob = fetchImageBlob(options).then(async (imageBlob) => {
-		const png = imageBlob.type === "image/png" ? imageBlob : await imageBlobToPng(imageBlob);
+	const imageBlob = fetchImageBlob(options);
+	// 下面的分支可能先返回，先接住 rejection 以免留下未处理的 promise。
+	void imageBlob.catch(() => {});
+
+	const clipboardBlob = imageBlob.then(async (blob) => {
+		const png = blob.type === "image/png" ? blob : await imageBlobToPng(blob);
 		assertBlobSafe(png);
 		return png;
 	});
@@ -152,8 +272,18 @@ export async function copyGeneratedImageToClipboard(
 	// The browser consumes the original promise; also handle its rejection if write
 	// or the constructor fails before consuming it (e.g. permission was denied).
 	void clipboardBlob.catch(() => {});
-	await Promise.all([
-		navigator.clipboard.write([new ClipboardItem({ "image/png": clipboardBlob })]),
-		clipboardBlob,
-	]);
+	try {
+		await Promise.all([
+			navigator.clipboard.write([new ClipboardItem({ "image/png": clipboardBlob })]),
+			clipboardBlob,
+		]);
+	} catch (error) {
+		// 权限被拒或浏览器不支持图片写入时，仍可尝试把 data:image 放进选区。
+		// 回退没能完成时抛出原错误：权限拒绝保持红色失败，不降级成下载。
+		try {
+			await copyWithSelection(options);
+		} catch {
+			throw error;
+		}
+	}
 }
