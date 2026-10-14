@@ -6,7 +6,13 @@ export interface WorkspaceContext {
 	pathFlavor: "posix" | "windows";
 	contextKey: string;
 	contextProjectId?: string;
-	git?: { workspaceKey: string; repositoryKey: string; rootPath: string };
+	git?: {
+		workspaceKey: string;
+		repositoryKey: string;
+		rootPath: string;
+		/** Canonical Git common directory; optional for pre-cache contexts. */
+		repositoryPath?: string;
+	};
 	capabilities: { switchDirectory: boolean; reason?: string };
 }
 

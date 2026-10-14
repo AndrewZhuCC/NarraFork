@@ -115,6 +115,8 @@ export interface GitWorkspaceTarget {
 	configuredCwd?: string;
 	/** Request-bound authorization refresh, never serialized to clients. */
 	beforeWrite?: () => Promise<void>;
+	/** Request-local, read-only recovery. Never enables ordinary Git operations. */
+	worktreeListOnly?: boolean;
 }
 
 export async function resolveNarratorGitTarget(
@@ -124,6 +126,7 @@ export async function resolveNarratorGitTarget(
 	beforeProbe?: (target: GitWorkspaceTarget) => Promise<void>,
 	/** Display discovery only; authoritative reads/writes keep the uncached probe. */
 	cachedDiscovery = false,
+	recoverWorktreeList = false,
 ): Promise<GitWorkspaceTarget> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -156,6 +159,7 @@ export async function resolveNarratorGitTarget(
 	const active = activeNarrators.get(narratorId);
 	const committedContext =
 		narrator.workspaceContext?.revision === narrator.workspaceRevision &&
+		(!narrator.cwd || localBackend.paths.equals(narrator.cwd, narrator.workspaceContext.cwd)) &&
 		narrator.workspaceContext.deviceId === "local"
 			? narrator.workspaceContext
 			: null;
@@ -272,11 +276,76 @@ export async function resolveNarratorGitTarget(
 	workspace.state = probe.state ?? "unsupported";
 	workspace.reason = probe.reason;
 	if (cachedDiscovery) workspace.branch = probe.branch ?? null;
+	if (probe.state === "missing_directory" && recoverWorktreeList && backend.kind === "local") {
+		const cached = committedContext?.git;
+		if (
+			!cached ||
+			!backend.paths.equals(committedContext.cwd, workspace.cwd) ||
+			gitWorkspaceIdentity(backend, cached.rootPath) !== cached.workspaceKey
+		)
+			return target;
+		// Only persisted evidence or an explicitly associated project root is a candidate.
+		const candidate = cached.repositoryPath ?? project?.gitPath ?? cached.rootPath;
+		if (!candidate || !backend.paths.isAbsolute(candidate)) return target;
+		const recovery = { ...target, workspace: { ...workspace, cwd: candidate } };
+		await beforeProbe?.(recovery);
+		let common: string | undefined;
+		if (cached.repositoryPath) {
+			const canonical = await realpath(candidate).catch(() => null);
+			if (!canonical || !backend.paths.equals(canonical, candidate)) return target;
+			const result = await safeSpawn({
+				cmd: [
+					"git",
+					"--no-optional-locks",
+					`--git-dir=${canonical}`,
+					"rev-parse",
+					"--path-format=absolute",
+					"--git-common-dir",
+				],
+				timeout: GIT_PROBE_TIMEOUT_MS,
+				maxOutputBytes: GIT_PROBE_MAX_BYTES,
+				signal,
+				env: {
+					...process.env,
+					GIT_DIR: undefined,
+					GIT_COMMON_DIR: undefined,
+					GIT_WORK_TREE: undefined,
+				},
+			});
+			if (result.exitCode || result.stdoutTruncated || result.stderrTruncated) return target;
+			common = await realpath(result.stdout.trim()).catch(() => undefined);
+		} else {
+			const recovered = await probeLocalGitWorkspace(candidate, signal);
+			if (recovered.state === "ready") common = recovered.repositoryPath;
+		}
+		if (!common || gitWorkspaceIdentity(backend, common) !== cached.repositoryKey) return target;
+		target.repositoryPath = common;
+		workspace.rootPath = cached.rootPath;
+		workspace.workspaceKey = cached.workspaceKey;
+		workspace.repositoryKey = cached.repositoryKey;
+		target.worktreeListOnly = true;
+		return target;
+	}
 	if (probe.state !== "ready" || !probe.rootPath || !probe.repositoryPath) return target;
 	workspace.rootPath = probe.rootPath;
 	target.repositoryPath = probe.repositoryPath;
 	workspace.workspaceKey = gitWorkspaceIdentity(backend, probe.rootPath);
 	workspace.repositoryKey = gitWorkspaceIdentity(backend, probe.repositoryPath);
+	if (backend.kind === "local" && (!cachedDiscovery || !committedContext?.git?.repositoryPath)) {
+		const { cacheLocalWorkspaceContext, localWorkspaceContext } = await import(
+			"./workspace-context-service"
+		);
+		await cacheLocalWorkspaceContext(
+			narratorId,
+			narrator,
+			localWorkspaceContext(workspace.cwd, narrator.workspaceRevision, projectId, {
+				rootPath: probe.rootPath,
+				repositoryPath: probe.repositoryPath,
+				workspaceKey: workspace.workspaceKey,
+				repositoryKey: workspace.repositoryKey,
+			}),
+		);
+	}
 	// A chapter is only a side-effect adapter for its *actual* worktree.
 	if (backend.kind === "local" && chapter?.worktreePath) {
 		const chapterRoot = await realpath(chapter.worktreePath).catch(() => null);

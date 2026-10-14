@@ -41,6 +41,7 @@ function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	delete workspace.chapterId;
 	delete workspace.projectId;
 	delete target.repositoryPath;
+	delete target.worktreeListOnly;
 	delete workspace.branch;
 }
 
@@ -197,6 +198,7 @@ export async function authorizeGitTargetForPrincipal(
 	need: "read" | "write",
 	signal: AbortSignal,
 	cachedDiscovery = false,
+	recoverWorktreeList = false,
 ): Promise<GitWorkspaceTarget> {
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
@@ -295,6 +297,7 @@ export async function authorizeGitTargetForPrincipal(
 				if (need === "write" && !canWrite) throw denied();
 			},
 			cachedDiscovery && need === "read",
+			recoverWorktreeList && need === "read",
 		);
 	} else {
 		await assertChapterProjectAccess(source.chapterId, principal, need);
@@ -307,7 +310,11 @@ export async function authorizeGitTargetForPrincipal(
 			);
 	}
 	const { workspace, backend } = target;
-	if (workspace.state !== "ready" || !backend || !workspace.rootPath) {
+	if (
+		(workspace.state !== "ready" && !target.worktreeListOnly) ||
+		!backend ||
+		!workspace.rootPath
+	) {
 		if (workspace.state === "access_denied") redactDeniedTarget(target);
 		return target;
 	}
@@ -340,7 +347,9 @@ export async function authorizeGitTargetForPrincipal(
 		}
 		if (need === "write" && !canWrite) throw denied();
 		scan.check();
-		workspace.capabilities = { read: true, write: canWrite };
+		workspace.capabilities = target.worktreeListOnly
+			? { read: false, write: false }
+			: { read: true, write: canWrite };
 	} catch (error) {
 		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
 		redactDeniedTarget(target);

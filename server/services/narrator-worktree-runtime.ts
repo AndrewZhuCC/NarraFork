@@ -19,6 +19,8 @@ import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspac
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
+	authorizeList: (principal, narratorId, _need, signal) =>
+		authorizeGitTargetForPrincipal(principal, { narratorId }, "read", signal, false, true),
 	authorize: async (principal, narratorId, need, signal) => {
 		if (activeDatabaseBackend !== "sqlite")
 			throw new AppError(

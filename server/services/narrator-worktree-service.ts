@@ -92,6 +92,8 @@ export interface WorktreeTarget {
 	repositoryPath?: string;
 	/** Verified server-side evidence; omitted fixture/legacy registrations stay unknown. */
 	resourceScope?: VerifiedWorktreeScope;
+	/** Authorized missing-checkout recovery, admitted by list() only. */
+	worktreeListOnly?: boolean;
 }
 export interface WorktreeServicePorts<Principal> {
 	/** Must be the existing Git ACL/policy authorization, not a client-path resolver. */
@@ -101,6 +103,8 @@ export interface WorktreeServicePorts<Principal> {
 		need: "read" | "write",
 		signal: AbortSignal,
 	): Promise<WorktreeTarget>;
+	/** Dedicated read-only recovery; ordinary read/create never receive this target. */
+	authorizeList?: WorktreeServicePorts<Principal>["authorize"];
 	/** Explicit path-scope authorization; repository identity alone never grants sibling access. */
 	authorizeDestination?(
 		principal: Principal,
@@ -611,7 +615,14 @@ export class NarratorWorktreeService<Principal> {
 		const operation = this.ports.runGit
 			? this.ports.runGit(target, args, signal, writing)
 			: safeSpawn({
-					cmd: ["git", "--no-optional-locks", "-C", target.workspace.rootPath ?? "", ...args],
+					cmd: [
+						"git",
+						"--no-optional-locks",
+						...(target.worktreeListOnly && !writing
+							? [`--git-dir=${target.repositoryPath}`]
+							: ["-C", target.workspace.rootPath ?? ""]),
+						...args,
+					],
 					timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
 					maxOutputBytes: maxBytes,
 					killProcessTree: true,
@@ -811,8 +822,23 @@ export class NarratorWorktreeService<Principal> {
 	): Promise<WorktreeListResult> {
 		const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
 		signal.throwIfAborted();
-		const target = await this.ports.authorize(principal, narratorId, "read", signal);
-		assertReady(target, "read", workspaceKey);
+		const target = await (this.ports.authorizeList ?? this.ports.authorize)(
+			principal,
+			narratorId,
+			"read",
+			signal,
+		);
+		if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
+			if (target.workspace.workspaceKey !== workspaceKey)
+				error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
+			if (
+				!target.repositoryPath ||
+				!target.workspace.repositoryKey ||
+				!target.backend ||
+				target.backend.kind !== "local"
+			)
+				error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
+		} else assertReady(target, "read", workspaceKey);
 		const binding = JSON.stringify([
 			this.actorKey(principal),
 			narratorId,
