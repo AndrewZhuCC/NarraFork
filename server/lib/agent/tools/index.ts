@@ -39,6 +39,7 @@ import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
+import { stopTool } from "./stop";
 import { structSedTool } from "./struct-sed";
 import { structViewTool } from "./struct-view";
 import { switchDeviceTool } from "./switch-device";
@@ -134,6 +135,7 @@ const coreProvider: ToolProvider = {
 			enterPlanModeTool,
 			exitPlanModeTool,
 			agentTool,
+			stopTool,
 			awaitTool,
 			contextAskTool,
 			sendTool,

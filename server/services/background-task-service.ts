@@ -3113,9 +3113,12 @@ class BackgroundTaskService {
 		return this.abortControllers.get(taskId)?.signal.aborted ?? false;
 	}
 
-	async cancel(taskId: string): Promise<boolean> {
+	async cancel(taskId: string, options?: { assertAuthorized?: () => void }): Promise<boolean> {
 		const task = await this.getById(taskId);
 		if (!task || task.status !== "running") return false;
+		// getById yields: recheck trusted authority after it and before ANY cancellation
+		// side effect. Authorization failures must propagate, never be swallowed as kill errors.
+		options?.assertAuthorized?.();
 
 		const ctrl = this.abortControllers.get(taskId);
 		if (ctrl) {

@@ -397,10 +397,26 @@ describe("Agent archive / unarchive commands", () => {
 		expect(narrators.get("child-1")?.status).toBe("idle");
 	});
 
-	test("stop, archive, and unarchive are mutually exclusive", async () => {
+	test("archive and unarchive are mutually exclusive", async () => {
 		seed();
-		const result = await agentTool.execute({ stop: "a", archive: "b" }, makeCtx());
+		const result = await agentTool.execute({ archive: "a", unarchive: "b" }, makeCtx());
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("mutually exclusive");
+	});
+
+	test("legacy stop is hidden and explicitly rejected without launching or archiving", async () => {
+		seed();
+		const schema = agentTool.rawJsonSchema as { properties: Record<string, unknown> };
+		expect(schema.properties).not.toHaveProperty("stop");
+		for (const args of [{ stop: "child-1" }, { stop: "child-1", archive: "child-1" }]) {
+			expect(agentTool.parameters.safeParse(args).success).toBe(false);
+			const result = await agentTool.execute(args, makeCtx());
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Stop");
+		}
+		expect(cancelled).toEqual([]);
+		expect(hardInterrupts).toEqual([]);
+		expect(statusUpdates).toEqual([]);
+		expect(runCalls.filter((c) => c.parentNarratorId === "parent")).toHaveLength(0);
 	});
 });

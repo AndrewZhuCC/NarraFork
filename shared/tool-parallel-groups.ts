@@ -47,6 +47,8 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
 ]);
 
 const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
+	// Cancellation must observe completed admission/registration of preceding work.
+	"Stop",
 	"StartPipeline",
 	"ExtractPipeline",
 	"EnterPlanMode",
