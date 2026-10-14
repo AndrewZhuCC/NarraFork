@@ -1,6 +1,6 @@
 {
-  "id": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
-  "prevId": "0f4d42ec-ba53-46e5-98e0-63c2c30c1f3e",
+  "id": "6b0f116c-6200-4566-8228-0887c535abaa",
+  "prevId": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -22025,6 +22025,13 @@
         },
         "narrator_toolbar_layout": {
           "name": "narrator_toolbar_layout",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "spec_tab_layout": {
+          "name": "spec_tab_layout",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

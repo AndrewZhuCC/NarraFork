@@ -92,6 +92,13 @@
 			"when": 1791798367499,
 			"tag": "0012_narrator_model_history_revision",
 			"breakpoints": true
+		},
+		{
+			"idx": 13,
+			"version": "7",
+			"when": 1791962003435,
+			"tag": "0013_spec-tab-layout",
+			"breakpoints": true
 		}
   ]
 }

@@ -13,7 +13,7 @@ import {
 } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconChecklist, IconFileText, IconLock, IconX } from "@tabler/icons-react";
+import { IconChecklist, IconLock, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -26,8 +26,17 @@ import { useSpecFile, useSpecFiles, useSpecTasks, useUpdateSpecFile } from "../.
 import { api } from "../../../lib/api";
 import type { SpecTaskItem } from "../../../lib/api/spec";
 import { MarkdownContent } from "../markdown/MarkdownContent";
+import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import { registerSpecFileSelector } from "./spec-file-reveal";
+import {
+	FIXED_DOC_PATHS,
+	orderSpecDocFiles,
+	reorderSpecTabGroup,
+	type SpecTabGroup,
+	toggleSpecTabPin,
+} from "./spec-tab-order";
+import { useSpecTabLayout } from "./useSpecTabLayout";
 
 const SpecMarkdownEditor = lazy(() =>
 	import("./SpecMarkdownEditor").then((m) => ({ default: m.SpecMarkdownEditor })),
@@ -58,6 +67,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	);
 	const { data: tasksData, isLoading: tasksLoading } = useSpecTasks(narratorId);
 	const updateFile = useUpdateSpecFile(narratorId);
+	const { layout: tabLayout, save: saveTabLayout } = useSpecTabLayout(narratorId);
 
 	// Look up UI-editability from the file list metadata so it is known even
 	// before the file content query resolves.
@@ -112,6 +122,36 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 		return files.filter((f) => f.uri !== TASKS_URI);
 	}, [files]);
 
+	// 标签条数据：内置文档固定在前，其余文档按用户排布（置顶 + 拖拽顺序）展示。
+	const tabChips = useMemo<SpecTabChip[]>(() => {
+		const pinnedPaths = new Set(tabLayout.pinned);
+		const fixedPaths = new Set(FIXED_DOC_PATHS);
+		const chips: SpecTabChip[] = [
+			{
+				uri: TASKS_URI,
+				path: "tasks.json",
+				label: t("spec.tabTasks"),
+				kind: "tasks",
+				movable: false,
+			},
+		];
+		for (const file of orderSpecDocFiles(docFiles, tabLayout)) {
+			chips.push({
+				uri: file.uri,
+				path: file.path,
+				label:
+					file.path === "behavior_fence"
+						? t("spec.tabBehaviorFence")
+						: file.path.replace(/\.md$/, ""),
+				kind: "doc",
+				locked: file.readonly,
+				pinned: pinnedPaths.has(file.path),
+				movable: !fixedPaths.has(file.path),
+			});
+		}
+		return chips;
+	}, [docFiles, tabLayout, t]);
+
 	const handleSelectFile = useCallback(
 		async (uri: string) => {
 			if (uri === selectedUri) return;
@@ -141,6 +181,20 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	useEffect(
 		() => registerSpecFileSelector(narratorId, (uri: string) => void handleSelectFile(uri)),
 		[narratorId, handleSelectFile],
+	);
+
+	const handleTogglePin = useCallback(
+		(path: string, pinned: boolean) => {
+			saveTabLayout((current) => toggleSpecTabPin(current, path, pinned));
+		},
+		[saveTabLayout],
+	);
+
+	const handleReorderTabs = useCallback(
+		(group: SpecTabGroup, paths: string[]) => {
+			saveTabLayout((current) => reorderSpecTabGroup(current, group, paths));
+		},
+		[saveTabLayout],
 	);
 
 	const handleSave = useCallback(async () => {
@@ -225,35 +279,6 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 
 	const loading = isTasksFile ? tasksLoading : fileLoading;
 
-	// Build segmented control data (Tasks + docs). Keep labels short.
-	const fileTabs = useMemo(() => {
-		const items: { value: string; label: React.ReactNode }[] = [
-			{
-				value: TASKS_URI,
-				label: (
-					<Group gap={4} wrap="nowrap">
-						<IconChecklist size={13} />
-						<span>{t("spec.tabTasks")}</span>
-					</Group>
-				),
-			},
-		];
-		for (const f of docFiles) {
-			const label =
-				f.path === "behavior_fence" ? t("spec.tabBehaviorFence") : f.path.replace(/\.md$/, "");
-			items.push({
-				value: f.uri,
-				label: (
-					<Group gap={4} wrap="nowrap">
-						{f.readonly ? <IconLock size={12} /> : <IconFileText size={13} />}
-						<span>{label}</span>
-					</Group>
-				),
-			});
-		}
-		return items;
-	}, [docFiles, t]);
-
 	return (
 		<Box h="100%" style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
 			{/* Header — hidden in the dock (ToolPanelShell provides it); save/reload
@@ -281,15 +306,13 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 
 			{/* File tabs */}
 			<Box px="xs" py={6} style={{ flexShrink: 0 }}>
-				<ScrollArea type="never" scrollbars="x">
-					<SegmentedControl
-						size="xs"
-						data={fileTabs}
-						value={selectedUri}
-						onChange={handleSelectFile}
-						styles={{ root: { flexWrap: "nowrap" } }}
-					/>
-				</ScrollArea>
+				<SpecFileTabStrip
+					chips={tabChips}
+					activeUri={selectedUri}
+					onSelect={handleSelectFile}
+					onReorder={handleReorderTabs}
+					onTogglePin={handleTogglePin}
+				/>
 			</Box>
 
 			{/* Content */}

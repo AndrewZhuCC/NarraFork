@@ -1,0 +1,1 @@
+ALTER TABLE "user_preferences" ADD COLUMN "spec_tab_layout" text DEFAULT '{}' NOT NULL;

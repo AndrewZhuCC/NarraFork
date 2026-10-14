@@ -2259,6 +2259,12 @@ export const userPreferences = sqliteTable("user_preferences", {
 	// desktop and mobile; how many actually fit is decided per host at render time.
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
 	/**
+	 * 大纲标签排布，按叙述者记录：`{ [narratorId]: { order: string[], pinned: string[] } }`。
+	 * order = 普通文档的展示序，pinned = 置顶文档的展示序；内置的
+	 * tasks.json / behavior_fence / index.md 不参与记录，始终固定在最前。
+	 */
+	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
 	 * Resolved per acting user at request time, mirroring how `fastModeDefault`
