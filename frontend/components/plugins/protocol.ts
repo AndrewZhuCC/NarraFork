@@ -48,6 +48,14 @@ const idSchema = z
 	.min(1)
 	.max(128)
 	.regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+// Host entity IDs are NanoIDs, whose first character may also be '_' or '-'.
+// Keep plugin/contribution/panel/RPC identifiers on their distinct idSchema.
+const hostEntityIdSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(128)
+	.regex(/^[A-Za-z0-9_-]+$/);
 const methodSchema = z
 	.string()
 	.trim()
@@ -230,13 +238,18 @@ const bindingSchema = z.discriminatedUnion("kind", [
 			surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
 		})
 		.strict(),
-	z.object({ kind: z.literal("focus-current-narrator"), narratorId: idSchema.optional() }).strict(),
-	z.object({ kind: z.literal("workspace"), workspaceId: idSchema }).strict(),
+	z
+		.object({
+			kind: z.literal("focus-current-narrator"),
+			narratorId: hostEntityIdSchema.optional(),
+		})
+		.strict(),
+	z.object({ kind: z.literal("workspace"), workspaceId: hostEntityIdSchema }).strict(),
 	z
 		.object({
 			kind: z.literal("workspace-narrator"),
-			workspaceId: idSchema,
-			ownerNarratorId: idSchema,
+			workspaceId: hostEntityIdSchema,
+			ownerNarratorId: hostEntityIdSchema,
 		})
 		.strict(),
 	z.object({ kind: z.literal("global") }).strict(),

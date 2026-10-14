@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	defaultScheduler,
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -13,6 +18,7 @@ let searchSpy: ReturnType<typeof spyOn<typeof api, "search">>;
 let result: ReturnType<typeof useSearch>;
 const originals = new Map<string, PropertyDescriptor | undefined>();
 const entities = "chapters,messages,narrators,knowledge";
+const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
 function Probe({ query, sort }: { query: string; sort?: SearchSortMode }) {
 	result = useSearch(query, entities, sort);
@@ -39,24 +45,47 @@ beforeEach(() => {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	// Preserve real asynchronous delivery, but own its timers so teardown can drain
+	// callbacks that still reference React before removing the window global.
+	notifyManager.setScheduler((callback) => {
+		const timer = setTimeout(() => {
+			notificationTimers.delete(timer);
+			callback();
+		}, 0);
+		notificationTimers.set(timer, callback);
+	});
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	searchSpy = spyOn(api, "search").mockResolvedValue({ results: [] });
 	root = createRoot(document.body.appendChild(document.createElement("div")));
 });
 
 afterEach(async () => {
-	await act(async () => {
-		root.unmount();
-		// Drain queued React Query notifications before restoring the DOM globals.
-		await Bun.sleep(0);
-	});
-	client.clear();
-	searchSpy.mockRestore();
-	for (const [key, descriptor] of originals) {
-		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-		else Reflect.deleteProperty(globalThis, key);
+	try {
+		await act(async () => {
+			root.unmount();
+			await client.cancelQueries();
+			client.clear();
+			// One sleep(0) is not proof that all setTimeout notifications have run.
+			while (notificationTimers.size) {
+				for (const [timer, callback] of [...notificationTimers]) {
+					clearTimeout(timer);
+					notificationTimers.delete(timer);
+					callback();
+				}
+				await Promise.resolve();
+			}
+		});
+	} finally {
+		for (const timer of notificationTimers.keys()) clearTimeout(timer);
+		notificationTimers.clear();
+		notifyManager.setScheduler(defaultScheduler);
+		searchSpy.mockRestore();
+		for (const [key, descriptor] of originals) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+		originals.clear();
 	}
-	originals.clear();
 });
 
 for (const query of ["中", "中文", "a", "ab"]) {
