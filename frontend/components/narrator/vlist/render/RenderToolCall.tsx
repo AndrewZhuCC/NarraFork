@@ -31,6 +31,7 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
+import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
@@ -1446,16 +1447,38 @@ function sectionLabelText(labels: DetailLabels, label: ToolSectionLabel): string
 	return labels.sections?.[label] ?? DEFAULT_SECTION_LABELS[label];
 }
 
+/**
+ * The absolute URL a share link is copied as.
+ *
+ * The card's action carries a server-authored `/api/shares/…` PATH (see
+ * `resolveServerUrl`): as a clipboard value it is unusable on its own, because
+ * pasting it into a browser address bar or a chat has no host to resolve against.
+ * The origin is the frontend's own, which is what the reader opening the link needs.
+ */
+function shareLinkForCopy(path: string): string {
+	const origin = globalThis.location?.origin ?? "";
+	return origin && path.startsWith("/") ? `${origin}${path}` : path;
+}
+
+/** Test-only handle: the copy button renders its value into a click handler, which a
+ * static render cannot reach, so RenderToolCall.sharelink.test.tsx asserts the
+ * mapping itself. */
+export const __TEST__shareLinkForCopy = shareLinkForCopy;
+
 /** Action controls on a meta row: the share card's download + copy-link buttons. */
 function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: DetailLabels }) {
 	return (
 		<Group gap="xs" wrap="nowrap" style={{ height: "100%", alignItems: "center" }}>
-			{actions.map((action) =>
-				action.kind === "download" ? (
+			{actions.map((action) => {
+				// Resolve the mount prefix at render time: the value is persisted with the
+				// message, so a producer-side fix could not reach rows already written. The
+				// download href needs the prefix, the copied text needs prefix + origin.
+				const href = resolveServerUrl(action.value);
+				return action.kind === "download" ? (
 					<Button
 						key={`download-${action.value}`}
 						component="a"
-						href={action.value}
+						href={href}
 						size="xs"
 						variant="light"
 						color="green"
@@ -1464,7 +1487,7 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
 						{labels.download}
 					</Button>
 				) : (
-					<CopyButton key={`copy-${action.value}`} value={action.value} timeout={2000}>
+					<CopyButton key={`copy-${action.value}`} value={shareLinkForCopy(href)} timeout={2000}>
 						{({ copied, copy }) => (
 							<Button
 								size="xs"
@@ -1477,8 +1500,8 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
 							</Button>
 						)}
 					</CopyButton>
-				),
-			)}
+				);
+			})}
 		</Group>
 	);
 }

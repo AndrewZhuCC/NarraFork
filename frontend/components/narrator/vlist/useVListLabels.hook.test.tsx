@@ -184,3 +184,28 @@ describe("useVListLabels summary labels", () => {
 		});
 	});
 });
+
+describe("useVListLabels share-card actions", () => {
+	/**
+	 * The copy button hands over a LINK, so it must say so. Switching to the vlist
+	 * silently re-bound it to the common `copy`/`copied` ("复制"/"已复制"), which reads
+	 * as "copy this card's text" — the chunked card had always used the shareFile keys.
+	 * The defaults in RenderToolCall.tsx say "Copy link"/"Copied" too, so only the
+	 * injected translation had drifted.
+	 */
+	it("words the copy action as a link, in every language", async () => {
+		await withLabels(async ({ labels, i18n }) => {
+			for (const language of ["en", "zh-CN"]) {
+				await act(async () => {
+					await i18n.changeLanguage(language);
+				});
+				const toolCall = labels().renderLabels.toolCall;
+				expect(toolCall.copy).toBe(i18n.t("shareFile.copyLink"));
+				expect(toolCall.copied).toBe(i18n.t("shareFile.linkCopied"));
+				expect(toolCall.copy).not.toBe(i18n.t("copy", { ns: "common" }));
+				expect(toolCall.download).toBe(i18n.t("download", { ns: "common" }));
+			}
+			expect(labels().renderLabels.toolCall.copy).toBe(zhNarrator["shareFile.copyLink"]);
+		});
+	});
+});
