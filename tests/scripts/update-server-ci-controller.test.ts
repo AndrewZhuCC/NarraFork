@@ -79,8 +79,11 @@ const gh = mock(async (args: string[]) => {
 });
 mock.module("../../scripts/lib/ci-release-plan", () => ({
 	...originalPlan,
-	revalidateCiReleasePlan: async () => {
+	// Real contract: returns the (online-revalidated) publisher plan. This fixture has no
+	// component evidence, so the revalidated plan is the input plan unchanged.
+	revalidateCiReleasePlan: async (input: CiReleasePlan) => {
 		trace.push("revalidate");
+		return input;
 	},
 }));
 mock.module("../../scripts/lib/ci-release-bundle", () => ({

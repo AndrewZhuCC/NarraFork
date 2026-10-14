@@ -41,8 +41,11 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
 			if (dot >= 0 && SCAN_EXTENSIONS.has(entry.slice(dot))) {
 				// Test files may statically import vlist's test stubs (canvas/geometry
 				// fakes) — they never ship in a production bundle, so they cannot leak
-				// the list onto the OFF path the way production code would.
-				if (entry.includes(".test.")) continue;
+				// the list onto the OFF path the way production code would. Browser
+				// fixtures are the same: each is a standalone entry point bundled only by
+				// its own *.browser.test.ts, and production code never imports one (a
+				// separate check below keeps it that way).
+				if (entry.includes(".test.") || entry.includes(".browser-fixture.")) continue;
 				out.push(full);
 			}
 		}
@@ -118,6 +121,18 @@ describe("vlist isolation guard (protected invariant)", () => {
 			);
 		}
 		expect(offenders).toHaveLength(0);
+	});
+
+	it("browser fixtures stay test-only entry points (no production file imports one)", () => {
+		// The exemption above is only sound while no shipped module reaches a fixture.
+		const importers: string[] = [];
+		for (const file of collectSourceFiles(FRONTEND_ROOT)) {
+			if (file.includes(".browser-fixture.")) continue;
+			const source = readFileSync(file, "utf8");
+			if (/["'][^"']*\.browser-fixture(?:\.tsx?)?["']/.test(source))
+				importers.push(relative(FRONTEND_ROOT, file));
+		}
+		expect(importers).toEqual([]);
 	});
 
 	it("guard self-check: correctly classifies static vs dynamic specifiers", () => {

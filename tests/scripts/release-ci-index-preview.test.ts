@@ -49,8 +49,10 @@ const published: UpdateIndexRelease = {
 	],
 };
 const trace: string[] = [];
-const revalidate = mock(async (_value: CiReleasePlan, _options: { publish: boolean }) => {
+// Real contract: returns the revalidated plan (unchanged here: no component evidence).
+const revalidate = mock(async (value: CiReleasePlan, _options: { publish: boolean }) => {
 	trace.push("revalidate");
+	return value;
 });
 const restore = mock(async (options: { sourceRunId: number; destination: string }) => {
 	trace.push("restore");
