@@ -18,6 +18,10 @@ export function VersionUpdateBanner() {
 			variant="light"
 			withCloseButton
 			onClose={dismiss}
+			styles={{
+				body: { minWidth: 0 },
+				closeButton: { flexShrink: 0 },
+			}}
 			style={{
 				position: "fixed",
 				...TOP_BANNER_SAFE_AREA_STYLE,
@@ -30,8 +34,16 @@ export function VersionUpdateBanner() {
 			}}
 		>
 			<Group justify="space-between" wrap="nowrap">
-				<Text size="sm">{t("versionUpdate", { version: serverVersion })}</Text>
-				<Button size="xs" variant="light" leftSection={<IconRefresh size={14} />} onClick={refresh}>
+				<Text size="sm" style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>
+					{t("versionUpdate", { version: serverVersion })}
+				</Text>
+				<Button
+					size="xs"
+					variant="light"
+					leftSection={<IconRefresh size={14} />}
+					onClick={refresh}
+					style={{ flexShrink: 0 }}
+				>
 					{t("refresh")}
 				</Button>
 			</Group>
