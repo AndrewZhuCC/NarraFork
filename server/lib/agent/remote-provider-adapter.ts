@@ -256,6 +256,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 				if (mapped === undefined) continue;
 				if (mapped === CANCELLED) {
+					// A cancelled terminal may be the only (or corrected) billing snapshot.
+					if (event.type === "done" && event.usage && usage) yield mapUsage(usage);
 					// Drain the RPC generator so its post-done error takes precedence.
 					cancelled = true;
 					continue;

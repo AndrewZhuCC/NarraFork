@@ -659,6 +659,49 @@ describe("RemoteProviderAdapter", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	for (const partial of [false, true]) {
+		for (const failure of [undefined, "STREAM_IDLE_TIMEOUT", "OUTPUT_LIMIT"] as const) {
+			test(`chat emits cancelled terminal billing before draining (partial=${partial}, failure=${failure})`, async () => {
+				let drained = false;
+				const original = failure
+					? new ProviderRpcError(failure, "original transport failure", { retryable: true })
+					: undefined;
+				const events = async function* () {
+					if (partial) {
+						yield event("usage", {
+							usage: {
+								promptTokens: 100,
+								inputTokens: 60,
+								cachedInputTokens: 40,
+								completionTokens: 8,
+							},
+						});
+					}
+					yield event("done", {
+						status: "cancelled",
+						stopReason: "cancelled",
+						usage: partial
+							? { cachedInputTokens: 100, completionTokens: 0 }
+							: { inputTokens: 17, completionTokens: 9 },
+					});
+					drained = true;
+					if (original) throw original;
+				};
+				const iterator = makeAdapter(makeRpc(events)).chat(chatParams());
+				if (partial) expect((await iterator.next()).value?.usage?.completionTokens).toBe(8);
+				expect((await iterator.next()).value?.usage).toMatchObject(
+					partial
+						? { promptTokens: 100, inputTokens: 0, cachedInputTokens: 100, completionTokens: 0 }
+						: { promptTokens: 17, inputTokens: 17, completionTokens: 9 },
+				);
+				expect(drained).toBe(false);
+				if (original) await expect(iterator.next()).rejects.toBe(original);
+				else await expect(iterator.next()).rejects.toMatchObject({ name: "AbortError" });
+				expect(drained).toBe(true);
+			});
+		}
+	}
+
 	for (const kind of ["chat", "generate"] as const) {
 		const run = (adapter: RemoteProviderAdapter, signal = new AbortController().signal) =>
 			kind === "chat"

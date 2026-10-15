@@ -834,6 +834,7 @@ describe("OpenAI lightweight partial output regression", () => {
 					expect(result).toMatchObject({
 						text: partialText,
 						outputTruncated: true,
+						// mock 的 11 是含缓存的总输入，内部口径需要扣掉 3 个缓存 token。
 						usage: { inputTokens: 8, outputTokens: 7, cachedInputTokens: 3, reasoningTokens: 2 },
 					});
 					expect(deltas).toEqual([partialText]);

@@ -88,6 +88,34 @@ const text = { text: "The final answer contains enough text for a nonzero output
 const windowSize = getModelContextWindow(model, "anthropic") ?? 0;
 
 describe("independent upstream context occupancy", () => {
+	test("output-only usage is persisted without inventing prompt occupancy", async () => {
+		const { ends, contexts } = await run([{ usage: { completionTokens: 9 } }, text]);
+		expect(ends.at(-1)?.usage?.completionTokens).toBe(9);
+		expect(ends.at(-1)?.usage?.promptTokens).toBeUndefined();
+		expect(ends.at(-1)?.usage?.inputTokens).toBeUndefined();
+		expect(contexts).toHaveLength(0);
+	});
+
+	for (const finalUsage of [{ promptTokens: 100, completionTokens: 0 }, { completionTokens: 0 }]) {
+		test(`explicit zero output corrects a previous nonzero count: ${JSON.stringify(finalUsage)}`, async () => {
+			const { ends } = await run([
+				{ usage: { promptTokens: 100, inputTokens: 100, completionTokens: 8 } },
+				{ usage: finalUsage },
+				text,
+			]);
+			expect(ends.at(-1)?.usage).toMatchObject({
+				promptTokens: 100,
+				inputTokens: 100,
+				completionTokens: 0,
+			});
+		});
+	}
+
+	test("all-zero prompt/output placeholders preserve earlier measured billing", async () => {
+		const { ends } = await run([measured, placeholder, text]);
+		expect(ends.at(-1)?.usage).toMatchObject(measured.usage);
+	});
+
 	test("a fully cached final prompt replaces earlier ordinary input with zero", async () => {
 		const { ends, contexts } = await run([
 			{ usage: { promptTokens: 1000, inputTokens: 1000, cachedInputTokens: 0 } },

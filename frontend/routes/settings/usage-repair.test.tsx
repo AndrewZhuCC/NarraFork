@@ -24,6 +24,17 @@ let starts: {
 	sourceJobId?: string;
 }[];
 let fixtureRows: TokenRepairCandidate[] | null = null;
+let fixtureNextCursor: string | null | undefined;
+let applyReply: Promise<{ applied: number; conflicts: number }> | undefined;
+function deferred<T>() {
+	let resolve: (value: T) => void = () => {};
+	let reject: (error: Error) => void = () => {};
+	const promise = new Promise<T>((success, failure) => {
+		resolve = success;
+		reject = failure;
+	});
+	return { promise, resolve, reject };
+}
 const counters = {
 	inputTokens: 100,
 	cachedInputTokens: 20,
@@ -95,7 +106,7 @@ mock.module("@frontend/lib/usage-token-repair-api", () => ({
 								record("bad", "insufficient"),
 								{ ...record("applied"), appliedAt: "2026-01-02" },
 							],
-				nextCursor: cursor ? null : "next",
+				nextCursor: fixtureNextCursor !== undefined ? fixtureNextCursor : cursor ? null : "next",
 			};
 		},
 		start: async (
@@ -124,7 +135,7 @@ mock.module("@frontend/lib/usage-token-repair-api", () => ({
 		},
 		apply: async (_id: string, ids: string[]) => {
 			applications.push({ ids });
-			return { applied: 1, conflicts: 2 };
+			return applyReply ? await applyReply : { applied: 1, conflicts: 2 };
 		},
 	},
 }));
@@ -264,6 +275,8 @@ beforeEach(() => {
 	applications = [];
 	starts = [];
 	fixtureRows = null;
+	fixtureNextCursor = undefined;
+	applyReply = undefined;
 	includeReviewed = false;
 	job = makeJob();
 	client = new QueryClient({
@@ -399,6 +412,82 @@ test.each([
 	expect(startButton()?.disabled).toBe(false);
 	await click(locale.tokenRepair.start);
 	expect(calls).toContain("start");
+});
+
+test.each([
+	"ready",
+	"failed",
+	"cancelled",
+] as const)("analysis reaching %s fetches its final candidates once and invalidates other pages", async (status) => {
+	job = makeJob("analyzing");
+	fixtureRows = [record("initial")];
+	await render(<UsageRepairPage />);
+	const inactiveKey = ["usage-token-repair", "candidates", "job", "next"];
+	client.setQueryData(inactiveKey, { records: [], nextCursor: null });
+	const before = calls.filter((call) => call === "page:first").length;
+	const reply = deferred<{ job: TokenRepairJob }>();
+	await act(async () => {
+		const response = client.fetchQuery({
+			queryKey: ["usage-token-repair", "job", "job"],
+			queryFn: () => reply.promise,
+		});
+		fixtureRows = [record("final")];
+		fixtureNextCursor = null;
+		job = makeJob(status);
+		reply.resolve({ job });
+		await response;
+	});
+	await act(settle);
+	await act(settle);
+	expect(container.textContent).toContain("request-final");
+	expect(container.textContent).not.toContain("request-initial");
+	expect(calls.filter((call) => call === "page:first")).toHaveLength(before + 1);
+	expect(client.getQueryState(inactiveKey)?.isInvalidated).toBe(true);
+	expect(
+		Array.from(container.querySelectorAll("button")).find(
+			(button) => button.textContent === locale.tokenRepair.next,
+		)?.disabled,
+	).toBe(true);
+	await render(<UsageRepairPage />);
+	expect(calls.filter((call) => call === "page:first")).toHaveLength(before + 1);
+});
+
+test("partial apply failure clears the old success and preview, then refreshes job, candidates and usage", async () => {
+	await render(<UsageRepairPage />);
+	await click("request-one");
+	await click("Preview selected");
+	await click(locale.tokenRepair.confirmApply);
+	expect(container.textContent).toContain("Applied 1 · Conflicts 2");
+	const usageKey = ["usage-history", "stats"];
+	client.setQueryData(usageKey, { total: 1 });
+	const previousJobsCalls = jobsCalls;
+	const previousCandidateCalls = calls.filter((call) => call === "page:first").length;
+	const reply = deferred<{ applied: number; conflicts: number }>();
+	applyReply = reply.promise;
+	await click("request-one");
+	await click("Preview selected");
+	await click(locale.tokenRepair.confirmApply);
+	await act(async () => {
+		job = { ...makeJob("failed"), repaired: 1 };
+		fixtureRows = [{ ...record("one"), appliedAt: "2026-01-02" }, record("remaining")];
+		reply.reject(new Error("failed after one committed correction"));
+		await settle();
+	});
+	await act(settle);
+	expect(container.querySelector('[role="dialog"]')).toBeNull();
+	expect(container.textContent).not.toContain("Applied 1 · Conflicts 2");
+	expect(container.textContent).toContain(locale.tokenRepair.failed);
+	expect(container.textContent).toContain(locale.tokenRepair.status.failed);
+	expect(container.textContent).toContain("request-remaining");
+	expect(container.textContent).toContain("Preview selected (0)");
+	expect(
+		(container.querySelector('[aria-label="request-one"]') as HTMLButtonElement).disabled,
+	).toBe(true);
+	expect(jobsCalls).toBeGreaterThan(previousJobsCalls);
+	expect(calls.filter((call) => call === "page:first").length).toBeGreaterThan(
+		previousCandidateCalls,
+	);
+	expect(client.getQueryState(usageKey)?.isInvalidated).toBe(true);
 });
 
 test("ready review can finish without applying selections and then start another batch", async () => {

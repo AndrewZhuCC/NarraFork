@@ -160,6 +160,54 @@ test("PostgreSQL detail-only repair preserves unrelated accounting and serialize
 			await store.close();
 			expect((await other.getJob(scoped.id))?.status).toBe("ready");
 			await other.cancelJob(scoped.id);
+
+			// Pause after the request snapshot is checked but before its audit is inserted.
+			// A competing writer must not change that snapshot before it is marked reviewed.
+			await admin`INSERT INTO api_requests (id, provider, model, created_at, input_tokens, cached_input_tokens, cache_creation_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens) VALUES ('review-race', 'openai', 'test', '2031-01-01', 100, 30, 20, 10, 10)`;
+			const race = await other.createJob("admin", false);
+			const raceRow = await other.getRequest("review-race");
+			if (!raceRow) throw new Error("Missing review race fixture");
+			await admin.unsafe(
+				"CREATE FUNCTION pause_token_review() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.request_id = 'review-race' THEN PERFORM pg_sleep(0.5); END IF; RETURN NEW; END $$",
+			);
+			await admin.unsafe(
+				"CREATE TRIGGER pause_token_review BEFORE INSERT ON usage_token_repair_candidates FOR EACH ROW EXECUTE FUNCTION pause_token_review()",
+			);
+			const saving = other.saveCandidate(race.id, raceRow, evidence);
+			void saving.catch(() => {});
+			try {
+				let inserting = false;
+				const deadline = Date.now() + 3000;
+				while (Date.now() < deadline) {
+					const [activity] =
+						await admin`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE 'INSERT INTO usage_token_repair_candidates%') AS inserting`;
+					if (activity?.inserting === true) {
+						inserting = true;
+						break;
+					}
+					await Bun.sleep(5);
+				}
+				expect(inserting).toBe(true);
+				await admin.unsafe("SET lock_timeout = '50ms'");
+				let concurrentWriteBlocked = false;
+				try {
+					await admin`UPDATE api_requests SET input_tokens = 101 WHERE id = 'review-race'`;
+				} catch (error) {
+					concurrentWriteBlocked = String(error).includes("lock timeout");
+				}
+				expect(concurrentWriteBlocked).toBe(true);
+			} finally {
+				await admin.unsafe("SET lock_timeout = '0'");
+				await saving;
+				await admin.unsafe("DROP TRIGGER pause_token_review ON usage_token_repair_candidates");
+				await admin.unsafe("DROP FUNCTION pause_token_review()");
+			}
+			expect(await other.getRequest("review-race")).toMatchObject({
+				inputTokens: 100,
+				tokenAccountingReviewVersion: 1,
+			});
+			await other.finishAnalysis(race.id);
+			await other.cancelJob(race.id);
 			return "passed";
 		} finally {
 			await store.close();

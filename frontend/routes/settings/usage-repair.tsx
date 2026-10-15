@@ -22,7 +22,7 @@ import type {
 import { TOKEN_REPAIR_MAX_PROTOCOL_OVERRIDES } from "@shared/usage-token-repair";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 export const Route = createFileRoute("/settings/usage-repair")({ component: UsageRepairPage });
@@ -100,6 +100,15 @@ function RepairPanel() {
 		enabled: !!jobId,
 		refetchInterval: active(job) ? 1500 : false,
 	});
+	const isActive = active(job);
+	const previousJob = useRef({ id: jobId, active: isActive });
+	useEffect(() => {
+		const previous = previousJob.current;
+		previousJob.current = { id: jobId, active: isActive };
+		if (jobId && previous.id === jobId && previous.active && !isActive) {
+			void client.invalidateQueries({ queryKey: [...key, "candidates", jobId] });
+		}
+	}, [client, jobId, isActive]);
 	const refresh = () => client.invalidateQueries({ queryKey: key });
 	const action = useMutation({
 		mutationFn: async (kind: "start" | "cancel" | "reanalyze") => {
@@ -147,12 +156,12 @@ function RepairPanel() {
 				preview.map((record) => record.id),
 			);
 		},
-		onSuccess: (value) => {
-			setResult(value);
+		onSuccess: (value) => setResult(value),
+		onSettled: (_value, error) => {
+			if (error) setResult(null);
 			setPreview(null);
 			setSelected([]);
-			void client.invalidateQueries({ queryKey: ["usage-history"] });
-			void refresh();
+			return Promise.all([client.invalidateQueries({ queryKey: ["usage-history"] }), refresh()]);
 		},
 	});
 	const rows = candidates.data?.records ?? [];

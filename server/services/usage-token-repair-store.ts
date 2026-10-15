@@ -512,7 +512,16 @@ export function createTokenRepairStore(config: TokenRepairStoreConfig) {
 						throw new Error("Candidate is outside the scan cursor");
 					if (job.scanned >= TOKEN_REPAIR_MAX_RECORDS)
 						throw new Error("Token repair scan limit reached");
-					const current = await getRequest(row.id, q);
+					// Hold the PostgreSQL request row until its reviewed marker is committed.
+					// SQLite's BEGIN IMMEDIATE already excludes a concurrent writer.
+					const current = requestFrom(
+						(
+							await q(
+								`SELECT ${requestColumns} FROM api_requests WHERE id = ?${pg ? " FOR UPDATE" : ""}`,
+								[row.id],
+							)
+						)[0],
+					);
 					const unchanged =
 						current &&
 						current.tokenAccountingVersion === null &&
