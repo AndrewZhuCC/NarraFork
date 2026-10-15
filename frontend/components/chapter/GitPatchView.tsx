@@ -4,6 +4,8 @@ import { Loader, Text } from "@mantine/core";
 import { parseUnifiedDiff } from "@shared/pretext-layout/parse-unified-diff";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import classes from "./GitPatchView.module.css";
+import { GitSplitDiff } from "./GitSplitDiff";
 
 const DIFF_SEGMENT_ROWS = 500;
 const METADATA_MAX_CHARS = 8_192;
@@ -20,6 +22,10 @@ export interface GitPatchViewProps {
 	loading?: boolean;
 	error?: Error | null;
 	maxHeight?: number;
+	/** `split` is the side-by-side GitHub layout; `unified` is the merged diff. */
+	layout?: "unified" | "split";
+	/** Fill the parent pane instead of capping the diff at `maxHeight`. */
+	fill?: boolean;
 }
 
 /** Presentation for a single-file patch: loading, errors, binary, truncation and paging. */
@@ -31,6 +37,8 @@ export function GitPatchView({
 	loading = false,
 	error = null,
 	maxHeight = 500,
+	layout = "unified",
+	fill = false,
 }: GitPatchViewProps) {
 	const { t } = useTranslation("git");
 	// Git already computed this diff, so the rows are parsed from the patch rather
@@ -88,8 +96,9 @@ export function GitPatchView({
 	}
 	if (loading) return <Loader size="sm" />;
 
+	const boundedHeight = fill ? undefined : maxHeight;
 	return (
-		<>
+		<div className={fill ? classes.fill : undefined} data-git-patch-view={layout}>
 			{/* The server-side byte ceiling applies even to binary or zero-row patches. */}
 			{truncated && (
 				<Text size="xs" c="yellow" mb="xs">
@@ -140,26 +149,39 @@ export function GitPatchView({
 			{parsed && !parsed.binary && parsed.lines.length > 0 && (
 				<>
 					{hasMoreLines && (
-						<Text size="xs" c="dimmed" mb="xs">
+						<Text size="xs" c="dimmed" mb="xs" className={classes.notice}>
 							{t("diffLoadMore", {
 								shown: visibleLines.length,
 								total: parsed.lines.length,
 							})}
 						</Text>
 					)}
-					<DiffView
-						key={resetKey}
-						lines={visibleLines}
-						hunks={visibleHunks}
-						language={file ? getShikiLang(file) : undefined}
-						maxHeight={maxHeight}
-						onNearBottom={hasMoreLines ? loadNextSegment : undefined}
-						// This panel is not measured by pretext, so the gutter may shrink to
-						// the digits actually present, which matters on a phone.
-						gutterMinWidth={1}
-					/>
+					{layout === "split" ? (
+						<GitSplitDiff
+							lines={visibleLines}
+							hunks={visibleHunks}
+							language={file ? getShikiLang(file) : undefined}
+							maxHeight={boundedHeight}
+							fill={fill}
+							onNearBottom={hasMoreLines ? loadNextSegment : undefined}
+						/>
+					) : (
+						<div className={fill ? classes.unified : undefined}>
+							<DiffView
+								key={resetKey}
+								lines={visibleLines}
+								hunks={visibleHunks}
+								language={file ? getShikiLang(file) : undefined}
+								maxHeight={boundedHeight}
+								onNearBottom={hasMoreLines ? loadNextSegment : undefined}
+								// This panel is not measured by pretext, so the gutter may shrink to
+								// the digits actually present, which matters on a phone.
+								gutterMinWidth={1}
+							/>
+						</div>
+					)}
 				</>
 			)}
-		</>
+		</div>
 	);
 }

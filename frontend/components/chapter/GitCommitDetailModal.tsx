@@ -20,7 +20,7 @@ export function GitCommitDetailModal({ target, sha, onClose }: Props) {
 		<Modal
 			opened={!!sha}
 			onClose={onClose}
-			size="min(1240px, 95vw)"
+			size="min(1440px, 96vw)"
 			fullScreen={isMobile}
 			closeButtonProps={{ "aria-label": t("commitPreview.close") }}
 			title={t("commitPreview.title", { sha: sha?.slice(0, 7) })}

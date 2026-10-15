@@ -962,15 +962,120 @@ describe("shared GitCommitPreview interactions", () => {
 		expect(statistics).toContain("Only the first 2 files are listed");
 		expect(element(`[data-commit-file="${FILE}"]`).textContent).toContain("+?");
 	});
+
+	test("shows changed files in a directory tree and can collapse a folder", async () => {
+		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} />);
+		await waitForFiles();
+		const file = element(`[data-commit-file="${FILE}"]`);
+		expect(file.textContent).toContain("one.ts");
+		expect(file.getAttribute("aria-label")).toContain(FILE);
+		expect(element(`[data-commit-file="${RENAMED_FILE}"]`).getAttribute("aria-label")).toContain(
+			OLD_PATH,
+		);
+		const folder = element('[data-commit-folder="src"]');
+		expect(folder.getAttribute("aria-expanded")).toBe("true");
+		click('[data-commit-folder="src"]');
+		await waitFor(() => folder.getAttribute("aria-expanded") === "false", "collapsed folder");
+		expect(document.body.querySelector(`[data-commit-file="${FILE}"]`)).toBeNull();
+		expect(element(`[data-commit-file="${RENAMED_FILE}"]`)).toBeTruthy();
+		click('[data-commit-folder="src"]');
+		await waitFor(
+			() => !!document.body.querySelector(`[data-commit-file="${FILE}"]`),
+			"expanded folder",
+		);
+	});
+
+	test("switches between unified and split diffs without refetching the patch", async () => {
+		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
+		const patches = spyOn(api, "getGitCommitDiff").mockResolvedValue(textPatch("NEW_SPLIT_TOKEN"));
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} />);
+		await waitFor(() => bodyText().includes("NEW_SPLIT_TOKEN"), "unified patch");
+		expect(element("[data-commit-diff-layout]").getAttribute("data-commit-diff-layout")).toBe(
+			"unified",
+		);
+		expect(document.body.querySelector('[data-diff-layout="split"]')).toBeNull();
+		click('[data-commit-diff-layout-option="split"]');
+		await waitFor(
+			() =>
+				element("[data-commit-diff-layout]").getAttribute("data-commit-diff-layout") === "split",
+			"split layout",
+		);
+		const oldSide = element('[data-diff-side="old"][data-diff-row="removed"]');
+		const newSide = element('[data-diff-side="new"][data-diff-row="added"]');
+		expect(oldSide.textContent).toContain("old line");
+		expect(oldSide.textContent).not.toContain("NEW_SPLIT_TOKEN");
+		expect(newSide.textContent).toContain("NEW_SPLIT_TOKEN");
+		expect(newSide.textContent).not.toContain("old line");
+		expect(patches).toHaveBeenCalledTimes(1);
+		click('[data-commit-diff-layout-option="unified"]');
+		await waitFor(
+			() =>
+				element("[data-commit-diff-layout]").getAttribute("data-commit-diff-layout") === "unified",
+			"unified layout",
+		);
+		expect(document.body.querySelector('[data-diff-layout="split"]')).toBeNull();
+		expect(patches).toHaveBeenCalledTimes(1);
+
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} />);
+		click('[data-commit-diff-layout-option="split"]');
+		await waitFor(
+			() =>
+				element("[data-commit-diff-layout]").getAttribute("data-commit-diff-layout") === "split",
+			"stored split layout",
+		);
+		renderUi(<div />);
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} />);
+		await waitFor(
+			() =>
+				element("[data-commit-diff-layout]").getAttribute("data-commit-diff-layout") === "split",
+			"restored split layout",
+		);
+	});
 });
 
 describe("GitPatchView presentation", () => {
 	function renderPatch(
 		diff: string | undefined,
-		options: { truncated?: boolean; error?: Error; loading?: boolean } = {},
+		options: {
+			truncated?: boolean;
+			error?: Error;
+			loading?: boolean;
+			layout?: "unified" | "split";
+		} = {},
 	) {
 		renderUi(<GitPatchView diff={diff} file={FILE} resetKey="patch" {...options} />);
 	}
+
+	test("split view pairs edits and leaves the old side empty for an added line", async () => {
+		renderPatch(
+			[
+				`diff --git a/${FILE} b/${FILE}`,
+				`--- a/${FILE}`,
+				`+++ b/${FILE}`,
+				"@@ -1,2 +1,2 @@ example",
+				" context",
+				"-old line",
+				"+NEW_SPLIT_TOKEN",
+				"+ONLY_ADDED",
+			].join("\n"),
+			{ layout: "split" },
+		);
+		await waitFor(() => !!document.body.querySelector('[data-diff-layout="split"]'), "split diff");
+		expect(element("[data-diff-hunk-separator]").textContent).toContain("@@ -1,2 +1,2 @@");
+		const removed = element('[data-diff-side="old"][data-diff-row="removed"]');
+		expect(removed.textContent).toContain("old line");
+		expect(element('[data-diff-side="new"][data-diff-row="added"]').textContent).toContain(
+			"NEW_SPLIT_TOKEN",
+		);
+		const emptyOld = document.body.querySelectorAll(
+			'[data-diff-side="old"][data-diff-empty="true"]',
+		);
+		expect(emptyOld.length).toBeGreaterThan(0);
+		expect(bodyText()).toContain("ONLY_ADDED");
+		expect(bodyText()).toContain(gitLocale["commitPreview.diffOriginal"]);
+		expect(bodyText()).toContain(gitLocale["commitPreview.diffModified"]);
+	});
 
 	test.each([undefined, "", " \n\t"])("shows an explicit empty state for %j", async (diff) => {
 		renderPatch(diff);
