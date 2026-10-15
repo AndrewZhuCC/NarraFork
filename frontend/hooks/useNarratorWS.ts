@@ -689,8 +689,8 @@ export interface NarratorWSCallbacks {
 		chapterId: string | null;
 		commitsAhead: number;
 		baseBranch: string;
-		linesAdded: number;
-		linesRemoved: number;
+		linesAdded?: number;
+		linesRemoved?: number;
 	}) => void;
 	/**
 	 * Individual worktree paths changed, so a file tree can patch the affected
@@ -1456,8 +1456,8 @@ export function useNarratorWS(
 							chapterId: (data.chapterId as string | null) ?? null,
 							commitsAhead: (data.commitsAhead as number) ?? 0,
 							baseBranch: (data.baseBranch as string) ?? "",
-							linesAdded: (data.linesAdded as number) ?? 0,
-							linesRemoved: (data.linesRemoved as number) ?? 0,
+							linesAdded: isFileChangeCount(data.linesAdded) ? data.linesAdded : undefined,
+							linesRemoved: isFileChangeCount(data.linesRemoved) ? data.linesRemoved : undefined,
 						});
 						break;
 					case "workspace_paths_changed": {

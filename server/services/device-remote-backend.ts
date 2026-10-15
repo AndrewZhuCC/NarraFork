@@ -30,6 +30,7 @@ import {
 } from "../lib/agent/execution/exclusive-create";
 import {
 	FEATURE_GIT_COMMIT_PREVIEW_V1,
+	FEATURE_GIT_WORKSPACE_STATUS_V1,
 	FEATURE_GIT_WORKSPACE_V1,
 	FEATURE_GIT_WORKSPACE_WATCH_V1,
 	GIT_WORKSPACE_MAX_BYTES,
@@ -514,6 +515,13 @@ export class RemoteBackend implements ExecutionBackend {
 
 	get supportsGitWorkspace(): boolean {
 		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_WORKSPACE_V1);
+	}
+
+	get supportsGitWorkspaceStatus(): boolean {
+		return (
+			this.supportsGitWorkspace &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_WORKSPACE_STATUS_V1)
+		);
 	}
 
 	get supportsGitWorkspaceWatch(): boolean {

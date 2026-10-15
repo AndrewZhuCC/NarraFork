@@ -174,6 +174,21 @@ describe("panel-only Git watch pool", () => {
 		b();
 		expect(calls).toBe(2);
 	});
+	test("legacy watch fallback without staged numstat never claims a stable index", async () => {
+		const remote = target("remote");
+		remote.backend = {
+			kind: "remote",
+			gitWorkspace: async (request: Record<string, unknown>) =>
+				request.operation === "status"
+					? { outputs: { status: "", head: "sha", branch: "main" } }
+					: { stdout: "" },
+		} as unknown as NonNullable<GitWorkspaceTarget["backend"]>;
+		const first = await probeGitWatch(remote, new AbortController().signal);
+		const second = await probeGitWatch(remote, new AbortController().signal);
+		expect(first.uncertain).toContain("index");
+		expect(first.fingerprints.index).toBeUndefined();
+		expect(changedGitCategories(first, second)).toEqual(["index"]);
+	});
 	test("remote idle and equal-line edits never invalidate history; RPC output/time stays bounded", async () => {
 		const calls: Record<string, unknown>[] = [];
 		let content = "-old\n+new";

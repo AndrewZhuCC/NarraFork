@@ -1462,6 +1462,7 @@
 	"fileTree.remoteUnsupported": "File-tree browsing for this remote device is not supported here. Existing remote files retain their original device and path.",
 	"fileTree.empty": "This directory is empty.",
 	"fileTree.refresh": "Refresh",
+	"fileTree.gitChanged": "Contains uncommitted Git changes",
 	"fileTree.showHidden": "Show hidden files",
 	"fileTree.hideHidden": "Hide hidden files",
 	"fileTree.retry": "Retry",

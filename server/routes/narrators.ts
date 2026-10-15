@@ -6507,7 +6507,7 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 });
 
 /**
- * Current uncommitted line counts for the narrator file tree.
+ * Current lightweight Git file states for the narrator file tree.
  *
  * The tree may be rooted at a standalone narrator's cwd or at a subdirectory inside a
  * chapter worktree, so this route is narrator-scoped rather than chapter-scoped. Git's
@@ -6524,16 +6524,19 @@ narratorRoutes.get("/:id/file-tree-status", async (c) => {
 	// Share the same short-lived cache used by the Git panel. The watcher invalidates it
 	// before broadcasting file activity, and concurrent file-tree surfaces then reuse the
 	// one fresh Git query instead of each spawning their own set of processes.
-	const status = await getStatusSummaryCached(cwd);
+	const status = await getStatusSummaryCached(cwd, { signal: c.req.raw.signal });
 	return c.json({
 		isGitRepo: true,
 		files: status.files.map((file) => ({
 			path: file.path,
+			status: file.status,
+			oldPath: file.oldPath,
 			linesAdded: file.linesAdded,
 			linesRemoved: file.linesRemoved,
 		})),
 		totalFiles: status.totalFiles,
-		truncated: status.totalFiles > status.files.length,
+		totalFilesExact: status.totalFilesExact,
+		truncated: status.truncated === true || status.totalFiles > status.files.length,
 	});
 });
 

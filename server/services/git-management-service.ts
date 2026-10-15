@@ -4,8 +4,9 @@ import { invalidateBoundaries } from "./git-commit-boundary-cache";
 import { gitDiscoveryCache } from "./git-discovery-cache";
 import { gitService } from "./git-service";
 import { invalidateStatus } from "./git-status-cache";
+import { invalidateGitStatusQuery } from "./git-status-query";
 import { type GitWorkspaceTarget, normalizeWorkspacePath } from "./git-workspace";
-import { createRemoteGitService } from "./remote-git-service";
+import { createRemoteGitService, getRemoteGitStatusQueryKey } from "./remote-git-service";
 import type { WorkspaceAttributionScope } from "./workspace-modification-view";
 
 export function gitManagementService(target: GitWorkspaceTarget, signal?: AbortSignal) {
@@ -23,10 +24,14 @@ export function invalidateGitWorkspace(target: GitWorkspaceTarget): void {
 		target.repositoryPath,
 		target.backend?.paths.equals,
 	);
-	// Remote reads deliberately have no host-path cache. Local legacy consumers keep sharing theirs.
-	if (target.backend?.kind === "local" && target.workspace.rootPath) {
-		invalidateStatus(target.workspace.rootPath);
-		invalidateBoundaries(target.workspace.rootPath);
+	const { backend, workspace } = target;
+	if (!backend || !workspace.rootPath) return;
+	if (backend.kind === "remote") {
+		// Watch events must queue a fresh read rather than reuse pre-event RPC work.
+		invalidateGitStatusQuery(getRemoteGitStatusQueryKey(backend, workspace.rootPath));
+	} else {
+		invalidateStatus(workspace.rootPath);
+		invalidateBoundaries(workspace.rootPath);
 	}
 }
 

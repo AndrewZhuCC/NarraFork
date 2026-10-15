@@ -2034,12 +2034,19 @@ export const narratorsApi = {
 			body: JSON.stringify({ summary }),
 		}),
 
-	// File tree — current uncommitted Git line counts, relative to this narrator's cwd.
+	// File tree — current Git changes relative to this narrator's cwd; legacy line counts are optional.
 	getFileTreeStatus: (narratorId: string) =>
 		request<{
 			isGitRepo: boolean;
-			files: Array<{ path: string; linesAdded: number; linesRemoved: number }>;
+			files: Array<{
+				path: string;
+				status?: string;
+				oldPath?: string;
+				linesAdded?: number;
+				linesRemoved?: number;
+			}>;
 			totalFiles: number;
+			totalFilesExact?: boolean;
 			truncated: boolean;
 		}>(`/narrators/${narratorId}/file-tree-status`),
 

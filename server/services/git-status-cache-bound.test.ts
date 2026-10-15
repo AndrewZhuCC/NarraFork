@@ -190,3 +190,61 @@ describe("git status cache — rejection handling", () => {
 		expect(peekStatusSummary(path)).toBeNull();
 	});
 });
+
+describe("git status cache — invalidation generations", () => {
+	test("an old completion cannot overwrite the cache populated after invalidation", async () => {
+		let finishOld!: (value: GitStatusSummary) => void;
+		let calls = 0;
+		gitService.getStatusSummary = mock(async (path: string) => {
+			calls++;
+			if (calls === 1)
+				return new Promise<GitStatusSummary>((resolve) => {
+					finishOld = resolve;
+				});
+			return { ...summaryFor(path), branch: "new" };
+		});
+		const path = "/tmp/nf-status-generation";
+		const old = getStatusSummaryCached(path);
+		invalidateStatus(path);
+		expect((await getStatusSummaryCached(path)).branch).toBe("new");
+		finishOld({ ...summaryFor(path), branch: "old" });
+		expect((await old).branch).toBe("old");
+		expect(peekStatusSummary(path)?.branch).toBe("new");
+	});
+
+	test("an invalidated result alone never becomes a fresh cache hit", async () => {
+		let finish!: (value: GitStatusSummary) => void;
+		gitService.getStatusSummary = mock(
+			() =>
+				new Promise<GitStatusSummary>((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const path = "/tmp/nf-status-invalidated";
+		const pending = getStatusSummaryCached(path);
+		invalidateStatus(path);
+		finish(summaryFor(path));
+		await pending;
+		expect(peekStatusSummary(path)).toBeNull();
+	});
+
+	test("an already-cancelled reader cannot consume even a cached result", async () => {
+		gitService.getStatusSummary = mock(async (path: string) => summaryFor(path));
+		const path = "/tmp/nf-status-aborted";
+		await getStatusSummaryCached(path);
+		const controller = new AbortController();
+		controller.abort(new Error("reader disconnected"));
+		await expect(getStatusSummaryCached(path, { signal: controller.signal })).rejects.toThrow(
+			"reader disconnected",
+		);
+	});
+
+	test("invalidating a root expires its cached subdirectory scope but not a sibling repository", async () => {
+		gitService.getStatusSummary = mock(async (path: string) => summaryFor(path));
+		await getStatusSummaryCached("/tmp/nf-status-scope/repo/sub");
+		await getStatusSummaryCached("/tmp/nf-status-scope/repo2");
+		invalidateStatus("/tmp/nf-status-scope/repo");
+		expect(peekStatusSummary("/tmp/nf-status-scope/repo/sub")).toBeNull();
+		expect(peekStatusSummary("/tmp/nf-status-scope/repo2")).not.toBeNull();
+	});
+});

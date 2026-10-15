@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -35,6 +35,8 @@ import {
 	parseNameStatusRecords,
 	requireCommitFile,
 } from "./git-commit-preview-parse";
+import { coordinateGitStatusQuery, getLocalGitStatusQueryKey } from "./git-status-query";
+import { GIT_STATUS_TIMEOUT_MS, readGitStatusStream } from "./git-status-stream";
 import {
 	captureLifecycleContextPath,
 	confirmLifecyclePathCreated,
@@ -308,16 +310,17 @@ export interface GitStatusFile {
 	 * under a path that no longer appears in the diff.
 	 */
 	oldPath?: string;
-	linesAdded: number;
-	linesRemoved: number;
-	stagedLinesAdded: number;
-	stagedLinesRemoved: number;
-	unstagedLinesAdded: number;
-	unstagedLinesRemoved: number;
+	/** Omitted by lightweight status; explicit diff APIs provide line statistics. */
+	linesAdded?: number;
+	linesRemoved?: number;
+	stagedLinesAdded?: number;
+	stagedLinesRemoved?: number;
+	unstagedLinesAdded?: number;
+	unstagedLinesRemoved?: number;
 }
 
 export interface GitStatusSummary {
-	/** The displayed files/statistics are incomplete when any subprocess hits its byte budget. */
+	/** File details or the status scan were capped; totals may still be exact. */
 	truncated?: boolean;
 	hasChanges: boolean;
 	staged: number;
@@ -325,14 +328,15 @@ export interface GitStatusSummary {
 	untracked: number;
 	/** Capped at 200 entries. Use `totalFiles` for the real count. */
 	files: GitStatusFile[];
-	/** Total number of changed files (may exceed files.length). */
+	/** Number of complete scanned records; a lower bound when totalFilesExact is false. */
 	totalFiles: number;
+	totalFilesExact?: boolean;
 	headSha: string;
 	branch: string;
 	/** Total lines added across all uncommitted changes (staged + unstaged + untracked). */
-	linesAdded: number;
+	linesAdded?: number;
 	/** Total lines removed across all uncommitted changes (staged + unstaged + untracked). */
-	linesRemoved: number;
+	linesRemoved?: number;
 }
 
 const MAX_GIT_FAILURE_OUTPUT_CHARS = 4000;
@@ -559,82 +563,8 @@ async function detectConflictFilesAfterFailedGitCommand(
 	return commandOutputMentionsConflict(result) ? [] : null;
 }
 
-interface LineStats {
-	added: number;
-	removed: number;
-}
-
 function parseNulSeparatedPaths(output: string): string[] {
 	return output.split("\0").filter(Boolean);
-}
-
-function countTextLines(content: string): number {
-	if (!content) return 0;
-	const lineCount = content.split("\n").length;
-	return content.endsWith("\n") ? lineCount - 1 : lineCount;
-}
-
-/** Max file size (bytes) to read for untracked line counting. Skip larger / binary files. */
-const MAX_UNTRACKED_FILE_SIZE = 1_000_000; // 1 MB
-/** Max number of untracked files to count lines for. */
-const MAX_UNTRACKED_LINE_COUNT_FILES = 200;
-/**
- * Number of bytes to sample for binary detection.
- * Matches VSCode's approach: read first 4100 bytes, scan for null byte.
- * See: vscode/extensions/git/src/git.ts — detectObjectType()
- */
-const BINARY_DETECT_BYTES = 4100;
-
-/**
- * Detect whether a file is binary by reading its first bytes and scanning
- * for null (0x00) bytes — the same heuristic used by VSCode and git itself.
- * Returns true if the file appears to be binary.
- */
-async function isBinaryFile(filePath: string, size: number): Promise<boolean> {
-	const bytesToRead = Math.min(size, BINARY_DETECT_BYTES);
-	try {
-		const file = Bun.file(filePath);
-		const slice = file.slice(0, bytesToRead);
-		const ab = await slice.arrayBuffer();
-		const view = new Uint8Array(ab);
-		for (let i = 0; i < view.length; i++) {
-			if (view[i] === 0) return true;
-		}
-		return false;
-	} catch {
-		return true; // If we can't read it, treat as binary
-	}
-}
-
-async function getUntrackedLineStatsMap(
-	worktreePath: string,
-	files: string[],
-): Promise<Map<string, LineStats>> {
-	const capped = files.slice(0, MAX_UNTRACKED_LINE_COUNT_FILES);
-	const entries = new Map<string, LineStats>();
-	// Ten bounded files at once, never a 200 MiB all-files burst on the HTTP thread.
-	for (let start = 0; start < capped.length; start += 10) {
-		gitRequestContext.getStore()?.signal?.throwIfAborted();
-		const batch = await Promise.all(
-			capped.slice(start, start + 10).map(async (file) => {
-				try {
-					const filePath = join(worktreePath, file);
-					const metadata = await lstat(filePath);
-					// The link itself is a Git entry, not permission to read its referent.
-					if (!metadata.isFile() || metadata.size > MAX_UNTRACKED_FILE_SIZE)
-						return [file, { added: 0, removed: 0 }] as const;
-					if (metadata.size > 0 && (await isBinaryFile(filePath, metadata.size)))
-						return [file, { added: 0, removed: 0 }] as const;
-					const content = await Bun.file(filePath).slice(0, MAX_UNTRACKED_FILE_SIZE).text();
-					return [file, { added: countTextLines(content), removed: 0 }] as const;
-				} catch {
-					return [file, { added: 0, removed: 0 }] as const;
-				}
-			}),
-		);
-		for (const [path, stats] of batch) entries.set(path, stats);
-	}
-	return entries;
 }
 
 function parseNumstatZ(
@@ -713,44 +643,6 @@ function stripGitPathPrefix(path: string, prefix: string): string {
 	return path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }
 
-function buildLineStatsMap(output: string, prefix = ""): Map<string, LineStats> {
-	return new Map(
-		parseNumstatZ(output).map(({ path, added, removed }) => [
-			stripGitPathPrefix(path, prefix),
-			{ added, removed },
-		]),
-	);
-}
-
-function parsePorcelainStatusZ(
-	output: string,
-): Array<{ status: string; path: string; oldPath?: string }> {
-	const entries: Array<{ status: string; path: string; oldPath?: string }> = [];
-	let offset = 0;
-
-	while (offset < output.length) {
-		const entryEnd = output.indexOf("\0", offset);
-		if (entryEnd === -1) break;
-		const entry = output.slice(offset, entryEnd);
-		offset = entryEnd + 1;
-		if (!entry) continue;
-
-		const status = entry.slice(0, 2);
-		const path = entry.slice(3);
-		let oldPath: string | undefined;
-		if (status.includes("R") || status.includes("C")) {
-			const oldPathEnd = output.indexOf("\0", offset);
-			if (oldPathEnd === -1) break;
-			oldPath = output.slice(offset, oldPathEnd);
-			offset = oldPathEnd + 1;
-		}
-
-		entries.push({ status, path, oldPath });
-	}
-
-	return entries;
-}
-
 /**
  * `git status --porcelain` arguments that list untracked files INDIVIDUALLY.
  *
@@ -774,9 +666,8 @@ function parsePorcelainStatusZ(
  * COST: on a repo with a huge untracked directory (a stray `node_modules`,
  * a build output folder that is not ignored) this enumerates every file instead
  * of one line. That is bounded where it matters — `files` is capped at
- * `MAX_FILES`, and the untracked line-count scan has its own cap — and it is the
- * honest number: those files ARE uncommitted, and the old single line simply hid
- * how many.
+ * 200 entries for the summary, with a separate streaming byte/record budget.
+ * `totalFilesExact` distinguishes an exhaustive count from a scanned lower bound.
  */
 const PORCELAIN_UNTRACKED_ALL = ["status", "--porcelain", "-uall"];
 
@@ -939,40 +830,6 @@ export const gitService = {
 			count: result.exitCode === 0 ? Number.parseInt(result.stdout, 10) || 0 : 0,
 			baseBranch,
 		};
-	},
-
-	async getUncommittedLineStats(worktreePath: string): Promise<{ added: number; removed: number }> {
-		// staged + unstaged diff against HEAD
-		const tracked = await execRead(["diff", "HEAD", "--numstat", "-z"], worktreePath, true);
-		// untracked files
-		const untracked = await execRead(
-			["ls-files", "--others", "--exclude-standard", "-z"],
-			worktreePath,
-			true,
-		);
-
-		let added = 0;
-		let removed = 0;
-
-		if (tracked.exitCode === 0 && tracked.stdout) {
-			for (const entry of parseNumstatZ(tracked.stdout)) {
-				added += entry.added;
-				removed += entry.removed;
-			}
-		}
-
-		if (untracked.exitCode === 0 && untracked.stdout) {
-			const untrackedStats = await getUntrackedLineStatsMap(
-				worktreePath,
-				parseNulSeparatedPaths(untracked.stdout),
-			);
-			for (const stats of untrackedStats.values()) {
-				added += stats.added;
-				removed += stats.removed;
-			}
-		}
-
-		return { added, removed };
 	},
 
 	/**
@@ -1298,129 +1155,73 @@ export const gitService = {
 	},
 
 	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
-		const [
-			prefixResult,
-			statusResult,
-			headResult,
-			branchResult,
-			stagedNumstat,
-			unstagedNumstat,
-			untrackedResult,
-		] = await Promise.all([
-			// `-z` output stays repository-root-relative even when Git runs below the
-			// root. `--show-prefix` supplies the exact Git path prefix to strip after
-			// parsing, so the result matches the caller's cwd-relative file tree.
-			execRead(["rev-parse", "--show-prefix"], worktreePath, true),
-			// Scope every path-producing command to the directory the caller named. Most
-			// callers pass the worktree root, but a narrator file tree may use a subdirectory.
-			execRead([...PORCELAIN_UNTRACKED_ALL, "-z", "--", "."], worktreePath),
-			execRead(["rev-parse", "HEAD"], worktreePath),
-			execRead(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
-			execRead(["diff", "--cached", "--numstat", "-z", "--", "."], worktreePath, true),
-			execRead(["diff", "--numstat", "-z", "--", "."], worktreePath, true),
-			execRead(["ls-files", "--others", "--exclude-standard", "-z", "--", "."], worktreePath, true),
-		]);
-		if (statusResult.exitCode !== 0)
-			throw new GitError(gitFailureMessage("Git status failed", statusResult));
-		const pathPrefix = prefixResult.exitCode === 0 ? prefixResult.stdout : "";
-
-		const stagedLineStats =
-			stagedNumstat.exitCode === 0
-				? buildLineStatsMap(stagedNumstat.stdout, pathPrefix)
-				: new Map<string, LineStats>();
-		const unstagedLineStats =
-			unstagedNumstat.exitCode === 0
-				? buildLineStatsMap(unstagedNumstat.stdout, pathPrefix)
-				: new Map<string, LineStats>();
-		const untrackedPaths =
-			untrackedResult.exitCode === 0
-				? // `ls-files --others` reports CWD-relative paths (unlike porcelain and
-					// numstat, which are root-relative and need the prefix stripped).
-					// Stripping here would corrupt a nested directory that shares the
-					// prefix's name (`sub/sub/x.txt` seen from `sub/` prints `sub/x.txt`,
-					// which stripping turns into the nonexistent `x.txt`).
-					parseNulSeparatedPaths(untrackedResult.stdout)
-				: [];
-		const untrackedLineStats = await getUntrackedLineStatsMap(worktreePath, untrackedPaths);
-
-		for (const [path, stats] of untrackedLineStats) {
-			unstagedLineStats.set(path, stats);
-		}
-
-		const entries = parsePorcelainStatusZ(statusResult.stdout).map((entry) => ({
-			...entry,
-			path: stripGitPathPrefix(entry.path, pathPrefix),
-			...(entry.oldPath ? { oldPath: stripGitPathPrefix(entry.oldPath, pathPrefix) } : {}),
-		}));
-		let staged = 0;
-		let unstaged = 0;
-		let untracked = 0;
-		const MAX_FILES = 200;
-		const files: GitStatusFile[] = [];
-
-		for (const entry of entries) {
-			const x = entry.status[0]; // index status
-			const y = entry.status[1]; // worktree status
-			if (files.length < MAX_FILES) {
-				const stagedStats = stagedLineStats.get(entry.path) ?? { added: 0, removed: 0 };
-				const unstagedStats = unstagedLineStats.get(entry.path) ?? { added: 0, removed: 0 };
-				files.push({
-					status: entry.status,
-					path: entry.path,
-					// Only `R`/`C` entries carry one; `parsePorcelainStatusZ` leaves it
-					// undefined otherwise, and the field is omitted rather than sent as
-					// null so a JSON consumer sees the same shape it always did.
-					...(entry.oldPath ? { oldPath: entry.oldPath } : {}),
-					linesAdded: stagedStats.added + unstagedStats.added,
-					linesRemoved: stagedStats.removed + unstagedStats.removed,
-					stagedLinesAdded: stagedStats.added,
-					stagedLinesRemoved: stagedStats.removed,
-					unstagedLinesAdded: unstagedStats.added,
-					unstagedLinesRemoved: unstagedStats.removed,
+		return coordinateGitStatusQuery(
+			getLocalGitStatusQueryKey(worktreePath),
+			async (signal) => {
+				const queryController = new AbortController();
+				const boundedSignal = AbortSignal.any([
+					signal,
+					queryController.signal,
+					AbortSignal.timeout(GIT_STATUS_TIMEOUT_MS),
+				]);
+				return withGitRequestContext(boundedSignal, async () => {
+					const startedAt = Date.now();
+					// Freeze lifecycle cwd once for streaming and all metadata commands alike.
+					const cwd = await lifecycleCreationPath(worktreePath);
+					const metadataOptions = { timeout: GIT_STATUS_TIMEOUT_MS, maxOutputBytes: 4096 };
+					const queries = [
+						execRead(["rev-parse", "--show-prefix"], cwd, true, metadataOptions),
+						readGitStatusStream(cwd, boundedSignal),
+						execRead(["rev-parse", "--verify", "HEAD"], cwd, true, metadataOptions),
+						execRead(["rev-parse", "--abbrev-ref", "HEAD"], cwd, true, metadataOptions),
+					] as const;
+					const [prefix, status, head, branch] = await Promise.all(queries).catch(async (error) => {
+						// Keep the coordinator slot until every sibling process has exited.
+						queryController.abort(error);
+						await Promise.allSettled(queries);
+						throw error;
+					});
+					boundedSignal.throwIfAborted();
+					if (prefix.exitCode !== 0 || prefix.truncated || head.truncated || branch.truncated)
+						throw new GitError("Git status metadata failed");
+					const branchResult =
+						branch.exitCode === 0
+							? branch
+							: await execRead(["symbolic-ref", "--short", "HEAD"], cwd, true, metadataOptions);
+					boundedSignal.throwIfAborted();
+					if (branchResult.exitCode !== 0 || branchResult.truncated)
+						throw new GitError("Git status branch metadata failed");
+					const { parser, budgetReason } = status;
+					const files = parser.files.map((entry) => ({
+						...entry,
+						path: stripGitPathPrefix(entry.path, prefix.stdout),
+						...(entry.oldPath ? { oldPath: stripGitPathPrefix(entry.oldPath, prefix.stdout) } : {}),
+					}));
+					const truncated = !!budgetReason || parser.totalFiles > files.length;
+					const elapsedMs = Date.now() - startedAt;
+					if (elapsedMs > 1000)
+						logger.warn("Slow Git status query", {
+							elapsedMs,
+							scanned: parser.totalFiles,
+							returned: files.length,
+							truncationReason: budgetReason ?? (truncated ? "details" : "none"),
+						});
+					return {
+						hasChanges: parser.totalFiles > 0 || !!budgetReason,
+						staged: parser.staged,
+						unstaged: parser.unstaged,
+						untracked: parser.untracked,
+						files,
+						totalFiles: parser.totalFiles,
+						totalFilesExact: !budgetReason,
+						headSha: head.exitCode === 0 ? head.stdout : "",
+						branch: branchResult.stdout,
+						truncated,
+					};
 				});
-			}
-
-			if (y === "?") {
-				untracked++;
-			} else {
-				if (x !== " " && x !== "?") staged++;
-				if (y !== " " && y !== "?") unstaged++;
-			}
-		}
-
-		// Aggregate total line stats from the per-file maps we already computed
-		let totalLinesAdded = 0;
-		let totalLinesRemoved = 0;
-		for (const stats of stagedLineStats.values()) {
-			totalLinesAdded += stats.added;
-			totalLinesRemoved += stats.removed;
-		}
-		for (const stats of unstagedLineStats.values()) {
-			totalLinesAdded += stats.added;
-			totalLinesRemoved += stats.removed;
-		}
-
-		const truncated =
-			entries.length > files.length ||
-			[statusResult, stagedNumstat, unstagedNumstat, untrackedResult].some(
-				(result) => result.truncated,
-			);
-		return {
-			hasChanges: entries.length > 0 || truncated,
-			staged,
-			unstaged,
-			untracked,
-			files,
-			totalFiles: entries.length,
-			headSha: headResult.exitCode === 0 ? headResult.stdout : "",
-			branch:
-				branchResult.exitCode === 0
-					? branchResult.stdout
-					: (await execRead(["symbolic-ref", "--short", "HEAD"], worktreePath, true)).stdout,
-			linesAdded: totalLinesAdded,
-			linesRemoved: totalLinesRemoved,
-			truncated,
-		};
+			},
+			{ signal: gitRequestContext.getStore()?.signal },
+		);
 	},
 
 	/** Get full diff of all uncommitted changes (staged + unstaged + untracked).

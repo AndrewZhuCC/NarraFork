@@ -150,14 +150,21 @@ export function NarratorGitBar({
 					<Badge size="xs" variant="light">
 						<Group gap={5} wrap="nowrap">
 							<Text span size="xs" fw={600}>
-								{counts.totalFiles}
+								{counts.totalFilesExact === false ||
+								(counts.totalFilesExact === undefined && counts.truncated)
+									? t("workspace.atLeastFiles", { count: counts.totalFiles })
+									: counts.totalFiles}
 							</Text>
-							<Text span size="xs" c="green" fw={600}>
-								+{counts.linesAdded}
-							</Text>
-							<Text span size="xs" c="red" fw={600}>
-								-{counts.linesRemoved}
-							</Text>
+							{counts.linesAdded != null && Number.isFinite(counts.linesAdded) && (
+								<Text span size="xs" c="green" fw={600}>
+									+{counts.linesAdded}
+								</Text>
+							)}
+							{counts.linesRemoved != null && Number.isFinite(counts.linesRemoved) && (
+								<Text span size="xs" c="red" fw={600}>
+									-{counts.linesRemoved}
+								</Text>
+							)}
 						</Group>
 					</Badge>
 				</Tooltip>
@@ -357,8 +364,8 @@ export function ChapterBar({
 					</Text>
 					{gitStatus &&
 						(gitStatus.commitsAhead > 0 ||
-							gitStatus.linesAdded > 0 ||
-							gitStatus.linesRemoved > 0) && (
+							(gitStatus.linesAdded != null && gitStatus.linesAdded > 0) ||
+							(gitStatus.linesRemoved != null && gitStatus.linesRemoved > 0)) && (
 							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 								{gitStatus.commitsAhead > 0 && (
 									<Tooltip
@@ -377,16 +384,21 @@ export function ChapterBar({
 										</Badge>
 									</Tooltip>
 								)}
-								{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
+								{((gitStatus.linesAdded != null && gitStatus.linesAdded > 0) ||
+									(gitStatus.linesRemoved != null && gitStatus.linesRemoved > 0)) && (
 									<Tooltip label={tn("chapterBar.uncommittedLines")}>
 										<Badge size="xs" variant="light" color="yellow">
-											{gitStatus.linesAdded > 0 && (
+											{gitStatus.linesAdded != null && gitStatus.linesAdded > 0 && (
 												<Text span size="xs" c="green" fw={600}>
 													+{gitStatus.linesAdded}
 												</Text>
 											)}
-											{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
-											{gitStatus.linesRemoved > 0 && (
+											{gitStatus.linesAdded != null &&
+												gitStatus.linesAdded > 0 &&
+												gitStatus.linesRemoved != null &&
+												gitStatus.linesRemoved > 0 &&
+												" "}
+											{gitStatus.linesRemoved != null && gitStatus.linesRemoved > 0 && (
 												<Text span size="xs" c="red" fw={600}>
 													-{gitStatus.linesRemoved}
 												</Text>

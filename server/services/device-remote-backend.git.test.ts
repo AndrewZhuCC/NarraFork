@@ -9,11 +9,11 @@ test("RemoteBackend Git RPC pins generation, negotiates capabilities and forward
 	const source = `
 import { mock } from "bun:test";
 import assert from "node:assert/strict";
-let online = true, supported = true, previewSupported = true, generation = 3;
+let online = true, supported = true, previewSupported = true, statusSupported = true, generation = 3;
 const calls = [];
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 65536 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
- hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1")),
+ hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1")),
  sendRpc: async (id, method, params, opts) => {
   calls.push({id, method, params, opts});
   if (!online) throw new Error("offline");
@@ -27,6 +27,11 @@ mock.module(${JSON.stringify(connectionPath)}, () => ({
 const { RemoteBackend } = await import(${JSON.stringify(backendPath)});
 const b = new RemoteBackend("remote-device", {connectionGeneration:3,platform:{os:"windows",arch:"x64"}});
 assert.equal(b.supportsGitWorkspace,true);
+assert.equal(b.supportsGitWorkspaceStatus,true);
+statusSupported=false;
+assert.equal(b.supportsGitWorkspaceStatus,false);
+assert.equal(b.supportsGitWorkspace,true);
+statusSupported=true;
 const controller = new AbortController();
 const result = await b.gitWorkspace({cwd:"C:\\\\Repo",expectedRoot:"C:\\\\Repo",operation:"diff",files:["file"],timeoutMs:1250,maxBytes:999999},controller.signal);
 assert.equal(result.truncated,true);

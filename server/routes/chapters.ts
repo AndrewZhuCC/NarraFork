@@ -749,7 +749,7 @@ chapterRoutes.get("/:id/commits/:sha/files/*", async (c) => {
 	return c.json(result);
 });
 
-// === Git Status (commits ahead + uncommitted lines) ===
+// === Lightweight chapter Git status (line statistics belong to diff views) ===
 
 chapterRoutes.get("/:id/git-status", async (c) => {
 	const id = c.req.param("id");
@@ -758,21 +758,14 @@ chapterRoutes.get("/:id/git-status", async (c) => {
 	if (!chapter.worktreePath) {
 		return c.json({
 			commitsAhead: 0,
-			linesAdded: 0,
-			linesRemoved: 0,
 			baseBranch: chapter.baseBranch,
 		});
 	}
 
-	const [ahead, lines] = await Promise.all([
-		gitService.getCommitsAhead(chapter.worktreePath, chapter.baseBranch),
-		gitService.getUncommittedLineStats(chapter.worktreePath),
-	]);
+	const ahead = await gitService.getCommitsAhead(chapter.worktreePath, chapter.baseBranch);
 
 	return c.json({
 		commitsAhead: ahead.count,
 		baseBranch: ahead.baseBranch,
-		linesAdded: lines.added,
-		linesRemoved: lines.removed,
 	});
 });

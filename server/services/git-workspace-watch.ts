@@ -85,7 +85,8 @@ export async function probeGitWatch(
 		if (outputs.head === undefined || outputs.branch === undefined || outputs.status === undefined)
 			throw new Error("Incomplete remote Git watch status");
 		fingerprints.head = fingerprint(`${outputs.head}\0${outputs.branch}`);
-		fingerprints.index = fingerprint(outputs.stagedNumstat ?? "");
+		if (outputs.stagedNumstat === undefined || status.truncated) uncertain.add("index");
+		else fingerprints.index = fingerprint(outputs.stagedNumstat);
 		// v1 exposes HEAD/branch, not unrelated refs. Never turn this limitation
 		// into periodic log invalidations. Bounded patches detect equal-line edits.
 		let patch = "";
