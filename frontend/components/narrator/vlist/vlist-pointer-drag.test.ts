@@ -243,13 +243,56 @@ describe("createPointerDragTracker", () => {
 		}
 	});
 
-	it("native drag survives pointercancel even when compatibility mousedown is absent", () => {
+	it("a cancelled dragstart with no counted press does not commit a release", async () => {
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => releases++);
+		const cancel = (event: Event) => event.preventDefault();
+		document.addEventListener("dragstart", cancel, true);
+		try {
+			fire("dragstart");
+			await Promise.resolve();
+			expect(tracker.isDown()).toBe(false);
+			expect(releases).toBe(0);
+		} finally {
+			document.removeEventListener("dragstart", cancel, true);
+			tracker.dispose();
+		}
+	});
+
+	it("drops a dragstart that a later listener cancels, because dragend will not fire", async () => {
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => releases++);
+		const cancel = (event: Event) => event.preventDefault();
+		document.addEventListener("dragstart", cancel, true);
+		try {
+			fire("pointerdown", 1);
+			fire("mousedown");
+			fire("dragstart");
+			await Promise.resolve();
+			// The press is still down. Only the native-drag slot is dropped; a
+			// microtask that cleared every slot would already have released.
+			expect(tracker.isDown()).toBe(true);
+			expect(releases).toBe(0);
+			fire("pointerup", 1);
+			fire("mouseup");
+			expect(tracker.isDown()).toBe(false);
+			expect(releases).toBe(1);
+		} finally {
+			document.removeEventListener("dragstart", cancel, true);
+			tracker.dispose();
+		}
+	});
+
+	it("native drag survives pointercancel even when compatibility mousedown is absent", async () => {
 		let releases = 0;
 		const tracker = createPointerDragTracker(() => releases++);
 		try {
 			fire("pointerdown", 4);
 			fire("dragstart");
 			fire("pointercancel", 4);
+			await Promise.resolve();
+			// NATIVE_DRAG_ID is the only slot left. An eager microtask delete would
+			// already report idle here.
 			expect(tracker.isDown()).toBe(true);
 			expect(releases).toBe(0);
 			// Cancelled/rejected native drops only emit dragend, not drop.

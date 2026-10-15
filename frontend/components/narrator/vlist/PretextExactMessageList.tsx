@@ -321,6 +321,7 @@ import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-l
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
+import { installVListTextDragGuard } from "./vlist-text-drag";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
 import {
@@ -3951,6 +3952,10 @@ export const PretextExactMessageList = memo(
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
+				// Before the pointer tracker. A text-selection dragstart is cancelled here,
+				// and the tracker must observe that cancellation instead of latching a
+				// native-drag slot that dragend will never clear.
+				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
 				const canMeasure = () => {
 					return (
@@ -4023,6 +4028,7 @@ export const PretextExactMessageList = memo(
 				observer?.observe(node);
 				return () => {
 					observer?.disconnect();
+					stopTextDrag();
 					pointerTracker.dispose();
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
