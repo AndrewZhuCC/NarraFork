@@ -253,6 +253,14 @@ export function extractAnthropicUsage(usage: {
 }
 
 /**
+ * OpenAI 系接口的 prompt/input token 已含缓存部分，扣掉缓存才是内部口径的「纯输入」。
+ * 少数上游已自行扣减过，此时总量不会大于缓存，保持原值避免出现负数。
+ */
+export function excludeCachedFromOpenAIInput(promptTokens: number, cachedTokens: number): number {
+	return promptTokens > cachedTokens ? promptTokens - cachedTokens : promptTokens;
+}
+
+/**
  * 从 OpenAI usage 对象提取 token 数据
  */
 export function extractOpenAIUsage(usage: {
@@ -265,10 +273,12 @@ export function extractOpenAIUsage(usage: {
 		reasoning_tokens?: number;
 	};
 }): UsageData {
+	const promptTokens = usage.prompt_tokens ?? 0;
+	const cachedTokens = usage.prompt_tokens_details?.cached_tokens || 0;
 	return {
-		inputTokens: usage.prompt_tokens ?? 0,
+		inputTokens: excludeCachedFromOpenAIInput(promptTokens, cachedTokens),
 		outputTokens: usage.completion_tokens ?? 0,
-		cachedInputTokens: usage.prompt_tokens_details?.cached_tokens || 0,
+		cachedInputTokens: cachedTokens,
 		reasoningTokens: usage.completion_tokens_details?.reasoning_tokens || 0,
 	};
 }

@@ -274,4 +274,38 @@ export async function applySqliteDataBackfills(
 	} catch (err) {
 		logger.warn("Knowledge base seed failed (non-fatal)", { error: String(err) });
 	}
+
+	// Usage normalization: OpenAI-compatible APIs report prompt_tokens INCLUDING the cached
+	// read, while the internal counter convention defines input_tokens as the uncached part.
+	// Records written before the adapters normalized this carry the inflated value and skew
+	// usage totals and cache-hit rate, so repair them once here.
+	//
+	// Why these three predicates identify a pre-fix row: cache_creation is an Anthropic-only
+	// counter, so an OpenAI-protocol row never has one. Anthropic's input_tokens already
+	// excludes cache reads, so its rows only match when a pure cache-hit request also added
+	// more new content than it read — rare, and a mis-hit there would only understate one
+	// historical input count.
+	//
+	// Idempotent: after subtracting, input_tokens no longer exceeds cached_input_tokens, so a
+	// re-run matches nothing. Non-fatal by the same rule as every other block in this module.
+	try {
+		const normalized = sqlite
+			.prepare(
+				`UPDATE api_requests
+				 SET input_tokens = input_tokens - cached_input_tokens
+				 WHERE cached_input_tokens > 0
+				   AND input_tokens > cached_input_tokens
+				   AND cache_creation_input_tokens = 0`,
+			)
+			.run();
+		if (normalized.changes > 0) {
+			logger.info("Normalized cached input tokens out of api_requests.input_tokens", {
+				count: normalized.changes,
+			});
+		}
+	} catch (err) {
+		logger.warn("api_requests input token normalization failed (non-fatal)", {
+			error: String(err),
+		});
+	}
 }
