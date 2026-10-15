@@ -1276,6 +1276,15 @@
 	"contextStaleHint": "Context usage shown is inaccurate after compacting/clearing/deleting messages. The accurate value will be available after the next request to the server.",
 	"estimated": "estimated",
 	"quotaBalance": "API balance: {{balance}}",
+	"deepseek": {
+		"loading": "Loading DeepSeek balance",
+		"unavailable": "DeepSeek balance unavailable",
+		"available": "Account available",
+		"accountUnavailable": "Account unavailable",
+		"total": "Total balance: {{currency}} {{amount}}",
+		"granted": "Granted balance: {{currency}} {{amount}}",
+		"toppedUp": "Topped-up balance: {{currency}} {{amount}}"
+	},
 	"kimi": {
 		"fiveHourShort": "5h {{percent}}%",
 		"fiveHourRatio": "5h {{used}}/{{limit}}",
