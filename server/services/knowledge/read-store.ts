@@ -33,7 +33,7 @@
  * silently widen a narrow one.
  */
 
-import type { KnowledgeCollectionRow } from "./write-store";
+import type { KnowledgeCollectionRow, KnowledgeDraftRow } from "./write-store";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Row shapes (plain data, field-identical across backends)
@@ -234,6 +234,15 @@ export type LinkListDirection = "out" | "in" | "both";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface KnowledgeReadStore {
+	getPersonalEntryById(id: string): Promise<KnowledgeDraftRow | null>;
+	listPersonalEntries(opts: {
+		userId: string;
+		status?: "active" | "archived";
+		limit: number;
+	}): Promise<(Omit<KnowledgeDraftRow, "content"> & { contentLength: number })[]>;
+	getEntryRevisionPointers(
+		ids: string[],
+	): Promise<{ id: string; currentRevisionId: string | null }[]>;
 	// ── entries ──
 	/** Full row by id, or null. The caller decides whether the content blob is needed. */
 	getEntryById(entryId: string): Promise<KnowledgeEntryRow | null>;
@@ -367,6 +376,22 @@ export interface KnowledgeReadStore {
 	}): Promise<AclEventReadRow[]>;
 
 	// ── passive keyword injection ──
+	listPersonalKeywordInjectionCandidates(opts: {
+		userId: string;
+		collectionId?: string;
+		projectId?: string;
+		limit: number;
+	}): Promise<KeywordInjectionCandidateRow[]>;
+	personalKeywordInjectionSignature(opts: {
+		userId: string;
+		collectionId?: string;
+		projectId?: string;
+	}): Promise<string>;
+	personalInjectionSnippets(
+		userId: string,
+		ids: string[],
+		maxChars: number,
+	): Promise<{ id: string; snippet: string | null }[]>;
 	/**
 	 * Active entries that carry keywords: the injection candidate scan. Metadata and
 	 * keyword JSON only — never the body — ordered newest-updated first and bounded

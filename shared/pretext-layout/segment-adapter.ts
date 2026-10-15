@@ -2982,7 +2982,7 @@ function adaptSpokenInjection(
 		// and key correctness, and relaxing the policy later would silently break it.
 		return substantive.map(({ hit, excerpt }) => ({
 			kind: "injection-bubble" as const,
-			key: `${idBase}-b${blockIndex}-k-${hit.entryId}`,
+			key: `${idBase}-b${blockIndex}-k-${hit.scope === "personal" ? "personal-" : ""}${hit.entryId}`,
 			data: {
 				...deliveryProjection(msg),
 				// PLAIN text, escaped rather than parsed: the excerpt is prose by
@@ -2996,11 +2996,14 @@ function adaptSpokenInjection(
 				speakerKind: null,
 				// The excerpt is a FLATTENED slice of the entry, so "read the rest" is the
 				// natural next action — this is the one bubble kind whose body is knowingly
-				// incomplete. Injected hits come from the global collections (see
-				// `knowledge-injection.ts`, which ACL-filters `knowledgeService` entries), so
-				// the scope is global rather than a guess.
+				// incomplete. Preserve personal identity; legacy rows without a scope
+				// came from global collections.
 				target: hit.entryId
-					? ({ kind: "knowledge", entryId: hit.entryId, scope: "global" } satisfies InjectionTarget)
+					? ({
+							kind: "knowledge",
+							entryId: hit.entryId,
+							scope: hit.scope ?? "global",
+						} satisfies InjectionTarget)
 					: null,
 				// Without this the row had no context-menu inspector at all.
 				modelFacing: modelFacingText,

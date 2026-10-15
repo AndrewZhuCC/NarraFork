@@ -46,6 +46,7 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -175,6 +176,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
 import { usageSourceFor } from "./model/custom-api-usage-source";
+import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -768,6 +770,30 @@ function NarratorPanelBody({
 		firstScreenActivity,
 	);
 
+	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
+	// generation so a balance fetched for a replaced account is never shown.
+	const currentDeepSeekProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const deepseekGeneration = currentDeepSeekProviderId
+		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
+		: undefined;
+	const deepseekBalancesQuery = useDeepSeekBalance(
+		currentDeepSeekProviderId,
+		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
+
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
 	const activeTerminalCount = useMemo(
@@ -1113,6 +1139,12 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
+		if (cfg.id === currentDeepSeekProviderId) {
+			return {
+				providerId: cfg.id,
+				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
+			};
+		}
 		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
 		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
 		// Go one would otherwise fall through to the previous account's Kimi allowance.
@@ -1162,6 +1194,9 @@ function NarratorPanelBody({
 		currentKimiProviderId,
 		currentOpencodeProviderId,
 		opencodeUsageQuery.data,
+		currentDeepSeekProviderId,
+		deepseekBalancesQuery.data,
+		deepseekBalancesQuery.isError,
 		t,
 	]);
 

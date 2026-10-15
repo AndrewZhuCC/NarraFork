@@ -30,6 +30,11 @@ import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
 } from "../lib/custom-api-quota-cache";
+import {
+	getDeepSeekBalanceGenerations,
+	refreshAllDeepSeekBalances,
+	syncDeepSeekBalanceCache,
+} from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import {
@@ -885,6 +890,7 @@ async function buildSettingsResponse(
 		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
+		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1679,6 +1685,11 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
+		}
+		// Invalidate account/transport identities immediately after a successful save.
+		syncDeepSeekBalanceCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllDeepSeekBalances().catch(() => {});
 		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider

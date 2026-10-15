@@ -256,7 +256,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 |---|---|---|
 | `subagent_message` / `team_message` | `narrator`（+ 消息） | `message.fromId` / `SideCarInboundMessage.fromMessageId` |
 | `bg_agent`（`flavor === "agent"`） | `narrator`（+ 消息） | `task.id`（后台代理的任务 id **就是**其叙述者 id）/ `SideCarDoneTask.resultMessageId` |
-| `knowledge_base_hint` | `knowledge` | `hit.entryId`，scope 恒为 global（注入命中来自全局集合） |
+| `knowledge_base_hint` | `knowledge` | `hit.entryId` + `hit.scope`（global / personal；旧消息缺省 global）。personal 命中来自当前用户未发布的个人条目 |
 | `spec_update`（**仅单文件**） | `spec` | `item.uri` |
 | `review_feedback` | `chapter` | `block.reviewChapterId`（producer 早已写入） |
 | `merge_summary` | `chapter` | `block.sourceChapterId`（producer 早已写入） |

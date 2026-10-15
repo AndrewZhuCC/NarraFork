@@ -53,6 +53,21 @@ export interface OpencodeUsageCache {
 	hasError?: boolean;
 }
 
+/** Per-provider official DeepSeek balance; errors are redacted for non-admins. */
+export interface DeepSeekBalanceCache {
+	generation: string;
+	isAvailable: boolean | null;
+	balanceInfos: Array<{
+		currency: string;
+		totalBalance: string;
+		grantedBalance: string;
+		toppedUpBalance: string;
+	}>;
+	fetchedAt: number;
+	error?: string | null;
+	hasError?: boolean;
+}
+
 /** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
 export interface KimiUsageWindow {
 	used: number | null;

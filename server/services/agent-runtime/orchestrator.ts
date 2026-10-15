@@ -94,7 +94,7 @@ import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { gitService } from "../git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
-import { knowledgeInjection } from "../knowledge-injection";
+import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -1773,7 +1773,7 @@ export async function runAgentLoopUnlocked(
 								source: "user_message",
 								hits,
 							});
-							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
+							for (const h of hits) knowledgeInjectedIds.add(injectionKey(h));
 							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
 						}
 					}

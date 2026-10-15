@@ -1412,6 +1412,14 @@ try {
 	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
 }
 
+try {
+	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
+	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
+	void refreshAllDeepSeekBalances().catch(() => {});
+} catch {
+	logger.warn("DeepSeek balance startup refresh failed");
+}
+
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });

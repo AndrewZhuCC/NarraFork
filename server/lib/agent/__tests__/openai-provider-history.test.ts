@@ -1275,6 +1275,280 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 	});
 });
 
+describe("Chat Completions reasoning_content replay", () => {
+	function completionsProvider(defaultModel = "deepseek-v4-pro"): OpenAIProvider {
+		return new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions", defaultModel });
+	}
+
+	test("pushAssistantTurn echoes reasoning text and backfills tool turns that have none", () => {
+		const provider = completionsProvider();
+		provider.noteActiveModel("deepseek-v4-pro");
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(
+			history,
+			"answer",
+			[],
+			[{ text: "thought one" }, { text: "thought two" }],
+		);
+		provider.pushAssistantTurn(history, "", [
+			{ toolUseId: "call_1", name: "Read", input: { file_path: "a.ts" } },
+		]);
+
+		expect(history[0]).toMatchObject({
+			role: "assistant",
+			content: "answer",
+			reasoning_content: "thought one\n\nthought two",
+		});
+		expect(history[1]).toMatchObject({
+			role: "assistant",
+			content: "",
+			reasoning_content: "",
+		});
+		expect(JSON.stringify(history[1])).toContain('"id":"call_1"');
+	});
+
+	test("ordered content is what the live loop replays as reasoning_content", () => {
+		const provider = completionsProvider();
+		provider.noteActiveModel("glm-5.1");
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(
+			history,
+			"flat text ignored",
+			[{ toolUseId: "ignored", name: "Read", input: {} }],
+			[{ text: "param reasoning ignored" }],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[
+				{ type: "reasoning", text: "ordered thought" },
+				{ type: "text", text: "ordered answer" },
+				{
+					type: "tool_use",
+					toolUseId: "call_ordered",
+					name: "Read",
+					input: { file_path: "a.ts" },
+				},
+			],
+		);
+		provider.pushAssistantTurn(
+			history,
+			"fallback",
+			[],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[{ type: "tool_use", toolUseId: "call_bare", name: "Bash", input: { command: "ls" } }],
+		);
+
+		expect(history[0]).toMatchObject({
+			content: "ordered answer",
+			reasoning_content: "ordered thought",
+		});
+		expect(JSON.stringify(history[0])).toContain('"id":"call_ordered"');
+		expect(JSON.stringify(history[0])).not.toContain("param reasoning ignored");
+		expect(history[1]).toMatchObject({ content: "", reasoning_content: "" });
+		expect(JSON.stringify(history[1])).toContain('"id":"call_bare"');
+	});
+
+	test("credential-strict completions models never receive reasoning_content", () => {
+		const provider = completionsProvider("gpt-5");
+		provider.noteActiveModel("gpt-5");
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(
+			history,
+			"",
+			[{ toolUseId: "call_strict", name: "Read", input: {} }],
+			[{ text: "hidden" }],
+		);
+
+		expect(history[0]).not.toHaveProperty("reasoning_content");
+		expect(JSON.stringify(history[0])).not.toContain("hidden");
+	});
+
+	test("buildHistory replays reasoning text and patches assistant turns that have none", async () => {
+		const provider = completionsProvider();
+		const result = await provider.buildHistory(
+			[
+				makeAssistantMessage({
+					id: "with-thought",
+					contentJson: [
+						{ type: "reasoning", text: "first" },
+						{ type: "reasoning", text: "second" },
+						{ type: "text", text: "visible" },
+					],
+					contentText: "visible",
+				}),
+				makeUserMessage({ id: "u1", contentText: "go" }),
+				makeAssistantMessage({
+					id: "tool-turn",
+					contentJson: [{ type: "text", text: "calling" }],
+					contentText: "calling",
+					toolCalls: [
+						{
+							toolUseId: "call_read",
+							toolName: "Read",
+							inputJson: { file_path: "a.ts" },
+							outputJson: "contents",
+							status: "success",
+						},
+					],
+				}),
+				makeUserMessage({ id: "u2", contentText: "current question" }),
+			],
+			"deepseek-v4-pro",
+		);
+
+		const assistants = (result.history as OAIMessage[]).filter((msg) => msg.role === "assistant");
+		expect(assistants).toHaveLength(2);
+		expect(assistants[0]).toMatchObject({
+			content: "visible",
+			reasoning_content: "first\n\nsecond",
+		});
+		expect(assistants[1]).toMatchObject({
+			content: "calling",
+			reasoning_content: "",
+		});
+		expect(JSON.stringify(assistants[1])).toContain('"id":"call_read"');
+		expect(JSON.stringify(result.history)).not.toContain("_reasoningBlocks");
+	});
+
+	test("buildHistory drops reasoning_content for credential-strict models", async () => {
+		const provider = completionsProvider("gpt-5");
+		const result = await provider.buildHistory(
+			[
+				makeAssistantMessage({
+					id: "with-thought",
+					contentJson: [
+						{ type: "reasoning", text: "hidden" },
+						{ type: "text", text: "visible" },
+					],
+					contentText: "visible",
+				}),
+				makeAssistantMessage({
+					id: "plain",
+					contentJson: [{ type: "text", text: "later" }],
+					contentText: "later",
+				}),
+				makeUserMessage({ id: "u", contentText: "current" }),
+			],
+			"openai:gpt-5",
+		);
+
+		const json = JSON.stringify(result.history);
+		expect(json).toContain("visible");
+		expect(json).toContain("later");
+		expect(json).not.toContain("reasoning_content");
+		expect(json).not.toContain("hidden");
+	});
+
+	test("tool continuation request passes reasoning_content back, including turns that omitted it", async () => {
+		const provider = completionsProvider();
+		const history: OAIMessage[] = [
+			{ role: "assistant", content: "older answer" },
+			{ role: "user", content: "read the file" },
+			{
+				role: "assistant",
+				content: "",
+				reasoning_content: "need the file",
+				tool_calls: [
+					{
+						id: "call_1",
+						type: "function",
+						function: { name: "Read", arguments: '{"file_path":"a.ts"}' },
+					},
+				],
+			},
+		];
+		const requests: Array<{ messages: OAIMessage[] }> = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input, init) => {
+			requests.push(JSON.parse(String(init?.body)) as { messages: OAIMessage[] });
+			return new Response(
+				'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+
+		try {
+			for await (const _event of provider.chat({
+				conversationId: "completions-reasoning",
+				content: "",
+				model: "openai:deepseek-v4-pro",
+				cwd: ".",
+				history,
+				tools: [],
+				toolResults: [{ tool_call_id: "call_1", content: "file body" }],
+				signal: new AbortController().signal,
+			})) {
+				/* consume */
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(requests).toHaveLength(1);
+		const messages = requests[0]?.messages ?? [];
+		expect(messages.find((msg) => msg.content === "older answer")?.reasoning_content).toBe("");
+		expect(messages.find((msg) => msg.tool_calls?.length)?.reasoning_content).toBe("need the file");
+		expect(messages.some((msg) => msg.role === "tool" && msg.content === "file body")).toBe(true);
+		// The placeholder must not replace reasoning the model already produced.
+		expect(JSON.stringify(messages).split("need the file").length - 1).toBe(1);
+	});
+
+	test("strict completions requests do not invent reasoning_content", async () => {
+		const provider = completionsProvider("gpt-5");
+		const history: OAIMessage[] = [
+			{
+				role: "assistant",
+				content: "",
+				tool_calls: [
+					{
+						id: "call_1",
+						type: "function",
+						function: { name: "Read", arguments: "{}" },
+					},
+				],
+			},
+		];
+		let body = "";
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input, init) => {
+			body = String(init?.body);
+			return new Response(
+				'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+
+		try {
+			for await (const _event of provider.chat({
+				conversationId: "completions-strict",
+				content: "",
+				model: "openai:gpt-5",
+				cwd: ".",
+				history,
+				tools: [],
+				toolResults: [{ tool_call_id: "call_1", content: "ok" }],
+				signal: new AbortController().signal,
+			})) {
+				/* consume */
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(body).not.toContain("reasoning_content");
+	});
+});
+
 describe("OpenAIProvider lightweight streaming generation", () => {
 	test.each([
 		["responses", "responses"],

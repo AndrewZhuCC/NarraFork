@@ -472,10 +472,20 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 121 tables and 1720 columns including token repair, Git identities and history revisions", () => {
+	test("covers 121 tables and 1721 columns including personal knowledge injection", () => {
 		expect(target.tables.length).toBe(121);
-		// 1717 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1720);
+		// 1718 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1721);
+		expect(
+			target.tables
+				.find((table) => table.name === "knowledge_injection_events")
+				?.columns.find((column) => column.property === "personalEntryId"),
+		).toMatchObject({
+			name: "personal_entry_id",
+			pgType: "text",
+			notNull: false,
+			references: { table: "knowledgeDrafts", column: "id", onDelete: "cascade" },
+		});
 		expect(target.tables.some((table) => table.name.startsWith("intelligent_ui_"))).toBe(false);
 		expect(
 			target.tables

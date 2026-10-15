@@ -472,6 +472,21 @@ export interface OAIMessage {
 	_reasoningTextFallback?: string;
 }
 
+/**
+ * Thinking-mode Chat Completions relays (DeepSeek, GLM, Kimi, MiniMax, QwQ, …)
+ * reject a follow-up when any assistant message omits `reasoning_content`.
+ * Captured text is copied in by the caller; this only fills the gap with an
+ * empty string, which is what those APIs accept for a turn that produced none.
+ * Credential-strict models must not call this — the official API rejects the field.
+ */
+function ensureCompletionsReasoningContent(messages: OAIMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role === "assistant" && msg.reasoning_content == null) {
+			msg.reasoning_content = "";
+		}
+	}
+}
+
 export interface OAIToolCall {
 	id: string;
 	type: "function";
@@ -720,14 +735,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (m._reasoningTextFallback !== undefined) {
 				delete m._reasoningTextFallback;
 			}
-			// Relay thinking models require reasoning_content on ALL assistant
-			// messages (not just those with tool_calls). When switching from a
-			// non-thinking model, historical messages lack this field — patch
-			// with empty string so the API doesn't reject the request.
-			if (!strict && m.role === "assistant" && m.reasoning_content == null) {
-				m.reasoning_content = "";
-			}
 		}
+		// Relay thinking models require reasoning_content on ALL assistant
+		// messages (not just those with tool_calls). When switching from a
+		// non-thinking model, historical messages lack this field — patch
+		// with empty string so the API doesn't reject the request.
+		if (!strict) ensureCompletionsReasoningContent(result.history);
 		return result;
 	}
 
@@ -901,6 +914,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		} else {
 			// Completions: POST /chat/completions
 			endpoint = `${baseUrl}/chat/completions`;
+			// Live tool loops replay pushAssistantTurn history instead of a fresh
+			// buildHistory. Thinking-mode relays reject that request unless every
+			// assistant message still carries reasoning_content.
+			if (!hasCredentialBoundReasoning(model)) {
+				ensureCompletionsReasoningContent(messages);
+			}
 			body = {
 				model,
 				messages,
@@ -1200,13 +1219,14 @@ export class OpenAIProvider implements ProviderAdapter {
 				}));
 			}
 			// Pass reasoning_content back for relay models that replay reasoning as
-			// plain text (DeepSeek, QwQ, GLM, Kimi…). Credential-strict models must
-			// not receive the field at all — the official API rejects it.
-			if (!this.isCredentialStrict() && reasoningBlocks?.length) {
-				const reasoningText = reasoningBlocks.map((b) => b.text).join("\n\n");
-				if (reasoningText) {
-					msg.reasoning_content = reasoningText;
-				}
+			// plain text (DeepSeek, QwQ, GLM, Kimi…). A tool-call turn that produced
+			// no reasoning text still needs the field — thinking mode 400s with
+			// "reasoning_content must be passed back" when it is absent. Credential-
+			// strict models must not receive the field at all.
+			if (!this.isCredentialStrict()) {
+				const reasoningText = reasoningBlocks?.map((b) => b.text).join("\n\n");
+				if (reasoningText) msg.reasoning_content = reasoningText;
+				ensureCompletionsReasoningContent([msg]);
 			}
 			h.push(msg);
 		}
@@ -3292,14 +3312,23 @@ function parseSSELine(
 	// emit `reasoning_content`, while OpenRouter-style layers emit only `reasoning`.
 	// Reading just one silently drops the other's thinking stream, so accept both;
 	// a non-empty `reasoning_content` wins when a relay happens to send both.
+	// Some relays put the full thinking text on the final `message` instead of
+	// streaming it through `delta`. Prefer a non-empty delta, then that snapshot,
+	// so the next request can pass the original reasoning_content back.
 	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
 	const deltaAny = delta as any;
-	const reasoning: unknown = deltaAny.reasoning_content || deltaAny.reasoning;
+	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
+	const messageAny = (choice as { message?: any }).message;
+	const reasoning: unknown =
+		deltaAny?.reasoning_content ||
+		deltaAny?.reasoning ||
+		messageAny?.reasoning_content ||
+		messageAny?.reasoning;
 	if (typeof reasoning === "string" && reasoning) results.push({ reasoning });
-	if (delta.content) results.push({ text: delta.content });
+	if (delta?.content) results.push({ text: delta.content });
 
 	// Tool call deltas — emit as toolUseChunk for early execution support
-	if (delta.tool_calls) {
+	if (delta?.tool_calls) {
 		for (const tc of delta.tool_calls) {
 			const idx = tc.index;
 
