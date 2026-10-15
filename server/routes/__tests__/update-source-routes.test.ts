@@ -176,6 +176,7 @@ describe("update source download boundary", () => {
 		{ ...sourceIdentity, platform: "linux-arm64" },
 		{
 			source: "update-server",
+			repository: "narrafork/narrafork",
 			serverUrl: "https://updates.example",
 			product: "other",
 			channel: "stable",

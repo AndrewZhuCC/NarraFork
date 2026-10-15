@@ -42,6 +42,25 @@ describe("update-server child environment", () => {
 		expect(environment).toEqual(before);
 	});
 
+	test("strips relay credentials and signing authority without changing GitHub authority", () => {
+		const environment = {
+			NF_MIRROR_TRANSPORT: "webdav",
+			NF_MIRROR_WEBDAV_URL: "https://private-relay.invalid/private",
+			NF_MIRROR_WEBDAV_USERNAME: "private-user",
+			nf_mirror_webdav_password: "private-pass",
+			NF_MIRROR_WEBDAV_TOKEN: "private-bearer",
+			Nf_Mirror_Relay_Signing_Key: "private-signing-key",
+			GH_TOKEN: "read-only-github-token",
+			HTTPS_PROXY: "https://proxy.invalid",
+		};
+		const filtered = updateServerChildEnvironment(environment);
+		expect(filtered).toEqual({
+			GH_TOKEN: environment.GH_TOKEN,
+			HTTPS_PROXY: environment.HTTPS_PROXY,
+		});
+		expect(environment.NF_MIRROR_WEBDAV_USERNAME).toBe("private-user");
+	});
+
 	test("returns independent mutable copies without altering the parent or another child", () => {
 		const environment = Object.freeze({
 			NF_UPDATE_TOKEN: "fake-upload-secret",

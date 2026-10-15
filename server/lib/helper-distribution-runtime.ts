@@ -27,14 +27,23 @@ export interface DistributionContext {
 	isTransportCurrent?(): boolean;
 }
 export function captureHelperSource(): HelperSource {
-	return normalizeHelperSource(settings.update ?? {});
+	return normalizeHelperSource({
+		source: "github",
+		githubRepository: settings.update?.githubRepository,
+	});
 }
 export function createDistributionContext(
-	source = captureHelperSource(),
+	source: HelperSource & { repository?: string } = captureHelperSource(),
 	fetcher?: DistributionFetch,
 	transport: UpdateFetchContext = createUpdateFetchContext(),
 ): DistributionContext {
-	const frozen = Object.freeze(normalizeHelperSource(source));
+	// Metadata delivery selection must never route auxiliary executable downloads to unsigned tools.
+	const frozen = Object.freeze(
+		normalizeHelperSource({
+			source: "github",
+			repository: source.repository ?? settings.update?.githubRepository,
+		}),
+	);
 	const identity = helperSourceIdentity(frozen);
 	return {
 		source: frozen,
@@ -57,9 +66,9 @@ export function distributionAssetUrl(source: HelperSource, tag: string, name: st
 		!/^[A-Za-z0-9._-]+$/.test(tag)
 	)
 		throw new Error("Invalid distribution asset");
-	return source.source === "github"
-		? `https://github.com/${source.repository}/releases/download/${tag}/${name}`
-		: `${source.serverUrl}/api/v2/tools/${name}`;
+	if (source.source !== "github")
+		throw new Error("Auxiliary binaries require a configured GitHub repository");
+	return `https://github.com/${source.repository}/releases/download/${tag}/${name}`;
 }
 export function withDeadline(
 	parent: AbortSignal | undefined,

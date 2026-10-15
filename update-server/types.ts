@@ -29,12 +29,28 @@ export interface TokenRecord {
 	createdAt: string;
 }
 
+/** Optional pull delivery; credentials stay in operator-selected environment variables. */
+export interface MirrorRelayConfig {
+	enabled: boolean;
+	url?: string;
+	feed?: string;
+	usernameEnv?: string;
+	passwordEnv?: string;
+	bearerTokenEnv?: string;
+	signingKeyEnv?: string;
+	pollIntervalSeconds?: number;
+}
+
 /** Server configuration persisted to config.json */
 export interface ServerConfig {
 	port: number;
 	host: string;
 	dataDir: string;
 	tokens: TokenRecord[];
+	/** Operator-established authority; never learned from uploads or responses. */
+	mirrorRepositories?: Record<string, string>;
+	mirrorLimits?: { quotaBytes?: number; minFreeBytes?: number; uploadTimeoutMs?: number };
+	mirrorRelay?: MirrorRelayConfig;
 	storage: {
 		type: "local";
 	};

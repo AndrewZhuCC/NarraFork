@@ -6,5 +6,10 @@ import { Hono } from "hono";
 export const healthRoutes = new Hono();
 
 healthRoutes.get("/", (c) => {
-	return c.json({ status: "ok", timestamp: new Date().toISOString() });
+	return c.json({
+		status: "ok",
+		timestamp: new Date().toISOString(),
+		mirrorProtocol: 1,
+		capabilities: ["canonical-index", "streaming-patch-mirror", "metadata-only-tools"],
+	});
 });

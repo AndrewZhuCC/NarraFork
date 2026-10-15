@@ -93,18 +93,21 @@ async function put(
 	});
 }
 
-test("tool upload stores the artifact and serves it back byte-identically", async () => {
+test("deprecated tool upload leaves historical artifact byte-identical and readable", async () => {
 	await withApp(async ({ app, storage, uploadToken }) => {
 		const payload = new Uint8Array(Buffer.from("executor-binary-bytes".repeat(32)));
-		const upload = await put(app, "narrafork-executor-1.2.3-linux-amd64", uploadToken, payload);
-		expect(upload.status).toBe(200);
-		const result = (await upload.json()) as { success: boolean; size: number; sha512: string };
-		expect(result.success).toBe(true);
-		expect(result.size).toBe(payload.byteLength);
-		expect(result.sha512).toBe(
-			new Bun.CryptoHasher("sha512").update(Buffer.from(payload)).digest("base64"),
+		await storage.saveFile("tools/narrafork-executor-1.2.3-linux-amd64", Buffer.from(payload));
+		const upload = await put(
+			app,
+			"narrafork-executor-1.2.3-linux-amd64",
+			uploadToken,
+			new Uint8Array([9]),
 		);
-		expect(storage.files.has("tools/narrafork-executor-1.2.3-linux-amd64")).toBe(true);
+		expect(upload.status).toBe(410);
+		expect((await upload.json()).error).toContain("deprecated");
+		expect(storage.files.get("tools/narrafork-executor-1.2.3-linux-amd64")).toEqual(
+			Buffer.from(payload),
+		);
 
 		const download = await app.request("/api/v2/tools/narrafork-executor-1.2.3-linux-amd64");
 		expect(download.status).toBe(200);
@@ -127,10 +130,11 @@ test("tool upload requires an authenticated upload-capable token", async () => {
 test("tool upload rejects empty bodies without clobbering a published artifact", async () => {
 	await withApp(async ({ app, storage, uploadToken }) => {
 		const original = new Uint8Array(Buffer.from("original-artifact"));
-		expect((await put(app, "keeper", uploadToken, original)).status).toBe(200);
+		await storage.saveFile("tools/keeper", Buffer.from(original));
+		expect((await put(app, "keeper", uploadToken, original)).status).toBe(410);
 
 		const empty = await put(app, "keeper", uploadToken, new Uint8Array(0));
-		expect(empty.status).toBe(400);
+		expect(empty.status).toBe(410);
 		expect(new Uint8Array(storage.files.get("tools/keeper") as Buffer)).toEqual(original);
 	});
 });

@@ -146,7 +146,6 @@ describe("CI component read transport", () => {
 describe("published recovery component mode forwarding", () => {
 	test.each([
 		"index",
-		"mirror",
 		"publish",
 	] as const)("%s CLI forwards the correct readiness mode at every publication recheck", async (command) => {
 		const original = { tag: "v0.9.0", version: "0.9.0", runId: 45, runAttempt: 2 };
@@ -160,6 +159,8 @@ describe("published recovery component mode forwarding", () => {
 					? ["index", "--plan=plan.json", "--publish=true"]
 					: [command, "--tag=v0.9.0", "--source-run-id=45", "--bundle-dir=bundle"],
 			parseCiReleaseArgs,
+			timeReleasePhase: (_phase: string, _details: unknown, operation: () => unknown) =>
+				operation(),
 			AbortController,
 			process: {
 				cwd: () => root,
@@ -167,8 +168,8 @@ describe("published recovery component mode forwarding", () => {
 				once: () => {},
 				removeListener: () => {},
 			},
-			ciBridgeDeadlineSignal: (_env: unknown, signal: AbortSignal) => signal,
-			createBridgeGhRunner: () => async () => "",
+			ciPublicationDeadlineSignal: (_env: unknown, signal: AbortSignal) => signal,
+			createPublicationGhRunner: () => async () => "",
 			createCiReleaseGhRunner: () => async () => "",
 			runGh: async () => "",
 			required: (values: Record<string, string>, name: string) => values[name],
@@ -200,7 +201,6 @@ describe("published recovery component mode forwarding", () => {
 	});
 	test.each([
 		"index",
-		"mirror",
 	] as const)("%s-only preflight forwards recovery mode without changing publication authorization", async (mode) => {
 		let seen: { indexOnly?: boolean; mirrorOnly?: boolean; publish: boolean } | undefined;
 		const stop = new Error("verified preflight mode");
@@ -208,6 +208,8 @@ describe("published recovery component mode forwarding", () => {
 			runInNewContext(`(${runCiRelease.toString()})(argv)`, {
 				argv: ["preflight", "--tag=v0.9.0", "--publish=true", `--${mode}-only=true`],
 				parseCiReleaseArgs,
+				timeReleasePhase: (_phase: string, _details: unknown, operation: () => unknown) =>
+					operation(),
 				AbortController,
 				process: { cwd: () => root, env: {}, once: () => {}, removeListener: () => {} },
 				runGh: async () => "",
@@ -223,7 +225,7 @@ describe("published recovery component mode forwarding", () => {
 		).rejects.toBe(stop);
 		expect(seen?.publish).toBe(true);
 		expect(seen?.indexOnly).toBe(mode === "index");
-		expect(seen?.mirrorOnly).toBe(mode === "mirror");
+		expect(seen?.mirrorOnly).toBeUndefined();
 	});
 });
 
@@ -237,6 +239,8 @@ describe("release workflow safety", () => {
 			"scripts/lib/build-repository.ts",
 			"scripts/lib/update-index.ts",
 			"scripts/lib/update-index-github.ts",
+			"scripts/lib/ci-publication-runtime.ts",
+			"scripts/lib/publication-receipt.ts",
 			...new Bun.Glob("scripts/lib/ci-{release,build}-*.ts").scanSync({ cwd: root }),
 		];
 		const result = spawnSync("git", ["check-ignore", "--no-index", "--", ...paths], {
@@ -257,12 +261,9 @@ describe("release workflow safety", () => {
 			default: false,
 		});
 		expect(Object.keys(release.on.workflow_dispatch?.inputs ?? {}).sort()).toEqual([
-			"bridge_run_attempt",
-			"bridge_run_id",
 			"build_run_attempt",
 			"build_run_id",
 			"index_only",
-			"mirror_only",
 			"publish",
 			"smoke_target",
 			"source_run_id",
@@ -539,9 +540,6 @@ describe("original build native re-verification", () => {
 			{ "build-run-id": "9007199254740992" },
 			{ "source-run-id": "34" },
 			{ "index-only": "true" },
-			{ "mirror-only": "true" },
-			{ "bridge-run-id": "34" },
-			{ "bridge-run-attempt": "1" },
 			{ publish: "true" },
 			{ "smoke-target": "windows-x86" },
 		];

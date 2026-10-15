@@ -36,8 +36,9 @@ export function updateSettingsKey(update?: UpdateSourceSettings): string {
 	return JSON.stringify([
 		source,
 		update?.channel ?? "stable",
+		(update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY).trim().toLowerCase(),
 		...(source === "github"
-			? [(update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY).trim().toLowerCase()]
+			? []
 			: [normalizeServerUrl(update?.serverUrl), update?.product ?? "narrafork"]),
 	]);
 }
@@ -68,8 +69,8 @@ export function sameUpdateSource(
 	const source = previous.source ?? "update-server";
 	return (
 		source === (next.source ?? "update-server") &&
-		(source !== "github" ||
-			previous.repository?.trim().toLowerCase() === next.repository?.trim().toLowerCase())
+		!!previous.repository &&
+		previous.repository.trim().toLowerCase() === next.repository?.trim().toLowerCase()
 	);
 }
 
@@ -91,6 +92,8 @@ export function updateCheckErrorKey(code?: string): string {
 			return "updateCheckAssetMissing";
 		case "INVALID_CONFIGURATION":
 			return "updateCheckInvalidConfiguration";
+		case "CANONICAL_MIRROR_REQUIRED":
+			return "updateCheckMirrorRequired";
 		case "INVALID_METADATA":
 			return "updateCheckInvalidMetadata";
 		case "NETWORK_ERROR":

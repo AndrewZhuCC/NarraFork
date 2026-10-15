@@ -165,6 +165,7 @@ describe("verified prepared update identity", () => {
 		{ ...source, platform: "darwin-arm64" },
 		{
 			source: "update-server" as const,
+			repository: "fixture/original",
 			serverUrl: "https://updates.fixture.example",
 			product: "narrafork",
 			channel: "stable" as const,
@@ -222,6 +223,25 @@ describe("verified prepared update identity", () => {
 		};
 		expect(await preparedIdentity()).toEqual(before);
 		expect(JSON.parse(readFileSync(metadataPath, "utf8")).sourceIdentity).toBeUndefined();
+	});
+
+	test("historical mirror prepared record without repository stays unknown and never adopts configured authority", async () => {
+		const info = writePrepared();
+		const legacy = {
+			source: "update-server",
+			serverUrl: "https://historical.example",
+			product: "narrafork",
+			channel: "stable",
+			platform: "linux-x64",
+		};
+		writeFileSync(metadataPath, JSON.stringify({ ...info, sourceIdentity: legacy }));
+		const before = await preparedIdentity();
+		expect(before.sourceIdentity).toBeNull();
+		if (!settings.update) throw new Error("Missing settings");
+		settings.update.githubRepository = "another/repo";
+		expect(await preparedIdentity()).toEqual(before);
+		expect(JSON.parse(readFileSync(metadataPath, "utf8")).sourceIdentity).toEqual(legacy);
+		expect(existsSync(info.updatePath)).toBe(true);
 	});
 
 	test("corrupt bytes never yield a ready identity", async () => {

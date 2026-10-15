@@ -13,6 +13,13 @@ const DEFAULT_CONFIG: ServerConfig = {
 	host: "localhost",
 	dataDir: "./data",
 	tokens: [],
+	mirrorRepositories: {},
+	mirrorRelay: { enabled: false },
+	mirrorLimits: {
+		quotaBytes: 8 * 1024 * 1024 * 1024,
+		minFreeBytes: 256 * 1024 * 1024,
+		// Delivery-specific defaults live in ingestAsset; an explicit timeout here is an operator cap.
+	},
 	storage: { type: "local" },
 	cors: { enabled: true, origins: ["*"] },
 };

@@ -202,10 +202,7 @@ describe("CI release plan trust boundary", () => {
 		expect(plan.componentEvidence).toEqual(componentEvidence);
 		expect(calls).toEqual(["read", "collect"]);
 	});
-	test.each([
-		"index",
-		"mirror",
-	] as const)("%s recovery preflight skips unavailable components but still requires protected publication", async (mode) => {
+	test("index recovery preflight skips unavailable components but still requires protected publication", async () => {
 		const state = fixture();
 		state.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 } };
 		state.releases = [
@@ -226,8 +223,7 @@ describe("CI release plan trust boundary", () => {
 		const opts = {
 			...options(state),
 			publish: true,
-			indexOnly: mode === "index",
-			mirrorOnly: mode === "mirror",
+			indexOnly: true,
 			sourceRunId: 122,
 			componentChecks: { readDependencies: unavailable, collectEvidence: unavailable },
 		};
@@ -235,9 +231,9 @@ describe("CI release plan trust boundary", () => {
 		expect(plan.componentEvidence).toBeUndefined();
 		expect(componentCalls).toBe(0);
 		expect(state.calls.some((call) => call[1].endsWith("environments/release"))).toBe(true);
-		await expect(
-			createCiReleasePlan({ ...opts, indexOnly: false, mirrorOnly: false }),
-		).rejects.toThrow("helpers/executor unavailable");
+		await expect(createCiReleasePlan({ ...opts, indexOnly: false })).rejects.toThrow(
+			"helpers/executor unavailable",
+		);
 		expect(componentCalls).toBe(1);
 		state.environment.protection_rules = [];
 		await expect(createCiReleasePlan(opts)).rejects.toThrow("required reviewers");

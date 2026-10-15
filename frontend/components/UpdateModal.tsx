@@ -552,7 +552,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							{preparedSource?.source === "github"
 								? t("updateSourceGithub", { repository: preparedSource.repository })
 								: preparedSource?.source === "update-server"
-									? `${t("updateSourceServer")}: ${preparedSource.serverUrl} / ${preparedSource.product}`
+									? `${t("updateSourceServer")}: ${preparedSource.repository} · ${preparedSource.serverUrl} / ${preparedSource.product}`
 									: t("updatePreparedUnknownSource")}
 							{preparedSource && ` · ${preparedSource.channel} · ${preparedSource.platform}`}
 						</Text>
@@ -575,7 +575,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						<Badge variant="light">
 							{releaseInfo.source === "github"
 								? t("updateSourceGithub", { repository: releaseInfo.repository })
-								: t("updateSourceServer")}
+								: `${t("updateSourceServer")}: ${releaseInfo.repository}`}
 						</Badge>
 						<Badge variant="outline">
 							{t(
@@ -665,7 +665,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					</div>
 				)}
 
-				{progress?.fallback && releaseInfo?.source === "github" && (
+				{progress?.fallback && releaseInfo && (
 					<Alert color="yellow" variant="light">
 						{t("updateDeltaFallback")}
 					</Alert>

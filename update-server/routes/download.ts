@@ -4,6 +4,7 @@
  * Supports HTTP Range requests (RFC 7233).
  */
 import { Hono } from "hono";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import type { StorageBackend } from "../storage/types";
 
 const PATCH_BASE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9._-]+)?$/;
@@ -22,6 +23,14 @@ export function createDownloadRoutes(storage: StorageBackend) {
 	// GET /api/v2/products/:product/releases/:version/download/:filename
 	routes.get("/:product/releases/:version/download/:filename", async (c) => {
 		const { product, version, filename } = c.req.param();
+		if (
+			!/^[A-Za-z0-9_-]{1,64}$/.test(product) ||
+			!isValidReleaseVersion(version) ||
+			filename.length > 512 ||
+			!/^[A-Za-z0-9._+-]+$/.test(filename) ||
+			filename.includes("..")
+		)
+			return c.json({ error: "Invalid release download identity" }, 400);
 		const platform = detectPlatformFromFilename(filename);
 		if (!platform) {
 			return c.json({ error: "Cannot determine platform from filename" }, 400);
@@ -34,6 +43,14 @@ export function createDownloadRoutes(storage: StorageBackend) {
 	// GET /api/v2/products/:product/releases/:version/zstd-patch/:filename
 	routes.get("/:product/releases/:version/zstd-patch/:filename", async (c) => {
 		const { product, version, filename } = c.req.param();
+		if (
+			!/^[A-Za-z0-9_-]{1,64}$/.test(product) ||
+			!isValidReleaseVersion(version) ||
+			filename.length > 512 ||
+			!/^[A-Za-z0-9._+-]+$/.test(filename) ||
+			filename.includes("..")
+		)
+			return c.json({ error: "Invalid release download identity" }, 400);
 		const platform = detectPlatformFromFilename(filename);
 		if (!platform) {
 			return c.json({ error: "Cannot determine platform from filename" }, 400);
@@ -51,6 +68,14 @@ export function createDownloadRoutes(storage: StorageBackend) {
 	// GET /api/v2/products/:product/releases/:version/zstd-patch-meta/:filename
 	routes.get("/:product/releases/:version/zstd-patch-meta/:filename", async (c) => {
 		const { product, version, filename } = c.req.param();
+		if (
+			!/^[A-Za-z0-9_-]{1,64}$/.test(product) ||
+			!isValidReleaseVersion(version) ||
+			filename.length > 512 ||
+			!/^[A-Za-z0-9._+-]+$/.test(filename) ||
+			filename.includes("..")
+		)
+			return c.json({ error: "Invalid release download identity" }, 400);
 		const platform = detectPlatformFromFilename(filename);
 		if (!platform) {
 			return c.json({ error: "Cannot determine platform from filename" }, 400);
