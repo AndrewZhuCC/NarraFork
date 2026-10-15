@@ -1404,6 +1404,15 @@ try {
 }
 
 try {
+	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
+	// restart re-reads it rather than trusting numbers from the previous process.
+	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
+	void refreshAllOpencodeUsages().catch(() => {});
+} catch (err) {
+	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
+}
+
+try {
 	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
 	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
 	void refreshAllDeepSeekBalances().catch(() => {});

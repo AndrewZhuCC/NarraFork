@@ -73,6 +73,7 @@ import {
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
+import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -174,6 +175,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { usageSourceFor } from "./model/custom-api-usage-source";
 import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
 	formatKimiBarText,
@@ -181,6 +183,11 @@ import {
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import {
+	formatOpencodeBarText,
+	formatOpencodeDetailsText,
+	isOpencodeProviderBaseUrl,
+} from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -738,6 +745,33 @@ function NarratorPanelBody({
 		refetchInterval: 60_000,
 	});
 
+	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
+	// generation token so an allowance fetched for a replaced account is never shown.
+	// The current window lives in the status bar; weekly/monthly are in the popover.
+	const currentOpencodeProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const opencodeGeneration = currentOpencodeProviderId
+		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
+		: undefined;
+	const opencodeUsageQuery = useOpencodeUsage(
+		currentOpencodeProviderId,
+		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
+	// generation so a balance fetched for a replaced account is never shown.
 	const currentDeepSeekProviderId = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
 		if (!prefix) return null;
@@ -1111,14 +1145,34 @@ function NarratorPanelBody({
 				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
 			};
 		}
+		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
+		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
+		// Go one would otherwise fall through to the previous account's Kimi allowance.
+		const usageSource = usageSourceFor({
+			providerId: cfg.id,
+			opencodeProviderId: currentOpencodeProviderId,
+			kimiProviderId: currentKimiProviderId,
+		});
+		if (usageSource === "opencode") {
+			const usage = opencodeUsageQuery.data;
+			if (usage) {
+				const quotaBalance = formatOpencodeBarText(usage, t);
+				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
+			}
+		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
-		const kimiUsage = kimiUsagesData?.[cfg.id];
-		if (kimiUsage) {
-			const quotaBalance = formatKimiBarText(kimiUsage, t);
-			const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-			if (quotaBalance || detailedQuotaBalance) {
-				return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+		if (usageSource === "kimi") {
+			const kimiUsage = kimiUsagesData?.[cfg.id];
+			if (kimiUsage) {
+				const quotaBalance = formatKimiBarText(kimiUsage, t);
+				const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
 			}
 		}
 		const quotas = settingsData?.customApiQuotas as
@@ -1137,6 +1191,9 @@ function NarratorPanelBody({
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
 		kimiUsagesData,
+		currentKimiProviderId,
+		currentOpencodeProviderId,
+		opencodeUsageQuery.data,
 		currentDeepSeekProviderId,
 		deepseekBalancesQuery.data,
 		deepseekBalancesQuery.isError,

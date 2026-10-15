@@ -47,6 +47,11 @@ import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
+import {
+	getOpencodeUsageGenerations,
+	refreshAllOpencodeUsages,
+	syncOpencodeUsageCache,
+} from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
@@ -939,6 +944,10 @@ async function buildSettingsResponse(
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
+		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
+		// them so an allowance fetched for a replaced account is never rendered
+		// under the new one.
+		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
@@ -1706,6 +1715,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// settings response.
 		if (validated.customApiProviders) {
 			void refreshAllKimiUsages().catch(() => {});
+		}
+
+		// Invalidate account/transport identities immediately after a successful
+		// save, then warm the new ones so a freshly added (or replaced) OpenCode Go
+		// provider shows its allowance without waiting for the next staleness window.
+		syncOpencodeUsageCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllOpencodeUsages().catch(() => {});
 		}
 
 		if (vnetChanged) {

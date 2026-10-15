@@ -1285,6 +1285,17 @@
 		"granted": "Granted balance: {{currency}} {{amount}}",
 		"toppedUp": "Topped-up balance: {{currency}} {{amount}}"
 	},
+	"opencode": {
+		"rollingShort": "5h {{percent}}%",
+		"unavailable": "OpenCode Go usage unavailable",
+		"window5h": "5-hour limit",
+		"windowWeekly": "Weekly limit",
+		"windowMonthly": "Monthly limit",
+		"windowLine": "{{label}}: {{percent}}% used",
+		"resetSuffix": ", resets at {{time}}",
+		"fetchError": "Usage fetch failed: {{error}}",
+		"fetchFailed": "Usage fetch failed (ask an administrator for details)"
+	},
 	"kimi": {
 		"fiveHourShort": "5h {{percent}}%",
 		"fiveHourRatio": "5h {{used}}/{{limit}}",

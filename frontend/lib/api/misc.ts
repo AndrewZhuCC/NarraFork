@@ -37,6 +37,7 @@ import type {
 	LearningIndexResponse,
 	LearningSearchResponse,
 	LicenseManifestResponse,
+	OpencodeUsageCache,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchResponse,
@@ -711,6 +712,14 @@ export const miscApi = {
 	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
 	kimiRefreshUsages: () =>
 		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
+
+	// OpenCode Go plan allowance — per-provider server-side cache
+	opencodeGetUsages: (options?: object) =>
+		request<Record<string, OpencodeUsageCache>>("/opencode/usages", pickRequestOptions(options)),
+	opencodeRefreshUsages: () =>
+		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
+			method: "POST",
+		}),
 	nugGetBillingConfig: (providerId: string) =>
 		request<{
 			enabled: boolean;

@@ -1284,6 +1284,17 @@
 		"granted": "赠送余额：{{currency}} {{amount}}",
 		"toppedUp": "充值余额：{{currency}} {{amount}}"
 	},
+	"opencode": {
+		"rollingShort": "5h {{percent}}%",
+		"unavailable": "OpenCode Go 用量不可用",
+		"window5h": "5 小时限制",
+		"windowWeekly": "周限制",
+		"windowMonthly": "月限制",
+		"windowLine": "{{label}}：已用 {{percent}}%",
+		"resetSuffix": "，{{time}} 重置",
+		"fetchError": "用量获取失败：{{error}}",
+		"fetchFailed": "用量获取失败（详情请联系管理员）"
+	},
 	"kimi": {
 		"fiveHourShort": "5h {{percent}}%",
 		"fiveHourRatio": "5h {{used}}/{{limit}}",
