@@ -133,7 +133,7 @@ function CommitPreviewContent({
 	const unknownStats = textFiles.some(
 		(file) => file.linesAdded === null || file.linesRemoved === null,
 	);
-	const hasBinary = data?.files.some((file) => file.binary);
+	const hasBinary = data?.files.some((file) => file.binary) ?? false;
 
 	return (
 		<Stack gap="md" className={classes.preview} data-commit-preview={mode}>
