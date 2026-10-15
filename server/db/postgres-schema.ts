@@ -11,6 +11,7 @@ import {
 	integer,
 	type PgColumn,
 	pgTable,
+	primaryKey,
 	text,
 	unique,
 	uniqueIndex,
@@ -56,6 +57,68 @@ export const permissionRuleRequests = pgTable(
 			table.createdAt,
 			table.id,
 		),
+	],
+);
+
+export const resourceProtectionPaths = pgTable(
+	"resource_protection_paths",
+	{
+		source: text("source").notNull(),
+		sourceId: text("source_id").notNull(),
+		slot: integer("slot").notNull(),
+		deviceId: text("device_id").notNull(),
+		canonicalPath: text("canonical_path"),
+		repositoryKey: text("repository_key"),
+		shadowKey: text("shadow_key"),
+		scopeProjectId: text("scope_project_id"),
+		aliasSensitive: integer("alias_sensitive").notNull().default(0),
+		claimJson: text("claim_json").notNull(),
+	},
+	(table) => [
+		index("idx_protection_path").on(
+			table.deviceId,
+			table.canonicalPath,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_repository").on(
+			table.deviceId,
+			table.repositoryKey,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_shadow").on(table.shadowKey, table.source, table.sourceId, table.slot),
+		index("idx_protection_scope").on(
+			table.scopeProjectId,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_alias").on(
+			table.aliasSensitive,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		primaryKey({ columns: [table.source, table.sourceId, table.slot] }),
+	],
+);
+
+export const resourceProtectionSources = pgTable(
+	"resource_protection_sources",
+	{
+		source: text("source").notNull(),
+		sourceId: text("source_id").notNull(),
+		revision: integer("revision").notNull().default(1),
+		dirty: integer("dirty").notNull().default(1),
+		cursor: text("cursor"),
+		complete: integer("complete").notNull().default(0),
+	},
+	(table) => [
+		index("idx_protection_dirty").on(table.dirty, table.source, table.sourceId),
+		primaryKey({ columns: [table.source, table.sourceId] }),
 	],
 );
 
@@ -3871,8 +3934,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 121,
-  "columnCount": 1726,
+  "tableCount": 123,
+  "columnCount": 1742,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -4097,6 +4160,260 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "resourceProtectionPaths",
+      "name": "resource_protection_paths",
+      "columns": [
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceId",
+          "name": "source_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "slot",
+          "name": "slot",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "canonicalPath",
+          "name": "canonical_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "repositoryKey",
+          "name": "repository_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "shadowKey",
+          "name": "shadow_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeProjectId",
+          "name": "scope_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "aliasSensitive",
+          "name": "alias_sensitive",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "claimJson",
+          "name": "claim_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_protection_path",
+          "columns": [
+            "deviceId",
+            "canonicalPath",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_repository",
+          "columns": [
+            "deviceId",
+            "repositoryKey",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_shadow",
+          "columns": [
+            "shadowKey",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_scope",
+          "columns": [
+            "scopeProjectId",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_alias",
+          "columns": [
+            "aliasSensitive",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "source",
+            "sourceId",
+            "slot"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "resourceProtectionSources",
+      "name": "resource_protection_sources",
+      "columns": [
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceId",
+          "name": "source_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "dirty",
+          "name": "dirty",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "cursor",
+          "name": "cursor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "complete",
+          "name": "complete",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_protection_dirty",
+          "columns": [
+            "dirty",
+            "source",
+            "sourceId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "source",
+            "sourceId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "narratorWorktreeResources",

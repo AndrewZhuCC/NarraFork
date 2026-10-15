@@ -1359,6 +1359,7 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -6797,6 +6798,17 @@ async function* agentLoopInMetadataSnapshot(
 					yield* abandonAttemptForReplay(REASONING_ONLY_MESSAGE);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// Keep the ordinary cleanup above, but do not retry or compact a model
+					// that has nothing to say while waiting for a background result / Send.
+					if (await config.shouldIdleOnReasoningOnly?.()) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield { type: "done", reason: "reasoning_only_idle" };
 						return;
 					}
 

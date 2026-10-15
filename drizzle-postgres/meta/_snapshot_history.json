@@ -155,11 +155,19 @@
 		},
 		{
 			"idx": 19,
-			"tag": "0019_history_token_repair_bulk",
-			"id": "fc3736b0-a4c7-4cb2-a728-0887056a0ecb",
+			"tag": "0019_resource_protection",
+			"id": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
 			"prevId": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
 			"version": "7",
-			"snapshotDigest": "1784f7a9b7a373da3eeea32c1de8c30207e2861d1f35de0cf64ebc079707cc47"
+			"snapshotDigest": "1c2b7c90348a965d5a92acb2a76160e89172db410126889d3b19fcc33df79510"
+		},
+		{
+			"idx": 20,
+			"tag": "0020_history_token_repair_bulk",
+			"id": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+			"prevId": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
+			"version": "7",
+			"snapshotDigest": "7cf8740acee4caea396d53dfaa786cb7d29552068ea4fd1674a5f34eac764ae6"
 		}
 	]
 }

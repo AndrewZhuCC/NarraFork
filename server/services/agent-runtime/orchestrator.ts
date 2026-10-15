@@ -82,7 +82,7 @@ import {
 	saveTextFileToWorktree,
 } from "../../lib/uploads";
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
-import { consumeAgentMessageHistory } from "../agent-message-delivery";
+import { consumeAgentMessageHistory, isLastModelInputMailbox } from "../agent-message-delivery";
 import {
 	claimInboxHead,
 	hasInboxKind,
@@ -91,6 +91,7 @@ import {
 } from "../agent-runtime/inbox";
 import type { ExecutionOwner } from "../agent-runtime/ownership";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { gitService } from "../git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
@@ -464,6 +465,7 @@ export async function runAgentLoopUnlocked(
 	}
 
 	const continueForSpec = async (cause: "spec" | "maxTurns", suppressed: boolean) => {
+		if (runState.lastPass?.reasoningOnlyIdle) return null;
 		if (profile.kind === "primary") return maybeStartContinuation(active, suppressed);
 		const spec = await readSubagentSpecContinuationState(narratorId);
 		const fresh = await narratorService.getById(narratorId);
@@ -1294,6 +1296,9 @@ export async function runAgentLoopUnlocked(
 
 			let toolCallLimitExceeded = false;
 			const passWorkspaceContext = active._workspaceContext;
+			let lastModelInputWasMailbox = false;
+			let adoptedInput: { history: unknown[]; content: string } | undefined;
+			let afterToolsInput: { history: unknown[]; content: string; mailbox: boolean } | undefined;
 			const config: import("../../lib/agent").AgentConfig = {
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
@@ -1516,6 +1521,12 @@ export async function runAgentLoopUnlocked(
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
+				shouldIdleOnReasoningOnly: async () => {
+					if (isSubagentNarrator) return lastModelInputWasMailbox;
+					const { activeWorkCount } =
+						await backgroundTaskService.countActiveKindsByParent(narratorId);
+					return activeWorkCount > 0;
+				},
 				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;
@@ -1527,6 +1538,11 @@ export async function runAgentLoopUnlocked(
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
 				onModelInputConsumed: (history, content, answerEventIds) => {
+					adoptedInput = { history, content };
+					lastModelInputWasMailbox =
+						afterToolsInput?.history === history && afterToolsInput.content === content
+							? afterToolsInput.mailbox
+							: isLastModelInputMailbox(history, content);
 					consumeAgentMessageHistory(history, content);
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
@@ -1535,8 +1551,23 @@ export async function runAgentLoopUnlocked(
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
 				},
-				getAfterToolsInjections: () =>
-					drainInjectionsIntoHistory(active, locale, subagentPlacement),
+				getAfterToolsInjections: async () => {
+					const input = await drainInjectionsIntoHistory(active, locale, subagentPlacement);
+					return {
+						...input,
+						onConsumed: () => {
+							input.onConsumed();
+							if (input.parts.length > 0) {
+								lastModelInputWasMailbox = input.lastInputWasMailbox;
+								// onConsumed runs only once, whereas the exact same request can
+								// be adopted again after a transient retry. Retain its provenance.
+								afterToolsInput = adoptedInput
+									? { ...adoptedInput, mailbox: input.lastInputWasMailbox }
+									: undefined;
+							}
+						},
+					};
+				},
 				deliverInjectionRow: async (injection) => {
 					const { messageId, turnText } = await deliverInjection(narratorId, {
 						subagent: subagentPlacement,
@@ -2005,7 +2036,7 @@ export async function runAgentLoopUnlocked(
 			// Track the latest pass's final text for the Stop hook (set on every pass,
 			// so the most recent assistant text / error message wins regardless of how
 			// the loop ultimately terminates).
-			if (result.finalText) {
+			if (result.finalText || result.reasoningOnlyIdle) {
 				runState.finalText = result.finalText;
 			}
 
@@ -3508,7 +3539,13 @@ export async function runAgentLoopUnlocked(
 	let finalText = runState.finalText;
 	if (runState.lastPass?.paymentRequired)
 		finalText = `Payment required: ${runState.lastPass.paymentRequired.message}`;
-	if (profile.kind === "subagent" && !finalText.trim() && !runState.hadError && !aborted) {
+	if (
+		profile.kind === "subagent" &&
+		!runState.lastPass?.reasoningOnlyIdle &&
+		!finalText.trim() &&
+		!runState.hadError &&
+		!aborted
+	) {
 		const latest = await narratorService.getLatestAssistantTextAndId(narratorId).catch(() => null);
 		if (latest?.text.trim()) finalText = latest.text;
 		else

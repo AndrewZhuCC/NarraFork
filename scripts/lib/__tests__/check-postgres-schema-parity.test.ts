@@ -122,6 +122,57 @@ describe("parity fixture baseline", () => {
 	});
 });
 
+describe("table primary key parity", () => {
+	const compositeFixture = () => {
+		const source = fixture();
+		source.tables[1].columns[0].primary = false;
+		source.tables[1].primaryKeys = [{ name: "posts_scope_pk", columns: ["authorEmail", "id"] }];
+		return source;
+	};
+
+	test("compares table-level PKs without requiring inline column primary flags", () => {
+		const source = compositeFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+	});
+
+	test.each([
+		"name",
+		"order",
+		"wrong column",
+		"missing key",
+		"extra key",
+	])("detects %s drift", (change) => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		const table = target.tables[1];
+		switch (change) {
+			case "name":
+				table.primaryKeys[0].name = "renamed_pk";
+				break;
+			case "order":
+				table.primaryKeys[0].columns.reverse();
+				break;
+			case "wrong column":
+				table.primaryKeys[0].columns = ["id"];
+				break;
+			case "missing key":
+				table.primaryKeys = [];
+				break;
+			case "extra key":
+				table.primaryKeys.push({ name: "extra_pk", columns: ["id"] });
+				break;
+		}
+		expect(validateCoverage(source, target).join("\n")).toContain("primary key");
+	});
+
+	test("retains inline column primary flag comparison", () => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		target.tables[1].columns[0].primary = true;
+		expect(validateCoverage(source, target)).toContain("column mismatch posts.id");
+	});
+});
+
 describe("constant expression index parity", () => {
 	const expressionFixture = () => {
 		const source = fixture();
@@ -472,10 +523,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 121 tables and 1726 columns including bulk token maintenance metadata", () => {
-		expect(target.tables.length).toBe(121);
-		// 1723 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1726);
+	test("covers 123 tables and 1742 columns including resource protection and bulk token maintenance", () => {
+		expect(target.tables.length).toBe(123);
+		// 1739 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1742);
 		expect(
 			target.tables
 				.find((table) => table.name === "knowledge_injection_events")

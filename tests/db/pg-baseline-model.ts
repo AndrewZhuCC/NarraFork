@@ -94,7 +94,7 @@ export type SnapshotTable = {
 		{ name: string; columns: string[]; nullsNotDistinct?: boolean }
 	>;
 	checkConstraints?: Record<string, { name: string; value: string }>;
-	compositePrimaryKeys?: Record<string, unknown>;
+	compositePrimaryKeys?: Record<string, { name: string; columns: string[] }>;
 	policies?: Record<string, unknown>;
 	isRLSEnabled?: boolean;
 };
@@ -143,6 +143,7 @@ export type ExpectedUnique = {
 	columns: string[];
 	nullsNotDistinct: boolean;
 };
+export type ExpectedPrimaryKey = { table: string; name: string; columns: string[] };
 export type ExpectedCheck = { table: string; name: string; value: string };
 /**
  * The sequence backing an identity column. Values are compared as TEXT: seqmax for a
@@ -184,6 +185,7 @@ export type Expected = {
 	foreignKeys: SnapshotForeignKey[];
 	indexes: ExpectedIndex[];
 	uniques: ExpectedUnique[];
+	primaryKeys: ExpectedPrimaryKey[];
 	checks: ExpectedCheck[];
 	sequences: ExpectedSequence[];
 	/**
@@ -217,6 +219,7 @@ export function buildExpected(
 	const foreignKeys: SnapshotForeignKey[] = [];
 	const indexes: ExpectedIndex[] = [];
 	const uniques: ExpectedUnique[] = [];
+	const primaryKeys: ExpectedPrimaryKey[] = [];
 	const checks: ExpectedCheck[] = [];
 	const sequences: ExpectedSequence[] = [];
 
@@ -229,8 +232,39 @@ export function buildExpected(
 	for (const table of Object.values(snapshot.tables ?? {})) {
 		if (table.schema) problems.push(`table ${table.name}: non-public schema ${table.schema}`);
 		if (table.isRLSEnabled) problems.push(`table ${table.name}: RLS is not covered by this gate`);
-		if (Object.keys(table.compositePrimaryKeys ?? {}).length > 0) {
-			problems.push(`table ${table.name}: composite primary keys are not covered`);
+		// Drizzle stores table-level PK membership only in compositePrimaryKeys; the
+		// participating columns' primaryKey flags remain false in the snapshot.
+		const tablePrimaryKeys: ExpectedPrimaryKey[] = [
+			...Object.values(table.columns)
+				.filter((column) => column.primaryKey)
+				.map((column) => ({
+					table: table.name,
+					name: `${table.name}_pkey`,
+					columns: [column.name],
+				})),
+			...Object.values(table.compositePrimaryKeys ?? {}).map((key) => ({
+				table: table.name,
+				name: key.name,
+				columns: [...key.columns],
+			})),
+		];
+		if (tablePrimaryKeys.length > 1) {
+			problems.push(`table ${table.name}: multiple primary keys`);
+		}
+		const primaryKeyColumns = new Set<string>();
+		for (const key of tablePrimaryKeys) {
+			if (!key.name) problems.push(`table ${table.name}: primary key has no name`);
+			if (!key.columns.length) problems.push(`primary key ${table.name}.${key.name}: no columns`);
+			if (new Set(key.columns).size !== key.columns.length) {
+				problems.push(`primary key ${table.name}.${key.name}: duplicate columns`);
+			}
+			for (const name of key.columns) {
+				if (!Object.values(table.columns).some((column) => column.name === name)) {
+					problems.push(`primary key ${table.name}.${key.name}: unknown column ${name}`);
+				}
+				primaryKeyColumns.add(name);
+			}
+			primaryKeys.push(key);
 		}
 		if (Object.keys(table.policies ?? {}).length > 0) {
 			problems.push(`table ${table.name}: policies are not covered`);
@@ -291,8 +325,8 @@ export function buildExpected(
 				table: table.name,
 				name: column.name,
 				type: column.type,
-				notNull: column.notNull,
-				primaryKey: column.primaryKey,
+				notNull: column.notNull || primaryKeyColumns.has(column.name),
+				primaryKey: primaryKeyColumns.has(column.name),
 				// Identity allocation is represented by attidentity, not a pg_attrdef default.
 				default: column.default === undefined ? null : String(column.default),
 				generated: column.generated
@@ -353,9 +387,7 @@ export function buildExpected(
 		foreignKeys: foreignKeys.length,
 		uniqueConstraints: uniques.length,
 		checkConstraints: checks.length,
-		primaryKeys: tables.filter((name) =>
-			columns.some((column) => column.table === name && column.primaryKey),
-		).length,
+		primaryKeys: primaryKeys.length,
 		indexes: indexes.length,
 		partialIndexes: indexes.filter((index) => index.where !== null).length,
 		uniqueIndexes: indexes.filter((index) => index.isUnique).length,
@@ -373,6 +405,7 @@ export function buildExpected(
 			foreignKeys,
 			indexes,
 			uniques,
+			primaryKeys,
 			checks,
 			sequences,
 			columnOrder: physicalColumnOrder(snapshot, prior, problems),
@@ -579,6 +612,16 @@ export const CATALOG_FACETS = {
 		JOIN ${PUBLIC_TABLE} ON c.oid = ix.indrelid
 		WHERE ${IS_PUBLIC_TABLE} AND NOT ix.indisprimary`,
 
+	primaryKeys: `SELECT c.relname || '#' || k2.conname AS "k",
+		json_build_array(
+			c.relname, k2.conname,
+			(SELECT json_agg(z.attname ORDER BY u.n) FROM unnest(k2.conkey) WITH ORDINALITY u(attnum, n)
+				JOIN pg_attribute z ON z.attrelid = c.oid AND z.attnum = u.attnum),
+			array_length(k2.conkey, 1)
+		) AS "j"
+		FROM pg_constraint k2 JOIN ${PUBLIC_TABLE} ON c.oid = k2.conrelid
+		WHERE ${IS_PUBLIC_TABLE} AND k2.contype = 'p'`,
+
 	uniques: `SELECT k2.conname AS "k",
 			json_build_array(
 				c.relname, k2.conname,
@@ -633,6 +676,7 @@ export const FACET_WIDTHS: Record<FacetName, number> = {
 	columns: 8,
 	foreignKeys: 9,
 	indexes: 11,
+	primaryKeys: 4,
 	uniques: 5,
 	checks: 3,
 	generated: 5,
@@ -762,6 +806,7 @@ export type ActualIndex = {
 };
 export type ActualForeignKey = SnapshotForeignKey & { columnCount: number; refColumnCount: number };
 export type ActualUnique = ExpectedUnique & { columnCount: number };
+export type ActualPrimaryKey = ExpectedPrimaryKey & { columnCount: number };
 export type ActualCheck = { table: string; name: string; definition: string };
 export type ActualGenerated = {
 	table: string;
@@ -778,6 +823,7 @@ export type Catalog = {
 	foreignKeys: ActualForeignKey[];
 	indexes: ActualIndex[];
 	uniques: ActualUnique[];
+	primaryKeys: ActualPrimaryKey[];
 	checks: ActualCheck[];
 	generated: ActualGenerated[];
 	sequences: ActualSequence[];
@@ -904,6 +950,12 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 			keyColumnCount: Number(row[8]),
 			nullsNotDistinct: row[9] === true,
 			constraintBacked: String(row[10]) === "u",
+		})),
+		primaryKeys: facets.primaryKeys.map((row) => ({
+			table: String(row[0]),
+			name: String(row[1]),
+			columns: asStrings(row[2]),
+			columnCount: Number(row[3]),
 		})),
 		uniques: facets.uniques.map((row) => ({
 			table: String(row[0]),
@@ -1338,6 +1390,20 @@ export function compareBaseline(
 		} else if (got !== want) {
 			problems.push(
 				`generated ${column.table}.${column.name}: expected ${clip(want)}, got ${clip(got ?? null)}`,
+			);
+		}
+	}
+
+	diffKeyed(
+		"primary key",
+		new Map(expected.primaryKeys.map((key) => [`${key.table}.${key.name}`, key.columns])),
+		new Map(actual.primaryKeys.map((key) => [`${key.table}.${key.name}`, key.columns])),
+		problems,
+	);
+	for (const key of actual.primaryKeys) {
+		if (key.columns.length !== key.columnCount) {
+			problems.push(
+				`primary key ${key.table}.${key.name}: ${key.columns.length} of ${key.columnCount} columns resolved`,
 			);
 		}
 	}

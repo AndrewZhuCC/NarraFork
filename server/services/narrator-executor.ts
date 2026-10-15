@@ -88,6 +88,8 @@ export interface ExecuteLoopResult {
 	 * work to do", and would produce an extra no-op request.
 	 */
 	completedNaturally?: boolean;
+	/** Quiet reasoning-only stop; do not immediately restart via spec continuation. */
+	reasoningOnlyIdle?: boolean;
 	/**
 	 * Set when the provider explicitly reports output was cut off — either by
 	 * completion token limits (`output_truncated`) or by a transient failure
@@ -161,6 +163,7 @@ export async function executeAgentLoop(
 	let lastAssistantHadToolUses = false;
 	let hadToolUses = false;
 	let completedNaturally = false;
+	let reasoningOnlyIdle = false;
 	const taskReflectionDenialFingerprints = new Set<string>();
 
 	try {
@@ -236,6 +239,7 @@ export async function executeAgentLoop(
 				// model has nothing left to do. Recorded rather than `break`-ing so the
 				// remaining events of this pass are still drained normally.
 				completedNaturally = true;
+				reasoningOnlyIdle = event.reason === "reasoning_only_idle";
 			}
 			if (event.type === "context_length_exceeded") {
 				contextLengthExceeded = true;
@@ -353,6 +357,7 @@ export async function executeAgentLoop(
 		// An aborted pass never counts as a natural completion, even if `done` was
 		// observed while draining post-abort events.
 		completedNaturally: completedNaturally && !aborted,
+		reasoningOnlyIdle: reasoningOnlyIdle && !aborted,
 		interrupted,
 		interruptedReason,
 		interruptionError,

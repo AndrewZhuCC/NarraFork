@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "568796c0-d7e3-47fd-9148-d0ee66fe1863",
+  "id": "b9942310-ebfc-42df-a530-d86866ba8843",
   "prevId": "30524ef1-1890-44e4-9c0f-a23102ff34c0",
   "tables": {
     "acl_events": {
@@ -15139,6 +15139,222 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "resource_protection_paths": {
+      "name": "resource_protection_paths",
+      "columns": {
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "source_id": {
+          "name": "source_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "slot": {
+          "name": "slot",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canonical_path": {
+          "name": "canonical_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "repository_key": {
+          "name": "repository_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "shadow_key": {
+          "name": "shadow_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "scope_project_id": {
+          "name": "scope_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "alias_sensitive": {
+          "name": "alias_sensitive",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "claim_json": {
+          "name": "claim_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_protection_path": {
+          "name": "idx_protection_path",
+          "columns": [
+            "device_id",
+            "canonical_path",
+            "source",
+            "source_id",
+            "slot"
+          ],
+          "isUnique": false
+        },
+        "idx_protection_repository": {
+          "name": "idx_protection_repository",
+          "columns": [
+            "device_id",
+            "repository_key",
+            "source",
+            "source_id",
+            "slot"
+          ],
+          "isUnique": false
+        },
+        "idx_protection_shadow": {
+          "name": "idx_protection_shadow",
+          "columns": [
+            "shadow_key",
+            "source",
+            "source_id",
+            "slot"
+          ],
+          "isUnique": false
+        },
+        "idx_protection_scope": {
+          "name": "idx_protection_scope",
+          "columns": [
+            "scope_project_id",
+            "source",
+            "source_id",
+            "slot"
+          ],
+          "isUnique": false
+        },
+        "idx_protection_alias": {
+          "name": "idx_protection_alias",
+          "columns": [
+            "alias_sensitive",
+            "source",
+            "source_id",
+            "slot"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "resource_protection_paths_source_source_id_slot_pk": {
+          "columns": [
+            "source",
+            "source_id",
+            "slot"
+          ],
+          "name": "resource_protection_paths_source_source_id_slot_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "resource_protection_sources": {
+      "name": "resource_protection_sources",
+      "columns": {
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "source_id": {
+          "name": "source_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
+        "dirty": {
+          "name": "dirty",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
+        "cursor": {
+          "name": "cursor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "complete": {
+          "name": "complete",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "idx_protection_dirty": {
+          "name": "idx_protection_dirty",
+          "columns": [
+            "dirty",
+            "source",
+            "source_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "resource_protection_sources_source_source_id_pk": {
+          "columns": [
+            "source",
+            "source_id"
+          ],
+          "name": "resource_protection_sources_source_source_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "revert_operation_files": {
       "name": "revert_operation_files",
       "columns": {
@@ -17813,41 +18029,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "workflow_version": {
-          "name": "workflow_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "phase": {
-          "name": "phase",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "summary_json": {
-          "name": "summary_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "rows_per_second": {
-          "name": "rows_per_second",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "scratch_retired_at": {
-          "name": "scratch_retired_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "scanned": {
           "name": "scanned",
           "type": "integer",
@@ -17938,15 +18119,6 @@
             "id"
           ],
           "isUnique": false
-        },
-        "idx_token_repair_scratch_retirement": {
-          "name": "idx_token_repair_scratch_retirement",
-          "columns": [
-            "updated_at",
-            "id"
-          ],
-          "isUnique": false,
-          "where": "\"usage_token_repair_jobs\".\"scratch_retired_at\" IS NULL AND \"usage_token_repair_jobs\".\"status\" IN ('completed', 'cancelled', 'failed', 'interrupted')"
         },
         "idx_token_repair_single_active": {
           "name": "idx_token_repair_single_active",

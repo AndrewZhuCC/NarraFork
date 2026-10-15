@@ -814,7 +814,7 @@ export type AgentEvent =
 			dumpSpillReuseToken?: string;
 	  }
 	| { type: "silent_disconnect" }
-	| { type: "done" };
+	| { type: "done"; reason?: "reasoning_only_idle" };
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
@@ -1177,6 +1177,8 @@ export interface AgentConfig {
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
 	) => Promise<AgentHistoryReplacement | null>;
+	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
+	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**
