@@ -8,6 +8,7 @@ type ReadingTarget = {
 	hovered: boolean;
 	active: boolean;
 	composer?: boolean;
+	isPrimary?: boolean;
 	read: () => void;
 };
 
@@ -101,9 +102,13 @@ export function handleReadFromStartShortcut(
 			position: readingPosition(target.host),
 		};
 	}).filter((target) => target.position !== null);
-	const eligible = targets.filter(
+	let eligible = targets.filter(
 		(target) => !!target.composer === composer && (!composer || !target.host.matches(":disabled")),
 	);
+	// A visible primary composer takes precedence over subagent hover/focus/last-panel hints.
+	if (composer && eligible.some((target) => target.isPrimary)) {
+		eligible = eligible.filter((target) => target.isPrimary);
+	}
 	if (!eligible.length) return;
 	const focused = doc.activeElement?.closest("[data-shortcut-reading-host]");
 	const reading =
@@ -164,17 +169,20 @@ export function registerReadFromStartTarget(get: () => ReadingTarget): () => voi
 	};
 }
 
-export function useFocusComposerShortcut(ref: RefObject<HTMLTextAreaElement | null>): void {
+export function useFocusComposerShortcut(
+	ref: RefObject<HTMLTextAreaElement | null>,
+	isPrimary = false,
+): void {
 	const active = useNarratorPanelVisible();
-	const latest = useRef(active);
-	latest.current = active;
+	const latest = useRef({ active, isPrimary });
+	latest.current = { active, isPrimary };
 	useEffect(() => {
 		const host = ref.current;
 		if (!host) return;
 		return registerReadFromStartTarget(() => ({
 			host,
 			hovered: false,
-			active: latest.current,
+			...latest.current,
 			composer: true,
 			read: () => host.focus(),
 		}));

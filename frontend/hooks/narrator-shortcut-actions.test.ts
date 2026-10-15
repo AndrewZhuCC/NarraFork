@@ -189,7 +189,7 @@ describe("read from start", () => {
 	afterEach(() => {
 		for (const cleanup of cleanups.splice(0)) cleanup();
 	});
-	function composer(id: string, parent = panel(), active = true) {
+	function composer(id: string, parent = panel(), active = true, isPrimary = false) {
 		const node = document.createElement("textarea");
 		node.setAttribute("data-narrator-composer", "");
 		rect(node, 400, 490);
@@ -200,6 +200,7 @@ describe("read from start", () => {
 				active,
 				hovered: false,
 				composer: true,
+				isPrimary,
 				read: () => {
 					calls.push(id);
 					focus = node;
@@ -241,6 +242,39 @@ describe("read from start", () => {
 		// Reading focus wins even while another body's hover remains active.
 		pressTab();
 		expect(calls).toEqual(["b", "a", "read-b", "b", "a"]);
+	});
+	test.each([
+		"active",
+		"pointerdown",
+		"wheel",
+		"hover",
+		"focus",
+	])("Tab selects the primary composer despite the subagent's %s hint", (hint) => {
+		const childPanel = panel();
+		const childBody = host("read-child", childPanel, {
+			hovered: hint === "hover",
+			active: true,
+		});
+		composer("child", childPanel);
+		const main = composer("main", panel(), false, true);
+		if (hint === "pointerdown" || hint === "wheel") {
+			childBody.dispatchEvent(new window.Event(hint, { bubbles: true }));
+		}
+		if (hint === "focus") focus = childBody;
+		expect(pressTab().defaultPrevented).toBe(true);
+		expect(focus).toBe(main);
+		expect(calls).toEqual(["main"]);
+	});
+	test.each([
+		"hidden",
+		"disabled",
+	])("Tab still selects a standalone subagent when the primary composer is %s", (mode) => {
+		const main = composer("main", panel(), true, true);
+		if (mode === "hidden") main.hidden = true;
+		else main.setAttribute("disabled", "");
+		composer("child");
+		pressTab();
+		expect(calls).toEqual(["child"]);
 	});
 	test.each([
 		"display",
