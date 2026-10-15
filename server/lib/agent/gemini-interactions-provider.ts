@@ -1336,10 +1336,15 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
@@ -1347,10 +1352,13 @@ function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): U
 
 function mapUsage(usage: GeminiInteractionUsage | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0;
+	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
-		inputTokens: usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0,
+		// Interactions 原始输入计数包含缓存读取。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
-		cachedInputTokens: usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens:
 			usage.total_thought_tokens ?? usage.thought_tokens ?? usage.reasoning_tokens ?? 0,

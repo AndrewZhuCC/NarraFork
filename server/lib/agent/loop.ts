@@ -43,6 +43,7 @@ import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
+import { buildUsageDataFromSnapshot } from "../usage-tracking";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -1191,16 +1192,7 @@ export function summarizeReflectionFailure(
 type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
 
 function normalizeApiRequestUsage(usage: ApiRequestEndEvent["usage"]) {
-	if (!usage) return null;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
+	return buildUsageDataFromSnapshot(usage);
 }
 
 async function recordReflectionApiRequestEnd(
@@ -5360,20 +5352,37 @@ async function* agentLoopInMetadataSnapshot(
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 							};
 						}
-						// Convert OpenAI/Anthropic usage to context_usage percentage
-						if (parsed.usage && parsed.usage.promptTokens != null) {
+						// Billing updates can be output-only; occupancy still requires a real prompt.
+						if (parsed.usage) {
 							receivedUsage = true;
 							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
+							const zeroPlaceholder =
+								parsed.usage.promptTokens === 0 &&
+								parsed.usage.completionTokens === 0 &&
+								[
+									parsed.usage.inputTokens,
+									parsed.usage.reasoningTokens,
+									parsed.usage.cachedInputTokens,
+									parsed.usage.cacheCreationInputTokens,
+									parsed.usage.cacheCreation5mTokens,
+									parsed.usage.cacheCreation1hTokens,
+								].every((count) => count == null || count === 0);
 							// Merge partial counters without letting prompt/input placeholders
-							// erase known counts. Output and cache counters update independently.
+							// erase known counts. A nonempty fully cached prompt legitimately has
+							// zero ordinary input. Output and cache counters update independently.
 							requestUsage = {
-								promptTokens: parsed.usage.promptTokens || previousUsage?.promptTokens || 0,
+								promptTokens:
+									parsed.usage.promptTokens === 0 && previousUsage?.promptTokens
+										? previousUsage.promptTokens
+										: (parsed.usage.promptTokens ?? previousUsage?.promptTokens),
 								inputTokens:
-									parsed.usage.inputTokens === 0 && previousUsage?.inputTokens
+									parsed.usage.promptTokens === 0 &&
+									parsed.usage.inputTokens === 0 &&
+									previousUsage?.inputTokens
 										? previousUsage.inputTokens
 										: (parsed.usage.inputTokens ?? previousUsage?.inputTokens),
 								completionTokens:
-									parsed.usage.completionTokens === 0 && previousUsage?.completionTokens
+									zeroPlaceholder && previousUsage?.completionTokens
 										? previousUsage.completionTokens
 										: (parsed.usage.completionTokens ?? previousUsage?.completionTokens),
 								reasoningTokens: parsed.usage.reasoningTokens ?? previousUsage?.reasoningTokens,
@@ -5396,6 +5405,7 @@ async function* agentLoopInMetadataSnapshot(
 							// causes the UI to briefly flash "0%" before showing the real value.
 							if (
 								contextWindow &&
+								parsed.usage.promptTokens != null &&
 								parsed.usage.promptTokens > 0 &&
 								upstreamContextPercent === undefined
 							) {

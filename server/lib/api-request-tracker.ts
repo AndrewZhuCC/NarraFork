@@ -17,6 +17,7 @@ import { recordCredentialUsage } from "@server/services/credential-usage-totals"
 import { insertApiRequestWithUserUsage } from "@server/services/user-usage-totals";
 import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
+import { TOKEN_ACCOUNTING_VERSION } from "@shared/usage-token-repair";
 import { eq } from "drizzle-orm";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
 import type { ApiRequestDiagnostics } from "./agent/types";
@@ -507,6 +508,8 @@ export async function finishApiRequest(
 
 	const inserted = insertApiRequestWithUserUsage({
 		id: handle.id,
+		tokenAccountingVersion: TOKEN_ACCOUNTING_VERSION,
+		tokenAccountingReviewVersion: TOKEN_ACCOUNTING_VERSION,
 		userId: handle.userId,
 		narratorId: handle.narratorId ?? null,
 		messageId: options.messageId ?? null,

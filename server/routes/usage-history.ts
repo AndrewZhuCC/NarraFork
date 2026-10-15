@@ -21,6 +21,7 @@ import {
 import { listUserUsageTotals } from "@server/services/user-usage-totals";
 import { Hono } from "hono";
 import { z } from "zod";
+import { createUsageTokenRepairRoutes } from "./usage-token-repair";
 
 export type UsageHistoryRouteService = Pick<
 	UsageHistoryService,
@@ -99,7 +100,17 @@ const credentialTotalsQuerySchema = z.object({
 
 const breakdownQuerySchema = statsQuerySchema.extend({
 	dimension: z.enum(["provider", "model", "kind", "user"]),
-	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	metric: z.enum([
+		"requests",
+		"tokens",
+		"cost",
+		"inputTokens",
+		"outputTokens",
+		"cachedInputTokens",
+		"cacheCreationTokens",
+		"cacheHitRate",
+		"reasoningTokens",
+	]),
 	cluster: z
 		.enum(["true", "false", "1", "0"])
 		.default("true")
@@ -108,7 +119,17 @@ const breakdownQuerySchema = statsQuerySchema.extend({
 
 const stackedTimeSeriesQuerySchema = statsQuerySchema.extend({
 	dimension: z.enum(["provider", "model", "kind", "user"]),
-	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	metric: z.enum([
+		"requests",
+		"tokens",
+		"cost",
+		"inputTokens",
+		"outputTokens",
+		"cachedInputTokens",
+		"cacheCreationTokens",
+		"cacheHitRate",
+		"reasoningTokens",
+	]),
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
 	topN: z.coerce.number().int().positive().max(10).default(5),
 	cluster: z
@@ -193,6 +214,10 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	const service = options.service ?? usageHistoryService;
 
 	routes.use("*", authMiddleware, adminMiddleware);
+	routes.route(
+		"/token-repair",
+		createUsageTokenRepairRoutes({ requireAuth: authMiddleware, requireAdmin: adminMiddleware }),
+	);
 
 	// Lifetime totals are independent of the date-filtered, removable history.
 	routes.get("/user-totals", (c) => {

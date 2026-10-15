@@ -27,6 +27,7 @@ type UsageMetricKey =
 	| "totalReasoningTokens"
 	| "totalCacheReadTokens"
 	| "totalCacheCreationTokens"
+	| "cacheHitRate"
 	| "totalCost"
 	| "averageTtftMs"
 	| "averageDurationMs"
@@ -193,6 +194,18 @@ export function UsageHistoryChart({
 				label: t("usageHistoryMetricCacheWrite"),
 				stroke: "var(--mantine-color-teal-6)",
 				getValue: (point) => point.totalCacheCreationTokens,
+			},
+			{
+				// 缓存命中率 = 缓存读取 ÷ (缓存读取 + 缓存写入 + 纯输入)。
+				// 分母为 0（该时间点没有输入侧 token）时返回 0，避免 NaN 进入图表。
+				value: "cacheHitRate",
+				label: t("usageHistoryMetricCacheHitRate"),
+				stroke: "var(--mantine-color-cyan-7)",
+				getValue: (point) => {
+					const denominator =
+						point.totalCacheReadTokens + point.totalCacheCreationTokens + point.totalInputTokens;
+					return denominator > 0 ? (point.totalCacheReadTokens / denominator) * 100 : 0;
+				},
 			},
 			{
 				value: "totalCost",

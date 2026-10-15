@@ -138,6 +138,7 @@ import {
 } from "../narrator-recovery";
 import { handleBashCommand, narratorService } from "../narrator-service";
 import {
+	accountRequestTokenUsage,
 	accountTokenUsageForTurn,
 	applySessionDefaultDevice,
 	buildContextManagementHooks,
@@ -860,6 +861,11 @@ export async function runAgentLoopUnlocked(
 				},
 				setTokenUsage: (usage) => {
 					active._lastTokenUsage = usage;
+				},
+				accountRequestTokenUsage: (usage) => {
+					if (activeNarrators.get(narratorId) === active) {
+						accountRequestTokenUsage(active, usage);
+					}
 				},
 				setTtftMs: (ttftMs) => {
 					active._ttftMs = ttftMs;
@@ -1954,7 +1960,7 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
-			active._tokenUsageBaseline = active._lastTokenUsage;
+			active._tokenUsageBaseline = active._requestTokenTotal ?? 0;
 			active._interruptCleanupDone = false;
 			const result = await executeAgentLoop({
 				config,
@@ -1964,6 +1970,9 @@ export async function runAgentLoopUnlocked(
 				images: loopImages,
 				eventContext,
 				hooks,
+			}).finally(() => {
+				// Account before workspace restarts, limits, or thrown-error exits.
+				runState.totalTokens += accountTokenUsageForTurn(active);
 			});
 			runState.lastPass = result;
 			if (
@@ -2006,7 +2015,6 @@ export async function runAgentLoopUnlocked(
 			// normally, this is cleared back to false before the Stop hook fires.
 			runState.hitMaxTurns = result.maxTurnsExceeded === true;
 
-			runState.totalTokens += accountTokenUsageForTurn(active);
 			const searchScope = getSearchExecutionScope();
 			if (searchScope && (searchScope.remainingTurns <= 0 || result.maxTurnsExceeded)) {
 				// No retry/spec/goal continuation can acquire a fresh budget implicitly.

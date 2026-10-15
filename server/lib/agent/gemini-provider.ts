@@ -1213,30 +1213,46 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
 }
 
+/**
+ * ⚠️ 新增 provider adapter 前必须先调研其 token 数据组成：input 是否已含缓存、缓存读取/写入
+ * 分别落在哪个字段、数值是「单次值」还是「会话累计值」，再决定换算方式。弄错的代价不会立刻
+ * 显现——错误口径会被静默写入 api_requests，污染用量统计与缓存命中率，事后只能靠数据特征
+ * 反推修补。
+ */
 function mapUsage(usage: GeminiUsageMetadata | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		inputTokens: usage.promptTokenCount ?? 0,
+		// Gemini promptTokenCount 明确包含缓存读取，异常计数也不能按净输入猜测。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.candidatesTokenCount ?? 0,
-		cachedInputTokens: usage.cachedContentTokenCount ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? 0,
 	};
 }
 
 function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEvent["usage"]> {
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		promptTokens: usage.promptTokenCount ?? 0,
-		inputTokens: (usage.promptTokenCount ?? 0) - (usage.cachedContentTokenCount ?? 0),
+		promptTokens,
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		completionTokens: usage.candidatesTokenCount ?? 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? undefined,
 		cachedInputTokens: usage.cachedContentTokenCount ?? undefined,

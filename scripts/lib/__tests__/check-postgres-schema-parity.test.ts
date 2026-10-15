@@ -122,6 +122,74 @@ describe("parity fixture baseline", () => {
 	});
 });
 
+describe("constant expression index parity", () => {
+	const expressionFixture = () => {
+		const source = fixture();
+		source.tables[1].indexes.push({
+			name: "singleton",
+			columns: [],
+			expression: "1",
+			unique: true,
+			predicate: '"author_email" IS NOT NULL',
+		});
+		return source;
+	};
+	test("an exact constant expression retains a distinct structural signature", () => {
+		const source = expressionFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+		expect(
+			normalizeCoverage(source, "test").coverage.tables.find((table) => table.name === "posts")
+				?.indexes[0].expression,
+		).toBe("1");
+	});
+	test.each([
+		"2",
+		"1+0",
+		"(1)",
+		"lower(id)",
+		"",
+		"true",
+	])("rejects unknown expression %s even on both sides", (expression) => {
+		const source = expressionFixture();
+		source.tables[1].indexes[0].expression = expression;
+		expect(validateCoverage(source, structuredClone(source)).join(" ")).toContain(
+			"unsupported index expression",
+		);
+	});
+	test("removal or replacement with a column is a mismatch", () => {
+		const source = expressionFixture();
+		for (const columns of [[], ["id"]]) {
+			const target = structuredClone(source);
+			delete target.tables[1].indexes[0].expression;
+			target.tables[1].indexes[0].columns = columns;
+			expect(validateCoverage(source, target).length).toBeGreaterThan(0);
+		}
+	});
+	test("mixed terms, unknown fields and promotion to a unique constraint fail closed", () => {
+		for (const extras of [
+			{ columns: ["id"] },
+			{ unexpectedExpression: "1" },
+			{ emitAsUniqueConstraint: true },
+		]) {
+			const source = expressionFixture();
+			Object.assign(source.tables[1].indexes[0], extras);
+			expect(validateCoverage(source, structuredClone(source)).length).toBeGreaterThan(0);
+		}
+	});
+	test("a constant expression cannot cover a referenced column", () => {
+		const source = fixture();
+		source.tables[0].indexes[0] = {
+			name: "idx_users_email",
+			columns: [],
+			expression: "1",
+			unique: true,
+		};
+		expect(validateCoverage(source, structuredClone(source)).join(" ")).toContain(
+			"no unique constraint",
+		);
+	});
+});
+
 describe("foreign key constraint names", () => {
 	test("a renamed column-level constraint fails", () => {
 		const errors = mutate((target) => {
@@ -404,10 +472,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 119 tables and 1689 columns including Git identities and history revisions", () => {
-		expect(target.tables.length).toBe(119);
-		// 1686 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1689);
+	test("covers 121 tables and 1720 columns including token repair, Git identities and history revisions", () => {
+		expect(target.tables.length).toBe(121);
+		// 1717 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1720);
 		expect(
 			target.tables
 				.find((table) => table.name === "model_history_revision_contracts")

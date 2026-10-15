@@ -99,6 +99,34 @@
 			"when": 1791962003435,
 			"tag": "0013_spec-tab-layout",
 			"breakpoints": true
+		},
+		{
+			"idx": 14,
+			"version": "7",
+			"when": 1792034785194,
+			"tag": "0014_usage_token_repair",
+			"breakpoints": true
+		},
+		{
+			"idx": 15,
+			"version": "7",
+			"when": 1792035197007,
+			"tag": "0015_usage_token_repair_lease",
+			"breakpoints": true
+		},
+		{
+			"idx": 16,
+			"version": "7",
+			"when": 1792037878820,
+			"tag": "0016_usage_token_repair_protocol_overrides",
+			"breakpoints": true
+		},
+		{
+			"idx": 17,
+			"version": "7",
+			"when": 1792039094595,
+			"tag": "0017_usage_token_repair_source_scope",
+			"breakpoints": true
 		}
   ]
 }

@@ -321,7 +321,8 @@ describe("Gemini transport selection", () => {
 		expect(result).toEqual({
 			text: "generated",
 			usage: {
-				inputTokens: 7,
+				// promptTokenCount 7 含缓存 1，归一到「input 不含缓存」后为 6。
+				inputTokens: 6,
 				outputTokens: 2,
 				cachedInputTokens: 1,
 				cacheCreationInputTokens: 0,
@@ -335,6 +336,98 @@ describe("Gemini transport selection", () => {
 		expect(headers.get("Accept")).toBe("text/event-stream");
 		expect(signal).toBe(controller.signal);
 	});
+});
+
+describe("Gemini input token accounting", () => {
+	for (const api of ["generateContent", "interactions"] as const) {
+		const model =
+			api === "generateContent"
+				? "gemini-generate-test:gemini-2.5-flash"
+				: "gemini-test:gemini-3-flash-preview";
+		const make = () => (api === "generateContent" ? makeGenerateContentProvider() : makeProvider());
+		for (const prompt of [100, 0, undefined]) {
+			for (const cached of [0, 40, 100, 120]) {
+				test(`${api} total=${prompt} cached=${cached} normalizes JSON and SSE`, async () => {
+					const usage =
+						api === "generateContent"
+							? {
+									promptTokenCount: prompt,
+									cachedContentTokenCount: cached,
+									candidatesTokenCount: 7,
+									thoughtsTokenCount: 2,
+								}
+							: {
+									total_input_tokens: prompt,
+									total_cached_tokens: cached,
+									total_output_tokens: 7,
+									total_thought_tokens: 2,
+								};
+					const data =
+						api === "generateContent" ? { usageMetadata: usage } : { status: "completed", usage };
+					const frames = [
+						{
+							event: api === "generateContent" ? "message" : "interaction.completed",
+							data: api === "generateContent" ? data : { interaction: data },
+						},
+					];
+					const expected = Math.max((prompt ?? 0) - cached, 0);
+					for (const transport of ["JSON", "SSE"]) {
+						setOutboundFetchOverrideForTest(async () =>
+							transport === "SSE"
+								? sseResponse(frames)
+								: new Response(JSON.stringify(data), {
+										headers: { "content-type": "application/json" },
+									}),
+						);
+						const result = await make().generateWithMeta("hello", model);
+						expect(result.usage).toEqual({
+							inputTokens: expected,
+							outputTokens: 7,
+							cachedInputTokens: cached,
+							cacheCreationInputTokens: 0,
+							reasoningTokens: 2,
+						});
+					}
+					setOutboundFetchOverrideForTest(async () => sseResponse(frames));
+					const events = await collect(make().chat(baseChatParams({ model })));
+					expect(events.find((event) => event.usage)?.usage).toMatchObject({
+						promptTokens: prompt ?? 0,
+						inputTokens: expected,
+						completionTokens: 7,
+					});
+				});
+			}
+		}
+
+		for (const inputTokens of [undefined, 0, 17]) {
+			test(`${api} stream conversion preserves normalized input=${inputTokens}`, async () => {
+				const provider = make() as TestGeminiProvider & {
+					parseSSEStream: () => AsyncGenerator<ParsedStreamEvent>;
+				};
+				provider.parseSSEStream = async function* () {
+					yield {
+						usage: {
+							promptTokens: 100,
+							inputTokens,
+							cachedInputTokens: 40,
+							cacheCreationInputTokens: 20,
+							completionTokens: 7,
+							reasoningTokens: 2,
+						},
+					};
+				};
+				setOutboundFetchOverrideForTest(async () => sseResponse([]));
+				const result = await provider.generateWithMeta("hello", model);
+				expect(result.usage).toEqual({
+					inputTokens: inputTokens ?? 40,
+					outputTokens: 7,
+					cachedInputTokens: 40,
+					cacheCreationInputTokens: 20,
+					reasoningTokens: 2,
+				});
+			});
+		}
+	}
 });
 
 describe("Gemini lightweight partial output regression", () => {
@@ -438,7 +531,8 @@ describe("Gemini lightweight partial output regression", () => {
 						text: partialText,
 						outputTruncated: true,
 						usage: {
-							inputTokens: 11,
+							// promptTokenCount 11 含缓存 3，归一到「input 不含缓存」后为 8。
+							inputTokens: 8,
 							outputTokens: 7,
 							cachedInputTokens: 3,
 							cacheCreationInputTokens: 0,
@@ -886,7 +980,8 @@ describe("Gemini Interactions API provider", () => {
 		expect(result).toEqual({
 			text: "Hello world",
 			usage: {
-				inputTokens: 9,
+				// total_input_tokens 9 含缓存 2，归一到「input 不含缓存」后为 7。
+				inputTokens: 7,
 				outputTokens: 3,
 				cachedInputTokens: 2,
 				cacheCreationInputTokens: 0,

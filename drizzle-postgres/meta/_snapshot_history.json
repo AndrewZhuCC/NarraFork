@@ -112,6 +112,38 @@
 			"prevId": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
 			"version": "7",
 			"snapshotDigest": "63e497e8370b6a5ed83be0502b59972779d492fa377d465d96db1863daa56b83"
+		},
+		{
+			"idx": 14,
+			"tag": "0014_usage_token_repair",
+			"id": "95757c8c-b354-4d1e-ac5c-1dd7b3d8c6d4",
+			"prevId": "6b0f116c-6200-4566-8228-0887c535abaa",
+			"version": "7",
+			"snapshotDigest": "6843bf7484bd0759be2c3249d7235e05d173fbb76b61db590edf8156ea9e3f22"
+		},
+		{
+			"idx": 15,
+			"tag": "0015_usage_token_repair_lease",
+			"id": "d76668d8-ba3a-4456-9dc3-54654dfa8828",
+			"prevId": "95757c8c-b354-4d1e-ac5c-1dd7b3d8c6d4",
+			"version": "7",
+			"snapshotDigest": "ac64972e6ccfeecf12b71b3336a90b3eb3aa03716e2c8a50f6a020760ba77b9b"
+		},
+		{
+			"idx": 16,
+			"tag": "0016_usage_token_repair_protocol_overrides",
+			"id": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
+			"prevId": "d76668d8-ba3a-4456-9dc3-54654dfa8828",
+			"version": "7",
+			"snapshotDigest": "a000e77994a2dac97e42bce3379e707765672e8292b165cf15f5c75b4b957865"
+		},
+		{
+			"idx": 17,
+			"tag": "0017_usage_token_repair_source_scope",
+			"id": "589f163a-9f46-4c42-9b4f-7421ec507a16",
+			"prevId": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
+			"version": "7",
+			"snapshotDigest": "f52554d3864e74c844630f1ace6bd08a3081ba1335074e9780fc488f6f47a816"
 		}
 	]
 }

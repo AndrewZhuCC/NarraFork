@@ -14,9 +14,49 @@ import {
 import { captureReferencePricingSnapshot, resolveModelPricing } from "../model-pricing";
 import { saveSettings, settings } from "../settings";
 import type { NarraForkSettings } from "../settings/types";
-import { calculateCost, calculateCostDetailed, type UsageData } from "../usage-tracking";
+import {
+	buildUsageDataFromSnapshot,
+	calculateCost,
+	calculateCostDetailed,
+	type UsageData,
+} from "../usage-tracking";
 
 afterEach(() => bindModelCatalogSettings(settings, () => saveSettings(settings)));
+
+describe("normalized usage snapshot conversion", () => {
+	test.each([
+		undefined,
+		0,
+		17,
+	])("input=%s preserves net counters or derives them from full prompt", (inputTokens) => {
+		expect(
+			buildUsageDataFromSnapshot({
+				promptTokens: 100,
+				inputTokens,
+				cachedInputTokens: 40,
+				cacheCreation5mTokens: 15,
+				cacheCreation1hTokens: 5,
+			}),
+		).toMatchObject({
+			inputTokens: inputTokens ?? 40,
+			cachedInputTokens: 40,
+			cacheCreationInputTokens: 20,
+		});
+	});
+	test("cache-only usage does not turn cache into ordinary input", () => {
+		expect(
+			buildUsageDataFromSnapshot({
+				promptTokens: 60,
+				cachedInputTokens: 40,
+				cacheCreation5mTokens: 20,
+			}),
+		).toMatchObject({ inputTokens: 0, cacheCreationInputTokens: 20 });
+		expect(buildUsageDataFromSnapshot({ cacheCreation1hTokens: 20 })).toMatchObject({
+			inputTokens: 0,
+			cacheCreationInputTokens: 20,
+		});
+	});
+});
 function install(
 	pricing?: ModelMetadata["referencePricing"],
 	extra: Partial<LocalCatalogState> = {},
@@ -194,7 +234,7 @@ describe("reference costs use effective catalog metadata", () => {
 			estimate(usage({ cachedInputTokens: 500_000, cacheCreationInputTokens: 100_000 })),
 		).toMatchObject({
 			status: "partial",
-			knownCost: 9,
+			knownCost: 10,
 			missingFields: ["cacheRead", "cacheWrite"],
 		});
 	});
@@ -292,7 +332,13 @@ describe("reference costs use effective catalog metadata", () => {
 			knownCost: 5,
 		});
 	});
-	test("OpenAI subtracts cached input; Anthropic counts disjoint components", () => {
+	test.each([
+		"openai",
+		"codex",
+		"gemini",
+		"nug",
+		"anthropic",
+	])("%s prices normalized disjoint input and cache components without another subtraction", (provider) => {
 		install(allPrices);
 		const data = usage({
 			inputTokens: 1_000_000,
@@ -300,8 +346,13 @@ describe("reference costs use effective catalog metadata", () => {
 			cachedInputTokens: 500_000,
 			cacheCreationInputTokens: 100_000,
 		});
-		expect(estimate(data, "openai").knownCost).toBe(1.5);
-		expect(estimate(data, "anthropic").knownCost).toBe(2.5);
+		expect(estimate(data, provider).knownCost).toBe(2.5);
+		const fullyCached = estimate(
+			usage({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 1_000_000 }),
+			provider,
+		);
+		expect(fullyCached.inputCost).toBe(0);
+		expect(fullyCached.cacheReadCost).toBe(0.5);
 	});
 	test("unknown models and empty usage do not look free", () => {
 		install();
@@ -346,17 +397,28 @@ describe("reference costs use effective catalog metadata", () => {
 		expect(estimate().status).toBe("unknown");
 		expect(estimate().missingFields).toContain("longContext.thresholdTokens");
 	});
-	test("Anthropic threshold includes disjoint cache tokens", () => {
+	test.each([
+		"anthropic",
+		"openai",
+		"codex",
+		"gemini",
+		"nug",
+	])("%s threshold includes disjoint cache read and write tokens", (provider) => {
 		install({
 			...allPrices,
 			longContext: { thresholdTokens: 100, basis: "promptTokens", mode: "full", input: "4" },
 		});
 		const result = estimate(
-			usage({ inputTokens: 50, cachedInputTokens: 60, outputTokens: 0 }),
-			"anthropic",
+			usage({
+				inputTokens: 50,
+				cachedInputTokens: 30,
+				cacheCreationInputTokens: 30,
+				outputTokens: 0,
+			}),
+			provider,
 		);
 		expect(result.inputCost).toBeCloseTo(0.0002);
-		expect(result.cacheReadCost).toBeCloseTo(0.00003);
+		expect(result.cacheReadCost).toBeCloseTo(0.000015);
 	});
 	test("marginal rules without verified reference allocation stay unknown", () => {
 		install({

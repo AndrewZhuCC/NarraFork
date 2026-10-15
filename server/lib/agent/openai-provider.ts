@@ -113,41 +113,62 @@ export function applyOpenAIModelMetadata(
 	assertModelInputModalities(model, body, metadata);
 }
 
-function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
-	if (typeof usage !== "object" || usage === null) return null;
-	const data = usage as Record<string, unknown>;
-	const details =
-		typeof data.output_tokens_details === "object" && data.output_tokens_details !== null
-			? (data.output_tokens_details as Record<string, unknown>)
-			: undefined;
-	const inputDetails =
-		typeof data.input_tokens_details === "object" && data.input_tokens_details !== null
-			? (data.input_tokens_details as Record<string, unknown>)
-			: undefined;
-	const numberValue = (...keys: string[]) => {
-		for (const key of keys) {
-			const value = data[key];
-			if (typeof value === "number") return value;
-		}
-		return undefined;
-	};
+/** Parsed stream events already carry disjoint counters; never subtract cache twice. */
+function parsedUsageToUsageData(
+	usage: NonNullable<ParsedStreamEvent["usage"]>,
+): NonNullable<GenerateMetaResult["usage"]> {
 	return {
-		inputTokens: numberValue("inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0,
-		outputTokens:
-			numberValue("completionTokens", "outputTokens", "completion_tokens", "output_tokens") ?? 0,
-		cachedInputTokens:
-			numberValue("cachedInputTokens", "cached_input_tokens") ??
-			(typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : 0),
-		cacheCreationInputTokens:
-			numberValue("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0,
-		cacheCreation5mInputTokens:
-			numberValue("cacheCreation5mTokens", "cache_creation_5m_tokens") ?? 0,
-		cacheCreation1hInputTokens:
-			numberValue("cacheCreation1hTokens", "cache_creation_1h_tokens") ?? 0,
-		reasoningTokens:
-			numberValue("reasoningTokens", "reasoning_tokens") ??
-			(typeof details?.reasoning_tokens === "number" ? details.reasoning_tokens : 0),
+		inputTokens: usage.inputTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
+}
+
+// The parser's tool map is created per request/attempt, including Codex WS.
+// Keep partial usage under the same lifetime instead of leaking it across retries.
+const openAIUsageState = new WeakMap<object, NonNullable<ParsedStreamEvent["usage"]>>();
+
+/** Merge reported counters first; derive net input only after cache updates. */
+function openAIUsageToParsedUsage(
+	usage: Parameters<typeof extractOpenAIUsage>[0],
+	request: object,
+): NonNullable<ParsedStreamEvent["usage"]> {
+	const merged = { ...openAIUsageState.get(request) };
+	const normalized = extractOpenAIUsage(usage);
+	const prompt = usage.input_tokens ?? usage.prompt_tokens;
+	// Relays can finish with a zero prompt placeholder and output-only accounting.
+	if (prompt != null && (prompt > 0 || merged.promptTokens == null)) {
+		merged.promptTokens = prompt;
+	}
+	if (usage.output_tokens != null || usage.completion_tokens != null) {
+		merged.completionTokens = normalized.outputTokens;
+	}
+	if (normalized.cachedInputTokens !== undefined) {
+		merged.cachedInputTokens = normalized.cachedInputTokens;
+	}
+	if (normalized.cacheCreationInputTokens !== undefined) {
+		merged.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+	}
+	if (
+		usage.output_tokens_details?.reasoning_tokens != null ||
+		usage.completion_tokens_details?.reasoning_tokens != null
+	) {
+		merged.reasoningTokens = normalized.reasoningTokens;
+	}
+	if (merged.promptTokens != null) {
+		merged.inputTokens = Math.max(
+			merged.promptTokens -
+				(merged.cachedInputTokens ?? 0) -
+				(merged.cacheCreationInputTokens ?? 0),
+			0,
+		);
+	}
+	openAIUsageState.set(request, merged);
+	return merged;
 }
 
 /** Resolve apiMode from provider config, with backward compat for the old `responsesApi` boolean. */
@@ -1412,7 +1433,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			return {
 				text,
 				...(outputTruncated && { outputTruncated }),
-				usage: parsedUsageToUsageData(json.usage),
+				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
 			};
 		}
 
@@ -1845,11 +1866,11 @@ function createOpenAIApiError(response: Response, rawBody: string): ApiError {
 /** Parse a /responses JSON payload with a clearer error message. */
 function parseResponsesJson(raw: string): {
 	output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
-	usage?: unknown;
+	usage?: Parameters<typeof extractOpenAIUsage>[0];
 } {
 	return parseJsonWithPreview<{
 		output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
-		usage?: unknown;
+		usage?: Parameters<typeof extractOpenAIUsage>[0];
 	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 
@@ -2075,6 +2096,7 @@ async function* _parseResponsesAPIStream(
 
 export interface ResponsesAPIChunk {
 	type?: string;
+	usage?: Parameters<typeof extractOpenAIUsage>[0];
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	item?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: provider-native content part
@@ -2308,9 +2330,8 @@ export function parseResponsesAPIEvent(
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic gateway response may have usage at top level
-	const usage = chunk.response?.usage || (chunk as any).usage;
-	if (usage?.input_tokens != null) {
+	const usage = chunk.response?.usage ?? chunk.usage;
+	if (usage) {
 		logger.debug("OpenAI Responses API usage found", {
 			type,
 			inputTokens: usage.input_tokens,
@@ -2319,13 +2340,7 @@ export function parseResponsesAPIEvent(
 			cachedInputTokens: usage.input_tokens_details?.cached_tokens,
 		});
 		results.push({
-			usage: {
-				promptTokens: usage.input_tokens,
-				inputTokens: usage.input_tokens,
-				completionTokens: usage.output_tokens,
-				reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? undefined,
-				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
-			},
+			usage: openAIUsageToParsedUsage(usage, toolAccum),
 		});
 	}
 
@@ -3151,20 +3166,7 @@ function parseSSELine(
 			hasPromptTokens: promptTokens != null,
 			usage: chunk.usage,
 		});
-		if (promptTokens != null) {
-			return [
-				{
-					usage: {
-						promptTokens,
-						inputTokens: promptTokens,
-						completionTokens: chunk.usage.completion_tokens,
-						reasoningTokens: chunk.usage.completion_tokens_details?.reasoning_tokens ?? undefined,
-						cachedInputTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? undefined,
-					},
-				},
-			];
-		}
-		return [];
+		return [{ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) }];
 	}
 
 	// ── Responses API: function call start (item with call_id + name) ──
@@ -3279,6 +3281,9 @@ function parseSSELine(
 
 	const delta = choice.delta;
 	const results: ParsedStreamEvent[] = [];
+	if (chunk.usage) {
+		results.push({ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) });
+	}
 	const result: ParsedStreamEvent = {};
 
 	// A chunk may contain all three lanes. Publish content before any tool can

@@ -1,0 +1,2 @@
+ALTER TABLE "usage_token_repair_jobs" ADD COLUMN "protocol_overrides_json" text DEFAULT '[]' NOT NULL;--> statement-breakpoint
+ALTER TABLE "usage_token_repair_jobs" ADD CONSTRAINT "token_repair_protocol_config_bound" CHECK (length("protocol_overrides_json") <= 16384);

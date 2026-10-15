@@ -1,6 +1,6 @@
 {
-  "id": "6b0f116c-6200-4566-8228-0887c535abaa",
-  "prevId": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
+  "id": "589f163a-9f46-4c42-9b4f-7421ec507a16",
+  "prevId": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -538,6 +538,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "token_accounting_version": {
+          "name": "token_accounting_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "token_accounting_review_version": {
+          "name": "token_accounting_review_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
         "input_tokens": {
           "name": "input_tokens",
           "type": "integer",
@@ -783,6 +795,50 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_api_requests_token_repair_pending": {
+          "name": "idx_api_requests_token_repair_pending",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"token_accounting_version\" IS NULL AND \"token_accounting_review_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_api_requests_token_repair_reviewed": {
+          "name": "idx_api_requests_token_repair_reviewed",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"token_accounting_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -21121,6 +21177,310 @@
         "ck_terminals_resource_owner": {
           "name": "ck_terminals_resource_owner",
           "value": "\"worktree_resource_id\" is null or (\"chapter_id\" is null and \"narrator_id\" is null)"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.usage_token_repair_candidates": {
+      "name": "usage_token_repair_candidates",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "job_id": {
+          "name": "job_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_id": {
+          "name": "request_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "model": {
+          "name": "model",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "snapshot_json": {
+          "name": "snapshot_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "evidence_json": {
+          "name": "evidence_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "applied_at": {
+          "name": "applied_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "applied_by": {
+          "name": "applied_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "totals_status": {
+          "name": "totals_status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'unchanged'"
+        }
+      },
+      "indexes": {
+        "idx_token_repair_candidate_request": {
+          "name": "idx_token_repair_candidate_request",
+          "columns": [
+            {
+              "expression": "job_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "request_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_token_repair_candidates_page": {
+          "name": "idx_token_repair_candidates_page",
+          "columns": [
+            {
+              "expression": "job_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "token_repair_snapshot_bound": {
+          "name": "token_repair_snapshot_bound",
+          "value": "length(\"snapshot_json\") <= 8192"
+        },
+        "token_repair_evidence_bound": {
+          "name": "token_repair_evidence_bound",
+          "value": "length(\"evidence_json\") <= 16384"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.usage_token_repair_jobs": {
+      "name": "usage_token_repair_jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by": {
+          "name": "created_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "owner_id": {
+          "name": "owner_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "scanned": {
+          "name": "scanned",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "repaired": {
+          "name": "repaired",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "conflicts": {
+          "name": "conflicts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "upper_created_at": {
+          "name": "upper_created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "upper_id": {
+          "name": "upper_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cursor_created_at": {
+          "name": "cursor_created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cursor_id": {
+          "name": "cursor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "include_reviewed": {
+          "name": "include_reviewed",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "protocol_overrides_json": {
+          "name": "protocol_overrides_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'"
+        },
+        "source_job_id": {
+          "name": "source_job_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error": {
+          "name": "error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_token_repair_jobs_created": {
+          "name": "idx_token_repair_jobs_created",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_token_repair_single_active": {
+          "name": "idx_token_repair_single_active",
+          "columns": [
+            {
+              "expression": "(1)",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"status\" IN ('analyzing', 'ready', 'applying')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "token_repair_protocol_config_bound": {
+          "name": "token_repair_protocol_config_bound",
+          "value": "length(\"protocol_overrides_json\") <= 16384"
+        },
+        "token_repair_error_bound": {
+          "name": "token_repair_error_bound",
+          "value": "\"error\" IS NULL OR length(\"error\") <= 2048"
         }
       },
       "isRLSEnabled": false

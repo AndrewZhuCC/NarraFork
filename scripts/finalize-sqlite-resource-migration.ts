@@ -36,6 +36,9 @@ interface SnapshotTable {
 }
 export interface ResourceMigrationSnapshot {
 	tables: Record<string, SnapshotTable>;
+	internal?: {
+		indexes?: Record<string, { columns?: Record<string, { isExpression?: boolean }> }>;
+	};
 }
 interface Token {
 	kind: "word" | "identifier" | "string" | "symbol";
@@ -238,7 +241,28 @@ function expressionSignature(source: string, table: string, columns: string[]): 
 	}
 	return JSON.stringify(normalized);
 }
-function snapshotDDL(name: string, table: SnapshotTable): string[] {
+/** Only the literal integer 1, optionally wrapped in balanced parentheses, is allowed.
+ * Do not accept other expressions even when they evaluate/normalize to the same value. */
+function constantOneIndexSignature(source: string): string {
+	const parsed = statementsOf(`${source};`);
+	if (
+		parsed.length !== 1 ||
+		parsed[0].tokens.some(
+			(token) =>
+				!(token.kind === "word" && token.value === "1") &&
+				!symbol(token, "(") &&
+				!symbol(token, ")"),
+		) ||
+		expressionSignature(source, "", []) !== expressionSignature("1", "", [])
+	)
+		throw new Error("Unsupported expression index");
+	return expressionSignature(source, "", []);
+}
+function snapshotDDL(
+	name: string,
+	table: SnapshotTable,
+	snapshot: ResourceMigrationSnapshot,
+): string[] {
 	const columns = Object.keys(table.columns);
 	const expression = (value: unknown) => {
 		const text = String(value);
@@ -282,10 +306,21 @@ function snapshotDDL(name: string, table: SnapshotTable): string[] {
 	}
 	return [
 		`CREATE TABLE ${quote(name)} (${definitions.join(",")});`,
-		...Object.values(table.indexes ?? {}).map(
-			(index) =>
-				`CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX ${quote(index.name)} ON ${quote(name)} (${index.columns.map(quote).join(",")})${index.where ? ` WHERE ${expression(index.where)}` : ""};`,
-		),
+		...Object.values(table.indexes ?? {}).map((index) => {
+			// Drizzle stores sql`1` as "1" in columns, without an expression flag.
+			// A real column of that name takes precedence; no other expressions are supported.
+			const terms = index.columns.map((column) => {
+				const isExpression =
+					snapshot.internal?.indexes?.[index.name]?.columns?.[column]?.isExpression;
+				if (isExpression !== true && columns.some((name) => key(name) === key(column)))
+					return quote(column);
+				if (isExpression === false) throw new Error("Unsupported snapshot index column");
+				if (index.columns.length !== 1) throw new Error("Unsupported snapshot index expression");
+				constantOneIndexSignature(column);
+				return column;
+			});
+			return `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX ${quote(index.name)} ON ${quote(name)} (${terms.join(",")})${index.where ? ` WHERE ${expression(index.where)}` : ""};`;
+		}),
 	];
 }
 function tableSignature(db: Database, name: string): string {
@@ -430,12 +465,36 @@ function tableSignature(db: Database, name: string): string {
 				)
 				.all()
 				.filter((row) => row.key);
-			if (rows.some((row) => row.cid < 0)) throw new Error("Unsupported expression index");
+			let indexExpression: string | undefined;
+			if (rows.some((row) => row.cid < 0)) {
+				const offset = keyword(it[1], "UNIQUE") ? 3 : 2;
+				const close = (where < 0 ? it.length : where) - 1;
+				if (
+					rows.length !== 1 ||
+					rows[0].cid !== -2 ||
+					!sql ||
+					!keyword(it[0], "CREATE") ||
+					!keyword(it[offset - 1], "INDEX") ||
+					!keyword(it[offset + 1], "ON") ||
+					!symbol(it[offset + 3], "(") ||
+					!symbol(it[close], ")")
+				)
+					throw new Error("Unsupported expression index");
+				indexExpression = constantOneIndexSignature(sql.slice(it[offset + 3].end, it[close].start));
+			}
 			return [
 				index.origin === "c" ? key(index.name) : index.origin,
 				index.unique,
 				index.partial,
-				rows.map((row) => [row.name === null ? null : key(row.name), row.desc, row.coll]),
+				rows.map((row) => [
+					indexExpression === undefined
+						? row.name === null
+							? null
+							: key(row.name)
+						: ["expression", indexExpression],
+					row.desc,
+					row.coll,
+				]),
 				where < 0 ? null : expr(sql?.slice(it[where].end) ?? ""),
 			];
 		});
@@ -472,9 +531,9 @@ function validateTargetDDL(
 	try {
 		expected = new Database(":memory:");
 		for (const [name, table] of Object.entries(before.tables))
-			for (const ddl of snapshotDDL(name, table)) actual.exec(ddl);
+			for (const ddl of snapshotDDL(name, table, before)) actual.exec(ddl);
 		for (const [name, table] of Object.entries(after.tables))
-			for (const ddl of snapshotDDL(name, table)) expected.exec(ddl);
+			for (const ddl of snapshotDDL(name, table, after)) expected.exec(ddl);
 		for (const statement of statements) {
 			const t = statement.tokens;
 			if (keyword(t[0], "PRAGMA") || keyword(t[0], "INSERT")) continue;
@@ -760,6 +819,24 @@ export function finalizeResourceMigration(
 				t.at(-1)?.value === ";"
 			)
 				throw new Error("Unsupported CREATE INDEX SQL");
+			// During table rebuilds Drizzle quotes expressions as if they were columns.
+			// Repair only the exact single term explicitly marked as an expression in
+			// this target snapshot; receipt-less validation must still reject raw SQL.
+			const definition = snapshotFor(identifier(t[offset + 2]));
+			const index = Object.values(definition.indexes ?? {}).find(
+				(index) => key(index.name) === key(identifier(t[offset])),
+			);
+			const term = t[offset + 4];
+			if (
+				index?.columns.length === 1 &&
+				term?.kind === "identifier" &&
+				term.value === index.columns[0] &&
+				symbol(t[offset + 5], ")") &&
+				after.internal?.indexes?.[index.name]?.columns?.[term.value]?.isExpression === true
+			) {
+				constantOneIndexSignature(term.value);
+				rendered = `${sql.slice(t[0].start, term.start)}1${sql.slice(term.end, t.at(-1)?.end)};`;
+			}
 		} else if (keyword(t[0], "DROP") && keyword(t[1], "INDEX") && t.length === 3) identifier(t[2]);
 		else throw new Error(`Unsupported migration SQL: ${t[0]?.value}`);
 		output.push(rendered);

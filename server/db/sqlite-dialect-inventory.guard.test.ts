@@ -553,6 +553,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/export-rows.ts": ["driver"],
 	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
+	// Explicit SQLite branch of the dual-backend, off-thread historical accounting store.
+	"server/services/usage-token-repair-store.ts": ["driver", "pragma", "indexHint"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
 	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
