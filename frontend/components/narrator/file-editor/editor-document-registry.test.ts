@@ -83,6 +83,7 @@ afterEach(async () => {
 		lease.copy.dispose();
 	}
 	await tick();
+	registry.shutdown();
 	for (const restore of restores.reverse()) restore();
 });
 
@@ -105,6 +106,10 @@ test("two independently authorized consumers share one working copy, model, base
 	expect(models[0].text).toBe("hello");
 	expect(b.copy.protected).toBe(false);
 	b.release();
+	await tick();
+	// Clean final consumers enter the bounded cache; invalidated clean entries are released.
+	expect(models[0].disposed).toBe(false);
+	registry.invalidateNarrator("source", "test context retired");
 	await tick();
 	expect(models[0].disposed).toBe(true);
 	expect(registry.size).toBe(0);
@@ -433,6 +438,119 @@ test("source failure retry reuses its existing model without leaking another can
 	await a.copy.ensureLoaded();
 	expect(a.copy.getSnapshot().loaded).toBe(true);
 	expect(models).toHaveLength(1);
+});
+
+test("clean hidden tab leases do not keep a model, baseline or server doc alive under pressure", async () => {
+	registry = new EditorDocumentRegistry({ count: 0, bytes: 0, idleMs: 300_000 });
+	const onEvicted = spyOn({ run() {} }, "run");
+	const lease = await registry.acquire(options, new AbortController().signal, onEvicted);
+	leases.push(lease);
+	await lease.copy.ensureLoaded();
+	expect(models[0].disposed).toBe(false);
+	lease.setVisible(false);
+	await tick();
+	expect(models[0].disposed).toBe(true);
+	expect(registry.size).toBe(0);
+	expect(onEvicted).toHaveBeenCalledTimes(1);
+	expect(lease.copy.session.resourceCosts).toEqual({ documents: 0, baselineBytes: 0 });
+	expect(release).toHaveBeenCalledWith("source", "doc-1");
+	lease.release();
+	lease.setVisible(true);
+	expect(registry.size).toBe(0);
+});
+
+for (const reason of [
+	"dirty",
+	"encoding",
+	"uploading",
+	"committing",
+	"unknown",
+	"confirmation",
+	"conflict",
+] as const)
+	test(`registry protects real working copy ${reason} state while hidden and all budgets are exceeded`, async () => {
+		registry = new EditorDocumentRegistry({ count: 0, bytes: 0, idleMs: 1 });
+		const lease = await acquire();
+		await lease.copy.ensureLoaded();
+		const clean = lease.copy.session.state;
+		if (reason === "dirty") models[0].edit("protected draft");
+		else if (reason === "confirmation" || reason === "conflict")
+			lease.copy.session.state = { ...clean, [reason]: {} };
+		else lease.copy.session.state = { ...clean, phase: reason };
+		lease.setVisible(false);
+		await tick();
+		expect(models[0].disposed).toBe(false);
+		expect(registry.diagnostics().pinReasons[reason]).toBe(1);
+		expect(registry.diagnostics().pinnedBytes).toBeGreaterThan(0);
+		lease.copy.session.state = clean;
+		lease.release();
+		await tick();
+		expect(models[0].disposed).toBe(true);
+	});
+
+test("one visible lease protects a shared model when the other hides and releases", async () => {
+	registry = new EditorDocumentRegistry({ count: 0, bytes: 0, idleMs: 1 });
+	const a = await acquire();
+	const b = await acquire();
+	await a.copy.ensureLoaded();
+	a.setVisible(false);
+	a.release();
+	await tick();
+	expect(models[0].disposed).toBe(false);
+	expect(registry.diagnostics().visibleConsumers).toBe(1);
+	b.setVisible(false);
+	await tick();
+	expect(models[0].disposed).toBe(true);
+});
+
+test("a valid candidate installation reference survives final consumer release even before a model exists", async () => {
+	const lease = await acquire();
+	const releaseCandidate = lease.copy.pin("candidate-install", { models: 1, bytes: 100 });
+	lease.release();
+	await tick();
+	expect(registry.size).toBe(1);
+	expect(source).not.toHaveBeenCalled();
+	expect(registry.diagnostics().pinReasons["candidate-install"]).toBe(1);
+	releaseCandidate();
+	await tick();
+	expect(registry.size).toBe(0);
+	expect(release).toHaveBeenCalledWith("source", "doc-1");
+});
+
+test("candidate reservations and independent pin owners account for old plus future costs", async () => {
+	registry = new EditorDocumentRegistry({ count: 0, bytes: 0, idleMs: 1 });
+	const lease = await acquire();
+	await lease.copy.ensureLoaded();
+	const initial = lease.copy.resourceCosts;
+	const releaseA = lease.copy.pin("candidate-install", { models: 1, bytes: 100 });
+	const releaseB = lease.copy.pin("candidate-install");
+	expect(lease.copy.resourceCosts.models).toBe(initial.models + 1);
+	expect(lease.copy.resourceCosts.bytes).toBe(initial.bytes + 100);
+	lease.setVisible(false);
+	await tick();
+	releaseA();
+	releaseA();
+	await tick();
+	expect(models[0].disposed).toBe(false);
+	expect(lease.copy.resourceCosts).toEqual(initial);
+	releaseB();
+	await tick();
+	expect(models[0].disposed).toBe(true);
+});
+
+test("a clean cached tab is authorized again before reattaching, not trusted by its old path", async () => {
+	const first = await acquire();
+	await first.copy.ensureLoaded();
+	first.setVisible(false);
+	await tick();
+	create.mockRejectedValueOnce(new ApiError("revoked", 403));
+	await expect(acquire()).rejects.toThrow("revoked");
+	expect(source).toHaveBeenCalledTimes(1);
+	expect(models[0].disposed).toBe(false);
+	registry.invalidateNarrator("source", "revoked");
+	first.release();
+	await tick();
+	expect(models[0].disposed).toBe(true);
 });
 
 test("late source results cannot install after binding invalidation", async () => {

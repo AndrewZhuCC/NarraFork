@@ -34,6 +34,7 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import type { FilePanelParams } from "../panels/panel-kind";
 import { WorkspaceDockStore } from "../workspace/workspace-dock";
@@ -47,6 +48,7 @@ import { mountedTestModels, TestEditorModel, TestMonacoEditor } from "./file-edi
 // Real Monaco tokenization/navigation/IME/search are covered by the Chromium fixture.
 import * as monacoComponent from "./MonacoEditor";
 import * as searchComponent from "./MonacoSearchPanel";
+import * as monacoScroll from "./monaco-scroll";
 
 const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 
@@ -219,6 +221,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	try {
 		await act(async () => root?.unmount());
+		editorDocumentRegistry.shutdown();
 		host?.remove();
 	} finally {
 		root = undefined;
@@ -547,6 +550,8 @@ for (const surface of ["focus", "workspace"] as const)
 				params,
 				api: {
 					id: panel.id,
+					isVisible: true,
+					onDidVisibilityChange: () => ({ dispose() {} }),
 					title: "a.txt",
 					close() {},
 					setTitle() {},
@@ -622,6 +627,10 @@ test("StrictMode effect replay still loads an editable session and releases aban
 	expect(await upload.mock.calls[0]?.[3].text()).toBe("strict draft");
 	expect(beginUpload.mock.calls[0]?.[0]).toBe("child");
 	await act(async () => root?.render(null));
+	expect(model.disposed).toBe(false);
+	expect(editorDocumentRegistry.diagnostics().pinReasons).toEqual({});
+	editorDocumentRegistry.invalidateNarrator("child", "retired clean test context");
+	await act(async () => {});
 	expect(model.disposed).toBe(true);
 	expect(release).toHaveBeenCalledWith("child", "strict-2");
 });
@@ -1059,6 +1068,10 @@ test("real FilePanelContent normal reopen has one recovery discovery and reuses 
 	await act(async () => current.undo());
 	expect(current.text).toBe("a\nb\n");
 	await act(async () => root?.render(null));
+	expect(current.disposed).toBe(false);
+	expect(editorDocumentRegistry.diagnostics().pinReasons).toEqual({});
+	editorDocumentRegistry.invalidateNarrator("normal-host-source", "retired clean context");
+	await act(async () => {});
 	expect(current.disposed).toBe(true);
 });
 
@@ -1509,6 +1522,234 @@ test("scoped files with no narrator never fall back to broad/local readers", asy
 	expect(preview).not.toHaveBeenCalled();
 	expect(create).not.toHaveBeenCalled();
 	expect(legacyWrite).not.toHaveBeenCalled();
+});
+
+test("real hidden grace aborts a deferred baseline hash and reveal retries to clear the dirty close guard", async () => {
+	const nativeTimeout = globalThis.setTimeout;
+	const nativeClear = globalThis.clearTimeout;
+	const timers = new Map<ReturnType<typeof setTimeout>, { ms: number; callback: () => void }>();
+	const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: () => void,
+		ms?: number,
+	) => {
+		if (ms !== 750 && ms !== 1000) return nativeTimeout(callback, ms);
+		const timer = nativeTimeout(() => {}, 60_000);
+		timers.set(timer, { ms, callback });
+		return timer;
+	}) as typeof setTimeout);
+	const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(((
+		timer: ReturnType<typeof setTimeout>,
+	) => {
+		timers.delete(timer);
+		nativeClear(timer);
+	}) as typeof clearTimeout);
+	const flush = async (ms: number) =>
+		act(async () => {
+			for (const [timer, task] of [...timers])
+				if (task.ms === ms) {
+					timers.delete(timer);
+					nativeClear(timer);
+					task.callback();
+				}
+		});
+	const visibleHost = spyOn(monacoScroll, "monacoHostVisible").mockReturnValue(true);
+	const hash = spyOn(snapshots, "hashEditorSnapshot").mockImplementation(async (snapshot) => {
+		let text = "";
+		for (let chunk = snapshot.read(); chunk !== null; chunk = snapshot.read()) text += chunk;
+		return text;
+	});
+	restores.push(() => {
+		for (const timer of timers.keys()) nativeClear(timer);
+		timeoutSpy.mockRestore();
+		clearSpy.mockRestore();
+		visibleHost.mockRestore();
+		hash.mockRestore();
+	});
+	let hashSignal: AbortSignal | undefined;
+	hash.mockImplementationOnce(async (snapshot, signal) => {
+		expect(snapshot.read()).toBe("a\nb\n");
+		hashSignal = signal;
+		return new Promise((_resolve, reject) =>
+			signal?.addEventListener("abort", () => reject(new DOMException("hidden", "AbortError")), {
+				once: true,
+			}),
+		);
+	});
+	const renderVisible = async (visible: boolean) =>
+		act(async () =>
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<NarratorPanelVisibilityProvider value={visible}>
+							<FileEditorContent
+								filePath="/work/hash-hide.txt"
+								narratorId="child"
+								referenceOrigin
+								onDirtyChange={dirty}
+							/>
+						</NarratorPanelVisibilityProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
+		);
+	await renderVisible(true);
+	const model = [...mountedTestModels.values()][0];
+	Object.assign(model, { getDomNode: () => host });
+	await edit(model, "c\nd\n");
+	await edit(model, "a\nb\n");
+	await flush(750);
+	expect(hash).toHaveBeenCalledTimes(1);
+	await renderVisible(false);
+	expect(hashSignal?.aborted).toBe(false);
+	await flush(1000);
+	expect(hashSignal?.aborted).toBe(true);
+	await flush(750);
+	expect(hash).toHaveBeenCalledTimes(1);
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+	expect(model.disposed).toBe(false);
+	await renderVisible(true);
+	await flush(750);
+	expect(hash).toHaveBeenCalledTimes(3);
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
+	expect(model.undoEntries).toHaveLength(2);
+	expect(create).toHaveBeenCalledTimes(1);
+	expect(read).toHaveBeenCalledTimes(1);
+});
+
+test("retry after a view-independent model loader failure releases the failed lease and authorizes again", async () => {
+	spyOn(workingCopies, "createWorkingCopyModel").mockRejectedValueOnce(
+		new Error("Monaco unavailable"),
+	);
+	await expect(mount()).rejects.toThrow("Monaco unavailable");
+	const retryButton = [...host.querySelectorAll("button")].find(
+		(button) => button.textContent === "Retry",
+	);
+	if (!retryButton) throw new Error("Missing loader retry button");
+	await click(retryButton);
+	expect([...mountedTestModels.values()]).toHaveLength(1);
+	expect(create).toHaveBeenCalledTimes(2);
+	expect(read).toHaveBeenCalledTimes(1);
+	expect(release).toHaveBeenCalled();
+});
+
+test("hiding a pending authorization cancels it and a late descriptor never starts a model or source read", async () => {
+	let resolve!: (value: EditorDocumentDescriptor) => void;
+	create.mockReturnValueOnce(
+		new Promise((done) => {
+			resolve = done;
+		}),
+	);
+	const renderVisible = async (visible: boolean) =>
+		act(async () =>
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<NarratorPanelVisibilityProvider value={visible}>
+							<FileEditorContent filePath="/work/pending.txt" narratorId="child" referenceOrigin />
+						</NarratorPanelVisibilityProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
+		);
+	await renderVisible(true);
+	const signal = create.mock.calls[0]?.[2];
+	await renderVisible(false);
+	expect(signal?.aborted).toBe(true);
+	await act(async () => resolve(descriptor));
+	expect(read).not.toHaveBeenCalled();
+	expect(workingCopies.createWorkingCopyModel).not.toHaveBeenCalled();
+	expect(release).toHaveBeenCalledWith("child", "doc");
+	await renderVisible(true);
+	expect(read).toHaveBeenCalledTimes(1);
+	expect([...mountedTestModels.values()]).toHaveLength(1);
+});
+
+test("hidden real panel keeps the dirty close/unload guard without continuing preview work", async () => {
+	const renderVisible = async (visible: boolean) =>
+		act(async () =>
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<NarratorPanelVisibilityProvider value={visible}>
+							<FileEditorContent
+								filePath="/work/hidden.md"
+								narratorId="child"
+								referenceOrigin
+								onDirtyChange={dirty}
+							/>
+						</NarratorPanelVisibilityProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
+		);
+	await renderVisible(true);
+	const model = [...mountedTestModels.values()][0];
+	await edit(model, "# hidden dirty");
+	await switchFileMode("split");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("hidden dirty");
+	await renderVisible(false);
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+	expect(model.props.visible).toBe(false);
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).not.toContain(
+		"hidden dirty",
+	);
+	const beforeUnload = new Event("beforeunload", { cancelable: true });
+	window.dispatchEvent(beforeUnload);
+	expect(beforeUnload.defaultPrevented).toBe(true);
+	expect(create).toHaveBeenCalledTimes(1);
+	await renderVisible(true);
+	expect([...mountedTestModels.values()][0]).toBe(model);
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("hidden dirty");
+});
+
+test("hidden recovery discovery is deferred, but a visible failed gate still exposes the original safe draft", async () => {
+	const { FilePanelContent } = await import("../file-panel/FilePanelContent");
+	create.mockResolvedValue({
+		...descriptor,
+		resourceKey: "old-hidden-binding",
+		recoveryKey: "verified-hidden-owner",
+	});
+	const old = await mount({ filePath: "/work/hidden-recovery.txt", narratorId: "child" });
+	await edit(old, "never bind this old draft to a new resource");
+	await act(async () => editorDocumentRegistry.invalidateNarrator("child", "workspace changed"));
+	await act(async () => root?.render(null));
+	create.mockClear();
+	const scope = spyOn(editorDocumentApi, "recoveryScope").mockResolvedValue({
+		recoveryKey: "verified-hidden-owner",
+	});
+	const info = spyOn(fileReferenceApi, "info").mockRejectedValue(
+		new ApiError("deleted current file", 404),
+	);
+	restores.push(
+		() => scope.mockRestore(),
+		() => info.mockRestore(),
+	);
+	const renderVisible = async (visible: boolean) =>
+		act(async () =>
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<FilePanelContent
+							filePath="/work/hidden-recovery.txt"
+							narratorId="child"
+							referenceOrigin
+							visible={visible}
+						/>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
+		);
+	await renderVisible(false);
+	expect(info).not.toHaveBeenCalled();
+	expect(create).not.toHaveBeenCalled();
+	expect(scope).not.toHaveBeenCalled();
+	expect(old.disposed).toBe(false);
+	await renderVisible(true);
+	expect(host.querySelector("[data-editor-retained-draft]")).not.toBeNull();
+	expect(host.textContent).toContain("deleted current file");
+	expect(create).not.toHaveBeenCalled();
+	expect(scope).toHaveBeenCalledTimes(1);
+	expect(old.text).toBe("never bind this old draft to a new resource");
 });
 
 for (const extension of ["txt", "md", "json"] as const)

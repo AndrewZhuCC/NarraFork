@@ -127,6 +127,49 @@ async function render(props: Partial<FilePanelContentProps> = {}) {
 	});
 }
 
+test("never-displayed labels are lightweight: no metadata, recovery or child load until visible", async () => {
+	await render({ visible: false });
+	expect(info).not.toHaveBeenCalled();
+	expect(page).not.toHaveBeenCalled();
+	expect(editorMounts).toBe(0);
+	expect(
+		host.querySelector("[data-editor], [data-viewer], [data-editor-retained-draft]"),
+	).toBeNull();
+	await render({ visible: true });
+	expect(info).toHaveBeenCalledTimes(1);
+	expect(editorMounts).toBe(1);
+	await render({ visible: false });
+	await render({ visible: true });
+	expect(info).toHaveBeenCalledTimes(1);
+	expect(editorMounts).toBe(1);
+});
+
+test("restoring one thousand retained label descriptors probes metadata only for selected split tabs", async () => {
+	const tabs = Array.from({ length: 1000 }, (_, index) => ({
+		path: `/file-${index}.txt`,
+		visible: index === 4 || index === 500,
+	}));
+	await act(async () =>
+		root.render(
+			<MantineProvider>
+				<I18nextProvider i18n={i18n}>
+					{tabs.map((tab) => (
+						<FilePanelContent
+							key={tab.path}
+							filePath={tab.path}
+							narratorId="source"
+							visible={tab.visible}
+						/>
+					))}
+				</I18nextProvider>
+			</MantineProvider>,
+		),
+	);
+	expect(info).toHaveBeenCalledTimes(2);
+	expect(editorMounts).toBe(2);
+	expect(page).not.toHaveBeenCalled();
+});
+
 const selection = { startLineNumber: 2, startColumn: 1, endLineNumber: 3, endColumn: 4 };
 
 test("text routes through the real gate and forwards source scope and editor callbacks", async () => {

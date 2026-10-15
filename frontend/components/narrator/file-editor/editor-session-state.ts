@@ -9,6 +9,7 @@ import type {
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import {
+	EditorSnapshotReplay,
 	type EditorTextSnapshot,
 	getEncodedEditorSnapshotHash,
 	hashEditorSnapshot,
@@ -114,7 +115,7 @@ export class EditorDocumentSession {
 	private attempt: Attempt | null = null;
 	private loadController: AbortController | null = null;
 	private disposed = false;
-	private baselineSource: EditorTextSnapshot | Blob | null = null;
+	private baselineSource: EditorSnapshotReplay | Blob | null = null;
 	private baselineDigest: Promise<string | null> | null = null;
 	private baselineController = new AbortController();
 	private baselineLength = -1;
@@ -144,7 +145,7 @@ export class EditorDocumentSession {
 			if (digest) this.baselineDigest = Promise.resolve(digest);
 		} else if (version) {
 			try {
-				this.baselineSource = this.options.snapshot();
+				this.baselineSource = new EditorSnapshotReplay(this.options.snapshot());
 			} catch {
 				/* Equality is optional; inability to verify must remain conservatively dirty. */
 			}
@@ -174,10 +175,27 @@ export class EditorDocumentSession {
 		const generation = this.baselineGeneration;
 		if (!this.baselineDigest && this.baselineSource) {
 			const source = this.baselineSource;
-			this.baselineSource = null;
-			this.baselineDigest = this.fingerprint(source, this.baselineController.signal).catch(
-				() => null,
-			);
+			const controller = this.baselineController;
+			const digest = this.fingerprint(
+				source instanceof EditorSnapshotReplay ? source.snapshot() : source,
+				controller.signal,
+			)
+				.then((value) => {
+					if (
+						controller.signal.aborted ||
+						generation !== this.baselineGeneration ||
+						this.baselineDigest !== digest
+					)
+						return null;
+					this.baselineSource = null;
+					return value;
+				})
+				.catch(() => {
+					// An old cancelled job must not clear a newer retry (or a saved baseline).
+					if (this.baselineDigest === digest) this.baselineDigest = null;
+					return null;
+				});
+			this.baselineDigest = digest;
 		}
 		if (!this.baselineDigest) return;
 		try {
@@ -854,6 +872,22 @@ export class EditorDocumentSession {
 				this.update({ loading: false });
 			}
 		}
+	}
+	get resourceCosts() {
+		return {
+			documents: this.document ? 1 : 0,
+			baselineBytes:
+				this.baselineSource instanceof EditorSnapshotReplay
+					? this.baselineSource.estimatedBytes
+					: (this.baselineSource?.size ?? 0),
+		};
+	}
+	cancelBackgroundVerification() {
+		this.baselineController.abort();
+		this.baselineController = new AbortController();
+		// Retain the replay owner while hashing is incomplete. A future visible consumer
+		// can restart immediately, even if the old worker has not settled its abort yet.
+		if (this.baselineSource) this.baselineDigest = null;
 	}
 	dispose() {
 		this.disposed = true;

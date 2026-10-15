@@ -3,7 +3,12 @@ import type { FileSelection } from "@shared/file-reference";
 import type { editor } from "monaco-editor/editor/editor.api";
 import { type Ref, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useEditorPanelVisible, useRetainedEditorView } from "../narrator-panel-visibility";
 import { createEditorLocalId } from "./editor-local-id";
+
+let liveViews = 0;
+export const getEditorViewDiagnostics = () => ({ views: liveViews });
+
 import { MonacoSearchPanel } from "./MonacoSearchPanel";
 import {
 	loadMonacoLanguage,
@@ -62,6 +67,7 @@ export interface MonacoEditorProps {
 	navigationRequestId?: string;
 	lineWrapping?: boolean;
 	visible?: boolean;
+	viewState?: { current: editor.ICodeEditorViewState | null };
 }
 
 interface Runtime {
@@ -100,6 +106,13 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 /** Monaco owns the only mutable document. Props are explicit loads, never controlled input echoes. */
 export function MonacoEditor(props: MonacoEditorProps) {
 	const { ref, documentKey, model: externalModel } = props;
+	const visible = useEditorPanelVisible(props.visible);
+	const retained = useRetainedEditorView(visible);
+	const ownViewState = useRef<editor.ICodeEditorViewState | null>(null);
+	const viewState = props.viewState ?? ownViewState;
+	const savedNavigation = useRef({ documentKey, request: "" });
+	const visibility = useRef(visible);
+	visibility.current = visible;
 	const { t } = useTranslation("narrator");
 	const [longLineDocumentKey, setLongLineDocumentKey] = useState<string | null>(null);
 	const [fullLongLineDocumentKey, setFullLongLineDocumentKey] = useState<string | null>(null);
@@ -139,7 +152,11 @@ export function MonacoEditor(props: MonacoEditorProps) {
 
 	useEffect(() => {
 		const host = hostRef.current;
-		if (!host) return;
+		if (!host || !retained) return;
+		if (savedNavigation.current.documentKey !== documentKey) {
+			savedNavigation.current = { documentKey, request: "" };
+			viewState.current = null;
+		}
 		let cancelled = false;
 		let dispose: (() => void) | undefined;
 		// Full rendering is an opt-in for this model lifetime, not a preference for another file.
@@ -162,7 +179,16 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				theme: "narrafork",
 				ariaLabel: initial.filePath,
 			});
-			dispose = () => view.dispose();
+			liveViews++;
+			let viewDisposed = false;
+			const disposeView = () => {
+				if (viewDisposed) return;
+				viewDisposed = true;
+				liveViews--;
+				viewState.current = view.saveViewState?.() ?? null;
+				view.dispose();
+			};
+			dispose = disposeView;
 			const uri = api.Uri.from({
 				scheme: "narrafork-editor",
 				authority: "document",
@@ -172,16 +198,17 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			const model =
 				externalModel ?? api.editor.createModel(initial.initialValue, languageStatus.language, uri);
 			dispose = () => {
-				view.dispose();
+				disposeView();
 				if (!externalModel) model.dispose();
 			};
 			const longLines = new MonacoLongLineTracker(model);
 			if (longLines.hasLongLine) view.updateOptions({ wordWrap: "off" });
 			view.setModel(model);
+			if (viewState.current) view.restoreViewState?.(viewState.current);
 			const navigation = new MonacoNavigationHighlight(view);
 			let loadedValue = initial.initialValue;
 			let loadedPath = initialLanguagePath;
-			let lastNavigation = "";
+			let lastNavigation = savedNavigation.current.request;
 			let loadRevision = 0;
 			let languageRequest = 0;
 			let readyCallback = initial.onReady;
@@ -210,7 +237,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				if (frame) return;
 				frame = requestAnimationFrame(() => {
 					frame = 0;
-					if (cancelled || latest.current.visible === false || !monacoHostVisible(host)) return;
+					if (cancelled || !visibility.current || !monacoHostVisible(host)) return;
 					if (width !== host.clientWidth || height !== host.clientHeight) {
 						width = host.clientWidth;
 						height = host.clientHeight;
@@ -286,6 +313,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					: "";
 				if (lastNavigation !== request) {
 					lastNavigation = request;
+					savedNavigation.current.request = request;
 					if (next.selection) {
 						const range = monacoFileSelectionRange(model, next.selection);
 						navigation.set(range);
@@ -428,7 +456,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				blurSubscription?.dispose();
 				navigation.dispose();
 				runtime.current = null;
-				view.dispose();
+				disposeView();
 				if (!externalModel) model.dispose();
 				readyCallback?.(null);
 			};
@@ -448,16 +476,22 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			cancelled = true;
 			dispose?.();
 		};
-	}, [documentKey, handle, externalModel]);
+	}, [documentKey, handle, externalModel, retained, viewState]);
 
 	// No props are lifecycle dependencies: theme, preview and callback changes retain the model.
 	useEffect(() => {
 		runtime.current?.sync();
 	});
 	useEffect(() => {
-		if (internalSearch && (internalSearch.documentKey !== documentKey || props.onSearchRequested))
+		if (
+			internalSearch &&
+			(!visible ||
+				!retained ||
+				internalSearch.documentKey !== documentKey ||
+				props.onSearchRequested)
+		)
 			setInternalSearch(null);
-	}, [internalSearch, documentKey, props.onSearchRequested]);
+	}, [internalSearch, documentKey, props.onSearchRequested, visible, retained]);
 	return (
 		<Box
 			style={{

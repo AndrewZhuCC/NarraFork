@@ -30,6 +30,7 @@ export class TestEditorModel {
 	getVersionId = () => this.revision;
 	getAlternativeVersionId = () => this.alt;
 	getValueLength = () => this.text.length;
+	getLineCount = () => this.text.split("\n").length;
 	getValue = () => this.text;
 	createSnapshot = () => {
 		let text: string | null = this.text;

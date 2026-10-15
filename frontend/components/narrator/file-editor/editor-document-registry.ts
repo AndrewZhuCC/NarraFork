@@ -1,14 +1,18 @@
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
+import { EDITOR_CACHE_LIMITS, type EditorCacheItem, EditorModelCache } from "./editor-model-cache";
 import { EditorWorkingCopy, type WorkingCopyOptions } from "./editor-working-copy";
 
-interface Entry {
+interface Entry extends EditorCacheItem {
 	copy: EditorWorkingCopy;
 	references: number;
 	viewReferences: number;
+	visible: number;
+	evictionListeners: Set<() => void>;
 	removeListener: () => void;
 }
 export interface EditorDocumentLease {
 	copy: EditorWorkingCopy;
+	setVisible(visible: boolean): void;
 	release(): void;
 }
 export interface EditorRecoveryLease {
@@ -20,6 +24,53 @@ export interface EditorRecoveryLease {
 /** Realm-local only. A path (even an absolute path) is NEVER an authorization identity. */
 export class EditorDocumentRegistry {
 	private entries = new Set<Entry>();
+	private cache: EditorModelCache<Entry>;
+	constructor(limits = EDITOR_CACHE_LIMITS, now = Date.now) {
+		this.cache = new EditorModelCache<Entry>(limits, now);
+	}
+	private pendingLoads = 0;
+	private tabs = 0;
+	registerTab() {
+		this.tabs++;
+		return () => {
+			this.tabs--;
+		};
+	}
+	/** Explicit bounded metadata diagnostics; never reads text/snapshots/undo stacks. */
+	diagnostics() {
+		let models = 0,
+			admittedModels = 0,
+			bytes = 0,
+			docs = 0,
+			loads = this.pendingLoads,
+			visible = 0,
+			pinnedBytes = 0;
+		const pinReasons: Record<string, number> = {};
+		for (const entry of this.entries) {
+			const cost = entry.copy.resourceCosts;
+			models += entry.copy.model ? 1 : 0;
+			admittedModels += cost.models;
+			bytes += cost.bytes;
+			docs += cost.documents;
+			loads += cost.loads;
+			visible += entry.visible;
+			const reasons = entry.pins();
+			if (reasons.length) pinnedBytes += cost.bytes;
+			for (const reason of reasons) pinReasons[reason] = (pinReasons[reason] ?? 0) + 1;
+		}
+		return {
+			tabs: this.tabs,
+			workingCopies: this.entries.size,
+			models,
+			admittedModels,
+			estimatedBytes: bytes,
+			pinnedBytes,
+			docs,
+			loads,
+			visibleConsumers: visible,
+			pinReasons,
+		};
+	}
 	private canonical = new Map<string, Entry>();
 	private generations = new Map<string, number>();
 	private removeUnload: (() => void) | undefined;
@@ -33,12 +84,17 @@ export class EditorDocumentRegistry {
 		window.addEventListener("beforeunload", listener);
 		this.removeUnload = () => window.removeEventListener("beforeunload", listener);
 	}
-	async acquire(options: WorkingCopyOptions, signal: AbortSignal): Promise<EditorDocumentLease> {
+	async acquire(
+		options: WorkingCopyOptions,
+		signal: AbortSignal,
+		onEvicted?: () => void,
+	): Promise<EditorDocumentLease> {
 		const generation = this.generations.get(options.narratorId) ?? 0;
 		// Each new consumer is reauthorized. No provisional sharing without a complete known scope.
-		const descriptor = options.readOnlySource
-			? undefined
-			: await editorDocumentApi.create(
+		this.pendingLoads++;
+		const descriptor = await (options.readOnlySource
+			? Promise.resolve(undefined)
+			: editorDocumentApi.create(
 					options.narratorId,
 					{
 						path: options.path,
@@ -46,7 +102,10 @@ export class EditorDocumentRegistry {
 						origin: options.origin(),
 					},
 					signal,
-				);
+				)
+		).finally(() => {
+			this.pendingLoads--;
+		});
 		const releaseExtra = () => {
 			if (descriptor)
 				void editorDocumentApi.release(options.narratorId, descriptor.docId).catch(() => {});
@@ -63,12 +122,25 @@ export class EditorDocumentRegistry {
 		if (entry) releaseExtra();
 		else {
 			const copy = new EditorWorkingCopy(options, descriptor);
-			entry = { copy, references: 0, viewReferences: 0, removeListener: () => {} };
-			const owned = entry;
-			entry.removeListener = copy.subscribe(() => {
-				if (owned.references === 0) this.collect(owned);
-			});
+			const owned: Entry = {
+				copy,
+				references: 0,
+				viewReferences: 0,
+				visible: 0,
+				evictionListeners: new Set(),
+				removeListener: () => {},
+				cost: () => copy.resourceCosts,
+				pins: () => [
+					...(owned.visible ? ["visible"] : []),
+					...(owned.references > owned.viewReferences ? ["recovery"] : []),
+					...copy.pinReasons,
+				],
+				evict: () => this.evict(owned),
+			};
+			entry = owned;
+			entry.removeListener = copy.subscribe(() => this.collect(owned));
 			this.entries.add(entry);
+			this.cache.add(entry);
 			this.canonical.set(copy.key, entry);
 			this.watchUnload();
 		}
@@ -93,12 +165,29 @@ export class EditorDocumentRegistry {
 		const viewing = entry;
 		viewing.viewReferences++;
 		viewing.references++;
+		viewing.visible++;
+		this.cache.used(viewing);
+		this.cache.enforce();
+		if (onEvicted) viewing.evictionListeners.add(onEvicted);
 		let released = false;
+		let visible = true;
+		const setVisible = (next: boolean) => {
+			if (released || visible === next || !this.entries.has(viewing)) return;
+			visible = next;
+			viewing.visible += next ? 1 : -1;
+			// Start idle time on last visible detach, not on background metadata updates.
+			this.cache.used(viewing);
+			if (!viewing.visible) viewing.copy.session.cancelBackgroundVerification();
+			this.collect(viewing);
+		};
 		return {
 			copy: entry.copy,
+			setVisible,
 			release: () => {
 				if (released) return;
+				setVisible(false);
 				released = true;
+				if (onEvicted) viewing.evictionListeners.delete(onEvicted);
 				viewing.viewReferences--;
 				viewing.references--;
 				this.collect(viewing);
@@ -113,8 +202,19 @@ export class EditorDocumentRegistry {
 		exclude: Promise<EditorWorkingCopy | null> = Promise.resolve(null),
 	): Promise<EditorRecoveryLease> {
 		const origin = options.origin();
+		const generation = this.generations.get(options.narratorId) ?? 0;
+		// A settled ordinary view needs no additional recovery request just because it
+		// was hidden. Do not wait on a pending/failed gate: recovery remains independent.
+		const alreadyViewing = await Promise.race([exclude, Promise.resolve(undefined)]);
+		signal.throwIfAborted();
+		if (generation !== (this.generations.get(options.narratorId) ?? 0))
+			throw new Error(
+				options.translate?.("identityChanged", "Editor authorization changed") ??
+					"Editor authorization changed",
+			);
 		const candidates = [...this.entries].filter(
 			(entry) =>
+				entry.copy !== alreadyViewing &&
 				entry.copy.recoveryKey &&
 				entry.copy.protected &&
 				entry.copy.options.narratorId === options.narratorId &&
@@ -123,7 +223,6 @@ export class EditorDocumentRegistry {
 				entry.copy.options.path === options.path,
 		);
 		if (!candidates.length) return { retainedCopies: [], release: () => {} };
-		const generation = this.generations.get(options.narratorId) ?? 0;
 		// The path above is only a UI filter. ONLY this fresh, server-verified owner scope
 		// may expose a previous draft; JWT/cache hints and a successful create are not proof.
 		const scope = await editorDocumentApi.recoveryScope(
@@ -183,6 +282,7 @@ export class EditorDocumentRegistry {
 		if (!entry || entry.viewReferences !== 0 || !copy.discardRetainedDraft()) return false;
 		if (this.canonical.get(copy.key) === entry) this.canonical.delete(copy.key);
 		this.entries.delete(entry);
+		this.cache.remove(entry);
 		entry.removeListener();
 		if (!this.entries.size) {
 			this.removeUnload?.();
@@ -190,24 +290,45 @@ export class EditorDocumentRegistry {
 		}
 		return true;
 	}
+	private evict(entry: Entry) {
+		if (!this.entries.delete(entry)) return;
+		if (this.canonical.get(entry.copy.key) === entry) this.canonical.delete(entry.copy.key);
+		entry.removeListener();
+		entry.copy.dispose();
+		for (const listener of entry.evictionListeners) listener();
+		entry.evictionListeners.clear();
+		if (!this.entries.size) {
+			this.removeUnload?.();
+			this.removeUnload = undefined;
+		}
+	}
 	private collect(entry: Entry) {
-		// StrictMode's synchronous detach/reattach is not a model lifetime. This is NOT an LRU.
+		// Defer past React/StrictMode cleanup and the current save/content event.
 		queueMicrotask(() => {
-			if (entry.references || entry.copy.protected) return;
-			if (this.canonical.get(entry.copy.key) === entry) this.canonical.delete(entry.copy.key);
-			this.entries.delete(entry);
-			if (!this.entries.size) {
-				this.removeUnload?.();
-				this.removeUnload = undefined;
-			}
-			entry.removeListener();
-			entry.copy.dispose();
+			if (!this.entries.has(entry)) return;
+			if (
+				!entry.visible &&
+				!entry.copy.protected &&
+				!entry.copy.hasResourcePins &&
+				entry.references === entry.viewReferences &&
+				(!entry.copy.getSnapshot().loaded ||
+					(!entry.references && entry.copy.getSnapshot().invalidated))
+			) {
+				this.cache.remove(entry);
+				this.evict(entry);
+			} else this.cache.enforce();
 		});
 	}
 	invalidateNarrator(narratorId: string, reason: string) {
 		this.generations.set(narratorId, (this.generations.get(narratorId) ?? 0) + 1);
 		for (const entry of this.entries.values())
 			if (entry.copy.options.narratorId === narratorId) entry.copy.invalidate(reason);
+	}
+	/** Realm teardown only (isolated fixtures / realm owner), never panel or workspace cleanup.
+	 * Normal UI teardown MUST release leases instead, preserving protected drafts. */
+	shutdown() {
+		this.cache.clear();
+		for (const entry of this.entries) this.evict(entry);
 	}
 	/** Dirty/inflight orphans remain owned until explicitly resolved; never silently discard them. */
 	get size() {

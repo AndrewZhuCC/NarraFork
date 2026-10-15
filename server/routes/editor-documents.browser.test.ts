@@ -62,7 +62,7 @@ function sourceBytes() {
 
 // Browser availability is a prerequisite failure, never a skipped acceptance.
 const browserTest = test;
-browserTest.each([false, true])(
+browserTest.each([false, true, "cache"] as const)(
 	"production Chromium editor and actual FilePanelContent/gate IO (hostGate=%s)",
 	async (hostGate) => {
 		expect(existsSync(CHROME)).toBe(true);
@@ -137,6 +137,17 @@ browserTest.each([false, true])(
 					expect(lines.length).toBeLessThanOrEqual(300_000);
 					expect(lines.every((line) => line.length <= 160)).toBe(true);
 					await writeFile(path, original);
+					if (hostGate === "cache") {
+						for (let index = 2; index <= 14; index++)
+							await writeFile(
+								join(workspace, `cache-${index}.txt`),
+								`cache file ${index}\n${originalText}`,
+							);
+						await writeFile(
+							join(workspace, "cache-markdown.md"),
+							`# Real preview fixture\n\n${Array.from({ length: 160 }, (_, index) => `## Preview section ${index}\n\n${"Long preview paragraph 中文 scroll retention. ".repeat(8)}\n\n`).join("")}`,
+						);
+					}
 					await writeFile(outside, "outside boundary sentinel\n");
 					const userId = generateId();
 					const intruderId = generateId();
@@ -217,8 +228,7 @@ browserTest.each([false, true])(
 					// emit ../ paths. This unique, gitignored directory belongs only to this test.
 					bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.editor-browser-bundle-"));
 					const manifestPath = join(bundleRoot, "manifest.json");
-					const htmlEntry =
-						'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Isolated real IO</title><link rel="icon" href="data:,"></head><body style="margin:0"><div id="root" style="height:100vh"></div><script type="module" src="/scripts/smoke-editor-real-io-fixture.tsx"></script></body></html>';
+					const htmlEntry = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Isolated real IO</title><link rel="icon" href="data:,"></head><body style="margin:0"><div id="root" style="height:100vh"></div><script type="module" src="/scripts/${hostGate === "cache" ? "smoke-editor-cache-fixture" : "smoke-editor-real-io-fixture"}.tsx"></script></body></html>`;
 					deadline.signal.throwIfAborted();
 					// A subprocess makes the production build cancellable. Promise.race around
 					// in-process Vite would keep writing after the deadline/finally cleanup.
@@ -326,6 +336,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					let recoveryScopes = 0;
 					let documentCreates = 0;
 					let infoFailures = 0;
+					let metadataRequests = 0;
 					page.on("pageerror", (error) => note(String(error)));
 					page.on("console", (message) => {
 						// Network errors are counted separately, including exactly two intentional refusals.
@@ -338,6 +349,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					// Passive observation only. Request interception can deadlock module Workers.
 					page.on("request", (request) => {
 						requestCount++;
+						if (request.url().includes("/file-references/info?")) metadataRequests++;
 						if (request.url().includes("/editor-operations/")) receiptQueries++;
 						if (request.url().includes("/editor-documents/recovery-scope?")) recoveryScopes++;
 						if (
@@ -392,6 +404,23 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						}
 					});
 					await bounded(page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }));
+					if (hostGate === "cache") {
+						const { editorCacheBrowserAcceptance } = await import(
+							"./editor-cache-browser-acceptance"
+						);
+						await bounded(
+							editorCacheBrowserAcceptance(page, documents, join(root, "transfers"), () => ({
+								documentCreates,
+								contentResponses,
+								recoveryScopes,
+								metadataRequests,
+							})),
+						);
+						expect(diagnostics).toEqual([]);
+						expect(httpErrors).toBe(0);
+						expect(offOriginCount).toBe(0);
+						return;
+					}
 					// waitForFunction holds a CDP call until ready, longer than the 15s
 					// protocol budget. Short observations preserve the page's 20s ready budget.
 					const readyBudgetMs = page.getDefaultTimeout();

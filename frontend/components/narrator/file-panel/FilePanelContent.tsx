@@ -1,8 +1,13 @@
 import { Center, Loader } from "@mantine/core";
 import type { FileSelection, FileTarget } from "@shared/file-reference";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect, useRef } from "react";
 import { EditorRecoveryBoundary } from "../file-editor/EditorRecoveryBoundary";
+import { editorDocumentRegistry } from "../file-editor/editor-document-registry";
 import type { FileEditorContentProps } from "../file-editor/FileEditorContent";
+import {
+	NarratorPanelVisibilityProvider,
+	useEditorPanelVisible,
+} from "../narrator-panel-visibility";
 import { getFilePreviewType } from "./FilePreviewModal";
 import { LargeFileGate } from "./LargeFileGate";
 
@@ -14,6 +19,8 @@ const FileViewerContent = lazy(() =>
 );
 
 export interface FilePanelContentProps {
+	/** Host visibility, never keyboard focus. Document visibility is applied independently. */
+	visible?: boolean;
 	filePath: string;
 	narratorId?: string;
 	deviceId?: string;
@@ -29,7 +36,26 @@ export interface FilePanelContentProps {
 }
 
 /** Shared ordinary file pane; tool-edit snapshots remain a host-owned branch. */
-export function FilePanelContent({
+export function FilePanelContent(props: FilePanelContentProps) {
+	return (
+		<FilePanelVisibilityContent
+			key={JSON.stringify([props.narratorId, props.deviceId ?? "local", props.filePath])}
+			{...props}
+		/>
+	);
+}
+function FilePanelVisibilityContent(props: FilePanelContentProps) {
+	const visible = useEditorPanelVisible(props.visible);
+	const displayed = useRef(false);
+	if (visible) displayed.current = true;
+	useEffect(() => editorDocumentRegistry.registerTab(), []);
+	return (
+		<NarratorPanelVisibilityProvider value={visible}>
+			{displayed.current && <FilePanelBody {...props} />}
+		</NarratorPanelVisibilityProvider>
+	);
+}
+function FilePanelBody({
 	filePath,
 	narratorId,
 	deviceId,

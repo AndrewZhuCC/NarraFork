@@ -246,5 +246,6 @@ window.__editorRealIo = {
 		for (const reader of receiptReaders) void reader.cancel().catch(() => {});
 		created.dispose();
 		root.unmount();
+		editorDocumentRegistry.shutdown();
 	},
 };

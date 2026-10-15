@@ -79,7 +79,9 @@ async function setup(load = true) {
 		for (let chunk = snapshot.read(); chunk !== null; chunk = snapshot.read()) chunks.push(chunk);
 		return chunks.join("");
 	};
-	const hash = mock(async (snapshot: EditorTextSnapshot) => textOf(snapshot));
+	const hash = mock(async (snapshot: EditorTextSnapshot, _signal?: AbortSignal) =>
+		textOf(snapshot),
+	);
 	const encode = mock(async (snapshot: EditorTextSnapshot) => {
 		const text = textOf(snapshot);
 		const blob = new Blob([text]);
@@ -763,6 +765,108 @@ test("equivalent text with different history becomes clean only after background
 	expect(sessionDirty(session.state)).toBe(true);
 	change("a\nb\n", 1);
 	expect(sessionDirty(session.state)).toBe(false);
+});
+
+test("hidden baseline hash cancellation retries its consumed immutable prefix without caching null", async () => {
+	const { session, change, hash, snapshot, text } = await setup(false);
+	let snapshots = 0;
+	let baselineReads = 0;
+	snapshot.mockImplementation(() => {
+		const value = text();
+		const baseline = ++snapshots === 1;
+		let offset = 0;
+		return {
+			revision: session.state.version?.revision ?? 1,
+			alternativeVersionId: session.state.version?.alternativeVersionId ?? 1,
+			length: value.length,
+			read: () => {
+				if (baseline) baselineReads++;
+				if (offset === value.length) return null;
+				const chunk = value.slice(offset, offset + 2);
+				offset += chunk.length;
+				return chunk;
+			},
+		};
+	});
+	await session.load();
+	change("c\nd\n");
+	change("a\nb\n");
+	const pending = deferred<string>();
+	let hashSignal: AbortSignal | undefined;
+	hash.mockImplementationOnce(async (source, signal) => {
+		expect(source.read()).toBe("a\n");
+		hashSignal = signal;
+		signal?.addEventListener(
+			"abort",
+			() => pending.reject(new DOMException("hidden", "AbortError")),
+			{ once: true },
+		);
+		return pending.promise;
+	});
+	const checking = session.verifyEquivalent(new AbortController().signal);
+	expect(hash).toHaveBeenCalledTimes(1);
+	session.cancelBackgroundVerification();
+	expect(hashSignal?.aborted).toBe(true);
+	await checking;
+	expect(sessionDirty(session.state)).toBe(true);
+	expect(sessionExitBlocked(session.state)).toBe(true);
+	expect(hash).toHaveBeenCalledTimes(1);
+	// An equal-length later draft must still compare against the ORIGINAL baseline.
+	change("c\nd\n");
+	await session.verifyEquivalent(new AbortController().signal);
+	expect(hash).toHaveBeenCalledTimes(3);
+	expect(sessionDirty(session.state)).toBe(true);
+	change("a\nb\n");
+	await session.verifyEquivalent(new AbortController().signal);
+	expect(sessionDirty(session.state)).toBe(false);
+	expect(sessionExitBlocked(session.state)).toBe(false);
+	expect(baselineReads).toBe(3);
+	session.dispose();
+});
+
+test("a cancelled uncooperative baseline hash cannot overwrite the newer replay result", async () => {
+	const { session, change, hash } = await setup();
+	const pending = deferred<string>();
+	hash.mockImplementationOnce(async (source) => {
+		source.read();
+		return pending.promise;
+	});
+	change("a\nb\n");
+	const oldCheck = session.verifyEquivalent(new AbortController().signal);
+	session.cancelBackgroundVerification();
+	await session.verifyEquivalent(new AbortController().signal);
+	expect(sessionDirty(session.state)).toBe(false);
+	change("c\nd\n");
+	pending.resolve("c\nd\n");
+	await oldCheck;
+	await session.verifyEquivalent(new AbortController().signal);
+	expect(sessionDirty(session.state)).toBe(true);
+	change("a\nb\n");
+	await session.verifyEquivalent(new AbortController().signal);
+	expect(sessionDirty(session.state)).toBe(false);
+	expect(hash).toHaveBeenCalledTimes(5);
+	session.dispose();
+});
+
+test("hiding background verification cannot cancel an inflight save or clean its guarded snapshot early", async () => {
+	const { session, change, api, hash } = await setup();
+	change("a\nb\n");
+	const upload = deferred<Awaited<ReturnType<typeof editorDocumentApi.createUpload>>>();
+	api.createUpload.mockReturnValueOnce(upload.promise);
+	const saving = session.save();
+	await Promise.resolve();
+	expect(session.state.phase).toBe("uploading");
+	const signal = api.createUpload.mock.calls[0]?.[3];
+	session.cancelBackgroundVerification();
+	await session.verifyEquivalent(new AbortController().signal);
+	expect(signal?.aborted).toBe(false);
+	expect(hash).not.toHaveBeenCalled();
+	expect(sessionExitBlocked(session.state)).toBe(true);
+	upload.resolve({ uploadId: "upload", state: "uploading" });
+	await saving;
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(sessionExitBlocked(session.state)).toBe(false);
+	session.dispose();
 });
 
 test("unequal length skips background snapshot hashing entirely", async () => {

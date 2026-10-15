@@ -12,6 +12,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../../../lib/api/client";
 import { saveBlobAsFile } from "../../../lib/file-download";
+import { useEditorPanelVisible } from "../narrator-panel-visibility";
 import { filePanelBaseName } from "../panels/panel-kind";
 import { useEditorAuthority } from "./editor-authority";
 import { editorDocumentRegistry } from "./editor-document-registry";
@@ -124,7 +125,9 @@ function RecoveryBoundaryIdentity({
 	const [retained, setRetained] = useState<readonly EditorWorkingCopy[]>([]);
 	const [error, setError] = useState<string | null>(null);
 	const [publishedFor, setPublishedFor] = useState<typeof request | null>(null);
+	const visible = useEditorPanelVisible();
 	useEffect(() => {
+		if (!visible) return;
 		setRetained([]);
 		setError(null);
 		setPublishedFor(null);
@@ -163,7 +166,7 @@ function RecoveryBoundaryIdentity({
 			controller.abort();
 			release?.();
 		};
-	}, [narratorId, filePath, deviceId, referenceOrigin, request]);
+	}, [narratorId, filePath, deviceId, referenceOrigin, request, visible]);
 	return (
 		<RecoveryHostContext.Provider value={host}>
 			<Box style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>

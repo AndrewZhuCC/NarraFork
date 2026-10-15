@@ -52,6 +52,7 @@ import { getShikiLang } from "../../../lib/shiki-lang";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import type { DiffLine } from "../diff/DiffView";
 import { availableModes } from "../file-viewer/file-viewer-modes";
+import { useEditorPanelVisible, useRetainedEditorView } from "../narrator-panel-visibility";
 import { filePanelBaseName } from "../panels/panel-kind";
 import {
 	EditorReceiptNotice,
@@ -59,7 +60,7 @@ import {
 	editorRecoveryScopeIdentity,
 	useEditorRecoveryHost,
 } from "./EditorRecoveryBoundary";
-import { editorDocumentRegistry } from "./editor-document-registry";
+import { type EditorDocumentLease, editorDocumentRegistry } from "./editor-document-registry";
 import {
 	type EditorMode,
 	fractionToScroll,
@@ -144,12 +145,37 @@ function FileEditorBinding(props: FileEditorContentProps) {
 	const latest = useRef(t);
 	latest.current = t;
 	const { narratorId, filePath, deviceId = "local", referenceOrigin = false } = props;
+	const visible = useEditorPanelVisible();
+	const retainedView = useRetainedEditorView(visible);
+	const leaseRef = useRef<EditorDocumentLease | null>(null);
+	const controllerRef = useRef<AbortController | null>(null);
+	const unregisterRef = useRef<(() => void) | undefined>(undefined);
+	const viewState = useRef<import("monaco-editor").editor.ICodeEditorViewState | null>(null);
+	useEffect(
+		() => () => {
+			controllerRef.current?.abort();
+			controllerRef.current = null;
+			unregisterRef.current?.();
+			leaseRef.current?.release();
+			leaseRef.current = null;
+		},
+		[],
+	);
+	useLayoutEffect(() => {
+		if (copy === leaseRef.current?.copy) leaseRef.current?.setVisible(retainedView);
+	}, [retainedView, copy]);
+	useEffect(() => {
+		if (!visible && !copy && !leaseRef.current) {
+			controllerRef.current?.abort();
+			controllerRef.current = null;
+		}
+	}, [visible, copy]);
 	useEffect(() => {
 		void retry;
+		if (copy || !visible || leaseRef.current || controllerRef.current) return;
 		setError(null);
-		setCopy(null);
 		const controller = new AbortController();
-		let release: (() => void) | undefined;
+		controllerRef.current = controller;
 		const readOnly = deviceId !== "local" || !narratorId;
 		const options: WorkingCopyOptions = {
 			narratorId: narratorId ?? "",
@@ -181,13 +207,19 @@ function FileEditorBinding(props: FileEditorContentProps) {
 				: {}),
 		};
 		const viewing = editorDocumentRegistry
-			.acquire(options, controller.signal)
+			.acquire(options, controller.signal, () => {
+				controllerRef.current?.abort();
+				leaseRef.current?.release();
+				leaseRef.current = null;
+				controllerRef.current = null;
+				setCopy(null);
+			})
 			.then((lease) => {
 				if (controller.signal.aborted) {
 					lease.release();
 					return null;
 				}
-				release = lease.release;
+				leaseRef.current = lease;
 				setCopy(lease.copy);
 				void lease.copy.ensureLoaded().catch((cause) => {
 					if (!controller.signal.aborted)
@@ -196,17 +228,14 @@ function FileEditorBinding(props: FileEditorContentProps) {
 				return lease.copy;
 			})
 			.catch((cause) => {
+				if (controllerRef.current === controller) controllerRef.current = null;
 				if (!controller.signal.aborted)
 					setError(cause instanceof Error ? cause.message : String(cause));
 				return null;
 			});
-		const unregister = recovery?.registerViewing(viewing);
-		return () => {
-			unregister?.();
-			controller.abort();
-			release?.();
-		};
-	}, [narratorId, filePath, deviceId, referenceOrigin, retry, recovery]);
+		unregisterRef.current?.();
+		unregisterRef.current = recovery?.registerViewing(viewing);
+	}, [narratorId, filePath, deviceId, referenceOrigin, retry, recovery, visible, copy]);
 	if (error)
 		return (
 			<Center h="100%">
@@ -214,7 +243,17 @@ function FileEditorBinding(props: FileEditorContentProps) {
 					<Text c="red" size="sm">
 						{error}
 					</Text>
-					<Button size="xs" onClick={() => setRetry((value) => value + 1)}>
+					<Button
+						size="xs"
+						onClick={() => {
+							controllerRef.current?.abort();
+							controllerRef.current = null;
+							leaseRef.current?.release();
+							leaseRef.current = null;
+							setCopy(null);
+							setRetry((value) => value + 1);
+						}}
+					>
 						{t("fileTree.retry")}
 					</Button>
 				</Group>
@@ -226,7 +265,7 @@ function FileEditorBinding(props: FileEditorContentProps) {
 				<Loader size="sm" />
 			</Center>
 		);
-	return <FileEditorDocument {...props} workingCopy={copy} />;
+	return <FileEditorDocument {...props} workingCopy={copy} viewState={viewState} />;
 }
 
 function FileEditorDocument({
@@ -239,8 +278,13 @@ function FileEditorDocument({
 	onFileReferenceSelectionChange,
 	onDirtyChange,
 	workingCopy,
-}: FileEditorContentProps & { workingCopy: EditorWorkingCopy }) {
+	viewState,
+}: FileEditorContentProps & {
+	workingCopy: EditorWorkingCopy;
+	viewState: { current: import("monaco-editor").editor.ICodeEditorViewState | null };
+}) {
 	const { t } = useTranslation("narrator");
+	const visible = useEditorPanelVisible();
 	const isMobileViewport = useMobileViewport();
 	const onDirtyChangeRef = useRef(onDirtyChange);
 	onDirtyChangeRef.current = onDirtyChange;
@@ -314,6 +358,37 @@ function FileEditorDocument({
 	// scroll, the raw editor keeps its absolute scroll line.
 	const previewScrollRef = useRef<HTMLDivElement | null>(null);
 	const previewScrollFraction = useRef<number | null>(null);
+	const previewLastScrollFraction = useRef<number | null>(null);
+	const previewResumeAuthoritative = useRef(false);
+	const previewVisible = useRef(visible);
+	previewVisible.current = visible;
+	const endPreviewResume = useCallback(() => {
+		previewResumeAuthoritative.current = false;
+		previewScrollFraction.current = null;
+	}, []);
+	const rememberPreviewScroll = useCallback(() => {
+		const el = previewScrollRef.current;
+		// Hiding removes rendered preview children in the same commit. Never let its
+		// resulting zero-size/zero-scroll events replace the last visible position.
+		if (
+			!previewVisible.current ||
+			!el ||
+			previewScrollFraction.current !== null ||
+			el.scrollHeight <= el.clientHeight
+		)
+			return;
+		previewLastScrollFraction.current = scrollFraction(
+			el.scrollTop,
+			el.scrollHeight,
+			el.clientHeight,
+		);
+	}, []);
+	useLayoutEffect(() => {
+		if (!visible && previewLastScrollFraction.current !== null) {
+			previewScrollFraction.current = previewLastScrollFraction.current;
+			previewResumeAuthoritative.current = true;
+		}
+	}, [visible]);
 	const splitContainerRef = useRef<HTMLDivElement | null>(null);
 	const [splitHorizontal, setSplitHorizontal] = useState(true);
 	const session = workingCopy.session;
@@ -343,12 +418,13 @@ function FileEditorDocument({
 				editorSelectionRef.current = null;
 				publishSelectionRef.current?.(null);
 				const el = previewScrollRef.current;
-				if (el)
-					previewScrollFraction.current = scrollFraction(
+				if (previewVisible.current && el && el.scrollHeight > el.clientHeight)
+					previewLastScrollFraction.current = scrollFraction(
 						el.scrollTop,
 						el.scrollHeight,
 						el.clientHeight,
 					);
+				previewScrollFraction.current = previewLastScrollFraction.current;
 				return () => {
 					if (scrollTop != null) view?.setScrollTop?.(scrollTop);
 					if (modeRef.current !== "raw") regeneratePreviewRef.current();
@@ -367,10 +443,16 @@ function FileEditorDocument({
 		previewController.current?.abort();
 		void session.load();
 	};
-	const handleReady = useCallback((handle: MonacoEditorHandle | null) => {
-		editorRef.current = handle;
-		setEditor(handle?.getEditor() ?? null);
-	}, []);
+	const attachedViewPin = useRef<(() => void) | undefined>(undefined);
+	const handleReady = useCallback(
+		(handle: MonacoEditorHandle | null) => {
+			attachedViewPin.current?.();
+			attachedViewPin.current = handle ? workingCopy.pin("view") : undefined;
+			editorRef.current = handle;
+			setEditor(handle?.getEditor() ?? null);
+		},
+		[workingCopy],
+	);
 	const handleChange = useCallback((status: MonacoDocumentStatus) => {
 		setHistory(status);
 	}, []);
@@ -416,7 +498,8 @@ function FileEditorDocument({
 	// known alternativeVersionId is immediate; equal text with different history is verified.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: any new revision or baseline cancels and restarts the quiet window
 	useEffect(() => {
-		if (!dirty || phase !== "idle" || readOnly) return;
+		if (!visible || (mode !== "raw" && mode !== "split") || !dirty || phase !== "idle" || readOnly)
+			return;
 		const controller = new AbortController();
 		const timer = setTimeout(() => {
 			const host = editorRef.current?.getEditor()?.getDomNode?.();
@@ -426,12 +509,12 @@ function FileEditorDocument({
 			clearTimeout(timer);
 			controller.abort();
 		};
-	}, [dirty, phase, readOnly, session, revision, baseHash]);
+	}, [visible, mode, dirty, phase, readOnly, session, revision, baseHash]);
 	// Metadata refresh for the panel's CURRENT selection when dirty/hash identity
 	// changes. Selection itself is not a dependency — drag-select must not re-enter
 	// this path. Identity publish remains explicit (handleSelection).
 	useEffect(() => {
-		if (!baseHash) return;
+		if (!visible || !baseHash) return;
 		const next = editorSelectionRef.current;
 		publishSelection?.(
 			next
@@ -443,7 +526,7 @@ function FileEditorDocument({
 					}
 				: null,
 		);
-	}, [baseHash, deviceId, dirty, filePath, publishSelection]);
+	}, [visible, baseHash, deviceId, dirty, filePath, publishSelection]);
 	useEffect(() => () => publishSelection?.(null), [publishSelection]);
 	useEffect(() => {
 		onDirtyChange?.(exitBlocked);
@@ -462,11 +545,14 @@ function FileEditorDocument({
 	// Only a CHANGE of explicit navigation returns to source — running on mount would
 	// clobber a remembered non-raw default before the user ever sees it.
 	const navigationRef = useRef(navigationKey);
-	useEffect(() => {
+	useLayoutEffect(() => {
 		if (navigationRef.current === navigationKey) return;
 		navigationRef.current = navigationKey;
+		// Explicit host navigation wins before the child's passive Monaco reveal;
+		// ordinary reattachment with the same navigation identity is not an intent.
+		endPreviewResume();
 		setMode("raw");
-	}, [navigationKey]);
+	}, [navigationKey, endPreviewResume]);
 	useEffect(() => {
 		if (mode === "raw") {
 			previewController.current?.abort();
@@ -483,7 +569,7 @@ function FileEditorDocument({
 				setPreviewError(null);
 			}
 			const model = workingCopy.model;
-			if (!model) return;
+			if (!visible || !model) return;
 			// No snapshot/full-text work until the user explicitly requests a preview.
 			if (model.getValueLength() > PREVIEW_BYTES) {
 				setPreviewError(tRef.current("fileEditor.previewTooLarge"));
@@ -502,28 +588,32 @@ function FileEditorDocument({
 					setPreviewError(error instanceof Error ? error.message : String(error));
 			}
 		},
-		[workingCopy],
+		[workingCopy, visible],
 	);
 	regeneratePreviewRef.current = () => void generatePreview(true);
 	// A remembered non-raw default means the panel OPENS in preview/split: generate
 	// the first rendering once the model is ready, without waiting for a mode click.
-	const previewKickRef = useRef(false);
 	useEffect(() => {
-		if (previewKickRef.current || !editor || mode === "raw") return;
-		previewKickRef.current = true;
-		void generatePreview(true);
-	}, [editor, mode, generatePreview]);
+		if (!visible) {
+			previewController.current?.abort();
+			setPreviewText(null);
+			setSearchOpen(false);
+			publishSelectionRef.current?.(null);
+			return;
+		}
+		if (state.loaded && mode !== "raw") void generatePreview(true);
+	}, [visible, state.loaded, mode, generatePreview]);
 	// Split mode is a LIVE view: edits regenerate the preview behind the current one
 	// (keepCurrent) after a short debounce, so typing never flashes a loader.
 	useEffect(() => {
-		if (mode !== "split" || revision == null) return;
+		if (!visible || mode !== "split" || revision == null) return;
 		const timer = setTimeout(() => void generatePreview(true), 300);
 		return () => clearTimeout(timer);
-	}, [mode, revision, generatePreview]);
+	}, [visible, mode, revision, generatePreview]);
 	// Split direction follows the panel's own aspect ratio: wide panels split left/
 	// right, tall (or narrow dock) panels stack the preview below the editor.
 	useEffect(() => {
-		if (mode !== "split") return;
+		if (!visible || mode !== "split") return;
 		const el = splitContainerRef.current;
 		if (!el || typeof ResizeObserver === "undefined") return;
 		const update = () => setSplitHorizontal(el.clientWidth >= el.clientHeight);
@@ -531,7 +621,7 @@ function FileEditorDocument({
 		const observer = new ResizeObserver(update);
 		observer.observe(el);
 		return () => observer.disconnect();
-	}, [mode]);
+	}, [visible, mode]);
 	// Bidirectional scroll sync. Both preview kinds carry `data-line` anchors:
 	// markdown blocks get them from MarkdownContent, node-tree rows from the
 	// parser (structured-parse stamps each entry's source line). Both directions
@@ -544,7 +634,7 @@ function FileEditorDocument({
 	const lineAnchorsRef = useRef<LineAnchor[]>([]);
 	const scheduleAnchorRefreshRef = useRef<(() => void) | null>(null);
 	useEffect(() => {
-		if (mode !== "split" || !editor) return;
+		if (!visible || mode !== "split" || !editor) return;
 		const previewEl = previewScrollRef.current;
 		if (!previewEl || !editor.onDidScrollChange) return;
 		// Programmatic writes are recognized by matching the value the follower
@@ -632,8 +722,31 @@ function FileEditorDocument({
 			if (Math.abs(editor.getScrollTop() - nextScrollTop) < 1 && !editorFollower.active) return;
 			editorFollower.setTarget(nextScrollTop);
 		};
+		const sourceHost = editor.getDomNode?.();
+		const userIntent = (event: Event) => {
+			if (event.type === "keydown") {
+				const key = event as KeyboardEvent;
+				if (
+					["Control", "Meta", "Alt", "Shift"].includes(key.key) ||
+					((key.ctrlKey || key.metaKey) && key.key.toLowerCase() === "f")
+				)
+					return;
+			}
+			endPreviewResume();
+		};
+		// A recreated source view emits layout/recovery scrolls before its first paint.
+		// Until user intent arrives, resume from the preview's saved reading position,
+		// not a lossy source-line round trip that creeps upward on every tab switch.
+		for (const type of ["wheel", "pointerdown", "keydown"]) {
+			sourceHost?.addEventListener(type, userIntent, true);
+			previewEl.addEventListener(type, userIntent, true);
+		}
 		const subscription = editor.onDidScrollChange(() => {
-			if (Math.abs(editor.getScrollTop() - lastWritten.editor) < 1) return;
+			if (
+				previewResumeAuthoritative.current ||
+				Math.abs(editor.getScrollTop() - lastWritten.editor) < 1
+			)
+				return;
 			editorFollower.cancel();
 			syncPreviewToEditor();
 		});
@@ -651,18 +764,23 @@ function FileEditorDocument({
 		// a drift correction, never a fight with the side the user is scrolling.
 		const anchorObserver = observePreviewAnchorChanges(previewEl, () => {
 			refreshAnchors();
-			syncPreviewToEditor();
+			if (previewResumeAuthoritative.current) syncEditorToPreview();
+			else syncPreviewToEditor();
 		});
 		scheduleAnchorRefreshRef.current = anchorObserver.schedule;
 		return () => {
 			subscription.dispose();
+			for (const type of ["wheel", "pointerdown", "keydown"]) {
+				sourceHost?.removeEventListener(type, userIntent, true);
+				previewEl.removeEventListener(type, userIntent, true);
+			}
 			previewEl.removeEventListener("scroll", previewListener);
 			scheduleAnchorRefreshRef.current = null;
 			anchorObserver.dispose();
 			previewFollower.dispose();
 			editorFollower.dispose();
 		};
-	}, [mode, editor]);
+	}, [visible, mode, editor, endPreviewResume]);
 	// React may reuse every preview row and only update data-line; an unchanged
 	// preview can also have a new model line count (the document-end sentinel).
 	// Schedule after the commit, retaining the observers' debounce and teardown.
@@ -674,16 +792,19 @@ function FileEditorDocument({
 	useLayoutEffect(() => {
 		const el = previewScrollRef.current;
 		const fraction = previewScrollFraction.current;
-		if (previewText == null || !el || fraction == null) return;
+		if (!visible || previewText == null || !el || fraction == null) return;
 		previewScrollFraction.current = null;
+		previewLastScrollFraction.current = fraction;
 		el.scrollTop = fraction * (el.scrollHeight - el.clientHeight);
-	}, [previewText]);
+	}, [visible, previewText]);
 	const switchMode = (next: EditorMode) => {
 		previewController.current?.abort();
 		setMode(next);
 		setPreviewText(null);
 		setPreviewError(null);
 		previewScrollFraction.current = null;
+		previewLastScrollFraction.current = null;
+		previewResumeAuthoritative.current = false;
 		if (next === "raw") return;
 		setSearchOpen(false);
 		void generatePreview();
@@ -694,7 +815,7 @@ function FileEditorDocument({
 		setConflictDiff(null);
 		setConflictError(null);
 		const model = workingCopy.model;
-		if (!conflict || !model) return;
+		if (!visible || !conflict || !model) return;
 		const controller = new AbortController();
 		// This is a bounded display prefix, NEVER an editable or saveable document.
 		const snapshot = captureEditorSnapshot(model);
@@ -719,7 +840,7 @@ function FileEditorDocument({
 					setConflictError(error instanceof Error ? error.message : String(error));
 			});
 		return () => controller.abort();
-	}, [conflict, session, conflictRetry]);
+	}, [visible, conflict, session, conflictRetry]);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: changing conflict identity cancels its old download
 	useEffect(() => {
 		setDownloadingConflict(false);
@@ -763,7 +884,7 @@ function FileEditorDocument({
 	// Split keeps the editor fully interactive beside the preview; preview/node
 	// modes keep it mounted but inert behind the rendered overlay.
 	const split = mode === "split";
-	const editorActive = mode === "raw" || split;
+	const editorActive = visible && (mode === "raw" || split);
 	return (
 		<Box
 			style={{ height: "100%", display: "flex", flexDirection: "column" }}
@@ -1130,6 +1251,7 @@ function FileEditorDocument({
 					editor={editor}
 					readOnly={readOnly || state.loading || !!state.invalidated}
 					onSave={handleSave}
+					onNavigationIntent={endPreviewResume}
 					onClose={() => setSearchOpen(false)}
 				/>
 			)}
@@ -1173,12 +1295,14 @@ function FileEditorDocument({
 						readOnly={readOnly || state.loading || !!state.invalidated}
 						lineWrapping={lineWrapping}
 						visible={editorActive}
+						viewState={viewState}
 					/>
 				</Box>
 				{mode !== "raw" && (
 					<Box
 						ref={previewScrollRef}
 						data-file-editor-preview={mode}
+						onScroll={rememberPreviewScroll}
 						style={
 							split
 								? {
@@ -1213,14 +1337,16 @@ function FileEditorDocument({
 									</Center>
 								}
 							>
-								<FileEditorPreview
-									text={previewText}
-									mode={split ? splitRenderMode(modes) : mode}
-									filePath={filePath}
-									deviceId={deviceId}
-									narratorId={narratorId}
-									withSourceLines={split}
-								/>
+								{visible && (
+									<FileEditorPreview
+										text={previewText}
+										mode={split ? splitRenderMode(modes) : mode}
+										filePath={filePath}
+										deviceId={deviceId}
+										narratorId={narratorId}
+										withSourceLines={split}
+									/>
+								)}
 							</Suspense>
 						)}
 					</Box>
