@@ -8242,10 +8242,7 @@ export async function recoverOnStartup(
 	// Preserve modern compact lifecycle records across restarts. Running attempts
 	// become failed audit entries; only legacy placeholders with no attempt/retry
 	// history are removed.
-	const staleCompactRecovery = await recoverStaleCompactingMessages();
-	if (staleCompactRecovery.preserved > 0 || staleCompactRecovery.deleted > 0) {
-		logger.info("Stale compacting messages recovered on startup", staleCompactRecovery);
-	}
+	await recoverStaleCompactingMessages();
 
 	const transientCompactRows = await db.query.narrators.findMany({
 		columns: { id: true, substatus: true },
