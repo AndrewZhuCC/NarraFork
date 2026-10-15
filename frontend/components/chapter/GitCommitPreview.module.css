@@ -30,8 +30,70 @@
 
 .preview[data-commit-preview="page"] .browser,
 .preview[data-commit-preview="window"] .browser {
-	height: calc(100vh - 280px);
-	min-height: 420px;
+	height: calc(100vh - 168px);
+	min-height: 360px;
+}
+
+.commitCard {
+	overflow: hidden;
+}
+
+.summary {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	padding: 4px 8px 4px 4px;
+}
+
+.summaryToggle {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1;
+	min-width: 0;
+	padding: 6px;
+	border: 0;
+	border-radius: var(--mantine-radius-sm);
+	background: transparent;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.summaryToggle:hover {
+	background: var(--mantine-color-default-hover);
+}
+
+.summarySubject {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: var(--mantine-font-size-sm);
+	font-weight: 600;
+}
+
+.summaryStats {
+	flex-shrink: 0;
+}
+
+.details {
+	padding: 0 var(--mantine-spacing-md) var(--mantine-spacing-md);
+	border-top: 1px solid var(--mantine-color-default-border);
+}
+
+.srOnly {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
 }
 
 .navigation,
@@ -211,6 +273,7 @@
 
 .layoutOption:focus-visible,
 .diffTitle:focus-visible,
+.summaryToggle:focus-visible,
 .mobileToggle:focus-visible {
 	outline: 2px solid var(--mantine-primary-color-filled);
 	outline-offset: -2px;
@@ -281,5 +344,22 @@
 
 	.layoutLabel {
 		display: none;
+	}
+
+	.summary {
+		flex-wrap: wrap;
+		align-items: flex-start;
+	}
+
+	.summaryStats {
+		width: 100%;
+		padding: 0 8px 6px 28px;
+	}
+
+	.browser,
+	.preview[data-commit-preview="page"] .browser,
+	.preview[data-commit-preview="window"] .browser {
+		height: auto;
+		min-height: 0;
 	}
 }

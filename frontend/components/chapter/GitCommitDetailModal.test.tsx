@@ -232,6 +232,13 @@ function click(selector: string) {
 	element(selector).dispatchEvent(new Event("click", { bubbles: true }));
 }
 
+async function expandCommitDetails() {
+	const toggle = element("[data-commit-details-toggle]");
+	if (toggle.getAttribute("aria-expanded") === "true") return;
+	click("[data-commit-details-toggle]");
+	await waitFor(() => toggle.getAttribute("aria-expanded") === "true", "commit details");
+}
+
 function renderUi(content: ReactNode) {
 	root.render(
 		<I18nextProvider i18n={i18n}>
@@ -372,9 +379,11 @@ describe("Git commit preview with real query observers", () => {
 		expect(details).toHaveBeenCalledTimes(1);
 		await waitFor(() => bodyText().includes("SELECTED_PATCH"), "default first file patch");
 		expect(patches).toHaveBeenCalledTimes(1);
-		expect(element("[data-commit-sha]").textContent).toContain(SHA_A);
 		expect(element("[data-commit-message]").textContent).toContain("Commit aaaaaaa subject");
 		expect(bodyText()).not.toContain("Detailed commit body");
+		expect(document.body.querySelector("[data-commit-sha]")).toBeNull();
+		await expandCommitDetails();
+		expect(element("[data-commit-sha]").textContent).toContain(SHA_A);
 		click("[data-commit-body-toggle]");
 		await waitFor(() => !!document.body.querySelector("[data-commit-body]"), "expanded body");
 		expect(element("[data-commit-body]").textContent).toBe("Detailed commit body");
@@ -698,6 +707,11 @@ describe("Git commit preview with real query observers", () => {
 		);
 		const patches = spyOn(api, "getGitCommitDiff");
 		renderModal();
+		await waitFor(
+			() => !!document.body.querySelector("[data-commit-details-toggle]"),
+			"truncated commit summary",
+		);
+		await expandCommitDetails();
 		const warning = i18n.t("commitPreview.filesTruncated", { ns: "git", count: 0 });
 		await waitFor(() => bodyText().includes(warning), "truncated file list");
 		expect(bodyText()).not.toContain(gitLocale["commitPreview.noFiles"]);
@@ -712,6 +726,7 @@ describe("Git commit preview with real query observers", () => {
 		const patches = spyOn(api, "getGitCommitDiff");
 		renderModal();
 		await waitFor(() => bodyText().includes(gitLocale["commitPreview.noFiles"]), "empty commit");
+		await expandCommitDetails();
 		expect(bodyText()).toContain(gitLocale["commitPreview.rootCommit"]);
 		expect(bodyText()).toContain(SHA_A);
 		expect(document.body.querySelector("[data-commit-file]")).toBeNull();
@@ -737,6 +752,7 @@ describe("shared GitCommitPreview interactions", () => {
 		Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
 		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} selectedPath={RENAMED_FILE} />);
 		await waitForFiles();
+		await expandCommitDetails();
 		const preview = element("[data-commit-open-page]").getAttribute("href") ?? "";
 		expect(new URL(preview, location.origin).pathname).toBe(
 			`${base}windows/git/narrators/${TARGET.narratorId}/commits/${SHA_A}`,
@@ -760,6 +776,7 @@ describe("shared GitCommitPreview interactions", () => {
 			<GitCommitPreview target={TARGET} sha={SHA_A} selectedPath={RENAMED_FILE} mode={mode} />,
 		);
 		await waitForFiles();
+		await expandCommitDetails();
 		click('[aria-label="Copy full SHA"]');
 		await waitFor(() => writeText.mock.calls.length === 1, "copied SHA");
 		expect(writeText.mock.calls[0]?.[0]).toBe(SHA_A);
@@ -894,6 +911,7 @@ describe("shared GitCommitPreview interactions", () => {
 		const navigate = mock((_sha: string) => {});
 		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} onNavigateCommit={navigate} />);
 		await waitForFiles();
+		await expandCommitDetails();
 		const parent = element(`[data-commit-parent="${PARENT}"]`);
 		expect(parent.tagName).toBe("A");
 		const parentHref = parent.getAttribute("href") ?? "";
@@ -937,6 +955,25 @@ describe("shared GitCommitPreview interactions", () => {
 		).toBe(RENAMED_FILE);
 	});
 
+	test("commit details start collapsed and fold away without clearing the patch", async () => {
+		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
+		const patches = spyOn(api, "getGitCommitDiff").mockResolvedValue(textPatch("VISIBLE_PATCH"));
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} />);
+		await waitFor(() => bodyText().includes("VISIBLE_PATCH"), "patch under collapsed details");
+		expect(document.body.querySelector("[data-commit-sha]")).toBeNull();
+		expect(element("[data-commit-message]").textContent).toContain("Commit aaaaaaa subject");
+		await expandCommitDetails();
+		expect(element("[data-commit-sha]").textContent).toContain(SHA_A);
+		click("[data-commit-details-toggle]");
+		await waitFor(
+			() => element("[data-commit-details-toggle]").getAttribute("aria-expanded") === "false",
+			"collapsed details",
+		);
+		expect(document.body.querySelector("[data-commit-sha]")).toBeNull();
+		expect(bodyText()).toContain("VISIBLE_PATCH");
+		expect(patches).toHaveBeenCalledTimes(1);
+	});
+
 	test("statistics explicitly distinguish unknown counts, binary files and truncated lists", async () => {
 		spyOn(api, "getGitCommitDetail").mockResolvedValue(
 			detail(SHA_A, {
@@ -955,6 +992,7 @@ describe("shared GitCommitPreview interactions", () => {
 		);
 		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} mode="page" selectedPath={null} />);
 		await waitForFiles();
+		await expandCommitDetails();
 		const statistics = element("[data-commit-statistics]").textContent;
 		expect(statistics).toContain(gitLocale["commitPreview.partialStats"]);
 		expect(statistics).toContain(gitLocale["commitPreview.unknownStats"]);

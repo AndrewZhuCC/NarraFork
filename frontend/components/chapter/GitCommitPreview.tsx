@@ -94,9 +94,11 @@ function CommitPreviewContent({
 	const [localPath, setLocalPath] = useState<string | null>(null);
 	const [filter, setFilter] = useState("");
 	const [bodyExpanded, setBodyExpanded] = useState(false);
+	const [detailsExpanded, setDetailsExpanded] = useState(false);
 	const [filesExpanded, setFilesExpanded] = useState(true);
 	const [diffLayout, setDiffLayout] = useState<CommitDiffLayout>(readCommitDiffLayout);
 	const bodyId = useId();
+	const detailsId = useId();
 	const filesId = useId();
 	const detail = useGitCommitDetail(target, sha);
 	// A failed refetch retains cached data. Never expose private metadata or keep
@@ -145,18 +147,56 @@ function CommitPreviewContent({
 				))}
 			{data && (
 				<>
-					<Paper withBorder radius="md" p="md">
-						<Stack gap="sm">
-							<div data-commit-message>
-								<Text component="h2" size="lg" fw={600} m={0} className={classes.wrap}>
+					<Paper withBorder radius="md" className={classes.commitCard} data-commit-statistics>
+						<div className={classes.summary}>
+							<UnstyledButton
+								type="button"
+								className={classes.summaryToggle}
+								aria-expanded={detailsExpanded}
+								aria-controls={detailsId}
+								data-commit-details-toggle
+								onClick={() => setDetailsExpanded((open) => !open)}
+							>
+								{detailsExpanded ? (
+									<IconChevronDown size={16} className={classes.chevron} />
+								) : (
+									<IconChevronRight size={16} className={classes.chevron} />
+								)}
+								<Text
+									component="span"
+									data-commit-message
+									className={classes.summarySubject}
+									title={subject}
+								>
 									{subject}
 								</Text>
+								<Text component="span" className={classes.srOnly}>
+									{t(
+										detailsExpanded
+											? "commitPreview.collapseDetails"
+											: "commitPreview.expandDetails",
+									)}
+								</Text>
+							</UnstyledButton>
+							<Group gap="sm" wrap="nowrap" className={classes.summaryStats}>
+								<Text size="xs" c="dimmed">
+									{t("commitPreview.files", { count: data.files.length })}
+								</Text>
+								<Text size="xs" c="green">
+									{t("commitPreview.additions", { count: added })}
+								</Text>
+								<Text size="xs" c="red">
+									{t("commitPreview.deletions", { count: removed })}
+								</Text>
+							</Group>
+						</div>
+						{detailsExpanded && (
+							<Stack id={detailsId} gap="sm" className={classes.details}>
 								{body && (
 									<>
 										<Button
 											variant="subtle"
 											size="compact-xs"
-											mt="xs"
 											onClick={() => setBodyExpanded(!bodyExpanded)}
 											aria-expanded={bodyExpanded}
 											aria-controls={bodyId}
@@ -169,7 +209,7 @@ function CommitPreviewContent({
 												id={bodyId}
 												component="pre"
 												size="sm"
-												mt="sm"
+												mt="xs"
 												mb={0}
 												className={classes.messageBody}
 												data-commit-body
@@ -179,156 +219,142 @@ function CommitPreviewContent({
 										)}
 									</>
 								)}
-							</div>
-							{data.messageTruncated && (
-								<Text size="xs" c="yellow">
-									{t("commitPreview.messageTruncated")}
-								</Text>
-							)}
-							<Group gap="xs" className={classes.wrap}>
-								<Text size="xs" ff="monospace" data-commit-sha>
-									{t("commitPreview.sha")}: {data.sha}
-								</Text>
-								<CopyButton value={data.sha}>
-									{({ copied, copy }) => (
-										<Tooltip label={t(copied ? "commitPreview.copied" : "commitPreview.copySha")}>
-											<ActionIcon
+								{data.messageTruncated && (
+									<Text size="xs" c="yellow">
+										{t("commitPreview.messageTruncated")}
+									</Text>
+								)}
+								<Group gap="xs" className={classes.wrap}>
+									<Text size="xs" ff="monospace" data-commit-sha>
+										{t("commitPreview.sha")}: {data.sha}
+									</Text>
+									<CopyButton value={data.sha}>
+										{({ copied, copy }) => (
+											<Tooltip label={t(copied ? "commitPreview.copied" : "commitPreview.copySha")}>
+												<ActionIcon
+													type="button"
+													variant="subtle"
+													size="sm"
+													onClick={copy}
+													aria-label={t("commitPreview.copySha")}
+												>
+													{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+												</ActionIcon>
+											</Tooltip>
+										)}
+									</CopyButton>
+									<CopyButton value={`${globalThis.location?.origin ?? ""}${previewHref}`}>
+										{({ copied, copy }) => (
+											<Button
 												type="button"
 												variant="subtle"
-												size="sm"
+												size="compact-xs"
 												onClick={copy}
-												aria-label={t("commitPreview.copySha")}
+												data-commit-copy-link
 											>
-												{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-											</ActionIcon>
-										</Tooltip>
-									)}
-								</CopyButton>
-								<CopyButton value={`${globalThis.location?.origin ?? ""}${previewHref}`}>
-									{({ copied, copy }) => (
-										<Button
-											type="button"
-											variant="subtle"
-											size="compact-xs"
-											onClick={copy}
-											data-commit-copy-link
+												{t(copied ? "commitPreview.copied" : "commitPreview.copyLink")}
+											</Button>
+										)}
+									</CopyButton>
+									{mode === "modal" && (
+										<Anchor
+											href={previewHref}
+											target="_blank"
+											rel="noopener noreferrer"
+											size="xs"
+											data-commit-open-page
 										>
-											{t(copied ? "commitPreview.copied" : "commitPreview.copyLink")}
-										</Button>
-									)}
-								</CopyButton>
-								{mode === "modal" && (
-									<Anchor
-										href={previewHref}
-										target="_blank"
-										rel="noopener noreferrer"
-										size="xs"
-										data-commit-open-page
-									>
-										<Group component="span" gap={4}>
-											{t("commitPreview.openPage")}
-											<IconExternalLink size={14} />
-										</Group>
-									</Anchor>
-								)}
-							</Group>
-							<Stack gap={3} className={classes.wrap}>
-								<Text size="xs" c="dimmed">
-									{t("commitPreview.author")}: {data.authorName} &lt;{data.authorEmail}&gt; ·{" "}
-									<time dateTime={data.authoredAt} title={formatRelativeTime(data.authoredAt)}>
-										{data.authoredAt}
-									</time>
-								</Text>
-								<Text size="xs" c="dimmed">
-									{t("commitPreview.committer")}: {data.committerName} &lt;{data.committerEmail}&gt;
-									·{" "}
-									<time dateTime={data.committedAt} title={formatRelativeTime(data.committedAt)}>
-										{data.committedAt}
-									</time>
-								</Text>
-								<Group gap="xs" title={data.parents.join(" ")}>
-									<Text size="xs" c="dimmed">
-										{t("commitPreview.parents")}:
-									</Text>
-									{data.parents.length === 0 ? (
-										<Text size="xs">—</Text>
-									) : (
-										data.parents.map((parent) => (
-											<Anchor
-												key={parent}
-												href={buildCommitPreviewBrowserHref(target, parent, undefined, linkMode)}
-												size="xs"
-												ff="monospace"
-												title={parent}
-												data-commit-parent={parent}
-												onClick={(event) => {
-													if (
-														onNavigateCommit &&
-														event.button === 0 &&
-														!event.metaKey &&
-														!event.ctrlKey &&
-														!event.shiftKey &&
-														!event.altKey
-													) {
-														event.preventDefault();
-														onNavigateCommit(parent);
-													}
-												}}
-											>
-												{parent.slice(0, 7)}
-											</Anchor>
-										))
+											<Group component="span" gap={4}>
+												{t("commitPreview.openPage")}
+												<IconExternalLink size={14} />
+											</Group>
+										</Anchor>
 									)}
 								</Group>
-							</Stack>
-							{data.parents.length === 0 && (
-								<Text size="xs" c="dimmed">
-									{t("commitPreview.rootCommit")}
-								</Text>
-							)}
-							{data.parents.length > 1 && (
-								<Alert color="blue" py={6}>
-									<Text size="xs">
-										{t("commitPreview.mergeNotice", { parent: data.parents[0].slice(0, 7) })}
+								<Stack gap={3} className={classes.wrap}>
+									<Text size="xs" c="dimmed">
+										{t("commitPreview.author")}: {data.authorName} &lt;{data.authorEmail}&gt; ·{" "}
+										<time dateTime={data.authoredAt} title={formatRelativeTime(data.authoredAt)}>
+											{data.authoredAt}
+										</time>
 									</Text>
-								</Alert>
-							)}
-						</Stack>
+									<Text size="xs" c="dimmed">
+										{t("commitPreview.committer")}: {data.committerName} &lt;{data.committerEmail}
+										&gt; ·{" "}
+										<time dateTime={data.committedAt} title={formatRelativeTime(data.committedAt)}>
+											{data.committedAt}
+										</time>
+									</Text>
+									<Group gap="xs" title={data.parents.join(" ")}>
+										<Text size="xs" c="dimmed">
+											{t("commitPreview.parents")}:
+										</Text>
+										{data.parents.length === 0 ? (
+											<Text size="xs">—</Text>
+										) : (
+											data.parents.map((parent) => (
+												<Anchor
+													key={parent}
+													href={buildCommitPreviewBrowserHref(target, parent, undefined, linkMode)}
+													size="xs"
+													ff="monospace"
+													title={parent}
+													data-commit-parent={parent}
+													onClick={(event) => {
+														if (
+															onNavigateCommit &&
+															event.button === 0 &&
+															!event.metaKey &&
+															!event.ctrlKey &&
+															!event.shiftKey &&
+															!event.altKey
+														) {
+															event.preventDefault();
+															onNavigateCommit(parent);
+														}
+													}}
+												>
+													{parent.slice(0, 7)}
+												</Anchor>
+											))
+										)}
+									</Group>
+								</Stack>
+								{data.parents.length === 0 && (
+									<Text size="xs" c="dimmed">
+										{t("commitPreview.rootCommit")}
+									</Text>
+								)}
+								{data.parents.length > 1 && (
+									<Alert color="blue" py={6}>
+										<Text size="xs">
+											{t("commitPreview.mergeNotice", { parent: data.parents[0].slice(0, 7) })}
+										</Text>
+									</Alert>
+								)}
+								{(data.filesTruncated || unknownStats) && (
+									<Text size="xs" c="yellow">
+										{t("commitPreview.partialStats")}
+									</Text>
+								)}
+								{unknownStats && (
+									<Text size="xs" c="yellow">
+										{t("commitPreview.unknownStats")}
+									</Text>
+								)}
+								{hasBinary && (
+									<Text size="xs" c="dimmed">
+										{t("commitPreview.binaryStats")}
+									</Text>
+								)}
+								{data.filesTruncated && (
+									<Text size="xs" c="yellow">
+										{t("commitPreview.filesTruncated", { count: data.files.length })}
+									</Text>
+								)}
+							</Stack>
+						)}
 					</Paper>
-
-					<Stack gap={4} data-commit-statistics>
-						<Group gap="md">
-							<Text size="sm" fw={600}>
-								{t("commitPreview.files", { count: data.files.length })}
-							</Text>
-							<Text size="sm" c="green">
-								{t("commitPreview.additions", { count: added })}
-							</Text>
-							<Text size="sm" c="red">
-								{t("commitPreview.deletions", { count: removed })}
-							</Text>
-						</Group>
-						{(data.filesTruncated || unknownStats) && (
-							<Text size="xs" c="yellow">
-								{t("commitPreview.partialStats")}
-							</Text>
-						)}
-						{unknownStats && (
-							<Text size="xs" c="yellow">
-								{t("commitPreview.unknownStats")}
-							</Text>
-						)}
-						{hasBinary && (
-							<Text size="xs" c="dimmed">
-								{t("commitPreview.binaryStats")}
-							</Text>
-						)}
-						{data.filesTruncated && (
-							<Text size="xs" c="yellow">
-								{t("commitPreview.filesTruncated", { count: data.files.length })}
-							</Text>
-						)}
-					</Stack>
 					{data.files.length === 0 && !data.filesTruncated && (
 						<Text size="sm" c="dimmed">
 							{t("commitPreview.noFiles")}
