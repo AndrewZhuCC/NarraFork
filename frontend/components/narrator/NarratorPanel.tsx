@@ -174,6 +174,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { usageSourceFor } from "./model/custom-api-usage-source";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -1112,7 +1113,15 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
-		if (cfg.id === currentOpencodeProviderId) {
+		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
+		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
+		// Go one would otherwise fall through to the previous account's Kimi allowance.
+		const usageSource = usageSourceFor({
+			providerId: cfg.id,
+			opencodeProviderId: currentOpencodeProviderId,
+			kimiProviderId: currentKimiProviderId,
+		});
+		if (usageSource === "opencode") {
 			const usage = opencodeUsageQuery.data;
 			if (usage) {
 				const quotaBalance = formatOpencodeBarText(usage, t);
@@ -1124,12 +1133,14 @@ function NarratorPanelBody({
 		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
-		const kimiUsage = kimiUsagesData?.[cfg.id];
-		if (kimiUsage) {
-			const quotaBalance = formatKimiBarText(kimiUsage, t);
-			const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-			if (quotaBalance || detailedQuotaBalance) {
-				return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+		if (usageSource === "kimi") {
+			const kimiUsage = kimiUsagesData?.[cfg.id];
+			if (kimiUsage) {
+				const quotaBalance = formatKimiBarText(kimiUsage, t);
+				const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
 			}
 		}
 		const quotas = settingsData?.customApiQuotas as
@@ -1148,6 +1159,7 @@ function NarratorPanelBody({
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
 		kimiUsagesData,
+		currentKimiProviderId,
 		currentOpencodeProviderId,
 		opencodeUsageQuery.data,
 		t,

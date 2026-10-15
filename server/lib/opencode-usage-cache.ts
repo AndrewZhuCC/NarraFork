@@ -118,10 +118,24 @@ export function opencodeUsageUrl(baseUrl: string): string {
 	return url.toString();
 }
 
+/**
+ * What the cached allowance is a function of.
+ *
+ * The usage endpoint is addressed by `baseUrl` and authenticated by `apiKey`. The
+ * transport fields join them because a proxy or TLS change can decide whether the
+ * next refresh reaches the endpoint at all, so dropping the entry and re-fetching is
+ * the safe response there.
+ *
+ * `protocol` is deliberately NOT part of this: it selects the wire format for
+ * INFERENCE calls, which the usage request never uses — and under the `opencode`
+ * preset all three protocols share one `baseUrl`, so including it threw away a valid
+ * cache every time an admin switched format. Same rule the repository already applies
+ * to Kimi usage in `getCustomApiProviderIdsWithKimiIdentityChanges`
+ * (`routes/settings.ts`).
+ */
 function identity(config: CustomApiProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
-		config.protocol,
 		config.apiKey,
 		config.proxy,
 		config.tlsRejectUnauthorized,

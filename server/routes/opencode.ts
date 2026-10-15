@@ -35,11 +35,11 @@ export const opencodeRoutes = new Hono();
  * message still describes the deployment's provider account rather than the
  * requesting user's allowance, and the route is open to every signed-in user.
  * `hasError` replaces it rather than the field simply vanishing: the status bar
- * must show "usage unavailable" instead of presenting the last cached
- * percentages as if they were current. An admin gets the text, because they are
- * the one who can act on it.
+ * must render "usage unavailable" on a failed fetch, and without a field of its
+ * own that state would be indistinguishable from a cold (never-fetched) entry.
+ * An admin gets the text, because they are the one who can act on it.
  */
-export function redactUsagesForRole(
+function redactUsagesForRole(
 	usages: Record<string, OpencodeUsageCache>,
 	isAdmin: boolean,
 ): Record<

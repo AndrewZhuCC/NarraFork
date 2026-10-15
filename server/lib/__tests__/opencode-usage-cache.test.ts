@@ -215,7 +215,6 @@ describe("OpenCode Go usage", () => {
 	for (const change of [
 		"apiKey",
 		"baseUrl",
-		"protocol",
 		"disabled",
 		"proxy",
 		"tls",
@@ -231,7 +230,6 @@ describe("OpenCode Go usage", () => {
 			if (!config) throw new Error("missing fixture");
 			if (change === "apiKey") config.apiKey = "new-account";
 			if (change === "baseUrl") config.baseUrl = "https://opencode.ai/inference/go/v1";
-			if (change === "protocol") config.protocol = "anthropic-messages";
 			if (change === "disabled") config.disabled = true;
 			if (change === "proxy") config.proxy = { mode: "direct" };
 			if (change === "tls") config.tlsRejectUnauthorized = false;
@@ -249,6 +247,24 @@ describe("OpenCode Go usage", () => {
 			expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling ?? null).toBeNull();
 		});
 	}
+
+	test("switching protocol keeps the allowance: it does not change what the endpoint returns", async () => {
+		await refreshOpencodeUsage("opencode-test");
+		const generation = getOpencodeUsageGenerations()["opencode-test"];
+		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
+		// Count relative to here: `beforeEach` installs a spy and the refresh above ran
+		// through it, so an absolute call count would be pre-loaded.
+		const callsSoFar = fetchSpy.mock.calls.length;
+		// The `opencode` preset serves all three protocols from one base URL, so an admin
+		// switching format must not blank the indicator nor spend an upstream call. Were
+		// `protocol` part of the identity, this would rotate the generation, reset the entry
+		// to `fetchedAt: 0`, and make the stale sweep below re-fetch it.
+		settings.customApiProviders = [{ ...provider(), protocol: "anthropic-messages" }];
+		expect(getOpencodeUsageGenerations()["opencode-test"]).toBe(generation);
+		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		await refreshStaleOpencodeUsages();
+		expect(fetchSpy.mock.calls.length).toBe(callsSoFar);
+	});
 
 	test("generations stay stable across reads and unrelated edits, and never encode credentials", async () => {
 		const original = getOpencodeUsageGenerations()["opencode-test"];
@@ -306,27 +322,69 @@ describe("OpenCode Go usage", () => {
 	});
 
 	test("bounds declared and streamed response size and fails safely on bad payloads", async () => {
-		const tooBig = new ReadableStream({
-			start(controller) {
-				controller.enqueue(new Uint8Array(70_000));
-				controller.close();
-			},
-		});
 		for (const response of [
 			new Response("private secret-test-key", { status: 401 }),
 			new Response("private secret-test-key", { status: 403 }),
 			new Response("not json"),
 			new Response("{}"),
-			// Declared size is refused before the body is read; the streamed case below
-			// proves the guard also holds when the upstream understates it.
-			new Response("{}", { headers: { "content-length": "65537" } }),
-			new Response(tooBig),
+			// Structurally invalid payloads: rejected by the parser, not the size guard.
 		]) {
 			respond = async () => response;
 			const cache = await refreshOpencodeUsage("opencode-test");
 			expect(cache?.error).toBe("OpenCode usage request failed");
 			expect(JSON.stringify(cache)).not.toContain("secret-test-key");
 		}
+	});
+
+	/**
+	 * The size guard needs payloads that are VALID usage JSON and merely too big.
+	 *
+	 * A malformed oversized body proves nothing: it would be rejected by the parser
+	 * even with the guard deleted, so the assertion could never fail. (The DeepSeek
+	 * suite this was modelled on has exactly that hole — it feeds `"{}"` behind a
+	 * declared length and 70k zero bytes as a stream, both of which fail parsing on
+	 * their own.) These fixtures keep the size guard the only reason to reject, and
+	 * carry a DIFFERENT percentage so that applying them would be observable.
+	 */
+	test("rejects an oversized declared length and an oversized streamed body", async () => {
+		await refreshOpencodeUsage("opencode-test");
+		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+
+		// A small, valid body that LIES about its length: only the declared-length branch
+		// can refuse it, since the body itself would parse fine.
+		const lying = new Response(JSON.stringify({ ...body, padding: " ".repeat(0) }), {
+			headers: { "content-length": "65537" },
+		});
+		expect(lying.headers.get("content-length")).toBe("65537");
+		respond = async () => lying;
+		expect((await refreshOpencodeUsage("opencode-test"))?.error).toBe(
+			"OpenCode usage request failed",
+		);
+
+		// With no declared length the cap has to be enforced while streaming. The payload
+		// is valid JSON reporting 99% used, so a guard that let it through would show 99.
+		const oversized = JSON.stringify({
+			...body,
+			usage: { ...body.usage, rolling: { status: "ok", percent: 99, resetsAt: null } },
+			padding: " ".repeat(70_000),
+		});
+		const streamed = new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(oversized));
+					controller.close();
+				},
+			}),
+		);
+		expect(streamed.headers.get("content-length")).toBeNull();
+		respond = async () => streamed;
+		await refreshOpencodeUsage("opencode-test");
+
+		const cache = getAllOpencodeCachedUsages()["opencode-test"];
+		expect(cache?.error).toBe("OpenCode usage request failed");
+		// The oversized body was never applied: the previous allowance survived, so an
+		// under-reported length cannot smuggle a truncated reading into the display.
+		expect(cache?.rolling?.percent).toBe(37);
 	});
 
 	test("the 15s deadline covers both a stalled transport and a stalled response body", async () => {
