@@ -34,7 +34,21 @@ import {
 	knowledgeTagTypes,
 	users,
 } from "@server/db/postgres-schema";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	getTableColumns,
+	inArray,
+	isNotNull,
+	isNull,
+	like,
+	lt,
+	ne,
+	or,
+	sql,
+} from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type {
 	AclEventReadRow,
@@ -134,7 +148,67 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 		);
 	};
 
+	const personalInjectionWhere = (opts: {
+		userId: string;
+		collectionId?: string;
+		projectId?: string;
+	}) =>
+		and(
+			eq(knowledgeDrafts.authorUserId, opts.userId),
+			eq(knowledgeDrafts.status, "active"),
+			isNull(knowledgeDrafts.entryId),
+			isNotNull(knowledgeDrafts.keywordsJson),
+			opts.collectionId ? eq(knowledgeDrafts.targetCollectionId, opts.collectionId) : undefined,
+			opts.projectId
+				? or(
+						isNull(knowledgeDrafts.targetCollectionId),
+						inArray(
+							knowledgeDrafts.targetCollectionId,
+							db
+								.select({ id: knowledgeCollections.id })
+								.from(knowledgeCollections)
+								.where(
+									or(
+										eq(knowledgeCollections.projectId, opts.projectId),
+										isNull(knowledgeCollections.projectId),
+									),
+								),
+						),
+					)
+				: undefined,
+		);
+
 	return {
+		async listPersonalEntries(opts) {
+			const { content, ...columns } = getTableColumns(knowledgeDrafts);
+			return db
+				.select({ ...columns, contentLength: sql<number>`length(${content})`.mapWith(Number) })
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.authorUserId, opts.userId),
+						opts.status ? eq(knowledgeDrafts.status, opts.status) : undefined,
+					),
+				)
+				.orderBy(desc(knowledgeDrafts.updatedAt))
+				.limit(Math.max(1, Math.min(opts.limit, 200)));
+		},
+		async getEntryRevisionPointers(ids) {
+			if (!ids.length) return [];
+			return db
+				.select({ id: knowledgeEntries.id, currentRevisionId: knowledgeEntries.currentRevisionId })
+				.from(knowledgeEntries)
+				.where(inArray(knowledgeEntries.id, ids))
+				.limit(200);
+		},
+		async getPersonalEntryById(id) {
+			const rows = await db
+				.select()
+				.from(knowledgeDrafts)
+				.where(eq(knowledgeDrafts.id, id))
+				.limit(1);
+			return rows[0] ?? null;
+		},
 		async getEntryById(entryId) {
 			const rows = await db
 				.select()
@@ -603,6 +677,50 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 			return rows as AclEventReadRow[];
 		},
 
+		async listPersonalKeywordInjectionCandidates(opts) {
+			return db
+				.select({
+					id: knowledgeDrafts.id,
+					collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
+					title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
+					currentRevisionId: sql<null>`null`,
+					tagsJson: sql<null>`null`,
+					keywordsJson: knowledgeDrafts.keywordsJson,
+					updatedAt: knowledgeDrafts.updatedAt,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts))
+				.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
+				.limit(opts.limit);
+		},
+		async personalKeywordInjectionSignature(opts) {
+			const rows = await db
+				.select({
+					cnt: sql<number>`count(*)`,
+					maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts));
+			return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
+		},
+		async personalInjectionSnippets(userId, ids, maxChars) {
+			if (!ids.length) return [];
+			return db
+				.select({
+					id: knowledgeDrafts.id,
+					snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, ${maxChars})`,
+				})
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.authorUserId, userId),
+						eq(knowledgeDrafts.status, "active"),
+						isNull(knowledgeDrafts.entryId),
+						inArray(knowledgeDrafts.id, ids),
+					),
+				);
+		},
+
 		async listKeywordInjectionCandidates(opts) {
 			const rows = await db
 				.select({
@@ -664,7 +782,10 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 
 		async listInjectedEntryIds(narratorId, compactSeq) {
 			const rows = await db
-				.select({ entryId: knowledgeInjectionEvents.entryId })
+				.select({
+					entryId: knowledgeInjectionEvents.entryId,
+					personalEntryId: knowledgeInjectionEvents.personalEntryId,
+				})
 				.from(knowledgeInjectionEvents)
 				.where(
 					and(
@@ -672,7 +793,9 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 						eq(knowledgeInjectionEvents.compactSeq, compactSeq),
 					),
 				);
-			return rows.map((row) => row.entryId);
+			return rows.map((row) =>
+				row.personalEntryId ? `personal:${row.personalEntryId}` : `global:${row.entryId}`,
+			);
 		},
 	};
 }

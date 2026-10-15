@@ -2991,6 +2991,7 @@ async function* agentLoopInMetadataSnapshot(
 							{
 								kind: "knowledge",
 								hits: scan.hits.map((hit) => ({
+									scope: hit.scope,
 									entryId: hit.entryId,
 									title: hit.title,
 									summary: hit.summary,

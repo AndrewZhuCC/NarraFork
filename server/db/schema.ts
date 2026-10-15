@@ -4927,9 +4927,10 @@ export const knowledgeInjectionEvents = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		compactSeq: integer("compact_seq").notNull(),
-		entryId: text("entry_id")
-			.notNull()
-			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryId: text("entry_id").references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		personalEntryId: text("personal_entry_id").references(() => knowledgeDrafts.id, {
+			onDelete: "cascade",
+		}),
 		entryRevisionId: text("entry_revision_id").references(() => knowledgeRevisions.id, {
 			onDelete: "set null",
 		}),
@@ -4946,7 +4947,17 @@ export const knowledgeInjectionEvents = sqliteTable(
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
+		check(
+			"knowledge_injection_exactly_one_entry",
+			sql`(${table.entryId} IS NOT NULL AND ${table.personalEntryId} IS NULL) OR (${table.entryId} IS NULL AND ${table.personalEntryId} IS NOT NULL)`,
+		),
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		uniqueIndex("idx_kie_cycle_personal_entry").on(
+			table.narratorId,
+			table.compactSeq,
+			table.personalEntryId,
+		),
+		index("idx_kie_personal_entry").on(table.personalEntryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
 		// FK covering indexes: both parents (narrator_messages / narrator_tool_calls) are

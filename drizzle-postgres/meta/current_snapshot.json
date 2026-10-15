@@ -1,6 +1,6 @@
 {
-  "id": "589f163a-9f46-4c42-9b4f-7421ec507a16",
-  "prevId": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
+  "id": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
+  "prevId": "589f163a-9f46-4c42-9b4f-7421ec507a16",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -8863,7 +8863,13 @@
           "name": "entry_id",
           "type": "text",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
+        },
+        "personal_entry_id": {
+          "name": "personal_entry_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "entry_revision_id": {
           "name": "entry_revision_id",
@@ -8926,6 +8932,48 @@
             }
           ],
           "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_kie_cycle_personal_entry": {
+          "name": "idx_kie_cycle_personal_entry",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "compact_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "personal_entry_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_kie_personal_entry": {
+          "name": "idx_kie_personal_entry",
+          "columns": [
+            {
+              "expression": "personal_entry_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -9039,6 +9087,19 @@
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
+        "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk": {
+          "name": "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk",
+          "tableFrom": "knowledge_injection_events",
+          "tableTo": "knowledge_drafts",
+          "columnsFrom": [
+            "personal_entry_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
         "knowledge_injection_events_entry_revision_id_know_a5763cfc54_fk": {
           "name": "knowledge_injection_events_entry_revision_id_know_a5763cfc54_fk",
           "tableFrom": "knowledge_injection_events",
@@ -9082,7 +9143,12 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "knowledge_injection_exactly_one_entry": {
+          "name": "knowledge_injection_exactly_one_entry",
+          "value": "(\"entry_id\" IS NOT NULL AND \"personal_entry_id\" IS NULL) OR (\"entry_id\" IS NULL AND \"personal_entry_id\" IS NOT NULL)"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.knowledge_levels": {

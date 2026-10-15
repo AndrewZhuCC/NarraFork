@@ -387,6 +387,7 @@ async function recordInjectionEventsSection(
 				narratorId: input.narratorId,
 				compactSeq: input.compactSeq,
 				entryId: hit.entryId,
+				personalEntryId: hit.personalEntryId ?? null,
 				entryRevisionId: hit.entryRevisionId,
 				source: input.source,
 				triggerMessageId: input.triggerMessageId,
@@ -1174,6 +1175,13 @@ export function createPostgresKnowledgeWriteStore(db: BunSQLDatabase): Knowledge
 			);
 		},
 
+		async createPersonalEntry(input) {
+			const rows = await db.insert(knowledgeDrafts).values(input).returning();
+			return rows[0];
+		},
+		async updatePersonalEntryMeta(id, patch) {
+			await db.update(knowledgeDrafts).set(patch).where(eq(knowledgeDrafts.id, id));
+		},
 		async getOrCreateActiveDraft(input: GetOrCreateActiveDraftWrite): Promise<KnowledgeDraftRow> {
 			return retryKnowledgeWrite(
 				() => db.transaction((tx) => getOrCreateActiveDraftSection(tx, input)),

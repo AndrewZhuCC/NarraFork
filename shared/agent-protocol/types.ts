@@ -144,6 +144,7 @@ export interface KnowledgeInjectionRecord {
 	compactSeq: number;
 	triggerToolCallId?: string | null;
 	hits: Array<{
+		scope?: "personal" | "global";
 		entryId: string;
 		entryRevisionId?: string | null;
 		summary?: string | null;

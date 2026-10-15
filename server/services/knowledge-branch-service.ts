@@ -4,7 +4,6 @@ import { eq } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import {
 	knowledgeCollections,
-	knowledgeDrafts,
 	knowledgeEntries,
 	knowledgeRevisions,
 	knowledgeSubmissions,
@@ -13,7 +12,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { slugify } from "../lib/slug";
-import { knowledgeWriteStore } from "./knowledge/store";
+import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
 import { WITHDRAWABLE_SUBMISSION_STATUSES } from "./knowledge/write-store";
 import {
 	type AclCollection,
@@ -171,9 +170,7 @@ async function getMyDraft(principal: Principal, entryId: string) {
 }
 
 async function loadOwnDraft(principal: Principal, draftId: string) {
-	const draft = await db.query.knowledgeDrafts.findFirst({
-		where: eq(knowledgeDrafts.id, draftId),
-	});
+	const draft = await knowledgeReadStore.getPersonalEntryById(draftId);
 	if (!draft) throw new NotFoundError("Knowledge draft", draftId);
 	if (draft.authorUserId !== principal.userId && principal.role !== "admin") {
 		throw new NotFoundError("Knowledge draft", draftId);
@@ -204,26 +201,22 @@ async function createStandalone(
 	const id = generateId();
 	const now = nowIso();
 	const content = input.content ?? "";
-	const draft = db
-		.insert(knowledgeDrafts)
-		.values({
-			id,
-			entryId: null,
-			authorUserId: principal.userId,
-			name: input.name ?? null,
-			title,
-			targetCollectionId: input.targetCollectionId ?? null,
-			baseRevisionId: null,
-			keywordsJson: Array.isArray(input.keywords) ? input.keywords : null,
-			content,
-			contentHash: hashContent(content),
-			format: "markdown",
-			status: "active",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.returning()
-		.get();
+	const draft = await knowledgeWriteStore.createPersonalEntry({
+		id,
+		entryId: null,
+		authorUserId: principal.userId,
+		name: input.name ?? null,
+		title,
+		targetCollectionId: input.targetCollectionId ?? null,
+		baseRevisionId: null,
+		keywordsJson: Array.isArray(input.keywords) ? input.keywords : null,
+		content,
+		contentHash: hashContent(content),
+		format: "markdown",
+		status: "active",
+		createdAt: now,
+		updatedAt: now,
+	});
 	return draft;
 }
 
@@ -242,35 +235,11 @@ async function listMine(
 ) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? 100, 200);
-	const rows = await db.query.knowledgeDrafts.findMany({
-		where: (d, { and: a, eq: e }) => {
-			const conds = [e(d.authorUserId, principal.userId)];
-			if (opts.status) conds.push(e(d.status, opts.status));
-			return a(...conds);
-		},
-		// SQL-layer projection: everything a summary needs, minus the body.
-		columns: {
-			id: true,
-			entryId: true,
-			authorUserId: true,
-			name: true,
-			title: true,
-			targetCollectionId: true,
-			baseRevisionId: true,
-			contentHash: true,
-			format: true,
-			keywordsJson: true,
-			status: true,
-			createdAt: true,
-			updatedAt: true,
-		},
-		extras: (d, { sql }) => ({
-			contentLength: sql<number>`length(${d.content})`.as("content_length"),
-		}),
-		orderBy: (d, { desc: dd }) => [dd(d.updatedAt)],
+	return knowledgeReadStore.listPersonalEntries({
+		userId: principal.userId,
+		status: opts.status,
 		limit,
 	});
-	return rows;
 }
 
 /**
@@ -296,11 +265,7 @@ async function findDriftedDraftIds(
 	const linked = drafts.filter((d) => d.entryId && d.baseRevisionId);
 	if (linked.length === 0) return new Set();
 	const entryIds = [...new Set(linked.map((d) => d.entryId as string))];
-	const entries = await db.query.knowledgeEntries.findMany({
-		where: (e, { inArray }) => inArray(e.id, entryIds),
-		// Only the pointer that defines drift — never currentContent.
-		columns: { id: true, currentRevisionId: true },
-	});
+	const entries = await knowledgeReadStore.getEntryRevisionPointers(entryIds);
 	const currentByEntry = new Map(entries.map((e) => [e.id, e.currentRevisionId ?? null]));
 	const drifted = new Set<string>();
 	for (const d of linked) {
@@ -333,7 +298,9 @@ async function updateStandaloneMeta(
 	if (draft.entryId) {
 		throw new ValidationError("Linked personal entries inherit title/target from the global entry");
 	}
-	const patch: Record<string, unknown> = { updatedAt: nowIso() };
+	const patch: Parameters<typeof knowledgeWriteStore.updatePersonalEntryMeta>[1] = {
+		updatedAt: nowIso(),
+	};
 	if (input.title !== undefined) {
 		const t = input.title.trim();
 		if (!t) throw new ValidationError("Title cannot be empty");
@@ -343,7 +310,7 @@ async function updateStandaloneMeta(
 	if (input.keywords !== undefined) {
 		patch.keywordsJson = Array.isArray(input.keywords) ? input.keywords : null;
 	}
-	await db.update(knowledgeDrafts).set(patch).where(eq(knowledgeDrafts.id, draftId));
+	await knowledgeWriteStore.updatePersonalEntryMeta(draftId, patch);
 	return loadOwnDraft(principal, draftId);
 }
 
@@ -421,7 +388,7 @@ async function updateDraft(
 			reason: "draft_updated",
 		});
 	}
-	return db.query.knowledgeDrafts.findFirst({ where: eq(knowledgeDrafts.id, draftId) });
+	return knowledgeReadStore.getPersonalEntryById(draftId);
 }
 
 /**

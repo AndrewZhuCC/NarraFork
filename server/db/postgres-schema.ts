@@ -3073,9 +3073,10 @@ export const knowledgeInjectionEvents = pgTable(
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		compactSeq: integer("compact_seq").notNull(),
-		entryId: text("entry_id")
-			.notNull()
-			.references((): PgColumn => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryId: text("entry_id").references((): PgColumn => knowledgeEntries.id, {
+			onDelete: "cascade",
+		}),
+		personalEntryId: text("personal_entry_id"),
 		entryRevisionId: text("entry_revision_id"),
 		source: text("source").notNull(),
 		triggerMessageId: text("trigger_message_id"),
@@ -3085,11 +3086,28 @@ export const knowledgeInjectionEvents = pgTable(
 	},
 	(table) => [
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		uniqueIndex("idx_kie_cycle_personal_entry").on(
+			table.narratorId,
+			table.compactSeq,
+			table.personalEntryId,
+		),
+		index("idx_kie_personal_entry").on(table.personalEntryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
 		index("idx_kie_trigger_message").on(table.triggerMessageId),
 		index("idx_kie_trigger_tool_call").on(table.triggerToolCallId),
 		index("idx_kie_entry_revision").on(table.entryRevisionId),
+		check(
+			"knowledge_injection_exactly_one_entry",
+			sql.raw(
+				'("entry_id" IS NOT NULL AND "personal_entry_id" IS NULL) OR ("entry_id" IS NULL AND "personal_entry_id" IS NOT NULL)',
+			),
+		),
+		foreignKey({
+			name: "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk",
+			columns: [table.personalEntryId],
+			foreignColumns: [knowledgeDrafts.id],
+		}).onDelete("cascade"),
 		foreignKey({
 			name: "knowledge_injection_events_entry_revision_id_know_a5763cfc54_fk",
 			columns: [table.entryRevisionId],
@@ -3842,7 +3860,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 121,
-  "columnCount": 1720,
+  "columnCount": 1721,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -22298,7 +22316,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "entry_id",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false,
           "references": {
@@ -22308,6 +22326,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "knowledge_injection_events_entry_id_knowledge_entries_id_fk"
           },
           "emitAsTableConstraint": false
+        },
+        {
+          "property": "personalEntryId",
+          "name": "personal_entry_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "knowledgeDrafts",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk"
+          },
+          "emitAsTableConstraint": true
         },
         {
           "property": "entryRevisionId",
@@ -22396,6 +22430,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": true
         },
         {
+          "name": "idx_kie_cycle_personal_entry",
+          "columns": [
+            "narratorId",
+            "compactSeq",
+            "personalEntryId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_kie_personal_entry",
+          "columns": [
+            "personalEntryId"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_kie_narrator_cycle",
           "columns": [
             "narratorId",
@@ -22432,8 +22482,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
-      "checks": [],
-      "checkDefinitions": [],
+      "checks": [
+        "knowledge_injection_exactly_one_entry"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "knowledge_injection_exactly_one_entry",
+          "expression": "(\"entry_id\" IS NOT NULL AND \"personal_entry_id\" IS NULL) OR (\"entry_id\" IS NULL AND \"personal_entry_id\" IS NOT NULL)"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

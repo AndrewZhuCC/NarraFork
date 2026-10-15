@@ -780,6 +780,7 @@ async function getRevision(revisionId: string, principal: Principal) {
 function mapRow(row: KnowledgeSearchRow) {
 	return {
 		id: row.id,
+		...(row.personalEntryId ? { personalEntryId: row.personalEntryId } : {}),
 		collectionId: row.collectionId,
 		title: row.title,
 		slug: row.slug,
@@ -818,6 +819,8 @@ type SearchOpts = {
 	field?: string;
 	/** When set, the caller's own active drafts shadow the main version (working-copy view). */
 	draftUserId?: string;
+	/** Internal tool opt-in; ordinary API searches keep their committed/linked contract. */
+	includeStandalone?: boolean;
 };
 
 /**
@@ -875,6 +878,7 @@ async function searchDrafts(
 		projectId: opts.projectId,
 		match: opts.match ?? "and",
 		authorUserId: draftUserId,
+		includeStandalone: opts.includeStandalone,
 		draftStatus: ACTIVE_DRAFT_STATUS,
 	});
 }
@@ -976,6 +980,7 @@ function recordInjectionEvents(input: {
 	triggerMessageId?: string | null;
 	triggerToolCallId?: string | null;
 	hits: Array<{
+		scope?: "personal" | "global";
 		entryId: string;
 		entryRevisionId?: string | null;
 		summary?: string | null;
@@ -1002,8 +1007,9 @@ function recordInjectionEvents(input: {
 			now: nowIso(),
 			hits: input.hits.map((hit) => ({
 				id: generateId(),
-				entryId: hit.entryId,
-				entryRevisionId: hit.entryRevisionId ?? null,
+				entryId: hit.scope === "personal" ? null : hit.entryId,
+				personalEntryId: hit.scope === "personal" ? hit.entryId : null,
+				entryRevisionId: hit.scope === "personal" ? null : (hit.entryRevisionId ?? null),
 				summary: hit.summary ?? null,
 			})),
 		})
@@ -1045,7 +1051,7 @@ async function search(opts: SearchOpts) {
 	// Fast path: the user has no active drafts → nothing to shadow. Fall back to the plain
 	// main-version search (one cheap indexed lookup above instead of a second FTS query).
 	// This keeps the hot passive-injection path cheap for the common no-draft case.
-	if (shadowedEntryIds.length === 0) {
+	if (shadowedEntryIds.length === 0 && !opts.includeStandalone) {
 		const rows = await searchMain(opts, limit, []);
 		const mapped = rows.map(mapRow);
 		const tag = opts.tag;
@@ -1081,7 +1087,7 @@ async function search(opts: SearchOpts) {
  * `opts.caps` lets hot callers (e.g. passive injection) pass already-resolved caps
  * to avoid a redundant grant lookup; when omitted, caps are resolved from `principal`.
  */
-async function filterReadable<T extends { id: string; collectionId?: string }>(
+async function filterReadable<T extends { id: string; collectionId?: string | null }>(
 	principal: Principal | undefined,
 	rows: T[],
 	opts: { caps?: PrincipalCaps } = {},
@@ -1129,13 +1135,29 @@ async function filterReadable<T extends { id: string; collectionId?: string }>(
  * narrator/runtime callers not yet migrated; these methods always follow the live
  * read binding and are usable on both engines. */
 export const knowledgeInjectionReads = {
-	async listKeywordInjectionCandidates(opts: { collectionId?: string; projectId?: string } = {}) {
-		const rows = await knowledgeReadStore.listKeywordInjectionCandidates({
+	async listKeywordInjectionCandidates(
+		opts: { collectionId?: string; projectId?: string; userId?: string | null } = {},
+	) {
+		const globalRows = await knowledgeReadStore.listKeywordInjectionCandidates({
 			...opts,
 			limit: KEYWORD_INJECTION_CANDIDATE_LIMIT,
 		});
+		const personalRows = opts.userId
+			? await knowledgeReadStore.listPersonalKeywordInjectionCandidates({
+					...opts,
+					userId: opts.userId,
+					limit: KEYWORD_INJECTION_CANDIDATE_LIMIT,
+				})
+			: [];
+		const rows = [
+			...globalRows.map((row) => ({ ...row, scope: "global" as const })),
+			...personalRows.map((row) => ({ ...row, scope: "personal" as const })),
+		]
+			.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
+			.slice(0, KEYWORD_INJECTION_CANDIDATE_LIMIT);
 		return rows
 			.map((row) => ({
+				scope: row.scope,
 				id: row.id,
 				collectionId: row.collectionId,
 				title: row.title,
@@ -1146,8 +1168,22 @@ export const knowledgeInjectionReads = {
 			}))
 			.filter((row) => row.keywords.length > 0);
 	},
-	keywordInjectionCandidatesSignature(opts: { collectionId?: string; projectId?: string } = {}) {
-		return knowledgeReadStore.keywordInjectionCandidatesSignature(opts);
+	async keywordInjectionCandidatesSignature(
+		opts: { collectionId?: string; projectId?: string; userId?: string | null } = {},
+	) {
+		const global = await knowledgeReadStore.keywordInjectionCandidatesSignature(opts);
+		const personal = opts.userId
+			? await knowledgeReadStore.personalKeywordInjectionSignature({ ...opts, userId: opts.userId })
+			: "";
+		return `${global}|${personal}`;
+	},
+	async personalSnippetsByEntryIds(userId: string, ids: string[]) {
+		const rows = await knowledgeReadStore.personalInjectionSnippets(
+			userId,
+			ids.slice(0, SNIPPETS_LOOKUP_MAX),
+			SNIPPET_SOURCE_CHARS,
+		);
+		return new Map(rows.map((row) => [row.id, row.snippet ?? ""]));
 	},
 	async snippetsByEntryIds(ids: string[]) {
 		const rows = await knowledgeReadStore.snippetsByEntryIds(
