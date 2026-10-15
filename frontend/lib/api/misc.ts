@@ -30,6 +30,7 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
+	DeepSeekBalanceCache,
 	HookApiRecord,
 	KimiUsageCache,
 	LearningDoc,
@@ -697,6 +698,14 @@ export const miscApi = {
 				{ status: "disabled" | "offline" | "connecting" | "online"; egressMode: string }
 			>
 		>("/nug/relay-status"),
+
+	deepseekGetBalances: (options?: object) =>
+		request<Record<string, DeepSeekBalanceCache>>(
+			"/deepseek/balances",
+			pickRequestOptions(options),
+		),
+	deepseekRefreshBalances: () =>
+		request<Record<string, DeepSeekBalanceCache>>("/deepseek/balances/refresh", { method: "POST" }),
 
 	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
 	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),

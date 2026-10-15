@@ -46,6 +46,7 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -173,6 +174,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -736,6 +738,28 @@ function NarratorPanelBody({
 		refetchInterval: 60_000,
 	});
 
+	const currentDeepSeekProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const deepseekGeneration = currentDeepSeekProviderId
+		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
+		: undefined;
+	const deepseekBalancesQuery = useDeepSeekBalance(
+		currentDeepSeekProviderId,
+		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
+
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
 	const activeTerminalCount = useMemo(
@@ -1081,6 +1105,12 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
+		if (cfg.id === currentDeepSeekProviderId) {
+			return {
+				providerId: cfg.id,
+				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
+			};
+		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
 		const kimiUsage = kimiUsagesData?.[cfg.id];
@@ -1107,6 +1137,9 @@ function NarratorPanelBody({
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
 		kimiUsagesData,
+		currentDeepSeekProviderId,
+		deepseekBalancesQuery.data,
+		deepseekBalancesQuery.isError,
 		t,
 	]);
 
