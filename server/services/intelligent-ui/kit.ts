@@ -612,13 +612,16 @@ async function buildKitLocked(
 		...manifest.styles,
 		...manifest.components.map((component) => component.from),
 	]) {
-		if (!specifier || !/^(?:\.{1,2}[/\\]|[A-Za-z]:[/\\])/.test(specifier)) continue;
-		const target = backend.paths.resolve(location.kitDir, specifier);
-		if (!backend.paths.contains(location.root, target))
-			throw uiError(
-				`kit.json imports "${specifier.slice(0, 200)}", which is outside the workspace`,
-				403,
-			);
+		if (!specifier) continue;
+		// kit.json is portable. A backslash is a separator even where the host's
+		// path API treats it as an ordinary character, and a drive prefix is never
+		// a file inside this workspace.
+		const portable = specifier.replaceAll("\\", "/");
+		if (!/^(?:\.{1,2}\/|[A-Za-z]:\/)/.test(portable)) continue;
+		const outside = `kit.json imports "${specifier.slice(0, 200)}", which is outside the workspace`;
+		if (/^[A-Za-z]:\//.test(portable)) throw uiError(outside, 403);
+		const target = backend.paths.resolve(location.kitDir, portable);
+		if (!backend.paths.contains(location.root, target)) throw uiError(outside, 403);
 	}
 	const previous = await readSignedMeta(backend, location, authorize, signal, boundWorkspace);
 	const print = await fingerprint(backend, location, manifest, manifestBytes, authorize, signal);

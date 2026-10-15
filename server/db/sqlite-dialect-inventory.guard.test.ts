@@ -584,7 +584,13 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/revert-planner-local-access.ts": ["json1"],
 	"server/services/revert-planner-service.ts": ["nativeClient"],
-	"server/services/revert-selection-service.ts": ["driver", "nativeClient", "rowid", "indexHint"],
+	"server/services/revert-selection-service.ts": [
+		"driver",
+		"nativeClient",
+		"rowid",
+		"indexHint",
+		"json1",
+	],
 	"server/services/revert-transaction-service.ts": ["nativeClient", "pragma", "sessionFn"],
 	"server/services/routine-service.ts": ["handle"],
 	// The whole search surface, in one file behind `services/search/port.ts`. NOT SQLite-only: a
