@@ -6,10 +6,14 @@ import { parentPort } from "node:worker_threads";
 import {
 	EDITOR_DOCUMENT_MAX_CHARS,
 	EDITOR_FILE_MAX_BYTES,
+	EDITOR_MAX_OPERATIONS,
+	EDITOR_MAX_SESSIONS,
+	EDITOR_MAX_UPLOADS_PER_SESSION,
 	EDITOR_METADATA_MAX_BYTES,
 	EDITOR_SESSION_IDLE_MS,
 	EDITOR_TRANSFER_CHUNK_BYTES,
 	EDITOR_TRANSFER_MAX_BYTES,
+	EDITOR_USER_MAX_OPERATIONS,
 } from "../../shared/editor-document";
 // The settings-free core: this worker is a fresh thread per job, and loading settings (with the
 // model catalog) only to encode bytes cost ~170 ms per editor operation.
@@ -32,7 +36,8 @@ export interface EditorVersionMetadata {
 	utf8Bytes: number;
 }
 export type EditorWorkerRequest =
-	| { action: "source"; sourcePath: string; outputPath: string }
+	| { action: "metadata"; sourcePath: string }
+	| { action: "content"; sourcePath: string; metadata: EditorVersionMetadata }
 	| { action: "seal"; path: string }
 	| {
 			action: "prepare";
@@ -53,6 +58,7 @@ export type EditorWorkerRequest =
 	| { action: "cleanup"; root: string };
 export type EditorWorkerResult =
 	| { kind: "source"; metadata: EditorVersionMetadata }
+	| { kind: "content"; bytes: Uint8Array }
 	| { kind: "sealed"; bytes: number; digest: string }
 	| { kind: "prepared"; nextBytes: Uint8Array; hash: string; bytes: number }
 	| { kind: "conflict"; metadata: EditorVersionMetadata; absent: boolean }
@@ -184,13 +190,18 @@ async function writeVersion(
 export async function runEditorWorker(request: EditorWorkerRequest): Promise<EditorWorkerResult> {
 	if (request.action === "cleanup") {
 		// Startup only, before admitting sessions. Directory inventory and deletion are off-thread.
+		// Cover every session's uploads, conflict and in-flight objects plus recovery receipts.
+		// Keep a finite inventory budget and the enclosing job's timeout, rather than the old
+		// 4096-entry budget that was smaller than the newly admitted lightweight session set.
+		const maxObjects =
+			EDITOR_MAX_SESSIONS * (EDITOR_MAX_UPLOADS_PER_SESSION + 3) + EDITOR_MAX_OPERATIONS * 2;
 		const dir = await opendir(request.root);
 		let count = 0;
 		const operations: EditorOperationMetadata[] = [];
 		const users = new Map<string, number>();
 		try {
 			for await (const entry of dir) {
-				if (++count > 4096)
+				if (++count > maxObjects)
 					fail("Editor orphan inventory exceeds startup budget; maintenance required");
 				const path = join(request.root, entry.name);
 				if (/^ed-[a-f0-9-]+\.json$/.test(entry.name) && entry.isFile()) {
@@ -206,7 +217,10 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 						continue;
 					}
 					users.set(metadata.userId, (users.get(metadata.userId) ?? 0) + 1);
-					if (operations.length >= 1024 || (users.get(metadata.userId) ?? 0) > 128)
+					if (
+						operations.length >= EDITOR_MAX_OPERATIONS ||
+						(users.get(metadata.userId) ?? 0) > EDITOR_USER_MAX_OPERATIONS
+					)
 						fail("Editor recovery quota exceeded");
 					operations.push(metadata);
 					continue;
@@ -224,14 +238,30 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 		}
 		return { kind: "cleaned", operations };
 	}
-	if (request.action === "source") {
-		return {
-			kind: "source",
-			metadata: await writeVersion(
-				await boundedRead(request.sourcePath, EDITOR_FILE_MAX_BYTES, true),
-				request.outputPath,
-			),
+	if (request.action === "metadata" || request.action === "content") {
+		const source = await boundedRead(request.sourcePath, EDITOR_FILE_MAX_BYTES, true);
+		const decoded = decode(source);
+		const text = normalized(decoded.text);
+		const metadata: EditorVersionMetadata = {
+			baseHash: hash(decoded.text),
+			encoding: decoded.encoding,
+			eol: eolOf(decoded.text),
+			sourceBytes: source.byteLength,
+			utf8Bytes: Buffer.byteLength(text, "utf8"),
 		};
+		if (metadata.utf8Bytes > EDITOR_TRANSFER_MAX_BYTES)
+			fail("Normalized source exceeds transfer budget");
+		if (request.action === "metadata") return { kind: "source", metadata };
+		if (
+			(Object.keys(metadata) as (keyof EditorVersionMetadata)[]).some(
+				(key) => metadata[key] !== request.metadata[key],
+			)
+		) {
+			const error = new Error("The file changed since the editor session was opened");
+			Object.assign(error, { code: "EDITOR_SOURCE_CHANGED" });
+			throw error;
+		}
+		return { kind: "content", bytes: new TextEncoder().encode(text) };
 	}
 	if (request.action === "seal") {
 		const bytes = await boundedRead(request.path, EDITOR_TRANSFER_MAX_BYTES);
@@ -351,10 +381,16 @@ if (parentPort) {
 			if (result.kind === "prepared") {
 				const bytes = new Uint8Array(result.nextBytes);
 				port.postMessage({ result: { ...result, nextBytes: bytes } }, [bytes.buffer]);
+			} else if (result.kind === "content") {
+				port.postMessage({ result }, [result.bytes.buffer as ArrayBuffer]);
 			} else port.postMessage({ result });
 		} catch (error) {
 			port.postMessage({
 				error: error instanceof Error ? error.message.slice(0, 256) : "Editor worker failed",
+				code:
+					(error as { code?: string }).code === "EDITOR_SOURCE_CHANGED"
+						? "EDITOR_SOURCE_CHANGED"
+						: undefined,
 			});
 		} finally {
 			port.close();

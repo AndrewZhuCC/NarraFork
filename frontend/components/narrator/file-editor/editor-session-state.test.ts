@@ -29,7 +29,7 @@ const descriptor: EditorDocumentDescriptor = {
 	sourceBytes: 8,
 	utf8Bytes: 4,
 };
-async function setup() {
+async function setup(load = true) {
 	let text = "";
 	let revision = 0;
 	let alternativeVersionId = 0;
@@ -71,7 +71,7 @@ async function setup() {
 			uploadId: "upload",
 			state: "cancelled",
 		})),
-		release: mock(async () => ({})),
+		release: mock<typeof editorDocumentApi.release>(async () => ({})),
 	};
 	const hashes = new WeakMap<Blob, string>();
 	const textOf = (snapshot: EditorTextSnapshot) => {
@@ -118,7 +118,7 @@ async function setup() {
 		applyContent,
 		onChange: () => {},
 	});
-	await session.load();
+	if (load) await session.load();
 	snapshot.mockClear();
 	const change = (next: string, alt?: number) => {
 		text = next;
@@ -144,6 +144,122 @@ test("source is immutable, authorized as child/reference, and bound to declared 
 		4,
 	);
 	expect(sessionDirty(session.state)).toBe(false);
+});
+
+const sourceChanged = () => new ApiError("Source changed", 409, { code: "EDITOR_SOURCE_CHANGED" });
+
+for (const stage of ["create", "source"] as const)
+	test(`initial load retries ${stage} source changes once with fresh metadata`, async () => {
+		const { session, api, applyContent } = await setup(false);
+		const fresh = { ...descriptor, docId: "fresh", versionHandle: "v2", baseHash: "new-hash" };
+		api[stage].mockRejectedValueOnce(sourceChanged());
+		if (stage === "source") api.create.mockResolvedValueOnce(descriptor);
+		api.create.mockResolvedValue(fresh);
+		await session.load();
+		expect(api.create).toHaveBeenCalledTimes(2);
+		expect(api.source).toHaveBeenLastCalledWith("child", "fresh", "v2", expect.any(AbortSignal), 4);
+		expect(api.release).toHaveBeenCalledTimes(stage === "source" ? 1 : 0);
+		if (stage === "source") expect(api.release).toHaveBeenCalledWith("child", "doc");
+		expect(applyContent).toHaveBeenCalledTimes(1);
+		expect(session.state.baseHash).toBe("new-hash");
+		expect(session.state.error).toBeNull();
+		expect(session.state.loading).toBe(false);
+	});
+
+test("repeated source changes stop after one retry and release both failed sessions", async () => {
+	const { session, api, applyContent } = await setup(false);
+	api.create.mockResolvedValueOnce(descriptor).mockResolvedValue({ ...descriptor, docId: "retry" });
+	api.source.mockRejectedValue(sourceChanged());
+	await session.load();
+	expect(api.create).toHaveBeenCalledTimes(2);
+	expect(api.source).toHaveBeenCalledTimes(2);
+	expect(api.release.mock.calls).toEqual([
+		["child", "doc"],
+		["child", "retry"],
+	]);
+	expect(applyContent).not.toHaveBeenCalled();
+	expect(session.state.loaded).toBe(false);
+	expect(session.state.loading).toBe(false);
+	expect(session.state.error).toBe("Source changed");
+});
+
+for (const failure of [
+	new ApiError("Other conflict", 409, { code: "OTHER_CONFLICT" }),
+	new ApiError("Wrong status", 403, { code: "EDITOR_SOURCE_CHANGED" }),
+	new ApiError("Expired", 410),
+	new TypeError("Network failure"),
+])
+	test(`initial load does not retry ${failure.message}`, async () => {
+		const { session, api, applyContent } = await setup(false);
+		api.source.mockRejectedValue(failure);
+		await session.load();
+		expect(api.create).toHaveBeenCalledTimes(1);
+		expect(api.source).toHaveBeenCalledTimes(1);
+		expect(api.release).toHaveBeenCalledWith("child", "doc");
+		expect(applyContent).not.toHaveBeenCalled();
+		expect(session.state.error).toBe(failure.message);
+	});
+
+test("source retry preserves a draft edited while retry authorization is pending", async () => {
+	const { session, api, applyContent, change, text } = await setup();
+	const pending = deferred<EditorDocumentDescriptor>();
+	api.create.mockResolvedValueOnce({ ...descriptor, docId: "stale" });
+	api.create.mockImplementationOnce(() => pending.promise);
+	api.source.mockRejectedValueOnce(sourceChanged());
+	const loading = session.load();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	change("keep my draft");
+	pending.resolve({ ...descriptor, docId: "retry" });
+	await loading;
+	expect(text()).toBe("keep my draft");
+	expect(applyContent).toHaveBeenCalledTimes(1);
+	expect(session.state.baseHash).toBe("original-hash");
+	expect(sessionDirty(session.state)).toBe(true);
+	expect(session.state.error).toContain("draft changed");
+	expect(api.release.mock.calls).toEqual([
+		["child", "stale"],
+		["child", "retry"],
+	]);
+});
+
+for (const superseded of [false, true])
+	test(`late source change does not retry after ${superseded ? "a newer load" : "dispose"}`, async () => {
+		const { session, api, applyContent } = await setup(false);
+		const pending = deferred<string>();
+		api.source.mockImplementationOnce(() => pending.promise);
+		const loading = session.load();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		if (superseded) {
+			api.create.mockResolvedValue({ ...descriptor, docId: "newer" });
+			await session.load();
+		} else session.dispose();
+		pending.reject(sourceChanged());
+		await loading;
+		expect(api.create).toHaveBeenCalledTimes(superseded ? 2 : 1);
+		expect(applyContent).toHaveBeenCalledTimes(superseded ? 1 : 0);
+		expect(api.release).toHaveBeenCalledWith("child", "doc");
+		if (superseded) {
+			expect(session.state.error).toBeNull();
+			expect(session.state.loaded).toBe(true);
+		}
+	});
+
+test("dispose during retry authorization releases the late session without fetching content", async () => {
+	const { session, api, applyContent } = await setup(false);
+	const pending = deferred<EditorDocumentDescriptor>();
+	api.create.mockResolvedValueOnce(descriptor).mockImplementationOnce(() => pending.promise);
+	api.source.mockRejectedValueOnce(sourceChanged());
+	const loading = session.load();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	session.dispose();
+	pending.resolve({ ...descriptor, docId: "retry" });
+	await loading;
+	expect(api.source).toHaveBeenCalledTimes(1);
+	expect(applyContent).not.toHaveBeenCalled();
+	expect(api.release.mock.calls).toEqual([
+		["child", "doc"],
+		["child", "retry"],
+	]);
 });
 
 test("ordinary changes only carry version metadata, never capture or encode text", async () => {

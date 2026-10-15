@@ -450,8 +450,11 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		expect(await response.json()).toMatchObject({ code: "EDITOR_IDENTITY_CHANGED" });
 		expect(await readFile(path, "utf8")).toBe("original\r\n");
 	});
-	test("actual routes expose immutable content, read-only upload status and stable operation ID", async () => {
+	test("actual routes expose version-checked content, read-only upload status and stable operation ID", async () => {
 		const doc = await openDoc();
+		expect(
+			await (await request(`${base()}/${doc.docId}/content?version=${doc.versionHandle}`)).text(),
+		).toBe("original\n");
 		const { upload, url } = await seal(doc);
 		expect(upload.operationId).toBeString();
 		expect(await (await request(url)).json()).toMatchObject({
@@ -469,10 +472,23 @@ describe("editor HTTP identity, small metadata and policies", () => {
 			state: "settled",
 			operationId: upload.operationId,
 		});
-		expect(
-			await (await request(`${base()}/${doc.docId}/content?version=${doc.versionHandle}`)).text(),
-		).toBe("original\n");
+		const stale = await request(`${base()}/${doc.docId}/content?version=${doc.versionHandle}`);
+		expect(stale.status).toBe(409);
+		expect(await stale.json()).toMatchObject({ code: "EDITOR_SOURCE_CHANGED" });
 		expect(await readFile(path, "utf8")).toBe("new\r\n");
+	});
+	test("content rejects a same-length source change and a newly opened version reads it", async () => {
+		const doc = await openDoc();
+		await writeFile(path, "modified\r\n");
+		const stale = await request(`${base()}/${doc.docId}/content?version=${doc.versionHandle}`);
+		expect(stale.status).toBe(409);
+		expect(await stale.json()).toMatchObject({ code: "EDITOR_SOURCE_CHANGED" });
+		const fresh = await openDoc();
+		const content = await request(
+			`${base()}/${fresh.docId}/content?version=${fresh.versionHandle}`,
+		);
+		expect(content.status).toBe(200);
+		expect(await content.text()).toBe("modified\n");
 	});
 	test("host narrator cannot substitute for bound source narrator, even with access to both", async () => {
 		const doc = await openDoc();

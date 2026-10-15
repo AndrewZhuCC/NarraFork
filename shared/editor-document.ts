@@ -9,8 +9,12 @@ export const EDITOR_TRANSFER_CHUNK_BYTES = 64 * 1024;
 export const EDITOR_IO_TIMEOUT_MS = 30_000;
 export const EDITOR_UPLOAD_IDLE_MS = 10_000;
 export const EDITOR_SESSION_IDLE_MS = 10 * 60_000;
-export const EDITOR_USER_MAX_SESSIONS = 8;
-export const EDITOR_MAX_SESSIONS = 32;
+/** Idle sessions retain metadata only; active IO and temporary bytes have separate budgets. */
+export const EDITOR_USER_MAX_SESSIONS = 4096;
+export const EDITOR_MAX_SESSIONS = 16384;
+export const EDITOR_MAX_UPLOADS_PER_SESSION = 32;
+export const EDITOR_MAX_OPERATIONS = 1024;
+export const EDITOR_USER_MAX_OPERATIONS = 128;
 export const EDITOR_USER_TEMP_MAX_BYTES = 512 * 1024 * 1024;
 export const EDITOR_TEMP_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 

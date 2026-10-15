@@ -6,13 +6,16 @@ import { join } from "node:path";
 import {
 	type CreateEditorDocumentInput,
 	type CreateEditorUploadInput,
+	EDITOR_MAX_OPERATIONS,
 	EDITOR_MAX_SESSIONS,
+	EDITOR_MAX_UPLOADS_PER_SESSION,
 	EDITOR_METADATA_MAX_BYTES,
 	EDITOR_SESSION_IDLE_MS,
 	EDITOR_TEMP_MAX_BYTES,
 	EDITOR_TRANSFER_CHUNK_BYTES,
 	EDITOR_TRANSFER_MAX_BYTES,
 	EDITOR_UPLOAD_IDLE_MS,
+	EDITOR_USER_MAX_OPERATIONS,
 	EDITOR_USER_MAX_SESSIONS,
 	EDITOR_USER_TEMP_MAX_BYTES,
 	type EditorCommitInput,
@@ -57,10 +60,12 @@ export class EditorDocumentError extends AppError {
 		super(message, status, code);
 	}
 }
-interface Version {
+interface SourceVersion {
 	handle: string;
-	path: string;
 	metadata: EditorVersionMetadata;
+}
+interface Version extends SourceVersion {
+	path: string;
 	readers?: number;
 	/** Set synchronously before unlink; never admit a new descriptor after this fence. */
 	retiring?: boolean;
@@ -88,7 +93,7 @@ interface Session {
 	narratorId: string;
 	input: CreateEditorDocumentInput;
 	binding: EditorBinding;
-	source?: Version;
+	source?: SourceVersion;
 	conflict?: Version;
 	uploads: Map<string, Upload>;
 	looseFiles: Set<string>;
@@ -227,6 +232,24 @@ export class EditorDocumentService {
 	private rootIdentity?: string;
 	private heal?: Promise<void>;
 	private timer?: ReturnType<typeof setInterval>;
+	private sweeping?: Promise<void>;
+	private userSessions = new Map<string, number>();
+	private userOperations = new Map<string, number>();
+	private userBytes = new Map<string, number>();
+	private totalBytes = 0;
+	private downloads = new Map<() => Promise<void>, Session>();
+	private count(map: Map<string, number>, user: string, delta: number) {
+		const value = (map.get(user) ?? 0) + delta;
+		if (value < 0) throw invalid("Editor accounting underflow");
+		if (value) map.set(user, value);
+		else map.delete(user);
+	}
+	private addOperation(id: string, operation: Operation) {
+		this.operations.set(id, operation);
+		this.count(this.userOperations, operation.userId, 1);
+		this.count(this.userBytes, operation.userId, EDITOR_METADATA_MAX_BYTES);
+		this.totalBytes += EDITOR_METADATA_MAX_BYTES;
+	}
 	constructor(private readonly deps: EditorDocumentDependencies) {
 		this.jobs = deps.jobs ?? new EditorDocumentJobs();
 	}
@@ -246,7 +269,7 @@ export class EditorDocumentService {
 		});
 		if (cleaned.kind !== "cleaned") throw invalid("Unexpected recovery worker response");
 		for (const recovery of cleaned.operations)
-			this.operations.set(recovery.operationId, {
+			this.addOperation(recovery.operationId, {
 				userId: recovery.userId,
 				narratorId: recovery.narratorId,
 				recovery,
@@ -295,22 +318,20 @@ export class EditorDocumentService {
 	}
 	private reserve(session: Session, delta: number) {
 		if (delta > 0) {
-			let total = this.operations.size * EDITOR_METADATA_MAX_BYTES,
-				user =
-					[...this.operations.values()].filter((o) => o.userId === session.userId).length *
-					EDITOR_METADATA_MAX_BYTES;
-			for (const entry of this.sessions.values()) {
-				total += entry.reserved;
-				if (entry.userId === session.userId) user += entry.reserved;
-			}
-			if (total + delta > EDITOR_TEMP_MAX_BYTES || user + delta > EDITOR_USER_TEMP_MAX_BYTES)
+			if (
+				this.totalBytes + delta > EDITOR_TEMP_MAX_BYTES ||
+				(this.userBytes.get(session.userId) ?? 0) + delta > EDITOR_USER_TEMP_MAX_BYTES
+			)
 				throw new EditorDocumentError(
 					"EDITOR_QUOTA_EXCEEDED",
 					"Editor temporary storage quota exceeded",
 					429,
 				);
 		}
+		if (session.reserved + delta < 0) throw invalid("Editor reservation underflow");
 		session.reserved += delta;
+		this.totalBytes += delta;
+		this.count(this.userBytes, session.userId, delta);
 	}
 	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
 		const session = this.sessions.get(docId);
@@ -352,8 +373,7 @@ export class EditorDocumentService {
 		const binding = await actor.authorize(input, "read");
 		if (
 			this.sessions.size >= EDITOR_MAX_SESSIONS ||
-			[...this.sessions.values()].filter((s) => s.userId === actor.userId).length >=
-				EDITOR_USER_MAX_SESSIONS
+			(this.userSessions.get(actor.userId) ?? 0) >= EDITOR_USER_MAX_SESSIONS
 		)
 			throw new EditorDocumentError("EDITOR_QUOTA_EXCEEDED", "Too many editor sessions", 429);
 		const session: Session = {
@@ -371,20 +391,16 @@ export class EditorDocumentService {
 			committing: false,
 		};
 		this.sessions.set(session.id, session);
-		const path = this.path();
-		session.looseFiles.add(path);
+		this.count(this.userSessions, actor.userId, 1);
 		try {
-			this.reserve(session, EDITOR_TRANSFER_MAX_BYTES);
 			const result = await this.jobs.run(
 				actor.userId,
-				{ action: "source", sourcePath: binding.canonicalPath, outputPath: path },
+				{ action: "metadata", sourcePath: binding.canonicalPath },
 				signal,
 			);
 			if (result.kind !== "source") throw invalid("Unexpected source worker response");
 			await this.bound(actor, session.id, "read");
-			this.reserve(session, result.metadata.utf8Bytes - EDITOR_TRANSFER_MAX_BYTES);
-			session.source = { path, handle: randomUUID(), metadata: result.metadata };
-			session.looseFiles.delete(path);
+			session.source = { handle: randomUUID(), metadata: result.metadata };
 			return {
 				docId: session.id,
 				target: { deviceId: "local", path: binding.canonicalPath },
@@ -392,7 +408,6 @@ export class EditorDocumentService {
 				...result.metadata,
 			};
 		} catch (error) {
-			await unlink(path).catch(() => {});
 			session.closing = true;
 			throw error;
 		} finally {
@@ -407,7 +422,9 @@ export class EditorDocumentService {
 		signal?: AbortSignal,
 	): Promise<ReadableStream<Uint8Array>> {
 		const { session } = await this.bound(actor, docId, "read");
-		const version = [session.source, session.conflict].find((v) => v?.handle === versionHandle);
+		if (session.source?.handle === versionHandle)
+			return this.sourceContent(actor, session, session.source, signal);
+		const version = session.conflict?.handle === versionHandle ? session.conflict : undefined;
 		if (!version) throw expired();
 		if (version.retiring)
 			throw new EditorDocumentError(
@@ -419,8 +436,24 @@ export class EditorDocumentService {
 			throw new EditorDocumentError("EDITOR_BUSY", "Too many active document transfers", 429);
 		session.pins++;
 		version.readers = (version.readers ?? 0) + 1;
-		let file: Awaited<ReturnType<typeof open>>;
+		const lifecycle = new AbortController();
+		const transferSignal = signal ? AbortSignal.any([signal, lifecycle.signal]) : lifecycle.signal;
+		let permit: Awaited<ReturnType<EditorDocumentJobs["acquireTransfer"]>> | undefined;
+		let file: Awaited<ReturnType<typeof open>> | undefined;
+		let initialized!: () => void;
+		const initialization = new Promise<void>((resolve) => {
+			initialized = resolve;
+		});
+		let close: () => Promise<void> = async () => {};
+		const cancel = async () => {
+			lifecycle.abort();
+			await initialization;
+			await close();
+		};
+		this.downloads.set(cancel, session);
 		try {
+			permit = await this.jobs.acquireTransfer(EDITOR_TRANSFER_CHUNK_BYTES, transferSignal);
+			permit.signal.throwIfAborted();
 			const entryBefore = await lstat(version.path);
 			if (
 				!entryBefore.isFile() ||
@@ -435,31 +468,37 @@ export class EditorDocumentService {
 				constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
 			);
 			const stat = await file.stat();
-			if (!stat.isFile() || stat.size !== version.metadata.utf8Bytes) {
-				await file.close();
-				throw expired();
-			}
+			if (!stat.isFile() || stat.size !== version.metadata.utf8Bytes) throw expired();
+			permit.signal.throwIfAborted();
 		} catch (error) {
+			await file?.close();
+			permit?.release();
+			this.downloads.delete(cancel);
 			session.pins--;
 			version.readers--;
+			initialized();
+			if (session.closing) await this.release(session);
 			throw error;
 		}
 		let closed = false;
 		let idle: ReturnType<typeof setTimeout> | undefined;
 		let controller: ReadableStreamDefaultController<Uint8Array>;
-		const close = async () => {
-			if (closed) return;
-			closed = true;
-			clearTimeout(idle);
-			signal?.removeEventListener("abort", abort);
-			try {
-				await file.close();
-			} finally {
-				session.pins--;
-				version.readers = Math.max(0, (version.readers ?? 1) - 1);
-				if (session.closing) await this.release(session);
-			}
-		};
+		let closePromise: Promise<void> | undefined;
+		close = () =>
+			(closePromise ??= (async () => {
+				closed = true;
+				clearTimeout(idle);
+				permit?.signal.removeEventListener("abort", abort);
+				try {
+					await file?.close();
+				} finally {
+					permit?.release();
+					this.downloads.delete(cancel);
+					session.pins--;
+					version.readers = Math.max(0, (version.readers ?? 1) - 1);
+					if (session.closing) await this.release(session);
+				}
+			})());
 		const abort = () => {
 			if (closed) return;
 			controller.error(
@@ -478,34 +517,146 @@ export class EditorDocumentService {
 			idle = setTimeout(abort, EDITOR_UPLOAD_IDLE_MS);
 			idle.unref();
 		};
-		return new ReadableStream({
-			start: (value) => {
-				controller = value;
-				signal?.addEventListener("abort", abort, { once: true });
-				if (signal?.aborted) abort();
-				else touch();
-			},
-			pull: async () => {
-				try {
-					if (closed) return;
-					const bytes = new Uint8Array(EDITOR_TRANSFER_CHUNK_BYTES);
-					const result = await file.read(bytes, 0, bytes.length, null);
-					if (closed) return;
-					if (!result.bytesRead) {
+		const stream = new ReadableStream<Uint8Array>(
+			{
+				start: (value) => {
+					controller = value;
+					permit?.signal.addEventListener("abort", abort, { once: true });
+					if (permit?.signal.aborted) abort();
+					else touch();
+				},
+				pull: async () => {
+					try {
+						if (closed || !file) return;
+						const bytes = new Uint8Array(EDITOR_TRANSFER_CHUNK_BYTES);
+						const result = await file.read(bytes, 0, bytes.length, null);
+						if (closed) return;
+						if (!result.bytesRead) {
+							await close();
+							controller.close();
+						} else {
+							session.lastUsed = Date.now();
+							touch();
+							controller.enqueue(bytes.subarray(0, result.bytesRead));
+						}
+					} catch (error) {
 						await close();
-						controller.close();
-					} else {
-						session.lastUsed = Date.now();
-						touch();
-						controller.enqueue(bytes.subarray(0, result.bytesRead));
+						controller.error(error);
 					}
-				} catch (error) {
-					await close();
-					controller.error(error);
-				}
+				},
+				cancel: close,
 			},
-			cancel: close,
+			{ highWaterMark: 0 },
+		);
+		initialized();
+		return stream;
+	}
+	private async sourceContent(
+		actor: EditorActor,
+		session: Session,
+		source: SourceVersion,
+		external?: AbortSignal,
+	): Promise<ReadableStream<Uint8Array>> {
+		if (session.pins >= 8)
+			throw new EditorDocumentError("EDITOR_BUSY", "Too many active document transfers", 429);
+		session.pins++;
+		const lifecycle = new AbortController();
+		const signal = external ? AbortSignal.any([external, lifecycle.signal]) : lifecycle.signal;
+		let permit: Awaited<ReturnType<EditorDocumentJobs["acquireTransfer"]>> | undefined;
+		let bytes: Uint8Array | undefined;
+		let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let closed = false;
+		let generating = true;
+		let generated!: () => void;
+		const generation = new Promise<void>((resolve) => {
+			generated = resolve;
 		});
+		let closePromise: Promise<void> | undefined;
+		const close = (): Promise<void> => {
+			if (generating) {
+				lifecycle.abort();
+				return Promise.resolve();
+			}
+			closePromise ??= (async () => {
+				closed = true;
+				bytes = undefined;
+				permit?.signal.removeEventListener("abort", abort);
+				permit?.release();
+				this.downloads.delete(cancel);
+				session.pins--;
+				if (session.closing) await this.release(session);
+			})();
+			return closePromise;
+		};
+		const abort = () => {
+			if (closed) return;
+			controller?.error(
+				new EditorDocumentError(
+					"EDITOR_TRANSFER_CANCELLED",
+					"Document transfer cancelled or timed out",
+					408,
+				),
+			);
+			void close();
+		};
+		const cancel = async () => {
+			lifecycle.abort();
+			abort();
+			await generation;
+			await close();
+		};
+		this.downloads.set(cancel, session);
+		try {
+			permit = await this.jobs.acquireTransfer(source.metadata.utf8Bytes, signal);
+			permit.signal.addEventListener("abort", abort, { once: true });
+			const result = await this.jobs.run(
+				actor.userId,
+				{
+					action: "content",
+					sourcePath: session.binding.canonicalPath,
+					metadata: source.metadata,
+				},
+				permit.signal,
+			);
+			permit.signal.throwIfAborted();
+			if (result.kind !== "content" || result.bytes.byteLength !== source.metadata.utf8Bytes)
+				throw invalid("Unexpected content worker response");
+			// Queued IO can outlive grants or a narrator's workspace binding.
+			// Reauthorize before publishing any bytes from the newly read source.
+			await this.bound(actor, session.id, "read");
+			permit.signal.throwIfAborted();
+			bytes = result.bytes;
+			generating = false;
+			let offset = 0;
+			return new ReadableStream<Uint8Array>(
+				{
+					start: (value) => {
+						controller = value;
+						if (permit?.signal.aborted) abort();
+					},
+					pull: async (value) => {
+						if (closed || !bytes) return;
+						if (offset === bytes.byteLength) {
+							await close();
+							value.close();
+							return;
+						}
+						const end = Math.min(offset + EDITOR_TRANSFER_CHUNK_BYTES, bytes.byteLength);
+						value.enqueue(bytes.slice(offset, end));
+						offset = end;
+						session.lastUsed = Date.now();
+					},
+					cancel: close,
+				},
+				{ highWaterMark: 0 },
+			);
+		} catch (error) {
+			generating = false;
+			await close();
+			throw error;
+		} finally {
+			generated();
+		}
 	}
 	async createUpload(
 		actor: EditorActor,
@@ -513,7 +664,7 @@ export class EditorDocumentService {
 		input: CreateEditorUploadInput,
 	): Promise<EditorUploadDescriptor> {
 		const { session } = await this.bound(actor, docId, "write");
-		if (session.uploads.size >= 32)
+		if (session.uploads.size >= EDITOR_MAX_UPLOADS_PER_SESSION)
 			throw new EditorDocumentError(
 				"EDITOR_QUOTA_EXCEEDED",
 				"Reopen this document session before another save",
@@ -700,8 +851,8 @@ export class EditorDocumentService {
 			);
 		}
 		if (
-			this.operations.size >= 1024 ||
-			[...this.operations.values()].filter((o) => o.userId === actor.userId).length >= 128
+			this.operations.size >= EDITOR_MAX_OPERATIONS ||
+			(this.userOperations.get(actor.userId) ?? 0) >= EDITOR_USER_MAX_OPERATIONS
 		)
 			throw new EditorDocumentError(
 				"EDITOR_QUOTA_EXCEEDED",
@@ -726,7 +877,7 @@ export class EditorDocumentService {
 			value: { status: "committing", operationId },
 			expires: Date.now() + EDITOR_SESSION_IDLE_MS,
 		};
-		this.operations.set(operationId, operation);
+		this.addOperation(operationId, operation);
 		this.reserve(session, -EDITOR_METADATA_MAX_BYTES); // Reservation is now owned by operations.
 		try {
 			const run = async () =>
@@ -962,6 +1113,7 @@ export class EditorDocumentService {
 	}
 	private async release(session: Session) {
 		session.closing = true;
+		for (const [cancel, owner] of this.downloads) if (owner === session) await cancel();
 		for (const upload of session.uploads.values())
 			if (upload.state === "uploading") upload.controller.abort();
 		if (session.pins || session.committing) return;
@@ -974,14 +1126,17 @@ export class EditorDocumentService {
 					});
 					session.looseFiles.delete(path);
 				}
-				for (const version of [session.source, session.conflict])
+				for (const version of [session.conflict])
 					if (version)
 						await unlink(version.path).catch((error: NodeJS.ErrnoException) => {
 							if (error.code !== "ENOENT") throw error;
 						});
 				for (const upload of session.uploads.values()) await this.cleanUpload(session, upload);
 				if ([...session.uploads.values()].some((upload) => upload.reserved > 0)) return;
-				this.sessions.delete(session.id);
+				if (this.sessions.delete(session.id)) {
+					this.reserve(session, -session.reserved);
+					this.count(this.userSessions, session.userId, -1);
+				}
 			} catch (error) {
 				logger.warn("Editor session cleanup deferred", { error: String(error) });
 			}
@@ -992,11 +1147,19 @@ export class EditorDocumentService {
 			session.cleanup = undefined;
 		}
 	}
-	async sweep(now = Date.now()) {
-		// At most 32 live sessions and 1024 small operation records, never a filesystem scan.
-		for (const session of this.sessions.values())
+	sweep(now = Date.now()): Promise<void> {
+		this.sweeping ??= this.sweepBatch(now).finally(() => {
+			this.sweeping = undefined;
+		});
+		return this.sweeping;
+	}
+	private async sweepBatch(now: number) {
+		let scanned = 0;
+		for (const session of this.sessions.values()) {
 			if (now - session.lastUsed > EDITOR_SESSION_IDLE_MS) await this.release(session);
-		for (const [id, operation] of this.operations)
+			if (++scanned % 64 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		for (const [id, operation] of this.operations) {
 			if (operation.value.status !== "committing" && operation.expires < now) {
 				try {
 					await unlink(join(this.deps.root, `ed-${id}.json`)).catch(
@@ -1004,14 +1167,21 @@ export class EditorDocumentService {
 							if (error.code !== "ENOENT") throw error;
 						},
 					);
-					this.operations.delete(id);
+					if (this.operations.delete(id)) {
+						this.count(this.userOperations, operation.userId, -1);
+						this.count(this.userBytes, operation.userId, -EDITOR_METADATA_MAX_BYTES);
+						this.totalBytes -= EDITOR_METADATA_MAX_BYTES;
+					}
 				} catch (error) {
 					logger.warn("Editor recovery cleanup deferred", { error: String(error) });
 				}
 			}
+			if (++scanned % 64 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+		}
 	}
 	async dispose() {
 		clearInterval(this.timer);
+		for (const cancel of this.downloads.keys()) await cancel();
 		for (const session of this.sessions.values()) await this.release(session);
 	}
 }

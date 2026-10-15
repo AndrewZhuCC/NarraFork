@@ -265,14 +265,36 @@ export class EditorDocumentSession {
 				});
 				return;
 			}
-			next = await this.authorize(controller.signal);
-			const text = await this.api.source(
-				this.options.narratorId,
-				next.docId,
-				next.versionHandle,
-				controller.signal,
-				next.utf8Bytes,
-			);
+			let text: string;
+			for (let retry = 0; ; retry++) {
+				try {
+					controller.signal.throwIfAborted();
+					next = await this.authorize(controller.signal);
+					controller.signal.throwIfAborted();
+					if (this.disposed || this.loadController !== controller) return;
+					text = await this.api.source(
+						this.options.narratorId,
+						next.docId,
+						next.versionHandle,
+						controller.signal,
+						next.utf8Bytes,
+					);
+					break;
+				} catch (error) {
+					if (
+						retry !== 0 ||
+						!(error instanceof ApiError) ||
+						error.status !== 409 ||
+						error.data?.code !== "EDITOR_SOURCE_CHANGED" ||
+						controller.signal.aborted ||
+						this.disposed ||
+						this.loadController !== controller
+					)
+						throw error;
+					if (next) this.release(next.docId);
+					next = null;
+				}
+			}
 			controller.signal.throwIfAborted();
 			if (this.disposed || this.loadController !== controller) return;
 			if (revision !== this.state.version?.revision)
