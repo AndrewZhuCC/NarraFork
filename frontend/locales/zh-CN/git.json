@@ -111,8 +111,6 @@
 	"commitPreview.binary": "二进制",
 	"commitPreview.showBody": "展开提交说明",
 	"commitPreview.hideBody": "收起提交说明",
-	"commitPreview.expandDetails": "展开提交信息",
-	"commitPreview.collapseDetails": "收起提交信息",
 	"commitPreview.openPage": "在 Git 窗口打开",
 	"commitPreview.page.openInApp": "在主应用打开",
 	"commitPreview.fileNavigation": "变更文件导航",

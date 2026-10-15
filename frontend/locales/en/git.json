@@ -111,8 +111,6 @@
 	"commitPreview.binary": "binary",
 	"commitPreview.showBody": "Show description",
 	"commitPreview.hideBody": "Hide description",
-	"commitPreview.expandDetails": "Show commit details",
-	"commitPreview.collapseDetails": "Hide commit details",
 	"commitPreview.openPage": "Open in Git window",
 	"commitPreview.page.openInApp": "Open in main app",
 	"commitPreview.fileNavigation": "Changed file navigation",
