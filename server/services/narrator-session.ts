@@ -2350,7 +2350,12 @@ export async function drainInjectionsIntoHistory(
 	active: ActiveNarrator,
 	locale: Locale,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
-): Promise<{ text: string; parts: AgentInputPart[]; onConsumed: () => void }> {
+): Promise<{
+	text: string;
+	parts: AgentInputPart[];
+	lastInputWasMailbox: boolean;
+	onConsumed: () => void;
+}> {
 	const narratorId = active.narratorId;
 	const parts: AgentInputPart[] = [];
 	const { buildPendingQuestionHint } = await import("./narrator-question-service");
@@ -2491,6 +2496,9 @@ export async function drainInjectionsIntoHistory(
 	return {
 		text: parts.map((part) => part.text).join("\n\n"),
 		parts,
+		lastInputWasMailbox: adoptedDeliveries.some(
+			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
+		),
 		onConsumed: () => {
 			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
 			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
