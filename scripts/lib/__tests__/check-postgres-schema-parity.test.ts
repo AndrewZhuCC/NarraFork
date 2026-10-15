@@ -472,10 +472,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 121 tables and 1721 columns including personal knowledge injection", () => {
+	test("covers 121 tables and 1726 columns including bulk token maintenance metadata", () => {
 		expect(target.tables.length).toBe(121);
-		// 1718 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1721);
+		// 1723 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1726);
 		expect(
 			target.tables
 				.find((table) => table.name === "knowledge_injection_events")
@@ -547,6 +547,31 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrators")
 				?.columns.map((column) => column.property),
 		).toContain("lastStopReason");
+	});
+
+	test("bulk token maintenance keeps nullable state and an indexed durable retirement marker", () => {
+		const jobs = target.tables.find((table) => table.name === "usage_token_repair_jobs");
+		for (const [property, name, pgType] of [
+			["workflowVersion", "workflow_version", "integer"],
+			["phase", "phase", "text"],
+			["summaryJson", "summary_json", "text"],
+			["rowsPerSecond", "rows_per_second", "double precision"],
+			["scratchRetiredAt", "scratch_retired_at", "text"],
+		]) {
+			expect(jobs?.columns.find((column) => column.property === property)).toMatchObject({
+				name,
+				pgType,
+				notNull: false,
+			});
+		}
+		expect(
+			jobs?.indexes.find((index) => index.name === "idx_token_repair_scratch_retirement"),
+		).toMatchObject({
+			columns: ["updatedAt", "id"],
+			unique: false,
+			predicate:
+				"\"scratch_retired_at\" IS NULL AND \"status\" IN ('completed', 'cancelled', 'failed', 'interrupted')",
+		});
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {
