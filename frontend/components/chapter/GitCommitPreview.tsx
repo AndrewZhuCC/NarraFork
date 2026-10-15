@@ -4,7 +4,6 @@ import {
 	Alert,
 	Anchor,
 	Badge,
-	Box,
 	Button,
 	Group,
 	Loader,
@@ -15,17 +14,15 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import {
-	GIT_COMMIT_PREVIEW_UNSUPPORTED,
-	type GitCommitFile,
-	type GitCommitFileStatus,
-} from "@shared/git-commit-preview";
+import { GIT_COMMIT_PREVIEW_UNSUPPORTED, type GitCommitFile } from "@shared/git-commit-preview";
 import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
+	IconColumns2,
 	IconCopy,
 	IconExternalLink,
+	IconLayoutRows,
 	IconSearch,
 } from "@tabler/icons-react";
 import { useId, useState } from "react";
@@ -35,29 +32,33 @@ import type { ApiError } from "../../lib/api";
 import { type GitTarget, gitBasePath, gitTargetKey } from "../../lib/api/git";
 import { formatRelativeTime } from "../../lib/format";
 import { CopyButton } from "../common/CopyButton";
+import {
+	COMMIT_STATUS_COLOR,
+	COMMIT_STATUS_LETTER,
+	commitFileLabel,
+	GitCommitFileTree,
+} from "./GitCommitFileTree";
 import classes from "./GitCommitPreview.module.css";
 import { GitPatchView } from "./GitPatchView";
 
-const STATUS_COLOR: Record<GitCommitFileStatus, string> = {
-	added: "green",
-	modified: "blue",
-	deleted: "red",
-	renamed: "violet",
-	copied: "cyan",
-	typechange: "orange",
-	unmerged: "yellow",
-	unknown: "gray",
-};
-const STATUS_LETTER: Record<GitCommitFileStatus, string> = {
-	added: "A",
-	modified: "M",
-	deleted: "D",
-	renamed: "R",
-	copied: "C",
-	typechange: "T",
-	unmerged: "U",
-	unknown: "?",
-};
+const COMMIT_DIFF_LAYOUT_KEY = "narrafork.git.commitDiffLayout";
+type CommitDiffLayout = "unified" | "split";
+
+function readCommitDiffLayout(): CommitDiffLayout {
+	try {
+		return localStorage.getItem(COMMIT_DIFF_LAYOUT_KEY) === "split" ? "split" : "unified";
+	} catch {
+		return "unified";
+	}
+}
+
+function storeCommitDiffLayout(layout: CommitDiffLayout) {
+	try {
+		localStorage.setItem(COMMIT_DIFF_LAYOUT_KEY, layout);
+	} catch {
+		// The toggle still applies to this view when storage is blocked.
+	}
+}
 
 function isUnsupported(error: unknown): boolean {
 	return (error as ApiError | null)?.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED;
@@ -94,6 +95,7 @@ function CommitPreviewContent({
 	const [filter, setFilter] = useState("");
 	const [bodyExpanded, setBodyExpanded] = useState(false);
 	const [filesExpanded, setFilesExpanded] = useState(true);
+	const [diffLayout, setDiffLayout] = useState<CommitDiffLayout>(readCommitDiffLayout);
 	const bodyId = useId();
 	const filesId = useId();
 	const detail = useGitCommitDetail(target, sha);
@@ -109,11 +111,15 @@ function CommitPreviewContent({
 		? buildCommitPreviewBrowserHref(target, sha, selected?.path, linkMode)
 		: "";
 	const query = filter.trim().toLocaleLowerCase();
-	const visibleFiles = data?.files.filter(
+	const visibleFiles = (data?.files ?? []).filter(
 		(file) =>
 			file.path.toLocaleLowerCase().includes(query) ||
 			file.oldPath?.toLocaleLowerCase().includes(query),
 	);
+	const changeDiffLayout = (layout: CommitDiffLayout) => {
+		setDiffLayout(layout);
+		storeCommitDiffLayout(layout);
+	};
 	const message = data?.message ?? "";
 	const lineBreak = message.indexOf("\n");
 	const subject = lineBreak < 0 ? message : message.slice(0, lineBreak);
@@ -329,14 +335,8 @@ function CommitPreviewContent({
 						</Text>
 					)}
 					{data.files.length > 0 && (
-						<div className={classes.layout}>
-							<Paper
-								component="nav"
-								withBorder
-								radius="md"
-								className={classes.navigation}
-								aria-label={t("commitPreview.fileNavigation")}
-							>
+						<div className={classes.browser} data-commit-browser>
+							<nav className={classes.navigation} aria-label={t("commitPreview.fileNavigation")}>
 								<UnstyledButton
 									type="button"
 									className={classes.mobileToggle}
@@ -354,75 +354,45 @@ function CommitPreviewContent({
 								</UnstyledButton>
 								<div id={filesId} className={classes.fileBrowser} data-expanded={filesExpanded}>
 									<TextInput
-										p="xs"
+										className={classes.filter}
 										size="xs"
 										value={filter}
 										onInput={(event) => setFilter(event.currentTarget.value)}
 										aria-label={t("commitPreview.filterFiles")}
-										placeholder={t("commitPreview.filterFiles")}
+										placeholder={t("commitPreview.filterFilesPlaceholder")}
 										leftSection={<IconSearch size={14} />}
 									/>
-									<div className={classes.fileList}>
-										{visibleFiles?.map((file) => {
-											const label = file.oldPath ? `${file.oldPath} → ${file.path}` : file.path;
-											return (
-												<UnstyledButton
-													key={file.path}
-													type="button"
-													className={classes.fileButton}
-													aria-pressed={selected?.path === file.path}
-													aria-label={`${t(`commitPreview.status.${file.status}`)}: ${label}`}
-													title={label}
-													data-commit-file={file.path}
-													onClick={() => {
-														if (selectedPath === undefined) setLocalPath(file.path);
-														onSelectPath?.(file.path);
-													}}
-												>
-													<Group gap={6} wrap="nowrap">
-														<Badge
-															component="span"
-															size="xs"
-															color={STATUS_COLOR[file.status]}
-															className={classes.status}
-														>
-															{STATUS_LETTER[file.status]}
-														</Badge>
-														<Text
-															component="span"
-															size="xs"
-															ff="monospace"
-															className={classes.fileName}
-														>
-															{label}
-														</Text>
-													</Group>
-													<Box pl={28}>
-														<FileStats file={file} />
-													</Box>
-												</UnstyledButton>
-											);
-										})}
-										{visibleFiles?.length === 0 && (
+									<div className={classes.fileList} data-commit-file-list>
+										{visibleFiles.length > 0 ? (
+											<GitCommitFileTree
+												files={visibleFiles}
+												selectedPath={selected?.path ?? null}
+												onSelect={(filePath) => {
+													if (selectedPath === undefined) setLocalPath(filePath);
+													onSelectPath?.(filePath);
+												}}
+											/>
+										) : (
 											<Text size="xs" c="dimmed" p="sm" role="status">
 												{t("commitPreview.noMatchingFiles")}
 											</Text>
 										)}
 									</div>
 								</div>
-							</Paper>
-							<div className={classes.diffColumn}>
+							</nav>
+							<div className={classes.diffPane}>
 								{selected ? (
 									<CommitFileCard
 										key={JSON.stringify([selected.path, selected.oldPath])}
 										target={target}
 										sha={sha}
 										file={selected}
-										mode={mode}
+										layout={diffLayout}
+										onLayoutChange={changeDiffLayout}
 									/>
 								) : (
 									path === null && (
-										<Text size="sm" c="dimmed">
+										<Text size="sm" c="dimmed" className={classes.emptyDiff}>
 											{t("commitPreview.selectFile")}
 										</Text>
 									)
@@ -441,30 +411,83 @@ function CommitPreviewContent({
 	);
 }
 
-function FileStats({ file }: { file: GitCommitFile }) {
+function ChangePills({ file }: { file: GitCommitFile }) {
 	const { t } = useTranslation("git");
-	return file.binary ? (
-		<Text component="span" size="xs" c="dimmed">
-			{t("commitPreview.binary")}
-		</Text>
-	) : (
-		<Text
-			component="span"
-			size="xs"
-			ff="monospace"
-			title={
-				file.linesAdded === null || file.linesRemoved === null
-					? t("commitPreview.unknownStats")
-					: undefined
-			}
-		>
-			<Text span c="green" inherit>
-				+{file.linesAdded ?? "?"}
-			</Text>{" "}
-			<Text span c="red" inherit>
-				-{file.linesRemoved ?? "?"}
+	if (file.binary) {
+		return (
+			<Text component="span" size="xs" c="dimmed">
+				{t("commitPreview.binary")}
 			</Text>
-		</Text>
+		);
+	}
+	const showAdded = file.linesAdded === null || file.linesAdded > 0;
+	const showRemoved = file.linesRemoved === null || file.linesRemoved > 0;
+	if (!showAdded && !showRemoved) return null;
+	return (
+		<span className={classes.pills}>
+			{showAdded && <span className={classes.addPill}>+{file.linesAdded ?? "?"}</span>}
+			{showRemoved && <span className={classes.delPill}>-{file.linesRemoved ?? "?"}</span>}
+		</span>
+	);
+}
+
+function PathCrumbs({ path, emphasize = false }: { path: string; emphasize?: boolean }) {
+	const parts = path.split("/");
+	const name = parts.pop() ?? path;
+	const directories = parts.map(
+		(part, index) => `${parts.slice(0, index).join("/")}${index ? "/" : ""}${part}`,
+	);
+	return (
+		<span className={classes.crumbs}>
+			{directories.map((directory) => (
+				<span key={directory} className={classes.crumbDir}>
+					{directory.slice(directory.lastIndexOf("/") + 1)}
+					<span className={classes.crumbSep}>/</span>
+				</span>
+			))}
+			<span className={emphasize ? classes.crumbFile : classes.crumbDir}>{name}</span>
+		</span>
+	);
+}
+
+function DiffLayoutToggle({
+	value,
+	onChange,
+}: {
+	value: CommitDiffLayout;
+	onChange: (layout: CommitDiffLayout) => void;
+}) {
+	const { t } = useTranslation("git");
+	const options = [
+		{ value: "unified" as const, label: t("commitPreview.viewUnified"), icon: IconLayoutRows },
+		{ value: "split" as const, label: t("commitPreview.viewSplit"), icon: IconColumns2 },
+	];
+	return (
+		<div
+			className={classes.layoutToggle}
+			role="radiogroup"
+			aria-label={t("commitPreview.diffLayout")}
+			data-commit-diff-layout={value}
+		>
+			{options.map((option) => {
+				const Icon = option.icon;
+				return (
+					<UnstyledButton
+						key={option.value}
+						type="button"
+						role="radio"
+						aria-checked={value === option.value}
+						aria-label={option.label}
+						className={classes.layoutOption}
+						data-commit-diff-layout-option={option.value}
+						onClick={() => onChange(option.value)}
+					>
+						<Icon size={14} />
+						<span className={classes.layoutLabel}>{option.label}</span>
+					</UnstyledButton>
+				);
+			})}
+		</div>
 	);
 }
 
@@ -472,64 +495,68 @@ function CommitFileCard({
 	target,
 	sha,
 	file,
-	mode,
+	layout,
+	onLayoutChange,
 }: {
 	target: GitTarget;
 	sha: string;
 	file: GitCommitFile;
-	mode: "modal" | "page" | "window";
+	layout: CommitDiffLayout;
+	onLayoutChange: (layout: CommitDiffLayout) => void;
 }) {
 	const { t } = useTranslation("git");
 	const [expanded, setExpanded] = useState(true);
 	const patchId = useId();
-	const label = file.oldPath ? `${file.oldPath} → ${file.path}` : file.path;
+	const label = commitFileLabel(file);
 	return (
-		<Paper withBorder radius="md" className={classes.diffCard} data-commit-diff-card>
-			<UnstyledButton
-				type="button"
-				className={classes.diffHeader}
-				onClick={() => setExpanded(!expanded)}
-				aria-expanded={expanded}
-				aria-controls={patchId}
-				aria-label={t(expanded ? "commitPreview.collapseDiff" : "commitPreview.expandDiff", {
-					path: file.path,
-				})}
-				data-commit-diff-toggle
-			>
-				<Group gap="xs" wrap="nowrap">
+		<div className={classes.diffCard} data-commit-diff-card>
+			<div className={classes.diffHeaderBar}>
+				<UnstyledButton
+					type="button"
+					className={classes.diffTitle}
+					onClick={() => setExpanded(!expanded)}
+					aria-expanded={expanded}
+					aria-controls={patchId}
+					aria-label={t(expanded ? "commitPreview.collapseDiff" : "commitPreview.expandDiff", {
+						path: file.path,
+					})}
+					data-commit-diff-toggle
+				>
 					{expanded ? (
 						<IconChevronDown size={16} className={classes.chevron} />
 					) : (
 						<IconChevronRight size={16} className={classes.chevron} />
 					)}
-					<Text component="span" size="xs" ff="monospace" className={classes.fileName}>
-						{label}
-					</Text>
+					<span className={classes.pathTitle} title={label}>
+						{file.oldPath && (
+							<>
+								<PathCrumbs path={file.oldPath} />
+								<span className={classes.pathArrow}>→</span>
+							</>
+						)}
+						<PathCrumbs path={file.path} emphasize />
+					</span>
 					<Badge
 						component="span"
 						size="xs"
-						color={STATUS_COLOR[file.status]}
+						color={COMMIT_STATUS_COLOR[file.status]}
 						className={classes.status}
 					>
-						{STATUS_LETTER[file.status]}
+						{COMMIT_STATUS_LETTER[file.status]}
 					</Badge>
-				</Group>
-				<Box pl={24}>
-					<FileStats file={file} />
-				</Box>
-			</UnstyledButton>
+				</UnstyledButton>
+				<div className={classes.diffTools}>
+					<ChangePills file={file} />
+					<DiffLayoutToggle value={layout} onChange={onLayoutChange} />
+				</div>
+			</div>
 			{/* Unmount, rather than merely hiding, to release and cancel the query. */}
 			{expanded && (
-				<Box id={patchId} p="xs">
-					<CommitFilePatch
-						target={target}
-						sha={sha}
-						file={file}
-						maxHeight={mode === "modal" ? 560 : 720}
-					/>
-				</Box>
+				<div id={patchId} className={classes.diffBody}>
+					<CommitFilePatch target={target} sha={sha} file={file} layout={layout} />
+				</div>
 			)}
-		</Paper>
+		</div>
 	);
 }
 
@@ -537,12 +564,12 @@ function CommitFilePatch({
 	target,
 	sha,
 	file,
-	maxHeight,
+	layout,
 }: {
 	target: GitTarget;
 	sha: string;
 	file: GitCommitFile;
-	maxHeight: number;
+	layout: CommitDiffLayout;
 }) {
 	const { t } = useTranslation("git");
 	const patch = useGitCommitDiff(target, sha, file.path, file.oldPath);
@@ -556,7 +583,8 @@ function CommitFilePatch({
 			resetKey={JSON.stringify([sha, file.oldPath, file.path, patch.dataUpdatedAt])}
 			loading={patch.isLoading}
 			error={patch.error}
-			maxHeight={maxHeight}
+			layout={layout}
+			fill
 		/>
 	);
 }

@@ -1,0 +1,19 @@
+.fill {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-height: 0;
+	height: 100%;
+}
+
+.notice {
+	flex-shrink: 0;
+}
+
+.unified {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-height: 280px;
+	min-width: 0;
+}

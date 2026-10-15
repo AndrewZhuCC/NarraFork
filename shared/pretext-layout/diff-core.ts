@@ -903,6 +903,14 @@ export interface DiffHighlightRowRef {
 	source: number;
 	/** 0-based line index within that source. */
 	line: number;
+	/**
+	 * Old-file location of a context row when both sides were reconstructed.
+	 *
+	 * `source`/`line` stay on the new file, which is what the unified painter
+	 * reads. Split view uses this so the original column is tokenized with the
+	 * old file's grammar state instead of the modified one.
+	 */
+	old?: { source: number; line: number };
 }
 
 /**
@@ -991,9 +999,16 @@ export function buildDiffHighlightPlan(lines: readonly DiffLine[]): DiffHighligh
 		}
 		// Context belongs to both files and must occupy a line in each, or the
 		// following rows' indexes would drift out of step with their source.
+		// The primary ref stays on the new side for the unified painter. `old`
+		// is the same text inside the old file, whose grammar state can differ
+		// once a removed construct is no longer open.
 		if (!take(oldLines, line.content)) return null;
 		if (!take(newLines, line.content)) return null;
-		rows.push({ source: 1, line: newLines.length - 1 });
+		rows.push({
+			source: 1,
+			line: newLines.length - 1,
+			old: { source: 0, line: oldLines.length - 1 },
+		});
 	}
 
 	return { sources: [oldLines.join("\n"), newLines.join("\n")], rows };
