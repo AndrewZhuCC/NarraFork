@@ -691,35 +691,65 @@ function scaleRgba(pixels: Uint8Array, width: number, height: number, size: numb
 }
 
 /**
- * 主题色窗口图标：读品牌 PNG 素材（按默认品牌色绘制），重着色成实例品牌色后缩到图标
- * 尺寸再构造 HICON。素材缺失（如独立分发 exe 时没有前端产物）返回 undefined，调用方
- * 回退静态 ico / exe 内嵌资源。
+ * 读取品牌 PNG 素材。
+ *
+ * 优先用编译产物里嵌入的前端资源：构建脚本把 dist/frontend 全部嵌进 exe（`with { type:
+ * "file" }`，编译后指向 $bunfs），所以独立分发的 exe 也能拿到素材。生成模块不存在（开发
+ * 模式尚未构建前端）或读取失败时，回退到工作区的文件候选路径。
  */
-async function loadBrandedIcon(colorHex: string): Promise<Pointer | undefined> {
-	const target = parseHexColor(colorHex);
-	const source = parseHexColor(DEFAULT_BRAND_ICON_COLOR);
-	if (!target || !source) return undefined;
+async function readBrandPng(): Promise<Uint8Array | undefined> {
+	try {
+		// 走变量路径：生成模块在 tsconfig 的 exclude 之外（显式 import 会把 172KB 的
+		// 生成文件拉进类型检查，而它的 `with { type: "file" }` 导入没有类型声明）。
+		// server/lib/branding/icons.ts 使用同样的方式加载它。
+		const generatedModulePath = "@server/generated/embedded-frontend";
+		const mod = (await import(generatedModulePath)) as {
+			embeddedAssets?: Record<string, string>;
+		};
+		const embeddedPath = mod.embeddedAssets?.["/pwa-192x192.png"];
+		if (embeddedPath) {
+			const file = Bun.file(embeddedPath);
+			if (await file.exists()) return new Uint8Array(await file.arrayBuffer());
+		}
+	} catch {
+		// 生成模块不可用 —— 继续走文件系统候选。
+	}
 	const candidates = [
 		join(process.cwd(), "dist", "frontend", "pwa-192x192.png"),
 		join(process.cwd(), "frontend", "public", "pwa-192x192.png"),
 		// 双击 exe 时 cwd 是 exe 所在目录：前端产物与它同级（dist/frontend）。
 		join(dirname(process.execPath), "frontend", "pwa-192x192.png"),
 	];
-	for (const path of candidates) {
+	for (const candidate of candidates) {
 		try {
-			const file = Bun.file(path);
-			if (!(await file.exists())) continue;
-			const decoded = decodeRgbaPng(new Uint8Array(await file.arrayBuffer()));
-			if (!decoded) continue;
-			const recolored = recolorRgbaPixels(decoded.pixels, target, source);
-			const scaled = scaleRgba(recolored, decoded.width, decoded.height, WINDOW_ICON_SIZE);
-			const icon = createIconFromRgba(WINDOW_ICON_SIZE, scaled);
-			if (icon) return icon;
+			const file = Bun.file(candidate);
+			if (await file.exists()) return new Uint8Array(await file.arrayBuffer());
 		} catch {
-			// 换下一个候选素材。
+			// 换下一个候选。
 		}
 	}
 	return undefined;
+}
+
+/**
+ * 主题色窗口图标：读品牌 PNG 素材（按默认品牌色绘制），重着色成实例品牌色后缩到图标
+ * 尺寸再构造 HICON。素材不可用时返回 undefined，调用方回退静态 ico / exe 内嵌资源。
+ */
+async function loadBrandedIcon(colorHex: string): Promise<Pointer | undefined> {
+	const target = parseHexColor(colorHex);
+	const source = parseHexColor(DEFAULT_BRAND_ICON_COLOR);
+	if (!target || !source) return undefined;
+	const bytes = await readBrandPng();
+	if (!bytes) return undefined;
+	try {
+		const decoded = decodeRgbaPng(bytes);
+		if (!decoded) return undefined;
+		const recolored = recolorRgbaPixels(decoded.pixels, target, source);
+		const scaled = scaleRgba(recolored, decoded.width, decoded.height, WINDOW_ICON_SIZE);
+		return createIconFromRgba(WINDOW_ICON_SIZE, scaled);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
