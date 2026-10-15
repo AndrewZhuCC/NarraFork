@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -27,7 +27,6 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
-import { maintainProtectionIndex } from "./resource-protection-index";
 import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import {
 	hasHotPathWarmupForTests,
@@ -38,12 +37,6 @@ import {
 	treeSnapshotKey,
 	worktreeTreeSnapshot,
 } from "./worktree-tree-snapshot";
-
-beforeAll(async () => {
-	// Destructive fixture cleanup starts after the empty legacy namespace is imported.
-	await maintainProtectionIndex(performance.now() + 5000);
-	await maintainProtectionIndex(performance.now() + 5000);
-});
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];

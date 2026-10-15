@@ -17,8 +17,12 @@ import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { ensureColumns } from "../server/db/ensure-columns";
 import * as relations from "../server/db/relations";
-import { installResourceProtectionTriggers } from "../server/db/resource-protection-index";
+import {
+	initializeAbsentReceiptProtectionSource,
+	installResourceProtectionTriggers,
+} from "../server/db/resource-protection-index";
 import * as schema from "../server/db/schema";
+import { getNarraforkPath } from "../server/lib/narrafork-home";
 
 const DRIZZLE_DIR = join(import.meta.dir, "..", "drizzle");
 
@@ -94,6 +98,7 @@ export function getTestDb() {
 	sqlite.run("PRAGMA foreign_keys = ON");
 	// Match runtime tracking even when a filesystem/service test replaces ../server/db.
 	installResourceProtectionTriggers(sqlite);
+	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };
 }
@@ -130,4 +135,5 @@ export function cleanDb(sqlite: Database) {
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
 	installResourceProtectionTriggers(sqlite);
+	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 }

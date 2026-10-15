@@ -1,10 +1,14 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installResourceProtectionTriggers } from "../db/resource-protection-index";
+import {
+	initializeAbsentReceiptProtectionSource,
+	installResourceProtectionTriggers,
+} from "../db/resource-protection-index";
 import type { WorktreeJournalRecord } from "./narrator-worktree-journal";
 import { createResourceProtectionIndex } from "./resource-protection-index";
 import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
@@ -83,6 +87,79 @@ beforeEach(async () => {
 afterEach(async () => {
 	database.close();
 	await rm(root, { recursive: true, force: true });
+});
+
+describe("absent legacy namespace startup", () => {
+	function receiptHead() {
+		return database
+			.query(`SELECT cursor, complete FROM resource_protection_sources
+			WHERE source = 'receipt' AND source_id = ''`)
+			.get();
+	}
+	test("an absent namespace is ready before the first zero-write read", async () => {
+		initializeAbsentReceiptProtectionSource(database, receipts);
+		expect(receiptHead()).toEqual({ cursor: "eof", complete: 1 });
+		narrator("n", root);
+		const before = changes();
+		expect((await claims([{ path: root }])).some((claim) => claim.id === "n")).toBe(true);
+		expect(changes()).toBe(before);
+		initializeAbsentReceiptProtectionSource(database, receipts);
+		expect(changes()).toBe(before);
+	});
+	test("an existing directory or dangling namespace symlink is not absent", async () => {
+		await mkdir(receipts);
+		initializeAbsentReceiptProtectionSource(database, receipts);
+		expect(receiptHead()).toEqual({ cursor: null, complete: 0 });
+		await rm(receipts, { recursive: true });
+		await symlink(join(root, "missing"), receipts);
+		initializeAbsentReceiptProtectionSource(database, receipts);
+		expect(receiptHead()).toEqual({ cursor: null, complete: 0 });
+	});
+	test("filesystem access errors leave bootstrap incomplete without writes", () => {
+		const stat = spyOn(fsSync, "lstatSync").mockImplementation(() => {
+			throw Object.assign(new Error("access denied"), { code: "EACCES" });
+		});
+		try {
+			const before = changes();
+			initializeAbsentReceiptProtectionSource(database, receipts);
+			expect(stat).toHaveBeenCalledWith(receipts);
+			expect(receiptHead()).toEqual({ cursor: null, complete: 0 });
+			expect(changes()).toBe(before);
+		} finally {
+			stat.mockRestore();
+		}
+	});
+	test("a missing namespace cannot bypass an already dirty legacy receipt", async () => {
+		database
+			.query(`INSERT INTO resource_protection_sources(source, source_id)
+			VALUES ('receipt', ?)`)
+			.run(join(receipts, "unimported.json"));
+		const before = changes();
+		initializeAbsentReceiptProtectionSource(database, receipts);
+		expect(receiptHead()).toEqual({ cursor: null, complete: 0 });
+		expect((await service.read([{ path: root }], deadline())).complete).toBe(false);
+		expect(changes()).toBe(before);
+	});
+	test("clean durable pins survive absent-namespace initialization", async () => {
+		await mkdir(receipts);
+		await writeFile(join(receipts, `${"a".repeat(64)}.json`), JSON.stringify(receipt(root)));
+		await bootstrap();
+		const pins = database
+			.query("SELECT * FROM resource_protection_paths WHERE source='receipt'")
+			.all();
+		expect(pins).toHaveLength(1);
+		await rm(receipts, { recursive: true });
+		database
+			.query(`UPDATE resource_protection_sources SET complete = 0
+			WHERE source = 'receipt' AND source_id = ''`)
+			.run();
+		initializeAbsentReceiptProtectionSource(database, receipts);
+		expect(receiptHead()).toEqual({ cursor: "eof", complete: 1 });
+		expect(
+			database.query("SELECT * FROM resource_protection_paths WHERE source='receipt'").all(),
+		).toEqual(pins);
+		expect((await claims([{ path: root }])).some((claim) => claim.kind === "receipt")).toBe(true);
+	});
 });
 
 describe("resource protection reverse index", () => {

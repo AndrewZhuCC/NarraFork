@@ -11,7 +11,7 @@
  * merge) rather than on our bookkeeping, because that computation is the thing being
  * relied upon.
  */
-import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +23,6 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
-import { maintainProtectionIndex } from "./resource-protection-index";
 import { ResourceProtectionError, withLegacyRetirement } from "./worktree-lifecycle-guard";
 import {
 	SNAPSHOT_BASE_REF,
@@ -32,12 +31,6 @@ import {
 	treeSnapshotKey,
 	worktreeTreeSnapshot,
 } from "./worktree-tree-snapshot";
-
-beforeAll(async () => {
-	// Destructive fixture cleanup starts after the empty legacy namespace is imported.
-	await maintainProtectionIndex(performance.now() + 5000);
-	await maintainProtectionIndex(performance.now() + 5000);
-});
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];

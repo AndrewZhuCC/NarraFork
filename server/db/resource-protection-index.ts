@@ -1,4 +1,28 @@
 import type { Database } from "bun:sqlite";
+import { lstatSync } from "node:fs";
+
+/** Startup only, under the instance lock: no legacy namespace means no files to import.
+ * Any existing namespace or ambiguous filesystem error leaves compatibility maintenance pending.
+ * Durable dirty receipts still require retry; existing indexed pins are never removed.
+ */
+export function initializeAbsentReceiptProtectionSource(
+	database: Database,
+	receiptDirectory: string,
+): void {
+	try {
+		lstatSync(receiptDirectory);
+		return;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+	}
+	database
+		.query(`UPDATE resource_protection_sources
+		SET cursor = 'eof', complete = 1, revision = revision + 1
+		WHERE source = 'receipt' AND source_id = '' AND complete = 0
+		AND NOT EXISTS (SELECT 1 FROM resource_protection_sources
+			WHERE dirty = 1 AND source = 'receipt' AND source_id != '' LIMIT 1)`)
+		.run();
+}
 
 export const protectionSources = ["narrator", "chapter", "registry", "receipt"] as const;
 export type ProtectionSource = (typeof protectionSources)[number];
