@@ -161,9 +161,9 @@ function parseTools(
 		new Set(assets.map((a) => a.name)).size !== assets.length
 	)
 		throw new Error("Only complete manifest/licenses metadata accepted; binaries prohibited");
+	// Canonical declarations, not filename keywords, authorize licence metadata.
 	for (const license of manifest.licenses) {
 		if (
-			!/license|notice|copying/i.test(license.name) ||
 			!assets.some(
 				(a) => a.name === license.name && a.size === license.size && a.sha256 === license.sha256,
 			)

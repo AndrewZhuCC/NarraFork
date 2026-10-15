@@ -1,15 +1,29 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	getHelperAssetName,
+	HELPER_CATALOG_VERSION,
+	HELPER_MANIFEST_FILENAME,
+	HELPER_PLATFORMS,
+	HELPER_RELEASE_TAG,
+	HELPER_TOOL_VERSIONS,
+	HELPER_TOOLS,
+} from "../../../shared/helper-distribution";
 import { isWindowsPeFile, matchesWindowsPeArch } from "../../../shared/windows-pe";
 import {
 	downloadHelperBinary,
 	getCachedHelperBinaryPath,
 	HELPER_BIN_DIR,
+	resetHelperBinaryDownloadCache,
 } from "../helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "../helper-binary-platform";
+import { resetHelperDistributionCache } from "../helper-distribution-runtime";
 import { settings } from "../settings";
+
+const repository = "fixture/helper-platform";
+const releaseBase = `https://github.com/${repository}/releases/download/${HELPER_RELEASE_TAG}/`;
 
 const originalUpdate = settings.update ?? {
 	serverUrl: "https://legacy.example",
@@ -28,9 +42,38 @@ function pe(machine: number): Buffer {
 	return bytes;
 }
 
+function catalog(payload: Uint8Array) {
+	return {
+		schemaVersion: 1,
+		repository,
+		tag: HELPER_RELEASE_TAG,
+		commit: "a".repeat(40),
+		catalogVersion: HELPER_CATALOG_VERSION,
+		files: HELPER_TOOLS.flatMap((tool) =>
+			HELPER_PLATFORMS.map((platform) => ({
+				tool,
+				platform,
+				toolVersion: HELPER_TOOL_VERSIONS[tool],
+				name: getHelperAssetName(tool, platform),
+				size: payload.byteLength,
+				sha256: createHash("sha256").update(payload).digest("hex"),
+			})),
+		),
+		licenses: [{ name: "LICENSE.txt", size: 10, sha256: "b".repeat(64) }],
+	};
+}
+
 const originalFetch = globalThis.fetch;
 beforeEach(() => {
-	settings.update = { ...originalUpdate, source: "update-server", proxy: { mode: "direct" } };
+	settings.update = {
+		...originalUpdate,
+		source: "update-server",
+		githubRepository: repository,
+		serverUrl: "https://must-not-use-mirror.example",
+		proxy: { mode: "direct" },
+	};
+	resetHelperBinaryDownloadCache();
+	resetHelperDistributionCache();
 	rmSync(HELPER_BIN_DIR, { recursive: true, force: true });
 	mkdirSync(HELPER_BIN_DIR, { recursive: true });
 });
@@ -104,8 +147,17 @@ describe("bounded PE architecture validation", () => {
 
 describe("helper download architecture validation", () => {
 	test("rejects x64 served under ARM64 name, without caching it", async () => {
-		globalThis.fetch = (async () =>
-			new Response(Uint8Array.from(pe(0x8664)))) as unknown as typeof fetch;
+		// Its digest matches the canonical fixture: rejection must reach PE architecture validation.
+		const payload = pe(0x8664);
+		const calls: string[] = [];
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			calls.push(url);
+			expect(url).toStartWith(releaseBase);
+			return url.endsWith(HELPER_MANIFEST_FILENAME)
+				? Response.json(catalog(payload))
+				: new Response(Uint8Array.from(payload));
+		}) as unknown as typeof fetch;
 		const spec = getCliHelperSpec("zstd", "win32", "arm64");
 		if (!spec) throw new Error("Missing spec");
 		expect(
@@ -115,28 +167,51 @@ describe("helper download architecture validation", () => {
 			),
 		).toBeNull();
 		expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
+		expect(
+			readdirSync(join(HELPER_BIN_DIR, "distribution")).filter(
+				(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
+			),
+		).toEqual([]);
+		expect(calls).toEqual([
+			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+			`${releaseBase}${spec.toolName}`,
+		]);
 	});
 	test("downloads native ARM64 even when legacy x64 cache exists", async () => {
 		writeFileSync(join(HELPER_BIN_DIR, "zstd.exe"), pe(0x8664));
 		const calls: string[] = [];
 		globalThis.fetch = (async (url: string | URL | Request) => {
 			calls.push(String(url));
-			return new Response(Uint8Array.from(pe(0xaa64)));
+			expect(String(url)).toStartWith(releaseBase);
+			return String(url).endsWith(HELPER_MANIFEST_FILENAME)
+				? Response.json(catalog(pe(0xaa64)))
+				: new Response(Uint8Array.from(pe(0xaa64)));
 		}) as unknown as typeof fetch;
 		const spec = getCliHelperSpec("zstd", "win32", "arm64");
 		if (!spec) throw new Error("Missing spec");
 		spec.expectedSha256 = createHash("sha256").update(pe(0xaa64)).digest("hex");
 		const path = await downloadHelperBinary(spec, { bypassFailureCache: true });
 		expect(path?.startsWith(join(HELPER_BIN_DIR, "distribution"))).toBe(true);
+		if (!path) throw new Error("Native ARM64 helper must be downloaded");
 		expect(path).toEndWith(".exe");
-		expect(calls[0]).toEndWith("/api/v2/tools/zstd-win-arm64.exe");
+		expect(await Bun.file(path).bytes()).toEqual(Uint8Array.from(pe(0xaa64)));
+		expect(calls).toEqual([
+			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+			`${releaseBase}${spec.toolName}`,
+		]);
 		expect(await downloadHelperBinary(spec)).toBe(path);
-		expect(calls.length).toBe(1);
+		expect(calls.length).toBe(2);
+		expect(existsSync(join(HELPER_BIN_DIR, "zstd.exe"))).toBe(true);
 	});
 	test("limits chunked downloads without trusting content-length", async () => {
 		let cancelled = false;
-		globalThis.fetch = (async () =>
-			new Response(
+		const calls: string[] = [];
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			calls.push(url);
+			expect(url).toStartWith(releaseBase);
+			if (url.endsWith(HELPER_MANIFEST_FILENAME)) return Response.json(catalog(pe(0xaa64)));
+			return new Response(
 				new ReadableStream({
 					pull(controller) {
 						controller.enqueue(new Uint8Array(128));
@@ -145,14 +220,21 @@ describe("helper download architecture validation", () => {
 						cancelled = true;
 					},
 				}),
-			)) as unknown as typeof fetch;
-		expect(
-			await downloadHelperBinary(
-				{ toolName: "bounded-test", cachedName: "bounded-test", displayName: "test" },
-				{ maxBytes: 64, bypassFailureCache: true },
-			),
-		).toBeNull();
+			);
+		}) as unknown as typeof fetch;
+		const spec = getCliHelperSpec("zstd", "win32", "arm64");
+		if (!spec) throw new Error("Missing spec");
+		expect(await downloadHelperBinary(spec, { maxBytes: 64, bypassFailureCache: true })).toBeNull();
 		expect(cancelled).toBe(true);
-		expect(existsSync(join(HELPER_BIN_DIR, "bounded-test"))).toBe(false);
+		expect(calls).toEqual([
+			`${releaseBase}${HELPER_MANIFEST_FILENAME}`,
+			`${releaseBase}${spec.toolName}`,
+		]);
+		expect(existsSync(join(HELPER_BIN_DIR, spec.cachedName))).toBe(false);
+		expect(
+			readdirSync(join(HELPER_BIN_DIR, "distribution")).filter(
+				(name) => name.endsWith(".exe") || name.endsWith(".tmp"),
+			),
+		).toEqual([]);
 	});
 });

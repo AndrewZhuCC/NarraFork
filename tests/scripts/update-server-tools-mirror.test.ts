@@ -180,6 +180,47 @@ describe("canonical auxiliary metadata mirror", () => {
 				`/ready/narrafork/${kind}/`,
 			);
 		});
+		for (const field of [
+			"download_count",
+			"label",
+			"url",
+			"browser_download_url",
+			"id",
+			"name",
+			"size",
+			"digest",
+			"state",
+		] as const)
+			test(`${kind} final source check binds identity, not volatile ${field}`, async () => {
+				const f = fixture(kind);
+				const run = f.options.run;
+				let assetReads = 0;
+				f.options.run = async (args) => {
+					if (args[1].includes("/releases/9/assets?") && ++assetReads === 2)
+						Object.assign(f.assets[0], {
+							[field]: {
+								download_count: 123,
+								label: "updated label",
+								url: "https://api.example.test/changed",
+								browser_download_url: "https://downloads.example.test/changed",
+								id: 999,
+								name: "renamed-asset",
+								size: f.assets[0].size + 1,
+								digest: `sha256:${"f".repeat(64)}`,
+								state: "deleted",
+							}[field],
+						});
+					return run(args);
+				};
+				if (["id", "name", "size", "digest", "state"].includes(field)) {
+					await expect(mirrorPublishedGitHubRelease(f.options)).rejects.toThrow();
+					expect(f.requests).toHaveLength(0);
+				} else {
+					expect((await mirrorPublishedGitHubRelease(f.options)).status).toBe("METADATA_ONLY");
+					expect(f.requests).toHaveLength(1);
+				}
+				expect(assetReads).toBe(2);
+			});
 		for (const result of [
 			{ ok: true },
 			{

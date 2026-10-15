@@ -152,7 +152,7 @@ GitHub → runner → WebDAV
 | secret | `NF_MIRROR_WEBDAV_TOKEN` | Bearer 上传凭证；不能同时配置 Basic |
 | secret | `NF_MIRROR_RELAY_SIGNING_KEY` | 32 随机字节的规范 base64，与服务器验证密钥一致 |
 
-runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满足保留期规则的自有日期桶，不修改用户其他目录或旧 123 分发目录。服务器可使用另一只读账号，仅需 GET/PROPFIND。密钥不能与 WebDAV 密码混用；HMAC 认证交接清单，不把 WebDAV 当独立发布权威。所有请求禁止跨域/HTTP 降级重定向；厂商必须直接支持配置的 HTTPS WebDAV 根目录。没有新增 rclone 或其他外部二进制依赖。
+runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满足保留期规则的自有日期桶，不修改用户其他目录或旧 123 分发目录。服务器可使用另一只读账号，仅需 GET/PROPFIND。密钥不能与 WebDAV 密码混用；HMAC 认证交接清单，不把 WebDAV 当独立发布权威。默认拒绝所有重定向。若厂商 GET 下载经 CDN，可在服务器 `mirrorRelay.downloadRedirectHosts` 显式配置精确主机名或受限后缀，例如 `["*.pd1.cjjd19.com"]`；只允许 HTTPS/443、最多 3 跳，后续请求不转发 Authorization、Cookie 或 Referer，且共用原超时与大小/hash 校验。PSL 校验拒绝公共及托管后缀本身，不能把 `*.com` 或 `*.s3.amazonaws.com` 当信任范围；域名白名单不等于 DNS 重绑定钉住。上传、发现、删除仍不跟随重定向，其他部署不配置此字段即可维持原策略。没有新增 rclone 或其他外部二进制依赖。
 
 独立更新服务器的 `config.json` 增加以下字段（合并进原有配置，替换示例仓库和 URL）：
 
@@ -171,7 +171,7 @@ runner 需要专属前缀的 MKCOL/PUT/PROPFIND/DELETE 权限；它只删除满�
 }
 ```
 
-服务器进程环境中配置对应只读账号和同一签名密钥；也可将 username/password 引用替换为 `bearerTokenEnv`。这些字段是**环境变量名称**，不把密码或解析后的密钥写入 config。`enabled` 缺省 false；启用却缺配置则明确失败，不能静默降级。轮询间隔允许 10–3600 秒，最多 16 个显式配置的产品。启用需由运营者加载新配置，本助手不会重启当前服务。
+服务器进程环境中配置对应只读账号和同一签名密钥；也可将 username/password 引用替换为 `bearerTokenEnv`。这些字段是**环境变量名称**，不把密码或解析后的密钥写入 config。`enabled` 缺省 false；启用却缺配置则明确失败，不能静默降级。轮询间隔允许 10–3600 秒，最多 16 个显式配置的产品。独立更新服务器需加载新配置；这不要求重启承载会话的 NarraFork 主服务。
 
 交接与结果：
 

@@ -50,6 +50,34 @@ describe("optional update server WebDAV configuration", () => {
 		expect(JSON.stringify(config)).not.toContain(env.DAV_PASSWORD);
 	});
 
+	test("download redirects stay disabled unless the operator explicitly configures CDN hosts", () => {
+		expect(resolveMirrorRelaySettings(config, env)?.webdav.downloadRedirectHosts).toBeUndefined();
+		const settings = resolveMirrorRelaySettings(
+			{
+				...config,
+				mirrorRelay: { ...relay, downloadRedirectHosts: ["*.PD1.CJJD19.COM"] },
+			},
+			env,
+		);
+		expect(settings?.webdav.downloadRedirectHosts).toEqual(["*.pd1.cjjd19.com"]);
+		for (const host of [
+			"*.com",
+			"*.co.uk",
+			"*.s3.amazonaws.com",
+			"127.0.0.1",
+			"https://cdn.example.com/",
+		])
+			expect(() =>
+				resolveMirrorRelaySettings(
+					{
+						...config,
+						mirrorRelay: { ...relay, downloadRedirectHosts: [host] },
+					},
+					env,
+				),
+			).toThrow();
+	});
+
 	test("supports separate read-only Bearer credentials and a bounded custom interval", () => {
 		const settings = resolveMirrorRelaySettings(
 			{

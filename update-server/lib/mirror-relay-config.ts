@@ -39,6 +39,7 @@ export function resolveMirrorRelaySettings(
 					"bearerTokenEnv",
 					"signingKeyEnv",
 					"pollIntervalSeconds",
+					"downloadRedirectHosts",
 				].includes(key),
 		)
 	)
@@ -62,6 +63,9 @@ export function resolveMirrorRelaySettings(
 	const webdav = validateWebDavConfig({
 		url: relay.url ?? "",
 		feed: relay.feed ?? "default",
+		...(relay.downloadRedirectHosts !== undefined
+			? { downloadRedirectHosts: relay.downloadRedirectHosts }
+			: {}),
 		auth: bearer
 			? { bearerToken: secret(relay.bearerTokenEnv, env) }
 			: { username: secret(relay.usernameEnv, env), password: secret(relay.passwordEnv, env) },
