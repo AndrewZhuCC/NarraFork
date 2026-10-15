@@ -4169,49 +4169,8 @@ export async function startBackgroundCompletionContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
-	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
-
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status !== "idle") return { started: false };
-		// Plan-mode narrators are not auto-woken, matching goal and inbound continuation.
-		// This check was missing here while the other three entries had it, so a finished
-		// background task could pull a narrator out of planning and into execution.
-		// Declining to wake loses nothing: the notification stays queued for the next
-		// drain (the queue is only emptied by a path that delivers it).
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
-
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
-
-		const prompt = await drainAndPersistPendingInjections(active);
-		if (!prompt) return { started: false };
-
-		active._continuationSuppressed = false;
-		active._continuationStallCount = 0;
-		active._continuationStallKey = undefined;
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = new Date().toISOString();
-
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (background completion)", {
-				narratorId,
-				error: String(err),
-			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
-		});
-		return { started: true };
-	});
+	// Background results and Send(parent) share one mailbox and the same wake policy.
+	return startParentInboundContinuationIfPossible(narratorId, locale, replyInUserLanguage);
 }
 
 /**
@@ -4802,8 +4761,8 @@ export async function resumeBufferedMessagesIfIdle(
  * Wake an idle parent narrator to consume progress reports sent by its child
  * subagents via Send({ id: "parent" }). A working/waiting parent drains the
  * queue at its next after_tools sidecar boundary, so this only acts on idle
- * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation)
- * — the message stays queued until their next activity.
+ * narrators, including plan-mode parents gathering delegated research. Delivering
+ * a report does not approve/exit plan mode; the resumed loop retains its plan gates.
  *
  * Reuses continuationStartLock so it cannot race the background-task
  * completion continuation into starting two concurrent loops.
@@ -4814,12 +4773,19 @@ export async function startParentInboundContinuationIfPossible(
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
+		// Recheck inside start admission: publication may have observed an idle
+		// recipient before an approval, compaction, or another owner took over.
+		if (
+			isNarratorRuntimeBusy(narratorId) ||
+			compactLocks.has(narratorId) ||
+			isNarratorRevertAdmissionBlocked(narratorId)
+		)
+			return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
-		// Plan-mode narrators are not auto-woken; leave the report queued.
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
+		if (narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error")
+			return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };

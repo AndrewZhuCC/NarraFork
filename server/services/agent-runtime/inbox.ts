@@ -1207,9 +1207,9 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
 				await import("../narrator-session");
 			const first = await peekInbox(narratorId);
-			// A user behind a bounded batch of notices is still explicit work, not
-			// an autonomous continuation (which intentionally refuses plan mode).
-			// The user consumer drains those preceding notices without skipping them.
+			// A user behind a bounded batch of notices is still explicit work.
+			// The user consumer drains those preceding notices without skipping them;
+			// delegated reports alone use the notification continuation, also in plan mode.
 			if (first?.kind === "user_input" || (await hasInboxKind(narratorId, ["user_input"])))
 				return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
 			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;
