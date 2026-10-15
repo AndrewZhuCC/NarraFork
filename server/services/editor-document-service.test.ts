@@ -9,6 +9,7 @@ import {
 	open,
 	readdir,
 	readFile,
+	rename,
 	rm,
 	symlink,
 	unlink,
@@ -280,6 +281,67 @@ describe("large editor objects and real durable pipeline", () => {
 			}
 		});
 	}
+	for (const change of ["revision", "root"] as const)
+		test(`queued commit rejects ${change} changes after its initial binding check with zero dispatch`, async () => {
+			const workspace = join(root, "execution");
+			await mkdir(workspace);
+			target = join(workspace, "file.txt");
+			const originalBytes = "same baseline\r\n";
+			await writeFile(target, originalBytes);
+			let revision = 1;
+			actor.authorize = async () => {
+				const stat = await lstat(workspace, { bigint: true });
+				return {
+					cwd: workspace,
+					projectId: null,
+					lexicalPath: target,
+					canonicalPath: target,
+					outsideRoots: false,
+					contextKey: `revision-${revision}`,
+					workspaceIdentity: `${stat.dev}:${stat.ino}`,
+					pathFlavor: "posix",
+				};
+			};
+			const doc = await create();
+			const uploadId = await upload(doc, "must not write\n");
+			const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
+			const entered = deferred();
+			const resume = deferred();
+			const queued = deferred();
+			const holding = jobs.withIo(actor.userId, async () => {
+				entered.resolve();
+				await resume.promise;
+			});
+			await entered.promise;
+			const withIo = jobs.withIo.bind(jobs);
+			const admission = spyOn(jobs, "withIo").mockImplementation((user, body, signal) => {
+				const result = withIo(user, body, signal);
+				queued.resolve();
+				return result;
+			});
+			const pending = service.commit(actor, doc.docId, uploadId, {}).catch((error) => error);
+			try {
+				await queued.promise;
+				expect((Reflect.get(jobs, "queue") as unknown[]).length).toBe(1);
+				if (change === "revision") revision++;
+				else {
+					await rename(workspace, `${workspace}-old`);
+					await mkdir(workspace);
+					await writeFile(target, originalBytes);
+				}
+				resume.resolve();
+				await holding;
+				expect(await pending).toMatchObject({ code: "EDITOR_IDENTITY_CHANGED", statusCode: 403 });
+				expect(dispatches).toBe(0);
+				expect(operations()).toHaveLength(0);
+				expect(await readFile(target, "utf8")).toBe(originalBytes);
+			} finally {
+				resume.resolve();
+				await holding;
+				await pending;
+				admission.mockRestore();
+			}
+		});
 	test("content validates every metadata field, not only hash or byte length", async () => {
 		const jobs = new EditorDocumentJobs();
 		const opened = await jobs.run(actor.userId, { action: "metadata", sourcePath: target });

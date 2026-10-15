@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import { constants } from "node:fs";
 import { chmod, chown, lstat, mkdir, open, readdir, rm, rmdir, unlink } from "node:fs/promises";
@@ -38,6 +38,48 @@ export interface EditorBinding {
 	lexicalPath: string;
 	canonicalPath: string;
 	outsideRoots: boolean;
+	/** Execution identity, never the UI workspace or dock host. */
+	contextKey?: string;
+	workspaceIdentity?: string;
+	pathFlavor?: "posix" | "windows";
+}
+
+export function editorResourceKey(
+	actor: EditorActor,
+	input: CreateEditorDocumentInput,
+	binding: EditorBinding,
+) {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				"editor-resource-v1",
+				actor.userId,
+				actor.narratorId,
+				input.deviceId ?? "local",
+				input.origin,
+				binding.cwd,
+				binding.projectId,
+				binding.contextKey,
+				binding.workspaceIdentity,
+				binding.pathFlavor,
+				binding.canonicalPath,
+				binding.outsideRoots,
+			]),
+		)
+		.digest("hex");
+}
+export function editorRecoveryKey(actor: EditorActor, input: CreateEditorDocumentInput) {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				"editor-recovery-v1",
+				actor.userId,
+				actor.narratorId,
+				input.deviceId ?? "local",
+				input.origin,
+			]),
+		)
+		.digest("hex");
 }
 export interface EditorActor {
 	userId: string;
@@ -60,6 +102,23 @@ export class EditorDocumentError extends AppError {
 		super(message, status, code);
 	}
 }
+function assertSameEditorBinding(
+	actor: EditorActor,
+	input: CreateEditorDocumentInput,
+	expected: EditorBinding,
+	fresh: EditorBinding,
+) {
+	if (
+		fresh.lexicalPath !== expected.lexicalPath ||
+		editorResourceKey(actor, input, fresh) !== editorResourceKey(actor, input, expected)
+	)
+		throw new EditorDocumentError(
+			"EDITOR_IDENTITY_CHANGED",
+			"Editor resource identity changed",
+			403,
+		);
+}
+
 interface SourceVersion {
 	handle: string;
 	metadata: EditorVersionMetadata;
@@ -333,7 +392,9 @@ export class EditorDocumentService {
 		this.totalBytes += delta;
 		this.count(this.userBytes, session.userId, delta);
 	}
-	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
+	/** Routes still require current narrator ACL. These operations expose only the
+	 * verified owner's private transfer metadata, never file bytes or write authority. */
+	private async owned(actor: EditorActor, docId: string) {
 		const session = this.sessions.get(docId);
 		if (
 			!session ||
@@ -347,18 +408,14 @@ export class EditorDocumentService {
 			throw expired();
 		}
 		await this.assertStore();
+		if (session.closing || !this.sessions.has(docId)) throw expired();
+		session.lastUsed = Date.now();
+		return session;
+	}
+	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
+		const session = await this.owned(actor, docId);
 		const binding = await actor.authorize(session.input, need);
-		if (
-			binding.cwd !== session.binding.cwd ||
-			binding.projectId !== session.binding.projectId ||
-			binding.lexicalPath !== session.binding.lexicalPath ||
-			binding.canonicalPath !== session.binding.canonicalPath
-		)
-			throw new EditorDocumentError(
-				"EDITOR_IDENTITY_CHANGED",
-				"Editor resource identity changed",
-				403,
-			);
+		assertSameEditorBinding(actor, session.input, session.binding, binding);
 		if (session.closing || !this.sessions.has(docId)) throw expired();
 		session.lastUsed = Date.now();
 		return { session, binding };
@@ -403,6 +460,8 @@ export class EditorDocumentService {
 			session.source = { handle: randomUUID(), metadata: result.metadata };
 			return {
 				docId: session.id,
+				resourceKey: editorResourceKey(actor, session.input, binding),
+				recoveryKey: editorRecoveryKey(actor, session.input),
 				target: { deviceId: "local", path: binding.canonicalPath },
 				versionHandle: session.source.handle,
 				...result.metadata,
@@ -902,13 +961,8 @@ export class EditorDocumentService {
 						authorize: async () => {
 							// Cancellation/DELETE may mark closing after commit began; pin keeps the bound bytes alive.
 							const fresh = await actor.authorize(session.input, "write");
-							if (
-								fresh.cwd !== binding.cwd ||
-								fresh.projectId !== binding.projectId ||
-								fresh.lexicalPath !== binding.lexicalPath ||
-								fresh.canonicalPath !== binding.canonicalPath ||
-								(fresh.outsideRoots && !confirmed)
-							)
+							assertSameEditorBinding(actor, session.input, binding, fresh);
+							if (fresh.outsideRoots && !confirmed)
 								throw new EditorDocumentError(
 									"EDITOR_IDENTITY_CHANGED",
 									"Write authorization or physical target changed",
@@ -1062,7 +1116,7 @@ export class EditorDocumentService {
 		docId: string,
 		uploadId: string,
 	): Promise<EditorUploadDescriptor> {
-		const { session } = await this.bound(actor, docId, "read");
+		const session = await this.owned(actor, docId);
 		const upload = this.upload(session, uploadId);
 		return {
 			uploadId,
@@ -1077,7 +1131,7 @@ export class EditorDocumentService {
 		docId: string,
 		uploadId: string,
 	): Promise<EditorUploadDescriptor> {
-		const { session } = await this.bound(actor, docId, "write");
+		const session = await this.owned(actor, docId);
 		const upload = this.upload(session, uploadId);
 		if (upload.state === "committing" || upload.state === "settled")
 			return { uploadId, state: upload.state };
@@ -1087,7 +1141,7 @@ export class EditorDocumentService {
 		return { uploadId, state: upload.state };
 	}
 	async remove(actor: EditorActor, docId: string): Promise<{ status: "released" | "committing" }> {
-		const { session } = await this.bound(actor, docId, "read");
+		const session = await this.owned(actor, docId);
 		await this.release(session);
 		return { status: session.committing ? "committing" : "released" };
 	}

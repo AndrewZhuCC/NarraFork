@@ -24,8 +24,18 @@ export interface CreateEditorDocumentInput {
 	origin: "reference" | "legacy";
 }
 
+export type EditorRecoveryScopeInput = Pick<CreateEditorDocumentInput, "deviceId" | "origin">;
+/** Server-derived original-owner namespace; it grants no file read/write or model sharing. */
+export interface EditorRecoveryScope {
+	recoveryKey: string;
+}
+
 export interface EditorDocumentDescriptor {
 	docId: string;
+	/** Opaque, server-authorized identity; absent on older v1 servers (no sharing). */
+	resourceKey?: string;
+	/** Opaque verified principal/narrator/device/origin scope; discovery only, never model sharing. */
+	recoveryKey?: string;
 	target: FileTarget;
 	versionHandle: string;
 	baseHash: string;

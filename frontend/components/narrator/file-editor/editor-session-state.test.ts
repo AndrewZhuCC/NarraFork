@@ -129,6 +129,230 @@ async function setup(load = true) {
 	return { session, api, encode, hash, applyContent, snapshot, change, text: () => text };
 }
 
+test("410 reauthorization cannot bind a dirty draft to another authorized execution scope", async () => {
+	const { session, api, change, text } = await setup(false);
+	api.create.mockResolvedValue({ ...descriptor, resourceKey: "original-scope" });
+	await session.load();
+	change("old draft");
+	api.createUpload.mockRejectedValueOnce(new ApiError("Expired", 410));
+	api.create.mockResolvedValue({
+		...descriptor,
+		docId: "new-doc",
+		resourceKey: "new-scope",
+		baseHash: "new-disk",
+	});
+	await session.save();
+	expect(text()).toBe("old draft");
+	expect(session.state.baseHash).toBe("original-hash");
+	expect(session.state.invalidated).toBe(true);
+	expect(sessionCanSave(session.state)).toBe(false);
+	expect(api.release).toHaveBeenCalledWith("child", "new-doc");
+	expect(api.commit).not.toHaveBeenCalled();
+});
+
+test("invalidation during commit preserves unknown attempt and rejects late success and confirmation dispatch", async () => {
+	const { session, api, change, text } = await setup();
+	change("inflight draft");
+	const pending = deferred<EditorCommitResult>();
+	api.commit.mockReturnValue(pending.promise);
+	const saving = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	expect(session.state.phase).toBe("committing");
+	session.invalidate("scope changed");
+	pending.resolve({
+		status: "saved",
+		hash: "late-hash",
+		operationId: "op",
+		snapshotRevision: 2,
+		bytes: 14,
+	});
+	await saving;
+	await session.confirm();
+	await session.load();
+	expect(session.state.phase).toBe("unknown");
+	expect(session.state.baseHash).toBe("original-hash");
+	expect(text()).toBe("inflight draft");
+	expect(sessionExitBlocked(session.state)).toBe(true);
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(api.operation).not.toHaveBeenCalled();
+	expect(api.cancelUpload).not.toHaveBeenCalled();
+});
+
+for (const status of ["saved", "conflict", "not-applied", "uncertain", "denied"] as const)
+	test(`invalidated dispatched attempt explicitly queries its ${status} receipt without rebinding or losing the draft`, async () => {
+		const { session, api, change, text, applyContent } = await setup();
+		change("old draft");
+		const baseline = session.state.baseline;
+		const pending = deferred<EditorCommitResult>();
+		api.commit.mockReturnValue(pending.promise);
+		const saving = session.save();
+		for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+		session.invalidate("scope changed");
+		expect(session.discardRetainedDraft()).toBe(false);
+		pending.resolve({
+			status: "saved",
+			operationId: "op",
+			hash: "late-hash",
+			snapshotRevision: 2,
+			bytes: 9,
+		});
+		await saving;
+		expect(api.operation).not.toHaveBeenCalled();
+		if (status === "saved")
+			api.operation.mockResolvedValue({
+				status: "saved",
+				operationId: "op",
+				result: {
+					status: "saved",
+					operationId: "op",
+					hash: "saved-hash",
+					snapshotRevision: 2,
+					bytes: 9,
+				},
+			});
+		else if (status === "conflict")
+			api.operation.mockResolvedValue({
+				status: "failed",
+				operationId: "op",
+				error: { code: "STALE_WRITE", message: "Conflict" },
+			});
+		else if (status === "not-applied") {
+			api.operation.mockRejectedValue(new ApiError("Not found", 404));
+			api.getUpload.mockResolvedValue({ uploadId: "upload", state: "cancelled" });
+		} else if (status === "denied") api.operation.mockRejectedValue(new ApiError("Forbidden", 403));
+		await session.reconcile();
+		expect(api.operation).toHaveBeenCalledWith("child", "op");
+		expect(session.state.phase).toBe(
+			status === "uncertain" || status === "denied" ? "unknown" : "idle",
+		);
+		expect(session.state.invalidated).toBe(true);
+		expect(sessionCanSave(session.state)).toBe(false);
+		expect(session.state.baseHash).toBe("original-hash");
+		expect(session.state.baseline).toBe(baseline);
+		expect(sessionDirty(session.state)).toBe(true);
+		expect(text()).toBe("old draft");
+		expect(applyContent).toHaveBeenCalledTimes(1);
+		expect(api.create).toHaveBeenCalledTimes(1);
+		expect(api.commit).toHaveBeenCalledTimes(1);
+		expect(api.cancelUpload).not.toHaveBeenCalled();
+		if (status === "denied") expect(session.state.receiptError).toContain("Forbidden");
+		else expect(session.state.receipt?.status).toBe(status === "conflict" ? "failed" : status);
+	});
+
+test("a late conflict response after invalidation retains its operation id for explicit receipt recovery only", async () => {
+	const { session, api, change, text } = await setup();
+	change("old draft");
+	const pending = deferred<EditorCommitResult>();
+	api.commit.mockReturnValue(pending.promise);
+	const saving = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	session.invalidate("scope changed");
+	pending.reject(
+		new ApiError("Conflict", 409, { code: "STALE_WRITE", operationId: "late-conflict" }),
+	);
+	await saving;
+	expect(api.operation).not.toHaveBeenCalled();
+	expect(session.state.phase).toBe("unknown");
+	api.operation.mockResolvedValue({
+		status: "failed",
+		operationId: "late-conflict",
+		error: { code: "STALE_WRITE", message: "Conflict" },
+	});
+	await session.reconcile();
+	expect(api.operation).toHaveBeenCalledWith("child", "late-conflict");
+	expect(session.state.phase).toBe("idle");
+	expect(session.state.invalidated).toBe(true);
+	expect(text()).toBe("old draft");
+	expect(api.commit).toHaveBeenCalledTimes(1);
+});
+
+test("invalidated receipt queries are single-flight, reject mismatched revisions and preserve edits made while checking", async () => {
+	const { session, api, change, text } = await setup();
+	change("sent");
+	const pending = deferred<EditorCommitResult>();
+	api.commit.mockReturnValue(pending.promise);
+	const saving = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	session.invalidate("scope changed");
+	pending.resolve({
+		status: "saved",
+		operationId: "op",
+		hash: "late",
+		snapshotRevision: 2,
+		bytes: 4,
+	});
+	await saving;
+	const query = deferred<Awaited<ReturnType<typeof editorDocumentApi.operation>>>();
+	api.operation.mockReturnValue(query.promise);
+	const first = session.reconcile();
+	const second = session.reconcile();
+	await Promise.resolve();
+	expect(api.operation).toHaveBeenCalledTimes(1);
+	expect(session.state.checkingReceipt).toBe(true);
+	change("preserved later draft");
+	query.resolve({
+		status: "saved",
+		operationId: "op",
+		result: {
+			status: "saved",
+			operationId: "op",
+			hash: "mismatch",
+			snapshotRevision: 99,
+			bytes: 4,
+		},
+	});
+	await Promise.all([first, second]);
+	expect(session.state.phase).toBe("unknown");
+	expect(session.state.receiptError).toContain("revision");
+	api.operation.mockResolvedValue({
+		status: "saved",
+		operationId: "op",
+		result: { status: "saved", operationId: "op", hash: "right", snapshotRevision: 2, bytes: 4 },
+	});
+	await session.reconcile();
+	expect(session.state.phase).toBe("idle");
+	expect(session.state.checkingReceipt).toBe(false);
+	expect(text()).toBe("preserved later draft");
+	expect(sessionDirty(session.state)).toBe(true);
+	expect(session.state.baseHash).toBe("original-hash");
+	expect(api.commit).toHaveBeenCalledTimes(1);
+});
+
+for (const cancellation of ["cancelled", "committing", "empty", "denied"] as const)
+	test(`invalidated not-found receipt requires authorized cancellation evidence: ${cancellation}`, async () => {
+		const { session, api, change, text } = await setup();
+		change("old draft");
+		const pending = deferred<EditorCommitResult>();
+		api.commit.mockReturnValue(pending.promise);
+		const saving = session.save();
+		for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+		session.invalidate("scope changed");
+		pending.resolve({
+			status: "saved",
+			operationId: "op",
+			hash: "late",
+			snapshotRevision: 2,
+			bytes: 9,
+		});
+		await saving;
+		api.operation.mockRejectedValue(new ApiError("missing", 404));
+		api.getUpload.mockResolvedValue({ uploadId: "upload", state: "sealed" });
+		if (cancellation === "denied") api.getUpload.mockRejectedValue(new ApiError("Forbidden", 403));
+		else
+			api.cancelUpload.mockResolvedValue(
+				cancellation === "empty" ? undefined : { uploadId: "upload", state: cancellation },
+			);
+		await session.reconcile();
+		expect(session.state.phase).toBe(cancellation === "cancelled" ? "idle" : "unknown");
+		if (cancellation === "cancelled") expect(session.state.receipt?.status).toBe("not-applied");
+		else expect(session.state.receiptError).toBeTruthy();
+		expect(text()).toBe("old draft");
+		expect(sessionDirty(session.state)).toBe(true);
+		expect(session.state.invalidated).toBe(true);
+		expect(api.commit).toHaveBeenCalledTimes(1);
+		if (cancellation === "denied") expect(api.cancelUpload).not.toHaveBeenCalled();
+	});
+
 test("source is immutable, authorized as child/reference, and bound to declared bytes", async () => {
 	const { session, api } = await setup();
 	expect(api.create).toHaveBeenCalledWith(
@@ -197,7 +421,10 @@ for (const failure of [
 		expect(api.source).toHaveBeenCalledTimes(1);
 		expect(api.release).toHaveBeenCalledWith("child", "doc");
 		expect(applyContent).not.toHaveBeenCalled();
-		expect(session.state.error).toBe(failure.message);
+		if (failure instanceof ApiError && failure.status === 403) {
+			expect(session.state.invalidated).toBe(true);
+			expect(session.state.error).toContain("authorization changed");
+		} else expect(session.state.error).toBe(failure.message);
 	});
 
 test("source retry preserves a draft edited while retry authorization is pending", async () => {
@@ -336,7 +563,7 @@ test("410 reauthorization preserves draft, undo versions, original hash and enco
 	]);
 });
 
-test("failed reauthorization retains saveable draft and old baseline", async () => {
+test("denied reauthorization retains draft and old baseline but revokes saving", async () => {
 	const { session, api, change, text } = await setup();
 	api.createUpload.mockRejectedValueOnce(new ApiError("Expired", 410));
 	api.create.mockRejectedValue(new ApiError("Forbidden", 403));
@@ -344,7 +571,8 @@ test("failed reauthorization retains saveable draft and old baseline", async () 
 	await session.save();
 	expect(text()).toBe("draft");
 	expect(session.state.baseHash).toBe("original-hash");
-	expect(sessionCanSave(session.state)).toBe(true);
+	expect(session.state.invalidated).toBe(true);
+	expect(sessionCanSave(session.state)).toBe(false);
 });
 
 const confirmation = new ApiError("Confirm", 409, {

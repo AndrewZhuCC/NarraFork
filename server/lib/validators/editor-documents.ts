@@ -29,6 +29,7 @@ export const createEditorDocumentSchema = z
 		origin: z.enum(["reference", "legacy"]),
 	})
 	.strict();
+export const editorRecoveryScopeSchema = createEditorDocumentSchema.omit({ path: true }).strict();
 export const createEditorUploadSchema = z
 	.object({
 		baseHash: z

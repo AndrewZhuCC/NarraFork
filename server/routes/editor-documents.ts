@@ -1,3 +1,4 @@
+import { lstat, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
@@ -14,6 +15,7 @@ import {
 	commitEditorUploadSchema,
 	createEditorDocumentSchema,
 	createEditorUploadSchema,
+	editorRecoveryScopeSchema,
 } from "../lib/validators/editor-documents";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import {
@@ -24,6 +26,7 @@ import {
 	type EditorActor,
 	EditorDocumentError,
 	type EditorDocumentService,
+	editorRecoveryKey,
 } from "../services/editor-document-service";
 import { rejectEditorSymlinks } from "../services/editor-document-worker";
 import { authorizeEditorReferenceTarget } from "../services/file-reference-service";
@@ -126,7 +129,18 @@ export function editorActor(c: Context): EditorActor {
 				if (canonical !== decision.physicalPath)
 					throw new AppError("Editor source identity changed", 403, "EDITOR_IDENTITY_CHANGED");
 			}
+			const canonicalRoot = await realpath(cwd);
+			const root = await lstat(canonicalRoot, { bigint: true });
 			return {
+				contextKey: JSON.stringify([
+					narrator.workspaceRevision,
+					narrator.workspaceContext?.contextKey,
+					narrator.defaultDeviceId,
+					narrator.chapterId,
+					chapter?.worktreePath,
+				]),
+				workspaceIdentity: JSON.stringify([canonicalRoot, String(root.dev), String(root.ino)]),
+				pathFlavor: process.platform === "win32" ? ("windows" as const) : ("posix" as const),
 				cwd,
 				lexicalPath,
 				canonicalPath: decision.physicalPath,
@@ -194,6 +208,16 @@ export function createEditorDocumentRoutes(
 			),
 		);
 	});
+	routes.get(`${base}/recovery-scope`, async (c) => {
+		const parsed = editorRecoveryScopeSchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		// Match the owner namespace minted on the original transfer without opening today's
+		// path, creating a document, or depending on an unexpired transfer session. Current
+		// verified principal + narrator ACL authorize private draft/receipt discovery only.
+		const scope = { recoveryKey: editorRecoveryKey(editorActor(c), { ...parsed.data, path: "" }) };
+		await protect(c);
+		return c.json(scope);
+	});
 	routes.post(base, async (c) =>
 		c.json(
 			await getService().create(
@@ -230,15 +254,15 @@ export function createEditorDocumentRoutes(
 			),
 		),
 	);
-	routes.get(`${base}/:docId/uploads/:uploadId`, async (c) =>
-		c.json(
-			await getService().uploadStatus(
-				editorActor(c),
-				c.req.param("docId"),
-				c.req.param("uploadId"),
-			),
-		),
-	);
+	routes.get(`${base}/:docId/uploads/:uploadId`, async (c) => {
+		const status = await getService().uploadStatus(
+			editorActor(c),
+			c.req.param("docId"),
+			c.req.param("uploadId"),
+		);
+		await protect(c);
+		return c.json(status);
+	});
 	routes.put(`${base}/:docId/uploads/:uploadId`, async (c) => {
 		if (c.req.header("content-type")?.split(";")[0].trim() !== "application/octet-stream")
 			throw new AppError(
@@ -288,7 +312,10 @@ export function createEditorDocumentRoutes(
 		if (operationId.length > 128)
 			throw new AppError("Invalid operation id", 400, "VALIDATION_ERROR");
 		try {
-			return c.json(await getService().operation(editorActor(c), operationId));
+			const receipt = await getService().operation(editorActor(c), operationId);
+			// A startup/recovery lookup may wait: revoked narrator access must not publish a queued receipt.
+			await protect(c);
+			return c.json(receipt);
 		} catch (error) {
 			editorRuntimeUnavailable(error);
 		}

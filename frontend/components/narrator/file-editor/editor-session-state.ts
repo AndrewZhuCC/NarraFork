@@ -2,6 +2,7 @@ import type {
 	EditorConfirmationData,
 	EditorConflictData,
 	EditorDocumentDescriptor,
+	EditorOperationResult,
 	EditorSaveResult,
 	EditorUploadDescriptor,
 } from "@shared/editor-document";
@@ -18,9 +19,18 @@ export interface DocumentVersion {
 	alternativeVersionId: number;
 	length: number;
 }
+export type EditorRetiredReceipt =
+	| EditorOperationResult
+	| { status: "not-applied"; operationId?: string };
 export interface EditorSessionState {
 	loaded: boolean;
 	loading: boolean;
+	invalidated?: boolean;
+	discarded?: boolean;
+	/** Receipt recovery is separate from the permanently invalidated editable binding. */
+	receipt?: EditorRetiredReceipt;
+	receiptError?: string | null;
+	checkingReceipt?: boolean;
 	baseHash: string | null;
 	encoding: string;
 	baseline: number | null;
@@ -44,6 +54,7 @@ export function sessionExitBlocked(state: EditorSessionState): boolean {
 export function sessionCanSave(state: EditorSessionState): boolean {
 	return (
 		state.loaded &&
+		!state.invalidated &&
 		!state.loading &&
 		state.phase === "idle" &&
 		!state.confirmation &&
@@ -60,10 +71,12 @@ interface Attempt {
 	blob?: Blob;
 	controller: AbortController;
 }
-interface Options {
+export interface EditorSessionOptions {
 	narratorId: string;
 	path: string;
 	deviceId: string;
+	/** A registry seed fixes authorization before even the first source read/retry. */
+	resourceKey?: string;
 	origin: () => "reference" | "legacy";
 	snapshot: () => EditorTextSnapshot;
 	encode: (snapshot: EditorTextSnapshot, signal: AbortSignal) => Promise<Blob>;
@@ -106,7 +119,8 @@ export class EditorDocumentSession {
 	private baselineController = new AbortController();
 	private baselineLength = -1;
 	private baselineGeneration = 0;
-	constructor(private options: Options) {
+	private receiptQuery: Promise<void> | null = null;
+	constructor(private options: EditorSessionOptions) {
 		this.api = options.api ?? editorDocumentApi;
 	}
 	/** React StrictMode replays effect setup/cleanup without recreating memoized adapters. */
@@ -114,7 +128,7 @@ export class EditorDocumentSession {
 		this.disposed = false;
 	}
 	private update(patch: Partial<EditorSessionState>) {
-		if (this.disposed) return;
+		if (this.disposed || this.state.invalidated) return;
 		this.state = { ...this.state, ...patch };
 		this.options.onChange(this.state);
 	}
@@ -192,11 +206,37 @@ export class EditorDocumentSession {
 	private text(key: string, fallback: string) {
 		return this.options.translate?.(key, fallback) ?? fallback;
 	}
+	private authorizationFailed(error: unknown) {
+		if (!(error instanceof ApiError) || (error.status !== 401 && error.status !== 403))
+			return false;
+		this.invalidate(
+			this.text(
+				"identityChanged",
+				"Editor authorization changed. The previous draft was preserved; reopen the file in its new context.",
+			),
+		);
+		return true;
+	}
 	private release(docId: string) {
 		void this.api.release(this.options.narratorId, docId).catch(() => {});
 	}
+	invalidate(reason: string) {
+		if (this.state.invalidated) return;
+		const dispatched = this.state.phase === "committing" || this.state.phase === "unknown";
+		if (!dispatched) this.cancel();
+		this.update({
+			invalidated: true,
+			loading: false,
+			error: reason,
+			...(dispatched ? { phase: "unknown" } : {}),
+		});
+		this.loadController?.abort();
+		this.attempt?.controller.abort();
+		this.baselineController.abort();
+	}
 	private async authorize(signal: AbortSignal) {
-		return this.api.create(
+		if (this.state.invalidated) throw new Error(this.state.error ?? "Editor identity changed");
+		const next = await this.api.create(
 			this.options.narratorId,
 			{
 				path: this.options.path,
@@ -205,6 +245,17 @@ export class EditorDocumentSession {
 			},
 			signal,
 		);
+		const expectedKey = this.options.resourceKey ?? this.document?.resourceKey;
+		if (expectedKey && next.resourceKey !== expectedKey) {
+			this.release(next.docId);
+			const reason = this.text(
+				"identityChanged",
+				"Editor authorization changed. The previous draft was preserved; reopen the file in its new context.",
+			);
+			this.invalidate(reason);
+			throw new Error(reason);
+		}
+		return next;
 	}
 	/** Reauthorization deliberately does NOT install the newly observed disk baseline or text. */
 	private async recover(signal: AbortSignal) {
@@ -220,6 +271,11 @@ export class EditorDocumentSession {
 		return next;
 	}
 	change(version: DocumentVersion) {
+		if (this.state.invalidated && !this.disposed) {
+			this.state = { ...this.state, version };
+			this.options.onChange(this.state);
+			return;
+		}
 		if (this.state.version === null && this.state.loaded) this.resetBaseline(version);
 		const confirmationChanged =
 			this.state.confirmation && this.attempt?.version.revision !== version.revision;
@@ -232,7 +288,7 @@ export class EditorDocumentSession {
 		});
 	}
 	async load() {
-		if (this.state.phase !== "idle" || this.disposed) return;
+		if (this.state.phase !== "idle" || this.disposed || this.state.invalidated) return;
 		this.loadController?.abort();
 		const controller = new AbortController();
 		this.loadController = controller;
@@ -322,6 +378,8 @@ export class EditorDocumentSession {
 			});
 			if (old) this.release(old.docId);
 		} catch (error) {
+			if (this.loadController === controller && !this.disposed && this.authorizationFailed(error))
+				return;
 			if (this.loadController === controller && !this.disposed)
 				this.update({ error: message(error) });
 		} finally {
@@ -333,7 +391,7 @@ export class EditorDocumentSession {
 		}
 	}
 	private settle(result: EditorSaveResult, attempt: Attempt) {
-		if (this.attempt !== attempt || this.disposed) return;
+		if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 		if (result.snapshotRevision !== attempt.version.revision) {
 			this.update({
 				phase: "unknown",
@@ -426,6 +484,7 @@ export class EditorDocumentSession {
 			attempt.controller.signal.throwIfAborted();
 			await this.commit(attempt);
 		} catch (error) {
+			if (this.attempt === attempt && this.authorizationFailed(error)) return;
 			if (this.attempt === attempt && this.state.phase !== "unknown") {
 				this.cancel();
 				this.update({ error: message(error) });
@@ -433,7 +492,7 @@ export class EditorDocumentSession {
 		}
 	}
 	private async commit(attempt: Attempt, confirmationToken?: string) {
-		if (!attempt.uploadId || this.attempt !== attempt) return;
+		if (!attempt.uploadId || this.attempt !== attempt || this.state.invalidated) return;
 		this.update({ phase: "committing", confirmation: null, error: null });
 		try {
 			const result = await this.api.commit(
@@ -446,7 +505,7 @@ export class EditorDocumentSession {
 			if (this.attempt !== attempt) return;
 			attempt.operationId = result.operationId;
 			if (result.status === "saved") this.settle(result, attempt);
-			else {
+			else if (!this.state.invalidated) {
 				this.update({ phase: "unknown" });
 				await this.reconcile();
 			}
@@ -457,6 +516,7 @@ export class EditorDocumentSession {
 					? (error.data as { code?: string; operationId?: string } | undefined)
 					: undefined;
 			if (data?.operationId) attempt.operationId = data.operationId;
+			if (this.state.invalidated || this.authorizationFailed(error)) return;
 			if (data?.code === "NEEDS_CONFIRMATION") {
 				if (this.state.version?.revision !== attempt.version.revision) {
 					this.cancel(true);
@@ -490,27 +550,152 @@ export class EditorDocumentSession {
 	async confirm() {
 		const attempt = this.attempt;
 		const confirmation = this.state.confirmation;
-		if (!attempt || !confirmation || this.state.phase !== "idle" || this.state.loading) return;
+		if (
+			!attempt ||
+			!confirmation ||
+			this.state.phase !== "idle" ||
+			this.state.loading ||
+			this.state.invalidated
+		)
+			return;
 		if (this.state.version?.revision !== attempt.version.revision) {
 			this.cancel();
 			return;
 		}
 		await this.commit(attempt, confirmation.confirmationToken);
 	}
-	async reconcile() {
+	/** Explicit confirmed discard only; unresolved writes must retain their evidence. */
+	discardRetainedDraft(): boolean {
+		if (
+			!this.state.invalidated ||
+			this.state.phase !== "idle" ||
+			this.receiptQuery ||
+			this.attempt ||
+			this.disposed
+		)
+			return false;
+		this.state = {
+			...this.state,
+			discarded: true,
+			version: null,
+			baseline: null,
+			equivalentVersion: null,
+			confirmation: null,
+			conflict: null,
+		};
+		this.options.onChange(this.state);
+		return true;
+	}
+	/** Only explicit UI recovery may query a retired attempt. It never installs a new base. */
+	private reconcileInvalidated(): Promise<void> {
+		if (this.receiptQuery) return this.receiptQuery;
 		const attempt = this.attempt;
-		if (!attempt || this.state.phase !== "unknown" || !attempt.uploadId) return;
+		const uploadId = attempt?.uploadId;
+		if (!attempt || this.state.phase !== "unknown" || !uploadId || this.disposed)
+			return Promise.resolve();
+		const publish = (
+			patch: Pick<
+				Partial<EditorSessionState>,
+				"receipt" | "receiptError" | "checkingReceipt" | "phase"
+			>,
+		) => {
+			if (this.disposed || !this.state.invalidated) return;
+			this.state = { ...this.state, ...patch };
+			this.options.onChange(this.state);
+		};
+		const current = () => !this.disposed && this.attempt === attempt && !!this.state.invalidated;
+		const finish = (receipt: EditorRetiredReceipt) => {
+			if (!current()) return;
+			this.attempt = null;
+			// The old draft, version, baseline, encoding and authorization remain untouched.
+			publish({ receipt, receiptError: null, phase: "idle" });
+		};
+		publish({ checkingReceipt: true, receiptError: null });
+		this.receiptQuery = Promise.resolve()
+			.then(async () => {
+				try {
+					let upload: EditorUploadDescriptor | undefined;
+					if (!attempt.operationId) {
+						upload = await this.api.getUpload(this.options.narratorId, attempt.docId, uploadId);
+						if (!current()) return;
+						attempt.operationId = upload.operationId;
+					}
+					if (attempt.operationId) {
+						try {
+							// The receipt endpoint independently checks current narrator ACL and verified ownership.
+							const receipt = await this.api.operation(
+								this.options.narratorId,
+								attempt.operationId,
+							);
+							if (!current()) return;
+							if (
+								receipt.operationId !== attempt.operationId ||
+								(receipt.status === "saved" &&
+									(!receipt.result ||
+										receipt.result.operationId !== attempt.operationId ||
+										receipt.result.snapshotRevision !== attempt.version.revision))
+							)
+								throw new Error(
+									this.text(
+										"receiptMismatch",
+										"Save receipt revision does not match. Check the save result before retrying.",
+									),
+								);
+							if (receipt.status === "saved" || receipt.status === "failed") finish(receipt);
+							else publish({ receipt });
+							return;
+						} catch (error) {
+							if (!(error instanceof ApiError) || error.status !== 404) throw error;
+							if (!current()) return;
+						}
+					}
+					// Not-found alone is never success or proof of non-application. Old upload lookup
+					// and cancellation require current narrator ACL plus original transfer ownership;
+					// they cannot read or write a file under either execution binding.
+					upload ??= await this.api.getUpload(this.options.narratorId, attempt.docId, uploadId);
+					if (!current()) return;
+					const cancelled =
+						upload.state === "sealed" || upload.state === "uploading"
+							? ((await this.api.cancelUpload(this.options.narratorId, attempt.docId, uploadId)) as
+									| { state?: string }
+									| undefined)
+							: upload;
+					if (!current()) return;
+					if (cancelled?.state === "cancelled" || cancelled?.state === "expired")
+						finish({ status: "not-applied", operationId: attempt.operationId });
+					else
+						publish({
+							receiptError: this.text(
+								"verifyBeforeSaving",
+								"Save outcome needs verification. Do not submit another save.",
+							),
+						});
+				} catch (error) {
+					if (current()) publish({ receiptError: message(error) });
+				}
+			})
+			.finally(() => {
+				publish({ checkingReceipt: false });
+				this.receiptQuery = null;
+			});
+		return this.receiptQuery;
+	}
+	async reconcile() {
+		if (this.state.invalidated) return this.reconcileInvalidated();
+		const attempt = this.attempt;
+		if (!attempt || this.state.phase !== "unknown" || !attempt.uploadId || this.state.invalidated)
+			return;
 		try {
 			let upload: EditorUploadDescriptor | undefined;
 			if (!attempt.operationId) {
 				upload = await this.api.getUpload(this.options.narratorId, attempt.docId, attempt.uploadId);
-				if (this.attempt !== attempt || this.disposed) return;
+				if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 				attempt.operationId = upload.operationId;
 			}
 			if (attempt.operationId) {
 				try {
 					const operation = await this.api.operation(this.options.narratorId, attempt.operationId);
-					if (this.attempt !== attempt || this.disposed) return;
+					if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 					if (operation.status === "saved" && operation.result)
 						this.settle(operation.result, attempt);
 					else if (operation.status === "failed") {
@@ -528,11 +713,11 @@ export class EditorDocumentSession {
 					// IDs are preallocated: a missing operation may mean commit never arrived.
 					// It is not evidence of an untouched disk; only upload cancellation proves that.
 					if (!(error instanceof ApiError) || error.status !== 404) throw error;
-					if (this.attempt !== attempt || this.disposed) return;
+					if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 				}
 			}
 			upload ??= await this.api.getUpload(this.options.narratorId, attempt.docId, attempt.uploadId);
-			if (this.attempt !== attempt || this.disposed) return;
+			if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 			attempt.operationId = upload.operationId ?? attempt.operationId;
 			// sealed alone is not sufficient: atomically cancel before a delayed commit can win.
 			// A committing/settled response (including a cancellation race) must remain blocked.
@@ -544,7 +729,7 @@ export class EditorDocumentSession {
 							attempt.uploadId,
 						)) as { state?: string } | undefined)
 					: upload;
-			if (this.attempt !== attempt || this.disposed) return;
+			if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 			if (cancelled?.state === "cancelled" || cancelled?.state === "expired") {
 				this.cancel(true);
 				this.update({
@@ -619,7 +804,7 @@ export class EditorDocumentSession {
 	}
 	keepMine() {
 		const conflict = this.state.conflict;
-		if (!conflict || this.state.loading) return;
+		if (!conflict || this.state.loading || this.state.invalidated) return;
 		this.resetBaseline(null);
 		this.update({
 			baseHash: conflict.currentHash,
@@ -632,7 +817,7 @@ export class EditorDocumentSession {
 	}
 	async takeTheirs() {
 		const conflict = this.state.conflict;
-		if (!conflict || this.state.loading) return;
+		if (!conflict || this.state.loading || this.state.invalidated) return;
 		const revision = this.state.version?.revision;
 		this.loadController?.abort();
 		const controller = new AbortController();
@@ -661,6 +846,7 @@ export class EditorDocumentSession {
 				conflict: null,
 			});
 		} catch (error) {
+			if (this.loadController === controller && this.authorizationFailed(error)) return;
 			if (this.loadController === controller) this.update({ error: message(error) });
 		} finally {
 			if (this.loadController === controller) {

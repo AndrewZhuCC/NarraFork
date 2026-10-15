@@ -271,6 +271,51 @@ async function render(
 	});
 }
 
+test("external model is shared by independent views and never reset or disposed by view cleanup", async () => {
+	const shared = new Model("shared document");
+	const renderViews = async (left: boolean) =>
+		act(async () =>
+			root.render(
+				<MantineProvider forceColorScheme="dark">
+					{left && (
+						<MonacoEditor
+							key="left"
+							documentKey="shared"
+							filePath="a.ts"
+							initialValue="ignored"
+							model={shared as unknown as editor.ITextModel}
+						/>
+					)}
+					<MonacoEditor
+						key="right"
+						documentKey="shared"
+						filePath="a.ts"
+						initialValue="also ignored"
+						model={shared as unknown as editor.ITextModel}
+					/>
+				</MantineProvider>,
+			),
+		);
+	await renderViews(true);
+	expect(models).toHaveLength(0);
+	expect(views).toHaveLength(2);
+	expect(views[0].model).toBe(shared);
+	expect(views[1].model).toBe(shared);
+	views[0].setPosition({ lineNumber: 1, column: 2 });
+	views[1].setPosition({ lineNumber: 1, column: 4 });
+	expect(views[0].getSelection().startColumn).toBe(2);
+	expect(views[1].getSelection().startColumn).toBe(4);
+	await renderViews(false);
+	expect(views[0].disposed).toBe(true);
+	expect(views[1].disposed).toBe(false);
+	expect(shared.disposed).toBe(false);
+	expect(shared.setValue).not.toHaveBeenCalled();
+	await act(async () => root.render(null));
+	expect(shared.disposed).toBe(false);
+	expect(views[1].disposed).toBe(true);
+	shared.dispose();
+});
+
 test.each([
 	{
 		name: "light shorthand",

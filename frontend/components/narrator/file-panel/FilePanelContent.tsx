@@ -1,6 +1,7 @@
 import { Center, Loader } from "@mantine/core";
 import type { FileSelection, FileTarget } from "@shared/file-reference";
 import { lazy, Suspense } from "react";
+import { EditorRecoveryBoundary } from "../file-editor/EditorRecoveryBoundary";
 import type { FileEditorContentProps } from "../file-editor/FileEditorContent";
 import { getFilePreviewType } from "./FilePreviewModal";
 import { LargeFileGate } from "./LargeFileGate";
@@ -44,7 +45,8 @@ export function FilePanelContent({
 }: FilePanelContentProps) {
 	// Navigation updates the current document without discarding its unsaved draft.
 	const identity = JSON.stringify([narratorId, deviceId ?? "local", filePath]);
-	return (
+	const isText = getFilePreviewType(filePath) === "text";
+	const content = (
 		<Suspense
 			fallback={
 				<Center h="100%">
@@ -52,7 +54,7 @@ export function FilePanelContent({
 				</Center>
 			}
 		>
-			{getFilePreviewType(filePath) === "text" ? (
+			{isText ? (
 				<LargeFileGate
 					narratorId={narratorId}
 					deviceId={deviceId}
@@ -88,5 +90,17 @@ export function FilePanelContent({
 				/>
 			)}
 		</Suspense>
+	);
+	return isText ? (
+		<EditorRecoveryBoundary
+			filePath={filePath}
+			narratorId={narratorId}
+			deviceId={deviceId}
+			referenceOrigin={referenceOrigin}
+		>
+			{content}
+		</EditorRecoveryBoundary>
+	) : (
+		content
 	);
 }

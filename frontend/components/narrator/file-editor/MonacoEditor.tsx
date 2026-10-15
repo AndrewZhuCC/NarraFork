@@ -47,6 +47,8 @@ export interface MonacoDocumentStatus extends MonacoLanguageStatus {
 export interface MonacoEditorProps {
 	ref?: Ref<MonacoEditorHandle>;
 	initialValue: string;
+	/** Externally owned document: disposing this view must never dispose or reset it. */
+	model?: editor.ITextModel;
 	documentKey: string;
 	filePath: string;
 	onReady?: (handle: MonacoEditorHandle | null) => void;
@@ -97,7 +99,7 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 
 /** Monaco owns the only mutable document. Props are explicit loads, never controlled input echoes. */
 export function MonacoEditor(props: MonacoEditorProps) {
-	const { ref, documentKey } = props;
+	const { ref, documentKey, model: externalModel } = props;
 	const { t } = useTranslation("narrator");
 	const [longLineDocumentKey, setLongLineDocumentKey] = useState<string | null>(null);
 	const [fullLongLineDocumentKey, setFullLongLineDocumentKey] = useState<string | null>(null);
@@ -167,10 +169,11 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				path: `/${encodeURIComponent(documentKey)}/${encodeURIComponent(initial.filePath)}`,
 				query: createEditorLocalId(),
 			});
-			const model = api.editor.createModel(initial.initialValue, languageStatus.language, uri);
+			const model =
+				externalModel ?? api.editor.createModel(initial.initialValue, languageStatus.language, uri);
 			dispose = () => {
 				view.dispose();
-				model.dispose();
+				if (!externalModel) model.dispose();
 			};
 			const longLines = new MonacoLongLineTracker(model);
 			if (longLines.hasLongLine) view.updateOptions({ wordWrap: "off" });
@@ -238,7 +241,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					readyCallback = next.onReady;
 					readyCallback?.(handle);
 				}
-				if (loadedValue !== next.initialValue) {
+				if (!externalModel && loadedValue !== next.initialValue) {
 					loadedValue = next.initialValue;
 					model.setValue(next.initialValue);
 				}
@@ -426,7 +429,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				navigation.dispose();
 				runtime.current = null;
 				view.dispose();
-				model.dispose();
+				if (!externalModel) model.dispose();
 				readyCallback?.(null);
 			};
 			runtime.current = { api, view, model, sync };
@@ -445,7 +448,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			cancelled = true;
 			dispose?.();
 		};
-	}, [documentKey, handle]);
+	}, [documentKey, handle, externalModel]);
 
 	// No props are lifecycle dependencies: theme, preview and callback changes retain the model.
 	useEffect(() => {

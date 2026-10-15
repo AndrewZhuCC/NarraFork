@@ -10,6 +10,8 @@ import {
 	type EditorCommitResult,
 	type EditorDocumentDescriptor,
 	type EditorOperationResult,
+	type EditorRecoveryScope,
+	type EditorRecoveryScopeInput,
 	type EditorUploadDescriptor,
 } from "@shared/editor-document";
 import { ApiError, authorizedFetch, readFetchError } from "./client";
@@ -143,6 +145,18 @@ async function metadata<T>(
 }
 
 export const editorDocumentApi = {
+	recoveryScope(narratorId: string, input: EditorRecoveryScopeInput, signal?: AbortSignal) {
+		const query = new URLSearchParams({
+			deviceId: input.deviceId ?? "local",
+			origin: input.origin,
+		});
+		return metadata<EditorRecoveryScope>(
+			`${base(narratorId)}/recovery-scope?${query}`,
+			"GET",
+			undefined,
+			signal,
+		);
+	},
 	create(narratorId: string, input: CreateEditorDocumentInput, signal?: AbortSignal) {
 		return metadata<EditorDocumentDescriptor>(base(narratorId), "POST", input, signal);
 	},

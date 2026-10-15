@@ -8,6 +8,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type FilePanelReadOrigin, fileReferenceApi } from "../../../lib/api/file-references";
 import { formatLocaleNumber } from "../../../lib/intl-format";
+import { useEditorRecoveryHost } from "../file-editor/EditorRecoveryBoundary";
 
 export const FILE_PANEL_AUTO_LOAD_BYTES = 1024 * 1024;
 
@@ -75,6 +76,21 @@ function LargeFileResource({
 	const [info, setInfo] = useState<{ fileName: string; size: number } | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [retry, setRetry] = useState(0);
+	const recovery = useEditorRecoveryHost({ narratorId, deviceId, filePath, referenceOrigin });
+	const presentation = !narratorId
+		? "editor"
+		: error
+			? "blocked"
+			: !info
+				? "pending"
+				: filePanelLoadPolicy(info.size) === "auto"
+					? "editor"
+					: "blocked";
+	// This notification only coordinates cached recovery outside the gate. It never
+	// changes the size/read policy below or authorizes a current content load.
+	useEffect(() => {
+		recovery?.gate(presentation, retry);
+	}, [recovery, presentation, retry]);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: retry explicitly reissues the bounded request
 	useEffect(() => {
 		if (!narratorId) return;

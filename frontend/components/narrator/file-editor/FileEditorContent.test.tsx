@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { EditorCommitResult, EditorDocumentDescriptor } from "@shared/editor-document";
 import type { FileReferenceEditorSelection, FileSelection } from "@shared/file-reference";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DockviewApi, IDockviewPanelProps, SerializedDockview } from "dockview-react";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -36,14 +37,11 @@ import {
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import type { FilePanelParams } from "../panels/panel-kind";
 import { WorkspaceDockStore } from "../workspace/workspace-dock";
+import { editorDocumentRegistry } from "./editor-document-registry";
 import * as snapshots from "./editor-worker-client";
+import * as workingCopies from "./editor-working-copy";
 import { FileEditorContent, type FileEditorContentProps } from "./FileEditorContent";
-import {
-	mountedTestModels,
-	type TestEditorModel,
-	TestMonacoEditor,
-} from "./file-editor-test-model";
-
+import { mountedTestModels, TestEditorModel, TestMonacoEditor } from "./file-editor-test-model";
 // Only the Monaco browser boundary/worker transport and I/O are mocked. The real
 // component, session controller, dock ownership and preview renderer run below.
 // Real Monaco tokenization/navigation/IME/search are covered by the Chromium fixture.
@@ -82,6 +80,7 @@ const descriptor: EditorDocumentDescriptor = {
 let preview: ReturnType<typeof spyOn<typeof fileReferenceApi, "preview">>;
 let create: ReturnType<typeof spyOn<typeof editorDocumentApi, "create">>;
 let read: ReturnType<typeof spyOn<typeof editorDocumentApi, "source">>;
+let release: ReturnType<typeof spyOn<typeof editorDocumentApi, "release">>;
 let beginUpload: ReturnType<typeof spyOn<typeof editorDocumentApi, "createUpload">>;
 let upload: ReturnType<typeof spyOn<typeof editorDocumentApi, "upload">>;
 let commit: ReturnType<typeof spyOn<typeof editorDocumentApi, "commit">>;
@@ -143,6 +142,11 @@ beforeEach(async () => {
 			resources: { en: { narrator: en } },
 			react: { useSuspense: false },
 		});
+	const factory = spyOn(workingCopies, "createWorkingCopyModel").mockImplementation(
+		async (filePath, documentKey) =>
+			new TestEditorModel({ filePath, documentKey, initialValue: "" }).getModel(),
+	);
+	restores.push(() => factory.mockRestore());
 	const monaco = spyOn(monacoComponent, "MonacoEditor").mockImplementation(TestMonacoEditor);
 	const search = spyOn(searchComponent, "MonacoSearchPanel").mockImplementation(({ readOnly }) => (
 		<div data-editor-search-panel data-read-only={readOnly} />
@@ -185,7 +189,7 @@ beforeEach(async () => {
 		snapshotRevision: uploadedRevision,
 	}));
 	legacyWrite = spyOn(api, "fsWrite").mockRejectedValue(new Error("Legacy writes are forbidden"));
-	const release = spyOn(editorDocumentApi, "release").mockResolvedValue({});
+	release = spyOn(editorDocumentApi, "release").mockResolvedValue({});
 	const cancel = spyOn(editorDocumentApi, "cancelUpload").mockResolvedValue({ state: "cancelled" });
 	const encoder = spyOn(snapshots, "encodeEditorSnapshot").mockImplementation(
 		async (snapshot, signal) => {
@@ -591,6 +595,11 @@ for (const surface of ["focus", "workspace"] as const)
 		});
 
 test("StrictMode effect replay still loads an editable session and releases abandoned authorization", async () => {
+	create.mockImplementation(async () => ({
+		...descriptor,
+		docId: `strict-${create.mock.calls.length}`,
+		resourceKey: "strict-scope",
+	}));
 	await act(async () =>
 		root?.render(
 			<StrictMode>
@@ -604,19 +613,521 @@ test("StrictMode effect replay still loads an editable session and releases aban
 	);
 	const model = [...mountedTestModels.values()][0];
 	expect(model?.text).toBe("a\nb\n");
+	expect(create).toHaveBeenCalledTimes(2);
+	expect(read).toHaveBeenCalledTimes(1);
+	expect(workingCopies.createWorkingCopyModel).toHaveBeenCalledTimes(1);
+	expect(release).toHaveBeenCalledWith("child", "strict-1");
 	await edit(model, "strict draft");
 	await click(iconButton("device-floppy"));
 	expect(await upload.mock.calls[0]?.[3].text()).toBe("strict draft");
 	expect(beginUpload.mock.calls[0]?.[0]).toBe("child");
+	await act(async () => root?.render(null));
+	expect(model.disposed).toBe(true);
+	expect(release).toHaveBeenCalledWith("child", "strict-2");
 });
 
-test("model identity includes source narrator and canonical authorized path", async () => {
+for (const currentFailure of ["none", "deleted", "forbidden"] as const)
+	test(`reopening after scope invalidation exposes authorized recovery when current create is ${currentFailure}`, async () => {
+		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		client.setQueryData(["auth", "me"], { id: "receipt-user" });
+		client.setQueryData(["workspaceContext", "receipt-source"], { contextKey: "old", revision: 1 });
+		const discovery = spyOn(editorDocumentApi, "recoveryScope").mockResolvedValue({
+			recoveryKey: "receipt-user-scope",
+		});
+		restores.push(() => discovery.mockRestore());
+		create.mockResolvedValue({
+			...descriptor,
+			docId: "old-receipt-doc",
+			resourceKey: "old-receipt-context",
+			recoveryKey: "receipt-user-scope",
+		});
+		const pending = deferred<EditorCommitResult>();
+		commit.mockReturnValue(pending.promise);
+		const receipt = spyOn(editorDocumentApi, "operation").mockResolvedValue({
+			status: "uncertain",
+			operationId: "old-operation",
+		});
+		restores.push(() => receipt.mockRestore());
+		const renderEditor = async () =>
+			act(async () =>
+				root?.render(
+					<QueryClientProvider client={client}>
+						<I18nextProvider i18n={i18n}>
+							<MantineProvider env="test">
+								<FileEditorContent
+									filePath="/work/receipt.txt"
+									narratorId="receipt-source"
+									referenceOrigin
+								/>
+							</MantineProvider>
+						</I18nextProvider>
+					</QueryClientProvider>,
+				),
+			);
+		await renderEditor();
+		const old = [...mountedTestModels.values()][0];
+		await edit(old, "retained unsaved body");
+		await click(iconButton("device-floppy"));
+		expect(commit).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			client.setQueryData(["workspaceContext", "receipt-source"], {
+				contextKey: "new",
+				revision: 2,
+			});
+		});
+		await act(async () => root?.render(null));
+		await act(async () => {
+			pending.resolve({
+				status: "saved",
+				operationId: "old-operation",
+				hash: "old-save-hash",
+				snapshotRevision: old.revision,
+				bytes: 21,
+			});
+		});
+		receipt.mockResolvedValue({
+			status: "saved",
+			operationId: "old-operation",
+			result: {
+				status: "saved",
+				operationId: "old-operation",
+				hash: "old-save-hash",
+				snapshotRevision: old.revision,
+				bytes: 21,
+			},
+		});
+		if (currentFailure === "none")
+			create.mockResolvedValue({
+				...descriptor,
+				docId: "new-receipt-doc",
+				resourceKey: "new-receipt-context",
+				recoveryKey: "receipt-user-scope",
+			});
+		else
+			create.mockRejectedValue(
+				new ApiError(currentFailure, currentFailure === "deleted" ? 404 : 403),
+			);
+		await renderEditor();
+		const current = [...mountedTestModels.values()][0];
+		expect(host.querySelector("[data-editor-retained-draft]")).not.toBeNull();
+		expect(discovery).toHaveBeenCalledWith(
+			"receipt-source",
+			{ deviceId: "local", origin: "reference" },
+			expect.any(AbortSignal),
+		);
+		if (currentFailure === "none") {
+			expect(current).not.toBe(old);
+			expect(current.text).toBe("a\nb\n");
+		} else {
+			expect(current).toBeUndefined();
+			expect(host.textContent).toContain(currentFailure);
+		}
+		expect(receipt).not.toHaveBeenCalled();
+		const check = [
+			...host.querySelectorAll<HTMLButtonElement>("[data-editor-retained-draft] button"),
+		].find((button) => button.textContent === en["fileEditor.checkSave"]);
+		expect(check).toBeDefined();
+		await click(check as HTMLButtonElement);
+		expect(receipt).toHaveBeenCalledWith("receipt-source", "old-operation");
+		expect(host.querySelector('[data-editor-retired-receipt="saved"]')).not.toBeNull();
+		expect(old.text).toBe("retained unsaved body");
+		expect(old.disposed).toBe(false);
+		if (current) {
+			expect(current.text).toBe("a\nb\n");
+			expect(current.props.readOnly).toBe(false);
+		}
+		const saveDraft = spyOn(fileDownload, "saveBlobAsFile").mockImplementation(() => {});
+		restores.push(() => saveDraft.mockRestore());
+		const download = [
+			...host.querySelectorAll<HTMLButtonElement>("[data-editor-retained-draft] button"),
+		].find((button) => button.textContent === en["fileEditor.downloadRetainedDraft"]);
+		await click(download as HTMLButtonElement);
+		expect(await saveDraft.mock.calls[0]?.[0].text()).toBe("retained unsaved body");
+		const discard = [
+			...host.querySelectorAll<HTMLButtonElement>("[data-editor-retained-draft] button"),
+		].find((button) => button.textContent === en["fileEditor.discardRetainedDraft"]);
+		confirmReload.mockReturnValue(false);
+		await click(discard as HTMLButtonElement);
+		expect(old.disposed).toBe(false);
+		expect(host.querySelector("[data-editor-retained-draft]")).not.toBeNull();
+		confirmReload.mockReturnValue(true);
+		await click(discard as HTMLButtonElement);
+		expect(old.disposed).toBe(true);
+		if (current) {
+			expect(current.disposed).toBe(false);
+			expect(current.text).toBe("a\nb\n");
+		}
+		expect(host.querySelector("[data-editor-retained-draft]")).toBeNull();
+		expect(commit).toHaveBeenCalledTimes(1);
+		await act(async () => root?.render(null));
+		client.clear();
+	});
+
+async function renderRecoveryFile(filePath: string, narratorId: string) {
+	await act(async () =>
+		root?.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<FileEditorContent filePath={filePath} narratorId={narratorId} referenceOrigin />
+				</MantineProvider>
+			</I18nextProvider>,
+		),
+	);
+}
+
+for (const access of ["different-user", "revoked"] as const)
+	test(`failed current create never exposes a retained draft when independent recovery is ${access}`, async () => {
+		const narratorId = `recovery-${access}`;
+		const filePath = `/work/${narratorId}.txt`;
+		create.mockResolvedValue({
+			...descriptor,
+			resourceKey: `${narratorId}-original`,
+			recoveryKey: `${narratorId}-owner`,
+			target: { deviceId: "local", path: filePath },
+		});
+		const proof = spyOn(editorDocumentApi, "recoveryScope");
+		restores.push(() => proof.mockRestore());
+		if (access === "revoked") proof.mockRejectedValue(new ApiError("Recovery denied", 403));
+		else proof.mockResolvedValue({ recoveryKey: "another-owner" });
+		await renderRecoveryFile(filePath, narratorId);
+		const old = [...mountedTestModels.values()][0];
+		await edit(old, "PRIVATE RETAINED DRAFT");
+		await act(async () => root?.render(null));
+		create.mockRejectedValue(new ApiError("Current file refused", 403));
+		await renderRecoveryFile(filePath, narratorId);
+		expect(proof).toHaveBeenCalledTimes(1);
+		expect(host.querySelector("[data-editor-retained-draft]")).toBeNull();
+		expect(mountedTestModels.size).toBe(0);
+		expect(host.textContent).not.toContain("PRIVATE RETAINED DRAFT");
+		expect(host.textContent).not.toContain(en["fileEditor.downloadRetainedDraft"]);
+		expect(old.text).toBe("PRIVATE RETAINED DRAFT");
+		expect(old.disposed).toBe(false);
+	});
+
+test("late independent recovery proof cannot expose the old draft after the panel changes path", async () => {
+	const narratorId = "recovery-late-panel";
+	const oldPath = "/work/old-private.txt";
+	const nextPath = "/work/new-file.txt";
+	let refused = false;
+	create.mockImplementation(async (_narrator, input) => {
+		if (refused && input.path === oldPath) throw new ApiError("Old path refused", 403);
+		return {
+			...descriptor,
+			resourceKey: `${narratorId}:${input.path}`,
+			recoveryKey: "late-panel-owner",
+			target: { deviceId: "local", path: input.path },
+		};
+	});
+	const pending = deferred<{ recoveryKey: string }>();
+	const proof = spyOn(editorDocumentApi, "recoveryScope").mockReturnValue(pending.promise);
+	restores.push(() => proof.mockRestore());
+	await renderRecoveryFile(oldPath, narratorId);
+	const old = [...mountedTestModels.values()][0];
+	await edit(old, "PRIVATE LATE DRAFT");
+	await act(async () => root?.render(null));
+	refused = true;
+	await renderRecoveryFile(oldPath, narratorId);
+	expect(proof).toHaveBeenCalledTimes(1);
+	await renderRecoveryFile(nextPath, narratorId);
+	await act(async () => {
+		pending.resolve({ recoveryKey: "late-panel-owner" });
+	});
+	expect(proof.mock.calls[0]?.[2]?.aborted).toBe(true);
+	expect(host.querySelector("[data-editor-retained-draft]")).toBeNull();
+	const current = [...mountedTestModels.values()][0];
+	expect(current.text).toBe("a\nb\n");
+	expect(current.props.filePath).toBe(nextPath);
+	expect(old.text).toBe("PRIVATE LATE DRAFT");
+	expect(old.disposed).toBe(false);
+});
+
+for (const hostKind of ["file-panel", "standalone"] as const)
+	for (const infoFailure of ["deleted", "denied", "revoked"] as const)
+		test(`real ${hostKind} host recovers an owned draft outside a LargeFileGate whose info is ${infoFailure}`, async () => {
+			const { FilePanelContent } = await import("../file-panel/FilePanelContent");
+			const router = await import("@tanstack/react-router");
+			const windowLayout = await import("../../StandaloneWindowLayout");
+			const ws = await import("../../../lib/narrator-ws-manager");
+			const navigate = spyOn(router, "useNavigate").mockImplementation(() => async () => {});
+			const title = spyOn(windowLayout, "useStandaloneWindowTitle").mockImplementation(() => {});
+			const connect = spyOn(ws.narratorWSManager, "connect").mockImplementation(() => {});
+			const disconnect = spyOn(ws.narratorWSManager, "disconnect").mockImplementation(() => {});
+			restores.push(
+				() => navigate.mockRestore(),
+				() => title.mockRestore(),
+				() => connect.mockRestore(),
+				() => disconnect.mockRestore(),
+			);
+			const { StandalonePanelWindow } = await import("../../window/StandalonePanelWindow");
+			const narratorId = `host-${hostKind}-${infoFailure}`;
+			const filePath = `/work/${narratorId}.txt`;
+			const client = new QueryClient({
+				defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+			});
+			for (const id of [narratorId, "display-host"])
+				client.setQueryData(["narrators", id], { id, title: id });
+			const info = spyOn(fileReferenceApi, "info").mockResolvedValue({
+				target: { deviceId: "local", path: filePath },
+				fileName: "host.txt",
+				size: 12,
+			});
+			const page = spyOn(fileReferenceApi, "page").mockRejectedValue(
+				new Error("Failed gate must not read pages"),
+			);
+			restores.push(() => page.mockRestore());
+			const discovery = spyOn(editorDocumentApi, "recoveryScope").mockResolvedValue({
+				recoveryKey: `${narratorId}-owner`,
+			});
+			restores.push(() => discovery.mockRestore());
+			create.mockResolvedValue({
+				...descriptor,
+				docId: `${narratorId}-doc`,
+				resourceKey: `${narratorId}-resource`,
+				recoveryKey: `${narratorId}-owner`,
+				target: { deviceId: "local", path: filePath },
+			});
+			const pending = deferred<EditorCommitResult>();
+			commit.mockReturnValue(pending.promise);
+			const receipt = spyOn(editorDocumentApi, "operation").mockImplementation(async () => ({
+				status: "saved",
+				operationId: `${narratorId}-operation`,
+				result: {
+					status: "saved",
+					operationId: `${narratorId}-operation`,
+					hash: "saved",
+					snapshotRevision: uploadedRevision,
+					bytes: 19,
+				},
+			}));
+			restores.push(() => receipt.mockRestore());
+			const renderHost = async () =>
+				act(async () =>
+					root?.render(
+						<QueryClientProvider client={client}>
+							<I18nextProvider i18n={i18n}>
+								<MantineProvider env="test">
+									{hostKind === "file-panel" ? (
+										<FilePanelContent filePath={filePath} narratorId={narratorId} referenceOrigin />
+									) : (
+										<StandalonePanelWindow
+											descriptor={{
+												panelType: "file",
+												filePath,
+												fileNarratorId: narratorId,
+												hostNarratorId: "display-host",
+												referenceOrigin: true,
+											}}
+										/>
+									)}
+								</MantineProvider>
+							</I18nextProvider>
+						</QueryClientProvider>,
+					),
+				);
+			await renderHost();
+			const old = [...mountedTestModels.values()][0];
+			expect(old).toBeDefined();
+			await edit(old, "PRIVATE HOST DRAFT");
+			await click(iconButton("device-floppy"));
+			await act(async () => root?.render(null));
+			info.mockRejectedValue(
+				new ApiError(`Host info ${infoFailure}`, infoFailure === "deleted" ? 404 : 403),
+			);
+			if (infoFailure === "revoked")
+				discovery.mockRejectedValue(new ApiError("Recovery ACL revoked", 403));
+			create.mockRejectedValue(new Error("Gate must not create a current document"));
+			await renderHost();
+			expect(info).toHaveBeenCalledTimes(2);
+			expect(info.mock.calls[1]?.[0]).toBe(narratorId);
+			expect(host.textContent).toContain(`Host info ${infoFailure}`);
+			if (infoFailure === "revoked") {
+				expect(host.querySelector("[data-editor-retained-draft]")).toBeNull();
+				expect(host.textContent).not.toContain(en["fileEditor.downloadRetainedDraft"]);
+				expect(discovery).toHaveBeenCalledTimes(1);
+				expect(create).toHaveBeenCalledTimes(1);
+				expect(read).toHaveBeenCalledTimes(1);
+				expect(page).not.toHaveBeenCalled();
+				await act(async () =>
+					pending.resolve({
+						status: "saved",
+						operationId: `${narratorId}-operation`,
+						hash: "saved",
+						snapshotRevision: uploadedRevision,
+						bytes: 19,
+					}),
+				);
+				expect(receipt).not.toHaveBeenCalled();
+				expect(old.text).toBe("PRIVATE HOST DRAFT");
+				expect(old.disposed).toBe(false);
+				await act(async () => root?.render(null));
+				client.clear();
+				return;
+			}
+			expect(host.querySelector("[data-editor-retained-draft]")).not.toBeNull();
+			expect(discovery).toHaveBeenCalledTimes(1);
+			expect(discovery.mock.calls[0]?.[0]).toBe(narratorId);
+			const retainedEntry = [
+				...(Reflect.get(editorDocumentRegistry, "entries") as Set<{
+					copy: workingCopies.EditorWorkingCopy;
+					references: number;
+					viewReferences: number;
+				}>),
+			].find((entry) => entry.copy.model === old.getModel());
+			expect(retainedEntry?.references).toBe(1);
+			expect(retainedEntry?.viewReferences).toBe(0);
+			expect(workingCopies.createWorkingCopyModel).toHaveBeenCalledTimes(1);
+			expect(create).toHaveBeenCalledTimes(1);
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(page).not.toHaveBeenCalled();
+			expect(mountedTestModels.size).toBe(0);
+			await act(async () =>
+				pending.resolve({
+					status: "saved",
+					operationId: `${narratorId}-operation`,
+					hash: "saved",
+					snapshotRevision: uploadedRevision,
+					bytes: 19,
+				}),
+			);
+			expect(receipt).not.toHaveBeenCalled();
+			const check = [
+				...host.querySelectorAll<HTMLButtonElement>("[data-editor-retained-draft] button"),
+			].find((button) => button.textContent === en["fileEditor.checkSave"]);
+			expect(check).toBeDefined();
+			await click(check as HTMLButtonElement);
+			expect(receipt).toHaveBeenCalledTimes(1);
+			expect(host.querySelector('[data-editor-retired-receipt="saved"]')).not.toBeNull();
+			expect(old.text).toBe("PRIVATE HOST DRAFT");
+			const downloaded = spyOn(fileDownload, "saveBlobAsFile").mockImplementation(() => {});
+			restores.push(() => downloaded.mockRestore());
+			const download = [
+				...host.querySelectorAll<HTMLButtonElement>("[data-editor-retained-draft] button"),
+			].find((button) => button.textContent === en["fileEditor.downloadRetainedDraft"]);
+			await click(download as HTMLButtonElement);
+			expect(await downloaded.mock.calls[0]?.[0].text()).toBe("PRIVATE HOST DRAFT");
+			const discard = [
+				...host.querySelectorAll<HTMLButtonElement>("[data-editor-retained-draft] button"),
+			].find((button) => button.textContent === en["fileEditor.discardRetainedDraft"]);
+			await click(discard as HTMLButtonElement);
+			expect(old.disposed).toBe(true);
+			expect(commit).toHaveBeenCalledTimes(1);
+			expect(host.querySelector("[data-editor-retained-draft]")).toBeNull();
+			await act(async () => root?.render(null));
+			client.clear();
+		});
+
+test("real FilePanelContent normal reopen has one recovery discovery and reuses the dirty model and undo", async () => {
+	const { FilePanelContent } = await import("../file-panel/FilePanelContent");
+	create.mockImplementation(async () => ({
+		...descriptor,
+		docId: `normal-host-${create.mock.calls.length}`,
+		resourceKey: "normal-host-resource",
+		recoveryKey: "normal-host-owner",
+	}));
+	const discovery = spyOn(editorDocumentApi, "recoveryScope").mockResolvedValue({
+		recoveryKey: "normal-host-owner",
+	});
+	restores.push(() => discovery.mockRestore());
+	const renderHost = async () =>
+		act(async () =>
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<FilePanelContent
+							filePath="/work/normal-host.txt"
+							narratorId="normal-host-source"
+							referenceOrigin
+						/>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
+		);
+	await renderHost();
+	const old = [...mountedTestModels.values()][0];
+	await edit(old, "same dirty draft");
+	await act(async () => root?.render(null));
+	await renderHost();
+	const current = [...mountedTestModels.values()][0];
+	expect(current).toBe(old);
+	expect(current.text).toBe("same dirty draft");
+	expect(current.props.readOnly).toBe(false);
+	expect(host.querySelector("[data-editor-retained-draft]")).toBeNull();
+	expect(discovery).toHaveBeenCalledTimes(1);
+	expect(create).toHaveBeenCalledTimes(2);
+	expect(read).toHaveBeenCalledTimes(1);
+	expect(workingCopies.createWorkingCopyModel).toHaveBeenCalledTimes(1);
+	await act(async () => current.undo());
+	expect(current.text).toBe("a\nb\n");
+	await act(async () => root?.render(null));
+	expect(current.disposed).toBe(true);
+});
+
+test("execution context changes visibly freeze the old dirty model without loading a new scope", async () => {
+	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	client.setQueryData(["auth", "me"], { id: "verified-user" });
+	client.setQueryData(["workspaceContext", "child"], { contextKey: "scope-a", revision: 1 });
+	await act(async () =>
+		root?.render(
+			<QueryClientProvider client={client}>
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<FileEditorContent filePath="/work/a.txt" narratorId="child" referenceOrigin />
+					</MantineProvider>
+				</I18nextProvider>
+			</QueryClientProvider>,
+		),
+	);
+	const model = [...mountedTestModels.values()][0];
+	await edit(model, "old-context-draft");
+	await act(async () => {
+		client.setQueryData(["workspaceContext", "child"], { contextKey: "scope-b", revision: 2 });
+	});
+	expect(model.text).toBe("old-context-draft");
+	expect(model.props.readOnly).toBe(true);
+	expect(host.textContent).toContain(en["fileEditor.identityChanged"]);
+	expect(create).toHaveBeenCalledTimes(1);
+	expect(model.disposed).toBe(false);
+	await act(async () => root?.render(null));
+	client.clear();
+});
+
+test("a principal cache switch authorizes a new consumer without exposing or disposing the prior dirty draft", async () => {
+	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	client.setQueryData(["auth", "me"], { id: "first-user" });
+	await act(async () =>
+		root?.render(
+			<QueryClientProvider client={client}>
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<FileEditorContent filePath="/work/a.txt" narratorId="child" referenceOrigin />
+					</MantineProvider>
+				</I18nextProvider>
+			</QueryClientProvider>,
+		),
+	);
+	const model = [...mountedTestModels.values()][0];
+	await edit(model, "first-user-draft");
+	await act(async () => {
+		client.setQueryData(["auth", "me"], { id: "second-user" });
+	});
+	const current = [...mountedTestModels.values()][0];
+	expect(current).not.toBe(model);
+	expect(current.text).toBe("a\nb\n");
+	expect(model.text).toBe("first-user-draft");
+	expect(model.disposed).toBe(false);
+	expect(create).toHaveBeenCalledTimes(2);
+	await act(async () => root?.render(null));
+	client.clear();
+});
+
+test("model identity uses the server-authorized opaque resource rather than a client path", async () => {
 	create.mockResolvedValue({
 		...descriptor,
+		resourceKey: "authorized-child-canonical-scope",
 		target: { deviceId: "local", path: "/canonical/a.txt" },
 	});
 	const model = await mount({ filePath: "/alias/a.txt", narratorId: "child" });
-	expect(JSON.parse(model.props.documentKey)).toEqual(["child", "local", "/canonical/a.txt"]);
+	expect(model.props.documentKey).toBe("authorized-child-canonical-scope");
 });
 
 test("large conflicts use bounded immutable prefixes and worker diff, never truncate the draft", async () => {
@@ -803,13 +1314,15 @@ test("local legacy-origin narrator files still use the authorized large-file ses
 	expect(legacyWrite).not.toHaveBeenCalled();
 });
 
-test("reference upgrade does not reload a reused dirty model", async () => {
+test("reference upgrade creates a new authority without rebinding or discarding the old dirty model", async () => {
 	const model = await mount({ referenceOrigin: false });
 	await edit(model, "draft");
-	expect(await mount({ referenceOrigin: true })).toBe(model);
-	expect(create).toHaveBeenCalledTimes(1);
+	const referenceModel = await mount({ referenceOrigin: true });
+	expect(referenceModel).not.toBe(model);
+	expect(create).toHaveBeenCalledTimes(2);
 	expect(model.text).toBe("draft");
-	await click(iconButton("refresh"));
+	expect(model.disposed).toBe(false);
+	expect(referenceModel.text).toBe("a\nb\n");
 	expect(create.mock.calls[1]?.[1].origin).toBe("reference");
 });
 

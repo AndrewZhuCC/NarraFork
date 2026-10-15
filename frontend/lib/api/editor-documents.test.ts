@@ -115,6 +115,24 @@ describe("bounded editor document transport", () => {
 			origin: "reference",
 		});
 	});
+	test("recovery discovery requests only an authorized owner scope without a current file path or body", async () => {
+		let sent = "";
+		let request: RequestInit | undefined;
+		mockFetch((url, options) => {
+			sent = url;
+			request = options;
+			return Response.json({ recoveryKey: "owner-proof" });
+		});
+		expect(
+			await editorDocumentApi.recoveryScope("child/id", { deviceId: "local", origin: "reference" }),
+		).toEqual({ recoveryKey: "owner-proof" });
+		expect(sent).toContain("/api/narrators/child%2Fid/editor-documents/recovery-scope?");
+		const query = new URL(sent, "http://localhost").searchParams;
+		expect([...query.keys()].sort()).toEqual(["deviceId", "origin"]);
+		expect(query.get("deviceId")).toBe("local");
+		expect(query.get("origin")).toBe("reference");
+		expect(request?.body).toBeUndefined();
+	});
 	test("source requests an immutable version and returns plain text instead of JSON", async () => {
 		let sent = "";
 		mockFetch((url) => {

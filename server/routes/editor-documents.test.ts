@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -143,6 +143,266 @@ function bindChapter(
 		.run();
 	return { chapterId, projectId };
 }
+
+test("resource keys distinguish origin and execution revision even when the absolute path and cwd are unchanged", async () => {
+	const legacy = await openDoc("legacy");
+	const repeated = await openDoc("legacy");
+	const reference = await openDoc("reference");
+	expect(legacy.resourceKey).toMatch(/^[a-f0-9]{64}$/);
+	expect(repeated.resourceKey).toBe(legacy.resourceKey);
+	expect(repeated.docId).not.toBe(legacy.docId);
+	expect(reference.resourceKey).not.toBe(legacy.resourceKey);
+	db.update(narrators).set({ workspaceRevision: 1 }).where(eq(narrators.id, narratorId)).run();
+	const response = await request(
+		`${base()}/${legacy.docId}/content?version=${legacy.versionHandle}`,
+	);
+	expect(response.status).toBe(403);
+	expect(await response.json()).toMatchObject({ code: "EDITOR_IDENTITY_CHANGED" });
+	const current = await openDoc("legacy");
+	expect(current.resourceKey).not.toBe(legacy.resourceKey);
+	expect(legacy.recoveryKey).toMatch(/^[a-f0-9]{64}$/);
+	expect(current.recoveryKey).toBe(legacy.recoveryKey);
+	expect(reference.recoveryKey).not.toBe(legacy.recoveryKey);
+	expect(await readFile(path, "utf8")).toBe("original\r\n");
+});
+
+for (const failure of ["deleted", "path-denied"] as const)
+	test(`independent recovery discovery authorizes only the original owner when current file create is ${failure}`, async () => {
+		const doc = await openDoc("reference");
+		const sealed = await seal(doc);
+		const commit = await request(`${sealed.url}/commit`, "POST", {});
+		expect(commit.status).toBe(200);
+		const saved = await commit.json();
+		if (failure === "deleted") await rm(path);
+		else {
+			const restricted = join(root, "restricted");
+			await mkdir(restricted);
+			db.update(narrators)
+				.set({ cwd: restricted, workspaceRevision: 1 })
+				.where(eq(narrators.id, narratorId))
+				.run();
+		}
+		expect(
+			(await request(base(), "POST", { path, origin: "reference", deviceId: "local" })).status,
+		).toBeGreaterThanOrEqual(400);
+		expect((await request(`${base()}/${doc.docId}`, "DELETE")).status).toBe(200);
+		const endpoint = `${base()}/recovery-scope?origin=reference&deviceId=local`;
+		const proof = await request(endpoint);
+		expect(proof.status).toBe(200);
+		expect(await proof.json()).toEqual({ recoveryKey: doc.recoveryKey });
+		const receipt = await request(
+			`/api/narrators/${narratorId}/editor-operations/${saved.operationId}`,
+		);
+		expect(receipt.status).toBe(200);
+		expect(await receipt.json()).toMatchObject({ status: "saved" });
+		const other = generateId();
+		db.insert(users)
+			.values({
+				id: other,
+				username: other,
+				passwordHash: "x",
+				role: "user",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId)).run();
+		tokenUser = other;
+		const foreign = await request(endpoint);
+		expect(foreign.status).toBe(200);
+		expect((await foreign.json()).recoveryKey).not.toBe(doc.recoveryKey);
+		expect(
+			(await request(`/api/narrators/${narratorId}/editor-operations/${saved.operationId}`)).status,
+		).toBe(404);
+		db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId)).run();
+		const revoked = await request(endpoint);
+		expect(revoked.status).toBe(404);
+		expect(await revoked.json()).not.toHaveProperty("recoveryKey");
+	});
+
+test("independent recovery scope accepts no path, principal hint or unbounded device metadata", async () => {
+	for (const query of [
+		"deviceId=local",
+		"origin=unknown",
+		"origin=reference&path=%2Fsecret",
+		"origin=reference&userId=forged",
+		`origin=reference&deviceId=${"x".repeat(129)}`,
+	])
+		expect((await request(`${base()}/recovery-scope?${query}`)).status).toBe(400);
+	const result = await request(`${base()}/recovery-scope?origin=legacy&deviceId=local`);
+	expect(result.status).toBe(200);
+	expect(result.headers.get("Cache-Control")).toBe("no-store");
+	expect(Object.keys(await result.json())).toEqual(["recoveryKey"]);
+});
+
+test("old operation receipts remain explicitly queryable after a context switch, but require current ACL and original verified ownership", async () => {
+	const doc = await openDoc();
+	const sealed = await seal(doc);
+	const committed = await request(`${sealed.url}/commit`, "POST", {});
+	expect(committed.status).toBe(200);
+	const saved = await committed.json();
+	db.update(narrators).set({ workspaceRevision: 1 }).where(eq(narrators.id, narratorId)).run();
+	const receiptUrl = `/api/narrators/${narratorId}/editor-operations/${saved.operationId}`;
+	const receipt = await request(receiptUrl);
+	expect(receipt.status).toBe(200);
+	expect(await receipt.json()).toMatchObject({
+		status: "saved",
+		operationId: saved.operationId,
+		result: { snapshotRevision: 123 },
+	});
+	const other = generateId();
+	db.insert(users)
+		.values({
+			id: other,
+			username: other,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId)).run();
+	tokenUser = other;
+	expect((await request(receiptUrl)).status).toBe(404);
+	db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId)).run();
+	expect((await request(receiptUrl)).status).toBe(404);
+});
+
+test("receipt authorization is rechecked after a queued lookup before publishing saved metadata", async () => {
+	const doc = await openDoc();
+	const sealed = await seal(doc);
+	const committed = await request(`${sealed.url}/commit`, "POST", {});
+	const saved = await committed.json();
+	const other = generateId();
+	db.insert(users)
+		.values({
+			id: other,
+			username: other,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	let entered!: () => void;
+	let resume!: () => void;
+	const entering = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const resuming = new Promise<void>((resolve) => {
+		resume = resolve;
+	});
+	const operation = service.operation.bind(service);
+	const lookup = spyOn(service, "operation").mockImplementation(async (...args) => {
+		const receipt = await operation(...args);
+		entered();
+		await resuming;
+		return receipt;
+	});
+	const pending = request(`/api/narrators/${narratorId}/editor-operations/${saved.operationId}`);
+	try {
+		await entering;
+		db.update(narrators).set({ ownerUserId: other }).where(eq(narrators.id, narratorId)).run();
+		resume();
+		const response = await pending;
+		expect(response.status).toBe(404);
+		expect(await response.json()).not.toHaveProperty("result");
+	} finally {
+		resume();
+		await pending;
+		lookup.mockRestore();
+	}
+});
+
+test("retired private upload metadata can prove non-application and release resources without restoring file access", async () => {
+	const doc = await openDoc();
+	const sealed = await seal(doc);
+	db.update(narrators).set({ workspaceRevision: 1 }).where(eq(narrators.id, narratorId)).run();
+	expect((await request(`${sealed.url}/commit`, "POST", {})).status).toBe(403);
+	const status = await request(sealed.url);
+	expect(status.status).toBe(200);
+	expect(await status.json()).toMatchObject({ state: "sealed" });
+	const cancelled = await request(sealed.url, "DELETE");
+	expect(cancelled.status).toBe(200);
+	expect(await cancelled.json()).toMatchObject({ state: "cancelled" });
+	expect(
+		(await request(`${base()}/${doc.docId}/content?version=${doc.versionHandle}`)).status,
+	).toBe(403);
+	const other = generateId();
+	db.insert(users)
+		.values({
+			id: other,
+			username: other,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId)).run();
+	tokenUser = other;
+	for (const [url, method] of [
+		[sealed.url, "GET"],
+		[sealed.url, "DELETE"],
+		[`${base()}/${doc.docId}`, "DELETE"],
+	])
+		expect((await request(url, method)).status).toBe(410);
+	tokenUser = userId;
+	expect((await request(`${base()}/${doc.docId}`, "DELETE")).status).toBe(200);
+	expect(await readFile(path, "utf8")).toBe("original\r\n");
+});
+
+test("replacing an execution root at the same path invalidates its old resource binding", async () => {
+	const first = await openDoc();
+	const previousRoot = `${root}-previous`;
+	await rename(root, previousRoot);
+	try {
+		await mkdir(root);
+		await writeFile(path, "original\r\n");
+		const response = await request(
+			`${base()}/${first.docId}/content?version=${first.versionHandle}`,
+		);
+		expect(response.status).toBe(403);
+		expect(await response.json()).toMatchObject({ code: "EDITOR_IDENTITY_CHANGED" });
+		expect((await openDoc()).resourceKey).not.toBe(first.resourceKey);
+	} finally {
+		await rm(previousRoot, { recursive: true, force: true });
+	}
+});
+
+test("the verified principal separates public narrator resources and cannot adopt another user's session", async () => {
+	db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId)).run();
+	const first = await openDoc();
+	const other = generateId();
+	db.insert(users)
+		.values({
+			id: other,
+			username: other,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	tokenUser = other;
+	const second = await openDoc();
+	expect(second.resourceKey).not.toBe(first.resourceKey);
+	expect(second.recoveryKey).not.toBe(first.recoveryKey);
+	expect(
+		(await request(`${base()}/${first.docId}/content?version=${first.versionHandle}`)).status,
+	).toBe(410);
+});
+
+test("same physical file under two authorized narrators never shares a resource key", async () => {
+	const first = await openDoc();
+	const other = generateId();
+	const now = new Date().toISOString();
+	db.insert(narrators)
+		.values({ id: other, cwd: root, ownerUserId: userId, createdAt: now, updatedAt: now })
+		.run();
+	const result = await request(`/api/narrators/${other}/editor-documents`, "POST", {
+		path,
+		origin: "legacy",
+		deviceId: "local",
+	});
+	expect(result.status).toBe(200);
+	expect((await result.json()).resourceKey).not.toBe(first.resourceKey);
+});
 
 describe("fs preview bounded panel reads", () => {
 	test("ordinary symlinks retain preview access without relaxing editor/ref boundaries", async () => {
