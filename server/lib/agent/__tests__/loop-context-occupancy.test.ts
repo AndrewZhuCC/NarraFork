@@ -88,6 +88,27 @@ const text = { text: "The final answer contains enough text for a nonzero output
 const windowSize = getModelContextWindow(model, "anthropic") ?? 0;
 
 describe("independent upstream context occupancy", () => {
+	test("a fully cached final prompt replaces earlier ordinary input with zero", async () => {
+		const { ends, contexts } = await run([
+			{ usage: { promptTokens: 1000, inputTokens: 1000, cachedInputTokens: 0 } },
+			{
+				usage: {
+					promptTokens: 1000,
+					inputTokens: 0,
+					cachedInputTokens: 1000,
+					completionTokens: 10,
+				},
+			},
+			text,
+		]);
+		expect(ends.at(-1)?.usage).toMatchObject({
+			promptTokens: 1000,
+			inputTokens: 0,
+			cachedInputTokens: 1000,
+			completionTokens: 10,
+		});
+		expect(contexts.at(-1)?.snapshot?.occupiedTokens).toBe(1000);
+	});
 	test("overflow display preserves token/window arithmetic without changing compact occupancy cap", async () => {
 		const { ends, contexts } = await run([
 			{

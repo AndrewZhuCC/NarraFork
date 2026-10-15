@@ -250,15 +250,6 @@ function TokensCell({
 }) {
 	const { t } = useTranslation("common");
 
-	// For OpenAI/Codex: input_tokens includes cached_tokens, so we need to subtract
-	// For Anthropic: input_tokens already excludes cache_read_input_tokens
-	const isOpenAIStyle = record.provider === "codex" || record.provider === "openai";
-
-	// Calculate actual billed input tokens (non-cached)
-	const actualInputTokens = isOpenAIStyle
-		? record.inputTokens - record.cachedInputTokens
-		: record.inputTokens;
-
 	const iconSize = compact ? 12 : 14;
 	const textSize = compact ? "xs" : "sm";
 	const cacheWriteTokens = formatCompactNumber(record.cacheCreationInputTokens);
@@ -268,7 +259,7 @@ function TokensCell({
 			<Group gap={compact ? 8 : 12} wrap="nowrap">
 				<Group gap={4} wrap="nowrap" align="flex-start">
 					<IconArrowUp size={iconSize} color="var(--mantine-color-violet-6)" />
-					<TokenAmount value={actualInputTokens} compact={compact} textSize={textSize} />
+					<TokenAmount value={record.inputTokens} compact={compact} textSize={textSize} />
 				</Group>
 				<Group gap={4} wrap="nowrap" align="flex-start">
 					<IconArrowDown size={iconSize} color="var(--mantine-color-green-6)" />
@@ -601,7 +592,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 		const getValue = (r: UsageHistoryRecord): number => {
 			switch (sortField) {
 				case "tokens":
-					return r.inputTokens + r.outputTokens;
+					return r.inputTokens + r.outputTokens + r.cachedInputTokens + r.cacheCreationInputTokens;
 				case "cost":
 					return r.costUsd ?? 0;
 				case "ttft":

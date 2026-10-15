@@ -1,0 +1,1 @@
+ALTER TABLE "usage_token_repair_jobs" ADD COLUMN "source_job_id" text;

@@ -1337,12 +1337,12 @@ function invalidStateHttpStatus(reason: string): number {
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
 	const cachedInputTokens = usage.cachedInputTokens ?? 0;
-	// promptTokens 含缓存；优先采用上游已扣减的 inputTokens，缺失时才由 promptTokens 扣除。
-	// 直接取 promptTokens 会把 mapUsageStream 的归一结果还原成含缓存口径。
-	const rawInput = usage.inputTokens ?? usage.promptTokens ?? 0;
-	const promptTokens = usage.promptTokens ?? rawInput;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : rawInput,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
 		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
@@ -1355,10 +1355,8 @@ function mapUsage(usage: GeminiInteractionUsage | undefined): UsageData | null {
 	const promptTokens = usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0;
 	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
-		// 与 mapUsageStream 同口径：prompt() 含缓存，只有确认大于缓存时才扣除，
-		// 否则说明上游已是「input 不含缓存」，保留原值以免出现负数或误判为 0。
-		inputTokens:
-			promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
+		// Interactions 原始输入计数包含缓存读取。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
 		cachedInputTokens,
 		cacheCreationInputTokens: 0,
@@ -1372,9 +1370,7 @@ function mapUsageStream(usage: GeminiInteractionUsage): NonNullable<ParsedStream
 	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
 		promptTokens,
-		// 同 mapUsage：大于才减，避免把已归一的输入二次扣减成 0。
-		inputTokens:
-			promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		completionTokens:
 			usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
 		reasoningTokens: usage.total_thought_tokens ?? usage.thought_tokens ?? usage.reasoning_tokens,

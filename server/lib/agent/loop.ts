@@ -43,6 +43,7 @@ import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
+import { buildUsageDataFromSnapshot } from "../usage-tracking";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -1191,16 +1192,7 @@ export function summarizeReflectionFailure(
 type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
 
 function normalizeApiRequestUsage(usage: ApiRequestEndEvent["usage"]) {
-	if (!usage) return null;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
+	return buildUsageDataFromSnapshot(usage);
 }
 
 async function recordReflectionApiRequestEnd(
@@ -5365,11 +5357,14 @@ async function* agentLoopInMetadataSnapshot(
 							receivedUsage = true;
 							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
 							// Merge partial counters without letting prompt/input placeholders
-							// erase known counts. Output and cache counters update independently.
+							// erase known counts. A nonempty fully cached prompt legitimately has
+							// zero ordinary input. Output and cache counters update independently.
 							requestUsage = {
 								promptTokens: parsed.usage.promptTokens || previousUsage?.promptTokens || 0,
 								inputTokens:
-									parsed.usage.inputTokens === 0 && previousUsage?.inputTokens
+									parsed.usage.promptTokens === 0 &&
+									parsed.usage.inputTokens === 0 &&
+									previousUsage?.inputTokens
 										? previousUsage.inputTokens
 										: (parsed.usage.inputTokens ?? previousUsage?.inputTokens),
 								completionTokens:

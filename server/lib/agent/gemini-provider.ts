@@ -1214,12 +1214,12 @@ function invalidStateHttpStatus(reason: string): number {
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
 	const cachedInputTokens = usage.cachedInputTokens ?? 0;
-	// promptTokens 含缓存；优先采用上游已扣减的 inputTokens，缺失时才由 promptTokens 扣除。
-	// 直接取 promptTokens 会把 mapUsageStream 的归一结果还原成含缓存口径。
-	const rawInput = usage.inputTokens ?? usage.promptTokens ?? 0;
-	const promptTokens = usage.promptTokens ?? rawInput;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : rawInput,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
 		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
@@ -1238,9 +1238,8 @@ function mapUsage(usage: GeminiUsageMetadata | undefined): UsageData | null {
 	const promptTokens = usage.promptTokenCount ?? 0;
 	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		// 与 mapUsageStream 保持同一口径：promptTokenCount 含缓存，这里扣掉后才是纯输入；
-		// 若上游已扣过（promptTokens 不大于 cached），跳过以免出现负数。
-		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
+		// Gemini promptTokenCount 明确包含缓存读取，异常计数也不能按净输入猜测。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.candidatesTokenCount ?? 0,
 		cachedInputTokens,
 		cacheCreationInputTokens: 0,
@@ -1253,8 +1252,7 @@ function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEve
 	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
 		promptTokens,
-		// 同 mapUsage：只有确认含缓存时才扣减，避免下游已归一的口径被二次扣减。
-		inputTokens: promptTokens > cachedInputTokens ? promptTokens - cachedInputTokens : promptTokens,
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		completionTokens: usage.candidatesTokenCount ?? 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? undefined,
 		cachedInputTokens: usage.cachedContentTokenCount ?? undefined,

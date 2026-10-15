@@ -3479,6 +3479,9 @@ export const apiRequests = sqliteTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
+		// Nullable so historical rows are never silently treated as normalized.
+		tokenAccountingVersion: integer("token_accounting_version"),
+		tokenAccountingReviewVersion: integer("token_accounting_review_version"),
 		// Token 使用统计
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
@@ -3518,8 +3521,82 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_api_requests_token_repair_pending")
+			.on(table.createdAt, table.id)
+			.where(
+				sql`${table.tokenAccountingVersion} IS NULL AND ${table.tokenAccountingReviewVersion} IS NULL AND (${table.cachedInputTokens} > 0 OR ${table.cacheCreationInputTokens} > 0 OR ${table.cacheCreation5mTokens} > 0 OR ${table.cacheCreation1hTokens} > 0)`,
+			),
+		index("idx_api_requests_token_repair_reviewed")
+			.on(table.createdAt, table.id)
+			.where(
+				sql`${table.tokenAccountingVersion} IS NULL AND (${table.cachedInputTokens} > 0 OR ${table.cacheCreationInputTokens} > 0 OR ${table.cacheCreation5mTokens} > 0 OR ${table.cacheCreation1hTokens} > 0)`,
+			),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
+	],
+);
+
+// Deployment-wide maintenance audit. No FK to requests/users: audit survives cleanup.
+export const usageTokenRepairJobs = sqliteTable(
+	"usage_token_repair_jobs",
+	{
+		id: text("id").primaryKey(),
+		status: text("status").notNull(),
+		createdBy: text("created_by").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		ownerId: text("owner_id"),
+		leaseUntil: text("lease_until"),
+		scanned: integer("scanned").notNull().default(0),
+		repaired: integer("repaired").notNull().default(0),
+		conflicts: integer("conflicts").notNull().default(0),
+		upperCreatedAt: text("upper_created_at"),
+		upperId: text("upper_id"),
+		cursorCreatedAt: text("cursor_created_at"),
+		cursorId: text("cursor_id"),
+		includeReviewed: integer("include_reviewed", { mode: "boolean" }).notNull(),
+		protocolOverridesJson: text("protocol_overrides_json").notNull().default("[]"),
+		/** Immutable candidate scope for a manual reanalysis; audit survives cleanup. */
+		sourceJobId: text("source_job_id"),
+		error: text("error"),
+	},
+	(table) => [
+		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
+		uniqueIndex("idx_token_repair_single_active")
+			.on(sql`(1)`)
+			.where(sql`${table.status} IN ('analyzing', 'ready', 'applying')`),
+		check(
+			"token_repair_protocol_config_bound",
+			sql`length(${table.protocolOverridesJson}) <= 16384`,
+		),
+		check(
+			"token_repair_error_bound",
+			sql`${table.error} IS NULL OR length(${table.error}) <= 2048`,
+		),
+	],
+);
+
+export const usageTokenRepairCandidates = sqliteTable(
+	"usage_token_repair_candidates",
+	{
+		id: text("id").primaryKey(),
+		jobId: text("job_id").notNull(),
+		requestId: text("request_id").notNull(),
+		createdAt: text("created_at").notNull(),
+		provider: text("provider"),
+		model: text("model"),
+		// Only five counters and indexed ownership metadata; never prompts/dumps.
+		snapshotJson: text("snapshot_json").notNull(),
+		evidenceJson: text("evidence_json").notNull(),
+		appliedAt: text("applied_at"),
+		appliedBy: text("applied_by"),
+		totalsStatus: text("totals_status").notNull().default("unchanged"),
+	},
+	(table) => [
+		uniqueIndex("idx_token_repair_candidate_request").on(table.jobId, table.requestId),
+		index("idx_token_repair_candidates_page").on(table.jobId, table.id),
+		check("token_repair_snapshot_bound", sql`length(${table.snapshotJson}) <= 8192`),
+		check("token_repair_evidence_bound", sql`length(${table.evidenceJson}) <= 16384`),
 	],
 );
 

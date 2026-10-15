@@ -21,6 +21,7 @@ import {
 import { listUserUsageTotals } from "@server/services/user-usage-totals";
 import { Hono } from "hono";
 import { z } from "zod";
+import { createUsageTokenRepairRoutes } from "./usage-token-repair";
 
 export type UsageHistoryRouteService = Pick<
 	UsageHistoryService,
@@ -213,6 +214,10 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	const service = options.service ?? usageHistoryService;
 
 	routes.use("*", authMiddleware, adminMiddleware);
+	routes.route(
+		"/token-repair",
+		createUsageTokenRepairRoutes({ requireAuth: authMiddleware, requireAdmin: adminMiddleware }),
+	);
 
 	// Lifetime totals are independent of the date-filtered, removable history.
 	routes.get("/user-totals", (c) => {

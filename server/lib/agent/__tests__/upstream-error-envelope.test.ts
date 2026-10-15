@@ -834,7 +834,7 @@ describe("OpenAI lightweight partial output regression", () => {
 					expect(result).toMatchObject({
 						text: partialText,
 						outputTruncated: true,
-						usage: { inputTokens: 11, outputTokens: 7, cachedInputTokens: 3, reasoningTokens: 2 },
+						usage: { inputTokens: 8, outputTokens: 7, cachedInputTokens: 3, reasoningTokens: 2 },
 					});
 					expect(deltas).toEqual([partialText]);
 				});

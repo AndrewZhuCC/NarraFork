@@ -98,6 +98,8 @@ const compile = Bun.spawnSync(
 		"build",
 		"./server/index.ts",
 		"./server/lib/db-worker/worker-entry.ts",
+		"./server/services/usage-token-repair-worker.ts",
+		"./server/services/usage-token-repair-evidence-worker.ts",
 		"--compile",
 		"--minify",
 		"--target=bun-windows-x64",

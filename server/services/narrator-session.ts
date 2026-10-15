@@ -1611,14 +1611,16 @@ async function maybeDeliverInterruptTaskGuard(
 
 // === Agent loop execution ===
 
-/** Sum non-cached input + output tokens from a usage snapshot (for round token totals). */
 function tokenUsageValue(usage?: TokenUsageSnapshot): number {
 	if (!usage) return 0;
-	const nonCachedInput = Math.max(0, (usage.inputTokens ?? 0) - (usage.cachedInputTokens ?? 0));
-	if (usage.inputTokens != null || usage.completionTokens != null) {
-		return nonCachedInput + Math.max(0, usage.completionTokens ?? 0);
-	}
-	return Math.max(0, usage.promptTokens ?? 0) + Math.max(0, usage.completionTokens ?? 0);
+	const cacheWrite = Math.max(
+		usage.cacheCreationInputTokens ?? 0,
+		(usage.cacheCreation5mTokens ?? 0) + (usage.cacheCreation1hTokens ?? 0),
+	);
+	const input =
+		usage.inputTokens ??
+		Math.max(0, (usage.promptTokens ?? 0) - (usage.cachedInputTokens ?? 0) - cacheWrite);
+	return Math.max(0, input) + Math.max(0, usage.completionTokens ?? 0);
 }
 
 export async function ensureSkillCacheFreshForActiveNarrator(
@@ -1667,12 +1669,15 @@ export async function updateActiveNarratorCwdAndSkillContext(
  * obtain a round-level token total for the Stop hook.
  */
 export function accountTokenUsageForTurn(active: ActiveNarrator): number {
-	const tokenDelta = Math.max(
-		0,
-		tokenUsageValue(active._lastTokenUsage) - tokenUsageValue(active._tokenUsageBaseline),
-	);
-	active._tokenUsageBaseline = active._lastTokenUsage;
+	const total = active._requestTokenTotal ?? 0;
+	const tokenDelta = Math.max(0, total - (active._tokenUsageBaseline ?? 0));
+	active._tokenUsageBaseline = total;
 	return tokenDelta;
+}
+
+/** Called once for each owned request end, independently of context occupancy snapshots. */
+export function accountRequestTokenUsage(active: ActiveNarrator, usage?: TokenUsageSnapshot): void {
+	active._requestTokenTotal = (active._requestTokenTotal ?? 0) + tokenUsageValue(usage);
 }
 
 async function loadCompiledSpecForContinuation(narratorId: string) {

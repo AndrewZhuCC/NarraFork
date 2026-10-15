@@ -312,6 +312,8 @@ export interface EventHandlerContext {
 	setContextUsagePct: (pct: number) => void;
 	setMeterData: (usage: number, unit: string) => void;
 	setTokenUsage: (usage: TokenUsageSnapshot | undefined) => void;
+	/** Completed request usage, separate from the latest context occupancy snapshot. */
+	accountRequestTokenUsage?: (usage: TokenUsageSnapshot | undefined) => void;
 	setTtftMs?: (ttftMs: number | undefined) => void;
 
 	// --- Substatus management ---
@@ -3533,6 +3535,13 @@ export async function processEvent(
 		}
 
 		case "api_request_end": {
+			// Consume the owned start before any await: duplicate/concurrent ends cannot
+			// count twice, and persistence/context failures cannot lose completed usage.
+			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
+			if (requestInfo) {
+				ctx.apiRequestsMap?.delete(event.requestId);
+				ctx.accountRequestTokenUsage?.(event.usage);
+			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {
 				await storeNarratorContextUsage(narratorId, snapshot);
@@ -3568,23 +3577,12 @@ export async function processEvent(
 				}
 			}
 			// Create API request record in database
-			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
 			if (!requestInfo) {
 				logger.warn("API request end without start", { narratorId, requestId: event.requestId });
 				return null;
 			}
 
-			const usageData = event.usage
-				? {
-						inputTokens: event.usage.inputTokens ?? event.usage.promptTokens ?? 0,
-						outputTokens: event.usage.completionTokens ?? 0,
-						cachedInputTokens: event.usage.cachedInputTokens ?? 0,
-						cacheCreationInputTokens: event.usage.cacheCreationInputTokens ?? 0,
-						cacheCreation5mInputTokens: event.usage.cacheCreation5mTokens ?? 0,
-						cacheCreation1hInputTokens: event.usage.cacheCreation1hTokens ?? 0,
-						reasoningTokens: event.usage.reasoningTokens ?? 0,
-					}
-				: null;
+			const usageData = buildUsageDataFromSnapshot(event.usage);
 
 			try {
 				const apiRequestId = await finishApiRequest(requestInfo, {

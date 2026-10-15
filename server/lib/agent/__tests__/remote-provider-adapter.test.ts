@@ -778,6 +778,205 @@ describe("RemoteProviderAdapter", () => {
 		});
 	});
 
+	for (const sample of [
+		{ usage: { inputTokens: 17, promptTokens: 100 }, expected: 17 },
+		{ usage: { inputTokens: 0, promptTokens: 100 }, expected: 0 },
+		{ usage: { inputTokens: 17 }, expected: 17 },
+		{ usage: { promptTokens: 100 }, expected: 40 },
+		{ usage: { promptTokens: 60 }, expected: 0 },
+		{ usage: { promptTokens: 20 }, expected: 0 },
+		{ usage: { promptTokens: 0 }, expected: 0 },
+	]) {
+		test(`chat and generate normalize plugin usage ${JSON.stringify(sample.usage)}`, async () => {
+			const usage = {
+				...sample.usage,
+				cachedInputTokens: 40,
+				cacheCreationInputTokens: 20,
+				completionTokens: 7,
+				reasoningTokens: 2,
+			};
+			for (const source of ["usage", "done"] as const) {
+				const events = [
+					event(source, {
+						usage,
+						...(source === "done" && { status: "completed", stopReason: "end_turn" }),
+					}),
+					...(source === "usage"
+						? [event("done", { status: "completed", stopReason: "end_turn" })]
+						: []),
+				];
+				const adapter = makeAdapter(makeRpc(events, events));
+				const chat = await collect(adapter.chat(chatParams()));
+				expect(chat.find((item) => item.usage)?.usage).toEqual({
+					...usage,
+					promptTokens: sample.usage.promptTokens ?? sample.expected + 60,
+					inputTokens: sample.expected,
+				});
+				const result = await adapter.generateWithMeta("prompt", "remote:model-1");
+				expect(result.usage).toEqual({
+					inputTokens: sample.expected,
+					outputTokens: 7,
+					cachedInputTokens: 40,
+					cacheCreationInputTokens: 20,
+					cacheCreation5mInputTokens: 0,
+					cacheCreation1hInputTokens: 0,
+					reasoningTokens: 2,
+				});
+			}
+		});
+	}
+
+	for (const aggregate of [undefined, 20, 10, 30]) {
+		for (const inputTokens of [undefined, 0, 17]) {
+			test(`TTL writes aggregate=${aggregate} input=${inputTokens} map once in chat and generate`, async () => {
+				const write = Math.max(aggregate ?? 0, 20);
+				const usage = {
+					promptTokens: 100,
+					inputTokens,
+					cachedInputTokens: 40,
+					cacheCreationInputTokens: aggregate,
+					cacheCreation5mTokens: 8,
+					cacheCreation1hTokens: 12,
+					completionTokens: 7,
+				};
+				for (const source of ["usage", "done"] as const) {
+					const events = [
+						event(source, { usage, status: "completed", stopReason: "end_turn" }),
+						...(source === "usage"
+							? [event("done", { status: "completed", stopReason: "end_turn" })]
+							: []),
+					];
+					const adapter = makeAdapter(makeRpc(events, events));
+					const chat = await collect(adapter.chat(chatParams()));
+					expect(chat.find((item) => item.usage)?.usage).toMatchObject({
+						promptTokens: 100,
+						inputTokens: inputTokens ?? 60 - write,
+						cacheCreationInputTokens: write,
+						cacheCreation5mTokens: 8,
+						cacheCreation1hTokens: 12,
+					});
+					const result = await adapter.generateWithMeta("prompt", "remote:model-1");
+					expect(result.usage).toMatchObject({
+						inputTokens: inputTokens ?? 60 - write,
+						cacheCreationInputTokens: write,
+						cacheCreation5mInputTokens: 8,
+						cacheCreation1hInputTokens: 12,
+					});
+				}
+			});
+		}
+	}
+
+	test("chat synthesizes full prompt from net input and TTL cache without clearing input on output-only events", async () => {
+		const events = [
+			event("usage", {
+				usage: {
+					inputTokens: 17,
+					cachedInputTokens: 40,
+					cacheCreation5mTokens: 8,
+					cacheCreation1hTokens: 12,
+					completionTokens: 1,
+				},
+			}),
+			event("usage", { usage: { completionTokens: 7 } }),
+			event("done", { status: "completed", stopReason: "end_turn" }),
+		];
+		const chat = await collect(makeAdapter(makeRpc(events)).chat(chatParams()));
+		expect(chat[0]?.usage).toEqual({
+			promptTokens: 77,
+			inputTokens: 17,
+			cachedInputTokens: 40,
+			cacheCreationInputTokens: 20,
+			cacheCreation5mTokens: 8,
+			cacheCreation1hTokens: 12,
+			completionTokens: 1,
+		});
+		expect(chat[1]?.usage).toEqual({ ...chat[0]?.usage, completionTokens: 7 });
+	});
+
+	for (const cachedInputTokens of [60, 100, 0]) {
+		for (const finalSource of ["usage", "done"] as const) {
+			test(`${finalSource} cache correction ${cachedInputTokens} merges before deriving chat/generate input`, async () => {
+				const events = [
+					event("usage", { usage: { promptTokens: 100, inputTokens: 60, cachedInputTokens: 40 } }),
+					event(finalSource, {
+						usage: { cachedInputTokens, completionTokens: 8 },
+						status: "completed",
+						stopReason: "end_turn",
+					}),
+					...(finalSource === "usage"
+						? [event("done", { status: "completed", stopReason: "end_turn" })]
+						: []),
+				];
+				const adapter = makeAdapter(makeRpc(events, events));
+				const chat = await collect(adapter.chat(chatParams()));
+				expect(chat[1]?.usage).toMatchObject({
+					promptTokens: 100,
+					inputTokens: 100 - cachedInputTokens,
+					cachedInputTokens,
+					completionTokens: 8,
+				});
+				expect((await adapter.generateWithMeta("prompt", "remote:model-1")).usage).toMatchObject({
+					inputTokens: 100 - cachedInputTokens,
+					cachedInputTokens,
+					outputTokens: 8,
+				});
+			});
+		}
+	}
+
+	test("partial accounting resets each remote request and honors explicit net zero", async () => {
+		let request = 0;
+		const rpc = makeRpc(async function* () {
+			if (request++ === 0) {
+				yield event("usage", {
+					usage: { promptTokens: 100, inputTokens: 60, cachedInputTokens: 40 },
+				});
+				yield event("usage", { usage: { promptTokens: 0, completionTokens: 8 } });
+				yield event("usage", { usage: { inputTokens: 0, cachedInputTokens: 100 } });
+			} else {
+				yield event("usage", { usage: { completionTokens: 9 } });
+			}
+			yield event("done", { status: "completed", stopReason: "end_turn" });
+		});
+		const adapter = makeAdapter(rpc);
+		const first = await collect(adapter.chat(chatParams()));
+		expect(first[1]?.usage).toMatchObject({
+			promptTokens: 100,
+			inputTokens: 60,
+			cachedInputTokens: 40,
+			completionTokens: 8,
+		});
+		expect(first[2]?.usage).toMatchObject({
+			promptTokens: 100,
+			inputTokens: 0,
+			cachedInputTokens: 100,
+		});
+		const second = await collect(adapter.chat(chatParams()));
+		expect(second[0]?.usage).toEqual({ completionTokens: 9 });
+	});
+
+	test("generate preserves TTL-only usage even without input or output counters", async () => {
+		const adapter = makeAdapter(
+			makeRpc(
+				[],
+				[
+					event("done", {
+						status: "completed",
+						stopReason: "end_turn",
+						usage: { cacheCreation5mTokens: 8, cacheCreation1hTokens: 12 },
+					}),
+				],
+			),
+		);
+		expect((await adapter.generateWithMeta("prompt", "remote:model-1")).usage).toMatchObject({
+			inputTokens: 0,
+			cacheCreationInputTokens: 20,
+			cacheCreation5mInputTokens: 8,
+			cacheCreation1hInputTokens: 12,
+		});
+	});
+
 	test("generateWithHistory uses history mode and rejects tool events", async () => {
 		const rpc = makeRpc(
 			[],

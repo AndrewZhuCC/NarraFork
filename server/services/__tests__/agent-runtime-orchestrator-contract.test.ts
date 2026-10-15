@@ -183,6 +183,62 @@ function fixture(
 	};
 }
 
+describe("round token totals at the Stop hook", () => {
+	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
+		test(`accounts every owned request before ${exit} exits`, async () => {
+			const { hookService } = await import("../hook-service");
+			const stopTotals: number[] = [];
+			spyOn(hookService, "runHooks").mockImplementation(async (event, input) => {
+				if (event === "Stop") stopTotals.push(input.total_tokens as number);
+				return { outcome: "success" };
+			});
+			const h = fixture(profiles[0], [
+				async (options) => {
+					options.eventContext.accountRequestTokenUsage?.({
+						inputTokens: 1000,
+						completionTokens: 100,
+					});
+					options.eventContext.accountRequestTokenUsage?.({
+						inputTokens: 1100,
+						completionTokens: 100,
+					});
+					// Latest occupancy deliberately disagrees with request totals.
+					options.eventContext.setTokenUsage({ inputTokens: 1, completionTokens: 1 });
+					if (exit === "workspace") h.session._workspacePassInvalidated = true;
+					if (exit === "tool-limit") options.config.onToolCallLimitExceeded?.(1);
+					if (exit === "throw") throw new Error("scripted failure after usage");
+					return { ...finished };
+				},
+				async (options) => {
+					options.eventContext.accountRequestTokenUsage?.({ inputTokens: 10, completionTokens: 5 });
+					return { ...finished };
+				},
+			]);
+			await h.run();
+			expect(stopTotals).toEqual([exit === "workspace" ? 2315 : 2300]);
+		});
+	}
+
+	test("stale active callbacks cannot charge the replacement narrator or parent", async () => {
+		const h = fixture(profiles[1], [
+			async (options) => {
+				const replacement = active("contract-child");
+				activeNarrators.set("contract-child", replacement);
+				options.eventContext.accountRequestTokenUsage?.({
+					inputTokens: 1000,
+					completionTokens: 100,
+				});
+				expect(replacement._requestTokenTotal).toBeUndefined();
+				expect(h.session._requestTokenTotal).toBeUndefined();
+				activeNarrators.set("contract-child", h.session);
+				return { ...finished };
+			},
+		]);
+		await h.run();
+		expect(h.session._requestTokenTotal).toBeUndefined();
+	});
+});
+
 describe("Bash Git command detection for status refresh", () => {
 	test("uses parsed command nodes instead of matching argument text", async () => {
 		expect(await isGitCommandToolResult("Bash", { command: "git status" }, "/tmp")).toBe(true);

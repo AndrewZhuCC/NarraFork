@@ -215,8 +215,10 @@ export interface ActiveNarrator {
 	 * but has not yet been consumed by a rebuilt in-memory agent history.
 	 */
 	_pendingHistoryCompactSeq?: number;
-	/** Token usage baseline at the start of the current turn (for round token totals). */
-	_tokenUsageBaseline?: TokenUsageSnapshot;
+	/** Cumulative ordinary input + output from completed requests owned by this active narrator. */
+	_requestTokenTotal?: number;
+	/** Cumulative request-token baseline at the start of the current pass. */
+	_tokenUsageBaseline?: number;
 	/** Guard against infinite auto-continuation when continuation turns make no effective progress. */
 	_continuationSuppressed?: boolean;
 	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
