@@ -291,6 +291,7 @@ describe("SQL-derived physical column order", () => {
 			columns: structuredClone(expected.columns),
 			foreignKeys: [],
 			indexes: [],
+			primaryKeys: [],
 			uniques: [],
 			checks: [],
 			generated: [],
