@@ -2031,6 +2031,11 @@ export const usageTokenRepairJobs = pgTable(
 		updatedAt: text("updated_at").notNull(),
 		ownerId: text("owner_id"),
 		leaseUntil: text("lease_until"),
+		workflowVersion: integer("workflow_version"),
+		phase: text("phase"),
+		summaryJson: text("summary_json"),
+		rowsPerSecond: doublePrecision("rows_per_second"),
+		scratchRetiredAt: text("scratch_retired_at"),
 		scanned: integer("scanned").notNull().default(0),
 		repaired: integer("repaired").notNull().default(0),
 		conflicts: integer("conflicts").notNull().default(0),
@@ -2045,6 +2050,13 @@ export const usageTokenRepairJobs = pgTable(
 	},
 	(table) => [
 		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
+		index("idx_token_repair_scratch_retirement")
+			.on(table.updatedAt, table.id)
+			.where(
+				sql.raw(
+					"\"scratch_retired_at\" IS NULL AND \"status\" IN ('completed', 'cancelled', 'failed', 'interrupted')",
+				),
+			),
 		uniqueIndex("idx_token_repair_single_active")
 			.on(sql.raw("(1)"))
 			.where(sql.raw("\"status\" IN ('analyzing', 'ready', 'applying')")),
@@ -3860,7 +3872,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 121,
-  "columnCount": 1721,
+  "columnCount": 1726,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -15804,6 +15816,51 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "workflowVersion",
+          "name": "workflow_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "phase",
+          "name": "phase",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "summaryJson",
+          "name": "summary_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rowsPerSecond",
+          "name": "rows_per_second",
+          "kind": "real",
+          "pgType": "double precision",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scratchRetiredAt",
+          "name": "scratch_retired_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "scanned",
           "name": "scanned",
           "kind": "integer",
@@ -15920,6 +15977,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "id"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_token_repair_scratch_retirement",
+          "columns": [
+            "updatedAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"scratch_retired_at\" IS NULL AND \"status\" IN ('completed', 'cancelled', 'failed', 'interrupted')"
         },
         {
           "name": "idx_token_repair_single_active",

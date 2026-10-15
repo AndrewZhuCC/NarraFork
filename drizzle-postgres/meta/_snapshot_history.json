@@ -152,6 +152,14 @@
 			"prevId": "589f163a-9f46-4c42-9b4f-7421ec507a16",
 			"version": "7",
 			"snapshotDigest": "3cdb7aad98c67d8abcecfb9fda4f0102cb1dda7d3374719a7eaee0c519732ffe"
+		},
+		{
+			"idx": 19,
+			"tag": "0019_history_token_repair_bulk",
+			"id": "fc3736b0-a4c7-4cb2-a728-0887056a0ecb",
+			"prevId": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
+			"version": "7",
+			"snapshotDigest": "1784f7a9b7a373da3eeea32c1de8c30207e2861d1f35de0cf64ebc079707cc47"
 		}
 	]
 }

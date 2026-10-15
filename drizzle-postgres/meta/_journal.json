@@ -134,6 +134,13 @@
 			"when": 1792071785464,
 			"tag": "0018_personal_knowledge_injection",
 			"breakpoints": true
+		},
+		{
+			"idx": 19,
+			"version": "7",
+			"when": 1792088365044,
+			"tag": "0019_history_token_repair_bulk",
+			"breakpoints": true
 		}
   ]
 }
