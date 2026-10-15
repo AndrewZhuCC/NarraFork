@@ -72,6 +72,7 @@ import {
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
+import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -179,6 +180,11 @@ import {
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import {
+	formatOpencodeBarText,
+	formatOpencodeDetailsText,
+	isOpencodeProviderBaseUrl,
+} from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -736,6 +742,31 @@ function NarratorPanelBody({
 		refetchInterval: 60_000,
 	});
 
+	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
+	// generation token so an allowance fetched for a replaced account is never shown.
+	// The current window lives in the status bar; weekly/monthly are in the popover.
+	const currentOpencodeProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const opencodeGeneration = currentOpencodeProviderId
+		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
+		: undefined;
+	const opencodeUsageQuery = useOpencodeUsage(
+		currentOpencodeProviderId,
+		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
+		firstScreenActivity,
+	);
+
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
 	const activeTerminalCount = useMemo(
@@ -1081,6 +1112,16 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
+		if (cfg.id === currentOpencodeProviderId) {
+			const usage = opencodeUsageQuery.data;
+			if (usage) {
+				const quotaBalance = formatOpencodeBarText(usage, t);
+				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
+			}
+		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
 		const kimiUsage = kimiUsagesData?.[cfg.id];
@@ -1107,6 +1148,8 @@ function NarratorPanelBody({
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
 		kimiUsagesData,
+		currentOpencodeProviderId,
+		opencodeUsageQuery.data,
 		t,
 	]);
 

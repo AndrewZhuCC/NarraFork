@@ -1275,6 +1275,17 @@
 	"contextStaleHint": "压缩、清空或删除消息后，上下文展示目前不准确，下次请求服务器后才可获知准确数值。",
 	"estimated": "估算",
 	"quotaBalance": "API 余额：{{balance}}",
+	"opencode": {
+		"rollingShort": "5h {{percent}}%",
+		"unavailable": "OpenCode Go 用量不可用",
+		"window5h": "5 小时限制",
+		"windowWeekly": "周限制",
+		"windowMonthly": "月限制",
+		"windowLine": "{{label}}：已用 {{percent}}%",
+		"resetSuffix": "，{{time}} 重置",
+		"fetchError": "用量获取失败：{{error}}",
+		"fetchFailed": "用量获取失败（详情请联系管理员）"
+	},
 	"kimi": {
 		"fiveHourShort": "5h {{percent}}%",
 		"fiveHourRatio": "5h {{used}}/{{limit}}",

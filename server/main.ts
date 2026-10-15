@@ -1403,6 +1403,15 @@ try {
 	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
 }
 
+try {
+	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
+	// restart re-reads it rather than trusting numbers from the previous process.
+	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
+	void refreshAllOpencodeUsages().catch(() => {});
+} catch (err) {
+	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
+}
+
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });
