@@ -83,14 +83,17 @@ export function useNarratorsPaginated(opts?: {
 
 export interface FileTreeStatusFile {
 	path: string;
-	linesAdded: number;
-	linesRemoved: number;
+	status?: string;
+	oldPath?: string;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface FileTreeStatus {
 	isGitRepo: boolean;
 	files: FileTreeStatusFile[];
 	totalFiles: number;
+	totalFilesExact?: boolean;
 	truncated: boolean;
 }
 

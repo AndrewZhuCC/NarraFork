@@ -11,6 +11,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import type { RenderTreeNodePayload, TreeNodeData } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import type { Root } from "react-dom/client";
 
@@ -71,9 +72,40 @@ mock.module("@mantine/core", () => ({
 	Center: ({ children }: { children?: import("react").ReactNode }) => <div>{children}</div>,
 	Group: ({ children }: { children?: import("react").ReactNode }) => <div>{children}</div>,
 	Loader: () => <div data-loader />,
-	Text: ({ children }: { children?: import("react").ReactNode }) => <span>{children}</span>,
+	Text: ({
+		children,
+		title,
+		"data-git-changed": changed,
+	}: {
+		children?: import("react").ReactNode;
+		title?: string;
+		"data-git-changed"?: boolean;
+	}) => (
+		<span title={title} data-git-changed={changed}>
+			{children}
+		</span>
+	),
 	Tooltip: ({ children }: { children?: import("react").ReactNode }) => <>{children}</>,
-	Tree: () => <div data-tree />,
+	Tree: ({
+		data,
+		renderNode,
+	}: {
+		data: TreeNodeData[];
+		renderNode: (payload: RenderTreeNodePayload) => import("react").ReactNode;
+	}) => (
+		<div data-tree>
+			{data.map((node) => (
+				<div key={node.value}>
+					{renderNode({
+						node,
+						expanded: false,
+						elementProps: { style: {} },
+						tree: { toggleExpanded: () => {} },
+					} as unknown as RenderTreeNodePayload)}
+				</div>
+			))}
+		</div>
+	),
 	useTree: () => ({ tree: {}, selected: [], expanded: {} }),
 }));
 
@@ -114,6 +146,28 @@ function render(props: { showHidden: boolean; onToggleShowHidden?: () => void })
 		);
 	});
 }
+
+test("lightweight Git changes keep file markers without fake or stale line statistics", () => {
+	const renderStatus = (changed: boolean, measured: boolean) =>
+		act(() => {
+			root.render(
+				<FileTreeContent
+					root="/repo"
+					showHidden
+					onOpenFile={() => {}}
+					changedPaths={new Set(changed ? ["a.txt"] : [])}
+					lineStats={new Map(measured ? [["a.txt", { added: 7, removed: 2 }]] : [])}
+				/>,
+			);
+		});
+	renderStatus(true, true);
+	expect(container.textContent).toContain("+7");
+	renderStatus(true, false);
+	expect(container.querySelector('[data-git-changed="true"]')?.textContent).toBe("a.txt");
+	expect(container.textContent).not.toMatch(/[+-][0-9]|NaN/);
+	renderStatus(false, false);
+	expect(container.querySelector("[data-git-changed]")).toBeNull();
+});
 
 /** The visibility toggle is the first toolbar button; refresh is the second. */
 const toggle = (): HTMLButtonElement | null => container.querySelector("button");

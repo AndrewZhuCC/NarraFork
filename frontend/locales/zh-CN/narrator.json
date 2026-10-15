@@ -1481,6 +1481,7 @@
 	"fileTree.remoteUnsupported": "当前暂不支持此远端设备的文件树浏览。已打开的远端文件仍保留原设备与绝对路径。",
 	"fileTree.empty": "该目录为空。",
 	"fileTree.refresh": "刷新",
+	"fileTree.gitChanged": "存在未提交的 Git 更改",
 	"fileTree.showHidden": "显示隐藏文件",
 	"fileTree.hideHidden": "隐藏隐藏文件",
 	"fileTree.retry": "重试",

@@ -10,6 +10,9 @@ import {
 	type GitWorkspaceRequest,
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
+import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
+import { invalidateGitWorkspace } from "./git-management-service";
+import type { GitWorkspaceTarget } from "./git-workspace";
 import {
 	createRemoteGitService,
 	parseRemoteGitStatus,
@@ -352,9 +355,10 @@ test("truncated remote status is incomplete rather than falsely clean", () => {
 		staged: 0,
 		unstaged: 0,
 		untracked: 0,
-		linesAdded: 0,
-		linesRemoved: 0,
+		totalFilesExact: false,
 	});
+	expect(emptyPrefix.linesAdded).toBeUndefined();
+	expect(emptyPrefix.linesRemoved).toBeUndefined();
 
 	const partialRename = parseRemoteGitStatus({
 		outputs: { status: "R  new-name\0" },
@@ -445,3 +449,159 @@ test("remote NUL status handles rename, whitespace and separate staged/unstaged 
 	});
 	expect(result.files[2]).toMatchObject({ path: "new.txt", unstagedLinesAdded: 5 });
 });
+
+test("lightweight remote status omits unknown line counts and keeps exact count beyond display cap", () => {
+	const summary = parseRemoteGitStatus({
+		outputs: { status: `${"?? file\0".repeat(201)}R  new\0old\0`, head: "sha", branch: "main" },
+		totalFilesExact: true,
+	});
+	expect(summary).toMatchObject({ totalFiles: 202, totalFilesExact: true, truncated: true });
+	expect(summary.linesAdded).toBeUndefined();
+	expect(summary.linesRemoved).toBeUndefined();
+	for (const file of summary.files) {
+		expect(Object.keys(file).some((key) => /lines/i.test(key))).toBe(false);
+	}
+	const legacyOversized = parseRemoteGitStatus({ outputs: { status: "?? file\0".repeat(10_001) } });
+	expect(legacyOversized).toMatchObject({
+		totalFiles: 10_000,
+		totalFilesExact: false,
+		truncated: true,
+	});
+	const partial = parseRemoteGitStatus({ outputs: { status: "?? complete\0?? incomplete" } });
+	expect(partial).toMatchObject({ totalFiles: 1, totalFilesExact: false, truncated: true });
+});
+
+test("remote status merges authorized readers but cancellation belongs to each caller", async () => {
+	const pending = Promise.withResolvers<GitWorkspaceResult>();
+	const started = Promise.withResolvers<void>();
+	const signals: AbortSignal[] = [];
+	let calls = 0;
+	const backend = {
+		...backendFixture().backend,
+		runtimeGeneration: 1,
+		async gitWorkspace(_request: GitWorkspaceRequest, signal: AbortSignal) {
+			calls++;
+			signals.push(signal);
+			started.resolve();
+			return pending.promise;
+		},
+	} as ExecutionBackend;
+	const first = new AbortController();
+	const second = new AbortController();
+	const a = createRemoteGitService(backend, first.signal).getStatusSummary("/coalesced");
+	const b = createRemoteGitService(backend, second.signal).getStatusSummary("/coalesced");
+	await started.promise;
+	expect(calls).toBe(1);
+	expect(signals[0]).not.toBe(first.signal);
+	first.abort(new Error("first reader left"));
+	await expect(a).rejects.toThrow("first reader left");
+	expect(signals[0]?.aborted).toBe(false);
+	pending.resolve({ outputs: { status: "?? file\0" } });
+	expect((await b).totalFiles).toBe(1);
+	await createRemoteGitService(backend).getStatusSummary("/coalesced");
+	expect(calls).toBe(2); // No result TTL.
+});
+
+test("remote status separates device, generation and cwd; last reader abort reaches RPC", async () => {
+	let calls = 0;
+	const started = Promise.withResolvers<void>();
+	const signals: AbortSignal[] = [];
+	const backend = {
+		...backendFixture().backend,
+		runtimeGeneration: 1,
+		gitWorkspace(_request: GitWorkspaceRequest, signal: AbortSignal) {
+			calls++;
+			signals.push(signal);
+			if (calls === 4) started.resolve();
+			return new Promise<GitWorkspaceResult>((_resolve, reject) => {
+				signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+			});
+		},
+	} as ExecutionBackend;
+	const controller = new AbortController();
+	const requests = [
+		createRemoteGitService(backend, controller.signal).getStatusSummary("/separate"),
+		createRemoteGitService(
+			{ ...backend, deviceId: "other-device" },
+			controller.signal,
+		).getStatusSummary("/separate"),
+		createRemoteGitService(
+			{ ...backend, runtimeGeneration: 2 },
+			controller.signal,
+		).getStatusSummary("/separate"),
+		createRemoteGitService(backend, controller.signal).getStatusSummary("/different-root"),
+	];
+	const settled = Promise.allSettled(requests);
+	await started.promise;
+	controller.abort();
+	expect((await settled).every((result) => result.status === "rejected")).toBe(true);
+	expect(signals.every((signal) => signal.aborted)).toBe(true);
+	expect(calls).toBe(4);
+});
+
+test("workspace events invalidate an in-flight remote read before the next refresh", async () => {
+	const pending = Promise.withResolvers<GitWorkspaceResult>();
+	const started = Promise.withResolvers<void>();
+	let statusCalls = 0;
+	const backend = {
+		...backendFixture().backend,
+		runtimeGeneration: 3,
+		paths: targetPathSemantics("posix"),
+		async gitWorkspace() {
+			statusCalls++;
+			if (statusCalls === 1) {
+				started.resolve();
+				return pending.promise;
+			}
+			return { outputs: { status: " M latest\0" } };
+		},
+	} as ExecutionBackend;
+	const target = {
+		backend,
+		workspace: { deviceId: backend.deviceId, cwd: "/event-root", rootPath: "/event-root" },
+	} as GitWorkspaceTarget;
+	const git = createRemoteGitService(backend);
+	const old = git.getStatusSummary("/event-root");
+	await started.promise;
+	invalidateGitWorkspace(target);
+	const refreshed = git.getStatusSummary("/event-root");
+	expect(statusCalls).toBe(1);
+	pending.resolve({ outputs: { status: "?? obsolete\0" } });
+	expect((await old).files[0]?.path).toBe("obsolete");
+	expect((await refreshed).files[0]?.path).toBe("latest");
+	expect(statusCalls).toBe(2);
+});
+
+for (const writeFails of [false, true]) {
+	test(`remote writes invalidate in-flight status even when uncertain=${writeFails}`, async () => {
+		const pending = Promise.withResolvers<GitWorkspaceResult>();
+		const started = Promise.withResolvers<void>();
+		let statusCalls = 0;
+		const backend = {
+			...backendFixture().backend,
+			async gitWorkspace(request: GitWorkspaceRequest) {
+				if (request.operation !== "status") {
+					if (writeFails) throw new Error("connection lost");
+					return {};
+				}
+				statusCalls++;
+				if (statusCalls === 1) {
+					started.resolve();
+					return pending.promise;
+				}
+				return { outputs: { status: "A  fresh\0" } };
+			},
+		} as ExecutionBackend;
+		const git = createRemoteGitService(backend);
+		const old = git.getStatusSummary("/write-invalidates");
+		await started.promise;
+		if (writeFails) await expect(git.stageAll("/write-invalidates")).rejects.toThrow("uncertain");
+		else await git.stageAll("/write-invalidates");
+		const fresh = git.getStatusSummary("/write-invalidates");
+		expect(statusCalls).toBe(1);
+		pending.resolve({ outputs: { status: "?? stale\0" } });
+		expect((await old).files[0]?.path).toBe("stale");
+		expect((await fresh).files[0]?.path).toBe("fresh");
+		expect(statusCalls).toBe(2);
+	});
+}

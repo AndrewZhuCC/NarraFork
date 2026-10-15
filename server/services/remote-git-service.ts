@@ -22,6 +22,7 @@ import {
 	parseCommitMeta,
 } from "./git-commit-preview-parse";
 import type { GitCommitIdentity, GitStatusFile, GitStatusSummary } from "./git-service";
+import { coordinateGitStatusQuery, invalidateGitStatusQuery } from "./git-status-query";
 
 const WRITES = new Set<GitWorkspaceOperation>([
 	"stage",
@@ -68,12 +69,19 @@ export function parseRemoteGitStatus(
 	result: GitWorkspaceResult,
 ): GitStatusSummary & { truncated: boolean } {
 	const outputs = result.outputs ?? {};
-	const truncated = result.truncated ?? false;
+	let truncated = result.truncated === true || result.totalFilesExact === false;
+	// Only legacy executors send statistics. Missing statistics are unknown, not zero.
+	const hasLineStats = ["stagedNumstat", "unstagedNumstat", "untrackedNumstat"].some(
+		(key) => typeof outputs[key] === "string",
+	);
 	const stagedStats = numstat(outputs.stagedNumstat ?? "");
 	const unstagedStats = numstat(outputs.unstagedNumstat ?? "");
 	for (const [path, stats] of numstat(outputs.untrackedNumstat ?? ""))
 		unstagedStats.set(path, stats);
-	const records = (outputs.status ?? "").split("\0");
+	const rawStatus = outputs.status ?? "";
+	const records = rawStatus.split("\0");
+	// Do not treat a legacy executor's incomplete final path as a complete entry.
+	if (records.pop()) truncated = true;
 	const files: GitStatusFile[] = [];
 	let staged = 0,
 		unstaged = 0,
@@ -82,6 +90,10 @@ export function parseRemoteGitStatus(
 	for (let i = 0; i < records.length; i++) {
 		const record = records[i] ?? "";
 		if (record.length < 4) continue;
+		if (totalFiles >= 10_000) {
+			truncated = true;
+			break;
+		}
 		const status = record.slice(0, 2);
 		const path = record.slice(3);
 		const renamed = /[RC]/.test(status);
@@ -89,7 +101,10 @@ export function parseRemoteGitStatus(
 		// A capped porcelain stream can end after the first half of a rename.
 		// Exclude that incomplete logical entry; `truncated` still makes every
 		// reported count a lower bound and prevents a false clean status.
-		if (renamed && !oldPath && truncated) continue;
+		if (renamed && !oldPath) {
+			truncated = true;
+			continue;
+		}
 		if (status === "??") untracked++;
 		else {
 			if (status[0] !== " " && status[0] !== "?") staged++;
@@ -103,12 +118,16 @@ export function parseRemoteGitStatus(
 			status,
 			path,
 			...(oldPath ? { oldPath } : {}),
-			linesAdded: s.added + u.added,
-			linesRemoved: s.removed + u.removed,
-			stagedLinesAdded: s.added,
-			stagedLinesRemoved: s.removed,
-			unstagedLinesAdded: u.added,
-			unstagedLinesRemoved: u.removed,
+			...(hasLineStats
+				? {
+						linesAdded: s.added + u.added,
+						linesRemoved: s.removed + u.removed,
+						stagedLinesAdded: s.added,
+						stagedLinesRemoved: s.removed,
+						unstagedLinesAdded: u.added,
+						unstagedLinesRemoved: u.removed,
+					}
+				: {}),
 		});
 	}
 	let linesAdded = 0,
@@ -125,18 +144,28 @@ export function parseRemoteGitStatus(
 		untracked,
 		files,
 		totalFiles,
+		totalFilesExact: !truncated,
 		headSha: (outputs.head ?? "").trim(),
 		branch: (outputs.branch ?? "").trim(),
-		linesAdded,
-		linesRemoved,
+		...(hasLineStats ? { linesAdded, linesRemoved } : {}),
 		// Both the upstream byte budget and this adapter's file cap make the list incomplete.
 		truncated: truncated || totalFiles > files.length,
 	};
 }
 
+/** Shared by reads, writes and workspace-event invalidation; never a host-path key. */
+export function getRemoteGitStatusQueryKey(
+	backend: Pick<ExecutionBackend, "deviceId" | "runtimeGeneration">,
+	cwd: string,
+	expectedRoot = cwd,
+): string {
+	return JSON.stringify(["remote", backend.deviceId, backend.runtimeGeneration, cwd, expectedRoot]);
+}
+
 /**
  * Caller must authorize narrator + project + device + canonical root on EVERY
- * request before constructing this adapter. No cache, local fallback, or retry.
+ * request before constructing this adapter. Only authorized in-flight status reads
+ * are merged; there is no settled cache, local fallback, or retry.
  * The backend is pinned to its authenticated transport generation; the executor
  * independently verifies expectedRoot and its operator-owned path policy.
  */
@@ -146,6 +175,7 @@ export function createRemoteGitService(
 	beforeWrite?: () => Promise<void>,
 ) {
 	const signal = options instanceof AbortSignal ? options : options?.signal;
+	const statusKey = (cwd: string) => getRemoteGitStatusQueryKey(backend, cwd);
 	async function request(
 		cwd: string,
 		operation: GitWorkspaceOperation,
@@ -178,6 +208,9 @@ export function createRemoteGitService(
 					`${detail}. Remote Git write result may be uncertain; refresh status/history before retrying.`,
 				);
 			throw error;
+		} finally {
+			// Even an uncertain write must not let the next read reuse pre-write work.
+			if (write) invalidateGitStatusQuery(statusKey(cwd));
 		}
 	}
 	async function mutate(
@@ -194,7 +227,12 @@ export function createRemoteGitService(
 			limits: Pick<GitWorkspaceRequest, "maxBytes" | "timeoutMs"> = {},
 		) => request(cwd, "probe", limits, probeSignal ?? signal),
 		async getStatusSummary(cwd: string) {
-			return parseRemoteGitStatus(await request(cwd, "status"));
+			return coordinateGitStatusQuery(
+				statusKey(cwd),
+				async (sharedSignal) =>
+					parseRemoteGitStatus(await request(cwd, "status", {}, sharedSignal)),
+				{ signal },
+			);
 		},
 		async getFileDiff(cwd: string, path: string, staged = false, maxBytes = 200_000) {
 			const result = await request(cwd, "diff", { files: [path], staged, maxBytes });

@@ -35,7 +35,7 @@ export type { GitLogEntry, GitTarget, GitWorkspace } from "../lib/api/git";
 
 // Types
 export interface GitStatusSummary {
-	/** The executor reached its output budget; counts may be lower bounds. */
+	/** The file list is incomplete; totalFilesExact separately indicates scan completeness. */
 	truncated?: boolean;
 	hasChanges: boolean;
 	staged: number;
@@ -45,19 +45,21 @@ export interface GitStatusSummary {
 		/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
 		status: string;
 		path: string;
-		linesAdded: number;
-		linesRemoved: number;
-		stagedLinesAdded: number;
-		stagedLinesRemoved: number;
-		unstagedLinesAdded: number;
-		unstagedLinesRemoved: number;
+		linesAdded?: number;
+		linesRemoved?: number;
+		stagedLinesAdded?: number;
+		stagedLinesRemoved?: number;
+		unstagedLinesAdded?: number;
+		unstagedLinesRemoved?: number;
 	}>;
 	/** Total changed files (may exceed files.length when capped server-side). */
 	totalFiles: number;
+	/** False means the scan stopped early; undefined preserves older responses. */
+	totalFilesExact?: boolean;
 	headSha: string;
 	branch: string;
-	linesAdded: number;
-	linesRemoved: number;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface GitStashEntry {
@@ -201,7 +203,10 @@ const deniedGitSummaries = new WeakMap<QueryClient, Set<string>>();
 // Presentation summaries may paint immediately, but can never become Git API targets.
 const gitSummarySeeds = new WeakSet<GitWorkspace>();
 const gitDetailSummaryScopes = new WeakMap<GitWorkspaceSummary, string>();
-export type GitDisplayCounts = Pick<GitStatusSummary, "totalFiles" | "linesAdded" | "linesRemoved">;
+export type GitDisplayCounts = Pick<
+	GitStatusSummary,
+	"totalFiles" | "totalFilesExact" | "truncated" | "linesAdded" | "linesRemoved"
+>;
 interface GitDisplaySnapshot {
 	scope: string;
 	workspace: GitWorkspace;
@@ -535,6 +540,8 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 			if (!narratorId || !data || accessFailure || denied) return;
 			storeGitDisplay(qc, narratorId, scope, data, {
 				totalFiles: counts.totalFiles,
+				totalFilesExact: counts.totalFilesExact,
+				truncated: counts.truncated,
 				linesAdded: counts.linesAdded,
 				linesRemoved: counts.linesRemoved,
 			});

@@ -2,6 +2,7 @@
 	"panel.title": "Git",
 	"workspace.statusTruncated": "Status output was truncated; file counts may be incomplete. Bulk actions affect the entire working tree.",
 	"workspace.sectionTruncated": "{{section}} count is a lower bound",
+	"workspace.atLeastFiles": "at least {{count}}",
 	"workspace.serverFilesTruncated": "some files are not shown",
 	"workspace.ready": "Git workspace",
 	"workspace.loading": "Checking workspace…",

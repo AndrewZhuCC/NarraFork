@@ -43,7 +43,14 @@ mock.module("@frontend/hooks/useChapterGitStatus", () => ({
 mock.module("@frontend/hooks/useContainers", () => ({ useContainers: () => ({ data: [] }) }));
 let gitWorkspace: { data?: GitWorkspace; isPending?: boolean; isError?: boolean } = {};
 let gitStatus:
-	| { branch: string; totalFiles: number; linesAdded: number; linesRemoved: number }
+	| {
+			branch: string;
+			totalFiles: number;
+			totalFilesExact?: boolean;
+			truncated?: boolean;
+			linesAdded?: number;
+			linesRemoved?: number;
+	  }
 	| undefined;
 mock.module("@frontend/hooks/useGit", () => ({
 	useGitWorkspace: () => gitWorkspace,
@@ -71,7 +78,9 @@ mock.module("react-i18next", () => ({
 		t: (key: string, values?: Record<string, unknown>) =>
 			key === "worktree.legacyContainerSource"
 				? `original:${values?.title}:${values?.chapterId}:${values?.path}`
-				: key,
+				: key === "workspace.atLeastFiles"
+					? `at least ${values?.count}`
+					: key,
 	}),
 }));
 mock.module("../dock/NarratorDockContext", () => ({ useNarratorDockContext: () => null }));
@@ -357,6 +366,23 @@ for (const variant of ["chapter", "standalone"] as const) {
 		});
 		expect(container.textContent).toContain("authoritative-branch");
 		expect((container.firstElementChild as HTMLElement).style.height).toBe("30px");
+		gitStatus = { branch: "lightweight", totalFiles: 12, totalFilesExact: false };
+		await act(async () => {
+			render();
+			await flush();
+		});
+		if (variant === "standalone") {
+			expect(container.textContent).toContain("at least 12");
+			expect(container.textContent).not.toContain("+100");
+			expect(container.textContent).not.toContain("-2");
+			expect(container.textContent).not.toMatch(/[+-]0|NaN/);
+			gitStatus = { ...gitStatus, totalFilesExact: true, truncated: true };
+			await act(async () => {
+				render();
+				await flush();
+			});
+			expect(container.textContent).not.toContain("at least");
+		}
 	});
 }
 for (const variant of ["chapter", "standalone"] as const) {

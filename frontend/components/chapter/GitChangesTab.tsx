@@ -96,13 +96,14 @@ type Translate = (key: string, opts?: Record<string, unknown>) => string;
 interface DisplayFile {
 	status: string;
 	path: string;
-	displayLinesAdded: number;
-	displayLinesRemoved: number;
+	displayLinesAdded?: number;
+	displayLinesRemoved?: number;
 }
 
 /** Everything a tree row needs that does not change per node. */
 interface TreeContext {
 	canWrite: boolean;
+	directoryStatsComplete: boolean;
 	keyPrefix: string;
 	action: "stage" | "unstage";
 	/**
@@ -212,13 +213,16 @@ export function GitChangesTab({
 	const hiddenUnstaged = hiddenGitSectionRows(matchedUnstaged.length, displayUnstaged.length);
 	const totalFiles = gitTotalFileCount(status);
 	const serverCapped = totalFiles > gitUniqueFileCount(status.files);
+	const countsAreLowerBounds =
+		status.totalFilesExact === false ||
+		(status.totalFilesExact === undefined && !!status.truncated);
 	const stagedCountLabel = formatGitSectionCount(
 		gitSectionCount(status, "staged"),
-		!!status.truncated,
+		countsAreLowerBounds,
 	);
 	const unstagedCountLabel = formatGitSectionCount(
 		gitSectionCount(status, "unstaged"),
-		!!status.truncated,
+		countsAreLowerBounds,
 	);
 	const filterActive = statusFilter.selected.size > 0;
 	const filterHidesEverything =
@@ -271,6 +275,11 @@ export function GitChangesTab({
 	): TreeContext {
 		return {
 			canWrite,
+			directoryStatsComplete:
+				!countsAreLowerBounds &&
+				!serverCapped &&
+				!filterActive &&
+				(section === "staged" ? hiddenStaged === 0 : hiddenUnstaged === 0),
 			keyPrefix,
 			action,
 			section,
@@ -431,7 +440,7 @@ export function GitChangesTab({
 				</Tooltip>
 			</Group>
 
-			{status.truncated && (
+			{countsAreLowerBounds && (
 				<Text size="xs" c="yellow" px="xs" pt={4}>
 					{t("workspace.statusTruncated")}
 				</Text>
@@ -459,7 +468,9 @@ export function GitChangesTab({
 					)}
 
 					{(matchedStaged.length > 0 ||
-						(!filterActive && status.truncated && gitSectionCount(status, "staged") > 0)) && (
+						(!filterActive &&
+							(serverCapped || countsAreLowerBounds) &&
+							gitSectionCount(status, "staged") > 0)) && (
 						<Stack gap={2}>
 							<Group gap="xs" justify="space-between" px={4}>
 								<Text size="xs" fw={600}>
@@ -484,10 +495,11 @@ export function GitChangesTab({
 								</Button>
 							</Group>
 							{renderRows("staged", "unstage", displayStaged, stagedFolders, "s")}
-							{(hiddenStaged > 0 || status.truncated) && (
+							{(hiddenStaged > 0 || serverCapped || countsAreLowerBounds) && (
 								<Text size="xs" c="dimmed" ta="center">
 									{hiddenStaged > 0 ? `+${hiddenStaged} more` : null}
-									{status.truncated
+									{serverCapped ? ` ${t("workspace.serverFilesTruncated")}` : null}
+									{countsAreLowerBounds
 										? ` ${t("workspace.sectionTruncated", { section: t("staged") })}`
 										: null}
 								</Text>
@@ -496,7 +508,9 @@ export function GitChangesTab({
 					)}
 
 					{(matchedUnstaged.length > 0 ||
-						(!filterActive && status.truncated && gitSectionCount(status, "unstaged") > 0)) && (
+						(!filterActive &&
+							(serverCapped || countsAreLowerBounds) &&
+							gitSectionCount(status, "unstaged") > 0)) && (
 						<Stack gap={2}>
 							<Group gap="xs" justify="space-between" px={4}>
 								<Text size="xs" fw={600}>
@@ -533,11 +547,11 @@ export function GitChangesTab({
 								</Group>
 							</Group>
 							{renderRows("unstaged", "stage", displayUnstaged, unstagedFolders, "u")}
-							{(hiddenUnstaged > 0 || serverCapped || status.truncated) && (
+							{(hiddenUnstaged > 0 || serverCapped || countsAreLowerBounds) && (
 								<Text size="xs" c="dimmed" ta="center">
 									{hiddenUnstaged > 0 ? `+${hiddenUnstaged} more` : null}
 									{serverCapped ? ` ${t("workspace.serverFilesTruncated")}` : null}
-									{status.truncated
+									{countsAreLowerBounds
 										? ` ${t("workspace.sectionTruncated", { section: t("unstaged") })}`
 										: null}
 								</Text>
@@ -726,7 +740,9 @@ function TreeRow({
 }
 
 /** Aggregated +/- counts, rendered for both folder and file rows. */
-function LineStats({ added, removed }: { added: number; removed: number }) {
+function LineStats({ added, removed }: { added?: number; removed?: number }) {
+	if (added == null || removed == null || !Number.isFinite(added) || !Number.isFinite(removed))
+		return null;
 	if (added <= 0 && removed <= 0) return null;
 	return (
 		<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -755,8 +771,21 @@ function DirectoryRow({
 }) {
 	const expanded = ctx.expandedFolders.has(node.path);
 	const files = collectFiles(node);
-	const added = files.reduce((sum, f) => sum + f.displayLinesAdded, 0);
-	const removed = files.reduce((sum, f) => sum + f.displayLinesRemoved, 0);
+	const complete =
+		ctx.directoryStatsComplete &&
+		files.every(
+			(f) =>
+				f.displayLinesAdded != null &&
+				f.displayLinesRemoved != null &&
+				Number.isFinite(f.displayLinesAdded) &&
+				Number.isFinite(f.displayLinesRemoved),
+		);
+	const added = complete
+		? files.reduce((sum, f) => sum + (f.displayLinesAdded as number), 0)
+		: undefined;
+	const removed = complete
+		? files.reduce((sum, f) => sum + (f.displayLinesRemoved as number), 0)
+		: undefined;
 	// Folder rows reuse the file wording: the action is the same, only the scope differs.
 	const actionLabel = ctx.action === "stage" ? ctx.t("stageFile") : ctx.t("unstageFile");
 
