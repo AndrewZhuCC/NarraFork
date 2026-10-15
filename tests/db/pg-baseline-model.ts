@@ -123,10 +123,12 @@ export type ExpectedColumn = {
 	/** `null` unless the column is GENERATED ... AS IDENTITY. */
 	identity: { type: "always" | "byDefault"; sequenceName: string } | null;
 };
+/** Array position is the index key position; expression keys never masquerade as columns. */
+export type IndexKey = string | { expression: string };
 export type ExpectedIndex = {
 	table: string;
 	name: string;
-	columns: string[];
+	columns: IndexKey[];
 	isUnique: boolean;
 	method: string;
 	/** Raw snapshot predicate; canonicalized through the server before comparison. */
@@ -419,29 +421,19 @@ export function physicalColumnOrder(
 }
 
 /**
- * Column names of a snapshot index, in index order.
- *
- * Snapshot index columns are objects (`{expression, isExpression, asc, nulls}`), so the
- * name lives in `expression`; stringifying the object yields "[object Object]", which
- * compares unequal against every real column name and therefore reports every index as
- * broken. Anything this gate cannot express — an expression key, DESC, NULLS FIRST — is
- * reported instead of being flattened into a name.
+ * Column names and expression keys of a snapshot index, preserving position and kind.
+ * Expressions are canonicalized by PostgreSQL, never flattened into column names.
+ * Unsupported DESC/NULLS FIRST ordering still fails closed.
  */
 export function expectedIndexColumns(
 	table: string,
 	index: SnapshotIndex,
 	problems: string[],
-): string[] {
-	const names: string[] = [];
+): IndexKey[] {
+	const names: IndexKey[] = [];
 	for (const column of index.columns ?? []) {
 		if (typeof column !== "object" || column === null || typeof column.expression !== "string") {
 			problems.push(`index ${table}.${index.name}: unreadable column entry ${clip(column)}`);
-			continue;
-		}
-		if (column.isExpression) {
-			problems.push(
-				`index ${table}.${index.name}: expression keys are not covered (${clip(column.expression)})`,
-			);
 			continue;
 		}
 		if (column.asc === false || (column.nulls ?? "last") !== "last") {
@@ -449,7 +441,7 @@ export function expectedIndexColumns(
 				`index ${table}.${index.name}: only ASC/NULLS LAST is covered (${clip(column)})`,
 			);
 		}
-		names.push(column.expression);
+		names.push(column.isExpression ? { expression: column.expression } : column.expression);
 	}
 	if (names.length === 0) problems.push(`index ${table}.${index.name}: no key columns`);
 	return names;
@@ -571,8 +563,11 @@ export const CATALOG_FACETS = {
 	indexes: `SELECT c.relname || '#' || i.relname AS "k",
 			json_build_array(
 				c.relname, i.relname, ix.indisunique,
-				(SELECT json_agg(z.attname ORDER BY u.n) FROM unnest(ix.indkey) WITH ORDINALITY u(attnum, n)
-					JOIN pg_attribute z ON z.attrelid = ix.indrelid AND z.attnum = u.attnum),
+				(SELECT json_agg(CASE WHEN u.attnum = 0
+					THEN json_build_object('expression', pg_get_indexdef(ix.indexrelid, u.n::int, true))
+					ELSE to_json(z.attname) END ORDER BY u.n)
+					FROM unnest(ix.indkey) WITH ORDINALITY u(attnum, n)
+					LEFT JOIN pg_attribute z ON z.attrelid = ix.indrelid AND z.attnum = u.attnum),
 				(SELECT json_agg(u.opt ORDER BY u.n) FROM unnest(ix.indoption) WITH ORDINALITY u(opt, n)),
 				am.amname, pg_get_expr(ix.indpred, ix.indrelid),
 				ix.indnatts, ix.indnkeyatts, ix.indnullsnotdistinct,
@@ -755,7 +750,7 @@ export type ActualColumn = ExpectedColumn;
 export type ActualIndex = {
 	table: string;
 	name: string;
-	columns: string[];
+	columns: IndexKey[];
 	options: number[];
 	isUnique: boolean;
 	method: string;
@@ -888,7 +883,20 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 			table: String(row[0]),
 			name: String(row[1]),
 			isUnique: row[2] === true,
-			columns: asStrings(row[3]),
+			columns: Array.isArray(row[3])
+				? row[3].map((key: unknown) => {
+						if (typeof key === "string") return key;
+						if (
+							key !== null &&
+							typeof key === "object" &&
+							"expression" in key &&
+							typeof key.expression === "string"
+						)
+							return { expression: key.expression };
+						problems.push(`index ${row[0]}.${row[1]}: unreadable key ${clip(key)}`);
+						return "<unresolved key>";
+					})
+				: [],
 			options: asNumbers(row[4]),
 			method: String(row[5]),
 			where: asString(row[6]),
@@ -941,6 +949,7 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 // ---------------------------------------------------------------------------------------
 
 export type DeparseRequest =
+	| { id: string; kind: "index"; table: string; text: string }
 	| { id: string; kind: "predicate"; table: string; keyColumn: string; text: string }
 	| { id: string; kind: "check"; table: string; text: string }
 	| { id: string; kind: "generated"; table: string; type: string; text: string }
@@ -976,13 +985,18 @@ export function deparseRequests(expected: Expected): DeparseRequest[] {
 		requests.push(request);
 	};
 	for (const index of expected.indexes) {
+		for (const key of index.columns) {
+			if (typeof key === "string") continue;
+			counter += 1;
+			push({ id: `idx_${counter}`, kind: "index", table: index.table, text: key.expression });
+		}
 		if (index.where === null) continue;
 		counter += 1;
 		push({
 			id: `pred_${counter}`,
 			kind: "predicate",
 			table: index.table,
-			keyColumn: firstColumn.get(index.table) ?? index.columns[0],
+			keyColumn: firstColumn.get(index.table) ?? "<missing ordinary column>",
 			text: index.where,
 		});
 	}
@@ -1033,7 +1047,9 @@ export function buildDeparseScript(requests: DeparseRequest[]): string {
 	}
 	for (const request of requests) {
 		const scratch = alias.get(request.table);
-		if (request.kind === "predicate") {
+		if (request.kind === "index") {
+			lines.push(`CREATE INDEX nf_${request.id} ON ${scratch} ((${request.text}));`);
+		} else if (request.kind === "predicate") {
 			lines.push(
 				`CREATE INDEX nf_${request.id} ON ${scratch} ("${request.keyColumn}") WHERE ${request.text};`,
 			);
@@ -1052,6 +1068,9 @@ export function buildDeparseScript(requests: DeparseRequest[]): string {
 	}
 	lines.push(`SELECT json_build_array(i.relname, pg_get_expr(ix.indpred, ix.indrelid))::text
 		FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE i.relname LIKE 'nf\\_pred\\_%'
+	UNION ALL
+	SELECT json_build_array(i.relname, pg_get_indexdef(ix.indexrelid, 1, true))::text
+		FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE i.relname LIKE 'nf\\_idx\\_%'
 	UNION ALL
 	SELECT json_build_array(conname, pg_get_constraintdef(oid))::text
 		FROM pg_constraint WHERE conname LIKE 'nf\\_chk\\_%'
@@ -1359,7 +1378,15 @@ export function compareBaseline(
 			expected.indexes.map((index) => [
 				indexKey(index),
 				{
-					columns: index.columns,
+					columns: index.columns.map((key) =>
+						typeof key === "string"
+							? key
+							: {
+									expression:
+										canonical.get(deparseKey("index", index.table, key.expression)) ??
+										`<no canonical form for ${key.expression}>`,
+								},
+					),
 					isUnique: index.isUnique,
 					method: index.method,
 					where:

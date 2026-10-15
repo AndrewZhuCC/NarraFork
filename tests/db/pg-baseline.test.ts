@@ -287,6 +287,13 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 						match: /^foreign key chapters_project_id_projects_id_fk: missing/,
 					},
 					{
+						label: "changed expression index key",
+						sql: `DROP INDEX "idx_token_repair_single_active";
+CREATE UNIQUE INDEX "idx_token_repair_single_active" ON "usage_token_repair_jobs" ((2)) WHERE status IN ('analyzing', 'ready', 'applying');`,
+						facets: ["indexes"],
+						match: /^index usage_token_repair_jobs\.idx_token_repair_single_active: expected/,
+					},
+					{
 						label: "dropped index",
 						sql: `DROP INDEX "idx_acl_event_created";`,
 						facets: ["indexes"],
@@ -404,6 +411,7 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 			// And the gate can still fail on real damage.
 			expect(observed.tamperDetected).toEqual([
 				"dropped foreign key",
+				"changed expression index key",
 				"dropped index",
 				"changed default",
 				"dropped unique constraint",

@@ -26,6 +26,7 @@ import {
 	dumpFacet,
 	type Expected,
 	FACET_WIDTHS,
+	type FacetName,
 	facetMetaSql,
 	migrationScript,
 	normDefault,
@@ -571,16 +572,16 @@ describe("snapshot index columns", () => {
 		}
 	});
 
-	it("reports an expression key it cannot express instead of naming it", () => {
-		const tampered = snapshot();
-		childIndex(tampered).columns = [
-			{ expression: "lower(created_at)", isExpression: true, asc: true, nulls: "last" },
+	it("preserves an expression key instead of naming it as a column", () => {
+		const snap = snapshot();
+		childIndex(snap).columns = [
+			{ expression: "(1)", isExpression: true, asc: true, nulls: "last" },
 		];
-		const built = buildExpected(tampered);
-		expect(built.problems).toEqual([
-			"index child.idx_child_created: expression keys are not covered (lower(created_at))",
-			"index child.idx_child_created: no key columns",
-		]);
+		const built = buildExpected(snap);
+		expect(built.problems).toEqual([]);
+		expect(
+			built.expected.indexes.find((index) => index.name === "idx_child_created")?.columns,
+		).toEqual([{ expression: "(1)" }]);
 	});
 
 	it("reports DESC or NULLS FIRST in the snapshot", () => {
@@ -1282,6 +1283,115 @@ describe("identity and incremental column order", () => {
 		const built = buildExpected(next, [old, next]);
 		expect(built.problems).toEqual([]);
 		expect(built.expected.columnOrder.get("child")).toEqual(expected);
+	});
+});
+
+describe("expression index keys", () => {
+	function expressionFixture(mixed = false) {
+		const state = fixture();
+		const snap = snapshot();
+		childIndex(snap).columns = [
+			...(mixed ? [{ expression: "created_at", isExpression: false, asc: true }] : []),
+			{ expression: "(1)", isExpression: true, asc: true },
+		];
+		const built = buildExpected(snap);
+		expect(built.problems).toEqual([]);
+		state.expected = built.expected;
+		const index = state.catalog.indexes[0];
+		index.columns = [...(mixed ? ["created_at"] : []), { expression: "1" }];
+		index.keyColumnCount = index.totalColumnCount = index.columns.length;
+		index.options = index.columns.map(() => 0);
+		state.canonical.set(deparseKey("index", "child", "(1)"), "1");
+		return state;
+	}
+	const diff = (state: ReturnType<typeof fixture>) =>
+		compareBaseline(state.expected, state.catalog, state.canonical, state.counts);
+
+	it("compares a single constant using the server's canonical form", () => {
+		expect(diff(expressionFixture())).toEqual([]);
+	});
+
+	it("preserves mixed column/expression positions and rejects reordered keys", () => {
+		const state = expressionFixture(true);
+		expect(diff(state)).toEqual([]);
+		state.catalog.indexes[0].columns.reverse();
+		expect(diff(state)).toContainEqual(
+			expect.stringContaining("index child.idx_child_created: expected"),
+		);
+	});
+
+	it("rejects a changed, missing, or column-replaced expression", () => {
+		for (const columns of [[{ expression: "2" }], [], ["1"], ["created_at"]]) {
+			const state = expressionFixture();
+			state.catalog.indexes[0].columns = columns;
+			expect(diff(state)).toContainEqual(
+				expect.stringContaining("index child.idx_child_created: expected"),
+			);
+		}
+	});
+
+	it("fails closed without canonicalization and preserves ordering checks on expressions", () => {
+		const state = expressionFixture();
+		state.canonical.delete(deparseKey("index", "child", "(1)"));
+		expect(diff(state)).toContainEqual(expect.stringContaining("no canonical form"));
+		state.catalog.indexes[0].options = [1];
+		expect(diff(state)).toContainEqual(expect.stringContaining("non-default key ordering"));
+		const snap = snapshot();
+		childIndex(snap).columns = [{ expression: "1", isExpression: true, asc: false }];
+		expect(buildExpected(snap).problems).toContainEqual(
+			expect.stringContaining("only ASC/NULLS LAST"),
+		);
+	});
+
+	it("parses catalog keys without losing expression position or kind", () => {
+		const facets: Record<FacetName, unknown[][]> = {
+			tables: [],
+			columns: [],
+			foreignKeys: [],
+			uniques: [],
+			checks: [],
+			generated: [],
+			sequences: [],
+			indexes: [
+				[
+					"child",
+					"mixed",
+					false,
+					["created_at", { expression: "1" }, "id"],
+					[0, 0, 0],
+					"btree",
+					null,
+					3,
+					3,
+					false,
+					null,
+				],
+			],
+		};
+		const parsed = parseCatalog(facets);
+		expect(parsed.problems).toEqual([]);
+		expect(parsed.catalog.indexes[0].columns).toEqual(["created_at", { expression: "1" }, "id"]);
+		facets.indexes[0][3] = ["created_at", null, "id"];
+		expect(parseCatalog(facets).problems).toContainEqual(expect.stringContaining("unreadable key"));
+		expect(CATALOG_FACETS.indexes).toContain("LEFT JOIN pg_attribute");
+		expect(CATALOG_FACETS.indexes).toContain("u.attnum = 0");
+		expect(CATALOG_FACETS.indexes).toContain("pg_get_indexdef(ix.indexrelid, u.n::int, true)");
+	});
+
+	it("round-trips expression requests through scratch index deparse", () => {
+		const state = expressionFixture(true);
+		const requests = deparseRequests(state.expected).filter((request) => request.kind === "index");
+		expect(requests).toHaveLength(1);
+		const request = requests[0];
+		const script = buildDeparseScript(requests);
+		expect(script).toContain(`CREATE INDEX nf_${request.id} ON nf_scratch_0 (((1)));`);
+		expect(script).toContain("pg_get_indexdef(ix.indexrelid, 1, true)");
+		const parsed = parseDeparseOutput(requests, JSON.stringify([`nf_${request.id}`, "1"]));
+		expect(parsed.problems).toEqual([]);
+		expect(parsed.canonical.get(deparseKey("index", "child", "(1)"))).toBe("1");
+		expect(parseDeparseOutput(requests, "").problems).toEqual([
+			"deparse: server returned nothing for index on child",
+		]);
 	});
 });
 
