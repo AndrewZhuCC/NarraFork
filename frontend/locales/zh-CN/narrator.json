@@ -324,6 +324,23 @@
 		"fixedCount": "已固定 {{count}} 项",
 		"sessionHelp": "只影响之后新建的子代理；指定后覆盖主代理传入的等级，实际请求按模型支持情况适配。不指定会移除本层覆盖、恢复继承，不等于 none（关闭思考）。"
 	},
+	"quote": {
+		"source": {
+			"assistant": "助手消息",
+			"user": "用户消息",
+			"message": "消息",
+			"merged": "{{count}} 段内容"
+		},
+		"add": "引用",
+		"addHint": "引用选中内容（Alt+Q）",
+		"dismiss": "忽略",
+		"remove": "移除引用",
+		"limit": "每条消息最多引用 {{count}} 段内容。",
+		"fileUnsaved": "保存文件后才能引用该选区",
+		"addFailed": "无法添加引用",
+		"placeholder": "针对引用内容提问…",
+		"open": "定位到引用内容"
+	},
 	"fileReferences": {
 		"title": "文件引用",
 		"searching": "正在搜索文件…",

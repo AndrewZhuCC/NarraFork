@@ -169,6 +169,40 @@ describe("measureMessageBubble — user", () => {
 		expect(bodyHeight).toBe(c.BODY_LINE_HEIGHT * 3);
 	});
 
+	it("shows sent quotes as chips and leaves the typed body", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const body = "what does this mean?";
+		const stored = `> [quote] short explanation @@m:msg1234\n> short explanation of the quote chip\n\n${body}`;
+		const quoted = measureMessageBubble({ role: "user", text: stored }, 440);
+		const plain = measureMessageBubble({ role: "user", text: body }, 440);
+		const chips = quoted.blocks.find(
+			(block) => block.kind === "fixed" && block.tag === "user-quote-chips",
+		);
+		expect(chips?.kind).toBe("fixed");
+		if (chips?.kind !== "fixed") return;
+		const storedQuotes = chips.data?.quotes as { label: string; anchor: string | null }[];
+		expect(storedQuotes[0]?.label).toBe("short explanation");
+		expect(storedQuotes[0]?.anchor).toBe("m:msg1234");
+		expect(chips.height).toBe(MEASURE_MESSAGE_CONSTANTS.USER_QUOTE_CHIP_HEIGHT);
+		expect(quoted.height - plain.height).toBe(
+			MEASURE_MESSAGE_CONSTANTS.USER_QUOTE_CHIP_HEIGHT +
+				MEASURE_MESSAGE_CONSTANTS.USER_ATTACHMENT_GAP,
+		);
+		const quotedBody = quoted.blocks.find((block) => block.kind === "code");
+		expect(JSON.stringify(quotedBody)).not.toContain("[quote]");
+		expect(JSON.stringify(quotedBody)).not.toContain("@@");
+		const onlyQuote = measureMessageBubble(
+			{
+				role: "user",
+				text: "> [quote] hello there @@m:msg1234\n> hello there\n\n",
+			},
+			440,
+		);
+		expect(onlyQuote.blocks.some((block) => block.kind === "code")).toBe(false);
+	});
+
 	it("shrink-wraps: narrow content uses less than full width", async () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const r = measureMessageBubble({ role: "user", text: "hi" }, 1000);

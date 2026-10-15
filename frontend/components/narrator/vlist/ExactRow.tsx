@@ -22,6 +22,7 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
+import { QUOTE_ROLE_ATTR } from "../composer/quote-source-attrs";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
@@ -959,6 +960,7 @@ export const ExactRow = memo(
 				// to this node (see vlist-fold-motion). `id` cannot serve: it is the
 				// MESSAGE id, which several rows of one message share. Height-neutral.
 				data-nf-row-key={item.spec.key}
+				{...(kind === "markdown" ? { [QUOTE_ROLE_ATTR]: "assistant" } : {})}
 				style={{
 					position: "absolute",
 					top,

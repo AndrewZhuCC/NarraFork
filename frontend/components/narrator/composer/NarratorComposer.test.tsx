@@ -9,6 +9,7 @@ import { parseHTML } from "linkedom";
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { joinQuotedComposerInput } from "./composer-quotes";
 import { FileReferenceScopeProvider } from "./FileReferenceScope";
 import { insertFileReference } from "./file-reference-input";
 import {
@@ -682,6 +683,28 @@ describe("composer atomic reference contract", () => {
 		expect(updateSpy.mock.calls[0]?.[4]).toEqual([]);
 		expect(handle.current?.getFileReferences()).toEqual([]);
 		expect(readNarratorInputDraft("u1", "n1").fileReferences).toBeUndefined();
+	});
+	test("quote prefix renders as chips, keeps the textarea to the body, and persists with the draft", async () => {
+		await render();
+		const prefix = "> [quote] Assistant message\n> hello\n> world\n\n";
+		const body = insertFileReference({ text: "explain ", fileReferences: [] }, reference);
+		const full = joinQuotedComposerInput(
+			[{ label: "Assistant message", text: "hello\nworld" }],
+			body,
+		);
+		expect(full.text).toBe(`${prefix}${body.text}`);
+		await act(async () => handle.current?.restoreInput(full.text, full.fileReferences));
+		const textarea = host.querySelector("textarea");
+		expect(textarea?.value).toBe(body.text);
+		expect(host.textContent).toContain("Assistant message");
+		expect(handle.current?.getText()).toBe(`${prefix}${body.text}`);
+		expect(handle.current?.getFileReferences()[0].inputRange?.[0]).toBe(
+			prefix.length + "explain ".length,
+		);
+		expect(readNarratorInputDraft("u1", "n1").text).toBe(`${prefix}${body.text}`);
+		await act(async () => handle.current?.appendText("more"));
+		expect(handle.current?.getText().startsWith(prefix)).toBe(true);
+		expect(textarea?.value).toBe(`${body.text}\nmore`);
 	});
 	test("metadata-only input is sendable and conflicts with a different remote target", async () => {
 		await render();

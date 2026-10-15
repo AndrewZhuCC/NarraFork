@@ -324,6 +324,23 @@
 		"fixedCount": "{{count}} fixed",
 		"sessionHelp": "Only affects newly created subagents. A specified tier overrides the agent's input and is adapted to model support. Not specified removes this layer's override and restores inheritance; it is not none (thinking off)."
 	},
+	"quote": {
+		"source": {
+			"assistant": "Assistant message",
+			"user": "User message",
+			"message": "Message",
+			"merged": "{{count}} blocks"
+		},
+		"add": "Quote",
+		"addHint": "Quote selection (Alt+Q)",
+		"dismiss": "Dismiss",
+		"remove": "Remove quote",
+		"limit": "You can quote up to {{count}} excerpts per message.",
+		"fileUnsaved": "Save the file to quote this selection",
+		"addFailed": "Could not add quote",
+		"placeholder": "Ask about the quoted content…",
+		"open": "Show quoted text"
+	},
 	"fileReferences": {
 		"title": "File references",
 		"searching": "Searching files…",
