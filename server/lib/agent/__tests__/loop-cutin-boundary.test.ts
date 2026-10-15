@@ -2,8 +2,15 @@ import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import { AnthropicProvider } from "../anthropic-provider";
 import { OpenAIProvider } from "../openai-provider";
-import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "../provider";
+import type {
+	BuiltHistory,
+	ChatParams,
+	DbMessage,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "../provider";
 import { toolRegistry } from "../tool-registry";
+import { uniquifyDbMessageToolUseIds } from "../tool-use-id-dedup";
 import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 /**
@@ -188,7 +195,11 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 }
 
 describe("model input adoption boundary", () => {
-	async function runInput(overrides: Partial<AgentConfig>, history: unknown[] = []) {
+	async function runInput(
+		overrides: Partial<AgentConfig>,
+		history: unknown[] = [],
+		initialToolResults?: unknown[],
+	) {
 		for await (const _event of agentLoop(
 			{
 				narratorId: "n-consumption",
@@ -202,6 +213,7 @@ describe("model input adoption boundary", () => {
 			},
 			"initial",
 			history,
+			initialToolResults,
 		)) {
 			/* Drain to the real provider-input boundary. */
 		}
@@ -245,6 +257,7 @@ describe("model input adoption boundary", () => {
 		format: (typeof historyFormats)[number],
 		script: Array<ParsedStreamEvent[] | Error>,
 		overrides: Partial<AgentConfig> = {},
+		initial?: BuiltHistory,
 	): Promise<HistoryRequest[]> {
 		const provider = historyProvider(format);
 		const requests: HistoryRequest[] = [];
@@ -275,7 +288,11 @@ describe("model input adoption boundary", () => {
 			for (const event of response) yield event;
 		});
 		try {
-			await runInput({ maxTurns: 8, maxTransientRetries: 0, ...overrides });
+			await runInput(
+				{ maxTurns: 8, maxTransientRetries: 0, ...overrides },
+				initial?.history,
+				initial?.trailingToolResults,
+			);
 			return requests;
 		} finally {
 			chat.mockRestore();
@@ -284,6 +301,180 @@ describe("model input adoption boundary", () => {
 			userTurn.mockRestore();
 		}
 	}
+
+	function completedHistoryTool(id: string, toolUseId: string, value: string): DbMessage {
+		return {
+			id,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: toolUseId, name: FAST, input: { value } }],
+			contentText: null,
+			parentToolUseId: null,
+			messageUuid: null,
+			toolCalls: [
+				{
+					toolUseId,
+					toolName: FAST,
+					inputJson: { value },
+					outputJson: `done:${value}`,
+					status: "success",
+				},
+			],
+		};
+	}
+
+	function toolPairIds(request: Pick<HistoryRequest, "history" | "toolResults">) {
+		const calls: string[] = [];
+		const results: string[] = [];
+		const visit = (value: unknown): void => {
+			if (Array.isArray(value)) {
+				for (const entry of value) visit(entry);
+				return;
+			}
+			if (!value || typeof value !== "object") return;
+			const block = value as Record<string, unknown>;
+			if (block.type === "function_call" && typeof block.call_id === "string") {
+				calls.push(block.call_id);
+			} else if (
+				(block.type === "tool_use" || block.type === "function") &&
+				typeof block.id === "string"
+			) {
+				calls.push(block.id);
+			}
+			if (typeof block.tool_call_id === "string") results.push(block.tool_call_id);
+			if (block.type === "function_call_output" && typeof block.call_id === "string") {
+				results.push(block.call_id);
+			}
+			if (typeof block.tool_use_id === "string") results.push(block.tool_use_id);
+			for (const entry of Object.values(block)) visit(entry);
+		};
+		visit([request.history, request.toolResults]);
+		return { calls, results };
+	}
+
+	test.each([
+		...historyFormats,
+	])("%s keeps rebuilt first-turn tool IDs after reasoning-only compact", async (format) => {
+		const provider = historyProvider(format);
+		const rows = [
+			completedHistoryTool("old-prefix", "call_same", "old-prefix"),
+			completedHistoryTool("kept-tail", "call_same", "kept-tail"),
+		];
+		const initial = await provider.buildHistory(
+			uniquifyDbMessageToolUseIds(rows),
+			"history-probe-model",
+		);
+		const rebuilt = await provider.buildHistory(
+			uniquifyDbMessageToolUseIds(rows.slice(1)),
+			"history-probe-model",
+		);
+		let compacts = 0;
+		const requests = await runHistoryInput(
+			format,
+			[
+				[{ contextUsagePercentage: 96 }, { reasoning: "context is full" }],
+				[historyTool("post-compact", "after-compact")],
+				[{ text: "finished" }],
+			],
+			{
+				onReasoningOnlyHighContext: async () => {
+					compacts++;
+					return { history: rebuilt.history, pendingToolResults: rebuilt.trailingToolResults };
+				},
+			},
+			initial,
+		);
+		expect(compacts).toBe(1);
+		expect(requests).toHaveLength(3);
+		expect(toolPairIds(requests[0]).calls).toEqual(["call_same", "call_same_nfdup2"]);
+		expect(toolPairIds(requests[1]).calls).toEqual(["call_same"]);
+		expect(toolPairIds(requests[2]).calls).toEqual(["call_same", "post-compact"]);
+		for (const request of requests) {
+			const pairs = toolPairIds(request);
+			expect(pairs.results).toEqual(pairs.calls);
+		}
+		expect(occurrences(requests[2], "call_same_nfdup2")).toBe(0);
+		expect(occurrences(requests[2], "done:after-compact")).toBe(1);
+	});
+
+	test.each([
+		"responses",
+		"completions",
+	] as const)("%s does not reappend initial tool results moved into rebuilt history", async (format) => {
+		const provider = historyProvider(format);
+		const row = completedHistoryTool("initial-tool", "initial-tool", "initial-tool");
+		const initial = await provider.buildHistory([row], "history-probe-model");
+		const rebuilt = await provider.buildHistory(
+			[
+				row,
+				{
+					id: "new-context",
+					role: "sys",
+					contentJson: [{ type: "text", text: "context added during preparation" }],
+					contentText: "context added during preparation",
+					parentToolUseId: null,
+					messageUuid: null,
+				},
+			],
+			"history-probe-model",
+		);
+		expect(initial.trailingToolResults).toHaveLength(1);
+		expect(rebuilt.trailingToolResults).toEqual([]);
+		let switched = false;
+		const requests = await runHistoryInput(
+			format,
+			[[historyTool("after-rebuild", "after-rebuild")], [{ text: "finished" }]],
+			{
+				getModelOverride: () => (switched ? null : "test:rebuilt-model"),
+				onBeforeTurn: async (turn, reason) => {
+					if (!reason?.force) return null;
+					expect(turn).toBe(0);
+					expect(reason.cause).toBe("model_switch");
+					switched = true;
+					return { history: rebuilt.history, pendingToolResults: rebuilt.trailingToolResults };
+				},
+			},
+			initial,
+		);
+		expect(switched).toBe(true);
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			const pairs = toolPairIds(request);
+			expect(pairs.results).toEqual(pairs.calls);
+			expect(occurrences(request, "done:initial-tool")).toBe(1);
+		}
+		expect(occurrences(requests[1], "done:after-rebuild")).toBe(1);
+	});
+
+	test.each([
+		...historyFormats,
+	])("%s retains rebuilt tool results when the run started without any", async (format) => {
+		const rebuilt = await historyProvider(format).buildHistory(
+			[completedHistoryTool("newly-completed", "newly-completed", "newly-completed")],
+			"history-probe-model",
+		);
+		expect(rebuilt.trailingToolResults).toHaveLength(1);
+		let switched = false;
+		const requests = await runHistoryInput(
+			format,
+			[[historyTool("after-rebuild", "after-rebuild")], [{ text: "finished" }]],
+			{
+				getModelOverride: () => (switched ? null : "test:rebuilt-model"),
+				onBeforeTurn: async (_turn, reason) => {
+					if (!reason?.force) return null;
+					switched = true;
+					return { history: rebuilt.history, pendingToolResults: rebuilt.trailingToolResults };
+				},
+			},
+		);
+		expect(requests).toHaveLength(2);
+		expect(toolPairIds(requests[0]).calls).toEqual(["newly-completed"]);
+		expect(toolPairIds(requests[1]).calls).toEqual(["newly-completed", "after-rebuild"]);
+		for (const request of requests) {
+			const pairs = toolPairIds(request);
+			expect(pairs.results).toEqual(pairs.calls);
+			expect(occurrences(request, "done:newly-completed")).toBe(1);
+		}
+	});
 
 	test.each([
 		...historyFormats,
