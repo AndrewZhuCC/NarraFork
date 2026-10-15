@@ -243,6 +243,29 @@ describe("createPointerDragTracker", () => {
 		}
 	});
 
+	it("drops a dragstart that a later listener cancels, because dragend will not fire", async () => {
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => releases++);
+		const cancel = (event: Event) => event.preventDefault();
+		document.addEventListener("dragstart", cancel, true);
+		try {
+			fire("pointerdown", 1);
+			fire("mousedown");
+			fire("dragstart");
+			await Promise.resolve();
+			// The press is still down, but the native-drag slot must not outlive
+			// the cancelled dragstart. pointerup + mouseup are delivered when the
+			// browser never takes the gesture over.
+			fire("pointerup", 1);
+			fire("mouseup");
+			expect(tracker.isDown()).toBe(false);
+			expect(releases).toBe(1);
+		} finally {
+			document.removeEventListener("dragstart", cancel, true);
+			tracker.dispose();
+		}
+	});
+
 	it("native drag survives pointercancel even when compatibility mousedown is absent", () => {
 		let releases = 0;
 		const tracker = createPointerDragTracker(() => releases++);

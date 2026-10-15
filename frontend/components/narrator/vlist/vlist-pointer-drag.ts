@@ -29,6 +29,8 @@
  * Native dragstart therefore holds its own slot until drop/dragend clears ALL
  * slots. Otherwise the orphaned MOUSE_ID defers a Dockview merge/swap's new width
  * until the 3s backstop, even though the user has already released the panel.
+ * A dragstart whose default action is cancelled does not get a slot: that drag
+ * never emits dragend, and keeping the slot would freeze width settle until reload.
  *
  * Listeners use the CAPTURE phase with `passive: true`: capture runs before any
  * bubble-phase `stopPropagation` an intermediate node might apply, and passive
@@ -86,8 +88,17 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 	const onDown = (event: Event) => {
 		active.add(slotOf(event));
 	};
-	const onDragStart = () => {
+	const onDragStart = (event: Event) => {
+		// A dragstart whose default is cancelled never emits dragend. Counting it
+		// would leave this slot set for the life of the page. Listeners registered
+		// later in the same turn (the text-selection guard) may cancel after us,
+		// so a slot opened for a drag that ends up cancelled is dropped here.
+		if (event.defaultPrevented) return;
 		active.add(NATIVE_DRAG_ID);
+		queueMicrotask(() => {
+			if (!event.defaultPrevented || !active.delete(NATIVE_DRAG_ID)) return;
+			if (active.size === 0) onRelease();
+		});
 	};
 	/**
 	 * Release ONE pointer. Reports a release only when it was the last one held.
