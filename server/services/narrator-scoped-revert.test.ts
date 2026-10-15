@@ -18,6 +18,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { generateId } from "../lib/id";
 import { safeSpawn } from "../lib/spawn";
 import {
@@ -43,7 +44,8 @@ const dirs: string[] = [];
 async function fixture() {
 	const repo = mkdtempSync(join(tmpdir(), "nf-scoped-m0-"));
 	dirs.push(repo);
-	await safeSpawn({ cmd: ["git", "init"], cwd: repo, timeout: 15_000 });
+	const initialized = await safeSpawn({ cmd: ["git", "init"], cwd: repo, timeout: 2_000 });
+	expect(initialized.exitCode).toBe(0);
 	const narratorId = generateId();
 	const now = new Date().toISOString();
 	await db.insert(narrators).values({ id: narratorId, cwd: repo, createdAt: now, updatedAt: now });
@@ -132,7 +134,7 @@ async function call(f: Fixture, mutate: () => void | Promise<void>, opts: CallOp
 		createdAt,
 		executionDeviceId: opts.executionDeviceId ?? "local",
 		executionCwd: f.repo,
-		executionPathFlavor: "posix",
+		executionPathFlavor: localPathSemantics.flavor,
 		resolvedFilePath:
 			opts.resolvedFilePath ?? (typeof input.file_path === "string" ? input.file_path : null),
 		isBackground: opts.isBackground ?? false,
@@ -180,6 +182,18 @@ afterEach(async () => {
 });
 
 describe("M0 complete operation coverage", () => {
+	test("native fixture captures a real tree without hiding initialization errors", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.repo, "a.txt"), "native capture\n");
+		// Unlike the hot-path hook, capture throws the original error. Keep this
+		// cold-start check separate so every M0 case need not scan an extra tree.
+		const tree = await worktreeTreeSnapshot.capture(f.repo);
+		expect(tree).toMatch(/^[a-f0-9]{40}$/);
+		expect(await worktreeTreeSnapshot.readFileAtTree(f.repo, tree, "a.txt")).toBe(
+			"native capture\n",
+		);
+	});
+
 	test.each([
 		"success",
 		"fail",
@@ -209,19 +223,25 @@ describe("M0 complete operation coverage", () => {
 
 	test("a nonzero shell exit cannot erase the write it already made", async () => {
 		const f = await fixture();
+		const windows = process.platform === "win32";
+		const command = windows
+			? "echo partial>a.txt & exit /b 7"
+			: "printf 'partial\\n' > a.txt; exit 7";
 		await call(
 			f,
 			async () => {
 				const result = await safeSpawn({
-					cmd: ["sh", "-c", "printf 'partial\\n' > a.txt; exit 7"],
+					cmd: windows
+						? [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", command]
+						: ["sh", "-c", command],
 					cwd: f.repo,
-					timeout: 15_000,
+					timeout: 2_000,
 				});
 				expect(result.exitCode).toBe(7);
 			},
 			{
 				toolName: "Bash",
-				input: { command: "printf 'partial\\n' > a.txt; exit 7" },
+				input: { command },
 				status: "fail",
 				capture: "before",
 			},
@@ -235,7 +255,7 @@ describe("M0 complete operation coverage", () => {
 			fileCount: 0,
 			failures: [],
 		});
-		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("partial\n");
+		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe(windows ? "partial\r\n" : "partial\n");
 	});
 
 	test("background success and equal trees do not settle a late writer", async () => {
