@@ -10,6 +10,7 @@ import {
 } from "../../shared/independent-update-mirror";
 import { isValidReleaseVersion } from "../../shared/release-version";
 import { parseUpdateNotes } from "../../shared/update-index";
+import { WebDavError } from "../../shared/webdav-transport";
 import {
 	downloadReleaseAsset,
 	hashReleaseFile,
@@ -69,10 +70,46 @@ export interface IndependentMirrorReceipt {
 	failureCode?: "FAILED_CONFIG" | "CANCELLED" | "MIRROR_FAILED" | "SERVER_RECEIPT_REQUIRED";
 }
 export class IndependentMirrorError extends Error {
-	constructor(readonly receipt: IndependentMirrorReceipt) {
+	readonly transportDiagnostic?: { code: string; httpStatus?: number };
+
+	constructor(
+		readonly receipt: IndependentMirrorReceipt,
+		failure?: unknown,
+	) {
 		super(
 			`Independent mirror ${receipt.failureCode ?? "MIRROR_FAILED"}; GitHub publication is unchanged${receipt.failureCode === "SERVER_RECEIPT_REQUIRED" ? "; upgrade update server for server-sha256 receipts; no asset GET fallback" : ""}`,
 		);
+		// Never copy arbitrary exception messages/URLs, request headers, response bodies
+		// or credentials into the wire receipt or CLI diagnostics.
+		try {
+			if (failure instanceof WebDavError) {
+				const knownCodes = [
+					"TIMEOUT",
+					"ABORTED",
+					"NETWORK_ERROR",
+					"HTTP_STATUS",
+					"REDIRECT",
+					"EARLY_RESPONSE",
+					"INTEGRITY",
+					"SIZE_LIMIT",
+					"SIZE_MISMATCH",
+					"INVALID_INPUT",
+				];
+				const code = failure.code;
+				const status = failure.status;
+				this.transportDiagnostic = {
+					code: knownCodes.includes(code) ? code : "OTHER_WEBDAV_ERROR",
+					...(typeof status === "number" &&
+					Number.isInteger(status) &&
+					status >= 100 &&
+					status <= 599
+						? { httpStatus: status }
+						: {}),
+				};
+			}
+		} catch {
+			// Diagnostics must not replace the original failure, including exotic getters.
+		}
 	}
 }
 export interface MirrorPublishedOptions {
@@ -240,7 +277,12 @@ export async function mirrorPublishedMainRelease(
 			}
 			try {
 				if (stage) {
-					await stage.uploadObject(asset, stream);
+					await timeReleasePhase(
+						"mirror.webdav-upload",
+						{ inputBytes: asset.size, platform: asset.platform, version },
+						() => stage.uploadObject(asset, stream),
+						signal,
+					);
 					receipt.uploaded.push(asset.name);
 					continue;
 				}
@@ -361,7 +403,7 @@ export async function mirrorPublishedMainRelease(
 			: error instanceof Error && error.message.includes("upgrade the update server")
 				? "SERVER_RECEIPT_REQUIRED"
 				: "MIRROR_FAILED";
-		throw new IndependentMirrorError(receipt);
+		throw new IndependentMirrorError(receipt, error);
 	} finally {
 		if (directory) await rm(directory, { recursive: true, force: true });
 	}

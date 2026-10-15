@@ -5,10 +5,10 @@ import {
 	resolveMirrorRelayConfig,
 	resolveMirrorTransport,
 } from "../../scripts/lib/mirror-relay-stage";
-import { IndependentMirrorError } from "../../scripts/lib/update-server-main-mirror";
+import { IndependentMirrorError, mirrorReceipt } from "../../scripts/lib/update-server-main-mirror";
 import { mirrorPublishedGitHubRelease } from "../../scripts/mirror-update-server";
 import { parseRelayReady, relayBucketExpired } from "../../shared/mirror-relay";
-import { WebDavClient } from "../../shared/webdav-transport";
+import { WebDavClient, WebDavError } from "../../shared/webdav-transport";
 import { createWebDavFixture } from "../fixtures/webdav-fixture";
 import { config, mirrorFixture, repository, sha } from "./mirror-fixture";
 
@@ -343,4 +343,91 @@ describe("bounded producer retention", () => {
 			expect(result.retention).toBe("RETENTION_INCOMPLETE");
 			expect(readyObjects(f.dav).filter(([path]) => path.endsWith(".json"))).toHaveLength(1);
 		});
+});
+
+describe("safe independent mirror transport diagnostics", () => {
+	test("retains only known WebDAV codes and valid HTTP status, never raw errors", () => {
+		const receipt = mirrorReceipt({ ...identity, transport: "webdav" });
+		for (const [failure, expected] of [
+			[new WebDavError("TIMEOUT"), { code: "TIMEOUT" }],
+			[new WebDavError("HTTP_STATUS", 503), { code: "HTTP_STATUS", httpStatus: 503 }],
+			[new WebDavError("HTTP_STATUS", 700), { code: "HTTP_STATUS" }],
+			[
+				new WebDavError("https://private.invalid/?token=PRIVATE_CREDENTIAL"),
+				{ code: "OTHER_WEBDAV_ERROR" },
+			],
+			[new Error("PRIVATE_CREDENTIAL https://private.invalid/"), undefined],
+		] as const) {
+			const wrapped = new IndependentMirrorError(receipt, failure);
+			expect(wrapped.transportDiagnostic).toEqual(expected);
+			expect(wrapped.receipt).toBe(receipt);
+			expect(JSON.stringify(wrapped)).not.toContain("PRIVATE_CREDENTIAL");
+			expect(JSON.stringify(wrapped)).not.toContain("private.invalid");
+		}
+		const exotic = new WebDavError("TIMEOUT");
+		Object.defineProperty(exotic, "code", {
+			get() {
+				throw new Error("diagnostic getter");
+			},
+		});
+		expect(new IndependentMirrorError(receipt, exotic).transportDiagnostic).toBeUndefined();
+	});
+
+	for (const code of ["TIMEOUT", "HTTP_STATUS"] as const) {
+		test(`${code} preserves partial upload evidence and bounded phase diagnostics without publishing ready`, async () => {
+			const f = fixture();
+			const github = mirrorFixture();
+			const before = JSON.stringify(github.publicRelease);
+			const client = f.relay.client;
+			if (!client) throw new Error("Expected fixture transport");
+			const originalPut = client.put.bind(client);
+			let attempts = 0;
+			const put = spyOn(client, "put").mockImplementation(async (...args) => {
+				if (++attempts === 2) throw new WebDavError(code, code === "HTTP_STATUS" ? 503 : undefined);
+				return originalPut(...args);
+			});
+			const events: Array<Record<string, unknown>> = [];
+			const output = spyOn(console, "info").mockImplementation((line) => {
+				if (typeof line === "string" && line.startsWith("{")) events.push(JSON.parse(line));
+			});
+			try {
+				let failure: unknown;
+				try {
+					await mirrorPublishedGitHubRelease({
+						...identity,
+						transport: "webdav",
+						relay: f.relay,
+						run: github.run,
+						downloadAsset: github.downloadAsset,
+					});
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBeInstanceOf(IndependentMirrorError);
+				const wrapped = failure as IndependentMirrorError;
+				expect(wrapped.transportDiagnostic).toEqual({
+					code,
+					...(code === "HTTP_STATUS" ? { httpStatus: 503 } : {}),
+				});
+				expect(wrapped.receipt.status).toBe("FAILED");
+				expect(wrapped.receipt.uploaded).toHaveLength(1);
+				expect(wrapped.receipt.verified).toEqual([]);
+				expect(wrapped.receipt.snapshotCommitted).toBe(false);
+				expect(readyObjects(f.dav)).toHaveLength(0);
+				expect(github.httpCalls).toHaveLength(0);
+				expect(JSON.stringify(github.publicRelease)).toBe(before);
+				const uploads = events.filter(
+					(event) => event.phase === "mirror.webdav-upload" && event.state === "end",
+				);
+				expect(uploads.map((event) => event.status)).toEqual(["success", "error"]);
+				for (const event of uploads) {
+					expect(event.durationMs).toBeGreaterThanOrEqual(0);
+					expect(event.inputBytes).toBeGreaterThan(0);
+				}
+			} finally {
+				put.mockRestore();
+				output.mockRestore();
+			}
+		});
+	}
 });

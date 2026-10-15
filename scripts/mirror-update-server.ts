@@ -171,6 +171,19 @@ async function main() {
 			error instanceof IndependentMirrorError
 				? error.receipt
 				: { ...receipt, failureCode: signal.aborted ? "CANCELLED" : "MIRROR_FAILED" };
+		if (error instanceof IndependentMirrorError && error.transportDiagnostic) {
+			try {
+				console.error(
+					JSON.stringify({
+						event: "mirror.transport.failure",
+						transport: receipt.transport,
+						...error.transportDiagnostic,
+					}),
+				);
+			} catch {
+				// Best-effort logging must not replace the failure or prevent its receipt.
+			}
+		}
 	} finally {
 		process.removeListener("SIGINT", cancel);
 		process.removeListener("SIGTERM", cancel);
