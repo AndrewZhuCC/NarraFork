@@ -2831,6 +2831,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
 	 */
 	let toolsPlanModeDisabled = planModeDisablesTools();
+	// The current provider-formatted results are the single replay source, including on
+	// turn zero: a retry rebuild may rename IDs or move these results into history.
+	// Never re-read initialToolResults when committing or reflecting the current input.
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
@@ -3115,7 +3118,7 @@ async function* agentLoopInMetadataSnapshot(
 	 *
 	 * Rebuilt on every history replacement so it always describes the live history.
 	 */
-	let historyToolUseIds = collectToolUseIdsFromHistory(history, initialToolResults);
+	let historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 
 	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
 		resetUpstreamSessionOnNextRequest = true;
@@ -3250,7 +3253,7 @@ async function* agentLoopInMetadataSnapshot(
 				history,
 				isFirstTurn ? userText : combinePendingInput(nextTurnContent, pendingInputParts),
 				effectiveModel,
-				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+				pendingToolResults,
 				isFirstTurn ? images : undefined,
 			);
 			yield { type: "turn_complete", turnIndex };
@@ -3309,7 +3312,7 @@ async function* agentLoopInMetadataSnapshot(
 					reflectionHistory,
 					content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				return reflectionHistory;
@@ -6511,12 +6514,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "done" };
 						return;
 					}
-					provider.pushUserTurn(
-						history,
-						content,
-						effectiveModel,
-						isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					);
+					provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					pendingToolResults = [];
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
@@ -7101,7 +7099,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				yield { type: "turn_complete", turnIndex };
@@ -7164,7 +7162,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				if (
@@ -7197,13 +7195,7 @@ async function* agentLoopInMetadataSnapshot(
 				});
 				if (toolUses.length === 0) {
 					if (isFirstTurn) {
-						provider.pushUserTurn(
-							history,
-							userText,
-							effectiveModel,
-							initialToolResults ?? [],
-							images,
-						);
+						provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
 					} else if (content || pendingToolResults.length > 0) {
 						provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					}
@@ -7243,7 +7235,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 				);
 				provider.pushAssistantTurn(history, assistantText, []);
 				pendingToolResults = [];
@@ -7265,7 +7257,7 @@ async function* agentLoopInMetadataSnapshot(
 			// After-tools injections are already consumed; retain their actual content
 			// in memory too, or later requests lose them until a full history rebuild.
 			if (isFirstTurn) {
-				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
+				provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
 			} else if (content || pendingToolResults.length > 0) {
 				provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 			}
