@@ -92,6 +92,18 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "intelligent_ui",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "IntelligentUI",
+			descriptionEn:
+				"Intelligent UI — draw UI in the conversation as it is generated, composed from the project's own component kit (or built-in components), and preview workspace UI files",
+			descriptionZh:
+				"智能 UI — 在对话中边生成边绘制界面，使用项目自己的组件包（或内置组件）组合，并可预览工作区 UI 文件",
+		},
+	},
+	{
 		id: "notification",
 		type: "tool",
 		category: "tools",

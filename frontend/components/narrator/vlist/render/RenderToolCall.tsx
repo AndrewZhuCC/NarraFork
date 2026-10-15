@@ -30,6 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { IntelligentUICard } from "@frontend/components/intelligent-ui/IntelligentUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
@@ -2032,6 +2033,27 @@ export function RenderToolBody({
 		}),
 		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
 	);
+	if (model.kind === "intelligent-ui")
+		return (
+			<IntelligentUICard
+				narratorId={narratorId}
+				file={model.file}
+				publicSummary={model.publicSummary}
+				historyUnavailable={model.historyUnavailable}
+				inline={
+					model.text === undefined
+						? undefined
+						: {
+								source: model.text,
+								live: model.live === true,
+								title: model.title,
+								runtime: model.runtime,
+							}
+				}
+				kit={model.kit}
+				height={height}
+			/>
+		);
 	if (model.kind === "ask")
 		return (
 			<AskDetailBlocks

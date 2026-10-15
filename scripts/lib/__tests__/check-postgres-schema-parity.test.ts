@@ -476,6 +476,7 @@ describe("real schema parity", () => {
 		expect(target.tables.length).toBe(121);
 		// 1717 SQLite-derived columns plus the three PG-only insert_seq identity columns.
 		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1720);
+		expect(target.tables.some((table) => table.name.startsWith("intelligent_ui_"))).toBe(false);
 		expect(
 			target.tables
 				.find((table) => table.name === "model_history_revision_contracts")
