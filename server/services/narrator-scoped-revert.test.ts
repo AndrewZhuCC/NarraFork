@@ -652,16 +652,32 @@ describe("M0 rejects unverified ownership without mutation", () => {
 		false,
 	])("a new operation pointer cannot mask another legacy call (new operation first=%s)", async (newFirst) => {
 		const f = await fixture();
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "first\n"), {
+		const first = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "first\n"), {
 			recordOperation: newFirst,
+			capture: "both",
 		});
-		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "second\n"), {
+		const second = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "second\n"), {
 			seq: 2,
 			recordOperation: !newFirst,
+			capture: "both",
 		});
+		for (const [target, isOperation] of [
+			[first, newFirst],
+			[second, !newFirst],
+		] as const) {
+			const boundary = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, target.toolUseId),
+				columns: { fileChangeOperationId: true, treeHashBefore: true, treeHashAfter: true },
+			});
+			expect(Boolean(boundary?.fileChangeOperationId)).toBe(isOperation);
+			expect(boundary?.treeHashBefore).toMatch(/^[a-f0-9]{40}$/);
+			expect(boundary?.treeHashAfter).toMatch(/^[a-f0-9]{40}$/);
+		}
 		await expectRefused(f, "legacy_unverified");
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("second\n");
-	});
+		// One git-init (2s), four real hot captures (4s each), plus 2s for DAO/cleanup.
+		// A capture that degrades to null still fails the four hash assertions above.
+	}, 20_000);
 });
 
 describe("M0 selector and history safety", () => {
