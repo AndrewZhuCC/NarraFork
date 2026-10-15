@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { EXECUTOR_RELEASE_VERSION } from "../../shared/helper-distribution";
 
@@ -8,7 +8,9 @@ const repoRoot = resolve(import.meta.dir, "../..");
 const releaseSource = readFileSync(resolve(repoRoot, "scripts/release.ts"), "utf8");
 
 function mirrorFixture(args: string[], missing = false, executor = false, cancellation = false) {
-	const root = mkdtempSync(join(repoRoot, ".narrafork/release-mirror-cli-"));
+	const temporaryParent = join(repoRoot, ".narrafork");
+	mkdirSync(temporaryParent, { recursive: true });
+	const root = mkdtempSync(join(temporaryParent, "release-mirror-cli-"));
 	const entry = join(root, "fixture.ts");
 	writeFileSync(
 		entry,
