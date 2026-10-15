@@ -7,9 +7,11 @@ import type { GeminiProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -266,7 +268,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
 
 		const url = `${this.baseUrl()}/interactions`;
-		const headers = this.headers(true);
+		const headers = this.headers(true, params.conversationId);
 		params.requestDump?.beginResponseAttempt(
 			{
 				transport: "http",
@@ -513,13 +515,29 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 	}
 
-	private headers(stream: boolean): Record<string, string> {
-		return {
+	private headers(stream: boolean, conversationId?: string): Record<string, string> {
+		const fingerprint = resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			conversationId,
+		});
+		const headers = new Headers({
 			"Content-Type": "application/json",
 			"x-goog-api-key": this.getApiKey(),
 			"Api-Revision": INTERACTIONS_REVISION,
+			"User-Agent": fingerprint.userAgent,
 			...(stream ? { Accept: "text/event-stream" } : {}),
-		};
+			...buildOpencodeSessionHeader({
+				baseUrl: this.baseUrl(),
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		});
+		// HTTP names are case-insensitive; extra headers replace, never comma-join defaults.
+		for (const [name, value] of Object.entries(fingerprint.headers)) headers.set(name, value);
+		return Object.fromEntries(headers.entries());
 	}
 
 	private buildRequestBody(options: {
@@ -1454,8 +1472,12 @@ function sanitizeNode(node: unknown): unknown {
 	const output: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
 		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
+		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
+			continue;
+		}
 		if (key === "const") {
-			output.enum = [value];
+			// Gemini's enum field accepts strings only; retain the type for other literals.
+			if (typeof value === "string") output.enum = [value];
 		} else if (key === "properties" && value && typeof value === "object") {
 			output.properties = Object.fromEntries(
 				Object.entries(value as Record<string, unknown>).map(([name, schema]) => [

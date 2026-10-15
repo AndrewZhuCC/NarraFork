@@ -225,6 +225,9 @@ const nugProviderSchema = z.object({
 });
 
 const geminiProviderSchema = z.object({
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),
