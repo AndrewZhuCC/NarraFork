@@ -985,6 +985,110 @@ function executorProjection(version: string, commit = "a".repeat(40)) {
 	};
 }
 
+for (const transport of ["direct", "pull-service"] as const) {
+	test(`${transport} accepts canonical executor go-*.txt licences, rejecting undeclared files and binaries`, async () => {
+		await withServer(async (ctx) => {
+			const original = executorProjection("0.9.1");
+			const licenses = [
+				"go-stdlib.txt",
+				"go-doublestar.txt",
+				"go-coder-websocket.txt",
+				"go-creack-pty.txt",
+				"go-x-sys.txt",
+				"go-purego.txt",
+			].map((name) => {
+				const content = `Canonical upstream licence text for ${name}\n`;
+				return {
+					name,
+					size: Buffer.byteLength(content),
+					sha256: digest(Buffer.from(content)),
+					content,
+				};
+			});
+			const manifest = JSON.parse(original.assets[0].content);
+			manifest.licenses = licenses.map(({ name, size, sha256 }) => ({ name, size, sha256 }));
+			const content = JSON.stringify(manifest);
+			const payload = {
+				...original,
+				assets: [
+					{
+						name: EXECUTOR_MANIFEST_FILENAME,
+						size: Buffer.byteLength(content),
+						sha256: digest(Buffer.from(content)),
+						content,
+					},
+					...licenses,
+				],
+			};
+			const url = `${ctx.url}/tools/executor/${payload.tag}`;
+			const deliver = async (input: typeof payload) => {
+				if (transport === "pull-service")
+					return ctx.ingest.commitTools(
+						"narrafork",
+						"executor",
+						payload.tag,
+						input,
+						new AbortController().signal,
+					);
+				const response = await ctx.app.request(url, {
+					method: "POST",
+					headers: { Authorization: `Bearer ${ctx.token}` },
+					body: JSON.stringify(input),
+				});
+				if (response.status !== 200) throw new Error((await response.json()).error);
+				return response.json();
+			};
+			const binary = {
+				name: executorPublishedFilename("0.9.1", "linux-amd64"),
+				size: 3,
+				sha256: digest(Buffer.from("bin")),
+				content: "bin",
+			};
+			for (const mutate of [
+				(p: typeof payload) => {
+					p.assets.push({ ...binary });
+				},
+				(p: typeof payload) => {
+					p.assets.push({ ...binary, name: "undeclared.txt" });
+				},
+				(p: typeof payload) => {
+					p.assets[1] = { ...binary };
+				},
+				(p: typeof payload) => {
+					p.assets[1] = { ...p.assets[2] };
+				},
+				(p: typeof payload) => {
+					p.assets[1].content += "\u0000";
+					p.assets[1].size++;
+					p.assets[1].sha256 = digest(Buffer.from(p.assets[1].content));
+				},
+				(p: typeof payload) => {
+					p.assets[1].content += "altered";
+					p.assets[1].size = Buffer.byteLength(p.assets[1].content);
+					p.assets[1].sha256 = digest(Buffer.from(p.assets[1].content));
+				},
+				(p: typeof payload) => {
+					p.assets[1].size++;
+				},
+				(p: typeof payload) => {
+					p.assets[1].sha256 = "f".repeat(64);
+				},
+			]) {
+				const invalid = structuredClone(payload);
+				mutate(invalid);
+				await expect(deliver(invalid)).rejects.toThrow();
+				expect((await ctx.app.request(url)).status).toBe(404);
+			}
+			const receipt = await deliver(payload);
+			expect(receipt.verification).toBe("server-sha256");
+			expect(receipt.verified).toEqual(
+				payload.assets.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
+			);
+			expect(await (await ctx.app.request(url)).json()).toEqual(payload);
+		});
+	});
+}
+
 test("tools persist exact tags immutably across out-of-order requests and restart, with bounded legacy compatibility", async () => {
 	await withServer(async (ctx) => {
 		const next = executorProjection("1.2.0");

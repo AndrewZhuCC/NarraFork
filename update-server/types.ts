@@ -39,6 +39,8 @@ export interface MirrorRelayConfig {
 	bearerTokenEnv?: string;
 	signingKeyEnv?: string;
 	pollIntervalSeconds?: number;
+	/** Optional HTTPS download CDN hosts. Never applies to writes or discovery. */
+	downloadRedirectHosts?: string[];
 }
 
 /** Server configuration persisted to config.json */

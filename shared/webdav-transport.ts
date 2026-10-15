@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
+import { parse as parseDomain } from "tldts";
 
 export type WebDavConfig = {
 	url: string;
 	feed: string;
 	auth: { username: string; password: string } | { bearerToken: string };
+	downloadRedirectHosts?: string[];
 };
 export class WebDavError extends Error {
 	constructor(
@@ -27,6 +30,70 @@ const SHA = /^[a-f0-9]{64}$/;
 const MAX_OBJECT_BYTES = 4 * 1024 ** 3;
 const CONTROL_TIMEOUT_MS = 30_000;
 const STREAM_TIMEOUT_MS = 15 * 60_000;
+const DOWNLOAD_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+function publicDownloadHostname(host: string): boolean {
+	const labels = host.split(".");
+	if (
+		!(
+			host.length <= 253 &&
+			labels.length >= 2 &&
+			labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) &&
+			/^[a-z]{2,63}$/.test(labels.at(-1) ?? "") &&
+			!isIP(host)
+		)
+	)
+		return false;
+	const parsed = parseDomain(host, { allowPrivateDomains: true });
+	return !!parsed.domain && (parsed.isIcann === true || parsed.isPrivate === true);
+}
+function downloadHosts(input: unknown): string[] | undefined {
+	if (input === undefined) return undefined;
+	check(Array.isArray(input) && input.length <= 8);
+	const normalized = Array.from(input, (value: unknown) => {
+		check(typeof value === "string" && value.length > 0 && value === value.trim());
+		const normalized = value.toLowerCase();
+		const wildcard = normalized.startsWith("*.");
+		const host = wildcard ? normalized.slice(2) : normalized;
+		check(publicDownloadHostname(host) && (!wildcard || host.split(".").length >= 3));
+		return normalized;
+	});
+	return normalized.length ? [...new Set(normalized)] : undefined;
+}
+function downloadRedirectUrl(location: string | null, current: URL, hosts: string[]): URL {
+	check(
+		typeof location === "string" &&
+			location.length > 0 &&
+			location.length <= 8192 &&
+			!hasControl(location) &&
+			!/[\\\s#]/.test(location),
+		"REDIRECT_TARGET",
+	);
+	let target: URL;
+	try {
+		target = new URL(location, current);
+	} catch {
+		throw new WebDavError("REDIRECT_TARGET");
+	}
+	check(
+		target.protocol === "https:" &&
+			!target.port &&
+			!target.username &&
+			!target.password &&
+			!target.hash &&
+			publicDownloadHostname(target.hostname) &&
+			!/^(?:https:)?\/\/[^/?#]*@/i.test(location),
+		"REDIRECT_TARGET",
+	);
+	check(
+		hosts.some((entry) =>
+			entry.startsWith("*.")
+				? target.hostname.endsWith(`.${entry.slice(2)}`) && target.hostname !== entry.slice(2)
+				: target.hostname === entry,
+		),
+		"REDIRECT_HOST",
+	);
+	return target;
+}
 function validDate(date: string): boolean {
 	return (
 		/^\d{4}-\d\d-\d\d$/.test(date) &&
@@ -52,6 +119,8 @@ export function validateWebDavConfig(input: WebDavConfig): WebDavConfig {
 				!input.url.split("/").some((s) => s === "." || s === ".."),
 		);
 		check(typeof input.feed === "string" && SEGMENT.test(input.feed));
+		const hosts = downloadHosts(input.downloadRedirectHosts);
+		const redirects = hosts ? { downloadRedirectHosts: hosts } : {};
 		const auth = input.auth;
 		check(auth && typeof auth === "object");
 		if ("bearerToken" in auth) {
@@ -64,6 +133,7 @@ export function validateWebDavConfig(input: WebDavConfig): WebDavConfig {
 				url: `${u.href.replace(/\/+$/, "")}/`,
 				feed: input.feed,
 				auth: { bearerToken: auth.bearerToken },
+				...redirects,
 			};
 		}
 		check(
@@ -82,6 +152,7 @@ export function validateWebDavConfig(input: WebDavConfig): WebDavConfig {
 			url: `${u.href.replace(/\/+$/, "")}/`,
 			feed: input.feed,
 			auth: { username: auth.username, password: auth.password },
+			...redirects,
 		};
 	} catch {
 		throw new WebDavError("INVALID_CONFIG");
@@ -236,7 +307,16 @@ export class WebDavClient {
 		pathParts(path, this.config.feed);
 		return new URL(`${path}${collection ? "/" : ""}`, this.config.url);
 	}
-	private async request(url: URL, init: RequestInit, life: Lifetime): Promise<Response> {
+	private async request(
+		url: URL,
+		init: RequestInit,
+		life: Lifetime,
+		download?: { anonymous: boolean },
+	): Promise<Response> {
+		const manualDownload =
+			download !== undefined &&
+			init.method === "GET" &&
+			!!this.config.downloadRedirectHosts?.length;
 		let receivedResponse: Response | undefined;
 		let abandoned = false;
 		const cancelUnownedBody = () => {
@@ -257,9 +337,18 @@ export class WebDavClient {
 			const response = await life.run(() =>
 				Promise.resolve(
 					this.fetchImpl(url, {
-						...init,
-						headers: { ...init.headers, Authorization: this.authorization },
-						redirect: "error",
+						...(download?.anonymous
+							? {
+									method: "GET",
+									headers: new Headers(),
+									credentials: "omit" as const,
+									referrer: "",
+									referrerPolicy: "no-referrer" as const,
+								}
+							: { ...init, headers: { ...init.headers, Authorization: this.authorization } }),
+						// Real fetch rejects a 302 with mode "error" before headers are
+						// available. Only opted-in GETs expose them for our own checks.
+						redirect: manualDownload ? "manual" : "error",
 						signal: life.signal,
 					}),
 				).then((response) => {
@@ -269,7 +358,11 @@ export class WebDavClient {
 					return response;
 				}),
 			);
-			if (response.redirected || (response.status >= 300 && response.status < 400)) {
+			const mayFollowDownload = manualDownload && DOWNLOAD_REDIRECT_STATUSES.has(response.status);
+			if (
+				response.redirected ||
+				(response.status >= 300 && response.status < 400 && !mayFollowDownload)
+			) {
 				cancelUnownedBody();
 				throw new WebDavError("REDIRECT", response.status);
 			}
@@ -426,19 +519,40 @@ export class WebDavClient {
 		const life = lifetime(signal, timeout);
 		let response: Response | undefined;
 		try {
-			response = await this.request(
-				this.url(path, method === "PROPFIND"),
-				{
-					method,
-					...(method === "PROPFIND"
-						? {
-								headers: { Depth: "1", "Content-Type": "application/xml" },
-								body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
-							}
-						: {}),
-				},
-				life,
-			);
+			let current = this.url(path, method === "PROPFIND");
+			const visited = new Set([current.href]);
+			let hops = 0;
+			for (;;) {
+				response = await this.request(
+					current,
+					{
+						method,
+						...(method === "PROPFIND"
+							? {
+									headers: { Depth: "1", "Content-Type": "application/xml" },
+									body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
+								}
+							: {}),
+					},
+					life,
+					method === "GET" ? { anonymous: hops > 0 } : undefined,
+				);
+				if (!DOWNLOAD_REDIRECT_STATUSES.has(response.status)) break;
+				void response.body?.cancel().catch(() => {});
+				check(
+					method === "GET" && this.config.downloadRedirectHosts?.length && hops < 3,
+					"REDIRECT_LIMIT",
+				);
+				const next = downloadRedirectUrl(
+					response.headers.get("location"),
+					current,
+					this.config.downloadRedirectHosts,
+				);
+				check(!visited.has(next.href), "REDIRECT_LOOP");
+				visited.add(next.href);
+				current = next;
+				hops++;
+			}
 			if (response.status === 404) {
 				void response.body?.cancel().catch(() => {});
 				life.finish();

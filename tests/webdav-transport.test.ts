@@ -903,3 +903,487 @@ describe("strict bounded Depth-1 XML discovery", () => {
 		).rejects.toThrow("SIZE_LIMIT");
 	});
 });
+
+describe("operator-opted GET-only download redirects", () => {
+	const downloadHost = "123-184-221-162-v3.pd1.cjjd19.com";
+	const signed = `https://${downloadHost}/object?signature=private-signed-query`;
+	const enabled: WebDavConfig = { ...config, downloadRedirectHosts: ["*.pd1.cjjd19.com"] };
+	function redirect(location: string, status = 302, canceled?: () => void): Response {
+		return new Response(
+			new ReadableStream<Uint8Array>({
+				start(c) {
+					c.enqueue(new Uint8Array([1]));
+				},
+				cancel() {
+					canceled?.();
+				},
+			}),
+			{ status, headers: { location, "set-cookie": "private-cookie=private-secret" } },
+		);
+	}
+	test("normalizes explicit public hosts with PSL/private-suffix checks and preserves absent-field shape", () => {
+		expect(validateWebDavConfig(config)).toEqual(config);
+		expect(validateWebDavConfig({ ...config, downloadRedirectHosts: [] })).toEqual(config);
+		expect(
+			validateWebDavConfig({
+				...config,
+				auth: { bearerToken: "secret" },
+				downloadRedirectHosts: [],
+			}),
+		).toEqual({ ...config, auth: { bearerToken: "secret" } });
+		expect(
+			validateWebDavConfig({
+				...config,
+				downloadRedirectHosts: ["*.PD1.CJJD19.COM", downloadHost.toUpperCase(), downloadHost],
+			}).downloadRedirectHosts,
+		).toEqual(["*.pd1.cjjd19.com", downloadHost]);
+		for (const hosts of [
+			null,
+			"*.pd1.cjjd19.com",
+			[""],
+			[" "],
+			[" cdn.example.com"],
+			["cdn.example.com "],
+			["https://cdn.example.com"],
+			["cdn.example.com:443"],
+			["cdn.example.com/path"],
+			["cdn.example.com?x"],
+			["cdn.example.com#x"],
+			["cdn.example.com."],
+			["user@cdn.example.com"],
+			["com"],
+			["co.uk"],
+			["github.io"],
+			["s3.amazonaws.com"],
+			["*.s3.amazonaws.com"],
+			["*.co.uk"],
+			["*.example.com"],
+			["*.localhost"],
+			["localhost"],
+			["cdn.localhost"],
+			["cdn.internal"],
+			["cdn.local"],
+			["cdn.test"],
+			["127.0.0.1"],
+			["10.0.0.1"],
+			["192.168.1.1"],
+			["169.254.169.254"],
+			["[::1]"],
+			["::1"],
+			["0x7f000001"],
+			["2130706433"],
+			["127.1"],
+			["*pd1.cjjd19.com"],
+			["a.*.cjjd19.com"],
+			Array.from({ length: 9 }, () => downloadHost),
+			Array(1),
+			[undefined],
+		])
+			expect(() =>
+				validateWebDavConfig({ ...config, downloadRedirectHosts: hosts as string[] }),
+			).toThrow("INVALID_CONFIG");
+	});
+
+	for (const status of [301, 302, 303, 307, 308]) {
+		test(`explicit exact/wildcard GET opt-in follows ${status} without forwarding credentials`, async () => {
+			for (const hosts of [[downloadHost], ["*.pd1.cjjd19.com"]]) {
+				const seen: Array<{ url: URL; init: RequestInit }> = [];
+				let redirectCanceled = false;
+				const client = new WebDavClient(
+					{ ...config, downloadRedirectHosts: hosts },
+					{
+						fetchImpl: fake((url, init) => {
+							seen.push({ url, init });
+							if (seen.length === 1)
+								return redirect(signed, status, () => {
+									redirectCanceled = true;
+								});
+							return new Response(new Uint8Array([1, 2, 3]), {
+								headers: { "content-length": "3" },
+							});
+						}),
+					},
+				);
+				expect(await read(await client.getStream(object, 3, signal()))).toEqual(
+					new Uint8Array([1, 2, 3]),
+				);
+				expect(redirectCanceled).toBe(true);
+				expect(seen).toHaveLength(2);
+				expect(new Headers(seen[0]?.init.headers).get("authorization")).toContain("Basic ");
+				const target = seen[1];
+				expect(target?.url.href).toBe(signed);
+				expect([...new Headers(target?.init.headers).keys()]).toEqual([]);
+				expect(target?.init.credentials).toBe("omit");
+				expect(target?.init.referrer).toBe("");
+				expect(target?.init.referrerPolicy).toBe("no-referrer");
+				expect(target?.init.method).toBe("GET");
+				expect(target?.init.signal).toBe(seen[0]?.init.signal);
+				expect(seen.every((entry) => entry.init.redirect === "manual")).toBe(true);
+			}
+		});
+	}
+
+	test("real Bun fetch exposes opted-in 302 manually, then reaches the CDN without origin secrets", async () => {
+		const originRequests: Array<{ method: string; headers: Headers }> = [];
+		const cdnRequests: Array<{ path: string; headers: Headers }> = [];
+		const options: Array<{ host: string; init: RequestInit }> = [];
+		const cdn = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				const url = new URL(request.url);
+				cdnRequests.push({
+					path: `${url.pathname}${url.search}`,
+					headers: new Headers(request.headers),
+				});
+				return new Response(new Uint8Array([1, 2, 3]), { headers: { "content-length": "3" } });
+			},
+		});
+		const origin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				originRequests.push({ method: request.method, headers: new Headers(request.headers) });
+				return new Response("redirect control body", {
+					status: 302,
+					headers: { location: signed, "set-cookie": "private-cookie=private-secret" },
+				});
+			},
+		});
+		try {
+			const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => {
+				const logical = new URL(String(input));
+				options.push({ host: logical.hostname, init: init ?? {} });
+				const base =
+					logical.hostname === "dav.example.test"
+						? origin.url
+						: logical.hostname === downloadHost
+							? cdn.url
+							: null;
+				if (!base) throw new Error("Unexpected test hostname");
+				// The wrapper changes only the transport address. Real Bun fetch must
+				// still enforce redirect:error/manual, including origin's real 302.
+				return fetch(new URL(`${logical.pathname}${logical.search}`, base), init);
+			}) as typeof fetch;
+			const client = new WebDavClient(enabled, { fetchImpl });
+			expect(await read(await client.getStream(object, 3, signal()))).toEqual(
+				new Uint8Array([1, 2, 3]),
+			);
+			expect(options.map((entry) => entry.init.redirect)).toEqual(["manual", "manual"]);
+			expect(originRequests[0]?.headers.get("authorization")).toContain("Basic ");
+			expect(cdnRequests).toHaveLength(1);
+			expect(cdnRequests[0]?.path).toBe("/object?signature=private-signed-query");
+			for (const secret of ["authorization", "cookie", "referer", "proxy-authorization"])
+				expect(cdnRequests[0]?.headers.get(secret)).toBeNull();
+			expect(options[1]?.init.credentials).toBe("omit");
+			expect(options[1]?.init.referrerPolicy).toBe("no-referrer");
+
+			const defaults = new WebDavClient(config, { fetchImpl });
+			const empty = new WebDavClient({ ...config, downloadRedirectHosts: [] }, { fetchImpl });
+			const bytes = new Uint8Array([1]);
+			for (const run of [
+				() => defaults.getBytes(file, 100, signal()),
+				() => empty.getBytes(file, 100, signal()),
+				() => client.ensureCollection(day, signal()),
+				() => client.put(object, bytes, digest(bytes), signal()),
+				() => client.list(day, { signal: signal() }),
+				() => client.deleteCollection(day, signal()),
+			])
+				await expect(run()).rejects.toBeInstanceOf(WebDavError);
+			expect(options.slice(2).map((entry) => entry.init.redirect)).toEqual(Array(6).fill("error"));
+			expect(originRequests.map((entry) => entry.method)).toEqual([
+				"GET",
+				"GET",
+				"GET",
+				"MKCOL",
+				"PUT",
+				"PROPFIND",
+				"DELETE",
+			]);
+			expect(cdnRequests).toHaveLength(1);
+		} finally {
+			await origin.stop(true);
+			await cdn.stop(true);
+		}
+	});
+
+	test("default and empty whitelist never follow, even a known CDN hostname", async () => {
+		for (const options of [config, { ...config, downloadRedirectHosts: [] }]) {
+			let calls = 0;
+			let canceled = false;
+			const client = new WebDavClient(options, {
+				fetchImpl: fake(() => {
+					calls++;
+					return redirect(signed, 302, () => {
+						canceled = true;
+					});
+				}),
+			});
+			await expect(client.getBytes(file, 100, signal())).rejects.toThrow("REDIRECT");
+			expect(calls).toBe(1);
+			expect(canceled).toBe(true);
+		}
+	});
+
+	for (const location of [
+		"https://evil.example.com/file?signature=private-signed-query",
+		"https://pd1.cjjd19.com/file",
+		"https://notpd1.cjjd19.com/file",
+		"https://a.pd1.cjjd19.com.evil.com/file",
+		"https://a.pd1-cjjd19.com/file",
+		`http://${downloadHost}/file`,
+		`https://${downloadHost}:8443/file`,
+		`https://user:private-password@${downloadHost}/file`,
+		`https://${downloadHost}/file#secret`,
+		`https://${downloadHost}/file#`,
+		`https://${downloadHost}\\@evil.example.com/file`,
+		"https://127.0.0.1/file",
+		"https://10.0.0.1/file",
+		"https://192.168.0.1/file",
+		"https://169.254.169.254/file",
+		"https://[::1]/file",
+		"https://cdn.localhost/file",
+		"https://cdn.internal/file",
+		"https://cdn.local/file",
+	]) {
+		test(`refuses unsafe/nonmatching download target ${location.split("?")[0]}`, async () => {
+			let calls = 0;
+			let canceled = false;
+			const client = new WebDavClient(enabled, {
+				fetchImpl: fake(() => {
+					calls++;
+					return redirect(location, 302, () => {
+						canceled = true;
+					});
+				}),
+			});
+			try {
+				await client.getBytes(file, 100, signal());
+				throw new Error("expected failure");
+			} catch (error) {
+				expect(error).toBeInstanceOf(WebDavError);
+				for (const secret of ["private", "https:", "signature", "password"])
+					expect(String(error)).not.toContain(secret);
+			}
+			expect(calls).toBe(1);
+			expect(canceled).toBe(true);
+		});
+	}
+
+	test("exact host does not trust its subdomains; wildcard supports only real subdomain boundaries", async () => {
+		let calls = 0;
+		const exact = new WebDavClient(
+			{ ...config, downloadRedirectHosts: ["pd1.cjjd19.com"] },
+			{
+				fetchImpl: fake(() => {
+					calls++;
+					return redirect(signed);
+				}),
+			},
+		);
+		await expect(exact.getBytes(file, 100, signal())).rejects.toThrow("REDIRECT_HOST");
+		expect(calls).toBe(1);
+		const nested = `https://nested.${downloadHost}:443/file`;
+		const client = new WebDavClient(enabled, {
+			fetchImpl: fake((url) =>
+				url.hostname === "dav.example.test" ? redirect(nested) : new Response("ok"),
+			),
+		});
+		expect(await client.getBytes(file, 100, signal())).toEqual(new TextEncoder().encode("ok"));
+	});
+
+	test("follows at most three hops, rejects loops, cancels every intermediate body", async () => {
+		for (const mode of ["three", "overflow", "loop"] as const) {
+			let calls = 0;
+			let canceled = 0;
+			const client = new WebDavClient(enabled, {
+				fetchImpl: fake((_url, init) => {
+					calls++;
+					if (calls > 1) expect(new Headers(init.headers).get("authorization")).toBeNull();
+					if (mode === "three" && calls === 4) return new Response("done");
+					const next = mode === "loop" ? "same" : String(calls);
+					return redirect(
+						`https://${downloadHost}/${next}?signature=private-signed-query`,
+						302,
+						() => {
+							canceled++;
+						},
+					);
+				}),
+			});
+			if (mode === "three")
+				expect(await client.getBytes(file, 100, signal())).toEqual(
+					new TextEncoder().encode("done"),
+				);
+			else
+				await expect(client.getBytes(file, 100, signal())).rejects.toThrow(
+					mode === "loop" ? "REDIRECT_LOOP" : "REDIRECT_LIMIT",
+				);
+			expect(calls).toBe(mode === "loop" ? 2 : 4);
+			expect(canceled).toBe(mode === "three" ? 3 : calls);
+		}
+	});
+
+	test("PUT MKCOL PROPFIND DELETE still reject redirects under the opt-in config", async () => {
+		let calls = 0;
+		let canceled = 0;
+		const seen: string[] = [];
+		const client = new WebDavClient(enabled, {
+			fetchImpl: fake((_url, init) => {
+				calls++;
+				seen.push(String(init.method));
+				return redirect(signed, 307, () => {
+					canceled++;
+				});
+			}),
+		});
+		const bytes = new Uint8Array([1]);
+		for (const run of [
+			() => client.ensureCollection(day, signal()),
+			() => client.put(object, bytes, digest(bytes), signal()),
+			() => client.list(day, { signal: signal() }),
+			() => client.deleteCollection(day, signal()),
+		])
+			await expect(run()).rejects.toThrow("REDIRECT");
+		expect(seen).toEqual(["MKCOL", "PUT", "PROPFIND", "DELETE"]);
+		expect(calls).toBe(4);
+		expect(canceled).toBe(4);
+	});
+
+	test("unsupported/missing Location and already-redirected responses fail closed", async () => {
+		for (const status of [300, 304, 305, 306]) {
+			const client = new WebDavClient(enabled, {
+				fetchImpl: fake(() => new Response(null, { status, headers: { location: signed } })),
+			});
+			await expect(client.getBytes(file, 100, signal())).rejects.toThrow("REDIRECT");
+		}
+		const missing = new WebDavClient(enabled, {
+			fetchImpl: fake(() => new Response(null, { status: 302 })),
+		});
+		await expect(missing.getBytes(file, 100, signal())).rejects.toThrow("REDIRECT_TARGET");
+		const response = new Response("secret");
+		Object.defineProperty(response, "redirected", { value: true });
+		const followed = new WebDavClient(enabled, { fetchImpl: fake(() => response) });
+		await expect(followed.getBytes(file, 100, signal())).rejects.toThrow("REDIRECT");
+	});
+
+	test("final byte limits, exact EOF and sanitized network errors still apply", async () => {
+		for (const mode of ["header", "oversize", "truncated", "network"] as const) {
+			let canceled = 0;
+			const client = new WebDavClient(enabled, {
+				fetchImpl: fake((url) => {
+					if (url.hostname === "dav.example.test")
+						return redirect(signed, 302, () => {
+							canceled++;
+						});
+					if (mode === "network") throw new Error(`failed ${signed} private-password`);
+					return new Response(
+						mode === "truncated"
+							? chunks([new Uint8Array([1])])
+							: new ReadableStream<Uint8Array>({
+									start(c) {
+										c.enqueue(new Uint8Array([1, 2, 3, 4]));
+									},
+									cancel() {
+										canceled++;
+									},
+								}),
+						mode === "header" ? { headers: { "content-length": "4" } } : {},
+					);
+				}),
+			});
+			try {
+				await read(await client.getStream(object, 3, signal()));
+				throw new Error("expected failure");
+			} catch (error) {
+				expect(error).toBeInstanceOf(WebDavError);
+				expect(String(error)).not.toContain("private");
+				expect(String(error)).not.toContain("https:");
+			}
+			expect(canceled).toBe(mode === "header" || mode === "oversize" ? 2 : 1);
+		}
+	});
+
+	test("abort while canceling the first hop never starts another GET", async () => {
+		const controller = new AbortController();
+		let calls = 0;
+		const client = new WebDavClient(enabled, {
+			fetchImpl: fake(() => {
+				calls++;
+				return redirect(signed, 302, () => controller.abort());
+			}),
+		});
+		await expect(client.getStream(object, 3, controller.signal)).rejects.toThrow("ABORTED");
+		expect(calls).toBe(1);
+	});
+
+	test("abort across a pending redirected fetch still cancels its late response body", async () => {
+		const entered = Promise.withResolvers<void>();
+		const headers = Promise.withResolvers<Response>();
+		const controller = new AbortController();
+		let calls = 0;
+		let canceled = 0;
+		const client = new WebDavClient(enabled, {
+			fetchImpl: fake(() => {
+				calls++;
+				if (calls === 1)
+					return redirect(signed, 302, () => {
+						canceled++;
+					});
+				entered.resolve();
+				return headers.promise;
+			}),
+		});
+		const pending = client.getStream(object, 3, controller.signal);
+		await entered.promise;
+		controller.abort();
+		await expect(pending).rejects.toThrow("ABORTED");
+		headers.resolve(
+			new Response(
+				new ReadableStream<Uint8Array>({
+					cancel() {
+						canceled++;
+					},
+				}),
+			),
+		);
+		await Promise.resolve();
+		expect(canceled).toBe(2);
+	});
+
+	test("hop chain shares one deadline through final streaming body", async () => {
+		const original = globalThis.setTimeout;
+		const deadlines: number[] = [];
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			handler: TimerHandler,
+			delay?: number,
+			...args: unknown[]
+		) => {
+			deadlines.push(delay ?? 0);
+			return Reflect.apply(original, globalThis, [handler, 10, ...args]);
+		}) as typeof setTimeout);
+		try {
+			let canceled = 0;
+			const client = new WebDavClient(enabled, {
+				fetchImpl: fake((url) =>
+					url.hostname === "dav.example.test"
+						? redirect(signed, 302, () => {
+								canceled++;
+							})
+						: new Response(
+								new ReadableStream<Uint8Array>({
+									cancel() {
+										canceled++;
+									},
+								}),
+							),
+				),
+			});
+			await expect(read(await client.getStream(object, 3, signal()))).rejects.toThrow("TIMEOUT");
+			expect(deadlines).toEqual([15 * 60_000]);
+			expect(canceled).toBe(2);
+		} finally {
+			timer.mockRestore();
+		}
+	});
+});

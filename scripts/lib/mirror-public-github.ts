@@ -170,7 +170,13 @@ export async function currentPublicRelease(
 		)
 			throw new Error("Public GitHub asset lacks trusted digest/identity");
 	}
-	return { ...release, assets };
+	// GitHub's asset response also contains mutable counters, labels and API URLs.
+	// Compare only the strictly validated publication/byte identity: our own downloads
+	// can update download_count while a long mirror is still staging unchanged bytes.
+	return {
+		...release,
+		assets: assets.map(({ id, name, size, digest, state }) => ({ id, name, size, digest, state })),
+	};
 }
 export function matchPublicAsset(
 	release: PublicMirrorRelease,
