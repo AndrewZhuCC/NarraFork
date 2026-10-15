@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import {
@@ -47,6 +47,7 @@ import type { NarraForkSettings } from "../../../server/lib/settings/types";
 import { modelCatalogRoutes } from "../../../server/routes/model-catalog";
 import type { ModelCatalogMutation } from "../../../shared/model-catalog/schema/api";
 import type { ResolvedModelMetadata } from "../../../shared/model-catalog/schema/catalog";
+import * as metadataResolvers from "../../../shared/model-catalog/src/index";
 
 let local: NarraForkSettings;
 let presetContextWindow: number;
@@ -1143,5 +1144,73 @@ describe("catalog update and API boundary", () => {
 			providerId: "codex",
 			providerKey: "codex",
 		});
+	});
+});
+
+describe("protected-field batch resolution", () => {
+	test("hundreds of bindings prepare only three resolvers and preserve protection counts", async () => {
+		const initial = getModelCatalogSnapshot();
+		const version = await mockCatalog("batch-protection-398-bindings", (catalog) => {
+			const model = catalog.models.find((entry) => entry.id === "gpt-5.5");
+			if (!model?.metadata.limits) throw new Error("Expected model limits");
+			model.metadata.limits.contextWindow = presetContextWindow + 1;
+		});
+		await checkModelCatalogUpdate();
+		const cfg = local.agent.modelCatalog;
+		if (!cfg) throw new Error("Expected initialized catalog");
+		cfg.local.bindings = Array.from({ length: 398 }, (_, i) => ({
+			id: `batch-binding-${i}`,
+			upstreamModelId: "gpt-5.5",
+			providerId: `batch-provider-${i}`,
+			modelId: "gpt-5.5",
+			overrides: { limits: { contextWindow: presetContextWindow * 2 } },
+		}));
+		cfg.local.revision++;
+		const prepare = spyOn(metadataResolvers, "createModelMetadataResolver");
+		const single = spyOn(metadataResolvers, "resolveModelMetadata");
+		try {
+			const checked = getModelCatalogSnapshot();
+			expect(checked.catalog.catalogVersion).toBe(initial.catalog.catalogVersion);
+			expect(checked.update.pendingVersion).toBe(`v2:${version}`);
+			expect(checked.update.protectedFieldCount).toBe(398);
+			expect(prepare).toHaveBeenCalledTimes(3);
+			expect(single).not.toHaveBeenCalled();
+			const again = getModelCatalogSnapshot();
+			expect(again).toEqual(checked);
+			expect(prepare).toHaveBeenCalledTimes(3);
+			// Neither a caller's view nor a cache hit may mutate future snapshots.
+			if (again.update.pendingDiff?.fields) again.update.pendingDiff.fields.length = 0;
+			expect(getModelCatalogSnapshot()).toEqual(checked);
+		} finally {
+			prepare.mockRestore();
+			single.mockRestore();
+		}
+	});
+
+	test("rebinding different local settings at the same revision invalidates the count", async () => {
+		await mockCatalog("rebound-protection-cache", (catalog) => {
+			const model = catalog.models.find((entry) => entry.id === "gpt-5.5");
+			if (!model?.metadata.limits) throw new Error("Expected model limits");
+			model.metadata.limits.contextWindow = presetContextWindow + 1;
+		});
+		const checked = await checkModelCatalogUpdate();
+		expect(checked.update.protectedFieldCount).toBe(0);
+		const rebound = structuredClone(local);
+		const cfg = rebound.agent.modelCatalog;
+		if (!cfg) throw new Error("Expected initialized catalog");
+		cfg.local.bindings = [
+			{
+				id: "rebound-binding",
+				upstreamModelId: "gpt-5.5",
+				providerId: "rebound-provider",
+				modelId: "gpt-5.5",
+				overrides: { limits: { contextWindow: presetContextWindow * 2 } },
+			},
+		];
+		bindModelCatalogSettings(rebound, () => {});
+		const after = getModelCatalogSnapshot();
+		expect(after.local.revision).toBe(checked.local.revision);
+		expect(after.update.pendingVersion).toBe(checked.update.pendingVersion);
+		expect(after.update.protectedFieldCount).toBe(1);
 	});
 });

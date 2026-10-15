@@ -31,6 +31,7 @@ import {
 	validateCatalog,
 	validateMetadata,
 } from "@shared/model-catalog/src/index";
+import { logger } from "../logger";
 import { getNarraforkHome } from "../narrafork-home";
 import { resolveNugModelMeta } from "../nug-model-cache";
 import { normalizeModelContextWindows } from "../settings/model-context-windows";
@@ -610,10 +611,20 @@ function diffCatalog(next: CatalogDocument) {
 		removed: [...before.keys()].filter((k) => !after.has(k)),
 	};
 }
-let protectedCountCache: { version: string; revision: number; count: number } | undefined;
+let protectedCountCache:
+	| {
+			active: CatalogDocument;
+			next: CatalogDocument;
+			local: LocalCatalogState;
+			revision: number;
+			count: number;
+	  }
+	| undefined;
 function protectedFieldCount(next: CatalogDocument, local: LocalCatalogState): number {
 	if (
-		protectedCountCache?.version === next.catalogVersion &&
+		protectedCountCache?.active === active &&
+		protectedCountCache.next === next &&
+		protectedCountCache.local === local &&
 		protectedCountCache.revision === local.revision
 	)
 		return protectedCountCache.count;
@@ -673,19 +684,35 @@ function protectedFieldCount(next: CatalogDocument, local: LocalCatalogState): n
 					value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined,
 				metadata,
 			);
-	const resolve = (catalog: CatalogDocument, state: LocalCatalogState, query: ModelQuery) => {
+	// The three immutable input layers do not change within this comparison.
+	// Rebuilding a resolver per query revalidates/copies the entire catalog: 398
+	// bindings used to cause 1194 complete validations (~43s on a real settings file).
+	const prepare = (catalog: CatalogDocument, state: LocalCatalogState) => {
 		try {
-			return resolveModelMetadata({ catalog, local: state, query });
+			return queries.length ? createModelMetadataResolver(catalog, state) : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	const currentResolver = prepare(active, local);
+	const beforeResolver = prepare(active, inherited);
+	const afterResolver = prepare(next, inherited);
+	const resolve = (
+		resolver: ReturnType<typeof createModelMetadataResolver> | undefined,
+		query: ModelQuery,
+	) => {
+		try {
+			return resolver?.(query);
 		} catch {
 			return undefined;
 		}
 	};
 	let count = 0;
 	for (const query of queries) {
-		const current = resolve(active, local, query);
+		const current = resolve(currentResolver, query);
 		if (!current) continue;
-		const before = resolve(active, inherited, query)?.metadata ?? {};
-		const after = resolve(next, inherited, query)?.metadata ?? {};
+		const before = resolve(beforeResolver, query)?.metadata ?? {};
+		const after = resolve(afterResolver, query)?.metadata ?? {};
 		for (const [path, source] of Object.entries(current.provenance))
 			if (
 				source.explicit &&
@@ -693,14 +720,19 @@ function protectedFieldCount(next: CatalogDocument, local: LocalCatalogState): n
 			)
 				count++;
 	}
-	protectedCountCache = { version: next.catalogVersion, revision: local.revision, count };
+	protectedCountCache = { active, next, local, revision: local.revision, count };
 	return count;
 }
 export function getModelCatalogSnapshot(): ModelCatalogSnapshot {
+	const started = performance.now();
 	const cfg = state();
+	const protectedFields = pending ? protectedFieldCount(pending, cfg.local) : 0;
+	const protectionFinished = performance.now();
+	const pendingDiff = pending ? diffCatalog(pending) : undefined;
+	const diffFinished = performance.now();
 	const update: CatalogUpdateStatus & { protectedFieldCount: number } = {
 		activeVersion: active.catalogVersion,
-		protectedFieldCount: pending ? protectedFieldCount(pending, cfg.local) : 0,
+		protectedFieldCount: protectedFields,
 		bundledVersion: bundled.catalogVersion,
 		lastCheckedAt,
 		lastError,
@@ -708,9 +740,25 @@ export function getModelCatalogSnapshot(): ModelCatalogSnapshot {
 		autoApply: cfg.autoApply,
 		pinnedVersion: cfg.pinnedVersion,
 		history: history.map((c) => ({ catalogVersion: c.catalogVersion, publishedAt: c.publishedAt })),
-		...(pending ? { pendingDiff: diffCatalog(pending) } : {}),
+		...(pendingDiff ? { pendingDiff } : {}),
 	};
-	return structuredClone({ catalog: active, local: cfg.local, update });
+	const snapshot = structuredClone({ catalog: active, local: cfg.local, update });
+	const finished = performance.now();
+	if (finished - started >= 100) {
+		const round = (ms: number) => Math.round(ms * 100) / 100;
+		logger.warn("Model catalog snapshot computation slow", {
+			durationMs: round(finished - started),
+			protectedFieldsMs: round(protectionFinished - started),
+			pendingDiffMs: round(diffFinished - protectionFinished),
+			cloneMs: round(finished - diffFinished),
+			modelCount: active.models.length,
+			variantCount: active.variants.length,
+			bindingCount: cfg.local.bindings?.length ?? 0,
+			localRevision: cfg.local.revision,
+			hasPendingUpdate: !!pending,
+		});
+	}
+	return snapshot;
 }
 
 /** Complete v2 view. Existing v1 routes remain compatibility projections. */
