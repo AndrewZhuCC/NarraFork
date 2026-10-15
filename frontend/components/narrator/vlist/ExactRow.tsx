@@ -446,10 +446,8 @@ export const ExactRow = memo(
 		// only decides whether they respond to a click.
 		if (kind === "knowledge-hint" && injectionNavigation?.onOpenKnowledge) {
 			const openKnowledge = injectionNavigation.onOpenKnowledge;
-			// A hint always names GLOBAL entries: the injector matches against the
-			// project's shared collections, so a personal scope here would resolve to an
-			// id that does not exist.
-			extra.onOpenEntry = (entryId: string) => openKnowledge(entryId, "global");
+			extra.onOpenEntry = (entryId: string, scope: "global" | "personal" = "global") =>
+				openKnowledge(entryId, scope);
 		}
 		// Dynamic Spec task rows animate ONLY on the newest surface of a running
 		// narrator. Both surfaces get the same flag: a framed task bubble

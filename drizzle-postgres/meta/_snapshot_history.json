@@ -144,6 +144,14 @@
 			"prevId": "ea5dc255-0883-4d86-bf3b-50e19f8d9e1b",
 			"version": "7",
 			"snapshotDigest": "f52554d3864e74c844630f1ace6bd08a3081ba1335074e9780fc488f6f47a816"
+		},
+		{
+			"idx": 18,
+			"tag": "0018_personal_knowledge_injection",
+			"id": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
+			"prevId": "589f163a-9f46-4c42-9b4f-7421ec507a16",
+			"version": "7",
+			"snapshotDigest": "3cdb7aad98c67d8abcecfb9fda4f0102cb1dda7d3374719a7eaee0c519732ffe"
 		}
 	]
 }

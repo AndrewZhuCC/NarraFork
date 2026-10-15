@@ -851,6 +851,9 @@ principal P：clearance=secret，grantedTags={product:M20}
 - standalone 条目由 `createStandalone()` 创建，**不做幂等**（同名可重复创建，属已知取舍）。
 - 个人条目自身只有 `active` / `archived` 两态；发布请求的生命周期完全在 `knowledge_submissions` 上，两者正交。
 - 个人版本参与**搜索遮蔽**：检索时（`draftUserId`）自己的 active 副本会遮蔽全局版本，命中标记 `(personal)`，落后时标记 `(personal ⚠ behind main)`。
+- **未发布也可使用**：`KnowledgeRead({ personalEntryId })` 读取本人的个人条目；`KnowledgeEdit` 的 `save` / `update_meta` 可直接修改正文、标题和关键词。发布仅用于分享。
+- `KnowledgeSearch` 默认包含本人的 active standalone（内部 `includeStandalone` 开关），结果给出 `personalEntryId`；`useDraft:false` 只搜索全局版本。现有 HTTP 搜索默认契约不变。
+- 关键词注入也包含本人的 active standalone，复用现有匹配、摘要限额和持久去重；personal/global 身份贯穿模型提示与气泡导航。无发布目标的条目可跨项目使用，有目标时遵循当前项目或全局集合范围；个人候选缓存按用户隔离。
 
 ### 6.7.2 drift 与 rebase
 

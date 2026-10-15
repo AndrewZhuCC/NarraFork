@@ -217,6 +217,8 @@ export interface KnowledgeSearchQuery {
 
 /** A knowledge search over the drafts of one author. */
 export interface KnowledgeDraftSearchQuery extends KnowledgeSearchQuery {
+	/** Internal opt-in: include this author's active standalone personal entries. */
+	includeStandalone?: boolean;
 	authorUserId: string;
 	/** Draft lifecycle status that shadows the committed version. */
 	draftStatus: string;
@@ -300,7 +302,9 @@ export interface RecallMessageRow {
 
 export interface KnowledgeSearchRow {
 	id: string;
-	collectionId: string;
+	/** Standalone rows use this id with KnowledgeRead, never a global entry id. */
+	personalEntryId?: string;
+	collectionId: string | null;
 	title: string;
 	slug: string;
 	/**

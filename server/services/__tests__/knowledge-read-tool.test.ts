@@ -21,12 +21,14 @@ import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	knowledgeCollections,
+	knowledgeDrafts,
 	knowledgeEntries,
 	knowledgeRevisions,
 	knowledgeTags,
 	users,
 } from "../../db/schema";
 import { knowledgeReadTool } from "../../lib/agent/tools/knowledge";
+import { knowledgeEditTool } from "../../lib/agent/tools/knowledge-edit";
 import type { ToolContext } from "../../lib/agent/types";
 import { AppError, ForbiddenError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
@@ -182,6 +184,109 @@ beforeAll(async () => {
 		title: DENIED_TITLE,
 		content: DENIED_BODY,
 		controlledTagId,
+	});
+});
+
+describe("unpublished personal knowledge", () => {
+	test("create, read, save and meta work without publishing", async () => {
+		const personal = await knowledgeBranchService.createStandalone(
+			{ userId: readerUserId, role: "user" },
+			{ title: "Private note", content: "original private body" },
+		);
+		let result = await knowledgeReadTool.execute(
+			{ personalEntryId: personal.id },
+			ctxFor(readerUserId),
+		);
+		expect(result.isError).toBeUndefined();
+		expect(result.output).toContain("original private body");
+		expect(result.metadata).toMatchObject({
+			personalEntryId: personal.id,
+			linkedEntryId: null,
+			isDraft: true,
+		});
+		const saved = await knowledgeEditTool.execute(
+			{ action: "save", personalEntryId: personal.id, content: "edited private body" },
+			ctxFor(readerUserId),
+		);
+		expect(saved.isError).toBeUndefined();
+		const meta = await knowledgeEditTool.execute(
+			{
+				action: "update_meta",
+				personalEntryId: personal.id,
+				title: "Renamed private",
+				keywords: ["private-token"],
+			},
+			ctxFor(readerUserId),
+		);
+		expect(meta.isError).toBeUndefined();
+		result = await knowledgeReadTool.execute(
+			{ personalEntryId: personal.id },
+			ctxFor(readerUserId),
+		);
+		expect(result.output).toContain("Renamed private");
+		expect(result.output).toContain("edited private body");
+		expect(result.metadata).toMatchObject({ keywords: ["private-token"] });
+		for (const userId of [null, adminUserId]) {
+			const denied = await knowledgeReadTool.execute(
+				{ personalEntryId: personal.id },
+				ctxFor(userId),
+			);
+			expect(denied.isError).toBe(true);
+			expect(denied.output).not.toContain("edited private body");
+		}
+	});
+
+	test("identifier validation and global-only flag fail explicitly", async () => {
+		for (const args of [
+			{},
+			{ entryId: readableEntryId, personalEntryId: "personal" },
+			{ personalEntryId: "personal", useDraft: false },
+		]) {
+			expect((await knowledgeReadTool.execute(args, ctxFor(readerUserId))).isError).toBe(true);
+		}
+	});
+
+	test("personal content is bounded and linked entries still require main ACL", async () => {
+		const personal = await knowledgeBranchService.createStandalone(
+			{ userId: readerUserId, role: "user" },
+			{ title: "Long private", content: "x".repeat(25000) },
+		);
+		const result = await knowledgeReadTool.execute(
+			{ personalEntryId: personal.id },
+			ctxFor(readerUserId),
+		);
+		expect(result.metadata).toMatchObject({ truncated: true });
+		expect(result.output.length).toBeLessThan(25000);
+		await db
+			.update(knowledgeDrafts)
+			.set({ entryId: sealedEntryId })
+			.where(eq(knowledgeDrafts.id, personal.id));
+		const denied = await knowledgeReadTool.execute(
+			{ personalEntryId: personal.id },
+			ctxFor(readerUserId),
+		);
+		expect(denied.isError).toBe(true);
+		expect(denied.output).toContain("not found or not accessible");
+	});
+
+	test("target collection respects narrator project scope", async () => {
+		const personal = await knowledgeBranchService.createStandalone(
+			{ userId: readerUserId, role: "user" },
+			{ title: "Scoped private", content: "scoped content", targetCollectionId: collectionId },
+		);
+		const spy = spyOn(knowledgeService, "getCollection").mockResolvedValue({
+			projectId: "other-project",
+		} as Awaited<ReturnType<typeof knowledgeService.getCollection>>);
+		try {
+			const result = await knowledgeReadTool.execute(
+				{ personalEntryId: personal.id },
+				{ ...ctxFor(readerUserId), projectId: "this-project" },
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).not.toContain("scoped content");
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });
 

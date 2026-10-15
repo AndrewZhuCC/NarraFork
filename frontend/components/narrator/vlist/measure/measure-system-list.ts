@@ -51,6 +51,7 @@ import {
 
 /** One injected knowledge entry surfaced as a single truncated line. */
 export interface KnowledgeHintEntry {
+	scope?: "global" | "personal";
 	/** Knowledge entry id (fallback label + navigation target). */
 	entryId: string;
 	/** Display title (falls back to entryId when absent). Height-neutral. */

@@ -344,7 +344,10 @@ function collectionClause(collectionId: string | undefined, params: Params): str
 function toKnowledgeRow(row: Row, fromDraft: boolean, snippet: string): KnowledgeSearchRow {
 	return {
 		id: strOr(row, "id", ""),
-		collectionId: strOr(row, "collection_id", ""),
+		collectionId: str(row, "collection_id"),
+		...(str(row, "personal_entry_id")
+			? { personalEntryId: strOr(row, "personal_entry_id", "") }
+			: {}),
 		title: strOr(row, "title", ""),
 		slug: strOr(row, "slug", ""),
 		tagsJson: str(row, "tags_json"),
@@ -687,14 +690,30 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 
 		async searchKnowledgeDrafts(query: KnowledgeDraftSearchQuery): Promise<KnowledgeSearchRow[]> {
 			const params = new Params();
+			const collection = query.includeStandalone
+				? "COALESCE(e.collection_id, d.target_collection_id)"
+				: "e.collection_id";
+			const title = query.includeStandalone ? "COALESCE(e.title, d.title, '')" : "e.title";
+			const join = query.includeStandalone ? "LEFT JOIN" : "JOIN";
 			const scope =
-				collectionClause(query.collectionId, params) + projectClause(query.projectId, params);
+				(query.collectionId ? `AND ${collection} = ${params.add(query.collectionId)} ` : "") +
+				(query.projectId
+					? `AND (${query.includeStandalone ? "(d.entry_id IS NULL AND d.target_collection_id IS NULL) OR " : ""}${collection} IN (
+						SELECT id FROM knowledge_collections WHERE project_id = ${params.add(query.projectId)} OR project_id IS NULL
+					))`
+					: "");
 			const drift = `(d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) AS drifted`;
-			const columns =
-				query.sort === "time"
+			const columns = query.includeStandalone
+				? `COALESCE(e.id, d.id) AS id, ${collection} AS collection_id,
+					${title} AS title, COALESCE(e.slug, '') AS slug, e.tags_json,
+					COALESCE(e.status, d.status) AS status, COALESCE(e.created_at, d.created_at) AS created_at,
+					${query.sort === "time" ? "d.updated_at" : "COALESCE(e.updated_at, d.updated_at)"} AS updated_at,
+					CASE WHEN d.entry_id IS NULL THEN d.id END AS personal_entry_id`
+				: query.sort === "time"
 					? KNOWLEDGE_ENTRY_COLUMNS.replace("e.updated_at", "d.updated_at")
 					: KNOWLEDGE_ENTRY_COLUMNS;
-			const order = query.sort === "time" ? "d.updated_at DESC, e.id ASC" : "rank_score";
+			const idOrder = query.includeStandalone ? "COALESCE(e.id, d.id)" : "e.id";
+			const order = query.sort === "time" ? `d.updated_at DESC, ${idOrder} ASC` : "rank_score";
 
 			if (query.strategy === "index") {
 				const terms = queryTerms(query.indexText);
@@ -706,7 +725,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 						${snippet} AS snippet_raw, ${rank} AS rank_score
 					 FROM search_knowledge_drafts f
 					 JOIN knowledge_drafts d ON d.id = f.id
-					 JOIN knowledge_entries e ON e.id = d.entry_id
+					 ${join} knowledge_entries e ON e.id = d.entry_id
 					 WHERE ${where}
 					   AND d.author_user_id = ${params.add(query.authorUserId)}
 					   AND d.status = ${params.add(query.draftStatus)} ${scope}
@@ -722,13 +741,13 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const pattern = params.add(escapedContains(query.substringText));
 			const rows = await run(
 				`SELECT ${columns}, ${drift},
-					substr(COALESCE(d.content, e.title), 1, ${PREVIEW_CHARS}) AS snippet_raw
+					substr(COALESCE(d.content, ${title}), 1, ${PREVIEW_CHARS}) AS snippet_raw
 				 FROM knowledge_drafts d
-				 JOIN knowledge_entries e ON e.id = d.entry_id
-				 WHERE (${raw} = '' OR e.title ILIKE ${pattern} ESCAPE '\\' OR d.content ILIKE ${pattern} ESCAPE '\\')
+				 ${join} knowledge_entries e ON e.id = d.entry_id
+				 WHERE (${raw} = '' OR ${title} ILIKE ${pattern} ESCAPE '\\' OR d.content ILIKE ${pattern} ESCAPE '\\')
 				   AND d.author_user_id = ${params.add(query.authorUserId)}
 				   AND d.status = ${params.add(query.draftStatus)} ${scope}
-				 ORDER BY d.updated_at DESC${query.sort === "time" ? ", e.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
+				 ORDER BY d.updated_at DESC${query.sort === "time" ? `, ${idOrder} ASC` : ""} LIMIT ${params.add(query.limit)}`,
 				params,
 			);
 			return rows.map((row) => toKnowledgeRow(row, true, str(row, "snippet_raw") ?? ""));

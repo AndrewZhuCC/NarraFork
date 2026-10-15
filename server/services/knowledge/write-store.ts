@@ -297,7 +297,8 @@ export interface RecordInjectionEventsWrite {
 	 *  same rows instead of minting new identities. */
 	hits: {
 		id: string;
-		entryId: string;
+		entryId: string | null;
+		personalEntryId?: string | null;
 		entryRevisionId: string | null;
 		summary: string | null;
 	}[];
@@ -584,6 +585,16 @@ export interface KnowledgeWriteStore {
 	recordInjectionEvents(input: RecordInjectionEventsWrite): Promise<void>;
 
 	// ── drafts (personal entries) ──
+	createPersonalEntry(input: KnowledgeDraftRow): Promise<KnowledgeDraftRow>;
+	updatePersonalEntryMeta(
+		id: string,
+		patch: {
+			title?: string;
+			targetCollectionId?: string | null;
+			keywordsJson?: string[] | null;
+			updatedAt: string;
+		},
+	): Promise<void>;
 	/**
 	 * Atomic get-or-create of the caller's ACTIVE draft on an entry: the existence
 	 * re-check happens inside the section, so two concurrent calls cannot both insert

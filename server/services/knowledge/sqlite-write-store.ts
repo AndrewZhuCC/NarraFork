@@ -529,6 +529,7 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 						narratorId: input.narratorId,
 						compactSeq: input.compactSeq,
 						entryId: hit.entryId,
+						personalEntryId: hit.personalEntryId ?? null,
 						entryRevisionId: hit.entryRevisionId,
 						source: input.source as "tool_output",
 						triggerMessageId: input.triggerMessageId,
@@ -542,6 +543,21 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 		});
 	},
 
+	async createPersonalEntry(input) {
+		return db
+			.insert(knowledgeDrafts)
+			.values({
+				...input,
+				format: "markdown",
+				status: "active",
+				keywordsJson: input.keywordsJson as string[] | null,
+			})
+			.returning()
+			.get();
+	},
+	async updatePersonalEntryMeta(id, patch) {
+		await db.update(knowledgeDrafts).set(patch).where(eq(knowledgeDrafts.id, id));
+	},
 	async getOrCreateActiveDraft(input: GetOrCreateActiveDraftWrite): Promise<KnowledgeDraftRow> {
 		return db.transaction((tx) => {
 			const existingActive = tx

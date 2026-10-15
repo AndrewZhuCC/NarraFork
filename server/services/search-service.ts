@@ -239,14 +239,16 @@ export const searchService = {
 		);
 		if (readable.length === 0) return [];
 
-		const collectionNames = await collectionNameMap(readable.map((r) => r.collectionId));
+		const collectionNames = await collectionNameMap(
+			readable.flatMap((r) => (r.collectionId ? [r.collectionId] : [])),
+		);
 		const safeQueryLower = safeQuery.toLowerCase();
 		return readable.map((row) => ({
 			type: "knowledge" as const,
 			id: row.id,
 			title: row.title,
-			collectionId: row.collectionId,
-			collectionName: collectionNames.get(row.collectionId),
+			collectionId: row.collectionId ?? undefined,
+			collectionName: row.collectionId ? collectionNames.get(row.collectionId) : undefined,
 			tags: row.tags,
 			status: row.status,
 			createdAt: row.createdAt,

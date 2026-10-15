@@ -42,6 +42,15 @@ mock.module("../../../../server/services/search/backend", () => ({
 }));
 const { knowledgeService: service } = await import("../../../../server/services/knowledge-service");
 const { knowledgeAcl: acl } = await import("../../../../server/services/knowledge-acl");
+const { knowledgeReadTool, knowledgeLibraryTool } = await import(
+	"../../../../server/lib/agent/tools/knowledge"
+);
+const { knowledgeCreateTool, knowledgeEditTool } = await import(
+	"../../../../server/lib/agent/tools/knowledge-edit"
+);
+
+import type { ToolContext } from "../../../../server/lib/agent/types";
+
 const { resolveInjections } = await import("../../../../server/services/knowledge-injection");
 const { knowledgeInjectionReads } = await import("../../../../server/services/knowledge-service");
 const { knowledgeLinkService: links } = await import(
@@ -95,6 +104,86 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 							role: p.role,
 							createdAt: now,
 						});
+					const context: ToolContext = {
+						narratorId: generateId(),
+						cwd: "/tmp",
+						userId: owner.userId,
+						signal: new AbortController().signal,
+						locale: "en",
+						requestPermission: async () => ({ behavior: "allow" }),
+					};
+					const createdPersonal = await knowledgeCreateTool.execute(
+						{ title: "PG private note", content: "unpublished PG body" },
+						context,
+					);
+					expect(createdPersonal.isError).toBeUndefined();
+					const personalEntryId = createdPersonal.metadata?.personalEntryId as string;
+					expect(personalEntryId).toBeTruthy();
+					const personalRead = await knowledgeReadTool.execute({ personalEntryId }, context);
+					expect(personalRead.isError).toBeUndefined();
+					expect(personalRead.output).toContain("unpublished PG body");
+					expect(
+						(
+							await knowledgeEditTool.execute(
+								{ action: "save", personalEntryId, content: "updated PG private" },
+								context,
+							)
+						).isError,
+					).toBeUndefined();
+					expect(
+						(
+							await knowledgeEditTool.execute(
+								{
+									action: "update_meta",
+									personalEntryId,
+									title: "PG renamed",
+									keywords: ["pg-private-keyword"],
+								},
+								context,
+							)
+						).isError,
+					).toBeUndefined();
+					const updatedPersonal = await knowledgeReadTool.execute({ personalEntryId }, context);
+					expect(updatedPersonal.output).toContain("PG renamed");
+					expect(updatedPersonal.output).toContain("updated PG private");
+					expect(updatedPersonal.metadata?.keywords).toEqual(["pg-private-keyword"]);
+					const personalCandidates = await read.listPersonalKeywordInjectionCandidates({
+						userId: owner.userId,
+						limit: 5000,
+					});
+					expect(personalCandidates.map((row) => row.id)).toContain(personalEntryId);
+					expect(
+						await read.listPersonalKeywordInjectionCandidates({
+							userId: admin.userId,
+							limit: 5000,
+						}),
+					).toEqual([]);
+					expect(await read.personalKeywordInjectionSignature({ userId: owner.userId })).toMatch(
+						/^1:/,
+					);
+					expect(await read.personalInjectionSnippets(owner.userId, [personalEntryId], 7)).toEqual([
+						{ id: personalEntryId, snippet: "updated" },
+					]);
+					expect(await read.personalInjectionSnippets(admin.userId, [personalEntryId], 7)).toEqual(
+						[],
+					);
+					const personalHits = await resolveInjections(owner.userId, "pg-private-keyword");
+					expect(personalHits).toContainEqual(
+						expect.objectContaining({ scope: "personal", entryId: personalEntryId }),
+					);
+					expect(await resolveInjections(reader.userId, "pg-private-keyword")).toEqual([]);
+					const mine = await knowledgeLibraryTool.execute({ action: "list_mine" }, context);
+					expect(mine.isError).toBeUndefined();
+					expect(mine.output).toContain(personalEntryId);
+					expect(mine.output).not.toContain("updated PG private");
+					expect(
+						(
+							await knowledgeReadTool.execute(
+								{ personalEntryId },
+								{ ...context, userId: reader.userId },
+							)
+						).isError,
+					).toBe(true);
 					const level = await acl.createLevel({ name: "p6-confidential", rank: 42 });
 					const col = await service.createCollection({
 						name: "P6 collection",
@@ -237,6 +326,34 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 							},
 						],
 					};
+					const personalLedger = {
+						...ledger,
+						compactSeq: 8,
+						hits: [
+							{
+								id: generateId(),
+								entryId: null,
+								personalEntryId,
+								entryRevisionId: null,
+								summary: "personal",
+							},
+						],
+					};
+					await write.recordInjectionEvents(personalLedger);
+					await write.recordInjectionEvents({
+						...personalLedger,
+						hits: [{ ...personalLedger.hits[0], id: generateId() }],
+					});
+					const personalAlready = await knowledgeInjectionReads.listInjectedEntryIds(
+						injectionNarrator,
+						8,
+					);
+					expect([...personalAlready]).toEqual([`personal:${personalEntryId}`]);
+					expect(
+						await resolveInjections(owner.userId, "pg-private-keyword", {
+							already: personalAlready,
+						}),
+					).toEqual([]);
 					await write.recordInjectionEvents(ledger);
 					await write.recordInjectionEvents({
 						...ledger,
@@ -246,7 +363,7 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 						injectionNarrator,
 						9,
 					);
-					expect([...currentCycleIds]).toEqual([entry.id]);
+					expect([...currentCycleIds]).toEqual([`global:${entry.id}`]);
 					expect(
 						await resolveInjections(reader.userId, "zephyr", {
 							collectionId: col.id,
@@ -279,7 +396,7 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 					).toHaveLength(0);
 					expect([
 						...(await knowledgeInjectionReads.listInjectedEntryIds(injectionNarrator, 9)),
-					]).toEqual([entry.id]);
+					]).toEqual([`global:${entry.id}`]);
 					const draft = await write.getOrCreateActiveDraft({
 						draftId: generateId(),
 						entryId: entry.id,
@@ -397,6 +514,9 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 					expect(await acl.deleteLevel(level.id)).toEqual({ ok: true });
 					expect(sqliteAccesses).toBe(0);
 					return { ok: true, auditCount, sqliteAccesses };
+				} catch (error) {
+					console.error("PG knowledge integration callback failed", error);
+					throw error;
 				} finally {
 					unbindPostgresSearchClientForTests();
 					setKnowledgeReadStore(undefined);
