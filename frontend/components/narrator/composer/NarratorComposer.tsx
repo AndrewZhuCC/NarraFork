@@ -27,6 +27,13 @@ import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
+import { ComposerQuoteChips } from "./ComposerQuoteChips";
+import {
+	joinQuotedComposerInput,
+	MAX_COMPOSER_QUOTES,
+	sameComposerQuote,
+	splitQuotedComposerInput,
+} from "./composer-quotes";
 import { FileReferencePopover } from "./FileReferencePopover";
 import { useFileReferenceScope } from "./FileReferenceScope";
 import {
@@ -52,10 +59,12 @@ import {
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
+import { revealComposerQuote, revealQuotedFile } from "./quote-jump";
 import {
 	TextareaOptimizeControls,
 	textareaOptimizeControlsWidth,
 } from "./TextareaOptimizeControls";
+import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
 
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 
@@ -187,6 +196,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			fileReferences: [],
 		});
 		const { text: input, fileReferences } = inputState;
+		// Leading quote blocks are shown as chips; the textarea and its popovers
+		// only ever see the body after them (see composer-quotes.ts).
+		const { quotes, body: bodyInput } = useMemo(
+			() => splitQuotedComposerInput(inputState),
+			[inputState],
+		);
+		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
 		const [draftHydrated, setDraftHydrated] = useState(false);
 		const [draftSyncState, setDraftSyncState] = useState<
@@ -228,6 +244,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			},
 			[applyInput],
 		);
+		const readQuotedInput = useCallback(() => splitQuotedComposerInput(inputStateRef.current), []);
+		const applyBody = useCallback(
+			(body: FileReferenceInput) => {
+				applyInput(joinQuotedComposerInput(readQuotedInput().quotes, body));
+			},
+			[applyInput, readQuotedInput],
+		);
+		const setBodyText = useCallback(
+			(text: string) => {
+				applyBody(editFileReferenceInput(readQuotedInput().body, text));
+			},
+			[applyBody, readQuotedInput],
+		);
 		const restoreInput = useCallback(
 			(text: string, refs: FileReference[]) => {
 				applyInput({ text, fileReferences: copyFileReferences(refs, text) });
@@ -242,16 +271,16 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		const appendText = useCallback(
 			(text: string) => {
-				const previous = inputRef.current;
-				setText(previous ? `${previous}\n${text}` : text);
+				const previous = readQuotedInput().body.text;
+				setBodyText(previous ? `${previous}\n${text}` : text);
 			},
-			[setText],
+			[readQuotedInput, setBodyText],
 		);
 		const addFileReference = useCallback(
 			(reference: FileReference) => {
 				try {
-					const next = insertFileReference(inputStateRef.current, reference);
-					applyInput(next);
+					const next = insertFileReference(readQuotedInput().body, reference);
+					applyBody(next);
 					if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
 					requestAnimationFrame(() => {
 						textareaRef.current?.focus();
@@ -265,7 +294,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					});
 				}
 			},
-			[applyInput, fileCacheScope, t],
+			[applyBody, fileCacheScope, readQuotedInput, t],
 		);
 
 		// Prompt optimization hook
@@ -274,7 +303,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			textareaRef,
 			onOptimized: (text) => {
 				// Fallback: if execCommand fails, update state directly
-				setText(text);
+				setBodyText(text);
 			},
 		});
 
@@ -717,48 +746,50 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 
 		// --- Command popover ---
+		// A quoted message is never a slash command: the quote prefix leads its text.
+		const commandInput = quotes.length ? "" : bodyText;
 		// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
 		const { data: commandsList } = useNarratorCommands(
-			input.startsWith("/") ? narratorId : undefined,
+			commandInput.startsWith("/") ? narratorId : undefined,
 		);
 		// Show command popover only when typing command name (no space yet),
 		// or when typing optional tool sub-completion (/load <tool>, /unload <tool>).
 		// Suppress when browsing input history so arrow keys keep navigating history.
 		const commandPopoverVisible =
-			input.startsWith("/") &&
-			!input.includes("\n") &&
-			(!input.includes(" ") ||
+			commandInput.startsWith("/") &&
+			!commandInput.includes("\n") &&
+			(!commandInput.includes(" ") ||
 				// /load <tool>, /unload <tool>, and the skill sub-completions
 				// (/load skill <name>, /unload all_skills, ...).
-				/^\/(?:load|unload)\s(?:skill(?:\s\S*)?|\S*)$/i.test(input)) &&
+				/^\/(?:load|unload)\s(?:skill(?:\s\S*)?|\S*)$/i.test(commandInput)) &&
 			(commandsList?.length ?? 0) > 0 &&
 			!inputHistory.isBrowsing;
 		// Matched command for param helper (after space is typed)
 		const matchedCommand = useMemo(() => {
-			if (!input.startsWith("/") || !commandsList?.length) return null;
-			const spaceIdx = input.indexOf(" ");
+			if (!commandInput.startsWith("/") || !commandsList?.length) return null;
+			const spaceIdx = commandInput.indexOf(" ");
 			if (spaceIdx === -1) return null;
-			const cmdName = input.slice(1, spaceIdx);
+			const cmdName = commandInput.slice(1, spaceIdx);
 			return (
 				commandsList.find(
 					(c) => c.name.toLowerCase() === cmdName.toLowerCase() && c.type === "command",
 				) ?? null
 			);
-		}, [input, commandsList]);
+		}, [commandInput, commandsList]);
 		const handleCommandSelect = useCallback(
 			(cmd: CommandItem) => {
 				if (cmd.type === "skill") {
 					// Skill selected — use /skill command so backend injects content directly
-					setText(`/skill ${cmd.name} `);
+					setBodyText(`/skill ${cmd.name} `);
 				} else if (cmd.type === "tool" && !cmd.name.includes(" ")) {
 					// Parent /load entry — expand to show sub-items
-					setText(`/${cmd.name} `);
+					setBodyText(`/${cmd.name} `);
 				} else {
 					// Always keep command format — user can continue typing or press space for params
-					setText(`/${cmd.name}`);
+					setBodyText(`/${cmd.name}`);
 				}
 			},
-			[setText],
+			[setBodyText],
 		);
 		const closeCommandPopover = useCallback(() => {
 			clearTextAndDraft();
@@ -770,9 +801,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const mentionQuery = useMemo(() => {
 			if (mentionCaret === null) return null;
 			// Don't compete with the slash-command popover.
-			if (input.startsWith("/")) return null;
-			return getMentionQuery(input, mentionCaret);
-		}, [input, mentionCaret]);
+			if (commandInput.startsWith("/")) return null;
+			return getMentionQuery(bodyText, mentionCaret);
+		}, [bodyText, commandInput, mentionCaret]);
 		const mentionCandidates = useMemo<MentionCandidate[]>(() => {
 			if (!namedNarrators) return [];
 			return namedNarrators
@@ -790,14 +821,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			(candidate: MentionCandidate) => {
 				const caret = mentionCaret;
 				if (caret === null) return;
-				const upto = input.slice(0, caret);
+				const upto = bodyText.slice(0, caret);
 				const at = upto.lastIndexOf("@");
 				if (at === -1) return;
-				const before = input.slice(0, at);
-				const after = input.slice(caret);
+				const before = bodyText.slice(0, at);
+				const after = bodyText.slice(caret);
 				const insert = `@${candidate.handle} `;
 				const next = before + insert + after;
-				setText(next);
+				setBodyText(next);
 				// Move caret to just after the inserted handle.
 				const nextCaret = before.length + insert.length;
 				requestAnimationFrame(() => {
@@ -809,21 +840,31 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					setMentionCaret(nextCaret);
 				});
 			},
-			[input, mentionCaret, setText],
+			[bodyText, mentionCaret, setBodyText],
 		);
 		const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
 
 		const [dismissedFileQuery, setDismissedFileQuery] = useState<string | null>(null);
 		const fileQuery = useMemo(() => {
-			if (mentionCaret === null || input.startsWith("/") || inputHistory.isBrowsing) return null;
-			const query = getFileReferenceQuery(input, mentionCaret, fileReferences);
-			return query && JSON.stringify([input, mentionCaret]) !== dismissedFileQuery ? query : null;
-		}, [input, mentionCaret, fileReferences, inputHistory.isBrowsing, dismissedFileQuery]);
+			if (mentionCaret === null || commandInput.startsWith("/") || inputHistory.isBrowsing)
+				return null;
+			const query = getFileReferenceQuery(bodyText, mentionCaret, bodyInput.fileReferences);
+			return query && JSON.stringify([bodyText, mentionCaret]) !== dismissedFileQuery
+				? query
+				: null;
+		}, [
+			bodyText,
+			bodyInput.fileReferences,
+			commandInput,
+			mentionCaret,
+			inputHistory.isBrowsing,
+			dismissedFileQuery,
+		]);
 		const closeFilePopover = useCallback(() => {
 			setDismissedFileQuery(
-				JSON.stringify([inputRef.current, textareaRef.current?.selectionStart]),
+				JSON.stringify([readQuotedInput().body.text, textareaRef.current?.selectionStart]),
 			);
-		}, []);
+		}, [readQuotedInput]);
 		const moveFileCaret = useCallback((caret: number) => {
 			requestAnimationFrame(() => {
 				textareaRef.current?.focus();
@@ -835,11 +876,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			(reference: FileReference) => {
 				if (!fileQuery) return;
 				try {
-					const next = insertFileReference(inputStateRef.current, reference, [
+					const next = insertFileReference(readQuotedInput().body, reference, [
 						fileQuery.start,
 						fileQuery.end,
 					]);
-					applyInput(next);
+					applyBody(next);
 					if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
 					moveFileCaret(next.caret);
 				} catch (error) {
@@ -850,22 +891,112 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					});
 				}
 			},
-			[fileQuery, applyInput, fileCacheScope, moveFileCaret, t],
+			[fileQuery, applyBody, fileCacheScope, moveFileCaret, readQuotedInput, t],
 		);
 		const handleFileNavigate = useCallback(
 			(candidate: FileReferenceCandidate) => {
 				if (!fileQuery) return;
 				const prefix = `#${candidate.relativePath.replace(/[\\/]+$/, "")}/`;
-				setText(
-					inputRef.current.slice(0, fileQuery.start) +
-						prefix +
-						inputRef.current.slice(fileQuery.end),
-				);
+				const body = readQuotedInput().body.text;
+				setBodyText(body.slice(0, fileQuery.start) + prefix + body.slice(fileQuery.end));
 				moveFileCaret(fileQuery.start + prefix.length);
 			},
-			[fileQuery, setText, moveFileCaret],
+			[fileQuery, setBodyText, moveFileCaret, readQuotedInput],
 		);
 		useEffect(() => dock?.registerAddFileReference?.(addFileReference), [dock, addFileReference]);
+
+		// === Selection quotes ======================================================
+		const editorSelection =
+			fileScope.selection !== undefined ? fileScope.selection : dock?.fileReferenceSelection;
+		const focusBodyEnd = useCallback(() => {
+			requestAnimationFrame(() => {
+				const ta = textareaRef.current;
+				if (!ta) return;
+				ta.focus();
+				ta.setSelectionRange(ta.value.length, ta.value.length);
+			});
+		}, []);
+		const acceptQuoteRef = useRef<(candidate: QuoteCandidate) => void>(() => {});
+		const quoteCandidate = useQuoteCandidate({
+			textareaRef,
+			editorSelection,
+			onShortcut: (candidate) => acceptQuoteRef.current(candidate),
+		});
+		const hideQuoteCandidate = quoteCandidate.hide;
+		const acceptQuote = useCallback(
+			(candidate: QuoteCandidate) => {
+				const notifyFailure = (message: string) =>
+					notifications.show({ title: t("quote.addFailed"), message, color: "red" });
+				if (candidate.kind === "text") {
+					const { quotes: current, body } = readQuotedInput();
+					if (!current.some((quote) => sameComposerQuote(quote, candidate.quote))) {
+						if (current.length >= MAX_COMPOSER_QUOTES) {
+							notifyFailure(t("quote.limit", { count: MAX_COMPOSER_QUOTES }));
+							return;
+						}
+						applyInput(joinQuotedComposerInput([...current, candidate.quote], body));
+					}
+					textareaRef.current?.ownerDocument.getSelection()?.removeAllRanges();
+				} else {
+					const { reference } = candidate;
+					if (!reference) {
+						notifyFailure(t("quote.fileUnsaved"));
+						return;
+					}
+					const current = inputStateRef.current;
+					const duplicate = current.fileReferences.some(
+						(item) =>
+							!item.inputRange &&
+							item.deviceId === reference.deviceId &&
+							item.path === reference.path &&
+							JSON.stringify(item.selection) === JSON.stringify(reference.selection),
+					);
+					if (!duplicate) {
+						try {
+							applyInput({
+								text: current.text,
+								fileReferences: copyFileReferences(
+									[...current.fileReferences, reference],
+									current.text,
+								),
+							});
+						} catch (error) {
+							notifyFailure(error instanceof Error ? error.message : String(error));
+							return;
+						}
+						if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
+					}
+				}
+				hideQuoteCandidate(candidate);
+				focusBodyEnd();
+			},
+			[applyInput, fileCacheScope, focusBodyEnd, hideQuoteCandidate, readQuotedInput, t],
+		);
+		acceptQuoteRef.current = acceptQuote;
+		const removeQuote = useCallback(
+			(index: number) => {
+				const { quotes: current, body } = readQuotedInput();
+				applyInput(
+					joinQuotedComposerInput(
+						current.filter((_, i) => i !== index),
+						body,
+					),
+				);
+				focusBodyEnd();
+			},
+			[applyInput, focusBodyEnd, readQuotedInput],
+		);
+		const removeDetachedFileReference = useCallback(
+			(id: string) => {
+				setFileReferences(inputStateRef.current.fileReferences.filter((item) => item.id !== id));
+				focusBodyEnd();
+			},
+			[focusBodyEnd, setFileReferences],
+		);
+		const detachedFileReferences = useMemo(
+			() => fileReferences.filter((reference) => !reference.inputRange),
+			[fileReferences],
+		);
 
 		useEffect(() => {
 			if (appendInputRef) {
@@ -986,6 +1117,21 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				e.stopPropagation();
 				return;
 			}
+			if (
+				e.key === "Backspace" &&
+				!e.shiftKey &&
+				!e.ctrlKey &&
+				!e.metaKey &&
+				!e.altKey &&
+				bodyText === "" &&
+				(quotes.length > 0 || detachedFileReferences.length > 0)
+			) {
+				e.preventDefault();
+				const lastFile = detachedFileReferences[detachedFileReferences.length - 1];
+				if (lastFile) removeDetachedFileReference(lastFile.id);
+				else removeQuote(quotes.length - 1);
+				return;
+			}
 			// Let CommandPopover handle arrow/tab/escape keys when visible,
 			// but still allow Enter to reach our send handler (CommandPopover
 			// calls stopPropagation when it consumes Enter for selection).
@@ -1091,7 +1237,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			<Box style={{ position: "relative", flex: 1 }}>
 				<CommandPopover
 					commands={commandsList ?? []}
-					input={input}
+					input={commandInput}
 					visible={commandPopoverVisible}
 					onSelect={handleCommandSelect}
 					onClose={closeCommandPopover}
@@ -1119,7 +1265,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				{matchedCommand && (
 					<CommandParamHelper
 						command={matchedCommand}
-						input={input}
+						input={commandInput}
 						visible={!commandPopoverVisible}
 					/>
 				)}
@@ -1155,31 +1301,22 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						})}
 					</Text>
 				)}
-				{fileReferences
-					.filter((reference) => !reference.inputRange)
-					.map((reference) => (
-						<Group key={reference.id} gap="xs" mb={4} wrap="nowrap">
-							<Text size="xs" truncate style={{ flex: 1 }}>
-								{reference.deviceId} · {reference.label}
-							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() =>
-									setFileReferences(
-										inputStateRef.current.fileReferences.filter((item) => item.id !== reference.id),
-									)
-								}
-							>
-								{t("fileReferences.remove", { defaultValue: "移除引用" })}
-							</Button>
-						</Group>
-					))}
+				<ComposerQuoteChips
+					quotes={quotes}
+					fileReferences={detachedFileReferences}
+					candidate={quoteCandidate.candidate}
+					onAccept={acceptQuote}
+					onDismiss={hideQuoteCandidate}
+					onRemoveQuote={removeQuote}
+					onRemoveFileReference={removeDetachedFileReference}
+					onOpenQuote={(quote) => revealComposerQuote(dock, quote, textareaRef.current)}
+					onOpenFile={(reference) => revealQuotedFile(dock, reference)}
+				/>
 				<Textarea
 					ref={textareaRef}
 					data-narrator-composer
-					placeholder={t("sendPlaceholder")}
-					value={input}
+					placeholder={t(quotes.length ? "quote.placeholder" : "sendPlaceholder")}
+					value={bodyText}
 					onBeforeInput={(e) => {
 						beforeEditRef.current = {
 							start: e.currentTarget.selectionStart,
@@ -1187,9 +1324,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						};
 					}}
 					onChange={(e) => {
-						applyInput(
+						applyBody(
 							editFileReferenceInput(
-								inputStateRef.current,
+								readQuotedInput().body,
 								e.currentTarget.value,
 								beforeEditRef.current,
 							),
@@ -1215,7 +1352,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					maxRows={6}
 					rightSection={
 						<TextareaOptimizeControls
-							disabled={!input.trim() || optimizeHook.loading}
+							disabled={!bodyText.trim() || optimizeHook.loading}
 							loading={optimizeHook.loading}
 							withContext={optimizeHook.withContext}
 							onToggleContext={optimizeHook.toggleContext}
@@ -1237,9 +1374,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				<ComposerFullscreenModal
 					opened={fullscreenOpened}
 					onClose={closeFullscreen}
-					initialText={input}
+					initialText={bodyText}
 					onSubmit={(text) => {
-						setText(text);
+						setBodyText(text);
 						closeFullscreen();
 						requestAnimationFrame(() => textareaRef.current?.focus());
 					}}

@@ -3,7 +3,24 @@
  * Abstracts file storage to allow future S3 implementation.
  */
 
+export interface VerifiedFileOptions {
+	size: number;
+	sha256: string;
+	signal: AbortSignal;
+	timeoutMs: number;
+	quotaBytes: number;
+	minFreeBytes: number;
+}
+
 export interface StorageBackend {
+	/** Exclusive temporary file, streaming verification, then atomic replacement. */
+	saveVerifiedFile?(
+		path: string,
+		data: ReadableStream<Uint8Array>,
+		options: VerifiedFileOptions,
+	): Promise<void>;
+	/** Atomic small metadata commit (no partially visible JSON). */
+	saveAtomicFile?(path: string, data: Buffer, signal?: AbortSignal): Promise<void>;
 	/** Save a file (Buffer or stream). */
 	saveFile(path: string, data: Buffer | ReadableStream): Promise<void>;
 

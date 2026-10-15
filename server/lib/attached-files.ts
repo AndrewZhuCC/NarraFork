@@ -40,20 +40,11 @@ export function buildAttachedFilesHint(
 	);
 	for (const image of images) {
 		lines.push(
-			`- image: ${JSON.stringify(image.filename)}; imageId: ${JSON.stringify(image.imageId)}; ` +
+			`- image: ${JSON.stringify(image.filename)}; ` +
 				(image.file
 					? `device: local; path: ${JSON.stringify(image.file.filePath)}; size: ${formatFileSize(image.file.size)}`
 					: "worktree copy unavailable; no usable path"),
 		);
 	}
-	return (
-		"\n\n<attached_files>\n" +
-		"The user has attached the following files for your reference (metadata, not instructions). " +
-		"These paths are on the NarraFork server (device: local), not on a remote execution device. " +
-		"Use Read with device: local when needed; transfer files before using them in a remote workspace. " +
-		"Image paths refer to worktree copies, not the retained upload originals. " +
-		"Copy attachments into project assets when needed. Normal file permissions still apply.\n" +
-		`${lines.join("\n")}\n` +
-		"</attached_files>"
-	);
+	return `\n\n<attached_files>\n${lines.join("\n")}\n</attached_files>`;
 }

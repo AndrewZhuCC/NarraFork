@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAttachedFilesHint, buildLegacyAttachedFilesHint } from "../../attached-files";
@@ -45,6 +45,33 @@ function message(text = "use this image"): TestMessage {
 function prepare(messages: TestMessage[], currentInput?: string, worktree = cwd) {
 	return projectAttachmentLocations(messages, { cwd: worktree, narratorId: "fork", currentInput });
 }
+
+test("attachment hints stay concise and do not direct tools or claim visual delivery", () => {
+	const file = { filename: "notes.txt", filePath: join(cwd, "notes.txt"), size: 12 };
+	const image = { filename: "logo.png", imageId: "image", file };
+	for (const hint of [
+		buildAttachedFilesHint([file]),
+		buildAttachedFilesHint([], [image]),
+		buildAttachedFilesHint([file], [image]),
+	]) {
+		const lines = hint.trim().split("\n");
+		expect(lines[0]).toBe("<attached_files>");
+		expect(lines.at(-1)).toBe("</attached_files>");
+		for (const line of lines.slice(1, -1)) {
+			expect(line).toMatch(/^- (file|image): /);
+			expect(line).toContain("device: local");
+		}
+		expect(hint).not.toContain("imageId");
+		expect(hint).not.toMatch(/NarraFork|metadata|worktree copies/);
+		expect(hint).not.toMatch(/\b(Read|transfer|Copy)\b/);
+		expect(hint).not.toMatch(/already|in context/);
+	}
+});
+
+test("Read description does not mandate reading screenshot paths", () => {
+	const source = readFileSync(new URL("../tools/read.ts", import.meta.url), "utf8");
+	expect(source).not.toMatch(/screenshot.*ALWAYS|ALWAYS.*screenshot/);
+});
 
 test("current input and history share one local image locator without mutating saved rows", async () => {
 	const source = message();
@@ -221,9 +248,7 @@ test("legacy file and image attachments share safe absolute worktree locations",
 	const before = JSON.stringify(source);
 	const prepared = await prepare([source], source.contentText);
 	expect(prepared.currentInput).toContain('file: "notes.txt"; device: local; path:');
-	expect(prepared.currentInput).toContain(
-		'image: "logo.png"; imageId: "image"; device: local; path:',
-	);
+	expect(prepared.currentInput).toContain('image: "logo.png"; device: local; path:');
 	expect(prepared.currentInput).not.toContain("owner/text/notes.txt");
 	expect(prepared.currentInput).not.toContain(join(root, "uploads"));
 	expect(prepared.currentInput?.match(/<attached_files>/g)).toHaveLength(1);

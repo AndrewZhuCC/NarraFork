@@ -1,6 +1,17 @@
-import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
-import { MAX_BYTES, MAX_LINES, truncateOutput } from "../../truncate";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { logger } from "../../../logger";
+import { cleanupTruncatedOutputs, MAX_BYTES, MAX_LINES, truncateOutput } from "../../truncate";
 
 // ============================================================
 // truncateOutput — dual limits + file persistence
@@ -134,5 +145,83 @@ describe("truncateOutput", () => {
 		const lines = Array.from({ length: MAX_LINES + 10 }, (_, i) => `x${i}`);
 		const result = truncateOutput(lines.join("\n"));
 		expect(result.outputPath).toContain("narrafork-tool-output");
+	});
+});
+
+describe("truncated output cleanup timing", () => {
+	test("reports scan/stat/unlink work and keeps unexpired or unrelated files", () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-truncate-cleanup-test-"));
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+			for (const [filename, text] of [
+				["tool_old", "abc"],
+				["toolcall_old", "xy"],
+				["unrelated", "keep"],
+			]) {
+				const path = join(directory, filename);
+				writeFileSync(path, text);
+				utimesSync(path, old, old);
+			}
+			writeFileSync(join(directory, "tool_new"), "new");
+			const oldDirectory = join(directory, "tool_directory");
+			mkdirSync(oldDirectory);
+			utimesSync(oldDirectory, old, old);
+			cleanupTruncatedOutputs(directory);
+			expect(existsSync(join(directory, "tool_old"))).toBe(false);
+			expect(existsSync(join(directory, "toolcall_old"))).toBe(false);
+			expect(existsSync(join(directory, "tool_new"))).toBe(true);
+			expect(existsSync(join(directory, "unrelated"))).toBe(true);
+			expect(existsSync(oldDirectory)).toBe(true);
+			const completed = info.mock.calls.find(
+				([message]) => message === "Truncated output cleanup completed",
+			)?.[1];
+			expect(completed).toMatchObject({
+				directoryAvailable: true,
+				entries: 5,
+				scanned: 4,
+				deleted: 2,
+				deletedBytes: 5,
+				errors: 1,
+			});
+			for (const field of ["durationMs", "readDirectoryMs", "statMs", "unlinkMs"]) {
+				expect(completed?.[field]).toBeGreaterThanOrEqual(0);
+			}
+		} finally {
+			mock.restore();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("missing output directory is still non-fatal and records a skipped scan", () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-truncate-cleanup-test-"));
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		try {
+			expect(() => cleanupTruncatedOutputs(join(directory, "missing"))).not.toThrow();
+			expect(
+				info.mock.calls.find(([message]) => message === "Truncated output cleanup completed")?.[1],
+			).toMatchObject({ directoryAvailable: false, entries: 0, scanned: 0, deleted: 0 });
+		} finally {
+			mock.restore();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("slow cleanup emits a warning with phase durations", () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-truncate-cleanup-test-"));
+		spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		let elapsed = 0;
+		spyOn(performance, "now").mockImplementation(() => (elapsed += 100));
+		try {
+			cleanupTruncatedOutputs(directory);
+			expect(
+				warn.mock.calls.find(([message]) => message === "Truncated output cleanup completed")?.[1],
+			).toMatchObject({ durationMs: 300, readDirectoryMs: 100 });
+		} finally {
+			mock.restore();
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });

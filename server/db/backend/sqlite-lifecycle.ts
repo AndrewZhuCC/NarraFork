@@ -285,9 +285,9 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 
 		// Refresh query-planner statistics once on a real startup (skip hot reloads — the stats are
 		// process-independent and this avoids redundant work on every --hot cycle). Bounded by
-		// analysis_limit so it stays fast even on large tables.
+		// analysis_limit; actual synchronous duration is logged by optimizeDatabase.
 		if (!isHotReload) {
-			optimizeDatabase(connection());
+			optimizeDatabase(connection(), { source: "startup" });
 		}
 
 		// Guarantee the instance lock is released on process exit. Deliberately NOT the clean-shutdown

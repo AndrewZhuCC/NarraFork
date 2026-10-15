@@ -11,7 +11,11 @@
  * only the executor's connection attempt on a remote machine ever revealed it.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { EXECUTOR_MANIFEST_FILENAME, executorPublishedFilename } from "@shared/remote-executor";
+import {
+	EXECUTOR_MANIFEST_FILENAME,
+	EXECUTOR_PLATFORMS,
+	executorPublishedFilename,
+} from "@shared/remote-executor";
 import { inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
@@ -21,6 +25,34 @@ import { getExecutorManifest, resetExecutorManifestCache } from "../../lib/execu
 import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
 
 const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
+const repository = "fixture/install-script-url";
+const tag = `executor-v${EXECUTOR_VERSION}`;
+const manifestUrl = `https://github.com/${repository}/releases/download/${tag}/${EXECUTOR_MANIFEST_FILENAME}`;
+
+function canonicalManifest() {
+	return {
+		schemaVersion: 1,
+		repository,
+		tag,
+		commit: "a".repeat(40),
+		manifest: {
+			version: EXECUTOR_VERSION,
+			protocolVersion: BUILD_EXECUTOR_DISTRIBUTION.protocolVersion,
+			releasedAt: "2026-01-01T00:00:00Z",
+			platforms: Object.fromEntries(
+				EXECUTOR_PLATFORMS.map((platform) => [
+					platform,
+					{
+						filename: executorPublishedFilename(EXECUTOR_VERSION, platform),
+						size: 256,
+						sha256: "a".repeat(64),
+					},
+				]),
+			),
+		},
+		licenses: [{ name: "LICENSE.txt", size: 10, sha256: "b".repeat(64) }],
+	};
+}
 
 const originalFetch = globalThis.fetch;
 const originalUpdate = settings.update ?? {
@@ -31,7 +63,10 @@ const originalUpdate = settings.update ?? {
 	autoDownload: false,
 };
 
-import { resetExecutorTickets } from "../../lib/executor-bootstrap-ticket";
+import {
+	countLiveExecutorTickets,
+	resetExecutorTickets,
+} from "../../lib/executor-bootstrap-ticket";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { deviceRoutes } from "../devices";
@@ -45,25 +80,18 @@ beforeEach(async () => {
 	settings.update = {
 		...originalUpdate,
 		source: "update-server",
+		githubRepository: repository,
 		serverUrl: "https://fixture.example",
 		proxy: { mode: "direct" },
 	};
 	resetExecutorManifestCache();
-	globalThis.fetch = (async (url: RequestInfo | URL) =>
-		String(url).endsWith(EXECUTOR_MANIFEST_FILENAME)
-			? Response.json({
-					version: EXECUTOR_VERSION,
-					protocolVersion: 1,
-					releasedAt: "2026-01-01T00:00:00Z",
-					platforms: {
-						"linux-amd64": {
-							filename: executorPublishedFilename(EXECUTOR_VERSION, "linux-amd64"),
-							size: 256,
-							sha256: "a".repeat(64),
-						},
-					},
-				})
-			: new Response(null, { status: 404 })) as typeof fetch;
+	globalThis.fetch = Object.assign(
+		async (url: RequestInfo | URL) => {
+			expect(String(url)).toBe(manifestUrl);
+			return Response.json(canonicalManifest());
+		},
+		{ preconnect: originalFetch.preconnect },
+	);
 	expect((await getExecutorManifest())?.platforms["linux-amd64"]).toBeTruthy();
 });
 
@@ -138,12 +166,44 @@ async function generate(deviceId: string, options: GenerateOptions = {}) {
 }
 
 describe("server URL composition", () => {
-	test("an unsupported release platform stays a client validation error", async () => {
+	test("an unsupported executor platform stays a client validation error", async () => {
 		const id = await makeDevice();
-		const response = await generate(id, { body: { platform: "windows-arm64" } });
+		// Canonical executor releases declare all six supported platforms, including Windows ARM64.
+		const response = await generate(id, { body: { platform: "freebsd-amd64" } });
 		expect(response.status).toBe(400);
-		expect((await response.json()).error).toContain("does not publish a build");
+		expect((await response.json()).error).toContain("platform");
+		expect(countLiveExecutorTickets()).toBe(0);
 	});
+	test.each([
+		"repository",
+		"tag",
+	] as const)("canonical %s mismatch cannot mint an install ticket", async (change) => {
+		const id = await makeDevice();
+		if (!settings.update) throw new Error("Missing update settings");
+		const expectedRepository = `fixture/install-${change}-change`;
+		settings.update.githubRepository = expectedRepository;
+		const metadata = canonicalManifest();
+		if (change === "tag") {
+			metadata.repository = expectedRepository;
+			metadata.tag = "executor-v99.0.0";
+		}
+		const calls: string[] = [];
+		globalThis.fetch = Object.assign(
+			async (input: RequestInfo | URL) => {
+				calls.push(String(input));
+				return Response.json(metadata);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		const response = await generate(id, { body: { serverBaseUrl: "https://nf.example.com" } });
+		expect(response.status).toBe(400);
+		expect((await response.json()).error).toContain("No compatible executor release");
+		expect(calls).toEqual([
+			`https://github.com/${expectedRepository}/releases/download/${tag}/${EXECUTOR_MANIFEST_FILENAME}`,
+		]);
+		expect(countLiveExecutorTickets()).toBe(0);
+	});
+
 	test("an explicit base URL is what lands in the command", async () => {
 		const id = await makeDevice();
 		const response = await generate(id, {

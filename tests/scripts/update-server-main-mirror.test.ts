@@ -1,737 +1,496 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Hono } from "hono";
 import {
-	computeBinaryMetadataFromBuffer,
-	formatMetadataJson,
-} from "../../scripts/lib/binary-metadata";
-import { hashReleaseFile } from "../../scripts/lib/ci-release-io";
-import { CI_RELEASE_TARGETS, type CiReleaseManifest } from "../../scripts/lib/ci-release-types";
-import {
-	BRIDGE_POST_LIMIT,
-	resolveUpdateServerBridgeConfig,
-	UpdateServerBridgeHttp,
+	resolveUpdateServerMirrorConfig,
+	UpdateServerMirrorHttp,
 } from "../../scripts/lib/update-server-bridge-http";
-import { generateBridgePatch } from "../../scripts/lib/update-server-bridge-patch";
 import {
-	MAIN_MIRROR_TOTAL_TIMEOUT_MS,
-	MirrorPublicationError,
+	IndependentMirrorError,
 	prepareUpdateServerMainMirror,
-	publishUpdateServerMainMirror,
-	restorePreparedMainMirror,
-	verifyPreparedMainMirror,
 } from "../../scripts/lib/update-server-main-mirror";
-import { addToken, initConfig } from "../../update-server/lib/config";
-import { invalidateProduct, setCachedRelease } from "../../update-server/lib/release-cache";
-import { createCheckRoutes } from "../../update-server/routes/check";
-import { createDownloadRoutes } from "../../update-server/routes/download";
-import { createReleaseRoutes } from "../../update-server/routes/releases";
+import { mirrorPublishedGitHubRelease } from "../../scripts/mirror-update-server";
+import { mergeUpdateIndex } from "../../shared/update-index";
+import { createApp } from "../../update-server/app";
+import { initConfig } from "../../update-server/lib/config";
 import { LocalStorage } from "../../update-server/storage/local";
-import type { ReleaseMeta } from "../../update-server/types";
+import { config, mirrorFixture, repository, sha } from "./mirror-fixture";
 
-const roots: string[] = [];
-let authRoot: string;
-let token: string;
-beforeAll(async () => {
-	authRoot = await mkdtemp(join(tmpdir(), "nf-main-mirror-auth-"));
-	await initConfig(join(authRoot, "config.json"));
-	token = (await addToken("test-main-mirror-only", "upload")).token;
+const options = (fixture: ReturnType<typeof mirrorFixture>) => ({
+	kind: "main" as const,
+	repository,
+	tag: fixture.release.tag,
+	config,
+	run: fixture.run,
+	http: fixture.http,
+	downloadAsset: fixture.downloadAsset,
 });
-afterEach(async () => {
-	invalidateProduct("narrafork");
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
-afterAll(async () => {
-	await rm(authRoot, { recursive: true, force: true });
-});
-function bytes(version: string, platform: string) {
-	return Buffer.from(`${version}-${platform}-original-binary\n`.repeat(1024));
-}
-function sha512(value: Buffer) {
-	return createHash("sha512").update(value).digest("base64");
-}
-async function fixture(channels: ("stable" | "beta")[] = ["beta"]) {
-	invalidateProduct("narrafork");
-	const root = await mkdtemp(join(tmpdir(), "nf-main-mirror-"));
-	roots.push(root);
-	const bundleDir = join(root, "bundle");
-	const bridgeDir = join(root, "bridge");
-	await mkdir(join(bundleDir, "dist"), { recursive: true });
-	const storage = new LocalStorage(join(root, "server"));
-	const app = new Hono();
-	app.route("/api/v2/products", createReleaseRoutes(storage));
-	app.route("/api/v2/products", createCheckRoutes(storage));
-	app.route("/api/v2/products", createDownloadRoutes(storage));
-	const config = resolveUpdateServerBridgeConfig({
-		NF_UPDATE_SERVER: "https://bridge.example",
-		NF_UPDATE_TOKEN: token,
-	});
-	if (!config) throw new Error("fixture configuration missing");
-	const manifest: CiReleaseManifest = {
-		schemaVersion: 1,
-		plan: {
-			schemaVersion: 1,
-			repository: "NarraFork/NarraFork",
-			tag: "v2.0.0",
-			version: "2.0.0",
-			commit: "a".repeat(40),
-			workflowCommit: "b".repeat(40),
-			bunVersion: "1.4.3",
-			channel: "stable",
-			changelog: { version: "2.0.0", date: "2026-10-09", en: "Release", "zh-CN": "发布" },
-			runId: 12,
-			runAttempt: 2,
-			baselines: [],
-		},
-		files: [],
-		smoke: [],
-	};
-	for (const target of CI_RELEASE_TARGETS) {
-		const name = `narrafork-2.0.0-${target.suffix}`;
-		const binary = bytes("2.0.0", target.platform);
-		const sidecar = computeBinaryMetadataFromBuffer(name, binary, {
-			version: "2.0.0",
-			platformId: target.platform,
-			target: `bun-${target.target}`,
-			commit: manifest.plan.commit,
-			repository: manifest.plan.repository,
-			buildDate: "2026-10-09T00:00:00.000Z",
-		});
-		await writeFile(join(bundleDir, "dist", name), binary);
-		await writeFile(join(bundleDir, "dist", `${name}.metadata.json`), formatMetadataJson(sidecar));
-		for (const filename of [name, `${name}.metadata.json`])
-			manifest.files.push({
-				name: filename,
-				...(await hashReleaseFile(join(bundleDir, "dist", filename))),
-			});
-	}
-	await writeFile(join(bundleDir, "manifest.json"), JSON.stringify(manifest));
-	async function seed(version: string, channel: "stable" | "beta", includeFull = true) {
-		const meta: ReleaseMeta = {
-			version,
-			channel,
-			releaseDate: "2026-10-01T00:00:00.000Z",
-			platforms: {},
-		};
-		for (const target of CI_RELEASE_TARGETS) {
-			const filename = `narrafork-${version}-${target.suffix}`;
-			const binary = bytes(version, target.platform);
-			meta.platforms[target.platform] = {
-				filename,
-				size: binary.length,
-				sha512: sha512(binary),
-				hasZstdPatch: false,
-			};
-			if (includeFull)
-				await storage.saveFile(
-					`products/narrafork/releases/${version}/${target.platform}/${filename}`,
-					binary,
+describe("canonical independent main mirror", () => {
+	for (const withPatch of [true, false])
+		test(`empty real Hono and LocalStorage server commits ${withPatch ? "current raw patch" : "metadata-only"} with server verification and no GET readback`, async () => {
+			const root = await mkdtemp(join(tmpdir(), "nf-producer-server-e2e-"));
+			try {
+				const configFile = join(root, "config.json");
+				const initialized = await initConfig(configFile);
+				if (!initialized.adminToken) throw new Error("Missing isolated fixture token");
+				const operatorConfig = JSON.parse(await readFile(configFile, "utf8"));
+				operatorConfig.mirrorRepositories = { narrafork: repository };
+				operatorConfig.mirrorLimits = {
+					minFreeBytes: 0,
+					quotaBytes: 1024 * 1024,
+					uploadTimeoutMs: 1000,
+				};
+				await writeFile(configFile, JSON.stringify(operatorConfig));
+				await initConfig(configFile);
+				const storage = new LocalStorage(join(root, "data"));
+				const app = createApp(storage);
+				const f = mirrorFixture(withPatch);
+				const serverConfig = { ...config, token: initialized.adminToken };
+				const requests: { path: string; method: string; status: number }[] = [];
+				const http = new UpdateServerMirrorHttp(serverConfig, {
+					fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+						const response = await app.request(String(url), init);
+						requests.push({
+							path: new URL(String(url)).pathname,
+							method: init?.method ?? "GET",
+							status: response.status,
+						});
+						return response;
+					}) as unknown as typeof fetch,
+				});
+				const asset = [...f.raw.keys()].find((name) => name.endsWith(".metadata.json")) as string;
+				const sidecar = f.raw.get(asset);
+				if (!sidecar) throw new Error("Missing sidecar fixture");
+				expect(
+					(await app.request(`/api/v3/products/narrafork/mirror/assets/${sha(sidecar)}`)).status,
+				).toBe(404);
+				const result = await mirrorPublishedGitHubRelease({
+					...options(f),
+					config: serverConfig,
+					http,
+				});
+				expect(result.status).toBe(withPatch ? "MIRRORED" : "METADATA_ONLY");
+				expect(result.uploaded).toEqual(result.verified);
+				expect(result.snapshotCommitted).toBe(true);
+				const commitAt = requests.findIndex(
+					(r) => r.method === "POST" && r.path.endsWith("/snapshot"),
 				);
-		}
-		await storage.saveFile(
-			`products/narrafork/releases/${version}/meta.json`,
-			Buffer.from(JSON.stringify(meta)),
-		);
-		setCachedRelease("narrafork", meta);
-		return meta;
-	}
-	for (const channel of channels) await seed(channel === "stable" ? "1.0.0" : "1.1.0", channel);
-	const requests: { method: string; path: string; platform?: string }[] = [];
-	let failPlatform: string | undefined;
-	let fakeSuccess = false;
-	let requestHook: ((request: Request) => Promise<void> | void) | undefined;
-	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-		const request = new Request(input, init);
-		const path = new URL(request.url).pathname;
-		await requestHook?.(request);
-		let platform: string | undefined;
-		if (request.method === "POST")
-			platform = (await request.clone().formData()).get("platform") as string;
-		requests.push({ method: request.method, path, platform });
-		if (request.method === "POST" && platform === failPlatform)
-			return Response.json({ error: "test injected failure" }, { status: 503 });
-		if (request.method === "POST" && fakeSuccess) return Response.json({ success: true });
-		return app.request(request);
-	}) as typeof fetch;
-	const http = new UpdateServerBridgeHttp(config, { fetchImpl });
-	const options = {
-		manifest,
-		bundleDir,
-		bridgeDir,
-		config,
-		http,
-		run: () => {
-			throw new Error("Unexpected GitHub request in local fixture");
-		},
-	};
-	return {
-		root,
-		manifest,
-		bundleDir,
-		bridgeDir,
-		storage,
-		app,
-		config,
-		options,
-		http,
-		requests,
-		seed,
-		hook(callback?: (request: Request) => Promise<void> | void) {
-			requestHook = callback;
-		},
-		fail(platform?: string) {
-			failPlatform = platform;
-		},
-		fake(value: boolean) {
-			fakeSuccess = value;
-		},
-	};
-}
-async function addBundlePatch(f: Awaited<ReturnType<typeof fixture>>, matchSource = true) {
-	const platform = CI_RELEASE_TARGETS[0];
-	const full = `narrafork-2.0.0-${platform.suffix}`;
-	const basis = join(f.root, "gh-source");
-	await writeFile(basis, bytes(matchSource ? "1.1.0" : "1.0.9", platform.platform));
-	const name = `${full}.from-1.1.0.zstd-patch`;
-	const path = join(f.bundleDir, "dist", name);
-	const metadata = await generateBridgePatch({
-		oldFilePath: basis,
-		newFilePath: join(f.bundleDir, "dist", full),
-		patchOutputPath: path,
-		fromVersion: "1.1.0",
-		toVersion: "2.0.0",
-		maxPatchBytes: 1024 * 1024,
-		signal: AbortSignal.timeout(5000),
-	});
-	await writeFile(`${path}.meta.json`, JSON.stringify(metadata));
-	for (const filename of [name, `${name}.meta.json`])
-		f.manifest.files.push({
-			name: filename,
-			...(await hashReleaseFile(join(f.bundleDir, "dist", filename))),
-		});
-	await writeFile(join(f.bundleDir, "manifest.json"), JSON.stringify(f.manifest));
-	return { name, metadata };
-}
-
-describe("eight-platform legacy mirror with real update-server routes and real zstd", () => {
-	test("plans both legacy channels, reconstructs exact full bytes, keeps GH bundle unchanged, publishes and skips complete retry", async () => {
-		const f = await fixture(["stable", "beta"]);
-		const before = new Map(
-			await Promise.all(
-				f.manifest.files.map(
-					async (file) =>
-						[file.name, await hashReleaseFile(join(f.bundleDir, "dist", file.name))] as const,
-				),
-			),
-		);
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		expect(prepared.seal.platforms).toHaveLength(8);
-		expect(prepared.seal.platforms.every((platform) => platform.patches.length === 2)).toBe(true);
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
-		expect(JSON.stringify(prepared)).not.toContain(token);
-		expect(
-			(await readdir(f.bridgeDir)).some(
-				(name) => name.endsWith(".basis") || name.endsWith(".rebuilt"),
-			),
-		).toBe(false);
-		for (const file of f.manifest.files) {
-			const prior = before.get(file.name);
-			if (!prior) throw new Error("Missing original fixture identity");
-			expect(await hashReleaseFile(join(f.bundleDir, "dist", file.name))).toEqual(prior);
-		}
-		const receipt = await publishUpdateServerMainMirror(prepared, f.config, { http: f.http });
-		expect(receipt.status).toBe("mirrored");
-		expect(receipt.platforms.every((item) => item.status === "verified")).toBe(true);
-		expect(f.requests.filter((request) => request.method === "POST")).toHaveLength(16);
-		for (const target of CI_RELEASE_TARGETS) {
-			const response = await f.app.request(
-				`https://bridge.example/api/v2/products/narrafork/releases/latest?channel=stable&platform=${target.platform}&version=1.0.0`,
-			);
-			const check = await response.json();
-			expect(check.version).toBe("2.0.0");
-			expect(check.zstdPatch.fromVersion).toBe("1.0.0");
-		}
-		await f.seed("3.0.0", "beta");
-		await publishUpdateServerMainMirror(prepared, f.config, { http: f.http });
-		expect(f.requests.filter((request) => request.method === "POST")).toHaveLength(16);
-	});
-	test("exact GH patch is reused only with old server identity match", async () => {
-		const f = await fixture();
-		const gh = await addBundlePatch(f);
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		expect(prepared.seal.platforms[0].patches[0].origin).toBe("github-bundle");
-		expect(await readFile(join(f.bridgeDir, gh.name))).toEqual(
-			await readFile(join(f.bundleDir, "dist", gh.name)),
-		);
-	});
-	test("large legacy dictionary GH patch is regenerated with streaming patch-from instead of whole-file buffering", async () => {
-		const f = await fixture();
-		const gh = await addBundlePatch(f);
-		const target = CI_RELEASE_TARGETS[0];
-		const oldBytes = Buffer.alloc(9 * 1024 * 1024, 65);
-		const sourceMeta = await f.seed("1.1.0", "beta");
-		const file = sourceMeta.platforms[target.platform];
-		file.size = oldBytes.length;
-		file.sha512 = sha512(oldBytes);
-		await f.storage.saveFile(
-			`products/narrafork/releases/1.1.0/${target.platform}/${file.filename}`,
-			oldBytes,
-		);
-		await f.storage.saveFile(
-			"products/narrafork/releases/1.1.0/meta.json",
-			Buffer.from(JSON.stringify(sourceMeta)),
-		);
-		setCachedRelease("narrafork", sourceMeta);
-		const metadataPath = join(f.bundleDir, "dist", `${gh.name}.meta.json`);
-		await writeFile(
-			metadataPath,
-			JSON.stringify({
-				...gh.metadata,
-				mode: "dictionary",
-				oldFileSize: file.size,
-				oldFileSha512: file.sha512,
-			}),
-		);
-		const record = f.manifest.files.find((entry) => entry.name === `${gh.name}.meta.json`);
-		if (!record) throw new Error("Missing GH patch metadata fixture");
-		Object.assign(record, await hashReleaseFile(metadataPath));
-		await writeFile(join(f.bundleDir, "manifest.json"), JSON.stringify(f.manifest));
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		expect(prepared.seal.platforms[0].patches[0].origin).toBe("bridge-generated");
-		expect(prepared.seal.platforms[0].patches[0].metadata.mode).toBe("patch-from");
-		expect(prepared.seal.platforms[0].patches[0].metadata.oldFileSize).toBe(oldBytes.length);
-	});
-	test("different GH basis bytes produce separate bridge patch without modifying GH patch", async () => {
-		const f = await fixture();
-		const gh = await addBundlePatch(f, false);
-		const original = await readFile(join(f.bundleDir, "dist", gh.name));
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		expect(prepared.seal.platforms[0].patches[0].origin).toBe("bridge-generated");
-		expect(prepared.seal.platforms[0].patches[0].metadata.oldFileSha512).not.toBe(
-			gh.metadata.oldFileSha512,
-		);
-		expect(await readFile(join(f.bundleDir, "dist", gh.name))).toEqual(original);
-	});
-	test("delta-only source uses exact already-public GH binary fallback, not tag rebuild", async () => {
-		const f = await fixture();
-		for (const target of CI_RELEASE_TARGETS)
-			await f.storage.deleteFile(
-				`products/narrafork/releases/1.1.0/${target.platform}/narrafork-1.1.0-${target.suffix}`,
-			);
-		const runArgs: string[][] = [];
-		const prepared = await prepareUpdateServerMainMirror({
-			...f.options,
-			run: (args: string[]) => {
-				runArgs.push(args);
-				return JSON.stringify({
-					draft: false,
-					tag_name: "v1.1.0",
-					assets: CI_RELEASE_TARGETS.map((target, index) => ({
-						id: index + 1,
-						name: `narrafork-1.1.0-${target.suffix}`,
-						size: bytes("1.1.0", target.platform).length,
-						state: "uploaded",
-					})),
-				});
-			},
-			downloadAsset: async ({ assetId, outputPath }) => {
-				await writeFile(outputPath, bytes("1.1.0", CI_RELEASE_TARGETS[assetId - 1].platform), {
-					flag: "wx",
-				});
-			},
-		});
-		expect(prepared.seal.platforms).toHaveLength(8);
-		expect(runArgs).toHaveLength(8);
-		expect(runArgs.every((args) => args.join(" ").includes("releases/tags/v1.1.0"))).toBe(true);
-	});
-	test("missing old full and unavailable GH stops instead of full-only success", async () => {
-		const f = await fixture();
-		const target = CI_RELEASE_TARGETS[0];
-		await f.storage.deleteFile(
-			`products/narrafork/releases/1.1.0/${target.platform}/narrafork-1.1.0-${target.suffix}`,
-		);
-		await expect(prepareUpdateServerMainMirror(f.options)).rejects.toThrow(
-			"Legacy source binary unavailable",
-		);
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
-		expect((await readdir(f.bridgeDir)).includes("prepared-main-mirror.json")).toBe(false);
-	});
-	test("corrupt old full is not hidden by GH fallback", async () => {
-		const f = await fixture();
-		const target = CI_RELEASE_TARGETS[0];
-		await f.storage.saveFile(
-			`products/narrafork/releases/1.1.0/${target.platform}/narrafork-1.1.0-${target.suffix}`,
-			Buffer.from("corrupt"),
-		);
-		let calls = 0;
-		await expect(
-			prepareUpdateServerMainMirror({
-				...f.options,
-				run: () => {
-					calls++;
-					return "{}";
-				},
-			}),
-		).rejects.toThrow();
-		expect(calls).toBe(0);
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
-	});
-	test("bad GH fallback bytes fail SHA512 even if tag/name/size agree", async () => {
-		const f = await fixture();
-		const target = CI_RELEASE_TARGETS[0];
-		const original = bytes("1.1.0", target.platform);
-		await f.storage.deleteFile(
-			`products/narrafork/releases/1.1.0/${target.platform}/narrafork-1.1.0-${target.suffix}`,
-		);
-		await expect(
-			prepareUpdateServerMainMirror({
-				...f.options,
-				run: () =>
-					JSON.stringify({
-						draft: false,
-						tag_name: "v1.1.0",
-						assets: [
-							{
-								id: 1,
-								name: `narrafork-1.1.0-${target.suffix}`,
-								size: original.length,
-								state: "uploaded",
-							},
-						],
-					}),
-				downloadAsset: async ({ outputPath }) => {
-					await writeFile(outputPath, Buffer.alloc(original.length, 1));
-				},
-			}),
-		).rejects.toThrow("hash mismatch");
-	});
-	test("all target conflicts preflight before downloading or writing any platform", async () => {
-		const f = await fixture();
-		await f.seed("2.0.0", "stable");
-		const metaResponse = await f.app.request(
-			"https://bridge.example/api/v2/products/narrafork/releases/2.0.0/metadata",
-		);
-		const meta = (await metaResponse.json()) as ReleaseMeta;
-		meta.platforms["darwin-arm64"].sha512 = sha512(Buffer.from("different"));
-		setCachedRelease("narrafork", meta);
-		await expect(prepareUpdateServerMainMirror(f.options)).rejects.toThrow("409");
-		expect(
-			f.requests.some(
-				(request) => request.path.includes("/download/") || request.method === "POST",
-			),
-		).toBe(false);
-	});
-	test("newer server latest prevents initial stale mirror", async () => {
-		const f = await fixture();
-		await f.seed("3.0.0", "beta");
-		await expect(prepareUpdateServerMainMirror(f.options)).rejects.toThrow("newer release");
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
-	});
-	test("invalid original full fails before any network read", async () => {
-		const f = await fixture();
-		await writeFile(join(f.bundleDir, "dist", f.manifest.files[0].name), "tampered");
-		await expect(prepareUpdateServerMainMirror(f.options)).rejects.toThrow();
-		expect(f.requests).toHaveLength(0);
-	});
-	test("multipart capacity failure happens before network or any publication", async () => {
-		const f = await fixture();
-		const binary = f.manifest.files[0];
-		const path = join(f.bundleDir, "dist", binary.name);
-		const handle = await open(path, "r+");
-		await handle.truncate(BRIDGE_POST_LIMIT - 32 * 1024);
-		await handle.close();
-		Object.assign(binary, await hashReleaseFile(path));
-		const sidecarName = `${binary.name}.metadata.json`;
-		const sidecarPath = join(f.bundleDir, "dist", sidecarName);
-		const sidecar = JSON.parse(await readFile(sidecarPath, "utf8"));
-		Object.assign(sidecar, { size: binary.size, sha256: binary.sha256, sha512: binary.sha512 });
-		await writeFile(sidecarPath, JSON.stringify(sidecar));
-		const record = f.manifest.files.find((file) => file.name === sidecarName);
-		if (!record) throw new Error("Missing sidecar fixture");
-		Object.assign(record, await hashReleaseFile(sidecarPath));
-		await writeFile(join(f.bundleDir, "manifest.json"), JSON.stringify(f.manifest));
-		await expect(prepareUpdateServerMainMirror(f.options)).rejects.toThrow("256MiB");
-		expect(f.requests).toHaveLength(0);
-		expect(await Bun.file(join(f.bridgeDir, "prepared-main-mirror.json")).exists()).toBe(false);
-	});
-	test("no legacy basis is an explicit failure, never patchless publication", async () => {
-		const f = await fixture([]);
-		await expect(prepareUpdateServerMainMirror(f.options)).rejects.toThrow("full-only");
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
-	});
-	test("partial immediate-public upload yields recoverable receipt; original seal restores without choosing new basis", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		f.fail("linux-arm64");
-		try {
-			await publishUpdateServerMainMirror(prepared, f.config, { http: f.http });
-			throw new Error("expected fail");
-		} catch (error) {
-			expect(error).toBeInstanceOf(MirrorPublicationError);
-			if (!(error instanceof MirrorPublicationError)) throw error;
-			expect(error.receipt.status).toBe("partial");
-			expect(error.receipt.platforms.filter((item) => item.status === "verified")).toHaveLength(2);
-			expect(JSON.stringify(error)).not.toContain(token);
-		}
-		const readsBefore = f.requests.length;
-		const restored = await restorePreparedMainMirror({
-			manifest: f.manifest,
-			bundleDir: f.bundleDir,
-			bridgeDir: f.bridgeDir,
-			config: f.config,
-			sealSha256: prepared.sealSha256,
-		});
-		expect(f.requests).toHaveLength(readsBefore);
-		expect(restored.seal.platforms[0].patches[0].source.version).toBe("1.1.0");
-		f.fail();
-		const receipt = await publishUpdateServerMainMirror(restored, f.config, { http: f.http });
-		expect(receipt.status).toBe("mirrored");
-		expect(
-			f.requests.filter((request) => request.method === "POST" && request.platform === "linux-x64"),
-		).toHaveLength(1);
-	});
-	test("parent cancellation during serial publish preserves partial receipt and cleans snapshots", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		const controller = new AbortController();
-		let writes = 0;
-		f.hook(async (request) => {
-			if (request.method === "POST" && ++writes === 3) {
-				controller.abort();
-				await new Promise<void>(() => {}); // transport fixture ignores abort; caller must still finish
+				expect(commitAt).toBeGreaterThan(0);
+				expect(
+					requests.slice(0, commitAt).every((r) => r.method === "PUT" && r.status === 200),
+				).toBe(true);
+				expect(requests.slice(commitAt + 1)).toHaveLength(0);
+				expect(requests.some((r) => r.method === "GET")).toBe(false);
+				expect(result.verification).toBe("server-sha256");
+				expect(result.uploaded).not.toContain(f.name);
+			} finally {
+				await rm(root, { recursive: true, force: true });
 			}
 		});
+	test("copies only current raw patch/sidecars/notes; never full binary or historical server state", async () => {
+		const f = mirrorFixture();
+		const receipt = await mirrorPublishedGitHubRelease(options(f));
+		expect(receipt.status).toBe("MIRRORED");
+		expect(receipt.snapshotCommitted).toBe(true);
+		expect(f.downloaded).toHaveLength(1);
+		expect(f.committed?.index).toEqual(f.index);
+		for (const asset of f.committed?.assets ?? []) {
+			const expected = asset.kind === "notes" ? Buffer.from(f.notesRaw) : f.raw.get(asset.name);
+			expect(f.stored.get(asset.sha256)).toEqual(expected);
+			expect(asset.name).not.toBe(f.name);
+		}
+		const write = f.httpCalls.findIndex((c) => c.path.endsWith("/snapshot"));
+		expect(
+			f.httpCalls
+				.slice(0, write)
+				.every((c) => !c.path.includes("/index") && !c.path.includes("/availability")),
+		).toBe(true);
+		expect(f.indexReads).toBeGreaterThanOrEqual(2); // fresh GitHub index immediately before commit
+		expect(
+			f.httpCalls
+				.filter((c) => c.method === "PUT")
+				.every((c) => c.headers.get("authorization") === `Bearer ${config.token}`),
+		).toBe(true);
+	});
+	test.each([
+		true,
+		false,
+	])("build metadata version mirrors canonical assets (patch=%s)", async (withPatch) => {
+		const f = mirrorFixture(withPatch, true, "1.2.0+build.42");
+		const receipt = await mirrorPublishedGitHubRelease(options(f));
+		expect(receipt.status).toBe(withPatch ? "MIRRORED" : "METADATA_ONLY");
+		expect(receipt.tag).toBe("v1.2.0+build.42");
+		expect(receipt.snapshotCommitted).toBe(true);
+		expect(f.committed?.targetVersion).toBe("1.2.0+build.42");
+		for (const asset of f.committed?.assets ?? []) {
+			const expected = asset.kind === "notes" ? Buffer.from(f.notesRaw) : f.raw.get(asset.name);
+			expect(f.stored.get(asset.sha256)).toEqual(expected);
+		}
+		expect(receipt.uploaded.some((name) => name.includes("+build.42"))).toBe(true);
+		expect(receipt.uploaded).not.toContain(f.name);
+	});
+	test("no-patch current release is legal metadata-only even empty mirror or old v999 garbage", async () => {
+		const f = mirrorFixture(false);
+		f.stored.set(sha("historical-v999"), Buffer.from("unrelated old data"));
+		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("METADATA_ONLY");
+		expect(f.downloaded).toHaveLength(0);
+		expect(f.stored.has(sha("historical-v999"))).toBe(true);
+	});
+	test("preview revalidates public GitHub identity without mirror token or server calls", async () => {
+		const f = mirrorFixture();
+		expect(
+			(await mirrorPublishedGitHubRelease({ ...options(f), config: undefined, dryRun: true }))
+				.status,
+		).toBe("DRY_RUN");
+		expect(f.httpCalls).toHaveLength(0);
+		expect(f.downloaded).toHaveLength(0);
+	});
+	test("two empty configuration fields skip without consuming primary/GitHub work", async () => {
+		const f = mirrorFixture();
+		expect(resolveUpdateServerMirrorConfig({})).toBeUndefined();
+		expect((await mirrorPublishedGitHubRelease({ ...options(f), config: undefined })).status).toBe(
+			"SKIPPED_UNCONFIGURED",
+		);
+		expect(f.ghCalls).toHaveLength(0);
+		expect(f.httpCalls).toHaveLength(0);
+	});
+	for (const env of [
+		{ NF_UPDATE_SERVER: config.serverUrl },
+		{ NF_UPDATE_TOKEN: "only-token" },
+		{ NF_UPDATE_SERVER: "http://bad.invalid", NF_UPDATE_TOKEN: "token" },
+		{ NF_UPDATE_SERVER: `${config.serverUrl}/other`, NF_UPDATE_TOKEN: "token" },
+	])
+		test("partial/invalid configuration fails independently", () =>
+			expect(() => resolveUpdateServerMirrorConfig(env)).toThrow());
+	test("bad runtime configuration returns an independent config receipt before GitHub/network", async () => {
+		const f = mirrorFixture();
 		try {
-			await publishUpdateServerMainMirror(prepared, f.config, {
-				http: f.http,
-				signal: controller.signal,
+			await mirrorPublishedGitHubRelease({
+				...options(f),
+				config: { ...config, serverUrl: "http://invalid" },
 			});
-			throw new Error("Expected cancellation");
+			throw new Error("must reject");
 		} catch (error) {
-			expect(error).toBeInstanceOf(MirrorPublicationError);
-			if (!(error instanceof MirrorPublicationError)) throw error;
-			expect(error.receipt.failureCode).toBe("CANCELLED");
-			expect(error.receipt.platforms.filter((item) => item.status === "verified")).toHaveLength(2);
+			expect(error).toBeInstanceOf(IndependentMirrorError);
+			expect((error as IndependentMirrorError).receipt.failureCode).toBe("FAILED_CONFIG");
 		}
-		const receipt = JSON.parse(
-			await readFile(join(f.bridgeDir, "receipt-main-mirror.json"), "utf8"),
-		);
-		expect(receipt.status).toBe("partial");
-		expect(receipt.failureCode).toBe("CANCELLED");
-		expect((await readdir(f.bridgeDir)).some((name) => name.startsWith(".upload-"))).toBe(false);
+		expect(f.ghCalls).toHaveLength(0);
 	});
-	test("success:true without public readback remains failure and recoverable", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		f.fake(true);
-		await expect(
-			publishUpdateServerMainMirror(prepared, f.config, { http: f.http }),
-		).rejects.toBeInstanceOf(MirrorPublicationError);
-		const receipt = JSON.parse(
-			await readFile(join(f.bridgeDir, "receipt-main-mirror.json"), "utf8"),
-		);
-		expect(receipt.status).toBe("partial");
-		expect(receipt.platforms.every((item: { status: string }) => item.status === "pending")).toBe(
-			true,
-		);
-	});
-	test("incomplete restore keeps original basis but refuses writes after legacy basis advances", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		await f.seed("1.2.0", "beta");
-		const readsBefore = f.requests.length;
-		const restored = await restorePreparedMainMirror({
-			manifest: f.manifest,
-			bundleDir: f.bundleDir,
-			bridgeDir: f.bridgeDir,
-			config: f.config,
-			sealSha256: prepared.sealSha256,
+	for (const corrupt of ["draft", "tag", "digest", "index", "orphan"] as const)
+		test(`rejects current source ${corrupt} without uploading`, async () => {
+			const f = mirrorFixture();
+			if (corrupt === "draft") f.publicRelease.draft = true;
+			if (corrupt === "tag") f.publicRelease.tag_name = "v1.3.0";
+			if (corrupt === "digest") f.assets[0].digest = "";
+			if (corrupt === "index") f.index.releases[0].commit = "c".repeat(40);
+			if (corrupt === "orphan")
+				f.assets.splice(
+					f.assets.findIndex((a) => a.name.endsWith(".meta.json")),
+					1,
+				);
+			await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toBeInstanceOf(
+				IndependentMirrorError,
+			);
+			expect(f.httpCalls).toHaveLength(0);
 		});
-		expect(f.requests).toHaveLength(readsBefore);
-		expect(restored.seal.platforms[0].patches[0].source.version).toBe("1.1.0");
+	test.each([
+		"../binary",
+		"dir/binary",
+		"binary\\path",
+		"binary%2fpath",
+		"binary?token=secret",
+		"binary\n",
+	])("unsafe public asset name %j still fails before uploading", async (name) => {
+		const f = mirrorFixture();
+		f.assets[0].name = name;
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toBeInstanceOf(
+			IndependentMirrorError,
+		);
+		expect(f.httpCalls).toHaveLength(0);
+	});
+	test("fork repository never silently falls back to official", async () => {
+		const f = mirrorFixture(false);
+		await mirrorPublishedGitHubRelease(options(f));
+		expect(f.ghCalls.every((args) => args[1].startsWith(`repos/${repository}/`))).toBe(true);
+	});
+	test("total byte budget rejects before download, with no server mutation", async () => {
+		const f = mirrorFixture();
+		await expect(
+			mirrorPublishedGitHubRelease({ ...options(f), maxTotalBytes: 1 }),
+		).rejects.toBeInstanceOf(IndependentMirrorError);
+		expect(f.downloaded).toHaveLength(0);
+		expect(f.httpCalls).toHaveLength(0);
+	});
+	test("partial upload failure retains real verified subset and never commits snapshot", async () => {
+		const f = mirrorFixture();
+		const patch = f.assets.find((a) => a.name.endsWith("zstd-patch"));
+		f.failPath = patch?.digest.slice(7) as string;
 		try {
-			await publishUpdateServerMainMirror(restored, f.config, { http: f.http });
-			throw new Error("Expected baseline failure");
+			await mirrorPublishedGitHubRelease(options(f));
+			throw new Error("must reject");
 		} catch (error) {
-			expect(error).toBeInstanceOf(MirrorPublicationError);
-			if (!(error instanceof MirrorPublicationError)) throw error;
-			expect(error.receipt.failureCode).toBe("BASELINE_ADVANCED");
+			expect(error).toBeInstanceOf(IndependentMirrorError);
+			const r = (error as IndependentMirrorError).receipt;
+			expect(r.status).toBe("FAILED");
+			expect(r.snapshotCommitted).toBe(false);
+			expect(r.uploaded).toEqual([`${f.name}.metadata.json`]);
+			expect(r.verified).toEqual([]);
 		}
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
+		expect(f.committed).toBeUndefined();
+		expect(f.publicRelease.draft).toBe(false);
 	});
-	test("frozen source drift prevents any new write", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		const old = await f.seed("1.1.0", "beta");
-		old.platforms["darwin-arm64"].sha512 = sha512(Buffer.from("drift"));
-		setCachedRelease("narrafork", old);
-		await expect(
-			publishUpdateServerMainMirror(prepared, f.config, { http: f.http }),
-		).rejects.toBeInstanceOf(MirrorPublicationError);
-		expect(f.requests.every((request) => request.method === "GET")).toBe(true);
+	for (const malformed of [
+		undefined,
+		{ ok: true },
+		{ schemaVersion: 1, verification: "server-sha256", repository, verified: [] },
+	])
+		test("missing/forged commit receipt fails with no asset GET fallback", async () => {
+			const f = mirrorFixture();
+			f.http.postJson = async () => malformed;
+			try {
+				await mirrorPublishedGitHubRelease(options(f));
+				throw new Error("must reject");
+			} catch (error) {
+				expect(error).toBeInstanceOf(IndependentMirrorError);
+				const r = (error as IndependentMirrorError).receipt;
+				expect(r.status).toBe("FAILED");
+				expect(r.snapshotCommitted).toBe(false);
+				expect(r.verified).toEqual([]);
+			}
+			expect(f.httpCalls.every((r) => r.method !== "GET")).toBe(true);
+		});
+	for (const field of [
+		"repository",
+		"indexCommit",
+		"generation",
+		"targetVersion",
+		"verification",
+		"verified",
+	])
+		test(`commit receipt binds exact ${field} rather than trusting early success`, async () => {
+			const f = mirrorFixture(false);
+			const post = f.http.postJson.bind(f.http);
+			f.http.postJson = async (...args) => {
+				const acknowledgement = (await post(...args)) as Record<string, unknown>;
+				acknowledgement[field] = field === "generation" ? 999 : field === "verified" ? [] : "wrong";
+				return acknowledgement;
+			};
+			await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toThrow(
+				"upgrade update server",
+			);
+			expect(f.httpCalls.some((r) => r.method === "GET")).toBe(false);
+		});
+	test("legacy upload ack fails before commit and never falls back to GET", async () => {
+		const f = mirrorFixture();
+		f.http.putRaw = async () => ({ schemaVersion: 1 });
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toBeInstanceOf(
+			IndependentMirrorError,
+		);
+		expect(f.committed).toBeUndefined();
+		expect(f.httpCalls).toHaveLength(0);
 	});
-	test("restoration rejects wrong server, seal digest and patch tampering", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		await expect(
-			verifyPreparedMainMirror(prepared, { serverUrl: "https://different.example", token }),
-		).rejects.toThrow("server/product");
-		await expect(
-			verifyPreparedMainMirror({ ...prepared, sealSha256: "0".repeat(64) }, f.config),
-		).rejects.toThrow("seal");
-		await writeFile(join(f.bridgeDir, prepared.seal.platforms[0].patches[0].file), "tampered");
-		await expect(verifyPreparedMainMirror(prepared, f.config)).rejects.toThrow("bytes changed");
+	test("corrupt patch byte stream rejects before a canonical snapshot is visible", async () => {
+		const f = mirrorFixture();
+		const patch = [...f.raw.keys()].find((n) => n.endsWith("zstd-patch")) as string;
+		f.raw.set(patch, Buffer.from("corrupt"));
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toBeInstanceOf(
+			IndependentMirrorError,
+		);
+		expect(f.committed).toBeUndefined();
 	});
-	test("parent cancellation aborts preparation before network", async () => {
-		const f = await fixture();
+	test("canonical target changed during transfer cannot replace newer snapshot", async () => {
+		const f = mirrorFixture(false);
+		f.onIndexRead = () => {
+			if (f.indexReads > 1) f.index.releases[0].commit = "c".repeat(40);
+		};
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toBeInstanceOf(
+			IndependentMirrorError,
+		);
+		expect(f.committed).toBeUndefined();
+	});
+	test("parent cancellation has a truthful cancelled receipt and zero network", async () => {
+		const f = mirrorFixture();
 		const controller = new AbortController();
 		controller.abort();
+		try {
+			await mirrorPublishedGitHubRelease({ ...options(f), signal: controller.signal });
+			throw new Error("must reject");
+		} catch (error) {
+			expect((error as IndependentMirrorError).receipt.failureCode).toBe("CANCELLED");
+		}
+		expect(f.httpCalls).toHaveLength(0);
+	});
+	test("fresh canonical index preserves a newer GitHub channel instead of electing the target or old server versions", async () => {
+		const f = mirrorFixture(false, false);
+		const next = structuredClone(f.release);
+		next.version = "1.3.0";
+		next.tag = "v1.3.0";
+		for (const file of next.files) {
+			file.name = file.name.replace("1.2.0", "1.3.0");
+			file.metadata.name = `${file.name}.metadata.json`;
+		}
+		f.onIndexRead = () => {
+			if (f.indexReads === 2) f.index = mergeUpdateIndex(f.index, next, repository);
+		};
+		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("METADATA_ONLY");
+		expect(f.committed?.index.channels.stable).toBe("1.3.0");
+		expect(f.committed?.targetVersion).toBe("1.2.0");
+	});
+	test("canonical 409 refreshes only GitHub and retries snapshot without uploading patches twice", async () => {
+		const f = mirrorFixture(true, false);
+		const next = structuredClone(f.release);
+		next.version = "1.3.0";
+		next.tag = "v1.3.0";
+		for (const file of next.files) {
+			file.name = file.name.replace("1.2.0", "1.3.0");
+			file.metadata.name = `${file.name}.metadata.json`;
+			file.patches = [];
+		}
+		f.snapshotConflicts = 1;
+		f.onSnapshotConflict = () => {
+			f.index = mergeUpdateIndex(f.index, next, repository);
+		};
+		expect((await mirrorPublishedGitHubRelease(options(f))).status).toBe("MIRRORED");
+		expect(f.committed?.index.channels.stable).toBe("1.3.0");
+		expect(f.httpCalls.filter((c) => c.method === "POST")).toHaveLength(2);
+		expect(f.httpCalls.filter((c) => c.method === "PUT")).toHaveLength(3);
+		expect(f.downloaded).toHaveLength(1);
+	});
+	test("repeated canonical conflicts exhaust a finite budget without reading mirror history", async () => {
+		const f = mirrorFixture(false);
+		f.snapshotConflicts = 10;
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toThrow();
+		expect(f.httpCalls.filter((c) => c.method === "POST")).toHaveLength(3);
+		expect(f.httpCalls.every((c) => c.method !== "GET")).toBe(true);
+		expect(f.committed).toBeUndefined();
+	});
+	test("canonical conflict cannot revive a target pruned from the latest GitHub window", async () => {
+		const f = mirrorFixture(false, false);
+		f.snapshotConflicts = 1;
+		f.onSnapshotConflict = () => {
+			const next = structuredClone(f.release);
+			next.version = "1.3.0";
+			next.tag = "v1.3.0";
+			for (const file of next.files) {
+				file.name = file.name.replace("1.2.0", "1.3.0");
+				file.metadata.name = `${file.name}.metadata.json`;
+			}
+			f.index = mergeUpdateIndex(null, next, repository);
+		};
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toThrow();
+		expect(f.httpCalls.filter((c) => c.method === "POST")).toHaveLength(1);
+		expect(f.committed).toBeUndefined();
+	});
+	test("a current orphan patch is never misclassified as legal no-patch", async () => {
+		const f = mirrorFixture(false);
+		f.assets.push({
+			id: 99,
+			name: "unknown-platform.from-1.0.0.zstd-patch",
+			size: 3,
+			digest: `sha256:${sha("raw")}`,
+			state: "uploaded",
+		});
+		await expect(mirrorPublishedGitHubRelease(options(f))).rejects.toThrow();
+		expect(f.httpCalls).toHaveLength(0);
+	});
+	test("preview rejects corrupted canonical notes without any mirror access", async () => {
+		const f = mirrorFixture(false);
+		const run = (args: string[]) =>
+			args[1].includes("/contents/notes/") ? f.notesRaw.replace("exact", "wrong") : f.run(args);
 		await expect(
-			prepareUpdateServerMainMirror({ ...f.options, signal: controller.signal }),
+			mirrorPublishedGitHubRelease({ ...options(f), dryRun: true, run }),
 		).rejects.toThrow();
-		expect(f.requests).toHaveLength(0);
+		expect(f.httpCalls).toHaveLength(0);
 	});
-	test("real route rejects changed published target with 409 and mismatched patch old identity with 400", async () => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		const platform = prepared.seal.platforms[0];
-		const patch = platform.patches[0];
-		await f.seed("2.0.0", "stable");
-		const form = new FormData();
-		form.set("version", "2.0.0");
-		form.set("channel", "stable");
-		form.set("platform", platform.platform);
-		form.set("file", new Blob(["different"]), platform.full.filename);
-		const conflict = await f.app.request(
-			"https://bridge.example/api/v2/products/narrafork/releases",
-			{
-				method: "POST",
-				headers: { Authorization: `Bearer ${token}` },
-				body: form,
-			},
-		);
-		expect(conflict.status).toBe(409);
-		form.set(
-			"file",
-			Bun.file(join(f.bundleDir, "dist", platform.full.filename)),
-			platform.full.filename,
-		);
-		form.set("zstdPatch", Bun.file(join(f.bridgeDir, patch.file)), patch.file);
-		form.set(
-			"zstdPatchMeta",
-			new Blob([
-				JSON.stringify({ ...patch.metadata, oldFileSha512: sha512(Buffer.from("wrong-old")) }),
-			]),
-			patch.metadataFile,
-		);
-		const mismatch = await f.app.request(
-			"https://bridge.example/api/v2/products/narrafork/releases",
-			{
-				method: "POST",
-				headers: { Authorization: `Bearer ${token}` },
-				body: form,
-			},
-		);
-		expect(mismatch.status).toBe(400);
-	});
-	test.each([
-		"full",
-		"patch",
-		"metadata",
-	] as const)("same-length %s byte drift during public preflight fails before first POST", async (field) => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		const platform = prepared.seal.platforms[0];
-		const patch = platform.patches[0];
-		const path =
-			field === "full"
-				? join(f.bundleDir, "dist", platform.full.filename)
-				: join(f.bridgeDir, field === "patch" ? patch.file : patch.metadataFile);
-		const original = await readFile(path);
-		let mutated = false;
-		f.hook(async (request) => {
-			if (!mutated && request.method === "GET") {
-				mutated = true;
-				const changed = Buffer.from(original);
-				changed[0] ^= 1;
-				await writeFile(path, changed); // same size, same source inode
-			}
-		});
+	test("disk-full download fails only this mirror and never commits incomplete projection", async () => {
+		const f = mirrorFixture();
 		await expect(
-			publishUpdateServerMainMirror(prepared, f.config, { http: f.http }),
-		).rejects.toBeInstanceOf(MirrorPublicationError);
-		expect(mutated).toBe(true);
-		expect(f.requests.filter((request) => request.method === "POST")).toHaveLength(0);
-		expect((await readdir(f.bridgeDir)).some((name) => name.startsWith(".upload-"))).toBe(false);
-	});
-	test.each([
-		{ field: "full", replace: false },
-		{ field: "patch", replace: false },
-		{ field: "metadata", replace: false },
-		{ field: "full", replace: true },
-		{ field: "patch", replace: true },
-		{ field: "metadata", replace: true },
-	] as const)("private readonly multipart snapshot survives network-await source drift %#", async ({
-		field,
-		replace,
-	}) => {
-		const f = await fixture();
-		const prepared = await prepareUpdateServerMainMirror(f.options);
-		const platform = prepared.seal.platforms[0];
-		const patch = platform.patches[0];
-		const originalFull = await readFile(join(f.bundleDir, "dist", platform.full.filename));
-		const originalPatch = await readFile(join(f.bridgeDir, patch.file));
-		const originalMeta = await readFile(join(f.bridgeDir, patch.metadataFile));
-		const path =
-			field === "full"
-				? join(f.bundleDir, "dist", platform.full.filename)
-				: join(f.bridgeDir, field === "patch" ? patch.file : patch.metadataFile);
-		const original = await readFile(path);
-		let mutated = false;
-		f.hook(async (request) => {
-			if (!mutated && request.method === "POST") {
-				mutated = true;
-				const changed = Buffer.from(original);
-				changed[0] ^= 1;
-				if (replace) {
-					await writeFile(`${path}.replacement`, changed);
-					await rename(`${path}.replacement`, path);
-				} else await writeFile(path, changed);
-				// The request body has not been consumed yet. Only detached read-only snapshot FDs remain.
-			}
-		});
-		const receipt = await publishUpdateServerMainMirror(prepared, f.config, { http: f.http });
-		expect(mutated).toBe(true);
-		expect(receipt.status).toBe("mirrored");
-		const base = `products/narrafork/releases/2.0.0/${platform.platform}`;
-		expect(await f.storage.getFile(`${base}/${platform.full.filename}`)).toEqual(originalFull);
-		expect(await f.storage.getFile(`${base}/${patch.file}`)).toEqual(originalPatch);
-		expect(await f.storage.getFile(`${base}/${patch.metadataFile}`)).toEqual(originalMeta);
-		expect((await readdir(f.bridgeDir)).some((name) => name.startsWith(".upload-"))).toBe(false);
-	});
-	test("main mirror cannot exceed the existing 30-minute publisher wall budget", () => {
-		expect(MAIN_MIRROR_TOTAL_TIMEOUT_MS).toBe(30 * 60 * 1000);
-	});
-	test("bounded zstd output cap fails, cleans file and does not publish", async () => {
-		const f = await fixture();
-		const basis = join(f.root, "basis");
-		await writeFile(basis, bytes("1.1.0", "linux-x64"));
-		const output = join(f.root, "limited.zstd-patch");
-		await expect(
-			generateBridgePatch({
-				oldFilePath: basis,
-				newFilePath: join(f.bundleDir, "dist", f.manifest.files[0].name),
-				patchOutputPath: output,
-				fromVersion: "1.1.0",
-				toVersion: "2.0.0",
-				maxPatchBytes: 1,
-				signal: AbortSignal.timeout(5000),
+			mirrorPublishedGitHubRelease({
+				...options(f),
+				downloadAsset: async () => {
+					throw Object.assign(new Error("fixture disk full"), { code: "ENOSPC" });
+				},
 			}),
-		).rejects.toThrow("budget");
-		expect(await Bun.file(output).exists()).toBe(false);
-		expect(f.requests).toHaveLength(0);
+		).rejects.toThrow();
+		expect(f.committed).toBeUndefined();
+		expect(f.publicRelease.draft).toBe(false);
+	});
+	test("raw PUT has bounded backpressure and hashes exact chunks without collecting the payload", async () => {
+		const chunk = new Uint8Array(64 * 1024).fill(7);
+		const count = 64;
+		const hash = createHash("sha256");
+		for (let i = 0; i < count; i++) hash.update(chunk);
+		let produced = 0;
+		let consumed = 0;
+		let ahead = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (produced === count) {
+					controller.close();
+					return;
+				}
+				produced++;
+				ahead = Math.max(ahead, produced - consumed);
+				controller.enqueue(chunk);
+			},
+		});
+		const http = new UpdateServerMirrorHttp(config, {
+			fetchImpl: (async (_url: unknown, init?: RequestInit) => {
+				const reader = (init?.body as ReadableStream<Uint8Array>).getReader();
+				try {
+					while (true) {
+						const item = await reader.read();
+						if (item.done) break;
+						consumed++;
+						await Promise.resolve();
+					}
+				} finally {
+					reader.releaseLock();
+				}
+				return Response.json({ ok: true });
+			}) as unknown as typeof fetch,
+		});
+		await http.putRaw("/api/v3/products/narrafork/mirror/assets/raw", stream, {
+			maxBytes: chunk.length * count,
+			expected: { size: chunk.length * count, sha256: hash.digest("hex") },
+			headers: {},
+		});
+		expect(consumed).toBe(count);
+		expect(ahead).toBeLessThanOrEqual(3);
+	});
+	test("deprecated pre-publication bridge entry refuses instead of selecting historical artifacts", async () => {
+		await expect(prepareUpdateServerMainMirror({ bridgeArtifactId: 11912974901 })).rejects.toThrow(
+			"retired",
+		);
+	});
+	test("raw streaming upload cancels its body on parent abort", async () => {
+		const controller = new AbortController();
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull() {
+				return new Promise(() => {});
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const http = new UpdateServerMirrorHttp(config, {
+			fetchImpl: (async (_url: unknown, init?: RequestInit) => {
+				controller.abort();
+				await new Response(init?.body).arrayBuffer();
+				return Response.json({ ok: true });
+			}) as unknown as typeof fetch,
+		});
+		await expect(
+			http.putRaw("/api/v3/products/narrafork/mirror/assets/a", body, {
+				maxBytes: 8,
+				signal: controller.signal,
+				expected: { size: 8, sha256: "a".repeat(64) },
+				headers: {},
+			}),
+		).rejects.toThrow();
+		expect(cancelled).toBe(true);
 	});
 });

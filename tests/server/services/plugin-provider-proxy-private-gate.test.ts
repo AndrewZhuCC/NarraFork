@@ -11,10 +11,11 @@
  *
  * 2. **Fire-and-forget side-effect** — verify that `addPendingRequest` is called on
  *    `permissionStore` when a private proxy is suppressed, using real store instances.
- *    A small busy-wait drains the microtask queue so the void promise resolves.
+ *    Track the real pending-write promises so assertions wait for persistence,
+ *    rather than guessing how many event-loop ticks a busy CI filesystem needs.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,8 +49,10 @@ const resolveOverride = (override: ProxyOverride): string | undefined => {
 // ---------------------------------------------------------------------------
 
 const roots: string[] = [];
+const pendingWrites = new Set<Promise<unknown>>();
 
 afterEach(async () => {
+	await settlePendingRequests();
 	await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true })));
 });
 
@@ -61,11 +64,9 @@ async function makeStores() {
 	return { stateStore, permissionStore };
 }
 
-/** Drain the microtask queue so fire-and-forget void promises settle. */
-async function flushMicrotasks(iterations = 10) {
-	for (let i = 0; i < iterations; i++) {
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
-	}
+/** Wait for actual asynchronous permission-store writes, not timer scheduling. */
+async function settlePendingRequests() {
+	await Promise.all([...pendingWrites]);
 }
 
 /**
@@ -119,13 +120,15 @@ function runHintsLogic(input: {
 				cachedState?.authorityInstallationId ??
 				cachedState?.current?.hash;
 			if (installationId) {
-				void permissionStore
+				const write = permissionStore
 					.addPendingRequest(pluginId, installationId, {
 						capability: PRIVATE_PROXY_CAPABILITY,
 						scope: { type: "global" },
 						source: "runtime",
 					})
 					.catch(() => undefined);
+				pendingWrites.add(write);
+				void write.finally(() => pendingWrites.delete(write));
 			}
 			return { hints: { outbound: {} }, suppressed: true };
 		}
@@ -174,7 +177,7 @@ describe("private proxy gate — full grant authorization", () => {
 				pluginId: PLUGIN_ID,
 			}).suppressed,
 		).toBe(true);
-		await flushMicrotasks();
+		await settlePendingRequests();
 	});
 
 	test("checks expiry on every read, installation identity, revocation and cold cache", async () => {
@@ -220,7 +223,7 @@ describe("private proxy gate — full grant authorization", () => {
 				pluginId: PLUGIN_ID,
 			}).suppressed,
 		).toBe(true);
-		await flushMicrotasks();
+		await settlePendingRequests();
 	});
 });
 
@@ -343,8 +346,8 @@ describe("private proxy gate — pending permission request", () => {
 			pluginId: PLUGIN_ID,
 		});
 
-		// Drain microtasks to let the void promise settle
-		await flushMicrotasks();
+		// Await the tracked permission-store write, including its asynchronous persistence.
+		await settlePendingRequests();
 
 		const pending = await permissionStore.listPendingRequests(PLUGIN_ID, INSTALLATION_ID);
 		expect(pending).toHaveLength(1);
@@ -354,6 +357,45 @@ describe("private proxy gate — pending permission request", () => {
 		expect(pending[0]?.status).toBe("pending");
 	});
 
+	test("awaits the real permission write without blocking synchronous proxy suppression", async () => {
+		const { stateStore, permissionStore } = await makeStores();
+		await stateStore.setState({
+			...createPluginStateRecord(PLUGIN_ID),
+			installationId: INSTALLATION_ID,
+			grants: { count: 0, capabilities: [], revision: 1 },
+		});
+		await stateStore.initialize();
+		const gate = Promise.withResolvers<void>();
+		const original = permissionStore.addPendingRequest.bind(permissionStore);
+		const writer = spyOn(permissionStore, "addPendingRequest").mockImplementation(
+			async (...args) => {
+				await gate.promise;
+				return original(...args);
+			},
+		);
+		const result = runHintsLogic({
+			proxyUrl: "http://10.0.0.1:3128",
+			stateStore,
+			permissionStore,
+			pluginId: PLUGIN_ID,
+		});
+		let settled = false;
+		const completion = settlePendingRequests().then(() => {
+			settled = true;
+		});
+		try {
+			expect(result.suppressed).toBe(true);
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			gate.resolve();
+			await completion;
+			expect(await permissionStore.listPendingRequests(PLUGIN_ID, INSTALLATION_ID)).toHaveLength(1);
+		} finally {
+			gate.resolve();
+			await completion;
+			writer.mockRestore();
+		}
+	});
 	test("addPendingRequest is idempotent — repeated suppression does not stack rows", async () => {
 		const { stateStore, permissionStore } = await makeStores();
 
@@ -376,7 +418,7 @@ describe("private proxy gate — pending permission request", () => {
 		runHintsLogic(opts);
 		runHintsLogic(opts);
 
-		await flushMicrotasks();
+		await settlePendingRequests();
 
 		const pending = await permissionStore.listPendingRequests(PLUGIN_ID, INSTALLATION_ID);
 		expect(pending).toHaveLength(1);
@@ -399,7 +441,7 @@ describe("private proxy gate — pending permission request", () => {
 			pluginId: PLUGIN_ID,
 		});
 
-		await flushMicrotasks();
+		await settlePendingRequests();
 
 		const pending = await permissionStore.listPendingRequests(PLUGIN_ID, INSTALLATION_ID);
 		expect(pending).toHaveLength(0);
@@ -418,7 +460,7 @@ describe("private proxy gate — pending permission request", () => {
 			pluginId: PLUGIN_ID,
 		});
 
-		await flushMicrotasks();
+		await settlePendingRequests();
 
 		// Cannot list pending without an installationId, but we can check the
 		// permissionStore document has no entry for this plugin.
@@ -451,7 +493,7 @@ describe("private proxy gate — pending permission request", () => {
 			pluginId: PLUGIN_ID,
 		});
 
-		await flushMicrotasks();
+		await settlePendingRequests();
 
 		const pending = await permissionStore.listPendingRequests(PLUGIN_ID, INSTALLATION_ID);
 		expect(pending).toHaveLength(0);

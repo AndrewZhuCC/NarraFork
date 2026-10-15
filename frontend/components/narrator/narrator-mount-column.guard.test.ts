@@ -17,11 +17,10 @@
  * unit test on the pure resolvers can see the sequence. They are asserted on the
  * wiring instead.
  *
- * A fourth source sat above the list: the panel skeleton and the lazy-chunk fallback
- * laid their skeletons out with Mantine padding while the list used px, so those
- * placeholders could differ from the column that replaced them. The guard therefore
- * also pins that all three placeholder hosts share ONE column helper — and that the
- * skeleton component itself owns no width, so nothing nests two caps.
+ * The message-list lazy fallback and document-loading placeholder share ONE column
+ * helper, and the message skeleton itself owns no width, so nothing nests two caps.
+ * The whole-panel fallback only shows a spinner: it must not paint a fake header,
+ * composer or message layout before the real panel is ready.
  *
  * Zero-runtime, filesystem-only.
  */
@@ -103,13 +102,19 @@ describe("mount column: dock hosts wait for their first positioned geometry", ()
 });
 
 describe("mount column: one owner for the placeholder width", () => {
-	it("routes all three placeholder hosts through the same helper", () => {
-		// The list's own document-loading placeholder...
+	it("routes both message placeholder hosts through the same helper", () => {
+		// The list's document-loading placeholder and lazy-chunk Suspense fallback.
 		expect(shell()).toContain("narratorColumnPlaceholderStyle(centeredColumn)");
-		// ...the panel-level skeleton (narrator record still loading)...
-		expect(panelSkeleton()).toContain("narratorColumnPlaceholderStyle(centeredColumn)");
-		// ...and the lazy-chunk Suspense fallback.
 		expect(panel()).toContain("narratorColumnPlaceholderStyle(narratorCenteredColumn)");
+	});
+
+	it("keeps the whole-panel fallback as a spinner without a fake panel layout", () => {
+		const source = panelSkeleton();
+		expect(source).toContain("<Center");
+		expect(source).toContain("<Loader");
+		expect(source).not.toMatch(/<(?:Skeleton|NarratorMessageListSkeleton)\b/);
+		expect(source).not.toContain("narratorColumnPlaceholderStyle");
+		expect(source).not.toContain("data-git-slot");
 	});
 
 	it("keeps the skeleton component itself free of any width", () => {
@@ -121,13 +126,19 @@ describe("mount column: one owner for the placeholder width", () => {
 		expect(source).not.toContain("NARRATOR_CENTERED_COLUMN_MAX_WIDTH");
 	});
 
-	it("keeps no Mantine padding on the placeholder hosts", () => {
+	it("keeps no Mantine padding on the message-list fallback host", () => {
 		// `px="md"` is a rem gutter; the rows measure in px. Identical at the default
 		// root font size, divergent at any other — which is a width jump on mount.
-		const skeletonBody = panelSkeleton().slice(panelSkeleton().indexOf("Message area skeleton"));
-		const messageArea = skeletonBody.slice(0, skeletonBody.indexOf("Status bar skeleton"));
-		expect(messageArea).not.toContain('px="md"');
-		expect(messageArea).not.toContain('py="sm"');
+		const source = panel();
+		const marker = source.indexOf("narratorColumnPlaceholderStyle(narratorCenteredColumn)");
+		expect(marker).toBeGreaterThan(-1);
+		const start = source.lastIndexOf("<Box", marker);
+		expect(start).toBeGreaterThan(-1);
+		const end = source.indexOf(">", marker);
+		expect(end).toBeGreaterThan(marker);
+		const host = source.slice(start, end);
+		expect(host).not.toContain('px="md"');
+		expect(host).not.toContain('py="sm"');
 	});
 
 	it("derives the helper's geometry in px from the shared gutter", () => {

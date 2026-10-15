@@ -285,15 +285,14 @@ export function ServerSystemSection({
 					{ label: t("updateSourceServer"), value: "update-server" },
 				]}
 			/>
-			{updateSource === "github" ? (
-				<TextInput
-					label={t("updateGithubRepository")}
-					description={t("updateGithubRepositoryDesc")}
-					placeholder="NarraFork/NarraFork"
-					value={updateGithubRepository}
-					onChange={(e) => setUpdateGithubRepository(e.currentTarget.value)}
-				/>
-			) : (
+			<TextInput
+				label={t("updateGithubRepository")}
+				description={t("updateGithubRepositoryDesc")}
+				placeholder="NarraFork/NarraFork"
+				value={updateGithubRepository}
+				onChange={(e) => setUpdateGithubRepository(e.currentTarget.value)}
+			/>
+			{updateSource === "update-server" && (
 				<TextInput
 					label={t("updateServerUrl")}
 					description={t("updateServerUrlDesc")}

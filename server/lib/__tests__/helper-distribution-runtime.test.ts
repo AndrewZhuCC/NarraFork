@@ -393,7 +393,7 @@ describe("source-bound helper runtime", () => {
 			),
 		).rejects.toThrow("limit");
 	});
-	test("legacy update-server tools paths remain compatible without cross-origin redirects", async () => {
+	test("mirror metadata selection still downloads canonical GitHub helpers", async () => {
 		settings.update = {
 			...(settings.update ?? originalUpdate),
 			source: "update-server",
@@ -403,7 +403,17 @@ describe("source-bound helper runtime", () => {
 		const calls: string[] = [];
 		const path = await downloadHelperBinary(value, { fetcher: routes(calls) });
 		expect(path).not.toBeNull();
-		expect(calls).toEqual(["https://legacy.example/api/v2/tools/zstd-linux-x64"]);
+		expect(calls).toEqual([
+			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/helper-manifest-v1.json`,
+			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/zstd-linux-x64`,
+		]);
+		const context = createDistributionContext({
+			source: "update-server",
+			repository: "fork/repo",
+			serverUrl: "https://legacy.example",
+		});
+		expect(context.source).toEqual({ source: "github", repository: "fork/repo" });
+		expect(context.isCurrent()).toBe(true);
 	});
 });
 describe("executor build identity integration", () => {

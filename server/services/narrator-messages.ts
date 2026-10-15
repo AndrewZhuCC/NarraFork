@@ -1485,78 +1485,147 @@ async function deleteMessageRange(
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
-	let affectedQuestionIds: string[] = [];
-	const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
-		if (planned.refs.length === 0) return;
-		affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
-			deletedMessageIds: planned.refs.map((ref) => ref.messageId),
-		}).affectedQuestionIds;
-		insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints);
-		deleteRecipientMessageRefs(tx)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(
-						narratorMessageRefs.id,
-						planned.refs.map((ref) => ref.id),
-					),
-				),
-			)
-			.run();
-		deleteOrphanedMessages(tx, planned.orphanIds);
-		tx.update(narrators)
-			.set({
-				...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-				messageVersion: sql`${narrators.messageVersion} + 1`,
-				contextUsageSnapshotJson: null,
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, narratorId))
-			.run();
+	const timingId = generateId();
+	const startedAt = new Date().toISOString();
+	const context = { timingId, narratorId, messageId, inclusive, skipRevert: !!opts?.skipRevert };
+	logger.info("Message history truncation started", { ...context, startedAt });
+	const started = performance.now();
+	const phaseDurationsMs: Record<string, number> = {};
+	let success = false;
+	let selectedMessageCount = 0;
+	const recordPhase = (phase: string, phaseStarted: number) => {
+		phaseDurationsMs[phase] = (phaseDurationsMs[phase] ?? 0) + performance.now() - phaseStarted;
 	};
-	const planned = db.transaction((tx) => {
-		const plan = planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts);
-		// History-only deletion needs no async gap: plan and mutation share this tx.
-		if (opts?.skipRevert) apply(tx, plan);
-		return plan;
-	});
-	const messageIds = planned.refs.map((ref) => ref.messageId);
-	let revertWarnings: RevertWarning[] = [];
-	if (!opts?.skipRevert && messageIds.length > 0) {
-		const version = JSON.stringify(planned);
-		const result = await revertForDeletedMessages(narratorId, messageIds, opts?.scope);
-		await commitSnapshotRevert(result, () =>
+	const measureSync = <T>(phase: string, fn: () => T): T => {
+		const phaseStarted = performance.now();
+		try {
+			return fn();
+		} finally {
+			recordPhase(phase, phaseStarted);
+		}
+	};
+	const measureAsync = async <T>(phase: string, fn: () => Promise<T>): Promise<T> => {
+		const phaseStarted = performance.now();
+		try {
+			return await fn();
+		} finally {
+			recordPhase(phase, phaseStarted);
+		}
+	};
+	try {
+		let affectedQuestionIds: string[] = [];
+		const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
+			if (planned.refs.length === 0) return;
+			measureSync("questions", () => {
+				affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+					deletedMessageIds: planned.refs.map((ref) => ref.messageId),
+				}).affectedQuestionIds;
+			});
+			measureSync("checkpoints", () =>
+				insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints),
+			);
+			measureSync("deleteRefs", () =>
+				deleteRecipientMessageRefs(tx)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							inArray(
+								narratorMessageRefs.id,
+								planned.refs.map((ref) => ref.id),
+							),
+						),
+					)
+					.run(),
+			);
+			measureSync("deleteOrphans", () => deleteOrphanedMessages(tx, planned.orphanIds));
+			measureSync("updateNarrator", () =>
+				tx
+					.update(narrators)
+					.set({
+						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, narratorId))
+					.run(),
+			);
+		};
+		const planned = measureSync("transaction", () =>
 			db.transaction((tx) => {
-				if (
-					JSON.stringify(planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts)) !==
-					version
-				) {
-					throw new AppError(
-						"Message history changed during deletion; retry the selection",
-						409,
-						"HISTORY_DELETE_STALE",
-					);
-				}
-				apply(tx, planned);
+				const plan = measureSync("plan", () =>
+					planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+				);
+				// History-only deletion needs no async gap: plan and mutation share this tx.
+				if (opts?.skipRevert) apply(tx, plan);
+				return plan;
 			}),
 		);
-		revertWarnings = result.warnings ?? [];
+		selectedMessageCount = planned.refs.length;
+		const messageIds = planned.refs.map((ref) => ref.messageId);
+		let revertWarnings: RevertWarning[] = [];
+		if (!opts?.skipRevert && messageIds.length > 0) {
+			const version = JSON.stringify(planned);
+			const result = await measureAsync("fileRevert", () =>
+				revertForDeletedMessages(narratorId, messageIds, opts?.scope),
+			);
+			await measureAsync("revertCommit", () =>
+				commitSnapshotRevert(result, () =>
+					measureSync("transaction", () =>
+						db.transaction((tx) => {
+							const current = measureSync("plan", () =>
+								planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+							);
+							if (JSON.stringify(current) !== version) {
+								throw new AppError(
+									"Message history changed during deletion; retry the selection",
+									409,
+									"HISTORY_DELETE_STALE",
+								);
+							}
+							apply(tx, planned);
+						}),
+					),
+				),
+			);
+			revertWarnings = result.warnings ?? [];
+		}
+		await measureAsync("questionNotifications", () =>
+			notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds),
+		);
+		// A removed Agent/Task card archives its subagent after the transaction commits.
+		if (planned.derived.subagentNarratorIds.length > 0) {
+			await measureAsync("archiveSubagents", async () => {
+				const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
+				await archiveRetiredSubagents(planned.derived.subagentNarratorIds);
+			});
+		}
+		success = true;
+		return {
+			deletedCount: planned.refs.length,
+			deletedMessageIds: messageIds,
+			revertWarnings,
+			...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
+			...(planned.derived.subagentNarratorIds.length
+				? { archivedSubagentIds: planned.derived.subagentNarratorIds }
+				: {}),
+		};
+	} finally {
+		const round = (ms: number) => Math.round(ms * 100) / 100;
+		const durationMs = round(performance.now() - started);
+		const log = durationMs >= 100 || !success ? logger.warn : logger.info;
+		log("Message history truncation completed", {
+			...context,
+			startedAt,
+			durationMs,
+			success,
+			selectedMessageCount,
+			// Transaction and revertCommit contain their child phases; do not sum them.
+			phaseDurationsMs: Object.fromEntries(
+				Object.entries(phaseDurationsMs).map(([phase, ms]) => [phase, round(ms)]),
+			),
+		});
 	}
-	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
-	// Same retire rule as block delete: a removed Agent/Task card archives its subagent.
-	if (planned.derived.subagentNarratorIds.length > 0) {
-		const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
-		await archiveRetiredSubagents(planned.derived.subagentNarratorIds);
-	}
-	return {
-		deletedCount: planned.refs.length,
-		deletedMessageIds: messageIds,
-		revertWarnings,
-		...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
-		...(planned.derived.subagentNarratorIds.length
-			? { archivedSubagentIds: planned.derived.subagentNarratorIds }
-			: {}),
-	};
 }
 
 function insertFileHistoryCheckpoints(

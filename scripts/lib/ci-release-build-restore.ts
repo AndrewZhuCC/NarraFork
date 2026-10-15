@@ -2,6 +2,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { validateSmokeMetadata } from "../smoke-release-binary";
+import { runPublicationProcess as runBridgeProcess } from "./ci-publication-runtime";
 import {
 	CI_DISK_RESERVE,
 	CI_METADATA_LIMIT,
@@ -30,7 +31,6 @@ import {
 	type CiReleasePlan,
 	type CiReleaseTarget,
 } from "./ci-release-types";
-import { runBridgeProcess } from "./ci-update-server-bridge-restore";
 import type { GhRunner } from "./github-release";
 
 const TIMEOUT = 15 * 60_000;

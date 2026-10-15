@@ -96,10 +96,10 @@ async function selectHelper(
 	let name = spec.toolName;
 	let sha256 = spec.expectedSha256;
 	let size = spec.expectedSize;
-	const tag =
-		options.tag ?? (context.source.source === "github" ? HELPER_RELEASE_TAG : "legacy-tools");
+	if (context.source.source !== "github") return null;
+	const tag = options.tag ?? HELPER_RELEASE_TAG;
 	let version = "legacy";
-	if (context.source.source === "github" && !options.tag) {
+	if (!options.tag) {
 		const manifest = await getHelperManifest(
 			context,
 			signal,
@@ -216,9 +216,7 @@ export async function downloadHelperBinary(
 							options.maxBytes ?? HELPER_BINARY_MAX_BYTES,
 							HELPER_BINARY_MAX_BYTES,
 						),
-						allowUnsigned:
-							selected.context.source.source === "update-server" &&
-							(options.allowUnsignedDownload ?? true),
+						allowUnsigned: false,
 						allowFrozenSource: options.allowFrozenSource,
 					},
 				);

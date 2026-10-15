@@ -35,21 +35,14 @@ const workflows = [
 	{ workflow: load("release"), publisher: "publish" },
 	{ workflow: load("helpers-release"), publisher: "publisher" },
 ];
-const expression = (body: string) => `\${{ ${body} }}`;
-
-describe("protected CI bridge wiring", () => {
-	test("all three artifact kinds share the same static noncancelling publisher lock", () => {
-		for (const { workflow, publisher } of workflows) {
-			expect(workflow.jobs[publisher]?.concurrency).toEqual({
-				group: "update-server-publish",
-				"cancel-in-progress": false,
-			});
-			expect(workflow.concurrency.group).not.toBe("update-server-publish");
-			expect(workflow.jobs[publisher]?.environment).toBe("release");
-		}
-	});
+describe("GitHub-only protected primary workflows", () => {
 	for (const { workflow, publisher } of workflows)
 		describe(publisher, () => {
+			test("publishing stays protected and never takes the independent mirror lock", () => {
+				expect(workflow.jobs[publisher]?.environment).toBe("release");
+				expect(workflow.jobs[publisher]?.concurrency).toBeUndefined();
+				expect(workflow.concurrency.group).not.toBe("update-server-publish");
+			});
 			test("actual publisher condition rejects cancellation even with already-successful source jobs", () => {
 				const condition = workflow.jobs[publisher]?.if?.trim();
 				if (!condition?.startsWith("${{") || !condition.endsWith("}}"))
@@ -122,73 +115,36 @@ describe("protected CI bridge wiring", () => {
 					).toBe(false);
 				}
 			});
-			test("default dry runs cannot obtain legacy credentials", () => {
+			test("default build-only and real publishers never obtain mirror credentials or inputs", () => {
 				expect(workflow.on.workflow_dispatch.inputs.publish?.default).toBe(false);
-				expect(workflow.on.workflow_dispatch.inputs.mirror_only?.default).toBe(false);
-				for (const [name, job] of Object.entries(workflow.jobs)) {
-					if (name === publisher)
-						expect(job.env).toEqual({
-							NF_UPDATE_SERVER: expression("vars.NF_UPDATE_SERVER"),
-							NF_UPDATE_TOKEN: expression("secrets.NF_UPDATE_TOKEN"),
-						});
-					else expect(JSON.stringify(job)).not.toMatch(/NF_UPDATE_TOKEN|NF_UPDATE_SERVER/);
-					for (const step of job.steps ?? [])
-						expect(step.run ?? "").not.toContain("NF_UPDATE_TOKEN");
-				}
+				for (const key of ["mirror_only", "bridge_run_id", "bridge_run_attempt"])
+					expect(workflow.on.workflow_dispatch.inputs[key]).toBeUndefined();
+				expect(JSON.stringify(workflow)).not.toMatch(
+					/NF_UPDATE_SERVER|NF_UPDATE_TOKEN|update-server-publish|prepare-bridge|mirror-required|bridge-artifact/,
+				);
 			});
-			test("successful immutable upload is sequenced before the first GitHub publisher", () => {
+			test("only successful publication uploads a bounded metadata receipt; source validation stays first", () => {
 				const steps = workflow.jobs[publisher]?.steps ?? [];
-				const prepare = steps.findIndex(
-					(step) => step.name === "Prepare immutable update server bridge",
-				);
-				const upload = steps.findIndex(
-					(step) => step.name === "Seal immutable update server bridge artifact",
-				);
 				const publish = steps.findIndex((step) => /control.js publish/.test(step.run ?? ""));
-				const mirror = steps.findIndex((step) => step.id === "mirror");
-				expect(prepare).toBeGreaterThanOrEqual(0);
-				expect(upload).toBeGreaterThan(prepare);
-				expect(publish).toBeGreaterThan(upload);
-				expect(mirror).toBeGreaterThan(publish);
-				expect(steps[upload]?.with?.["if-no-files-found"]).toBe("error");
-				expect(steps[upload]?.with?.overwrite).toBeUndefined();
-				expect(steps[publish]?.env?.BRIDGE_ARTIFACT_ID).toBe(
-					expression("steps.bridge-artifact.outputs.artifact-id"),
+				const receipt = steps.findIndex(
+					(step) => step.name === "Record verified GitHub publication",
 				);
-				expect(steps[publish]?.env?.BRIDGE_ARTIFACT_DIGEST).toBe(
-					expression("steps.bridge-artifact.outputs.artifact-digest"),
-				);
+				expect(publish).toBeGreaterThan(0);
+				expect(receipt).toBeGreaterThan(publish);
+				expect(steps[receipt]?.if).toBeUndefined();
+				expect(steps[receipt]?.with?.["if-no-files-found"]).toBe("error");
+				expect(steps[receipt]?.with?.path).toBe("artifacts/publication/publication-receipt.json");
+				expect(steps.some((step) => /apt-get.*zstd/.test(step.run ?? ""))).toBe(false);
+				expect(JSON.stringify(workflow.jobs.preflight)).toContain("inputs.source_run_id");
 			});
-			test("mirror-only cannot execute prepare or GitHub publication; it restores both run identities", () => {
-				const steps = workflow.jobs[publisher]?.steps ?? [];
-				expect(steps.find((step) => step.id === "prepare-bridge")?.if).toContain(
-					"!inputs.mirror_only",
-				);
-				expect(steps.find((step) => /control.js publish/.test(step.run ?? ""))?.if).toContain(
-					"!inputs.mirror_only",
-				);
-				expect(steps.find((step) => step.id === "mirror")?.if).toContain("inputs.mirror_only");
-				const preflight = JSON.stringify(workflow.jobs.preflight);
-				expect(preflight).toContain("inputs.source_run_id");
-				expect(preflight).toContain("inputs.bridge_run_id");
-				expect(preflight).toContain("inputs.bridge_run_attempt");
-			});
-			test("partial receipts are retained without modifying the sealed artifact", () => {
-				const steps = workflow.jobs[publisher]?.steps ?? [];
-				const receipt = steps.find((step) => step.name === "Preserve partial publication receipts");
-				expect(receipt?.if).toBe(expression("always()"));
-				expect(receipt?.with?.["if-no-files-found"]).toBe("ignore");
-				expect(String(receipt?.with?.path)).toContain("mirror-bridge/");
-			});
-			test("one shared absolute deadline is frozen before any publisher stage", () => {
+			test("publication has its own fixed deadline and cancellation guard", () => {
 				const job = workflow.jobs[publisher];
 				expect(job?.["timeout-minutes"]).toBe(30);
 				expect(job?.steps[0]?.run).toContain("NF_RELEASE_DEADLINE_MS");
 				expect(job?.steps[0]?.run).toContain("25 * 60 * 1000");
-				expect(job?.steps[0]?.run).toContain("$GITHUB_ENV");
 				expect(
-					job?.steps.filter((step) => /NF_RELEASE_DEADLINE_MS/.test(step.run ?? "")).length,
-				).toBe(1);
+					job?.steps.filter((step) => /NF_RELEASE_DEADLINE_MS/.test(step.run ?? "")),
+				).toHaveLength(1);
 			});
 		});
 });
@@ -218,36 +174,30 @@ for (const kind of ["main", "helpers"] as const)
 		test("GitHub-only succeeds without fabricated mirror receipt", () => {
 			expect(() => gate(env(kind))).not.toThrow();
 		});
-		for (const status of [
-			"",
-			"PREPARED",
-			"PUBLISHED",
-			"INDEXED",
-			"PUBLISHED_NOT_MIRRORED",
-			"partial",
-		])
-			test(`configured mirror ${status || "missing"} fails`, () => {
+		for (const status of ["", "PREPARED", "FAILED", "cancelled", "partial", "MIRRORED"])
+			test(`independent mirror ${status || "absent"} never changes core success`, () => {
 				expect(() =>
-					gate({ ...env(kind), MIRROR_REQUIRED: "true", MIRROR_STATUS: status }),
-				).toThrow();
+					gate({
+						...env(kind),
+						MIRROR_REQUIRED: "invalid",
+						MIRROR_STATUS: status,
+						NF_UPDATE_SERVER: "not a URL",
+						NF_UPDATE_TOKEN: "fixture",
+					}),
+				).not.toThrow();
 			});
-		test("configured mirror succeeds only with verified MIRRORED status", () => {
-			expect(() =>
-				gate({ ...env(kind), MIRROR_REQUIRED: "true", MIRROR_STATUS: "MIRRORED" }),
-			).not.toThrow();
-		});
-		test("mirror-only does not invent a fresh index commit and still requires mirror success", () => {
-			const value = {
-				...env(kind, true),
-				MIRROR_ONLY: "true",
-				MIRROR_REQUIRED: "true",
-				MIRROR_STATUS: "MIRRORED",
-				INDEX_COMMIT: "",
-				INDEX_GENERATION: "",
-			};
-			expect(() => gate(value)).not.toThrow();
-			expect(() => gate({ ...value, MIRROR_STATUS: "PUBLISHED_NOT_MIRRORED" })).toThrow();
-		});
+		if (kind === "main")
+			test("mirror output cannot bypass missing canonical index proof", () => {
+				expect(() =>
+					gate({
+						...env(kind),
+						INDEX_COMMIT: "",
+						INDEX_GENERATION: "",
+						MIRROR_ONLY: "true",
+						MIRROR_STATUS: "MIRRORED",
+					}),
+				).toThrow("index receipt");
+			});
 		for (const result of ["failure", "cancelled", "skipped"])
 			test(`publisher ${result} never becomes success despite mirror output`, () => {
 				expect(() =>
@@ -259,10 +209,6 @@ for (const kind of ["main", "helpers"] as const)
 					}),
 				).toThrow();
 			});
-		test("invalid mirror modes are rejected", () => {
-			expect(() => gate({ ...env(kind), MIRROR_ONLY: "maybe" })).toThrow();
-			expect(() => gate({ ...env(kind), MIRROR_REQUIRED: "maybe" })).toThrow();
-		});
 	});
 describe("helper CLI mirror-only restrictions before any IO", () => {
 	for (const args of [
@@ -280,17 +226,16 @@ describe("helper CLI mirror-only restrictions before any IO", () => {
 				]),
 			).toThrow();
 		});
-	test("accepts original source X with sealed publisher Y", () => {
-		expect(
+	test("rejects removed bridge arguments even with an otherwise valid trusted plan", () => {
+		expect(() =>
 			parseHelperReleaseArguments([
 				"preflight",
 				"--kind=helpers",
 				"--tag=helpers-v1.0.0",
 				"--publish=true",
-				"--mirror-only=true",
 				"--source-run-id=11",
 				"--bridge-run-id=22",
-			]).options.get("bridge-run-id"),
-		).toBe("22");
+			]),
+		).toThrow("Unknown option");
 	});
 });

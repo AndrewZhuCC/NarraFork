@@ -1,0 +1,71 @@
+.tree {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.row {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	width: 100%;
+	padding-top: 3px;
+	padding-bottom: 3px;
+	padding-right: 6px;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.row:hover {
+	background: var(--mantine-color-default-hover);
+}
+
+.file[aria-pressed="true"] {
+	background: var(--mantine-primary-color-light);
+	box-shadow: inset 2px 0 0 var(--mantine-primary-color-filled);
+}
+
+.row:focus-visible {
+	outline: 2px solid var(--mantine-primary-color-filled);
+	outline-offset: -2px;
+}
+
+.twist,
+.mark {
+	flex-shrink: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+}
+
+.mark {
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 11px;
+	font-weight: 700;
+}
+
+.name {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 12px;
+}
+
+.stats,
+.count {
+	flex-shrink: 0;
+}
+
+.count {
+	color: var(--mantine-color-dimmed);
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+}

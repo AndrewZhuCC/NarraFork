@@ -103,7 +103,6 @@ updateRoutes.post("/notes", requireAuth, requireAdmin, async (c) => {
 			!body ||
 			Object.keys(body).some((key) => !["version", "sha512", "sourceIdentity"].includes(key)) ||
 			!identity ||
-			identity.source !== "github" ||
 			typeof body.version !== "string" ||
 			!isValidReleaseVersion(body.version) ||
 			typeof body.sha512 !== "string" ||

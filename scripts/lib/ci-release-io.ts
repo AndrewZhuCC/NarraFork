@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
@@ -6,6 +7,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { isValidGitHubRepository } from "../../shared/github-repository";
 import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import type { GhRunner } from "./github-release";
 
@@ -14,6 +16,128 @@ export const CI_METADATA_LIMIT = 64 * 1024;
 export const CI_DOWNLOAD_TIMEOUT = 15 * 60 * 1000;
 export const CI_BUNDLE_LIMIT = 24 * 1024 ** 3;
 export const CI_DISK_RESERVE = 4 * 1024 ** 3;
+
+/** Known logical input/output sizes, not measured network traffic or partial failure bytes. */
+export interface ReleasePhaseDetails {
+	platform?: string;
+	version?: string;
+	fromVersion?: string;
+	inputBytes?: number;
+	outputBytes?: number;
+	fileCount?: number;
+	targetCount?: number;
+	baselineCount?: number;
+}
+
+const releasePhaseScope = new AsyncLocalStorage<number>();
+let releasePhaseId = 0;
+
+function releasePhaseDetails(details: ReleasePhaseDetails): ReleasePhaseDetails {
+	const safe: ReleasePhaseDetails = {};
+	if (
+		typeof details.platform === "string" &&
+		/^(?:linux|win|windows|darwin|macos)-(?:x64(?:-baseline)?|amd64|arm64)$/.test(details.platform)
+	)
+		safe.platform = details.platform;
+	for (const key of ["version", "fromVersion"] as const) {
+		const value = details[key];
+		if (typeof value === "string" && value.length <= 128 && isValidReleaseVersion(value))
+			safe[key] = value;
+	}
+	for (const key of [
+		"inputBytes",
+		"outputBytes",
+		"fileCount",
+		"targetCount",
+		"baselineCount",
+	] as const) {
+		const value = details[key];
+		if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) safe[key] = value;
+	}
+	return safe;
+}
+
+function releasePhaseNow(): number | undefined {
+	try {
+		const value = performance.now();
+		return Number.isFinite(value) ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeReleasePhase(
+	phase: string,
+	id: number,
+	parentId: number | undefined,
+	state: "start" | "end",
+	details: ReleasePhaseDetails,
+	result?: {
+		durationMs?: number;
+		timingUnavailable?: boolean;
+		status: "success" | "error" | "cancelled";
+		errorKind?: string;
+	},
+) {
+	try {
+		console.info(
+			JSON.stringify({
+				event: "release.phase",
+				phase: /^[a-z][a-z0-9.-]{0,95}$/.test(phase) ? phase : "unknown",
+				id,
+				...(parentId === undefined ? {} : { parentId }),
+				state,
+				timestamp: new Date().toISOString(),
+				...releasePhaseDetails(details),
+				// This is the controller's RSS snapshot, NOT zstd child RSS or a peak measurement.
+				controllerRssBytes: process.memoryUsage.rss(),
+				...result,
+			}),
+		);
+	} catch {
+		// Observability failures must never replace an integrity/cancellation error or its result.
+	}
+}
+
+/** Emits bounded phase boundaries without adding IO, changing cancellation, or wrapping errors. */
+export async function timeReleasePhase<T>(
+	phase: string,
+	details: ReleasePhaseDetails,
+	operation: () => T | Promise<T>,
+	signal?: AbortSignal,
+): Promise<T> {
+	const id = ++releasePhaseId;
+	const parentId = releasePhaseScope.getStore();
+	const start = releasePhaseNow();
+	let status: "success" | "error" | "cancelled" = "success";
+	let errorKind: "Error" | "AbortError" | "TimeoutError" | undefined;
+	writeReleasePhase(phase, id, parentId, "start", details);
+	try {
+		return await releasePhaseScope.run(id, operation);
+	} catch (error) {
+		errorKind = "Error";
+		try {
+			const name = (error as { name?: unknown } | null)?.name;
+			if (name === "AbortError" || name === "TimeoutError") errorKind = name;
+		} catch {
+			// An exotic thrown object's getter is not part of the operation's failure contract.
+		}
+		status =
+			errorKind !== "TimeoutError" && (signal?.aborted || errorKind === "AbortError")
+				? "cancelled"
+				: "error";
+		throw error;
+	} finally {
+		const end = releasePhaseNow();
+		writeReleasePhase(phase, id, parentId, "end", details, {
+			...(start === undefined || end === undefined
+				? { timingUnavailable: true }
+				: { durationMs: Math.max(0, Math.round(end - start)) }),
+			status,
+			...(errorKind ? { errorKind } : {}),
+		});
+	}
+}
 
 /** CI queries are read-only, noninteractive and bounded before collecting output. */
 export const runCiGh: GhRunner = (args) =>

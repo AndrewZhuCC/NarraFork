@@ -529,8 +529,6 @@ export interface CreateCiReleasePlanOptions {
 	publish: boolean;
 	/** Read-only preparation or repair of the index for an already published release. */
 	indexOnly?: boolean;
-	/** Restore the sealed legacy mirror of an already published release. */
-	mirrorOnly?: boolean;
 	signal?: AbortSignal;
 	/** Fixture injection only; production uses bounded read-only component checks. */
 	componentChecks?: CiReleaseComponentChecks;
@@ -572,7 +570,7 @@ export async function createCiReleasePlan(
 	let dependencies: HelperDistributionDependencies | undefined;
 	if (options.publish) await assertReleaseEnvironment(run, repository, defaultBranch);
 	// Repairs authorize writes to an existing publication, not a new component release.
-	if (options.publish && !options.indexOnly && !options.mirrorOnly) {
+	if (options.publish && !options.indexOnly) {
 		const componentOptions = {
 			repository,
 			targetCommit: commit,
@@ -610,7 +608,7 @@ export async function revalidateCiReleasePlan(
 	options: {
 		root: string;
 		publish: boolean;
-		/** Index/mirror recovery verifies sealed identities, not current remote component readiness. */
+		/** Index recovery verifies sealed identities, not current remote component readiness. */
 		requireAlreadyPublished?: boolean;
 		run?: GhRunner;
 		env?: NodeJS.ProcessEnv;
