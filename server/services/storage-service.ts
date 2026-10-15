@@ -29,11 +29,7 @@ import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { dropRecentlyAttributed } from "./file-attribution-service";
 import { dropStatus } from "./git-status-cache";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
-import { readWorktreeReceiptProtection } from "./narrator-worktree-journal";
-import {
-	isRegisteredNarratorWorktree,
-	readLegacyNarratorWorktreeProtection,
-} from "./narrator-worktree-resources";
+import { isRegisteredNarratorWorktree } from "./narrator-worktree-resources";
 import { parseWorktreePorcelain } from "./narrator-worktree-service";
 import {
 	DatabaseStorageScanCancelledError,
@@ -1098,12 +1094,6 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 							(await realpath(wtDir)) !== wtDir
 						)
 							return;
-						const receipts = await readWorktreeReceiptProtection(
-							getNarraforkPath("worktree-requests"),
-						);
-						if (!receipts.complete) return;
-						const legacy = await readLegacyNarratorWorktreeProtection(deadline);
-						if (!legacy.complete) return;
 						// Never treat a capped porcelain prefix as proof that a worktree is absent.
 						const list = await safeSpawn({
 							cmd: [
@@ -1133,11 +1123,7 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 							if (performance.now() > deadline) break;
 							// ALL resource states survive narrator deletion. Errors (e.g. an unmigrated
 							// registry) abort the repo sweep, rather than making ownership disappear.
-							if (
-								isRegisteredNarratorWorktree(fullPath) ||
-								[...receipts.paths].some((path) => localBackend.paths.contains(fullPath, path))
-							)
-								continue;
+							if (isRegisteredNarratorWorktree(fullPath)) continue;
 							const chapter = db
 								.select({ id: chapters.id })
 								.from(chapters)
@@ -1145,14 +1131,8 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 								.limit(1)
 								.get();
 							if (chapter) continue;
-							// Legacy switched sessions may predate receipts/registry. Protect ancestor
-							// directories too, e.g. a narrator running in a worktree subdirectory.
-							const cwdOwner = legacy.owners.find(
-								(owner) =>
-									owner.deviceId === "local" && localBackend.paths.contains(fullPath, owner.path),
-							);
-							// A cleanup inspection must never select/adopt an owner or write inventory.
-							if (cwdOwner) continue;
+							// The final reservation below checks receipt and legacy cwd references
+							// for this target; do not rescan every session once per repository.
 							const entry = registered.entries.find((item) =>
 								localBackend.paths.equals(item.path, fullPath),
 							);

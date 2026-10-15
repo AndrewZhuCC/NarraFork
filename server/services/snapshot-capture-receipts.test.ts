@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	mkdir,
@@ -30,12 +30,19 @@ import {
 	recordTreeSnapshotBefore,
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
+import { maintainProtectionIndex } from "./resource-protection-index";
 import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
 import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+
+beforeAll(async () => {
+	// Destructive fixture cleanup starts after the empty legacy namespace is imported.
+	await maintainProtectionIndex(performance.now() + 5000);
+	await maintainProtectionIndex(performance.now() + 5000);
+});
 
 let root: string;
 let workspace: string;

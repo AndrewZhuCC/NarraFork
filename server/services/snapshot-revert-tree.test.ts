@@ -3,7 +3,7 @@
  * expected automatic v1 restore/compensation now require refusal and unchanged
  * bytes. Low-level tree engine mechanics are covered in its own test suite.
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,7 @@ import {
 import { generateId } from "../lib/id";
 import { safeSpawn } from "../lib/spawn";
 import type { TreeSnapshotSession } from "./narrator-tree-snapshot-hooks";
+import { maintainProtectionIndex } from "./resource-protection-index";
 import {
 	commitSnapshotRevert,
 	discardSnapshotRevert,
@@ -37,6 +38,12 @@ import {
 } from "./snapshot-revert";
 import { buildTreeSnapshotEventHooks } from "./tree-snapshot-loop-hooks";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+
+beforeAll(async () => {
+	// Destructive fixture cleanup starts after the empty legacy namespace is imported.
+	await maintainProtectionIndex(performance.now() + 5000);
+	await maintainProtectionIndex(performance.now() + 5000);
+});
 
 const ids: string[] = [];
 const projectIds: string[] = [];

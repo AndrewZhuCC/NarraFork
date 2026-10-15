@@ -1422,6 +1422,13 @@
       "when": 1792071700491,
       "tag": "0202_personal_knowledge_injection",
       "breakpoints": true
+    },
+    {
+      "idx": 203,
+      "version": "6",
+      "when": 1792086100087,
+      "tag": "0203_magical_speed_demon",
+      "breakpoints": true
     }
   ]
 }

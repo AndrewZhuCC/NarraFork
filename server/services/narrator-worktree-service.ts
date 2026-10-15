@@ -1383,7 +1383,8 @@ export class NarratorWorktreeService<Principal> {
 		let record: WorktreeJournalRecord | null;
 		try {
 			record = await this.ports.journal.read(narratorId, operationId);
-		} catch {
+		} catch (cause) {
+			if (cause instanceof AppError && cause.code === "WORKTREE_RECEIPT_INVALID") throw cause;
 			error("WORKTREE_RECEIPT_UNAVAILABLE", "Cannot read the original worktree receipt", 409);
 		}
 		if (!record) error("WORKTREE_REQUEST_NOT_FOUND", "Worktree request receipt not found", 404);
@@ -1407,7 +1408,8 @@ export class NarratorWorktreeService<Principal> {
 		let record: WorktreeJournalRecord | null;
 		try {
 			record = await this.ports.journal.read(narratorId, request.requestId);
-		} catch {
+		} catch (cause) {
+			if (cause instanceof AppError && cause.code === "WORKTREE_RECEIPT_INVALID") throw cause;
 			return {
 				outcome: "unknown",
 				worktree: null,
@@ -1499,7 +1501,11 @@ export class NarratorWorktreeService<Principal> {
 						expectedHead: "",
 					});
 				} catch (cause) {
-					if (cause instanceof AppError && cause.code === "WORKTREE_REQUEST_CONFLICT") throw cause;
+					if (
+						cause instanceof AppError &&
+						["WORKTREE_REQUEST_CONFLICT", "WORKTREE_RECEIPT_INVALID"].includes(cause.code)
+					)
+						throw cause;
 					return {
 						outcome: "unknown",
 						worktree: null,

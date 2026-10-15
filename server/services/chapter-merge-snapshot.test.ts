@@ -12,7 +12,7 @@
  * Everything runs against real git worktrees and real shadow repositories, because the
  * question in every case is whether the git-level pieces compose correctly.
  */
-import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -50,7 +50,13 @@ const {
 } = await import("./chapter-merge-snapshot");
 const { ensureChapterSnapshot } = await import("./chapter-snapshot-ref");
 const { gitService } = await import("./git-service");
+const { maintainProtectionIndex } = await import("./resource-protection-index");
 const { treeSnapshotKey, worktreeTreeSnapshot } = await import("./worktree-tree-snapshot");
+beforeAll(async () => {
+	// This runtime-free fixture has no background bootstrap; finish its empty legacy import.
+	await maintainProtectionIndex(performance.now() + 5000);
+	await maintainProtectionIndex(performance.now() + 5000);
+});
 afterAll(() => mock.restore());
 
 const tempDirs: string[] = [];

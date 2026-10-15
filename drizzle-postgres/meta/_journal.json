@@ -134,6 +134,13 @@
 			"when": 1792071785464,
 			"tag": "0018_personal_knowledge_injection",
 			"breakpoints": true
+		},
+		{
+			"idx": 19,
+			"version": "7",
+			"when": 1792086101922,
+			"tag": "0019_resource_protection",
+			"breakpoints": true
 		}
   ]
 }

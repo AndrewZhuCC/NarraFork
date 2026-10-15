@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { ensureColumns } from "../server/db/ensure-columns";
 import * as relations from "../server/db/relations";
+import { installResourceProtectionTriggers } from "../server/db/resource-protection-index";
 import * as schema from "../server/db/schema";
 
 const DRIZZLE_DIR = join(import.meta.dir, "..", "drizzle");
@@ -91,6 +92,8 @@ export function getTestDb() {
 		CREATE INDEX IF NOT EXISTS idx_narrator_git_identity_user ON narrator_git_identity_bindings(user_id);
 	`);
 	sqlite.run("PRAGMA foreign_keys = ON");
+	// Match runtime tracking even when a filesystem/service test replaces ../server/db.
+	installResourceProtectionTriggers(sqlite);
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };
 }
@@ -126,4 +129,5 @@ export function cleanDb(sqlite: Database) {
 		sqlite.run(`DELETE FROM "${name}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
+	installResourceProtectionTriggers(sqlite);
 }

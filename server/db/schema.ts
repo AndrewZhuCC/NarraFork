@@ -23,6 +23,7 @@ import {
 	foreignKey,
 	index,
 	integer,
+	primaryKey,
 	real,
 	sqliteTable,
 	text,
@@ -73,6 +74,70 @@ export const permissionRuleRequests = sqliteTable(
 			table.createdAt,
 			table.id,
 		),
+	],
+);
+
+/** Business rows own resources; their paths are derived. Legacy receipt paths are retained pins. */
+export const resourceProtectionPaths = sqliteTable(
+	"resource_protection_paths",
+	{
+		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		sourceId: text("source_id").notNull(),
+		slot: integer("slot").notNull(),
+		deviceId: text("device_id").notNull(),
+		canonicalPath: text("canonical_path"),
+		repositoryKey: text("repository_key"),
+		shadowKey: text("shadow_key"),
+		scopeProjectId: text("scope_project_id"),
+		aliasSensitive: integer("alias_sensitive").notNull().default(0),
+		claimJson: text("claim_json").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source, table.sourceId, table.slot] }),
+		index("idx_protection_path").on(
+			table.deviceId,
+			table.canonicalPath,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_repository").on(
+			table.deviceId,
+			table.repositoryKey,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_shadow").on(table.shadowKey, table.source, table.sourceId, table.slot),
+		index("idx_protection_scope").on(
+			table.scopeProjectId,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_alias").on(
+			table.aliasSensitive,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+	],
+);
+
+/** Derived source revisions/dirty markers and bootstrap progress; receipt rows retain legacy pins. */
+export const resourceProtectionSources = sqliteTable(
+	"resource_protection_sources",
+	{
+		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		sourceId: text("source_id").notNull(),
+		revision: integer("revision").notNull().default(1),
+		dirty: integer("dirty").notNull().default(1),
+		cursor: text("cursor"),
+		complete: integer("complete").notNull().default(0),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source, table.sourceId] }),
+		index("idx_protection_dirty").on(table.dirty, table.source, table.sourceId),
 	],
 );
 
