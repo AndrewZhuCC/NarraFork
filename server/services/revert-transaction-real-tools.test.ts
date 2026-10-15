@@ -53,6 +53,7 @@ import {
 	write,
 } from "./__tests__/revert-transaction.fixture";
 import { fileChangeLocalIo } from "./file-change-local-io";
+import * as localRestore from "./file-change-local-restore";
 import { resetFileChangeNamespace } from "./file-change-namespace-reset";
 import { FileChangeReversalCalculator } from "./file-change-reversal";
 import { localFileChangeRuntimeBinding } from "./file-change-runtime";
@@ -1111,28 +1112,73 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const { a, b, plan } = await twoFiles();
 		const before = history();
 		const controller = new AbortController();
+		const entered = hold();
+		const expired = hold();
+		const release = hold();
 		let cleanupExpired = false;
+		let namespaceAcquired = false;
+		let namespaceWait: Promise<void> | undefined;
 		setService(makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 50 }));
-		setFileHook(async (path, signal) => {
+		setFileHook((path) => {
 			if (
 				path === b &&
 				operation(plan)?.status === "applying" &&
 				journalFiles(plan)[1].status === "applying"
 			)
 				controller.abort();
-			if (!cleanupExpired && path === a && operation(plan)?.status === "compensating") {
-				await new Promise<void>((resolve) => {
-					if (signal.aborted) resolve();
-					else signal.addEventListener("abort", () => resolve(), { once: true });
-				});
-				cleanupExpired = signal.aborted;
-				// Resume the original authorization/namespace path with its REAL aborted
-				// cleanup signal. No timer replacement or fabricated receipt is involved.
-			}
 		});
+		const restore = localRestore.restoreLocalFile;
+		const fault = spyOn(localRestore, "restoreLocalFile").mockImplementation(async (input) => {
+			if (input.identity.canonicalPath === a && operation(plan)?.status === "compensating") {
+				// compensate() starts its real 50ms budget BEFORE restore's async preflight.
+				// Park at invocation entry, after claim/register but before namespace/blob/FS
+				// awaits can consume the budget and prevent a later authorization hook.
+				entered.release();
+				await new Promise<void>((resolve) => {
+					if (input.signal.aborted) resolve();
+					else input.signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				cleanupExpired = input.signal.aborted;
+				expired.release();
+				await release.promise;
+				// Resume the original restore with its REAL expired cleanup signal:
+				// no timer replacement, fabricated receipt or blind compensation.
+			}
+			return restore(input);
+		});
+		restores.push(() => fault.mockRestore());
 		const attempt = execution(plan, controller.signal);
+		try {
+			await Promise.race([
+				entered.promise,
+				attempt.whenSettled.then(() => {
+					throw new Error("Compensation settled before the restore-entry barrier");
+				}),
+			]);
+			namespaceWait = runtime.withNamespaceAccess(async () => {
+				namespaceAcquired = true;
+			});
+			await expired.promise;
+			expect(cleanupExpired).toBe(true);
+			expect(await attempt.result).toMatchObject({
+				status: "recovery_required",
+				journalStatus: "compensating",
+				settling: true,
+			});
+			const row = journalFiles(plan)[0];
+			expect(row.status).toBe("compensating");
+			expect(row.receiptJson).toMatchObject({ compensate: { receipt: null } });
+			const scope = runtime.evidence.getScope(row.scopeId);
+			if (!scope) throw new Error("Missing scope");
+			expect(scope.activeLeaseId).toBeTruthy();
+			expect(scope.activeMutationCount).toBe(1);
+			expect(namespaceAcquired).toBe(false);
+		} finally {
+			release.release();
+		}
 		const final = await attempt.whenSettled;
-		expect(cleanupExpired).toBe(true);
+		await namespaceWait;
+		expect(namespaceAcquired).toBe(true);
 		expect(final).toMatchObject({
 			status: "recovery_required",
 			journalStatus: "compensating",
