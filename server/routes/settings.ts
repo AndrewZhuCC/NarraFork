@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
+	MAX_MODEL_CONTEXT_WINDOW,
+	MIN_MODEL_CONTEXT_WINDOW,
+	normalizeModelContextWindowOverrides,
+} from "@shared/model-context-window";
+import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -497,7 +502,13 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.record(z.string(), z.number().int().min(256).max(10_000_000)),
+				modelContextWindows: z.preprocess(
+					normalizeModelContextWindowOverrides,
+					z.record(
+						z.string(),
+						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
+					),
+				),
 				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),

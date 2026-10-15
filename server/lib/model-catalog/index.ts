@@ -33,6 +33,7 @@ import {
 } from "@shared/model-catalog/src/index";
 import { getNarraforkHome } from "../narrafork-home";
 import { resolveNugModelMeta } from "../nug-model-cache";
+import { normalizeModelContextWindows } from "../settings/model-context-windows";
 import type { NarraForkSettings } from "../settings/types";
 import { sanitizeCatalogErrorText } from "./error-text";
 import {
@@ -241,9 +242,17 @@ function upgradeLocalSettings(settings: NarraForkSettings, save: () => void): vo
 export function bindModelCatalogSettings(settings: NarraForkSettings, save: () => void): void {
 	settingsRef = settings;
 	persistSettings = save;
+	if (!settings.agent.modelCatalog) normalizeModelContextWindows(settings);
 	observedLegacyWindows = structuredClone(settings.agent.modelContextWindows ?? {});
 	if (settings.agent.modelCatalog) {
 		upgradeLocalSettings(settings, save);
+		// Retain the pre-normalization baseline until the stored catalog has been
+		// upgraded. Only repaired windows should update bindings; replaying every
+		// legacy value would resurrect overrides reset in the catalog editor.
+		if (normalizeModelContextWindows(settings)) {
+			reconcileLegacyWindowSettings(settings);
+			save();
+		}
 		return;
 	}
 	const legacyArchive = {
@@ -397,7 +406,10 @@ export function bindModelCatalogSettings(settings: NarraForkSettings, save: () =
  * Only changed inputs are considered; untouched legacy values never re-pin reset fields. */
 export function reconcileLegacyWindowSettings(nextSettings: NarraForkSettings): void {
 	const cfg = nextSettings.agent.modelCatalog;
-	if (!cfg) return;
+	if (!cfg) {
+		normalizeModelContextWindows(nextSettings);
+		return;
+	}
 	// Startup migrations call saveSettings before bindModelCatalogSettings has
 	// upgraded the stored document into its in-memory schema-v1 view, so the local
 	// layer here may still be the raw v2 source read from disk. Its source fields
@@ -407,6 +419,7 @@ export function reconcileLegacyWindowSettings(nextSettings: NarraForkSettings): 
 	// rewrite bindings the user never touched. Either way this editor has nothing
 	// to adapt yet: the windows on disk are exactly the ones the bindings encode.
 	if (!settingsRef || (cfg as { schemaVersion: number }).schemaVersion !== 1) return;
+	normalizeModelContextWindows(nextSettings);
 	const windows = nextSettings.agent.modelContextWindows ?? {};
 	const changed = [
 		...new Set([...Object.keys(observedLegacyWindows), ...Object.keys(windows)]),
