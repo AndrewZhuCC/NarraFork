@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { lstat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -14,7 +14,7 @@ import {
 	GIT_WORKSPACE_TIMEOUT_MS,
 	GIT_WORKSPACE_WRITE_TIMEOUT_MS,
 } from "../lib/agent/execution/git-workspace-rpc";
-import { worktreeLock } from "../lib/async-mutex";
+import { PathKeyedMutex, worktreeLock } from "../lib/async-mutex";
 import { AppError, GitAuthError, GitError, ValidationError } from "../lib/errors";
 import type { GitIdentityEnv } from "../lib/git-identity";
 import { mergeGitTrees, requireCompleteMergeTree } from "../lib/git-tree-merge";
@@ -232,6 +232,34 @@ async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): 
 			"GIT_WORKSPACE_BUSY",
 		);
 	return result.value;
+}
+
+/**
+ * Git's worktree registry is shared by every linked checkout. `worktree add`
+ * publishes its admin directory before finishing files such as `commondir`; another
+ * add/remove/prune can scan that incomplete entry (or prune it). A per-worktree
+ * index lock and lifecycle admission reservations do not serialize these siblings.
+ *
+ * Keep this a separate leaf lock: callers may already hold worktreeLock. Resolve
+ * the real common directory, not the checkout path, so linked checkouts and aliases
+ * share one queue while unrelated repositories can still proceed independently.
+ */
+const worktreeStructureLock = new PathKeyedMutex();
+
+async function withWorktreeStructureLock<T>(
+	repoPath: string,
+	fn: (frozenRepository: string) => Promise<T>,
+): Promise<T> {
+	const frozenRepository = await lifecycleCreationPath(repoPath);
+	const common = await execRead(
+		["rev-parse", "--path-format=absolute", "--git-common-dir"],
+		frozenRepository,
+	);
+	if (common.exitCode !== 0 || common.truncated || !common.stdout) {
+		throw new GitError(gitFailureMessage("Failed to resolve worktree registry", common));
+	}
+	const commonDirectory = await realpath(common.stdout);
+	return worktreeStructureLock.acquire(commonDirectory, () => fn(frozenRepository));
 }
 
 /**
@@ -814,37 +842,44 @@ export const gitService = {
 	},
 
 	async createWorktree(repoPath: string, worktreePath: string, branchName: string): Promise<void> {
-		const frozenPath = await lifecycleCreationPath(worktreePath);
-		const result = await exec(["worktree", "add", frozenPath, branchName], repoPath);
-		if (result.exitCode !== 0) {
-			// Detect shallow clone as a likely cause of "unable to read tree" errors
-			if (result.stderr.includes("unable to read tree")) {
-				const shallow = await gitService.isShallowRepository(repoPath);
-				if (shallow) {
-					throw new Error(
-						`Failed to create worktree: ${result.stderr}\n\n` +
-							`This repository appears to be a shallow clone and is missing the required git objects. ` +
-							`Run \`git fetch --unshallow\` in the repository to fetch the full history, then try again.`,
-					);
+		return withWorktreeStructureLock(repoPath, async (frozenRepository) => {
+			const frozenPath = await lifecycleCreationPath(worktreePath);
+			const result = await exec(["worktree", "add", frozenPath, branchName], frozenRepository);
+			if (result.exitCode !== 0) {
+				// Detect shallow clone as a likely cause of "unable to read tree" errors
+				if (result.stderr.includes("unable to read tree")) {
+					const shallow = await gitService.isShallowRepository(frozenRepository);
+					if (shallow) {
+						throw new Error(
+							`Failed to create worktree: ${result.stderr}\n\n` +
+								`This repository appears to be a shallow clone and is missing the required git objects. ` +
+								`Run \`git fetch --unshallow\` in the repository to fetch the full history, then try again.`,
+						);
+					}
 				}
+				throw new Error(`Failed to create worktree: ${result.stderr}`);
 			}
-			throw new Error(`Failed to create worktree: ${result.stderr}`);
-		}
-		await confirmLifecyclePathCreated(frozenPath);
-	},
-
-	async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
-		return withProtectionReservation([{ path: worktreePath }], "git worktree remove", async () => {
-			const frozenRepository = await captureLifecycleContextPath(repoPath);
-			const frozenPath = await revalidateLifecycleTarget(worktreePath);
-			const result = await exec(["worktree", "remove", frozenPath, "--force"], frozenRepository);
-			if (result.exitCode !== 0) throw new GitError(`Failed to remove worktree: ${result.stderr}`);
-			await confirmLifecyclePathRemoved(frozenPath);
+			await confirmLifecyclePathCreated(frozenPath);
 		});
 	},
 
+	async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
+		return withProtectionReservation([{ path: worktreePath }], "git worktree remove", async () =>
+			withWorktreeStructureLock(repoPath, async (repository) => {
+				const frozenRepository = await captureLifecycleContextPath(repository);
+				const frozenPath = await revalidateLifecycleTarget(worktreePath);
+				const result = await exec(["worktree", "remove", frozenPath, "--force"], frozenRepository);
+				if (result.exitCode !== 0)
+					throw new GitError(`Failed to remove worktree: ${result.stderr}`);
+				await confirmLifecyclePathRemoved(frozenPath);
+			}),
+		);
+	},
+
 	async pruneWorktrees(repoPath: string): Promise<void> {
-		await exec(["worktree", "prune"], repoPath);
+		await withWorktreeStructureLock(repoPath, async (frozenRepository) => {
+			await exec(["worktree", "prune"], frozenRepository);
+		});
 	},
 
 	async deleteBranch(repoPath: string, branchName: string): Promise<void> {
