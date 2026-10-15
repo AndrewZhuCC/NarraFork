@@ -10,12 +10,6 @@
 	min-width: 0;
 }
 
-.messageBody {
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-	font-family: inherit;
-}
-
 .browser {
 	display: grid;
 	grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
@@ -30,8 +24,98 @@
 
 .preview[data-commit-preview="page"] .browser,
 .preview[data-commit-preview="window"] .browser {
-	height: calc(100vh - 280px);
-	min-height: 420px;
+	height: calc(100vh - 168px);
+	min-height: 360px;
+}
+
+.commitCard {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 10px 12px;
+}
+
+.head {
+	display: flex;
+	align-items: flex-start;
+	gap: 12px;
+	min-width: 0;
+}
+
+.subject {
+	flex: 1;
+	min-width: 0;
+	margin: 0;
+	font-size: var(--mantine-font-size-md);
+	font-weight: 600;
+	line-height: 1.35;
+	overflow-wrap: anywhere;
+}
+
+.shaCluster {
+	display: inline-flex;
+	align-items: center;
+	flex-shrink: 0;
+	gap: 2px;
+	padding: 1px 2px 1px 8px;
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-sm);
+	background: var(--mantine-color-body);
+}
+
+.sha {
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 12px;
+	line-height: 1;
+}
+
+.iconLink {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 28px;
+	height: 28px;
+	border-radius: var(--mantine-radius-sm);
+	color: inherit;
+}
+
+.iconLink:hover {
+	background: var(--mantine-color-default-hover);
+}
+
+.meta {
+	line-height: 1.45;
+}
+
+.messageBody {
+	margin: 2px 0 0;
+	color: var(--mantine-color-dimmed);
+	font-family: inherit;
+	font-size: var(--mantine-font-size-xs);
+	line-height: 1.45;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.messageBody[data-clamped="true"] {
+	display: -webkit-box;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 4;
+}
+
+.more {
+	align-self: flex-start;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: var(--mantine-color-dimmed);
+	font-size: var(--mantine-font-size-xs);
+	cursor: pointer;
+}
+
+.more:hover {
+	color: var(--mantine-color-text);
 }
 
 .navigation,
@@ -211,6 +295,8 @@
 
 .layoutOption:focus-visible,
 .diffTitle:focus-visible,
+.more:focus-visible,
+.iconLink:focus-visible,
 .mobileToggle:focus-visible {
 	outline: 2px solid var(--mantine-primary-color-filled);
 	outline-offset: -2px;
@@ -281,5 +367,20 @@
 
 	.layoutLabel {
 		display: none;
+	}
+
+	.head {
+		flex-wrap: wrap;
+	}
+
+	.shaCluster {
+		margin-left: auto;
+	}
+
+	.browser,
+	.preview[data-commit-preview="page"] .browser,
+	.preview[data-commit-preview="window"] .browser {
+		height: auto;
+		min-height: 0;
 	}
 }

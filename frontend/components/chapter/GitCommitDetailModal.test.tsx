@@ -372,17 +372,16 @@ describe("Git commit preview with real query observers", () => {
 		expect(details).toHaveBeenCalledTimes(1);
 		await waitFor(() => bodyText().includes("SELECTED_PATCH"), "default first file patch");
 		expect(patches).toHaveBeenCalledTimes(1);
-		expect(element("[data-commit-sha]").textContent).toContain(SHA_A);
 		expect(element("[data-commit-message]").textContent).toContain("Commit aaaaaaa subject");
-		expect(bodyText()).not.toContain("Detailed commit body");
-		click("[data-commit-body-toggle]");
-		await waitFor(() => !!document.body.querySelector("[data-commit-body]"), "expanded body");
 		expect(element("[data-commit-body]").textContent).toBe("Detailed commit body");
-		expect(bodyText()).toContain("Author: Preview Author <author@example.test>");
-		expect(bodyText()).toContain("Committer: Preview Author <author@example.test>");
-		expect(bodyText()).toContain(commit.authoredAt);
-		expect(bodyText()).toContain(commit.committedAt);
-		expect(document.body.querySelectorAll("time")).toHaveLength(2);
+		expect(document.body.querySelector("[data-commit-body-toggle]")).toBeNull();
+		expect(element("[data-commit-sha]").getAttribute("data-commit-sha")).toBe(SHA_A);
+		expect(element("[data-commit-sha]").textContent).toBe(SHA_A.slice(0, 7));
+		expect(bodyText()).toContain("Preview Author <author@example.test>");
+		expect(bodyText()).not.toContain("Committer");
+		const times = document.body.querySelectorAll("[data-commit-at]");
+		expect(times).toHaveLength(1);
+		expect(times[0]?.getAttribute("data-commit-at")).toBe(commit.authoredAt);
 		expect(document.body.querySelector(`[title="${PARENT} ${SHA_B}"]`)).not.toBeNull();
 		expect(bodyText()).toContain("first parent ccccccc");
 		expect(bodyText()).toContain(gitLocale["commitPreview.messageTruncated"]);
@@ -713,7 +712,7 @@ describe("Git commit preview with real query observers", () => {
 		renderModal();
 		await waitFor(() => bodyText().includes(gitLocale["commitPreview.noFiles"]), "empty commit");
 		expect(bodyText()).toContain(gitLocale["commitPreview.rootCommit"]);
-		expect(bodyText()).toContain(SHA_A);
+		expect(element("[data-commit-sha]").getAttribute("data-commit-sha")).toBe(SHA_A);
 		expect(document.body.querySelector("[data-commit-file]")).toBeNull();
 		expect(patches).not.toHaveBeenCalled();
 	});
@@ -935,6 +934,24 @@ describe("shared GitCommitPreview interactions", () => {
 				"file",
 			),
 		).toBe(RENAMED_FILE);
+	});
+
+	test("a long commit description clamps to four lines and expands in place", async () => {
+		const description = Array.from({ length: 8 }, (_, index) => `line ${index}`).join("\n");
+		spyOn(api, "getGitCommitDetail").mockResolvedValue(
+			detail(SHA_A, { message: `Subject only\n\n${description}` }),
+		);
+		spyOn(api, "getGitCommitDiff").mockResolvedValue(textPatch("VISIBLE_PATCH"));
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} />);
+		await waitFor(() => bodyText().includes("VISIBLE_PATCH"), "patch beside clamped body");
+		const body = element("[data-commit-body]");
+		expect(body.getAttribute("data-clamped")).toBe("true");
+		expect(body.textContent).toBe(description);
+		click("[data-commit-body-toggle]");
+		await waitFor(() => body.getAttribute("data-clamped") == null, "description expanded");
+		expect(bodyText()).toContain("VISIBLE_PATCH");
+		click("[data-commit-body-toggle]");
+		await waitFor(() => body.getAttribute("data-clamped") === "true", "description clamped");
 	});
 
 	test("statistics explicitly distinguish unknown counts, binary files and truncated lists", async () => {
