@@ -89,6 +89,7 @@ const state = hotSafe("narrator.modelHistorySource.v1", () => {
 		hits: 0,
 		signatureReads: 0,
 		lastCounters: null as ModelHistoryCounters | null,
+		workerSpecifier: null as string | null,
 		sourceSignatures: new WeakMap<ModelHistorySource, SourceSignatureRecord>(),
 		rowSignatures: new WeakMap<object, SourceSignatureRecord>(),
 	};
@@ -97,6 +98,7 @@ const state = hotSafe("narrator.modelHistorySource.v1", () => {
 // miss these maps and must take the fully validated cold path before they can be reused.
 state.sourceSignatures ??= new WeakMap<ModelHistorySource, SourceSignatureRecord>();
 state.rowSignatures ??= new WeakMap<object, SourceSignatureRecord>();
+state.workerSpecifier ??= null;
 export function modelHistorySourceStats() {
 	return {
 		loads: state.loads,
@@ -197,6 +199,30 @@ export async function freezeModelHistorySource(
 	if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 }
 
+/**
+ * The embedded worker key inside a compiled binary depends on the build layout: a build whose
+ * entries share the `server/` root folds the prefix away, while multi-entry builds keep the full
+ * path. No single shape is correct for both, so candidates are probed (same reason
+ * COMPILED_WORKER_PATHS exists for the db worker); the winner is cached in state.
+ */
+export function modelHistoryWorkerSpecifiers(
+	compiled = isCompiledRuntime(),
+	moduleUrl = import.meta.url,
+): string[] {
+	return (
+		compiled
+			? [
+					"./services/agent-runtime/model-history-worker.js",
+					"./server/services/agent-runtime/model-history-worker.js",
+					"./model-history-worker.js",
+				]
+			: ["./model-history-worker.ts"]
+	).map((path) => new URL(path, moduleUrl).href);
+}
+
+/** Sentinel distinguishing a worker that never started from one that failed mid-query. */
+const WORKER_STARTUP_ERROR = new Error("Model history read-only worker failed to start");
+
 async function readWorker(
 	backend: ModelHistoryBackend,
 	narratorId: string,
@@ -214,97 +240,122 @@ async function readWorker(
 	if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 	state.workers++;
 	try {
-		const specifier = isCompiledRuntime()
-			? new URL("./services/agent-runtime/model-history-worker.js", import.meta.url)
-			: new URL("./model-history-worker.ts", import.meta.url);
-		const worker = new Worker(specifier.href);
-		return await new Promise<ModelHistorySource>((resolve, reject) => {
-			const messages: ModelSourceRow[] = [];
-			const byId = new Map<string, ModelSourceRow>();
-			const previousById = new Map(previous?.messages.map((row) => [row.id, row]));
-			const previousTools = new Map(
-				previous?.messages.flatMap((row) => row.toolCalls.map((tool) => [tool.id, tool] as const)),
-			);
-			let finished = false;
-			const finish = (
-				error?: Error,
-				counters?: ModelHistoryCounters,
-				compactSeq?: number | null,
-			) => {
-				if (finished) return;
-				finished = true;
-				clearTimeout(timer);
-				options.signal?.removeEventListener("abort", abort);
-				worker.terminate();
-				if (error || !counters) reject(error ?? new Error("Model history worker did not complete"));
-				else {
-					for (const row of messages)
-						row.toolCalls.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-					resolve({ messages, counters, compactSeq });
-				}
-			};
-			const abort = () => finish(new Error("Model history preparation cancelled"));
-			const timer = setTimeout(
-				() => finish(new Error("Model history preparation exceeded 10s budget")),
-				Math.max(1, deadline - Date.now()),
-			);
-			options.signal?.addEventListener("abort", abort, { once: true });
-			worker.onerror = () => finish(new Error("Model history read-only worker failed"));
-			worker.onmessage = (event) => {
-				if (Date.now() >= deadline || options.signal?.aborted)
-					return finish(new Error("Model history preparation cancelled or timed out"));
-				if (event.data.type === "page") {
-					for (const row of event.data.rows as ModelSourceRow[]) {
-						messages.push(row);
-						byId.set(row.id, row);
-					}
-					worker.postMessage({ type: "ack" });
-				} else if (event.data.type === "tools") {
-					for (const { messageId, ...tool } of event.data.rows as Array<
-						ModelToolSourceRow & { messageId: string }
-					>)
-						byId.get(messageId)?.toolCalls.push(tool);
-					worker.postMessage({ type: "ack" });
-				} else if (event.data.type === "reuseBodies") {
-					for (const id of event.data.ids as string[]) {
-						const old = previousById.get(id);
-						if (!old) return finish(new Error("Model history delta source unavailable"));
-						const row = { ...old, toolCalls: [] };
-						messages.push(row);
-						byId.set(id, row);
-					}
-					worker.postMessage({ type: "ack" });
-				} else if (event.data.type === "reuseTools") {
-					for (const { id, messageId } of event.data.rows as Array<{
-						id: string;
-						messageId: string;
-					}>) {
-						const old = previousTools.get(id);
-						if (!old) return finish(new Error("Model history delta tool source unavailable"));
-						byId.get(messageId)?.toolCalls.push(old);
-					}
-					worker.postMessage({ type: "ack" });
-				} else if (event.data.type === "order") {
-					if (event.data.reset) messages.length = 0;
-					for (const id of event.data.ids as string[])
-						messages.push(byId.get(id) as ModelSourceRow);
-					worker.postMessage({ type: "ack" });
-				} else if (event.data.type === "done")
-					finish(undefined, event.data.counters, event.data.compactSeq);
-				else if (event.data.type === "error") finish(new Error(event.data.message));
-			};
-			worker.postMessage({
-				narratorId,
-				deadline,
-				limit: options.limit,
-				maxBytes: MODEL_HISTORY_MAX_BYTES,
-				versioned,
-				previous: previous ? modelHistoryManifest(previous) : undefined,
-				...(backend.backend === "sqlite"
-					? { backend: "sqlite", path: backend.sqlite.filename }
-					: { backend: "postgres", url: backend.url }),
-			});
-		});
+		const candidates = state.workerSpecifier
+			? [state.workerSpecifier]
+			: modelHistoryWorkerSpecifiers();
+		let lastError: Error | undefined;
+		for (const specifier of candidates) {
+			options.signal?.throwIfAborted();
+			if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
+			const worker = new Worker(specifier);
+			// A module-load failure surfaces as onerror with no message at all; a running
+			// worker always communicates before dying. That difference gates the probe.
+			let received = false;
+			try {
+				const source = await new Promise<ModelHistorySource>((resolve, reject) => {
+					const messages: ModelSourceRow[] = [];
+					const byId = new Map<string, ModelSourceRow>();
+					const previousById = new Map(previous?.messages.map((row) => [row.id, row]));
+					const previousTools = new Map(
+						previous?.messages.flatMap((row) =>
+							row.toolCalls.map((tool) => [tool.id, tool] as const),
+						),
+					);
+					let finished = false;
+					const finish = (
+						error?: Error,
+						counters?: ModelHistoryCounters,
+						compactSeq?: number | null,
+					) => {
+						if (finished) return;
+						finished = true;
+						clearTimeout(timer);
+						options.signal?.removeEventListener("abort", abort);
+						worker.terminate();
+						if (error || !counters)
+							reject(error ?? new Error("Model history worker did not complete"));
+						else {
+							for (const row of messages)
+								row.toolCalls.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+							resolve({ messages, counters, compactSeq });
+						}
+					};
+					const abort = () => finish(new Error("Model history preparation cancelled"));
+					const timer = setTimeout(
+						() => finish(new Error("Model history preparation exceeded 10s budget")),
+						Math.max(1, deadline - Date.now()),
+					);
+					options.signal?.addEventListener("abort", abort, { once: true });
+					worker.onerror = () =>
+						finish(
+							received ? new Error("Model history read-only worker failed") : WORKER_STARTUP_ERROR,
+						);
+					worker.onmessage = (event) => {
+						received = true;
+						if (Date.now() >= deadline || options.signal?.aborted)
+							return finish(new Error("Model history preparation cancelled or timed out"));
+						if (event.data.type === "page") {
+							for (const row of event.data.rows as ModelSourceRow[]) {
+								messages.push(row);
+								byId.set(row.id, row);
+							}
+							worker.postMessage({ type: "ack" });
+						} else if (event.data.type === "tools") {
+							for (const { messageId, ...tool } of event.data.rows as Array<
+								ModelToolSourceRow & { messageId: string }
+							>)
+								byId.get(messageId)?.toolCalls.push(tool);
+							worker.postMessage({ type: "ack" });
+						} else if (event.data.type === "reuseBodies") {
+							for (const id of event.data.ids as string[]) {
+								const old = previousById.get(id);
+								if (!old) return finish(new Error("Model history delta source unavailable"));
+								const row = { ...old, toolCalls: [] };
+								messages.push(row);
+								byId.set(id, row);
+							}
+							worker.postMessage({ type: "ack" });
+						} else if (event.data.type === "reuseTools") {
+							for (const { id, messageId } of event.data.rows as Array<{
+								id: string;
+								messageId: string;
+							}>) {
+								const old = previousTools.get(id);
+								if (!old) return finish(new Error("Model history delta tool source unavailable"));
+								byId.get(messageId)?.toolCalls.push(old);
+							}
+							worker.postMessage({ type: "ack" });
+						} else if (event.data.type === "order") {
+							if (event.data.reset) messages.length = 0;
+							for (const id of event.data.ids as string[])
+								messages.push(byId.get(id) as ModelSourceRow);
+							worker.postMessage({ type: "ack" });
+						} else if (event.data.type === "done")
+							finish(undefined, event.data.counters, event.data.compactSeq);
+						else if (event.data.type === "error") finish(new Error(event.data.message));
+					};
+					worker.postMessage({
+						narratorId,
+						deadline,
+						limit: options.limit,
+						maxBytes: MODEL_HISTORY_MAX_BYTES,
+						versioned,
+						previous: previous ? modelHistoryManifest(previous) : undefined,
+						...(backend.backend === "sqlite"
+							? { backend: "sqlite", path: backend.sqlite.filename }
+							: { backend: "postgres", url: backend.url }),
+					});
+				});
+				state.workerSpecifier = specifier;
+				return source;
+			} catch (error) {
+				// Only a candidate that never started is probed against the next path shape;
+				// a worker that died mid-query must surface its real error unchanged.
+				if (error !== WORKER_STARTUP_ERROR || specifier === candidates.at(-1)) throw error as Error;
+				lastError = error as Error;
+			}
+		}
+		throw lastError ?? new Error("Model history read-only worker failed");
 	} finally {
 		state.workers--;
 	}

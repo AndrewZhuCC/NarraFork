@@ -14,6 +14,7 @@ import {
 	ModelHistorySourceCache,
 	markModelHistoryRows,
 	modelHistorySourceStats,
+	modelHistoryWorkerSpecifiers,
 	verifyModelHistoryRowsCurrent,
 } from "./model-history-source";
 
@@ -460,4 +461,18 @@ test("transactional revisions cover shared bodies, final UUID, reorder/compact/s
 		})();
 	} catch {}
 	expect(revision(db)).toBe(original);
+});
+
+test("compiled runtimes probe every worker path shape, source runtimes resolve the development path", () => {
+	expect(modelHistoryWorkerSpecifiers(true, "file:///$bunfs/root/narrafork.exe")).toEqual([
+		"file:///$bunfs/root/services/agent-runtime/model-history-worker.js",
+		"file:///$bunfs/root/server/services/agent-runtime/model-history-worker.js",
+		"file:///$bunfs/root/model-history-worker.js",
+	]);
+	expect(
+		modelHistoryWorkerSpecifiers(
+			false,
+			"file:///repo/server/services/agent-runtime/model-history-source.ts",
+		),
+	).toEqual(["file:///repo/server/services/agent-runtime/model-history-worker.ts"]);
 });
