@@ -536,7 +536,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
-	"server/services/narrator-persistence.ts": ["handle", "json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],

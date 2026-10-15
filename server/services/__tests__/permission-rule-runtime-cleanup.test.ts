@@ -1,37 +1,22 @@
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
+import { openSchemaCopyInMemory } from "../../../tests/sqlite-schema-image";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import type { AgentConfig, ToolCallBinding } from "../../lib/agent/types";
 
-// Real isolated SQLite declarations, no filesystem database or migration edits.
-const sqlite = new Database(":memory:");
-const dialect = new SQLiteSyncDialect();
-const tables: string[] = [];
-for (const table of Object.values(schema)) {
-	let config: ReturnType<typeof getTableConfig>;
-	try {
-		config = getTableConfig(table as Parameters<typeof getTableConfig>[0]);
-	} catch {
-		continue;
-	}
-	if (!config?.name || !config.columns) continue;
-	tables.push(config.name);
-	const columns = config.columns.map((column) => {
-		const value = column.default;
-		const defaultSql =
-			value === undefined
-				? ""
-				: ` DEFAULT ${typeof value === "object" && value !== null && "queryChunks" in value ? dialect.sqlToQuery(value as Parameters<typeof dialect.sqlToQuery>[0]).sql : typeof value === "string" ? `'${value.replaceAll("'", "''")}'` : typeof value === "boolean" ? Number(value) : value === null ? "NULL" : typeof value === "object" ? `'${JSON.stringify(value).replaceAll("'", "''")}'` : value}`;
-		return `${column.name} ${column.getSQLType()} ${column.primary ? "PRIMARY KEY" : ""}${defaultSql}`;
-	});
-	sqlite.run(`CREATE TABLE ${config.name} (${columns.join(",")})`);
-}
+// Copy the fully migrated isolated test schema, including generated columns and
+// partial indexes. Reconstructing columns alone is not a real startup fixture.
+const realDbModule = { ...(await import("../../db")) };
+const sqlite = openSchemaCopyInMemory(realDbModule.sqlite);
+const tables = sqlite
+	.query<{ name: string }, []>(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 2048",
+	)
+	.all();
 const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { executeTool } = await import("../../lib/agent/tool-executor");
 const { requestPermissionRuleTool } = await import("../../lib/agent/tools/request-permission-rule");
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
@@ -42,12 +27,13 @@ const previousTool = toolRegistry.get("RequestPermissionRule");
 toolRegistry.register(requestPermissionRuleTool);
 let sequence = 0;
 beforeEach(() => {
-	for (const table of tables) sqlite.run(`DELETE FROM ${table}`);
+	for (const { name } of tables) sqlite.run(`DELETE FROM "${name.replaceAll('"', '""')}"`);
 });
 afterAll(() => {
 	toolRegistry.unregister("RequestPermissionRule");
 	if (previousTool) toolRegistry.register(previousTool);
 	mock.restore();
+	mock.module("../../db", () => realDbModule);
 	sqlite.close();
 });
 async function fixture(
@@ -187,11 +173,49 @@ describe("permission rule executor and cold-start audit cleanup", () => {
 		const applied = await fixture("applied");
 		const existing = await fixture("alreadyExists");
 		const obsolete = await fixture("approved");
+		// Exercise the real indexed recovery during the full startup path, not just
+		// an empty placeholder table that happens to accept the query.
+		const compactId = "startup-legacy-compact";
+		await db.insert(schema.narratorMessages).values({
+			id: compactId,
+			narratorId: pending.narratorId,
+			role: "system",
+			contentJson: [{ type: "compact", status: "compacting", mode: "blocking" }],
+			contentText: "[Compacting]",
+			createdAt: new Date().toISOString(),
+		});
+		await db.insert(schema.narratorMessageRefs).values({
+			id: "startup-legacy-compact-ref",
+			narratorId: pending.narratorId,
+			messageId: compactId,
+			seq: 0,
+		});
+		expect(
+			db
+				.select({ pending: schema.narratorMessages.compactPending })
+				.from(schema.narratorMessages)
+				.where(eq(schema.narratorMessages.id, compactId))
+				.get()?.pending,
+		).toBe(1);
 		await db
 			.update(schema.narratorToolCalls)
 			.set({ executionAttempt: 2 })
 			.where(eq(schema.narratorToolCalls.id, obsolete.id));
 		await recoverOnStartup();
+		expect(
+			db
+				.select()
+				.from(schema.narratorMessages)
+				.where(eq(schema.narratorMessages.id, compactId))
+				.get(),
+		).toBeUndefined();
+		expect(
+			db
+				.select()
+				.from(schema.narratorMessageRefs)
+				.where(eq(schema.narratorMessageRefs.messageId, compactId))
+				.get(),
+		).toBeUndefined();
 		expect(pending.read()?.status).toBe("cancelled");
 		expect(approved.read()?.status).toBe("cancelled");
 		expect(approved.read()?.approvalSource).toBe("user");
