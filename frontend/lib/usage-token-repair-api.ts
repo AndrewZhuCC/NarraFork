@@ -1,7 +1,6 @@
 import type {
-	TokenRepairApplyResult,
-	TokenRepairCandidatePage,
 	TokenRepairJob,
+	TokenRepairModelPage,
 	TokenRepairProbe,
 	TokenRepairProtocolOverride,
 } from "@shared/usage-token-repair";
@@ -14,27 +13,20 @@ export const usageTokenRepairApi = {
 	probe: (signal?: AbortSignal) => request<TokenRepairProbe>(`${base}/probe`, { signal }),
 	jobs: (signal?: AbortSignal) =>
 		request<{ job: TokenRepairJob | null }>(`${base}/jobs`, { signal }),
-	start: (
-		includeReviewed: boolean,
-		protocolOverrides: TokenRepairProtocolOverride[] = [],
-		sourceJobId?: string,
-	) =>
-		post<{ job: TokenRepairJob }>("/jobs", {
-			includeReviewed,
-			protocolOverrides,
-			...(sourceJobId !== undefined ? { sourceJobId } : {}),
-		}),
+	start: (includeReviewed = true) => post<{ job: TokenRepairJob }>("/jobs", { includeReviewed }),
 	job: (id: string, signal?: AbortSignal) =>
 		request<{ job: TokenRepairJob }>(`${base}/jobs/${encodeURIComponent(id)}`, { signal }),
-	candidates: (id: string, cursor?: string, signal?: AbortSignal) =>
-		request<TokenRepairCandidatePage>(
-			`${base}/jobs/${encodeURIComponent(id)}/candidates${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+	models: (id: string, cursor?: string, signal?: AbortSignal) =>
+		request<TokenRepairModelPage>(
+			`${base}/jobs/${encodeURIComponent(id)}/models${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
 			{ signal },
 		),
 	cancel: (id: string) => post<{ job: TokenRepairJob }>(`/jobs/${encodeURIComponent(id)}/cancel`),
-	apply: (id: string, candidateIds: string[]) =>
-		post<TokenRepairApplyResult>(`/jobs/${encodeURIComponent(id)}/apply`, {
-			candidateIds,
+	dryRun: (id: string, protocolOverrides: TokenRepairProtocolOverride[]) =>
+		post<{ job: TokenRepairJob }>(`/jobs/${encodeURIComponent(id)}/dry-run`, { protocolOverrides }),
+	apply: (id: string, previewVersion: string) =>
+		post<{ job: TokenRepairJob }>(`/jobs/${encodeURIComponent(id)}/apply`, {
+			previewVersion,
 			confirm: true,
 		}),
 };

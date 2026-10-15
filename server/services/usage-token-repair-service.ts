@@ -6,6 +6,7 @@ import type {
 	TokenRepairApplyResult,
 	TokenRepairCandidatePage,
 	TokenRepairJob,
+	TokenRepairModelPage,
 	TokenRepairProbe,
 	TokenRepairProtocolOverride,
 } from "@shared/usage-token-repair";
@@ -24,6 +25,7 @@ type Command = {
 	sourceJobId?: string;
 	cursor?: string;
 	candidateIds?: string[];
+	previewVersion?: string;
 	config?: TokenRepairStoreConfig;
 	directory?: string;
 };
@@ -192,6 +194,15 @@ export class TokenRepairClient {
 			sourceJobId,
 		});
 	}
+	models(jobId: string, cursor?: string) {
+		return this.call<TokenRepairModelPage>({ op: "models", jobId, cursor });
+	}
+	dryRun(jobId: string, protocolOverrides: TokenRepairProtocolOverride[]) {
+		return this.call<TokenRepairJob>({ op: "dry-run", jobId, protocolOverrides });
+	}
+	applyPreview(jobId: string, previewVersion: string, userId: string) {
+		return this.call<TokenRepairJob>({ op: "apply-preview", jobId, previewVersion, userId });
+	}
 	async cancel(jobId: string) {
 		this.probeCache = null;
 		return this.call<TokenRepairJob | null>({ op: "cancel", jobId });
@@ -248,6 +259,11 @@ export const usageTokenRepairService = {
 		overrides?: TokenRepairProtocolOverride[],
 		sourceJobId?: string,
 	) => (await client()).start(userId, reviewed, overrides, sourceJobId),
+	models: async (id: string, cursor?: string) => (await client()).models(id, cursor),
+	dryRun: async (id: string, overrides: TokenRepairProtocolOverride[]) =>
+		(await client()).dryRun(id, overrides),
+	applyPreview: async (id: string, version: string, userId: string) =>
+		(await client()).applyPreview(id, version, userId),
 	cancel: async (id: string) => (await client()).cancel(id),
 	apply: async (id: string, ids: string[], userId: string) =>
 		(await client()).apply(id, ids, userId),

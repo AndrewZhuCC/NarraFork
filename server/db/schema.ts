@@ -3547,6 +3547,12 @@ export const usageTokenRepairJobs = sqliteTable(
 		updatedAt: text("updated_at").notNull(),
 		ownerId: text("owner_id"),
 		leaseUntil: text("lease_until"),
+		workflowVersion: integer("workflow_version"),
+		phase: text("phase"),
+		summaryJson: text("summary_json"),
+		rowsPerSecond: real("rows_per_second"),
+		/** Durable cleanup acknowledgement; keep audit rows after scratch files are retired. */
+		scratchRetiredAt: text("scratch_retired_at"),
 		scanned: integer("scanned").notNull().default(0),
 		repaired: integer("repaired").notNull().default(0),
 		conflicts: integer("conflicts").notNull().default(0),
@@ -3562,6 +3568,11 @@ export const usageTokenRepairJobs = sqliteTable(
 	},
 	(table) => [
 		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
+		index("idx_token_repair_scratch_retirement")
+			.on(table.updatedAt, table.id)
+			.where(
+				sql`${table.scratchRetiredAt} IS NULL AND ${table.status} IN ('completed', 'cancelled', 'failed', 'interrupted')`,
+			),
 		uniqueIndex("idx_token_repair_single_active")
 			.on(sql`(1)`)
 			.where(sql`${table.status} IN ('analyzing', 'ready', 'applying')`),

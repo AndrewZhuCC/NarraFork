@@ -28,7 +28,7 @@ test("compiled historical repair embeds both worker boundaries and completes a r
 			harness,
 			`import { TokenRepairClient } from ${JSON.stringify(resolve("server/services/usage-token-repair-service.ts"))};
 const c = new TokenRepairClient({backend:'sqlite',sqlitePath:Bun.argv[2]},Bun.argv[3]);
-try { const p=await c.probe(); if(!p.hasPending) throw Error('probe'); const j=await c.start('admin',false,[{provider:'openai',model:'test',protocol:'openai'}]); const deadline=Date.now()+10000; let ready=false; while(Date.now()<deadline){ const s=await c.getJob(j.id); if(s?.status==='ready'){ready=true;break;} if(s?.status!=='analyzing')throw Error('status'); await Bun.sleep(10); } if(!ready)throw Error('timeout'); const rows=await c.listCandidates(j.id); if(rows.records[0]?.after?.inputTokens!==60||rows.records[0]?.manualProtocol!=='openai')throw Error('manual evidence'); console.log('TOKEN_REPAIR_COMPILED_OK'); } finally { await c.close(); }
+try { const p=await c.probe(); if(!p.hasPending) throw Error('probe'); const j=await c.start('admin',true); const deadline=Date.now()+10000; let ready=false; while(Date.now()<deadline){ const s=await c.getJob(j.id); if(s?.phase==='models'&&s.status==='ready'){ready=true;break;} if(s?.status!=='analyzing')throw Error('status'); await Bun.sleep(10); } if(!ready)throw Error('timeout'); await c.dryRun(j.id,[]); let preview=false; while(Date.now()<deadline){const s=await c.getJob(j.id);if(s?.phase==='preview'&&s.status==='ready'){if(s.summary?.after.inputTokens!=='60')throw Error('aggregate evidence');preview=true;break;}if(s?.status==='failed')throw Error('preview failed');await Bun.sleep(10);}if(!preview)throw Error('preview timeout');console.log('TOKEN_REPAIR_COMPILED_OK'); } finally { await c.close(); }
 `,
 		);
 		const executable = join(directory, process.platform === "win32" ? "probe.exe" : "probe");
@@ -50,7 +50,7 @@ try { const p=await c.probe(); if(!p.hasPending) throw Error('probe'); const j=a
 			{ stdout: "pipe", stderr: "pipe", timeout: 60_000, maxBuffer: 1024 * 1024 },
 		);
 		expect(compile.exitCode, new TextDecoder().decode(compile.stderr).slice(0, 4000)).toBe(0);
-		const run = Bun.spawnSync([executable, path, directory], {
+		const run = Bun.spawnSync([executable, path, join(directory, "request-dumps")], {
 			stdout: "pipe",
 			stderr: "pipe",
 			timeout: 20_000,
@@ -97,7 +97,7 @@ try { const j=await c.start('admin',false,[{provider:'openai',model:'test',proto
 			missingBuild.exitCode,
 			new TextDecoder().decode(missingBuild.stderr).slice(0, 4000),
 		).toBe(0);
-		const missingRun = Bun.spawnSync([missingExecutable, path, directory], {
+		const missingRun = Bun.spawnSync([missingExecutable, path, join(directory, "request-dumps")], {
 			stdout: "pipe",
 			stderr: "pipe",
 			timeout: 20_000,

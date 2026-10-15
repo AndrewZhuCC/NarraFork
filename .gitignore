@@ -39,6 +39,7 @@ analyze2/
 *.heapsnapshot
 script/
 scripts/*
+!scripts/benchmark-token-repair-bulk.ts
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts

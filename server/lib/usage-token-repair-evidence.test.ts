@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TOKEN_REPAIR_MAX_DUMP_BYTES, type TokenRepairCounters } from "@shared/usage-token-repair";
-import { analyzeTokenRepairEvidence } from "./usage-token-repair-evidence";
+import { analyzeTokenRepairEvidence, resolveRepairEvidence } from "./usage-token-repair-evidence";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -46,6 +46,53 @@ async function analyze(before = row(), payload = dump(response())) {
 }
 
 describe("protocol evidence, never provider or model guesses", () => {
+	test("only validated unresolved usage is offered for model association and scratch is reusable", async () => {
+		const original = await analyze(
+			row(100, 0),
+			dump({ usage: { input_tokens: 100 } }, "https://private.invalid/custom"),
+		);
+		expect(original.reason).toBe("needs_protocol");
+		expect(original.structuredUsage?.version).toBe(1);
+		expect(JSON.stringify(original)).not.toMatch(/private|secret|Authorization|https:/);
+		const restored = JSON.parse(JSON.stringify(original));
+		expect(resolveRepairEvidence(row(100, 0), restored, "openai").classification).toBe("correct");
+		expect(resolveRepairEvidence(row(100, 0), restored, "anthropic").classification).toBe(
+			"correct",
+		);
+		expect(resolveRepairEvidence(row(99, 0), restored, "openai").reason).toBe("source_changed");
+	});
+	test("missing and invalid evidence never become protocol questions", async () => {
+		for (const raw of [
+			null,
+			dump({ output: "no usage" }, "/custom"),
+			dump({ usage: { input_tokens: -1 } }, "/custom"),
+			stream([{ usage: { input_tokens: 100 } }], "/custom"),
+		]) {
+			const evidence = await analyzeTokenRepairEvidence(row(), raw);
+			expect(evidence.reason).not.toBe("needs_protocol");
+			expect(evidence.structuredUsage).toBeUndefined();
+		}
+	});
+	test("strong token schema at a custom URL is automatically identified", async () => {
+		const evidence = await analyze(row(), dump({ usage: oa() }, "/custom"));
+		expect(evidence.protocol).toBe("openai");
+		expect(evidence.classification).toBe("repairable");
+		expect(evidence.structuredUsage).toBeUndefined();
+	});
+	test("unknown conversion is not a protocol association question", async () => {
+		const evidence = await analyze(row(1, 0), dump({ usage: { input_tokens: 100 } }, "/custom"));
+		expect(evidence.reason).toBe("unrecognized_previous_conversion");
+		expect(evidence.structuredUsage).toBeUndefined();
+		expect((await analyze(row(), dump({ usage: { input_tokens: -1 } }, "/custom"))).reason).toBe(
+			"invalid_token_counter",
+		);
+	});
+	test("structured resolution cannot override strong protocol or repair absent evidence", async () => {
+		const strong = await analyze();
+		expect(resolveRepairEvidence(row(), strong, "anthropic").reason).toBe("protocol_conflict");
+		const absent = await analyzeTokenRepairEvidence(row(), null);
+		expect(resolveRepairEvidence(row(), absent, "openai").reason).toBe("dump_missing");
+	});
 	test("OpenAI raw-inclusive legacy input is repaired and summary never leaks content", async () => {
 		const evidence = await analyze();
 		expect(evidence).toMatchObject({
@@ -523,7 +570,8 @@ describe("manual protocol hint stays subordinate to raw evidence", () => {
 
 	test("OpenAI hint explains bare upstream usage at custom URL", async () => {
 		const payload = { usage: oa() };
-		expect((await analyze(row(), dump(payload, custom))).classification).toBe("insufficient");
+		// A unique validated schema is now automatic; a matching hint remains supported.
+		expect((await analyze(row(), dump(payload, custom))).classification).toBe("repairable");
 		const evidence = await hinted("openai", payload);
 		expect(evidence).toMatchObject({
 			classification: "repairable",
@@ -535,7 +583,7 @@ describe("manual protocol hint stays subordinate to raw evidence", () => {
 	});
 	test("Anthropic hint preserves net bare usage and only repairs known TTL aggregate", async () => {
 		const payload = { usage: { input_tokens: 100, cache_read_input_tokens: 40 } };
-		expect((await analyze(row(), dump(payload, custom))).classification).toBe("insufficient");
+		expect((await analyze(row(), dump(payload, custom))).reason).toBe("needs_protocol");
 		expect(await hinted("anthropic", payload)).toMatchObject({
 			classification: "correct",
 			protocol: "anthropic",
@@ -616,7 +664,8 @@ describe("manual protocol hint stays subordinate to raw evidence", () => {
 			{ usage: { total_input_tokens: 100, total_cached_tokens: 40 } },
 			{ usageMetadata: { promptTokenCount: 100, cachedContentTokenCount: 40 } },
 		]) {
-			expect((await analyze(row(), dump(payload, custom))).classification).toBe("insufficient");
+			// A unique validated schema is now automatic; a matching hint remains supported.
+			expect((await analyze(row(), dump(payload, custom))).classification).toBe("repairable");
 			expect(await hinted("gemini", payload)).toMatchObject({
 				classification: "repairable",
 				protocol: "gemini",
