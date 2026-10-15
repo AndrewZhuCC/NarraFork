@@ -99,10 +99,11 @@ export function GitSplitDiff({
 								key={splitEntryKey(entry)}
 								left={entry.left}
 								right={entry.right}
-								tokensFor={(sourceIndex) => {
+								tokensFor={(sourceIndex, edge) => {
 									const ref = plan?.rows[sourceIndex];
 									if (!ref) return undefined;
-									return tokenTables[ref.source]?.[ref.line];
+									const chosen = edge === "old" && ref.old ? ref.old : ref;
+									return tokenTables[chosen.source]?.[chosen.line];
 								}}
 								wordStyles={wordStyles}
 							/>
@@ -131,7 +132,7 @@ function SplitRow({
 }: {
 	left: SplitDiffSide | null;
 	right: SplitDiffSide | null;
-	tokensFor: (sourceIndex: number) => readonly ShikiToken[] | undefined;
+	tokensFor: (sourceIndex: number, edge: "old" | "new") => readonly ShikiToken[] | undefined;
 	wordStyles: DiffWordStyles;
 }) {
 	return (
@@ -139,13 +140,13 @@ function SplitRow({
 			<SplitCell
 				edge="old"
 				side={left}
-				tokens={left ? tokensFor(left.sourceIndex) : undefined}
+				tokens={left ? tokensFor(left.sourceIndex, "old") : undefined}
 				wordStyles={wordStyles}
 			/>
 			<SplitCell
 				edge="new"
 				side={right}
-				tokens={right ? tokensFor(right.sourceIndex) : undefined}
+				tokens={right ? tokensFor(right.sourceIndex, "new") : undefined}
 				wordStyles={wordStyles}
 			/>
 		</>

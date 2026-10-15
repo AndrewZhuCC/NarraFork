@@ -2,7 +2,7 @@ import { Text, UnstyledButton } from "@mantine/core";
 import type { GitCommitFile, GitCommitFileStatus } from "@shared/git-commit-preview";
 import { IconChevronDown, IconChevronRight, IconFolder, IconFolderOpen } from "@tabler/icons-react";
 import type { TFunction } from "i18next";
-import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import classes from "./GitCommitFileTree.module.css";
 import { buildGitFileTree, type GitFileTreeNode } from "./git-file-tree";
@@ -33,6 +33,29 @@ export function commitFileLabel(file: GitCommitFile): string {
 	return file.oldPath ? `${file.oldPath} → ${file.path}` : file.path;
 }
 
+function coversSelection(folderPath: string, selectedPath: string): boolean {
+	return selectedPath === folderPath || selectedPath.startsWith(`${folderPath}/`);
+}
+
+function openAncestors(collapsed: ReadonlySet<string>, selectedPath: string): ReadonlySet<string> {
+	let changed = false;
+	const next = new Set(collapsed);
+	for (const path of collapsed) {
+		if (!coversSelection(path, selectedPath)) continue;
+		next.delete(path);
+		changed = true;
+	}
+	return changed ? next : collapsed;
+}
+
+function isSelectionHidden(collapsed: ReadonlySet<string>, selectedPath: string | null): boolean {
+	if (!selectedPath) return false;
+	for (const path of collapsed) {
+		if (coversSelection(path, selectedPath)) return true;
+	}
+	return false;
+}
+
 export function GitCommitFileTree({
 	files,
 	selectedPath,
@@ -46,26 +69,21 @@ export function GitCommitFileTree({
 	const tree = useMemo(() => buildGitFileTree(files), [files]);
 	const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
 	const selectedRef = useRef<HTMLButtonElement>(null);
+	const selectionHidden = isSelectionHidden(collapsed, selectedPath);
 
 	// Opening a file from the header or the URL should reveal it, without pinning
 	// the folder open after the reader collapses it again.
 	useEffect(() => {
 		if (!selectedPath) return;
-		setCollapsed((prev) => {
-			let changed = false;
-			const next = new Set(prev);
-			for (const path of prev) {
-				if (selectedPath === path || selectedPath.startsWith(`${path}/`)) {
-					next.delete(path);
-					changed = true;
-				}
-			}
-			return changed ? next : prev;
-		});
+		setCollapsed((prev) => openAncestors(prev, selectedPath));
 	}, [selectedPath]);
 
-	useEffect(() => {
-		if (!selectedPath) return;
+	// Scroll only once the selected row is actually mounted. Expanding a collapsed
+	// ancestor commits on the next render, so this effect also depends on whether
+	// the selection is still hidden — otherwise the first pass finds no row and
+	// never retries.
+	useLayoutEffect(() => {
+		if (!selectedPath || selectionHidden) return;
 		const node = selectedRef.current;
 		const container = node?.closest("[data-commit-file-list]");
 		if (!node || !(container instanceof HTMLElement)) return;
@@ -73,7 +91,7 @@ export function GitCommitFileTree({
 		const frame = container.getBoundingClientRect();
 		if (row.top < frame.top) container.scrollTop -= frame.top - row.top;
 		else if (row.bottom > frame.bottom) container.scrollTop += row.bottom - frame.bottom;
-	}, [selectedPath]);
+	}, [selectedPath, selectionHidden]);
 
 	const toggle = (path: string) => {
 		setCollapsed((prev) => {
