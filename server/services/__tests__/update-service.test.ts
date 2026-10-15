@@ -2,17 +2,21 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { registerOperatorShutdownHandler } from "../../lib/server-restart";
+import { registerRecoverySource, withRecoveryAdvance } from "../recovery-handoff";
 import { toolContinuationService } from "../tool-continuation-service";
 import {
 	beginQuiescingTools,
+	capturePlannedUpdateRecoverySnapshot,
 	consumePlannedUpdateRecoverySnapshot,
 	getUpdateCoordinationStatus,
 	markUpdateRestarting,
 	resetUpdateCoordinationForTests,
 	scheduleUpdate,
 	tryAcquireFinalUpdateExecution,
+	waitForScheduledRecoveryHandoff,
 	waitUntilUpdateGateOpens,
 	writePlannedUpdateRecoverySnapshot,
+	writePreparedUpdateRecoverySnapshot,
 } from "../update-coordinator";
 import {
 	__getVerifiedDigestComputationCount,
@@ -43,7 +47,43 @@ function scheduleWithManifest(targetVersion: string): string {
 	return scheduled.updateEpoch;
 }
 
+async function prepareInheritedShutdown(
+	operation: "update" | "system_shutdown" = "system_shutdown",
+	validateManifest?: () => void,
+) {
+	const original = writePlannedUpdateRecoverySnapshot({
+		version: 2,
+		updateEpoch: "previous-recovery",
+		capturedAt: new Date().toISOString(),
+		evidenceOnly: true,
+		narrators: [{ narratorId: "old-owner", locale: "en" }],
+	});
+	registerRecoverySource(
+		{
+			kind: "planned",
+			updateEpoch: original.updateEpoch,
+			capturedAt: original.capturedAt,
+			narrators: original.narrators,
+			pendingNarratorIds: ["old-owner"],
+		},
+		{ manifestIdentity: JSON.stringify(original), validateManifest },
+	);
+	const scheduled = scheduleUpdate(undefined, operation, {
+		supportedRecoveryManifestVersions: [1, 2, 3],
+	});
+	if (!scheduled.updateEpoch) throw new Error("Missing shutdown epoch");
+	await waitForScheduledRecoveryHandoff();
+	beginQuiescingTools();
+	const snapshot = capturePlannedUpdateRecoverySnapshot();
+	writePreparedUpdateRecoverySnapshot({ ...snapshot, resumeOnNextStartup: true });
+	return { original, epoch: scheduled.updateEpoch };
+}
 describe("planned update checkpoint fence", () => {
+	beforeEach(() => {
+		resetUpdateCoordinationForTests();
+		scheduleUpdate("2.0.0");
+	});
+	afterEach(resetUpdateCoordinationForTests);
 	test("covers a tool row inserted while the checkpoint query is in flight", async () => {
 		const activeToolCallIds = ["tool-a"];
 		const coveredToolCallIds = new Set<string>();
@@ -51,7 +91,7 @@ describe("planned update checkpoint fence", () => {
 		let activeQueries = 0;
 		const snapshot = {
 			version: 2 as const,
-			updateEpoch: "race-epoch",
+			updateEpoch: getUpdateCoordinationStatus().updateEpoch as string,
 			targetVersion: "2.0.0",
 			capturedAt: new Date().toISOString(),
 			narrators: [],
@@ -82,7 +122,7 @@ describe("planned update checkpoint fence", () => {
 		test(`rechecks a Send await that settles by ${settlement} after the first checkpoint`, async () => {
 			const snapshot = {
 				version: 2 as const,
-				updateEpoch: `send-${settlement}-epoch`,
+				updateEpoch: getUpdateCoordinationStatus().updateEpoch as string,
 				targetVersion: "2.0.0",
 				capturedAt: new Date().toISOString(),
 				narrators: [],
@@ -129,6 +169,173 @@ describe("update service failure cleanup", () => {
 		resetUpdateCoordinationForTests();
 	});
 
+	test("cancelling a published inherited root restores the prior evidence and leaves old rows alone", async () => {
+		const { original, epoch } = await prepareInheritedShutdown();
+		expect(consumePlannedUpdateRecoverySnapshot()).toMatchObject({
+			version: 3,
+			updateEpoch: epoch,
+			resumeOnNextStartup: true,
+			sources: [expect.objectContaining({ updateEpoch: original.updateEpoch })],
+		});
+		const cancelledEpochs: string[] = [];
+		toolContinuationService.cancelEpoch = async (selectedEpoch) => {
+			cancelledEpochs.push(selectedEpoch);
+			expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+			expect(getUpdateCoordinationStatus().scheduled).toBe(true);
+			return 0;
+		};
+		await failPreparedUpdateAttempt({
+			updateEpoch: epoch,
+			targetVersion: "current",
+			error: "cancelled",
+			cancelled: true,
+		});
+		expect(cancelledEpochs).toEqual([epoch]);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+		await expect(withRecoveryAdvance(original.updateEpoch, () => "continued")).resolves.toBe(
+			"continued",
+		);
+	});
+
+	test("an inherited rollback conflict retains the gate and does not cancel any epoch", async () => {
+		const { epoch } = await prepareInheritedShutdown();
+		const published = consumePlannedUpdateRecoverySnapshot();
+		writeFileSync(
+			join(getUpdateDirectory(), "planned-update-recovery.json"),
+			JSON.stringify({
+				version: 2,
+				updateEpoch: "foreign-root",
+				capturedAt: new Date().toISOString(),
+				narrators: [],
+			}),
+		);
+		let cancellations = 0;
+		toolContinuationService.cancelEpoch = async () => {
+			cancellations++;
+			return 0;
+		};
+		await expect(
+			failPreparedUpdateAttempt({
+				updateEpoch: epoch,
+				targetVersion: "current",
+				error: "cancelled",
+				cancelled: true,
+			}),
+		).rejects.toThrow();
+		expect(cancellations).toBe(0);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(true);
+		expect(consumePlannedUpdateRecoverySnapshot()?.updateEpoch).toBe("foreign-root");
+		expect(tryAcquireFinalUpdateExecution("ordinary")).toBeNull();
+		// Repair only this isolated fixture's simulated foreign write, then retry rollback.
+		writeFileSync(
+			join(getUpdateDirectory(), "planned-update-recovery.json"),
+			JSON.stringify(published, null, 2),
+		);
+		await failPreparedUpdateAttempt({
+			updateEpoch: epoch,
+			targetVersion: "current",
+			error: "cancelled",
+			cancelled: true,
+		});
+		expect(cancellations).toBe(1);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+	});
+
+	test("an inherited cleanup failure is retryable without reopening or cancelling the source", async () => {
+		const { original, epoch } = await prepareInheritedShutdown();
+		const cancelledEpochs: string[] = [];
+		toolContinuationService.cancelEpoch = async (selectedEpoch) => {
+			cancelledEpochs.push(selectedEpoch);
+			throw new Error("Temporary continuation database failure");
+		};
+		await expect(
+			failPreparedUpdateAttempt({
+				updateEpoch: epoch,
+				targetVersion: "current",
+				error: "cancelled",
+				cancelled: true,
+			}),
+		).rejects.toThrow("Temporary continuation database failure");
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(true);
+		toolContinuationService.cancelEpoch = async (selectedEpoch) => {
+			cancelledEpochs.push(selectedEpoch);
+			return 0;
+		};
+		await failPreparedUpdateAttempt({
+			updateEpoch: epoch,
+			targetVersion: "current",
+			error: "cancelled",
+			cancelled: true,
+		});
+		expect(cancelledEpochs).toEqual([epoch, epoch]);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+	});
+	test("automatic update cancellation retries failed handoff cleanup after its watchdog ended", async () => {
+		const { original, epoch } = await prepareInheritedShutdown("update");
+		markUpdateRestarting();
+		toolContinuationService.cancelEpoch = async () => {
+			throw new Error("Database temporarily locked");
+		};
+		await expect(
+			failPreparedUpdateAttempt({
+				updateEpoch: epoch,
+				targetVersion: "next",
+				error: "watchdog expired",
+			}),
+		).rejects.toThrow("Database temporarily locked");
+		expect(getUpdateCoordinationStatus().phase).toBe("restarting");
+		expect(await getUpdateStatus()).toMatchObject({
+			scheduled: true,
+			cleanupRetryPending: true,
+			error: expect.stringContaining("Database temporarily locked"),
+		});
+		const cancelledEpochs: string[] = [];
+		toolContinuationService.cancelEpoch = async (selectedEpoch) => {
+			cancelledEpochs.push(selectedEpoch);
+			return 0;
+		};
+		const gate = waitUntilUpdateGateOpens();
+		expect(cancelPreparedUpdate("retry cleanup").cancelled).toBe(true);
+		await gate;
+		expect(cancelledEpochs).toEqual([epoch]);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+	});
+	test("source validation failure remains retryable before cleanup can inspect descriptors", async () => {
+		let valid = true;
+		const { original, epoch } = await prepareInheritedShutdown("update", () => {
+			if (!valid) throw new Error("Source manifest changed");
+		});
+		markUpdateRestarting();
+		valid = false;
+		let cancellations = 0;
+		toolContinuationService.cancelEpoch = async () => {
+			cancellations++;
+			return 0;
+		};
+		await expect(
+			failPreparedUpdateAttempt({
+				updateEpoch: epoch,
+				targetVersion: "next",
+				error: "watchdog expired",
+			}),
+		).rejects.toThrow("Source manifest changed");
+		expect(cancellations).toBe(0);
+		expect(await getUpdateStatus()).toMatchObject({
+			scheduled: true,
+			cleanupRetryPending: true,
+			error: expect.stringContaining("Source manifest changed"),
+		});
+		valid = true;
+		const gate = waitUntilUpdateGateOpens();
+		expect(cancelPreparedUpdate("retry cleanup").cancelled).toBe(true);
+		await gate;
+		expect(cancellations).toBe(1);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+	});
 	test("cancels the attempt epoch before deleting recovery evidence and opening the gate", async () => {
 		const updateEpoch = scheduleWithManifest("2.0.0");
 		const events: string[] = [];
@@ -179,6 +386,60 @@ describe("update service failure cleanup", () => {
 		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
 	});
 
+	test("published automatic root becomes inert when continuation cancellation fails", async () => {
+		const scheduled = scheduleUpdate("3.0.0");
+		if (!scheduled.updateEpoch) throw new Error("Missing epoch");
+		await waitForScheduledRecoveryHandoff();
+		beginQuiescingTools();
+		writePreparedUpdateRecoverySnapshot(capturePlannedUpdateRecoverySnapshot(), {
+			handoffMarkerNonce: "failed-replacement-nonce",
+		});
+		markUpdateRestarting();
+		toolContinuationService.cancelEpoch = async () => {
+			throw new Error("database busy");
+		};
+		await failPreparedUpdateAttempt({
+			updateEpoch: scheduled.updateEpoch,
+			targetVersion: "3.0.0",
+			error: "watchdog expired",
+		});
+		expect(consumePlannedUpdateRecoverySnapshot()).toMatchObject({
+			updateEpoch: scheduled.updateEpoch,
+			evidenceOnly: true,
+		});
+		expect(consumePlannedUpdateRecoverySnapshot()?.resumeOnNextStartup).toBeUndefined();
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+		await expect(waitUntilUpdateGateOpens()).resolves.toBeUndefined();
+	});
+	test("no-source rollback failure registers a retryable cancellation instead of stranding restarting", async () => {
+		const epoch = scheduleUpdate("3.0.0").updateEpoch;
+		if (!epoch) throw new Error("Missing epoch");
+		await waitForScheduledRecoveryHandoff();
+		beginQuiescingTools();
+		const published = writePreparedUpdateRecoverySnapshot(capturePlannedUpdateRecoverySnapshot());
+		markUpdateRestarting();
+		const path = join(getUpdateDirectory(), "planned-update-recovery.json");
+		writeFileSync(path, JSON.stringify({ ...published, updateEpoch: "foreign-evidence" }));
+		toolContinuationService.cancelEpoch = async () => {
+			throw new Error("database busy");
+		};
+		await expect(
+			failPreparedUpdateAttempt({
+				updateEpoch: epoch,
+				targetVersion: "3.0.0",
+				error: "watchdog expired",
+			}),
+		).rejects.toThrow();
+		expect(await getUpdateStatus()).toMatchObject({ scheduled: true, cleanupRetryPending: true });
+		expect(consumePlannedUpdateRecoverySnapshot()?.updateEpoch).toBe("foreign-evidence");
+		writeFileSync(path, JSON.stringify(published, null, 2));
+		toolContinuationService.cancelEpoch = async () => 0;
+		const gate = waitUntilUpdateGateOpens();
+		expect(cancelPreparedUpdate("retry cleanup").cancelled).toBe(true);
+		await gate;
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+		expect((await getUpdateStatus()).cleanupRetryPending).toBe(false);
+	});
 	test("preserves the manifest but still reopens the gate when epoch cancellation fails", async () => {
 		const scheduled = scheduleUpdate("3.0.0");
 		if (!scheduled.updateEpoch) throw new Error("Expected scheduled update epoch");

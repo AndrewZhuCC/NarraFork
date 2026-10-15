@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { eq } from "drizzle-orm";
 import { testEnvironment } from "../../../tests/preload";
 import { cleanDb, getTestDb } from "../../../tests/setup";
@@ -11,6 +11,12 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { getNarraforkPath } from "../../lib/narrafork-home";
+import {
+	beginRecoveryDiscovery,
+	finishRecoveryDiscovery,
+	getRegisteredRecoverySource,
+	resetRecoveryHandoffForTests,
+} from "../recovery-handoff";
 
 // Keep all recovery classification, conditional result writes, and continuation claims real.
 // Only the boundaries that would launch a tool/model are replaced below.
@@ -86,6 +92,7 @@ async function seedTool(
 		toolName,
 		inputJson: {},
 		executionIdentityVersion: 1,
+		executionAttempt: 1,
 		status: "running",
 		createdAt: now,
 		...values,
@@ -132,6 +139,7 @@ async function tool(id: string) {
 beforeEach(async () => {
 	cleanDb(sqlite);
 	recovery.resetRestartRecoveryForTests();
+	resetRecoveryHandoffForTests();
 	coordinator.resetUpdateCoordinationForTests();
 	process.argv = originalArgs.filter((arg) => arg !== recovery.NO_AUTO_RESUME_FLAG);
 	resumed.length = 0;
@@ -228,6 +236,155 @@ describe("ordinary restart eligibility and tool disposition", () => {
 });
 
 describe("ordinary restart with real persisted recovery records", () => {
+	test("ordinary same-epoch external manifest edits reject a new handoff before changing the gate", async () => {
+		await seedNarrator("child");
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		if (!prepared.manifest) throw new Error("Missing ordinary manifest");
+		const foreign = {
+			...prepared.manifest,
+			targets: [{ narratorId: "child", logicalRunId: "foreign-run" }],
+		};
+		await writeFile(getNarraforkPath("restart-recovery.json"), JSON.stringify(foreign));
+		expect(() =>
+			coordinator.scheduleUpdate(undefined, "system_shutdown", {
+				supportedRecoveryManifestVersions: [1, 2, 3],
+			}),
+		).toThrow("manifest changed");
+		expect(coordinator.getUpdateCoordinationStatus().phase).toBe("idle");
+		expect(coordinator.getUpdateCoordinationStatus().updateEpoch).toBeUndefined();
+		expect(resumed).toEqual([]);
+		expect(JSON.parse(await readFile(getNarraforkPath("restart-recovery.json"), "utf8"))).toEqual(
+			foreign,
+		);
+	});
+
+	test("ordinary legitimate manual target shrink refreshes its identity for the next handoff", async () => {
+		process.argv.push(recovery.NO_AUTO_RESUME_FLAG);
+		await seedNarrator("chosen");
+		await seedNarrator("remaining");
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		await db.update(narrators).set({ status: "idle", substatus: JSON.stringify(["interrupted"]) });
+		const handle = await recovery.restoreOrdinaryRestartRecovery(prepared, {
+			manual: true,
+			includedNarratorIds: new Set(["chosen"]),
+		});
+		await handle?.completion;
+		const current = JSON.parse(await readFile(getNarraforkPath("restart-recovery.json"), "utf8"));
+		expect(current.targets.map((target: { narratorId: string }) => target.narratorId)).toEqual([
+			"remaining",
+		]);
+		coordinator.scheduleUpdate(undefined, "system_shutdown", {
+			supportedRecoveryManifestVersions: [1, 2, 3],
+		});
+		await coordinator.waitForScheduledRecoveryHandoff();
+		expect(coordinator.getScheduledRecoverySources()[0]?.pendingNarratorIds).toEqual(["remaining"]);
+		const epoch = coordinator.getUpdateCoordinationStatus().updateEpoch;
+		if (!epoch) throw new Error("Missing handoff epoch");
+		coordinator.cancelScheduledUpdate();
+		coordinator.rollbackPreparedUpdateRecoverySnapshot(epoch);
+		coordinator.releasePreparedUpdateRecoveryHandoff(epoch);
+	});
+
+	for (const background of [false, true]) {
+		test(`v3 reattached ${background ? "background" : "foreground"} Agent protects its child before ordinary classification`, async () => {
+			await seedAgent(background);
+			await toolContinuationService.upsert({
+				toolCallId: "agent-call",
+				narratorId: "parent",
+				updateEpoch: "old-source",
+				kind: "pending_permission",
+				state: "waiting",
+			});
+			await toolContinuationService.claim("agent-call", {
+				claimToken: "old-claim",
+				deadlineAt: new Date(Date.now() + 300_000).toISOString(),
+			});
+			coordinator.writePlannedUpdateRecoverySnapshot({
+				version: 3,
+				updateEpoch: "new-root",
+				capturedAt: now,
+				resumeOnNextStartup: true,
+				narrators: [],
+				sources: [
+					{
+						updateEpoch: "old-source",
+						kind: "planned",
+						capturedAt: now,
+						narrators: [
+							{ narratorId: "parent", locale: "en" },
+							{ narratorId: "child", locale: "en" },
+						],
+						pendingNarratorIds: ["parent", "child"],
+						unstartedTools: [{ toolCallId: "agent-call", executionAttempt: 1 }],
+					},
+				],
+			});
+			const { getPlannedUpdateStartupProtection } = await import("../update-recovery-service");
+			const startup = await getPlannedUpdateStartupProtection();
+			const record = await toolContinuationService.getByToolCallId("agent-call");
+			expect(record?.kind).toBe(background ? "background_agent" : "foreground_agent");
+			expect(record?.updateEpoch).toBe("old-source");
+			expect(record?.claimToken).toBeNull();
+			expect(startup.protection.narratorIds.has("child")).toBe(true);
+			if (background)
+				expect(startup.protection.backgroundTaskIds.has("background-child")).toBe(true);
+			const ordinary = await recovery.prepareOrdinaryRestartRecovery(startup.protection);
+			expect(ordinary.manifest).toBeNull();
+			expect(resumed).toEqual([]);
+			expect(executedTools).toBe(0);
+		});
+	}
+
+	test("v3 clears only an evidenced unstarted permission claim and consumes root authorization once", async () => {
+		await seedNarrator("child");
+		await seedTool("approval", "child", { status: "pending" });
+		await toolContinuationService.upsert({
+			toolCallId: "approval",
+			narratorId: "child",
+			updateEpoch: "old-source",
+			kind: "pending_permission",
+			state: "waiting",
+		});
+		await toolContinuationService.claim("approval", {
+			claimToken: "old-claim",
+			deadlineAt: new Date(Date.now() + 300_000).toISOString(),
+		});
+		coordinator.writePlannedUpdateRecoverySnapshot({
+			version: 3,
+			updateEpoch: "new-root",
+			capturedAt: now,
+			resumeOnNextStartup: true,
+			narrators: [],
+			sources: [
+				{
+					updateEpoch: "old-source",
+					kind: "ordinary",
+					capturedAt: now,
+					narrators: [{ narratorId: "child", locale: "en" }],
+					pendingNarratorIds: ["child"],
+					logicalRuns: [{ narratorId: "child", logicalRunId: "run-child" }],
+					unstartedTools: [{ toolCallId: "approval", executionAttempt: 1 }],
+				},
+			],
+		});
+		const { getPlannedUpdateStartupProtection } = await import("../update-recovery-service");
+		const startup = await getPlannedUpdateStartupProtection();
+		expect(startup.snapshot?.updateEpoch).toBe("new-root");
+		expect(await toolContinuationService.getByToolCallId("approval")).toMatchObject({
+			updateEpoch: "old-source",
+			state: "waiting",
+			claimToken: null,
+		});
+		await toolContinuationService.claim("approval", {
+			claimToken: "current-claim",
+			deadlineAt: new Date(Date.now() + 300_000).toISOString(),
+		});
+		expect((await getPlannedUpdateStartupProtection()).snapshot).toBeNull();
+		expect((await toolContinuationService.getByToolCallId("approval"))?.claimToken).toBe(
+			"current-claim",
+		);
+	});
+
 	test("active foreground child resumes its logical run and settles its parent exactly once", async () => {
 		await seedAgent();
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
@@ -267,6 +424,154 @@ describe("ordinary restart with real persisted recovery records", () => {
 		]);
 		expect((await tool("agent-call"))?.outputJson).toBe(backgroundStartOutput);
 		expect(executedTools).toBe(0);
+	});
+
+	test("an ordinary cold boot adopts only actual old planned Agent and approval executions", async () => {
+		await seedAgent();
+		await seedTool("approval", "child", { status: "pending", permissionStartedAt: now });
+		await seedTool("started-write", "child", { executionStartedAt: now });
+		await seedNarrator("independent");
+		for (const [toolCallId, narratorId, kind, payloadJson] of [
+			[
+				"agent-call",
+				"parent",
+				"foreground_agent",
+				{ subagentId: "child", logicalRunId: "run-child" },
+			],
+			["approval", "child", "pending_permission", {}],
+			["started-write", "child", "deferred_tool", {}],
+		] as const) {
+			await toolContinuationService.create({
+				toolCallId,
+				narratorId,
+				kind,
+				payloadJson,
+				updateEpoch: "old-planned",
+				state: "waiting",
+			});
+			await toolContinuationService.claim(toolCallId, {
+				claimToken: `dead-${toolCallId}`,
+				deadlineAt: "2099-01-01T00:00:00.000Z",
+			});
+		}
+		let finishApproval!: () => void;
+		const approval = new Promise<void>((resolve) => {
+			finishApproval = resolve;
+		});
+		let reportApprovalMounted!: () => void;
+		const approvalMounted = new Promise<void>((resolve) => {
+			reportApprovalMounted = resolve;
+		});
+		spyOn(session, "executePersistedToolCall").mockImplementation(async (input) => {
+			expect(input.toolCallId).toBe("approval");
+			executedTools++;
+			reportApprovalMounted();
+			await approval;
+			const call = await tool("approval");
+			if (!call) throw new Error("Missing approval");
+			await narratorPersistence.updateToolCallResultIfActive(
+				call.toolUseId,
+				{
+					status: "success",
+					output: "Approved",
+					completedAt: Date.now(),
+				},
+				call.messageId,
+				call.id,
+			);
+			return { ok: true, shouldContinue: true } as never;
+		});
+		beginRecoveryDiscovery();
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		finishRecoveryDiscovery();
+		expect(prepared.manifest?.snapshot.updateEpoch).toMatch(/^restart-/);
+		expect(getRegisteredRecoverySource("old-planned")).toBeUndefined();
+		for (const id of ["agent-call", "approval"]) {
+			expect((await toolContinuationService.getByToolCallId(id))?.updateEpoch).toBe(
+				prepared.manifest?.snapshot.updateEpoch,
+			);
+		}
+		expect((await tool("started-write"))?.errorMessage).toBe(recovery.RESTART_EXECUTION_UNKNOWN);
+		const mounted = await recovery.restoreOrdinaryRestartRecovery(prepared);
+		await approvalMounted;
+		expect(resumed.some((input) => input.subagentId === "independent")).toBe(true);
+		expect(executedTools).toBe(1);
+		finishApproval();
+		await mounted?.completion;
+		expect((await tool("approval"))?.status).toBe("success");
+		expect(
+			(await toolContinuationService.getByToolCallId("approval"))?.payloadJson?.recoveryStatus,
+		).not.toBe("failed");
+		expect(resumed.filter((input) => input.subagentId === "child")).toHaveLength(1);
+		expect(resumed.find((input) => input.subagentId === "child")?.resumeLogicalRunId).toBe(
+			"run-child",
+		);
+		expect(await db.select({ id: narrators.id }).from(narrators)).toHaveLength(3);
+	});
+
+	for (const state of ["cancelled", "owner_started"] as const) {
+		test(`old planned ${state} Agent cannot revive its stale active child during ordinary recovery`, async () => {
+			await seedAgent();
+			await seedNarrator("independent");
+			await toolContinuationService.create({
+				toolCallId: "agent-call",
+				narratorId: "parent",
+				updateEpoch: "old-planned",
+				kind: "foreground_agent",
+				state: state === "cancelled" ? "cancelled" : "completed",
+				payloadJson: {
+					subagentId: "child",
+					logicalRunId: "run-child",
+					...(state === "owner_started" ? { recoveryPhase: "owner_continuation_started" } : {}),
+				},
+			});
+			const previous = await toolContinuationService.getByToolCallId("agent-call");
+			beginRecoveryDiscovery();
+			const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+			finishRecoveryDiscovery();
+			await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
+			expect(resumed.map((input) => input.subagentId)).toEqual(["independent"]);
+			expect(await toolContinuationService.getByToolCallId("agent-call")).toEqual(previous);
+		});
+	}
+
+	test("a delivered old planned background Agent still recovers its running child without reviving the parent", async () => {
+		await seedAgent(true);
+		await toolContinuationService.create({
+			toolCallId: "agent-call",
+			narratorId: "parent",
+			updateEpoch: "old-planned",
+			kind: "background_agent",
+			state: "completed",
+			payloadJson: {
+				subagentId: "child",
+				logicalRunId: "run-child",
+				backgroundTaskId: "background-child",
+				recoveryPhase: "owner_continuation_started",
+			},
+		});
+		const original = await toolContinuationService.getByToolCallId("agent-call");
+		beginRecoveryDiscovery();
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		finishRecoveryDiscovery();
+		await (await recovery.restoreOrdinaryRestartRecovery(prepared))?.completion;
+		expect(resumed).toHaveLength(1);
+		expect(resumed[0]).toMatchObject({
+			subagentId: "child",
+			resumeLogicalRunId: "run-child",
+			preserveBackground: true,
+			skipConclusionDelivery: true,
+		});
+		expect(continued).toEqual([]);
+		expect(executedTools).toBe(0);
+		expect(await toolContinuationService.getByToolCallId("agent-call")).toEqual(original);
+		expect(
+			(
+				await db.query.backgroundTasks.findFirst({
+					where: eq(backgroundTasks.id, "background-child"),
+				})
+			)?.status,
+		).toBe("running");
 	});
 
 	test("a started side-effect tool gets an explicit unknown result without being executed", async () => {
@@ -487,6 +792,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		});
 		coordinator.resetUpdateCoordinationForTests();
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		process.argv = originalArgs.filter((arg) => arg !== recovery.NO_AUTO_RESUME_FLAG);
 		spyOn(session, "executePersistedToolCall").mockImplementation(async (input) => {
 			const call = await tool(input.toolCallId);
@@ -540,6 +846,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		]);
 		coordinator.resetUpdateCoordinationForTests();
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		await (await recovery.restoreOrdinaryRestartRecovery(cold))?.completion;
 		expect(resumed.map((input) => input.subagentId)).toEqual(["result-owner"]);
@@ -588,6 +895,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		).toEqual(["mixed-owner", "paused-owner", "streaming-only"]);
 		coordinator.resetUpdateCoordinationForTests();
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(cold.manifest?.targets.map((target) => target.narratorId).sort()).toEqual([
 			"mixed-owner",
@@ -633,6 +941,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		expect(signal.targets).toEqual([]);
 		coordinator.resetUpdateCoordinationForTests();
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		const cold = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(cold.manifest).toBeNull();
 		expect(resumed).toEqual([]);
@@ -736,6 +1045,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 			.set({ status: "idle", substatus: "[]" })
 			.where(eq(narrators.id, "result-owner"));
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		const second = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(second.manifest?.snapshot.updateEpoch).toBe(epoch);
 		expect(second.manifest?.targets.map((target) => target.narratorId)).toEqual(["result-owner"]);
@@ -812,6 +1122,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 			.set({ status: "idle", substatus: "[]" })
 			.where(eq(narrators.id, "result-owner"));
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		const second = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(second.manifest?.snapshot.updateEpoch).toBe(first.manifest?.snapshot.updateEpoch);
 		await (await recovery.restoreOrdinaryRestartRecovery(second))?.completion;
@@ -837,6 +1148,7 @@ describe("ordinary restart with real persisted recovery records", () => {
 		const completedAt = (await tool("started"))?.completedAt;
 		await db.update(narrators).set({ status: "idle", substatus: JSON.stringify(["interrupted"]) });
 		recovery.resetRestartRecoveryForTests();
+		resetRecoveryHandoffForTests();
 		const second = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(second.manifest?.snapshot.updateEpoch).toBe(first.manifest?.snapshot.updateEpoch);
 		expect((await toolContinuationService.getByToolCallId("approval"))?.id).toBe(approvalId);

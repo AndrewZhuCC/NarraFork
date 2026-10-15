@@ -6,6 +6,7 @@ import {
 	type HelperDistributionDependencies,
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
+import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 import {
 	type BinaryMetadata,
 	type ComputeMetadataInput,
@@ -158,6 +159,11 @@ export async function computeCiBinaryMetadata(
 			: {
 					helperDistribution: parseHelperDistributionDependencies(input.helperDistribution),
 				}),
+		...(input.recoveryManifestVersions === undefined
+			? {}
+			: {
+					recoveryManifestVersions: parseRecoveryManifestVersions(input.recoveryManifestVersions),
+				}),
 		buildDate: input.buildDate,
 		size,
 		sha256: sha256.digest("hex"),
@@ -175,6 +181,7 @@ export function validateCiMetadata(
 		commit: string;
 		repository: string;
 		helperDistribution?: HelperDistributionDependencies;
+		recoveryManifestVersions?: readonly number[];
 	},
 ): asserts metadata is BinaryMetadata {
 	if (
@@ -196,6 +203,14 @@ export function validateCiMetadata(
 	) {
 		throw new Error(`Invalid or missing Release CI metadata: ${expected.name}`);
 	}
+	const recoveryManifestVersions = parseRecoveryManifestVersions(metadata.recoveryManifestVersions);
+	if (
+		expected.recoveryManifestVersions !== undefined &&
+		(metadata.recoveryManifestVersions === undefined ||
+			JSON.stringify(recoveryManifestVersions) !==
+				JSON.stringify(parseRecoveryManifestVersions(expected.recoveryManifestVersions)))
+	)
+		throw new Error(`Release recovery manifest capabilities mismatch: ${expected.name}`);
 	const dependencies =
 		metadata.helperDistribution === undefined
 			? undefined
@@ -218,6 +233,7 @@ export async function verifyCiSidecar(
 		commit: string;
 		repository: string;
 		helperDistribution?: HelperDistributionDependencies;
+		recoveryManifestVersions?: readonly number[];
 	},
 ): Promise<BinaryMetadata> {
 	const sidecar = `${path}.metadata.json`;

@@ -145,10 +145,39 @@ describe("verified prepared update identity", () => {
 			sha512: info.sha512,
 			sizeBytes: payload.length,
 			sourceIdentity: source,
+			recoveryManifestVersions: [1, 2],
 		});
 		expect(await preparedIdentity()).toEqual(identity);
 	});
 
+	test("recovery protocol capability is bound to the prepared selector, not current settings", async () => {
+		const info = writePrepared();
+		const legacy = await preparedIdentity();
+		expect(legacy.recoveryManifestVersions).toEqual([1, 2]);
+		writeFileSync(metadataPath, JSON.stringify({ ...info, recoveryManifestVersions: [3, 1, 2] }));
+		const capable = await preparedIdentity();
+		expect(capable.recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(capable.sha512).toBe(legacy.sha512);
+		expect(capable.id).not.toBe(legacy.id);
+		expect(await applyUpdate({ preparedId: legacy.id })).toMatchObject({
+			success: false,
+			code: "PREPARED_UPDATE_CHANGED",
+		});
+		writeFileSync(metadataPath, JSON.stringify({ ...info, recoveryManifestVersions: [1, 2, 3] }));
+		expect(await preparedIdentity()).toEqual(capable);
+	});
+
+	test.each(
+		[null, [], [3, 3], ["3"], [0], [1.5]].map((capabilities) => ({ capabilities })),
+	)("invalid persisted recovery capabilities are not accepted: %j", async ({ capabilities }) => {
+		const info = writePrepared();
+		writeFileSync(
+			metadataPath,
+			JSON.stringify({ ...info, recoveryManifestVersions: capabilities }),
+		);
+		expect((await getUpdateStatus(version)).ready).toBe(false);
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+	});
 	test("same version with different bytes produces a different selector", async () => {
 		writePrepared();
 		const before = await preparedIdentity();

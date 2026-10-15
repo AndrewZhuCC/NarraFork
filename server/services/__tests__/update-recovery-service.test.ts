@@ -9,6 +9,13 @@ import {
 } from "../../db/schema";
 import { NotFoundError } from "../../lib/errors";
 import { runtimePublication } from "../agent-runtime/publication";
+import {
+	invalidateRecoveryTarget,
+	releaseRecoveryHandoff,
+	reserveRecoveryHandoff,
+	resetRecoveryHandoffForTests,
+	waitForRecoveryHandoffReady,
+} from "../recovery-handoff";
 
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 const realNarratorPersistenceModule = { ...(await import("../narrator-persistence")) };
@@ -29,7 +36,7 @@ function actAsReplacementProcess(markerNonce: string | undefined = HANDOFF_NONCE
 }
 
 let loadMode: "missing" | "transient" | "idle" | "working" | "archived" = "transient";
-let requestedProtectionEpoch: string | null = null;
+let requestedProtectionEpoch: import("../tool-continuation-service").EpochScope | null = null;
 let renewCalls = 0;
 let renewClaimSucceeds = true;
 let executePersistedCalls = 0;
@@ -51,6 +58,7 @@ let executePersistedToolCallImpl: (input?: {
 });
 const resumedAgentCalls: Array<Record<string, unknown>> = [];
 const awaitAgentCalls: Array<Record<string, unknown>> = [];
+let onAwaitMounted: (() => void) | null = null;
 const updatedToolResults: Array<{ args: unknown[] }> = [];
 let expectedPendingReplyProbe: {
 	requesterId: string;
@@ -177,14 +185,16 @@ mock.module("../tool-continuation-service", () => ({
 		},
 		bindRecoveryTokenForNarrator: async (
 			narratorId: string,
-			updateEpoch: string,
+			updateEpoch: import("../tool-continuation-service").EpochScope,
 			recoveryToken: string,
 		) => {
 			const updated = continuationRows
 				.filter(
 					(row) =>
 						row.narratorId === narratorId &&
-						row.updateEpoch === updateEpoch &&
+						(typeof updateEpoch === "string"
+							? row.updateEpoch === updateEpoch
+							: updateEpoch.includes(row.updateEpoch)) &&
 						row.state !== "cancelled" &&
 						row.payloadJson?.recoveryPhase !== "owner_continuation_started",
 				)
@@ -281,7 +291,7 @@ mock.module("../tool-continuation-service", () => ({
 		markOwnerContinuationStartedForNarrator: async () => true,
 		cancelInterruptibleForNarrator: async (
 			narratorId: string,
-			updateEpoch: string,
+			updateEpoch: import("../tool-continuation-service").EpochScope,
 			input:
 				| string
 				| {
@@ -301,7 +311,9 @@ mock.module("../tool-continuation-service", () => ({
 				.filter(
 					(row) =>
 						row.narratorId === narratorId &&
-						row.updateEpoch === updateEpoch &&
+						(typeof updateEpoch === "string"
+							? row.updateEpoch === updateEpoch
+							: updateEpoch.includes(row.updateEpoch)) &&
 						(includeBackgroundAgentOwner || row.kind !== "background_agent") &&
 						(!recoveryToken || row.payloadJson?.recoveryToken === recoveryToken) &&
 						row.state !== "cancelled" &&
@@ -379,6 +391,7 @@ mock.module("../agent-communication", () => ({
 	...realAgentCommunicationModule,
 	awaitAgentResultDetailed: async (input: Record<string, unknown>) => {
 		awaitAgentCalls.push(input);
+		onAwaitMounted?.();
 		return awaitAgentResult;
 	},
 }));
@@ -402,6 +415,7 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+	resetRecoveryHandoffForTests();
 	loadMode = "transient";
 	requestedProtectionEpoch = null;
 	renewCalls = 0;
@@ -420,6 +434,7 @@ afterEach(() => {
 	executePersistedToolCallImpl = async () => ({ ok: true, shouldContinue: true });
 	resumedAgentCalls.length = 0;
 	awaitAgentCalls.length = 0;
+	onAwaitMounted = null;
 	updatedToolResults.length = 0;
 	expectedPendingReplyProbe = null;
 	replyWaiterPresenceAtAgentResume.length = 0;
@@ -496,7 +511,10 @@ function recoveryItem(
 	};
 }
 
-async function prepareRecovery() {
+async function prepareRecovery(
+	targets: { narratorId: string; locale: string }[] = [],
+	sources: import("../recovery-handoff").RecoverySource[] = [],
+) {
 	// These are current-protocol scheduling fixtures, not fabricated legacy proofs.
 	// Persist their original run/slot and exact origin before simulating replacement.
 	for (const item of recoveryQueue) {
@@ -576,7 +594,8 @@ async function prepareRecovery() {
 		targetVersion: "4.0.0",
 		capturedAt: new Date().toISOString(),
 		handoffMarkerNonce: HANDOFF_NONCE,
-		narrators: [],
+		narrators: targets,
+		...(sources.length ? { sources } : {}),
 	});
 	actAsReplacementProcess();
 	return getPlannedUpdateStartupProtection();
@@ -611,6 +630,282 @@ function sendAwaitSnapshot(input: {
 }
 
 describe("planned update recovery snapshot", () => {
+	for (const kind of ["foreground_agent", "await_agent", "pending_permission"] as const) {
+		test(`independent legacy narrator starts while ${kind} is unfinished`, async () => {
+			loadMode = "idle";
+			const gate = Promise.withResolvers<void>();
+			const record = continuationRecord(`long-${kind}`, "owner", {
+				kind,
+				payloadJson: { subagentId: "child", targetId: "child" },
+			});
+			continuationRows = [record];
+			recoveryQueue = [recoveryItem(record, "message", 0)];
+			resumedAgentCompletion = gate.promise.then(() => "done");
+			awaitAgentResult = gate.promise.then(() => ({
+				id: "child",
+				status: "completed",
+				formatted: "done",
+			}));
+			executePersistedToolCallImpl = async () => {
+				await gate.promise;
+				return { ok: true, shouldContinue: true };
+			};
+			loadMode = "working";
+			const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+			loadMode = "idle";
+			if (kind === "await_agent") {
+				const now = new Date().toISOString();
+				db.insert(narrators)
+					.values({
+						id: "owner",
+						type: "primary",
+						variant: "primary",
+						createdAt: now,
+						updatedAt: now,
+					})
+					.run();
+				db.insert(narratorMessages)
+					.values({
+						id: "message",
+						narratorId: "owner",
+						role: "assistant",
+						contentJson: [],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorToolCalls)
+					.values({
+						id: record.toolCallId,
+						narratorId: "owner",
+						messageId: "message",
+						toolUseId: record.toolCallId,
+						toolName: "Await",
+						inputJson: {},
+						status: "running",
+						createdAt: now,
+					})
+					.run();
+			}
+			const mounting = restoreNarratorsAfterPlannedUpdate(startup);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			try {
+				expect(continueNarratorCalls).toBe(1);
+			} finally {
+				gate.resolve();
+				const recovery = await mounting;
+				await recovery?.completion;
+			}
+		});
+	}
+
+	test("a failed queue mount does not skip independent legacy recovery", async () => {
+		loadMode = "idle";
+		const record = continuationRecord("bad-send", "owner", { kind: "send_await" });
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "message", 0)];
+		loadMode = "working";
+		const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+		loadMode = "idle";
+		await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(continueNarratorCalls).toBe(1);
+	});
+	test("a sibling mount failure keeps a live owner's interrupt controller until it finishes", async () => {
+		loadMode = "idle";
+		const gate = Promise.withResolvers<void>();
+		const live = continuationRecord("live-permission", "live", { kind: "pending_permission" });
+		const failed = continuationRecord("bad-agent", "failed", { kind: "foreground_agent" });
+		continuationRows = [live, failed];
+		recoveryQueue = [
+			recoveryItem(live, "live-message", 0),
+			recoveryItem(failed, "failed-message", 0),
+		];
+		executePersistedToolCallImpl = async () => {
+			await gate.promise;
+			return { ok: true, shouldContinue: true };
+		};
+		const startup = await prepareRecovery();
+		await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow("missing subagentId");
+		expect(executePersistedCalls).toBe(1);
+		expect(realNarratorSessionModule.interruptNarrator("live")).toBe(true);
+		gate.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(continuationRows.find((row) => row.toolCallId === live.toolCallId)?.state).toBe(
+			"cancelled",
+		);
+	});
+
+	test("a pending legacy cancellation during a handoff reservation cannot revive on release", async () => {
+		loadMode = "working";
+		const startup = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+		loadMode = "idle";
+		const ticket = reserveRecoveryHandoff();
+		await waitForRecoveryHandoffReady(ticket);
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(continueNarratorCalls).toBe(0);
+		invalidateRecoveryTarget("legacy");
+		releaseRecoveryHandoff(ticket);
+		await handle?.completion;
+		expect(continueNarratorCalls).toBe(0);
+	});
+
+	test("handoff does not wait for approval and pauses the old completion until cancellation", async () => {
+		loadMode = "idle";
+		const gate = Promise.withResolvers<void>();
+		const record = continuationRecord("long-permission", "owner", { kind: "pending_permission" });
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "message", 0)];
+		executePersistedToolCallImpl = async () => {
+			await gate.promise;
+			return { ok: true, shouldContinue: true };
+		};
+		const startup = await prepareRecovery();
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		updateCoordinator.scheduleUpdate(undefined, "system_shutdown", {
+			supportedRecoveryManifestVersions: [1, 2, 3],
+		});
+		await updateCoordinator.waitForScheduledRecoveryHandoff();
+		const next = updateCoordinator.writePreparedUpdateRecoverySnapshot();
+		expect(next.sources?.map((source) => source.updateEpoch)).toEqual(["epoch"]);
+		gate.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(continueNarratorCalls).toBe(0);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()?.updateEpoch).toBe(
+			next.updateEpoch,
+		);
+		updateCoordinator.cancelScheduledUpdate();
+		updateCoordinator.rollbackPreparedUpdateRecoverySnapshot(next.updateEpoch);
+		updateCoordinator.releasePreparedUpdateRecoveryHandoff(next.updateEpoch);
+		await handle?.completion;
+		expect(continueNarratorCalls).toBe(1);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+	});
+
+	for (const kind of ["planned", "ordinary"] as const) {
+		test(`current root legacy target outranks completed same-ID ${kind} source target`, async () => {
+			loadMode = "working";
+			const startup = await prepareRecovery(
+				[{ narratorId: "legacy", locale: "en" }],
+				[
+					{
+						updateEpoch: "old-source",
+						kind,
+						capturedAt: "2026-10-01T00:00:00.000Z",
+						narrators: [{ narratorId: "legacy", locale: "en" }],
+						pendingNarratorIds: [],
+					},
+				],
+			);
+			loadMode = "idle";
+			const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+			await handle?.completion;
+			expect(continueNarratorCalls).toBe(1);
+		});
+	}
+
+	test("v3 installs inherited Send waiters before a legacy responder can start", async () => {
+		loadMode = "working";
+		const snapshot = sendAwaitSnapshot({ toolUseId: "inherited-send", responders: ["legacy"] });
+		const record = continuationRecord("inherited-send-call", "owner", {
+			updateEpoch: "old-source",
+			kind: "send_await",
+			state: "waiting",
+			payloadJson: { sendAwait: snapshot },
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "send-message", 0)];
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: snapshot.toolUseId,
+			messageId: "send-message",
+			status: "running",
+			outputJson: null,
+		});
+		const startup = await prepareRecovery(
+			[{ narratorId: "legacy", locale: "en" }],
+			[
+				{
+					updateEpoch: "old-source",
+					kind: "planned",
+					capturedAt: "2026-10-01T00:00:00.000Z",
+					narrators: [],
+					pendingNarratorIds: [],
+				},
+			],
+		);
+		loadMode = "idle";
+		let responded = false;
+		continueNarratorImpl = async () => {
+			if (!responded) {
+				responded = true;
+				expect(
+					realAgentReplyWaiterModule.hasPendingAgentReply(
+						"owner",
+						"legacy",
+						snapshot.waiters[0].scope,
+					),
+				).toBe(true);
+				expect(
+					realAgentReplyWaiterModule.resolvePendingAgentReply({
+						fromNarratorId: "legacy",
+						toNarratorId: "owner",
+						scope: snapshot.waiters[0].scope,
+						replyTo: snapshot.waiters[0].requestId,
+						message: "restored response",
+					}),
+				).toMatchObject({ matched: true });
+			}
+			return { ok: true };
+		};
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		await handle?.completion;
+		expect(responded).toBe(true);
+		expect(continueNarratorCalls).toBe(2);
+	});
+
+	test("v3 combines root and source tools into one ordered message and one owner delivery", async () => {
+		loadMode = "idle";
+		const first = continuationRecord("root-write", "owner");
+		const second = continuationRecord("source-write", "owner", { updateEpoch: "old-source" });
+		continuationRows = [first, second];
+		recoveryQueue = [
+			recoveryItem(first, "same-message", 0),
+			recoveryItem(second, "same-message", 1),
+		];
+		const gate = Promise.withResolvers<void>();
+		const started: string[] = [];
+		executePersistedToolCallImpl = async (input) => {
+			started.push(input?.toolCallId ?? "missing");
+			if (input?.toolCallId === first.toolCallId) await gate.promise;
+			return { ok: true, shouldContinue: true };
+		};
+		const startup = await prepareRecovery(
+			[],
+			[
+				{
+					updateEpoch: "old-source",
+					kind: "planned",
+					capturedAt: "2026-10-01T00:00:00.000Z",
+					narrators: [{ narratorId: "owner", locale: "en" }],
+					pendingNarratorIds: ["owner"],
+				},
+			],
+		);
+		startup.protection = { ...startup.protection, narratorIds: new Set(["owner"]) };
+		expect(requestedProtectionEpoch).toEqual(["epoch", "old-source"]);
+		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
+		expect(started).toEqual(["root-write"]);
+		expect(continueNarratorCalls).toBe(0);
+		gate.resolve();
+		await handle?.completion;
+		expect(started).toEqual(["root-write", "source-write"]);
+		expect(continueNarratorCalls).toBe(1);
+		expect(ownerStartedCalls).toBe(1);
+		expect(continuationRows.map((row) => row.updateEpoch)).toEqual(["epoch", "old-source"]);
+		expect(new Set(continuationRows.map((row) => row.payloadJson?.recoveryToken)).size).toBe(1);
+	});
+
 	test("manual startup claims prepared work once and resumes through existing recovery", async () => {
 		loadMode = "working";
 		setObservedRestartHandoffForTests(null);
@@ -705,7 +1000,8 @@ describe("planned update recovery snapshot", () => {
 			narrators: [{ narratorId: "n1", locale: "en" }],
 		});
 
-		// The next startup is not this update's replacement, so the leftover cannot resume anything.
+		// The next process is not this update's replacement, so the leftover cannot resume anything.
+		resetRecoveryHandoffForTests();
 		setObservedRestartHandoffForTests(null);
 		continueNarratorCalls = 0;
 		const nextStartup = await getPlannedUpdateStartupProtection();
@@ -1022,8 +1318,13 @@ describe("planned update continuation scheduling", () => {
 		await Bun.sleep(0);
 		expect(executePersistedCalls).toBe(1);
 		expect(awaitStarted).toBe(false);
-		releaseAgent();
+		// Readiness and another close attempt do not wait for human approval or Agent completion.
 		const recovery = await restoring;
+		const ticket = reserveRecoveryHandoff();
+		await waitForRecoveryHandoffReady(ticket);
+		expect(awaitStarted).toBe(false);
+		releaseRecoveryHandoff(ticket);
+		releaseAgent();
 		await recovery?.completion;
 		expect(awaitStarted).toBe(true);
 	});
@@ -1066,8 +1367,13 @@ describe("planned update continuation scheduling", () => {
 		await Bun.sleep(0);
 		expect(executePersistedCalls).toBe(1);
 		expect(awaitStarted).toBe(false);
-		releaseAgent();
+		// Readiness and another close attempt do not wait for human approval or Agent completion.
 		const recovery = await restoring;
+		const ticket = reserveRecoveryHandoff();
+		await waitForRecoveryHandoffReady(ticket);
+		expect(awaitStarted).toBe(false);
+		releaseRecoveryHandoff(ticket);
+		releaseAgent();
 		await recovery?.completion;
 		expect(awaitStarted).toBe(true);
 	});
@@ -1284,6 +1590,8 @@ describe("planned update continuation scheduling", () => {
 
 	test("parent interrupt reaches recovered foreground Agent and Await", async () => {
 		loadMode = "idle";
+		const awaitMounted = Promise.withResolvers<void>();
+		onAwaitMounted = awaitMounted.resolve;
 		let finishAgent = (_value: string) => {};
 		resumedAgentCompletion = new Promise<string>((resolve) => {
 			finishAgent = resolve;
@@ -1313,19 +1621,23 @@ describe("planned update continuation scheduling", () => {
 		const prepared = await prepareRecovery();
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		expect(resumedAgentCalls).toHaveLength(1);
-		expect(awaitAgentCalls).toHaveLength(1);
-		const agentSignal = resumedAgentCalls[0]?.signal as AbortSignal;
-		const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
-		expect(agentSignal.aborted).toBe(false);
-		expect(awaitSignal.aborted).toBe(false);
-
-		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
-		expect(agentSignal.aborted).toBe(true);
-		expect(awaitSignal.aborted).toBe(true);
-		finishAgent("<subagent_id>child-interrupt</subagent_id>\n\ninterrupted");
-		finishAwait({ id: "child-interrupt", status: "aborted", formatted: "interrupted" });
-		await recovery?.completion;
+		try {
+			expect(resumedAgentCalls).toHaveLength(1);
+			await awaitMounted.promise;
+			expect(awaitAgentCalls).toHaveLength(1);
+			const agentSignal = resumedAgentCalls[0]?.signal as AbortSignal;
+			const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
+			expect(agentSignal.aborted).toBe(false);
+			expect(awaitSignal.aborted).toBe(false);
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			expect(agentSignal.aborted).toBe(true);
+			expect(awaitSignal.aborted).toBe(true);
+		} finally {
+			realNarratorSessionModule.interruptNarrator("owner");
+			finishAgent("<subagent_id>child-interrupt</subagent_id>\n\ninterrupted");
+			finishAwait({ id: "child-interrupt", status: "aborted", formatted: "interrupted" });
+			await recovery?.completion;
+		}
 		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
 		expect(continueNarratorCalls).toBe(0);
 	});
@@ -1408,6 +1720,8 @@ describe("planned update continuation scheduling", () => {
 
 	test("parent interrupt resolves mixed background delivery without failing recovery", async () => {
 		loadMode = "idle";
+		const awaitMounted = Promise.withResolvers<void>();
+		onAwaitMounted = awaitMounted.resolve;
 		let finishBackground = (_value: string) => {};
 		let backgroundSettled = false;
 		resumedAgentCompletion = new Promise<string>((resolve) => {
@@ -1477,28 +1791,37 @@ describe("planned update continuation scheduling", () => {
 		const prepared = await prepareRecovery();
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		await resultWriteReached;
-		expect(resumedAgentCalls).toHaveLength(1);
-		expect(awaitAgentCalls).toHaveLength(1);
-		const backgroundSignal = resumedAgentCalls[0]?.signal as AbortSignal;
-		const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
-		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
-		await cancellationStart;
-		expect(backgroundSignal.aborted).toBe(false);
-		expect(awaitSignal.aborted).toBe(true);
-		releaseCancellation();
-		await Bun.sleep(0);
-		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
-		finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
-		releaseResultWrite();
-		await recovery?.completion;
+		try {
+			await resultWriteReached;
+			expect(resumedAgentCalls).toHaveLength(1);
+			await awaitMounted.promise;
+			expect(awaitAgentCalls).toHaveLength(1);
+			const backgroundSignal = resumedAgentCalls[0]?.signal as AbortSignal;
+			const awaitSignal = awaitAgentCalls[0]?.signal as AbortSignal;
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			await cancellationStart;
+			expect(backgroundSignal.aborted).toBe(false);
+			expect(awaitSignal.aborted).toBe(true);
+			releaseCancellation();
+			await Bun.sleep(0);
+			expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
+			finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
+			releaseResultWrite();
+			await recovery?.completion;
 
-		expect(backgroundSignal.aborted).toBe(false);
-		expect(backgroundSettled).toBe(false);
-		expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
-		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
-		finishBackground("<subagent_id>background-mixed-child</subagent_id>\n\ndone");
-		await resumedAgentCompletion;
+			expect(backgroundSignal.aborted).toBe(false);
+			expect(backgroundSettled).toBe(false);
+			expect(continuationRows.every((row) => row.state === "cancelled")).toBe(true);
+			expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+		} finally {
+			realNarratorSessionModule.interruptNarrator("owner");
+			releaseCancellation();
+			finishAwait({ id: "foreground-mixed-child", status: "aborted", formatted: "interrupted" });
+			releaseResultWrite();
+			finishBackground("<subagent_id>background-mixed-child</subagent_id>\n\ndone");
+			await recovery?.completion;
+			await resumedAgentCompletion;
+		}
 	});
 
 	test("recovered Await output matches the uninterrupted tool result shape", () => {
@@ -1738,6 +2061,7 @@ describe("planned update continuation scheduling", () => {
 			scope: snapshot.waiters[0].scope,
 		};
 		const sendRecord = continuationRecord("tool-send-priority", "owner", {
+			updateEpoch: "old-source",
 			kind: "send_await",
 			state: "waiting",
 			payloadJson: { sendAwait: snapshot },
@@ -1759,7 +2083,18 @@ describe("planned update continuation scheduling", () => {
 			recoveryItem(agentRecord, "message-agent-priority", 0),
 			recoveryItem(sendRecord, "message-send-priority", 0),
 		];
-		const prepared = await prepareRecovery();
+		const prepared = await prepareRecovery(
+			[],
+			[
+				{
+					updateEpoch: "old-source",
+					kind: "planned",
+					capturedAt: "2026-10-01T00:00:00.000Z",
+					narrators: [],
+					pendingNarratorIds: [],
+				},
+			],
+		);
 
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 		expect(replyWaiterPresenceAtAgentResume).toEqual([true]);

@@ -1,6 +1,7 @@
 import {
 	beginToolStartAdmission,
 	convertToolStartGrantToExecution,
+	getUpdateCoordinationStatus,
 	inertUpdateExecutionLease,
 	type UpdateCheckpointActivityLease,
 	type UpdateExecutionKind,
@@ -85,6 +86,8 @@ export interface ToolAdmissionState {
 		toolCallId: string;
 		updateEpoch: string;
 		payloadJson: Record<string, unknown>;
+		/** The existing recovery owner alone may finish this carried execution. */
+		carryover?: boolean;
 	};
 }
 
@@ -440,6 +443,7 @@ async function upsertDeferredTool(
 			toolUseId: tu.toolUseId,
 			toolName: tu.name,
 			executionKind: kind,
+			executionAttempt: binding.attempt,
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
 			...(tu.name === "Await" && typeof tu.input.type === "string"
@@ -451,16 +455,46 @@ async function upsertDeferredTool(
 					}
 				: {}),
 		};
+		const obsoleteGate = () => {
+			const current = getUpdateCoordinationStatus();
+			return (
+				current.cancelRequested || current.phase === "idle" || current.updateEpoch !== updateEpoch
+			);
+		};
 		const { toolContinuationService } = await import("@server/services/tool-continuation-service");
-		await toolContinuationService.upsert({
+		if (obsoleteGate()) return;
+		let continuation: Awaited<ReturnType<typeof toolContinuationService.checkpoint>>;
+		try {
+			continuation = await toolContinuationService.checkpoint({
+				toolCallId: toolCall.id,
+				narratorId: config.narratorId,
+				updateEpoch,
+				kind: "deferred_tool",
+				state: "paused",
+				payloadJson,
+			});
+		} catch (error) {
+			// Cancellation may release the ticket while checkpoint's bounded DB reads yield.
+			// Only an obsolete gate permits dropping this write; an active foreign owner is fatal.
+			if (obsoleteGate()) return;
+			throw error;
+		}
+		if (obsoleteGate()) {
+			// Close a late *new-root* write after the cancelling owner's cleanup already ran.
+			// This CAS never cancels carryover or a claimed/result-bearing execution.
+			if (continuation.updateEpoch === updateEpoch)
+				await toolContinuationService.cancelUnclaimedCheckpoint(toolCall.id, updateEpoch);
+			return;
+		}
+		state.deferred = {
 			toolCallId: toolCall.id,
-			narratorId: config.narratorId,
-			updateEpoch,
-			kind: "deferred_tool",
-			state: "paused",
-			payloadJson,
-		});
-		state.deferred = { toolCallId: toolCall.id, updateEpoch, payloadJson };
+			updateEpoch: continuation.updateEpoch,
+			payloadJson: continuation.payloadJson ?? payloadJson,
+			carryover:
+				continuation.updateEpoch !== updateEpoch ||
+				continuation.state === "resuming" ||
+				continuation.kind !== "deferred_tool",
+		};
 	} finally {
 		activity.release();
 	}
@@ -618,14 +652,15 @@ async function acquireFinalToolExecution(
 			const { toolContinuationService } = await import(
 				"@server/services/tool-continuation-service"
 			);
-			await toolContinuationService.upsert({
-				toolCallId: deferred.toolCallId,
-				narratorId: config.narratorId,
-				updateEpoch: deferred.updateEpoch,
-				kind: "deferred_tool",
-				state: "completed",
-				payloadJson: deferred.payloadJson,
-			});
+			if (!deferred.carryover)
+				await toolContinuationService.checkpoint({
+					toolCallId: deferred.toolCallId,
+					narratorId: config.narratorId,
+					updateEpoch: deferred.updateEpoch,
+					kind: "deferred_tool",
+					state: "completed",
+					payloadJson: deferred.payloadJson,
+				});
 			state.deferred = undefined;
 		}
 		return { lease, resumed };
