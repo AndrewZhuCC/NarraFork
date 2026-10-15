@@ -7,9 +7,11 @@ import type { GeminiProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -170,6 +172,30 @@ export class GeminiProvider implements ProviderAdapter {
 		return (this.config.baseUrl || DEFAULT_GEMINI_BASE).replace(/\/+$/, "");
 	}
 
+	private headers(apiKey: string, conversationId?: string, stream = false): Record<string, string> {
+		const fingerprint = resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			conversationId,
+		});
+		const headers = new Headers({
+			"Content-Type": "application/json",
+			"x-goog-api-key": apiKey,
+			"User-Agent": fingerprint.userAgent,
+			...(stream ? { Accept: "text/event-stream" } : {}),
+			...buildOpencodeSessionHeader({
+				baseUrl: this.baseUrl(),
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		});
+		// HTTP names are case-insensitive; extra headers replace, never comma-join defaults.
+		for (const [name, value] of Object.entries(fingerprint.headers)) headers.set(name, value);
+		return Object.fromEntries(headers.entries());
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (tools.length === 0) return [];
 		const functionDeclarations: GeminiFunctionDeclaration[] = tools.map((tool) => {
@@ -281,10 +307,7 @@ export class GeminiProvider implements ProviderAdapter {
 
 		assertModelInputModalities(params.model, body, metadata);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-		const headers: Record<string, string> = {
-			"Content-Type": "application/json",
-			"x-goog-api-key": apiKey,
-		};
+		const headers = this.headers(apiKey, params.conversationId);
 
 		logger.debug("Gemini chat request", {
 			model,
@@ -567,11 +590,7 @@ export class GeminiProvider implements ProviderAdapter {
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const response = await this.pfetch(url, {
 			method: "POST",
-			headers: {
-				Accept: "text/event-stream",
-				"Content-Type": "application/json",
-				"x-goog-api-key": apiKey,
-			},
+			headers: this.headers(apiKey, undefined, true),
 			body: bodyText,
 			signal: opts.signal,
 		});
@@ -1029,7 +1048,8 @@ async function readResponseTextWithLimit(response: Response, limit: number): Pro
  * Recursively sanitize a JSON Schema for Gemini's function-declaration format.
  * Gemini's Schema type is a strict OpenAPI subset — it rejects `additionalProperties`,
  * `$schema`, `const`, `$ref`, and a few other keywords. This drops the unsupported
- * keys and rewrites `const` to a single-value `enum`.
+ * keys and rewrites string `const` to a single-value `enum`. Non-string enum
+ * constraints are dropped while preserving the schema's type.
  */
 export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
 	return sanitizeNode(schema) as Record<string, unknown>;
@@ -1084,8 +1104,11 @@ function sanitizeNode(node: unknown): unknown {
 	for (const [key, value] of Object.entries(input)) {
 		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
 		if (key === "const") {
-			// Rewrite const → single-value enum, which Gemini supports.
-			out.enum = [value];
+			// Gemini's enum field accepts strings only; retain the type for other literals.
+			if (typeof value === "string") out.enum = [value];
+			continue;
+		}
+		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
 			continue;
 		}
 		if (key === "properties" && value && typeof value === "object") {

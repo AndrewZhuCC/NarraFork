@@ -3,6 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
+import {
+	customApiProviderToGemini,
+	geminiProviderToCustomApi,
+} from "../../settings/custom-api-providers";
+import type { CustomApiProviderConfig } from "../../settings/types";
 import type { DbMessage, ParsedStreamEvent } from "../provider";
 import { ApiRequestDumpCollector } from "../request-dump";
 
@@ -1173,3 +1178,179 @@ describe("Gemini Interactions API provider", () => {
 		expect(thrown?.message).toContain("rate limited");
 	});
 });
+
+// Exercise both transports through the real outbound request path.
+for (const transport of ["generate-content", "interactions"] as const) {
+	describe(`Gemini ${transport} request compatibility`, () => {
+		function provider(config: Record<string, unknown> = {}): TestGeminiProvider {
+			const Constructor =
+				transport === "interactions" ? GeminiProvider : GeminiGenerateContentProvider;
+			const converted = customApiProviderToGemini({
+				id: "gem-headers",
+				name: "Gemini",
+				prefix: "gem-headers",
+				protocol: "gemini-compatible",
+				defaultModel: "gemini-2.5-flash",
+				geminiTransport: transport,
+				apiKey: "test-key",
+				baseUrl: "https://opencode.ai/inference/go/v1",
+				userAgentMode: "narrafork",
+				...config,
+			} as CustomApiProviderConfig);
+			if (!converted) throw new Error("Gemini conversion failed");
+			// Include legacy round-tripping so fingerprint settings cannot disappear in projections.
+			const roundTrip = customApiProviderToGemini(geminiProviderToCustomApi(converted));
+			return new Constructor(roundTrip as unknown as Record<string, unknown>);
+		}
+
+		function captureRequests(): Array<{ headers: Headers; body: Record<string, unknown> }> {
+			const requests: Array<{ headers: Headers; body: Record<string, unknown> }> = [];
+			setOutboundFetchOverrideForTest(async (_input, init) => {
+				requests.push({
+					headers: new Headers(init?.headers),
+					body: JSON.parse(String(init?.body)),
+				});
+				return transport === "interactions"
+					? sseResponse([
+							{
+								event: "interaction.completed",
+								data: {
+									event_type: "interaction.completed",
+									interaction: { status: "completed" },
+								},
+							},
+						])
+					: sseResponse([
+							{
+								event: "message",
+								data: {
+									candidates: [
+										{ content: { role: "model", parts: [{ text: "OK" }] }, finishReason: "STOP" },
+									],
+								},
+							},
+						]);
+			});
+			return requests;
+		}
+
+		test("sends stable per-conversation OpenCode identity and the configured fingerprint", async () => {
+			const requests = captureRequests();
+			const adapter = provider({
+				userAgentMode: "custom",
+				customUserAgent: "Gemini-Test/1",
+				extraHeaders: { "X-Test": "configured" },
+			});
+			for (const conversationId of ["conv-one", "conv-one", "conv-two"]) {
+				await collect(adapter.chat(baseChatParams({ conversationId })));
+			}
+			const first = requests[0].headers;
+			expect(first.get("user-agent")).toBe("Gemini-Test/1");
+			expect(first.get("x-test")).toBe("configured");
+			expect(first.get("x-goog-api-key")).toBe("test-key");
+			expect(first.get("x-opencode-session")).toBeTruthy();
+			expect(requests[1].headers.get("x-opencode-session")).toBe(first.get("x-opencode-session"));
+			expect(requests[2].headers.get("x-opencode-session")).not.toBe(
+				first.get("x-opencode-session"),
+			);
+		});
+
+		test("extra headers override defaults case-insensitively without duplicate values", async () => {
+			const requests = captureRequests();
+			await collect(
+				provider({
+					extraHeaders: {
+						"USER-AGENT": "Override/2",
+						"X-OpenCode-Session": "manual-session",
+						"X-Goog-Api-Key": "override-key",
+						"content-type": "application/json; charset=utf-8",
+					},
+				}).chat(baseChatParams()),
+			);
+			expect(requests[0].headers.get("user-agent")).toBe("Override/2");
+			expect(requests[0].headers.get("x-opencode-session")).toBe("manual-session");
+			expect(requests[0].headers.get("x-goog-api-key")).toBe("override-key");
+			expect(requests[0].headers.get("content-type")).toBe("application/json; charset=utf-8");
+		});
+
+		test("does not add OpenCode identity to other hosts", async () => {
+			const requests = captureRequests();
+			await collect(
+				provider({ baseUrl: "https://generativelanguage.googleapis.com/v1beta" }).chat(
+					baseChatParams(),
+				),
+			);
+			expect(requests[0].headers.has("x-opencode-session")).toBe(false);
+			expect(requests[0].headers.get("user-agent")).toMatch(/narrafork/i);
+		});
+
+		test("auxiliary generation also applies fingerprint and fallback session headers", async () => {
+			const requests = captureRequests();
+			const adapter = provider({ extraHeaders: { "user-agent": "Auxiliary/1", "X-Test": "aux" } });
+			await adapter.generateWithMeta("hello", "gemini-2.5-flash");
+			await adapter.generateWithMeta("hello again", "gemini-2.5-flash");
+			expect(requests[0].headers.get("user-agent")).toBe("Auxiliary/1");
+			expect(requests[0].headers.get("x-test")).toBe("aux");
+			expect(requests[0].headers.get("accept")).toBe("text/event-stream");
+			expect(requests[0].headers.get("x-opencode-session")).toBeTruthy();
+			expect(requests[1].headers.get("x-opencode-session")).toBe(
+				requests[0].headers.get("x-opencode-session"),
+			);
+		});
+
+		test("emits valid nested function schemas for literal and enum constraints", async () => {
+			const requests = captureRequests();
+			const adapter = provider();
+			const properties = {
+				confirm: { type: "boolean", const: true },
+				cancel: { type: "boolean", const: false },
+				count: { type: "integer", const: 1, minimum: 0 },
+				action: { type: "string", const: "approve" },
+				flag: { type: "boolean", enum: [true, false] },
+				numbers: { type: "array", items: { type: "number", enum: [1, 2] } },
+				mixed: {
+					anyOf: [
+						{ type: "boolean", const: true },
+						{ type: "string", enum: ["yes", "no"] },
+					],
+				},
+				// A property named const or enum must not itself be interpreted as a keyword.
+				const: { type: "boolean", const: true },
+				enum: { type: "string", const: "literal" },
+			};
+			const tools = adapter.formatTools([
+				{
+					name: "DangerConfirm",
+					description: "Confirm",
+					parameters: z.object({ confirm: z.literal(true) }),
+					rawJsonSchema: { type: "object", properties, required: ["confirm"] },
+				},
+			]);
+			await collect(adapter.chat(baseChatParams({ tools })));
+			const body = requests[0].body;
+			const declarations = body.tools as Array<{
+				parameters?: unknown;
+				functionDeclarations?: Array<{ parameters: unknown }>;
+			}>;
+			const parameters =
+				transport === "interactions"
+					? declarations[0].parameters
+					: declarations[0].functionDeclarations?.[0].parameters;
+			expect(parameters).toEqual({
+				type: "object",
+				required: ["confirm"],
+				properties: {
+					confirm: { type: "boolean" },
+					cancel: { type: "boolean" },
+					count: { type: "integer", minimum: 0 },
+					action: { type: "string", enum: ["approve"] },
+					flag: { type: "boolean" },
+					numbers: { type: "array", items: { type: "number" } },
+					mixed: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["yes", "no"] }] },
+					const: { type: "boolean" },
+					enum: { type: "string", enum: ["literal"] },
+				},
+			});
+		});
+	});
+}
