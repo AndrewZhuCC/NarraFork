@@ -299,6 +299,7 @@ function needsUnavailableSudoPassword(cmd: string): boolean {
 				stdout: "ignore",
 				stderr: "ignore",
 				stdin: "ignore",
+				windowsHide: true,
 			});
 			passwordlessSudo = probe.exitCode === 0;
 		} catch {

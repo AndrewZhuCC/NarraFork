@@ -101,6 +101,7 @@ async function zstdCliResponds(binary: string, signal?: AbortSignal): Promise<bo
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
+			windowsHide: true,
 		});
 	} catch {
 		return false;
@@ -1755,6 +1756,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 						cwd: process.cwd(),
 						env,
 						stdio: ["ignore", "ignore", "ignore"],
+						windowsHide: true,
 					},
 				)
 			: Bun.spawn([options.newExecPath, ...launchArgs], {

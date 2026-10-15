@@ -230,7 +230,7 @@ fsRoutes.post("/reveal", async (c) => {
 	// Wait only for launch, not for the desktop window to close. Handle ENOENT
 	// (e.g. missing xdg-utils) as an API error rather than an unhandled child error.
 	await new Promise<void>((resolve, reject) => {
-		const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+		const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
 		child.once("error", (error) => {
 			reject(new AppError(`Could not launch file manager (${cmd}): ${error.message}`, 500));
 		});
@@ -1240,7 +1240,7 @@ function resolveWindowsKnownFolder(key: string, _home: string): string | null {
 		try {
 			const result = execSync(
 				`powershell -NoProfile -Command "[Environment]::GetFolderPath('${specialFolder}')"`,
-				{ encoding: "utf-8", timeout: 3000 },
+				{ encoding: "utf-8", timeout: 3000, windowsHide: true },
 			).trim();
 			if (result && existsSync(result)) {
 				_winFolderCache[key] = result;

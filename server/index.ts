@@ -22,10 +22,15 @@ if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
 	// before ./main, so no instance lock / DB / HTTP server. Loads the plugin
 	// entry, which owns the stdio RPC channel.
 	await import("./plugin-runtime-worker").then((m) => m.runPluginRuntimeWorker());
-} else {
+} else if (process.argv.includes("--serve") || process.platform !== "win32") {
+	// 服务模式：管理器用它拉起后端，脚本调用与其它平台也走这里。
 	const handoffOk = await waitForPreviousServerShutdown();
 	if (!handoffOk) {
 		process.exit(1);
 	}
 	await import("./main");
+} else {
+	// 默认进入图形化管理器。它自己不监听端口，所以不做"上一次服务退出等待"；
+	// 真正的服务由管理器以 `--serve` 子进程形式拉起，那一步会做该等待。
+	await import("./manager/main").then((manager) => manager.runManager());
 }

@@ -203,7 +203,7 @@ function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buf
 				"--force",
 				"--long=31",
 			],
-			{ stdout: "pipe", stderr: "pipe", env: updateServerChildEnvironment() },
+			{ stdout: "pipe", stderr: "pipe", env: updateServerChildEnvironment(), windowsHide: true },
 		);
 
 		if (result.exitCode !== 0) {
@@ -633,7 +633,7 @@ function applyZstdCliPatch(
 	try {
 		const result = Bun.spawnSync(
 			[zstdBin, "-d", `--patch-from=${oldPath}`, patchPath, "-o", outPath, "--force", "--long=31"],
-			{ stdout: "pipe", stderr: "pipe", env: updateServerChildEnvironment() },
+			{ stdout: "pipe", stderr: "pipe", env: updateServerChildEnvironment(), windowsHide: true },
 		);
 
 		if (result.exitCode !== 0) {

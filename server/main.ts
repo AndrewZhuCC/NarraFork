@@ -50,8 +50,10 @@ import {
 	registerOperatorShutdownHandler,
 	registerRuntimeAddressGetter,
 	registerServerRestart,
+	scheduleServerRestart,
 } from "./lib/server-restart";
-import { settings } from "./lib/settings";
+import { reloadSettings, settings } from "./lib/settings";
+import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
@@ -252,6 +254,8 @@ import { refreshWindowsPath } from "./lib/win-env";
 		const gitCheck = Bun.spawnSync(["git", "--version"], {
 			stdout: "pipe",
 			stderr: "pipe",
+			// GUI 模式（管理器托管的后端）下不隐藏会闪出控制台窗口。
+			windowsHide: true,
 		});
 		if (gitCheck.exitCode === 0) {
 			_gitAvailable = true;
@@ -269,6 +273,7 @@ import { refreshWindowsPath } from "./lib/win-env";
 				const retry = Bun.spawnSync(["git", "--version"], {
 					stdout: "pipe",
 					stderr: "pipe",
+					windowsHide: true,
 				});
 				if (retry.exitCode === 0) {
 					_gitAvailable = true;
@@ -571,7 +576,11 @@ function tryReclaimPort(targetPort: number): void {
 		// netstat -ano gives lines like:
 		//   TCP    0.0.0.0:7778           0.0.0.0:0              LISTENING       12345
 		//   TCP    [::]:7778              [::]:0                 LISTENING       12345
-		const result = Bun.spawnSync(["netstat", "-ano"], { stdout: "pipe", stderr: "ignore" });
+		const result = Bun.spawnSync(["netstat", "-ano"], {
+			stdout: "pipe",
+			stderr: "ignore",
+			windowsHide: true,
+		});
 		if (result.exitCode !== 0) return;
 		const output = new TextDecoder().decode(result.stdout);
 		const listeningPids = new Set<number>();
@@ -1272,11 +1281,24 @@ registerServerRestart((newHost: string, newPort: number, options) => {
 	return address;
 });
 
+// settings.json 地址热重载：管理器面板或外部编辑直接写文件也能即时生效。
+// PATCH /api/settings 的保存路径同样写该文件，isCurrent 比对可避免双重重绑。
+startServerAddressWatcher({
+	isCurrent: (address) => address.host === configuredHost && address.port === actualPort,
+	onChanged: (address) => {
+		reloadSettings();
+		scheduleServerRestart(address.host, address.port);
+	},
+});
+
 /** Open a URL in the user's default browser. */
 function openInBrowser(url: string) {
 	try {
 		if (IS_WINDOWS) {
-			Bun.spawn(["cmd", "/c", "start", url], { stdio: ["ignore", "ignore", "ignore"] });
+			Bun.spawn(["cmd", "/c", "start", url], {
+				stdio: ["ignore", "ignore", "ignore"],
+				windowsHide: true,
+			});
 		} else if (IS_MACOS) {
 			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
 		} else {
@@ -1310,7 +1332,10 @@ async function openAsApp(url: string) {
 
 	for (const cmd of candidates) {
 		try {
-			const proc = Bun.spawn(cmd, { stdio: ["ignore", "ignore", "ignore"] });
+			const proc = Bun.spawn(cmd, {
+				stdio: ["ignore", "ignore", "ignore"],
+				windowsHide: true,
+			});
 			// On Unix, check if the process exits immediately with an error
 			if (!IS_WINDOWS) {
 				// Give it a moment to fail (e.g. command not found)
