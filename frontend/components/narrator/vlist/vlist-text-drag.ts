@@ -3,11 +3,9 @@
  *
  * Selecting message text and then pressing on that selection starts an HTML5
  * drag, not a new selection. The browser takes the gesture over with
- * `pointercancel` and may never deliver `mouseup` or `dragend` — especially
- * once a virtualized row is replaced under the pointer, or once an ancestor
- * drop target has called `preventDefault` on `dragover`. The page is then
- * stuck inside that drag session: clicks and keystrokes stop reaching the UI
- * until a reload.
+ * `pointercancel` and can finish without `dragend` once the virtualized row
+ * under the pointer is replaced. The page is then stuck inside that drag
+ * session: clicks and keystrokes stop reaching the UI until a reload.
  *
  * Cancelling `dragstart` before the drag session begins leaves the pointer
  * sequence intact (`pointerup` / `mouseup` still fire) and leaves copy,
@@ -22,6 +20,8 @@ export interface TextSelectionDragProbe {
 	explicitDragSource: boolean;
 	/** A non-collapsed selection touches this list. */
 	selectionInRoot: boolean;
+	/** The pressed node lies inside that selection. */
+	targetIntersectsSelection: boolean;
 }
 
 /**
@@ -31,7 +31,7 @@ export interface TextSelectionDragProbe {
 export function shouldCancelTextSelectionDrag(probe: TextSelectionDragProbe): boolean {
 	if (probe.defaultPrevented) return false;
 	if (!probe.targetInRoot || probe.explicitDragSource) return false;
-	return probe.selectionInRoot;
+	return probe.selectionInRoot && probe.targetIntersectsSelection;
 }
 
 const EXPLICIT_DRAG_SOURCE =
@@ -70,15 +70,35 @@ export function probeTextSelectionDrag(event: Event, root: Node): TextSelectionD
 		targetInRoot: nodeInside(root, targetNode),
 		explicitDragSource: !!element?.closest(EXPLICIT_DRAG_SOURCE),
 		selectionInRoot,
+		targetIntersectsSelection:
+			!!selection && !!targetNode && rangeIntersectsTarget(selection, targetNode),
 	};
+}
+
+/**
+ * True when `target` lies in the current range.
+ *
+ * `intersectsNode` throws for a node that is not in this document. A failure
+ * leaves the drag alone: cancelling an unrelated image or link is worse than
+ * missing one detached selection.
+ */
+function rangeIntersectsTarget(selection: Selection, target: Node): boolean {
+	try {
+		if (selection.rangeCount < 1 || selection.isCollapsed) return false;
+		const range = selection.getRangeAt(0);
+		return typeof range.intersectsNode === "function" && range.intersectsNode(target);
+	} catch {
+		return false;
+	}
 }
 
 /**
  * Install the guard for one list root.
  *
- * Document capture, and not passive: it has to run before a drop target accepts
- * the drag, and `preventDefault` is what keeps the browser from opening the
- * session. Returns a disposer.
+ * Document capture, and not passive: `preventDefault` here runs before a
+ * target-phase `dragstart` handler can install drag state that only `dragend`
+ * would remove. A cancelled `dragstart` never dispatches `dragover`. Returns a
+ * disposer.
  */
 export function installVListTextDragGuard(root: Node): () => void {
 	const doc = root.ownerDocument;

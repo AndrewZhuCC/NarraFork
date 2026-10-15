@@ -90,14 +90,17 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 	};
 	const onDragStart = (event: Event) => {
 		// A dragstart whose default is cancelled never emits dragend. Counting it
-		// would leave this slot set for the life of the page. Listeners registered
-		// later in the same turn (the text-selection guard) may cancel after us,
-		// so a slot opened for a drag that ends up cancelled is dropped here.
+		// would leave this slot set for the life of the page. This list's text
+		// guard is registered first and is visible as defaultPrevented already.
+		// A later canceller (another list's guard, or the file-panel exit guard)
+		// runs after this listener, so the slot is dropped at the end of the turn.
+		// Do not call onRelease for that drop: the press, when one was counted,
+		// still ends on mouseup, and a dragstart-only slot was never a gesture.
 		if (event.defaultPrevented) return;
 		active.add(NATIVE_DRAG_ID);
 		queueMicrotask(() => {
-			if (!event.defaultPrevented || !active.delete(NATIVE_DRAG_ID)) return;
-			if (active.size === 0) onRelease();
+			if (!event.defaultPrevented) return;
+			active.delete(NATIVE_DRAG_ID);
 		});
 	};
 	/**

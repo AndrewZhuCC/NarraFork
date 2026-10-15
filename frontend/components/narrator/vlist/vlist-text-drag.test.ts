@@ -28,6 +28,15 @@ function installDom(html: string): Document {
 }
 
 function select(doc: Document, node: Node | null, collapsed = false): void {
+	const range = {
+		intersectsNode(target: Node) {
+			if (!node || collapsed) return false;
+			if (target === node) return true;
+			if (target.nodeType === 1 && (target as Element).contains(node)) return true;
+			if (node.nodeType === 1 && (node as Element).contains(target)) return true;
+			return false;
+		},
+	};
 	Object.defineProperty(doc, "getSelection", {
 		configurable: true,
 		value: () =>
@@ -37,6 +46,7 @@ function select(doc: Document, node: Node | null, collapsed = false): void {
 						rangeCount: collapsed ? 0 : 1,
 						anchorNode: node,
 						focusNode: node,
+						getRangeAt: () => range,
 					}
 				: null,
 	});
@@ -51,7 +61,7 @@ function dragstart(target: Node): Event {
 
 beforeEach(() => {
 	installDom(
-		`<div id="list"><p id="msg">hello session text</p><span id="handle" draggable="true">move</span><input id="field" value="edit" /></div><div id="outside">other</div>`,
+		`<div id="list"><p id="msg">hello session text</p><a id="link" href="/doc">quoted link</a><img id="photo" alt="pic" /><span id="handle" draggable="true">move</span><input id="field" value="edit" /></div><div id="outside">other</div>`,
 	);
 });
 
@@ -68,6 +78,7 @@ describe("shouldCancelTextSelectionDrag", () => {
 				targetInRoot: true,
 				explicitDragSource: false,
 				selectionInRoot: true,
+				targetIntersectsSelection: true,
 			}),
 		).toBe(true);
 		expect(
@@ -76,6 +87,7 @@ describe("shouldCancelTextSelectionDrag", () => {
 				targetInRoot: true,
 				explicitDragSource: false,
 				selectionInRoot: true,
+				targetIntersectsSelection: true,
 			}),
 		).toBe(false);
 		expect(
@@ -84,6 +96,7 @@ describe("shouldCancelTextSelectionDrag", () => {
 				targetInRoot: false,
 				explicitDragSource: false,
 				selectionInRoot: true,
+				targetIntersectsSelection: true,
 			}),
 		).toBe(false);
 		expect(
@@ -92,6 +105,7 @@ describe("shouldCancelTextSelectionDrag", () => {
 				targetInRoot: true,
 				explicitDragSource: true,
 				selectionInRoot: true,
+				targetIntersectsSelection: true,
 			}),
 		).toBe(false);
 		expect(
@@ -100,6 +114,16 @@ describe("shouldCancelTextSelectionDrag", () => {
 				targetInRoot: true,
 				explicitDragSource: false,
 				selectionInRoot: false,
+				targetIntersectsSelection: true,
+			}),
+		).toBe(false);
+		expect(
+			shouldCancelTextSelectionDrag({
+				defaultPrevented: false,
+				targetInRoot: true,
+				explicitDragSource: false,
+				selectionInRoot: true,
+				targetIntersectsSelection: false,
 			}),
 		).toBe(false);
 	});
@@ -122,6 +146,21 @@ describe("installVListTextDragGuard", () => {
 			expect(releases).toBe(0);
 		} finally {
 			tracker.dispose();
+			stop();
+		}
+	});
+
+	it("cancels a link inside the selection and leaves an image outside it", () => {
+		const list = document.getElementById("list") as HTMLElement;
+		const linkText = document.querySelector("#link")?.firstChild;
+		const photo = document.getElementById("photo");
+		if (!linkText || !photo) throw new Error("missing link or image");
+		select(document, linkText);
+		const stop = installVListTextDragGuard(list);
+		try {
+			expect(dragstart(document.getElementById("link") as Node).defaultPrevented).toBe(true);
+			expect(dragstart(photo).defaultPrevented).toBe(false);
+		} finally {
 			stop();
 		}
 	});
@@ -161,7 +200,9 @@ describe("installVListTextDragGuard", () => {
 		const source = readFileSync(new URL("./PretextExactMessageList.tsx", import.meta.url), "utf8");
 		const guard = source.indexOf("installVListTextDragGuard(node)");
 		const tracker = source.indexOf("createPointerDragTracker(");
+		const cleanup = source.indexOf("stopTextDrag()");
 		expect(guard).toBeGreaterThan(0);
 		expect(tracker).toBeGreaterThan(guard);
+		expect(cleanup).toBeGreaterThan(tracker);
 	});
 });
