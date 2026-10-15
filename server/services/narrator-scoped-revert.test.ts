@@ -225,7 +225,7 @@ describe("M0 complete operation coverage", () => {
 		const f = await fixture();
 		const windows = process.platform === "win32";
 		const command = windows
-			? "echo partial>a.txt & exit /b 7"
+			? ">a.txt (echo partial) & exit /b 7"
 			: "printf 'partial\\n' > a.txt; exit 7";
 		await call(
 			f,
