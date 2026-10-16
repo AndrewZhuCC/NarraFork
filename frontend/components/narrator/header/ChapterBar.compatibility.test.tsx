@@ -406,7 +406,7 @@ for (const variant of ["chapter", "standalone"] as const) {
 		}
 	});
 }
-test("standalone bar uses independent totals and labels partial, refreshing and unsupported stats", async () => {
+test("standalone bar refreshes totals silently and labels partial and unsupported stats", async () => {
 	gitWorkspace = {
 		data: {
 			state: "ready",
@@ -434,11 +434,21 @@ test("standalone bar uses independent totals and labels partial, refreshing and 
 	expect(container.textContent).toContain("+12");
 	expect(container.textContent).toContain("-4");
 	expect(container.querySelector('[aria-label="lineStats.partial"]')).not.toBeNull();
+	const measuredText = container.textContent;
 	lineStats = { ...lineStats, isFetching: true };
 	await render();
-	expect(container.textContent).toContain("+12");
-	expect(container.textContent).toContain("-4");
-	expect(container.querySelector('[aria-label="lineStats.updating"]')).not.toBeNull();
+	expect(container.textContent).toBe(measuredText);
+	expect(container.querySelector('[role="status"]')).toBeNull();
+	expect(container.textContent).not.toContain("…");
+	lineStats = {
+		data: { files: [], linesAdded: 18, linesRemoved: 6, complete: true },
+		isFetching: false,
+		error: null,
+	};
+	await render();
+	expect(container.textContent).toContain("+18");
+	expect(container.textContent).toContain("-6");
+	expect(container.querySelector('[role="status"]')).toBeNull();
 	lineStats = {
 		...lineStats,
 		isFetching: false,
@@ -448,7 +458,7 @@ test("standalone bar uses independent totals and labels partial, refreshing and 
 	};
 	await render();
 	expect(container.textContent).toContain("lineStats.unsupported");
-	expect(container.textContent).not.toContain("+12");
+	expect(container.textContent).not.toContain("+18");
 	expect(container.textContent).toContain("main");
 });
 
