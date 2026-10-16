@@ -14,9 +14,8 @@
 
 import { createWriteStream, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DEFAULT_BRAND_ICON_COLOR, parseHexColor } from "@shared/branding";
 import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
-import { decodeRgbaPng, recolorRgbaPixels } from "../lib/branding/png-recolor";
+import { decodeRgbaPng, getBrandIcons } from "../lib/branding";
 import {
 	BackendProcess,
 	type BackendState,
@@ -746,61 +745,17 @@ function scaleRgba(pixels: Uint8Array, width: number, height: number, size: numb
 }
 
 /**
- * 读取品牌 PNG 素材。
- *
- * 优先用编译产物里嵌入的前端资源：构建脚本把 dist/frontend 全部嵌进 exe（`with { type:
- * "file" }`，编译后指向 $bunfs），所以独立分发的 exe 也能拿到素材。生成模块不存在（开发
- * 模式尚未构建前端）或读取失败时，回退到工作区的文件候选路径。
- */
-async function readBrandPng(): Promise<Uint8Array | undefined> {
-	try {
-		// 走变量路径：生成模块在 tsconfig 的 exclude 之外（显式 import 会把 172KB 的
-		// 生成文件拉进类型检查，而它的 `with { type: "file" }` 导入没有类型声明）。
-		// server/lib/branding/icons.ts 使用同样的方式加载它。
-		const generatedModulePath = "@server/generated/embedded-frontend";
-		const mod = (await import(generatedModulePath)) as {
-			embeddedAssets?: Record<string, string>;
-		};
-		const embeddedPath = mod.embeddedAssets?.["/pwa-192x192.png"];
-		if (embeddedPath) {
-			const file = Bun.file(embeddedPath);
-			if (await file.exists()) return new Uint8Array(await file.arrayBuffer());
-		}
-	} catch {
-		// 生成模块不可用 —— 继续走文件系统候选。
-	}
-	const candidates = [
-		join(process.cwd(), "dist", "frontend", "pwa-192x192.png"),
-		join(process.cwd(), "frontend", "public", "pwa-192x192.png"),
-		// 双击 exe 时 cwd 是 exe 所在目录：前端产物与它同级（dist/frontend）。
-		join(dirname(process.execPath), "frontend", "pwa-192x192.png"),
-	];
-	for (const candidate of candidates) {
-		try {
-			const file = Bun.file(candidate);
-			if (await file.exists()) return new Uint8Array(await file.arrayBuffer());
-		} catch {
-			// 换下一个候选。
-		}
-	}
-	return undefined;
-}
-
-/**
- * 主题色窗口图标：读品牌 PNG 素材（按默认品牌色绘制），重着色成实例品牌色后缩到图标
- * 尺寸再构造 HICON。素材不可用时返回 undefined，调用方回退静态 ico / exe 内嵌资源。
+ * 主题色窗口图标：复用 server 侧的图标管线（含嵌入资源查找、按色重着色与缓存）生成，
+ * 再缩到窗口图标尺寸构造 HICON。素材不可用时返回 undefined，调用方回退静态 ico。
  */
 async function loadBrandedIcon(colorHex: string): Promise<Pointer | undefined> {
-	const target = parseHexColor(colorHex);
-	const source = parseHexColor(DEFAULT_BRAND_ICON_COLOR);
-	if (!target || !source) return undefined;
-	const bytes = await readBrandPng();
-	if (!bytes) return undefined;
 	try {
-		const decoded = decodeRgbaPng(bytes);
+		// 复用 server 侧的图标管线：嵌入资源/工作区文件的查找、按色重着色与缓存都在里面，
+		// 面板不再自己读 PNG。icon192 是面板窗口图标需要的尺寸。
+		const icons = await getBrandIcons(colorHex);
+		const decoded = decodeRgbaPng(new Uint8Array(icons.icon192.body));
 		if (!decoded) return undefined;
-		const recolored = recolorRgbaPixels(decoded.pixels, target, source);
-		const scaled = scaleRgba(recolored, decoded.width, decoded.height, WINDOW_ICON_SIZE);
+		const scaled = scaleRgba(decoded.pixels, decoded.width, decoded.height, WINDOW_ICON_SIZE);
 		return createIconFromRgba(WINDOW_ICON_SIZE, scaled);
 	} catch {
 		return undefined;
@@ -881,19 +836,31 @@ function restoreFromTray(hwnd: Pointer): void {
 	redrawWindow(hwnd);
 }
 
+/**
+ * 打开前端面板。
+ *
+ * 打开方式沿用 NarraFork 的 server.openBrowser 设置：应用 → 无地址栏窗口，网页 → 默认浏览器。
+ * forceNewWindow 表示"用户明确要求打开"（托盘「打开新窗口」、Shift+点击）：此时即使设置是
+ * "不打开"，也回落为浏览器网页 —— 否则那个菜单项会像坏掉一样毫无反应。
+ */
 function openPanel(forceNewWindow = false): void {
-	// 已有前端窗口（--app 窗口的标题就是实例显示名）时直接聚焦，不重复打开；
-	// Shift+点击或托盘"打开新窗口"时跳过查找，强制新建。
+	// 已有前端窗口（--app 窗口的标题就是实例显示名）时直接聚焦，不重复打开。
 	if (!forceNewWindow && focusWindowByTitle(settings.brandName)) {
 		appendLog("WEB", t("log.focusedPanel"));
 		return;
 	}
+	const mode = readNarraForkSettings().openBrowser;
+	if (mode === "off" && !forceNewWindow) return;
 	const url = `http://${displayHost(activeHost())}:${activePort()}/`;
 	appendLog(
 		"WEB",
 		forceNewWindow ? t("log.openedPanelNew", { url }) : t("log.openedPanel", { url }),
 	);
-	openWebPanel(url, forceNewWindow);
+	if (mode === "app") {
+		openWebPanel(url, forceNewWindow);
+	} else {
+		openExternal(url);
+	}
 }
 
 /** 按当前语言刷新静态文案；自绘按钮与状态行的文字在重绘时自动取新值。 */

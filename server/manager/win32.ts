@@ -22,6 +22,7 @@ import {
 } from "bun:ffi";
 import { existsSync } from "node:fs";
 import { CHROMIUM_PATHS } from "@shared/browser-paths";
+import { shellExecute as shellExecuteWin } from "../lib/shell-exec";
 
 export type { Pointer };
 
@@ -99,7 +100,6 @@ export const WM_LBUTTONDBLCLK = 0x0203;
 export const WM_RBUTTONUP = 0x0205;
 
 export const SW_SHOW = 5;
-export const SW_SHOWNORMAL = 1;
 export const SW_HIDE = 0;
 export const SW_RESTORE = 9;
 
@@ -966,30 +966,9 @@ export function postMessage(hwnd: Pointer, msg: number, wParam = 0, lParam = 0):
 	native.user32.PostMessageW(hwnd, msg, wParam, lParam);
 }
 
-/**
- * 交给系统 shell 打开 URL / 文件，可带参数（浏览器 --app 之类）。
- *
- * 不用 `cmd /c start`：那会多起一个控制台中间进程，个别时序下即使 windowsHide 也仍会闪
- * 一下黑窗；ShellExecuteW 直接走 shell，没有中间进程，也不会创建控制台。
- */
-export function shellExecute(target: string, params?: string, show = SW_SHOWNORMAL): boolean {
-	const lib = loadShell32();
-	if (!lib) return false;
-	const result = lib.ShellExecuteW(
-		0n as unknown as Pointer,
-		wstrTemp("open"),
-		wstrTemp(target),
-		params === undefined ? (null as unknown as Pointer) : wstrTemp(params),
-		null as unknown as Pointer,
-		show,
-	);
-	// ShellExecuteW 返回值 > 32 才是成功，其余是错误码。
-	return Number(result) > 32;
-}
-
-/** 用系统默认程序打开 URL 或文件（走 ShellExecuteW，无中间控制台进程）。 */
+/** 用系统默认程序打开 URL 或文件：复用 server 侧实现（其内部走 ShellExecuteW，无中间控制台进程）。 */
 export function openExternal(url: string): boolean {
-	return shellExecute(url);
+	return shellExecuteWin(url);
 }
 
 /**
@@ -1541,28 +1520,16 @@ const NID_TIP_OFFSET = 40;
 
 interface Shell32 {
 	Shell_NotifyIconW: (message: number, data: Pointer) => number;
-	ShellExecuteW: (
-		hwnd: Pointer,
-		operation: Pointer,
-		file: Pointer,
-		params: Pointer,
-		directory: Pointer,
-		show: number,
-	) => Pointer;
 }
 
 let shell32: Shell32 | undefined;
 
-/** 托盘图标与 ShellExecute 都走 shell32；加载失败返回 undefined，调用方降级。 */
+/** 托盘图标走 shell32；加载失败返回 undefined，调用方降级为无托盘。 */
 function loadShell32(): Shell32 | undefined {
 	if (process.platform !== "win32") return undefined;
 	try {
 		shell32 ??= dlopen("shell32.dll", {
 			Shell_NotifyIconW: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.i32 },
-			ShellExecuteW: {
-				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.i32],
-				returns: FFIType.ptr,
-			},
 		}).symbols as unknown as Shell32;
 		return shell32;
 	} catch {

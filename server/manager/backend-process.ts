@@ -1,15 +1,3 @@
-/**
- * 后端服务子进程：启动、停止、重启，并把它的输出逐行交给调用方。
- *
- * 子进程就是同一个 exe 的 `--serve` 模式。编译产物里 `process.execPath` 指向 exe 自身；
- * 开发环境下指向 bun，此时用 `bun server/index.ts --serve` 的等价形式。
- *
- * 采用子进程而不是同进程双角色：重启必须是一次干净的重初始化（数据库、单实例锁、
- * 迁移、监听端口），子进程模型能直接表达它，同进程"重启"则要把状态全部拆掉再装回来。
- */
-
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { t } from "./manager-i18n";
@@ -63,11 +51,8 @@ function isCompiledRuntime(): boolean {
 	return url.includes("$bunfs/") || url.includes("%7EBUN/");
 }
 
-/** 数据目录：与 server 侧同一套环境变量约定。 */
-export function resolveNarraforkHome(): string {
-	const configured = process.env.NARRAFORK_HOME?.trim();
-	return configured && configured.length > 0 ? configured : join(homedir(), ".narrafork");
-}
+/** 数据目录：直接复用 server 侧实现 —— 环境变量约定只能有一处。 */
+export { getNarraforkHome as resolveNarraforkHome } from "../lib/narrafork-home";
 
 export class BackendProcess {
 	private child?: Bun.Subprocess<"pipe", "pipe", "pipe">;
