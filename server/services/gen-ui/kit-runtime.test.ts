@@ -152,17 +152,22 @@ describe("render", () => {
 		expect(notice(result)).toEqual({ state: "builtin" });
 	});
 
-	test("unknown tags draw nothing and tell the model what exists", async () => {
+	test("unknown tags become placeholders and the model is told what it probably meant", async () => {
 		const { env } = await fixture();
 		const result = await executeKitAction(
-			{ action: "render", source: "<Stack><AcmeWidget /><script>x</script></Stack>" },
+			{
+				action: "render",
+				source: "<Stack><TextImput /><Acordion /><AcmeWidget /><script>x</script></Stack>",
+			},
 			env,
 		);
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("<AcmeWidget>");
-		expect(result.output).toContain("<script>");
-		expect(result.output).toContain("Stack");
-		expect(result.metadata).toBeUndefined();
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.genUiInline).toEqual({ version: 1, kit: "builtin" });
+		expect(result.output).toContain("drawn as dashed placeholders");
+		expect(result.output).toContain("<TextImput>: did you mean <TextInput>");
+		expect(result.output).toContain("<Acordion>: did you mean <Accordion>");
+		expect(result.output).toContain("<AcmeWidget>: no similar component");
+		expect(result.output).toContain("<script>: not an allowed HTML tag");
 	});
 
 	test("markup with nothing renderable is rejected", async () => {
@@ -181,9 +186,11 @@ describe("render", () => {
 		expect(notice(first)?.request).toMatchObject({ kind: "build", state: "pending" });
 		expect(notice(second)).toEqual({ state: "builtin" });
 		expect(getKitRequest("n", "workspace")?.id).toBe(notice(first)?.request?.id as string);
-		// The agent is still told, every time, not to build on its own.
-		for (const result of [first, second])
-			expect(result.output).toContain("Do not build until they confirm");
+		// The agent hears about the prompt when the user does, and is told it will not repeat;
+		// a build still needs the user's approval, so later renders need not say it again.
+		expect(first.output).toContain("Do not build until they confirm");
+		expect(first.output).toContain("Rendering again does not ask them again");
+		expect(second.output).not.toContain("Do not build until they confirm");
 		// Once the user confirms, the next result carries the approval for the agent.
 		approveKitRequest("n", notice(first)?.request?.id as string);
 		const third = await executeKitAction({ action: "render", source: "<Group />" }, env);

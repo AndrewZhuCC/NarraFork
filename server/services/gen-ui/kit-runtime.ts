@@ -7,7 +7,13 @@ import {
 	type GenUiKitRequest,
 	type GenUiKitStatus,
 } from "@shared/gen-ui-kit";
-import { findUnknownUiTags, parseUiMarkup, UI_MARKUP_LIMITS } from "@shared/gen-ui-markup";
+import {
+	findUnknownUiTags,
+	isUiIntrinsicTag,
+	parseUiMarkup,
+	UI_MARKUP_LIMITS,
+	visitElements,
+} from "@shared/gen-ui-markup";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { builtinComponentNames } from "./compiler";
 import { type AuthorizeFile, uiError, workspaceKey } from "./files";
@@ -114,6 +120,65 @@ export async function kitNoticeFor(env: KitToolEnvironment): Promise<GenUiKitNot
 	}
 }
 
+/** Edit distance, bounded: names this far apart are not a typo of each other anyway. */
+function distance(a: string, b: string, limit: number): number {
+	if (Math.abs(a.length - b.length) > limit) return limit + 1;
+	let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+	for (let i = 1; i <= a.length; i++) {
+		const current = [i];
+		for (let j = 1; j <= b.length; j++)
+			current[j] = Math.min(
+				(previous[j] as number) + 1,
+				(current[j - 1] as number) + 1,
+				(previous[j - 1] as number) + (a[i - 1] === b[j - 1] ? 0 : 1),
+			);
+		previous = current;
+	}
+	return previous[b.length] as number;
+}
+
+/** Up to three available names the model most likely meant by `name`. */
+export function closestComponentNames(name: string, available: readonly string[]): string[] {
+	const wanted = (name.split(".")[0] ?? name).toLowerCase();
+	const limit = Math.max(2, Math.floor(wanted.length / 3));
+	return available
+		.map((candidate) => {
+			const lower = candidate.toLowerCase();
+			const edits = distance(wanted, lower, limit);
+			// A shared prefix (Text / TextInput) is a hint, never better than a near miss.
+			const score =
+				lower.startsWith(wanted) || wanted.startsWith(lower) ? Math.min(edits, 2) : edits;
+			return { candidate, score };
+		})
+		.filter((entry) => entry.score <= limit)
+		.sort((a, b) => a.score - b.score || a.candidate.length - b.candidate.length)
+		.slice(0, 3)
+		.map((entry) => entry.candidate);
+}
+
+/** One line per unknown tag, with the names the model most likely meant. */
+function unknownTagLines(unknown: string[], available: readonly string[]): string {
+	return unknown
+		.slice(0, 12)
+		.map((name) => {
+			const close = closestComponentNames(name, available);
+			return `- <${name}>${close.length ? `: did you mean ${close.map((item) => `<${item}>`).join(", ")}?` : /^[a-z]/.test(name) ? ": not an allowed HTML tag" : ": no similar component"}`;
+		})
+		.join("\n");
+}
+
+/**
+ * What the agent is told about the kit prompt on a render. The user is asked once per
+ * workspace, so the agent hears about it once too: repeating it under every render reads as
+ * "every render bothers the user" and makes agents avoid re-rendering to fix mistakes.
+ */
+function describeRenderRequest(prompt: KitPrompt): string {
+	if (prompt.shown?.state === "approved") return describeRequest(prompt.shown).trim();
+	if (prompt.shown)
+		return "The user has just been asked, once, whether to build a component kit for this workspace. Do not build until they confirm; you will be told if they do. Rendering again does not ask them again.";
+	return "";
+}
+
 function describeRequest(request: GenUiKitRequest | null): string {
 	if (!request) return "";
 	return request.state === "approved"
@@ -135,18 +200,20 @@ async function render(
 	const project = snapshot.status.hash !== undefined;
 	const available = project ? snapshot.status.components : await builtinComponentNames();
 	const known = new Set(available);
+	// Unknown tags are drawn as placeholders by the frame; refusing the whole UI for one
+	// misspelt name cost a full round trip and taught agents to avoid components.
 	const unknown = findUnknownUiTags(parsed.nodes, (name) => known.has(name));
-	if (unknown.length > 0) {
+	let drawable = 0;
+	visitElements(parsed.nodes, (element) => {
+		const { name } = element;
+		if (isUiIntrinsicTag(name) || (/^[A-Z]/.test(name) && known.has(name.split(".")[0] as string)))
+			drawable++;
+	});
+	// Only placeholders would appear: that is not a UI, so say plainly what exists instead.
+	if (drawable === 0 && unknown.length > 0) {
 		return {
 			isError: true,
-			output: `Nothing was rendered. Unknown tags: ${unknown
-				.slice(0, 20)
-				.map((name) => `<${name}>`)
-				.join(", ")}. The ${project ? "project" : "built-in Mantine"} kit provides: ${available
-				.slice(0, 200)
-				.join(
-					", ",
-				)}. Plain HTML tags (div, span, p, h1-h6, ul, li, table, img, a…) are also allowed. Call kit_status for props and examples.`,
+			output: `Nothing was rendered: none of these tags exist.\n${unknownTagLines(unknown, available)}\nThe ${project ? "project" : "built-in Mantine"} kit provides: ${available.slice(0, 200).join(", ")}. Plain HTML tags (div, span, p, h1-h6, ul, li, table, img, a…) are also allowed.`,
 		};
 	}
 	const prompt = await suggest(env, snapshot);
@@ -155,7 +222,12 @@ async function render(
 		.map((item) => `- ${item.message} (offset ${item.offset})`);
 	return {
 		output: [
-			`Rendered inline with the ${project ? "project's" : "built-in Mantine"} component kit (${parsed.elements} elements).`,
+			`Rendered inline with the ${project ? "project's" : "built-in Mantine"} component kit (${parsed.elements} elements). The user sees it in the chat now. Values they type or pick stay in the card; only a sendPrompt click reaches you.`,
+			...(unknown.length
+				? [
+						`These tags do not exist and were drawn as dashed placeholders; the rest of the UI rendered. Fix them and render again:\n${unknownTagLines(unknown, available)}`,
+					]
+				: []),
 			...(problems.length ? [`Parts of the markup were ignored:\n${problems.join("\n")}`] : []),
 			...(snapshot.status.state === "stale"
 				? ["The kit is out of date; this used the last built bundle."]
@@ -163,7 +235,7 @@ async function render(
 			...(snapshot.status.state === "invalid"
 				? [`kit.json is invalid (${snapshot.status.reason}); fix it before the next build.`]
 				: []),
-			describeRequest(prompt.open).trim(),
+			describeRenderRequest(prompt),
 		]
 			.filter(Boolean)
 			.join("\n"),
@@ -183,7 +255,7 @@ async function status(env: KitToolEnvironment): Promise<ToolResult> {
 	const lines: string[] = [];
 	if (state === "builtin") {
 		lines.push(
-			"No project component kit. UI renders with the built-in Mantine components (Stack, Group, Card, Text, Title, Button, Badge, Table, Tabs, TextInput, Select, Slider, Progress, Alert…).",
+			"No project component kit. UI renders with the built-in components: every export of @mantine/core (Stack, Group, Card, Text, Title, Button, Badge, Table, Tabs, Accordion, TextInput, Select, Checkbox, Slider, SegmentedControl, Progress, Alert…). You do not need a kit to render.",
 			KIT_AUTHORING_GUIDE,
 		);
 	} else {

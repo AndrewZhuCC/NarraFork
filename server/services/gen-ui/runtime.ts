@@ -263,8 +263,8 @@ export async function executeGenUiTool(
 	return {
 		output:
 			input.action === "create"
-				? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory.${fileMetadata?.fileChangeHistoryUnavailable ? " Remote file-change journal is unavailable; this creation cannot be reverted through message history." : ""}`
-				: `Preview: ${directory}/App.tsx`,
+				? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory. The user sees nothing until you show it.${fileMetadata?.fileChangeHistoryUnavailable ? " Remote file-change journal is unavailable; this creation cannot be reverted through message history." : ""}`
+				: `Preview: ${directory}/App.tsx. The user sees a card with an "Open preview" button; the app is built and runs only when they click it, from the files as they are then. Nothing the app does reaches you. Tell the user to open the preview rather than describing it as already on screen.`,
 		title: reference.title,
 		metadata: {
 			...fileMetadata,

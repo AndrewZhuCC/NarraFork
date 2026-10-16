@@ -198,6 +198,7 @@ describe("ordinary GenUI workspace files", () => {
 		};
 		const result = await executeGenUiTool({ action: "show", path: directory }, ctx, deps);
 		expect(result.output).toStartWith("Preview:");
+		expect(result.output).toContain('"Open preview" button');
 		expect(events).toEqual([`read:${directory}/App.tsx`]);
 	});
 	test("rejects stale workspace and offline/legacy remote without local fallback", async () => {

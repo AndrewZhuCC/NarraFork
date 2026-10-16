@@ -55,15 +55,19 @@ export type GenUiInput =
 
 export const genUiTool: ToolDefinition = {
 	name: GEN_UI_TOOL_NAME,
-	description: `Show the user real UI in the conversation, composed from this project's own components.
+	description: `Show the user UI in the conversation. Two ways:
 
-render({title, size, source}) draws UI inline in the chat WHILE you write it. source is JSX-like markup, not code: tags are component names from the component kit (dotted members such as <Tabs.List> work) or plain HTML tags; attributes are string/number/boolean literals, {[…]} / {{…}} array and object literals, or JSX ({<Icon />}). No variables, expressions, map(), hooks or imports: write repeated items out. Lay out with the kit's own layout components rather than ad-hoc class names. Two handlers exist: onClick={sendPrompt("text")} sends text to the chat as the user's next message, onClick={openLink("https://…")} opens a link. Put title and size ("sm" | "md" | "lg") before source. Example: <Stack gap="sm"><Title order={4}>Plans</Title><Group><Badge color="green">Active</Badge><Button onClick={sendPrompt("Compare the plans")}>Compare</Button></Group></Stack>
+render({title, size, source}) — the default. Draws markup inline in the chat while you write it: no build, no click. Use it for cards, tables, comparisons, forms, tabs, accordions.
+- Components: every export of @mantine/core (Stack, Group, Card, Text, Title, Badge, Button, Table, Tabs, Accordion, TextInput, Textarea, NumberInput, Select, Checkbox, Switch, Radio, Slider, SegmentedControl, Progress, Alert…), dotted members such as <Tabs.List>, and plain HTML (div, p, ul, li, table, img, a…). With a project component kit its components replace Mantine; kit_status lists them. A misspelt tag is drawn as a placeholder and the result names the closest real one.
+- source is JSX-like DATA, not code. Attributes are string/number/boolean literals, {[…]} / {{…}} literals, or JSX ({<Icon />}). No variables, expressions, map(), hooks, imports or onChange: write repeated items out.
+- Controls keep their own state. Use defaultValue / defaultChecked; a literal value= or checked= freezes the control.
+- The only handlers: onClick={sendPrompt("text")} sends that fixed text as the user's next message; onClick={openLink("https://…")} opens a link after the user confirms. What the user types or picks in a card is NOT sent to you. To collect a choice, give one button per option, each with its own sendPrompt text.
+- Put title and size before source: "sm" (240px), "md" (400px, default) or "lg" (580px).
+Example: <Stack gap="sm"><Title order={4}>Plans</Title><Tabs defaultValue="a"><Tabs.List><Tabs.Tab value="a">Basic</Tabs.Tab><Tabs.Tab value="b">Pro</Tabs.Tab></Tabs.List><Tabs.Panel value="a"><Text>$0</Text></Tabs.Panel><Tabs.Panel value="b"><Text>$9</Text></Tabs.Panel></Tabs><Group><Button onClick={sendPrompt("I'll take Basic")}>Basic</Button><Button onClick={sendPrompt("I'll take Pro")}>Pro</Button></Group></Stack>
 
-kit_status() lists the kit's components with props and examples; call it before your first render in a workspace. With no project kit the built-in Mantine components are used.
+create({prefix}) then show({path}) — a full React app, only when markup cannot do it (controls that drive each other, computed values, live updates). create writes ${GEN_UI_DIRECTORY}/<prefix>-<id>/App.tsx. Edit it with the normal file tools: default-export a component; import react, @mantine/core, @mantine/hooks and relative files, or "kit" when the project has a kit; no other packages and no host API. Then show the directory. The user sees a card with an "Open preview" button: the app is built and runs only when they click it, and nothing in it reaches you.
 
-kit_build() builds the project's component kit from ${GEN_UI_DIRECTORY}/kit/kit.json: once the user confirms in the chat UI, NarraFork runs the project's own Vite and records the result. The confirmation is requested for you; never ask for it repeatedly. A bundle you build yourself is never used.
-
-create({prefix}) / show({path}) are for a full interactive app instead of markup: create makes ${GEN_UI_DIRECTORY}/<prefix>-<id>/App.tsx, you edit it with the normal file tools, then show the directory. App.tsx default-exports a React component; it may import relative files and, with a project kit, components from "kit" (otherwise react, @mantine/core and @mantine/hooks). No other packages, no host API.
+kit_status() — optional: the project kit's components with props and examples, or how to author one. kit_build() — builds the project kit from ${GEN_UI_DIRECTORY}/kit/kit.json with the project's own Vite once the user confirms in the chat. The confirmation is requested for you; never ask for it repeatedly. A bundle you build yourself is never used.
 
 Never put secrets in UI.`,
 	parameters: genUiParameters,
