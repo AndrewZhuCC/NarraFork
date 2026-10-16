@@ -3,6 +3,7 @@ import { parseHTML } from "linkedom";
 import type { HTMLAttributes, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { Root } from "react-dom/client";
+import type { GitLineStats } from "../../../../shared/git-line-stats";
 import type { GitWorkspace } from "../../../../shared/git-workspace";
 
 const keys = ["window", "document", "navigator", "IS_REACT_ACT_ENVIRONMENT"] as const;
@@ -52,9 +53,14 @@ let gitStatus:
 			linesRemoved?: number;
 	  }
 	| undefined;
+let lineStats: { data?: GitLineStats; isFetching: boolean; error: Error | null } = {
+	isFetching: true,
+	error: null,
+};
 mock.module("@frontend/hooks/useGit", () => ({
 	useGitWorkspace: () => gitWorkspace,
 	useGitStatus: () => ({ data: gitStatus }),
+	useGitLineStats: () => lineStats,
 	gitWorkspaceTarget: (_id: string, workspace?: GitWorkspace) =>
 		workspace?.state === "ready" && workspace.capabilities?.read ? { narratorId: "n" } : null,
 }));
@@ -144,9 +150,23 @@ mock.module("@frontend/components/container/ContainerConfigModal", () => ({
 	},
 }));
 type WrapperProps = { children?: ReactNode };
-const Wrapper = ({ children, onClick, onKeyDown, role, style }: HTMLAttributes<HTMLDivElement>) => (
+const Wrapper = ({
+	children,
+	onClick,
+	onKeyDown,
+	role,
+	style,
+	"aria-label": label,
+}: HTMLAttributes<HTMLDivElement>) => (
 	// biome-ignore lint/a11y/noStaticElementInteractions: mock forwards Mantine Group event handlers and dynamic role
-	<div role={role} onClick={onClick} onKeyDown={onKeyDown} style={style}>
+	// biome-ignore lint/a11y/useAriaPropsSupportedByRole: mock forwards names with the dynamically selected role
+	<div
+		role={role ?? (label ? "group" : undefined)}
+		onClick={onClick}
+		onKeyDown={onKeyDown}
+		style={style}
+		aria-label={label}
+	>
 		{children}
 	</div>
 );
@@ -205,6 +225,7 @@ async function click(label: string) {
 beforeEach(async () => {
 	gitWorkspace = {};
 	gitStatus = undefined;
+	lineStats = { isFetching: true, error: null };
 	chapter = { ...chapter, status: "active", containerConfig: { services: {} } };
 	currentCwd = "/different/current-workspace";
 	containerSupported = true;
@@ -385,6 +406,51 @@ for (const variant of ["chapter", "standalone"] as const) {
 		}
 	});
 }
+test("standalone bar uses independent totals and labels partial, refreshing and unsupported stats", async () => {
+	gitWorkspace = {
+		data: {
+			state: "ready",
+			branch: "main",
+			capabilities: { read: true, write: true },
+		} as GitWorkspace,
+	};
+	gitStatus = { branch: "main", totalFiles: 3, linesAdded: 999, linesRemoved: 999 };
+	const render = async () => {
+		await act(async () => {
+			root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />);
+			await flush();
+		});
+	};
+	await render();
+	expect(container.textContent).toContain("main");
+	expect(container.textContent).not.toContain("999");
+	expect(container.querySelector('[aria-label="lineStats.loading"]')).not.toBeNull();
+	lineStats = {
+		data: { files: [], linesAdded: 12, linesRemoved: 4, complete: false },
+		isFetching: false,
+		error: null,
+	};
+	await render();
+	expect(container.textContent).toContain("+12");
+	expect(container.textContent).toContain("-4");
+	expect(container.querySelector('[aria-label="lineStats.partial"]')).not.toBeNull();
+	lineStats = { ...lineStats, isFetching: true };
+	await render();
+	expect(container.textContent).not.toContain("+12");
+	expect(container.querySelector('[aria-label="lineStats.updating"]')).not.toBeNull();
+	lineStats = {
+		...lineStats,
+		isFetching: false,
+		error: Object.assign(new Error("unsupported"), {
+			data: { code: "GIT_LINE_STATS_UNSUPPORTED" },
+		}),
+	};
+	await render();
+	expect(container.textContent).toContain("lineStats.unsupported");
+	expect(container.textContent).not.toContain("+12");
+	expect(container.textContent).toContain("main");
+});
+
 for (const variant of ["chapter", "standalone"] as const) {
 	test(`${variant} Git row ignores worktree portal clicks and activation keys`, async () => {
 		gitWorkspace = {

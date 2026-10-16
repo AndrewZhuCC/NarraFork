@@ -376,7 +376,7 @@ describe("bounded presentation snapshot cache", () => {
 		render("first");
 		await flush();
 		expect(branch()).toBe("remembered");
-		expect(latest.displayCounts).toEqual({ totalFiles: 10, linesAdded: 12, linesRemoved: 3 });
+		expect(latest.displayCounts).toEqual({ totalFiles: 10 });
 		expect(gitWorkspaceTarget("first", latest.data)).toBeNull();
 	});
 	test("a lightweight status replaces remembered line counts and retains lower-bound metadata", async () => {

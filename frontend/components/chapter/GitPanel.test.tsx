@@ -45,6 +45,7 @@ class TestResizeObserver {
 
 let root: Root | undefined;
 let restoreGitApi: (() => void) | undefined;
+const originalGitLineStats = api.getGitLineStats;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -325,6 +326,12 @@ function flushRender() {
 describe("GitPanel", () => {
 	beforeEach(async () => {
 		installDom();
+		api.getGitLineStats = async () => ({
+			files: [],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
 		// Preference snapshots are memoized at module scope; installDom() hands out
 		// fresh storage maps each test, so every cache must be reset between cases.
 		__resetGitFolderPrefsCache();
@@ -353,6 +360,7 @@ describe("GitPanel", () => {
 	afterEach(() => {
 		restoreGitApi?.();
 		restoreGitApi = undefined;
+		api.getGitLineStats = originalGitLineStats;
 		if (!root) return;
 		root.unmount();
 		root = undefined;
@@ -1080,6 +1088,7 @@ describe("GitPanel", () => {
 				options.types?.includes("narrator_access_changed"),
 			);
 			expect(subscription).toBeDefined();
+			expect(queryClient.getQueryData(["gitLineStats", "local:/repo"])).toBeDefined();
 			api.getGitWorkspace = async () =>
 				readyWorkspace({ state: "access_denied", capabilities: { read: false, write: false } });
 			await workspaceAct(async () => {
@@ -1088,6 +1097,7 @@ describe("GitPanel", () => {
 			await waitForWorkspace(() => container.textContent?.includes("do not have access") === true);
 			expect(container.textContent).toContain("do not have access");
 			expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
+			expect(queryClient.getQueryData(["gitLineStats", "local:/repo"])).toBeUndefined();
 			root?.unmount();
 			root = undefined;
 			expect(remove).toHaveBeenCalled();

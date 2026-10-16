@@ -10,7 +10,14 @@ interface GitTransport {
 	onConnectionChange(callback: (connected: boolean, isReconnect: boolean) => void): () => void;
 }
 
-const FACTS = ["gitStatus", "gitModifications", "gitDiff", "gitLog", "gitStashList"];
+const FACTS = [
+	"gitStatus",
+	"gitLineStats",
+	"gitModifications",
+	"gitDiff",
+	"gitLog",
+	"gitStashList",
+];
 let nextSubscriptionId = 0;
 
 /** No timers: only the active panel's server subscription drives background reads. */
@@ -77,7 +84,8 @@ export class GitWorkspaceSubscriptions {
 						: [];
 				const prefixes = new Set<string>();
 				if (categories.some((category) => ["worktree", "index", "head", "refs"].includes(category)))
-					for (const prefix of ["gitStatus", "gitModifications", "gitDiff"]) prefixes.add(prefix);
+					for (const prefix of ["gitStatus", "gitLineStats", "gitModifications", "gitDiff"])
+						prefixes.add(prefix);
 				if (categories.includes("refs") || categories.includes("head")) prefixes.add("gitLog");
 				if (categories.includes("stash")) prefixes.add("gitStashList");
 				const keys = new Set([gitTargetKey(target), data.workspaceKey]);

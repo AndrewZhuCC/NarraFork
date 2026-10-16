@@ -9,16 +9,17 @@ test("RemoteBackend Git RPC pins generation, negotiates capabilities and forward
 	const source = `
 import { mock } from "bun:test";
 import assert from "node:assert/strict";
-let online = true, supported = true, previewSupported = true, statusSupported = true, generation = 3;
+let online = true, supported = true, previewSupported = true, statusSupported = true, lineStatsSupported = true, generation = 3;
 const calls = [];
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 65536 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
- hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1")),
+ hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1") || (lineStatsSupported && f === "git.workspace.line-stats.v1")),
  sendRpc: async (id, method, params, opts) => {
   calls.push({id, method, params, opts});
   if (!online) throw new Error("offline");
   if (!supported) throw new Error("unsupported");
   if (!previewSupported && opts.requiredFeatures?.includes("git.workspace.commit-preview.v1")) throw new Error("preview unsupported");
+  if (!lineStatsSupported && opts.requiredFeatures?.includes("git.workspace.line-stats.v1")) throw new Error("line stats unsupported");
   if (generation !== opts.expectedConnectionGeneration) throw new Error("generation changed");
   if (opts.signal?.aborted) throw new Error("aborted");
   return {stdout:"patch",truncated:true};
@@ -65,7 +66,22 @@ await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"commitDetail",commit
 await b.gitWorkspace({cwd:"/repo",operation:"probe"});
 assert.deepEqual(calls.at(-1).opts.requiredFeatures,["git.workspace.v1"]);
 previewSupported=true;
+assert.equal(b.supportsGitLineStats,true);
+await b.gitWorkspace({cwd:"/repo",expectedRoot:"/repo",operation:"lineStats",timeoutMs:1250,maxBytes:999999},controller.signal);
+const stats = calls.at(-1);
+assert.equal(stats.params.operation,"lineStats");
+assert.equal(stats.params.expectedRoot,"/repo");
+assert.equal(stats.params.maxBytes,65536);
+assert.equal(stats.opts.signal,controller.signal);
+assert.equal(stats.opts.timeoutMs,6250);
+assert.equal(stats.opts.expectedConnectionGeneration,3);
+assert.deepEqual(stats.opts.requiredFeatures,["git.workspace.v1","git.workspace.line-stats.v1"]);
+lineStatsSupported=false;
+assert.equal(b.supportsGitLineStats,false);
+await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"lineStats"}),/line stats unsupported/);
+lineStatsSupported=true;
 supported=false; assert.equal(b.supportsGitWorkspace,false);
+assert.equal(b.supportsGitLineStats,false);
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/unsupported/);
 supported=true; generation=4;
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/generation changed/);
@@ -73,7 +89,7 @@ generation=3; online=false;
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/offline/);
 online=true; controller.abort();
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"},controller.signal),/aborted/);
-assert.equal(calls.length,9);
+assert.equal(calls.length,11);
 console.log("remote Git backend assertions passed");
 `;
 	const proc = Bun.spawn([process.execPath, "--eval", source], { stdout: "pipe", stderr: "pipe" });

@@ -21,6 +21,7 @@ import {
 import { commitSyncService } from "../services/commit-sync-service";
 import { getCommitBoundariesCached } from "../services/git-commit-boundary-cache";
 import {
+	getGitWorkspaceLineStats,
 	gitAttributionScopes,
 	gitManagementService,
 	invalidateGitWorkspace,
@@ -207,6 +208,9 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 
 	routes.get(`${prefix}/workspace`, (c) => c.json(c.get("gitTarget").workspace));
 	routes.get(`${prefix}/status`, async (c) => c.json(await summary(c)));
+	routes.get(`${prefix}/line-stats`, async (c) =>
+		c.json(await getGitWorkspaceLineStats(c.get("gitTarget"), c.req.raw.signal)),
+	);
 	routes.get(`${prefix}/modifications`, async (c) => {
 		const { target, path, git } = access(c);
 		const query = gitModificationsQuerySchema.parse(c.req.query());

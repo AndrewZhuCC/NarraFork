@@ -11,10 +11,12 @@ import {
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
+import { getGitLineStatsCached } from "./git-line-stats-cache";
 import { invalidateGitWorkspace } from "./git-management-service";
 import type { GitWorkspaceTarget } from "./git-workspace";
 import {
 	createRemoteGitService,
+	getRemoteGitStatusQueryKey,
 	parseRemoteGitStatus,
 	supportsRemoteGitWorkspace,
 } from "./remote-git-service";
@@ -27,6 +29,7 @@ function backendFixture(supportsGitCommitPreview = true) {
 		kind: "remote",
 		deviceId: "device-a",
 		supportsGitWorkspace: true,
+		supportsGitLineStats: true,
 		supportsGitCommitPreview,
 		async gitWorkspace(request: GitWorkspaceRequest, signal?: AbortSignal) {
 			calls.push({ request, signal });
@@ -44,6 +47,71 @@ function backendFixture(supportsGitCommitPreview = true) {
 			failure = error;
 		},
 	};
+}
+
+test("remote line stats is an independent raw read with unknown fields preserved", async () => {
+	const f = backendFixture();
+	const controller = new AbortController();
+	const partial = {
+		files: [{ path: "large.txt", stagedLinesAdded: 1, stagedLinesRemoved: 0, complete: false }],
+		linesAdded: 1,
+		linesRemoved: 0,
+		complete: false,
+	};
+	f.respond({ lineStats: partial });
+	const git = createRemoteGitService(f.backend, controller.signal);
+	expect(await git.getLineStats("C:\\Repo")).toEqual(partial);
+	expect(f.calls[0]).toEqual({
+		request: {
+			cwd: "C:\\Repo",
+			expectedRoot: "C:\\Repo",
+			operation: "lineStats",
+			timeoutMs: GIT_WORKSPACE_TIMEOUT_MS,
+			maxBytes: GIT_WORKSPACE_MAX_BYTES,
+		},
+		signal: controller.signal,
+	});
+	// No settled cache or status coalescer is hidden inside the raw adapter.
+	await git.getLineStats("C:\\Repo");
+	expect(f.calls).toHaveLength(2);
+	f.respond({});
+	await expect(git.getLineStats("/repo")).rejects.toThrow("statistics are missing");
+	f.fail(new Error("cancelled"));
+	await expect(git.getLineStats("/repo")).rejects.toThrow("cancelled");
+});
+
+test("remote line stats unsupported requires upgrade without legacy status fallback", async () => {
+	const f = backendFixture();
+	const backend = { ...f.backend, supportsGitLineStats: false } as ExecutionBackend;
+	await expect(createRemoteGitService(backend).getLineStats("/repo")).rejects.toMatchObject({
+		code: "GIT_LINE_STATS_UNSUPPORTED",
+		statusCode: 501,
+	});
+	expect(f.calls).toHaveLength(0);
+});
+
+for (const writeFails of [false, true]) {
+	test(`remote writes invalidate settled line statistics even when uncertain=${writeFails}`, async () => {
+		const f = backendFixture();
+		const cwd = `/stats-write-invalidates-${writeFails}`;
+		const key = getRemoteGitStatusQueryKey(f.backend, cwd);
+		const stats = { files: [], linesAdded: 1, linesRemoved: 0, complete: false };
+		let reads = 0;
+		const read = () =>
+			getGitLineStatsCached(key, async () => {
+				reads++;
+				return stats;
+			});
+		await read();
+		await read();
+		expect(reads).toBe(1);
+		if (writeFails) f.fail(new Error("connection lost"));
+		const git = createRemoteGitService(f.backend);
+		if (writeFails) await expect(git.stageAll(cwd)).rejects.toThrow("uncertain");
+		else await git.stageAll(cwd);
+		await read();
+		expect(reads).toBe(2);
+	});
 }
 
 const PREVIEW_SHA = "a".repeat(40);

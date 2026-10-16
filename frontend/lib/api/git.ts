@@ -1,4 +1,5 @@
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
+import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type {
 	WorktreeCreateRequest,
@@ -115,6 +116,8 @@ export const gitApi = {
 		}),
 	getGitStatus: (target: GitTarget, signal?: AbortSignal) =>
 		gitRequest<ApiEntity>(gitReadPath(target, "/status"), { signal }),
+	getGitLineStats: (target: GitTarget, signal?: AbortSignal) =>
+		gitRequest<GitLineStats>(gitReadPath(target, "/line-stats"), { signal }),
 	getGitModifications: (
 		target: GitTarget,
 		opts?: {

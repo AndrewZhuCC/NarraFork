@@ -41,6 +41,7 @@ import {
 	useGitAiCommitMessage,
 	useGitCommit,
 	useGitDiscard,
+	useGitLineStats,
 	useGitModifications,
 	useGitStage,
 	useGitStatus,
@@ -54,6 +55,7 @@ import { formatLocaleDateTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionLabels } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
+import { GitLineStatsSummary } from "./GitLineStatsSummary";
 import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
 import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
 import {
@@ -98,6 +100,7 @@ interface DisplayFile {
 	path: string;
 	displayLinesAdded?: number;
 	displayLinesRemoved?: number;
+	statsComplete: boolean;
 }
 
 /** Everything a tree row needs that does not change per node. */
@@ -150,6 +153,17 @@ export function GitChangesTab({
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
 	const { data: status, isLoading, error } = useGitStatus(target);
+	const lineStats = useGitLineStats(target);
+	// No stale row numbers during a refetch/error, nor fallback to legacy status counts.
+	const statsByPath = useMemo(
+		() =>
+			new Map(
+				(lineStats.isFetching || lineStats.error ? [] : (lineStats.data?.files ?? [])).map(
+					(file) => [file.path, file],
+				),
+			),
+		[lineStats.data, lineStats.isFetching, lineStats.error],
+	);
 	const { data: modifications } = useGitModifications(target);
 	const stage = useGitStage(target);
 	const unstage = useGitUnstage(target);
@@ -189,16 +203,18 @@ export function GitChangesTab({
 		.map((f) => ({
 			status: f.status,
 			path: f.path,
-			displayLinesAdded: f.stagedLinesAdded,
-			displayLinesRemoved: f.stagedLinesRemoved,
+			displayLinesAdded: statsByPath.get(f.path)?.stagedLinesAdded,
+			displayLinesRemoved: statsByPath.get(f.path)?.stagedLinesRemoved,
+			statsComplete: statsByPath.get(f.path)?.complete === true,
 		}));
 	const unstagedFiles: DisplayFile[] = status.files
 		.filter((f) => f.status.startsWith("?") || isUnstagedFile(f.status))
 		.map((f) => ({
 			status: f.status,
 			path: f.path,
-			displayLinesAdded: f.unstagedLinesAdded,
-			displayLinesRemoved: f.unstagedLinesRemoved,
+			displayLinesAdded: statsByPath.get(f.path)?.unstagedLinesAdded,
+			displayLinesRemoved: statsByPath.get(f.path)?.unstagedLinesRemoved,
+			statsComplete: statsByPath.get(f.path)?.complete === true,
 		}));
 	const badgeCounts = countBadgeChars([
 		{ section: "staged", files: stagedFiles },
@@ -384,6 +400,7 @@ export function GitChangesTab({
 				<Text size="sm" fw={600} style={{ flexShrink: 0, flexGrow: status.branch ? 0 : 1 }}>
 					{t("panel.changes")}
 				</Text>
+				<GitLineStatsSummary {...lineStats} compact />
 				{status.branch && (
 					<Group gap={2} wrap="nowrap" justify="flex-end" style={{ flex: 1, minWidth: 0 }}>
 						<Text
@@ -743,15 +760,14 @@ function TreeRow({
 function LineStats({ added, removed }: { added?: number; removed?: number }) {
 	if (added == null || removed == null || !Number.isFinite(added) || !Number.isFinite(removed))
 		return null;
-	if (added <= 0 && removed <= 0) return null;
 	return (
 		<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-			{added > 0 && (
+			{(added > 0 || removed === 0) && (
 				<Text size="xs" c="green" ff="monospace">
 					+{added}
 				</Text>
 			)}
-			{removed > 0 && (
+			{(removed > 0 || added === 0) && (
 				<Text size="xs" c="red" ff="monospace">
 					-{removed}
 				</Text>
@@ -775,6 +791,7 @@ function DirectoryRow({
 		ctx.directoryStatsComplete &&
 		files.every(
 			(f) =>
+				f.statsComplete &&
 				f.displayLinesAdded != null &&
 				f.displayLinesRemoved != null &&
 				Number.isFinite(f.displayLinesAdded) &&

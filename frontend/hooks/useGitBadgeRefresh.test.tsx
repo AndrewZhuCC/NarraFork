@@ -80,7 +80,7 @@ afterAll(() => {
 	}
 });
 
-const GIT_KEYS = [["gitStatus"], ["chapterGitStatus"]];
+const GIT_KEYS = [["gitStatus"], ["gitLineStats"], ["chapterGitStatus"]];
 
 describe("useGitBadgeRefresh", () => {
 	test("invalidates the badge queries when the window regains focus", async () => {
@@ -100,7 +100,7 @@ describe("useGitBadgeRefresh", () => {
 		document.dispatchEvent(new window.Event("visibilitychange"));
 		window.dispatchEvent(new window.Event("focus"));
 		await flush();
-		expect(invalidate).toHaveBeenCalledTimes(2); // one refresh = two prefixes
+		expect(invalidate).toHaveBeenCalledTimes(3); // one refresh = three prefixes
 	});
 
 	test("invalidates on WS reconnect, not on the first connect or on disconnect", async () => {

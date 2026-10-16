@@ -4,26 +4,26 @@ import { logger } from "../lib/logger";
 import { normalizePathForOS } from "../lib/platform-path";
 import type { GitStatusSummary } from "./git-service";
 
-type Loader = (signal: AbortSignal) => Promise<GitStatusSummary>;
-interface Waiter {
-	resolve(value: GitStatusSummary): void;
+type Loader<T> = (signal: AbortSignal) => Promise<T>;
+interface Waiter<T> {
+	resolve(value: T): void;
 	reject(error: unknown): void;
 	cleanup(): void;
 }
-interface Job {
+interface Job<T> {
 	key: string;
-	loader: Loader;
+	loader: Loader<T>;
 	controller: AbortController;
-	waiters: Set<Waiter>;
+	waiters: Set<Waiter<T>>;
 	state: "queued" | "running" | "finished";
 	invalidated: boolean;
 	createdAt: number;
 	readers: number;
 	timer?: ReturnType<typeof setTimeout>;
 }
-interface Entry {
-	current: Job;
-	next?: Job;
+interface Entry<T> {
+	current: Job<T>;
+	next?: Job<T>;
 }
 
 export function getLocalGitStatusQueryKey(path: string): string {
@@ -51,15 +51,15 @@ export function localGitStatusScopesOverlap(key: string, rawPath: string): boole
  * No result cache here: fresh HTTP reads and the legacy short-TTL facade share the
  * same actual subprocess. A caller's abort never owns another caller's query.
  */
-export class GitStatusQueryCoordinator {
-	private entries = new Map<string, Entry>();
-	private queue: Job[] = [];
+export class GitStatusQueryCoordinator<T = GitStatusSummary> {
+	private entries = new Map<string, Entry<T>>();
+	private queue: Job<T>[] = [];
 	private running = 0;
 	private clearing = false;
 
 	constructor(private readonly limits = { concurrency: 4, queued: 128, timeoutMs: 30_000 }) {}
 
-	query(key: string, loader: Loader, options: { signal?: AbortSignal } = {}) {
+	query(key: string, loader: Loader<T>, options: { signal?: AbortSignal } = {}) {
 		const signal = options.signal;
 		if (signal?.aborted) return Promise.reject(signal.reason);
 		const entry = this.entries.get(key);
@@ -100,7 +100,7 @@ export class GitStatusQueryCoordinator {
 			return Promise.reject(
 				new AppError("Too many Git status readers; retry shortly", 503, "GIT_STATUS_BUSY"),
 			);
-		const result = new Promise<GitStatusSummary>((resolve, reject) => {
+		const result = new Promise<T>((resolve, reject) => {
 			const abort = () => {
 				shared.waiters.delete(waiter);
 				waiter.cleanup();
@@ -108,7 +108,7 @@ export class GitStatusQueryCoordinator {
 				if (shared.waiters.size === 0)
 					this.cancel(shared, new DOMException("No remaining status readers", "AbortError"));
 			};
-			const waiter: Waiter = {
+			const waiter: Waiter<T> = {
 				resolve,
 				reject,
 				cleanup: () => signal?.removeEventListener("abort", abort),
@@ -145,7 +145,7 @@ export class GitStatusQueryCoordinator {
 		}
 	}
 
-	private cancel(job: Job, error: unknown): void {
+	private cancel(job: Job<T>, error: unknown): void {
 		if (job.state === "finished") return;
 		job.controller.abort(error);
 		this.settle(job, undefined, error);
@@ -153,7 +153,7 @@ export class GitStatusQueryCoordinator {
 		if (job.state === "queued") this.finish(job);
 	}
 
-	private settle(job: Job, value?: GitStatusSummary, error?: unknown): void {
+	private settle(job: Job<T>, value?: T, error?: unknown): void {
 		if (job.timer) clearTimeout(job.timer);
 		for (const waiter of job.waiters) {
 			waiter.cleanup();
@@ -163,7 +163,7 @@ export class GitStatusQueryCoordinator {
 		job.waiters.clear();
 	}
 
-	private finish(job: Job): void {
+	private finish(job: Job<T>): void {
 		if (job.state === "finished") return;
 		if (job.state === "running") this.running--;
 		else this.queue = this.queue.filter((queued) => queued !== job);

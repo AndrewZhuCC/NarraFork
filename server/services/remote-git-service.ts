@@ -4,6 +4,7 @@ import {
 	type GitCommitDetail,
 	type GitCommitPatch,
 } from "@shared/git-commit-preview";
+import type { GitLineStats } from "@shared/git-line-stats";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import {
 	GIT_WORKSPACE_AI_DIFF_BYTES,
@@ -21,6 +22,7 @@ import {
 	commitNotFound,
 	parseCommitMeta,
 } from "./git-commit-preview-parse";
+import { invalidateGitLineStats } from "./git-line-stats-cache";
 import type { GitCommitIdentity, GitStatusFile, GitStatusSummary } from "./git-service";
 import { coordinateGitStatusQuery, invalidateGitStatusQuery } from "./git-status-query";
 
@@ -210,7 +212,10 @@ export function createRemoteGitService(
 			throw error;
 		} finally {
 			// Even an uncertain write must not let the next read reuse pre-write work.
-			if (write) invalidateGitStatusQuery(statusKey(cwd));
+			if (write) {
+				invalidateGitStatusQuery(statusKey(cwd));
+				invalidateGitLineStats(statusKey(cwd));
+			}
 		}
 	}
 	async function mutate(
@@ -233,6 +238,18 @@ export function createRemoteGitService(
 					parseRemoteGitStatus(await request(cwd, "status", {}, sharedSignal)),
 				{ signal },
 			);
+		},
+		async getLineStats(cwd: string): Promise<GitLineStats> {
+			if (backend.supportsGitLineStats !== true) {
+				throw new AppError(
+					"Remote executor lacks git.workspace.line-stats.v1; upgrade the device executor",
+					501,
+					"GIT_LINE_STATS_UNSUPPORTED",
+				);
+			}
+			const result = await request(cwd, "lineStats");
+			if (!result.lineStats) throw new GitError("Remote Git line statistics are missing");
+			return result.lineStats;
 		},
 		async getFileDiff(cwd: string, path: string, staged = false, maxBytes = 200_000) {
 			const result = await request(cwd, "diff", { files: [path], staged, maxBytes });

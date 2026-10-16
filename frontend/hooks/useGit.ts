@@ -11,6 +11,7 @@ import {
 	type GitCommitDetail,
 	type GitCommitPatch,
 } from "../../shared/git-commit-preview";
+import type { GitLineStats } from "../../shared/git-line-stats";
 import type { GitWorkspaceSummary } from "../../shared/git-workspace";
 import { type ApiError, api } from "../lib/api";
 import {
@@ -139,6 +140,7 @@ const GIT_QUERY_GC_TIME_MS = 60_000;
 const GIT_WORKSPACE_RECOVERY_INTERVAL_MS = 30_000;
 export const GIT_FACT_QUERIES = [
 	"gitStatus",
+	"gitLineStats",
 	"gitModifications",
 	"gitDiff",
 	"gitLog",
@@ -353,20 +355,22 @@ async function readWorkspace<T>(
 	qc: QueryClient,
 	target: GitTarget | null | undefined,
 	read: () => Promise<T>,
+	reprobeUnavailable = true,
 ): Promise<T> {
 	try {
 		return await read();
 	} catch (error) {
 		const failure = error as ApiError;
-		// An older executor missing preview operations is not a workspace change.
-		// Re-probing here would unmount/reopen its consumer and repeat the same 409.
-		const unsupportedPreview =
-			failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED;
+		// An older executor missing an optional read is not a workspace change.
+		// Re-probing would unmount/reopen its consumer and repeat the same failure.
+		const unsupportedOperation =
+			(failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED) ||
+			failure?.data?.code === "GIT_LINE_STATS_UNSUPPORTED";
 		if (
 			target &&
 			typeof target !== "string" &&
-			!unsupportedPreview &&
-			[401, 403, 409, 503].includes(failure?.status)
+			!unsupportedOperation &&
+			([401, 403, 409].includes(failure?.status) || (reprobeUnavailable && failure?.status === 503))
 		) {
 			if ([401, 403].includes(failure.status)) blockGitSummary(qc, target.narratorId);
 			void qc.cancelQueries({ queryKey: ["narrators", target.narratorId], exact: true });
@@ -542,8 +546,6 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 				totalFiles: counts.totalFiles,
 				totalFilesExact: counts.totalFilesExact,
 				truncated: counts.truncated,
-				linesAdded: counts.linesAdded,
-				linesRemoved: counts.linesRemoved,
 			});
 		},
 		[qc, narratorId, scope, data, accessFailure, denied],
@@ -627,6 +629,18 @@ export function invalidateGitStatusPushQueries(
 	}
 }
 
+export function useGitLineStats(target: GitTarget | undefined | null) {
+	const qc = useQueryClient();
+	return useQuery<GitLineStats>({
+		queryKey: ["gitLineStats", gitTargetKey(target)],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () => api.getGitLineStats(target as GitTarget, signal), false),
+		enabled: !!target,
+		retry: false,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+}
+
 export function useGitStatus(target: GitTarget | undefined | null) {
 	const qc = useQueryClient();
 	return useQuery<GitStatusSummary>({
@@ -679,6 +693,7 @@ export function useGitBadgeRefresh() {
 			if (now - lastRefreshAt < GIT_BADGE_REFRESH_MIN_INTERVAL_MS) return;
 			lastRefreshAt = now;
 			void qc.invalidateQueries({ queryKey: ["gitStatus"] });
+			void qc.invalidateQueries({ queryKey: ["gitLineStats"] });
 			void qc.invalidateQueries({ queryKey: ["chapterGitStatus"] });
 		};
 		const unobserve = observePageLifecycle({ onForeground: refresh });

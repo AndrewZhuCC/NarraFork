@@ -33,7 +33,14 @@ function setup() {
 	const target = { narratorId: "n", workspaceKey: "w", repositoryKey: "r", canWrite: true };
 	const subscriptions = new GitWorkspaceSubscriptions(qc, transport);
 	const seed = () => {
-		for (const prefix of ["gitStatus", "gitDiff", "gitModifications", "gitLog", "gitStashList"])
+		for (const prefix of [
+			"gitStatus",
+			"gitLineStats",
+			"gitDiff",
+			"gitModifications",
+			"gitLog",
+			"gitStashList",
+		])
 			qc.setQueryData([prefix, "w"], { value: 1 });
 	};
 	const emit = (type: string, extra: Record<string, unknown> = {}) => {
@@ -75,6 +82,7 @@ describe("Git workspace WS subscriptions", () => {
 		s.seed();
 		s.emit("git_workspace_changed", { version: 1, categories: ["worktree"] });
 		expect(s.stale("gitStatus")).toBe(true);
+		expect(s.stale("gitLineStats")).toBe(true);
 		expect(s.stale("gitDiff")).toBe(true);
 		expect(s.stale("gitLog")).toBe(false);
 		expect(s.stale("gitStashList")).toBe(false);
@@ -126,8 +134,10 @@ describe("Git workspace WS subscriptions", () => {
 		const off = s.subscriptions.subscribe("chapter");
 		expect(s.sent[0]?.chapterId).toBe("chapter");
 		s.qc.setQueryData(["gitLog", "chapter"], []);
+		s.qc.setQueryData(["gitLineStats", "chapter"], { linesAdded: 10 });
 		s.emit("git_workspace_error", { code: "access_denied" });
 		expect(s.qc.getQueryData(["gitLog", "chapter"])).toBeUndefined();
+		expect(s.qc.getQueryData(["gitLineStats", "chapter"])).toBeUndefined();
 		s.subscriptions.retry("chapter");
 		expect(s.sent[1]?.type).toBe("git_workspace_subscribe");
 		s.subscriptions.retry("chapter");

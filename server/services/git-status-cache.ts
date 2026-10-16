@@ -7,6 +7,7 @@
 import { logger } from "../lib/logger";
 import { invalidateBoundaries } from "./git-commit-boundary-cache";
 import { gitDiscoveryCache } from "./git-discovery-cache";
+import { clearGitLineStatsCache, invalidateLocalGitLineStats } from "./git-line-stats-cache";
 import { type GitStatusSummary, gitService, withGitRequestContext } from "./git-service";
 import {
 	clearGitStatusQueries,
@@ -128,6 +129,7 @@ export function peekStatusSummary(rawPath: string): GitStatusSummary | null {
  * Call this after a write operation (commit, stage, discard) or on file change.
  */
 export function invalidateStatus(rawPath: string): void {
+	invalidateLocalGitLineStats(rawPath);
 	// Commit boundaries are derived from the same working tree, so they go stale on
 	// exactly the events that invalidate a status. Invalidating both here — rather than
 	// asking every call site to remember a second function — is what keeps them from
@@ -169,6 +171,7 @@ export function invalidateStatus(rawPath: string): void {
  * so one `dropStatus` call at each site covers both caches.
  */
 export function dropStatus(rawPath: string): void {
+	invalidateLocalGitLineStats(rawPath);
 	invalidateLocalGitStatusQueries(rawPath);
 	invalidateBoundaries(rawPath);
 	gitDiscoveryCache.invalidate(
@@ -184,6 +187,7 @@ export function dropStatus(rawPath: string): void {
 
 /** Clear the entire cache. Used on shutdown / test teardown. */
 export function clearStatusCache(): void {
+	clearGitLineStatsCache();
 	clearGitStatusQueries();
 	cache.clear();
 }
