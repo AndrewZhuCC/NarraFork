@@ -137,6 +137,7 @@ export type {
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
+	KnowledgeSubmissionOutcome,
 	KnowledgeSubmissionStatus,
 	KnowledgeTag,
 	KnowledgeTagType,

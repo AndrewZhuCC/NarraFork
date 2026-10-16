@@ -579,6 +579,16 @@ knowledgeRoutes.get("/my-open-submissions", async (c) => {
 	return c.json(await knowledgeBranchService.listMyOpenSubmissions(principalOf(c), parsed.data));
 });
 
+// Recent verdicts on the caller's own submissions (approved / rejected / changes requested).
+// Powers the notification bell. Ids, status, and findings only — no title or body, so the
+// bell cannot become a side channel for a classified entry the caller cannot read.
+// Own rows only; a stranger's call returns their own (empty) list, never this user's.
+knowledgeRoutes.get("/my-submission-outcomes", async (c) => {
+	const parsed = listDraftSubmissionsQuerySchema.safeParse({ limit: c.req.query("limit") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeBranchService.listMySubmissionOutcomes(principalOf(c), parsed.data));
+});
+
 // ─── Bulk grants + collection ACL readback (admin only) ─────────────────
 
 // Grant one credential (clearance / tag / review) to many users at once. The Zod schema caps

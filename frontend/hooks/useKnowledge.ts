@@ -356,6 +356,8 @@ export function useReviewKnowledgeSubmission() {
 			qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entry"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+			qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 		},
 	});
 }
@@ -372,6 +374,8 @@ export function useResolveKnowledgeConflict() {
 			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entry"] });
+			qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 		},
 	});
 }
@@ -758,6 +762,33 @@ export function useReviewInboxCount() {
 	});
 }
 
+/** React Query key for the author's recent verdicts (notification bell). */
+export const SUBMISSION_OUTCOMES_KEY = ["knowledge", "submissionOutcomes"] as const;
+
+/**
+ * Verdicts on the caller's own submissions from the last 30 days.
+ *
+ * The bell uses this so an author hears about approve / reject / request-changes
+ * without those events being copied into the notification-center table.
+ */
+export function useMyKnowledgeSubmissionOutcomes(limit?: number) {
+	return useQuery({
+		queryKey: [...SUBMISSION_OUTCOMES_KEY, limit ?? null],
+		queryFn: () => api.listMyKnowledgeSubmissionOutcomes({ limit }),
+		staleTime: STALE,
+	});
+}
+
+/**
+ * True when the bell should show a knowledge-review section: open reviews for this
+ * user, or a recent verdict on something they submitted.
+ */
+export function useHasKnowledgeReviewNotices(): boolean {
+	const inbox = useReviewInboxCount();
+	const outcomes = useMyKnowledgeSubmissionOutcomes();
+	return (inbox.data?.count ?? 0) > 0 || (outcomes.data?.length ?? 0) > 0;
+}
+
 /**
  * Subscribe to knowledge-base publish/review pushes and invalidate the affected
  * queries. The WS frame carries ids only (no entry content), so every refresh goes
@@ -804,6 +835,7 @@ export function useKnowledgeNotifications(): void {
 				}
 				if (data.type !== "knowledge:review_inbox_changed") return;
 				qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+				qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 				qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
@@ -840,6 +872,7 @@ function invalidateSubmissionViews(qc: ReturnType<typeof useQueryClient>, id?: s
 	qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 	qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
 	qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+	qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 	// The history list is keyed by personal-entry (draft) id; invalidate the whole prefix
 	// when the caller only knows the submission id.
 	if (id) qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });
