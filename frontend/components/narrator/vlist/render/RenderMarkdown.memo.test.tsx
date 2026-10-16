@@ -473,6 +473,21 @@ describe("the mounted real RenderMarkdown memo", () => {
 			subscription.mockRestore();
 		}
 	});
+	test("OpenUI can shrink below its estimate without minimum heights trapping blank space", async () => {
+		const measured = measureMarkdown(
+			"```openui-lang\nroot = Card([])\n```\n\nAfter the widget",
+			640,
+		);
+		await render({ measured, onUnknownHeight: noop });
+		const widget = node('[data-vlist-unknown="openui"]');
+		const flow = widget.closest("[data-vlist-flow-block]") as HTMLElement;
+		const host = flow.parentElement as HTMLElement;
+		expect(widget.style.minHeight).toBeFalsy();
+		expect(flow.style.minHeight).toBeFalsy();
+		expect(host.style.minHeight).toBeFalsy();
+		expect(container.textContent).toContain("After the widget");
+	});
+
 	test("keeps the unknown-height observer across equal wrappers and replaces changed callbacks", async () => {
 		const measured: MeasuredElement = {
 			height: 50,

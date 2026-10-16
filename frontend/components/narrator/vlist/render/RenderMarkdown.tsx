@@ -325,9 +325,12 @@ function RenderMarkdownBody({
 	// When any unpredictable block is present, switch the whole host to a
 	// simple stacked flow. Absolute frame tops cannot reflow subsequent siblings
 	// after a mermaid/katex grows past its placeholder; stacking lets the host
-	// settle to the real total height, which the shell then writes back as an
-	// override. Predicted `minHeight` still reserves space for the first paint.
+	// settle to the real total height, which the shell writes back as an override.
+	// Other unknown blocks keep their placeholder reservation. OpenUI reports
+	// its intrinsic size and can shrink after interactions; estimates must not
+	// become permanent minimum heights in any of its flowing wrappers.
 	if (hasUnknown) {
+		const hasOpenUI = blocks.some((block) => block.kind === "unknown" && block.tag === "openui");
 		return (
 			<div
 				ref={hostRef}
@@ -335,7 +338,7 @@ function RenderMarkdownBody({
 				style={{
 					position: "relative",
 					width: contentWidth,
-					minHeight: frame.contentHeight,
+					minHeight: hasOpenUI ? undefined : frame.contentHeight,
 				}}
 			>
 				{blocks.map((block, index) => {
@@ -349,7 +352,10 @@ function RenderMarkdownBody({
 							style={{
 								position: "relative",
 								width: "100%",
-								minHeight: blockFrame.height,
+								minHeight:
+									block.kind === "unknown" && block.tag === "openui"
+										? undefined
+										: blockFrame.height,
 								marginTop: block.marginTop,
 								boxSizing: "border-box",
 							}}
@@ -1683,7 +1689,7 @@ function UnknownBlockView({
 				style={{
 					position: "relative",
 					width: "100%",
-					minHeight: frame.height,
+					minHeight: block.tag === "openui" ? undefined : frame.height,
 					boxSizing: "border-box",
 				}}
 			>
