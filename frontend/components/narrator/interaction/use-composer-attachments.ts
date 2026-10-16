@@ -1,8 +1,10 @@
 import { notifications } from "@mantine/notifications";
+import type { ComposerAsset } from "@shared/composer-document";
 import type React from "react";
 import { type SetStateAction, useCallback, useEffect, useRef, useState } from "react";
 import {
 	clearDraftImageAttachments,
+	getComposerAssetId,
 	getDraftImageAttachmentKey,
 	loadDraftImageAttachments,
 	saveDraftImageAttachments,
@@ -19,6 +21,8 @@ export interface UseComposerAttachmentsOptions {
 }
 
 export interface UseComposerAttachmentsResult {
+	/** Stable manifest for legacy array consumers adopting inline resource bindings. */
+	composerAssets: ComposerAsset[];
 	attachedImages: File[];
 	attachedTextFiles: File[];
 	/** Live mirror of `attachedImages` for callbacks registered once (user-chat bridge). */
@@ -33,6 +37,8 @@ export interface UseComposerAttachmentsResult {
 	updateAttachedImages: (next: SetStateAction<File[]>) => void;
 	/** Text-file counterpart of `updateAttachedImages`. */
 	updateAttachedTextFiles: (next: SetStateAction<File[]>) => void;
+	/** Declare document-owned assets and remove unreferenced local blobs, including late hydrates. */
+	reconcileDocumentAssets: (ids: readonly string[]) => void;
 	/** Clear on-screen attachments for an in-flight send WITHOUT touching the stored draft. */
 	hideAttachedFilesForSend: () => void;
 	/** Clear attachments AND the persisted draft record. */
@@ -55,6 +61,19 @@ export function useComposerAttachments(
 	options: UseComposerAttachmentsOptions,
 ): UseComposerAttachmentsResult {
 	const { narratorId, currentUserId, sendingRef, t } = options;
+	const documentAssetsRef = useRef({
+		narratorId,
+		currentUserId,
+		allowedIds: null as Set<string> | null,
+	});
+	// Reset ownership during render, before a child can declare the new document
+	// and before an old IndexedDB promise can apply to the new owner.
+	if (
+		documentAssetsRef.current.narratorId !== narratorId ||
+		documentAssetsRef.current.currentUserId !== currentUserId
+	) {
+		documentAssetsRef.current = { narratorId, currentUserId, allowedIds: null };
+	}
 
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
 	const attachedImagesRef = useRef<File[]>(attachedImages);
@@ -77,11 +96,14 @@ export function useComposerAttachments(
 	}, []);
 	const updateAttachedImages = useCallback((next: SetStateAction<File[]>) => {
 		attachmentDraftLocalVersionRef.current++;
-		setAttachedImages((prev) => {
-			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
-			attachedImagesRef.current = resolved;
-			return resolved;
-		});
+		const resolved = typeof next === "function" ? next(attachedImagesRef.current) : next;
+		for (const file of resolved) {
+			const id = getComposerAssetId(file);
+			// New local uploads are allowed before the document adopts their ids.
+			documentAssetsRef.current.allowedIds?.add(id);
+		}
+		attachedImagesRef.current = resolved;
+		setAttachedImages(resolved);
 	}, []);
 	/**
 	 * Text-file counterpart of `updateAttachedImages`.
@@ -92,11 +114,33 @@ export function useComposerAttachments(
 	 */
 	const updateAttachedTextFiles = useCallback((next: SetStateAction<File[]>) => {
 		attachmentDraftLocalVersionRef.current++;
-		setAttachedTextFiles((prev) => {
-			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
-			attachedTextFilesRef.current = resolved;
-			return resolved;
-		});
+		const resolved = typeof next === "function" ? next(attachedTextFilesRef.current) : next;
+		for (const file of resolved) {
+			const id = getComposerAssetId(file);
+			documentAssetsRef.current.allowedIds?.add(id);
+		}
+		attachedTextFilesRef.current = resolved;
+		setAttachedTextFiles(resolved);
+	}, []);
+	const reconcileDocumentAssets = useCallback((ids: readonly string[]) => {
+		const allowed = new Set(ids);
+		documentAssetsRef.current.allowedIds = allowed;
+		// This is a document ownership declaration, NOT a local edit. Bumping the
+		// local version here would discard every valid blob in an in-flight hydrate.
+		const images = attachedImagesRef.current.filter((file) =>
+			allowed.has(getComposerAssetId(file)),
+		);
+		const textFiles = attachedTextFilesRef.current.filter((file) =>
+			allowed.has(getComposerAssetId(file)),
+		);
+		if (images.length !== attachedImagesRef.current.length) {
+			attachedImagesRef.current = images;
+			setAttachedImages(images);
+		}
+		if (textFiles.length !== attachedTextFilesRef.current.length) {
+			attachedTextFilesRef.current = textFiles;
+			setAttachedTextFiles(textFiles);
+		}
 	}, []);
 	const persistCurrentDraftAttachments = useCallback(
 		(targetUserId: string, targetNarratorId: string) => {
@@ -143,6 +187,7 @@ export function useComposerAttachments(
 
 	useEffect(() => {
 		let cancelled = false;
+		const scope = documentAssetsRef.current;
 		const localVersionAtRequest = attachmentDraftLocalVersionRef.current;
 		const draftKey = currentUserId ? getDraftImageAttachmentKey(currentUserId, narratorId) : null;
 		attachmentDraftHydratedKeyRef.current = null;
@@ -160,13 +205,20 @@ export function useComposerAttachments(
 
 		void loadDraftImageAttachments(currentUserId, narratorId)
 			.then((loaded) => {
-				if (cancelled) return;
+				if (cancelled || scope !== documentAssetsRef.current) return;
 				attachmentDraftHydratedKeyRef.current = draftKey;
 				if (attachmentDraftLocalVersionRef.current === localVersionAtRequest) {
-					attachedImagesRef.current = loaded.images;
-					attachedTextFilesRef.current = loaded.textFiles;
-					setAttachedImages(loaded.images);
-					setAttachedTextFiles(loaded.textFiles);
+					const allowed = documentAssetsRef.current.allowedIds;
+					const images = loaded.images.filter(
+						(file) => !allowed || allowed.has(getComposerAssetId(file)),
+					);
+					const textFiles = loaded.textFiles.filter(
+						(file) => !allowed || allowed.has(getComposerAssetId(file)),
+					);
+					attachedImagesRef.current = images;
+					attachedTextFilesRef.current = textFiles;
+					setAttachedImages(images);
+					setAttachedTextFiles(textFiles);
 					// An entry that was stored but cannot be rebuilt (blob evicted by the
 					// browser, unreadable record) must be reported: silently restoring
 					// two of three attachments looks like the user misremembered.
@@ -182,7 +234,7 @@ export function useComposerAttachments(
 				}
 			})
 			.catch((err) => {
-				if (cancelled) return;
+				if (cancelled || scope !== documentAssetsRef.current) return;
 				warnDraftAttachmentsPersistenceFailure("load", err);
 				attachmentDraftHydratedKeyRef.current = draftKey;
 				persistLocalChanges();
@@ -227,7 +279,24 @@ export function useComposerAttachments(
 		warnDraftAttachmentsPersistenceFailure,
 	]);
 
+	const composerAssets: ComposerAsset[] = [
+		...attachedImages.map((file) => ({
+			id: getComposerAssetId(file),
+			kind: "image" as const,
+			name: file.name,
+			size: file.size,
+			mimeType: file.type,
+		})),
+		...attachedTextFiles.map((file) => ({
+			id: getComposerAssetId(file),
+			kind: "textFile" as const,
+			name: file.name,
+			size: file.size,
+			mimeType: file.type,
+		})),
+	];
 	return {
+		composerAssets,
 		attachedImages,
 		attachedTextFiles,
 		attachedImagesRef,
@@ -237,6 +306,7 @@ export function useComposerAttachments(
 		dragCounterRef,
 		updateAttachedImages,
 		updateAttachedTextFiles,
+		reconcileDocumentAssets,
 		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 	};

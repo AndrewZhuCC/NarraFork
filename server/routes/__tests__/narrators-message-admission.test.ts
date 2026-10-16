@@ -5,6 +5,11 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
+import {
+	parseOptionalComposerDocument,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../../lib/composer-document";
 import { AppError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
@@ -44,6 +49,7 @@ function fixture(
 		subagent?: boolean;
 		compact?: boolean;
 		modelOverride?: boolean;
+		expandedCommand?: boolean;
 		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
 	} = {},
@@ -99,6 +105,9 @@ function fixture(
 		narratorRoutes: routes,
 		ValidationError,
 		parseFileReferenceInput,
+		parseOptionalComposerDocument,
+		validateComposerProjection,
+		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -159,7 +168,13 @@ function fixture(
 								bashCommand: "pwd",
 								command: { modelOverride: { model: "replacement", mode: "temporary" } },
 							}
-						: { resolved: false },
+						: options.expandedCommand
+							? {
+									resolved: true,
+									expandedPrompt: "expanded skill instructions",
+									rawCommand: message,
+								}
+							: { resolved: false },
 		getUserLanguage: async () => "zh-CN",
 		getUserReplyInLanguage: async () => true,
 		acceptUserMessage: accept,
@@ -227,6 +242,24 @@ function fixture(
 	};
 }
 
+test.each([
+	false,
+	true,
+])("subagent expanded commands discard obsolete text-only layout (busy=%s)", async (busy) => {
+	const f = fixture({ subagent: true, busy, expandedCommand: true });
+	const document = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "/skill explain" }] }],
+		assets: [],
+	};
+	const response = await f.post({ message: "/skill explain", composerDocument: document });
+	expect(response.status).toBe(busy ? 202 : 201);
+	const input = busy ? f.pushSub.mock.calls[0]?.[2] : f.resume.mock.calls[0]?.[0];
+	expect(input?.composerDocument).toBeUndefined();
+	expect(busy ? f.pushSub.mock.calls[0]?.[1] : input?.prompt).toBe("expanded skill instructions");
+	expect(input?.commandText).toBe("/skill explain");
+});
+
 function multipart(interrupt?: string) {
 	const body = new FormData();
 	body.set("message", "hello");
@@ -282,6 +315,20 @@ describe("save_dump immediate HTTP control", () => {
 });
 
 describe("primary HTTP message admission", () => {
+	test("semantic document is validated and passed intact to durable admission", async () => {
+		const f = fixture({ buffered: true });
+		const document = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "text", text: "rich" }] }],
+			assets: [],
+		};
+		expect((await f.post({ message: "rich", composerDocument: document })).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
+		expect((await f.post({ message: "different", composerDocument: document })).status).toBe(400);
+		expect(
+			(await f.post({ message: "rich", composerDocument: { ...document, version: 9 } })).status,
+		).toBe(400);
+	});
 	test.each([
 		"turn",
 		"tool",

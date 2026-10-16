@@ -1,0 +1,32 @@
+.fullscreen {
+	position: fixed;
+	inset: 16px;
+	z-index: 400;
+	padding: var(--mantine-spacing-md);
+	background: var(--mantine-color-body);
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-md);
+	box-shadow: 0 0 0 100vmax rgb(0 0 0 / 55%);
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+}
+
+.fullscreen [data-inline-composer] {
+	flex: 1;
+	min-height: 0;
+}
+
+.fullscreen [data-composer-scroll] {
+	flex: 1;
+	min-height: 0;
+	max-height: none;
+	display: flex;
+	flex-direction: column;
+}
+
+.fullscreen [role="textbox"] {
+	flex: 1 0 auto;
+	max-height: none;
+	min-height: 0;
+}

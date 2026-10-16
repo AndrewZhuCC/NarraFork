@@ -49,6 +49,11 @@ import {
 } from "../lib/boolean-override";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
+	parseOptionalComposerDocument,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../lib/composer-document";
+import {
 	measureMessageCharacters,
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
@@ -395,7 +400,17 @@ export type { ContinuationStallState };
  */
 export { computeContinuationStallState };
 
-export function parseQueuedNewCommand(message: string, commandText?: string | null) {
+export function parseQueuedNewCommand(
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+) {
+	if (
+		composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+	)
+		return null;
 	const raw = commandText?.trim().startsWith("/new") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/new(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
@@ -408,7 +423,17 @@ export function parseQueuedNewCommand(message: string, commandText?: string | nu
  * immediately; on consumption we parse it here and run executeQueuedGoalCommand.
  * Returns null (fall through to a normal model turn) when there is no objective.
  */
-export function parseQueuedGoalCommand(message: string, commandText?: string | null) {
+export function parseQueuedGoalCommand(
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+) {
+	if (
+		composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+	)
+		return null;
 	const raw = commandText?.trim().startsWith("/goal") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/goal(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
@@ -808,8 +833,12 @@ async function resumeNextBufferedMessageUnlocked(
 		// differently: a terminal command owns its attachments from here on, while a
 		// plain message keeps its files on disk until delivery has actually succeeded —
 		// they are what a restore needs when it has not.
-		const newCommand = parseQueuedNewCommand(first.text, first.commandText);
-		const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
+		const newCommand = parseQueuedNewCommand(first.text, first.commandText, first.composerDocument);
+		const goalCommand = parseQueuedGoalCommand(
+			first.text,
+			first.commandText,
+			first.composerDocument,
+		);
 		const controlCommand = first.executionIntent?.controlCommand;
 		if (newCommand || controlCommand) {
 			const commandMessage = await withInboxOwner(narratorId, async () => {
@@ -3118,6 +3147,7 @@ async function feedMessageUnlocked(
 			commandText,
 			createdBy: userId,
 			origin,
+			composerDocument: accepted.composerDocument,
 		})) as unknown as typeof narratorMessages.$inferSelect;
 		if (accepted.executionIntent?.modelOverride) {
 			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
@@ -3509,6 +3539,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 // === Public API ===
 
 export interface UserMessageAdmissionOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
@@ -3611,6 +3642,7 @@ export async function acceptUserMessage(
 					"fifo",
 					options.executionIntent,
 					queueMode,
+					options.composerDocument,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3641,8 +3673,8 @@ export async function acceptUserMessage(
 						// exits. Leave it to the command-aware buffered consumer, not feedMessage.
 						const queuedCommand =
 							options.executionIntent?.controlCommand ||
-							parseQueuedNewCommand(prompt, options.commandText) ||
-							parseQueuedGoalCommand(prompt, options.commandText);
+							parseQueuedNewCommand(prompt, options.commandText, options.composerDocument) ||
+							parseQueuedGoalCommand(prompt, options.commandText, options.composerDocument);
 						claimed = queuedCommand
 							? undefined
 							: await claimInboxHead(
@@ -6069,6 +6101,10 @@ function extractImageRefs(
 					imageId: block.imageId as string,
 					filename: block.filename as string,
 					mediaType: block.mediaType as string,
+					...(typeof block.size === "number" ? { size: block.size } : {}),
+					...(typeof block.sourceMimeType === "string"
+						? { sourceMimeType: block.sourceMimeType }
+						: {}),
 					...dimensions,
 					...(uploadNarratorId ? { uploadNarratorId } : {}),
 				});
@@ -6276,6 +6312,7 @@ export async function editAndRegenerate(
 }
 
 export interface EditAndRegenerateOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
@@ -6341,6 +6378,12 @@ async function editAndRegenerateUnlocked(
 	const selectedReferences = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(originalBlocks),
 	);
+	const document = parseOptionalComposerDocument(opts?.composerDocument);
+	validateComposerProjection(
+		document,
+		newContent,
+		selectedReferences.map((snapshot) => snapshot.reference),
+	);
 	const actualImageIds = originalBlocks
 		.filter((block) => block.type === "image" && typeof block.imageId === "string")
 		.map((block) => block.imageId as string);
@@ -6353,6 +6396,38 @@ async function editAndRegenerateUnlocked(
 		opts?.keepTextFilePaths,
 	);
 
+	if (document && targetMsg.composerDocument) {
+		validateComposerAssets(
+			document,
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "image")
+					.filter((_, index) => keepImageIds.includes(actualImageIds[index])),
+				...(opts?.newImages ?? []),
+			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "textFile")
+					.filter((_, index) => keepTextFilePaths.includes(actualTextFilePaths[index])),
+				...(opts?.newTextFiles ?? []),
+			],
+		);
+	}
+	validateComposerAssets(
+		document,
+		[
+			...extractImageRefs(originalBlocks, targetMsg.narratorId).filter((image) =>
+				keepImageIds.includes(image.imageId),
+			),
+			...(opts?.newImages ?? []),
+		],
+		[
+			...extractTextFileRefs(originalBlocks).filter((file) =>
+				keepTextFilePaths.includes(file.filePath),
+			),
+			...(opts?.newTextFiles ?? []),
+		],
+	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
 	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
@@ -6503,7 +6578,11 @@ async function editAndRegenerateUnlocked(
 		for (const file of opts?.newImages ?? []) {
 			const ref = await saveUploadedImage(narratorId, file);
 			createdImageIds.push(ref.imageId);
-			savedNewImages.push({ ...ref, uploadNarratorId: narratorId });
+			savedNewImages.push({
+				...ref,
+				uploadNarratorId: narratorId,
+				...(document ? { size: file.size, sourceMimeType: file.type } : {}),
+			});
 		}
 
 		const savedNewTextFiles: TextFileRef[] = [];
@@ -6555,6 +6634,7 @@ async function editAndRegenerateUnlocked(
 		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 			contentText: effectivePrompt,
 			contentJson: newContentJson,
+			composerDocument: document ?? null,
 		});
 		copyOnWriteSucceeded = true;
 	} catch (error) {

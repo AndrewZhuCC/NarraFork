@@ -178,6 +178,29 @@ test("successful edit also refreshes attachments and preserves acceptance time",
 	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
 });
 
+test("structured edit forwards the exact document and explicit empty keep lists; ok:false retains the draft", async () => {
+	const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: false });
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: " mixed body " }] }],
+		assets: [],
+	};
+	const payload = {
+		keepImageIds: [],
+		keepTextFiles: [],
+		newImages: [],
+		newTextFiles: [],
+		fileReferences: [],
+		composerDocument: document,
+	};
+	await act(async () => {
+		expect(await actions.handleSaveEditQueued(queue[0], " mixed body ", payload)).toBe(false);
+	});
+	expect(update).toHaveBeenCalledWith("n", "a", " mixed body ", payload);
+	expect(update.mock.calls[0][3]?.composerDocument).toBe(document);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
 test("urgent dispatch hides ordinary rows, requires delivery ACK and suppresses stale snapshots", async () => {
 	const receipt = Promise.withResolvers<{ ok: true; delivered: boolean }>();
 	spyOn(api, "setBufferedMessageMode").mockReturnValue(receipt.promise);

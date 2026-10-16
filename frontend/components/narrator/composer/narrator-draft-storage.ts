@@ -4,12 +4,14 @@ import {
 	SESSION_STORE_LIMITS,
 	writeSession,
 } from "@frontend/lib/session-store";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import {
 	copyFileReferences,
 	type FileReferenceInput,
 	readFileReferences,
+	readInputComposerDocument,
 	sameFileReferenceInput,
 } from "./file-reference-input";
 
@@ -33,6 +35,7 @@ export const MAX_LOCAL_DRAFT_MIRROR_CHARS = 16_000;
 export interface StoredNarratorInputDraft {
 	text: string;
 	fileReferences?: FileReference[];
+	composerDocument?: ComposerDocument;
 	serverRevision: number | null;
 	serverUpdatedAt: string | null;
 	/** Present only when this exact text/reference snapshot was acknowledged by the server. */
@@ -54,6 +57,7 @@ interface LegacyStoredNarratorInputDraftEnvelope {
 export interface ResolvedNarratorDraft {
 	text: string;
 	fileReferences?: FileReference[];
+	composerDocument?: ComposerDocument;
 	conflict: boolean;
 }
 
@@ -228,9 +232,15 @@ export function readNarratorInputDraft(
 			return drop();
 		}
 		const fileReferences = readFileReferences(parsed.fileReferences, parsed.text);
+		const composerDocument = readInputComposerDocument(
+			parsed.composerDocument,
+			parsed.text,
+			fileReferences,
+		);
 		return {
 			text: parsed.text,
 			...(fileReferences.length ? { fileReferences } : {}),
+			...(composerDocument ? { composerDocument } : {}),
 			serverRevision: parsed.serverRevision ?? null,
 			serverUpdatedAt: parsed.serverUpdatedAt ?? null,
 			...(typeof parsed.syncedRevision === "number" &&
@@ -264,6 +274,7 @@ export function persistNarratorInputDraft(
 	fileReferences: FileReference[] = [],
 	// undefined: legacy/unknown snapshot; null: explicitly unsynced, including a clear.
 	syncedInput?: FileReferenceInput | null,
+	composerDocument?: ComposerDocument,
 ): boolean {
 	const id = getNarratorDraftStorageId(userId, narratorId);
 	if (text.length > MAX_LOCAL_DRAFT_MIRROR_CHARS) {
@@ -279,16 +290,24 @@ export function persistNarratorInputDraft(
 		removeSession("narrator-draft", id);
 		return false;
 	}
-	const envelope: StoredNarratorInputDraftEnvelope = {
-		version: INPUT_DRAFT_STORAGE_VERSION,
+	const document = readInputComposerDocument(composerDocument, text, references);
+	// A supplied but invalid layout must not be acknowledged or silently mirrored as lossless.
+	if (composerDocument && !document) {
+		removeSession("narrator-draft", id);
+		return false;
+	}
+	const input = {
 		text,
 		fileReferences: references,
+		...(document ? { composerDocument: document } : {}),
+	};
+	const envelope: StoredNarratorInputDraftEnvelope = {
+		version: INPUT_DRAFT_STORAGE_VERSION,
+		...input,
 		serverRevision,
 		serverUpdatedAt,
 		...(syncedInput !== undefined
-			? syncedInput &&
-				serverRevision != null &&
-				sameFileReferenceInput({ text, fileReferences: references }, syncedInput)
+			? syncedInput && serverRevision != null && sameFileReferenceInput(input, syncedInput)
 				? { syncedRevision: serverRevision }
 				: { unsynced: true as const }
 			: {}),
@@ -316,7 +335,7 @@ export function persistNarratorInputDraft(
 		"narrator-draft",
 		id,
 		serialized,
-		text || references.length ? "durable" : "disposable",
+		text || references.length || document?.assets.length ? "durable" : "disposable",
 	);
 	return true;
 }
@@ -340,7 +359,8 @@ export function canHydrateNarratorDraftFromMeta(
 	return (
 		isAcknowledgedNarratorDraft(local) &&
 		local.serverRevision === meta.revision &&
-		meta.hasDraft === !!(local.text || local.fileReferences?.length)
+		meta.hasDraft ===
+			!!(local.text || local.fileReferences?.length || local.composerDocument?.assets.length)
 	);
 }
 
@@ -348,26 +368,37 @@ export function resolveHydratedNarratorDraft(options: {
 	local: StoredNarratorInputDraft;
 	serverText: string;
 	serverFileReferences?: FileReference[];
+	serverComposerDocument?: ComposerDocument;
 	serverRevision: number;
 	currentInput: string;
 	currentFileReferences?: FileReference[];
+	currentComposerDocument?: ComposerDocument;
 	localChangedSinceRequest: boolean;
 }): ResolvedNarratorDraft {
-	const local = {
-		text: options.local.text,
-		fileReferences: readFileReferences(options.local.fileReferences, options.local.text),
+	const input = (text: string, refs: unknown, doc: unknown): FileReferenceInput => {
+		const fileReferences = readFileReferences(refs, text);
+		const composerDocument = readInputComposerDocument(doc, text, fileReferences);
+		return { text, fileReferences, ...(composerDocument ? { composerDocument } : {}) };
 	};
-	const server = {
-		text: options.serverText,
-		fileReferences: readFileReferences(options.serverFileReferences, options.serverText),
-	};
-	const current = {
-		text: options.currentInput,
-		fileReferences: readFileReferences(options.currentFileReferences, options.currentInput),
-	};
+	const local = input(
+		options.local.text,
+		options.local.fileReferences,
+		options.local.composerDocument,
+	);
+	const server = input(
+		options.serverText,
+		options.serverFileReferences,
+		options.serverComposerDocument,
+	);
+	const current = input(
+		options.currentInput,
+		options.currentFileReferences,
+		options.currentComposerDocument,
+	);
 	const result = (value: typeof local, conflict: boolean): ResolvedNarratorDraft => ({
 		text: value.text,
 		...(value.fileReferences.length ? { fileReferences: value.fileReferences } : {}),
+		...(value.composerDocument ? { composerDocument: value.composerDocument } : {}),
 		conflict,
 	});
 	if (options.localChangedSinceRequest) {
@@ -383,7 +414,10 @@ export function resolveHydratedNarratorDraft(options: {
 	}
 	if (
 		(options.local.unsynced || options.local.serverRevision === null) &&
-		(local.text || local.fileReferences.length || options.local.unsynced) &&
+		(local.text ||
+			local.fileReferences.length ||
+			local.composerDocument?.assets.length ||
+			options.local.unsynced) &&
 		!sameFileReferenceInput(local, server)
 	) {
 		// Version-1 browser storage has no trustworthy base revision.

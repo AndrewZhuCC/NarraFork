@@ -816,6 +816,7 @@ export const narratorMessages = pgTable(
 		contentJson: jsonText("content_json").notNull(),
 		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
+		composerDocument: jsonText("composer_document"),
 		contextCharsJson: jsonText("context_chars_json"),
 		tokensIn: integer("tokens_in"),
 		costUsd: doublePrecision("cost_usd"),
@@ -1578,6 +1579,7 @@ export const narratorDrafts = pgTable(
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
 		fileReferencesJson: text("file_references_json"),
+		composerDocument: jsonText("composer_document"),
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
@@ -3935,7 +3937,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 123,
-  "columnCount": 1742,
+  "columnCount": 1744,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8687,6 +8689,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "composerDocument",
+          "name": "composer_document",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "contextCharsJson",
           "name": "context_chars_json",
           "kind": "text",
@@ -13318,6 +13330,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "fileReferencesJson",
           "name": "file_references_json",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "composerDocument",
+          "name": "composer_document",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,

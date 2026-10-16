@@ -89,6 +89,8 @@ export interface ImageRef {
 	imageId: string;
 	filename: string;
 	mediaType: string;
+	size?: number;
+	sourceMimeType?: string;
 	width?: number;
 	height?: number;
 	/** Original narrator that owns the uploaded image file. */
@@ -110,6 +112,8 @@ export type PersistedUserImageBlock = {
 	imageId: string;
 	filename: string;
 	mediaType: string;
+	size?: number;
+	sourceMimeType?: string;
 	width?: number;
 	height?: number;
 	uploadNarratorId?: string;
@@ -138,6 +142,8 @@ export function imageRefToContentBlock(
 		imageId: image.imageId,
 		filename: image.filename,
 		mediaType: image.mediaType,
+		...(image.size !== undefined ? { size: image.size } : {}),
+		...(image.sourceMimeType !== undefined ? { sourceMimeType: image.sourceMimeType } : {}),
 		...dimensions,
 		...(uploadNarratorId ? { uploadNarratorId } : {}),
 	};

@@ -40,6 +40,39 @@ afterAll(() => {
 });
 
 describe("per-user narrator drafts", () => {
+	test("rich layout participates in CAS, missing blobs remain visible and legacy saves clear layout", async () => {
+		await seedUser("rich-user");
+		await seedNarrator("rich-narrator");
+		const document = {
+			version: 1 as const,
+			paragraphs: [{ children: [{ type: "attachment" as const, id: "node", assetId: "image" }] }],
+			assets: [
+				{ id: "image", kind: "image" as const, name: "image.png", size: 9, mimeType: "image/png" },
+			],
+		};
+		const first = await updateNarratorDraft(
+			"rich-user",
+			"rich-narrator",
+			"",
+			"tab",
+			0,
+			[],
+			document,
+		);
+		expect(first).toMatchObject({ hasDraft: true, composerDocument: document, revision: 1 });
+		expect(await getNarratorDraft("rich-user", "rich-narrator")).toMatchObject({
+			composerDocument: document,
+		});
+		expect(await narratorHasDraft("rich-user", "rich-narrator")).toBe(true);
+		expect(
+			await updateNarratorDraft("rich-user", "rich-narrator", "stale", "tab", 0),
+		).toMatchObject({ conflict: true, current: { composerDocument: document } });
+		await updateNarratorDraft("rich-user", "rich-narrator", "legacy", "tab", 1);
+		expect((await getNarratorDraft("rich-user", "rich-narrator")).composerDocument).toBeUndefined();
+		await expect(
+			updateNarratorDraft("rich-user", "rich-narrator", "different", "tab", 2, [], document),
+		).rejects.toThrow("does not match");
+	});
 	test("isolates text and clear tombstones between users", async () => {
 		await seedUser("user-a");
 		await seedUser("user-b");

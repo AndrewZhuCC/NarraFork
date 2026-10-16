@@ -120,6 +120,35 @@ async function runEdit(opts: Parameters<typeof editAndRegenerate>[5]) {
 	return (msg?.contentJson as Block[]) ?? [];
 }
 
+test("history editing persists semantic layout and legacy editing clears stale layout", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "nf-rich-edit-"));
+	seed(cwd, [{ type: "text", text: "old" }]);
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: "new" }] }],
+		assets: [],
+	};
+	await editAndRegenerate("n1", "m1", "new", "en", false, {
+		composerDocument: document,
+		deferContinuation: true,
+		revertFiles: false,
+	});
+	const read = () => db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "m1") });
+	expect((await read())?.composerDocument).toEqual(document);
+	await editAndRegenerate("n1", "m1", "legacy", "en", false, {
+		deferContinuation: true,
+		revertFiles: false,
+	});
+	expect((await read())?.composerDocument).toBeNull();
+	await expect(
+		editAndRegenerate("n1", "m1", "mismatch", "en", false, {
+			composerDocument: document,
+			deferContinuation: true,
+			revertFiles: false,
+		}),
+	).rejects.toThrow("does not match");
+});
+
 describe("resolveRequestedAttachmentKeys", () => {
 	test("returns the unique intersection in target attachment order", () => {
 		expect(resolveRequestedAttachmentKeys(["a", "b", "a"], ["ghost", "a", "a"])).toEqual(["a"]);

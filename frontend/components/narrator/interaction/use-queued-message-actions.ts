@@ -20,6 +20,8 @@ export interface QueuedEditPayload {
 	keepTextFiles: { index: number; filename: string }[];
 	newImages: File[];
 	newTextFiles: File[];
+	fileReferences?: import("@shared/file-reference").FileReference[];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 }
 
 export interface UseQueuedMessageActionsOptions {
@@ -365,9 +367,9 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		): Promise<boolean> => {
 			setQueuedMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, text } : m)));
 			try {
-				await api.updateBufferedMessage(narratorId, msg.id, text, payload);
+				const result = await api.updateBufferedMessage(narratorId, msg.id, text, payload);
 				reconcileBufferedMessages();
-				return true;
+				return result.ok === true;
 			} catch (err) {
 				reconcileBufferedMessages();
 				notifications.show({

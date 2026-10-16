@@ -1,4 +1,9 @@
 import { notifications } from "@mantine/notifications";
+import {
+	type ComposerDocument,
+	composerDocumentText,
+	parseComposerDocument,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import type { SavedRecording } from "@shared/request-recording";
 import type { TFunction } from "i18next";
@@ -7,12 +12,38 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type BufferMessageSummary, isAbortError } from "../../../lib/api";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
+import { getComposerAssetId } from "../composer/draft-image-attachments";
 import { editFileReferenceInput, trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
 import type { ContentBlock } from "../narrator-panel-types";
 import type { BooleanOverride, DangerReflectionOverride } from "./reflection-types";
+
+/** Manifest order is the upload binding; duplicate filenames are never identity. */
+export function snapshotComposerFiles(
+	document: ComposerDocument | undefined,
+	images: File[],
+	textFiles: File[],
+): { images: File[]; textFiles: File[] } | undefined {
+	if (!document) return { images: [...images], textFiles: [...textFiles] };
+	const byId = new Map([...images, ...textFiles].map((file) => [getComposerAssetId(file), file]));
+	const snapshot = { images: [] as File[], textFiles: [] as File[] };
+	for (const asset of document.assets) {
+		const file = byId.get(asset.id);
+		if (
+			!file ||
+			file.name !== asset.name ||
+			file.size !== asset.size ||
+			file.type !== asset.mimeType
+		)
+			return undefined;
+		if (asset.kind === "image" ? !images.includes(file) : !textFiles.includes(file))
+			return undefined;
+		(asset.kind === "image" ? snapshot.images : snapshot.textFiles).push(file);
+	}
+	return snapshot;
+}
 
 /** Subset of a send response that indicates a buffered (queued) message. */
 export type BufferedSendResult = {
@@ -67,6 +98,8 @@ export interface UseNarratorSendOptions {
 
 	// Shared send guard (also read by the composer's disabled state).
 	sendingRef: React.RefObject<boolean>;
+	/** Set synchronously when a file is enqueued, before asynchronous resize/validation. */
+	ingestingRef?: React.RefObject<boolean>;
 
 	// Queue buffer (owned by the WS layer).
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
@@ -182,6 +215,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		t,
 	} = options;
 
+	const ingestingRef = options.ingestingRef;
+	const blockWhileIngesting = useCallback(() => {
+		if (!ingestingRef?.current) return false;
+		notifications.show({ color: "yellow", message: t("composerAttachmentsProcessing") });
+		return true;
+	}, [ingestingRef, t]);
 	const recordingSavedRef = useRef(options.onRequestRecordingSaved);
 	recordingSavedRef.current = options.onRequestRecordingSaved;
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
@@ -281,6 +320,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		fileReferences: FileReference[] = [],
 		interrupt?: boolean,
 		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
+		composerDocument?: ComposerDocument,
 	) => {
 		if (interrupt) priority = true;
 		const optimisticBlocks: ContentBlock[] = [
@@ -311,6 +351,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				fileReferences,
 				interrupt,
 				queueMode,
+				...(composerDocument ? [{ composerDocument }] : []),
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -373,15 +414,24 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		references?: FileReference[],
 		interrupt?: boolean,
 		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
+		composerDocument?: ComposerDocument,
+		attachmentSnapshot?: { images: File[]; textFiles: File[] },
 	): Promise<boolean> => {
 		if (interrupt) priority = true;
 		const draft = trimFileReferenceInput({
 			text: composerRef.current?.getText() ?? "",
 			fileReferences: composerRef.current?.getFileReferences() ?? [],
+			composerDocument: composerRef.current?.getDocument?.(),
 		});
+		if (!attachmentSnapshot)
+			composerDocument ??= draft.text === msg ? draft.composerDocument : undefined;
 		const fileReferences = references ?? (draft.text === msg ? draft.fileReferences : []);
-		const images = [...attachedImages];
-		const textFiles = [...attachedTextFiles];
+		const files =
+			attachmentSnapshot ??
+			snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles);
+		if (!files) throw new Error(t("composerMissingAssets"));
+		const images = files.images;
+		const textFiles = files.textFiles;
 		composerRef.current?.hideTextForSend();
 		hideAttachedFilesForSend();
 		try {
@@ -396,6 +446,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				fileReferences,
 				interrupt,
 				queueMode,
+				...(composerDocument ? [{ composerDocument }] : []),
 			);
 			const buffered = applyBufferedSendResult(
 				result,
@@ -413,7 +464,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			return buffered;
 		} catch (err) {
 			// Restore text and its independently tracked file references together.
-			composerRef.current?.restoreInput(msg, fileReferences);
+			composerRef.current?.restoreInput(
+				msg,
+				fileReferences,
+				...(composerDocument ? [composerDocument] : []),
+			);
 			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
 			throw err; // Re-throw to let caller handle
@@ -451,20 +506,43 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	 * narrator should not interrupt the current turn.
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
+		if (blockWhileIngesting()) return;
 		const composerText = composerRef.current?.getText() ?? "";
-		const { text: msg, fileReferences } = trimFileReferenceInput({
-			text: composerText,
-			fileReferences: composerRef.current?.getFileReferences() ?? [],
-		});
-		const attachmentCount =
-			attachedImages.length + attachedTextFiles.length + fileReferences.length;
+		const liveDocument = composerRef.current?.getDocument?.();
+		const document = liveDocument ? parseComposerDocument(liveDocument) : undefined;
+		const {
+			text: msg,
+			fileReferences,
+			composerDocument,
+		} = document
+			? { ...composerDocumentText(document), composerDocument: document }
+			: trimFileReferenceInput({
+					text: composerText,
+					fileReferences: composerRef.current?.getFileReferences() ?? [],
+				});
+		const isPlainCommand =
+			!composerDocument ||
+			composerDocument.paragraphs.every((p) =>
+				p.children.every((n) => n.type === "text" || n.type === "break"),
+			);
+		if (sendingRef.current) return;
+		const files = snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles);
+		if (!files || composerRef.current?.hasMissingAssets?.()) {
+			notifications.show({
+				color: "red",
+				title: t("sendFailed"),
+				message: t("composerMissingAssets"),
+			});
+			return;
+		}
+		const attachmentCount = files.images.length + files.textFiles.length + fileReferences.length;
 		// An attachment-only message is a valid turn: images (and text files) carry the
 		// content by themselves, so an empty textarea must not block the send.
 		if (
 			!hasSendableComposerContent({
 				text: composerText,
-				imageCount: attachedImages.length,
-				textFileCount: attachedTextFiles.length,
+				imageCount: files.images.length,
+				textFileCount: files.textFiles.length,
 				fileReferenceCount: fileReferences.length,
 			}) ||
 			sendingRef.current
@@ -485,11 +563,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			images: File[];
 			textFiles: File[];
 			fileReferences: FileReference[];
+			composerDocument?: ComposerDocument;
 		} | null = null;
 		try {
 			// This diagnostic control is never model input, queued guidance or an interrupt,
 			// including while working/compacting. Leave drafts untouched until acceptance.
-			if (/^\/save_dump(?:\s|$)/i.test(msg)) {
+			if (isPlainCommand && /^\/save_dump(?:\s|$)/i.test(msg)) {
 				let commandText = msg;
 				for (const ref of [...fileReferences].sort(
 					(a, b) => (b.inputRange?.[0] ?? 0) - (a.inputRange?.[0] ?? 0),
@@ -520,7 +599,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				recordingSavedRef.current?.(recording);
 				return;
 			}
-			composerRef.current?.noteSent(msg, fileReferences);
+			composerRef.current?.noteSent(
+				msg,
+				fileReferences,
+				...(composerDocument ? [composerDocument] : []),
+			);
 
 			// /fork and /compact are client-side control commands mirroring the
 			// manual actions (fork from the latest message; compact now). They are
@@ -528,7 +611,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			// action immediately, keeping any staged attachments for the next
 			// message. File references still cannot attach to a control command.
 			const controlCommand = msg.trim();
-			if (controlCommand === "/fork" || controlCommand === "/compact") {
+			if (isPlainCommand && (controlCommand === "/fork" || controlCommand === "/compact")) {
 				if (fileReferences.length) throw new Error(t("fileReferences.controlCommand"));
 				composerRef.current?.hideTextForSend();
 				composerRef.current?.commitDraftAfterSend();
@@ -537,19 +620,28 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				return;
 			}
 
-			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
+			const newMatch = isPlainCommand ? msg.match(/^\/new(?:\s+([\s\S]*))?$/) : null;
 			if (newMatch) {
 				if (fileReferences.length) throw new Error(t("fileReferences.newSessionFirst"));
 				if (isActive) {
 					// /new while active: always normal queue (never interrupt to spawn).
-					await doSendBuffered(msg);
+					await doSendBuffered(
+						msg,
+						undefined,
+						abortController.signal,
+						fileReferences,
+						undefined,
+						"turn",
+						composerDocument,
+						files,
+					);
 					return;
 				}
 
 				const initialMessage = newMatch[1]?.trim() ?? "";
-				const images = [...attachedImages];
-				const textFiles = [...attachedTextFiles];
-				restoreOnError = { msg, images, textFiles, fileReferences };
+				const images = files.images;
+				const textFiles = files.textFiles;
+				restoreOnError = { msg, images, textFiles, fileReferences, composerDocument };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 
@@ -577,7 +669,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				});
 
 				if (initialMessage || images.length > 0 || textFiles.length > 0) {
-					await api.sendNarratorMessage(
+					const initialInput = editFileReferenceInput(
+						{ text: msg, fileReferences, composerDocument },
+						initialMessage,
+					);
+					const sendArgs: Parameters<typeof api.sendNarratorMessage> = [
 						newNarrator.id,
 						initialMessage,
 						images.length > 0 ? images : undefined,
@@ -585,7 +681,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 						undefined,
 						reportUploadProgress,
 						abortController.signal,
-					);
+					];
+					if (initialInput.composerDocument) {
+						sendArgs[7] = initialInput.fileReferences;
+						sendArgs[10] = { composerDocument: initialInput.composerDocument };
+					}
+					await api.sendNarratorMessage(...sendArgs);
 				}
 
 				composerRef.current?.commitDraftAfterSend();
@@ -605,6 +706,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					fileReferences,
 					mode === "interrupt" ? true : undefined,
 					mode,
+					composerDocument,
 				);
 				return;
 			}
@@ -614,9 +716,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			// tells us which happened — a 202 lands in the queued-messages area, a 201
 			// starts a turn — so both outcomes are handled by `submitMessage` already.
 			if (showCompactQueueChoice) {
-				const images = [...attachedImages];
-				const textFiles = [...attachedTextFiles];
-				restoreOnError = { msg, images, textFiles, fileReferences };
+				const images = files.images;
+				const textFiles = files.textFiles;
+				restoreOnError = { msg, images, textFiles, fileReferences, composerDocument };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 				await submitMessage(
@@ -628,17 +730,18 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					fileReferences,
 					undefined,
 					mode,
+					composerDocument,
 				);
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
 				restoreOnError = null;
 				return;
 			}
-			const images = [...attachedImages];
-			const textFiles = [...attachedTextFiles];
+			const images = files.images;
+			const textFiles = files.textFiles;
 			// Remember the draft so a cancelled upload can restore it — submitMessage
 			// clears the input/attachments up-front for the optimistic bubble.
-			restoreOnError = { msg, images, textFiles, fileReferences };
+			restoreOnError = { msg, images, textFiles, fileReferences, composerDocument };
 			composerRef.current?.hideTextForSend();
 			hideAttachedFilesForSend();
 			await submitMessage(
@@ -650,6 +753,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				fileReferences,
 				mode === "interrupt" ? true : undefined,
 				mode,
+				composerDocument,
 			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
@@ -659,7 +763,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			// message. `doSendBuffered` already restores internally on its own throw;
 			// this covers the `/new` and idle direct-send paths.
 			if (restoreOnError) {
-				composerRef.current?.restoreInput(restoreOnError.msg, restoreOnError.fileReferences);
+				composerRef.current?.restoreInput(
+					restoreOnError.msg,
+					restoreOnError.fileReferences,
+					...(restoreOnError.composerDocument ? [restoreOnError.composerDocument] : []),
+				);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
 			}
@@ -713,6 +821,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	// biome-ignore lint/correctness/useExhaustiveDependencies: stable refs from hook
 	const forwardTextToNarrator = useCallback(
 		(text: string) => {
+			if (blockWhileIngesting()) return;
 			const trimmed = text.trim();
 			if (!trimmed) return;
 			// Forwarded controls have the same immediate admission as composer controls,
@@ -740,9 +849,13 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				})();
 				return;
 			}
+			if (sendingRef.current) return;
+			sendingRef.current = true;
+			setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
 			void (async () => {
 				const preservedDraft = composerRef.current?.getText() ?? "";
 				const preservedFileReferences = composerRef.current?.getFileReferences() ?? [];
+				const preservedDocument = composerRef.current?.getDocument?.();
 				const preservedImages = attachedImagesRef.current;
 				const preservedTextFiles = attachedTextFilesRef.current;
 				try {
@@ -751,7 +864,16 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					composerRef.current?.restoreInput(trimmed, []);
 					updateAttachedImages([]);
 					updateAttachedTextFiles([]);
-					await doSendBufferedRef.current(trimmed, false);
+					await doSendBufferedRef.current(
+						trimmed,
+						false,
+						undefined,
+						[],
+						undefined,
+						"turn",
+						undefined,
+						{ images: [], textFiles: [] },
+					);
 				} catch (err) {
 					notifications.show({
 						color: "red",
@@ -759,13 +881,19 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 						message: err instanceof Error ? err.message : "",
 					});
 				} finally {
-					composerRef.current?.restoreInput(preservedDraft, preservedFileReferences);
+					composerRef.current?.restoreInput(
+						preservedDraft,
+						preservedFileReferences,
+						...(preservedDocument ? [preservedDocument] : []),
+					);
 					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
 					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
+					sendingRef.current = false;
+					setSendingState(null);
 				}
 			})();
 		},
-		[narratorId, t, updateAttachedImages, updateAttachedTextFiles],
+		[narratorId, t, updateAttachedImages, updateAttachedTextFiles, blockWhileIngesting],
 	);
 
 	useEffect(() => {

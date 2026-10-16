@@ -1548,6 +1548,9 @@ export const narratorMessages = sqliteTable(
 		/** Incremented transactionally when model-visible body/identity changes. */
 		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
+		composerDocument: text("composer_document", { mode: "json" }).$type<
+			import("@shared/composer-document").ComposerDocument
+		>(),
 		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
@@ -2849,6 +2852,9 @@ export const narratorDrafts = sqliteTable(
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
 		fileReferencesJson: text("file_references_json"), // bounded FileReference[]; no file contents
+		composerDocument: text("composer_document", { mode: "json" }).$type<
+			import("@shared/composer-document").ComposerDocument
+		>(),
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),

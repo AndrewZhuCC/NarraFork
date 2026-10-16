@@ -2044,6 +2044,7 @@ export const narratorService = {
 			images?: ImageRef[];
 			textFiles?: TextFileRef[];
 			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
+			composerDocument?: import("@shared/composer-document").ComposerDocument;
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
@@ -2105,6 +2106,7 @@ export const narratorService = {
 				parentToolUseId,
 				messageId: delivery?.recipientMessageId,
 				mailboxClaim: options?.mailboxClaim ?? delivery?.mailboxClaim,
+				composerDocument: options?.composerDocument,
 			},
 		);
 		// See (2) above: withheld here rather than in the shared entry point, so the

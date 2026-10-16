@@ -1,3 +1,4 @@
+import { parseComposerDocument } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
@@ -19,6 +20,18 @@ import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
 import { fileReferencesSchema } from "./file-references";
+
+const composerDocumentSchema = z
+	.unknown()
+	.transform((value, ctx) => {
+		try {
+			return parseComposerDocument(value);
+		} catch {
+			ctx.addIssue({ code: "custom", message: "Invalid composer document" });
+			return z.NEVER;
+		}
+	})
+	.optional();
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh", "max"]);
 const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
@@ -166,6 +179,7 @@ export const sendMessageSchema = z
 		interrupt: z.boolean().optional(),
 		queueMode: bufferQueueModeSchema.optional(),
 		fileReferences: fileReferencesSchema.optional(),
+		composerDocument: composerDocumentSchema,
 	})
 	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {
 		message: "message or an attachment is required",
@@ -174,6 +188,7 @@ export const sendMessageSchema = z
 export const updateNarratorDraftSchema = z.object({
 	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS),
 	fileReferences: fileReferencesSchema.optional(),
+	composerDocument: composerDocumentSchema,
 	baseRevision: z.number().int().min(0),
 	sourceId: z.string().min(1).max(120).optional(),
 });
@@ -466,8 +481,9 @@ export const updateBlacklistCmdSchema = z.object({
  * the original File objects where two same-named files can coexist.
  */
 export const updateBufferedMessageSchema = z.object({
-	text: z.string().max(100_000).optional(),
+	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS).optional(),
 	fileReferences: fileReferencesSchema.optional(),
+	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_IMAGES_PER_MESSAGE).optional(),
 	keepTextFiles: z
 		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
@@ -719,8 +735,9 @@ export const editAssistantMessageSchema = z.object({
  * since that is what its UI offered.
  */
 export const editAndRegenerateJsonSchema = z.object({
-	content: z.string().max(100000).optional(),
+	content: z.string().max(MAX_NARRATOR_DRAFT_CHARS).optional(),
 	fileReferences: fileReferencesSchema.optional(),
+	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string()).max(100).optional(),
 	keepTextFilePaths: z.array(z.string()).max(100).optional(),
 	/** True => delete the messages but leave the workspace alone. */

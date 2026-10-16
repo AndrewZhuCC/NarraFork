@@ -160,6 +160,32 @@ afterEach(async () => {
 	await backgroundOccupancyStore.flush();
 });
 
+test.each([
+	false,
+	true,
+])("composer document persists atomically with accepted input (queued=%s)", async (queued) => {
+	const narratorId = `composer-send-${queued}`;
+	seedNarrator(narratorId);
+	if (queued) await enqueueBufferedMessage(narratorId, "earlier");
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: "rich 😀" }] }],
+		assets: [],
+	};
+	const result = await acceptUserMessage(narratorId, "rich 😀", { composerDocument: document });
+	if (!result.buffered) expect(result.userMsg).toMatchObject({ hasComposerDocument: true });
+	await waitForIdle(narratorId, queued ? 2 : 1);
+	const row = db
+		.select()
+		.from(narratorMessages)
+		.where(eq(narratorMessages.contentText, "rich 😀"))
+		.get();
+	expect(row?.composerDocument).toEqual(document);
+	expect(row?.contentJson).toEqual([{ type: "text", text: "rich 😀" }]);
+	expect(providerCalls.at(-1)).toBe("rich 😀");
+	closeNarrator(narratorId);
+});
+
 test("consumes earlier cancelled task notices before sending a new idle user input", async () => {
 	const narratorId = "mailbox-send-cancelled-notices";
 	seedNarrator(narratorId);

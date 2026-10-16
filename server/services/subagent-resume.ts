@@ -73,6 +73,8 @@ export interface ResumeSubagentInput {
 	images?: ImageRef[];
 	textFiles?: File[];
 	fileReferences?: FileReferenceSnapshot[];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
+	editComposerDocument?: import("@shared/composer-document").ComposerDocument;
 	editFileReferences?: FileReferenceSnapshot[];
 	commandText?: string | null;
 	createdBy?: string | null;
@@ -677,6 +679,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					keepTextFilePaths: effectiveInput.editKeepTextFilePaths,
 					newTextFiles: effectiveInput.editNewTextFiles,
 					fileReferences: effectiveInput.editFileReferences,
+					composerDocument: effectiveInput.editComposerDocument,
 					userId: effectiveInput.createdBy,
 					deferContinuation: true,
 					revertFiles: effectiveInput.editRevertFiles ?? true,
@@ -800,6 +803,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 							images: input.images,
 							textFiles: savedTextFiles,
 							fileReferences: input.fileReferences,
+							composerDocument: input.composerDocument,
 							delivery: input.delivery,
 							commandText: input.commandText,
 							createdBy: input.createdBy,
@@ -887,6 +891,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				images: input.images,
 				textFiles: input.textFiles,
 				fileReferences: input.fileReferences,
+				composerDocument: input.composerDocument,
 				delivery: input.delivery,
 				commandText: input.commandText,
 				createdBy: input.createdBy,
