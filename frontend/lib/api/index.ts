@@ -253,6 +253,8 @@ export type {
 	SearchFallback,
 	SearchMetadata,
 	SearchResponse,
+	StorageCategoryJobState,
+	StorageCategoryKey,
 	StorageCategoryResult,
 	StorageScanJobState,
 	StorageScanJobStatus,
