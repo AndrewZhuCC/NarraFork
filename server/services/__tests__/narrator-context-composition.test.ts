@@ -1,7 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { postgresPlaceholders } from "../context-composition-history";
 
-mock.module("../../db", () => ({ activeDatabaseBackend: "sqlite", sqlite: null, db: null }));
+mock.module("../../db", () => ({
+	activeDatabaseBackend: "sqlite",
+	sqlite: null,
+	db: null,
+	postgresRuntime: null,
+}));
 const { createContextCharacterService } = await import("../narrator-context-composition");
 
 let database: Database;
@@ -97,6 +103,12 @@ test("a shared write during pinning leaves the request unclassified", async () =
 	expect(await pending).toBeNull();
 	expect((await service.get("n")).usage?.composition).toBeNull();
 	expect((await service.get("n")).totalChars).toBe(5);
+});
+
+test("postgres placeholders stay positional", () => {
+	expect(postgresPlaceholders("SELECT * FROM t WHERE a = ? AND (b, c) > (?, ?) LIMIT ?")).toBe(
+		"SELECT * FROM t WHERE a = $1 AND (b, c) > ($2, $3) LIMIT $4",
+	);
 });
 
 test("provider classification is pinned without reading history", async () => {

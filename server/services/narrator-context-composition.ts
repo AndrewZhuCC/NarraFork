@@ -11,9 +11,7 @@ import {
 	type ContextUsageSnapshot,
 	MAX_INPUT_COMPOSITION_SEGMENTS,
 } from "@shared/context-usage";
-import { eq } from "drizzle-orm";
-import { activeDatabaseBackend, db, sqlite } from "../db";
-import { narrators } from "../db/schema";
+import { activeDatabaseBackend, postgresRuntime, sqlite } from "../db";
 import { observeContextCharacterWrites } from "../lib/context-characters";
 import {
 	boundedContextSnapshot,
@@ -22,7 +20,13 @@ import {
 } from "../lib/context-usage-snapshot";
 import { AppError, NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { readContextHistoryEntries, yieldContextReader } from "./context-composition-history";
+import {
+	type ContextQuery,
+	postgresContextQuery,
+	readContextHistoryEntries,
+	sqliteContextQuery,
+	yieldContextReader,
+} from "./context-composition-history";
 import { readContextSegments } from "./context-composition-projection";
 
 /** Post-compact transcripts are shown in one response. This only stops a runaway scan. */
@@ -66,14 +70,17 @@ function compositionOf(
 
 /** Dependency injection keeps tests on disposable SQLite schemas. */
 export function createContextCharacterService(database: Database) {
+	return createContextCharacterServiceFromQuery(sqliteContextQuery(database));
+}
+
+export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 	const metadata = (id: string) =>
-		database
-			.query<Meta, [string]>(
-				`SELECT type, variant, context_system_chars AS systemChars,
-			 context_summary_chars AS summaryChars, context_tools_chars AS toolsChars,
-			 context_usage_snapshot_json AS usage FROM narrators WHERE id = ?`,
-			)
-			.get(id);
+		query.get<Meta>(
+			`SELECT type AS "type", variant AS "variant", context_system_chars AS "systemChars",
+			 context_summary_chars AS "summaryChars", context_tools_chars AS "toolsChars",
+			 context_usage_snapshot_json AS "usage" FROM narrators WHERE id = ?`,
+			[id],
+		);
 
 	async function historySegments(
 		id: string,
@@ -81,7 +88,7 @@ export function createContextCharacterService(database: Database) {
 		signal?: AbortSignal,
 	): Promise<{ segments: ContextSegment[]; truncated: boolean }> {
 		const segments: ContextSegment[] = [];
-		for await (const entry of readContextHistoryEntries(database, id, {
+		for await (const entry of readContextHistoryEntries(query, id, {
 			profile,
 			check: () => {
 				if (signal?.aborted) throw new DOMException("Context composition cancelled", "AbortError");
@@ -102,21 +109,21 @@ export function createContextCharacterService(database: Database) {
 		return [...prefixSegments(meta.systemChars, meta.summaryChars, meta.toolsChars), ...history];
 	}
 
-	function writeSnapshot(id: string, snapshot: ContextUsageSnapshot | null) {
-		database
-			.query("UPDATE narrators SET context_usage_snapshot_json = ? WHERE id = ?")
-			.run(snapshot ? JSON.stringify(snapshot) : null, id);
+	async function writeSnapshot(id: string, snapshot: ContextUsageSnapshot | null) {
+		await query.run("UPDATE narrators SET context_usage_snapshot_json = ? WHERE id = ?", [
+			snapshot ? JSON.stringify(snapshot) : null,
+			id,
+		]);
 	}
 
-	function publishPin(id: string, composition: ContextCharCache, segments: ContextSegment[]) {
-		database.transaction(() => {
-			database.query("DELETE FROM narrator_context_pins WHERE narrator_id = ?").run(id);
-			database
-				.query(
-					"INSERT INTO narrator_context_pins (generation, narrator_id, segments_json) VALUES (?,?,?)",
-				)
-				.run(composition.generation, id, JSON.stringify(segments));
-		})();
+	async function publishPin(id: string, composition: ContextCharCache, segments: ContextSegment[]) {
+		await query.transaction(async (tx) => {
+			await tx.run("DELETE FROM narrator_context_pins WHERE narrator_id = ?", [id]);
+			await tx.run(
+				"INSERT INTO narrator_context_pins (generation, narrator_id, segments_json) VALUES (?,?,?)",
+				[composition.generation, id, JSON.stringify(segments)],
+			);
+		});
 	}
 
 	const preparing = new Set<string>();
@@ -128,24 +135,23 @@ export function createContextCharacterService(database: Database) {
 		async cancel() {},
 		async dispose() {},
 		async settled() {},
-		storeUsage(id: string, snapshot: ContextUsageSnapshot) {
+		async storeUsage(id: string, snapshot: ContextUsageSnapshot) {
 			const value = boundedContextSnapshot(snapshot);
 			if (!value) return;
-			writeSnapshot(id, value);
+			await writeSnapshot(id, value);
 		},
 		async storeRuntime(id: string, values: { systemChars?: number; toolsChars?: number }) {
 			const systemChars =
 				values.systemChars === undefined ? null : safeCharacters(values.systemChars);
 			const toolsChars = values.toolsChars === undefined ? null : safeCharacters(values.toolsChars);
-			database
-				.query(
-					`UPDATE narrators SET context_system_chars = coalesce(?, context_system_chars),
+			await query.run(
+				`UPDATE narrators SET context_system_chars = coalesce(?, context_system_chars),
 				 context_tools_chars = coalesce(?, context_tools_chars),
 				 context_char_revision = context_char_revision + 1
 				 WHERE id = ? AND (context_system_chars != coalesce(?, context_system_chars)
 				 OR context_tools_chars != coalesce(?, context_tools_chars))`,
-				)
-				.run(systemChars, toolsChars, id, systemChars, toolsChars);
+				[systemChars, toolsChars, id, systemChars, toolsChars],
+			);
 		},
 		async freezeForRequest(
 			id: string,
@@ -156,10 +162,10 @@ export function createContextCharacterService(database: Database) {
 			signal?: AbortSignal,
 		): Promise<ContextCharCache | null> {
 			if (signal?.aborted || preparing.has(id)) return null;
-			const meta = metadata(id);
+			const meta = await metadata(id);
 			if (!meta) return null;
 			const requestCounts = validInputCharacters(counts);
-			const unknown = () => {
+			const unknown = async () => {
 				const snapshot = boundedContextSnapshot({
 					requestId,
 					startedAt,
@@ -170,8 +176,8 @@ export function createContextCharacterService(database: Database) {
 					inputCharacters: counts,
 					composition: null,
 				});
-				writeSnapshot(id, snapshot);
-				database.query("DELETE FROM narrator_context_pins WHERE narrator_id = ?").run(id);
+				await writeSnapshot(id, snapshot);
+				await query.run("DELETE FROM narrator_context_pins WHERE narrator_id = ?", [id]);
 				return null;
 			};
 			if (requestCounts?.compositionSegments) {
@@ -205,33 +211,32 @@ export function createContextCharacterService(database: Database) {
 					composition,
 				});
 				if (!snapshot) return null;
-				publishPin(id, composition, segments);
-				writeSnapshot(id, snapshot);
+				await publishPin(id, composition, segments);
+				await writeSnapshot(id, snapshot);
 				return composition;
 			}
 			if (
 				counts?.compositionSegments === null ||
 				(counts?.compositionSegments !== undefined && !requestCounts?.compositionSegments)
 			)
-				return unknown();
+				return await unknown();
 			preparing.add(id);
 			const writes: Array<{ narratorId: string; messageId?: string }> = [];
 			const stop = observeContextCharacterWrites((narratorId, messageId) => {
 				writes.push({ narratorId, messageId });
 			});
 			const seen = new Set<string>();
-			const relevant = () => {
+			const relevant = async () => {
 				for (const write of writes) {
 					const key = `${write.narratorId}:${write.messageId ?? "*"}`;
 					if (seen.has(key)) continue;
 					seen.add(key);
 					if (write.narratorId === id) return true;
 					if (!write.messageId) continue;
-					const shared = database
-						.query<{ ok: number }, [string, string]>(
-							"SELECT 1 AS ok FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ? LIMIT 1",
-						)
-						.get(id, write.messageId);
+					const shared = await query.get<{ ok: number }>(
+						`SELECT 1 AS "ok" FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ? LIMIT 1`,
+						[id, write.messageId],
+					);
 					if (shared) return true;
 				}
 				return false;
@@ -240,7 +245,7 @@ export function createContextCharacterService(database: Database) {
 				// A write that lands while this request is being pinned belongs to a later input.
 				await yieldContextReader();
 				if (signal?.aborted) return null;
-				if (relevant()) return unknown();
+				if (await relevant()) return await unknown();
 				const summary =
 					requestCounts &&
 					Number.isSafeInteger(runtimeSummaryChars) &&
@@ -253,8 +258,8 @@ export function createContextCharacterService(database: Database) {
 					: prefixSegments(meta.systemChars, meta.summaryChars, meta.toolsChars);
 				const history = await historySegments(id, profileOf(meta.type, meta.variant), signal);
 				if (signal?.aborted) return null;
-				if (relevant()) return unknown();
-				if (history.truncated) return unknown();
+				if (await relevant()) return await unknown();
+				if (history.truncated) return await unknown();
 				const segments = [...fixed, ...history.segments];
 				const composition = compositionOf(crypto.randomUUID(), `request:${requestId}`, segments);
 				const snapshot = boundedContextSnapshot({
@@ -267,9 +272,9 @@ export function createContextCharacterService(database: Database) {
 					inputCharacters: counts,
 					composition,
 				});
-				if (!snapshot?.composition) return unknown();
-				publishPin(id, snapshot.composition, segments);
-				writeSnapshot(id, snapshot);
+				if (!snapshot?.composition) return await unknown();
+				await publishPin(id, snapshot.composition, segments);
+				await writeSnapshot(id, snapshot);
 				return snapshot.composition;
 			} finally {
 				stop();
@@ -278,16 +283,15 @@ export function createContextCharacterService(database: Database) {
 		},
 		async get(id: string, signal?: AbortSignal): Promise<ContextComposition> {
 			signal?.throwIfAborted();
-			const meta = metadata(id);
+			const meta = await metadata(id);
 			if (!meta) throw new NotFoundError("Narrator", id);
 			const usage = parseContextSnapshot(meta.usage);
 			const pinned = usage?.composition;
 			if (pinned) {
-				const row = database
-					.query<{ json: string }, [string, string]>(
-						"SELECT segments_json AS json FROM narrator_context_pins WHERE generation = ? AND narrator_id = ?",
-					)
-					.get(pinned.generation, id);
+				const row = await query.get<{ json: string }>(
+					`SELECT segments_json AS "json" FROM narrator_context_pins WHERE generation = ? AND narrator_id = ?`,
+					[pinned.generation, id],
+				);
 				if (row) {
 					return {
 						usage,
@@ -318,12 +322,18 @@ export function createContextCharacterService(database: Database) {
 
 let service: ReturnType<typeof createContextCharacterService> | undefined;
 function currentService() {
-	if (activeDatabaseBackend === "postgres")
-		throw new AppError(
-			"Context composition is not yet available on PostgreSQL",
-			501,
-			"CONTEXT_COMPOSITION_UNAVAILABLE",
+	if (activeDatabaseBackend === "postgres") {
+		if (!postgresRuntime)
+			throw new AppError(
+				"PostgreSQL runtime is not connected",
+				503,
+				"CONTEXT_COMPOSITION_UNAVAILABLE",
+			);
+		service ??= createContextCharacterServiceFromQuery(
+			postgresContextQuery(postgresRuntime.client.sql),
 		);
+		return service;
+	}
 	service ??= createContextCharacterService(sqlite);
 	return service;
 }
@@ -336,7 +346,6 @@ export async function freezeNarratorContextComposition(
 	runtimeSummaryChars = 0,
 	signal?: AbortSignal,
 ): Promise<ContextCharCache | null> {
-	if (activeDatabaseBackend === "postgres") return null;
 	return currentService().freezeForRequest(
 		narratorId,
 		counts,
@@ -351,16 +360,7 @@ export async function storeNarratorContextUsage(
 	narratorId: string,
 	snapshot: ContextUsageSnapshot,
 ): Promise<void> {
-	if (activeDatabaseBackend === "postgres") {
-		const value = boundedContextSnapshot(snapshot);
-		if (value)
-			await db
-				.update(narrators)
-				.set({ contextUsageSnapshotJson: value })
-				.where(eq(narrators.id, narratorId));
-		return;
-	}
-	currentService().storeUsage(narratorId, snapshot);
+	await currentService().storeUsage(narratorId, snapshot);
 }
 
 export async function invalidateContextCharacterCache(
@@ -380,7 +380,6 @@ export async function storeContextRuntimeCharacters(
 	narratorId: string,
 	values: { systemChars?: number; toolsChars?: number },
 ): Promise<void> {
-	if (activeDatabaseBackend === "postgres") return;
 	await currentService().storeRuntime(narratorId, values);
 }
 
