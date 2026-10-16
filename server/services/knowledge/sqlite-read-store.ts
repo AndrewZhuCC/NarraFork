@@ -320,10 +320,22 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 	},
 
 	async listEntries(opts) {
+		const after = opts.after;
 		return db.query.knowledgeEntries.findMany({
-			where: opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+			where: and(
+				opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+				after
+					? or(
+							lt(knowledgeEntries.updatedAt, after.updatedAt),
+							and(
+								eq(knowledgeEntries.updatedAt, after.updatedAt),
+								lt(knowledgeEntries.id, after.id),
+							),
+						)
+					: undefined,
+			),
 			columns: ENTRY_LIST_COLUMNS,
-			orderBy: (e, { desc: d }) => [d(e.updatedAt)],
+			orderBy: (e, { desc: d }) => [d(e.updatedAt), d(e.id)],
 			limit: opts.limit,
 		}) as Promise<KnowledgeEntryListRow[]>;
 	},

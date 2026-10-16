@@ -115,6 +115,7 @@ export type {
 	KnowledgeDraftStatus,
 	KnowledgeEntry,
 	KnowledgeEntryLink,
+	KnowledgeEntryPage,
 	KnowledgeFinding,
 	KnowledgeFormat,
 	KnowledgeGrant,

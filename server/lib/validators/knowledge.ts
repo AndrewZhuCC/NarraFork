@@ -67,6 +67,14 @@ export const knowledgeSearchQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(100).optional().default(30),
 });
 
+// === entry list (keyset pagination) ===
+// Supplying `limit` and/or `cursor` opts in to the paged `{ items, nextCursor }` envelope;
+// without either, GET /entries keeps returning the legacy bare array (first page only).
+export const listKnowledgeEntriesQuerySchema = z.object({
+	cursor: z.string().min(1).max(512).optional(),
+	limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+
 // === drafts (personal working copies) ===
 export const createKnowledgeDraftSchema = z.object({
 	name: z.string().max(200).optional(),

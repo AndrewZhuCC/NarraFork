@@ -16,6 +16,7 @@ import {
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
 	listKnowledgeAclEventsQuerySchema,
+	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,
@@ -127,18 +128,46 @@ knowledgeRoutes.delete("/collections/:id", async (c) => {
 
 // ─── Entries ──────────────────────────────────────────────────────────
 
+// List entries. Two response shapes, chosen by the caller:
+//   - legacy (no `limit` / `cursor`): a bare array — the first page (up to 100 readable
+//     entries, newest-updated first). `X-Next-Cursor` carries the resume cursor when more
+//     exist, so legacy callers can at least detect truncation.
+//   - paged (`limit` and/or `cursor` present): `{ items, nextCursor }`, keyset-paginated on
+//     (updatedAt DESC, id DESC); `nextCursor` is null once the list is exhausted. Pages may
+//     come back short (even empty) with a non-null cursor when ACL filtering hides most
+//     rows within the per-request scan budget — keep following `nextCursor`.
+// With `q` the FTS search path runs instead (already capped, not paginated): the paged
+// shape then always carries `nextCursor: null`.
 knowledgeRoutes.get("/entries", async (c) => {
 	const collectionId = c.req.query("collectionId") || undefined;
 	const tag = c.req.query("tag") || undefined;
 	const q = c.req.query("q");
+	const parsed = listKnowledgeEntriesQuerySchema.safeParse({
+		cursor: c.req.query("cursor") || undefined,
+		limit: c.req.query("limit") || undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const paged = parsed.data.cursor !== undefined || parsed.data.limit !== undefined;
 	const principal = principalOf(c);
 	if (q?.trim()) {
 		const results = await knowledgeService.search({ q, collectionId, tag });
-		return c.json(await knowledgeService.filterReadable(principal, results));
+		const readable = await knowledgeService.filterReadable(principal, results);
+		return c.json(paged ? { items: readable, nextCursor: null } : readable);
 	}
-	const entries = await knowledgeService.listEntries({ collectionId, tag });
-	return c.json(await knowledgeService.filterReadable(principal, entries));
+	const page = await knowledgeService.listEntriesPage({
+		principal,
+		collectionId,
+		tag,
+		limit: parsed.data.limit ?? (paged ? undefined : LEGACY_ENTRY_LIST_LIMIT),
+		cursor: parsed.data.cursor,
+	});
+	if (paged) return c.json(page);
+	if (page.nextCursor) c.header("X-Next-Cursor", page.nextCursor);
+	return c.json(page.items);
 });
+
+/** Size of the legacy (un-paged) GET /entries response — unchanged from before paging. */
+const LEGACY_ENTRY_LIST_LIMIT = 100;
 
 knowledgeRoutes.post("/entries", async (c) => {
 	const parsed = createKnowledgeEntrySchema.safeParse(await c.req.json());

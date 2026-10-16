@@ -46,6 +46,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
 import { CollectionAclPanel } from "../../components/knowledge/CollectionAclPanel";
+import cardClasses from "../../components/knowledge/KnowledgeCards.module.css";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -56,6 +57,7 @@ import {
 	useDeleteKnowledgeCollection,
 	useKnowledgeCollections,
 	useKnowledgeEntries,
+	useKnowledgeEntriesPaged,
 	useKnowledgeSubmission,
 	useKnowledgeSubmissions,
 	useMyOpenKnowledgeSubmissions,
@@ -65,8 +67,8 @@ import {
 } from "../../hooks/useKnowledge";
 import type {
 	KnowledgeCollection,
+	KnowledgeEntryPage,
 	KnowledgeOpenSubmission,
-	KnowledgeSearchResult,
 	KnowledgeSubmission,
 } from "../../lib/api";
 import { api } from "../../lib/api";
@@ -181,16 +183,39 @@ function KnowledgePage() {
 	);
 }
 
+interface BrowseRow {
+	id: string;
+	title: string;
+	snippet: string | null;
+	tags: string[];
+}
+
+/** List rows carry `tagsJson`; FTS search rows carry `tags` + `snippet`. */
+function toBrowseRow(e: KnowledgeEntryPage["items"][number]): BrowseRow {
+	if ("snippet" in e) return { id: e.id, title: e.title, snippet: e.snippet, tags: e.tags ?? [] };
+	return {
+		id: e.id,
+		title: e.title,
+		snippet: null,
+		tags: Array.isArray(e.tagsJson) ? e.tagsJson : [],
+	};
+}
+
 function BrowseTab() {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
 	const collections = useKnowledgeCollections();
 	const [collectionId, setCollectionId] = useState<string | null>(null);
 	const [q, setQ] = useState("");
-	const entries = useKnowledgeEntries({
+	// Keyset-paginated: the list used to stop silently at the first 100 rows.
+	const entries = useKnowledgeEntriesPaged({
 		collectionId: collectionId ?? undefined,
 		q: q.trim() || undefined,
 	});
+	const entryRows = useMemo(
+		() => (entries.data?.pages ?? []).flatMap((p) => p.items).map(toBrowseRow),
+		[entries.data],
+	);
 
 	const [colModal, colModalH] = useDisclosure(false);
 	const [entryModal, entryModalH] = useDisclosure(false);
@@ -200,14 +225,9 @@ function BrowseTab() {
 		[collections.data],
 	);
 
-	// Count readable entries per collection
-	const countByCollection = useMemo(() => {
-		const m = new Map<string, number>();
-		for (const e of entries.data ?? []) {
-			m.set(e.collectionId, (m.get(e.collectionId) ?? 0) + 1);
-		}
-		return m;
-	}, [entries.data]);
+	// No per-collection counts: deriving them from the loaded (filtered, paginated) list
+	// showed wrong numbers, and an exact ACL-respecting count would need a full per-entry
+	// ACL scan on the main thread. The sidebar is navigation only.
 
 	return (
 		<Grid gap="md">
@@ -233,11 +253,6 @@ function BrowseTab() {
 							onClick={() => setCollectionId(null)}
 							variant="filled"
 							styles={{ label: { fontWeight: 500 } }}
-							rightSection={
-								<Badge size="xs" variant="light" color="gray">
-									{entries.data?.length ?? 0}
-								</Badge>
-							}
 						/>
 
 						<ScrollArea.Autosize mah={400} type="auto">
@@ -247,7 +262,6 @@ function BrowseTab() {
 										key={c.id}
 										collection={c}
 										active={collectionId === c.id}
-										count={countByCollection.get(c.id) ?? 0}
 										onSelect={() => setCollectionId(c.id)}
 									/>
 								))}
@@ -291,7 +305,13 @@ function BrowseTab() {
 								{t("loading")}
 							</Text>
 						</Paper>
-					) : (entries.data?.length ?? 0) === 0 ? (
+					) : entries.isError ? (
+						<Paper withBorder p="xl" radius="md" ta="center">
+							<Text size="sm" c="red">
+								{(entries.error as Error).message}
+							</Text>
+						</Paper>
+					) : entryRows.length === 0 && !entries.hasNextPage ? (
 						<Paper withBorder p="xl" radius="md" ta="center">
 							<ThemeIcon variant="light" size="xl" radius="xl" color="gray" mb="xs">
 								<IconFileText size={24} />
@@ -302,24 +322,20 @@ function BrowseTab() {
 						</Paper>
 					) : (
 						<Stack gap="xs">
-							{(entries.data as KnowledgeSearchResult[]).map((e) => (
+							{entryRows.length === 0 ? (
+								// A non-empty cursor with no rows: the server's scan budget ran out
+								// behind entries this user cannot read. More may follow.
+								<Text size="xs" c="dimmed" ta="center">
+									{t("entriesNoneVisibleYet")}
+								</Text>
+							) : null}
+							{entryRows.map((e) => (
 								<Card
 									key={e.id}
 									withBorder
 									padding="md"
 									radius="md"
-									style={{
-										cursor: "pointer",
-										transition: "transform 100ms ease, box-shadow 100ms ease",
-									}}
-									styles={{
-										root: {
-											"&:hover": {
-												transform: "translateY(-1px)",
-												boxShadow: "var(--mantine-shadow-xs)",
-											},
-										},
-									}}
+									className={cardClasses.entryCard}
 									onClick={() => navigate({ to: "/knowledge/$entryId", params: { entryId: e.id } })}
 								>
 									<Group justify="space-between" wrap="nowrap" align="flex-start">
@@ -346,6 +362,18 @@ function BrowseTab() {
 									</Group>
 								</Card>
 							))}
+							{entries.hasNextPage ? (
+								<Group justify="center" mt="xs">
+									<Button
+										variant="default"
+										size="xs"
+										loading={entries.isFetchingNextPage}
+										onClick={() => entries.fetchNextPage()}
+									>
+										{t("loadMoreEntries")}
+									</Button>
+								</Group>
+							) : null}
 						</Stack>
 					)}
 				</Stack>
@@ -365,12 +393,10 @@ function BrowseTab() {
 function CollectionItem({
 	collection,
 	active,
-	count,
 	onSelect,
 }: {
 	collection: KnowledgeCollection;
 	active: boolean;
-	count: number;
 	onSelect: () => void;
 }) {
 	const { t } = useTranslation("knowledge");
@@ -400,9 +426,6 @@ function CollectionItem({
 				onClick={onSelect}
 				rightSection={
 					<Group gap={4} wrap="nowrap" onClick={(e) => e.stopPropagation()}>
-						<Badge size="xs" variant="light" color="gray">
-							{count}
-						</Badge>
 						{isAdmin ? (
 							<ActionIcon
 								size="xs"
@@ -968,6 +991,22 @@ type ReviewGroup =
 	| { kind: "entry"; key: string; entryId: string; subs: KnowledgeSubmission[] }
 	| { kind: "standalone"; key: string; sub: KnowledgeSubmission };
 
+/**
+ * Title of a review group's entry. `known` comes from the first page of the entry list
+ * (recently updated entries); an older entry is looked up individually — bounded by the
+ * submission list — instead of degrading to its id. Unreadable → id prefix.
+ */
+function ReviewEntryTitle({ entryId, known }: { entryId: string; known: string | undefined }) {
+	const entry = useQuery({
+		queryKey: ["knowledge", "entry", entryId],
+		queryFn: () => api.getKnowledgeEntry(entryId),
+		enabled: known === undefined,
+		retry: false,
+		staleTime: 30_000,
+	});
+	return <>{known ?? entry.data?.title ?? entryId.slice(0, 8)}</>;
+}
+
 function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | null }) {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
@@ -1126,7 +1165,7 @@ function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | nu
 												style={{ minWidth: 0, textAlign: "left" }}
 											>
 												<Text size="sm" fw={600} truncate="end">
-													{titleById.get(g.entryId) ?? g.entryId.slice(0, 8)}
+													<ReviewEntryTitle entryId={g.entryId} known={titleById.get(g.entryId)} />
 												</Text>
 											</Anchor>
 											<Badge size="xs" variant="light" color="gray" style={{ flexShrink: 0 }}>
@@ -1153,17 +1192,7 @@ function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | nu
 												withBorder
 												padding="xs"
 												radius="sm"
-												style={{
-													cursor: "pointer",
-													transition: "background 100ms ease",
-												}}
-												styles={{
-													root: {
-														"&:hover": {
-															background: "var(--mantine-color-dark-6)",
-														},
-													},
-												}}
+												className={cardClasses.reviewCard}
 												onClick={() => openLinked(g.entryId, s.id)}
 											>
 												<Group justify="space-between" wrap="nowrap" align="center">
@@ -1220,18 +1249,8 @@ function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | nu
 										withBorder
 										padding="xs"
 										radius="sm"
-										style={{
-											cursor: "pointer",
-											transition: "background 100ms ease",
-											flex: 1,
-										}}
-										styles={{
-											root: {
-												"&:hover": {
-													background: "var(--mantine-color-dark-6)",
-												},
-											},
-										}}
+										className={cardClasses.reviewCard}
+										style={{ flex: 1 }}
 										onClick={() => setReviewingId(g.sub.id)}
 									>
 										<Group justify="space-between" wrap="nowrap" align="center">

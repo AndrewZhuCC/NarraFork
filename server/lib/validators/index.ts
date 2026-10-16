@@ -114,6 +114,7 @@ export {
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
 	listKnowledgeAclEventsQuerySchema,
+	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,

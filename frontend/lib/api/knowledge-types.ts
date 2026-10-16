@@ -76,6 +76,17 @@ export interface KnowledgeSearchResult {
 }
 
 /**
+ * One page of GET /knowledge/entries in paged mode (`limit` and/or `cursor` sent).
+ * List rows carry `tagsJson`; FTS search rows (when `q` is set) carry `tags` + `snippet`.
+ * `nextCursor` is null once exhausted; a non-null cursor may accompany a short or even
+ * empty page (ACL filtering within the server's per-request scan budget).
+ */
+export interface KnowledgeEntryPage {
+	items: (KnowledgeEntry | KnowledgeSearchResult)[];
+	nextCursor: string | null;
+}
+
+/**
  * A revision's METADATA, as returned by the history list.
  *
  * The body is deliberately absent: a list of N versions of a large document would otherwise ship

@@ -4,7 +4,11 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import type { KnowledgeEntryRow } from "./knowledge/read-store";
+import type {
+	KnowledgeEntryListCursor,
+	KnowledgeEntryListRow,
+	KnowledgeEntryRow,
+} from "./knowledge/read-store";
 import {
 	knowledgeReadStore,
 	knowledgeWriteStore,
@@ -398,6 +402,103 @@ async function listEntries(opts: { collectionId?: string; tag?: string; limit?: 
 	});
 	const tag = opts.tag;
 	return tag ? rows.filter((r) => parseTags(r.tagsJson).includes(tag)) : rows;
+}
+
+/** Default / max page size of the paginated entry list (`listEntriesPage`). */
+export const ENTRY_PAGE_DEFAULT_LIMIT = 50;
+export const ENTRY_PAGE_MAX_LIMIT = LIST_MAX_LIMIT;
+/**
+ * Upper bound on raw rows one `listEntriesPage` call may read while back-filling a page
+ * that ACL/tag filtering left short. Past it the call returns a (possibly short or empty)
+ * page with a cursor that resumes after the last scanned row, so a reader who can see
+ * almost nothing never turns one request into an unbounded table walk.
+ */
+export const ENTRY_PAGE_MAX_SCAN_ROWS = 1000;
+
+/** Opaque cursor: base64url(JSON [updatedAt, id]) of the last position consumed. */
+export function encodeEntryCursor(pos: KnowledgeEntryListCursor): string {
+	return Buffer.from(JSON.stringify([pos.updatedAt, pos.id]), "utf8").toString("base64url");
+}
+
+export function decodeEntryCursor(raw: string): KnowledgeEntryListCursor {
+	try {
+		if (raw.length > 512) throw new Error("too long");
+		const v: unknown = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+		if (
+			Array.isArray(v) &&
+			v.length === 2 &&
+			typeof v[0] === "string" &&
+			typeof v[1] === "string" &&
+			v[0] &&
+			v[1]
+		) {
+			return { updatedAt: v[0], id: v[1] };
+		}
+	} catch {
+		// fall through
+	}
+	throw new ValidationError("Invalid cursor");
+}
+
+/**
+ * Keyset-paginated entry list, post-filtered by tag and by the principal's read ACL.
+ *
+ * Order is (updatedAt DESC, id DESC). Because the ACL (and tag) filter runs after the DB
+ * read, a raw batch can come back short; this keeps reading further batches until `limit`
+ * readable rows are collected, the source is exhausted, or ENTRY_PAGE_MAX_SCAN_ROWS raw
+ * rows were scanned. `nextCursor` resumes strictly after the last row this call consumed
+ * (the last emitted row when the page filled, otherwise the last scanned row), so pages
+ * never duplicate or skip rows. `nextCursor` is null only when the source is exhausted.
+ */
+async function listEntriesPage(opts: {
+	principal: Principal | undefined;
+	collectionId?: string;
+	tag?: string;
+	limit?: number;
+	cursor?: string;
+}): Promise<{ items: KnowledgeEntryListRow[]; nextCursor: string | null }> {
+	const requested = Math.floor(opts.limit ?? ENTRY_PAGE_DEFAULT_LIMIT);
+	const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : 1, 1), LIST_MAX_LIMIT);
+	let after = opts.cursor ? decodeEntryCursor(opts.cursor) : undefined;
+	// limit + 1 so an unfiltered (admin) page knows whether more exist without a 2nd query.
+	const batchSize = Math.min(LIST_MAX_LIMIT, Math.max(limit + 1, 50));
+	// Resolve caps once; every batch reuses them.
+	const caps = opts.principal
+		? await resolvePrincipalCaps(opts.principal)
+		: await resolveCapsByUserId(null);
+	const items: KnowledgeEntryListRow[] = [];
+	let scanned = 0;
+	while (scanned < ENTRY_PAGE_MAX_SCAN_ROWS) {
+		const want = Math.min(batchSize, ENTRY_PAGE_MAX_SCAN_ROWS - scanned);
+		const batch = await knowledgeReadStore.listEntries({
+			...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
+			limit: want,
+			...(after ? { after } : {}),
+		});
+		scanned += batch.length;
+		const exhausted = batch.length < want;
+		const tag = opts.tag;
+		const tagged = tag ? batch.filter((r) => parseTags(r.tagsJson).includes(tag)) : batch;
+		const readable = await filterReadable(opts.principal, tagged, { caps });
+		for (let i = 0; i < readable.length; i++) {
+			const row = readable[i] as KnowledgeEntryListRow;
+			items.push(row);
+			if (items.length === limit) {
+				// Page full. More exist if another readable row is already in hand, or the
+				// batch came back full (the source may continue past it).
+				const more = i < readable.length - 1 || !exhausted;
+				return {
+					items,
+					nextCursor: more ? encodeEntryCursor({ updatedAt: row.updatedAt, id: row.id }) : null,
+				};
+			}
+		}
+		const last = batch[batch.length - 1];
+		if (exhausted || !last) return { items, nextCursor: null };
+		after = { updatedAt: last.updatedAt, id: last.id };
+	}
+	// Scan budget spent: return what we have and resume after the last scanned row.
+	return { items, nextCursor: after ? encodeEntryCursor(after) : null };
 }
 
 async function getEntry(
@@ -1205,6 +1306,7 @@ export const knowledgeService = {
 	deleteCollection,
 	transferCollectionOwner,
 	listEntries,
+	listEntriesPage,
 	getEntry,
 	createEntry,
 	updateEntryMeta,

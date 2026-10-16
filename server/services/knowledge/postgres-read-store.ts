@@ -255,11 +255,25 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 		},
 
 		async listEntries(opts) {
+			const after = opts.after;
 			const rows = await db
 				.select(ENTRY_LIST_SELECT)
 				.from(knowledgeEntries)
-				.where(opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined)
-				.orderBy(desc(knowledgeEntries.updatedAt))
+				.where(
+					and(
+						opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+						after
+							? or(
+									lt(knowledgeEntries.updatedAt, after.updatedAt),
+									and(
+										eq(knowledgeEntries.updatedAt, after.updatedAt),
+										lt(knowledgeEntries.id, after.id),
+									),
+								)
+							: undefined,
+					),
+				)
+				.orderBy(desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id))
 				.limit(opts.limit);
 			return rows as KnowledgeEntryListRow[];
 		},
