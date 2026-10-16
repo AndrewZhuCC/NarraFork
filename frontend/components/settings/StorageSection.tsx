@@ -11,10 +11,12 @@ import {
 	Progress,
 	Select,
 	Stack,
+	Tabs,
 	Text,
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { STORAGE_CATEGORY_KEYS } from "@shared/storage-categories";
 import {
 	IconAlertTriangle,
 	IconBox,
@@ -50,13 +52,14 @@ import {
 	type DatabaseCleanupTarget,
 	type DatabaseStorageBreakdown,
 	type DatabaseVacuumResult,
+	type StorageCategoryJobState,
+	type StorageCategoryKey,
 	type StorageCategoryResult,
 	type StorageScanJobState,
 	type StorageScanResult,
 } from "../../lib/api";
 import { formatLocaleDateTime, formatLocaleTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { WorkspaceBarriersCard } from "./WorkspaceBarriersCard";
 
 function formatBytes(bytes: number): string {
 	if (bytes === 0) return "0 B";
@@ -138,19 +141,20 @@ const CATEGORY_COLORS: Record<string, string> = {
  * scan reports, otherwise a category's bytes land in the total with no card to
  * explain them.
  */
-const DISPLAYED_CATEGORY_KEYS = [
-	"database",
-	"uploads",
-	"chatAttachments",
-	"shares",
-	"worktrees",
-	"treeSnapshots",
-	"requestDumps",
-	"requestRecordings",
-	"savedRequestRecordings",
-	"dormantIgnored",
-	"containers",
-] as const;
+const DISPLAYED_CATEGORY_KEYS = STORAGE_CATEGORY_KEYS;
+
+function categoryMessageKey(key: string): string {
+	return `storage${key.charAt(0).toUpperCase()}${key.slice(1)}`;
+}
+
+function formatScanDetail(
+	detail: { done: number; total: number | null } | null,
+	filesVisited: (count: number) => string,
+): string {
+	if (!detail) return "";
+	if (detail.total == null) return ` (${filesVisited(detail.done)})`;
+	return ` (${detail.done}/${detail.total})`;
+}
 
 const STORAGE_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
@@ -285,12 +289,9 @@ export function StorageSection() {
 	const scanDisabledReason =
 		storageHealthDisabledReason ?? scanReason ?? t("storageScanUnsupported");
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
-	const [scanning, setScanning] = useState(false);
-	const [progressMsg, setProgressMsg] = useState("");
-	// Table-level counter for the database step, which is by far the longest part of the scan.
-	const [progressDetail, setProgressDetail] = useState<{ done: number; total: number } | null>(
-		null,
-	);
+	const [tab, setTab] = useState<string>("summary");
+	const [categoryJobs, setCategoryJobs] = useState<StorageCategoryJobState[]>([]);
+	const toastedErrors = useRef(new Set<string>());
 	const [cleaningTarget, setCleaningTarget] = useState<string | null>(null);
 	const [databaseTarget, setDatabaseTarget] = useState<DatabaseCleanupTarget | null>(null);
 	const [databaseOlderThanDays, setDatabaseOlderThanDays] = useState<number>(
@@ -328,27 +329,30 @@ export function StorageSection() {
 	);
 
 	const applyJobState = (state: StorageScanJobState) => {
-		if (state.status === "running") {
-			setScanning(true);
-			setProgressMsg(state.progressMessage ?? "");
-			setProgressDetail(state.progressDetail);
-			for (const cat of state.categories) upsertCategory(cat);
-			return false;
-		}
-		setScanning(false);
-		setProgressMsg("");
-		setProgressDetail(null);
-		if (state.status === "complete" && state.result) {
+		const jobs = state.categoryJobs ?? [];
+		setCategoryJobs(jobs);
+		if (state.result) {
 			setScanResult(state.result);
-		} else if (state.status === "error") {
-			console.error("Storage scan failed:", state.error);
+		} else if (state.categories.length > 0) {
+			for (const cat of state.categories) upsertCategory(cat);
+		}
+		for (const job of jobs) {
+			if (job.status !== "error" || !job.error) continue;
+			const token = `${job.key}:${job.finishedAt ?? job.error}`;
+			if (toastedErrors.current.has(token)) continue;
+			toastedErrors.current.add(token);
+			console.error("Storage scan failed:", job.error);
 			notifications.show({
 				color: "red",
-				message: state.error || t("storageScanFailed"),
+				message: job.error || t("storageScanFailed"),
 			});
 		}
-		return true;
+		return !jobs.some((job) => job.status === "running");
 	};
+
+	const jobFor = (key: string) => categoryJobs.find((job) => job.key === key);
+	const categoryRunning = (key: string) => jobFor(key)?.status === "running";
+	const anyRunning = categoryJobs.some((job) => job.status === "running");
 
 	const stopPolling = () => {
 		if (pollTimerRef.current) {
@@ -382,6 +386,10 @@ export function StorageSection() {
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: unmount-only cleanup; stopPolling is stable
 	useEffect(() => {
+		// StrictMode replays this effect: cleanup sets the flag false, and the replay
+		// must set it true again. Otherwise the flag stays false for the life of the
+		// page and every scan response is dropped.
+		mountedRef.current = true;
 		return () => {
 			mountedRef.current = false;
 			stopPolling();
@@ -391,23 +399,24 @@ export function StorageSection() {
 	// Resume an in-flight background scan after remounting (navigating away and back).
 	// biome-ignore lint/correctness/useExhaustiveDependencies: mount-only resume; handlers are stable
 	useEffect(() => {
+		let active = true;
 		api
 			.getStorageScanStatus()
 			.then((res) => {
-				if (!mountedRef.current) return;
-				if (res.state.status === "running") {
+				if (!active || !mountedRef.current) return;
+				if (res.state.categoryJobs?.some((job) => job.status === "running")) {
 					applyJobState(res.state);
 					pollScanStatus();
 					return;
 				}
-				// A TERMINAL state is also worth applying: a scan that finished — or failed —
-				// while this page was closed used to be ignored entirely, so the reader came
-				// back to stale numbers with no hint that the run had ended, let alone that it
-				// had errored. `applyJobState` surfaces the result / the error notification;
-				// `idle` (nothing ever ran) carries neither and is a harmless no-op.
+				// A terminal state is also worth applying: a scan that finished while this
+				// page was closed used to be ignored, so the reader came back to empty rows.
 				applyJobState(res.state);
 			})
 			.catch(() => {});
+		return () => {
+			active = false;
+		};
 	}, []);
 
 	useEffect(() => {
@@ -416,9 +425,22 @@ export function StorageSection() {
 		api
 			.getCachedStorage()
 			.then((res) => {
-				if (!cancelled && res.cached && res.data) {
-					setScanResult(res.data);
-				}
+				if (cancelled || !res.cached || !res.data) return;
+				// The job state is newer for any category it already holds. A cache
+				// response that arrives later must not replace those with a partial set.
+				setScanResult((current) => {
+					if (!current) return res.data ?? null;
+					const byKey = new Map(res.data?.categories.map((cat) => [cat.key, cat]) ?? []);
+					for (const cat of current.categories) byKey.set(cat.key, cat);
+					const categories = [...byKey.values()];
+					return {
+						categories,
+						totalBytes: categories
+							.filter((cat) => !cat.unavailable)
+							.reduce((sum, cat) => sum + cat.sizeBytes, 0),
+						scannedAt: Math.max(current.scannedAt, res.data?.scannedAt ?? 0),
+					};
+				});
 			})
 			.catch(() => {});
 		return () => {
@@ -494,42 +516,63 @@ export function StorageSection() {
 		});
 	};
 
-	const handleScan = async () => {
-		if (!storageHealthReady || scanning || !scanSupported) return;
-		setScanning(true);
-		setProgressMsg("");
-		setProgressDetail(null);
+	const handleScan = async (categories?: StorageCategoryKey[]) => {
+		if (!storageHealthReady || !scanSupported) return;
+		const keys = categories ?? [...DISPLAYED_CATEGORY_KEYS];
+		if (keys.every((key) => categoryRunning(key))) return;
+		setCategoryJobs((prev) => {
+			const next = [...prev];
+			for (const key of keys) {
+				if (next.some((job) => job.key === key && job.status === "running")) continue;
+				const idx = next.findIndex((job) => job.key === key);
+				const running: StorageCategoryJobState = {
+					key,
+					status: "running",
+					progressMessage: null,
+					progressDetail: null,
+					result: idx >= 0 ? next[idx].result : null,
+					error: null,
+					startedAt: Date.now(),
+					finishedAt: null,
+				};
+				if (idx >= 0) next[idx] = running;
+				else next.push(running);
+			}
+			return next;
+		});
 
 		try {
-			const res = await api.startStorageScan();
+			const res = await api.startStorageScan(categories);
 			// The unmount cleanup may already have run during this await; starting the
 			// poll chain now would leave it with nothing to stop it.
 			if (!mountedRef.current) return;
-			// started=false means a scan (possibly from another admin or a previous visit of
-			// this page) is already in flight — either way we just observe the same job.
-			applyJobState(res.state);
-			pollScanStatus();
+			// started=false means each requested category was already in flight.
+			const finished = applyJobState(res.state);
+			if (!finished) pollScanStatus();
 		} catch (err) {
 			console.error("Storage scan failed:", err);
 			notifications.show({
 				color: "red",
 				message: err instanceof Error && err.message ? err.message : t("storageScanFailed"),
 			});
-			setScanning(false);
+			setCategoryJobs((prev) =>
+				prev.map((job) =>
+					keys.includes(job.key) && job.status === "running"
+						? { ...job, status: "error", error: null, finishedAt: Date.now() }
+						: job,
+				),
+			);
 		}
 	};
 
-	const handleCancelScan = async () => {
+	const handleCancelScan = async (categories?: StorageCategoryKey[]) => {
 		try {
-			const res = await api.cancelStorageScan();
-			applyJobState(res.state);
+			const res = await api.cancelStorageScan(categories);
+			if (!mountedRef.current) return;
+			const finished = applyJobState(res.state);
+			if (finished) stopPolling();
 		} catch (err) {
 			console.error("Cancel storage scan failed:", err);
-		} finally {
-			stopPolling();
-			setScanning(false);
-			setProgressMsg("");
-			setProgressDetail(null);
 		}
 	};
 
@@ -553,7 +596,7 @@ export function StorageSection() {
 						}),
 						color: "green",
 					});
-					void handleScan();
+					void handleScan(["worktrees"]);
 				}
 				return;
 			}
@@ -574,7 +617,7 @@ export function StorageSection() {
 						color: "green",
 					});
 				}
-				void handleScan();
+				void handleScan([target.target]);
 			}
 		} catch (err) {
 			console.error("Cleanup failed:", err);
@@ -610,7 +653,7 @@ export function StorageSection() {
 					duration: (result.durationMs / 1000).toFixed(1),
 				}),
 			});
-			void handleScan();
+			void handleScan(["database"]);
 		} catch (err) {
 			console.error("Database VACUUM failed:", err);
 			notifications.show({
@@ -683,7 +726,7 @@ export function StorageSection() {
 				});
 			}
 			closeDatabasePreview();
-			void handleScan();
+			void handleScan(["database"]);
 		} catch (err) {
 			console.error("Database cleanup failed:", err);
 			notifications.show({
@@ -697,7 +740,7 @@ export function StorageSection() {
 	};
 
 	const getCategory = (key: string): StorageCategoryResult | undefined =>
-		scanResult?.categories.find((c) => c.key === key);
+		jobFor(key)?.result ?? scanResult?.categories.find((c) => c.key === key);
 
 	const getCategorySubtext = (cat: StorageCategoryResult): string | null => {
 		const d = cat.details;
@@ -841,55 +884,17 @@ export function StorageSection() {
 			: undefined;
 	const vacuumDisabledReason =
 		storageHealthDisabledReason ?? vacuumReason ?? t("storageDatabaseVacuumDisabled");
+	const scannedCategoryCount = DISPLAYED_CATEGORY_KEYS.filter((key) => getCategory(key)).length;
+	const visibleTotal = DISPLAYED_CATEGORY_KEYS.reduce((sum, key) => {
+		const cat = getCategory(key);
+		if (!cat || cat.unavailable) return sum;
+		return sum + cat.sizeBytes;
+	}, 0);
+	const databaseScanRunning = categoryRunning("database");
 
 	return (
 		<>
 			<Stack gap="md">
-				<Group justify="space-between" align="center">
-					<div>
-						{scanResult && (
-							<>
-								<Text size="sm" c="dimmed">
-									{t("storageTotal")}
-								</Text>
-								<Text fw={600} size="lg">
-									{formatBytes(scanResult.totalBytes)}
-								</Text>
-							</>
-						)}
-					</div>
-					<Group gap="xs">
-						{scanResult && (
-							<Text size="xs" c="dimmed">
-								{t("storageLastScanned", {
-									time: formatLocaleTime(scanResult.scannedAt),
-								})}
-							</Text>
-						)}
-						<Button
-							size="xs"
-							variant="light"
-							color={scanning ? "red" : undefined}
-							leftSection={scanning ? <Loader size={14} /> : <IconRefresh size={14} />}
-							onClick={scanning ? handleCancelScan : handleScan}
-							disabled={!scanning && (!storageHealthReady || !scanSupported)}
-							title={
-								scanning
-									? undefined
-									: !storageHealthReady || !scanSupported
-										? scanDisabledReason
-										: undefined
-							}
-						>
-							{scanning
-								? t("storageScanCancel")
-								: scanResult
-									? t("storageRescan")
-									: t("storageScan")}
-						</Button>
-					</Group>
-				</Group>
-
 				{storageHealthState === "loading" && (
 					<Alert color="blue" variant="light">
 						<Group gap="xs" wrap="nowrap">
@@ -939,303 +944,495 @@ export function StorageSection() {
 					</Alert>
 				)}
 
-				{scanning && progressMsg && (
-					<Text size="xs" c="dimmed">
-						{t(`storageScanProgress_${progressMsg}`, { defaultValue: progressMsg })}
-						{progressDetail ? ` (${progressDetail.done}/${progressDetail.total})` : ""}
-					</Text>
-				)}
+				<Tabs value={tab} onChange={(value) => setTab(value ?? "summary")} keepMounted={false}>
+					<Tabs.List style={{ flexWrap: "nowrap", overflowX: "auto" }}>
+						<Tabs.Tab value="summary">{t("storageTabSummary")}</Tabs.Tab>
+						{DISPLAYED_CATEGORY_KEYS.map((key) => (
+							<Tabs.Tab key={key} value={key}>
+								<Group gap={6} wrap="nowrap">
+									<span>{t(categoryMessageKey(key) as never)}</span>
+									{categoryRunning(key) ? <Loader size={12} /> : null}
+								</Group>
+							</Tabs.Tab>
+						))}
+					</Tabs.List>
 
-				{storageHealthReady && !scanResult && !scanning && (
-					<Text size="sm" c="dimmed" ta="center" py="xl">
-						{t("storageNotScanned")}
-					</Text>
-				)}
-
-				{scanResult && (
-					<Stack gap="xs">
-						{DISPLAYED_CATEGORY_KEYS.map((key) => {
-							const cat = getCategory(key);
-							if (!cat) return null;
-							const color = CATEGORY_COLORS[key] ?? "gray";
-							const pct =
-								scanResult.totalBytes > 0 ? (cat.sizeBytes / scanResult.totalBytes) * 100 : 0;
-							const subtext = getCategorySubtext(cat);
-							const cleanupTarget = CLEANUP_TARGETS.find((ct) => ct.key === key);
-							const cleanupCap = cleanupCapability(cleanupTarget);
-							const cleanupUsesRuntime = usesRuntimeWorktreeCleanup(cleanupTarget);
-							const cleanupUnsafeReason =
-								cleanupTarget?.target === "uploads" &&
-								cleanupCap.preservesMessageImageRefs === false
-									? (cleanupCap.reason ?? t("storageCleanupUploadsUnsafe"))
-									: null;
-							const cleanupUnsupportedReason =
-								cleanupCap.supported === false
-									? (cleanupCap.reason ?? t("storageCleanupUnsupported"))
-									: cleanupUnsafeReason;
-
-							const cleanupDisabled = !canCleanup(key, cleanupTarget) || cleaningTarget === key;
-							const isDatabase = key === "database";
-
-							return (
-								<Paper key={key} data-storage-category={key} p="sm" radius="sm" withBorder>
-									<Stack gap="sm">
-										<Group justify="space-between" align="center" wrap="nowrap">
-											<Group gap="sm" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
-												{CATEGORY_ICONS[key]}
-												<div style={{ flex: 1, minWidth: 0 }}>
-													<Group gap="xs" align="center" wrap="wrap">
-														<Text size="sm" fw={500}>
-															{t(`storage${key.charAt(0).toUpperCase() + key.slice(1)}` as never)}
-														</Text>
-														<Badge size="xs" variant="light" color={color}>
-															{formatBytes(cat.sizeBytes)}
-														</Badge>
-													</Group>
-													{subtext && (
-														<Text size="xs" c="dimmed">
-															{subtext}
-														</Text>
-													)}
-													<Text size="xs" c="dimmed">
-														{t(`storage${key.charAt(0).toUpperCase() + key.slice(1)}Desc` as never)}
-													</Text>
-													<Progress value={pct} color={color} size="xs" mt={4} radius="xl" />
-												</div>
-											</Group>
-											{cleanupTarget && (
-												<Tooltip
-													label={
-														cleanupUnsupportedReason ??
-														(cleanupUsesRuntime
-															? t("storageCleanupWorktreesRuntimeFallback")
-															: t(cleanupTarget.labelKey as never))
-													}
-												>
-													<span>
-														<ActionIcon
-															variant="subtle"
-															color="red"
-															size="sm"
-															disabled={cleanupDisabled}
-															loading={cleaningTarget === key}
-															onClick={() => handleCleanup(cleanupTarget)}
-														>
-															<IconTrash size={14} />
-														</ActionIcon>
-													</span>
-												</Tooltip>
+					<Tabs.Panel value="summary" pt="md">
+						<Stack gap="md">
+							<Group justify="space-between" align="center">
+								<div>
+									{scannedCategoryCount > 0 && (
+										<>
+											<Text size="sm" c="dimmed">
+												{scannedCategoryCount < DISPLAYED_CATEGORY_KEYS.length
+													? t("storagePartialTotal")
+													: t("storageTotal")}
+											</Text>
+											<Text fw={600} size="lg">
+												{formatBytes(visibleTotal)}
+											</Text>
+											{scannedCategoryCount < DISPLAYED_CATEGORY_KEYS.length && (
+												<Text size="xs" c="dimmed">
+													{t("storagePartialTotalNote")}
+												</Text>
 											)}
-										</Group>
+										</>
+									)}
+								</div>
+								<Group gap="xs">
+									{scanResult && scannedCategoryCount > 0 && (
+										<Text size="xs" c="dimmed">
+											{t("storageLastScanned", {
+												time: formatLocaleTime(scanResult.scannedAt),
+											})}
+										</Text>
+									)}
+									<Button
+										size="xs"
+										variant="light"
+										color={anyRunning ? "red" : undefined}
+										leftSection={anyRunning ? <Loader size={14} /> : <IconRefresh size={14} />}
+										onClick={() => void (anyRunning ? handleCancelScan() : handleScan())}
+										disabled={!anyRunning && (!storageHealthReady || !scanSupported)}
+										title={
+											anyRunning
+												? undefined
+												: !storageHealthReady || !scanSupported
+													? scanDisabledReason
+													: undefined
+										}
+									>
+										{anyRunning
+											? t("storageScanCancel")
+											: scannedCategoryCount > 0
+												? t("storageRescan")
+												: t("storageScanAll")}
+									</Button>
+								</Group>
+							</Group>
 
-										{isDatabase && databaseDetails && (
-											<>
-												<Divider />
-												{databaseReadFailureCount > 0 && (
-													<Alert
-														color="yellow"
-														variant="light"
-														icon={<IconAlertTriangle size={16} />}
-														title={t("storageDatabaseIncompleteTitle")}
-													>
-														{databaseReadFailureNames
-															? t("storageDatabaseIncompleteWithTables", {
-																	count: databaseReadFailureCount,
-																	tables: databaseReadFailureNames,
-																})
-															: t("storageDatabaseIncomplete", {
-																	count: databaseReadFailureCount,
-																})}
-													</Alert>
-												)}
-												{databaseUsageCategories.length > 0 && (
-													<Stack gap="xs">
-														<Group justify="space-between" align="center" gap="xs">
+							{storageHealthReady && scannedCategoryCount === 0 && !anyRunning && (
+								<Text size="sm" c="dimmed" ta="center" py="md">
+									{t("storageNotScanned")}
+								</Text>
+							)}
+
+							<Stack gap="xs">
+								{DISPLAYED_CATEGORY_KEYS.map((key) => {
+									const cat = getCategory(key);
+									const job = jobFor(key);
+									const running = job?.status === "running";
+									const color = CATEGORY_COLORS[key] ?? "gray";
+									const pct =
+										cat && !cat.unavailable && visibleTotal > 0
+											? (cat.sizeBytes / visibleTotal) * 100
+											: 0;
+									return (
+										<Paper
+											key={key}
+											data-storage-category={key}
+											p="sm"
+											radius="sm"
+											withBorder
+											style={{ cursor: "pointer" }}
+											onClick={() => setTab(key)}
+										>
+											<Group justify="space-between" align="center" wrap="nowrap">
+												<Group gap="sm" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
+													{CATEGORY_ICONS[key]}
+													<div style={{ flex: 1, minWidth: 0 }}>
+														<Group gap="xs" align="center" wrap="wrap">
 															<Text size="sm" fw={500}>
-																{t("storageDatabaseUsageTitle")}
+																{t(categoryMessageKey(key) as never)}
 															</Text>
-															<Group gap="xs">
-																{databaseDetails.scanMode && (
-																	<Badge size="xs" variant="outline" color="gray">
-																		{t(
-																			`storageDatabaseScanMode_${databaseDetails.scanMode}` as never,
-																		)}
-																	</Badge>
+															{cat && !cat.unavailable && (
+																<Badge size="xs" variant="light" color={color}>
+																	{formatBytes(cat.sizeBytes)}
+																</Badge>
+															)}
+															{running && <Loader size={12} />}
+														</Group>
+														{running && (
+															<Text size="xs" c="dimmed">
+																{job?.progressMessage
+																	? t(`storageScanProgress_${job.progressMessage}`, {
+																			defaultValue: job.progressMessage,
+																		})
+																	: t("storageScanning")}
+																{formatScanDetail(job?.progressDetail ?? null, (count) =>
+																	t("storageScanFilesVisited", { count }),
 																)}
-																{vacuumSupported ? (
+															</Text>
+														)}
+														{cat && getCategorySubtext(cat) && (
+															<Text size="xs" c="dimmed">
+																{getCategorySubtext(cat)}
+															</Text>
+														)}
+														{cat && (
+															<Text size="xs" c="dimmed">
+																{t(`${categoryMessageKey(key)}Desc` as never)}
+															</Text>
+														)}
+														{!cat && !running && (
+															<Text size="xs" c="dimmed">
+																{t("storageCategoryNotScanned")}
+															</Text>
+														)}
+														{cat && (
+															<Progress value={pct} color={color} size="xs" mt={4} radius="xl" />
+														)}
+													</div>
+												</Group>
+											</Group>
+										</Paper>
+									);
+								})}
+							</Stack>
+						</Stack>
+					</Tabs.Panel>
+
+					{DISPLAYED_CATEGORY_KEYS.map((key) => {
+						const cat = getCategory(key);
+						const job = jobFor(key);
+						const running = job?.status === "running";
+						const categoryScanButton = (
+							<Group justify="flex-end">
+								<Button
+									size="xs"
+									variant="light"
+									color={running ? "red" : undefined}
+									leftSection={running ? <Loader size={14} /> : <IconRefresh size={14} />}
+									onClick={() => void (running ? handleCancelScan([key]) : handleScan([key]))}
+									disabled={!running && (!storageHealthReady || !scanSupported)}
+									title={
+										running
+											? undefined
+											: !storageHealthReady || !scanSupported
+												? scanDisabledReason
+												: undefined
+									}
+								>
+									{running
+										? t("storageScanCancel")
+										: cat
+											? t("storageRescan")
+											: t("storageScanThisCategory")}
+								</Button>
+							</Group>
+						);
+						const categoryProgress = running ? (
+							<Text size="xs" c="dimmed">
+								{job?.progressMessage
+									? t(`storageScanProgress_${job.progressMessage}`, {
+											defaultValue: job.progressMessage,
+										})
+									: t("storageScanning")}
+								{formatScanDetail(job?.progressDetail ?? null, (count) =>
+									t("storageScanFilesVisited", { count }),
+								)}
+							</Text>
+						) : null;
+						if (!cat) {
+							return (
+								<Tabs.Panel key={key} value={key} pt="md">
+									<Stack gap="sm">
+										{categoryScanButton}
+										{categoryProgress}
+										{storageHealthReady && !running && (
+											<Text size="sm" c="dimmed" ta="center" py="xl">
+												{t("storageCategoryNotScanned")}
+											</Text>
+										)}
+									</Stack>
+								</Tabs.Panel>
+							);
+						}
+						const color = CATEGORY_COLORS[key] ?? "gray";
+						const pct =
+							!cat.unavailable && visibleTotal > 0 ? (cat.sizeBytes / visibleTotal) * 100 : 0;
+						const subtext = getCategorySubtext(cat);
+						const cleanupTarget = CLEANUP_TARGETS.find((ct) => ct.key === key);
+						const cleanupCap = cleanupCapability(cleanupTarget);
+						const cleanupUsesRuntime = usesRuntimeWorktreeCleanup(cleanupTarget);
+						const cleanupUnsafeReason =
+							cleanupTarget?.target === "uploads" && cleanupCap.preservesMessageImageRefs === false
+								? (cleanupCap.reason ?? t("storageCleanupUploadsUnsafe"))
+								: null;
+						const cleanupUnsupportedReason =
+							cleanupCap.supported === false
+								? (cleanupCap.reason ?? t("storageCleanupUnsupported"))
+								: cleanupUnsafeReason;
+
+						const cleanupDisabled = !canCleanup(key, cleanupTarget) || cleaningTarget === key;
+						const isDatabase = key === "database";
+
+						return (
+							<Tabs.Panel key={key} value={key} pt="md">
+								<Stack gap="sm">
+									{categoryScanButton}
+									{categoryProgress}
+									<Paper data-storage-detail={key} p="sm" radius="sm" withBorder>
+										<Stack gap="sm">
+											<Group justify="space-between" align="center" wrap="nowrap">
+												<Group gap="sm" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
+													{CATEGORY_ICONS[key]}
+													<div style={{ flex: 1, minWidth: 0 }}>
+														<Group gap="xs" align="center" wrap="wrap">
+															<Text size="sm" fw={500}>
+																{t(`storage${key.charAt(0).toUpperCase() + key.slice(1)}` as never)}
+															</Text>
+															<Badge size="xs" variant="light" color={color}>
+																{formatBytes(cat.sizeBytes)}
+															</Badge>
+														</Group>
+														{subtext && (
+															<Text size="xs" c="dimmed">
+																{subtext}
+															</Text>
+														)}
+														<Text size="xs" c="dimmed">
+															{t(
+																`storage${key.charAt(0).toUpperCase() + key.slice(1)}Desc` as never,
+															)}
+														</Text>
+														<Progress value={pct} color={color} size="xs" mt={4} radius="xl" />
+													</div>
+												</Group>
+												{cleanupTarget && (
+													<Tooltip
+														label={
+															cleanupUnsupportedReason ??
+															(cleanupUsesRuntime
+																? t("storageCleanupWorktreesRuntimeFallback")
+																: t(cleanupTarget.labelKey as never))
+														}
+													>
+														<span>
+															<ActionIcon
+																variant="subtle"
+																color="red"
+																size="sm"
+																disabled={cleanupDisabled}
+																loading={cleaningTarget === key}
+																onClick={() => handleCleanup(cleanupTarget)}
+															>
+																<IconTrash size={14} />
+															</ActionIcon>
+														</span>
+													</Tooltip>
+												)}
+											</Group>
+
+											{isDatabase && databaseDetails && (
+												<>
+													<Divider />
+													{databaseReadFailureCount > 0 && (
+														<Alert
+															color="yellow"
+															variant="light"
+															icon={<IconAlertTriangle size={16} />}
+															title={t("storageDatabaseIncompleteTitle")}
+														>
+															{databaseReadFailureNames
+																? t("storageDatabaseIncompleteWithTables", {
+																		count: databaseReadFailureCount,
+																		tables: databaseReadFailureNames,
+																	})
+																: t("storageDatabaseIncomplete", {
+																		count: databaseReadFailureCount,
+																	})}
+														</Alert>
+													)}
+													{databaseUsageCategories.length > 0 && (
+														<Stack gap="xs">
+															<Group justify="space-between" align="center" gap="xs">
+																<Text size="sm" fw={500}>
+																	{t("storageDatabaseUsageTitle")}
+																</Text>
+																<Group gap="xs">
+																	{databaseDetails.scanMode && (
+																		<Badge size="xs" variant="outline" color="gray">
+																			{t(
+																				`storageDatabaseScanMode_${databaseDetails.scanMode}` as never,
+																			)}
+																		</Badge>
+																	)}
+																	{vacuumSupported ? (
+																		<Button
+																			size="xs"
+																			variant="light"
+																			color="orange"
+																			loading={databaseVacuuming}
+																			disabled={!canVacuumDatabase || databaseScanRunning}
+																			onClick={handleDatabaseVacuum}
+																		>
+																			{t("storageDatabaseVacuum")}
+																		</Button>
+																	) : (
+																		<Tooltip label={vacuumDisabledReason}>
+																			<span>
+																				<Button size="xs" variant="light" color="orange" disabled>
+																					{t("storageDatabaseVacuum")}
+																				</Button>
+																			</span>
+																		</Tooltip>
+																	)}
+																</Group>
+															</Group>
+
+															{databaseDetails.objectBytes != null && (
+																<Text size="xs" c="dimmed">
+																	{t("storageDatabaseUsageDesc", {
+																		objects: formatBytes(databaseDetails.objectBytes),
+																		free: formatBytes(databaseDetails.freelistBytes ?? 0),
+																	})}
+																</Text>
+															)}
+															<Stack gap={6}>
+																{databaseUsageCategories.map((category) => (
+																	<Paper
+																		key={category.key}
+																		p="xs"
+																		radius="sm"
+																		bg={NESTED_ROW_BG}
+																		withBorder
+																	>
+																		<Group
+																			justify="space-between"
+																			align="flex-start"
+																			gap="xs"
+																			wrap="nowrap"
+																		>
+																			<div style={{ flex: 1, minWidth: 0 }}>
+																				<Text size="sm" fw={500}>
+																					{t(
+																						`storageDatabaseUsageCategory_${category.key}` as never,
+																					)}
+																				</Text>
+																				<Text size="xs" c="dimmed">
+																					{category.key === "free"
+																						? t("storageDatabaseUsageFreeStats")
+																						: t("storageDatabaseUsageCategoryStats", {
+																								tables: category.tableCount,
+																								rows: category.rowCount,
+																								indexes: formatBytes(category.indexBytes),
+																							})}
+																				</Text>
+																			</div>
+																			<Badge variant="light" color="blue">
+																				{formatBytes(category.totalBytes)}
+																			</Badge>
+																		</Group>
+																	</Paper>
+																))}
+															</Stack>
+															{databaseTopTables.length > 0 && (
+																<Text size="xs" c="dimmed">
+																	{t("storageDatabaseTopTables", {
+																		tables: databaseTopTables
+																			.slice(0, 5)
+																			.map(
+																				(table) => `${table.name} ${formatBytes(table.totalBytes)}`,
+																			)
+																			.join(" · "),
+																	})}
+																</Text>
+															)}
+														</Stack>
+													)}
+													{databaseUsageCategories.length > 0 && <Divider />}
+													<Stack gap="xs">
+														{databaseRows.map((row) => (
+															<Paper
+																key={row.target}
+																p="xs"
+																radius="sm"
+																bg={NESTED_ROW_BG}
+																withBorder
+															>
+																<Group
+																	justify="space-between"
+																	align="flex-start"
+																	gap="sm"
+																	wrap="nowrap"
+																>
+																	<div style={{ flex: 1, minWidth: 0 }}>
+																		<Group gap="xs" wrap="wrap">
+																			<Text size="sm" fw={500}>
+																				{getDatabaseTargetLabel(row.target)}
+																			</Text>
+																			<Badge size="xs" variant="light" color="blue">
+																				{formatBytes(row.summary.approxBytes)}
+																			</Badge>
+																		</Group>
+																		<Text size="xs" c="dimmed">
+																			{row.description}
+																		</Text>
+																		<Group gap="xs" mt={4} wrap="wrap">
+																			<Text size="xs" c="dimmed">
+																				{row.target === "apiRequestDumps"
+																					? t("storageDatabaseSummaryRequests", {
+																							count: row.summary.count,
+																						})
+																					: row.target === "toolCallPayloads"
+																						? t("storageDatabaseSummaryToolCalls", {
+																								count: row.summary.count,
+																							})
+																						: t("storageDatabaseSummarySessions", {
+																								count: row.summary.count,
+																							})}
+																			</Text>
+																			{row.summary.oldestAt && (
+																				<Text size="xs" c="dimmed">
+																					{t("storageDatabaseSummaryOldest", {
+																						time: formatDateTime(row.summary.oldestAt),
+																					})}
+																				</Text>
+																			)}
+																			{row.summary.blockedCount > 0 && (
+																				<Text size="xs" c="yellow">
+																					{t("storageDatabaseSummaryBlocked", {
+																						count: row.summary.blockedCount,
+																					})}
+																				</Text>
+																			)}
+																		</Group>
+																		{row.target === "apiRequestDumps" && requestDumpEnabled && (
+																			<Group mt={6} gap={6} wrap="nowrap">
+																				<IconInfoCircle size={14} />
+																				<Text size="xs" c="dimmed">
+																					{t("storageDatabaseDumpEnabledNote")}
+																				</Text>
+																			</Group>
+																		)}
+																	</div>
 																	<Button
 																		size="xs"
 																		variant="light"
-																		color="orange"
-																		loading={databaseVacuuming}
-																		disabled={!canVacuumDatabase || scanning}
-																		onClick={handleDatabaseVacuum}
+																		onClick={() => openDatabasePreview(row.target)}
+																		disabled={!databasePreviewCapability.supported}
+																		title={
+																			!databasePreviewCapability.supported
+																				? databasePreviewDisabledReason
+																				: undefined
+																		}
 																	>
-																		{t("storageDatabaseVacuum")}
+																		{t("storageDatabasePreview")}
 																	</Button>
-																) : (
-																	<Tooltip label={vacuumDisabledReason}>
-																		<span>
-																			<Button size="xs" variant="light" color="orange" disabled>
-																				{t("storageDatabaseVacuum")}
-																			</Button>
-																		</span>
-																	</Tooltip>
-																)}
-															</Group>
-														</Group>
-
-														{databaseDetails.objectBytes != null && (
-															<Text size="xs" c="dimmed">
-																{t("storageDatabaseUsageDesc", {
-																	objects: formatBytes(databaseDetails.objectBytes),
-																	free: formatBytes(databaseDetails.freelistBytes ?? 0),
-																})}
-															</Text>
-														)}
-														<Stack gap={6}>
-															{databaseUsageCategories.map((category) => (
-																<Paper
-																	key={category.key}
-																	p="xs"
-																	radius="sm"
-																	bg={NESTED_ROW_BG}
-																	withBorder
-																>
-																	<Group
-																		justify="space-between"
-																		align="flex-start"
-																		gap="xs"
-																		wrap="nowrap"
-																	>
-																		<div style={{ flex: 1, minWidth: 0 }}>
-																			<Text size="sm" fw={500}>
-																				{t(`storageDatabaseUsageCategory_${category.key}` as never)}
-																			</Text>
-																			<Text size="xs" c="dimmed">
-																				{category.key === "free"
-																					? t("storageDatabaseUsageFreeStats")
-																					: t("storageDatabaseUsageCategoryStats", {
-																							tables: category.tableCount,
-																							rows: category.rowCount,
-																							indexes: formatBytes(category.indexBytes),
-																						})}
-																			</Text>
-																		</div>
-																		<Badge variant="light" color="blue">
-																			{formatBytes(category.totalBytes)}
-																		</Badge>
-																	</Group>
-																</Paper>
-															))}
-														</Stack>
-														{databaseTopTables.length > 0 && (
-															<Text size="xs" c="dimmed">
-																{t("storageDatabaseTopTables", {
-																	tables: databaseTopTables
-																		.slice(0, 5)
-																		.map(
-																			(table) => `${table.name} ${formatBytes(table.totalBytes)}`,
-																		)
-																		.join(" · "),
-																})}
-															</Text>
-														)}
+																</Group>
+															</Paper>
+														))}
 													</Stack>
-												)}
-												{databaseUsageCategories.length > 0 && <Divider />}
-												<Stack gap="xs">
-													{databaseRows.map((row) => (
-														<Paper
-															key={row.target}
-															p="xs"
-															radius="sm"
-															bg={NESTED_ROW_BG}
-															withBorder
-														>
-															<Group
-																justify="space-between"
-																align="flex-start"
-																gap="sm"
-																wrap="nowrap"
-															>
-																<div style={{ flex: 1, minWidth: 0 }}>
-																	<Group gap="xs" wrap="wrap">
-																		<Text size="sm" fw={500}>
-																			{getDatabaseTargetLabel(row.target)}
-																		</Text>
-																		<Badge size="xs" variant="light" color="blue">
-																			{formatBytes(row.summary.approxBytes)}
-																		</Badge>
-																	</Group>
-																	<Text size="xs" c="dimmed">
-																		{row.description}
-																	</Text>
-																	<Group gap="xs" mt={4} wrap="wrap">
-																		<Text size="xs" c="dimmed">
-																			{row.target === "apiRequestDumps"
-																				? t("storageDatabaseSummaryRequests", {
-																						count: row.summary.count,
-																					})
-																				: row.target === "toolCallPayloads"
-																					? t("storageDatabaseSummaryToolCalls", {
-																							count: row.summary.count,
-																						})
-																					: t("storageDatabaseSummarySessions", {
-																							count: row.summary.count,
-																						})}
-																		</Text>
-																		{row.summary.oldestAt && (
-																			<Text size="xs" c="dimmed">
-																				{t("storageDatabaseSummaryOldest", {
-																					time: formatDateTime(row.summary.oldestAt),
-																				})}
-																			</Text>
-																		)}
-																		{row.summary.blockedCount > 0 && (
-																			<Text size="xs" c="yellow">
-																				{t("storageDatabaseSummaryBlocked", {
-																					count: row.summary.blockedCount,
-																				})}
-																			</Text>
-																		)}
-																	</Group>
-																	{row.target === "apiRequestDumps" && requestDumpEnabled && (
-																		<Group mt={6} gap={6} wrap="nowrap">
-																			<IconInfoCircle size={14} />
-																			<Text size="xs" c="dimmed">
-																				{t("storageDatabaseDumpEnabledNote")}
-																			</Text>
-																		</Group>
-																	)}
-																</div>
-																<Button
-																	size="xs"
-																	variant="light"
-																	onClick={() => openDatabasePreview(row.target)}
-																	disabled={!databasePreviewCapability.supported}
-																	title={
-																		!databasePreviewCapability.supported
-																			? databasePreviewDisabledReason
-																			: undefined
-																	}
-																>
-																	{t("storageDatabasePreview")}
-																</Button>
-															</Group>
-														</Paper>
-													))}
-												</Stack>
-											</>
-										)}
-									</Stack>
-								</Paper>
-							);
-						})}
-					</Stack>
-				)}
-
-				<WorkspaceBarriersCard />
+												</>
+											)}
+										</Stack>
+									</Paper>
+								</Stack>
+							</Tabs.Panel>
+						);
+					})}
+				</Tabs>
 			</Stack>
 
 			<Modal

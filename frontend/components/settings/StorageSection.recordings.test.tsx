@@ -40,7 +40,6 @@ mock.module("../../hooks/usePlatform", () => ({
 mock.module("../common/confirm-dialog-context", () => ({
 	useConfirmDialog: () => async () => true,
 }));
-mock.module("./WorkspaceBarriersCard", () => ({ WorkspaceBarriersCard: () => null }));
 const { StorageSection } = await import("./StorageSection");
 
 const result: StorageScanResult = {
@@ -105,6 +104,7 @@ beforeEach(() => {
 			error: null,
 			startedAt: null,
 			finishedAt: null,
+			categoryJobs: [],
 		},
 	});
 	cleanup = spyOn(api, "cleanupStorage");
@@ -145,7 +145,7 @@ test.each([
 		for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 	});
 	expect(cached).toHaveBeenCalledTimes(1);
-	expect(document.querySelectorAll("[data-storage-category]")).toHaveLength(3);
+	expect(document.querySelectorAll("[data-storage-category]")).toHaveLength(11);
 	const checks = [
 		[
 			"requestRecordings",

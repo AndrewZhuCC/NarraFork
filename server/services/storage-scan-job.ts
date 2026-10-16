@@ -1,174 +1,265 @@
 /**
- * Server-side storage scan job.
+ * Per-category storage scan jobs.
  *
- * The scan is decoupled from the HTTP connection that triggered it: an admin can
- * navigate away (or close the tab) mid-scan and the scan keeps running to
- * completion, writing its result into the shared cache. Clients observe progress
- * by polling `getStorageScanJob()` instead of owning the scan through an SSE
- * stream — the old SSE route aborted the whole scan on client disconnect, which
- * made the scan impossible to background.
+ * An admin can scan every category from the summary tab, or one category from its
+ * own tab. Each category has its own slot and abort controller, and running
+ * categories proceed together — nothing waits for the database step to finish
+ * before a directory walk starts.
  *
- * Dedupe: there is exactly one job slot. `startStorageScan()` while a scan is
- * already running returns the existing job instead of stacking a second scan on
- * the worker pool.
+ * Dedupe is per category. Starting a category that is already running returns the
+ * current state instead of stacking a second walk on the worker pool.
  */
 
+import {
+	STORAGE_CATEGORY_KEYS,
+	STORAGE_CATEGORY_PROGRESS_MESSAGE,
+	type StorageCategoryKey,
+} from "@shared/storage-categories";
 import { logger } from "../lib/logger";
 import {
+	rememberStorageCategory,
 	type StorageCategoryResult,
 	StorageScanAbortedError,
 	type StorageScanResult,
-	scanStorage,
+	scanStorageCategory,
 } from "./storage-service";
 
 export type StorageScanJobStatus = "idle" | "running" | "complete" | "error" | "cancelled";
 
-export interface StorageScanJobState {
+export interface StorageCategoryJobState {
+	key: StorageCategoryKey;
 	status: StorageScanJobStatus;
 	progressMessage: string | null;
-	progressDetail: { done: number; total: number } | null;
-	/** Categories reported so far, so a late-joining poller sees partial results. */
+	progressDetail: { done: number; total: number | null } | null;
+	result: StorageCategoryResult | null;
+	error: string | null;
+	startedAt: number | null;
+	finishedAt: number | null;
+}
+
+export interface StorageScanJobState {
+	/** `running` while any category is still running. */
+	status: StorageScanJobStatus;
+	progressMessage: string | null;
+	progressDetail: { done: number; total: number | null } | null;
+	/** Category results gathered so far, including ones kept from an earlier scan. */
 	categories: StorageCategoryResult[];
+	categoryJobs: StorageCategoryJobState[];
 	result: StorageScanResult | null;
 	error: string | null;
 	startedAt: number | null;
 	finishedAt: number | null;
 }
 
-const idleState = (): StorageScanJobState => ({
+export interface StorageScanStartInput {
+	/** Omit to scan every category. */
+	categories?: StorageCategoryKey[];
+}
+
+const idleCategory = (key: StorageCategoryKey): StorageCategoryJobState => ({
+	key,
 	status: "idle",
 	progressMessage: null,
 	progressDetail: null,
-	categories: [],
 	result: null,
 	error: null,
 	startedAt: null,
 	finishedAt: null,
 });
 
-let state: StorageScanJobState = idleState();
-let abortController: AbortController | null = null;
+const jobs = new Map<StorageCategoryKey, StorageCategoryJobState>(
+	STORAGE_CATEGORY_KEYS.map((key) => [key, idleCategory(key)]),
+);
+const abortControllers = new Map<StorageCategoryKey, AbortController>();
+
+function selectedKeys(categories?: StorageCategoryKey[]): StorageCategoryKey[] {
+	if (!categories || categories.length === 0) return [...STORAGE_CATEGORY_KEYS];
+	const seen = new Set<StorageCategoryKey>();
+	const keys: StorageCategoryKey[] = [];
+	for (const key of categories) {
+		if (!STORAGE_CATEGORY_KEYS.includes(key) || seen.has(key)) continue;
+		seen.add(key);
+		keys.push(key);
+	}
+	return keys;
+}
+
+function deriveStatus(list: StorageCategoryJobState[]): StorageScanJobStatus {
+	if (list.some((job) => job.status === "running")) return "running";
+	if (list.some((job) => job.status === "error")) return "error";
+	if (list.some((job) => job.status === "complete")) return "complete";
+	if (list.some((job) => job.status === "cancelled")) return "cancelled";
+	return "idle";
+}
+
+function snapshot(): StorageScanJobState {
+	const categoryJobs = STORAGE_CATEGORY_KEYS.map((key) => jobs.get(key) ?? idleCategory(key));
+	const categories = categoryJobs.flatMap((job) => (job.result ? [job.result] : []));
+	const status = deriveStatus(categoryJobs);
+	const running = categoryJobs.filter((job) => job.status === "running");
+	const errors = categoryJobs.flatMap((job) => (job.error ? [job.error] : []));
+	const startedAt = categoryJobs.reduce<number | null>((earliest, job) => {
+		if (job.startedAt == null) return earliest;
+		return earliest == null ? job.startedAt : Math.min(earliest, job.startedAt);
+	}, null);
+	const finishedAt =
+		status === "running"
+			? null
+			: categoryJobs.reduce<number | null>((latest, job) => {
+					if (job.finishedAt == null) return latest;
+					return latest == null ? job.finishedAt : Math.max(latest, job.finishedAt);
+				}, null);
+	const single = running.length === 1 ? running[0] : null;
+	const result: StorageScanResult | null =
+		categories.length === 0
+			? null
+			: {
+					categories,
+					totalBytes: categories
+						.filter((category) => !category.unavailable)
+						.reduce((sum, category) => sum + category.sizeBytes, 0),
+					...(categories.some((category) => category.truncated || category.unavailable)
+						? { truncated: true }
+						: {}),
+					scannedAt: finishedAt ?? Date.now(),
+				};
+	return {
+		status,
+		progressMessage: single?.progressMessage ?? null,
+		progressDetail: single?.progressDetail ?? null,
+		categories,
+		categoryJobs,
+		result,
+		error: errors.length > 0 ? errors.join("\n") : null,
+		startedAt,
+		finishedAt,
+	};
+}
 
 export function getStorageScanJob(): StorageScanJobState {
-	return state;
+	return snapshot();
 }
 
 /**
- * Start a scan, or return the in-flight one. `started` tells the caller whether
- * this call initiated the scan (false means another caller — possibly another
- * admin, possibly this page before a remount — already started it).
+ * Start the requested categories, or every category when none are named.
+ *
+ * `started` is false only when every requested category was already running and
+ * had not been aborted. A category whose abort was requested does not hold its
+ * slot: Cancel then Scan starts a new run immediately.
  */
-export function startStorageScan(): { started: boolean; state: StorageScanJobState } {
-	// A job whose abort has already been requested does NOT hold the slot: it is on
-	// its way out and will only write a `cancelled` state. Treating it as in-flight
-	// made "Cancel, then Rescan" silently no-op — the second call was deduped onto the
-	// dying job, so the user had to click Rescan twice. The outgoing scan cannot
-	// clobber the new state either: `runScan`'s terminal writes are guarded by
-	// `abortController === controller`, which the reassignment below invalidates.
-	if (state.status === "running" && abortController && !abortController.signal.aborted) {
-		return { started: false, state };
+export function startStorageScan(input: StorageScanStartInput = {}): {
+	started: boolean;
+	state: StorageScanJobState;
+} {
+	let started = false;
+	for (const key of selectedKeys(input.categories)) {
+		const current = jobs.get(key) ?? idleCategory(key);
+		const controller = abortControllers.get(key);
+		if (current.status === "running" && controller && !controller.signal.aborted) continue;
+
+		const next = new AbortController();
+		abortControllers.set(key, next);
+		jobs.set(key, {
+			...current,
+			status: "running",
+			progressMessage: STORAGE_CATEGORY_PROGRESS_MESSAGE[key],
+			progressDetail: null,
+			error: null,
+			startedAt: Date.now(),
+			finishedAt: null,
+		});
+		started = true;
+		void runCategory(key, next);
 	}
-
-	state = { ...idleState(), status: "running", startedAt: Date.now() };
-	const controller = new AbortController();
-	abortController = controller;
-
-	void runScan(controller);
-
-	return { started: true, state };
+	return { started, state: snapshot() };
 }
 
-async function runScan(controller: AbortController): Promise<void> {
-	/**
-	 * Does this run still own the job slot?
-	 *
-	 * A cancelled scan keeps running until its next checkpoint, and `startStorageScan`
-	 * deliberately hands the slot to a replacement rather than waiting for it. So an
-	 * outgoing run can reach a state write AFTER the new run has published its own —
-	 * and without this check it would overwrite the new `running` state with its own
-	 * `cancelled`/progress, making a freshly started scan look cancelled while it is
-	 * in fact still scanning. The controller identity is the slot's owner token.
-	 */
-	const ownsSlot = () => abortController === controller;
+async function runCategory(key: StorageCategoryKey, controller: AbortController): Promise<void> {
+	/** The controller identity is the slot's owner token. A replacement run invalidates it. */
+	const ownsSlot = () => abortControllers.get(key) === controller;
 	try {
-		const gen = scanStorage({ signal: controller.signal });
-		for (;;) {
-			const { value, done } = await gen.next();
-			if (!ownsSlot()) return;
-			if (done) {
-				state = {
-					...state,
-					status: "complete",
-					result: value,
-					progressMessage: null,
-					progressDetail: null,
-					finishedAt: Date.now(),
-				};
-				return;
-			}
-			if (value.type === "progress") {
-				state = {
-					...state,
-					progressMessage: value.message,
-					progressDetail: value.detail ?? null,
-				};
-			} else {
-				const categories = [...state.categories];
-				const idx = categories.findIndex((c) => c.key === value.data.key);
-				if (idx >= 0) categories[idx] = value.data;
-				else categories.push(value.data);
-				state = { ...state, categories };
-			}
-		}
-	} catch (err) {
-		const aborted = controller.signal.aborted || err instanceof StorageScanAbortedError;
+		const result = await scanStorageCategory(key, {
+			signal: controller.signal,
+			onProgress: (detail) => {
+				if (!ownsSlot()) return;
+				const current = jobs.get(key);
+				if (!current || current.status !== "running") return;
+				jobs.set(key, {
+					...current,
+					progressMessage: STORAGE_CATEGORY_PROGRESS_MESSAGE[key],
+					progressDetail: detail,
+				});
+			},
+		});
+		if (!ownsSlot()) return;
+		rememberStorageCategory(result);
+		const current = jobs.get(key) ?? idleCategory(key);
+		jobs.set(key, {
+			...current,
+			status: "complete",
+			result,
+			progressMessage: null,
+			progressDetail: null,
+			error: null,
+			finishedAt: Date.now(),
+		});
+	} catch (error) {
+		const aborted = controller.signal.aborted || error instanceof StorageScanAbortedError;
 		if (!aborted) {
-			logger.error("Background storage scan failed", {
-				error: err instanceof Error ? err.message : String(err),
+			logger.error("Background storage category scan failed", {
+				category: key,
+				error: error instanceof Error ? error.message : String(error),
 			});
 		}
-		// Logged above regardless, but only PUBLISHED while this run owns the slot.
 		if (!ownsSlot()) return;
-		state = {
-			...state,
+		const current = jobs.get(key) ?? idleCategory(key);
+		jobs.set(key, {
+			...current,
 			status: aborted ? "cancelled" : "error",
-			error: aborted ? null : err instanceof Error ? err.message : String(err),
+			error: aborted ? null : error instanceof Error ? error.message : String(error),
 			progressMessage: null,
 			progressDetail: null,
 			finishedAt: Date.now(),
-		};
+		});
 	} finally {
-		if (abortController === controller) {
-			abortController = null;
-		}
+		if (abortControllers.get(key) === controller) abortControllers.delete(key);
 	}
 }
 
 /**
  * How long `cancelStorageScan` waits for the abort to actually land.
  *
- * `abort()` only sets a flag; the scan notices it at its next checkpoint (between
- * steps), so the state is still `running` when abort() returns. Returning that
- * state told the client "still running" for a cancel it had just performed, and —
- * worse — an immediate Rescan hit the `running && abortController` dedupe and was
- * refused, so the button appeared to do nothing until the user clicked twice.
- *
- * Short, because it blocks the response: a checkpoint is one scan step away, and if
- * a step is slow the loop below gives up and returns the still-running state rather
- * than holding the request open. `startStorageScan` no longer depends on this
- * anyway (see its `signal.aborted` check), so a timeout costs only a stale status.
+ * Short, because it blocks the response. A category blocked inside one synchronous
+ * query can outlive this wait; the caller still gets the latest state, and a
+ * follow-up scan is not deduped onto an abort that was already requested.
  */
 const CANCEL_SETTLE_TIMEOUT_MS = 1500;
 const CANCEL_SETTLE_POLL_MS = 25;
 
-export async function cancelStorageScan(): Promise<StorageScanJobState> {
-	if (state.status !== "running" || !abortController) return state;
-	abortController.abort();
+export async function cancelStorageScan(
+	input: StorageScanStartInput = {},
+): Promise<StorageScanJobState> {
+	const keys = selectedKeys(input.categories);
+	let abortedAny = false;
+	for (const key of keys) {
+		const job = jobs.get(key);
+		const controller = abortControllers.get(key);
+		if (job?.status !== "running" || !controller || controller.signal.aborted) continue;
+		controller.abort();
+		abortedAny = true;
+	}
+	if (!abortedAny) return snapshot();
 	const deadline = Date.now() + CANCEL_SETTLE_TIMEOUT_MS;
-	// Wait for the scan loop to observe the abort and write its terminal state, so the
-	// client is told what actually happened instead of a status it just invalidated.
-	while (state.status === "running" && Date.now() < deadline) {
+	while (Date.now() < deadline) {
+		const stillRunning = keys.some((key) => {
+			const job = jobs.get(key);
+			const controller = abortControllers.get(key);
+			return job?.status === "running" && controller && !controller.signal.aborted;
+		});
+		// Also wait while a controller is aborted but the job has not published cancelled yet.
+		const settling = keys.some((key) => jobs.get(key)?.status === "running");
+		if (!stillRunning && !settling) break;
 		await new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_POLL_MS));
 	}
-	return state;
+	return snapshot();
 }
