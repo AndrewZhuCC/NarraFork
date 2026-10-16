@@ -140,6 +140,11 @@ knowledgeRoutes.delete("/collections/:id", async (c) => {
 //     rows within the per-request scan budget — keep following `nextCursor`.
 // With `q` the FTS search path runs instead (already capped, not paginated): the paged
 // shape then always carries `nextCursor: null`.
+//
+// Paged mode also takes `level` (effective level), `status` and `sort` (`updated` default /
+// `title`, keyset on (title, id); `relevance` is the search default) and annotates each row
+// with `ownerUsername`, `myPersonalEntryId` and `myPersonalEntryBehindMain` (two bounded
+// batch lookups per page). The legacy array shape is unchanged.
 knowledgeRoutes.get("/entries", async (c) => {
 	const collectionId = c.req.query("collectionId") || undefined;
 	const tag = c.req.query("tag") || undefined;
@@ -147,23 +152,50 @@ knowledgeRoutes.get("/entries", async (c) => {
 	const parsed = listKnowledgeEntriesQuerySchema.safeParse({
 		cursor: c.req.query("cursor") || undefined,
 		limit: c.req.query("limit") || undefined,
+		level: c.req.query("level") || undefined,
+		status: c.req.query("status") || undefined,
+		sort: c.req.query("sort") || undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { level, status, sort } = parsed.data;
 	const paged = parsed.data.cursor !== undefined || parsed.data.limit !== undefined;
 	const principal = principalOf(c);
 	if (q?.trim()) {
-		const results = await knowledgeService.search({ q, collectionId, tag });
-		const readable = await knowledgeService.filterReadable(principal, results);
-		return c.json(paged ? { items: readable, nextCursor: null } : readable);
+		if (!paged) {
+			const results = await knowledgeService.search({ q, collectionId, tag });
+			return c.json(await knowledgeService.filterReadable(principal, results));
+		}
+		const rows = await knowledgeService.searchEntriesForBrowse({
+			principal,
+			q,
+			collectionId,
+			tag,
+			level,
+			status,
+			sort,
+		});
+		return c.json({
+			items: await knowledgeService.annotateEntryRows(principal, rows),
+			nextCursor: null,
+		});
 	}
 	const page = await knowledgeService.listEntriesPage({
 		principal,
 		collectionId,
 		tag,
+		level,
+		status,
+		// `relevance` only means something with `q`; the list falls back to its default order.
+		sort: sort === "title" ? "title" : "updated",
 		limit: parsed.data.limit ?? (paged ? undefined : LEGACY_ENTRY_LIST_LIMIT),
 		cursor: parsed.data.cursor,
 	});
-	if (paged) return c.json(page);
+	if (paged) {
+		return c.json({
+			items: await knowledgeService.annotateEntryRows(principal, page.items),
+			nextCursor: page.nextCursor,
+		});
+	}
 	if (page.nextCursor) c.header("X-Next-Cursor", page.nextCursor);
 	return c.json(page.items);
 });

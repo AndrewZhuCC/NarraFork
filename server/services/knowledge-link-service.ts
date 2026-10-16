@@ -6,6 +6,7 @@ import { WriteConflictError } from "./knowledge/write-store";
 import {
 	type AclCollection,
 	type AclEntry,
+	canManageEntryLinks,
 	canRead,
 	type Principal,
 	type PrincipalCaps,
@@ -65,6 +66,12 @@ export interface LinkWithEntries {
 	direction: "out" | "in";
 	fromEntry: LinkEndpoint;
 	toEntry: LinkEndpoint;
+}
+
+/** A `listLinks` row: the link plus whether the caller may delete it (`DELETE /links/:id`'s
+ *  gate, {@link canManageEntryLinks} on the link's source entry). */
+export interface LinkListItem extends LinkWithEntries {
+	canRemove: boolean;
 }
 
 export interface GraphNode extends LinkEndpoint {
@@ -179,6 +186,14 @@ class ReadResolver {
 		this.readableCache.set(entryId, ok);
 		return ok;
 	}
+
+	/** {@link canManageEntryLinks} on an already-preloaded entry (fail closed when absent). */
+	async canManageLinksFrom(entryId: string): Promise<boolean> {
+		const entry = this.entryCache.get(entryId);
+		const col = entry ? this.collectionById.get(entry.collectionId) : undefined;
+		if (!entry || !col) return false;
+		return canManageEntryLinks(this.caps, toAclEntry(entry), toAclCollection(col));
+	}
 }
 
 /** Load an entry and assert the principal can read it; otherwise NotFound (don't leak existence). */
@@ -189,6 +204,20 @@ async function assertReadableEntry(caps: PrincipalCaps, entryId: string): Promis
 	// Fail closed on a missing collection row rather than assuming a public gate.
 	if (!collection) throw new NotFoundError("Knowledge entry", entryId);
 	const ok = await canRead(caps, toAclEntry(entry), toAclCollection(collection));
+	if (!ok) throw new NotFoundError("Knowledge entry", entryId);
+	return entry;
+}
+
+/**
+ * Load the SOURCE entry of a link write and assert the link-management gate
+ * ({@link canManageEntryLinks}, shared with `viewerCaps.canManageLinks`); otherwise NotFound.
+ */
+async function assertCanManageLinksFrom(caps: PrincipalCaps, entryId: string): Promise<EntryRow> {
+	const entry = await knowledgeReadStore.getEntryGraphById(entryId);
+	if (!entry) throw new NotFoundError("Knowledge entry", entryId);
+	const collection = await knowledgeReadStore.getCollectionAclById(entry.collectionId);
+	if (!collection) throw new NotFoundError("Knowledge entry", entryId);
+	const ok = await canManageEntryLinks(caps, toAclEntry(entry), toAclCollection(collection));
 	if (!ok) throw new NotFoundError("Knowledge entry", entryId);
 	return entry;
 }
@@ -215,8 +244,9 @@ async function addLink(
 		throw new ValidationError("cannot link an entry to itself");
 	}
 	const caps = await resolvePrincipalCaps(principal);
-	// Both endpoints must be readable (unreadable → NotFound, no existence leak).
-	const fromEntry = await assertReadableEntry(caps, input.fromEntryId);
+	// Source passes the link-management gate (today: readable), the target must be readable
+	// (unreadable → NotFound, no existence leak).
+	const fromEntry = await assertCanManageLinksFrom(caps, input.fromEntryId);
 	const toEntry = await assertReadableEntry(caps, input.toEntryId);
 
 	// If pinning to a target revision, it must belong to the target entry.
@@ -275,8 +305,8 @@ async function removeLink(principal: Principal, linkId: string): Promise<{ ok: t
 	const link = await knowledgeReadStore.getEntryLinkById(linkId);
 	if (!link) throw new NotFoundError("Knowledge entry link", linkId);
 	const caps = await resolvePrincipalCaps(principal);
-	// Reuse the readability gate on the source entry (throws NotFound if unreadable).
-	await assertReadableEntry(caps, link.fromEntryId);
+	// The link-management gate on the source entry (throws NotFound when it fails).
+	await assertCanManageLinksFrom(caps, link.fromEntryId);
 	await knowledgeWriteStore.deleteEntryLink({ linkId });
 	return { ok: true as const };
 }
@@ -289,7 +319,7 @@ async function listLinks(
 	principal: Principal,
 	entryId: string,
 	direction: LinkDirection = "both",
-): Promise<LinkWithEntries[]> {
+): Promise<LinkListItem[]> {
 	const caps = await resolvePrincipalCaps(principal);
 	// Anchor entry must itself be readable.
 	await assertReadableEntry(caps, entryId);
@@ -305,7 +335,7 @@ async function listLinks(
 	}
 	await resolver.preload([...endpointIds]);
 
-	const out: LinkWithEntries[] = [];
+	const out: LinkListItem[] = [];
 	for (const l of links) {
 		// Both ends must be readable, else the link is invisible.
 		if (!(await resolver.canReadEntry(l.fromEntryId))) continue;
@@ -319,6 +349,7 @@ async function listLinks(
 			direction: l.fromEntryId === entryId ? "out" : "in",
 			fromEntry: toEndpoint(fromEntry),
 			toEntry: toEndpoint(toEntry),
+			canRemove: await resolver.canManageLinksFrom(l.fromEntryId),
 		});
 	}
 	return out;

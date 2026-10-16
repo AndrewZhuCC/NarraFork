@@ -485,6 +485,32 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 					expect(page2.items).toHaveLength(1);
 					expect(page2.items[0]?.id).not.toBe(page1.items[0]?.id);
 					expect(page2.nextCursor).toBeNull();
+					// Title order + filters on PG (same keyset contract as SQLite).
+					const titlePages: string[] = [];
+					let titleCursor: string | undefined;
+					for (let n = 0; n < 5; n++) {
+						const p = await service.listEntriesPage({
+							principal: admin,
+							collectionId: col.id,
+							sort: "title",
+							limit: 1,
+							cursor: titleCursor,
+						});
+						titlePages.push(...p.items.map((r) => r.title));
+						if (!p.nextCursor) break;
+						titleCursor = p.nextCursor;
+					}
+					expect(titlePages).toEqual([...titlePages].sort());
+					expect(titlePages).toHaveLength(2);
+					const archivedPage = await service.listEntriesPage({
+						principal: admin,
+						collectionId: col.id,
+						status: "archived",
+						level: "public",
+					});
+					expect(archivedPage.items).toHaveLength(0);
+					const annotated = await service.annotateEntryRows(admin, page1.items);
+					expect(annotated[0]).toHaveProperty("ownerUsername");
 					await service.transferEntryOwner(entry.id, reader.userId, owner);
 					await service.transferCollectionOwner(col.id, reader.userId, owner);
 					expect((await acl.getCollectionAcl(col.id)).ownerUserId).toBe(reader.userId);
