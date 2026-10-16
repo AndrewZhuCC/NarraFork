@@ -4,11 +4,12 @@
  * points: History, Settings (when any settings capability), copy link.
  */
 import { ActionIcon, Badge, Group, Stack, Text, Title, Tooltip } from "@mantine/core";
-import { useClipboard } from "@mantine/hooks";
 import { IconCheck, IconHistory, IconLink, IconPencil, IconSettings } from "@tabler/icons-react";
 import { useRouter } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { KnowledgeCollectionListItem, KnowledgeEntryDetail } from "../../../lib/api";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
 import { PersonalVersionAction } from "../personal/PersonalVersionAction";
 import { ActionIconLink, ButtonLink } from "../router-links";
@@ -27,7 +28,12 @@ export function EntryReadHeader({
 }) {
 	const { t } = useTranslation("knowledge");
 	const router = useRouter();
-	const clipboard = useClipboard({ timeout: 1500 });
+	const [copied, setCopied] = useState(false);
+	useEffect(() => {
+		if (!copied) return;
+		const timer = window.setTimeout(() => setCopied(false), 1500);
+		return () => window.clearTimeout(timer);
+	}, [copied]);
 	const caps = entry.viewerCaps;
 	const actions = entryReadActions(caps);
 	// The level the read gate actually ranks: the entry's own, else the collection default.
@@ -39,7 +45,10 @@ export function EntryReadHeader({
 			to: "/knowledge/$entryId",
 			params: { entryId: entry.id },
 		});
-		clipboard.copy(new URL(href, window.location.href).toString());
+		copyTextToClipboard(new URL(href, window.location.href).toString()).then(
+			() => setCopied(true),
+			() => setCopied(false),
+		);
 	};
 
 	return (
@@ -120,9 +129,9 @@ export function EntryReadHeader({
 						</ActionIconLink>
 					</Tooltip>
 				) : null}
-				<Tooltip label={clipboard.copied ? t("linkCopied") : t("copyLink")}>
+				<Tooltip label={copied ? t("linkCopied") : t("copyLink")}>
 					<ActionIcon variant="default" size="lg" onClick={copyLink} aria-label={t("copyLink")}>
-						{clipboard.copied ? <IconCheck size={16} /> : <IconLink size={16} />}
+						{copied ? <IconCheck size={16} /> : <IconLink size={16} />}
 					</ActionIcon>
 				</Tooltip>
 			</Group>
