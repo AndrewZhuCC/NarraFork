@@ -278,6 +278,7 @@ export function mergeStartupProtection(
 /** Runs under the database instance lock, before generic startup cleanup touches any rows. */
 export async function prepareOrdinaryRestartRecovery(
 	plannedProtection: ToolContinuationProtectionSets,
+	options: { onTargetsDiscovered?: (ids: readonly string[]) => void } = {},
 ): Promise<RestartStartupRecovery> {
 	const empty: RestartStartupRecovery = {
 		manifest: null,
@@ -288,6 +289,8 @@ export async function prepareOrdinaryRestartRecovery(
 	const saved = await readManifest();
 	// A v3 planned root already owns this source; never load the ordinary file a second time.
 	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
+	// Publish only the validated, unclaimed ordinary source before bounded continuation reads.
+	if (previous) options.onTargetsDiscovered?.(previous.targets.map((target) => target.narratorId));
 	const unfinishedOwners = new Set(
 		previous
 			? (await toolContinuationService.listByEpoch(previous.snapshot.updateEpoch))
@@ -338,6 +341,8 @@ export async function prepareOrdinaryRestartRecovery(
 		return empty;
 	}
 	const selected = rows.filter((row) => selectedIds.has(row.id));
+	// If manifest publication or any repair fails, startup can still settle these known runs.
+	options.onTargetsDiscovered?.(selected.map((row) => row.id));
 	const snapshot: PlannedUpdateRecoverySnapshot = {
 		version: 2,
 		updateEpoch: previous?.snapshot.updateEpoch ?? `restart-${generateId()}`,

@@ -99,6 +99,7 @@ import {
 } from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
 import {
+	failUnownedStartupRecovery,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
@@ -1473,6 +1474,13 @@ function startQuestionAnswerRecovery(): void {
 	});
 }
 
+// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
+// never compensate by scanning every narrator or interrupting another queue's live owner.
+const startupRecoveryNarratorIds = new Set<string>();
+const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
+	for (const id of ids) startupRecoveryNarratorIds.add(id);
+};
+
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
@@ -1481,13 +1489,26 @@ withBackgroundOccupancyInitialization(
 	async () => {
 		const plannedUpdate = await getPlannedUpdateStartupProtection({
 			claimAuthorization: automaticResumeEnabled(),
+			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
 		});
+		for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+		for (const target of plannedUpdate.snapshot?.narrators ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		for (const source of plannedUpdate.snapshot?.sources ?? [])
+			for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
 		// The instance lock is already held. Release only previous-process mailbox claims
 		// before planned recovery mounts owners; hot reload preserves the process marker.
 		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
 			recoverInboxClaimsOnColdStartup(),
 		);
-		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection);
+		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
+			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+		});
+		for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+		for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		for (const target of ordinaryRestart.manifest?.targets ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
 		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
 		await recoverNarrators(protection);
 		return { plannedUpdate, ordinaryRestart };
@@ -1525,20 +1546,22 @@ withBackgroundOccupancyInitialization(
 					startQuestionAnswerRecovery();
 					logger.info("Planned-update background continuation recovery completed");
 				})
-				.catch((err) => {
+				.catch(async (err) => {
 					const error = err instanceof Error ? err.message : String(err);
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
+					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
 				});
 		} else {
 			startQuestionAnswerRecovery();
 		}
 	})
-	.catch((err) => {
+	.catch(async (err) => {
 		const error = err instanceof Error ? err.message : String(err);
 		startupReadiness.markFailed(error);
 		logger.error("Narrator state recovery failed", { error });
 		startupReadiness.settle({ ok: false, error });
+		await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
 		// A recovery failure caused by an unusable provider is almost always a persisted
 		// narrator pointing at a prefix the user has since removed. Surface which narrators
 		// are affected instead of leaving the reason buried in this log line.

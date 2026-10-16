@@ -574,6 +574,14 @@ export async function runAgentLoopUnlocked(
 				);
 				runState.input.text = "";
 				runState.firstPass = false;
+				if (profile.kind === "primary" && active.abortController.signal.aborted) {
+					runState.wasInterrupted = true;
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["interrupted"],
+						skipErrorMessage: true,
+					});
+					break;
+				}
 			}
 			const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 			// Knowledge-injection de-dup is scoped to a compact cycle: when the latest compact
