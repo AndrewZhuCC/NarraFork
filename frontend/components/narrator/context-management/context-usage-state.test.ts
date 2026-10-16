@@ -103,19 +103,18 @@ function stateMachine() {
 	};
 }
 
-test("新request和同request补齐校准均刷新composition，重复event不形成请求风暴", () => {
+test("新request才刷新composition，仅补齐字符数的event不重复刷新", () => {
 	const machine = stateMachine();
 	machine.live(92.6, 510_800, 1_000_000, false, 80, snapshot);
 	machine.live(92.6, 510_800, 1_000_000, false, 80, { ...snapshot });
 	expect(machine.invalidations()).toBe(1);
-	const calibrated = {
+	machine.live(92.6, 510_800, 1_000_000, false, 80, {
 		...snapshot,
 		inputCharacters: { totalChars: 10_000, systemChars: 100, toolsChars: 50 },
-	};
-	machine.live(92.6, 510_800, 1_000_000, false, 80, calibrated);
+	});
+	expect(machine.invalidations()).toBe(1);
+	machine.live(92.6, 510_800, 1_000_000, false, 80, { ...snapshot, requestId: "next" });
 	expect(machine.invalidations()).toBe(2);
-	machine.live(92.6, 510_800, 1_000_000, false, 80, { ...calibrated, requestId: "next" });
-	expect(machine.invalidations()).toBe(3);
 });
 
 test("共享parser丢弃畸形snapshot并安全回落legacy，不保留正文", () => {
