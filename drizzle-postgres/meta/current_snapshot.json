@@ -1,6 +1,6 @@
 {
-  "id": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
-  "prevId": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
+  "id": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+  "prevId": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -21774,6 +21774,36 @@
           "primaryKey": false,
           "notNull": false
         },
+        "workflow_version": {
+          "name": "workflow_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "summary_json": {
+          "name": "summary_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "rows_per_second": {
+          "name": "rows_per_second",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "scratch_retired_at": {
+          "name": "scratch_retired_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "scanned": {
           "name": "scanned",
           "type": "integer",
@@ -21863,6 +21893,28 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_token_repair_scratch_retirement": {
+          "name": "idx_token_repair_scratch_retirement",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"scratch_retired_at\" IS NULL AND \"status\" IN ('completed', 'cancelled', 'failed', 'interrupted')",
           "concurrently": false,
           "method": "btree",
           "with": {}

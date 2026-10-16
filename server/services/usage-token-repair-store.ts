@@ -15,9 +15,11 @@ import {
 	type TokenRepairJobStatus,
 	type TokenRepairProbe,
 	type TokenRepairProtocolOverride,
+	type TokenRepairWriteMetrics,
 	tokenRepairProtocolFor,
 } from "@shared/usage-token-repair";
 import { SQL } from "bun";
+import { addTotals } from "./usage-token-repair-scratch";
 
 export interface RepairRequestRow extends TokenRepairCounters {
 	id: string;
@@ -47,7 +49,7 @@ const counterColumns = [
 ] as const;
 const jobColumns = `id, status, created_by, created_at, updated_at, scanned, repaired, conflicts,
  upper_created_at, upper_id, cursor_created_at, cursor_id, include_reviewed,
- protocol_overrides_json, source_job_id, error`;
+ protocol_overrides_json, source_job_id, workflow_version, phase, summary_json, rows_per_second, error`;
 const counterKeys = [
 	"inputTokens",
 	"cachedInputTokens",
@@ -139,6 +141,8 @@ function jobFrom(row: Row | undefined): TokenRepairJob | null {
 		throw new Error("Invalid persisted token repair protocol configuration");
 	result.protocolOverrides = normalizeOverrides(JSON.parse(protocolJson));
 	delete result.protocolOverridesJson;
+	result.summary = result.summaryJson ? JSON.parse(String(result.summaryJson)) : null;
+	delete result.summaryJson;
 	return result as unknown as TokenRepairJob;
 }
 function requestFrom(row: Row | undefined): RepairRequestRow | null {
@@ -193,8 +197,14 @@ function required<T>(value: T | null | undefined): T {
 
 /** Standalone worker connection. Deliberately never imports application db/settings. */
 export function createTokenRepairStore(config: TokenRepairStoreConfig) {
+	const owner = newId();
 	let sqlite: Database | undefined;
 	let pg: SQL | undefined;
+	const reader =
+		config.backend === "sqlite" && config.sqlitePath
+			? new Database(config.sqlitePath, { readonly: true, strict: true })
+			: undefined;
+	reader?.exec("PRAGMA busy_timeout = 50");
 	let closed = false;
 	let closing = false;
 	let closePromise: Promise<void> | undefined;
@@ -249,9 +259,42 @@ export function createTokenRepairStore(config: TokenRepairStoreConfig) {
 		queue = next.catch(() => {});
 		return next;
 	}
-	async function transaction<T>(fn: (q: Query) => Promise<T>): Promise<T> {
-		if (pg) return (await pg.begin(async (tx) => await fn(queryFor(tx)))) as T;
+	// Fixed 1ms buckets (overflow uses max), never a growing per-batch sample array.
+	const writeHistogram = new Uint32Array(1001);
+	let writeCount = 0;
+	let writeMaxMs = 0;
+	const observeWrite = (started: number) => {
+		const elapsed = performance.now() - started;
+		writeCount++;
+		writeMaxMs = Math.max(writeMaxMs, elapsed);
+		writeHistogram[Math.min(1000, Math.ceil(elapsed))]++;
+	};
+	const writeMetrics = (): TokenRepairWriteMetrics => {
+		let seen = 0;
+		let p99Ms = 0;
+		for (let i = 0; i < writeHistogram.length && writeCount; i++) {
+			seen += writeHistogram[i];
+			if (seen >= Math.ceil(writeCount * 0.99)) {
+				p99Ms = i === 1000 ? writeMaxMs : i;
+				break;
+			}
+		}
+		return { count: writeCount, maxMs: writeMaxMs, p99Ms };
+	};
+	async function transaction<T>(fn: (q: Query) => Promise<T>, measure = false): Promise<T> {
+		if (pg) {
+			let started: number | undefined;
+			try {
+				return (await pg.begin(async (tx) => {
+					started = performance.now();
+					return await fn(queryFor(tx));
+				})) as T;
+			} finally {
+				if (measure && started !== undefined) observeWrite(started);
+			}
+		}
 		required(sqlite).exec("BEGIN IMMEDIATE");
+		const started = performance.now();
 		try {
 			const result = await fn(query);
 			required(sqlite).exec("COMMIT");
@@ -259,6 +302,8 @@ export function createTokenRepairStore(config: TokenRepairStoreConfig) {
 		} catch (error) {
 			required(sqlite).exec("ROLLBACK");
 			throw error;
+		} finally {
+			if (measure) observeWrite(started);
 		}
 	}
 	const repairFrom = (includeReviewed: boolean) =>
@@ -335,15 +380,278 @@ export function createTokenRepairStore(config: TokenRepairStoreConfig) {
 		);
 	}
 
+	const read: Query = reader
+		? async (text, args = []) => reader.query(text).all(...(args as SQLQueryBindings[])) as Row[]
+		: query;
 	return {
+		writeMetrics,
+		resetWriteMetrics: () => {
+			writeHistogram.fill(0);
+			writeCount = 0;
+			writeMaxMs = 0;
+		},
+		createBulkJob: (userId: string) =>
+			serial(() =>
+				transaction(async (q) => {
+					if (
+						(await q(`SELECT id FROM usage_token_repair_jobs WHERE ${activePredicate} LIMIT 1`))
+							.length
+					)
+						throw new Error("A token repair job is already active");
+					const upper = (
+						await q(
+							"SELECT created_at, id FROM api_requests ORDER BY created_at DESC, id DESC LIMIT 1",
+						)
+					)[0];
+					const id = newId(),
+						at = now();
+					await q(
+						"INSERT INTO usage_token_repair_jobs (id,status,created_by,created_at,updated_at,include_reviewed,upper_created_at,upper_id,workflow_version,phase,owner_id) VALUES (?,'analyzing',?,?,?,?,?,?,2,'scanning',?)",
+						[
+							id,
+							userId,
+							at,
+							at,
+							pg ? true : 1,
+							upper?.created_at ?? null,
+							upper?.id ?? null,
+							owner,
+						],
+					);
+					return required(await getJob(id, q));
+				}),
+			),
+		retiredJobs: () =>
+			serial(async () =>
+				(
+					await query(
+						"SELECT id FROM usage_token_repair_jobs WHERE scratch_retired_at IS NULL AND status IN ('completed','cancelled','failed','interrupted') AND updated_at < ? ORDER BY updated_at, id LIMIT 20",
+						[new Date(Date.now() - 7 * 86400000).toISOString()],
+					)
+				).map((r) => String(r.id)),
+			),
+		markScratchRetired: (ids: string[]) =>
+			serial(async () => {
+				if (!ids.length) return [];
+				if (
+					ids.length > 20 ||
+					new Set(ids).size !== ids.length ||
+					ids.some((id) => !/^[A-Za-z0-9_-]{21}$/.test(id))
+				)
+					throw new Error("Invalid scratch retirement batch");
+				const result = await query(
+					`UPDATE usage_token_repair_jobs SET scratch_retired_at=? WHERE id IN (${ids.map(() => "?").join(",")}) AND scratch_retired_at IS NULL AND status IN ('completed','cancelled','failed','interrupted') AND updated_at < ? RETURNING id`,
+					[now(), ...ids, new Date(Date.now() - 7 * 86400000).toISOString()],
+				);
+				return result.map((row) => String(row.id));
+			}),
+		getRawDumps: (ids: string[]) =>
+			serial(async () => {
+				if (!ids.length || ids.length > 100) throw new Error("Invalid dump batch");
+				const length = pg ? "octet_length(raw_dump_json)" : "length(CAST(raw_dump_json AS BLOB))";
+				const rows = await read(
+					`WITH sizes AS (SELECT id,COALESCE(${length},0) AS bytes FROM api_requests WHERE id IN (${ids.map(() => "?").join(",")})), budget AS (SELECT id,bytes,SUM(CASE WHEN bytes<=${TOKEN_REPAIR_MAX_DUMP_BYTES} THEN bytes ELSE 0 END) OVER (ORDER BY id) AS total FROM sizes) SELECT a.id,CASE WHEN b.bytes<=${TOKEN_REPAIR_MAX_DUMP_BYTES} THEN a.raw_dump_json ELSE NULL END AS raw FROM budget b JOIN api_requests a ON a.id=b.id WHERE b.total<=${TOKEN_REPAIR_MAX_DUMP_BYTES}`,
+					ids,
+				);
+				return new Map(rows.map((r) => [String(r.id), typeof r.raw === "string" ? r.raw : null]));
+			}),
+		bulkPage: (job: TokenRepairJob, cursor?: RepairRequestRow) =>
+			serial(async () => {
+				if (!job.upperId) return [];
+				const args: unknown[] = [job.upperCreatedAt, job.upperId];
+				if (cursor) args.push(cursor.createdAt, cursor.id);
+				return (
+					await read(
+						`SELECT ${requestColumns} FROM api_requests WHERE (created_at,id) <= (?,?) ${cursor ? "AND (created_at,id) > (?,?)" : ""} ORDER BY created_at,id LIMIT 1000`,
+						args,
+					)
+				).map((r) => required(requestFrom(r)));
+			}),
+		bulkClaim: (
+			id: string,
+			phase: "dry-running" | "applying",
+			overrides?: TokenRepairProtocolOverride[],
+			version?: string,
+		) =>
+			serial(() =>
+				transaction(async (q) => {
+					const job = await getJob(id, q, true);
+					if (
+						job?.workflowVersion !== 2 ||
+						job.status !== "ready" ||
+						(phase === "applying"
+							? job.phase !== "preview" || job.summary?.previewVersion !== version
+							: !["models", "preview"].includes(job.phase ?? ""))
+					)
+						throw new Error("Stale maintenance state");
+					await q(
+						"UPDATE usage_token_repair_jobs SET phase=?,status=?,summary_json=?,owner_id=?,protocol_overrides_json=?,updated_at=? WHERE id=?",
+						[
+							phase,
+							phase === "applying" ? "applying" : "analyzing",
+							phase === "applying" ? JSON.stringify(job.summary) : null,
+							owner,
+							overrides
+								? boundedJson(normalizeOverrides(overrides), TOKEN_REPAIR_PROTOCOL_CONFIG_MAX_BYTES)
+								: JSON.stringify(job.protocolOverrides ?? []),
+							now(),
+							id,
+						],
+					);
+					return required(await getJob(id, q));
+				}),
+			),
+		bulkFail: (id: string) =>
+			serial(async () => {
+				await query(
+					"UPDATE usage_token_repair_jobs SET status='failed',error='Maintenance stopped; no incomplete preview can be applied. Start a new scan.',updated_at=? WHERE id=? AND owner_id=? AND status IN ('analyzing','applying')",
+					[now(), id, owner],
+				);
+			}),
+		bulkState: (
+			id: string,
+			phase: NonNullable<TokenRepairJob["phase"]>,
+			status: TokenRepairJobStatus,
+			summary: TokenRepairJob["summary"],
+			scanned: number,
+			rate = 0,
+			overrides?: TokenRepairProtocolOverride[],
+		) =>
+			serial(async () => {
+				const updated = await query(
+					"UPDATE usage_token_repair_jobs SET phase=?,status=?,summary_json=?,scanned=?,rows_per_second=?,updated_at=?,protocol_overrides_json=COALESCE(?,protocol_overrides_json) WHERE id=? AND owner_id=? AND status NOT IN ('cancelled','completed','failed') RETURNING id",
+					[
+						phase,
+						status,
+						summary ? boundedJson(summary, 32768) : null,
+						scanned,
+						rate,
+						now(),
+						overrides
+							? boundedJson(normalizeOverrides(overrides), TOKEN_REPAIR_PROTOCOL_CONFIG_MAX_BYTES)
+							: null,
+						id,
+						owner,
+					],
+				);
+				if (!updated.length) throw new Error("Stale maintenance ownership or state");
+				return getJob(id);
+			}),
+		applyBulk: (
+			jobId: string,
+			entries: {
+				row: RepairRequestRow;
+				evidence: TokenRepairEvidence;
+				valid: boolean;
+				expectedRaw: string | null;
+			}[],
+			userId: string,
+		) =>
+			serial(() =>
+				transaction(async (q) => {
+					const job = await requireStatus(q, jobId, "applying");
+					if (
+						job.workflowVersion !== 2 ||
+						!(
+							await q("SELECT id FROM usage_token_repair_jobs WHERE id=? AND owner_id=?", [
+								jobId,
+								owner,
+							])
+						).length
+					)
+						throw new Error("Not an owned bulk job");
+					const outcomes: ("applied" | "conflict" | "already")[] = [];
+					for (const entry of entries) {
+						const { row, evidence } = entry;
+						if (
+							(
+								await q(
+									"SELECT id FROM usage_token_repair_candidates WHERE job_id=? AND request_id=? AND applied_at IS NOT NULL",
+									[jobId, row.id],
+								)
+							).length
+						) {
+							outcomes.push("already");
+							continue;
+						}
+						const after = evidence.after;
+						let applied = false;
+						if (
+							entry.valid &&
+							evidence.classification === "repairable" &&
+							after &&
+							validCounters(row) &&
+							counters(row).every((n, i) => n === counters(evidence.before)[i]) &&
+							validCounters(after) &&
+							row.tokenAccountingVersion === null
+						) {
+							const result = await q(
+								`UPDATE api_requests SET ${counterColumns.map((c) => `${c}=?`).join(",")},token_accounting_version=?,token_accounting_review_version=? WHERE id=? AND token_accounting_version IS NULL AND token_accounting_review_version IS NOT DISTINCT FROM ? AND ${counterColumns.map((c) => `${c}=?`).join(" AND ")} AND ${["user_id", "credential_id", "provider", "model", "message_id", "created_at"].map((c) => `${c} IS NOT DISTINCT FROM ?`).join(" AND ")} AND raw_dump_json IS NOT DISTINCT FROM ? RETURNING id`,
+								[
+									...counters(after),
+									TOKEN_ACCOUNTING_VERSION,
+									TOKEN_ACCOUNTING_VERSION,
+									row.id,
+									row.tokenAccountingReviewVersion,
+									...counters(row),
+									row.userId,
+									row.credentialId,
+									row.provider,
+									row.model,
+									row.messageId,
+									row.createdAt,
+									entry.expectedRaw,
+								],
+							);
+							applied = result.length === 1;
+						}
+						await q(
+							"INSERT INTO usage_token_repair_candidates (id,job_id,request_id,created_at,provider,model,snapshot_json,evidence_json,applied_at,applied_by,totals_status) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (job_id,request_id) DO NOTHING",
+							[
+								newId(),
+								jobId,
+								row.id,
+								now(),
+								row.provider,
+								row.model,
+								boundedJson(snapshot(row), 8192),
+								boundedJson(
+									applied
+										? evidence
+										: {
+												...evidence,
+												classification: "conflict",
+												reason: "Source or evidence changed",
+											},
+									16384,
+								),
+								applied ? now() : null,
+								applied ? userId : null,
+								applied ? "pending" : "unchanged",
+							],
+						);
+						await q(
+							"UPDATE usage_token_repair_jobs SET repaired=repaired+?,conflicts=conflicts+?,updated_at=? WHERE id=?",
+							[Number(applied), Number(!applied), now(), jobId],
+						);
+						outcomes.push(applied ? "applied" : "conflict");
+						if (job.summary) {
+							if (applied && after) {
+								addTotals(job.summary.appliedDelta, after);
+								addTotals(job.summary.appliedDelta, row, -1);
+							} else job.summary.conflicts++;
+						}
+					}
+					await q("UPDATE usage_token_repair_jobs SET summary_json=? WHERE id=?", [
+						job.summary ? boundedJson(job.summary, 32768) : null,
+						jobId,
+					]);
+					return outcomes;
+				}, true),
+			),
 		probe: () =>
 			serial<TokenRepairProbe>(async () => ({
-				hasPending:
-					(
-						await query(
-							`SELECT id FROM ${repairFrom(false)} WHERE token_accounting_version IS NULL AND token_accounting_review_version IS NULL AND ${cachePredicate} ORDER BY created_at, id LIMIT 1`,
-						)
-					).length > 0,
+				hasPending: true,
 				job: await latestJob(),
 			})),
 		createJob: (
@@ -577,6 +885,8 @@ export function createTokenRepairStore(config: TokenRepairStoreConfig) {
 			),
 		listCandidates: (jobId: string, cursor?: string) =>
 			serial(async (): Promise<TokenRepairCandidatePage> => {
+				if ((await getJob(jobId))?.workflowVersion === 2)
+					throw new Error("Bulk jobs do not expose candidates");
 				const rows = await query(
 					`SELECT * FROM usage_token_repair_candidates WHERE job_id = ? ${cursor ? "AND id > ?" : ""} ORDER BY id LIMIT ?`,
 					cursor
@@ -689,6 +999,7 @@ export function createTokenRepairStore(config: TokenRepairStoreConfig) {
 			closePromise = (async () => {
 				await queue;
 				closed = true;
+				reader?.close();
 				sqlite?.close();
 				await pg?.close({ timeout: 1 });
 			})();

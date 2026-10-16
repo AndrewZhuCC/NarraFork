@@ -9,6 +9,8 @@ import { createUsageTokenRepairRoutes } from "../usage-token-repair";
 const job: TokenRepairJob = {
 	id: "job",
 	status: "ready",
+	workflowVersion: 2,
+	phase: "preview",
 	createdBy: "admin",
 	createdAt: "2026-01-01",
 	updatedAt: "2026-01-01",
@@ -39,6 +41,9 @@ function fixture() {
 				_sourceJobId?: string,
 			) => job,
 		),
+		models: mock(async (_id: string, _cursor?: string) => ({ models: [], nextCursor: null })),
+		dryRun: mock(async (_id: string, _overrides: TokenRepairProtocolOverride[]) => job),
+		applyPreview: mock(async (_id: string, _version: string, _user: string) => job),
 		cancel: mock(async (_id: string) => job),
 		apply: mock(async (_id: string, _ids: string[], _user: string) => ({
 			applied: 1,
@@ -113,7 +118,7 @@ describe("historical token repair administration boundary", () => {
 				})
 			).status,
 		).toBe(202);
-		expect(service.start).toHaveBeenCalledWith("actual-user", true, [], undefined);
+		expect(service.start).toHaveBeenCalledWith("actual-user", true);
 	});
 	test.each([
 		{ candidateIds: ["c"] },
@@ -137,41 +142,41 @@ describe("historical token repair administration boundary", () => {
 			).status,
 		).toBe(400);
 		expect(service.apply).not.toHaveBeenCalled();
+		expect(service.applyPreview).not.toHaveBeenCalled();
 	});
-	test("explicit confirmation only sends candidate IDs and actor", async () => {
+	test("confirmation sends the immutable preview version and authenticated actor", async () => {
 		const { app, service } = fixture();
 		expect(
 			(
 				await app.request("/jobs/job/apply", {
 					method: "POST",
 					headers: admin,
-					body: JSON.stringify({ candidateIds: ["c"], confirm: true }),
+					body: JSON.stringify({ previewVersion: "preview-1", confirm: true }),
 				})
 			).status,
-		).toBe(200);
-		expect(service.apply).toHaveBeenCalledWith("job", ["c"], "actual-user");
+		).toBe(202);
+		expect(service.applyPreview).toHaveBeenCalledWith("job", "preview-1", "actual-user");
+		expect(service.apply).not.toHaveBeenCalled();
 	});
 	test("unknown jobs are not empty successful previews", async () => {
 		const { app, service } = fixture();
 		expect((await app.request("/jobs/missing/candidates", { headers: admin })).status).toBe(404);
 		expect(service.listCandidates).not.toHaveBeenCalled();
 	});
-	test("start freezes administrator protocol choices with exact provider and model identities", async () => {
+	test("start rejects legacy pre-scan associations rather than silently ignoring them", async () => {
 		const { app, service } = fixture();
-		const protocolOverrides = [
-			{ provider: "nug", model: "same-model", protocol: "openai" },
-			{ provider: "other", model: "same-model", protocol: "anthropic" },
-		];
 		expect(
 			(
 				await app.request("/jobs", {
 					method: "POST",
 					headers: admin,
-					body: JSON.stringify({ includeReviewed: true, protocolOverrides }),
+					body: JSON.stringify({
+						protocolOverrides: [{ provider: "nug", model: "m", protocol: "openai" }],
+					}),
 				})
 			).status,
-		).toBe(202);
-		expect(service.start).toHaveBeenCalledWith("actual-user", true, protocolOverrides, undefined);
+		).toBe(400);
+		expect(service.start).not.toHaveBeenCalled();
 	});
 	test.each(
 		[
@@ -194,48 +199,106 @@ describe("historical token repair administration boundary", () => {
 				protocol: "openai",
 			})),
 		].map((protocolOverrides) => ({ protocolOverrides })),
-	)("invalid or excessive protocol choices are rejected before starting %#", async ({
+	)("invalid or excessive protocol choices are rejected before dry-run %#", async ({
 		protocolOverrides,
 	}) => {
 		const { app, service } = fixture();
-		const response = await app.request("/jobs", {
+		const response = await app.request("/jobs/job/dry-run", {
 			method: "POST",
 			headers: admin,
 			body: JSON.stringify({ protocolOverrides }),
 		});
 		expect([400, 413]).toContain(response.status);
+		expect(service.dryRun).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		{ includeReviewed: true, sourceJobId: "previous-job" },
+		{ includeReviewed: false },
+	])("bulk scans reject legacy partial-scope options %#", async (body) => {
+		const { app, service } = fixture();
+		expect(
+			(await app.request("/jobs", { method: "POST", headers: admin, body: JSON.stringify(body) }))
+				.status,
+		).toBe(400);
 		expect(service.start).not.toHaveBeenCalled();
 	});
 
-	test("reanalysis forwards a fixed source batch and requires reviewed records", async () => {
+	test("bulk jobs never expose per-request candidates", async () => {
+		const { app, service } = fixture();
+		expect((await app.request("/jobs/job/candidates", { headers: admin })).status).toBe(410);
+		expect(service.listCandidates).not.toHaveBeenCalled();
+	});
+	test("model identities are paginated only after scanning finishes", async () => {
 		const { app, service } = fixture();
 		expect(
+			await (await app.request("/jobs/job/models?cursor=next", { headers: admin })).json(),
+		).toEqual({ models: [], nextCursor: null });
+		expect(service.models).toHaveBeenCalledWith("job", "next");
+		const opaque = JSON.stringify(["provider", "model/中文"]);
+		expect(
 			(
-				await app.request("/jobs", {
+				await app.request(`/jobs/job/models?cursor=${encodeURIComponent(opaque)}`, {
+					headers: admin,
+				})
+			).status,
+		).toBe(200);
+		expect(service.models).toHaveBeenCalledWith("job", opaque);
+		service.models.mockClear();
+		service.getJob.mockImplementation(async () => ({
+			...job,
+			status: "analyzing",
+			phase: "scanning",
+		}));
+		expect((await app.request("/jobs/job/models", { headers: admin })).status).toBe(409);
+		expect(service.models).not.toHaveBeenCalled();
+	});
+	test("dry-run accepts exact model associations, never candidate IDs or counters", async () => {
+		const { app, service } = fixture();
+		const protocolOverrides: TokenRepairProtocolOverride[] = [
+			{ provider: "nug", model: "m", protocol: "anthropic" },
+		];
+		expect(
+			(
+				await app.request("/jobs/job/dry-run", {
 					method: "POST",
 					headers: admin,
-					body: JSON.stringify({
-						includeReviewed: true,
-						sourceJobId: "previous-job",
-						protocolOverrides: [],
-					}),
+					body: JSON.stringify({ protocolOverrides }),
 				})
 			).status,
 		).toBe(202);
-		expect(service.start).toHaveBeenCalledWith("actual-user", true, [], "previous-job");
-		const invalid = fixture();
+		expect(service.dryRun).toHaveBeenCalledWith("job", protocolOverrides);
+		service.dryRun.mockClear();
 		expect(
 			(
-				await invalid.app.request("/jobs", {
+				await app.request("/jobs/job/dry-run", {
 					method: "POST",
 					headers: admin,
-					body: JSON.stringify({ sourceJobId: "previous-job" }),
+					body: JSON.stringify({ candidateIds: ["c"] }),
 				})
 			).status,
 		).toBe(400);
-		expect(invalid.service.start).not.toHaveBeenCalled();
+		expect(service.dryRun).not.toHaveBeenCalled();
 	});
-
+	test.each([
+		"/jobs/job/models",
+		"/jobs/job/dry-run",
+		"/jobs/job/apply",
+	])("non-admins cannot access %s", async (path) => {
+		const { app, service } = fixture();
+		expect(
+			(
+				await app.request(path, {
+					method: path.endsWith("models") ? "GET" : "POST",
+					headers: { ...admin, "x-test-role": "user" },
+					body: path.endsWith("models") ? undefined : "{}",
+				})
+			).status,
+		).toBe(403);
+		expect(service.models).not.toHaveBeenCalled();
+		expect(service.dryRun).not.toHaveBeenCalled();
+		expect(service.applyPreview).not.toHaveBeenCalled();
+	});
 	test("maintenance request bodies are bounded before parsing", async () => {
 		const { app, service } = fixture();
 		expect(

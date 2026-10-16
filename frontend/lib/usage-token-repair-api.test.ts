@@ -12,7 +12,7 @@ beforeEach(() => {
 		localStorage: { getItem: () => "test-token", setItem: () => {}, removeItem: () => {} },
 		fetch: async (input: RequestInfo | URL, options?: RequestInit) => {
 			calls.push({ url: String(input), options });
-			return new Response(JSON.stringify(status === 200 ? {} : { reason: "repair denied" }), {
+			return new Response(JSON.stringify(status < 400 ? {} : { reason: "repair denied" }), {
 				status,
 				headers: { "content-type": "application/json" },
 			});
@@ -29,67 +29,49 @@ afterEach(() => {
 	}
 	originals.clear();
 });
-test("apply submits candidate IDs and explicit confirmation, never arbitrary counters", async () => {
-	await api.apply("job/one", ["candidate"]);
+test("apply submits immutable preview version and explicit confirmation, accepts 202", async () => {
+	status = 202;
+	await api.apply("job/one", "immutable-version");
 	expect(calls[0]?.url).toBe("/api/usage-history/token-repair/jobs/job%2Fone/apply");
 	expect(calls[0]?.options?.method).toBe("POST");
 	expect(JSON.parse(String(calls[0]?.options?.body))).toEqual({
-		candidateIds: ["candidate"],
+		previewVersion: "immutable-version",
 		confirm: true,
 	});
 	expect((calls[0]?.options?.headers as Record<string, string>).Authorization).toBe(
 		"Bearer test-token",
 	);
 });
-test("GETs preserve abort signals and encode pagination cursor", async () => {
+test("GETs preserve abort signals and only models are paginated", async () => {
 	const { signal } = new AbortController();
 	await api.probe(signal);
 	await api.jobs(signal);
 	await api.job("one", signal);
-	await api.candidates("one", "a+b/c", signal);
+	await api.models("one", "a+b/c", signal);
 	expect(calls.map((call) => call.url)).toEqual([
 		"/api/usage-history/token-repair/probe",
 		"/api/usage-history/token-repair/jobs",
 		"/api/usage-history/token-repair/jobs/one",
-		"/api/usage-history/token-repair/jobs/one/candidates?cursor=a%2Bb%2Fc",
+		"/api/usage-history/token-repair/jobs/one/models?cursor=a%2Bb%2Fc",
 	]);
 	for (const call of calls) expect(call.options?.signal).toBe(signal);
+	expect("candidates" in api).toBe(false);
 });
-test("manual analysis and ending a job use the existing authenticated client", async () => {
-	await api.start(true);
+test("scan includes reviewed by default and cancel uses existing authenticated client", async () => {
+	await api.start();
 	await api.cancel("one");
-	expect(calls.map((call) => call.options?.method)).toEqual(["POST", "POST"]);
-	expect(JSON.parse(String(calls[0]?.options?.body))).toEqual({
-		includeReviewed: true,
-		protocolOverrides: [],
-	});
+	expect(JSON.parse(String(calls[0]?.options?.body))).toEqual({ includeReviewed: true });
 	expect(calls[1]?.url.endsWith("/cancel")).toBe(true);
 });
-test("manual API rules preserve exact provider and model identity in the start payload", async () => {
+test("dry-run posts exact provider/model rules and accepts asynchronous response", async () => {
+	status = 202;
 	const protocolOverrides = [
 		{ provider: null, model: "same", protocol: "openai" as const },
 		{ provider: "other", model: "same", protocol: "gemini" as const },
 	];
-	await api.start(true, protocolOverrides);
-	expect(JSON.parse(String(calls[0]?.options?.body))).toEqual({
-		includeReviewed: true,
-		protocolOverrides,
-	});
-});
-test("reanalysis scopes both manual and automatic choices to the source job only when provided", async () => {
-	const overrides = [{ provider: "p", model: "same", protocol: "anthropic" as const }];
-	await api.start(true, overrides, "source-job");
-	await api.start(true, [], "source-job");
-	expect(JSON.parse(String(calls[0]?.options?.body))).toEqual({
-		includeReviewed: true,
-		protocolOverrides: overrides,
-		sourceJobId: "source-job",
-	});
-	expect(JSON.parse(String(calls[1]?.options?.body))).toEqual({
-		includeReviewed: true,
-		protocolOverrides: [],
-		sourceJobId: "source-job",
-	});
+	await api.dryRun("job/one", protocolOverrides);
+	expect(calls[0]?.url).toBe("/api/usage-history/token-repair/jobs/job%2Fone/dry-run");
+	expect(JSON.parse(String(calls[0]?.options?.body))).toEqual({ protocolOverrides });
 });
 test("structured server failures propagate instead of displaying success", async () => {
 	status = 403;

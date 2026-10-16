@@ -71,7 +71,7 @@ import {
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
-import { normalizePathForComparison } from "../lib/platform-path";
+import { normalizePathForComparison, pathsEqualForOS } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-snapshot-paths";
@@ -1135,6 +1135,9 @@ async function validateShadowRepo(dir: string): Promise<void> {
 	});
 	const after = lstatSync(dir);
 	const [bare, gitDir] = result.stdout.trim().split("\n");
+	// Windows realpath preserves the input casing, while Git reports the disk
+	// spelling. Compare OS paths, but still require the exact directory identity.
+	const reported = gitDir && existsSync(gitDir) ? lstatSync(gitDir) : null;
 	if (
 		result.exitCode !== 0 ||
 		result.stdoutTruncated ||
@@ -1143,8 +1146,10 @@ async function validateShadowRepo(dir: string): Promise<void> {
 		!gitDir ||
 		before.dev !== after.dev ||
 		before.ino !== after.ino ||
-		realpathSync(dir) !== canonical ||
-		realpathSync(gitDir) !== canonical
+		reported?.dev !== before.dev ||
+		reported?.ino !== before.ino ||
+		!pathsEqualForOS(realpathSync(dir), canonical, process.platform) ||
+		!pathsEqualForOS(realpathSync(gitDir), canonical, process.platform)
 	)
 		throw new TreeSnapshotError("existing shadow repo is invalid or changed identity");
 }

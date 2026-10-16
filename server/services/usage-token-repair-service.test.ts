@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TokenRepairJob } from "@shared/usage-token-repair";
 import { getTestDb } from "../../tests/setup";
 import { openSchemaCopyAt } from "../../tests/sqlite-schema-image";
 import { TokenRepairClient } from "./usage-token-repair-service";
@@ -12,29 +13,29 @@ import {
 } from "./usage-token-repair-worker-paths";
 
 const source = getTestDb().sqlite;
-let directory: string;
-let path: string;
-let db: Database;
-let client: TokenRepairClient;
+let directory: string, path: string, db: Database, client: TokenRepairClient;
 beforeEach(() => {
-	directory = mkdtempSync(join(tmpdir(), "token-repair-worker-"));
-	path = join(directory, "test.sqlite");
+	directory = mkdtempSync(join(tmpdir(), "token-repair-v2-"));
+	path = join(directory, "source.sqlite");
 	db = openSchemaCopyAt(source, path);
-	client = new TokenRepairClient({ backend: "sqlite", sqlitePath: path }, directory);
+	db.exec("PRAGMA journal_mode=WAL");
+	client = new TokenRepairClient(
+		{ backend: "sqlite", sqlitePath: path },
+		join(directory, "request-dumps"),
+	);
 });
 afterEach(async () => {
 	await client.close();
 	db.close();
 	rmSync(directory, { recursive: true, force: true });
 });
-function request() {
+function request(id = "request", url = "https://example.invalid/v1/responses") {
 	const dump = JSON.stringify({
-		request: { url: "https://example.invalid/v1/responses" },
+		request: { url },
 		response: {
 			status: 200,
 			bodyText: JSON.stringify({
-				object: "response",
-				status: "completed",
+				...(url.endsWith("/responses") ? { object: "response", status: "completed" } : {}),
 				usage: {
 					input_tokens: 100,
 					output_tokens: 10,
@@ -44,241 +45,172 @@ function request() {
 		},
 	});
 	db.query(
-		"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json,cost_usd,meter_usage) VALUES ('request','nug','test','2026-01-01',100,40,20,?,7,9)",
-	).run(dump);
+		"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json,cost_usd,meter_usage) VALUES (?,'nug','test','2026-01-01',100,40,20,?,7,9)",
+	).run(id, dump);
 }
-async function ready(id: string) {
-	const deadline = Date.now() + 10_000;
+async function settled(id: string, phase = "models"): Promise<TokenRepairJob> {
+	const deadline = Date.now() + 15000;
 	while (Date.now() < deadline) {
 		const job = await client.getJob(id);
-		if (job?.status !== "analyzing") {
-			expect(job?.status).toBe("ready");
-			return job;
-		}
+		if (job?.phase === phase && ["ready", "completed"].includes(job.status)) return job;
+		if (job && ["failed", "cancelled"].includes(job.status)) throw new Error(JSON.stringify(job));
 		await Bun.sleep(5);
 	}
-	throw new Error("Analysis did not reach ready before the test deadline");
+	throw new Error("Maintenance deadline exceeded");
 }
-
-describe("historical repair worker integration", () => {
-	test("probe never starts analysis; manual preview and apply preserve costs and metering", async () => {
+async function rejects(call: Promise<unknown>) {
+	let rejected = false;
+	try {
+		await call;
+	} catch {
+		rejected = true;
+	}
+	expect(rejected).toBe(true);
+}
+async function preview(id: string) {
+	await client.dryRun(id, []);
+	return settled(id, "preview");
+}
+describe("aggregate historical repair worker", () => {
+	test("scan and dry-run are read-only, aggregate the whole range, and apply preserves costs", async () => {
 		request();
+		db.query(
+			"INSERT INTO api_requests (id,created_at,input_tokens,token_accounting_review_version) VALUES ('no-cache','2026-01-01',7,1)",
+		).run();
+		const before = db.query("SELECT * FROM api_requests ORDER BY id").all();
 		expect(await client.probe()).toMatchObject({ hasPending: true, job: null });
-		expect(db.query("SELECT input_tokens FROM api_requests").get()).toEqual({ input_tokens: 100 });
 		const job = await client.start("admin", false);
-		const completedJob = await ready(job.id);
-		expect(completedJob?.scanned).toBe(1);
-		const page = await client.listCandidates(job.id);
-		expect(page.records).toHaveLength(1);
-		const candidate = page.records[0];
-		if (!candidate) throw new Error("Expected an analyzed candidate");
-		expect(candidate).toMatchObject({
-			classification: "repairable",
-			protocol: "openai",
-			before: { inputTokens: 100 },
-			after: { inputTokens: 40 },
+		await settled(job.id);
+		expect(db.query("SELECT * FROM api_requests ORDER BY id").all()).toEqual(before);
+		expect(db.query("SELECT * FROM usage_token_repair_candidates").all()).toEqual([]);
+		await rejects(client.listCandidates(job.id));
+		const ready = await preview(job.id);
+		expect(ready.summary).toMatchObject({
+			requestCount: 2,
+			repairable: 1,
+			before: { inputTokens: "107" },
+			after: { inputTokens: "47" },
+			delta: { inputTokens: "-60" },
 		});
-		expect(await client.apply(job.id, [candidate.id], "admin")).toEqual({
-			applied: 1,
-			conflicts: 0,
-		});
+		expect(db.query("SELECT * FROM api_requests ORDER BY id").all()).toEqual(before);
+		const version = ready.summary?.previewVersion;
+		if (!version) throw new Error("Missing preview");
+		await client.applyPreview(job.id, version, "admin");
+		const done = await settled(job.id, "done");
+		expect(done.repaired).toBe(1);
+		expect(done.summary?.appliedDelta.inputTokens).toBe("-60");
+		expect(done.summary?.writeTransactions?.count).toBe(1);
+		expect(done.summary?.writeTransactions?.maxMs).toBeGreaterThan(0);
 		expect(
 			db
 				.query(
-					"SELECT input_tokens, cached_input_tokens, cache_creation_input_tokens, cost_usd, meter_usage, token_accounting_version FROM api_requests",
+					"SELECT input_tokens,cost_usd,meter_usage,token_accounting_version FROM api_requests WHERE id='request'",
 				)
 				.get(),
-		).toEqual({
-			input_tokens: 40,
-			cached_input_tokens: 40,
-			cache_creation_input_tokens: 20,
-			cost_usd: 7,
-			meter_usage: 9,
-			token_accounting_version: 1,
-		});
-		expect(await client.apply(job.id, [candidate.id], "admin")).toMatchObject({
-			applied: 0,
-			conflicts: 1,
-		});
-		expect((await client.listCandidates(job.id)).records[0]).toMatchObject({
-			appliedBy: "admin",
-			totalsStatus: "pending",
-		});
-	}, 15_000);
-
-	test("restart does not take over old jobs or replay writes; analysis is explicitly restarted", async () => {
-		request();
+		).toEqual({ input_tokens: 40, cost_usd: 7, meter_usage: 9, token_accounting_version: 1 });
+		await rejects(client.applyPreview(job.id, version, "admin"));
+		expect(
+			db
+				.query(
+					"SELECT COUNT(*) AS n FROM usage_token_repair_candidates WHERE applied_at IS NOT NULL",
+				)
+				.get(),
+		).toEqual({ n: 1 });
+	}, 20000);
+	test("changed counters and missing dump are conflicts, not silent overwrites", async () => {
+		request("a");
+		request("b");
 		const job = await client.start("admin", false);
-		await ready(job.id);
+		await settled(job.id);
+		const p = await preview(job.id);
+		db.query("UPDATE api_requests SET input_tokens=111 WHERE id='a'").run();
+		db.query("UPDATE api_requests SET raw_dump_json=NULL WHERE id='b'").run();
+		await client.applyPreview(job.id, p.summary?.previewVersion ?? "", "admin");
+		const done = await settled(job.id, "done");
+		expect(done.repaired).toBe(0);
+		expect(done.conflicts).toBe(2);
+		expect(done.summary?.appliedDelta.inputTokens).toBe("0");
+		expect(db.query("SELECT input_tokens FROM api_requests WHERE id='a'").get()).toEqual({
+			input_tokens: 111,
+		});
+	}, 20000);
+	test("manual protocols are model scoped, missing dump never becomes a model, and old preview is invalidated", async () => {
+		request("a", "https://example.invalid/custom");
+		request("b", "https://example.invalid/custom");
+		const unresolvedDump = JSON.stringify({
+			request: { url: "https://example.invalid/custom" },
+			response: {
+				status: 200,
+				bodyText: JSON.stringify({ usage: { input_tokens: 100, cache_read_input_tokens: 40 } }),
+			},
+		});
+		db.query("UPDATE api_requests SET raw_dump_json=?,cache_creation_input_tokens=0").run(
+			unresolvedDump,
+		);
+		db.query("UPDATE api_requests SET provider='other' WHERE id='b'").run();
+		db.query(
+			"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens) VALUES ('missing','nug','missing-dump','2026-01-01',100,40)",
+		).run();
+		const job = await client.start("admin", false);
+		await settled(job.id);
+		const models = await client.models(job.id);
+		expect(models.models).toHaveLength(2);
+		expect(models.models.some((m) => m.model === "missing-dump")).toBe(false);
+		const first = await preview(job.id);
+		expect(first.summary?.unresolved).toBe(2);
+		await client.dryRun(job.id, [{ provider: "nug", model: "test", protocol: "openai" }]);
+		const p = await settled(job.id, "preview");
+		expect(p.summary).toMatchObject({ repairable: 1, unresolved: 1, skipped: 1 });
+		await rejects(client.applyPreview(job.id, first.summary?.previewVersion ?? "", "admin"));
 		await client.close();
-		db.query("UPDATE usage_token_repair_jobs SET status='applying' WHERE id=?").run(job.id);
-		client = new TokenRepairClient({ backend: "sqlite", sqlitePath: path }, directory);
-		expect((await client.probe()).job?.status).toBe("applying");
-		expect(db.query("SELECT input_tokens FROM api_requests").get()).toEqual({ input_tokens: 100 });
+		client = new TokenRepairClient(
+			{ backend: "sqlite", sqlitePath: path },
+			join(directory, "request-dumps"),
+		);
+		await client.applyPreview(job.id, p.summary?.previewVersion ?? "", "admin");
+		expect((await settled(job.id, "done")).repaired).toBe(1);
+	}, 20000);
+	test("fixed upper bound excludes inserts after start and cancellation permits a full fresh scan", async () => {
+		request();
+		const job = await client.start("admin", false);
+		db.query("INSERT INTO api_requests (id,created_at) VALUES ('later','2099-01-01')").run();
+		expect((await settled(job.id)).scanned).toBe(1);
 		await client.cancel(job.id);
-		const restarted = await client.start("admin", true, [], job.id);
-		expect(restarted.id).not.toBe(job.id);
-		await ready(restarted.id);
-		expect(db.query("SELECT input_tokens FROM api_requests").get()).toEqual({ input_tokens: 100 });
-	}, 15_000);
-
-	test("stale previews become persistent conflicts rather than overwriting changed records", async () => {
-		request();
-		const job = await client.start("admin", false);
-		await ready(job.id);
-		const candidate = (await client.listCandidates(job.id)).records[0];
-		if (!candidate) throw new Error("Expected an analyzed candidate");
-		db.query("UPDATE api_requests SET input_tokens=111 WHERE id='request'").run();
-		expect(await client.apply(job.id, [candidate.id], "admin")).toMatchObject({
-			applied: 0,
-			conflicts: 1,
-		});
-		expect((await client.listCandidates(job.id)).records[0]?.classification).toBe("conflict");
-		expect((await client.getJob(job.id))?.conflicts).toBe(1);
-		expect(db.query("SELECT input_tokens FROM api_requests").get()).toEqual({ input_tokens: 111 });
-	}, 15_000);
-
-	test("ready work can be ended before manually starting another bounded analysis", async () => {
-		request();
-		const job = await client.start("admin", false);
-		await ready(job.id);
-		expect((await client.cancel(job.id))?.status).toBe("cancelled");
 		const next = await client.start("admin", false);
-		expect(next.id).not.toBe(job.id);
-		await ready(next.id);
-	}, 15_000);
-
-	test("cancel stops at a bounded record boundary and a new analysis never applies tokens", async () => {
-		request();
-		for (let i = 0; i < 10; i++)
-			db.query(
-				"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json) SELECT ?,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json FROM api_requests WHERE id='request'",
-			).run(`copy-${i}`);
+		expect((await settled(next.id)).scanned).toBe(2);
+	}, 20000);
+	test("scan has no ten-thousand truncation and includes old reviewed rows", async () => {
+		db.transaction(() => {
+			const insert = db.query(
+				"INSERT INTO api_requests (id,created_at,input_tokens,token_accounting_review_version) VALUES (?,'2026-01-01',1,1)",
+			);
+			for (let i = 0; i < 10001; i++) insert.run(`r-${i}`);
+		})();
 		const job = await client.start("admin", false);
-		expect((await client.cancel(job.id))?.status).toBe("cancelled");
+		expect((await settled(job.id)).scanned).toBe(10001);
+		expect((await preview(job.id)).summary?.before.inputTokens).toBe("10001");
 		expect(
-			db.query("SELECT count(*) AS n FROM api_requests WHERE input_tokens != 100").get(),
+			db
+				.query("SELECT COUNT(*) AS n FROM api_requests WHERE token_accounting_review_version!=1")
+				.get(),
 		).toEqual({ n: 0 });
-		const cancelled = await client.getJob(job.id);
-		const restarted = await client.start("admin", false);
-		expect(restarted.id).not.toBe(job.id);
-		expect(((await ready(restarted.id))?.scanned ?? 0) + (cancelled?.scanned ?? 0)).toBe(11);
-		expect(
-			db.query("SELECT count(*) AS n FROM api_requests WHERE input_tokens != 100").get(),
-		).toEqual({ n: 0 });
-	}, 15_000);
-
-	test("a second worker probe cannot interrupt a live owner's analysis", async () => {
+	}, 30000);
+	test("probe from another worker never takes over the live owner", async () => {
 		request();
-		for (let i = 0; i < 5; i++)
-			db.query(
-				"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json) SELECT ?,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json FROM api_requests WHERE id='request'",
-			).run(`copy-${i}`);
-		const other = new TokenRepairClient({ backend: "sqlite", sqlitePath: path }, directory);
+		const job = await client.start("admin", false);
+		const other = new TokenRepairClient(
+			{ backend: "sqlite", sqlitePath: path },
+			join(directory, "request-dumps"),
+		);
 		try {
-			const job = await client.start("admin", false);
 			expect(["analyzing", "ready"]).toContain((await other.probe()).job?.status ?? "missing");
-			expect((await ready(job.id))?.scanned).toBe(6);
+			await rejects(other.start("admin", false));
+			await settled(job.id);
 		} finally {
 			await other.close();
 		}
-	}, 15_000);
-
-	test("evidence is rechecked after preview and missing evidence records a conflict", async () => {
-		request();
-		const job = await client.start("admin", false);
-		await ready(job.id);
-		const candidate = (await client.listCandidates(job.id)).records[0];
-		if (!candidate) throw new Error("Expected a preview candidate");
-		db.query("UPDATE api_requests SET raw_dump_json=NULL WHERE id='request'").run();
-		expect(await client.apply(job.id, [candidate.id], "admin")).toMatchObject({
-			applied: 0,
-			conflicts: 1,
-		});
-		expect((await client.listCandidates(job.id)).records[0]?.classification).toBe("conflict");
-		expect(db.query("SELECT input_tokens FROM api_requests").get()).toEqual({ input_tokens: 100 });
-	}, 15_000);
-
-	test("manual model protocol choices survive restart and are reused for apply without crossing providers", async () => {
-		request();
-		const dump = JSON.stringify({
-			request: { url: "https://example.invalid/custom-gateway" },
-			response: {
-				status: 200,
-				bodyText: JSON.stringify({
-					usage: {
-						input_tokens: 100,
-						input_tokens_details: { cached_tokens: 40, cache_write_tokens: 20 },
-					},
-				}),
-			},
-		});
-		db.query("UPDATE api_requests SET raw_dump_json=? WHERE id='request'").run(dump);
-		db.query(
-			"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json) SELECT 'other-request','other',model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json FROM api_requests WHERE id='request'",
-		).run();
-		db.query(
-			"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens) SELECT 'missing-dump',provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens FROM api_requests WHERE id='request'",
-		).run();
-		const automatic = await client.start("admin", false);
-		await ready(automatic.id);
-		expect(
-			(await client.listCandidates(automatic.id)).records.every(
-				(candidate) => candidate.classification !== "repairable",
-			),
-		).toBe(true);
-		await client.cancel(automatic.id);
-		const choices = [{ provider: "nug", model: "test", protocol: "openai" as const }];
-		db.query(
-			"INSERT INTO api_requests (id,provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json) SELECT 'outside-source',provider,model,created_at,input_tokens,cached_input_tokens,cache_creation_input_tokens,raw_dump_json FROM api_requests WHERE id='request'",
-		).run();
-		const manual = await client.start("admin", true, choices, automatic.id);
-		await ready(manual.id);
-		const page = await client.listCandidates(manual.id);
-		expect(page.records).toHaveLength(3);
-		expect(page.records.some((candidate) => candidate.requestId === "outside-source")).toBe(false);
-		const selected = page.records.find((candidate) => candidate.requestId === "request");
-		if (!selected) throw new Error("Expected the manually analyzed request");
-		expect(selected).toMatchObject({
-			classification: "repairable",
-			manualProtocol: "openai",
-			after: { inputTokens: 40 },
-		});
-		expect(
-			page.records.find((candidate) => candidate.requestId === "other-request")?.manualProtocol,
-		).toBeUndefined();
-		expect(
-			page.records.find((candidate) => candidate.requestId === "other-request")?.classification,
-		).not.toBe("repairable");
-		expect(page.records.find((candidate) => candidate.requestId === "missing-dump")).toMatchObject({
-			classification: "insufficient",
-			manualProtocol: "openai",
-			after: null,
-		});
-		await client.close();
-		client = new TokenRepairClient({ backend: "sqlite", sqlitePath: path }, directory);
-		expect((await client.getJob(manual.id))?.protocolOverrides).toEqual(choices);
-		expect((await client.getJob(manual.id))?.sourceJobId).toBe(automatic.id);
-		expect(await client.apply(manual.id, [selected.id], "admin")).toMatchObject({
-			applied: 1,
-			conflicts: 0,
-		});
-		expect(db.query("SELECT input_tokens FROM api_requests WHERE id='request'").get()).toEqual({
-			input_tokens: 40,
-		});
-		expect(
-			db.query("SELECT input_tokens FROM api_requests WHERE id='other-request'").get(),
-		).toEqual({ input_tokens: 100 });
-		let rejectedOldPreview = false;
-		try {
-			await client.apply(automatic.id, [selected.id], "admin");
-		} catch {
-			rejectedOldPreview = true;
-		}
-		expect(rejectedOldPreview).toBe(true);
-	}, 15_000);
-
-	test("compiled worker paths and Windows virtual paths preserve bundled entry identities", () => {
+	}, 20000);
+	test("compiled paths retain Windows and bundled identities", () => {
 		expect(
 			tokenRepairWorkerSpecifiers(
 				"usage-token-repair-worker",

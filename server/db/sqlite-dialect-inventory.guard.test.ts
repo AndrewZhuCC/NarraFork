@@ -428,6 +428,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
 	[
+		"server/services/usage-token-repair-scratch.ts",
+		"private local maintenance scratch file; deliberately SQLite even with a PostgreSQL source database",
+	],
+	[
 		"server/services/file-change-physical-audit-worker.ts",
 		"SQLite-side physical audit in a worker",
 	],
@@ -557,6 +561,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// Explicit SQLite branch of the dual-backend, off-thread historical accounting store.
 	"server/services/usage-token-repair-store.ts": ["driver", "pragma", "indexHint"],
+	"server/services/usage-token-repair-scratch.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
 	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],

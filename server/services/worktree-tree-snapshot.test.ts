@@ -103,6 +103,23 @@ afterEach(async () => {
 });
 
 describe("worktree tree snapshots", () => {
+	test("captures a mixed-case native workspace through its canonical comparison path", async () => {
+		const repo = await createRepo("Nf-Tree-Case-Identity-");
+		const target = normalizePathForComparison(repo);
+		writeFileSync(join(repo, "a.txt"), "case-preserving bytes\n");
+		// On Windows the reservation lowercases the dispatch path, while Git
+		// reports the on-disk spelling. Both must identify the same real inode.
+		const tree = await worktreeTreeSnapshot.capture(target);
+		const dir = treeSnapshotPhysicalDir("local", target);
+		const before = lstatSync(dir);
+		expect(await worktreeTreeSnapshot.capture(target)).toBe(tree);
+		expect(await worktreeTreeSnapshot.readFileAtTree(target, tree, "a.txt")).toBe(
+			"case-preserving bytes\n",
+		);
+		expect(lstatSync(dir).dev).toBe(before.dev);
+		expect(lstatSync(dir).ino).toBe(before.ino);
+	});
+
 	for (const partial of ["empty", "HEAD", "objects", "complete"] as const) {
 		for (const cold of [false, true]) {
 			test(`failed ${partial} shadow birth resumes ${cold ? "in a cold process" : "on retry"} without deleting evidence`, async () => {

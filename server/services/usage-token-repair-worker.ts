@@ -20,6 +20,7 @@ parentPort.on(
 		sourceJobId?: string;
 		cursor?: string;
 		candidateIds?: string[];
+		previewVersion?: string;
 	}) => {
 		try {
 			let value: unknown;
@@ -44,6 +45,19 @@ parentPort.on(
 						break;
 					case "list":
 						value = await runner.store.listCandidates(request.jobId ?? "", request.cursor);
+						break;
+					case "models":
+						value = await runner.models(request.jobId ?? "", request.cursor);
+						break;
+					case "dry-run":
+						value = await runner.dryRun(request.jobId ?? "", request.protocolOverrides ?? []);
+						break;
+					case "apply-preview":
+						value = await runner.applyPreview(
+							request.jobId ?? "",
+							request.previewVersion ?? "",
+							request.userId ?? "",
+						);
 						break;
 					case "start":
 						value = await runner.start(
