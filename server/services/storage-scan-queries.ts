@@ -861,8 +861,8 @@ export function measureTables(
 /**
  * Full single-connection object-storage scan.
  *
- * This is the serial reference implementation: it is what the main-thread fallback runs, and what
- * the parallel worker path must match field-for-field.
+ * This is the serial reference implementation. The parallel worker path must match it
+ * field-for-field. A worker that cannot shard runs this function on its own connection.
  */
 export function scanDatabaseObjectStorage(
 	sqlite: Database,
@@ -887,4 +887,93 @@ export function scanDatabaseObjectStorage(
 		indexesByTable: context.indexesByTable,
 		tableSummaries,
 	});
+}
+
+/**
+ * Rebuild the measurement context from a `storageScanContext` snapshot.
+ *
+ * Shards use this instead of calling `loadScanContext`, which would walk `dbstat` again.
+ */
+export function measurementContextFromSnapshot(snapshot: {
+	tables: Array<{ name: string; kind: string }>;
+	dbstatSupported: boolean;
+	dbstatBytes: Array<[string, number]>;
+	indexesByTable: Array<[string, string[]]>;
+}): {
+	tables: ScanTableRef[];
+	dbstat: DbstatObjectBytes;
+	indexesByTable: Map<string, string[]>;
+} {
+	return {
+		tables: snapshot.tables.map((table) => ({
+			name: table.name,
+			kind: table.kind as DatabaseTableKind,
+		})),
+		dbstat: {
+			supported: snapshot.dbstatSupported,
+			bytesByName: new Map(snapshot.dbstatBytes),
+		},
+		indexesByTable: new Map(snapshot.indexesByTable),
+	};
+}
+
+export interface StorageByteSummary {
+	count: number;
+	approxBytes: number;
+	oldestAt: string | null;
+}
+
+const EMPTY_BYTE_SUMMARY: StorageByteSummary = { count: 0, approxBytes: 0, oldestAt: null };
+
+/** Byte total for API request dumps older than the cutoff. Same predicate as the cleanup preview. */
+export function summarizeApiRequestDumps(sqlite: Database, cutoffIso: string): StorageByteSummary {
+	if (!tableExists(sqlite, "api_requests")) return { ...EMPTY_BYTE_SUMMARY };
+	const summary = sqlite
+		.prepare(
+			`SELECT
+				COUNT(*) AS count,
+				COALESCE(SUM(length(CAST(coalesce(raw_dump_json, '') AS BLOB))), 0) AS approxBytes,
+				MIN(created_at) AS oldestAt
+			 FROM api_requests
+			 WHERE raw_dump_json IS NOT NULL AND created_at <= ?`,
+		)
+		.get(cutoffIso) as {
+		count: number | string | bigint;
+		approxBytes: number | string | bigint;
+		oldestAt: string | null;
+	} | null;
+	return {
+		count: numberFromRow(summary?.count),
+		approxBytes: numberFromRow(summary?.approxBytes),
+		oldestAt: summary?.oldestAt ?? null,
+	};
+}
+
+/** Byte total for tool-call payloads older than the cutoff. Same predicate as the cleanup preview. */
+export function summarizeToolCallPayloads(sqlite: Database, cutoffIso: string): StorageByteSummary {
+	if (!tableExists(sqlite, "narrator_tool_calls")) return { ...EMPTY_BYTE_SUMMARY };
+	const summary = sqlite
+		.prepare(
+			`SELECT
+				COUNT(*) AS count,
+				COALESCE(SUM(
+					length(CAST(coalesce(input_json, '') AS BLOB)) +
+					length(CAST(coalesce(output_json, '') AS BLOB))
+				), 0) AS approxBytes,
+				MIN(created_at) AS oldestAt
+			 FROM narrator_tool_calls
+			 WHERE created_at <= ?
+				 AND is_file_history_checkpoint = 0
+				 AND (input_json IS NOT NULL OR output_json IS NOT NULL)`,
+		)
+		.get(cutoffIso) as {
+		count: number | string | bigint;
+		approxBytes: number | string | bigint;
+		oldestAt: string | null;
+	} | null;
+	return {
+		count: numberFromRow(summary?.count),
+		approxBytes: numberFromRow(summary?.approxBytes),
+		oldestAt: summary?.oldestAt ?? null,
+	};
 }

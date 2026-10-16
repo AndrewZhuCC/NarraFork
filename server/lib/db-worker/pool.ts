@@ -711,6 +711,112 @@ export class WorkersUnavailableError extends Error {
 }
 
 /**
+ * Run one task on a freshly spawned worker, then terminate it.
+ *
+ * Ignores the pool's disabled flag. The storage scan uses this when the shared pool cannot take
+ * the work, so a disabled pool does not fall back to a synchronous scan on the server thread.
+ * It must not be used while VACUUM has shut the pool down to clear readers.
+ */
+export async function runEphemeralReadTask<T>(
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions = {},
+): Promise<T> {
+	const specifiers = workerSpecifierCandidates();
+	let lastError: Error | null = null;
+	for (const specifier of specifiers) {
+		try {
+			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options);
+		} catch (err) {
+			if (options.signal?.aborted) throw err;
+			lastError = err instanceof Error ? err : new Error(String(err));
+		}
+	}
+	throw lastError ?? new WorkersUnavailableError("ephemeral_spawn_failed");
+}
+
+function runEphemeralOnSpecifier<T>(
+	specifier: string,
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions,
+): Promise<T> {
+	const requestId = `ephemeral-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	const timeoutMs = options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	return new Promise<T>((resolve, reject) => {
+		const worker = new Worker(specifier);
+		let settled = false;
+		let ready = false;
+		const finish = (error?: Error, result?: T) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", onAbort);
+			try {
+				worker.terminate();
+			} catch {
+				// best effort
+			}
+			if (error) reject(error);
+			else resolve(result as T);
+		};
+		const onAbort = () => {
+			try {
+				worker.postMessage({ type: "cancel", requestId });
+			} catch {
+				// The worker is already gone.
+			}
+			finish(new Error("database read task aborted"));
+		};
+		const timer = setTimeout(
+			() => finish(new Error(`database read task timed out after ${timeoutMs}ms`)),
+			timeoutMs,
+		);
+		if (options.signal) {
+			if (options.signal.aborted) {
+				finish(new Error("database read task aborted"));
+				return;
+			}
+			options.signal.addEventListener("abort", onAbort, { once: true });
+		}
+		worker.onerror = (event: ErrorEvent) => {
+			finish(new Error(event?.message ?? "database worker failed to start"));
+		};
+		worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) => {
+			const message = event.data;
+			if (!ready) {
+				if (message?.type !== "ready") {
+					finish(new Error("database worker sent no ready handshake"));
+					return;
+				}
+				ready = true;
+				try {
+					worker.postMessage({ type: "task", requestId, dbPath, params });
+				} catch (err) {
+					finish(err instanceof Error ? err : new Error(String(err)));
+				}
+				return;
+			}
+			if (message?.type === "progress") {
+				options.onProgress?.({
+					tableName: message.tableName,
+					done: message.done,
+					total: message.total,
+				});
+				return;
+			}
+			if (message?.type === "result" && message.requestId === requestId) {
+				finish(undefined, message.result as T);
+				return;
+			}
+			if (message?.type === "error" && message.requestId === requestId) {
+				finish(new Error(message.message || "database worker failed"));
+			}
+		};
+	});
+}
+
+/**
  * Run a read-only task in a worker.
  *
  * Throws {@link WorkersUnavailableError} when workers cannot be used; callers are expected to catch

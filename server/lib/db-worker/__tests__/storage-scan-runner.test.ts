@@ -115,8 +115,8 @@ describe("runParallelObjectStorageScan", () => {
 				dbPath,
 				mainBytes: MAIN_BYTES,
 			});
-			expect(viaFallback.executedOn).toBe("main-thread");
-			expect(viaFallback.workerCount).toBe(0);
+			expect(viaFallback.executedOn).toBe("worker-serial");
+			expect(viaFallback.workerCount).toBe(1);
 
 			expect(storageFields(viaWorkers)).toEqual(storageFields(viaFallback));
 			// Not vacuous: the fixture must have measurable content.
