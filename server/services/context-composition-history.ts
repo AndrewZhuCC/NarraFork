@@ -1,29 +1,29 @@
-import type { Database } from "bun:sqlite";
+import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type ContextSegment, safeCharacters } from "@shared/context-composition";
 import type { SQL } from "bun";
 import { readContextSegments } from "./context-composition-projection";
 
 /** Shared by SQLite and PostgreSQL. `?` placeholders are rewritten to `$1` for Postgres. */
 export interface ContextQuery {
-	get<T>(sql: string, bindings: readonly unknown[]): Promise<T | null>;
-	all<T>(sql: string, bindings: readonly unknown[]): Promise<T[]>;
-	run(sql: string, bindings: readonly unknown[]): Promise<void>;
+	get<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T | null>;
+	all<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T[]>;
+	run(sql: string, bindings: readonly SQLQueryBindings[]): Promise<void>;
 	transaction(fn: (tx: ContextQuery) => Promise<void>): Promise<void>;
 }
 
 export function sqliteContextQuery(database: Database): ContextQuery {
 	const query: ContextQuery = {
-		async get<T>(sql: string, bindings: readonly unknown[]) {
+		async get<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
 			return (database.query(sql).get(...bindings) as T | null | undefined) ?? null;
 		},
-		async all<T>(sql: string, bindings: readonly unknown[]) {
+		async all<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
 			return database.query(sql).all(...bindings) as T[];
 		},
-		async run(sql: string, bindings: readonly unknown[]) {
+		async run(sql: string, bindings: readonly SQLQueryBindings[]) {
 			database.query(sql).run(...bindings);
 		},
 		async transaction(fn) {
-			const queued: Array<{ sql: string; bindings: readonly unknown[] }> = [];
+			const queued: Array<{ sql: string; bindings: readonly SQLQueryBindings[] }> = [];
 			const tx: ContextQuery = {
 				...query,
 				async run(sql, bindings) {
@@ -77,18 +77,18 @@ export function postgresPlaceholders(sql: string): string {
 }
 
 export function postgresContextQuery(sql: SQL): ContextQuery {
-	const run = async (statement: string, bindings: readonly unknown[]) =>
+	const run = async (statement: string, bindings: readonly SQLQueryBindings[]) =>
 		sql.unsafe(postgresPlaceholders(statement), [...bindings]);
 	const query: ContextQuery = {
-		async get<T>(statement: string, bindings: readonly unknown[]) {
+		async get<T>(statement: string, bindings: readonly SQLQueryBindings[]) {
 			const rows = (await run(statement, bindings)) as Record<string, unknown>[];
 			return rows[0] ? normalizeRow<T>(rows[0]) : null;
 		},
-		async all<T>(statement: string, bindings: readonly unknown[]) {
+		async all<T>(statement: string, bindings: readonly SQLQueryBindings[]) {
 			const rows = (await run(statement, bindings)) as Record<string, unknown>[];
 			return rows.map((row) => normalizeRow<T>(row));
 		},
-		async run(statement: string, bindings: readonly unknown[]) {
+		async run(statement: string, bindings: readonly SQLQueryBindings[]) {
 			await run(statement, bindings);
 		},
 		async transaction(fn) {

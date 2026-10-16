@@ -85,7 +85,7 @@ test("a request pin stays put after later messages arrive", async () => {
 	expect(pin?.totalChars).toBe(13);
 	message("later", 2, [{ category: "assistant", chars: 50 }]);
 	const shown = await service.get("n");
-	expect(shown.generation).toBe(pin?.generation);
+	expect(shown.generation).toBe(pin?.generation ?? null);
 	expect(shown.totalChars).toBe(13);
 	expect(shown.segments.some((segment) => segment.chars === 50)).toBe(false);
 });

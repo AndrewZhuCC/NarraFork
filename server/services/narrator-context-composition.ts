@@ -46,11 +46,11 @@ function profileOf(type: string, variant: string): "primary" | "subagent" {
 }
 
 function prefixSegments(system: number, summary: number, tools: number): ContextSegment[] {
-	return [
-		{ category: "system", chars: safeCharacters(system) },
-		{ category: "summary", chars: safeCharacters(summary) },
-		{ category: "toolDefinition", chars: safeCharacters(tools) },
-	].filter((segment) => segment.chars > 0);
+	const segments: ContextSegment[] = [];
+	if (system > 0) segments.push({ category: "system", chars: safeCharacters(system) });
+	if (summary > 0) segments.push({ category: "summary", chars: safeCharacters(summary) });
+	if (tools > 0) segments.push({ category: "toolDefinition", chars: safeCharacters(tools) });
+	return segments;
 }
 
 function compositionOf(
@@ -129,8 +129,12 @@ export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 	const preparing = new Set<string>();
 
 	return {
-		async invalidate() {},
-		async invalidateBatch() {},
+		async invalidate(_id?: string, _messageId?: string) {},
+		async invalidateBatch(
+			_id?: string,
+			_messageIds?: readonly string[],
+			_options?: { full?: boolean },
+		) {},
 		async invalidateOverflow() {},
 		async cancel() {},
 		async dispose() {},

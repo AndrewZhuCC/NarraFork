@@ -97,7 +97,9 @@ test("数字窄表迁移回填已有统计并在之后的写入上保持同步",
 	expect(migration).toContain("DROP TABLE `narrator_context_char_pages`");
 	expect(migration).not.toContain("content_json");
 	const postgres = await Bun.file(
-		fileURLToPath(new URL("../../../drizzle-postgres/0022_context_numeric_stats.sql", import.meta.url)),
+		fileURLToPath(
+			new URL("../../../drizzle-postgres/0022_context_numeric_stats.sql", import.meta.url),
+		),
 	).text();
 	expect(postgres).toContain("CREATE FUNCTION narrator_message_context_stats_sync()");
 	expect(postgres).toContain("CREATE TRIGGER narrator_message_context_stats_insert");
