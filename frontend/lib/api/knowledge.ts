@@ -3,11 +3,13 @@ import type {
 	KnowledgeBulkGrantResponse,
 	KnowledgeCollection,
 	KnowledgeCollectionAcl,
+	KnowledgeCollectionListItem,
 	KnowledgeDeletePersonalEntryResult,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
 	KnowledgeDraftDrift,
 	KnowledgeEntry,
+	KnowledgeEntryDetail,
 	KnowledgeEntryLink,
 	KnowledgeEntryPage,
 	KnowledgeFinding,
@@ -96,7 +98,7 @@ export const KNOWLEDGE_ENTRY_PAGE_SIZE = 50;
 export const knowledgeApi = {
 	// ─── Collections ───
 	listKnowledgeCollections: (projectId?: string) =>
-		request<KnowledgeCollection[]>(`/knowledge/collections${qs({ projectId })}`),
+		request<KnowledgeCollectionListItem[]>(`/knowledge/collections${qs({ projectId })}`),
 	createKnowledgeCollection: (data: {
 		name: string;
 		slug?: string;
@@ -128,7 +130,7 @@ export const knowledgeApi = {
 				limit: String(opts.limit ?? KNOWLEDGE_ENTRY_PAGE_SIZE),
 			})}`,
 		),
-	getKnowledgeEntry: (id: string) => request<KnowledgeEntry>(`/knowledge/entries/${id}`),
+	getKnowledgeEntry: (id: string) => request<KnowledgeEntryDetail>(`/knowledge/entries/${id}`),
 	createKnowledgeEntry: (data: CreateEntryInput) =>
 		request<KnowledgeEntry>("/knowledge/entries", {
 			method: "POST",

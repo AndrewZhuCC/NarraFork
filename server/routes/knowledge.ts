@@ -65,7 +65,9 @@ function actorOf(c: { get: (k: "user") => { sub: string; role: "admin" | "user" 
 
 knowledgeRoutes.get("/collections", async (c) => {
 	const projectId = c.req.query("projectId") || undefined;
-	return c.json(await knowledgeService.listCollections(projectId, principalOf(c)));
+	// Each row carries `viewerCaps` (what the caller may do with it), computed from the same
+	// predicates the collection write endpoints enforce.
+	return c.json(await knowledgeService.listCollectionsForViewer(projectId, principalOf(c)));
 });
 
 knowledgeRoutes.post("/collections", async (c) => {
@@ -184,12 +186,10 @@ knowledgeRoutes.post("/entries", async (c) => {
 	);
 });
 
+// Returns the entry plus `viewerCaps` — the caller's capability bits, each computed by the same
+// predicate its write endpoint enforces — so the UI shows actions without re-deriving the ACL.
 knowledgeRoutes.get("/entries/:id", async (c) => {
-	const entry = await knowledgeService.getEntry(c.req.param("id"), {
-		withContent: true,
-		principal: principalOf(c),
-	});
-	return c.json(entry);
+	return c.json(await knowledgeService.getEntryForViewer(c.req.param("id"), principalOf(c)));
 });
 
 knowledgeRoutes.patch("/entries/:id", async (c) => {

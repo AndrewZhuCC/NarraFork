@@ -673,6 +673,18 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 		});
 	},
 
+	async findActivePersonalEntryId(entryId, authorUserId) {
+		const row = await db.query.knowledgeDrafts.findFirst({
+			where: and(
+				eq(knowledgeDrafts.entryId, entryId),
+				eq(knowledgeDrafts.authorUserId, authorUserId),
+				eq(knowledgeDrafts.status, "active"),
+			),
+			columns: { id: true },
+		});
+		return row?.id ?? null;
+	},
+
 	async listKnowledgeAclEventRows(opts) {
 		const conds = [like(aclEvents.scopeType, "knowledge%")];
 		if (opts.eventType) conds.push(eq(aclEvents.eventType, opts.eventType));

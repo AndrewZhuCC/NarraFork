@@ -41,6 +41,50 @@ export interface KnowledgeCollection {
 	updatedAt: string;
 }
 
+/**
+ * What the requesting user may do with one collection, as decided by the server
+ * (GET /knowledge/collections). Each flag mirrors the gate of the endpoint named beside it;
+ * the UI shows actions from these bits instead of re-deriving the ACL.
+ */
+export interface KnowledgeCollectionViewerCaps {
+	/** PATCH /collections/:id (rename / description). */
+	canEdit: boolean;
+	/** PATCH /collections/:id/acl (level / controlled tags). */
+	canManageAcl: boolean;
+	/** POST /collections/:id/transfer-owner. */
+	canTransferOwner: boolean;
+	/** DELETE /collections/:id. */
+	canDelete: boolean;
+	/** POST /entries into this collection. */
+	canCreateEntry: boolean;
+}
+
+/** A row of GET /knowledge/collections: the collection plus the caller's capability bits. */
+export interface KnowledgeCollectionListItem extends KnowledgeCollection {
+	viewerCaps: KnowledgeCollectionViewerCaps;
+}
+
+/**
+ * What the requesting user may do with one entry, as decided by the server
+ * (GET /knowledge/entries/:id). Each flag mirrors the gate of the endpoint named beside it.
+ */
+export interface KnowledgeEntryViewerCaps {
+	/** POST /entries/:id/revisions — direct edit of main. */
+	canWriteMain: boolean;
+	/** PATCH /entries/:id — title / tags / keywords / status. */
+	canEditMeta: boolean;
+	/** PATCH /entries/:id/acl — level / controlled tags / review tags. */
+	canManageAcl: boolean;
+	/** POST /entries/:id/transfer-owner. */
+	canTransferOwner: boolean;
+	/** DELETE /entries/:id. */
+	canDelete: boolean;
+	/** May review linked publish requests on this entry (own requests excepted). */
+	canReview: boolean;
+	/** The caller's active personal version of this entry, if any. */
+	myPersonalEntryId: string | null;
+}
+
 export interface KnowledgeEntry {
 	id: string;
 	collectionId: string;
@@ -60,6 +104,11 @@ export interface KnowledgeEntry {
 	status: KnowledgeEntryStatus;
 	createdAt: string;
 	updatedAt: string;
+}
+
+/** GET /knowledge/entries/:id: the full entry plus the caller's capability bits. */
+export interface KnowledgeEntryDetail extends KnowledgeEntry {
+	viewerCaps: KnowledgeEntryViewerCaps;
 }
 
 /** Search / list result row (lighter shape with snippet). */
