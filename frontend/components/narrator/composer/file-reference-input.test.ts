@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import {
 	type FileReference,
 	type FileReferenceEditorSelection,
@@ -16,6 +17,7 @@ import {
 	getFileReferenceQuery,
 	insertFileReference,
 	readFileReferences,
+	readInputComposerDocument,
 	recentFileReferences,
 	rememberFileReference,
 	sameFileReferenceInput,
@@ -32,6 +34,65 @@ const reference: FileReference = {
 const query = (text: string) => getFileReferenceQuery(text, text.length);
 const input = (): FileReferenceInput =>
 	insertFileReference({ text: "before ", fileReferences: [] }, reference);
+
+describe("structured input sidecars", () => {
+	function richInput(): FileReferenceInput {
+		const composerDocument: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "  before " },
+						{ type: "fileReference", id: "node-ref", reference },
+						{ type: "text", text: " after  " },
+					],
+				},
+			],
+		};
+		return { ...composerDocumentText(composerDocument), composerDocument };
+	}
+	test("same projection with a different layout is a different draft", () => {
+		const original = richInput();
+		expect(
+			sameFileReferenceInput(original, {
+				text: original.text,
+				fileReferences: original.fileReferences,
+			}),
+		).toBe(false);
+		expect(sameFileReferenceInput(original, structuredClone(original))).toBe(true);
+	});
+	test("trimming a rich projection never shifts reference ranges", () => {
+		const original = richInput();
+		expect(trimFileReferenceInput(original)).toBe(original);
+	});
+	test("maps a local plain-text edit without moving inline atoms", () => {
+		const original = richInput();
+		const edited = editFileReferenceInput(original, original.text.replace("before", "earlier"));
+		expect(edited.composerDocument).toBeDefined();
+		expect(edited.composerDocument?.paragraphs[0].children[1]).toEqual(
+			original.composerDocument?.paragraphs[0].children[1],
+		);
+		if (!edited.composerDocument) throw new Error("Missing mapped document");
+		expect(composerDocumentText(edited.composerDocument)).toEqual({
+			text: edited.text,
+			fileReferences: edited.fileReferences,
+		});
+	});
+	test("removes stale layout when a legacy edit touches an atom", () => {
+		const original = richInput();
+		expect(
+			editFileReferenceInput(original, original.text.replace("#file:", "#renamed:"))
+				.composerDocument,
+		).toBeUndefined();
+		expect(
+			readInputComposerDocument(original.composerDocument, "other text", original.fileReferences),
+		).toBeUndefined();
+		expect(
+			readInputComposerDocument({ version: 99 }, original.text, original.fileReferences),
+		).toBeUndefined();
+	});
+});
 
 describe("file query boundaries", () => {
 	test.each([
@@ -246,5 +307,23 @@ describe("keyboard and recent metadata", () => {
 		).toEqual(["RemoteABC", "local"]);
 		for (let i = 0; i < 9; i++) rememberFileReference(`new-scope-${i}`, reference);
 		expect(recentFileReferences("scope-a")).toEqual([]);
+	});
+});
+
+describe("rich composer text-run query boundaries", () => {
+	test("a quote or image cannot join a file token from two text runs", () => {
+		expect(getFileReferenceQuery("#foo", 4, [], 3)).toBeNull();
+		expect(getFileReferenceQuery("#foo", 4, [], 0)?.q).toBe("foo");
+	});
+	test("the start of a text run is a boundary without requiring a typed space", () => {
+		expect(getFileReferenceQuery("before#foo", 10, [], 6)).toMatchObject({
+			start: 6,
+			end: 10,
+			q: "foo",
+		});
+	});
+	test("code fences still use the complete document prefix", () => {
+		const text = "```ts\n#foo";
+		expect(getFileReferenceQuery(text, text.length, [], 6)).toBeNull();
 	});
 });

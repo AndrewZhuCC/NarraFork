@@ -1158,6 +1158,166 @@ describe("tool continuation interrupt scope", () => {
 	});
 });
 
+describe("bounded continuation read races", () => {
+	async function seedContinuations(count = 1, payloadBytes?: (index: number) => number) {
+		await seedNarrator("n1");
+		await seedMessage("m1", "n1", []);
+		const insertTool = sqlite.prepare(
+			"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, status, created_at) VALUES (?, 'n1', 'm1', ?, 'Bash', 'running', ?)",
+		);
+		const insertRow = sqlite.prepare(
+			"INSERT INTO narrator_tool_continuations (id, tool_call_id, narrator_id, update_epoch, kind, state, payload_json, created_at, updated_at) VALUES (?, ?, 'n1', ?, 'deferred_tool', 'completed', ?, ?, ?)",
+		);
+		sqlite.transaction(() => {
+			for (let index = 0; index < count; index++) {
+				const id = `tc-${index.toString().padStart(3, "0")}`;
+				insertTool.run(id, id, NOW);
+				insertRow.run(
+					id,
+					id,
+					index % 2 ? "source" : "root",
+					JSON.stringify({ data: "x".repeat((payloadBytes?.(index) ?? 11) - 11) }),
+					NOW,
+					NOW,
+				);
+			}
+		})();
+	}
+
+	// Keep every query real: write only after metadata has completed, immediately before
+	// the payload SELECT is built. SQL byte guards must still reject any enlarged row.
+	function beforePayloadRead(write: () => void) {
+		const originalSelect = db.select.bind(db);
+		return spyOn(db, "select").mockImplementation(((fields?: Parameters<typeof db.select>[0]) => {
+			if (!fields || !("bytes" in fields)) write();
+			return fields ? originalSelect(fields) : originalSelect();
+		}) as typeof db.select);
+	}
+
+	const updatePayload = (payload: Record<string, unknown>, id = "tc-000") =>
+		sqlite
+			.prepare("UPDATE narrator_tool_continuations SET payload_json = ? WHERE id = ?")
+			.run(JSON.stringify(payload), id);
+
+	for (const reader of ["listByEpoch", "listRecoveryQueueByEpoch"] as const) {
+		test(`${reader} restarts all metadata after legal recovery payload growth in a later page`, async () => {
+			await seedContinuations(102);
+			// An out-of-scope oversized row must never enter either the retry or its budget.
+			sqlite.run(
+				"UPDATE narrator_tool_continuations SET update_epoch = 'unrelated', payload_json = ? WHERE id = 'tc-001'",
+				[JSON.stringify({ data: "x".repeat(65536) })],
+			);
+			const grownPayload = {
+				executionAttempt: 1,
+				recoveryToken: "startup-recovery-token",
+				recoveryPhase: "owner_continuation_pending",
+			};
+			let payloadReads = 0;
+			const select = beforePayloadRead(() => {
+				if (++payloadReads === 2) updatePayload(grownPayload, "tc-101");
+			});
+			try {
+				const rows = await toolContinuationService[reader](["root", "source"]);
+				const records = rows.map((row) => ("record" in row ? row.record : row));
+				expect(records).toHaveLength(101);
+				expect(new Set(records.map((row) => row.id)).size).toBe(101);
+				expect(records.find((row) => row.toolCallId === "tc-101")?.payloadJson).toEqual(
+					grownPayload,
+				);
+				expect(records.every((row) => ["root", "source"].includes(row.updateEpoch))).toBe(true);
+				expect(payloadReads).toBe(4);
+				expect(select.mock.calls.map(([fields]) => !!fields && "bytes" in fields)).toEqual([
+					true,
+					true,
+					false,
+					false,
+					true,
+					true,
+					false,
+					false,
+				]);
+			} finally {
+				select.mockRestore();
+			}
+		});
+
+		test(`${reader} rejects oversized growth on fresh metadata without reading large fields`, async () => {
+			await seedContinuations();
+			const select = beforePayloadRead(() => updatePayload({ data: "x".repeat(65536) }));
+			const payloadRead = spyOn(narratorToolContinuations.payloadJson, "mapFromDriverValue");
+			const inputRead = spyOn(narratorToolCalls.inputJson, "mapFromDriverValue");
+			const contentRead = spyOn(narratorMessages.contentJson, "mapFromDriverValue");
+			try {
+				await expect(toolContinuationService[reader](["root", "source"])).rejects.toThrow(
+					"payload budget exceeded",
+				);
+				expect(select.mock.calls.map(([fields]) => !!fields && "bytes" in fields)).toEqual([
+					true,
+					false,
+					true,
+				]);
+				expect(payloadRead).not.toHaveBeenCalled();
+				expect(inputRead).not.toHaveBeenCalled();
+				expect(contentRead).not.toHaveBeenCalled();
+			} finally {
+				select.mockRestore();
+				payloadRead.mockRestore();
+				inputRead.mockRestore();
+				contentRead.mockRestore();
+			}
+		});
+
+		test(`${reader} rechecks the combined byte budget after growth`, async () => {
+			// Payloads are 1216 bytes below 16 MiB, leaving room for the queue's tiny messages.
+			await seedContinuations(257, (index) => (index === 0 ? 8000 : 65500));
+			const select = beforePayloadRead(() =>
+				updatePayload({ data: "x".repeat(7989), recoveryToken: "t".repeat(2048) }),
+			);
+			const payloadRead = spyOn(narratorToolContinuations.payloadJson, "mapFromDriverValue");
+			try {
+				await expect(toolContinuationService[reader](["root", "source"])).rejects.toThrow(
+					"payload budget exceeded",
+				);
+				// The first guarded batch can read only unchanged, already-budgeted rows.
+				expect(
+					payloadRead.mock.calls.every(([value]) => !String(value).includes("recoveryToken")),
+				).toBe(true);
+				expect(
+					select.mock.calls.filter(([fields]) => !fields || !("bytes" in fields)),
+				).toHaveLength(1);
+				expect(select.mock.calls.filter(([fields]) => fields && "bytes" in fields)).toHaveLength(6);
+			} finally {
+				select.mockRestore();
+				payloadRead.mockRestore();
+			}
+		});
+
+		test(`${reader} fails after three attempts when recovery payload keeps growing`, async () => {
+			await seedContinuations();
+			let writes = 0;
+			const select = beforePayloadRead(() => {
+				updatePayload({ recoveryToken: "t".repeat(++writes), recoveryPhase: "result_written" });
+			});
+			try {
+				await expect(toolContinuationService[reader](["root", "source"])).rejects.toThrow(
+					"Continuation recovery scope changed during bounded read",
+				);
+				expect(writes).toBe(3);
+				expect(select.mock.calls.map(([fields]) => !!fields && "bytes" in fields)).toEqual([
+					true,
+					false,
+					true,
+					false,
+					true,
+					false,
+				]);
+			} finally {
+				select.mockRestore();
+			}
+		});
+	}
+});
+
 describe("tool continuation recovery ordering and epoch isolation", () => {
 	test("a combined message waits for both epochs, preserves tool order, and writes each actual epoch", async () => {
 		await seedNarrator("n1");

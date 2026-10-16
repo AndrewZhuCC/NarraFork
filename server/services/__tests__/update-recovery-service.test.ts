@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import {
@@ -45,6 +46,7 @@ let cancelInterruptibleGate: Promise<void> | null = null;
 let markCancelInterruptibleStarted: (() => void) | null = null;
 let continueNarratorResult: { ok: boolean } = { ok: true };
 let continueNarratorImpl: (() => Promise<{ ok: boolean }>) | null = null;
+let useRealLegacyContinuation = false;
 let beforeConditionalToolResultWrite: (() => void | Promise<void>) | null = null;
 let beforeMarkResultWritten: ((toolCallId: string) => void | Promise<void>) | null = null;
 let afterOwnerPending: (() => void | Promise<void>) | null = null;
@@ -104,6 +106,13 @@ mock.module("../narrator-service", () => ({
 		getById: async (id: string) => {
 			if (loadMode === "missing") throw new NotFoundError("Narrator", id);
 			if (loadMode === "transient") throw new Error("temporary database failure");
+			// Real start admission resolves the narrator's DB root even when this test
+			// replaces its service projection. Keep that fixture identity real as well.
+			const now = new Date().toISOString();
+			db.insert(narrators)
+				.values({ id, type: "primary", variant: "primary", createdAt: now, updatedAt: now })
+				.onConflictDoNothing()
+				.run();
 			return {
 				id,
 				variant: "primary",
@@ -359,6 +368,14 @@ mock.module("../narrator-session", () => ({
 		continueNarratorCalls += 1;
 		return continueNarratorImpl ? continueNarratorImpl() : continueNarratorResult;
 	},
+	continueNarratorAfterPlannedUpdate: async (
+		...args: Parameters<typeof realNarratorSessionModule.continueNarratorAfterPlannedUpdate>
+	) => {
+		continueNarratorCalls += 1;
+		if (useRealLegacyContinuation)
+			return realNarratorSessionModule.continueNarratorAfterPlannedUpdate(...args);
+		return continueNarratorImpl ? continueNarratorImpl() : continueNarratorResult;
+	},
 	abortActiveNarratorLoopForPlannedUpdateRecovery: () => {
 		abortActiveRecoveryLoopCalls += 1;
 		return true;
@@ -426,6 +443,7 @@ afterEach(() => {
 	markCancelInterruptibleStarted = null;
 	continueNarratorResult = { ok: true };
 	continueNarratorImpl = null;
+	useRealLegacyContinuation = false;
 	beforeConditionalToolResultWrite = null;
 	beforeMarkResultWritten = null;
 	afterOwnerPending = null;
@@ -512,7 +530,7 @@ function recoveryItem(
 }
 
 async function prepareRecovery(
-	targets: { narratorId: string; locale: string }[] = [],
+	targets: import("../update-coordinator").NarratorRecoveryTarget[] = [],
 	sources: import("../recovery-handoff").RecoverySource[] = [],
 ) {
 	// These are current-protocol scheduling fixtures, not fabricated legacy proofs.
@@ -969,6 +987,35 @@ describe("planned update recovery snapshot", () => {
 		expect(requestedProtectionEpoch).toBe("update-protection-epoch");
 		expect(startup.snapshot?.updateEpoch).toBe("update-protection-epoch");
 		expect(startup.protection).toBe(startupProtection);
+	});
+
+	test.each([
+		true,
+		false,
+	])("publishes only owned targets before a bounded discovery read fails (owned=%s)", async (owned) => {
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "discovery-failure",
+			capturedAt: new Date().toISOString(),
+			handoffMarkerNonce: HANDOFF_NONCE,
+			narrators: [{ narratorId: "owner", locale: "en" }],
+		});
+		actAsReplacementProcess(owned ? HANDOFF_NONCE : "another-process");
+		const { toolContinuationService: service } = await import("../tool-continuation-service");
+		const read = spyOn(service, "listByEpoch").mockRejectedValue(
+			new Error("Continuation recovery payload budget exceeded"),
+		);
+		const targets: string[] = [];
+		try {
+			const startup = getPlannedUpdateStartupProtection({
+				onTargetsDiscovered: (ids) => targets.push(...ids),
+			});
+			if (owned) await expect(startup).rejects.toThrow("payload budget exceeded");
+			else expect((await startup).snapshot).toBeNull();
+			expect(targets).toEqual(owned ? ["owner"] : []);
+		} finally {
+			read.mockRestore();
+		}
 	});
 
 	test("reports a failed legacy resume without writing the target back to the manifest", async () => {
@@ -1534,6 +1581,729 @@ describe("planned update continuation scheduling", () => {
 		expect(updatedToolResults).toHaveLength(0);
 		expect(continuationRows[0]?.payloadJson?.recoveryPhase).toBe("owner_continuation_started");
 		finishBackground("<subagent_id>child-background</subagent_id>\n\ndone");
+	});
+
+	test.each([
+		true,
+		false,
+	])("background recovery resumes only a severed foreground owner (severed=%s)", async (severed) => {
+		loadMode = severed ? "working" : "idle";
+		const childFinished = Promise.withResolvers<string>();
+		resumedAgentCompletion = childFinished.promise;
+		const record = continuationRecord("background-only", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([{ narratorId: "owner", locale: "en" }]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		loadMode = "idle";
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await recovery?.completion;
+			expect(resumedAgentCalls).toHaveLength(1);
+			expect(continueNarratorCalls).toBe(severed ? 1 : 0);
+			expect(continuationRows[0]?.payloadJson?.recoveryPhase).toBe("owner_continuation_started");
+		} finally {
+			childFinished.resolve("done");
+		}
+	});
+
+	async function prepareBackgroundOwner() {
+		sqlite
+			.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+			.run("acl-user", "acl-user", "unused", new Date().toISOString());
+		loadMode = "working";
+		const childFinished = Promise.withResolvers<string>();
+		resumedAgentCompletion = childFinished.promise;
+		const record = continuationRecord("background-race", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([
+			{ narratorId: "owner", locale: "en", userId: "acl-user" },
+		]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		loadMode = "idle";
+		return { prepared, childFinished };
+	}
+
+	test("interrupt during legacy owner lookup cannot restart its foreground turn", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		const entered = Promise.withResolvers<void>();
+		const lookup = Promise.withResolvers<void>();
+		const { narratorService } = await import("../narrator-service");
+		const getById = narratorService.getById;
+		const lookupSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => {
+			if (id === "owner") {
+				entered.resolve();
+				await lookup.promise;
+			}
+			return getById(id);
+		});
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await entered.promise;
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			lookup.resolve();
+			await recovery?.completion;
+			expect(continueNarratorCalls).toBe(0);
+			expect(resumedAgentCalls).toHaveLength(1);
+			expect((resumedAgentCalls[0]?.signal as AbortSignal).aborted).toBe(false);
+		} finally {
+			lookup.resolve();
+			lookupSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test("interrupt inside real continuation history admission cannot abort a later user run", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const entered = Promise.withResolvers<void>();
+		const history = Promise.withResolvers<void>();
+		const newRunFinished = Promise.withResolvers<void>();
+		const interruptFinalizer = Promise.withResolvers<void>();
+		const finalizerEntered = Promise.withResolvers<void>();
+		cancelInterruptibleGate = interruptFinalizer.promise;
+		markCancelInterruptibleStarted = finalizerEntered.resolve;
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+			async () => {
+				entered.resolve();
+				await history.promise;
+				return [];
+			},
+		);
+		const launches: string[] = [];
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation(
+			async (active, _owner, text) => {
+				active._loopRunning = true;
+				launches.push(text);
+				await newRunFinished.promise;
+				active._loopRunning = false;
+				return { started: true };
+			},
+		);
+		const next = {
+			narratorId: "owner",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		let newRun: Promise<{ started: boolean }> | undefined;
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await entered.promise;
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			// The newer start is genuinely queued behind the old continuation admission.
+			activeNarrators.set("owner", next);
+			newRun = realNarratorSessionModule.runAgentLoop(next, "new user turn");
+			history.resolve();
+			await finalizerEntered.promise;
+			expect(launches).toEqual([]);
+			interruptFinalizer.resolve();
+			await recovery?.completion;
+			expect(launches).toEqual(["new user turn"]);
+			expect(next.abortController.signal.aborted).toBe(false);
+			expect((resumedAgentCalls[0]?.signal as AbortSignal).aborted).toBe(false);
+			const persisted =
+				await realNarratorServiceModule.narratorService.getModelHistorySinceLastCompact("owner");
+			expect(persisted.filter((message) => message.role === "user")).toHaveLength(0);
+		} finally {
+			history.resolve();
+			interruptFinalizer.resolve();
+			newRunFinished.resolve();
+			await newRun;
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test.each([
+		{ toolTail: false, gate: "status" },
+		{ toolTail: true, gate: "status" },
+		{ toolTail: false, gate: "enqueue" },
+		{ toolTail: false, gate: "claim" },
+	])("real continuation keeps interrupt coverage through loop dispatch (%j)", async ({
+		toolTail,
+		gate,
+	}) => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const statusEntered = Promise.withResolvers<void>();
+		const statusGate = Promise.withResolvers<void>();
+		const buffer = await import("../narrator-buffer");
+		if (gate === "claim")
+			await buffer.enqueueBufferedMessage(
+				"owner",
+				"queued real input",
+				undefined,
+				null,
+				"acl-user",
+			);
+		const inbox = await import("../agent-runtime/inbox");
+		const claim = inbox.claimInboxHead;
+		const claimSpy = spyOn(inbox, "claimInboxHead").mockImplementation(async (...args) => {
+			const row = await claim(...args);
+			if (gate === "claim") {
+				statusEntered.resolve();
+				await statusGate.promise;
+			}
+			return row;
+		});
+		const enqueue = buffer.enqueueBufferedMessage;
+		const enqueueSpy = spyOn(buffer, "enqueueBufferedMessage").mockImplementation(
+			async (...args) => {
+				const accepted = await enqueue(...args);
+				if (gate === "enqueue") {
+					statusEntered.resolve();
+					await statusGate.promise;
+				}
+				return accepted;
+			},
+		);
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue(
+			toolTail
+				? ([
+						{
+							id: "tool-tail",
+							role: "assistant",
+							contentJson: [{ type: "tool_use", id: "tool-use", name: "Bash" }],
+						},
+					] as never)
+				: [],
+		);
+		const getById = narratorService.getById;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => ({
+			...(await getById(id)),
+			title: "Existing",
+		}));
+		const statusSpy = spyOn(narratorService, "updateStatus").mockImplementation(
+			async (_id, status) => {
+				if (status === "working") {
+					statusEntered.resolve();
+					await statusGate.promise;
+				}
+			},
+		);
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockResolvedValue({ started: true });
+		const active = {
+			narratorId: "owner",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("owner", active);
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await statusEntered.promise;
+			expect(active._currentUserId).toBe("acl-user");
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			statusGate.resolve();
+			await recovery?.completion;
+			expect(runtimeSpy).not.toHaveBeenCalled();
+			expect(await buffer.getBufferedMessagesAsync("owner")).toHaveLength(gate === "claim" ? 1 : 0);
+			expect((resumedAgentCalls[0]?.signal as AbortSignal).aborted).toBe(false);
+		} finally {
+			statusGate.resolve();
+			await recovery?.completion;
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			getSpy.mockRestore();
+			statusSpy.mockRestore();
+			enqueueSpy.mockRestore();
+			claimSpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test.each([
+		"plain",
+		"queued",
+		"queued-bash",
+		"queued-bash-interrupt",
+	])("real background owner continuation hands off with accepted user identity (%s)", async (input) => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators, hasNarratorRuntimeClaim } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const finishLoop = Promise.withResolvers<void>();
+		const buffer = await import("../narrator-buffer");
+		if (input !== "plain") {
+			sqlite
+				.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+				.run("queued-user", "queued-user", "unused", new Date().toISOString());
+			await buffer.enqueueBufferedMessage(
+				"owner",
+				"queued user turn",
+				undefined,
+				null,
+				"queued-user",
+				null,
+				undefined,
+				"back",
+				input.includes("bash") ? "test-command" : null,
+			);
+		}
+		const narratorModule = await import("../narrator-service");
+		const bashSpy = spyOn(narratorModule, "handleBashCommand").mockImplementation(
+			async (_id, _command, _raw, userId, options) => {
+				expect(userId).toBe("queued-user");
+				expect(options?.signal?.aborted).toBe(false);
+				if (input === "queued-bash-interrupt") {
+					expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+					expect(options?.signal?.aborted).toBe(true);
+				}
+				return { type: "bash", id: "test-bash", output: "done", isError: false };
+			},
+		);
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue(
+			[],
+		);
+		const getById = narratorService.getById;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => ({
+			...(await getById(id)),
+			title: "Existing",
+		}));
+		const active = {
+			narratorId: "owner",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("owner", active);
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation(
+			async (current, owner, _text, _images, profile) => {
+				expect(owner.isCurrent()).toBe(true);
+				current._loopRunning = true;
+				if (profile?.initialPrePromptBashCommand)
+					await narratorModule.handleBashCommand(
+						"owner",
+						profile.initialPrePromptBashCommand,
+						"",
+						current._currentUserId ?? undefined,
+						{ signal: current.abortController.signal },
+					);
+				await finishLoop.promise;
+				current._loopRunning = false;
+				return { started: true };
+			},
+		);
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await recovery?.completion;
+			expect(runtimeSpy).toHaveBeenCalledTimes(1);
+			expect(active._currentUserId).toBe(input === "plain" ? "acl-user" : "queued-user");
+			expect(bashSpy).toHaveBeenCalledTimes(input.includes("bash") ? 1 : 0);
+			expect(hasNarratorRuntimeClaim("owner")).toBe(false);
+			expect(await buffer.getBufferedMessagesAsync("owner")).toHaveLength(0);
+			if (input !== "queued-bash-interrupt")
+				expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			expect(active.abortController.signal.aborted).toBe(true);
+			expect((resumedAgentCalls[0]?.signal as AbortSignal).aborted).toBe(false);
+			if (input !== "plain") {
+				const history =
+					await realNarratorServiceModule.narratorService.getModelHistorySinceLastCompact("owner");
+				expect(history.filter((row) => row.role === "user").map((row) => row.contentText)).toEqual([
+					"queued user turn",
+				]);
+			}
+		} finally {
+			finishLoop.resolve();
+			// Serialize with runtime ownership release before the next isolated case.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(realNarratorSessionModule.isLoopRunning("owner")).toBe(false);
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			getSpy.mockRestore();
+			bashSpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test("long queued Bash transfers to real runtime before a short recovery handoff", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		useRealLegacyContinuation = true;
+		const buffer = await import("../narrator-buffer");
+		sqlite
+			.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+			.run("queued-user", "queued-user", "unused", new Date().toISOString());
+		await buffer.enqueueBufferedMessage(
+			"owner",
+			"queued long Bash turn",
+			undefined,
+			null,
+			"queued-user",
+			null,
+			undefined,
+			"back",
+			"test-long-command",
+		);
+		const narratorModule = await import("../narrator-service");
+		const { narratorService } = narratorModule;
+		const { activeNarrators } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const executor = await import("../narrator-executor");
+		const { bashTool } = await import("../../lib/agent/tools/bash");
+		const bashEntered = Promise.withResolvers<AbortSignal>();
+		const finishBash = Promise.withResolvers<void>();
+		const finishedRuntime = Promise.withResolvers<void>();
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue(
+			[],
+		);
+		const getById = narratorService.getById;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(async (id) => ({
+			...(await getById(id)),
+			title: "Existing",
+		}));
+		const statusSpy = spyOn(narratorService, "updateStatus").mockImplementation(
+			realNarratorServiceModule.narratorService.updateStatus,
+		);
+		const handleSpy = spyOn(narratorModule, "handleBashCommand").mockImplementation(
+			realNarratorServiceModule.handleBashCommand,
+		);
+		const toolSpy = spyOn(bashTool, "execute").mockImplementation(async (_input, context) => {
+			bashEntered.resolve(context.signal);
+			await finishBash.promise;
+			return { output: "cancelled test command", isError: false };
+		});
+		const executorSpy = spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
+			throw new Error("Interrupted Bash must never request a model turn");
+		});
+		const runUnlocked = runtime.runAgentLoopUnlocked;
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation((...args) => {
+			const running = runUnlocked(...args);
+			void running.then(() => finishedRuntime.resolve(), finishedRuntime.reject);
+			return running;
+		});
+		const active = {
+			narratorId: "owner",
+			conversationId: "test-long-bash",
+			model: "test-model",
+			provider: "anthropic",
+			systemPrompt: null,
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+			_substatus: new Set(),
+			_enabledOptionalTools: new Set(),
+			_disabledTools: new Set(),
+			_blockedSkills: { all: false, names: new Set<string>() },
+			_preparedPlanModes: new Map(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("owner", active);
+		let ticket: ReturnType<typeof reserveRecoveryHandoff> | undefined;
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			const bashSignal = await bashEntered.promise;
+			ticket = reserveRecoveryHandoff();
+			await expect(waitForRecoveryHandoffReady(ticket, { timeoutMs: 40 })).resolves.toBeUndefined();
+			expect(active._loopRunning).toBe(true);
+			expect(active._currentUserId).toBe("queued-user");
+			expect(handleSpy.mock.calls[0]?.[3]).toBe("queued-user");
+			releaseRecoveryHandoff(ticket);
+			ticket = undefined;
+			await recovery?.completion;
+			expect(toolSpy).toHaveBeenCalledTimes(1);
+			expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
+			expect(bashSignal.aborted).toBe(true);
+			expect((resumedAgentCalls[0]?.signal as AbortSignal).aborted).toBe(false);
+			finishBash.resolve();
+			await finishedRuntime.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(runtimeSpy).toHaveBeenCalledTimes(1);
+			expect(toolSpy).toHaveBeenCalledTimes(1);
+			expect(executorSpy).not.toHaveBeenCalled();
+			expect(realNarratorSessionModule.isLoopRunning("owner")).toBe(false);
+			const row = await realNarratorServiceModule.narratorService.getById("owner");
+			expect(row.status).toBe("idle");
+			expect(JSON.parse(row.substatus)).toContain("interrupted");
+		} finally {
+			if (ticket) {
+				try {
+					releaseRecoveryHandoff(ticket);
+				} catch {
+					/* Readiness timeout already released it. */
+				}
+			}
+			if (!active.abortController.signal.aborted)
+				realNarratorSessionModule.interruptNarrator("owner");
+			finishBash.resolve();
+			await recovery?.completion;
+			if (runtimeSpy.mock.calls.length) await finishedRuntime.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			activeNarrators.delete("owner");
+			historySpy.mockRestore();
+			getSpy.mockRestore();
+			statusSpy.mockRestore();
+			handleSpy.mockRestore();
+			toolSpy.mockRestore();
+			executorSpy.mockRestore();
+			runtimeSpy.mockRestore();
+			childFinished.resolve("done");
+		}
+	});
+
+	test.each([
+		false,
+		true,
+	])("independent legacy cancellation settles late working write before next start (newRun=%s)", async (startNewRun) => {
+		loadMode = "working";
+		useRealLegacyContinuation = true;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "legacy",
+			type: "primary",
+			variant: "primary",
+			status: "working",
+			createdAt: now,
+			updatedAt: now,
+		});
+		const prepared = await prepareRecovery([{ narratorId: "legacy", locale: "en" }]);
+		const { narratorService } = await import("../narrator-service");
+		const { activeNarrators, hasNarratorRuntimeClaim } = await import("../narrator-session-state");
+		const runtime = await import("../agent-runtime/orchestrator");
+		const entered = Promise.withResolvers<void>();
+		const workingGate = Promise.withResolvers<void>();
+		const finishNewRun = Promise.withResolvers<void>();
+		const realStatus = realNarratorServiceModule.narratorService.updateStatus;
+		const getSpy = spyOn(narratorService, "getById").mockImplementation(
+			realNarratorServiceModule.narratorService.getById,
+		);
+		const historySpy = spyOn(narratorService, "getModelHistorySinceLastCompact").mockResolvedValue([
+			{
+				id: "legacy-tool-tail",
+				role: "assistant",
+				contentJson: [{ type: "tool_use", id: "legacy-tool", name: "Bash" }],
+			},
+		] as never);
+		const statusSpy = spyOn(narratorService, "updateStatus").mockImplementation(async (...args) => {
+			if (args[1] === "working") {
+				entered.resolve();
+				await workingGate.promise;
+			}
+			return realStatus(...args);
+		});
+		const active = {
+			narratorId: "legacy",
+			alive: true,
+			abortController: new AbortController(),
+			locale: "en",
+			events: new EventEmitter(),
+			cwd: process.cwd(),
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set("legacy", active);
+		const launches: string[] = [];
+		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockImplementation(
+			async (current, _owner, text) => {
+				launches.push(text);
+				current._loopRunning = true;
+				await realStatus("legacy", "working");
+				await finishNewRun.promise;
+				current._loopRunning = false;
+				return { started: true };
+			},
+		);
+		let newRun: Promise<{ started: boolean }> | undefined;
+		try {
+			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			await entered.promise;
+			expect(realNarratorSessionModule.interruptNarrator("legacy")).toBe(true);
+			if (startNewRun) {
+				const next = { ...active, abortController: new AbortController() };
+				activeNarrators.set("legacy", next);
+				newRun = realNarratorSessionModule.runAgentLoop(next, "new legacy user turn");
+			}
+			workingGate.resolve();
+			await recovery?.completion;
+			const row = await realNarratorServiceModule.narratorService.getById("legacy");
+			expect(row.status).toBe(startNewRun ? "working" : "idle");
+			if (!startNewRun) {
+				expect(JSON.parse(row.substatus)).toContain("interrupted");
+				expect(row.lastStopReason).toBe("user_interrupt");
+			}
+			expect(launches).toEqual(startNewRun ? ["new legacy user turn"] : []);
+			expect(hasNarratorRuntimeClaim("legacy")).toBe(false);
+		} finally {
+			workingGate.resolve();
+			finishNewRun.resolve();
+			await newRun;
+			activeNarrators.delete("legacy");
+			getSpy.mockRestore();
+			historySpy.mockRestore();
+			statusSpy.mockRestore();
+			runtimeSpy.mockRestore();
+		}
+	});
+
+	test("background owner handoff reservation never waits on its own nested advance", async () => {
+		const { prepared, childFinished } = await prepareBackgroundOwner();
+		const reserved = Promise.withResolvers<ReturnType<typeof reserveRecoveryHandoff>>();
+		const severed = prepared.severedNarratorIds;
+		prepared.severedNarratorIds = {
+			...severed,
+			has(id: string) {
+				const ticket = reserveRecoveryHandoff();
+				reserved.resolve(ticket);
+				return severed.has(id);
+			},
+		} as ReadonlySet<string>;
+		let ticket: ReturnType<typeof reserveRecoveryHandoff> | undefined;
+		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
+		try {
+			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+			ticket = await reserved.promise;
+			await expect(waitForRecoveryHandoffReady(ticket, { timeoutMs: 40 })).resolves.toBeUndefined();
+		} finally {
+			if (ticket) {
+				try {
+					releaseRecoveryHandoff(ticket);
+				} catch {
+					/* Timeout already releases the ticket. */
+				}
+			}
+			await recovery?.completion;
+			childFinished.resolve("done");
+		}
+	});
+
+	test("an invalidated background owner is not resumed after its child mounts", async () => {
+		loadMode = "working";
+		const record = continuationRecord("background-invalidated", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([{ narratorId: "owner", locale: "en" }]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		invalidateRecoveryTarget("owner");
+		loadMode = "idle";
+		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+		await recovery?.completion;
+		expect(continueNarratorCalls).toBe(0);
+	});
+
+	test("failed background parent continuation is visible and retains recovery evidence", async () => {
+		loadMode = "working";
+		const record = continuationRecord("background-parent-failed", "owner", {
+			kind: "background_agent",
+			payloadJson: { subagentId: "background-child", backgroundTaskId: "background-child" },
+		});
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: record.toolCallId,
+			messageId: "background-message",
+			status: "running",
+			outputJson: null,
+		});
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "background-message", 0)];
+		const prepared = await prepareRecovery([{ narratorId: "owner", locale: "en" }]);
+		prepared.protection = {
+			...prepared.protection,
+			narratorIds: new Set(["owner", "background-child"]),
+		};
+		sqlite.prepare("UPDATE narrators SET status = 'working' WHERE id = 'owner'").run();
+		loadMode = "idle";
+		continueNarratorImpl = async () => {
+			throw new Error("foreground continuation failed");
+		};
+		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+		await expect(recovery?.completion).rejects.toThrow("Failed to mount 1 legacy narrator");
+		expect(continueNarratorCalls).toBe(1);
+		const row = sqlite
+			.prepare("SELECT status, substatus, error_message FROM narrators WHERE id = 'owner'")
+			.get() as { status: string; substatus: string; error_message: string };
+		expect(row.status).toBe("idle");
+		expect(JSON.parse(row.substatus)).toContain("error");
+		expect(row.error_message).toContain("Startup recovery failed");
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).not.toBeNull();
+	});
+
+	test("token binding failure releases all registrations before any execution starts", async () => {
+		loadMode = "idle";
+		const first = continuationRecord("first-result", "first", { state: "completed" });
+		const second = continuationRecord("second-result", "second", { state: "completed" });
+		continuationRows = [first, second];
+		recoveryQueue = [
+			recoveryItem(first, "first-message", 0),
+			recoveryItem(second, "second-message", 0),
+		];
+		const prepared = await prepareRecovery();
+		const { toolContinuationService: service } = await import("../tool-continuation-service");
+		const { hasNarratorRuntimeClaim } = await import("../narrator-session-state");
+		const bind = service.bindRecoveryTokenForNarrator;
+		const binding = spyOn(service, "bindRecoveryTokenForNarrator").mockImplementation(
+			async (...args) => {
+				if (args[0] === "second") throw new Error("binding failed");
+				return bind(...args);
+			},
+		);
+		try {
+			await expect(restoreNarratorsAfterPlannedUpdate(prepared)).rejects.toThrow("binding failed");
+			expect(hasNarratorRuntimeClaim("first")).toBe(false);
+			expect(hasNarratorRuntimeClaim("second")).toBe(false);
+			expect(executePersistedCalls).toBe(0);
+			expect(continueNarratorCalls).toBe(0);
+		} finally {
+			binding.mockRestore();
+		}
 	});
 
 	test("preserves an explicit Agent timeout as an absolute execution deadline", () => {

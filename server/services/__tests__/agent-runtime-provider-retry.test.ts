@@ -18,6 +18,7 @@ const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { narratorService } = await import("../narrator-service");
 const executor = await import("../narrator-executor");
 const runtimeSession = await import("../narrator-session");
@@ -31,8 +32,12 @@ const savedMaxToolCallsPerResponse = settings.agent.maxToolCallsPerResponse;
 const ids = ["retry-parent", "retry-primary", "retry-child"];
 const marker = "CONTINUATION_CONTEXT Self-continuations left: 5";
 
-beforeEach(() => cleanDb(sqlite));
-afterEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
+	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
+});
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
@@ -40,9 +45,24 @@ afterEach(() => {
 	settings.openaiProviders = savedOpenai;
 	settings.anthropicProviders = savedAnthropic;
 	settings.agent.maxToolCallsPerResponse = savedMaxToolCallsPerResponse;
+	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
-afterAll(() => mock.module("../../db", () => realDb));
+afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
+	mock.module("../../db", () => realDb);
+});
+
+// Direct SQL fixtures must publish the same entity-specific maintenance as production writes.
+async function seedNarrator(row: typeof narrators.$inferInsert): Promise<void> {
+	await db.insert(narrators).values(row);
+	backgroundOccupancyStore.refreshNarrator(row.id);
+}
+
+async function seedTask(row: typeof backgroundTasks.$inferInsert): Promise<void> {
+	await db.insert(backgroundTasks).values(row);
+	backgroundOccupancyStore.refreshTask(row.id);
+}
 
 function session(id: string, model: string, provider: string): ActiveNarrator {
 	return {
@@ -80,7 +100,7 @@ async function reasoningIdleFixture(kind: "primary" | "subagent", autoContinuati
 	const id = kind === "primary" ? "retry-primary" : "retry-child";
 	const now = new Date().toISOString();
 	for (const target of ["retry-parent", id]) {
-		await db.insert(narrators).values({
+		await seedNarrator({
 			id: target,
 			type: target === "retry-child" ? "subagent" : "primary",
 			variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -135,7 +155,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			const fixture = await reasoningIdleFixture("primary", expected);
 			const { id, now, active, owner, profile } = fixture;
 			if (background === "agent") {
-				await db.insert(narrators).values({
+				await seedNarrator({
 					id: "retry-child",
 					type: "subagent",
 					variant: "subagent:general",
@@ -147,7 +167,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 				});
 			}
 			if (background !== "none") {
-				await db.insert(backgroundTasks).values({
+				await seedTask({
 					id: "reasoning-idle-background",
 					parentNarratorId: id,
 					type: background === "agent" ? "agent" : "bash",
@@ -313,7 +333,7 @@ describe("tool-call limit stops the real runtime without locking later user turn
 			const id = kind === "primary" ? "retry-primary" : "retry-child";
 			const now = new Date().toISOString();
 			for (const target of ["retry-parent", id]) {
-				await db.insert(narrators).values({
+				await seedNarrator({
 					id: target,
 					type: target === "retry-child" ? "subagent" : "primary",
 					variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -427,7 +447,7 @@ describe("provider retry policy is identical through the real primary and child 
 				const id = kind === "primary" ? "retry-primary" : "retry-child";
 				const now = new Date().toISOString();
 				for (const target of ["retry-parent", id]) {
-					await db.insert(narrators).values({
+					await seedNarrator({
 						id: target,
 						type: target === "retry-child" ? "subagent" : "primary",
 						variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -564,7 +584,7 @@ describe("subagent transient-retry recovery notifies the parent", () => {
 		const id = "retry-child";
 		const now = new Date().toISOString();
 		for (const target of ["retry-parent", id]) {
-			await db.insert(narrators).values({
+			await seedNarrator({
 				id: target,
 				type: target === "retry-child" ? "subagent" : "primary",
 				variant: target === "retry-child" ? "subagent:general" : "primary",
@@ -650,7 +670,7 @@ describe("runtime outcome distinguishes resource cleanup from user cancellation"
 				const id = kind === "primary" ? "retry-primary" : "retry-child";
 				const now = new Date().toISOString();
 				for (const target of ["retry-parent", id]) {
-					await db.insert(narrators).values({
+					await seedNarrator({
 						id: target,
 						type: target === "retry-child" ? "subagent" : "primary",
 						variant: target === "retry-child" ? "subagent:general" : "primary",

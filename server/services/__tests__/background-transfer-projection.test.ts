@@ -21,6 +21,7 @@ mock.module("../../db", () => ({ db, sqlite }));
 const broadcasts: Array<{ narratorId: string; message: Record<string, unknown> }> = [];
 
 const { backgroundTaskService } = await import("../background-task-service");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 // Injected rather than `mock.module`d: the service caches its lazily-imported
 // broadcast fn, so whichever test file resolves it first wins for the whole
 // process. Another file mocking `narrator-ws` would silently swallow these frames
@@ -44,7 +45,9 @@ beforeEach(() => {
 	backgroundTaskService.resetListVersionsForTests();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	if (backgroundOccupancyStore.isReady) await flush();
+	backgroundTaskService.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
 
@@ -66,6 +69,7 @@ async function seedParent(): Promise<void> {
 		createdAt: now,
 		updatedAt: now,
 	});
+	await backgroundOccupancyStore.start();
 }
 
 /** An owning transfer row, with optional progress figures. */
@@ -103,7 +107,8 @@ async function projectionOf(transferTaskId: string) {
 }
 
 async function flush(): Promise<void> {
-	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	await backgroundOccupancyStore.flush();
+	for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 describe("transfer projection lifecycle", () => {

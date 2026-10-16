@@ -35,6 +35,7 @@ import type {
 	BooleanOverride,
 	DangerReflectionOverride,
 } from "../lib/boolean-override";
+import { validatePersistedComposerDocument } from "../lib/composer-document";
 import {
 	measureMessageCharacters,
 	measureSerializedCharacters,
@@ -56,6 +57,7 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
@@ -695,6 +697,7 @@ async function writeSubstatus(
 				.where(eq(narrators.id, narratorId)),
 		{ label: "writeSubstatus", maxRetries: 5 },
 	);
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 }
 
 /**
@@ -978,6 +981,7 @@ export async function recoverStaleCompactingMessages(
  * pass it when the recipient is a subagent whose page drops the filter.
  */
 export interface MessagePlacementOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Reserved by the exact agent delivery; never supplied by public input. */
 	messageId?: string;
 	/** Claimed durable input; user_input does not require an agent delivery envelope. */
@@ -1203,6 +1207,10 @@ const sqliteNarratorPersistence = {
 		origin?: MessageOriginOptions,
 		placement?: MessagePlacementOptions,
 	) {
+		const composerDocument = validatePersistedComposerDocument(
+			placement?.composerDocument,
+			contentBlocks ?? [{ type: "text", text }],
+		);
 		const parentToolUseId = placement?.parentToolUseId ?? null;
 		const pg = getNarratorMessageRefsPort();
 		if (pg) {
@@ -1213,6 +1221,7 @@ const sqliteNarratorPersistence = {
 				parentToolUseId,
 				role: "user",
 				contentJson: contentBlocks ?? [{ type: "text", text }],
+				composerDocument: composerDocument ?? null,
 				contextCharsJson: measureMessageCharacters(
 					"user",
 					contentBlocks ?? [{ type: "text", text }],
@@ -1245,6 +1254,7 @@ const sqliteNarratorPersistence = {
 							parentToolUseId,
 							role: "user",
 							contentJson: contentBlocks ?? [{ type: "text", text }],
+							composerDocument: composerDocument ?? null,
 							contextCharsJson: measureMessageCharacters(
 								"user",
 								contentBlocks ?? [{ type: "text", text }],
@@ -2714,6 +2724,7 @@ const sqliteNarratorPersistence = {
 			await writeStatus();
 		}
 
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 		// Always emit status_changed so downstream listeners (gateway, notifications)
 		// are notified. For errors, also emit the dedicated narrator:error event.
 		eventBus.emit({
@@ -2921,6 +2932,7 @@ const sqliteNarratorPersistence = {
 				: await runCompareAndSet();
 
 		if (result.changes === 0) return false;
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 
 		// Always emit status_changed; for errors also emit narrator:error.
 		eventBus.emit({

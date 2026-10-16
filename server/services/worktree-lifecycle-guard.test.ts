@@ -1,12 +1,17 @@
 import { describe, expect, mock, test } from "bun:test";
 import { normalizePathForComparison } from "../lib/platform-path";
+import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import {
+	assertLifecycleProtectionCurrent,
 	assertWorkspaceAdmission,
 	canonicalWorkspaceAdmissionTarget,
 	createLifecycleGuard,
 	type LifecycleGuardPorts,
+	legacyDeletionTargets,
 	type ResourceClaim,
 	ResourceProtectionError,
+	revalidateLifecycleTarget,
+	withLifecycleContext,
 	withLifecycleGuardPorts,
 	withProtectionReservation,
 	withWorkspaceAdmission,
@@ -20,6 +25,169 @@ function fixture(claims: ResourceClaim[] = [], complete = true) {
 	return { ports, guard: createLifecycleGuard(ports) };
 }
 const target = { path: "/real/worktree" };
+
+function latch() {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { promise, release };
+}
+
+describe("explicit deletion effects and identity contexts", () => {
+	test("legacy deletion helper returns only actual checkout and shadow effects", () => {
+		expect(legacyDeletionTargets(null, { checkout: true, shadow: true })).toEqual([]);
+		expect(legacyDeletionTargets(target.path, { checkout: false, shadow: false })).toEqual([]);
+		expect(legacyDeletionTargets(target.path, { checkout: true, shadow: false })).toEqual([
+			{ deviceId: "local", path: target.path },
+		]);
+		expect(legacyDeletionTargets(target.path, { checkout: false, shadow: true })).toEqual([
+			{ deviceId: "local", shadowKey: treeSnapshotKey("local", target.path) },
+			{ deviceId: "local", path: treeSnapshotPhysicalDir("local", target.path) },
+		]);
+	});
+	test("identity context permits shared use without reading inventory", async () => {
+		const { ports } = fixture();
+		ports.pathIdentity = async () => "device:inode";
+		const readClaims = mock(async () => {
+			throw new Error("must not inventory normal use");
+		});
+		ports.readClaims = readClaims;
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([target.path], async () => {
+				expect(await revalidateLifecycleTarget(target.path)).toBe(target.path);
+				await withWorkspaceAdmission(target, async () => undefined);
+				expect(() => assertWorkspaceAdmission({ path: "/real/worktree/child" })).not.toThrow();
+				await expect(
+					assertLifecycleProtectionCurrent([target], "identity is not deletion authority"),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+			}),
+		);
+		expect(readClaims).not.toHaveBeenCalled();
+	});
+	test("identity context cannot waive a subsequent real sink's claims", async () => {
+		const { ports } = fixture([{ kind: "registry", id: "independent", ...target }]);
+		ports.pathIdentity = async () => "device:inode";
+		const sink = mock(async () => undefined);
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([target.path], async () => {
+				await expect(withProtectionReservation([target], "real sink", sink)).rejects.toBeInstanceOf(
+					ResourceProtectionError,
+				);
+				expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+			}),
+		);
+		expect(sink).not.toHaveBeenCalled();
+	});
+	test("target-free context can publish a later real sink and block only that target", async () => {
+		const { ports } = fixture();
+		ports.pathIdentity = async () => "device:inode";
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([], async () => {
+				expect(
+					await withProtectionReservation([target], "real sink", async () => {
+						expect(() => assertWorkspaceAdmission(target)).toThrow(ResourceProtectionError);
+						expect(() => assertWorkspaceAdmission({ path: "/real/sibling" })).not.toThrow();
+						await assertLifecycleProtectionCurrent([target], "real sink fallback");
+						return "removed";
+					}),
+				).toBe("removed");
+			}),
+		);
+		expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+	});
+	test("identity contexts still reject inode replacement", async () => {
+		const { ports } = fixture();
+		let identity = "device:before";
+		ports.pathIdentity = async () => identity;
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([target.path], async () => {
+				identity = "device:after";
+				await expect(revalidateLifecycleTarget(target.path)).rejects.toBeInstanceOf(
+					ResourceProtectionError,
+				);
+			}),
+		);
+	});
+	test("identity contexts still reject alias redirection", async () => {
+		const { ports } = fixture();
+		let canonical = target.path;
+		ports.pathIdentity = async () => "device:inode";
+		ports.canonicalPath = async (path) => (path === "/alias/worktree" ? canonical : path);
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext(["/alias/worktree"], async () => {
+				canonical = "/real/replacement";
+				await expect(revalidateLifecycleTarget("/alias/worktree")).rejects.toBeInstanceOf(
+					ResourceProtectionError,
+				);
+			}),
+		);
+	});
+	test("metadata barrier blocks only its project and never inventories unrelated disk", async () => {
+		const { ports, guard } = fixture();
+		const readClaims = mock(async () => {
+			throw new Error("unrelated inventory unavailable");
+		});
+		ports.readClaims = readClaims;
+		await guard.withProtectionReservation(
+			[{ scopeProjectId: "project-a" }],
+			"project metadata",
+			async () => {
+				expect(() =>
+					assertWorkspaceAdmission({ scopeProjectId: "project-a", deviceId: "remote" }),
+				).toThrow(ResourceProtectionError);
+				await withWorkspaceAdmission(
+					{ scopeProjectId: "project-b", ...target },
+					async () => undefined,
+				);
+				expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+			},
+		);
+		expect(readClaims).not.toHaveBeenCalled();
+	});
+	test("a same-project admission protects metadata retirement even at another device", async () => {
+		const { guard } = fixture();
+		await withWorkspaceAdmission(
+			{ scopeProjectId: "project-a", deviceId: "remote", path: "/work" },
+			async () => {
+				await expect(
+					guard.withProtectionReservation(
+						[{ scopeProjectId: "project-a" }],
+						"project metadata",
+						async () => undefined,
+					),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+			},
+		);
+	});
+	test("a deletion resolving aliases observes an in-flight claim published during preparation", async () => {
+		const { ports } = fixture();
+		const entered = latch();
+		const prepared = latch();
+		ports.canonicalPath = async (path) => {
+			if (path === "/alias/worktree") {
+				entered.release();
+				await prepared.promise;
+			}
+			return path.replace("/alias/", "/real/");
+		};
+		const guard = createLifecycleGuard(ports);
+		const sink = mock(async () => undefined);
+		const deletion = guard.withProtectionReservation(
+			[{ path: "/alias/worktree" }],
+			"retire alias",
+			sink,
+		);
+		await entered.promise;
+		await withLifecycleGuardPorts(ports, () =>
+			withWorkspaceAdmission(target, async () => {
+				prepared.release();
+				await expect(deletion).rejects.toBeInstanceOf(ResourceProtectionError);
+			}),
+		);
+		expect(sink).not.toHaveBeenCalled();
+	});
+});
 
 describe("canonical cwd spelling", () => {
 	test("Windows cwd keeps filesystem casing while ownership keys still ignore case", async () => {
@@ -90,11 +258,66 @@ describe("read-only lifecycle protection", () => {
 			});
 		});
 	}
-	test("shared dormant shadow key protects with no worktreePath", async () => {
+	test("dormant shadow owns its reference and storage, not its former checkout", async () => {
 		const { guard } = fixture([
 			{ kind: "chapter", id: "dormant", shadowKey: "local\0/real/worktree" },
 		]);
-		expect((await guard.inspect([target], "shadow force")).status).toBe("protected");
+		expect((await guard.inspect([target], "checkout remove")).status).toBe("clear");
+		expect(
+			(
+				await guard.inspect(
+					legacyDeletionTargets(target.path, {
+						checkout: false,
+						shadow: true,
+					}),
+					"shadow destroy",
+				)
+			).status,
+		).toBe("protected");
+		expect(
+			(
+				await guard.inspect(
+					[
+						{
+							path: treeSnapshotPhysicalDir("local", target.path),
+						},
+					],
+					"physical shadow remove",
+				)
+			).status,
+		).toBe("protected");
+	});
+	test("ordinary checkout cwd is not a claim on shadow storage", async () => {
+		const { guard } = fixture([{ kind: "narrator", id: "cwd", path: target.path }]);
+		expect(
+			(
+				await guard.inspect(
+					legacyDeletionTargets(target.path, {
+						checkout: false,
+						shadow: true,
+					}),
+					"shadow destroy",
+				)
+			).status,
+		).toBe("clear");
+	});
+	test("shadow aliases match references without inventing checkout ownership", async () => {
+		const { guard } = fixture([
+			{ kind: "chapter", id: "old-alias", shadowKey: "local\0/alias/worktree" },
+		]);
+		expect((await guard.inspect([target], "checkout remove")).status).toBe("clear");
+		expect(
+			(
+				await guard.inspect(
+					[
+						{
+							shadowKey: treeSnapshotKey("local", target.path),
+						},
+					],
+					"shadow destroy",
+				)
+			).status,
+		).toBe("protected");
 	});
 	test("same-repository inventory outside project gitPath protects project deletion", async () => {
 		const { guard } = fixture([
@@ -158,6 +381,29 @@ describe("read-only lifecycle protection", () => {
 		expect(includeLegacy).toEqual([false, true, true]);
 	});
 
+	test("cold shadow initialization does not treat lineage projections as direct physical owners", async () => {
+		const shadowKey = treeSnapshotKey("local", target.path);
+		const physical = treeSnapshotPhysicalDir("local", target.path);
+		const { guard } = fixture([{ kind: "chapter", id: "lineage", shadowKey }]);
+		expect(
+			await guard.withShadowCreationReservation(
+				{ deviceId: "local", path: physical },
+				async () => "created",
+			),
+		).toBe("created");
+		// The same lineage remains a hard pin for both real physical and logical deletion.
+		for (const deletion of [{ path: physical }, { shadowKey }])
+			expect((await guard.inspect([deletion], "destroy")).status).toBe("protected");
+		for (const kind of ["chapter", "narrator", "registry"] as const) {
+			const direct = fixture([{ kind, id: "direct-D-owner", path: physical, shadowKey }]);
+			await expect(
+				direct.guard.withShadowCreationReservation(
+					{ deviceId: "local", path: physical },
+					async () => undefined,
+				),
+			).rejects.toMatchObject({ inspection: { status: "protected" } });
+		}
+	});
 	test("cold creation still refuses a live business reference", async () => {
 		const { ports } = fixture();
 		ports.readClaims = async (_deadline, _signal, _targets, legacy) => {
@@ -285,6 +531,68 @@ test("cwd ordinary subdirectory is not an exact Git root and cannot waive its ch
 });
 
 describe("same-process reservation and workspace admission", () => {
+	test("retiring a child checkout permits a new parent cwd but still rejects exact or nested references", async () => {
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, () =>
+			guard.withProtectionReservation([target], "retire child", async () => {
+				expect(() => assertWorkspaceAdmission({ path: "/real" })).not.toThrow();
+				await withWorkspaceAdmission(
+					{ path: "/real", scopeProjectId: "other-project" },
+					async () => undefined,
+				);
+				for (const path of [target.path, `${target.path}/nested`, "/alias/worktree"]) {
+					await expect(
+						withWorkspaceAdmission({ path }, async () => undefined),
+					).rejects.toBeInstanceOf(ResourceProtectionError);
+				}
+			}),
+		);
+	});
+	test("an in-flight parent cwd admission does not own every child checkout", async () => {
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, () =>
+			withWorkspaceAdmission({ path: "/real" }, async () => {
+				expect(
+					await guard.withProtectionReservation(
+						[target],
+						"retire linked child",
+						async () => "removed",
+					),
+				).toBe("removed");
+			}),
+		);
+	});
+	for (const [first, second] of [
+		["/real", "/real/worktree"],
+		["/real/worktree", "/real"],
+	]) {
+		test(`deletion versus deletion stays symmetric: ${first} then ${second}`, async () => {
+			const { guard } = fixture();
+			const entered = latch();
+			const finish = latch();
+			const deletion = guard.withProtectionReservation(
+				[{ path: first }],
+				"first deletion",
+				async () => {
+					entered.release();
+					await finish.promise;
+				},
+			);
+			await entered.promise;
+			try {
+				await expect(
+					guard.withProtectionReservation(
+						[{ path: second }],
+						"independent deletion",
+						async () => undefined,
+					),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+			} finally {
+				finish.release();
+				await deletion;
+			}
+		});
+	}
 	test("aborted retirement has no claim-read or destructive dispatch", async () => {
 		const controller = new AbortController();
 		controller.abort();
@@ -356,21 +664,72 @@ describe("same-process reservation and workspace admission", () => {
 		).toBe("removed");
 		expect(sink).toHaveBeenCalledTimes(1);
 	});
-	test("preparing canonicalization blocks admission before its first await completes", async () => {
+	test("private canonicalization permits admissions; a new same-target durable claim stops deletion", async () => {
 		let release!: () => void;
+		let enter!: () => void;
 		const waiting = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const { ports } = fixture();
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const claims: ResourceClaim[] = [];
+		const { ports } = fixture(claims);
 		ports.canonicalPath = async (path) => {
+			enter();
 			await waiting;
 			return path;
 		};
 		const guard = createLifecycleGuard(ports);
-		const retirement = guard.withProtectionReservation([target], "retire", async () => undefined);
-		expect(() => assertWorkspaceAdmission(target)).toThrow(ResourceProtectionError);
-		release();
-		await retirement;
+		const destroy = mock(async () => undefined);
+		const retirement = guard.withProtectionReservation([target], "retire", destroy);
+		await entered;
+		try {
+			for (const admission of [
+				target,
+				{ path: "/unrelated" },
+				{
+					deviceId: "remote",
+					path: "/remote/worktree",
+				},
+			])
+				expect(() => assertWorkspaceAdmission(admission)).not.toThrow();
+			await withWorkspaceAdmission(
+				{ deviceId: "remote", path: "/remote/worktree" },
+				async () => undefined,
+			);
+			claims.push({ kind: "registry", id: "committed-during-resolution", ...target });
+		} finally {
+			release();
+		}
+		await expect(retirement).rejects.toBeInstanceOf(ResourceProtectionError);
+		expect(destroy).toHaveBeenCalledTimes(0);
 		expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+	});
+	test("an alias admission is published canonical before its durable write", async () => {
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, () =>
+			withWorkspaceAdmission({ path: "/alias/worktree" }, async () => {
+				await expect(
+					guard.withProtectionReservation([target], "retire", async () => undefined),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+			}),
+		);
+	});
+	test("two shared admissions run concurrently and do not block sibling deletion", async () => {
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, () =>
+			withWorkspaceAdmission(target, () =>
+				withWorkspaceAdmission({ path: "/alias/worktree" }, async () => {
+					expect(
+						await guard.withProtectionReservation(
+							[{ path: "/real/sibling" }],
+							"sibling delete",
+							async () => "removed",
+						),
+					).toBe("removed");
+				}),
+			),
+		);
 	});
 });

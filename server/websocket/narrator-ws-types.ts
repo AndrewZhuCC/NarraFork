@@ -479,6 +479,7 @@ export type NarratorServerMessage =
 	| { type: "custom_traits_changed"; narratorId: string; traits: string[]; customTraits: unknown }
 	| {
 			type: "draft_changed";
+			hasComposerDocument?: boolean;
 			narratorId: string;
 			hasDraft: boolean;
 			text: string;

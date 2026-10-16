@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "fa5a887d-7ff8-4f4b-80b0-1d542d2083f8",
+  "id": "e43b8175-bf0c-4699-9bf7-32a458ac5e36",
   "prevId": "bbce779d-23a0-4861-b6bf-79243569f9e2",
   "tables": {
     "acl_events": {
@@ -9405,6 +9405,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "composer_document": {
+          "name": "composer_document",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "source_id": {
           "name": "source_id",
           "type": "text",
@@ -9993,6 +10000,13 @@
         },
         "content_text": {
           "name": "content_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "composer_document": {
+          "name": "composer_document",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -11299,12 +11313,7 @@
           "name": "idx_toolcalls_context_id",
           "columns": [
             "message_id",
-            "id",
-            "tool_use_id",
-            "created_at",
-            "execution_attempt",
-            "input_chars",
-            "output_chars"
+            "id"
           ],
           "isUnique": false
         },

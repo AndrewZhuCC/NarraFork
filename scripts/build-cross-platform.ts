@@ -440,8 +440,12 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		// `worker-entry.js` (note the rewritten extension), which is what pool.ts resolves at
 		// runtime when it detects the compiled runtime.
 		"./server/lib/db-worker/worker-entry.ts",
+		// Storage directory walks (worktrees, uploads, snapshots) stay off the HTTP thread.
+		"./server/lib/fs-scan-worker/fs-scan-worker-entry.ts",
 		// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 		"./server/services/editor-document-worker.ts",
+		// Untracked file line counting must also stay off-thread in compiled distributions.
+		"./server/services/git-untracked-line-worker.ts",
 		// Model history JSON decoding stays off-thread in compiled distributions too.
 		"./server/services/agent-runtime/model-history-worker.ts",
 		"./server/lib/browser/memory-snapshot-worker.ts",

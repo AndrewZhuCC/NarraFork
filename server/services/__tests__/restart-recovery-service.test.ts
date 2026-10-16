@@ -236,6 +236,81 @@ describe("ordinary restart eligibility and tool disposition", () => {
 });
 
 describe("ordinary restart with real persisted recovery records", () => {
+	test("publishes validated previous targets before an early bounded continuation read fails", async () => {
+		await seedNarrator("parent", { type: "primary", variant: "primary", status: "idle" });
+		await seedNarrator("child", { parentNarratorId: "parent" });
+		await seedNarrator("unrelated");
+		await writeFile(
+			getNarraforkPath("restart-recovery.json"),
+			JSON.stringify({
+				version: 1,
+				snapshot: {
+					version: 2,
+					updateEpoch: "restart-early-bounded-failure",
+					capturedAt: now,
+					narrators: [{ narratorId: "child", locale: "en" }],
+				},
+				targets: [{ narratorId: "child", logicalRunId: "run-child" }],
+			}),
+		);
+		const error = new Error("Continuation payload exceeds startup budget");
+		spyOn(toolContinuationService, "listByEpoch").mockRejectedValue(error);
+		const discovered = new Set<string>();
+		await expect(
+			recovery.prepareOrdinaryRestartRecovery(emptyProtection(), {
+				onTargetsDiscovered: (ids) => {
+					for (const id of ids) discovered.add(id);
+				},
+			}),
+		).rejects.toThrow(error.message);
+		expect([...discovered]).toEqual(["child"]);
+		expect(await session.failUnownedStartupRecovery(discovered, error)).toBe(1);
+		const child = await db.query.narrators.findFirst({ where: eq(narrators.id, "child") });
+		expect(child?.status).toBe("idle");
+		expect(child?.errorMessage).toBe(`Startup recovery failed: ${error.message}`);
+		expect(JSON.parse(child?.substatus ?? "[]")).toContain("interrupted");
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, "unrelated") }))?.status,
+		).toBe("working");
+	});
+
+	test("publishes newly selected targets before output repair can fail", async () => {
+		await seedNarrator("parent", { type: "primary", variant: "primary", status: "idle" });
+		await seedNarrator("child", { parentNarratorId: "parent" });
+		const outputRecovery = await import("../narrator-output-recovery");
+		const error = new Error("output repair failed");
+		spyOn(outputRecovery, "cleanupIncompleteNarratorOutput").mockRejectedValue(error);
+		const discovered: string[] = [];
+		await expect(
+			recovery.prepareOrdinaryRestartRecovery(emptyProtection(), {
+				onTargetsDiscovered: (ids) => discovered.push(...ids),
+			}),
+		).rejects.toThrow(error.message);
+		expect(discovered).toEqual(["child"]);
+		expect(await session.failUnownedStartupRecovery(discovered, error)).toBe(1);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, "child") }))?.errorMessage,
+		).toBe(`Startup recovery failed: ${error.message}`);
+	});
+
+	test("does not publish targets from an invalid previous manifest", async () => {
+		await writeFile(
+			getNarraforkPath("restart-recovery.json"),
+			JSON.stringify({
+				version: 1,
+				snapshot: { updateEpoch: "unowned-epoch", narrators: [] },
+				targets: [{ narratorId: "untrusted", logicalRunId: null }],
+			}),
+		);
+		const discovered: string[] = [];
+		await expect(
+			recovery.prepareOrdinaryRestartRecovery(emptyProtection(), {
+				onTargetsDiscovered: (ids) => discovered.push(...ids),
+			}),
+		).rejects.toThrow("Invalid restart recovery manifest");
+		expect(discovered).toEqual([]);
+	});
+
 	test("ordinary same-epoch external manifest edits reject a new handoff before changing the gate", async () => {
 		await seedNarrator("child");
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());

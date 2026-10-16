@@ -752,7 +752,10 @@ async function loadUpdateSeveredNarrators(
 
 /** Read the manifest epoch before generic startup cleanup mutates any protected row. */
 export async function getPlannedUpdateStartupProtection(
-	options: { claimAuthorization?: boolean } = {},
+	options: {
+		claimAuthorization?: boolean;
+		onTargetsDiscovered?: (narratorIds: readonly string[]) => void;
+	} = {},
 ): Promise<{
 	snapshot: PlannedUpdateRecoverySnapshot | null;
 	protection: ToolContinuationProtectionSets;
@@ -785,6 +788,8 @@ export async function getPlannedUpdateStartupProtection(
 		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
 	}
 
+	// Publish only owned, bounded manifest targets before continuation validation can fail.
+	options.onTargetsDiscovered?.(recoveryTargets(snapshot).map((target) => target.narratorId));
 	let claimedSnapshot = snapshot;
 	if (snapshot.resumeOnNextStartup && options.claimAuthorization !== false) {
 		// Claim before mounting any owner. Keep evidence for this recovery pass, but a later
@@ -1984,7 +1989,13 @@ function restoreRecoveryQueue(
 		sendWaitersSettled: Promise.allSettled(sendMounts).then(() => undefined),
 		completion: Promise.all(messageCompletions).then(() => undefined),
 		ownerCompletions: new Map(
-			[...owners].map(([id, promises]) => [id, Promise.allSettled(promises).then(() => undefined)]),
+			[...owners].map(([id, promises]) => [
+				id,
+				Promise.allSettled(promises).then((outcomes) => {
+					const failure = outcomes.find((outcome) => outcome.status === "rejected");
+					if (failure?.status === "rejected") throw failure.reason;
+				}),
+			]),
 		),
 	};
 }
@@ -2006,8 +2017,21 @@ async function restoreLegacyNarrators(
 	snapshot: PlannedUpdateRecoverySnapshot,
 	protection: ToolContinuationProtectionSets,
 	severedNarratorIds: ReadonlySet<string>,
+	controls?: ReadonlyMap<
+		string,
+		{
+			controller: AbortController;
+			registration: import("./narrator-session").PlannedUpdateRecoveryRegistration;
+		}
+	>,
 ): Promise<void> {
 	const { narratorService } = await import("./narrator-service");
+	const {
+		continueNarratorAfterPlannedUpdate,
+		registerPlannedUpdateRecoveryController,
+		isLoopRunning,
+	} = await import("./narrator-session");
+	const { withNarratorStartAdmission } = await import("./narrator-session-state");
 	const failures: string[] = [];
 	let skipped = 0;
 	for (const target of recoveryTargets(snapshot)) {
@@ -2023,41 +2047,65 @@ async function restoreLegacyNarrators(
 			continue;
 		}
 		try {
-			await withRecoveryAdvance(recoveryEpochScope(snapshot), async () => {
-				const registered = getRecoverySource(epoch);
-				if (registered && !registered.pendingNarratorIds.includes(target.narratorId)) return;
-				const narrator = await narratorService.getById(target.narratorId);
-				if (isSubagentVariant(narrator.variant) || narrator.status === "archived") {
-					invalidateRecoveryTarget(target.narratorId);
-					return;
-				}
-				const run = source?.logicalRuns?.find((entry) => entry.narratorId === target.narratorId);
-				if (run && run.logicalRunId !== (narrator.logicalRunId ?? null)) {
-					invalidateRecoveryTarget(target.narratorId);
-					return;
-				}
-				const { continueNarrator } = await import("./narrator-session");
-				const continued = await continueNarrator(
-					target.narratorId,
-					target.locale as Locale,
-					target.replyInUserLanguage ?? false,
-					target.userId ?? null,
-				);
-				if (!continued.ok) {
-					const current = await narratorService.getById(target.narratorId);
-					if (current.status !== "working" && current.status !== "waiting") {
-						throw new Error("Legacy narrator continuation did not start");
+			await withRecoveryAdvance(recoveryEpochScope(snapshot), () =>
+				withNarratorStartAdmission(target.narratorId, async () => {
+					const registered = getRecoverySource(epoch);
+					if (registered && !registered.pendingNarratorIds.includes(target.narratorId)) return;
+					const existing = controls?.get(target.narratorId);
+					const controller = existing?.controller ?? new AbortController();
+					const registration =
+						existing?.registration ??
+						registerPlannedUpdateRecoveryController(target.narratorId, controller);
+					try {
+						if (controller.signal.aborted) return;
+						const narrator = await narratorService.getById(target.narratorId);
+						controller.signal.throwIfAborted();
+						if (isSubagentVariant(narrator.variant) || narrator.status === "archived") {
+							invalidateRecoveryTarget(target.narratorId);
+							return;
+						}
+						const run = source?.logicalRuns?.find(
+							(entry) => entry.narratorId === target.narratorId,
+						);
+						if (run && run.logicalRunId !== (narrator.logicalRunId ?? null)) {
+							invalidateRecoveryTarget(target.narratorId);
+							return;
+						}
+						const continued = await continueNarratorAfterPlannedUpdate(
+							target.narratorId,
+							registration.token,
+							target.locale as Locale,
+							target.replyInUserLanguage ?? false,
+							target.userId ?? null,
+						);
+						controller.signal.throwIfAborted();
+						if (!continued.ok && !isLoopRunning(target.narratorId)) {
+							throw new Error("Legacy narrator continuation did not start");
+						}
+						const original = getRegisteredRecoverySource(epoch);
+						const current = getRecoverySource(epoch);
+						if (current && original)
+							registerRecoverySource(original).update({
+								...current,
+								pendingNarratorIds: current.pendingNarratorIds.filter(
+									(id) => id !== target.narratorId,
+								),
+							});
+					} catch (error) {
+						if (!controller.signal.aborted) throw error;
+						await registration.finalizeInterrupt();
+						// Async preparation (especially updateStatus(working)) may have finished
+						// AFTER the interrupt finalizer. Settle last, before this start admission
+						// can release a newer user run; this also covers legacy-only epochs.
+						await narratorService.updateStatus(target.narratorId, "idle", {
+							substatus: ["interrupted"],
+							skipErrorMessage: true,
+						});
+					} finally {
+						if (!existing) registration.unregister();
 					}
-				}
-				const original = getRegisteredRecoverySource(epoch);
-				if (registered && original)
-					registerRecoverySource(original).update({
-						...registered,
-						pendingNarratorIds: registered.pendingNarratorIds.filter(
-							(id) => id !== target.narratorId,
-						),
-					});
-			});
+				}),
+			);
 		} catch (error) {
 			if (error instanceof NotFoundError) {
 				invalidateRecoveryTarget(target.narratorId);
@@ -2168,36 +2216,39 @@ export async function restoreNarratorsAfterPlannedUpdate(
 			registration: ReturnType<typeof registerPlannedUpdateRecoveryController>;
 		}
 	>();
-	for (const narratorId of new Set(queue.map(({ record }) => record.narratorId))) {
-		const controller = new AbortController();
-		const recoveryToken = generateId();
-		await withRecoveryAdvance(scope, () =>
-			toolContinuationService.bindRecoveryTokenForNarrator(narratorId, scope, recoveryToken),
-		);
-		const registration = registerPlannedUpdateRecoveryController(
-			narratorId,
-			controller,
-			(token) =>
-				finalizeInterruptedRecoveryParent(
-					narratorId,
-					scope,
-					localeFor(snapshot, narratorId),
-					token,
-				),
-			{
-				token: recoveryToken,
-				// The subagents this owner re-drives in the foreground. Named individually
-				// because their continuation runs on a signal that is not this narrator's,
-				// so an interrupt cannot otherwise find them — and so it cannot reach the
-				// parent's other children either.
-				foregroundSubagentIds: queue.flatMap(({ record }) => {
-					if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
-					const subagentId = payloadString(record.payloadJson, "subagentId");
-					return subagentId ? [subagentId] : [];
-				}),
-			},
-		);
-		parentControls.set(narratorId, { controller, registration });
+	try {
+		for (const narratorId of new Set(queue.map(({ record }) => record.narratorId))) {
+			const controller = new AbortController();
+			const recoveryToken = generateId();
+			await withRecoveryAdvance(scope, () =>
+				toolContinuationService.bindRecoveryTokenForNarrator(narratorId, scope, recoveryToken),
+			);
+			const registration = registerPlannedUpdateRecoveryController(
+				narratorId,
+				controller,
+				(token) =>
+					finalizeInterruptedRecoveryParent(
+						narratorId,
+						scope,
+						localeFor(snapshot, narratorId),
+						token,
+					),
+				{
+					token: recoveryToken,
+					foregroundSubagentIds: queue.flatMap(({ record }) => {
+						if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
+						const subagentId = payloadString(record.payloadJson, "subagentId");
+						return subagentId ? [subagentId] : [];
+					}),
+				},
+			);
+			parentControls.set(narratorId, { controller, registration });
+		}
+	} catch (error) {
+		// No queue has started yet: release partial registrations so startup failure
+		// reconciliation can distinguish these owners from genuinely mounted work.
+		for (const control of parentControls.values()) control.registration.unregister();
+		throw error;
 	}
 	const queueRecovery = restoreRecoveryQueue(
 		queue,
@@ -2213,28 +2264,67 @@ export async function restoreNarratorsAfterPlannedUpdate(
 			]),
 		),
 	);
-	const ownerReleases = [...queueRecovery.ownerCompletions].map(([id, settled]) =>
-		settled.then(async () => {
-			parentControls.get(id)?.registration.unregister();
-			await withRecoveryAdvance(recoveryEpochScope(snapshot), async () => {
-				const rows = (await toolContinuationService.listByEpoch(scope)).filter(
-					(row) => row.narratorId === id,
-				);
-				if (rows.every((row) => row.state === "cancelled" || isToolContinuationOwnerMounted(row))) {
-					for (const [epoch, handle] of sourceHandles) {
-						const source = getRecoverySource(epoch);
-						if (source)
-							handle.update({
-								...source,
-								pendingNarratorIds: source.pendingNarratorIds.filter((target) => target !== id),
-							});
+	const backgroundOnlyOwners = new Set(parentControls.keys());
+	for (const { record } of queue) {
+		if (record.kind !== "background_agent") backgroundOnlyOwners.delete(record.narratorId);
+	}
+	const ownerReleases = [...queueRecovery.ownerCompletions].map(([id, settled]) => {
+		const release = (async () => {
+			try {
+				try {
+					await settled;
+					// Keep interrupt coverage until the actual foreground execution takes over.
+					// This helper owns its advance; nesting it here makes a handoff reservation
+					// wait for the outer advance while the inner waits for that reservation.
+					if (!options.onQueueCompleted && backgroundOnlyOwners.has(id)) {
+						const narratorIds = new Set(protection.narratorIds);
+						narratorIds.delete(id);
+						await restoreLegacyNarrators(
+							snapshot,
+							{ ...protection, narratorIds },
+							new Set(severedNarratorIds.has(id) ? [id] : []),
+							parentControls,
+						);
 					}
+				} finally {
+					// Wait for this owner's actual executions, not an aggregate sibling failure.
+					parentControls.get(id)?.registration.unregister();
 				}
-				await drainQueuedMessagesAfterRecovery(snapshot, [id]);
-			});
-			flushRuntimePublications();
-		}),
-	);
+				await withRecoveryAdvance(scope, async () => {
+					const rows = (await toolContinuationService.listByEpoch(scope)).filter(
+						(row) => row.narratorId === id,
+					);
+					if (
+						rows.every((row) => row.state === "cancelled" || isToolContinuationOwnerMounted(row))
+					) {
+						for (const [epoch, handle] of sourceHandles) {
+							const source = getRecoverySource(epoch);
+							if (source)
+								handle.update({
+									...source,
+									pendingNarratorIds: source.pendingNarratorIds.filter((target) => target !== id),
+								});
+						}
+					}
+					const { reconcileRunningStatus } = await import("./narrator-session");
+					await reconcileRunningStatus(id);
+				});
+				// Queue wake may itself acquire recovery admission. Never hold an epoch
+				// advance across that nested entry point.
+				if (!parentControls.get(id)?.controller.signal.aborted)
+					await drainQueuedMessagesAfterRecovery(snapshot, [id]);
+			} catch (error) {
+				const { failUnownedStartupRecovery } = await import("./narrator-session");
+				await failUnownedStartupRecovery([id], error);
+				throw error;
+			} finally {
+				flushRuntimePublications();
+			}
+		})();
+		// A mount failure may make the caller return before background owners settle.
+		void release.catch(() => {});
+		return release;
+	});
 	// Independent legacy work only waits for global Send waiter installation attempts.
 	// Ordinary restart has its own qualified targets and must never take this branch.
 	const legacyRecovery = options.onQueueCompleted

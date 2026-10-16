@@ -5,6 +5,7 @@ import {
 	SESSION_STORE_LIMITS,
 	writeSession,
 } from "@frontend/lib/session-store";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
 import { insertFileReference } from "./file-reference-input";
@@ -54,6 +55,95 @@ afterAll(() => {
 			value: originalSessionStorage,
 		});
 	}
+});
+
+describe("rich draft lifecycle", () => {
+	const doc: ComposerDocument = {
+		version: 1,
+		assets: [
+			{ id: "image-resource", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+		],
+		paragraphs: [
+			{ children: [{ type: "attachment", id: "image-node", assetId: "image-resource" }] },
+		],
+	};
+	test("mirrors attachment-only layout with its acknowledged revision", () => {
+		const input = { ...composerDocumentText(doc), composerDocument: doc };
+		expect(
+			persistNarratorInputDraft("u", "n", input.text, 3, "now", input.fileReferences, input, doc),
+		).toBe(true);
+		const stored = readNarratorInputDraft("u", "n");
+		expect(stored.composerDocument).toEqual(doc);
+		expect(stored.syncedRevision).toBe(3);
+		expect(canHydrateNarratorDraftFromMeta(stored, { hasDraft: true, revision: 3 })).toBe(true);
+	});
+	test("layout-only changes cannot claim an older acknowledgement", () => {
+		const moved: ComposerDocument = { ...doc, paragraphs: [{ children: [] }, ...doc.paragraphs] };
+		const projection = composerDocumentText(moved);
+		persistNarratorInputDraft(
+			"u",
+			"n",
+			projection.text,
+			3,
+			"now",
+			[],
+			{ text: projection.text, fileReferences: [], composerDocument: doc },
+			moved,
+		);
+		expect(readNarratorInputDraft("u", "n").unsynced).toBe(true);
+	});
+	test("new server layout hydrates and a newer clear removes the old one", () => {
+		const local = {
+			text: "",
+			serverRevision: 1,
+			serverUpdatedAt: "then",
+			syncedRevision: 1,
+			composerDocument: doc,
+		};
+		const hydrated = resolveHydratedNarratorDraft({
+			local,
+			serverText: "",
+			serverComposerDocument: doc,
+			serverRevision: 2,
+			currentInput: "",
+			localChangedSinceRequest: false,
+		});
+		expect(hydrated.composerDocument).toEqual(doc);
+		const cleared = resolveHydratedNarratorDraft({
+			local,
+			serverText: "",
+			serverRevision: 2,
+			currentInput: "",
+			localChangedSinceRequest: false,
+		});
+		expect(cleared.composerDocument).toBeUndefined();
+	});
+	test("late hydrate preserves current layout and detects a layout-only conflict", () => {
+		const current: ComposerDocument = {
+			...doc,
+			paragraphs: [
+				{
+					children: [{ type: "attachment", id: "different-occurrence", assetId: "image-resource" }],
+				},
+			],
+		};
+		const result = resolveHydratedNarratorDraft({
+			local: { text: "", serverRevision: 1, serverUpdatedAt: "then" },
+			serverText: "",
+			serverComposerDocument: doc,
+			serverRevision: 2,
+			currentInput: "",
+			currentComposerDocument: current,
+			localChangedSinceRequest: true,
+		});
+		expect(result.composerDocument).toEqual(current);
+		expect(result.conflict).toBe(true);
+	});
+	test("a stale projection drops the mirror rather than claiming lossless persistence", () => {
+		persistNarratorInputDraft("u", "n", "old", 1, "then");
+		expect(persistNarratorInputDraft("u", "n", "different", 1, "then", [], null, doc)).toBe(false);
+		expect(readNarratorInputDraft("u", "n").text).toBe("");
+	});
 });
 
 describe("narrator draft browser isolation", () => {

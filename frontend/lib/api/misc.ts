@@ -41,6 +41,7 @@ import type {
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchResponse,
+	StorageCategoryKey,
 	StorageScanJobState,
 	StorageScanResult,
 	WorkspaceBarrier,
@@ -1335,14 +1336,18 @@ export const miscApi = {
 
 	// Storage
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
-	startStorageScan: () =>
+	startStorageScan: (categories?: StorageCategoryKey[]) =>
 		request<{ started: boolean; state: StorageScanJobState }>("/storage/scan/start", {
 			method: "POST",
+			body: JSON.stringify(categories ? { categories } : {}),
 		}),
 	getStorageScanStatus: (signal?: AbortSignal) =>
 		request<{ state: StorageScanJobState }>("/storage/scan/status", { signal }),
-	cancelStorageScan: () =>
-		request<{ state: StorageScanJobState }>("/storage/scan/cancel", { method: "POST" }),
+	cancelStorageScan: (categories?: StorageCategoryKey[]) =>
+		request<{ state: StorageScanJobState }>("/storage/scan/cancel", {
+			method: "POST",
+			body: JSON.stringify(categories ? { categories } : {}),
+		}),
 	cleanupStorage: (target: "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers") =>
 		request<{
 			ok: boolean;

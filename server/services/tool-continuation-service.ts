@@ -276,6 +276,7 @@ const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_ROWS_PER_EPOCH = 10_000;
 const MAX_RECOVERY_BYTES = 16 * 1024 * 1024;
 const METADATA_PAGE_SIZE = 100;
+const MAX_BOUNDED_READ_ATTEMPTS = 3;
 const payloadBytes = sql<number>`coalesce(length(cast(${narratorToolContinuations.payloadJson} as blob)), 0)`;
 const toolInputBytes = sql<number>`coalesce(length(cast(${narratorToolCalls.inputJson} as blob)), 0)`;
 const messageContentBytes = sql<number>`coalesce(length(cast(${narratorMessages.contentJson} as blob)), 0)`;
@@ -459,60 +460,82 @@ export function isToolContinuationOwnerMounted(
 	);
 }
 
+class ContinuationScopeChangedError extends ValidationError {
+	constructor() {
+		super("Continuation recovery scope changed during bounded read");
+	}
+}
+
+// Recovery writes may grow payloads after metadata validation. Start over with fresh
+// metadata and empty budgets/results; never retry budget failures or relax SQL byte guards.
+async function retryBoundedContinuationRead<T>(read: () => Promise<T>): Promise<T> {
+	for (let attempt = 1; attempt < MAX_BOUNDED_READ_ATTEMPTS; attempt++) {
+		try {
+			return await read();
+		} catch (error) {
+			if (!(error instanceof ContinuationScopeChangedError)) throw error;
+		}
+	}
+	return read();
+}
+
 async function readBoundedContinuations(
 	scope: EpochScope,
 	filter?: SQL,
 ): Promise<ToolContinuationRecord[]> {
-	const metadata: { id: string; bytes: number }[] = [];
-	let cursor: string | undefined;
-	let totalBytes = 0;
-	while (true) {
-		const page = await db
-			.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
-			.from(narratorToolContinuations)
-			.where(
-				and(
-					epochCondition(scope),
-					filter,
-					cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narratorToolContinuations.id))
-			.limit(METADATA_PAGE_SIZE + 1);
-		assertEpochRowLimit([...metadata, ...page], scope);
-		for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
-			totalBytes += row.bytes;
-			if (row.bytes > MAX_PAYLOAD_BYTES || totalBytes > MAX_RECOVERY_BYTES)
-				throw new ValidationError("Continuation recovery payload budget exceeded");
-			metadata.push(row);
+	return retryBoundedContinuationRead(async () => {
+		const metadata: { id: string; bytes: number }[] = [];
+		let cursor: string | undefined;
+		let totalBytes = 0;
+		while (true) {
+			const page = await db
+				.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
+				.from(narratorToolContinuations)
+				.where(
+					and(
+						epochCondition(scope),
+						filter,
+						cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narratorToolContinuations.id))
+				.limit(METADATA_PAGE_SIZE + 1);
+			assertEpochRowLimit([...metadata, ...page], scope);
+			for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
+				totalBytes += row.bytes;
+				if (row.bytes > MAX_PAYLOAD_BYTES || totalBytes > MAX_RECOVERY_BYTES)
+					throw new ValidationError("Continuation recovery payload budget exceeded");
+				metadata.push(row);
+			}
+			if (page.length <= METADATA_PAGE_SIZE) break;
+			cursor = metadata.at(-1)?.id;
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		}
-		if (page.length <= METADATA_PAGE_SIZE) break;
-		cursor = metadata.at(-1)?.id;
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
-	}
-	const records: ToolContinuationRecord[] = [];
-	for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
-		const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
-		const rows = await db
-			.select()
-			.from(narratorToolContinuations)
-			.where(
-				and(
-					epochCondition(scope),
-					filter,
-					or(
-						...page.map((row) =>
-							and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+		const records: ToolContinuationRecord[] = [];
+		for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
+			const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
+			const rows = await db
+				.select()
+				.from(narratorToolContinuations)
+				.where(
+					and(
+						epochCondition(scope),
+						filter,
+						or(
+							...page.map((row) =>
+								and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+							),
 						),
 					),
-				),
-			);
-		if (rows.length !== page.length)
-			throw new ValidationError("Continuation recovery scope changed during bounded read");
-		records.push(...rows);
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
-	}
-	return records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+				);
+			if (rows.length !== page.length) throw new ContinuationScopeChangedError();
+			records.push(...rows);
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		}
+		return records.sort(
+			(a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+		);
+	});
 }
 
 async function listMessageContinuations(
@@ -1276,98 +1299,100 @@ export const toolContinuationService = {
 	},
 
 	async listRecoveryQueueByEpoch(updateEpoch: EpochScope): Promise<ToolContinuationRecoveryItem[]> {
-		// Validate the entire union before materializing any payload, message, or tool input.
-		const metadata: { id: string; bytes: number; inputBytes: number; contentBytes: number }[] = [];
-		let cursor: string | undefined;
-		let totalBytes = 0;
-		while (true) {
-			const page = await db
-				.select({
-					id: narratorToolContinuations.id,
-					bytes: payloadBytes,
-					inputBytes: toolInputBytes,
-					contentBytes: messageContentBytes,
-				})
-				.from(narratorToolContinuations)
-				.innerJoin(
-					narratorToolCalls,
-					eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
-				)
-				.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
-				.where(
-					and(
-						epochCondition(updateEpoch),
-						cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
-					),
-				)
-				.orderBy(asc(narratorToolContinuations.id))
-				.limit(METADATA_PAGE_SIZE + 1);
-			assertEpochRowLimit([...metadata, ...page], updateEpoch);
-			for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
-				totalBytes += row.bytes + row.inputBytes + row.contentBytes;
-				if (row.bytes > MAX_PAYLOAD_BYTES || totalBytes > MAX_RECOVERY_BYTES)
-					throw new ValidationError("Continuation recovery payload budget exceeded");
-				metadata.push(row);
+		return retryBoundedContinuationRead(async () => {
+			// Validate the entire union before materializing any payload, message, or tool input.
+			const metadata: { id: string; bytes: number; inputBytes: number; contentBytes: number }[] =
+				[];
+			let cursor: string | undefined;
+			let totalBytes = 0;
+			while (true) {
+				const page = await db
+					.select({
+						id: narratorToolContinuations.id,
+						bytes: payloadBytes,
+						inputBytes: toolInputBytes,
+						contentBytes: messageContentBytes,
+					})
+					.from(narratorToolContinuations)
+					.innerJoin(
+						narratorToolCalls,
+						eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+					)
+					.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+					.where(
+						and(
+							epochCondition(updateEpoch),
+							cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
+						),
+					)
+					.orderBy(asc(narratorToolContinuations.id))
+					.limit(METADATA_PAGE_SIZE + 1);
+				assertEpochRowLimit([...metadata, ...page], updateEpoch);
+				for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
+					totalBytes += row.bytes + row.inputBytes + row.contentBytes;
+					if (row.bytes > MAX_PAYLOAD_BYTES || totalBytes > MAX_RECOVERY_BYTES)
+						throw new ValidationError("Continuation recovery payload budget exceeded");
+					metadata.push(row);
+				}
+				if (page.length <= METADATA_PAGE_SIZE) break;
+				cursor = metadata.at(-1)?.id;
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			}
-			if (page.length <= METADATA_PAGE_SIZE) break;
-			cursor = metadata.at(-1)?.id;
-			await new Promise<void>((resolve) => setTimeout(resolve, 0));
-		}
-		const result: ToolContinuationRecoveryItem[] = [];
-		for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
-			const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
-			const rows = await db
-				.select({
-					record: getTableColumns(narratorToolContinuations),
-					messageId: narratorToolCalls.messageId,
-					messageCreatedAt: narratorMessages.createdAt,
-					toolCallCreatedAt: narratorToolCalls.createdAt,
-					toolUseId: narratorToolCalls.toolUseId,
-					toolName: narratorToolCalls.toolName,
-					inputJson: narratorToolCalls.inputJson,
-					contentJson: narratorMessages.contentJson,
-				})
-				.from(narratorToolContinuations)
-				.innerJoin(
-					narratorToolCalls,
-					eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
-				)
-				.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
-				.where(
-					and(
-						epochCondition(updateEpoch),
-						or(
-							...page.map((row) =>
-								and(
-									eq(narratorToolContinuations.id, row.id),
-									lte(payloadBytes, row.bytes),
-									lte(toolInputBytes, row.inputBytes),
-									lte(messageContentBytes, row.contentBytes),
+			const result: ToolContinuationRecoveryItem[] = [];
+			for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
+				const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
+				const rows = await db
+					.select({
+						record: getTableColumns(narratorToolContinuations),
+						messageId: narratorToolCalls.messageId,
+						messageCreatedAt: narratorMessages.createdAt,
+						toolCallCreatedAt: narratorToolCalls.createdAt,
+						toolUseId: narratorToolCalls.toolUseId,
+						toolName: narratorToolCalls.toolName,
+						inputJson: narratorToolCalls.inputJson,
+						contentJson: narratorMessages.contentJson,
+					})
+					.from(narratorToolContinuations)
+					.innerJoin(
+						narratorToolCalls,
+						eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+					)
+					.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+					.where(
+						and(
+							epochCondition(updateEpoch),
+							or(
+								...page.map((row) =>
+									and(
+										eq(narratorToolContinuations.id, row.id),
+										lte(payloadBytes, row.bytes),
+										lte(toolInputBytes, row.inputBytes),
+										lte(messageContentBytes, row.contentBytes),
+									),
 								),
 							),
 						),
-					),
+					);
+				if (rows.length !== page.length) throw new ContinuationScopeChangedError();
+				result.push(
+					...rows.map(({ toolUseId, inputJson, contentJson, ...row }) => ({
+						...row,
+						input: normalizeToolInput(inputJson),
+						toolUseOrder: toolUseOrder(contentJson, toolUseId),
+					})),
 				);
-			if (rows.length !== page.length)
-				throw new ValidationError("Continuation recovery scope changed during bounded read");
-			result.push(
-				...rows.map(({ toolUseId, inputJson, contentJson, ...row }) => ({
-					...row,
-					input: normalizeToolInput(inputJson),
-					toolUseOrder: toolUseOrder(contentJson, toolUseId),
-				})),
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			}
+			return result.sort(
+				(a, b) =>
+					a.record.narratorId.localeCompare(b.record.narratorId) ||
+					a.messageCreatedAt.localeCompare(b.messageCreatedAt) ||
+					a.messageId.localeCompare(b.messageId) ||
+					a.toolUseOrder - b.toolUseOrder ||
+					a.toolCallCreatedAt.localeCompare(b.toolCallCreatedAt) ||
+					a.record.toolCallId.localeCompare(b.record.toolCallId),
 			);
-			await new Promise<void>((resolve) => setTimeout(resolve, 0));
-		}
-		return result.sort(
-			(a, b) =>
-				a.record.narratorId.localeCompare(b.record.narratorId) ||
-				a.messageCreatedAt.localeCompare(b.messageCreatedAt) ||
-				a.messageId.localeCompare(b.messageId) ||
-				a.toolUseOrder - b.toolUseOrder ||
-				a.toolCallCreatedAt.localeCompare(b.toolCallCreatedAt) ||
-				a.record.toolCallId.localeCompare(b.record.toolCallId),
-		);
+		});
 	},
 
 	async getProtectionSets(updateEpoch: EpochScope): Promise<ToolContinuationProtectionSets> {

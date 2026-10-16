@@ -2058,6 +2058,7 @@ export const handleNarratorWS = {
 		switch (msg.type) {
 			case "git_workspace_subscribe":
 			case "git_workspace_unsubscribe":
+			case "git_workspace_refresh":
 				await handleGitWorkspaceMessage(ws, msg);
 				break;
 			case "pong":

@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "a110cb13-9ba6-40a1-a72b-f63b32d2eec8",
-  "prevId": "fa5a887d-7ff8-4f4b-80b0-1d542d2083f8",
+  "id": "374f7148-4917-4069-aeab-e7d3ed73c0ee",
+  "prevId": "e43b8175-bf0c-4699-9bf7-32a458ac5e36",
   "tables": {
     "acl_events": {
       "name": "acl_events",
@@ -9389,6 +9389,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "composer_document": {
+          "name": "composer_document",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "source_id": {
           "name": "source_id",
           "type": "text",
@@ -10029,6 +10036,13 @@
         },
         "content_text": {
           "name": "content_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "composer_document": {
+          "name": "composer_document",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

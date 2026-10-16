@@ -10,7 +10,7 @@ import { useConfirmDialog } from "./common/confirm-dialog-context";
 
 /**
  * Data directory permissions are checked only when an operator asks for it, from
- * Settings > Storage. The earlier design probed in the background on every login and
+ * Settings > Server. The earlier design probed in the background on every login and
  * raised a notification for any non-ok result — including a probe that merely timed
  * out on a slow filesystem. That reported a permission fault where there was none,
  * and admins who followed the alert found a healthy directory. Real permission

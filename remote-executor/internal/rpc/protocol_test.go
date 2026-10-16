@@ -32,6 +32,7 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
 		FeatureGitWorkspaceStatusV1,
+		FeatureGitLineStatsV1,
 		FeatureGitCommitPreviewV1,
 	} {
 		if !containsFeature(decoded.Features, feature) {
@@ -46,7 +47,7 @@ func TestCapabilitiesPreserveLegacyFeaturesDuringRollingUpgrade(t *testing.T) {
 	if err := json.Unmarshal(legacyHello, &hello); err != nil {
 		t.Fatalf("decode legacy hello: %v", err)
 	}
-	for _, feature := range []string{FeatureFsStatResolvedPathV1, FeatureGitWorkspaceV1, FeatureGitWorkspaceStatusV1, FeatureGitCommitPreviewV1} {
+	for _, feature := range []string{FeatureFsStatResolvedPathV1, FeatureGitWorkspaceV1, FeatureGitWorkspaceStatusV1, FeatureGitLineStatsV1, FeatureGitCommitPreviewV1} {
 		if containsFeature(hello.Capabilities.Features, feature) {
 			t.Fatalf("legacy hello must not gain %q during decode", feature)
 		}

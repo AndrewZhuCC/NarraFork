@@ -14,7 +14,9 @@ CREATE TABLE `narrator_message_context_stats` (
 	FOREIGN KEY (`message_id`) REFERENCES `narrator_messages`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
-DROP TABLE `narrator_context_char_pages`;
+DROP TABLE `narrator_context_char_pages`;--> statement-breakpoint
+DROP INDEX `idx_toolcalls_context_id`;--> statement-breakpoint
+CREATE INDEX `idx_toolcalls_context_id` ON `narrator_tool_calls` (`message_id`,`id`,`tool_use_id`,`created_at`,`execution_attempt`,`input_chars`,`output_chars`);
 --> statement-breakpoint
 INSERT INTO `narrator_message_context_stats` (`message_id`, `role`, `parent_tool_use_id`, `segments_json`)
 SELECT `id`, `role`, `parent_tool_use_id`, COALESCE(`context_chars_json`, '{"segments":[]}')

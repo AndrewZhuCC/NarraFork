@@ -1,10 +1,20 @@
 import { lstat, realpath } from "node:fs/promises";
 import { AppError, ValidationError } from "../lib/errors";
-import { invalidateBoundaries } from "./git-commit-boundary-cache";
+import { eventBus } from "../lib/event-bus";
 import { gitDiscoveryCache } from "./git-discovery-cache";
-import { gitService } from "./git-service";
+import { getGitLineStats } from "./git-line-stats";
+import {
+	getGitLineStatsCached,
+	invalidateGitLineStats,
+	validateGitLineStatsCache,
+} from "./git-line-stats-cache";
+import { gitService, withGitRequestContext } from "./git-service";
 import { invalidateStatus } from "./git-status-cache";
-import { invalidateGitStatusQuery } from "./git-status-query";
+import {
+	getLocalGitStatusQueryKey,
+	invalidateGitStatusQuery,
+	validateGitStatusQuery,
+} from "./git-status-query";
 import { type GitWorkspaceTarget, normalizeWorkspacePath } from "./git-workspace";
 import { createRemoteGitService, getRemoteGitStatusQueryKey } from "./remote-git-service";
 import type { WorkspaceAttributionScope } from "./workspace-modification-view";
@@ -15,6 +25,56 @@ export function gitManagementService(target: GitWorkspaceTarget, signal?: AbortS
 	return target.backend.kind === "remote"
 		? createRemoteGitService(target.backend, signal, target.beforeWrite)
 		: gitService;
+}
+
+/** Caller must authorize the workspace on every request, before any cache lookup. */
+export function getGitWorkspaceStatus(
+	target: GitWorkspaceTarget,
+	signal?: AbortSignal,
+	ttlMs?: number,
+) {
+	if (!target.backend || !target.workspace.rootPath)
+		throw new AppError("Git execution device unavailable", 409, "GIT_WORKSPACE_UNAVAILABLE");
+	const path = target.workspace.rootPath;
+	const read = () => gitManagementService(target, signal).getStatusSummary(path, { ttlMs });
+	return signal ? withGitRequestContext(signal, read) : read();
+}
+
+/** Called only after per-request workspace authorization, independently of status. */
+export function getGitWorkspaceLineStats(
+	target: GitWorkspaceTarget,
+	signal?: AbortSignal,
+	ttlMs?: number,
+) {
+	const { backend, workspace } = target;
+	if (!backend || !workspace.rootPath)
+		throw new AppError("Git execution device unavailable", 409, "GIT_WORKSPACE_UNAVAILABLE");
+	const path = workspace.rootPath;
+	const key =
+		backend.kind === "remote"
+			? getRemoteGitStatusQueryKey(backend, path)
+			: getLocalGitStatusQueryKey(path);
+	return getGitLineStatsCached(
+		key,
+		(sharedSignal) =>
+			backend.kind === "remote"
+				? createRemoteGitService(backend, sharedSignal).getLineStats(path)
+				: getGitLineStats(path, sharedSignal),
+		signal,
+		ttlMs,
+	);
+}
+
+/** An unchanged fingerprint renews existing clean results, never creates statistics. */
+export function validateGitWorkspaceCache(target: GitWorkspaceTarget): void {
+	const { backend, workspace } = target;
+	if (!backend || !workspace.rootPath) return;
+	const key =
+		backend.kind === "remote"
+			? getRemoteGitStatusQueryKey(backend, workspace.rootPath)
+			: getLocalGitStatusQueryKey(workspace.rootPath);
+	validateGitStatusQuery(key);
+	validateGitLineStatsCache(key);
 }
 
 export function invalidateGitWorkspace(target: GitWorkspaceTarget): void {
@@ -28,10 +88,12 @@ export function invalidateGitWorkspace(target: GitWorkspaceTarget): void {
 	if (!backend || !workspace.rootPath) return;
 	if (backend.kind === "remote") {
 		// Watch events must queue a fresh read rather than reuse pre-event RPC work.
-		invalidateGitStatusQuery(getRemoteGitStatusQueryKey(backend, workspace.rootPath));
+		const key = getRemoteGitStatusQueryKey(backend, workspace.rootPath);
+		invalidateGitStatusQuery(key);
+		invalidateGitLineStats(key);
+		eventBus.emit({ type: "git:workspace_invalidated", queryKey: key });
 	} else {
 		invalidateStatus(workspace.rootPath);
-		invalidateBoundaries(workspace.rootPath);
 	}
 }
 

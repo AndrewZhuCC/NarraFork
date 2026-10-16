@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { notifications } from "@mantine/notifications";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import type { SavedRecording } from "@shared/request-recording";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance, type TFunction } from "i18next";
@@ -10,6 +11,7 @@ import { I18nextProvider } from "react-i18next";
 import { useNarratorCommands } from "../../../hooks/useCommands";
 import { api, type BufferMessageSummary } from "../../../lib/api";
 import type { CommandItem } from "../composer/CommandPopover";
+import { getComposerAssetId } from "../composer/draft-image-attachments";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import {
 	type UseNarratorSendOptions,
@@ -50,6 +52,11 @@ beforeEach(() => {
 	notify = spyOn(notifications, "show").mockReturnValue("notification");
 	const composer: NarratorComposerHandle = {
 		getText: () => "replace",
+		captureAttachmentSelection: mock(() => {}),
+		captureAttachmentInsertion: mock(() => undefined),
+		insertAcceptedFiles: mock(() => false),
+		getDocument: () => undefined,
+		hasMissingAssets: () => false,
 		getFileReferences: () => [reference],
 		isTextEmpty: () => false,
 		ownsTextarea: () => false,
@@ -120,6 +127,179 @@ async function render(overrides: Partial<UseNarratorSendOptions> = {}) {
 	options = { ...options, ...overrides };
 	await act(async () => root.render(<Probe {...options} />));
 }
+
+describe("structured send snapshots", () => {
+	function richDraft() {
+		const images = [
+			new File(["first"], "same.png", { type: "image/png" }),
+			new File(["second"], "same.png", { type: "image/png" }),
+		];
+		const textFiles = [new File(["log"], "a.log", { type: "text/plain" })];
+		const assets = [images[1], textFiles[0], images[0]].map((file) => ({
+			id: getComposerAssetId(file),
+			kind: file.type === "image/png" ? ("image" as const) : ("textFile" as const),
+			name: file.name,
+			size: file.size,
+			mimeType: file.type,
+		}));
+		const doc: ComposerDocument = {
+			version: 1,
+			assets,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "  before " },
+						{ type: "attachment", id: "image-node", assetId: assets[0].id },
+						{ type: "quote", id: "quote", label: "quote", text: "quoted text" },
+						{ type: "attachment", id: "text-node", assetId: assets[1].id },
+						{ type: "fileReference", id: "file-node", reference },
+						{ type: "attachment", id: "other-image", assetId: assets[2].id },
+						{ type: "text", text: " after  " },
+					],
+				},
+			],
+		};
+		const projection = composerDocumentText(doc);
+		Object.assign(options.composerRef.current ?? {}, {
+			getDocument: () => doc,
+			getText: () => projection.text,
+			getFileReferences: () => projection.fileReferences,
+		});
+		return { doc, projection, images, textFiles };
+	}
+	test.each([
+		"busy",
+		"idle",
+		"compacting",
+	] as const)("%s sends the exact projection and manifest-ordered resources", async (state) => {
+		const { doc, projection, images, textFiles } = richDraft();
+		await render({
+			isActive: state === "busy",
+			showCompactQueueChoice: state === "compacting",
+			attachedImages: images,
+			attachedTextFiles: textFiles,
+		});
+		await act(async () => actions.handleSend());
+		expect(send.mock.calls[0]?.[1]).toBe(projection.text);
+		expect(send.mock.calls[0]?.[2]).toEqual([images[1], images[0]]);
+		expect(send.mock.calls[0]?.[3]).toEqual(textFiles);
+		expect(send.mock.calls[0]?.[7]).toEqual(projection.fileReferences);
+		expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+		expect(options.composerRef.current?.noteSent).toHaveBeenCalledWith(
+			projection.text,
+			projection.fileReferences,
+			doc,
+		);
+	});
+	test.each([
+		"busy",
+		"idle",
+		"compacting",
+	] as const)("%s restores the identical mixed document after cancellation", async (state) => {
+		const { doc, projection, images, textFiles } = richDraft();
+		send.mockRejectedValue(new DOMException("Cancelled", "AbortError"));
+		await render({
+			isActive: state === "busy",
+			showCompactQueueChoice: state === "compacting",
+			attachedImages: images,
+			attachedTextFiles: textFiles,
+		});
+		await act(async () => actions.handleSend());
+		expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith(
+			projection.text,
+			projection.fileReferences,
+			doc,
+		);
+		expect(options.updateAttachedImages).toHaveBeenCalledWith([images[1], images[0]]);
+		expect(options.updateAttachedTextFiles).toHaveBeenCalledWith(textFiles);
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(options.sendingRef.current).toBe(false);
+	});
+	test("missing resources block sends without clearing the document", async () => {
+		richDraft();
+		await render();
+		await act(async () => actions.handleSend());
+		expect(send).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({ message: "composerMissingAssets" }),
+		);
+	});
+	test("editor missing-resource gate is also honored", async () => {
+		Object.assign(options.composerRef.current ?? {}, { hasMissingAssets: () => true });
+		await render();
+		await act(async () => actions.handleSend());
+		expect(send).not.toHaveBeenCalled();
+	});
+	test("forwarding preserves layout and never uploads the operator's staged files", async () => {
+		const { doc, projection, images, textFiles } = richDraft();
+		await render({
+			attachedImages: images,
+			attachedTextFiles: textFiles,
+			attachedImagesRef: { current: images },
+			attachedTextFilesRef: { current: textFiles },
+		});
+		await act(async () => {
+			actions.forwardTextToNarrator("forwarded");
+			await Promise.resolve();
+		});
+		expect(send.mock.calls[0]?.[1]).toBe("forwarded");
+		expect(send.mock.calls[0]?.[2]).toBeUndefined();
+		expect(send.mock.calls[0]?.[3]).toBeUndefined();
+		expect(send.mock.calls[0]?.[10]).toBeUndefined();
+		expect(options.composerRef.current?.restoreInput).toHaveBeenLastCalledWith(
+			projection.text,
+			projection.fileReferences,
+			doc,
+		);
+		expect(options.updateAttachedImages).toHaveBeenLastCalledWith(images);
+	});
+	test("pure-text /new projects a new document without retaining the command", async () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "/new describe this  " }] }],
+		};
+		Object.assign(options.composerRef.current ?? {}, {
+			getDocument: () => doc,
+			getText: () => composerDocumentText(doc).text,
+			getFileReferences: () => [],
+		});
+		await render({ isActive: false });
+		await act(async () => actions.handleSend());
+		expect(send.mock.calls[0]?.[0]).toBe("created");
+		expect(send.mock.calls[0]?.[1]).toBe("describe this");
+		const sentDocument = send.mock.calls[0]?.[10]?.composerDocument;
+		if (!sentDocument) throw new Error("Missing new-session document");
+		expect(composerDocumentText(sentDocument).text).toBe("describe this");
+	});
+	test.each([
+		"direct",
+		"forward",
+	] as const)("%s waits until async attachment ingestion finishes", async (path) => {
+		const ingestingRef = { current: true };
+		await render({ ingestingRef });
+		await act(async () => {
+			if (path === "direct") await actions.handleSend();
+			else actions.forwardTextToNarrator("forwarded");
+		});
+		expect(send).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({ message: "composerAttachmentsProcessing" }),
+		);
+		ingestingRef.current = false;
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(1);
+	});
+	test("old handles without getDocument remain supported", async () => {
+		Reflect.deleteProperty(options.composerRef.current ?? {}, "getDocument");
+		Reflect.deleteProperty(options.composerRef.current ?? {}, "hasMissingAssets");
+		await render();
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(1);
+	});
+});
 
 describe("narrator interrupt send", () => {
 	test("primary sends once without a separate stop and prepends the prioritized replacement", async () => {

@@ -258,6 +258,9 @@ export async function persistPgMessageWithRef(
 		seq,
 		message: {
 			...created,
+			composerDocument: (created.composerDocument ?? null) as
+				| import("@shared/composer-document").ComposerDocument
+				| null,
 			// PostgreSQL has not enabled character caching yet; legacy rows remain unknown.
 			contextCharsJson: null,
 			costStatus: created.costStatus as "complete" | "partial" | "unknown" | null,

@@ -51,6 +51,7 @@ import {
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
@@ -1086,6 +1087,7 @@ async function clearBackgroundRunningClaim(
 		.update(narrators)
 		.set({ backgroundStatus: "failed", backgroundCompletedAt: now, updatedAt: now })
 		.where(and(eq(narrators.id, subagentId), eq(narrators.backgroundStatus, "running")))
+		.then(() => backgroundOccupancyStore.refreshNarrator(subagentId))
 		.catch((err) => {
 			logger.error("Failed to clear the background claim of an unstarted subagent", {
 				subagentId,
@@ -1218,6 +1220,7 @@ export async function resumeRecoverySubagents(input: {
 							updatedAt: new Date().toISOString(),
 						})
 						.where(eq(narrators.id, subagentId));
+					backgroundOccupancyStore.refreshNarrator(subagentId);
 				});
 
 				// d) restart, keeping background semantics and leaving the historical

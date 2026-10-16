@@ -2,8 +2,15 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from "node:timers";
 import { MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import {
+	type ComposerDocument,
+	type ComposerInlineNode,
+	composerDocumentText,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Editor } from "@tiptap/core";
+import { Slice } from "@tiptap/pm/model";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode, useState } from "react";
@@ -13,6 +20,7 @@ import { api, type BufferMessageSummary } from "../../../lib/api";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
 import { ImageViewerContext } from "../../common/image-viewer-context";
+import { editorBodyPositions } from "../composer/InlineComposerEditor";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "../interaction/QueuedMessageRow";
 import {
 	QueuedMessagesPanel,
@@ -93,7 +101,23 @@ function installDom() {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
+	const selection = {
+		rangeCount: 0,
+		anchorNode: null,
+		focusNode: null,
+		anchorOffset: 0,
+		focusOffset: 0,
+		removeAllRanges() {},
+		addRange() {},
+		collapse() {},
+		extend() {},
+		setBaseAndExtent() {},
+	};
+	Object.defineProperty(window.document, "getSelection", { value: () => selection });
 	const overrides = {
+		innerHeight: 800,
+		innerWidth: 1200,
+		getSelection: () => selection,
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -151,6 +175,7 @@ async function render(child: ReactNode) {
 	});
 }
 function button(label: string) {
+	if (label.startsWith(`${en.removeFile}:`)) label = en.fileReferences.remove;
 	const found = Array.from(document.querySelectorAll("button")).find(
 		(item) => item.textContent?.trim() === label || item.getAttribute("aria-label") === label,
 	);
@@ -181,6 +206,8 @@ function editor(overrides: Partial<MessageEditorPanelProps> = {}) {
 
 beforeEach(async () => {
 	installDom();
+	spyOn(api, "getMessageComposerDocument").mockResolvedValue({});
+	spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({});
 	if (!i18n.isInitialized)
 		await i18n.use(initReactI18next).init({
 			lng: "en",
@@ -226,6 +253,7 @@ async function cleanupDom() {
 			else Reflect.deleteProperty(globalThis, key);
 		}
 		previousGlobals.clear();
+		mock.restore();
 	}
 }
 afterEach(cleanupDom);
@@ -250,18 +278,115 @@ test("fixture teardown cancels owned window/global timers and RAF before restori
 	}
 });
 
-// linkedom has no native textarea editing/default actions. Deliver beforeinput
-// through the DOM listener, then invoke React's installed change handler after
-// applying the browser's value/selection mutation (not the pure helper).
+// linkedom has no native editing defaults. Exercise the actual mounted Tiptap
+// transaction/history controller instead of the removed controlled textarea path.
+function inlineEditor() {
+	const element = document.querySelector<HTMLElement>(".ProseMirror") as
+		| (HTMLElement & { editor: Editor })
+		| null;
+	if (!element?.editor) throw new Error("Inline editor missing");
+	return element.editor;
+}
+function inlineDocument(): ComposerDocument {
+	const paragraphs: ComposerDocument["paragraphs"] = [];
+	inlineEditor().state.doc.forEach((paragraph) => {
+		const children: ComposerInlineNode[] = [];
+		paragraph.forEach((node) => {
+			if (node.isText) children.push({ type: "text", text: node.text ?? "" });
+			else if (node.type.name === "hardBreak") children.push({ type: "break" });
+			else children.push(node.attrs.value as ComposerInlineNode);
+		});
+		paragraphs.push({ children });
+	});
+	return { version: 1, paragraphs, assets: [] };
+}
+const harnesses = new WeakMap<
+	Editor,
+	{ textarea: HTMLTextAreaElement; props: ComponentProps<"textarea"> }
+>();
 function textareaProps() {
-	const textarea = document.querySelector("textarea");
-	if (!textarea) throw new Error("Textarea missing");
-	const key = Object.keys(textarea).find((key) => key.startsWith("__reactProps$"));
-	if (!key) throw new Error("React textarea props missing");
-	return {
-		textarea,
-		props: (textarea as unknown as Record<string, ComponentProps<"textarea">>)[key],
+	const editor = inlineEditor();
+	const cached = harnesses.get(editor);
+	if (cached) return cached;
+	let pending: string | undefined;
+	let range: { start: number; end: number; backward: boolean } | undefined;
+	const text = () => composerDocumentText(inlineDocument()).text;
+	const textarea = {
+		get value() {
+			return pending ?? text();
+		},
+		set value(value: string) {
+			pending = value;
+		},
+		selectionStart: 0,
+		selectionEnd: 0,
+		dispatchEvent(event: Event) {
+			range = {
+				start: this.selectionStart,
+				end: this.selectionEnd,
+				backward: (event as InputEvent).inputType?.includes("Backward") ?? false,
+			};
+			return true;
+		},
+	} as HTMLTextAreaElement;
+	const props: ComponentProps<"textarea"> = {
+		onChange: () => {
+			const previous = text();
+			const next = pending ?? previous;
+			let start = range?.start ?? textarea.selectionStart;
+			let end = range?.end ?? textarea.selectionEnd;
+			if (start === end && next.length < previous.length) {
+				if (range?.backward) start = Math.max(0, start - previous.length + next.length);
+				else end += previous.length - next.length;
+			}
+			const replacement = next.slice(start, next.length - (previous.length - end));
+			const positions = editorBodyPositions(editor.state.doc);
+			pending = undefined;
+			range = undefined;
+			editor.view.dispatch(
+				editor.state.tr.insertText(replacement, positions.toEditor(start), positions.toEditor(end)),
+			);
+		},
+		onCompositionStart: () => {
+			(editor.view as unknown as { input: { composing: boolean } }).input.composing = true;
+		},
+		onCompositionEnd: () => {
+			(editor.view as unknown as { input: { composing: boolean } }).input.composing = false;
+		},
+		onPaste: (event) => {
+			range = { start: textarea.selectionStart, end: textarea.selectionEnd, backward: false };
+			const files = Array.from(event.clipboardData.items).flatMap((item) => {
+				const file = item.getAsFile();
+				return file ? [file] : [];
+			});
+			if (files.length)
+				editor.view.someProp("handlePaste", (handler) =>
+					handler(
+						editor.view,
+						{ clipboardData: { files }, preventDefault() {} } as unknown as ClipboardEvent,
+						Slice.empty,
+					),
+				);
+		},
+		onKeyDown: (event) => {
+			if (editor.view.composing || event.nativeEvent.isComposing) return;
+			if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+				editor.commands.undo();
+				return;
+			}
+			const wrapper = editor.view.dom.closest("[data-inline-composer]");
+			if (!wrapper) throw new Error("Editor wrapper missing");
+			const key = Object.keys(wrapper).find((name) => name.startsWith("__reactProps$"));
+			if (!key) throw new Error("Editor React handlers missing");
+			const handlers = (wrapper as unknown as Record<string, ComponentProps<"div">>)[key];
+			handlers.onKeyDownCapture?.({ ...event, target: editor.view.dom } as unknown as Parameters<
+				NonNullable<typeof handlers.onKeyDownCapture>
+			>[0]);
+		},
 	};
+	const result = { textarea, props };
+	harnesses.set(editor, result);
+	return result;
 }
 async function editRange(
 	start: number,
@@ -444,16 +569,16 @@ describe("message reference attachment editor", () => {
 				false,
 		);
 		await render(editor({ onEditAndRegenerate: save, onClose: close }));
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
-		expect(document.body.textContent).toContain("#file:a.ts:5-5");
+		expect(document.body.textContent).toContain("a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:5-5");
 		expect(button(en.editSubmit).disabled).toBe(false);
 		expect(registered?.canSubmit).toBe(true);
 		await click(button(en.editSubmit));
-		expect(save.mock.calls[0][1]).toBe("");
-		expect(save.mock.calls[0][3]?.fileReferences).toEqual([reference, secondReference]);
+		expect(save.mock.calls[0][1]).toBe("#file:a.ts:2-2#file:a.ts:5-5");
+		expect(save.mock.calls[0][3]?.fileReferences).toMatchObject([reference, secondReference]);
 		expect(JSON.stringify(save.mock.calls[0][3])).not.toContain("snapshotText");
 		expect(close).not.toHaveBeenCalled();
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("removing one occurrence keeps the other selection, removing all disables pure-ref submit", async () => {
@@ -464,7 +589,7 @@ describe("message reference attachment editor", () => {
 		await render(editor({ onEditAndRegenerate: save }));
 		await click(button(`${en.removeFile}: a.ts`));
 		await click(button(en.editSubmit));
-		expect(save.mock.calls[0][3]?.fileReferences).toEqual([secondReference]);
+		expect(save.mock.calls[0][3]?.fileReferences).toMatchObject([secondReference]);
 		await click(button(`${en.removeFile}: a.ts`));
 		expect(button(en.editSubmit).disabled).toBe(true);
 		expect(registered?.canSubmit).toBe(false);
@@ -480,6 +605,194 @@ describe("message reference attachment editor", () => {
 		await click(button(`${en.removeFile}: a.ts`));
 		await click(button(en.editSubmit));
 		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
+	});
+});
+
+describe("structured edit layout details", () => {
+	const owner = "layout-owner";
+	const layout: ComposerDocument = {
+		version: 1,
+		assets: [
+			{ id: "persisted-image", kind: "image", name: "image.png", size: 3, mimeType: "image/png" },
+		],
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: " before " },
+					{ type: "attachment", id: "image-occurrence", assetId: "persisted-image" },
+					{ type: "quote", id: "quote-occurrence", label: "Source", text: "protected quote" },
+					{ type: "fileReference", id: reference.id, reference },
+					{ type: "text", text: " after " },
+				],
+			},
+		],
+	};
+	test("message details load only for editing and preserve mixed order, stable IDs and fullscreen controller", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		const load = spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
+			affectedFiles: [],
+			deletedMessageCount: 0,
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({
+				narratorId: owner,
+				initialText: "stale legacy body",
+				blocks: [
+					{
+						type: "image",
+						imageId: "stale-list-image",
+						filename: "stale-list-image.png",
+						previewUrl: "blob:test-image",
+					},
+					{ type: "file_reference", reference },
+				],
+				onEditAndRegenerate: save,
+			}),
+		);
+		expect(load).toHaveBeenCalledTimes(1);
+		expect(load.mock.calls[0].slice(0, 2)).toEqual([owner, "message"]);
+		const controller = inlineEditor();
+		const expand = document.querySelector(".tabler-icon-arrows-maximize")?.closest("button");
+		if (!expand) throw new Error("Fullscreen action missing");
+		await click(expand);
+		expect(inlineEditor()).toBe(controller);
+		expect(inlineDocument().paragraphs).toEqual(layout.paragraphs);
+		await click(button(en.editSubmit));
+		expect(save.mock.calls[0][1]).toBe(composerDocumentText(layout).text);
+		expect(save.mock.calls[0][3]?.composerDocument).toEqual(layout);
+		expect(save.mock.calls[0][3]?.keepImageIds).toEqual(["server-image"]);
+		expect(save.mock.calls[0][3]?.fileReferences).toEqual(
+			composerDocumentText(layout).fileReferences,
+		);
+		expect(load).toHaveBeenCalledTimes(1);
+	});
+	test("queued detail uses its own endpoint and forwards the unchanged layout with kept resources", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		const load = spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		const save = mock(
+			async (_message: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(
+			queueRow({
+				narratorId: owner,
+				isEditing: true,
+				msg: {
+					id: "queued-layout",
+					text: "legacy",
+					imageCount: 1,
+					bufferedAt: "now",
+					images: [{ imageId: "stale-queue-image", filename: "image.png", mediaType: "image/png" }],
+				},
+				onSaveEdit: save,
+			}),
+		);
+		expect(load).toHaveBeenCalledTimes(1);
+		expect(load.mock.calls[0].slice(0, 2)).toEqual([owner, "queued-layout"]);
+		await editorKey("Enter");
+		expect(save.mock.calls[0][1]).toBe(composerDocumentText(layout).text);
+		expect(save.mock.calls[0][2].composerDocument).toEqual(layout);
+		expect(save.mock.calls[0][2].keepImageIds).toEqual(["server-image"]);
+		expect(save.mock.calls[0][2].keepTextFiles).toEqual([]);
+	});
+	test("legacy edits use body and references from the same detail snapshot, not stale rows", async () => {
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			text: "latest body",
+			fileReferences: [],
+			images: [],
+			textFiles: [],
+		});
+		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
+			affectedFiles: [],
+			deletedMessageCount: 0,
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({ narratorId: owner, initialText: "stale row body", onEditAndRegenerate: save }),
+		);
+		await click(button(en.editSubmit));
+		expect(save.mock.calls[0][1]).toBe("latest body");
+		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
+		expect(save.mock.calls[0][3]?.keepImageIds).toEqual([]);
+	});
+	test("a rich layout without its same-snapshot resource detail cannot bind stale attachments", async () => {
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({ composerDocument: layout });
+		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
+			affectedFiles: [],
+			deletedMessageCount: 0,
+		});
+		await render(editor({ narratorId: owner, initialText: "stale body" }));
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(button(en.editSubmit).disabled).toBe(true);
+	});
+	test("layout failure disables save until an explicit successful retry", async () => {
+		const load = spyOn(api, "getMessageComposerDocument").mockRejectedValue(
+			new Error("unavailable"),
+		);
+		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
+			affectedFiles: [],
+			deletedMessageCount: 0,
+		});
+		await render(editor({ narratorId: owner, initialText: "must not overwrite unknown layout" }));
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(button(en.editSubmit).disabled).toBe(true);
+		expect(registered?.canSubmit).toBe(false);
+		load.mockResolvedValue({});
+		await click(button(en.documentRetry));
+		expect(document.querySelector(".ProseMirror")).not.toBeNull();
+		expect(button(en.editSubmit).disabled).toBe(false);
+		expect(load).toHaveBeenCalledTimes(2);
+	});
+	test("assistant editing remains plain text and does not load a composer layout", async () => {
+		const save = mock((_messageId: string, _text: string) => {});
+		await render(
+			editor({
+				messageRole: "assistant",
+				initialText: "plain assistant",
+				blocks: [],
+				onEditAssistantMessage: save,
+			}),
+		);
+		expect(document.querySelector("textarea")).not.toBeNull();
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(api.getMessageComposerDocument).not.toHaveBeenCalled();
+		await click(button(en.editAssistantSubmit));
+		expect(save).toHaveBeenCalledWith("message", "plain assistant");
 	});
 });
 
@@ -567,7 +880,7 @@ describe("visible queued message collaboration details", () => {
 		expect(document.querySelectorAll("[data-queue-image]")).toHaveLength(4);
 		expect(document.body.textContent).toContain("notes.txt");
 		expect(document.body.textContent).toContain("report.md");
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("remove is directly accessible and double-clicking it does not edit", async () => {
@@ -634,9 +947,9 @@ describe("queued collaboration gesture and image integration", () => {
 		);
 		expect<string | null>(editingQueuedId).toBe(message.id);
 		await render(view());
-		expect(textareaProps().textarea.value).toBe(message.text);
+		expect(textareaProps().textarea.value).toBe(`${message.text}#file:a.ts:2-2`);
 		expect(document.querySelector("[data-queue-sender]")?.textContent).toContain("peer");
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("mode changes in flight block double-click editing and external removal", async () => {
@@ -788,7 +1101,7 @@ describe("inline queued message mode actions", () => {
 		expect(button(en.queuedSendUrgently).disabled).toBe(false);
 		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
 		expect(document.body.textContent).toContain(queued.text);
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("failed messages cannot urgently stop work before an explicit retry", async () => {
@@ -806,7 +1119,7 @@ describe("failed queued message retry UI", () => {
 		expect(document.body.textContent).toContain(en.queuedFailed);
 		expect(document.body.textContent).toContain("Provider refused request");
 		expect(document.body.textContent).toContain("Original input");
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 		expect(button(en.queuedRetry).disabled).toBe(false);
 		for (const state of ["queued", undefined] as const) {
 			await render(
@@ -881,7 +1194,7 @@ describe("failed queued message retry UI", () => {
 			expect(document.body.textContent).toContain("Retry network failure");
 			expect(document.body.textContent).toContain("Provider refused request");
 			expect(document.body.textContent).toContain("Original input");
-			expect(document.body.textContent).toContain("#file:a.ts:2-2");
+			expect(document.body.textContent).toContain("a.ts:2-2");
 			expect(notice).not.toHaveBeenCalled();
 			await click(retry);
 			expect(requests).toHaveLength(2);
@@ -910,7 +1223,7 @@ describe("failed queued message retry UI", () => {
 		await editRange(0, "Original input".length, "Changed draft");
 		await editorKey("Enter");
 		expect(save).toHaveBeenCalledTimes(1);
-		expect(textareaProps().textarea.value).toBe("Changed draft");
+		expect(textareaProps().textarea.value).toBe("Changed draft#file:a.ts:2-2");
 		expect(document.body.textContent).toContain("Provider refused request");
 		expect(retry).not.toHaveBeenCalled();
 	});
@@ -949,7 +1262,7 @@ describe("queued reference attachment editor", () => {
 		await render(
 			<QueuedAttachmentPreview images={[]} textFiles={[]} fileReferences={[reference]} />,
 		);
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("queued pure references retain metadata and support occurrence deletion", async () => {
@@ -985,7 +1298,7 @@ describe("queued reference attachment editor", () => {
 		if (!save) throw new Error("Queued save button missing");
 		expect(save.disabled).toBe(false);
 		await click(save);
-		expect(payloads[0].fileReferences).toEqual([secondReference]);
+		expect(payloads[0].fileReferences).toMatchObject([secondReference]);
 		expect(cancel).not.toHaveBeenCalled();
 		await click(button(`${en.removeFile}: a.ts`));
 		expect(save.disabled).toBe(true);
@@ -1092,7 +1405,7 @@ describe("urgent dispatch real hook and panel", () => {
 				expect(urgent?.textContent).toContain(strings.queuedUrgentSending);
 				expect(urgent?.textContent).toContain("peer");
 				expect(urgent?.textContent).toContain("notes.txt");
-				expect(urgent?.textContent).toContain("#file:a.ts:2-2");
+				expect(urgent?.textContent).toContain("a.ts:2-2");
 				expect(urgent?.querySelectorAll("[data-queue-image]")).toHaveLength(2);
 				for (const image of ["one.png", "two.png"])
 					expect(urgent?.querySelector(`img[alt="${image}"]`)).not.toBeNull();
@@ -1239,7 +1552,7 @@ describe("real queued panel composition", () => {
 			// A buffer_set also replaces summary objects; this must not re-seed drafts.
 			messages = messages.map((message) => ({ ...message }));
 			await render(view());
-			expect(host?.querySelector("textarea")).not.toBeNull();
+			expect(host?.querySelector(".ProseMirror")).not.toBeNull();
 			expect(textareaProps().textarea.value).toBe("Unsaved body");
 			expect(textareaProps().textarea).toBe(textareaBefore);
 			expect(host?.querySelector('img[alt="draft.gif"]')).not.toBeNull();
@@ -1249,6 +1562,11 @@ describe("real queued panel composition", () => {
 			expect(save.mock.calls[0][1]).toBe("Unsaved body");
 			expect(save.mock.calls[0][2].newImages).toEqual([image]);
 			expect(save.mock.calls[0][2].newTextFiles).toEqual([textFile]);
+			// Attachments and text now share native history: first undo removes the
+			// single multi-file insertion, second undo restores the text transaction.
+			await editorKey("z", true);
+			expect(textareaProps().textarea.value).toBe("Unsaved body");
+			expect(host?.querySelector('img[alt="draft.gif"]')).toBeNull();
 			await editorKey("z", true);
 			expect(textareaProps().textarea.value).toBe("Original");
 			if (collapsedSingle) {
@@ -1263,7 +1581,7 @@ describe("real queued panel composition", () => {
 				editingQueuedId = null;
 				await render(view());
 				// Once editing ends, the unchanged user's collapsed preference takes effect.
-				expect(host?.querySelector("textarea")).toBeNull();
+				expect(host?.querySelector(".ProseMirror")).toBeNull();
 				expect(toggle.getAttribute("aria-expanded")).toBe("false");
 				expect(toggle.disabled).toBe(false);
 				expect(host?.textContent).not.toContain("New arrival");

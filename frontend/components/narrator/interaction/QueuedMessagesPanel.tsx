@@ -16,6 +16,7 @@ import type { BufferMessageSummary } from "../../../lib/api";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { QueuedMessageRow } from "./QueuedMessageRow";
 import { queuedMessageMode } from "./queue-message-mode";
+import type { QueuedEditPayload } from "./queued-attachment-edit";
 import type { UrgentDispatch } from "./use-queued-message-actions";
 
 export interface QueuedMessagesData {
@@ -31,12 +32,7 @@ export interface QueuedMessagesData {
 	handleSaveEditQueued: (
 		msg: BufferMessageSummary,
 		text: string,
-		payload: {
-			keepImageIds: string[];
-			keepTextFiles: { index: number; filename: string }[];
-			newImages: File[];
-			newTextFiles: File[];
-		},
+		payload: QueuedEditPayload,
 	) => Promise<boolean>;
 	handleCancelEditQueued: () => void;
 	handleStartEditQueued: (msg: BufferMessageSummary) => void;

@@ -1,4 +1,12 @@
 {
+	"composerAttachmentInsertionExpired": "附件处理期间草稿已切换，未插入任何附件，请重新添加。",
+	"composerAttachmentsProcessing": "附件仍在处理中，请稍后发送。",
+	"composerMissingAssets": "附件资源缺失，请重新选择文件或移除对应节点。",
+	"attachments": { "missing": "附件需重新选择" },
+	"richComposer": {
+		"collapse": "退出全屏",
+		"optimizeChanged": "草稿已变化，或优化结果无法保留文本分段。未替换任何内容，请重试。"
+	},
 	"tokendanceBalance": "余额 ¥{{balance}}",
 	"tokendanceBalanceUnknown": "余额暂不可用",
 	"tokendanceBalanceDetails": "累计充值 ¥{{credits}}\n已消耗 ¥{{used}}\n剩余 ¥{{balance}}",
@@ -370,11 +378,12 @@
 			"merged": "{{count}} 段内容"
 		},
 		"add": "引用",
-		"addHint": "引用选中内容（Alt+Q）",
+		"addHint": "引用选中内容（Tab）",
 		"dismiss": "忽略",
 		"remove": "移除引用",
 		"limit": "每条消息最多引用 {{count}} 段内容。",
 		"fileUnsaved": "保存文件后才能引用该选区",
+		"fileUnavailable": "当前预览无法校验保存内容，请打开完整文件后引用。",
 		"addFailed": "无法添加引用",
 		"placeholder": "针对引用内容提问…",
 		"open": "定位到引用内容"

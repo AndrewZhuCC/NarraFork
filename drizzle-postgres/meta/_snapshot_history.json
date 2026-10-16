@@ -171,19 +171,19 @@
 		},
 		{
 			"idx": 21,
-			"tag": "0021_context_character_covering_index",
-			"id": "e3f4b979-4abf-491f-a015-5a1912dc077e",
+			"tag": "0021_rich_composer_document",
+			"id": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
 			"prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
 			"version": "7",
-			"snapshotDigest": "f5a26d8079f5186cc3737fe4fa55034a07432cf688a416f47f717acbb46f690a"
+			"snapshotDigest": "3c80d720f39991d0d854ae8fb218d53dcd253d49bd4aa9c3a655536cb487d123"
 		},
 		{
 			"idx": 22,
 			"tag": "0022_context_numeric_stats",
-			"id": "43a4d822-79d0-46ef-abb4-dadd921e37c2",
-			"prevId": "e3f4b979-4abf-491f-a015-5a1912dc077e",
+			"id": "3fc16cee-d009-4621-8ff8-75080ec7d211",
+			"prevId": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
 			"version": "7",
-			"snapshotDigest": "5a6c796d4a2fc3bee13c2da4730e14672d49e9fbc6d5e826376639076936627b"
+			"snapshotDigest": "0f56b1fc448b5bc0a187faa9e0649ca59003698b49141c0b733242eaeed2cc9c"
 		}
 	]
 }

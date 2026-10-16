@@ -63,6 +63,8 @@ export interface VListRowHandlers {
 			newImages: File[];
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
+			fileReferences?: import("@shared/file-reference").FileReference[];
+			composerDocument?: import("@shared/composer-document").ComposerDocument;
 		},
 	) => Promise<boolean>;
 	/** Persist edited ASSISTANT text without truncating later messages. */

@@ -523,10 +523,22 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 123 tables and 1742 columns including resource protection and bulk token maintenance", () => {
+	test("covers 123 tables and 1744 columns including composer layouts", () => {
 		expect(target.tables.length).toBe(123);
-		// 1739 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1742);
+		// 1741 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1744);
+		for (const name of ["narrator_drafts", "narrator_messages"]) {
+			expect(
+				target.tables
+					.find((table) => table.name === name)
+					?.columns.find((column) => column.property === "composerDocument"),
+			).toMatchObject({
+				name: "composer_document",
+				mode: "json",
+				pgType: "text",
+				notNull: false,
+			});
+		}
 		expect(
 			target.tables
 				.find((table) => table.name === "knowledge_injection_events")
