@@ -35,6 +35,8 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 
 **开发需要两个进程：** `bun run dev`（后端）和 `bun run dev:frontend`（前端）。也可用 `bun run dev:all` 一条命令同时启动两者（自动处理跨平台信号转发）。
 
+**测试范围（严格遵守）：** 默认只跑与改动最相关的几个测试文件/目录（如 `bun test --isolate server/services/__tests__/knowledge-*`），**不要在本地跑全量测试**——全仓 1000+ 文件、单机串行约半小时以上。全量回归交给 CI：提 PR 后由 CI（4 分片并行）跑全量，以 CI 结果判断是否有回归。仅在用户明确要求时才本地跑全量，此时用 `bun test --parallel=<核数> --timings=.github/test-timings.json`，且确保仓库内没有 `.claude/worktrees/` 等嵌套工作副本（否则测试会被重复扫描）。`--changed` 在本仓库几乎选中大半文件，不能当作快速子集。
+
 **测试要点：** 单文件全绿、混跑失败 = 测试间原型污染，加 `--isolate` 复跑（详见 docs/TESTING.md）。移动被 `readFileSync` 类守卫测试引用的源文件后，必须全仓搜索旧路径字符串——类型检查和构建都不会发现（详见 docs/TESTING.md）。
 
 **运行中 NarraFork 进程铁律（最高优先级）：**
