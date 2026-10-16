@@ -377,6 +377,17 @@
 	"driftTakeMainHint": "适用于主线已经覆盖了你要写的内容，你只想跟上最新版本的情况。",
 	"driftTakeMainDone": "个人版本已与主线一致",
 
+	"authorSubmissionsHint": "这些是你的发布请求。审核者的意见列在每一条上。",
+	"reviewNoticeSection": "知识库审核",
+	"reviewNoticeInbox_one": "{{count}} 条提交正在等待你审核",
+	"reviewNoticeInbox_other": "{{count}} 条提交正在等待你审核",
+	"reviewNoticeInboxCapped": "{{count}}+ 条提交正在等待你审核",
+	"reviewNoticeAwaiting": "有一条提交正在等待你审核",
+	"reviewNoticeOutcome_approved": "你的提交已通过并发布",
+	"reviewNoticeOutcome_rejected": "你的提交已被拒绝",
+	"reviewNoticeOutcome_changes_requested": "审核者要求修改",
+	"reviewNoticeOpenCenter": "打开审核中心",
+
 	"reviewScopeTitle": "你的审核范围",
 	"reviewScopeAdmin": "你是管理员：可以审核所有发布请求。",
 	"reviewScopeNone": "你没有任何审核授权，也不能向任何集合发布，因此不会有内容分配给你审核。可以联系管理员申请审核标签或集合写权限。",

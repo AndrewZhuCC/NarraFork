@@ -36,13 +36,14 @@ import {
 	IconUserShare,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EntryAclPanel } from "../../components/knowledge/EntryAclPanel";
 import { EntryMetaPanel } from "../../components/knowledge/EntryMetaPanel";
 import { ReviewScopeNotice } from "../../components/knowledge/ReviewScopeNotice";
 import { SubmissionAuthorActions } from "../../components/knowledge/SubmissionAuthorActions";
+import { SubmissionFindings } from "../../components/knowledge/SubmissionFindings";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { DiffView } from "../../components/narrator/diff/DiffView";
@@ -71,6 +72,12 @@ import {
 import type { KnowledgeEntry, KnowledgeEntryLink, KnowledgeLinkType } from "../../lib/api";
 import { api } from "../../lib/api";
 import { formatLocaleDateTime } from "../../lib/intl-format";
+import {
+	initialSubmissionSelection,
+	knowledgeSubmissionHash,
+	parseKnowledgeEntryHash,
+	submissionTabNotice,
+} from "../../lib/knowledge-review-nav";
 
 function LinksSummary({ entryId }: { entryId: string }) {
 	const { t } = useTranslation("knowledge");
@@ -227,7 +234,20 @@ function EntryDetailPage() {
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
 	const entry = useKnowledgeEntry(entryId);
-	const [activeTab, setActiveTab] = useState<string | null>("content");
+	// The hash is the tab state. Review center and the bell link here with
+	// `#submissions/<id>` so a reload lands on the verdict panel, not Content.
+	const hash = useRouterState({ select: (s) => s.location.hash });
+	const locationTarget = parseKnowledgeEntryHash(hash);
+	const activeTab = locationTarget.tab;
+
+	const goTab = (value: string | null) => {
+		navigate({
+			to: "/knowledge/$entryId",
+			params: { entryId },
+			hash: !value || value === "content" ? "content" : value,
+			replace: true,
+		});
+	};
 
 	if (entry.isLoading) {
 		return (
@@ -284,7 +304,7 @@ function EntryDetailPage() {
 			<Grid gap="lg">
 				{/* Left Column: Content, Draft, History, Submissions, Links tabs */}
 				<Grid.Col span={{ base: 12, md: 8, lg: 9 }}>
-					<Tabs value={activeTab} onChange={setActiveTab} keepMounted={false}>
+					<Tabs value={activeTab} onChange={goTab} keepMounted={false}>
 						<Tabs.List mb="md">
 							<Tabs.Tab value="content">{t("tabContent")}</Tabs.Tab>
 							<Tabs.Tab value="draft">{t("tabMyDraft")}</Tabs.Tab>
@@ -307,7 +327,19 @@ function EntryDetailPage() {
 							<DraftTab entryId={entryId} mainContent={e.currentContent ?? ""} />
 						</Tabs.Panel>
 						<Tabs.Panel value="submissions">
-							<SubmissionsTab entryId={entryId} mainContent={e.currentContent ?? ""} />
+							<SubmissionsTab
+								entryId={entryId}
+								mainContent={e.currentContent ?? ""}
+								focusSubmissionId={locationTarget.submissionId}
+								onSelectSubmission={(id) =>
+									navigate({
+										to: "/knowledge/$entryId",
+										params: { entryId },
+										hash: knowledgeSubmissionHash(id),
+										replace: true,
+									})
+								}
+							/>
 						</Tabs.Panel>
 						<Tabs.Panel value="links">
 							<LinksTab entryId={entryId} collectionId={e.collectionId} />
@@ -335,7 +367,7 @@ function EntryDetailPage() {
 										{t("tabLinks")}
 									</Text>
 									<Tooltip label={t("linkAdd")}>
-										<ActionIcon size="xs" variant="subtle" onClick={() => setActiveTab("links")}>
+										<ActionIcon size="xs" variant="subtle" onClick={() => goTab("links")}>
 											<IconExternalLink size={12} />
 										</ActionIcon>
 									</Tooltip>
@@ -893,7 +925,17 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 	);
 }
 
-function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent: string }) {
+function SubmissionsTab({
+	entryId,
+	mainContent,
+	focusSubmissionId,
+	onSelectSubmission,
+}: {
+	entryId: string;
+	mainContent: string;
+	focusSubmissionId: string | null;
+	onSelectSubmission: (submissionId: string) => void;
+}) {
 	const { t } = useTranslation("knowledge");
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
@@ -904,11 +946,22 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 	// or re-submit it from this tab).
 	const myDraft = useMyKnowledgeDraft(entryId);
 	const mine = usePersonalEntrySubmissions(myDraft.data?.id);
-	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [selectedId, setSelectedId] = useState<string | null>(focusSubmissionId);
 	const detail = useKnowledgeSubmission(selectedId ?? undefined);
 
 	const reviewable = list.data ?? [];
 	const ownRows = mine.data ?? [];
+	const notice = submissionTabNotice({
+		isAdmin,
+		reviewableCount: reviewable.length,
+		ownCount: ownRows.length,
+	});
+	// Own history loads after the reviewer list. Don't flash the "you have no review
+	// grants" explainer at an author whose request has not arrived yet.
+	const waitingForOwn =
+		!isAdmin &&
+		reviewable.length === 0 &&
+		(myDraft.isLoading || (!!myDraft.data && mine.isLoading));
 	// Merge both views, de-duplicated (an admin sees their own request in both), newest first.
 	const submissions = useMemo(() => {
 		const byId = new Map(reviewable.map((s) => [s.id, s]));
@@ -916,10 +969,25 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 		return [...byId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 	}, [reviewable, ownRows]);
 
+	useEffect(() => {
+		const next = initialSubmissionSelection({
+			focusSubmissionId,
+			current: selectedId,
+			rows: submissions,
+		});
+		if (next !== selectedId) setSelectedId(next);
+	}, [focusSubmissionId, selectedId, submissions]);
+
 	return (
 		<Group align="flex-start" gap="md" wrap="nowrap">
 			<Stack gap="xs" w={260} style={{ flexShrink: 0 }}>
-				<ReviewScopeNotice />
+				{waitingForOwn ? null : notice === "author" ? (
+					<Alert color="blue" variant="light" p="xs">
+						<Text size="xs">{t("authorSubmissionsHint")}</Text>
+					</Alert>
+				) : (
+					<ReviewScopeNotice />
+				)}
 				{submissions.length === 0 ? (
 					<Text size="sm" c="dimmed">
 						{t("noSubmissions")}
@@ -936,7 +1004,10 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 										cursor: "pointer",
 										borderColor: s.id === selectedId ? "var(--mantine-color-blue-5)" : undefined,
 									}}
-									onClick={() => setSelectedId(s.id)}
+									onClick={() => {
+										setSelectedId(s.id);
+										onSelectSubmission(s.id);
+									}}
 								>
 									<Group justify="space-between" wrap="nowrap">
 										<Text size="xs" truncate="end">
@@ -965,6 +1036,7 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 											</Badge>
 										</Group>
 									</Group>
+									<SubmissionFindings findings={s.findingsJson} />
 									{/* Author-side actions: withdraw an open request, re-submit a bounced one.
 									    Rendered per row so they are reachable without opening the detail
 									    panel (which is the reviewer surface). */}

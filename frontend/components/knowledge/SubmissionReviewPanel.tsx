@@ -25,6 +25,7 @@ import type {
 	KnowledgeVerdict,
 } from "../../lib/api";
 import { DiffView } from "../narrator/diff/DiffView";
+import { SubmissionFindings } from "./SubmissionFindings";
 
 interface Props {
 	submission: KnowledgeSubmissionDetail;
@@ -130,6 +131,8 @@ export function SubmissionReviewPanel({ submission, currentContent, canReview, o
 						wordWrap
 					/>
 				</div>
+
+				<SubmissionFindings findings={submission.findingsJson} />
 
 				{isConflict ? (
 					<Stack gap="sm">
