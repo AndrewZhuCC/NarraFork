@@ -74,14 +74,19 @@ describe("persisted context characters", () => {
 		).toEqual({ segments: [{ category: "attachment", chars: 6 }] });
 	});
 
-	test("reasoning is assistant text, native model projections are system text", () => {
+	test("reasoning and visible assistant text are counted separately", () => {
 		expect(
 			measureMessageCharacters("assistant", [
 				{ type: "reasoning", text: "thought", translatedText: "not model-facing" },
 				{ type: "thinking", thinking: "more" },
 				{ type: "text", text: "answer" },
 			]),
-		).toEqual({ segments: [{ category: "assistant", chars: 17 }] });
+		).toEqual({
+			segments: [
+				{ category: "reasoning", chars: 11 },
+				{ category: "assistant", chars: 6 },
+			],
+		});
 		expect(
 			measureMessageCharacters("sys", [
 				{ type: "system_injection", modelText: "projection", body: { text: "UI" } },
@@ -169,7 +174,7 @@ test("new flat bodies, reasoning aliases and tool markers retain their character
 		]),
 	).toEqual({
 		segments: [
-			{ category: "assistant", chars: 7 },
+			{ category: "reasoning", chars: 7 },
 			{ category: "toolCall", chars: 0, toolUseId: "alias" },
 			{ category: "assistant", chars: 4 },
 		],

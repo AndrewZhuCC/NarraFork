@@ -28,6 +28,7 @@ export const CONTEXT_COLORS: Record<ContextCategory, string> = {
 	toolDefinition: "violet",
 	user: "blue",
 	assistant: "teal",
+	reasoning: "cyan",
 	toolCall: "orange",
 	toolResult: "yellow",
 	attachment: "pink",

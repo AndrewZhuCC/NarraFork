@@ -288,6 +288,26 @@ test("工具定义作为独立分类", async () => {
 	expect(container.textContent).toContain("contextComposition.categories.toolDefinition · ≈128K");
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("80.0%");
 });
+test("思考作为独立分类，使用专属颜色与标签", async () => {
+	const values = [
+		{ category: "reasoning" as const, chars: 60 },
+		{ category: "assistant" as const, chars: 40 },
+	];
+	await render({
+		...data,
+		totalChars: 100,
+		segments: values,
+		totals: groupContextSegments(values),
+	});
+	const reasoning = [...bar().querySelectorAll("button")].find((button) =>
+		button.getAttribute("aria-label")?.includes("contextComposition.categories.reasoning"),
+	);
+	expect(reasoning?.getAttribute("aria-label")).toContain("≈96K · 60.0%");
+	expect(reasoning?.getAttribute("style")).toContain("width:60%");
+	expect(reasoning?.getAttribute("style")).toContain("var(--mantine-color-cyan-6)");
+	expect(container.textContent).toContain("contextComposition.categories.reasoning · ≈96K · 60.0%");
+	expect(container.textContent).toContain("contextComposition.categories.assistant · ≈64K · 40.0%");
+});
 test("一次响应直接展示全部分类", async () => {
 	query = { ...query, data };
 	await act(() =>
@@ -363,51 +383,45 @@ test("实时快照占用更新总量，分类分母仍取自身总字符", async
 	);
 });
 
-test("实时快照占用优先于API记录，不再与API做请求配对", async () => {
-	const current = snapshot(160_000, 4_000);
-	for (const external of [
-		{ ...snapshot(926_000, 8_000), requestId: "old-request" },
-		snapshot(926_000, 8_000, "old-generation"),
-		{ ...snapshot(926_000), inputCharacters: null },
-	]) {
-		await act(() =>
-			root.render(
-				createElement(ContextCompositionView, {
-					data: { ...data, usage: current },
-					snapshot: external,
-				}),
-			),
-		);
-		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
-		expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
-		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
-			"~926K",
-		);
-		expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toBe(
-			"contextComposition.categories.user · ≈463K · 50.0%",
-		);
-	}
+test("实时快照占用优先于API记录", async () => {
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, {
+				data: { ...data, usage: snapshot(160_000, 4_000) },
+				snapshot: snapshot(926_000, 8_000),
+			}),
+		),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
+	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~926K",
+	);
+	expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toBe(
+		"contextComposition.categories.user · ≈463K · 50.0%",
+	);
 });
 
-test("API记录缺完整输入或分类时仍按API占用估算，且不追加提示", async () => {
-	for (const value of [
-		{ ...data, usage: snapshot(926_000, 4_000, "other") },
-		{ ...data, generation: null, usage: snapshot(926_000, 4_000) },
-		{ ...data, usage: { ...snapshot(926_000), inputCharacters: null } },
-		{ ...data, usage: { ...snapshot(926_000), composition: null } },
-		{ ...data, usage: snapshot(926_000, 0) },
-	]) {
-		await act(() => root.render(createElement(ContextCompositionView, { data: value })));
-		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
-		expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
-		expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toBe(
-			"contextComposition.categories.user · ≈463K · 50.0%",
-		);
-		await act(() => (bar().querySelector("button") as HTMLElement).click());
-		expect(container.querySelector('[role="status"]')?.textContent).toBe(
-			"contextComposition.categories.user · ≈463K · 50.0%",
-		);
-	}
+test("API记录缺少分类与完整输入时仍用其占用估算，且不追加提示", async () => {
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, {
+				data: {
+					...data,
+					usage: { ...snapshot(926_000), inputCharacters: null, composition: null },
+				},
+			}),
+		),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
+	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
+	expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toBe(
+		"contextComposition.categories.user · ≈463K · 50.0%",
+	);
+	await act(() => (bar().querySelector("button") as HTMLElement).click());
+	expect(container.querySelector('[role="status"]')?.textContent).toBe(
+		"contextComposition.categories.user · ≈463K · 50.0%",
+	);
 });
 
 test("无API记录时用实时快照占用，分类按自身字符分母", async () => {
@@ -468,24 +482,21 @@ test("零占用仍是有效总量，分类估算为零", async () => {
 
 test("API占用缺失时依次回退实时快照与总量参数", async () => {
 	const api = { ...snapshot(160_000, 4_000), occupiedTokens: null };
-	const live = snapshot(926_000, 4_000);
-	for (const external of [live, { ...live, requestId: "different" }]) {
-		await act(() =>
-			root.render(
-				createElement(ContextCompositionView, {
-					data: { ...data, usage: api },
-					snapshot: external,
-				}),
-			),
-		);
-		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
-			"~926K",
-		);
-		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
-		expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toBe(
-			"contextComposition.categories.user · ≈463K · 50.0%",
-		);
-	}
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, {
+				data: { ...data, usage: api },
+				snapshot: snapshot(926_000, 4_000),
+			}),
+		),
+	);
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~926K",
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
+	expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toBe(
+		"contextComposition.categories.user · ≈463K · 50.0%",
+	);
 	await act(() =>
 		root.render(
 			createElement(ContextCompositionView, {

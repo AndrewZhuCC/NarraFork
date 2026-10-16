@@ -161,6 +161,7 @@
 			"toolDefinition": "Tool definitions",
 			"user": "User messages",
 			"assistant": "Assistant messages",
+			"reasoning": "Reasoning",
 			"toolCall": "Tool calls",
 			"toolResult": "Tool results",
 			"attachment": "Attachments",

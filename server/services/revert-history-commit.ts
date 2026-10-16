@@ -1339,7 +1339,10 @@ function measureCharacters(role, blocks, contentText) {
     add('attachment', block.text ?? block.content ?? block.source?.text);
     break;
    case 'thinking':
-    add(category, block.thinking ?? block.text);
+    add('reasoning', block.thinking ?? block.text);
+    break;
+   case 'reasoning': case 'reasoning_text': case 'thought':
+    add('reasoning', block.modelText ?? block.text);
     break;
    default:
     add(category, block.modelText ?? block.text);

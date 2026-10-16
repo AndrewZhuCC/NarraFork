@@ -161,6 +161,7 @@
 			"toolDefinition": "工具定义",
 			"user": "用户消息",
 			"assistant": "助手消息",
+			"reasoning": "思考",
 			"toolCall": "工具调用",
 			"toolResult": "工具结果",
 			"attachment": "附件",
