@@ -1,6 +1,6 @@
 # gen_ui 重设计：问题分析与方案草案
 
-> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1–4 步（改名、描述与报错、markup 状态绑定、阻塞表单）已实施，第 5 步待定。
+> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1–5 步全部已实施。
 > 材料：一次真实会话导出（deepseek-v4.1-flash 使用 IntelligentUI 的全过程）+ main 上的现有实现。
 
 ## 0. 现状速览
@@ -92,6 +92,8 @@
 - 只读表面（列表行、公开分享）保持现状不执行。
 - 构建：命中「工作区文件哈希未变」时复用上次产物（当前 `useIntelligentUI` 明确无缓存），减少点开/重进的构建开销。
 - App 也拿到宿主桥：帧内注入 `globalThis.genUI = { sendPrompt, submit }`（或 `import { submit } from "gen-ui"`），走与 markup 相同的 `ui-action` 消息；由于 App 是模型写的任意代码，**一律宿主确认**（与项目 kit 同策略）。
+
+已实施（第 5 步）：`show` 可带 `size`，结果元数据记录 `genUiShow.shownAt`，卡片按尺寸预留高度并在卡内运行 App；同一会话里最新且 15 分钟内的 App 自动启动，其余显示“运行”按钮，“放大”仍打开大窗。预览构建按“文件内容 + kit 哈希”缓存（8 条 / 16 MiB，只缓存通过全部校验的产物，鉴权每次照跑）。App 内可调 `globalThis.genUI.sendPrompt / submit / openLink`，宿主一律弹确认条后才发送。markup 卡片的输入在同一卡片的各个框之间共享（放大视图、滚出后重绘都保留）。`show` 暂不支持 `wait`：等待期间工具还没有返回文件引用，卡片无从显示。
 
 ### 2.3 值回传给 agent：两种语义
 

@@ -34,7 +34,7 @@ export const genUiParameters = z
 			input.action === "create"
 				? given("prefix") && only("prefix")
 				: input.action === "show"
-					? given("path") && only("path")
+					? given("path") && only("path", "size")
 					: input.action === "render"
 						? given("source") && only("source", "title", "size", "wait")
 						: input.action === "kit_build"
@@ -44,12 +44,12 @@ export const genUiParameters = z
 			ctx.addIssue({
 				code: "custom",
 				message:
-					"create takes only prefix; show takes only path; render takes source (+ title, size, wait); kit_build and kit_status take nothing",
+					"create takes only prefix; show takes path (+ size); render takes source (+ title, size, wait); kit_build and kit_status take nothing",
 			});
 	});
 export type GenUiInput =
 	| { action: "create"; prefix: string }
-	| { action: "show"; path: string }
+	| { action: "show"; path: string; size?: "sm" | "md" | "lg" }
 	| {
 			action: "render";
 			source: string;
@@ -73,7 +73,7 @@ render({title, size, wait, source}) — the default. Draws markup inline in the 
 - Put title and size before source: "sm" (240px), "md" (400px, default) or "lg" (580px).
 Example: <Stack gap="sm"><Title order={4}>Card corners</Title><Slider bind="radius" defaultValue={12} min={0} max={48} /><Card withBorder radius={$radius}><Text>border-radius: {$radius}px</Text></Card><TextInput bind="note" label="Note" /><Button onClick={submit("Use these settings")}>Apply</Button></Stack>
 
-create({prefix}) then show({path}) — a full React app, only when markup cannot do it (arithmetic or conditions on values, lists that grow, timers, live data). create writes ${GEN_UI_DIRECTORY}/<prefix>-<id>/App.tsx. Edit it with the normal file tools: default-export a component; import react, @mantine/core, @mantine/hooks and relative files, or "kit" when the project has a kit; no other packages and no host API. Then show the directory. The user sees a card with an "Open preview" button: the app is built and runs only when they click it, and nothing in it reaches you.
+create({prefix}) then show({path, size}) — a full React app, only when markup cannot do it (arithmetic or conditions on values, lists that grow, timers, live data). create writes ${GEN_UI_DIRECTORY}/<prefix>-<id>/App.tsx. Edit it with the normal file tools: default-export a component; import react, @mantine/core, @mantine/hooks and relative files, or "kit" when the project has a kit; no other packages. Then show the directory: the app is built and runs inside the chat (only the latest one starts by itself; older ones wait for a click). To reach you, call globalThis.genUI.sendPrompt(text), genUI.submit(values, message?) or genUI.openLink(url) from a click handler; the user confirms each before it is sent.
 
 kit_status() — optional: the project kit's components with props and examples, or how to author one. kit_build() — builds the project kit from ${GEN_UI_DIRECTORY}/kit/kit.json with the project's own Vite once the user confirms in the chat. The confirmation is requested for you; never ask for it repeatedly. A bundle you build yourself is never used.
 
@@ -98,7 +98,7 @@ Never put secrets in UI.`,
 		},
 	},
 	formatValidationError: () =>
-		"Use {action:'render',title,size,wait,source}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx'}.",
+		"Use {action:'render',title,size,wait,source}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx',size}.",
 	async execute(args, ctx) {
 		try {
 			const { executeGenUiTool } = await import("@server/services/gen-ui/runtime");

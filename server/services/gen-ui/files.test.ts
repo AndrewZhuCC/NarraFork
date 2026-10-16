@@ -196,9 +196,17 @@ describe("ordinary GenUI workspace files", () => {
 			lexicalPath: directory,
 			canonicalPath: directory,
 		};
-		const result = await executeGenUiTool({ action: "show", path: directory }, ctx, deps);
-		expect(result.output).toStartWith("Preview:");
-		expect(result.output).toContain('"Open preview" button');
+		const result = await executeGenUiTool(
+			{ action: "show", path: directory, size: "lg" },
+			ctx,
+			deps,
+		);
+		expect(result.output).toStartWith("Shown:");
+		expect(result.output).toContain("Only the latest app starts by itself");
+		expect(result.metadata?.genUiShow).toMatchObject({ version: 1, size: "lg" });
+		expect(
+			Date.now() - Date.parse((result.metadata?.genUiShow as { shownAt: string }).shownAt),
+		).toBeLessThan(5000);
 		expect(events).toEqual([`read:${directory}/App.tsx`]);
 	});
 	test("rejects stale workspace and offline/legacy remote without local fallback", async () => {

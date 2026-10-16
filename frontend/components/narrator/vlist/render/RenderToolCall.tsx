@@ -2053,6 +2053,7 @@ export function RenderToolBody({
 							}
 				}
 				kit={model.kit}
+				appShownAt={model.appShownAt}
 				height={height}
 			/>
 		);

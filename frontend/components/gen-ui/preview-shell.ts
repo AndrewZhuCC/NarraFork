@@ -138,6 +138,14 @@ export function createPreviewShell(
     const tokens = style(config.kit ? "" : config.theme.tokenCss);
     if (!config.kit) document.documentElement.dataset.mantineColorScheme = config.theme.colorScheme;
     script(config.runtimeJs);
+    // The app's way to reach the conversation. Filled in once the actions exist below;
+    // the host asks the reader to confirm everything an app sends.
+    const bridge = {};
+    if (config.mode === "app") globalThis.genUI = Object.freeze({
+      sendPrompt: (text) => bridge.sendPrompt?.(text),
+      submit: (values, message) => bridge.submit?.(values, message),
+      openLink: (url) => bridge.openLink?.(url),
+    });
     if (config.mode === "app") script(config.js);
     // Drop the bootstrap's duplicate source strings once the browser has parsed them.
     config.runtimeJs = config.runtimeCss = config.js = config.css = "";
@@ -206,6 +214,9 @@ export function createPreviewShell(
       if (action === "openLink") return act(action, value);
       const fields = {};
       for (const [name, current] of state) fields[name] = plain(current);
+      submitFields(value, fields);
+    };
+    const submitFields = (value, fields) => {
       // The host sends at most 2000 characters, so each field is cut on its own rather
       // than the last ones disappearing behind a long first answer.
       const names = Object.keys(fields);
@@ -216,8 +227,14 @@ export function createPreviewShell(
       });
       act("submit", [value.trim(), ...lines].filter(Boolean).join("\\n"), {fields, message: value.trim()});
     };
-    // A change reaches a bound control as an event (inputs, checkboxes) or as the value
-    // itself (Select, Slider, SegmentedControl, Tabs…).
+    bridge.sendPrompt = (text) => act("sendPrompt", String(text ?? ""));
+    bridge.openLink = (url) => act("openLink", String(url ?? ""));
+    bridge.submit = (values, message) => {
+      const fields = {};
+      if (values && typeof values === "object" && !Array.isArray(values))
+        for (const name of Object.keys(values).slice(0, 200)) if (stateName.test(name)) fields[name] = plain(values[name]);
+      submitFields(typeof message === "string" ? message : "", fields);
+    };
     // What the reader has set goes to the host, which hands it to another frame of the same
     // card (the expanded view, or the card drawn again after scrolling away).
     const share = () => {
@@ -234,6 +251,8 @@ export function createPreviewShell(
       }
       rerender();
     };
+    // A change reaches a bound control as an event (inputs, checkboxes) or as the value
+    // itself (Select, Slider, SegmentedControl, Tabs…).
     const changed = (input, checkable) => {
       const target = input && typeof input === "object" && !Array.isArray(input) && (input.currentTarget || input.target);
       if (target && typeof target === "object" && "value" in target) return checkable ? !!target.checked : target.value;

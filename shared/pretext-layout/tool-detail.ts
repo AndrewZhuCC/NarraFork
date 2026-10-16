@@ -525,6 +525,11 @@ export interface ToolGenUiDetail {
 	formToolUseId?: string;
 	/** The `render` call's id: every frame drawing it shares what the reader entered. */
 	stateKey?: string;
+	/**
+	 * When a `show` call put its app in the chat. The card runs the app in place, and only
+	 * the most recent app starts without a click.
+	 */
+	appShownAt?: string;
 }
 
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
@@ -922,6 +927,13 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				}
 			: {}),
 	};
+	const uiShowMeta = toolName === "GenUI" ? asObject(metadata?.genUiShow) : undefined;
+	const uiShow =
+		uiShowMeta?.version === 1 &&
+		typeof uiShowMeta.shownAt === "string" &&
+		!Number.isNaN(Date.parse(uiShowMeta.shownAt))
+			? { shownAt: uiShowMeta.shownAt, size: uiShowMeta.size }
+			: null;
 	const uiInput = toolName === "GenUI" ? asObject(fields) : undefined;
 	// A call that failed, was refused or was stopped drew nothing the reader should take
 	// for an answer: its status and error text are the body instead.
@@ -960,6 +972,12 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 					// Select the visible copy, not an origin PK retained in immutable tool output.
 					// The server checks both visibility and the copy's trusted provenance column.
 					file: uiFile && input.toolCallId ? { ...uiFile, toolCallId: input.toolCallId } : uiFile,
+					...(uiShow && uiFile
+						? {
+								appShownAt: uiShow.shownAt,
+								contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiShow.size)],
+							}
+						: {}),
 					...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
 					...uiKitFields,
 				})

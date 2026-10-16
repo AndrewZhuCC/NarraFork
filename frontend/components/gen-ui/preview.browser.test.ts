@@ -31,6 +31,7 @@ interface FixtureControls {
 	login(): void;
 	switchAccount(): void;
 	tokens(css: string): void;
+	show(shownAt: string | undefined): void;
 }
 declare global {
 	interface Window {

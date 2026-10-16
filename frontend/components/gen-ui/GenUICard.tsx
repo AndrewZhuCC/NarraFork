@@ -13,6 +13,9 @@ const FilePreview = lazy(() =>
 const InlineRender = lazy(() =>
 	import("./InlineRender").then((module) => ({ default: module.InlineRender })),
 );
+const AppFrame = lazy(() =>
+	import("./FilePreview").then((module) => ({ default: module.AppFrame })),
+);
 const KitNoticeBar = lazy(() =>
 	import("./KitNoticeBar").then((module) => ({ default: module.KitNoticeBar })),
 );
@@ -42,6 +45,8 @@ export interface GenUICardProps {
 	};
 	/** The kit this result used, and any build the user is being asked to confirm. */
 	kit?: GenUiKitNotice;
+	/** A `show` call: the app runs in the card, and when it was shown decides if it starts. */
+	appShownAt?: string;
 }
 
 /** List rows and public shares never mount a preview, fetch source or execute an iframe. */
@@ -55,6 +60,19 @@ export function GenUICard(props: GenUICardProps) {
 				key={props.narratorId}
 				narratorId={props.narratorId}
 				inline={props.inline}
+				kit={props.kit}
+				height={props.height}
+			/>
+		);
+	}
+	if (usable && props.narratorId && props.file && props.appShownAt) {
+		return (
+			<AppCard
+				key={`${props.narratorId}:${props.file.toolCallId}`}
+				narratorId={props.narratorId}
+				file={props.file}
+				shownAt={props.appShownAt}
+				historyUnavailable={props.historyUnavailable}
 				kit={props.kit}
 				height={props.height}
 			/>
@@ -295,5 +313,131 @@ function PrivateCard({
 					</Modal>
 				))}
 		</>
+	);
+}
+
+/** An app shown longer ago than this waits for a click, even as the newest. */
+const AUTO_RUN_WINDOW_MS = 15 * 60_000;
+const newestShown = new Map<string, number>();
+
+/**
+ * Only the newest app in a conversation starts by itself, and only while it is recent:
+ * scrolling back through history must not build and run every app it passes, nor run
+ * code the agent has long since moved on from.
+ */
+function startsByItself(narratorId: string, shownAt: string): boolean {
+	const at = Date.parse(shownAt);
+	const newest = Math.max(newestShown.get(narratorId) ?? 0, at);
+	newestShown.set(narratorId, newest);
+	if (newestShown.size > 50) newestShown.delete(newestShown.keys().next().value as string);
+	return at === newest && Date.now() - at < AUTO_RUN_WINDOW_MS;
+}
+
+function AppCard({
+	narratorId,
+	file,
+	shownAt,
+	height,
+	historyUnavailable,
+	kit,
+}: {
+	narratorId: string;
+	file: GenUiFileReference;
+	shownAt: string;
+	height: number;
+	historyUnavailable?: boolean;
+	kit?: GenUiKitNotice;
+}) {
+	const { t } = useTranslation("narrator");
+	const mobile = useMobileViewport();
+	const [running, setRunning] = useState(() => startsByItself(narratorId, shownAt));
+	const [run, setRun] = useState(0);
+	const [expanded, setExpanded] = useState(false);
+	useEffect(() => {
+		if (!running && !expanded) return;
+		const stop = () => {
+			setRunning(false);
+			setExpanded(false);
+		};
+		const unsubscribe = onTokenChange(stop);
+		const onStorage = (event: StorageEvent) => {
+			if (event.key === "narrafork_token" || event.key === null) stop();
+		};
+		window.addEventListener("storage", onStorage);
+		return () => {
+			unsubscribe();
+			window.removeEventListener("storage", onStorage);
+		};
+	}, [running, expanded]);
+	const title = file.title || t("genUi.title");
+	const path = `${file.directory.replace(/[\\/]$/, "")}/${file.entry}`;
+	const notice = kit?.request ? NOTICE_ROW : 0;
+	const bodyHeight = Math.max(60, height - INLINE_HEADER - notice);
+	const preview = expanded ? (
+		<Suspense fallback={<Loader size="sm" />}>
+			<FilePreview narratorId={narratorId} file={file} />
+		</Suspense>
+	) : null;
+	return (
+		<Box h={height} style={{ overflow: "hidden" }}>
+			<Group h={INLINE_HEADER} px="xs" gap="xs" wrap="nowrap" justify="space-between">
+				<Text fw={600} size="xs" truncate title={title} style={{ minWidth: 0 }}>
+					{title}
+				</Text>
+				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						onClick={() => {
+							// Run again from the files as they are now.
+							setRunning(true);
+							setRun((value) => value + 1);
+						}}
+					>
+						{t(running ? "genUi.reload" : "genUi.run")}
+					</Button>
+					<Button size="compact-xs" variant="subtle" onClick={() => setExpanded(true)}>
+						{t("genUi.expand")}
+					</Button>
+				</Group>
+			</Group>
+			{kit?.request && (
+				<Box px="xs">
+					<Suspense fallback={<Box h={NOTICE_ROW} />}>
+						<KitNoticeBar narratorId={narratorId} notice={kit} />
+					</Suspense>
+				</Box>
+			)}
+			{running ? (
+				<Suspense fallback={null}>
+					<AppFrame key={run} narratorId={narratorId} file={file} height={bodyHeight} />
+				</Suspense>
+			) : (
+				<Box px="xs" h={bodyHeight}>
+					<Text size="xs" c="dimmed" truncate title={path}>
+						{path}
+					</Text>
+					<Text size="xs" c={historyUnavailable ? "orange" : "dimmed"}>
+						{t(historyUnavailable ? "genUi.historyUnavailable" : "genUi.notRunning")}
+					</Text>
+				</Box>
+			)}
+			{expanded &&
+				(mobile ? (
+					<Drawer
+						opened
+						onClose={() => setExpanded(false)}
+						title={title}
+						position="bottom"
+						size="90%"
+					>
+						{preview}
+					</Drawer>
+				) : (
+					<Modal opened onClose={() => setExpanded(false)} title={title} size="90%">
+						{preview}
+					</Modal>
+				))}
+		</Box>
 	);
 }

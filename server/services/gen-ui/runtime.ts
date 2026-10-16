@@ -264,11 +264,20 @@ export async function executeGenUiTool(
 		output:
 			input.action === "create"
 				? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory. The user sees nothing until you show it.${fileMetadata?.fileChangeHistoryUnavailable ? " Remote file-change journal is unavailable; this creation cannot be reverted through message history." : ""}`
-				: `Preview: ${directory}/App.tsx. The user sees a card with an "Open preview" button; the app is built and runs only when they click it, from the files as they are then. Nothing the app does reaches you. Tell the user to open the preview rather than describing it as already on screen.`,
+				: `Shown: ${directory}/App.tsx. The app is built from the files as they are now and runs inside the chat, where the user sees it. Only the latest app starts by itself: an older one, or one opened again later, waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them.`,
 		title: reference.title,
 		metadata: {
 			...fileMetadata,
 			genUi: reference,
+			...(input.action === "show"
+				? {
+						genUiShow: {
+							version: 1,
+							shownAt: new Date().toISOString(),
+							size: input.size ?? "md",
+						},
+					}
+				: {}),
 			...(kitNotice ? { genUiKit: kitNotice } : {}),
 		},
 	};

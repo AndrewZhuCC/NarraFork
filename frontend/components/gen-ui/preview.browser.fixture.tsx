@@ -30,6 +30,15 @@ await i18n.init({
 						"Do not preview secret files or enter passwords or tokens; code may navigate away.",
 					navigationStopped: "Preview navigated away; a request may already have been sent.",
 					historyUnavailable: "Current files · history rollback unavailable",
+					run: "Run",
+					notRunning: "Not running",
+					expand: "Expand",
+					promptConfirm: "Send this to the chat? {{text}}",
+					promptSend: "Send",
+					linkConfirm: "Open {{url}}?",
+					linkOpen: "Open",
+					cancel: "Cancel",
+					sendFailed: "Send failed",
 				},
 			},
 		},
@@ -41,11 +50,13 @@ function Fixture() {
 	const [scheme, setScheme] = useState<"light" | "dark">("dark");
 	const [mounted, setMounted] = useState(true);
 	const [shared, setShared] = useState(false);
+	const [shownAt, setShownAt] = useState<string | undefined>(undefined);
 	Object.assign(window, {
 		previewFixture: {
 			theme: setScheme,
 			mount: setMounted,
 			share: setShared,
+			show: setShownAt,
 			logout: clearToken,
 			login: () => setToken("fixture-private-token"),
 			switchAccount: () => setToken("fixture-other-account"),
@@ -74,7 +85,8 @@ function Fixture() {
 							narratorId="narrator/id"
 							file={fileReference}
 							publicSummary={shared}
-							height={88}
+							appShownAt={shownAt}
+							height={shownAt ? 400 : 88}
 						/>
 					)}
 				</RenderLodCtx.Provider>

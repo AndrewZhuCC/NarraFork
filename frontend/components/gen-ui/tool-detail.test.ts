@@ -74,6 +74,28 @@ describe("GenUI file preview classification", () => {
 		})?.sections[0].body;
 		expect(plain).not.toHaveProperty("formToolUseId");
 	});
+	test("a shown app reserves room to run in the card; a created one stays a small card", () => {
+		const shownAt = "2026-10-16T19:00:00.000Z";
+		const shown = classifyToolDetail({
+			toolName: "GenUI",
+			toolUseId: fileReference.toolUseId,
+			category: "generic",
+			status: "completed",
+			inputJson: { action: "show", path: "App.tsx", size: "lg" },
+			metadata: { genUi: fileReference, genUiShow: { version: 1, shownAt, size: "lg" } },
+		})?.sections[0].body;
+		expect(shown).toMatchObject({ kind: "gen-ui", appShownAt: shownAt, contentPx: 580 });
+		const created = classifyToolDetail({
+			toolName: "GenUI",
+			toolUseId: fileReference.toolUseId,
+			category: "generic",
+			status: "completed",
+			inputJson: { action: "create", prefix: "demo" },
+			metadata: { genUi: fileReference },
+		})?.sections[0].body;
+		expect(created).not.toHaveProperty("appShownAt");
+		expect(created).not.toHaveProperty("contentPx");
+	});
 	test("public summaries never carry a private file reference", () => {
 		const result = classifyToolDetail({
 			toolName: "GenUI",
