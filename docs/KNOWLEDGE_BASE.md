@@ -868,6 +868,8 @@ principal P：clearance=secret，grantedTags={product:M20}
 - **未发布也可使用**：`KnowledgeRead({ personalEntryId })` 读取本人的个人条目；`KnowledgeEdit` 的 `save` / `update_meta` 可直接修改正文、标题和关键词。发布仅用于分享。
 - `KnowledgeSearch` 默认包含本人的 active standalone（内部 `includeStandalone` 开关），结果给出 `personalEntryId`；`useDraft:false` 只搜索全局版本。现有 HTTP 搜索默认契约不变。
 - 关键词注入也包含本人的 active standalone，复用现有匹配、摘要限额和持久去重；personal/global 身份贯穿模型提示与气泡导航。无发布目标的条目可跨项目使用，有目标时遵循当前项目或全局集合范围；个人候选缓存按用户隔离。
+- **前端入口**（KNOWLEDGE_UI_REDESIGN.md §5.4 / §5.5 / §8.3）：两种形态共用一个列表 `/knowledge/mine` 和一个编辑页 `/knowledge/mine/<personalEntryId>`；条目页的「提议修改 / 我的个人版本」按钮进入或创建（`createDraft`）它。旧的 `/knowledge/personal/<id>`、条目页 `#draft`、`/knowledge?tab=mylibrary` 均重定向到这里；叙述者 dock 面板、知识提示与工具详情里的个人条目链接同样指向它。
+- **页面数据**：`GET /personal-entries/:id`（作者或 admin，否则 404）在条目本身之外返回 `entryTitle` / `currentMainContent` / `drift`（仅 linked 且调用者当前**仍可读**该条目时）、`targetCollectionName`（仅 standalone 且目标集合可读时）、`openSubmissions`（删除会一并撤回的 pending / conflict / changes_requested 请求，不含正文）和 `viewerCaps`：`canEdit` / `canEditMeta` / `canRebase` / `canDelete` / `canSubmit` + `submitBlockers`（`archived` / `missing_target` / `missing_title` / `open_request`），每一位与对应写接口同一判定（提交前置条件是 `submitForReview` 共用的纯函数）。`GET /personal-entries` 每行同样带 ACL 检查过的 `entryTitle` / `targetCollectionName`。失去条目读权限后，作者自己的副本正文仍可见可改，但 main 的标题、正文与 drift 不再经个人条目泄露。
 
 ### 6.7.2 drift 与 rebase
 
@@ -967,7 +969,7 @@ principal P：clearance=secret，grantedTags={product:M20}
 **和通知铃的关系。** 这些 WS 帧只让客户端重新拉取，不写入平台通知中心的 `notifications` 表（该表的动态投影会回查源内容，知识库标题一旦写进去就可能泄露密级）。铃铛另读两条 ACL 检查过的 HTTP 接口：
 
 - 审核者：`GET /api/knowledge/review-inbox/count`，加上待审列表。点击一条提交（linked 与 standalone 相同）打开请求页 `/knowledge/requests/<id>`；收件箱入口打开 `/knowledge/review`。
-- 作者：`GET /api/knowledge/my-submission-outcomes`，最近 30 天内自己的 `approved` / `rejected` / `changes_requested`。响应只有 id、状态和 findings，**没有标题、变更说明或正文**。点击后同样打开请求页 `/knowledge/requests/<id>`——作者与审核者是同一个 URL，页面按 `GET /submissions/:id` 返回的 `viewerCaps` 显示各自的操作（见 KNOWLEDGE_UI_REDESIGN.md §8.2）。
+- 作者：`GET /api/knowledge/my-submission-outcomes`，最近 30 天内自己的 `approved` / `rejected` / `changes_requested`。响应只有 id、状态和 findings，**没有标题、变更说明或正文**。点击后同样打开请求页 `/knowledge/requests/<id>`——作者与审核者是同一个 URL，页面按 `GET /submissions/:id` 返回的 `viewerCaps` 显示各自的操作（见 KNOWLEDGE_UI_REDESIGN.md §8.2）。请求页的「编辑我的版本」进入 `/knowledge/mine/<draftId>`；`/knowledge/mine` 的「我发起的请求」区也列出同样的结论（标签取自作者自己的个人条目列表）。
 - 请求页本身再走 ACL 检查过的 `GET /api/knowledge/submissions/:id`：提交者本人或对目标有审核权（§6.7.5）才能看到，其余一律 404；条目标题、当前 main 等展示字段另需对条目/集合的读权限。
 
 收到 `knowledge:review_inbox_changed` 时前端会失效上述查询，所以审核队列有变化时铃铛不会一直空着。

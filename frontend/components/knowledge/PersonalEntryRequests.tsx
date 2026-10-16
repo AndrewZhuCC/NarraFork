@@ -1,7 +1,7 @@
 /**
  * The publish requests of ONE personal version, as a compact list for its author.
  *
- * Shown under the linked draft editor and on the standalone personal-entry page. Each row is a
+ * Shown on the personal-version page (`/knowledge/mine/$personalEntryId`). Each row is a
  * link to the request page (`/knowledge/requests/$submissionId`), where findings, the review
  * history and the author's withdraw / re-submit actions live — a request has exactly one page,
  * so no actions are duplicated here.

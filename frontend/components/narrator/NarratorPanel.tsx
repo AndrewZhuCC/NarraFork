@@ -103,6 +103,7 @@ import {
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
+import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
@@ -2066,10 +2067,7 @@ function NarratorPanelBody({
 				return;
 			}
 			if (scope === "personal") {
-				navigate({
-					to: "/knowledge/personal/$personalEntryId",
-					params: { personalEntryId: entryId },
-				});
+				navigate(knowledgePersonalEntryDestination(entryId));
 				return;
 			}
 			navigate({ to: "/knowledge/$entryId", params: { entryId } });

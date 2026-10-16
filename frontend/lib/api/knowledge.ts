@@ -20,6 +20,7 @@ import type {
 	KnowledgeLinkType,
 	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgePersonalEntryDetail,
 	KnowledgePersonalEntrySummary,
 	KnowledgeRebaseResult,
 	KnowledgeRebaseStrategy,
@@ -242,7 +243,7 @@ export const knowledgeApi = {
 			body: JSON.stringify(data),
 		}),
 	getPersonalEntry: (id: string) =>
-		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`),
+		request<KnowledgePersonalEntryDetail>(`/knowledge/personal-entries/${id}`),
 	updatePersonalEntryMeta: (
 		id: string,
 		data: { title?: string; targetCollectionId?: string | null; keywords?: string[] },

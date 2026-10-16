@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+	isLegacyDraftHash,
+	knowledgePersonalEntryDestination,
 	knowledgeRequestDestination,
+	legacyDraftHashRedirect,
 	legacyEntryHashRedirect,
 	legacyKnowledgeIndexRedirect,
-	linkedPersonalRedirect,
 	parseKnowledgeEntryHash,
+	parseKnowledgeEntrySearch,
 	parseKnowledgeReviewSearch,
 } from "./knowledge-review-nav";
 
@@ -16,11 +19,11 @@ describe("parseKnowledgeEntryHash", () => {
 		expect(parseKnowledgeEntryHash("not-a-tab")).toBe("content");
 	});
 
-	test("selects a named tab; the Submissions tab is gone", () => {
-		expect(parseKnowledgeEntryHash("#draft")).toBe("draft");
+	test("selects a named tab; the Submissions and My-draft tabs are gone", () => {
 		expect(parseKnowledgeEntryHash("history")).toBe("history");
 		expect(parseKnowledgeEntryHash("links")).toBe("links");
 		expect(parseKnowledgeEntryHash("submissions")).toBe("content");
+		expect(parseKnowledgeEntryHash("#draft")).toBe("content");
 	});
 });
 
@@ -69,7 +72,6 @@ describe("legacy URL redirects (§4.2, P2a rows)", () => {
 
 	test("other URLs are left alone", () => {
 		expect(legacyKnowledgeIndexRedirect({})).toBeNull();
-		expect(legacyKnowledgeIndexRedirect({ tab: "mylibrary" })).toBeNull();
 		expect(legacyKnowledgeIndexRedirect({ tab: "admin", submission: "x" })).toBeNull();
 		for (const hash of ["", "#content", "#draft", "#history", "#links", "#submissionsX"]) {
 			expect(legacyEntryHashRedirect("entry-1", hash)).toBeNull();
@@ -98,31 +100,47 @@ describe("knowledgeRequestDestination", () => {
 	});
 });
 
-describe("linkedPersonalRedirect", () => {
-	test("lands on the request that carries findings", () => {
-		expect(
-			linkedPersonalRedirect([
-				{ id: "pending", status: "pending", findingsJson: [] },
-				{
-					id: "bounced",
-					status: "changes_requested",
-					findingsJson: [{ message: "spell out the grant" }],
-				},
-			]),
-		).toEqual({ to: "request", submissionId: "bounced" });
+// One test per §4.2 row owned by P2b.
+describe("legacy URL redirects (§4.2, P2b rows)", () => {
+	test("/knowledge?tab=mylibrary → /knowledge/mine", () => {
+		expect(legacyKnowledgeIndexRedirect({ tab: "mylibrary" })).toEqual({ to: "/knowledge/mine" });
 	});
 
-	test("lands on an open request when nothing has findings yet", () => {
-		expect(linkedPersonalRedirect([{ id: "open", status: "pending" }])).toEqual({
-			to: "request",
-			submissionId: "open",
+	test("/knowledge/$entryId#draft → /knowledge/mine/<draftId> when a personal version exists", () => {
+		expect(legacyDraftHashRedirect("entry-1", "#draft", "-draft_1")).toEqual({
+			to: "/knowledge/mine/$personalEntryId",
+			params: { personalEntryId: "-draft_1" },
 		});
 	});
 
-	test("lands on the draft tab when there is nothing to review", () => {
-		expect(linkedPersonalRedirect([])).toEqual({ to: "draft" });
-		expect(linkedPersonalRedirect([{ id: "old", status: "withdrawn", findingsJson: [] }])).toEqual({
-			to: "draft",
+	test("/knowledge/$entryId#draft → entry page with the create prompt when there is none", () => {
+		const prompt = {
+			to: "/knowledge/$entryId",
+			params: { entryId: "entry-1" },
+			search: { personal: "create" },
+		} as const;
+		expect(legacyDraftHashRedirect("entry-1", "draft", null)).toEqual(prompt);
+		expect(legacyDraftHashRedirect("entry-1", "#draft", undefined)).toEqual(prompt);
+		// Other hashes are not this row's business.
+		for (const hash of ["", "#content", "#history", "#drafts", "#submissions"]) {
+			expect(legacyDraftHashRedirect("entry-1", hash, "d")).toBeNull();
+			expect(isLegacyDraftHash(hash)).toBe(false);
+		}
+		expect(isLegacyDraftHash("#draft")).toBe(true);
+	});
+
+	test("/knowledge/personal/$id → /knowledge/mine/$id (linked and standalone alike)", () => {
+		expect(knowledgePersonalEntryDestination("Wl5v48sFqX9hn_NC7Y5ja")).toEqual({
+			to: "/knowledge/mine/$personalEntryId",
+			params: { personalEntryId: "Wl5v48sFqX9hn_NC7Y5ja" },
 		});
+	});
+});
+
+describe("parseKnowledgeEntrySearch", () => {
+	test("only the create prompt survives", () => {
+		expect(parseKnowledgeEntrySearch({})).toEqual({});
+		expect(parseKnowledgeEntrySearch({ personal: "create" })).toEqual({ personal: "create" });
+		expect(parseKnowledgeEntrySearch({ personal: "delete" })).toEqual({});
 	});
 });

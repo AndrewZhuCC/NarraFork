@@ -1,6 +1,6 @@
 # 知识库前端重构设计
 
-状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），P2a 已完成（见 §8.2）。
+状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），P2a 已完成（见 §8.2），P2b 已完成（见 §8.3）。
 关联文档：数据模型、权限和审核状态机以 `docs/KNOWLEDGE_BASE.md` 为准，本文只改前端信息架构与少量为其服务的后端接口，**不改审核状态机和 ACL 语义**。
 
 ---
@@ -204,7 +204,7 @@ frontend/hooks/knowledge/       按领域拆分 useKnowledge.ts（entries / pers
 | **P0**（✅ 已合入 #81） | 条目列表 cursor 分页、去掉错误的集合计数、卡片悬停样式 | 超过一页的条目可达；侧栏不再显示错误计数 |
 | **P1** 基础件（✅ 已完成，见 §8.1） | `viewerCaps` 接口；`KnowledgeEditor`、`SubmissionStatusBadge`、`DriftBanner` 抽取；现有页面换用这些组件，路由暂不动 | 前端不再出现 `isAdmin \|\| isOwner` 式权限推断；write grant 持有者能看到编辑入口；所有编辑处有预览与未保存提醒 |
 | **P2a** 请求与审核（✅ 已完成，见 §8.2） | `/knowledge/review`、`/knowledge/requests/$id`；铃铛与审核导航迁移；对应旧 URL 重定向 | 关联型与独立型请求同一页面；作者与审核者同一 URL |
-| **P2b** 个人版本 | `/knowledge/mine*`；关联与独立统一编辑页；`#draft` 与 `/personal/$id` 重定向 | "我的版本"只有一个入口 |
+| **P2b** 个人版本（✅ 已完成，见 §8.3） | `/knowledge/mine*`；关联与独立统一编辑页；`#draft` 与 `/personal/$id` 重定向 | "我的版本"只有一个入口 |
 | **P2c** 阅读与设置 | 条目阅读页、`/history`、`/edit`、`/settings`；浏览页筛选排序；删除侧栏 | 只读用户只看到正文、历史、链接 |
 | **P2d** 管理 | `/knowledge/admin/*` 子路由拆分 | 现有管理功能无回退 |
 | **P3** 缺口 | ACL 审计页、知识包管理、知识图谱视图、"为什么我能/不能访问"说明 | 对应 KNOWLEDGE_BASE.md §10 条目可关闭 |
@@ -293,7 +293,57 @@ P2 的子项相互独立，可按 a → b → c → d 顺序并行开发、逐�
 - 集合筛选在客户端对（有上限的）审核者列表过滤：linked 请求的集合要经条目解析，服务端列表接口未加该参数。
 - 请求页的"评审意见与 findings 时间线"按**轮次**展示：`knowledge_submissions` 每行只存最后一次 verdict/findings（`comment_only` 会覆盖），没有逐条评审事件表；补事件表属于后端状态机变更，不在本期。
 - 自审：§8.1 中"审核面板对作者本人保守隐藏"的做法随 caps 取消——admin 审自己的请求时请求页会显示审核操作，与服务端 §6.7.5 的 admin 例外一致；非 admin 作者的 `canReview` 恒为 false。
-- `/knowledge/personal/$id` 对 linked 条目的重定向改为：有带 findings 或打开中的请求 → 该请求页；否则 → 条目 `#draft`（P2b 再改到 `/knowledge/mine/<id>`）。「编辑我的版本」同样暂指 `#draft` / `/knowledge/personal/$id`。
+- `/knowledge/personal/$id` 对 linked 条目的重定向改为：有带 findings 或打开中的请求 → 该请求页；否则 → 条目 `#draft`（P2b 再改到 `/knowledge/mine/<id>`）。「编辑我的版本」同样暂指 `#draft` / `/knowledge/personal/$id`。——P2b 已全部替换，见 §8.3。
+
+### 8.3 P2b 落地记录
+
+**后端**（`server/services/knowledge-branch-service.ts`，均为新增字段，未改语义）：
+
+- `GET /personal-entries/:id` 走 `getMineForViewer`（读闸不变：`loadOwnDraft`，作者或 admin，其余 404），在条目本身之外返回：
+  - `entryTitle`、`currentMainContent`（diff 基线）、`drift`（`drifted` + `versionsBehind`）——仅 linked 且调用者**当前**对该条目 `canRead`（集合闸 + 条目闸）；失去读权限后作者仍能看/改自己的副本，但 main 的标题、正文与漂移不再经个人条目泄露；
+  - `targetCollectionName`——仅 standalone 且目标集合 `canReadCollection`；
+  - `openSubmissions`——本版本处于 `CLOSED_ON_ENTRY_DELETE_STATUSES`（pending / conflict / changes_requested）的请求（id、状态、轮次、时间，无正文，上限 `OPEN_SUBMISSION_SCAN_LIMIT`），即删除会一并撤回的那些；
+  - `viewerCaps`（`personalEntryViewerCaps`，纯函数）：
+
+| 能力位 | 判定（写接口同用） | 对应写接口 |
+|--------|--------------------|------------|
+| `canEdit` | 未归档（`updateDraft`） | `PATCH /drafts/:id` |
+| `canEditMeta` | 未归档 ∧ standalone（`updateStandaloneMeta`） | `PATCH /personal-entries/:id` |
+| `canRebase` | 未归档 ∧ linked ∧ 条目可读（`rebaseDraft` 的 `assertCanRead`） | `POST /drafts/:id/rebase` |
+| `canDelete` | 未归档（归档条目再删是幂等空操作，无可删） | `DELETE /personal-entries/:id` |
+| `canSubmit` / `submitBlockers` | `personalEntrySubmitBlockers`：`archived`、`missing_target`、`missing_title`（`submitForReview` 改为调用同一纯函数 `personalEntrySubmitPreconditionBlocker` 抛错），`open_request` = 存在 `CLAIMABLE_SUBMISSION_STATUSES`（pending / conflict）请求，与 store 的 `createSubmissionGuarded` 同一集合 | `POST /drafts/:id/submit` |
+
+- `GET /personal-entries` 走 `listMineForViewer`：原字段 + `drifted`（不变）+ `entryTitle`（linked 且可读）+ `targetCollectionName`（standalone 且可读）。条目与集合各一次 `inArray`，无逐行查询。
+- 一致性测试 `server/services/__tests__/knowledge-personal-entry-viewer.test.ts`：linked / 漂移 / 有 pending 请求 / 已归档 / standalone / 缺目标 / standalone 有 pending 七种状态，逐位验证"能力位为 true ⇔ 对应调用不被拒绝"（每个探测用全新 fixture）；另测失去条目/集合读权限后标题、正文、drift 被隐去（详情与列表），以及他人 404。
+
+**前端**：
+
+- `/knowledge/mine`（`routes/knowledge/mine/index.tsx`）：关联型与独立型同一列表（标题——关联型用全局条目标题；类型「关联到「条目」」/「独立 · 目标集合」；落后 main、打开请求状态、已归档徽章；更新时间），search `archived=1` 显示已归档（默认隐藏，§10.3）；「我发起的请求」区：进行中（pending / conflict / changes_requested）在上、近 30 天结论在下，changes_requested 只列一次（在上，带 findings），每行进请求页。请求接口按设计不带标题，行标签取自本人的个人条目列表（需要时额外取一页 archived）。新建按钮 → `/knowledge/mine/new`。知识库首页标题栏「我的版本」按钮取代原「我的库」tab 及其常驻新建表单。
+- `/knowledge/mine/new`：`KnowledgeEditor` + 标题、可选目标集合、关键词；保存后 `replace` 跳到 `/knowledge/mine/<id>`。
+- `/knowledge/mine/$personalEntryId`：状态条（类型、关联条目链接或目标集合、drift、当前打开请求链接、更新时间）；`KnowledgeEditor`（linked 基线 = 当前 main，不可读时无基线；standalone 无基线）；linked 且 `canRebase` 时 `DriftBanner`；发布区（变更说明 + 提交审核，`submitBlockers` 全部列出；有未保存元数据时先要求保存；提交成功后给出新请求页链接，带 `driftWarning` 时同时提示落后版本数）；`PersonalEntryRequests` 请求历史；删除确认列出将被撤回的请求（链接到各请求页）。linked 的元数据卡只说明"标题/标签/关键词属于共享条目"并链接过去；standalone 可编辑标题/目标/关键词。
+- 条目页：删除「我的草稿」tab；标题栏新增 `PersonalVersionAction`——有 `viewerCaps.myPersonalEntryId` → 「我的个人版本」链接；否则只读用户为「提议修改」，可直接写 main 的用户为次级「创建个人版本」，确认后 `createDraft` 并进入新页面。直接编辑 main（`canWriteMain`）不变。
+- 带路径参数的链接用 `components/knowledge/router-links.tsx`（`createLink` 包装的 Mantine `Anchor` / `Button`），是真实 `<a href>` 且参数有类型检查。
+
+**旧 URL 重定向**（`lib/knowledge-review-nav.ts` 纯函数，`beforeLoad` 中 `redirect({ replace: true })`，每行一条单测）：
+
+| 旧 | 新 |
+|----|----|
+| `/knowledge?tab=mylibrary` | `/knowledge/mine` |
+| `/knowledge/$entryId#draft`（有个人版本） | `/knowledge/mine/<draftId>` |
+| `/knowledge/$entryId#draft`（没有） | `/knowledge/$entryId?personal=create`：阅读页并自动打开"创建个人版本"确认；关闭确认即去掉该参数 |
+| `/knowledge/personal/$id` | `/knowledge/mine/$id`（linked 与 standalone 相同；路由文件只剩 `beforeLoad` 重定向） |
+
+`#draft` 需要知道 `myPersonalEntryId`，所以这一行在 `beforeLoad` 里先 `queryClient.ensureQueryData` 读条目（与 `useKnowledgeEntry` 同一 query key，页面随后直接命中缓存）；读失败（条目不存在/不可读）按"没有"处理，落到阅读页的 not-found 状态。创建是写操作，从不由重定向自动完成。
+
+**替换的 P2a 临时链接**：请求页「编辑我的版本」、P2a 的 `linkedPersonalRedirect`（删除）、「我的库」行目标（随 tab 删除）、叙述者 dock 面板 `KnowledgeEntryPanelContent` 个人条目的"在知识库中打开"、`NarratorPanel` 知识提示的个人条目回退导航、`shared/pretext-layout/tool-detail.ts`（`KnowledgeSearch` 的 standalone 结果与带 `personalEntryId` 的 `KnowledgeRead` / `KnowledgeEdit` 原先错误地链到 `/knowledge/<personalEntryId>`），全部改为 `knowledgePersonalEntryDestination(id)` / `/knowledge/mine/<id>`。铃铛无需改动：作者结论行一直有 submission，进请求页。
+
+**偏差**：
+
+- 目标集合下拉列出**所有可见集合**，而不是只列 `viewerCaps.canCreateEntry`：`submitForReview` 只检查"有目标"，不检查作者对目标的写权限（批准时需要的是**审核者**对目标的写权限，§6.7.5），只列可建条目的集合会把"通过审核发布"这条路对普通作者藏起来。服务端对目标集合的可读性也不校验，这一点维持现状；不可读的已存目标在下拉与状态条里显示为"你无权读取的集合"，不显示名称。
+- "My" 未新增聚合接口（§6.2 的评估项）：沿用 `GET /personal-entries`（active，必要时 archived）、`/my-open-submissions`、`/my-submission-outcomes` 四个有上限的请求，各自已有缓存与失效路径；聚合只省请求数，却要复制三处 ACL 与上限逻辑。
+- `#draft` 无个人版本时落到 `?personal=create`（新 search 参数）而非纯 hash，因为确认弹窗是页面状态、应可链接（§3）。
+- 条目页的个人版本入口暂放在标题栏（与转移/删除并列）；§5.2 的完整头部与主次按钮布局属于 P2c。
+- 去掉草稿 tab 后不再被任何页面使用的 hook（`useMyKnowledgeDraft`、`useKnowledgeDraftDrift`、`useUpdateKnowledgeDraft`、`useSubmitKnowledgeDraft`）与 `draft` / `draftDrift` 缓存键的失效一并删除；通知失效改为刷新 `personalEntry`（详情里带 drift 与打开请求）。对应 HTTP 接口保留（agent 工具与旧客户端仍在用）。
 
 ## 9. 测试策略
 
@@ -308,4 +358,4 @@ P2 的子项相互独立，可按 a → b → c → d 顺序并行开发、逐�
 
 1. **非管理员的直接写**：本文默认维持服务端现状（owner、write grant、集合 owner 可直接改 main），前端按 `viewerCaps` 展示。若希望只有管理员能直接改 main，需要改服务端 `addRevision` 判定，并处理"owner 不能自审"带来的后果（owner 的修改需要他人审核），建议单独立项。
 2. **知识包、审计、图谱（P3）**的优先级。
-3. **archived 个人条目在"我的"页的展示**：默认隐藏，提供"显示已归档"开关；清理策略仍按 KNOWLEDGE_BASE.md §10.2 待定。
+3. **archived 个人条目在"我的"页的展示**：默认隐藏，提供"显示已归档"开关（P2b 已按此实现，`/knowledge/mine?archived=1`）；清理策略仍按 KNOWLEDGE_BASE.md §10.2 待定。

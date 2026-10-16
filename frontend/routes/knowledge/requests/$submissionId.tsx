@@ -40,7 +40,10 @@ import { SubmissionTimeline } from "../../../components/knowledge/SubmissionTime
 import { useKnowledgeSubmission } from "../../../hooks/useKnowledge";
 import type { KnowledgeSubmissionDetail } from "../../../lib/api";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
-import { knowledgeRequestDestination } from "../../../lib/knowledge-review-nav";
+import {
+	knowledgePersonalEntryDestination,
+	knowledgeRequestDestination,
+} from "../../../lib/knowledge-review-nav";
 
 export const Route = createFileRoute("/knowledge/requests/$submissionId")({
 	component: RequestPage,
@@ -192,18 +195,7 @@ function RequestDetail({ submission: s }: { submission: KnowledgeSubmissionDetai
 									size="xs"
 									variant="light"
 									leftSection={<IconPencil size={12} />}
-									onClick={() =>
-										s.entryId
-											? navigate({
-													to: "/knowledge/$entryId",
-													params: { entryId: s.entryId },
-													hash: "draft",
-												})
-											: navigate({
-													to: "/knowledge/personal/$personalEntryId",
-													params: { personalEntryId: s.draftId },
-												})
-									}
+									onClick={() => navigate(knowledgePersonalEntryDestination(s.draftId))}
 								>
 									{t("requestEditVersion")}
 								</Button>

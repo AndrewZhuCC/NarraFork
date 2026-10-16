@@ -23,12 +23,9 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
-	IconBook2,
-	IconFileSymlink,
 	IconFileText,
 	IconFolder,
 	IconFolderOpen,
-	IconGitMerge,
 	IconGitPullRequest,
 	IconLock,
 	IconNotebook,
@@ -47,18 +44,14 @@ import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
 import { CollectionAclPanel } from "../../components/knowledge/CollectionAclPanel";
 import { KnowledgeEditor } from "../../components/knowledge/editor/KnowledgeEditor";
 import cardClasses from "../../components/knowledge/KnowledgeCards.module.css";
-import { SubmissionStatusBadge } from "../../components/knowledge/SubmissionStatusBadge";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useCreateKnowledgeCollection,
 	useCreateKnowledgeEntry,
-	useCreatePersonalEntry,
 	useDeleteKnowledgeCollection,
 	useKnowledgeCollections,
 	useKnowledgeEntriesPaged,
-	useMyOpenKnowledgeSubmissions,
-	useMyPersonalEntries,
 	useReviewInboxCount,
 	useUpdateKnowledgeCollection,
 } from "../../hooks/useKnowledge";
@@ -66,15 +59,11 @@ import type {
 	KnowledgeCollection,
 	KnowledgeCollectionListItem,
 	KnowledgeEntryPage,
-	KnowledgeOpenSubmission,
 } from "../../lib/api";
 import { api } from "../../lib/api";
-import {
-	knowledgeRequestDestination,
-	legacyKnowledgeIndexRedirect,
-} from "../../lib/knowledge-review-nav";
+import { legacyKnowledgeIndexRedirect } from "../../lib/knowledge-review-nav";
 
-const KNOWLEDGE_TABS = ["browse", "mylibrary", "admin"] as const;
+const KNOWLEDGE_TABS = ["browse", "admin"] as const;
 type KnowledgeTab = (typeof KNOWLEDGE_TABS)[number];
 
 export interface KnowledgeIndexSearch {
@@ -89,8 +78,9 @@ function parseKnowledgeIndexSearch(search: Record<string, unknown>): KnowledgeIn
 }
 
 export const Route = createFileRoute("/knowledge/")({
-	// Legacy review-center URLs (§4.2): `?tab=review[&submission=<id>]` → inbox / request page.
-	// Reads the raw location search: validateSearch drops `tab=review` and `submission`.
+	// Legacy tab URLs (§4.2): `?tab=review[&submission=<id>]` → inbox / request page,
+	// `?tab=mylibrary` → `/knowledge/mine`. Reads the raw location search: validateSearch drops
+	// those values.
 	beforeLoad: ({ location }) => {
 		const target = legacyKnowledgeIndexRedirect(location.search as Record<string, unknown>);
 		if (target) throw redirect({ ...target, replace: true });
@@ -120,29 +110,39 @@ function KnowledgePage() {
 						{t("subtitle")}
 					</Text>
 				</Stack>
-				<Button
-					component={Link}
-					to="/knowledge/review"
-					variant="light"
-					leftSection={<IconGitPullRequest size={16} />}
-					rightSection={
-						inboxCount > 0 ? (
-							<Tooltip label={t("reviewInboxTooltip", { count: inboxCount })}>
-								<Badge size="sm" circle variant="filled" color="indigo">
-									{inboxLabel}
-								</Badge>
-							</Tooltip>
-						) : null
-					}
-				>
-					{t("reviewInboxTitle")}
-				</Button>
+				<Group gap="xs">
+					<Button
+						component={Link}
+						to="/knowledge/mine"
+						variant="light"
+						leftSection={<IconNotebook size={16} />}
+					>
+						{t("mineTitle")}
+					</Button>
+					<Button
+						component={Link}
+						to="/knowledge/review"
+						variant="light"
+						leftSection={<IconGitPullRequest size={16} />}
+						rightSection={
+							inboxCount > 0 ? (
+								<Tooltip label={t("reviewInboxTooltip", { count: inboxCount })}>
+									<Badge size="sm" circle variant="filled" color="indigo">
+										{inboxLabel}
+									</Badge>
+								</Tooltip>
+							) : null
+						}
+					>
+						{t("reviewInboxTitle")}
+					</Button>
+				</Group>
 			</Group>
 
 			<Tabs
 				value={tab}
 				onChange={(value) => {
-					const next = value === "mylibrary" || (value === "admin" && isAdmin) ? value : undefined;
+					const next = value === "admin" && isAdmin ? value : undefined;
 					navigate({
 						to: "/knowledge",
 						search: next ? { tab: next } : {},
@@ -153,15 +153,11 @@ function KnowledgePage() {
 			>
 				<Tabs.List mb="md">
 					<Tabs.Tab value="browse">{t("tabEntries")}</Tabs.Tab>
-					<Tabs.Tab value="mylibrary">{t("tabMyLibrary")}</Tabs.Tab>
 					{isAdmin ? <Tabs.Tab value="admin">{t("tabAdmin")}</Tabs.Tab> : null}
 				</Tabs.List>
 
 				<Tabs.Panel value="browse">
 					<BrowseTab />
-				</Tabs.Panel>
-				<Tabs.Panel value="mylibrary">
-					<MyLibraryTab />
 				</Tabs.Panel>
 				{isAdmin ? (
 					<Tabs.Panel value="admin">
@@ -729,244 +725,5 @@ function CreateEntryModal({
 				</Group>
 			</Stack>
 		</Modal>
-	);
-}
-
-function MyLibraryTab() {
-	const { t } = useTranslation("knowledge");
-	const navigate = useNavigate();
-	const entries = useMyPersonalEntries({ status: "active" });
-	const collections = useKnowledgeCollections();
-	const create = useCreatePersonalEntry();
-	// One bounded query badges every card with its publish state (pending / conflict /
-	// changes requested), so users see progress without opening the detail page.
-	const openSubs = useMyOpenKnowledgeSubmissions();
-	const [title, setTitle] = useState("");
-	const [content, setContent] = useState("");
-	const [target, setTarget] = useState<string | null>(null);
-	const [keywords, setKeywords] = useState<string[]>([]);
-
-	const collectionOptions = useMemo(
-		() => (collections.data ?? []).map((c) => ({ value: c.id, label: c.name })),
-		[collections.data],
-	);
-	const colName = useMemo(() => {
-		const m = new Map<string, string>();
-		for (const c of collections.data ?? []) m.set(c.id, c.name);
-		return m;
-	}, [collections.data]);
-	// draftId → newest in-flight submission (the list is ordered createdAt DESC).
-	const openByDraft = useMemo(() => {
-		const m = new Map<string, KnowledgeOpenSubmission>();
-		for (const s of openSubs.data ?? []) {
-			if (!m.has(s.draftId)) m.set(s.draftId, s);
-		}
-		return m;
-	}, [openSubs.data]);
-
-	const save = () => {
-		if (!title.trim()) return;
-		create.mutate(
-			{
-				title: title.trim(),
-				content: content || undefined,
-				targetCollectionId: target ?? undefined,
-				keywords: keywords.length > 0 ? keywords : undefined,
-			},
-			{
-				onSuccess: () => {
-					setTitle("");
-					setContent("");
-					setTarget(null);
-					setKeywords([]);
-				},
-			},
-		);
-	};
-
-	return (
-		<Grid gap="lg">
-			{/* Left Column: Create New Personal Entry */}
-			<Grid.Col span={{ base: 12, md: 5 }}>
-				<Paper withBorder p="md" radius="md" bg="var(--mantine-color-body)">
-					<Stack gap="sm">
-						<div>
-							<Text size="sm" fw={600}>
-								{t("newPersonalEntry")}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("myLibraryDesc")}
-							</Text>
-						</div>
-
-						<TextInput
-							label={t("title_field")}
-							placeholder={t("title_field")}
-							value={title}
-							onChange={(e) => setTitle(e.currentTarget.value)}
-							required
-						/>
-
-						<Select
-							label={t("publishTarget")}
-							placeholder={t("noTargetCollection")}
-							clearable
-							data={collectionOptions}
-							value={target}
-							onChange={setTarget}
-						/>
-
-						<KnowledgeEditor
-							label={t("content")}
-							placeholder={t("content")}
-							value={content}
-							onChange={setContent}
-							savedValue=""
-							onSave={save}
-							saving={create.isPending}
-							minRows={4}
-							maxRows={12}
-						/>
-
-						<TagsInput
-							label={t("keywords")}
-							description={t("keywordsHint")}
-							placeholder={t("keywordsPlaceholder")}
-							value={keywords}
-							onChange={setKeywords}
-							clearable
-						/>
-
-						<Button
-							onClick={save}
-							disabled={!title.trim()}
-							loading={create.isPending}
-							fullWidth
-							mt="xs"
-						>
-							{t("save")}
-						</Button>
-					</Stack>
-				</Paper>
-			</Grid.Col>
-
-			{/* Right Column: Personal Entry List */}
-			<Grid.Col span={{ base: 12, md: 7 }}>
-				<Stack gap="md">
-					<Text size="sm" fw={600} c="dimmed" tt="uppercase">
-						{t("tabMyLibrary")}
-					</Text>
-
-					{entries.isLoading ? (
-						<Paper
-							withBorder
-							p="xl"
-							radius="md"
-							style={{ display: "flex", justifyContent: "center" }}
-						>
-							<Text size="sm" c="dimmed">
-								{t("loading")}
-							</Text>
-						</Paper>
-					) : (entries.data?.length ?? 0) === 0 ? (
-						<Paper withBorder p="xl" radius="md" ta="center">
-							<ThemeIcon variant="light" size="xl" radius="xl" color="gray" mb="xs">
-								<IconNotebook size={24} />
-							</ThemeIcon>
-							<Text size="sm" fw={600} c="dimmed">
-								{t("noPersonalEntries")}
-							</Text>
-						</Paper>
-					) : (
-						<Stack gap="xs">
-							{(entries.data ?? []).map((p) => {
-								// An in-flight request opens its request page (findings / withdraw /
-								// resubmit). Otherwise linked entries open on the shared entry's Draft tab.
-								const openSub = openByDraft.get(p.id);
-								const openEntry = () => {
-									if (openSub) {
-										navigate(knowledgeRequestDestination(openSub.id));
-										return;
-									}
-									if (p.entryId) {
-										navigate({
-											to: "/knowledge/$entryId",
-											params: { entryId: p.entryId },
-											hash: "draft",
-										});
-										return;
-									}
-									navigate({
-										to: "/knowledge/personal/$personalEntryId",
-										params: { personalEntryId: p.id },
-									});
-								};
-								const openStatus = openSub?.status;
-								return (
-									<Card
-										key={p.id}
-										withBorder
-										padding="md"
-										radius="md"
-										style={{ cursor: "pointer" }}
-										onClick={openEntry}
-									>
-										<Group justify="space-between" wrap="nowrap" align="center">
-											<div style={{ flex: 1, minWidth: 0 }}>
-												<Group gap="xs" align="center" mb={4}>
-													<IconBook2 size={16} style={{ color: "var(--mantine-color-grape-5)" }} />
-													<Text size="sm" fw={600} truncate="end">
-														{p.title ?? p.id.slice(0, 8)}
-													</Text>
-												</Group>
-												<Text size="xs" c="dimmed">
-													{p.entryId ? (
-														<Group gap={4} wrap="nowrap">
-															<IconFileSymlink size={12} />
-															<span>{t("personalEntryLinked")}</span>
-														</Group>
-													) : p.targetCollectionId ? (
-														<Group gap={4} wrap="nowrap">
-															<IconFolder size={12} />
-															<span>
-																{t("publishTarget")}:{" "}
-																{colName.get(p.targetCollectionId) ?? p.targetCollectionId}
-															</span>
-														</Group>
-													) : (
-														<span>{t("noTargetCollection")}</span>
-													)}
-												</Text>
-											</div>
-											<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
-												{/* Drift used to be visible only inside the entry's Draft tab, so a user
-												    had to open every entry to discover which copies had fallen behind.
-												    The list endpoint resolves it for the whole page in one query. */}
-												{p.drifted ? (
-													<Tooltip label={t("driftBadgeTooltip")} withArrow>
-														<Badge
-															size="xs"
-															variant="light"
-															color="orange"
-															leftSection={<IconGitMerge size={10} />}
-														>
-															{t("driftBadge")}
-														</Badge>
-													</Tooltip>
-												) : null}
-												{openStatus ? <SubmissionStatusBadge status={openStatus} /> : null}
-												<Badge size="xs" variant="light" color={p.entryId ? "blue" : "grape"}>
-													{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
-												</Badge>
-											</Group>
-										</Group>
-									</Card>
-								);
-							})}
-						</Stack>
-					)}
-				</Stack>
-			</Grid.Col>
-		</Grid>
 	);
 }
