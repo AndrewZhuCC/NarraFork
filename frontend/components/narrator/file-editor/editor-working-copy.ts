@@ -1,9 +1,14 @@
-import type { EditorDocumentDescriptor } from "@shared/editor-document";
+import type {
+	EditorDocumentDescriptor,
+	EditorRawDocumentDescriptor,
+} from "@shared/editor-document";
 import type { editor } from "monaco-editor/editor/editor.api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { EditorDraftCheckpoint } from "./editor-draft-checkpoint";
 import type { EditorDraftScope } from "./editor-draft-store";
+import type { EditorFormat } from "./editor-format";
 import { createEditorLocalId } from "./editor-local-id";
+import { loadEditorRawCandidate } from "./editor-model-loader";
 import {
 	EditorDocumentSession,
 	type EditorSessionOptions,
@@ -13,10 +18,18 @@ import {
 import { captureEditorSnapshot, encodeEditorSnapshot } from "./editor-worker-client";
 import { loadMonacoLanguage } from "./monaco-languages";
 import { loadMonaco } from "./monaco-loader";
+import { editorRawProfile } from "./monaco-profile";
 
 export type WorkingCopyOptions = Pick<
 	EditorSessionOptions,
-	"narratorId" | "path" | "deviceId" | "origin" | "translate" | "readOnlySource"
+	| "narratorId"
+	| "path"
+	| "deviceId"
+	| "origin"
+	| "translate"
+	| "readOnlySource"
+	| "protocol"
+	| "encodingHint"
 >;
 
 /** Model creation is independent of any view, including preview-only consumers. */
@@ -42,6 +55,7 @@ export async function createWorkingCopyModel(
 export class EditorWorkingCopy {
 	readonly session: EditorDocumentSession;
 	readonly key: string;
+	readonly protocol: "text-v1" | "raw-v2";
 	readonly lifetimeId = createEditorLocalId();
 	readonly recoveryKey?: string;
 	readonly draftScope?: EditorDraftScope;
@@ -50,9 +64,16 @@ export class EditorWorkingCopy {
 		this.session.setBackupError(incomplete);
 	}
 	model: editor.ITextModel | null = null;
+	format?: EditorFormat;
+	rawLoadStats?: { batches: number; maxBatchMs: number; maxQueuedBytes: number };
+	get pagedDocument(): EditorRawDocumentDescriptor | undefined {
+		const current = this.session.currentDocument;
+		return this.session.state.paged && current?.protocol === "raw-v2" ? current : undefined;
+	}
 	private listeners = new Set<() => void>();
 	private subscription: { dispose(): void } | null = null;
 	private loading: Promise<void> | null = null;
+	private visible = true;
 	private disposed = false;
 	private generation = 0;
 	private applying = false;
@@ -107,6 +128,11 @@ export class EditorWorkingCopy {
 			// Conservative accounting of UTF-16 text/index, retained baseline and edits.
 			// Monaco/GC overhead is implementation-dependent: this is NOT a heap bound.
 			bytes:
+				(this.format?.kind === "mixed"
+					? this.format.chunks.reduce((bytes, chunk) => bytes + chunk.byteLength, 0)
+					: this.format
+						? 64
+						: 0) +
 				this.reserved.bytes +
 				Math.max(
 					this.session.state.loaded ? 0 : this.admissionBytes,
@@ -122,8 +148,8 @@ export class EditorWorkingCopy {
 			loads: this.loading ? 1 : 0,
 		};
 	}
-	private beforeApply = new Set<() => () => void>();
-	onWillApply = (listener: () => () => void) => {
+	private beforeApply = new Set<(nextModel?: editor.ITextModel | null) => () => void>();
+	onWillApply = (listener: (nextModel?: editor.ITextModel | null) => () => void) => {
 		this.beforeApply.add(listener);
 		return () => {
 			this.beforeApply.delete(listener);
@@ -135,15 +161,22 @@ export class EditorWorkingCopy {
 		descriptor?: EditorDocumentDescriptor,
 	) {
 		this.key = descriptor?.resourceKey ?? createEditorLocalId();
+		this.protocol = descriptor?.protocol ?? options.protocol ?? "text-v1";
 		this.recoveryKey = descriptor?.recoveryKey;
 		this.seed = descriptor;
 		// V1 has no full text profile. Reserve a soft estimate from authorized metadata
 		// before allocating the foreground model, then account actual text/index/history.
-		this.admissionBytes = descriptor
-			? 4096 + Math.max(descriptor.utf8Bytes, descriptor.sourceBytes) * 12
-			: 0;
+		this.admissionBytes =
+			descriptor?.protocol === "raw-v2"
+				? editorRawProfile(descriptor).paged
+					? 0
+					: 4096 + descriptor.textLength * 6 + descriptor.lineCount * 65
+				: descriptor
+					? 4096 + Math.max(descriptor.utf8Bytes, descriptor.sourceBytes) * 12
+					: 0;
 		this.session = new EditorDocumentSession({
 			...options,
+			protocol: this.protocol,
 			resourceKey: descriptor?.resourceKey,
 			snapshot: () => {
 				if (!this.model) throw new Error("Editor is not ready");
@@ -160,6 +193,65 @@ export class EditorWorkingCopy {
 					}
 					return editorDocumentApi.create(...args);
 				},
+			},
+			loadRaw: async (document, signal) => {
+				const generation = this.generation;
+				if (editorRawProfile(document).paged) {
+					return {
+						paged: true,
+						install: () => {
+							signal.throwIfAborted();
+							if (this.disposed || generation !== this.generation)
+								throw new Error("EDITOR_LOAD_SUPERSEDED");
+							this.format = undefined;
+							this.rawLoadStats = undefined;
+							this.admissionBytes = 0;
+							this.replaceModel(null);
+							return null;
+						},
+						dispose() {},
+					};
+				}
+				this.admissionBytes = 0;
+				const release = this.pin("candidate", {
+					models: 1,
+					bytes: 4096 + document.textLength * 6 + document.lineCount * 65,
+				});
+				let candidate: Awaited<ReturnType<typeof loadEditorRawCandidate>>;
+				try {
+					candidate = await loadEditorRawCandidate({
+						document,
+						path: options.path,
+						signal,
+						read: (consume, credit) =>
+							editorDocumentApi.rawSource(options.narratorId, document, consume, signal, credit),
+					});
+				} catch (error) {
+					release();
+					throw error;
+				}
+				let installed = false;
+				return {
+					install: () => {
+						signal.throwIfAborted();
+						if (this.disposed || generation !== this.generation)
+							throw new Error("EDITOR_LOAD_SUPERSEDED");
+						this.format = candidate.format;
+						this.rawLoadStats = {
+							batches: candidate.batches,
+							maxBatchMs: candidate.maxBatchMs,
+							maxQueuedBytes: candidate.maxQueuedBytes,
+						};
+						this.replaceModel(candidate.model);
+						installed = true;
+						release();
+						return this.version();
+					},
+					dispose: () => {
+						if (!installed) candidate.model.dispose();
+						release();
+					},
+				};
 			},
 			applyContent: (text) => {
 				if (!this.model || this.disposed) throw new Error("Editor closed");
@@ -181,7 +273,12 @@ export class EditorWorkingCopy {
 				void this.draftCheckpoint?.saved(revision);
 			},
 		});
-		if (descriptor?.resourceKey && descriptor.recoveryKey && !options.readOnlySource) {
+		if (
+			descriptor?.resourceKey &&
+			descriptor.recoveryKey &&
+			!options.readOnlySource &&
+			descriptor.protocol !== "raw-v2"
+		) {
 			this.draftScope = {
 				recoveryKey: descriptor.recoveryKey,
 				resourceKey: descriptor.resourceKey,
@@ -193,6 +290,27 @@ export class EditorWorkingCopy {
 			};
 			this.draftCheckpoint = new EditorDraftCheckpoint(this, this.draftScope);
 		}
+	}
+	private replaceModel(next: editor.ITextModel | null) {
+		const restore = [...this.beforeApply].map((listener) => listener(next));
+		const old = this.model;
+		this.subscription?.dispose();
+		this.model = next;
+		this.undoBytes = 0;
+		this.watchModel();
+		for (const listener of restore) listener();
+		// Every attached view switches/detaches before disposing the old shared model.
+		old?.dispose();
+	}
+	private watchModel() {
+		this.subscription =
+			this.model?.onDidChangeContent((event) => {
+				if (!this.applying) {
+					for (const change of event.changes ?? [])
+						this.undoBytes += (change.rangeLength + change.text.length) * 2 + 64;
+					this.session.change(this.version());
+				}
+			}) ?? null;
 	}
 	private version() {
 		if (!this.model) throw new Error("Editor is not ready");
@@ -220,31 +338,51 @@ export class EditorWorkingCopy {
 			!!this.session.state.conflict
 		);
 	}
+	setVisible(visible: boolean) {
+		if (this.visible === visible) return;
+		this.visible = visible;
+		if (!visible) {
+			this.session.cancelBackgroundVerification();
+			this.session.cancelRawLoad();
+		} else if (this.protocol === "raw-v2" && !this.session.state.loaded) void this.ensureLoaded();
+	}
 	ensureLoaded(): Promise<void> {
-		if (this.disposed || this.session.state.invalidated || this.session.state.loaded)
+		if (
+			this.disposed ||
+			this.session.state.invalidated ||
+			this.session.state.loaded ||
+			(this.protocol === "raw-v2" && !this.visible)
+		)
 			return Promise.resolve();
 		if (this.loading) return this.loading;
 		const generation = this.generation;
 		this.loading = (async () => {
-			if (!this.model) {
+			if (!this.model && this.protocol !== "raw-v2") {
 				const model = await createWorkingCopyModel(this.options.path, this.key);
 				if (this.disposed || generation !== this.generation) {
 					model.dispose();
 					return;
 				}
 				this.model = model;
-				this.subscription = model.onDidChangeContent((event) => {
-					if (!this.applying) {
-						for (const change of event.changes ?? [])
-							this.undoBytes += (change.rangeLength + change.text.length) * 2 + 64;
-						this.session.change(this.version());
-					}
-				});
+				this.watchModel();
 			}
 			await this.session.load();
 		})().finally(() => {
 			this.loading = null;
 			this.emit();
+			const state = this.session.state;
+			// Reveal may precede completion of the old cancellation. Retry only that
+			// uninstalled, error-free raw load after its candidate has been disposed.
+			if (
+				this.protocol === "raw-v2" &&
+				this.visible &&
+				!this.disposed &&
+				!state.loaded &&
+				!state.loading &&
+				!state.invalidated &&
+				!state.error
+			)
+				void this.ensureLoaded();
 		});
 		return this.loading;
 	}

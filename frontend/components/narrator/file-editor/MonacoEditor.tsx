@@ -63,6 +63,7 @@ export interface MonacoEditorProps {
 	onSave?: () => void;
 	onError?: (error: Error) => void;
 	readOnly?: boolean;
+	forcePlaintext?: boolean;
 	selection?: FileSelection;
 	navigationRequestId?: string;
 	lineWrapping?: boolean;
@@ -166,7 +167,9 @@ export function MonacoEditor(props: MonacoEditorProps) {
 		void (async () => {
 			const api = await loadMonaco();
 			const initialLanguagePath = latest.current.filePath;
-			let languageStatus = await loadMonacoLanguage(api, initialLanguagePath);
+			let languageStatus = latest.current.forcePlaintext
+				? resolveMonacoLanguage("file.txt")
+				: await loadMonacoLanguage(api, initialLanguagePath);
 			if (cancelled) return;
 			const initial = latest.current;
 			// This order is critical. createModel consults the standalone configuration service.
@@ -272,7 +275,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					loadedValue = next.initialValue;
 					model.setValue(next.initialValue);
 				}
-				if (loadedPath !== next.filePath) {
+				if (loadedPath !== next.filePath && !next.forcePlaintext) {
 					loadedPath = next.filePath;
 					const request = ++languageRequest;
 					languageStatus = resolveMonacoLanguage(loadedPath);

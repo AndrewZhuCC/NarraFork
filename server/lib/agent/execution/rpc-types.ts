@@ -31,6 +31,7 @@ export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
 export const FEATURE_FS_READ_OFFSET_V1 = "fs.read.offset.v1";
 /** Serialized content check + replacement; does not exclude external filesystem writers. */
 export const FEATURE_FS_CONDITIONAL_WRITE_V1 = "fs.write.conditional.v1";
+export const FEATURE_EDITOR_RAW_READ_V1 = "editor.raw-read.v1";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -121,6 +122,9 @@ export interface DeviceHelloAckFrame {
 
 export type RpcMethod =
 	| "system.ping"
+	| "editor.read.open"
+	| "editor.read.chunk"
+	| "editor.read.close"
 	| "fs.stat"
 	| "fs.read"
 	| "fs.write"
@@ -214,6 +218,10 @@ export interface FsStatParams {
 	path: string;
 }
 export interface FsStatResult {
+	/** Present only with editorIdentity:true and editor.raw-read.v1. */
+	canonicalRoot?: string;
+	rootIdentity?: string;
+	runtimeEpoch?: string;
 	exists: boolean;
 	isDirectory: boolean;
 	isFile: boolean;

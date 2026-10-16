@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { EditorDocumentDescriptor } from "@shared/editor-document";
+import { EditorStreamCodec } from "@shared/editor-stream-codec";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import {
@@ -7,6 +8,8 @@ import {
 	EditorDocumentRegistry,
 	type EditorRecoveryLease,
 } from "./editor-document-registry";
+import * as modelLoader from "./editor-model-loader";
+import { sessionCanSave } from "./editor-session-state";
 import * as worker from "./editor-worker-client";
 import * as workingCopies from "./editor-working-copy";
 import { TestEditorModel } from "./file-editor-test-model";
@@ -115,6 +118,190 @@ test("two independently authorized consumers share one working copy, model, base
 	expect(registry.size).toBe(0);
 	expect(release).toHaveBeenCalledWith("source", "doc-1");
 });
+
+test("raw-v2 and v1 never share a session/cache entry even with equal opaque keys and ASCII digests", async () => {
+	const codec = new EditorStreamCodec("utf-8");
+	codec.push(new TextEncoder().encode("hello"), true);
+	const metadata = codec.finish();
+	let id = 0;
+	create.mockImplementation(async (_narrator, input) =>
+		input.protocol === "raw-v2"
+			? { ...descriptor(++id), ...metadata }
+			: { ...descriptor(++id), baseHash: metadata.baseHash },
+	);
+	const v1 = await acquire();
+	const raw = await registry.acquire(
+		{ ...options, protocol: "raw-v2" },
+		new AbortController().signal,
+	);
+	leases.push(raw);
+	const sameV1 = await acquire();
+	const sameRaw = await registry.acquire(
+		{ ...options, protocol: "raw-v2" },
+		new AbortController().signal,
+	);
+	leases.push(sameRaw);
+	expect(v1.copy).not.toBe(raw.copy);
+	expect(v1.copy.session).not.toBe(raw.copy.session);
+	expect(sameV1.copy).toBe(v1.copy);
+	expect(sameRaw.copy).toBe(raw.copy);
+	expect(models).toHaveLength(0);
+	expect(source).not.toHaveBeenCalled();
+});
+test("opening raw preview does not invalidate a v1 dirty draft under the same authorized owner/path", async () => {
+	const codec = new EditorStreamCodec("utf-8");
+	codec.push(new TextEncoder().encode("hello"), true);
+	const metadata = codec.finish();
+	let id = 0;
+	create.mockImplementation(async (_narrator, input) =>
+		input.protocol === "raw-v2"
+			? { ...descriptor(++id, "raw-resource"), recoveryKey: "same-owner", ...metadata }
+			: { ...descriptor(++id), recoveryKey: "same-owner", baseHash: metadata.baseHash },
+	);
+	const v1 = await acquire();
+	await v1.copy.ensureLoaded();
+	models[0].edit("draft");
+	const raw = await registry.acquire(
+		{ ...options, protocol: "raw-v2" },
+		new AbortController().signal,
+	);
+	leases.push(raw);
+	const recovery = await registry.discoverRetained(
+		{ ...options, protocol: "raw-v2" },
+		new AbortController().signal,
+		Promise.resolve(raw.copy),
+		async () => ({ recoveryKey: "same-owner" }),
+	);
+	recoveryLeases.push(recovery);
+	expect(recovery.retainedCopies).toHaveLength(0);
+	expect(v1.copy.getSnapshot().invalidated).not.toBe(true);
+	expect(sessionCanSave(v1.copy.getSnapshot())).toBe(true);
+	expect(models[0].text).toBe("draft");
+	expect(v1.copy).not.toBe(raw.copy);
+	create.mockImplementation(async (_narrator, input) =>
+		input.protocol === "raw-v2"
+			? { ...descriptor(++id, "new-actual-context-raw"), recoveryKey: "same-owner", ...metadata }
+			: { ...descriptor(++id, "new-actual-context"), recoveryKey: "same-owner" },
+	);
+	const changed = await acquire();
+	await changed.copy.ensureLoaded();
+	models[1].edit("new context draft");
+	expect(changed.copy.getSnapshot().invalidated).not.toBe(true);
+	expect(v1.copy.getSnapshot().invalidated).toBe(true);
+	expect(raw.copy.getSnapshot().invalidated).toBe(true);
+	const newRaw = await registry.acquire(
+		{ ...options, protocol: "raw-v2" },
+		new AbortController().signal,
+	);
+	leases.push(newRaw);
+	const sameV1 = await acquire();
+	const sameRaw = await registry.acquire(
+		{ ...options, protocol: "raw-v2" },
+		new AbortController().signal,
+	);
+	leases.push(sameRaw);
+	expect(sameV1.copy).toBe(changed.copy);
+	expect(sameRaw.copy).toBe(newRaw.copy);
+	expect(changed.copy.getSnapshot().invalidated).not.toBe(true);
+	expect(newRaw.copy.getSnapshot().invalidated).not.toBe(true);
+	expect(sessionCanSave(changed.copy.getSnapshot())).toBe(true);
+	const oldDraft = await registry.discoverRetained(
+		options,
+		new AbortController().signal,
+		Promise.resolve(changed.copy),
+		async () => ({ recoveryKey: "same-owner" }),
+	);
+	recoveryLeases.push(oldDraft);
+	expect(oldDraft.retainedCopies).toEqual([v1.copy]);
+	expect(oldDraft.retainedCopies[0].session).toBe(v1.copy.session);
+	expect(v1.copy.getSnapshot().invalidated).toBe(true);
+	// The retained copy still provides the public immutable snapshot used by export.
+	const model = oldDraft.retainedCopies[0].model;
+	if (!model) throw new Error("Retained draft must keep its exportable model");
+	const snapshot = model.createSnapshot();
+	let text = "";
+	for (let chunk = snapshot.read(); chunk !== null; chunk = snapshot.read()) text += chunk;
+	expect(text).toBe("draft");
+});
+for (const rapid of [false, true])
+	test(`last raw visibility cancels the candidate and ${rapid ? "rapid reveal retries after old cancellation" : "another visible view keeps it alive"}`, async () => {
+		const codec = new EditorStreamCodec("utf-8");
+		codec.push(new TextEncoder().encode("hello"), true);
+		const metadata = codec.finish();
+		let id = 0;
+		create.mockImplementation(async () => ({ ...descriptor(++id), ...metadata }));
+		const closing = deferred<void>();
+		const signals: AbortSignal[] = [];
+		const loader = spyOn(modelLoader, "loadEditorRawCandidate").mockImplementation(
+			async (input) => {
+				signals.push(input.signal);
+				if (signals.length === 1)
+					return new Promise((_resolve, reject) =>
+						input.signal.addEventListener(
+							"abort",
+							() => {
+								void (rapid ? closing.promise : Promise.resolve()).then(() =>
+									reject(input.signal.reason),
+								);
+							},
+							{ once: true },
+						),
+					);
+				const target = new TestEditorModel({
+					filePath: options.path,
+					documentKey: "retry",
+					initialValue: "hello",
+				});
+				models.push(target);
+				return {
+					model: target.getModel(),
+					format: { version: 1, kind: "uniform", tag: 1, count: 0 },
+					batches: 1,
+					maxBatchMs: 0,
+					maxQueuedBytes: 0,
+				};
+			},
+		);
+		restores.push(() => loader.mockRestore());
+		const a = await registry.acquire(
+			{ ...options, protocol: "raw-v2" },
+			new AbortController().signal,
+		);
+		leases.push(a);
+		const b = !rapid
+			? await registry.acquire({ ...options, protocol: "raw-v2" }, new AbortController().signal)
+			: undefined;
+		if (b) leases.push(b);
+		const loading = a.copy.ensureLoaded();
+		try {
+			for (let turn = 0; turn < 8; turn++) await Promise.resolve();
+			expect(signals).toHaveLength(1);
+			a.setVisible(false);
+			if (b) {
+				expect(signals[0].aborted).toBe(false);
+				b.setVisible(false);
+			}
+			expect(signals[0].aborted).toBe(true);
+			if (rapid) {
+				a.setVisible(true);
+				expect(signals).toHaveLength(1);
+				closing.resolve();
+			}
+			await loading;
+			for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+			if (rapid) {
+				expect(signals).toHaveLength(2);
+				expect(a.copy.getSnapshot().loaded).toBe(true);
+			} else {
+				expect(a.copy.pinReasons).not.toContain("candidate");
+				expect(a.copy.model).toBeNull();
+			}
+		} finally {
+			closing.resolve();
+			a.copy.dispose();
+			await loading;
+		}
+	});
 
 test("simultaneous saves from two leases encode, upload and commit one immutable attempt", async () => {
 	const pending = deferred<Blob>();

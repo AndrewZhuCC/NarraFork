@@ -1077,23 +1077,48 @@ const productionDependencies: FileReferenceDependencies = {
  * requiring the live file to exist. Immutable source/conflict versions remain readable
  * after deletion, and commit can report the deletion as an optimistic-lock conflict.
  * Ordinary reference/preview budgets and existence checks remain unchanged. */
-export async function authorizeEditorReferenceTarget(
+export async function authorizeEditorReferenceContext(
 	narratorId: string,
 	userId: string,
 	path: string,
-): Promise<string> {
+	deviceId = "local",
+) {
 	const deps = productionDependencies;
 	const scope = await deps.loadScope(narratorId, userId, "read");
-	if (scope.runtimePolicy && !scope.runtimePolicy.allowLocalExecution)
-		throw failure("FORBIDDEN", "Narrator runtime policy denies local files", 403);
-	const backend = await deps.getBackend("local");
+	if (
+		scope.runtimePolicy &&
+		(deviceId === "local"
+			? !scope.runtimePolicy.allowLocalExecution
+			: !scope.runtimePolicy.deviceIds.includes(deviceId))
+	)
+		throw failure("FORBIDDEN", "Narrator runtime policy denies this device", 403);
+	if (deviceId !== "local") {
+		const device = scope.devices.find((device) => device.id === deviceId);
+		if (!device)
+			throw failure("FORBIDDEN", "Device is not authorized for this user and narrator", 403);
+		if (!device.online)
+			throw failure(
+				"DEVICE_OFFLINE",
+				"Remote execution device is offline; no local fallback is permitted",
+				503,
+			);
+	}
+	const backend = await deps.getBackend(deviceId);
+	if (
+		backend.deviceId !== deviceId ||
+		(deviceId === "local" ? backend.kind !== "local" : backend.kind !== "remote")
+	)
+		throw failure("IDENTITY_CHANGED", "Execution backend identity mismatch", 409);
+	const cwd = backend.kind === "remote" ? backend.defaultCwd : scope.cwd;
+	if (!cwd || !backend.paths.isAbsolute(cwd))
+		throw failure("INVALID_TARGET", "Execution device has no absolute working directory");
 	const context = await createExecutionTargetContext({
 		backend,
 		target: {
-			deviceId: "local",
-			backendKind: "local",
-			cwd: scope.cwd,
-			lexicalPath: backend.paths.resolve(scope.cwd, path),
+			deviceId,
+			backendKind: backend.kind,
+			cwd,
+			lexicalPath: backend.paths.resolve(cwd, path),
 			pathFlavor: backend.pathFlavor,
 			runtimeGeneration: backend.runtimeGeneration,
 			selectionSource: "explicit",
@@ -1107,7 +1132,15 @@ export async function authorizeEditorReferenceTarget(
 		(await deps.readDecision(scope, context)) !== "allow"
 	)
 		throw failure("FORBIDDEN", "Read policy denies this editor source", 403);
-	return canonical;
+	return context;
+}
+export async function authorizeEditorReferenceTarget(
+	narratorId: string,
+	userId: string,
+	path: string,
+): Promise<string> {
+	return (await authorizeEditorReferenceContext(narratorId, userId, path)).target
+		.canonicalPath as string;
 }
 
 export const fileReferenceService = createFileReferenceService(productionDependencies);

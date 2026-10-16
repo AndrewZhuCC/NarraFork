@@ -16,8 +16,11 @@ import {
 	createEditorDocumentSchema,
 	createEditorDraftAnchorSchema,
 	createEditorUploadSchema,
+	editorRawChunkSchema,
+	editorRawOpenSchema,
 	editorRecoveryScopeSchema,
 } from "../lib/validators/editor-documents";
+import { RemoteBackend } from "../services/device-remote-backend";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import {
 	editorRuntimeUnavailable,
@@ -25,12 +28,17 @@ import {
 } from "../services/editor-document-runtime";
 import {
 	type EditorActor,
+	type EditorBinding,
 	EditorDocumentError,
 	type EditorDocumentService,
 	editorRecoveryKey,
+	editorResourceKey,
 } from "../services/editor-document-service";
 import { rejectEditorSymlinks } from "../services/editor-document-worker";
-import { authorizeEditorReferenceTarget } from "../services/file-reference-service";
+import {
+	authorizeEditorReferenceContext,
+	authorizeEditorReferenceTarget,
+} from "../services/file-reference-service";
 import { resolveNarratorSessionCwd } from "../services/narrator-cwd";
 
 /** Bounded raw metadata reading also covers chunked requests with no Content-Length. */
@@ -65,13 +73,62 @@ export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<
 	return parsed.data;
 }
 export function editorActor(c: Context): EditorActor {
-	return {
+	const actor: EditorActor = {
 		userId: c.get("user").sub,
 		narratorId: c.req.param("id") ?? "",
 		locale: c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en",
 		async authorize(input, need) {
 			const narrator = await requireNarratorAccess(c, c.req.param("id") ?? "", need);
 			const device = input.deviceId ?? narrator.defaultDeviceId ?? "local";
+			if (device !== "local" && input.protocol === "raw-v2" && need === "read") {
+				const context = await authorizeEditorReferenceContext(
+					narrator.id,
+					actor.userId,
+					input.path,
+					device,
+				);
+				const backend = context.backend;
+				if (!(backend instanceof RemoteBackend) || !backend.supportsEditorRawRead)
+					throw new AppError(
+						"Upgrade the executor: editor.raw-read.v1 is required; no host fallback is permitted",
+						422,
+						"EDITOR_PROVIDER_UNSUPPORTED",
+					);
+				const root = await backend.editorRootIdentity();
+				const binding: EditorBinding = {
+					deviceId: device,
+					cwd: root.canonicalRoot,
+					projectId: null,
+					lexicalPath:
+						context.target.lexicalPath ??
+						backend.paths.resolve(backend.defaultCwd ?? "", input.path),
+					canonicalPath: context.target.canonicalPath as string,
+					outsideRoots: false,
+					contextKey: JSON.stringify([
+						narrator.workspaceRevision,
+						narrator.workspaceContext?.contextKey,
+						narrator.defaultDeviceId,
+						narrator.chapterId,
+					]),
+					workspaceIdentity: root.rootIdentity,
+					pathFlavor: backend.pathFlavor,
+					runtimeGeneration: backend.runtimeGeneration,
+					runtimeEpoch: root.runtimeEpoch,
+				};
+				binding.rawSource = backend.editorRawSource(
+					{
+						deviceId: device,
+						pathFlavor: backend.pathFlavor,
+						canonicalPath: binding.canonicalPath,
+						workspaceIdentity: root.rootIdentity,
+						runtimeEpoch: root.runtimeEpoch,
+						runtimeGeneration: backend.runtimeGeneration,
+						fencingToken: backend.runtimeGeneration,
+					},
+					editorResourceKey(actor, input, binding),
+				);
+				return binding;
+			}
 			if (device !== "local")
 				throw new AppError(
 					"Remote editor transfers are unsupported; use the existing read-only entry",
@@ -150,6 +207,7 @@ export function editorActor(c: Context): EditorActor {
 			};
 		},
 	};
+	return actor;
 }
 export function createEditorDocumentRoutes(
 	getService: () => EditorDocumentService = getEditorDocumentService,
@@ -163,7 +221,10 @@ export function createEditorDocumentRoutes(
 	};
 	const base = "/:id/editor-documents";
 	routes.use(`${base}/*`, async (c, next) => {
-		if (c.req.method === "GET" && /\/editor-documents\/(info|page)$/.test(c.req.path)) {
+		if (
+			(c.req.method === "GET" && /\/editor-documents\/(info|page)$/.test(c.req.path)) ||
+			/\/editor-documents\/[^/]+\/raw-reads(?:\/[^/]+)?$/.test(c.req.path)
+		) {
 			// The panel operation budgets access checks together with metadata/IO.
 			if (!c.get("user")?.sub) throw new AppError("Authentication required", 401, "UNAUTHORIZED");
 			c.header("Cache-Control", "no-store");
@@ -288,6 +349,39 @@ export function createEditorDocumentRoutes(
 		// Reauthorization boundary: a revoked narrator cannot publish a late disk observation.
 		await protect(c);
 		return c.json(state);
+	});
+	routes.post(`${base}/:docId/raw-reads`, async (c) => {
+		const input = await readEditorMetadata(c.req.raw, editorRawOpenSchema);
+		return c.json(
+			await getService().rawOpen(
+				editorActor(c),
+				c.req.param("docId"),
+				input.versionHandle,
+				c.req.raw.signal,
+			),
+		);
+	});
+	routes.post(`${base}/:docId/raw-reads/:readId`, async (c) => {
+		const input = await readEditorMetadata(c.req.raw, editorRawChunkSchema);
+		const chunk = await getService().rawChunk(
+			editorActor(c),
+			c.req.param("docId"),
+			c.req.param("readId"),
+			input.offset,
+			input.maxBytes,
+		);
+		return new Response(chunk.bytes as Uint8Array<ArrayBuffer>, {
+			headers: {
+				"Content-Type": "application/octet-stream",
+				"Cache-Control": "no-store",
+				"X-Editor-EOF": chunk.eof ? "1" : "0",
+				"X-Content-Type-Options": "nosniff",
+			},
+		});
+	});
+	routes.delete(`${base}/:docId/raw-reads/:readId`, async (c) => {
+		await getService().rawClose(editorActor(c), c.req.param("docId"), c.req.param("readId"));
+		return c.body(null, 204);
 	});
 	routes.get(`${base}/:docId/content`, async (c) => {
 		const version = c.req.query("version");

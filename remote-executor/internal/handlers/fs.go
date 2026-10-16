@@ -52,13 +52,23 @@ func (h *Handlers) FsStat(params map[string]any) (any, error) {
 		}
 		return nil, err
 	}
-	return map[string]any{
+	result := map[string]any{
 		"exists":       true,
 		"isDirectory":  info.IsDir(),
 		"isFile":       info.Mode().IsRegular(),
 		"size":         info.Size(),
 		"resolvedPath": path,
-	}, nil
+	}
+	if boolParam(params, "editorIdentity") {
+		root, identity, err := h.EditorRootIdentity(path)
+		if err != nil {
+			return nil, err
+		}
+		result["canonicalRoot"] = root
+		result["rootIdentity"] = identity
+		result["runtimeEpoch"] = EditorRuntimeEpoch()
+	}
+	return result, nil
 }
 
 func (h *Handlers) FsExists(params map[string]any) (any, error) {

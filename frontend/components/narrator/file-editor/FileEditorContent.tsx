@@ -14,6 +14,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { EditorRawEncoding } from "@shared/editor-document";
 import {
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	type FileReferenceEditorSelection,
@@ -54,10 +55,12 @@ import type { DiffLine } from "../diff/DiffView";
 import { availableModes } from "../file-viewer/file-viewer-modes";
 import { useEditorPanelVisible, useRetainedEditorView } from "../narrator-panel-visibility";
 import { filePanelBaseName } from "../panels/panel-kind";
+import { EditorPagedView } from "./EditorPagedView";
 import {
 	EditorReceiptNotice,
 	EditorRecoveryBoundary,
 	editorRecoveryScopeIdentity,
+	readEditorProtocol,
 	useEditorRecoveryHost,
 } from "./EditorRecoveryBoundary";
 import { editorDiskStateRegistry } from "./editor-disk-state";
@@ -101,6 +104,9 @@ const CONFLICT_DIFF_CHARS = 32 * 1024;
 
 export interface FileEditorContentProps {
 	filePath: string;
+	/** Explicit raw-v2 read-only rollout. Default remains the existing v1 editor. */
+	rawProtocol?: boolean;
+	rawEncoding?: EditorRawEncoding;
 	/** Actual source narrator; the dock host is not a filesystem authority. */
 	narratorId?: string;
 	deviceId?: string;
@@ -141,6 +147,12 @@ function FileEditorBinding(props: FileEditorContentProps) {
 	const { t } = useTranslation("narrator");
 	const [copy, setCopy] = useState<EditorWorkingCopy | null>(null);
 	const recovery = useEditorRecoveryHost(props);
+	const [rawV2] = useState(
+		() =>
+			(props.rawProtocol !== undefined
+				? readEditorProtocol(props.rawProtocol)
+				: (recovery?.protocol ?? readEditorProtocol())) === "raw-v2",
+	);
 	const [error, setError] = useState<string | null>(null);
 	const [retry, setRetry] = useState(0);
 	const latest = useRef(t);
@@ -193,11 +205,14 @@ function FileEditorBinding(props: FileEditorContentProps) {
 		setError(null);
 		const controller = new AbortController();
 		controllerRef.current = controller;
-		const readOnly = deviceId !== "local" || !narratorId;
+		const readOnly = !narratorId || (deviceId !== "local" && !rawV2);
 		const options: WorkingCopyOptions = {
 			narratorId: narratorId ?? "",
 			path: filePath,
 			deviceId,
+			...(rawV2 && narratorId
+				? { protocol: "raw-v2" as const, encodingHint: props.rawEncoding }
+				: {}),
 			origin: () => (referenceOrigin ? "reference" : "legacy"),
 			translate: (key, defaultValue) => latest.current(`fileEditor.${key}`, { defaultValue }),
 			...(readOnly
@@ -252,7 +267,18 @@ function FileEditorBinding(props: FileEditorContentProps) {
 			});
 		unregisterRef.current?.();
 		unregisterRef.current = recovery?.registerViewing(viewing);
-	}, [narratorId, filePath, deviceId, referenceOrigin, retry, recovery, visible, copy]);
+	}, [
+		narratorId,
+		filePath,
+		deviceId,
+		referenceOrigin,
+		retry,
+		recovery,
+		visible,
+		copy,
+		rawV2,
+		props.rawEncoding,
+	]);
 	if (error)
 		return (
 			<Center h="100%">
@@ -332,6 +358,7 @@ function FileEditorDocument({
 	// Only an older server that declares none keeps the original device heuristic.
 	const readOnly =
 		!narratorId ||
+		state.protocol === "raw-v2" ||
 		!!state.invalidated ||
 		(state.capabilities ? !state.capabilities.v1Save : deviceId !== "local");
 	const clipboard = useClipboard({ timeout: 1500 });
@@ -434,7 +461,7 @@ function FileEditorDocument({
 	// Reload is document-owned, but each view preserves its own reading position.
 	useEffect(
 		() =>
-			workingCopy.onWillApply(() => {
+			workingCopy.onWillApply((nextModel) => {
 				const view = editorRef.current?.getEditor();
 				const scrollTop = view?.getScrollTop?.();
 				// setValue resets cursor/selection; reinstall this view's own state afterwards.
@@ -450,6 +477,7 @@ function FileEditorDocument({
 					);
 				previewScrollFraction.current = previewLastScrollFraction.current;
 				return () => {
+					if (nextModel !== undefined) view?.setModel(nextModel);
 					if (saved) view?.restoreViewState?.(saved);
 					if (scrollTop != null) view?.setScrollTop?.(scrollTop);
 					if (modeRef.current !== "raw") regeneratePreviewRef.current();
@@ -496,7 +524,7 @@ function FileEditorDocument({
 			// only runs for ownership-relevant moments (mouseup / keyboard / focus).
 			if (explicit) {
 				publishSelection?.(
-					session.state.baseHash && next
+					session.state.baseHash && next && session.state.protocol !== "raw-v2"
 						? {
 								target: { deviceId, path: filePath, selection: next },
 								label: filePanelBaseName(filePath),
@@ -542,7 +570,7 @@ function FileEditorDocument({
 		if (!visible || !baseHash) return;
 		const next = editorSelectionRef.current;
 		publishSelection?.(
-			next
+			next && session.state.protocol !== "raw-v2"
 				? {
 						target: { deviceId, path: filePath, selection: next },
 						label: filePanelBaseName(filePath),
@@ -551,7 +579,7 @@ function FileEditorDocument({
 					}
 				: null,
 		);
-	}, [visible, baseHash, deviceId, dirty, filePath, publishSelection]);
+	}, [visible, baseHash, deviceId, dirty, filePath, publishSelection, session.state.protocol]);
 	useEffect(() => () => publishSelection?.(null), [publishSelection]);
 	useEffect(() => {
 		onDirtyChange?.(exitBlocked);
@@ -619,7 +647,7 @@ function FileEditorDocument({
 	// A remembered non-raw default means the panel OPENS in preview/split: generate
 	// the first rendering once the model is ready, without waiting for a mode click.
 	useEffect(() => {
-		if (!visible) {
+		if (!visible || state.paged) {
 			previewController.current?.abort();
 			setPreviewText(null);
 			setSearchOpen(false);
@@ -627,7 +655,7 @@ function FileEditorDocument({
 			return;
 		}
 		if (state.loaded && mode !== "raw") void generatePreview(true);
-	}, [visible, state.loaded, mode, generatePreview]);
+	}, [visible, state.loaded, state.paged, mode, generatePreview]);
 	// Split mode is a LIVE view: edits regenerate the preview behind the current one
 	// (keepCurrent) after a short debounce, so typing never flashes a loader.
 	useEffect(() => {
@@ -638,7 +666,7 @@ function FileEditorDocument({
 	// Split direction follows the panel's own aspect ratio: wide panels split left/
 	// right, tall (or narrow dock) panels stack the preview below the editor.
 	useEffect(() => {
-		if (!visible || mode !== "split") return;
+		if (!visible || state.paged || mode !== "split") return;
 		const el = splitContainerRef.current;
 		if (!el || typeof ResizeObserver === "undefined") return;
 		const update = () => setSplitHorizontal(el.clientWidth >= el.clientHeight);
@@ -646,7 +674,7 @@ function FileEditorDocument({
 		const observer = new ResizeObserver(update);
 		observer.observe(el);
 		return () => observer.disconnect();
-	}, [visible, mode]);
+	}, [visible, state.paged, mode]);
 	// Bidirectional scroll sync. Both preview kinds carry `data-line` anchors:
 	// markdown blocks get them from MarkdownContent, node-tree rows from the
 	// parser (structured-parse stamps each entry's source line). Both directions
@@ -904,6 +932,18 @@ function FileEditorDocument({
 					<Loader size="sm" />
 				)}
 			</Center>
+		);
+	if (state.paged && workingCopy.pagedDocument)
+		return (
+			<EditorPagedView
+				narratorId={narratorId ?? ""}
+				document={workingCopy.pagedDocument}
+				expectedHash={state.baseHash}
+				onReload={() => {
+					void session.load();
+				}}
+				visible={visible}
+			/>
 		);
 	const saving = state.phase !== "idle" && state.phase !== "unknown";
 	// Split keeps the editor fully interactive beside the preview; preview/node
@@ -1313,24 +1353,29 @@ function FileEditorDocument({
 								}
 					}
 				>
-					<MonacoEditor
-						initialValue=""
-						model={workingCopy.model ?? undefined}
-						documentKey={documentKey}
-						filePath={filePath}
-						onReady={handleReady}
-						onDocumentChange={handleChange}
-						onSelectionChange={handleSelection}
-						onSearchRequested={openSearch}
-						onSave={handleSave}
-						onError={(error) => setEditorError(error.message)}
-						selection={selection}
-						navigationRequestId={navigationRequestId}
-						readOnly={readOnly || state.loading || !!state.invalidated}
-						lineWrapping={lineWrapping}
-						visible={editorActive}
-						viewState={viewState}
-					/>
+					{(workingCopy.protocol !== "raw-v2" || workingCopy.model) && (
+						<MonacoEditor
+							initialValue=""
+							model={workingCopy.model ?? undefined}
+							forcePlaintext={
+								state.protocol === "raw-v2" && workingCopy.model?.getLanguageId() === "plaintext"
+							}
+							documentKey={documentKey}
+							filePath={filePath}
+							onReady={handleReady}
+							onDocumentChange={handleChange}
+							onSelectionChange={handleSelection}
+							onSearchRequested={openSearch}
+							onSave={handleSave}
+							onError={(error) => setEditorError(error.message)}
+							selection={selection}
+							navigationRequestId={navigationRequestId}
+							readOnly={readOnly || state.loading || !!state.invalidated}
+							lineWrapping={lineWrapping}
+							visible={editorActive}
+							viewState={viewState}
+						/>
+					)}
 				</Box>
 				{mode !== "raw" && (
 					<Box

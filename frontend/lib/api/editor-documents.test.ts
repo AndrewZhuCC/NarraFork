@@ -1,6 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { EDITOR_METADATA_MAX_BYTES, EDITOR_TRANSFER_MAX_BYTES } from "@shared/editor-document";
+import { EditorStreamCodec } from "@shared/editor-stream-codec";
 import { editorDocumentApi, readEditorBody } from "./editor-documents";
+
+const rawDocument = (text = "abcdef") => {
+	const codec = new EditorStreamCodec("utf-8");
+	codec.push(new TextEncoder().encode(text), true);
+	return {
+		...codec.finish(),
+		docId: "doc",
+		versionHandle: "version",
+		target: { deviceId: "local", path: "/a.txt" },
+	};
+};
 
 const originalFetch = globalThis.fetch;
 let storage: PropertyDescriptor | undefined;
@@ -22,6 +34,114 @@ function mockFetch(fn: (url: string, options?: RequestInit) => Response | Promis
 }
 
 describe("bounded editor document transport", () => {
+	test("raw pull credit waits for real consumer completion and never materializes a body Blob", async () => {
+		let pulls = 0,
+			closed = 0,
+			entered!: () => void,
+			resume!: () => void;
+		const first = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const paused = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		mockFetch((_url, options) => {
+			if (options?.method === "DELETE") {
+				closed++;
+				return new Response(null, { status: 204 });
+			}
+			const input = JSON.parse(String(options?.body));
+			if (input.versionHandle) return Response.json({ readId: "read" });
+			pulls++;
+			expect(input.maxBytes).toBe(3);
+			return new Response(input.offset ? "def" : "abc", {
+				headers: { "x-editor-eof": input.offset ? "1" : "0" },
+			});
+		});
+		let text = "";
+		const loading = editorDocumentApi.rawSource(
+			"n",
+			rawDocument(),
+			async (bytes) => {
+				text += new TextDecoder().decode(bytes);
+				if (pulls === 1) {
+					entered();
+					await paused;
+				}
+			},
+			new AbortController().signal,
+			() => 3,
+		);
+		await first;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(pulls).toBe(1);
+		resume();
+		await loading;
+		expect(pulls).toBe(2);
+		expect(text).toBe("abcdef");
+		expect(closed).toBe(1);
+	});
+	test("raw cancellation closes a blocked body reader and releases its read context", async () => {
+		let closed = 0,
+			cancelled = false,
+			entered!: () => void;
+		const reading = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		mockFetch((_url, options) => {
+			if (options?.method === "DELETE") {
+				closed++;
+				return new Response(null, { status: 204 });
+			}
+			if (JSON.parse(String(options?.body)).versionHandle) return Response.json({ readId: "read" });
+			entered();
+			return new Response(
+				new ReadableStream({
+					cancel() {
+						cancelled = true;
+					},
+				}),
+				{ headers: { "x-editor-eof": "0" } },
+			);
+		});
+		const controller = new AbortController();
+		const loading = editorDocumentApi.rawSource(
+			"n",
+			rawDocument(),
+			async () => {},
+			controller.signal,
+		);
+		await reading;
+		controller.abort(new Error("raw abort"));
+		await expect(loading).rejects.toThrow("raw abort");
+		expect(cancelled).toBe(true);
+		expect(closed).toBe(1);
+	});
+	for (const failure of ["credit", "eof", "length"] as const)
+		test(`raw transport rejects ${failure} and closes its context`, async () => {
+			let closed = 0;
+			mockFetch((_url, options) => {
+				if (options?.method === "DELETE") {
+					closed++;
+					return new Response(null, { status: 204 });
+				}
+				if (JSON.parse(String(options?.body)).versionHandle)
+					return Response.json({ readId: "read" });
+				return new Response(failure === "credit" ? "1234567" : "abc", {
+					headers: failure === "eof" ? {} : { "x-editor-eof": "1" },
+				});
+			});
+			await expect(
+				editorDocumentApi.rawSource(
+					"n",
+					rawDocument(),
+					async () => {},
+					new AbortController().signal,
+					() => 6,
+				),
+			).rejects.toThrow();
+			expect(closed).toBe(1);
+		});
 	test("coalesces tiny chunks while preserving UTF-8 boundaries", async () => {
 		const bytes = new TextEncoder().encode("中文𝄞\n");
 		let offset = 0;

@@ -143,6 +143,43 @@ function deferred() {
 	return { resolve, promise };
 }
 
+test("raw open final authorization and DELETE settle without leaking the closing session quota", async () => {
+	const doc = await service.create(actor, {
+		path: target,
+		deviceId: "local",
+		origin: "legacy",
+		protocol: "raw-v2",
+	});
+	const entered = deferred(),
+		resume = deferred();
+	const authorize = actor.authorize.bind(actor);
+	let calls = 0;
+	const pause = spyOn(actor, "authorize").mockImplementation(async (...args) => {
+		const binding = await authorize(...args);
+		if (++calls === 2) {
+			entered.resolve();
+			await resume.promise;
+		}
+		return binding;
+	});
+	const opening = service.rawOpen(actor, doc.docId, doc.versionHandle).catch((error) => error);
+	try {
+		await entered.promise;
+		expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
+		resume.resolve();
+		expect(await opening).toBeInstanceOf(EditorDocumentError);
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		expect(
+			(Reflect.get(service, "userSessions") as Map<string, number>).get(actor.userId) ?? 0,
+		).toBe(0);
+		expect(service.streams.diagnostics.active).toBe(0);
+	} finally {
+		resume.resolve();
+		await opening;
+		pause.mockRestore();
+	}
+});
+
 async function createFifo(path: string) {
 	const command = Bun.spawn(["mkfifo", path], {
 		stdin: "ignore",

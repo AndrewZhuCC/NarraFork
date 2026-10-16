@@ -2,10 +2,13 @@ package rpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"github.com/narrafork/remote-executor/internal/handlers"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -159,13 +162,31 @@ func TestEditorContractGoldenFixture(t *testing.T) {
 	}
 }
 
-// Phase 5 freezes types only: no editor feature may be advertised before its handler exists.
-func TestEditorContractsAdvertiseNoFeature(t *testing.T) {
+// Only implemented editor features may be advertised; frozen future contracts
+// alone must not enable write, stage, query, or watch capabilities.
+func TestEditorContractsAdvertiseImplementedFeaturesOnly(t *testing.T) {
 	encoded, err := json.Marshal(Capabilities{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(encoded, []byte("editor")) {
-		t.Fatalf("executor advertises an unimplemented editor feature: %s", encoded)
+	var caps Capabilities
+	if err := json.Unmarshal(encoded, &caps); err != nil {
+		t.Fatal(err)
+	}
+	for _, feature := range caps.Features {
+		if strings.HasPrefix(feature, "editor.") && feature != FeatureEditorRawReadV1 {
+			t.Fatalf("executor advertises an unimplemented editor feature: %s", feature)
+		}
+	}
+	if !containsFeature(caps.Features, FeatureEditorRawReadV1) {
+		t.Fatal("implemented raw-read feature missing")
+	}
+	d := NewDispatcher(handlers.New(handlers.NewPathGuard(nil), 1024))
+	defer d.CloseEditorReads()
+	for _, method := range []string{"editor.read.open", "editor.read.chunk", "editor.read.close"} {
+		_, err := d.Dispatch(context.Background(), method, nil, nil)
+		if err != nil && strings.Contains(err.Error(), "unknown method") {
+			t.Fatal("advertised method has no handler", method)
+		}
 	}
 }

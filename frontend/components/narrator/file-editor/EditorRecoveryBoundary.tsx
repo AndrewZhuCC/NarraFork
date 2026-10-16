@@ -28,6 +28,15 @@ export interface EditorRecoveryScopeProps {
 	narratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
+	rawProtocol?: boolean;
+}
+export function readEditorProtocol(explicit?: boolean): "text-v1" | "raw-v2" {
+	if (explicit !== undefined) return explicit ? "raw-v2" : "text-v1";
+	try {
+		return localStorage.getItem("narrafork_editor_raw_v2") === "1" ? "raw-v2" : "text-v1";
+	} catch {
+		return "text-v1";
+	}
 }
 export function editorRecoveryScopeIdentity(props: EditorRecoveryScopeProps) {
 	return JSON.stringify([
@@ -55,7 +64,10 @@ class RecoveryHost {
 	private snapshot = { epoch: 0, exclude: this.slot.exclude };
 	private listeners = new Set<() => void>();
 	private gateAttempt: number | undefined;
-	constructor(readonly identity: string) {}
+	constructor(
+		readonly identity: string,
+		readonly protocol: "text-v1" | "raw-v2",
+	) {}
 	subscribe = (listener: () => void) => {
 		this.listeners.add(listener);
 		return () => {
@@ -111,19 +123,32 @@ class RecoveryHost {
 const RecoveryHostContext = createContext<RecoveryHost | null>(null);
 export function useEditorRecoveryHost(props: EditorRecoveryScopeProps) {
 	const host = useContext(RecoveryHostContext);
-	return host?.identity === editorRecoveryScopeIdentity(props) ? host : null;
+	return host?.identity === editorRecoveryScopeIdentity(props) &&
+		(props.rawProtocol === undefined || host.protocol === readEditorProtocol(props.rawProtocol))
+		? host
+		: null;
 }
 
 /** Stable outside metadata/size gates, including when the editable child never mounts. */
 export function EditorRecoveryBoundary(props: EditorRecoveryScopeProps & { children: ReactNode }) {
 	const { t } = useTranslation("narrator");
 	const principal = useEditorAuthority(props.narratorId, t("fileEditor.identityChanged"));
+	const [defaultProtocol] = useState(() => readEditorProtocol());
+	const protocol =
+		props.rawProtocol === undefined ? defaultProtocol : readEditorProtocol(props.rawProtocol);
 	// Origin updates retain the host DOM; the independently keyed coordinator and editor
 	// binding still forbid migrating an old draft to a different authorization origin.
 	return (
 		<RecoveryBoundaryIdentity
-			key={JSON.stringify([principal, props.narratorId, props.deviceId ?? "local", props.filePath])}
+			key={JSON.stringify([
+				principal,
+				props.narratorId,
+				props.deviceId ?? "local",
+				props.filePath,
+				protocol,
+			])}
 			{...props}
+			protocol={protocol}
 		/>
 	);
 }
@@ -132,13 +157,14 @@ function RecoveryBoundaryIdentity({
 	narratorId,
 	deviceId = "local",
 	referenceOrigin = false,
+	protocol,
 	children,
-}: EditorRecoveryScopeProps & { children: ReactNode }) {
+}: EditorRecoveryScopeProps & { children: ReactNode; protocol: "text-v1" | "raw-v2" }) {
 	const { t } = useTranslation("narrator");
 	const latest = useRef(t);
 	latest.current = t;
 	const identity = editorRecoveryScopeIdentity({ filePath, narratorId, deviceId, referenceOrigin });
-	const host = useMemo(() => new RecoveryHost(identity), [identity]);
+	const host = useMemo(() => new RecoveryHost(identity, protocol), [identity, protocol]);
 	const request = useSyncExternalStore(host.subscribe, host.getSnapshot, host.getSnapshot);
 	const [retained, setRetained] = useState<readonly EditorWorkingCopy[]>([]);
 	const [error, setError] = useState<string | null>(null);
@@ -172,6 +198,7 @@ function RecoveryBoundaryIdentity({
 			narratorId: narratorId ?? "",
 			path: filePath,
 			deviceId,
+			protocol,
 			origin: () => (referenceOrigin ? "reference" : "legacy"),
 			translate: (key, defaultValue) => latest.current(`fileEditor.${key}`, { defaultValue }),
 		};
@@ -201,7 +228,7 @@ function RecoveryBoundaryIdentity({
 			controller.abort();
 			release?.();
 		};
-	}, [narratorId, filePath, deviceId, referenceOrigin, request, visible, authorizeScope]);
+	}, [narratorId, filePath, deviceId, referenceOrigin, request, visible, authorizeScope, protocol]);
 	return (
 		<RecoveryHostContext.Provider value={host}>
 			<Box style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
@@ -213,6 +240,7 @@ function RecoveryBoundaryIdentity({
 						narratorId: narratorId ?? "",
 						path: filePath,
 						deviceId,
+						protocol,
 						origin: () => (referenceOrigin ? "reference" : "legacy"),
 					}}
 				/>

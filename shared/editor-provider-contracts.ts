@@ -8,7 +8,8 @@
  * The request/response types below are mirrored in
  * remote-executor/internal/rpc/editor_contracts.go and pinned by the shared
  * fixture editor-provider-contracts.golden.json (decoded strictly by Go and
- * type/enum-checked by TS). No handler implements them yet.
+ * type/enum-checked by TS). Phase 6 implements only raw read; stage/apply/query/watch
+ * remain unavailable until their handlers and tests ship.
  */
 
 export interface EditorProviderCapabilities {

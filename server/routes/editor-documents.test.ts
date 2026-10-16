@@ -94,6 +94,89 @@ async function openDoc(origin = "legacy", deviceId = "local") {
 	expect(response.status).toBe(200);
 	return (await response.json()) as EditorDocumentDescriptor;
 }
+test("raw-v2 streams exact BOM bytes, has separate cache/hash domain and rejects all v1 writes", async () => {
+	await writeFile(path, "\ufeffone\r\ntwo\rthree\n\ufeff");
+	const v1 = await openDoc();
+	const response = await request(base(), "POST", { path, origin: "legacy", protocol: "raw-v2" });
+	expect(response.status).toBe(200);
+	const raw =
+		(await response.json()) as import("../../shared/editor-document").EditorRawDocumentDescriptor;
+	expect(raw.protocol).toBe("raw-v2");
+	expect(raw.hashKind).toBe("raw-sha256");
+	expect(raw.resourceKey).not.toBe(v1.resourceKey);
+	expect(raw.capabilities?.v1Save).toBe(false);
+	const open = await request(`${base()}/${raw.docId}/raw-reads`, "POST", {
+		versionHandle: raw.versionHandle,
+	});
+	expect(open.status).toBe(200);
+	const { readId } = await open.json();
+	const chunks: Uint8Array[] = [];
+	let offset = 0;
+	for (;;) {
+		const chunk = await request(`${base()}/${raw.docId}/raw-reads/${readId}`, "POST", {
+			offset,
+			maxBytes: 3,
+		});
+		expect(chunk.status).toBe(200);
+		const bytes = new Uint8Array(await chunk.arrayBuffer());
+		chunks.push(bytes);
+		offset += bytes.length;
+		if (chunk.headers.get("x-editor-eof") === "1") break;
+	}
+	expect(Buffer.concat(chunks)).toEqual(await readFile(path));
+	expect(service.streams.diagnostics.active).toBe(1);
+	expect((await request(`${base()}/${raw.docId}/raw-reads/${readId}`, "DELETE")).status).toBe(204);
+	expect(service.streams.diagnostics.active).toBe(0);
+	const upload = await request(`${base()}/${raw.docId}/uploads`, "POST", {
+		baseHash: raw.baseHash,
+		encoding: raw.encoding,
+		snapshotRevision: 1,
+	});
+	expect(upload.status).toBe(403);
+	expect((await upload.json()).code).toBe("EDITOR_RAW_READ_ONLY");
+	const disk = await request(`${base()}/${raw.docId}/disk-state`);
+	expect((await disk.json()).hashKind).toBe("raw-sha256");
+	await writeFile(path, "same ascii");
+	const ascii = await request(base(), "POST", { path, origin: "legacy", protocol: "raw-v2" });
+	const asciiDoc = await ascii.json();
+	const old = await openDoc();
+	expect(asciiDoc.baseHash).toBe(old.baseHash);
+	expect(
+		(
+			await request(`${base()}/${asciiDoc.docId}/uploads`, "POST", {
+				baseHash: old.baseHash,
+				encoding: "utf-8",
+				snapshotRevision: 1,
+			})
+		).status,
+	).toBe(403);
+});
+test("raw-v2 rechecks publication authority and closes a revoked owner's active source", async () => {
+	const response = await request(base(), "POST", { path, origin: "legacy", protocol: "raw-v2" });
+	const raw = await response.json();
+	const opened = await request(`${base()}/${raw.docId}/raw-reads`, "POST", {
+		versionHandle: raw.versionHandle,
+	});
+	const { readId } = await opened.json();
+	expect(service.streams.diagnostics.active).toBe(1);
+	const other = generateId();
+	db.insert(users)
+		.values({
+			id: other,
+			username: other,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	db.update(narrators).set({ ownerUserId: other }).where(eq(narrators.id, narratorId)).run();
+	const chunk = await request(`${base()}/${raw.docId}/raw-reads/${readId}`, "POST", {
+		offset: 0,
+		maxBytes: 64,
+	});
+	expect(chunk.status).toBe(404);
+	expect(service.streams.diagnostics.active).toBe(0);
+});
 async function seal(doc: EditorDocumentDescriptor) {
 	const response = await request(`${base()}/${doc.docId}/uploads`, "POST", {
 		baseHash: doc.baseHash,

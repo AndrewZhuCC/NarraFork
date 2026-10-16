@@ -126,7 +126,10 @@ async function copyWith(
 		api,
 		applyContent,
 		edit,
-		setDisk: (next: Partial<EditorDocumentDescriptor>, body: string) => {
+		setDisk: (
+			next: Partial<import("@shared/editor-document").EditorV1DocumentDescriptor>,
+			body: string,
+		) => {
 			source = { ...source, ...next };
 			text = body;
 		},

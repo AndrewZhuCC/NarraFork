@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import { constants } from "node:fs";
 import { chmod, chown, lstat, mkdir, open, readdir, rm, rmdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import type { EditorRawMetadata } from "../../shared/editor-document";
 import {
 	type CreateEditorDocumentInput,
 	type CreateEditorDraftAnchorInput,
@@ -31,6 +32,7 @@ import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { EditorOperationMetadata } from "../lib/validators/editor-documents";
 import { EditorDocumentJobs } from "./editor-document-jobs";
+import { EditorDocumentStreams, type EditorRemoteRawSource } from "./editor-document-streams";
 import type { EditorVersionMetadata } from "./editor-document-worker";
 import { EditorDraftAnchorStore } from "./editor-draft-anchor-store";
 import type { EditorFileChangeRequest, FileChangeCompletion } from "./file-change-runtime";
@@ -45,6 +47,11 @@ export interface EditorBinding {
 	contextKey?: string;
 	workspaceIdentity?: string;
 	pathFlavor?: "posix" | "windows";
+	/** Only a reauthorized remote backend can supply this; never host-open remote paths. */
+	rawSource?: EditorRemoteRawSource;
+	deviceId?: string;
+	runtimeGeneration?: number;
+	runtimeEpoch?: string;
 }
 
 export function editorResourceKey(
@@ -58,7 +65,7 @@ export function editorResourceKey(
 				"editor-resource-v1",
 				actor.userId,
 				actor.narratorId,
-				input.deviceId ?? "local",
+				binding.deviceId ?? input.deviceId ?? "local",
 				input.origin,
 				binding.cwd,
 				binding.projectId,
@@ -67,6 +74,9 @@ export function editorResourceKey(
 				binding.pathFlavor,
 				binding.canonicalPath,
 				binding.outsideRoots,
+				...(input.protocol === "raw-v2"
+					? ["raw-v2", input.encodingHint, binding.runtimeGeneration, binding.runtimeEpoch]
+					: []),
 			]),
 		)
 		.digest("hex");
@@ -156,6 +166,7 @@ interface Session {
 	input: CreateEditorDocumentInput;
 	binding: EditorBinding;
 	source?: SourceVersion;
+	raw?: { handle: string; metadata: EditorRawMetadata };
 	conflict?: Version;
 	uploads: Map<string, Upload>;
 	looseFiles: Set<string>;
@@ -290,6 +301,7 @@ export class EditorDocumentService {
 	private sessions = new Map<string, Session>();
 	private operations = new Map<string, Operation>();
 	private readonly jobs: EditorDocumentJobs;
+	readonly streams = new EditorDocumentStreams();
 	private ready?: Promise<void>;
 	private rootIdentity?: string;
 	private heal?: Promise<void>;
@@ -466,6 +478,12 @@ export class EditorDocumentService {
 	}
 	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
 		const session = await this.owned(actor, docId);
+		if (need === "write" && session.input.protocol === "raw-v2")
+			throw new EditorDocumentError(
+				"EDITOR_RAW_READ_ONLY",
+				"The raw-v2 writer is not available",
+				403,
+			);
 		const binding = await actor.authorize(session.input, need);
 		assertSameEditorBinding(actor, session.input, session.binding, binding);
 		if (session.closing || !this.sessions.has(docId)) throw expired();
@@ -502,6 +520,29 @@ export class EditorDocumentService {
 		this.sessions.set(session.id, session);
 		this.count(this.userSessions, actor.userId, 1);
 		try {
+			if (input.protocol === "raw-v2") {
+				const metadata = await this.streams.metadata(
+					actor.userId,
+					binding.rawSource ?? binding.canonicalPath,
+					input.encodingHint,
+					signal,
+					session.id,
+				);
+				await this.bound(actor, session.id, "read");
+				session.raw = { handle: randomUUID(), metadata };
+				return {
+					docId: session.id,
+					resourceKey: editorResourceKey(actor, input, binding),
+					recoveryKey: editorRecoveryKey(actor, input),
+					target: {
+						deviceId: binding.deviceId ?? input.deviceId ?? "local",
+						path: binding.canonicalPath,
+					},
+					versionHandle: session.raw.handle,
+					capabilities: { ...EDITOR_LOCAL_V1_CAPABILITIES, v1Save: false, rawRead: true },
+					...metadata,
+				};
+			}
 			const result = await this.jobs.run(
 				actor.userId,
 				{ action: "metadata", sourcePath: binding.canonicalPath },
@@ -542,7 +583,25 @@ export class EditorDocumentService {
 		docId: string,
 		signal?: AbortSignal,
 	): Promise<import("../../shared/editor-document").EditorDiskState> {
-		const { binding } = await this.bound(actor, docId, "read");
+		const { binding, session } = await this.bound(actor, docId, "read");
+		if (session.raw) {
+			try {
+				const metadata = await this.streams.metadata(
+					actor.userId,
+					binding.rawSource ?? binding.canonicalPath,
+					session.raw.metadata.encoding,
+					signal,
+					docId,
+				);
+				await this.bound(actor, docId, "read");
+				return { exists: true, ...metadata };
+			} catch (error) {
+				await this.bound(actor, docId, "read");
+				if ((error as NodeJS.ErrnoException).code === "ENOENT")
+					return { exists: false, protocol: "raw-v2", hashKind: "raw-sha256" };
+				throw error;
+			}
+		}
 		const result = await this.jobs.run(
 			actor.userId,
 			{ action: "disk-state", sourcePath: binding.canonicalPath },
@@ -560,6 +619,54 @@ export class EditorDocumentService {
 			sourceBytes: result.metadata.sourceBytes,
 			utf8Bytes: result.metadata.utf8Bytes,
 		};
+	}
+	/** Explicit consumer pulls are credit; no HTTP fetch read-ahead can drain the source. */
+	async rawOpen(actor: EditorActor, docId: string, versionHandle: string, signal?: AbortSignal) {
+		const { session, binding } = await this.bound(actor, docId, "read");
+		if (!session.raw || session.raw.handle !== versionHandle) throw invalid("Invalid raw version");
+		session.pins++;
+		let opened: { readId: string; metadata: EditorRawMetadata } | undefined;
+		try {
+			opened = await this.streams.open(
+				actor.userId,
+				docId,
+				binding.rawSource ?? binding.canonicalPath,
+				session.raw.metadata.encoding,
+				session.raw.metadata,
+				signal,
+			);
+			await this.bound(actor, docId, "read");
+			return { readId: opened.readId };
+		} catch (error) {
+			if (opened) await this.streams.close(docId, opened.readId);
+			throw error;
+		} finally {
+			session.pins--;
+			if (session.closing) await this.release(session);
+		}
+	}
+	async rawChunk(
+		actor: EditorActor,
+		docId: string,
+		readId: string,
+		offset: number,
+		maxBytes: number,
+	) {
+		try {
+			const { session } = await this.bound(actor, docId, "read");
+			if (!session.raw) throw invalid("Not a raw document");
+			const result = await this.streams.chunk(docId, readId, offset, maxBytes);
+			// Publication fence on first chunk AND EOF (and each intervening chunk).
+			await this.bound(actor, docId, "read");
+			return result;
+		} catch (error) {
+			await this.streams.close(docId, readId);
+			throw error;
+		}
+	}
+	async rawClose(actor: EditorActor, docId: string, readId: string) {
+		await this.owned(actor, docId);
+		await this.streams.close(docId, readId);
 	}
 	async content(
 		actor: EditorActor,
@@ -1273,6 +1380,7 @@ export class EditorDocumentService {
 		}
 	}
 	private async release(session: Session) {
+		await this.streams.closeOwner(session.id);
 		session.closing = true;
 		for (const [cancel, owner] of this.downloads) if (owner === session) await cancel();
 		for (const upload of session.uploads.values())
@@ -1342,6 +1450,7 @@ export class EditorDocumentService {
 	}
 	async dispose() {
 		clearInterval(this.timer);
+		await this.streams.dispose();
 		for (const cancel of this.downloads.keys()) await cancel();
 		for (const session of this.sessions.values()) await this.release(session);
 	}

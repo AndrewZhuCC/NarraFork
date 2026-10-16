@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, opendir, unlink } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { rejectEditorSymlinks } from "./editor-source-path";
+
+export { rejectEditorSymlinks } from "./editor-source-path";
+
 import { parentPort } from "node:worker_threads";
 import {
 	EDITOR_DOCUMENT_MAX_CHARS,
@@ -71,17 +75,6 @@ function fail(message: string): never {
 }
 function hash(value: string | Uint8Array): string {
 	return createHash("sha256").update(value).digest("hex");
-}
-export async function rejectEditorSymlinks(path: string): Promise<void> {
-	for (let cursor = resolve(path), depth = 0; ; cursor = dirname(cursor)) {
-		if (++depth > 128) fail("File path exceeds its ancestor budget");
-		try {
-			if ((await lstat(cursor)).isSymbolicLink()) fail("Symbolic links cannot be edited");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		if (dirname(cursor) === cursor) break;
-	}
 }
 async function boundedRead(path: string, max: number, source = false): Promise<Uint8Array> {
 	if (source) await rejectEditorSymlinks(path);

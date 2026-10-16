@@ -165,6 +165,13 @@ export class EditorDiskStateRegistry {
 			entry.queued = true;
 			return;
 		}
+		if (
+			(entry.copy.session.state.hashKind ?? "decoded-sha256") !==
+			("hashKind" in disk ? (disk.hashKind ?? "decoded-sha256") : "decoded-sha256")
+		) {
+			this.diagnostics.discarded++;
+			return;
+		}
 		if (!disk.exists) return entry.copy.session.setExternalDisk("deleted");
 		if (disk.baseHash === baseHash) return entry.copy.session.setExternalDisk(null);
 		const state = entry.copy.session.state;

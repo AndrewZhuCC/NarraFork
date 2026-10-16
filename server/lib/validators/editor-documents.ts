@@ -22,14 +22,34 @@ const path = z
 	.min(1)
 	.max(4096)
 	.refine((value) => !value.includes("\0"));
-export const createEditorDocumentSchema = z
+const editorDocumentInputSchema = z
 	.object({
 		path,
 		deviceId: z.string().min(1).max(128).optional(),
 		origin: z.enum(["reference", "legacy"]),
 	})
 	.strict();
-export const editorRecoveryScopeSchema = createEditorDocumentSchema.omit({ path: true }).strict();
+export const createEditorDocumentSchema = z.union([
+	editorDocumentInputSchema.extend({ protocol: z.literal("text-v1").optional() }).strict(),
+	editorDocumentInputSchema
+		.extend({
+			protocol: z.literal("raw-v2"),
+			encodingHint: z.enum(["utf-8", "utf-16le", "utf-16be", "gbk", "gb18030"]).optional(),
+		})
+		.strict(),
+]);
+export const editorRawOpenSchema = z.object({ versionHandle: z.string().uuid() }).strict();
+export const editorRawChunkSchema = z
+	.object({
+		offset: z.number().int().nonnegative().max(EDITOR_FILE_MAX_BYTES),
+		maxBytes: z
+			.number()
+			.int()
+			.min(1)
+			.max(64 * 1024),
+	})
+	.strict();
+export const editorRecoveryScopeSchema = editorDocumentInputSchema.omit({ path: true }).strict();
 export const createEditorDraftAnchorSchema = editorRecoveryScopeSchema
 	.extend({
 		writerId: z.string().min(1).max(128),

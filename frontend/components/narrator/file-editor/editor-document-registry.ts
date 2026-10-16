@@ -5,6 +5,7 @@ import { EditorWorkingCopy, type WorkingCopyOptions } from "./editor-working-cop
 
 interface Entry extends EditorCacheItem {
 	copy: EditorWorkingCopy;
+	canonicalKey: string;
 	references: number;
 	viewReferences: number;
 	visible: number;
@@ -126,6 +127,9 @@ export class EditorDocumentRegistry {
 						path: options.path,
 						deviceId: options.deviceId,
 						origin: options.origin(),
+						...(options.protocol === "raw-v2"
+							? { protocol: "raw-v2" as const, encodingHint: options.encodingHint }
+							: {}),
 					},
 					signal,
 				)
@@ -143,13 +147,17 @@ export class EditorDocumentRegistry {
 				"Editor authorization changed. The previous draft was preserved; reopen the file in its new context.";
 			throw new Error(options.translate?.("identityChanged", fallback) ?? fallback);
 		}
-		let entry = descriptor?.resourceKey ? this.canonical.get(descriptor.resourceKey) : undefined;
+		const canonicalKey = descriptor?.resourceKey
+			? `${descriptor.protocol ?? "text-v1"}:${descriptor.resourceKey}`
+			: undefined;
+		let entry = canonicalKey ? this.canonical.get(canonicalKey) : undefined;
 		if (entry?.copy.getSnapshot().invalidated) entry = undefined;
 		if (entry) releaseExtra();
 		else {
 			const copy = new EditorWorkingCopy(options, descriptor);
 			const owned: Entry = {
 				copy,
+				canonicalKey: canonicalKey ?? copy.key,
 				references: 0,
 				viewReferences: 0,
 				visible: 0,
@@ -167,31 +175,39 @@ export class EditorDocumentRegistry {
 			entry.removeListener = copy.subscribe(() => this.collect(owned));
 			this.entries.add(entry);
 			this.cache.add(entry);
-			this.canonical.set(copy.key, entry);
+			this.canonical.set(entry.canonicalKey, entry);
 			this.watchUnload();
 		}
-		if (descriptor?.recoveryKey)
-			for (const other of this.entries) {
-				if (
-					other === entry ||
-					other.copy.recoveryKey !== descriptor.recoveryKey ||
-					other.copy.options.path !== options.path
+		if (descriptor?.recoveryKey) {
+			const related = [...this.entries].filter(
+				(other) =>
+					other !== entry &&
+					other.copy.recoveryKey === descriptor.recoveryKey &&
+					other.copy.options.path === options.path,
+			);
+			// Only a same-protocol binding comparison proves an authorization change.
+			// Once proved, freeze every corresponding copy, including other protocols.
+			if (
+				related.some(
+					(other) =>
+						!other.copy.getSnapshot().invalidated &&
+						other.copy.protocol === entry.copy.protocol &&
+						other.copy.key !== entry.copy.key,
 				)
-					continue;
-				// A fresh server authorization confirms this is a different execution binding
-				// owned by the same verified principal. Never migrate its draft to the new model.
-				if (other.copy.key !== entry.copy.key)
+			)
+				for (const other of related)
 					other.copy.invalidate(
 						options.translate?.(
 							"identityChanged",
 							"Editor authorization changed; the previous draft was preserved.",
 						) ?? "Editor authorization changed; the previous draft was preserved.",
 					);
-			}
+		}
 		const viewing = entry;
 		viewing.viewReferences++;
 		viewing.references++;
 		viewing.visible++;
+		viewing.copy.setVisible(true);
 		this.cache.used(viewing);
 		this.cache.enforce();
 		if (onEvicted) viewing.evictionListeners.add(onEvicted);
@@ -203,7 +219,7 @@ export class EditorDocumentRegistry {
 			viewing.visible += next ? 1 : -1;
 			// Start idle time on last visible detach, not on background metadata updates.
 			this.cache.used(viewing);
-			if (!viewing.visible) viewing.copy.session.cancelBackgroundVerification();
+			viewing.copy.setVisible(viewing.visible > 0);
 			this.collect(viewing);
 		};
 		return {
@@ -239,9 +255,11 @@ export class EditorDocumentRegistry {
 				options.translate?.("identityChanged", "Editor authorization changed") ??
 					"Editor authorization changed",
 			);
+		const protocol = alreadyViewing?.protocol ?? options.protocol ?? "text-v1";
 		const candidates = [...this.entries].filter(
 			(entry) =>
 				entry.copy !== alreadyViewing &&
+				entry.copy.protocol === protocol &&
 				entry.copy.recoveryKey &&
 				entry.copy.protected &&
 				entry.copy.options.narratorId === options.narratorId &&
@@ -279,6 +297,7 @@ export class EditorDocumentRegistry {
 			(entry) =>
 				this.entries.has(entry) &&
 				entry.copy !== current &&
+				entry.copy.protocol === (current?.protocol ?? protocol) &&
 				entry.copy.recoveryKey === scope.recoveryKey &&
 				entry.copy.protected &&
 				!entry.copy.getSnapshot().discarded,
@@ -320,7 +339,7 @@ export class EditorDocumentRegistry {
 	discardRetained(copy: EditorWorkingCopy): boolean {
 		const entry = [...this.entries].find((candidate) => candidate.copy === copy);
 		if (!entry || entry.viewReferences !== 0 || !copy.discardRetainedDraft()) return false;
-		if (this.canonical.get(copy.key) === entry) this.canonical.delete(copy.key);
+		if (this.canonical.get(entry.canonicalKey) === entry) this.canonical.delete(entry.canonicalKey);
 		this.entries.delete(entry);
 		this.cache.remove(entry);
 		entry.removeListener();
@@ -332,7 +351,7 @@ export class EditorDocumentRegistry {
 	}
 	private evict(entry: Entry) {
 		if (!this.entries.delete(entry)) return;
-		if (this.canonical.get(entry.copy.key) === entry) this.canonical.delete(entry.copy.key);
+		if (this.canonical.get(entry.canonicalKey) === entry) this.canonical.delete(entry.canonicalKey);
 		entry.removeListener();
 		entry.copy.dispose();
 		for (const listener of entry.evictionListeners) listener();

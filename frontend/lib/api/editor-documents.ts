@@ -13,6 +13,7 @@ import {
 	type EditorDocumentDescriptor,
 	type EditorDraftAnchorDescriptor,
 	type EditorOperationResult,
+	type EditorRawDocumentDescriptor,
 	type EditorRecoveryScope,
 	type EditorRecoveryScopeInput,
 	type EditorUploadDescriptor,
@@ -220,6 +221,85 @@ export const editorDocumentApi = {
 			scope,
 			signal,
 		);
+	},
+	/** No speculative next fetch: completion of consume is the application ACK. */
+	async rawSource(
+		narratorId: string,
+		document: EditorRawDocumentDescriptor,
+		consume: (bytes: Uint8Array<ArrayBuffer>, eof: boolean) => Promise<void>,
+		signal: AbortSignal,
+		credit: () => number = () => EDITOR_TRANSFER_CHUNK_BYTES,
+	) {
+		const path = `${documentPath(narratorId, document.docId)}/raw-reads`;
+		const bounded = timedSignal(signal);
+		const { readId } = await metadata<{ readId: string }>(
+			path,
+			"POST",
+			{ versionHandle: document.versionHandle },
+			bounded,
+		);
+		let offset = 0;
+		try {
+			for (;;) {
+				bounded.throwIfAborted();
+				const maxBytes = credit();
+				if (
+					!Number.isSafeInteger(maxBytes) ||
+					maxBytes < 1 ||
+					maxBytes > EDITOR_TRANSFER_CHUNK_BYTES
+				)
+					throw new Error("Invalid editor credit");
+				const response = await checkedFetch(
+					`${path}/${encodeURIComponent(readId)}`,
+					{
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ offset, maxBytes }),
+					},
+					bounded,
+				);
+				const reader = response.body?.getReader();
+				const buffer = new Uint8Array(maxBytes);
+				let size = 0;
+				const cancel = () => {
+					void reader?.cancel(bounded.reason).catch(() => {});
+				};
+				bounded.addEventListener("abort", cancel, { once: true });
+				try {
+					while (reader) {
+						bounded.throwIfAborted();
+						const chunk = await reader.read();
+						bounded.throwIfAborted();
+						if (chunk.done) break;
+						if (size + chunk.value.length > maxBytes)
+							throw new Error("Editor raw chunk exceeds credit");
+						buffer.set(chunk.value, size);
+						size += chunk.value.length;
+					}
+				} catch (error) {
+					await reader?.cancel(error);
+					throw error;
+				} finally {
+					bounded.removeEventListener("abort", cancel);
+					reader?.releaseLock();
+				}
+				const eof = response.headers.get("x-editor-eof");
+				if (eof !== "0" && eof !== "1") throw new Error("Editor raw EOF marker missing");
+				offset += size;
+				if (
+					offset > document.sourceBytes ||
+					(!size && eof !== "1") ||
+					(eof === "1" && offset !== document.sourceBytes)
+				)
+					throw new Error("Editor raw source length mismatch");
+				await consume(buffer.subarray(0, size), eof === "1");
+				bounded.throwIfAborted();
+				if (eof === "1") break;
+			}
+		} finally {
+			// Deliberately not the cancelled load signal: closing must still reach the server.
+			await metadata(`${path}/${encodeURIComponent(readId)}`, "DELETE").catch(() => {});
+		}
 	},
 	create(narratorId: string, input: CreateEditorDocumentInput, signal?: AbortSignal) {
 		return metadata<EditorDocumentDescriptor>(base(narratorId), "POST", input, signal);

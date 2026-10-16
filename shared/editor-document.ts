@@ -19,11 +19,35 @@ export const EDITOR_USER_MAX_OPERATIONS = 128;
 export const EDITOR_USER_TEMP_MAX_BYTES = 512 * 1024 * 1024;
 export const EDITOR_TEMP_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
-export interface CreateEditorDocumentInput {
+interface EditorDocumentInput {
 	path: string;
 	deviceId?: string;
 	origin: "reference" | "legacy";
 }
+/** Opt-in only until the lossless writer is available. Omission preserves v1 semantics. */
+export type CreateEditorDocumentInput = EditorDocumentInput &
+	({ protocol?: "text-v1" } | { protocol: "raw-v2"; encodingHint?: EditorRawEncoding });
+export type EditorRawEncoding = "utf-8" | "utf-16le" | "utf-16be" | "gbk" | "gb18030";
+export type EditorBom = "none" | "utf8" | "utf16le" | "utf16be";
+export interface EditorRawMetadata {
+	protocol: "raw-v2";
+	hashKind: "raw-sha256";
+	baseHash: string;
+	textDigest: string;
+	encoding: EditorRawEncoding;
+	bom: EditorBom;
+	sourceBytes: number;
+	utf8Bytes: number;
+	textLength: number;
+	lineCount: number;
+	maxLineLength: number;
+	eolCounts: { LF: number; CRLF: number; CR: number };
+	preferredEol: "LF" | "CRLF" | "CR";
+	eol: "LF" | "CRLF" | "CR";
+	formatVersion: 1;
+}
+export const EDITOR_RAW_WINDOW_BYTES = 256 * 1024;
+export const EDITOR_RAW_MAX_STREAMS = 8;
 
 export type EditorRecoveryScopeInput = Pick<CreateEditorDocumentInput, "deviceId" | "origin">;
 /** Server-derived original-owner namespace; it grants no file read/write or model sharing. */
@@ -31,7 +55,13 @@ export interface EditorRecoveryScope {
 	recoveryKey: string;
 }
 
-export interface EditorDocumentDescriptor {
+export type EditorDocumentDescriptor = EditorV1DocumentDescriptor | EditorRawDocumentDescriptor;
+export interface EditorRawDocumentDescriptor
+	extends Omit<EditorV1DocumentDescriptor, "protocol" | "hashKind" | "encoding">,
+		EditorRawMetadata {}
+export interface EditorV1DocumentDescriptor {
+	protocol?: "text-v1";
+	hashKind?: "decoded-sha256";
 	docId: string;
 	/** Opaque, server-authorized identity; absent on older v1 servers (no sharing). */
 	resourceKey?: string;
@@ -149,7 +179,8 @@ export interface EditorConfirmationData {
  * re-reading the document.
  */
 export type EditorDiskState =
-	| { exists: false }
+	| ({ exists: true } & EditorRawMetadata)
+	| { exists: false; protocol?: "raw-v2"; hashKind?: "raw-sha256" }
 	| {
 			exists: true;
 			baseHash: string;

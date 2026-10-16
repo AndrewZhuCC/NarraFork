@@ -3,6 +3,8 @@ import type {
 	EditorConflictData,
 	EditorDocumentDescriptor,
 	EditorOperationResult,
+	EditorRawDocumentDescriptor,
+	EditorRawEncoding,
 	EditorSaveResult,
 	EditorUploadDescriptor,
 } from "@shared/editor-document";
@@ -28,6 +30,9 @@ export type EditorRetiredReceipt =
 	| EditorOperationResult
 	| { status: "not-applied"; operationId?: string };
 export interface EditorSessionState {
+	protocol?: "text-v1" | "raw-v2";
+	hashKind?: "decoded-sha256" | "raw-sha256";
+	paged?: boolean;
 	loaded: boolean;
 	loading: boolean;
 	invalidated?: boolean;
@@ -70,6 +75,7 @@ export function sessionExitBlocked(state: EditorSessionState): boolean {
 export function sessionCanSave(state: EditorSessionState): boolean {
 	return (
 		state.loaded &&
+		state.protocol !== "raw-v2" &&
 		!state.invalidated &&
 		// Declared capabilities are authoritative; only an older server that omits
 		// them keeps the legacy v1 save path.
@@ -94,6 +100,12 @@ export interface EditorSessionOptions {
 	narratorId: string;
 	path: string;
 	deviceId: string;
+	protocol?: "text-v1" | "raw-v2";
+	encodingHint?: EditorRawEncoding;
+	loadRaw?: (
+		document: EditorRawDocumentDescriptor,
+		signal: AbortSignal,
+	) => Promise<{ install(): DocumentVersion | null; dispose(): void; paged?: boolean }>;
 	/** A registry seed fixes authorization before even the first source read/retry. */
 	resourceKey?: string;
 	origin: () => "reference" | "legacy";
@@ -195,7 +207,7 @@ export class EditorDocumentSession {
 		if (source) {
 			const digest = (this.options.encodedHash ?? getEncodedEditorSnapshotHash)(source);
 			if (digest) this.baselineDigest = Promise.resolve(digest);
-		} else if (version) {
+		} else if (version && this.document?.protocol !== "raw-v2") {
 			try {
 				this.baselineSource = new EditorSnapshotReplay(this.options.snapshot());
 			} catch {
@@ -215,6 +227,9 @@ export class EditorDocumentSession {
 		return (this.options.hash ?? hashEditorSnapshot)(source, signal);
 	}
 	/** Current authorized document id, if any. Used ONLY for identity-probe reads. */
+	get currentDocument(): EditorDocumentDescriptor | null {
+		return this.document;
+	}
 	get documentId(): string | undefined {
 		return this.document?.docId;
 	}
@@ -317,6 +332,9 @@ export class EditorDocumentSession {
 				path: this.options.path,
 				deviceId: this.options.deviceId,
 				origin: this.options.origin(),
+				...(this.options.protocol === "raw-v2"
+					? { protocol: "raw-v2" as const, encodingHint: this.options.encodingHint }
+					: {}),
 			},
 			signal,
 		);
@@ -349,6 +367,7 @@ export class EditorDocumentSession {
 	}
 	/** Explicit user recovery only: the original baseline is retained even if disk changed. */
 	restoreDraft(text: string, baseHash: string | null, encoding: string) {
+		if (this.options.protocol === "raw-v2" || this.state.protocol === "raw-v2") return false;
 		if (
 			this.disposed ||
 			!this.state.loaded ||
@@ -411,6 +430,9 @@ export class EditorDocumentSession {
 	 * view read-only, never preempts an explicit load, and silently yields (returns
 	 * false) if the user edits before the fresh source is installed.
 	 */
+	cancelRawLoad() {
+		if (this.options.protocol === "raw-v2") this.loadController?.abort();
+	}
 	async load(background = false): Promise<boolean> {
 		if (this.state.phase !== "idle" || this.disposed || this.state.invalidated) return false;
 		if (background && (this.loadController || sessionDirty(this.state))) return false;
@@ -418,8 +440,10 @@ export class EditorDocumentSession {
 		const controller = new AbortController();
 		this.loadController = controller;
 		const revision = this.state.version?.revision;
+		const alternative = this.state.version?.alternativeVersionId;
 		if (!background) this.update({ loading: true, error: null });
 		let next: EditorDocumentDescriptor | null = null;
+		let candidate: Awaited<ReturnType<NonNullable<EditorSessionOptions["loadRaw"]>>> | undefined;
 		let installed = false;
 		const changedDuringReload = () => {
 			if (background) controller.abort();
@@ -435,7 +459,11 @@ export class EditorDocumentSession {
 				const source = await this.options.readOnlySource(controller.signal);
 				controller.signal.throwIfAborted();
 				if (this.disposed || this.loadController !== controller) return false;
-				if (revision !== this.state.version?.revision) throw changedDuringReload();
+				if (
+					revision !== this.state.version?.revision ||
+					alternative !== this.state.version?.alternativeVersionId
+				)
+					throw changedDuringReload();
 				const version = this.options.applyContent(source.content.replace(/\r\n?/g, "\n"));
 				this.resetBaseline(version);
 				this.update({
@@ -452,7 +480,7 @@ export class EditorDocumentSession {
 				});
 				return true;
 			}
-			let text: string;
+			let text = "";
 			for (let retry = 0; ; retry++) {
 				try {
 					controller.signal.throwIfAborted();
@@ -461,6 +489,11 @@ export class EditorDocumentSession {
 					if (this.disposed || this.loadController !== controller) return false;
 					// A background refresh stops as soon as the clean document becomes a draft.
 					if (background && revision !== this.state.version?.revision) throw changedDuringReload();
+					if (next.protocol === "raw-v2") {
+						if (!this.options.loadRaw) throw new Error("EDITOR_RAW_LOADER_UNAVAILABLE");
+						candidate = await this.options.loadRaw(next, controller.signal);
+						break;
+					}
 					text = await this.api.source(
 						this.options.narratorId,
 						next.docId,
@@ -486,19 +519,30 @@ export class EditorDocumentSession {
 			}
 			controller.signal.throwIfAborted();
 			if (this.disposed || this.loadController !== controller) return false;
-			if (revision !== this.state.version?.revision) throw changedDuringReload();
+			if (
+				revision !== this.state.version?.revision ||
+				alternative !== this.state.version?.alternativeVersionId
+			)
+				throw changedDuringReload();
 			// The install below is synchronous: no edit or save can interleave after this check.
 			if (background && (this.state.phase !== "idle" || this.attempt)) return false;
 			this.cancel();
 			const old = this.document;
+			const paged = candidate?.paged;
+			const version = candidate
+				? candidate.install()
+				: this.options.applyContent(text, next ?? undefined);
+			candidate = undefined;
 			this.document = next;
 			next = null;
-			const version = this.options.applyContent(text, this.document);
 			this.resetBaseline(version);
 			this.update({
 				loaded: true,
 				baseHash: this.document.baseHash,
 				encoding: this.document.encoding,
+				protocol: this.document.protocol ?? "text-v1",
+				hashKind: this.document.protocol === "raw-v2" ? "raw-sha256" : "decoded-sha256",
+				paged: !!paged,
 				version,
 				baseline: version?.alternativeVersionId ?? null,
 				equivalentVersion: null,
@@ -511,9 +555,15 @@ export class EditorDocumentSession {
 		} catch (error) {
 			if (this.loadController === controller && !this.disposed && this.authorizationFailed(error))
 				return false;
-			if (this.loadController === controller && !this.disposed && !background)
+			if (
+				this.loadController === controller &&
+				!this.disposed &&
+				!background &&
+				!controller.signal.aborted
+			)
 				this.update({ error: message(error) });
 		} finally {
+			candidate?.dispose();
 			if (next) this.release(next.docId);
 			if (this.loadController === controller) {
 				this.loadController = null;

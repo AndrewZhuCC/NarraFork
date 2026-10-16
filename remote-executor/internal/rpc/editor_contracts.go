@@ -1,6 +1,6 @@
 // Mirror of shared/editor-provider-contracts.ts. These are frozen wire shapes
-// for editor Phases 6-9; no handler in this executor implements them yet and no
-// feature for them is advertised in Capabilities. The shared fixture
+// for editor Phases 6-9. Phase 6 raw read is implemented and feature-gated;
+// future stage/apply/query/watch contracts remain unadvertised. The shared fixture
 // shared/editor-provider-contracts.golden.json is decoded strictly here and
 // type-checked on the TS side. Required-nullable fields are pointers WITHOUT
 // omitempty (they always encode, as null when absent); optional fields use
