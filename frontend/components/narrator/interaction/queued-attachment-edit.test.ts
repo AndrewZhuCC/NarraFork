@@ -389,9 +389,9 @@ describe("semantic composer edits", () => {
 		expect(added.assets[0].id).not.toBe(added.assets[1].id);
 		const edited: ComposerDocument = {
 			...session.document,
-			assets: [...added.assets.toReversed(), ...session.document.assets],
+			assets: [...[...added.assets].reverse(), ...session.document.assets],
 			paragraphs: [
-				{ children: [...added.nodes.toReversed(), ...session.document.paragraphs[0].children] },
+				{ children: [...[...added.nodes].reverse(), ...session.document.paragraphs[0].children] },
 			],
 		};
 		const result = projectComposerEdit(session, edited);

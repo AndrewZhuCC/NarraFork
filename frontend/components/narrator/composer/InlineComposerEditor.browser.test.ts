@@ -131,7 +131,7 @@ async function snapshot(page: Page) {
 async function chord(page: Page, key: "z" | "Z" | "Enter", ...modifiers: ("Control" | "Shift")[]) {
 	for (const modifier of modifiers) await page.keyboard.down(modifier);
 	await page.keyboard.press(key);
-	for (const modifier of modifiers.toReversed()) await page.keyboard.up(modifier);
+	for (const modifier of [...modifiers].reverse()) await page.keyboard.up(modifier);
 }
 
 test("empty insert deletes a selected suffix once but remains a noop for a collapsed cursor", async () => {
