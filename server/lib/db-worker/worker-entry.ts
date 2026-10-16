@@ -101,7 +101,7 @@ function runStorageScanTables(
 
 	const tables: StorageScanTablesResult["tables"] = [];
 	for (const [index, table] of wanted.entries()) {
-		// A running COUNT(*) cannot be interrupted. Stop before the next table.
+		// A running statement cannot be interrupted. Stop before the next table.
 		if (signal.aborted) throw new Error("storage scan aborted");
 		const summary = measureTable(sqlite, table, context);
 		post({

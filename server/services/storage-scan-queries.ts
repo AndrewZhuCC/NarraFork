@@ -491,10 +491,9 @@ export function measureTable(
 ): DatabaseStorageTableSummary {
 	const { dbstat, indexesByTable } = context;
 	const budget = createBusyRetryBudget();
-	const counted = readWithBusyRetry(
-		() => countQuery(sqlite, `FROM ${quoteIdentifier(table.name)}`),
-		budget,
-	);
+	// Row counts are a COUNT(*) per table. On a multi-GB database that is the multi-second part of
+	// the scan (about 4.6s serial on a 5.3GB file, once dbstat already supplied the bytes). The
+	// storage page decides what to clean from bytes, so the count is not measured.
 	// dbstat already gives exact page-level object sizes, so skip the extra SUM(length(...))
 	// full-table scan in that mode. Virtual tables are measured through their shadow tables.
 	const skipContentScan = dbstat.supported || table.kind === "virtual";
@@ -505,8 +504,7 @@ export function measureTable(
 				budget,
 			);
 
-	const readFailed = !counted.ok || !measured.ok;
-	const rowCount = counted.ok ? counted.value : null;
+	const readFailed = !measured.ok;
 	const approxContentBytes = measured.ok ? measured.value : 0;
 	const indexNames = indexesByTable.get(table.name) ?? [];
 	const diskBytes = dbstat.supported
@@ -519,7 +517,7 @@ export function measureTable(
 		name: table.name,
 		category: getDatabaseStorageCategory(table.name),
 		kind: table.kind,
-		rowCount,
+		rowCount: null,
 		approxContentBytes,
 		diskBytes,
 		indexBytes,

@@ -2065,7 +2065,7 @@
 	"storageDatabaseUsageCategory_internal": "SQLite 内部对象",
 	"storageDatabaseUsageCategory_free": "可复用空闲页",
 	"storageDatabaseUsageCategory_other": "其他数据",
-	"storageDatabaseUsageCategoryStats": "{{tables}} 张表 · {{rows}} 行 · 索引 {{indexes}}",
+	"storageDatabaseUsageCategoryStats": "{{tables}} 张表 · 索引 {{indexes}}",
 	"storageDatabaseUsageFreeStats": "SQLite 可复用但尚未归还给文件系统的页面",
 	"storageDatabaseTopTables": "最大表：{{tables}}",
 	"storageDatabaseVacuum": "释放未归还空间",

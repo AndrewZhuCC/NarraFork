@@ -1315,7 +1315,6 @@ export function StorageSection() {
 																						? t("storageDatabaseUsageFreeStats")
 																						: t("storageDatabaseUsageCategoryStats", {
 																								tables: category.tableCount,
-																								rows: category.rowCount,
 																								indexes: formatBytes(category.indexBytes),
 																							})}
 																				</Text>

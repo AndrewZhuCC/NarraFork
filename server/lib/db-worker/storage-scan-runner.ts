@@ -130,8 +130,8 @@ function toTableSummary(
  * Run the object-storage scan, preferring workers.
  *
  * On the worker path the main thread only builds the shard plan, forwards progress, and merges —
- * all cheap. The per-table `COUNT(*)` / `SUM(length(...))` scans (the multi-second part) happen
- * entirely off-thread.
+ * all cheap. With dbstat, per-table work is a lookup: row counts are not measured. Without
+ * dbstat, the `SUM(length(...))` scans (the multi-second part) happen entirely off-thread.
  */
 export async function runParallelObjectStorageScan(
 	options: ParallelScanOptions,
