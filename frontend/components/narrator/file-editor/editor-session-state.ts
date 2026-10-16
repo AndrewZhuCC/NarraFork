@@ -6,6 +6,10 @@ import type {
 	EditorSaveResult,
 	EditorUploadDescriptor,
 } from "@shared/editor-document";
+import {
+	EDITOR_BOUNDED_READ_CAPABILITIES,
+	type EditorProviderCapabilities,
+} from "@shared/editor-provider-contracts";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import {
@@ -46,6 +50,12 @@ export interface EditorSessionState {
 	conflict: (EditorConflictData & { docId: string }) | null;
 	/** Advisory observation only; never a baseline. Cleared whenever baseHash moves. */
 	externalDisk?: "modified" | "deleted" | null;
+	/**
+	 * Capabilities of the current authorized descriptor (or the bounded-read
+	 * source). undefined = not yet authorized, or an older server that does not
+	 * declare them. Replaced only together with the descriptor.
+	 */
+	capabilities?: EditorProviderCapabilities;
 }
 export function sessionDirty(state: EditorSessionState): boolean {
 	return (
@@ -61,6 +71,9 @@ export function sessionCanSave(state: EditorSessionState): boolean {
 	return (
 		state.loaded &&
 		!state.invalidated &&
+		// Declared capabilities are authoritative; only an older server that omits
+		// them keeps the legacy v1 save path.
+		state.capabilities?.v1Save !== false &&
 		!state.loading &&
 		state.phase === "idle" &&
 		!state.confirmation &&
@@ -372,6 +385,8 @@ export class EditorDocumentSession {
 		const old = this.document;
 		this.document = next;
 		if (old) this.release(old.docId);
+		// Same resourceKey (checked by authorize) but possibly different provider support.
+		this.update({ capabilities: next.capabilities });
 		return next;
 	}
 	change(version: DocumentVersion) {
@@ -432,6 +447,8 @@ export class EditorDocumentSession {
 					equivalentVersion: null,
 					conflict: null,
 					confirmation: null,
+					// The source resolved a complete, identity-checked bounded read; no save path.
+					capabilities: EDITOR_BOUNDED_READ_CAPABILITIES,
 				});
 				return true;
 			}
@@ -487,6 +504,7 @@ export class EditorDocumentSession {
 				equivalentVersion: null,
 				conflict: null,
 				confirmation: null,
+				capabilities: this.document.capabilities,
 			});
 			installed = true;
 			if (old) this.release(old.docId);

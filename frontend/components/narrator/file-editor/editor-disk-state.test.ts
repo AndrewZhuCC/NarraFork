@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type { EditorDiskState, EditorDocumentDescriptor } from "@shared/editor-document";
+import {
+	EDITOR_BOUNDED_READ_CAPABILITIES,
+	EDITOR_NO_CAPABILITIES,
+	type EditorProviderCapabilities,
+} from "@shared/editor-provider-contracts";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
@@ -62,7 +67,11 @@ const track = <T extends { detach(): void }>(view: T) => {
 };
 
 /** Real session; only the text model is replaced by a revision counter. */
-async function copyWith(probe: (docId: string) => Promise<EditorDiskState>, docId = "doc-1") {
+async function copyWith(
+	probe: (docId: string) => Promise<EditorDiskState>,
+	docId = "doc-1",
+	capabilities?: EditorProviderCapabilities,
+) {
 	let revision = 0;
 	let text = "a";
 	const descriptor: EditorDocumentDescriptor = {
@@ -74,6 +83,7 @@ async function copyWith(probe: (docId: string) => Promise<EditorDiskState>, docI
 		eol: "LF",
 		sourceBytes: 1,
 		utf8Bytes: 1,
+		...(capabilities ? { capabilities } : {}),
 	};
 	let source = { ...descriptor };
 	const api = {
@@ -285,6 +295,32 @@ test("WS hints and reconnects coalesce into one probe per copy", async () => {
 	await flush();
 	// Exactly one queued follow-up for all wake-ups that arrived while in flight.
 	expect(probe).toHaveBeenCalledTimes(2);
+});
+
+test("a read-only resource with boundedRead still verifies disk identity and only hints when dirty", async () => {
+	const registry = new EditorDiskStateRegistry();
+	const ctx = await copyWith(
+		async () => disk("base-b"),
+		"doc-ro",
+		EDITOR_BOUNDED_READ_CAPABILITIES,
+	);
+	spyOn(editorDocumentApi, "diskState").mockImplementation(ctx.api.diskState);
+	expect(ctx.session.state.capabilities).toEqual(EDITOR_BOUNDED_READ_CAPABILITIES);
+	ctx.edit();
+	track(registry.attach(ctx.copy, true));
+	await flush();
+	expect(ctx.api.diskState).toHaveBeenCalledTimes(1);
+	expect(ctx.session.state.externalDisk).toBe("modified");
+	expect(ctx.applyContent).toHaveBeenCalledTimes(1);
+});
+
+test("a declared provider without boundedRead is never probed", async () => {
+	const registry = new EditorDiskStateRegistry();
+	const ctx = await copyWith(async () => disk("base-b"), "doc-none", EDITOR_NO_CAPABILITIES);
+	spyOn(editorDocumentApi, "diskState").mockImplementation(ctx.api.diskState);
+	track(registry.attach(ctx.copy, true));
+	await flush();
+	expect(ctx.api.diskState).not.toHaveBeenCalled();
 });
 
 test("an expired server document reauthorizes without touching the draft", async () => {

@@ -54,7 +54,8 @@ declare global {
 
 const response = await fetch("/api/fixture/config", { signal: AbortSignal.timeout(10_000) });
 if (!response.ok) throw new Error(`Fixture config: ${response.status}`);
-const config: { path: string; narratorId: string; hostGate?: boolean } = await response.json();
+const config: { path: string; narratorId: string; hostGate?: boolean; deviceId?: string } =
+	await response.json();
 // The small-file scenario uses the actual ordinary host and unmodified metadata/size gate.
 const FilePane = config.hostGate ? FilePanelContent : FileEditorContent;
 // Observe actual browser fetch responses, not CDP's evictable response-body cache.
@@ -162,6 +163,7 @@ function renderViews(secondary = true) {
 							key={documentGeneration}
 							filePath={config.path}
 							narratorId={config.narratorId}
+							deviceId={config.deviceId}
 							referenceOrigin
 							onDirtyChange={(value) => {
 								dirty = value;
@@ -170,7 +172,12 @@ function renderViews(secondary = true) {
 					</div>
 					{secondary && (
 						<div key="secondary" style={{ width: "50%", height: "100%" }}>
-							<FilePane filePath={config.path} narratorId={config.narratorId} referenceOrigin />
+							<FilePane
+								filePath={config.path}
+								narratorId={config.narratorId}
+								deviceId={config.deviceId}
+								referenceOrigin
+							/>
 						</div>
 					)}
 				</div>
@@ -178,7 +185,8 @@ function renderViews(secondary = true) {
 		</MantineProvider>,
 	);
 }
-renderViews();
+// Remote acceptance exercises one ordinary file panel; local scenarios also test shared views.
+renderViews(!config.deviceId);
 window.__editorRealIo = {
 	state() {
 		const model = editor?.getModel();

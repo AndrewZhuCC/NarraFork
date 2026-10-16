@@ -1,3 +1,4 @@
+import type { EditorProviderCapabilities } from "./editor-provider-contracts";
 import type { FileTarget } from "./file-reference";
 
 /** Editor transfer budgets are deliberately independent of chat file-reference budgets. */
@@ -43,6 +44,13 @@ export interface EditorDocumentDescriptor {
 	eol: "LF" | "CRLF" | "CR";
 	sourceBytes: number;
 	utf8Bytes: number;
+	/**
+	 * Capabilities the provider has already verified for this authorized
+	 * resource. Omitted by older v1 servers; UI code that reads it must keep
+	 * its original heuristic as a fallback. See
+	 * shared/editor-provider-contracts.ts for Phase 6-9 semantics.
+	 */
+	capabilities?: EditorProviderCapabilities;
 }
 
 export interface CreateEditorUploadInput {

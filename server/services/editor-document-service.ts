@@ -26,6 +26,7 @@ import {
 	type EditorSaveResult,
 	type EditorUploadDescriptor,
 } from "../../shared/editor-document";
+import { EDITOR_LOCAL_V1_CAPABILITIES } from "../../shared/editor-provider-contracts";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { EditorOperationMetadata } from "../lib/validators/editor-documents";
@@ -515,6 +516,9 @@ export class EditorDocumentService {
 				recoveryKey: editorRecoveryKey(actor, session.input),
 				target: { deviceId: "local", path: binding.canonicalPath },
 				versionHandle: session.source.handle,
+				// The route admits only local bindings, so this session owns the local
+				// worker read and the v1 save; nothing in Phases 6-9 is claimed.
+				capabilities: EDITOR_LOCAL_V1_CAPABILITIES,
 				...result.metadata,
 			};
 		} catch (error) {

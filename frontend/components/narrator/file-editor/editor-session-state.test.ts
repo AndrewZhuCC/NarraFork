@@ -1,5 +1,9 @@
 import { expect, mock, test } from "bun:test";
 import type { EditorCommitResult, EditorDocumentDescriptor } from "@shared/editor-document";
+import {
+	EDITOR_BOUNDED_READ_CAPABILITIES,
+	EDITOR_LOCAL_V1_CAPABILITIES,
+} from "@shared/editor-provider-contracts";
 import { ApiError } from "../../../lib/api/client";
 import type { editorDocumentApi } from "../../../lib/api/editor-documents";
 import {
@@ -150,6 +154,60 @@ test("410 reauthorization cannot bind a dirty draft to another authorized execut
 	expect(sessionCanSave(session.state)).toBe(false);
 	expect(api.release).toHaveBeenCalledWith("child", "new-doc");
 	expect(api.commit).not.toHaveBeenCalled();
+});
+
+test("410 refresh replaces capabilities with the new descriptor without rebuilding the draft", async () => {
+	const { session, api, change, text, applyContent } = await setup(false);
+	api.create.mockResolvedValue({
+		...descriptor,
+		resourceKey: "scope",
+		capabilities: EDITOR_LOCAL_V1_CAPABILITIES,
+	});
+	await session.load();
+	expect(sessionCanSave(session.state)).toBe(false); // clean
+	change("draft");
+	expect(sessionCanSave(session.state)).toBe(true);
+	const before = session.state;
+	// Same authorized resource, but the provider now only offers a bounded read.
+	api.create.mockResolvedValue({
+		...descriptor,
+		docId: "doc-2",
+		resourceKey: "scope",
+		capabilities: EDITOR_BOUNDED_READ_CAPABILITIES,
+	});
+	expect(await session.refreshDocument()).toBe(true);
+	// A new immutable snapshot is what useSyncExternalStore subscribers re-render on.
+	expect(session.state).not.toBe(before);
+	expect(session.state.capabilities).toEqual(EDITOR_BOUNDED_READ_CAPABILITIES);
+	expect(session.documentId).toBe("doc-2");
+	expect(text()).toBe("draft");
+	expect(applyContent).toHaveBeenCalledTimes(1); // no model rebuild
+	expect(sessionDirty(session.state)).toBe(true);
+	expect(sessionCanSave(session.state)).toBe(false);
+	await session.save(); // a caller bypassing the UI is refused too
+	expect(api.createUpload).not.toHaveBeenCalled();
+});
+
+test("invalidation keeps the last declared capabilities and never falls back to the local heuristic", async () => {
+	const { session, api, change } = await setup(false);
+	api.create.mockResolvedValue({ ...descriptor, capabilities: EDITOR_LOCAL_V1_CAPABILITIES });
+	await session.load();
+	change("draft");
+	session.invalidate("revoked");
+	expect(session.state.capabilities).toEqual(EDITOR_LOCAL_V1_CAPABILITIES);
+	expect(sessionCanSave(session.state)).toBe(false);
+	await session.save();
+	expect(api.createUpload).not.toHaveBeenCalled();
+	expect(sessionDirty(session.state)).toBe(true);
+});
+
+test("an older server without declared capabilities keeps the v1 save path", async () => {
+	const { session, api, change } = await setup();
+	expect(session.state.capabilities).toBeUndefined();
+	change("draft");
+	expect(sessionCanSave(session.state)).toBe(true);
+	await session.save();
+	expect(api.commit).toHaveBeenCalledTimes(1);
 });
 
 test("invalidation during commit preserves unknown attempt and rejects late success and confirmation dispatch", async () => {

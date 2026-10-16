@@ -328,7 +328,12 @@ function FileEditorDocument({
 	const editorSelectionRef = useRef<FileSelection | null>(null);
 	const [lineWrapping, setLineWrapping] = useState(false);
 	const [searchOpen, setSearchOpen] = useState(false);
-	const readOnly = deviceId !== "local" || !narratorId || !!state.invalidated;
+	// Server-declared capabilities of the current authorization decide editability.
+	// Only an older server that declares none keeps the original device heuristic.
+	const readOnly =
+		!narratorId ||
+		!!state.invalidated ||
+		(state.capabilities ? !state.capabilities.v1Save : deviceId !== "local");
 	const clipboard = useClipboard({ timeout: 1500 });
 	const [downloading, setDownloading] = useState(false);
 	const download = async () => {

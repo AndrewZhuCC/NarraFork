@@ -1523,6 +1523,41 @@ test("late reload cannot replace queued input and restores editability after fai
 	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
 });
 
+test("remote files read only through the narrator-scoped bounded reference read", async () => {
+	const remote = { ...source, target: { deviceId: "remote-device", path: "/work/a.txt" } };
+	preview.mockResolvedValue(remote);
+	const model = await mount({ deviceId: "remote-device" });
+	expect(preview).toHaveBeenCalledWith(
+		"narrator",
+		{ deviceId: "remote-device", path: "/work/a.txt" },
+		expect.any(AbortSignal),
+	);
+	expect(model.text).toBe("a\nb\n");
+	expect(model.props.readOnly).toBe(true);
+	expect(host.textContent).toContain(en["fileEditor.remoteBudget"]);
+	// No editor-document session, host reader, disk probe or write path is reachable.
+	expect(create).not.toHaveBeenCalled();
+	expect(read).not.toHaveBeenCalled();
+	expect(host.querySelector(".tabler-icon-device-floppy")).toBeNull();
+	await edit(model, "attempt");
+	expect(beginUpload).not.toHaveBeenCalled();
+	expect(legacyWrite).not.toHaveBeenCalled();
+});
+
+test("a refused remote bounded read is reported, never replaced by a host read", async () => {
+	preview.mockRejectedValue(
+		new ApiError("Source file exceeds 1 MiB; partial references are not accepted", 413, {
+			code: "FILE_REFERENCE_SOURCE_TOO_LARGE",
+		}),
+	);
+	await expect(mount({ deviceId: "remote-device" })).rejects.toThrow(
+		"partial references are not accepted",
+	);
+	expect(create).not.toHaveBeenCalled();
+	expect(read).not.toHaveBeenCalled();
+	expect(legacyWrite).not.toHaveBeenCalled();
+});
+
 test("scoped files with no narrator never fall back to broad/local readers", async () => {
 	await expect(mount({ narratorId: undefined, deviceId: "remote-device" })).rejects.toThrow(
 		en["fileEditor.missingContext"],

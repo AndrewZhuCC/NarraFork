@@ -57,7 +57,9 @@ export class EditorDiskStateRegistry {
 	/** One handle per view; the copy's entry lives while any view is attached. */
 	attach(copy: EditorWorkingCopy, visible: boolean): EditorDiskStateView {
 		const { narratorId, deviceId, readOnlySource } = copy.options;
-		if (!narratorId || deviceId !== "local" || readOnlySource)
+		// Probes need an editor-document session (readOnlySource has none). Whether
+		// the provider can verify it is decided per probe from the current caps.
+		if (!narratorId || readOnlySource || (!copy.session.state.capabilities && deviceId !== "local"))
 			return { setVisible: () => {}, detach: () => {} };
 		let entry = this.entries.get(copy);
 		if (!entry) {
@@ -120,7 +122,9 @@ export class EditorDiskStateRegistry {
 		entry.queued = false;
 		const session = entry.copy.session;
 		const docId = session.documentId;
-		const { phase, loading, invalidated, baseHash } = session.state;
+		const { phase, loading, invalidated, baseHash, capabilities } = session.state;
+		// A declared provider without a bounded read cannot verify disk identity.
+		if (capabilities && !capabilities.boundedRead) return;
 		// Unknown/in-flight saves and reloads own the baseline; check again later.
 		if (!docId || phase !== "idle" || loading || invalidated) {
 			this.scheduleIdle(entry);

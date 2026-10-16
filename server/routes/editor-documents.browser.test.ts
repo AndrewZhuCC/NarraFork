@@ -26,6 +26,7 @@ import { queryEditorOperation } from "../services/editor-document-runtime";
 import { EditorDocumentService } from "../services/editor-document-service";
 import { LocalFileChangeRuntime } from "../services/file-change-runtime";
 import { createEditorDocumentRoutes } from "./editor-documents";
+import { remoteEditorFixture } from "./editor-remote-browser-acceptance";
 import { createFileReferenceRoutes } from "./narrator-file-references";
 
 const CHROME =
@@ -63,7 +64,7 @@ function sourceBytes() {
 
 // Browser availability is a prerequisite failure, never a skipped acceptance.
 const browserTest = test;
-browserTest.each([false, true, "cache", "draft"] as const)(
+browserTest.each([false, true, "cache", "draft", "remote"] as const)(
 	"production Chromium editor and actual FilePanelContent/gate IO (hostGate=%s)",
 	async (hostGate) => {
 		expect(existsSync(CHROME)).toBe(true);
@@ -89,6 +90,7 @@ browserTest.each([false, true, "cache", "draft"] as const)(
 		let service: EditorDocumentService | undefined;
 		let backend: ReturnType<typeof Bun.serve> | undefined;
 		let browser: Browser | undefined;
+		let remote: ReturnType<typeof remoteEditorFixture> | undefined;
 		let sampler: Promise<void> | undefined;
 		let duringCommit = false;
 		let duringDurable = false;
@@ -261,13 +263,31 @@ browserTest.each([false, true, "cache", "draft"] as const)(
 							}
 						} else await next();
 					});
-					app.get("/api/fixture/config", (c) => c.json({ path, narratorId, hostGate }));
+					if (hostGate === "remote")
+						remote = remoteEditorFixture({
+							path,
+							cwd: workspace,
+							hostCwd: root,
+							narratorId,
+							userId,
+						});
+					app.get("/api/fixture/config", (c) =>
+						c.json({
+							path: remote ? "twenty-mib.ts" : path,
+							narratorId,
+							hostGate,
+							deviceId: remote?.deviceId,
+						}),
+					);
 					app.get("/api/health", (c) => c.json({ ok: true, fixture: narratorId }));
 					app.route(
 						"/api/narrators",
 						createEditorDocumentRoutes(() => documents),
 					);
-					app.route("/api/narrators/:id/file-references", createFileReferenceRoutes());
+					app.route(
+						"/api/narrators/:id/file-references",
+						createFileReferenceRoutes(remote?.service),
+					);
 					app.onError((error, c) =>
 						c.json(
 							{ error: error.message, code: error instanceof AppError ? error.code : "ERROR" },
@@ -462,6 +482,15 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						}
 					});
 					await bounded(page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }));
+					if (remote) {
+						await bounded(remote.accept(page, origin));
+						expect(documentCreates).toBe(0);
+						expect(commits).toBe(0);
+						expect(contentResponses).toBe(0);
+						expect(diagnostics).toEqual([]);
+						expect(offOriginCount).toBe(0);
+						return;
+					}
 					if (hostGate === "draft") {
 						const { editorDraftBrowserAcceptance } = await import(
 							"./editor-draft-browser-acceptance"
@@ -1008,6 +1037,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 				}),
 				cleanup("Bun server and streams", async () => backend?.stop(true)),
 			]);
+			remote?.restore();
 			await cleanup("document service", async () => service?.dispose());
 			await Promise.all([
 				cleanup("temporary fixture", async () => {
