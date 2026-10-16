@@ -8,6 +8,7 @@ import { genUiParameters } from "@server/lib/agent/tools/gen-ui";
 import type { ToolContext } from "@server/lib/agent/types";
 import { readGenUiKitNotice } from "@shared/gen-ui-kit";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { answerGenUiForm, isGenUiFormWaiting } from "./form-wait";
 import {
 	approveKitRequest,
 	dismissKitRequest,
@@ -195,6 +196,48 @@ describe("render", () => {
 			env,
 		);
 		expect(result.output).not.toContain("Nothing binds");
+	});
+
+	test("wait holds the call until the user answers the form", async () => {
+		const { env } = await fixture();
+		env.ctx = { ...env.ctx, currentToolUseId: "form-1" } as ToolContext;
+		const source =
+			'<Stack><TextInput bind="name" defaultValue="Ada" /><Button onClick={submit("Done")}>Send</Button></Stack>';
+		const pending = executeKitAction({ action: "render", source, wait: true }, env);
+		// The wait registers once the markup has been checked.
+		for (let i = 0; i < 50 && !isGenUiFormWaiting("n", "form-1"); i++) await Bun.sleep(10);
+		expect(
+			answerGenUiForm("n", "form-1", {
+				status: "submitted",
+				message: "Done",
+				fields: { name: "Ada L" },
+			}),
+		).toBe(true);
+		const result = await pending;
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain('The user submitted the form ("Done").');
+		expect(result.output).toContain('"name": "Ada L"');
+		expect(result.metadata?.genUiForm).toEqual({ version: 1, status: "submitted" });
+		expect(result.metadata?.genUiInline).toBeDefined();
+	});
+
+	test("wait needs a submit control, and a session someone can answer in", async () => {
+		const { env } = await fixture();
+		env.ctx = { ...env.ctx, currentToolUseId: "form-2" } as ToolContext;
+		const noSubmit = await executeKitAction(
+			{ action: "render", source: '<Stack><TextInput bind="name" /></Stack>', wait: true },
+			env,
+		);
+		expect(noSubmit.isError).toBe(true);
+		expect(noSubmit.output).toContain("wait: true needs a submit() control");
+		expect(isGenUiFormWaiting("n", "form-2")).toBe(false);
+		env.ctx = { ...env.ctx, parentNarratorId: "parent" } as ToolContext;
+		const subagent = await executeKitAction(
+			{ action: "render", source: "<Button onClick={submit()}>Go</Button>", wait: true },
+			env,
+		);
+		expect(subagent.isError).toBe(true);
+		expect(subagent.output).toContain("wait: true is unavailable");
 	});
 
 	test("markup with nothing renderable is rejected", async () => {

@@ -184,9 +184,9 @@ export function createPreviewShell(
     let lastGesture = -Infinity;
     for (const type of ["pointerdown", "keydown", "click"])
       document.addEventListener(type, event => { if (event.isTrusted) lastGesture = performance.now(); }, true);
-    const act = (action, value, fields) => {
+    const act = (action, value, form) => {
       if (performance.now() - lastGesture > 1000) return;
-      parent.postMessage({type: "narrafork:ui-action", action, value: String(value).slice(0, 2000), ...(fields ? {fields} : {})}, "*");
+      parent.postMessage({type: "narrafork:ui-action", action, value: String(value).slice(0, 2000), ...(form ? {fields: form.fields, message: form.message.slice(0, 2000)} : {})}, "*");
     };
     // Named state: what a bind="x" control holds, read by $x and by the actions. It lives
     // for the frame, so a newer tree posted while the UI streams keeps what was typed.
@@ -214,7 +214,7 @@ export function createPreviewShell(
         const text = shown(fields[name]);
         return name + ": " + (text.length > room ? text.slice(0, room - 1) + "…" : text);
       });
-      act("submit", [value.trim(), ...lines].filter(Boolean).join("\\n"), fields);
+      act("submit", [value.trim(), ...lines].filter(Boolean).join("\\n"), {fields, message: value.trim()});
     };
     // A change reaches a bound control as an event (inputs, checkboxes) or as the value
     // itself (Select, Slider, SegmentedControl, Tabs…).

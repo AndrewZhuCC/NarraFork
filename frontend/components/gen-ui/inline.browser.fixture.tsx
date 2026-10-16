@@ -32,6 +32,8 @@ await i18n.init({
 					promptConfirm: "Send this to the chat? {{text}}",
 					promptSend: "Send",
 					cancel: "Cancel",
+					formWaiting: "Waiting for your answer: {{title}}",
+					formClose: "Close form",
 					kit: {
 						title: "Component kit",
 						buildPrompt: "Build a component kit?",
@@ -53,10 +55,12 @@ setToken("fixture-private-token");
 function Fixture() {
 	const [inline, setInline] = useState({ source: "", live: true });
 	const [kit, setKit] = useState<GenUiKitNotice | undefined>(undefined);
+	const [form, setForm] = useState<string | undefined>(undefined);
 	Object.assign(window, {
 		inlineFixture: {
 			stream: (source: string, live: boolean) => setInline({ source, live }),
 			kit: setKit,
+			form: setForm,
 		},
 	});
 	return (
@@ -71,7 +75,7 @@ function Fixture() {
 						<GenUICard
 							narratorId="n1"
 							file={null}
-							inline={{ ...inline, title: "Plans" }}
+							inline={{ ...inline, title: "Plans", formToolUseId: form }}
 							kit={kit}
 							height={400}
 						/>

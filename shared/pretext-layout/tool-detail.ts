@@ -518,6 +518,11 @@ export interface ToolGenUiDetail {
 	runtime?: "builtin" | "project";
 	/** Identity of the host-owned state above, which arrives after the input does. */
 	revision?: string;
+	/**
+	 * Set while a `wait: true` render holds its call open: the card's submit answers that
+	 * call instead of sending a chat message.
+	 */
+	formToolUseId?: string;
 }
 
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
@@ -933,6 +938,15 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
 					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
 					...uiKitFields,
+					...(uiInput.wait === true &&
+					status != null &&
+					!isTerminalToolStatus(status) &&
+					typeof input.toolUseId === "string"
+						? {
+								formToolUseId: input.toolUseId,
+								revision: `${uiKitFields.revision ?? ""}:form`,
+							}
+						: {}),
 				})
 			: null;
 	const uiDetail: ToolDetailData | null = uiInline

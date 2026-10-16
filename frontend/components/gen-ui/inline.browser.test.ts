@@ -16,6 +16,7 @@ declare global {
 		inlineFixture: {
 			stream(source: string, live: boolean): void;
 			kit(notice: unknown): void;
+			form(toolUseId: string | undefined): void;
 		};
 	}
 }
@@ -340,6 +341,75 @@ browserTest(
 			await new Promise((done) => setTimeout(done, 1200));
 			expect(messages).toHaveLength(2);
 			expect(messages[1]?.body).toEqual({ message: "too soon" });
+		});
+	},
+	120_000,
+);
+
+browserTest(
+	"a form the agent waits on: submit and close answer the call, not the chat",
+	async () => {
+		const answers: Array<{ path: string; body: unknown }> = [];
+		let waiting = true;
+		const kit = async (path: string, incoming: Request) => {
+			if (path.includes("/gen-ui/form/")) {
+				answers.push({ path, body: await incoming.json() });
+				return waiting
+					? Response.json({ ok: true })
+					: Response.json(
+							{ error: "Nothing is waiting", code: "UI_FORM_NOT_WAITING" },
+							{ status: 409 },
+						);
+			}
+			if (path.endsWith("/gen-ui/kit"))
+				return Response.json({ status: { state: "builtin", components: [] }, request: null });
+			return null;
+		};
+		await withFixturePage(kit, async (page, messages) => {
+			const form = `<Stack>
+	<TextInput id="who" bind="who" defaultValue="Ada" />
+	<Button id="send" onClick={submit("Here you go")}>Send</Button>
+</Stack>`;
+			await page.evaluate((s) => window.inlineFixture.stream(s, false), form);
+			await page.evaluate(() => window.inlineFixture.form("form-1"));
+			const handle = await page.waitForSelector('#card iframe[title="Plans"]');
+			const frame = (await handle?.contentFrame()) as Frame;
+			await frame.waitForSelector("#send");
+			await page.waitForFunction(() =>
+				document.querySelector("#card")?.textContent?.includes("Waiting for your answer: Plans"),
+			);
+			await frame.click("#send");
+			for (let waited = 0; answers.length === 0 && waited < 40; waited++)
+				await new Promise((done) => setTimeout(done, 50));
+			expect(answers).toEqual([
+				{
+					path: "/nf/api/narrators/n1/gen-ui/form/form-1",
+					body: { status: "submitted", message: "Here you go", fields: { who: "Ada" } },
+				},
+			]);
+			expect(messages).toEqual([]);
+
+			// Closing the form is an answer too.
+			const close = await page.waitForSelector("#card button ::-p-text(Close form)");
+			await close?.click();
+			for (let waited = 0; answers.length < 2 && waited < 40; waited++)
+				await new Promise((done) => setTimeout(done, 50));
+			expect(answers[1]?.body).toEqual({ status: "closed" });
+
+			// The call ended (it timed out, say): the card is ordinary again, and a click
+			// becomes a chat message.
+			waiting = false;
+			await page.evaluate(() => window.inlineFixture.form(undefined));
+			await page.waitForFunction(
+				() => !document.querySelector("#card")?.textContent?.includes("Waiting for your answer"),
+			);
+			await new Promise((done) => setTimeout(done, 1100));
+			await frame.click("#send");
+			for (let waited = 0; messages.length === 0 && waited < 40; waited++)
+				await new Promise((done) => setTimeout(done, 50));
+			expect(messages).toHaveLength(1);
+			expect(messages[0]?.body).toEqual({ message: "Here you go\nwho: Ada" });
+			expect(answers).toHaveLength(2);
 		});
 	},
 	120_000,

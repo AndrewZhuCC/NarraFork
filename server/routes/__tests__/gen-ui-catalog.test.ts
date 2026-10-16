@@ -43,6 +43,10 @@ function fixture(overrides: Partial<GenUiRouteDependencies> = {}) {
 			approve: async () => ({ status: { state: "builtin", components: [] }, request: null }),
 			dismiss: async () => ({ dismissed: true }),
 		},
+		answerForm: (...args) => {
+			seen.push(args);
+			return args[1] === "waiting";
+		},
 		...overrides,
 	};
 	return { app: createGenUiRoutes(deps), seen };
@@ -106,6 +110,46 @@ describe("GenUI file preview route", () => {
 				expect(seen).toEqual([["n", "actor", { ...reference, toolCallId: "copy" }]]);
 			else expect(seen).toEqual([]);
 		}
+	});
+	test("form answers reach only a waiting call, as plain checked data", async () => {
+		const { app, seen } = fixture();
+		const post = (toolUseId: string, body: unknown) =>
+			app.request(`/n/gen-ui/form/${toolUseId}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		const fields = { size: "L", count: 3, agree: true, tags: ["a", "b"], none: null };
+		expect((await post("waiting", { status: "submitted", message: "Go", fields })).status).toBe(
+			200,
+		);
+		expect((await post("waiting", { status: "closed" })).status).toBe(200);
+		expect((await post("done", { status: "closed" })).status).toBe(409);
+		for (const bad of [
+			{ status: "submitted", message: "Go", fields: { "a b": 1 } },
+			{ status: "submitted", message: "Go", fields: { a: { nested: 1 } } },
+			{ status: "submitted", fields: {} },
+			{ status: "maybe" },
+		])
+			expect((await post("waiting", bad)).status).toBe(400);
+		expect(seen).toEqual([
+			["n", "waiting", { status: "submitted", message: "Go", fields }],
+			["n", "waiting", { status: "closed" }],
+			["n", "done", { status: "closed" }],
+		]);
+	});
+	test("form answers check access first", async () => {
+		const { app, seen } = fixture({
+			authorize: async () => {
+				throw new AppError("denied", 403);
+			},
+		});
+		const response = await app.request("/n/gen-ui/form/waiting", {
+			method: "POST",
+			body: JSON.stringify({ status: "closed" }),
+		});
+		expect(response.status).toBe(403);
+		expect(seen).toEqual([]);
 	});
 	test("does not expose any legacy catalog/session/action routes", async () => {
 		const { app } = fixture();

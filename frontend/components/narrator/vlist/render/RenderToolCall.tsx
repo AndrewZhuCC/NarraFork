@@ -2048,6 +2048,7 @@ export function RenderToolBody({
 								live: model.live === true,
 								title: model.title,
 								runtime: model.runtime,
+								formToolUseId: model.formToolUseId,
 							}
 				}
 				kit={model.kit}

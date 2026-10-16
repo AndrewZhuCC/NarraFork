@@ -35,6 +35,8 @@ export interface GenUICardProps {
 		title?: string;
 		/** What the finished call was drawn with; old UI keeps that runtime. */
 		runtime?: "builtin" | "project";
+		/** Set while a `wait: true` call is holding open for this form. */
+		formToolUseId?: string;
 	};
 	/** The kit this result used, and any build the user is being asked to confirm. */
 	kit?: GenUiKitNotice;
@@ -113,7 +115,18 @@ function InlineCard({
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
 	const [expanded, setExpanded] = useState(false);
+	const [closing, setClosing] = useState(false);
 	const title = inline.title || t("genUi.title");
+	const form = inline.live ? undefined : inline.formToolUseId;
+	// Kept out of the chat bundle: only a card that is waiting on its reader needs it.
+	const closeForm = () => {
+		if (!form) return;
+		setClosing(true);
+		void import("./kit-client")
+			.then((client) => client.answerGenUiForm(narratorId, form, { status: "closed" }))
+			.catch(() => undefined)
+			.finally(() => setClosing(false));
+	};
 	const notice = kit?.request ? NOTICE_ROW : 0;
 	const expandedFrame = expanded ? (
 		<Suspense fallback={<Loader size="sm" />}>
@@ -124,6 +137,7 @@ function InlineCard({
 				height="70dvh"
 				title={title}
 				runtime={inline.runtime}
+				formToolUseId={form}
 			/>
 		</Suspense>
 	) : null;
@@ -133,17 +147,29 @@ function InlineCard({
 				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
 					{inline.live && <Loader size={12} />}
 					<Text fw={600} size="xs" truncate title={title}>
-						{inline.live ? t("genUi.streaming", { title }) : title}
+						{inline.live
+							? t("genUi.streaming", { title })
+							: form
+								? t("genUi.formWaiting", { title })
+								: title}
 					</Text>
 				</Group>
-				<Button
-					size="compact-xs"
-					variant="subtle"
-					onClick={() => setExpanded(true)}
-					style={{ flexShrink: 0 }}
-				>
-					{t("genUi.expand")}
-				</Button>
+				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					{form && (
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							color="gray"
+							loading={closing}
+							onClick={closeForm}
+						>
+							{t("genUi.formClose")}
+						</Button>
+					)}
+					<Button size="compact-xs" variant="subtle" onClick={() => setExpanded(true)}>
+						{t("genUi.expand")}
+					</Button>
+				</Group>
 			</Group>
 			{kit?.request && (
 				<Box px="xs">
@@ -160,6 +186,7 @@ function InlineCard({
 					height={Math.max(60, height - INLINE_HEADER - notice)}
 					title={title}
 					runtime={inline.runtime}
+					formToolUseId={form}
 				/>
 			</Suspense>
 			{expanded &&

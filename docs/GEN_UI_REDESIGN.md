@@ -1,6 +1,6 @@
 # gen_ui 重设计：问题分析与方案草案
 
-> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1 步（改名）、第 2 步（描述与报错）、第 3 步（markup 状态绑定）已实施，其余待定。
+> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1–4 步（改名、描述与报错、markup 状态绑定、阻塞表单）已实施，第 5 步待定。
 > 材料：一次真实会话导出（deepseek-v4.1-flash 使用 IntelligentUI 的全过程）+ main 上的现有实现。
 
 ## 0. 现状速览
@@ -100,7 +100,9 @@
 | **阻塞表单**（推荐默认） | agent 需要用户填完才能继续（配置向导、参数选择） | `render` 增加 `wait: true`：工具调用像 `AskUserQuestion` 一样挂起，用户点 `submit()` 后，**工具结果**就是 `{"radius": 24, "label": "卡片"}`；取消/超时返回明确的取消结果。可复用 `narrator-question-service` 的挂起/恢复与通知（human-attention） |
 | **非阻塞提交** | 卡片留在对话里，用户随时操作 | 不带 `wait` 时 `submit()` 发一条用户消息，正文是人类可读的摘要 + 结构化附件（`gen_ui_submission` 元数据，含 toolUseId 与字段值），模型下一轮读到 |
 
-两者都满足「值是用户手势产生的、宿主可见的」。阻塞表单比「伪造一条用户消息」更干净：值进工具结果、不污染对话、模型不会误以为用户说了话。
+两者都满足「值是用户手势产生的、宿主可见的」。
+
+已实施（第 4 步）：没有复用权限弹窗那条路（`AskUserQuestion` 的同步模式靠权限门挂起，会带上自动代答、权限模式等语义），而是在工具内等待：`render` 带 `wait: true` 时，校验通过后在内存中登记等待（`server/services/gen-ui/form-wait.ts`），用户点 `submit()` 时卡片调 `POST /api/narrators/:id/gen-ui/form/:toolUseId`，工具结果为 JSON 字段值；卡片标题显示“等待你填写”，旁边有“关闭表单”。30 分钟超时、用户中断、服务重启都会结束等待，之后卡片里的提交退回为普通聊天消息。没有 `submit()` 控件或子代理（无法提问的运行时）中使用 `wait` 时直接报错，不挂起。非阻塞提交仍按第 3 步发聊天消息，暂未加 `gen_ui_submission` 元数据。阻塞表单比「伪造一条用户消息」更干净：值进工具结果、不污染对话、模型不会误以为用户说了话。
 
 ---
 

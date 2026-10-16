@@ -909,15 +909,24 @@ export function findUnknownUiTags(
 	return [...unknown];
 }
 
-/** State the markup binds (`bind="x"`) and reads (`$x`), each name once, in order of use. */
-export function collectUiState(nodes: UiNode[]): { bound: string[]; read: string[] } {
+/**
+ * State the markup binds (`bind="x"`) and reads (`$x`), and the actions its controls
+ * perform, each name once, in order of use.
+ */
+export function collectUiState(nodes: UiNode[]): {
+	bound: string[];
+	read: string[];
+	actions: string[];
+} {
 	const bound = new Set<string>();
 	const read = new Set<string>();
+	const actions = new Set<string>();
 	const readValue = (value: UiValue): void => {
 		if (Array.isArray(value)) for (const item of value) readValue(item);
 		else if (value && typeof value === "object") {
 			if ("$ref" in value && typeof value.$ref === "string") read.add(value.$ref);
 			else if ((value as UiElement).$node === "el") walk([value as UiElement]);
+			else if ("$action" in value && typeof value.$action === "string") actions.add(value.$action);
 			else if (!("$node" in value) && !("$action" in value))
 				for (const item of Object.values(value)) readValue(item);
 		}
@@ -937,5 +946,5 @@ export function collectUiState(nodes: UiNode[]): { bound: string[]; read: string
 		}
 	};
 	walk(nodes);
-	return { bound: [...bound], read: [...read] };
+	return { bound: [...bound], read: [...read], actions: [...actions] };
 }

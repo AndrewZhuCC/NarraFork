@@ -7,6 +7,7 @@ import type { GenUiKitBundle } from "@shared/gen-ui-kit";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { type Context, Hono } from "hono";
 import { AppError } from "../lib/errors";
+import { answerGenUiForm, readGenUiFormFields } from "../services/gen-ui/form-wait";
 import type { KitOverview } from "../services/gen-ui/kit-service";
 
 export interface GenUiRouteDependencies {
@@ -33,6 +34,7 @@ export interface GenUiRouteDependencies {
 		approve(narratorId: string, userId: string, requestId: string): Promise<KitOverview>;
 		dismiss(narratorId: string, requestId: string): Promise<{ dismissed: boolean }>;
 	};
+	answerForm: typeof answerGenUiForm;
 }
 const defaults: GenUiRouteDependencies = {
 	async authorize(c, narratorId) {
@@ -74,6 +76,7 @@ const defaults: GenUiRouteDependencies = {
 			return kitService.dismiss(...args);
 		},
 	},
+	answerForm: answerGenUiForm,
 };
 
 export function createGenUiRoutes(overrides: Partial<GenUiRouteDependencies> = {}) {
@@ -171,6 +174,27 @@ export function createGenUiRoutes(overrides: Partial<GenUiRouteDependencies> = {
 		const narratorId = c.req.param("id");
 		await deps.authorize(c, narratorId);
 		return c.json(await deps.kit.dismiss(narratorId, await requestId(c)));
+	});
+	// The reader's answer to a form a `render` with `wait: true` is holding its call open
+	// for. Answering is acting in the conversation, so it takes the same write access.
+	app.post("/:id/gen-ui/form/:toolUseId", async (c) => {
+		const narratorId = c.req.param("id");
+		const toolUseId = c.req.param("toolUseId");
+		if (toolUseId.length > 200) throw new AppError("Invalid tool call", 400, "UI_FORM_INVALID");
+		await deps.authorize(c, narratorId);
+		const body: unknown = await c.req.json().catch(() => null);
+		const input = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+		let answer: Parameters<GenUiRouteDependencies["answerForm"]>[2];
+		if (input.status === "closed") answer = { status: "closed" };
+		else {
+			const fields = readGenUiFormFields(input.fields ?? {});
+			if (input.status !== "submitted" || !fields || typeof input.message !== "string")
+				throw new AppError("Not a form answer", 400, "UI_FORM_INVALID");
+			answer = { status: "submitted", message: input.message, fields };
+		}
+		if (!deps.answerForm(narratorId, toolUseId, answer))
+			throw new AppError("Nothing is waiting for this form", 409, "UI_FORM_NOT_WAITING");
+		return c.json({ ok: true });
 	});
 	return app;
 }

@@ -27,6 +27,8 @@
 		"historyUnavailable": "当前文件 · 此创建无法随消息回退",
 		"streaming": "正在生成 {{title}}…",
 		"expand": "放大",
+		"formWaiting": "等待你填写：{{title}}",
+		"formClose": "关闭表单",
 		"sendFailed": "消息发送失败",
 		"linkConfirm": "打开 {{url}}？",
 		"linkOpen": "打开",

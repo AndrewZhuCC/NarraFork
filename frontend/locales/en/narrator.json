@@ -27,6 +27,8 @@
 		"historyUnavailable": "Current files · history rollback unavailable",
 		"streaming": "Generating {{title}}…",
 		"expand": "Expand",
+		"formWaiting": "Waiting for your answer: {{title}}",
+		"formClose": "Close form",
 		"sendFailed": "Could not send the message",
 		"linkConfirm": "Open {{url}}?",
 		"linkOpen": "Open",

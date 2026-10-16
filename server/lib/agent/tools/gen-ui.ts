@@ -18,6 +18,7 @@ export const genUiParameters = z
 		path: z.string().min(1).max(4096).optional(),
 		title: z.string().min(1).max(80).optional(),
 		size: z.enum(["sm", "md", "lg"]).optional(),
+		wait: z.boolean().optional(),
 		// Retired: still parsed so a call already in flight is answered, never honoured.
 		skip_build: z.boolean().optional(),
 		source: z.string().min(1).max(UI_MARKUP_LIMITS.sourceChars).optional(),
@@ -26,7 +27,7 @@ export const genUiParameters = z
 	.superRefine((input, ctx) => {
 		const given = (key: keyof typeof input) => input[key] !== undefined;
 		const only = (...allowed: Array<keyof typeof input>) =>
-			(["prefix", "path", "title", "size", "skip_build", "source"] as const).every(
+			(["prefix", "path", "title", "size", "wait", "skip_build", "source"] as const).every(
 				(key) => allowed.includes(key) || !given(key),
 			);
 		const valid =
@@ -35,7 +36,7 @@ export const genUiParameters = z
 				: input.action === "show"
 					? given("path") && only("path")
 					: input.action === "render"
-						? given("source") && only("source", "title", "size")
+						? given("source") && only("source", "title", "size", "wait")
 						: input.action === "kit_build"
 							? only("skip_build")
 							: only();
@@ -43,13 +44,19 @@ export const genUiParameters = z
 			ctx.addIssue({
 				code: "custom",
 				message:
-					"create takes only prefix; show takes only path; render takes source (+ title, size); kit_build and kit_status take nothing",
+					"create takes only prefix; show takes only path; render takes source (+ title, size, wait); kit_build and kit_status take nothing",
 			});
 	});
 export type GenUiInput =
 	| { action: "create"; prefix: string }
 	| { action: "show"; path: string }
-	| { action: "render"; source: string; title?: string; size?: "sm" | "md" | "lg" }
+	| {
+			action: "render";
+			source: string;
+			title?: string;
+			size?: "sm" | "md" | "lg";
+			wait?: boolean;
+	  }
 	| { action: "kit_status" }
 	| { action: "kit_build"; skip_build?: boolean };
 
@@ -57,11 +64,12 @@ export const genUiTool: ToolDefinition = {
 	name: GEN_UI_TOOL_NAME,
 	description: `Show the user UI in the conversation. Two ways:
 
-render({title, size, source}) — the default. Draws markup inline in the chat while you write it: no build, no click. Use it for cards, tables, comparisons, forms, tabs, accordions, and controls that drive a preview.
+render({title, size, wait, source}) — the default. Draws markup inline in the chat while you write it: no build, no click. Use it for cards, tables, comparisons, forms, tabs, accordions, and controls that drive a preview.
 - Components: every export of @mantine/core (Stack, Group, Card, Text, Title, Badge, Button, Table, Tabs, Accordion, TextInput, Textarea, NumberInput, Select, Checkbox, Switch, Radio, Slider, SegmentedControl, Progress, Alert…), dotted members such as <Tabs.List>, and plain HTML (div, p, ul, li, table, img, a…). With a project component kit its components replace Mantine; kit_status lists them. A misspelt tag is drawn as a placeholder and the result names the closest real one.
 - source is JSX-like DATA, not code. Attributes are string/number/boolean literals, {[…]} / {{…}} literals, JSX ({<Icon />}) or $name. No other variables, no expressions, map(), hooks, imports or onChange: write repeated items out.
 - State: bind="name" on a control (TextInput, Select, Slider, Checkbox, Switch, SegmentedControl, Radio.Group, Tabs…) keeps its value under that name, starting from defaultValue / defaultChecked; give every bound control one, or it starts empty. $name reads it anywhere: an attribute (radius={$radius}), a style ({{ borderRadius: $radius }}) or a child ({$radius}px). That is how one control drives the rest of the UI. A control without bind keeps its own value, which nothing else can read; never write a literal value= or checked=, it freezes the control.
 - Handlers (onClick and other gesture props only): sendPrompt("text") sends text as the user's next message, with {name} replaced by that state's value at click time; submit("message") sends the message followed by every bound value as "name: value" lines; openLink("https://…") opens a link after the user confirms. Values reach you only through a click on one of these.
+- wait: true makes it a form you wait on: the call stays open until the user clicks a submit() control, and its result is the bound values as JSON instead of a chat message (or that they closed it). Use it when you need their answers before going on; it needs a submit() control.
 - Put title and size before source: "sm" (240px), "md" (400px, default) or "lg" (580px).
 Example: <Stack gap="sm"><Title order={4}>Card corners</Title><Slider bind="radius" defaultValue={12} min={0} max={48} /><Card withBorder radius={$radius}><Text>border-radius: {$radius}px</Text></Card><TextInput bind="note" label="Note" /><Button onClick={submit("Use these settings")}>Apply</Button></Stack>
 
@@ -90,7 +98,7 @@ Never put secrets in UI.`,
 		},
 	},
 	formatValidationError: () =>
-		"Use {action:'render',title,size,source}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx'}.",
+		"Use {action:'render',title,size,wait,source}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx'}.",
 	async execute(args, ctx) {
 		try {
 			const { executeGenUiTool } = await import("@server/services/gen-ui/runtime");

@@ -1,6 +1,10 @@
 import type { ExecutionBackend } from "@server/lib/agent/execution/backend";
 import type { ToolContext, ToolResult } from "@server/lib/agent/types";
 import {
+	assertRuntimeCanAskQuestion,
+	runtimePolicyForContext,
+} from "@server/services/agent-runtime/policy";
+import {
 	describeGenUiKitCatalog,
 	GEN_UI_KIT_DIRECTORY,
 	type GenUiKitNotice,
@@ -18,6 +22,7 @@ import {
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { builtinComponentNames } from "./compiler";
 import { type AuthorizeFile, uiError, workspaceKey } from "./files";
+import { describeGenUiFormOutcome, waitForGenUiForm } from "./form-wait";
 import { buildKit, type KitBuildOptions, type KitSnapshot, readKit } from "./kit";
 import {
 	consumeKitApproval,
@@ -28,7 +33,13 @@ import {
 } from "./kit-requests";
 
 export type KitToolInput =
-	| { action: "render"; source: string; title?: string; size?: "sm" | "md" | "lg" }
+	| {
+			action: "render";
+			source: string;
+			title?: string;
+			size?: "sm" | "md" | "lg";
+			wait?: boolean;
+	  }
 	| { action: "kit_status" }
 	| { action: "kit_build"; skip_build?: boolean };
 
@@ -223,35 +234,85 @@ async function render(
 	const problems = parsed.diagnostics
 		.slice(0, 8)
 		.map((item) => `- ${item.message} (offset ${item.offset})`);
+	const metadata = {
+		genUiInline: { version: 1, kit: project ? "project" : "builtin" },
+		genUiKit: notice(snapshot.status, prompt.shown),
+	};
+	const notes = [
+		...(unknown.length
+			? [
+					`These tags do not exist and were drawn as dashed placeholders; the rest of the UI rendered. Fix them and render again:\n${unknownTagLines(unknown, available)}`,
+				]
+			: []),
+		...(unbound.length
+			? [
+					`Nothing binds ${unbound.map((name) => `$${name}`).join(", ")}, so it shows nothing: add bind="${unbound[0]}" to the control that should hold it.`,
+				]
+			: []),
+		...(problems.length ? [`Parts of the markup were ignored:\n${problems.join("\n")}`] : []),
+		...(snapshot.status.state === "stale"
+			? ["The kit is out of date; this used the last built bundle."]
+			: []),
+		...(snapshot.status.state === "invalid"
+			? [`kit.json is invalid (${snapshot.status.reason}); fix it before the next build.`]
+			: []),
+		describeRenderRequest(prompt),
+	];
+	if (input.wait) return waitForForm(input, env, state.actions, notes, metadata);
 	return {
 		output: [
 			`Rendered inline with the ${project ? "project's" : "built-in Mantine"} component kit (${parsed.elements} elements). The user sees it in the chat now. Values they type or pick stay in the card until they click a sendPrompt or submit control.`,
-			...(unknown.length
-				? [
-						`These tags do not exist and were drawn as dashed placeholders; the rest of the UI rendered. Fix them and render again:\n${unknownTagLines(unknown, available)}`,
-					]
-				: []),
-			...(unbound.length
-				? [
-						`Nothing binds ${unbound.map((name) => `$${name}`).join(", ")}, so it shows nothing: add bind="${unbound[0]}" to the control that should hold it.`,
-					]
-				: []),
-			...(problems.length ? [`Parts of the markup were ignored:\n${problems.join("\n")}`] : []),
-			...(snapshot.status.state === "stale"
-				? ["The kit is out of date; this used the last built bundle."]
-				: []),
-			...(snapshot.status.state === "invalid"
-				? [`kit.json is invalid (${snapshot.status.reason}); fix it before the next build.`]
-				: []),
-			describeRenderRequest(prompt),
+			...notes,
 		]
 			.filter(Boolean)
 			.join("\n"),
 		title: input.title,
-		metadata: {
-			genUiInline: { version: 1, kit: project ? "project" : "builtin" },
-			genUiKit: notice(snapshot.status, prompt.shown),
-		},
+		metadata,
+	};
+}
+
+/**
+ * A `wait: true` render: the UI is already in the chat (it streamed from the input), so
+ * what is left is holding the call open until the reader answers it.
+ */
+async function waitForForm(
+	input: Extract<KitToolInput, { action: "render" }>,
+	env: KitToolEnvironment,
+	actions: string[],
+	notes: string[],
+	metadata: ToolResult["metadata"],
+): Promise<ToolResult> {
+	const toolUseId = env.ctx.currentToolUseId;
+	const refusal = !actions.includes("submit")
+		? "wait: true needs a submit() control, and this UI has none: it is in the chat, but nothing waits for it. Add a button with onClick={submit()} and render again."
+		: !toolUseId
+			? "This call cannot wait for a form; render it without wait."
+			: (() => {
+					try {
+						assertRuntimeCanAskQuestion(runtimePolicyForContext(env.ctx));
+						return null;
+					} catch {
+						return "Nobody can answer a form in this session, so wait: true is unavailable. Render without wait, or carry on with sensible defaults.";
+					}
+				})();
+	if (refusal || !toolUseId)
+		return {
+			output: [refusal ?? "", ...notes].filter(Boolean).join("\n"),
+			isError: true,
+			title: input.title,
+			metadata,
+		};
+	const outcome = await waitForGenUiForm({
+		narratorId: env.ctx.narratorId,
+		toolUseId,
+		signal: env.ctx.signal,
+	});
+	const answer = describeGenUiFormOutcome(outcome);
+	return {
+		output: [answer.output, ...notes].filter(Boolean).join("\n"),
+		...(answer.isError ? { isError: true } : {}),
+		title: input.title,
+		metadata: { ...metadata, genUiForm: { version: 1, status: outcome.status } },
 	};
 }
 

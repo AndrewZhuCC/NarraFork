@@ -236,6 +236,35 @@ export async function dismissKitRequest(narratorId: string, requestId: string): 
 	await json<unknown>(await post(narratorId, "dismiss", requestId), 16 * 1024);
 }
 
+export type GenUiFormAnswer =
+	| { status: "submitted"; message: string; fields: Record<string, unknown> }
+	| { status: "closed" };
+
+/**
+ * Answer the form a `wait: true` render is holding its call open for. "not-waiting" means
+ * the call already ended (answered, timed out or stopped): the caller decides what the
+ * click becomes instead.
+ */
+export async function answerGenUiForm(
+	narratorId: string,
+	toolUseId: string,
+	answer: GenUiFormAnswer,
+): Promise<"answered" | "not-waiting"> {
+	const response = await authorizedFetch(
+		`/api/narrators/${encodeURIComponent(narratorId)}/gen-ui/form/${encodeURIComponent(toolUseId)}`,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(answer),
+			redirect: "error",
+			signal: AbortSignal.timeout(20_000),
+		},
+	);
+	if (response.status === 409) return "not-waiting";
+	await json<unknown>(response, 16 * 1024);
+	return "answered";
+}
+
 /** Test seam: module caches must not leak between cases. */
 export function resetUiRuntimeCachesForTest(): void {
 	builtin = undefined;

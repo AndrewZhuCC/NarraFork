@@ -4,7 +4,7 @@ import { Alert, Box, Button, Group, Loader, Text } from "@mantine/core";
 import { parseUiMarkup } from "@shared/gen-ui-markup";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { loadUiRuntime, type UiRuntime } from "./kit-client";
+import { answerGenUiForm, loadUiRuntime, type UiRuntime } from "./kit-client";
 import { createPreviewShell, readPreviewTheme } from "./preview-shell";
 
 function httpUrl(value: string): string | null {
@@ -14,6 +14,19 @@ function httpUrl(value: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+interface SubmittedForm {
+	message: string;
+	fields: Record<string, unknown>;
+}
+
+/** The values a submit() carried; the server checks their shape again. */
+function readSubmittedForm(data: { message?: unknown; fields?: unknown }): SubmittedForm | null {
+	const { message, fields } = data;
+	if (typeof message !== "string" || !fields || typeof fields !== "object" || Array.isArray(fields))
+		return null;
+	return { message, fields: fields as Record<string, unknown> };
 }
 
 /**
@@ -31,6 +44,7 @@ export function InlineRender({
 	height,
 	title,
 	runtime: recorded,
+	formToolUseId,
 }: {
 	narratorId: string;
 	source: string;
@@ -40,12 +54,16 @@ export function InlineRender({
 	title: string;
 	/** The runtime the finished call was drawn with; absent while it is still streaming. */
 	runtime?: "builtin" | "project";
+	/** A `wait: true` call is holding open for this UI: submit() answers it. */
+	formToolUseId?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const [runtime, setRuntime] = useState<UiRuntime | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [link, setLink] = useState<string | null>(null);
 	const [prompt, setPrompt] = useState<string | null>(null);
+	// What a confirmed prompt delivers: a submit() also carries the form's values.
+	const promptForm = useRef<SubmittedForm | null>(null);
 	const [sendFailed, setSendFailed] = useState(false);
 	const [navigated, setNavigated] = useState(false);
 	const loads = useRef(0);
@@ -62,6 +80,9 @@ export function InlineRender({
 	// would otherwise still see the previous runtime and send a project-kit prompt.
 	const runtimeNow = useRef(runtime);
 	runtimeNow.current = runtime;
+	// Read at click time too: the call stops waiting while the card stays on screen.
+	const formNow = useRef(formToolUseId);
+	formNow.current = formToolUseId;
 	latest.current = { source, live };
 
 	useEffect(() => {
@@ -105,6 +126,7 @@ export function InlineRender({
 		setNavigated(false);
 		setLink(null);
 		setPrompt(null);
+		promptForm.current = null;
 	}, [srcDoc]);
 
 	const send = useCallback(
@@ -121,6 +143,39 @@ export function InlineRender({
 			return true;
 		},
 		[narratorId],
+	);
+
+	// A submit() answers the call waiting on this form when there is one; once that call
+	// has ended (answered, timed out, stopped) the click is a chat message like any other.
+	const deliver = useCallback(
+		(text: string, form: SubmittedForm | null): boolean => {
+			const toolUseId = formNow.current;
+			if (!form || !toolUseId) return send(text);
+			if (Date.now() - lastSent.current < 1000) return false;
+			lastSent.current = Date.now();
+			setSendFailed(false);
+			// The card shows the form as soon as the markup has streamed, a moment before the
+			// call starts waiting: while the row still says it waits, try again shortly.
+			const attempt = async (tries: number): Promise<void> => {
+				const result = await answerGenUiForm(narratorId, toolUseId, {
+					status: "submitted",
+					...form,
+				});
+				if (result === "answered") return;
+				if (tries > 0 && formNow.current === toolUseId) {
+					await new Promise((done) => setTimeout(done, 1000));
+					return attempt(tries - 1);
+				}
+				lastSent.current = 0;
+				send(text);
+			};
+			void attempt(formNow.current === toolUseId ? 5 : 0).catch(() => {
+				lastSent.current = 0;
+				setSendFailed(true);
+			});
+			return true;
+		},
+		[narratorId, send],
 	);
 
 	const post = useCallback(() => {
@@ -164,7 +219,13 @@ export function InlineRender({
 		if (!srcDoc) return;
 		const onMessage = (event: MessageEvent) => {
 			if (event.source !== frame.current?.contentWindow) return;
-			const data = event.data as { type?: unknown; action?: unknown; value?: unknown } | null;
+			const data = event.data as {
+				type?: unknown;
+				action?: unknown;
+				value?: unknown;
+				message?: unknown;
+				fields?: unknown;
+			} | null;
 			if (data?.type === "narrafork:ui-ready") {
 				onReady();
 				return;
@@ -190,16 +251,18 @@ export function InlineRender({
 			// chat it is the same as a sendPrompt the reader triggered.
 			const text = data.value.trim();
 			if ((data.action !== "sendPrompt" && data.action !== "submit") || !text) return;
+			const form = data.action === "submit" ? readSubmittedForm(data) : null;
 			// The frame's gesture check guards markup, but a project kit's own code runs
 			// in that frame and can post this message itself: the reader confirms it.
 			if (current.kit) {
 				if (confirming.current) return;
 				confirming.current = true;
 				setLink(null);
+				promptForm.current = form;
 				setPrompt(text.slice(0, 2000));
 				return;
 			}
-			send(text);
+			deliver(text, form);
 		};
 		window.addEventListener("message", onMessage);
 		const unsubscribe = subscribeHostPresentation(sendTheme);
@@ -207,7 +270,7 @@ export function InlineRender({
 			window.removeEventListener("message", onMessage);
 			unsubscribe();
 		};
-	}, [srcDoc, onReady, sendTheme, send]);
+	}, [srcDoc, onReady, sendTheme, deliver]);
 
 	useEffect(() => {
 		if (!sendFailed) return;
@@ -309,7 +372,7 @@ export function InlineRender({
 						onClick={() => {
 							// A click inside the quiet period leaves the bar up, so the
 							// reader can see that this text has not been sent yet.
-							if (!send(prompt)) return;
+							if (!deliver(prompt, promptForm.current)) return;
 							confirming.current = false;
 							setPrompt(null);
 						}}

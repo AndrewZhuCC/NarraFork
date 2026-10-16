@@ -50,6 +50,30 @@ describe("GenUI file preview classification", () => {
 			historyUnavailable: true,
 		});
 	});
+	test("a running wait: true render answers its call; a finished one does not", () => {
+		const classify = (status: string) =>
+			classifyToolDetail({
+				toolName: "GenUI",
+				toolUseId: "form-use",
+				category: "generic",
+				status,
+				inputJson: {
+					action: "render",
+					wait: true,
+					source: "<Button onClick={submit()}>Go</Button>",
+				},
+			})?.sections[0].body;
+		expect(classify("running")).toMatchObject({ kind: "gen-ui", formToolUseId: "form-use" });
+		expect(classify("completed")).not.toHaveProperty("formToolUseId");
+		const plain = classifyToolDetail({
+			toolName: "GenUI",
+			toolUseId: "plain-use",
+			category: "generic",
+			status: "running",
+			inputJson: { action: "render", source: "<Stack />" },
+		})?.sections[0].body;
+		expect(plain).not.toHaveProperty("formToolUseId");
+	});
 	test("public summaries never carry a private file reference", () => {
 		const result = classifyToolDetail({
 			toolName: "GenUI",
