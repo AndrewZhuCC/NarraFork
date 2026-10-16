@@ -4,7 +4,6 @@ import { parseHTML } from "linkedom";
 import type { editor, IPosition, IRange } from "monaco-editor/editor/editor.api";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import * as selectionPopover from "../../common/SelectionPopover";
 import {
 	type MonacoDocumentStatus,
 	MonacoEditor,
@@ -40,15 +39,6 @@ class Model {
 	getVersionId = () => this.version;
 	getAlternativeVersionId = () => this.version;
 	getValueLength = () => this.text.length;
-	getValueLengthInRange = (r: IRange) =>
-		this.getOffsetAt({ lineNumber: r.endLineNumber, column: r.endColumn }) -
-		this.getOffsetAt({ lineNumber: r.startLineNumber, column: r.startColumn });
-	getValueInRange = mock((r: IRange) =>
-		this.text.slice(
-			this.getOffsetAt({ lineNumber: r.startLineNumber, column: r.startColumn }),
-			this.getOffsetAt({ lineNumber: r.endLineNumber, column: r.endColumn }),
-		),
-	);
 	getOffsetAt = (p: IPosition) =>
 		this.text
 			.split("\n")
@@ -89,10 +79,7 @@ class View {
 	onDidFocusEditorText = this.focusEvent.on;
 	onMouseDown = this.mouse.on;
 	mouseUp = new Signal<void>();
-	keyUp = new Signal<void>();
 	onMouseUp = this.mouseUp.on;
-	onKeyUp = this.keyUp.on;
-	getScrolledVisiblePosition = () => ({ left: 12, top: 24, height: 18 });
 	setModel = (model: Model) => {
 		this.model = model;
 	};
@@ -285,71 +272,6 @@ async function render(
 		);
 	});
 }
-
-test("comments freeze model ranges, wait for gestures and invalidate on scope/content changes", async () => {
-	let popover: Parameters<typeof selectionPopover.SelectionPopover>[0] | undefined;
-	const spy = spyOn(selectionPopover, "SelectionPopover").mockImplementation((props) => {
-		popover = props;
-		return null;
-	});
-	const onComment = mock(() => {});
-	try {
-		await render({ onComment, readOnly: true, commentScopeKey: "first" });
-		const range = { startLineNumber: 1, startColumn: 2, endLineNumber: 2, endColumn: 3 };
-		views[0].selection = range;
-		await act(async () =>
-			views[0].cursor.emit({ selection: range, reason: 3 } as editor.ICursorSelectionChangedEvent),
-		);
-		expect(models[0].getValueInRange).not.toHaveBeenCalled();
-		await act(async () => views[0].mouseUp.emit());
-		expect(popover?.externalSelection).toBe("ne\ntw");
-		views[0].selection = { ...range, endColumn: 1 };
-		await act(async () =>
-			popover?.onComment?.({ excerpt: "ne\ntw", comment: "note", anchorNode: null }),
-		);
-		expect(onComment).toHaveBeenCalledWith({
-			excerpt: "ne\ntw",
-			comment: "note",
-			anchorNode: null,
-			selection: range,
-		});
-		expect(models[0].setValue).not.toHaveBeenCalled();
-		await act(async () => views[0].keyUp.emit());
-		expect(popover?.externalSelection).toBe("ne\n");
-		const stale = popover?.onComment;
-		await render({ onComment, commentScopeKey: "second" });
-		expect(popover?.externalSelection).toBe("");
-		stale?.({ excerpt: "ne\n", comment: "stale", anchorNode: null });
-		expect(onComment).toHaveBeenCalledTimes(1);
-		await act(async () => views[0].keyUp.emit());
-		await act(async () => models[0].setValue("changed"));
-		expect(popover?.externalSelection).toBe("");
-	} finally {
-		spy.mockRestore();
-	}
-});
-
-test("oversized selections never allocate excerpt text and absent handlers do nothing", async () => {
-	const spy = spyOn(selectionPopover, "SelectionPopover").mockImplementation(() => null);
-	try {
-		const initialValue = "x".repeat(200_001);
-		await render({ initialValue, onComment: () => {} });
-		views[0].selection = {
-			startLineNumber: 1,
-			startColumn: 1,
-			endLineNumber: 1,
-			endColumn: 200_002,
-		};
-		await act(async () => views[0].keyUp.emit());
-		expect(models[0].getValueInRange).not.toHaveBeenCalled();
-		expect(host.textContent).toContain("fileEditor.commentSelectionTooLarge");
-		await render({ initialValue });
-		await act(async () => views[0].mouseUp.emit());
-		expect(models[0].getValueInRange).not.toHaveBeenCalled();
-	} finally {
-		spy.mockRestore();
-	}
-});
 
 test.each([
 	{

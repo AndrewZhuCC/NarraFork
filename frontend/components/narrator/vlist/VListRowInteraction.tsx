@@ -62,7 +62,7 @@ export interface VListRowInteractionProps {
 	messageId: string;
 	/** Stable top-level message ordering, when available. */
 	messageSeq?: number;
-	/** Message role, kept raw until a CommentDraft needs normalization. */
+	/** Owning message role for selection metadata. */
 	role?: string;
 	/** Primary block index for the DOM contract. */
 	blockIndex: number;

@@ -1,12 +1,8 @@
 import { Box, Text } from "@mantine/core";
 import type React from "react";
-import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
-import { useSpecFiles } from "../../hooks/useSpec";
-import { CommentDraftChips } from "./CommentDraftChips";
-import { removeCommentDraft, updateCommentDraft, useCommentDrafts } from "./comment-draft-store";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { ChapterBar, NarratorGitBar } from "./header/ChapterBar";
 import { AttachmentPreviews } from "./interaction/AttachmentPreviews";
@@ -101,13 +97,6 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const retainWorktreeRequirement = (text: string) =>
 		props.composerRowProps.composerRef.current?.appendText(text);
 	const bottomSpacing = useBottomSpacing();
-	const commentDrafts = useCommentDrafts(props.common.narratorId);
-	const { data: specFiles } = useSpecFiles(props.common.narratorId);
-	const specRevisionByUri = useMemo(() => {
-		const revisions = new Map<string, string | null>();
-		for (const file of specFiles ?? []) revisions.set(file.uri, file.revisionId);
-		return revisions;
-	}, [specFiles]);
 	const [resizeEnabled] = useLocalPref("narrafork_narrator_bottom_spacing_resize");
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
@@ -221,15 +210,6 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				attachedTextFiles={props.attachedTextFiles}
 				updateAttachedImages={props.updateAttachedImages}
 				updateAttachedTextFiles={props.updateAttachedTextFiles}
-			/>
-
-			<CommentDraftChips
-				key={props.common.narratorId}
-				drafts={commentDrafts}
-				onRemove={(id) => removeCommentDraft(props.common.narratorId, id)}
-				onUpdate={(id, comment) => updateCommentDraft(props.common.narratorId, id, comment)}
-				specRevisionByUri={specRevisionByUri}
-				withTopBorder={props.attachedImages.length === 0 && props.attachedTextFiles.length === 0}
 			/>
 
 			{/* Upload / send progress while attachments upload. */}

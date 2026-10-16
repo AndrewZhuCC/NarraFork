@@ -2,7 +2,6 @@ import { ActionIcon, Box, Button, Group, Tooltip } from "@mantine/core";
 import { IconPaperclip } from "@tabler/icons-react";
 import type { RefObject } from "react";
 import { useTranslation } from "react-i18next";
-import { useCommentDrafts } from "../comment-draft-store";
 import { resolveComposerActionSlot } from "./composer-action-slot";
 import { NarratorComposer, type NarratorComposerHandle } from "./NarratorComposer";
 import { type QueueMode, SendOptionsSplitButton } from "./SendOptionsSplitButton";
@@ -93,9 +92,8 @@ export interface NarratorComposerRowProps {
 export function NarratorComposerRow(props: NarratorComposerRowProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const commentDrafts = useCommentDrafts(props.narratorId);
 
-	const hasInput = props.composerHasText || commentDrafts.length > 0;
+	const hasInput = props.composerHasText;
 	const hasAttachments = props.composerHasAttachments;
 	const sendLabel = props.isActive ? t(`queueMode_${props.enterQueueMode}`) : tc("send");
 	const idleCandidates = [tc("send"), t("retry"), t("continue")];

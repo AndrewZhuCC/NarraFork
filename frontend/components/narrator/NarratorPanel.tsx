@@ -113,7 +113,7 @@ import {
 import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { type SelectionCommentPayload, SelectionPopover } from "../common/SelectionPopover";
+import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
@@ -122,8 +122,6 @@ import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
 } from "./background/BackgroundTasksDrawer";
-import { resolveChatCommentAnchor } from "./comment-anchor";
-import { addCommentDraft, createCommentDraft } from "./comment-draft-store";
 import { COMPACTING_MARKER_ATTR, CompactSummaryModalCtx } from "./compact/compact-summary-modal";
 import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
@@ -961,29 +959,6 @@ function NarratorPanelBody({
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
-	const handleChatComment = useCallback(
-		({ excerpt, comment, anchorNode }: SelectionCommentPayload) => {
-			const anchor = resolveChatCommentAnchor(anchorNode, contentRef.current);
-			addCommentDraft(
-				narratorId,
-				createCommentDraft({
-					source: "chat",
-					excerpt,
-					comment,
-					...(anchor
-						? {
-								messageId: anchor.messageId,
-								messageSeq: anchor.messageSeq,
-								role: anchor.role,
-								blockIndex: anchor.blockIndex,
-								blockId: anchor.blockId,
-							}
-						: {}),
-				}),
-			);
-		},
-		[narratorId],
-	);
 	const chunkListRef = useRef<MessageListHandle>(null);
 
 	// Confirm-then-apply flow for the two destructive history actions (delete tool
@@ -3447,7 +3422,6 @@ function NarratorPanelBody({
 							containerRef={contentRef}
 							onAction={effSendToTerminal}
 							label={tt("sendToTerminal")}
-							onComment={handleChatComment}
 						/>
 
 						{/* Scroll to bottom button */}
@@ -3802,7 +3776,6 @@ function NarratorPanelBody({
 									onOpenFileTarget={handleOpenReferencedFile}
 									onDirtyChange={onFileEditorDirtyChange}
 									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
-									commentNarratorId={narratorId}
 								/>
 							</Suspense>
 						</Drawer>

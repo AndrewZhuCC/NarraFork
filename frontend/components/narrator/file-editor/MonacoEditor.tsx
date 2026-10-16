@@ -3,15 +3,7 @@ import type { FileSelection } from "@shared/file-reference";
 import type { editor } from "monaco-editor/editor/editor.api";
 import { type Ref, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	MAX_SELECTION_POPOVER_TEXT_CHARS,
-	type SelectionCommentPayload,
-	SelectionPopover,
-} from "../../common/SelectionPopover";
 import { createEditorLocalId } from "./editor-local-id";
-
-export type MonacoSelectionCommentPayload = SelectionCommentPayload & { selection: FileSelection };
-
 import { MonacoSearchPanel } from "./MonacoSearchPanel";
 import {
 	loadMonacoLanguage,
@@ -60,8 +52,6 @@ export interface MonacoEditorProps {
 	onReady?: (handle: MonacoEditorHandle | null) => void;
 	onDocumentChange?: (status: MonacoDocumentStatus) => void;
 	onSelectionChange?: (selection: FileSelection | null, explicit: boolean) => void;
-	onComment?: (payload: MonacoSelectionCommentPayload) => void;
-	commentScopeKey?: string;
 	onSearchRequested?: () => void;
 	onSave?: () => void;
 	onError?: (error: Error) => void;
@@ -108,32 +98,6 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 /** Monaco owns the only mutable document. Props are explicit loads, never controlled input echoes. */
 export function MonacoEditor(props: MonacoEditorProps) {
 	const { ref, documentKey } = props;
-	const commentScope = JSON.stringify([
-		documentKey,
-		props.filePath,
-		props.commentScopeKey,
-		props.visible !== false,
-		!!props.onComment,
-	]);
-	const commentScopeRef = useRef(commentScope);
-	commentScopeRef.current = commentScope;
-	const [commentSelection, setCommentSelection] = useState<{
-		scope: string;
-		model: editor.ITextModel;
-		revision: number;
-		excerpt: string;
-		selection: FileSelection;
-		anchor: { x: number; y: number };
-		tooLarge: boolean;
-	} | null>(null);
-	const activeComment =
-		commentSelection?.scope === commentScope && props.visible !== false && props.onComment
-			? commentSelection
-			: null;
-	useEffect(() => {
-		void commentScope;
-		setCommentSelection(null);
-	}, [commentScope]);
 	const { t } = useTranslation("narrator");
 	const [longLineDocumentKey, setLongLineDocumentKey] = useState<string | null>(null);
 	const [fullLongLineDocumentKey, setFullLongLineDocumentKey] = useState<string | null>(null);
@@ -337,35 +301,6 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				}
 				layout();
 			};
-			// Read only once the gesture is complete, never on each drag cursor event.
-			const captureCommentSelection = () => {
-				if (cancelled || !latest.current.onComment || latest.current.visible === false) return;
-				const range = view.getSelection();
-				const selection = monacoFileSelection(range);
-				if (!range || !selection) {
-					setCommentSelection(null);
-					return;
-				}
-				const point = view.getScrolledVisiblePosition({
-					lineNumber: range.endLineNumber,
-					column: range.endColumn,
-				});
-				if (!point) {
-					setCommentSelection(null);
-					return;
-				}
-				const rect = host.getBoundingClientRect();
-				const tooLarge = model.getValueLengthInRange(range) > MAX_SELECTION_POPOVER_TEXT_CHARS;
-				setCommentSelection({
-					scope: commentScopeRef.current,
-					model,
-					revision: model.getVersionId(),
-					selection,
-					excerpt: tooLarge ? "" : model.getValueInRange(range),
-					anchor: { x: rect.left + point.left, y: rect.top + point.top },
-					tooLarge,
-				});
-			};
 			// Drag-select fires onDidChangeCursorSelection on every pointer move. Publishing
 			// each frame into React re-renders the dock/NarratorPanel tree and blocks the
 			// main thread, so Monaco's own hit-testing starves — that is the production
@@ -401,11 +336,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					? view.onDidBlurEditorText(() => flushDragSelection())
 					: null;
 			const subscriptions = [
-				view.onMouseUp(() => {
-					flushDragSelection();
-					captureCommentSelection();
-				}),
-				view.onKeyUp(captureCommentSelection),
+				view.onMouseUp(() => flushDragSelection()),
 				view.onDidFocusEditorText(() => {
 					// A focus steal mid-drag must still settle the gesture once.
 					flushDragSelection();
@@ -434,7 +365,6 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					});
 				}),
 				model.onDidChangeContent((event) => {
-					setCommentSelection(null);
 					if (event.isFlush) {
 						loadRevision++;
 						// Also support explicit reloads performed through the public model handle.
@@ -538,30 +468,6 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			}}
 		>
 			{error && <Box role="alert">{error}</Box>}
-			{activeComment?.tooLarge && (
-				<Text size="xs" role="status">
-					{t("fileEditor.commentSelectionTooLarge", { limit: MAX_SELECTION_POPOVER_TEXT_CHARS })}
-				</Text>
-			)}
-			{props.onComment && props.visible !== false && (
-				<SelectionPopover
-					containerRef={hostRef}
-					resetKey={commentScope}
-					externalSelection={activeComment?.excerpt ?? ""}
-					externalAnchor={activeComment?.anchor}
-					onComment={(payload) => {
-						if (
-							!activeComment ||
-							activeComment.scope !== commentScopeRef.current ||
-							activeComment.model !== runtime.current?.model ||
-							activeComment.revision !== activeComment.model.getVersionId()
-						)
-							return;
-						latest.current.onComment?.({ ...payload, selection: activeComment.selection });
-						setCommentSelection(null);
-					}}
-				/>
-			)}
 			{longLineDocumentKey === documentKey && (
 				<Group gap="xs" px="xs" py={4} wrap="nowrap" data-monaco-long-line-protection>
 					<Text size="xs" c="dimmed" style={{ flex: 1 }} role="status">

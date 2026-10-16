@@ -1046,7 +1046,6 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 						<FilePanelContent
 							filePath={filePath}
 							narratorId={fileNarratorId}
-							commentNarratorId={hostNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
 							selection={selection}

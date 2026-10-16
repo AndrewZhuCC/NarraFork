@@ -50,9 +50,7 @@ import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { ImageViewer } from "../../common/ImageViewer";
 import { useImageViewer } from "../../common/image-viewer-context";
-import { type SelectionCommentPayload, SelectionPopover } from "../../common/SelectionPopover";
 import { TruncatedText } from "../../common/TruncatedText";
-import { addCommentDraft } from "../comment-draft-store";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
 import { ContentViewer } from "../content/ContentViewer";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
@@ -164,8 +162,6 @@ export interface FileViewerContentProps {
 	filePath: string;
 	/** Scoped references never fall back to the unrestricted/local preview route. */
 	narratorId?: string;
-	/** Receiving chat, which may differ from the file's source narrator. */
-	commentNarratorId?: string;
 	deviceId?: string;
 	/** References use scoped text/image readers, never the legacy binary/download reader. */
 	referenceOrigin?: boolean;
@@ -206,7 +202,6 @@ export function fileViewerUsesText(
 export function FileViewerContent({
 	filePath,
 	narratorId: narratorIdProp,
-	commentNarratorId,
 	deviceId = "local",
 	referenceOrigin = false,
 	selection,
@@ -384,30 +379,6 @@ export function FileViewerContent({
 		sourceOnly || (mode === "node" && nodeUnavailable) ? "raw" : mode;
 	const sourcePath = load.target?.path ?? filePath;
 	const sourceDeviceId = load.target?.deviceId ?? deviceId;
-	const handleComment = useCallback(
-		({ excerpt, comment, selection }: SelectionCommentPayload & { selection?: FileSelection }) => {
-			if (!commentNarratorId) return;
-			addCommentDraft(commentNarratorId, {
-				source: "file",
-				fileTarget: {
-					deviceId: sourceDeviceId,
-					path: sourcePath,
-					...(selection ? { selection } : {}),
-				},
-				excerpt,
-				comment,
-			});
-		},
-		[commentNarratorId, sourceDeviceId, sourcePath],
-	);
-	const commentScopeKey = JSON.stringify([
-		commentNarratorId,
-		sourceDeviceId,
-		sourcePath,
-		effectiveMode,
-		load.hash,
-		reloadToken,
-	]);
 	const viewerScope = useMemo(
 		() => ({
 			narratorId,
@@ -555,8 +526,6 @@ export function FileViewerContent({
 									selection={selection}
 									navigationRequestId={highlightRequestId}
 									onSelectionChange={setSourceSelection}
-									onComment={commentNarratorId ? handleComment : undefined}
-									commentScopeKey={commentScopeKey}
 								/>
 							</Box>
 							{load.truncated && (
@@ -579,8 +548,6 @@ export function FileViewerContent({
 							nodeUnavailable={nodeUnavailable}
 							structuredFormat={structuredFormat}
 							reloadToken={reloadToken}
-							onComment={commentNarratorId ? handleComment : undefined}
-							commentScopeKey={commentScopeKey}
 						/>
 					)}
 				</Box>
@@ -740,8 +707,6 @@ function FileBody({
 	structuredFormat,
 	reloadToken,
 	filePath,
-	onComment,
-	commentScopeKey,
 }: {
 	filePath: string;
 	fileName: string;
@@ -754,14 +719,8 @@ function FileBody({
 	nodeUnavailable: NodeUnavailableReason | null;
 	structuredFormat: string | null;
 	reloadToken: number;
-	onComment?: (payload: SelectionCommentPayload) => void;
-	commentScopeKey: string;
 }) {
 	const { t } = useTranslation("narrator");
-	const commentRef = useRef<HTMLDivElement>(null);
-	const commentPopover = onComment ? (
-		<SelectionPopover containerRef={commentRef} onComment={onComment} resetKey={commentScopeKey} />
-	) : null;
 
 	// A caveat about how to read what follows belongs ABOVE the document.
 	//
@@ -792,10 +751,7 @@ function FileBody({
 		return (
 			<>
 				{topNotices}
-				<Box ref={commentRef}>
-					<StructuredNodeTree nodes={parsed.nodes} resetKey={`${filePath}:${reloadToken}`} />
-				</Box>
-				{commentPopover}
+				<StructuredNodeTree nodes={parsed.nodes} resetKey={`${filePath}:${reloadToken}`} />
 				{parsed.truncated && (
 					<Text size="xs" c="yellow" px="xs" pb="xs">
 						{t("fileViewer.nodesTruncated")}
@@ -809,10 +765,9 @@ function FileBody({
 		return (
 			<>
 				{topNotices}
-				<Box p="xs" ref={commentRef}>
+				<Box p="xs">
 					<MarkdownContent text={text} />
 				</Box>
-				{commentPopover}
 				{truncationNotice}
 			</>
 		);
@@ -821,7 +776,7 @@ function FileBody({
 	return (
 		<>
 			{topNotices}
-			<Box p="xs" ref={commentRef}>
+			<Box p="xs">
 				<ContentViewer
 					content={text}
 					title={fileName}
@@ -830,7 +785,6 @@ function FileBody({
 					style={{ fontSize: 12 }}
 				/>
 			</Box>
-			{commentPopover}
 			{truncationNotice}
 		</>
 	);

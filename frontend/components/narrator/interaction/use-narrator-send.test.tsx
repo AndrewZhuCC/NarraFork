@@ -9,7 +9,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { useNarratorCommands } from "../../../hooks/useCommands";
 import { api, type BufferMessageSummary } from "../../../lib/api";
-import { clearAllCommentDrafts, getCommentDrafts, setCommentDrafts } from "../comment-draft-store";
 import type { CommandItem } from "../composer/CommandPopover";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import {
@@ -33,7 +32,6 @@ function Probe(props: UseNarratorSendOptions) {
 }
 
 beforeEach(() => {
-	clearAllCommentDrafts();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	for (const [key, value] of Object.entries({
 		window,
@@ -109,7 +107,6 @@ beforeEach(() => {
 
 afterEach(async () => {
 	await act(async () => root.unmount());
-	clearAllCommentDrafts();
 	send.mockRestore();
 	notify.mockRestore();
 	for (const [key, descriptor] of originals) {
@@ -146,44 +143,6 @@ describe("narrator interrupt send", () => {
 		expect(queue[0]).toMatchObject({ priority: true, fileReferences: [reference] });
 		expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
 		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
-	});
-
-	test("interrupt queues comments exactly once and restores them if admission fails", async () => {
-		const comments = [
-			{ id: "comment-1", source: "chat" as const, excerpt: "selected", comment: "Review" },
-		];
-		setCommentDrafts("n", comments);
-		await render();
-		await act(async () => actions.handleSend());
-		expect(send).toHaveBeenCalledTimes(1);
-		expect(send.mock.calls[0]?.[1]).toContain("<comments>");
-		expect(send.mock.calls[0]?.[1].match(/<comments>/g)).toHaveLength(1);
-		expect(send.mock.calls[0]?.[8]).toBe(true);
-		expect(getCommentDrafts("n")).toEqual([]);
-
-		setCommentDrafts("n", comments);
-		send.mockRejectedValueOnce(new Error("admission failed"));
-		await act(async () => actions.handleSend());
-		expect(send).toHaveBeenCalledTimes(2);
-		expect(send.mock.calls[1]?.[1].match(/<comments>/g)).toHaveLength(1);
-		expect(send.mock.calls[1]?.[8]).toBe(true);
-		expect(getCommentDrafts("n")).toEqual(comments);
-	});
-
-	test("forwarding keeps staged comments separate from the forwarded text", async () => {
-		const comments = [
-			{ id: "comment-1", source: "chat" as const, excerpt: "selected", comment: "Review" },
-		];
-		setCommentDrafts("n", comments);
-		await render();
-		await act(async () => {
-			actions.forwardTextToNarrator("forwarded");
-			await Promise.resolve();
-		});
-		expect(send).toHaveBeenCalledTimes(1);
-		expect(send.mock.calls[0]?.[1]).toBe("forwarded");
-		expect(send.mock.calls[0]?.[8]).toBeUndefined();
-		expect(getCommentDrafts("n")).toEqual(comments);
 	});
 
 	test.each([

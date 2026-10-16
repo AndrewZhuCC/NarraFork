@@ -15,7 +15,6 @@ const FileViewerContent = lazy(() =>
 export interface FilePanelContentProps {
 	filePath: string;
 	narratorId?: string;
-	commentNarratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
 	selection?: FileSelection;
@@ -32,7 +31,6 @@ export interface FilePanelContentProps {
 export function FilePanelContent({
 	filePath,
 	narratorId,
-	commentNarratorId,
 	deviceId,
 	referenceOrigin,
 	selection,
@@ -68,7 +66,6 @@ export function FilePanelContent({
 						key={identity}
 						filePath={filePath}
 						narratorId={narratorId}
-						commentNarratorId={commentNarratorId}
 						deviceId={deviceId}
 						referenceOrigin={referenceOrigin}
 						selection={selection}
@@ -82,7 +79,6 @@ export function FilePanelContent({
 					key={identity}
 					filePath={filePath}
 					narratorId={narratorId}
-					commentNarratorId={commentNarratorId}
 					deviceId={deviceId}
 					referenceOrigin={referenceOrigin}
 					selection={selection}

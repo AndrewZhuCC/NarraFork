@@ -31,7 +31,6 @@ mock.module("../../hooks/useResizableBottomSpacing", () => ({
 	useBottomSpacing: () => 0,
 	startBottomSpacingResize: () => {},
 }));
-mock.module("../../hooks/useSpec", () => ({ useSpecFiles: () => ({ data: [] }) }));
 mock.module("./panels/compact-context", () => ({ useNarratorPanelCompact: () => false }));
 mock.module("./interaction/use-status-bar-props", () => ({ useStatusBarProps: () => ({}) }));
 mock.module("./interaction/use-queued-message-actions", () => ({
@@ -66,7 +65,6 @@ mock.module("./interaction/AttachmentPreviews", () => ({
 mock.module("./interaction/UploadProgressBar", () => ({
 	UploadProgressBar: () => <div data-region="upload" />,
 }));
-mock.module("./CommentDraftChips", () => ({ CommentDraftChips: () => null }));
 mock.module("./composer/NarratorComposerRow", () => ({
 	NarratorComposerRow: () => <div data-region="composer" />,
 }));

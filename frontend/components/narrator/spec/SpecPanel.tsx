@@ -1,9 +1,5 @@
 import { useConfirmDialog } from "@frontend/components/common/confirm-dialog-context";
 import {
-	type SelectionCommentPayload,
-	SelectionPopover,
-} from "@frontend/components/common/SelectionPopover";
-import {
 	ActionIcon,
 	Anchor,
 	Box,
@@ -29,8 +25,6 @@ import {
 import { useSpecFile, useSpecFiles, useSpecTasks, useUpdateSpecFile } from "../../../hooks/useSpec";
 import { api } from "../../../lib/api";
 import type { SpecTaskItem } from "../../../lib/api/spec";
-import { addCommentDraft, createCommentDraft } from "../comment-draft-store";
-import { resolveHeadingPathFromDom } from "../heading-path";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
@@ -284,41 +278,6 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	}, []);
 
 	const loading = isTasksFile ? tasksLoading : fileLoading;
-	const previewRef = useRef<HTMLDivElement>(null);
-	const editorRef = useRef<HTMLDivElement>(null);
-	const [editorSelectionAnchorNode, setEditorSelectionAnchorNode] = useState<Node | null>(null);
-	const handleEditorSelectionAnchor = useCallback((anchorNode: Node | null) => {
-		setEditorSelectionAnchorNode(anchorNode);
-	}, []);
-	const handleSpecComment = useCallback(
-		({ excerpt, comment, anchorNode }: SelectionCommentPayload) => {
-			const container = isPreviewOnly ? previewRef.current : editorRef.current;
-			const headingPath = resolveHeadingPathFromDom(
-				anchorNode ?? editorSelectionAnchorNode,
-				container,
-			);
-			addCommentDraft(
-				narratorId,
-				createCommentDraft({
-					source: "spec",
-					excerpt,
-					comment,
-					uri: fileData?.uri ?? selectedUri,
-					revisionId: fileData?.revisionId ?? selectedMeta?.revisionId ?? undefined,
-					headingPath,
-				}),
-			);
-		},
-		[
-			editorSelectionAnchorNode,
-			fileData?.revisionId,
-			fileData?.uri,
-			narratorId,
-			selectedMeta?.revisionId,
-			selectedUri,
-			isPreviewOnly,
-		],
-	);
 
 	return (
 		<Box h="100%" style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -363,12 +322,9 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 						<Loader size="sm" />
 					</Center>
 				) : isPreviewOnly ? (
-					<Box ref={previewRef} style={{ flex: 1, minHeight: 0, display: "flex" }}>
-						<ScrollArea style={{ flex: 1 }} p="sm">
-							<MarkdownContent text={fileData?.content ?? ""} />
-						</ScrollArea>
-						<SelectionPopover containerRef={previewRef} onComment={handleSpecComment} />
-					</Box>
+					<ScrollArea style={{ flex: 1 }} p="sm">
+						<MarkdownContent text={fileData?.content ?? ""} />
+					</ScrollArea>
 				) : isTasksFile ? (
 					<ScrollArea style={{ flex: 1 }}>
 						<AutoContinuationControl narratorId={narratorId} />
@@ -419,7 +375,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 						{selectedMeta?.path === "behavior_fence" && (
 							<BehaviorFenceControl narratorId={narratorId} />
 						)}
-						<Box ref={editorRef} style={{ flex: 1, minHeight: 0, display: "flex" }}>
+						<Box style={{ flex: 1, minHeight: 0, display: "flex" }}>
 							<Suspense
 								fallback={
 									<Center style={{ flex: 1 }}>
@@ -435,14 +391,8 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 									onSave={handleSave}
 									onReload={handleReload}
 									isSaving={updateFile.isPending}
-									onSelectionAnchor={handleEditorSelectionAnchor}
 								/>
 							</Suspense>
-							<SelectionPopover
-								containerRef={editorRef}
-								onComment={handleSpecComment}
-								selectionAnchorNode={editorSelectionAnchorNode}
-							/>
 						</Box>
 					</Box>
 				)}

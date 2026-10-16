@@ -1,17 +1,10 @@
-import { ActionIcon, Box, Button, Group, Portal, Text, Textarea, Tooltip } from "@mantine/core";
-import { IconCopy, IconMessage, IconSend } from "@tabler/icons-react";
+import { ActionIcon, Group, Portal, Tooltip } from "@mantine/core";
+import { IconCopy, IconSend } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { collectSelectionTextPreview } from "../../lib/dom-text";
 import { Z } from "../../lib/z-index";
-
-export type SelectionCommentPayload = {
-	excerpt: string;
-	comment: string;
-	/** Node the selection lived in when the popover opened. */
-	anchorNode: Node | null;
-};
 
 interface SelectionPopoverProps {
 	containerRef: React.RefObject<HTMLElement | null>;
@@ -22,16 +15,9 @@ interface SelectionPopoverProps {
 	externalSelection?: string;
 	/** Anchor position for external selection (e.g. touch point). When provided, popover appears near this point. */
 	externalAnchor?: { x: number; y: number } | null;
-	/** Comment on the current selection. The button remains available even without a handler. */
-	onComment?: (payload: SelectionCommentPayload) => void;
-	/** Real DOM anchor supplied by an editor selection, when available. */
-	selectionAnchorNode?: Node | null;
-	resetKey?: string;
-	hideComment?: boolean;
 }
 
 export const MAX_SELECTION_POPOVER_TEXT_CHARS = 200_000;
-const COMMENT_PANEL_WIDTH = 280;
 
 function clampSelectionPopoverText(text: string): string {
 	return text.length > MAX_SELECTION_POPOVER_TEXT_CHARS
@@ -49,35 +35,15 @@ export function SelectionPopover({
 	label,
 	externalSelection,
 	externalAnchor,
-	onComment,
-	selectionAnchorNode,
-	resetKey,
-	hideComment = false,
 }: SelectionPopoverProps) {
 	const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
-	const [commentOpen, setCommentOpen] = useState(false);
-	const [commentText, setCommentText] = useState("");
 	const selectedTextRef = useRef("");
-	const anchorNodeRef = useRef<Node | null>(null);
-	const selectionAnchorNodeRef = useRef<Node | null>(selectionAnchorNode ?? null);
-	selectionAnchorNodeRef.current = selectionAnchorNode ?? null;
 	const popoverRef = useRef<HTMLDivElement>(null);
-	const commentInputRef = useRef<HTMLTextAreaElement>(null);
 	const [copied, setCopied] = useState(false);
 	const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const scopeRef = useRef(resetKey);
 	const epochRef = useRef(0);
-	const suppressedExternalRef = useRef<string | undefined>(undefined);
-	if (scopeRef.current !== resetKey) {
-		scopeRef.current = resetKey;
-		epochRef.current++;
-		suppressedExternalRef.current = externalSelection;
-		selectedTextRef.current = "";
-		anchorNodeRef.current = null;
-	}
 	const externalMode = externalSelection !== undefined;
 	const { t } = useTranslation("common");
-	const { t: tn } = useTranslation("narrator");
 
 	const clearSelection = useCallback(() => {
 		epochRef.current++;
@@ -85,9 +51,6 @@ export function SelectionPopover({
 		copyTimerRef.current = null;
 		setCopied(false);
 		selectedTextRef.current = "";
-		anchorNodeRef.current = null;
-		setCommentOpen(false);
-		setCommentText("");
 		setPosition(null);
 	}, []);
 
@@ -97,11 +60,6 @@ export function SelectionPopover({
 			left: clampPopoverLeft(rect.left + rect.width / 2 - 16, 80),
 		});
 	}, []);
-
-	useEffect(() => {
-		void resetKey;
-		clearSelection();
-	}, [resetKey, clearSelection]);
 
 	const popoverVisible = position !== null;
 	useEffect(() => {
@@ -150,10 +108,6 @@ export function SelectionPopover({
 
 			const rect = range.getBoundingClientRect();
 			selectedTextRef.current = text;
-			anchorNodeRef.current =
-				selectionAnchorNodeRef.current ?? range.startContainer ?? range.commonAncestorContainer;
-			setCommentOpen(false);
-			setCommentText("");
 			setCopied(false);
 			placeAbove(rect);
 		}, 10);
@@ -185,13 +139,8 @@ export function SelectionPopover({
 
 	// Handle external selection (e.g. from xterm canvas)
 	useEffect(() => {
-		if (externalSelection && externalSelection === suppressedExternalRef.current) return;
-		suppressedExternalRef.current = undefined;
 		if (externalSelection) {
 			selectedTextRef.current = clampSelectionPopoverText(externalSelection);
-			anchorNodeRef.current = null;
-			setCommentOpen(false);
-			setCommentText("");
 			if (externalAnchor) {
 				setPosition({
 					top: Math.max(4, externalAnchor.y - 44),
@@ -235,57 +184,16 @@ export function SelectionPopover({
 			.catch(() => {});
 	}, [clearSelection]);
 
-	const handleOpenComment = useCallback(() => {
-		if (!selectedTextRef.current) return;
-		setCommentOpen(true);
-		setPosition((prev) =>
-			prev ? { ...prev, left: clampPopoverLeft(prev.left, COMMENT_PANEL_WIDTH) } : prev,
-		);
-	}, []);
-
-	useEffect(() => {
-		if (!commentOpen) return;
-		commentInputRef.current?.focus();
-	}, [commentOpen]);
-
-	const handleConfirmComment = useCallback(() => {
-		const excerpt = selectedTextRef.current;
-		const comment = commentText.trim();
-		if (!excerpt || !comment) return;
-		onComment?.({ excerpt, comment, anchorNode: anchorNodeRef.current });
-		clearSelection();
-		window.getSelection()?.removeAllRanges();
-	}, [clearSelection, commentText, onComment]);
-
-	const handleCommentKeyDown = useCallback(
-		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-			e.stopPropagation();
-			if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-				e.preventDefault();
-				handleConfirmComment();
-			}
-			if (e.key === "Escape") {
-				e.preventDefault();
-				setCommentOpen(false);
-				setCommentText("");
-			}
-		},
-		[handleConfirmComment],
-	);
-
 	// Cleanup copy timer on unmount
 	useEffect(() => {
 		return () => {
 			epochRef.current++;
 			if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
 			selectedTextRef.current = "";
-			anchorNodeRef.current = null;
 		};
 	}, []);
 
 	if (!position) return null;
-
-	const quotedPreview = selectedTextRef.current.replace(/\s+/g, " ").trim();
 
 	return (
 		<Portal>
@@ -311,20 +219,6 @@ export function SelectionPopover({
 							<IconCopy size={14} />
 						</ActionIcon>
 					</Tooltip>
-					{!hideComment && (
-						<Tooltip label={tn("addComment")} position="top" withArrow>
-							<ActionIcon
-								variant="filled"
-								color={commentOpen ? "indigo" : "gray"}
-								size="sm"
-								radius="xl"
-								aria-label={tn("addComment")}
-								onClick={handleOpenComment}
-							>
-								<IconMessage size={14} />
-							</ActionIcon>
-						</Tooltip>
-					)}
 					{onAction && (
 						<Tooltip label={label ?? t("send")} position="top" withArrow>
 							<ActionIcon
@@ -340,54 +234,6 @@ export function SelectionPopover({
 						</Tooltip>
 					)}
 				</Group>
-				{commentOpen && (
-					<Box
-						mt={6}
-						p={8}
-						style={{
-							width: COMMENT_PANEL_WIDTH,
-							borderRadius: "var(--mantine-radius-sm)",
-							background: "var(--mantine-color-body)",
-							border: "1px solid var(--mantine-color-default-border)",
-							boxShadow: "var(--mantine-shadow-sm)",
-						}}
-					>
-						<Text size="xs" c="dimmed" lineClamp={2} mb={6} fs="italic">
-							{quotedPreview}
-						</Text>
-						<Textarea
-							ref={commentInputRef}
-							autosize
-							minRows={2}
-							maxRows={6}
-							size="xs"
-							placeholder={tn("commentPlaceholder")}
-							value={commentText}
-							onChange={(e) => setCommentText(e.currentTarget.value)}
-							onInput={(e) => setCommentText(e.currentTarget.value)}
-							onKeyDown={handleCommentKeyDown}
-						/>
-						<Group justify="flex-end" gap={6} mt={6}>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() => {
-									setCommentOpen(false);
-									setCommentText("");
-								}}
-							>
-								{t("cancel")}
-							</Button>
-							<Button
-								size="compact-xs"
-								onClick={handleConfirmComment}
-								disabled={!commentText.trim()}
-							>
-								{t("confirm")}
-							</Button>
-						</Group>
-					</Box>
-				)}
 			</div>
 		</Portal>
 	);

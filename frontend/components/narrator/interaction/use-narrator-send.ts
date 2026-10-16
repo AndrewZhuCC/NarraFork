@@ -6,13 +6,6 @@ import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type BufferMessageSummary, isAbortError } from "../../../lib/api";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
-import {
-	type CommentDraft,
-	clearCommentDrafts,
-	composeUserMessageWithComments,
-	getCommentDrafts,
-	setCommentDrafts,
-} from "../comment-draft-store";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
 import { editFileReferenceInput, trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
@@ -378,7 +371,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		priority?: boolean,
 		signal?: AbortSignal,
 		references?: FileReference[],
-		includeCommentDrafts = true,
 		interrupt?: boolean,
 		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 	): Promise<boolean> => {
@@ -390,18 +382,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		const fileReferences = references ?? (draft.text === msg ? draft.fileReferences : []);
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
-		// `/new` must remain the leading command. Forwarded dock text is likewise
-		// independent from the operator's staged composer comments.
-		const comments =
-			includeCommentDrafts && !/^\/new(?:\s|$)/.test(msg) ? getCommentDrafts(narratorId) : [];
-		const payload = composeUserMessageWithComments(msg, comments);
 		composerRef.current?.hideTextForSend();
 		hideAttachedFilesForSend();
-		if (comments.length > 0) clearCommentDrafts(narratorId);
 		try {
 			const result = await api.sendNarratorMessage(
 				narratorId,
-				payload,
+				msg,
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
@@ -413,7 +399,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			);
 			const buffered = applyBufferedSendResult(
 				result,
-				payload,
+				msg,
 				images.length,
 				priority,
 				fileReferences,
@@ -426,11 +412,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			scrollToBottom(true);
 			return buffered;
 		} catch (err) {
-			// Restore text, references, attachments and staged comments together.
+			// Restore text and its independently tracked file references together.
 			composerRef.current?.restoreInput(msg, fileReferences);
 			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
-			if (comments.length > 0) setCommentDrafts(narratorId, comments);
 			throw err; // Re-throw to let caller handle
 		}
 	};
@@ -481,7 +466,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				imageCount: attachedImages.length,
 				textFileCount: attachedTextFiles.length,
 				fileReferenceCount: fileReferences.length,
-				commentCount: getCommentDrafts(narratorId).length,
 			}) ||
 			sendingRef.current
 		)
@@ -501,7 +485,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			images: File[];
 			textFiles: File[];
 			fileReferences: FileReference[];
-			comments: CommentDraft[];
 		} | null = null;
 		try {
 			// This diagnostic control is never model input, queued guidance or an interrupt,
@@ -563,15 +546,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					return;
 				}
 
+				const initialMessage = newMatch[1]?.trim() ?? "";
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
-				const comments = getCommentDrafts(narratorId);
-				// Pack comments into the new narrator's first message, never before `/new`.
-				const initialMessage = composeUserMessageWithComments(newMatch[1]?.trim() ?? "", comments);
-				restoreOnError = { msg, images, textFiles, fileReferences, comments };
+				restoreOnError = { msg, images, textFiles, fileReferences };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
-				if (comments.length > 0) clearCommentDrafts(narratorId);
 
 				const currentCwd =
 					fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath ?? undefined;
@@ -623,7 +603,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					mode !== "turn",
 					abortController.signal,
 					fileReferences,
-					true,
 					mode === "interrupt" ? true : undefined,
 					mode,
 				);
@@ -637,14 +616,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			if (showCompactQueueChoice) {
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
-				const comments = getCommentDrafts(narratorId);
-				const payload = composeUserMessageWithComments(msg, comments);
-				restoreOnError = { msg, images, textFiles, fileReferences, comments };
+				restoreOnError = { msg, images, textFiles, fileReferences };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
-				if (comments.length > 0) clearCommentDrafts(narratorId);
 				await submitMessage(
-					payload,
+					msg,
 					images,
 					textFiles,
 					abortController.signal,
@@ -660,16 +636,13 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			}
 			const images = [...attachedImages];
 			const textFiles = [...attachedTextFiles];
-			const comments = getCommentDrafts(narratorId);
-			const payload = composeUserMessageWithComments(msg, comments);
 			// Remember the draft so a cancelled upload can restore it — submitMessage
 			// clears the input/attachments up-front for the optimistic bubble.
-			restoreOnError = { msg, images, textFiles, fileReferences, comments };
+			restoreOnError = { msg, images, textFiles, fileReferences };
 			composerRef.current?.hideTextForSend();
 			hideAttachedFilesForSend();
-			if (comments.length > 0) clearCommentDrafts(narratorId);
 			await submitMessage(
-				payload,
+				msg,
 				images,
 				textFiles,
 				abortController.signal,
@@ -689,9 +662,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				composerRef.current?.restoreInput(restoreOnError.msg, restoreOnError.fileReferences);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
-				if (restoreOnError.comments.length > 0) {
-					setCommentDrafts(narratorId, restoreOnError.comments);
-				}
 			}
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
 			if (isAbortError(err)) {
@@ -781,7 +751,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					composerRef.current?.restoreInput(trimmed, []);
 					updateAttachedImages([]);
 					updateAttachedTextFiles([]);
-					await doSendBufferedRef.current(trimmed, false, undefined, undefined, false);
+					await doSendBufferedRef.current(trimmed, false);
 				} catch (err) {
 					notifications.show({
 						color: "red",

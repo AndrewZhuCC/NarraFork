@@ -7,7 +7,6 @@ import {
 	MAX_FILE_REFERENCE_QUERY_CHARS,
 	MAX_FILE_REFERENCE_SEARCH_RESULTS,
 } from "@shared/file-reference";
-import { composeUserMessageWithComments } from "../comment-draft-store";
 import {
 	copyFileReferences,
 	editFileReferenceInput,
@@ -33,38 +32,6 @@ const reference: FileReference = {
 const query = (text: string) => getFileReferenceQuery(text, text.length);
 const input = (): FileReferenceInput =>
 	insertFileReference({ text: "before ", fileReferences: [] }, reference);
-
-describe("comments with file references", () => {
-	test.each([
-		false,
-		true,
-	])("preserves references and the original draft (comments: %s)", (withComments) => {
-		const draft = trimFileReferenceInput(input());
-		const before = JSON.stringify(draft);
-		const payload = composeUserMessageWithComments(
-			draft.text,
-			withComments
-				? [
-						{
-							id: "comment-1",
-							source: "chat",
-							excerpt: draft.text,
-							comment: "看看这里",
-						},
-					]
-				: [],
-		);
-		const sent = editFileReferenceInput(draft, payload, { start: 0, end: 0 });
-		expect(copyFileReferences(sent.fileReferences, sent.text)).toHaveLength(1);
-		const range = sent.fileReferences[0].inputRange;
-		const originalRange = draft.fileReferences[0].inputRange;
-		if (!range || !originalRange) throw new Error("Missing file reference range");
-		const [start, end] = range;
-		expect(sent.text.slice(start, end)).toBe(fileReferenceToken(reference));
-		expect(start).toBe(originalRange[0] + payload.length - draft.text.length);
-		expect(JSON.stringify(draft)).toBe(before);
-	});
-});
 
 describe("file query boundaries", () => {
 	test.each([
