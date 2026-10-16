@@ -1405,11 +1405,15 @@ async function openAsApp(url: string) {
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
 
-	const openMode = settings.server.openBrowser;
-	if (openMode === "app") {
-		openAsApp(url);
-	} else if (openMode === "browser") {
-		openInBrowser(url);
+	// 由管理器面板托管的实例：前端窗口交给面板打开 —— 它会先聚焦已有窗口，
+	// 这里再开一次就会重复弹窗（同一份逻辑不该有两份实现）。
+	if (process.env.NARRAFORK_MANAGER_MANAGED !== "1") {
+		const openMode = settings.server.openBrowser;
+		if (openMode === "app") {
+			openAsApp(url);
+		} else if (openMode === "browser") {
+			openInBrowser(url);
+		}
 	}
 }
 

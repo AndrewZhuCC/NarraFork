@@ -908,6 +908,22 @@ function refreshControlTexts(): void {
 	invalidate(mainWindow.hwnd);
 }
 
+/** 服务就绪后是否已经按设置打开过前端；服务停下时复位。 */
+let frontendOpened = false;
+
+/**
+ * 服务就绪后打开前端。
+ *
+ * 与「打开面板」按钮走同一条路径：先聚焦已存在的窗口，没有才新建 —— 所以反复启动项目
+ * 不会堆出一排重复窗口。是否打开由 NarraFork 的"启动时打开前端"设置决定。
+ */
+function openFrontendOnce(): void {
+	if (frontendOpened) return;
+	frontendOpened = true;
+	if (readNarraForkSettings().openBrowser === "off") return;
+	openPanel();
+}
+
 /**
  * 打开设置窗口（模态），保存后即时应用：语言立即切换，主题色/实例名变化时刷新窗口图标与强调色。
  * 更新检查与下载走服务端自带接口（本机回环免认证），地址用面板当前实际使用的 host/port。
@@ -970,7 +986,12 @@ export async function runManager(): Promise<void> {
 		host: settings.host,
 		port: settings.port,
 		onLine: (line) => appendLog(undefined, formatBackendLine(line)),
-		onState: (state, detail) => applyStatus(state, detail),
+		onState: (state, detail) => {
+			applyStatus(state, detail);
+			// 服务就绪后按设置打开前端；服务停下来时复位，下次启动可以再打开一次。
+			if (state === "running") openFrontendOnce();
+			else if (state === "stopped" || state === "error") frontendOpened = false;
+		},
 	});
 
 	mainWindow = createWindow({

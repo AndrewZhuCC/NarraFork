@@ -112,7 +112,7 @@ export class BackendProcess {
 				windowsHide: true,
 				stdout: "pipe",
 				stderr: "pipe",
-				env: { ...process.env },
+				env: { ...process.env, NARRAFORK_MANAGER_MANAGED: "1" },
 			});
 		} catch (error) {
 			this.setState("error", error instanceof Error ? error.message : String(error));
