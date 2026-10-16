@@ -31,6 +31,7 @@ import type {
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
+	KnowledgeSubmissionListItem,
 	KnowledgeSubmissionOutcome,
 	KnowledgeSubmitResult,
 	KnowledgeTag,
@@ -282,7 +283,7 @@ export const knowledgeApi = {
 
 	// ─── Submissions (review) ───
 	listKnowledgeSubmissions: (opts: { entryId?: string; status?: string } = {}) =>
-		request<KnowledgeSubmission[]>(`/knowledge/submissions${qs(opts)}`),
+		request<KnowledgeSubmissionListItem[]>(`/knowledge/submissions${qs(opts)}`),
 	getKnowledgeSubmission: (id: string) =>
 		request<KnowledgeSubmissionDetail>(`/knowledge/submissions/${id}`),
 	reviewKnowledgeSubmission: (

@@ -14,9 +14,8 @@ import {
 	useMyKnowledgeSubmissionOutcomes,
 	useReviewInboxCount,
 } from "../../hooks/useKnowledge";
-import type { KnowledgeSubmission, KnowledgeSubmissionOutcome } from "../../lib/api";
 import { formatLocaleDateTime } from "../../lib/intl-format";
-import { knowledgeReviewDestination } from "../../lib/knowledge-review-nav";
+import { knowledgeRequestDestination } from "../../lib/knowledge-review-nav";
 
 const REVIEWER_ROW_CAP = 5;
 
@@ -36,52 +35,10 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 	const inboxCount = inbox.data?.count ?? 0;
 	if (inboxCount === 0 && reviewerRows.length === 0 && authorRows.length === 0) return null;
 
-	const openReviewer = (row: KnowledgeSubmission) => {
-		const dest = knowledgeReviewDestination({
-			audience: "reviewer",
-			entryId: row.entryId,
-			draftId: row.draftId,
-			submissionId: row.id,
-		});
-		if (dest.to === "entry") {
-			void navigate({
-				to: "/knowledge/$entryId",
-				params: { entryId: dest.entryId },
-				hash: dest.hash,
-			});
-		} else if (dest.to === "review-center") {
-			void navigate({
-				to: "/knowledge",
-				search: { tab: "review", submission: dest.submissionId },
-			});
-		}
-		onOpen();
-	};
-
-	const openAuthor = (row: KnowledgeSubmissionOutcome) => {
-		const dest = knowledgeReviewDestination({
-			audience: "author",
-			entryId: row.entryId,
-			draftId: row.draftId,
-			submissionId: row.id,
-		});
-		if (dest.to === "entry") {
-			void navigate({
-				to: "/knowledge/$entryId",
-				params: { entryId: dest.entryId },
-				hash: dest.hash,
-			});
-		} else if (dest.to === "personal") {
-			void navigate({
-				to: "/knowledge/personal/$personalEntryId",
-				params: { personalEntryId: dest.personalEntryId },
-			});
-		} else {
-			void navigate({
-				to: "/knowledge",
-				search: { tab: "review", submission: dest.submissionId },
-			});
-		}
+	// Every row — reviewer inbox or author verdict, linked or standalone — opens the request
+	// page, which re-checks access and shows the actions this viewer has.
+	const openRequest = (submissionId: string) => {
+		void navigate(knowledgeRequestDestination(submissionId));
 		onOpen();
 	};
 
@@ -98,7 +55,7 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 				<UnstyledButton
 					data-testid="knowledge-review-inbox"
 					onClick={() => {
-						void navigate({ to: "/knowledge", search: { tab: "review" } });
+						void navigate({ to: "/knowledge/review" });
 						onOpen();
 					}}
 					style={{ width: "100%", textAlign: "left", padding: "8px 12px", borderRadius: 8 }}
@@ -116,7 +73,7 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 					key={row.id}
 					data-testid="knowledge-review-notice"
 					data-submission-id={row.id}
-					onClick={() => openReviewer(row)}
+					onClick={() => openRequest(row.id)}
 					style={{ width: "100%", textAlign: "left", padding: "8px 12px", borderRadius: 8 }}
 				>
 					<Text size="sm" fw={600} lineClamp={1}>
@@ -134,7 +91,7 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 						key={row.id}
 						data-testid="knowledge-review-outcome"
 						data-submission-id={row.id}
-						onClick={() => openAuthor(row)}
+						onClick={() => openRequest(row.id)}
 						style={{ width: "100%", textAlign: "left", padding: "8px 12px", borderRadius: 8 }}
 					>
 						<Text size="sm" fw={600} lineClamp={1}>
