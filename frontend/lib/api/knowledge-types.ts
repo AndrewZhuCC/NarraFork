@@ -81,6 +81,8 @@ export interface KnowledgeEntryViewerCaps {
 	canDelete: boolean;
 	/** May review linked publish requests on this entry (own requests excepted). */
 	canReview: boolean;
+	/** POST /entries/:id/links (this entry as source); incoming links carry `canRemove`. */
+	canManageLinks: boolean;
 	/** The caller's active personal version of this entry, if any. */
 	myPersonalEntryId: string | null;
 }
@@ -108,6 +110,10 @@ export interface KnowledgeEntry {
 
 /** GET /knowledge/entries/:id: the full entry plus the caller's capability bits. */
 export interface KnowledgeEntryDetail extends KnowledgeEntry {
+	/** Display name of `ownerUserId` (null when unowned or the user is gone). */
+	ownerUsername: string | null;
+	/** Version number of the newest revision (null before the first one). */
+	currentVersion: number | null;
 	viewerCaps: KnowledgeEntryViewerCaps;
 }
 
@@ -131,9 +137,28 @@ export interface KnowledgeSearchResult {
  * empty page (ACL filtering within the server's per-request scan budget).
  */
 export interface KnowledgeEntryPage {
-	items: (KnowledgeEntry | KnowledgeSearchResult)[];
+	items: KnowledgeEntryListItem[];
 	nextCursor: string | null;
 }
+
+/** Per-row annotations of the paged list (owner name, the caller's personal version). */
+export interface KnowledgeEntryListAnnotations {
+	ownerUsername: string | null;
+	myPersonalEntryId: string | null;
+	/** The personal version forked from an older main revision (list rows only; search rows
+	 *  carry no revision id, so this stays false there). */
+	myPersonalEntryBehindMain: boolean;
+}
+
+/** A row of the paged entry list: a list row, or (with `q`) a search row with owner + level. */
+export type KnowledgeEntryListItem = KnowledgeEntryListAnnotations &
+	(
+		| KnowledgeEntry
+		| (KnowledgeSearchResult & { ownerUserId: string | null; classificationLevel: string | null })
+	);
+
+/** `sort` of the browse list: `relevance` applies only with a search query. */
+export type KnowledgeEntrySort = "updated" | "title" | "relevance";
 
 /**
  * A revision's METADATA, as returned by the history list.
@@ -544,6 +569,8 @@ export interface KnowledgeEntryLink {
 	direction: "out" | "in";
 	fromEntry: KnowledgeLinkEndpoint;
 	toEntry: KnowledgeLinkEndpoint;
+	/** DELETE /links/:id would be accepted (the gate on the link's source entry). */
+	canRemove: boolean;
 }
 
 export interface KnowledgeGraphNode extends KnowledgeLinkEndpoint {

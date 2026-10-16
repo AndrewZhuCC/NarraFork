@@ -3,14 +3,11 @@
  *
  * Every publish request — linked or standalone, for its author or a reviewer — has one page,
  * `/knowledge/requests/$submissionId`; every personal version — linked or standalone — has one
- * page, `/knowledge/mine/$personalEntryId`. The legacy URLs (review / my-library tabs, entry
- * `#submissions` and `#draft` hashes, `/knowledge/personal/<id>`) redirect there; the parsing
- * lives here so each redirect row is unit-tested.
+ * page, `/knowledge/mine/$personalEntryId`; an entry's history / edit / settings are sub-pages
+ * of `/knowledge/$entryId`. The legacy URLs (review / my-library tabs, entry `#submissions`,
+ * `#draft`, `#content`, `#history` and `#links` hashes, `/knowledge/personal/<id>`) redirect
+ * there; the parsing lives here so each redirect row is unit-tested.
  */
-
-export const KNOWLEDGE_ENTRY_TABS = ["content", "history", "links"] as const;
-
-export type KnowledgeEntryTab = (typeof KNOWLEDGE_ENTRY_TABS)[number];
 
 /** Submission ids are nanoids and may start with "-" (URL-safe alphabet). */
 const SUBMISSION_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -19,16 +16,49 @@ export function isKnowledgeSubmissionId(id: unknown): id is string {
 	return typeof id === "string" && SUBMISSION_ID.test(id);
 }
 
+/** Anchor of the read page's "Related entries" section (target of the legacy `#links`). */
+export const KNOWLEDGE_RELATED_ANCHOR = "related";
+
+/** The read page, optionally scrolled to an anchor. */
+export interface KnowledgeEntryReadDestination {
+	to: "/knowledge/$entryId";
+	params: { entryId: string };
+	hash?: string;
+}
+
 /**
- * Read the `/knowledge/$entryId` hash into a tab. Empty, `content` or anything unknown →
- * Content. (`#submissions…` and `#draft` never reach the page: {@link legacyEntryHashRedirect}
- * and {@link legacyDraftHashRedirect} send them to the request / personal-version pages first.)
+ * Legacy entry tab hashes (§4.2) — the tabs became pages:
+ *  - `#content` → `/knowledge/$entryId` (the read page, no hash)
+ *  - `#history` → `/knowledge/$entryId/history`
+ *  - `#links` → `/knowledge/$entryId#related` (the read page, scrolled to "Related entries")
+ * Anything else (incl. `#related` itself, `#draft`, `#submissions…`) → null.
  */
-export function parseKnowledgeEntryHash(hash: string | undefined | null): KnowledgeEntryTab {
+export function legacyEntryTabRedirect(
+	entryId: string,
+	hash: string | undefined | null,
+):
+	| KnowledgeEntryReadDestination
+	| { to: "/knowledge/$entryId/history"; params: { entryId: string } }
+	| null {
 	const raw = (hash ?? "").replace(/^#/, "").trim();
-	return (KNOWLEDGE_ENTRY_TABS as readonly string[]).includes(raw)
-		? (raw as KnowledgeEntryTab)
-		: "content";
+	if (raw === "content") return { to: "/knowledge/$entryId", params: { entryId } };
+	if (raw === "history") return { to: "/knowledge/$entryId/history", params: { entryId } };
+	if (raw === "links") {
+		return { to: "/knowledge/$entryId", params: { entryId }, hash: KNOWLEDGE_RELATED_ANCHOR };
+	}
+	return null;
+}
+
+/**
+ * `/knowledge/$entryId/edit` is only for callers who may write main directly
+ * (`viewerCaps.canWriteMain`); everyone else — and an entry that could not be read
+ * (`canWriteMain` unknown) — lands on the read page instead.
+ */
+export function entryEditRedirect(
+	entryId: string,
+	canWriteMain: boolean | null | undefined,
+): KnowledgeEntryReadDestination | null {
+	return canWriteMain ? null : { to: "/knowledge/$entryId", params: { entryId } };
 }
 
 /** A redirect target for a legacy knowledge URL. */
@@ -102,7 +132,7 @@ export function legacyKnowledgeIndexRedirect(
  *  - `#submissions/<id>` → `/knowledge/requests/<id>`
  *  - `#submissions` (or a malformed id) → `/knowledge/review?entry=<entryId>&status=all`
  *    (the entry's requests the caller may review, any status — what the old tab listed)
- * Other hashes are entry tabs (null).
+ * Other hashes are not this function's business (null).
  */
 export function legacyEntryHashRedirect(
 	entryId: string,

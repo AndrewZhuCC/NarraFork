@@ -24,9 +24,21 @@
 	background: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6));
 }
 
+/* Browse-list table rows: the whole row opens the entry. */
+.browseRow {
+	cursor: pointer;
+	transition: background 100ms ease;
+}
+
+.browseRow:hover,
+.browseRow:focus-within {
+	background: light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-6));
+}
+
 @media (prefers-reduced-motion: reduce) {
 	.entryCard,
-	.reviewCard {
+	.reviewCard,
+	.browseRow {
 		transition: none;
 	}
 

@@ -1,29 +1,55 @@
 import { describe, expect, test } from "bun:test";
 import {
+	entryEditRedirect,
 	isLegacyDraftHash,
 	knowledgePersonalEntryDestination,
 	knowledgeRequestDestination,
 	legacyDraftHashRedirect,
 	legacyEntryHashRedirect,
+	legacyEntryTabRedirect,
 	legacyKnowledgeIndexRedirect,
-	parseKnowledgeEntryHash,
 	parseKnowledgeEntrySearch,
 	parseKnowledgeReviewSearch,
 } from "./knowledge-review-nav";
 
-describe("parseKnowledgeEntryHash", () => {
-	test("defaults to the content tab", () => {
-		expect(parseKnowledgeEntryHash("")).toBe("content");
-		expect(parseKnowledgeEntryHash(null)).toBe("content");
-		expect(parseKnowledgeEntryHash("#content")).toBe("content");
-		expect(parseKnowledgeEntryHash("not-a-tab")).toBe("content");
+// One test per §4.2 row owned by P2c: the entry tabs became pages.
+describe("legacy URL redirects (§4.2, P2c rows)", () => {
+	test("/knowledge/$entryId#content → /knowledge/$entryId", () => {
+		expect(legacyEntryTabRedirect("entry-1", "#content")).toEqual({
+			to: "/knowledge/$entryId",
+			params: { entryId: "entry-1" },
+		});
 	});
 
-	test("selects a named tab; the Submissions and My-draft tabs are gone", () => {
-		expect(parseKnowledgeEntryHash("history")).toBe("history");
-		expect(parseKnowledgeEntryHash("links")).toBe("links");
-		expect(parseKnowledgeEntryHash("submissions")).toBe("content");
-		expect(parseKnowledgeEntryHash("#draft")).toBe("content");
+	test("/knowledge/$entryId#history → /knowledge/$entryId/history", () => {
+		expect(legacyEntryTabRedirect("entry-1", "history")).toEqual({
+			to: "/knowledge/$entryId/history",
+			params: { entryId: "entry-1" },
+		});
+	});
+
+	test("/knowledge/$entryId#links → /knowledge/$entryId#related (Related entries)", () => {
+		expect(legacyEntryTabRedirect("entry-1", "#links")).toEqual({
+			to: "/knowledge/$entryId",
+			params: { entryId: "entry-1" },
+			hash: "related",
+		});
+	});
+
+	test("other hashes are left alone (no redirect loop on #related)", () => {
+		for (const hash of ["", null, "#related", "#draft", "#submissions", "#submissions/x", "#x"]) {
+			expect(legacyEntryTabRedirect("entry-1", hash)).toBeNull();
+		}
+	});
+});
+
+describe("entryEditRedirect", () => {
+	test("only direct writers stay on /edit; everyone else reads", () => {
+		expect(entryEditRedirect("entry-1", true)).toBeNull();
+		const read = { to: "/knowledge/$entryId", params: { entryId: "entry-1" } } as const;
+		expect(entryEditRedirect("entry-1", false)).toEqual(read);
+		// Unknown (entry unreadable / failed to load) fails closed to the read page.
+		expect(entryEditRedirect("entry-1", null)).toEqual(read);
 	});
 });
 
