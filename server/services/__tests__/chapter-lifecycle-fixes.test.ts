@@ -24,8 +24,17 @@
  * rows, because in every case the question is whether the git-level and SQL-level
  * pieces compose correctly.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
@@ -36,6 +45,7 @@ import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
+	narratorWorktreeResources,
 	portAllocations,
 	projects,
 	terminals,
@@ -49,6 +59,7 @@ import { chapterService } from "../chapter-service";
 import { ensureChapterSnapshot } from "../chapter-snapshot-ref";
 import { gitService } from "../git-service";
 import { reviewService } from "../review-service";
+import { withLifecycleContext, withLifecycleGuardPorts } from "../worktree-lifecycle-guard";
 import {
 	SNAPSHOT_HEAD_REF,
 	snapshotIncomingRef,
@@ -70,7 +81,36 @@ function present<T>(value: T | null | undefined, what: string): T {
 
 async function git(args: string[], cwd: string): Promise<string> {
 	const result = await safeSpawn({ cmd: ["git", ...args], cwd, timeout: 15_000 });
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
 	return result.stdout.trim();
+}
+
+/** Fail only wake's activation query, after its WHERE has been assembled. */
+function failWakeActivation(
+	worktreePath: string,
+	failure: Error,
+	beforeFailure: () => Promise<void> = async () => {},
+) {
+	const update = db.update.bind(db);
+	return spyOn(db, "update").mockImplementation(((table: typeof chapters) => {
+		const builder = update(table);
+		const set = builder.set.bind(builder);
+		builder.set = (values) => {
+			const query = set(values);
+			if (
+				table === chapters &&
+				values.status === "active" &&
+				values.worktreePath === worktreePath
+			) {
+				query.execute = async () => {
+					await beforeFailure();
+					throw failure;
+				};
+			}
+			return query;
+		};
+		return builder;
+	}) as typeof db.update);
 }
 
 /**
@@ -278,6 +318,222 @@ afterEach(async () => {
 	}
 });
 
+describe("retirement follows actual disk effects", () => {
+	test("dirty batch items skip before consulting global deletion inventory", async () => {
+		const env = await createChapterEnv();
+		writeFileSync(join(env.worktree, BASE_FILE), "uncommitted\n");
+		let reads = 0;
+		const report = await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => {
+					reads++;
+					return { complete: false, claims: [] };
+				},
+			},
+			() => chapterCleanup.batchCleanup([env.chapterId]),
+		);
+		expect(report.skipped).toEqual([env.chapterId]);
+		expect(report.errors).toEqual([]);
+		expect(reads).toBe(0);
+		expect((await chapterRow(env.chapterId)).status).toBe("active");
+	});
+
+	test("dormant-row removal without disk deletion does not read global inventory", async () => {
+		const env = await createChapterEnv();
+		await chapterCleanup.dormant(env.chapterId);
+		let reads = 0;
+		await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => {
+					reads++;
+					return { complete: false, claims: [] };
+				},
+			},
+			() => chapterService.remove(env.chapterId),
+		);
+		expect(reads).toBe(0);
+		expect(
+			await db.query.chapters.findFirst({ where: eq(chapters.id, env.chapterId) }),
+		).toBeUndefined();
+	});
+
+	test("ordinary wake creates its checkout without acquiring a deletion scope", async () => {
+		const env = await createChapterEnv();
+		await chapterCleanup.dormant(env.chapterId);
+		let reads = 0;
+		await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => {
+					reads++;
+					return { complete: false, claims: [] };
+				},
+			},
+			() => chapterCleanup.wake(env.chapterId),
+		);
+		expect(reads).toBe(0);
+		expect((await chapterRow(env.chapterId)).status).toBe("active");
+		expect(existsSync(env.worktree)).toBe(true);
+	});
+
+	test("dormant retains a shadow shared by another chapter", async () => {
+		const env = await createChapterEnv();
+		const snapshot = present(await ensureChapterSnapshot(env.worktree), "snapshot");
+		const source = await chapterRow(env.chapterId);
+		await db.insert(chapters).values({
+			id: generateId(),
+			projectId: env.projectId,
+			title: "shadow reader",
+			branch: "chapter/shadow-reader",
+			baseBranch: "main",
+			status: "dormant",
+			snapshotShadowKey: source.snapshotShadowKey,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+		});
+		await chapterCleanup.dormant(env.chapterId);
+		expect(existsSync(env.worktree)).toBe(false);
+		expect(await worktreeTreeSnapshot.treeOfSnapshot(env.worktree, snapshot.commitSha)).toBe(
+			snapshot.treeHash,
+		);
+	});
+
+	test("chapter removal without a repository does not reserve a checkout it will keep", async () => {
+		const env = await createChapterEnv();
+		await ensureChapterSnapshot(env.worktree);
+		await db.update(projects).set({ gitPath: null }).where(eq(projects.id, env.projectId));
+		const resourceId = generateId();
+		await db.insert(narratorWorktreeResources).values({
+			id: resourceId,
+			deviceId: "local",
+			repositoryKey: "retained-checkout",
+			worktreePath: env.worktree,
+			createRequestId: generateId(),
+			state: "ready",
+		});
+		try {
+			await chapterService.remove(env.chapterId);
+			expect(existsSync(env.worktree)).toBe(true);
+			expect(
+				await db.query.chapters.findFirst({ where: eq(chapters.id, env.chapterId) }),
+			).toBeUndefined();
+			expect(
+				await db.query.narratorWorktreeResources.findFirst({
+					where: eq(narratorWorktreeResources.id, resourceId),
+				}),
+			).toBeDefined();
+		} finally {
+			await db
+				.delete(narratorWorktreeResources)
+				.where(eq(narratorWorktreeResources.id, resourceId));
+		}
+	});
+
+	test("review dismissal without disk cleanup ignores unrelated global inventory", async () => {
+		const env = await createChapterEnv();
+		await db
+			.update(chapters)
+			.set({ role: "review", reviewStatus: "concluded" })
+			.where(eq(chapters.id, env.chapterId));
+		await db.update(projects).set({ gitPath: null }).where(eq(projects.id, env.projectId));
+		let reads = 0;
+		await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => {
+					reads++;
+					return { complete: false, claims: [] };
+				},
+			},
+			() => reviewService.dismissReview(env.chapterId),
+		);
+		expect(reads).toBe(0);
+		expect((await chapterRow(env.chapterId)).reviewStatus).toBe("dismissed");
+		expect(existsSync(env.worktree)).toBe(true);
+	});
+
+	test("review conversion deletes only review checkout/shadow, not its independently owned source", async () => {
+		const env = await createChapterEnv();
+		const reviewId = generateId();
+		const branch = `review/${reviewId}`;
+		const worktree = resolve(env.gitPath, ".worktrees", reviewId);
+		await git(["worktree", "add", worktree, "-b", branch], env.gitPath);
+		tempDirs.push(worktree);
+		const now = new Date().toISOString();
+		await db.insert(chapters).values({
+			id: reviewId,
+			projectId: env.projectId,
+			title: "review",
+			branch,
+			baseBranch: env.branch,
+			role: "review",
+			reviewStatus: "concluded",
+			reviewSourceChapterId: env.chapterId,
+			worktreePath: worktree,
+			createdAt: now,
+			updatedAt: now,
+		});
+		await ensureChapterSnapshot(worktree);
+		const sourceNarrator = generateId();
+		const reviewNarrator = generateId();
+		await db.insert(narrators).values([
+			{
+				id: sourceNarrator,
+				chapterId: env.chapterId,
+				cwd: env.worktree,
+				createdAt: now,
+				updatedAt: now,
+			},
+			{ id: reviewNarrator, chapterId: reviewId, cwd: worktree, createdAt: now, updatedAt: now },
+		]);
+		createdNarrators.push(sourceNarrator, reviewNarrator);
+		const resourceId = generateId();
+		await db.insert(narratorWorktreeResources).values({
+			id: resourceId,
+			ownerNarratorId: sourceNarrator,
+			deviceId: "local",
+			repositoryKey: "review-source-independent",
+			worktreePath: env.worktree,
+			createRequestId: generateId(),
+			state: "ready",
+		});
+		try {
+			await reviewService.convertToSubagent(reviewId);
+			expect(existsSync(worktree)).toBe(false);
+			expect(existsSync(env.worktree)).toBe(true);
+			expect((await chapterRow(reviewId)).reviewStatus).toBe("converted");
+			const converted = await db.query.narrators.findFirst({
+				where: eq(narrators.id, reviewNarrator),
+			});
+			expect(converted?.chapterId).toBe(env.chapterId);
+			expect(converted?.cwd).toBe(env.worktree);
+			expect(converted?.parentNarratorId).toBe(sourceNarrator);
+		} finally {
+			await db
+				.delete(narratorWorktreeResources)
+				.where(eq(narratorWorktreeResources.id, resourceId));
+		}
+	});
+
+	test("unverifiable batch cleanup reports its retained target without aborting the batch", async () => {
+		const env = await createChapterEnv();
+		const report = await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => ({ complete: false, claims: [] }),
+			},
+			() => chapterCleanup.batchCleanup([env.chapterId], { force: true }),
+		);
+		expect(report.cleaned).toEqual([]);
+		expect(report.errors).toHaveLength(1);
+		expect(report.errors[0]?.chapterId).toBe(env.chapterId);
+		expect((await chapterRow(env.chapterId)).worktreePath).toBe(env.worktree);
+		expect(existsSync(env.worktree)).toBe(true);
+	});
+});
+
 describe("dormant refuses when nothing holds the work", () => {
 	test("a failed commit AND a failed snapshot keep the chapter active with its worktree", async () => {
 		const env = await createChapterEnv();
@@ -346,6 +602,9 @@ describe("dormant refuses when nothing holds the work", () => {
 		const row = await chapterRow(env.chapterId);
 		expect(row.status).toBe("dormant");
 		expect(row.dormantSnapshotCommitSha).toBeTruthy();
+		await chapterCleanup.wake(env.chapterId);
+		expect(readFileSync(join(env.worktree, "uncommitted.txt"), "utf-8")).toBe("snapshot has it\n");
+		expect((await chapterRow(env.chapterId)).dormantSnapshotCommitSha).toBeNull();
 	});
 });
 
@@ -411,7 +670,18 @@ describe("dormant when the worktree cannot be removed", () => {
 		});
 		rmSync(path, { recursive: true, force: true });
 
-		await chapterCleanup.wake(env.chapterId);
+		let reads = 0;
+		await withLifecycleGuardPorts(
+			{
+				canonicalPath: async (value) => value,
+				readClaims: async () => {
+					reads++;
+					return { complete: false, claims: [] };
+				},
+			},
+			() => chapterCleanup.wake(env.chapterId),
+		);
+		expect(reads).toBe(0);
 		const woken = await chapterRow(env.chapterId);
 		tempDirs.push(present(woken.worktreePath, "woken worktree"));
 		expect(woken.status).toBe("active");
@@ -551,6 +821,185 @@ describe("the ignored-file archive does not outlive its chapter", () => {
 		// have read this archive again.
 		expect((await chapterRow(env.chapterId)).status).toBe("abandoned");
 		expect(existsSync(archive)).toBe(false);
+	});
+});
+
+describe("wake failure compensation preserves creation identity", () => {
+	test("normal wake preserves the snapshot key of a stable repository alias", async () => {
+		const env = await createChapterEnv();
+		const aliasRoot = mkdtempSync(join(tmpdir(), "nf-wake-alias-"));
+		tempDirs.push(aliasRoot);
+		const repositoryAlias = join(aliasRoot, "repository");
+		symlinkSync(env.gitPath, repositoryAlias, "junction");
+		const worktreeAlias = resolve(repositoryAlias, ".worktrees", env.branch.split("/")[1]);
+		await db
+			.update(projects)
+			.set({ gitPath: repositoryAlias })
+			.where(eq(projects.id, env.projectId));
+		await db
+			.update(chapters)
+			.set({ worktreePath: worktreeAlias })
+			.where(eq(chapters.id, env.chapterId));
+		writeFileSync(join(worktreeAlias, "uncommitted.txt"), "snapshot under stable alias\n");
+		const commit = spyOn(gitService, "autoCommitUnlocked").mockRejectedValue(
+			new Error("simulated commit failure"),
+		);
+		try {
+			expect((await chapterCleanup.dormant(env.chapterId)).snapshotOnly).toBe(true);
+		} finally {
+			commit.mockRestore();
+		}
+		await withLifecycleContext([repositoryAlias, worktreeAlias], () =>
+			chapterCleanup.wake(env.chapterId),
+		);
+		expect(readFileSync(join(worktreeAlias, "uncommitted.txt"), "utf-8")).toBe(
+			"snapshot under stable alias\n",
+		);
+		const row = await chapterRow(env.chapterId);
+		expect(row.status).toBe("active");
+		expect(row.worktreePath).toBe(worktreeAlias);
+		expect(row.dormantSnapshotCommitSha).toBeNull();
+	});
+
+	test.each([
+		"direct",
+		"nested",
+	] as const)("does not delete a replacement checkout after the active DB update fails (%s)", async (context) => {
+		const env = await createChapterEnv();
+		await chapterCleanup.dormant(env.chapterId);
+		const moved = `${env.worktree}-original`;
+		const replacementBranch = `replacement/${generateId()}`;
+		const failure = new Error("simulated wake activation failure");
+		let birthInode: number | undefined;
+		let replacementInode: number | undefined;
+		let failedActivations = 0;
+		const removed: string[] = [];
+		const removeWorktree = gitService.removeWorktree;
+		gitService.removeWorktree = async (repository, path) => {
+			removed.push(path);
+			return removeWorktree.call(gitService, repository, path);
+		};
+		const update = failWakeActivation(env.worktree, failure, async () => {
+			failedActivations++;
+			birthInode = lstatSync(env.worktree).ino;
+			writeFileSync(join(env.worktree, "original.txt"), "original birth's uncommitted bytes\n");
+			// Keep the original inode alive, so the new checkout cannot accidentally reuse it.
+			await git(["worktree", "move", env.worktree, moved], env.gitPath);
+			await git(["worktree", "add", "-b", replacementBranch, env.worktree, "HEAD"], env.gitPath);
+			writeFileSync(join(env.worktree, "replacement.txt"), "replacement's uncommitted bytes\n");
+			replacementInode = lstatSync(env.worktree).ino;
+		});
+		try {
+			const wake = () => chapterCleanup.wake(env.chapterId);
+			await expect(
+				context === "nested" ? withLifecycleContext([env.gitPath, env.worktree], wake) : wake(),
+			).rejects.toBe(failure);
+		} finally {
+			update.mockRestore();
+			gitService.removeWorktree = removeWorktree;
+		}
+		expect(failedActivations).toBe(1);
+		expect(birthInode).toBeDefined();
+		expect(replacementInode).not.toBe(birthInode);
+		expect(lstatSync(moved).ino).toBe(present(birthInode, "original birth inode"));
+		expect(readFileSync(join(moved, "original.txt"), "utf-8")).toBe(
+			"original birth's uncommitted bytes\n",
+		);
+		expect(existsSync(env.worktree)).toBe(true);
+		expect(readFileSync(join(env.worktree, "replacement.txt"), "utf-8")).toBe(
+			"replacement's uncommitted bytes\n",
+		);
+		expect(lstatSync(env.worktree).ino).toBe(present(replacementInode, "replacement inode"));
+		expect(await git(["branch", "--show-current"], env.worktree)).toBe(replacementBranch);
+		expect(removed).toEqual([]);
+		const row = await chapterRow(env.chapterId);
+		expect(row.status).toBe("dormant");
+		expect(row.worktreePath).toBeNull();
+	});
+
+	test.each([
+		"fresh",
+		"reclaimed",
+	] as const)("still removes its own creation after the active DB update fails (%s)", async (creation) => {
+		const env = await createChapterEnv();
+		await chapterCleanup.dormant(env.chapterId);
+		if (creation === "reclaimed") {
+			mkdirSync(env.worktree);
+			writeFileSync(join(env.worktree, "leftover.txt"), "leftover\n");
+		}
+		const failure = new Error("simulated own-worktree activation failure");
+		let failedActivations = 0;
+		const update = failWakeActivation(env.worktree, failure, async () => {
+			failedActivations++;
+			expect(readFileSync(join(env.worktree, BASE_FILE), "utf-8")).toBe(BASE_CONTENT);
+		});
+		try {
+			await expect(
+				withLifecycleContext([env.gitPath, env.worktree], () => chapterCleanup.wake(env.chapterId)),
+			).rejects.toBe(failure);
+		} finally {
+			update.mockRestore();
+		}
+		expect(failedActivations).toBe(1);
+		expect(existsSync(env.worktree)).toBe(false);
+		expect(await git(["worktree", "list", "--porcelain"], env.gitPath)).not.toContain(
+			`branch refs/heads/${env.branch}`,
+		);
+		const row = await chapterRow(env.chapterId);
+		expect(row.status).toBe("dormant");
+		expect(row.worktreePath).toBeNull();
+	});
+
+	test.each([
+		"inode",
+		"alias",
+	] as const)("refuses to restore archived content into a replaced creation (%s)", async (replacementKind) => {
+		const env = await createChapterEnv({ gitignore: "secret.env\n" });
+		writeFileSync(join(env.worktree, "secret.env"), "archived secret\n");
+		writeFileSync(join(env.worktree, BASE_FILE), "snapshot-only tracked bytes\n");
+		const commit = spyOn(gitService, "autoCommitUnlocked").mockRejectedValue(
+			new Error("simulated commit failure leaves snapshot-only work"),
+		);
+		try {
+			expect((await chapterCleanup.dormant(env.chapterId)).snapshotOnly).toBe(true);
+		} finally {
+			commit.mockRestore();
+		}
+		const moved = `${env.worktree}-original`;
+		const replacement = replacementKind === "alias" ? `${env.worktree}-alias` : env.worktree;
+		const replacementBranch = `replacement/${generateId()}`;
+		const createWorktree = gitService.createWorktree;
+		let replacements = 0;
+		let birthInode: number | undefined;
+		gitService.createWorktree = async (repository, path, branch) => {
+			await createWorktree.call(gitService, repository, path, branch);
+			if (path !== env.worktree) return;
+			replacements++;
+			birthInode = lstatSync(path).ino;
+			writeFileSync(join(path, "original.txt"), "original bytes\n");
+			await git(["worktree", "move", path, moved], repository);
+			await git(["worktree", "add", "-b", replacementBranch, replacement, "HEAD"], repository);
+			writeFileSync(join(replacement, "replacement.txt"), "replacement bytes\n");
+			writeFileSync(join(replacement, BASE_FILE), "replacement tracked bytes\n");
+			if (replacementKind === "alias") symlinkSync(replacement, path, "junction");
+		};
+		try {
+			await expect(
+				withLifecycleContext([env.gitPath, env.worktree], () => chapterCleanup.wake(env.chapterId)),
+			).rejects.toThrow(/footprint changed/i);
+		} finally {
+			gitService.createWorktree = createWorktree;
+		}
+		expect(replacements).toBe(1);
+		expect(lstatSync(moved).ino).toBe(present(birthInode, "original birth inode"));
+		expect(readFileSync(join(moved, "original.txt"), "utf-8")).toBe("original bytes\n");
+		expect(readFileSync(join(replacement, "replacement.txt"), "utf-8")).toBe("replacement bytes\n");
+		expect(readFileSync(join(replacement, BASE_FILE), "utf-8")).toBe("replacement tracked bytes\n");
+		expect(existsSync(join(replacement, "secret.env"))).toBe(false);
+		expect(
+			readFileSync(getNarraforkPath("dormant-ignored", env.chapterId, "secret.env"), "utf-8"),
+		).toBe("archived secret\n");
+		expect((await chapterRow(env.chapterId)).status).toBe("dormant");
 	});
 });
 

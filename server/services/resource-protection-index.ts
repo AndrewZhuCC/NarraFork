@@ -11,6 +11,8 @@ import {
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { hotSafe } from "../lib/hot-safe";
 import { normalizePathForComparison } from "../lib/platform-path";
+import { worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
+import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
 
 const PAGE = 64;
@@ -97,6 +99,8 @@ type PathRow = {
 };
 type IndexedClaim = {
 	claim: ResourceClaim;
+	/** Canonical logical reference; claim.shadowKey retains the persisted physical hash input. */
+	shadowKey?: string;
 	canonicalPath: string | null;
 	deviceId: string;
 	alias: number;
@@ -138,6 +142,41 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 	let receiptEntry: Dirent | null | undefined;
 	let receiptImport: Promise<void> | undefined;
 	let receiptRetryCursor = "";
+	// New shadow-only projections use slot -1. Upgrade old slots in bounded
+	// maintenance pages; this cursor is never a global read/admission barrier.
+	let shadowProjectionCursor: [string, number] = ["", -2];
+	let shadowProjectionComplete = false;
+	function shadowProjectionPage(limit: number) {
+		return database
+			.query(`SELECT source_id, slot, shadow_key IS NOT NULL AS has_shadow FROM resource_protection_paths
+			WHERE source = 'chapter' AND (source_id, slot) > (?, ?)
+			ORDER BY source_id, slot LIMIT ?`)
+			.all(...shadowProjectionCursor, limit) as {
+			source_id: string;
+			slot: number;
+			has_shadow: number;
+		}[];
+	}
+	function legacyShadowProjection(row: { slot: number; has_shadow: number }): boolean {
+		return row.slot >= 0 && row.has_shadow !== 0;
+	}
+	function invalidateLegacyShadowProjections() {
+		if (shadowProjectionComplete) return;
+		const rows = shadowProjectionPage(PAGE);
+		database.transaction(() => {
+			for (const row of rows) {
+				if (!legacyShadowProjection(row)) continue;
+				const result = database
+					.query(`UPDATE resource_protection_sources SET dirty = 1, revision = revision + 1
+					WHERE source = 'chapter' AND source_id = ? AND dirty = 0`)
+					.run(row.source_id);
+				if (result.changes) changedSource("chapter");
+			}
+		})();
+		const last = rows.at(-1);
+		if (last) shadowProjectionCursor = [last.source_id, last.slot];
+		if (rows.length < PAGE) shadowProjectionComplete = true;
+	}
 	// Project bounded scalars before crossing the SQLite/JS boundary, including malformed legacy rows.
 	const smallText = (column: string, max = 4096) =>
 		`CASE WHEN length(cast(${column} AS blob)) > ${max} THEN char(0) ELSE ${column} END`;
@@ -240,20 +279,13 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		return claims;
 	}
 
-	async function indexed(
+	async function indexedPath(
 		claim: ResourceClaim,
+		path: string | undefined,
+		deviceId: string,
 		deadline: number,
 		signal?: AbortSignal,
 	): Promise<IndexedClaim> {
-		if (Buffer.byteLength(JSON.stringify(claim)) > MAX_ROW_BYTES)
-			throw new Error("Claim exceeds row budget");
-		let path = claim.path;
-		let deviceId = claim.deviceId ?? "local";
-		if (claim.shadowKey && !path) {
-			const parts = claim.shadowKey.split("\0");
-			if (parts.length !== 2 || !parts[0] || !parts[1]) throw new Error("Invalid shadow reference");
-			[deviceId, path] = parts as [string, string];
-		}
 		if (!validText(deviceId, 256)) throw new Error("Invalid resource device");
 		if (!path) return { claim, canonicalPath: null, deviceId, alias: 0 };
 		if (!validText(path)) throw new Error("Invalid resource path");
@@ -274,6 +306,39 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			alias:
 				canonicalPath !== normalizePathForComparison(path) || metadata?.isSymbolicLink() ? 1 : 0,
 		};
+	}
+	async function indexed(
+		claim: ResourceClaim,
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<IndexedClaim[]> {
+		if (Buffer.byteLength(JSON.stringify(claim)) > MAX_ROW_BYTES)
+			throw new Error("Claim exceeds row budget");
+		const { shadowKey, ...direct } = claim;
+		const rows: IndexedClaim[] = [];
+		if (shadowKey) {
+			const parts = shadowKey.split("\0");
+			const [deviceId, logicalPath] = parts;
+			if (parts.length !== 2 || !deviceId || !logicalPath || !isAbsolute(logicalPath))
+				throw new Error("Invalid shadow reference");
+			const reference = { ...claim, path: undefined };
+			const logical = await indexedPath(reference, logicalPath, deviceId, deadline, signal);
+			const physical = await indexedPath(
+				reference,
+				treeSnapshotPhysicalDir(deviceId, logicalPath),
+				deviceId,
+				deadline,
+				signal,
+			);
+			rows.push({
+				...physical,
+				shadowKey: treeSnapshotKey(deviceId, logical.canonicalPath ?? logicalPath),
+				alias: logical.alias || physical.alias,
+			});
+		}
+		if (claim.path || !shadowKey)
+			rows.push(await indexedPath(direct, claim.path, claim.deviceId ?? "local", deadline, signal));
+		return rows;
 	}
 
 	function changedSource(source: ProtectionSource) {
@@ -298,11 +363,13 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			if (!state || state.revision !== revision) return false;
 			const old = database
 				.query(
-					"SELECT device_id, canonical_path, alias_sensitive, claim_json FROM resource_protection_paths WHERE source = ? AND source_id = ? ORDER BY slot LIMIT ?",
+					"SELECT slot, device_id, canonical_path, shadow_key, alias_sensitive, claim_json FROM resource_protection_paths WHERE source = ? AND source_id = ? ORDER BY slot LIMIT ?",
 				)
 				.all(source, id, PAGE + 1) as {
+				slot: number;
 				device_id: string;
 				canonical_path: string | null;
+				shadow_key: string | null;
 				alias_sensitive: number;
 				claim_json: string;
 			}[];
@@ -310,8 +377,10 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				old.length === rows.length &&
 				rows.every(
 					(row, i) =>
+						old[i]?.slot === (row.shadowKey ? -1 : i) &&
 						old[i]?.device_id === row.deviceId &&
 						old[i]?.canonical_path === row.canonicalPath &&
+						old[i]?.shadow_key === (row.shadowKey ?? null) &&
 						old[i]?.alias_sensitive === row.alias &&
 						old[i]?.claim_json === JSON.stringify(row.claim),
 				);
@@ -334,11 +403,11 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 					.run(
 						source,
 						id,
-						slot,
+						row.shadowKey ? -1 : slot,
 						row.deviceId,
 						row.canonicalPath,
 						row.claim.repositoryKey ?? null,
-						row.claim.shadowKey ?? null,
+						row.shadowKey ?? null,
 						row.claim.scopeProjectId ?? null,
 						row.alias,
 						JSON.stringify(row.claim),
@@ -351,7 +420,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		filePath: string,
 		deadline: number,
 		signal?: AbortSignal,
-	): Promise<ResourceClaim | null> {
+	): Promise<ResourceClaim | null | false> {
 		check(deadline, signal);
 		let file: FileHandle;
 		try {
@@ -378,11 +447,19 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				before.ctimeMs !== after.ctimeMs
 			)
 				throw new Error("Receipt changed while reading");
-			const claim = receiptClaim(
-				JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")),
-				filePath,
-			);
-			return claim;
+			const record: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+			if (
+				!record ||
+				typeof record !== "object" ||
+				Array.isArray(record) ||
+				Object.hasOwn(record, "__proto__") ||
+				Object.hasOwn(record, "version")
+			)
+				throw new Error("Invalid receipt");
+			// An explicit no-dispatch result is durable retry metadata, not a claim.
+			// Its invalid original destination need not be canonicalizable.
+			if (!worktreeReceiptHasResourceEffect(record)) return false;
+			return receiptClaim(record, filePath);
 		} finally {
 			await file.close();
 		}
@@ -411,8 +488,13 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 	) {
 		try {
 			const claim = await readReceipt(filePath, deadline, signal);
-			if (!claim) throw new Error("Legacy receipt disappeared before import");
-			save("receipt", filePath, revision, [await indexed(claim, deadline, signal)]);
+			if (claim === null) throw new Error("Legacy receipt disappeared before import");
+			save(
+				"receipt",
+				filePath,
+				revision,
+				claim === false ? [] : await indexed(claim, deadline, signal),
+			);
 		} catch {
 			check(deadline, signal); // Retry bad finals after reaching EOF, without starving later files.
 		}
@@ -522,6 +604,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		deadline = performance.now() + 1000,
 		signal?: AbortSignal,
 	): Promise<void> {
+		check(deadline, signal);
+		invalidateLegacyShadowProjections();
 		for (const source of ["narrator", "chapter", "registry"] as const) {
 			check(deadline, signal);
 			const progress = database
@@ -561,9 +645,13 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 					state.source,
 					state.source_id,
 					state.revision,
-					await Promise.all(
-						readRaw(state.source, state.source_id).map((claim) => indexed(claim, deadline, signal)),
-					),
+					(
+						await Promise.all(
+							readRaw(state.source, state.source_id).map((claim) =>
+								indexed(claim, deadline, signal),
+							),
+						)
+					).flat(),
 				);
 			} catch {
 				check(deadline, signal); /* Keep invalid facts dirty and fail closed on reads. */
@@ -608,7 +696,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 	function matches(targets: readonly LifecycleTarget[], row: IndexedClaim): boolean {
 		return targets.some((target) => {
 			if (target.scopeProjectId && target.scopeProjectId === row.claim.scopeProjectId) return true;
-			if (target.shadowKey && target.shadowKey === row.claim.shadowKey) return true;
+			if (target.shadowKey && target.shadowKey === row.shadowKey) return true;
 			if ((target.deviceId ?? "local") !== row.deviceId) return false;
 			if (target.repositoryKey && target.repositoryKey === row.claim.repositoryKey) return true;
 			const a = target.path,
@@ -663,6 +751,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 					.all(...sources),
 			);
 		const initialVersion = version();
+		const bootstrapKeys = new Set(bootstrapOverlay.map(({ source, id }) => `${source}\0${id}`));
 		function candidateClaim(row: PathRow): ResourceClaim {
 			const saved = database
 				.query(`SELECT ${smallText("claim_json", MAX_ROW_BYTES)} AS claim_json FROM resource_protection_paths
@@ -684,7 +773,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		async function* claims(): AsyncGenerator<ResourceClaim> {
 			for (const { source, id } of bootstrapOverlay) {
 				for (const claim of readRaw(source, id))
-					if (matches(targets, await indexed(claim, deadline, signal))) yield claim;
+					for (const row of await indexed(claim, deadline, signal))
+						if (matches(targets, row)) yield row.claim;
 			}
 			const seen = new Set<string>();
 			for (const target of targets)
@@ -706,7 +796,11 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 							const key = `${row.source}\0${row.source_id}\0${row.slot}`;
 							if (!seen.has(key)) {
 								seen.add(key);
-								yield candidateClaim(row);
+								const claim = candidateClaim(row);
+								if (row.slot >= 0 && claim.shadowKey) {
+									for (const projection of await indexed(claim, deadline, signal))
+										if (matches(targets, projection)) yield projection.claim;
+								} else yield claim;
 							}
 						}
 						if (rows.length < PAGE) break;
@@ -729,14 +823,63 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 					WHERE dirty = 1 AND source IN ('narrator', 'chapter', 'registry') AND source_id != '' AND (source, source_id) > (?, ?) ORDER BY source, source_id LIMIT ?`)
 					.all(...cursor, PAGE) as SourceState[];
 				for (const state of states) {
+					if (bootstrapKeys.has(`${state.source}\0${state.source_id}`)) continue;
 					for (const claim of readRaw(state.source, state.source_id))
-						if (matches(targets, await indexed(claim, deadline, signal))) yield claim;
+						for (const row of await indexed(claim, deadline, signal))
+							if (matches(targets, row)) yield row.claim;
 				}
 				if (states.length < PAGE) break;
 				const last = states.at(-1);
 				if (!last) break;
 				cursor = [last.source, last.source_id];
 				await tick();
+			}
+			// Before maintenance upgrades old shadow slots, only physical shadow
+			// deletion needs their missing hash-derived path projection. Checkout
+			// reads and cold births do not depend on unrelated migration history.
+			if (
+				!shadowProjectionComplete &&
+				includeLegacyReceipts &&
+				targets.some((target) => target.path)
+			) {
+				const storage = await bounded(
+					canonicalProtectionPath(dirname(treeSnapshotPhysicalDir("local", "/"))),
+					deadline,
+					signal,
+				);
+				const physicalDeletion = targets.some(
+					(target) =>
+						(target.deviceId ?? "local") === "local" &&
+						target.path &&
+						(localPathSemantics.contains(storage, target.path) ||
+							localPathSemantics.contains(target.path, storage)),
+				);
+				if (physicalDeletion) {
+					let oldCursor: [string, number] = ["", -2];
+					let foundLegacy = false;
+					while (true) {
+						check(deadline, signal);
+						const rows = database
+							.query(`SELECT 'chapter' AS source, source_id, slot, shadow_key IS NOT NULL AS has_shadow
+							FROM resource_protection_paths WHERE source = 'chapter' AND (source_id, slot) > (?, ?)
+							ORDER BY source_id, slot LIMIT ?`)
+							.all(...oldCursor, PAGE) as (PathRow & { has_shadow: number })[];
+						for (const row of rows) {
+							if (!legacyShadowProjection(row)) continue;
+							foundLegacy = true;
+							if (skipCandidate(row) || seen.has(`${row.source}\0${row.source_id}\0${row.slot}`))
+								continue;
+							for (const projection of await indexed(candidateClaim(row), deadline, signal))
+								if (matches(targets, projection)) yield projection.claim;
+						}
+						if (rows.length < PAGE) break;
+						const last = rows.at(-1);
+						if (!last) break;
+						oldCursor = [last.source_id, last.slot];
+						await tick();
+					}
+					if (!foundLegacy) shadowProjectionComplete = true;
+				}
 			}
 			let aliasCursor: [string, string, number] = ["", "", -1];
 			while (true) {
@@ -749,7 +892,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				for (const row of rows) {
 					if (skipCandidate(row)) continue;
 					const claim = candidateClaim(row);
-					if (matches(targets, await indexed(claim, deadline, signal))) yield claim;
+					for (const projection of await indexed(claim, deadline, signal))
+						if (matches(targets, projection)) yield projection.claim;
 				}
 				if (rows.length < PAGE) break;
 				const last = rows.at(-1);

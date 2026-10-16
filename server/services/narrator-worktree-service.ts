@@ -25,6 +25,7 @@ import {
 
 import type {
 	VerifiedWorktreeScope,
+	WorktreeResourceRegistration,
 	WorktreeResourceRegistry,
 } from "./narrator-worktree-resources";
 
@@ -488,6 +489,7 @@ const receiptSchema = z
 		// A claimed receipt can fail validation before resolving either HEAD or branch.
 		expectedHead: z.union([z.literal(""), receiptHead]),
 		branchName: z.string().min(1).max(256).optional(),
+		dispatchState: z.enum(["not_started", "started"]).optional(),
 		commandSucceeded: z.boolean().optional(),
 		result: receiptResultSchema.optional(),
 	})
@@ -505,6 +507,7 @@ function validateReceipt(input: unknown, requestId: string): WorktreeJournalReco
 	// Keep its original typed proposal queryable, but never use it as reconciliation evidence.
 	const validationFailure =
 		record.result?.outcome === "failed" &&
+		record.dispatchState !== "started" &&
 		record.expectedHead === "" &&
 		record.commandSucceeded === undefined &&
 		record.result.error !== undefined &&
@@ -526,7 +529,15 @@ function validateReceipt(input: unknown, requestId: string): WorktreeJournalReco
 					(hasControlCharacters(record.request.baseRef) ||
 						/\s/.test(record.request.baseRef) ||
 						record.request.baseRef.startsWith("-"))))) ||
-		(record.commandSucceeded === true && (!branchName || !record.expectedHead))
+		(record.commandSucceeded === true && (!branchName || !record.expectedHead)) ||
+		(record.dispatchState === "started" && (!branchName || !record.expectedHead)) ||
+		(record.dispatchState === "not_started" &&
+			(record.commandSucceeded !== undefined ||
+				(record.result !== undefined &&
+					(record.result.outcome !== "failed" ||
+						record.result.error === undefined ||
+						record.result.residuals.destinationExists !== null ||
+						record.result.residuals.branchExists !== null))))
 	)
 		error("WORKTREE_RECEIPT_INVALID", "Inconsistent worktree request receipt", 409);
 	const result = record.result;
@@ -1259,6 +1270,16 @@ export class NarratorWorktreeService<Principal> {
 		target: WorktreeTarget,
 		record: WorktreeJournalRecord,
 	): Promise<WorktreeCreateResult> {
+		if (record.dispatchState === "not_started")
+			return {
+				outcome: "failed",
+				worktree: null,
+				residuals: { destinationExists: null, branchExists: null },
+				error: {
+					code: "WORKTREE_NOT_DISPATCHED",
+					message: "Creation stopped before Git dispatch; no creation or cleanup was dispatched",
+				},
+			};
 		// Verification has its own bounded deadline, independent of the disconnected request.
 		const signal = AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS);
 		let destinationExists: boolean | null = null;
@@ -1499,6 +1520,7 @@ export class NarratorWorktreeService<Principal> {
 						deviceId: target.workspace.deviceId,
 						destination: request.destinationPath,
 						expectedHead: "",
+						dispatchState: "not_started",
 					});
 				} catch (cause) {
 					if (
@@ -1560,6 +1582,7 @@ export class NarratorWorktreeService<Principal> {
 					return result;
 				}
 				let dispatched = false;
+				let registeredResource: WorktreeResourceRegistration | undefined;
 				const started = performance.now();
 				let result: WorktreeCreateResult;
 				try {
@@ -1598,25 +1621,35 @@ export class NarratorWorktreeService<Principal> {
 					await this.verifyIdentity(fresh, signal);
 					await this.requireDestination(principal, narratorId, fresh, record.destination, signal);
 					// Durable protection is admitted under the same lock used by storage cleanup.
-					// Failure to register means no Git dispatch; uncertain/failed adds stay protected.
-					await this.ports.resources?.register({
-						ownerNarratorId: narratorId,
-						deviceId: record.deviceId ?? "local",
-						repositoryKey: record.repositoryKey,
-						worktreePath: record.destination,
-						createRequestId: request.requestId,
-						scope: fresh.resourceScope,
-					});
+					// A fresh receipt may reuse historical inventory after receipt loss. Only this
+					// register call's actual INSERT may be retracted before Git dispatch.
+					if (this.ports.resources) {
+						const resource: WorktreeResourceRegistration = {
+							ownerNarratorId: narratorId,
+							deviceId: record.deviceId ?? "local",
+							repositoryKey: record.repositoryKey,
+							worktreePath: record.destination,
+							createRequestId: request.requestId,
+							scope: fresh.resourceScope,
+						};
+						const registration = await this.ports.resources.register(resource);
+						if (registration && registration.inserted === true) registeredResource = resource;
+					}
 					signal.throwIfAborted();
 					const args =
 						request.branch.kind === "new"
 							? ["worktree", "add", "-b", branchName, "--", record.destination, record.expectedHead]
 							: ["worktree", "add", "--", record.destination, branchName];
+					// Crash/lost response after this durable boundary is potentially side-effectful.
+					record.dispatchState = "started";
+					await this.ports.journal.save(narratorId, request.requestId, record);
+					signal.throwIfAborted();
 					dispatched = true;
 					const execution = await this.run(fresh, args, signal, true);
 					record.commandSucceeded = execution.exitCode === 0;
 					result = await this.reconcile(fresh, record);
 				} catch (cause) {
+					if (!dispatched) record.dispatchState = "not_started";
 					result = dispatched
 						? await this.reconcile(target, record)
 						: {
@@ -1631,6 +1664,11 @@ export class NarratorWorktreeService<Principal> {
 											: "Worktree validation failed before Git execution",
 								},
 							};
+				}
+				if (claim.fresh && registeredResource && !dispatched) {
+					await this.ports.resources?.releaseUndispatched?.(registeredResource).catch(() => {
+						logger.warn("Unable to release undispatched worktree registration", { narratorId });
+					});
 				}
 				if (dispatched) {
 					await this.ports.resources

@@ -20,6 +20,7 @@ import {
 	FileWorktreeJournal,
 	type WorktreeJournalRecord,
 	worktreeProposalHash,
+	worktreeReceiptHasResourceEffect,
 } from "./narrator-worktree-journal";
 import {
 	boundWorktreeGitResult,
@@ -1151,7 +1152,20 @@ describe("local worktree list/create fixtures", () => {
 		expect(writes).toBe(0);
 	});
 
-	test("rejects relative/outside/traversal/missing-parent/existing destinations", async () => {
+	test("rejects invalid destinations with durable no-effect receipts and no resource ownership", async () => {
+		const ownershipChanges: string[] = [];
+		ports.resources = {
+			register: async () => {
+				ownershipChanges.push("register");
+				return { inserted: true };
+			},
+			setState: async () => {
+				ownershipChanges.push("setState");
+			},
+			releaseUndispatched: async () => {
+				ownershipChanges.push("releaseUndispatched");
+			},
+		};
 		const exists = join(source, ".worktrees", "already");
 		await mkdir(exists);
 		const paths = [
@@ -1162,14 +1176,16 @@ describe("local worktree list/create fixtures", () => {
 			exists,
 		];
 		for (const [index, destinationPath] of paths.entries()) {
-			const result = await service.create(
-				"actor",
-				"narrator",
-				{ ...proposal(`path-${index}`), destinationPath },
-				signal(),
-			);
+			const request = { ...proposal(`path-${index}`), destinationPath };
+			const result = await service.create("actor", "narrator", request, signal());
 			expect(result.outcome).toBe("failed");
+			const record = await ports.journal.read("narrator", request.requestId);
+			expect(record?.request).toEqual(request);
+			expect(record?.dispatchState).toBe("not_started");
+			expect(worktreeReceiptHasResourceEffect(record)).toBe(false);
 		}
+		expect(ownershipChanges).toEqual([]);
+		expect((await lstat(exists)).isDirectory()).toBe(true);
 		expect(writes).toBe(0);
 	});
 
@@ -1261,6 +1277,21 @@ describe("local worktree list/create fixtures", () => {
 	});
 
 	test("unknown with incomplete evidence is durable; retry only verifies and never re-adds", async () => {
+		const registered: unknown[] = [];
+		const states: string[] = [];
+		let releases = 0;
+		ports.resources = {
+			register: async (resource) => {
+				registered.push(resource);
+				return { inserted: true };
+			},
+			setState: async (_resource, state) => {
+				states.push(state);
+			},
+			releaseUndispatched: async () => {
+				releases++;
+			},
+		};
 		const run = ports.runGit;
 		let dispatched = false;
 		ports.runGit = async (workspace, args, abort, writing) => {
@@ -1277,11 +1308,29 @@ describe("local worktree list/create fixtures", () => {
 		};
 		const request = proposal();
 		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("unknown");
+		const record = await ports.journal.read("narrator", request.requestId);
+		expect(record?.dispatchState).toBe("started");
+		expect(worktreeReceiptHasResourceEffect(record)).toBe(true);
+		expect(record?.result?.outcome).toBe("unknown");
+		expect(registered).toEqual([
+			{
+				ownerNarratorId: "narrator",
+				deviceId: "local",
+				repositoryKey: "repository",
+				worktreePath: request.destinationPath,
+				createRequestId: request.requestId,
+			},
+		]);
+		expect(states).toEqual(["unknown"]);
+		expect(releases).toBe(0);
 		service = new NarratorWorktreeService({
 			...ports,
 			journal: new FileWorktreeJournal(join(temporary, "receipts")),
 		});
 		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("unknown");
+		expect(registered).toHaveLength(1);
+		expect(states).toEqual(["unknown"]);
+		expect(releases).toBe(0);
 		expect(writes).toBe(1);
 	});
 
@@ -1384,14 +1433,16 @@ describe("local worktree list/create fixtures", () => {
 
 	test("lost final receipt write leaves a recoverable pending receipt, never re-adds", async () => {
 		const save = ports.journal.save.bind(ports.journal);
-		let saves = 0;
 		ports.journal.save = async (...args) => {
-			saves++;
-			if (saves === 2) throw new Error("Receipt storage failed after Git succeeded");
+			if (args[2].result) throw new Error("Receipt storage failed after Git succeeded");
 			return save(...args);
 		};
 		const request = proposal();
 		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("created");
+		const pending = await ports.journal.read("narrator", request.requestId);
+		expect(pending?.dispatchState).toBe("started");
+		expect(pending?.result).toBeUndefined();
+		expect(worktreeReceiptHasResourceEffect(pending)).toBe(true);
 		service = new NarratorWorktreeService({
 			...ports,
 			journal: new FileWorktreeJournal(join(temporary, "receipts")),
@@ -1662,6 +1713,197 @@ describe("local worktree list/create fixtures", () => {
 			(await service.create("actor", "narrator", proposal("registry-error", "other"), signal()))
 				.outcome,
 		).toBe("failed");
+		expect(writes).toBe(1);
+	});
+
+	test("claim is not_started, dispatch is durably started, and created/replayed resources stay protected", async () => {
+		const request = proposal();
+		const claim = ports.journal.claim.bind(ports.journal);
+		ports.journal.claim = async (...args) => {
+			const result = await claim(...args);
+			if (result.fresh) {
+				const saved = await ports.journal.read("narrator", request.requestId);
+				expect(saved?.dispatchState).toBe("not_started");
+				expect(worktreeReceiptHasResourceEffect(saved)).toBe(false);
+			}
+			return result;
+		};
+		let registrations = 0;
+		let releases = 0;
+		const states: string[] = [];
+		ports.resources = {
+			register: async () => {
+				registrations++;
+				return { inserted: true };
+			},
+			setState: async (_resource, state) => {
+				states.push(state);
+			},
+			releaseUndispatched: async () => {
+				releases++;
+			},
+		};
+		const run = ports.runGit;
+		ports.runGit = async (...args) => {
+			if (args[3]) {
+				const record = await ports.journal.read("narrator", request.requestId);
+				expect(record?.dispatchState).toBe("started");
+				expect(record?.expectedHead).not.toBe("");
+				expect(record?.result).toBeUndefined();
+				expect(worktreeReceiptHasResourceEffect(record)).toBe(true);
+				expect(registrations).toBe(1);
+				expect(states).toEqual([]);
+				expect(releases).toBe(0);
+			}
+			if (!run) throw new Error("Missing fixture Git port");
+			return run(...args);
+		};
+		const result = await service.create("actor", "narrator", request, signal());
+		expect(result.outcome).toBe("created");
+		let replayProbes = 0;
+		ports.runGit = async () => {
+			replayProbes++;
+			throw new Error("Completed request replay must not invoke Git");
+		};
+		expect(await service.create("actor", "narrator", request, signal())).toEqual(result);
+		expect(
+			worktreeReceiptHasResourceEffect(await ports.journal.read("narrator", request.requestId)),
+		).toBe(true);
+		expect(registrations).toBe(1);
+		expect(states).toEqual(["ready"]);
+		expect(replayProbes).toBe(0);
+		expect(releases).toBe(0);
+		expect(writes).toBe(1);
+	});
+
+	for (const failure of ["cancelled", "dispatch-save"] as const) {
+		test(`successful registration followed by ${failure} retracts only this fresh undispatched claim`, async () => {
+			const request = proposal();
+			const controller = new AbortController();
+			const sentinel = join(request.destinationPath, "unrelated.txt");
+			target.resourceScope = {
+				scopeKind: "standalone",
+				scopeProjectId: null,
+				scopeOwnerUserId: "resource-owner",
+			};
+			let registrations = 0;
+			let releases = 0;
+			let registered: unknown;
+			let released: unknown;
+			const states: string[] = [];
+			ports.resources = {
+				register: async (resource) => {
+					registrations++;
+					registered = resource;
+					await mkdir(request.destinationPath);
+					await writeFile(sentinel, "Keep concurrent filesystem changes\n");
+					if (failure === "cancelled") controller.abort();
+					return { inserted: true };
+				},
+				setState: async (_resource, state) => {
+					states.push(state);
+				},
+				releaseUndispatched: async (resource) => {
+					releases++;
+					released = resource;
+				},
+			};
+			const save = ports.journal.save.bind(ports.journal);
+			ports.journal.save = async (...args) => {
+				if (failure === "dispatch-save" && args[2].dispatchState === "started") {
+					// Even an error after publishing started is known not to have dispatched Git here.
+					await save(...args);
+					throw new Error("Started receipt durability failed");
+				}
+				return save(...args);
+			};
+			const failed = await service.create("actor", "narrator", request, controller.signal);
+			expect(failed.outcome).toBe("failed");
+			const record = await ports.journal.read("narrator", request.requestId);
+			expect(record?.expectedHead).not.toBe("");
+			expect(record?.dispatchState).toBe("not_started");
+			expect(record?.request).toEqual(request);
+			expect(worktreeReceiptHasResourceEffect(record)).toBe(false);
+			expect(record?.result).toEqual(failed);
+			expect(released).toEqual(registered);
+			expect(released).toEqual({
+				ownerNarratorId: "narrator",
+				deviceId: "local",
+				repositoryKey: "repository",
+				createRequestId: request.requestId,
+				worktreePath: request.destinationPath,
+				scope: target.resourceScope,
+			});
+			expect(states).toEqual([]);
+			expect(await readFile(sentinel, "utf8")).toBe("Keep concurrent filesystem changes\n");
+			let replayProbes = 0;
+			ports.runGit = async () => {
+				replayProbes++;
+				throw new Error("Terminal undispatched replay must not invoke Git");
+			};
+			expect(await service.create("actor", "narrator", request, signal())).toEqual(failed);
+			expect(registrations).toBe(1);
+			expect(releases).toBe(1);
+			expect(replayProbes).toBe(0);
+			expect(writes).toBe(0);
+		});
+	}
+
+	for (const registration of [undefined, { inserted: false }] as const) {
+		test(`${registration ? "reused" : "void"} registration never authorizes releasing historical or unknown ownership`, async () => {
+			const controller = new AbortController();
+			let releases = 0;
+			ports.resources = {
+				register: async () => {
+					controller.abort();
+					return registration;
+				},
+				setState: async () => {},
+				releaseUndispatched: async () => {
+					releases++;
+				},
+			};
+			expect(
+				(await service.create("actor", "narrator", proposal(), controller.signal)).outcome,
+			).toBe("failed");
+			expect(releases).toBe(0);
+			expect(writes).toBe(0);
+		});
+	}
+
+	test("registration conflicts and dispatched unknown results never release registry protection", async () => {
+		let releases = 0;
+		ports.resources = {
+			register: async () => {
+				throw new Error("Another owner already registered this path");
+			},
+			setState: async () => {},
+			releaseUndispatched: async () => {
+				releases++;
+			},
+		};
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"failed",
+		);
+		expect(releases).toBe(0);
+		expect(writes).toBe(0);
+		ports.resources.register = async () => ({ inserted: true });
+		const run = ports.runGit;
+		let dispatched = false;
+		ports.runGit = async (...args) => {
+			if (args[3]) {
+				dispatched = true;
+				writes++;
+				throw new Error("Dispatch outcome unknown");
+			}
+			if (dispatched) throw new Error("Verification unavailable");
+			if (!run) throw new Error("Missing fixture Git port");
+			return run(...args);
+		};
+		const request = proposal("unknown-resource", "other-feature");
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("unknown");
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("unknown");
+		expect(releases).toBe(0);
 		expect(writes).toBe(1);
 	});
 
@@ -2218,6 +2460,172 @@ describe("local worktree list/create fixtures", () => {
 	});
 });
 
+describe("v2 journal compatibility", () => {
+	test("legacy fallback replays without writes and v2 saves never rewrite the legacy receipt", async () => {
+		const request = proposal("legacy-validation", "-invalid");
+		const failed = await service.create("actor", "narrator", request, signal());
+		expect(failed.outcome).toBe("failed");
+		const legacy = ports.journal;
+		const record = await legacy.read("narrator", request.requestId);
+		if (!record) throw new Error("Missing legacy fixture receipt");
+		const key = createHash("sha256")
+			.update(JSON.stringify(["narrator", request.requestId]))
+			.digest("hex");
+		const legacyPath = join(temporary, "receipts", `${key}.json`);
+		const legacyBytes = await readFile(legacyPath, "utf8");
+		const directory = join(temporary, "receipts-v2");
+		const journal = new FileWorktreeJournal(directory, join(temporary, "receipts"));
+		ports.journal = journal;
+		let probes = 0;
+		ports.runGit = async () => {
+			probes++;
+			throw new Error("Legacy terminal replay must not invoke Git");
+		};
+		expect(await journal.read("narrator", request.requestId)).toEqual(record);
+		expect(await service.create("actor", "narrator", request, signal())).toEqual(failed);
+		await expect(
+			service.create(
+				"actor",
+				"narrator",
+				{ ...request, branch: { kind: "new", name: "different" } },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_REQUEST_CONFLICT" });
+		await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+		const updated = {
+			...record,
+			result: { ...failed, error: { code: "NEW_RESULT", message: "v2" } },
+		};
+		await journal.save("narrator", request.requestId, updated);
+		expect(await journal.read("narrator", request.requestId)).toEqual(updated);
+		expect(await readFile(legacyPath, "utf8")).toBe(legacyBytes);
+		expect(await legacy.read("narrator", request.requestId)).toEqual(record);
+		expect(probes).toBe(0);
+		expect(writes).toBe(0);
+	});
+
+	test("claim and save preencode oversized records before creating directories or receipt files", async () => {
+		const request = proposal();
+		const record: WorktreeJournalRecord = {
+			proposalHash: worktreeProposalHash(request),
+			request,
+			repositoryKey: "repository",
+			actorKey: "a".repeat(32 * 1024),
+			deviceId: "local",
+			destination: request.destinationPath,
+			expectedHead: "",
+			dispatchState: "not_started",
+		};
+		for (const operation of ["claim", "save"] as const) {
+			const directory = join(temporary, `oversized-${operation}`);
+			const journal = new FileWorktreeJournal(directory);
+			await expect(journal[operation]("narrator", request.requestId, record)).rejects.toThrow(
+				"byte budget",
+			);
+			await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	});
+});
+
+describe("receipt resource-effect evidence", () => {
+	test("only explicit non-dispatch and strict terminal legacy validation failures have no resource effect", () => {
+		const failed = {
+			expectedHead: "",
+			result: {
+				outcome: "failed",
+				worktree: null,
+				residuals: { destinationExists: null, branchExists: null },
+				error: { code: "WORKTREE_VALIDATION_FAILED", message: "Rejected before Git" },
+			},
+		};
+		for (const record of [
+			failed,
+			{ ...failed, destination: "relative-rejected-path" },
+			{ ...failed, dispatchState: "not_started", expectedHead: "a".repeat(40) },
+			{ dispatchState: "not_started", expectedHead: "", result: undefined },
+		])
+			expect(worktreeReceiptHasResourceEffect(record)).toBe(false);
+		for (const record of [
+			null,
+			[],
+			{},
+			{ expectedHead: "" },
+			{ ...failed, expectedHead: "a".repeat(40) },
+			{ ...failed, commandSucceeded: false },
+			{ ...failed, commandSucceeded: true },
+			{ ...failed, dispatchState: "started" },
+			{ ...failed, dispatchState: "invalid" },
+			{ ...failed, result: { ...failed.result, error: undefined } },
+			{ ...failed, result: { ...failed.result, worktree: {} } },
+			{
+				...failed,
+				result: { ...failed.result, residuals: { destinationExists: false, branchExists: null } },
+			},
+			...["unknown", "created"].flatMap((outcome) => [
+				{ ...failed, result: { ...failed.result, outcome } },
+				{ ...failed, dispatchState: "not_started", result: { ...failed.result, outcome } },
+			]),
+		])
+			expect(worktreeReceiptHasResourceEffect(record)).toBe(true);
+	});
+
+	test("legacy rejected relative receipts are no-effect, unlike pending/failed/unknown dispatch evidence", async () => {
+		const request = { ...proposal("rejected-relative"), destinationPath: "relative" };
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("failed");
+		const failed = await ports.journal.read("narrator", request.requestId);
+		if (!failed) throw new Error("Missing real failed receipt");
+		delete failed.dispatchState;
+		await ports.journal.save("narrator", request.requestId, failed);
+		expect(
+			worktreeReceiptHasResourceEffect(await ports.journal.read("narrator", request.requestId)),
+		).toBe(false);
+		for (const kind of ["pending", "failed", "unknown"] as const) {
+			const proposalRequest = proposal(`legacy-${kind}`);
+			await ports.journal.claim("narrator", proposalRequest.requestId, {
+				proposalHash: worktreeProposalHash(proposalRequest),
+				request: proposalRequest,
+				repositoryKey: "repository",
+				actorKey: "actor",
+				deviceId: "local",
+				destination: proposalRequest.destinationPath,
+				expectedHead: "a".repeat(40),
+				...(kind === "pending"
+					? {}
+					: {
+							result: {
+								outcome: kind,
+								worktree: null,
+								residuals: { destinationExists: null, branchExists: null },
+								error: { code: "WORKTREE_OUTCOME_UNKNOWN", message: "Possible effects" },
+							},
+						}),
+			});
+			const saved = await ports.journal.read("narrator", proposalRequest.requestId);
+			expect(saved?.destination).toBe(proposalRequest.destinationPath);
+			expect(worktreeReceiptHasResourceEffect(saved)).toBe(true);
+		}
+		await expect(service.create("actor", "narrator", request, signal())).rejects.toMatchObject({
+			code: "WORKTREE_RECOVERY_DENIED",
+		});
+		expect(writes).toBe(0);
+	});
+
+	test("even no-effect receipts cannot bypass the per-file byte budget", async () => {
+		const directory = join(temporary, "oversized-receipts");
+		await mkdir(directory);
+		const journal = new FileWorktreeJournal(directory);
+		const request = proposal();
+		const key = createHash("sha256")
+			.update(JSON.stringify(["narrator", request.requestId]))
+			.digest("hex");
+		await writeFile(
+			join(directory, `${key}.json`),
+			JSON.stringify({ dispatchState: "not_started", padding: " ".repeat(32 * 1024) }),
+		);
+		await expect(journal.read("narrator", request.requestId)).rejects.toThrow("byte budget");
+	});
+});
+
 describe("read-only worktree operation lookup", () => {
 	const operationId = `wt1_${"a".repeat(64)}`;
 	const query = (actor = "actor", id = operationId) =>
@@ -2394,6 +2802,8 @@ describe("read-only worktree operation lookup", () => {
 		const record = await ports.journal.read("narrator", operationId);
 		if (!record?.result) throw new Error("Missing failed fixture receipt");
 		const corruptions = [
+			{ ...record, dispatchState: "started" },
+			{ ...record, dispatchState: "invalid" },
 			{ ...record, result: { ...record.result, outcome: "unknown" } },
 			{ ...record, result: { ...record.result, outcome: "created" } },
 			{ ...record, result: undefined },
@@ -2448,6 +2858,27 @@ describe("read-only worktree operation lookup", () => {
 		expect((await query()).outcome).toBe("unknown");
 		expect((await query()).outcome).toBe("unknown");
 		expect(await readFile(receiptPath(), "utf8")).toBe(before);
+		expect(writes).toBe(0);
+	});
+
+	test("not_started pending recovery never probes Git or adopts another creation", async () => {
+		const record = await seed();
+		record.dispatchState = "not_started";
+		await ports.journal.save("narrator", operationId, record);
+		const before = await readFile(receiptPath(), "utf8");
+		let probes = 0;
+		ports.runGit = async () => {
+			probes++;
+			throw new Error("Known undispatched operation must not reconcile unrelated resources");
+		};
+		forbidWrites();
+		expect(await query()).toMatchObject({
+			outcome: "failed",
+			error: { code: "WORKTREE_NOT_DISPATCHED" },
+		});
+		expect(worktreeReceiptHasResourceEffect(record)).toBe(false);
+		expect(await readFile(receiptPath(), "utf8")).toBe(before);
+		expect(probes).toBe(0);
 		expect(writes).toBe(0);
 	});
 
@@ -2555,6 +2986,29 @@ describe("read-only worktree operation lookup", () => {
 			await writeFile(receiptPath(), content);
 			await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_UNAVAILABLE" });
 		}
+		expect(writes).toBe(0);
+	});
+
+	test("non-object receipts preserve WORKTREE_RECEIPT_INVALID across create, lookup and reconciliation", async () => {
+		const record = await seed();
+		let probes = 0;
+		ports.runGit = async () => {
+			probes++;
+			throw new Error("Invalid receipts must not invoke Git");
+		};
+		for (const invalid of [null, false, 0, "invalid", []]) {
+			const bytes = JSON.stringify(invalid);
+			await writeFile(receiptPath(), bytes);
+			await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+			await expect(
+				service.reconcileRequest("actor", "narrator", record.request, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+			await expect(
+				service.create("actor", "narrator", record.request, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+			expect(await readFile(receiptPath(), "utf8")).toBe(bytes);
+		}
+		expect(probes).toBe(0);
 		expect(writes).toBe(0);
 	});
 
