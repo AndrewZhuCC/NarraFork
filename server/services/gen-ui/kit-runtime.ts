@@ -8,6 +8,7 @@ import {
 	type GenUiKitStatus,
 } from "@shared/gen-ui-kit";
 import {
+	collectUiState,
 	findUnknownUiTags,
 	isUiIntrinsicTag,
 	parseUiMarkup,
@@ -217,15 +218,22 @@ async function render(
 		};
 	}
 	const prompt = await suggest(env, snapshot);
+	const state = collectUiState(parsed.nodes);
+	const unbound = state.read.filter((name) => !state.bound.includes(name)).slice(0, 8);
 	const problems = parsed.diagnostics
 		.slice(0, 8)
 		.map((item) => `- ${item.message} (offset ${item.offset})`);
 	return {
 		output: [
-			`Rendered inline with the ${project ? "project's" : "built-in Mantine"} component kit (${parsed.elements} elements). The user sees it in the chat now. Values they type or pick stay in the card; only a sendPrompt click reaches you.`,
+			`Rendered inline with the ${project ? "project's" : "built-in Mantine"} component kit (${parsed.elements} elements). The user sees it in the chat now. Values they type or pick stay in the card until they click a sendPrompt or submit control.`,
 			...(unknown.length
 				? [
 						`These tags do not exist and were drawn as dashed placeholders; the rest of the UI rendered. Fix them and render again:\n${unknownTagLines(unknown, available)}`,
+					]
+				: []),
+			...(unbound.length
+				? [
+						`Nothing binds ${unbound.map((name) => `$${name}`).join(", ")}, so it shows nothing: add bind="${unbound[0]}" to the control that should hold it.`,
 					]
 				: []),
 			...(problems.length ? [`Parts of the markup were ignored:\n${problems.join("\n")}`] : []),

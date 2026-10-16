@@ -186,8 +186,10 @@ export function InlineRender({
 				setLink(url);
 				return;
 			}
+			// submit() arrives as the text the frame composed from the bound fields: to the
+			// chat it is the same as a sendPrompt the reader triggered.
 			const text = data.value.trim();
-			if (data.action !== "sendPrompt" || !text) return;
+			if ((data.action !== "sendPrompt" && data.action !== "submit") || !text) return;
 			// The frame's gesture check guards markup, but a project kit's own code runs
 			// in that frame and can post this message itself: the reader confirms it.
 			if (current.kit) {

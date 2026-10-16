@@ -217,7 +217,7 @@ describe("UI markup parser", () => {
 			const collect = (nodes: UiNode[]) => {
 				for (const node of nodes) {
 					if (node.$node === "text") text += node.text;
-					else collect(node.children);
+					else if (node.$node === "el") collect(node.children);
 				}
 			};
 			collect(partial.nodes);
@@ -367,4 +367,63 @@ describe("UI markup parser", () => {
 		}
 		expect(cases).toBeGreaterThan(20_000);
 	}, 60_000);
+});
+
+describe("named state", () => {
+	test("bind names a control's state; $name reads it in attributes, literals and children", () => {
+		const result = parseUiMarkup(
+			'<Stack><Slider bind="radius" defaultValue={12} /><Card radius={$radius} style={{ borderRadius: $radius }}>r = {$radius}px</Card></Stack>',
+		);
+		expect(result.diagnostics).toEqual([]);
+		const [slider, card] = el(result.nodes[0]).children.map(el);
+		expect(slider?.props).toEqual({ bind: "radius", defaultValue: 12 });
+		expect(card?.props).toEqual({
+			radius: { $ref: "radius" },
+			style: { borderRadius: { $ref: "radius" } },
+		});
+		expect(card?.children).toEqual([
+			{ $node: "text", text: "r = " },
+			{ $node: "ref", name: "radius" },
+			{ $node: "text", text: "px" },
+		]);
+	});
+
+	test("submit() takes an optional message; sendPrompt keeps {name} for the frame to fill", () => {
+		const result = parseUiMarkup(
+			'<><Button onClick={submit()} /><Button onClick={() => submit("Apply")} /><Button onClick={sendPrompt("Use {radius}px")} /></>',
+		);
+		expect(result.diagnostics).toEqual([]);
+		expect(el(result.nodes[0]).children.map((node) => el(node).props.onClick)).toEqual([
+			{ $action: "submit", value: "" },
+			{ $action: "submit", value: "Apply" },
+			{ $action: "sendPrompt", value: "Use {radius}px" },
+		]);
+	});
+
+	test("state can be read, never run, and only bind may name it", () => {
+		const result = parseUiMarkup(
+			'<Stack><Button onClick={$go} /><Box data={{ $ref: "x" }} /><TextInput bind="bad name" /><TextInput bind={$x} /><Text>{$1}</Text><Box submit={submit()} /></Stack>',
+		);
+		const [button, box, bad, refBind, text, misplaced] = el(result.nodes[0]).children.map(el);
+		expect(button?.props).toEqual({});
+		expect(box?.props).toEqual({ data: {} });
+		expect(bad?.props).toEqual({});
+		expect(refBind?.props).toEqual({});
+		expect(text?.children).toEqual([]);
+		expect(misplaced?.props).toEqual({});
+		expect(result.diagnostics.map((item) => item.message).join("\n")).toContain(
+			"bind takes a name",
+		);
+	});
+
+	test("a reference still arriving is held back, not misread", () => {
+		const source = "<Text>{$radius}</Text>";
+		for (let length = 0; length <= source.length; length++) {
+			const partial = parseUiMarkup(source.slice(0, length), { complete: false });
+			for (const node of partial.nodes)
+				if (node.$node === "el")
+					for (const child of node.children)
+						if (child.$node === "ref") expect(child.name).toBe("radius");
+		}
+	});
 });

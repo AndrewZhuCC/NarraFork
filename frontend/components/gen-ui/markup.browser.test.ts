@@ -22,10 +22,14 @@ const HOST = `<!doctype html><html><body style="margin:0">
 <iframe id="ui" sandbox="allow-scripts" style="width:900px;height:640px;border:0"></iframe>
 <script>
 	window.actions = [];
+	window.fields = [];
 	window.ready = false;
 	addEventListener("message", (event) => {
 		if (event.data?.type === "narrafork:ui-ready") window.ready = true;
-		if (event.data?.type === "narrafork:ui-action") window.actions.push([event.data.action, event.data.value]);
+		if (event.data?.type === "narrafork:ui-action") {
+			window.actions.push([event.data.action, event.data.value]);
+			if (event.data.fields) window.fields.push(event.data.fields);
+		}
 	});
 </script></body></html>`;
 
@@ -225,6 +229,61 @@ browserTest(
 		]);
 		// The link was handed to the host; the frame itself went nowhere.
 		expect(await frame.$("#tail")).not.toBeNull();
+		await page.close();
+	},
+	90_000,
+);
+
+browserTest(
+	"bound controls drive the rest of the UI and their values reach the host",
+	async () => {
+		const { page, frame } = await open(await builtinRuntime(), false);
+		const markup = `<Stack gap="sm">
+	<TextInput id="name" label="Name" bind="name" defaultValue="Ada" />
+	<Checkbox id="agree" label="Agree" bind="agree" />
+	<SegmentedControl bind="size" data={["S", "M", "L"]} defaultValue="M" />
+	<div id="box" title={$name}>Hello {$name}</div>
+	<Text id="size">size {$size}</Text>
+	<Text id="state">agreed: {$agree}</Text>
+	<Button id="ask" onClick={sendPrompt("Greet {name}, unknown {other}")}>Ask</Button>
+	<Button id="send" onClick={submit("Here are my answers")}>Send</Button>
+</Stack>`;
+		// Streamed: the control appears first, and keeps what is typed while the rest arrives.
+		await post(page, markup.slice(0, markup.indexOf("<Checkbox")), false);
+		await frame.waitForSelector("#name");
+		expect(await frame.$eval("#name", (node) => (node as HTMLInputElement).value)).toBe("Ada");
+		await frame.type("#name", " L");
+		await post(page, markup, true);
+		await frame.waitForSelector("#send");
+		expect(await frame.$eval("#box", (node) => node.textContent)).toBe("Hello Ada L");
+		expect(await frame.$eval("#box", (node) => node.getAttribute("title"))).toBe("Ada L");
+		expect(await frame.$eval("#state", (node) => node.textContent)).toBe("agreed: false");
+		await frame.click("#agree");
+		await frame.waitForFunction(
+			() => document.getElementById("state")?.textContent === "agreed: true",
+		);
+		// A control that reports the value itself rather than an event.
+		expect(await frame.$eval("#size", (node) => node.textContent)).toBe("size M");
+		await frame.evaluate(() => {
+			for (const label of document.querySelectorAll("label"))
+				if (label.textContent === "L") label.click();
+		});
+		await frame.waitForFunction(() => document.getElementById("size")?.textContent === "size L");
+		await frame.click("#ask");
+		await page.waitForFunction(
+			() => (window as unknown as { actions: unknown[] }).actions.length >= 1,
+		);
+		await frame.click("#send");
+		await page.waitForFunction(
+			() => (window as unknown as { actions: unknown[] }).actions.length >= 2,
+		);
+		expect(await actions(page)).toEqual([
+			["sendPrompt", "Greet Ada L, unknown {other}"],
+			["submit", "Here are my answers\nname: Ada L\nagree: true\nsize: L"],
+		]);
+		expect(await page.evaluate(() => (window as unknown as { fields: unknown[] }).fields)).toEqual([
+			{ name: "Ada L", agree: true, size: "L" },
+		]);
 		await page.close();
 	},
 	90_000,

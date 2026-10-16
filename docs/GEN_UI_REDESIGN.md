@@ -1,6 +1,6 @@
 # gen_ui 重设计：问题分析与方案草案
 
-> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1 步（改名）、第 2 步（描述与报错）已实施，其余待定。
+> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1 步（改名）、第 2 步（描述与报错）、第 3 步（markup 状态绑定）已实施，其余待定。
 > 材料：一次真实会话导出（deepseek-v4.1-flash 使用 IntelligentUI 的全过程）+ main 上的现有实现。
 
 ## 0. 现状速览
@@ -63,8 +63,8 @@
 
 ```jsx
 <Stack>
-  <Slider name="radius" defaultValue={12} min={0} max={64} />
-  <TextInput name="label" defaultValue="卡片" />
+  <Slider bind="radius" defaultValue={12} min={0} max={64} />
+  <TextInput bind="label" defaultValue="卡片" />
   <Card radius={$radius} withBorder>
     <Text>{$label}：border-radius = {$radius}px</Text>
   </Card>
@@ -72,13 +72,15 @@
 </Stack>
 ```
 
-- **`name="x"`**：带 `name` 的输入控件自动变成受控组件，值存进帧内一个 `form` 状态表（帧内渲染器负责给它接上 `value` + `onChange`，模型不写 handler）。
+- **`bind="x"`**（实现时由 `name` 改为 `bind`：Mantine 的 Avatar、Radio 等本身就有 `name` 属性，会冲突）：带 `bind` 的输入控件自动变成受控组件，值存进帧内一个 `form` 状态表（帧内渲染器负责给它接上 `value` + `onChange`，模型不写 handler）。
 - **`$x` 引用**：属性值或文本里出现 `$x` 即读状态表；只允许**裸标识符**（可选一层成员 `$x.y`），不支持运算、调用。解析器把它解析成 `{ $ref: "x" }` 节点，帧内查表替换。仍然是数据，无 eval。
 - **动作可携带值**：
   - `sendPrompt("把圆角设为 {radius}px")`：字符串里的 `{name}` 在点击时按状态表插值；
   - `submit()`：把全部命名字段打包回传（见 2.3）。
 
 这样「拖滑条改圆角」这类联动可以用 `render` 直接做，**同时满足流式 + 动态 + 行内**。表达能力故意有限（无条件、无循环），够做表单、调参、预览类 UI；需要真逻辑的才走 App。
+
+已实施（第 3 步）：`bind` / `$x`（属性、style 字面量、子节点）/ `sendPrompt` 中 `{x}` 插值 / `submit("可选消息")`。`submit` 以“消息 + 每行 `name: value`”作为用户消息发出，同时把结构化 `fields` 交给宿主（第 4 步阻塞表单会用它作为工具结果）。读了却没有任何控件 bind 的 `$x`，渲染结果会提示模型补上。
 
 可选增强（第二步再定）：`showIf={$advanced}` 布尔显隐、`$x` 对 `Select`/`Checkbox` 的类型约定、`defaultValue` 缺省时的初始值规则。
 

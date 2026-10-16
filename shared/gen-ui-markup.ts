@@ -2,7 +2,10 @@
  * UI markup: the JSX subset a model streams to compose kit components inline.
  *
  * It is DATA, not code. Tags name kit components (or a few HTML elements), attributes
- * are literals, and the only behaviour is two host actions. Nothing here is evaluated,
+ * are literals, and the only behaviour is three host actions plus named state: a control
+ * with `bind="x"` keeps its value under `x`, and `$x` reads it anywhere else (an attribute,
+ * a child, `{x}` in a sendPrompt text, or the fields `submit()` sends). Nothing here is
+ * evaluated,
  * which is what lets a half-received document render safely on every chunk: the parser
  * keeps every element whose opening tag has fully arrived, closes what is still open,
  * and drops the unfinished tail.
@@ -21,14 +24,29 @@ export interface UiText {
 	$node: "text";
 	text: string;
 }
-export type UiNode = UiElement | UiText;
-export const UI_ACTIONS = ["sendPrompt", "openLink"] as const;
+/** `{$x}` as a child: the current value of the state a `bind="x"` control keeps. */
+export interface UiRefNode {
+	$node: "ref";
+	name: string;
+}
+export type UiNode = UiElement | UiText | UiRefNode;
+export const UI_ACTIONS = ["sendPrompt", "openLink", "submit"] as const;
 export type UiActionName = (typeof UI_ACTIONS)[number];
-/** A click handler the host owns: send a chat message, or open a link after confirmation. */
+/**
+ * A click handler the host owns: send a chat message (`{x}` in its text is filled from
+ * state at click time), open a link after confirmation, or submit every bound field with
+ * an optional message.
+ */
 export interface UiAction {
 	$action: UiActionName;
 	value: string;
 }
+/** `$x` as a value: the current value of the state a `bind="x"` control keeps. */
+export interface UiRef {
+	$ref: string;
+}
+/** Names `bind` may give a piece of state, and `$name` may read. */
+export const UI_STATE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 export type UiValue =
 	| string
 	| number
@@ -37,7 +55,8 @@ export type UiValue =
 	| UiValue[]
 	| { [key: string]: UiValue }
 	| UiElement
-	| UiAction;
+	| UiAction
+	| UiRef;
 
 export interface UiDiagnostic {
 	message: string;
@@ -84,7 +103,7 @@ const FORBIDDEN = new Set(UI_FORBIDDEN_PROPS);
 /** Attributes React owns; not something markup sets. */
 const REACT_OWNED = new Set(["ref", "key"]);
 /** Marks of parser-made nodes and actions; a literal carrying one would pose as markup. */
-const RESERVED_KEYS = new Set(["$node", "$action"]);
+const RESERVED_KEYS = new Set(["$node", "$action", "$ref"]);
 /**
  * The only places a host action may sit: handlers a reader triggers with a gesture.
  * Anything that fires on its own (onLoad, onError, a ref, an animation) could otherwise
@@ -100,7 +119,7 @@ export const UI_ACTION_PROPS: readonly string[] = [
 	"onConfirm",
 ];
 const ACTION_PROPS = new Set(UI_ACTION_PROPS);
-const ACTION_PLACEMENT = `sendPrompt() and openLink() can only be the value of ${UI_ACTION_PROPS.join(", ")}`;
+const ACTION_PLACEMENT = `sendPrompt(), openLink() and submit() can only be the value of ${UI_ACTION_PROPS.join(", ")}`;
 /**
  * Props through which a component renders as another tag. They may only name HTML the
  * markup could have written directly: `component="meta"` is a tag by another route.
@@ -294,6 +313,10 @@ class Parser {
 			into.push(value as UiElement);
 			return;
 		}
+		if (isRef(value)) {
+			into.push({ $node: "ref", name: value.$ref });
+			return;
+		}
 		this.report("Objects cannot be rendered as children", offset);
 	}
 
@@ -461,6 +484,16 @@ class Parser {
 			this.s.slice(this.i, this.i + 80),
 		);
 		if (arrow) return this.parseHandler(start, arrow[0].length);
+		if (char === "$") {
+			const ref = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(this.s.slice(this.i, this.i + 80));
+			// The name at the very end of the stream may still be growing.
+			if (ref && this.i + ref[0].length >= this.s.length) throw INCOMPLETE;
+			if (ref && UI_STATE_NAME.test(ref[1] as string)) {
+				this.i += ref[0].length;
+				return { $ref: ref[1] as string };
+			}
+			return this.unsupported(start, "$name must name state that a bind= control keeps");
+		}
 		if (char === "(") {
 			this.i++;
 			const inner = this.parseValue();
@@ -492,6 +525,14 @@ class Parser {
 			while (next < this.s.length && /\s/.test(this.s[next] as string)) next++;
 			if (this.s[next] === "(" && (UI_ACTIONS as readonly string[]).includes(word[0])) {
 				this.i = next + 1;
+				if (word[0] === "submit") {
+					this.skipSpace();
+					if (this.eof()) throw INCOMPLETE;
+					if (this.s[this.i] === ")") {
+						this.i++;
+						return { $action: "submit", value: "" };
+					}
+				}
 				const argument = this.parseValue();
 				this.skipSpace();
 				if (this.eof()) throw INCOMPLETE;
@@ -519,7 +560,7 @@ class Parser {
 	}
 
 	private parseHandler(start: number, prefix: number): Parsed {
-		const message = "Handlers may only call sendPrompt() or openLink()";
+		const message = "Handlers may only call sendPrompt(), openLink() or submit()";
 		this.i = start + prefix;
 		this.skipSpace();
 		if (this.eof()) throw INCOMPLETE;
@@ -553,7 +594,7 @@ class Parser {
 
 	private unsupported(
 		start: number,
-		message = "Only literals, JSX, sendPrompt() and openLink() are supported",
+		message = "Only literals, JSX, $state, sendPrompt(), openLink() and submit() are supported",
 	): typeof OMIT {
 		this.i = start;
 		this.report(message, start);
@@ -707,12 +748,31 @@ class Parser {
 			this.report(ACTION_PLACEMENT, offset);
 			return OMIT;
 		}
+		if (isRef(value) && ACTION_PROPS.has(name)) {
+			this.report(ACTION_PLACEMENT, offset);
+			return OMIT;
+		}
+		if (name === "bind" && !(typeof value === "string" && UI_STATE_NAME.test(value))) {
+			this.report('bind takes a name such as bind="radius"', offset);
+			return OMIT;
+		}
 		if (TAG_PROPS.has(name) && !(typeof value === "string" && isUiIntrinsicTag(value))) {
 			this.report(`"${name}" may only name a permitted HTML tag`, offset);
 			return OMIT;
 		}
 		return value;
 	}
+}
+
+function isRef(value: Parsed): value is UiRef {
+	return (
+		value !== OMIT &&
+		value !== null &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		"$ref" in value &&
+		typeof value.$ref === "string"
+	);
 }
 
 function isAction(value: Parsed): value is UiAction {
@@ -807,7 +867,7 @@ function visitValue(value: UiValue, visit: (element: UiElement) => void): void {
 		for (const item of value) visitValue(item, visit);
 	} else if (isElement(value)) {
 		visitElements([value], visit);
-	} else if (value && typeof value === "object" && !("$action" in value)) {
+	} else if (value && typeof value === "object" && !("$action" in value) && !("$ref" in value)) {
 		for (const item of Object.values(value)) visitValue(item, visit);
 	}
 }
@@ -847,4 +907,34 @@ export function findUnknownUiTags(
 		if (/^[a-z]/.test(element.name) || !isComponent(root)) unknown.add(element.name);
 	});
 	return [...unknown];
+}
+
+/** State the markup binds (`bind="x"`) and reads (`$x`), each name once, in order of use. */
+export function collectUiState(nodes: UiNode[]): { bound: string[]; read: string[] } {
+	const bound = new Set<string>();
+	const read = new Set<string>();
+	const readValue = (value: UiValue): void => {
+		if (Array.isArray(value)) for (const item of value) readValue(item);
+		else if (value && typeof value === "object") {
+			if ("$ref" in value && typeof value.$ref === "string") read.add(value.$ref);
+			else if (!("$node" in value) && !("$action" in value))
+				for (const item of Object.values(value)) readValue(item);
+		}
+	};
+	const walk = (list: UiNode[]): void => {
+		for (const node of list) {
+			if (node.$node === "ref") read.add(node.name);
+			if (node.$node !== "el") continue;
+			const bind = node.props.bind;
+			if (typeof bind === "string") bound.add(bind);
+			for (const value of Object.values(node.props)) {
+				if (value && typeof value === "object" && (value as UiElement).$node === "el")
+					walk([value as UiElement]);
+				else readValue(value);
+			}
+			walk(node.children);
+		}
+	};
+	walk(nodes);
+	return { bound: [...bound], read: [...read] };
 }

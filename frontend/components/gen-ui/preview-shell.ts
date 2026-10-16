@@ -54,7 +54,7 @@ const KIT_CSP =
 /**
  * The host fetches the runtime without credentials. The opaque frame has no host DOM
  * access or token; its only channel to the host is `postMessage`, carrying theme updates
- * in and (in markup mode) element trees in and two declared actions out. JS/CSS are JSON
+ * in and (in markup mode) element trees in and three declared actions out. JS/CSS are JSON
  * data, never interpolated into raw script/style HTML.
  */
 export function createPreviewShell(
@@ -184,9 +184,37 @@ export function createPreviewShell(
     let lastGesture = -Infinity;
     for (const type of ["pointerdown", "keydown", "click"])
       document.addEventListener(type, event => { if (event.isTrusted) lastGesture = performance.now(); }, true);
-    const act = (action, value) => {
+    const act = (action, value, fields) => {
       if (performance.now() - lastGesture > 1000) return;
-      parent.postMessage({type: "narrafork:ui-action", action, value: String(value).slice(0, 4000)}, "*");
+      parent.postMessage({type: "narrafork:ui-action", action, value: String(value).slice(0, 4000), ...(fields ? {fields} : {})}, "*");
+    };
+    // Named state: what a bind="x" control holds, read by $x and by the actions. It lives
+    // for the frame, so a newer tree posted while the UI streams keeps what was typed.
+    const stateName = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+    const state = new Map();
+    const touched = new Set();
+    let rerender = () => {};
+    const shown = (value) => value == null ? "" : Array.isArray(value) ? value.map(shown).join(", ")
+      : typeof value === "object" ? JSON.stringify(value) : String(value);
+    // Only plain data leaves the frame: what controls hold is strings, numbers, booleans,
+    // arrays of those, or null.
+    const plain = (value) => value == null ? null : Array.isArray(value) ? value.slice(0, 200).map(plain)
+      : typeof value === "string" ? value.slice(0, 2000) : typeof value === "number" || typeof value === "boolean" ? value : shown(value).slice(0, 2000);
+    const fill = (text) => text.replace(/\\{([A-Za-z_][A-Za-z0-9_]{0,63})\\}/g, (match, name) => state.has(name) ? shown(state.get(name)) : match);
+    const perform = (action, value) => {
+      if (action === "sendPrompt") return act(action, fill(value));
+      if (action === "openLink") return act(action, value);
+      const fields = {};
+      for (const [name, current] of state) fields[name] = plain(current);
+      const lines = Object.keys(fields).map((name) => name + ": " + shown(fields[name]));
+      act("submit", [value.trim(), ...lines].filter(Boolean).join("\\n"), fields);
+    };
+    // A change reaches a bound control as an event (inputs, checkboxes) or as the value
+    // itself (Select, Slider, SegmentedControl, Tabs…).
+    const changed = (input, checkable) => {
+      const target = input && typeof input === "object" && !Array.isArray(input) && (input.currentTarget || input.target);
+      if (target && typeof target === "object" && "value" in target) return checkable ? !!target.checked : target.value;
+      return input;
     };
     const intrinsic = new Set(config.intrinsic);
     const actionProps = new Set(config.actionProps);
@@ -212,9 +240,10 @@ export function createPreviewShell(
       if (value && typeof value === "object") {
         if (value.$node === "el") return renderNode(value);
         if (value.$node === "text") return typeof value.text === "string" ? value.text : undefined;
+        if ("$ref" in value) return typeof value.$ref === "string" && state.has(value.$ref) && !actionProps.has(name) ? state.get(value.$ref) : undefined;
         if ("$action" in value) {
-          if (!actionProps.has(name) || (value.$action !== "sendPrompt" && value.$action !== "openLink") || typeof value.value !== "string") return undefined;
-          return () => act(value.$action, value.value);
+          if (!actionProps.has(name) || !["sendPrompt", "openLink", "submit"].includes(value.$action) || typeof value.value !== "string") return undefined;
+          return () => perform(value.$action, value.value);
         }
         const out = {};
         for (const key of Object.keys(value)) {
@@ -229,15 +258,31 @@ export function createPreviewShell(
     function renderNode(node, key) {
       if (!node || typeof node !== "object") return null;
       if (node.$node === "text") return typeof node.text === "string" ? node.text : null;
+      if (node.$node === "ref") return typeof node.name === "string" ? shown(state.get(node.name)) : null;
       if (node.$node !== "el" || typeof node.name !== "string") return null;
       const type = resolve(node.name);
       if (type === null) return placeholder(key, "<" + node.name.slice(0, 80) + ">");
       const props = {};
       const given = node.props && typeof node.props === "object" && !Array.isArray(node.props) ? node.props : {};
+      const bind = typeof given.bind === "string" && stateName.test(given.bind) ? given.bind : null;
       for (const name of Object.keys(given)) {
-        if (name === "ref" || name === "key" || name === "__proto__") continue;
+        if (name === "ref" || name === "key" || name === "__proto__" || name === "bind") continue;
         const value = toValue(given[name], name);
         if (value !== undefined) props[name] = value;
+      }
+      if (bind) {
+        // The frame owns a bound control's value, so it is controlled from here on.
+        const checkable = "defaultChecked" in props || props.type === "checkbox" || props.type === "radio"
+          || /(^|\\.)(Checkbox|Switch|Chip)$/.test(node.name);
+        if (!state.has(bind)) state.set(bind, checkable ? props.defaultChecked === true : props.defaultValue ?? (/(^input$|^textarea$|Input$|Textarea$)/.test(node.name) ? "" : null));
+        delete props.defaultValue;
+        delete props.defaultChecked;
+        const current = state.get(bind);
+        if (checkable) props.checked = current === true;
+        // With no default, a Slider or Select is left to pick its own start until it moves:
+        // null is not a value every control accepts.
+        else if (current !== null || touched.has(bind)) props.value = current;
+        props.onChange = (input) => { touched.add(bind); state.set(bind, changed(input, checkable)); rerender(); };
       }
       if (key !== undefined) props.key = key;
       const children = (Array.isArray(node.children) ? node.children : []).map((child, index) => renderNode(child, index));
@@ -249,7 +294,9 @@ export function createPreviewShell(
     let setTree;
     function Markup() {
       const [nodes, set] = React.useState([]);
+      const [, setVersion] = React.useState(0);
       setTree = set;
+      rerender = () => setVersion((version) => version + 1);
       return nodes.map((node, index) => h(Boundary, {key: index, inline: true}, h(NodeView, {node})));
     }
     const root = ReactDOMClient.createRoot(document.getElementById("root"));

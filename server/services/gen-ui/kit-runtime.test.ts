@@ -170,6 +170,21 @@ describe("render", () => {
 		expect(result.output).toContain("<script>: not an allowed HTML tag");
 	});
 
+	test("state read but never bound is pointed out", async () => {
+		const { env } = await fixture();
+		const result = await executeKitAction(
+			{
+				action: "render",
+				source:
+					'<Stack><Slider bind="radius" /><Card radius={$radius}>{$radius} {$size}</Card></Stack>',
+			},
+			env,
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain('Nothing binds $size, so it shows nothing: add bind="size"');
+		expect(result.output).not.toContain("$radius,");
+	});
+
 	test("markup with nothing renderable is rejected", async () => {
 		const { env } = await fixture();
 		for (const source of ["   ", "just some prose", "<Stack"])
