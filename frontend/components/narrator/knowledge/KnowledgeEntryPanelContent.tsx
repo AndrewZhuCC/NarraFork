@@ -3,7 +3,7 @@
  *
  * Supports both global entries (shared base) and personal entries. Permission
  * rules:
- * - Global: `isAdmin || isOwner` → direct edit via `useAddKnowledgeRevision`.
+ * - Global: the server's `viewerCaps.canWriteMain` → direct edit via `useAddKnowledgeRevision`.
  * - Personal: always editable by the owner via `useUpdatePersonalEntryContent`.
  *
  * Does NOT replicate the full tab structure of the standalone route. Only shows

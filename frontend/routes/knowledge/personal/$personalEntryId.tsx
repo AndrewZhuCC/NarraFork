@@ -24,7 +24,6 @@ import {
 	Stack,
 	TagsInput,
 	Text,
-	Textarea,
 	TextInput,
 	Title,
 } from "@mantine/core";
@@ -38,9 +37,12 @@ import {
 } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
+import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { KnowledgeEditor } from "../../../components/knowledge/editor/KnowledgeEditor";
 import { SubmissionAuthorActions } from "../../../components/knowledge/SubmissionAuthorActions";
 import { SubmissionFindings } from "../../../components/knowledge/SubmissionFindings";
+import { SubmissionStatusBadge } from "../../../components/knowledge/SubmissionStatusBadge";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import {
 	useDeletePersonalEntry,
@@ -205,7 +207,13 @@ function StandaloneDetail({ entry }: { entry: KnowledgePersonalEntry }) {
 	const onDelete = () =>
 		remove.mutate(entry.id, {
 			onSuccess: () => {
-				setConfirmDelete(false);
+				// The entry is gone, so unsaved body edits are moot: drop them synchronously so
+				// the editor's unsaved-changes guard does not stop the navigation away.
+				flushSync(() => {
+					setContent(entry.content);
+					setDirty(false);
+					setConfirmDelete(false);
+				});
 				navigate({ to: "/knowledge" });
 			},
 		});
@@ -237,13 +245,7 @@ function StandaloneDetail({ entry }: { entry: KnowledgePersonalEntry }) {
 							{t(`personalEntryStatus_${entry.status}`)}
 						</Badge>
 						{openSubmission ? (
-							<Badge
-								size="sm"
-								variant="light"
-								color={openSubmission.status === "conflict" ? "orange" : "blue"}
-							>
-								{t(`submissionStatus_${openSubmission.status}`)}
-							</Badge>
+							<SubmissionStatusBadge status={openSubmission.status} size="sm" />
 						) : null}
 						<Text size="xs" c="dimmed">
 							{targetName ? (
@@ -287,31 +289,29 @@ function StandaloneDetail({ entry }: { entry: KnowledgePersonalEntry }) {
 					<Stack gap="md">
 						<Paper withBorder p="md" radius="md">
 							<Stack gap="sm">
-								<Group justify="space-between" align="center">
-									<Text size="sm" fw={600}>
-										{t("personalEntryContent")}
-									</Text>
-									<Button
-										size="xs"
-										variant="light"
-										loading={saveContent.isPending}
-										disabled={isArchived || !dirty}
-										onClick={onSaveContent}
-									>
-										{t("save")}
-									</Button>
-								</Group>
-								<Textarea
+								<KnowledgeEditor
+									label={t("personalEntryContent")}
 									value={content}
-									onChange={(e) => {
-										setContent(e.currentTarget.value);
+									onChange={(v) => {
+										setContent(v);
 										setDirty(true);
 									}}
+									savedValue={entry.content}
 									placeholder={t("content")}
-									autosize
-									minRows={10}
-									maxRows={28}
-									disabled={isArchived}
+									onSave={onSaveContent}
+									saving={saveContent.isPending}
+									readOnly={isArchived}
+									toolbar={
+										<Button
+											size="xs"
+											variant="light"
+											loading={saveContent.isPending}
+											disabled={isArchived || !dirty}
+											onClick={onSaveContent}
+										>
+											{t("save")}
+										</Button>
+									}
 								/>
 								{saveContent.isError ? (
 									<Text size="xs" c="red">
@@ -545,23 +545,7 @@ function SubmissionHistory({
 									{t("subFlowRound", { round: s.round })}
 								</Badge>
 							) : null}
-							<Badge
-								size="xs"
-								variant="light"
-								color={
-									s.status === "conflict"
-										? "orange"
-										: s.status === "pending"
-											? "blue"
-											: s.status === "approved"
-												? "green"
-												: s.status === "changes_requested"
-													? "yellow"
-													: "gray"
-								}
-							>
-								{t(`submissionStatus_${s.status}`)}
-							</Badge>
+							<SubmissionStatusBadge status={s.status} />
 						</Group>
 					</Group>
 					<SubmissionFindings findings={s.findingsJson} />

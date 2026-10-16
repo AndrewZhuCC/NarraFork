@@ -408,5 +408,18 @@
 	"panel.unsavedTitle": "未保存的修改",
 	"panel.unsavedMessage": "你有未保存的编辑内容，确定放弃？",
 	"panel.discardConfirm": "放弃",
-	"panel.keepEditing": "继续编辑"
+	"panel.keepEditing": "继续编辑",
+
+	"editorView_edit": "编辑",
+	"editorView_preview": "预览",
+	"editorView_split": "并排",
+	"editorView_diff": "改动",
+	"editorUnsaved": "未保存",
+	"editorSaveShortcut": "Ctrl/⌘ + S 保存",
+	"editorLeaveTitle": "放弃未保存的修改？",
+	"editorLeaveDesc": "你有尚未保存的修改，离开此页面将丢弃这些修改。",
+	"editorStay": "继续编辑",
+	"editorLeave": "放弃并离开",
+	"editVsMain": "你的修改 vs 当前版本",
+	"resolvedVsMain": "解决后的内容 vs 当前版本"
 }

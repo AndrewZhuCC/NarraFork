@@ -660,7 +660,7 @@ DELETE /api/knowledge/collections/:id
 
 GET    /api/knowledge/entries?collectionId=&tag=&q=&limit=&cursor=&view.version=&view.product= 列出/筛选条目（q 触发 FTS；结果按权限过滤；view.* 传 viewContext 裁剪正文/摘要；分页见下）
 POST   /api/knowledge/entries                        创建条目（含首版本、密级、标签）
-GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）
+GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）；附 viewerCaps（见下）
 PATCH  /api/knowledge/entries/:id                    改元数据（标题/标签/密级/metadata）
 DELETE /api/knowledge/entries/:id                    归档/删除
 
@@ -694,6 +694,8 @@ DELETE /api/knowledge/grants/:id                       撤销授权
 - 带 `q` 时走 FTS 检索（自身已有上限、不分页）；分页模式下其 `nextCursor` 恒为 `null`。
 - 全量（无 `collectionId`）列表目前没有 `(updated_at, id)` 索引，依赖每次请求的行数预算限界；若条目量很大需补索引（schema 变更 + 迁移，另行立项）。
 - 侧栏**不显示每个集合的条目数**：按条目逐条 ACL 判定后计数需要全表扫描，不满足主线程约束；而从已加载的列表推算的数字是错误的（只覆盖当前筛选与已加载页），因此去掉。
+
+**`viewerCaps`（调用者能力位）**：`GET /entries/:id` 返回条目时附带 `viewerCaps: { canWriteMain, canEditMeta, canManageAcl, canTransferOwner, canDelete, canReview, myPersonalEntryId }`；`GET /collections` 的每一行附带 `viewerCaps: { canEdit, canManageAcl, canTransferOwner, canDelete, canCreateEntry }`。每一位都由对应写接口所用的同一判定函数计算（`canDirectWriteEntry` / `canWriteMain` / `isEntryOwnerOrAdmin` / `canAdministerKnowledgeAcl` / `canReview` / `isCollectionOwnerOrAdmin` / `canWriteCollection`），前端只按它显隐操作，不自行推断权限。映射表见 `KNOWLEDGE_UI_REDESIGN.md` §8.1，一致性由 `server/services/__tests__/knowledge-viewer-caps.test.ts` 保证。能力位只说明"该类调用会被接受"，不含逐请求的输入校验（如"只有 admin 能把 owner 设为空"、"不能审核自己的提交"）。
 
 > 开放 API（API token 鉴权、外部读写）见 `OPEN_API.md`；本文件只定义资源本身与内部（JWT）接口。两者复用同一 `knowledgeService`。
 

@@ -225,8 +225,11 @@ export function useCreateKnowledgeDraft() {
 	return useMutation({
 		mutationFn: ({ entryId, name }: { entryId: string; name?: string }) =>
 			api.createKnowledgeDraft(entryId, name ? { name } : {}),
-		onSuccess: (_r, { entryId }) =>
-			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] }),
+		onSuccess: (_r, { entryId }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
+			// The entry's viewerCaps.myPersonalEntryId now points at the new personal version.
+			qc.invalidateQueries({ queryKey: ["knowledge", "entry", entryId] });
+		},
 	});
 }
 

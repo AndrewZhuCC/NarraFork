@@ -1,6 +1,6 @@
 # 知识库前端重构设计
 
-状态：**规划中**（P0 缺陷修复单独提交，不在本文范围内实施）。
+状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1）。
 关联文档：数据模型、权限和审核状态机以 `docs/KNOWLEDGE_BASE.md` 为准，本文只改前端信息架构与少量为其服务的后端接口，**不改审核状态机和 ACL 语义**。
 
 ---
@@ -201,8 +201,8 @@ frontend/hooks/knowledge/       按领域拆分 useKnowledge.ts（entries / pers
 
 | 期 | 内容 | 验收 |
 |----|------|------|
-| **P0**（进行中） | 条目列表 cursor 分页、集合计数修正、卡片悬停样式 | 超过一页的条目可达；切换集合或搜索不改变其他集合计数 |
-| **P1** 基础件 | `viewerCaps` 接口；`KnowledgeEditor`、`SubmissionStatusBadge`、`DriftBanner` 抽取；现有页面换用这些组件，路由暂不动 | 前端不再出现 `isAdmin \|\| isOwner` 式权限推断；write grant 持有者能看到编辑入口；所有编辑处有预览与未保存提醒 |
+| **P0**（✅ 已合入 #81） | 条目列表 cursor 分页、去掉错误的集合计数、卡片悬停样式 | 超过一页的条目可达；侧栏不再显示错误计数 |
+| **P1** 基础件（✅ 已完成，见 §8.1） | `viewerCaps` 接口；`KnowledgeEditor`、`SubmissionStatusBadge`、`DriftBanner` 抽取；现有页面换用这些组件，路由暂不动 | 前端不再出现 `isAdmin \|\| isOwner` 式权限推断；write grant 持有者能看到编辑入口；所有编辑处有预览与未保存提醒 |
 | **P2a** 请求与审核 | `/knowledge/review`、`/knowledge/requests/$id`；铃铛与审核导航迁移；对应旧 URL 重定向 | 关联型与独立型请求同一页面；作者与审核者同一 URL |
 | **P2b** 个人版本 | `/knowledge/mine*`；关联与独立统一编辑页；`#draft` 与 `/personal/$id` 重定向 | "我的版本"只有一个入口 |
 | **P2c** 阅读与设置 | 条目阅读页、`/history`、`/edit`、`/settings`；浏览页筛选排序；删除侧栏 | 只读用户只看到正文、历史、链接 |
@@ -210,6 +210,43 @@ frontend/hooks/knowledge/       按领域拆分 useKnowledge.ts（entries / pers
 | **P3** 缺口 | ACL 审计页、知识包管理、知识图谱视图、"为什么我能/不能访问"说明 | 对应 KNOWLEDGE_BASE.md §10 条目可关闭 |
 
 P2 的子项相互独立，可按 a → b → c → d 顺序并行开发、逐个合入；每个 PR 带上它负责的那部分旧 URL 重定向。
+
+### 8.1 P1 落地记录
+
+**后端 `viewerCaps`**（`server/services/knowledge-service.ts` 的 `entryViewerCaps` / `collectionViewerCaps`；路由 `GET /entries/:id` 走 `getEntryForViewer`，`GET /collections` 走 `listCollectionsForViewer`）。每个能力位调用的就是对应写接口的判定函数；原本内联的判定已抽出为共享函数，两边不可能漂移：
+
+| 能力位 | 判定函数（写接口同用） | 对应写接口 |
+|--------|------------------------|------------|
+| `canWriteMain` | `canDirectWriteEntry` = `canWriteMain(entry) \|\| canWriteCollection(collection)`（从 `addRevision` 内联判定抽出） | `POST /entries/:id/revisions` |
+| `canEditMeta` | `canWriteMain`（`loadWritableEntry`） | `PATCH /entries/:id` |
+| `canDelete` | `canWriteMain`（`loadWritableEntry`） | `DELETE /entries/:id` |
+| `canTransferOwner` | `isEntryOwnerOrAdmin`（`assertCanManageEntry` 的内联判定改为调用它） | `POST /entries/:id/transfer-owner` |
+| `canManageAcl` | `canAdministerKnowledgeAcl` = admin（与路由上的 `requireAdmin` 同一规则） | `PATCH /entries/:id/acl` |
+| `canReview` | `canReview(caps, entry)`（linked 提交的审核判定；自审禁止是逐请求规则，不并入） | `POST /submissions/:id/review`、`/resolve` |
+| `myPersonalEntryId` | read store `findActivePersonalEntryId`（`idx_kd_entry_author` 单次索引查询，SQLite/PG 双实现） | — |
+| 集合 `canEdit` / `canTransferOwner` / `canDelete` | `isCollectionOwnerOrAdmin`（`assertCanManageCollection`） | `PATCH` / `transfer-owner` / `DELETE /collections/:id` |
+| 集合 `canManageAcl` | `canAdministerKnowledgeAcl` | `PATCH /collections/:id/acl` |
+| 集合 `canCreateEntry` | `canWriteCollection`（`createEntry`） | `POST /entries` |
+
+所有能力位都建立在调用方已通过读闸（`canRead` 含集合读闸）之上；principal caps 每请求解析一次，集合列表逐行只做纯函数计算。一致性测试：`server/services/__tests__/knowledge-viewer-caps.test.ts`，在 admin / 条目 owner / 集合 owner / write grant / review tag / 普通读者六类 principal 上逐位验证"能力位为 true ⇔ 对应调用不被拒绝"。外部 API v1 不暴露知识库（`/api/knowledge` 仅接受会话 JWT），新字段只出现在内部接口。
+
+**前端**：`components/knowledge/editor/KnowledgeEditor.tsx`（编辑/预览/与基线 diff，宽屏另有并排；`savedValue` 判脏；`useBlocker` + `beforeunload`；Ctrl/Cmd+S）、`SubmissionStatusBadge.tsx`、`DriftBanner.tsx`。正文编辑处全部换用编辑器：新建条目弹窗、「我的库」新建表单、条目页直接编辑、草稿 tab、独立个人条目页、冲突解决。新建条目弹窗的标签改为 `TagsInput`。条目页、集合菜单与叙述者 dock 面板的按钮显隐全部改读 `viewerCaps`。
+
+**与旧前端推断的差异（P1 修正的问题）**：
+
+- write grant 持有者与集合 owner 可以直接写 main，但旧前端只给 admin/owner 显示「直接编辑」（dock 面板同样如此）。
+- 集合 owner 能追加 revision，却**不能**改元数据或删除条目（`updateEntryMeta`/`deleteEntry` 只认 `canWriteMain`，不含集合 owner）；旧前端把元数据面板绑在 admin/owner 上，恰好对集合 owner 隐藏，但对 write grant 持有者也隐藏了（服务端其实允许）。现在两者都按服务端显示。
+- 删除条目：服务端允许 write grant 持有者，旧前端只给 admin/owner。
+- 集合的「编辑」「删除」按钮旧前端对所有人显示（服务端仅 admin/集合 owner），现在按能力位隐藏；「新建条目」只提供可建条目的集合。
+- 条目 ACL：HTTP 接口仅 admin，但 agent 工具 `KnowledgeEdit` 允许条目 owner 设置 ACL（`isEntryOwnerOrAdmin`）。`canManageAcl` 反映 UI 所用的 HTTP 接口（admin）；两条路径的差异保持现状，未在 P1 改动。
+- 自审：服务端允许 admin 审核自己的提交，条目页审核面板仍对作者本人隐藏操作（保守，维持旧行为）。
+
+**偏差**：
+
+- 状态徽章统一后 `rejected` 显示为红色（旧代码多处为灰色），`approved` 统一为绿色。
+- 叙述者 dock 面板（§5.3 规定只读展示）仍保留其原有的轻量编辑，未嵌入 `KnowledgeEditor`，只把权限改为 `viewerCaps.canWriteMain`；去掉 dock 编辑留给 P2。
+- 编辑器的 Ctrl/Cmd+S 绑定在编辑器根节点（焦点在编辑器内时生效），不是全局快捷键，避免同页多个编辑器互相抢占；未保存拦截对同页 hash 切 tab 同样生效（非活动 tab 会被卸载，编辑会丢）。
+- `SubmissionAuthorActions` 的 `isAdmin`（撤回/重提）与独立提交审核弹窗的权限仍按旧逻辑，属于 P2a 请求详情页的范围。
 
 ## 9. 测试策略
 
