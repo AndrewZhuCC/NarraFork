@@ -2,8 +2,6 @@
 	"title": "Knowledge Base",
 	"subtitle": "Structured, versioned, reviewable knowledge with a personal library.",
 	"tabCollections": "Collections",
-	"tabEntries": "Entries",
-	"tabAdmin": "Access Control",
 
 	"newPersonalEntry": "New personal entry",
 	"personalEntryStandalone": "Standalone",
@@ -153,9 +151,11 @@
 
 	"accessControl": "Access Control",
 	"accessControlDesc": "Manage classification levels, controlled tags, and user permissions (admin only).",
-	"aclTabLevels": "Levels",
-	"aclTabTags": "Tags",
-	"aclTabUsers": "Users",
+	"adminEntry": "Admin",
+	"adminTitle": "Knowledge admin",
+	"adminNavLevels": "Levels",
+	"adminNavTags": "Tags & tag types",
+	"adminNavUsers": "User grants",
 	"levels": "Classification levels",
 	"levelsDesc": "Defines the classification hierarchy. Higher rank = stricter access. Users need clearance at or above an entry's level to read it.",
 	"levelName": "Level name",

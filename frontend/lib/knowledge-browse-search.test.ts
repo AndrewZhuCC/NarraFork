@@ -46,8 +46,8 @@ describe("parseKnowledgeBrowseSearch", () => {
 		});
 	});
 
-	test("keeps the admin tab until the admin pages move (P2d)", () => {
-		expect(parseKnowledgeBrowseSearch({ tab: "admin" })).toEqual({ tab: "admin" });
+	test("drops the legacy admin tab (it redirects to /knowledge/admin before validation)", () => {
+		expect(parseKnowledgeBrowseSearch({ tab: "admin" })).toEqual({});
 	});
 });
 

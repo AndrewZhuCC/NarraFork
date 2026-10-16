@@ -5,7 +5,8 @@
  * `/knowledge/requests/$submissionId`; every personal version — linked or standalone — has one
  * page, `/knowledge/mine/$personalEntryId`; an entry's history / edit / settings are sub-pages
  * of `/knowledge/$entryId`. The legacy URLs (review / my-library tabs, entry `#submissions`,
- * `#draft`, `#content`, `#history` and `#links` hashes, `/knowledge/personal/<id>`) redirect
+ * `#draft`, `#content`, `#history` and `#links` hashes, `/knowledge/personal/<id>`, the admin
+ * tab) redirect
  * there; the parsing lives here so each redirect row is unit-tested.
  */
 
@@ -66,6 +67,7 @@ export type KnowledgeLegacyRedirect =
 	| { to: "/knowledge/review"; search: KnowledgeReviewSearch }
 	| { to: "/knowledge/requests/$submissionId"; params: { submissionId: string } }
 	| { to: "/knowledge/mine" }
+	| { to: "/knowledge/admin" }
 	| KnowledgePersonalEntryDestination;
 
 /** Search params of the review inbox. */
@@ -111,12 +113,14 @@ export function parseKnowledgeReviewSearch(search: Record<string, unknown>): Kno
  *  - `tab=review&submission=<id>` → `/knowledge/requests/<id>`
  *  - `tab=review` (or a malformed id) → `/knowledge/review`
  *  - `tab=mylibrary` → `/knowledge/mine`
+ *  - `tab=admin` → `/knowledge/admin` (whose layout sends non-admins back to `/knowledge`)
  * Anything else stays on the browse page (null).
  */
 export function legacyKnowledgeIndexRedirect(
 	search: Record<string, unknown>,
 ): KnowledgeLegacyRedirect | null {
 	if (search.tab === "mylibrary") return { to: "/knowledge/mine" };
+	if (search.tab === "admin") return { to: "/knowledge/admin" };
 	if (search.tab !== "review") return null;
 	if (isKnowledgeSubmissionId(search.submission)) {
 		return {

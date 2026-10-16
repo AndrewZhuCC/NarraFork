@@ -1,6 +1,6 @@
 # 知识库前端重构设计
 
-状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），P2a 已完成（见 §8.2），P2b 已完成（见 §8.3），P2c 已完成（见 §8.4）。
+状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），**P2 全部完成**：P2a（见 §8.2）、P2b（见 §8.3）、P2c（见 §8.4）、P2d（见 §8.5）。剩余 P3。
 关联文档：数据模型、权限和审核状态机以 `docs/KNOWLEDGE_BASE.md` 为准，本文只改前端信息架构与少量为其服务的后端接口，**不改审核状态机和 ACL 语义**。
 
 ---
@@ -49,7 +49,7 @@
 | `/knowledge/mine/$personalEntryId` | 个人版本编辑页 | 关联型与独立型同一页面：编辑、diff、drift/rebase、发布、该版本的请求历史 |
 | `/knowledge/review` | 审核收件箱 | search：`status`；分组展示可审请求 |
 | `/knowledge/requests/$submissionId` | 发布请求详情 | 作者与审核者共用；按角色显示 verdict / 解冲突 / 撤回 / 重提 |
-| `/knowledge/admin` | 管理（admin） | 子路由：`levels`、`tags`、`users`、`audit`、`packs` |
+| `/knowledge/admin` | 管理（admin） | 子路由：`levels`、`tags`、`users`（P2d 已实现，见 §8.5）；`audit`、`packs` 属 P3 |
 
 ### 4.2 旧 URL 重定向
 
@@ -144,7 +144,7 @@
 ### 5.8 设置与管理
 
 - `/knowledge/$entryId/settings`：分区卡片：基本信息（标题/标签/关键词/状态）、访问控制（密级、受控标签、review tags，含空 review tags 的 fail-closed 说明）、所有权（转移）、危险操作（删除）。每个分区按能力位显示或只读。
-- `/knowledge/admin`：左侧子导航（密级、标签与标签类型、用户授权、ACL 审计、知识包）。现有 `AclAdminPanel` 的三个 tab 拆为三个子路由；审计和知识包为新页面（P3）。
+- `/knowledge/admin`：左侧子导航（密级、标签与标签类型、用户授权、ACL 审计、知识包）。现有 `AclAdminPanel` 的三个 tab 拆为三个子路由；审计和知识包为新页面（P3）。——P2d 已完成前三项，见 §8.5；审计与知识包在实现前不出现在子导航中。
 
 ## 6. 需要的后端改动
 
@@ -206,7 +206,7 @@ frontend/hooks/knowledge/       按领域拆分 useKnowledge.ts（entries / pers
 | **P2a** 请求与审核（✅ 已完成，见 §8.2） | `/knowledge/review`、`/knowledge/requests/$id`；铃铛与审核导航迁移；对应旧 URL 重定向 | 关联型与独立型请求同一页面；作者与审核者同一 URL |
 | **P2b** 个人版本（✅ 已完成，见 §8.3） | `/knowledge/mine*`；关联与独立统一编辑页；`#draft` 与 `/personal/$id` 重定向 | "我的版本"只有一个入口 |
 | **P2c** 阅读与设置（✅ 已完成，见 §8.4） | 条目阅读页、`/history`、`/edit`、`/settings`；浏览页筛选排序；删除侧栏 | 只读用户只看到正文、历史、链接 |
-| **P2d** 管理 | `/knowledge/admin/*` 子路由拆分 | 现有管理功能无回退 |
+| **P2d** 管理（✅ 已完成，见 §8.5） | `/knowledge/admin/*` 子路由拆分 | 现有管理功能无回退 |
 | **P3** 缺口 | ACL 审计页、知识包管理、知识图谱视图、"为什么我能/不能访问"说明 | 对应 KNOWLEDGE_BASE.md §10 条目可关闭 |
 
 P2 的子项相互独立，可按 a → b → c → d 顺序并行开发、逐个合入；每个 PR 带上它负责的那部分旧 URL 重定向。
@@ -386,10 +386,35 @@ P2a 的 `#submissions[/<id>]` 与 P2b 的 `#draft` 随路由一起搬到 `$entry
 - §5.1 的"你没有权限看到更多"空状态未单列：服务端不（也不应）告知被 ACL 隐藏的行数；扫描预算耗尽的空页仍显示原有"继续加载"提示，"无搜索结果"的说明里注明不可读条目不会列出。
 - 筛选条的状态筛选为新增服务端参数 `status`（§6.2 只列了 `level`、`sort`），成本是一个 SQL 等值条件（有 `idx_ke_status`）。
 - 标签筛选是自由文本框（条目标签是自由标签，没有可枚举的列表接口；`/tags` 是 ACL 标签），另可点击行上的标签徽章。
-- 浏览页的「Access Control」管理 tab 保留在 `?tab=admin`，属于 P2d 的拆分范围。
+- 浏览页的「Access Control」管理 tab 保留在 `?tab=admin`，属于 P2d 的拆分范围。——P2d 已拆出，见 §8.5。
 - 设置入口仅在有任一设置能力位时出现在阅读页；设置页本身对任何可读者可直接打开（全部只读）。危险操作卡在无 `canDelete` 时隐藏而非只读——没有可展示的只读内容。
 - 管理员在访问控制卡里仍可通过 `EntryAclPanel` 的 owner 字段改 owner（`PATCH …/acl` 的既有能力），与所有权卡的转移并存，未在 P2c 合并。
 - 叙述者 dock 面板、`NarratorPanel` 知识提示与 `shared/pretext-layout/tool-detail.ts` 只链接 `/knowledge/<id>`（不带 tab hash），路径不变，无需修改。
+
+### 8.5 P2d 落地记录
+
+**无后端改动**：管理区的所有写接口（密级、标签、标签类型的增改删，`/grants/bulk`，`PUT /users/:id/acl`）与授权读取（`GET /grants`、`GET /users/:id/acl`、`/api/admin/users`）在服务端已是 `requireAdmin`，未改；密级与标签列表的 `GET` 本就对所有登录用户开放（浏览筛选与条目设置也在用）。
+
+**前端**：
+
+- 路由 `routes/knowledge/admin/`：`route.tsx` 为布局（面包屑 知识库 › 管理、标题与说明、左侧子导航，窄屏改为横向按钮行；`<Outlet />`），`index.tsx` 只在 `beforeLoad` 里 `redirect({ to: "/knowledge/admin/levels", replace: true })`，`levels.tsx` / `tags.tsx` / `users.tsx` 各挂一个分区组件。
+- 子导航与门禁在 `lib/knowledge-admin-nav.ts`（纯函数 + `knowledge-admin-nav.test.ts`）：`KNOWLEDGE_ADMIN_SECTIONS` 只列已实现的三项；`knowledgeAdminGate(user, isLoading)`——当前用户 `role === "admin"` 放行，加载中不判定（显示 Loader），其余（含取不到用户）在布局里 `<Navigate to="/knowledge" replace />`。按角色决定纯管理界面属于 §8.1 允许的 `isAdmin` 用法；接口本身仍由服务端 `requireAdmin` 把关。
+- `AclAdminPanel.tsx`（约 1160 行）按分区拆到 `components/knowledge/admin/`，函数体原样搬移、行为不变：`LevelsAdmin`（密级）、`TagsAdmin` + `TagTypesModal`（标签与标签类型）、`UsersAdmin` + `BulkGrantModal` + `UserPermissionDetail`（用户授权、批量授权、逐用户权限）。原文件删除。
+- 浏览页：去掉只为管理 tab 保留的 `Tabs` 脚手架，`BrowsePanel` 直接渲染；标题栏对 admin 多一个「管理」按钮 → `/knowledge/admin`。`parseKnowledgeBrowseSearch` 不再保留 `tab`。
+- i18n：新增 `adminEntry`、`adminTitle`、`adminNavLevels`、`adminNavTags`、`adminNavUsers`；删除不再使用的 `tabEntries`、`tabAdmin`、`aclTabLevels`、`aclTabTags`、`aclTabUsers`。说明文字沿用 `accessControlDesc`，移到管理区标题下。
+
+**旧 URL 重定向**（`lib/knowledge-review-nav.ts` 的 `legacyKnowledgeIndexRedirect`，`/knowledge/` 的 `beforeLoad` 中 `redirect({ replace: true })`，单测在 `knowledge-review-nav.test.ts` 的 P2d 分组）：
+
+| 旧 | 新 |
+|----|----|
+| `/knowledge?tab=admin` | `/knowledge/admin`（→ `/knowledge/admin/levels`；非 admin 再被布局送回 `/knowledge`） |
+
+**偏差**：
+
+- 子导航未列「ACL 审计」「知识包」：两页属于 P3、尚未实现，按"不放死链接"处理；实现时把条目加进 `KNOWLEDGE_ADMIN_SECTIONS` 即可。
+- 门禁在布局组件里判定（与 `/settings` 的 admin 页相同做法），而不是在 `beforeLoad` 里：当前用户来自 `useCurrentUser` 的 query，组件层判定无需复制其 token / 重试逻辑；子路由组件只在放行后才挂载，非 admin 不会发出管理接口请求。
+- 旧管理 tab 内的分区切换是组件状态（不可链接）；现在每个分区有自己的 URL。用户授权分区里"当前选中的用户"仍是页面内状态，未进 URL（与旧行为一致，属于 §5.8 之外的新功能）。
+- 非 admin 打开旧的 `/knowledge?tab=admin`：旧行为是忽略该参数、停在浏览页；现在经两次 `replace` 重定向后同样落在 `/knowledge`，历史记录里不留中间页。
 
 ## 9. 测试策略
 

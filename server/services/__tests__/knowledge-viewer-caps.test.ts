@@ -68,7 +68,7 @@ async function makeTag(label: string): Promise<string> {
 async function makeFixture(): Promise<{ collectionId: string; entryId: string }> {
 	const reviewTagId = await makeTag("review");
 	const col = await knowledgeService.createCollection({
-		name: `${TAG}-col-${generateId(4)}`,
+		name: `${TAG}-col-${generateId()}`,
 		ownerUserId: ids.collectionOwner,
 	});
 	const entry = await knowledgeService.createEntry({

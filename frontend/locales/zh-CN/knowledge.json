@@ -2,8 +2,6 @@
 	"title": "知识库",
 	"subtitle": "结构化、可版本化、可审核的知识，并支持个人知识库。",
 	"tabCollections": "集合",
-	"tabEntries": "条目",
-	"tabAdmin": "访问控制",
 
 	"newPersonalEntry": "新建个人条目",
 	"personalEntryStandalone": "独立",
@@ -153,9 +151,11 @@
 
 	"accessControl": "访问控制",
 	"accessControlDesc": "管理密级、受控标签和用户权限（仅管理员）。",
-	"aclTabLevels": "密级",
-	"aclTabTags": "标签",
-	"aclTabUsers": "用户",
+	"adminEntry": "管理",
+	"adminTitle": "知识库管理",
+	"adminNavLevels": "密级",
+	"adminNavTags": "标签与标签类型",
+	"adminNavUsers": "用户授权",
 	"levels": "密级阶梯",
 	"levelsDesc": "定义密级层级。等级越高，访问限制越严格。用户需持有不低于条目密级的许可才能读取。",
 	"levelName": "密级名称",

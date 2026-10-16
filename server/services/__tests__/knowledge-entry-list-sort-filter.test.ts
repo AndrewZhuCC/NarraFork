@@ -70,7 +70,7 @@ function appFor(principal: { userId: string; role: "admin" | "user" }) {
 }
 
 async function newCollection(label: string) {
-	return knowledgeService.createCollection({ name: `${label}-${TAG}-${generateId(4)}` });
+	return knowledgeService.createCollection({ name: `${label}-${TAG}-${generateId()}` });
 }
 
 async function seedEntry(

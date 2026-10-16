@@ -79,7 +79,7 @@ function appFor(principal: { userId: string; role: "admin" | "user" }) {
  * so that several entries share a timestamp (exercises the id tie-break).
  */
 async function seedCollection(spec: boolean[], tags: (i: number) => string[] = () => []) {
-	const col = await knowledgeService.createCollection({ name: `page-${TAG}-${generateId(4)}` });
+	const col = await knowledgeService.createCollection({ name: `page-${TAG}-${generateId()}` });
 	const ids: string[] = [];
 	for (let i = 0; i < spec.length; i++) {
 		const e = await knowledgeService.createEntry({
@@ -171,7 +171,7 @@ describe("listEntriesPage", () => {
 
 	test("scan budget bounds one call; the cursor still resumes after scanned rows", async () => {
 		// More hidden rows than one call may scan, then one visible row at the end.
-		const col = await knowledgeService.createCollection({ name: `budget-${TAG}-${generateId(4)}` });
+		const col = await knowledgeService.createCollection({ name: `budget-${TAG}-${generateId()}` });
 		const hiddenCount = ENTRY_PAGE_MAX_SCAN_ROWS + 20;
 		const rows = Array.from({ length: hiddenCount }, (_, i) => ({
 			id: generateId(),
