@@ -1257,7 +1257,8 @@ function resolveWindowsKnownFolder(key: string, _home: string): string | null {
 		try {
 			const result = execSync(
 				`powershell -NoProfile -Command "(New-Object -ComObject Shell.Application).NameSpace('shell:${key}').Self.Path"`,
-				{ encoding: "utf-8", timeout: 3000 },
+				// 隐藏控制台：PowerShell 会创建窗口，这里只是解析已知文件夹路径。
+				{ encoding: "utf-8", timeout: 3000, windowsHide: true },
 			).trim();
 			if (result && existsSync(result)) {
 				_winFolderCache[key] = result;

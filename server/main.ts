@@ -11,6 +11,7 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
+import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { isWildcardHost } from "../shared/server-host";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
@@ -55,6 +56,8 @@ import {
 } from "./lib/server-restart";
 import { reloadSettings, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
+import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
+import { shellExecute } from "./lib/shell-exec";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
@@ -621,6 +624,7 @@ function killPortHolder(pid: number, port: number): void {
 	const directKill = Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 	const stderr = new TextDecoder().decode(directKill.stderr).toLowerCase();
 	if (directKill.exitCode === 0) {
@@ -647,7 +651,7 @@ function killPortHolder(pid: number, port: number): void {
 				"Caption,ProcessId",
 				"/FORMAT:CSV",
 			],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		const childOutput = new TextDecoder().decode(childQuery.stdout);
 		for (const line of childOutput.split("\n")) {
@@ -662,6 +666,8 @@ function killPortHolder(pid: number, port: number): void {
 			try {
 				Bun.spawnSync(["taskkill", "/F", "/PID", String(childPid)], {
 					stdio: ["ignore", "ignore", "ignore"],
+					// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+					windowsHide: true,
 				});
 			} catch {
 				// best effort
@@ -672,7 +678,7 @@ function killPortHolder(pid: number, port: number): void {
 		// inherited the handle. Look up the parent first.
 		const parentQuery = Bun.spawnSync(
 			["wmic", "process", "where", `(ProcessId=${pid})`, "get", "ParentProcessId", "/FORMAT:CSV"],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		const parentOutput = new TextDecoder().decode(parentQuery.stdout);
 		for (const line of parentOutput.split("\n")) {
@@ -692,7 +698,7 @@ function killPortHolder(pid: number, port: number): void {
 					"Caption,ProcessId",
 					"/FORMAT:CSV",
 				],
-				{ stdout: "pipe", stderr: "ignore" },
+				{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 			);
 			const siblingOutput = new TextDecoder().decode(siblingQuery.stdout);
 			for (const sLine of siblingOutput.split("\n")) {
@@ -707,6 +713,8 @@ function killPortHolder(pid: number, port: number): void {
 					try {
 						Bun.spawnSync(["taskkill", "/F", "/PID", String(sPid)], {
 							stdio: ["ignore", "ignore", "ignore"],
+							// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+							windowsHide: true,
 						});
 					} catch {
 						// best effort
@@ -732,7 +740,7 @@ function getWindowsChildProcesses(parentPid: number): WindowsProcessInfo[] {
 				"Caption,CommandLine,ProcessId",
 				"/FORMAT:CSV",
 			],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		if (result.exitCode !== 0) return [];
 		return parseWmicProcessCsv(new TextDecoder().decode(result.stdout)).filter((proc) => {
@@ -779,6 +787,8 @@ function killOwnWindowsChildProcesses(): void {
 			);
 			Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
 				stdio: ["ignore", "ignore", "ignore"],
+				// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+				windowsHide: true,
 			});
 		} catch {
 			// best effort — process may already be gone
@@ -1308,17 +1318,22 @@ startServerAddressWatcher({
 	},
 });
 
+// 其余配置（实例名、主题色、打开方式等）由管理器面板直接写文件，没有地址那样的重绑回路：
+// 文件变化时重载配置即可，运行时组件按需读取新值。地址变化由上面的监听单独处理。
+startSettingsFileWatcher(() => {
+	reloadSettings();
+});
+
 /** Open a URL in the user's default browser. */
 function openInBrowser(url: string) {
+	// Windows 走 ShellExecuteW：不经 cmd start，避免偶尔闪出的控制台窗口。
+	if (IS_WINDOWS) {
+		if (shellExecute(url)) return;
+	}
 	try {
-		if (IS_WINDOWS) {
-			Bun.spawn(["cmd", "/c", "start", "", url], {
-				stdio: ["ignore", "ignore", "ignore"],
-				windowsHide: true,
-			});
-		} else if (IS_MACOS) {
+		if (IS_MACOS) {
 			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else {
+		} else if (!IS_WINDOWS) {
 			Bun.spawn(["xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] });
 		}
 	} catch {
@@ -1327,37 +1342,41 @@ function openInBrowser(url: string) {
 }
 
 async function openAsApp(url: string) {
-	const candidates: { program: string; args: string[] }[] = IS_WINDOWS
-		? [
-				{ program: "msedge", args: [`--app=${url}`] },
-				{ program: "chrome", args: [`--app=${url}`] },
-			]
-		: IS_MACOS
-			? [
-					{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
-					{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
-					{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
-				]
-			: [
-					{ program: "google-chrome", args: [`--app=${url}`] },
-					{ program: "google-chrome-stable", args: [`--app=${url}`] },
-					{ program: "chromium", args: [`--app=${url}`] },
-					{ program: "chromium-browser", args: [`--app=${url}`] },
-					{ program: "microsoft-edge", args: [`--app=${url}`] },
-				];
-
-	for (const { program, args } of candidates) {
-		try {
-			if (IS_WINDOWS) {
-				// 经 cmd 启动无法判断成败（start 总是返回成功），先确认可执行文件存在，
-				// 否则浏览器缺失时会静默什么都不开，而不是回退到下一个候选。
-				if (!Bun.which(program)) continue;
-				Bun.spawn(["cmd", "/c", "start", "", program, ...args], {
+	// Windows 上 Edge/Chrome 不在 PATH 里（Bun.which 找不到），按标准安装路径探测；
+	// 直接 spawn 绝对路径，避免经 cmd start 时参数被重新解析。
+	if (IS_WINDOWS) {
+		const browser = CHROMIUM_PATHS.find((path) => existsSync(path));
+		if (browser) {
+			try {
+				Bun.spawn([browser, `--app=${url}`], {
 					stdio: ["ignore", "ignore", "ignore"],
 					windowsHide: true,
 				});
 				return;
+			} catch {
+				// 落到默认浏览器兜底
 			}
+		}
+		openInBrowser(url);
+		return;
+	}
+
+	const candidates: { program: string; args: string[] }[] = IS_MACOS
+		? [
+				{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
+				{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
+				{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
+			]
+		: [
+				{ program: "google-chrome", args: [`--app=${url}`] },
+				{ program: "google-chrome-stable", args: [`--app=${url}`] },
+				{ program: "chromium", args: [`--app=${url}`] },
+				{ program: "chromium-browser", args: [`--app=${url}`] },
+				{ program: "microsoft-edge", args: [`--app=${url}`] },
+			];
+
+	for (const { program, args } of candidates) {
+		try {
 			const proc = Bun.spawn([program, ...args], {
 				stdio: ["ignore", "ignore", "ignore"],
 				windowsHide: true,

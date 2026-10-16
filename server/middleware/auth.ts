@@ -18,6 +18,7 @@ import {
 // The two remaining raw AppErrors below are deliberate: `INVALID_SCOPE` is a programming
 // error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
 // OAuth clients rather than rendered in the UI, so neither needs a localized wording.
+import { isTrustedProxyAddress } from "../lib/client-ip";
 import { AppError, catalogError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { validateAccessToken } from "../lib/oauth-provider";
@@ -390,6 +391,27 @@ export function assertAdmin(c: Context): void {
 }
 
 export async function requireAdmin(c: Context, next: Next) {
+	assertAdmin(c);
+	await next();
+}
+
+/** 本机回环网段：管理器面板与服务同机运行，没有登录凭据。 */
+const LOCAL_PEER_CIDRS = ["127.0.0.0/8", "::1/128"];
+
+/**
+ * 管理员会话，或来自本机回环的请求。
+ *
+ * 管理器面板是独立进程、没有 JWT，需要对少量接口（更新检查/下载/应用）免凭据调用；
+ * 只放行回环来源，其余请求仍走完整的认证与管理员校验。clientIp 由 Bun 边界解析后
+ * 注入 Context（见 server/main.ts），不信任调用方自带的转发头。
+ */
+export async function requireAdminOrLocalPeer(c: Context, next: Next) {
+	const clientIp = (c.env as { clientIp?: string } | undefined)?.clientIp;
+	if (isTrustedProxyAddress(clientIp, LOCAL_PEER_CIDRS)) {
+		await next();
+		return;
+	}
+	await authenticateRequest(c);
 	assertAdmin(c);
 	await next();
 }

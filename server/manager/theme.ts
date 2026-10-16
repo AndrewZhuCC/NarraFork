@@ -20,6 +20,7 @@ import {
 	fillRect,
 	makeRectOf,
 	ODS_DISABLED,
+	ODS_FOCUS,
 	ODS_SELECTED,
 	type Pointer,
 	type readDrawItem,
@@ -40,6 +41,7 @@ export const TEXT_FAINT = 0x00a89f96; // #969fa8
 export const WHITE_REF = 0x00ffffff;
 export const BUTTON_BG = 0x00ffffff;
 export const BUTTON_BG_PRESSED = 0x00f2f0ee; // #eef0f2
+export const BUTTON_BG_HOVER = 0x00f7f5f3; // #f3f5f7
 export const BUTTON_BORDER = 0x00ddd8d5; // #d5d8dd
 export const BUTTON_TEXT = 0x006b635f; // #5f636b
 export const DISABLED_BG = 0x00fafaf9; // #f9fafa
@@ -59,6 +61,14 @@ export function toColorRef(hex: string): number {
 	const g = (value >> 8) & 0xff;
 	const b = value & 0xff;
 	return (b << 16) | (g << 8) | r;
+}
+
+/** COLORREF → #rrggbb（toColorRef 的逆运算，用于把系统取色结果写回配置）。 */
+export function fromColorRef(ref: number): string {
+	const r = ref & 0xff;
+	const g = (ref >> 8) & 0xff;
+	const b = (ref >> 16) & 0xff;
+	return `#${[r, g, b].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /** 两色线性混合，t∈[0,1]。 */
@@ -129,18 +139,35 @@ export function drawButton(
 	item: ReturnType<typeof readDrawItem>,
 	spec: ButtonSpec,
 	brandColorRef: number,
+	hovered = false,
 ): void {
 	const disabled = (item.itemState & ODS_DISABLED) !== 0;
 	const pressed = (item.itemState & ODS_SELECTED) !== 0;
-	const fill =
-		spec.primary && !disabled
-			? mixColor(brandColorRef, 0x000000, pressed ? 0.12 : 0)
-			: disabled
-				? DISABLED_BG
-				: pressed
-					? BUTTON_BG_PRESSED
+	// 键盘焦点（Tab 遍历）与鼠标悬停都算"当前交互对象"。
+	const focused = (item.itemState & ODS_FOCUS) !== 0;
+	const highlighted = !disabled && (hovered || focused);
+	// 主按钮悬停时"提亮"（品牌色混白），次按钮悬停时染一层品牌浅色并点亮边框 ——
+	// 两者都要一眼可见，否则用户会以为按钮没有反馈。
+	const fill = disabled
+		? DISABLED_BG
+		: pressed
+			? spec.primary
+				? mixColor(brandColorRef, 0x000000, 0.12)
+				: BUTTON_BG_PRESSED
+			: highlighted
+				? spec.primary
+					? mixColor(brandColorRef, 0x00ffffff, 0.18)
+					: mixColor(0x00ffffff, brandColorRef, 0.12)
+				: spec.primary
+					? brandColorRef
 					: BUTTON_BG;
-	const border = spec.primary && !disabled ? fill : disabled ? DISABLED_BORDER : BUTTON_BORDER;
+	const border = disabled
+		? DISABLED_BORDER
+		: spec.primary
+			? fill
+			: highlighted
+				? brandColorRef
+				: BUTTON_BORDER;
 	const textColor = spec.primary && !disabled ? WHITE_REF : disabled ? DISABLED_TEXT : BUTTON_TEXT;
 	drawRoundedRect(item.hdc, item.rect, fill, border, BUTTON_RADIUS);
 	drawText(item.hdc, spec.text, item.rect, textColor);

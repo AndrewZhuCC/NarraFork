@@ -9,9 +9,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	readNarraForkSettings,
 	readPreferences,
 	readServerAddress,
 	settingsMtime,
+	writeNarraForkSettings,
 	writePreferences,
 	writeServerAddress,
 } from "../manager-config";
@@ -62,13 +64,89 @@ describe("监听地址读写", () => {
 	});
 });
 
-describe("关闭偏好", () => {
-	test("缺文件时默认每次询问、默认直接退出", () => {
-		expect(readPreferences()).toEqual({ askOnClose: true, closeAction: "exit" });
+describe("管理器偏好", () => {
+	test("缺文件时用默认值（询问、直接退出、中文、显示窗口）", () => {
+		expect(readPreferences()).toEqual({
+			askOnClose: true,
+			closeAction: "exit",
+			language: "zh-CN",
+			startMinimized: false,
+			autoStartBackend: false,
+		});
 	});
 
-	test("往返写入后读回一致", () => {
-		expect(writePreferences({ askOnClose: false, closeAction: "minimize" })).toBe(true);
-		expect(readPreferences()).toEqual({ askOnClose: false, closeAction: "minimize" });
+	test("往返写入后读回一致（含语言与最小化启动）", () => {
+		const saved = {
+			askOnClose: false,
+			closeAction: "minimize" as const,
+			language: "en" as const,
+			startMinimized: true,
+			autoStartBackend: true,
+		};
+		expect(writePreferences(saved)).toBe(true);
+		expect(readPreferences()).toEqual(saved);
+	});
+
+	test("非法的语言值回落到中文", () => {
+		writeFileSync(join(home, "manager.json"), JSON.stringify({ language: "fr" }), "utf8");
+		expect(readPreferences().language).toBe("zh-CN");
+	});
+});
+
+describe("NarraFork 配置同步", () => {
+	test("缺文件时用与 nf 一致的默认值", () => {
+		expect(readNarraForkSettings()).toEqual({
+			openBrowser: "browser",
+			brandName: "",
+			brandColor: "",
+		});
+	});
+
+	test("只覆盖关注字段，其余配置原样保留", () => {
+		writeSettings({
+			server: { host: "127.0.0.1", port: 7779, trustProxy: true },
+			branding: { iconColor: "#123456", extra: "keep" },
+			agent: { defaultModel: "x" },
+		});
+
+		expect(
+			writeNarraForkSettings({
+				openBrowser: "off",
+				brandName: "NF公司",
+				brandColor: "#abcdef",
+			}),
+		).toBe(true);
+
+		const saved = JSON.parse(readFileSync(join(home, "settings.json"), "utf8"));
+		expect(saved.server).toEqual({
+			host: "127.0.0.1",
+			port: 7779,
+			trustProxy: true,
+			openBrowser: "off",
+		});
+		expect(saved.branding).toEqual({ iconColor: "#abcdef", extra: "keep", name: "NF公司" });
+		expect(saved.agent).toEqual({ defaultModel: "x" });
+		expect(readNarraForkSettings()).toEqual({
+			openBrowser: "off",
+			brandName: "NF公司",
+			brandColor: "#abcdef",
+		});
+	});
+
+	test("空串表示回到默认（删除对应键）", () => {
+		writeSettings({ branding: { name: "NF公司", iconColor: "#123456" } });
+		expect(writeNarraForkSettings({ brandName: "", brandColor: "" })).toBe(true);
+		const saved = JSON.parse(readFileSync(join(home, "settings.json"), "utf8"));
+		expect(saved.branding).toEqual({});
+		expect(readNarraForkSettings()).toEqual({
+			openBrowser: "browser",
+			brandName: "",
+			brandColor: "",
+		});
+	});
+
+	test("非法的 openBrowser 值回落到默认", () => {
+		writeSettings({ server: { openBrowser: "weird" } });
+		expect(readNarraForkSettings().openBrowser).toBe("browser");
 	});
 });

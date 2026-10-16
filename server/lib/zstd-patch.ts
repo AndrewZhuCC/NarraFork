@@ -408,6 +408,7 @@ async function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promi
 			],
 			{
 				stdin: "ignore",
+				windowsHide: true,
 				stdout: "pipe",
 				stderr: "pipe",
 				env: updateServerChildEnvironment(),
@@ -484,6 +485,7 @@ async function runZstdCli(
 		stdout: "pipe",
 		stderr: "pipe",
 		env: updateServerChildEnvironment(),
+		windowsHide: true,
 	});
 
 	let timedOut = false;

@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
 import { getLanAddresses } from "../lib/net/lan-addresses";
+import { t } from "./manager-i18n";
 
 export type BackendState = "stopped" | "starting" | "running" | "stopping" | "error";
 
@@ -127,7 +128,7 @@ export class BackendProcess {
 			this.child = undefined;
 			if (this.disposed) return;
 			// 主动停止走的是 stop() 的路径；这里只处理"自己退出"。
-			this.setState("stopped", code === 0 ? undefined : `退出码 ${code}`);
+			this.setState("stopped", code === 0 ? undefined : t("error.exitedWithCode", { code }));
 		});
 
 		await this.waitUntilReady();
@@ -187,10 +188,7 @@ export class BackendProcess {
 		while (Date.now() < deadline) {
 			// 实例锁冲突：服务会立即退出，直接给出原因，不必等超时。
 			if (this.lockConflictPid !== undefined) {
-				this.setState(
-					"error",
-					`已有 NarraFork 实例在运行（PID ${this.lockConflictPid}）：同一数据目录只能运行一个，请先停止它`,
-				);
+				this.setState("error", t("error.instanceLockConflict", { pid: this.lockConflictPid }));
 				return;
 			}
 			if (!this.child) return;
@@ -217,7 +215,7 @@ export class BackendProcess {
 			}
 			await this.sleep(READY_POLL_MS);
 		}
-		if (this.child) this.setState("error", "启动超时：健康检查未通过");
+		if (this.child) this.setState("error", t("error.readyTimeout"));
 	}
 
 	/** 可中断等待：stop/dispose 会立即唤醒，避免启动流程卡在定时器上。 */

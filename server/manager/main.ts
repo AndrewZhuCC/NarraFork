@@ -41,12 +41,15 @@ import {
 } from "./layout";
 import {
 	type ManagerPreferences,
+	readNarraForkSettings,
 	readPreferences,
 	readServerAddress,
 	watchSettings,
 	writePreferences,
 	writeServerAddress,
 } from "./manager-config";
+import { setLanguage, t } from "./manager-i18n";
+import { showSettingsDialog } from "./settings-window";
 import {
 	CARD_BG,
 	DANGER_COLOR,
@@ -72,6 +75,7 @@ import {
 	applyControlColors,
 	BS_OWNERDRAW,
 	clientSize,
+	controlIdAtCursor,
 	createControl,
 	createFont,
 	createIconFromRgba,
@@ -87,6 +91,7 @@ import {
 	getControlId,
 	invalidate,
 	isNativeAvailable,
+	isOwnerDrawButton,
 	isShiftPressed,
 	loadAppIcon,
 	loadIconFromFile,
@@ -128,6 +133,7 @@ import {
 	WM_SIZE,
 	WS_BORDER,
 	WS_VSCROLL,
+	windowAtCursor,
 } from "./win32";
 
 // ── 托盘与消息 ──────────────────────────────────────────────────────────────
@@ -140,6 +146,7 @@ const TRAY_ID_ASK_TOGGLE = 9102;
 const TRAY_ID_EXIT = 9103;
 const TRAY_ID_WEB = 9104;
 const TRAY_ID_WEB_NEW = 9105;
+const TRAY_ID_SETTINGS = 9106;
 
 interface ManagerSettings {
 	host: string;
@@ -193,22 +200,23 @@ function activeHost(): string {
 
 // ── 状态 ────────────────────────────────────────────────────────────────────
 
-const STATUS_STYLE: Record<BackendState, { text: string; color: number }> = {
-	running: { text: "运行中", color: SUCCESS_COLOR },
-	starting: { text: "启动中", color: WARNING_COLOR },
-	stopping: { text: "正在停止", color: WARNING_COLOR },
-	stopped: { text: "已停止", color: TEXT_MUTED },
-	error: { text: "异常退出", color: DANGER_COLOR },
+const STATUS_STYLE: Record<BackendState, { key: string; color: number }> = {
+	running: { key: "status.running", color: SUCCESS_COLOR },
+	starting: { key: "status.starting", color: WARNING_COLOR },
+	stopping: { key: "status.stopping", color: WARNING_COLOR },
+	stopped: { key: "status.stopped", color: TEXT_MUTED },
+	error: { key: "status.error", color: DANGER_COLOR },
 };
 
-/** 按钮外观：主按钮用品牌色实底，其余白底描边。 */
-const BUTTONS: Record<number, { text: string; primary: boolean }> = {
-	[ID.start]: { text: "启动项目", primary: true },
-	[ID.restart]: { text: "重启服务", primary: false },
-	[ID.stop]: { text: "关闭项目", primary: false },
-	[ID.open]: { text: "打开面板", primary: false },
-	[ID.save]: { text: "保存并应用", primary: false },
-	[ID.openLogFile]: { text: "查看完整日志", primary: false },
+/** 按钮外观：文案存 i18n key，绘制时按当前语言取值，切换语言只需重绘。 */
+const BUTTONS: Record<number, { key: string; primary: boolean }> = {
+	[ID.start]: { key: "button.start", primary: true },
+	[ID.restart]: { key: "button.restart", primary: false },
+	[ID.stop]: { key: "button.stop", primary: false },
+	[ID.open]: { key: "button.open", primary: false },
+	[ID.settings]: { key: "button.settings", primary: false },
+	[ID.save]: { key: "button.save", primary: false },
+	[ID.openLogFile]: { key: "button.openLog", primary: false },
 };
 
 interface Controls {
@@ -221,6 +229,7 @@ interface Controls {
 	restart?: Pointer;
 	stop?: Pointer;
 	open?: Pointer;
+	settings?: Pointer;
 	ipEdit?: Pointer;
 	portEdit?: Pointer;
 	save?: Pointer;
@@ -242,7 +251,13 @@ const settings: ManagerSettings = {
 };
 let brandColorRef = toColorRef(DEFAULT_BRAND_COLOR);
 let backend: BackendProcess | undefined;
-let preferences: ManagerPreferences = { askOnClose: true, closeAction: "exit" };
+let preferences: ManagerPreferences = {
+	askOnClose: true,
+	closeAction: "exit",
+	language: "zh-CN",
+	startMinimized: false,
+	autoStartBackend: false,
+};
 /** 托盘是否挂上了：没挂上时关闭窗口只能直接退出，否则窗口就再也找不回来了。 */
 let trayAdded = false;
 let closeDialogShown = false;
@@ -421,17 +436,21 @@ function applyStatus(status: BackendState, detail?: string): void {
 	const style = external ? STATUS_STYLE.running : STATUS_STYLE[status];
 	const suffix = external
 		? awaitingHandover
-			? "（等待接管：请在终端停止外部服务）"
-			: "（外部启动）"
+			? t("status.handover")
+			: t("status.external")
 		: detail
-			? `（${detail}）`
+			? t("status.detail", { detail })
 			: "";
 	setText(controls.statusDot, "●");
-	setText(controls.statusText, `${style.text}${suffix}`);
-	setText(controls.address, `面板地址: http://${displayHost(activeHost())}:${activePort()}/`);
+	setText(controls.statusText, `${t(style.key)}${suffix}`);
+	setText(
+		controls.address,
+		t("label.address", { url: `${displayHost(activeHost())}:${activePort()}/` }),
+	);
 	const startEnabled = external ? !awaitingHandover : status === "stopped" || status === "error";
 	setEnabled(controls.start, startEnabled);
-	setEnabled(controls.restart, !external && status === "running");
+	// 异常退出时也允许重启（等价于重新启动）：否则用户只能点「启动项目」，语义不符。
+	setEnabled(controls.restart, !external && (status === "running" || status === "error"));
 	setEnabled(controls.stop, !external && (status === "running" || status === "starting"));
 	invalidate(controls.statusDot);
 	invalidate(controls.start);
@@ -507,28 +526,28 @@ function onCommand(id: number): void {
 				// 接管流程：外部实例还在跑，先等它退出，再启动面板托管的后端。
 				if (!awaitingHandover) {
 					awaitingHandover = true;
-					appendLog(
-						"PREP",
-						"已进入接管等待：请在终端中停止外部服务（Ctrl+C），面板会在其退出后自动启动托管实例。",
-					);
+					appendLog("PREP", t("log.handoverWait"));
 					applyStatus("stopped");
 				}
 				break;
 			}
-			appendLog("RUN", "正在启动服务...");
+			appendLog("RUN", t("log.startingService"));
 			void backend?.start();
 			break;
 		case ID.restart:
-			appendLog("RUN", "正在重启服务...");
+			appendLog("RUN", t("log.restartingService"));
 			void backend?.restart();
 			break;
 		case ID.stop:
-			appendLog("RUN", "正在关闭服务...");
+			appendLog("RUN", t("log.stoppingService"));
 			void backend?.stop();
 			break;
 		case ID.open:
 			// Shift+点击 = 强制新建前端窗口（对齐浏览器 Shift+点击的惯例）。
 			openPanel(isShiftPressed());
+			break;
+		case ID.settings:
+			void openSettings();
 			break;
 		case ID.openLogFile:
 			// 用系统默认程序打开日志文件（面板内存里被裁断的完整历史在这里）。
@@ -538,16 +557,19 @@ function onCommand(id: number): void {
 			const ip = controls.ipEdit
 				? readWstr(controls.ipEdit, 128).trim() || settings.host
 				: settings.host;
-			const parsedPort = controls.portEdit
-				? Number.parseInt(readWstr(controls.portEdit, 16), 10)
-				: Number.NaN;
-			const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : settings.port;
+			const rawPort = controls.portEdit ? readWstr(controls.portEdit, 16).trim() : "";
+			const parsedPort = rawPort ? Number.parseInt(rawPort, 10) : Number.NaN;
+			const portValid = Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535;
+			if (!portValid) {
+				appendLog("WARN", t("log.portInvalid", { value: rawPort || "(空)", port: settings.port }));
+			}
+			const port = portValid ? parsedPort : settings.port;
 			if (writeServerAddress({ host: ip, port })) {
 				settings.host = ip;
 				settings.port = port;
-				appendLog("OK", `监听配置已保存，后端将自动应用：${ip}:${port}`);
+				appendLog("OK", t("log.settingsSaved", { address: `${ip}:${port}` }));
 			} else {
-				appendLog("ERROR", "写入 settings.json 失败，配置未保存");
+				appendLog("ERROR", t("log.settingsWriteFailed"));
 			}
 			// IP 内容可能变长/变短：重排让输入框宽度跟着内容走。
 			if (mainWindow) relayout(mainWindow.hwnd);
@@ -601,7 +623,10 @@ function handleMessage(
 		case WM_DRAWITEM: {
 			const item = readDrawItem(lParam);
 			const spec = BUTTONS[item.controlId];
-			if (spec) drawButton(item, spec, brandColorRef);
+			if (spec) {
+				const hovered = controlIdAtCursor() === item.controlId;
+				drawButton(item, { primary: spec.primary, text: t(spec.key) }, brandColorRef, hovered);
+			}
 			return 1;
 		}
 		case WM_TRAY: {
@@ -613,10 +638,12 @@ function handleMessage(
 			}
 			if (event === WM_RBUTTONUP) {
 				const choice = showTrayMenu(hwnd, [
-					{ id: TRAY_ID_OPEN, text: "打开管理器窗口" },
-					{ id: TRAY_ID_WEB, text: "打开前端面板" },
-					{ id: TRAY_ID_WEB_NEW, text: "打开新窗口" },
-					{ id: TRAY_ID_ASK_TOGGLE, text: "关闭时不再询问", checked: !preferences.askOnClose },
+					{ id: TRAY_ID_OPEN, text: t("tray.openWindow") },
+					{ id: TRAY_ID_SETTINGS, text: t("tray.settings") },
+					{ separator: true, id: 0, text: "" },
+					{ id: TRAY_ID_WEB, text: t("tray.openPanel") },
+					{ id: TRAY_ID_WEB_NEW, text: t("tray.openNewWindow") },
+					{ id: TRAY_ID_ASK_TOGGLE, text: t("tray.askToggle"), checked: !preferences.askOnClose },
 					{ separator: true, id: 0, text: "" },
 					{ id: TRAY_ID_EXIT, text: "退出并关闭项目" },
 				]);
@@ -626,12 +653,17 @@ function handleMessage(
 					openPanel();
 				} else if (choice === TRAY_ID_WEB_NEW) {
 					openPanel(true);
+				} else if (choice === TRAY_ID_SETTINGS) {
+					void openSettings();
 				} else if (choice === TRAY_ID_EXIT) {
 					exitApplication(hwnd);
 				} else if (choice === TRAY_ID_ASK_TOGGLE) {
 					preferences = { ...preferences, askOnClose: !preferences.askOnClose };
 					writePreferences(preferences);
-					appendLog("PREP", preferences.askOnClose ? "关闭窗口时会询问" : "关闭窗口时不再询问");
+					appendLog(
+						"PREP",
+						preferences.askOnClose ? t("log.askOnCloseOn") : t("log.askOnCloseOff"),
+					);
 				}
 				return 0;
 			}
@@ -813,7 +845,7 @@ async function handleCloseRequest(hwnd: Pointer): Promise<void> {
 				writePreferences(preferences);
 				appendLog(
 					"PREP",
-					answer.action === "exit" ? "已记住：关闭时直接退出" : "已记住：关闭时最小化",
+					answer.action === "exit" ? t("log.rememberedExit") : t("log.rememberedMinimize"),
 				);
 			}
 			if (answer.action === "exit") exitApplication(hwnd);
@@ -853,21 +885,62 @@ function openPanel(forceNewWindow = false): void {
 	// 已有前端窗口（--app 窗口的标题就是实例显示名）时直接聚焦，不重复打开；
 	// Shift+点击或托盘"打开新窗口"时跳过查找，强制新建。
 	if (!forceNewWindow && focusWindowByTitle(settings.brandName)) {
-		appendLog("WEB", "已聚焦打开的前端面板窗口。");
+		appendLog("WEB", t("log.focusedPanel"));
 		return;
 	}
 	const url = `http://${displayHost(activeHost())}:${activePort()}/`;
-	appendLog("WEB", forceNewWindow ? `已打开新面板窗口: ${url}` : `已打开面板: ${url}`);
+	appendLog(
+		"WEB",
+		forceNewWindow ? t("log.openedPanelNew", { url }) : t("log.openedPanel", { url }),
+	);
 	openWebPanel(url, forceNewWindow);
+}
+
+/** 按当前语言刷新静态文案；自绘按钮与状态行的文字在重绘时自动取新值。 */
+function refreshControlTexts(): void {
+	if (!mainWindow) return;
+	setText(controls.bannerSubtitle, t("label.console"));
+	setText(controls.configTitle, t("label.listenConfig"));
+	setText(controls.configHint, t("label.autoApply"));
+	setText(controls.ipLabel, t("label.ip"));
+	setText(controls.portLabel, t("label.port"));
+	setText(controls.logTitle, t("label.output"));
+	invalidate(mainWindow.hwnd);
+}
+
+/**
+ * 打开设置窗口（模态），保存后即时应用：语言立即切换，主题色/实例名变化时刷新窗口图标与强调色。
+ * 更新检查与下载走服务端自带接口（本机回环免认证），地址用面板当前实际使用的 host/port。
+ */
+async function openSettings(): Promise<void> {
+	if (!mainWindow) return;
+	const result = await showSettingsDialog(mainWindow.hwnd, {
+		preferences,
+		narrafork: readNarraForkSettings(),
+		brandColorRef,
+		serviceBaseUrl: `http://${displayHost(activeHost())}:${activePort()}`,
+	});
+	if (!result) return;
+	preferences = result.preferences;
+	setLanguage(result.preferences.language);
+	if (result.narraforkChanged) {
+		settings.brandColor = result.narrafork.brandColor || DEFAULT_BRAND_COLOR;
+		settings.brandName = result.narrafork.brandName || DEFAULT_BRAND_NAME;
+		brandColorRef = toColorRef(settings.brandColor);
+		const icon =
+			(await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(mainWindow.instance);
+		if (icon) setWindowIcon(mainWindow.hwnd, icon);
+	}
+	refreshControlTexts();
+	applyStatus(backend?.current ?? "stopped", undefined);
+	appendLog("PREP", t("settings.saved"));
 }
 
 // ── 启动 ────────────────────────────────────────────────────────────────────
 
 export async function runManager(): Promise<void> {
 	if (!isNativeAvailable()) {
-		console.error(
-			"管理器需要 Windows 原生窗口支持；请改用 `narrafork.exe --serve` 以控制台模式运行。",
-		);
+		console.error(t("error.nativeUnavailable"));
 		process.exit(1);
 	}
 
@@ -875,13 +948,14 @@ export async function runManager(): Promise<void> {
 	// 再开一个；找不到窗口则静默退出，避免留下第二个实例。
 	if (!acquireSingleInstanceMutex("Local\\NarraFork.Manager")) {
 		if (!focusWindowByTitle(WINDOW_TITLE)) {
-			console.error("NarraFork Manager 已在运行，但未能定位它的窗口。");
+			console.error(t("error.alreadyRunning"));
 		}
 		return;
 	}
 
 	// 地址与品牌都来自 NarraFork 的 settings；地址的读写与回显由 manager-config 负责。
 	preferences = readPreferences();
+	setLanguage(preferences.language);
 	openLogFileMirror();
 	const address = readServerAddress();
 	settings.host = address.host;
@@ -902,16 +976,19 @@ export async function runManager(): Promise<void> {
 	mainWindow = createWindow({
 		title: WINDOW_TITLE,
 		className: "NarraForkManagerWindow",
-		// 首次启动用最小尺寸；用户调整过后按上次的尺寸恢复。
-		width: preferences.windowWidth ?? MIN_WINDOW_WIDTH,
-		height: preferences.windowHeight ?? MIN_WINDOW_HEIGHT,
+		// 先以隐藏方式创建：托盘挂好后再决定显示，避免"先闪一下再隐藏"。
+		visible: false,
+		// 首次启动用最小尺寸；用户调整过后按上次的尺寸恢复。按钮从 4 个增至 5 个后，旧偏好
+		// 可能小于新的最小值，这里取较大者，避免按钮被挤出窗口。
+		width: Math.max(preferences.windowWidth ?? MIN_WINDOW_WIDTH, MIN_WINDOW_WIDTH),
+		height: Math.max(preferences.windowHeight ?? MIN_WINDOW_HEIGHT, MIN_WINDOW_HEIGHT),
 		onClose: () => {
 			if (mainWindow) void handleCloseRequest(mainWindow.hwnd);
 		},
 		onMessage: handleMessage,
 	});
 	if (!mainWindow) {
-		console.error("创建管理器窗口失败；请改用 `narrafork.exe --serve`。");
+		console.error(t("error.windowCreateFailed"));
 		process.exit(1);
 	}
 	const { hwnd, instance } = mainWindow;
@@ -1018,6 +1095,17 @@ export async function runManager(): Promise<void> {
 		BS_OWNERDRAW,
 		ID.open,
 		buttonX(3),
+		BUTTON_Y,
+		BUTTON_WIDTH,
+		BUTTON_HEIGHT,
+		uiFont,
+	);
+	controls.settings = add(
+		"BUTTON",
+		"设置",
+		BS_OWNERDRAW,
+		ID.settings,
+		buttonX(4),
 		BUTTON_Y,
 		BUTTON_WIDTH,
 		BUTTON_HEIGHT,
@@ -1147,17 +1235,23 @@ export async function runManager(): Promise<void> {
 	if (icon) {
 		setWindowIcon(hwnd, icon);
 		trayAdded = addTrayIcon(hwnd, icon, WINDOW_TITLE, WM_TRAY);
-		if (!trayAdded) appendLog("WARN", "托盘图标添加失败，关闭窗口将直接退出。");
+		if (!trayAdded) appendLog("WARN", t("log.trayFailed"));
 	}
 
-	showWindow(hwnd, SW_SHOW);
+	// 窗口是隐藏创建的；托盘挂好后决定是否需要显示。托盘没挂上时必须显示窗口，
+	// 否则窗口就再也找不回来了。
+	if (preferences.startMinimized && trayAdded) {
+		appendLog("PREP", t("log.minimized"));
+	} else {
+		showWindow(hwnd, SW_SHOW);
+	}
 	// 必须在显示之后：RedrawWindow 对隐藏窗口不生效，否则自绘按钮首次显示时是空白，要等用户
 	// 改变窗口大小才画出来。
 	relayout(hwnd);
 	invalidate(hwnd);
 	applyStatus("stopped");
-	appendLog("PREP", `管理器已启动（主题色 ${settings.brandColor}）。`);
-	appendLog("PREP", "点击「启动项目」拉起后端服务。");
+	appendLog("PREP", t("log.managerStarted", { color: settings.brandColor }));
+	appendLog("PREP", t("log.clickStart"));
 
 	// 前端改的也是同一份 settings，按 mtime 回显到输入框。
 	const stopWatching = watchSettings(() => {
@@ -1167,11 +1261,12 @@ export async function runManager(): Promise<void> {
 		settings.port = current.port;
 		if (controls.ipEdit) setText(controls.ipEdit, current.host);
 		if (controls.portEdit) setText(controls.portEdit, String(current.port));
-		appendLog("PREP", `检测到外部修改的监听配置: ${current.host}:${current.port}`);
+		appendLog("PREP", t("log.addressChanged", { address: `${current.host}:${current.port}` }));
 		applyStatus(backend?.current ?? "stopped");
 	});
 
 	// 终端里手动启动的服务面板也要能看见：立即探测一次，之后每 4 秒复查。
+	let firstProbeDone = false;
 	const probeExternal = (): void => {
 		if (backend?.current !== "stopped") return;
 		void probeServiceHealth(settings.host, settings.port).then((alive) => {
@@ -1179,26 +1274,57 @@ export async function runManager(): Promise<void> {
 				// 外部服务已退出：完成接管，启动面板托管的后端。
 				awaitingHandover = false;
 				externalRunning = false;
-				appendLog("RUN", "外部服务已停止，面板开始接管启动...");
+				appendLog("RUN", t("log.takeoverStart"));
 				applyStatus("stopped");
 				void backend?.start();
 				return;
 			}
+			// 首次探测结束后按偏好自动启动：此时才知道有没有外部服务在跑，避免与它抢实例锁。
+			if (!firstProbeDone) {
+				firstProbeDone = true;
+				if (preferences.autoStartBackend && !alive) {
+					appendLog("RUN", t("settings.autoStarting"));
+					void backend?.start();
+					return;
+				}
+			}
 			if (alive === externalRunning) return;
 			externalRunning = alive;
-			appendLog(
-				"PREP",
-				alive
-					? "检测到服务已在运行（外部启动）；点「启动项目」可在其退出后由面板接管。"
-					: "外部启动的服务已停止。",
-			);
+			appendLog("PREP", alive ? t("log.externalDetected") : t("log.externalStopped"));
 			applyStatus("stopped");
 		});
 	};
 	void probeExternal();
 	const externalTimer = setInterval(probeExternal, 4000);
 
+	// 悬停高亮：光标下的控件变化时重绘两侧 —— 自绘按钮不会自己收到"已进入/已离开"通知。
+	let lastHovered: Pointer | undefined;
+	// 状态点动效：启动/停止过程中让圆点闪烁，"正在变化"一眼可见。
+	let statusDotBlinking = false;
 	const timer = setInterval(() => {
+		const hovered = windowAtCursor();
+		if (hovered !== lastHovered) {
+			// 只重绘 owner-draw 按钮，而且不擦背景：否则鼠标划过日志等大控件时整块重绘，
+			// 界面会持续闪烁。
+			for (const target of [lastHovered, hovered]) {
+				if (isOwnerDrawButton(target)) invalidate(target, false);
+			}
+			lastHovered = hovered;
+		}
+		const currentStatus = backend?.current ?? "stopped";
+		const shouldBlink = currentStatus === "starting" || currentStatus === "stopping";
+		if (shouldBlink) {
+			const on = Math.floor(Date.now() / 450) % 2 === 0;
+			if (on !== statusDotBlinking) {
+				statusDotBlinking = on;
+				setText(controls.statusDot, on ? "●" : "○");
+				invalidate(controls.statusDot);
+			}
+		} else if (statusDotBlinking) {
+			statusDotBlinking = false;
+			setText(controls.statusDot, "●");
+			invalidate(controls.statusDot);
+		}
 		if (!window.pump()) {
 			clearInterval(timer);
 			clearInterval(externalTimer);

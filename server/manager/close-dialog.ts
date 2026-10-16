@@ -7,10 +7,13 @@
  * 模态方式：创建时禁用主窗口，对话框期间自转消息轮询，关闭后恢复主窗口并返回选择。
  */
 
+import { t } from "./manager-i18n";
+import { mixColor } from "./theme";
 import {
 	BS_AUTOCHECKBOX,
 	BS_OWNERDRAW,
 	brushFor,
+	controlIdAtCursor,
 	createControl,
 	createFont,
 	createWindow,
@@ -24,6 +27,7 @@ import {
 	isChecked,
 	loadNative,
 	makeRectOf,
+	ODS_FOCUS,
 	ODS_SELECTED,
 	type Pointer,
 	readDrawItem,
@@ -59,10 +63,11 @@ const ID_HINT = 105;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-const BUTTONS: Record<number, { text: string; danger: boolean; primary: boolean }> = {
-	[ID_MINIMIZE]: { text: "最小化到托盘", danger: false, primary: true },
-	[ID_EXIT]: { text: "退出程序", danger: true, primary: false },
-	[ID_CANCEL]: { text: "取消", danger: false, primary: false },
+/** 文案存 i18n key，绘制与创建控件时按当前语言取值。 */
+const BUTTONS: Record<number, { key: string; danger: boolean; primary: boolean }> = {
+	[ID_MINIMIZE]: { key: "close.minimize", danger: false, primary: true },
+	[ID_EXIT]: { key: "close.exit", danger: true, primary: false },
+	[ID_CANCEL]: { key: "close.cancel", danger: false, primary: false },
 };
 
 /** 模态弹出关闭确认（禁用主窗口），返回用户的选择；点标题栏 X 或「取消」视为取消（null）。 */
@@ -93,7 +98,7 @@ export async function showCloseDialog(
 	};
 
 	dialog = createWindow({
-		title: "关闭 NarraFork",
+		title: t("close.title"),
 		className: "NarraForkCloseDialog",
 		width: DIALOG_WIDTH,
 		height: DIALOG_HEIGHT,
@@ -125,16 +130,28 @@ export async function showCloseDialog(
 					const spec = BUTTONS[item.controlId];
 					if (!spec) return 0;
 					const pressed = (item.itemState & ODS_SELECTED) !== 0;
+					const focused = (item.itemState & ODS_FOCUS) !== 0;
+					const hovered = controlIdAtCursor() === item.controlId;
+					const highlighted = focused || hovered;
 					const fill = spec.danger
 						? pressed
 							? DANGER_PRESSED
 							: DANGER_COLOR
 						: pressed
 							? 0x00f2f0ee // #eef0f2
-							: CARD_BG;
-					const border = spec.primary ? brandColorRef : spec.danger ? fill : NEUTRAL_BORDER;
+							: hovered
+								? mixColor(CARD_BG, brandColorRef, 0.12) // 品牌浅色，悬停一眼可见
+								: CARD_BG;
+					// 危险按钮悬停/聚焦时用白描边（红底上更醒目），其余点亮品牌色。
+					const border = spec.danger
+						? highlighted
+							? WHITE_REF
+							: fill
+						: spec.primary || highlighted
+							? brandColorRef
+							: NEUTRAL_BORDER;
 					drawRoundedRect(item.hdc, item.rect, fill, border, 6);
-					drawText(item.hdc, spec.text, item.rect, spec.danger ? WHITE_REF : TEXT_MAIN);
+					drawText(item.hdc, t(spec.key), item.rect, spec.danger ? WHITE_REF : TEXT_MAIN);
 					return 1;
 				}
 				case WM_DESTROY: {
@@ -182,23 +199,13 @@ export async function showCloseDialog(
 			font,
 		});
 
-	add(
-		"STATIC",
-		"要关闭后端服务并退出，还是最小化到任务栏继续在后台运行？",
-		0x00000000,
-		0,
-		26,
-		22,
-		DIALOG_WIDTH - 52,
-		36,
-		uiFont,
-	);
+	add("STATIC", t("close.question"), 0x00000000, 0, 26, 22, DIALOG_WIDTH - 52, 36, uiFont);
 	// 按钮排在复选框上方：最小化是主选项（品牌色边框），退出用红色警示。
 	const buttonWidth = 108;
 	const buttonY = 74;
 	add(
 		"BUTTON",
-		BUTTONS[ID_MINIMIZE].text,
+		t(BUTTONS[ID_MINIMIZE].key),
 		BS_OWNERDRAW,
 		ID_MINIMIZE,
 		26,
@@ -209,7 +216,7 @@ export async function showCloseDialog(
 	);
 	add(
 		"BUTTON",
-		BUTTONS[ID_EXIT].text,
+		t(BUTTONS[ID_EXIT].key),
 		BS_OWNERDRAW,
 		ID_EXIT,
 		26 + (buttonWidth + 12) * 1,
@@ -220,7 +227,7 @@ export async function showCloseDialog(
 	);
 	add(
 		"BUTTON",
-		BUTTONS[ID_CANCEL].text,
+		t(BUTTONS[ID_CANCEL].key),
 		BS_OWNERDRAW,
 		ID_CANCEL,
 		26 + (buttonWidth + 12) * 2,
@@ -231,7 +238,7 @@ export async function showCloseDialog(
 	);
 	checkbox = add(
 		"BUTTON",
-		"记住我的选择，下次不再询问",
+		t("close.remember"),
 		BS_AUTOCHECKBOX,
 		ID_CHECKBOX,
 		26,
@@ -240,17 +247,7 @@ export async function showCloseDialog(
 		22,
 		uiFont,
 	);
-	add(
-		"STATIC",
-		"最小化到托盘后，项目服务继续在后台运行。",
-		0x00000000,
-		ID_HINT,
-		26,
-		156,
-		DIALOG_WIDTH - 52,
-		18,
-		uiFont,
-	);
+	add("STATIC", t("close.hint"), 0x00000000, ID_HINT, 26, 156, DIALOG_WIDTH - 52, 18, uiFont);
 
 	enableWindow(owner, false);
 	// 必须激活对话框：SW_SHOW 只显示不激活，用户第一次点击会被"激活窗口"吃掉，

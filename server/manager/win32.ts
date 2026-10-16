@@ -21,6 +21,7 @@ import {
 	ptr as toPtr,
 } from "bun:ffi";
 import { existsSync } from "node:fs";
+import { CHROMIUM_PATHS } from "@shared/browser-paths";
 
 export type { Pointer };
 
@@ -61,9 +62,16 @@ export const BS_CHECKBOX = 0x00000002;
 export const BS_AUTOCHECKBOX = 0x00000003;
 /** 读取按钮/复选框的勾选状态（GET）。0x00F1 是 SETCHECK，写错会把状态改掉且读不到值。 */
 export const BM_GETCHECK = 0x00f0;
+export const BM_SETCHECK = 0x00f1;
 export const BST_CHECKED = 0x0001;
 export const BS_GROUPBOX = 0x00000007;
 export const BS_LEFT = 0x0100;
+
+/** 下拉框：只读列表（用户不能输入任意值），配合 CB_* 消息读写选项与选中项。 */
+export const CBS_DROPDOWNLIST = 0x0003;
+export const CB_ADDSTRING = 0x0143;
+export const CB_GETCURSEL = 0x0147;
+export const CB_SETCURSEL = 0x014e;
 
 export const SS_LEFT = 0x00000000;
 
@@ -91,6 +99,7 @@ export const WM_LBUTTONDBLCLK = 0x0203;
 export const WM_RBUTTONUP = 0x0205;
 
 export const SW_SHOW = 5;
+export const SW_SHOWNORMAL = 1;
 export const SW_HIDE = 0;
 export const SW_RESTORE = 9;
 
@@ -161,6 +170,8 @@ interface User32 {
 	) => number;
 	DestroyMenu: (menu: Pointer) => number;
 	GetCursorPos: (point: Pointer) => number;
+	WindowFromPoint: (point: Pointer) => Pointer;
+	GetWindowLongW: (hwnd: Pointer, index: number) => number;
 	DrawTextW: (hdc: Pointer, text: Pointer, length: number, rect: Pointer, format: number) => number;
 	LoadImageW: (
 		instance: Pointer,
@@ -346,6 +357,10 @@ export function loadNative(): { user32: User32; gdi32: Gdi32; kernel32: Kernel32
 			},
 			DestroyMenu: { args: [FFIType.ptr], returns: FFIType.i32 },
 			GetCursorPos: { args: [FFIType.ptr], returns: FFIType.i32 },
+			// POINT 是按值传递的结构体（x64 下装进一个寄存器）：用 i64 传打包坐标，
+			// 声明成指针会把坐标值当地址解引用，永远找不到窗口。
+			WindowFromPoint: { args: [FFIType.i64], returns: FFIType.ptr },
+			GetWindowLongW: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
 			SetProcessDPIAware: { args: [], returns: FFIType.i32 },
 			GetDC: { args: [FFIType.ptr], returns: FFIType.ptr },
 			ReleaseDC: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -553,6 +568,8 @@ export interface WindowOptions {
 	height: number;
 	/** 默认 true；false 时去掉可缩放边框，窗口尺寸固定（对话框用）。 */
 	resizable?: boolean;
+	/** 默认 true；false 时创建为隐藏窗口，由调用方决定何时显示（避免启动时先闪一下）。 */
+	visible?: boolean;
 	/** owner 窗口：owned 窗口由系统保证永远显示在它之上（模态对话框用）。 */
 	owner?: Pointer;
 	/** 收到 WM_CLOSE 时的处理；未提供则走默认销毁（对话框点 X 即取消）。 */
@@ -665,7 +682,7 @@ export function createWindow(options: WindowOptions): NativeWindow | undefined {
 		0,
 		className,
 		wstrTemp(options.title),
-		style | WS_VISIBLE,
+		options.visible === false ? style : style | WS_VISIBLE,
 		x,
 		y,
 		windowWidth,
@@ -852,6 +869,43 @@ export function isWindow(hwnd: Pointer): boolean {
 }
 
 /** 读取复选框的勾选状态。 */
+/** 下拉框：追加一个选项，返回其序号（失败为 -1）。 */
+export function comboBoxAddItem(hwnd: Pointer | undefined, text: string): number {
+	const native = loadNative();
+	if (!native || !hwnd) return -1;
+	return native.user32.SendMessageW(hwnd, CB_ADDSTRING, 0 as unknown as Pointer, wstrTemp(text));
+}
+
+/** 选中下拉框第 index 项；-1 表示清空选择。 */
+export function comboBoxSelect(hwnd: Pointer | undefined, index: number): void {
+	const native = loadNative();
+	if (!native || !hwnd) return;
+	native.user32.SendMessageW(
+		hwnd,
+		CB_SETCURSEL,
+		index as unknown as Pointer,
+		0 as unknown as Pointer,
+	);
+}
+
+/** 下拉框当前选中的序号；无选择时为 -1。 */
+export function comboBoxSelected(hwnd: Pointer | undefined): number {
+	const native = loadNative();
+	if (!native || !hwnd) return -1;
+	// SendMessageW 按指针返回：选中第 0 项时原始值 0 会被 Bun 转成 null，不归一化的话
+	// "选第一项"会被当成读不到选择（语言改不回中文就是这么来的）。
+	const selected = native.user32.SendMessageW(
+		hwnd,
+		CB_GETCURSEL,
+		0 as unknown as Pointer,
+		0 as unknown as Pointer,
+	);
+	if (selected == null) return 0;
+	const value = Number(selected);
+	// 未选中时 Win32 返回 -1，按指针返回时可能变成无符号最大值。
+	return value === 0xffffffff ? -1 : value;
+}
+
 export function isChecked(hwnd: Pointer | undefined): boolean {
 	const native = loadNative();
 	if (!native || !hwnd) return false;
@@ -867,10 +921,31 @@ export function isChecked(hwnd: Pointer | undefined): boolean {
 	);
 }
 
-export function invalidate(hwnd: Pointer | undefined): void {
+/** 设置复选框勾选状态：创建后要用已保存的偏好回显，否则每次打开都是默认未勾选。 */
+export function checkBoxSetChecked(hwnd: Pointer | undefined, checked: boolean): void {
 	const native = loadNative();
 	if (!native || !hwnd) return;
-	native.user32.InvalidateRect(hwnd, null as unknown as Pointer, 1);
+	native.user32.SendMessageW(
+		hwnd,
+		BM_SETCHECK,
+		(checked ? BST_CHECKED : 0) as unknown as Pointer,
+		0 as unknown as Pointer,
+	);
+}
+
+/** 标记窗口需要重绘；erase 为 true 时先擦背景，自绘控件应传 false（擦除会造成闪烁）。 */
+export function invalidate(hwnd: Pointer | undefined, erase = true): void {
+	const native = loadNative();
+	if (!native || !hwnd) return;
+	native.user32.InvalidateRect(hwnd, null as unknown as Pointer, erase ? 1 : 0);
+}
+
+/** 是否 owner-draw 按钮：悬停高亮只对这类控件有意义，其它控件不必跟着重绘。 */
+export function isOwnerDrawButton(hwnd: Pointer | undefined): boolean {
+	const native = loadNative();
+	if (!native || !hwnd) return false;
+	// GWL_STYLE = -16
+	return (native.user32.GetWindowLongW(hwnd, -16) & BS_OWNERDRAW) !== 0;
 }
 
 export function destroyWindow(hwnd: Pointer): void {
@@ -892,31 +967,30 @@ export function postMessage(hwnd: Pointer, msg: number, wParam = 0, lParam = 0):
 }
 
 /**
- * 用系统默认程序打开 URL。
+ * 交给系统 shell 打开 URL / 文件，可带参数（浏览器 --app 之类）。
  *
- * 不用 ShellExecuteW：它在 shell32.dll（不是 user32.dll），为一次调用多装一层 FFI 不划算。
- * `cmd /c start` 等价且更省事；windowsHide 保证不闪控制台窗口。
+ * 不用 `cmd /c start`：那会多起一个控制台中间进程，个别时序下即使 windowsHide 也仍会闪
+ * 一下黑窗；ShellExecuteW 直接走 shell，没有中间进程，也不会创建控制台。
  */
-export function openExternal(url: string): boolean {
-	try {
-		Bun.spawn(["cmd", "/c", "start", "", url], {
-			windowsHide: true,
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-		return true;
-	} catch {
-		return false;
-	}
+export function shellExecute(target: string, params?: string, show = SW_SHOWNORMAL): boolean {
+	const lib = loadShell32();
+	if (!lib) return false;
+	const result = lib.ShellExecuteW(
+		0n as unknown as Pointer,
+		wstrTemp("open"),
+		wstrTemp(target),
+		params === undefined ? (null as unknown as Pointer) : wstrTemp(params),
+		null as unknown as Pointer,
+		show,
+	);
+	// ShellExecuteW 返回值 > 32 才是成功，其余是错误码。
+	return Number(result) > 32;
 }
 
-/** Chromium 系浏览器的常见安装位置（msedge 不在 PATH，必须用绝对路径直启）。 */
-const CHROMIUM_PATHS = [
-	"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-	"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-	"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-];
+/** 用系统默认程序打开 URL 或文件（走 ShellExecuteW，无中间控制台进程）。 */
+export function openExternal(url: string): boolean {
+	return shellExecute(url);
+}
 
 /**
  * 打开前端面板：优先 Chromium 的 --app 窗口。
@@ -950,6 +1024,50 @@ export function messageBox(hwnd: Pointer, text: string, caption: string, type: n
 	const native = loadNative();
 	if (!native) return 0;
 	return native.user32.MessageBoxW(hwnd, wstrTemp(text), wstrTemp(caption), type);
+}
+
+/** CHOOSECOLORW 在 x64 下的固定大小与标志位。 */
+const CHOOSECOLOR_SIZE = 72;
+const CC_RGBINIT = 0x00000001;
+const CC_FULLOPEN = 0x00000002;
+
+let comdlg: { ChooseColorW: (params: Pointer) => number } | undefined;
+
+function loadComDlg(): typeof comdlg {
+	if (comdlg) return comdlg;
+	if (process.platform !== "win32") return undefined;
+	try {
+		const loaded = dlopen("comdlg32.dll", {
+			ChooseColorW: { args: [FFIType.ptr], returns: FFIType.i32 },
+		}).symbols as unknown as typeof comdlg;
+		comdlg = loaded;
+	} catch {
+		comdlg = undefined;
+	}
+	return comdlg;
+}
+
+/**
+ * 打开系统颜色选择对话框，返回选中的颜色（COLORREF）；用户取消时为 undefined。
+ *
+ * CHOOSECOLORW 是固定布局的结构体，必须按 x64 偏移逐字段写入；lpCustColors 指向
+ * 一块 16 个 COLORREF 的缓冲，由调用方跨次持有以保留用户的最近自定义色。
+ */
+export function chooseColor(
+	owner: Pointer | undefined,
+	initialRef: number,
+	customColors: Buffer,
+): number | undefined {
+	const lib = loadComDlg();
+	if (!lib) return undefined;
+	const frame = Buffer.alloc(CHOOSECOLOR_SIZE);
+	frame.writeUInt32LE(CHOOSECOLOR_SIZE, 0); // lStructSize
+	frame.writeBigUInt64LE(ptrValue(owner), 8); // hwndOwner
+	frame.writeUInt32LE(initialRef >>> 0, 24); // rgbResult（初值）
+	frame.writeBigUInt64LE(ptrValue(toPtr(customColors)), 32); // lpCustColors
+	frame.writeUInt32LE(CC_RGBINIT | CC_FULLOPEN, 40); // Flags
+	if (!lib.ChooseColorW(toPtr(frame))) return undefined;
+	return frame.readUInt32LE(24);
 }
 
 export function clientSize(hwnd: Pointer): { width: number; height: number } {
@@ -1077,6 +1195,7 @@ export const WM_DRAWITEM = 0x002b;
 export const BS_OWNERDRAW = 0x0000000b;
 export const ODS_SELECTED = 0x0001;
 export const ODS_DISABLED = 0x0004;
+export const ODS_FOCUS = 0x0010;
 export const DT_LEFT = 0x00000000;
 export const DT_CENTER = 0x00000001;
 export const DT_VCENTER = 0x00000004;
@@ -1422,16 +1541,28 @@ const NID_TIP_OFFSET = 40;
 
 interface Shell32 {
 	Shell_NotifyIconW: (message: number, data: Pointer) => number;
+	ShellExecuteW: (
+		hwnd: Pointer,
+		operation: Pointer,
+		file: Pointer,
+		params: Pointer,
+		directory: Pointer,
+		show: number,
+	) => Pointer;
 }
 
 let shell32: Shell32 | undefined;
 
-/** 托盘图标走 shell32；加载失败返回 undefined，调用方降级为无托盘。 */
+/** 托盘图标与 ShellExecute 都走 shell32；加载失败返回 undefined，调用方降级。 */
 function loadShell32(): Shell32 | undefined {
 	if (process.platform !== "win32") return undefined;
 	try {
 		shell32 ??= dlopen("shell32.dll", {
 			Shell_NotifyIconW: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.i32 },
+			ShellExecuteW: {
+				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.i32],
+				returns: FFIType.ptr,
+			},
 		}).symbols as unknown as Shell32;
 		return shell32;
 	} catch {
@@ -1486,6 +1617,29 @@ export function getControlId(hwnd: Pointer): number {
 	const native = loadNative();
 	if (!native) return 0;
 	return native.user32.GetDlgCtrlID(hwnd);
+}
+
+/** 光标正下方的窗口（含子控件）；查询失败时 undefined。 */
+export function windowAtCursor(): Pointer | undefined {
+	const native = loadNative();
+	if (!native) return undefined;
+	const point = Buffer.alloc(8);
+	if (!native.user32.GetCursorPos(toPtr(point))) return undefined;
+	// WindowFromPoint 的 POINT 按值传递：把 x/y 打包成一个 64 位值（低 32 位 x、高 32 位 y）。
+	const packed = BigInt(point.readUInt32LE(0)) | (BigInt(point.readUInt32LE(4)) << 32n);
+	const target = native.user32.WindowFromPoint(packed as unknown as Pointer);
+	return target ? target : undefined;
+}
+
+/**
+ * 光标下方控件的 id；不在任何控件上时为 0。
+ *
+ * 自绘按钮据此做悬停高亮：比跟踪 WM_MOUSEMOVE/TrackMouseEvent 简单，且对对话框里的按钮
+ * 同样有效（消息泵统一派发，不必每个窗口各自维护悬停状态）。
+ */
+export function controlIdAtCursor(): number {
+	const target = windowAtCursor();
+	return target ? getControlId(target) : 0;
 }
 
 /** 画刷缓存：WM_CTLCOLOR* 每次重绘都要返回画刷，反复新建会泄漏 GDI 对象。 */

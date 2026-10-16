@@ -90,7 +90,7 @@ import { tlsRoutes } from "./routes/tls";
 import { tokendanceRoutes } from "./routes/tokendance";
 import { traitLayerRoutes } from "./routes/trait-layers";
 import { tutorialRoutes } from "./routes/tutorial";
-import { updateRoutes } from "./routes/update";
+import { localPeerUpdateRoutes, updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
@@ -321,6 +321,10 @@ app.route("/api/external/v1", externalV1Routes);
 
 // Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
 app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
+
+// 管理器面板的更新端点（检查/下载/应用）：仅本机回环来源可免登录，因此必须注册在
+// 全局会话认证之前 —— Hono 按注册顺序匹配，晚于 requireSessionAuth 就永远轮不到。
+app.route("/api/update", localPeerUpdateRoutes);
 
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
