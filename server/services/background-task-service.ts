@@ -25,7 +25,6 @@ import {
 	inArray,
 	like,
 	lt,
-	lte,
 	ne,
 	notExists,
 	notInArray,
@@ -55,6 +54,7 @@ import {
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
 
 // === Types ===
@@ -404,6 +404,16 @@ class BackgroundTaskService {
 		this.listVersions = hotSafe("narrafork:bg-task:listVersions", () => new Map<string, number>());
 		this._broadcastFn = null;
 		this._livenessFn = null;
+		backgroundOccupancyStore.subscribe("background-task-list", (parentIds) => {
+			for (const parentId of parentIds) {
+				void this.broadcastListDelta(parentId, { invalidate: true }).catch((error) => {
+					logger.warn("Failed to broadcast maintained background occupancy", {
+						parentNarratorId: parentId,
+						error: String(error),
+					});
+				});
+			}
+		});
 		runtimePublication.setLegacyRuntimeAdmissionReader("bash", (source) => {
 			if (!this.abortControllers.has(source.taskId) && !this.killHandlers.has(source.taskId))
 				return undefined;
@@ -430,6 +440,7 @@ class BackgroundTaskService {
 	/** Reset the tracked versions. Test-only — production relies on the epoch. */
 	resetListVersionsForTests(): void {
 		this.listVersions.clear();
+		backgroundOccupancyStore.resetForTests();
 	}
 
 	/**
@@ -474,8 +485,10 @@ class BackgroundTaskService {
 	private async broadcastListDelta(
 		parentNarratorId: string,
 		delta: Omit<BackgroundTaskListDelta, "listEpoch" | "version" | "activeCount">,
-		refreshAncestors = true,
 	): Promise<void> {
+		// Recovery can mutate tasks before the explicit startup rebuild. Its
+		// subscriber publishes the baseline afterwards; never bootstrap from a frame.
+		if (!backgroundOccupancyStore.isReady) return;
 		const fn = await this.getBroadcastFn();
 		if (!fn) return;
 		let counts: BackgroundTaskActiveCounts;
@@ -507,39 +520,8 @@ class BackgroundTaskService {
 			activeBackgroundWorkCount: counts.activeWorkCount,
 			activeBackgroundServiceCount: counts.activeServiceCount,
 		});
-		if (refreshAncestors) await this.refreshAncestorTaskLists(parentNarratorId);
-	}
-
-	/** Child work can change an idle ancestor's agent projection to child_running. */
-	private async refreshAncestorTaskLists(narratorId: string): Promise<void> {
-		const visited = new Set<string>();
-		// Bound corrupt/cyclic ancestry as well as legitimate deeply nested teams.
-		for (let depth = 0; depth < 32 && !visited.has(narratorId); depth++) {
-			visited.add(narratorId);
-			const narrator = await db
-				.select({ parentNarratorId: narrators.parentNarratorId, type: narrators.type })
-				.from(narrators)
-				.where(eq(narrators.id, narratorId))
-				.get();
-			const parentId = narrator?.parentNarratorId;
-			if (narrator?.type !== "subagent" || !parentId || visited.has(parentId)) return;
-			// Unified projections may have a task id different from the narrator id;
-			// legacy subagents use their narrator id as the list row id.
-			const projection = await db
-				.select({ id: backgroundTasks.id })
-				.from(backgroundTasks)
-				.where(
-					and(
-						eq(backgroundTasks.parentNarratorId, parentId),
-						eq(backgroundTasks.type, "agent"),
-						eq(backgroundTasks.subagentNarratorId, narratorId),
-					),
-				)
-				.limit(1)
-				.get();
-			await this.broadcastTaskUpsert(parentId, projection?.id ?? narratorId, false);
-			narratorId = parentId;
-		}
+		// The maintenance subscriber invalidates affected old/new ancestors once
+		// per published batch; row frames must not walk or refresh them again.
 	}
 
 	/**
@@ -548,11 +530,7 @@ class BackgroundTaskService {
 	 * `effectiveStatus` — a delta that disagreed with the paged endpoint would
 	 * make the panel flip between two answers depending on which arrived last.
 	 */
-	private async broadcastTaskUpsert(
-		parentNarratorId: string,
-		taskId: string,
-		refreshAncestors = true,
-	): Promise<void> {
+	private async broadcastTaskUpsert(parentNarratorId: string, taskId: string): Promise<void> {
 		try {
 			// Callers may supply either the task id or its subagent narrator id.
 			// Prefer a direct task match, and keep both lookups in the requested parent.
@@ -577,10 +555,10 @@ class BackgroundTaskService {
 			const item =
 				unified ?? (await this.listLegacyRows(parentNarratorId, { ids: [taskId], limit: 1 }))[0];
 			if (!item) {
-				await this.broadcastListDelta(parentNarratorId, { removeIds: [taskId] }, refreshAncestors);
+				await this.broadcastListDelta(parentNarratorId, { removeIds: [taskId] });
 				return;
 			}
-			await this.broadcastListDelta(parentNarratorId, { upsert: item }, refreshAncestors);
+			await this.broadcastListDelta(parentNarratorId, { upsert: item });
 		} catch (err) {
 			logger.warn("Failed to broadcast background task list delta", {
 				parentNarratorId,
@@ -592,7 +570,10 @@ class BackgroundTaskService {
 
 	/** Fire-and-forget wrapper for the synchronous mark* paths. */
 	private queueTaskUpsert(parentNarratorId: string, taskId: string): void {
-		void this.broadcastTaskUpsert(parentNarratorId, taskId);
+		backgroundOccupancyStore.refreshTask(taskId);
+		if (backgroundOccupancyStore.isReady) {
+			void this.broadcastTaskUpsert(parentNarratorId, taskId);
+		}
 	}
 
 	/**
@@ -644,6 +625,7 @@ class BackgroundTaskService {
 	 * version guard `finalizeResumedAgentTask` relies on.
 	 */
 	notifyDerivedStatusChanged(parentNarratorId: string, taskId: string): void {
+		backgroundOccupancyStore.refreshNarrator(taskId);
 		this.queueTaskUpsert(parentNarratorId, taskId);
 	}
 
@@ -1991,194 +1973,13 @@ class BackgroundTaskService {
 		return this.reconcileSummaries(await this.listByParents(parentIds));
 	}
 
-	/**
-	 * Occupancy is a bounded graph, not a raw running-row count: an idle child
-	 * can own an idle grandchild which still owns a bash/paused transfer. Only
-	 * small metadata columns are read; no historical task outputs are loaded.
-	 * Budget exhaustion throws (and logs) rather than publishing a false zero.
-	 */
+	/** Read the maintained active closure; never discover historical descendants here. */
 	private async descendantOccupancy(rootIds: string[]): Promise<{
 		childCounts: Map<string, number>;
 		occupied: Set<string>;
 	}> {
-		const maxNodes = 4_096;
-		const maxRows = 8_192;
-		const maxDepth = 32;
-		const budgetMs = 150;
-		const startedAt = performance.now();
-		const visited = new Set(rootIds);
-		const children = new Map<string, Set<string>>();
-		const parents = new Map<string, Set<string>>();
-		const ownTasks = new Map<string, Set<string>>();
-		const occupied = new Set<string>();
-		const isLive = await this.getLivenessFn();
-		let rowCount = 0;
-		const fail = (reason: string): never => {
-			logger.warn("Background task descendant occupancy budget exceeded", {
-				reason,
-				roots: rootIds.length,
-				nodes: visited.size,
-				rows: rowCount,
-				elapsedMs: performance.now() - startedAt,
-			});
-			throw new Error(`Background task descendant occupancy incomplete: ${reason}`);
-		};
-		const checkBudget = () => {
-			if (visited.size > maxNodes) fail("node limit");
-			if (rowCount > maxRows) fail("row limit");
-			if (performance.now() - startedAt > budgetMs) fail("time limit");
-		};
-		const link = (parent: string, child: string) => {
-			if (parent === child) return;
-			if (!children.has(parent)) children.set(parent, new Set());
-			children.get(parent)?.add(child);
-			if (!parents.has(child)) parents.set(child, new Set());
-			parents.get(child)?.add(parent);
-		};
-		// Indexed existence probes discard terminal historical leaves BEFORE they
-		// enter the graph budget. Idle intermediates remain candidates, including
-		// an arbitrarily old ancestor of live work within the depth/node limits.
-		const hasDescendants = sql<boolean>`exists(select 1 from ${narrators} as occupancy_child
-			where occupancy_child.parent_narrator_id = ${narrators.id}
-			and occupancy_child.type = 'subagent')`;
-		const hasActiveTasks = sql<boolean>`exists(select 1 from ${backgroundTasks}
-			where ${backgroundTasks.parentNarratorId} = ${narrators.id}
-			and ${backgroundTasks.status} in ('running', 'paused')
-			and not (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service'))`;
-		let frontier = [...visited];
-		for (let depth = 0; frontier.length > 0; depth++) {
-			checkBudget();
-			if (depth >= maxDepth) fail("depth limit");
-			const next = new Set<string>();
-			// Keep IN lists small even for a wide team; LIMIT + 1 detects truncation.
-			for (let offset = 0; offset < frontier.length; offset += 128) {
-				checkBudget();
-				const batch = frontier.slice(offset, offset + 128);
-				// In-memory-only liveness gets a bounded parent-index probe. Do not sort
-				// historical siblings: parent/createdAt has no all-subagent index. Reserve
-				// half the remaining row budget for persisted work across remaining parents.
-				const probeLimit = Math.min(
-					BACKGROUND_TASK_ACTIVE_LIMIT + 1,
-					Math.floor((maxRows - rowCount) / (2 * (frontier.length - offset))),
-				);
-				const probeIds = sql.join(
-					batch.map(
-						(parentId) => sql`
-					select id from (select id from ${narrators}
-					where ${narrators.parentNarratorId} = ${parentId}
-					limit ${probeLimit}) as occupancy_probe`,
-					),
-					sql` union all `,
-				);
-				const livenessProbe = sql<boolean>`${narrators.id} in (${probeIds})`;
-				// Dead probes consume only the row budget, never the graph-node budget.
-				const rowLimit = maxRows - rowCount;
-				const rows = await db
-					.select({
-						id: narrators.id,
-						parentNarratorId: narrators.parentNarratorId,
-						status: narrators.status,
-						backgroundStatus: narrators.backgroundStatus,
-						substatus: narrators.substatus,
-						potentialWork: sql<boolean>`${hasDescendants} or ${hasActiveTasks}`,
-						// Both identities are indexed; EXISTS never loads terminal history.
-						hasProjection: sql<boolean>`exists(select 1 from ${backgroundTasks} where
-							${backgroundTasks.id} = ${narrators.id} or
-							(${backgroundTasks.type} = 'agent' and ${backgroundTasks.subagentNarratorId} = ${narrators.id}))`,
-					})
-					.from(narrators)
-					.where(
-						and(
-							inArray(narrators.parentNarratorId, batch),
-							eq(narrators.type, "subagent"),
-							or(
-								inArray(narrators.status, ["working", "waiting"]),
-								eq(narrators.backgroundStatus, "running"),
-								like(narrators.substatus, '%"taken_over"%'),
-								hasActiveTasks,
-								hasDescendants,
-								isLive && probeLimit > 0 ? livenessProbe : undefined,
-							),
-						),
-					)
-					.limit(rowLimit + 1)
-					.all();
-				rowCount += rows.length;
-				if (rows.length > rowLimit) fail("child query limit");
-				for (const row of rows) {
-					if (!row.parentNarratorId) continue;
-					const active =
-						row.status === "working" ||
-						row.status === "waiting" ||
-						(row.backgroundStatus === "running" && !row.hasProjection) ||
-						parseSubstatus(row.substatus).includes("taken_over") ||
-						isLive?.(row.id);
-					if (!active && !row.potentialWork) continue;
-					link(row.parentNarratorId, row.id);
-					if (active) occupied.add(row.id);
-					if (!visited.has(row.id)) {
-						visited.add(row.id);
-						next.add(row.id);
-					}
-				}
-				checkBudget();
-				const tasks = await db
-					.select({
-						id: backgroundTasks.id,
-						parentNarratorId: backgroundTasks.parentNarratorId,
-						type: backgroundTasks.type,
-						subagentNarratorId: backgroundTasks.subagentNarratorId,
-					})
-					.from(backgroundTasks)
-					.where(
-						and(
-							inArray(backgroundTasks.parentNarratorId, batch),
-							inArray(backgroundTasks.status, ["running", "paused"]),
-							sql`not (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service')`,
-						),
-					)
-					.limit(maxRows - rowCount + 1)
-					.all();
-				rowCount += tasks.length;
-				for (const task of tasks) {
-					if (task.type === "agent") {
-						const child = task.subagentNarratorId ?? task.id;
-						link(task.parentNarratorId, child);
-						occupied.add(child);
-						if (!visited.has(child)) {
-							visited.add(child);
-							next.add(child);
-						}
-					} else {
-						if (!ownTasks.has(task.parentNarratorId))
-							ownTasks.set(task.parentNarratorId, new Set());
-						ownTasks.get(task.parentNarratorId)?.add(task.id);
-						occupied.add(task.parentNarratorId);
-					}
-				}
-				checkBudget();
-			}
-			frontier = [...next];
-		}
-		// Work-seeded reachability converges once per node, including cyclic data.
-		const queue = [...occupied];
-		for (let index = 0; index < queue.length; index++) {
-			for (const parent of parents.get(queue[index]) ?? []) {
-				if (occupied.has(parent)) continue;
-				occupied.add(parent);
-				queue.push(parent);
-			}
-		}
-		const childCounts = new Map<string, number>();
-		for (const id of visited) {
-			let value = ownTasks.get(id)?.size ?? 0;
-			for (const child of children.get(id) ?? []) {
-				if (occupied.has(child)) value++;
-			}
-			childCounts.set(id, value);
-		}
-		checkBudget();
-		return { childCounts, occupied };
+		await backgroundOccupancyStore.flush();
+		return backgroundOccupancyStore.snapshot(rootIds);
 	}
 
 	/**
@@ -2471,8 +2272,11 @@ class BackgroundTaskService {
 			omitOutput?: boolean;
 		},
 	): Promise<BackgroundTaskListItem[]> {
-		const occupancy = opts.activeOnly ? await this.descendantOccupancy([parentNarratorId]) : null;
-		const occupiedIds = occupancy ? [...occupancy.occupied] : [];
+		if (opts.activeOnly) await backgroundOccupancyStore.flush();
+		const activeIds = opts.activeOnly
+			? backgroundOccupancyStore.getActiveLegacyIds(parentNarratorId, opts.limit)
+			: null;
+		if (activeIds?.length === 0) return [];
 		const conditions = [
 			eq(narrators.parentNarratorId, parentNarratorId),
 			// Execution mode is temporary, not membership: user continuations clear
@@ -2494,15 +2298,7 @@ class BackgroundTaskService {
 			),
 		];
 		if (opts.ids) conditions.push(inArray(narrators.id, opts.ids));
-		if (opts.activeOnly)
-			conditions.push(
-				or(
-					eq(narrators.backgroundStatus, "running"),
-					inArray(narrators.status, ["working", "waiting"]),
-					like(narrators.substatus, '%"taken_over"%'),
-					occupiedIds.length > 0 ? inArray(narrators.id, occupiedIds) : undefined,
-				),
-			);
+		if (activeIds) conditions.push(inArray(narrators.id, activeIds));
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, narrators.createdAt, narrators.id)
 			: undefined;
@@ -2531,8 +2327,7 @@ class BackgroundTaskService {
 			.limit(opts.limit)
 			.all();
 
-		const { childCounts } =
-			occupancy ?? (await this.descendantOccupancy(rows.map((row) => row.id)));
+		const { childCounts } = await this.descendantOccupancy(rows.map((row) => row.id));
 		return this.applyLiveness(
 			rows.map((row) => {
 				const activeChildTaskCount = childCounts.get(row.id) ?? 0;
@@ -2595,7 +2390,15 @@ class BackgroundTaskService {
 		},
 	): Promise<BackgroundTaskListItem[]> {
 		const conditions = [eq(backgroundTasks.parentNarratorId, parentNarratorId)];
-		if (opts.activeOnly) conditions.push(inArray(backgroundTasks.status, ["running", "paused"]));
+		if (opts.activeOnly) {
+			await backgroundOccupancyStore.flush();
+			const activeIds = backgroundOccupancyStore.getActiveTaskIds(parentNarratorId, {
+				serviceOnly: opts.serviceOnly,
+				limit: opts.limit,
+			});
+			if (activeIds.length === 0) return [];
+			conditions.push(inArray(backgroundTasks.id, activeIds));
+		}
 		if (opts.serviceOnly) {
 			conditions.push(
 				eq(backgroundTasks.type, "bash"),
@@ -2656,13 +2459,9 @@ class BackgroundTaskService {
 	 * Batch variant of `countActiveByParent` for list surfaces (RecentTabs
 	 * snapshot, GET /api/narrators) that render one badge per narrator.
 	 *
-	 * The per-parent candidate cap is applied in SQL via a window function: the
-	 * `type='agent'` predicate matches every historical agent row forever, so
-	 * capping in JS after an uncapped read would materialize a narrator's whole
-	 * agent history on the main thread. Reconcile + liveness semantics are shared
-	 * with the single-parent path so a sidebar badge and the panel badge can
-	 * never disagree, and the result is capped at BACKGROUND_TASK_ACTIVE_LIMIT
-	 * per parent for the same reason `listActiveItems` truncates.
+	 * Counts come from the same maintained graph as single-parent and list reads.
+	 * Only the returned work/service counts are capped; terminal history is never
+	 * queried or ranked to answer a badge request.
 	 */
 	async countActiveByParentBatch(parentNarratorIds: string[]): Promise<Map<string, number>> {
 		const counts = await this.countActiveKindsByParentBatch(parentNarratorIds);
@@ -2673,274 +2472,50 @@ class BackgroundTaskService {
 		);
 	}
 
+	/** Batch badges are a materialized read, independent of terminal task history. */
 	async countActiveKindsByParentBatch(
 		parentNarratorIds: string[],
 	): Promise<Map<string, BackgroundTaskActiveCounts>> {
-		const result = new Map<string, BackgroundTaskActiveCounts>();
-		const counts = new Map<string, number>();
-		const services = new Map<string, number>();
 		const ids = [...new Set(parentNarratorIds.filter((id) => typeof id === "string" && id))];
-		if (ids.length === 0) return result;
-		if (ids.length > 4_096) {
-			logger.warn("Background task batch count root limit exceeded", { roots: ids.length });
-			throw new Error("Background task batch count incomplete: root limit");
-		}
-
-		const cap = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
-		const candidateSq = db
-			.select({
-				id: backgroundTasks.id,
-				parentNarratorId: backgroundTasks.parentNarratorId,
-				type: backgroundTasks.type,
-				status: backgroundTasks.status,
-				subagentNarratorId: backgroundTasks.subagentNarratorId,
-				backgroundKind: backgroundTasks.backgroundKind,
-				rn: sql<number>`ROW_NUMBER() OVER (PARTITION BY ${backgroundTasks.parentNarratorId}, (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service') ORDER BY ${backgroundTasks.createdAt} DESC, ${backgroundTasks.id} DESC)`.as(
-					"rn",
-				),
-			})
-			.from(backgroundTasks)
-			.where(
-				and(
-					inArray(backgroundTasks.parentNarratorId, ids),
-					or(
-						eq(backgroundTasks.status, "running"),
-						eq(backgroundTasks.status, "paused"),
-						eq(backgroundTasks.type, "agent"),
-					),
-				),
-			)
-			.as("candidates");
-		const candidateRows = await db
-			.select({
-				id: candidateSq.id,
-				parentNarratorId: candidateSq.parentNarratorId,
-				type: candidateSq.type,
-				backgroundKind: candidateSq.backgroundKind,
-				status: candidateSq.status,
-				subagentNarratorId: candidateSq.subagentNarratorId,
-			})
-			.from(candidateSq)
-			.where(lte(candidateSq.rn, cap))
-			.limit(16_385)
-			.all();
-		const serviceCandidateCount = candidateRows.filter(
-			(row) => row.type === "bash" && row.backgroundKind === "service",
-		).length;
-		if (serviceCandidateCount > 8_192 || candidateRows.length - serviceCandidateCount > 8_192) {
-			logger.warn("Background task batch count candidate limit exceeded", {
-				roots: ids.length,
-				rows: candidateRows.length,
-			});
-			throw new Error("Background task batch count incomplete: candidate limit");
-		}
-
-		// Reconcile agent rows against their subagent narrators' current state —
-		// same inputs as reconcileSummaries, but count-only (no list items built).
-		const agentIds = [
-			...new Set(
-				candidateRows
-					.filter((row) => row.type === "agent")
-					.map((row) => row.subagentNarratorId ?? row.id),
-			),
-		];
-		const narratorState = new Map<
-			string,
-			{
-				status: string;
-				isBackground: boolean | null;
-				backgroundStatus: string | null;
-				substatus: string | null;
-				errorMessage: string | null;
-			}
-		>();
-		const { childCounts, occupied } = await this.descendantOccupancy([...ids, ...agentIds]);
-		if (agentIds.length > 0) {
-			const narratorRows = await db
-				.select({
-					id: narrators.id,
-					status: narrators.status,
-					isBackground: narrators.isBackground,
-					backgroundStatus: narrators.backgroundStatus,
-					substatus: narrators.substatus,
-					errorMessage: narrators.errorMessage,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, agentIds))
-				.all();
-			for (const row of narratorRows) narratorState.set(row.id, row);
-		}
-
-		const isLive = await this.getLivenessFn();
-		// Same overlay as applyLiveness, minus transfer progress (which never
-		// changes whether a row counts as active).
-		const liveEffectiveStatus = (row: {
-			type: string;
-			status: string;
-			subagentNarratorId: string | null;
-			id: string;
-			effectiveStatus: string;
-		}): string => {
-			if (!isLive || row.type !== "agent") return row.effectiveStatus;
-			if (!isLive(row.subagentNarratorId ?? row.id)) return row.effectiveStatus;
-			if (row.effectiveStatus === "taken_over") return "taken_over";
-			return row.status === "running" ? "running" : "continued";
-		};
-
-		for (const row of candidateRows) {
-			const subagentNarratorId = row.type === "agent" ? (row.subagentNarratorId ?? row.id) : null;
-			const currentNarrator = subagentNarratorId
-				? (narratorState.get(subagentNarratorId) ?? null)
-				: null;
-			const effectiveStatus = liveEffectiveStatus({
-				...row,
-				effectiveStatus: resolveBackgroundTaskEffectiveStatus({
-					taskStatus: row.status,
-					currentNarratorStatus: currentNarrator?.status ?? null,
-					currentNarratorIsBackground: currentNarrator?.isBackground,
-					currentNarratorBackgroundStatus: currentNarrator?.backgroundStatus,
-					currentNarratorSubstatus: currentNarrator?.substatus,
-					currentNarratorErrorMessage: currentNarrator?.errorMessage,
-					activeChildTaskCount: subagentNarratorId ? (childCounts.get(subagentNarratorId) ?? 0) : 0,
-				}),
-			});
-			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
-				const bucket = row.type === "bash" && row.backgroundKind === "service" ? services : counts;
-				bucket.set(row.parentNarratorId, (bucket.get(row.parentNarratorId) ?? 0) + 1);
-			}
-		}
-
-		// Same legacy candidates and per-parent cap/order as listLegacyRows.
-		// The bounded graph also discovers idle legacy ancestors of live work.
-		const occupiedIds = [...occupied];
-		const legacySq = db
-			.select({
-				id: narrators.id,
-				parentNarratorId: narrators.parentNarratorId,
-				status: narrators.status,
-				isBackground: narrators.isBackground,
-				backgroundStatus: narrators.backgroundStatus,
-				substatus: narrators.substatus,
-				errorMessage: narrators.errorMessage,
-				rn: sql<number>`ROW_NUMBER() OVER (PARTITION BY ${narrators.parentNarratorId} ORDER BY ${narrators.createdAt} DESC, ${narrators.id} DESC)`.as(
-					"rn",
-				),
-			})
-			.from(narrators)
-			.where(
-				and(
-					inArray(narrators.parentNarratorId, ids),
-					or(eq(narrators.isBackground, true), like(narrators.variant, "subagent:%")),
-					notExists(
-						db
-							.select({ one: sql`1` })
-							.from(backgroundTasks)
-							.where(
-								or(
-									eq(backgroundTasks.id, narrators.id),
-									and(
-										eq(backgroundTasks.type, "agent"),
-										eq(backgroundTasks.subagentNarratorId, narrators.id),
-									),
-								),
-							),
-					),
-					or(
-						eq(narrators.backgroundStatus, "running"),
-						inArray(narrators.status, ["working", "waiting"]),
-						like(narrators.substatus, '%"taken_over"%'),
-						occupiedIds.length > 0 ? inArray(narrators.id, occupiedIds) : undefined,
-					),
-				),
-			)
-			.as("legacy_candidates");
-		const legacyRows = await db.select().from(legacySq).where(lte(legacySq.rn, cap)).all();
-		for (const row of legacyRows) {
-			if (!row.parentNarratorId) continue;
-			const status =
-				row.backgroundStatus ??
-				(row.status === "working" || row.status === "waiting" ? "running" : "completed");
-			const effectiveStatus = liveEffectiveStatus({
-				id: row.id,
-				type: "agent",
-				status,
-				subagentNarratorId: row.id,
-				effectiveStatus: resolveBackgroundTaskEffectiveStatus({
-					taskStatus: status as BackgroundTaskRecord["status"],
-					currentNarratorStatus: row.status,
-					currentNarratorIsBackground: row.isBackground,
-					currentNarratorBackgroundStatus: row.backgroundStatus,
-					currentNarratorSubstatus: row.substatus,
-					currentNarratorErrorMessage: row.errorMessage,
-					activeChildTaskCount: childCounts.get(row.id) ?? 0,
-				}),
-			});
-			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
-				counts.set(row.parentNarratorId, (counts.get(row.parentNarratorId) ?? 0) + 1);
-			}
-		}
-
-		// Independent caps prevent long-lived services from hiding active work.
-		for (const parentId of ids) {
-			const activeWorkCount = Math.min(counts.get(parentId) ?? 0, BACKGROUND_TASK_ACTIVE_LIMIT);
-			const activeServiceCount = Math.min(
-				services.get(parentId) ?? 0,
-				BACKGROUND_TASK_ACTIVE_LIMIT,
-			);
-			result.set(parentId, {
-				activeCount: activeWorkCount + activeServiceCount,
-				activeWorkCount,
-				activeServiceCount,
-			});
-		}
-		return result;
+		if (ids.length === 0) return new Map();
+		await backgroundOccupancyStore.flush();
+		return backgroundOccupancyStore.snapshot(ids).counts;
 	}
 
-	/**
-	 * The active set: every row whose reconciled status is still doing work.
-	 *
-	 * Candidates are the `running` rows plus all agent rows (only agent rows can
-	 * derive `continued`/`child_running`), capped at the active limit + 1 so the
-	 * caller can report truncation instead of silently under-counting.
-	 *
-	 * With `omitOutput` the rows come back without any preview text — valid only
-	 * for callers that just count them, never for the ones that serve `activeTasks`.
-	 */
+	/** Load bounded, already-maintained active IDs; never rank historical agent rows. */
 	private async listActiveItems(
 		parentNarratorId: string,
 		opts?: { omitOutput?: boolean },
 	): Promise<{ items: BackgroundTaskListItem[]; truncated: boolean }> {
 		const limit = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
+		await backgroundOccupancyStore.flush();
+		const activeIds = backgroundOccupancyStore.getActiveTaskIds(parentNarratorId, {
+			serviceOnly: false,
+			limit,
+		});
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
 		const [candidateRows, legacyActive, serviceActive] = await Promise.all([
-			db
-				.select({
-					...columns,
-					output: opts?.omitOutput
-						? sql<string | null>`null`
-						: sql<
-								string | null
-							>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
-				})
-				.from(backgroundTasks)
-				.where(
-					and(
-						eq(backgroundTasks.parentNarratorId, parentNarratorId),
-						sql`not (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service')`,
-						or(
-							eq(backgroundTasks.status, "running"),
-							// A paused transfer is still active work (see
-							// isBackgroundTaskActiveStatus). Omitting it here would make the
-							// candidate set disagree with the predicate that filters it,
-							// which is the silent kind of bug: the row simply never appears.
-							eq(backgroundTasks.status, "paused"),
-							eq(backgroundTasks.type, "agent"),
-						),
-					),
-				)
-				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-				.limit(limit)
-				.all(),
+			activeIds.length === 0
+				? Promise.resolve([])
+				: db
+						.select({
+							...columns,
+							output: opts?.omitOutput
+								? sql<string | null>`null`
+								: sql<
+										string | null
+									>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+						})
+						.from(backgroundTasks)
+						.where(
+							and(
+								eq(backgroundTasks.parentNarratorId, parentNarratorId),
+								inArray(backgroundTasks.id, activeIds),
+							),
+						)
+						.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+						.limit(limit)
+						.all(),
 			this.listLegacyRows(parentNarratorId, {
 				limit,
 				activeOnly: true,
@@ -2954,9 +2529,6 @@ class BackgroundTaskService {
 			}),
 		]);
 		const summaries = await this.reconcileSummaries(candidateRows);
-		// Liveness BEFORE the filter: a terminal row whose loop is running again is
-		// exactly the `continued` case the active set exists to surface, and filtering
-		// on the persisted status first would drop it.
 		const unifiedActive = await this.applyLiveness(
 			summaries.map((summary) => this.toListItem(summary)),
 		);
@@ -2964,15 +2536,14 @@ class BackgroundTaskService {
 			.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus))
 			.concat(legacyActive.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus)))
 			.sort(compareBackgroundTaskListItemsDesc);
-		const truncated =
-			items.length > BACKGROUND_TASK_ACTIVE_LIMIT ||
-			serviceActive.length > BACKGROUND_TASK_ACTIVE_LIMIT;
 		return {
 			items: [
 				...items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
 				...serviceActive.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
 			].sort(compareBackgroundTaskListItemsDesc),
-			truncated,
+			truncated:
+				items.length > BACKGROUND_TASK_ACTIVE_LIMIT ||
+				serviceActive.length > BACKGROUND_TASK_ACTIVE_LIMIT,
 		};
 	}
 
@@ -3900,7 +3471,9 @@ class BackgroundTaskService {
 				.where(inArray(narrators.id, narratorIds));
 		}
 
+		backgroundOccupancyStore.refreshNarrators(narratorIds);
 		for (const task of staleTasks) {
+			backgroundOccupancyStore.refreshTask(task.id);
 			this.cleanupRuntime(task.id);
 			// A paused transfer emits NOTHING here. The `cancelled` event is what
 			// unblocks a waiting `Await`, and answering "cancelled" for a transfer that
@@ -4014,6 +3587,7 @@ class BackgroundTaskService {
 				logicalRunId: backgroundTasks.logicalRunId,
 				parentNarratorId: backgroundTasks.parentNarratorId,
 				type: backgroundTasks.type,
+				subagentNarratorId: backgroundTasks.subagentNarratorId,
 			})
 			.from(backgroundTasks)
 			.where(
@@ -4096,8 +3670,11 @@ class BackgroundTaskService {
 			),
 		);
 
-		for (const taskId of deletableIds) {
-			this.cleanupRuntime(taskId);
+		for (const row of deletable) {
+			backgroundOccupancyStore.refreshTask(row.id);
+			if (row.type === "agent")
+				backgroundOccupancyStore.refreshNarrator(row.subagentNarratorId ?? row.id);
+			this.cleanupRuntime(row.id);
 		}
 
 		// Tell each affected parent's subscribers which rows disappeared. A reap the
@@ -4129,10 +3706,18 @@ class BackgroundTaskService {
 
 	/** Broadcast cleanup deltas to affected parent narrators (shared by PG and SQLite paths). */
 	private broadcastCleanupDelta(
-		rows: ReadonlyArray<{ id: string; parentNarratorId: string; type: string }>,
+		rows: ReadonlyArray<{
+			id: string;
+			parentNarratorId: string;
+			type: string;
+			subagentNarratorId?: string | null;
+		}>,
 	): void {
 		const byParent = new Map<string, string[]>();
 		for (const row of rows) {
+			backgroundOccupancyStore.refreshTask(row.id);
+			if (row.type === "agent")
+				backgroundOccupancyStore.refreshNarrator(row.subagentNarratorId ?? row.id);
 			const ids = byParent.get(row.parentNarratorId);
 			if (ids) ids.push(row.id);
 			else byParent.set(row.parentNarratorId, [row.id]);

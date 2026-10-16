@@ -56,6 +56,7 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
@@ -695,6 +696,7 @@ async function writeSubstatus(
 				.where(eq(narrators.id, narratorId)),
 		{ label: "writeSubstatus", maxRetries: 5 },
 	);
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 }
 
 /**
@@ -2714,6 +2716,7 @@ const sqliteNarratorPersistence = {
 			await writeStatus();
 		}
 
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 		// Always emit status_changed so downstream listeners (gateway, notifications)
 		// are notified. For errors, also emit the dedicated narrator:error event.
 		eventBus.emit({
@@ -2921,6 +2924,7 @@ const sqliteNarratorPersistence = {
 				: await runCompareAndSet();
 
 		if (result.changes === 0) return false;
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 
 		// Always emit status_changed; for errors also emit narrator:error.
 		eventBus.emit({

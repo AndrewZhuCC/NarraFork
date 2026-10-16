@@ -101,6 +101,7 @@ import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -1671,6 +1672,7 @@ export function createPreparedNarratorInTransaction(
 
 /** Publish non-transactional narrator creation side effects after commit. */
 export function publishNarratorCreated(narrator: typeof narrators.$inferSelect): void {
+	backgroundOccupancyStore.refreshNarrator(narrator.id);
 	logger.info("Narrator created", {
 		id: narrator.id,
 		chapterId: narrator.chapterId,
@@ -1860,6 +1862,7 @@ export const narratorService = {
 					})
 					.returning();
 
+				backgroundOccupancyStore.refreshNarrator(id);
 				logger.info("Subagent created", {
 					id,
 					parentNarratorId: input.parentNarratorId,
@@ -2379,6 +2382,8 @@ export const narratorService = {
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		backgroundOccupancyStore.removeNarrators([narratorId]);
+		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
 		eventBus.emit({ type: "human_attention:changed" });
 		if (bindingTransition) {

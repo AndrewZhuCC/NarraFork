@@ -509,6 +509,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	// The injected occupancy source currently uses the SQLite builder; the maintained
+	// graph is backend-neutral, so this is not a permanently SQLite-only module.
+	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays

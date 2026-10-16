@@ -14,6 +14,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { buildReviewSystemPrompt, getReviewStartMessage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
@@ -672,6 +673,7 @@ export const reviewService = {
 						updatedAt: now,
 					})
 					.where(eq(narrators.id, reviewNarrator.id));
+				backgroundOccupancyStore.refreshNarrator(reviewNarrator.id);
 
 				// Use updateStatus to ensure event bus + WS broadcast
 				await narratorService.updateStatus(reviewNarrator.id, "idle", {

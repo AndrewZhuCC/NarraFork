@@ -139,6 +139,7 @@ import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
 	backgroundAgentNoticePreview,
@@ -8121,6 +8122,7 @@ export async function recoverOnStartup(
 				.update(narrators)
 				.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
 				.where(inArray(narrators.id, interruptedIds));
+			backgroundOccupancyStore.refreshNarrators(interruptedIds);
 			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
 				count: interruptedIds.length,
 			});

@@ -52,6 +52,7 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { IMPORTED_TRAIT, subagentVariant } from "../../lib/narrator-utils";
 import { imageRefToContentBlock, saveUploadedImage } from "../../lib/uploads";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "../narrator-refs/seq-store";
@@ -464,6 +465,7 @@ function createImportedSubagent(input: {
 			updatedAt: now,
 		})
 		.run();
+	backgroundOccupancyStore.refreshNarrator(id);
 	return id;
 }
 

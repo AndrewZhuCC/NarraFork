@@ -41,6 +41,7 @@ const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
 );
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
 const manual = await import("../subagent-manual-override");
 const takeover = await import("../subagent-takeover");
@@ -85,8 +86,10 @@ const unregister = provider.registerExternalProviderResolver({
 	listReadiness: () => [],
 });
 const ids = ["contract-parent", "contract-primary", "contract-child"];
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	settings.agent.autoContinuationMode = "off";
 	const now = new Date().toISOString();
 	for (const id of ["principal-a", "principal-b"]) {
@@ -106,15 +109,20 @@ beforeEach(() => {
 				updatedAt: now,
 			})
 			.run();
+	backgroundOccupancyStore.refreshNarrators(ids);
+	await backgroundOccupancyStore.flush();
 });
-afterEach(() => {
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
+		backgroundOccupancyStore.setRuntimeLive(id, false);
 	}
+	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
 afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
 	unregister();
 	mock.module("../../db", () => realDb);
 });
@@ -165,6 +173,7 @@ function fixture(
 	const owner = tryClaimExecution(id, profile.kind);
 	if (!owner) throw new Error("Missing fixture owner");
 	activeNarrators.set(id, session);
+	backgroundOccupancyStore.setRuntimeLive(id, true);
 	const calls: ExecuteLoopOptions[] = [];
 	spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 		expect(options.config.executionSegmentId).toBe(
@@ -418,6 +427,8 @@ describe("real shared orchestrator profile contract", () => {
 			.set({ contextSummary: summary, contextSummaryChars: 0 })
 			.where(eq(narrators.id, "contract-child"))
 			.run();
+		backgroundOccupancyStore.refreshNarrator("contract-child");
+		await backgroundOccupancyStore.flush();
 		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 			expect(options.config.systemPrompt).toBe(finalPrompt);
 			expect(options.config.executionSegmentId).toBe("child-run-segment");
@@ -477,6 +488,8 @@ describe("real shared orchestrator profile contract", () => {
 				.set({ contextSummary: "cached", contextSummaryChars: 6 })
 				.where(eq(narrators.id, h.session.narratorId))
 				.run();
+			backgroundOccupancyStore.refreshNarrator(h.session.narratorId);
+			await backgroundOccupancyStore.flush();
 			expect((await h.run()).hasError).toBe(false);
 		});
 
@@ -509,6 +522,8 @@ describe("real shared orchestrator profile contract", () => {
 				.set({ contextSummary: summary, contextSummaryChars: 0 })
 				.where(eq(narrators.id, h.session.narratorId))
 				.run();
+			backgroundOccupancyStore.refreshNarrator(h.session.narratorId);
+			await backgroundOccupancyStore.flush();
 			expect((await h.run()).hasError).toBe(false);
 		});
 

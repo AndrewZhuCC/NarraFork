@@ -2,6 +2,7 @@ import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, terminals } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
+import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
 import { getNarratorIdsWithDraft } from "./narrator-draft-service";
@@ -88,16 +89,24 @@ export async function enrichTabs(
 
 		// Active background task counts (subagents + bash + transfers). Lazy import
 		// matches the narrators route: the service pulls in half the agent runtime.
-		const { backgroundTaskService } = await import("./background-task-service");
-		const bgTaskCountMap = await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
-		for (const tab of tabs) {
-			const nId = getTabNarratorId(tab);
-			if (nId) {
-				const counts = bgTaskCountMap.get(nId);
-				tab.activeBackgroundTaskCount = counts?.activeCount ?? 0;
-				tab.activeBackgroundWorkCount = counts?.activeWorkCount ?? 0;
-				tab.activeBackgroundServiceCount = counts?.activeServiceCount ?? 0;
+		try {
+			const { backgroundTaskService } = await import("./background-task-service");
+			const bgTaskCountMap = await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
+			for (const tab of tabs) {
+				const nId = getTabNarratorId(tab);
+				if (nId) {
+					const counts = bgTaskCountMap.get(nId);
+					tab.activeBackgroundTaskCount = counts?.activeCount ?? 0;
+					tab.activeBackgroundWorkCount = counts?.activeWorkCount ?? 0;
+					tab.activeBackgroundServiceCount = counts?.activeServiceCount ?? 0;
+				}
 			}
+		} catch (err) {
+			// Keep existing counts (or omit unknown ones), without losing basic tab data.
+			logger.warn("Failed to load background counts for recent tabs", {
+				count: narratorIds.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 
 		// Presence (from in-memory map)
