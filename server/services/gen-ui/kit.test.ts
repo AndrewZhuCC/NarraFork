@@ -9,7 +9,6 @@ import { buildKit, type KitBuildRun, readKit, readKitBundle } from "./kit";
 import { kitFileSha256, resetKitSigningKeyForTest, signKitFields } from "./kit-signature";
 
 const KIT = ".narrafork/gen_ui/kit";
-const LEGACY_KIT = ".narrafork/intelligent_ui/kit";
 const REPO_MODULES = resolve(import.meta.dir, "../../../node_modules");
 const roots: string[] = [];
 afterEach(async () => {
@@ -144,21 +143,6 @@ describe("component kit state", () => {
 		expect(broken.reason).toBeTruthy();
 		await writeFile(join(f.root, KIT, "kit.json"), manifest([{ name: "lower", from: "./a" }]));
 		expect((await f.read()).status.reason).toContain("PascalCase");
-	});
-
-	test("a kit authored before the rename is used until one exists at the current place", async () => {
-		const f = await project({
-			[`${LEGACY_KIT}/kit.json`]: manifest([{ name: "Old", from: "./old" }]),
-		});
-		const legacy = await f.record("globalThis.__nfKit = {};");
-		expect(legacy.status).toMatchObject({ state: "ready", components: ["Old"] });
-		expect(existsSync(join(f.root, LEGACY_KIT, "dist/kit.meta.json"))).toBe(true);
-		expect(existsSync(join(f.root, KIT))).toBe(false);
-		expect((await f.read()).status).toMatchObject({ state: "ready", components: ["Old"] });
-
-		await mkdir(join(f.root, KIT), { recursive: true });
-		await writeFile(join(f.root, KIT, "kit.json"), manifest([{ name: "New", from: "./new" }]));
-		expect((await f.read()).status).toMatchObject({ state: "unbuilt" });
 	});
 
 	test("a build that exits 0 without writing its bundle records nothing", async () => {

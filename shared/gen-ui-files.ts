@@ -1,7 +1,5 @@
 /** Ordinary workspace files, not a second document/revision store. */
 export const GEN_UI_DIRECTORY = ".narrafork/gen_ui";
-/** Where UI files lived before the rename. Still previewed; never created in. */
-export const GEN_UI_LEGACY_DIRECTORY = ".narrafork/intelligent_ui";
 export const GEN_UI_ENTRY = "App.tsx";
 
 /** Written by the tool host; API callers cannot use a path as an authorization grant. */

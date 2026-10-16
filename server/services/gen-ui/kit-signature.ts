@@ -11,7 +11,7 @@ import { getNarraforkPath } from "@server/lib/narrafork-home";
  * file tools do not reach, so a bundle is served only when the host itself recorded it.
  * The signature also names the workspace, so a copy into another workspace does not verify.
  */
-const KEY_FILE = "intelligent-ui-kit-signing.key";
+const KEY_FILE = "gen-ui-kit-signing.key";
 const KEY_BYTES = 32;
 const SIGNATURE = /^[0-9a-f]{64}$/;
 

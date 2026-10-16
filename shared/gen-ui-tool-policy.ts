@@ -1,34 +1,5 @@
 /** Kept dependency-free so permission gates never load the preview compiler. */
 export const GEN_UI_TOOL_NAME = "GenUI";
-/**
- * What this tool was called before it became GenUI. Recorded tool calls, narrators'
- * `enabledTools` and exported transcripts still carry it, so everything that reads
- * history accepts both; nothing new is ever written under it.
- */
-export const GEN_UI_LEGACY_TOOL_NAME = "IntelligentUI";
-export const GEN_UI_TOOL_NAMES: readonly string[] = [GEN_UI_TOOL_NAME, GEN_UI_LEGACY_TOOL_NAME];
-
-/** A recorded call of this tool, under its current or its former name. */
-export function isGenUiToolName(name: unknown): boolean {
-	return name === GEN_UI_TOOL_NAME || name === GEN_UI_LEGACY_TOOL_NAME;
-}
-
-/** Result metadata keys, each with the name results were recorded under before the rename. */
-const LEGACY_METADATA_KEYS = Object.freeze({
-	genUi: "intelligentUi",
-	genUiInline: "intelligentUiInline",
-	genUiKit: "intelligentUiKit",
-});
-export type GenUiMetadataKey = keyof typeof LEGACY_METADATA_KEYS;
-
-/** Read a GenUI field of a tool result's metadata, whichever name it was recorded under. */
-export function readGenUiMetadata(
-	metadata: Record<string, unknown> | null | undefined,
-	key: GenUiMetadataKey,
-): unknown {
-	if (!metadata) return undefined;
-	return metadata[key] ?? metadata[LEGACY_METADATA_KEYS[key]];
-}
 export const GEN_UI_ACTIONS = ["create", "show", "render", "kit_status", "kit_build"] as const;
 export type GenUiToolAction = (typeof GEN_UI_ACTIONS)[number];
 

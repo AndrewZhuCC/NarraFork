@@ -34,11 +34,9 @@
 
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import {
-	GEN_UI_LEGACY_TOOL_NAME,
 	GEN_UI_PUBLIC_SUMMARY,
 	GEN_UI_PUBLIC_SUMMARY_CODE,
 	GEN_UI_TOOL_NAME,
-	GEN_UI_TOOL_NAMES,
 	isGenUiToolName,
 	publicGenUiSummary,
 } from "@shared/gen-ui-public";
@@ -551,7 +549,7 @@ export async function* iterateNarratorTranscript(
 const messageHasPrivateUi = sql<number>`EXISTS (
 	SELECT 1 FROM narrator_tool_calls AS private_ui_call
 	WHERE private_ui_call.message_id = narrator_messages.id
-	AND private_ui_call.tool_name IN (${GEN_UI_TOOL_NAME}, ${GEN_UI_LEGACY_TOOL_NAME})
+	AND private_ui_call.tool_name = ${GEN_UI_TOOL_NAME}
 	LIMIT 1
 )`;
 
@@ -620,19 +618,19 @@ async function loadToolCallMeta(messageIds: string[]) {
 			createdAt: narratorToolCalls.createdAt,
 			// A private UI contributes no source, error excerpt or source-length side channel.
 			errorMessage: sql<string | null>`CASE
-				WHEN ${narratorToolCalls.toolName} IN (${GEN_UI_TOOL_NAME}, ${GEN_UI_LEGACY_TOOL_NAME}) THEN NULL
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN NULL
 				ELSE substr(${narratorToolCalls.errorMessage}, 1, ${EXPORT_TOOL_ERROR_LIMIT})
 				END`.as("error_excerpt"),
 			errorBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} IN (${GEN_UI_TOOL_NAME}, ${GEN_UI_LEGACY_TOOL_NAME}) THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(${narratorToolCalls.errorMessage}, '')) END`.as("error_bytes"),
 			inputBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} IN (${GEN_UI_TOOL_NAME}, ${GEN_UI_LEGACY_TOOL_NAME}) THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), '')) END`.as(
 				"input_bytes",
 			),
 			outputBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} IN (${GEN_UI_TOOL_NAME}, ${GEN_UI_LEGACY_TOOL_NAME}) THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(CAST(${narratorToolCalls.outputJson} AS TEXT), '')) END`.as(
 				"output_bytes",
 			),
@@ -967,7 +965,7 @@ async function projectExportMessages(
 			.where(
 				and(
 					inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
-					inArray(narratorToolCalls.toolName, [...GEN_UI_TOOL_NAMES]),
+					eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
 				),
 			)
 			.limit(maxIdentities - count + 1);

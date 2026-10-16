@@ -110,7 +110,7 @@ describe("kit signature", () => {
 		const workspace = await mkdtemp(join(tmpdir(), "nf-ui-kit-signing-workspace-"));
 		try {
 			const signature = await signKitFields(fields);
-			const keyPath = join(home, "intelligent-ui-kit-signing.key");
+			const keyPath = join(home, "gen-ui-kit-signing.key");
 			expect(existsSync(keyPath)).toBe(true);
 			expect(relative(workspace, keyPath).startsWith("..")).toBe(true);
 			const key = await readFile(keyPath);

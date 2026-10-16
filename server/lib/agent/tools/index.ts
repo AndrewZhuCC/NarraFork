@@ -1,4 +1,3 @@
-import { GEN_UI_LEGACY_TOOL_NAME, GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
@@ -63,24 +62,11 @@ import { writeTool } from "./write";
  *
  * Map key = tool name as it appears in the registry (e.g. "Terminal").
  */
-/**
- * Optional tools that were renamed. Narrators persist the names they loaded, so a name
- * written before the rename must still load (and unload) the tool it meant.
- */
-const RENAMED_OPTIONAL_TOOLS: ReadonlyMap<string, string> = new Map([
-	[GEN_UI_LEGACY_TOOL_NAME, GEN_UI_TOOL_NAME],
-]);
-
-/** The current name of an optional tool, given any name it was ever persisted under. */
-export function canonicalOptionalToolName(name: string): string {
-	return RENAMED_OPTIONAL_TOOLS.get(name) ?? name;
-}
-
 export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
-	[GEN_UI_TOOL_NAME, genUiTool],
+	["GenUI", genUiTool],
 	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],

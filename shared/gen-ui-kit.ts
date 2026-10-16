@@ -7,8 +7,6 @@
  * and Vite config and runs the project's own Vite to produce `dist/`.
  */
 export const GEN_UI_KIT_DIRECTORY = ".narrafork/gen_ui/kit";
-/** A kit authored before the rename. Used while no kit exists at the current location. */
-export const GEN_UI_LEGACY_KIT_DIRECTORY = ".narrafork/intelligent_ui/kit";
 export const GEN_UI_KIT_MANIFEST = "kit.json";
 export const GEN_UI_KIT_ENTRY = "entry.generated.ts";
 export const GEN_UI_KIT_VITE_CONFIG = "vite.kit.config.mjs";

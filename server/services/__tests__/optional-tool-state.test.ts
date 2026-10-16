@@ -113,16 +113,6 @@ describe("resolveOptionalToolState", () => {
 		expect(result.state).toBe("loaded");
 	});
 
-	test("a tool persisted under its former name is loaded under its current one", async () => {
-		const narrator = await createStandaloneNarrator();
-		await db
-			.update(narrators)
-			.set({ enabledTools: ["IntelligentUI"] })
-			.where(eq(narrators.id, narrator.id));
-		expect((await resolveOptionalToolState(narrator.id, "GenUI")).state).toBe("loaded");
-		expect((await resolveOptionalToolState(narrator.id, "IntelligentUI")).state).toBe("loaded");
-	});
-
 	test("a custom trait deny-list wins over a persisted load", async () => {
 		// normalizeDisabledTools drops names absent from the registry.
 		registerCoreTools();

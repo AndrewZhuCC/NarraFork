@@ -4,7 +4,7 @@ import {
 	readGenUiFileReference,
 } from "@shared/gen-ui-files";
 import type { GenUiKitBundle } from "@shared/gen-ui-kit";
-import { isGenUiToolName, readGenUiMetadata } from "@shared/gen-ui-tool-policy";
+import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { type Context, Hono } from "hono";
 import { AppError } from "../lib/errors";
 import type { KitOverview } from "../services/gen-ui/kit-service";
@@ -109,12 +109,10 @@ export function createGenUiRoutes(overrides: Partial<GenUiRouteDependencies> = {
 		const metadata =
 			output && typeof output === "object" && "_metadata" in output ? output._metadata : null;
 		const reference = readGenUiFileReference(
-			metadata && typeof metadata === "object" && !Array.isArray(metadata)
-				? readGenUiMetadata(metadata as Record<string, unknown>, "genUi")
-				: null,
+			metadata && typeof metadata === "object" && "genUi" in metadata ? metadata.genUi : null,
 		);
 		if (
-			!isGenUiToolName(tool.toolName) ||
+			tool.toolName !== GEN_UI_TOOL_NAME ||
 			tool.id !== toolCallId ||
 			!reference ||
 			reference.toolUseId !== toolUseId ||

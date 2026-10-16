@@ -4,18 +4,14 @@
  * through ordinary Read/Write/Edit tools follows the same rules as other file history;
  * this boundary does not make those files or their historical contents private.
  */
-import {
-	GEN_UI_LEGACY_TOOL_NAME,
-	GEN_UI_TOOL_NAME,
-	GEN_UI_TOOL_NAMES,
-	isGenUiToolName,
-} from "./gen-ui-tool-policy";
-
-export { GEN_UI_LEGACY_TOOL_NAME, GEN_UI_TOOL_NAME, GEN_UI_TOOL_NAMES, isGenUiToolName };
-// Kept from the tool's former name: exported transcripts already carry this code.
-export const GEN_UI_PUBLIC_SUMMARY_CODE = "INTELLIGENT_UI_PRIVATE";
+export const GEN_UI_TOOL_NAME = "GenUI";
+export const GEN_UI_PUBLIC_SUMMARY_CODE = "GEN_UI_PRIVATE";
 export const GEN_UI_PUBLIC_SUMMARY =
 	"Interactive previews are unavailable in this shared transcript.";
+
+export function isGenUiToolName(name: unknown): boolean {
+	return name === GEN_UI_TOOL_NAME;
+}
 
 /**
  * Rebuild rather than delete known sensitive fields: new output/preview/capability fields

@@ -222,21 +222,6 @@ describe("ordinary GenUI workspace files", () => {
 		);
 		expect(await readdir(root)).toEqual([]);
 	});
-	test("UI created before the rename stays previewable; other .narrafork folders do not", async () => {
-		const { root, backend, ctx } = await fixture();
-		const legacy = join(root, ".narrafork/intelligent_ui/old");
-		const other = join(root, ".narrafork/other/old");
-		for (const directory of [legacy, other]) {
-			await mkdir(directory, { recursive: true });
-			await writeFile(join(directory, "App.tsx"), "export default ()=>null");
-		}
-		expect(
-			(await validateDirectory(backend, ctx.workspaceContext, legacy, ctx.signal)).directory,
-		).toBe(legacy);
-		await expect(
-			validateDirectory(backend, ctx.workspaceContext, other, ctx.signal),
-		).rejects.toThrow("directly inside");
-	});
 	test("rejects symlinked roots, outside directories and symlinked imported files", async () => {
 		const { root, base, backend, ctx } = await fixture();
 		const directory = join(base, "safe");

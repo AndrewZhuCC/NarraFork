@@ -1,6 +1,6 @@
 # gen_ui 重设计：问题分析与方案草案
 
-> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1 步（改名 + 兼容）已实施，其余待定。
+> 状态：讨论稿（分支 `claude/gen-ui-redesign-sidkzo`）。第 1 步（改名）已实施，其余待定。
 > 材料：一次真实会话导出（deepseek-v4.1-flash 使用 IntelligentUI 的全过程）+ main 上的现有实现。
 
 ## 0. 现状速览
@@ -109,33 +109,17 @@
 - 工作区目录 `.narrafork/intelligent_ui` → `.narrafork/gen_ui`
 - 代码目录/文件 `intelligent-ui` → `gen-ui`、i18n 命名空间键 `intelligentUi.*`、元数据键 `intelligentUi` / `intelligentUiInline` / `intelligentUiKit`
 
-### 兼容性（必须做）
-
-已持久化的东西不能断：
-- `narrator_tool_calls` / 消息里历史工具名 `IntelligentUI` 和元数据键：前端渲染与回退（`file-state-rebuild`、`revert-selection-service`、`narrator-export`、公开分享）要同时认新旧名；
-- `settings.routines.toolModes` / `enabledRoutines` / 项目 `chapterSettings` / `narrators.enabledTools` 里的 `intelligent_ui`、`IntelligentUI`：读时映射到新名（一次性迁移或读时别名都可，倾向读时别名，不碰数据库）；
-- 工作区里已有的 `.narrafork/intelligent_ui/**`（App 与 kit.json）：新目录不存在时回退读旧目录，或首次使用时提示迁移；
-- 权限规则里写了 `IntelligentUI(...)` 的用户规则：别名匹配。
-
-### 已定：工具名 `GenUI`
+### 已定：工具名 `GenUI`，不保留旧名
 
 与 `AskUserQuestion`、`ShareFile` 等保持 PascalCase；例程 id、工作区目录与代码路径用 `gen_ui` / `gen-ui`。
 
-已在本分支完成（第 1 步）：
-- 工具名 `GenUI`，旧名 `IntelligentUI` 通过 `isGenUiToolName` 在历史渲染、导出、公开分享、回退与重放中继续识别（SQL 用 `IN ('GenUI','IntelligentUI')`）；
-- 叙述者 `enabledTools` 里的旧名经 `canonicalOptionalToolName` 读成新名，加载/卸载同样认旧名；
-- 例程 `gen_ui` 读取 `toolModes` / `enabledRoutines` / `disabledRoutines` 时回退到 `intelligent_ui`，写入新模式时清掉旧 id；
-- 工具结果元数据 `genUi` / `genUiInline` / `genUiKit` 读取时回退到旧键；
-- 新 UI 建在 `.narrafork/gen_ui`，旧目录 `.narrafork/intelligent_ui` 下的 App 仍可预览；组件包在新位置没有 `kit.json` 时继续使用旧位置的；
-- 保留不改的持久化字面量：公开摘要码 `INTELLIGENT_UI_PRIVATE`、签名密钥文件名 `intelligent-ui-kit-signing.key`（改了会让已构建的组件包全部失效）。
-
-未做别名：用户手写的权限规则或 trait 禁用列表里若写了 `IntelligentUI`，需要改成 `GenUI`；模型若在旧会话里继续调用 `IntelligentUI` 会得到未知工具错误后改用新名。
+还没有发布过包含 IntelligentUI 的版本，所以**不做任何旧名兼容**（用户确认）：工具名、例程 id、元数据键、工作区目录、公开摘要码（`GEN_UI_PRIVATE`）、组件包签名密钥文件（`gen-ui-kit-signing.key`）全部只用新名。开发环境里用旧版本留下的 `.narrafork/intelligent_ui` 和已构建组件包需要重新生成。
 
 ---
 
 ## 建议的实施顺序
 
-1. **改名 + 兼容别名**（机械改动，先做，后续改动都在新名字上）
+1. **改名**（机械改动，先做，后续改动都在新名字上）
 2. **描述重写 + 错误信息 + kit 提示只问一次**（问题 1，改动小、收益立刻可见）
 3. **markup 状态绑定：`name` / `$x` / 插值 `sendPrompt` / `submit()`**（问题 2 核心）
 4. **阻塞表单 `wait: true`**

@@ -3,7 +3,6 @@ import { AppError } from "@server/lib/errors";
 import {
 	GEN_UI_DIRECTORY,
 	GEN_UI_ENTRY,
-	GEN_UI_LEGACY_DIRECTORY,
 	type GenUiFileReference,
 	GEN_UI_FILE_LIMITS as LIMITS,
 } from "@shared/gen-ui-files";
@@ -49,17 +48,13 @@ export async function validateDirectory(
 	signal: AbortSignal,
 ): Promise<{ directory: string; entryPath: string }> {
 	const root = await workspaceRoot(backend, workspace, signal);
-	// UI made before the rename lives under the former directory and stays previewable.
-	const bases = [GEN_UI_DIRECTORY, GEN_UI_LEGACY_DIRECTORY].map((dir) =>
-		backend.paths.resolve(root, dir),
-	);
+	const base = backend.paths.resolve(root, GEN_UI_DIRECTORY);
 	const resolved = backend.paths.resolve(workspace.cwd, input);
 	const directory =
 		backend.paths.basename(resolved) === GEN_UI_ENTRY ? backend.paths.dirname(resolved) : resolved;
-	const parent = backend.paths.dirname(directory);
-	if (!bases.some((base) => backend.paths.equals(parent, base)))
+	if (!backend.paths.equals(backend.paths.dirname(directory), base))
 		throw uiError(
-			`UI directory must be directly inside the current workspace's ${GEN_UI_DIRECTORY}`,
+			"UI directory must be directly inside the current workspace's .narrafork/gen_ui",
 			403,
 		);
 	await checkedIdentity(backend, directory, signal);

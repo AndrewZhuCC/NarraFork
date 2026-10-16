@@ -24,25 +24,6 @@ describe("GenUI file preview classification", () => {
 			expect(measureToolBody(body, 360).height).toBe(88);
 		});
 	}
-	test("a call recorded under the former tool name and metadata key still draws its card", () => {
-		const result = classifyToolDetail({
-			toolName: "IntelligentUI",
-			toolUseId: fileReference.toolUseId,
-			category: "generic",
-			status: "completed",
-			inputJson: { action: "show", path: "App.tsx" },
-			outputJson: "Done",
-			metadata: {
-				intelligentUi: fileReference,
-				intelligentUiKit: { state: "builtin" },
-			},
-		});
-		expect(result?.sections[0].body).toMatchObject({
-			kind: "gen-ui",
-			file: fileReference,
-			kit: { state: "builtin" },
-		});
-	});
 	test("a COW card selects its visible row without rewriting the stored file reference", () => {
 		const result = classifyToolDetail({
 			toolName: "GenUI",
@@ -74,7 +55,7 @@ describe("GenUI file preview classification", () => {
 			toolName: "GenUI",
 			toolUseId: "public",
 			category: "generic",
-			publicSummary: "INTELLIGENT_UI_PRIVATE",
+			publicSummary: "GEN_UI_PRIVATE",
 			metadata: { genUi: fileReference },
 		});
 		expect(result?.sections[0].body).toEqual({

@@ -30,7 +30,6 @@ import {
 	hasSettledMeasuredFileEffect,
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
-import { isGenUiToolName } from "@shared/gen-ui-tool-policy";
 import { AppError } from "../lib/errors";
 import {
 	createFileChangeIdentity,
@@ -775,10 +774,10 @@ export class RevertSelectionService {
 			});
 			return;
 		}
-		const isGenUi = isGenUiToolName(tool.toolName);
-		const isUiShow = isGenUi && tool.genUiAction === "show";
+		const isUiShow = tool.toolName === "GenUI" && tool.genUiAction === "show";
 		const isFileTool =
-			["Write", "Edit", "StructSed"].includes(tool.toolName) || (isGenUi && !isUiShow);
+			["Write", "Edit", "StructSed"].includes(tool.toolName) ||
+			(tool.toolName === "GenUI" && !isUiShow);
 		const isDelegationTool = ["Agent", "Task"].includes(tool.toolName);
 		if (!isFileTool && !isDelegationTool) {
 			this.add(state, state.result.noDiskTools, {
@@ -1213,7 +1212,7 @@ const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrato
  m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;
 const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS messageId, tool_use_id AS toolUseId, tool_name AS toolName, status,
- CASE WHEN tool_name IN ('GenUI', 'IntelligentUI') AND octet_length(input_json) <= 8192
+ CASE WHEN tool_name = 'GenUI' AND octet_length(input_json) <= 8192
  THEN CASE WHEN json_valid(input_json) THEN CASE WHEN json_extract(input_json, '$.action') = 'show'
  THEN 'show' ELSE 'create' END END END AS genUiAction,
  is_background AS isBackground, execution_identity_version AS executionIdentityVersion, execution_origin_tool_call_id AS executionOriginToolCallId,

@@ -10,7 +10,6 @@ import {
 	GEN_UI_KIT_META,
 	GEN_UI_KIT_STAGING,
 	GEN_UI_KIT_VITE_CONFIG,
-	GEN_UI_LEGACY_KIT_DIRECTORY,
 	type GenUiKitBundle,
 	type GenUiKitManifest,
 	type GenUiKitStatus,
@@ -96,14 +95,7 @@ export async function locateKit(
 	signal: AbortSignal,
 ): Promise<KitLocation> {
 	const root = await workspaceRoot(backend, workspace, signal);
-	const current = backend.paths.resolve(root, GEN_UI_KIT_DIRECTORY);
-	const legacy = backend.paths.resolve(root, GEN_UI_LEGACY_KIT_DIRECTORY);
-	// A kit authored before the rename keeps working until one exists at the current place.
-	const kitDir =
-		!(await backend.fileExists(backend.paths.resolve(current, GEN_UI_KIT_MANIFEST))) &&
-		(await backend.fileExists(backend.paths.resolve(legacy, GEN_UI_KIT_MANIFEST)))
-			? legacy
-			: current;
+	const kitDir = backend.paths.resolve(root, GEN_UI_KIT_DIRECTORY);
 	const distDir = backend.paths.resolve(kitDir, GEN_UI_KIT_DIST);
 	return {
 		root,

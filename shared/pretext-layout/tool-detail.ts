@@ -16,12 +16,7 @@
 import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
 import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
-import {
-	GEN_UI_INLINE_HEIGHTS,
-	isGenUiToolName,
-	readGenUiInlineSize,
-	readGenUiMetadata,
-} from "../gen-ui-tool-policy";
+import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -889,9 +884,8 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			? toolInputFieldView(input.inputJson)
 			: input.inputJson;
 	const output = toolOutputValue(input.outputJson, metadata);
-	const isGenUi = isGenUiToolName(toolName);
 	if (
-		isGenUi &&
+		toolName === "GenUI" &&
 		(input.publicSummary === GEN_UI_PUBLIC_SUMMARY_CODE ||
 			output === GEN_UI_PUBLIC_SUMMARY ||
 			asObject(output)?.text === GEN_UI_PUBLIC_SUMMARY)
@@ -903,14 +897,15 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		});
 	}
 	// Only host-owned metadata is a file reference; never promote tool input or output text.
-	const uiRef = isGenUi ? readGenUiMetadata(metadata, "genUi") : null;
+	const uiRef = toolName === "GenUI" ? metadata?.genUi : null;
 	const uiFile = readGenUiFileReference(uiRef);
-	const uiKit = isGenUi
-		? (readGenUiKitNotice(readGenUiMetadata(metadata, "genUiKit")) ?? undefined)
-		: undefined;
-	const uiDrawnWith = asObject(readGenUiMetadata(metadata, "genUiInline"))?.kit;
+	const uiKit =
+		toolName === "GenUI" ? (readGenUiKitNotice(metadata?.genUiKit) ?? undefined) : undefined;
+	const uiDrawnWith = asObject(metadata?.genUiInline)?.kit;
 	const uiRuntime: "builtin" | "project" | undefined =
-		isGenUi && (uiDrawnWith === "builtin" || uiDrawnWith === "project") ? uiDrawnWith : undefined;
+		toolName === "GenUI" && (uiDrawnWith === "builtin" || uiDrawnWith === "project")
+			? uiDrawnWith
+			: undefined;
 	const uiKitFields = {
 		...(uiKit ? { kit: uiKit } : {}),
 		...(uiRuntime ? { runtime: uiRuntime } : {}),
@@ -920,7 +915,7 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				}
 			: {}),
 	};
-	const uiInput = isGenUi ? asObject(fields) : undefined;
+	const uiInput = toolName === "GenUI" ? asObject(fields) : undefined;
 	// A call that failed, was refused or was stopped drew nothing the reader should take
 	// for an answer: its status and error text are the body instead.
 	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
@@ -956,7 +951,7 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				? single("gen-ui", { kind: "gen-ui", file: null, ...uiKitFields })
 				: null;
 	const base = withErrorSection(
-		isGenUi
+		toolName === "GenUI"
 			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
 			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,

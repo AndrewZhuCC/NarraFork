@@ -2,7 +2,6 @@
  * Rebuild file contents by replaying successful Write/Edit tool calls from the
  * narrator's first-touch snapshots. File identity is device + target path.
  */
-import { isGenUiToolName } from "@shared/gen-ui-tool-policy";
 import { and, asc, eq, lte, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -499,7 +498,7 @@ export function applyToolCall(
 	toolCall: OrderedToolCall,
 ): string | null {
 	const input = toolCall.inputJson as Record<string, unknown> | null;
-	if (isGenUiToolName(toolCall.toolName) && input?.action !== "show") {
+	if (toolCall.toolName === "GenUI" && input?.action !== "show") {
 		// Template bytes live in the v2 journal, not the input. Never silently
 		// replay generated creates as no-ops or recreate a historical template.
 		throw new ReplayDivergedError(
