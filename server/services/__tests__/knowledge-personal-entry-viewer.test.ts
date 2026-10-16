@@ -64,7 +64,7 @@ const STATES: State[] = [
 ];
 
 async function makeFixture(state: State) {
-	const col = await knowledgeService.createCollection({ name: `${TAG}-col-${generateId(4)}` });
+	const col = await knowledgeService.createCollection({ name: `${TAG}-col-${generateId()}` });
 	if (state.startsWith("standalone")) {
 		const draft = await knowledgeBranchService.createStandalone(author, {
 			title: `${TAG}-standalone`,
