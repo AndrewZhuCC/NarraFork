@@ -1334,6 +1334,48 @@ async function getSubmission(principal: Principal, submissionId: string) {
  * and excluding the large proposedContent blob. No ACL gate is needed: these are the
  * caller's own submissions.
  */
+/**
+ * Author-facing verdicts from the last 30 days.
+ *
+ * The notification bell reads this instead of the `notifications` table. That table's
+ * activity projection re-joins source rows and would have to store a title; knowledge
+ * titles are classified, so review events stay id-only here (no title, change note, or
+ * proposed content). Findings are included because they are the reviewer's notes to the
+ * author of this submission — the same rows `listSubmissionsForDraft` already returns.
+ *
+ * Pending requests are omitted: the author just submitted those. `changes_requested`,
+ * `approved`, and `rejected` are the verdicts they would otherwise miss.
+ */
+const SUBMISSION_OUTCOME_STATUSES = ["approved", "rejected", "changes_requested"] as const;
+const SUBMISSION_OUTCOME_LIMIT = 30;
+const SUBMISSION_OUTCOME_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+async function listMySubmissionOutcomes(principal: Principal, opts: { limit?: number } = {}) {
+	if (!principal.userId) return [];
+	const limit = Math.min(opts.limit ?? SUBMISSION_OUTCOME_LIMIT, SUBMISSION_OUTCOME_LIMIT);
+	const cutoff = new Date(Date.now() - SUBMISSION_OUTCOME_MAX_AGE_MS).toISOString();
+	return db.query.knowledgeSubmissions.findMany({
+		where: (s, { and: a, eq: e, inArray: ia, gte }) =>
+			a(
+				e(s.submitterUserId, principal.userId),
+				ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
+				gte(s.reviewedAt, cutoff),
+			),
+		columns: {
+			id: true,
+			draftId: true,
+			entryId: true,
+			status: true,
+			verdict: true,
+			findingsJson: true,
+			reviewedAt: true,
+			createdAt: true,
+		},
+		orderBy: (s, { desc: d }) => [d(s.reviewedAt)],
+		limit,
+	});
+}
+
 async function listMyOpenSubmissions(principal: Principal, opts: { limit?: number } = {}) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
@@ -1629,6 +1671,7 @@ export const knowledgeBranchService = {
 	listSubmissions,
 	listSubmissionsForDraft,
 	listMyOpenSubmissions,
+	listMySubmissionOutcomes,
 	countReviewInbox,
 	getSubmission,
 	withdrawSubmission,

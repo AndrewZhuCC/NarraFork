@@ -28,6 +28,7 @@ import type {
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
+	KnowledgeSubmissionOutcome,
 	KnowledgeSubmitResult,
 	KnowledgeTag,
 	KnowledgeTagType,
@@ -252,6 +253,13 @@ export const knowledgeApi = {
 	listMyOpenKnowledgeSubmissions: (opts: { limit?: number } = {}) =>
 		request<KnowledgeOpenSubmission[]>(
 			`/knowledge/my-open-submissions${qs({
+				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
+			})}`,
+		),
+	/** Recent verdicts on the caller's own submissions. No titles or bodies. */
+	listMyKnowledgeSubmissionOutcomes: (opts: { limit?: number } = {}) =>
+		request<KnowledgeSubmissionOutcome[]>(
+			`/knowledge/my-submission-outcomes${qs({
 				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
 			})}`,
 		),

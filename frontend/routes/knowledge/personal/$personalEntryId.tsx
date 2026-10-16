@@ -40,6 +40,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { SubmissionAuthorActions } from "../../../components/knowledge/SubmissionAuthorActions";
+import { SubmissionFindings } from "../../../components/knowledge/SubmissionFindings";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import {
 	useDeletePersonalEntry,
@@ -52,6 +53,7 @@ import {
 } from "../../../hooks/useKnowledge";
 import type { KnowledgePersonalEntry, KnowledgeSubmission } from "../../../lib/api";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
+import { linkedPersonalRedirectHash } from "../../../lib/knowledge-review-nav";
 
 export const Route = createFileRoute("/knowledge/personal/$personalEntryId")({
 	component: PersonalEntryPage,
@@ -63,15 +65,21 @@ function PersonalEntryPage() {
 	const navigate = useNavigate();
 	const entry = usePersonalEntry(personalEntryId);
 
-	// A linked personal entry belongs on its global entry's Draft tab.
+	// A linked personal entry belongs on its global entry. Editing is the Draft tab;
+	// an open or reviewed request lands on that submission so findings survive the redirect.
 	const linkedEntryId = entry.data?.entryId ?? null;
+	const history = usePersonalEntrySubmissions(linkedEntryId ? personalEntryId : undefined);
 	useEffect(() => {
-		if (linkedEntryId) {
-			navigate({ to: "/knowledge/$entryId", params: { entryId: linkedEntryId }, replace: true });
-		}
-	}, [linkedEntryId, navigate]);
+		if (!linkedEntryId || history.isPending) return;
+		navigate({
+			to: "/knowledge/$entryId",
+			params: { entryId: linkedEntryId },
+			hash: linkedPersonalRedirectHash(history.data ?? []),
+			replace: true,
+		});
+	}, [linkedEntryId, history.isPending, history.data, navigate]);
 
-	if (entry.isLoading) {
+	if (entry.isLoading || linkedEntryId) {
 		return (
 			<Container size="lg" py="lg">
 				<Text size="sm" c="dimmed">
@@ -556,16 +564,7 @@ function SubmissionHistory({
 							</Badge>
 						</Group>
 					</Group>
-					{(s.findingsJson ?? []).length > 0 ? (
-						<Stack gap={2} mt={6}>
-							{/* Findings have no id; they're immutable once reviewed, so key on content. */}
-							{(s.findingsJson ?? []).map((f) => (
-								<Text key={`${s.id}-${f.severity}-${f.message}`} size="xs" c="dimmed">
-									[{t(`severity_${f.severity}`)}] {f.message}
-								</Text>
-							))}
-						</Stack>
-					) : null}
+					<SubmissionFindings findings={s.findingsJson} />
 					{s.status === "superseded" ? (
 						<Text size="xs" c="dimmed" mt={4}>
 							{t("subFlowSupersededHint")}

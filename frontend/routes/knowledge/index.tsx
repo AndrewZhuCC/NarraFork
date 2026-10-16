@@ -71,15 +71,48 @@ import type {
 } from "../../lib/api";
 import { api } from "../../lib/api";
 import { formatLocaleDateTime } from "../../lib/intl-format";
+import {
+	knowledgeReviewDestination,
+	knowledgeSubmissionHash,
+	primaryReviewSubmission,
+} from "../../lib/knowledge-review-nav";
+
+const KNOWLEDGE_TABS = ["browse", "mylibrary", "review", "admin"] as const;
+type KnowledgeTab = (typeof KNOWLEDGE_TABS)[number];
+
+export interface KnowledgeIndexSearch {
+	tab?: KnowledgeTab;
+	submission?: string;
+}
+
+const SUBMISSION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+function parseKnowledgeIndexSearch(search: Record<string, unknown>): KnowledgeIndexSearch {
+	const tab = KNOWLEDGE_TABS.includes(search.tab as KnowledgeTab)
+		? (search.tab as KnowledgeTab)
+		: undefined;
+	const submission =
+		typeof search.submission === "string" && SUBMISSION_ID.test(search.submission)
+			? search.submission
+			: undefined;
+	return {
+		...(tab && tab !== "browse" ? { tab } : {}),
+		...(submission ? { submission } : {}),
+	};
+}
 
 export const Route = createFileRoute("/knowledge/")({
 	component: KnowledgePage,
+	validateSearch: parseKnowledgeIndexSearch,
 });
 
 function KnowledgePage() {
 	const { t } = useTranslation("knowledge");
+	const navigate = useNavigate();
+	const { tab: searchTab, submission } = Route.useSearch();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
+	const tab: KnowledgeTab = searchTab === "admin" && !isAdmin ? "browse" : (searchTab ?? "browse");
 	// Bounded server-side count; `capped` means "at least this many" → render "100+".
 	const inbox = useReviewInboxCount();
 	const inboxCount = inbox.data?.count ?? 0;
@@ -94,7 +127,21 @@ function KnowledgePage() {
 				</Text>
 			</Stack>
 
-			<Tabs defaultValue="browse" keepMounted={false}>
+			<Tabs
+				value={tab}
+				onChange={(value) => {
+					const next =
+						value === "mylibrary" || value === "review" || (value === "admin" && isAdmin)
+							? value
+							: undefined;
+					navigate({
+						to: "/knowledge",
+						search: next ? { tab: next } : {},
+						replace: true,
+					});
+				}}
+				keepMounted={false}
+			>
 				<Tabs.List mb="md">
 					<Tabs.Tab value="browse">{t("tabEntries")}</Tabs.Tab>
 					<Tabs.Tab value="mylibrary">{t("tabMyLibrary")}</Tabs.Tab>
@@ -122,7 +169,7 @@ function KnowledgePage() {
 					<MyLibraryTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="review">
-					<ReviewCenterTab />
+					<ReviewCenterTab focusSubmissionId={tab === "review" ? (submission ?? null) : null} />
 				</Tabs.Panel>
 				{isAdmin ? (
 					<Tabs.Panel value="admin">
@@ -679,11 +726,11 @@ function MyLibraryTab() {
 		for (const c of collections.data ?? []) m.set(c.id, c.name);
 		return m;
 	}, [collections.data]);
-	// draftId → newest in-flight submission status (the list is ordered createdAt DESC).
-	const openStatusByDraft = useMemo(() => {
-		const m = new Map<string, KnowledgeOpenSubmission["status"]>();
+	// draftId → newest in-flight submission (the list is ordered createdAt DESC).
+	const openByDraft = useMemo(() => {
+		const m = new Map<string, KnowledgeOpenSubmission>();
 		for (const s of openSubs.data ?? []) {
-			if (!m.has(s.draftId)) m.set(s.draftId, s.status);
+			if (!m.has(s.draftId)) m.set(s.draftId, s);
 		}
 		return m;
 	}, [openSubs.data]);
@@ -802,16 +849,32 @@ function MyLibraryTab() {
 					) : (
 						<Stack gap="xs">
 							{(entries.data ?? []).map((p) => {
-								// Both kinds are now openable: a linked entry goes to its global entry's
-								// Draft tab; a standalone entry (no global counterpart yet) has its own page.
-								const openEntry = () =>
-									p.entryId
-										? navigate({ to: "/knowledge/$entryId", params: { entryId: p.entryId } })
-										: navigate({
-												to: "/knowledge/personal/$personalEntryId",
-												params: { personalEntryId: p.id },
-											});
-								const openStatus = openStatusByDraft.get(p.id);
+								// Linked entries open on the shared entry. An in-flight request goes
+								// straight to that submission (findings / withdraw); otherwise the Draft tab.
+								const openSub = openByDraft.get(p.id);
+								const openEntry = () => {
+									if (p.entryId) {
+										const dest = openSub
+											? knowledgeReviewDestination({
+													audience: "author",
+													entryId: p.entryId,
+													draftId: p.id,
+													submissionId: openSub.id,
+												})
+											: null;
+										navigate({
+											to: "/knowledge/$entryId",
+											params: { entryId: p.entryId },
+											hash: dest && dest.to === "entry" ? dest.hash : "draft",
+										});
+										return;
+									}
+									navigate({
+										to: "/knowledge/personal/$personalEntryId",
+										params: { personalEntryId: p.id },
+									});
+								};
+								const openStatus = openSub?.status;
 								return (
 									<Card
 										key={p.id}
@@ -905,7 +968,7 @@ type ReviewGroup =
 	| { kind: "entry"; key: string; entryId: string; subs: KnowledgeSubmission[] }
 	| { kind: "standalone"; key: string; sub: KnowledgeSubmission };
 
-function ReviewCenterTab() {
+function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | null }) {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
 	const { data: user } = useCurrentUser();
@@ -915,7 +978,40 @@ function ReviewCenterTab() {
 	const entries = useKnowledgeEntries({});
 	const collections = useKnowledgeCollections();
 	// Standalone submission opened for inline review (no entry page exists yet).
-	const [reviewingId, setReviewingId] = useState<string | null>(null);
+	// A linked id passed in the URL is redirected to the entry review panel once loaded.
+	const [reviewingId, setReviewingId] = useState<string | null>(focusSubmissionId);
+	const reviewing = useKnowledgeSubmission(reviewingId ?? undefined);
+
+	useEffect(() => {
+		if (focusSubmissionId) setReviewingId(focusSubmissionId);
+	}, [focusSubmissionId]);
+
+	useEffect(() => {
+		const sub = reviewing.data;
+		if (!reviewingId || !sub?.entryId) return;
+		navigate({
+			to: "/knowledge/$entryId",
+			params: { entryId: sub.entryId },
+			hash: knowledgeSubmissionHash(sub.id),
+			replace: true,
+		});
+	}, [reviewing.data, reviewingId, navigate]);
+
+	const openLinked = (entryId: string, submissionId: string) => {
+		const dest = knowledgeReviewDestination({
+			audience: "reviewer",
+			entryId,
+			draftId: null,
+			submissionId,
+		});
+		if (dest.to === "entry") {
+			navigate({
+				to: "/knowledge/$entryId",
+				params: { entryId: dest.entryId },
+				hash: dest.hash,
+			});
+		}
+	};
 
 	// Map entryId → title for readable entries (falls back to id prefix when not visible).
 	const titleById = useMemo(() => {
@@ -950,8 +1046,12 @@ function ReviewCenterTab() {
 		return groups;
 	}, [submissions.data]);
 
-	const goEntry = (entryId: string) =>
-		navigate({ to: "/knowledge/$entryId", params: { entryId }, hash: "submissions" });
+	const closeReview = () => {
+		setReviewingId(null);
+		if (focusSubmissionId) {
+			navigate({ to: "/knowledge", search: { tab: "review" }, replace: true });
+		}
+	};
 
 	const statusColor = (s: KnowledgeSubmission["status"]) =>
 		s === "conflict" ? "orange" : s === "pending" ? "blue" : "gray";
@@ -1019,7 +1119,10 @@ function ReviewCenterTab() {
 											<Anchor
 												component="button"
 												type="button"
-												onClick={() => goEntry(g.entryId)}
+												onClick={() => {
+													const target = primaryReviewSubmission(g.subs);
+													if (target) openLinked(g.entryId, target.id);
+												}}
 												style={{ minWidth: 0, textAlign: "left" }}
 											>
 												<Text size="sm" fw={600} truncate="end">
@@ -1034,7 +1137,10 @@ function ReviewCenterTab() {
 											size="compact-xs"
 											variant="light"
 											leftSection={<IconSearch size={12} />}
-											onClick={() => goEntry(g.entryId)}
+											onClick={() => {
+												const target = primaryReviewSubmission(g.subs);
+												if (target) openLinked(g.entryId, target.id);
+											}}
 											style={{ flexShrink: 0 }}
 										>
 											{t("reviewCenterViewEntry")}
@@ -1058,7 +1164,7 @@ function ReviewCenterTab() {
 														},
 													},
 												}}
-												onClick={() => goEntry(g.entryId)}
+												onClick={() => openLinked(g.entryId, s.id)}
 											>
 												<Group justify="space-between" wrap="nowrap" align="center">
 													<div style={{ flex: 1, minWidth: 0 }}>
@@ -1159,10 +1265,10 @@ function ReviewCenterTab() {
 			)}
 
 			<StandaloneReviewModal
-				submissionId={reviewingId}
+				submissionId={reviewing.data?.entryId ? null : reviewingId}
 				isAdmin={isAdmin}
 				currentUserId={user?.id}
-				onClose={() => setReviewingId(null)}
+				onClose={closeReview}
 			/>
 		</Stack>
 	);

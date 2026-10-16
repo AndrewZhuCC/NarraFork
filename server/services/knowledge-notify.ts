@@ -9,6 +9,11 @@
  *  - **No notification table.** The push is an invalidation signal (ids only); clients
  *    refetch through the ACL-checked HTTP endpoints. Nothing here carries entry titles
  *    or bodies, so a push can never leak a classified entry to a user who can't read it.
+ *    The header bell does not read `notifications` for these events either. It renders
+ *    `GET /review-inbox/count` (reviewers) and `GET /my-submission-outcomes` (authors)
+ *    and refetches them when this push arrives. Putting a knowledge title into the
+ *    notification-center table would either leak classification or be an empty label;
+ *    that table stays chat + permission only.
  *  - **ACL is never re-implemented.** Reviewer resolution reuses `knowledge-acl`'s
  *    `canReadCollection` / `canReview` / `canWriteCollection` predicates, matching the
  *    authorization in `knowledgeBranchService.review` exactly.

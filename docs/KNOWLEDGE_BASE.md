@@ -950,6 +950,13 @@ principal P：clearance=secret，grantedTags={product:M20}
 
 后三类走 `knowledge:library_changed`（读者视角的变化，与审核队列无关）；前四类走 `knowledge:review_inbox_changed`。drift 与 ACL 的通知都有**上限**（各 200 用户），避免一次写入引发无界扇出。
 
+**和通知铃的关系。** 这些 WS 帧只让客户端重新拉取，不写入平台通知中心的 `notifications` 表（该表的动态投影会回查源内容，知识库标题一旦写进去就可能泄露密级）。铃铛另读两条 ACL 检查过的 HTTP 接口：
+
+- 审核者：`GET /api/knowledge/review-inbox/count`，加上待审列表。点击一条 **linked** 提交会打开 `/knowledge/$entryId#submissions/<id>`（审核面板）；**standalone** 提交打开审核中心的就地审核框。
+- 作者：`GET /api/knowledge/my-submission-outcomes`，最近 30 天内自己的 `approved` / `rejected` / `changes_requested`。响应只有 id、状态和 findings，**没有标题、变更说明或正文**。点击后同样落到共享条目的提交页（已关联）或个人条目页（尚未关联）。
+
+收到 `knowledge:review_inbox_changed` 时前端会失效上述查询，所以审核队列有变化时铃铛不会一直空着。
+
 ### 6.7.7 ACL 审计
 
 所有**授权变更**写入 append-only 的 `knowledge_acl_events`（`server/services/knowledge-audit.ts`），回答"谁在何时给谁授了什么权"：
@@ -1052,4 +1059,4 @@ principal P：clearance=secret，grantedTags={product:M20}
 - **知识图谱无可视化**：`useEntryGraph` hook 与 `GET /entries/:id/graph` 都已就绪，缺 React Flow 之类的图视图组件。
 - **条目筛选**：`GET /entries` 支持 `tag`，但前端无标签筛选控件；按密级筛选前后端都没有。
 - **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页。
-- **知识库事件尚未进站内通知中心**：平台已有应用内通知中心（`notifications` 表 + NotificationBell/Drawer），但知识库通知仍走 WS 推送 + React Query 失效（6.7.6），未写入通知中心的未读列表。`notification-service` 另有钉钉/飞书 webhook。要把知识库审核/发布等事件接入通知中心，需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。
+- **知识库事件不进 `notifications` 表**：平台通知中心（`notifications` 表）仍只存聊天和权限请求。知识库审核/发布走 6.7.6 的 WS 失效 + 铃铛里的知识库区块（审核队列计数、作者最近结论）。这是有意的：通知中心的动态投影会回查源内容，把条目标题写进该表会泄露密级，不写标题则没有可读性。铃铛上的文案因此是固定句子，不带标题或正文；findings 只出现在作者自己的结论里。`notification-service` 的钉钉/飞书 webhook 仍未接入知识库事件。

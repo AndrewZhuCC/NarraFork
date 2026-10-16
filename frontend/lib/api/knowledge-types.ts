@@ -242,6 +242,23 @@ export interface KnowledgeOpenSubmission {
 	createdAt: string;
 }
 
+/**
+ * A verdict on the caller's own submission, for the notification bell.
+ *
+ * Deliberately has no title, change note, or proposed content. Those can carry
+ * classified text; the bell links to the entry, which re-checks read access.
+ */
+export interface KnowledgeSubmissionOutcome {
+	id: string;
+	draftId: string;
+	entryId: string | null;
+	status: Extract<KnowledgeSubmissionStatus, "approved" | "rejected" | "changes_requested">;
+	verdict: KnowledgeVerdict | null;
+	findingsJson: KnowledgeFinding[] | null;
+	reviewedAt: string | null;
+	createdAt: string;
+}
+
 export interface KnowledgeDraftDiff {
 	draftId: string;
 	against: "base" | "current";
