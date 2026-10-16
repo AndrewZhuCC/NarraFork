@@ -24,7 +24,9 @@ import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { gitService } from "./git-service";
+import * as statusCache from "./git-status-cache";
 import { clearStatusCache } from "./git-status-cache";
+import * as statusStream from "./git-status-stream";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 import { MAX_SKIPPED_POLLS, worktreeWatcher } from "./worktree-watcher";
 import { worktreeWatcherMetadata } from "./worktree-watcher-metadata";
@@ -113,6 +115,79 @@ afterEach(async () => {
 });
 
 describe("watcher polling ticks", () => {
+	for (const triggers of [
+		[true, true],
+		[true, false, true],
+		[false, true],
+	]) {
+		test(`coalesced triggers retain poll-only provenance: ${JSON.stringify(triggers)}`, async () => {
+			const repo = await createRepo("nf-watch-coalesced-");
+			registerEntry(repo);
+			const entry = worktreeWatcher._entries.get(repo);
+			if (!entry) throw new Error("entry was not registered");
+			let release!: () => void;
+			const pending = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const process = spyOn(worktreeWatcher, "_processChange")
+				.mockImplementationOnce(() => pending)
+				.mockResolvedValue(undefined);
+			try {
+				worktreeWatcher._enqueueProcessChange(repo, entry, true);
+				for (const polled of triggers) {
+					worktreeWatcher._enqueueProcessChange(repo, entry, polled);
+				}
+				expect(process).toHaveBeenCalledTimes(1);
+				release();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(process).toHaveBeenCalledTimes(2);
+				expect(process.mock.calls[1][2]).toBe(triggers.every(Boolean));
+				expect(entry.pendingProcess).toBe(false);
+			} finally {
+				release();
+				process.mockRestore();
+			}
+		});
+	}
+
+	test("idle polls preserve shared caches; writes and sweeps invalidate once without rereading", async () => {
+		const repo = await createRepo("nf-watch-cache-");
+		registerEntry(repo);
+		const entry = worktreeWatcher._entries.get(repo);
+		if (!entry) throw new Error("entry was not registered");
+		await worktreeWatcher._processChange(repo, entry, true);
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const query = spyOn(statusStream, "readGitStatusStream");
+		try {
+			for (let tick = 0; tick < 3; tick++) {
+				await worktreeWatcher._processChange(repo, entry, true);
+			}
+			expect(invalidate).not.toHaveBeenCalled();
+			expect(query).toHaveBeenCalledTimes(3);
+			// The latest idle probe remains reusable by legacy narrator readers.
+			await statusCache.getStatusSummaryCached(repo);
+			expect(query).toHaveBeenCalledTimes(3);
+
+			writeFileSync(join(repo, "seed.txt"), "external write\n");
+			await worktreeWatcher._processChange(repo, entry, true);
+			expect(invalidate).toHaveBeenCalledTimes(1);
+			expect(query).toHaveBeenCalledTimes(4);
+
+			entry.skippedPolls = MAX_SKIPPED_POLLS;
+			await worktreeWatcher._processChange(repo, entry, true);
+			expect(invalidate).toHaveBeenCalledTimes(2);
+			expect(query).toHaveBeenCalledTimes(5);
+
+			// Native events are write evidence even if the structural status is unchanged.
+			await worktreeWatcher._processChange(repo, entry, false);
+			expect(invalidate).toHaveBeenCalledTimes(3);
+			expect(query).toHaveBeenCalledTimes(6);
+		} finally {
+			invalidate.mockRestore();
+			query.mockRestore();
+		}
+	});
+
 	test("an idle polled tick takes no snapshot", async () => {
 		const repo = await createRepo("nf-watch-idle-");
 		registerEntry(repo);
@@ -159,6 +234,56 @@ describe("watcher polling ticks", () => {
 		expect(await worktreeTreeSnapshot.readFileAtTree(repo, captured, "seed.txt")).toBe(
 			"edited outside the tool path\n",
 		);
+	});
+
+	test("native ignored-file events publish paths before status and retain external attribution", async () => {
+		const repo = await createRepo("nf-watch-native-ignored-");
+		writeFileSync(join(repo, ".gitignore"), "build/\n");
+		await safeSpawn({ cmd: ["git", "add", ".gitignore"], cwd: repo, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "ignore"], cwd: repo, timeout: 15_000 });
+		registerEntry(repo);
+		const entry = worktreeWatcher._entries.get(repo);
+		if (!entry) throw new Error("entry was not registered");
+		await worktreeWatcher._processChange(repo, entry, true);
+		const signature = entry.lastStatusSignature;
+		mkdirSync(join(repo, "build"));
+		const path = join(repo, "build", "asset.txt");
+		writeFileSync(path, "ignored artifact\n");
+		entry.pendingPaths = new Map([[path, "added"]]);
+		const changedPaths = entry.pendingPaths;
+		const paths: NarraForkEvent[] = [];
+		const listener = (event: NarraForkEvent) => {
+			if (
+				event.type === "narrator:ws_broadcast" &&
+				event.message.type === "workspace_paths_changed"
+			)
+				paths.push(event);
+		};
+		eventBus.on("narrator:ws_broadcast", listener);
+		const original = gitService.getStatusSummary;
+		const query = spyOn(gitService, "getStatusSummary").mockImplementation((...args) => {
+			expect(paths).toHaveLength(1);
+			return original.apply(gitService, args);
+		});
+		const attribute = spyOn(worktreeWatcher, "_recordExternalChanges");
+		try {
+			await worktreeWatcher._processChange(repo, entry, false);
+			expect(entry.lastStatusSignature).toBe(signature);
+			expect(attribute).toHaveBeenCalledWith(repo, entry, changedPaths, false);
+			expect(paths[0]).toMatchObject({
+				type: "narrator:ws_broadcast",
+				narratorId: "narrator-test",
+				message: {
+					type: "workspace_paths_changed",
+					changes: [{ path: "build/asset.txt", kind: "added" }],
+					truncated: false,
+				},
+			});
+		} finally {
+			eventBus.off("narrator:ws_broadcast", listener);
+			query.mockRestore();
+			attribute.mockRestore();
+		}
 	});
 
 	test("a watcher event captures even when git status is unchanged", async () => {

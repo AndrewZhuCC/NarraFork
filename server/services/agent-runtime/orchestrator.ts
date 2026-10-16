@@ -1128,6 +1128,10 @@ export async function runAgentLoopUnlocked(
 					const chapterId = active._chapterId ?? null;
 					const worktreePath = gitTrackPathForSession(active);
 					if (!worktreePath) return;
+					// Mark the directory dirty at the tool boundary, not in the narrator's
+					// trailing timer. The directory pool owns throttled live refreshes;
+					// this timer only retains the legacy chapter-specific broadcast.
+					invalidateStatus(worktreePath);
 					const baseBranch = active._baseBranch as string | undefined;
 					const scheduleRefresh = (delayMs: number) => {
 						// Collapse rapid successive calls into one trailing query. Git commands
@@ -1135,11 +1139,10 @@ export async function runAgentLoopUnlocked(
 						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 						active._gitTrackTimer = setTimeout(() => {
 							active._gitTrackTimer = undefined;
-							// File changes just happened → invalidate then read through
-							// the shared cache so co-located narrators reuse one query.
-							invalidateStatus(worktreePath);
+							// Reuse the directory pool's result (or another narrator's query).
+							// A late timer must not invalidate the same completed write again.
 							Promise.all([
-								getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
+								getStatusSummaryCached(worktreePath),
 								baseBranch
 									? gitService.getCommitsAhead(worktreePath, baseBranch)
 									: Promise.resolve({ count: 0, baseBranch: "" }),

@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import type { GitWorkspaceCategory } from "@shared/git-workspace-events";
+import type { GitLineStats } from "@shared/git-line-stats";
+import type { GitWorkspaceCategory, GitWorkspaceSnapshot } from "@shared/git-workspace-events";
+import { AppError } from "../lib/errors";
+import type { getGitWorkspaceStatus } from "./git-management-service";
+import { GitStatusQueryCoordinator } from "./git-status-query";
 import type { GitWorkspaceTarget } from "./git-workspace";
 import {
+	boundGitSnapshot,
 	changedGitCategories,
+	GIT_SNAPSHOT_MAX_BYTES,
 	GitWorkspaceWatchPool,
 	probeGitWatch,
+	projectGitSnapshot,
 	WATCH_MAX_BYTES,
 } from "./git-workspace-watch";
 
@@ -26,6 +33,153 @@ const remoteTarget = (generation: number): GitWorkspaceTarget => ({
 	} as NonNullable<GitWorkspaceTarget["backend"]>,
 });
 const pause = (ms = 15) => new Promise((resolve) => setTimeout(resolve, ms));
+function required<T>(value: T | undefined): T {
+	if (value === undefined) throw new Error("Missing expected snapshot fixture value");
+	return value;
+}
+async function waitFor(predicate: () => boolean, timeoutMs = 2000) {
+	const deadline = performance.now() + timeoutMs;
+	while (!predicate()) {
+		if (performance.now() >= deadline) throw new Error("Timed out waiting for snapshot state");
+		await pause(1);
+	}
+}
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+const statusFacts = (path = "file"): Awaited<ReturnType<typeof getGitWorkspaceStatus>> => ({
+	hasChanges: true,
+	staged: 0,
+	unstaged: 1,
+	untracked: 0,
+	totalFiles: 1,
+	totalFilesExact: true,
+	headSha: "sha",
+	branch: "main",
+	files: [{ status: " M", path }],
+});
+const lineFacts = (path = "file", linesAdded = 3): GitLineStats => ({
+	linesAdded,
+	linesRemoved: 2,
+	complete: true,
+	files: [{ path, unstagedLinesAdded: linesAdded, unstagedLinesRemoved: 2, complete: true }],
+});
+function snapshotFixture() {
+	const counts = { status: 0, lineStats: 0, invalidate: 0, validate: 0, probes: 0 };
+	const reads = {
+		status: async (_target: GitWorkspaceTarget, _signal?: AbortSignal) => {
+			counts.status++;
+			return statusFacts();
+		},
+		lineStats: async (_target: GitWorkspaceTarget, _signal?: AbortSignal) => {
+			counts.lineStats++;
+			return lineFacts();
+		},
+		invalidate: (_target: GitWorkspaceTarget) => {
+			counts.invalidate++;
+		},
+		validate: (_target: GitWorkspaceTarget) => {
+			counts.validate++;
+		},
+	};
+	let fingerprint = "baseline";
+	const pool = new GitWorkspaceWatchPool(
+		async () => {
+			counts.probes++;
+			return { fingerprints: { worktree: fingerprint }, uncertain: [] };
+		},
+		5,
+		reads,
+	);
+	return {
+		pool,
+		reads,
+		counts,
+		change: (value: string) => {
+			fingerprint = value;
+		},
+	};
+}
+
+function coordinatedSnapshotFixture() {
+	const statusCache = new GitStatusQueryCoordinator<
+		Awaited<ReturnType<typeof getGitWorkspaceStatus>>
+	>();
+	const lineCache = new GitStatusQueryCoordinator<GitLineStats>();
+	const key = "snapshot-initial-baseline";
+	let path = "cached-before-opening";
+	const counts = { status: 0, lineStats: 0, invalidate: 0, validate: 0 };
+	const requestedTtls: Array<{ kind: "status" | "lineStats"; ttlMs: number | undefined }> = [];
+	const reads = {
+		status: (_target: GitWorkspaceTarget, signal?: AbortSignal, ttlMs?: number) => {
+			requestedTtls.push({ kind: "status", ttlMs });
+			return statusCache.query(
+				key,
+				async () => {
+					counts.status++;
+					return statusFacts(path);
+				},
+				{ signal, ttlMs },
+			);
+		},
+		lineStats: (_target: GitWorkspaceTarget, signal?: AbortSignal, ttlMs?: number) => {
+			requestedTtls.push({ kind: "lineStats", ttlMs });
+			return lineCache.query(
+				key,
+				async () => {
+					counts.lineStats++;
+					return lineFacts(path);
+				},
+				{ signal, ttlMs },
+			);
+		},
+		invalidate: (_target: GitWorkspaceTarget) => {
+			counts.invalidate++;
+			statusCache.invalidate(key);
+			lineCache.invalidate(key);
+		},
+		validate: (_target: GitWorkspaceTarget) => {
+			counts.validate++;
+			statusCache.validate(key);
+			lineCache.validate(key);
+		},
+	};
+	return {
+		reads,
+		counts,
+		requestedTtls,
+		beginStatusRead: (pending: Promise<Awaited<ReturnType<typeof getGitWorkspaceStatus>>>) =>
+			statusCache.query(
+				key,
+				async () => {
+					counts.status++;
+					return pending;
+				},
+				{ ttlMs: 0 },
+			),
+		beginLineRead: (pending: Promise<GitLineStats>) =>
+			lineCache.query(
+				key,
+				async () => {
+					counts.lineStats++;
+					return pending;
+				},
+				{ ttlMs: 0 },
+			),
+		setPath: (value: string) => {
+			path = value;
+		},
+		probe: async () => ({ fingerprints: { worktree: path }, uncertain: [] }),
+		clear: () => {
+			statusCache.clear();
+			lineCache.clear();
+		},
+	};
+}
 
 describe("panel-only Git watch pool", () => {
 	test("deduplicates workspace+device and releases the last subscription", async () => {
@@ -99,7 +253,7 @@ describe("panel-only Git watch pool", () => {
 			await pause(30);
 			expect(generations.length).toBeGreaterThan(1);
 			expect(generations.slice(1).every((generation) => generation === 2)).toBe(true);
-			expect(events.slice(0, 2)).toEqual([["worktree"], ["worktree"]]);
+			expect(events.slice(0, 2)).toEqual([[], []]);
 			// Late teardown and even a late old authorization cannot remove/downgrade the new slot.
 			stopA();
 			stopB();
@@ -154,7 +308,7 @@ describe("panel-only Git watch pool", () => {
 		);
 		const stop = pool.subscribe(target(), (categories) => events.push(categories));
 		await pause();
-		expect(events[0]).toEqual(["worktree"]);
+		expect(events[0]).toEqual([]);
 		expect(events.slice(1).every((event) => event.length === 0)).toBe(true);
 		uncertain = ["worktree"];
 		await pause();
@@ -261,5 +415,602 @@ describe("panel-only Git watch pool", () => {
 		const next = await probeGitWatch(remote, new AbortController().signal);
 		expect(changedGitCategories(capped, next)).not.toContain("head");
 		expect(changedGitCategories(capped, next)).not.toContain("refs");
+	});
+});
+
+describe("directory-owned Git snapshots", () => {
+	test("opening an idle directory invalidates old TTL once, never again for additional readers", async () => {
+		const fixture = coordinatedSnapshotFixture();
+		const { reads, counts, requestedTtls } = fixture;
+		const current = remoteTarget(1);
+		const stops: Array<() => void> = [];
+		try {
+			await reads.status(current);
+			await reads.lineStats(current);
+			fixture.setPath("edited-with-no-subscribers");
+			// Prove the pre-existing HTTP TTL still returns stale facts before opening.
+			expect((await reads.status(current)).files[0]?.path).toBe("cached-before-opening");
+			expect((await reads.lineStats(current)).files[0]?.path).toBe("cached-before-opening");
+			expect(counts.status).toBe(1);
+			expect(counts.lineStats).toBe(1);
+			requestedTtls.length = 0;
+			const pool = new GitWorkspaceWatchPool(fixture.probe, 5, reads);
+			const snapshots: GitWorkspaceSnapshot[] = [];
+			for (let i = 0; i < 10; i++)
+				stops.push(
+					pool.subscribe(
+						current,
+						() => {},
+						(value) => snapshots.push(value),
+					),
+				);
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)).toMatchObject({
+				status: { files: [{ path: "edited-with-no-subscribers" }] },
+				lineStats: { files: [{ path: "edited-with-no-subscribers" }] },
+			});
+			expect(requestedTtls).toEqual([
+				{ kind: "status", ttlMs: 0 },
+				{ kind: "lineStats", ttlMs: 0 },
+			]);
+			expect(counts.status).toBe(2);
+			expect(counts.lineStats).toBe(2);
+			expect(counts.invalidate).toBe(1);
+			await waitFor(() => counts.validate >= 2);
+			const late: GitWorkspaceSnapshot[] = [];
+			stops.push(
+				pool.subscribe(
+					current,
+					() => {},
+					(value) => late.push(value),
+				),
+			);
+			expect(late).toEqual([required(snapshots.at(-1))]);
+			expect(counts.status).toBe(2);
+			expect(counts.lineStats).toBe(2);
+			expect(counts.invalidate).toBe(1);
+		} finally {
+			for (const stop of stops) stop();
+			fixture.clear();
+		}
+	});
+
+	test("the first baseline excludes status and line-stat operations started before observation", async () => {
+		const fixture = coordinatedSnapshotFixture();
+		const staleStatus = deferred<Awaited<ReturnType<typeof getGitWorkspaceStatus>>>();
+		const staleLines = deferred<GitLineStats>();
+		const oldStatusRequest = fixture.beginStatusRead(staleStatus.promise);
+		const oldLineRequest = fixture.beginLineRead(staleLines.promise);
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let stop = () => {};
+		try {
+			await waitFor(() => fixture.counts.status === 1 && fixture.counts.lineStats === 1);
+			fixture.setPath("edited-after-http-started");
+			const pool = new GitWorkspaceWatchPool(fixture.probe, 5, fixture.reads);
+			stop = pool.subscribe(
+				remoteTarget(1),
+				() => {},
+				(value) => snapshots.push(value),
+			);
+			await waitFor(() => fixture.counts.invalidate === 1 && fixture.requestedTtls.length > 0);
+			expect(fixture.counts.status).toBe(1);
+			expect(snapshots.some((snapshot) => snapshot.status)).toBe(false);
+			staleStatus.resolve(statusFacts("pre-baseline-status"));
+			staleLines.resolve(lineFacts("pre-baseline-lines", 999));
+			expect((await oldStatusRequest).files[0]?.path).toBe("pre-baseline-status");
+			expect((await oldLineRequest).linesAdded).toBe(999);
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)?.status?.files?.[0]?.path).toBe("edited-after-http-started");
+			expect(snapshots.at(-1)?.lineStats?.files?.[0]?.path).toBe("edited-after-http-started");
+			expect(
+				snapshots.some(
+					(snapshot) =>
+						snapshot.status?.files?.[0]?.path === "pre-baseline-status" ||
+						snapshot.lineStats?.linesAdded === 999,
+				),
+			).toBe(false);
+			expect(fixture.counts.status).toBe(2);
+			expect(fixture.counts.lineStats).toBe(2);
+			expect(fixture.counts.invalidate).toBe(1);
+		} finally {
+			stop();
+			staleStatus.resolve(statusFacts());
+			staleLines.resolve(lineFacts());
+			await Promise.allSettled([oldStatusRequest, oldLineRequest]);
+			fixture.clear();
+		}
+	});
+
+	test("a recovered initial probe invalidates slow status even before any status snapshot exists", async () => {
+		const fixture = coordinatedSnapshotFixture();
+		const staleStatus = deferred<Awaited<ReturnType<typeof getGitWorkspaceStatus>>>();
+		const oldStatusRequest = fixture.beginStatusRead(staleStatus.promise);
+		const recoveredProbe = deferred<Awaited<ReturnType<typeof fixture.probe>>>();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let probes = 0;
+		const pool = new GitWorkspaceWatchPool(
+			async () => {
+				probes++;
+				if (probes === 1) throw new Error("Initial probe failed");
+				return probes === 2 ? recoveredProbe.promise : fixture.probe();
+			},
+			5,
+			fixture.reads,
+		);
+		let stop = () => {};
+		try {
+			await waitFor(() => fixture.counts.status === 1);
+			stop = pool.subscribe(
+				remoteTarget(1),
+				() => {},
+				(value) => snapshots.push(value),
+			);
+			await waitFor(() => probes === 2 && fixture.requestedTtls.length === 1);
+			expect(snapshots.some((snapshot) => snapshot.status)).toBe(false);
+			expect(fixture.counts.invalidate).toBe(0);
+			expect(fixture.counts.lineStats).toBe(0);
+			fixture.setPath("fresh-after-monitor-recovery");
+			recoveredProbe.resolve(await fixture.probe());
+			await waitFor(() => fixture.counts.invalidate === 1);
+			staleStatus.resolve(statusFacts("old-status-before-monitor-recovery"));
+			await oldStatusRequest;
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)?.status?.files?.[0]?.path).toBe("fresh-after-monitor-recovery");
+			expect(snapshots.at(-1)?.lineStats?.files?.[0]?.path).toBe("fresh-after-monitor-recovery");
+			expect(
+				snapshots.some(
+					(snapshot) => snapshot.status?.files?.[0]?.path === "old-status-before-monitor-recovery",
+				),
+			).toBe(false);
+			expect(fixture.counts.status).toBe(2);
+			expect(fixture.counts.lineStats).toBe(1);
+		} finally {
+			stop();
+			recoveredProbe.resolve({ fingerprints: { worktree: "cancelled" }, uncertain: [] });
+			staleStatus.resolve(statusFacts());
+			await Promise.allSettled([oldStatusRequest]);
+			fixture.clear();
+		}
+	});
+
+	test("a slow first probe precedes fresh facts and later edits still invalidate its baseline", async () => {
+		const fixture = coordinatedSnapshotFixture();
+		const { reads, counts, requestedTtls } = fixture;
+		const initialProbe = deferred<Awaited<ReturnType<typeof fixture.probe>>>();
+		const current = remoteTarget(1);
+		let probes = 0;
+		const pool = new GitWorkspaceWatchPool(
+			async () => {
+				probes++;
+				return probes === 1 ? initialProbe.promise : fixture.probe();
+			},
+			20,
+			reads,
+		);
+		let stop = () => {};
+		try {
+			await reads.status(current);
+			await reads.lineStats(current);
+			fixture.setPath("edited-before-probe");
+			requestedTtls.length = 0;
+			const snapshots: GitWorkspaceSnapshot[] = [];
+			const changes: GitWorkspaceCategory[][] = [];
+			stop = pool.subscribe(
+				current,
+				(categories) => changes.push(categories),
+				(value) => snapshots.push(value),
+			);
+			await pause();
+			expect(probes).toBe(1);
+			expect(requestedTtls).toEqual([]);
+			expect(counts.status).toBe(1);
+			expect(counts.lineStats).toBe(1);
+			expect(snapshots).toEqual([]);
+			initialProbe.resolve(await fixture.probe());
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)?.status?.files?.[0]?.path).toBe("edited-before-probe");
+			expect(snapshots.at(-1)?.lineStats?.files?.[0]?.path).toBe("edited-before-probe");
+			expect(changes[0]).toEqual([]);
+			fixture.setPath("edited-after-first-snapshot");
+			await waitFor(() => counts.invalidate === 2);
+			expect(changes.some((categories) => categories.includes("worktree"))).toBe(true);
+			await waitFor(
+				() =>
+					snapshots.at(-1)?.updating === false &&
+					snapshots.at(-1)?.status?.files?.[0]?.path === "edited-after-first-snapshot",
+			);
+			expect(snapshots.at(-1)?.lineStats?.files?.[0]?.path).toBe("edited-after-first-snapshot");
+			expect(counts.status).toBe(3);
+			expect(counts.lineStats).toBe(3);
+		} finally {
+			stop();
+			initialProbe.resolve({ fingerprints: { worktree: "cancelled" }, uncertain: [] });
+			fixture.clear();
+		}
+	});
+
+	test("an initial probe failure permits fresh facts, then successful baseline refreshes the unpaired snapshot", async () => {
+		const fixture = coordinatedSnapshotFixture();
+		const { reads, counts } = fixture;
+		const recoveredProbe = deferred<Awaited<ReturnType<typeof fixture.probe>>>();
+		const current = remoteTarget(1);
+		let probes = 0;
+		const pool = new GitWorkspaceWatchPool(
+			async () => {
+				probes++;
+				if (probes === 1) throw new Error("Initial monitor unavailable");
+				return probes === 2 ? recoveredProbe.promise : fixture.probe();
+			},
+			5,
+			reads,
+		);
+		let stop = () => {};
+		try {
+			await reads.status(current);
+			await reads.lineStats(current);
+			fixture.setPath("fresh-despite-monitor-failure");
+			const snapshots: GitWorkspaceSnapshot[] = [];
+			stop = pool.subscribe(
+				current,
+				() => {},
+				(value) => snapshots.push(value),
+			);
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)?.status?.files?.[0]?.path).toBe("fresh-despite-monitor-failure");
+			expect(snapshots.at(-1)?.lineStats?.files?.[0]?.path).toBe("fresh-despite-monitor-failure");
+			expect(counts.status).toBe(2);
+			expect(counts.lineStats).toBe(2);
+			expect(counts.invalidate).toBe(0);
+			await waitFor(() => probes === 2);
+			fixture.setPath("changed-before-first-successful-probe");
+			recoveredProbe.resolve(await fixture.probe());
+			await waitFor(() => counts.invalidate === 1);
+			await waitFor(
+				() =>
+					snapshots.at(-1)?.updating === false &&
+					snapshots.at(-1)?.status?.files?.[0]?.path === "changed-before-first-successful-probe",
+			);
+			expect(snapshots.at(-1)?.lineStats?.files?.[0]?.path).toBe(
+				"changed-before-first-successful-probe",
+			);
+			expect(counts.status).toBe(3);
+			expect(counts.lineStats).toBe(3);
+		} finally {
+			stop();
+			recoveredProbe.resolve({ fingerprints: { worktree: "cancelled" }, uncertain: [] });
+			fixture.clear();
+		}
+	});
+
+	test("ten readers share one load; staggered readers reuse facts without invalidation", async () => {
+		const { pool, counts } = snapshotFixture();
+		const received = Array.from({ length: 10 }, () => [] as GitWorkspaceSnapshot[]);
+		const stops = received.map((snapshots) =>
+			pool.subscribe(
+				remoteTarget(1),
+				() => {},
+				(value) => snapshots.push(value),
+			),
+		);
+		try {
+			await waitFor(() => received.every((values) => values.at(-1)?.updating === false));
+			expect(counts.status).toBe(1);
+			expect(counts.lineStats).toBe(1);
+			expect(counts.invalidate).toBe(1);
+			for (const values of received) {
+				expect(values).toHaveLength(3);
+				expect(new Set(values.map((value) => value.revision)).size).toBe(1);
+				expect(values.map((value) => value.updating)).toEqual([true, true, false]);
+			}
+			const late: GitWorkspaceSnapshot[] = [];
+			await waitFor(() => counts.validate >= 2);
+			stops.push(
+				pool.subscribe(
+					remoteTarget(1),
+					() => {},
+					(value) => late.push(value),
+				),
+			);
+			expect(late).toEqual([required(received[0]?.at(-1))]);
+			await waitFor(() => counts.validate >= 4);
+			expect(counts.status).toBe(1);
+			expect(counts.lineStats).toBe(1);
+			expect(counts.invalidate).toBe(1);
+		} finally {
+			for (const stop of stops) stop();
+		}
+		const after = { ...counts };
+		await pause();
+		expect(counts).toEqual(after);
+	});
+
+	test("publishes status before slow line statistics and finishes the same revision", async () => {
+		const { pool, reads, counts } = snapshotFixture();
+		const line = deferred<GitLineStats>();
+		reads.lineStats = async () => {
+			counts.lineStats++;
+			return line.promise;
+		};
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const stop = pool.subscribe(
+			remoteTarget(1),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => counts.lineStats === 1);
+			expect(snapshots).toHaveLength(2);
+			expect(snapshots.at(-1)).toMatchObject({ status: statusFacts(), updating: true });
+			expect(snapshots.at(-1)?.lineStats).toBeUndefined();
+			line.resolve(lineFacts());
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)?.lineStats).toEqual(lineFacts());
+			expect(new Set(snapshots.map((value) => value.revision)).size).toBe(1);
+		} finally {
+			line.resolve(lineFacts());
+			stop();
+		}
+	});
+
+	test("changes during a dirty read discard stale stats and run exactly one trailing refresh", async () => {
+		const { pool, reads, counts, change } = snapshotFixture();
+		const old = deferred<GitLineStats>();
+		reads.lineStats = async () => {
+			counts.lineStats++;
+			return counts.lineStats === 1 ? old.promise : lineFacts("file", 20);
+		};
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const stop = pool.subscribe(
+			remoteTarget(1),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => counts.lineStats === 1);
+			const originalRevision = required(snapshots.at(-1)).revision;
+			change("second");
+			await waitFor(() => counts.invalidate === 2);
+			change("third");
+			await waitFor(() => counts.invalidate === 3);
+			const dirtyRevision = required(snapshots.at(-1)).revision;
+			expect(dirtyRevision).toBeGreaterThan(originalRevision);
+			old.resolve(lineFacts("old", 999));
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.some((value) => value.lineStats?.linesAdded === 999)).toBe(false);
+			expect(snapshots.at(-1)).toMatchObject({
+				revision: dirtyRevision,
+				lineStats: { linesAdded: 20 },
+			});
+			expect(counts.status).toBe(2);
+			expect(counts.lineStats).toBe(2);
+			await pause();
+			expect(counts.status).toBe(2);
+		} finally {
+			old.resolve(lineFacts());
+			stop();
+		}
+	});
+
+	test("explicit refresh invalidates and reloads only its directory with a newer revision", async () => {
+		const { pool, counts } = snapshotFixture();
+		const a: GitWorkspaceSnapshot[] = [];
+		const b: GitWorkspaceSnapshot[] = [];
+		const other = {
+			...remoteTarget(1),
+			workspace: { ...remoteTarget(1).workspace, workspaceKey: "other", rootPath: "/other" },
+		};
+		const stops = [
+			pool.subscribe(
+				remoteTarget(1),
+				() => {},
+				(value) => a.push(value),
+			),
+			pool.subscribe(
+				other,
+				() => {},
+				(value) => b.push(value),
+			),
+		];
+		try {
+			await waitFor(() => a.at(-1)?.updating === false && b.at(-1)?.updating === false);
+			const beforeA = required(a.at(-1)).revision;
+			const beforeB = required(b.at(-1));
+			pool.refresh(remoteTarget(1));
+			await waitFor(() => a.at(-1)?.updating === false && required(a.at(-1)).revision > beforeA);
+			expect(counts.invalidate).toBe(3);
+			expect(counts.status).toBe(3);
+			expect(counts.lineStats).toBe(3);
+			expect(b.at(-1)).toBe(beforeB);
+			expect(required(a.at(-1)).revision).toBeGreaterThan(beforeB.revision);
+		} finally {
+			for (const stop of stops) stop();
+		}
+	});
+
+	test("generation replacement cancels old stats and cannot mix them into new status", async () => {
+		const { pool, reads, counts } = snapshotFixture();
+		const old = deferred<GitLineStats>();
+		let oldSignal: AbortSignal | undefined;
+		reads.status = async (current) => {
+			counts.status++;
+			return statusFacts(`generation-${current.backend?.runtimeGeneration}`);
+		};
+		reads.lineStats = async (current, signal) => {
+			counts.lineStats++;
+			if (current.backend?.runtimeGeneration === 1) {
+				oldSignal = signal;
+				return old.promise;
+			}
+			return lineFacts("generation-2", 7);
+		};
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const stops = [
+			pool.subscribe(
+				remoteTarget(1),
+				() => {},
+				(value) => snapshots.push(value),
+			),
+		];
+		try {
+			await waitFor(() => counts.lineStats === 1);
+			stops.push(
+				pool.subscribe(
+					remoteTarget(2),
+					() => {},
+					(value) => snapshots.push(value),
+				),
+			);
+			expect(oldSignal?.aborted).toBe(true);
+			old.resolve(lineFacts("generation-1", 999));
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)).toMatchObject({
+				status: { files: [{ path: "generation-2" }] },
+				lineStats: { linesAdded: 7, files: [{ path: "generation-2" }] },
+			});
+			expect(snapshots.some((value) => value.lineStats?.linesAdded === 999)).toBe(false);
+			expect(counts.status).toBe(2);
+			expect(counts.lineStats).toBe(2);
+		} finally {
+			old.resolve(lineFacts());
+			for (const stop of stops) stop();
+		}
+	});
+
+	test("unsupported line statistics are not retried until the runtime generation changes", async () => {
+		const { pool, reads, counts } = snapshotFixture();
+		reads.lineStats = async (current) => {
+			counts.lineStats++;
+			if (current.backend?.runtimeGeneration === 1)
+				throw new AppError("Upgrade required", 409, "GIT_LINE_STATS_UNSUPPORTED");
+			return lineFacts();
+		};
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const stops = [
+			pool.subscribe(
+				remoteTarget(1),
+				() => {},
+				(value) => snapshots.push(value),
+			),
+		];
+		try {
+			await waitFor(() => snapshots.at(-1)?.updating === false);
+			expect(snapshots.at(-1)).toMatchObject({
+				lineStatsError: "GIT_LINE_STATS_UNSUPPORTED",
+				status: statusFacts(),
+			});
+			expect(counts.lineStats).toBe(1);
+			pool.refresh(remoteTarget(1));
+			await waitFor(() => counts.status === 2 && snapshots.at(-1)?.updating === false);
+			expect(counts.lineStats).toBe(1);
+			expect(snapshots.at(-1)?.lineStatsError).toBe("GIT_LINE_STATS_UNSUPPORTED");
+			stops.push(
+				pool.subscribe(
+					remoteTarget(2),
+					() => {},
+					(value) => snapshots.push(value),
+				),
+			);
+			await waitFor(() => counts.status === 3 && snapshots.at(-1)?.updating === false);
+			expect(counts.lineStats).toBe(2);
+			expect(snapshots.at(-1)?.lineStats).toEqual(lineFacts());
+			expect(snapshots.at(-1)?.lineStatsError).toBeUndefined();
+		} finally {
+			for (const stop of stops) stop();
+		}
+	});
+
+	test("last unsubscribe aborts the read and suppresses its late publication", async () => {
+		const { pool, reads, counts } = snapshotFixture();
+		const pending = deferred<Awaited<ReturnType<typeof getGitWorkspaceStatus>>>();
+		let signal: AbortSignal | undefined;
+		reads.status = async (_target, currentSignal) => {
+			counts.status++;
+			signal = currentSignal;
+			return pending.promise;
+		};
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const stop = pool.subscribe(
+			remoteTarget(1),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => counts.status === 1);
+			stop();
+			expect(signal?.aborted).toBe(true);
+			pending.resolve(statusFacts());
+			await pause();
+			expect(snapshots).toHaveLength(1);
+			expect(counts.lineStats).toBe(0);
+		} finally {
+			pending.resolve(statusFacts());
+			stop();
+		}
+	});
+
+	test("bounded details retain whole-measurement totals and independent partial flags", () => {
+		const files = Array.from({ length: 250 }, (_, i) => ({ status: " M", path: `file-${i}` }));
+		const input: GitWorkspaceSnapshot = {
+			revision: 42,
+			updating: false,
+			status: { ...statusFacts(), files, totalFiles: 250 },
+			lineStats: {
+				linesAdded: 1000,
+				linesRemoved: 20,
+				complete: false,
+				files: files.map(({ path }) => ({ path, complete: false })),
+			},
+		};
+		const bounded = boundGitSnapshot(input);
+		expect(bounded.status?.files).toHaveLength(200);
+		expect(bounded.lineStats?.files).toHaveLength(200);
+		expect(bounded).toMatchObject({
+			detailsTruncated: true,
+			status: { totalFiles: 250, totalFilesExact: true, truncated: true },
+			lineStats: { linesAdded: 1000, linesRemoved: 20, complete: false },
+		});
+		expect(projectGitSnapshot(bounded, "details")).toBe(bounded);
+		const summary = JSON.parse(JSON.stringify(projectGitSnapshot(bounded, "summary")));
+		expect(summary.status.files).toBeUndefined();
+		expect(summary.lineStats.files).toBeUndefined();
+		expect(summary.detailsTruncated).toBeUndefined();
+		expect(summary.lineStats.complete).toBe(false);
+		expect(summary.status.totalFiles).toBe(250);
+		expect(input.status?.files).toHaveLength(250);
+		const complete = boundGitSnapshot({
+			...input,
+			lineStats: { ...required(input.lineStats), complete: true },
+		});
+		expect(complete.detailsTruncated).toBe(true);
+		expect(complete.lineStats?.complete).toBe(true);
+	});
+
+	test("byte budget bounds multibyte paths and keeps only matching line details", () => {
+		const files = Array.from({ length: 200 }, (_, i) => ({
+			status: " M",
+			path: `${i}-${"界".repeat(1200)}`,
+		}));
+		const bounded = boundGitSnapshot({
+			revision: 1,
+			updating: false,
+			status: { ...statusFacts(), files, totalFiles: 200 },
+			lineStats: {
+				...lineFacts(),
+				files: [
+					...files.map(({ path }) => ({ path, complete: true })),
+					{ path: "not-in-status", complete: true },
+				],
+			},
+		});
+		expect(Buffer.byteLength(JSON.stringify(bounded))).toBeLessThanOrEqual(
+			GIT_SNAPSHOT_MAX_BYTES - 4096,
+		);
+		expect(bounded.status?.files?.length).toBeGreaterThan(0);
+		expect(bounded.status?.files?.length).toBeLessThan(200);
+		expect(bounded.lineStats?.files?.map((file) => file.path)).toEqual(
+			bounded.status?.files?.map((file) => file.path),
+		);
+		expect(bounded.detailsTruncated).toBe(true);
+		expect(bounded.lineStats?.complete).toBe(true);
 	});
 });

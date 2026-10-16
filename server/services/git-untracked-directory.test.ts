@@ -163,7 +163,7 @@ describe("untracked directories are expanded to files", () => {
 		});
 	});
 
-	test("cache and direct concurrent readers share one real status process, but direct reads stay fresh", async () => {
+	test("cache and direct readers share real status processes and fresh overrides bypass settled results", async () => {
 		const repo = await makeRepo();
 		writeNested(repo);
 		const spawnSpy = spyOn(Bun, "spawn");
@@ -180,7 +180,9 @@ describe("untracked directories are expanded to files", () => {
 			await getStatusSummaryCached(repo);
 			expect(statusCalls()).toBe(1);
 			writeFileSync(join(repo, "another.txt"), "new\n");
-			expect((await gitService.getStatusSummary(repo)).totalFiles).toBe(4);
+			expect((await gitService.getStatusSummary(repo)).totalFiles).toBe(3);
+			expect(statusCalls()).toBe(1);
+			expect((await gitService.getStatusSummary(repo, { ttlMs: 0 })).totalFiles).toBe(4);
 			expect(statusCalls()).toBe(2);
 		} finally {
 			spawnSpy.mockRestore();

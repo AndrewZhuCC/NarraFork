@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import {
 	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
 	GIT_COMMIT_PREVIEW_UNSUPPORTED,
@@ -11,13 +11,24 @@ import {
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
-import { invalidateGitWorkspace } from "./git-management-service";
+import { eventBus } from "../lib/event-bus";
+import { getGitLineStatsCached } from "./git-line-stats-cache";
+import {
+	getGitWorkspaceLineStats,
+	getGitWorkspaceStatus,
+	invalidateGitWorkspace,
+	validateGitWorkspaceCache,
+} from "./git-management-service";
+import { clearStatusCache } from "./git-status-cache";
 import type { GitWorkspaceTarget } from "./git-workspace";
 import {
 	createRemoteGitService,
+	getRemoteGitStatusQueryKey,
 	parseRemoteGitStatus,
 	supportsRemoteGitWorkspace,
 } from "./remote-git-service";
+
+afterEach(clearStatusCache);
 
 function backendFixture(supportsGitCommitPreview = true) {
 	const calls: Array<{ request: GitWorkspaceRequest; signal?: AbortSignal }> = [];
@@ -27,6 +38,7 @@ function backendFixture(supportsGitCommitPreview = true) {
 		kind: "remote",
 		deviceId: "device-a",
 		supportsGitWorkspace: true,
+		supportsGitLineStats: true,
 		supportsGitCommitPreview,
 		async gitWorkspace(request: GitWorkspaceRequest, signal?: AbortSignal) {
 			calls.push({ request, signal });
@@ -44,6 +56,122 @@ function backendFixture(supportsGitCommitPreview = true) {
 			failure = error;
 		},
 	};
+}
+
+test("workspace helpers share results, preserve fresh overrides and renew only clean cached data", async () => {
+	const f = backendFixture();
+	const backend = { ...f.backend, paths: targetPathSemantics("posix") } as ExecutionBackend;
+	const target = {
+		backend,
+		workspace: { deviceId: backend.deviceId, cwd: "/helpers", rootPath: "/helpers" },
+	} as GitWorkspaceTarget;
+	f.respond({
+		outputs: { status: "?? a\0" },
+		lineStats: { files: [], linesAdded: 1, linesRemoved: 0, complete: true },
+	});
+	let now = 0;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const events: string[] = [];
+	const listener = (event: { queryKey: string }) => {
+		events.push(event.queryKey);
+	};
+	eventBus.on("git:workspace_invalidated", listener);
+	try {
+		validateGitWorkspaceCache(target);
+		expect(f.calls).toHaveLength(0);
+		await getGitWorkspaceStatus(target);
+		validateGitWorkspaceCache(target);
+		expect(f.calls.map(({ request }) => request.operation)).toEqual(["status"]);
+		await getGitWorkspaceLineStats(target);
+		now = 2999;
+		validateGitWorkspaceCache(target);
+		now = 5000;
+		await getGitWorkspaceStatus(target);
+		await getGitWorkspaceLineStats(target);
+		expect(f.calls).toHaveLength(2);
+		await getGitWorkspaceStatus(target, undefined, 0);
+		await getGitWorkspaceLineStats(target, undefined, 0);
+		expect(f.calls).toHaveLength(4);
+		invalidateGitWorkspace(target);
+		validateGitWorkspaceCache(target);
+		await getGitWorkspaceStatus(target);
+		await getGitWorkspaceLineStats(target);
+		expect(f.calls).toHaveLength(6);
+		expect(events).toEqual([getRemoteGitStatusQueryKey(backend, "/helpers")]);
+		await createRemoteGitService(backend).stageAll("/helpers");
+		expect(events).toHaveLength(2);
+		await getGitWorkspaceStatus(target);
+		await getGitWorkspaceLineStats(target);
+		expect(f.calls).toHaveLength(9);
+	} finally {
+		clock.mockRestore();
+		eventBus.off("git:workspace_invalidated", listener);
+	}
+});
+
+test("remote line stats is an independent raw read with unknown fields preserved", async () => {
+	const f = backendFixture();
+	const controller = new AbortController();
+	const partial = {
+		files: [{ path: "large.txt", stagedLinesAdded: 1, stagedLinesRemoved: 0, complete: false }],
+		linesAdded: 1,
+		linesRemoved: 0,
+		complete: false,
+	};
+	f.respond({ lineStats: partial });
+	const git = createRemoteGitService(f.backend, controller.signal);
+	expect(await git.getLineStats("C:\\Repo")).toEqual(partial);
+	expect(f.calls[0]).toEqual({
+		request: {
+			cwd: "C:\\Repo",
+			expectedRoot: "C:\\Repo",
+			operation: "lineStats",
+			timeoutMs: GIT_WORKSPACE_TIMEOUT_MS,
+			maxBytes: GIT_WORKSPACE_MAX_BYTES,
+		},
+		signal: controller.signal,
+	});
+	// No settled cache or status coalescer is hidden inside the raw adapter.
+	await git.getLineStats("C:\\Repo");
+	expect(f.calls).toHaveLength(2);
+	f.respond({});
+	await expect(git.getLineStats("/repo")).rejects.toThrow("statistics are missing");
+	f.fail(new Error("cancelled"));
+	await expect(git.getLineStats("/repo")).rejects.toThrow("cancelled");
+});
+
+test("remote line stats unsupported requires upgrade without legacy status fallback", async () => {
+	const f = backendFixture();
+	const backend = { ...f.backend, supportsGitLineStats: false } as ExecutionBackend;
+	await expect(createRemoteGitService(backend).getLineStats("/repo")).rejects.toMatchObject({
+		code: "GIT_LINE_STATS_UNSUPPORTED",
+		statusCode: 501,
+	});
+	expect(f.calls).toHaveLength(0);
+});
+
+for (const writeFails of [false, true]) {
+	test(`remote writes invalidate settled line statistics even when uncertain=${writeFails}`, async () => {
+		const f = backendFixture();
+		const cwd = `/stats-write-invalidates-${writeFails}`;
+		const key = getRemoteGitStatusQueryKey(f.backend, cwd);
+		const stats = { files: [], linesAdded: 1, linesRemoved: 0, complete: false };
+		let reads = 0;
+		const read = () =>
+			getGitLineStatsCached(key, async () => {
+				reads++;
+				return stats;
+			});
+		await read();
+		await read();
+		expect(reads).toBe(1);
+		if (writeFails) f.fail(new Error("connection lost"));
+		const git = createRemoteGitService(f.backend);
+		if (writeFails) await expect(git.stageAll(cwd)).rejects.toThrow("uncertain");
+		else await git.stageAll(cwd);
+		await read();
+		expect(reads).toBe(2);
+	});
 }
 
 const PREVIEW_SHA = "a".repeat(40);
@@ -406,14 +534,14 @@ test("remote status retains upstream byte-budget truncation below the file cap",
 	const git = createRemoteGitService(f.backend);
 	for (const status of ["", "?? captured.txt\0", "R  incomplete-rename\0"]) {
 		f.respond({ outputs: { status }, truncated: true });
-		const summary = await git.getStatusSummary("/repo");
+		const summary = await git.getStatusSummary("/repo", { ttlMs: 0 });
 		expect(summary.truncated).toBe(true);
 		expect(summary.hasChanges).toBe(true);
 		expect(summary.totalFiles).toBe(summary.files.length);
 		expect(summary.files).toHaveLength(status.startsWith("??") ? 1 : 0);
 	}
 	f.respond({ outputs: { status: "" }, truncated: false });
-	expect(await git.getStatusSummary("/repo")).toMatchObject({
+	expect(await git.getStatusSummary("/repo", { ttlMs: 0 })).toMatchObject({
 		hasChanges: false,
 		truncated: false,
 		totalFiles: 0,
@@ -499,7 +627,9 @@ test("remote status merges authorized readers but cancellation belongs to each c
 	pending.resolve({ outputs: { status: "?? file\0" } });
 	expect((await b).totalFiles).toBe(1);
 	await createRemoteGitService(backend).getStatusSummary("/coalesced");
-	expect(calls).toBe(2); // No result TTL.
+	expect(calls).toBe(1); // A different authorized adapter shares the settled result.
+	await createRemoteGitService(backend).getStatusSummary("/coalesced", { ttlMs: 0 });
+	expect(calls).toBe(2);
 });
 
 test("remote status separates device, generation and cwd; last reader abort reaches RPC", async () => {

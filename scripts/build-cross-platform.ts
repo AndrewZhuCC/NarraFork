@@ -444,6 +444,8 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		"./server/lib/fs-scan-worker/fs-scan-worker-entry.ts",
 		// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 		"./server/services/editor-document-worker.ts",
+		// Untracked file line counting must also stay off-thread in compiled distributions.
+		"./server/services/git-untracked-line-worker.ts",
 		// Model history JSON decoding stays off-thread in compiled distributions too.
 		"./server/services/agent-runtime/model-history-worker.ts",
 		"./server/lib/browser/memory-snapshot-worker.ts",

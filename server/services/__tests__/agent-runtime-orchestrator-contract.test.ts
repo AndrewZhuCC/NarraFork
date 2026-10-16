@@ -263,6 +263,99 @@ describe("Bash Git command detection for status refresh", () => {
 	});
 });
 
+describe("tool Git status refresh", () => {
+	test("invalidates at the write boundary and shares cached status in the trailing chapter broadcast", async () => {
+		const statusCache = await import("../git-status-cache");
+		const { gitService } = await import("../git-service");
+		const ws = await import("../../websocket/narrator-ws");
+		const repo = join(process.env.HOME as string, "git-track-fixture");
+		statusCache.clearStatusCache();
+		const summary = {
+			hasChanges: true,
+			staged: 0,
+			unstaged: 1,
+			untracked: 0,
+			totalFiles: 1,
+			files: [{ path: "changed.txt", status: " M" }],
+			headSha: "fixture-head",
+			branch: "feature",
+		};
+		const { coordinateGitStatusQuery, getLocalGitStatusQueryKey } = await import(
+			"../git-status-query"
+		);
+		const query = mock(async () => summary);
+		spyOn(gitService, "getStatusSummary").mockImplementation((path, options) =>
+			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
+		);
+		const ahead = spyOn(gitService, "getCommitsAhead").mockResolvedValue({
+			count: 2,
+			baseBranch: "main",
+		});
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
+		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
+		let verified = false;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				h.session._chapterId = "git-track-chapter";
+				h.session._worktreePath = repo;
+				h.session._baseBranch = "main";
+				const scheduled: Array<() => void> = [];
+				const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+					callback: () => void,
+				) => {
+					scheduled.push(callback);
+					return scheduled.length as unknown as ReturnType<typeof setTimeout>;
+				}) as typeof setTimeout);
+				const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+				try {
+					options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
+					expect(invalidate).toHaveBeenCalledTimes(1);
+					options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
+					expect(invalidate).toHaveBeenCalledTimes(2);
+					expect(query).not.toHaveBeenCalled();
+					expect(clear).toHaveBeenCalledTimes(1);
+					expect(scheduled).toHaveLength(2);
+				} finally {
+					timer.mockRestore();
+					clear.mockRestore();
+				}
+
+				// A directory subscriber already refreshed after the latest write.
+				await statusCache.getStatusSummaryCached(repo);
+				expect(query).toHaveBeenCalledTimes(1);
+				cachedRead.mockClear();
+				scheduled[1]();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(invalidate).toHaveBeenCalledTimes(2);
+				expect(query).toHaveBeenCalledTimes(1);
+				expect(cachedRead).toHaveBeenCalledWith(repo);
+				expect(ahead).toHaveBeenCalledWith(repo, "main");
+				expect(
+					broadcast.mock.calls.some(
+						([, message]) =>
+							message.type === "git_status" &&
+							message.toolUseId === "write-2" &&
+							message.chapterId === "git-track-chapter" &&
+							message.commitsAhead === 2 &&
+							message.baseBranch === "main" &&
+							!("files" in message.status),
+					),
+				).toBe(true);
+				verified = true;
+				return { ...finished };
+			},
+		]);
+		try {
+			await h.run();
+			expect(h.calls).toHaveLength(1);
+			expect(verified).toBe(true);
+		} finally {
+			statusCache.clearStatusCache();
+		}
+	});
+});
+
 describe("subagent signed source projection", () => {
 	function seed() {
 		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.
