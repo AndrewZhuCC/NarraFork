@@ -4,7 +4,7 @@ import { onTokenChange } from "@frontend/lib/api/client";
 import { Box, Button, Drawer, Group, Loader, Modal, Text } from "@mantine/core";
 import type { GenUiFileReference } from "@shared/gen-ui-files";
 import type { GenUiKitNotice } from "@shared/gen-ui-kit";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 const FilePreview = lazy(() =>
@@ -138,12 +138,22 @@ function InlineCard({
 	const [closing, setClosing] = useState(false);
 	const title = inline.title || t("genUi.title");
 	const form = inline.live ? undefined : inline.formToolUseId;
+	const formRef = useRef(form);
+	formRef.current = form;
 	// Kept out of the chat bundle: only a card that is waiting on its reader needs it.
 	const closeForm = () => {
 		if (!form) return;
 		setClosing(true);
-		void import("./kit-client")
-			.then((client) => client.answerGenUiForm(narratorId, form, { status: "closed" }))
+		// Like a submit, a close can come a moment before the call starts waiting.
+		const attempt = async (tries: number): Promise<void> => {
+			const client = await import("./kit-client");
+			const result = await client.answerGenUiForm(narratorId, form, { status: "closed" });
+			if (result === "not-waiting" && tries > 0 && formRef.current === form) {
+				await new Promise((done) => setTimeout(done, 1000));
+				return attempt(tries - 1);
+			}
+		};
+		void attempt(5)
 			.catch(() => undefined)
 			.finally(() => setClosing(false));
 	};
@@ -323,14 +333,19 @@ const newestShown = new Map<string, number>();
 /**
  * Only the newest app in a conversation starts by itself, and only while it is recent:
  * scrolling back through history must not build and run every app it passes, nor run
- * code the agent has long since moved on from.
+ * code the agent has long since moved on from. Every card registers when it mounts and
+ * decides once the rows mounted with it have registered too, so of two cards drawn
+ * together only the newer one starts.
  */
+function registerShown(narratorId: string, shownAt: string): void {
+	const at = Date.parse(shownAt);
+	newestShown.set(narratorId, Math.max(newestShown.get(narratorId) ?? 0, at));
+	if (newestShown.size > 50) newestShown.delete(newestShown.keys().next().value as string);
+}
+
 function startsByItself(narratorId: string, shownAt: string): boolean {
 	const at = Date.parse(shownAt);
-	const newest = Math.max(newestShown.get(narratorId) ?? 0, at);
-	newestShown.set(narratorId, newest);
-	if (newestShown.size > 50) newestShown.delete(newestShown.keys().next().value as string);
-	return at === newest && Date.now() - at < AUTO_RUN_WINDOW_MS;
+	return at === newestShown.get(narratorId) && Date.now() - at < AUTO_RUN_WINDOW_MS;
 }
 
 function AppCard({
@@ -350,7 +365,14 @@ function AppCard({
 }) {
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
-	const [running, setRunning] = useState(() => startsByItself(narratorId, shownAt));
+	const [running, setRunning] = useState(false);
+	useEffect(() => {
+		registerShown(narratorId, shownAt);
+		const timer = setTimeout(() => {
+			if (startsByItself(narratorId, shownAt)) setRunning(true);
+		}, 0);
+		return () => clearTimeout(timer);
+	}, [narratorId, shownAt]);
 	const [run, setRun] = useState(0);
 	const [expanded, setExpanded] = useState(false);
 	useEffect(() => {

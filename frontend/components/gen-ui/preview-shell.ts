@@ -206,7 +206,7 @@ export function createPreviewShell(
       : typeof value === "object" ? JSON.stringify(value) : String(value);
     // Only plain data leaves the frame: what controls hold is strings, numbers, booleans,
     // arrays of those, or null.
-    const plain = (value) => value == null ? null : Array.isArray(value) ? value.slice(0, 200).map(plain)
+    const plain = (value) => value == null ? null : Array.isArray(value) ? value.slice(0, 200).map((item) => Array.isArray(item) ? shown(item).slice(0, 2000) : plain(item))
       : typeof value === "string" ? value.slice(0, 2000) : typeof value === "number" || typeof value === "boolean" ? value : shown(value).slice(0, 2000);
     const fill = (text) => text.replace(/\\{([A-Za-z_][A-Za-z0-9_]{0,63})\\}/g, (match, name) => state.has(name) ? shown(state.get(name)) : match);
     const perform = (action, value) => {

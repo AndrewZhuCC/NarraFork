@@ -284,7 +284,7 @@ async function waitForForm(
 ): Promise<ToolResult> {
 	const toolUseId = env.ctx.currentToolUseId;
 	const refusal = !actions.includes("submit")
-		? "wait: true needs a submit() control, and this UI has none: it is in the chat, but nothing waits for it. Add a button with onClick={submit()} and render again."
+		? "Nothing was shown: wait: true needs a submit() control and this UI has none. Add a button with onClick={submit()} and render again."
 		: !toolUseId
 			? "This call cannot wait for a form; render it without wait."
 			: (() => {
@@ -292,7 +292,7 @@ async function waitForForm(
 						assertRuntimeCanAskQuestion(runtimePolicyForContext(env.ctx));
 						return null;
 					} catch {
-						return "Nobody can answer a form in this session, so wait: true is unavailable. Render without wait, or carry on with sensible defaults.";
+						return "Nothing was shown: nobody can answer a form in this session, so wait: true is unavailable. Render without wait, or carry on with sensible defaults.";
 					}
 				})();
 	if (refusal || !toolUseId)

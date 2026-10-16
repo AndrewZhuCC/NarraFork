@@ -22,12 +22,70 @@ interface SubmittedForm {
 	fields: Record<string, unknown>;
 }
 
-/** The values a submit() carried; the server checks their shape again. */
-function readSubmittedForm(data: { message?: unknown; fields?: unknown }): SubmittedForm | null {
+/** Forms this page has answered: each waiting call takes one answer. */
+const answeredForms = new Set<string>();
+
+type FormValue = string | number | boolean | null | FormValue[];
+const FIELD_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+function flatValue(value: unknown): string | number | boolean | null {
+	if (value === null || value === undefined) return null;
+	if (typeof value === "number") return Number.isFinite(value) ? value : null;
+	if (typeof value === "boolean") return value;
+	return (typeof value === "string" ? value : (JSON.stringify(value) ?? "")).slice(0, 2000);
+}
+
+/**
+ * The values a submit() carried, in the shape the server accepts: named fields of plain
+ * values or flat lists, small enough to send. The frame is not trusted to have done it.
+ */
+export function readSubmittedForm(data: {
+	message?: unknown;
+	fields?: unknown;
+}): SubmittedForm | null {
 	const { message, fields } = data;
 	if (typeof message !== "string" || !fields || typeof fields !== "object" || Array.isArray(fields))
 		return null;
-	return { message, fields: fields as Record<string, unknown> };
+	const out: Record<string, FormValue> = {};
+	for (const name of Object.keys(fields).slice(0, 200)) {
+		if (!FIELD_NAME.test(name) || name === "__proto__") continue;
+		const value = (fields as Record<string, unknown>)[name];
+		out[name] = Array.isArray(value) ? value.slice(0, 200).map(flatValue) : flatValue(value);
+	}
+	// Long answers are cut evenly rather than the whole submit being refused.
+	const names = Object.keys(out);
+	const room = Math.floor(28_000 / Math.max(1, names.length) / 2);
+	if (JSON.stringify(out).length > 30_000)
+		for (const name of names) {
+			const value = out[name];
+			out[name] = Array.isArray(value)
+				? value.map((item) => (typeof item === "string" ? item.slice(0, 40) : item))
+				: typeof value === "string"
+					? value.slice(0, room)
+					: (value ?? null);
+		}
+	return { message: message.trim().slice(0, 2000), fields: out };
+}
+
+const shownValue = (value: unknown): string =>
+	value === null || value === undefined
+		? ""
+		: Array.isArray(value)
+			? value.map(shownValue).join(", ")
+			: String(value);
+
+/**
+ * What a submit says, built here from the values that will actually be sent: the reader
+ * confirms, and the chat or the agent receives, the same thing.
+ */
+export function submittedText(form: SubmittedForm): string {
+	const names = Object.keys(form.fields);
+	const room = Math.max(40, Math.floor((1900 - form.message.length) / Math.max(1, names.length)));
+	const lines = names.map((name) => {
+		const text = shownValue(form.fields[name]);
+		return `${name}: ${text.length > room ? `${text.slice(0, room - 1)}…` : text}`;
+	});
+	return [form.message, ...lines].filter(Boolean).join("\n").slice(0, 2000);
 }
 
 /**
@@ -155,6 +213,9 @@ export function InlineRender({
 		(text: string, form: SubmittedForm | null): boolean => {
 			const toolUseId = formNow.current;
 			if (!form || !toolUseId) return send(text);
+			// The call takes one answer; a later click on this form while its row still says
+			// it waits (or from the expanded view) is not a second message.
+			if (answeredForms.has(toolUseId)) return false;
 			if (Date.now() - lastSent.current < 1000) return false;
 			lastSent.current = Date.now();
 			setSendFailed(false);
@@ -165,7 +226,12 @@ export function InlineRender({
 					status: "submitted",
 					...form,
 				});
-				if (result === "answered") return;
+				if (result === "answered") {
+					answeredForms.add(toolUseId);
+					if (answeredForms.size > 100)
+						answeredForms.delete(answeredForms.values().next().value as string);
+					return;
+				}
 				if (tries > 0 && formNow.current === toolUseId) {
 					await new Promise((done) => setTimeout(done, 1000));
 					return attempt(tries - 1);
@@ -271,9 +337,10 @@ export function InlineRender({
 			}
 			// submit() arrives as the text the frame composed from the bound fields: to the
 			// chat it is the same as a sendPrompt the reader triggered.
-			const text = data.value.trim();
-			if ((data.action !== "sendPrompt" && data.action !== "submit") || !text) return;
+			if (data.action !== "sendPrompt" && data.action !== "submit") return;
 			const form = data.action === "submit" ? readSubmittedForm(data) : null;
+			const text = form ? submittedText(form) : data.value.trim();
+			if (!text) return;
 			// The frame's gesture check guards markup, but a project kit's own code runs
 			// in that frame and can post this message itself: the reader confirms it.
 			if (current.kit) {

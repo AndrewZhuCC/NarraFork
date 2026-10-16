@@ -148,5 +148,8 @@ export function describeGenUiFormOutcome(outcome: GenUiFormOutcome): {
 		return {
 			output: `The user did not submit the form within ${GEN_UI_FORM_TIMEOUT_MS / 60_000} minutes; the wait ended. The form stays in the chat, and if they submit it later it arrives as a chat message.`,
 		};
-	return { output: "Stopped while waiting for the form.", isError: true };
+	return {
+		output: "Stopped while waiting for the form; the user did not answer it.",
+		isError: true,
+	};
 }
