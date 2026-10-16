@@ -391,7 +391,7 @@ function operationResult(
 				result.outcome === "unknown"
 					? "Query GetWorktreeOperation with this operationId. Do not recreate or clean up."
 					: result.outcome === "created"
-						? "Worktree created. Directory switching is a separate explicit operation."
+						? "Worktree created; cwd unchanged. SwitchWorkingDirectory if this narrator will work there (visible git stats follow cwd). Pass the path as Agent workdir to assign it to a subagent without switching."
 						: "This operation failed. Inspect the error and residuals before making a corrected request; do not blindly retry or clean up.",
 		}),
 	};
