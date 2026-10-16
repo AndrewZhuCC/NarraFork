@@ -659,7 +659,7 @@ DELETE /api/knowledge/collections/:id
 
 GET    /api/knowledge/entries?collectionId=&tags=&q=&view.version=&view.product= 列出/筛选条目（q 触发 FTS；结果按权限过滤；view.* 传 viewContext 裁剪正文/摘要）
 POST   /api/knowledge/entries                        创建条目（含首版本、密级、标签）
-GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）
+GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）；附 viewerCaps（见下）
 PATCH  /api/knowledge/entries/:id                    改元数据（标题/标签/密级/metadata）
 DELETE /api/knowledge/entries/:id                    归档/删除
 
@@ -683,6 +683,8 @@ GET    /api/knowledge/grants?scope=&principal=         列出授权（clearance 
 POST   /api/knowledge/grants                           授予 clearance 或 tag
 DELETE /api/knowledge/grants/:id                       撤销授权
 ```
+
+**`viewerCaps`（调用者能力位）**：`GET /entries/:id` 返回条目时附带 `viewerCaps: { canWriteMain, canEditMeta, canManageAcl, canTransferOwner, canDelete, canReview, myPersonalEntryId }`；`GET /collections` 的每一行附带 `viewerCaps: { canEdit, canManageAcl, canTransferOwner, canDelete, canCreateEntry }`。每一位都由对应写接口所用的同一判定函数计算（`canDirectWriteEntry` / `canWriteMain` / `isEntryOwnerOrAdmin` / `canAdministerKnowledgeAcl` / `canReview` / `isCollectionOwnerOrAdmin` / `canWriteCollection`），前端只按它显隐操作，不自行推断权限。映射表见 `KNOWLEDGE_UI_REDESIGN.md` §8.1，一致性由 `server/services/__tests__/knowledge-viewer-caps.test.ts` 保证。能力位只说明"该类调用会被接受"，不含逐请求的输入校验（如"只有 admin 能把 owner 设为空"、"不能审核自己的提交"）。
 
 > 开放 API（API token 鉴权、外部读写）见 `OPEN_API.md`；本文件只定义资源本身与内部（JWT）接口。两者复用同一 `knowledgeService`。
 
