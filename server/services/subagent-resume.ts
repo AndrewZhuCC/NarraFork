@@ -18,6 +18,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { getRuntimePublicationService } from "./agent-runtime/publication";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { classifyRuntimeWriteError, runAtomicWrite } from "./agent-runtime/runtime-write";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import {
@@ -472,6 +473,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				updatedAt: completedAt,
 			})
 			.where(and(eq(narrators.id, input.subagentId), eq(narrators.logicalRunId, logicalRunId)));
+		backgroundOccupancyStore.refreshNarrator(input.subagentId);
 		await db
 			.update(backgroundTasks)
 			.set({
@@ -488,6 +490,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					eq(backgroundTasks.logicalRunId, logicalRunId),
 				),
 			);
+		backgroundOccupancyStore.refreshTask(input.subagentId);
 		backgroundTaskService.notifyDerivedStatusChanged(
 			preContinuationRun.recipientId,
 			input.subagentId,
@@ -599,6 +602,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 										eq(narrators.logicalRunId, retryRun.logicalRunId),
 									),
 								);
+							backgroundOccupancyStore.refreshNarrator(input.subagentId);
 							await db
 								.update(backgroundTasks)
 								.set({
@@ -617,6 +621,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 										eq(backgroundTasks.logicalRunId, retryRun.logicalRunId),
 									),
 								);
+							backgroundOccupancyStore.refreshTask(input.subagentId);
 							backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, input.subagentId);
 						}
 						await establishSubagentExecutionSegment({

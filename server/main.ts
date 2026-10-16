@@ -85,6 +85,10 @@ import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
 
+import {
+	backgroundOccupancyInitializer,
+	withBackgroundOccupancyInitialization,
+} from "./services/background-occupancy-startup";
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import {
@@ -1466,8 +1470,11 @@ function startQuestionAnswerRecovery(): void {
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
 // the background after that queue is mounted.
-getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled() })
-	.then(async (plannedUpdate) => {
+withBackgroundOccupancyInitialization(
+	async () => {
+		const plannedUpdate = await getPlannedUpdateStartupProtection({
+			claimAuthorization: automaticResumeEnabled(),
+		});
 		// The instance lock is already held. Release only previous-process mailbox claims
 		// before planned recovery mounts owners; hot reload preserves the process marker.
 		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
@@ -1476,6 +1483,11 @@ getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled()
 		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection);
 		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
 		await recoverNarrators(protection);
+		return { plannedUpdate, ordinaryRestart };
+	},
+	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
+)
+	.then(async ({ plannedUpdate, ordinaryRestart }) => {
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation
 		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
@@ -1760,6 +1772,7 @@ async function performGracefulShutdown(
 
 	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
+		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
 		// Track every teardown step's outcome. The clean-shutdown marker is a promise that the DB

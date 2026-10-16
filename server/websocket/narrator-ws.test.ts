@@ -14,6 +14,14 @@ mock.module("../db", () => ({ db, sqlite }));
 const { broadcastToNarrator, broadcastToUser, getNarratorConnections, handleNarratorWS } =
 	await import("./narrator-ws");
 const { eventBus } = await import("../lib/event-bus");
+const { backgroundOccupancyStore } = await import("../services/background-occupancy-store");
+const { backgroundTaskService } = await import("../services/background-task-service");
+
+async function settleOccupancy(): Promise<void> {
+	await backgroundOccupancyStore.flush();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 type SentMessage = Record<string, unknown>;
 type FakeNarratorWS = Parameters<typeof handleNarratorWS.open>[0];
@@ -62,7 +70,7 @@ function openFakeWs(
 	return connection;
 }
 
-function seedNarrators() {
+async function seedNarrators() {
 	const now = "2026-07-19T00:00:00.000Z";
 	db.insert(projects)
 		.values({
@@ -109,6 +117,8 @@ function seedNarrators() {
 			},
 		])
 		.run();
+	await backgroundOccupancyStore.start();
+	await settleOccupancy();
 }
 
 /** A readable standalone narrator, for frames that need an existing row. */
@@ -129,6 +139,7 @@ function seedReadableNarrator(id: string) {
 afterEach(() => {
 	for (const ws of openedConnections.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
+	backgroundTaskService.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
 
@@ -215,7 +226,7 @@ describe("HumanAttention global invalidation", () => {
 
 describe("narrator WebSocket message snapshot subscribe", () => {
 	it("returns request-scoped sync_ok for a matching version-only empty snapshot", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const { ws, sent } = openFakeWs();
 
 		await handleNarratorWS.message(ws, {
@@ -251,7 +262,7 @@ describe("narrator WebSocket message snapshot subscribe", () => {
 	});
 
 	it("forces a request-scoped reload when a version-only empty snapshot is stale", async () => {
-		seedNarrators();
+		await seedNarrators();
 		db.update(narrators).set({ messageVersion: 1 }).where(eq(narrators.id, "narrator-idle")).run();
 		const { ws, sent } = openFakeWs();
 
@@ -273,7 +284,7 @@ describe("narrator WebSocket message snapshot subscribe", () => {
 	});
 
 	it("catches up a stale snapshot cursor instead of accepting sync_ok", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const now = "2026-07-19T00:00:01.000Z";
 		db.insert(narratorMessages)
 			.values([
@@ -329,7 +340,7 @@ describe("narrator WebSocket message snapshot subscribe", () => {
 
 describe("narrator WebSocket RecentTabs scaling", () => {
 	it("sends list initial state as one batch snapshot instead of status_change frames", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const { ws, sent } = openFakeWs();
 
 		await handleNarratorWS.message(ws, {
@@ -365,7 +376,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 	});
 
 	it("initial and reconnect list snapshots include work that outlives the foreground", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const { backgroundTasks } = await import("../db/schema");
 		const now = new Date().toISOString();
 		db.insert(backgroundTasks)
@@ -379,6 +390,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 				updatedAt: now,
 			})
 			.run();
+		backgroundOccupancyStore.refreshTask("snapshot-background-bash");
+		await settleOccupancy();
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const { ws, sent } = openFakeWs();
 			await handleNarratorWS.message(ws, {
@@ -395,7 +408,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 	});
 
 	it("an in-flight old count snapshot cannot overwrite a delivered live count", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const { backgroundTaskService } = await import("../services/background-task-service");
 		const original = backgroundTaskService.countActiveKindsByParentBatch;
 		let releaseRead = () => {};
@@ -468,7 +481,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 	});
 
 	it("restores service and work counts together without treating a service as unfinished work", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const { backgroundTasks } = await import("../db/schema");
 		const now = new Date().toISOString();
 		await db.insert(backgroundTasks).values({
@@ -481,6 +494,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
+		backgroundOccupancyStore.refreshTask("snapshot-service");
+		await settleOccupancy();
 		const { ws, sent } = openFakeWs();
 		await handleNarratorWS.message(ws, {
 			type: "subscribe",
@@ -501,7 +516,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 	});
 
 	it("keeps basic list status and omits unknown counts when occupancy loading fails", async () => {
-		seedNarrators();
+		await seedNarrators();
 		const { backgroundTaskService } = await import("../services/background-task-service");
 		const original = backgroundTaskService.countActiveKindsByParentBatch;
 		backgroundTaskService.countActiveKindsByParentBatch = async () => {

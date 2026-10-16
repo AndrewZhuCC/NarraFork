@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator, ActiveSubagentSettings } from "../narrator-session-state";
 import { getManualOverrideMap } from "../subagent-manual-override";
 import type { RunningSubagentExecutionSnapshot } from "../subagent-runner";
@@ -77,10 +78,12 @@ export function tryClaimExecution(narratorId: string, kind: ExecutionKind): Exec
 			delete record.phase;
 			delete record.pass;
 			prune(narratorId);
+			publishRuntimeLiveness(narratorId);
 			return true;
 		},
 	};
 	record.owner = owner;
+	publishRuntimeLiveness(narratorId);
 	return owner;
 }
 
@@ -94,6 +97,16 @@ export function isExecutionSuspended(narratorId: string): boolean {
 	);
 }
 
+/** Preserve isNarratorActive || isLoopRunning, including session-only cleanup windows. */
+export function publishRuntimeLiveness(narratorId: string): void {
+	const record = records.get(narratorId);
+	backgroundOccupancyStore.setRuntimeLive(
+		narratorId,
+		Boolean(record?.session) ||
+			(!isExecutionSuspended(narratorId) && Boolean(record?.owner || record?.toolReplayCompletion)),
+	);
+}
+
 export function setExecutionSuspended(owner: ExecutionOwner, suspended: boolean): boolean {
 	const record = records.get(owner.narratorId);
 	// The single orchestrator keeps its invocation reservation while waiting for
@@ -101,6 +114,7 @@ export function setExecutionSuspended(owner: ExecutionOwner, suspended: boolean)
 	if (record?.owner !== owner) return false;
 	if (suspended) record.phase = "suspended";
 	else delete record.phase;
+	publishRuntimeLiveness(owner.narratorId);
 	return true;
 }
 
@@ -172,6 +186,7 @@ export function createRuntimeMapView<K extends ViewField>(
 			const record = recordFor(id);
 			record[field] = value;
 			if (field === "session") attachSessionControlView(id, record, value as ActiveNarrator);
+			publishRuntimeLiveness(id);
 			return this;
 		}
 		override delete(id: string): boolean {
@@ -180,6 +195,7 @@ export function createRuntimeMapView<K extends ViewField>(
 			delete record[field];
 			if (field === "session") delete record.bufferSoftStop;
 			prune(id);
+			publishRuntimeLiveness(id);
 			return true;
 		}
 		override clear(): void {
@@ -247,6 +263,7 @@ function bindLegacyOwner(narratorId: string, kind: ExecutionKind, source: object
 	const sources = legacyOwnerSources.get(owner) ?? new Set<object>();
 	sources.add(source);
 	legacyOwnerSources.set(owner, sources);
+	publishRuntimeLiveness(narratorId);
 	return owner;
 }
 
@@ -421,3 +438,7 @@ adoptLegacyMap("narrafork.activeNarrators", "session");
 adoptLegacyMap("narrafork:runningSubagentExecutions", "subagentExecution");
 adoptLegacyMap("narrafork.activeSubagentSettings", "subagentSettings");
 adoptLegacyMap("narrafork.narratorToolExecutionAdmissions", "toolReplayCompletion");
+
+// A newly installed occupancy store may share already-populated hot runtime records.
+// Re-seed them after legacy adoption, even when no runtime view mutation will follow.
+for (const narratorId of records.keys()) publishRuntimeLiveness(narratorId);

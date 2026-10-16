@@ -18,6 +18,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { chapterCleanup, discardIgnoredArchive } from "./chapter-cleanup";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
@@ -549,6 +550,9 @@ export const chapterService = {
 							.update(narrators)
 							.set({ chapterId: null, status: "archived", updatedAt: now })
 							.where(eq(narrators.chapterId, id));
+						backgroundOccupancyStore.refreshNarrators(
+							chapterNarrators.map((narrator) => narrator.id),
+						);
 					}
 
 					// Kill running terminals and delete records
