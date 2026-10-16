@@ -647,6 +647,7 @@ export interface NarratorWSCallbacks {
 		hasDraft: boolean;
 		text: string;
 		fileReferences?: import("@shared/file-reference").FileReference[];
+		hasComposerDocument?: boolean;
 		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
@@ -1373,6 +1374,7 @@ export function useNarratorWS(
 					case "draft_changed":
 						callbackOwner.callbacks.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
+							...(data.hasComposerDocument ? { hasComposerDocument: true } : {}),
 							text: typeof data.text === "string" ? data.text : "",
 							fileReferences: Array.isArray(data.fileReferences)
 								? (data.fileReferences as import("@shared/file-reference").FileReference[])

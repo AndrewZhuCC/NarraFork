@@ -1,0 +1,76 @@
+import type { ComposerDocument } from "@shared/composer-document";
+import { fileReferenceToken } from "./file-reference-input";
+import type { InlineComposerEditorHandle } from "./InlineComposerEditor";
+
+export function composerOptimizeTarget(editor: InlineComposerEditorHandle | null) {
+	if (!editor) return null;
+	const original = editor.getDocument();
+	const signature = JSON.stringify(original);
+	const selection = editor.getSelection();
+	if (selection.type === "node") return null;
+	const selected = selection.empty === false || selection.start !== selection.end;
+	const fragments: { p: number; n: number; text: string; from: number; to: number }[] = [];
+	let offset = 0;
+	for (const [p, paragraph] of original.paragraphs.entries()) {
+		if (p) offset++;
+		for (const [n, node] of paragraph.children.entries()) {
+			if (node.type === "text") {
+				const from = selected ? Math.max(0, selection.start - offset) : 0;
+				const to = selected ? Math.min(node.text.length, selection.end - offset) : node.text.length;
+				if (to > from && node.text.slice(from, to).trim())
+					fragments.push({ p, n, text: node.text.slice(from, to), from, to });
+				offset += node.text.length;
+			} else if (node.type === "break") offset++;
+			else if (node.type === "fileReference") offset += fileReferenceToken(node.reference).length;
+		}
+	}
+	if (!fragments.length) return null;
+	const plain = fragments.length === 1;
+	const token = globalThis.crypto?.randomUUID?.() ?? String(Date.now());
+	const marker = (index: number, end = false) => `<<<NF_${token}_${index}${end ? "_END" : ""}>>>`;
+	const text = plain
+		? fragments[0].text
+		: `Optimize each text segment below separately. Preserve every marker exactly, in order, with no introduction or conclusion. Do not merge segments.\n${fragments.map((fragment, i) => `${marker(i)}\n${fragment.text}\n${marker(i, true)}`).join("\n")}`;
+	return {
+		text,
+		apply(result: string) {
+			if (JSON.stringify(editor.getDocument()) !== signature) return false;
+			const replacements: string[] = [];
+			if (plain) replacements.push(result);
+			else {
+				let remainder = result.trim();
+				for (let i = 0; i < fragments.length; i++) {
+					const start = marker(i);
+					const end = marker(i, true);
+					if (!remainder.startsWith(start)) return false;
+					const endIndex = remainder.indexOf(end, start.length);
+					if (endIndex < 0) return false;
+					replacements.push(remainder.slice(start.length, endIndex).replace(/^\n|\n$/g, ""));
+					remainder = remainder.slice(endIndex + end.length).trim();
+				}
+				if (remainder) return false;
+			}
+			const next: ComposerDocument = {
+				...original,
+				paragraphs: original.paragraphs.map((paragraph) => ({
+					children: paragraph.children.map((node) => ({ ...node })),
+				})),
+			};
+			for (const [index, fragment] of fragments.entries()) {
+				const node = next.paragraphs[fragment.p].children[fragment.n];
+				if (node.type !== "text") return false;
+				next.paragraphs[fragment.p].children[fragment.n] = {
+					type: "text",
+					text:
+						node.text.slice(0, fragment.from) + replacements[index] + node.text.slice(fragment.to),
+				};
+			}
+			try {
+				editor.setDocument(next, true);
+			} catch {
+				return false;
+			}
+			return true;
+		},
+	};
+}

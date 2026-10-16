@@ -2323,6 +2323,7 @@ export interface ContinueSubagentInput {
 	resumeLogicalRunId?: string;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	fileReferences?: FileReferenceSnapshot[];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	subagentId: string;
 	parentNarratorId: string;
 	/** Stable tool call that originally created this subagent. */
@@ -2609,6 +2610,7 @@ async function startContinuedSubagentUnlocked(
 					images: input.images,
 					textFiles: savedTextFiles,
 					fileReferences: acceptedReferences,
+					composerDocument: input.composerDocument,
 					delivery: input.delivery,
 					commandText: input.commandText,
 					createdBy: input.createdBy,

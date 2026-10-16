@@ -322,6 +322,8 @@ export interface BufferCreator {
 
 /** Shape stored in DB for text files that were saved to a temp directory. */
 export interface SavedBufferedFile {
+	originalName?: string;
+	sourceMimeType?: string;
 	filename: string;
 	path: string;
 	size: number;
@@ -336,6 +338,8 @@ export interface BufferedExecutionIntent {
 }
 
 export interface BufferedMessage {
+	hasComposerDocument?: boolean;
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	executionIntent?: BufferedExecutionIntent;
 	id: string;

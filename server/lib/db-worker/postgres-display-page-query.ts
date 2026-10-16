@@ -25,12 +25,18 @@ const CREATOR_COLUMNS = ["id", "username", "avatar_color", "avatar_image_id"];
 function selection(alias: string, descriptors: readonly DisplayColumn[]): string {
 	// Explicit ::text defeats driver auto-JSON decoding BEFORE our admission preflight.
 	return descriptors
-		.map(({ column, field, json }) => `${alias}."${column}"${json ? "::text" : ""} AS "${field}"`)
+		.map(({ column, field, json }) =>
+			field === "hasComposerDocument"
+				? `(${alias}."${column}" IS NOT NULL) AS "${field}"`
+				: `${alias}."${column}"${json ? "::text" : ""} AS "${field}"`,
+		)
 		.join(", ");
 }
 function storedBytes(alias: string, columns: readonly string[]): string {
 	return columns
-		.map((column) => `coalesce(octet_length(${alias}."${column}"::text),0)`)
+		.map((column) =>
+			column === "composer_document" ? "1" : `coalesce(octet_length(${alias}."${column}"::text),0)`,
+		)
 		.join(" + ");
 }
 function budgetError(reason: string): never {

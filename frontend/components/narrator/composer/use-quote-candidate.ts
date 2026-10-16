@@ -25,23 +25,47 @@ let shortcutOwner = 0;
 
 function isQuoteShortcut(event: KeyboardEvent): boolean {
 	return (
-		event.code === "KeyQ" &&
-		event.altKey &&
+		event.key === "Tab" &&
+		!event.altKey &&
 		!event.ctrlKey &&
 		!event.metaKey &&
 		!event.shiftKey &&
 		!event.repeat &&
+		event.keyCode !== 229 &&
 		!event.isComposing
 	);
 }
 
+function targetElement(target: EventTarget | null): Element | null {
+	return target && typeof (target as Element).closest === "function" ? (target as Element) : null;
+}
 function isEditableTarget(target: EventTarget | null): boolean {
-	return (
-		target instanceof Element &&
-		!!target.closest(
-			'input, textarea, select, [contenteditable]:not([contenteditable="false"]), .monaco-editor, [role="dialog"], [role="menu"], [role="listbox"]',
-		)
+	return !!targetElement(target)?.closest(
+		'input, textarea, select, [contenteditable]:not([contenteditable="false"]), .monaco-editor, [role="dialog"], [role="menu"], [role="listbox"]',
 	);
+}
+function textQuoteKey(quote: ComposerQuote): string {
+	return JSON.stringify([quote.label, quote.text, quote.anchor ?? null]);
+}
+
+/** Tab is a selection action, not a global replacement for ordinary focus/indent keys. */
+function canQuoteWithTab(
+	candidate: QuoteCandidate,
+	textarea: HTMLElement,
+	event: KeyboardEvent,
+): boolean {
+	if (event.defaultPrevented) return false;
+	const target = targetElement(event.target);
+	// File editors expose their own source-bound gutter action. Tab always belongs to Monaco.
+	if (candidate.kind === "file") return false;
+	if (target?.closest('button, a[href], select, [role="button"], [role="menu"], [role="listbox"]'))
+		return false;
+	if (isEditableTarget(target) && (!target || !textarea.contains(target))) return false;
+	const panel = textarea.closest(NARRATOR_PANEL_SELECTOR);
+	const quote = panel
+		? readPanelQuoteSelection(panel, textarea.ownerDocument.getSelection())
+		: null;
+	return !!quote && textQuoteKey(quote) === candidate.key;
 }
 
 function editorSelectionLabel(selection: FileReferenceEditorSelection): string {
@@ -69,20 +93,22 @@ export function editorSelectionCandidate(
 }
 
 /**
- * The "temporary chip": the latest quotable selection in this composer's own
- * message list or in a file panel publishing to this narrator. Consuming or
- * dismissing a candidate hides it until that source's selection changes.
+ * The temporary message/tool quote in this composer's own list. File selections
+ * use source-bound Monaco gutter buttons, never this popup or the global Tab.
+ * Consuming/dismissing hides a candidate until its source selection changes.
  */
 export function useQuoteCandidate({
 	textareaRef,
-	editorSelection,
+	element,
 	onShortcut,
 }: {
-	textareaRef: RefObject<HTMLTextAreaElement | null>;
-	editorSelection: FileReferenceEditorSelection | null | undefined;
+	textareaRef: RefObject<HTMLElement | null>;
+	element?: HTMLElement | null;
 	onShortcut: (candidate: QuoteCandidate) => void;
 }) {
 	const [candidate, setCandidate] = useState<QuoteCandidate | null>(null);
+	const [showShortcut, setShowShortcut] = useState(true);
+	const touchInputRef = useRef(false);
 	const candidateRef = useRef(candidate);
 	candidateRef.current = candidate;
 	const onShortcutRef = useRef(onShortcut);
@@ -100,7 +126,42 @@ export function useQuoteCandidate({
 	}, []);
 
 	useEffect(() => {
-		const textarea = textareaRef.current;
+		const doc = (element ?? textareaRef.current)?.ownerDocument;
+		if (!doc) return;
+		const record = (touch: boolean, updateHint = true) => {
+			touchInputRef.current = touch;
+			if (updateHint && candidateRef.current) setShowShortcut(!touch);
+		};
+		const onQuoteControl = (event: Event) =>
+			!!targetElement(event.target)?.closest(
+				"[data-inline-quote-candidate], [data-composer-quote-candidate]",
+			);
+		const pointer = (event: PointerEvent) =>
+			record(event.pointerType === "touch" || event.pointerType === "pen", !onQuoteControl(event));
+		const touch = (event: TouchEvent) => record(true, !onQuoteControl(event));
+		const keyboard = (event: KeyboardEvent) => {
+			// Virtual-keyboard/IME composition does not imply a physical keyboard was used.
+			if (
+				event.isComposing ||
+				event.keyCode === 229 ||
+				event.key === "Process" ||
+				event.key === "Unidentified"
+			)
+				return;
+			record(false);
+		};
+		doc.addEventListener("pointerdown", pointer, { capture: true, passive: true });
+		doc.addEventListener("touchstart", touch, { capture: true, passive: true });
+		doc.addEventListener("keydown", keyboard, true);
+		return () => {
+			doc.removeEventListener("pointerdown", pointer, true);
+			doc.removeEventListener("touchstart", touch, true);
+			doc.removeEventListener("keydown", keyboard, true);
+		};
+	}, [textareaRef, element]);
+
+	useEffect(() => {
+		const textarea = element ?? textareaRef.current;
 		if (!textarea) return;
 		const doc = textarea.ownerDocument;
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -112,8 +173,9 @@ export function useQuoteCandidate({
 				setCandidate((current) => (current?.kind === "text" ? null : current));
 				return;
 			}
-			const key = JSON.stringify([quote.label, quote.text]);
+			const key = textQuoteKey(quote);
 			if (key === hiddenKeysRef.current.text) return;
+			setShowShortcut(!touchInputRef.current);
 			setCandidate((current) => (current?.key === key ? current : { kind: "text", key, quote }));
 		};
 		const schedule = () => {
@@ -125,22 +187,7 @@ export function useQuoteCandidate({
 			clearTimeout(timer);
 			doc.removeEventListener("selectionchange", schedule);
 		};
-	}, [textareaRef]);
-
-	useEffect(() => {
-		const next = editorSelectionCandidate(editorSelection);
-		if (!next) {
-			hiddenKeysRef.current.file = null;
-			setCandidate((current) => (current?.kind === "file" ? null : current));
-			return;
-		}
-		if (next.key === hiddenKeysRef.current.file) return;
-		setCandidate((current) =>
-			current?.kind === "file" && current.key === next.key && !current.reference === !next.reference
-				? current
-				: next,
-		);
-	}, [editorSelection]);
+	}, [textareaRef, element]);
 
 	useEffect(() => {
 		const owner = ownerRef.current;
@@ -155,14 +202,14 @@ export function useQuoteCandidate({
 	);
 
 	useEffect(() => {
-		const view = textareaRef.current?.ownerDocument.defaultView;
+		const view = (element ?? textareaRef.current)?.ownerDocument.defaultView;
 		if (!view) return;
 		const handler = (event: KeyboardEvent) => {
 			const current = candidateRef.current;
-			const textarea = textareaRef.current;
+			const textarea = element ?? textareaRef.current;
 			if (!current || !textarea || shortcutOwner !== ownerRef.current) return;
 			if (textarea.getClientRects().length === 0) return;
-			if (isQuoteShortcut(event)) {
+			if (isQuoteShortcut(event) && canQuoteWithTab(current, textarea, event)) {
 				event.preventDefault();
 				event.stopPropagation();
 				onShortcutRef.current(current);
@@ -174,10 +221,10 @@ export function useQuoteCandidate({
 				hide(current);
 			}
 		};
-		// Capture phase: Monaco and other editors must not see the shortcut first.
+		// Capture only a live source selection; normal editor Tab and focus navigation remain native.
 		view.addEventListener("keydown", handler, true);
 		return () => view.removeEventListener("keydown", handler, true);
-	}, [textareaRef, hide]);
+	}, [textareaRef, element, hide]);
 
-	return { candidate, hide };
+	return { candidate, hide, showShortcut };
 }

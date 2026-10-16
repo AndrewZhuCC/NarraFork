@@ -1436,6 +1436,13 @@
       "when": 1792089886575,
       "tag": "0204_productive_bill_hollister",
       "breakpoints": true
+    },
+    {
+      "idx": 205,
+      "version": "6",
+      "when": 1792144293651,
+      "tag": "0205_rich_composer_document",
+      "breakpoints": true
     }
   ]
 }

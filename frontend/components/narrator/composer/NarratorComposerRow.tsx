@@ -32,6 +32,10 @@ export interface NarratorComposerRowProps {
 	// File handling
 	onFileInputChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
 	onComposerPasteImages: (files: File[]) => void;
+	attachedImages?: File[];
+	attachedTextFiles?: File[];
+	onAttachmentsChange?: (images: File[], textFiles: File[]) => void;
+	onDocumentAssetsChange?: (ids: readonly string[]) => void;
 
 	// Actions
 	onSendWithMode: (mode: QueueMode) => void | Promise<void>;
@@ -298,75 +302,82 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		editing: !!props.editingMessageState,
 	});
 
+	const actions =
+		actionSlot === "taken-over" ? (
+			<Group gap="xs" align="end" wrap="nowrap">
+				{renderPrimaryActionButton()}
+				<Tooltip label={t("stopTakeoverHint")} position="top">
+					<Button
+						key="stop-takeover"
+						color="grape"
+						variant="outline"
+						onClick={props.onStopTakeover}
+						loading={props.stopTakeoverMutationPending}
+					>
+						{t("stopTakeover")}
+					</Button>
+				</Tooltip>
+			</Group>
+		) : actionSlot === "takeover" ? (
+			<Button
+				key="takeover"
+				color="grape"
+				variant="light"
+				onClick={props.onTakeover}
+				loading={props.takeoverMutationPending}
+			>
+				{t("takeover")}
+			</Button>
+		) : (
+			renderPrimaryActionButton()
+		);
+
 	return (
-		<Box
-			px="md"
-			style={{
-				paddingBottom: "var(--mantine-spacing-xs)",
-				flexShrink: 0,
-			}}
-		>
+		<Box px="md" style={{ paddingBottom: "var(--mantine-spacing-xs)", flexShrink: 0 }}>
 			<input
 				ref={props.fileInputRef}
 				type="file"
 				multiple
 				style={{ display: "none" }}
 				onChange={props.onFileInputChange}
+				disabled={props.isSending}
 			/>
-			<Group gap="xs" align="end" wrap="nowrap">
-				<Tooltip label={t("attachFile")}>
-					<ActionIcon
-						variant="subtle"
-						color="gray"
-						onClick={() => props.fileInputRef.current?.click()}
-						mb={4}
-					>
-						<IconPaperclip size={18} />
-					</ActionIcon>
-				</Tooltip>
-				{/* Always mounted, including canTakeover — see actionSlot comment. */}
-				<NarratorComposer
-					ref={props.composerRef}
-					narratorId={props.narratorId}
-					sendingRef={props.sendingRef}
-					appendInputRef={props.appendInputRef}
-					permEnterActive={props.effectiveFocusIndex != null}
-					hasAttachments={props.composerHasAttachments}
-					enterMode={props.enterQueueMode}
-					ctrlEnterMode={props.ctrlEnterQueueMode}
-					onSendWithMode={props.onSendWithMode}
-					onTextFlagsChange={props.setComposerHasText}
-					onPasteImages={props.onComposerPasteImages}
-				/>
-				{actionSlot === "taken-over" ? (
-					<Group gap="xs" align="end" wrap="nowrap">
-						{renderPrimaryActionButton()}
-						<Tooltip label={t("stopTakeoverHint")} position="top">
-							<Button
-								key="stop-takeover"
-								color="grape"
-								variant="outline"
-								onClick={props.onStopTakeover}
-								loading={props.stopTakeoverMutationPending}
-							>
-								{t("stopTakeover")}
-							</Button>
-						</Tooltip>
-					</Group>
-				) : actionSlot === "takeover" ? (
-					<Button
-						key="takeover"
-						color="grape"
-						variant="light"
-						onClick={props.onTakeover}
-						loading={props.takeoverMutationPending}
-					>
-						{t("takeover")}
-					</Button>
-				) : (
-					renderPrimaryActionButton()
-				)}
-			</Group>
+			<NarratorComposer
+				ref={props.composerRef}
+				narratorId={props.narratorId}
+				sendingRef={props.sendingRef}
+				sending={props.isSending}
+				appendInputRef={props.appendInputRef}
+				permEnterActive={props.effectiveFocusIndex != null}
+				hasAttachments={props.composerHasAttachments}
+				enterMode={props.enterQueueMode}
+				ctrlEnterMode={props.ctrlEnterQueueMode}
+				onSendWithMode={props.onSendWithMode}
+				onTextFlagsChange={props.setComposerHasText}
+				onPasteImages={props.onComposerPasteImages}
+				attachedImages={props.attachedImages}
+				attachedTextFiles={props.attachedTextFiles}
+				onAttachmentsChange={props.onAttachmentsChange}
+				onDocumentAssetsChange={props.onDocumentAssetsChange}
+				controls={
+					<Tooltip label={t("attachFile")}>
+						<ActionIcon
+							aria-label={t("attachFile")}
+							variant="subtle"
+							color="gray"
+							disabled={props.isSending}
+							onMouseDown={(event) => event.preventDefault()}
+							onClick={() => {
+								props.composerRef.current?.captureAttachmentSelection();
+								props.fileInputRef.current?.click();
+							}}
+						>
+							<IconPaperclip size={18} />
+						</ActionIcon>
+					</Tooltip>
+				}
+				actions={actions}
+			/>
 		</Box>
 	);
 }
