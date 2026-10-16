@@ -36,7 +36,7 @@ import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
-import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
+import { canonicalOptionalToolName, OPTIONAL_TOOLS } from "../lib/agent/tools/index";
 import type { AgentInputPart } from "../lib/agent/types";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
@@ -1380,7 +1380,8 @@ async function createNarrator(
 		}
 		// Merge tools explicitly enabled on this narrator (via /load).
 		if (Array.isArray(narrator.enabledTools)) {
-			for (const toolName of narrator.enabledTools) {
+			for (const persisted of narrator.enabledTools) {
+				const toolName = canonicalOptionalToolName(persisted);
 				if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
 			}
 		}
@@ -8586,6 +8587,7 @@ export async function resolveOptionalToolState(
 	/** The effective routine mode, when the tool belongs to a tool routine. */
 	mode?: ToolRoutineMode;
 }> {
+	toolName = canonicalOptionalToolName(toolName);
 	if (!OPTIONAL_TOOLS.has(toolName)) {
 		return { state: "unknown_tool", globallyEnabled: false };
 	}
@@ -8647,7 +8649,9 @@ export async function resolveOptionalToolState(
 	}
 
 	const persisted = Array.isArray(narrator.enabledTools) ? narrator.enabledTools : [];
-	const loaded = globallyEnabled || persisted.includes(toolName);
+	const loaded =
+		globallyEnabled ||
+		persisted.some((name: string) => canonicalOptionalToolName(name) === toolName);
 	return { state: loaded ? "loaded" : "not_loaded", globallyEnabled, ...(mode ? { mode } : {}) };
 }
 
@@ -8659,6 +8663,7 @@ export async function loadOptionalTool(
 	narratorId: string,
 	toolName: string,
 ): Promise<"loaded" | "already_loaded" | "unknown_tool"> {
+	toolName = canonicalOptionalToolName(toolName);
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
 
 	// Read current enabled tools from DB
@@ -8667,7 +8672,7 @@ export async function loadOptionalTool(
 		columns: { enabledTools: true },
 	});
 	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
-	if (current.includes(toolName)) return "already_loaded";
+	if (current.some((name) => canonicalOptionalToolName(name) === toolName)) return "already_loaded";
 
 	// Persist
 	await db
@@ -8693,6 +8698,7 @@ export async function unloadOptionalTool(
 	narratorId: string,
 	toolName: string,
 ): Promise<"unloaded" | "not_loaded" | "unknown_tool"> {
+	toolName = canonicalOptionalToolName(toolName);
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
 
 	const narrator = await db.query.narrators.findFirst({
@@ -8700,7 +8706,7 @@ export async function unloadOptionalTool(
 		columns: { enabledTools: true },
 	});
 	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
-	const next = current.filter((name) => name !== toolName);
+	const next = current.filter((name) => canonicalOptionalToolName(name) !== toolName);
 	const wasPersisted = next.length !== current.length;
 
 	const active = activeNarrators.get(narratorId);

@@ -85,7 +85,7 @@ import {
 	isPublicToolSourceAllowed,
 	projectPublicNarratorEvent,
 	rememberPublicToolIdentity,
-} from "../services/public-narrator-share-intelligent-ui";
+} from "../services/public-narrator-share-gen-ui";
 import {
 	onPublicShareRevoked,
 	revalidatePublicShare,

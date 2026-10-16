@@ -30,7 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { IntelligentUICard } from "@frontend/components/intelligent-ui/IntelligentUICard";
+import { GenUICard } from "@frontend/components/gen-ui/GenUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
@@ -2033,9 +2033,9 @@ export function RenderToolBody({
 		}),
 		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
 	);
-	if (model.kind === "intelligent-ui")
+	if (model.kind === "gen-ui")
 		return (
-			<IntelligentUICard
+			<GenUICard
 				narratorId={narratorId}
 				file={model.file}
 				publicSummary={model.publicSummary}

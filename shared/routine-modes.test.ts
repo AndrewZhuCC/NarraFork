@@ -200,3 +200,37 @@ describe("clearToolRoutineMode", () => {
 		expect(resolveProjectToolRoutineModeOverride(optIn, next)).toBe("global");
 	});
 });
+
+describe("a renamed routine", () => {
+	const genUi = { id: "gen_ui" };
+	test("settings stored under the former id still apply", () => {
+		expect(resolveToolRoutineMode(genUi, { toolModes: { intelligent_ui: "resident" } })).toBe(
+			"resident",
+		);
+		expect(resolveToolRoutineMode(genUi, { enabledRoutines: ["intelligent_ui"] })).toBe("resident");
+		expect(
+			resolveProjectToolRoutineModeOverride(genUi, { disabledRoutines: ["intelligent_ui"] }),
+		).toBe("manual");
+	});
+	test("the current id wins over the former one", () => {
+		expect(
+			resolveToolRoutineMode(genUi, {
+				toolModes: { intelligent_ui: "resident", gen_ui: "manual" },
+			}),
+		).toBe("manual");
+	});
+	test("writing or clearing the mode retires the former id", () => {
+		const legacy = {
+			toolModes: { intelligent_ui: "resident" },
+			enabledRoutines: ["intelligent_ui", "recall"],
+			disabledRoutines: [],
+		};
+		const next = applyToolRoutineMode(legacy, "gen_ui", "manual");
+		expect(next.toolModes).toEqual({ gen_ui: "manual" });
+		expect(next.enabledRoutines).toEqual(["recall"]);
+		expect(next.disabledRoutines).toEqual(["gen_ui"]);
+		const cleared = clearToolRoutineMode(legacy, "gen_ui");
+		expect(cleared.toolModes).toEqual({});
+		expect(cleared.enabledRoutines).toEqual(["recall"]);
+	});
+});

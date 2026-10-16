@@ -63,6 +63,33 @@ export interface ToolRoutineModeSubject {
 	defaultEnabled?: boolean;
 }
 
+/**
+ * Built-in routines that were renamed, with the ids a config layer may still store for
+ * them. The current id always wins; a former id only speaks when the current one is silent.
+ */
+const LEGACY_ROUTINE_IDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+	gen_ui: ["intelligent_ui"],
+});
+
+/** A routine's current id followed by any id it was stored under before a rename. */
+export function routineIdsFor(routineId: string): readonly string[] {
+	return [routineId, ...(LEGACY_ROUTINE_IDS[routineId] ?? [])];
+}
+
+/** What one layer says about a routine through its explicit or legacy fields, if anything. */
+function storedToolRoutineMode(
+	routineId: string,
+	config: RoutineModeConfig,
+): ToolRoutineMode | null {
+	for (const id of routineIdsFor(routineId)) {
+		const explicit = normalizeToolRoutineMode(config.toolModes?.[id]);
+		if (explicit) return explicit;
+		if (config.enabledRoutines?.includes(id)) return "resident";
+		if (config.disabledRoutines?.includes(id)) return "manual";
+	}
+	return null;
+}
+
 /** Parse an untrusted value into a mode, or null when it is not one. */
 export function normalizeToolRoutineMode(raw: unknown): ToolRoutineMode | null {
 	if (typeof raw !== "string") return null;
@@ -92,10 +119,8 @@ export function resolveToolRoutineModeInLayer(
 	config: RoutineModeConfig | undefined,
 ): ToolRoutineMode | null {
 	if (!config) return null;
-	const explicit = normalizeToolRoutineMode(config.toolModes?.[routine.id]);
-	if (explicit) return explicit;
-	if (config.enabledRoutines?.includes(routine.id)) return "resident";
-	if (config.disabledRoutines?.includes(routine.id)) return "manual";
+	const stored = storedToolRoutineMode(routine.id, config);
+	if (stored) return stored;
 	if (routine.defaultEnabled) return "resident";
 	return null;
 }
@@ -124,11 +149,7 @@ export function resolveProjectToolRoutineModeOverride(
 	// not be read as a project opinion — otherwise every default-on routine would
 	// look permanently pinned at the project level and "follow global" would be
 	// unreachable in the UI.
-	const explicit = normalizeToolRoutineMode(projectConfig.toolModes?.[routine.id]);
-	if (explicit) return explicit;
-	if (projectConfig.enabledRoutines?.includes(routine.id)) return "resident";
-	if (projectConfig.disabledRoutines?.includes(routine.id)) return "manual";
-	return "global";
+	return storedToolRoutineMode(routine.id, projectConfig) ?? "global";
 }
 
 /** The mode that actually applies, and which layer decided it. */
@@ -168,11 +189,14 @@ export function applyToolRoutineMode<T extends RoutineModeConfig>(
 	routineId: string,
 	mode: ToolRoutineMode,
 ): ResolvedRoutineModeConfig<T> {
+	// Writing under the current id retires any former one, so the two cannot disagree.
+	const ids = routineIdsFor(routineId);
 	const toolModes = { ...(config.toolModes ?? {}) };
+	for (const id of ids) delete toolModes[id];
 	toolModes[routineId] = mode;
 
-	const enabled = (config.enabledRoutines ?? []).filter((id) => id !== routineId);
-	const disabled = (config.disabledRoutines ?? []).filter((id) => id !== routineId);
+	const enabled = (config.enabledRoutines ?? []).filter((id) => !ids.includes(id));
+	const disabled = (config.disabledRoutines ?? []).filter((id) => !ids.includes(id));
 	if (mode === "resident") {
 		enabled.push(routineId);
 	} else if (mode === "manual") {
@@ -195,12 +219,13 @@ export function clearToolRoutineMode<T extends RoutineModeConfig>(
 	config: T,
 	routineId: string,
 ): ResolvedRoutineModeConfig<T> {
+	const ids = routineIdsFor(routineId);
 	const toolModes = { ...(config.toolModes ?? {}) };
-	delete toolModes[routineId];
+	for (const id of ids) delete toolModes[id];
 	return {
 		...config,
 		toolModes,
-		enabledRoutines: (config.enabledRoutines ?? []).filter((id) => id !== routineId),
-		disabledRoutines: (config.disabledRoutines ?? []).filter((id) => id !== routineId),
+		enabledRoutines: (config.enabledRoutines ?? []).filter((id) => !ids.includes(id)),
+		disabledRoutines: (config.disabledRoutines ?? []).filter((id) => !ids.includes(id)),
 	};
 }

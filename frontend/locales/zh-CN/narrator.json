@@ -12,8 +12,8 @@
 	"tokendanceBalanceDetails": "累计充值 ¥{{credits}}\n已消耗 ¥{{used}}\n剩余 ¥{{balance}}",
 	"tokendanceBalanceStale": "余额可能已过期，请刷新",
 	"tokendanceAdminRechargeRequired": "余额不足，请联系管理员充值",
-	"intelligentUi": {
-		"title": "智能 UI",
+	"genUi": {
+		"title": "GenUI",
 		"staticPreview": "共享记录不提供交互式预览。",
 		"unavailable": "旧版 UI 引用不可用，请重新展示当前文件以预览。",
 		"currentFiles": "当前文件 · 非历史快照",

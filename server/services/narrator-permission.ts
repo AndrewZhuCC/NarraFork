@@ -3,7 +3,7 @@ import { realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { isParentSelector } from "@shared/communication-tool";
-import { isIntelligentUiReadAction } from "@shared/intelligent-ui-tool-policy";
+import { isGenUiReadAction } from "@shared/gen-ui-tool-policy";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -232,7 +232,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "AttachWorktree":
 			return typeof input.destinationPath === "string" ? [input.destinationPath] : [];
 		case "ShareFile":
-		case "IntelligentUI":
+		case "GenUI":
 			return typeof input.path === "string" ? [input.path] : [];
 		case "Glob":
 		case "Grep":
@@ -971,11 +971,11 @@ export function resolvePermissionDecision(
 	// Showing existing files is read-only; an allowlist must never let create
 	// write files from a read-only/review/planning session.
 	if (
-		toolName === "IntelligentUI" &&
-		!isIntelligentUiReadAction(input.action) &&
+		toolName === "GenUI" &&
+		!isGenUiReadAction(input.action) &&
 		(effectiveMode === "readOnly" || planMode || reviewReadOnlyBash)
 	) {
-		if (meta) meta.blacklistReason = "IntelligentUI mutations require an implementation session.";
+		if (meta) meta.blacklistReason = "GenUI mutations require an implementation session.";
 		return "deny";
 	}
 
@@ -1260,7 +1260,7 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Glob",
 	"Grep",
 	"StructView",
-	"IntelligentUI",
+	"GenUI",
 ];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
@@ -1301,7 +1301,7 @@ const READ_ONLY_TOOLS = [
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
 	if (toolName === "Notification") return input.action === "list_channels";
-	if (toolName === "IntelligentUI") return isIntelligentUiReadAction(input.action);
+	if (toolName === "GenUI") return isGenUiReadAction(input.action);
 	if (toolName === "Worktree") return input.action === "list";
 	return toolName === "StructSed" && input.dry_run !== false;
 }

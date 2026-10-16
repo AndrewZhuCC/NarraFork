@@ -13,19 +13,15 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
+import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
+import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
+import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import {
-	type IntelligentUiFileReference,
-	readIntelligentUiFileReference,
-} from "../intelligent-ui-files";
-import { type IntelligentUiKitNotice, readIntelligentUiKitNotice } from "../intelligent-ui-kit";
-import {
-	INTELLIGENT_UI_PUBLIC_SUMMARY,
-	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
-} from "../intelligent-ui-public";
-import {
-	INTELLIGENT_UI_INLINE_HEIGHTS,
-	readIntelligentUiInlineSize,
-} from "../intelligent-ui-tool-policy";
+	GEN_UI_INLINE_HEIGHTS,
+	isGenUiToolName,
+	readGenUiInlineSize,
+	readGenUiMetadata,
+} from "../gen-ui-tool-policy";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -504,9 +500,9 @@ export type ToolSectionLabel =
 	| "plan"
 	| "error";
 
-export interface ToolIntelligentUiDetail {
-	kind: "intelligent-ui";
-	file: IntelligentUiFileReference | null;
+export interface ToolGenUiDetail {
+	kind: "gen-ui";
+	file: GenUiFileReference | null;
 	publicSummary?: boolean;
 	historyUnavailable?: boolean;
 	/**
@@ -519,7 +515,7 @@ export interface ToolIntelligentUiDetail {
 	/** Reserved body height: a pure function of the declared size, never a measurement. */
 	contentPx?: number;
 	title?: string;
-	kit?: IntelligentUiKitNotice;
+	kit?: GenUiKitNotice;
 	/**
 	 * The runtime the finished call was validated against. Old UI keeps rendering with it
 	 * after the workspace later gains (or loses) a project kit; absent while streaming.
@@ -537,7 +533,7 @@ export type ToolSectionBody =
 	| ToolSpecTasksDetail
 	| ToolMetaRowsDetail
 	| ToolAskDetail
-	| ToolIntelligentUiDetail;
+	| ToolGenUiDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -893,30 +889,28 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			? toolInputFieldView(input.inputJson)
 			: input.inputJson;
 	const output = toolOutputValue(input.outputJson, metadata);
+	const isGenUi = isGenUiToolName(toolName);
 	if (
-		toolName === "IntelligentUI" &&
-		(input.publicSummary === INTELLIGENT_UI_PUBLIC_SUMMARY_CODE ||
-			output === INTELLIGENT_UI_PUBLIC_SUMMARY ||
-			asObject(output)?.text === INTELLIGENT_UI_PUBLIC_SUMMARY)
+		isGenUi &&
+		(input.publicSummary === GEN_UI_PUBLIC_SUMMARY_CODE ||
+			output === GEN_UI_PUBLIC_SUMMARY ||
+			asObject(output)?.text === GEN_UI_PUBLIC_SUMMARY)
 	) {
-		return single("intelligent-ui", {
-			kind: "intelligent-ui",
+		return single("gen-ui", {
+			kind: "gen-ui",
 			file: null,
 			publicSummary: true,
 		});
 	}
 	// Only host-owned metadata is a file reference; never promote tool input or output text.
-	const uiRef = toolName === "IntelligentUI" ? metadata?.intelligentUi : null;
-	const uiFile = readIntelligentUiFileReference(uiRef);
-	const uiKit =
-		toolName === "IntelligentUI"
-			? (readIntelligentUiKitNotice(metadata?.intelligentUiKit) ?? undefined)
-			: undefined;
-	const uiDrawnWith = asObject(metadata?.intelligentUiInline)?.kit;
+	const uiRef = isGenUi ? readGenUiMetadata(metadata, "genUi") : null;
+	const uiFile = readGenUiFileReference(uiRef);
+	const uiKit = isGenUi
+		? (readGenUiKitNotice(readGenUiMetadata(metadata, "genUiKit")) ?? undefined)
+		: undefined;
+	const uiDrawnWith = asObject(readGenUiMetadata(metadata, "genUiInline"))?.kit;
 	const uiRuntime: "builtin" | "project" | undefined =
-		toolName === "IntelligentUI" && (uiDrawnWith === "builtin" || uiDrawnWith === "project")
-			? uiDrawnWith
-			: undefined;
+		isGenUi && (uiDrawnWith === "builtin" || uiDrawnWith === "project") ? uiDrawnWith : undefined;
 	const uiKitFields = {
 		...(uiKit ? { kit: uiKit } : {}),
 		...(uiRuntime ? { runtime: uiRuntime } : {}),
@@ -926,7 +920,7 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				}
 			: {}),
 	};
-	const uiInput = toolName === "IntelligentUI" ? asObject(fields) : undefined;
+	const uiInput = isGenUi ? asObject(fields) : undefined;
 	// A call that failed, was refused or was stopped drew nothing the reader should take
 	// for an answer: its status and error text are the body instead.
 	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
@@ -936,11 +930,11 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		typeof uiInput?.source === "string" &&
 		(uiInput.action === undefined || uiInput.action === "render") &&
 		!uiUnusable
-			? single("intelligent-ui", {
-					kind: "intelligent-ui",
+			? single("gen-ui", {
+					kind: "gen-ui",
 					file: null,
 					text: uiInput.source,
-					contentPx: INTELLIGENT_UI_INLINE_HEIGHTS[readIntelligentUiInlineSize(uiInput.size)],
+					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiInput.size)],
 					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
 					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
 					...uiKitFields,
@@ -949,8 +943,8 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 	const uiDetail: ToolDetailData | null = uiInline
 		? uiInline
 		: uiRef
-			? single("intelligent-ui", {
-					kind: "intelligent-ui",
+			? single("gen-ui", {
+					kind: "gen-ui",
 					// Select the visible copy, not an origin PK retained in immutable tool output.
 					// The server checks both visibility and the copy's trusted provenance column.
 					file: uiFile && input.toolCallId ? { ...uiFile, toolCallId: input.toolCallId } : uiFile,
@@ -959,10 +953,10 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				})
 			: // A kit build the user must confirm is something to act on, not text to read.
 				uiKit?.request && !uiUnusable
-				? single("intelligent-ui", { kind: "intelligent-ui", file: null, ...uiKitFields })
+				? single("gen-ui", { kind: "gen-ui", file: null, ...uiKitFields })
 				: null;
 	const base = withErrorSection(
-		toolName === "IntelligentUI"
+		isGenUi
 			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
 			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
