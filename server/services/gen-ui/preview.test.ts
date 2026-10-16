@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { LocalBackend } from "@server/lib/agent/execution/local-backend";
 import type { GenUiFileReference } from "@shared/gen-ui-files";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { buildGenUiPreview, type PreviewDependencies } from "./preview";
+import { buildGenUiPreview, type PreviewDependencies, resetPreviewCacheForTest } from "./preview";
 
 const roots: string[] = [];
 afterEach(async () => {
+	resetPreviewCacheForTest();
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 async function fixture() {
@@ -57,6 +58,33 @@ describe("current-file UI previews", () => {
 		expect(first.js).toContain("null");
 		expect(second.js).toContain("42");
 		expect(second.files).toEqual(["App.tsx"]);
+	});
+	test("unchanged files reuse the last build; a change or another kit compiles again", async () => {
+		const f = await fixture();
+		let runs = 0;
+		f.deps.compile = async (files) => {
+			runs++;
+			return { js: new TextDecoder().decode(files[0].bytes), css: "" };
+		};
+		await buildGenUiPreview("n", "actor", f.reference, signal(), f.deps);
+		const again = await buildGenUiPreview("n", "actor", f.reference, signal(), f.deps);
+		expect(runs).toBe(1);
+		expect(again.js).toContain("null");
+		await writeFile(join(f.directory, "App.tsx"), "export default ()=>7");
+		expect((await buildGenUiPreview("n", "actor", f.reference, signal(), f.deps)).js).toContain(
+			"7",
+		);
+		expect(runs).toBe(2);
+		f.deps.kit = async () => ({ hash: "kit-1", components: [] });
+		await buildGenUiPreview("n", "actor", f.reference, signal(), f.deps);
+		expect(runs).toBe(3);
+		// A cached build is still only released to a reader allowed to read the files.
+		f.deps.authorize = async () => {
+			throw new Error("Read denied");
+		};
+		await expect(buildGenUiPreview("n", "actor", f.reference, signal(), f.deps)).rejects.toThrow(
+			"Read denied",
+		);
 	});
 	test("authorizes every dependency before it reaches the compiler", async () => {
 		const f = await fixture();

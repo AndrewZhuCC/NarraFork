@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { answerGenUiForm, loadUiRuntime, type UiRuntime } from "./kit-client";
 import { createPreviewShell, readPreviewTheme } from "./preview-shell";
+import { readUiState, subscribeUiState, writeUiState } from "./shared-state";
 
 function httpUrl(value: string): string | null {
 	try {
@@ -45,6 +46,7 @@ export function InlineRender({
 	title,
 	runtime: recorded,
 	formToolUseId,
+	stateKey,
 }: {
 	narratorId: string;
 	source: string;
@@ -56,6 +58,8 @@ export function InlineRender({
 	runtime?: "builtin" | "project";
 	/** A `wait: true` call is holding open for this UI: submit() answers it. */
 	formToolUseId?: string;
+	/** Identifies the card: frames with the same key share what the reader entered. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const [runtime, setRuntime] = useState<UiRuntime | null>(null);
@@ -206,7 +210,19 @@ export function InlineRender({
 		ready.current = true;
 		sendTheme();
 		post();
-	}, [post, sendTheme]);
+		const saved = stateKey ? readUiState(stateKey) : undefined;
+		if (saved)
+			frame.current?.contentWindow?.postMessage({ type: "narrafork:ui-state", values: saved }, "*");
+	}, [post, sendTheme, stateKey]);
+
+	useEffect(() => {
+		if (!stateKey) return;
+		return subscribeUiState(stateKey, (values, from) => {
+			const target = frame.current?.contentWindow;
+			if (from === target || !ready.current || !target) return;
+			target.postMessage({ type: "narrafork:ui-state", values }, "*");
+		});
+	}, [stateKey]);
 	// The document loads once. A second load means the frame went somewhere else: what is
 	// in it now is not this conversation's UI and must not stay on screen as if it were.
 	// Best-effort teardown, not a firewall: the navigation request has already been made.
@@ -232,6 +248,12 @@ export function InlineRender({
 			}
 			if (data?.type === "narrafork:preview-left") {
 				setNavigated(true);
+				return;
+			}
+			if (data?.type === "narrafork:ui-state") {
+				const values = (data as { values?: unknown }).values;
+				if (stateKey && values && typeof values === "object" && !Array.isArray(values))
+					writeUiState(stateKey, values as Record<string, unknown>, event.source);
 				return;
 			}
 			const current = runtimeNow.current;
@@ -270,7 +292,7 @@ export function InlineRender({
 			window.removeEventListener("message", onMessage);
 			unsubscribe();
 		};
-	}, [srcDoc, onReady, sendTheme, deliver]);
+	}, [srcDoc, onReady, sendTheme, deliver, stateKey]);
 
 	useEffect(() => {
 		if (!sendFailed) return;

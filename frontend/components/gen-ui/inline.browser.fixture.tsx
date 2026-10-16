@@ -75,7 +75,7 @@ function Fixture() {
 						<GenUICard
 							narratorId="n1"
 							file={null}
-							inline={{ ...inline, title: "Plans", formToolUseId: form }}
+							inline={{ ...inline, title: "Plans", formToolUseId: form, stateKey: "use-1" }}
 							kit={kit}
 							height={400}
 						/>

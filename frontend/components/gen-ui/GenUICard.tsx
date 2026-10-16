@@ -37,6 +37,8 @@ export interface GenUICardProps {
 		runtime?: "builtin" | "project";
 		/** Set while a `wait: true` call is holding open for this form. */
 		formToolUseId?: string;
+		/** The tool call: frames of this card share what the reader entered. */
+		stateKey?: string;
 	};
 	/** The kit this result used, and any build the user is being asked to confirm. */
 	kit?: GenUiKitNotice;
@@ -138,6 +140,7 @@ function InlineCard({
 				title={title}
 				runtime={inline.runtime}
 				formToolUseId={form}
+				stateKey={inline.stateKey}
 			/>
 		</Suspense>
 	) : null;
@@ -187,6 +190,7 @@ function InlineCard({
 					title={title}
 					runtime={inline.runtime}
 					formToolUseId={form}
+					stateKey={inline.stateKey}
 				/>
 			</Suspense>
 			{expanded &&

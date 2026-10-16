@@ -7,7 +7,13 @@ import {
 } from "@shared/gen-ui-files";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { compilePreview } from "./compiler";
-import { assertReferenceWorkspace, collectSources, uiError, validateDirectory } from "./files";
+import {
+	assertReferenceWorkspace,
+	collectSources,
+	type SourceFile,
+	uiError,
+	validateDirectory,
+} from "./files";
 import { readKit } from "./kit";
 
 export interface PreviewDependencies {
@@ -54,6 +60,47 @@ const defaults: PreviewDependencies = {
 		return status.hash ? { hash: status.hash, components: status.components } : null;
 	},
 };
+
+/**
+ * Compiled output by content: the same files against the same kit compile to the same
+ * bundle, so reopening a preview (or the card mounting again) skips the compiler. Keyed
+ * by bytes, not paths or times, so an edit is never served stale. Everything else a
+ * build checks (workspace, authorization) still runs on every request.
+ */
+const COMPILE_CACHE_ENTRIES = 8;
+const COMPILE_CACHE_BYTES = 16 * 1024 * 1024;
+const compiled = new Map<string, { js: string; css: string; bytes: number }>();
+
+export function compileCacheKey(sources: SourceFile[], kitHash: string | undefined): string {
+	const hash = new Bun.CryptoHasher("sha256");
+	hash.update(`kit:${kitHash ?? ""}\0`);
+	for (const source of [...sources].sort((a, b) =>
+		a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+	)) {
+		hash.update(`${source.path}\0${source.bytes.byteLength}\0`);
+		hash.update(source.bytes);
+	}
+	return hash.digest("hex");
+}
+
+function remember(key: string, result: { js: string; css: string }): void {
+	const bytes = (result.js.length + result.css.length) * 2;
+	if (bytes > COMPILE_CACHE_BYTES / 2) return;
+	compiled.delete(key);
+	compiled.set(key, { ...result, bytes });
+	let total = 0;
+	for (const entry of compiled.values()) total += entry.bytes;
+	while (compiled.size > COMPILE_CACHE_ENTRIES || total > COMPILE_CACHE_BYTES) {
+		const [oldest, entry] = compiled.entries().next().value as [string, { bytes: number }];
+		compiled.delete(oldest);
+		total -= entry.bytes;
+	}
+}
+
+/** Test seam: cases must not see each other's builds. */
+export function resetPreviewCacheForTest(): void {
+	compiled.clear();
+}
 
 let activePreviews = 0;
 export async function buildGenUiPreview(
@@ -113,7 +160,16 @@ export async function buildGenUiPreview(
 						deps.authorize(narratorId, userId, reference.deviceId, path, readSignal),
 					signal,
 				);
-				const result = await deps.compile(sources, signal, kit ?? undefined);
+				const key = compileCacheKey(sources, kit?.hash);
+				const hit = compiled.get(key);
+				if (hit) {
+					// Most recently used last.
+					compiled.delete(key);
+					compiled.set(key, hit);
+				}
+				const result = hit
+					? { js: hit.js, css: hit.css }
+					: await deps.compile(sources, signal, kit ?? undefined);
 				signal.throwIfAborted();
 				const current = await deps.workspace(narratorId);
 				assertReferenceWorkspace(reference, current, backend);
@@ -153,6 +209,8 @@ export async function buildGenUiPreview(
 				};
 				if (Buffer.byteLength(JSON.stringify(preview)) > LIMITS.outputBytes)
 					throw uiError("UI preview JSON exceeds the 4 MiB output limit", 413);
+				// Only a build that passed every check is kept.
+				if (!hit) remember(key, result);
 				return preview;
 			})(),
 		]);

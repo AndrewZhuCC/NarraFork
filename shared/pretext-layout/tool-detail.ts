@@ -523,6 +523,8 @@ export interface ToolGenUiDetail {
 	 * call instead of sending a chat message.
 	 */
 	formToolUseId?: string;
+	/** The `render` call's id: every frame drawing it shares what the reader entered. */
+	stateKey?: string;
 }
 
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
@@ -938,6 +940,7 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
 					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
 					...uiKitFields,
+					...(typeof input.toolUseId === "string" ? { stateKey: input.toolUseId } : {}),
 					...(uiInput.wait === true &&
 					status != null &&
 					!isTerminalToolStatus(status) &&

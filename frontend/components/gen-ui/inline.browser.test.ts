@@ -414,3 +414,49 @@ browserTest(
 	},
 	120_000,
 );
+
+browserTest(
+	"what the reader typed follows the card into the expanded view and back",
+	async () => {
+		const kit = async (path: string) =>
+			path.endsWith("/gen-ui/kit")
+				? Response.json({ status: { state: "builtin", components: [] }, request: null })
+				: null;
+		await withFixturePage(kit, async (page) => {
+			const markup = `<Stack>
+	<TextInput id="who" bind="who" defaultValue="Ada" />
+	<Text id="echo">hi {$who}</Text>
+</Stack>`;
+			await page.evaluate((s) => window.inlineFixture.stream(s, false), markup);
+			const card = (await (
+				await page.waitForSelector('#card iframe[title="Plans"]')
+			)?.contentFrame()) as Frame;
+			await card.waitForSelector("#who");
+			await card.type("#who", " L");
+			await card.waitForFunction(() => document.getElementById("echo")?.textContent === "hi Ada L");
+
+			const expand = await page.waitForSelector("#card button ::-p-text(Expand)");
+			await expand?.click();
+			const expandedHandle = await page.waitForFunction(() => {
+				const frames = document.querySelectorAll('iframe[title="Plans"]');
+				return frames.length === 2 ? frames[1] : null;
+			});
+			const expanded = (await (
+				expandedHandle.asElement() as unknown as { contentFrame(): Promise<Frame> }
+			).contentFrame()) as Frame;
+			await expanded.waitForFunction(
+				() => document.getElementById("echo")?.textContent === "hi Ada L",
+			);
+			expect(await expanded.$eval("#who", (node) => (node as HTMLInputElement).value)).toBe(
+				"Ada L",
+			);
+			// A change in the expanded view reaches the card behind it.
+			await expanded.type("#who", "!");
+			await card.waitForFunction(
+				() => document.getElementById("echo")?.textContent === "hi Ada L!",
+			);
+			expect(await card.$eval("#who", (node) => (node as HTMLInputElement).value)).toBe("Ada L!");
+		});
+	},
+	120_000,
+);

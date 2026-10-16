@@ -2049,6 +2049,7 @@ export function RenderToolBody({
 								title: model.title,
 								runtime: model.runtime,
 								formToolUseId: model.formToolUseId,
+								stateKey: model.stateKey,
 							}
 				}
 				kit={model.kit}

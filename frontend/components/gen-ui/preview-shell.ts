@@ -218,6 +218,22 @@ export function createPreviewShell(
     };
     // A change reaches a bound control as an event (inputs, checkboxes) or as the value
     // itself (Select, Slider, SegmentedControl, Tabs…).
+    // What the reader has set goes to the host, which hands it to another frame of the same
+    // card (the expanded view, or the card drawn again after scrolling away).
+    const share = () => {
+      const values = {};
+      for (const name of touched) if (state.has(name)) values[name] = plain(state.get(name));
+      parent.postMessage({type: "narrafork:ui-state", values}, "*");
+    };
+    const adopt = (values) => {
+      if (!values || typeof values !== "object" || Array.isArray(values)) return;
+      for (const name of Object.keys(values).slice(0, 200)) {
+        if (!stateName.test(name)) continue;
+        state.set(name, plain(values[name]));
+        touched.add(name);
+      }
+      rerender();
+    };
     const changed = (input, checkable) => {
       const target = input && typeof input === "object" && !Array.isArray(input) && (input.currentTarget || input.target);
       if (target && typeof target === "object" && "value" in target) return checkable ? !!target.checked : target.value;
@@ -338,6 +354,7 @@ export function createPreviewShell(
           touched.add(bind);
           state.set(bind, next);
           rerender();
+          share();
         };
         props.onChange = update;
         // Radix-style kit controls (shadcn Select, Tabs, Checkbox, Switch) report changes
@@ -383,6 +400,7 @@ export function createPreviewShell(
       if (event.source !== parent) return;
       const data = event.data;
       if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) { seedTree(data.nodes); setTree?.(data.nodes); return; }
+      if (data?.type === "narrafork:ui-state") { adopt(data.values); return; }
       if (data?.type !== "narrafork:preview-theme" || config.kit) return;
       const theme = data.theme;
       if (!theme || !["light", "dark"].includes(theme.colorScheme) || typeof theme.tokenCss !== "string" || theme.tokenCss.length > 65536) return;
