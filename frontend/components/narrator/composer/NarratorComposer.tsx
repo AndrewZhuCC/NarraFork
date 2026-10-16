@@ -4,6 +4,8 @@ import { notifications } from "@mantine/notifications";
 import {
 	type ComposerDocument,
 	type ComposerInlineNode,
+	composerDocumentText,
+	parseComposerDocument,
 	readComposerDocument,
 } from "@shared/composer-document";
 import type { FileReference, FileReferenceCandidate } from "@shared/file-reference";
@@ -41,11 +43,7 @@ import {
 } from "./composer-document-adapter";
 import { getComposerFileOrder } from "./composer-file-order";
 import { composerOptimizeTarget } from "./composer-optimize-target";
-import {
-	joinQuotedComposerInput,
-	MAX_COMPOSER_QUOTES,
-	splitQuotedComposerInput,
-} from "./composer-quotes";
+import { joinQuotedComposerInput, MAX_COMPOSER_QUOTES } from "./composer-quotes";
 import { getComposerAssetId } from "./draft-image-attachments";
 import { FileReferencePopover } from "./FileReferencePopover";
 import { useFileReferenceScope } from "./FileReferenceScope";
@@ -92,7 +90,21 @@ function isDraftWithinSyncLimit(input: string): boolean {
 	return input.length <= MAX_NARRATOR_DRAFT_CHARS;
 }
 
-/** Remote draft shape carried by the WS `draft_changed` event and 409 conflicts. */
+function splitDocumentInput(document: ComposerDocument) {
+	// The model prefix is a projection of quote atoms, not a second parser for literal text.
+	// A quote-looking text node after a real quote must remain in the editable body.
+	const quotes = document.paragraphs.flatMap((paragraph) =>
+		paragraph.children.filter((node) => node.type === "quote"),
+	);
+	const bodyDocument: ComposerDocument = {
+		...document,
+		paragraphs: document.paragraphs.map((paragraph) => ({
+			children: paragraph.children.filter((node) => node.type !== "quote"),
+		})),
+	};
+	return { quotes, body: composerDocumentText(bodyDocument) };
+}
+
 export interface NarratorRemoteDraft {
 	hasDraft: boolean;
 	text: string;
@@ -256,12 +268,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			fileReferences: [],
 		});
 		const { text: input, fileReferences } = inputState;
+		const document = useMemo(() => importComposerInput(inputState), [inputState]);
 		// Leading quote blocks are shown as chips; the textarea and its popovers
 		// only ever see the body after them (see composer-quotes.ts).
-		const { quotes, body: bodyInput } = useMemo(
-			() => splitQuotedComposerInput(inputState),
-			[inputState],
-		);
+		const { quotes, body: bodyInput } = useMemo(() => splitDocumentInput(document), [document]);
 		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
 		const [draftHydrated, setDraftHydrated] = useState(false);
@@ -312,7 +322,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		}
 		for (const file of [...attachedImages, ...attachedTextFiles])
 			resourceCacheRef.current.set(getComposerAssetId(file), file);
-		const document = useMemo(() => importComposerInput(inputState), [inputState]);
 		const resources = new Map(resourceCacheRef.current);
 		const documentRef = useRef(document);
 		documentRef.current = document;
@@ -357,9 +366,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		/** Synchronous ref updates make restore→send in the same tick atomic. */
 		const applyInput = useCallback((next: FileReferenceInput) => {
+			const nextDocument = importComposerInput(next);
 			inputStateRef.current = next;
 			inputRef.current = next.text;
-			documentRef.current = importComposerInput(next);
+			documentRef.current = nextDocument;
 			setInputState(next);
 		}, []);
 		const setText = useCallback(
@@ -368,7 +378,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			},
 			[applyInput],
 		);
-		const readQuotedInput = useCallback(() => splitQuotedComposerInput(inputStateRef.current), []);
+		const readQuotedInput = useCallback(() => splitDocumentInput(documentRef.current), []);
 		const applyBody = useCallback(
 			(body: FileReferenceInput) => {
 				applyInput(joinQuotedComposerInput(readQuotedInput().quotes, body));
@@ -400,8 +410,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const restoreInput = useCallback(
 			(text: string, refs: FileReference[], composerDocument?: ComposerDocument) => {
 				const next = { text, fileReferences: copyFileReferences(refs, text), composerDocument };
+				// Validate/apply before committing refs: a failed restore must keep the local draft intact.
+				const restored = parseComposerDocument(importComposerInput(next));
+				editorRef.current?.setDocument(restored);
 				applyInput(next);
-				editorRef.current?.setDocument(importComposerInput(next));
 			},
 			[applyInput],
 		);
@@ -900,6 +912,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							!sameFileReferenceInput(inputStateRef.current, localDraftAtRequest) ||
 							(!!unacknowledgedDraftRef.current?.unsynced && !localDraft.unsynced),
 					});
+					if (resolved.composerDocument || localDraft.composerDocument)
+						restoreRemoteInput(
+							resolved.text,
+							resolved.fileReferences ?? [],
+							resolved.composerDocument,
+						);
+					else
+						restoreInput(resolved.text, resolved.fileReferences ?? [], resolved.composerDocument);
 					lastSyncedDraftRef.current = {
 						text: serverText,
 						fileReferences: serverFileReferences,
@@ -911,14 +931,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					lastDraftUpdatedAtRef.current = resolved.conflict
 						? localDraft.serverUpdatedAt
 						: draft.updatedAt;
-					if (resolved.composerDocument || localDraft.composerDocument)
-						restoreRemoteInput(
-							resolved.text,
-							resolved.fileReferences ?? [],
-							resolved.composerDocument,
-						);
-					else
-						restoreInput(resolved.text, resolved.fileReferences ?? [], resolved.composerDocument);
 					persistNarratorInputDraft(
 						currentUserId,
 						narratorId,
@@ -1038,7 +1050,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
 			(draft: NarratorRemoteDraft) => {
-				if (draft.hasComposerDocument && !draft.composerDocument) {
+				const currentRevision = lastDraftRevisionRef.current;
+				if (currentRevision != null && draft.revision < currentRevision) return;
+				if (draft.hasDraft && draft.hasComposerDocument && !draft.composerDocument) {
 					const epoch = ++draftReadEpochRef.current;
 					const scope = draftOwnerScopeRef.current;
 					void api
@@ -1047,22 +1061,35 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							if (
 								epoch !== draftReadEpochRef.current ||
 								scope !== draftOwnerScopeRef.current ||
-								detail.revision < draft.revision
+								detail.revision < draft.revision ||
+								detail.revision < (lastDraftRevisionRef.current ?? 0)
 							)
 								return;
-							if (!readComposerDocument(detail.composerDocument)) {
-								setDraftSyncState("error");
-								return;
-							}
+							// A newer save may legitimately clear the draft or come from a legacy text client.
+							// Only the same nonempty revision is bound by this summary's layout promise.
+							if (
+								detail.hasDraft &&
+								detail.revision === draft.revision &&
+								!readComposerDocument(detail.composerDocument)
+							)
+								throw new Error("Draft detail is missing the announced layout");
 							remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
 						})
 						.catch(() => {
-							if (epoch === draftReadEpochRef.current) setDraftSyncState("error");
+							if (
+								epoch === draftReadEpochRef.current &&
+								scope === draftOwnerScopeRef.current &&
+								// PUT already returns the full draft after broadcasting its summary.
+								// A failed redundant GET cannot invalidate that acknowledged snapshot.
+								!(
+									(lastDraftRevisionRef.current ?? -1) >= draft.revision &&
+									lastSyncedDraftRef.current
+								)
+							)
+								setDraftSyncState("error");
 						});
 					return;
 				}
-				const currentRevision = lastDraftRevisionRef.current;
-				if (currentRevision != null && draft.revision < currentRevision) return;
 				draftReadEpochRef.current++;
 				const remoteText = draft.hasDraft ? draft.text : "";
 				const remoteRefs = draft.hasDraft
@@ -1091,12 +1118,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					setDraftSyncState("conflict");
 					return;
 				}
+				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
+				if (shouldApplyRemote) restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
 				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;
 				lastDraftUpdatedAtRef.current = draft.updatedAt;
 				draftConflictRef.current = null;
 				setDraftSyncState("ready");
-				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
 				const nextInput = shouldApplyRemote ? remoteInput : inputStateRef.current;
 				if (currentUserId) {
 					persistNarratorInputDraft(
@@ -1110,7 +1138,6 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						nextInput.composerDocument,
 					);
 				}
-				if (shouldApplyRemote) restoreRemoteInput(remoteText, remoteRefs, draft.composerDocument);
 			},
 			[currentUserId, narratorId, restoreRemoteInput],
 		);
@@ -1616,18 +1643,29 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						})}
 					</Text>
 				)}
-				<InlineQuoteCandidate
-					candidate={quoteCandidate.candidate}
-					showShortcut={quoteCandidate.showShortcut}
-					anchorElement={editorElement}
-					onAccept={acceptQuote}
-					onDismiss={quoteCandidate.hide}
-				/>
 				<InlineComposerEditor
 					ref={editorRef}
 					elementRef={textareaRef}
 					onElement={setEditorElement}
 					value={document}
+					adaptive={!fullscreenOpened}
+					leadingControls={controls}
+					candidate={
+						quoteCandidate.candidate
+							? {
+									key: quoteCandidate.candidate.key,
+									content: (
+										<InlineQuoteCandidate
+											candidate={quoteCandidate.candidate}
+											showShortcut={quoteCandidate.showShortcut}
+											disabled={sending}
+											onAccept={acceptQuote}
+											onDismiss={quoteCandidate.hide}
+										/>
+									),
+								}
+							: undefined
+					}
 					onChange={applyDocument}
 					resources={resources}
 					disabled={sending}
@@ -1654,30 +1692,27 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						openImageViewer({ src, blob: file, filename: file.name, alt: file.name });
 					}}
 					controls={
-						<Group justify="space-between" wrap="nowrap" gap="xs">
-							{controls}
-							<Group gap="xs" wrap="nowrap">
-								{fullscreenOpened && (
-									<Button size="compact-xs" variant="subtle" onClick={closeFullscreen}>
-										{t("richComposer.collapse")}
-									</Button>
-								)}
-								<TextareaOptimizeControls
-									disabled={!bodyText.trim() || optimizeHook.loading || sending}
-									loading={optimizeHook.loading}
-									withContext={optimizeHook.withContext}
-									onToggleContext={optimizeHook.toggleContext}
-									onOptimize={optimizeHook.handleOptimize}
-									onCancelOptimize={optimizeHook.cancelOptimize}
-									onExpand={() => {
-										optimizeHook.cancelOptimize();
-										openFullscreen();
-									}}
-									contextMessageCount={optimizeHook.contextMessageCount}
-									onContextMessageCountChange={optimizeHook.setContextMessageCount}
-								/>
-								{actions}
-							</Group>
+						<Group gap="xs" wrap="wrap" justify="flex-end">
+							{fullscreenOpened && (
+								<Button size="compact-xs" variant="subtle" onClick={closeFullscreen}>
+									{t("richComposer.collapse")}
+								</Button>
+							)}
+							<TextareaOptimizeControls
+								disabled={!bodyText.trim() || optimizeHook.loading || sending}
+								loading={optimizeHook.loading}
+								withContext={optimizeHook.withContext}
+								onToggleContext={optimizeHook.toggleContext}
+								onOptimize={optimizeHook.handleOptimize}
+								onCancelOptimize={optimizeHook.cancelOptimize}
+								onExpand={() => {
+									optimizeHook.cancelOptimize();
+									openFullscreen();
+								}}
+								contextMessageCount={optimizeHook.contextMessageCount}
+								onContextMessageCountChange={optimizeHook.setContextMessageCount}
+							/>
+							{actions}
 						</Group>
 					}
 				/>

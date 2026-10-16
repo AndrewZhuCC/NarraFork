@@ -19,10 +19,12 @@ import {
 	EditorState,
 	NodeSelection,
 	Plugin,
+	PluginKey,
 	type Selection,
 	type SelectionBookmark,
 	TextSelection,
 } from "@tiptap/pm/state";
+import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import {
 	EditorContent,
 	Extension,
@@ -44,13 +46,16 @@ import {
 	useContext,
 	useEffect,
 	useImperativeHandle,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { fileReferenceToken } from "./file-reference-input";
 import classes from "./InlineComposerEditor.module.css";
+import { useComposerLayout } from "./use-composer-layout";
 
 export interface InlineComposerSelection {
 	start: number;
@@ -105,7 +110,13 @@ export interface InlineComposerEditorProps {
 	onOpenFile?: (reference: FileReference) => void;
 	onOpenImage?: (asset: ComposerAsset) => void;
 	controls?: ReactNode;
+	leadingControls?: ReactNode;
+	/** Transient preview only; never becomes a document node or history entry. */
+	candidate?: { key: string; content: ReactNode };
+	adaptive?: boolean;
 }
+
+const candidateKey = new PluginKey<number | null>("inlineComposerCandidate");
 
 type AtomNode = Exclude<ComposerInlineNode, { type: "text" } | { type: "break" }>;
 type AtomContextValue = Pick<
@@ -385,6 +396,9 @@ export const InlineComposerEditor = forwardRef<
 	const { t } = useTranslation("narrator");
 	const propsRef = useRef(props);
 	propsRef.current = props;
+	const rootRef = useRef<HTMLDivElement | null>(null);
+	const leadingRef = useRef<HTMLDivElement | null>(null);
+	const trailingRef = useRef<HTMLDivElement | null>(null);
 	// Deliberately retain asset metadata for undo, including assets no longer in the live document.
 	const assetsRef = useRef(new Map(props.value.assets.map((asset) => [asset.id, asset])));
 	const [assetGeneration, setAssetGeneration] = useState(0);
@@ -393,6 +407,8 @@ export const InlineComposerEditor = forwardRef<
 	const actualSignatureRef = useRef<string | null>(null);
 	const receivedValueRef = useRef(props.value);
 	const transactionStartedRef = useRef(0);
+	const candidateHostRef = useRef<HTMLSpanElement | null>(null);
+	const [candidateHost, setCandidateHost] = useState<HTMLSpanElement | null>(null);
 	const bookmarksRef = useRef(new Set<{ value: SelectionBookmark | null }>());
 	const clearBookmarks = useCallback(() => {
 		for (const bookmark of bookmarksRef.current) bookmark.value = null;
@@ -450,6 +466,34 @@ export const InlineComposerEditor = forwardRef<
 			Extension.create({
 				name: "composerBoundaries",
 				addProseMirrorPlugins: () => [
+					new Plugin<number | null>({
+						key: candidateKey,
+						state: {
+							init: () => null,
+							apply: (transaction, position) => {
+								const change = transaction.getMeta(candidateKey) as
+									| { visible: boolean }
+									| undefined;
+								if (change) return change.visible ? transaction.selection.from : null;
+								return position == null ? null : transaction.mapping.map(position);
+							},
+						},
+						props: {
+							decorations: (state) => {
+								const position = candidateKey.getState(state);
+								const host = candidateHostRef.current;
+								if (position == null || !host || !propsRef.current.candidate) return null;
+								return DecorationSet.create(state.doc, [
+									Decoration.widget(position, () => host, {
+										key: "pending-quote",
+										side: -1,
+										ignoreSelection: true,
+										stopEvent: () => true,
+									}),
+								]);
+							},
+						},
+					}),
 					new Plugin({
 						state: {
 							init: () => null,
@@ -504,7 +548,16 @@ export const InlineComposerEditor = forwardRef<
 			}),
 		],
 		editorProps: {
-			attributes: { role: "textbox", "aria-multiline": "true", class: classes.editable },
+			attributes: (state) => ({
+				role: "textbox",
+				"aria-multiline": "true",
+				class: classes.editable,
+				"data-empty": String(
+					state.doc.childCount === 1 &&
+						state.doc.firstChild?.content.size === 0 &&
+						!propsRef.current.candidate,
+				),
+			}),
 			handleKeyDown: (_view, event) => event.defaultPrevented,
 			clipboardTextSerializer: (slice) =>
 				slice.content.textBetween(0, slice.content.size, "\n", (node) => {
@@ -610,26 +663,32 @@ export const InlineComposerEditor = forwardRef<
 			propsRef.current.onBlur?.();
 		},
 	});
+	useComposerLayout({ editor, adaptive: !!props.adaptive, rootRef, leadingRef, trailingRef });
 	const replaceDocument = (document: ComposerDocument, preserveHistory = false) => {
 		const parsed = parseComposerDocument(document);
 		if (preserveHistory && propsRef.current.disabled) return;
-		clearBookmarks();
-		if (!preserveHistory) assetsRef.current = new Map();
-		mergeAssets(parsed.assets);
+		const nextAssets = new Map(preserveHistory ? assetsRef.current : []);
+		for (const asset of parsed.assets) nextAssets.set(asset.id, asset);
 		if (preserveHistory && editor && !editor.isDestroyed) {
-			const doc = editor.schema.nodeFromJSON(composerDocumentToEditorJSON(parsed));
-			editor.view.dispatch(
-				closeHistory(editor.state.tr).replaceWith(0, editor.state.doc.content.size, doc.content),
-			);
-			editor.view.dispatch(closeHistory(editor.state.tr));
+			const previousAssets = assetsRef.current;
+			assetsRef.current = nextAssets;
+			try {
+				const doc = editor.schema.nodeFromJSON(composerDocumentToEditorJSON(parsed));
+				editor.view.dispatch(
+					closeHistory(editor.state.tr).replaceWith(0, editor.state.doc.content.size, doc.content),
+				);
+				editor.view.dispatch(closeHistory(editor.state.tr));
+			} catch (error) {
+				assetsRef.current = previousAssets;
+				throw error;
+			}
+			clearBookmarks();
 			setAssetGeneration((generation) => generation + 1);
 			return;
 		}
-		latestRef.current = parsed;
-		signatureRef.current = JSON.stringify(parsed);
 		if (editor && !editor.isDestroyed) {
 			const doc = editor.schema.nodeFromJSON(composerDocumentToEditorJSON(parsed));
-			// External draft/history loads must not undo into a different document's resources.
+			// A failed view application cannot clear the current draft's metadata or resources.
 			editor.view.updateState(
 				EditorState.create({
 					schema: editor.schema,
@@ -638,10 +697,20 @@ export const InlineComposerEditor = forwardRef<
 					selection: TextSelection.atEnd(doc),
 				}),
 			);
+		}
+		assetsRef.current = nextAssets;
+		latestRef.current = parsed;
+		signatureRef.current = JSON.stringify(parsed);
+		clearBookmarks();
+		if (editor && !editor.isDestroyed) {
+			if (propsRef.current.candidate)
+				editor.view.dispatch(
+					editor.state.tr.setMeta(candidateKey, { visible: true }).setMeta("addToHistory", false),
+				);
 			actualSignatureRef.current = JSON.stringify(
 				readEditorDocument(editor.state.doc, assetsRef.current),
 			);
-			propsRef.current.onSelectionChange?.(selectionOf(doc, editor.state.selection));
+			propsRef.current.onSelectionChange?.(selectionOf(editor.state.doc, editor.state.selection));
 		}
 		setAssetGeneration((generation) => generation + 1);
 	};
@@ -651,6 +720,26 @@ export const InlineComposerEditor = forwardRef<
 		// Internal render/imperative restore is not a newly received controlled value.
 		if (JSON.stringify(props.value) !== signatureRef.current) replaceDocument(props.value);
 	});
+	useLayoutEffect(() => {
+		if (!editor) return;
+		const host = editor.view.dom.ownerDocument.createElement("span");
+		host.contentEditable = "false";
+		host.dataset.composerCandidateHost = "true";
+		candidateHostRef.current = host;
+		setCandidateHost(host);
+		return () => {
+			candidateHostRef.current = null;
+		};
+	}, [editor]);
+	const pendingKey = props.candidate?.key;
+	useLayoutEffect(() => {
+		if (!editor || !candidateHost) return;
+		editor.view.dispatch(
+			editor.state.tr
+				.setMeta(candidateKey, { visible: pendingKey !== undefined })
+				.setMeta("addToHistory", false),
+		);
+	}, [editor, candidateHost, pendingKey]);
 	useEffect(() => () => clearBookmarks(), [clearBookmarks]);
 	useEffect(() => {
 		editor?.setEditable(!props.disabled, false);
@@ -803,9 +892,12 @@ export const InlineComposerEditor = forwardRef<
 	);
 	return (
 		<AtomContext.Provider value={atomContext}>
+			{candidateHost && props.candidate && createPortal(props.candidate.content, candidateHost)}
 			<div
+				ref={rootRef}
 				className={classes.root}
 				data-inline-composer
+				data-adaptive={props.adaptive || undefined}
 				data-assets-generation={assetGeneration}
 				data-disabled={props.disabled || undefined}
 				onDropCapture={(event) => {
@@ -826,7 +918,16 @@ export const InlineComposerEditor = forwardRef<
 				}}
 			>
 				<EditorContent editor={editor} className={classes.content} data-composer-scroll />
-				{props.controls && <div className={classes.controls}>{props.controls}</div>}
+				{(props.controls || props.leadingControls) && (
+					<div className={classes.controls} data-composer-controls>
+						<div ref={leadingRef} className={classes.leadingControls}>
+							{props.leadingControls}
+						</div>
+						<div ref={trailingRef} className={classes.trailingControls}>
+							{props.controls}
+						</div>
+					</div>
+				)}
 			</div>
 		</AtomContext.Provider>
 	);

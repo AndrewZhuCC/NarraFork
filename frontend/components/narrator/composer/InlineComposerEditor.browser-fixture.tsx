@@ -111,6 +111,26 @@ function Fixture() {
 							resources={resources}
 							disabled={disabled}
 							placeholder="Message"
+							candidate={
+								show
+									? {
+											key: candidate.key,
+											content: (
+												<InlineQuoteCandidate
+													candidate={candidate}
+													onAccept={() => {
+														accepted++;
+														setShow(false);
+													}}
+													onDismiss={() => {
+														dismissed++;
+														setShow(false);
+													}}
+												/>
+											),
+										}
+									: undefined
+							}
 							onRemoveAsset={(id) => removed.push(id)}
 							onOpenQuote={() => opened++}
 							onOpenImage={() => opened++}
@@ -133,18 +153,6 @@ function Fixture() {
 									Controls
 								</button>
 							}
-						/>
-						<InlineQuoteCandidate
-							candidate={show ? candidate : null}
-							anchorElement={element.current}
-							onAccept={() => {
-								accepted++;
-								setShow(false);
-							}}
-							onDismiss={() => {
-								dismissed++;
-								setShow(false);
-							}}
 						/>
 					</div>
 				</div>
@@ -354,7 +362,6 @@ export function frameCandidate() {
 		<I18nextProvider i18n={instance}>
 			<InlineQuoteCandidate
 				candidate={candidate}
-				anchorElement={anchor}
 				onAccept={() => accepted++}
 				onDismiss={() => dismissed++}
 			/>

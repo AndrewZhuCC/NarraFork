@@ -35,6 +35,7 @@ let parentRenders = 0;
 let sends = 0;
 let updateFiles: (images: File[], textFiles: File[]) => void;
 let updateSending: (value: boolean) => void;
+let updateTakeover: (value: boolean) => void;
 let ingestFiles: ReturnType<typeof useComposerFileIngest>["ingestFiles"];
 let pendingFiles: Promise<File[]> | undefined;
 let currentFiles: File[] = [];
@@ -94,6 +95,8 @@ function PanelBoundary({ showFileSource = false }: { showFileSource?: boolean })
 	const [images, setImages] = useState<File[]>([]);
 	const [textFiles, setTextFiles] = useState<File[]>([]);
 	const [isSending, setIsSending] = useState(false);
+	const [takenOver, setTakenOver] = useState(false);
+	updateTakeover = setTakenOver;
 	const changeFiles = useCallback((nextImages: File[], nextTextFiles: File[]) => {
 		setImages(nextImages);
 		setTextFiles(nextTextFiles);
@@ -149,6 +152,8 @@ function PanelBoundary({ showFileSource = false }: { showFileSource?: boolean })
 			<div id="row">
 				<NarratorComposerRow
 					{...defaults}
+					canTakeover={takenOver}
+					isTakenOver={takenOver}
 					onFileInputChange={ingest.handleFileInputChange}
 					onComposerPasteImages={ingest.handleComposerPasteImages}
 					composerHasText={hasText}
@@ -349,4 +354,8 @@ export function publishFileSelection(dirty = false) {
 	const source = document.getElementById("file-selection-source") as HTMLTextAreaElement;
 	source.focus();
 	source.setSelectionRange(0, 6);
+}
+
+export function takeover(value: boolean) {
+	updateTakeover(value);
 }

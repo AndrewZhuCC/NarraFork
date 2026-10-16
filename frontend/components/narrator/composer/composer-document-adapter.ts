@@ -19,13 +19,31 @@ export function composerNodeId(): string {
 export function importComposerInput(input: FileReferenceInput): ComposerDocument {
 	const stored = readComposerDocument(input.composerDocument);
 	if (stored) return stored;
-	const { quotes, prefixLength } = parseComposerQuotePrefix(input.text);
+	const parsed = parseComposerQuotePrefix(input.text);
+	const quoteDocument = readComposerDocument({
+		version: 1,
+		paragraphs: [
+			{
+				children: parsed.quotes.map((quote) => ({
+					type: "quote",
+					id: composerNodeId(),
+					...quote,
+				})),
+			},
+		],
+		assets: [],
+	});
+	// Legacy prefixes can exceed today's quote limits or use noncanonical spacing.
+	// Only promote a lossless, valid prefix; otherwise retain every original character.
+	const prefixLength =
+		quoteDocument &&
+		composerDocumentText(quoteDocument).text === input.text.slice(0, parsed.prefixLength)
+			? parsed.prefixLength
+			: 0;
 	const refs = readFileReferences(input.fileReferences, input.text);
-	const children: ComposerInlineNode[] = quotes.map((quote) => ({
-		type: "quote",
-		id: composerNodeId(),
-		...quote,
-	}));
+	const children: ComposerInlineNode[] = prefixLength
+		? (quoteDocument?.paragraphs[0].children ?? [])
+		: [];
 	const ranges = refs
 		.filter((ref) => ref.inputRange && ref.inputRange[0] >= prefixLength)
 		.sort((a, b) => (a.inputRange?.[0] ?? 0) - (b.inputRange?.[0] ?? 0));

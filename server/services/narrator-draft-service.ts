@@ -62,12 +62,12 @@ function rowToDraftState(
 	const fileReferences: FileReference[] = row.fileReferencesJson
 		? (JSON.parse(row.fileReferencesJson) as FileReference[]).map(copyFileReference)
 		: [];
+	const composerDocument = readComposerDocument(row.composerDocument);
 	return {
-		hasDraft:
-			!!row.text.trim() || fileReferences.length > 0 || !!row.composerDocument?.assets.length,
+		hasDraft: !!row.text.trim() || fileReferences.length > 0 || !!composerDocument?.assets.length,
 		text: row.text,
 		fileReferences,
-		composerDocument: readComposerDocument(row.composerDocument),
+		composerDocument,
 		revision: row.revision,
 		updatedAt: row.updatedAt,
 		updatedBy: userId,
@@ -170,7 +170,7 @@ export async function updateNarratorDraft(
 		}
 
 		const now = new Date().toISOString();
-		const storedText = composerDocument ? text : text.trim() ? text : "";
+		const storedText = text.trim() || composerDocument?.assets.length ? text : "";
 		const storedReferences =
 			suppliedReferences ??
 			retainMatchingDraftFileReferences(current.text, storedText, current.fileReferences);
@@ -178,13 +178,14 @@ export async function updateNarratorDraft(
 		// Omission keeps the previous source attribution for legacy autosave clients.
 		const storedSourceId = sourceId ?? current.sourceId ?? null;
 		const nextRevision = current.revision + 1;
+		const storedComposerDocument =
+			storedText.trim() || storedReferences.length || composerDocument?.assets.length
+				? composerDocument
+				: undefined;
 		const fields = {
 			text: storedText,
 			fileReferencesJson,
-			composerDocument:
-				storedText.trim() || storedReferences.length || composerDocument?.assets.length
-					? (composerDocument ?? null)
-					: null,
+			composerDocument: storedComposerDocument ?? null,
 			sourceId: storedSourceId,
 			revision: nextRevision,
 			updatedAt: now,
@@ -200,10 +201,12 @@ export async function updateNarratorDraft(
 		return {
 			previousHasDraft: current.hasDraft,
 			hasDraft:
-				!!storedText.trim() || storedReferences.length > 0 || !!composerDocument?.assets.length,
+				!!storedText.trim() ||
+				storedReferences.length > 0 ||
+				!!storedComposerDocument?.assets.length,
 			text: storedText,
 			fileReferences: storedReferences,
-			composerDocument,
+			composerDocument: storedComposerDocument,
 			revision: nextRevision,
 			updatedAt: now,
 			updatedBy: userId,
