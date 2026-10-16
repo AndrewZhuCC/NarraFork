@@ -22,7 +22,7 @@ import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { UnbornHeadError } from "../lib/errors";
+import { GitError, UnbornHeadError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
@@ -290,6 +290,29 @@ describe("untracked directories are expanded to files", () => {
 			expect(await gitService.getCurrentBranch(repo)).toBe("fresh");
 			await expect(gitService.getHeadCommit(repo)).rejects.toBeInstanceOf(UnbornHeadError);
 			expect(errors.mock.calls.some((call) => call[0] === "git command failed")).toBe(false);
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	test("a directory that is not a git repository is not an unborn HEAD", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nf-not-a-repo-"));
+		tempDirs.push(dir);
+		const errors = spyOn(logger, "error");
+		const assertGitFailure = async (run: Promise<unknown>) => {
+			const error = await run.then(
+				() => {
+					throw new Error("expected a git failure");
+				},
+				(caught: unknown) => caught,
+			);
+			expect(error).toBeInstanceOf(GitError);
+			expect(error).not.toBeInstanceOf(UnbornHeadError);
+		};
+		try {
+			await assertGitFailure(gitService.getHeadCommit(dir));
+			await assertGitFailure(gitService.getCurrentBranch(dir));
+			expect(errors.mock.calls.filter((call) => call[0] === "git command failed")).toHaveLength(2);
 		} finally {
 			errors.mockRestore();
 		}
