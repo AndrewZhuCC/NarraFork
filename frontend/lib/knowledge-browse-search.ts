@@ -1,8 +1,8 @@
 /**
  * Search params of the browse page `/knowledge` (docs/KNOWLEDGE_UI_REDESIGN.md §4.1, §5.1):
- * `collection`, `q`, `tag`, `level`, `status`, `sort`, plus the admin tab (`tab=admin`) that
- * lives here until the admin pages get their own routes (P2d). Every view state is in the URL,
- * so a filtered list can be linked; defaults are left out.
+ * `collection`, `q`, `tag`, `level`, `status`, `sort`. Every view state is in the URL, so a
+ * filtered list can be linked; defaults are left out. The legacy `tab=…` values are read by the
+ * route's `beforeLoad` redirect (`legacyKnowledgeIndexRedirect`), not kept here.
  */
 import type { KnowledgeEntrySort, KnowledgeEntryStatus } from "./api";
 
@@ -13,7 +13,6 @@ export interface KnowledgeBrowseSearch {
 	level?: string;
 	status?: KnowledgeEntryStatus;
 	sort?: KnowledgeEntrySort;
-	tab?: "admin";
 }
 
 /** Entry / collection ids are nanoids (URL-safe alphabet). */
@@ -51,7 +50,6 @@ export function parseKnowledgeBrowseSearch(search: Record<string, unknown>): Kno
 		...(level ? { level } : {}),
 		...(status ? { status } : {}),
 		...(sort ? { sort } : {}),
-		...(search.tab === "admin" ? { tab: "admin" as const } : {}),
 	};
 }
 

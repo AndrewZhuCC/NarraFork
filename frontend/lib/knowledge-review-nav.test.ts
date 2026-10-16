@@ -98,7 +98,8 @@ describe("legacy URL redirects (§4.2, P2a rows)", () => {
 
 	test("other URLs are left alone", () => {
 		expect(legacyKnowledgeIndexRedirect({})).toBeNull();
-		expect(legacyKnowledgeIndexRedirect({ tab: "admin", submission: "x" })).toBeNull();
+		expect(legacyKnowledgeIndexRedirect({ tab: "entries" })).toBeNull();
+		expect(legacyKnowledgeIndexRedirect({ collection: "col-1", q: "x" })).toBeNull();
 		for (const hash of ["", "#content", "#draft", "#history", "#links", "#submissionsX"]) {
 			expect(legacyEntryHashRedirect("entry-1", hash)).toBeNull();
 		}
@@ -168,5 +169,16 @@ describe("parseKnowledgeEntrySearch", () => {
 		expect(parseKnowledgeEntrySearch({})).toEqual({});
 		expect(parseKnowledgeEntrySearch({ personal: "create" })).toEqual({ personal: "create" });
 		expect(parseKnowledgeEntrySearch({ personal: "delete" })).toEqual({});
+	});
+});
+
+// One test per §4.2 row owned by P2d.
+describe("legacy URL redirects (§4.2, P2d rows)", () => {
+	test("/knowledge?tab=admin → /knowledge/admin", () => {
+		expect(legacyKnowledgeIndexRedirect({ tab: "admin" })).toEqual({ to: "/knowledge/admin" });
+		// Stray params from the old tab URL do not change the destination.
+		expect(legacyKnowledgeIndexRedirect({ tab: "admin", submission: "x" })).toEqual({
+			to: "/knowledge/admin",
+		});
 	});
 });

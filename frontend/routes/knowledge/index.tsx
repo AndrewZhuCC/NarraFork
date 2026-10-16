@@ -1,35 +1,24 @@
 /**
  * Knowledge browse page (docs/KNOWLEDGE_UI_REDESIGN.md §5.1). All view state is in the URL
  * (`collection`, `q`, `tag`, `level`, `status`, `sort` — `lib/knowledge-browse-search.ts`):
- * collection tree on the left, a cursor-paginated table of entries on the right. The admin tab
- * (`tab=admin`) stays here until the admin pages get their own routes (P2d).
+ * collection tree on the left, a cursor-paginated table of entries on the right. Admins get an
+ * "Admin" entry point to `/knowledge/admin` in the header.
  *
  * Legacy tab URLs redirect in `beforeLoad` (§4.2): `?tab=review[&submission=<id>]` → inbox /
- * request page, `?tab=mylibrary` → `/knowledge/mine`.
+ * request page, `?tab=mylibrary` → `/knowledge/mine`, `?tab=admin` → `/knowledge/admin`.
  */
-import {
-	Badge,
-	Button,
-	Container,
-	Group,
-	Menu,
-	Stack,
-	Tabs,
-	Text,
-	Title,
-	Tooltip,
-} from "@mantine/core";
+import { Badge, Button, Container, Group, Menu, Stack, Text, Title, Tooltip } from "@mantine/core";
 import {
 	IconChevronDown,
 	IconFilePlus,
 	IconGitPullRequest,
 	IconNotebook,
 	IconPlus,
+	IconShieldLock,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
 import { BrowsePanel } from "../../components/knowledge/browse/BrowsePanel";
 import { CreateEntryModal } from "../../components/knowledge/browse/CreateEntryModal";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -53,7 +42,6 @@ function KnowledgePage() {
 	const search = Route.useSearch();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
-	const tab = search.tab === "admin" && isAdmin ? "admin" : "browse";
 	const collections = useKnowledgeCollections();
 	const [createOpen, setCreateOpen] = useState(false);
 	// Bounded server-side count; `capped` means "at least this many" → render "100+".
@@ -126,34 +114,20 @@ function KnowledgePage() {
 					>
 						{t("reviewInboxTitle")}
 					</Button>
+					{isAdmin ? (
+						<Button
+							component={Link}
+							to="/knowledge/admin"
+							variant="default"
+							leftSection={<IconShieldLock size={16} />}
+						>
+							{t("adminEntry")}
+						</Button>
+					) : null}
 				</Group>
 			</Group>
 
-			{isAdmin ? (
-				<Tabs
-					value={tab}
-					onChange={(value) =>
-						navigate({
-							search: (prev) => ({ ...prev, tab: value === "admin" ? "admin" : undefined }),
-							replace: true,
-						})
-					}
-					keepMounted={false}
-				>
-					<Tabs.List mb="md">
-						<Tabs.Tab value="browse">{t("tabEntries")}</Tabs.Tab>
-						<Tabs.Tab value="admin">{t("tabAdmin")}</Tabs.Tab>
-					</Tabs.List>
-					<Tabs.Panel value="browse">
-						<BrowsePanel search={search} />
-					</Tabs.Panel>
-					<Tabs.Panel value="admin">
-						<AclAdminPanel />
-					</Tabs.Panel>
-				</Tabs>
-			) : (
-				<BrowsePanel search={search} />
-			)}
+			<BrowsePanel search={search} />
 
 			<CreateEntryModal
 				opened={createOpen}
