@@ -6,6 +6,7 @@ import { MantineProvider } from "@mantine/core";
 import {
 	type ComposerDocument,
 	composerDocumentText,
+	MAX_COMPOSER_DOCUMENT_TEXT,
 	parseComposerDocument,
 } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
@@ -762,6 +763,285 @@ describe("composer rich document contract", () => {
 		expect(handle.current?.getText()).toBe(change === "local edit" ? "new input" : "");
 		expect(handle.current?.getDocument()).toBeUndefined();
 	});
+	test.each([
+		"clear",
+		"legacy text",
+	] as const)("a layout summary accepts a newer GET %s before its WS event arrives", async (change) => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				...input,
+				hasDraft: true,
+				composerDocument: doc,
+				revision: 2,
+				sourceId: "other",
+			}),
+		);
+		const pending = deferred<NarratorRemoteDraft>();
+		getSpy.mockClear();
+		getSpy.mockReturnValueOnce(pending.promise);
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				...input,
+				hasDraft: true,
+				hasComposerDocument: true,
+				revision: 3,
+				sourceId: "other",
+			}),
+		);
+		expect(getSpy).toHaveBeenCalledTimes(1);
+		expect(handle.current?.getDocument()).toEqual(doc);
+		const text = change === "clear" ? "" : "newer legacy text";
+		await act(async () =>
+			pending.resolve({
+				...initial,
+				hasDraft: change !== "clear",
+				text,
+				revision: 4,
+				sourceId: "other",
+			}),
+		);
+		expect(handle.current?.getText()).toBe(text);
+		expect(handle.current?.getFileReferences()).toEqual([]);
+		expect(handle.current?.getDocument()).toBeUndefined();
+		expect(handle.current?.hasMissingAssets()).toBe(false);
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		expect(host.textContent).not.toContain("draft conflict");
+		expect(readNarratorInputDraft("u1", "n1")).toMatchObject({ text, syncedRevision: 4 });
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeUndefined();
+		expect(readNarratorInputDraft("u1", "n1").unsynced).toBeUndefined();
+	});
+
+	test("a same-revision nonempty GET without its announced layout errors without changing local input", async () => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		const local = readNarratorInputDraft("u1", "n1");
+		const pending = deferred<NarratorRemoteDraft>();
+		getSpy.mockClear();
+		getSpy.mockReturnValueOnce(pending.promise);
+		const summary = {
+			...initial,
+			hasDraft: true,
+			text: "missing layout",
+			hasComposerDocument: true,
+			revision: 2,
+			sourceId: "other",
+		};
+		await act(async () => handle.current?.handleDraftChanged(summary));
+		await act(async () => pending.resolve({ ...summary, hasComposerDocument: false }));
+		expect(getSpy).toHaveBeenCalledTimes(1);
+		expect(host.textContent).toContain("draftLoadFailed");
+		expect(host.textContent).not.toContain("draft conflict");
+		expect(handle.current?.getText()).toBe(input.text);
+		expect(handle.current?.getFileReferences()).toEqual(input.fileReferences);
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(handle.current?.hasMissingAssets()).toBe(true);
+		expect(readNarratorInputDraft("u1", "n1")).toEqual(local);
+	});
+
+	test.each([
+		"newer remote clear",
+		"account switch",
+		"narrator switch",
+	] as const)("a late layout GET rejection does not error after a %s", async (change) => {
+		await render();
+		const pending = deferred<void>();
+		getSpy.mockReturnValueOnce(
+			pending.promise.then(() => {
+				throw new Error("stale layout request failed");
+			}),
+		);
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				hasDraft: true,
+				text: "old rich summary",
+				hasComposerDocument: true,
+				revision: 2,
+				sourceId: "other",
+			}),
+		);
+		if (change === "newer remote clear") {
+			await act(async () =>
+				handle.current?.handleDraftChanged({
+					...initial,
+					revision: 3,
+					sourceId: "other",
+				}),
+			);
+		} else if (change === "account switch") {
+			await act(async () => qc.setQueryData(["auth", "me"], { id: "u2" }));
+		} else {
+			testNarratorId = "n2";
+			await render();
+		}
+		const userId = change === "account switch" ? "u2" : "u1";
+		const local = readNarratorInputDraft(userId, testNarratorId);
+		await act(async () => pending.resolve());
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		expect(host.textContent).not.toContain("draft conflict");
+		expect(handle.current?.getText()).toBe("");
+		expect(handle.current?.getFileReferences()).toEqual([]);
+		expect(handle.current?.getDocument()).toBeUndefined();
+		expect(readNarratorInputDraft(userId, testNarratorId)).toEqual(local);
+	});
+
+	test.each([
+		"same-revision save",
+		"newer local clear",
+	] as const)("a redundant layout GET rejection does not undo an acknowledged %s", async (acknowledgement) => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		const save = deferred<Awaited<ReturnType<typeof api.updateNarratorDraft>>>();
+		updateSpy.mockReturnValueOnce(save.promise);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 820));
+		});
+		expect(updateSpy).toHaveBeenCalledTimes(1);
+		const sourceId = updateSpy.mock.calls[0][3] ?? null;
+		const read = deferred<void>();
+		getSpy.mockClear();
+		getSpy.mockReturnValueOnce(
+			read.promise.then(() => {
+				throw new Error("redundant layout request failed");
+			}),
+		);
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				...input,
+				hasDraft: true,
+				hasComposerDocument: true,
+				revision: 2,
+				sourceId,
+			}),
+		);
+		expect(getSpy).toHaveBeenCalledTimes(1);
+		await act(async () =>
+			save.resolve({
+				...initial,
+				...input,
+				composerDocument: doc,
+				hasDraft: true,
+				revision: 2,
+				sourceId,
+				ok: true,
+				traits: [],
+			}),
+		);
+		expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(2);
+		expect(handle.current?.getDocument()).toEqual(doc);
+		if (acknowledgement === "newer local clear") {
+			await act(async () => handle.current?.clearTextAndDraft());
+			expect(updateSpy).toHaveBeenCalledTimes(2);
+		}
+		const text = acknowledgement === "same-revision save" ? input.text : "";
+		const revision = acknowledgement === "same-revision save" ? 2 : 3;
+		const local = readNarratorInputDraft("u1", "n1");
+		expect(local.syncedRevision).toBe(revision);
+		await act(async () => read.resolve());
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		expect(host.textContent).not.toContain("draft conflict");
+		expect(handle.current?.getText()).toBe(text);
+		expect(handle.current?.getDocument()).toEqual(
+			acknowledgement === "same-revision save" ? doc : undefined,
+		);
+		expect(readNarratorInputDraft("u1", "n1")).toEqual(local);
+		expect(local.unsynced).toBeUndefined();
+	});
+
+	test("old-server empty summaries ignore a contradictory layout flag without fetching or erroring", async () => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				...input,
+				hasDraft: true,
+				composerDocument: doc,
+				revision: 2,
+				sourceId: "other",
+			}),
+		);
+		getSpy.mockClear();
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				hasComposerDocument: true,
+				revision: 3,
+				sourceId: "other",
+			}),
+		);
+		expect(getSpy).not.toHaveBeenCalled();
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		expect(host.textContent).not.toContain("draft conflict");
+		expect(handle.current?.getText()).toBe("");
+		expect(handle.current?.getFileReferences()).toEqual([]);
+		expect(handle.current?.getDocument()).toBeUndefined();
+		expect(handle.current?.hasMissingAssets()).toBe(false);
+		expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(3);
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeUndefined();
+	});
+
+	test.each([
+		"overlong text",
+		"editor rejection",
+	] as const)("failed restore from %s preserves local text, document and persistent draft atomically", async (failure) => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		const local = readNarratorInputDraft("u1", "n1");
+		const editor = getEditor();
+		const editorDocument = editor.getJSON();
+		const rejection =
+			failure === "editor rejection"
+				? spyOn(editor.view, "updateState").mockImplementationOnce(() => {
+						throw new Error("editor rejected replacement");
+					})
+				: undefined;
+		try {
+			await act(async () => {
+				expect(() =>
+					handle.current?.restoreInput(
+						failure === "overlong text"
+							? "x".repeat(MAX_COMPOSER_DOCUMENT_TEXT + 1)
+							: "replacement",
+						[],
+					),
+				).toThrow();
+			});
+			if (rejection) expect(rejection).toHaveBeenCalledTimes(1);
+			expect(handle.current?.getText()).toBe(input.text);
+			expect(handle.current?.getFileReferences()).toEqual(input.fileReferences);
+			expect(handle.current?.getDocument()).toEqual(doc);
+			expect(handle.current?.hasMissingAssets()).toBe(true);
+			expect(editor.getJSON()).toEqual(editorDocument);
+			expect(readNarratorInputDraft("u1", "n1")).toEqual(local);
+		} finally {
+			rejection?.mockRestore();
+		}
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("safe ", 1)));
+		expect(handle.current?.getDocument()?.assets).toEqual(doc.assets);
+		expect(handle.current?.getText()).toContain("safe before ");
+		expect(handle.current?.getDocument()?.paragraphs[0].children.map((node) => node.type)).toEqual([
+			"text",
+			"quote",
+			"attachment",
+			"fileReference",
+			"text",
+		]);
+	});
+
 	test("WS layout summaries load their document lazily instead of clearing inline nodes", async () => {
 		await render();
 		const doc = richDocument();
@@ -894,6 +1174,63 @@ describe("composer atomic reference contract", () => {
 		expect(handle.current?.getText()).toBe(`${prefix}${body.text}\nmore`);
 		expect(editor.getJSON().content?.[0].content?.some((node) => node.type === "quote")).toBe(true);
 	});
+	test.each([
+		["empty quote body", "> [quote] source\n>\n\nbody"],
+		["noncanonical quote header", "> [quote]  source  \n> quote\n\nbody"],
+		["noncanonical quote separator", "> [quote] source\n> quote"],
+	])("appendText preserves a legacy %s as plain text and appends at the actual end", async (_kind, text) => {
+		await render();
+		await act(async () => handle.current?.restoreInput(text, []));
+		expect(handle.current?.getText()).toBe(text);
+		expect(
+			getEditor()
+				.getJSON()
+				.content?.some((paragraph) => paragraph.content?.some((node) => node.type === "quote")),
+		).toBe(false);
+		await act(async () => handle.current?.appendText("new"));
+		const expected = `${text}\nnew`;
+		expect(handle.current?.getText()).toBe(expected);
+		expect(handle.current?.getFileReferences()).toEqual([]);
+		expect(readNarratorInputDraft("u1", "n1").text).toBe(expected);
+		const document = handle.current?.getDocument();
+		expect(document).toBeDefined();
+		if (!document) throw new Error("Missing restored composer document");
+		expect(parseComposerDocument(document)).toEqual(document);
+		expect(composerDocumentText(document)).toEqual({ text: expected, fileReferences: [] });
+		expect(
+			document.paragraphs.every((paragraph) =>
+				paragraph.children.every((node) => node.type === "text" || node.type === "break"),
+			),
+		).toBe(true);
+	});
+
+	test("appendText only excludes real quote atoms, not literal quote-looking text after them", async () => {
+		await render();
+		const literal = "> [quote] source\n>\n\nbody";
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "quote", id: "real-quote", label: "real", text: "actual" },
+						{ type: "text", text: literal },
+					],
+				},
+			],
+		};
+		const original = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(original.text, [], doc));
+		await act(async () => handle.current?.appendText("new"));
+		expect(handle.current?.getText()).toBe(`${original.text}\nnew`);
+		const restored = handle.current?.getDocument();
+		expect(restored?.paragraphs[0].children).toEqual([
+			doc.paragraphs[0].children[0],
+			{ type: "text", text: `${literal}\nnew` },
+		]);
+		expect(readNarratorInputDraft("u1", "n1").text).toBe(`${original.text}\nnew`);
+	});
+
 	test("metadata-only input is sendable and conflicts with a different remote target", async () => {
 		await render();
 		await act(async () => handle.current?.restoreInput("", [reference]));

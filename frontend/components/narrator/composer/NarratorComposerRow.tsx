@@ -304,7 +304,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 
 	const actions =
 		actionSlot === "taken-over" ? (
-			<Group gap="xs" align="end" wrap="nowrap">
+			<Group gap="xs" align="end" wrap="wrap" justify="flex-end">
 				{renderPrimaryActionButton()}
 				<Tooltip label={t("stopTakeoverHint")} position="top">
 					<Button

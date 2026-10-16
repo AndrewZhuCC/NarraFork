@@ -199,6 +199,13 @@ test("20 real message selections keep main composer geometry, message scroll and
 			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selectSource());
 			await page.waitForSelector("[data-inline-quote-candidate]", { visible: true });
 			const selected = await geometry(page);
+			expect(
+				await page.$eval(
+					"[data-inline-quote-candidate]",
+					(node) => !!node.closest('[data-inline-composer] [role="textbox"]'),
+				),
+			).toBe(true);
+			expect((await snapshot(page)).document).toBeUndefined();
 			expect(Math.abs(selected.rowTop - initial.rowTop)).toBeLessThanOrEqual(1);
 			expect(Math.abs(selected.rowHeight - initial.rowHeight)).toBeLessThanOrEqual(1);
 			expect(Math.abs(selected.messagesHeight - initial.messagesHeight)).toBeLessThanOrEqual(1);
@@ -811,3 +818,226 @@ test("touch-to-mouse dismiss does not move the close target during pointerdown",
 		await close(page);
 	}
 }, 15000);
+
+async function layoutSettled(page: Page) {
+	await settle(page);
+	await page.waitForFunction(() => {
+		const root = document.querySelector("[data-inline-composer]");
+		return !!root && !root.getAnimations().some((animation) => animation.playState === "running");
+	});
+}
+async function layoutSnapshot(page: Page) {
+	return page.evaluate(() => {
+		const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+		const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
+		if (!root || !textbox) throw new Error("Missing input");
+		return {
+			mode: root.dataset.layout,
+			height: root.getBoundingClientRect().height,
+			target: Number.parseFloat(root.style.height),
+			width: root.clientWidth,
+			scrollWidth: root.scrollWidth,
+			contentHeight:
+				root.querySelector("[data-composer-scroll]")?.getBoundingClientRect().height ?? 0,
+			placeholder: getComputedStyle(textbox, "::before").content,
+			focused: root.ownerDocument.activeElement === textbox,
+		};
+	});
+}
+const shortLayoutDocument: ComposerDocument = {
+	version: 1,
+	assets: [],
+	paragraphs: [{ children: [{ type: "text", text: "Short input" }] }],
+};
+const longLayoutDocument: ComposerDocument = {
+	version: 1,
+	assets: [],
+	paragraphs: [{ children: [{ type: "text", text: "long input ".repeat(200) }] }],
+};
+
+test("empty, short text and regular chips use a compact single line; long content expands", async () => {
+	const page = await open();
+	try {
+		await layoutSettled(page);
+		const empty = await layoutSnapshot(page);
+		expect(empty.mode).toBe("compact");
+		expect(empty.height).toBeLessThanOrEqual(54);
+		for (const doc of [
+			shortLayoutDocument,
+			{
+				...shortLayoutDocument,
+				paragraphs: [
+					{
+						children: [
+							{ type: "quote" as const, id: "regular-chip", label: "Source", text: "quoted" },
+						],
+					},
+				],
+			},
+		]) {
+			await page.evaluate((doc) => (window as unknown as FixtureWindow).fixture.load(doc), doc);
+			await layoutSettled(page);
+			const short = await layoutSnapshot(page);
+			expect(short.mode).toBe("compact");
+			expect(short.height).toBe(empty.height);
+			expect(short.placeholder).toBe("none");
+		}
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.load(doc),
+			longLayoutDocument,
+		);
+		await layoutSettled(page);
+		const long = await layoutSnapshot(page);
+		expect(long.mode).toBe("expanded");
+		expect(long.height).toBeGreaterThan(empty.height + 24);
+		expect(long.contentHeight).toBeLessThanOrEqual(200);
+		expect(long.scrollWidth).toBeLessThanOrEqual(long.width);
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.load(doc),
+			shortLayoutDocument,
+		);
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).height).toBe(empty.height);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("height transitions reverse in flight without remounting the editor or queuing stale targets", async () => {
+	const page = await open();
+	try {
+		await layoutSettled(page);
+		const compact = (await layoutSnapshot(page)).height;
+		await page.click('[role="textbox"]');
+		const result = await page.evaluate(
+			async ({ short, long }) => {
+				const fixture = (window as unknown as FixtureWindow).fixture;
+				const input = document.querySelector('[role="textbox"]');
+				const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+				if (!root) throw new Error("No input");
+				const frames: { time: number; height: number; target: number }[] = [];
+				for (let index = 0; index < 48; index++) {
+					if (index < 24 && index % 3 === 0) fixture.load(index % 6 === 0 ? long : short);
+					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+					frames.push({
+						time: performance.now(),
+						height: root.getBoundingClientRect().height,
+						target: Number.parseFloat(root.style.height),
+					});
+				}
+				return {
+					frames,
+					sameElement: input === document.querySelector('[role="textbox"]'),
+					focused: document.activeElement === input,
+				};
+			},
+			{ short: shortLayoutDocument, long: longLayoutDocument },
+		);
+		expect(result.sameElement).toBe(true);
+		expect(result.focused).toBe(true);
+		const max = Math.max(...result.frames.map((frame) => frame.target));
+		expect(max).toBeGreaterThan(compact + 24);
+		expect(
+			result.frames.some((frame) => frame.height > compact + 1 && frame.height < max - 1),
+		).toBe(true);
+		for (let index = 1; index < result.frames.length; index++) {
+			const current = result.frames[index];
+			const previous = result.frames[index - 1];
+			expect(current.height).toBeGreaterThanOrEqual(compact - 1);
+			expect(current.height).toBeLessThanOrEqual(max + 1);
+			// Account for missed frames on slow CI; detect an instantaneous full-height snap.
+			const allowed = (((max - compact) * (current.time - previous.time)) / 180) * 4 + 2;
+			expect(Math.abs(current.height - previous.height)).toBeLessThanOrEqual(allowed);
+		}
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).height).toBe(compact);
+		expect((await snapshot(page)).text).toBe("Short input");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("reduced motion and viewport changes settle to a valid layout without retaining inline fullscreen heights", async () => {
+	const page = await open();
+	try {
+		await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.load(doc),
+			longLayoutDocument,
+		);
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).mode).toBe("expanded");
+		expect(
+			await page.$eval(
+				"[data-inline-composer]",
+				(node) => getComputedStyle(node).transitionDuration,
+			),
+		).toBe("0s");
+		await page.setViewport({ width: 390, height: 700 });
+		await layoutSettled(page);
+		const narrow = await layoutSnapshot(page);
+		expect(narrow.scrollWidth).toBeLessThanOrEqual(narrow.width);
+		await page.setViewport({ width: 1000, height: 700 });
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.load(doc),
+			shortLayoutDocument,
+		);
+		await layoutSettled(page);
+		expect((await layoutSnapshot(page)).mode).toBe("compact");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test.each([
+	[390, 400, false],
+	[390, 500, false],
+	[390, 500, true],
+	[280, 500, true],
+])(
+	"short/narrow viewport reserves only visible content and keeps controls reachable (%s×%s, takeover=%s)",
+	async (width, height, takeover) => {
+		const page = await open();
+		try {
+			await page.setViewport({ width: Number(width), height: Number(height) });
+			await page.evaluate(
+				({ doc, takeover }) => {
+					(window as unknown as FixtureWindow).fixture.takeover(Boolean(takeover));
+					(window as unknown as FixtureWindow).fixture.load(doc);
+				},
+				{ doc: longLayoutDocument, takeover },
+			);
+			await layoutSettled(page);
+			const result = await page.$eval("[data-inline-composer]", (root) => {
+				const frame = root.getBoundingClientRect();
+				const content = root.querySelector("[data-composer-scroll]")?.getBoundingClientRect();
+				const controls = root.querySelector("[data-composer-controls]")?.getBoundingClientRect();
+				if (!content || !controls) throw new Error("Missing layout geometry");
+				return {
+					height: frame.height,
+					content: content.height,
+					controls: controls.height,
+					clipped: [...root.querySelectorAll("button")]
+						.filter((button) => {
+							const box = button.getBoundingClientRect();
+							return (
+								box.width > 0 &&
+								(box.left < frame.left ||
+									box.right > frame.right + 1 ||
+									box.bottom > frame.bottom + 1)
+							);
+						})
+						.map((button) => button.textContent || button.getAttribute("aria-label")),
+				};
+			});
+			expect(result.content).toBeLessThanOrEqual(Number(height) * 0.3 + 1);
+			expect(Math.abs(result.height - result.content - result.controls - 14)).toBeLessThanOrEqual(
+				1,
+			);
+			expect(result.clipped).toEqual([]);
+		} finally {
+			await close(page);
+		}
+	},
+	15_000,
+);

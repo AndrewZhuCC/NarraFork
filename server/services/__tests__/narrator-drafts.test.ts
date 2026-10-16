@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import { and, eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { migrateLegacyNarratorDraftTraits } from "../../db/migrate-narrator-drafts";
@@ -13,8 +14,13 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
-const { getNarratorDraft, getNarratorIdsWithDraft, narratorHasDraft, updateNarratorDraft } =
-	await import("../narrator-draft-service");
+const {
+	getNarratorDraft,
+	getNarratorDraftMetadata,
+	getNarratorIdsWithDraft,
+	narratorHasDraft,
+	updateNarratorDraft,
+} = await import("../narrator-draft-service");
 
 async function seedUser(id: string): Promise<void> {
 	await db.insert(users).values({
@@ -40,6 +46,170 @@ afterAll(() => {
 });
 
 describe("per-user narrator drafts", () => {
+	test.each([
+		"",
+		" \n\t",
+	])("empty rich drafts persist and return the same tombstone: %j", async (text) => {
+		await seedUser("rich-user");
+		await seedNarrator("rich-narrator");
+		const document: ComposerDocument = {
+			version: 1,
+			paragraphs: [{ children: text ? [{ type: "text", text }] : [] }],
+			assets: [],
+		};
+		const saved = await updateNarratorDraft(
+			"rich-user",
+			"rich-narrator",
+			text,
+			"tab",
+			0,
+			[],
+			document,
+		);
+		expect(saved).toMatchObject({
+			hasDraft: false,
+			text: "",
+			composerDocument: undefined,
+			revision: 1,
+			previousHasDraft: false,
+		});
+		if ("conflict" in saved) throw new Error("Unexpected draft conflict");
+		const { previousHasDraft: _previous, ...state } = saved;
+		expect(await getNarratorDraft("rich-user", "rich-narrator")).toEqual(state);
+		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toEqual({
+			hasDraft: false,
+			revision: 1,
+			updatedAt: state.updatedAt,
+		});
+		expect(await narratorHasDraft("rich-user", "rich-narrator")).toBe(false);
+		expect(await getNarratorIdsWithDraft("rich-user", ["rich-narrator"])).toEqual(new Set());
+		const row = await db.select().from(narratorDrafts).get();
+		expect(row?.composerDocument).toBeNull();
+		expect(row?.text).toBe("");
+	});
+
+	test("removing the last attachment clears layout in the response, storage and CAS conflicts", async () => {
+		await seedUser("rich-user");
+		await seedNarrator("rich-narrator");
+		const document: ComposerDocument = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "image" }] }],
+			assets: [{ id: "image", kind: "image", name: "image.png", size: 9, mimeType: "image/png" }],
+		};
+		await updateNarratorDraft("rich-user", "rich-narrator", "", "tab", 0, [], document);
+		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: true,
+		});
+		const cleared = await updateNarratorDraft("rich-user", "rich-narrator", "", undefined, 1, [], {
+			version: 1,
+			paragraphs: [{ children: [] }],
+			assets: [],
+		});
+		expect(cleared).toMatchObject({
+			hasDraft: false,
+			composerDocument: undefined,
+			revision: 2,
+			previousHasDraft: true,
+			sourceId: "tab",
+		});
+		expect(await getNarratorDraft("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: false,
+			composerDocument: undefined,
+			revision: 2,
+		});
+		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: false,
+		});
+		expect(await narratorHasDraft("rich-user", "rich-narrator")).toBe(false);
+		expect(await getNarratorIdsWithDraft("rich-user", ["rich-narrator"])).toEqual(new Set());
+		expect(
+			await updateNarratorDraft("rich-user", "rich-narrator", "stale", "tab", 1),
+		).toMatchObject({
+			conflict: true,
+			current: { hasDraft: false, composerDocument: undefined, revision: 2 },
+		});
+		expect((await db.select().from(narratorDrafts).get())?.composerDocument).toBeNull();
+	});
+
+	test.each([
+		{},
+		{ version: 99, paragraphs: [], assets: [] },
+		{ version: 1, paragraphs: [], assets: { length: 1 } },
+		{ version: 1, paragraphs: [], assets: [{ id: "invalid" }] },
+	])("empty historical drafts tolerate invalid document JSON: %j", async (historical) => {
+		await seedUser("rich-user");
+		await seedNarrator("rich-narrator");
+		await updateNarratorDraft("rich-user", "rich-narrator", "", "tab", 0);
+		sqlite.run("UPDATE narrator_drafts SET composer_document = ?", [JSON.stringify(historical)]);
+		expect(await getNarratorDraft("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: false,
+			composerDocument: undefined,
+			text: "",
+			revision: 1,
+		});
+		// Metadata remains a cheap SQL presence summary, without decoding historical JSON.
+		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: true,
+		});
+		expect(await updateNarratorDraft("rich-user", "rich-narrator", "", undefined, 1)).toMatchObject(
+			{
+				hasDraft: false,
+				composerDocument: undefined,
+				previousHasDraft: false,
+				revision: 2,
+			},
+		);
+		expect(await getNarratorDraftMetadata("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: false,
+		});
+	});
+
+	test("legacy saves keep matching file references while clearing rich layout", async () => {
+		await seedUser("rich-user");
+		await seedNarrator("rich-narrator");
+		const reference = {
+			id: "ref",
+			deviceId: "local",
+			path: "/a.ts",
+			label: "a.ts",
+			inputRange: [0, 10] as [number, number],
+		};
+		const document: ComposerDocument = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "fileReference", id: "node", reference }] }],
+			assets: [],
+		};
+		await updateNarratorDraft(
+			"rich-user",
+			"rich-narrator",
+			"#file:a.ts",
+			"tab",
+			0,
+			[reference],
+			document,
+		);
+		const saved = await updateNarratorDraft(
+			"rich-user",
+			"rich-narrator",
+			"#file:a.ts",
+			undefined,
+			1,
+		);
+		expect(saved).toMatchObject({
+			hasDraft: true,
+			composerDocument: undefined,
+			fileReferences: [reference],
+			revision: 2,
+			sourceId: "tab",
+		});
+		expect(await getNarratorDraft("rich-user", "rich-narrator")).toMatchObject({
+			hasDraft: true,
+			composerDocument: undefined,
+			fileReferences: [reference],
+			revision: 2,
+		});
+	});
+
 	test("rich layout participates in CAS, missing blobs remain visible and legacy saves clear layout", async () => {
 		await seedUser("rich-user");
 		await seedNarrator("rich-narrator");
