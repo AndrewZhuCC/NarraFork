@@ -1019,7 +1019,7 @@
 	"branchRenamed": "分支已重命名",
 	"contextMenu_branch": "从此处创建对话分支",
 	"contextMenu_fork": "从此处分叉",
-	"contextMenu_compactBefore": "压缩到此",
+	"contextMenu_compactBefore": "压缩此前的内容",
 	"contextMenu_clearContextBefore": "清空到此",
 	"contextMenu_manualSummarize": "手动总结",
 	"contextMenu_fullscreen": "全屏展示",
