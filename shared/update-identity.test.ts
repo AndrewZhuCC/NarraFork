@@ -1,11 +1,42 @@
 import { expect, test } from "bun:test";
 import {
+	CURRENT_RECOVERY_MANIFEST_VERSIONS,
 	isLegacyMirrorSourceIdentity,
+	parseRecoveryManifestVersions,
 	parseUpdateSourceIdentity,
 	preparedMatchesRelease,
 	sameUpdateSourceIdentity,
 	type UpdateSourceIdentity,
 } from "./update-identity";
+
+test("recovery capabilities are bounded, unique, canonical and never guessed from future versions", () => {
+	expect(CURRENT_RECOVERY_MANIFEST_VERSIONS).toEqual([1, 2, 3]);
+	expect(parseRecoveryManifestVersions(undefined)).toEqual([1, 2]);
+	expect(parseRecoveryManifestVersions([3, 1, 2])).toEqual([1, 2, 3]);
+	expect(parseRecoveryManifestVersions([1, 2, 4])).not.toContain(3);
+	const versions = [1, 2, 3];
+	const parsed = parseRecoveryManifestVersions(versions);
+	versions.pop();
+	expect(parsed).toEqual([1, 2, 3]);
+	for (const invalid of [
+		null,
+		"3",
+		{},
+		[],
+		[0],
+		[-1],
+		[1.5],
+		["3"],
+		[NaN],
+		[Infinity],
+		[256],
+		[1, 2, 3, 3],
+		Array.from({ length: 33 }, (_, index) => index + 1),
+		new Array(2),
+	]) {
+		expect(() => parseRecoveryManifestVersions(invalid)).toThrow("recoveryManifestVersions");
+	}
+});
 
 const mirror: UpdateSourceIdentity = {
 	source: "update-server",
@@ -63,4 +94,23 @@ test("same-version prepared binary cannot adopt another repository's recommendat
 		}),
 	).toBe(false);
 	expect(preparedMatchesRelease({ ...prepared, sourceIdentity: null }, release)).toBe(false);
+	for (const changed of [
+		{ sha512: "changed" },
+		{ files: [{ size: 65 }] },
+		{ recoveryManifestVersions: [1, 2, 3] },
+	]) {
+		expect(preparedMatchesRelease(prepared, { ...release, ...changed })).toBe(false);
+	}
+	expect(preparedMatchesRelease(prepared, { ...release, recoveryManifestVersions: [2, 1] })).toBe(
+		true,
+	);
+	expect(
+		preparedMatchesRelease(
+			{ ...prepared, recoveryManifestVersions: [1, 2, 3] },
+			{ ...release, recoveryManifestVersions: [3, 2, 1] },
+		),
+	).toBe(true);
+	expect(preparedMatchesRelease({ ...prepared, recoveryManifestVersions: [3, 3] }, release)).toBe(
+		false,
+	);
 });

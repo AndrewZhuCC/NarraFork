@@ -360,6 +360,7 @@ import {
 	recoverStaleCompactingMessages,
 } from "./narrator-persistence";
 import { ensureNarratorPlanFileId } from "./narrator-plan-mode";
+import { invalidateRecoveryTarget } from "./recovery-handoff";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
 // Defined next to the snapshot hooks so both loops agree on the set.
@@ -7221,6 +7222,7 @@ export function abortActiveNarratorLoopForPlannedUpdateRecovery(
 }
 
 export function interruptNarrator(narratorId: string): boolean {
+	invalidateRecoveryTarget(narratorId);
 	// Persist before aborting: the finalizer and answer wake may race this call.
 	db.update(narrators)
 		.set({ lastStopReason: "user_interrupt" })

@@ -12,7 +12,8 @@ import {
 	UpdateCancelledError,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
-	writePlannedUpdateRecoverySnapshot,
+	waitForScheduledRecoveryHandoff,
+	writePreparedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 import { checkpointPreparedUpdateFence, failPreparedUpdateAttempt } from "./update-service";
 
@@ -22,6 +23,8 @@ export const systemLifecycle = hotSafe("systemLifecycle", () =>
 		canShutdown: canOperatorShutdown,
 		schedule: () => scheduleUpdate(undefined, "system_shutdown"),
 		drain: async (epoch) => {
+			await waitForScheduledRecoveryHandoff();
+			assertUpdateNotCancelled();
 			await waitForBackgroundBashDrain();
 			assertUpdateNotCancelled();
 			beginQuiescingTools();
@@ -29,7 +32,7 @@ export const systemLifecycle = hotSafe("systemLifecycle", () =>
 			return checkpointPreparedUpdateFence(epoch);
 		},
 		persist: (snapshot) => {
-			writePlannedUpdateRecoverySnapshot(snapshot, { expectedEpoch: snapshot.updateEpoch });
+			writePreparedUpdateRecoverySnapshot(snapshot, { expectedEpoch: snapshot.updateEpoch });
 		},
 		assertNotCancelled: assertUpdateNotCancelled,
 		markClosing: markUpdateRestarting,

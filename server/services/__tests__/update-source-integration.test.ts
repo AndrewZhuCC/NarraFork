@@ -47,6 +47,8 @@ const metadata = JSON.stringify({
 	size: payload.length,
 	sha512,
 	sha256: createHash("sha256").update(payload).digest("hex"),
+	commit: "a".repeat(40),
+	recoveryManifestVersions: [1, 2, 3],
 });
 const release = {
 	tag_name: `v${version}`,
@@ -219,20 +221,34 @@ describe("selected update source integration", () => {
 		};
 		const identity = getCurrentUpdateSourceIdentity();
 		installFetch((url) => {
+			if (url === sidecarUrl) return new Response(metadata);
 			expect(url).toStartWith(`${serverUrl}/api/v3/products/private-product/mirror/`);
 			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
 		});
 		const checked = await checkForUpdate({ force: true });
 		expect(checked.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
-		expect(requestOptions[0]?.proxy).toBe("http://global.proxy-fixture.example:8080/");
-		if (!checked.releaseInfo) throw new Error("Expected legacy update descriptor");
+		expect(checked.releaseInfo?.recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(requestOptions).toHaveLength(3);
+		expect(
+			requestOptions.every(
+				(options) => options.proxy === "http://global.proxy-fixture.example:8080/",
+			),
+		).toBe(true);
+		if (!checked.releaseInfo) throw new Error("Expected canonical update descriptor");
+		const inheritedRequestCount = requestOptions.length;
 		settings.update.proxy = { mode: "custom", url: "http://dedicated.proxy-fixture.example:3128" };
 		const after = await checkForUpdate({ force: true });
-		expect(requestOptions[2]?.proxy).toBe("http://dedicated.proxy-fixture.example:3128/");
+		expect(requestOptions).toHaveLength(inheritedRequestCount + 3);
+		expect(
+			requestOptions
+				.slice(inheritedRequestCount)
+				.every((options) => options.proxy === "http://dedicated.proxy-fixture.example:3128/"),
+		).toBe(true);
 		expect(after.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
 		expect(getCurrentUpdateSourceIdentity()).toEqual(identity);
 		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(true);
-		expect(requested.every((url) => url.startsWith(serverUrl))).toBe(true);
+		expect(requested.every((url) => url.startsWith(serverUrl) || url === sidecarUrl)).toBe(true);
+		expect(requested.filter((url) => url === sidecarUrl)).toHaveLength(2);
 	});
 
 	test("beta-to-stable change during forced GitHub detection refuses the captured result", async () => {
@@ -271,13 +287,16 @@ describe("selected update source integration", () => {
 		};
 		const update = settings.update;
 		installFetch((url) => {
+			if (url === sidecarUrl) return new Response(metadata);
 			expect(url).toStartWith(`${serverUrl}/api/v3/products/first/mirror/`);
 			if (field === "product") update.product = "second";
 			else update.channel = "beta";
 			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
 		});
 		const checked = await checkForUpdate({ force: true });
-		if (!checked.releaseInfo) throw new Error("Missing checked legacy release");
+		if (!checked.releaseInfo) throw new Error("Missing checked canonical release");
+		expect(checked.releaseInfo.recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(requested.filter((url) => url === sidecarUrl)).toHaveLength(1);
 		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(false);
 		const before = [...requested];
 		expect((await downloadUpdate(checked.releaseInfo)).success).toBe(false);
@@ -439,24 +458,45 @@ describe("selected update source integration", () => {
 		expect(requested).toEqual([]);
 		expectNoTemporaryArtifacts();
 	});
-	test("canonical mirror selects full from the configured repo without fetching GitHub metadata", async () => {
+	test("canonical mirror selects full with only its trusted GitHub sidecar through frozen transport", async () => {
 		const serverUrl = "https://updates.integration.example";
 		settings.update = {
 			...selectGithub(),
 			source: "update-server",
 			serverUrl,
 			product: "custom-product",
+			proxy: { mode: "custom", url: "http://frozen.proxy-fixture.example:8080" },
 		};
+		const update = settings.update;
 		installFetch((url) => {
+			if (url === sidecarUrl) return new Response(metadata);
 			expect(url).toStartWith(`${serverUrl}/api/v3/products/custom-product/mirror/`);
-			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
+			if (url.endsWith("/index")) {
+				// The remaining requests must retain this check's captured transport.
+				update.proxy = {
+					mode: "custom",
+					url: "http://changed.proxy-fixture.example:3128",
+				};
+				return Response.json(mirrorIndex());
+			}
+			return emptyAvailability();
 		});
 		const result = await checkForUpdate();
 		expect(result.source).toBe("update-server");
 		expect(result.repository).toBe(repository);
 		expect(result.strategy).toBe("full");
 		expect(result.releaseInfo?._github?.downloadUrl).toBe(binaryUrl);
-		expect(requested.some((url) => url.includes("github"))).toBe(false);
+		expect(result.releaseInfo?.recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(requested.filter((url) => !url.startsWith(serverUrl))).toEqual([sidecarUrl]);
+		expect(requested).not.toContain(binaryUrl);
+		expect(requested.some((url) => url.startsWith("https://api.github.com/"))).toBe(false);
+		expect(requestOptions).toHaveLength(3);
+		expect(
+			requestOptions.every(
+				(options) => options.proxy === "http://frozen.proxy-fixture.example:8080/",
+			),
+		).toBe(true);
+		expect(requestOptions[1]?.redirect).toBe("manual");
 		if (!result.releaseInfo) throw new Error("Missing canonical descriptor");
 		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(true);
 		settings.update.serverUrl = "https://other.integration.example";

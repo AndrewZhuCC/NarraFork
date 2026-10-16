@@ -125,6 +125,7 @@ import {
 	type VerifiedPublicShare,
 	verifyPublicShare,
 } from "./services/public-narrator-share-service";
+import { beginRecoveryDiscovery, finishRecoveryDiscovery } from "./services/recovery-handoff";
 import {
 	automaticResumeEnabled,
 	mergeStartupProtection,
@@ -150,6 +151,10 @@ import {
 	waitForWebSocketActivityDrain,
 	wsHandlers,
 } from "./websocket/ws-handler";
+
+// Startup ownership must be classified before a new shutdown/update may allocate
+// an epoch. This is separate from long-running recovery terminal completion.
+beginRecoveryDiscovery();
 
 // Builtin/compatible-API providers are resolved first. Only an unregistered plugin
 // prefix may decline here; preserve registered providers' actual failure reasons.
@@ -1481,6 +1486,9 @@ getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled()
 					error: err instanceof Error ? err.message : String(err),
 				});
 			});
+		// All sources are now registered. New preparation can reserve them without
+		// waiting for an Agent, Await, or human approval to finish (or even mount).
+		finishRecoveryDiscovery();
 		const recoveryHandles = automaticResumeEnabled()
 			? await Promise.all([
 					restoreNarratorsAfterPlannedUpdate(plannedUpdate),

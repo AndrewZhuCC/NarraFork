@@ -13,6 +13,7 @@ import { Worker } from "node:worker_threads";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import type { LocalizedValue } from "../shared/i18n-locales";
+import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
@@ -501,6 +502,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 				commit: commitHash,
 				repository: BUILD_REPOSITORY,
 				helperDistribution: HELPER_DISTRIBUTION,
+				recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 				releaseCi,
 			},
 		});
@@ -525,6 +527,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 								commit: commitHash,
 								repository: BUILD_REPOSITORY,
 								helperDistribution: HELPER_DISTRIBUTION,
+								recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 							});
 						} catch (error) {
 							reject(error);
@@ -569,6 +572,7 @@ if (releaseCi) {
 			commit: commitHash,
 			repository: BUILD_REPOSITORY,
 			helperDistribution: HELPER_DISTRIBUTION,
+			recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 		});
 		const reported = results[index].metadata;
 		if (

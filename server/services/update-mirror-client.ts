@@ -16,7 +16,11 @@ import {
 	readUpdateJson,
 	type UpdateFetchContext,
 } from "../lib/net/update-fetch";
-import { GithubUpdateError, validateGithubAssetUrl } from "./github-release-update";
+import {
+	GithubUpdateError,
+	readIndexedGithubBinaryMetadata,
+	validateGithubAssetUrl,
+} from "./github-release-update";
 import type { ReleaseInfo, UpdateCheckResult } from "./update-service";
 
 function mirrorBase(identity: Extract<UpdateSourceIdentity, { source: "update-server" }>) {
@@ -70,6 +74,16 @@ export async function checkMirrorUpdate(
 		`https://github.com/${identity.repository}/releases/download/${target.tag}/${name}`;
 	const fullUrl = assetUrl(file.name);
 	validateGithubAssetUrl(fullUrl, identity.repository, target.version, file.name);
+	// Capability evidence comes from the selected GitHub binary's raw sidecar, not mirror hints.
+	const { recoveryManifestVersions } = await readIndexedGithubBinaryMetadata(
+		{
+			repository: identity.repository,
+			version: target.version,
+			commit: target.commit,
+			binary: file,
+		},
+		{ signal, fetcher: transport.fetch },
+	);
 	const release: ReleaseInfo = {
 		source: "update-server",
 		repository: identity.repository,
@@ -78,6 +92,7 @@ export async function checkMirrorUpdate(
 		releaseDate: target.publishedAt,
 		path: file.name,
 		sha512: file.sha512,
+		recoveryManifestVersions,
 		files: [{ url: file.name, size: file.size, sha512: file.sha512 }],
 		notesDeferred: true,
 		notesAvailable: !!target.notes,
