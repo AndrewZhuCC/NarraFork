@@ -532,6 +532,21 @@ export function canWriteMain(caps: PrincipalCaps, entry: AclEntry): boolean {
 }
 
 /**
+ * The entry-link management authority on the SOURCE side — `POST /entries/:id/links` (this entry
+ * as `from`) and `DELETE /links/:id` (the link's `from` entry). Today it is read access (design
+ * §6.5's "source writable" is deliberately relaxed, see knowledge-link-service `addLink`); the
+ * target of a new link must additionally be readable. Shared with `viewerCaps.canManageLinks`
+ * so tightening it later moves the UI and the endpoints together.
+ */
+export function canManageEntryLinks(
+	caps: PrincipalCaps,
+	entry: AclEntry,
+	collection: AclCollection,
+): Promise<boolean> {
+	return canRead(caps, entry, collection);
+}
+
+/**
  * The DIRECT-WRITE (append a main revision) authority used by `addRevision`: entry-level write
  * (admin / entry owner / write grant via {@link canWriteMain}) OR collection write (adds the
  * collection owner). Callers must run the collection read gate first. Shared with

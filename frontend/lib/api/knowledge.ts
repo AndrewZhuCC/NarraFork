@@ -12,6 +12,8 @@ import type {
 	KnowledgeEntryDetail,
 	KnowledgeEntryLink,
 	KnowledgeEntryPage,
+	KnowledgeEntrySort,
+	KnowledgeEntryStatus,
 	KnowledgeFinding,
 	KnowledgeGrant,
 	KnowledgeGraph,
@@ -124,7 +126,16 @@ export const knowledgeApi = {
 		request<KnowledgeSearchResult[] | KnowledgeEntry[]>(`/knowledge/entries${qs(opts)}`),
 	/** Keyset-paginated entry list; follow `nextCursor` until null. */
 	listKnowledgeEntriesPage: (
-		opts: { collectionId?: string; tag?: string; q?: string; cursor?: string; limit?: number } = {},
+		opts: {
+			collectionId?: string;
+			tag?: string;
+			q?: string;
+			level?: string;
+			status?: KnowledgeEntryStatus;
+			sort?: KnowledgeEntrySort;
+			cursor?: string;
+			limit?: number;
+		} = {},
 	) =>
 		request<KnowledgeEntryPage>(
 			`/knowledge/entries${qs({

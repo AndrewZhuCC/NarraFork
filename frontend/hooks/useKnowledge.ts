@@ -67,7 +67,7 @@ export function useKnowledgeEntries(opts: { collectionId?: string; tag?: string;
  * single page (`nextCursor: null`).
  */
 export function useKnowledgeEntriesPaged(
-	opts: { collectionId?: string; tag?: string; q?: string; limit?: number },
+	opts: Omit<Parameters<typeof api.listKnowledgeEntriesPage>[0] & object, "cursor">,
 	queryOpts: { enabled?: boolean } = {},
 ) {
 	return useInfiniteQuery({

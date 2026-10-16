@@ -35,7 +35,7 @@ export function EntryMetaPanel({ entry }: { entry: KnowledgeEntry }) {
 
 	return (
 		<Stack gap="sm">
-			{/* The surrounding card owns the "metaSettings" heading; only the description here. */}
+			{/* The surrounding settings card owns the heading; only the description here. */}
 			<Text size="xs" c="dimmed">
 				{t("metaDesc")}
 			</Text>

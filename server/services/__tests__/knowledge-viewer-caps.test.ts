@@ -20,6 +20,7 @@ import { generateId } from "../../lib/id";
 import { knowledgeRoutes } from "../../routes/knowledge";
 import { knowledgeAcl, type Principal } from "../knowledge-acl";
 import { knowledgeBranchService } from "../knowledge-branch-service";
+import { knowledgeLinkService } from "../knowledge-link-service";
 import { knowledgeService } from "../knowledge-service";
 
 const TAG = `vc-${Date.now()}`;
@@ -144,6 +145,7 @@ async function entryCapsVia(role: Role, entryId: string) {
 			canTransferOwner: boolean;
 			canDelete: boolean;
 			canReview: boolean;
+			canManageLinks: boolean;
 			myPersonalEntryId: string | null;
 		};
 	};
@@ -240,6 +242,41 @@ describe("entry viewerCaps ⇔ write paths", () => {
 			expect((await entryCapsVia(role, fReview.entryId)).canReview).toBe(
 				await accepts(() => knowledgeBranchService.review(p, sub.id, { verdict: "comment_only" })),
 			);
+
+			// Links: add from this entry to a readable sibling; remove a link whose source is this
+			// entry (the per-link `canRemove` of GET /entries/:id/links must agree too).
+			const fLink = await makeFixture();
+			const target = await knowledgeService.createEntry({
+				collectionId: fLink.collectionId,
+				title: `${TAG}-target-${generateId(4)}`,
+				content: "t\n",
+			});
+			expect((await entryCapsVia(role, fLink.entryId)).canManageLinks).toBe(
+				await accepts(() =>
+					knowledgeLinkService.addLink(p, {
+						fromEntryId: fLink.entryId,
+						toEntryId: target.id,
+						linkType: "related",
+					}),
+				),
+			);
+			const fUnlink = await makeFixture();
+			const target2 = await knowledgeService.createEntry({
+				collectionId: fUnlink.collectionId,
+				title: `${TAG}-target-${generateId(4)}`,
+				content: "t\n",
+			});
+			const link = await knowledgeLinkService.addLink(principalFor("admin"), {
+				fromEntryId: fUnlink.entryId,
+				toEntryId: target2.id,
+				linkType: "expands",
+			});
+			const listed = await knowledgeLinkService.listLinks(p, target2.id, "in");
+			const canRemove = listed.find((l) => l.id === link.id)?.canRemove;
+			const capsUnlink = await entryCapsVia(role, fUnlink.entryId);
+			const removed = await accepts(() => knowledgeLinkService.removeLink(p, link.id));
+			expect(capsUnlink.canManageLinks).toBe(removed);
+			expect(canRemove).toBe(removed);
 		});
 	}
 

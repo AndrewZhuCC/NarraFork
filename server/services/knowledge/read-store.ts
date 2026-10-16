@@ -78,12 +78,39 @@ export interface KnowledgeEntryGraphRow extends KnowledgeEntryAclRow {
 	slug: string;
 }
 
-/** The list-view projection: everything a listing renders, never the content blob. */
 /** Keyset position in the (updatedAt DESC, id DESC) entry list order. */
 export interface KnowledgeEntryListCursor {
 	updatedAt: string;
 	id: string;
 }
+
+/** Keyset position in the (title ASC, id ASC) entry list order. */
+export interface KnowledgeEntryTitleCursor {
+	title: string;
+	id: string;
+}
+
+/**
+ * Entry list order + its keyset position. `updated` = (updatedAt DESC, id DESC) — the default
+ * and the only order before `sort` existed; `title` = (title ASC, id ASC), compared with the
+ * column's own collation on each engine (binary in SQLite, the database collation in PG), so the
+ * keyset predicate and the ORDER BY always agree within one backend.
+ */
+export type KnowledgeEntryListOrder =
+	| { sort: "updated"; after?: KnowledgeEntryListCursor }
+	| { sort: "title"; after?: KnowledgeEntryTitleCursor };
+
+/**
+ * SQL-side list filters. `level` matches the EFFECTIVE classification — the entry's own level,
+ * or (when it has none) its collection's `defaultLevel` — the same value the read gate ranks.
+ */
+export interface KnowledgeEntryListFilter {
+	collectionId?: string;
+	level?: string;
+	status?: "active" | "archived";
+}
+
+/** The list-view projection: everything a listing renders, never the content blob. */
 
 export interface KnowledgeEntryListRow {
 	id: string;
@@ -270,6 +297,13 @@ export interface KnowledgeReadStore {
 		limit: number;
 		after?: KnowledgeEntryListCursor;
 	}): Promise<KnowledgeEntryListRow[]>;
+	/**
+	 * {@link listEntries} with an explicit order and SQL-side filters (the paginated browse list).
+	 * Same projection; bounded by `limit`; rows strictly after `order.after` in that order.
+	 */
+	listEntriesOrdered(
+		opts: KnowledgeEntryListFilter & { limit: number; order: KnowledgeEntryListOrder },
+	): Promise<KnowledgeEntryListRow[]>;
 	/** The slug pre-check before an entry insert. Only the id crosses back. */
 	findEntryBySlug(collectionId: string, slug: string): Promise<{ id: string } | null>;
 
@@ -309,6 +343,8 @@ export interface KnowledgeReadStore {
 	userExists(userId: string): Promise<boolean>;
 	getUserRoleById(userId: string): Promise<{ id: string; role: string } | null>;
 	getUsernameById(userId: string): Promise<{ username: string } | null>;
+	/** Batch: usernames of the given ids (display only; one `IN` lookup bounded by the caller). */
+	listUsernamesByIds(userIds: string[]): Promise<{ id: string; username: string }[]>;
 	/** Bounded user listing for batch cap resolution / role-scoped notify fan-out. */
 	listUserIdsAndRoles(opts: {
 		role?: string;
@@ -373,6 +409,12 @@ export interface KnowledgeReadStore {
 	/** The id of `authorUserId`'s ACTIVE personal version of this entry, or null. One lookup on
 	 *  the (entry_id, author_user_id) index — powers `viewerCaps.myPersonalEntryId`. */
 	findActivePersonalEntryId(entryId: string, authorUserId: string): Promise<string | null>;
+	/** Batch form for a list page: `authorUserId`'s ACTIVE personal versions of the given entries
+	 *  (one `IN` lookup on the same index; the caller bounds `entryIds` by its page size). */
+	listActivePersonalEntriesForEntries(
+		entryIds: string[],
+		authorUserId: string,
+	): Promise<{ id: string; entryId: string; baseRevisionId: string | null }[]>;
 
 	// ── audit read ──
 	/**

@@ -6,8 +6,10 @@ import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type {
 	KnowledgeEntryListCursor,
+	KnowledgeEntryListOrder,
 	KnowledgeEntryListRow,
 	KnowledgeEntryRow,
+	KnowledgeEntryTitleCursor,
 } from "./knowledge/read-store";
 import {
 	knowledgeReadStore,
@@ -20,6 +22,7 @@ import {
 	type AclEntry,
 	canAdministerKnowledgeAcl,
 	canDirectWriteEntry,
+	canManageEntryLinks,
 	canRead,
 	canReadCollection,
 	canReview,
@@ -471,51 +474,96 @@ export const ENTRY_PAGE_MAX_LIMIT = LIST_MAX_LIMIT;
  */
 export const ENTRY_PAGE_MAX_SCAN_ROWS = 1000;
 
+/**
+ * Longest accepted cursor. A title cursor carries the title itself (≤ 500 chars, up to 3 UTF-8
+ * bytes each), so the bound is well above that; anything longer is rejected before decoding.
+ */
+export const ENTRY_CURSOR_MAX_LENGTH = 4096;
+
+/** Orders of the paginated entry list (`GET /entries?sort=`). */
+export type EntryListSort = "updated" | "title";
+
 /** Opaque cursor: base64url(JSON [updatedAt, id]) of the last position consumed. */
 export function encodeEntryCursor(pos: KnowledgeEntryListCursor): string {
 	return Buffer.from(JSON.stringify([pos.updatedAt, pos.id]), "utf8").toString("base64url");
 }
 
-export function decodeEntryCursor(raw: string): KnowledgeEntryListCursor {
+/** Opaque title-order cursor: base64url(JSON ["title", title, id]); never valid as the other. */
+export function encodeTitleCursor(pos: KnowledgeEntryTitleCursor): string {
+	return Buffer.from(JSON.stringify(["title", pos.title, pos.id]), "utf8").toString("base64url");
+}
+
+function decodeCursorTuple(raw: string): string[] | null {
 	try {
-		if (raw.length > 512) throw new Error("too long");
+		if (raw.length > ENTRY_CURSOR_MAX_LENGTH) return null;
 		const v: unknown = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
-		if (
-			Array.isArray(v) &&
-			v.length === 2 &&
-			typeof v[0] === "string" &&
-			typeof v[1] === "string" &&
-			v[0] &&
-			v[1]
-		) {
-			return { updatedAt: v[0], id: v[1] };
-		}
+		if (!Array.isArray(v) || !v.every((x) => typeof x === "string" && x)) return null;
+		return v as string[];
 	} catch {
-		// fall through
+		return null;
 	}
+}
+
+export function decodeEntryCursor(raw: string): KnowledgeEntryListCursor {
+	const v = decodeCursorTuple(raw);
+	if (v?.length === 2) return { updatedAt: v[0] as string, id: v[1] as string };
 	throw new ValidationError("Invalid cursor");
+}
+
+export function decodeTitleCursor(raw: string): KnowledgeEntryTitleCursor {
+	const v = decodeCursorTuple(raw);
+	if (v?.length === 3 && v[0] === "title") return { title: v[1] as string, id: v[2] as string };
+	throw new ValidationError("Invalid cursor");
+}
+
+/** The keyset order for `sort`, positioned after `cursor` (a cursor of the other order → 400). */
+function entryListOrder(sort: EntryListSort, cursor: string | undefined): KnowledgeEntryListOrder {
+	if (sort === "title") return cursor ? { sort, after: decodeTitleCursor(cursor) } : { sort };
+	return cursor ? { sort, after: decodeEntryCursor(cursor) } : { sort };
+}
+
+/** The keyset position just after `row` in `sort` order. */
+function entryListPosition(
+	sort: EntryListSort,
+	row: KnowledgeEntryListRow,
+): KnowledgeEntryListOrder {
+	return sort === "title"
+		? { sort, after: { title: row.title, id: row.id } }
+		: { sort, after: { updatedAt: row.updatedAt, id: row.id } };
+}
+
+function encodeEntryListPosition(order: KnowledgeEntryListOrder): string | null {
+	if (!order.after) return null;
+	return order.sort === "title" ? encodeTitleCursor(order.after) : encodeEntryCursor(order.after);
 }
 
 /**
  * Keyset-paginated entry list, post-filtered by tag and by the principal's read ACL.
  *
- * Order is (updatedAt DESC, id DESC). Because the ACL (and tag) filter runs after the DB
- * read, a raw batch can come back short; this keeps reading further batches until `limit`
- * readable rows are collected, the source is exhausted, or ENTRY_PAGE_MAX_SCAN_ROWS raw
- * rows were scanned. `nextCursor` resumes strictly after the last row this call consumed
- * (the last emitted row when the page filled, otherwise the last scanned row), so pages
- * never duplicate or skip rows. `nextCursor` is null only when the source is exhausted.
+ * Order is `sort`: `updated` = (updatedAt DESC, id DESC) (default), `title` = (title ASC,
+ * id ASC). `level` (effective level) and `status` filter in SQL; `tag` and the read ACL
+ * post-filter. Because the post-filters run after the DB read, a raw batch can come back
+ * short; this keeps reading further batches until `limit` readable rows are collected, the
+ * source is exhausted, or ENTRY_PAGE_MAX_SCAN_ROWS raw rows were scanned. `nextCursor`
+ * resumes strictly after the last row this call consumed (the last emitted row when the page
+ * filled, otherwise the last scanned row), so pages never duplicate or skip rows. `nextCursor`
+ * is null only when the source is exhausted. A cursor is bound to its order: one minted under
+ * the other `sort` is a 400, never a silently wrong page.
  */
 async function listEntriesPage(opts: {
 	principal: Principal | undefined;
 	collectionId?: string;
 	tag?: string;
+	level?: string;
+	status?: "active" | "archived";
+	sort?: EntryListSort;
 	limit?: number;
 	cursor?: string;
 }): Promise<{ items: KnowledgeEntryListRow[]; nextCursor: string | null }> {
 	const requested = Math.floor(opts.limit ?? ENTRY_PAGE_DEFAULT_LIMIT);
 	const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : 1, 1), LIST_MAX_LIMIT);
-	let after = opts.cursor ? decodeEntryCursor(opts.cursor) : undefined;
+	const sort = opts.sort ?? "updated";
+	let order = entryListOrder(sort, opts.cursor);
 	// limit + 1 so an unfiltered (admin) page knows whether more exist without a 2nd query.
 	const batchSize = Math.min(LIST_MAX_LIMIT, Math.max(limit + 1, 50));
 	// Resolve caps once; every batch reuses them.
@@ -526,10 +574,12 @@ async function listEntriesPage(opts: {
 	let scanned = 0;
 	while (scanned < ENTRY_PAGE_MAX_SCAN_ROWS) {
 		const want = Math.min(batchSize, ENTRY_PAGE_MAX_SCAN_ROWS - scanned);
-		const batch = await knowledgeReadStore.listEntries({
+		const batch = await knowledgeReadStore.listEntriesOrdered({
 			...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
+			...(opts.level ? { level: opts.level } : {}),
+			...(opts.status ? { status: opts.status } : {}),
 			limit: want,
-			...(after ? { after } : {}),
+			order,
 		});
 		scanned += batch.length;
 		const exhausted = batch.length < want;
@@ -545,16 +595,112 @@ async function listEntriesPage(opts: {
 				const more = i < readable.length - 1 || !exhausted;
 				return {
 					items,
-					nextCursor: more ? encodeEntryCursor({ updatedAt: row.updatedAt, id: row.id }) : null,
+					nextCursor: more ? encodeEntryListPosition(entryListPosition(sort, row)) : null,
 				};
 			}
 		}
 		const last = batch[batch.length - 1];
 		if (exhausted || !last) return { items, nextCursor: null };
-		after = { updatedAt: last.updatedAt, id: last.id };
+		order = entryListPosition(sort, last);
 	}
 	// Scan budget spent: return what we have and resume after the last scanned row.
-	return { items, nextCursor: after ? encodeEntryCursor(after) : null };
+	return { items, nextCursor: encodeEntryListPosition(order) };
+}
+
+/** Display + "my version" annotations of a browse-list row (§5.1). */
+export interface EntryListAnnotations {
+	ownerUsername: string | null;
+	/** The caller's ACTIVE personal version of this entry, if any. */
+	myPersonalEntryId: string | null;
+	/** That personal version forked from an older main revision (the same drift rule as "My"). */
+	myPersonalEntryBehindMain: boolean;
+}
+
+/**
+ * Annotate one page of already-readable list rows for the browse UI: owner usernames and the
+ * caller's own personal versions. Two `IN` lookups bounded by the page (no per-row query);
+ * nothing here widens what the rows already disclose (owner ids are on the row, drafts are the
+ * caller's own).
+ */
+async function annotateEntryRows<
+	T extends { id: string; ownerUserId?: string | null; currentRevisionId?: string | null },
+>(principal: Principal | undefined, rows: T[]): Promise<(T & EntryListAnnotations)[]> {
+	if (rows.length === 0) return [];
+	const ownerIds = [...new Set(rows.flatMap((r) => (r.ownerUserId ? [r.ownerUserId] : [])))];
+	const [owners, drafts] = await Promise.all([
+		knowledgeReadStore.listUsernamesByIds(ownerIds),
+		principal?.userId
+			? knowledgeReadStore.listActivePersonalEntriesForEntries(
+					rows.map((r) => r.id),
+					principal.userId,
+				)
+			: Promise.resolve([]),
+	]);
+	const nameById = new Map(owners.map((u) => [u.id, u.username]));
+	const draftByEntry = new Map<string, { id: string; baseRevisionId: string | null }>();
+	for (const d of drafts) if (!draftByEntry.has(d.entryId)) draftByEntry.set(d.entryId, d);
+	return rows.map((r) => {
+		const draft = draftByEntry.get(r.id);
+		return {
+			...r,
+			ownerUsername: r.ownerUserId ? (nameById.get(r.ownerUserId) ?? null) : null,
+			myPersonalEntryId: draft?.id ?? null,
+			myPersonalEntryBehindMain:
+				!!draft?.baseRevisionId &&
+				!!r.currentRevisionId &&
+				draft.baseRevisionId !== r.currentRevisionId,
+		};
+	});
+}
+
+/**
+ * The search (`q`) branch of the browse list: FTS rows (relevance or time order, capped, not
+ * paginated) already read-filtered, plus the list-row fields search rows lack (owner, level,
+ * current revision) from one bounded ACL projection, then `level` (effective) / `status`
+ * filters and the `title` order applied in memory over that capped set.
+ */
+async function searchEntriesForBrowse(opts: {
+	principal: Principal;
+	q: string;
+	collectionId?: string;
+	tag?: string;
+	level?: string;
+	status?: "active" | "archived";
+	sort?: EntryListSort | "relevance";
+}) {
+	const results = await search({
+		q: opts.q,
+		collectionId: opts.collectionId,
+		tag: opts.tag,
+		...(opts.sort === "updated" ? { sort: "time" as const } : {}),
+	});
+	const readable = await filterReadable(opts.principal, results);
+	if (readable.length === 0) return [];
+	const acl = await knowledgeReadStore.getEntriesAclByIds(readable.map((r) => r.id));
+	const aclById = new Map(acl.map((e) => [e.id, e]));
+	let defaultLevelByCol = new Map<string, string>();
+	if (opts.level) {
+		const cols = await knowledgeReadStore.getCollectionsAclByIds([
+			...new Set(acl.map((e) => e.collectionId)),
+		]);
+		defaultLevelByCol = new Map(cols.map((c) => [c.id, c.defaultLevel]));
+	}
+	const rows = readable.flatMap((r) => {
+		const e = aclById.get(r.id);
+		if (!e) return [];
+		if (opts.status && r.status !== opts.status) return [];
+		if (
+			opts.level &&
+			(e.classificationLevel ?? defaultLevelByCol.get(e.collectionId)) !== opts.level
+		) {
+			return [];
+		}
+		return [{ ...r, ownerUserId: e.ownerUserId, classificationLevel: e.classificationLevel }];
+	});
+	if (opts.sort === "title") {
+		rows.sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : a.id < b.id ? -1 : 1));
+	}
+	return rows;
 }
 
 async function getEntry(
@@ -607,6 +753,9 @@ export interface KnowledgeEntryViewerCaps {
 	/** Linked-submission review authority on this entry — canReview (self-review is a
 	 *  per-submission rule and is NOT folded in here). */
 	canReview: boolean;
+	/** `POST /entries/:id/links` (this entry as source) / `DELETE /links/:id` of its outgoing
+	 *  links — canManageEntryLinks (per-link `canRemove` covers incoming links). */
+	canManageLinks: boolean;
 	/** The caller's ACTIVE personal version of this entry, if any. */
 	myPersonalEntryId: string | null;
 }
@@ -630,6 +779,7 @@ export async function entryViewerCaps(
 		canTransferOwner: isEntryOwnerOrAdmin(caps, entry),
 		canDelete: writeMeta,
 		canReview: canReview(caps, entry),
+		canManageLinks: await canManageEntryLinks(caps, entry, collection),
 		myPersonalEntryId: caps.userId
 			? await knowledgeReadStore.findActivePersonalEntryId(entry.id, caps.userId)
 			: null,
@@ -651,7 +801,18 @@ async function getEntryForViewer(id: string, principal: Principal) {
 	if (!(await canRead(caps, aclEntry, aclCol))) {
 		throw new NotFoundError("Knowledge entry", id);
 	}
-	return { ...entry, viewerCaps: await entryViewerCaps(caps, aclEntry, aclCol) };
+	const [owner, latest] = await Promise.all([
+		entry.ownerUserId ? knowledgeReadStore.getUsernameById(entry.ownerUserId) : null,
+		// Newest revision's metadata only (version-descending, limit 1, no body).
+		knowledgeReadStore.listRevisionMeta(entry.id, 1),
+	]);
+	return {
+		...entry,
+		// Display only: the owner id is already on the row; the read page shows the name.
+		ownerUsername: owner?.username ?? null,
+		currentVersion: latest[0]?.version ?? null,
+		viewerCaps: await entryViewerCaps(caps, aclEntry, aclCol),
+	};
 }
 
 async function createEntry(input: {
@@ -1426,6 +1587,8 @@ export const knowledgeService = {
 	transferCollectionOwner,
 	listEntries,
 	listEntriesPage,
+	annotateEntryRows,
+	searchEntriesForBrowse,
 	getEntry,
 	getEntryForViewer,
 	createEntry,

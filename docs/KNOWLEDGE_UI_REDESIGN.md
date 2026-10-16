@@ -1,6 +1,6 @@
 # 知识库前端重构设计
 
-状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），P2a 已完成（见 §8.2），P2b 已完成（见 §8.3）。
+状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），P2a 已完成（见 §8.2），P2b 已完成（见 §8.3），P2c 已完成（见 §8.4）。
 关联文档：数据模型、权限和审核状态机以 `docs/KNOWLEDGE_BASE.md` 为准，本文只改前端信息架构与少量为其服务的后端接口，**不改审核状态机和 ACL 语义**。
 
 ---
@@ -205,7 +205,7 @@ frontend/hooks/knowledge/       按领域拆分 useKnowledge.ts（entries / pers
 | **P1** 基础件（✅ 已完成，见 §8.1） | `viewerCaps` 接口；`KnowledgeEditor`、`SubmissionStatusBadge`、`DriftBanner` 抽取；现有页面换用这些组件，路由暂不动 | 前端不再出现 `isAdmin \|\| isOwner` 式权限推断；write grant 持有者能看到编辑入口；所有编辑处有预览与未保存提醒 |
 | **P2a** 请求与审核（✅ 已完成，见 §8.2） | `/knowledge/review`、`/knowledge/requests/$id`；铃铛与审核导航迁移；对应旧 URL 重定向 | 关联型与独立型请求同一页面；作者与审核者同一 URL |
 | **P2b** 个人版本（✅ 已完成，见 §8.3） | `/knowledge/mine*`；关联与独立统一编辑页；`#draft` 与 `/personal/$id` 重定向 | "我的版本"只有一个入口 |
-| **P2c** 阅读与设置 | 条目阅读页、`/history`、`/edit`、`/settings`；浏览页筛选排序；删除侧栏 | 只读用户只看到正文、历史、链接 |
+| **P2c** 阅读与设置（✅ 已完成，见 §8.4） | 条目阅读页、`/history`、`/edit`、`/settings`；浏览页筛选排序；删除侧栏 | 只读用户只看到正文、历史、链接 |
 | **P2d** 管理 | `/knowledge/admin/*` 子路由拆分 | 现有管理功能无回退 |
 | **P3** 缺口 | ACL 审计页、知识包管理、知识图谱视图、"为什么我能/不能访问"说明 | 对应 KNOWLEDGE_BASE.md §10 条目可关闭 |
 
@@ -342,8 +342,54 @@ P2 的子项相互独立，可按 a → b → c → d 顺序并行开发、逐�
 - 目标集合下拉列出**所有可见集合**，而不是只列 `viewerCaps.canCreateEntry`：`submitForReview` 只检查"有目标"，不检查作者对目标的写权限（批准时需要的是**审核者**对目标的写权限，§6.7.5），只列可建条目的集合会把"通过审核发布"这条路对普通作者藏起来。服务端对目标集合的可读性也不校验，这一点维持现状；不可读的已存目标在下拉与状态条里显示为"你无权读取的集合"，不显示名称。
 - "My" 未新增聚合接口（§6.2 的评估项）：沿用 `GET /personal-entries`（active，必要时 archived）、`/my-open-submissions`、`/my-submission-outcomes` 四个有上限的请求，各自已有缓存与失效路径；聚合只省请求数，却要复制三处 ACL 与上限逻辑。
 - `#draft` 无个人版本时落到 `?personal=create`（新 search 参数）而非纯 hash，因为确认弹窗是页面状态、应可链接（§3）。
-- 条目页的个人版本入口暂放在标题栏（与转移/删除并列）；§5.2 的完整头部与主次按钮布局属于 P2c。
+- 条目页的个人版本入口暂放在标题栏（与转移/删除并列）；§5.2 的完整头部与主次按钮布局属于 P2c。——P2c 已完成，见 §8.4。
 - 去掉草稿 tab 后不再被任何页面使用的 hook（`useMyKnowledgeDraft`、`useKnowledgeDraftDrift`、`useUpdateKnowledgeDraft`、`useSubmitKnowledgeDraft`）与 `draft` / `draftDrift` 缓存键的失效一并删除；通知失效改为刷新 `personalEntry`（详情里带 drift 与打开请求）。对应 HTTP 接口保留（agent 工具与旧客户端仍在用）。
+
+### 8.4 P2c 落地记录
+
+**后端**（均为新增字段/参数，未改语义）：
+
+- `GET /entries` 分页模式新增 `level`（有效密级：条目自身，为空取集合 `defaultLevel`，SQL 侧 `OR` + 集合 `IN` 子查询）、`status`（`active` / `archived`，SQL 侧）、`sort`（`updated` 默认 / `title`；带 `q` 时另有 `relevance` 默认）。新端口方法 `listEntriesOrdered`（SQLite 与 PostgreSQL 两份实现，同一投影、同一顺序）；`tag` 与 ACL 仍为后过滤，沿用 `ENTRY_PAGE_MAX_SCAN_ROWS` 扫描预算与"短页 + 续游标"语义。
+- **游标设计**：`updated` 仍为 base64url(`[updatedAt, id]`)，旧游标继续有效；`title` 为 base64url(`["title", title, id]`)，keyset 谓词 `title > t OR (title = t AND id > i)`，与 `ORDER BY title, id` 同一列排序规则（SQLite 二进制、PG 数据库排序规则），重复标题由 `id` 决胜。游标与排序绑定：拿 `updated` 游标请求 `sort=title`（或反之）返回 400，不会静默返回错页。标题游标携带标题本身，游标上限由 512 提到 4096 字符。
+- **未加索引**：按标题排序在集合内走 `idx_ke_collection` 过滤后排序，全量按标题排序是整表 top-N——与 P0 起全量按时间排序的现状相同，返回行数由扫描预算限界。补 `(collection_id, title, id)` 索引需要 SQLite + PG 两条迁移，与并行分支的迁移编号冲突风险大于收益，记为后续项（KNOWLEDGE_BASE.md §4.2 已注明）。
+- 分页行注解：`ownerUsername`、`myPersonalEntryId`、`myPersonalEntryBehindMain`，每页两次 `IN` 批量查询（`listUsernamesByIds`、`listActivePersonalEntriesForEntries`，后者走 `idx_kd_entry_author`）。检索（`q`）行补齐 `ownerUserId` / `classificationLevel` 用一次 ACL 投影批量查询；检索行没有 revision id，"落后 main"只在非检索列表上标出。
+- `GET /entries/:id` 增加 `ownerUsername`、`currentVersion`（最新 revision 元数据，`LIMIT 1`、不含正文）与能力位 `canManageLinks`；`GET /entries/:id/links` 每行增加 `canRemove`：
+
+| 能力位 | 判定（写接口同用） | 对应写接口 |
+|--------|--------------------|------------|
+| `canManageLinks` | `canManageEntryLinks(caps, entry, collection)`（当前 = `canRead`；`addLink` 的源端、`removeLink` 改为调用它） | `POST /entries/:id/links`（本条目作源） |
+| 链接 `canRemove` | 对该链接**源条目**的 `canManageEntryLinks` | `DELETE /links/:id` |
+
+  一致性测试：`knowledge-viewer-caps.test.ts` 六类 principal 上验证 `canManageLinks ⇔ addLink 不被拒绝 ⇔ removeLink 不被拒绝`，以及入链 `canRemove ⇔ removeLink 不被拒绝`。列表/排序/筛选测试：`server/services/__tests__/knowledge-entry-list-sort-filter.test.ts`（标题序含重复标题、ACL 回填、游标与排序绑定、长中文标题游标往返、有效密级含集合默认与覆盖、状态、路由注解与 drift、`q` 分支的筛选与标题序、详情的 owner/版本号）；PG 集成测试（`PG_INTEGRATION=1`）补了标题序与筛选。
+
+**前端**：
+
+- 路由改为目录：`routes/knowledge/$entryId/{index,history,edit,settings}.tsx`，共用 `components/knowledge/entry/EntryPageFrame`（加载/不可读状态 + 面包屑 知识库 › 集合 [› 条目 › 子页]）。
+- 阅读页（§5.2）：`EntryReadHeader`——标题、有效密级（继承自集合时为描边徽章 + 提示）、归档状态、标签、owner、更新时间与版本号；主操作由纯函数 `entryReadActions(viewerCaps)` 决定：`canWriteMain` → 「编辑」（`/edit`）+ 次级个人版本按钮，否则个人版本按钮（「提议修改」/「我的个人版本」，P2b 流程）为唯一实心主按钮；次级图标：历史、设置（任一设置能力位时）、复制链接。`EntryBanners`：`canReview` 时统计本条目 pending + conflict 请求数 → `/knowledge/review?entry=<id>`；有个人版本且其详情带打开请求时显示状态 → 请求页。正文 `MarkdownContent` 全宽；`EntryRelatedSection`（锚点 `#related`）出链/入链各按类型分组，添加按 `canManageLinks`，删除按每条 `canRemove`。常驻侧栏删除。
+- `/history`：`EntryHistory`（原 HistoryTab：元数据列表 + 任选两版按需取正文 diff）。
+- `/edit`：`KnowledgeEditor`（基线 = 当前 main，宽屏默认并排）+ 变更说明（写入新 revision 的 `changeNote`）；无改动时 Ctrl/Cmd+S 不追加空版本；保存后先释放离开拦截再回阅读页。`beforeLoad` 以与 `#draft` 相同的方式 `ensureQueryData` 读条目，`entryEditRedirect(entryId, canWriteMain)` 非直接写者（含读不到条目）一律回阅读页。
+- `/settings`（§5.8）：`EntrySettingsCards`——基本信息（`canEditMeta` → `EntryMetaPanel`，否则只读）、访问控制（`canManageAcl` → `EntryAclPanel`，否则只读展示密级/受控标签/审核标签名，审核标签为空时显示 fail-closed 说明）、所有权（`canTransferOwner` → `TransferOwnerModal`）、危险操作（`canDelete` → 输入标题确认删除；无权限时整卡隐藏）。
+- 浏览页（§5.1）：search `collection` / `q` / `tag` / `level` / `status` / `sort`（`lib/knowledge-browse-search.ts`，默认排序不入 URL：有 `q` 为相关度，否则为最近更新），文本框防抖写 URL；左侧 `CollectionTree`，每行"⋯"菜单按集合 `viewerCaps` 列出编辑 / 访问设置 / 转移 / 删除；右侧 `EntryTable` 表格行（标题 + 检索摘要、标签——点击即按标签筛选、有效密级、更新时间、owner、"我的版本"/"落后 main"徽章），沿用 P0 的游标"加载更多"；「新建」菜单（新建条目到可建集合 / 新建个人条目 → `/knowledge/mine/new`）；空状态区分 没有集合 / 无搜索结果（有任一筛选）/ 集合为空 / 无条目（`browseEmptyState`）。
+
+**旧 URL 重定向**（`lib/knowledge-review-nav.ts` 纯函数，`/knowledge/$entryId/` 的 `beforeLoad` 中 `redirect({ replace: true })`，每行一条单测）：
+
+| 旧 | 新 |
+|----|----|
+| `/knowledge/$entryId#content` | `/knowledge/$entryId` |
+| `/knowledge/$entryId#history` | `/knowledge/$entryId/history` |
+| `/knowledge/$entryId#links` | `/knowledge/$entryId#related`（加载后滚动到"关联条目"） |
+
+P2a 的 `#submissions[/<id>]` 与 P2b 的 `#draft` 随路由一起搬到 `$entryId/index.tsx`，行为与测试不变。
+
+**偏差**：
+
+- §5.1 的"你没有权限看到更多"空状态未单列：服务端不（也不应）告知被 ACL 隐藏的行数；扫描预算耗尽的空页仍显示原有"继续加载"提示，"无搜索结果"的说明里注明不可读条目不会列出。
+- 筛选条的状态筛选为新增服务端参数 `status`（§6.2 只列了 `level`、`sort`），成本是一个 SQL 等值条件（有 `idx_ke_status`）。
+- 标签筛选是自由文本框（条目标签是自由标签，没有可枚举的列表接口；`/tags` 是 ACL 标签），另可点击行上的标签徽章。
+- 浏览页的「Access Control」管理 tab 保留在 `?tab=admin`，属于 P2d 的拆分范围。
+- 设置入口仅在有任一设置能力位时出现在阅读页；设置页本身对任何可读者可直接打开（全部只读）。危险操作卡在无 `canDelete` 时隐藏而非只读——没有可展示的只读内容。
+- 管理员在访问控制卡里仍可通过 `EntryAclPanel` 的 owner 字段改 owner（`PATCH …/acl` 的既有能力），与所有权卡的转移并存，未在 P2c 合并。
+- 叙述者 dock 面板、`NarratorPanel` 知识提示与 `shared/pretext-layout/tool-detail.ts` 只链接 `/knowledge/<id>`（不带 tab hash），路径不变，无需修改。
 
 ## 9. 测试策略
 

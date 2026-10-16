@@ -116,6 +116,7 @@ describe("canEditKnowledgeEntry", () => {
 			canTransferOwner: false,
 			canDelete: false,
 			canReview: false,
+			canManageLinks: true,
 			myPersonalEntryId: null,
 		});
 		// A write-grant holder who is neither admin nor owner: the server allows it.

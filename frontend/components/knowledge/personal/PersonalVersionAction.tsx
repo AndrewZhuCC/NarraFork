@@ -35,14 +35,18 @@ export function PersonalVersionAction({
 	const create = useCreateKnowledgeDraft();
 	const [open, setOpen] = useState(false);
 
+	// The read page shows ONE primary action (§5.2): "Edit" for direct writers, this one for
+	// everyone else — so it is filled only when the caller cannot write main.
+	const variant = canWriteMain ? "default" : "filled";
+
 	if (myPersonalEntryId) {
 		return (
 			<ButtonLink
 				{...knowledgePersonalEntryDestination(myPersonalEntryId)}
-				size="compact-xs"
-				variant="light"
+				size="sm"
+				variant={variant}
 				color="grape"
-				leftSection={<IconPencil size={12} />}
+				leftSection={<IconPencil size={14} />}
 			>
 				{t("openMyVersion")}
 			</ButtonLink>
@@ -59,10 +63,10 @@ export function PersonalVersionAction({
 	return (
 		<>
 			<Button
-				size="compact-xs"
-				variant={canWriteMain ? "default" : "light"}
+				size="sm"
+				variant={variant}
 				color="grape"
-				leftSection={<IconGitFork size={12} />}
+				leftSection={<IconGitFork size={14} />}
 				onClick={() => setOpen(true)}
 			>
 				{label}
