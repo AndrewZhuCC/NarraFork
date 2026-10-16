@@ -20,7 +20,7 @@ interface CompactMenuSubProps {
 const ROW_HOVER_BG = "var(--mantine-color-default-hover)";
 
 /**
- * "Compact earlier content" menu entry rendered as a split control:
+ * "Compact earlier" menu entry rendered as a split control:
  * - Clicking the left part (icon + label) runs the compact action directly.
  * - Clicking the right part (chevron, after a vertical divider) toggles an inline,
  *   in-place expansion with "Clear to here" and "Manual summarize" sub-items.
