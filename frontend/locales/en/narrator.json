@@ -398,7 +398,11 @@
 		"fileUnsaved": "Save the file to quote this selection",
 		"addFailed": "Could not add quote",
 		"placeholder": "Ask about the quoted content…",
-		"open": "Show quoted text"
+		"open": "Show quoted text",
+		"editComment": "Edit comment",
+		"viewComment": "View comment",
+		"commentDone": "Done editing",
+		"commentPlaceholder": "Add your thoughts…"
 	},
 	"fileReferences": {
 		"title": "File references",

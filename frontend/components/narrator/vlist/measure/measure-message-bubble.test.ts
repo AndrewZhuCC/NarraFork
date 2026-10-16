@@ -203,6 +203,31 @@ describe("measureMessageBubble — user", () => {
 		expect(onlyQuote.blocks.some((block) => block.kind === "code")).toBe(false);
 	});
 
+	it("keeps comments inside their quote chips without extra arrow paragraphs", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const { serializeComposerQuotes } = await import("../../composer/composer-quotes");
+		const text = `${serializeComposerQuotes([
+			{
+				label: "first",
+				text: "original one",
+				anchor: "m:first",
+				comment: "first comment\nsecond line",
+			},
+			{ label: "second", text: "original two", anchor: "m:second", comment: "second comment" },
+		])}overall request`;
+		const measured = measureMessageBubble({ role: "user", text }, 320);
+		expect(
+			measured.blocks.map((block) => (block.kind === "fixed" ? block.tag : block.kind)),
+		).toEqual(["user-quote-chips", "code"]);
+		const chips = measured.blocks[0];
+		if (chips?.kind !== "fixed") throw new Error("Missing quote chips");
+		expect(chips.data?.quotes).toMatchObject([
+			{ label: "first", anchor: "m:first", comment: "first comment\nsecond line" },
+			{ label: "second", anchor: "m:second", comment: "second comment" },
+		]);
+		expect(chips.displayWidth).toBeLessThanOrEqual(320);
+	});
+
 	it("shrink-wraps: narrow content uses less than full width", async () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const r = measureMessageBubble({ role: "user", text: "hi" }, 1000);

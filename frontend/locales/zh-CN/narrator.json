@@ -398,7 +398,11 @@
 		"fileUnsaved": "保存文件后才能引用该选区",
 		"addFailed": "无法添加引用",
 		"placeholder": "针对引用内容提问…",
-		"open": "定位到引用内容"
+		"open": "定位到引用内容",
+		"editComment": "编辑评论",
+		"viewComment": "查看评论",
+		"commentDone": "完成评论",
+		"commentPlaceholder": "写下你的想法…"
 	},
 	"fileReferences": {
 		"title": "文件引用",

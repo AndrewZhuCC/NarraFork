@@ -15,11 +15,17 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
-import { Tooltip } from "@mantine/core";
+import { CloseButton, Group, Popover, Text, Tooltip } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
-import { IconChevronDown, IconChevronRight, IconQuote } from "@tabler/icons-react";
-import { useId, useMemo } from "react";
+import {
+	IconChevronDown,
+	IconChevronRight,
+	IconMessageCircle,
+	IconQuote,
+} from "@tabler/icons-react";
+import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { QuoteChip } from "../../composer/ComposerQuoteChips";
 import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
@@ -395,19 +401,19 @@ function UserBubble({
 	onQuoteClick?: () => void;
 	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }) {
-	// A user bubble is [attachment…, body?]: attachment blocks are fixed boxes,
-	// the body (when present) is the trailing pre-wrap code block.
-	const bodyIndex = measured.blocks.findIndex((block) => block.kind === "code");
-	const bodyBlock = bodyIndex >= 0 ? (measured.blocks[bodyIndex] as PreparedCodeBlock) : undefined;
-	const bodyFrame = bodyIndex >= 0 ? measured.frame.blocks[bodyIndex] : undefined;
-	const lines = useMemo(() => {
-		if (!bodyBlock) return [];
-		return layoutWithLines(bodyBlock.prepared, measured.contentWidth, bodyBlock.lineHeight).lines;
-	}, [bodyBlock, measured.contentWidth]);
+	// Quote comments and the overall prompt share the same pre-wrap text layout.
+	const textLines = useMemo(
+		() =>
+			measured.blocks.map((block) =>
+				block.kind === "code"
+					? layoutWithLines(block.prepared, measured.contentWidth, block.lineHeight).lines
+					: null,
+			),
+		[measured.blocks, measured.contentWidth],
+	);
 
 	const headerBlock = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
 	const contentTop = USER_BUBBLE_PADDING + headerBlock;
-	const lineHeight = bodyBlock?.lineHeight ?? 20;
 
 	const surface = bubbleSurface(isSelf);
 
@@ -441,10 +447,37 @@ function UserBubble({
 					</div>
 				) : null}
 				{measured.blocks.map((block, index) => {
-					if (block.kind !== "fixed") return null;
 					const frame = measured.frame.blocks[index];
 					if (!frame) return null;
 					const top = contentTop + frame.top;
+					if (block.kind === "code") {
+						return (
+							<div
+								// biome-ignore lint/suspicious/noArrayIndexKey: text blocks follow persisted message order
+								key={`user-text-${index}`}
+								style={{ position: "absolute", top, left: USER_BUBBLE_PADDING }}
+							>
+								{textLines[index]?.map((line, lineIndex) => (
+									<div
+										// biome-ignore lint/suspicious/noArrayIndexKey: measured lines have a stable order
+										key={lineIndex}
+										style={{
+											position: "absolute",
+											top: lineIndex * block.lineHeight,
+											left: 0,
+											height: block.lineHeight,
+											whiteSpace: "pre",
+											font: typographyMetrics().font.body,
+											color: "var(--mantine-color-text)",
+										}}
+									>
+										{line.text}
+									</div>
+								))}
+							</div>
+						);
+					}
+					if (block.kind !== "fixed") return null;
 					if (block.tag === "user-quote") {
 						return (
 							<QuoteStrip key="user-quote" block={block} top={top} onQuoteClick={onQuoteClick} />
@@ -479,7 +512,8 @@ function UserBubble({
 					if (block.tag === "user-quote-chips") {
 						return (
 							<UserQuoteChips
-								key="user-quote-chips"
+								// biome-ignore lint/suspicious/noArrayIndexKey: quote/comment blocks follow persisted message order
+								key={`user-quote-chips-${index}`}
 								block={block}
 								top={top}
 								left={USER_BUBBLE_PADDING}
@@ -500,33 +534,6 @@ function UserBubble({
 						/>
 					);
 				})}
-				{bodyBlock ? (
-					<div
-						style={{
-							position: "absolute",
-							top: contentTop + (bodyFrame?.top ?? 0),
-							left: USER_BUBBLE_PADDING,
-						}}
-					>
-						{lines.map((line, i) => (
-							<div
-								// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
-								key={i}
-								style={{
-									position: "absolute",
-									top: i * lineHeight,
-									left: 0,
-									height: lineHeight,
-									whiteSpace: "pre",
-									font: typographyMetrics().font.body,
-									color: "var(--mantine-color-text)",
-								}}
-							>
-								{line.text}
-							</div>
-						))}
-					</div>
-				) : null}
 			</div>
 		</div>
 	);
@@ -535,7 +542,9 @@ function UserBubble({
 interface StoredQuoteChip {
 	label: string;
 	text: string;
+	comment?: string;
 	anchor: string | null;
+	reference?: FileReference | null;
 }
 
 interface StoredQuoteChipBox {
@@ -544,11 +553,6 @@ interface StoredQuoteChipBox {
 	width: number;
 }
 
-/**
- * Quote chips for a sent user message. The measured box already wrapped them;
- * this only paints those positions. The quoted paragraphs stay in the chip
- * metadata so a click can highlight the source.
- */
 function UserQuoteChips({
 	block,
 	top,
@@ -560,86 +564,124 @@ function UserQuoteChips({
 }) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
+	const [previewIndex, setPreviewIndex] = useState<number | null>(null);
 	const data = block.data ?? {};
 	const quotes = Array.isArray(data.quotes) ? (data.quotes as StoredQuoteChip[]) : [];
 	const chips = Array.isArray(data.chips) ? (data.chips as StoredQuoteChipBox[]) : [];
+	const activeQuote = previewIndex === null ? null : quotes[previewIndex];
 	return (
-		<div
-			style={{
-				position: "absolute",
-				top,
-				left,
-				width: block.displayWidth,
-				height: block.height,
-			}}
+		<Popover
+			opened={!!activeQuote?.comment}
+			onDismiss={() => setPreviewIndex(null)}
+			position="top-start"
+			width="min(420px, calc(100vw - 24px))"
+			withinPortal
+			withArrow
+			shadow="md"
 		>
-			{quotes.map((quote, index) => {
-				const box = chips[index];
-				if (!box) return null;
-				const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
-				return (
-					<Tooltip
-						// biome-ignore lint/suspicious/noArrayIndexKey: chip order is the stored quote order
-						key={index}
-						label={
-							<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>
-						}
-						multiline
-						w={360}
-						openDelay={300}
-						withinPortal
-					>
-						<button
-							type="button"
-							aria-label={t("quote.open")}
-							disabled={!quote.anchor}
-							onClick={(event) => {
-								if (!quote.anchor) return;
-								if (window.getSelection()?.isCollapsed === false) return;
-								event.stopPropagation();
-								revealComposerQuote(
-									dock,
-									{ label: quote.label, text: quote.text, anchor: quote.anchor },
-									event.currentTarget,
-								);
-							}}
+			<Popover.Target>
+				<div
+					style={{
+						position: "absolute",
+						top,
+						left,
+						width: block.displayWidth,
+						height: block.height,
+					}}
+				>
+					{quotes.map((quote, index) => {
+						const box = chips[index];
+						if (!box) return null;
+						const preview = quote.text.length > 600 ? `${quote.text.slice(0, 600)}…` : quote.text;
+						const canOpen = !!quote.reference || (!!quote.anchor && !quote.anchor.startsWith("f:"));
+						return (
+							<Tooltip
+								// biome-ignore lint/suspicious/noArrayIndexKey: chip order is the stored quote order
+								key={index}
+								label={
+									<span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{preview}</span>
+								}
+								multiline
+								w={360}
+								openDelay={300}
+								withinPortal
+							>
+								<QuoteChip
+									label={quote.label}
+									comment={quote.comment}
+									file={!!quote.reference}
+									style={{
+										position: "absolute",
+										left: box.x,
+										top: box.y,
+										width: box.width,
+										height: USER_QUOTE_CHIP_HEIGHT,
+										font: typographyMetrics().font.xs,
+									}}
+									onOpen={
+										canOpen
+											? (event) => {
+													if (window.getSelection()?.isCollapsed === false) return;
+													event.stopPropagation();
+													if (quote.reference) revealQuotedFile(dock, quote.reference);
+													else if (quote.anchor)
+														revealComposerQuote(
+															dock,
+															{ label: quote.label, text: quote.text, anchor: quote.anchor },
+															event.currentTarget,
+														);
+												}
+											: undefined
+									}
+									commentLabel={t("quote.viewComment")}
+									onComment={
+										quote.comment
+											? (event) => {
+													event.stopPropagation();
+													setPreviewIndex((current) => (current === index ? null : index));
+												}
+											: undefined
+									}
+								/>
+							</Tooltip>
+						);
+					})}
+				</div>
+			</Popover.Target>
+			{activeQuote?.comment && (
+				<Popover.Dropdown p="xs" role="dialog" aria-label={t("quote.viewComment")}>
+					<Group gap={6} wrap="nowrap" mb={6}>
+						<IconQuote size={14} style={{ flexShrink: 0 }} />
+						<Text size="xs" truncate style={{ flex: 1 }}>
+							{activeQuote.label}
+						</Text>
+						<CloseButton
+							size="sm"
+							aria-label={t("close", { ns: "common" })}
+							onClick={() => setPreviewIndex(null)}
+						/>
+					</Group>
+					<Group gap={6} align="flex-start" wrap="nowrap">
+						<IconMessageCircle
+							size={15}
+							style={{ flexShrink: 0, color: "var(--mantine-primary-color-filled)" }}
+						/>
+						<Text
+							size="xs"
 							style={{
-								position: "absolute",
-								left: box.x,
-								top: box.y,
-								width: box.width,
-								height: USER_QUOTE_CHIP_HEIGHT,
-								boxSizing: "border-box",
-								display: "flex",
-								alignItems: "center",
-								gap: 4,
-								padding: "0 6px",
-								border: "1px solid var(--mantine-color-default-border)",
-								borderRadius: "var(--mantine-radius-sm)",
-								background: "var(--mantine-color-default-hover)",
-								color: "inherit",
-								font: typographyMetrics().font.xs,
-								overflow: "hidden",
-								cursor: quote.anchor ? "pointer" : "default",
-								textAlign: "left",
+								whiteSpace: "pre-wrap",
+								overflowWrap: "anywhere",
+								maxHeight: "min(40dvh, 280px)",
+								overflowY: "auto",
+								minWidth: 0,
 							}}
 						>
-							<IconQuote size={12} style={{ flexShrink: 0 }} />
-							<span
-								style={{
-									overflow: "hidden",
-									textOverflow: "ellipsis",
-									whiteSpace: "nowrap",
-									minWidth: 0,
-								}}
-							>
-								{quote.label}
-							</span>
-						</button>
-					</Tooltip>
-				);
-			})}
-		</div>
+							{activeQuote.comment}
+						</Text>
+					</Group>
+				</Popover.Dropdown>
+			)}
+		</Popover>
 	);
 }
 

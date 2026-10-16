@@ -208,6 +208,55 @@ describe("RenderMessageBubble — chat Markdown geometry", () => {
 	});
 });
 
+test("sent quote comments reuse compact chips without editing controls or arrow text", async () => {
+	const { serializeComposerQuotes } = await import("../../composer/composer-quotes");
+	const doc = setupDom();
+	currentContainer = doc.createElement("div") as unknown as HTMLElement;
+	doc.body.appendChild(currentContainer);
+	currentRoot = createRoot(currentContainer);
+	const m = measureMessageBubble(
+		{
+			role: "user",
+			hasHeader: false,
+			text: serializeComposerQuotes([
+				{
+					label: "first quote",
+					text: "original first",
+					anchor: "m:first",
+					comment: "first comment",
+				},
+				{
+					label: "second quote",
+					text: "original second",
+					anchor: "m:second",
+					comment: "second comment",
+				},
+			]),
+		},
+		WIDTH,
+	);
+	act(() =>
+		currentRoot?.render(
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					{/* biome-ignore lint/a11y/useValidAriaRole: domain prop */}
+					<RenderMessageBubble role="user" measured={m} hasHeader={false} />
+				</MantineProvider>
+			</I18nextProvider>,
+		),
+	);
+	const chips = currentContainer.querySelectorAll("[data-quote-chip]");
+	expect(chips).toHaveLength(2);
+	expect(chips[0]?.textContent).toContain("first comment");
+	expect(chips[1]?.textContent).toContain("second comment");
+	expect(currentContainer.querySelectorAll("[data-quote-comment] svg")).toHaveLength(2);
+	expect(currentContainer.querySelectorAll('button[aria-label="quote.viewComment"]')).toHaveLength(
+		2,
+	);
+	expect(currentContainer.querySelector('button[aria-label="quote.remove"]')).toBeNull();
+	expect(currentContainer.textContent).not.toContain("↳");
+});
+
 describe("RenderMessageBubble — the side is height-neutral", () => {
 	test("both sides paint the SAME measured geometry", () => {
 		// The measure layer never learns who is reading, so one measurement serves both

@@ -31,6 +31,8 @@ import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
 import { ComposerQuoteChips } from "./ComposerQuoteChips";
 import {
+	type ComposerQuote,
+	fileReferenceQuote,
 	joinQuotedComposerInput,
 	MAX_COMPOSER_QUOTES,
 	sameComposerQuote,
@@ -217,6 +219,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		const bodyText = bodyInput.text;
 		const inputStateRef = useRef(inputState);
+		const [editingQuote, setEditingQuote] = useState<ComposerQuote | null>(null);
 		const [draftHydrated, setDraftHydrated] = useState(false);
 		const [draftSyncState, setDraftSyncState] = useState<
 			"loading" | "ready" | "error" | "conflict"
@@ -944,13 +947,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				if (candidate.kind === "text") {
 					const { quotes: current, body } = readQuotedInput();
 					if (!current.some((quote) => sameComposerQuote(quote, candidate.quote))) {
-						if (current.length >= MAX_COMPOSER_QUOTES) {
+						if (
+							current.filter((quote) => !quote.anchor?.startsWith("f:")).length >=
+							MAX_COMPOSER_QUOTES
+						) {
 							notifyFailure(t("quote.limit", { count: MAX_COMPOSER_QUOTES }));
 							return;
 						}
 						applyInput(joinQuotedComposerInput([...current, candidate.quote], body));
 					}
 					textareaRef.current?.ownerDocument.getSelection()?.removeAllRanges();
+					setEditingQuote(candidate.quote);
 				} else {
 					const { reference } = candidate;
 					if (!reference) {
@@ -958,7 +965,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						return;
 					}
 					const current = inputStateRef.current;
-					const duplicate = current.fileReferences.some(
+					const duplicate = current.fileReferences.find(
 						(item) =>
 							!item.inputRange &&
 							item.deviceId === reference.deviceId &&
@@ -980,11 +987,36 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						}
 						if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
 					}
+					setEditingQuote(fileReferenceQuote(duplicate ?? reference));
 				}
 				hideQuoteCandidate(candidate);
-				focusBodyEnd();
 			},
-			[applyInput, fileCacheScope, focusBodyEnd, hideQuoteCandidate, readQuotedInput, t],
+			[applyInput, fileCacheScope, hideQuoteCandidate, readQuotedInput, t],
+		);
+		const changeQuoteComment = useCallback(
+			(target: ComposerQuote, comment: string) => {
+				const { quotes: current, body } = readQuotedInput();
+				const index = current.findIndex((quote) => sameComposerQuote(quote, target));
+				const isFile = target.anchor?.startsWith("f:");
+				if (
+					index < 0 &&
+					(!isFile || !body.fileReferences.some((ref) => target.anchor === `f:${ref.id}`))
+				)
+					return;
+				const next = [...current];
+				if (isFile && !comment) {
+					if (index >= 0) next.splice(index, 1);
+				} else {
+					const updated = {
+						...(index >= 0 ? current[index] : target),
+						comment: comment || undefined,
+					};
+					if (index >= 0) next[index] = updated;
+					else next.push(updated);
+				}
+				applyInput(joinQuotedComposerInput(next, body));
+			},
+			[applyInput, readQuotedInput],
 		);
 		acceptQuoteRef.current = acceptQuote;
 		const removeQuote = useCallback(
@@ -1002,10 +1034,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		const removeDetachedFileReference = useCallback(
 			(id: string) => {
-				setFileReferences(inputStateRef.current.fileReferences.filter((item) => item.id !== id));
+				const { quotes: current, body } = readQuotedInput();
+				applyInput(
+					joinQuotedComposerInput(
+						current.filter((quote) => quote.anchor !== `f:${id}`),
+						{
+							...body,
+							fileReferences: body.fileReferences.filter((item) => item.id !== id),
+						},
+					),
+				);
 				focusBodyEnd();
 			},
-			[focusBodyEnd, setFileReferences],
+			[applyInput, focusBodyEnd, readQuotedInput],
 		);
 		const detachedFileReferences = useMemo(
 			() => fileReferences.filter((reference) => !reference.inputRange),
@@ -1367,6 +1408,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					quotes={quotes}
 					fileReferences={detachedFileReferences}
 					candidate={quoteCandidate.candidate}
+					editingQuote={editingQuote}
+					onEditQuote={setEditingQuote}
+					onChangeComment={changeQuoteComment}
+					onCommentDone={() => {
+						setEditingQuote(null);
+						focusBodyEnd();
+					}}
 					onAccept={acceptQuote}
 					onDismiss={hideQuoteCandidate}
 					onRemoveQuote={removeQuote}

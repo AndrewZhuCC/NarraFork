@@ -392,6 +392,20 @@ function attachmentBlock(
 	};
 }
 
+function userTextBlock(text: string, marginTop: number): PreparedCodeBlock {
+	return {
+		kind: "code",
+		prepared: getPreparedTextWithSegments(text, typographyMetrics().font.body, "pre-wrap"),
+		lineHeight: typographyMetrics().line.body,
+		lang: null,
+		marginTop,
+		contentLeft: 0,
+		quoteRailLefts: [],
+		markerText: null,
+		markerLeft: null,
+		markerClassName: null,
+	};
+}
 // ── user: plain pre-wrap body inside a shrink-wrapping bubble ─────────────────
 /** Pack quote chips into rows. Positions are what the bubble paints; nothing is remeasured there. */
 function quoteChipLayout(quotes: readonly ComposerQuote[], innerWidth: number) {
@@ -403,9 +417,25 @@ function quoteChipLayout(quotes: readonly ComposerQuote[], innerWidth: number) {
 			whiteSpace: "pre-wrap",
 		});
 		const textWidth = Math.ceil(measureNaturalWidth(prepared));
+		const commentWidth = quote.comment
+			? 4 +
+				Math.min(
+					140,
+					17 +
+						Math.ceil(
+							measureNaturalWidth(
+								prepareWithSegments(
+									quote.comment.replace(/\s+/gu, " "),
+									typographyMetrics().font.xs,
+								),
+							),
+						),
+				)
+			: 0;
 		const width = Math.min(
 			innerWidth,
-			Math.max(USER_QUOTE_CHIP_CHROME + 8, USER_QUOTE_CHIP_CHROME + textWidth),
+			quote.comment ? 380 : 280,
+			Math.max(USER_QUOTE_CHIP_CHROME + 8, USER_QUOTE_CHIP_CHROME + textWidth + commentWidth),
 		);
 		if (x > 0 && x + width > innerWidth) {
 			x = 0;
@@ -426,6 +456,7 @@ function quoteChipBlock(
 	quotes: readonly ComposerQuote[],
 	innerWidth: number,
 	marginTop: number,
+	attachments: readonly MeasureUserAttachment[] = [],
 ): PreparedFixedBlock {
 	const layout = quoteChipLayout(quotes, innerWidth);
 	return {
@@ -438,7 +469,12 @@ function quoteChipBlock(
 			quotes: quotes.map((quote) => ({
 				label: quote.label,
 				text: quote.text,
+				comment: quote.comment,
 				anchor: quote.anchor ?? null,
+				reference:
+					attachments.find(
+						(item) => item.type === "file_reference" && quote.anchor === `f:${item.reference?.id}`,
+					)?.reference ?? null,
 			})),
 			chips: layout.chips,
 		},
@@ -525,6 +561,7 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 					storedQuotes.quotes,
 					innerWidth,
 					blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+					input.attachments,
 				),
 			);
 		}
@@ -565,21 +602,7 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 				markerClassName: null,
 			});
 		} else if (bodyText.length > 0 || (!hasAttachments && storedQuotes.quotes.length === 0)) {
-			const bodyBlock: PreparedCodeBlock = {
-				kind: "code",
-				// Cross-width memo (see prepared-markdown-cache): the segment precompute is
-				// width-independent and is the dominant cost of a user bubble.
-				prepared: getPreparedTextWithSegments(bodyText, typographyMetrics().font.body, "pre-wrap"),
-				lineHeight: typographyMetrics().line.body,
-				lang: null,
-				marginTop: blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
-				contentLeft: 0,
-				quoteRailLefts: [],
-				markerText: null,
-				markerLeft: null,
-				markerClassName: null,
-			};
-			blocks.push(bodyBlock);
+			blocks.push(userTextBlock(bodyText, blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP));
 		}
 	}
 	// No code-box padding for plain user text (it's not a fenced block).

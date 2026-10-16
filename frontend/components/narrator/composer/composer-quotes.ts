@@ -1,5 +1,5 @@
-import type { FileReference } from "@shared/file-reference";
-import type { FileReferenceInput } from "./file-reference-input";
+import { type FileReference, MAX_FILE_REFERENCE_COUNT } from "@shared/file-reference";
+import { type FileReferenceInput, fileReferenceToken } from "./file-reference-input";
 
 /**
  * A quoted excerpt of conversation content (message text or tool output).
@@ -21,10 +21,9 @@ import type { FileReferenceInput } from "./file-reference-input";
 export interface ComposerQuote {
 	label: string;
 	text: string;
-	/**
-	 * Where the excerpt came from, so a click can scroll back to it after send.
-	 * `m:<messageId>` or `t:<toolUseId>`. Absent when the source has no stable id.
-	 */
+	/** User-authored annotation, separate from the original excerpt. */
+	comment?: string;
+	/** m:<messageId>, t:<toolUseId>, or f:<attachedFileReferenceId>. */
 	anchor?: string;
 }
 
@@ -57,8 +56,9 @@ export const MAX_COMPOSER_QUOTE_LABEL_CHARS = 80;
 
 const HEADER_PREFIX = "> [quote] ";
 const HEADER = /^> \[quote\] (.+)$/;
+const COMMENT_HEADER = "| [comment]";
 /** Trailing jump target. The id is at least 4 characters so ordinary prose cannot collide. */
-const ANCHOR_SUFFIX = / @@([mt]:[A-Za-z0-9_-]{4,})$/;
+const ANCHOR_SUFFIX = / @@([mtf]:[A-Za-z0-9_-]{4,})$/;
 // A content line that would read as a header is escaped with one extra backslash.
 const ESCAPABLE = /^\\*\[quote\]/;
 const ESCAPED = /^\\+\[quote\]/;
@@ -106,6 +106,16 @@ export function sameComposerQuote(a: ComposerQuote, b: ComposerQuote): boolean {
 	return a.label === b.label && a.text === b.text && a.anchor === b.anchor;
 }
 
+/** File comments refer to the existing immutable attachment; never copy editor bytes. */
+export function fileReferenceQuote(reference: FileReference): ComposerQuote {
+	const token = fileReferenceToken(reference);
+	return {
+		label: clipLabel(token.replace(/^#file:/, "")),
+		text: token,
+		anchor: `f:${reference.id}`,
+	};
+}
+
 function serializeQuote(quote: ComposerQuote): string {
 	const content = quote.text
 		.split("\n")
@@ -115,7 +125,13 @@ function serializeQuote(quote: ComposerQuote): string {
 		})
 		.join("\n");
 	const suffix = quote.anchor ? ` @@${quote.anchor}` : "";
-	return `${HEADER_PREFIX}${clipLabel(quote.label)}${suffix}\n${content}\n\n`;
+	const comment = quote.comment
+		? `\n${COMMENT_HEADER}\n${quote.comment
+				.split("\n")
+				.map((line) => `| ${line}`)
+				.join("\n")}`
+		: "";
+	return `${HEADER_PREFIX}${clipLabel(quote.label)}${suffix}\n${content}${comment}\n\n`;
 }
 
 export function serializeComposerQuotes(quotes: readonly ComposerQuote[]): string {
@@ -132,11 +148,6 @@ function lineEnd(text: string, from: number): number {
 	return end < 0 ? text.length : end;
 }
 
-/**
- * Parse the leading quote blocks. A block must be a header, at least one `>`
- * content line, then a blank line, another header, or the end of the text; a
- * block that is not terminated that way is left in the body untouched.
- */
 export function parseComposerQuotePrefix(text: string): {
 	quotes: ComposerQuote[];
 	prefixLength: number;
@@ -144,7 +155,7 @@ export function parseComposerQuotePrefix(text: string): {
 	const quotes: ComposerQuote[] = [];
 	let prefixLength = 0;
 	let pos = 0;
-	while (pos < text.length && quotes.length < MAX_COMPOSER_QUOTES) {
+	while (pos < text.length && quotes.length < MAX_COMPOSER_QUOTES + MAX_FILE_REFERENCE_COUNT) {
 		const headerEnd = lineEnd(text, pos);
 		const header = HEADER.exec(text.slice(pos, headerEnd));
 		if (!header || headerEnd >= text.length) break;
@@ -162,6 +173,20 @@ export function parseComposerQuotePrefix(text: string): {
 		if (!label) break;
 		const quote: ComposerQuote = { label, text: lines.join("\n") };
 		if (anchor) quote.anchor = anchor;
+		// A different line prefix keeps comments out of the quoted source, even
+		// when either side contains headers, pipes or nested blockquotes.
+		if (text.startsWith(`${COMMENT_HEADER}\n`, cursor)) {
+			cursor += COMMENT_HEADER.length + 1;
+			const comments: string[] = [];
+			while (cursor < text.length && text[cursor] === "|") {
+				const end = lineEnd(text, cursor);
+				const raw = text.slice(cursor, end);
+				comments.push(raw.startsWith("| ") ? raw.slice(2) : raw.slice(1));
+				cursor = end < text.length ? end + 1 : text.length;
+			}
+			if (!comments.length) break;
+			quote.comment = comments.join("\n");
+		}
 		if (cursor >= text.length) {
 			quotes.push(quote);
 			prefixLength = text.length;
@@ -255,7 +280,13 @@ export function quoteDisplayText(text: string): { text: string; jumps: QuoteDisp
 	for (const [index, quote] of quotes.entries()) {
 		const header = `${HEADER_PREFIX}${quote.label}`;
 		display += serializeQuote({ label: quote.label, text: quote.text });
-		if (quote.anchor) {
+		if (quote.comment) {
+			display += `${quote.comment
+				.split("\n")
+				.map((line) => `↳ ${line}`)
+				.join("\n")}\n\n`;
+		}
+		if (quote.anchor && !quote.anchor.startsWith("f:")) {
 			jumps.push({
 				header,
 				anchor: quote.anchor,

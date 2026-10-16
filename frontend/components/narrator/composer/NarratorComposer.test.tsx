@@ -987,10 +987,11 @@ describe("composer atomic reference contract", () => {
 	});
 	test("quote prefix renders as chips, keeps the textarea to the body, and persists with the draft", async () => {
 		await render();
-		const prefix = "> [quote] Assistant message\n> hello\n> world\n\n";
+		const prefix =
+			"> [quote] Assistant message\n> hello\n> world\n| [comment]\n| explain this quote\n\n";
 		const body = insertFileReference({ text: "explain ", fileReferences: [] }, reference);
 		const full = joinQuotedComposerInput(
-			[{ label: "Assistant message", text: "hello\nworld" }],
+			[{ label: "Assistant message", text: "hello\nworld", comment: "explain this quote" }],
 			body,
 		);
 		expect(full.text).toBe(`${prefix}${body.text}`);

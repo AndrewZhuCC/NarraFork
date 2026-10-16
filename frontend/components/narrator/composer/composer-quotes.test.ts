@@ -53,6 +53,58 @@ describe("normalizeComposerQuote", () => {
 });
 
 describe("quote prefix serialization", () => {
+	test("comments stay paired across multiple quotes, drafts and display without polluting source jumps", () => {
+		const quotes = [
+			{
+				label: "same",
+				text: "first source\n[comment]\n| [comment]",
+				anchor: "m:first",
+				comment: "change this\n\n> [quote] not a new quote\n| keep pipe\n",
+			},
+			{ label: "same", text: "second", anchor: "t:second", comment: "keep this" },
+		];
+		const body = insertFileReference({ text: "overall: ", fileReferences: [] }, reference);
+		const input = joinQuotedComposerInput(quotes, body);
+		expect(splitQuotedComposerInput(input)).toEqual({
+			quotes,
+			body: { text: body.text, fileReferences: body.fileReferences },
+		});
+		expect(parseComposerQuotePrefix(serializeComposerQuotes(quotes).trimEnd()).quotes).toEqual(
+			quotes,
+		);
+		const display = quoteDisplayText(input.text);
+		expect(display.text).toContain("↳ change this");
+		expect(display.text).toContain("↳ keep this");
+		expect(display.text).not.toContain("@@");
+		expect(display.jumps.map((jump) => jump.highlight)).toEqual(["first source", "second"]);
+		const lines = display.text.split("\n").map((text) => ({ text }));
+		expect(
+			quoteJumpForLine(
+				lines,
+				lines.findIndex((line) => line.text === "↳ keep this"),
+				display.jumps,
+			),
+		).toBeUndefined();
+	});
+
+	test("file comments keep their attachment identity and malformed comments stay visible as text", () => {
+		const quote = {
+			label: "app.ts",
+			text: "#file:app.ts",
+			anchor: "f:ref-1",
+			comment: "explain this range",
+		};
+		const input = joinQuotedComposerInput([quote], { text: "", fileReferences: [reference] });
+		expect(splitQuotedComposerInput(input)).toEqual({
+			quotes: [quote],
+			body: { text: "", fileReferences: [reference] },
+		});
+		expect(quoteDisplayText(input.text).jumps).toEqual([]);
+		expect(
+			parseComposerQuotePrefix("> [quote] L\n> source\n| [comment]\nmissing prefix").prefixLength,
+		).toBe(0);
+	});
+
 	test("round-trips quotes, including lines that look like headers", () => {
 		const quotes = [
 			{ label: "Assistant message", text: "first\n\n[quote] not a header\n\\[quote] escaped" },
