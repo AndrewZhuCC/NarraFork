@@ -1020,7 +1020,7 @@
 	"branchRenamed": "Branch renamed",
 	"contextMenu_branch": "Branch from here",
 	"contextMenu_fork": "Fork from here",
-	"contextMenu_compactBefore": "Compact to here",
+	"contextMenu_compactBefore": "Compact earlier",
 	"contextMenu_clearContextBefore": "Clear to here",
 	"contextMenu_manualSummarize": "Manual summary",
 	"contextMenu_fullscreen": "Fullscreen",
