@@ -319,6 +319,7 @@ export const knowledgeGrants = sqliteTable(
 - **admin 角色**视为拥有最高 clearance + 所有受控标签（实现层短路，不必逐条 grant）。
 - **owner**（条目/集合 `ownerUserId`）对自己拥有的内容拥有完整访问 + 写权限。
 - 默认：未授予任何 grant 的 principal 拥有 `public` clearance、无任何受控标签——即只能读 `public` 密级且不带受控标签的条目。
+- **管理界面**（仅 admin）：密级（3.4）在 `/knowledge/admin/levels`，ACL 标签与标签类型（3.5）在 `/knowledge/admin/tags`，用户授权（逐用户替换式 `setUserAcl` + 追加式批量授权）在 `/knowledge/admin/users`；知识库浏览页标题栏的「管理」按钮进入，旧的 `/knowledge?tab=admin` 重定向到这里（见 KNOWLEDGE_UI_REDESIGN.md §8.5）。
 
 ### 3.7 条目链接：knowledge_entry_links（知识图谱 + 内容级内联链接）
 
@@ -1076,5 +1077,5 @@ principal P：clearance=secret，grantedTags={product:M20}
 ### 10.4 知识库前端的其余缺口
 
 - **知识图谱无可视化**：`useEntryGraph` hook 与 `GET /entries/:id/graph` 都已就绪，缺 React Flow 之类的图视图组件。
-- **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页。
+- **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页；管理区 `/knowledge/admin` 的子导航在该页实现前不列此项（知识包 10.1 同理）。
 - **知识库事件不进 `notifications` 表**：平台通知中心（`notifications` 表）仍只存聊天和权限请求。知识库审核/发布走 6.7.6 的 WS 失效 + 铃铛里的知识库区块（审核队列计数、作者最近结论）。这是有意的：通知中心的动态投影会回查源内容，把条目标题写进该表会泄露密级，不写标题则没有可读性。铃铛上的文案因此是固定句子，不带标题或正文；findings 只出现在作者自己的结论里。`notification-service` 的钉钉/飞书 webhook 仍未接入知识库事件。
