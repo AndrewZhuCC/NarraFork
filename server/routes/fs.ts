@@ -229,8 +229,11 @@ fsRoutes.post("/reveal", async (c) => {
 
 	// Wait only for launch, not for the desktop window to close. Handle ENOENT
 	// (e.g. missing xdg-utils) as an API error rather than an unhandled child error.
+	//
+	// 这里不能加 windowsHide：explorer / open / xdg-open 都是"拉起文件管理器窗口"，
+	// 隐藏窗口会让它表现为点了没反应（GUI 程序没有控制台可隐藏）。
 	await new Promise<void>((resolve, reject) => {
-		const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
+		const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
 		child.once("error", (error) => {
 			reject(new AppError(`Could not launch file manager (${cmd}): ${error.message}`, 500));
 		});
