@@ -43,6 +43,7 @@ import { Box } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
 	type CSSProperties,
+	type MouseEvent,
 	type ReactNode,
 	useCallback,
 	useEffect,
@@ -50,6 +51,7 @@ import {
 	useState,
 } from "react";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
+import { shouldIgnoreMessageBlockSelection } from "../message/MessageSelectionCtx";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import type { ContentViewportSnapshot } from "../scroll/AutoFollowScroll";
 import { VListContentViewActions } from "./VListContentViewActions";
@@ -366,16 +368,24 @@ export function VListContentViewHost({
 	// Handled HERE rather than in VListRowInteraction because a row can host
 	// several bodies and the row layer cannot tell which one was tapped.
 	const touchSurface = isMobile || touchPointer;
-	const handleClick = useCallback(() => {
-		if (!touchSurface) return;
-		const now = Date.now();
-		if (now - lastTapRef.current < DOUBLE_TAP_MS) {
-			lastTapRef.current = 0;
-			openFullscreen();
-		} else {
-			lastTapRef.current = now;
-		}
-	}, [touchSurface, openFullscreen]);
+	const handleClick = useCallback(
+		(event: MouseEvent<HTMLDivElement>) => {
+			if (!touchSurface) return;
+			// Labels also forward a click to their controls; neither click is a body tap.
+			if (event.defaultPrevented || shouldIgnoreMessageBlockSelection(event.target)) {
+				lastTapRef.current = 0;
+				return;
+			}
+			const now = Date.now();
+			if (now - lastTapRef.current < DOUBLE_TAP_MS) {
+				lastTapRef.current = 0;
+				openFullscreen();
+			} else {
+				lastTapRef.current = now;
+			}
+		},
+		[touchSurface, openFullscreen],
+	);
 
 	return (
 		// A Mantine Box (not a raw div) keeps the pointer handlers off a static host

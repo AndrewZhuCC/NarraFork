@@ -744,6 +744,46 @@ describe("VListContentViewHost — height neutrality", () => {
 });
 
 describe("VListContentViewHost — mobile", () => {
+	test.each([
+		"narrow viewport",
+		"touch pointer",
+	])("ignores interactive controls on %s without disabling body double-tap", async (surface) => {
+		isMobileViewport = surface === "narrow viewport";
+		touchPointerMatches = surface === "touch pointer";
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: MARKDOWN_TARGET, controls });
+		const body = container?.querySelector('[data-testid="body"]');
+		if (!body) throw new Error("Missing body");
+		const label = document.createElement("label");
+		label.htmlFor = "source-mode";
+		label.textContent = "Source";
+		const input = document.createElement("input");
+		input.type = "radio";
+		input.id = "source-mode";
+		const button = document.createElement("button");
+		let clicks = 0;
+		button.addEventListener("click", () => {
+			clicks += 1;
+		});
+		body.append(label, input, button);
+		await act(async () => {
+			// A real label activation also forwards a second click to its input.
+			label.click();
+			input.click();
+			button.click();
+			button.click();
+		});
+		expect(recorded.opened).toEqual([]);
+		expect(clicks).toBe(2);
+		await act(async () => {
+			hostEl().click();
+			button.click();
+			hostEl().click();
+		});
+		expect(recorded.opened).toEqual([]);
+		await act(async () => hostEl().click());
+		expect(recorded.opened).toEqual([MARKDOWN_TARGET.id]);
+	});
 	test("shows no hover bar; a double-tap opens fullscreen instead", async () => {
 		isMobileViewport = true;
 		const { controls, recorded } = makeControls();

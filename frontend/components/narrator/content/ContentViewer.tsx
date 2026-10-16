@@ -463,6 +463,10 @@ export const ContentViewer = memo(
 			(e: React.MouseEvent) => {
 				if (!interactionEnabled) return;
 				if (isMobile) {
+					if (e.defaultPrevented || shouldIgnoreMessageBlockSelection(e.target)) {
+						lastTapRef.current = 0;
+						return;
+					}
 					handleDoubleTap();
 					return;
 				}
