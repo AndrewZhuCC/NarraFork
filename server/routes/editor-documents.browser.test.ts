@@ -22,6 +22,7 @@ import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { queryEditorOperation } from "../services/editor-document-runtime";
 import { EditorDocumentService } from "../services/editor-document-service";
 import { LocalFileChangeRuntime } from "../services/file-change-runtime";
 import { createEditorDocumentRoutes } from "./editor-documents";
@@ -62,7 +63,7 @@ function sourceBytes() {
 
 // Browser availability is a prerequisite failure, never a skipped acceptance.
 const browserTest = test;
-browserTest.each([false, true, "cache"] as const)(
+browserTest.each([false, true, "cache", "draft"] as const)(
 	"production Chromium editor and actual FilePanelContent/gate IO (hostGate=%s)",
 	async (hostGate) => {
 		expect(existsSync(CHROME)).toBe(true);
@@ -171,25 +172,51 @@ browserTest.each([false, true, "cache"] as const)(
 						db,
 						privateRoot: testEnvironment.narraforkHome,
 					});
-					const documents = new EditorDocumentService({
-						root: join(root, "transfers"),
-						execute: (request) => runtime.executeEditor(request),
-					});
+					const transferRoot = join(root, "transfers");
+					const makeDocuments = () =>
+						new EditorDocumentService({
+							root: transferRoot,
+							execute: (request) => runtime.executeEditor(request),
+							queryOperation: queryEditorOperation,
+						});
+					let documents = makeDocuments();
 					service = documents;
 					const app = new Hono();
+					let activeUser = userId;
 					app.use("*", async (c, next) => {
 						c.set("user", {
-							sub: c.req.header("x-fixture-user") === intruderId ? intruderId : userId,
+							sub: c.req.header("x-fixture-user") === intruderId ? intruderId : activeUser,
 							role: "user",
 							iat: 1,
 							exp: 9999999999,
 						});
 						await next();
 					});
-					let commits = 0;
+					let commits = 0,
+						dropNextReply = false,
+						denyReceiptQueries = false;
 					app.use("/api/narrators/*", async (c, next) => {
+						if (denyReceiptQueries && c.req.path.includes("/editor-operations/"))
+							return c.json(
+								{ error: "Fixture receipt transport unavailable", code: "FIXTURE_RECEIPT_OFFLINE" },
+								503,
+							);
 						if (c.req.method === "POST" && c.req.path.endsWith("/commit")) {
 							const commitNumber = ++commits;
+							if (hostGate === "draft") {
+								await next();
+								if (dropNextReply && c.res.status === 200) {
+									dropNextReply = false;
+									c.res = new Response(
+										JSON.stringify({
+											error: "Fixture lost the commit reply",
+											code: "FIXTURE_COMMIT_RESPONSE_LOST",
+										}),
+										{ status: 503, headers: { "content-type": "application/json" } },
+									);
+								}
+								return;
+							}
 							duringCommit = true;
 							if (commitNumber === 1) {
 								// Timing barrier ONLY: the sealed upload, route, service and runtime stay real.
@@ -228,7 +255,7 @@ browserTest.each([false, true, "cache"] as const)(
 					// emit ../ paths. This unique, gitignored directory belongs only to this test.
 					bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.editor-browser-bundle-"));
 					const manifestPath = join(bundleRoot, "manifest.json");
-					const htmlEntry = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Isolated real IO</title><link rel="icon" href="data:,"></head><body style="margin:0"><div id="root" style="height:100vh"></div><script type="module" src="/scripts/${hostGate === "cache" ? "smoke-editor-cache-fixture" : "smoke-editor-real-io-fixture"}.tsx"></script></body></html>`;
+					const htmlEntry = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Isolated real IO</title><link rel="icon" href="data:,"></head><body style="margin:0"><div id="root" style="height:100vh"></div><script type="module" src="/scripts/${hostGate === "cache" || hostGate === "draft" ? "smoke-editor-cache-fixture" : "smoke-editor-real-io-fixture"}.tsx"></script></body></html>`;
 					deadline.signal.throwIfAborted();
 					// A subprocess makes the production build cancellable. Promise.race around
 					// in-process Vite would keep writing after the deadline/finally cleanup.
@@ -404,6 +431,45 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						}
 					});
 					await bounded(page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }));
+					if (hostGate === "draft") {
+						const { editorDraftBrowserAcceptance } = await import(
+							"./editor-draft-browser-acceptance"
+						);
+						await bounded(
+							editorDraftBrowserAcceptance(page, {
+								path,
+								origin,
+								original: originalText,
+								downloadDirectory: join(root, "draft-downloads"),
+								writeDisk: (text) => writeFile(path, text),
+								readDisk: () => readFile(path, "utf8"),
+								removeDisk: () => rm(path),
+								revoke: (revoked) => {
+									activeUser = revoked ? intruderId : userId;
+								},
+								commits: () => commits,
+								loseNextReceipt: () => {
+									dropNextReply = true;
+									denyReceiptQueries = true;
+								},
+								restartService: async () => {
+									await documents.dispose();
+									documents = makeDocuments();
+									service = documents;
+									denyReceiptQueries = false;
+								},
+								changeContext: (changed) => {
+									db.update(narrators)
+										.set({ workspaceRevision: changed ? 1 : 0 })
+										.where(eq(narrators.id, narratorId))
+										.run();
+								},
+							}),
+						);
+						expect(diagnostics).toEqual([]);
+						expect(offOriginCount).toBe(0);
+						return;
+					}
 					if (hostGate === "cache") {
 						const { editorCacheBrowserAcceptance } = await import(
 							"./editor-cache-browser-acceptance"
@@ -685,6 +751,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						.set({ workspaceRevision: 1 })
 						.where(eq(narrators.id, narratorId))
 						.run();
+					const scopesBeforeDeniedHost = recoveryScopes;
 					const createsBeforeDeniedHost = documentCreates;
 					const readsBeforeDeniedHost = contentResponses;
 					await rm(path); // Actual host info (or the direct editor create) must fail.
@@ -698,7 +765,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 							!window.__editorRealIo.state().ready,
 					);
 					expect(await Bun.file(path).exists()).toBe(false);
-					expect(recoveryScopes).toBe(1);
+					expect(recoveryScopes).toBe(scopesBeforeDeniedHost + 2); // invalidation + independent gate reopen
 					const deniedHostCreates = documentCreates - createsBeforeDeniedHost;
 					const deniedHostReads = contentResponses - readsBeforeDeniedHost;
 					expect(infoFailures).toBe(hostGate ? 1 : 0);
@@ -791,7 +858,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					expect(await page.evaluate(() => window.__editorRealIo.retainedFingerprint())).toEqual(
 						fingerprint(retiredDraft),
 					);
-					expect(recoveryScopes).toBe(2);
+					expect(recoveryScopes).toBe(scopesBeforeDeniedHost + 3); // retry obtains one fresh owner proof
 					expect(httpErrors).toBe(3);
 					expect(await page.evaluate(() => window.__editorRealIo.sharedState().models)).toBe(2);
 					page.once("dialog", (dialog) => void dialog.accept());

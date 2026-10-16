@@ -144,3 +144,15 @@ test("a newly dirty entry racing an eviction decision is rechecked immediately b
 	expect(h.evicted).toEqual([]);
 	h.cache.clear();
 });
+test("orphan recovery body reservations share the clean cache budget and release idempotently", () => {
+	const h = harness({ count: 8, bytes: 64, idleMs: 1000 });
+	h.add(1, 32);
+	const release = h.cache.reserve({ models: 0, bytes: 40 });
+	expect(h.evicted).toEqual([1]);
+	release();
+	release();
+	h.add(2, 64);
+	h.cache.enforce();
+	expect(h.evicted).toEqual([1]);
+	h.cache.clear();
+});

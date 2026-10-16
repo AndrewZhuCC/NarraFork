@@ -799,6 +799,8 @@ for (const access of ["different-user", "revoked"] as const)
 		if (access === "revoked") proof.mockRejectedValue(new ApiError("Recovery denied", 403));
 		else proof.mockResolvedValue({ recoveryKey: "another-owner" });
 		await renderRecoveryFile(filePath, narratorId);
+		expect(proof).toHaveBeenCalledTimes(1);
+		proof.mockClear(); // reopening must obtain a fresh proof, coalesced across both recovery owners
 		const old = [...mountedTestModels.values()][0];
 		await edit(old, "PRIVATE RETAINED DRAFT");
 		await act(async () => root?.render(null));
@@ -831,6 +833,8 @@ test("late independent recovery proof cannot expose the old draft after the pane
 	const proof = spyOn(editorDocumentApi, "recoveryScope").mockReturnValue(pending.promise);
 	restores.push(() => proof.mockRestore());
 	await renderRecoveryFile(oldPath, narratorId);
+	expect(proof).toHaveBeenCalledTimes(1);
+	proof.mockClear();
 	const old = [...mountedTestModels.values()][0];
 	await edit(old, "PRIVATE LATE DRAFT");
 	await act(async () => root?.render(null));
@@ -934,6 +938,8 @@ for (const hostKind of ["file-panel", "standalone"] as const)
 					),
 				);
 			await renderHost();
+			expect(discovery).toHaveBeenCalledTimes(1);
+			discovery.mockClear();
 			const old = [...mountedTestModels.values()][0];
 			expect(old).toBeDefined();
 			await edit(old, "PRIVATE HOST DRAFT");
@@ -1052,6 +1058,8 @@ test("real FilePanelContent normal reopen has one recovery discovery and reuses 
 			),
 		);
 	await renderHost();
+	expect(discovery).toHaveBeenCalledTimes(1);
+	discovery.mockClear();
 	const old = [...mountedTestModels.values()][0];
 	await edit(old, "same dirty draft");
 	await act(async () => root?.render(null));

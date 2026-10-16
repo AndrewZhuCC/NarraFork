@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import type {
 	EditorDocumentDescriptor,
+	EditorDraftAnchorDescriptor,
 	EditorUploadDescriptor,
 } from "../../shared/editor-document";
 import { FILE_PANEL_PAGE_BYTES, MAX_FILE_PANEL_BYTES } from "../../shared/file-reference";
@@ -17,7 +18,8 @@ import { generateId } from "../lib/id";
 import { narraforkDir } from "../lib/settings";
 import { commitEditorUploadSchema } from "../lib/validators/editor-documents";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
-import type { EditorActor } from "../services/editor-document-service";
+import { queryEditorOperation } from "../services/editor-document-runtime";
+import type { EditorActor, EditorDocumentDependencies } from "../services/editor-document-service";
 import { EditorDocumentService } from "../services/editor-document-service";
 import { LocalFileChangeRuntime } from "../services/file-change-runtime";
 import { createEditorDocumentRoutes, readEditorMetadata } from "./editor-documents";
@@ -144,6 +146,185 @@ function bindChapter(
 	return { chapterId, projectId };
 }
 
+async function anchorFor(
+	doc: EditorDocumentDescriptor,
+	writerId = "writer-a",
+	modelLifetime = "model-a",
+	revision = 3,
+) {
+	const response = await request(`${base()}/draft-anchors`, "POST", {
+		origin: "reference",
+		deviceId: "local",
+		resourceKey: doc.resourceKey,
+		writerId,
+		modelLifetime,
+		revision,
+	});
+	expect(response.status).toBe(200);
+	const anchor = (await response.json()) as EditorDraftAnchorDescriptor;
+	expect(
+		(
+			await request(`${base()}/draft-anchors/${anchor.anchorId}/publish`, "POST", {
+				origin: "reference",
+				deviceId: "local",
+			})
+		).status,
+	).toBe(200);
+	return anchor;
+}
+const anchorUrl = (id: string) => `${base()}/draft-anchors/${id}?origin=reference&deviceId=local`;
+test("draft anchor discovery keeps actual narrator ACL and original owner even when the current file is missing", async () => {
+	const doc = await openDoc("reference"),
+		anchor = await anchorFor(doc);
+	await rm(path);
+	expect((await request(anchorUrl(anchor.anchorId))).status).toBe(200);
+	expect(
+		(await request(`${base()}/draft-anchors/${anchor.anchorId}?origin=legacy&deviceId=local`))
+			.status,
+	).toBe(404);
+	const intruder = generateId();
+	db.insert(users)
+		.values({
+			id: intruder,
+			username: intruder,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	tokenUser = intruder;
+	expect((await request(anchorUrl(anchor.anchorId))).status).toBeGreaterThanOrEqual(403);
+	expect(
+		(
+			await request(`${base()}/draft-anchors/${anchor.anchorId}/claim`, "POST", {
+				origin: "reference",
+				deviceId: "local",
+			})
+		).status,
+	).toBeGreaterThanOrEqual(403);
+});
+test("draft provenance persistence failure fails before file-change dispatch and preserves the original file", async () => {
+	const doc = await openDoc("reference");
+	await anchorFor(doc);
+	const { url } = await seal(doc);
+	const execute = spyOn(
+		(service as unknown as { deps: EditorDocumentDependencies }).deps,
+		"execute",
+	);
+	const failure = spyOn(service.draftAnchors, "persist").mockRejectedValue(
+		new Error("fixture disk failure"),
+	);
+	try {
+		const response = await request(`${url}/commit`, "POST", {
+			draftWriterId: "writer-a",
+			draftModelLifetime: "model-a",
+		});
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({ code: "EDITOR_DRAFT_PROVENANCE_UNAVAILABLE" });
+		expect(execute).not.toHaveBeenCalled();
+		expect(await readFile(path, "utf8")).toBe("original\r\n");
+	} finally {
+		failure.mockRestore();
+		execute.mockRestore();
+	}
+});
+test("draft anchors and the same durable save receipt survive a real editor-service cold restart", async () => {
+	const doc = await openDoc("reference"),
+		a = await anchorFor(doc),
+		b = await anchorFor(doc, "writer-b");
+	const { url, upload } = await seal(doc);
+	const response = await request(`${url}/commit`, "POST", {
+		draftWriterId: "writer-a",
+		draftModelLifetime: "model-a",
+	});
+	expect(response.status).toBe(200);
+	const saved = await response.json();
+	expect(saved.operationId).toBe(upload.operationId);
+	await service.dispose();
+	const runtime = new LocalFileChangeRuntime({ db, privateRoot: testEnvironment.narraforkHome });
+	service = new EditorDocumentService({
+		root: join(root, "transfers"),
+		execute: (request) => runtime.executeEditor(request),
+		queryOperation: queryEditorOperation,
+	});
+	const anchor = await (await request(anchorUrl(a.anchorId))).json();
+	expect(anchor).toMatchObject({
+		status: "query-first",
+		operation: { operationId: saved.operationId, snapshotRevision: 123 },
+	});
+	expect(await (await request(anchorUrl(b.anchorId))).json()).toMatchObject({
+		status: "no-dispatch",
+	});
+	const receipt = await request(
+		`/api/narrators/${narratorId}/editor-operations/${saved.operationId}`,
+	);
+	expect(receipt.status).toBe(200);
+	expect(await receipt.json()).toMatchObject({
+		status: "saved",
+		result: { operationId: saved.operationId, snapshotRevision: 123 },
+	});
+	expect(
+		await (
+			await request(`${base()}/draft-anchors/${a.anchorId}/claim`, "POST", {
+				origin: "reference",
+				deviceId: "local",
+			})
+		).json(),
+	).toMatchObject({ status: "query-first", retired: false });
+	expect(await readFile(path, "utf8")).toBe("new\r\n");
+});
+test("new ordinary coverage requires a matching terminal receipt, never just a saved-status hint", async () => {
+	const doc = await openDoc("reference");
+	await anchorFor(doc);
+	const { url } = await seal(doc);
+	const saved = await (
+		await request(`${url}/commit`, "POST", {
+			draftWriterId: "writer-a",
+			draftModelLifetime: "model-a",
+		})
+	).json();
+	const mismatch = spyOn(service, "operation").mockResolvedValue({
+		operationId: saved.operationId,
+		status: "saved",
+		result: { ...saved, snapshotRevision: 124 },
+	});
+	try {
+		expect((await anchorFor(doc, "writer-a", "model-a", 4)).status).toBe("query-first");
+	} finally {
+		mismatch.mockRestore();
+	}
+	expect((await anchorFor(doc, "writer-a", "model-a", 5)).status).toBe("no-dispatch");
+});
+test("explicit recovery claim rejects a late old writer lifetime but lets its newly opened editor save", async () => {
+	const doc = await openDoc("reference"),
+		anchor = await anchorFor(doc),
+		old = await seal(doc);
+	expect(
+		await (
+			await request(`${base()}/draft-anchors/${anchor.anchorId}/claim`, "POST", {
+				origin: "reference",
+				deviceId: "local",
+			})
+		).json(),
+	).toMatchObject({ status: "no-dispatch", retired: true });
+	const late = await request(`${old.url}/commit`, "POST", {
+		draftWriterId: "writer-a",
+		draftModelLifetime: "model-a",
+	});
+	expect(late.status).toBe(409);
+	expect(await late.json()).toMatchObject({ code: "EDITOR_DRAFT_WRITER_RETIRED" });
+	expect(await readFile(path, "utf8")).toBe("original\r\n");
+	await anchorFor(doc, "writer-a", "model-new");
+	const fresh = await seal(doc);
+	expect(
+		(
+			await request(`${fresh.url}/commit`, "POST", {
+				draftWriterId: "writer-a",
+				draftModelLifetime: "model-new",
+			})
+		).status,
+	).toBe(200);
+});
 test("resource keys distinguish origin and execution revision even when the absolute path and cwd are unchanged", async () => {
 	const legacy = await openDoc("legacy");
 	const repeated = await openDoc("legacy");

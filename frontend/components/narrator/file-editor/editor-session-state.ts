@@ -39,6 +39,9 @@ export interface EditorSessionState {
 	version: DocumentVersion | null;
 	phase: "idle" | "encoding" | "uploading" | "committing" | "unknown";
 	error: string | null;
+	backupIncomplete?: boolean;
+	restoredDraft?: boolean;
+	restoredDiskChanged?: boolean;
 	confirmation: EditorConfirmationData | null;
 	conflict: (EditorConflictData & { docId: string }) | null;
 }
@@ -85,6 +88,12 @@ export interface EditorSessionOptions {
 	encodedHash?: typeof getEncodedEditorSnapshotHash;
 	applyContent: (text: string, document?: EditorDocumentDescriptor) => DocumentVersion | null;
 	onChange: (state: EditorSessionState) => void;
+	beforeDispatch?: (operation: {
+		operationId?: string;
+		snapshotRevision: number;
+		status: "query-first";
+	}) => Promise<undefined | { draftWriterId?: string; draftModelLifetime?: string }>;
+	onSaved?: (revision: number) => void;
 	api?: typeof editorDocumentApi;
 	translate?: (key: string, fallback: string) => string;
 	readOnlySource?: (
@@ -275,6 +284,48 @@ export class EditorDocumentSession {
 		}
 		return next;
 	}
+	/** Credential-free association for crash backups; never permits a second apply. */
+	get draftOperation() {
+		return this.attempt && this.state.phase !== "idle"
+			? {
+					operationId: this.attempt.operationId,
+					snapshotRevision: this.attempt.version.revision,
+					status: "query-first" as const,
+				}
+			: undefined;
+	}
+	setBackupError(incomplete: boolean) {
+		if (this.state.backupIncomplete === incomplete || this.disposed) return;
+		this.state = { ...this.state, backupIncomplete: incomplete };
+		this.options.onChange(this.state);
+	}
+	/** Explicit user recovery only: the original baseline is retained even if disk changed. */
+	restoreDraft(text: string, baseHash: string | null, encoding: string) {
+		if (
+			this.disposed ||
+			!this.state.loaded ||
+			this.state.invalidated ||
+			this.state.phase !== "idle" ||
+			sessionDirty(this.state)
+		)
+			return false;
+		const diskChanged = this.state.baseHash !== baseHash;
+		const version = this.options.applyContent(text);
+		if (!version) return false;
+		this.resetBaseline(null);
+		this.update({
+			version,
+			baseline: null,
+			equivalentVersion: null,
+			baseHash,
+			encoding,
+			restoredDraft: true,
+			restoredDiskChanged: diskChanged,
+			confirmation: null,
+			conflict: null,
+		});
+		return true;
+	}
 	/** Reauthorization deliberately does NOT install the newly observed disk baseline or text. */
 	private async recover(signal: AbortSignal) {
 		const next = await this.authorize(signal);
@@ -421,6 +472,7 @@ export class EditorDocumentSession {
 			return;
 		}
 		this.attempt = null;
+		this.options.onSaved?.(attempt.version.revision);
 		this.resetBaseline(attempt.version, attempt.blob);
 		this.update({
 			baseHash: result.hash,
@@ -513,11 +565,18 @@ export class EditorDocumentSession {
 		if (!attempt.uploadId || this.attempt !== attempt || this.state.invalidated) return;
 		this.update({ phase: "committing", confirmation: null, error: null });
 		try {
+			const provenance = await this.options.beforeDispatch?.({
+				operationId: attempt.operationId,
+				snapshotRevision: attempt.version.revision,
+				status: "query-first",
+			});
+			if (this.attempt !== attempt || this.state.invalidated) return;
+			attempt.controller.signal.throwIfAborted();
 			const result = await this.api.commit(
 				this.options.narratorId,
 				attempt.docId,
 				attempt.uploadId,
-				confirmationToken ? { confirmationToken } : {},
+				{ ...(provenance ?? {}), ...(confirmationToken ? { confirmationToken } : {}) },
 				attempt.controller.signal,
 			);
 			if (this.attempt !== attempt) return;
@@ -535,6 +594,24 @@ export class EditorDocumentSession {
 					: undefined;
 			if (data?.operationId) attempt.operationId = data.operationId;
 			if (this.state.invalidated || this.authorizationFailed(error)) return;
+			if (
+				data?.code === "EDITOR_DRAFT_WRITER_RETIRED" ||
+				data?.code === "EDITOR_DRAFT_PROVENANCE_UNAVAILABLE" ||
+				data?.code === "EDITOR_DRAFT_ANCHOR_LIMIT"
+			) {
+				this.cancel(true);
+				this.update({
+					error: this.text(
+						data.code === "EDITOR_DRAFT_WRITER_RETIRED"
+							? "draftWriterRetired"
+							: "draftSafetyFailed",
+						data.code === "EDITOR_DRAFT_WRITER_RETIRED"
+							? "This writer was retired by explicit draft recovery. Your text is preserved; reopen the previous editor before saving."
+							: "The server could not persist the recovery safety check. No write was dispatched; keep the draft and retry after storage is repaired.",
+					),
+				});
+				return;
+			}
 			if (data?.code === "NEEDS_CONFIRMATION") {
 				if (this.state.version?.revision !== attempt.version.revision) {
 					this.cancel(true);

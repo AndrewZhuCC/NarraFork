@@ -1,3 +1,4 @@
+import type { EditorRecoveryScope } from "@shared/editor-document";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { EDITOR_CACHE_LIMITS, type EditorCacheItem, EditorModelCache } from "./editor-model-cache";
 import { EditorWorkingCopy, type WorkingCopyOptions } from "./editor-working-copy";
@@ -24,6 +25,16 @@ export interface EditorRecoveryLease {
 /** Realm-local only. A path (even an absolute path) is NEVER an authorization identity. */
 export class EditorDocumentRegistry {
 	private entries = new Set<Entry>();
+	private recoveryBodies = new Set<{ bytes: number }>();
+	reserveRecovery(bytes: number) {
+		if (!Number.isFinite(bytes) || bytes < 0) throw new Error("Invalid recovery reservation");
+		const cost = { bytes };
+		this.recoveryBodies.add(cost);
+		const release = this.cache.reserve({ models: 0, bytes });
+		return () => {
+			if (this.recoveryBodies.delete(cost)) release();
+		};
+	}
 	private cache: EditorModelCache<Entry>;
 	constructor(limits = EDITOR_CACHE_LIMITS, now = Date.now) {
 		this.cache = new EditorModelCache<Entry>(limits, now);
@@ -46,6 +57,11 @@ export class EditorDocumentRegistry {
 			visible = 0,
 			pinnedBytes = 0;
 		const pinReasons: Record<string, number> = {};
+		for (const cost of this.recoveryBodies) {
+			bytes += cost.bytes;
+			pinnedBytes += cost.bytes;
+		}
+		if (this.recoveryBodies.size) pinReasons["recovery-candidate"] = this.recoveryBodies.size;
 		for (const entry of this.entries) {
 			const cost = entry.copy.resourceCosts;
 			models += entry.copy.model ? 1 : 0;
@@ -76,13 +92,23 @@ export class EditorDocumentRegistry {
 	private removeUnload: (() => void) | undefined;
 	private watchUnload() {
 		if (this.removeUnload || typeof window === "undefined") return;
+		const flush = () => {
+			for (const entry of this.entries) entry.copy.draftCheckpoint?.flush();
+		};
 		const listener = (event: BeforeUnloadEvent) => {
+			flush();
 			if (![...this.entries].some((entry) => entry.copy.protected)) return;
 			event.preventDefault();
 			event.returnValue = "";
 		};
 		window.addEventListener("beforeunload", listener);
-		this.removeUnload = () => window.removeEventListener("beforeunload", listener);
+		window.addEventListener("pagehide", flush);
+		document.addEventListener("visibilitychange", flush);
+		this.removeUnload = () => {
+			window.removeEventListener("beforeunload", listener);
+			window.removeEventListener("pagehide", flush);
+			document.removeEventListener("visibilitychange", flush);
+		};
 	}
 	async acquire(
 		options: WorkingCopyOptions,
@@ -200,6 +226,7 @@ export class EditorDocumentRegistry {
 		options: WorkingCopyOptions,
 		signal: AbortSignal,
 		exclude: Promise<EditorWorkingCopy | null> = Promise.resolve(null),
+		authorizeScope?: (signal: AbortSignal) => Promise<EditorRecoveryScope>,
 	): Promise<EditorRecoveryLease> {
 		const origin = options.origin();
 		const generation = this.generations.get(options.narratorId) ?? 0;
@@ -225,11 +252,13 @@ export class EditorDocumentRegistry {
 		if (!candidates.length) return { retainedCopies: [], release: () => {} };
 		// The path above is only a UI filter. ONLY this fresh, server-verified owner scope
 		// may expose a previous draft; JWT/cache hints and a successful create are not proof.
-		const scope = await editorDocumentApi.recoveryScope(
-			options.narratorId,
-			{ deviceId: options.deviceId, origin },
-			signal,
-		);
+		const scope = await (authorizeScope
+			? authorizeScope(signal)
+			: editorDocumentApi.recoveryScope(
+					options.narratorId,
+					{ deviceId: options.deviceId, origin },
+					signal,
+				));
 		let removeAbort: (() => void) | undefined;
 		const current = await Promise.race([
 			exclude,
@@ -275,6 +304,17 @@ export class EditorDocumentRegistry {
 				}
 			},
 		};
+	}
+	canDiscardRetained(copy: EditorWorkingCopy) {
+		const entry = [...this.entries].find((candidate) => candidate.copy === copy);
+		const state = copy.getSnapshot();
+		return (
+			!!entry &&
+			entry.viewReferences === 0 &&
+			!!state.invalidated &&
+			state.phase === "idle" &&
+			!state.checkingReceipt
+		);
 	}
 	/** Called only after explicit user confirmation. Never dispose a model attached to an old view. */
 	discardRetained(copy: EditorWorkingCopy): boolean {

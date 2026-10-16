@@ -68,6 +68,33 @@ export interface EditorUploadDescriptor {
 
 export interface EditorCommitInput {
 	confirmationToken?: string;
+	/** Local checkpoint provenance only; never grants file access. */
+	draftWriterId?: string;
+	draftModelLifetime?: string;
+}
+export interface EditorDraftAnchorOperation {
+	operationId?: string;
+	snapshotRevision: number;
+}
+export interface CreateEditorDraftAnchorInput extends EditorRecoveryScopeInput {
+	writerId: string;
+	resourceKey: string;
+	revision: number;
+	modelLifetime: string;
+	operation?: EditorDraftAnchorOperation;
+}
+export interface EditorDraftAnchorDescriptor {
+	anchorId: string;
+	checkpointGeneration: string;
+	recoveryKey: string;
+	resourceKey: string;
+	writerId: string;
+	revision: number;
+	modelLifetime: string;
+	status: "no-dispatch" | "query-first";
+	operation?: EditorDraftAnchorOperation;
+	retired: boolean;
+	expiresAt: number;
 }
 
 export interface EditorSaveResult {

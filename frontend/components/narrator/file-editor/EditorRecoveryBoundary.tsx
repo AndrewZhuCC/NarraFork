@@ -1,4 +1,5 @@
 import { Alert, Box, Button, Group, Text } from "@mantine/core";
+import type { EditorRecoveryScope } from "@shared/editor-document";
 import {
 	createContext,
 	type ReactNode,
@@ -11,9 +12,11 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../../../lib/api/client";
+import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { useEditorPanelVisible } from "../narrator-panel-visibility";
 import { filePanelBaseName } from "../panels/panel-kind";
+import { EditorDraftRecovery } from "./EditorDraftRecovery";
 import { useEditorAuthority } from "./editor-authority";
 import { editorDocumentRegistry } from "./editor-document-registry";
 import type { EditorSessionState } from "./editor-session-state";
@@ -71,7 +74,22 @@ class RecoveryHost {
 		this.slot.kind = "view";
 		this.slot.token = token;
 		this.slot.resolve(viewing);
+		let active = true;
+		let unsubscribe: (() => void) | undefined;
+		void viewing.then((copy) => {
+			if (!active || !copy) return;
+			let invalidated = !!copy.getSnapshot().invalidated;
+			unsubscribe = copy.subscribe(() => {
+				const next = !!copy.getSnapshot().invalidated;
+				if (next === invalidated || this.slot.token !== token) return;
+				invalidated = next;
+				this.snapshot = { epoch: this.snapshot.epoch + 1, exclude: this.slot.exclude };
+				for (const listener of this.listeners) listener();
+			});
+		});
 		return () => {
+			active = false;
+			unsubscribe?.();
 			if (this.slot.token === token) this.slot.token = null;
 		};
 	}
@@ -126,6 +144,23 @@ function RecoveryBoundaryIdentity({
 	const [error, setError] = useState<string | null>(null);
 	const [publishedFor, setPublishedFor] = useState<typeof request | null>(null);
 	const visible = useEditorPanelVisible();
+	// Coalesce only this visible discovery generation, not a cross-request ACL cache.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a new visible request must obtain fresh ACL proof
+	const authorizeScope = useMemo(() => {
+		let pending: Promise<EditorRecoveryScope> | undefined;
+		let ownerSignal: AbortSignal | undefined;
+		return (signal: AbortSignal) => {
+			if (!pending || ownerSignal?.aborted) {
+				ownerSignal = signal;
+				pending = editorDocumentApi.recoveryScope(
+					narratorId ?? "",
+					{ deviceId, origin: referenceOrigin ? "reference" : "legacy" },
+					signal,
+				);
+			}
+			return pending;
+		};
+	}, [narratorId, deviceId, referenceOrigin, request, visible]);
 	useEffect(() => {
 		if (!visible) return;
 		setRetained([]);
@@ -141,7 +176,7 @@ function RecoveryBoundaryIdentity({
 			translate: (key, defaultValue) => latest.current(`fileEditor.${key}`, { defaultValue }),
 		};
 		void editorDocumentRegistry
-			.discoverRetained(options, controller.signal, request.exclude)
+			.discoverRetained(options, controller.signal, request.exclude, authorizeScope)
 			.then((lease) => {
 				if (controller.signal.aborted) {
 					lease.release();
@@ -166,10 +201,21 @@ function RecoveryBoundaryIdentity({
 			controller.abort();
 			release?.();
 		};
-	}, [narratorId, filePath, deviceId, referenceOrigin, request, visible]);
+	}, [narratorId, filePath, deviceId, referenceOrigin, request, visible, authorizeScope]);
 	return (
 		<RecoveryHostContext.Provider value={host}>
 			<Box style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
+				<EditorDraftRecovery
+					visible={visible}
+					exclude={request.exclude}
+					authorizeScope={authorizeScope}
+					options={{
+						narratorId: narratorId ?? "",
+						path: filePath,
+						deviceId,
+						origin: () => (referenceOrigin ? "reference" : "legacy"),
+					}}
+				/>
 				{publishedFor === request &&
 					retained.map((copy) => <RetainedEditorCopy key={copy.lifetimeId} copy={copy} />)}
 				{publishedFor === request && error && (
@@ -227,9 +273,23 @@ function RetainedEditorCopy({ copy }: { copy: EditorWorkingCopy }) {
 			if (!pending.signal.aborted) setExporting(false);
 		}
 	};
-	const discard = () => {
+	const discard = async () => {
 		if (!window.confirm(t("fileEditor.confirmDiscardRetained"))) return;
-		if (!editorDocumentRegistry.discardRetained(copy)) setError(t("fileEditor.closeRetainedView"));
+		if (!editorDocumentRegistry.canDiscardRetained(copy)) {
+			setError(t("fileEditor.closeRetainedView"));
+			return;
+		}
+		setExporting(true);
+		try {
+			if ((await copy.draftCheckpoint?.discard()) === false) {
+				setError(t("fileEditor.backupIncomplete"));
+				return;
+			}
+			if (!editorDocumentRegistry.discardRetained(copy))
+				setError(t("fileEditor.closeRetainedView"));
+		} finally {
+			setExporting(false);
+		}
 	};
 	if (state.discarded) return null;
 	return (

@@ -14,6 +14,7 @@ import { settings } from "../lib/settings";
 import {
 	commitEditorUploadSchema,
 	createEditorDocumentSchema,
+	createEditorDraftAnchorSchema,
 	createEditorUploadSchema,
 	editorRecoveryScopeSchema,
 } from "../lib/validators/editor-documents";
@@ -218,6 +219,57 @@ export function createEditorDocumentRoutes(
 		await protect(c);
 		return c.json(scope);
 	});
+	routes.post(`${base}/draft-anchors`, async (c) => {
+		await protect(c);
+		const input = await readEditorMetadata(c.req.raw, createEditorDraftAnchorSchema);
+		if (input.deviceId && input.deviceId !== "local")
+			throw new AppError("Remote draft anchors are unsupported", 422, "EDITOR_REMOTE_UNSUPPORTED");
+		const anchor = await getService().createDraftAnchor(editorActor(c), input);
+		await protect(c);
+		return c.json(anchor);
+	});
+	routes.get(`${base}/draft-anchors/:anchorId`, async (c) => {
+		await protect(c);
+		const parsed = editorRecoveryScopeSchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const id = c.req.param("anchorId");
+		if (!/^[a-f0-9-]{36}$/.test(id))
+			throw new AppError("Invalid draft anchor", 400, "VALIDATION_ERROR");
+		const anchor = await getService().draftAnchors.get(
+			editorRecoveryKey(editorActor(c), { ...parsed.data, path: "" }),
+			id,
+		);
+		await protect(c);
+		return c.json(anchor);
+	});
+	routes.delete(`${base}/draft-anchors/:anchorId`, async (c) => {
+		await protect(c);
+		const parsed = editorRecoveryScopeSchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const id = c.req.param("anchorId");
+		if (!/^[a-f0-9-]{36}$/.test(id))
+			throw new AppError("Invalid draft anchor", 400, "VALIDATION_ERROR");
+		const result = await getService().draftAnchors.release(
+			editorRecoveryKey(editorActor(c), { ...parsed.data, path: "" }),
+			id,
+		);
+		await protect(c);
+		return c.json(result);
+	});
+	for (const action of ["publish", "claim"] as const)
+		routes.post(`${base}/draft-anchors/:anchorId/${action}`, async (c) => {
+			await protect(c);
+			const scope = await readEditorMetadata(c.req.raw, editorRecoveryScopeSchema);
+			const id = c.req.param("anchorId");
+			if (!/^[a-f0-9-]{36}$/.test(id))
+				throw new AppError("Invalid draft anchor", 400, "VALIDATION_ERROR");
+			const anchor = await getService().draftAnchors[action](
+				editorRecoveryKey(editorActor(c), { ...scope, path: "" }),
+				id,
+			);
+			await protect(c);
+			return c.json(anchor);
+		});
 	routes.post(base, async (c) =>
 		c.json(
 			await getService().create(

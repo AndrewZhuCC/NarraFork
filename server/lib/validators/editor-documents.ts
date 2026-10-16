@@ -30,6 +30,21 @@ export const createEditorDocumentSchema = z
 	})
 	.strict();
 export const editorRecoveryScopeSchema = createEditorDocumentSchema.omit({ path: true }).strict();
+export const createEditorDraftAnchorSchema = editorRecoveryScopeSchema
+	.extend({
+		writerId: z.string().min(1).max(128),
+		resourceKey: z.string().regex(/^[a-f0-9]{64}$/),
+		revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+		modelLifetime: z.string().min(1).max(128),
+		operation: z
+			.object({
+				operationId: z.string().uuid().optional(),
+				snapshotRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+			})
+			.strict()
+			.optional(),
+	})
+	.strict();
 export const createEditorUploadSchema = z
 	.object({
 		baseHash: z
@@ -43,5 +58,10 @@ export const createEditorUploadSchema = z
 export const commitEditorUploadSchema = z
 	.object({
 		confirmationToken: z.string().min(1).max(128).optional(),
+		draftWriterId: z.string().min(1).max(128).optional(),
+		draftModelLifetime: z.string().min(1).max(128).optional(),
 	})
-	.strict();
+	.strict()
+	.refine((input) => !!input.draftWriterId === !!input.draftModelLifetime, {
+		message: "Draft writer and model lifetime must be provided together",
+	});

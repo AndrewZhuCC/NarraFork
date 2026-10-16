@@ -1,6 +1,8 @@
 import type { EditorDocumentDescriptor } from "@shared/editor-document";
 import type { editor } from "monaco-editor/editor/editor.api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
+import { EditorDraftCheckpoint } from "./editor-draft-checkpoint";
+import type { EditorDraftScope } from "./editor-draft-store";
 import { createEditorLocalId } from "./editor-local-id";
 import {
 	EditorDocumentSession,
@@ -42,6 +44,11 @@ export class EditorWorkingCopy {
 	readonly key: string;
 	readonly lifetimeId = createEditorLocalId();
 	readonly recoveryKey?: string;
+	readonly draftScope?: EditorDraftScope;
+	readonly draftCheckpoint?: EditorDraftCheckpoint;
+	setBackupError(incomplete: boolean) {
+		this.session.setBackupError(incomplete);
+	}
 	model: editor.ITextModel | null = null;
 	private listeners = new Set<() => void>();
 	private subscription: { dispose(): void } | null = null;
@@ -168,7 +175,24 @@ export class EditorWorkingCopy {
 				return this.version();
 			},
 			onChange: () => this.emit(),
+			beforeDispatch: (operation) =>
+				this.draftCheckpoint?.beforeDispatch(operation) ?? Promise.resolve(undefined),
+			onSaved: (revision) => {
+				void this.draftCheckpoint?.saved(revision);
+			},
 		});
+		if (descriptor?.resourceKey && descriptor.recoveryKey && !options.readOnlySource) {
+			this.draftScope = {
+				recoveryKey: descriptor.recoveryKey,
+				resourceKey: descriptor.resourceKey,
+				narratorId: options.narratorId,
+				deviceId: options.deviceId,
+				origin: options.origin(),
+				canonicalPath: descriptor.target.path,
+				requestedPath: options.path,
+			};
+			this.draftCheckpoint = new EditorDraftCheckpoint(this, this.draftScope);
+		}
 	}
 	private version() {
 		if (!this.model) throw new Error("Editor is not ready");
@@ -186,6 +210,7 @@ export class EditorWorkingCopy {
 		};
 	};
 	private emit() {
+		this.draftCheckpoint?.changed();
 		for (const listener of this.listeners) listener();
 	}
 	get protected() {
@@ -239,6 +264,7 @@ export class EditorWorkingCopy {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.generation++;
+		this.draftCheckpoint?.dispose();
 		this.subscription?.dispose();
 		this.session.dispose();
 		this.model?.dispose();

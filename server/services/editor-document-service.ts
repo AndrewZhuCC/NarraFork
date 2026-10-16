@@ -5,6 +5,7 @@ import { chmod, chown, lstat, mkdir, open, readdir, rm, rmdir, unlink } from "no
 import { join } from "node:path";
 import {
 	type CreateEditorDocumentInput,
+	type CreateEditorDraftAnchorInput,
 	type CreateEditorUploadInput,
 	EDITOR_MAX_OPERATIONS,
 	EDITOR_MAX_SESSIONS,
@@ -30,6 +31,7 @@ import { logger } from "../lib/logger";
 import type { EditorOperationMetadata } from "../lib/validators/editor-documents";
 import { EditorDocumentJobs } from "./editor-document-jobs";
 import type { EditorVersionMetadata } from "./editor-document-worker";
+import { EditorDraftAnchorStore } from "./editor-draft-anchor-store";
 import type { EditorFileChangeRequest, FileChangeCompletion } from "./file-change-runtime";
 
 export interface EditorBinding {
@@ -309,8 +311,57 @@ export class EditorDocumentService {
 		this.count(this.userBytes, operation.userId, EDITOR_METADATA_MAX_BYTES);
 		this.totalBytes += EDITOR_METADATA_MAX_BYTES;
 	}
+	readonly draftAnchors: EditorDraftAnchorStore;
 	constructor(private readonly deps: EditorDocumentDependencies) {
+		this.draftAnchors = new EditorDraftAnchorStore(`${deps.root}-draft-recovery`);
 		this.jobs = deps.jobs ?? new EditorDocumentJobs();
+	}
+	private async settledDraftOperations(
+		actor: EditorActor,
+		owner: string,
+		writerId: string,
+		resourceKey: string,
+		modelLifetime: string,
+		extra?: { operationId?: string; snapshotRevision: number },
+	) {
+		const pending = await this.draftAnchors.pendingOperations(
+			owner,
+			writerId,
+			resourceKey,
+			modelLifetime,
+		);
+		if (extra?.operationId && !pending.some((op) => op.operationId === extra.operationId))
+			pending.push(extra);
+		const settled: string[] = [];
+		for (const operation of pending)
+			if (operation.operationId) {
+				try {
+					const receipt = await this.operation(actor, operation.operationId);
+					if (
+						receipt.operationId === operation.operationId &&
+						(receipt.status === "failed" ||
+							(receipt.status === "saved" &&
+								receipt.result?.operationId === operation.operationId &&
+								receipt.result.snapshotRevision === operation.snapshotRevision))
+					)
+						settled.push(operation.operationId);
+				} catch {
+					/* Missing/transport failures never prove a terminal operation. */
+				}
+			}
+		return settled;
+	}
+	async createDraftAnchor(actor: EditorActor, input: CreateEditorDraftAnchorInput) {
+		const owner = editorRecoveryKey(actor, { ...input, path: "" });
+		const settled = await this.settledDraftOperations(
+			actor,
+			owner,
+			input.writerId,
+			input.resourceKey,
+			input.modelLifetime,
+			input.operation,
+		);
+		return this.draftAnchors.create(owner, input, settled);
 	}
 	private initialize(): Promise<void> {
 		this.ready ??= this.bootstrap().catch((error) => {
@@ -939,6 +990,26 @@ export class EditorDocumentService {
 		this.addOperation(operationId, operation);
 		this.reserve(session, -EDITOR_METADATA_MAX_BYTES); // Reservation is now owned by operations.
 		try {
+			if (input.draftWriterId) {
+				const owner = editorRecoveryKey(actor, session.input),
+					resource = editorResourceKey(actor, session.input, binding),
+					lifetime = input.draftModelLifetime ?? "";
+				const settled = await this.settledDraftOperations(
+					actor,
+					owner,
+					input.draftWriterId,
+					resource,
+					lifetime,
+				);
+				await this.draftAnchors.beforeDispatch(
+					owner,
+					input.draftWriterId,
+					resource,
+					lifetime,
+					{ operationId, snapshotRevision: upload.snapshotRevision },
+					settled,
+				);
+			}
 			const run = async () =>
 				this.jobs.withIo(actor.userId, async (signal) => {
 					const completed = await this.deps.execute({

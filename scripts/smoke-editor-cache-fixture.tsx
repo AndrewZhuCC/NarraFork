@@ -14,6 +14,11 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { editorDocumentRegistry } from "../frontend/components/narrator/file-editor/editor-document-registry";
+import { editorDraftScheduler } from "../frontend/components/narrator/file-editor/editor-draft-checkpoint";
+import {
+	editorDraftStore,
+	editorDraftWriterId,
+} from "../frontend/components/narrator/file-editor/editor-draft-store";
 import { getEditorWorkerDiagnostics } from "../frontend/components/narrator/file-editor/editor-worker-client";
 import { getEditorViewDiagnostics } from "../frontend/components/narrator/file-editor/MonacoEditor";
 import { loadMonaco } from "../frontend/components/narrator/file-editor/monaco-loader";
@@ -23,6 +28,7 @@ import {
 } from "../frontend/components/narrator/file-panel/FilePanelContent";
 import { NarratorPanelVisibilityProvider } from "../frontend/components/narrator/narrator-panel-visibility";
 import { WorkspaceResourceFrame } from "../frontend/components/narrator/workspace/WorkspaceResourceFrame";
+import { editorDocumentApi } from "../frontend/lib/api/editor-documents";
 import translations from "../frontend/locales/en/narrator.json";
 
 export async function runEditorCacheFixture(config: { path: string; narratorId: string }) {
@@ -139,6 +145,11 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 				ready: !!dock,
 				tabs: dock?.panels.filter((panel) => panel.id.startsWith("file-")).length ?? 0,
 				registry: editorDocumentRegistry.diagnostics(),
+				drafts: {
+					...editorDraftStore.diagnostics,
+					writerId: editorDraftWriterId,
+					...editorDraftScheduler.diagnostics(),
+				},
 				...getEditorViewDiagnostics(),
 				monacoModels: monaco.editor.getModels().length,
 				workers: getEditorWorkerDiagnostics(),
@@ -156,6 +167,27 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 					)?.api.isVisible,
 				})),
 			};
+		},
+		async tryCheckpointCleanup() {
+			const scope = await editorDocumentApi.recoveryScope(config.narratorId, {
+				deviceId: "local",
+				origin: "reference",
+			});
+			const row = (await editorDraftStore.list(scope.recoveryKey)).find(
+				(row) => row.writerId === editorDraftWriterId,
+			);
+			if (!row) return { attempted: false, failed: false };
+			try {
+				await editorDraftStore.removeSaved(
+					row.writerId,
+					row.scope.resourceKey,
+					row.revision,
+					row.modelLifetime,
+				);
+				return { attempted: true, failed: false };
+			} catch {
+				return { attempted: true, failed: true };
+			}
 		},
 		show(id: string) {
 			dock?.getPanel(id)?.api.setActive();

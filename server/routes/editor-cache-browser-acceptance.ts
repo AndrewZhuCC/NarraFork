@@ -34,7 +34,8 @@ export async function editorCacheBrowserAcceptance(
 	await wait(
 		() =>
 			window.__editorCache?.snapshot().views === 2 &&
-			window.__editorCache.snapshot().registry.loads === 0,
+			window.__editorCache.snapshot().registry.loads === 0 &&
+			window.__editorCache.snapshot().drafts.metadataReads === 2,
 	);
 	const initial = await state();
 	expect(initial.tabs).toBe(1000);
@@ -46,9 +47,11 @@ export async function editorCacheBrowserAcceptance(
 	expect(requests()).toEqual({
 		documentCreates: 2,
 		contentResponses: 1,
-		recoveryScopes: 0,
+		recoveryScopes: 2, // one fresh owner proof per visible host; none for 998 hidden tabs
 		metadataRequests: 2,
 	});
+	expect(initial.drafts.metadataReads).toBe(2);
+	expect(initial.drafts.bodyReads).toBe(0);
 	expect(initial.panes.filter((pane) => pane.visible)).toHaveLength(2);
 	expect(initial.panes.some((pane) => pane.visible && !pane.active)).toBe(true);
 	const fdBaseline = (await readdir("/proc/self/fd")).length;
@@ -102,7 +105,7 @@ export async function editorCacheBrowserAcceptance(
 	expect(requests()).toEqual({
 		documentCreates: 2,
 		contentResponses: 1,
-		recoveryScopes: 0,
+		recoveryScopes: 4, // rapid reveal and later reattach each reauthorize discovery
 		metadataRequests: 2,
 	});
 	await page.evaluate(() => window.__editorCache.undo("file-1"));
@@ -179,7 +182,7 @@ export async function editorCacheBrowserAcceptance(
 	expect(requests()).toEqual({
 		documentCreates: 15,
 		contentResponses: 14,
-		recoveryScopes: 0,
+		recoveryScopes: 19,
 		metadataRequests: 15,
 	});
 	expect(cached.workers.active).toHaveLength(0);

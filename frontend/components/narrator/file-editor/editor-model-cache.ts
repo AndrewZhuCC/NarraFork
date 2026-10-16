@@ -11,6 +11,23 @@ export interface EditorCacheItem {
  * updates never refresh LRU/TTL. Only actual visible consumption refreshes lastUsed. */
 export class EditorModelCache<T extends EditorCacheItem> {
 	private entries = new Map<T, number>();
+	private reservations = new Set<{ models: number; bytes: number }>();
+	/** Transient recovery bodies without a resident working copy still consume admission. */
+	reserve(cost: { models: number; bytes: number }) {
+		if (
+			!Number.isFinite(cost.bytes) ||
+			cost.bytes < 0 ||
+			!Number.isInteger(cost.models) ||
+			cost.models < 0
+		)
+			throw new Error("Invalid editor reservation");
+		const held = { ...cost };
+		this.reservations.add(held);
+		this.enforce();
+		return () => {
+			if (this.reservations.delete(held)) this.enforce();
+		};
+	}
 	private timer: ReturnType<typeof setTimeout> | undefined;
 	constructor(
 		readonly limits = EDITOR_CACHE_LIMITS,
@@ -38,6 +55,10 @@ export class EditorModelCache<T extends EditorCacheItem> {
 		this.timer = undefined;
 		let models = 0;
 		let bytes = 0;
+		for (const held of this.reservations) {
+			models += held.models;
+			bytes += held.bytes;
+		}
 		const eligible: [T, number][] = [];
 		for (const [item, lastUsed] of this.entries) {
 			const cost = item.cost();

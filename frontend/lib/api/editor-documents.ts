@@ -1,5 +1,6 @@
 import {
 	type CreateEditorDocumentInput,
+	type CreateEditorDraftAnchorInput,
 	type CreateEditorUploadInput,
 	EDITOR_DOCUMENT_MAX_CHARS,
 	EDITOR_IO_TIMEOUT_MS,
@@ -9,6 +10,7 @@ import {
 	type EditorCommitInput,
 	type EditorCommitResult,
 	type EditorDocumentDescriptor,
+	type EditorDraftAnchorDescriptor,
 	type EditorOperationResult,
 	type EditorRecoveryScope,
 	type EditorRecoveryScopeInput,
@@ -154,6 +156,67 @@ export const editorDocumentApi = {
 			`${base(narratorId)}/recovery-scope?${query}`,
 			"GET",
 			undefined,
+			signal,
+		);
+	},
+	createDraftAnchor(narratorId: string, input: CreateEditorDraftAnchorInput, signal?: AbortSignal) {
+		return metadata<EditorDraftAnchorDescriptor>(
+			`${base(narratorId)}/draft-anchors`,
+			"POST",
+			input,
+			signal,
+		);
+	},
+	getDraftAnchor(
+		narratorId: string,
+		anchorId: string,
+		scope: EditorRecoveryScopeInput,
+		signal?: AbortSignal,
+	) {
+		const query = new URLSearchParams({
+			deviceId: scope.deviceId ?? "local",
+			origin: scope.origin,
+		});
+		return metadata<EditorDraftAnchorDescriptor>(
+			`${base(narratorId)}/draft-anchors/${encodeURIComponent(anchorId)}?${query}`,
+			"GET",
+			undefined,
+			signal,
+		);
+	},
+	releaseDraftAnchor(narratorId: string, anchorId: string, scope: EditorRecoveryScopeInput) {
+		const query = new URLSearchParams({
+			deviceId: scope.deviceId ?? "local",
+			origin: scope.origin,
+		});
+		return metadata<{ released: boolean }>(
+			`${base(narratorId)}/draft-anchors/${encodeURIComponent(anchorId)}?${query}`,
+			"DELETE",
+		);
+	},
+	publishDraftAnchor(
+		narratorId: string,
+		anchorId: string,
+		scope: EditorRecoveryScopeInput,
+		signal?: AbortSignal,
+	) {
+		return metadata<EditorDraftAnchorDescriptor>(
+			`${base(narratorId)}/draft-anchors/${encodeURIComponent(anchorId)}/publish`,
+			"POST",
+			scope,
+			signal,
+		);
+	},
+	claimDraftAnchor(
+		narratorId: string,
+		anchorId: string,
+		scope: EditorRecoveryScopeInput,
+		signal?: AbortSignal,
+	) {
+		return metadata<EditorDraftAnchorDescriptor>(
+			`${base(narratorId)}/draft-anchors/${encodeURIComponent(anchorId)}/claim`,
+			"POST",
+			scope,
 			signal,
 		);
 	},
