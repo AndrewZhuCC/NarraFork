@@ -945,8 +945,12 @@ test("height transitions reverse in flight without remounting the editor or queu
 			const previous = result.frames[index - 1];
 			expect(current.height).toBeGreaterThanOrEqual(compact - 1);
 			expect(current.height).toBeLessThanOrEqual(max + 1);
-			// Account for missed frames on slow CI; detect an instantaneous full-height snap.
-			const allowed = (((max - compact) * (current.time - previous.time)) / 180) * 4 + 2;
+			// The easing peaks at about four times linear, and one compositor frame of that
+			// peak is ~66px on this control. JS timestamps on CI can be closer than the
+			// vsync that produced the pixels, so the budget never shrinks below one 60Hz
+			// frame. A same-frame snap of the whole range still fails.
+			const frameMs = Math.max(current.time - previous.time, 1000 / 60);
+			const allowed = (((max - compact) * frameMs) / 180) * 4 + 2;
 			expect(Math.abs(current.height - previous.height)).toBeLessThanOrEqual(allowed);
 		}
 		await layoutSettled(page);

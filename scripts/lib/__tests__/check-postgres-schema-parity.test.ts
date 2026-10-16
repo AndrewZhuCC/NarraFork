@@ -523,10 +523,22 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 123 tables and 1744 columns including composer layouts", () => {
-		expect(target.tables.length).toBe(123);
-		// 1741 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1744);
+	test("covers 124 tables and 1746 columns including composer layouts", () => {
+		expect(target.tables.length).toBe(124);
+		// 1743 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1746);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_context_pins")
+				?.columns.map((column) => column.property),
+		).toEqual(["generation", "narratorId", "segmentsJson"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_message_context_stats")
+				?.columns.map((column) => column.property),
+		).toEqual(["messageId", "role", "parentToolUseId", "segmentsJson"]);
+		expect(target.tables.some((table) => table.name === "narrator_context_char_pages")).toBe(false);
 		for (const name of ["narrator_drafts", "narrator_messages"]) {
 			expect(
 				target.tables
