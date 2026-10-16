@@ -22,6 +22,7 @@ import { closeNarrator, sendMessage, updateNarratorChapterRole } from "./narrato
 import {
 	compensateLegacyCreation,
 	isResourceProtectionError,
+	legacyDeletionTargets,
 	recordChapterCreated,
 	recordChapterNarratorCreated,
 	withChapterCreation,
@@ -548,59 +549,66 @@ export const reviewService = {
 			where: eq(projects.id, chapter.projectId),
 		});
 
-		return withLegacyRetirement([reviewChapterId], "review dismiss", async () => {
-			// Interrupt any running narrators before removing git resources
-			const chapterNarrators = await db.query.narrators.findMany({
-				where: eq(narrators.chapterId, reviewChapterId),
-			});
-			for (const n of chapterNarrators) {
-				closeNarrator(n.id);
-			}
+		return withLegacyRetirement(
+			[reviewChapterId],
+			"review dismiss",
+			async () => {
+				// Interrupt any running narrators before removing git resources
+				const chapterNarrators = await db.query.narrators.findMany({
+					where: eq(narrators.chapterId, reviewChapterId),
+				});
+				for (const n of chapterNarrators) {
+					closeNarrator(n.id);
+				}
 
-			// Clean up git resources
-			if (chapter.worktreePath && project?.gitPath) {
-				try {
-					await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
-				} catch (err) {
-					if (isResourceProtectionError(err)) throw err;
-					logger.warn("Failed to remove review worktree", { error: String(err) });
-				}
-				try {
-					await gitService.deleteBranch(project.gitPath, chapter.branch);
-				} catch (err) {
-					if (isResourceProtectionError(err)) throw err;
-					logger.warn("Failed to delete review branch", { error: String(err) });
-				}
-				// The review workspace now has a shadow repository of its own, and the chapter
-				// row that claims it is about to go. `force` is required for exactly that
-				// reason: the ownership guard reads the row being deleted.
-				await worktreeTreeSnapshot
-					.destroy(chapter.worktreePath, undefined, { force: true })
-					.catch((err) => {
+				// Clean up git resources
+				if (chapter.worktreePath && project?.gitPath) {
+					try {
+						await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+					} catch (err) {
 						if (isResourceProtectionError(err)) throw err;
-						logger.debug("Failed to remove review tree snapshots", { error: String(err) });
-					});
-			}
+						logger.warn("Failed to remove review worktree", { error: String(err) });
+					}
+					try {
+						await gitService.deleteBranch(project.gitPath, chapter.branch);
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to delete review branch", { error: String(err) });
+					}
+					// The review workspace now has a shadow repository of its own, and the chapter
+					// row that claims it is about to go. `force` is required for exactly that
+					// reason: the ownership guard reads the row being deleted.
+					await worktreeTreeSnapshot
+						.destroy(chapter.worktreePath, undefined, { force: true })
+						.catch((err) => {
+							if (isResourceProtectionError(err)) throw err;
+							logger.debug("Failed to remove review tree snapshots", { error: String(err) });
+						});
+				}
 
-			// Archive narrators (already closed above)
-			for (const n of chapterNarrators) {
-				await narratorService.updateStatus(n.id, "archived");
-			}
+				// Archive narrators (already closed above)
+				for (const n of chapterNarrators) {
+					await narratorService.updateStatus(n.id, "archived");
+				}
 
-			const now = new Date().toISOString();
-			await db
-				.update(chapters)
-				.set({
-					reviewStatus: "dismissed",
-					status: "abandoned",
-					worktreePath: null,
-					updatedAt: now,
-				})
-				.where(eq(chapters.id, reviewChapterId));
+				const now = new Date().toISOString();
+				await db
+					.update(chapters)
+					.set({
+						reviewStatus: "dismissed",
+						status: "abandoned",
+						worktreePath: null,
+						updatedAt: now,
+					})
+					.where(eq(chapters.id, reviewChapterId));
 
-			eventBus.emit({ type: "review:dismissed", reviewChapterId });
-			logger.info("Review dismissed", { reviewChapterId });
-		});
+				eventBus.emit({ type: "review:dismissed", reviewChapterId });
+				logger.info("Review dismissed", { reviewChapterId });
+			},
+			chapter.worktreePath && project?.gitPath
+				? legacyDeletionTargets(chapter.worktreePath, { checkout: true, shadow: true })
+				: [],
+		);
 	},
 
 	/**
@@ -639,90 +647,97 @@ export const reviewService = {
 		const now = new Date().toISOString();
 
 		const sourceChapterId = chapter.reviewSourceChapterId;
-		return withLegacyRetirement([reviewChapterId], "review convert", async () => {
-			// Re-parent the review narrator as a subagent of the source narrator
-			// Also update cwd to source chapter's worktree since the review worktree will be removed
-			const sourceChapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, sourceChapterId),
-				columns: { worktreePath: true },
-			});
-			await db
-				.update(narrators)
-				.set({
-					type: "subagent",
-					variant: "subagent:review",
-					subagentType: "review",
-					parentNarratorId: sourceNarrator.id,
-					chapterId: chapter.reviewSourceChapterId,
-					cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, reviewNarrator.id));
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, chapter.projectId),
+		});
+		return withLegacyRetirement(
+			[reviewChapterId],
+			"review convert",
+			async () => {
+				// Re-parent the review narrator as a subagent of the source narrator
+				// Also update cwd to source chapter's worktree since the review worktree will be removed
+				const sourceChapter = await db.query.chapters.findFirst({
+					where: eq(chapters.id, sourceChapterId),
+					columns: { worktreePath: true },
+				});
+				await db
+					.update(narrators)
+					.set({
+						type: "subagent",
+						variant: "subagent:review",
+						subagentType: "review",
+						parentNarratorId: sourceNarrator.id,
+						chapterId: chapter.reviewSourceChapterId,
+						cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, reviewNarrator.id));
 
-			// Use updateStatus to ensure event bus + WS broadcast
-			await narratorService.updateStatus(reviewNarrator.id, "idle", {
-				substatus: ["unread"],
-			});
+				// Use updateStatus to ensure event bus + WS broadcast
+				await narratorService.updateStatus(reviewNarrator.id, "idle", {
+					substatus: ["unread"],
+				});
 
-			// Clean up review chapter's git resources
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-			});
-			if (chapter.worktreePath && project?.gitPath) {
-				try {
-					await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
-				} catch (err) {
-					if (isResourceProtectionError(err)) throw err;
-					logger.warn("Failed to remove review worktree during conversion", {
-						error: String(err),
-					});
-				}
-				try {
-					await gitService.deleteBranch(project.gitPath, chapter.branch);
-				} catch (err) {
-					if (isResourceProtectionError(err)) throw err;
-					logger.warn("Failed to delete review branch during conversion", {
-						error: String(err),
-					});
-				}
-				// Same reasoning as `deleteReview`: the workspace is gone and the row that
-				// claims its shadow repository is being emptied, so nothing will read the
-				// lineage again.
-				await worktreeTreeSnapshot
-					.destroy(chapter.worktreePath, undefined, { force: true })
-					.catch((err) => {
+				// Clean up review chapter's git resources
+				if (chapter.worktreePath && project?.gitPath) {
+					try {
+						await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+					} catch (err) {
 						if (isResourceProtectionError(err)) throw err;
-						logger.debug("Failed to remove review tree snapshots during conversion", {
+						logger.warn("Failed to remove review worktree during conversion", {
 							error: String(err),
 						});
-					});
-			}
+					}
+					try {
+						await gitService.deleteBranch(project.gitPath, chapter.branch);
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to delete review branch during conversion", {
+							error: String(err),
+						});
+					}
+					// Same reasoning as `deleteReview`: the workspace is gone and the row that
+					// claims its shadow repository is being emptied, so nothing will read the
+					// lineage again.
+					await worktreeTreeSnapshot
+						.destroy(chapter.worktreePath, undefined, { force: true })
+						.catch((err) => {
+							if (isResourceProtectionError(err)) throw err;
+							logger.debug("Failed to remove review tree snapshots during conversion", {
+								error: String(err),
+							});
+						});
+				}
 
-			// Update review chapter status
-			await db
-				.update(chapters)
-				.set({
-					reviewStatus: "converted",
-					status: "abandoned",
-					worktreePath: null,
-					updatedAt: now,
-				})
-				.where(eq(chapters.id, reviewChapterId));
+				// Update review chapter status
+				await db
+					.update(chapters)
+					.set({
+						reviewStatus: "converted",
+						status: "abandoned",
+						worktreePath: null,
+						updatedAt: now,
+					})
+					.where(eq(chapters.id, reviewChapterId));
 
-			eventBus.emit({
-				type: "review:converted",
-				reviewChapterId,
-				action: "subagent",
-			});
+				eventBus.emit({
+					type: "review:converted",
+					reviewChapterId,
+					action: "subagent",
+				});
 
-			logger.info("Review converted to subagent", {
-				reviewChapterId,
-				reviewNarratorId: reviewNarrator.id,
-				sourceNarratorId: sourceNarrator.id,
-			});
+				logger.info("Review converted to subagent", {
+					reviewChapterId,
+					reviewNarratorId: reviewNarrator.id,
+					sourceNarratorId: sourceNarrator.id,
+				});
 
-			return reviewNarrator;
-		});
+				return reviewNarrator;
+			},
+			chapter.worktreePath && project?.gitPath
+				? legacyDeletionTargets(chapter.worktreePath, { checkout: true, shadow: true })
+				: [],
+		);
 	},
 
 	/**

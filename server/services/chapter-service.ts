@@ -31,10 +31,12 @@ import { removeTabFromAllUsers } from "./user-preferences-service";
 import {
 	compensateLegacyCreation,
 	isResourceProtectionError,
+	legacyDeletionTargets,
 	recordChapterCreated,
 	recordChapterNarratorCreated,
 	withChapterCreation,
 	withLegacyRetirement,
+	withWorkspaceAdmission,
 } from "./worktree-lifecycle-guard";
 import { snapshotIncomingRef, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
@@ -111,7 +113,7 @@ export const chapterService = {
 		});
 		if (!project?.gitPath || resolve(project.gitPath) !== resolve(input.gitPath))
 			throw new ValidationError("Root chapter must use its project's repository");
-		return withChapterCreation(input.projectId, project.gitPath, async () => {
+		const createRoot = async () => {
 			const now = new Date().toISOString();
 			const id = generateId();
 
@@ -194,7 +196,10 @@ export const chapterService = {
 				}
 				throw error;
 			}
-		});
+		};
+		return withChapterCreation(input.projectId, project.gitPath, () =>
+			withWorkspaceAdmission({ deviceId: "local", path: input.gitPath }, createRoot),
+		);
 	},
 
 	async create(input: CreateChapterInput) {
@@ -419,89 +424,96 @@ export const chapterService = {
 			});
 			if (!chapter) return;
 
-			return withLegacyRetirement([id], "chapter delete for project", async () => {
-				// Delete ALL narrators — no detach since the project is being removed
-				const chapterNarrators = await db.query.narrators.findMany({
-					where: eq(narrators.chapterId, id),
-				});
-				for (const narrator of chapterNarrators) {
-					await narratorService.remove(narrator.id);
-				}
-
-				// Kill running terminals and delete records
-				await terminalService.cleanupForChapter(id);
-
-				// Clean up tables that reference chapters without onDelete cascade
-				await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
-				await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
-
-				// Stop and remove containers
-				try {
-					await containerService.removeChapterContainers(id, { deleteVolumes: true });
-				} catch (err) {
-					if (isResourceProtectionError(err)) throw err;
-					logger.warn("Failed to remove containers during project delete", {
-						chapterId: id,
-						error: String(err),
+			return withLegacyRetirement(
+				[id],
+				"chapter delete for project",
+				async () => {
+					// Delete ALL narrators — no detach since the project is being removed
+					const chapterNarrators = await db.query.narrators.findMany({
+						where: eq(narrators.chapterId, id),
 					});
-				}
-				// Unconditional for the same reason as in `remove()`: these three FKs are
-				// NO ACTION, so a surviving row aborts the chapter delete below — and here that
-				// would abort the whole project deletion partway through.
-				await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
-				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
-				await db.delete(terminals).where(eq(terminals.chapterId, id));
+					for (const narrator of chapterNarrators) {
+						await narratorService.remove(narrator.id);
+					}
 
-				// Clean up git worktree — skip root chapters (their worktreePath is the repo itself)
-				if (chapter.worktreePath && projectGitPath && !chapter.isRoot) {
+					// Kill running terminals and delete records
+					await terminalService.cleanupForChapter(id);
+
+					// Clean up tables that reference chapters without onDelete cascade
+					await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
+					await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
+
+					// Stop and remove containers
 					try {
-						await gitService.removeWorktree(projectGitPath, chapter.worktreePath);
+						await containerService.removeChapterContainers(id, { deleteVolumes: true });
 					} catch (err) {
 						if (isResourceProtectionError(err)) throw err;
-						logger.warn("Failed to remove worktree during project delete", {
+						logger.warn("Failed to remove containers during project delete", {
 							chapterId: id,
 							error: String(err),
 						});
 					}
-					// The chapter itself is going away, so its lineage has no future reader —
-					// `force` is required because the ownership guard would otherwise keep the
-					// repository alive on the strength of the very row being deleted.
-					await worktreeTreeSnapshot
-						.destroy(chapter.worktreePath, undefined, { force: true })
-						.catch((err) => {
+					// Unconditional for the same reason as in `remove()`: these three FKs are
+					// NO ACTION, so a surviving row aborts the chapter delete below — and here that
+					// would abort the whole project deletion partway through.
+					await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+					await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+					await db.delete(terminals).where(eq(terminals.chapterId, id));
+
+					// Clean up git worktree — skip root chapters (their worktreePath is the repo itself)
+					if (chapter.worktreePath && projectGitPath && !chapter.isRoot) {
+						try {
+							await gitService.removeWorktree(projectGitPath, chapter.worktreePath);
+						} catch (err) {
 							if (isResourceProtectionError(err)) throw err;
-							logger.debug("Failed to remove tree snapshots during chapter delete", {
+							logger.warn("Failed to remove worktree during project delete", {
 								chapterId: id,
 								error: String(err),
 							});
-						});
-					// Same reason, for the in-memory caches keyed by that path: the directory is
-					// gone, so the entries can never be read again. `invalidateStatus` would keep
-					// the keys (it assumes the path returns), which is what leaks here.
-					dropStatus(chapter.worktreePath);
-					dropRecentlyAttributed(chapter.worktreePath);
-				}
+						}
+						// The chapter itself is going away, so its lineage has no future reader —
+						// `force` is required because the ownership guard would otherwise keep the
+						// repository alive on the strength of the very row being deleted.
+						await worktreeTreeSnapshot
+							.destroy(chapter.worktreePath, undefined, { force: true })
+							.catch((err) => {
+								if (isResourceProtectionError(err)) throw err;
+								logger.debug("Failed to remove tree snapshots during chapter delete", {
+									chapterId: id,
+									error: String(err),
+								});
+							});
+						// Same reason, for the in-memory caches keyed by that path: the directory is
+						// gone, so the entries can never be read again. `invalidateStatus` would keep
+						// the keys (it assumes the path returns), which is what leaks here.
+						dropStatus(chapter.worktreePath);
+						dropRecentlyAttributed(chapter.worktreePath);
+					}
 
-				// Ignored-file archive from any dormant cycle. Not covered by the worktree
-				// removal above (it lives outside the repo, in `~/.narrafork/dormant-ignored`)
-				// and only ever consumed by a wake that can no longer happen. Since it holds
-				// precisely the untracked files — `secret.env`, `config.local.json`, tokens —
-				// deleting the project while leaving it behind meant leaving plaintext
-				// credentials on disk permanently.
-				discardIgnoredArchive(id);
+					// Ignored-file archive from any dormant cycle. Not covered by the worktree
+					// removal above (it lives outside the repo, in `~/.narrafork/dormant-ignored`)
+					// and only ever consumed by a wake that can no longer happen. Since it holds
+					// precisely the untracked files — `secret.env`, `config.local.json`, tokens —
+					// deleting the project while leaving it behind meant leaving plaintext
+					// credentials on disk permanently.
+					discardIgnoredArchive(id);
 
-				// Detach self-referencing FKs pointing to this chapter
-				await db
-					.update(chapters)
-					.set({ parentChapterId: null })
-					.where(eq(chapters.parentChapterId, id));
-				await db
-					.update(chapters)
-					.set({ mergedIntoChapterId: null })
-					.where(eq(chapters.mergedIntoChapterId, id));
+					// Detach self-referencing FKs pointing to this chapter
+					await db
+						.update(chapters)
+						.set({ parentChapterId: null })
+						.where(eq(chapters.parentChapterId, id));
+					await db
+						.update(chapters)
+						.set({ mergedIntoChapterId: null })
+						.where(eq(chapters.mergedIntoChapterId, id));
 
-				await db.delete(chapters).where(eq(chapters.id, id));
-			});
+					await db.delete(chapters).where(eq(chapters.id, id));
+				},
+				chapter.worktreePath && projectGitPath && !chapter.isRoot
+					? legacyDeletionTargets(chapter.worktreePath, { checkout: true, shadow: true })
+					: [],
+			);
 		});
 	},
 
@@ -514,144 +526,157 @@ export const chapterService = {
 			}
 
 			const now = new Date().toISOString();
-
-			return withLegacyRetirement([id], "chapter delete", async () => {
-				// Detach narrators and archive them (read-only, user can delete later)
-				const chapterNarrators = await db.query.narrators.findMany({
-					where: eq(narrators.chapterId, id),
-				});
-				for (const narrator of chapterNarrators) {
-					interruptNarrator(narrator.id);
-				}
-				if (chapterNarrators.length > 0) {
-					await db
-						.update(narrators)
-						.set({ chapterId: null, status: "archived", updatedAt: now })
-						.where(eq(narrators.chapterId, id));
-				}
-
-				// Kill running terminals and delete records
-				await terminalService.cleanupForChapter(id);
-
-				// Clean up tables that reference chapters without onDelete cascade
-				await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
-				await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
-
-				// Stop and remove containers (+ release ports)
-				try {
-					await containerService.removeChapterContainers(id, { deleteVolumes: true });
-				} catch (err) {
-					if (isResourceProtectionError(err)) throw err;
-					logger.warn("Failed to remove containers during chapter delete", {
-						chapterId: id,
-						error: String(err),
-					});
-				}
-				// Unconditionally, not only on the failure path above.
-				//
-				// `container_instances.chapter_id` and `port_allocations.chapter_id` are
-				// `ON DELETE NO ACTION`, so any surviving row makes the `DELETE FROM chapters`
-				// below fail with FOREIGN KEY constraint failed and takes the whole deletion
-				// down with it — after the worktree and branch are already gone. Doing this
-				// only inside the catch was not enough: `removeChapterContainers` can also
-				// return successfully while leaving rows behind (proxy mode deliberately keeps
-				// port allocations, and its own deletes are best-effort).
-				await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
-				await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
-				// Same class of FK, reached through a different table: `terminals.chapter_id` is
-				// also NO ACTION, and `cleanupForChapter` above deletes only rows it managed to
-				// enumerate. A row left by a failed kill would block the chapter delete.
-				await db.delete(terminals).where(eq(terminals.chapterId, id));
-
-				// Clean up git resources
-				if (chapter.worktreePath) {
-					const project = await db.query.projects.findFirst({
+			const project = chapter.worktreePath
+				? await db.query.projects.findFirst({
 						where: eq(projects.id, chapter.projectId),
+						columns: { gitPath: true },
+					})
+				: null;
+
+			return withLegacyRetirement(
+				[id],
+				"chapter delete",
+				async () => {
+					// Detach narrators and archive them (read-only, user can delete later)
+					const chapterNarrators = await db.query.narrators.findMany({
+						where: eq(narrators.chapterId, id),
 					});
-					if (project?.gitPath) {
-						try {
-							await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
-							await gitService.deleteBranch(project.gitPath, chapter.branch);
-						} catch (err) {
-							if (isResourceProtectionError(err)) throw err;
-							logger.warn("Failed to clean up git resources", {
-								error: String(err),
-							});
-						}
+					for (const narrator of chapterNarrators) {
+						interruptNarrator(narrator.id);
 					}
-					// The chapter itself is going away, so its lineage has no future reader —
-					// `force` is required because the ownership guard would otherwise keep the
-					// repository alive on the strength of the very row being deleted.
-					await worktreeTreeSnapshot
-						.destroy(chapter.worktreePath, undefined, { force: true })
-						.catch((err) => {
-							if (isResourceProtectionError(err)) throw err;
-							logger.debug("Failed to remove tree snapshots during chapter delete", {
-								chapterId: id,
-								error: String(err),
-							});
+					if (chapterNarrators.length > 0) {
+						await db
+							.update(narrators)
+							.set({ chapterId: null, status: "archived", updatedAt: now })
+							.where(eq(narrators.chapterId, id));
+					}
+
+					// Kill running terminals and delete records
+					await terminalService.cleanupForChapter(id);
+
+					// Clean up tables that reference chapters without onDelete cascade
+					await db.delete(terminalViewState).where(eq(terminalViewState.chapterId, id));
+					await db.delete(mergeSessions).where(eq(mergeSessions.targetChapterId, id));
+
+					// Stop and remove containers (+ release ports)
+					try {
+						await containerService.removeChapterContainers(id, { deleteVolumes: true });
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to remove containers during chapter delete", {
+							chapterId: id,
+							error: String(err),
 						});
-					// Same reason, for the in-memory caches keyed by that path: the directory is
-					// gone, so the entries can never be read again. `invalidateStatus` would keep
-					// the keys (it assumes the path returns), which is what leaks here.
-					dropStatus(chapter.worktreePath);
-					dropRecentlyAttributed(chapter.worktreePath);
-				}
+					}
+					// Unconditionally, not only on the failure path above.
+					//
+					// `container_instances.chapter_id` and `port_allocations.chapter_id` are
+					// `ON DELETE NO ACTION`, so any surviving row makes the `DELETE FROM chapters`
+					// below fail with FOREIGN KEY constraint failed and takes the whole deletion
+					// down with it — after the worktree and branch are already gone. Doing this
+					// only inside the catch was not enough: `removeChapterContainers` can also
+					// return successfully while leaving rows behind (proxy mode deliberately keeps
+					// port allocations, and its own deletes are best-effort).
+					await db.delete(containerInstances).where(eq(containerInstances.chapterId, id));
+					await db.delete(portAllocations).where(eq(portAllocations.chapterId, id));
+					// Same class of FK, reached through a different table: `terminals.chapter_id` is
+					// also NO ACTION, and `cleanupForChapter` above deletes only rows it managed to
+					// enumerate. A row left by a failed kill would block the chapter delete.
+					await db.delete(terminals).where(eq(terminals.chapterId, id));
 
-				// Same for the ignored-file archive a dormant cycle may have left in
-				// `~/.narrafork/dormant-ignored/<id>`. It sits outside the repo, so removing the
-				// worktree does not touch it, and only a wake consumes it — which a deleted
-				// chapter can never have. Its contents are the files git refuses to track, i.e.
-				// the user's plaintext secrets, so "delete this chapter" has to mean them too.
-				discardIgnoredArchive(id);
-
-				// And the fork ref this chapter left in its *parent's* shadow repository.
-				//
-				// `adoptParentLineage` writes `refs/nf/incoming/fork-<childId>` there so the fork
-				// can fetch the exact commit it branched from. That ref lives in a repository this
-				// deletion does not touch, and it is a GC root: `gcAll` runs `gc --no-prune`, so
-				// while it exists the parent keeps that snapshot commit and every tree beneath it
-				// on disk for a chapter that no longer exists. The parent's own worktree path is
-				// needed to find the repository, so this runs before the row is gone.
-				if (chapter.parentChapterId) {
-					const parent = await db.query.chapters.findFirst({
-						where: eq(chapters.id, chapter.parentChapterId),
-						columns: { worktreePath: true },
-					});
-					if (parent?.worktreePath) {
+					// Clean up git resources
+					if (chapter.worktreePath) {
+						if (project?.gitPath) {
+							try {
+								await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+								await gitService.deleteBranch(project.gitPath, chapter.branch);
+							} catch (err) {
+								if (isResourceProtectionError(err)) throw err;
+								logger.warn("Failed to clean up git resources", {
+									error: String(err),
+								});
+							}
+						}
+						// The chapter itself is going away, so its lineage has no future reader —
+						// `force` is required because the ownership guard would otherwise keep the
+						// repository alive on the strength of the very row being deleted.
 						await worktreeTreeSnapshot
-							.deleteRef(parent.worktreePath, snapshotIncomingRef(`fork-${id}`))
-							.catch((err) =>
-								logger.debug("Failed to drop the fork ref from the parent's snapshot repo", {
+							.destroy(chapter.worktreePath, undefined, { force: true })
+							.catch((err) => {
+								if (isResourceProtectionError(err)) throw err;
+								logger.debug("Failed to remove tree snapshots during chapter delete", {
 									chapterId: id,
 									error: String(err),
-								}),
-							);
+								});
+							});
+						// Same reason, for the in-memory caches keyed by that path: the directory is
+						// gone, so the entries can never be read again. `invalidateStatus` would keep
+						// the keys (it assumes the path returns), which is what leaks here.
+						dropStatus(chapter.worktreePath);
+						dropRecentlyAttributed(chapter.worktreePath);
 					}
-				}
 
-				// Detach self-referencing FKs pointing to this chapter
-				await db
-					.update(chapters)
-					.set({ parentChapterId: null })
-					.where(eq(chapters.parentChapterId, id));
-				await db
-					.update(chapters)
-					.set({ mergedIntoChapterId: null })
-					.where(eq(chapters.mergedIntoChapterId, id));
+					// Same for the ignored-file archive a dormant cycle may have left in
+					// `~/.narrafork/dormant-ignored/<id>`. It sits outside the repo, so removing the
+					// worktree does not touch it, and only a wake consumes it — which a deleted
+					// chapter can never have. Its contents are the files git refuses to track, i.e.
+					// the user's plaintext secrets, so "delete this chapter" has to mean them too.
+					discardIgnoredArchive(id);
 
-				const removedProjectId = chapter.projectId;
-				await db.delete(chapters).where(eq(chapters.id, id));
-				eventBus.emit({ type: "chapter:abandoned", chapterId: id, projectId: removedProjectId });
+					// And the fork ref this chapter left in its *parent's* shadow repository.
+					//
+					// `adoptParentLineage` writes `refs/nf/incoming/fork-<childId>` there so the fork
+					// can fetch the exact commit it branched from. That ref lives in a repository this
+					// deletion does not touch, and it is a GC root: `gcAll` runs `gc --no-prune`, so
+					// while it exists the parent keeps that snapshot commit and every tree beneath it
+					// on disk for a chapter that no longer exists. The parent's own worktree path is
+					// needed to find the repository, so this runs before the row is gone.
+					if (chapter.parentChapterId) {
+						const parent = await db.query.chapters.findFirst({
+							where: eq(chapters.id, chapter.parentChapterId),
+							columns: { worktreePath: true },
+						});
+						if (parent?.worktreePath) {
+							await worktreeTreeSnapshot
+								.deleteRef(parent.worktreePath, snapshotIncomingRef(`fork-${id}`))
+								.catch((err) =>
+									logger.debug("Failed to drop the fork ref from the parent's snapshot repo", {
+										chapterId: id,
+										error: String(err),
+									}),
+								);
+						}
+					}
 
-				// Remove this chapter from every user's recent tabs so ghost entries don't linger
-				removeTabFromAllUsers("chapter", id).catch((err) => {
-					logger.warn("Failed to clean up recent tabs after chapter delete", {
-						chapterId: id,
-						error: String(err),
+					// Detach self-referencing FKs pointing to this chapter
+					await db
+						.update(chapters)
+						.set({ parentChapterId: null })
+						.where(eq(chapters.parentChapterId, id));
+					await db
+						.update(chapters)
+						.set({ mergedIntoChapterId: null })
+						.where(eq(chapters.mergedIntoChapterId, id));
+
+					const removedProjectId = chapter.projectId;
+					await db.delete(chapters).where(eq(chapters.id, id));
+					eventBus.emit({ type: "chapter:abandoned", chapterId: id, projectId: removedProjectId });
+
+					// Remove this chapter from every user's recent tabs so ghost entries don't linger
+					removeTabFromAllUsers("chapter", id).catch((err) => {
+						logger.warn("Failed to clean up recent tabs after chapter delete", {
+							chapterId: id,
+							error: String(err),
+						});
 					});
-				});
-			});
+				},
+				chapter.worktreePath
+					? legacyDeletionTargets(chapter.worktreePath, {
+							checkout: !!project?.gitPath,
+							shadow: true,
+						})
+					: [],
+			);
 		});
 	},
 };

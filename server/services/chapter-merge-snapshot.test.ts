@@ -14,12 +14,20 @@
  */
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../tests/setup";
-import { chapters, mergeSessions, projects } from "../db/schema";
+import {
+	chapterEdges,
+	chapters,
+	mergeSessions,
+	narrators,
+	narratorWorktreeResources,
+	projects,
+} from "../db/schema";
+import { chapterLock } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
@@ -50,11 +58,44 @@ const {
 } = await import("./chapter-merge-snapshot");
 const { ensureChapterSnapshot } = await import("./chapter-snapshot-ref");
 const { gitService } = await import("./git-service");
-const { treeSnapshotKey, worktreeTreeSnapshot } = await import("./worktree-tree-snapshot");
+const { mergeSummaryService } = await import("./merge-summary-service");
+const lifecycle = await import("./worktree-lifecycle-guard");
+const { ResourceProtectionError, withLifecycleGuardPorts } = lifecycle;
+const { chapterWriteStore } = await import("./chapter-write/store");
+const { SNAPSHOT_HEAD_REF, treeSnapshotKey, worktreeTreeSnapshot } = await import(
+	"./worktree-tree-snapshot"
+);
 afterAll(() => mock.restore());
 
 const tempDirs: string[] = [];
 const createdProjects: string[] = [];
+const createdNarrators: string[] = [];
+const createdResources: string[] = [];
+
+async function bindSourceNarrator(chapterId: string, worktree: string): Promise<string> {
+	const id = generateId();
+	const now = new Date().toISOString();
+	await db
+		.insert(narrators)
+		.values({ id, chapterId, cwd: worktree, createdAt: now, updatedAt: now });
+	createdNarrators.push(id);
+	return id;
+}
+
+async function retainIndependentWorktree(worktree: string, ownerNarratorId: string | null = null) {
+	const id = generateId();
+	await db.insert(narratorWorktreeResources).values({
+		id,
+		ownerNarratorId,
+		deviceId: "local",
+		repositoryKey: "merge-test-independent",
+		worktreePath: worktree,
+		createRequestId: generateId(),
+		state: "ready",
+	});
+	createdResources.push(id);
+}
+
 /**
  * Merge sessions created directly by the interactive-lifecycle cases.
  *
@@ -139,12 +180,48 @@ async function createMergePair(): Promise<{
 	return { projectId, gitPath, target, source };
 }
 
+function gate() {
+	let open!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	return { promise, open };
+}
+
+async function addMergeChapter(env: Awaited<ReturnType<typeof createMergePair>>, label: string) {
+	const id = generateId();
+	const branch = `chapter/${label}-${id}`;
+	const worktree = resolve(env.gitPath, ".worktrees", `${label}-${id}`);
+	await git(["worktree", "add", worktree, "-b", branch, "HEAD"], env.gitPath);
+	tempDirs.push(worktree);
+	const now = new Date().toISOString();
+	await db.insert(chapters).values({
+		id,
+		projectId: env.projectId,
+		title: label,
+		branch,
+		baseBranch: "main",
+		worktreePath: worktree,
+		status: "active",
+		role: "branch",
+		createdAt: now,
+		updatedAt: now,
+	});
+	return { id, worktree };
+}
+
 async function chapterRow(id: string) {
 	const row = await db.query.chapters.findFirst({ where: eq(chapters.id, id) });
 	return present(row, `chapter ${id}`);
 }
 
 afterEach(async () => {
+	for (const id of createdResources.splice(0)) {
+		await db.delete(narratorWorktreeResources).where(eq(narratorWorktreeResources.id, id));
+	}
+	for (const id of createdNarrators.splice(0)) {
+		await db.delete(narrators).where(eq(narrators.id, id));
+	}
 	for (const sessionId of createdSessions.splice(0)) {
 		await db.delete(mergeSessions).where(eq(mergeSessions.id, sessionId));
 	}
@@ -169,6 +246,495 @@ afterEach(async () => {
 		await worktreeTreeSnapshot.destroy(dir, undefined, { force: true }).catch(() => {});
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+describe("same-source merge transitions", () => {
+	for (const sameTarget of [true, false]) {
+		test(`concurrent commit merges to ${sameTarget ? "one target" : "different targets"} preserve one undo coordinate`, async () => {
+			const env = await createMergePair();
+			const otherTarget = sameTarget ? env.target : await addMergeChapter(env, "other-target");
+			writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+			await git(["add", "-A"], env.source.worktree);
+			await git(["commit", "-m", "feature"], env.source.worktree);
+			const before = await git(["rev-parse", "HEAD"], env.target.worktree);
+			const entered = gate();
+			const secondArrived = gate();
+			const release = gate();
+			const firstCompleted = gate();
+			const originalAncestor = gitService.isAncestor;
+			const originalAcquire = chapterLock.acquire.bind(chapterLock);
+			let sourceAcquires = 0;
+			let ancestors = 0;
+			const lock = spyOn(chapterLock, "acquire").mockImplementation((key, body) => {
+				if (key === env.source.id && ++sourceAcquires === 2) secondArrived.open();
+				return originalAcquire(key, body);
+			});
+			const ancestor = spyOn(gitService, "isAncestor").mockImplementation(async (...args) => {
+				if (++ancestors === 1) {
+					entered.open();
+					await release.promise;
+				} else {
+					secondArrived.open();
+					await firstCompleted.promise;
+				}
+				return originalAncestor.apply(gitService, args);
+			});
+			const merge = spyOn(gitService, "merge");
+			try {
+				const first = chapterMerge.merge(env.source.id, {
+					targetChapterId: env.target.id,
+					mode: "commit",
+				});
+				await entered.promise;
+				const second = chapterMerge
+					.merge(env.source.id, { targetChapterId: otherTarget.id, mode: "commit" })
+					.then(
+						(value) => ({ value, error: null }),
+						(error: unknown) => ({ value: null, error }),
+					);
+				await secondArrived.promise;
+				release.open();
+				const result = await first;
+				firstCompleted.open();
+				expect(result.success).toBe(true);
+				const rejected = await second;
+				expect(String(rejected.error)).toContain("Source chapter must be active or dormant");
+				expect(merge).toHaveBeenCalledTimes(1);
+				const source = await chapterRow(env.source.id);
+				expect(source.mergedIntoChapterId).toBe(env.target.id);
+				expect(source.preMergeTargetSha).toBe(before);
+				expect(source.mergeCommitSha).toBe(present(result.commitSha, "merge commit"));
+				const edges = await db.query.chapterEdges.findMany({
+					where: eq(chapterEdges.sourceId, env.source.id),
+				});
+				expect(edges.filter((edge) => edge.type === "merge")).toHaveLength(1);
+				if (!sameTarget) {
+					expect(await git(["rev-parse", "HEAD"], otherTarget.worktree)).toBe(before);
+					expect(existsSync(join(otherTarget.worktree, "feature.txt"))).toBe(false);
+				}
+				await chapterMerge.unmerge(env.source.id);
+				expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(before);
+				expect((await chapterRow(env.source.id)).status).toBe("active");
+			} finally {
+				release.open();
+				firstCompleted.open();
+				lock.mockRestore();
+				ancestor.mockRestore();
+				merge.mockRestore();
+			}
+		});
+	}
+
+	test("snapshot row helpers re-read source state after waiting for its chapter lock", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		const staleSource = await chapterRow(env.source.id);
+		const target = await chapterRow(env.target.id);
+		const before = await git(["rev-parse", "HEAD"], env.target.worktree);
+		let pending: Promise<unknown> = Promise.resolve();
+		await chapterLock.acquire(env.source.id, async () => {
+			pending = chapterMerge.mergeViaSnapshot(staleSource, target, "merge", "stale request");
+			await db
+				.update(chapters)
+				.set({ status: "merged", worktreePath: null })
+				.where(eq(chapters.id, env.source.id));
+		});
+		await expect(pending).rejects.toThrow("Source chapter must be active or dormant");
+		expect(await git(["rev-parse", "HEAD"], env.target.worktree)).toBe(before);
+		expect(existsSync(join(env.target.worktree, "feature.txt"))).toBe(false);
+	});
+
+	test("interactive completion cannot commit a source already merged through another entry", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		const result = await chapterMerge.merge(env.source.id, {
+			targetChapterId: env.target.id,
+			mode: "commit",
+		});
+		expect(result.success).toBe(true);
+		const before = await chapterRow(env.source.id);
+		const commit = spyOn(gitService, "autoCommitUnlocked");
+		try {
+			await expect(
+				chapterMerge.completeInteractiveConflictMerge(env.source.id, {
+					targetChapterId: env.target.id,
+				}),
+			).rejects.toThrow("Source chapter must be active or dormant");
+			expect(commit).not.toHaveBeenCalled();
+			const after = await chapterRow(env.source.id);
+			expect(after.preMergeTargetSha).toBe(before.preMergeTargetSha);
+			expect(after.mergeCommitSha).toBe(before.mergeCommitSha);
+		} finally {
+			commit.mockRestore();
+		}
+	});
+
+	test("background descendants cannot inherit an ended source lock", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		const resume = gate();
+		let background: Promise<unknown> = Promise.resolve();
+		const summary = spyOn(mergeSummaryService, "generateAndInject").mockImplementation(async () => {
+			background = (async () => {
+				await resume.promise;
+				try {
+					await chapterMerge.merge(env.source.id, {
+						targetChapterId: env.target.id,
+						mode: "commit",
+					});
+				} catch (error) {
+					return error;
+				}
+			})();
+		});
+		try {
+			expect(
+				(
+					await chapterMerge.merge(env.source.id, {
+						targetChapterId: env.target.id,
+						mode: "commit",
+					})
+				).success,
+			).toBe(true);
+			const acquire = spyOn(chapterLock, "acquire");
+			try {
+				resume.open();
+				expect(String(await background)).toContain("Source chapter must be active or dormant");
+				expect(acquire.mock.calls.filter(([id]) => id === env.source.id)).toHaveLength(1);
+			} finally {
+				acquire.mockRestore();
+			}
+		} finally {
+			resume.open();
+			summary.mockRestore();
+		}
+	});
+
+	test("independent sources reach their Git merges concurrently", async () => {
+		const env = await createMergePair();
+		const secondSource = await addMergeChapter(env, "second-source");
+		const secondTarget = await addMergeChapter(env, "second-target");
+		for (const source of [env.source, secondSource]) {
+			writeFileSync(join(source.worktree, "feature.txt"), `${source.id}\n`);
+			await git(["add", "-A"], source.worktree);
+			await git(["commit", "-m", "feature"], source.worktree);
+		}
+		const bothEntered = gate();
+		const release = gate();
+		const originalMerge = gitService.merge;
+		let entered = 0;
+		const merge = spyOn(gitService, "merge").mockImplementation(async (...args) => {
+			if (++entered === 2) bothEntered.open();
+			await release.promise;
+			return originalMerge.apply(gitService, args);
+		});
+		try {
+			const first = chapterMerge.merge(env.source.id, {
+				targetChapterId: env.target.id,
+				mode: "commit",
+			});
+			const second = chapterMerge.merge(secondSource.id, {
+				targetChapterId: secondTarget.id,
+				mode: "commit",
+			});
+			await bothEntered.promise;
+			release.open();
+			expect((await first).success).toBe(true);
+			expect((await second).success).toBe(true);
+			expect(readFileSync(join(env.target.worktree, "feature.txt"), "utf-8")).toBe(
+				`${env.source.id}\n`,
+			);
+			expect(readFileSync(join(secondTarget.worktree, "feature.txt"), "utf-8")).toBe(
+				`${secondSource.id}\n`,
+			);
+		} finally {
+			release.open();
+			merge.mockRestore();
+		}
+	});
+});
+
+describe("optional source cleanup after merge", () => {
+	test("interactive commit merge without conflicts forwards the source-replacement cleanup warning", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		await bindSourceNarrator(env.source.id, env.source.worktree);
+		const birth = statSync(env.source.worktree).ino;
+		const moved = `${env.source.worktree}-original`;
+		tempDirs.push(moved);
+		const entered = gate();
+		const release = gate();
+		const originalCommit = gitService.autoCommitUnlocked;
+		const commit = spyOn(gitService, "autoCommitUnlocked").mockImplementation(async (...args) => {
+			const result = await originalCommit.apply(gitService, args);
+			if (args[0] === env.target.worktree) {
+				entered.open();
+				await release.promise;
+			}
+			return result;
+		});
+		const merge = spyOn(gitService, "mergeNoCommit");
+		const finalized = spyOn(chapterWriteStore, "recordChapterMerge");
+		try {
+			const pending = chapterMerge.startInteractiveConflictMerge(env.source.id, {
+				targetChapterId: env.target.id,
+				mode: "commit",
+			});
+			await entered.promise;
+			await git(["worktree", "move", env.source.worktree, moved], env.gitPath);
+			await git(
+				["worktree", "add", env.source.worktree, "-b", `replacement-${generateId()}`, "HEAD"],
+				env.gitPath,
+			);
+			const replacement = statSync(env.source.worktree).ino;
+			writeFileSync(join(env.source.worktree, "replacement.txt"), "do not delete\n");
+			release.open();
+			const result = await pending;
+			expect(result.success).toBe(true);
+			expect(result.conflictFiles).toBeUndefined();
+			expect(result.warning).toContain("source worktree was kept");
+			expect(merge).toHaveBeenCalledTimes(1);
+			expect(finalized).toHaveBeenCalledTimes(1);
+			expect(commit.mock.calls.filter(([path]) => path === env.target.worktree)).toHaveLength(1);
+			expect(statSync(env.source.worktree).ino).toBe(replacement);
+			expect(readFileSync(join(env.source.worktree, "replacement.txt"), "utf-8")).toBe(
+				"do not delete\n",
+			);
+			expect(statSync(moved).ino).toBe(birth);
+			expect(readFileSync(join(moved, "feature.txt"), "utf-8")).toBe("feature\n");
+			expect(readFileSync(join(env.target.worktree, "feature.txt"), "utf-8")).toBe("feature\n");
+			const source = await chapterRow(env.source.id);
+			expect(source.status).toBe("merged");
+			expect(source.mergeCommitSha).toBe(present(result.commitSha, "interactive merge commit"));
+		} finally {
+			release.open();
+			commit.mockRestore();
+			merge.mockRestore();
+			finalized.mockRestore();
+		}
+	});
+
+	test("source replacement during the Git merge keeps both the replacement and original inode", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		await bindSourceNarrator(env.source.id, env.source.worktree);
+		const birth = statSync(env.source.worktree).ino;
+		const moved = `${env.source.worktree}-original`;
+		tempDirs.push(moved);
+		const entered = gate();
+		const release = gate();
+		const originalMerge = gitService.merge;
+		const merge = spyOn(gitService, "merge").mockImplementation(async (...args) => {
+			const result = await originalMerge.apply(gitService, args);
+			entered.open();
+			await release.promise;
+			return result;
+		});
+		try {
+			const pending = chapterMerge.merge(env.source.id, {
+				targetChapterId: env.target.id,
+				mode: "commit",
+			});
+			await entered.promise;
+			await git(["worktree", "move", env.source.worktree, moved], env.gitPath);
+			await git(
+				["worktree", "add", env.source.worktree, "-b", `replacement-${generateId()}`, "HEAD"],
+				env.gitPath,
+			);
+			const replacement = statSync(env.source.worktree).ino;
+			writeFileSync(join(env.source.worktree, "replacement.txt"), "do not delete\n");
+			release.open();
+			const result = await pending;
+			expect(result.success).toBe(true);
+			expect(result.warning).toContain("source worktree was kept");
+			expect(merge).toHaveBeenCalledTimes(1);
+			expect(statSync(env.source.worktree).ino).toBe(replacement);
+			expect(readFileSync(join(env.source.worktree, "replacement.txt"), "utf-8")).toBe(
+				"do not delete\n",
+			);
+			expect(statSync(moved).ino).toBe(birth);
+			expect(readFileSync(join(moved, "feature.txt"), "utf-8")).toBe("feature\n");
+			expect(readFileSync(join(env.target.worktree, "feature.txt"), "utf-8")).toBe("feature\n");
+			expect((await chapterRow(env.source.id)).status).toBe("merged");
+		} finally {
+			release.open();
+			merge.mockRestore();
+		}
+	});
+	for (const mode of ["snapshot", "commit"] as const) {
+		test(`${mode} merge succeeds once while an independent registry keeps the source`, async () => {
+			const env = await createMergePair();
+			writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+			await ensureChapterSnapshot(env.source.worktree);
+			const owner = await bindSourceNarrator(env.source.id, env.source.worktree);
+			await retainIndependentWorktree(env.source.worktree, owner);
+			const merge = spyOn(gitService, "merge");
+			try {
+				const result = await chapterMerge.merge(env.source.id, {
+					targetChapterId: env.target.id,
+					mode,
+				});
+				expect(result.success).toBe(true);
+				expect(result.warning).toContain("source worktree was kept");
+				expect(existsSync(env.source.worktree)).toBe(true);
+				expect(readFileSync(join(env.target.worktree, "feature.txt"), "utf-8")).toBe("feature\n");
+				const row = await chapterRow(env.source.id);
+				expect(row.status).toBe("merged");
+				expect(row.mergedIntoChapterId).toBe(env.target.id);
+				expect(mode === "snapshot" ? row.mergeSnapshotCommitSha : row.mergeCommitSha).toBeTruthy();
+				expect(merge).toHaveBeenCalledTimes(mode === "commit" ? 1 : 0);
+				const edges = await db.query.chapterEdges.findMany({
+					where: eq(chapterEdges.sourceId, env.source.id),
+				});
+				expect(edges.filter((edge) => edge.type === "merge")).toHaveLength(1);
+				expect(
+					await worktreeTreeSnapshot.getRef(env.source.worktree, SNAPSHOT_HEAD_REF),
+				).toBeTruthy();
+			} finally {
+				merge.mockRestore();
+			}
+		});
+	}
+
+	test("conflicts return normally when source cleanup would be forbidden", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.target.worktree, BASE_FILE), BASE_CONTENT.replace("l5", "target"));
+		writeFileSync(join(env.source.worktree, BASE_FILE), BASE_CONTENT.replace("l5", "source"));
+		await retainIndependentWorktree(env.source.worktree);
+		const result = await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id });
+		expect(result.success).toBe(false);
+		expect(result.conflictFiles).toEqual([BASE_FILE]);
+		expect((await chapterRow(env.source.id)).status).toBe("active");
+		expect(existsSync(env.source.worktree)).toBe(true);
+	});
+
+	test("unverifiable optional scope cannot retry or roll back a completed Git merge", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		await ensureChapterSnapshot(env.source.worktree);
+		await bindSourceNarrator(env.source.id, env.source.worktree);
+		const finalized = spyOn(chapterMerge, "markMerged");
+		const originalMerge = gitService.merge;
+		let written = false;
+		const merge = spyOn(gitService, "merge").mockImplementation(async (...args) => {
+			const result = await originalMerge.apply(gitService, args);
+			written = true;
+			return result;
+		});
+		try {
+			const result = await withLifecycleGuardPorts(
+				{
+					canonicalPath: async (path) => {
+						if (written) throw new Error("unverifiable cleanup identity");
+						return resolve(path);
+					},
+					readClaims: async () => ({ complete: false, claims: [] }),
+				},
+				() => chapterMerge.merge(env.source.id, { targetChapterId: env.target.id, mode: "commit" }),
+			);
+			expect(result.success).toBe(true);
+			expect(result.warning).toContain("source worktree was kept");
+			expect(finalized).toHaveBeenCalledTimes(1);
+			expect(merge).toHaveBeenCalledTimes(1);
+			expect((await chapterRow(env.source.id)).mergeCommitSha).toBe(
+				present(result.commitSha, "merge commit"),
+			);
+			expect(readFileSync(join(env.target.worktree, "feature.txt"), "utf-8")).toBe("feature\n");
+			expect(existsSync(env.source.worktree)).toBe(true);
+		} finally {
+			finalized.mockRestore();
+			merge.mockRestore();
+		}
+	});
+
+	test("incomplete legacy-binding provenance still records the completed merge exactly once", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		// Exceed the guard's bounded legacy-binding inventory without fabricating a
+		// deletion scope. The metadata itself needs no authority to remove these cwds.
+		const now = new Date().toISOString();
+		const owners = Array.from({ length: 129 }, () => ({
+			id: generateId(),
+			chapterId: env.source.id,
+			cwd: env.source.worktree,
+			createdAt: now,
+			updatedAt: now,
+		}));
+		await db.insert(narrators).values(owners);
+		createdNarrators.push(...owners.map((owner) => owner.id));
+		const finalized = spyOn(chapterWriteStore, "recordChapterMerge");
+		try {
+			const result = await chapterMerge.merge(env.source.id, {
+				targetChapterId: env.target.id,
+				mode: "commit",
+			});
+			expect(result.success).toBe(true);
+			expect(result.warning).toContain("source worktree was kept");
+			expect(finalized).toHaveBeenCalledTimes(1);
+			expect((await chapterRow(env.source.id)).status).toBe("merged");
+			expect(existsSync(env.source.worktree)).toBe(true);
+		} finally {
+			finalized.mockRestore();
+		}
+	});
+
+	test("failure before entering the metadata scope skips deletion but finalizes once", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		const failure = new ResourceProtectionError("metadata scope unavailable", {
+			status: "unavailable",
+			complete: false,
+			claims: [],
+		});
+		const scope = spyOn(lifecycle, "withLegacyRetirement").mockRejectedValueOnce(failure);
+		const finalized = spyOn(chapterWriteStore, "recordChapterMerge");
+		try {
+			const result = await chapterMerge.merge(env.source.id, {
+				targetChapterId: env.target.id,
+				mode: "commit",
+			});
+			expect(result.success).toBe(true);
+			expect(result.warning).toContain("cleanup scope could not be verified");
+			expect(scope).toHaveBeenCalledTimes(1);
+			expect(finalized).toHaveBeenCalledTimes(1);
+			expect(existsSync(env.source.worktree)).toBe(true);
+			expect((await chapterRow(env.source.id)).status).toBe("merged");
+		} finally {
+			scope.mockRestore();
+			finalized.mockRestore();
+		}
+	});
+
+	test("errors inside metadata are not hidden by the optional-scope fallback", async () => {
+		const env = await createMergePair();
+		const failure = new ResourceProtectionError("metadata write", {
+			status: "unavailable",
+			complete: false,
+			claims: [],
+		});
+		const finalized = spyOn(chapterWriteStore, "recordChapterMerge").mockRejectedValue(failure);
+		try {
+			await expect(
+				chapterMerge.markMergedResult(env.source.id, env.target.id, "merge"),
+			).rejects.toBe(failure);
+			expect(finalized).toHaveBeenCalledTimes(1);
+			expect((await chapterRow(env.source.id)).status).toBe("active");
+			expect(existsSync(env.source.worktree)).toBe(true);
+		} finally {
+			finalized.mockRestore();
+		}
+	});
+
+	test("old chapter-owned narrator cwd does not block checkout-only cleanup", async () => {
+		const env = await createMergePair();
+		writeFileSync(join(env.source.worktree, "feature.txt"), "feature\n");
+		await bindSourceNarrator(env.source.id, env.source.worktree);
+		const result = await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id });
+		expect(result.success).toBe(true);
+		expect(result.warning).toBeUndefined();
+		expect(existsSync(env.source.worktree)).toBe(false);
+		expect((await chapterRow(env.source.id)).mergedSourceSnapshotSha).toBeTruthy();
+	});
 });
 
 describe("merging uncommitted chapters", () => {
