@@ -11,7 +11,7 @@ import {
 	type ContextUsageSnapshot,
 	MAX_INPUT_COMPOSITION_SEGMENTS,
 } from "@shared/context-usage";
-import { activeDatabaseBackend, postgresRuntime, sqlite } from "../db";
+import { activeDatabaseBackend, sqlite } from "../db";
 import { observeContextCharacterWrites } from "../lib/context-characters";
 import {
 	boundedContextSnapshot,
@@ -117,12 +117,18 @@ export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 	}
 
 	async function publishPin(id: string, composition: ContextCharCache, segments: ContextSegment[]) {
-		await query.transaction(async (tx) => {
-			await tx.run("DELETE FROM narrator_context_pins WHERE narrator_id = ?", [id]);
-			await tx.run(
-				"INSERT INTO narrator_context_pins (generation, narrator_id, segments_json) VALUES (?,?,?)",
-				[composition.generation, id, JSON.stringify(segments)],
-			);
+		// The callback stays synchronous: bun:sqlite commits when it returns, so an async
+		// callback would publish the pin outside the transaction. Both statements are queued
+		// before the driver replays them; PostgreSQL awaits the returned chain.
+		await query.transaction((tx) => {
+			return tx
+				.run("DELETE FROM narrator_context_pins WHERE narrator_id = ?", [id])
+				.then(() =>
+					tx.run(
+						"INSERT INTO narrator_context_pins (generation, narrator_id, segments_json) VALUES (?,?,?)",
+						[composition.generation, id, JSON.stringify(segments)],
+					),
+				);
 		});
 	}
 
@@ -325,20 +331,31 @@ export function createContextCharacterServiceFromQuery(query: ContextQuery) {
 }
 
 let service: ReturnType<typeof createContextCharacterService> | undefined;
+let servicePromise: Promise<ReturnType<typeof createContextCharacterService>> | undefined;
 function currentService() {
+	servicePromise ??= openService().catch((error: unknown) => {
+		servicePromise = undefined;
+		throw error;
+	});
+	return servicePromise;
+}
+
+async function openService() {
+	if (service) return service;
 	if (activeDatabaseBackend === "postgres") {
-		if (!postgresRuntime)
+		// Dynamic import: test doubles replace `../db` without this binding, and a static
+		// named import would fail those modules to link.
+		const runtime = (await import("../db")).postgresRuntime;
+		if (!runtime)
 			throw new AppError(
 				"PostgreSQL runtime is not connected",
 				503,
 				"CONTEXT_COMPOSITION_UNAVAILABLE",
 			);
-		service ??= createContextCharacterServiceFromQuery(
-			postgresContextQuery(postgresRuntime.client.sql),
-		);
+		service = createContextCharacterServiceFromQuery(postgresContextQuery(runtime.client.sql));
 		return service;
 	}
-	service ??= createContextCharacterService(sqlite);
+	service = createContextCharacterService(sqlite);
 	return service;
 }
 
@@ -350,7 +367,7 @@ export async function freezeNarratorContextComposition(
 	runtimeSummaryChars = 0,
 	signal?: AbortSignal,
 ): Promise<ContextCharCache | null> {
-	return currentService().freezeForRequest(
+	return (await currentService()).freezeForRequest(
 		narratorId,
 		counts,
 		requestId,
@@ -364,7 +381,7 @@ export async function storeNarratorContextUsage(
 	narratorId: string,
 	snapshot: ContextUsageSnapshot,
 ): Promise<void> {
-	await currentService().storeUsage(narratorId, snapshot);
+	await (await currentService()).storeUsage(narratorId, snapshot);
 }
 
 export async function invalidateContextCharacterCache(
@@ -384,12 +401,12 @@ export async function storeContextRuntimeCharacters(
 	narratorId: string,
 	values: { systemChars?: number; toolsChars?: number },
 ): Promise<void> {
-	await currentService().storeRuntime(narratorId, values);
+	await (await currentService()).storeRuntime(narratorId, values);
 }
 
 export async function getNarratorContextComposition(
 	narratorId: string,
 	signal?: AbortSignal,
 ): Promise<ContextComposition> {
-	return currentService().get(narratorId, signal);
+	return (await currentService()).get(narratorId, signal);
 }

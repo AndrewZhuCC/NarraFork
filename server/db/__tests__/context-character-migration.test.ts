@@ -90,6 +90,7 @@ test("数字窄表迁移回填已有统计并在之后的写入上保持同步",
 		}
 	}
 	if (!migration) throw new Error("Generate the numeric context stats migration first");
+	expect(migration).toContain("WHERE true\nON CONFLICT(`message_id`) DO NOTHING");
 	expect(migration).toContain("INSERT INTO `narrator_message_context_stats`");
 	expect(migration).toContain("COALESCE(`context_chars_json`, '{\"segments\":[]}')");
 	expect(migration).toContain("CREATE TRIGGER `narrator_message_context_stats_insert`");

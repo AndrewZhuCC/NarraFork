@@ -20,7 +20,9 @@ CREATE INDEX `idx_toolcalls_context_id` ON `narrator_tool_calls` (`message_id`,`
 --> statement-breakpoint
 INSERT INTO `narrator_message_context_stats` (`message_id`, `role`, `parent_tool_use_id`, `segments_json`)
 SELECT `id`, `role`, `parent_tool_use_id`, COALESCE(`context_chars_json`, '{"segments":[]}')
-FROM `narrator_messages`;
+FROM `narrator_messages`
+WHERE true
+ON CONFLICT(`message_id`) DO NOTHING;
 --> statement-breakpoint
 CREATE TRIGGER `narrator_message_context_stats_insert`
 AFTER INSERT ON `narrator_messages`
