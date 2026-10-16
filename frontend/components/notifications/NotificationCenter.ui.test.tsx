@@ -15,7 +15,7 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
-import type { KnowledgeSubmission, KnowledgeSubmissionOutcome } from "../../lib/api";
+import type { KnowledgeSubmissionListItem, KnowledgeSubmissionOutcome } from "../../lib/api";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import knowledgeEn from "../../locales/en/knowledge.json";
@@ -189,7 +189,7 @@ let unreadPayload: NotificationUnreadCounts = {
 };
 let reviewInboxPayload = { count: 0, capped: false, limit: 100 };
 let outcomePayload: KnowledgeSubmissionOutcome[] = [];
-let submissionPayload: KnowledgeSubmission[] = [];
+let submissionPayload: KnowledgeSubmissionListItem[] = [];
 
 type TestRouter = ReturnType<typeof testRouter>;
 
@@ -592,6 +592,11 @@ describe("NotificationCenterDrawer", () => {
 				reviewedAt: null,
 				mergedRevisionId: null,
 				createdAt: new Date().toISOString(),
+				entryTitle: "classified title",
+				targetCollectionId: "col-1",
+				collectionName: "secret collection",
+				submitterUsername: "author",
+				drifted: false,
 			},
 		];
 		outcomePayload = [
@@ -613,6 +618,71 @@ describe("NotificationCenterDrawer", () => {
 		expect(document.body.textContent).not.toContain("secret body");
 		expect(document.body.textContent).not.toContain("secret note");
 		expect(container?.querySelector('[data-testid="notification-empty"]')).toBeNull();
+	});
+
+	test("reviewer and author knowledge rows open the request page (linked and standalone)", async () => {
+		reviewInboxPayload = { count: 1, capped: false, limit: 100 };
+		const base = {
+			draftId: "draft-1",
+			collectionId: null,
+			title: null,
+			submitterUserId: "author",
+			baseRevisionId: null,
+			proposedContent: "",
+			changeNote: null,
+			status: "pending" as const,
+			reviewerUserId: null,
+			verdict: null,
+			findingsJson: null,
+			reviewedAt: null,
+			mergedRevisionId: null,
+			createdAt: new Date().toISOString(),
+			entryTitle: null,
+			targetCollectionId: null,
+			collectionName: null,
+			submitterUsername: null,
+			drifted: null,
+		};
+		submissionPayload = [
+			{ ...base, id: "linked-sub", entryId: "entry-1" },
+			{ ...base, id: "standalone-sub", entryId: null, collectionId: "col-1" },
+		];
+		outcomePayload = [
+			{
+				id: "author-sub",
+				draftId: "draft-2",
+				entryId: null,
+				status: "changes_requested",
+				verdict: "request_changes",
+				findingsJson: null,
+				reviewedAt: new Date().toISOString(),
+				createdAt: new Date().toISOString(),
+			},
+		];
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
+		const click = async (selector: string) => {
+			const el = container?.querySelector(selector) as HTMLElement;
+			expect(el).not.toBeNull();
+			await act(async () => {
+				el.click();
+			});
+			await settle();
+		};
+		for (const id of ["linked-sub", "standalone-sub"]) {
+			navigations = [];
+			await click(`[data-testid="knowledge-review-notice"][data-submission-id="${id}"]`);
+			expect(navigations).toEqual([
+				{ to: "/knowledge/requests/$submissionId", params: { submissionId: id } },
+			]);
+		}
+		navigations = [];
+		await click('[data-testid="knowledge-review-outcome"][data-submission-id="author-sub"]');
+		expect(navigations).toEqual([
+			{ to: "/knowledge/requests/$submissionId", params: { submissionId: "author-sub" } },
+		]);
+		navigations = [];
+		await click('[data-testid="knowledge-review-inbox"]');
+		expect(navigations).toEqual([{ to: "/knowledge/review" }]);
 	});
 
 	test("activity empty state has source filters, not duplicate approval forms", async () => {

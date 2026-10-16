@@ -267,9 +267,67 @@ export interface KnowledgeSubmission {
 	createdAt: string;
 }
 
-/** getSubmission adds a unified diff string. */
+/**
+ * A reviewer-list row (`GET /submissions`) with ACL-checked display metadata for the review
+ * inbox. `entryTitle` / `collectionName` are null when the caller cannot read them.
+ */
+export interface KnowledgeSubmissionListItem extends KnowledgeSubmission {
+	entryTitle: string | null;
+	/** Linked → the entry's collection; standalone → the publish target. */
+	targetCollectionId: string | null;
+	collectionName: string | null;
+	submitterUsername: string | null;
+	/** Open linked request based on a stale main; null when unknown / not applicable. */
+	drifted: boolean | null;
+}
+
+/**
+ * What the caller may do with one publish request. Computed server-side by the same functions
+ * the action endpoints use — the request page never infers these from role or identity.
+ */
+export interface KnowledgeSubmissionViewerCaps {
+	isSubmitter: boolean;
+	/** A verdict is accepted (at least comment-only). */
+	canReview: boolean;
+	/** `approve` is accepted (pending only; a conflict is resolved instead). */
+	canApprove: boolean;
+	canResolveConflict: boolean;
+	canWithdraw: boolean;
+	canResubmit: boolean;
+}
+
+/** One round of the same proposal (same personal version and target). */
+export interface KnowledgeSubmissionHistoryItem {
+	id: string;
+	changeNote: string | null;
+	round?: number;
+	status: KnowledgeSubmissionStatus;
+	verdict: KnowledgeVerdict | null;
+	findingsJson: KnowledgeFinding[] | null;
+	reviewerUserId: string | null;
+	reviewerUsername: string | null;
+	reviewedAt: string | null;
+	createdAt: string;
+}
+
+/** `GET /submissions/:id`: the request page's whole payload. */
 export interface KnowledgeSubmissionDetail extends KnowledgeSubmission {
+	/** Unified diff base → proposed. */
 	diff: string;
+	/** The fork point the proposal was made against ("" for standalone). */
+	baseContent: string;
+	/** Current main; null for standalone or when the caller cannot read the entry. */
+	currentMainContent: string | null;
+	entryTitle: string | null;
+	targetCollectionId: string | null;
+	collectionName: string | null;
+	submitterUsername: string | null;
+	reviewerUsername: string | null;
+	/** Linked and readable only. */
+	drift: { drifted: boolean; versionsBehind: number } | null;
+	/** Rounds of this proposal, newest first (includes this request). */
+	history: KnowledgeSubmissionHistoryItem[];
+	viewerCaps: KnowledgeSubmissionViewerCaps;
 }
 
 /**

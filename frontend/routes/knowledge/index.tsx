@@ -1,6 +1,5 @@
 import {
 	ActionIcon,
-	Anchor,
 	Badge,
 	Button,
 	Card,
@@ -11,7 +10,6 @@ import {
 	NavLink,
 	Paper,
 	ScrollArea,
-	SegmentedControl,
 	Select,
 	Stack,
 	Tabs,
@@ -41,7 +39,7 @@ import {
 	IconUserShare,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
@@ -49,7 +47,6 @@ import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
 import { CollectionAclPanel } from "../../components/knowledge/CollectionAclPanel";
 import { KnowledgeEditor } from "../../components/knowledge/editor/KnowledgeEditor";
 import cardClasses from "../../components/knowledge/KnowledgeCards.module.css";
-import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
 import { SubmissionStatusBadge } from "../../components/knowledge/SubmissionStatusBadge";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -59,10 +56,7 @@ import {
 	useCreatePersonalEntry,
 	useDeleteKnowledgeCollection,
 	useKnowledgeCollections,
-	useKnowledgeEntries,
 	useKnowledgeEntriesPaged,
-	useKnowledgeSubmission,
-	useKnowledgeSubmissions,
 	useMyOpenKnowledgeSubmissions,
 	useMyPersonalEntries,
 	useReviewInboxCount,
@@ -73,41 +67,34 @@ import type {
 	KnowledgeCollectionListItem,
 	KnowledgeEntryPage,
 	KnowledgeOpenSubmission,
-	KnowledgeSubmission,
 } from "../../lib/api";
 import { api } from "../../lib/api";
-import { formatLocaleDateTime } from "../../lib/intl-format";
 import {
-	knowledgeReviewDestination,
-	knowledgeSubmissionHash,
-	primaryReviewSubmission,
+	knowledgeRequestDestination,
+	legacyKnowledgeIndexRedirect,
 } from "../../lib/knowledge-review-nav";
 
-const KNOWLEDGE_TABS = ["browse", "mylibrary", "review", "admin"] as const;
+const KNOWLEDGE_TABS = ["browse", "mylibrary", "admin"] as const;
 type KnowledgeTab = (typeof KNOWLEDGE_TABS)[number];
 
 export interface KnowledgeIndexSearch {
 	tab?: KnowledgeTab;
-	submission?: string;
 }
-
-const SUBMISSION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 function parseKnowledgeIndexSearch(search: Record<string, unknown>): KnowledgeIndexSearch {
 	const tab = KNOWLEDGE_TABS.includes(search.tab as KnowledgeTab)
 		? (search.tab as KnowledgeTab)
 		: undefined;
-	const submission =
-		typeof search.submission === "string" && SUBMISSION_ID.test(search.submission)
-			? search.submission
-			: undefined;
-	return {
-		...(tab && tab !== "browse" ? { tab } : {}),
-		...(submission ? { submission } : {}),
-	};
+	return tab && tab !== "browse" ? { tab } : {};
 }
 
 export const Route = createFileRoute("/knowledge/")({
+	// Legacy review-center URLs (§4.2): `?tab=review[&submission=<id>]` → inbox / request page.
+	// Reads the raw location search: validateSearch drops `tab=review` and `submission`.
+	beforeLoad: ({ location }) => {
+		const target = legacyKnowledgeIndexRedirect(location.search as Record<string, unknown>);
+		if (target) throw redirect({ ...target, replace: true });
+	},
 	component: KnowledgePage,
 	validateSearch: parseKnowledgeIndexSearch,
 });
@@ -115,7 +102,7 @@ export const Route = createFileRoute("/knowledge/")({
 function KnowledgePage() {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
-	const { tab: searchTab, submission } = Route.useSearch();
+	const { tab: searchTab } = Route.useSearch();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
 	const tab: KnowledgeTab = searchTab === "admin" && !isAdmin ? "browse" : (searchTab ?? "browse");
@@ -126,20 +113,36 @@ function KnowledgePage() {
 
 	return (
 		<Container size="lg" py="lg">
-			<Stack gap="xs" mb="md">
-				<Title order={2}>{t("title")}</Title>
-				<Text size="sm" c="dimmed">
-					{t("subtitle")}
-				</Text>
-			</Stack>
+			<Group justify="space-between" align="flex-start" mb="md" wrap="wrap">
+				<Stack gap="xs">
+					<Title order={2}>{t("title")}</Title>
+					<Text size="sm" c="dimmed">
+						{t("subtitle")}
+					</Text>
+				</Stack>
+				<Button
+					component={Link}
+					to="/knowledge/review"
+					variant="light"
+					leftSection={<IconGitPullRequest size={16} />}
+					rightSection={
+						inboxCount > 0 ? (
+							<Tooltip label={t("reviewInboxTooltip", { count: inboxCount })}>
+								<Badge size="sm" circle variant="filled" color="indigo">
+									{inboxLabel}
+								</Badge>
+							</Tooltip>
+						) : null
+					}
+				>
+					{t("reviewInboxTitle")}
+				</Button>
+			</Group>
 
 			<Tabs
 				value={tab}
 				onChange={(value) => {
-					const next =
-						value === "mylibrary" || value === "review" || (value === "admin" && isAdmin)
-							? value
-							: undefined;
+					const next = value === "mylibrary" || (value === "admin" && isAdmin) ? value : undefined;
 					navigate({
 						to: "/knowledge",
 						search: next ? { tab: next } : {},
@@ -151,20 +154,6 @@ function KnowledgePage() {
 				<Tabs.List mb="md">
 					<Tabs.Tab value="browse">{t("tabEntries")}</Tabs.Tab>
 					<Tabs.Tab value="mylibrary">{t("tabMyLibrary")}</Tabs.Tab>
-					<Tabs.Tab
-						value="review"
-						rightSection={
-							inboxCount > 0 ? (
-								<Tooltip label={t("reviewInboxTooltip", { count: inboxCount })}>
-									<Badge size="sm" circle variant="filled" color="indigo">
-										{inboxLabel}
-									</Badge>
-								</Tooltip>
-							) : null
-						}
-					>
-						{t("tabReview")}
-					</Tabs.Tab>
 					{isAdmin ? <Tabs.Tab value="admin">{t("tabAdmin")}</Tabs.Tab> : null}
 				</Tabs.List>
 
@@ -173,9 +162,6 @@ function KnowledgePage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="mylibrary">
 					<MyLibraryTab />
-				</Tabs.Panel>
-				<Tabs.Panel value="review">
-					<ReviewCenterTab focusSubmissionId={tab === "review" ? (submission ?? null) : null} />
 				</Tabs.Panel>
 				{isAdmin ? (
 					<Tabs.Panel value="admin">
@@ -746,8 +732,6 @@ function CreateEntryModal({
 	);
 }
 
-type ReviewFilter = "all" | "pending" | "conflict";
-
 function MyLibraryTab() {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
@@ -896,23 +880,19 @@ function MyLibraryTab() {
 					) : (
 						<Stack gap="xs">
 							{(entries.data ?? []).map((p) => {
-								// Linked entries open on the shared entry. An in-flight request goes
-								// straight to that submission (findings / withdraw); otherwise the Draft tab.
+								// An in-flight request opens its request page (findings / withdraw /
+								// resubmit). Otherwise linked entries open on the shared entry's Draft tab.
 								const openSub = openByDraft.get(p.id);
 								const openEntry = () => {
+									if (openSub) {
+										navigate(knowledgeRequestDestination(openSub.id));
+										return;
+									}
 									if (p.entryId) {
-										const dest = openSub
-											? knowledgeReviewDestination({
-													audience: "author",
-													entryId: p.entryId,
-													draftId: p.id,
-													submissionId: openSub.id,
-												})
-											: null;
 										navigate({
 											to: "/knowledge/$entryId",
 											params: { entryId: p.entryId },
-											hash: dest && dest.to === "entry" ? dest.hash : "draft",
+											hash: "draft",
 										});
 										return;
 									}
@@ -988,345 +968,5 @@ function MyLibraryTab() {
 				</Stack>
 			</Grid.Col>
 		</Grid>
-	);
-}
-
-/**
- * A review-center group is either a set of submissions targeting one existing global
- * entry (linked) or a single new-entry proposal targeting a collection (standalone,
- * entryId === null). Standalone proposals have no entry page yet, so they are reviewed
- * inline via a modal instead of navigating away.
- */
-type ReviewGroup =
-	| { kind: "entry"; key: string; entryId: string; subs: KnowledgeSubmission[] }
-	| { kind: "standalone"; key: string; sub: KnowledgeSubmission };
-
-/**
- * Title of a review group's entry. `known` comes from the first page of the entry list
- * (recently updated entries); an older entry is looked up individually — bounded by the
- * submission list — instead of degrading to its id. Unreadable → id prefix.
- */
-function ReviewEntryTitle({ entryId, known }: { entryId: string; known: string | undefined }) {
-	const entry = useQuery({
-		queryKey: ["knowledge", "entry", entryId],
-		queryFn: () => api.getKnowledgeEntry(entryId),
-		enabled: known === undefined,
-		retry: false,
-		staleTime: 30_000,
-	});
-	return <>{known ?? entry.data?.title ?? entryId.slice(0, 8)}</>;
-}
-
-function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | null }) {
-	const { t } = useTranslation("knowledge");
-	const navigate = useNavigate();
-	const { data: user } = useCurrentUser();
-	const isAdmin = user?.role === "admin";
-	const [status, setStatus] = useState<ReviewFilter>("all");
-	const submissions = useKnowledgeSubmissions({ status: status === "all" ? undefined : status });
-	const entries = useKnowledgeEntries({});
-	const collections = useKnowledgeCollections();
-	// Standalone submission opened for inline review (no entry page exists yet).
-	// A linked id passed in the URL is redirected to the entry review panel once loaded.
-	const [reviewingId, setReviewingId] = useState<string | null>(focusSubmissionId);
-	const reviewing = useKnowledgeSubmission(reviewingId ?? undefined);
-
-	useEffect(() => {
-		if (focusSubmissionId) setReviewingId(focusSubmissionId);
-	}, [focusSubmissionId]);
-
-	useEffect(() => {
-		const sub = reviewing.data;
-		if (!reviewingId || !sub?.entryId) return;
-		navigate({
-			to: "/knowledge/$entryId",
-			params: { entryId: sub.entryId },
-			hash: knowledgeSubmissionHash(sub.id),
-			replace: true,
-		});
-	}, [reviewing.data, reviewingId, navigate]);
-
-	const openLinked = (entryId: string, submissionId: string) => {
-		const dest = knowledgeReviewDestination({
-			audience: "reviewer",
-			entryId,
-			draftId: null,
-			submissionId,
-		});
-		if (dest.to === "entry") {
-			navigate({
-				to: "/knowledge/$entryId",
-				params: { entryId: dest.entryId },
-				hash: dest.hash,
-			});
-		}
-	};
-
-	// Map entryId → title for readable entries (falls back to id prefix when not visible).
-	const titleById = useMemo(() => {
-		const m = new Map<string, string>();
-		for (const e of entries.data ?? []) m.set(e.id, e.title);
-		return m;
-	}, [entries.data]);
-	const collectionNameById = useMemo(() => {
-		const m = new Map<string, string>();
-		for (const c of collections.data ?? []) m.set(c.id, c.name);
-		return m;
-	}, [collections.data]);
-
-	// Group linked submissions by entry so reviewers see a per-entry to-do list; each
-	// standalone submission (entryId null) becomes its own group.
-	const grouped = useMemo<ReviewGroup[]>(() => {
-		const linked = new Map<string, KnowledgeSubmission[]>();
-		const groups: ReviewGroup[] = [];
-		for (const s of submissions.data ?? []) {
-			if (s.entryId) {
-				const arr = linked.get(s.entryId);
-				if (arr) arr.push(s);
-				else {
-					const list = [s];
-					linked.set(s.entryId, list);
-					groups.push({ kind: "entry", key: `entry:${s.entryId}`, entryId: s.entryId, subs: list });
-				}
-			} else {
-				groups.push({ kind: "standalone", key: `sub:${s.id}`, sub: s });
-			}
-		}
-		return groups;
-	}, [submissions.data]);
-
-	const closeReview = () => {
-		setReviewingId(null);
-		if (focusSubmissionId) {
-			navigate({ to: "/knowledge", search: { tab: "review" }, replace: true });
-		}
-	};
-
-	return (
-		<Stack gap="md">
-			<Paper withBorder p="sm" radius="md">
-				<Group justify="space-between" align="center" gap="md" wrap="wrap">
-					<div>
-						<Text size="sm" fw={600}>
-							{t("reviewCenter")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("reviewCenterDesc")}
-						</Text>
-					</div>
-					<Group gap="xs" align="center">
-						<Text size="xs" c="dimmed">
-							{t("reviewCenterFilterLabel")}
-						</Text>
-						<SegmentedControl
-							size="xs"
-							value={status}
-							onChange={(v) => setStatus(v as ReviewFilter)}
-							data={[
-								{ value: "all", label: t("reviewCenterAll") },
-								{ value: "pending", label: t("submissionStatus_pending") },
-								{ value: "conflict", label: t("submissionStatus_conflict") },
-							]}
-						/>
-					</Group>
-				</Group>
-			</Paper>
-
-			{submissions.isLoading ? (
-				<Paper withBorder p="xl" radius="md" style={{ display: "flex", justifyContent: "center" }}>
-					<Text size="sm" c="dimmed">
-						{t("loading")}
-					</Text>
-				</Paper>
-			) : grouped.length === 0 ? (
-				<Paper withBorder p="xl" radius="md" ta="center">
-					<ThemeIcon variant="light" size="xl" radius="xl" color="gray" mb="xs">
-						<IconGitPullRequest size={24} />
-					</ThemeIcon>
-					<Text size="sm" fw={600} c="dimmed">
-						{t("noSubmissions")}
-					</Text>
-				</Paper>
-			) : (
-				<Grid gap="md">
-					{grouped.map((g) => (
-						<Grid.Col key={g.key} span={{ base: 12, md: 6 }}>
-							{g.kind === "entry" ? (
-								<Paper
-									withBorder
-									p="md"
-									radius="md"
-									h="100%"
-									style={{ display: "flex", flexDirection: "column" }}
-								>
-									<Group justify="space-between" mb="xs" wrap="nowrap" align="center">
-										<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-											<IconBook2 size={16} style={{ color: "var(--mantine-color-blue-5)" }} />
-											<Anchor
-												component="button"
-												type="button"
-												onClick={() => {
-													const target = primaryReviewSubmission(g.subs);
-													if (target) openLinked(g.entryId, target.id);
-												}}
-												style={{ minWidth: 0, textAlign: "left" }}
-											>
-												<Text size="sm" fw={600} truncate="end">
-													<ReviewEntryTitle entryId={g.entryId} known={titleById.get(g.entryId)} />
-												</Text>
-											</Anchor>
-											<Badge size="xs" variant="light" color="gray" style={{ flexShrink: 0 }}>
-												{g.subs.length}
-											</Badge>
-										</Group>
-										<Button
-											size="compact-xs"
-											variant="light"
-											leftSection={<IconSearch size={12} />}
-											onClick={() => {
-												const target = primaryReviewSubmission(g.subs);
-												if (target) openLinked(g.entryId, target.id);
-											}}
-											style={{ flexShrink: 0 }}
-										>
-											{t("reviewCenterViewEntry")}
-										</Button>
-									</Group>
-									<Stack gap="xs" style={{ flex: 1 }}>
-										{g.subs.map((s) => (
-											<Card
-												key={s.id}
-												withBorder
-												padding="xs"
-												radius="sm"
-												className={cardClasses.reviewCard}
-												onClick={() => openLinked(g.entryId, s.id)}
-											>
-												<Group justify="space-between" wrap="nowrap" align="center">
-													<div style={{ flex: 1, minWidth: 0 }}>
-														<Text size="xs" fw={500} truncate="end">
-															{s.changeNote || s.id.slice(0, 8)}
-														</Text>
-														<Text size="xs" c="dimmed">
-															{formatLocaleDateTime(s.createdAt)}
-														</Text>
-													</div>
-													<SubmissionStatusBadge status={s.status} style={{ flexShrink: 0 }} />
-												</Group>
-											</Card>
-										))}
-									</Stack>
-								</Paper>
-							) : (
-								<Paper
-									withBorder
-									p="md"
-									radius="md"
-									h="100%"
-									style={{ display: "flex", flexDirection: "column" }}
-								>
-									<Group justify="space-between" mb="xs" wrap="nowrap" align="center">
-										<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-											<IconFolder size={16} style={{ color: "var(--mantine-color-teal-5)" }} />
-											<Text size="sm" fw={600} truncate="end">
-												{g.sub.title || t("reviewCenterUntitledEntry")}
-											</Text>
-											<Badge size="xs" variant="light" color="teal" style={{ flexShrink: 0 }}>
-												{t("reviewCenterNewEntry")}
-											</Badge>
-										</Group>
-										<Button
-											size="compact-xs"
-											variant="light"
-											leftSection={<IconSearch size={12} />}
-											onClick={() => setReviewingId(g.sub.id)}
-											style={{ flexShrink: 0 }}
-										>
-											{t("reviewCenterReview")}
-										</Button>
-									</Group>
-									<Card
-										withBorder
-										padding="xs"
-										radius="sm"
-										className={cardClasses.reviewCard}
-										style={{ flex: 1 }}
-										onClick={() => setReviewingId(g.sub.id)}
-									>
-										<Group justify="space-between" wrap="nowrap" align="center">
-											<div style={{ flex: 1, minWidth: 0 }}>
-												<Text size="xs" fw={500} truncate="end">
-													{g.sub.changeNote ||
-														(g.sub.collectionId
-															? collectionNameById.get(g.sub.collectionId)
-															: undefined) ||
-														g.sub.id.slice(0, 8)}
-												</Text>
-												<Text size="xs" c="dimmed">
-													{formatLocaleDateTime(g.sub.createdAt)}
-												</Text>
-											</div>
-											<SubmissionStatusBadge status={g.sub.status} style={{ flexShrink: 0 }} />
-										</Group>
-									</Card>
-								</Paper>
-							)}
-						</Grid.Col>
-					))}
-				</Grid>
-			)}
-
-			<StandaloneReviewModal
-				submissionId={reviewing.data?.entryId ? null : reviewingId}
-				isAdmin={isAdmin}
-				currentUserId={user?.id}
-				onClose={closeReview}
-			/>
-		</Stack>
-	);
-}
-
-/** Inline reviewer for a standalone (new-entry) submission, which has no entry page. */
-function StandaloneReviewModal({
-	submissionId,
-	isAdmin,
-	currentUserId,
-	onClose,
-}: {
-	submissionId: string | null;
-	isAdmin: boolean;
-	currentUserId?: string;
-	onClose: () => void;
-}) {
-	const { t } = useTranslation("knowledge");
-	const detail = useKnowledgeSubmission(submissionId ?? undefined);
-	const sub = detail.data;
-	// A new entry has no existing main content, so the diff's "old" side is empty.
-	const canReview = !!sub && sub.submitterUserId !== currentUserId;
-
-	return (
-		<Modal
-			opened={!!submissionId}
-			onClose={onClose}
-			size="xl"
-			title={sub?.title || t("reviewCenterUntitledEntry")}
-		>
-			{detail.isLoading ? (
-				<Text size="sm" c="dimmed">
-					{t("loading")}
-				</Text>
-			) : sub ? (
-				<SubmissionReviewPanel
-					submission={sub}
-					currentContent=""
-					canReview={isAdmin || canReview}
-					onDone={onClose}
-				/>
-			) : (
-				<Text size="sm" c="dimmed">
-					{t("selectSubmissionHint")}
-				</Text>
-			)}
-		</Modal>
 	);
 }

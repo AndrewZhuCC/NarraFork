@@ -13,7 +13,6 @@ import {
 	Alert,
 	Badge,
 	Button,
-	Card,
 	Container,
 	Divider,
 	Grid,
@@ -40,10 +39,8 @@ import { useEffect, useMemo, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { KnowledgeEditor } from "../../../components/knowledge/editor/KnowledgeEditor";
-import { SubmissionAuthorActions } from "../../../components/knowledge/SubmissionAuthorActions";
-import { SubmissionFindings } from "../../../components/knowledge/SubmissionFindings";
+import { PersonalEntryRequests } from "../../../components/knowledge/PersonalEntryRequests";
 import { SubmissionStatusBadge } from "../../../components/knowledge/SubmissionStatusBadge";
-import { useCurrentUser } from "../../../hooks/useAuth";
 import {
 	useDeletePersonalEntry,
 	useKnowledgeCollections,
@@ -53,9 +50,12 @@ import {
 	useUpdatePersonalEntryContent,
 	useUpdatePersonalEntryMeta,
 } from "../../../hooks/useKnowledge";
-import type { KnowledgePersonalEntry, KnowledgeSubmission } from "../../../lib/api";
+import type { KnowledgePersonalEntry } from "../../../lib/api";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
-import { linkedPersonalRedirectHash } from "../../../lib/knowledge-review-nav";
+import {
+	knowledgeRequestDestination,
+	linkedPersonalRedirect,
+} from "../../../lib/knowledge-review-nav";
 
 export const Route = createFileRoute("/knowledge/personal/$personalEntryId")({
 	component: PersonalEntryPage,
@@ -68,17 +68,22 @@ function PersonalEntryPage() {
 	const entry = usePersonalEntry(personalEntryId);
 
 	// A linked personal entry belongs on its global entry. Editing is the Draft tab;
-	// an open or reviewed request lands on that submission so findings survive the redirect.
+	// an open or reviewed request lands on its request page so findings survive the redirect.
 	const linkedEntryId = entry.data?.entryId ?? null;
 	const history = usePersonalEntrySubmissions(linkedEntryId ? personalEntryId : undefined);
 	useEffect(() => {
 		if (!linkedEntryId || history.isPending) return;
-		navigate({
-			to: "/knowledge/$entryId",
-			params: { entryId: linkedEntryId },
-			hash: linkedPersonalRedirectHash(history.data ?? []),
-			replace: true,
-		});
+		const dest = linkedPersonalRedirect(history.data ?? []);
+		if (dest.to === "request") {
+			navigate({ ...knowledgeRequestDestination(dest.submissionId), replace: true });
+		} else {
+			navigate({
+				to: "/knowledge/$entryId",
+				params: { entryId: linkedEntryId },
+				hash: "draft",
+				replace: true,
+			});
+		}
 	}, [linkedEntryId, history.isPending, history.data, navigate]);
 
 	if (entry.isLoading || linkedEntryId) {
@@ -121,7 +126,6 @@ function PersonalEntryPage() {
 function StandaloneDetail({ entry }: { entry: KnowledgePersonalEntry }) {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
-	const { data: user } = useCurrentUser();
 	const collections = useKnowledgeCollections();
 	const submissions = usePersonalEntrySubmissions(entry.id);
 	const saveContent = useUpdatePersonalEntryContent();
@@ -365,28 +369,7 @@ function StandaloneDetail({ entry }: { entry: KnowledgePersonalEntry }) {
 							</Stack>
 						</Paper>
 
-						<Paper withBorder p="md" radius="md">
-							<Stack gap="sm">
-								<Text size="sm" fw={600}>
-									{t("tabSubmissions")}
-								</Text>
-								<Divider />
-								<SubmissionHistory
-									rows={rows}
-									loading={submissions.isLoading}
-									personalEntryId={entry.id}
-									currentUserId={user?.id}
-									isAdmin={user?.role === "admin"}
-									// Re-submit builds the new request from the SAVED draft, so flush any
-									// unsaved body edits first (same rule as publish).
-									onBeforeResubmit={async () => {
-										if (!dirty) return;
-										await saveContent.mutateAsync({ id: entry.id, content });
-										setDirty(false);
-									}}
-								/>
-							</Stack>
-						</Paper>
+						<PersonalEntryRequests personalEntryId={entry.id} />
 					</Stack>
 				</Grid.Col>
 
@@ -491,84 +474,5 @@ function StandaloneDetail({ entry }: { entry: KnowledgePersonalEntry }) {
 				</Stack>
 			</Modal>
 		</Container>
-	);
-}
-
-function SubmissionHistory({
-	rows,
-	loading,
-	personalEntryId,
-	currentUserId,
-	isAdmin,
-	onBeforeResubmit,
-}: {
-	rows: KnowledgeSubmission[];
-	loading: boolean;
-	personalEntryId: string;
-	currentUserId: string | undefined;
-	isAdmin: boolean;
-	onBeforeResubmit: () => Promise<void>;
-}) {
-	const { t } = useTranslation("knowledge");
-
-	if (loading) {
-		return (
-			<Text size="sm" c="dimmed">
-				{t("loading")}
-			</Text>
-		);
-	}
-	if (rows.length === 0) {
-		return (
-			<Text size="sm" c="dimmed">
-				{t("noSubmissions")}
-			</Text>
-		);
-	}
-
-	return (
-		<Stack gap="xs">
-			{rows.map((s) => (
-				<Card key={s.id} withBorder padding="xs" radius="sm">
-					<Group justify="space-between" wrap="nowrap" align="center">
-						<div style={{ minWidth: 0, flex: 1 }}>
-							<Text size="xs" truncate="end">
-								{s.changeNote || s.id.slice(0, 8)}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{formatLocaleDateTime(s.createdAt)}
-							</Text>
-						</div>
-						<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-							{(s.round ?? 1) > 1 ? (
-								<Badge size="xs" variant="outline" color="grape">
-									{t("subFlowRound", { round: s.round })}
-								</Badge>
-							) : null}
-							<SubmissionStatusBadge status={s.status} />
-						</Group>
-					</Group>
-					<SubmissionFindings findings={s.findingsJson} />
-					{s.status === "superseded" ? (
-						<Text size="xs" c="dimmed" mt={4}>
-							{t("subFlowSupersededHint")}
-						</Text>
-					) : null}
-					{/* Withdraw an open request / re-submit a bounced one. The component hides
-					    itself for statuses and identities where the server would refuse. */}
-					<Group mt={6}>
-						<SubmissionAuthorActions
-							submissionId={s.id}
-							status={s.status}
-							submitterUserId={s.submitterUserId}
-							currentUserId={currentUserId}
-							isAdmin={isAdmin}
-							personalEntryId={personalEntryId}
-							onBeforeResubmit={onBeforeResubmit}
-						/>
-					</Group>
-				</Card>
-			))}
-		</Stack>
 	);
 }

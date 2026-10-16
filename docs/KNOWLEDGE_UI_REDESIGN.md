@@ -1,6 +1,6 @@
 # 知识库前端重构设计
 
-状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1）。
+状态：**实施中**——P0 已合入（NarraFork/NarraFork#81），P1 已完成（见 §8.1），P2a 已完成（见 §8.2）。
 关联文档：数据模型、权限和审核状态机以 `docs/KNOWLEDGE_BASE.md` 为准，本文只改前端信息架构与少量为其服务的后端接口，**不改审核状态机和 ACL 语义**。
 
 ---
@@ -203,7 +203,7 @@ frontend/hooks/knowledge/       按领域拆分 useKnowledge.ts（entries / pers
 |----|------|------|
 | **P0**（✅ 已合入 #81） | 条目列表 cursor 分页、去掉错误的集合计数、卡片悬停样式 | 超过一页的条目可达；侧栏不再显示错误计数 |
 | **P1** 基础件（✅ 已完成，见 §8.1） | `viewerCaps` 接口；`KnowledgeEditor`、`SubmissionStatusBadge`、`DriftBanner` 抽取；现有页面换用这些组件，路由暂不动 | 前端不再出现 `isAdmin \|\| isOwner` 式权限推断；write grant 持有者能看到编辑入口；所有编辑处有预览与未保存提醒 |
-| **P2a** 请求与审核 | `/knowledge/review`、`/knowledge/requests/$id`；铃铛与审核导航迁移；对应旧 URL 重定向 | 关联型与独立型请求同一页面；作者与审核者同一 URL |
+| **P2a** 请求与审核（✅ 已完成，见 §8.2） | `/knowledge/review`、`/knowledge/requests/$id`；铃铛与审核导航迁移；对应旧 URL 重定向 | 关联型与独立型请求同一页面；作者与审核者同一 URL |
 | **P2b** 个人版本 | `/knowledge/mine*`；关联与独立统一编辑页；`#draft` 与 `/personal/$id` 重定向 | "我的版本"只有一个入口 |
 | **P2c** 阅读与设置 | 条目阅读页、`/history`、`/edit`、`/settings`；浏览页筛选排序；删除侧栏 | 只读用户只看到正文、历史、链接 |
 | **P2d** 管理 | `/knowledge/admin/*` 子路由拆分 | 现有管理功能无回退 |
@@ -247,6 +247,53 @@ P2 的子项相互独立，可按 a → b → c → d 顺序并行开发、逐�
 - 叙述者 dock 面板（§5.3 规定只读展示）仍保留其原有的轻量编辑，未嵌入 `KnowledgeEditor`，只把权限改为 `viewerCaps.canWriteMain`；去掉 dock 编辑留给 P2。
 - 编辑器的 Ctrl/Cmd+S 绑定在编辑器根节点（焦点在编辑器内时生效），不是全局快捷键，避免同页多个编辑器互相抢占；未保存拦截对同页 hash 切 tab 同样生效（非活动 tab 会被卸载，编辑会丢）。
 - `SubmissionAuthorActions` 的 `isAdmin`（撤回/重提）与独立提交审核弹窗的权限仍按旧逻辑，属于 P2a 请求详情页的范围。
+
+### 8.2 P2a 落地记录
+
+**后端**（`server/services/knowledge-branch-service.ts`）。`GET /submissions/:id` 走 `getSubmissionForViewer`，返回原有字段 + `diff`，以及：
+
+- `viewerCaps`（`submissionViewerCaps`，纯函数，输入为同一套共享判定）：
+
+| 能力位 | 判定（写接口同用） | 对应写接口 |
+|--------|--------------------|------------|
+| `isSubmitter` | `sub.submitterUserId === principal.userId` | — |
+| `canReview` | `submissionReviewAuthority` 通过 ∧ `!isSelfReviewBlocked` ∧ status ∈ {pending, conflict} | `POST /submissions/:id/review`（至少 `comment_only`） |
+| `canApprove` | 同上 ∧ status = pending（conflict 上 approve 被拒，须走 resolve） | `POST /submissions/:id/review`（`approve`） |
+| `canResolveConflict` | 同上 ∧ status = conflict ∧ linked | `POST /submissions/:id/resolve` |
+| `canWithdraw` | `canActAsSubmitter`（提交者或 admin）∧ `isWithdrawableStatus` | `POST /submissions/:id/withdraw` |
+| `canResubmit` | `canActAsSubmitter` ∧ status = changes_requested | `POST /submissions/:id/resubmit` |
+
+  `submissionReviewAuthority` 从 `review` / `resolveConflict` / 旧 `assertCanReviewStandalone` 的内联判定抽出：linked = 集合可读 ∧ `canReview(entry)`，standalone = 目标集合可读 ∧ 可写；返回值带写接口原样抛出的错误，写接口经 `assertSubmissionReviewAuthority` 调用，与 caps 不可能漂移。`isSelfReviewBlocked`、`canActAsSubmitter`、`isWithdrawableStatus` 同样被写接口与 caps 共用。`canResubmit` 只覆盖 resubmit 自身的闸门；`submitForReview` 的内容前置条件（个人条目已归档、独立型缺标题/目标集合）仍由调用返回错误说明。
+- 展示元信息（§6.2），均在读闸之上再做 ACL：`entryTitle`、`currentMainContent`、`drift`（`drifted` + `versionsBehind`）需要对目标条目 `canRead`；`collectionName` 需要 `canReadCollection`；`baseContent`（fork 基线）可由 `proposedContent` + `diff` 反推，不构成新泄露；`submitterUsername` / `reviewerUsername` 一次 `inArray` 查询；`history` 为同一个人条目、**同一目标**的各轮请求（`idx_ks_draft`，上限 20，不含正文）。
+- 读闸 `loadViewableSubmission`：提交者本人，或对目标有审核权；其余一律 404。修正了旧行为——standalone 请求对"能读不能写目标集合"的用户返回 400 并点名权限。
+- `GET /submissions`（审核者列表）每行补 `entryTitle`（可读才给）、`targetCollectionId`、`collectionName`、`submitterUsername`、`drifted`（仅打开中的 linked 请求），三次批量查询，无逐行查询。
+- 一致性测试 `server/services/__tests__/knowledge-submission-viewer-caps.test.ts`：admin / 条目 owner / 集合 owner / write grant / review tag / 普通读者 / 提交者七类 principal × pending / conflict / changes_requested / standalone 四种状态，逐位验证"能力位为 true ⇔ 对应调用不被拒绝"（看不到的请求按全 false 处理），另测 404 不泄露标题/正文与展示字段。
+
+**前端**：
+
+- `/knowledge/review`（`routes/knowledge/review/index.tsx`）：search `status`（`open` 默认 = pending + conflict，与导航徽章同口径；`pending`、`conflict`、`all`）、`collection`、`entry`；顶部 `ReviewScopeNotice`；每行一个请求，点击进请求页。知识库首页标题栏有带计数徽章的「审核收件箱」按钮，取代原 Review tab。
+- `/knowledge/requests/$submissionId`（`routes/knowledge/requests/$submissionId.tsx`）：头部（状态、类型、轮次 + 上一轮链接、提交者、目标、变更说明、drift 警告）；正文 `SubmissionBody`（linked：对比当前 main / 对比基线 / 预览；无权读 main 时只给基线对比；standalone：预览）；审核者操作 `SubmissionReviewPanel`（verdict + findings，conflict 时为 `KnowledgeEditor` 合并编辑 + 非 approve 的 verdict）；作者操作 `SubmissionAuthorActions` + 「编辑我的版本」；其余只读；`SubmissionTimeline` 列出各轮 verdict / 审核者 / findings。页面上的操作集合由纯函数 `requestActions(viewerCaps)` 决定（`request-actions.test.ts`）。
+- 去掉 §8.1 遗留的客户端推断：`SubmissionAuthorActions` 改收 `caps`（`canWithdraw` / `canResubmit`），独立提交审核弹窗与条目页提交 tab 的 `submissionTabNotice` 随页面一并删除。
+- 导航迁移：`knowledgeRequestDestination(id)` 统一返回请求页；铃铛的审核者行与作者结论行（linked / standalone 一样）、「我的库」中有打开请求的条目、个人条目页的请求列表都进请求页；铃铛的收件箱入口进 `/knowledge/review`；导航徽章仍为收件箱计数。
+
+**旧 URL 重定向**（`lib/knowledge-review-nav.ts` 纯函数，`beforeLoad` 中 `redirect({ replace: true })`，每行一条单测）：
+
+| 旧 | 新 |
+|----|----|
+| `/knowledge?tab=review` | `/knowledge/review` |
+| `/knowledge?tab=review&submission=<id>` | `/knowledge/requests/<id>`（id 不合法 → `/knowledge/review`） |
+| `/knowledge/$entryId#submissions/<id>` | `/knowledge/requests/<id>`（id 不合法 → 下一行） |
+| `/knowledge/$entryId#submissions` | `/knowledge/review?entry=$entryId&status=all` |
+
+**偏差**：
+
+- 条目页的 Submissions tab **删除**而非保留为精简列表：请求只有一个详情页，作者从「我的库」、铃铛或草稿 tab 下的请求列表进入，审核者从收件箱进入，保留第二个列表只会再造一个入口。草稿 tab 与独立个人条目页改为显示本版本的请求列表（`PersonalEntryRequests`，只链接，不再内嵌撤回/重提），因为个人版本页（§5.5）本就规划了"本版本的请求历史"。
+- `#submissions` 重定向到 `?entry=` 过滤的收件箱且 `status=all`（与旧 tab 列出该条目所有可审请求一致）；**不**在无可见请求时自动跳回阅读页（需要先等列表加载，重定向就不再是纯函数），改为空状态里给"返回条目"链接。
+- 收件箱多了 `open` 筛选并作为默认值：§5.6 的"待审"若只含 pending，会把同样等着审核者处理的 conflict 藏起来，且与导航徽章计数不一致。
+- 集合筛选在客户端对（有上限的）审核者列表过滤：linked 请求的集合要经条目解析，服务端列表接口未加该参数。
+- 请求页的"评审意见与 findings 时间线"按**轮次**展示：`knowledge_submissions` 每行只存最后一次 verdict/findings（`comment_only` 会覆盖），没有逐条评审事件表；补事件表属于后端状态机变更，不在本期。
+- 自审：§8.1 中"审核面板对作者本人保守隐藏"的做法随 caps 取消——admin 审自己的请求时请求页会显示审核操作，与服务端 §6.7.5 的 admin 例外一致；非 admin 作者的 `canReview` 恒为 false。
+- `/knowledge/personal/$id` 对 linked 条目的重定向改为：有带 findings 或打开中的请求 → 该请求页；否则 → 条目 `#draft`（P2b 再改到 `/knowledge/mine/<id>`）。「编辑我的版本」同样暂指 `#draft` / `/knowledge/personal/$id`。
 
 ## 9. 测试策略
 

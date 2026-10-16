@@ -966,8 +966,9 @@ principal P：clearance=secret，grantedTags={product:M20}
 
 **和通知铃的关系。** 这些 WS 帧只让客户端重新拉取，不写入平台通知中心的 `notifications` 表（该表的动态投影会回查源内容，知识库标题一旦写进去就可能泄露密级）。铃铛另读两条 ACL 检查过的 HTTP 接口：
 
-- 审核者：`GET /api/knowledge/review-inbox/count`，加上待审列表。点击一条 **linked** 提交会打开 `/knowledge/$entryId#submissions/<id>`（审核面板）；**standalone** 提交打开审核中心的就地审核框。
-- 作者：`GET /api/knowledge/my-submission-outcomes`，最近 30 天内自己的 `approved` / `rejected` / `changes_requested`。响应只有 id、状态和 findings，**没有标题、变更说明或正文**。点击后同样落到共享条目的提交页（已关联）或个人条目页（尚未关联）。
+- 审核者：`GET /api/knowledge/review-inbox/count`，加上待审列表。点击一条提交（linked 与 standalone 相同）打开请求页 `/knowledge/requests/<id>`；收件箱入口打开 `/knowledge/review`。
+- 作者：`GET /api/knowledge/my-submission-outcomes`，最近 30 天内自己的 `approved` / `rejected` / `changes_requested`。响应只有 id、状态和 findings，**没有标题、变更说明或正文**。点击后同样打开请求页 `/knowledge/requests/<id>`——作者与审核者是同一个 URL，页面按 `GET /submissions/:id` 返回的 `viewerCaps` 显示各自的操作（见 KNOWLEDGE_UI_REDESIGN.md §8.2）。
+- 请求页本身再走 ACL 检查过的 `GET /api/knowledge/submissions/:id`：提交者本人或对目标有审核权（§6.7.5）才能看到，其余一律 404；条目标题、当前 main 等展示字段另需对条目/集合的读权限。
 
 收到 `knowledge:review_inbox_changed` 时前端会失效上述查询，所以审核队列有变化时铃铛不会一直空着。
 

@@ -402,11 +402,19 @@ knowledgeRoutes.post("/drafts/:id/submit", async (c) => {
 knowledgeRoutes.get("/submissions", async (c) => {
 	const entryId = c.req.query("entryId") || undefined;
 	const status = c.req.query("status") || undefined;
-	return c.json(await knowledgeBranchService.listSubmissions(principalOf(c), { entryId, status }));
+	// Reviewer list + ACL-checked display metadata (entry title, collection name, submitter,
+	// drift) for the review inbox.
+	return c.json(
+		await knowledgeBranchService.listSubmissionsForInbox(principalOf(c), { entryId, status }),
+	);
 });
 
+// One publish request for the request page: diff, display metadata and `viewerCaps` (what the
+// caller may do with it, computed by the same functions the action endpoints use).
 knowledgeRoutes.get("/submissions/:id", async (c) => {
-	return c.json(await knowledgeBranchService.getSubmission(principalOf(c), c.req.param("id")));
+	return c.json(
+		await knowledgeBranchService.getSubmissionForViewer(principalOf(c), c.req.param("id")),
+	);
 });
 
 knowledgeRoutes.post("/submissions/:id/review", async (c) => {

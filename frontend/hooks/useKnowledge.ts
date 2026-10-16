@@ -348,11 +348,15 @@ export function useSubmitKnowledgeDraft() {
 }
 
 // ─── Submissions ───
-export function useKnowledgeSubmissions(opts: { entryId?: string; status?: string } = {}) {
+export function useKnowledgeSubmissions(
+	opts: { entryId?: string; status?: string } = {},
+	{ enabled = true }: { enabled?: boolean } = {},
+) {
 	return useQuery({
 		queryKey: ["knowledge", "submissions", opts],
 		queryFn: () => api.listKnowledgeSubmissions(opts),
 		staleTime: 10_000,
+		enabled,
 	});
 }
 
