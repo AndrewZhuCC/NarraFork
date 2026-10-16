@@ -3,11 +3,13 @@ import type {
 	KnowledgeBulkGrantResponse,
 	KnowledgeCollection,
 	KnowledgeCollectionAcl,
+	KnowledgeCollectionListItem,
 	KnowledgeDeletePersonalEntryResult,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
 	KnowledgeDraftDrift,
 	KnowledgeEntry,
+	KnowledgeEntryDetail,
 	KnowledgeEntryLink,
 	KnowledgeFinding,
 	KnowledgeGrant,
@@ -92,7 +94,7 @@ function qs(params: Record<string, string | undefined>): string {
 export const knowledgeApi = {
 	// ─── Collections ───
 	listKnowledgeCollections: (projectId?: string) =>
-		request<KnowledgeCollection[]>(`/knowledge/collections${qs({ projectId })}`),
+		request<KnowledgeCollectionListItem[]>(`/knowledge/collections${qs({ projectId })}`),
 	createKnowledgeCollection: (data: {
 		name: string;
 		slug?: string;
@@ -114,7 +116,7 @@ export const knowledgeApi = {
 	// ─── Entries ───
 	listKnowledgeEntries: (opts: { collectionId?: string; tag?: string; q?: string } = {}) =>
 		request<KnowledgeSearchResult[] | KnowledgeEntry[]>(`/knowledge/entries${qs(opts)}`),
-	getKnowledgeEntry: (id: string) => request<KnowledgeEntry>(`/knowledge/entries/${id}`),
+	getKnowledgeEntry: (id: string) => request<KnowledgeEntryDetail>(`/knowledge/entries/${id}`),
 	createKnowledgeEntry: (data: CreateEntryInput) =>
 		request<KnowledgeEntry>("/knowledge/entries", {
 			method: "POST",

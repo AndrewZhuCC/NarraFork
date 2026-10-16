@@ -407,5 +407,18 @@
 	"panel.unsavedTitle": "Unsaved changes",
 	"panel.unsavedMessage": "You have unsaved edits. Discard them?",
 	"panel.discardConfirm": "Discard",
-	"panel.keepEditing": "Keep editing"
+	"panel.keepEditing": "Keep editing",
+
+	"editorView_edit": "Edit",
+	"editorView_preview": "Preview",
+	"editorView_split": "Side by side",
+	"editorView_diff": "Changes",
+	"editorUnsaved": "Unsaved",
+	"editorSaveShortcut": "Ctrl/⌘ + S to save",
+	"editorLeaveTitle": "Discard unsaved changes?",
+	"editorLeaveDesc": "You have edits that have not been saved. Leaving this page will discard them.",
+	"editorStay": "Keep editing",
+	"editorLeave": "Discard and leave",
+	"editVsMain": "Your edit vs. current version",
+	"resolvedVsMain": "Resolved content vs. current version"
 }
