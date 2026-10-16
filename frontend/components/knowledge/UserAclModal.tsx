@@ -16,7 +16,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-	useKnowledgeEntries,
+	useKnowledgeEntriesPaged,
 	useKnowledgeLevels,
 	useKnowledgeTags,
 	useKnowledgeTagTypes,
@@ -43,7 +43,12 @@ export function UserAclModal({ userId, username, opened, onClose }: Props) {
 	const tagTypes = useKnowledgeTagTypes();
 	const acl = useUserAcl(opened ? (userId ?? undefined) : undefined);
 	const setAcl = useSetUserAcl();
-	const entries = useKnowledgeEntries({});
+	// Paged at the server max; the preview states when it covers only the loaded pages.
+	const entries = useKnowledgeEntriesPaged({ limit: 200 }, { enabled: opened });
+	const loadedEntries = useMemo(
+		() => (entries.data?.pages ?? []).flatMap((p) => p.items),
+		[entries.data],
+	);
 
 	const [clearanceLevel, setClearanceLevel] = useState<string | null>(null);
 	const [tagIds, setTagIds] = useState<string[]>([]);
@@ -78,7 +83,7 @@ export function UserAclModal({ userId, username, opened, onClose }: Props) {
 	// Client-side preview: simulate access check using current selections
 	// Note: entry list data may not contain full ACL fields; this is an approximation.
 	const preview = useMemo(() => {
-		const allEntries = entries.data ?? [];
+		const allEntries = loadedEntries;
 		const allLevels = levels.data ?? [];
 		const levelRankMap = new Map(allLevels.map((l) => [l.name, l.rank]));
 		levelRankMap.set("public", 0);
@@ -120,7 +125,7 @@ export function UserAclModal({ userId, username, opened, onClose }: Props) {
 			byCollection,
 			totalByCollection,
 		};
-	}, [entries.data, levels.data, clearanceLevel, tagIds]);
+	}, [loadedEntries, levels.data, clearanceLevel, tagIds]);
 
 	const levelOptions = useMemo(
 		() =>
@@ -279,6 +284,22 @@ export function UserAclModal({ userId, username, opened, onClose }: Props) {
 								</Stack>
 							)}
 						</Paper>
+
+						{entries.hasNextPage ? (
+							<Group gap="xs" wrap="nowrap" align="center">
+								<Text size="xs" c="orange">
+									{t("previewTruncated", { count: loadedEntries.length })}
+								</Text>
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									loading={entries.isFetchingNextPage}
+									onClick={() => entries.fetchNextPage()}
+								>
+									{t("loadMoreEntries")}
+								</Button>
+							</Group>
+						) : null}
 
 						<Text size="xs" c="dimmed">
 							{t("previewDisclaimer")}

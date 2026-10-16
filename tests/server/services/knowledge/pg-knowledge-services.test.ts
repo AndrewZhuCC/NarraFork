@@ -468,6 +468,23 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 					).toBe(true);
 					expect((await service.listRevisions(entry.id, owner)).length).toBe(2);
 					expect(await service.listEntries({ collectionId: col.id })).toHaveLength(2);
+					// Keyset pagination on PG: two pages of one, no overlap, cursor ends null.
+					const page1 = await service.listEntriesPage({
+						principal: admin,
+						collectionId: col.id,
+						limit: 1,
+					});
+					expect(page1.items).toHaveLength(1);
+					expect(page1.nextCursor).not.toBeNull();
+					const page2 = await service.listEntriesPage({
+						principal: admin,
+						collectionId: col.id,
+						limit: 1,
+						cursor: page1.nextCursor ?? undefined,
+					});
+					expect(page2.items).toHaveLength(1);
+					expect(page2.items[0]?.id).not.toBe(page1.items[0]?.id);
+					expect(page2.nextCursor).toBeNull();
 					await service.transferEntryOwner(entry.id, reader.userId, owner);
 					await service.transferCollectionOwner(col.id, reader.userId, owner);
 					expect((await acl.getCollectionAcl(col.id)).ownerUserId).toBe(reader.userId);

@@ -21,6 +21,7 @@ import {
 	Title,
 	Tooltip,
 } from "@mantine/core";
+import { useDebouncedValue } from "@mantine/hooks";
 import {
 	IconAlertTriangle,
 	IconArrowBackUp,
@@ -57,7 +58,7 @@ import {
 	useDeleteKnowledgeEntry,
 	useEntryLinks,
 	useKnowledgeDraftDrift,
-	useKnowledgeEntries,
+	useKnowledgeEntriesPaged,
 	useKnowledgeEntry,
 	useKnowledgeRevision,
 	useKnowledgeRevisions,
@@ -1096,10 +1097,19 @@ function LinksTab({ entryId, collectionId }: { entryId: string; collectionId: st
 	const links = useEntryLinks(entryId, "both");
 	const createLink = useCreateEntryLink();
 	const deleteLink = useDeleteEntryLink();
-	// Candidate targets: readable entries in the same collection (excluding self).
-	const candidates = useKnowledgeEntries({ collectionId });
+	// Candidate targets: readable entries in the same collection (excluding self). Without
+	// a search term only the most recently updated page is listed; typing searches the
+	// whole collection server-side, so older entries stay reachable.
+	const [targetSearch, setTargetSearch] = useState("");
+	const [debouncedSearch] = useDebouncedValue(targetSearch.trim(), 250);
+	const candidates = useKnowledgeEntriesPaged({
+		collectionId,
+		q: debouncedSearch || undefined,
+		limit: 100,
+	});
 
 	const [targetId, setTargetId] = useState<string | null>(null);
+	const [targetLabel, setTargetLabel] = useState<string | null>(null);
 	const [linkType, setLinkType] = useState<KnowledgeLinkType>("related");
 	const [label, setLabel] = useState("");
 
@@ -1108,9 +1118,15 @@ function LinksTab({ entryId, collectionId }: { entryId: string; collectionId: st
 	const inLinks = all.filter((l) => l.direction === "in");
 
 	const targetOptions = useMemo(() => {
-		const rows = candidates.data ?? [];
-		return rows.filter((r) => r.id !== entryId).map((r) => ({ value: r.id, label: r.title }));
-	}, [candidates.data, entryId]);
+		const rows = (candidates.data?.pages ?? []).flatMap((p) => p.items);
+		const opts = rows.filter((r) => r.id !== entryId).map((r) => ({ value: r.id, label: r.title }));
+		// Keep the current selection selectable after the result set changes.
+		if (targetId && targetLabel && !opts.some((o) => o.value === targetId)) {
+			opts.unshift({ value: targetId, label: targetLabel });
+		}
+		return opts;
+	}, [candidates.data, entryId, targetId, targetLabel]);
+	const candidatesTruncated = !debouncedSearch && !!candidates.hasNextPage;
 
 	const linkTypeOptions = LINK_TYPES.map((lt) => ({ value: lt, label: t(`linkType_${lt}`) }));
 
@@ -1126,6 +1142,8 @@ function LinksTab({ entryId, collectionId }: { entryId: string; collectionId: st
 			{
 				onSuccess: () => {
 					setTargetId(null);
+					setTargetLabel(null);
+					setTargetSearch("");
 					setLabel("");
 					setLinkType("related");
 				},
@@ -1146,10 +1164,19 @@ function LinksTab({ entryId, collectionId }: { entryId: string; collectionId: st
 					<Select
 						label={t("linkTarget")}
 						placeholder={t("linkTargetPlaceholder")}
+						description={candidatesTruncated ? t("linkTargetTruncated") : undefined}
 						data={targetOptions}
 						value={targetId}
-						onChange={setTargetId}
+						onChange={(v, option) => {
+							setTargetId(v);
+							setTargetLabel(option?.label ?? null);
+						}}
 						searchable
+						searchValue={targetSearch}
+						onSearchChange={setTargetSearch}
+						// Server search (FTS) also matches body text, so don't re-filter its
+						// results by label on the client.
+						filter={debouncedSearch ? ({ options }) => options : undefined}
 						w={260}
 						nothingFoundMessage={t("linkNoCandidates")}
 					/>

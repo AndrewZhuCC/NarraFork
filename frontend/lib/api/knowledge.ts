@@ -9,6 +9,7 @@ import type {
 	KnowledgeDraftDrift,
 	KnowledgeEntry,
 	KnowledgeEntryLink,
+	KnowledgeEntryPage,
 	KnowledgeFinding,
 	KnowledgeGrant,
 	KnowledgeGraph,
@@ -89,6 +90,9 @@ function qs(params: Record<string, string | undefined>): string {
 	return s ? `?${s}` : "";
 }
 
+/** Default page size for the paged entry list (server max is 200). */
+export const KNOWLEDGE_ENTRY_PAGE_SIZE = 50;
+
 export const knowledgeApi = {
 	// ─── Collections ───
 	listKnowledgeCollections: (projectId?: string) =>
@@ -114,6 +118,16 @@ export const knowledgeApi = {
 	// ─── Entries ───
 	listKnowledgeEntries: (opts: { collectionId?: string; tag?: string; q?: string } = {}) =>
 		request<KnowledgeSearchResult[] | KnowledgeEntry[]>(`/knowledge/entries${qs(opts)}`),
+	/** Keyset-paginated entry list; follow `nextCursor` until null. */
+	listKnowledgeEntriesPage: (
+		opts: { collectionId?: string; tag?: string; q?: string; cursor?: string; limit?: number } = {},
+	) =>
+		request<KnowledgeEntryPage>(
+			`/knowledge/entries${qs({
+				...opts,
+				limit: String(opts.limit ?? KNOWLEDGE_ENTRY_PAGE_SIZE),
+			})}`,
+		),
 	getKnowledgeEntry: (id: string) => request<KnowledgeEntry>(`/knowledge/entries/${id}`),
 	createKnowledgeEntry: (data: CreateEntryInput) =>
 		request<KnowledgeEntry>("/knowledge/entries", {

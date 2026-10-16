@@ -79,6 +79,12 @@ export interface KnowledgeEntryGraphRow extends KnowledgeEntryAclRow {
 }
 
 /** The list-view projection: everything a listing renders, never the content blob. */
+/** Keyset position in the (updatedAt DESC, id DESC) entry list order. */
+export interface KnowledgeEntryListCursor {
+	updatedAt: string;
+	id: string;
+}
+
 export interface KnowledgeEntryListRow {
 	id: string;
 	collectionId: string;
@@ -254,8 +260,16 @@ export interface KnowledgeReadStore {
 	getEntriesAclByIds(entryIds: string[]): Promise<KnowledgeEntryAclRow[]>;
 	/** Batch: ACL + display fields of many entries (graph traversal preload). */
 	getEntriesGraphByIds(entryIds: string[]): Promise<KnowledgeEntryGraphRow[]>;
-	/** List-view rows, newest-updated first, bounded by `limit`. */
-	listEntries(opts: { collectionId?: string; limit: number }): Promise<KnowledgeEntryListRow[]>;
+	/**
+	 * List-view rows ordered by (updatedAt DESC, id DESC), bounded by `limit`. When `after`
+	 * is given, only rows strictly after that keyset position are returned (keyset
+	 * pagination — the `id` tie-break keeps equal timestamps from being skipped/duplicated).
+	 */
+	listEntries(opts: {
+		collectionId?: string;
+		limit: number;
+		after?: KnowledgeEntryListCursor;
+	}): Promise<KnowledgeEntryListRow[]>;
 	/** The slug pre-check before an entry insert. Only the id crosses back. */
 	findEntryBySlug(collectionId: string, slug: string): Promise<{ id: string } | null>;
 

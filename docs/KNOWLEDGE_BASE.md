@@ -616,7 +616,8 @@ knowledgeService = {
   // 集合
   listCollections(scope), createCollection(...), updateCollection(...), deleteCollection(...),
   // 条目
-  listEntries(collectionId, { tags, status, cursor }),
+  listEntriesPage({ principal, collectionId, tag, limit, cursor }),  // keyset 分页 + 标签/ACL 后过滤回填，见 4.2
+  listEntries({ collectionId, tag, limit }),  // 未过滤的原始首页，仅内部/测试用；对外一律走 listEntriesPage
   getEntry(entryId, { withContent, viewContext }),  // viewContext 命中时返回按条件块裁剪后的正文（见 3.9）
   createEntry(...),            // 创建条目 + 首个 revision（含 classificationLevel、tags）
   updateEntryMeta(...),        // 改 title/slug/tags/classificationLevel/metadata（不改正文）
@@ -657,7 +658,7 @@ POST   /api/knowledge/collections                   创建集合
 PATCH  /api/knowledge/collections/:id
 DELETE /api/knowledge/collections/:id
 
-GET    /api/knowledge/entries?collectionId=&tags=&q=&view.version=&view.product= 列出/筛选条目（q 触发 FTS；结果按权限过滤；view.* 传 viewContext 裁剪正文/摘要）
+GET    /api/knowledge/entries?collectionId=&tag=&q=&limit=&cursor=&view.version=&view.product= 列出/筛选条目（q 触发 FTS；结果按权限过滤；view.* 传 viewContext 裁剪正文/摘要；分页见下）
 POST   /api/knowledge/entries                        创建条目（含首版本、密级、标签）
 GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）
 PATCH  /api/knowledge/entries/:id                    改元数据（标题/标签/密级/metadata）
@@ -683,6 +684,16 @@ GET    /api/knowledge/grants?scope=&principal=         列出授权（clearance 
 POST   /api/knowledge/grants                           授予 clearance 或 tag
 DELETE /api/knowledge/grants/:id                       撤销授权
 ```
+
+**`GET /entries` 分页（keyset）：**
+
+- 排序固定为 `(updatedAt DESC, id DESC)`；`id` 作为同一时间戳下的稳定决胜键。`cursor` 是不透明的 base64url 串（编码最后消费位置的 `[updatedAt, id]`），非法值返回 400。
+- **带 `limit`（1–200，默认 50）或 `cursor` 时**返回分页信封 `{ items, nextCursor }`，`nextCursor` 为 `null` 表示已到底。
+- **两者都不带时**保留旧形状：裸数组，即第一页（最多 100 条可读条目）；若还有更多，用响应头 `X-Next-Cursor` 告知，旧调用方至少能察觉截断。选择"参数显式开启信封"而不是直接改形状，是为了不打断任何仍按数组解析的调用方（`GET /entries` 不在 External API v1 中，见 `OPEN_API.md`）。
+- 标签与 ACL 过滤发生在 DB 读取之后，所以服务层（`listEntriesPage`）会按批（`max(limit+1, 50)`，上限 200）继续往后读，直到凑满一页、源数据读尽，或单次请求扫描满 `ENTRY_PAGE_MAX_SCAN_ROWS = 1000` 行为止。预算耗尽时返回一页**偏短甚至为空**的结果 + 指向最后扫描行之后的 `nextCursor`——调用方应继续跟随游标，而不是把"短页"当作结束。页填满时游标指向最后返回的那一行，因此跨页不重不漏。
+- 带 `q` 时走 FTS 检索（自身已有上限、不分页）；分页模式下其 `nextCursor` 恒为 `null`。
+- 全量（无 `collectionId`）列表目前没有 `(updated_at, id)` 索引，依赖每次请求的行数预算限界；若条目量很大需补索引（schema 变更 + 迁移，另行立项）。
+- 侧栏**不显示每个集合的条目数**：按条目逐条 ACL 判定后计数需要全表扫描，不满足主线程约束；而从已加载的列表推算的数字是错误的（只覆盖当前筛选与已加载页），因此去掉。
 
 > 开放 API（API token 鉴权、外部读写）见 `OPEN_API.md`；本文件只定义资源本身与内部（JWT）接口。两者复用同一 `knowledgeService`。
 
@@ -788,6 +799,7 @@ principal P：clearance=secret，grantedTags={product:M20}
 ### 6.4 命中过滤发生在返回/注入之前
 
 - 检索（FTS / tag / metadata）先召回候选，再按 6.1 逐条 `canRead` 过滤，**未通过的条目既不返回也不计数**，避免通过结果数量/标题泄露存在性（侧信道）。
+- 列表分页（4.2）同理：被过滤的行只推进游标，不出现在 `items` 里；短页/空页 + 非空游标只说明"扫描预算用完、后面还有行"，不暴露被隐藏条目的标题、内容或确切数量（这是有界扫描的固有代价：读者最多能推断"存在大量不可读条目"）。
 - 关键词自动注入（第 5 节）同样在注入前过滤：principal 看不到无权访问的条目摘要。
 - 受控标签本身的存在（如"有个 team:售后 分区"）不向无权 principal 暴露。
 

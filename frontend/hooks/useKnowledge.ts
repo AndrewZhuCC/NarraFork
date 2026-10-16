@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import type {
 	BulkKnowledgeGrantInput,
@@ -57,6 +57,27 @@ export function useKnowledgeEntries(opts: { collectionId?: string; tag?: string;
 		queryKey: ["knowledge", "entries", opts],
 		queryFn: () => api.listKnowledgeEntries(opts),
 		staleTime: STALE,
+	});
+}
+
+/**
+ * Keyset-paginated entry list (GET /knowledge/entries with `limit`/`cursor`). Use this
+ * wherever the full list matters: the legacy `useKnowledgeEntries` only ever sees the
+ * first 100 readable entries. With `q` the server's capped FTS results come back as a
+ * single page (`nextCursor: null`).
+ */
+export function useKnowledgeEntriesPaged(
+	opts: { collectionId?: string; tag?: string; q?: string; limit?: number },
+	queryOpts: { enabled?: boolean } = {},
+) {
+	return useInfiniteQuery({
+		queryKey: ["knowledge", "entries", "paged", opts],
+		queryFn: ({ pageParam }) =>
+			api.listKnowledgeEntriesPage({ ...opts, cursor: pageParam ?? undefined }),
+		initialPageParam: null as string | null,
+		getNextPageParam: (last) => last.nextCursor,
+		staleTime: STALE,
+		enabled: queryOpts.enabled ?? true,
 	});
 }
 
