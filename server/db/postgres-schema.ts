@@ -783,23 +783,32 @@ export const modelHistoryRevisionContracts = pgTable("model_history_revision_con
 	installedVersion: text("installed_version").notNull(),
 });
 
-export const narratorContextCharPages = pgTable(
-	"narrator_context_char_pages",
+export const narratorContextPins = pgTable(
+	"narrator_context_pins",
 	{
-		id: text("id").primaryKey().notNull(),
+		generation: text("generation").primaryKey().notNull(),
 		narratorId: text("narrator_id")
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
-		generation: text("generation").notNull(),
-		page: integer("page").notNull(),
+		segmentsJson: jsonText("segments_json").notNull(),
+	},
+	(table) => [index("idx_context_pins_narrator").on(table.narratorId)],
+);
+
+export const narratorMessageContextStats = pgTable(
+	"narrator_message_context_stats",
+	{
+		messageId: text("message_id").primaryKey().notNull(),
+		role: text("role").notNull(),
+		parentToolUseId: text("parent_tool_use_id"),
 		segmentsJson: jsonText("segments_json").notNull(),
 	},
 	(table) => [
-		uniqueIndex("context_char_pages_generation_page_idx").on(
-			table.narratorId,
-			table.generation,
-			table.page,
-		),
+		foreignKey({
+			name: "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk",
+			columns: [table.messageId],
+			foreignColumns: [narratorMessages.id],
+		}).onDelete("cascade"),
 	],
 );
 
@@ -3942,8 +3951,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 123,
-  "columnCount": 1742,
+  "tableCount": 124,
+  "columnCount": 1744,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8535,12 +8544,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
-      "exportName": "narratorContextCharPages",
-      "name": "narrator_context_char_pages",
+      "exportName": "narratorContextPins",
+      "name": "narrator_context_pins",
       "columns": [
         {
-          "property": "id",
-          "name": "id",
+          "property": "generation",
+          "name": "generation",
           "kind": "text",
           "pgType": "text",
           "notNull": true,
@@ -8559,27 +8568,9 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "table": "narrators",
             "column": "id",
             "onDelete": "cascade",
-            "constraintName": "narrator_context_char_pages_narrator_id_narrators_id_fk"
+            "constraintName": "narrator_context_pins_narrator_id_narrators_id_fk"
           },
           "emitAsTableConstraint": false
-        },
-        {
-          "property": "generation",
-          "name": "generation",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "page",
-          "name": "page",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false
         },
         {
           "property": "segmentsJson",
@@ -8594,15 +8585,69 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "indexes": [
         {
-          "name": "context_char_pages_generation_page_idx",
+          "name": "idx_context_pins_narrator",
           "columns": [
-            "narratorId",
-            "generation",
-            "page"
+            "narratorId"
           ],
-          "unique": true
+          "unique": false
         }
       ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorMessageContextStats",
+      "name": "narrator_message_context_stats",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "role",
+          "name": "role",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "parentToolUseId",
+          "name": "parent_tool_use_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "segmentsJson",
+          "name": "segments_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],

@@ -1,6 +1,6 @@
 {
-  "id": "e3f4b979-4abf-491f-a015-5a1912dc077e",
-  "prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+  "id": "43a4d822-79d0-46ef-abb4-dadd921e37c2",
+  "prevId": "e3f4b979-4abf-491f-a015-5a1912dc077e",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -11316,12 +11316,12 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.narrator_context_char_pages": {
-      "name": "narrator_context_char_pages",
+    "public.narrator_context_pins": {
+      "name": "narrator_context_pins",
       "schema": "",
       "columns": {
-        "id": {
-          "name": "id",
+        "generation": {
+          "name": "generation",
           "type": "text",
           "primaryKey": true,
           "notNull": true
@@ -11329,18 +11329,6 @@
         "narrator_id": {
           "name": "narrator_id",
           "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "generation": {
-          "name": "generation",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "page": {
-          "name": "page",
-          "type": "integer",
           "primaryKey": false,
           "notNull": true
         },
@@ -11352,38 +11340,26 @@
         }
       },
       "indexes": {
-        "context_char_pages_generation_page_idx": {
-          "name": "context_char_pages_generation_page_idx",
+        "idx_context_pins_narrator": {
+          "name": "idx_context_pins_narrator",
           "columns": [
             {
               "expression": "narrator_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
-            },
-            {
-              "expression": "generation",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "page",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
             }
           ],
-          "isUnique": true,
+          "isUnique": false,
           "concurrently": false,
           "method": "btree",
           "with": {}
         }
       },
       "foreignKeys": {
-        "narrator_context_char_pages_narrator_id_narrators_id_fk": {
-          "name": "narrator_context_char_pages_narrator_id_narrators_id_fk",
-          "tableFrom": "narrator_context_char_pages",
+        "narrator_context_pins_narrator_id_narrators_id_fk": {
+          "name": "narrator_context_pins_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_context_pins",
           "tableTo": "narrators",
           "columnsFrom": [
             "narrator_id"
@@ -11936,6 +11912,57 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.narrator_message_context_stats": {
+      "name": "narrator_message_context_stats",
+      "schema": "",
+      "columns": {
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "parent_tool_use_id": {
+          "name": "parent_tool_use_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "segments_json": {
+          "name": "segments_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk": {
+          "name": "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk",
+          "tableFrom": "narrator_message_context_stats",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

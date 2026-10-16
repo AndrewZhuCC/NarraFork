@@ -18,7 +18,7 @@ import {
 	contextCharacterPercent,
 } from "@shared/context-composition";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -62,16 +62,12 @@ export function ContextCompositionView({
 	data,
 	totalTokens,
 	snapshot,
-	onLoadMore,
-	loadingMore,
 	mode: controlledMode,
 	onModeChange,
 }: {
 	data: ContextComposition;
 	totalTokens?: number | null;
 	snapshot?: ContextUsageSnapshot | null;
-	onLoadMore?: () => void;
-	loadingMore?: boolean;
 	mode?: string;
 	onModeChange?: (value: string) => void;
 }) {
@@ -125,8 +121,6 @@ export function ContextCompositionView({
 		return `${t(`contextComposition.categories.${category}`)} · ${tokens == null ? "—" : `≈${formatContextTokens(tokens)}`} · ${contextCharacterPercent(chars, totalChars).toFixed(1)}%`;
 	};
 	const tooltip = (label: string) => (hasEstimate ? `${label} · ${estimateHint}` : label);
-	const unloadedChars =
-		mode === "sequence" && data.nextCursor ? Math.max(0, data.totalChars - offset) : 0;
 	return (
 		<Stack gap="sm">
 			<Group justify="space-between">
@@ -183,28 +177,6 @@ export function ContextCompositionView({
 						</Tooltip>
 					);
 				})}
-				{unloadedChars > 0 && (
-					<Tooltip label={t("contextComposition.loadMore")}>
-						<Box
-							component="button"
-							type="button"
-							data-testid="context-composition-more"
-							aria-label={t("contextComposition.loadMore")}
-							disabled={loadingMore}
-							onClick={onLoadMore}
-							style={{
-								width: `${contextCharacterPercent(unloadedChars, totalChars)}%`,
-								border: 0,
-								padding: 0,
-								cursor: "pointer",
-								background: "var(--mantine-color-default-hover)",
-								color: "var(--mantine-color-text)",
-							}}
-						>
-							…
-						</Box>
-					</Tooltip>
-				)}
 			</Box>
 			{!calibrated && hasEstimate && segments.length > 0 && (
 				<Text size="xs" c="dimmed" data-testid="context-composition-estimate-hint">
@@ -235,11 +207,6 @@ export function ContextCompositionView({
 					);
 				})}
 			</Group>
-			{mode === "sequence" && data.nextCursor && (
-				<Button variant="subtle" size="xs" loading={loadingMore} onClick={onLoadMore}>
-					{t("contextComposition.loadMore")}
-				</Button>
-			)}
 		</Stack>
 	);
 }
@@ -259,33 +226,15 @@ export function ContextCompositionPanel({
 	const qc = useQueryClient();
 	const [mode, setMode] = useState("category");
 	const queryKey = ["contextComposition", narratorId];
-	const query = useInfiniteQuery({
+	const query = useQuery({
 		queryKey,
-		initialPageParam: undefined as string | undefined,
-		queryFn: ({ signal, pageParam }) => getContextComposition(narratorId, signal, pageParam),
-		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		queryFn: ({ signal }) => getContextComposition(narratorId, signal),
 		enabled: opened,
 		staleTime: 0,
 		retry: false,
-		refetchInterval: (state) => (state.state.data?.pages[0]?.pending ? 300 : false),
+		refetchInterval: (state) => (state.state.data?.pending ? 300 : false),
 	});
-	const pages = query.data?.pages;
-	const first = pages?.[0];
-	const mixedGeneration = Boolean(
-		first && pages?.some((page) => page.generation !== first.generation),
-	);
-	useEffect(() => {
-		if (mixedGeneration)
-			void qc.resetQueries({ queryKey: ["contextComposition", narratorId], exact: true });
-	}, [mixedGeneration, qc, narratorId]);
-	const data =
-		first && !mixedGeneration
-			? {
-					...first,
-					segments: pages?.flatMap((page) => page.segments) ?? [],
-					nextCursor: pages?.at(-1)?.nextCursor ?? null,
-				}
-			: undefined;
+	const data = query.data;
 	return (
 		<Stack gap="sm" data-testid="context-composition-panel">
 			<Group justify="space-between">
@@ -320,8 +269,6 @@ export function ContextCompositionPanel({
 					snapshot={snapshot}
 					mode={mode}
 					onModeChange={setMode}
-					onLoadMore={() => void query.fetchNextPage()}
-					loadingMore={query.isFetchingNextPage}
 				/>
 			)}
 		</Stack>

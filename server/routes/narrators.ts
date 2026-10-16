@@ -789,7 +789,7 @@ narratorRoutes.route("/:id/request-recordings", requestRecordingRoutes);
 // The /:id/* middleware above enforces requireNarratorAccess(..., "read").
 narratorRoutes.get("/:id/context-composition", async (c) => {
 	return c.json(
-		await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal, c.req.query("cursor")),
+		await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal),
 	);
 });
 

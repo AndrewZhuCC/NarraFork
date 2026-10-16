@@ -22,7 +22,7 @@ const client = {
 	},
 };
 mock.module("@tanstack/react-query", () => ({
-	useInfiniteQuery: () => query,
+	useQuery: () => query,
 	useQueryClient: () => client,
 }));
 function element({
@@ -120,11 +120,10 @@ beforeEach(() => {
 	container = window.document.getElementById("root") as unknown as HTMLElement;
 	root = createRoot(container);
 	query = {
-		data: { pages: [data] },
+		data,
 		isFetching: false,
 		isError: false,
 		refetch: () => {},
-		fetchNextPage: () => {},
 	};
 	resets = 0;
 });
@@ -136,17 +135,12 @@ afterEach(async () => {
 	}
 	savedGlobals.clear();
 });
-async function render(
-	value = data,
-	onLoadMore?: () => void,
-	usage = snapshot(160_000, value.totalChars),
-) {
+async function render(value = data, usage = snapshot(160_000, value.totalChars)) {
 	await act(() =>
 		root.render(
 			createElement(ContextCompositionView, {
 				data: { ...value, usage },
 				snapshot: usage,
-				onLoadMore,
 			}),
 		),
 	);
@@ -197,44 +191,32 @@ test("旧数据0不会产生虚假区块或说明段落", async () => {
 	expect(container.querySelector('[data-testid="context-composition-threshold"]')).toBeNull();
 	expect(container.querySelector('[data-testid="context-composition-free"]')).toBeNull();
 });
-test("分页不改变完整分类汇总和百分比分母", async () => {
-	let loads = 0;
-	await render({ ...data, segments: [segments[0]], nextCursor: "g:1" }, () => {
-		loads++;
-	});
+test("顺序视图一次展示已返回片段，不再提供翻页", async () => {
+	await render({ ...data, segments: [segments[0]], nextCursor: null });
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
 	await act(() => {
 		(container.querySelector('[data-mode="sequence"]') as HTMLElement).click();
 	});
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:25%");
-	const more = container.querySelector('[data-testid="context-composition-more"]') as HTMLElement;
-	expect(more.getAttribute("style")).toContain("width:75%");
-	await act(() => more.click());
-	expect(loads).toBe(1);
+	expect(container.querySelector('[data-testid="context-composition-more"]')).toBeNull();
+	expect(container.textContent).not.toContain("contextComposition.loadMore");
 	expect(container.textContent).toContain("contextComposition.categories.assistant · ≈80K");
 });
-test("校准后的分页仅补齐已知分类，未知输入不成为加载更多区块", async () => {
-	let loads = 0;
+test("校准后的顺序视图使用完整输入作分母，没有加载更多区块", async () => {
 	const usage = snapshot(160_000, 4_000);
-	const onLoadMore = () => loads++;
-	await render({ ...data, segments: [segments[0]], nextCursor: "g:1" }, onLoadMore, usage);
+	await render({ ...data, segments: [segments[0]], nextCursor: null }, usage);
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("8K · 5.0%");
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:5%");
 	await act(() => {
 		(container.querySelector('[data-mode="sequence"]') as HTMLElement).click();
 	});
-	expect(bar().querySelectorAll("button").length).toBe(2);
+	expect(bar().querySelectorAll("button").length).toBe(1);
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("4K · 2.5%");
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:2.5%");
-	const more = container.querySelector('[data-testid="context-composition-more"]') as HTMLElement;
-	expect(more.getAttribute("style")).toContain("width:7.5%");
-	await act(() => more.click());
-	expect(loads).toBe(1);
-	expect(container.textContent).toContain("contextComposition.categories.assistant · ≈8K · 5.0%");
-	await render(data, onLoadMore, usage);
+	expect(container.querySelector('[data-testid="context-composition-more"]')).toBeNull();
+	await render(data, usage);
 	expect(bar().querySelectorAll("button").length).toBe(3);
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:2.5%");
-	expect(container.querySelector('[data-testid="context-composition-more"]')).toBeNull();
 	expect(container.textContent).not.toContain("contextComposition.loadMore");
 });
 test("已知系统和工具只占完整输入的一部分，剩余背景留空不增加说明", async () => {
@@ -259,7 +241,7 @@ test("已知系统和工具只占完整输入的一部分，剩余背景留空�
 			totals: partial.totals,
 		},
 	};
-	await render(partial, undefined, usage);
+	await render(partial, usage);
 	const buttons = bar().querySelectorAll("button");
 	expect(buttons.length).toBe(2);
 	expect(buttons[0]?.getAttribute("aria-label")).toContain("system · ≈32K · 20.0%");
@@ -306,8 +288,8 @@ test("工具定义作为独立分类", async () => {
 	expect(container.textContent).toContain("contextComposition.categories.toolDefinition · ≈128K");
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("80.0%");
 });
-test("跨世代分页不会混合展示旧新缓存", async () => {
-	query = { ...query, data: { pages: [data, { ...data, generation: "new" }] } };
+test("一次响应直接展示全部分类", async () => {
+	query = { ...query, data };
 	await act(() =>
 		root.render(
 			createElement(ContextCompositionPanel, {
@@ -316,8 +298,9 @@ test("跨世代分页不会混合展示旧新缓存", async () => {
 			}),
 		),
 	);
-	expect(resets).toBe(1);
-	expect(container.querySelector('[data-testid="context-composition-bar"]')).toBeNull();
+	expect(resets).toBe(0);
+	expect(container.querySelector('[data-testid="context-composition-bar"]')).not.toBeNull();
+	expect(container.querySelector('[data-testid="context-composition-more"]')).toBeNull();
 });
 test("加载失败只显示简短状态与重试", async () => {
 	query = { isFetching: false, isError: true, refetch: () => {} };
@@ -341,9 +324,7 @@ test("缓存换代后保留用户选择的顺序模式", async () => {
 		(container.querySelector('[data-mode="sequence"]') as HTMLElement).click();
 	});
 	expect(bar().querySelectorAll("button").length).toBe(3);
-	query = { ...query, data: { pages: [data, { ...data, generation: "new" }] } };
-	await act(() => root.render(createElement(ContextCompositionPanel, props)));
-	query = { ...query, data: { pages: [{ ...data, generation: "new" }] } };
+	query = { ...query, data: { ...data, generation: "new" } };
 	await act(() => root.render(createElement(ContextCompositionPanel, props)));
 	expect(bar().querySelectorAll("button").length).toBe(3);
 });
@@ -555,7 +536,7 @@ test("没有上游token时只显示横杠，不回退显示字符数", async () 
 	}
 });
 test("同请求WS占用与完整字符分母优先更新，已选分类同步更新", async () => {
-	await render(data, undefined, snapshot(160_000, 4_000));
+	await render(data, snapshot(160_000, 4_000));
 	await act(() => {
 		(bar().querySelector("button") as HTMLElement).click();
 	});

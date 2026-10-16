@@ -77,6 +77,27 @@ test("字符统计迁移保持旧数据不变且缓存初值为0", async () => {
 	}
 });
 
+test("数字窄表迁移回填已有统计并在之后的写入上保持同步", async () => {
+	const folder = fileURLToPath(new URL("../../../drizzle/", import.meta.url));
+	let migration: string | undefined;
+	for await (const path of new Bun.Glob("*.sql").scan({ cwd: folder, absolute: true })) {
+		const file = Bun.file(path);
+		if (file.size > 64 * 1024) continue;
+		const sql = await file.text();
+		if (sql.includes("CREATE TABLE `narrator_message_context_stats`")) {
+			migration = sql;
+			break;
+		}
+	}
+	if (!migration) throw new Error("Generate the numeric context stats migration first");
+	expect(migration).toContain("INSERT INTO `narrator_message_context_stats`");
+	expect(migration).toContain("COALESCE(`context_chars_json`, '{\"segments\":[]}')");
+	expect(migration).toContain("CREATE TRIGGER `narrator_message_context_stats_insert`");
+	expect(migration).toContain("CREATE TRIGGER `narrator_message_context_stats_update`");
+	expect(migration).toContain("DROP TABLE `narrator_context_char_pages`");
+	expect(migration).not.toContain("content_json");
+});
+
 // Resource migrations bundled alongside these additions are covered by their own integration fixtures.
 test("请求快照新增字段保持旧正文不变且初值为null", async () => {
 	const db = new Database(":memory:");

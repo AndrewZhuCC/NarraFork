@@ -266,9 +266,10 @@ export async function* readContextHistoryEntries(
 	const boundary =
 		database
 			.query<{ seq: number }, [string, string]>(
-				`SELECT r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
+				`SELECT r.seq FROM narrator_message_refs r
+		 JOIN narrator_message_context_stats s ON s.message_id = r.message_id
 		 WHERE r.narrator_id = ? AND r.is_compact = 1
-		 AND (? = 'subagent' OR m.parent_tool_use_id IS NULL) ORDER BY r.seq DESC LIMIT 1`,
+		 AND (? = 'subagent' OR s.parent_tool_use_id IS NULL) ORDER BY r.seq DESC LIMIT 1`,
 			)
 			.get(narratorId, profile)?.seq ?? -1;
 	let seq = Math.max(boundary, options.afterSeq ?? -1);
@@ -282,9 +283,11 @@ export async function* readContextHistoryEntries(
 		if (targets && !targets.length) return;
 		const rows = database
 			.query<HistoryRow, (string | number)[]>(
-				`SELECT r.seq, m.id, m.context_chars_json AS stats, m.role, r.segment_compact_id AS hidden,
-			 m.parent_tool_use_id AS parentToolUseId FROM narrator_message_refs r
-			 JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ?
+				`SELECT r.seq, s.message_id AS id, s.segments_json AS stats, s.role,
+			 r.segment_compact_id AS hidden, s.parent_tool_use_id AS parentToolUseId
+			 FROM narrator_message_refs r
+			 JOIN narrator_message_context_stats s ON s.message_id = r.message_id
+			 WHERE r.narrator_id = ?
 			 AND ${targets ? `r.message_id IN (${placeholders(targets.length)})` : "r.seq > ?"}
 			 ORDER BY r.seq LIMIT ?`,
 			)

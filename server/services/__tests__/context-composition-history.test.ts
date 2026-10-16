@@ -17,7 +17,7 @@ beforeEach(() => {
 	database.run(`CREATE TABLE narrator_message_refs (narrator_id TEXT, message_id TEXT, seq INTEGER, is_compact INTEGER DEFAULT 0, segment_compact_id TEXT);
 	 CREATE INDEX refs_seq ON narrator_message_refs(narrator_id,seq);
 	 CREATE UNIQUE INDEX refs_message ON narrator_message_refs(narrator_id,message_id);
-	 CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, role TEXT, parent_tool_use_id TEXT, context_chars_json TEXT);
+	 CREATE TABLE narrator_message_context_stats (message_id TEXT PRIMARY KEY, role TEXT, parent_tool_use_id TEXT, segments_json TEXT);
 	 CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, tool_use_id TEXT, execution_attempt INTEGER DEFAULT 0, created_at TEXT DEFAULT '2026-01-01', input_chars INTEGER DEFAULT 0, output_chars INTEGER DEFAULT 0);
 	 CREATE INDEX tools_message ON narrator_tool_calls(message_id);
 	 CREATE INDEX tools_use ON narrator_tool_calls(tool_use_id);
@@ -62,7 +62,9 @@ function message(
 	role = "assistant",
 ) {
 	database
-		.query("INSERT INTO narrator_messages(id,role,context_chars_json) VALUES (?,?,?)")
+		.query(
+			"INSERT INTO narrator_message_context_stats(message_id,role,segments_json) VALUES (?,?,?)",
+		)
 		.run(id, role, segments === null ? null : JSON.stringify({ segments }));
 	database
 		.query("INSERT INTO narrator_message_refs(narrator_id,message_id,seq) VALUES ('n',?,?)")
@@ -176,7 +178,9 @@ test("targeted entries emit hidden/display/excluded/before-compact empties and o
 	);
 	message("display", 4, [{ category: "other", chars: 70 }], "disp");
 	message("child", 5, [{ category: "assistant", chars: 60 }]);
-	database.run("UPDATE narrator_messages SET parent_tool_use_id='parent' WHERE id='child'");
+	database.run(
+		"UPDATE narrator_message_context_stats SET parent_tool_use_id='parent' WHERE message_id='child'",
+	);
 	message(
 		"summary",
 		6,
@@ -214,7 +218,7 @@ test("linked child compact cannot advance primary boundary; tail reader skips ol
 	message("top", 1, [{ category: "user", chars: 3 }]);
 	message("child", 2, [], "system");
 	database.run(`UPDATE narrator_message_refs SET is_compact=1 WHERE message_id='child';
-	 UPDATE narrator_messages SET parent_tool_use_id='parent' WHERE id='child'`);
+	 UPDATE narrator_message_context_stats SET parent_tool_use_id='parent' WHERE message_id='child'`);
 	message("last", 3, [{ category: "assistant", chars: 5 }]);
 	expect(await segments()).toEqual([
 		{ category: "user", chars: 3 },

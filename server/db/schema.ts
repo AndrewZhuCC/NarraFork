@@ -1518,21 +1518,33 @@ export const modelHistoryRevisionContracts = sqliteTable("model_history_revision
 });
 
 // === narrator_messages ===
-export const narratorContextCharPages = sqliteTable(
-	"narrator_context_char_pages",
+/**
+ * One frozen segment list for the request currently shown in the composition menu.
+ * The usage snapshot keeps the small totals; this row keeps the ordered numbers.
+ */
+export const narratorContextPins = sqliteTable(
+	"narrator_context_pins",
 	{
-		id: text("id").primaryKey(),
+		generation: text("generation").primaryKey(),
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
-		generation: text("generation").notNull(),
-		page: integer("page").notNull(),
 		segmentsJson: text("segments_json", { mode: "json" }).$type<ContextSegment[]>().notNull(),
 	},
-	(t) => [
-		uniqueIndex("context_char_pages_generation_page_idx").on(t.narratorId, t.generation, t.page),
-	],
+	(t) => [index("idx_context_pins_narrator").on(t.narratorId)],
 );
+/**
+ * Numeric projection of a message. Composition reads this instead of the message
+ * body. Triggers keep it aligned with role, parent and context_chars_json.
+ */
+export const narratorMessageContextStats = sqliteTable("narrator_message_context_stats", {
+	messageId: text("message_id")
+		.primaryKey()
+		.references(() => narratorMessages.id, { onDelete: "cascade" }),
+	role: text("role").notNull(),
+	parentToolUseId: text("parent_tool_use_id"),
+	segmentsJson: text("segments_json", { mode: "json" }).$type<ContextCharStats>().notNull(),
+});
 
 export const narratorMessages = sqliteTable(
 	"narrator_messages",
