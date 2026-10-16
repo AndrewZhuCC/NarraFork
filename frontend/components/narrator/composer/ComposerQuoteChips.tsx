@@ -62,6 +62,7 @@ export interface ComposerQuoteChipsProps {
 	/** References without an inline `#file:` token in the text. */
 	fileReferences: readonly FileReference[];
 	candidate: QuoteCandidate | null;
+	showShortcut?: boolean;
 	onAccept: (candidate: QuoteCandidate) => void;
 	onDismiss: (candidate: QuoteCandidate) => void;
 	onRemoveQuote: (index: number) => void;
@@ -76,6 +77,7 @@ export function ComposerQuoteChips({
 	quotes,
 	fileReferences,
 	candidate,
+	showShortcut = true,
 	onAccept,
 	onDismiss,
 	onRemoveQuote,
@@ -167,7 +169,7 @@ export function ComposerQuoteChips({
 						) : candidate.kind === "text" ? (
 							<QuotePreview quote={candidate.quote} />
 						) : (
-							t("quote.addHint")
+							t("quote.add")
 						)
 					}
 					multiline
@@ -183,7 +185,9 @@ export function ComposerQuoteChips({
 							onMouseDown={keepSelection}
 							onClick={() => onAccept(candidate)}
 							disabled={unavailable}
-							aria-label={t("quote.addHint")}
+							aria-label={t(
+								showShortcut && candidate.kind === "text" ? "quote.addHint" : "quote.add",
+							)}
 							style={{
 								display: "inline-flex",
 								alignItems: "center",
@@ -212,9 +216,11 @@ export function ComposerQuoteChips({
 									>
 										{t("quote.add")}
 									</Text>
-									<Kbd size="xs" style={{ flexShrink: 0 }}>
-										Alt Q
-									</Kbd>
+									{showShortcut && candidate.kind === "text" && (
+										<Kbd size="xs" style={{ flexShrink: 0 }}>
+											Tab
+										</Kbd>
+									)}
 								</>
 							)}
 						</UnstyledButton>

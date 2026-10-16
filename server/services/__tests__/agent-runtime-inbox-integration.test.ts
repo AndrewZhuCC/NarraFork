@@ -1,4 +1,8 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -11,6 +15,10 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
+import type { PgMaterializer, PgRuntimeTx } from "../agent-runtime/postgres-runtime-queue";
+import { bindRuntimeQueue, type RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import type { NarratorMessageRefsPort, RefMessageInput } from "../narrator-refs/port";
+import { bindNarratorMessageRefs } from "../narrator-refs/store";
 
 const { db, sqlite } = getTestDb();
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
@@ -41,9 +49,12 @@ const {
 	consumeNextBufferedSubagentMessage,
 	consumeBufferedSubagentMessageInPass,
 	getSubagentBufferedMessages,
+	getSubagentBufferedMessagesAsync,
 	updateSubagentBufferedMessage,
 } = await import("../subagent-executor");
-const { enqueueBufferedMessage, clearBufferedMessages } = await import("../narrator-buffer");
+const { enqueueBufferedMessage, clearBufferedMessages, toBufferSummary } = await import(
+	"../narrator-buffer"
+);
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
@@ -167,6 +178,255 @@ function state(id: string) {
 function childMessages() {
 	return db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, "child")).all();
 }
+
+test("rich text-file input enqueues and persists through the real child consumer", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "nf-rich-textfile-"));
+	const document: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "asset" }] }],
+		assets: [{ id: "asset", kind: "textFile", name: "note.txt", size: 5, mimeType: "text/plain" }],
+	};
+	try {
+		const accepted = await pushSubagentBufferedMessage("child", "", {
+			textFiles: [new File(["hello"], "note.txt", { type: "text/plain" })],
+			composerDocument: document,
+		});
+		const consumed = await consumeNextBufferedSubagentMessage({
+			narratorId: "child",
+			parentNarratorId: "parent",
+			toolUseId: "origin",
+			model: "test",
+			provider: "anthropic",
+			cwd,
+		});
+		expect(consumed).not.toBeNull();
+		expect(state(accepted.id)?.state).toBe("materialized");
+		const [message] = childMessages();
+		expect(message?.composerDocument).toEqual(document);
+		const file = (message?.contentJson as Array<{ type: string; filePath: string }>).find(
+			(block) => block.type === "text_file",
+		);
+		expect(await Bun.file(required(file).filePath).text()).toBe("hello");
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("spilled child text, references and layout survive real staging cleanup before request rebuild", async () => {
+	const document: ComposerDocument = {
+		version: 1,
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: "中".repeat(100_000) },
+					{
+						type: "fileReference",
+						id: "node",
+						reference: { id: "ref", deviceId: "local", path: "/snapshot.ts", label: "snapshot.ts" },
+					},
+				],
+			},
+		],
+		assets: [],
+	};
+	const projection = composerDocumentText(document);
+	const accepted = await pushSubagentBufferedMessage("child", projection.text, {
+		composerDocument: document,
+		commandText: "command".repeat(50_000),
+		fileReferences: [
+			{
+				type: "file_reference",
+				reference: required(projection.fileReferences[0]),
+				snapshotText: "snapshot".repeat(40_000),
+				snapshotHash: "a".repeat(64),
+				capturedAt: time,
+			},
+		],
+	});
+	const queued = required(state(accepted.id));
+	const payloadPath = JSON.parse(required(queued.payloadRefJson)).path;
+	const metadata = JSON.parse(required(queued.metadataJson));
+	expect(existsSync(payloadPath)).toBe(true);
+	expect(existsSync(metadata.fileReferencesPath)).toBe(true);
+	// This fixture uses an in-memory DB, which a read-only worker cannot open.
+	// Stub only the subsequent history read, after real persistence + cleanup.
+	const runtimeHistory = await import("../agent-runtime/history");
+	const history = spyOn(runtimeHistory, "buildRuntimeHistory").mockImplementation(
+		async (options) => {
+			expect(state(accepted.id)?.state).toBe("materialized");
+			for (const path of [
+				payloadPath,
+				metadata.fileReferencesPath,
+				metadata.composerDocumentPath,
+				metadata.commandTextPath,
+			])
+				expect(existsSync(path)).toBe(false);
+			return {
+				history: [],
+				trailingToolResults: [],
+				replayedInjectionMessageIds: [],
+				sourceMessages: [],
+				modelMessages: [],
+				currentText: options.currentInput ?? "",
+				currentInputText: options.currentInput ?? "",
+				isPureToolResultReplay: false,
+				recoveredTrailingUserText: null,
+			};
+		},
+	);
+	try {
+		const consumed = required(await consume());
+		expect(history).toHaveBeenCalled();
+		expect(consumed.currentInput).toContain("中".repeat(100_000));
+		expect(consumed.currentInput).toContain("snapshot.ts");
+		expect(childMessages()[0]?.composerDocument).toEqual(document);
+	} finally {
+		history.mockRestore();
+	}
+});
+
+test("child list and summary never materialize the full staging document", async () => {
+	const document: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "rich" }] }],
+		assets: [],
+	};
+	const accepted = await pushSubagentBufferedMessage("child", "rich", {
+		composerDocument: document,
+	});
+	const path = JSON.parse(required(state(accepted.id)?.metadataJson)).composerDocumentPath;
+	const original = await Bun.file(path).text();
+	await Bun.write(path, "must not parse this full document in a summary");
+	try {
+		for (const messages of [
+			getSubagentBufferedMessages("child"),
+			await getSubagentBufferedMessagesAsync("child"),
+		]) {
+			expect(toBufferSummary(messages)[0]?.hasComposerDocument).toBe(true);
+			expect(JSON.stringify(toBufferSummary(messages))).not.toContain("paragraphs");
+		}
+	} finally {
+		await Bun.write(path, original);
+		await clearBufferedMessages("child");
+	}
+});
+
+test("PG queue-port fake runs the real user materializer and child forwarding with composer validation", async () => {
+	// No external PostgreSQL: a transaction fake records the real PG writer's inputs.
+	const document: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "rich" }] }],
+		assets: [],
+	};
+	const accepted = await pushSubagentBufferedMessage("child", "rich", {
+		composerDocument: document,
+	});
+	const staged = required(state(accepted.id));
+	const owner = required(tryClaimExecution("child", "tool-replay"));
+	const row = { ...staged, state: "claimed", claimEpoch: owner.epoch, claimToken: "pg-fake" };
+	const claim = inbox.inboxClaim(row);
+	const messages: RefMessageInput[] = [];
+	const tx = {
+		select: () => ({
+			from: () => ({
+				where: () => ({
+					limit: async () => [],
+					orderBy: () => ({ limit: async () => [] }),
+					for: async () => [{ id: "child" }],
+				}),
+			}),
+		}),
+		update: () => ({ set: () => ({ where: () => ({ returning: async () => [{ nextSeq: 1 }] }) }) }),
+		insert: () => ({
+			values: (value: RefMessageInput) => ({
+				returning: async () => {
+					messages.push(structuredClone(value));
+					return [value];
+				},
+			}),
+		}),
+		execute: async () => [{ seq: 0 }],
+	} as unknown as PgRuntimeTx;
+	const publication = await import("../agent-runtime/publication");
+	// No publication outbox exists in this queue-port fake; test the actual consumer/materializer.
+	const barrier = spyOn(publication, "flushRuntimePublications").mockResolvedValue(undefined);
+	let materializeCount = 0;
+	const queue = {
+		mailbox: {
+			claimEligibleHead: async () => row,
+			peekQueued: async () => undefined,
+			getById: async () => ({ ...row, state: "materialized" }),
+			listPending: async () => [],
+			materialize: async (_claim: unknown, materializer: PgMaterializer) => {
+				materializeCount++;
+				const binding = await materializer(tx, row);
+				return {
+					...row,
+					state: "materialized",
+					recipientMessageId: binding.messageId,
+					recipientRefId: binding.refId,
+				};
+			},
+		},
+	} as unknown as RuntimeQueuePort;
+	bindRuntimeQueue({ backend: "postgres", queue });
+	bindNarratorMessageRefs({
+		backend: "postgres",
+		port: { creator: async () => null } as unknown as NarratorMessageRefsPort,
+	});
+	try {
+		const input = {
+			claim,
+			reservedMessageId: row.recipientMessageId,
+			narratorId: "child",
+			text: "model-facing effective text",
+			contentBlocks: [{ type: "text", text: "rich" }],
+			composerDocument: document,
+		};
+		const persisted = await inbox.persistClaimedUserInput(input);
+		expect(persisted.hasComposerDocument).toBe(true);
+		expect(messages[0]?.composerDocument).toEqual(document);
+		expect(messages[0]?.contentText).toBe("model-facing effective text");
+		const child = required(await consume());
+		expect(child.currentInput).toBe("rich");
+		expect(messages[1]).toMatchObject({ composerDocument: document, parentToolUseId: "origin" });
+		const legacy = await inbox.persistClaimedUserInput({ ...input, composerDocument: undefined });
+		expect(legacy.hasComposerDocument).toBeUndefined();
+		expect(messages[2]?.composerDocument).toBeNull();
+		const committed = materializeCount;
+		await expect(
+			inbox.persistClaimedUserInput({
+				...input,
+				contentBlocks: [{ type: "text", text: "mismatch" }],
+			}),
+		).rejects.toThrow("does not match");
+		const assetDocument: ComposerDocument = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "asset" }] }],
+			assets: [
+				{ id: "asset", kind: "textFile", name: "note.txt", size: 5, mimeType: "text/plain" },
+			],
+		};
+		for (const metadata of [
+			{ filename: "wrong.txt", size: 5 },
+			{ filename: "note.txt", size: 6 },
+			{ filename: "note.txt", size: 5, mimeType: "text/html" },
+		])
+			await expect(
+				inbox.persistClaimedUserInput({
+					...input,
+					composerDocument: assetDocument,
+					contentBlocks: [{ type: "text_file", ...metadata }],
+				}),
+			).rejects.toThrow("metadata");
+		expect(materializeCount).toBe(committed);
+	} finally {
+		bindRuntimeQueue(undefined);
+		bindNarratorMessageRefs(undefined);
+		barrier.mockRestore();
+		owner.release();
+	}
+});
 
 test("consumed Send recovers its own durable source receipt, not another wake trigger", async () => {
 	const first = delivery("child", "first");

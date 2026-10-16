@@ -10,6 +10,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import * as viewport from "../../../hooks/useMobileViewport";
+import * as apiModule from "../../../lib/api";
 import { ApiError, api } from "../../../lib/api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
@@ -23,6 +24,10 @@ import {
 } from "../../graph/dock/detached-panels";
 import { readPanelSubject } from "../../graph/dock/tab-detach";
 import {
+	FileReferenceScopeProvider,
+	type FileReferenceScopeValue,
+} from "../composer/FileReferenceScope";
+import {
 	NarratorDockContext,
 	type NarratorDockContextValue,
 	NarratorDockProvider,
@@ -33,6 +38,11 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import {
+	FileViewerContent,
+	type FileViewerContentProps,
+	MAX_FILE_VIEWER_TEXT_CHARS,
+} from "../file-viewer/FileViewerContent";
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import type { FilePanelParams } from "../panels/panel-kind";
 import { WorkspaceDockStore } from "../workspace/workspace-dock";
@@ -109,7 +119,7 @@ beforeEach(async () => {
 		window,
 		confirm: confirmReload,
 		document: window.document,
-		navigator: window.navigator,
+		navigator: { ...window.navigator, platform: "Linux", userAgent: "test" },
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
 		Node: window.Node,
@@ -227,20 +237,25 @@ afterEach(async () => {
 		mountedTestModels.clear();
 	}
 });
-async function mount(props: Partial<FileEditorContentProps> = {}) {
+async function mount(
+	props: Partial<FileEditorContentProps> = {},
+	referenceScope: FileReferenceScopeValue = {},
+) {
 	await act(async () =>
 		root?.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">
-					<FileEditorContent
-						filePath={source.target.path}
-						narratorId="narrator"
-						referenceOrigin
-						selection={selection}
-						onDirtyChange={dirty}
-						onFileReferenceSelectionChange={publish}
-						{...props}
-					/>
+					<FileReferenceScopeProvider value={referenceScope}>
+						<FileEditorContent
+							filePath={source.target.path}
+							narratorId="narrator"
+							referenceOrigin
+							selection={selection}
+							onDirtyChange={dirty}
+							onFileReferenceSelectionChange={publish}
+							{...props}
+						/>
+					</FileReferenceScopeProvider>
 				</MantineProvider>
 			</I18nextProvider>,
 		),
@@ -291,6 +306,289 @@ function deferred<T>() {
 	});
 	return { resolve, promise };
 }
+test("gutter quote uses this document and clicked range, never the shared selection", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mount(
+		{},
+		{
+			addReference,
+			selection: {
+				target: { deviceId: "other-device", path: "/other/file", selection },
+				label: "other",
+				expectedHash: "other-hash",
+				dirty: false,
+			},
+		},
+	);
+	expect(model.props.quoteSelectionDisabledReason).toBeNull();
+	const range = { startLineNumber: 1, startColumn: 1, endLineNumber: 2, endColumn: 2 };
+	model.props.onQuoteSelection?.(range);
+	expect(addReference).toHaveBeenCalledTimes(1);
+	expect(addReference.mock.calls[0][0]).toEqual({
+		id: expect.any(String),
+		...source.target,
+		label: "a.txt",
+		selection: range,
+		expectedHash: source.hash,
+	});
+	model.props.onQuoteSelection?.(range);
+	expect(addReference.mock.calls[1][0]).not.toEqual(addReference.mock.calls[0][0]);
+	model.props.onQuoteSelection?.({ ...range, endLineNumber: 1, endColumn: 1 });
+	expect(addReference).toHaveBeenCalledTimes(2);
+});
+
+test("simultaneous panes quote independent files into their own composer scopes", async () => {
+	const addA = mock((_reference: unknown) => {});
+	const addB = mock((_reference: unknown) => {});
+	create.mockImplementation(async (_narrator, input) => ({
+		...descriptor,
+		target: { deviceId: "local", path: input.path },
+		baseHash: `hash:${input.path}`,
+	}));
+	await act(async () =>
+		root?.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<FileReferenceScopeProvider value={{ narratorId: "composer-a", addReference: addA }}>
+						<FileEditorContent
+							filePath="/work/a.txt"
+							narratorId="source-a"
+							onFileReferenceSelectionChange={publish}
+						/>
+					</FileReferenceScopeProvider>
+					<FileReferenceScopeProvider value={{ narratorId: "composer-b", addReference: addB }}>
+						<FileEditorContent
+							filePath="/work/b.txt"
+							narratorId="source-b"
+							onFileReferenceSelectionChange={publish}
+						/>
+					</FileReferenceScopeProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		),
+	);
+	const [a, b] = [...mountedTestModels.values()];
+	await act(async () => b.select(selection));
+	expect(currentSelection()).toMatchObject({ target: { path: "/work/b.txt" } });
+	a.props.onQuoteSelection?.(selection);
+	b.props.onQuoteSelection?.(selection);
+	expect(addA).toHaveBeenCalledTimes(1);
+	expect(addB).toHaveBeenCalledTimes(1);
+	expect(addA.mock.calls[0][0]).toMatchObject({
+		path: "/work/a.txt",
+		expectedHash: "hash:/work/a.txt",
+	});
+	expect(addB.mock.calls[0][0]).toMatchObject({
+		path: "/work/b.txt",
+		expectedHash: "hash:/work/b.txt",
+	});
+});
+
+test("gutter quote hard-rejects edits/save-start before React commits, then uses saved hash", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mount({}, { addReference });
+	const quote = model.props.onQuoteSelection;
+	expect(quote).toBeFunction();
+	await act(async () => {
+		model.edit("changed\nb\n");
+		quote?.(selection);
+		expect(addReference).not.toHaveBeenCalled();
+	});
+	expect(model.props.quoteSelectionDisabledReason).toBe(en.quote.fileUnsaved);
+	const pending = deferred<EditorCommitResult>();
+	commit.mockImplementation(() => pending.promise);
+	await act(async () => {
+		model.props.onSave?.();
+		model.undo(); // Clean baseline still cannot be quoted during an in-flight save.
+		quote?.(selection);
+		expect(addReference).not.toHaveBeenCalled();
+	});
+	expect(model.props.quoteSelectionDisabledReason).toBe(en["fileEditor.saveTask"]);
+	await act(async () => model.redo());
+	await act(async () =>
+		pending.resolve({
+			status: "saved",
+			operationId: "op",
+			hash: "quoted-saved-hash",
+			bytes: 12,
+			snapshotRevision: uploadedRevision,
+		}),
+	);
+	expect(model.props.quoteSelectionDisabledReason).toBeNull();
+	quote?.(selection);
+	expect(addReference.mock.calls[0][0]).toMatchObject({ expectedHash: "quoted-saved-hash" });
+});
+
+test("gutter quote immediately rejects a reload and resumes only after the same read completes", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mount({}, { addReference });
+	const quote = model.props.onQuoteSelection;
+	const pending = deferred<string>();
+	read.mockImplementation(() => pending.promise);
+	await act(async () => {
+		iconButton("refresh").dispatchEvent(new Event("click", { bubbles: true }));
+		quote?.(selection);
+		expect(addReference).not.toHaveBeenCalled();
+	});
+	expect(model.props.quoteSelectionDisabledReason).toBeTruthy();
+	await act(async () => pending.resolve("reloaded\nb\n"));
+	expect(model.props.quoteSelectionDisabledReason).toBeNull();
+	quote?.(selection);
+	expect(addReference).toHaveBeenCalledTimes(1);
+});
+
+test("gutter quote rejects a loaded document without a saved hash", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	create.mockResolvedValue({ ...descriptor, baseHash: "" });
+	const model = await mount({}, { addReference });
+	expect(model.props.quoteSelectionDisabledReason).toBe(
+		i18n.t("quote.fileUnavailable", { ns: "narrator" }),
+	);
+	model.props.onQuoteSelection?.(selection);
+	expect(addReference).not.toHaveBeenCalled();
+});
+
+test("remote readonly gutter quote uses canonical target and matching response hash", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const target = { deviceId: "remote-source", path: "C:/canonical/a.txt" };
+	preview.mockResolvedValue({ ...source, target, hash: "remote-byte-hash" });
+	const model = await mount({ deviceId: "remote-request" }, { addReference });
+	expect(model.props.readOnly).toBe(true);
+	expect(model.props.quoteSelectionDisabledReason).toBeNull();
+	model.props.onQuoteSelection?.(selection);
+	expect(addReference.mock.calls[0][0]).toMatchObject({
+		...target,
+		selection,
+		expectedHash: "remote-byte-hash",
+	});
+});
+
+test("gutter quote is absent without an owning composer and disposed callbacks cannot retarget", async () => {
+	const noReceiver = await mount();
+	expect(noReceiver.props.onQuoteSelection).toBeUndefined();
+	const first = mock((_reference: unknown) => {});
+	const second = mock((_reference: unknown) => {});
+	const a = await mount({}, { addReference: first });
+	const staleQuote = a.props.onQuoteSelection;
+	const b = await mount({ filePath: "/work/b.txt" }, { addReference: second });
+	staleQuote?.(selection);
+	expect(first).not.toHaveBeenCalled();
+	expect(second).not.toHaveBeenCalled();
+	b.props.onQuoteSelection?.(selection);
+	expect(second.mock.calls[0][0]).toMatchObject({ path: "/work/b.txt", expectedHash: source.hash });
+});
+
+async function mountViewer(
+	props: Partial<FileViewerContentProps> = {},
+	referenceScope: FileReferenceScopeValue = {},
+) {
+	await act(async () =>
+		root?.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<FileReferenceScopeProvider value={referenceScope}>
+						<FileViewerContent
+							filePath={source.target.path}
+							narratorId="source-narrator"
+							referenceOrigin
+							selection={selection}
+							{...props}
+						/>
+					</FileReferenceScopeProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		),
+	);
+	const key = host.querySelector("[data-monaco-test-editor]")?.getAttribute("data-document-key");
+	const model = key ? mountedTestModels.get(key) : null;
+	if (!model) throw new Error(`Viewer missing: ${host.textContent}`);
+	return model;
+}
+
+test("legacy/mobile readonly viewer quotes matching canonical target/hash into its own scope", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const target = { deviceId: "remote-canonical", path: "C:/canonical/view.txt" };
+	preview.mockResolvedValue({ ...source, target, hash: "viewer-byte-hash" });
+	const model = await mountViewer(
+		{ deviceId: "remote" },
+		{ narratorId: "owning-composer", addReference },
+	);
+	expect(model.props.readOnly).toBe(true);
+	expect(model.props.quoteSelectionDisabledReason).toBeNull();
+	model.props.onQuoteSelection?.(selection);
+	expect(addReference.mock.calls[0][0]).toEqual({
+		id: expect.any(String),
+		...target,
+		selection,
+		label: "view.txt",
+		expectedHash: "viewer-byte-hash",
+	});
+	expect(preview.mock.calls[0][0]).toBe("source-narrator");
+});
+
+test("readonly viewer has no gutter action without a receiver and rejects a missing saved hash", async () => {
+	const absent = await mountViewer();
+	expect(absent.props.onQuoteSelection).toBeUndefined();
+	const addReference = mock((_reference: unknown) => {});
+	preview.mockResolvedValue({ ...source, hash: "" });
+	const noHash = await mountViewer({ filePath: "/work/no-hash.txt" }, { addReference });
+	expect(noHash.props.quoteSelectionDisabledReason).toBe(
+		i18n.t("quote.fileUnavailable", { ns: "narrator" }),
+	);
+	noHash.props.onQuoteSelection?.(selection);
+	expect(addReference).not.toHaveBeenCalled();
+});
+
+test("viewer reload and identity switch reject retained callbacks instead of mixing sources", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mountViewer({}, { addReference });
+	const oldQuote = model.props.onQuoteSelection;
+	const pending = deferred<typeof source>();
+	preview.mockImplementation(() => pending.promise);
+	await click(iconButton("refresh"));
+	oldQuote?.(selection);
+	expect(addReference).not.toHaveBeenCalled();
+	await act(async () => pending.resolve(source));
+	const b = await mountViewer({ filePath: "/work/b.txt" }, { addReference });
+	oldQuote?.(selection);
+	expect(addReference).not.toHaveBeenCalled();
+	// This response deliberately canonicalizes back to a.txt; never pair its hash with b.txt.
+	b.props.onQuoteSelection?.(selection);
+	expect(addReference.mock.calls[0][0]).toMatchObject({
+		path: "/work/a.txt",
+		expectedHash: source.hash,
+	});
+});
+
+test("disposed viewer callbacks cannot publish into an owning composer", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mountViewer({}, { addReference });
+	const quote = model.props.onQuoteSelection;
+	await act(async () => {
+		root?.unmount();
+		root = undefined;
+	});
+	quote?.(selection);
+	expect(addReference).not.toHaveBeenCalled();
+});
+
+test("legacy local previews keep their reader policy and reject truncated/unhashed quote attempts", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const fetch = spyOn(apiModule, "authorizedFetch").mockResolvedValue(
+		new Response("x".repeat(MAX_FILE_VIEWER_TEXT_CHARS + 1)),
+	);
+	restores.push(() => fetch.mockRestore());
+	const model = await mountViewer({ referenceOrigin: false }, { addReference });
+	expect(fetch.mock.calls[0][0]).toBe("/api/fs/preview?path=%2Fwork%2Fa.txt");
+	expect(preview).not.toHaveBeenCalled();
+	expect(model.props.readOnly).toBe(true);
+	expect(model.props.quoteSelectionDisabledReason).toBe(
+		i18n.t("quote.fileUnavailable", { ns: "narrator" }),
+	);
+	model.props.onQuoteSelection?.(selection);
+	expect(addReference).not.toHaveBeenCalled();
+});
+
 function OwnedEditor({ filePath }: { filePath: string }) {
 	const onFileReferenceSelectionChange = useFilePanelSelectionPublisher();
 	return (
@@ -525,10 +823,12 @@ for (const surface of ["focus", "workspace"] as const)
 				params = { ...restored, panelType: "file", filePath: restored.filePath };
 			}
 			const hostSelections = mock((_next: FileReferenceEditorSelection | null) => {});
+			const addReference = mock((_reference: unknown) => {});
 			const hostDock = {
 				narratorId: "parent",
 				openFilePanel: open,
 				setFileReferenceSelection: hostSelections,
+				addFileReference: addReference,
 			} as unknown as NarratorDockContextValue;
 			const dock =
 				lifecycle === "detached"
@@ -578,7 +878,17 @@ for (const surface of ["focus", "workspace"] as const)
 			);
 			const model = [...mountedTestModels.values()][0];
 			expect(model.text).toBe("a\nb\n");
+			model.props.onQuoteSelection?.(selection);
+			expect(addReference).toHaveBeenCalledTimes(1);
+			expect(addReference.mock.calls[0][0]).toMatchObject({
+				deviceId: "local",
+				path: filePath,
+				selection,
+				expectedHash: source.hash,
+			});
 			await edit(model, "child draft");
+			model.props.onQuoteSelection?.(selection);
+			expect(addReference).toHaveBeenCalledTimes(1);
 			expect(hostSelections.mock.calls.at(-1)?.[0]).toMatchObject({
 				target: { path: filePath },
 				dirty: true,

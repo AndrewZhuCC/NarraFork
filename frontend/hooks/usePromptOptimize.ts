@@ -19,6 +19,8 @@ export interface UsePromptOptimizeOptions {
 	 * NOT called when using document.execCommand (browser handles it).
 	 */
 	onOptimized?: (text: string) => void;
+	/** Structured editors capture a versioned text-only transformation; atoms never enter the prompt. */
+	target?: () => { text: string; apply: (text: string) => boolean } | null;
 }
 
 export interface UsePromptOptimizeResult {
@@ -70,7 +72,9 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 	const handleOptimize = useCallback(
 		async (style: OptimizeStyle) => {
 			const textarea = options.textareaRef.current;
-			if (!textarea?.value.trim()) return;
+			const target = options.target?.();
+			const originalText = target?.text ?? textarea?.value ?? "";
+			if (!originalText.trim()) return;
 
 			// Save preference
 			try {
@@ -88,27 +92,23 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 			setLoading(true);
 
 			try {
-				const result = await narratorsApi.optimizePrompt(
-					options.narratorId,
-					textarea.value,
-					style,
-					{
-						withContext: options.withContext ?? withContext,
-						messageId: options.messageId,
-						signal: controller.signal,
-					},
-				);
+				const result = await narratorsApi.optimizePrompt(options.narratorId, originalText, style, {
+					withContext: options.withContext ?? withContext,
+					messageId: options.messageId,
+					signal: controller.signal,
+				});
 
 				if (controller.signal.aborted || abortRef.current !== controller) return;
 
-				// Use document.execCommand for browser native undo support
-				textarea.focus();
-				textarea.setSelectionRange(0, textarea.value.length);
-				const success = document.execCommand("insertText", false, result.text);
-
-				// Fallback if execCommand fails (rare)
-				if (!success && options.onOptimized) {
-					options.onOptimized(result.text);
+				if (target) {
+					if (!target.apply(result.text)) throw new Error(t("richComposer.optimizeChanged"));
+				} else if (textarea) {
+					// A late result must never overwrite intervening input.
+					if (textarea.value !== originalText) throw new Error(t("richComposer.optimizeChanged"));
+					textarea.focus();
+					textarea.setSelectionRange(0, textarea.value.length);
+					const success = textarea.ownerDocument.execCommand("insertText", false, result.text);
+					if (!success && options.onOptimized) options.onOptimized(result.text);
 				}
 
 				notifications.show({

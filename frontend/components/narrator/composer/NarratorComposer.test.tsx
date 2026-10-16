@@ -1,9 +1,16 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
 import { ApiError, api } from "@frontend/lib/api";
 import { resetSessionStoreForTest } from "@frontend/lib/session-store";
 import { MantineProvider } from "@mantine/core";
+import {
+	type ComposerDocument,
+	composerDocumentText,
+	parseComposerDocument,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Editor, JSONContent } from "@tiptap/core";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, createRef } from "react";
@@ -72,6 +79,28 @@ beforeEach(async () => {
 		configurable: true,
 		value: { addEventListener() {}, removeEventListener() {} },
 	});
+	const selection = {
+		rangeCount: 0,
+		anchorNode: null,
+		anchorOffset: 0,
+		focusNode: null,
+		focusOffset: 0,
+		removeAllRanges() {
+			this.rangeCount = 0;
+		},
+		addRange() {
+			this.rangeCount = 1;
+		},
+		collapse() {},
+		extend() {},
+		getRangeAt() {
+			return window.document.createRange();
+		},
+	};
+	Object.defineProperty(window.document, "getSelection", {
+		configurable: true,
+		value: () => selection,
+	});
 	const stored = new Map<string, string>();
 	const storage = {
 		get length() {
@@ -87,15 +116,10 @@ beforeEach(async () => {
 			stored.delete(key);
 		},
 	};
-	Object.defineProperty(window.HTMLTextAreaElement.prototype, "setSelectionRange", {
-		configurable: true,
-		value(this: HTMLTextAreaElement, start: number, end: number) {
-			this.selectionStart = start;
-			this.selectionEnd = end;
-		},
-	});
 	for (const [key, value] of Object.entries({
 		window,
+		innerHeight: 800,
+		innerWidth: 1200,
 		document: window.document,
 		navigator: window.navigator,
 		HTMLElement: window.HTMLElement,
@@ -157,15 +181,16 @@ beforeEach(async () => {
 	});
 	getSpy = spyOn(api, "getNarratorDraft").mockResolvedValue(initial);
 	updateSpy = spyOn(api, "updateNarratorDraft").mockImplementation(
-		async (_id, text, revision, sourceId, fileReferences) => ({
+		async (_id, text, revision, sourceId, fileReferences, composerDocument) => ({
 			...initial,
 			ok: true,
 			traits: [],
 			text,
 			fileReferences,
+			composerDocument,
 			revision: revision + 1,
 			sourceId: sourceId ?? null,
-			hasDraft: !!text || !!fileReferences?.length,
+			hasDraft: !!text || !!fileReferences?.length || !!composerDocument?.assets.length,
 		}),
 	);
 	host = document.createElement("div");
@@ -180,6 +205,10 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await act(async () => root.unmount());
+	// Tiptap releases its view on a zero-delay destroy timer; keep this fixture's DOM alive.
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	});
 	host.remove();
 	qc.clear();
 	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
@@ -203,13 +232,23 @@ async function render() {
 						<FileReferenceScopeProvider
 							value={{ narratorId: "n1", context: { deviceId: "RemoteABC", cwd: "/work" } }}
 						>
-							<Harness />
+							<ImageViewerContext.Provider value={{ open: () => {} }}>
+								<Harness />
+							</ImageViewerContext.Provider>
 						</FileReferenceScopeProvider>
 					</I18nextProvider>
 				</MantineProvider>
 			</QueryClientProvider>,
 		),
 	);
+}
+
+function getEditor(): Editor {
+	const element = host.querySelector<HTMLDivElement>(".ProseMirror") as
+		| (HTMLDivElement & { editor?: Editor })
+		| null;
+	if (!element?.editor) throw new Error("Missing real composer editor");
+	return element.editor;
 }
 
 function deferred<T>() {
@@ -610,11 +649,146 @@ describe("composer revision-only initial reconciliation", () => {
 	}
 });
 
+describe("composer rich document contract", () => {
+	function richDocument(): ComposerDocument {
+		return parseComposerDocument({
+			version: 1,
+			assets: [
+				{ id: "missing-image", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+			],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "before " },
+						{ type: "quote", id: "quote-node", label: "Assistant", text: "quote body" },
+						{ type: "attachment", id: "image-node", assetId: "missing-image" },
+						{ type: "fileReference", id: "file-node", reference },
+						{ type: "text", text: " after  " },
+					],
+				},
+			],
+		});
+	}
+	test("restore, hide and failure restore retain the exact document and missing-resource state", async () => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(handle.current?.hasMissingAssets()).toBe(true);
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(doc);
+		sendingRef.current = true;
+		await act(async () => handle.current?.hideTextForSend());
+		expect(handle.current?.getText()).toBe("");
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(doc);
+		sendingRef.current = false;
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(handle.current?.hasMissingAssets()).toBe(true);
+	});
+	// Real File/objectURL send recovery and release run in NarratorComposer.browser.test.ts:
+	// linkedom hangs while mounting the image NodeView, so Chromium verifies the actual lifecycle.
+	test("real ProseMirror text transactions and undo preserve mixed node order", async () => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("edited ", 1)));
+		expect(handle.current?.getText()).toContain("edited before ");
+		const nodeKinds = () =>
+			handle.current?.getDocument()?.paragraphs[0].children.map((node) => node.type);
+		expect(nodeKinds()).toEqual(["text", "quote", "attachment", "fileReference", "text"]);
+		await act(async () => {
+			editor.commands.undo();
+		});
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(nodeKinds()).toEqual(["text", "quote", "attachment", "fileReference", "text"]);
+	});
+	test("layout-only remote edits conflict without overwriting local node positions", async () => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		const moved: ComposerDocument = {
+			...doc,
+			paragraphs: [
+				{
+					children: [
+						doc.paragraphs[0].children[2],
+						...doc.paragraphs[0].children.filter((node) => node.type !== "attachment"),
+					],
+				},
+			],
+		};
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				...input,
+				hasDraft: true,
+				composerDocument: moved,
+				revision: 2,
+				sourceId: "other",
+			}),
+		);
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(host.textContent).toContain("draft conflict");
+	});
+	test.each([
+		"local edit",
+		"newer remote clear",
+	] as const)("late WS document reads preserve a %s", async (change) => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		const pending = deferred<Awaited<ReturnType<typeof api.getNarratorDraft>>>();
+		getSpy.mockReturnValueOnce(pending.promise);
+		const summary = {
+			...initial,
+			...input,
+			hasDraft: true,
+			hasComposerDocument: true,
+			revision: 2,
+			sourceId: "other",
+		};
+		await act(async () => handle.current?.handleDraftChanged(summary));
+		if (change === "local edit")
+			await act(async () => handle.current?.restoreInput("new input", []));
+		else
+			await act(async () =>
+				handle.current?.handleDraftChanged({ ...initial, revision: 3, sourceId: "other" }),
+			);
+		await act(async () => pending.resolve({ ...summary, composerDocument: doc }));
+		expect(handle.current?.getText()).toBe(change === "local edit" ? "new input" : "");
+		expect(handle.current?.getDocument()).toBeUndefined();
+	});
+	test("WS layout summaries load their document lazily instead of clearing inline nodes", async () => {
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		const pending = deferred<Awaited<ReturnType<typeof api.getNarratorDraft>>>();
+		getSpy.mockReturnValueOnce(pending.promise);
+		const summary = {
+			...initial,
+			...input,
+			hasDraft: true,
+			hasComposerDocument: true,
+			revision: 2,
+			sourceId: "other",
+		};
+		await act(async () => handle.current?.handleDraftChanged(summary));
+		expect(handle.current?.getText()).toBe("");
+		await act(async () => pending.resolve({ ...summary, composerDocument: doc }));
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(handle.current?.hasMissingAssets()).toBe(true);
+	});
+});
+
 describe("composer Enter focus", () => {
 	test("focuses from the page without sending; leaves controls and modified Enter alone", async () => {
 		await render();
-		const textarea = host.querySelector("textarea");
-		if (!textarea) throw new Error("Missing composer textarea");
+		const textarea = host.querySelector<HTMLElement>('[role="textbox"]');
+		if (!textarea) throw new Error("Missing composer textbox");
 		Object.defineProperty(textarea, "getClientRects", { value: () => [{}] });
 		const focus = spyOn(textarea, "focus").mockImplementation(() => {});
 		const press = (target: Element, extra = {}) => {
@@ -655,7 +829,7 @@ describe("composer atomic reference contract", () => {
 		const before = renders;
 		await act(async () => {
 			handle.current?.addFileReference(reference);
-			expect(handle.current?.getText()).toBe("#file:src/a.ts ");
+			expect(handle.current?.getText()).toBe("#file:src/a.ts");
 			expect(handle.current?.getFileReferences()[0]).toMatchObject(reference);
 			const copy = handle.current?.getFileReferences() ?? [];
 			copy[0].path = "/mutated";
@@ -684,7 +858,7 @@ describe("composer atomic reference contract", () => {
 		expect(handle.current?.getFileReferences()).toEqual([]);
 		expect(readNarratorInputDraft("u1", "n1").fileReferences).toBeUndefined();
 	});
-	test("quote prefix renders as chips, keeps the textarea to the body, and persists with the draft", async () => {
+	test("quote prefix becomes an inline atom rather than editable header text and persists with the draft", async () => {
 		await render();
 		const prefix = "> [quote] Assistant message\n> hello\n> world\n\n";
 		const body = insertFileReference({ text: "explain ", fileReferences: [] }, reference);
@@ -694,8 +868,21 @@ describe("composer atomic reference contract", () => {
 		);
 		expect(full.text).toBe(`${prefix}${body.text}`);
 		await act(async () => handle.current?.restoreInput(full.text, full.fileReferences));
-		const textarea = host.querySelector("textarea");
-		expect(textarea?.value).toBe(body.text);
+		const editor = getEditor();
+		const children = (editor.getJSON() as JSONContent).content?.[0].content ?? [];
+		expect(children.find((node) => node.type === "quote")?.attrs?.value).toMatchObject({
+			label: "Assistant message",
+			text: "hello\nworld",
+		});
+		expect(
+			children
+				.filter((node) => node.type === "text")
+				.map((node) => node.text)
+				.join(""),
+		).toBe("explain  ");
+		expect(
+			children.find((node) => node.type === "fileReference")?.attrs?.value.reference,
+		).toMatchObject(reference);
 		expect(host.textContent).toContain("Assistant message");
 		expect(handle.current?.getText()).toBe(`${prefix}${body.text}`);
 		expect(handle.current?.getFileReferences()[0].inputRange?.[0]).toBe(
@@ -704,14 +891,20 @@ describe("composer atomic reference contract", () => {
 		expect(readNarratorInputDraft("u1", "n1").text).toBe(`${prefix}${body.text}`);
 		await act(async () => handle.current?.appendText("more"));
 		expect(handle.current?.getText().startsWith(prefix)).toBe(true);
-		expect(textarea?.value).toBe(`${body.text}\nmore`);
+		expect(handle.current?.getText()).toBe(`${prefix}${body.text}\nmore`);
+		expect(editor.getJSON().content?.[0].content?.some((node) => node.type === "quote")).toBe(true);
 	});
 	test("metadata-only input is sendable and conflicts with a different remote target", async () => {
 		await render();
 		await act(async () => handle.current?.restoreInput("", [reference]));
 		expect(handle.current?.isTextEmpty()).toBe(false);
 		expect(flags).toEqual([false, true]);
-		expect(host.textContent).toContain("RemoteABC");
+		expect(host.textContent).toContain(reference.label);
+		expect(
+			(getEditor().getJSON() as JSONContent).content?.[0].content?.find(
+				(node) => node.type === "fileReference",
+			)?.attrs?.value.reference.deviceId,
+		).toBe("RemoteABC");
 		const remote = {
 			...initial,
 			hasDraft: true,

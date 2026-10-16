@@ -128,8 +128,16 @@ export function fileReferenceContentForDisplay(content: unknown): unknown {
 /** Only call at HTTP/WS display exits; DB rows and model input keep their immutable snapshots. */
 export function fileReferenceMessageForDisplay<T extends { contentJson?: unknown }>(
 	message: T,
-): Omit<T, "contentJson"> & { contentJson: unknown } {
-	return { ...message, contentJson: fileReferenceContentForDisplay(message.contentJson) };
+): Omit<T, "contentJson" | "composerDocument"> & {
+	contentJson: unknown;
+	hasComposerDocument?: boolean;
+} {
+	const { composerDocument, ...rest } = message as T & { composerDocument?: unknown };
+	return {
+		...(rest as Omit<T, "contentJson" | "composerDocument">),
+		...(composerDocument ? { hasComposerDocument: true } : {}),
+		contentJson: fileReferenceContentForDisplay(message.contentJson),
+	};
 }
 
 export function isFileReferenceSnapshot(value: unknown): value is FileReferenceSnapshot {

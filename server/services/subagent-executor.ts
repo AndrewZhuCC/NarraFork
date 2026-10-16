@@ -118,6 +118,7 @@ export interface SubagentBufferedMessage {
 	images?: ImageRef[];
 	textFiles?: File[];
 	fileReferences?: FileReferenceSnapshot[];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	commandText?: string | null;
 	createdBy?: string | null;
 	prePromptBashCommand?: string;
@@ -172,14 +173,20 @@ export interface SubagentExecOptions {
 // where a stale dynamic-import resolution can reference the module binding
 // before the const initializer has executed.
 
+function projectSubagentBufferedUserMessage(
+	message: ReturnType<typeof projectMailboxUserMessage>,
+): SubagentBufferedMessage {
+	return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(message)), {
+		prePromptBashCommand: message.bashCommand ?? undefined,
+	}) as SubagentBufferedMessage;
+}
+
 function projectSubagentInboxMessage(row: RuntimeMailboxRow): SubagentBufferedMessage {
 	if (row.kind === "user_input") {
 		const user = projectMailboxUserMessage(row);
-		return {
-			...user,
-			prePromptBashCommand: user.bashCommand ?? undefined,
+		return Object.assign(projectSubagentBufferedUserMessage(user), {
 			_mailboxConsumption: inboxConsumption(row),
-		};
+		});
 	}
 	return {
 		id: row.id,
@@ -556,6 +563,7 @@ export interface SubagentBufferedMessageOptions {
 	images?: ImageRef[];
 	textFiles?: File[];
 	fileReferences?: FileReferenceSnapshot[];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	commandText?: string | null;
 	createdBy?: string | null;
 	prePromptBashCommand?: string;
@@ -595,6 +603,7 @@ export async function pushSubagentBufferedMessage(
 		"fifo",
 		undefined,
 		options?.queueMode,
+		options?.composerDocument,
 	);
 }
 
@@ -663,19 +672,13 @@ export async function clearSubagentBufferedMessages(subagentId: string): Promise
 
 /** Get the full subagent buffer queue (for REST hydration). */
 export function getSubagentBufferedMessages(subagentId: string): SubagentBufferedMessage[] {
-	return getBufferedMessages(subagentId).map((message) => ({
-		...message,
-		prePromptBashCommand: message.bashCommand ?? undefined,
-	}));
+	return getBufferedMessages(subagentId).map(projectSubagentBufferedUserMessage);
 }
 
 export async function getSubagentBufferedMessagesAsync(
 	subagentId: string,
 ): Promise<SubagentBufferedMessage[]> {
-	return (await getBufferedMessagesAsync(subagentId)).map((message) => ({
-		...message,
-		prePromptBashCommand: message.bashCommand ?? undefined,
-	}));
+	return (await getBufferedMessagesAsync(subagentId)).map(projectSubagentBufferedUserMessage);
 }
 
 /**
@@ -884,7 +887,9 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 	if (!row) return null;
 	let buffered: SubagentBufferedMessage;
 	try {
-		buffered = projectSubagentInboxMessage(row);
+		// Lists stay lazy, but a claimed input must outlive staging cleanup below.
+		// Materialize all staging-backed fields before committing/removing their files.
+		buffered = { ...projectSubagentInboxMessage(row) };
 	} catch (error) {
 		await releaseInboxClaim(row, error);
 		throw error;
@@ -931,6 +936,7 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 				createdBy: buffered.createdBy,
 				origin,
 				parentToolUseId: toolUseId,
+				composerDocument: buffered.composerDocument,
 			});
 			// Withhold the creator for machine-authored text, as persistSubagentUserMessage does.
 			userMsg = (origin?.origin ?? "user") === "user" ? persisted : { ...persisted, creator: null };
@@ -944,6 +950,7 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 					images: buffered.images,
 					textFiles,
 					fileReferences: buffered.fileReferences,
+					composerDocument: buffered.composerDocument,
 					delivery: buffered.delivery,
 					commandText: buffered.commandText,
 					createdBy: buffered.createdBy,

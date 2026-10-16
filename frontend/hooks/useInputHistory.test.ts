@@ -18,6 +18,7 @@ import {
 	insertFileReference,
 } from "@frontend/components/narrator/composer/file-reference-input";
 import { flush, readSession, resetSessionStoreForTest } from "@frontend/lib/session-store";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { parseHTML } from "linkedom";
 import { act, createElement } from "react";
@@ -234,6 +235,35 @@ describe("history hook whole-input navigation", () => {
 		await act(async () => root.render(createElement(Harness)));
 		expect(history.isBrowsing).toBe(false);
 		expect(history.navigateEntry("up", "")).toBeNull();
+	});
+	test("rich history preserves whitespace, attachment-only entries and unsent layout", async () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [{ id: "asset", kind: "image", name: "a.png", size: 1, mimeType: "image/png" }],
+			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "asset" }] }],
+		};
+		const draft: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "  unsent  " }] }],
+		};
+		await act(async () => history.push("", [], doc));
+		expect(readInputHistoryEntries("u1:n1")[0]?.composerDocument).toEqual(doc);
+		let entry: FileReferenceInput | null = null;
+		await act(async () => {
+			entry = history.navigateEntry("up", composerDocumentText(draft).text, [], draft);
+		});
+		expect((entry as FileReferenceInput | null)?.composerDocument).toEqual(doc);
+		await act(async () => {
+			entry = history.navigateEntry("down", "");
+		});
+		expect(entry as FileReferenceInput | null).toEqual({
+			text: "  unsent  ",
+			fileReferences: [],
+			composerDocument: draft,
+		});
+		await act(async () => history.push("  unsent  ", [], draft));
+		expect(readInputHistoryEntries("u1:n1")[0]?.text).toBe("  unsent  ");
 	});
 	test("unknown user scope writes nothing and reference-only messages remain recallable", async () => {
 		storageKey = null;

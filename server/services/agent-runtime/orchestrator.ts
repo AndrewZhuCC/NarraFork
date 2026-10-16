@@ -2835,10 +2835,13 @@ export async function runAgentLoopUnlocked(
 					// Keep accepted snapshots and uploaded files recoverable until the
 					// ordinary user message commits, just like the interrupt drain path.
 					const terminalCommand =
-						parseQueuedNewCommand(buffered.text, buffered.commandText) ||
-						parseQueuedGoalCommand(buffered.text, buffered.commandText);
+						parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument) ||
+						parseQueuedGoalCommand(buffered.text, buffered.commandText, buffered.composerDocument);
 					pendingBufferedDelivery = buffered;
-					if (terminalCommand && parseQueuedNewCommand(buffered.text, buffered.commandText)) {
+					if (
+						terminalCommand &&
+						parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument)
+					) {
 						await persistClaimedUserInput({
 							claim: bufferedClaim,
 							reservedMessageId: bufferedRow?.recipientMessageId,
@@ -2867,7 +2870,11 @@ export async function runAgentLoopUnlocked(
 						remaining,
 					});
 					// [continuation-source: queued-command]
-					const newCommand = parseQueuedNewCommand(buffered.text, buffered.commandText);
+					const newCommand = parseQueuedNewCommand(
+						buffered.text,
+						buffered.commandText,
+						buffered.composerDocument,
+					);
 					if (newCommand) {
 						const newNarratorId = await executeQueuedNewCommand(
 							active,
@@ -2897,7 +2904,11 @@ export async function runAgentLoopUnlocked(
 					// A queued /goal appends its protected task, then continues this same
 					// loop with an explicit Spec instruction. Later queued messages retain
 					// their order and are consumed after this goal turn.
-					const goalCommand = parseQueuedGoalCommand(buffered.text, buffered.commandText);
+					const goalCommand = parseQueuedGoalCommand(
+						buffered.text,
+						buffered.commandText,
+						buffered.composerDocument,
+					);
 					if (goalCommand) {
 						await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
 						active._continuationSuppressed = false;
@@ -2975,6 +2986,7 @@ export async function runAgentLoopUnlocked(
 						narratorId,
 						text: effectiveBufferedText,
 						contentBlocks: persistBlocks,
+						composerDocument: buffered.composerDocument,
 						commandText: buffered.commandText,
 						createdBy: buffered.createdBy,
 					});

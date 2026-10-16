@@ -488,7 +488,9 @@ test("display settlement keeps real early and late failure codes instead of cloc
 describe("real readonly display page worker", () => {
 	test("explicit DTO columns stay field-compatible with Drizzle, without importing it into the worker", () => {
 		expect(DISPLAY_MESSAGE_COLUMNS.map((column) => column.field).sort()).toEqual(
-			Object.keys(getTableColumns(narratorMessages)).sort(),
+			Object.keys(getTableColumns(narratorMessages))
+				.map((key) => (key === "composerDocument" ? "hasComposerDocument" : key))
+				.sort(),
 		);
 		expect(DISPLAY_TOOL_COLUMNS.map((column) => column.field).sort()).toEqual(
 			Object.keys(getTableColumns(narratorToolCalls)).sort(),
@@ -499,8 +501,23 @@ describe("real readonly display page worker", () => {
 		] as const) {
 			const actualColumns = getTableColumns(table) as Record<string, { name: string }>;
 			for (const descriptor of descriptors)
-				expect(descriptor.column).toBe(actualColumns[descriptor.field].name);
+				expect(descriptor.column).toBe(
+					actualColumns[
+						descriptor.field === "hasComposerDocument" ? "composerDocument" : descriptor.field
+					].name,
+				);
 		}
+	});
+
+	test("rich layout is represented by a boolean, never read into the display budget", async () => {
+		message(writer, "message-1");
+		writer.run("UPDATE narrator_messages SET composer_document = ? WHERE id = 'message-1'", [
+			"private-layout".repeat(200_000),
+		]);
+		const [row] = await read();
+		expect(row.hasComposerDocument).toBe(true);
+		expect(Object.hasOwn(row, "composerDocument")).toBe(false);
+		expect(JSON.stringify(row)).not.toContain("private-layout");
 	});
 
 	test("display worker and protocol never pull in narrator/model runtime or DB bootstrap", async () => {

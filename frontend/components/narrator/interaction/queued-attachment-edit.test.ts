@@ -8,16 +8,21 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { BufferMessageSummary } from "../../../lib/api/types";
 import {
+	bindComposerEditFiles,
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,
+	type ExistingComposerAttachment,
 	MAX_QUEUED_IMAGES,
 	MAX_QUEUED_TEXT_FILES,
+	projectComposerEdit,
 	type QueuedEditAttachmentState,
 	queuedEditTouchesAttachments,
 	remainingImageRoom,
 	remainingTextFileRoom,
+	seedComposerEditSession,
 	seedQueuedEditAttachments,
 } from "./queued-attachment-edit";
 
@@ -275,5 +280,153 @@ describe("queuedEditTouchesAttachments", () => {
 				}),
 			),
 		).toBe(true);
+	});
+});
+
+// The same pure projection is consumed by queued and historical user editors.
+describe("semantic composer edits", () => {
+	const existing: ExistingComposerAttachment[] = [
+		{ kind: "image", imageId: "first-image", name: "same.png", size: 3, mimeType: "image/png" },
+		{ kind: "image", imageId: "second-image", name: "same.png", size: 3, mimeType: "image/png" },
+		{
+			kind: "textFile",
+			index: 0,
+			filePath: "/saved/one",
+			name: "same.txt",
+			size: 1,
+			mimeType: "text/plain",
+		},
+		{
+			kind: "textFile",
+			index: 1,
+			filePath: "/saved/two",
+			name: "same.txt",
+			size: 1,
+			mimeType: "text/plain",
+		},
+	];
+	function mixed(): ComposerDocument {
+		return {
+			version: 1,
+			assets: existing.map((resource, index) => ({
+				id: `asset-${index}`,
+				kind: resource.kind,
+				name: resource.name,
+				size: resource.size,
+				mimeType: resource.mimeType,
+			})),
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: " start😀 " },
+						{ type: "attachment", id: "node-file-two", assetId: "asset-3" },
+						{ type: "quote", id: "quote", label: "Source", text: "quoted text" },
+						{ type: "attachment", id: "node-image-two", assetId: "asset-1" },
+						{ type: "text", text: " middle " },
+						{ type: "attachment", id: "node-file-one", assetId: "asset-2" },
+						{ type: "attachment", id: "node-image-one", assetId: "asset-0" },
+						{ type: "text", text: " end " },
+					],
+				},
+			],
+		};
+	}
+	test("new record preserves interleaved occurrences but binds assets in server order", () => {
+		const document = mixed();
+		const session = seedComposerEditSession(
+			{ text: "ignored legacy text", fileReferences: [], composerDocument: document },
+			existing,
+		);
+		const snapshot = projectComposerEdit(session, session.document);
+		expect(snapshot.composerDocument).toEqual(document);
+		expect(snapshot.keepImageIds).toEqual(["first-image", "second-image"]);
+		expect(snapshot.keepTextFiles).toEqual([
+			{ index: 0, filename: "same.txt" },
+			{ index: 1, filename: "same.txt" },
+		]);
+		expect(snapshot.keepTextFilePaths).toEqual(["/saved/one", "/saved/two"]);
+		expect(snapshot.text).toContain(" start😀 ");
+		expect(snapshot.text.endsWith(" end ")).toBe(true);
+	});
+	test("legacy import uses the old grouping, without inventing historical mixed positions", () => {
+		const session = seedComposerEditSession({ text: "legacy body", fileReferences: [] }, existing);
+		expect(session.document.paragraphs[0].children.map((node) => node.type)).toEqual([
+			"attachment",
+			"attachment",
+			"attachment",
+			"attachment",
+		]);
+		expect(session.document.paragraphs[1].children).toEqual([
+			{ type: "text", text: "legacy body" },
+		]);
+	});
+	test("removal emits explicit empty keep arrays; undo restores identities from retained bindings", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: mixed() },
+			existing,
+		);
+		const removed: ComposerDocument = {
+			...session.document,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "still text" }] }],
+		};
+		const cleared = projectComposerEdit(session, removed);
+		expect(cleared.keepImageIds).toEqual([]);
+		expect(cleared.keepTextFiles).toEqual([]);
+		expect(cleared.keepTextFilePaths).toEqual([]);
+		expect(projectComposerEdit(session, session.document).keepImageIds).toEqual([
+			"first-image",
+			"second-image",
+		]);
+	});
+	test("same-name new Files remain separate and reorder does not swap upload identity", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: mixed() },
+			existing,
+		);
+		const files = [fakeFile("same.txt"), fakeFile("same.txt")];
+		const added = bindComposerEditFiles(session, files, "textFile");
+		expect(added.assets[0].id).not.toBe(added.assets[1].id);
+		const edited: ComposerDocument = {
+			...session.document,
+			assets: [...added.assets.toReversed(), ...session.document.assets],
+			paragraphs: [
+				{ children: [...added.nodes.toReversed(), ...session.document.paragraphs[0].children] },
+			],
+		};
+		const result = projectComposerEdit(session, edited);
+		expect(result.newTextFiles).toEqual(files);
+		expect(result.composerDocument.assets.map((asset) => asset.id)).toEqual([
+			"asset-0",
+			"asset-1",
+			"asset-2",
+			"asset-3",
+			...added.assets.map((asset) => asset.id),
+		]);
+		expect(result.composerDocument.paragraphs).toEqual(edited.paragraphs);
+	});
+	test("missing resources, unknown versions and stale manifest counts fail closed", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: mixed() },
+			existing,
+		);
+		session.bindings.delete("asset-0");
+		expect(() => projectComposerEdit(session, session.document)).toThrow("missing");
+		expect(() =>
+			seedComposerEditSession(
+				{ text: "", fileReferences: [], composerDocument: mixed() },
+				existing.slice(1),
+			),
+		).toThrow("out of date");
+		expect(() =>
+			seedComposerEditSession(
+				{
+					text: "",
+					fileReferences: [],
+					composerDocument: { ...mixed(), version: 9 } as unknown as ComposerDocument,
+				},
+				existing,
+			),
+		).toThrow();
 	});
 });

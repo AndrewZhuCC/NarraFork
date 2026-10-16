@@ -1,4 +1,12 @@
 {
+	"composerAttachmentInsertionExpired": "The draft changed while attachments were being prepared. Nothing was inserted; please attach them again.",
+	"composerAttachmentsProcessing": "Attachments are still being prepared. Please wait before sending.",
+	"composerMissingAssets": "Some attachments are unavailable. Reselect the files or remove their nodes.",
+	"attachments": { "missing": "Attachment needs to be reselected" },
+	"richComposer": {
+		"collapse": "Exit fullscreen",
+		"optimizeChanged": "The draft changed or the optimization could not preserve its text segments. Nothing was replaced; please try again."
+	},
 	"tokendanceBalance": "Balance ¥{{balance}}",
 	"tokendanceBalanceUnknown": "Balance temporarily unavailable",
 	"tokendanceBalanceDetails": "Total credited ¥{{credits}}\nConsumed ¥{{used}}\nRemaining ¥{{balance}}",
@@ -370,11 +378,12 @@
 			"merged": "{{count}} blocks"
 		},
 		"add": "Quote",
-		"addHint": "Quote selection (Alt+Q)",
+		"addHint": "Quote selection (Tab)",
 		"dismiss": "Dismiss",
 		"remove": "Remove quote",
 		"limit": "You can quote up to {{count}} excerpts per message.",
 		"fileUnsaved": "Save the file to quote this selection",
+		"fileUnavailable": "This preview cannot verify saved content. Open the full file before quoting.",
 		"addFailed": "Could not add quote",
 		"placeholder": "Ask about the quoted content…",
 		"open": "Show quoted text"

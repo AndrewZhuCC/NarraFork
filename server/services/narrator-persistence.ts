@@ -35,6 +35,7 @@ import type {
 	BooleanOverride,
 	DangerReflectionOverride,
 } from "../lib/boolean-override";
+import { validatePersistedComposerDocument } from "../lib/composer-document";
 import {
 	measureMessageCharacters,
 	measureSerializedCharacters,
@@ -980,6 +981,7 @@ export async function recoverStaleCompactingMessages(
  * pass it when the recipient is a subagent whose page drops the filter.
  */
 export interface MessagePlacementOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Reserved by the exact agent delivery; never supplied by public input. */
 	messageId?: string;
 	/** Claimed durable input; user_input does not require an agent delivery envelope. */
@@ -1205,6 +1207,10 @@ const sqliteNarratorPersistence = {
 		origin?: MessageOriginOptions,
 		placement?: MessagePlacementOptions,
 	) {
+		const composerDocument = validatePersistedComposerDocument(
+			placement?.composerDocument,
+			contentBlocks ?? [{ type: "text", text }],
+		);
 		const parentToolUseId = placement?.parentToolUseId ?? null;
 		const pg = getNarratorMessageRefsPort();
 		if (pg) {
@@ -1215,6 +1221,7 @@ const sqliteNarratorPersistence = {
 				parentToolUseId,
 				role: "user",
 				contentJson: contentBlocks ?? [{ type: "text", text }],
+				composerDocument: composerDocument ?? null,
 				contextCharsJson: measureMessageCharacters(
 					"user",
 					contentBlocks ?? [{ type: "text", text }],
@@ -1247,6 +1254,7 @@ const sqliteNarratorPersistence = {
 							parentToolUseId,
 							role: "user",
 							contentJson: contentBlocks ?? [{ type: "text", text }],
+							composerDocument: composerDocument ?? null,
 							contextCharsJson: measureMessageCharacters(
 								"user",
 								contentBlocks ?? [{ type: "text", text }],
