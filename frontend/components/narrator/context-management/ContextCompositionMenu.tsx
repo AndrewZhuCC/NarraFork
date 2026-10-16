@@ -87,40 +87,16 @@ export function ContextCompositionView({
 			offset += segment.chars;
 			return { ...segment, key };
 		});
-	// The API pins classification to a request. A matching WS snapshot carries
-	// newer occupancy; another request must never replace the API calibration.
 	const validTokens = (tokens?: number | null): tokens is number =>
 		tokens != null && Number.isFinite(tokens) && tokens >= 0;
-	const matches = (usage?: ContextUsageSnapshot | null) =>
-		usage != null &&
-		validTokens(usage.occupiedTokens) &&
-		data.generation != null &&
-		usage.composition?.generation === data.generation &&
-		usage.composition.totalChars === data.totalChars &&
-		usage.inputCharacters != null &&
-		Number.isFinite(usage.inputCharacters.totalChars) &&
-		usage.inputCharacters.totalChars > 0 &&
-		usage.inputCharacters.totalChars >= data.totalChars;
-	const matchedUsage =
-		snapshot?.requestId === data.usage?.requestId && matches(snapshot)
-			? snapshot
-			: matches(data.usage)
-				? data.usage
-				: null;
-	const occupiedTokens = matchedUsage
-		? matchedUsage.occupiedTokens
-		: [data.usage?.occupiedTokens, snapshot?.occupiedTokens, totalTokens].find(validTokens);
-	const calibrated = matchedUsage != null;
-	const totalChars = matchedUsage?.inputCharacters?.totalChars ?? data.totalChars;
-	const hasEstimate = contextTokenShare(1, totalChars, occupiedTokens) != null;
-	const estimateHint = t(
-		calibrated ? "contextComposition.calibratedHint" : "contextComposition.historyEstimateHint",
+	/** Occupancy is whichever number is known to be newest; the live snapshot leads. */
+	const occupiedTokens = [snapshot?.occupiedTokens, data.usage?.occupiedTokens, totalTokens].find(
+		validTokens,
 	);
 	const describe = (category: ContextCategory, chars: number) => {
-		const tokens = contextTokenShare(chars, totalChars, occupiedTokens);
-		return `${t(`contextComposition.categories.${category}`)} · ${tokens == null ? "—" : `≈${formatContextTokens(tokens)}`} · ${contextCharacterPercent(chars, totalChars).toFixed(1)}%`;
+		const tokens = contextTokenShare(chars, data.totalChars, occupiedTokens);
+		return `${t(`contextComposition.categories.${category}`)} · ${tokens == null ? "—" : `≈${formatContextTokens(tokens)}`} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
 	};
-	const tooltip = (label: string) => (hasEstimate ? `${label} · ${estimateHint}` : label);
 	return (
 		<Stack gap="sm">
 			<Group justify="space-between">
@@ -158,14 +134,14 @@ export function ContextCompositionView({
 				{segments.map((segment) => {
 					const label = describe(segment.category, segment.chars);
 					return (
-						<Tooltip key={segment.key} label={tooltip(label)} withArrow>
+						<Tooltip key={segment.key} label={label} withArrow>
 							<Box
 								component="button"
 								type="button"
 								aria-label={label}
 								onClick={() => setSelected({ category: segment.category, chars: segment.chars })}
 								style={{
-									width: `${contextCharacterPercent(segment.chars, totalChars)}%`,
+									width: `${contextCharacterPercent(segment.chars, data.totalChars)}%`,
 									flexShrink: 0,
 									height: "100%",
 									border: 0,
@@ -178,14 +154,9 @@ export function ContextCompositionView({
 					);
 				})}
 			</Box>
-			{!calibrated && hasEstimate && segments.length > 0 && (
-				<Text size="xs" c="dimmed" data-testid="context-composition-estimate-hint">
-					{estimateHint}
-				</Text>
-			)}
 			{selected && (
 				<Text size="xs" role="status">
-					{tooltip(describe(selected.category, selected.chars))}
+					{describe(selected.category, selected.chars)}
 				</Text>
 			)}
 			<Group gap="xs">
@@ -194,7 +165,7 @@ export function ContextCompositionView({
 					if (!item || item.chars <= 0) return null;
 					const label = describe(category, item.chars);
 					return (
-						<Tooltip key={category} label={tooltip(label)} withArrow>
+						<Tooltip key={category} label={label} withArrow>
 							<Button
 								variant="light"
 								size="compact-xs"
