@@ -309,3 +309,23 @@ describe("GET /knowledge/entries browse params", () => {
 		expect(archived.items).toEqual([]);
 	});
 });
+
+describe("GET /knowledge/entries/:id read-page fields", () => {
+	test("carries the owner's username and the current version number", async () => {
+		const col = await newCollection("detail");
+		const id = await seedEntry(col.id, "detail", { ownerUserId: adminId });
+		const app = appFor({ userId: adminId, role: "admin" });
+		const read = async () =>
+			(await (await app.request(`/knowledge/entries/${id}`)).json()) as {
+				ownerUsername: string | null;
+				currentVersion: number | null;
+			};
+		expect(await read()).toMatchObject({ ownerUsername: adminName, currentVersion: 1 });
+		await knowledgeService.addRevision(id, {
+			content: "v2",
+			authorUserId: adminId,
+			principal: P(adminId, "admin"),
+		});
+		expect((await read()).currentVersion).toBe(2);
+	});
+});

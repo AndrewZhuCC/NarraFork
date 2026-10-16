@@ -801,13 +801,16 @@ async function getEntryForViewer(id: string, principal: Principal) {
 	if (!(await canRead(caps, aclEntry, aclCol))) {
 		throw new NotFoundError("Knowledge entry", id);
 	}
-	const owner = entry.ownerUserId
-		? await knowledgeReadStore.getUsernameById(entry.ownerUserId)
-		: null;
+	const [owner, latest] = await Promise.all([
+		entry.ownerUserId ? knowledgeReadStore.getUsernameById(entry.ownerUserId) : null,
+		// Newest revision's metadata only (version-descending, limit 1, no body).
+		knowledgeReadStore.listRevisionMeta(entry.id, 1),
+	]);
 	return {
 		...entry,
 		// Display only: the owner id is already on the row; the read page shows the name.
 		ownerUsername: owner?.username ?? null,
+		currentVersion: latest[0]?.version ?? null,
 		viewerCaps: await entryViewerCaps(caps, aclEntry, aclCol),
 	};
 }
