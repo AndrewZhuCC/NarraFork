@@ -43,6 +43,7 @@ function installDom() {
 		matchMedia,
 		getSelection: () => ({ removeAllRanges() {} }),
 	});
+	Object.assign(window.document, { getSelection: () => window.getSelection() });
 	Object.defineProperty(window.document, "fonts", {
 		configurable: true,
 		value: { addEventListener() {}, removeEventListener() {} },
@@ -180,15 +181,20 @@ describe("SelectionPopover actions", () => {
 	test.each([
 		"touchend",
 		"keyup",
-	])("DOM selection completes on %s with the shared budget", async (event) => {
+	])("DOM selection completes on %s and dismisses when cleared", async (event) => {
 		const preview = spyOn(domText, "collectSelectionTextPreview").mockReturnValue("selected");
 		try {
 			await renderHarness({ domMode: true });
 			const target = container?.querySelector("[data-selectable]");
 			if (!target) throw new Error("missing selection container");
+			let collapsed = false;
 			Object.assign(window, {
 				getSelection: () => ({
-					rangeCount: 1,
+					isCollapsed: collapsed,
+					rangeCount: collapsed ? 0 : 1,
+					removeAllRanges: () => {
+						collapsed = true;
+					},
 					getRangeAt: () => ({
 						commonAncestorContainer: target,
 						startContainer: target,
@@ -202,17 +208,30 @@ describe("SelectionPopover actions", () => {
 			});
 			expect(preview).toHaveBeenCalledWith(expect.anything(), 200_000);
 			expect(button("copy")).toBeTruthy();
+			const press = new MouseEvent("mousedown", { bubbles: true, cancelable: true });
+			await act(async () => button("copy")?.dispatchEvent(press));
+			expect(press.defaultPrevented).toBe(true);
+			await act(async () => document.dispatchEvent(new Event("selectionchange")));
+			expect(button("copy")).toBeTruthy();
+			// Alt+Q clears the selection and focuses the comment editor outside the message list.
+			// There is no subsequent mouse/key event in the selection container.
+			await act(async () => {
+				window.getSelection()?.removeAllRanges();
+				document.dispatchEvent(new Event("selectionchange"));
+			});
+			expect(button("copy") === null).toBe(true);
 		} finally {
 			preview.mockRestore();
 		}
 	});
-	test("external selection survives DOM mouseup", async () => {
+	test("external selection survives DOM mouseup and selectionchange", async () => {
 		const sent: string[] = [];
 		await renderHarness({ onAction: (text) => sent.push(text) });
 		await act(async () => {
 			container
 				?.querySelector("[data-selectable]")
 				?.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+			document.dispatchEvent(new Event("selectionchange"));
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		});
 		expect(button("copy")).toBeTruthy();

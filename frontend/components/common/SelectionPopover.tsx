@@ -115,8 +115,11 @@ export function SelectionPopover({
 
 	const handleMouseDown = useCallback(
 		(e: MouseEvent) => {
-			// Don't dismiss if clicking the popover itself
-			if (popoverRef.current?.contains(e.target as Node)) return;
+			// Keep the native selection until the popover action has consumed it.
+			if (popoverRef.current?.contains(e.target as Node)) {
+				e.preventDefault();
+				return;
+			}
 			clearSelection();
 		},
 		[clearSelection],
@@ -125,17 +128,25 @@ export function SelectionPopover({
 	useEffect(() => {
 		const container = containerRef.current;
 		if (!container) return;
+		const doc = container.ownerDocument;
+		const handleSelectionChange = () => {
+			const selection = doc.getSelection();
+			if (!selection || selection.isCollapsed) clearSelection();
+		};
 
 		const selectionEvents = ["mouseup", "touchend", "keyup"] as const;
-		if (!externalMode)
+		if (!externalMode) {
 			for (const event of selectionEvents) container.addEventListener(event, handleMouseUp);
-		document.addEventListener("mousedown", handleMouseDown);
+			doc.addEventListener("selectionchange", handleSelectionChange);
+		}
+		doc.addEventListener("mousedown", handleMouseDown);
 
 		return () => {
 			for (const event of selectionEvents) container.removeEventListener(event, handleMouseUp);
-			document.removeEventListener("mousedown", handleMouseDown);
+			doc.removeEventListener("selectionchange", handleSelectionChange);
+			doc.removeEventListener("mousedown", handleMouseDown);
 		};
-	}, [containerRef, handleMouseUp, handleMouseDown, externalMode]);
+	}, [containerRef, handleMouseUp, handleMouseDown, externalMode, clearSelection]);
 
 	// Handle external selection (e.g. from xterm canvas)
 	useEffect(() => {
