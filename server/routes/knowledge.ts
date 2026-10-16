@@ -311,9 +311,8 @@ knowledgeRoutes.get("/personal-entries", async (c) => {
 		limit: c.req.query("limit"),
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const rows = await knowledgeBranchService.listMine(principalOf(c), parsed.data);
-	const driftedIds = await knowledgeBranchService.findDriftedDraftIds(rows);
-	return c.json(rows.map((r) => ({ ...r, drifted: driftedIds.has(r.id) })));
+	// + ACL-checked display names (linked entry title, standalone target collection name).
+	return c.json(await knowledgeBranchService.listMineForViewer(principalOf(c), parsed.data));
 });
 
 knowledgeRoutes.post("/personal-entries", async (c) => {
@@ -322,8 +321,11 @@ knowledgeRoutes.post("/personal-entries", async (c) => {
 	return c.json(await knowledgeBranchService.createStandalone(principalOf(c), parsed.data), 201);
 });
 
+// The personal-version page payload: the entry + ACL-checked linked-entry / target display
+// fields, drift, the requests a delete would close, and `viewerCaps` (same gates as the
+// edit / meta / rebase / delete / submit endpoints).
 knowledgeRoutes.get("/personal-entries/:id", async (c) => {
-	return c.json(await knowledgeBranchService.getMine(principalOf(c), c.req.param("id")));
+	return c.json(await knowledgeBranchService.getMineForViewer(principalOf(c), c.req.param("id")));
 });
 
 knowledgeRoutes.patch("/personal-entries/:id", async (c) => {
