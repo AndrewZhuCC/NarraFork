@@ -917,6 +917,7 @@ export function collectUiState(nodes: UiNode[]): { bound: string[]; read: string
 		if (Array.isArray(value)) for (const item of value) readValue(item);
 		else if (value && typeof value === "object") {
 			if ("$ref" in value && typeof value.$ref === "string") read.add(value.$ref);
+			else if ((value as UiElement).$node === "el") walk([value as UiElement]);
 			else if (!("$node" in value) && !("$action" in value))
 				for (const item of Object.values(value)) readValue(item);
 		}

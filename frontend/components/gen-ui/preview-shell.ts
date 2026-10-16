@@ -186,7 +186,7 @@ export function createPreviewShell(
       document.addEventListener(type, event => { if (event.isTrusted) lastGesture = performance.now(); }, true);
     const act = (action, value, fields) => {
       if (performance.now() - lastGesture > 1000) return;
-      parent.postMessage({type: "narrafork:ui-action", action, value: String(value).slice(0, 4000), ...(fields ? {fields} : {})}, "*");
+      parent.postMessage({type: "narrafork:ui-action", action, value: String(value).slice(0, 2000), ...(fields ? {fields} : {})}, "*");
     };
     // Named state: what a bind="x" control holds, read by $x and by the actions. It lives
     // for the frame, so a newer tree posted while the UI streams keeps what was typed.
@@ -206,7 +206,14 @@ export function createPreviewShell(
       if (action === "openLink") return act(action, value);
       const fields = {};
       for (const [name, current] of state) fields[name] = plain(current);
-      const lines = Object.keys(fields).map((name) => name + ": " + shown(fields[name]));
+      // The host sends at most 2000 characters, so each field is cut on its own rather
+      // than the last ones disappearing behind a long first answer.
+      const names = Object.keys(fields);
+      const room = Math.max(40, Math.floor((1900 - value.length) / Math.max(1, names.length)));
+      const lines = names.map((name) => {
+        const text = shown(fields[name]);
+        return name + ": " + (text.length > room ? text.slice(0, room - 1) + "…" : text);
+      });
       act("submit", [value.trim(), ...lines].filter(Boolean).join("\\n"), fields);
     };
     // A change reaches a bound control as an event (inputs, checkboxes) or as the value
@@ -231,6 +238,49 @@ export function createPreviewShell(
       let current = components;
       for (const part of name.split(".")) current = current == null ? undefined : current[part];
       return typeof current === "function" || (current && typeof current === "object" && current.$$typeof) ? current : null;
+    };
+    // How a bound control holds its value: "check" is a boolean, "radio" holds the value
+    // of whichever radio sharing the name is picked, "multi" is a list, "text" a string,
+    // and anything else starts at null until it moves.
+    const bindKind = (name, props) => {
+      if (props.type === "radio" || /(^|\\.)Radio$/.test(name)) return "radio";
+      if ("defaultChecked" in props || props.type === "checkbox" || /(^|\\.)(Checkbox|Switch|Chip)$/.test(name)) return "check";
+      if (/(^|\\.)(TagsInput|MultiSelect|PillsInput)$|^Checkbox\\.Group$/.test(name) || (name === "Chip.Group" && props.multiple)) return "multi";
+      if (/^(input|textarea|TextInput|PasswordInput|Textarea|JsonInput|NumberInput|ColorInput|Autocomplete)$/.test(name)) return "text";
+      return "value";
+    };
+    const seedBind = (bind, kind, props) => {
+      if (kind === "radio") {
+        if (props.defaultChecked === true && !touched.has(bind) && state.get(bind) == null) state.set(bind, props.value ?? null);
+        else if (!state.has(bind)) state.set(bind, null);
+        return;
+      }
+      if (state.has(bind)) return;
+      if (kind === "check") state.set(bind, props.defaultChecked === true);
+      else if (props.defaultValue !== undefined) state.set(bind, props.defaultValue);
+      else state.set(bind, kind === "multi" ? [] : kind === "text" ? "" : null);
+    };
+    // A $x may come before the control that binds x, so every bound control's starting
+    // value is in place before a tree is drawn.
+    const seedTree = (value) => {
+      if (Array.isArray(value)) { for (const item of value) seedTree(item); return; }
+      if (!value || typeof value !== "object" || "$ref" in value || "$action" in value) return;
+      if (value.$node === "el") {
+        const given = value.props && typeof value.props === "object" && !Array.isArray(value.props) ? value.props : {};
+        if (typeof given.bind === "string" && stateName.test(given.bind) && typeof value.name === "string") {
+          const props = {};
+          for (const name of ["type", "value", "defaultValue", "defaultChecked", "multiple"]) {
+            const item = name in given ? toValue(given[name], name) : undefined;
+            if (item !== undefined) props[name] = item;
+          }
+          seedBind(given.bind, bindKind(value.name, props), props);
+        }
+        for (const key of Object.keys(given)) seedTree(given[key]);
+        seedTree(value.children);
+        return;
+      }
+      if (value.$node) return;
+      for (const key of Object.keys(value)) seedTree(value[key]);
     };
     // undefined means "leave this prop out".
     const toValue = (value, name) => {
@@ -272,17 +322,30 @@ export function createPreviewShell(
       }
       if (bind) {
         // The frame owns a bound control's value, so it is controlled from here on.
-        const checkable = "defaultChecked" in props || props.type === "checkbox" || props.type === "radio"
-          || /(^|\\.)(Checkbox|Switch|Chip)$/.test(node.name);
-        if (!state.has(bind)) state.set(bind, checkable ? props.defaultChecked === true : props.defaultValue ?? (/(^input$|^textarea$|Input$|Textarea$)/.test(node.name) ? "" : null));
+        const kind = bindKind(node.name, props);
+        seedBind(bind, kind, props);
         delete props.defaultValue;
         delete props.defaultChecked;
         const current = state.get(bind);
-        if (checkable) props.checked = current === true;
+        if (kind === "radio") props.checked = current != null && current === props.value;
+        else if (kind === "check") props.checked = current === true;
         // With no default, a Slider or Select is left to pick its own start until it moves:
         // null is not a value every control accepts.
         else if (current !== null || touched.has(bind)) props.value = current;
-        props.onChange = (input) => { touched.add(bind); state.set(bind, changed(input, checkable)); rerender(); };
+        const update = (input) => {
+          const next = kind === "radio" ? props.value : changed(input, kind === "check");
+          if (kind === "radio" && changed(input, true) === false) return;
+          touched.add(bind);
+          state.set(bind, next);
+          rerender();
+        };
+        props.onChange = update;
+        // Radix-style kit controls (shadcn Select, Tabs, Checkbox, Switch) report changes
+        // through these instead; Mantine and plain HTML never see them.
+        if (kit && typeof type !== "string") {
+          if (kind === "check") props.onCheckedChange = update;
+          else props.onValueChange = update;
+        }
       }
       if (key !== undefined) props.key = key;
       const children = (Array.isArray(node.children) ? node.children : []).map((child, index) => renderNode(child, index));
@@ -319,7 +382,7 @@ export function createPreviewShell(
     window.addEventListener("message", event => {
       if (event.source !== parent) return;
       const data = event.data;
-      if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) { setTree?.(data.nodes); return; }
+      if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) { seedTree(data.nodes); setTree?.(data.nodes); return; }
       if (data?.type !== "narrafork:preview-theme" || config.kit) return;
       const theme = data.theme;
       if (!theme || !["light", "dark"].includes(theme.colorScheme) || typeof theme.tokenCss !== "string" || theme.tokenCss.length > 65536) return;

@@ -290,6 +290,38 @@ browserTest(
 );
 
 browserTest(
+	"state is in place before its control is drawn, and lists and radios keep their shape",
+	async () => {
+		const { page, frame } = await open(await builtinRuntime(), false);
+		const markup = `<Stack>
+	<Text id="early">{$radius}px, tags {$tags}, plan {$plan}</Text>
+	<Slider bind="radius" defaultValue={12} />
+	<TagsInput id="tags" bind="tags" label="Tags" />
+	<input id="free" type="radio" bind="plan" value="free" />
+	<input id="pro" type="radio" bind="plan" value="pro" defaultChecked />
+	<Button id="send" onClick={submit()}>Send</Button>
+</Stack>`;
+		await post(page, markup, true);
+		await frame.waitForSelector("#send");
+		expect(await frame.$eval("#early", (node) => node.textContent)).toBe("12px, tags , plan pro");
+		expect(await frame.$eval("#pro", (node) => (node as HTMLInputElement).checked)).toBe(true);
+		expect(await frame.$eval("#free", (node) => (node as HTMLInputElement).checked)).toBe(false);
+		await frame.click("#free");
+		await frame.waitForFunction(
+			() => document.getElementById("early")?.textContent === "12px, tags , plan free",
+		);
+		expect(await frame.$eval("#pro", (node) => (node as HTMLInputElement).checked)).toBe(false);
+		await frame.click("#send");
+		await page.waitForFunction(
+			() => (window as unknown as { actions: unknown[] }).actions.length >= 1,
+		);
+		expect(await actions(page)).toEqual([["submit", "radius: 12\ntags: \nplan: free"]]);
+		await page.close();
+	},
+	60_000,
+);
+
+browserTest(
 	"markup cannot introduce script: disallowed tags and props never reach the document",
 	async () => {
 		const { page, frame } = await open(await builtinRuntime(), false);

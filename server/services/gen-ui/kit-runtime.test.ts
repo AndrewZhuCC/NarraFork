@@ -185,6 +185,18 @@ describe("render", () => {
 		expect(result.output).not.toContain("$radius,");
 	});
 
+	test("a bind on an element inside a list prop counts", async () => {
+		const { env } = await fixture();
+		const result = await executeKitAction(
+			{
+				action: "render",
+				source: '<Stack><Group items={[<TextInput bind="q" />]} /><Text>{$q}</Text></Stack>',
+			},
+			env,
+		);
+		expect(result.output).not.toContain("Nothing binds");
+	});
+
 	test("markup with nothing renderable is rejected", async () => {
 		const { env } = await fixture();
 		for (const source of ["   ", "just some prose", "<Stack"])
