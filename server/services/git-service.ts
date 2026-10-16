@@ -1154,7 +1154,10 @@ export const gitService = {
 		return this.getHeadCommit(worktreePath);
 	},
 
-	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
+	async getStatusSummary(
+		worktreePath: string,
+		options: { ttlMs?: number } = {},
+	): Promise<GitStatusSummary> {
 		return coordinateGitStatusQuery(
 			getLocalGitStatusQueryKey(worktreePath),
 			async (signal) => {
@@ -1220,7 +1223,7 @@ export const gitService = {
 					};
 				});
 			},
-			{ signal: gitRequestContext.getStore()?.signal },
+			{ signal: gitRequestContext.getStore()?.signal, ttlMs: options.ttlMs },
 		);
 	},
 

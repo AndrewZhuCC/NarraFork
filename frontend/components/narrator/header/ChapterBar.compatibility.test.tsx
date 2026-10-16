@@ -436,7 +436,8 @@ test("standalone bar uses independent totals and labels partial, refreshing and 
 	expect(container.querySelector('[aria-label="lineStats.partial"]')).not.toBeNull();
 	lineStats = { ...lineStats, isFetching: true };
 	await render();
-	expect(container.textContent).not.toContain("+12");
+	expect(container.textContent).toContain("+12");
+	expect(container.textContent).toContain("-4");
 	expect(container.querySelector('[aria-label="lineStats.updating"]')).not.toBeNull();
 	lineStats = {
 		...lineStats,

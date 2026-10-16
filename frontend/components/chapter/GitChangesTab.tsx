@@ -154,15 +154,13 @@ export function GitChangesTab({
 	const confirm = useConfirmDialog();
 	const { data: status, isLoading, error } = useGitStatus(target);
 	const lineStats = useGitLineStats(target);
-	// No stale row numbers during a refetch/error, nor fallback to legacy status counts.
+	// Keep the last measured rows while updating; errors never fall back to legacy counts.
 	const statsByPath = useMemo(
 		() =>
 			new Map(
-				(lineStats.isFetching || lineStats.error ? [] : (lineStats.data?.files ?? [])).map(
-					(file) => [file.path, file],
-				),
+				(lineStats.error ? [] : (lineStats.data?.files ?? [])).map((file) => [file.path, file]),
 			),
-		[lineStats.data, lineStats.isFetching, lineStats.error],
+		[lineStats.data, lineStats.error],
 	);
 	const { data: modifications } = useGitModifications(target);
 	const stage = useGitStage(target);

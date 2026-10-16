@@ -91,8 +91,8 @@ export function NarratorGitBar({
 	const workspace = useGitWorkspace(narratorId);
 	const { data: executionContext } = useWorkspaceContext(narratorId);
 	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
-	const status = useGitStatus(target);
-	const lineStats = useGitLineStats(target);
+	const status = useGitStatus(target, "summary");
+	const lineStats = useGitLineStats(target, "summary");
 	const workspaceState = workspace.data?.state;
 	useEffect(() => {
 		if (status.data) workspace.rememberCounts?.(status.data);
@@ -211,7 +211,8 @@ export function ChapterBar({
 		narratorId && !workspaceQuery.isError
 			? gitWorkspaceTarget(narratorId, workspaceQuery.data)
 			: null;
-	const { data: workspaceStatus } = useGitStatus(workspaceTarget);
+	const { data: workspaceStatus } = useGitStatus(workspaceTarget, "summary");
+	const workspaceLineStats = useGitLineStats(workspaceTarget, "summary");
 	const { data: chapterStatus } = useChapterGitStatus(narratorId ? null : chapterId);
 	const gitStatus = narratorId
 		? workspaceStatus
@@ -406,6 +407,7 @@ export function ChapterBar({
 								)}
 							</Group>
 						)}
+					{workspaceTarget && <GitLineStatsSummary {...workspaceLineStats} compact />}
 					{chapter.status !== "active" && (
 						<Badge
 							size="xs"

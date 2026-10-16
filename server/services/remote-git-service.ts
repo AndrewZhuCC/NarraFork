@@ -16,6 +16,7 @@ import {
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
 import { AppError, GitError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import {
 	assertSingleFilePatch,
 	buildCommitDetail,
@@ -166,8 +167,8 @@ export function getRemoteGitStatusQueryKey(
 
 /**
  * Caller must authorize narrator + project + device + canonical root on EVERY
- * request before constructing this adapter. Only authorized in-flight status reads
- * are merged; there is no settled cache, local fallback, or retry.
+ * request before constructing this adapter. Status results share a bounded cache,
+ * never authorization decisions; there is no local fallback or retry.
  * The backend is pinned to its authenticated transport generation; the executor
  * independently verifies expectedRoot and its operator-owned path policy.
  */
@@ -213,8 +214,10 @@ export function createRemoteGitService(
 		} finally {
 			// Even an uncertain write must not let the next read reuse pre-write work.
 			if (write) {
-				invalidateGitStatusQuery(statusKey(cwd));
-				invalidateGitLineStats(statusKey(cwd));
+				const queryKey = statusKey(cwd);
+				invalidateGitStatusQuery(queryKey);
+				invalidateGitLineStats(queryKey);
+				eventBus.emit({ type: "git:workspace_invalidated", queryKey });
 			}
 		}
 	}
@@ -231,12 +234,12 @@ export function createRemoteGitService(
 			probeSignal?: AbortSignal,
 			limits: Pick<GitWorkspaceRequest, "maxBytes" | "timeoutMs"> = {},
 		) => request(cwd, "probe", limits, probeSignal ?? signal),
-		async getStatusSummary(cwd: string) {
+		async getStatusSummary(cwd: string, options: { ttlMs?: number } = {}) {
 			return coordinateGitStatusQuery(
 				statusKey(cwd),
 				async (sharedSignal) =>
 					parseRemoteGitStatus(await request(cwd, "status", {}, sharedSignal)),
-				{ signal },
+				{ signal, ttlMs: options.ttlMs },
 			);
 		},
 		async getLineStats(cwd: string): Promise<GitLineStats> {

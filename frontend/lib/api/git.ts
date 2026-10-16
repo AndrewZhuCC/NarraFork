@@ -114,10 +114,12 @@ export const gitApi = {
 		gitRequest<GitWorkspace>(`/narrators/${encodeURIComponent(narratorId)}/git/workspace`, {
 			signal,
 		}),
-	getGitStatus: (target: GitTarget, signal?: AbortSignal) =>
-		gitRequest<ApiEntity>(gitReadPath(target, "/status"), { signal }),
-	getGitLineStats: (target: GitTarget, signal?: AbortSignal) =>
-		gitRequest<GitLineStats>(gitReadPath(target, "/line-stats"), { signal }),
+	getGitStatus: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
+		gitRequest<ApiEntity>(gitReadPath(target, fresh ? "/status?fresh=1" : "/status"), { signal }),
+	getGitLineStats: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
+		gitRequest<GitLineStats>(gitReadPath(target, fresh ? "/line-stats?fresh=1" : "/line-stats"), {
+			signal,
+		}),
 	getGitModifications: (
 		target: GitTarget,
 		opts?: {

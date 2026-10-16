@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { GitLineStats } from "@shared/git-line-stats";
 import {
 	clearGitLineStatsCache,
@@ -27,6 +27,25 @@ const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 afterEach(clearGitLineStatsCache);
 
 describe("independent Git line statistics cache", () => {
+	test("defaults to 5s, permits TTL overrides and bounds completed results to 128", async () => {
+		let now = 0;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let calls = 0;
+		const load = async () => stats(++calls);
+		try {
+			await getGitLineStatsCached("first", load);
+			now = 4999;
+			expect((await getGitLineStatsCached("first", load)).linesAdded).toBe(1);
+			now = 5000;
+			expect((await getGitLineStatsCached("first", load)).linesAdded).toBe(2);
+			expect((await getGitLineStatsCached("first", load, undefined, 0)).linesAdded).toBe(3);
+			for (let i = 0; i < 128; i++) await getGitLineStatsCached(`other-${i}`, async () => stats());
+			expect((await getGitLineStatsCached("first", load)).linesAdded).toBe(4);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	test("two authorized surfaces share one read and its short-lived result", async () => {
 		const pending = deferred<GitLineStats>();
 		let calls = 0;

@@ -17,6 +17,7 @@ interface Job<T> {
 	waiters: Set<Waiter<T>>;
 	state: "queued" | "running" | "finished";
 	invalidated: boolean;
+	discardResult?: boolean;
 	createdAt: number;
 	readers: number;
 	timer?: ReturnType<typeof setTimeout>;
@@ -46,22 +47,32 @@ export function localGitStatusScopesOverlap(key: string, rawPath: string): boole
 	return within(scope, changed) || within(changed, scope);
 }
 
-/**
- * Single flight per execution target, with one trailing refresh after invalidation.
- * No result cache here: fresh HTTP reads and the legacy short-TTL facade share the
- * same actual subprocess. A caller's abort never owns another caller's query.
- */
+export const GIT_QUERY_CACHE_MAX_ENTRIES = 128;
+export const GIT_STATUS_TTL_MS = 3000;
+
+/** Single flight and bounded results per target, with one trailing refresh after invalidation. */
 export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 	private entries = new Map<string, Entry<T>>();
+	private results = new Map<string, { value: T; producedAt: number; dirty: boolean }>();
 	private queue: Job<T>[] = [];
 	private running = 0;
 	private clearing = false;
 
-	constructor(private readonly limits = { concurrency: 4, queued: 128, timeoutMs: 30_000 }) {}
+	constructor(
+		private readonly limits = { concurrency: 4, queued: 128, timeoutMs: 30_000 },
+		private readonly ttlMs = GIT_STATUS_TTL_MS,
+	) {}
 
-	query(key: string, loader: Loader<T>, options: { signal?: AbortSignal } = {}) {
+	query(key: string, loader: Loader<T>, options: { signal?: AbortSignal; ttlMs?: number } = {}) {
 		const signal = options.signal;
 		if (signal?.aborted) return Promise.reject(signal.reason);
+		const cached = this.results.get(key);
+		const ttl = options.ttlMs ?? this.ttlMs;
+		if (cached && !cached.dirty && ttl > 0 && Date.now() - cached.producedAt < ttl) {
+			this.results.delete(key);
+			this.results.set(key, cached);
+			return Promise.resolve(cached.value);
+		}
 		const entry = this.entries.get(key);
 		let job = entry
 			? entry.current.invalidated || entry.current.controller.signal.aborted
@@ -121,19 +132,50 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 		return result;
 	}
 
+	peek(key: string): T | null {
+		return this.results.get(key)?.value ?? null;
+	}
+
+	get size(): number {
+		return this.results.size;
+	}
+
+	/** A matching filesystem fingerprint can renew only an existing, clean result. */
+	validate(key: string): void {
+		const cached = this.results.get(key);
+		if (cached && !cached.dirty) cached.producedAt = Date.now();
+	}
+
+	drop(key: string): void {
+		this.invalidate(key);
+		this.results.delete(key);
+		const entry = this.entries.get(key);
+		if (entry) entry.current.discardResult = true;
+		if (entry?.next) entry.next.discardResult = true;
+	}
+
+	dropMatching(matches: (key: string) => boolean): void {
+		for (const key of new Set([...this.results.keys(), ...this.entries.keys()])) {
+			if (matches(key)) this.drop(key);
+		}
+	}
+
 	invalidate(key: string): void {
+		const cached = this.results.get(key);
+		if (cached) cached.dirty = true;
 		const job = this.entries.get(key)?.current;
 		// A queued query has not observed the repository yet, so it is already fresh.
 		if (job?.state === "running") job.invalidated = true;
 	}
 
 	invalidateMatching(matches: (key: string) => boolean): void {
-		for (const key of this.entries.keys()) {
+		for (const key of new Set([...this.results.keys(), ...this.entries.keys()])) {
 			if (matches(key)) this.invalidate(key);
 		}
 	}
 
 	clear(): void {
+		this.results.clear();
 		this.clearing = true;
 		try {
 			for (const entry of [...this.entries.values()]) {
@@ -157,7 +199,7 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 		if (job.timer) clearTimeout(job.timer);
 		for (const waiter of job.waiters) {
 			waiter.cleanup();
-			if (value) waiter.resolve(value);
+			if (value !== undefined) waiter.resolve(value);
 			else waiter.reject(error);
 		}
 		job.waiters.clear();
@@ -205,6 +247,14 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 				})
 				.then(
 					(value) => {
+						if (!job.invalidated && !job.discardResult && !job.controller.signal.aborted) {
+							this.results.delete(job.key);
+							this.results.set(job.key, { value, producedAt: Date.now(), dirty: false });
+							while (this.results.size > GIT_QUERY_CACHE_MAX_ENTRIES) {
+								const oldest = this.results.keys().next().value;
+								if (oldest !== undefined) this.results.delete(oldest);
+							}
+						}
 						this.finish(job);
 						if (!job.controller.signal.aborted) this.settle(job, value);
 					},
@@ -221,6 +271,13 @@ const coordinator = new GitStatusQueryCoordinator();
 export const coordinateGitStatusQuery = coordinator.query.bind(coordinator);
 export const invalidateGitStatusQuery = coordinator.invalidate.bind(coordinator);
 export const clearGitStatusQueries = coordinator.clear.bind(coordinator);
+export const peekGitStatusQuery = coordinator.peek.bind(coordinator);
+export const validateGitStatusQuery = coordinator.validate.bind(coordinator);
+export const gitStatusQueryCacheSize = () => coordinator.size;
+
+export function dropLocalGitStatusQueries(path: string): void {
+	coordinator.dropMatching((key) => localGitStatusScopesOverlap(key, path));
+}
 
 export function invalidateLocalGitStatusQueries(path: string): void {
 	coordinator.invalidateMatching((key) => localGitStatusScopesOverlap(key, path));
