@@ -1139,3 +1139,183 @@ test("a pending explicit reload prevents confirmation from dispatching the older
 	expect(session.state.confirmation).toBeNull();
 	expect(sessionDirty(session.state)).toBe(false);
 });
+
+test("one queued save intent during an in-flight commit serializes with the next captured snapshot", async () => {
+	const { session, api, change, encode } = await setup();
+	change("first draft");
+	const firstCommit = deferred<EditorCommitResult>();
+	api.commit.mockImplementationOnce(() => firstCommit.promise);
+	const firstSave = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	expect(session.state.phase).toBe("committing");
+	change("second draft");
+	// Multiple extra save requests during the in-flight attempt collapse to one intent.
+	void session.save();
+	void session.save();
+	void session.save();
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(encode).toHaveBeenCalledTimes(1);
+	firstCommit.resolve({
+		status: "saved",
+		operationId: "op-a",
+		hash: "hash-a",
+		snapshotRevision: 2,
+		bytes: 11,
+	});
+	await firstSave;
+	// Settle must advance the baseline AND start exactly one more save with the latest text.
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	expect(api.commit).toHaveBeenCalledTimes(2);
+	expect(encode).toHaveBeenCalledTimes(2);
+	// Second attempt binds against the hash of the first receipt, never the stale initial baseline.
+	expect(api.createUpload.mock.calls[1]?.[2].baseHash).toBe("hash-a");
+	// Second upload's Blob reflects the newest buffer, not the already-saved snapshot.
+	const uploaded = (await api.upload.mock.calls[1]?.[3].text()) ?? "";
+	expect(uploaded).toBe("second draft");
+});
+
+test("intents while committing do not accumulate: only the final visible edit is saved", async () => {
+	const { session, api, change } = await setup();
+	change("first");
+	const firstCommit = deferred<EditorCommitResult>();
+	api.commit.mockImplementationOnce(() => firstCommit.promise);
+	const firstSave = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	change("final");
+	void session.save();
+	change("final-plus");
+	void session.save();
+	firstCommit.resolve({
+		status: "saved",
+		operationId: "op-a",
+		hash: "hash-a",
+		snapshotRevision: 2,
+		bytes: 5,
+	});
+	await firstSave;
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	expect(api.commit).toHaveBeenCalledTimes(2);
+	// Only one additional attempt, which captured the newest buffer.
+	expect(api.createUpload).toHaveBeenCalledTimes(2);
+});
+
+test("repeated saves on the same revision after settle do not create a redundant commit", async () => {
+	const { session, api, change } = await setup();
+	change("first");
+	const firstCommit = deferred<EditorCommitResult>();
+	api.commit.mockImplementationOnce(() => firstCommit.promise);
+	const firstSave = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	// A duplicate request on the same (already in-flight) revision records one intent.
+	void session.save();
+	firstCommit.resolve({
+		status: "saved",
+		operationId: "op-a",
+		hash: "hash-a",
+		snapshotRevision: 2,
+		bytes: 5,
+	});
+	await firstSave;
+	// After the receipt, the buffer equals the saved baseline — no second attempt starts.
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(sessionDirty(session.state)).toBe(false);
+});
+
+test("a repeat at the in-flight revision never auto-saves text typed afterwards", async () => {
+	const { session, api, change, encode } = await setup();
+	change("first");
+	const firstCommit = deferred<EditorCommitResult>();
+	api.commit.mockImplementationOnce(() => firstCommit.promise);
+	const firstSave = session.save();
+	for (let step = 0; step < 10 && !api.commit.mock.calls.length; step++) await Promise.resolve();
+	void session.save();
+	void session.save();
+	change("typed after the shortcut");
+	firstCommit.resolve({
+		status: "saved",
+		operationId: "op-a",
+		hash: "hash-a",
+		snapshotRevision: 2,
+		bytes: 5,
+	});
+	await firstSave;
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	expect(encode).toHaveBeenCalledTimes(1);
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(sessionDirty(session.state)).toBe(true);
+	expect(session.state.baseHash).toBe("hash-a");
+});
+
+test("cancelling an in-flight upload drops the queued intent", async () => {
+	const { session, api, change } = await setup();
+	change("first");
+	const sealed = deferred<Awaited<ReturnType<typeof editorDocumentApi.upload>>>();
+	api.upload.mockImplementationOnce(() => sealed.promise);
+	const saving = session.save();
+	for (let step = 0; step < 10 && !api.upload.mock.calls.length; step++) await Promise.resolve();
+	change("second");
+	void session.save();
+	session.cancel();
+	sealed.resolve({ uploadId: "upload", state: "sealed" });
+	await saving;
+	for (let step = 0; step < 20; step++) await Promise.resolve();
+	expect(api.commit).not.toHaveBeenCalled();
+	expect(api.createUpload).toHaveBeenCalledTimes(1);
+});
+
+test("confirmation path clears the queued intent and never dispatches another write", async () => {
+	const { session, api, change } = await setup();
+	change("first");
+	api.commit.mockRejectedValueOnce(
+		new ApiError("needs confirmation", 409, {
+			code: "NEEDS_CONFIRMATION",
+			confirmationToken: "tok",
+			physicalPath: "/outside",
+		}),
+	);
+	// Attempt once; while server is "deciding" the user mashes Ctrl+S again.
+	await session.save();
+	expect(session.state.confirmation?.code).toBe("NEEDS_CONFIRMATION");
+	expect(session.state.phase).toBe("idle");
+	// Any queued intent that pre-dated the confirmation must NOT trigger another save.
+	await Promise.resolve();
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(api.createUpload).toHaveBeenCalledTimes(1);
+});
+
+test("stale-write conflict clears any queued intent and never auto-resaves", async () => {
+	const { session, api, change } = await setup();
+	change("first");
+	api.commit.mockRejectedValueOnce(
+		new ApiError("stale", 409, {
+			code: "STALE_WRITE",
+			currentHash: "new-hash",
+			conflictVersionHandle: "conflict-v1",
+			encoding: "utf-8",
+			size: 10,
+		}),
+	);
+	const slowCommit = api.commit.mock;
+	void session.save();
+	// Queue multiple extra intents while save is still forming its single attempt.
+	void session.save();
+	void session.save();
+	for (let step = 0; step < 10 && !slowCommit.calls.length; step++) await Promise.resolve();
+	for (let step = 0; step < 10 && session.state.conflict === null; step++) await Promise.resolve();
+	expect(session.state.conflict?.code).toBe("STALE_WRITE");
+	expect(api.commit).toHaveBeenCalledTimes(1);
+});
+
+test("500 error leaves the attempt in unknown and no queued save continues automatically", async () => {
+	const { session, api, change } = await setup();
+	change("first");
+	api.commit.mockRejectedValueOnce(new ApiError("boom", 500));
+	void session.save();
+	// Request a second save while the error is in flight.
+	void session.save();
+	for (let step = 0; step < 20 && session.state.phase !== "unknown"; step++)
+		await Promise.resolve();
+	expect(session.state.phase).toBe("unknown");
+	expect(api.commit).toHaveBeenCalledTimes(1);
+});

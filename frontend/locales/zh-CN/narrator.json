@@ -1478,6 +1478,8 @@
 	"fileEditor.languageUnavailable": "当前语言暂不支持语法着色。",
 	"fileEditor.saveTask": "正在保存固定版本的快照，你可以继续编辑。",
 	"fileEditor.cancelTask": "取消任务",
+	"fileEditor.externalDiskModified": "此文件已在磁盘上被修改。草稿和撤销历史已保留；保存时会先显示冲突。",
+	"fileEditor.externalDiskDeleted": "此文件已从磁盘删除。草稿已保留；保存时会先显示冲突。",
 	"fileEditor.unknownSave": "保存结果需要核对。草稿已保留，核对前不能再次保存。",
 	"fileEditor.checkSave": "检查保存结果",
 	"fileEditor.receiptMismatch": "保存回执的文档版本不匹配，请先核对保存结果再重试。",

@@ -194,8 +194,32 @@ browserTest.each([false, true, "cache", "draft"] as const)(
 					});
 					let commits = 0,
 						dropNextReply = false,
-						denyReceiptQueries = false;
+						denyReceiptQueries = false,
+						diskProbes = 0;
+					// Cache scenario: hold ONE chosen commit at a real-route barrier.
+					let holdCommit: { entered: () => void; release: Promise<void> } | undefined;
+					const cacheUploads: { baseHash: string | null; status: number }[] = [];
 					app.use("/api/narrators/*", async (c, next) => {
+						if (c.req.path.endsWith("/disk-state")) diskProbes++;
+						if (hostGate === "cache" && c.req.method === "POST" && c.req.path.endsWith("/uploads"))
+							cacheUploads.push({
+								baseHash: ((await c.req.raw.clone().json()) as { baseHash: string | null })
+									.baseHash,
+								status: 0,
+							});
+						if (hostGate === "cache" && c.req.method === "POST" && c.req.path.endsWith("/commit")) {
+							commits++;
+							const hold = holdCommit;
+							holdCommit = undefined;
+							if (hold) {
+								hold.entered();
+								await bounded(hold.release);
+							}
+							await next();
+							const last = cacheUploads.at(-1);
+							if (last) last.status = c.res.status;
+							return;
+						}
 						if (denyReceiptQueries && c.req.path.includes("/editor-operations/"))
 							return c.json(
 								{ error: "Fixture receipt transport unavailable", code: "FIXTURE_RECEIPT_OFFLINE" },
@@ -359,6 +383,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					let workerCount = 0;
 					let contentResponses = 0;
 					let httpErrors = 0;
+					const httpErrorUrls: string[] = [];
 					let receiptQueries = 0;
 					let recoveryScopes = 0;
 					let documentCreates = 0;
@@ -391,7 +416,13 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						workerCount++;
 					});
 					page.on("response", (response) => {
-						if (response.status() >= 400) httpErrors++;
+						if (response.status() >= 400) {
+							httpErrors++;
+							if (httpErrorUrls.length < 16)
+								httpErrorUrls.push(
+									`${response.status()} ${new URL(response.url()).pathname.replace(/[a-f0-9-]{36}/g, ":id")}`,
+								);
+						}
 						if (response.status() >= 400 && response.url().includes("/file-references/info?"))
 							infoFailures++;
 						if (response.url().includes("/content?version=") && response.status() === 200)
@@ -475,15 +506,38 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 							"./editor-cache-browser-acceptance"
 						);
 						await bounded(
-							editorCacheBrowserAcceptance(page, documents, join(root, "transfers"), () => ({
-								documentCreates,
-								contentResponses,
-								recoveryScopes,
-								metadataRequests,
-							})),
+							editorCacheBrowserAcceptance(
+								page,
+								documents,
+								join(root, "transfers"),
+								() => ({
+									documentCreates,
+									contentResponses,
+									recoveryScopes,
+									metadataRequests,
+								}),
+								{
+									workspace,
+									uploads: () => [...cacheUploads],
+									diskProbes: () => diskProbes,
+									holdNextCommit: () => {
+										const entered = deferred();
+										const release = deferred();
+										holdCommit = { entered: entered.resolve, release: release.promise };
+										return { entered: entered.promise, release: release.resolve };
+									},
+									revoke: (revoked) => {
+										activeUser = revoked ? intruderId : userId;
+									},
+								},
+							),
 						);
 						expect(diagnostics).toEqual([]);
-						expect(httpErrors).toBe(0);
+						// Exactly the revoked-principal probe is refused; nothing else fails.
+						expect(httpErrorUrls).toEqual([
+							`404 /api/narrators/${narratorId}/editor-documents/:id/disk-state`,
+						]);
+						expect(httpErrors).toBe(1);
 						expect(offOriginCount).toBe(0);
 						return;
 					}

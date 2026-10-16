@@ -1468,6 +1468,62 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		await create();
 		expect(await bodies()).toHaveLength(0);
 	});
+	test("disk-state reports an unchanged baseline without creating a session or body", async () => {
+		const doc = await create();
+		const before = (service as unknown as { sessions: Map<string, unknown> }).sessions.size;
+		const bodiesBefore = (await bodies()).length;
+		const state = await service.diskState(actor, doc.docId);
+		expect(state).toEqual({
+			exists: true,
+			baseHash: doc.baseHash,
+			encoding: doc.encoding,
+			eol: doc.eol,
+			sourceBytes: doc.sourceBytes,
+			utf8Bytes: doc.utf8Bytes,
+		});
+		expect((service as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(before);
+		expect((await bodies()).length).toBe(bodiesBefore);
+	});
+	test("disk-state reports an external change with the v1 text hash and leaves the baseline", async () => {
+		const doc = await create();
+		await writeFile(target, "external edit\n");
+		const state = await service.diskState(actor, doc.docId);
+		expect(state.exists).toBe(true);
+		if (!state.exists) throw new Error("unreachable");
+		expect(state.baseHash).toBe(hash("external edit\n"));
+		expect(state.baseHash).not.toBe(doc.baseHash);
+		// The saved session baseline still guards uploads against the original version.
+		const uploadId = await upload(doc, "mine\n");
+		const conflict = await failure(() => service.commit(actor, doc.docId, uploadId, {}));
+		expect(conflict.code).toBe("STALE_WRITE");
+	});
+	test("disk-state reports deletion without failing or exposing a path", async () => {
+		const doc = await create();
+		await rm(target);
+		expect(await service.diskState(actor, doc.docId)).toEqual({ exists: false });
+	});
+	test("disk-state reauthorizes after IO: a changed binding cannot publish the observation", async () => {
+		const doc = await create();
+		let calls = 0;
+		const original = actor.authorize;
+		actor.authorize = async (input, need) => {
+			calls++;
+			const binding = await original.call(actor, input, need);
+			// First call (before IO) matches; the post-IO reauthorization sees a new workspace.
+			return calls >= 2 ? { ...binding, contextKey: "rebound" } : binding;
+		};
+		const error = await failure(() => service.diskState(actor, doc.docId));
+		expect(error.code).toBe("EDITOR_IDENTITY_CHANGED");
+		actor.authorize = original;
+	});
+	test("disk-state for an unknown or other user's document is indistinguishable from expired", async () => {
+		const doc = await create();
+		const other: EditorActor = { ...actor, userId: generateId() };
+		const error = await failure(() => service.diskState(other, doc.docId));
+		expect(error.statusCode).toBe(410);
+		const missing = await failure(() => service.diskState(actor, randomUUID()));
+		expect(missing.statusCode).toBe(410);
+	});
 });
 
 describe("editor temporary directory auto-repair", () => {

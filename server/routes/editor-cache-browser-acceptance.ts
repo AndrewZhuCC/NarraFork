@@ -1,8 +1,18 @@
 import { expect } from "bun:test";
-import { readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { Page } from "puppeteer-core";
 import type {} from "../../scripts/smoke-editor-cache-fixture";
 import type { EditorDocumentService } from "../services/editor-document-service";
+
+export interface EditorDiskHost {
+	workspace: string;
+	uploads: () => { baseHash: string | null; status: number }[];
+	diskProbes: () => number;
+	holdNextCommit: () => { entered: Promise<void>; release: () => void };
+	revoke: (revoked: boolean) => void;
+}
 
 export async function editorCacheBrowserAcceptance(
 	page: Page,
@@ -14,6 +24,7 @@ export async function editorCacheBrowserAcceptance(
 		recoveryScopes: number;
 		metadataRequests: number;
 	},
+	host: EditorDiskHost,
 ) {
 	const state = () => page.evaluate(() => window.__editorCache.snapshot());
 	const wait = (predicate: Parameters<Page["waitForFunction"]>[0]) =>
@@ -193,6 +204,7 @@ export async function editorCacheBrowserAcceptance(
 	// Cached immutable v1 source snapshots are released together with the server documents.
 	expect(transferCached).toBeLessThanOrEqual(transferBaseline + 16);
 	const cachedRequests = requests();
+	await editorDiskStateAcceptance(page, host, state, wait);
 	// Keep split orientation stable when the search toolbar consumes height, so
 	// this regression isolates navigation rather than a legitimate preview reflow.
 	await page.setViewport({ width: 1800, height: 700 });
@@ -445,7 +457,10 @@ export async function editorCacheBrowserAcceptance(
 	for (let attempt = 0; docCount() && attempt < 100; attempt++)
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	expect(docCount()).toBe(0);
-	expect(await files(transferRoot)).toBe(0);
+	// Only the two coalesced saves' bounded durable receipts remain; no bodies/uploads.
+	const leftovers = await readdir(transferRoot);
+	expect(leftovers.filter((name) => !/^ed-[a-f0-9-]+\.json$/.test(name))).toEqual([]);
+	expect(leftovers).toHaveLength(2);
 	console.info(
 		"EDITOR_CACHE_CHROMIUM",
 		JSON.stringify({
@@ -479,6 +494,215 @@ export async function editorCacheBrowserAcceptance(
 				transferCached,
 			},
 			teardown: { docs: docCount(), transfers: await files(transferRoot) },
+		}),
+	);
+}
+
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+type Snapshot = Awaited<ReturnType<Window["__editorCache"]["snapshot"]>>;
+
+/**
+ * Phase 4 through the actual Dockview + FilePanelContent/LargeFileGate host.
+ * External writes use the fixture's real filesystem (no editor apply, no Git).
+ */
+async function editorDiskStateAcceptance(
+	page: Page,
+	host: EditorDiskHost,
+	state: () => Promise<Snapshot>,
+	wait: (predicate: Parameters<Page["waitForFunction"]>[0]) => ReturnType<Page["waitForFunction"]>,
+) {
+	const pane = (id: string) => page.evaluate((id) => window.__editorCache.paneState(id), id);
+	const settle = (ms: number) =>
+		page.evaluate((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)), ms);
+	const ctrlS = async (id: string) => {
+		await page.evaluate((id) => window.__editorCache.focus(id), id);
+		await page.keyboard.down("Control");
+		await page.keyboard.press("s");
+		await page.keyboard.up("Control");
+	};
+	// 1. Every working copy is hidden: zero probes, regardless of external writes.
+	const hiddenFile = join(host.workspace, "cache-3.txt");
+	const hiddenProbes = host.diskProbes();
+	await writeFile(hiddenFile, "hidden external rewrite\n");
+	await settle(1200);
+	expect(host.diskProbes()).toBe(hiddenProbes);
+	expect((await state()).views).toBe(0);
+
+	// 2. Clean visible copy: no-change probe keeps the model and its undo stack.
+	const cleanFile = join(host.workspace, "cache-2.txt");
+	await page.evaluate(() => window.__editorCache.show("file-2"));
+	await wait(() => window.__editorCache.snapshot().panes.some((p) => p.id === "file-2"));
+	// A dirty edit with undo history, then a probe against an unchanged disk.
+	await page.evaluate(() => window.__editorCache.edit("file-2", "U"));
+	const beforeNoChange = await pane("file-2");
+	expect(beforeNoChange.text?.startsWith("Ucache file 2")).toBe(true);
+	const noChangeProbes = (await state()).disk.probes;
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(
+		(n) => window.__editorCache.snapshot().disk.probes > (n as number),
+		{ timeout: 10_000, polling: 50 },
+		noChangeProbes,
+	);
+	await settle(200);
+	const afterNoChange = await pane("file-2");
+	expect(afterNoChange.text).toBe(beforeNoChange.text);
+	expect(afterNoChange.lifetime).toBe(beforeNoChange.lifetime);
+	expect(afterNoChange.hint).toBeNull();
+	expect(await page.evaluate(() => window.__editorCache.canUndo("file-2"))).toBe(true);
+	await page.evaluate(() => window.__editorCache.undo("file-2"));
+	await wait(
+		() => window.__editorCache.paneState("file-2").text?.startsWith("cache file 2") ?? false,
+	);
+	const noChangeReloads = (await state()).disk.reloads;
+	expect(noChangeReloads).toBe(0);
+
+	// 3. Clean visible copy changed by an external writer: refresh in place,
+	// keeping cursor/scroll and the same Monaco view.
+	await page.evaluate(() => window.__editorCache.position("file-2", 40, 600));
+	const beforeRefresh = await pane("file-2");
+	const original = await readFile(cleanFile, "utf8");
+	const external = `EXTERNAL BASH WRITE\n${original.split("\n").slice(1).join("\n")}`;
+	await writeFile(cleanFile, external);
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(
+		(prefix) =>
+			window.__editorCache.paneState("file-2").text?.startsWith(prefix as string) ?? false,
+		{ timeout: 10_000, polling: 50 },
+		"EXTERNAL BASH WRITE",
+	);
+	const refreshed = await pane("file-2");
+	expect(refreshed.text).toBe(external);
+	expect(refreshed.lifetime).toBe(beforeRefresh.lifetime);
+	expect(refreshed.position).toEqual(beforeRefresh.position);
+	expect(refreshed.scroll).toBeCloseTo(beforeRefresh.scroll, 0);
+	expect(refreshed.hint).toBeNull();
+	expect((await state()).disk.reloads).toBe(noChangeReloads + 1);
+	expect((await state()).registry.pinReasons.dirty).toBe(1); // only the twenty-mib draft
+
+	// 4. Dirty visible copy: external change only produces a hint.
+	await page.evaluate(() => window.__editorCache.edit("file-2", "MY DRAFT "));
+	await writeFile(cleanFile, "SECOND EXTERNAL WRITE\n");
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(() => window.__editorCache.paneState("file-2").hint === "modified", {
+		timeout: 10_000,
+		polling: 50,
+	});
+	const dirty = await pane("file-2");
+	expect(dirty.text).toBe(`MY DRAFT ${external}`);
+	expect(await page.evaluate(() => window.__editorCache.canUndo("file-2"))).toBe(true);
+
+	// 5. Deletion while dirty: hint changes, draft retained, no write.
+	const uploadsBeforeDelete = host.uploads().length;
+	await rm(cleanFile);
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(() => window.__editorCache.paneState("file-2").hint === "deleted", {
+		timeout: 10_000,
+		polling: 50,
+	});
+	expect((await pane("file-2")).text).toBe(`MY DRAFT ${external}`);
+	expect(host.uploads().length).toBe(uploadsBeforeDelete);
+	expect(await Bun.file(cleanFile).exists()).toBe(false);
+	// Recreate externally: the dirty draft stays a draft (hint back to modified).
+	await writeFile(cleanFile, "RECREATED\n");
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(() => window.__editorCache.paneState("file-2").hint === "modified", {
+		timeout: 10_000,
+		polling: 50,
+	});
+	expect((await pane("file-2")).text).toBe(`MY DRAFT ${external}`);
+
+	// 6. Undo to the clean baseline, then a revoked principal must not refresh it.
+	await page.evaluate(() => window.__editorCache.undo("file-2"));
+	await wait(() => window.__editorCache.paneState("file-2").text?.startsWith("EXTERNAL") ?? false);
+	const reloadsBeforeRevoke = (await state()).disk.reloads;
+	// Disk differs from the clean baseline, so ONLY revocation can prevent a refresh.
+	await writeFile(cleanFile, "WRITTEN WHILE REVOKED\n");
+	host.revoke(true);
+	// Read the counter BEFORE the wake-up: focus starts the probe synchronously.
+	const revokedProbes = (await state()).disk.probes;
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(
+		(n) => window.__editorCache.snapshot().disk.probes > (n as number),
+		{ timeout: 10_000, polling: 50 },
+		revokedProbes,
+	);
+	await settle(300);
+	host.revoke(false);
+	expect((await pane("file-2")).text).toBe(external);
+	expect((await state()).disk.reloads).toBe(reloadsBeforeRevoke);
+
+	// 7. Slow save A, type B, mash Ctrl+S: exactly A then B, B based on A's receipt.
+	await writeFile(cleanFile, external);
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await page.waitForFunction(() => window.__editorCache.paneState("file-2").hint === null, {
+		timeout: 10_000,
+		polling: 50,
+	});
+	const uploadsBefore = host.uploads().length;
+	await page.evaluate(() => window.__editorCache.edit("file-2", "A:"));
+	const draftA = `A:${external}`;
+	const held = host.holdNextCommit();
+	await ctrlS("file-2");
+	await held.entered;
+	await page.evaluate(() => window.__editorCache.edit("file-2", "B:"));
+	for (let press = 0; press < 4; press++) await ctrlS("file-2");
+	// Same-revision presses while saving and a focus probe during the slow commit.
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await settle(300);
+	expect(host.uploads().length).toBe(uploadsBefore + 1);
+	expect(await readFile(cleanFile, "utf8")).toBe(external);
+	held.release();
+	const draftB = `B:${draftA}`;
+	// Durable bytes land before the HTTP reply: wait for the recorded commit response.
+	for (
+		let attempt = 0;
+		attempt < 150 && host.uploads()[uploadsBefore + 1]?.status !== 200;
+		attempt++
+	)
+		await settle(50);
+	expect(await readFile(cleanFile, "utf8")).toBe(draftB);
+	const saves = host.uploads().slice(uploadsBefore);
+	expect(saves).toHaveLength(2);
+	expect(saves.map((save) => save.status)).toEqual([200, 200]);
+	expect(saves[0]?.baseHash).toBe(sha256(external));
+	expect(saves[1]?.baseHash).toBe(sha256(draftA));
+	// No further request after the queued intent: typing more never auto-saves.
+	await page.evaluate(() => window.__editorCache.edit("file-2", "C:"));
+	await settle(800);
+	expect(host.uploads().length).toBe(uploadsBefore + 2);
+	expect((await pane("file-2")).hint).toBeNull();
+	await page.evaluate(() => window.__editorCache.undo("file-2"));
+	await wait(() => window.__editorCache.snapshot().registry.pinReasons.dirty === 1);
+
+	// 8. Hide everything again: the probe counter stops.
+	await page.evaluate(() => {
+		window.__editorCache.show("blank-left");
+		window.__editorCache.show("blank-right");
+	});
+	await wait(() => window.__editorCache.snapshot().views === 0);
+	const hiddenAgain = host.diskProbes();
+	await writeFile(cleanFile, "WHILE HIDDEN\n");
+	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+	await settle(1200);
+	expect(host.diskProbes()).toBe(hiddenAgain);
+	await writeFile(cleanFile, draftB);
+	const final = await state();
+	console.info(
+		"EDITOR_DISK_STATE_CHROMIUM",
+		JSON.stringify({
+			tabs: final.tabs,
+			workingCopies: final.registry.workingCopies,
+			diskEntries: final.disk.entries,
+			probes: final.disk.probes,
+			reloads: final.disk.reloads,
+			discarded: final.disk.discarded,
+			hostProbes: host.diskProbes(),
+			hiddenProbeDelta: 0,
+			coalescedUploads: saves.length,
+			baseHashChain: [saves[0]?.baseHash?.slice(0, 8), saves[1]?.baseHash?.slice(0, 8)],
+			cleanRefreshKeptView: true,
+			dirtyHintOnly: true,
+			deletedHintOnly: true,
 		}),
 	);
 }

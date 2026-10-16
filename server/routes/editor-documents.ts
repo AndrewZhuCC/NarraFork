@@ -279,6 +279,16 @@ export function createEditorDocumentRoutes(
 			),
 		),
 	);
+	routes.get(`${base}/:docId/disk-state`, async (c) => {
+		const state = await getService().diskState(
+			editorActor(c),
+			c.req.param("docId"),
+			c.req.raw.signal,
+		);
+		// Reauthorization boundary: a revoked narrator cannot publish a late disk observation.
+		await protect(c);
+		return c.json(state);
+	});
 	routes.get(`${base}/:docId/content`, async (c) => {
 		const version = c.req.query("version");
 		if (!version || version.length > 128)

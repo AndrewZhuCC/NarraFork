@@ -13,6 +13,7 @@ import type { editor } from "monaco-editor";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { editorDiskStateRegistry } from "../frontend/components/narrator/file-editor/editor-disk-state";
 import { editorDocumentRegistry } from "../frontend/components/narrator/file-editor/editor-document-registry";
 import { editorDraftScheduler } from "../frontend/components/narrator/file-editor/editor-draft-checkpoint";
 import {
@@ -151,6 +152,7 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 					...editorDraftScheduler.diagnostics(),
 				},
 				...getEditorViewDiagnostics(),
+				disk: { ...editorDiskStateRegistry.diagnostics, entries: editorDiskStateRegistry.size },
 				monacoModels: monaco.editor.getModels().length,
 				workers: getEditorWorkerDiagnostics(),
 				panes: [...views].map((view) => ({
@@ -226,6 +228,27 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 		},
 		undo(id: string) {
 			viewFor(id).trigger("fixture", "undo", null);
+		},
+		canUndo(id: string) {
+			const model = viewFor(id).getModel() as
+				| (editor.ITextModel & { canUndo?: () => boolean })
+				| null;
+			return !!model?.canUndo?.();
+		},
+		paneState(id: string) {
+			const view = viewFor(id);
+			const pane = document.querySelector(`[data-cache-pane="${id}"]`);
+			return {
+				lifetime: lifetimes.get(view),
+				text: view.getModel()?.getValue() ?? null,
+				position: view.getPosition(),
+				scroll: view.getScrollTop(),
+				hint:
+					pane?.querySelector<HTMLElement>("[data-editor-external-disk]")?.dataset
+						.editorExternalDisk ?? null,
+				readOnly: !!view.getOption(monaco.editor.EditorOption.readOnly),
+				session: editorDiskStateRegistry.inspect(view.getModel()),
+			};
 		},
 		redo(id: string) {
 			viewFor(id).trigger("fixture", "redo", null);

@@ -131,3 +131,22 @@ export interface EditorConfirmationData {
 	physicalPath: string;
 	confirmationToken: string;
 }
+
+/**
+ * Bounded identity probe for an authorized editor document's disk source.
+ *
+ * Does not open a new session, does not read file bytes to the client, and never
+ * modifies the saved baseline. `baseHash` uses the same v1 hashing domain as
+ * {@link EditorDocumentDescriptor.baseHash} so a client can compare without
+ * re-reading the document.
+ */
+export type EditorDiskState =
+	| { exists: false }
+	| {
+			exists: true;
+			baseHash: string;
+			encoding: string;
+			eol: "LF" | "CRLF" | "CR";
+			sourceBytes: number;
+			utf8Bytes: number;
+	  };

@@ -44,6 +44,8 @@ export interface EditorSessionState {
 	restoredDiskChanged?: boolean;
 	confirmation: EditorConfirmationData | null;
 	conflict: (EditorConflictData & { docId: string }) | null;
+	/** Advisory observation only; never a baseline. Cleared whenever baseHash moves. */
+	externalDisk?: "modified" | "deleted" | null;
 }
 export function sessionDirty(state: EditorSessionState): boolean {
 	return (
@@ -130,6 +132,15 @@ export class EditorDocumentSession {
 	private baselineLength = -1;
 	private baselineGeneration = 0;
 	private receiptQuery: Promise<void> | null = null;
+	/**
+	 * At most one explicit user-requested save intent queued while an immutable attempt
+	 * runs. Not a buffer of edits: only the next successful receipt may consume it, and
+	 * then only if the latest revision still differs from the newly saved baseline.
+	 */
+	private pendingIntent = false;
+	private clearPendingIntent() {
+		this.pendingIntent = false;
+	}
 	constructor(private options: EditorSessionOptions) {
 		this.api = options.api ?? editorDocumentApi;
 	}
@@ -139,8 +150,27 @@ export class EditorDocumentSession {
 	}
 	private update(patch: Partial<EditorSessionState>) {
 		if (this.disposed || this.state.invalidated) return;
-		this.state = { ...this.state, ...patch };
+		const rebased = "baseHash" in patch && patch.baseHash !== this.state.baseHash;
+		this.state = { ...this.state, ...(rebased ? { externalDisk: null } : {}), ...patch };
 		this.options.onChange(this.state);
+	}
+	setExternalDisk(next: "modified" | "deleted" | null) {
+		if ((this.state.externalDisk ?? null) !== next) this.update({ externalDisk: next });
+	}
+	/** Reauthorize an expired document id while keeping the draft and old baseline. */
+	async refreshDocument(): Promise<boolean> {
+		if (this.attempt || this.state.phase !== "idle" || this.loadController) return false;
+		const controller = new AbortController();
+		this.loadController = controller;
+		try {
+			await this.recover(controller.signal);
+			return this.loadController === controller;
+		} catch (error) {
+			if (this.loadController === controller) this.authorizationFailed(error);
+			return false;
+		} finally {
+			if (this.loadController === controller) this.loadController = null;
+		}
 	}
 	private resetBaseline(version: DocumentVersion | null, source?: Blob) {
 		this.baselineController.abort();
@@ -170,6 +200,10 @@ export class EditorDocumentSession {
 			return digest;
 		}
 		return (this.options.hash ?? hashEditorSnapshot)(source, signal);
+	}
+	/** Current authorized document id, if any. Used ONLY for identity-probe reads. */
+	get documentId(): string | undefined {
+		return this.document?.docId;
 	}
 	/** Explicit idle/background verification only: change() never reads or hashes document text. */
 	async verifyEquivalent(signal: AbortSignal) {
@@ -249,6 +283,7 @@ export class EditorDocumentSession {
 	}
 	invalidate(reason: string) {
 		if (this.state.invalidated) return;
+		this.clearPendingIntent();
 		const dispatched = this.state.phase === "committing" || this.state.phase === "unknown";
 		if (!dispatched) this.cancel();
 		this.update({
@@ -356,26 +391,36 @@ export class EditorDocumentSession {
 				: {}),
 		});
 	}
-	async load() {
-		if (this.state.phase !== "idle" || this.disposed || this.state.invalidated) return;
+	/**
+	 * `background` is the disk-state refresh of a clean document: it never makes the
+	 * view read-only, never preempts an explicit load, and silently yields (returns
+	 * false) if the user edits before the fresh source is installed.
+	 */
+	async load(background = false): Promise<boolean> {
+		if (this.state.phase !== "idle" || this.disposed || this.state.invalidated) return false;
+		if (background && (this.loadController || sessionDirty(this.state))) return false;
 		this.loadController?.abort();
 		const controller = new AbortController();
 		this.loadController = controller;
 		const revision = this.state.version?.revision;
-		this.update({ loading: true, error: null });
+		if (!background) this.update({ loading: true, error: null });
 		let next: EditorDocumentDescriptor | null = null;
+		let installed = false;
+		const changedDuringReload = () => {
+			if (background) controller.abort();
+			return new Error(
+				this.text(
+					"changedDuringReload",
+					"The draft changed while reloading. Your edits were preserved.",
+				),
+			);
+		};
 		try {
 			if (this.options.readOnlySource) {
 				const source = await this.options.readOnlySource(controller.signal);
 				controller.signal.throwIfAborted();
-				if (this.disposed || this.loadController !== controller) return;
-				if (revision !== this.state.version?.revision)
-					throw new Error(
-						this.text(
-							"changedDuringReload",
-							"The draft changed while reloading. Your edits were preserved.",
-						),
-					);
+				if (this.disposed || this.loadController !== controller) return false;
+				if (revision !== this.state.version?.revision) throw changedDuringReload();
 				const version = this.options.applyContent(source.content.replace(/\r\n?/g, "\n"));
 				this.resetBaseline(version);
 				this.update({
@@ -388,7 +433,7 @@ export class EditorDocumentSession {
 					conflict: null,
 					confirmation: null,
 				});
-				return;
+				return true;
 			}
 			let text: string;
 			for (let retry = 0; ; retry++) {
@@ -396,7 +441,9 @@ export class EditorDocumentSession {
 					controller.signal.throwIfAborted();
 					next = await this.authorize(controller.signal);
 					controller.signal.throwIfAborted();
-					if (this.disposed || this.loadController !== controller) return;
+					if (this.disposed || this.loadController !== controller) return false;
+					// A background refresh stops as soon as the clean document becomes a draft.
+					if (background && revision !== this.state.version?.revision) throw changedDuringReload();
 					text = await this.api.source(
 						this.options.narratorId,
 						next.docId,
@@ -421,14 +468,10 @@ export class EditorDocumentSession {
 				}
 			}
 			controller.signal.throwIfAborted();
-			if (this.disposed || this.loadController !== controller) return;
-			if (revision !== this.state.version?.revision)
-				throw new Error(
-					this.text(
-						"changedDuringReload",
-						"The draft changed while reloading. Your edits were preserved.",
-					),
-				);
+			if (this.disposed || this.loadController !== controller) return false;
+			if (revision !== this.state.version?.revision) throw changedDuringReload();
+			// The install below is synchronous: no edit or save can interleave after this check.
+			if (background && (this.state.phase !== "idle" || this.attempt)) return false;
 			this.cancel();
 			const old = this.document;
 			this.document = next;
@@ -445,23 +488,26 @@ export class EditorDocumentSession {
 				conflict: null,
 				confirmation: null,
 			});
+			installed = true;
 			if (old) this.release(old.docId);
 		} catch (error) {
 			if (this.loadController === controller && !this.disposed && this.authorizationFailed(error))
-				return;
-			if (this.loadController === controller && !this.disposed)
+				return false;
+			if (this.loadController === controller && !this.disposed && !background)
 				this.update({ error: message(error) });
 		} finally {
 			if (next) this.release(next.docId);
 			if (this.loadController === controller) {
 				this.loadController = null;
-				this.update({ loading: false });
+				if (!background) this.update({ loading: false });
 			}
 		}
+		return installed;
 	}
 	private settle(result: EditorSaveResult, attempt: Attempt) {
 		if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
 		if (result.snapshotRevision !== attempt.version.revision) {
+			this.clearPendingIntent();
 			this.update({
 				phase: "unknown",
 				error: this.text(
@@ -483,15 +529,24 @@ export class EditorDocumentSession {
 			confirmation: null,
 			conflict: null,
 		});
+		// One queued user intent may chain only after a confirmed receipt updates the
+		// baseline. A fresh snapshot captures the newest keystrokes; nothing is replayed.
+		if (this.pendingIntent) {
+			this.pendingIntent = false;
+			if (sessionCanSave(this.state)) void this.save();
+		}
 	}
 	async save() {
-		if (
-			!sessionCanSave(this.state) ||
-			this.attempt ||
-			!this.options.narratorId ||
-			this.options.readOnlySource
-		)
+		if (!this.options.narratorId || this.options.readOnlySource) return;
+		// An in-flight attempt owns an immutable snapshot: queue at most one explicit
+		// intent and let settle() start the next capture against the saved baseline.
+		if (this.attempt) {
+			// A repeat at the attempt's own revision is the same save, not a new request.
+			if (this.state.version && this.state.version.revision !== this.attempt.version.revision)
+				this.pendingIntent = true;
 			return;
+		}
+		if (!sessionCanSave(this.state)) return;
 		let snapshot: EditorTextSnapshot;
 		try {
 			snapshot = this.options.snapshot();
@@ -556,6 +611,7 @@ export class EditorDocumentSession {
 		} catch (error) {
 			if (this.attempt === attempt && this.authorizationFailed(error)) return;
 			if (this.attempt === attempt && this.state.phase !== "unknown") {
+				this.clearPendingIntent();
 				this.cancel();
 				this.update({ error: message(error) });
 			}
@@ -583,6 +639,7 @@ export class EditorDocumentSession {
 			attempt.operationId = result.operationId;
 			if (result.status === "saved") this.settle(result, attempt);
 			else if (!this.state.invalidated) {
+				this.clearPendingIntent();
 				this.update({ phase: "unknown" });
 				await this.reconcile();
 			}
@@ -599,6 +656,7 @@ export class EditorDocumentSession {
 				data?.code === "EDITOR_DRAFT_PROVENANCE_UNAVAILABLE" ||
 				data?.code === "EDITOR_DRAFT_ANCHOR_LIMIT"
 			) {
+				this.clearPendingIntent();
 				this.cancel(true);
 				this.update({
 					error: this.text(
@@ -613,6 +671,7 @@ export class EditorDocumentSession {
 				return;
 			}
 			if (data?.code === "NEEDS_CONFIRMATION") {
+				this.clearPendingIntent();
 				if (this.state.version?.revision !== attempt.version.revision) {
 					this.cancel(true);
 					this.update({
@@ -625,6 +684,7 @@ export class EditorDocumentSession {
 				return;
 			}
 			if (data?.code === "STALE_WRITE") {
+				this.clearPendingIntent();
 				this.attempt = null;
 				this.update({
 					phase: "idle",
@@ -634,10 +694,12 @@ export class EditorDocumentSession {
 			}
 			// After dispatch, a transport/5xx/expiry failure is not proof that the disk was untouched.
 			if (!(error instanceof ApiError) || error.status >= 500 || expired(error)) {
+				this.clearPendingIntent();
 				this.update({ phase: "unknown", error: message(error) });
 				await this.reconcile();
 				return;
 			}
+			this.clearPendingIntent();
 			this.cancel(true);
 			this.update({ error: message(error) });
 		}
@@ -794,6 +856,7 @@ export class EditorDocumentSession {
 					if (operation.status === "saved" && operation.result)
 						this.settle(operation.result, attempt);
 					else if (operation.status === "failed") {
+						this.clearPendingIntent();
 						this.attempt = null;
 						this.update({ phase: "idle", error: operation.error?.message ?? "Save failed" });
 					} else
@@ -843,10 +906,12 @@ export class EditorDocumentSession {
 			!verifiedUncommitted &&
 			(this.state.phase === "committing" || this.state.phase === "unknown")
 		) {
+			this.clearPendingIntent();
 			this.attempt?.controller.abort();
 			this.update({ phase: "unknown" });
 			return;
 		}
+		this.clearPendingIntent();
 		const attempt = this.attempt;
 		this.attempt = null;
 		attempt?.controller.abort();
@@ -968,6 +1033,7 @@ export class EditorDocumentSession {
 	}
 	dispose() {
 		this.disposed = true;
+		this.clearPendingIntent();
 		this.resetBaseline(null);
 		this.loadController?.abort();
 		this.attempt?.controller.abort();

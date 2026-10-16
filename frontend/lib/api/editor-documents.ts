@@ -9,6 +9,7 @@ import {
 	EDITOR_TRANSFER_MAX_BYTES,
 	type EditorCommitInput,
 	type EditorCommitResult,
+	type EditorDiskState,
 	type EditorDocumentDescriptor,
 	type EditorDraftAnchorDescriptor,
 	type EditorOperationResult,
@@ -222,6 +223,14 @@ export const editorDocumentApi = {
 	},
 	create(narratorId: string, input: CreateEditorDocumentInput, signal?: AbortSignal) {
 		return metadata<EditorDocumentDescriptor>(base(narratorId), "POST", input, signal);
+	},
+	diskState(narratorId: string, docId: string, signal?: AbortSignal) {
+		return metadata<EditorDiskState>(
+			`${documentPath(narratorId, docId)}/disk-state`,
+			"GET",
+			undefined,
+			signal,
+		);
 	},
 	async source(
 		narratorId: string,

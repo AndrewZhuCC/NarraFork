@@ -60,6 +60,7 @@ import {
 	editorRecoveryScopeIdentity,
 	useEditorRecoveryHost,
 } from "./EditorRecoveryBoundary";
+import { editorDiskStateRegistry } from "./editor-disk-state";
 import { type EditorDocumentLease, editorDocumentRegistry } from "./editor-document-registry";
 import {
 	type EditorMode,
@@ -164,6 +165,22 @@ function FileEditorBinding(props: FileEditorContentProps) {
 	useLayoutEffect(() => {
 		if (copy === leaseRef.current?.copy) leaseRef.current?.setVisible(retainedView);
 	}, [retainedView, copy]);
+	// One shared disk-state entry per working copy; only a foreground view probes.
+	const diskView = useRef<ReturnType<typeof editorDiskStateRegistry.attach> | null>(null);
+	const visibleRef = useRef(visible);
+	visibleRef.current = visible;
+	useEffect(() => {
+		if (!copy) return;
+		const view = editorDiskStateRegistry.attach(copy, visibleRef.current);
+		diskView.current = view;
+		return () => {
+			view.detach();
+			if (diskView.current === view) diskView.current = null;
+		};
+	}, [copy]);
+	useEffect(() => {
+		diskView.current?.setVisible(visible);
+	}, [visible]);
 	useEffect(() => {
 		if (!visible && !copy && !leaseRef.current) {
 			controllerRef.current?.abort();
@@ -415,6 +432,8 @@ function FileEditorDocument({
 			workingCopy.onWillApply(() => {
 				const view = editorRef.current?.getEditor();
 				const scrollTop = view?.getScrollTop?.();
+				// setValue resets cursor/selection; reinstall this view's own state afterwards.
+				const saved = view?.saveViewState?.() ?? null;
 				editorSelectionRef.current = null;
 				publishSelectionRef.current?.(null);
 				const el = previewScrollRef.current;
@@ -426,6 +445,7 @@ function FileEditorDocument({
 					);
 				previewScrollFraction.current = previewLastScrollFraction.current;
 				return () => {
+					if (saved) view?.restoreViewState?.(saved);
 					if (scrollTop != null) view?.setScrollTop?.(scrollTop);
 					if (modeRef.current !== "raw") regeneratePreviewRef.current();
 					else {
@@ -1110,6 +1130,15 @@ function FileEditorDocument({
 						{t("fileEditor.cancelTask", { defaultValue: "Cancel task" })}
 					</Button>
 				</Group>
+			)}
+			{state.externalDisk && !conflict && (
+				<Alert color="yellow" radius={0} data-editor-external-disk={state.externalDisk}>
+					<Text size="xs">
+						{state.externalDisk === "deleted"
+							? t("fileEditor.externalDiskDeleted")
+							: t("fileEditor.externalDiskModified")}
+					</Text>
+				</Alert>
 			)}
 			{state.phase === "unknown" && (
 				<Alert color="yellow" radius={0}>

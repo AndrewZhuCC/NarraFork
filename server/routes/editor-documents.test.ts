@@ -956,6 +956,46 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		expect((await request(`${url}/commit`, "POST", {})).status).toBe(403);
 		expect(await readFile(path, "utf8")).toBe("original\r\n");
 	});
+	test("disk-state returns bounded identity metadata, no body, and no new session", async () => {
+		const doc = await openDoc();
+		const sessions = (service as unknown as { sessions: Map<string, unknown> }).sessions;
+		const before = sessions.size;
+		const unchanged = await request(`${base()}/${doc.docId}/disk-state`);
+		expect(unchanged.status).toBe(200);
+		expect(unchanged.headers.get("cache-control")).toBe("no-store");
+		const body = await unchanged.text();
+		expect(body.length).toBeLessThan(512);
+		expect(body).not.toContain("original");
+		expect(JSON.parse(body)).toEqual({
+			exists: true,
+			baseHash: doc.baseHash,
+			encoding: doc.encoding,
+			eol: doc.eol,
+			sourceBytes: doc.sourceBytes,
+			utf8Bytes: doc.utf8Bytes,
+		});
+		await writeFile(path, "changed externally\n");
+		const changed = (await (await request(`${base()}/${doc.docId}/disk-state`)).json()) as {
+			baseHash: string;
+		};
+		expect(changed.baseHash).not.toBe(doc.baseHash);
+		await rm(path);
+		expect(await (await request(`${base()}/${doc.docId}/disk-state`)).json()).toEqual({
+			exists: false,
+		});
+		expect(sessions.size).toBe(before);
+	});
+	test("disk-state rechecks ACL and cwd binding for an existing session", async () => {
+		const doc = await openDoc();
+		tokenUser = "different-user";
+		expect((await request(`${base()}/${doc.docId}/disk-state`)).status).toBe(404);
+		tokenUser = userId;
+		db.update(narrators)
+			.set({ cwd: testEnvironment.isolatedHome })
+			.where(eq(narrators.id, narratorId))
+			.run();
+		expect((await request(`${base()}/${doc.docId}/disk-state`)).status).toBe(403);
+	});
 	test("read visibility never grants write and remote never falls back to local", async () => {
 		const doc = await openDoc();
 		db.update(narrators)

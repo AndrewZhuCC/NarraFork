@@ -38,6 +38,7 @@ export interface EditorVersionMetadata {
 export type EditorWorkerRequest =
 	| { action: "metadata"; sourcePath: string }
 	| { action: "content"; sourcePath: string; metadata: EditorVersionMetadata }
+	| { action: "disk-state"; sourcePath: string }
 	| { action: "seal"; path: string }
 	| {
 			action: "prepare";
@@ -58,6 +59,7 @@ export type EditorWorkerRequest =
 	| { action: "cleanup"; root: string };
 export type EditorWorkerResult =
 	| { kind: "source"; metadata: EditorVersionMetadata }
+	| { kind: "disk-state"; metadata: EditorVersionMetadata | null }
 	| { kind: "content"; bytes: Uint8Array }
 	| { kind: "sealed"; bytes: number; digest: string }
 	| { kind: "prepared"; nextBytes: Uint8Array; hash: string; bytes: number }
@@ -237,6 +239,30 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 			}
 		}
 		return { kind: "cleaned", operations };
+	}
+	if (request.action === "disk-state") {
+		// Bounded identity probe only. Never allocates a session; never streams body bytes
+		// back to the client; result is NOT installed as a new baseline server-side.
+		let source: Uint8Array;
+		try {
+			source = await boundedRead(request.sourcePath, EDITOR_FILE_MAX_BYTES, true);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				return { kind: "disk-state", metadata: null };
+			throw error;
+		}
+		const decoded = decode(source);
+		const text = normalized(decoded.text);
+		const metadata: EditorVersionMetadata = {
+			baseHash: hash(decoded.text),
+			encoding: decoded.encoding,
+			eol: eolOf(decoded.text),
+			sourceBytes: source.byteLength,
+			utf8Bytes: Buffer.byteLength(text, "utf8"),
+		};
+		if (metadata.utf8Bytes > EDITOR_TRANSFER_MAX_BYTES)
+			fail("Normalized source exceeds transfer budget");
+		return { kind: "disk-state", metadata };
 	}
 	if (request.action === "metadata" || request.action === "content") {
 		const source = await boundedRead(request.sourcePath, EDITOR_FILE_MAX_BYTES, true);

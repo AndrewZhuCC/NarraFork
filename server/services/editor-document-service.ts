@@ -525,6 +525,38 @@ export class EditorDocumentService {
 			if (session.closing) await this.release(session);
 		}
 	}
+	/**
+	 * Authorized identity probe for a document's live disk source.
+	 *
+	 * Reuses the bounded two-track metadata worker. Never allocates a new session,
+	 * never streams body bytes to the caller, and never advances the stored baseline.
+	 * Reauthorization is applied before AND after the worker completes so a revoked
+	 * narrator or rebound workspace cannot publish an older observation.
+	 */
+	async diskState(
+		actor: EditorActor,
+		docId: string,
+		signal?: AbortSignal,
+	): Promise<import("../../shared/editor-document").EditorDiskState> {
+		const { binding } = await this.bound(actor, docId, "read");
+		const result = await this.jobs.run(
+			actor.userId,
+			{ action: "disk-state", sourcePath: binding.canonicalPath },
+			signal,
+		);
+		if (result.kind !== "disk-state") throw invalid("Unexpected disk-state worker response");
+		// bound() itself ends with the closing/sessions guard; it is the publication check.
+		await this.bound(actor, docId, "read");
+		if (!result.metadata) return { exists: false };
+		return {
+			exists: true,
+			baseHash: result.metadata.baseHash,
+			encoding: result.metadata.encoding,
+			eol: result.metadata.eol,
+			sourceBytes: result.metadata.sourceBytes,
+			utf8Bytes: result.metadata.utf8Bytes,
+		};
+	}
 	async content(
 		actor: EditorActor,
 		docId: string,

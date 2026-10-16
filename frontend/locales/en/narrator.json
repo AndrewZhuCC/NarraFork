@@ -1479,6 +1479,8 @@
 	"fileEditor.languageUnavailable": "Syntax highlighting is unavailable for this language.",
 	"fileEditor.saveTask": "Saving an immutable snapshot; you may continue editing.",
 	"fileEditor.cancelTask": "Cancel task",
+	"fileEditor.externalDiskModified": "This file changed on disk. Your draft and undo history are kept; saving will first show the conflict.",
+	"fileEditor.externalDiskDeleted": "This file was deleted from disk. Your draft is kept; saving will first show the conflict.",
 	"fileEditor.unknownSave": "The save result needs verification. Your draft is retained; another save is blocked.",
 	"fileEditor.checkSave": "Check save result",
 	"fileEditor.receiptMismatch": "Save receipt revision does not match. Check the save result before retrying.",
