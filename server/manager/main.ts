@@ -15,6 +15,7 @@
 import { createWriteStream, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DEFAULT_BRAND_ICON_COLOR, parseHexColor } from "@shared/branding";
+import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
 import { decodeRgbaPng, recolorRgbaPixels } from "../lib/branding/png-recolor";
 import {
 	BackendProcess,
@@ -164,8 +165,30 @@ async function loadBranding(): Promise<{ color: string; name: string }> {
 	}
 }
 
+/**
+ * URL 里可用的主机名。
+ *
+ * `auto-lan` 是"监听第一个局域网地址"的配置意图，通配地址表示监听所有接口：
+ * 两者都不是可访问的主机名，直接拼进 URL 只会得到浏览器报地址错误的页面。
+ * 面板自己在本机运行，因此这类值一律回退到回环地址。
+ */
 function displayHost(host: string): string {
-	return host === "0.0.0.0" || host === "::" || host === "" ? "127.0.0.1" : host;
+	return isWildcardHost(host) || host === AUTO_LAN_HOST ? "127.0.0.1" : host;
+}
+
+/**
+ * 面板当前使用的端口。
+ *
+ * 托管服务运行中时以它实际监听的端口为准 —— 配置端口被占用时服务会自动换端口，
+ * 地址显示与「打开面板」都应跟随实际值。
+ */
+function activePort(): number {
+	return backend?.listeningPort ?? settings.port;
+}
+
+/** 面板当前使用的主机名；托管服务运行中时以它实际监听的值为准。 */
+function activeHost(): string {
+	return backend?.listeningHost ?? settings.host;
 }
 
 // ── 状态 ────────────────────────────────────────────────────────────────────
@@ -405,7 +428,7 @@ function applyStatus(status: BackendState, detail?: string): void {
 			: "";
 	setText(controls.statusDot, "●");
 	setText(controls.statusText, `${style.text}${suffix}`);
-	setText(controls.address, `面板地址: http://${displayHost(settings.host)}:${settings.port}/`);
+	setText(controls.address, `面板地址: http://${displayHost(activeHost())}:${activePort()}/`);
 	const startEnabled = external ? !awaitingHandover : status === "stopped" || status === "error";
 	setEnabled(controls.start, startEnabled);
 	setEnabled(controls.restart, !external && status === "running");
@@ -833,7 +856,7 @@ function openPanel(forceNewWindow = false): void {
 		appendLog("WEB", "已聚焦打开的前端面板窗口。");
 		return;
 	}
-	const url = `http://${displayHost(settings.host)}:${settings.port}/`;
+	const url = `http://${displayHost(activeHost())}:${activePort()}/`;
 	appendLog("WEB", forceNewWindow ? `已打开新面板窗口: ${url}` : `已打开面板: ${url}`);
 	openWebPanel(url, forceNewWindow);
 }

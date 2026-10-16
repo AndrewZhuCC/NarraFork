@@ -11,6 +11,7 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
+import { isWildcardHost } from "../shared/server-host";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -795,6 +796,18 @@ function getProtocol(): "https" | "http" {
 	return settings.server.tls?.enabled ? "https" : "http";
 }
 
+/**
+ * URL 里可用的主机名。
+ *
+ * 通配地址（0.0.0.0 / :: / 空）不是可访问的主机名，IPv6 字面量还必须有方括号；
+ * 直接拼进 URL 会得到 `http://:::7778` 这种畸形地址 —— 浏览器报错，解析方也读不出端口。
+ */
+function urlHost(host: string): string {
+	if (isWildcardHost(host)) return "127.0.0.1";
+	if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
+	return host;
+}
+
 async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
 	if (!settings.vnet?.enabled) return null;
 	const bearer = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
@@ -1236,11 +1249,15 @@ if (portExplicit) {
 	}
 }
 
-logger.info(`NarraFork server running on ${getProtocol()}://${currentHost}:${actualPort}`, {
-	isProd,
-	isCompiledBinary,
-	metaUrl: import.meta.url,
-});
+logger.info(
+	`NarraFork server running on ${getProtocol()}://${urlHost(currentHost)}:${actualPort}`,
+	{
+		isProd,
+		isCompiledBinary,
+		metaUrl: import.meta.url,
+		listenHost: currentHost,
+	},
+);
 
 function runtimeAddress() {
 	return {
@@ -1295,7 +1312,7 @@ startServerAddressWatcher({
 function openInBrowser(url: string) {
 	try {
 		if (IS_WINDOWS) {
-			Bun.spawn(["cmd", "/c", "start", url], {
+			Bun.spawn(["cmd", "/c", "start", "", url], {
 				stdio: ["ignore", "ignore", "ignore"],
 				windowsHide: true,
 			});
@@ -1309,41 +1326,46 @@ function openInBrowser(url: string) {
 	}
 }
 
-/** Try to open the URL in Chromium's --app mode (frameless window); fall back to default browser. */
 async function openAsApp(url: string) {
-	const candidates: string[][] = IS_WINDOWS
+	const candidates: { program: string; args: string[] }[] = IS_WINDOWS
 		? [
-				["cmd", "/c", "start", "", "msedge", `--app=${url}`],
-				["cmd", "/c", "start", "", "chrome", `--app=${url}`],
+				{ program: "msedge", args: [`--app=${url}`] },
+				{ program: "chrome", args: [`--app=${url}`] },
 			]
 		: IS_MACOS
 			? [
-					["open", "-a", "Google Chrome", url, "--args", `--app=${url}`],
-					["open", "-a", "Microsoft Edge", url, "--args", `--app=${url}`],
-					["open", "-a", "Chromium", url, "--args", `--app=${url}`],
+					{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
+					{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
+					{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
 				]
 			: [
-					["google-chrome", `--app=${url}`],
-					["google-chrome-stable", `--app=${url}`],
-					["chromium", `--app=${url}`],
-					["chromium-browser", `--app=${url}`],
-					["microsoft-edge", `--app=${url}`],
+					{ program: "google-chrome", args: [`--app=${url}`] },
+					{ program: "google-chrome-stable", args: [`--app=${url}`] },
+					{ program: "chromium", args: [`--app=${url}`] },
+					{ program: "chromium-browser", args: [`--app=${url}`] },
+					{ program: "microsoft-edge", args: [`--app=${url}`] },
 				];
 
-	for (const cmd of candidates) {
+	for (const { program, args } of candidates) {
 		try {
-			const proc = Bun.spawn(cmd, {
+			if (IS_WINDOWS) {
+				// 经 cmd 启动无法判断成败（start 总是返回成功），先确认可执行文件存在，
+				// 否则浏览器缺失时会静默什么都不开，而不是回退到下一个候选。
+				if (!Bun.which(program)) continue;
+				Bun.spawn(["cmd", "/c", "start", "", program, ...args], {
+					stdio: ["ignore", "ignore", "ignore"],
+					windowsHide: true,
+				});
+				return;
+			}
+			const proc = Bun.spawn([program, ...args], {
 				stdio: ["ignore", "ignore", "ignore"],
 				windowsHide: true,
 			});
-			// On Unix, check if the process exits immediately with an error
-			if (!IS_WINDOWS) {
-				// Give it a moment to fail (e.g. command not found)
-				const exited = proc.exited;
-				const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
-				const result = await Promise.race([exited, timeout]);
-				if (result !== null && result !== 0) continue;
-			}
+			// Give it a moment to fail (e.g. command not found)
+			const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
+			const result = await Promise.race([proc.exited, timeout]);
+			if (result !== null && result !== 0) continue;
 			return;
 		} catch {}
 	}
@@ -1357,7 +1379,7 @@ async function openAsApp(url: string) {
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
 	const proto = getProtocol();
-	const url = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	const url = `${proto}://${urlHost(currentHost)}:${runtimeAddress().port}`;
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);

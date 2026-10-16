@@ -182,6 +182,8 @@ interface User32 {
 		repaint: number,
 	) => number;
 	SetProcessDPIAware: () => number;
+	GetDC: (hwnd: Pointer) => Pointer;
+	ReleaseDC: (hwnd: Pointer, hdc: Pointer) => number;
 	RedrawWindow: (hwnd: Pointer, rect: Pointer, region: Pointer, flags: number) => number;
 }
 
@@ -207,6 +209,7 @@ interface Gdi32 {
 	SetBkColor: (hdc: Pointer, color: number) => number;
 	SetBkMode: (hdc: Pointer, mode: number) => number;
 	GetStockObject: (index: number) => Pointer;
+	GetDeviceCaps: (hdc: Pointer, index: number) => number;
 	DeleteObject: (object: Pointer) => number;
 	RoundRect: (
 		hdc: Pointer,
@@ -344,6 +347,8 @@ export function loadNative(): { user32: User32; gdi32: Gdi32; kernel32: Kernel32
 			DestroyMenu: { args: [FFIType.ptr], returns: FFIType.i32 },
 			GetCursorPos: { args: [FFIType.ptr], returns: FFIType.i32 },
 			SetProcessDPIAware: { args: [], returns: FFIType.i32 },
+			GetDC: { args: [FFIType.ptr], returns: FFIType.ptr },
+			ReleaseDC: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 			RedrawWindow: {
 				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32],
 				returns: FFIType.i32,
@@ -390,6 +395,7 @@ export function loadNative(): { user32: User32; gdi32: Gdi32; kernel32: Kernel32
 			SetBkColor: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.u32 },
 			SetBkMode: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
 			GetStockObject: { args: [FFIType.i32], returns: FFIType.ptr },
+			GetDeviceCaps: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
 			DeleteObject: { args: [FFIType.ptr], returns: FFIType.i32 },
 			RoundRect: {
 				args: [
@@ -439,6 +445,45 @@ export function loadNative(): { user32: User32; gdi32: Gdi32; kernel32: Kernel32
 
 export function isNativeAvailable(): boolean {
 	return loadNative() !== undefined;
+}
+
+// ── DPI 缩放 ────────────────────────────────────────────────────────────────
+
+/**
+ * DPI 缩放因子（1.0 = 96 DPI）。
+ *
+ * SetProcessDPIAware 之后窗口与字体都以物理像素计；为在 125% / 150% / 200% 等高 DPI
+ * 屏幕上保持同样的视觉大小，所有界面坐标在 API 边界统一乘以该因子，clientSize 反向
+ * 除以它 —— 调用方始终工作在"逻辑像素"上，布局常量无需感知 DPI。
+ */
+let dpiScale = 1;
+
+/** 读取主屏 DPI 并更新缩放因子；createWindow 时自动调用一次。 */
+function refreshDpiScale(): void {
+	const native = loadNative();
+	if (!native) return;
+	const hdc = native.user32.GetDC(0 as unknown as Pointer);
+	if (!hdc) return;
+	const dpi = native.gdi32.GetDeviceCaps(hdc, 88 /* LOGPIXELSX */);
+	native.user32.ReleaseDC(0 as unknown as Pointer, hdc);
+	dpiScale = dpi > 0 ? dpi / 96 : 1;
+}
+
+/**
+ * 当前生效的缩放因子。
+ *
+ * NARRAFORK_MANAGER_DPI_SCALE 可强制覆盖，供标准 DPI 机器上验证高 DPI 布局
+ * （例如 =1.5 模拟 150%）。
+ */
+export function currentDpiScale(): number {
+	const override = Number(process.env.NARRAFORK_MANAGER_DPI_SCALE);
+	if (Number.isFinite(override) && override > 0) return override;
+	return dpiScale;
+}
+
+/** 逻辑像素 → 物理像素。 */
+function px(value: number): number {
+	return Math.round(value * currentDpiScale());
 }
 
 // ── 字符串与内存 ────────────────────────────────────────────────────────────
@@ -542,6 +587,8 @@ export function createWindow(options: WindowOptions): NativeWindow | undefined {
 
 	// 声明进程 DPI 感知：否则系统会虚拟化缩放，客户区像素尺寸与控件坐标对不上，布局会错位。
 	user32.SetProcessDPIAware();
+	// 感知生效后读取真实 DPI，后续所有界面坐标按此缩放。
+	refreshDpiScale();
 
 	const wndProc = new JSCallback(
 		(hwnd: Pointer | null, msg: number, wParam: Pointer, lParam: Pointer): Pointer | number => {
@@ -591,8 +638,8 @@ export function createWindow(options: WindowOptions): NativeWindow | undefined {
 	const frame = makeRect();
 	frame.writeInt32LE(0, 0);
 	frame.writeInt32LE(0, 4);
-	frame.writeInt32LE(options.width, 8);
-	frame.writeInt32LE(options.height, 12);
+	frame.writeInt32LE(px(options.width), 8);
+	frame.writeInt32LE(px(options.height), 12);
 	user32.AdjustWindowRect(toPtr(frame), style, 0);
 	const frameRect = readRect(frame);
 	const windowWidth = frameRect.right - frameRect.left;
@@ -684,10 +731,10 @@ export function createControl(options: ControlOptions): Pointer | undefined {
 		wstr(options.className),
 		wstrTemp(options.text),
 		WS_CHILD | WS_VISIBLE | options.style,
-		options.x,
-		options.y,
-		options.width,
-		options.height,
+		px(options.x),
+		px(options.y),
+		px(options.width),
+		px(options.height),
 		options.parent,
 		options.id as unknown as Pointer,
 		options.instance,
@@ -714,7 +761,8 @@ export function createFont(
 	const native = loadNative();
 	if (!native) return undefined;
 	return native.gdi32.CreateFontW(
-		-sizePx,
+		// 负高度 = 字符高度；按 DPI 缩放保持高分辨率屏幕上的可读性。
+		-px(sizePx),
 		0,
 		0,
 		0,
@@ -910,7 +958,12 @@ export function clientSize(hwnd: Pointer): { width: number; height: number } {
 	const rect = makeRect();
 	if (!native.user32.GetClientRect(hwnd, toPtr(rect))) return { width: 0, height: 0 };
 	const size = readRect(rect);
-	return { width: size.right - size.left, height: size.bottom - size.top };
+	// 除以缩放因子：调用方看到的始终是逻辑像素。
+	const scale = currentDpiScale();
+	return {
+		width: Math.round((size.right - size.left) / scale),
+		height: Math.round((size.bottom - size.top) / scale),
+	};
 }
 
 /** 从 exe 资源加载图标（--windows-icon 写入的资源 id 为 1）；资源缺失时回退系统默认
@@ -1094,10 +1147,10 @@ export function drawText(
 /** 造一个 RECT 结构。 */
 export function makeRectOf(left: number, top: number, right: number, bottom: number): Buffer {
 	const rect = makeRect();
-	rect.writeInt32LE(left, 0);
-	rect.writeInt32LE(top, 4);
-	rect.writeInt32LE(right, 8);
-	rect.writeInt32LE(bottom, 12);
+	rect.writeInt32LE(px(left), 0);
+	rect.writeInt32LE(px(top), 4);
+	rect.writeInt32LE(px(right), 8);
+	rect.writeInt32LE(px(bottom), 12);
 	return rect;
 }
 
@@ -1140,7 +1193,7 @@ export function setMinTrackSize(lParam: Pointer, width: number, height: number):
 	const frame = makeRect();
 	frame.writeInt32LE(0, 0);
 	frame.writeInt32LE(0, 4);
-	frame.writeInt32LE(width, 8);
+	frame.writeInt32LE(px(width), 8);
 	frame.writeInt32LE(height, 12);
 	native.user32.AdjustWindowRect(toPtr(frame), WS_OVERLAPPEDWINDOW, 0);
 	const rect = readRect(frame);
@@ -1425,7 +1478,7 @@ export function moveWindow(
 ): void {
 	const native = loadNative();
 	if (!native || !hwnd) return;
-	native.user32.MoveWindow(hwnd, x, y, width, height, 1);
+	native.user32.MoveWindow(hwnd, px(x), px(y), px(width), px(height), 1);
 }
 
 /** 控件 id：WM_COMMAND 与 WM_CTLCOLOR* 都靠它区分控件。 */

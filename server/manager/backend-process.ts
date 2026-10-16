@@ -10,6 +10,8 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
+import { getLanAddresses } from "../lib/net/lan-addresses";
 
 export type BackendState = "stopped" | "starting" | "running" | "stopping" | "error";
 
@@ -25,15 +27,19 @@ export interface BackendProcessOptions {
 /** 健康检查间隔与启动超时。 */
 const READY_POLL_MS = 700;
 const READY_TIMEOUT_MS = 90_000;
+/** 等待服务自报监听地址的上限；超过后回退到配置端口探测，避免解析失败时一路悬空。 */
+const ADDRESS_WAIT_MS = 15_000;
 
 /**
  * 健康检查用的本地探测地址。
  *
- * settings 里的 host 可以是 0.0.0.0 / ::（监听所有网卡），它们不能作为请求目标；
- * IPv6 字面量还要加方括号。修正后才能得到能真正连通的回环地址。
+ * settings 里的 host 可以是 0.0.0.0 / ::（监听所有网卡）或 auto-lan（监听第一个
+ * 局域网地址），它们都不能作为请求目标；IPv6 字面量还要加方括号。修正后才能得到
+ * 能真正连通的地址。
  */
 function probeHost(host: string): string {
-	if (host === "0.0.0.0" || host === "::" || host === "") return "127.0.0.1";
+	if (isWildcardHost(host)) return "127.0.0.1";
+	if (host === AUTO_LAN_HOST) return getLanAddresses()[0] ?? "127.0.0.1";
 	if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
 	return host;
 }
@@ -65,13 +71,24 @@ export function resolveNarraforkHome(): string {
 export class BackendProcess {
 	private child?: Bun.Subprocess<"pipe", "pipe", "pipe">;
 	private state: BackendState = "stopped";
-	private readyTimer?: ReturnType<typeof setTimeout>;
+	/** 可中断等待的唤醒句柄：stop/dispose 用它立刻结束 waitUntilReady 的 sleep。 */
+	private sleepResolve?: () => void;
 	private disposed = false;
 
 	constructor(private readonly options: BackendProcessOptions) {}
 
 	get current(): BackendState {
 		return this.state;
+	}
+
+	/** 服务当前监听的端口（未运行时为配置值）。 */
+	get listeningPort(): number {
+		return this.probePort();
+	}
+
+	/** 服务实际监听的主机名（未解析到时为配置值）。 */
+	get listeningHost(): string {
+		return this.observedHost ?? this.options.host;
 	}
 
 	get pid(): number | undefined {
@@ -108,7 +125,6 @@ export class BackendProcess {
 		void child.exited.then((code) => {
 			if (this.child !== child) return;
 			this.child = undefined;
-			clearTimeout(this.readyTimer);
 			if (this.disposed) return;
 			// 主动停止走的是 stop() 的路径；这里只处理"自己退出"。
 			this.setState("stopped", code === 0 ? undefined : `退出码 ${code}`);
@@ -117,14 +133,77 @@ export class BackendProcess {
 		await this.waitUntilReady();
 	}
 
+	/**
+	 * 服务实际监听的端口。
+	 *
+	 * 启动时目标端口被占用的话，服务会自动换一个可用端口（自身 fallback），此时按
+	 * 配置端口做健康检查会永远失败、状态卡在"启动中"；以服务输出里的真实地址为准。
+	 */
+	private observedPort = 0;
+
+	/**
+	 * 服务实际监听的主机名（`running on` 那一行里的值）。
+	 *
+	 * 配置里的 host 可能是 `auto-lan` 这类"意图值"而非可用主机名，直接拼进 URL 只会
+	 * 得到浏览器报地址错误的页面；以服务自己报出的实际地址为准。
+	 */
+	private observedHost: string | undefined;
+
+	/**
+	 * 实例锁冲突：同一数据目录已有另一个 NarraFork 在运行（服务输出会报出持有者 PID）。
+	 *
+	 * 面板托管的服务与用户手动启动的服务共用 ~/.narrafork，单实例锁只允许一个；此时
+	 * 新服务会立即退出，健康检查只会一直失败。记录 PID 以便马上给出明确原因。
+	 */
+	private lockConflictPid: number | undefined;
+
+	/** 健康检查应使用的端口。 */
+	private probePort(): number {
+		return this.observedPort > 0 ? this.observedPort : this.options.port;
+	}
+
+	/** 从服务输出里解析实际监听地址与实例锁冲突。 */
+	private observeListenerAddress(line: string): void {
+		const conflict = line.match(/Another NarraFork process \(pid (\d+)\) is already using/);
+		if (conflict) {
+			const pid = Number.parseInt(conflict[1], 10);
+			if (Number.isFinite(pid) && pid > 0) this.lockConflictPid = pid;
+			return;
+		}
+		// 主机名可能是 IPv4/主机名，也可能是带方括号的 IPv6 字面量（[::1]）。
+		const match = line.match(/running on https?:\/\/(\[[^\]]+\]|[^:/]+):(\d+)/);
+		if (!match) return;
+		const port = Number.parseInt(match[2], 10);
+		if (Number.isFinite(port) && port > 0) {
+			this.observedHost = match[1];
+			this.observedPort = port;
+		}
+	}
+
 	/** 轮询健康检查直到就绪；超时只报状态，不杀进程（服务可能仍在慢启动）。 */
 	private async waitUntilReady(): Promise<void> {
 		const deadline = Date.now() + READY_TIMEOUT_MS;
+		const startedAt = Date.now();
 		while (Date.now() < deadline) {
+			// 实例锁冲突：服务会立即退出，直接给出原因，不必等超时。
+			if (this.lockConflictPid !== undefined) {
+				this.setState(
+					"error",
+					`已有 NarraFork 实例在运行（PID ${this.lockConflictPid}）：同一数据目录只能运行一个，请先停止它`,
+				);
+				return;
+			}
 			if (!this.child) return;
+			// 先等服务自己报告监听地址再探测端口：直接探测会把"已在运行的外部实例"
+			// 误当成刚启动的这个（表现为瞬间 running，随后子进程因锁冲突退出）。
+			// 等待有上限：地址解析失败时必须回退到配置端口，否则会悬空到启动超时。
+			if (this.observedPort <= 0 && Date.now() - startedAt < ADDRESS_WAIT_MS) {
+				await this.sleep(READY_POLL_MS);
+				continue;
+			}
 			try {
 				const response = await fetch(
-					`http://${probeHost(this.options.host)}:${this.options.port}/api/health`,
+					`http://${probeHost(this.options.host)}:${this.probePort()}/api/health`,
 					{
 						signal: AbortSignal.timeout(1500),
 					},
@@ -136,11 +215,28 @@ export class BackendProcess {
 			} catch {
 				// 还没起来，继续等。
 			}
-			await new Promise((resolve) => {
-				this.readyTimer = setTimeout(resolve, READY_POLL_MS);
-			});
+			await this.sleep(READY_POLL_MS);
 		}
 		if (this.child) this.setState("error", "启动超时：健康检查未通过");
+	}
+
+	/** 可中断等待：stop/dispose 会立即唤醒，避免启动流程卡在定时器上。 */
+	private sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				this.sleepResolve = undefined;
+				resolve();
+			}, ms);
+			this.sleepResolve = () => {
+				clearTimeout(timer);
+				this.sleepResolve = undefined;
+				resolve();
+			};
+		});
+	}
+
+	private interruptSleep(): void {
+		this.sleepResolve?.();
 	}
 
 	/** 逐块解码子进程输出并按行回调；流结束时冲掉最后的不完整行。 */
@@ -160,7 +256,11 @@ export class BackendProcess {
 				const lines = buffer.split(/\r?\n/);
 				buffer = lines.pop() ?? "";
 				for (const line of lines) {
-					if (line.length > 0) this.options.onLine(channel === "stderr" ? `! ${line}` : line);
+					if (line.length > 0) {
+						// 监听地址走 stdout（logger.info），实例锁冲突走 stderr（未捕获错误），两边都要看。
+						this.observeListenerAddress(line);
+						this.options.onLine(channel === "stderr" ? `! ${line}` : line);
+					}
 				}
 			}
 			if (buffer.length > 0) this.options.onLine(buffer);
@@ -180,7 +280,7 @@ export class BackendProcess {
 		}
 		this.setState("stopping");
 		this.child = undefined;
-		clearTimeout(this.readyTimer);
+		this.interruptSleep();
 		child.kill();
 		await child.exited.catch(() => undefined);
 		this.setState("stopped");
@@ -194,7 +294,7 @@ export class BackendProcess {
 	/** 管理器退出时调用：不等待、不回报状态。 */
 	dispose(): void {
 		this.disposed = true;
-		clearTimeout(this.readyTimer);
+		this.interruptSleep();
 		this.child?.kill();
 		this.child = undefined;
 	}
