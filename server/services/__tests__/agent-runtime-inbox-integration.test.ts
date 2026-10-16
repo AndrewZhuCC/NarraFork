@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -46,15 +46,18 @@ const {
 const { enqueueBufferedMessage, clearBufferedMessages } = await import("../narrator-buffer");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const time = "2026-09-09T00:00:00.000Z";
 let serial = 0;
 function required<T>(value: T | null | undefined): T {
 	if (value == null) throw new Error("Missing test fixture value");
 	return value;
 }
-beforeEach(() => {
+beforeEach(async () => {
 	for (const id of ["parent", "child", "sender"]) getExecutionOwner(id)?.release();
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	failBroadcast = false;
 	for (const id of ["parent", "child", "sender"])
 		db.insert(narrators)
@@ -67,9 +70,15 @@ beforeEach(() => {
 				updatedAt: time,
 			})
 			.run();
+	backgroundOccupancyStore.refreshNarrators(["parent", "child", "sender"]);
+	await backgroundOccupancyStore.flush();
+});
+afterEach(async () => {
+	await backgroundOccupancyStore.flush();
 });
 afterAll(() => {
 	for (const id of ["parent", "child", "sender"]) getExecutionOwner(id)?.release();
+	backgroundOccupancyStore.resetForTests();
 	sqlite.close();
 });
 function delivery(recipient = "child", text = "same words") {
@@ -294,6 +303,8 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	expect(await drainPendingInjections("parent")).toHaveLength(1);
 	expect(await drainPendingInjections("parent")).toHaveLength(1);
 	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "child")).run();
+	backgroundOccupancyStore.refreshNarrator("child");
+	await backgroundOccupancyStore.flush();
 	const teamOwner = required(tryClaimExecution("child", "subagent"));
 	const team = delivery();
 	await deliverTeamMessage(
@@ -324,6 +335,8 @@ test("broadcast-only inbox never authorizes a wake, regardless of persisted reci
 	for (const status of ["idle", "working", "waiting"] as const) {
 		for (const id of ["parent", "child"]) {
 			db.update(narrators).set({ status }).where(eq(narrators.id, id)).run();
+			backgroundOccupancyStore.refreshNarrator(id);
+			await backgroundOccupancyStore.flush();
 			const d = delivery(id);
 			await inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
 			expect(await inbox.hasWakeEligibleInboxInput(id)).toBe(false);
@@ -845,9 +858,8 @@ for (const kind of ["bg_agent", "bg_bash"] as const) {
 			};
 			const deliver = (locale: "en" | "zh-CN" = "en") =>
 				deliverPendingInjection("parent", locale, mode, "none", entry);
-			const seed = (id: string, parentNarratorId: string, backgroundKind: "task" | "service") =>
-				db
-					.insert(backgroundTasks)
+			const seed = (id: string, parentNarratorId: string, backgroundKind: "task" | "service") => {
+				db.insert(backgroundTasks)
 					.values({
 						id,
 						parentNarratorId,
@@ -859,13 +871,17 @@ for (const kind of ["bg_agent", "bg_bash"] as const) {
 						updatedAt: time,
 					})
 					.run();
+				backgroundOccupancyStore.refreshTask(id);
+			};
 
 			// A different session's task and this session's long-lived service do not block it.
 			db.insert(narrators)
 				.values({ id: "unrelated", variant: "primary", createdAt: time, updatedAt: time })
 				.run();
+			backgroundOccupancyStore.refreshNarrator("unrelated");
 			seed("other-task", "unrelated", "task");
 			seed("dev-server", "parent", "service");
+			await backgroundOccupancyStore.flush();
 			expect((await deliver())?.endsWith(hint)).toBe(true);
 			expect(
 				(await deliver("zh-CN"))?.endsWith(t("sidecar.noActiveBackgroundTasks", "zh-CN")),
@@ -878,22 +894,29 @@ for (const kind of ["bg_agent", "bg_bash"] as const) {
 			expect(persisted.some((row) => row.contentText?.endsWith(hint))).toBe(true);
 
 			seed("remaining-task", "parent", "task");
+			await backgroundOccupancyStore.flush();
 			expect(await deliver()).not.toContain(hint);
 			db.update(backgroundTasks)
 				.set({ status: "completed" })
 				.where(eq(backgroundTasks.id, "remaining-task"))
 				.run();
+			backgroundOccupancyStore.refreshTask("remaining-task");
+			await backgroundOccupancyStore.flush();
 			expect((await deliver())?.endsWith(hint)).toBe(true);
 			// A still-running subagent blocks the hint too, including legacy agents without task rows.
 			db.update(narrators)
 				.set({ status: "working", isBackground: true, backgroundStatus: "running" })
 				.where(eq(narrators.id, "child"))
 				.run();
+			backgroundOccupancyStore.refreshNarrator("child");
+			await backgroundOccupancyStore.flush();
 			expect(await deliver()).not.toContain(hint);
 			db.update(narrators)
 				.set({ status: "idle", backgroundStatus: "completed" })
 				.where(eq(narrators.id, "child"))
 				.run();
+			backgroundOccupancyStore.refreshNarrator("child");
+			await backgroundOccupancyStore.flush();
 			expect((await deliver())?.endsWith(hint)).toBe(true);
 			// Taken-over agents remain outstanding even when parked idle and their
 			// historical task row is terminal. Cover legacy and registered agents.
@@ -911,12 +934,16 @@ for (const kind of ["bg_agent", "bg_bash"] as const) {
 							updatedAt: time,
 						})
 						.run();
+					backgroundOccupancyStore.refreshTask("child-task");
+					await backgroundOccupancyStore.flush();
 				}
 				for (const status of ["idle", "working", "waiting"] as const) {
 					db.update(narrators)
 						.set({ status, isBackground: false, substatus: JSON.stringify(["taken_over"]) })
 						.where(eq(narrators.id, "child"))
 						.run();
+					backgroundOccupancyStore.refreshNarrator("child");
+					await backgroundOccupancyStore.flush();
 					expect(await deliver()).not.toContain(hint);
 				}
 				// Releasing takeover and returning the result finally exhausts the work.
@@ -924,6 +951,8 @@ for (const kind of ["bg_agent", "bg_bash"] as const) {
 					.set({ status: "idle", substatus: "[]", backgroundStatus: "completed" })
 					.where(eq(narrators.id, "child"))
 					.run();
+				backgroundOccupancyStore.refreshNarrator("child");
+				await backgroundOccupancyStore.flush();
 				expect((await deliver())?.endsWith(hint)).toBe(true);
 			}
 			for (const status of ["started", "running", "failed", "cancelled", "timeout"]) {
