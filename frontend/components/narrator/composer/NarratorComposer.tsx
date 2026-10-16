@@ -689,6 +689,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		}, [currentUserId, narratorId, restoreInput]);
 
 		const commitDraftAfterSend = useCallback(() => {
+			// Sending skips the normal mirror effect; switching away invalidates the clear response.
+			// Save the remaining input now, including any next message typed during the send.
+			if (currentUserId && draftOwnerScopeRef.current === currentDraftScope) {
+				persistNarratorInputDraft(
+					currentUserId,
+					narratorId,
+					inputRef.current,
+					lastDraftRevisionRef.current,
+					lastDraftUpdatedAtRef.current,
+					inputStateRef.current.fileReferences,
+					lastSyncedDraftRef.current ?? null,
+				);
+			}
 			if (draftSyncState === "ready") {
 				setDraftSyncState("loading");
 				void syncDraftNow("", undefined, []).catch(() => setDraftSyncState("error"));
@@ -697,7 +710,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				// remote draft rather than clearing it as a side effect of this send.
 				acceptServerDraft();
 			}
-		}, [draftSyncState, syncDraftNow, acceptServerDraft]);
+		}, [
+			currentUserId,
+			currentDraftScope,
+			narratorId,
+			draftSyncState,
+			syncDraftNow,
+			acceptServerDraft,
+		]);
 
 		const overwriteServerDraft = useCallback(() => {
 			const remote = draftConflictRef.current;

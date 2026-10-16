@@ -951,6 +951,47 @@ describe("Codex Composer cached suggestions", () => {
 });
 
 describe("composer atomic reference contract", () => {
+	test.each([
+		"",
+		"next unsent message",
+	])("confirmed sends mirror the remaining draft %j before a delayed clear response", async (nextText) => {
+		await render();
+		await act(async () => handle.current?.restoreInput("already sent", [reference]));
+		expect(readNarratorInputDraft("u1", "n1").unsynced).toBe(true);
+		const pending = deferred<Awaited<ReturnType<typeof api.updateNarratorDraft>>>();
+		updateSpy.mockReturnValueOnce(pending.promise);
+		sendingRef.current = true;
+		await act(async () => handle.current?.hideTextForSend());
+		// Preserve the original draft until sending succeeds, in case sending fails.
+		expect(readNarratorInputDraft("u1", "n1").text).toBe("already sent");
+		await act(async () => {
+			if (nextText) handle.current?.restoreInput(nextText, []);
+			handle.current?.commitDraftAfterSend();
+		});
+		expect(updateSpy).toHaveBeenCalledWith("n1", "", 1, expect.any(String), []);
+		expect(readNarratorInputDraft("u1", "n1").text).toBe(nextText);
+		expect(readNarratorInputDraft("u1", "n1").fileReferences ?? []).toEqual([]);
+
+		// Switch away before the clear response arrives: its callbacks become stale.
+		testNarratorId = "n2";
+		await render();
+		sendingRef.current = false;
+		const cleared = { ...initial, revision: 2 };
+		await act(async () => pending.resolve({ ...cleared, ok: true, traits: [] }));
+		getSpy.mockResolvedValue(cleared);
+		panelSpy.mockResolvedValue({
+			permissions: [],
+			buffer: [],
+			draft: { hasDraft: false, revision: 2, updatedAt: null },
+			hasMore: { permissions: false, buffer: false },
+		});
+		testNarratorId = "n1";
+		await render();
+		expect(handle.current?.getText()).toBe(nextText);
+		expect(handle.current?.getFileReferences()).toEqual([]);
+		if (!nextText) expect(host.textContent).not.toContain("draft conflict");
+	});
+
 	test("same-tick restore and add expose detached text/reference state without rerendering the parent", async () => {
 		await render();
 		const before = renders;
