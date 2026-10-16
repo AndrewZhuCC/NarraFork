@@ -1,6 +1,5 @@
 import {
 	Alert,
-	Badge,
 	Button,
 	Group,
 	Modal,
@@ -8,7 +7,6 @@ import {
 	Select,
 	Stack,
 	Text,
-	Textarea,
 	TextInput,
 } from "@mantine/core";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
@@ -25,7 +23,9 @@ import type {
 	KnowledgeVerdict,
 } from "../../lib/api";
 import { DiffView } from "../narrator/diff/DiffView";
+import { KnowledgeEditor } from "./editor/KnowledgeEditor";
 import { SubmissionFindings } from "./SubmissionFindings";
+import { SubmissionStatusBadge } from "./SubmissionStatusBadge";
 
 interface Props {
 	submission: KnowledgeSubmissionDetail;
@@ -107,9 +107,7 @@ export function SubmissionReviewPanel({ submission, currentContent, canReview, o
 						<Text size="sm" fw={600}>
 							{t("submission")}
 						</Text>
-						<Badge size="sm" variant="light" color={isConflict ? "orange" : "blue"}>
-							{t(`submissionStatus_${submission.status}`)}
-						</Badge>
+						<SubmissionStatusBadge status={submission.status} size="sm" />
 					</Group>
 					{submission.changeNote ? (
 						<Text size="xs" c="dimmed">
@@ -139,11 +137,16 @@ export function SubmissionReviewPanel({ submission, currentContent, canReview, o
 						<Alert color="orange" title={t("conflict")}>
 							{t("conflictDesc")}
 						</Alert>
-						<Textarea
+						<KnowledgeEditor
 							label={t("resolvedContent")}
 							value={resolved}
-							onChange={(e) => setResolved(e.currentTarget.value)}
-							autosize
+							onChange={setResolved}
+							savedValue={submission.proposedContent}
+							baseline={currentContent}
+							baselineLabel={t("resolvedVsMain")}
+							onSave={canReview && resolved.trim() ? submitResolve : undefined}
+							saving={resolveMut.isPending}
+							readOnly={!canReview}
 							minRows={6}
 							maxRows={20}
 						/>

@@ -43,10 +43,13 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
+import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
 import { CollectionAclPanel } from "../../components/knowledge/CollectionAclPanel";
+import { KnowledgeEditor } from "../../components/knowledge/editor/KnowledgeEditor";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
+import { SubmissionStatusBadge } from "../../components/knowledge/SubmissionStatusBadge";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
@@ -65,6 +68,7 @@ import {
 } from "../../hooks/useKnowledge";
 import type {
 	KnowledgeCollection,
+	KnowledgeCollectionListItem,
 	KnowledgeOpenSubmission,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
@@ -195,8 +199,13 @@ function BrowseTab() {
 	const [colModal, colModalH] = useDisclosure(false);
 	const [entryModal, entryModalH] = useDisclosure(false);
 
-	const collectionOptions = useMemo(
-		() => (collections.data ?? []).map((c) => ({ value: c.id, label: c.name })),
+	// Only collections the server lets the caller create entries in (viewerCaps.canCreateEntry);
+	// offering the rest would only lead to a refused POST.
+	const creatableOptions = useMemo(
+		() =>
+			(collections.data ?? [])
+				.filter((c) => c.viewerCaps.canCreateEntry)
+				.map((c) => ({ value: c.id, label: c.name })),
 		[collections.data],
 	);
 
@@ -273,7 +282,7 @@ function BrowseTab() {
 								size="sm"
 								leftSection={<IconPlus size={14} />}
 								onClick={entryModalH.open}
-								disabled={(collections.data?.length ?? 0) === 0}
+								disabled={creatableOptions.length === 0}
 							>
 								{t("createEntry")}
 							</Button>
@@ -355,8 +364,12 @@ function BrowseTab() {
 			<CreateEntryModal
 				opened={entryModal}
 				onClose={entryModalH.close}
-				collectionId={collectionId}
-				collectionOptions={collectionOptions}
+				collectionId={
+					collectionId && creatableOptions.some((o) => o.value === collectionId)
+						? collectionId
+						: null
+				}
+				collectionOptions={creatableOptions}
 			/>
 		</Grid>
 	);
@@ -368,15 +381,17 @@ function CollectionItem({
 	count,
 	onSelect,
 }: {
-	collection: KnowledgeCollection;
+	collection: KnowledgeCollectionListItem;
 	active: boolean;
 	count: number;
 	onSelect: () => void;
 }) {
 	const { t } = useTranslation("knowledge");
 	const { data: user } = useCurrentUser();
+	// Actions come from the server's per-collection capability bits. `isAdmin` below only
+	// gates the admin-only user directory used to pick a transfer target (a data source).
+	const caps = collection.viewerCaps;
 	const isAdmin = user?.role === "admin";
-	const isOwner = !!user && collection.ownerUserId === user.id;
 	const del = useDeleteKnowledgeCollection();
 	const [editing, setEditing] = useState<KnowledgeCollection | null>(null);
 	const [pendingDelete, setPendingDelete] = useState<KnowledgeCollection | null>(null);
@@ -403,7 +418,7 @@ function CollectionItem({
 						<Badge size="xs" variant="light" color="gray">
 							{count}
 						</Badge>
-						{isAdmin ? (
+						{caps.canManageAcl ? (
 							<ActionIcon
 								size="xs"
 								variant="subtle"
@@ -414,8 +429,7 @@ function CollectionItem({
 								<IconLock size={12} />
 							</ActionIcon>
 						) : null}
-						{/* Ownership transfer is admin OR current owner (enforced server-side). */}
-						{isAdmin || isOwner ? (
+						{caps.canTransferOwner ? (
 							<ActionIcon
 								size="xs"
 								variant="subtle"
@@ -426,24 +440,28 @@ function CollectionItem({
 								<IconUserShare size={12} />
 							</ActionIcon>
 						) : null}
-						<ActionIcon
-							size="xs"
-							variant="subtle"
-							color="gray"
-							onClick={() => setEditing(collection)}
-							title={t("edit")}
-						>
-							<IconPencil size={12} />
-						</ActionIcon>
-						<ActionIcon
-							size="xs"
-							variant="subtle"
-							color="red"
-							onClick={() => setPendingDelete(collection)}
-							title={t("delete")}
-						>
-							<IconTrash size={12} />
-						</ActionIcon>
+						{caps.canEdit ? (
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="gray"
+								onClick={() => setEditing(collection)}
+								title={t("edit")}
+							>
+								<IconPencil size={12} />
+							</ActionIcon>
+						) : null}
+						{caps.canDelete ? (
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="red"
+								onClick={() => setPendingDelete(collection)}
+								title={t("delete")}
+							>
+								<IconTrash size={12} />
+							</ActionIcon>
+						) : null}
 					</Group>
 				}
 			/>
@@ -459,14 +477,14 @@ function CollectionItem({
 					}
 				}}
 			/>
-			{isAdmin ? (
+			{caps.canManageAcl ? (
 				<CollectionAclPanel
 					collectionId={aclOpen ? collection.id : null}
 					opened={aclOpen}
 					onClose={() => setAclOpen(false)}
 				/>
 			) : null}
-			{isAdmin || isOwner ? (
+			{caps.canTransferOwner ? (
 				<TransferOwnerModal
 					kind="collection"
 					targetId={collection.id}
@@ -628,7 +646,7 @@ function CreateEntryModal({
 	const [target, setTarget] = useState<string | null>(collectionId);
 	const [title, setTitle] = useState("");
 	const [content, setContent] = useState("");
-	const [tags, setTags] = useState("");
+	const [tags, setTags] = useState<string[]>([]);
 
 	const effectiveTarget = target ?? collectionId ?? collectionOptions[0]?.value ?? null;
 
@@ -639,17 +657,18 @@ function CreateEntryModal({
 				collectionId: effectiveTarget,
 				title: title.trim(),
 				content,
-				tags: tags
-					.split(",")
-					.map((s) => s.trim())
-					.filter(Boolean),
+				tags,
 			},
 			{
 				onSuccess: (entry) => {
-					setTitle("");
-					setContent("");
-					setTags("");
-					onClose();
+					// Clear the form (and close the modal) synchronously so the editor's
+					// unsaved-changes guard is released before we navigate to the new entry.
+					flushSync(() => {
+						setTitle("");
+						setContent("");
+						setTags([]);
+						onClose();
+					});
 					navigate({ to: "/knowledge/$entryId", params: { entryId: entry.id } });
 				},
 			},
@@ -670,17 +689,20 @@ function CreateEntryModal({
 					value={title}
 					onChange={(e) => setTitle(e.currentTarget.value)}
 				/>
-				<TextInput
+				<TagsInput
 					label={t("tags")}
 					placeholder={t("tagsPlaceholder")}
 					value={tags}
-					onChange={(e) => setTags(e.currentTarget.value)}
+					onChange={setTags}
+					clearable
 				/>
-				<Textarea
+				<KnowledgeEditor
 					label={t("content")}
 					value={content}
-					onChange={(e) => setContent(e.currentTarget.value)}
-					autosize
+					onChange={setContent}
+					savedValue=""
+					onSave={save}
+					saving={create.isPending}
 					minRows={6}
 					maxRows={18}
 				/>
@@ -787,12 +809,14 @@ function MyLibraryTab() {
 							onChange={setTarget}
 						/>
 
-						<Textarea
+						<KnowledgeEditor
 							label={t("content")}
 							placeholder={t("content")}
 							value={content}
-							onChange={(e) => setContent(e.currentTarget.value)}
-							autosize
+							onChange={setContent}
+							savedValue=""
+							onSave={save}
+							saving={create.isPending}
 							minRows={4}
 							maxRows={12}
 						/>
@@ -927,21 +951,7 @@ function MyLibraryTab() {
 														</Badge>
 													</Tooltip>
 												) : null}
-												{openStatus ? (
-													<Badge
-														size="xs"
-														variant="light"
-														color={
-															openStatus === "conflict"
-																? "orange"
-																: openStatus === "changes_requested"
-																	? "yellow"
-																	: "blue"
-														}
-													>
-														{t(`submissionStatus_${openStatus}`)}
-													</Badge>
-												) : null}
+												{openStatus ? <SubmissionStatusBadge status={openStatus} /> : null}
 												<Badge size="xs" variant="light" color={p.entryId ? "blue" : "grape"}>
 													{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
 												</Badge>
@@ -1052,9 +1062,6 @@ function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | nu
 			navigate({ to: "/knowledge", search: { tab: "review" }, replace: true });
 		}
 	};
-
-	const statusColor = (s: KnowledgeSubmission["status"]) =>
-		s === "conflict" ? "orange" : s === "pending" ? "blue" : "gray";
 
 	return (
 		<Stack gap="md">
@@ -1175,14 +1182,7 @@ function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | nu
 															{formatLocaleDateTime(s.createdAt)}
 														</Text>
 													</div>
-													<Badge
-														size="xs"
-														variant="light"
-														color={statusColor(s.status)}
-														style={{ flexShrink: 0 }}
-													>
-														{t(`submissionStatus_${s.status}`)}
-													</Badge>
+													<SubmissionStatusBadge status={s.status} style={{ flexShrink: 0 }} />
 												</Group>
 											</Card>
 										))}
@@ -1247,14 +1247,7 @@ function ReviewCenterTab({ focusSubmissionId }: { focusSubmissionId: string | nu
 													{formatLocaleDateTime(g.sub.createdAt)}
 												</Text>
 											</div>
-											<Badge
-												size="xs"
-												variant="light"
-												color={statusColor(g.sub.status)}
-												style={{ flexShrink: 0 }}
-											>
-												{t(`submissionStatus_${g.sub.status}`)}
-											</Badge>
+											<SubmissionStatusBadge status={g.sub.status} style={{ flexShrink: 0 }} />
 										</Group>
 									</Card>
 								</Paper>

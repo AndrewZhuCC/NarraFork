@@ -16,14 +16,12 @@ import {
 	Stack,
 	Tabs,
 	Text,
-	Textarea,
 	TextInput,
 	Title,
 	Tooltip,
 } from "@mantine/core";
 import {
 	IconAlertTriangle,
-	IconArrowBackUp,
 	IconArrowLeft,
 	IconExternalLink,
 	IconFolder,
@@ -39,12 +37,15 @@ import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DriftBanner } from "../../components/knowledge/DriftBanner";
 import { EntryAclPanel } from "../../components/knowledge/EntryAclPanel";
 import { EntryMetaPanel } from "../../components/knowledge/EntryMetaPanel";
+import { KnowledgeEditor } from "../../components/knowledge/editor/KnowledgeEditor";
 import { ReviewScopeNotice } from "../../components/knowledge/ReviewScopeNotice";
 import { SubmissionAuthorActions } from "../../components/knowledge/SubmissionAuthorActions";
 import { SubmissionFindings } from "../../components/knowledge/SubmissionFindings";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
+import { SubmissionStatusBadge } from "../../components/knowledge/SubmissionStatusBadge";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { DiffView } from "../../components/narrator/diff/DiffView";
 import { MarkdownContent } from "../../components/narrator/markdown/MarkdownContent";
@@ -65,7 +66,6 @@ import {
 	useKnowledgeSubmissions,
 	useMyKnowledgeDraft,
 	usePersonalEntrySubmissions,
-	useRebaseKnowledgeDraft,
 	useSubmitKnowledgeDraft,
 	useUpdateKnowledgeDraft,
 } from "../../hooks/useKnowledge";
@@ -231,8 +231,6 @@ function EntryDetailPage() {
 	const { t } = useTranslation("knowledge");
 	const { entryId } = Route.useParams();
 	const navigate = useNavigate();
-	const { data: user } = useCurrentUser();
-	const isAdmin = user?.role === "admin";
 	const entry = useKnowledgeEntry(entryId);
 	// The hash is the tab state. Review center and the bell link here with
 	// `#submissions/<id>` so a reload lands on the verdict panel, not Content.
@@ -265,8 +263,9 @@ function EntryDetailPage() {
 	}
 
 	const e = entry.data;
-	const isOwner = !!user && e.ownerUserId === user.id;
-	const canDirectWrite = isAdmin || isOwner;
+	// Every action below is shown from the server's capability bits (same predicates as the
+	// write endpoints), never inferred from role/ownership on the client.
+	const caps = e.viewerCaps;
 
 	return (
 		<Container size="lg" py="lg">
@@ -297,8 +296,11 @@ function EntryDetailPage() {
 						))}
 					</Group>
 				</div>
-				{/* Ownership transfer is admin OR current owner; delete follows the write gate. */}
-				<EntryOwnerActions entry={e} isAdmin={isAdmin} isOwner={isOwner} />
+				<EntryOwnerActions
+					entry={e}
+					canTransferOwner={caps.canTransferOwner}
+					canDelete={caps.canDelete}
+				/>
 			</Group>
 
 			<Grid gap="lg">
@@ -316,7 +318,7 @@ function EntryDetailPage() {
 						<Tabs.Panel value="content">
 							<ContentTab
 								content={e.currentContent ?? ""}
-								canDirectWrite={canDirectWrite}
+								canWriteMain={caps.canWriteMain}
 								entryId={entryId}
 							/>
 						</Tabs.Panel>
@@ -330,6 +332,7 @@ function EntryDetailPage() {
 							<SubmissionsTab
 								entryId={entryId}
 								mainContent={e.currentContent ?? ""}
+								canReviewEntry={caps.canReview}
 								focusSubmissionId={locationTarget.submissionId}
 								onSelectSubmission={(id) =>
 									navigate({
@@ -356,7 +359,7 @@ function EntryDetailPage() {
 									{t("metaSettings")}
 								</Text>
 								<Divider />
-								{canDirectWrite ? <EntryMetaPanel entry={e} /> : <ReadOnlyMetaView entry={e} />}
+								{caps.canEditMeta ? <EntryMetaPanel entry={e} /> : <ReadOnlyMetaView entry={e} />}
 							</Stack>
 						</Paper>
 
@@ -377,7 +380,7 @@ function EntryDetailPage() {
 							</Stack>
 						</Paper>
 
-						{isAdmin && (
+						{caps.canManageAcl && (
 							<Paper withBorder p="md" radius="md">
 								<EntryAclPanel entry={e} />
 							</Paper>
@@ -390,24 +393,25 @@ function EntryDetailPage() {
 }
 
 /**
- * Owner-scoped actions in the entry header: transfer ownership and delete.
- *
- * Both are gated to admin-or-owner. Transfer matches the server rule exactly (the route is
- * NOT requireAdmin — the service accepts admin OR the current owner). Delete goes through the
- * write gate server-side, so a write-grant holder's attempt is accepted there even though this
- * header only surfaces the button for admin/owner.
+ * Entry header actions: transfer ownership and delete, each shown from its own server
+ * capability bit — transfer is admin-or-owner, delete is the entry write gate (which also
+ * admits write-grant holders), so the two buttons can legitimately differ.
  */
 function EntryOwnerActions({
 	entry,
-	isAdmin,
-	isOwner,
+	canTransferOwner,
+	canDelete,
 }: {
 	entry: KnowledgeEntry;
-	isAdmin: boolean;
-	isOwner: boolean;
+	canTransferOwner: boolean;
+	canDelete: boolean;
 }) {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
+	const { data: user } = useCurrentUser();
+	// The user directory endpoint itself is admin-only; a non-admin owner sees the modal's own
+	// fallback. This gates a DATA source, not an action.
+	const isAdmin = user?.role === "admin";
 	const del = useDeleteKnowledgeEntry();
 	const [transferOpen, setTransferOpen] = useState(false);
 	const [deleteOpen, setDeleteOpen] = useState(false);
@@ -419,7 +423,7 @@ function EntryOwnerActions({
 		enabled: isAdmin && transferOpen,
 	});
 
-	if (!isAdmin && !isOwner) return null;
+	if (!canTransferOwner && !canDelete) return null;
 
 	// Typing the title is required so a mis-click can't destroy an entry and its whole
 	// revision history (the DELETE cascades to revisions and links).
@@ -428,37 +432,43 @@ function EntryOwnerActions({
 	return (
 		<>
 			<Group gap="xs">
-				<Button
-					size="compact-xs"
-					variant="light"
-					leftSection={<IconUserShare size={12} />}
-					onClick={() => setTransferOpen(true)}
-				>
-					{t("transferOwnerOpen")}
-				</Button>
-				<Button
-					size="compact-xs"
-					variant="light"
-					color="red"
-					leftSection={<IconTrash size={12} />}
-					onClick={() => {
-						setConfirmText("");
-						setDeleteOpen(true);
-					}}
-				>
-					{t("deleteEntry")}
-				</Button>
+				{canTransferOwner ? (
+					<Button
+						size="compact-xs"
+						variant="light"
+						leftSection={<IconUserShare size={12} />}
+						onClick={() => setTransferOpen(true)}
+					>
+						{t("transferOwnerOpen")}
+					</Button>
+				) : null}
+				{canDelete ? (
+					<Button
+						size="compact-xs"
+						variant="light"
+						color="red"
+						leftSection={<IconTrash size={12} />}
+						onClick={() => {
+							setConfirmText("");
+							setDeleteOpen(true);
+						}}
+					>
+						{t("deleteEntry")}
+					</Button>
+				) : null}
 			</Group>
 
-			<TransferOwnerModal
-				kind="entry"
-				targetId={entry.id}
-				targetName={entry.title}
-				currentOwnerUserId={entry.ownerUserId}
-				users={(users.data ?? []) as { id: string; username: string; role: string }[]}
-				opened={transferOpen}
-				onClose={() => setTransferOpen(false)}
-			/>
+			{canTransferOwner ? (
+				<TransferOwnerModal
+					kind="entry"
+					targetId={entry.id}
+					targetName={entry.title}
+					currentOwnerUserId={entry.ownerUserId}
+					users={(users.data ?? []) as { id: string; username: string; role: string }[]}
+					opened={transferOpen}
+					onClose={() => setTransferOpen(false)}
+				/>
+			) : null}
 
 			<Modal opened={deleteOpen} onClose={() => setDeleteOpen(false)} title={t("deleteEntryTitle")}>
 				<Stack gap="md">
@@ -506,11 +516,11 @@ function EntryOwnerActions({
 
 function ContentTab({
 	content,
-	canDirectWrite,
+	canWriteMain,
 	entryId,
 }: {
 	content: string;
-	canDirectWrite: boolean;
+	canWriteMain: boolean;
 	entryId: string;
 }) {
 	const { t } = useTranslation("knowledge");
@@ -522,34 +532,26 @@ function ContentTab({
 		setDraft(content);
 	}, [content]);
 
+	const save = () =>
+		addRev.mutate({ entryId, content: draft }, { onSuccess: () => setEditing(false) });
+	const cancel = () => {
+		setDraft(content);
+		setEditing(false);
+	};
+
 	return (
 		<Stack>
-			{canDirectWrite ? (
-				<Group justify="space-between">
-					<Text size="xs" c="dimmed">
-						{t("directEditDesc")}
-					</Text>
-					{editing ? (
-						<Group gap="xs">
-							<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
-								{t("cancel")}
-							</Button>
-							<Button
-								size="xs"
-								loading={addRev.isPending}
-								onClick={() =>
-									addRev.mutate({ entryId, content: draft }, { onSuccess: () => setEditing(false) })
-								}
-							>
-								{t("save")}
-							</Button>
-						</Group>
-					) : (
+			{canWriteMain ? (
+				editing ? null : (
+					<Group justify="space-between">
+						<Text size="xs" c="dimmed">
+							{t("directEditDesc")}
+						</Text>
 						<Button size="xs" variant="light" onClick={() => setEditing(true)}>
 							{t("directEdit")}
 						</Button>
-					)}
-				</Group>
+					</Group>
+				)
 			) : (
 				<Text size="xs" c="dimmed">
 					{t("directEditHint")}
@@ -557,12 +559,24 @@ function ContentTab({
 			)}
 
 			{editing ? (
-				<Textarea
+				<KnowledgeEditor
 					value={draft}
-					onChange={(ev) => setDraft(ev.currentTarget.value)}
-					autosize
-					minRows={10}
-					maxRows={30}
+					onChange={setDraft}
+					savedValue={content}
+					baseline={content}
+					baselineLabel={t("editVsMain")}
+					onSave={save}
+					saving={addRev.isPending}
+					toolbar={
+						<>
+							<Button variant="subtle" size="xs" onClick={cancel}>
+								{t("cancel")}
+							</Button>
+							<Button size="xs" loading={addRev.isPending} onClick={save}>
+								{t("save")}
+							</Button>
+						</>
+					}
 				/>
 			) : (
 				<Paper withBorder p="md">
@@ -575,6 +589,11 @@ function ContentTab({
 					)}
 				</Paper>
 			)}
+			{addRev.isError ? (
+				<Text size="xs" c="red">
+					{(addRev.error as Error).message}
+				</Text>
+			) : null}
 		</Stack>
 	);
 }
@@ -668,12 +687,8 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 	const createDraft = useCreateKnowledgeDraft();
 	const updateDraft = useUpdateKnowledgeDraft();
 	const submitDraft = useSubmitKnowledgeDraft();
-	const rebaseDraft = useRebaseKnowledgeDraft();
 	const [content, setContent] = useState("");
 	const [dirty, setDirty] = useState(false);
-	const [conflict, setConflict] = useState<{ theirs: string; yours: string } | null>(null);
-	// "Take main" discards the author's edits irreversibly → always confirm first.
-	const [takeMainOpen, setTakeMainOpen] = useState(false);
 	// Set when a submit went through on a stale base. The drift banner above warns BEFORE
 	// submitting, but it is dismissible-by-scrolling and easy to walk past; this confirms
 	// after the fact that the reviewer may hit a conflict, while rebasing is still an option.
@@ -719,76 +734,21 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 	const isDrifted = !!driftData && driftData.hasDraft && driftData.drifted;
 	const versionsBehind = driftData?.hasDraft && driftData.drifted ? driftData.versionsBehind : 0;
 
-	const onRebase = () => {
-		setConflict(null);
-		rebaseDraft.mutate(
-			{ draftId: draft.id, entryId },
-			{
-				onSuccess: (res) => {
-					if (res.ok) {
-						// Merged content is now persisted; drop local edits so the fresh draft shows.
-						setDirty(false);
-					} else if (res.conflict) {
-						setConflict({ theirs: res.conflict.theirs, yours: res.conflict.yours });
-					}
-				},
-			},
+	const saveDraft = () =>
+		updateDraft.mutate(
+			{ draftId: draft.id, entryId, content },
+			{ onSuccess: () => setDirty(false) },
 		);
-	};
-
-	// strategy=theirs replaces the draft with main verbatim — it never conflicts, and it
-	// throws away the local edits, which is exactly the point (catching up when main already
-	// covers what you were writing).
-	const onTakeMain = () => {
-		setConflict(null);
-		rebaseDraft.mutate(
-			{ draftId: draft.id, entryId, strategy: "theirs" },
-			{
-				onSuccess: () => {
-					setDirty(false);
-					setTakeMainOpen(false);
-				},
-			},
-		);
-	};
 
 	return (
 		<Stack>
-			{isDrifted ? (
-				<Alert color="orange" title={t("driftBanner")} icon={<IconGitMerge size={16} />}>
-					<Stack gap="xs">
-						<Text size="sm">
-							{versionsBehind > 0 ? t("driftDesc", { count: versionsBehind }) : t("driftDesc_zero")}
-						</Text>
-						<Group>
-							<Button
-								size="xs"
-								color="orange"
-								leftSection={<IconGitMerge size={14} />}
-								loading={rebaseDraft.isPending}
-								onClick={onRebase}
-							>
-								{rebaseDraft.isPending ? t("rebasing") : t("rebaseDraft")}
-							</Button>
-							{/* Escape hatch when the merge conflicts (or you simply want main): take
-							    main verbatim. Confirmed in a modal because local edits are lost. */}
-							<Button
-								size="xs"
-								variant="light"
-								color="gray"
-								leftSection={<IconArrowBackUp size={14} />}
-								disabled={rebaseDraft.isPending}
-								onClick={() => setTakeMainOpen(true)}
-							>
-								{t("driftTakeMain")}
-							</Button>
-							<Text size="xs" c="dimmed">
-								{t("rebaseHint")}
-							</Text>
-						</Group>
-					</Stack>
-				</Alert>
-			) : null}
+			<DriftBanner
+				draftId={draft.id}
+				entryId={entryId}
+				drifted={isDrifted}
+				versionsBehind={versionsBehind}
+				onResolved={() => setDirty(false)}
+			/>
 
 			{submittedDrift !== null ? (
 				<Alert
@@ -802,57 +762,6 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 				</Alert>
 			) : null}
 
-			<Modal
-				opened={takeMainOpen}
-				onClose={() => setTakeMainOpen(false)}
-				title={t("driftTakeMainTitle")}
-			>
-				<Stack gap="md">
-					<Alert color="red" icon={<IconAlertTriangle size={16} />} p="xs">
-						<Text size="xs">{t("driftTakeMainDesc")}</Text>
-					</Alert>
-					<Text size="xs" c="dimmed">
-						{t("driftTakeMainHint")}
-					</Text>
-					{rebaseDraft.isError ? (
-						<Text size="xs" c="red">
-							{(rebaseDraft.error as Error).message}
-						</Text>
-					) : null}
-					<Group justify="flex-end">
-						<Button variant="subtle" size="xs" onClick={() => setTakeMainOpen(false)}>
-							{t("cancel")}
-						</Button>
-						<Button size="xs" color="red" loading={rebaseDraft.isPending} onClick={onTakeMain}>
-							{t("driftTakeMain")}
-						</Button>
-					</Group>
-				</Stack>
-			</Modal>
-
-			{conflict ? (
-				<Alert
-					color="red"
-					title={t("rebaseConflict")}
-					withCloseButton
-					onClose={() => setConflict(null)}
-				>
-					<Stack gap="xs">
-						<Text size="sm">{t("rebaseConflictDesc")}</Text>
-						<Text size="xs" c="dimmed">
-							{t("rebaseConflictMain")} → {t("rebaseConflictYours")}
-						</Text>
-						<DiffView
-							oldStr={conflict.theirs}
-							newStr={conflict.yours}
-							language="markdown"
-							maxHeight={280}
-							wordWrap
-						/>
-					</Stack>
-				</Alert>
-			) : null}
-
 			<Group justify="space-between">
 				<Badge variant="light" color={isActive ? "blue" : "gray"}>
 					{t(`personalEntryStatus_${draft.status}`)}
@@ -863,12 +772,7 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 						variant="light"
 						loading={updateDraft.isPending}
 						disabled={!isActive}
-						onClick={() =>
-							updateDraft.mutate(
-								{ draftId: draft.id, entryId, content },
-								{ onSuccess: () => setDirty(false) },
-							)
-						}
+						onClick={saveDraft}
 					>
 						{t("saveDraft")}
 					</Button>
@@ -897,30 +801,20 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 				</Group>
 			</Group>
 
-			<Textarea
+			<KnowledgeEditor
 				label={t("draftContent")}
 				value={content}
-				onChange={(e) => {
-					setContent(e.currentTarget.value);
+				onChange={(v) => {
+					setContent(v);
 					setDirty(true);
 				}}
-				autosize
-				minRows={8}
-				maxRows={24}
+				savedValue={draft.content}
+				baseline={mainContent}
+				baselineLabel={isDrifted ? t("mainVsDraft") : t("draftVsMain")}
+				onSave={saveDraft}
+				saving={updateDraft.isPending}
+				readOnly={!isActive}
 			/>
-
-			<div>
-				<Text size="xs" c="dimmed" mb={4}>
-					{isDrifted ? t("mainVsDraft") : t("draftVsMain")}
-				</Text>
-				<DiffView
-					oldStr={mainContent}
-					newStr={content}
-					language="markdown"
-					maxHeight={320}
-					wordWrap
-				/>
-			</div>
 		</Stack>
 	);
 }
@@ -928,11 +822,14 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 function SubmissionsTab({
 	entryId,
 	mainContent,
+	canReviewEntry,
 	focusSubmissionId,
 	onSelectSubmission,
 }: {
 	entryId: string;
 	mainContent: string;
+	/** viewerCaps.canReview — the server's review authority on this entry. */
+	canReviewEntry: boolean;
 	focusSubmissionId: string | null;
 	onSelectSubmission: (submissionId: string) => void;
 }) {
@@ -1019,21 +916,7 @@ function SubmissionsTab({
 													{t("subFlowRound", { round: s.round })}
 												</Badge>
 											) : null}
-											<Badge
-												size="xs"
-												variant="light"
-												color={
-													s.status === "conflict"
-														? "orange"
-														: s.status === "pending"
-															? "blue"
-															: s.status === "changes_requested"
-																? "yellow"
-																: "gray"
-												}
-											>
-												{t(`submissionStatus_${s.status}`)}
-											</Badge>
+											<SubmissionStatusBadge status={s.status} />
 										</Group>
 									</Group>
 									<SubmissionFindings findings={s.findingsJson} />
@@ -1061,13 +944,10 @@ function SubmissionsTab({
 						submission={detail.data}
 						currentContent={mainContent}
 						canReview={
-							// Backend listSubmissions only returns submissions the user may
-							// review (or everything for admins). Checked against `reviewable`,
-							// NOT the merged list, which also holds the caller's own requests.
-							// A user may never review their OWN submission (the server rejects
-							// it), so exclude that case.
-							(isAdmin || reviewable.some((s) => s.id === detail.data?.id)) &&
-							detail.data.submitterUserId !== user?.id
+							// Review authority on this entry comes from the server
+							// (viewerCaps.canReview). Self-review is a per-submission rule: the
+							// UI keeps an author away from their OWN request.
+							canReviewEntry && detail.data.submitterUserId !== user?.id
 						}
 						onDone={() => setSelectedId(null)}
 					/>
