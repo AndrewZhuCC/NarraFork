@@ -7,6 +7,12 @@ export const CONTEXT_COMPOSITION_LIMITS = {
 	toolBatch: 256,
 	toolCache: 1024,
 	sliceMs: 4,
+	/**
+	 * Cheap rows must still pause eventually so cancellation can run, but a timer
+	 * turn per SQL batch made cold rebuild wall time track history length and
+	 * tripped the slow-rebuild warning while SQL itself stayed small.
+	 */
+	sliceUnits: 2048,
 	pageSegments: 128,
 	responseBytes: 256 * 1024,
 } as const;
@@ -64,23 +70,27 @@ const executionOrder = (a: NumericTool, b: NumericTool) =>
 					? 1
 					: 0;
 
-/** Check cancellation at boundaries; yield after 4ms or a hard work-count boundary. */
+/**
+ * Pause only after 4ms of work or a large cheap-unit budget.
+ * Returning undefined (instead of an already-resolved promise) keeps the fast path
+ * synchronous: awaiting a resolved promise once per segment is itself a timer-scale cost.
+ */
 function timeSlice(check: () => void) {
 	let started = performance.now();
 	let work = 0;
-	return async (count = 1, force = false) => {
+	return (count = 1): Promise<void> | undefined => {
 		work += count;
 		if (
-			!force &&
-			work < CONTEXT_COMPOSITION_LIMITS.toolBatch &&
+			work < CONTEXT_COMPOSITION_LIMITS.sliceUnits &&
 			performance.now() - started < CONTEXT_COMPOSITION_LIMITS.sliceMs
 		)
 			return;
 		check();
-		await yieldContextReader();
-		check();
-		started = performance.now();
-		work = 0;
+		return yieldContextReader().then(() => {
+			check();
+			started = performance.now();
+			work = 0;
+		});
 	};
 }
 
@@ -115,12 +125,12 @@ async function readBatchTools(
 			}
 			const previous = calls.get(tool.toolUseId);
 			if (!previous || newerThan(tool, previous)) calls.set(tool.toolUseId, tool);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		if (tools.length < CONTEXT_COMPOSITION_LIMITS.toolBatch) return byMessage;
 		messageId = tools[tools.length - 1].messageId;
 		id = tools[tools.length - 1].id;
-		await slice(0, true);
 	}
 }
 
@@ -147,12 +157,15 @@ async function* streamMessageTools(
 			.all(messageId, time, id, CONTEXT_COMPOSITION_LIMITS.toolBatch);
 		for (const tool of tools) {
 			if (tool.isLatest) yield tool;
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		if (tools.length < CONTEXT_COMPOSITION_LIMITS.toolBatch) return;
 		id = tools[tools.length - 1].id;
 		time = tools[tools.length - 1].createdAt;
-		await slice(0, true);
+		// A 5000-attempt call is many full pages. Pause between pages so that scan cannot
+		// run to completion on the main thread; the common batched reader stays on sliceUnits.
+		await yieldContextReader();
 	}
 }
 
@@ -169,7 +182,8 @@ async function projectRow(
 	if (row.role === "system") {
 		for (const segment of metadata) {
 			if (segment.category === "summary") segments.push(segment);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		return segments;
 	}
@@ -212,7 +226,8 @@ async function projectRow(
 						segments.push({ category: "toolCall", chars: safeCharacters(tool.inputChars) });
 				}
 			} else if (segment.category !== "toolResult") segments.push(segment);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 	}
 	const results: ContextSegment[] = [];
@@ -227,12 +242,14 @@ async function projectRow(
 	} else {
 		for (const tool of [...(tools?.values() ?? [])].sort(executionOrder)) {
 			append(tool);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 	}
 	for (const result of results) {
 		segments.push(result);
-		await slice();
+		const pending = slice();
+		if (pending) await pending;
 	}
 	return segments;
 }
@@ -283,11 +300,11 @@ export async function* readContextHistoryEntries(
 					? await projectRow(database, row, tools?.get(row.id), tools === null, slice, check)
 					: [];
 			yield { messageId: row.id, seq: row.seq, segments };
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		if (rows.length) seq = rows[rows.length - 1].seq;
 		targetOffset += CONTEXT_COMPOSITION_LIMITS.batch;
-		await slice(0, true);
 	}
 }
 
@@ -301,7 +318,8 @@ export async function* readContextHistory(
 	for await (const entry of readContextHistoryEntries(database, narratorId, options)) {
 		for (const segment of entry.segments) {
 			yield segment;
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 	}
 }

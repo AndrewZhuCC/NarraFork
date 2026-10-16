@@ -1825,8 +1825,17 @@ export const narratorToolCalls = sqliteTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
-		// Numeric context keyset paging must not sort the entire message on every batch.
-		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		// Numeric context keyset paging must not sort the entire message on every batch,
+		// and must not open input_json/output_json just to read the character columns.
+		index("idx_toolcalls_context_id").on(
+			table.messageId,
+			table.id,
+			table.toolUseId,
+			table.createdAt,
+			table.executionAttempt,
+			table.inputChars,
+			table.outputChars,
+		),
 		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
 		// Latest attempts are scoped to the canonical message, not its current fork holder.
 		index("idx_toolcalls_context_latest").on(

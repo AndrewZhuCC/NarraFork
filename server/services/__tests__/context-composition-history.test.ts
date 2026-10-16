@@ -112,6 +112,33 @@ test("1000 legacy NULL messages use bounded batch reads, not per-message SQL/che
 	);
 });
 
+test("thousands of refs checkpoint on the unit budget, not once per batch", async () => {
+	const count = 4096;
+	const insert = database.transaction(() => {
+		for (let i = 0; i < count; i++) message(`m${i}`, i, [{ category: "user", chars: 1 }]);
+	});
+	insert();
+	const now = performance.now.bind(performance);
+	const frozen = now();
+	performance.now = () => frozen;
+	let checks = 0;
+	try {
+		const result = await segments({
+			check: () => {
+				checks++;
+			},
+		});
+		expect(result).toHaveLength(count);
+	} finally {
+		performance.now = now;
+	}
+	const batches = Math.ceil(count / CONTEXT_COMPOSITION_LIMITS.batch);
+	// A timer turn per batch calls check() at least twice per batch on top of the
+	// batch and tool probes. The unit budget must stay well under that.
+	expect(checks).toBeGreaterThanOrEqual(batches);
+	expect(checks).toBeLessThan(batches * 3);
+});
+
 test("bulk attempts and marker order preserve cross-narrator latest identity and result packet", async () => {
 	message("m", 1, [
 		{ category: "assistant", chars: 2 },
@@ -332,8 +359,8 @@ test("actual common/fallback SQL needs message-leading indexes under large globa
 	expect(oldCollision.result.every((row) => (row as { isLatest: number }).isLatest === 0)).toBe(
 		true,
 	);
-	// These indexes are fixture-only: no production schema or user database changes.
-	database.run(`CREATE INDEX idx_toolcalls_context_id ON narrator_tool_calls(message_id,id);
+	// Fixture copies of the production numeric indexes. The id index covers the character columns.
+	database.run(`CREATE INDEX idx_toolcalls_context_id ON narrator_tool_calls(message_id,id,tool_use_id,created_at,execution_attempt,input_chars,output_chars);
 	 CREATE INDEX idx_toolcalls_context_order ON narrator_tool_calls(message_id,created_at,id);
 	 CREATE INDEX idx_toolcalls_context_latest ON narrator_tool_calls(message_id,tool_use_id,execution_attempt,created_at,id);`);
 	const indexedTuplePlan = plan(common, commonBindings);
@@ -343,7 +370,7 @@ test("actual common/fallback SQL needs message-leading indexes under large globa
 	expect(indexedTuple.result).toEqual(oldTuple.result);
 	expect(indexedCollision.result).toEqual(oldCollision.result);
 	expect(indexedTuplePlan.join("\n")).not.toContain("TEMP B-TREE");
-	expect(indexedTuplePlan.join("\n")).toContain("idx_toolcalls_context_id");
+	expect(indexedTuplePlan.join("\n")).toContain("COVERING INDEX idx_toolcalls_context_id");
 	expect(indexedCollisionPlan.join("\n")).not.toContain("TEMP B-TREE");
 	expect(indexedCollisionPlan.join("\n")).toContain("idx_toolcalls_context_latest");
 	expect(indexedCollisionPlan.join("\n")).toContain("execution_attempt>?");

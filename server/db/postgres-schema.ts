@@ -964,7 +964,15 @@ export const narratorToolCalls = pgTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
-		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		index("idx_toolcalls_context_id").on(
+			table.messageId,
+			table.id,
+			table.toolUseId,
+			table.createdAt,
+			table.executionAttempt,
+			table.inputChars,
+			table.outputChars,
+		),
 		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
 		index("idx_toolcalls_context_latest").on(
 			table.messageId,
@@ -9815,7 +9823,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_toolcalls_context_id",
           "columns": [
             "messageId",
-            "id"
+            "id",
+            "toolUseId",
+            "createdAt",
+            "executionAttempt",
+            "inputChars",
+            "outputChars"
           ],
           "unique": false
         },

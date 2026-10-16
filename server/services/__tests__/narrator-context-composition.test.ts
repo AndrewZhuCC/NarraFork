@@ -282,14 +282,17 @@ test("shared message invalidation refreshes existing fullfork numeric caches", a
 
 test("actor removal interrupts a background rebuild and removes its staged generation", async () => {
 	for (let i = 0; i < 150; i++) message(`m${i}`, i, [{ category: "user", chars: 1 }]);
+	// Delete the actor as soon as the first unpublished page lands. A timer poll cannot
+	// see that window once staging no longer yields once per batch.
+	database.run(`CREATE TEMP TRIGGER remove_actor_on_stage
+		AFTER INSERT ON narrator_context_char_pages
+		WHEN NEW.narrator_id = 'n'
+		BEGIN
+			DELETE FROM narrators WHERE id = 'n';
+		END`);
 	await service.get("n");
-	for (let attempt = 0; attempt < 200; attempt++) {
-		if (database.query("SELECT id FROM narrator_context_char_pages LIMIT 1").get()) break;
-		await new Promise<void>((resolve) => setTimeout(resolve, 2));
-	}
-	expect(database.query("SELECT id FROM narrator_context_char_pages LIMIT 1").get()).not.toBeNull();
-	database.run("DELETE FROM narrators WHERE id='n'");
 	await service.settled();
+	expect(database.query("SELECT id FROM narrators WHERE id='n'").get()).toBeNull();
 	expect(database.query("SELECT id FROM narrator_context_char_pages LIMIT 1").get()).toBeNull();
 });
 
@@ -675,7 +678,12 @@ test("warm 1000 refs rereads only one dirty contribution, fresh GET never rebuil
 		.query("UPDATE narrator_messages SET context_chars_json=? WHERE id='m500'")
 		.run(JSON.stringify({ segments: [{ category: "user", chars: 41 }] }));
 	await service.invalidateBatch("n", ["m500"]);
-	expect((await service.get("n")).pending).toBe(true);
+	// Publication no longer waits on a timer turn per batch, so this GET may already
+	// observe the finished cache. Either state is current: pending still serves the
+	// previous total, and a finished rebuild has the adjusted total.
+	const during = await service.get("n");
+	if (during.pending) expect(during.totalChars).toBe(1000);
+	else expect(during.totalChars).toBe(1040);
 	await service.settled();
 	expect((await service.get("n")).totalChars).toBe(1040);
 	expect(metrics).toHaveLength(1);

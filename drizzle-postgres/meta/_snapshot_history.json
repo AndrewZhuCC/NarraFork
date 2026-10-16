@@ -168,6 +168,14 @@
 			"prevId": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
 			"version": "7",
 			"snapshotDigest": "7cf8740acee4caea396d53dfaa786cb7d29552068ea4fd1674a5f34eac764ae6"
+		},
+		{
+			"idx": 21,
+			"tag": "0021_context_character_covering_index",
+			"id": "e3f4b979-4abf-491f-a015-5a1912dc077e",
+			"prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+			"version": "7",
+			"snapshotDigest": "f5a26d8079f5186cc3737fe4fa55034a07432cf688a416f47f717acbb46f690a"
 		}
 	]
 }

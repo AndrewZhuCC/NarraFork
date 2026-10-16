@@ -1,6 +1,6 @@
 {
-  "id": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
-  "prevId": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
+  "id": "e3f4b979-4abf-491f-a015-5a1912dc077e",
+  "prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -13615,6 +13615,36 @@
             },
             {
               "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "tool_use_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "execution_attempt",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "input_chars",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "output_chars",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

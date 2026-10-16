@@ -293,6 +293,7 @@ export function createContextCharacterService(
 				const affected = incremental ? new Set(dirty.ids ?? []) : undefined;
 				if (affected) {
 					let cursor = state.maxSeq;
+					let tailStarted = performance.now();
 					while (true) {
 						check();
 						metrics.queries++;
@@ -308,7 +309,10 @@ export function createContextCharacterService(
 							break;
 						}
 						cursor = tail[tail.length - 1].seq;
-						await yieldContextReader();
+						if (performance.now() - tailStarted >= CONTEXT_COMPOSITION_LIMITS.sliceMs) {
+							await yieldContextReader();
+							tailStarted = performance.now();
+						}
 					}
 				}
 				const adjustTotals = (items: ContextSegment[], direction: number) => {
@@ -332,9 +336,10 @@ export function createContextCharacterService(
 				let sliceStarted = performance.now();
 				const project = async (entry: { segments: ContextSegment[] }) => {
 					for (const segment of entry.segments) {
-						const beforePage = page;
 						append(segment, false);
-						if (page !== beforePage || performance.now() - sliceStarted >= 4) {
+						// Page boundaries are not yields. A timer turn per 128 segments made
+						// every incremental republish cost O(history) even when the bytes were hot.
+						if (performance.now() - sliceStarted >= CONTEXT_COMPOSITION_LIMITS.sliceMs) {
 							check();
 							await yieldContextReader();
 							sliceStarted = performance.now();

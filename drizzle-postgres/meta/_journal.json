@@ -148,6 +148,13 @@
 			"when": 1792089888326,
 			"tag": "0020_history_token_repair_bulk",
 			"breakpoints": true
+		},
+		{
+			"idx": 21,
+			"version": "7",
+			"when": 1792121362230,
+			"tag": "0021_context_character_covering_index",
+			"breakpoints": true
 		}
   ]
 }
