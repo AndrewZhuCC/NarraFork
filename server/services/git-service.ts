@@ -15,7 +15,7 @@ import {
 	GIT_WORKSPACE_WRITE_TIMEOUT_MS,
 } from "../lib/agent/execution/git-workspace-rpc";
 import { PathKeyedMutex, worktreeLock } from "../lib/async-mutex";
-import { AppError, GitAuthError, GitError, ValidationError } from "../lib/errors";
+import { AppError, GitAuthError, GitError, UnbornHeadError, ValidationError } from "../lib/errors";
 import type { GitIdentityEnv } from "../lib/git-identity";
 import { mergeGitTrees, requireCompleteMergeTree } from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
@@ -531,6 +531,41 @@ async function hasNoCommits(repoPath: string): Promise<boolean> {
 }
 
 /**
+ * Branch name HEAD is attached to, including a repository that has no commits yet.
+ *
+ * `rev-parse --abbrev-ref HEAD` exits 128 on an unborn branch (Git prints the literal
+ * `HEAD` and an "ambiguous argument" fatal). `symbolic-ref --short` reads the ref
+ * name without requiring a commit, and fails only for a detached HEAD — where
+ * `--abbrev-ref` then prints `HEAD` and exits 0.
+ */
+async function resolveCurrentBranch(
+	repoPath: string,
+	options?: { timeout?: number; maxOutputBytes?: number },
+): Promise<string> {
+	const symbolic = await execRead(
+		["symbolic-ref", "--quiet", "--short", "HEAD"],
+		repoPath,
+		true,
+		options,
+	);
+	if (symbolic.truncated) throw new GitError("Git branch metadata failed");
+	if (symbolic.exitCode === 0 && symbolic.stdout.trim()) return symbolic.stdout.trim();
+	const abbrev = await execRead(["rev-parse", "--abbrev-ref", "HEAD"], repoPath, true, options);
+	if (abbrev.truncated) throw new GitError("Git branch metadata failed");
+	if (abbrev.exitCode === 0 && abbrev.stdout.trim()) return abbrev.stdout.trim();
+	if (await hasNoCommits(repoPath)) throw new UnbornHeadError();
+	logger.error("git command failed", {
+		args: "rev-parse --abbrev-ref HEAD",
+		cwd: repoPath,
+		stdout: abbrev.stdout || undefined,
+		stderr: abbrev.stderr || symbolic.stderr || undefined,
+		exitCode: abbrev.exitCode,
+		optionalLocks: false,
+	});
+	throw new GitError(gitFailureMessage("Failed to read the current branch", abbrev));
+}
+
+/**
  * Whether `ref` names a branch/commit that simply is not in this repository.
  *
  * The companion to {@link hasNoCommits}, which only ever recognises an unborn HEAD: a
@@ -718,8 +753,7 @@ async function readCommitMeta(repoPath: string, sha: string): Promise<CommitMeta
 
 export const gitService = {
 	async getCurrentBranch(repoPath: string): Promise<string> {
-		const result = await execRead(["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
-		return result.stdout;
+		return resolveCurrentBranch(repoPath);
 	},
 
 	async branchExists(repoPath: string, branchName: string): Promise<boolean> {
@@ -805,9 +839,21 @@ export const gitService = {
 	},
 
 	async getHeadCommit(repoPath: string): Promise<string> {
-		const result = await execRead(["rev-parse", "HEAD"], repoPath);
-		if (result.exitCode !== 0) throw new GitError(`Failed to get HEAD commit: ${result.stderr}`);
-		return result.stdout;
+		// `--verify --quiet` exits 1 with no output when HEAD has no commit. Plain
+		// `rev-parse HEAD` exits 128 and is logged as a hard failure for that same state.
+		const result = await execRead(["rev-parse", "--verify", "--quiet", "HEAD"], repoPath, true);
+		const sha = result.stdout.trim();
+		if (result.exitCode === 0 && sha) return sha;
+		if (result.exitCode === 1 && !sha && !result.stderr.trim()) throw new UnbornHeadError();
+		logger.error("git command failed", {
+			args: "rev-parse --verify --quiet HEAD",
+			cwd: repoPath,
+			stdout: result.stdout || undefined,
+			stderr: result.stderr || undefined,
+			exitCode: result.exitCode,
+			optionalLocks: false,
+		});
+		throw new GitError(gitFailureMessage("Failed to get HEAD commit", result));
 	},
 
 	async getRefCommit(repoPath: string, ref: string): Promise<string> {
@@ -1172,8 +1218,8 @@ export const gitService = {
 					const queries = [
 						execRead(["rev-parse", "--show-prefix"], cwd, true, metadataOptions),
 						readGitStatusStream(cwd, boundedSignal),
-						execRead(["rev-parse", "--verify", "HEAD"], cwd, true, metadataOptions),
-						execRead(["rev-parse", "--abbrev-ref", "HEAD"], cwd, true, metadataOptions),
+						execRead(["rev-parse", "--verify", "--quiet", "HEAD"], cwd, true, metadataOptions),
+						execRead(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, true, metadataOptions),
 					] as const;
 					const [prefix, status, head, branch] = await Promise.all(queries).catch(async (error) => {
 						// Keep the coordinator slot until every sibling process has exited.
@@ -1184,10 +1230,12 @@ export const gitService = {
 					boundedSignal.throwIfAborted();
 					if (prefix.exitCode !== 0 || prefix.truncated || head.truncated || branch.truncated)
 						throw new GitError("Git status metadata failed");
+					// symbolic-ref already named an attached branch, including one with no commits.
+					// It fails for detached HEAD, where abbrev-ref prints the literal "HEAD".
 					const branchResult =
-						branch.exitCode === 0
+						branch.exitCode === 0 && branch.stdout.trim()
 							? branch
-							: await execRead(["symbolic-ref", "--short", "HEAD"], cwd, true, metadataOptions);
+							: await execRead(["rev-parse", "--abbrev-ref", "HEAD"], cwd, true, metadataOptions);
 					boundedSignal.throwIfAborted();
 					if (branchResult.exitCode !== 0 || branchResult.truncated)
 						throw new GitError("Git status branch metadata failed");

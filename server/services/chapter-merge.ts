@@ -4,7 +4,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, reviewConclusions } from "../db/schema";
 import { chapterLock, worktreeLock } from "../lib/async-mutex";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { NotFoundError, UnbornHeadError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { requireCompleteMergeTree, requireMarkerResolvableTree } from "../lib/git-tree-merge";
@@ -177,11 +177,10 @@ async function isUnbornHead(targetWorktree: string): Promise<boolean> {
 /**
  * Read the worktree's *real* git HEAD for a guarded abort.
  *
- * Reuses {@link gitService.getHeadCommit} (bounded `rev-parse HEAD` via `execRead`).
- * That method throws for every non-zero exit, which conflates unborn HEAD with a
- * broken worktree; the secondary probe above separates them. Only an unborn HEAD
- * yields `null`. Any other failure throws — a guard must never interpret "git is
- * broken" as "empty repository, expectedHeadSha null, restore anyway".
+ * {@link gitService.getHeadCommit} throws {@link UnbornHeadError} when the repository
+ * has no commits, and throws when git could not answer. Only the unborn case yields
+ * `null`. Any other failure throws — a guard must never interpret "git is broken" as
+ * "empty repository, expectedHeadSha null, restore anyway".
  */
 async function readRealHeadShaForGuard(targetWorktree: string): Promise<string | null> {
 	try {
@@ -190,6 +189,7 @@ async function readRealHeadShaForGuard(targetWorktree: string): Promise<string |
 		// Resolved to empty: treat as unreadable, not as empty-repo.
 	} catch (err) {
 		if (isResourceProtectionError(err)) throw err;
+		if (err instanceof UnbornHeadError) return null;
 		if (await isUnbornHead(targetWorktree)) return null;
 		throw new ValidationError(
 			`Cannot abort snapshot merge: failed to read HEAD in ${targetWorktree}: ` +

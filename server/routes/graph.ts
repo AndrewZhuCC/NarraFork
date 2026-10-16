@@ -2,7 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { chapters } from "../db/schema";
-import { ValidationError } from "../lib/errors";
+import { UnbornHeadError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
@@ -282,6 +282,9 @@ graphRoutes.get("/:id/graph", async (c) => {
 							}
 						}
 					} catch (err) {
+						// An empty repository has no commit to refresh. Counting it as a
+						// failure marked every new project degraded until the first commit.
+						if (err instanceof UnbornHeadError) return;
 						// Still non-fatal — the cached commit count and HEAD are served as-is.
 						// But it is counted, because swallowing it silently is what made the
 						// `allSettled` check below dead code: this catch is inside the mapped

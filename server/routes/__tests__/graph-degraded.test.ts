@@ -20,6 +20,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
 import { chapters, projects } from "../../db/schema";
+import { UnbornHeadError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { commitSyncService } from "../../services/commit-sync-service";
 import { gitService } from "../../services/git-service";
@@ -200,6 +201,17 @@ describe("GET /projects/:id/graph degradation reporting", () => {
 			feature: "graph.commitSync",
 			failedChapters: 5,
 		});
+	});
+
+	test("does not degrade a repository that has no commits yet", async () => {
+		stub(gitService, "getHeadCommit", async () => {
+			throw new UnbornHeadError();
+		});
+
+		const graph = await getGraph();
+
+		expect(graph.degraded).toBe(false);
+		expect(graph.fallbacks).toEqual([]);
 	});
 
 	test("reports a healthy graph when the git refresh succeeds", async () => {

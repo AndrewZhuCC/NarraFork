@@ -185,6 +185,21 @@ export class GitError extends AppError {
 	}
 }
 
+/**
+ * HEAD does not name a commit yet.
+ *
+ * `git init` leaves HEAD as a symbolic ref with no object behind it. Asking
+ * `rev-parse` for that name exits 128 and prints an "ambiguous argument" fatal,
+ * which is the ordinary empty-repository state, not a broken worktree.
+ */
+export class UnbornHeadError extends GitError {
+	constructor() {
+		super("Repository has no commits yet");
+		this.name = "UnbornHeadError";
+		this.code = "GIT_UNBORN_HEAD";
+	}
+}
+
 export class GitAuthError extends AppError {
 	/**
 	 * Same rule as {@link ForbiddenError}: the catalog entry is attached only for the
