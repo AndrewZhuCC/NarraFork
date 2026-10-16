@@ -652,6 +652,21 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 				.limit(limit);
 		},
 
+		async findActivePersonalEntryId(entryId, authorUserId) {
+			const rows = await db
+				.select({ id: knowledgeDrafts.id })
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.entryId, entryId),
+						eq(knowledgeDrafts.authorUserId, authorUserId),
+						eq(knowledgeDrafts.status, "active"),
+					),
+				)
+				.limit(1);
+			return rows[0]?.id ?? null;
+		},
+
 		async listKnowledgeAclEventRows(opts) {
 			const conds = [like(aclEvents.scopeType, "knowledge%")];
 			if (opts.eventType) conds.push(eq(aclEvents.eventType, opts.eventType));

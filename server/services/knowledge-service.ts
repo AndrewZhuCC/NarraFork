@@ -14,11 +14,15 @@ import { type KnowledgeCollectionRow, WriteConflictError } from "./knowledge/wri
 import {
 	type AclCollection,
 	type AclEntry,
+	canAdministerKnowledgeAcl,
+	canDirectWriteEntry,
 	canRead,
 	canReadCollection,
+	canReview,
 	canWriteCollection,
 	canWriteMain,
 	isCollectionOwnerOrAdmin,
+	isEntryOwnerOrAdmin,
 	type Principal,
 	type PrincipalCaps,
 	resolveCapsByUserId,
@@ -200,21 +204,73 @@ function keywordsMirror(keywords: string[]): string | null {
  */
 const COLLECTION_LIST_MAX = 500;
 
-async function listCollections(projectId?: string, principal?: Principal) {
+async function listReadableCollections(projectId: string | undefined, caps: PrincipalCaps) {
 	const rows = await knowledgeReadStore.listCollections({
 		...(projectId !== undefined ? { projectId } : {}),
 		limit: COLLECTION_LIST_MAX,
 	});
-	// When a principal is supplied, hide collections they cannot read (don't leak
-	// existence of restricted collections). admin sees all.
-	if (!principal) return rows;
-	const caps = await resolvePrincipalCaps(principal);
+	// Hide collections the principal cannot read (don't leak existence of restricted
+	// collections). admin sees all.
 	if (caps.isAdmin) return rows;
 	const out: typeof rows = [];
 	for (const c of rows) {
 		if (await canReadCollection(caps, toAclCollection(c))) out.push(c);
 	}
 	return out;
+}
+
+async function listCollections(projectId?: string, principal?: Principal) {
+	if (!principal) {
+		return knowledgeReadStore.listCollections({
+			...(projectId !== undefined ? { projectId } : {}),
+			limit: COLLECTION_LIST_MAX,
+		});
+	}
+	return listReadableCollections(projectId, await resolvePrincipalCaps(principal));
+}
+
+/** What the requesting principal may do with one collection (see {@link collectionViewerCaps}). */
+export interface KnowledgeCollectionViewerCaps {
+	/** Rename / re-describe — `PATCH /collections/:id` (assertCanManageCollection). */
+	canEdit: boolean;
+	/** Level / controlled tags — `PATCH /collections/:id/acl` (requireAdmin). */
+	canManageAcl: boolean;
+	/** `POST /collections/:id/transfer-owner` (assertCanManageCollection). */
+	canTransferOwner: boolean;
+	/** `DELETE /collections/:id` (assertCanManageCollection). */
+	canDelete: boolean;
+	/** `POST /entries` into this collection (createEntry's canWriteCollection gate). */
+	canCreateEntry: boolean;
+}
+
+/**
+ * Capability bits for a collection the principal can already READ. Every flag is the exact
+ * predicate the corresponding write path evaluates after its read gate, so a button shown on
+ * these bits is a call the server will accept (modulo per-request input checks such as
+ * "only an admin may set owner to null").
+ */
+export function collectionViewerCaps(
+	caps: PrincipalCaps,
+	collection: AclCollection,
+): KnowledgeCollectionViewerCaps {
+	const manage = isCollectionOwnerOrAdmin(caps, collection);
+	return {
+		canEdit: manage,
+		canManageAcl: canAdministerKnowledgeAcl(caps),
+		canTransferOwner: manage,
+		canDelete: manage,
+		canCreateEntry: canWriteCollection(caps, collection),
+	};
+}
+
+/**
+ * Collection list for the UI: the readable collections plus each one's `viewerCaps`. Caps are
+ * resolved ONCE per call and every flag is a pure function of (caps, row) — no per-row query.
+ */
+async function listCollectionsForViewer(projectId: string | undefined, principal: Principal) {
+	const caps = await resolvePrincipalCaps(principal);
+	const rows = await listReadableCollections(projectId, caps);
+	return rows.map((c) => ({ ...c, viewerCaps: collectionViewerCaps(caps, toAclCollection(c)) }));
 }
 
 async function createCollection(input: {
@@ -435,6 +491,68 @@ async function getEntry(
 	return rest;
 }
 
+/** What the requesting principal may do with one entry (see {@link entryViewerCaps}). */
+export interface KnowledgeEntryViewerCaps {
+	/** `POST /entries/:id/revisions` — addRevision's canDirectWriteEntry gate. */
+	canWriteMain: boolean;
+	/** `PATCH /entries/:id` — updateEntryMeta's loadWritableEntry (canWriteMain). */
+	canEditMeta: boolean;
+	/** `PATCH /entries/:id/acl` — requireAdmin (canAdministerKnowledgeAcl). */
+	canManageAcl: boolean;
+	/** `POST /entries/:id/transfer-owner` — assertCanManageEntry (isEntryOwnerOrAdmin). */
+	canTransferOwner: boolean;
+	/** `DELETE /entries/:id` — deleteEntry's loadWritableEntry (canWriteMain). */
+	canDelete: boolean;
+	/** Linked-submission review authority on this entry — canReview (self-review is a
+	 *  per-submission rule and is NOT folded in here). */
+	canReview: boolean;
+	/** The caller's ACTIVE personal version of this entry, if any. */
+	myPersonalEntryId: string | null;
+}
+
+/**
+ * Capability bits for an entry the principal can already READ (the caller has passed canRead,
+ * which includes the collection read gate every write path also runs first). Each flag calls
+ * the same predicate as its write path — see the field docs — so the UI never re-implements
+ * the ACL. One indexed lookup for `myPersonalEntryId`; everything else is pure.
+ */
+export async function entryViewerCaps(
+	caps: PrincipalCaps,
+	entry: AclEntry,
+	collection: AclCollection,
+): Promise<KnowledgeEntryViewerCaps> {
+	const writeMeta = canWriteMain(caps, entry);
+	return {
+		canWriteMain: canDirectWriteEntry(caps, entry, collection),
+		canEditMeta: writeMeta,
+		canManageAcl: canAdministerKnowledgeAcl(caps),
+		canTransferOwner: isEntryOwnerOrAdmin(caps, entry),
+		canDelete: writeMeta,
+		canReview: canReview(caps, entry),
+		myPersonalEntryId: caps.userId
+			? await knowledgeReadStore.findActivePersonalEntryId(entry.id, caps.userId)
+			: null,
+	};
+}
+
+/**
+ * `GET /entries/:id` for the UI: the full entry (with content) plus `viewerCaps`. Same read gate
+ * as {@link getEntry} (unreadable or missing collection → NotFound); caps resolved once.
+ */
+async function getEntryForViewer(id: string, principal: Principal) {
+	const entry = await knowledgeReadStore.getEntryById(id);
+	if (!entry) throw new NotFoundError("Knowledge entry", id);
+	const collection = await knowledgeReadStore.getCollectionById(entry.collectionId);
+	if (!collection) throw new NotFoundError("Knowledge entry", id);
+	const caps = await resolvePrincipalCaps(principal);
+	const aclEntry = toAclEntry(entry);
+	const aclCol = toAclCollection(collection);
+	if (!(await canRead(caps, aclEntry, aclCol))) {
+		throw new NotFoundError("Knowledge entry", id);
+	}
+	return { ...entry, viewerCaps: await entryViewerCaps(caps, aclEntry, aclCol) };
+}
+
 async function createEntry(input: {
 	collectionId: string;
 	title: string;
@@ -568,7 +686,7 @@ async function assertCanManageEntry(
 	if (!(await canReadCollection(caps, aclCol))) {
 		throw new NotFoundError("Knowledge entry", id);
 	}
-	if (!caps.isAdmin && entry.ownerUserId !== caps.userId) {
+	if (!isEntryOwnerOrAdmin(caps, toAclEntry(entry))) {
 		throw new NotFoundError("Knowledge entry", id);
 	}
 	return { entry, caps };
@@ -712,7 +830,7 @@ async function addRevision(
 		// Write authority: entry-level (admin / entry owner / write grant) OR collection
 		// owner. canWriteMain already covers admin/owner/write-grant; canWriteCollection
 		// additionally lets the collection owner write entries in their own collection.
-		if (!canWriteMain(caps, toAclEntry(entryRow)) && !canWriteCollection(caps, aclCol)) {
+		if (!canDirectWriteEntry(caps, toAclEntry(entryRow), aclCol)) {
 			throw new ValidationError(
 				"Direct edits require write permission; submit a draft for review instead",
 			);
@@ -1199,6 +1317,7 @@ export const knowledgeInjectionReads = {
 
 export const knowledgeService = {
 	listCollections,
+	listCollectionsForViewer,
 	createCollection,
 	getCollection,
 	updateCollection,
@@ -1206,6 +1325,7 @@ export const knowledgeService = {
 	transferCollectionOwner,
 	listEntries,
 	getEntry,
+	getEntryForViewer,
 	createEntry,
 	updateEntryMeta,
 	updateEntryAcl,

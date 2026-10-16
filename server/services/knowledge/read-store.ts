@@ -356,6 +356,9 @@ export interface KnowledgeReadStore {
 	/** Authors holding an ACTIVE draft pinned to a base revision of this entry —
 	 *  the drift-notification population, bounded by `limit`. */
 	listActiveDraftHolderIds(entryId: string, limit: number): Promise<{ authorUserId: string }[]>;
+	/** The id of `authorUserId`'s ACTIVE personal version of this entry, or null. One lookup on
+	 *  the (entry_id, author_user_id) index — powers `viewerCaps.myPersonalEntryId`. */
+	findActivePersonalEntryId(entryId: string, authorUserId: string): Promise<string | null>;
 
 	// ── audit read ──
 	/**
