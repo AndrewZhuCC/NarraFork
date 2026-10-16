@@ -277,7 +277,8 @@ describe("validate-local-upgrade", () => {
 			| "0015_nifty_magma"
 			| "0016_high_shiva"
 			| "0017_merge_opensource_083"
-			| "0018_merge_upstream_090",
+			| "0018_merge_upstream_090"
+			| "0204_merge_selfuse_092",
 	) {
 		const root = mkdtempSync(join(tmpdir(), `nf-local-upgrade-${targetTag.slice(0, 4)}-`));
 		try {
@@ -286,10 +287,10 @@ describe("validate-local-upgrade", () => {
 			const journalPath = join(migrations, "meta/_journal.json");
 			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
 			const migrationIndex = journal.entries.findIndex(
-				(entry: { tag: string }) => entry.tag === targetTag,
+				(entry: { tag: string }) => entry.tag === (targetTag === "0204_merge_selfuse_092" ? "0196_narrator_model_history_revision" : targetTag),
 			);
 			if (migrationIndex < 0) throw new Error(`Missing ${targetTag} migration fixture`);
-			const target = journal.entries[migrationIndex] as { tag: string };
+			const targets = journal.entries.slice(migrationIndex, targetTag === "0204_merge_selfuse_092" ? undefined : migrationIndex + 1) as Array<{ tag: string }>;
 			for (const entry of journal.entries.splice(migrationIndex) as Array<{ tag: string }>) {
 				rmSync(join(migrations, `${entry.tag}.sql`));
 			}
@@ -370,11 +371,15 @@ describe("validate-local-upgrade", () => {
 							unknown
 						>)
 					: undefined;
+			if (targetTag === "0204_merge_selfuse_092") {
+				db.run("UPDATE narrators SET turn_ended_at = ? WHERE id = ?", ["2026-10-16T06:00:00Z", narratorId]);
+				db.run("INSERT INTO file_attributions (id, workspace_path, file_path, narrator_id, action, changed_at, lines_added, lines_removed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["attribute-0204", root, "sample.ts", narratorId, "edit", "2026-10-16T06:00:00Z", 2, 1]);
+			}
 			db.close();
 
-			journal.entries.push(target);
+			journal.entries.push(...targets);
 			writeFileSync(journalPath, JSON.stringify(journal));
-			cpSync(join(ROOT, "drizzle", `${target.tag}.sql`), join(migrations, `${target.tag}.sql`));
+			for (const target of targets) cpSync(join(ROOT, "drizzle", `${target.tag}.sql`), join(migrations, `${target.tag}.sql`));
 			const validation = join(root, "validation.db");
 			cpSync(original, validation);
 			const online = join(root, "online.db");
@@ -383,7 +388,7 @@ describe("validate-local-upgrade", () => {
 			const sourceHash = "1".repeat(64);
 			const commit = "a".repeat(40);
 			const version =
-				targetTag === "0018_merge_upstream_090"
+				targetTag === "0204_merge_selfuse_092" ? "0.9.2" : targetTag === "0018_merge_upstream_090"
 					? "0.9.0"
 					: targetTag === "0017_merge_opensource_083"
 						? "0.8.3"
@@ -418,9 +423,7 @@ describe("validate-local-upgrade", () => {
 			expect(child.exitCode, child.stderr.toString()).toBe(0);
 			const report = JSON.parse(child.stdout.toString());
 			expect(report.status).toBe("ok");
-			expect(report.targetMigrations).toEqual([
-				{ tag: target.tag, hash: sha256(join(ROOT, "drizzle", `${target.tag}.sql`)) },
-			]);
+			expect(report.targetMigrations).toEqual(targets.map((target) => ({ tag: target.tag, hash: sha256(join(ROOT, "drizzle", `${target.tag}.sql`)) })));
 			expect(report.backupSha256).toBe(originalHash);
 			expect(report.sourceSha256).toBe(sourceHash);
 			expect(report.commit).toBe(commit);
@@ -434,6 +437,9 @@ describe("validate-local-upgrade", () => {
 			expect(sha256(original)).toBe(originalHash);
 			const upgraded = new Database(validation, { readonly: true });
 			try {
+				if (targetTag === "0204_merge_selfuse_092") {
+					expect(upgraded.query("SELECT narrator_id, lines_added, lines_removed FROM file_attributions WHERE id='attribute-0204'").get()).toEqual({ narrator_id: narratorId, lines_added: 2, lines_removed: 1 });
+				}
 				if (targetTag === "0016_high_shiva") {
 					expect(beforeRef).not.toBeNull();
 					const index = (
@@ -496,7 +502,7 @@ describe("validate-local-upgrade", () => {
 								"SELECT id, created_at, updated_at, traits, next_seq, turn_ended_at FROM narrators",
 							)
 							.get(),
-					).toEqual({ ...before, turn_ended_at: null });
+					).toEqual({ ...before, turn_ended_at: targetTag === "0204_merge_selfuse_092" ? "2026-10-16T06:00:00Z" : null });
 				}
 			} finally {
 				upgraded.close();
@@ -525,4 +531,5 @@ describe("validate-local-upgrade", () => {
 		() => validateTailMigration("0018_merge_upstream_090"),
 		300_000,
 	);
+test("validates the 0196–0204 chain while preserving selfuse fields and rebuilt data", () => validateTailMigration("0204_merge_selfuse_092"), 300_000);
 });

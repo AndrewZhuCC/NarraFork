@@ -15,6 +15,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0016_high_shiva",
 	"0017_merge_opensource_083",
 	"0018_merge_upstream_090",
+	"0204_merge_selfuse_092",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -23,9 +24,20 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0016_high_shiva",
 	"0017_merge_opensource_083",
 	"0018_merge_upstream_090",
+	"0204_merge_selfuse_092",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
 const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
+const MERGE_092_TAGS = [
+	"0196_narrator_model_history_revision", "0197_fluffy_the_professor",
+	"0198_broken_viper", "0199_sudden_richard_fisk", "0200_faithful_major_mapleleaf",
+	"0201_mute_white_tiger", "0202_personal_knowledge_injection",
+	"0203_magical_speed_demon", "0204_merge_selfuse_092",
+];
+const MERGE_092_NEW_TABLES = [
+	"model_history_revision_contracts", "usage_token_repair_candidates", "usage_token_repair_jobs",
+	"resource_protection_paths", "resource_protection_sources",
+];
 const LEGACY_GIT_IDENTITY_FILTER = `u.git_username IS NOT NULL AND trim(u.git_username) <> ''
 	AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
 	AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
@@ -149,7 +161,7 @@ function tableDigest(
 	key = "id",
 ): Record<string, unknown> {
 	if (!tableExists(db, table)) throw new Error(`Missing required table: ${table}`);
-	const selected = columns(db, table).filter((column) => !excluded.has(column));
+	const selected = columns(db, table).filter((column) => !excluded.has(column)).sort();
 	if (!selected.includes(key)) throw new Error(`Missing stable row key: ${table}.${key}`);
 	const statement = db.prepare(
 		`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)} ORDER BY ${quoteIdentifier(key)}`,
@@ -173,6 +185,14 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0204_merge_selfuse_092") {
+		return {
+			narrators: tableDigest(db, "narrators", excludeNew ? new Set(["model_history_revision"]) : new Set()),
+			scheduled_tasks: tableDigest(db, "scheduled_tasks"),
+			file_attributions: tableDigest(db, "file_attributions"),
+			knowledge_injection_events: tableDigest(db, "knowledge_injection_events", excludeNew ? new Set(["personal_entry_id"]) : new Set()),
+		};
+	}
 	if (targetTag === "0018_merge_upstream_090") {
 		return {
 			users: tableDigest(db, "users"),
@@ -307,6 +327,23 @@ function schemaShape(db: Database, targetTag?: string): Record<string, unknown> 
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
+	if (targetTag === "0204_merge_selfuse_092") {
+		for (const table of [...MERGE_092_NEW_TABLES, "file_attributions", "knowledge_injection_events"]) shape[table] = tableSchemaShape(db, table);
+		for (const [table, names] of [
+			["narrators", ["model_history_revision", "turn_ended_at"]],
+			["narrator_messages", ["body_revision"]],
+			["narrator_tool_calls", ["model_revision"]],
+			["user_preferences", ["spec_tab_layout"]],
+			["api_requests", ["token_accounting_version", "token_accounting_review_version"]],
+			["scheduled_tasks", ["reasoning_effort"]],
+		] as const) for (const name of names) shape[`${table}.${name}`] = columnShape(db, table, name);
+		shape.modelHistoryTriggers = db.query("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'model_history_v1_%' ORDER BY name").all();
+		for (const name of ["idx_api_requests_token_repair_pending", "idx_api_requests_token_repair_reviewed"]) {
+			const index = db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?").get(name);
+			if (!index) throw new Error(`Missing index: ${name}`);
+			shape[name] = index;
+		}
+	}
 	if (targetTag === "0018_merge_upstream_090") {
 		for (const table of MERGE_090_NEW_TABLES) shape[table] = tableSchemaShape(db, table);
 		shape["background_tasks.background_kind"] = columnShape(
@@ -447,16 +484,18 @@ async function main() {
 		const beforeLedger = new Set(ledger(db));
 		const pending = migrationsWithTags.filter((migration) => !beforeLedger.has(migration.hash));
 		const target = pending.at(-1);
+		const merge092Chain = canonical(pending.map((migration) => migration.tag)) === canonical(MERGE_092_TAGS);
 		const merge083Pair =
 			pending.length === 2 &&
 			pending[0].tag === "0016_high_shiva" &&
 			target?.tag === "0017_merge_opensource_083";
 		if (
-			(!merge083Pair && pending.length !== 1) ||
+			(!merge083Pair && !merge092Chain && pending.length !== 1) ||
 			!target?.tag ||
-			!ALLOWED_TARGET_TAGS.has(target.tag)
-		) {
-			throw new Error("Validation requires an allowed single migration or the 0016 + 0017 pair");
+			!ALLOWED_TARGET_TAGS.has(target.tag) ||
+			(target.tag === "0204_merge_selfuse_092" && !merge092Chain)
+			) {
+			throw new Error("Validation requires a reviewed single migration, 0016 + 0017 pair, or complete 0196–0204 chain");
 		}
 		const affectedForUpgrade = (excludeNew: boolean) => ({
 			...affectedSummary(db, target.tag, excludeNew),
@@ -497,8 +536,13 @@ async function main() {
 							? MERGE_083_NEW_TABLES
 							: target.tag === "0018_merge_upstream_090"
 								? MERGE_090_NEW_TABLES
-								: [];
+								: target.tag === "0204_merge_selfuse_092" ? MERGE_092_NEW_TABLES : [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
+		if (merge092Chain) {
+			if (!("model_history_revision_contracts" in beforeCounts)) expectedCounts.model_history_revision_contracts = 1;
+			const contract = db.query("SELECT installed_version FROM model_history_revision_contracts WHERE id='model-history'").get() as { installed_version: string } | null;
+			if (contract?.installed_version !== "model-history-v1") throw new Error("Model history revision contract missing");
+		}
 		if (legacyGitIdentityCount !== null) {
 			expectedCounts.user_git_identities = legacyGitIdentityCount;
 			const missingIdentity = db

@@ -258,7 +258,11 @@ def main():
             ['0016_high_shiva.sql'], ['0017_merge_opensource_083.sql'],
             ['0018_merge_upstream_090.sql'],
             ['0016_high_shiva.sql', '0017_merge_opensource_083.sql'],
-        ), ('Validation is limited to reviewed migrations (0012 through 0018, or 0016 + 0017)',
+            ['0196_narrator_model_history_revision.sql', '0197_fluffy_the_professor.sql',
+             '0198_broken_viper.sql', '0199_sudden_richard_fisk.sql', '0200_faithful_major_mapleleaf.sql',
+             '0201_mute_white_tiger.sql', '0202_personal_knowledge_injection.sql',
+             '0203_magical_speed_demon.sql', '0204_merge_selfuse_092.sql'],
+        ), ('Validation requires reviewed migrations or the complete 0196–0204 chain',
             [item['name'] for item in pending_files])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)

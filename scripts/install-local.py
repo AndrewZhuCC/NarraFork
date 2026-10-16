@@ -230,7 +230,11 @@ def main():
             ['0012_curved_bloodstorm'], ['0013_omniscient_dormammu'],
             ['0014_blue_tomorrow_man'], ['0015_nifty_magma'], ['0016_high_shiva'],
             ['0017_merge_opensource_083'], ['0018_merge_upstream_090'],
-        ), ('Validation is limited to a single reviewed migration (0012 through 0018)',
+            ['0196_narrator_model_history_revision', '0197_fluffy_the_professor',
+             '0198_broken_viper', '0199_sudden_richard_fisk', '0200_faithful_major_mapleleaf',
+             '0201_mute_white_tiger', '0202_personal_knowledge_injection',
+             '0203_magical_speed_demon', '0204_merge_selfuse_092'],
+        ), ('Validation requires a reviewed migration or the complete 0196–0204 chain',
             [entry['tag'] for entry in pending])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
