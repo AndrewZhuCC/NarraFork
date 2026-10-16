@@ -1,12 +1,14 @@
 /**
- * Pure routing decisions for the knowledge review UX (docs/KNOWLEDGE_UI_REDESIGN.md §4).
+ * Pure routing decisions for the knowledge UX (docs/KNOWLEDGE_UI_REDESIGN.md §4).
  *
  * Every publish request — linked or standalone, for its author or a reviewer — has one page,
- * `/knowledge/requests/$submissionId`. The legacy URLs (review tab, entry `#submissions` hash)
- * redirect there; the parsing lives here so each redirect row is unit-tested.
+ * `/knowledge/requests/$submissionId`; every personal version — linked or standalone — has one
+ * page, `/knowledge/mine/$personalEntryId`. The legacy URLs (review / my-library tabs, entry
+ * `#submissions` and `#draft` hashes, `/knowledge/personal/<id>`) redirect there; the parsing
+ * lives here so each redirect row is unit-tested.
  */
 
-export const KNOWLEDGE_ENTRY_TABS = ["content", "draft", "history", "links"] as const;
+export const KNOWLEDGE_ENTRY_TABS = ["content", "history", "links"] as const;
 
 export type KnowledgeEntryTab = (typeof KNOWLEDGE_ENTRY_TABS)[number];
 
@@ -19,8 +21,8 @@ export function isKnowledgeSubmissionId(id: unknown): id is string {
 
 /**
  * Read the `/knowledge/$entryId` hash into a tab. Empty, `content` or anything unknown →
- * Content. (`#submissions…` never reaches the page: {@link legacyEntryHashRedirect} sends it to
- * the review inbox / request page first.)
+ * Content. (`#submissions…` and `#draft` never reach the page: {@link legacyEntryHashRedirect}
+ * and {@link legacyDraftHashRedirect} send them to the request / personal-version pages first.)
  */
 export function parseKnowledgeEntryHash(hash: string | undefined | null): KnowledgeEntryTab {
 	const raw = (hash ?? "").replace(/^#/, "").trim();
@@ -32,7 +34,9 @@ export function parseKnowledgeEntryHash(hash: string | undefined | null): Knowle
 /** A redirect target for a legacy knowledge URL. */
 export type KnowledgeLegacyRedirect =
 	| { to: "/knowledge/review"; search: KnowledgeReviewSearch }
-	| { to: "/knowledge/requests/$submissionId"; params: { submissionId: string } };
+	| { to: "/knowledge/requests/$submissionId"; params: { submissionId: string } }
+	| { to: "/knowledge/mine" }
+	| KnowledgePersonalEntryDestination;
 
 /** Search params of the review inbox. */
 export interface KnowledgeReviewSearch {
@@ -73,14 +77,16 @@ export function parseKnowledgeReviewSearch(search: Record<string, unknown>): Kno
 }
 
 /**
- * Legacy `/knowledge?tab=review[&submission=<id>]` (§4.2):
+ * Legacy `/knowledge?tab=…` (§4.2):
  *  - `tab=review&submission=<id>` → `/knowledge/requests/<id>`
  *  - `tab=review` (or a malformed id) → `/knowledge/review`
+ *  - `tab=mylibrary` → `/knowledge/mine`
  * Anything else stays on the browse page (null).
  */
 export function legacyKnowledgeIndexRedirect(
 	search: Record<string, unknown>,
 ): KnowledgeLegacyRedirect | null {
+	if (search.tab === "mylibrary") return { to: "/knowledge/mine" };
 	if (search.tab !== "review") return null;
 	if (isKnowledgeSubmissionId(search.submission)) {
 		return {
@@ -123,7 +129,7 @@ export function legacyEntryHashRedirect(
 
 /**
  * Where a submission row opens — the bell (reviewer inbox rows and author verdicts alike), the
- * review inbox, "my library" and personal-entry histories. One page for every audience.
+ * review inbox, "My" and personal-version histories. One page for every audience.
  */
 export function knowledgeRequestDestination(submissionId: string): {
 	to: "/knowledge/requests/$submissionId";
@@ -132,23 +138,55 @@ export function knowledgeRequestDestination(submissionId: string): {
 	return { to: "/knowledge/requests/$submissionId", params: { submissionId } };
 }
 
+/** The one page of a personal version (linked or standalone). */
+export interface KnowledgePersonalEntryDestination {
+	to: "/knowledge/mine/$personalEntryId";
+	params: { personalEntryId: string };
+}
+
 /**
- * Where a LINKED personal entry's legacy page (`/knowledge/personal/<id>`) should land.
- *
- * Editing lives on the shared entry's Draft tab. An in-flight or already-reviewed request lands
- * on that request's page so its findings are not dropped by the redirect.
+ * Where a personal version opens — "My" rows, the entry page's "my version" button, the request
+ * page's "edit my version", the narrator dock and knowledge hints. Also the legacy
+ * `/knowledge/personal/<id>` redirect (§4.2), for linked and standalone entries alike.
  */
-export function linkedPersonalRedirect(
-	rows: readonly { id: string; status: string; findingsJson?: readonly unknown[] | null }[],
-): { to: "request"; submissionId: string } | { to: "draft" } {
-	const withFindings = rows.find(
-		(s) =>
-			(s.findingsJson?.length ?? 0) > 0 &&
-			(s.status === "changes_requested" || s.status === "rejected" || s.status === "approved"),
-	);
-	const open = rows.find(
-		(s) => s.status === "changes_requested" || s.status === "pending" || s.status === "conflict",
-	);
-	const focus = withFindings ?? open;
-	return focus ? { to: "request", submissionId: focus.id } : { to: "draft" };
+export function knowledgePersonalEntryDestination(
+	personalEntryId: string,
+): KnowledgePersonalEntryDestination {
+	return { to: "/knowledge/mine/$personalEntryId", params: { personalEntryId } };
+}
+
+/** Is this `/knowledge/$entryId` hash the legacy "My draft" tab? */
+export function isLegacyDraftHash(hash: string | undefined | null): boolean {
+	return (hash ?? "").replace(/^#/, "").trim() === "draft";
+}
+
+/** Search params of the entry page (the `#draft` fallback below is the only one). */
+export interface KnowledgeEntrySearch {
+	/** `create` → open the "create personal version" confirmation on arrival. */
+	personal?: "create";
+}
+
+export function parseKnowledgeEntrySearch(search: Record<string, unknown>): KnowledgeEntrySearch {
+	return search.personal === "create" ? { personal: "create" } : {};
+}
+
+/**
+ * Legacy `/knowledge/$entryId#draft` (§4.2), once the caller's personal version id is known
+ * (`viewerCaps.myPersonalEntryId`):
+ *  - a personal version exists → `/knowledge/mine/<id>`
+ *  - none → the entry page itself with `?personal=create`, which opens the create confirmation
+ *    (creating is a write, so it is never done by a redirect)
+ * Other hashes → null.
+ */
+export function legacyDraftHashRedirect(
+	entryId: string,
+	hash: string | undefined | null,
+	myPersonalEntryId: string | null | undefined,
+):
+	| KnowledgePersonalEntryDestination
+	| { to: "/knowledge/$entryId"; params: { entryId: string }; search: KnowledgeEntrySearch }
+	| null {
+	if (!isLegacyDraftHash(hash)) return null;
+	if (myPersonalEntryId) return knowledgePersonalEntryDestination(myPersonalEntryId);
+	return { to: "/knowledge/$entryId", params: { entryId }, search: { personal: "create" } };
 }

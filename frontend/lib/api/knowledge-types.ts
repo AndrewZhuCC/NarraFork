@@ -208,6 +208,10 @@ export interface KnowledgePersonalEntrySummary {
 	 * endpoint, so the badge costs nothing extra. Always false for standalone entries (no main).
 	 */
 	drifted?: boolean;
+	/** Linked: the global entry's title — null when the caller can no longer read it. */
+	entryTitle?: string | null;
+	/** Standalone: the publish target's name — null when unset or not readable. */
+	targetCollectionName?: string | null;
 }
 
 /**
@@ -218,6 +222,45 @@ export interface KnowledgePersonalEntrySummary {
 export interface KnowledgePersonalEntry
 	extends Omit<KnowledgePersonalEntrySummary, "contentLength"> {
 	content: string;
+}
+
+/** Why a personal entry cannot be submitted right now (server `personalEntrySubmitBlockers`). */
+export type KnowledgePersonalSubmitBlocker =
+	| "archived"
+	| "missing_target"
+	| "missing_title"
+	| "open_request";
+
+/**
+ * What the owner may do with one personal version — each flag is the gate of the endpoint it
+ * stands for (edit body, edit standalone metadata, rebase, delete, submit).
+ */
+export interface KnowledgePersonalEntryViewerCaps {
+	canEdit: boolean;
+	canEditMeta: boolean;
+	canRebase: boolean;
+	canDelete: boolean;
+	canSubmit: boolean;
+	submitBlockers: KnowledgePersonalSubmitBlocker[];
+}
+
+/** `GET /personal-entries/:id`: the personal-version page payload. */
+export interface KnowledgePersonalEntryDetail extends KnowledgePersonalEntry {
+	/** Linked and readable only. */
+	entryTitle: string | null;
+	/** Linked and readable only: the diff baseline. */
+	currentMainContent: string | null;
+	/** Linked and readable only. */
+	drift: { drifted: boolean; versionsBehind: number } | null;
+	targetCollectionName: string | null;
+	/** Requests a delete would close (pending / conflict / changes requested), newest first. */
+	openSubmissions: {
+		id: string;
+		status: KnowledgeSubmissionStatus;
+		round: number;
+		createdAt: string;
+	}[];
+	viewerCaps: KnowledgePersonalEntryViewerCaps;
 }
 
 /**

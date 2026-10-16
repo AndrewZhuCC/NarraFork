@@ -36,11 +36,10 @@ import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, redirect, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { DriftBanner } from "../../components/knowledge/DriftBanner";
 import { EntryAclPanel } from "../../components/knowledge/EntryAclPanel";
 import { EntryMetaPanel } from "../../components/knowledge/EntryMetaPanel";
 import { KnowledgeEditor } from "../../components/knowledge/editor/KnowledgeEditor";
-import { PersonalEntryRequests } from "../../components/knowledge/PersonalEntryRequests";
+import { PersonalVersionAction } from "../../components/knowledge/personal/PersonalVersionAction";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { DiffView } from "../../components/narrator/diff/DiffView";
 import { MarkdownContent } from "../../components/narrator/markdown/MarkdownContent";
@@ -48,23 +47,24 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useAddKnowledgeRevision,
 	useCreateEntryLink,
-	useCreateKnowledgeDraft,
 	useDeleteEntryLink,
 	useDeleteKnowledgeEntry,
 	useEntryLinks,
-	useKnowledgeDraftDrift,
 	useKnowledgeEntriesPaged,
 	useKnowledgeEntry,
 	useKnowledgeRevision,
 	useKnowledgeRevisions,
-	useMyKnowledgeDraft,
-	useSubmitKnowledgeDraft,
-	useUpdateKnowledgeDraft,
 } from "../../hooks/useKnowledge";
 import type { KnowledgeEntry, KnowledgeEntryLink, KnowledgeLinkType } from "../../lib/api";
 import { api } from "../../lib/api";
 import { formatLocaleDateTime } from "../../lib/intl-format";
-import { legacyEntryHashRedirect, parseKnowledgeEntryHash } from "../../lib/knowledge-review-nav";
+import {
+	isLegacyDraftHash,
+	legacyDraftHashRedirect,
+	legacyEntryHashRedirect,
+	parseKnowledgeEntryHash,
+	parseKnowledgeEntrySearch,
+} from "../../lib/knowledge-review-nav";
 
 function LinksSummary({ entryId }: { entryId: string }) {
 	const { t } = useTranslation("knowledge");
@@ -211,20 +211,39 @@ function ReadOnlyMetaView({ entry }: { entry: KnowledgeEntry }) {
 }
 
 export const Route = createFileRoute("/knowledge/$entryId")({
-	// Legacy `#submissions[/<id>]` (§4.2): requests have their own page and the review inbox.
-	beforeLoad: ({ params, location }) => {
+	beforeLoad: async ({ params, location, context }) => {
+		// Legacy `#submissions[/<id>]` (§4.2): requests have their own page and the review inbox.
 		const target = legacyEntryHashRedirect(params.entryId, location.hash);
 		if (target) throw redirect({ ...target, replace: true });
+		// Legacy `#draft` (§4.2): the personal version has its own page. Which one is only known
+		// from the entry's viewerCaps, so this one row reads the (cached) entry query first. An
+		// unreadable entry falls through to the create prompt, which the not-found page never shows.
+		if (isLegacyDraftHash(location.hash)) {
+			let myPersonalEntryId: string | null = null;
+			try {
+				const entry = await context.queryClient.ensureQueryData({
+					queryKey: ["knowledge", "entry", params.entryId],
+					queryFn: () => api.getKnowledgeEntry(params.entryId),
+				});
+				myPersonalEntryId = entry.viewerCaps.myPersonalEntryId;
+			} catch {
+				myPersonalEntryId = null;
+			}
+			const dest = legacyDraftHashRedirect(params.entryId, location.hash, myPersonalEntryId);
+			if (dest) throw redirect({ ...dest, replace: true });
+		}
 	},
+	validateSearch: parseKnowledgeEntrySearch,
 	component: EntryDetailPage,
 });
 
 function EntryDetailPage() {
 	const { t } = useTranslation("knowledge");
 	const { entryId } = Route.useParams();
+	const { personal } = Route.useSearch();
 	const navigate = useNavigate();
 	const entry = useKnowledgeEntry(entryId);
-	// The hash is the tab state (`#draft`, `#history`, `#links`).
+	// The hash is the tab state (`#history`, `#links`).
 	const hash = useRouterState({ select: (s) => s.location.hash });
 	const activeTab = parseKnowledgeEntryHash(hash);
 
@@ -286,20 +305,35 @@ function EntryDetailPage() {
 						))}
 					</Group>
 				</div>
-				<EntryOwnerActions
-					entry={e}
-					canTransferOwner={caps.canTransferOwner}
-					canDelete={caps.canDelete}
-				/>
+				<Group gap="xs">
+					<PersonalVersionAction
+						entryId={entryId}
+						myPersonalEntryId={caps.myPersonalEntryId}
+						canWriteMain={caps.canWriteMain}
+						promptCreate={personal === "create"}
+						onPromptClosed={() =>
+							navigate({
+								to: "/knowledge/$entryId",
+								params: { entryId },
+								search: {},
+								replace: true,
+							})
+						}
+					/>
+					<EntryOwnerActions
+						entry={e}
+						canTransferOwner={caps.canTransferOwner}
+						canDelete={caps.canDelete}
+					/>
+				</Group>
 			</Group>
 
 			<Grid gap="lg">
-				{/* Left Column: Content, Draft, History, Links tabs */}
+				{/* Left Column: Content, History, Links tabs */}
 				<Grid.Col span={{ base: 12, md: 8, lg: 9 }}>
 					<Tabs value={activeTab} onChange={goTab} keepMounted={false}>
 						<Tabs.List mb="md">
 							<Tabs.Tab value="content">{t("tabContent")}</Tabs.Tab>
-							<Tabs.Tab value="draft">{t("tabMyDraft")}</Tabs.Tab>
 							<Tabs.Tab value="history">{t("tabHistory")}</Tabs.Tab>
 							<Tabs.Tab value="links">{t("tabLinks")}</Tabs.Tab>
 						</Tabs.List>
@@ -313,9 +347,6 @@ function EntryDetailPage() {
 						</Tabs.Panel>
 						<Tabs.Panel value="history">
 							<HistoryTab entryId={entryId} />
-						</Tabs.Panel>
-						<Tabs.Panel value="draft">
-							<DraftTab entryId={entryId} mainContent={e.currentContent ?? ""} />
 						</Tabs.Panel>
 						<Tabs.Panel value="links">
 							<LinksTab entryId={entryId} collectionId={e.collectionId} />
@@ -649,147 +680,6 @@ function HistoryTab({ entryId }: { entryId: string }) {
 					))}
 				</Stack>
 			)}
-		</Stack>
-	);
-}
-
-function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: string }) {
-	const { t } = useTranslation("knowledge");
-	const myDraft = useMyKnowledgeDraft(entryId);
-	const drift = useKnowledgeDraftDrift(entryId);
-	const createDraft = useCreateKnowledgeDraft();
-	const updateDraft = useUpdateKnowledgeDraft();
-	const submitDraft = useSubmitKnowledgeDraft();
-	const [content, setContent] = useState("");
-	const [dirty, setDirty] = useState(false);
-	// Set when a submit went through on a stale base. The drift banner above warns BEFORE
-	// submitting, but it is dismissible-by-scrolling and easy to walk past; this confirms
-	// after the fact that the reviewer may hit a conflict, while rebasing is still an option.
-	const [submittedDrift, setSubmittedDrift] = useState<number | null>(null);
-
-	const draft = myDraft.data;
-	useEffect(() => {
-		if (draft && !dirty) setContent(draft.content);
-	}, [draft, dirty]);
-
-	if (myDraft.isLoading) {
-		return (
-			<Text size="sm" c="dimmed">
-				{t("loading")}
-			</Text>
-		);
-	}
-
-	if (!draft) {
-		return (
-			<Stack>
-				<Text size="sm" c="dimmed">
-					{t("noDraft")}
-				</Text>
-				<Group>
-					<Button
-						size="xs"
-						loading={createDraft.isPending}
-						onClick={() => createDraft.mutate({ entryId })}
-					>
-						{t("createDraft")}
-					</Button>
-				</Group>
-			</Stack>
-		);
-	}
-
-	// A personal entry is editable while it is in use; `archived` means it was retired
-	// (e.g. after a successful publish) and no longer accepts edits or submissions.
-	const isActive = draft.status === "active";
-
-	const driftData = drift.data;
-	const isDrifted = !!driftData && driftData.hasDraft && driftData.drifted;
-	const versionsBehind = driftData?.hasDraft && driftData.drifted ? driftData.versionsBehind : 0;
-
-	const saveDraft = () =>
-		updateDraft.mutate(
-			{ draftId: draft.id, entryId, content },
-			{ onSuccess: () => setDirty(false) },
-		);
-
-	return (
-		<Stack>
-			<DriftBanner
-				draftId={draft.id}
-				entryId={entryId}
-				drifted={isDrifted}
-				versionsBehind={versionsBehind}
-				onResolved={() => setDirty(false)}
-			/>
-
-			{submittedDrift !== null ? (
-				<Alert
-					color="yellow"
-					title={t("submitDriftTitle")}
-					icon={<IconAlertTriangle size={16} />}
-					withCloseButton
-					onClose={() => setSubmittedDrift(null)}
-				>
-					<Text size="sm">{t("submitDriftDesc", { count: submittedDrift })}</Text>
-				</Alert>
-			) : null}
-
-			<Group justify="space-between">
-				<Badge variant="light" color={isActive ? "blue" : "gray"}>
-					{t(`personalEntryStatus_${draft.status}`)}
-				</Badge>
-				<Group gap="xs">
-					<Button
-						size="xs"
-						variant="light"
-						loading={updateDraft.isPending}
-						disabled={!isActive}
-						onClick={saveDraft}
-					>
-						{t("saveDraft")}
-					</Button>
-					<Button
-						size="xs"
-						loading={submitDraft.isPending || updateDraft.isPending}
-						disabled={!isActive}
-						onClick={async () => {
-							// Persist any unsaved edits before submitting, so the submission
-							// always carries the latest draft content (not the stale DB copy).
-							if (dirty) {
-								await updateDraft.mutateAsync({ draftId: draft.id, entryId, content });
-								setDirty(false);
-							}
-							setSubmittedDrift(null);
-							submitDraft.mutate(
-								{ draftId: draft.id, entryId },
-								{
-									onSuccess: (res) => setSubmittedDrift(res.driftWarning?.versionsBehind ?? null),
-								},
-							);
-						}}
-					>
-						{t("submitForReview")}
-					</Button>
-				</Group>
-			</Group>
-
-			<KnowledgeEditor
-				label={t("draftContent")}
-				value={content}
-				onChange={(v) => {
-					setContent(v);
-					setDirty(true);
-				}}
-				savedValue={draft.content}
-				baseline={mainContent}
-				baselineLabel={isDrifted ? t("mainVsDraft") : t("draftVsMain")}
-				onSave={saveDraft}
-				saving={updateDraft.isPending}
-				readOnly={!isActive}
-			/>
-
-			<PersonalEntryRequests personalEntryId={draft.id} />
 		</Stack>
 	);
 }
