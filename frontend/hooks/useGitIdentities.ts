@@ -23,8 +23,10 @@ export interface NarratorGitIdentityState {
 
 const IDENTITIES_KEY = ["auth", "git-identities"] as const;
 
-const narratorPickKey = (narratorId: string) =>
-	[...IDENTITIES_KEY, "narrator", narratorId] as const;
+/** Query key for one caller's pick on one narrator. Shared by the details panel and create flow. */
+export function narratorGitIdentityQueryKey(narratorId: string) {
+	return [...IDENTITIES_KEY, "narrator", narratorId] as const;
+}
 
 /** Every identity write reports the same way: a toast naming what the server refused. */
 function useIdentityWriteFailure(): (error: unknown) => void {
@@ -38,19 +40,20 @@ function useIdentityWriteFailure(): (error: unknown) => void {
 	};
 }
 
-/** The caller's identities. */
-export function useGitIdentities() {
+/** The caller's identities. Pass false to skip the request until a surface is actually shown. */
+export function useGitIdentities(enabled = true) {
 	return useQuery({
 		queryKey: IDENTITIES_KEY,
 		queryFn: () => api.listGitIdentities(),
 		staleTime: 30_000,
+		enabled,
 	});
 }
 
 /** The caller's pick for one narrator, together with the identities to choose from. */
 export function useNarratorGitIdentity(narratorId: string | null) {
 	return useQuery({
-		queryKey: narratorPickKey(narratorId ?? ""),
+		queryKey: narratorGitIdentityQueryKey(narratorId ?? ""),
 		queryFn: () => api.getNarratorGitIdentity(narratorId as string),
 		enabled: !!narratorId,
 		staleTime: 30_000,
@@ -101,7 +104,7 @@ export function useSetNarratorGitIdentity(narratorId: string) {
 	const onError = useIdentityWriteFailure();
 	return useMutation({
 		mutationFn: (identityId: string | null) => api.setNarratorGitIdentity(narratorId, identityId),
-		onSuccess: () => qc.invalidateQueries({ queryKey: narratorPickKey(narratorId) }),
+		onSuccess: () => qc.invalidateQueries({ queryKey: narratorGitIdentityQueryKey(narratorId) }),
 		onError,
 	});
 }

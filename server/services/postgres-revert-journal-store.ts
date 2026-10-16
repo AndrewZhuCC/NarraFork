@@ -88,6 +88,7 @@ type Scan = {
 	allAppliedVerified: boolean;
 	allCompensated: boolean;
 };
+type RunningTotals = { operation: OperationRecord; bytes: number; applied: number };
 
 /**
  * The history commit a caller supplies on PostgreSQL: an ASYNC callback over the
@@ -113,6 +114,8 @@ export class PostgresRevertMutationJournal {
 	private readonly now: () => string;
 	private readonly namespaceKey: string;
 	private readonly plans: PostgresRevertPlanStore;
+	/** Same revision-keyed running totals as the SQLite journal; see `RunningTotalsCache`. */
+	private readonly totals = new J.RunningTotalsCache();
 
 	constructor(
 		private readonly database: BunSQLDatabase,
@@ -380,7 +383,18 @@ export class PostgresRevertMutationJournal {
 			.returning()) as OperationRecord[];
 		const row = result[0];
 		if (!row) throw J.fail("CONCURRENT_CHANGE", "The journal revision changed");
+		// The revision moved; see the SQLite journal. A retried/rolled-back section only misses.
+		this.totals.evict(original.id);
 		return row;
+	}
+
+	/** Totals for the CURRENT revision, reused on an exact revision match, else fully scanned. */
+	private async runningTotals(context: RevertJournalContext): Promise<RunningTotals> {
+		const live = await this.requireOperation(this.database as unknown as Tx, context);
+		const cached = this.totals.get(live);
+		if (cached) return cached;
+		const scan = await this.scan(context);
+		return { operation: scan.operation, bytes: scan.bytes, applied: scan.applied };
 	}
 
 	// ── the write operations ──
@@ -452,7 +466,11 @@ export class PostgresRevertMutationJournal {
 		return withPgRetry(
 			() => this.database.transaction((tx) => this.claimSection(tx, context, fixed, lease, phase)),
 			{ label: `revertJournal.claim.${phase}` },
-		);
+		).then(({ claim, carried }) => {
+			// After COMMIT only; a retried section recomputed `carried` against its own read.
+			if (carried) this.totals.set(carried);
+			return claim;
+		});
 	}
 
 	private async claimSection(
@@ -461,7 +479,7 @@ export class PostgresRevertMutationJournal {
 		fixed: RevertPlanFileMetadata,
 		lease: WorkspaceWriteLease,
 		phase: Phase,
-	): Promise<RevertJournalClaim> {
+	): Promise<{ claim: RevertJournalClaim; carried: RunningTotals | undefined }> {
 		const operation = await this.requireOperation(tx, context);
 		const file = await this.requireFile(tx, operation, fixed.id);
 		J.assertFixedMetadata(file, fixed);
@@ -477,13 +495,16 @@ export class PostgresRevertMutationJournal {
 		if (old) {
 			// Query/idempotence only, even on another connection epoch. Never replace the binding.
 			return {
-				file,
-				mayExecute: false,
-				mutationId,
-				requestDigest,
-				executionBinding: old.executionBinding,
-				expected,
-				desired,
+				claim: {
+					file,
+					mayExecute: false,
+					mutationId,
+					requestDigest,
+					executionBinding: old.executionBinding,
+					expected,
+					desired,
+				},
+				carried: undefined,
 			};
 		}
 		if (phase === "apply") {
@@ -520,15 +541,20 @@ export class PostgresRevertMutationJournal {
 			.returning()) as FileRecord[];
 		const record = result[0];
 		if (!record) throw J.fail("CONCURRENT_CHANGE", "The claimed file changed");
-		await this.updateOperation(tx, operation, {});
+		// A claim changes no evidence bytes or applied count; proven totals carry forward.
+		const carried = this.totals.get(operation);
+		const next = await this.updateOperation(tx, operation, {});
 		return {
-			file: record,
-			mayExecute: true,
-			mutationId,
-			requestDigest,
-			executionBinding: binding,
-			expected,
-			desired,
+			claim: {
+				file: record,
+				mayExecute: true,
+				mutationId,
+				requestDigest,
+				executionBinding: binding,
+				expected,
+				desired,
+			},
+			carried: carried ? { ...carried, operation: next } : undefined,
 		};
 	}
 
@@ -576,9 +602,10 @@ export class PostgresRevertMutationJournal {
 		) {
 			throw J.fail("UNSAFE_COMPENSATION", "Compensation has no confirmed apply baseline");
 		}
-		// Total budget is bounded by the fixed plan and counted pagewise; no global SUM.
-		const scan = await this.scan(context);
-		return withPgRetry(
+		// Total budget is bounded by the fixed plan. The first receipt of a revision proves the
+		// totals with a complete pagewise scan; later receipts carry them forward incrementally.
+		const totals = await this.runningTotals(context);
+		const written = await withPgRetry(
 			() =>
 				this.database.transaction((tx) =>
 					this.recordReceiptSection(
@@ -589,11 +616,14 @@ export class PostgresRevertMutationJournal {
 						fileId,
 						receipt,
 						phase,
-						scan,
+						totals,
 					),
 				),
 			{ label: `revertJournal.recordReceipt.${phase}` },
 		);
+		// Seed only after the transaction committed (see the SQLite journal).
+		this.totals.set(written.totals);
+		return written.record;
 	}
 
 	private async recordReceiptSection(
@@ -604,16 +634,26 @@ export class PostgresRevertMutationJournal {
 		fileId: string,
 		receipt: FileChangeExecutionReceipt,
 		phase: Phase,
-		scan: Scan,
-	): Promise<FileRecord> {
+		totals: RunningTotals,
+	): Promise<{ record: FileRecord; totals: RunningTotals }> {
 		const operation = await this.requireOperation(tx, context);
-		J.assertRevision(original, scan.operation);
+		J.assertRevision(original, totals.operation);
 		J.assertRevision(original, operation);
 		const file = await this.requireFile(tx, operation, fileId);
 		if (!J.equal(file, originalFile)) {
 			throw J.fail("CONCURRENT_CHANGE", "The phase changed during receipt admission");
 		}
-		await this.namespace(tx);
+		// The row checks a complete scan would have applied to THIS file.
+		J.assertFile(operation, file);
+		await this.manifests(tx, operation);
+		for (const state of [
+			file.expectedStateJson,
+			file.desiredStateJson,
+			file.observedAfterStateJson,
+			file.compensationAfterStateJson,
+		]) {
+			if (state) await this.readyState(tx, state);
+		}
 		await this.readyState(tx, receipt.observedAfter);
 		const journal = J.readJournal(file);
 		J.assertBoundReceipt(file, journal[phase], receipt, phase);
@@ -649,7 +689,9 @@ export class PostgresRevertMutationJournal {
 			updatedAt: this.timestamp(file.updatedAt),
 		};
 		J.metadata(updated);
-		J.evidenceBudget(scan.bytes - oldBytes + J.fileBytes(updated));
+		const bytes = totals.bytes - oldBytes + J.fileBytes(updated);
+		J.evidenceBudget(bytes);
+		const appliedCount = totals.applied + (applied ? 1 : 0);
 		const result = (await tx
 			.update(files)
 			.set({
@@ -663,14 +705,14 @@ export class PostgresRevertMutationJournal {
 			.returning()) as FileRecord[];
 		const record = result[0];
 		if (!record) throw J.fail("CONCURRENT_CHANGE", "The receipt's file changed");
-		await this.updateOperation(tx, operation, {
-			appliedFileCount: scan.applied + (applied ? 1 : 0),
+		const next = await this.updateOperation(tx, operation, {
+			appliedFileCount: appliedCount,
 			// Preserve a compensation window so other proven files may still be restored.
 			status:
 				!valid && operation.status !== "compensating" ? "recovery_required" : operation.status,
 			reason: valid ? operation.reason : "result_unverified",
 		});
-		return record;
+		return { record, totals: { operation: next, bytes, applied: appliedCount } };
 	}
 
 	/** Complete, contiguous, <=32-row pages; counts/statuses alone never prove verification. */
@@ -752,23 +794,28 @@ export class PostgresRevertMutationJournal {
 
 	async beginCompensation(ctx: RevertJournalContext): Promise<OperationRecord> {
 		const context = J.normalizeContext(ctx);
-		return withPgRetry(
+		const began = await withPgRetry(
 			() => this.database.transaction((tx) => this.beginCompensationSection(tx, context)),
 			{ label: "revertJournal.beginCompensation" },
 		);
+		if (began.carried) this.totals.set(began.carried);
+		return began.next;
 	}
 
 	private async beginCompensationSection(
 		tx: Tx,
 		context: RevertJournalContext,
-	): Promise<OperationRecord> {
+	): Promise<{ next: OperationRecord; carried: RunningTotals | undefined }> {
 		const operation = await this.requireOperation(tx, context);
-		if (operation.status === "compensating") return operation;
+		if (operation.status === "compensating") return { next: operation, carried: undefined };
 		if (!["applying", "files_verified", "recovery_required"].includes(operation.status)) {
 			throw J.fail("INVALID_TRANSITION", "Committed or unstarted plans cannot compensate");
 		}
 		await this.manifests(tx, operation);
-		return this.updateOperation(tx, operation, { status: "compensating" });
+		// Only the status changes; no file row is touched, so proven totals carry forward.
+		const carried = this.totals.get(operation);
+		const next = await this.updateOperation(tx, operation, { status: "compensating" });
+		return { next, carried: carried ? { ...carried, operation: next } : undefined };
 	}
 
 	/** Unknown apply/compensation is never cleaned away to make this terminal. */

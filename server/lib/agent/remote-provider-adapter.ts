@@ -219,6 +219,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		}
 		const removeAbort = this.listenForAbort(operation, params.signal);
 		const dumpTap = this.createDumpTap(params, chatParams);
+		let usage: ProviderUsage | undefined;
 		let requestStarted = false;
 		let cancelled = false;
 		try {
@@ -241,7 +242,12 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 					requestStarted = true;
 					params.onRequestStart?.();
 				}
-				const mapped = mapStreamEvent(event, {
+				let mergedEvent = event;
+				if ((event.type === "usage" || event.type === "done") && event.usage) {
+					usage = mergeUsage(usage, event.usage);
+					mergedEvent = { ...event, usage };
+				}
+				const mapped = mapStreamEvent(mergedEvent, {
 					providerPrefix: this.providerPrefix,
 					providerTypeId: this.providerTypeId,
 					providerInstanceId: this.providerInstanceId,
@@ -250,6 +256,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 				if (mapped === undefined) continue;
 				if (mapped === CANCELLED) {
+					// A cancelled terminal may be the only (or corrected) billing snapshot.
+					if (event.type === "done" && event.usage && usage) yield mapUsage(usage);
 					// Drain the RPC generator so its post-done error takes precedence.
 					cancelled = true;
 					continue;
@@ -826,7 +834,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						await input.options?.onTextDelta?.(event.text);
 						break;
 					case "usage":
-						usage = event.usage;
+						usage = mergeUsage(usage, event.usage);
 						break;
 					case "error":
 						throw operationError(event.error, {
@@ -845,7 +853,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						if (event.status === "failed") {
 							throw new Error(`Provider generation failed (${event.stopReason})`);
 						}
-						usage = event.usage ?? usage;
+						if (event.usage) usage = mergeUsage(usage, event.usage);
 						return buildGenerateMeta(text, usage, credentialId);
 					case "reasoning.delta":
 						// Surfaced so lightweight callers can show a "thinking" progress
@@ -1011,19 +1019,50 @@ function mapDone(
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function mergeUsage(previous: ProviderUsage | undefined, update: ProviderUsage): ProviderUsage {
+	const merged = { ...previous, ...update };
+	if (update.promptTokens === 0 && (previous?.promptTokens ?? 0) > 0) {
+		merged.promptTokens = previous?.promptTokens;
+	}
+	// An old net counter must not survive a correction to its prompt/cache buckets.
+	// A freshly reported inputTokens (including zero) remains authoritative.
+	if (
+		merged.promptTokens !== undefined &&
+		update.inputTokens === undefined &&
+		((update.promptTokens ?? 0) > 0 ||
+			update.cachedInputTokens !== undefined ||
+			update.cacheCreationInputTokens !== undefined ||
+			update.cacheCreation5mTokens !== undefined ||
+			update.cacheCreation1hTokens !== undefined)
+	) {
+		delete merged.inputTokens;
+	}
+	return merged;
+}
+
 function mapUsage(usage: ProviderUsage): ParsedStreamEvent {
 	return {
 		usage: {
-			...(usage.promptTokens === undefined ? {} : { promptTokens: usage.promptTokens }),
-			...(usage.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
+			...(usage.promptTokens === undefined && usage.inputTokens === undefined
+				? {}
+				: {
+						promptTokens:
+							usage.promptTokens ??
+							(usage.inputTokens ?? 0) + (usage.cachedInputTokens ?? 0) + cacheWriteTokens(usage),
+					}),
+			...(usage.inputTokens === undefined && usage.promptTokens === undefined
+				? {}
+				: { inputTokens: netInputTokens(usage) }),
 			...(usage.completionTokens === undefined ? {} : { completionTokens: usage.completionTokens }),
 			...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
 			...(usage.cachedInputTokens === undefined
 				? {}
 				: { cachedInputTokens: usage.cachedInputTokens }),
-			...(usage.cacheCreationInputTokens === undefined
+			...(usage.cacheCreationInputTokens === undefined &&
+			usage.cacheCreation5mTokens === undefined &&
+			usage.cacheCreation1hTokens === undefined
 				? {}
-				: { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
+				: { cacheCreationInputTokens: cacheWriteTokens(usage) }),
 			...(usage.cacheCreation5mTokens === undefined
 				? {}
 				: { cacheCreation5mTokens: usage.cacheCreation5mTokens }),
@@ -1435,6 +1474,24 @@ function buildGenerateMeta(
 	};
 }
 
+function cacheWriteTokens(usage: ProviderUsage): number {
+	return Math.max(
+		usage.cacheCreationInputTokens ?? 0,
+		(usage.cacheCreation5mTokens ?? 0) + (usage.cacheCreation1hTokens ?? 0),
+	);
+}
+
+function netInputTokens(usage: ProviderUsage): number {
+	// Plugin inputTokens 遵循内部净输入契约；promptTokens 则是含缓存读写的完整输入。
+	return (
+		usage.inputTokens ??
+		Math.max(
+			(usage.promptTokens ?? 0) - (usage.cachedInputTokens ?? 0) - cacheWriteTokens(usage),
+			0,
+		)
+	);
+}
+
 function usageToUsageData(usage: ProviderUsage | undefined): GenerateMetaResult["usage"] {
 	if (!usage) return null;
 	if (
@@ -1442,15 +1499,17 @@ function usageToUsageData(usage: ProviderUsage | undefined): GenerateMetaResult[
 		usage.promptTokens === undefined &&
 		usage.completionTokens === undefined &&
 		usage.cachedInputTokens === undefined &&
-		usage.cacheCreationInputTokens === undefined
+		usage.cacheCreationInputTokens === undefined &&
+		usage.cacheCreation5mTokens === undefined &&
+		usage.cacheCreation1hTokens === undefined
 	) {
 		return null;
 	}
 	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
+		inputTokens: netInputTokens(usage),
 		outputTokens: usage.completionTokens ?? 0,
 		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreationInputTokens: cacheWriteTokens(usage),
 		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,

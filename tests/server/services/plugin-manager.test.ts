@@ -47,6 +47,7 @@ const fixturePackage = fileURLToPath(
 	new URL("../../fixtures/plugins/packages/valid-package", import.meta.url),
 );
 const tempRoots: string[] = [];
+const drainBeforeCleanup: Array<() => Promise<void>> = [];
 
 async function makeTempRoot(base = tmpdir()): Promise<string> {
 	const created = await mkdtemp(join(base, "narrafork-plugin-manager-"));
@@ -83,8 +84,22 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+/** Await actual fire-and-forget lifecycle work, including handlers queued by another handler. */
+function trackRuntimeLifecycle(manager: PluginManager): () => Promise<void> {
+	const pending: Promise<void>[] = [];
+	const internal = manager as unknown as Record<string, (...args: unknown[]) => Promise<void>>;
+	for (const name of ["handleRuntimeStateChange", "observeRuntimeLifecycle"]) {
+		const original = internal[name]?.bind(manager);
+		if (!original) continue;
+		internal[name] = (...args) => {
+			const result = original(...args);
+			pending.push(result);
+			return result;
+		};
+	}
+	return async () => {
+		while (pending.length) await Promise.all(pending.splice(0));
+	};
 }
 
 class FakeRuntime {
@@ -271,22 +286,7 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 			if (blockCrash) restored.resolve();
 		},
 	});
-	// Observe the actual fire-and-forget handler promises, not a sleep followed by
-	// a binding-presence check. This also works before the serialization fix.
-	const pending: Promise<void>[] = [];
-	const internal = manager as unknown as Record<string, (...args: unknown[]) => Promise<void>>;
-	for (const name of ["handleRuntimeStateChange", "observeRuntimeLifecycle"]) {
-		const original = internal[name]?.bind(manager);
-		if (!original) continue;
-		internal[name] = (...args) => {
-			const result = original(...args);
-			pending.push(result);
-			return result;
-		};
-	}
-	const settle = async () => {
-		while (pending.length) await Promise.all(pending.splice(0));
-	};
+	const settle = trackRuntimeLifecycle(manager);
 	const source = await makePackage(root, pluginId, (manifest) => {
 		(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 	});
@@ -338,6 +338,8 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 }
 
 afterEach(async () => {
+	// Also release and drain held operations when Bun times out a test body.
+	for (const drain of drainBeforeCleanup.splice(0)) await drain();
 	for (const root of tempRoots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -1124,24 +1126,32 @@ describe("PluginManager", () => {
 		const pluginB = await manager.install(await makePackage(root, "com.example.concurrencyb"));
 		await Promise.all([manager.enable(pluginA.pluginId), manager.enable(pluginB.pluginId)]);
 		const gate = supervisor.gate(pluginA.pluginId);
-		const firstA = manager.activate(pluginA.pluginId);
-		await gate.entered;
-		const secondA = manager.activate(pluginA.pluginId);
-		await sleep(10);
-		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
-
-		const statusB = await Promise.race([
-			manager.activate(pluginB.pluginId),
-			sleep(250).then(() => {
-				throw new Error("plugin B was blocked by plugin A");
-			}),
-		]);
-		expect(statusB.runtimeState).toBe("active");
-		gate.release();
-		const [statusA1, statusA2] = await Promise.all([firstA, secondA]);
-		expect(statusA1.runtimeState).toBe("active");
-		expect(statusA2.runtimeState).toBe("active");
-		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+		const activations = [manager.activate(pluginA.pluginId)];
+		let draining: Promise<void> | undefined;
+		const drain = () =>
+			(draining ??= (async () => {
+				gate.release();
+				await Promise.allSettled(activations);
+			})());
+		drainBeforeCleanup.push(drain);
+		try {
+			await gate.entered;
+			activations.push(manager.activate(pluginA.pluginId));
+			expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+			const activatingB = manager.activate(pluginB.pluginId);
+			activations.push(activatingB);
+			// B must finish while A's gate is still held; this tests independence,
+			// not whether real Windows journal IO finishes inside an arbitrary 250ms.
+			const statusB = await activatingB;
+			expect(statusB.runtimeState).toBe("active");
+			gate.release();
+			const [statusA1, statusA2] = await Promise.all(activations.slice(0, 2));
+			expect(statusA1?.runtimeState).toBe("active");
+			expect(statusA2?.runtimeState).toBe("active");
+			expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+		} finally {
+			await drain();
+		}
 	});
 
 	test("isolates a revoked residual plugin during initialization", async () => {
@@ -1907,6 +1917,8 @@ describe("PluginManager", () => {
 			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: platform.restorePlugin,
 		});
+		const settle = trackRuntimeLifecycle(manager);
+		drainBeforeCleanup.push(settle);
 		const source = await makePackage(root, pluginId, (manifest) => {
 			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 		});
@@ -1925,9 +1937,9 @@ describe("PluginManager", () => {
 		await supervisor.start(pluginId);
 		expect(runtime.generation).toBe(generationBefore + 1);
 
-		// handleRuntimeStateChange is fire-and-forget from the onStateChange
-		// wrapper, so yield until the revoke+rebind settles.
-		await sleep(50);
+		// onStateChange enqueues revoke+rebind without awaiting it. Drain the actual
+		// handler promises instead of racing a fixed timer against filesystem work.
+		await settle();
 
 		// After the generation change the manager must have revoked the stale
 		// binding and re-registered it for the (still same) runtimeId.
@@ -2046,6 +2058,8 @@ describe("PluginManager", () => {
 			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: platform.restorePlugin,
 		});
+		const settle = trackRuntimeLifecycle(manager);
+		drainBeforeCleanup.push(settle);
 		const source = await makePackage(root, pluginId, (manifest) => {
 			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 		});
@@ -2065,7 +2079,7 @@ describe("PluginManager", () => {
 		const beforeActive = runtime.state;
 		runtime.state = "active";
 		runtime.options.onStateChange?.("active", beforeActive);
-		await sleep(50);
+		await settle();
 
 		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(true);
 		const binding = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);

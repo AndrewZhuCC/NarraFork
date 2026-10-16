@@ -16,6 +16,65 @@ const provider = {
 	codexAccountId: "",
 };
 
+describe("providers reducer context window merging", () => {
+	test("accepts inclusive bounds and preserves valid values outside the visible model list", () => {
+		const next = providersReducer(initialProvidersState, {
+			type: "MERGE_CONTEXT_WINDOWS",
+			windows: { "unlisted:minimum": 256, "unlisted:maximum": 10_000_000 },
+		});
+		expect(next.modelContextWindows).toEqual({
+			"unlisted:minimum": 256,
+			"unlisted:maximum": 10_000_000,
+		});
+		expect(initialProvidersState.modelContextWindows).toEqual({});
+	});
+
+	test.each([
+		0,
+		-1,
+		255,
+		256.5,
+		10_000_001,
+		Number.NaN,
+		Infinity,
+		-Infinity,
+	])("ignores invalid automatic context window %s without changing state identity", (value) => {
+		const next = providersReducer(initialProvidersState, {
+			type: "MERGE_CONTEXT_WINDOWS",
+			windows: { "unlisted:model": value },
+		});
+		expect(next).toBe(initialProvidersState);
+	});
+
+	test("merges valid entries while ignoring invalid entries in the same response", () => {
+		const next = providersReducer(initialProvidersState, {
+			type: "MERGE_CONTEXT_WINDOWS",
+			windows: { "unlisted:valid": 128_000, "unlisted:invalid": 100 },
+		});
+		expect(next.modelContextWindows).toEqual({ "unlisted:valid": 128_000 });
+	});
+
+	test.each([
+		100, 256.5, 128_000, 10_000_001,
+	])("preserves manual value %s until save-time normalization rather than overwriting it", (size) => {
+		const edited = providersReducer(initialProvidersState, {
+			type: "SET_CONTEXT_WINDOW",
+			modelVal: "unlisted:model",
+			size,
+		});
+		expect(edited.modelContextWindows).toEqual({ "unlisted:model": size });
+		const merged = providersReducer(edited, {
+			type: "MERGE_CONTEXT_WINDOWS",
+			windows: { "unlisted:model": 256_000, "unlisted:other": 64_000 },
+		});
+		expect(merged.modelContextWindows).toEqual({
+			"unlisted:model": size,
+			"unlisted:other": 64_000,
+		});
+		expect(edited.modelContextWindows).toEqual({ "unlisted:model": size });
+	});
+});
+
 describe("providers reducer server synchronization", () => {
 	test("SYNC_FROM_SETTINGS replaces local state with the server-final normalized response", () => {
 		const local = providersStateFromSettings({

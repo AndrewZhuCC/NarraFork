@@ -9,7 +9,11 @@ import type { NarratorDockContextValue } from "./dock/NarratorDockContext";
 // queries, WS connection and virtual list. No callback/dependency logic is copied
 // into this fixture: a boundary move must update the fixture rather than silently
 // leaving an old implementation under test.
-const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+// 行尾归一化：边界标记里含 `\n`，CRLF 检出（Windows）下否则永远匹配不到。
+const source = (await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text()).replaceAll(
+	"\r\n",
+	"\n",
+);
 function section(start: string, end: string) {
 	const from = source.indexOf(start);
 	const to = source.indexOf(end, from);

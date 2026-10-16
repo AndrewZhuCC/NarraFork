@@ -1,4 +1,5 @@
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { narratorLoadingMetrics } from "@frontend/lib/narrator-loading-metrics";
 import type {
 	PretextLayoutAnchor,
 	PretextLayoutIndex,
@@ -24,6 +25,7 @@ import {
 	PretextLayoutCoordinator,
 	type PretextLayoutCoordinatorSnapshot,
 } from "./pretext-layout-coordinator";
+import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
 import type { VListItem } from "./vlist-pipeline";
 import type { ResizePermissionResolver } from "./vlist-resize-permission";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
@@ -43,6 +45,8 @@ export interface PretextDocumentView {
 
 export interface UsePretextDocumentOptions {
 	enabled?: boolean;
+	/** DOM readiness is separate from coordinator lifetime: parked panes keep their input. */
+	layoutReady?: boolean;
 	/** Keep the trailing empty reasoning live while the narrator is active. */
 	keepEmptyReasoningLive?: boolean;
 	/**
@@ -340,10 +344,29 @@ export function usePretextDocument(
 	options: UsePretextDocumentOptions,
 ): UsePretextDocumentResult {
 	const enabled = options.enabled !== false;
-	const coordinator = useMemo(() => (enabled ? new PretextLayoutCoordinator() : null), [enabled]);
+	const sessionEpoch = useSyncExternalStore(
+		onPretextSessionChange,
+		pretextSessionEpoch,
+		pretextSessionEpoch,
+	);
+	// Never repaint or publish a previous principal's loaded window, even if auth
+	// becomes an in-page transition instead of today's full-navigation logout.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a session change retires the coordinator's private input
+	const coordinator = useMemo(
+		() => (enabled ? new PretextLayoutCoordinator() : null),
+		[enabled, sessionEpoch],
+	);
 	const [reloadToken, setReloadToken] = useState(0);
 	const handledReloadTokenRef = useRef(0);
 	const previousNarratorRef = useRef<string | null>(null);
+	const restoreRevalidationRef = useRef<{
+		coordinator: PretextLayoutCoordinator;
+		narratorId: string;
+		sessionEpoch: number;
+	} | null>(null);
+	const latestOptionsRef = useRef(options);
+	latestOptionsRef.current = options;
+	const initialLayoutPendingRef = useRef(true);
 	const viewRef = useRef({
 		scrollTop: options.scrollTop,
 		viewportHeight: options.viewportHeight,
@@ -485,6 +508,8 @@ export function usePretextDocument(
 			options.widthBucket,
 		],
 	);
+	const latestBuildOptionsRef = useRef(buildOptions);
+	latestBuildOptionsRef.current = buildOptions;
 	const snapshot = useSyncExternalStore(
 		coordinator?.subscribe ?? (() => () => {}),
 		coordinator?.getSnapshot ?? (() => ({ status: "idle" as const })),
@@ -493,33 +518,74 @@ export function usePretextDocument(
 	useEffect(() => {
 		if (!coordinator) return;
 		if (previousNarratorRef.current !== narratorId) {
+			restoreRevalidationRef.current = null;
 			previousNarratorRef.current = narratorId;
 			coordinator.reset();
-			// Adopt a cached document for this narrator so the first screen paints from
-			// memory instead of a 283KB-1.3MB tail refetch plus a cold measure pass.
-			//
-			// A restore is an OPTIMISATION, never authority: the window it replays was
-			// current when the reader left, and anything that happened since (new
-			// messages, an edit, a compact) is invisible to it. So a successful restore
-			// always schedules one structural revalidation, which replaces the window
-			// with the live tail. The reader sees their history immediately and the
-			// refresh lands underneath them, pinned to the bottom exactly as a cold
-			// load would be.
-			//
-			// Returns here rather than falling through: the restore already committed a
-			// layout at these very build options, so continuing would rebuild the
-			// identical document a second time in this same effect run. The revalidation
-			// is scheduled by bumping the reload token, which re-runs THIS effect and
-			// takes its `forceReload` branch — the same path a manual refresh uses, so
-			// the restored window is replaced by the live tail with no special-case
-			// commit logic. The restored screen stays visible until that fetch commits
-			// (the coordinator keeps its `input` while `status` is "loading"), making it
-			// a background refresh rather than a flash back to a skeleton.
+			initialLayoutPendingRef.current = true;
+		}
+		// A dock portal can be mounted while parked at width zero. Fetch preloading
+		// continues independently, but adopting/measuring must wait for real geometry.
+		// In particular, do not let restore's build failure evict a valid snapshot.
+		if (
+			options.layoutReady === false ||
+			!Number.isFinite(buildOptions.contentWidth) ||
+			buildOptions.contentWidth <= 0
+		)
+			return;
+		if (initialLayoutPendingRef.current) {
+			initialLayoutPendingRef.current = false;
+			// Paint the cached window immediately, then revalidate its complete canonical
+			// span by stable head ID. Cache is never freshness evidence; replacing a warm
+			// window with a tail would both discard history and duplicate route preloading.
+			// The bounded read owns its lifecycle independently of layout-effect reruns.
 			if (
 				coordinator.restore(narratorId, buildOptions, options.loadOptions, options.viewportHeight)
 			) {
+				const token = narratorLoadingMetrics.current(narratorId);
+				if (token) narratorLoadingMetrics.mark(token, "cache-restored");
 				lastLodRef.current = options.lod;
-				setReloadToken((value) => value + 1);
+				const entry = { coordinator, narratorId, sessionEpoch: pretextSessionEpoch() };
+				restoreRevalidationRef.current = entry;
+				const current = () =>
+					restoreRevalidationRef.current === entry &&
+					previousNarratorRef.current === narratorId &&
+					pretextSessionEpoch() === entry.sessionEpoch;
+				const getView = () =>
+					resolvePretextDocumentView(viewRef.current, latestOptionsRef.current.getCurrentView);
+				const deadline = performance.now() + 10_000;
+				void (async () => {
+					// Header/width commits can supersede one read without changing narrator.
+					// Retry those cancellations at most three times within ONE shared deadline.
+					for (let attempt = 0; attempt < 3 && current(); attempt++) {
+						const remaining = deadline - performance.now();
+						if (remaining <= 0) break;
+						try {
+							if (await coordinator.refreshCurrentWindow(getView, remaining)) return;
+							break;
+						} catch (error) {
+							if (!current()) return;
+							if ((error as { name?: string })?.name === "AbortError") continue;
+							// Authorization/layout failures remain observable in the snapshot.
+							return;
+						}
+					}
+					if (!current()) return;
+					const snapshot = coordinator.getSnapshot();
+					const status = (snapshot.error as { status?: number })?.status;
+					if (status === 401 || status === 403) return;
+					const view = getView();
+					const anchor = snapshot.index ? captureAnchor(snapshot.index, view) : undefined;
+					await coordinator.load(
+						narratorId,
+						latestBuildOptionsRef.current,
+						{ ...latestOptionsRef.current.loadOptions, forceTailReload: true },
+						anchor,
+						view.viewportHeight,
+						{ forceReload: true },
+					);
+				})().catch(() => {
+					// The load/commit published its error; do not turn it into an unhandled rejection.
+				});
 				return;
 			}
 		}
@@ -532,7 +598,13 @@ export function usePretextDocument(
 		);
 		const anchor = current.index ? captureAnchor(current.index, currentView) : undefined;
 		const forceReload = shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
-		if (forceReload) handledReloadTokenRef.current = reloadToken;
+		if (forceReload) {
+			restoreRevalidationRef.current = null;
+			handledReloadTokenRef.current = reloadToken;
+		} else {
+			const status = (current.error as { status?: number })?.status;
+			if (status === 401 || status === 403) return;
+		}
 		if (forceReload || current.status === "loading") {
 			let loadAnchor = anchor;
 			let restoreOverrides: ReadonlyMap<string, number> | undefined;
@@ -568,14 +640,21 @@ export function usePretextDocument(
 			// coordinator (that discarded the in-flight fetch on every width change,
 			// causing a duplicate initial request); narrator switch / reload handle
 			// invalidation explicitly.
-			void coordinator.load(
-				narratorId,
-				buildOptions,
-				options.loadOptions,
-				loadAnchor,
-				currentView.viewportHeight,
-				{ forceReload, restoreOverrides },
-			);
+			void coordinator
+				.load(
+					narratorId,
+					buildOptions,
+					{
+						...options.loadOptions,
+						forceTailReload: forceReload,
+					},
+					loadAnchor,
+					currentView.viewportHeight,
+					{ forceReload, restoreOverrides },
+				)
+				.catch(() => {
+					// The coordinator's snapshot retains the original load/layout error.
+				});
 			return;
 		}
 		if (current.input) {
@@ -604,13 +683,11 @@ export function usePretextDocument(
 			}
 			lastWidthCommitEpochRef.current = options.widthCommitEpoch;
 		} else
-			void coordinator.load(
-				narratorId,
-				buildOptions,
-				options.loadOptions,
-				anchor,
-				options.viewportHeight,
-			);
+			void coordinator
+				.load(narratorId, buildOptions, options.loadOptions, anchor, options.viewportHeight)
+				.catch(() => {
+					// The coordinator's snapshot retains the original load/layout error.
+				});
 	}, [
 		buildOptions,
 		coordinator,
@@ -621,6 +698,7 @@ export function usePretextDocument(
 		options.lod,
 		options.getCurrentView,
 		options.loadOptions,
+		options.layoutReady,
 		options.viewportHeight,
 		options.widthCommitEpoch,
 		reloadToken,
@@ -633,11 +711,30 @@ export function usePretextDocument(
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId drives the cleanup that publishes the outgoing narrator's document
 	useEffect(() => {
 		if (!coordinator) return;
+		const sessionEpoch = pretextSessionEpoch();
 		return () => {
-			coordinator.publishDocumentSnapshot();
+			if (sessionEpoch === pretextSessionEpoch()) coordinator.publishDocumentSnapshot();
+			if (restoreRevalidationRef.current?.coordinator === coordinator)
+				restoreRevalidationRef.current = null;
+			coordinator.cancel();
 			coordinator.releaseTransientCaches();
 		};
 	}, [coordinator, narratorId]);
+	useEffect(() => {
+		if (snapshot.status !== "ready" || !snapshot.input) return;
+		const token = narratorLoadingMetrics.current(narratorId);
+		if (!token) return;
+		narratorLoadingMetrics.mark(token, "layout-ready", { rows: snapshot.input.messages.length });
+		if (typeof requestAnimationFrame === "undefined") return;
+		let second = 0;
+		const first = requestAnimationFrame(() => {
+			second = requestAnimationFrame(() => narratorLoadingMetrics.mark(token, "first-paint"));
+		});
+		return () => {
+			cancelAnimationFrame(first);
+			cancelAnimationFrame(second);
+		};
+	}, [snapshot.status, snapshot.input, narratorId]);
 	// A font face resolving mid-session invalidates every baked fragment width, so
 	// the prepared blocks AND the heights derived from them must be dropped and the
 	// layout rebuilt — otherwise the committed geometry keeps the old wrap points

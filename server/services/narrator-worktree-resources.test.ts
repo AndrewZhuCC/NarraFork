@@ -5,7 +5,7 @@ import { narrators } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { generateId } from "../lib/id";
 import { narratorService } from "./narrator-service";
-import { readLegacyNarratorWorktreeProtection } from "./narrator-worktree-resources";
+import { readProtectionClaims } from "./resource-protection-index";
 
 beforeAll(() => {
 	if (process.env.NARRAFORK_TEST !== "1")
@@ -30,7 +30,35 @@ async function legacyRow(
 			.run(JSON.stringify(context), id);
 	return id;
 }
-const read = () => readLegacyNarratorWorktreeProtection(performance.now() + 5000);
+async function read(deadline = performance.now() + 5000, signal?: AbortSignal) {
+	const owners: Array<{ narratorId: string; deviceId: string; path: string }> = [];
+	try {
+		const result = await readProtectionClaims(
+			[
+				{ deviceId: "local", path: localPathSemantics.resolve(process.cwd(), ".") },
+				{ deviceId: "fixture-remote", path: "." },
+				{ deviceId: "fixture-remote", path: "./remote-context" },
+			],
+			deadline,
+			signal,
+			false,
+		);
+		if (!result.complete) return { complete: false, owners };
+		const seen = new Set<string>();
+		for await (const claim of result.claims) {
+			if (claim.kind !== "narrator" || !claim.path) continue;
+			const owner = { narratorId: claim.id, deviceId: claim.deviceId ?? "local", path: claim.path };
+			const key = JSON.stringify(owner);
+			if (!seen.has(key)) {
+				seen.add(key);
+				owners.push(owner);
+			}
+		}
+		return { complete: true, owners };
+	} catch {
+		return { complete: false, owners };
+	}
+}
 test("actual narratorService.create cwd '.' stays literal, but legacy protection is complete and absolute", async () => {
 	const row = await narratorService.create({
 		cwd: ".",
@@ -119,9 +147,6 @@ test("ambiguous/malformed device or cwd evidence fails closed instead of hiding 
 test("expired deadlines and cancellation remain incomplete ownership sets", async () => {
 	const controller = new AbortController();
 	controller.abort();
-	expect(
-		(await readLegacyNarratorWorktreeProtection(performance.now() + 5000, controller.signal))
-			.complete,
-	).toBe(false);
-	expect((await readLegacyNarratorWorktreeProtection(performance.now() - 1)).complete).toBe(false);
+	expect((await read(performance.now() + 5000, controller.signal)).complete).toBe(false);
+	expect((await read(performance.now() - 1)).complete).toBe(false);
 });

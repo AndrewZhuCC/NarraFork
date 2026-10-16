@@ -46,6 +46,8 @@ import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
+import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
@@ -70,7 +72,8 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
-import { useNarratorLod } from "../../hooks/useNarratorLod";
+import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
+import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -174,12 +177,19 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { usageSourceFor } from "./model/custom-api-usage-source";
+import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import {
+	formatOpencodeBarText,
+	formatOpencodeDetailsText,
+	isOpencodeProviderBaseUrl,
+} from "./model/opencode-usage-format";
 import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -199,6 +209,7 @@ import {
 	SetGlobalModelModal,
 } from "./panels/memoized-dialogs";
 import { filePanelBaseName } from "./panels/panel-kind";
+import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -289,6 +300,8 @@ function NarratorPanelBody({
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
+	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
+	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
 	const narrator = narratorProp ?? fetchedNarrator;
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
@@ -318,8 +331,21 @@ function NarratorPanelBody({
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
+	useEffect(() => {
+		if (isWorkspacePreview) return;
+		const controller = new AbortController();
+		void import("./vlist/PretextExactMessageList").catch(() => {});
+		void preloadPendingPanelTail({
+			narratorId,
+			signal: controller.signal,
+			readOpeningLod: () => readOpeningLod(narratorId),
+			getCurrent: () => preloadStateRef.current,
+			loadModule: () => import("./vlist/pretext-document-loader"),
+		}).catch(() => {});
+		return () => controller.abort();
+	}, [narratorId, isWorkspacePreview]);
 	// Keep an explicitly enabled narrator scan alive after its Git panel closes.
-	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
+	useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
 	const [chunkTailMeta, setMessageListTailMeta] = useState<MessageListTailMeta>({
@@ -329,6 +355,10 @@ function NarratorPanelBody({
 	useEffect(() => {
 		setMessageListTailMeta({ lastRealMessage: null });
 	}, [narratorId]);
+	const firstScreenActivity = useFirstScreenActivity(
+		narratorId,
+		chunkTailMeta.statusReady === true,
+	);
 	const handleMessageListTailMetaChange = useCallback((meta: MessageListTailMeta) => {
 		setMessageListTailMeta((prev) => {
 			if (
@@ -450,8 +480,11 @@ function NarratorPanelBody({
 	 * Still skipped for workspace previews, which stay lightweight and offer no
 	 * tool entries at all.
 	 */
-	const userChatRoomQuery = useNarratorChatRoom(narratorId, !isWorkspacePreview);
-	const chatUnreadQuery = useChatUnread();
+	const userChatRoomQuery = useNarratorChatRoom(
+		narratorId,
+		!isWorkspacePreview && firstScreenActivity,
+	);
+	const chatUnreadQuery = useChatUnread(firstScreenActivity);
 	const userChatRoomId = userChatRoomQuery.data?.id;
 	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
 	const qc = useQueryClient();
@@ -669,7 +702,11 @@ function NarratorPanelBody({
 	// NUG quota data layer (provider config + quota queries + cache writeback +
 	// derived provider info). Kept lifted here because the derived info feeds the
 	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
-	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const nugProviderInfo = useNugQuota(
+		resolvedModel,
+		settingsData?.nugProviders,
+		firstScreenActivity,
+	);
 	const tokenDanceConnection = settingsData?.tokendance;
 	const tokenDanceGeneration =
 		resolvedModel?.startsWith("tokendance:") &&
@@ -706,10 +743,59 @@ function NarratorPanelBody({
 	const { data: kimiUsagesData } = useQuery({
 		queryKey: ["kimi", "usages"],
 		queryFn: api.kimiGetUsages,
-		enabled: currentKimiProviderId != null,
+		enabled: currentKimiProviderId != null && firstScreenActivity,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
+
+	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
+	// generation token so an allowance fetched for a replaced account is never shown.
+	// The current window lives in the status bar; weekly/monthly are in the popover.
+	const currentOpencodeProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const opencodeGeneration = currentOpencodeProviderId
+		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
+		: undefined;
+	const opencodeUsageQuery = useOpencodeUsage(
+		currentOpencodeProviderId,
+		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
+	// generation so a balance fetched for a replaced account is never shown.
+	const currentDeepSeekProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const deepseekGeneration = currentDeepSeekProviderId
+		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
+		: undefined;
+	const deepseekBalancesQuery = useDeepSeekBalance(
+		currentDeepSeekProviderId,
+		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1079,14 +1165,40 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
+		if (cfg.id === currentDeepSeekProviderId) {
+			return {
+				providerId: cfg.id,
+				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
+			};
+		}
+		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
+		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
+		// Go one would otherwise fall through to the previous account's Kimi allowance.
+		const usageSource = usageSourceFor({
+			providerId: cfg.id,
+			opencodeProviderId: currentOpencodeProviderId,
+			kimiProviderId: currentKimiProviderId,
+		});
+		if (usageSource === "opencode") {
+			const usage = opencodeUsageQuery.data;
+			if (usage) {
+				const quotaBalance = formatOpencodeBarText(usage, t);
+				const detailedQuotaBalance = formatOpencodeDetailsText(usage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
+			}
+		}
 		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
 		// in the details popover) instead of the generic relay quota string.
-		const kimiUsage = kimiUsagesData?.[cfg.id];
-		if (kimiUsage) {
-			const quotaBalance = formatKimiBarText(kimiUsage, t);
-			const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-			if (quotaBalance || detailedQuotaBalance) {
-				return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+		if (usageSource === "kimi") {
+			const kimiUsage = kimiUsagesData?.[cfg.id];
+			if (kimiUsage) {
+				const quotaBalance = formatKimiBarText(kimiUsage, t);
+				const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
+				if (quotaBalance || detailedQuotaBalance) {
+					return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
+				}
 			}
 		}
 		const quotas = settingsData?.customApiQuotas as
@@ -1105,6 +1217,12 @@ function NarratorPanelBody({
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
 		kimiUsagesData,
+		currentKimiProviderId,
+		currentOpencodeProviderId,
+		opencodeUsageQuery.data,
+		currentDeepSeekProviderId,
+		deepseekBalancesQuery.data,
+		deepseekBalancesQuery.isError,
 		t,
 	]);
 
@@ -1381,13 +1499,13 @@ function NarratorPanelBody({
 		runningCount: tasksRunningCount,
 		workCount: tasksWorkCount,
 		serviceCount: tasksServiceCount,
-	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled);
+	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled && firstScreenActivity);
 	// Open state and toggling for the tasks entry now live in the registry-driven
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
 	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId);
+	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
 	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
@@ -1474,7 +1592,11 @@ function NarratorPanelBody({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, true, isWorkspacePreview);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(
+		narratorId,
+		firstScreenActivity || substatus.includes("waiting"),
+		isWorkspacePreview,
+	);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
@@ -2723,13 +2845,9 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	// List props are not detail readiness: wait until the workspace shape is known
-	// before exposing messages, otherwise a late Git strip shifts the whole panel.
-	if (
-		!narrator ||
-		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
-	)
-		return <NarratorPanelSkeleton />;
+	// The detail determines variant and operation permissions. Git discovery does
+	// not determine message readiness: its fixed-height slot owns the transition.
+	if (!narrator || (!isWorkspacePreview && !fetchedNarrator)) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,

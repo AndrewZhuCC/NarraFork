@@ -37,7 +37,7 @@ const suffix =
 	platform.replace("darwin-", "macos-").replace("win-", "windows-") +
 	(process.platform === "win32" ? ".exe" : "");
 const filename = `narrafork-${version}-${suffix}`;
-const repository = "Integration/Updates";
+const repository = "integration/updates";
 const binaryUrl = `https://github.com/${repository}/releases/download/v${version}/${filename}`;
 const sidecarUrl = `${binaryUrl}.metadata.json`;
 const metadata = JSON.stringify({
@@ -77,6 +77,42 @@ function fixtureReleaseInfo(patchChain?: GithubPatchStep[]): ReleaseInfo {
 		files: [{ url: filename, size: payload.length, sha512 }],
 		_github: { repository, downloadUrl: binaryUrl, patchChain },
 	};
+}
+function mirrorIndex() {
+	return {
+		schemaVersion: 1,
+		repository,
+		generation: 1,
+		generatedAt: "2026-10-06T00:00:00Z",
+		channels: { stable: version, beta: version },
+		releases: [
+			{
+				version,
+				tag: `v${version}`,
+				commit: "a".repeat(40),
+				prerelease: false,
+				publishedAt: "2026-10-06T00:00:00Z",
+				files: [
+					{
+						name: filename,
+						size: payload.length,
+						sha512,
+						sha256: createHash("sha256").update(payload).digest("hex"),
+						platform,
+						metadata: {
+							name: `${filename}.metadata.json`,
+							size: Buffer.byteLength(metadata),
+							sha256: createHash("sha256").update(metadata).digest("hex"),
+						},
+						patches: [],
+					},
+				],
+			},
+		],
+	};
+}
+function emptyAvailability() {
+	return Response.json({ schemaVersion: 1, repository, version, platform, assets: [] });
 }
 function selectGithub() {
 	settings.update = {
@@ -168,11 +204,12 @@ describe("selected update source integration", () => {
 	test.each([
 		undefined,
 		{ mode: "default" as const },
-	])("legacy update detection inherits global proxy with override %j and proxy edits preserve provenance", async (proxy) => {
+	])("canonical mirror detection inherits global proxy with override %j and proxy edits preserve provenance", async (proxy) => {
 		const serverUrl = "https://updates.proxy-fixture.example";
 		settings.proxy = { mode: "custom", url: "http://global.proxy-fixture.example:8080" };
 		settings.update = {
 			source: "update-server",
+			githubRepository: repository,
 			serverUrl,
 			product: "private-product",
 			channel: "stable",
@@ -182,13 +219,8 @@ describe("selected update source integration", () => {
 		};
 		const identity = getCurrentUpdateSourceIdentity();
 		installFetch((url) => {
-			expect(url).toContain(`${serverUrl}/api/v2/products/private-product/releases/latest`);
-			return Response.json({
-				updateAvailable: true,
-				version,
-				releaseDate: "2026-10-06",
-				file: { filename, size: payload.length, sha512 },
-			});
+			expect(url).toStartWith(`${serverUrl}/api/v3/products/private-product/mirror/`);
+			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
 		});
 		const checked = await checkForUpdate({ force: true });
 		expect(checked.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
@@ -196,7 +228,7 @@ describe("selected update source integration", () => {
 		if (!checked.releaseInfo) throw new Error("Expected legacy update descriptor");
 		settings.update.proxy = { mode: "custom", url: "http://dedicated.proxy-fixture.example:3128" };
 		const after = await checkForUpdate({ force: true });
-		expect(requestOptions[1]?.proxy).toBe("http://dedicated.proxy-fixture.example:3128/");
+		expect(requestOptions[2]?.proxy).toBe("http://dedicated.proxy-fixture.example:3128/");
 		expect(after.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
 		expect(getCurrentUpdateSourceIdentity()).toEqual(identity);
 		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(true);
@@ -225,11 +257,12 @@ describe("selected update source integration", () => {
 	test.each([
 		"product",
 		"channel",
-	] as const)("legacy %s change during detection refuses the captured result", async (field) => {
+	] as const)("mirror %s change during detection refuses the captured result", async (field) => {
 		const serverUrl = "https://updates.integration.example";
 		settings.update = {
 			...settings.update,
 			source: "update-server",
+			githubRepository: repository,
 			serverUrl,
 			product: "first",
 			channel: "stable",
@@ -238,15 +271,10 @@ describe("selected update source integration", () => {
 		};
 		const update = settings.update;
 		installFetch((url) => {
-			expect(url).toContain(`${serverUrl}/api/v2/products/first/releases/latest`);
+			expect(url).toStartWith(`${serverUrl}/api/v3/products/first/mirror/`);
 			if (field === "product") update.product = "second";
 			else update.channel = "beta";
-			return Response.json({
-				updateAvailable: true,
-				version,
-				releaseDate: "2026-10-06",
-				file: { filename, size: payload.length, sha512 },
-			});
+			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
 		});
 		const checked = await checkForUpdate({ force: true });
 		if (!checked.releaseInfo) throw new Error("Missing checked legacy release");
@@ -411,39 +439,25 @@ describe("selected update source integration", () => {
 		expect(requested).toEqual([]);
 		expectNoTemporaryArtifacts();
 	});
-	test("self-deployed v2 source retains patch descriptors and never calls GitHub", async () => {
+	test("canonical mirror selects full from the configured repo without fetching GitHub metadata", async () => {
 		const serverUrl = "https://updates.integration.example";
 		settings.update = {
-			...settings.update,
+			...selectGithub(),
 			source: "update-server",
 			serverUrl,
 			product: "custom-product",
-			channel: "stable",
-			checkIntervalMinutes: 60,
-			autoDownload: false,
 		};
 		installFetch((url) => {
-			expect(url).toContain(`${serverUrl}/api/v2/products/custom-product/releases/latest`);
-			return Response.json({
-				updateAvailable: true,
-				version,
-				releaseDate: "2026-10-06",
-				file: { filename, size: payload.length, sha512 },
-				zstdPatch: {
-					fromVersion: APP_VERSION,
-					patchSize: 4,
-					url: "/patch",
-					metaUrl: "/patch.meta.json",
-				},
-			});
+			expect(url).toStartWith(`${serverUrl}/api/v3/products/custom-product/mirror/`);
+			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
 		});
 		const result = await checkForUpdate();
 		expect(result.source).toBe("update-server");
-		expect(result.strategy).toBe("zstd");
-		expect(result.releaseInfo?._v2?.zstdPatchUrl).toBe(`${serverUrl}/patch`);
-		expect(result.releaseInfo?._v2?.serverUrl).toBe(serverUrl);
+		expect(result.repository).toBe(repository);
+		expect(result.strategy).toBe("full");
+		expect(result.releaseInfo?._github?.downloadUrl).toBe(binaryUrl);
 		expect(requested.some((url) => url.includes("github"))).toBe(false);
-		if (!result.releaseInfo) throw new Error("Missing v2 releaseInfo");
+		if (!result.releaseInfo) throw new Error("Missing canonical descriptor");
 		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(true);
 		settings.update.serverUrl = "https://other.integration.example";
 		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(false);

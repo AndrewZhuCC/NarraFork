@@ -144,6 +144,7 @@ export interface KnowledgeInjectionRecord {
 	compactSeq: number;
 	triggerToolCallId?: string | null;
 	hits: Array<{
+		scope?: "personal" | "global";
 		entryId: string;
 		entryRevisionId?: string | null;
 		summary?: string | null;
@@ -274,11 +275,11 @@ export interface ParsedStreamEvent {
 		/** Upstream identity that minted the thought signature. */
 		thoughtSignatureSource?: string;
 	};
-	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
+	/** Protocol-normalized usage; input/cache buckets are disjoint for every provider. */
 	usage?: {
-		/** Total prompt footprint occupying context window; may include cache read/write depending on provider. */
+		/** Total prompt footprint occupying context, including cache reads and writes. */
 		promptTokens?: number;
-		/** Raw uncached input tokens billed as normal input. */
+		/** Non-cached input tokens billed as normal input; do not subtract cache counters again. */
 		inputTokens?: number;
 		completionTokens?: number;
 		/** Reasoning tokens (o1/o3 models) */

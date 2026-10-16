@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
+import { INTELLIGENT_UI_STREAM_FIELDS } from "@shared/intelligent-ui-tool-policy";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -44,6 +45,7 @@ import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
+import { buildUsageDataFromSnapshot } from "../usage-tracking";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -205,6 +207,11 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	// deferred question before the call completes; `withdraw` so a maintenance-only
 	// call is not rendered as an empty question.
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
+	// `source` is UI markup the chat renders while it streams.
+	IntelligentUI: {
+		short: [...INTELLIGENT_UI_STREAM_FIELDS.short],
+		large: [...INTELLIGENT_UI_STREAM_FIELDS.large],
+	},
 };
 
 interface StreamingToolAccumulator {
@@ -536,6 +543,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"WebSearch",
 	"WebFetch",
 	"Await",
+	"Stop",
 	"ShareFile",
 	"ContextAsk",
 	"LearningGuide",
@@ -662,6 +670,8 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	// registered/running state. Defer them to the ordered post-stream tool phase.
 	"Await",
 	"Send",
+	// Stop can target work launched earlier in the same assistant turn.
+	"Stop",
 	"Browser",
 	"Terminal",
 	"ShareFile",
@@ -1197,16 +1207,7 @@ export function summarizeReflectionFailure(
 type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
 
 function normalizeApiRequestUsage(usage: ApiRequestEndEvent["usage"]) {
-	if (!usage) return null;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
+	return buildUsageDataFromSnapshot(usage);
 }
 
 async function recordReflectionApiRequestEnd(
@@ -1367,6 +1368,7 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -2929,6 +2931,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
 	 */
 	let toolsPlanModeDisabled = planModeDisablesTools();
+	// The current provider-formatted results are the single replay source, including on
+	// turn zero: a retry rebuild may rename IDs or move these results into history.
+	// Never re-read initialToolResults when committing or reflecting the current input.
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
@@ -3089,6 +3094,7 @@ async function* agentLoopInMetadataSnapshot(
 							{
 								kind: "knowledge",
 								hits: scan.hits.map((hit) => ({
+									scope: hit.scope,
 									entryId: hit.entryId,
 									title: hit.title,
 									summary: hit.summary,
@@ -3245,7 +3251,7 @@ async function* agentLoopInMetadataSnapshot(
 	 *
 	 * Rebuilt on every history replacement so it always describes the live history.
 	 */
-	let historyToolUseIds = collectToolUseIdsFromHistory(history, initialToolResults);
+	let historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 
 	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
 		resetCacheDropBaseline(config.narratorId);
@@ -3381,7 +3387,7 @@ async function* agentLoopInMetadataSnapshot(
 				history,
 				isFirstTurn ? userText : combinePendingInput(nextTurnContent, pendingInputParts),
 				effectiveModel,
-				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+				pendingToolResults,
 				isFirstTurn ? images : undefined,
 			);
 			yield { type: "turn_complete", turnIndex };
@@ -3440,7 +3446,7 @@ async function* agentLoopInMetadataSnapshot(
 					reflectionHistory,
 					content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				return reflectionHistory;
@@ -4273,9 +4279,11 @@ async function* agentLoopInMetadataSnapshot(
 			// Stateful providers (responses/codex) cannot retry here because the
 			// server already consumed the request.
 			const maxConfiguredRetries = config.maxTransientRetries ?? 0;
+			// Watchdog timeouts must use the same retry owner as other transport errors:
+			// stateful providers replay in the outer runtime, stateless providers retry
+			// here. Giving both layers a full budget multiplies the configured limit.
 			const getMaxChatRetries = () =>
 				usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
-			const maxFirstTokenRetries = maxConfiguredRetries;
 			const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 			const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
 			let chatRetryCount = 0;
@@ -5582,20 +5590,37 @@ async function* agentLoopInMetadataSnapshot(
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 							};
 						}
-						// Convert OpenAI/Anthropic usage to context_usage percentage
-						if (parsed.usage && parsed.usage.promptTokens != null) {
+						// Billing updates can be output-only; occupancy still requires a real prompt.
+						if (parsed.usage) {
 							receivedUsage = true;
 							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
+							const zeroPlaceholder =
+								parsed.usage.promptTokens === 0 &&
+								parsed.usage.completionTokens === 0 &&
+								[
+									parsed.usage.inputTokens,
+									parsed.usage.reasoningTokens,
+									parsed.usage.cachedInputTokens,
+									parsed.usage.cacheCreationInputTokens,
+									parsed.usage.cacheCreation5mTokens,
+									parsed.usage.cacheCreation1hTokens,
+								].every((count) => count == null || count === 0);
 							// Merge partial counters without letting prompt/input placeholders
-							// erase known counts. Output and cache counters update independently.
+							// erase known counts. A nonempty fully cached prompt legitimately has
+							// zero ordinary input. Output and cache counters update independently.
 							requestUsage = {
-								promptTokens: parsed.usage.promptTokens || previousUsage?.promptTokens || 0,
+								promptTokens:
+									parsed.usage.promptTokens === 0 && previousUsage?.promptTokens
+										? previousUsage.promptTokens
+										: (parsed.usage.promptTokens ?? previousUsage?.promptTokens),
 								inputTokens:
-									parsed.usage.inputTokens === 0 && previousUsage?.inputTokens
+									parsed.usage.promptTokens === 0 &&
+									parsed.usage.inputTokens === 0 &&
+									previousUsage?.inputTokens
 										? previousUsage.inputTokens
 										: (parsed.usage.inputTokens ?? previousUsage?.inputTokens),
 								completionTokens:
-									parsed.usage.completionTokens === 0 && previousUsage?.completionTokens
+									zeroPlaceholder && previousUsage?.completionTokens
 										? previousUsage.completionTokens
 										: (parsed.usage.completionTokens ?? previousUsage?.completionTokens),
 								reasoningTokens: parsed.usage.reasoningTokens ?? previousUsage?.reasoningTokens,
@@ -5618,6 +5643,7 @@ async function* agentLoopInMetadataSnapshot(
 							// causes the UI to briefly flash "0%" before showing the real value.
 							if (
 								contextWindow &&
+								parsed.usage.promptTokens != null &&
 								parsed.usage.promptTokens > 0 &&
 								upstreamContextPercent === undefined
 							) {
@@ -6102,7 +6128,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -6118,14 +6144,14 @@ async function* agentLoopInMetadataSnapshot(
 								model: effectiveModel,
 								requestId,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								firstTokenTimeoutMs,
 							});
 							yield {
 								type: "retrying",
 								message: firstTokenTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -6165,7 +6191,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -6179,7 +6205,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "retrying",
 								message: streamIdleTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -6566,7 +6592,7 @@ async function* agentLoopInMetadataSnapshot(
 						model: effectiveModel,
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6580,7 +6606,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: firstTokenTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6621,7 +6647,7 @@ async function* agentLoopInMetadataSnapshot(
 						model: effectiveModel,
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6635,7 +6661,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: streamIdleTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6717,12 +6743,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "done" };
 						return;
 					}
-					provider.pushUserTurn(
-						history,
-						content,
-						effectiveModel,
-						isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					);
+					provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					pendingToolResults = [];
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
@@ -7004,6 +7025,17 @@ async function* agentLoopInMetadataSnapshot(
 					yield* abandonAttemptForReplay(REASONING_ONLY_MESSAGE);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// Keep the ordinary cleanup above, but do not retry or compact a model
+					// that has nothing to say while waiting for a background result / Send.
+					if (await config.shouldIdleOnReasoningOnly?.()) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield { type: "done", reason: "reasoning_only_idle" };
 						return;
 					}
 
@@ -7307,7 +7339,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				yield { type: "turn_complete", turnIndex };
@@ -7370,7 +7402,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 					isFirstTurn ? images : undefined,
 				);
 				if (
@@ -7403,13 +7435,7 @@ async function* agentLoopInMetadataSnapshot(
 				});
 				if (toolUses.length === 0) {
 					if (isFirstTurn) {
-						provider.pushUserTurn(
-							history,
-							userText,
-							effectiveModel,
-							initialToolResults ?? [],
-							images,
-						);
+						provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
 					} else if (content || pendingToolResults.length > 0) {
 						provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 					}
@@ -7449,7 +7475,7 @@ async function* agentLoopInMetadataSnapshot(
 					history,
 					isFirstTurn ? userText : content,
 					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					pendingToolResults,
 				);
 				provider.pushAssistantTurn(history, assistantText, []);
 				pendingToolResults = [];
@@ -7496,7 +7522,7 @@ async function* agentLoopInMetadataSnapshot(
 			// After-tools injections are already consumed; retain their actual content
 			// in memory too, or later requests lose them until a full history rebuild.
 			if (isFirstTurn) {
-				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
+				provider.pushUserTurn(history, userText, effectiveModel, pendingToolResults, images);
 			} else if (content || pendingToolResults.length > 0) {
 				provider.pushUserTurn(history, content, effectiveModel, pendingToolResults);
 			}

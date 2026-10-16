@@ -25,9 +25,11 @@ import {
 	downloadReleaseAsset,
 	hashReleaseFile,
 	type ReleaseAssetDownloader,
+	type ReleasePhaseDetails,
 	readReleaseText,
+	timeReleasePhase,
 } from "./ci-release-io";
-import { validateCiReleasePlan } from "./ci-release-plan";
+import { validateCiComponentDependencies, validateCiReleasePlan } from "./ci-release-plan";
 import {
 	CI_RELEASE_TARGETS,
 	type CiReleaseBaseline,
@@ -91,6 +93,8 @@ const manifestSchema = z
 
 export interface AssembleReleaseBundleOptions {
 	plan: CiReleasePlan;
+	/** Target-commit JSON pin, not the control checkout's current configuration. */
+	targetHelperDistribution?: BinaryMetadata["helperDistribution"];
 	platformsDir: string;
 	smokeDir: string;
 	bundleDir: string;
@@ -195,6 +199,25 @@ function validateSmoke(
 	return smoke;
 }
 
+async function hashBundleFile(
+	phase: string,
+	path: string,
+	maximum: number,
+	details: ReleasePhaseDetails,
+	signal?: AbortSignal,
+): Promise<Awaited<ReturnType<typeof hashReleaseFile>>> {
+	return timeReleasePhase(
+		phase,
+		details,
+		async () => {
+			const identity = await hashReleaseFile(path, maximum, signal);
+			details.outputBytes = identity.size;
+			return identity;
+		},
+		signal,
+	);
+}
+
 async function readBinary(
 	directory: string,
 	plan: CiReleasePlan,
@@ -202,25 +225,44 @@ async function readBinary(
 	signal?: AbortSignal,
 ): Promise<BinaryMetadata> {
 	const name = `narrafork-${plan.version}-${target.suffix}`;
-	const raw = await readReleaseText(join(directory, `${name}.metadata.json`), CI_METADATA_LIMIT);
-	const identity = await hashReleaseFile(join(directory, name), MAX_RELEASE_BINARY_BYTES, signal);
-	const metadata = validateBaselineMetadata(JSON.parse(raw), {
-		version: plan.version,
-		platform: target.platform,
-		name,
-		size: identity.size,
-		commit: plan.commit,
-	});
-	assertIdentity(identity, metadata, name);
-	if (plan.defaultBranch !== undefined && metadata.repository === undefined)
-		throw new Error(`Missing strict build repository provenance: ${name}`);
-	const buildRepository = metadata.repository ?? OFFICIAL_GITHUB_REPOSITORY;
-	if (
-		!isValidGitHubRepository(buildRepository) ||
-		buildRepository.toLowerCase() !== plan.repository.toLowerCase()
-	)
-		throw new Error(`Binary build repository mismatch: ${name}`);
-	return metadata;
+	const details = { platform: target.platform, version: plan.version };
+	const raw = await timeReleasePhase(
+		"platform.metadata.read",
+		details,
+		() => readReleaseText(join(directory, `${name}.metadata.json`), CI_METADATA_LIMIT),
+		signal,
+	);
+	const identity = await hashBundleFile(
+		"platform.binary.hash",
+		join(directory, name),
+		MAX_RELEASE_BINARY_BYTES,
+		{ ...details },
+		signal,
+	);
+	return timeReleasePhase(
+		"platform.metadata.verify",
+		{ ...details, inputBytes: identity.size },
+		() => {
+			const metadata = validateBaselineMetadata(JSON.parse(raw), {
+				version: plan.version,
+				platform: target.platform,
+				name,
+				size: identity.size,
+				commit: plan.commit,
+			});
+			assertIdentity(identity, metadata, name);
+			if (plan.defaultBranch !== undefined && metadata.repository === undefined)
+				throw new Error(`Missing strict build repository provenance: ${name}`);
+			const buildRepository = metadata.repository ?? OFFICIAL_GITHUB_REPOSITORY;
+			if (
+				!isValidGitHubRepository(buildRepository) ||
+				buildRepository.toLowerCase() !== plan.repository.toLowerCase()
+			)
+				throw new Error(`Binary build repository mismatch: ${name}`);
+			return metadata;
+		},
+		signal,
+	);
 }
 
 function patchName(plan: CiReleasePlan, baseline: CiReleaseBaseline): string {
@@ -239,12 +281,11 @@ function assetLimit(name: string): number {
 /** Never infer dependencies from the control script: legacy bytes retain their old contract. */
 export function validateBundleHelperDistribution(
 	binaries: readonly BinaryMetadata[],
-	version: string,
 ): BinaryMetadata["helperDistribution"] {
 	const declared = binaries.map((binary) =>
 		binary.helperDistribution === undefined
 			? undefined
-			: parseHelperDistributionDependencies(binary.helperDistribution, version),
+			: parseHelperDistributionDependencies(binary.helperDistribution),
 	);
 	const first = declared[0];
 	if (declared.some((value) => !isDeepStrictEqual(value, first)))
@@ -259,7 +300,21 @@ export async function verifyReleaseBundle(
 	return verifyBundle(bundleDir, expectedPlan, AbortSignal.timeout(30 * 60 * 1000));
 }
 
+// Inclusive parent timings overlap their nested phases; do not sum them as independent costs.
 async function verifyBundle(
+	bundleDir: string,
+	expectedPlan: CiReleasePlan | undefined,
+	signal: AbortSignal,
+): Promise<CiReleaseManifest> {
+	return timeReleasePhase(
+		"bundle.verify",
+		{ version: expectedPlan?.version, targetCount: CI_RELEASE_TARGETS.length },
+		() => verifyBundleContents(bundleDir, expectedPlan, signal),
+		signal,
+	);
+}
+
+async function verifyBundleContents(
 	bundleDir: string,
 	expectedPlan: CiReleasePlan | undefined,
 	signal: AbortSignal,
@@ -290,6 +345,7 @@ async function verifyBundle(
 			"runAttempt",
 			"baselines",
 			"buildSource",
+			"componentEvidence",
 		] as const) {
 			if (!isDeepStrictEqual(plan[key], expected[key]))
 				throw new Error(`Bundle expected target identity mismatch: ${key}`);
@@ -302,15 +358,27 @@ async function verifyBundle(
 		throw new Error("Duplicate manifest filenames");
 	assertSameNames(names, listedNames, "bundle assets");
 	let total = 0;
-	for (const file of parsed.files) {
-		total += file.size;
-		if (total > CI_BUNDLE_LIMIT) throw new Error("Bundle byte limit exceeded");
-		assertIdentity(
-			await hashReleaseFile(join(dist, file.name), assetLimit(file.name), signal),
-			file,
-			file.name,
-		);
-	}
+	const hashDetails: ReleasePhaseDetails = {
+		version: plan.version,
+		fileCount: parsed.files.length,
+	};
+	await timeReleasePhase(
+		"bundle.verify.assets.hash",
+		hashDetails,
+		async () => {
+			for (const file of parsed.files) {
+				total += file.size;
+				if (total > CI_BUNDLE_LIMIT) throw new Error("Bundle byte limit exceeded");
+				assertIdentity(
+					await hashReleaseFile(join(dist, file.name), assetLimit(file.name), signal),
+					file,
+					file.name,
+				);
+			}
+			hashDetails.outputBytes = total;
+		},
+		signal,
+	);
 	const allowed = new Set<string>();
 	const binaries: BinaryMetadata[] = [];
 	const smoke: CiReleaseSmokeResult[] = [];
@@ -319,25 +387,45 @@ async function verifyBundle(
 		CI_RELEASE_TARGETS.map((entry) => entry.target),
 		"smoke platforms",
 	);
-	for (const target of CI_RELEASE_TARGETS) {
-		const binary = await readBinary(dist, plan, target, signal);
-		binaries.push(binary);
-		allowed.add(binary.name);
-		allowed.add(`${binary.name}.metadata.json`);
-		smoke.push(
-			validateSmoke(
-				parsed.smoke.find((entry) => entry.target === target.target),
-				plan,
-				target,
-				binary,
-			),
-		);
-	}
-	const helperDistribution = validateBundleHelperDistribution(binaries, plan.version);
+	await timeReleasePhase(
+		"bundle.verify.platforms.read",
+		{ version: plan.version, targetCount: CI_RELEASE_TARGETS.length },
+		async () => {
+			for (const target of CI_RELEASE_TARGETS) {
+				const details = { platform: target.platform, version: plan.version };
+				const binary = await timeReleasePhase(
+					"bundle.verify.platform.read",
+					details,
+					() => readBinary(dist, plan, target, signal),
+					signal,
+				);
+				binaries.push(binary);
+				allowed.add(binary.name);
+				allowed.add(`${binary.name}.metadata.json`);
+				smoke.push(
+					await timeReleasePhase(
+						"bundle.verify.smoke.verify",
+						details,
+						() =>
+							validateSmoke(
+								parsed.smoke.find((entry) => entry.target === target.target),
+								plan,
+								target,
+								binary,
+							),
+						signal,
+					),
+				);
+			}
+		},
+		signal,
+	);
+	const helperDistribution = validateBundleHelperDistribution(binaries);
+	validateCiComponentDependencies(plan, helperDistribution);
 	const recordedDependencies =
 		parsed.helperDistribution === undefined
 			? undefined
-			: parseHelperDistributionDependencies(parsed.helperDistribution, plan.version);
+			: parseHelperDistributionDependencies(parsed.helperDistribution);
 	if (!isDeepStrictEqual(helperDistribution, recordedDependencies))
 		throw new Error("Bundle helper dependency declaration mismatch");
 	const sums = `narrafork-${plan.version}-SHA256SUMS`;
@@ -384,14 +472,22 @@ async function verifyBundle(
 	const disk = await statfs(tmpdir());
 	if (disk.bavail * disk.bsize < total + CI_DISK_RESERVE)
 		throw new Error("Insufficient disk space for publisher verification and 4 GiB reserve");
-	const sealed = await publishGitHubRelease({
-		distDir: dist,
-		version: plan.version,
-		repository: plan.repository,
-		commit: plan.commit,
-		platformSuffixes: new Map(CI_RELEASE_TARGETS.map((entry) => [entry.platform, entry.suffix])),
-		dryRun: true,
-	});
+	const sealed = await timeReleasePhase(
+		"bundle.verify.publisher.dryrun",
+		{ version: plan.version, inputBytes: total, fileCount: names.length },
+		() =>
+			publishGitHubRelease({
+				distDir: dist,
+				version: plan.version,
+				repository: plan.repository,
+				commit: plan.commit,
+				platformSuffixes: new Map(
+					CI_RELEASE_TARGETS.map((entry) => [entry.platform, entry.suffix]),
+				),
+				dryRun: true,
+			}),
+		signal,
+	);
 	signal.throwIfAborted();
 	assertSameNames(sealed.assets, names, "publisher dry-run assets");
 	return {
@@ -417,53 +513,92 @@ async function addPatch(
 	const apply = options.dependencies?.applyPatch ?? applyZstdPatchToFile;
 	const binary = binaries.find((entry) => entry.platform === baseline.platform);
 	if (!binary) throw new Error("Baseline platform missing");
+	const details = {
+		platform: baseline.platform,
+		version: options.plan.version,
+		fromVersion: baseline.version,
+	};
 	const workspace = await mkdtemp(join(temporary, "baseline-"));
 	try {
 		const oldFilePath = join(workspace, "base");
 		const sidecarPath = join(workspace, "metadata.json");
-		await download({
-			repository: options.plan.repository,
-			assetId: baseline.metadataAsset.id,
-			size: baseline.metadataAsset.size,
-			outputPath: sidecarPath,
+		await timeReleasePhase(
+			"baseline.sidecar.download",
+			{ ...details, inputBytes: baseline.metadataAsset.size },
+			() =>
+				download({
+					repository: options.plan.repository,
+					assetId: baseline.metadataAsset.id,
+					size: baseline.metadataAsset.size,
+					outputPath: sidecarPath,
+					signal,
+				}),
 			signal,
-		});
-		const sidecar = await hashReleaseFile(sidecarPath, CI_METADATA_LIMIT, signal);
-		if (
-			sidecar.size !== baseline.metadataAsset.size ||
-			sidecar.sha256 !== baseline.metadataSha256 ||
-			!isDeepStrictEqual(
-				JSON.parse(await readReleaseText(sidecarPath, CI_METADATA_LIMIT)),
-				baseline.metadata,
-			)
-		)
-			throw new Error("Baseline sidecar identity mismatch");
-		await download({
-			repository: options.plan.repository,
-			assetId: baseline.binaryAsset.id,
-			size: baseline.binaryAsset.size,
-			outputPath: oldFilePath,
+		);
+		await timeReleasePhase(
+			"baseline.sidecar.verify",
+			{ ...details, inputBytes: baseline.metadataAsset.size },
+			async () => {
+				const sidecar = await hashReleaseFile(sidecarPath, CI_METADATA_LIMIT, signal);
+				if (
+					sidecar.size !== baseline.metadataAsset.size ||
+					sidecar.sha256 !== baseline.metadataSha256 ||
+					!isDeepStrictEqual(
+						JSON.parse(await readReleaseText(sidecarPath, CI_METADATA_LIMIT)),
+						baseline.metadata,
+					)
+				)
+					throw new Error("Baseline sidecar identity mismatch");
+			},
 			signal,
-		});
-		assertIdentity(
-			await hashReleaseFile(oldFilePath, MAX_RELEASE_BINARY_BYTES, signal),
-			baseline.metadata,
-			"baseline binary",
+		);
+		await timeReleasePhase(
+			"baseline.binary.download",
+			{ ...details, inputBytes: baseline.binaryAsset.size },
+			() =>
+				download({
+					repository: options.plan.repository,
+					assetId: baseline.binaryAsset.id,
+					size: baseline.binaryAsset.size,
+					outputPath: oldFilePath,
+					signal,
+				}),
+			signal,
+		);
+		await timeReleasePhase(
+			"baseline.binary.hash",
+			{ ...details, inputBytes: baseline.metadata.size },
+			async () => {
+				assertIdentity(
+					await hashReleaseFile(oldFilePath, MAX_RELEASE_BINARY_BYTES, signal),
+					baseline.metadata,
+					"baseline binary",
+				);
+			},
+			signal,
 		);
 		const name = patchName(options.plan, baseline);
 		const patchPath = join(workspace, name);
-		const meta = await generate({
-			oldFilePath,
-			newFilePath: join(dist, binary.name),
-			patchOutputPath: patchPath,
-			fromVersion: baseline.version,
-			toVersion: options.plan.version,
-			timeoutMs: 15 * 60 * 1000,
+		const meta = await timeReleasePhase(
+			"baseline.patch.generate",
+			{ ...details, inputBytes: baseline.metadata.size + binary.size },
+			() =>
+				generate({
+					oldFilePath,
+					newFilePath: join(dist, binary.name),
+					patchOutputPath: patchPath,
+					fromVersion: baseline.version,
+					toVersion: options.plan.version,
+					timeoutMs: 15 * 60 * 1000,
+					signal,
+				}),
 			signal,
-		});
-		const generated = await hashReleaseFile(
+		);
+		const generated = await hashBundleFile(
+			"baseline.patch.hash",
 			patchPath,
 			MAX_RELEASE_BINARY_BYTES + CI_TEXT_LIMIT,
+			{ ...details },
 			signal,
 		);
 		if (
@@ -478,31 +613,62 @@ async function addPatch(
 		)
 			throw new Error("Generated patch identity mismatch");
 		const restoredPath = join(workspace, "restored");
-		await apply({
-			oldFilePath,
-			patchFilePath: patchPath,
-			outputFilePath: restoredPath,
-			meta,
-			maxOutputBytes: binary.size,
-			timeoutMs: 15 * 60 * 1000,
+		await timeReleasePhase(
+			"baseline.patch.rebuild",
+			{ ...details, inputBytes: baseline.metadata.size + generated.size },
+			() =>
+				apply({
+					oldFilePath,
+					patchFilePath: patchPath,
+					outputFilePath: restoredPath,
+					meta,
+					maxOutputBytes: binary.size,
+					timeoutMs: 15 * 60 * 1000,
+					signal,
+				}),
 			signal,
-		});
-		assertIdentity(
-			await hashReleaseFile(restoredPath, binary.size, signal),
-			binary,
-			"restored patch",
+		);
+		await timeReleasePhase(
+			"baseline.patch.rebuild.hash",
+			{ ...details, inputBytes: binary.size },
+			async () => {
+				assertIdentity(
+					await hashReleaseFile(restoredPath, binary.size, signal),
+					binary,
+					"restored patch",
+				);
+			},
+			signal,
 		);
 		if (generated.size >= binary.size) {
 			console.info(`Omitting patch ${name}: not smaller than full binary`);
 			return;
 		}
 		validateReleasePatchMetadata(meta);
-		await copyReleaseFile(patchPath, join(dist, name), MAX_RELEASE_PATCH_BYTES, signal);
-		await writeFile(join(dist, `${name}.meta.json`), `${JSON.stringify(meta, null, 2)}\n`, {
-			flag: "wx",
-		});
+		await timeReleasePhase(
+			"baseline.patch.copy",
+			{ ...details, inputBytes: generated.size },
+			() => copyReleaseFile(patchPath, join(dist, name), MAX_RELEASE_PATCH_BYTES, signal),
+			signal,
+		);
+		const metadataText = `${JSON.stringify(meta, null, 2)}\n`;
+		const metadataDetails: ReleasePhaseDetails = { ...details };
+		await timeReleasePhase(
+			"baseline.patch.metadata.write",
+			metadataDetails,
+			async () => {
+				await writeFile(join(dist, `${name}.meta.json`), metadataText, { flag: "wx" });
+				metadataDetails.outputBytes = Buffer.byteLength(metadataText);
+			},
+			signal,
+		);
 	} finally {
-		await rm(workspace, { recursive: true, force: true });
+		await timeReleasePhase(
+			"baseline.scratch.cleanup",
+			details,
+			() => rm(workspace, { recursive: true, force: true }),
+			signal,
+		);
 	}
 }
 
@@ -510,6 +676,19 @@ async function addPatch(
 export async function assembleReleaseBundle(
 	options: AssembleReleaseBundleOptions,
 ): Promise<CiReleaseManifest> {
+	return timeReleasePhase(
+		"bundle.assemble",
+		{
+			version: options.plan?.version,
+			targetCount: CI_RELEASE_TARGETS.length,
+			baselineCount: options.plan?.baselines?.length,
+		},
+		() => assembleBundle(options),
+		options.signal,
+	);
+}
+
+async function assembleBundle(options: AssembleReleaseBundleOptions): Promise<CiReleaseManifest> {
 	const plan = validateCiReleasePlan(options.plan);
 	validateBaselines(plan);
 	const signal = AbortSignal.any([
@@ -540,27 +719,57 @@ export async function assembleReleaseBundle(
 	const smoke: CiReleaseSmokeResult[] = [];
 	for (const target of CI_RELEASE_TARGETS) {
 		signal.throwIfAborted();
-		const directory = join(options.platformsDir, target.target);
-		// Diagnostics may coexist, but only these explicit artifact names are ever consumed.
-		await directoryEntries(directory, 32);
-		await directoryEntries(join(options.smokeDir, target.target), 32);
-		const binary = await readBinary(directory, plan, target, signal);
-		binaries.push(binary);
-		smoke.push(
-			validateSmoke(
-				JSON.parse(
-					await readReleaseText(
-						join(options.smokeDir, target.target, "smoke.json"),
-						CI_METADATA_LIMIT,
+		const details = { platform: target.platform, version: plan.version };
+		await timeReleasePhase(
+			"platform.read",
+			details,
+			async () => {
+				const directory = join(options.platformsDir, target.target);
+				// Diagnostics may coexist, but only these explicit artifact names are ever consumed.
+				await directoryEntries(directory, 32);
+				await directoryEntries(join(options.smokeDir, target.target), 32);
+				const binary = await readBinary(directory, plan, target, signal);
+				binaries.push(binary);
+				smoke.push(
+					await timeReleasePhase(
+						"platform.smoke.verify",
+						details,
+						async () =>
+							validateSmoke(
+								JSON.parse(
+									await readReleaseText(
+										join(options.smokeDir, target.target, "smoke.json"),
+										CI_METADATA_LIMIT,
+									),
+								),
+								plan,
+								target,
+								binary,
+							),
+						signal,
 					),
-				),
-				plan,
-				target,
-				binary,
-			),
+				);
+			},
+			signal,
 		);
 	}
-	const helperDistribution = validateBundleHelperDistribution(binaries, plan.version);
+	const helperDistribution = validateBundleHelperDistribution(binaries);
+	validateCiComponentDependencies(plan, helperDistribution);
+	if (Object.hasOwn(options, "targetHelperDistribution")) {
+		const expected = options.targetHelperDistribution;
+		if (expected === undefined && plan.componentEvidence !== undefined)
+			throw new Error("Legacy target cannot declare component evidence");
+		if (expected !== undefined) {
+			if (!isDeepStrictEqual(helperDistribution, parseHelperDistributionDependencies(expected)))
+				throw new Error("Release helper dependencies do not match target component configuration");
+		} else if (
+			helperDistribution !== undefined &&
+			(helperDistribution.executor.version !== plan.version ||
+				helperDistribution.executor.protocolVersion !== 1)
+		) {
+			throw new Error("Legacy target helper dependency version/protocol mismatch");
+		}
+	}
 	const fullBytes = binaries.reduce((sum, entry) => sum + entry.size, 0);
 	const maxBase = Math.max(0, ...plan.baselines.map((entry) => entry.metadata.size));
 	const maxFull = Math.max(...binaries.map((entry) => entry.size));
@@ -583,23 +792,43 @@ export async function assembleReleaseBundle(
 		for (const target of CI_RELEASE_TARGETS) {
 			const binary = binaries.find((entry) => entry.platform === target.platform);
 			if (!binary) throw new Error("Missing platform binary");
-			await copyReleaseFile(
-				join(options.platformsDir, target.target, binary.name),
-				join(dist, binary.name),
-				MAX_RELEASE_BINARY_BYTES,
+			const details = { platform: target.platform, version: plan.version };
+			await timeReleasePhase(
+				"platform.stage.binary.copy",
+				{ ...details, inputBytes: binary.size },
+				() =>
+					copyReleaseFile(
+						join(options.platformsDir, target.target, binary.name),
+						join(dist, binary.name),
+						MAX_RELEASE_BINARY_BYTES,
+						signal,
+					),
 				signal,
 			);
 			// Preserve exact sidecar bytes; provenance hashes must not depend on reserialization.
-			await copyReleaseFile(
-				join(options.platformsDir, target.target, `${binary.name}.metadata.json`),
-				join(dist, `${binary.name}.metadata.json`),
-				CI_METADATA_LIMIT,
+			await timeReleasePhase(
+				"platform.stage.sidecar.copy",
+				details,
+				() =>
+					copyReleaseFile(
+						join(options.platformsDir, target.target, `${binary.name}.metadata.json`),
+						join(dist, `${binary.name}.metadata.json`),
+						CI_METADATA_LIMIT,
+						signal,
+					),
 				signal,
 			);
-			assertIdentity(
-				await hashReleaseFile(join(dist, binary.name), MAX_RELEASE_BINARY_BYTES, signal),
-				binary,
-				binary.name,
+			await timeReleasePhase(
+				"platform.stage.binary.hash",
+				{ ...details, inputBytes: binary.size },
+				async () => {
+					assertIdentity(
+						await hashReleaseFile(join(dist, binary.name), MAX_RELEASE_BINARY_BYTES, signal),
+						binary,
+						binary.name,
+					);
+				},
+				signal,
 			);
 		}
 		await writeFile(
@@ -614,9 +843,22 @@ export async function assembleReleaseBundle(
 		);
 		for (const baseline of plan.baselines)
 			await addPatch(options, baseline, binaries, dist, staging, signal);
-		const files = [];
-		for (const name of await directoryEntries(dist, 51))
-			files.push({ name, ...(await hashReleaseFile(join(dist, name), assetLimit(name), signal)) });
+		const files: CiReleaseManifest["files"] = [];
+		const hashDetails: ReleasePhaseDetails = { version: plan.version };
+		await timeReleasePhase(
+			"bundle.manifest.hash",
+			hashDetails,
+			async () => {
+				for (const name of await directoryEntries(dist, 51))
+					files.push({
+						name,
+						...(await hashReleaseFile(join(dist, name), assetLimit(name), signal)),
+					});
+				hashDetails.fileCount = files.length;
+				hashDetails.outputBytes = files.reduce((sum, file) => sum + file.size, 0);
+			},
+			signal,
+		);
 		const manifest: CiReleaseManifest = {
 			schemaVersion: 1,
 			plan,
@@ -624,14 +866,35 @@ export async function assembleReleaseBundle(
 			smoke,
 			...(helperDistribution === undefined ? {} : { helperDistribution }),
 		};
-		await writeFile(join(staging, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
-			flag: "wx",
-		});
+		const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+		const manifestDetails: ReleasePhaseDetails = {
+			version: plan.version,
+			fileCount: files.length,
+		};
+		await timeReleasePhase(
+			"bundle.manifest.write",
+			manifestDetails,
+			async () => {
+				await writeFile(join(staging, "manifest.json"), manifestText, { flag: "wx" });
+				manifestDetails.outputBytes = Buffer.byteLength(manifestText);
+			},
+			signal,
+		);
 		const verified = await verifyBundle(staging, plan, signal);
 		signal.throwIfAborted();
-		await rename(staging, bundleDir);
+		await timeReleasePhase(
+			"bundle.seal.rename",
+			{ version: plan.version, fileCount: files.length },
+			() => rename(staging, bundleDir),
+			signal,
+		);
 		return verified;
 	} finally {
-		await rm(staging, { recursive: true, force: true });
+		await timeReleasePhase(
+			"bundle.staging.cleanup",
+			{ version: plan.version },
+			() => rm(staging, { recursive: true, force: true }),
+			signal,
+		);
 	}
 }

@@ -14,11 +14,19 @@
  * branch service all exercised).
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators, users } from "../../db/schema";
+import { knowledgeDrafts, knowledgeEntries, narrators, projects, users } from "../../db/schema";
+import { knowledgeSearchTool } from "../../lib/agent/tools/knowledge";
+import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import { knowledgeBranchService } from "../knowledge-branch-service";
-import { resolveInjections, scanToolOutputForKnowledge } from "../knowledge-injection";
+import {
+	formatInjectionsBare,
+	injectionKey,
+	resolveInjections,
+	scanToolOutputForKnowledge,
+} from "../knowledge-injection";
 import { knowledgeService } from "../knowledge-service";
 
 let collectionId: string;
@@ -140,6 +148,163 @@ describe("draft-shadow search", () => {
 		const hit = res.find((r) => r.id === entry.id);
 		expect(hit).toBeDefined();
 		expect(hit?.fromDraft).toBe(false);
+	});
+});
+
+describe("standalone personal search", () => {
+	test("linked results keep global identity and cannot bypass global ACL", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: "linkedaclmarker",
+			content: "initial",
+			tags: ["linked-tag"],
+		});
+		await knowledgeBranchService.createDraft(principal, entry.id, {});
+		const ctx = { userId } as ToolContext;
+		const result = await knowledgeSearchTool.execute(
+			{ query: "linkedaclmarker", tag: "linked-tag" },
+			ctx,
+		);
+		expect(result.metadata?.results).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: entry.id, fromDraft: true })]),
+		);
+		expect(
+			(
+				await knowledgeService.search({
+					q: "linkedaclmarker",
+					draftUserId: userId,
+					includeStandalone: true,
+				})
+			)[0]?.personalEntryId,
+		).toBeUndefined();
+		await db
+			.update(knowledgeEntries)
+			.set({ classificationLevel: "unknown-denied-level" })
+			.where(eq(knowledgeEntries.id, entry.id));
+		expect(
+			(await knowledgeSearchTool.execute({ query: "linkedaclmarker" }, ctx)).output,
+		).not.toContain(entry.id);
+	});
+	test("owner-only index/substring search works without linked shadows and remains opt-in", async () => {
+		const ownerId = generateId();
+		await db.insert(users).values({
+			id: ownerId,
+			username: ownerId,
+			passwordHash: "x",
+			role: "user",
+			createdAt: new Date().toISOString(),
+		});
+		const owner = { userId: ownerId, role: "user" as const };
+		const draft = await knowledgeBranchService.createStandalone(owner, {
+			title: "standalonesearchmarker 电池",
+			content: "bodymatchmarker",
+		});
+		for (const q of ["standalonesearchmarker", "bodymatchmarker", "电池", ""]) {
+			const opts = { q, draftUserId: ownerId, includeStandalone: true };
+			const rows = await knowledgeService.search(opts);
+			const hit = rows.find((row) => row.personalEntryId === draft.id);
+			expect(hit).toMatchObject({
+				id: draft.id,
+				collectionId: null,
+				fromDraft: true,
+				drifted: false,
+				tags: [],
+			});
+			expect(
+				(await knowledgeService.search({ ...opts, includeStandalone: false })).some(
+					(row) => row.id === draft.id,
+				),
+			).toBe(false);
+			expect(
+				(await knowledgeService.search({ ...opts, draftUserId: userId })).some(
+					(row) => row.id === draft.id,
+				),
+			).toBe(false);
+			expect(
+				(await knowledgeService.search({ ...opts, draftUserId: undefined })).some(
+					(row) => row.id === draft.id,
+				),
+			).toBe(false);
+			expect(
+				(await knowledgeService.search({ ...opts, tag: "anything" })).some(
+					(row) => row.id === draft.id,
+				),
+			).toBe(false);
+			expect(
+				(await knowledgeService.search({ ...opts, collectionId })).some(
+					(row) => row.id === draft.id,
+				),
+			).toBe(false);
+		}
+		const ctx = { userId: ownerId } as ToolContext;
+		const result = await knowledgeSearchTool.execute({ query: "standalonesearchmarker" }, ctx);
+		expect(result.output).toContain(`personalEntryId: ${draft.id}`);
+		expect(result.metadata?.results).toEqual(
+			expect.arrayContaining([expect.objectContaining({ personalEntryId: draft.id })]),
+		);
+		expect(
+			(await knowledgeSearchTool.execute({ query: "standalonesearchmarker", useDraft: false }, ctx))
+				.output,
+		).not.toContain(draft.id);
+		expect(
+			(
+				await knowledgeSearchTool.execute({ query: "standalonesearchmarker" }, {
+					userId,
+				} as ToolContext)
+			).output,
+		).not.toContain(draft.id);
+		await db
+			.update(knowledgeDrafts)
+			.set({ status: "archived" })
+			.where(eq(knowledgeDrafts.id, draft.id));
+		expect(
+			(
+				await knowledgeService.search({
+					q: "standalonesearchmarker",
+					draftUserId: ownerId,
+					includeStandalone: true,
+				})
+			).some((row) => row.id === draft.id),
+		).toBe(false);
+	});
+
+	test("target collection obeys project/global scope while untargeted entries remain available", async () => {
+		const projectId = generateId();
+		const otherProjectId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(projects).values(
+			[projectId, otherProjectId].map((id) => ({
+				id,
+				name: id,
+				status: "active" as const,
+				flowMode: "classic" as const,
+				createdAt: now,
+				updatedAt: now,
+			})),
+		);
+		const local = await knowledgeService.createCollection({ name: generateId(), projectId });
+		const other = await knowledgeService.createCollection({
+			name: generateId(),
+			projectId: otherProjectId,
+		});
+		const drafts = await Promise.all(
+			[undefined, collectionId, local.id, other.id].map((targetCollectionId) =>
+				knowledgeBranchService.createStandalone(principal, {
+					title: "targetscopemarker 电机",
+					targetCollectionId,
+				}),
+			),
+		);
+		for (const q of ["targetscopemarker", "电机"]) {
+			const opts = { q, draftUserId: userId, includeStandalone: true, projectId };
+			const ids = (await knowledgeService.search(opts)).map((row) => row.id);
+			for (const draft of drafts.slice(0, 3)) expect(ids).toContain(draft.id);
+			expect(ids).not.toContain(drafts[3]!.id);
+			expect(
+				(await knowledgeService.search({ ...opts, collectionId: local.id })).map((row) => row.id),
+			).toEqual([drafts[2]!.id]);
+			expect(await knowledgeService.search({ ...opts, collectionId: other.id })).toEqual([]);
+		}
 	});
 });
 
@@ -271,6 +436,113 @@ describe("passive injection matches author-declared keywords only", () => {
 	});
 });
 
+describe("personal keyword injection", () => {
+	test("owner-only standalone hints use explicit identity and durable cycle dedupe", async () => {
+		const keyword = `personalhint${TAG}`;
+		const draft = await knowledgeBranchService.createStandalone(principal, {
+			title: "Personal hint",
+			content: "private body",
+			keywords: [keyword],
+		});
+		const hits = await resolveInjections(userId, keyword);
+		expect(hits).toContainEqual(
+			expect.objectContaining({ scope: "personal", entryId: draft.id, summary: "private body" }),
+		);
+		expect(await resolveInjections(null, keyword)).toEqual([]);
+		const other = generateId();
+		await db.insert(users).values({
+			id: other,
+			username: other,
+			passwordHash: "x",
+			role: "admin",
+			createdAt: new Date().toISOString(),
+		});
+		expect(await resolveInjections(other, keyword)).toEqual([]);
+		expect(formatInjectionsBare(hits, "heading")).toContain(
+			JSON.stringify({ personalEntryId: draft.id }),
+		);
+		expect(
+			formatInjectionsBare([{ entryId: "main", title: "Main", summary: "" }], "heading"),
+		).toContain(JSON.stringify({ entryId: "main" }));
+		const narratorId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+		knowledgeService.recordInjectionEvents({
+			narratorId,
+			compactSeq: -1,
+			source: "user_message",
+			hits,
+		});
+		knowledgeService.recordInjectionEvents({
+			narratorId,
+			compactSeq: -1,
+			source: "user_message",
+			hits,
+		});
+		const already = knowledgeService.listInjectedEntryIds(narratorId, -1);
+		expect([...already]).toEqual([`personal:${draft.id}`]);
+		expect(await resolveInjections(userId, keyword, { already })).toEqual([]);
+		expect(
+			(
+				await resolveInjections(userId, keyword, {
+					already: knowledgeService.listInjectedEntryIds(narratorId, 1),
+				})
+			).length,
+		).toBe(1);
+		await db
+			.update(knowledgeDrafts)
+			.set({ status: "archived" })
+			.where(eq(knowledgeDrafts.id, draft.id));
+		expect(await resolveInjections(userId, keyword)).toEqual([]);
+	});
+
+	test("project/global targets and unassigned entries are eligible; edits refresh matcher", async () => {
+		const now = new Date().toISOString();
+		const projectId = generateId();
+		const otherProjectId = generateId();
+		await db.insert(projects).values(
+			[projectId, otherProjectId].map((id) => ({
+				id,
+				name: id,
+				gitPath: `/test/${id}`,
+				createdAt: now,
+				updatedAt: now,
+			})),
+		);
+		const local = await knowledgeService.createCollection({ name: generateId(), projectId });
+		const other = await knowledgeService.createCollection({
+			name: generateId(),
+			projectId: otherProjectId,
+		});
+		const keyword = `scopehint${TAG}`;
+		const drafts = await Promise.all(
+			[undefined, collectionId, local.id, other.id].map((targetCollectionId) =>
+				knowledgeBranchService.createStandalone(principal, {
+					title: "Scope",
+					content: "body",
+					keywords: [keyword],
+					targetCollectionId,
+				}),
+			),
+		);
+		const ids = (await resolveInjections(userId, keyword, { projectId })).map((hit) => hit.entryId);
+		for (const draft of drafts.slice(0, 3)) expect(ids).toContain(draft.id);
+		expect(ids).not.toContain(drafts[3]!.id);
+		const edited = drafts[0];
+		if (!edited) throw new Error("Missing personal entry fixture");
+		await db
+			.update(knowledgeDrafts)
+			.set({ keywordsJson: [`changed${TAG}`], updatedAt: "2099-01-01T00:00:00.000Z" })
+			.where(eq(knowledgeDrafts.id, edited.id));
+		expect(
+			(await resolveInjections(userId, keyword, { projectId })).map((hit) => hit.entryId),
+		).not.toContain(edited.id);
+		expect(
+			(await resolveInjections(userId, `changed${TAG}`, { projectId })).map((hit) => hit.entryId),
+		).toContain(edited.id);
+	});
+});
+
 describe("persistent injection de-dup ledger", () => {
 	test("fresh in-memory sets can rebuild already-injected entries from DB", async () => {
 		const kw = `ledgerkw${TAG}`;
@@ -298,7 +570,7 @@ describe("persistent injection de-dup ledger", () => {
 		});
 
 		const rebuiltAlready = knowledgeService.listInjectedEntryIds(narratorId, -1);
-		expect(rebuiltAlready.has(entry.id)).toBe(true);
+		expect(rebuiltAlready.has(`global:${entry.id}`)).toBe(true);
 		const second = await resolveInjections(userId, `need ${kw}`, {
 			collectionId,
 			already: rebuiltAlready,
@@ -333,7 +605,7 @@ describe("injection de-dup within a compact cycle (shared `already` set)", () =>
 		});
 		expect(first).not.toBeNull();
 		expect(first).toContain(entry.id);
-		expect(already.has(entry.id)).toBe(true);
+		expect(already.has(`global:${entry.id}`)).toBe(true);
 
 		// Second scan with the SAME set must not re-surface the entry (de-dup).
 		const second = await scanToolOutputForKnowledge(userId, `again ${kw} here`, already, {
@@ -363,7 +635,7 @@ describe("injection de-dup within a compact cycle (shared `already` set)", () =>
 		const first = await resolveInjections(userId, `need ${kw}`, { collectionId, already });
 		expect(first.some((h) => h.entryId === entry.id)).toBe(true);
 		// Caller records the hit (mirrors the session runner) — next call skips it.
-		for (const h of first) already.add(h.entryId);
+		for (const h of first) already.add(injectionKey(h));
 
 		const second = await resolveInjections(userId, `need ${kw}`, { collectionId, already });
 		expect(second.some((h) => h.entryId === entry.id)).toBe(false);

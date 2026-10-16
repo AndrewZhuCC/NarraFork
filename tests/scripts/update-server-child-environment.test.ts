@@ -31,6 +31,7 @@ import {
 	type HelperReleasePlan,
 	restoreHelperReleaseBundle,
 } from "../../scripts/lib/helper-release-control";
+import { mirrorGhRunner } from "../../scripts/lib/mirror-public-github";
 import {
 	resolveUpdateServerBridgeConfig,
 	UpdateServerBridgeHttp,
@@ -300,61 +301,43 @@ async function mirrorFixture(f: Awaited<ReturnType<typeof sandbox>>, fallback = 
 }
 
 describe("upload-only credentials never enter release preparation subprocesses", () => {
-	test("real eight-platform legacy Hono prepare generates and rebuilds zstd without upload authority", async () => {
+	test("retired pre-publication bridge refuses without server requests or generation subprocesses", async () => {
 		const f = await sandbox();
 		const fixture = await mirrorFixture(f);
 		const before = await readFile(join(fixture.bundleDir, "manifest.json"), "utf8");
 		setEnvironment(f.environment);
-		const prepared = await prepareUpdateServerMainMirror({
-			...fixture,
-			run: () => {
-				throw new Error("Unexpected GH request");
-			},
-		});
-		expect(prepared.seal.platforms).toHaveLength(8);
-		expect(prepared.seal.platforms.every((entry) => entry.patches.length === 1)).toBe(true);
-		for (const entry of prepared.seal.platforms) {
-			expect(await readFile(join(fixture.bundleDir, "dist", entry.full.filename))).toEqual(
-				binary("2.0.0", entry.platform),
-			);
-		}
+		await expect(
+			prepareUpdateServerMainMirror({
+				...fixture,
+				run: () => {
+					throw new Error("Unexpected GH request");
+				},
+			}),
+		).rejects.toThrow("retired");
 		expect(await readFile(join(fixture.bundleDir, "manifest.json"), "utf8")).toBe(before);
-		expect(JSON.stringify(prepared)).not.toContain(sentinel);
+		expect(fixture.requests).toHaveLength(0);
 		expect(process.env.NF_UPDATE_TOKEN).toBe(sentinel);
-		const records = await f.assertChildren();
-		expect(records.filter((entry) => entry.tool === "zstd")).toHaveLength(16);
+		expect(await readdir(f.root)).not.toContain("child-observations.jsonl");
 	});
 
-	test("legacy 404 falls back to real gh child download and independent verified SHA512", async () => {
+	test("current GitHub raw asset downloader filters upload credentials without historical server fallback", async () => {
 		const f = await sandbox();
-		const fixture = await mirrorFixture(f, true);
-		const target = CI_RELEASE_TARGETS[0];
-		const bytes = binary("1.0.0", target.platform);
+		const bytes = Buffer.from("current public canonical patch raw bytes");
 		const asset = join(f.root, "gh-asset");
+		const outputPath = join(f.root, "current-patch");
 		await writeFile(asset, bytes);
 		setEnvironment({ ...f.environment, FIXTURE_ASSET: asset });
-		const prepared = await prepareUpdateServerMainMirror({
-			...fixture,
-			run: () =>
-				JSON.stringify({
-					draft: false,
-					tag_name: "v1.0.0",
-					assets: [
-						{
-							id: 77,
-							name: `narrafork-1.0.0-${target.suffix}`,
-							size: bytes.length,
-							state: "uploaded",
-						},
-					],
-				}),
+		await downloadReleaseAsset({
+			repository: "Fixture/Fork",
+			assetId: 77,
+			size: bytes.length,
+			outputPath,
 		});
-		expect(prepared.seal.platforms).toHaveLength(8);
-		expect(
-			fixture.requests.some((entry) => entry.status === 404 && entry.path.includes("/download/")),
-		).toBe(true);
+		expect(await readFile(outputPath)).toEqual(bytes);
+		expect(process.env.NF_UPDATE_TOKEN).toBe(sentinel);
 		const records = await f.assertChildren();
 		expect(records.filter((entry) => entry.tool === "gh")).toHaveLength(1);
+		expect(records.filter((entry) => entry.tool === "zstd")).toHaveLength(0);
 	});
 
 	test("buffer CLI generation/application preserves exact bytes and filters both synchronous calls", async () => {
@@ -417,7 +400,10 @@ describe("upload-only credentials never enter release preparation subprocesses",
 		expect(await resolveHelperTagCommit({ repository: "Fixture/Fork" }, HELPER_RELEASE_TAG)).toBe(
 			commit,
 		);
-		expect(await f.assertChildren()).toHaveLength(3);
+		expect(await mirrorGhRunner()(["api", "repos/Fixture/Fork/git/ref/tags/helpers-v1.0.0"])).toBe(
+			response,
+		);
+		expect(await f.assertChildren()).toHaveLength(4);
 		expect(process.env.NF_UPDATE_TOKEN).toBe(sentinel);
 		expect(explicitEnvironment.NF_UPDATE_TOKEN).toBe(sentinel);
 	});
@@ -536,6 +522,10 @@ async function restoreFixture(f: Awaited<ReturnType<typeof sandbox>>) {
 			return contents(manifest.plan.changelog);
 		if (path === `contents/scripts/lib/ci-release-types.ts?ref=${commit}`)
 			return JSON.stringify({ type: "file", size: 100 });
+		// Component source read (publish revalidation): this fixture is a legacy target with no
+		// shared/component-versions.json, so the bounded tree walk finds nothing to pin.
+		if (path === `git/trees/${commit}`)
+			return JSON.stringify({ sha: commit, truncated: false, tree: [] });
 		throw new Error(`Unexpected source fixture API ${path}`);
 	};
 	const env: NodeJS.ProcessEnv = {

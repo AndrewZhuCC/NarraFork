@@ -19,6 +19,55 @@ export type ChangelogEntry = {
 	date: string;
 } & LocalizedValue<string>;
 
+/**
+ * One OpenCode Go plan window (5-hour rolling / weekly / monthly) as cached by
+ * the server. `percent` is how much of the window is already USED; the status bar
+ * converts it to the "remaining" convention the other quota indicators use.
+ */
+export interface OpencodeUsageWindow {
+	status: "ok" | "rate-limited" | null;
+	percent: number | null;
+	/** ISO timestamp when the window refills. The windows are not calendar periods. */
+	resetsAt: string | null;
+}
+
+/**
+ * Per-provider OpenCode Go usage cache entry.
+ *
+ * `GET /api/opencode/usages` is readable by any signed-in user, but the upstream error text
+ * is not: it describes the deployment's own provider account rather than the requesting
+ * user's allowance, so the server sends `error` only to admins and everyone else gets
+ * `hasError`. Both fields are optional here because a given response carries exactly one of
+ * them — read them through `opencodeUsageFailed()` rather than testing `error` directly, or a
+ * non-admin's failed fetch reads as a successful one whose numbers are merely stale.
+ */
+export interface OpencodeUsageCache {
+	rolling: OpencodeUsageWindow | null;
+	weekly: OpencodeUsageWindow | null;
+	monthly: OpencodeUsageWindow | null;
+	generation: string;
+	fetchedAt: number;
+	/** Admin-only: the upstream failure text. Absent for non-admins. */
+	error?: string | null;
+	/** Non-admin substitute for `error`: that it failed, without saying how. */
+	hasError?: boolean;
+}
+
+/** Per-provider official DeepSeek balance; errors are redacted for non-admins. */
+export interface DeepSeekBalanceCache {
+	generation: string;
+	isAvailable: boolean | null;
+	balanceInfos: Array<{
+		currency: string;
+		totalBalance: string;
+		grantedBalance: string;
+		toppedUpBalance: string;
+	}>;
+	fetchedAt: number;
+	error?: string | null;
+	hasError?: boolean;
+}
+
 /** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
 export interface KimiUsageWindow {
 	used: number | null;

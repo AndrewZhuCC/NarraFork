@@ -30,7 +30,9 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { IntelligentUICard } from "@frontend/components/intelligent-ui/IntelligentUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
+import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
@@ -88,6 +90,14 @@ import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { resolveToolCallTiming } from "@shared/tool-display-duration";
 import { CopyButton } from "../../../common/CopyButton";
+import {
+	QUOTE_FILE_ATTR,
+	QUOTE_PART_ATTR,
+	QUOTE_TOOL_ATTR,
+	QUOTE_TOOL_ID_ATTR,
+	QUOTE_TOOL_SUMMARY_ATTR,
+	quoteSectionPart,
+} from "../../composer/quote-source-attrs";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";
@@ -266,6 +276,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	taskOutput: "indigo",
 	agent: "pink",
 	await: "indigo",
+	stop: "orange",
 	contextAsk: "indigo",
 	send: "blue",
 	ask: "blue",
@@ -1446,16 +1457,38 @@ function sectionLabelText(labels: DetailLabels, label: ToolSectionLabel): string
 	return labels.sections?.[label] ?? DEFAULT_SECTION_LABELS[label];
 }
 
+/**
+ * The absolute URL a share link is copied as.
+ *
+ * The card's action carries a server-authored `/api/shares/…` PATH (see
+ * `resolveServerUrl`): as a clipboard value it is unusable on its own, because
+ * pasting it into a browser address bar or a chat has no host to resolve against.
+ * The origin is the frontend's own, which is what the reader opening the link needs.
+ */
+function shareLinkForCopy(path: string): string {
+	const origin = globalThis.location?.origin ?? "";
+	return origin && path.startsWith("/") ? `${origin}${path}` : path;
+}
+
+/** Test-only handle: the copy button renders its value into a click handler, which a
+ * static render cannot reach, so RenderToolCall.sharelink.test.tsx asserts the
+ * mapping itself. */
+export const __TEST__shareLinkForCopy = shareLinkForCopy;
+
 /** Action controls on a meta row: the share card's download + copy-link buttons. */
 function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: DetailLabels }) {
 	return (
 		<Group gap="xs" wrap="nowrap" style={{ height: "100%", alignItems: "center" }}>
-			{actions.map((action) =>
-				action.kind === "download" ? (
+			{actions.map((action) => {
+				// Resolve the mount prefix at render time: the value is persisted with the
+				// message, so a producer-side fix could not reach rows already written. The
+				// download href needs the prefix, the copied text needs prefix + origin.
+				const href = resolveServerUrl(action.value);
+				return action.kind === "download" ? (
 					<Button
 						key={`download-${action.value}`}
 						component="a"
-						href={action.value}
+						href={href}
 						size="xs"
 						variant="light"
 						color="green"
@@ -1464,7 +1497,7 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
 						{labels.download}
 					</Button>
 				) : (
-					<CopyButton key={`copy-${action.value}`} value={action.value} timeout={2000}>
+					<CopyButton key={`copy-${action.value}`} value={shareLinkForCopy(href)} timeout={2000}>
 						{({ copied, copy }) => (
 							<Button
 								size="xs"
@@ -1477,8 +1510,8 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
 							</Button>
 						)}
 					</CopyButton>
-				),
-			)}
+				);
+			})}
 		</Group>
 	);
 }
@@ -1883,6 +1916,19 @@ function askRoleColor(role: string, selected: boolean): string | undefined {
 	}
 }
 
+/** The path row of a file tool card. Edit appends `:line`; the quote reader strips that. */
+function quoteFilePath(detail: MeasuredToolDetail | null): string | undefined {
+	if (!detail) return undefined;
+	for (const section of detail.sections) {
+		if (section.key !== "meta.file" && section.key !== "meta.target") continue;
+		const model = section.measuredBody.model;
+		if (model.kind !== "meta-rows") continue;
+		const text = model.rows.map((row) => row.text.trim()).find((row) => row.length > 0);
+		if (text) return text;
+	}
+	return undefined;
+}
+
 function DetailRegion({
 	detail,
 	availableWidth,
@@ -1905,48 +1951,52 @@ function DetailRegion({
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-			{detail.sections.map((section) => (
-				<Fragment key={section.key}>
-					{section.label ? (
-						<Text
-							size="xs"
-							fw={500}
+			{detail.sections.map((section) => {
+				const part = quoteSectionPart(section.key);
+				return (
+					<Fragment key={section.key}>
+						{section.label ? (
+							<Text
+								size="xs"
+								fw={500}
+								style={{
+									position: "absolute",
+									top: section.top,
+									left: 0,
+									width: availableWidth,
+									height: typographyMetrics().line.xs,
+								}}
+							>
+								{sectionLabelText(labels, section.label)}
+							</Text>
+						) : null}
+						<div
+							{...(part ? { [QUOTE_PART_ATTR]: part } : {})}
 							style={{
 								position: "absolute",
-								top: section.top,
+								top: section.bodyTop,
 								left: 0,
 								width: availableWidth,
-								height: typographyMetrics().line.xs,
+								height: section.bodyHeight,
 							}}
 						>
-							{sectionLabelText(labels, section.label)}
-						</Text>
-					) : null}
-					<div
-						style={{
-							position: "absolute",
-							top: section.bodyTop,
-							left: 0,
-							width: availableWidth,
-							height: section.bodyHeight,
-						}}
-					>
-						<RenderToolBody
-							measured={section.measuredBody}
-							labels={labels}
-							narratorId={narratorId}
-							openSession={openSession}
-							viewTarget={
-								section.measuredBody.model.kind === "capped"
-									? findViewTarget(viewTargets, section.measuredBody.model.source)
-									: undefined
-							}
-							viewControls={viewControls}
-							specTasksLive={specTasksLive}
-						/>
-					</div>
-				</Fragment>
-			))}
+							<RenderToolBody
+								measured={section.measuredBody}
+								labels={labels}
+								narratorId={narratorId}
+								openSession={openSession}
+								viewTarget={
+									section.measuredBody.model.kind === "capped"
+										? findViewTarget(viewTargets, section.measuredBody.model.source)
+										: undefined
+								}
+								viewControls={viewControls}
+								specTasksLive={specTasksLive}
+							/>
+						</div>
+					</Fragment>
+				);
+			})}
 		</div>
 	);
 }
@@ -1983,6 +2033,27 @@ export function RenderToolBody({
 		}),
 		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
 	);
+	if (model.kind === "intelligent-ui")
+		return (
+			<IntelligentUICard
+				narratorId={narratorId}
+				file={model.file}
+				publicSummary={model.publicSummary}
+				historyUnavailable={model.historyUnavailable}
+				inline={
+					model.text === undefined
+						? undefined
+						: {
+								source: model.text,
+								live: model.live === true,
+								title: model.title,
+								runtime: model.runtime,
+							}
+				}
+				kit={model.kit}
+				height={height}
+			/>
+		);
 	if (model.kind === "ask")
 		return (
 			<AskDetailBlocks
@@ -2511,13 +2582,20 @@ export function RenderToolCall({
 			{liveSlot}
 		</>
 	);
+	const quoteFile = quoteFilePath(measured.detail);
+	const quoteSource = {
+		[QUOTE_TOOL_ATTR]: measured.toolName,
+		[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
+		...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
+		...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
+	};
 
 	// In a run: no border, a trailing divider unless last. The shimmer overlay
 	// sits on the inner padded box (not the outer wrapper) so the divider stays
 	// outside the `overflow: hidden` sweep — mirrors ToolCallCard :6100.
 	if (inRun) {
 		return (
-			<Box>
+			<Box {...quoteSource}>
 				<Box p="xs" className={shimmerClass} style={{ boxSizing: "border-box" }}>
 					{body}
 				</Box>
@@ -2533,6 +2611,7 @@ export function RenderToolCall({
 			// so it has to arrive and leave rather than travel). Marked rather than found by
 			// tag so the fade cannot silently retarget if the card's markup changes.
 			data-nf-card-surface
+			{...quoteSource}
 			withBorder={hasBorder}
 			radius="sm"
 			p="xs"

@@ -17,6 +17,7 @@ import {
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
 	setRecentTabDirectoryOrderSchema,
+	specTabLayoutPatchSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
@@ -304,6 +305,7 @@ function serializeUserPreferences(
 		gatewayConfig: serializeGatewayConfig(pref.gatewayConfig),
 		navLayout: parseJsonObject(pref.navLayout),
 		narratorToolbarLayout: parseJsonObject(pref.narratorToolbarLayout),
+		specTabLayout: parseJsonObject(pref.specTabLayout),
 	};
 }
 
@@ -326,6 +328,7 @@ userPreferencesRoutes.get("/", async (c) => {
 			gatewayConfig: {},
 			navLayout: {},
 			narratorToolbarLayout: {},
+			specTabLayout: {},
 		});
 	}
 
@@ -682,6 +685,42 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 			   graph_viewports = ?,
 			   updated_at = ?`,
 			[id, userId, JSON.stringify(viewports), now, now, JSON.stringify(viewports), now],
+		);
+	});
+
+	return c.json({ ok: true });
+});
+
+// --- Dynamic Spec 大纲标签排布（按叙述者） ---
+
+/**
+ * 写入某个叙述者的大纲标签排布。整张映射按 narratorId 合并写入，
+ * 其他叙述者的记录不受影响。
+ */
+userPreferencesRoutes.patch("/spec-tab-layout", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = specTabLayoutPatchSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { narratorId, order, pinned } = parsed.data;
+	const now = new Date().toISOString();
+	const id = generateId();
+
+	await userPreferencesLock.acquire(userId, async () => {
+		const existing = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { specTabLayout: true },
+		});
+		const layouts = parseJsonObject(existing?.specTabLayout);
+		layouts[narratorId] = { order, pinned };
+		const specTabLayout = JSON.stringify(layouts);
+		sqlite.run(
+			`INSERT INTO user_preferences (id, user_id, spec_tab_layout, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (user_id) DO UPDATE SET
+			   spec_tab_layout = ?,
+			   updated_at = ?`,
+			[id, userId, specTabLayout, now, now, specTabLayout, now],
 		);
 	});
 

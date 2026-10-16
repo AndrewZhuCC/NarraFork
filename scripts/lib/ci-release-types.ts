@@ -4,7 +4,7 @@ import type { BinaryMetadata } from "./binary-metadata";
 /** Compatibility default only; live CI derives identity from validated GITHUB_REPOSITORY. */
 export const CI_RELEASE_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
 export const CI_RELEASE_WORKFLOW = ".github/workflows/release.yml";
-export const CI_RELEASE_BUN = "1.4.2";
+export const CI_RELEASE_BUN = "1.4.3";
 export const CI_RELEASE_TARGETS = [
 	{
 		target: "linux-x64",
@@ -93,6 +93,16 @@ export interface CiReleaseBuildSource {
 	controlArtifact: CiReleaseArtifactIdentity;
 	platforms: { target: CiReleaseTarget; artifact: CiReleaseArtifactIdentity }[];
 }
+export interface CiReleaseComponentEvidence {
+	executor: {
+		version: string;
+		protocolVersion: number;
+		tag: string;
+		commit: string;
+		manifestSha256: string;
+		buildInputsSha256: string;
+	};
+}
 export interface CiReleasePlan {
 	schemaVersion: 1;
 	repository: string;
@@ -108,6 +118,8 @@ export interface CiReleasePlan {
 	runId: number;
 	runAttempt: number;
 	baselines: CiReleaseBaseline[];
+	/** Read-only component identities, collected only by an online publisher control plan. */
+	componentEvidence?: CiReleaseComponentEvidence;
 	/** Present only for native re-verification of byte-identical original builds. */
 	buildSource?: CiReleaseBuildSource;
 }

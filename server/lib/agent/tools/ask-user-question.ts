@@ -97,8 +97,8 @@ export const askUserQuestionTool: ToolDefinition = {
 						},
 						options: {
 							description:
-								"The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
-							minItems: 2,
+								"The available choices for this question. Use an empty array for free-form input, or provide 2-4 options for a choice question. Put all choices inside this question's options array, not as separate questions. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
+							minItems: 0,
 							maxItems: 4,
 							type: "array",
 							items: {

@@ -83,14 +83,17 @@ export function useNarratorsPaginated(opts?: {
 
 export interface FileTreeStatusFile {
 	path: string;
-	linesAdded: number;
-	linesRemoved: number;
+	status?: string;
+	oldPath?: string;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface FileTreeStatus {
 	isGitRepo: boolean;
 	files: FileTreeStatusFile[];
 	totalFiles: number;
+	totalFilesExact?: boolean;
 	truncated: boolean;
 }
 
@@ -770,6 +773,18 @@ export function useNarrator(id: string) {
 	});
 }
 
+/** Presentation only: decisions always go through fresh WS/REST reconciliation and server authorization. */
+export function useNarratorPanelState(narratorId: string, userId: string | null, enabled = true) {
+	return useQuery({
+		queryKey: ["narrator-panel-state", userId, narratorId],
+		queryFn: ({ signal }) => api.getNarratorPanelState(narratorId, { signal }),
+		enabled: !!narratorId && !!userId && enabled,
+		staleTime: 0,
+		retry: false,
+		gcTime: 30_000,
+	});
+}
+
 export function useNarratorUsageStats(narratorId: string, includeSubagents = true, enabled = true) {
 	return useQuery({
 		queryKey: ["narrators", narratorId, "usage-stats", { includeSubagents }],
@@ -1275,6 +1290,8 @@ export function useNarratorCustomTraits(id: string, enabled = true) {
 		queryKey: ["narrators", id, "custom-traits"],
 		queryFn: () => api.getCustomTraits(id),
 		enabled: !!id && enabled,
+		// Tool/model changes already invalidate this domain; avoid duplicate drawer reads.
+		staleTime: 5_000,
 		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
 	});
 }

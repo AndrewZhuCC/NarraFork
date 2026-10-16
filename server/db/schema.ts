@@ -24,6 +24,7 @@ import {
 	foreignKey,
 	index,
 	integer,
+	primaryKey,
 	real,
 	sqliteTable,
 	text,
@@ -74,6 +75,70 @@ export const permissionRuleRequests = sqliteTable(
 			table.createdAt,
 			table.id,
 		),
+	],
+);
+
+/** Business rows own resources; their paths are derived. Legacy receipt paths are retained pins. */
+export const resourceProtectionPaths = sqliteTable(
+	"resource_protection_paths",
+	{
+		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		sourceId: text("source_id").notNull(),
+		slot: integer("slot").notNull(),
+		deviceId: text("device_id").notNull(),
+		canonicalPath: text("canonical_path"),
+		repositoryKey: text("repository_key"),
+		shadowKey: text("shadow_key"),
+		scopeProjectId: text("scope_project_id"),
+		aliasSensitive: integer("alias_sensitive").notNull().default(0),
+		claimJson: text("claim_json").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source, table.sourceId, table.slot] }),
+		index("idx_protection_path").on(
+			table.deviceId,
+			table.canonicalPath,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_repository").on(
+			table.deviceId,
+			table.repositoryKey,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_shadow").on(table.shadowKey, table.source, table.sourceId, table.slot),
+		index("idx_protection_scope").on(
+			table.scopeProjectId,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_alias").on(
+			table.aliasSensitive,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+	],
+);
+
+/** Derived source revisions/dirty markers and bootstrap progress; receipt rows retain legacy pins. */
+export const resourceProtectionSources = sqliteTable(
+	"resource_protection_sources",
+	{
+		source: text("source", { enum: ["narrator", "chapter", "registry", "receipt"] }).notNull(),
+		sourceId: text("source_id").notNull(),
+		revision: integer("revision").notNull().default(1),
+		dirty: integer("dirty").notNull().default(1),
+		cursor: text("cursor"),
+		complete: integer("complete").notNull().default(0),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source, table.sourceId] }),
+		index("idx_protection_dirty").on(table.dirty, table.source, table.sourceId),
 	],
 );
 
@@ -755,6 +820,8 @@ export const narrators = sqliteTable(
 		turnEndedAt: text("turn_ended_at"),
 		/** Monotonically increasing counter bumped on every message add/delete/update */
 		messageVersion: integer("message_version").notNull().default(0),
+		/** Durable model-source invalidation, independent of display/WS versions and usage. */
+		modelHistoryRevision: integer("model_history_revision").notNull().default(0),
 		/** Monotonically increasing counter bumped when the visible timeline structure changes. */
 		messageStructureVersion: integer("message_structure_version").notNull().default(0),
 		/**
@@ -1447,6 +1514,12 @@ export const specProtectedTasks = sqliteTable(
 	],
 );
 
+// === model history revision contract (published by the generated trigger migration) ===
+export const modelHistoryRevisionContracts = sqliteTable("model_history_revision_contracts", {
+	id: text("id").primaryKey(),
+	installedVersion: text("installed_version").notNull(),
+});
+
 // === narrator_messages ===
 export const narratorContextCharPages = sqliteTable(
 	"narrator_context_char_pages",
@@ -1475,6 +1548,8 @@ export const narratorMessages = sqliteTable(
 		parentToolUseId: text("parent_tool_use_id"),
 		role: text("role", { enum: ["user", "assistant", "system", "sys", "disp"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),
+		/** Incremented transactionally when model-visible body/identity changes. */
+		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
 		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
@@ -1619,6 +1694,8 @@ export const narratorToolCalls = sqliteTable(
 			.references(() => narratorMessages.id),
 		toolUseId: text("tool_use_id").notNull(),
 		toolName: text("tool_name").notNull(),
+		/** Incremented transactionally for input/output/status/attempt ordering changes. */
+		modelRevision: integer("model_revision").notNull().default(0),
 		inputJson: text("input_json", { mode: "json" }),
 		outputJson: text("output_json", { mode: "json" }),
 		inputChars: integer("input_chars").notNull().default(0),
@@ -2249,6 +2326,12 @@ export const userPreferences = sqliteTable("user_preferences", {
 	// it always live in the overflow menu). Order is the user's priority and is shared across
 	// desktop and mobile; how many actually fit is decided per host at render time.
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
+	/**
+	 * 大纲标签排布，按叙述者记录：`{ [narratorId]: { order: string[], pinned: string[] } }`。
+	 * order = 普通文档的展示序，pinned = 置顶文档的展示序；内置的
+	 * tasks.json / behavior_fence / index.md 不参与记录，始终固定在最前。
+	 */
+	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
@@ -3464,6 +3547,9 @@ export const apiRequests = sqliteTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
+		// Nullable so historical rows are never silently treated as normalized.
+		tokenAccountingVersion: integer("token_accounting_version"),
+		tokenAccountingReviewVersion: integer("token_accounting_review_version"),
 		// Token 使用统计
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
@@ -3503,8 +3589,82 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_api_requests_token_repair_pending")
+			.on(table.createdAt, table.id)
+			.where(
+				sql`${table.tokenAccountingVersion} IS NULL AND ${table.tokenAccountingReviewVersion} IS NULL AND (${table.cachedInputTokens} > 0 OR ${table.cacheCreationInputTokens} > 0 OR ${table.cacheCreation5mTokens} > 0 OR ${table.cacheCreation1hTokens} > 0)`,
+			),
+		index("idx_api_requests_token_repair_reviewed")
+			.on(table.createdAt, table.id)
+			.where(
+				sql`${table.tokenAccountingVersion} IS NULL AND (${table.cachedInputTokens} > 0 OR ${table.cacheCreationInputTokens} > 0 OR ${table.cacheCreation5mTokens} > 0 OR ${table.cacheCreation1hTokens} > 0)`,
+			),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
+	],
+);
+
+// Deployment-wide maintenance audit. No FK to requests/users: audit survives cleanup.
+export const usageTokenRepairJobs = sqliteTable(
+	"usage_token_repair_jobs",
+	{
+		id: text("id").primaryKey(),
+		status: text("status").notNull(),
+		createdBy: text("created_by").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		ownerId: text("owner_id"),
+		leaseUntil: text("lease_until"),
+		scanned: integer("scanned").notNull().default(0),
+		repaired: integer("repaired").notNull().default(0),
+		conflicts: integer("conflicts").notNull().default(0),
+		upperCreatedAt: text("upper_created_at"),
+		upperId: text("upper_id"),
+		cursorCreatedAt: text("cursor_created_at"),
+		cursorId: text("cursor_id"),
+		includeReviewed: integer("include_reviewed", { mode: "boolean" }).notNull(),
+		protocolOverridesJson: text("protocol_overrides_json").notNull().default("[]"),
+		/** Immutable candidate scope for a manual reanalysis; audit survives cleanup. */
+		sourceJobId: text("source_job_id"),
+		error: text("error"),
+	},
+	(table) => [
+		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
+		uniqueIndex("idx_token_repair_single_active")
+			.on(sql`(1)`)
+			.where(sql`${table.status} IN ('analyzing', 'ready', 'applying')`),
+		check(
+			"token_repair_protocol_config_bound",
+			sql`length(${table.protocolOverridesJson}) <= 16384`,
+		),
+		check(
+			"token_repair_error_bound",
+			sql`${table.error} IS NULL OR length(${table.error}) <= 2048`,
+		),
+	],
+);
+
+export const usageTokenRepairCandidates = sqliteTable(
+	"usage_token_repair_candidates",
+	{
+		id: text("id").primaryKey(),
+		jobId: text("job_id").notNull(),
+		requestId: text("request_id").notNull(),
+		createdAt: text("created_at").notNull(),
+		provider: text("provider"),
+		model: text("model"),
+		// Only five counters and indexed ownership metadata; never prompts/dumps.
+		snapshotJson: text("snapshot_json").notNull(),
+		evidenceJson: text("evidence_json").notNull(),
+		appliedAt: text("applied_at"),
+		appliedBy: text("applied_by"),
+		totalsStatus: text("totals_status").notNull().default("unchanged"),
+	},
+	(table) => [
+		uniqueIndex("idx_token_repair_candidate_request").on(table.jobId, table.requestId),
+		index("idx_token_repair_candidates_page").on(table.jobId, table.id),
+		check("token_repair_snapshot_bound", sql`length(${table.snapshotJson}) <= 8192`),
+		check("token_repair_evidence_bound", sql`length(${table.evidenceJson}) <= 16384`),
 	],
 );
 
@@ -4836,9 +4996,10 @@ export const knowledgeInjectionEvents = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		compactSeq: integer("compact_seq").notNull(),
-		entryId: text("entry_id")
-			.notNull()
-			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryId: text("entry_id").references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		personalEntryId: text("personal_entry_id").references(() => knowledgeDrafts.id, {
+			onDelete: "cascade",
+		}),
 		entryRevisionId: text("entry_revision_id").references(() => knowledgeRevisions.id, {
 			onDelete: "set null",
 		}),
@@ -4855,7 +5016,17 @@ export const knowledgeInjectionEvents = sqliteTable(
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
+		check(
+			"knowledge_injection_exactly_one_entry",
+			sql`(${table.entryId} IS NOT NULL AND ${table.personalEntryId} IS NULL) OR (${table.entryId} IS NULL AND ${table.personalEntryId} IS NOT NULL)`,
+		),
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		uniqueIndex("idx_kie_cycle_personal_entry").on(
+			table.narratorId,
+			table.compactSeq,
+			table.personalEntryId,
+		),
+		index("idx_kie_personal_entry").on(table.personalEntryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
 		// FK covering indexes: both parents (narrator_messages / narrator_tool_calls) are

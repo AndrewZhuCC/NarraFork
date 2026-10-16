@@ -96,6 +96,14 @@
 			"prevId": "493d731c-ffd2-42b5-a3f0-1968a6b7ff9a",
 			"version": "7",
 			"snapshotDigest": "f20cd062d8f9c2faa02c3aeaa7606f19308197de2fddc3af5a9ee84d72de8221"
+		},
+		{
+			"idx": 12,
+			"tag": "0012_merge_upstream_092",
+			"id": "ad2f22a4-0a76-46e9-8e78-faabb8a2a810",
+			"prevId": "d328ea85-67c6-4b54-b1a0-b00e6fca594b",
+			"version": "7",
+			"snapshotDigest": "c640671367231b645f4fc76010d1260444740a78166aa2ef8b3385aad554e72a"
 		}
 	]
 }

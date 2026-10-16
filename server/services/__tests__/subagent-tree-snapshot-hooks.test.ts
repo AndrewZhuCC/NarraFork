@@ -17,7 +17,7 @@
  * session. It must degrade to a null boundary and let the tool proceed.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -124,6 +124,54 @@ afterEach(async () => {
 });
 
 describe("execution-owned snapshot boundaries", () => {
+	test("IntelligentUI create records a generated file boundary while show records none", async () => {
+		const repo = await createRepo("nf-ui-snapshot-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+		const directory = join(repo, ".narrafork/intelligent_ui/demo-unique");
+		for (const [seq, action] of [
+			[1, "create"],
+			[2, "show"],
+		] as const) {
+			const call = await seedToolCall(narratorId, "IntelligentUI", seq);
+			const row = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.messageId, call.messageId),
+			});
+			if (!row) throw new Error("Missing UI tool fixture");
+			await db
+				.update(narratorToolCalls)
+				.set({ executionAttempt: 1 })
+				.where(eq(narratorToolCalls.id, row.id));
+			const input = action === "create" ? { action, prefix: "demo" } : { action, path: directory };
+			const context = {
+				toolUse: { name: "IntelligentUI", toolUseId: call.toolUseId, input },
+				effectiveInput: input,
+				binding: { toolCallId: row.id, attempt: 1 },
+				executionTarget: {
+					deviceId: "local",
+					backendKind: "local" as const,
+					cwd: repo,
+					selectionSource: "local_default" as const,
+				},
+			};
+			await hooks.onToolExecutionBefore?.(context);
+			if (action === "create") {
+				mkdirSync(directory, { recursive: true });
+				writeFileSync(join(directory, "App.tsx"), "export default () => null");
+			}
+			await hooks.onToolExecutionAfter?.({ ...context, result: { output: "ok" } });
+			const boundary = await readToolCallBoundaries(call.toolUseId);
+			if (action === "create") {
+				expect(boundary?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
+				expect(boundary?.treeHashAfter).toMatch(/^[0-9a-f]{40}$/);
+				expect(boundary?.treeHashAfter).not.toBe(boundary?.treeHashBefore);
+			} else {
+				expect(boundary?.treeHashBefore).toBeNull();
+				expect(boundary?.treeHashAfter).toBeNull();
+			}
+		}
+	});
 	test("uses redirected inputs and updates only the bound row among repeated provider ids", async () => {
 		const repo = await createRepo("nf-lifecycle-binding-");
 		const narratorId = await createSubagent(repo);
@@ -515,14 +563,22 @@ describe("subagent snapshot hooks never block the loop", () => {
 					);
 				}),
 		);
+		// Same real budget path, shorter budget: the production 4 s budget elapses twice (before
+		// and after hooks), which made this case ~8 s of waiting. Only "the hook returns once its
+		// budget expires instead of waiting for the hung scan" is under test.
+		const realHot = worktreeTreeSnapshot.tryCaptureHot.bind(worktreeTreeSnapshot);
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot").mockImplementation(
+			(path, deviceId, hotOpts) => realHot(path, deviceId, { ...hotOpts, budgetMs: 400 }),
+		);
 		try {
 			const startedAt = Date.now();
-			// The real budget is 4s; the hook must return well inside it and NOT wait
-			// for the hung scan. Asserting the elapsed time is the whole point — a
-			// version that awaited the capture would sit here for 30s.
+			// The hook must return at its budget and NOT wait for the hung scan. Asserting
+			// the elapsed time is the whole point — a version that awaited the capture would
+			// sit here for 30 s.
 			await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
 			const elapsed = Date.now() - startedAt;
 			expect(elapsed).toBeLessThan(10_000);
+			expect(hot).toHaveBeenCalled();
 
 			// The tool proceeds and its result hook also returns, with no boundary
 			// recorded: degraded to per-file replay, which is the designed fallback.
@@ -533,6 +589,7 @@ describe("subagent snapshot hooks never block the loop", () => {
 			expect(row?.treeHashBefore).toBeNull();
 			expect(row?.treeHashAfter).toBeNull();
 		} finally {
+			hot.mockRestore();
 			spy.mockRestore();
 			// Kill the promoted background warm-up so the hung mock cannot outlive this
 			// test; destroy() aborts an in-flight warm-up by contract.

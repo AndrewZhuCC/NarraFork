@@ -249,15 +249,17 @@ export function DockviewWorkspace({
 		[],
 	);
 	/**
-	 * Whether the user has edited the arrangement on THIS mount.
+	 * Whether the surface holds arrangement edits the server has NOT acknowledged.
 	 *
-	 * This is the guard against a stale-query-cache clobber: when a refetch delivers
-	 * a layout that differs from what the surface shows, a local edit means "keep
-	 * the surface, the next persist makes the server agree", while no local edit
-	 * means the server layout is strictly newer and the surface rebuilds from it.
-	 * Local-first lasts only for this mount; remounting re-adopts server state.
+	 * Set by `onDidLayoutChange`, cleared by a successful save of the observed
+	 * arrangement and by a rebuild. This is the cross-device sync contract: a
+	 * surface with nothing unsaved adopts a newer server layout immediately
+	 * ("rebuild" in `decideSurfaceRefresh`), while one mid-edit keeps it and lets
+	 * the pending persist win (last-writer-wins). The predecessor flag was sticky
+	 * for the whole mount — one tab click made every later server-side change
+	 * invisible until remount, which is why a second device never followed along.
 	 */
-	const localEditRef = useRef(false);
+	const unsavedArrangementRef = useRef(false);
 	/**
 	 * The tree string the surface was last built from (or saved as).
 	 *
@@ -268,12 +270,25 @@ export function DockviewWorkspace({
 	 */
 	const builtTreeRef = useRef<string | null>(null);
 	/**
+	 * The `layoutRevision` `builtTreeRef` corresponds to.
+	 *
+	 * Compared against the incoming prop revision so a STALE read (one that started
+	 * before our own save, or simply arrived late) is ignored rather than adopted.
+	 * Distinct from `layoutRevisionRef`: that one advances on every render where the
+	 * prop is newer, so comparing against it would make "incoming <= known" always
+	 * true and no remote layout would ever be adopted. Assigned exactly where
+	 * `builtTreeRef` is — `buildSurface`, `commitSavedLayout`, and the
+	 * adopt-baseline branch of the stale-refresh effect.
+	 */
+	const builtRevisionRef = useRef(layoutRevision);
+	/**
 	 * Suppresses the `onDidLayoutChange` handler while a rebuild is in flight.
 	 *
 	 * Rebuilding calls `fromJSON`, which fires layout-change events; without the
-	 * flag those would set `localEditRef` (making every later server-side change
-	 * invisible) and persist the rebuilt layout straight back (a pointless write
-	 * that also bumps the revision). Both handlers check this before doing work.
+	 * flag those would set `unsavedArrangementRef` (making every later server-side
+	 * change invisible) and persist the rebuilt layout straight back (a pointless
+	 * write that also bumps the revision). Both handlers check this before doing
+	 * work.
 	 */
 	const suppressLayoutEventsRef = useRef(false);
 	/** Narrator ids we have joined (via panels) and must leave on unmount. */
@@ -284,6 +299,13 @@ export function DockviewWorkspace({
 	// Keep latest treeJson without forcing effect re-runs on every keystroke.
 	const treeJsonRef = useRef(treeJson);
 	treeJsonRef.current = treeJson;
+	/**
+	 * Mirror of the incoming revision prop, read where `builtTreeRef` is (re)seeded
+	 * from `treeJsonRef` — `buildSurface` runs from callbacks, not renders, so it
+	 * cannot read the prop directly.
+	 */
+	const incomingRevisionRef = useRef(layoutRevision);
+	incomingRevisionRef.current = layoutRevision;
 	/** Latest membership, read by the ready path and the unmount cleanup. */
 	const panelsRef = useRef(panels);
 	panelsRef.current = panels;
@@ -342,6 +364,12 @@ export function DockviewWorkspace({
 		(serialized: string, revision: number) => {
 			layoutRevisionRef.current = revision;
 			builtTreeRef.current = serialized;
+			builtRevisionRef.current = revision;
+			// The save acknowledged the observed arrangement — unless a NEWER edit
+			// arrived while the request was in flight (observed moved past the saved
+			// snapshot), in which case the surface is still dirty and its own pending
+			// persist will settle it.
+			if (observedArrangementRef.current === serialized) unsavedArrangementRef.current = false;
 			qc.setQueryData(workspaceQueryKey(workspaceId), (old: unknown) => {
 				if (!old || typeof old !== "object") return old;
 				return {
@@ -405,7 +433,16 @@ export function DockviewWorkspace({
 		if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 		saveTimerRef.current = setTimeout(() => {
 			const serialized = serializeCurrentLayout(api);
-			if (serialized !== builtTreeRef.current) void saveLayout(serialized);
+			if (serialized !== builtTreeRef.current) {
+				void saveLayout(serialized);
+			} else {
+				// The edits that scheduled this persist returned the surface to the
+				// saved baseline byte-for-byte (a panel dragged out and back): nothing
+				// is unsaved after all. Leaving the flag set would keep every later
+				// remote layout at "adopt-baseline" — the sticky-local-edit bug in
+				// miniature.
+				unsavedArrangementRef.current = false;
+			}
 		}, SAVE_DEBOUNCE_MS);
 	}, [saveLayout, serializeCurrentLayout]);
 
@@ -421,9 +458,22 @@ export function DockviewWorkspace({
 			// content while the director overlay hosts the live instances.
 			dockStoreRef.current?.setDirectorActive(next.mode === "director");
 			onDirectorStateChange?.(directorRef.current);
+			// Director state is serialized into the layout but, being a pure overlay,
+			// never fires onDidLayoutChange — so the dirty bookkeeping that handler
+			// maintains is mirrored here. Without it a director save in flight looks
+			// "clean", and a remote change landing mid-save would rebuild the surface
+			// away from the state being saved.
+			const api = apiRef.current;
+			if (api) {
+				const serialized = serializeCurrentLayout(api);
+				if (serialized !== observedArrangementRef.current) {
+					observedArrangementRef.current = serialized;
+					unsavedArrangementRef.current = true;
+				}
+			}
 			persist();
 		},
-		[persist, onDirectorStateChange],
+		[persist, onDirectorStateChange, serializeCurrentLayout],
 	);
 
 	const setMode = useCallback(
@@ -722,8 +772,10 @@ export function DockviewWorkspace({
 			dockStoreRef.current?.setDirectorActive(resolved.director.mode === "director");
 			// Record the baseline the surface is being built from, so the stale-refresh
 			// effect can tell "a refetch delivered this same tree" (nothing to do)
-			// from "the server holds a different layout" (maybe rebuild).
+			// from "the server holds a different layout" (maybe rebuild). The revision
+			// mirrors the prop that carried this tree in.
 			builtTreeRef.current = treeJson ?? null;
+			builtRevisionRef.current = incomingRevisionRef.current;
 
 			if (resolved.kind === "seed") {
 				// A freshly created workspace (sidebar drag). The seed carries PLACEMENT
@@ -829,7 +881,7 @@ export function DockviewWorkspace({
 					const serialized = serializeCurrentLayout(api);
 					if (serialized !== observedArrangementRef.current) {
 						observedArrangementRef.current = serialized;
-						localEditRef.current = true;
+						unsavedArrangementRef.current = true;
 						persist();
 					}
 					syncNarratorIds();
@@ -880,11 +932,11 @@ export function DockviewWorkspace({
 	 * Rebuild the surface in place from the latest props.
 	 *
 	 * Used when a refetch delivers a different layout than the surface was built
-	 * from and the user has no local edits to protect. Every live panel is closed
-	 * through `closePanelInternally` so `onDidRemovePanel` does not detach the
-	 * panel from membership, and layout events are suppressed so the rebuild's
-	 * `fromJSON` is not misread as a user edit (which would set `localEditRef`
-	 * and persist the rebuilt layout straight back).
+	 * from and the surface has no unsaved edits to protect. Every live panel is
+	 * closed through `closePanelInternally` so `onDidRemovePanel` does not detach
+	 * the panel from membership, and layout events are suppressed so the rebuild's
+	 * `fromJSON` is not misread as a user edit (which would set
+	 * `unsavedArrangementRef` and persist the rebuilt layout straight back).
 	 */
 	const rebuildSurface = useCallback(
 		(api: DockviewApi) => {
@@ -896,6 +948,9 @@ export function DockviewWorkspace({
 				durableActiveGroupRef.current = api.activeGroup?.id ?? null;
 				dockStoreRef.current?.restoreTemporaryResources(temporaryResources);
 				observedArrangementRef.current = serializeCurrentLayout(api);
+				// The surface now shows exactly the server baseline; nothing local
+				// is waiting to be persisted.
+				unsavedArrangementRef.current = false;
 			} finally {
 				suppressLayoutEventsRef.current = false;
 			}
@@ -906,33 +961,38 @@ export function DockviewWorkspace({
 	);
 
 	/**
-	 * Stale-cache guard: adopt a server-side layout delivered by a refetch.
+	 * Adopt a server-side layout delivered by a refetch.
 	 *
-	 * `buildSurface` runs once at mount against whatever the query cache held —
-	 * which, for a workspace revisited within `gcTime`, is the tree from the
-	 * PREVIOUS visit unless a save updated the cache in between. When the fresh
-	 * fetch lands with a different tree this effect decides what to do (see
-	 * `decideSurfaceRefresh`): without it the stale arrangement stayed on screen,
-	 * and the next layout change persisted it back over the newer one — the
-	 * round-trip that made split layouts "never survive reopening".
+	 * Two triggers land here: the original stale-cache mount (`buildSurface` ran
+	 * against whatever the query cache held, then the fresh fetch arrives with a
+	 * different tree), and the cross-device sync — a `workspace_changed` event
+	 * invalidates the workspace query and the refetch carries the other device's
+	 * arrangement. `decideSurfaceRefresh` keeps the two honest: echoes of our own
+	 * saves and stale reads are ignored by tree/revision comparison, a surface
+	 * with unsaved edits keeps them (its pending persist wins), and only a clean
+	 * surface rebuilds from the newer server layout.
 	 */
 	useEffect(() => {
 		const api = apiRef.current;
 		if (!api) return;
 		const decision = decideSurfaceRefresh({
-			localEdit: localEditRef.current,
+			unsaved: unsavedArrangementRef.current,
 			builtTree: builtTreeRef.current,
+			builtRevision: builtRevisionRef.current,
 			incomingTree: treeJson,
+			incomingRevision: layoutRevision,
 		});
 		if (decision === "ignore") return;
 		if (decision === "adopt-baseline") {
-			// Local edits win on this mount; advance the baseline so a later
-			// identical refetch is recognised as "ignore".
+			// Unsaved local edits win; advance the baseline so a later identical
+			// refetch is recognised as "ignore". The pending persist carries the
+			// newer revision, so the save that follows does not 409.
 			builtTreeRef.current = treeJson ?? null;
+			builtRevisionRef.current = layoutRevision;
 			return;
 		}
 		rebuildSurface(api);
-	}, [treeJson, rebuildSurface]);
+	}, [treeJson, layoutRevision, rebuildSurface]);
 
 	/**
 	 * Reflect server-side membership changes onto a surface that is already mounted.
@@ -941,6 +1001,14 @@ export function DockviewWorkspace({
 	 * from the sidebar arrives as a membership change, and a panel removed in another
 	 * session must not linger here. The surface converges on the member list without
 	 * anyone having to guess from the layout.
+	 *
+	 * The changes are applied with layout events SUPPRESSED: they are reflections of
+	 * server state, not user edits, so they must not dirty the surface nor persist.
+	 * Without the suppression, every device that merely RECEIVED a membership change
+	 * would persist its own default placement back, racing the acting device's
+	 * deliberate arrangement — and the passive device's save lands later, so it would
+	 * systematically win. The acting device saves the placement; everyone else
+	 * rebuilds from that layout when it arrives.
 	 */
 	useEffect(() => {
 		const api = apiRef.current;
@@ -965,19 +1033,30 @@ export function DockviewWorkspace({
 			if (identity) liveByIdentity.set(identity, panel);
 		}
 
-		const memberIdentities = new Set<string>();
-		for (const member of panels) {
-			const identity = memberIdentity(member);
-			memberIdentities.add(identity);
-			if (!liveByIdentity.has(identity)) addMemberPanel(api, member);
+		suppressLayoutEventsRef.current = true;
+		try {
+			const memberIdentities = new Set<string>();
+			for (const member of panels) {
+				const identity = memberIdentity(member);
+				memberIdentities.add(identity);
+				if (!liveByIdentity.has(identity)) addMemberPanel(api, member);
+			}
+			for (const [identity, panel] of liveByIdentity) {
+				// Internal close: this panel's row is already gone, so detaching again would
+				// DELETE a row that does not exist (and, during a prune, could delete a row we
+				// are in the middle of rendering).
+				if (!memberIdentities.has(identity)) closePanelInternally(panel);
+			}
+		} finally {
+			suppressLayoutEventsRef.current = false;
 		}
-		for (const [identity, panel] of liveByIdentity) {
-			// Internal close: this panel's row is already gone, so detaching again would
-			// DELETE a row that does not exist (and, during a prune, could delete a row we
-			// are in the middle of rendering).
-			if (!memberIdentities.has(identity)) closePanelInternally(panel);
-		}
-	}, [panels, addMemberPanel, closePanelInternally]);
+		// The suppressed mutations still moved the surface: keep the observed
+		// arrangement honest (so a later save's dirty check compares against what is
+		// actually on screen) and reconcile the joined-narrator set that the
+		// suppressed handler would have maintained.
+		observedArrangementRef.current = serializeCurrentLayout(api);
+		syncNarratorIds();
+	}, [panels, addMemberPanel, closePanelInternally, serializeCurrentLayout, syncNarratorIds]);
 
 	// ── External drop from sidebar (native HTML5 payload) ──
 	const handleDidDrop = useCallback(

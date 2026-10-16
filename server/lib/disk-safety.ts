@@ -82,6 +82,14 @@ const nativeProbe: DiskProbe = {
 	now: Date.now,
 };
 
+function describeError(error: unknown): string {
+	if (error instanceof Error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code && !error.message.includes(code) ? `${code} ${error.message}` : error.message;
+	}
+	return String(error);
+}
+
 function boundedSet<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
 	map.delete(key);
 	map.set(key, value);
@@ -109,26 +117,50 @@ export function diskLevel(space: DiskSpace | null, config: DiskSafetySettings): 
  * pile up unboundedly. Failure results are cached as unknown for the same throttle interval.
  */
 export class DiskSpaceMonitor {
-	private paths = new Map<string, { at: number; volume: DiskVolume | null }>();
-	private volumes = new Map<string, { at: number; space: DiskSpace | null; spent: number }>();
+	private paths = new Map<string, { at: number; volume: DiskVolume | null; error?: string }>();
+	private volumes = new Map<
+		string,
+		{ at: number; space: DiskSpace | null; spent: number; error?: string }
+	>();
 	private pendingPaths = new Map<string, Promise<DiskVolume | null>>();
 	private pendingVolumes = new Map<string, Promise<DiskSpace | null>>();
+	/** Why the latest lookup of a path produced no space. Diagnostics only, bounded. */
+	private failures = new Map<string, string>();
 
 	constructor(private readonly probe: DiskProbe = nativeProbe) {}
 
 	async assess(path: string, config: DiskSafetySettings): Promise<DiskAssessment> {
 		if (config.mode === "off") return { path, level: "ok", space: null };
-		const space = await this.withDeadline(this.lookup(path, config), config.probeTimeoutMs);
+		const space = await this.withDeadline(this.lookup(path, config), config.probeTimeoutMs, () =>
+			this.noteFailure(path, `probe timed out after ${config.probeTimeoutMs}ms`),
+		);
+		if (space) this.failures.delete(path);
 		return { path, level: diskLevel(space, config), space };
 	}
 
-	private async withDeadline<T>(work: Promise<T | null>, timeoutMs: number): Promise<T | null> {
+	/** The recorded reason the most recent probe of `path` returned unknown, if any. */
+	failureReason(path: string): string | undefined {
+		return this.failures.get(path);
+	}
+
+	private noteFailure(path: string, reason: string): void {
+		boundedSet(this.failures, path, reason, MAX_PATHS);
+	}
+
+	private async withDeadline<T>(
+		work: Promise<T | null>,
+		timeoutMs: number,
+		onTimeout: () => void,
+	): Promise<T | null> {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			return await Promise.race([
 				work,
 				new Promise<null>((done) => {
-					timer = setTimeout(() => done(null), timeoutMs);
+					timer = setTimeout(() => {
+						onTimeout();
+						done(null);
+					}, timeoutMs);
 				}),
 			]);
 		} finally {
@@ -141,12 +173,21 @@ export class DiskSpaceMonitor {
 		if (!cached || this.probe.now() - cached.at >= config.pathCacheTtlMs) {
 			let pending = this.pendingPaths.get(path);
 			if (!pending) {
-				if (this.pendingPaths.size + this.pendingVolumes.size >= MAX_PENDING) return null;
+				if (this.pendingPaths.size + this.pendingVolumes.size >= MAX_PENDING) {
+					this.noteFailure(path, "too many disk probes in flight");
+					return null;
+				}
 				pending = this.probe
 					.resolveVolume(path)
-					.catch(() => null)
-					.then((volume) => {
-						boundedSet(this.paths, path, { at: this.probe.now(), volume }, MAX_PATHS);
+					.then(
+						(volume) => ({ volume, error: undefined }),
+						(error: unknown) => ({
+							volume: null,
+							error: `resolve volume: ${describeError(error)}`,
+						}),
+					)
+					.then(({ volume, error }) => {
+						boundedSet(this.paths, path, { at: this.probe.now(), volume, error }, MAX_PATHS);
 						return volume;
 					})
 					.finally(() => this.pendingPaths.delete(path));
@@ -155,32 +196,46 @@ export class DiskSpaceMonitor {
 			await pending;
 			cached = this.paths.get(path);
 		}
-		if (!cached?.volume) return null;
+		if (!cached?.volume) {
+			this.noteFailure(path, cached?.error ?? "volume unresolved");
+			return null;
+		}
 		const volume = cached.volume;
 		const cachedSpace = this.volumes.get(volume.key);
-		if (cachedSpace && this.probe.now() - cachedSpace.at < config.checkIntervalMs)
-			return cachedSpace.space
-				? {
-						...cachedSpace.space,
-						freeBytes: Math.max(0, cachedSpace.space.freeBytes - cachedSpace.spent),
-					}
-				: null;
+		if (cachedSpace && this.probe.now() - cachedSpace.at < config.checkIntervalMs) {
+			if (!cachedSpace.space) {
+				this.noteFailure(path, cachedSpace.error ?? "statfs unavailable");
+				return null;
+			}
+			return {
+				...cachedSpace.space,
+				freeBytes: Math.max(0, cachedSpace.space.freeBytes - cachedSpace.spent),
+			};
+		}
 		let pending = this.pendingVolumes.get(volume.key);
 		if (!pending) {
-			if (this.pendingPaths.size + this.pendingVolumes.size >= MAX_PENDING) return null;
+			if (this.pendingPaths.size + this.pendingVolumes.size >= MAX_PENDING) {
+				this.noteFailure(path, "too many disk probes in flight");
+				return null;
+			}
 			pending = this.probe
 				.statVolume(volume)
 				.then((size) => {
 					if (!Number.isFinite(size.freeBytes) || size.freeBytes < 0 || size.totalBytes <= 0)
-						throw new Error("Invalid statfs result");
-					return { ...volume, ...size, checkedAt: this.probe.now() };
+						throw new Error(
+							`invalid statfs result (free=${size.freeBytes}, total=${size.totalBytes})`,
+						);
+					return { space: { ...volume, ...size, checkedAt: this.probe.now() }, error: undefined };
 				})
-				.catch(() => null)
-				.then((space) => {
+				.catch((error: unknown) => ({
+					space: null,
+					error: `statfs ${volume.mountPath}: ${describeError(error)}`,
+				}))
+				.then(({ space, error }) => {
 					boundedSet(
 						this.volumes,
 						volume.key,
-						{ at: this.probe.now(), space, spent: 0 },
+						{ at: this.probe.now(), space, spent: 0, error },
 						MAX_VOLUMES,
 					);
 					return space;
@@ -188,7 +243,9 @@ export class DiskSpaceMonitor {
 				.finally(() => this.pendingVolumes.delete(volume.key));
 			this.pendingVolumes.set(volume.key, pending);
 		}
-		return pending;
+		const space = await pending;
+		if (!space) this.noteFailure(path, this.volumes.get(volume.key)?.error ?? "statfs unavailable");
+		return space;
 	}
 
 	/** An actual ENOSPC outranks an earlier healthy probe. Recheck after the normal TTL. */

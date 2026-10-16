@@ -279,4 +279,8 @@ export async function applySqliteDataBackfills(
 	} catch (err) {
 		logger.warn("Knowledge base seed failed (non-fatal)", { error: String(err) });
 	}
+
+	// Historical token semantics cannot be inferred from counter sizes or provider names.
+	// Keep accounting rows unchanged at startup; administrators review bounded evidence
+	// and explicitly confirm corrections on the dedicated usage repair page.
 }

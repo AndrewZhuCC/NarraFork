@@ -132,6 +132,15 @@ async function settle() {
 	});
 }
 
+async function waitForDom(predicate: () => boolean, description: string) {
+	const deadline = performance.now() + 2000;
+	do {
+		await settle();
+		if (predicate()) return;
+	} while (performance.now() < deadline);
+	throw new Error(`Timed out waiting for ${description}`);
+}
+
 function sampleItem(overrides: Partial<NotificationListPage["items"][number]> = {}) {
 	return {
 		id: "n-chat",
@@ -317,6 +326,13 @@ describe("new center integration", () => {
 			document.querySelector('[data-testid="notification-bell"]')?.getAttribute("aria-label"),
 		).toContain("pending items");
 		await clickElement('[data-testid="notification-bell"]');
+		// The Drawer can render before its nested lazy inbox has committed.
+		await waitForDom(
+			() =>
+				!!document.querySelector('[data-attention-id="permission"]') &&
+				!!document.querySelector('[data-attention-id="question"]'),
+			"the permission and question attention rows",
+		);
 		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
 		expect(
 			[...document.querySelectorAll("[data-attention-id]")].map((row) =>

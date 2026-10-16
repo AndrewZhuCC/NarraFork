@@ -10,7 +10,8 @@
  * omitted are all still proxied on Bun 1.3.14). The ambient variables are
  * therefore snapshotted and blanked at startup by `proxy-env.ts`, which leaves
  * the explicit `proxy` value that `outbound-fetch.ts` passes as the only thing
- * deciding whether a request is proxied. "system" mode reads the snapshot.
+ * deciding whether a request is proxied. Bun 1.4.3 adds `proxy: false` for direct
+ * requests; startup blanking remains as defence in depth. "system" mode reads the snapshot.
  */
 
 import { settings } from "../settings";

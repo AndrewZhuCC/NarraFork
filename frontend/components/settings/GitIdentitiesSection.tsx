@@ -6,12 +6,14 @@ import {
 	Loader,
 	Modal,
 	Paper,
+	Popover,
 	Stack,
+	Switch,
 	Text,
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
-import { IconPencil, IconPlus, IconStar, IconTrash } from "@tabler/icons-react";
+import { IconPencil, IconPlus, IconSettings, IconStar, IconTrash } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -20,6 +22,7 @@ import {
 	useGitIdentities,
 	useUpdateGitIdentity,
 } from "../../hooks/useGitIdentities";
+import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 /**
@@ -34,6 +37,7 @@ export function GitIdentitiesSection() {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const { data: identities, isLoading } = useGitIdentities();
+	const visibility = useGitIdentityVisibility();
 	const createIdentity = useCreateGitIdentity();
 	const updateIdentity = useUpdateGitIdentity();
 	const deleteIdentity = useDeleteGitIdentity();
@@ -77,9 +81,40 @@ export function GitIdentitiesSection() {
 		<Stack gap="xs">
 			<Group justify="space-between">
 				<Text fw={500}>{t("gitIdentitiesTitle")}</Text>
-				<Button size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={openCreate}>
-					{t("gitIdentityAdd")}
-				</Button>
+				<Group gap="xs">
+					<Button
+						size="xs"
+						variant="light"
+						leftSection={<IconPlus size={14} />}
+						onClick={openCreate}
+					>
+						{t("gitIdentityAdd")}
+					</Button>
+					{/* 默认只在外部点击或 Esc 时关闭：点开关本身不关闭，方便连续改两个。 */}
+					<Popover width="max-content" position="bottom-end" shadow="md">
+						<Popover.Target>
+							<Button size="xs" variant="default" leftSection={<IconSettings size={14} />}>
+								{t("gitIdentitiesDisplaySettings")}
+							</Button>
+						</Popover.Target>
+						<Popover.Dropdown>
+							<Stack gap="xs">
+								<Switch
+									size="sm"
+									label={t("gitIdentitiesDisplayContextMenu")}
+									checked={visibility.contextMenu}
+									onChange={(e) => visibility.setContextMenu(e.currentTarget.checked)}
+								/>
+								<Switch
+									size="sm"
+									label={t("gitIdentitiesDisplayCreateModal")}
+									checked={visibility.createModal}
+									onChange={(e) => visibility.setCreateModal(e.currentTarget.checked)}
+								/>
+							</Stack>
+						</Popover.Dropdown>
+					</Popover>
+				</Group>
 			</Group>
 			<Text size="xs" c="dimmed">
 				{t("gitIdentitiesDescription")}

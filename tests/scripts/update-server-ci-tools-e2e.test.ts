@@ -1,23 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Hono } from "hono";
-import {
-	BRIDGE_PREPARE_STEP,
-	BRIDGE_UPLOAD_STEP,
-	bridgeArtifactName,
-} from "../../scripts/lib/ci-update-server-bridge-restore";
 import { EXECUTOR_LICENSE_FILES, HELPER_LICENSE_FILES } from "../../scripts/lib/helper-release";
 import {
+	type HelperPublicationOptions,
 	type HelperReleasePlan,
-	mirrorHelperReleasePlan,
-	prepareHelperReleaseBridge,
 	publishHelperReleasePlan,
 } from "../../scripts/lib/helper-release-control";
-import { HELPER_MIRROR_STATE_FILENAME } from "../../scripts/lib/update-server-tools-mirror";
 import {
 	getHelperAssetName,
 	HELPER_MANIFEST_FILENAME,
@@ -30,9 +21,6 @@ import {
 	EXECUTOR_PLATFORMS,
 	executorPublishedFilename,
 } from "../../shared/remote-executor";
-import { initConfig } from "../../update-server/lib/config";
-import { createToolRoutes } from "../../update-server/routes/tools";
-import type { StorageBackend } from "../../update-server/storage/types";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -59,14 +47,14 @@ async function fixture(kind: "helpers" | "executor") {
 		sourceRunId: "11",
 		publish: true,
 	};
-	const token = "fixture-legacy-never-real";
+	const token = "fixture-never-real";
 	const environment = {
 		GITHUB_REPOSITORY: plan.repository,
 		GITHUB_EVENT_NAME: "workflow_dispatch",
 		GITHUB_REF: "refs/heads/trunk",
 		GITHUB_SHA: commit,
 		GITHUB_RUN_ID: "22",
-		GITHUB_RUN_ATTEMPT: "1",
+		GITHUB_RUN_ATTEMPT: "3",
 		GH_TOKEN: "fixture-gh-never-real",
 		GITHUB_OUTPUT: join(root, "output.txt"),
 		GITHUB_STEP_SUMMARY: join(root, "summary.txt"),
@@ -121,82 +109,8 @@ async function fixture(kind: "helpers" | "executor") {
 	const manifestName = kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
 	files.set(manifestName, Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`));
 	for (const [name, bytes] of files) await writeFile(join(bundleDir, name), bytes);
-	const configPath = join(root, "fixture-config.json");
-	await writeFile(
-		configPath,
-		JSON.stringify({
-			tokens: [
-				{
-					id: "fixture",
-					name: "fixture",
-					tokenHash: sha(token),
-					role: "upload",
-					createdAt: "1970-01-01T00:00:00Z",
-				},
-			],
-		}),
-	);
-	await initConfig(configPath);
-	const remote = new Map<string, Buffer>();
-	const serverWrites: string[] = [];
 	let publicRelease = false;
-	let artifactDownloads = 0;
-	const storage: StorageBackend = {
-		async saveFile(path, data) {
-			if (!publicRelease) throw new Error("Legacy write before GitHub public readback");
-			const bytes = Buffer.isBuffer(data)
-				? data
-				: Buffer.from(await new Response(data).arrayBuffer());
-			remote.set(path.replace("tools/", ""), Buffer.from(bytes));
-			serverWrites.push(path.replace("tools/", ""));
-		},
-		async getFile(path) {
-			return remote.get(path.replace("tools/", "")) ?? null;
-		},
-		async getFileStream(path) {
-			const bytes = remote.get(path.replace("tools/", ""));
-			return bytes ? new Blob([Uint8Array.from(bytes)]).stream() : null;
-		},
-		async getFileSize(path) {
-			return remote.get(path.replace("tools/", ""))?.length ?? null;
-		},
-		async deleteFile(path) {
-			remote.delete(path.replace("tools/", ""));
-		},
-		async deleteDirectory() {},
-		async listFiles() {
-			return [...remote.keys()].map((name) => `tools/${name}`);
-		},
-		async fileExists(path) {
-			return remote.has(path.replace("tools/", ""));
-		},
-		async getFileSliceStream() {
-			return null;
-		},
-	};
-	const app = new Hono().route("/api/v2/tools", createToolRoutes(storage));
-	let failName: string | undefined;
-	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-		const request = new Request(input, init);
-		if (request.method === "PUT" && new URL(request.url).pathname.endsWith(`/${failName}`))
-			return new Response("fixture partial", { status: 503 });
-		return app.fetch(request);
-	}) as typeof fetch;
-	let zipBytes = Buffer.alloc(0);
-	const artifact = {
-		id: 44,
-		name: bridgeArtifactName(kind, 22, 1),
-		expired: false,
-		size_in_bytes: 1,
-		digest: `sha256:${"b".repeat(64)}`,
-		workflow_run: {
-			id: 22,
-			repository_id: 88,
-			head_repository_id: 88,
-			head_sha: commit,
-			head_branch: "trunk",
-		},
-	};
+	let serverRequests = 0;
 	const release = {
 		id: 99,
 		tag_name: plan.tag,
@@ -207,7 +121,6 @@ async function fixture(kind: "helpers" | "executor") {
 	const githubWrites: string[] = [];
 	const run = async (args: string[]) => {
 		if (args[0] === "release") {
-			if (!zipBytes.length) throw new Error("GitHub write before immutable bridge upload");
 			githubWrites.push(args[1] ?? "");
 			if (args[1] === "upload") {
 				const path = args[3];
@@ -253,7 +166,7 @@ async function fixture(kind: "helpers" | "executor") {
 			return JSON.stringify({ status: "identical", merge_base_commit: { sha: commit } });
 		if (path === `repos/${plan.repository}/releases/${release.id}`) {
 			// The publisher binds the uploaded asset set to this known draft ID before publication.
-			expect(publicRelease).toBe(false);
+
 			return JSON.stringify(release);
 		}
 		if (path === `repos/${plan.repository}/releases/tags/${plan.tag}`)
@@ -264,171 +177,224 @@ async function fixture(kind: "helpers" | "executor") {
 			if (!asset) throw new Error("Missing asset");
 			return files.get(asset.name)?.toString("utf8") ?? "";
 		}
-		if (path.endsWith("/actions/runs/22"))
-			return JSON.stringify({
-				id: 22,
-				run_attempt: 1,
-				workflow_id: 77,
-				path: ".github/workflows/helpers-release.yml",
-				event: "workflow_dispatch",
-				head_branch: "trunk",
-				head_sha: commit,
-				status: "completed",
-				conclusion: "failure",
-				repository: { id: 88, full_name: plan.repository },
-				head_repository: { id: 88, full_name: plan.repository },
-			});
-		if (path.endsWith("/actions/workflows/77"))
-			return JSON.stringify({
-				id: 77,
-				path: ".github/workflows/helpers-release.yml",
-				state: "active",
-			});
-		if (path.includes("/jobs?"))
-			return JSON.stringify({
-				total_count: 1,
-				jobs: [
-					{
-						id: 55,
-						run_id: 22,
-						run_attempt: 1,
-						head_sha: commit,
-						name: "Publish approved helper draft",
-						steps: [BRIDGE_PREPARE_STEP, BRIDGE_UPLOAD_STEP].map((name) => ({
-							name,
-							status: "completed",
-							conclusion: "success",
-						})),
-					},
-				],
-			});
-		if (path.includes("/artifacts?"))
-			return JSON.stringify({ total_count: 1, artifacts: [artifact] });
-		if (path.endsWith("/actions/artifacts/44")) return JSON.stringify(artifact);
 		throw new Error(`Unexpected GitHub API ${path}`);
 	};
-	const artifactFetch = (async () => {
-		artifactDownloads++;
-		return new Response(zipBytes);
-	}) as unknown as typeof fetch;
-	const options = { environment, run, fetchImpl, artifactFetch, sourceRunAttempt: "1" };
-	const prepareDir = join(root, "prepared");
-	async function sealUpload() {
-		const zip = join(root, "bridge.zip");
-		execFileSync(
-			"python3",
-			[
-				"-c",
-				"import os,sys,zipfile\nroot,out=sys.argv[1:]\nwith zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:\n for base,dirs,files in os.walk(root):\n  for name in files:\n   p=os.path.join(base,name);z.write(p,os.path.relpath(p,root))",
-				prepareDir,
-				zip,
-			],
-			{ timeout: 10000, maxBuffer: 65536 },
-		);
-		zipBytes = await readFile(zip);
-		artifact.size_in_bytes = zipBytes.length;
-		artifact.digest = `sha256:${sha(zipBytes)}`;
-		return { artifactId: "44", artifactDigest: sha(zipBytes) };
-	}
+	const options = {
+		environment,
+		run,
+		sourceRunAttempt: "1",
+		receiptPath: join(root, "receipt.json"),
+		fetchImpl: (async () => {
+			serverRequests++;
+			throw new Error("Forbidden server request");
+		}) as unknown as typeof fetch,
+	};
 	return {
 		root,
 		plan,
 		bundleDir,
-		prepareDir,
 		files,
-		remote,
-		serverWrites,
-		githubWrites,
 		release,
+		githubWrites,
 		options,
-		sealUpload,
-		downloadCount: () => artifactDownloads,
-		fail: (name: string | undefined) => {
-			failName = name;
-		},
+		serverRequests: () => serverRequests,
+		publicRelease: () => publicRelease,
 	};
 }
 for (const kind of ["helpers", "executor"] as const)
-	describe(`${kind} real CI bridge fixture`, () => {
-		test("prepare -> immutable ZIP upload -> GitHub publish -> old API mirror -> mirror-only replay", async () => {
+	describe(`${kind} GitHub-only real publisher`, () => {
+		for (const config of ["empty", "partial", "invalid", "configured"] as const)
+			test(`publishes exact bundle with ${config} mirror configuration and zero server IO`, async () => {
+				const f = await fixture(kind);
+				if (config === "empty") {
+					delete (f.options.environment as NodeJS.ProcessEnv).NF_UPDATE_SERVER;
+					delete (f.options.environment as NodeJS.ProcessEnv).NF_UPDATE_TOKEN;
+				}
+				if (config === "partial")
+					delete (f.options.environment as NodeJS.ProcessEnv).NF_UPDATE_TOKEN;
+				if (config === "invalid") f.options.environment.NF_UPDATE_SERVER = "not a valid URL";
+				await publishHelperReleasePlan(f.plan, f.bundleDir, false, f.options);
+				expect(f.publicRelease()).toBe(true);
+				expect(f.release.draft).toBe(false);
+				expect(f.serverRequests()).toBe(0);
+				const receipt = JSON.parse(await readFile(f.options.receiptPath, "utf8"));
+				expect(receipt.releaseId).toBe(99);
+				expect(receipt.repository).toBe("Fixture/Fork");
+				expect(receipt.assets).toHaveLength(f.files.size);
+				for (const asset of receipt.assets)
+					expect(asset.digest).toBe(`sha256:${sha(f.files.get(asset.name) as Buffer)}`);
+				expect(receipt.source).toEqual({
+					runId: 22,
+					runAttempt: 3,
+					workflowPath: ".github/workflows/helpers-release.yml",
+					nativeProof: "verified-original-bundle",
+				});
+				expect(receipt.buildSource).toEqual({
+					runId: 11,
+					runAttempt: 1,
+					workflowPath: ".github/workflows/helpers-release.yml",
+					nativeProof: "verified-original-bundle",
+				});
+			});
+		for (const field of [
+			"publisher-run",
+			"publisher-attempt",
+			"build-run",
+			"build-attempt",
+			"artifact",
+		] as const)
+			test(`${field === "artifact" ? "invalid" : "missing/invalid"} ${field} provenance fails before any GitHub write`, async () => {
+				const f = await fixture(kind);
+				for (const value of [
+					undefined,
+					"",
+					"0",
+					"-1",
+					"01",
+					"1.5",
+					"1e2",
+					" 1",
+					"not-an-id",
+					"9007199254740992",
+				]) {
+					// Empty sourceRunId explicitly denotes this dispatch, and artifact ID is optional.
+					if (field === "build-run" && value === "") continue;
+					if (field === "artifact" && (value === undefined || value === "")) continue;
+					const plan = { ...f.plan };
+					const environment: NodeJS.ProcessEnv = { ...f.options.environment };
+					const options: HelperPublicationOptions = {
+						...f.options,
+						environment,
+						bundleArtifactId: "456",
+					};
+					if (field === "publisher-run") environment.GITHUB_RUN_ID = value;
+					if (field === "publisher-attempt") environment.GITHUB_RUN_ATTEMPT = value;
+					if (field === "build-run") plan.sourceRunId = value as string;
+					if (field === "build-attempt") options.sourceRunAttempt = value;
+					if (field === "artifact") options.bundleArtifactId = value;
+					await expect(
+						publishHelperReleasePlan(plan, f.bundleDir, false, options),
+					).rejects.toThrow();
+					expect(f.githubWrites).toEqual([]);
+					expect(f.publicRelease()).toBe(false);
+				}
+				expect(f.serverRequests()).toBe(0);
+				await expect(readFile(f.options.receiptPath)).rejects.toThrow();
+				await expect(readFile(f.options.environment.GITHUB_OUTPUT)).rejects.toThrow();
+			});
+		test("publication freezes original run, attempt and artifact before writes", async () => {
 			const f = await fixture(kind);
-			await prepareHelperReleaseBridge(f.plan, f.bundleDir, {
-				...f.options,
-				bridgeDir: f.prepareDir,
+			const environment = { ...f.options.environment };
+			const options = { ...f.options, environment, bundleArtifactId: "456" };
+			let mutated = false;
+			const run = async (args: string[]) => {
+				if (args[0] === "release" && !mutated) {
+					mutated = true;
+					environment.GITHUB_RUN_ID = "33";
+					environment.GITHUB_RUN_ATTEMPT = "4";
+					f.plan.sourceRunId = "44";
+					options.sourceRunAttempt = "5";
+					options.bundleArtifactId = "789";
+				}
+				return f.options.run(args);
+			};
+			// Keep the same options object so late mutation would expose a receipt-time reparse.
+			options.run = run;
+			await publishHelperReleasePlan(f.plan, f.bundleDir, false, options);
+			expect(mutated).toBe(true);
+			expect(f.publicRelease()).toBe(true);
+			const receipt = JSON.parse(await readFile(f.options.receiptPath, "utf8"));
+			expect(receipt.source).toEqual({
+				runId: 22,
+				runAttempt: 3,
+				workflowPath: ".github/workflows/helpers-release.yml",
+				nativeProof: "verified-original-bundle",
 			});
-			expect(f.githubWrites).toEqual([]);
-			expect(f.serverWrites).toEqual([]);
-			const uploaded = await f.sealUpload();
-			await publishHelperReleasePlan(f.plan, f.bundleDir, false, {
-				...f.options,
-				...uploaded,
-				bridgeDir: join(f.root, "publish-bridge"),
+			expect(receipt.buildSource).toEqual({
+				runId: 11,
+				runAttempt: 1,
+				workflowPath: ".github/workflows/helpers-release.yml",
+				bundleArtifactId: 456,
+				nativeProof: "verified-original-bundle",
 			});
-			expect(f.release.draft).toBe(false);
-			expect(f.serverWrites.length).toBeGreaterThan(0);
-			expect(f.downloadCount()).toBe(1);
-			const writes = [...f.githubWrites];
-			await mirrorHelperReleasePlan(
-				{ ...f.plan, mirrorOnly: true, bridgeRunId: "22" },
-				f.bundleDir,
-				{
-					...f.options,
-					environment: { ...f.options.environment, GITHUB_RUN_ID: "33" },
-					bridgeDir: join(f.root, "retry-bridge"),
-				},
-			);
-			expect(f.githubWrites).toEqual(writes);
-			expect(f.downloadCount()).toBe(2);
-			for (const [name, bytes] of f.files) {
-				if (name === HELPER_MANIFEST_FILENAME || name === EXECUTOR_MANIFEST_FILENAME) continue;
-				expect(f.remote.get(name)).toEqual(bytes);
-			}
-			if (kind === "executor") {
-				const projected = JSON.parse(
-					f.remote.get(EXECUTOR_MANIFEST_FILENAME)?.toString("utf8") ?? "{}",
-				);
-				expect(projected.version).toBe(f.plan.version);
-				expect(projected.manifest).toBeUndefined();
-				expect(f.serverWrites.at(-1)).toBe(EXECUTOR_MANIFEST_FILENAME);
-			} else expect(f.serverWrites.at(-1)).toBe(HELPER_MIRROR_STATE_FILENAME);
-			expect(await readFile(join(f.root, "summary.txt"), "utf8")).not.toContain(
-				"fixture-legacy-never-real",
-			);
 		});
-		test("real partial response fails publication status, retains receipt, and recovers original ZIP only", async () => {
+		test("normal dispatch uses current run ID but retains the verified original attempt", async () => {
 			const f = await fixture(kind);
-			await prepareHelperReleaseBridge(f.plan, f.bundleDir, {
-				...f.options,
-				bridgeDir: f.prepareDir,
+			await publishHelperReleasePlan({ ...f.plan, sourceRunId: "" }, f.bundleDir, false, f.options);
+			const receipt = JSON.parse(await readFile(f.options.receiptPath, "utf8"));
+			expect(receipt.source.runAttempt).toBe(3);
+			expect(receipt.buildSource.runId).toBe(22);
+			expect(receipt.buildSource.runAttempt).toBe(1);
+			expect(receipt.buildSource.bundleArtifactId).toBeUndefined();
+		});
+		for (const withProvenance of [false, true])
+			test(`offline preview needs no CI identities or network; provenance flags=${withProvenance}`, async () => {
+				const f = await fixture(kind);
+				let requests = 0;
+				await publishHelperReleasePlan(f.plan, f.bundleDir, true, {
+					environment: {},
+					...(withProvenance ? { sourceRunAttempt: "1", bundleArtifactId: "456" } : {}),
+					run: async () => {
+						requests++;
+						throw new Error("Forbidden offline GitHub request");
+					},
+				});
+				expect(requests).toBe(0);
+				expect(f.githubWrites).toEqual([]);
+				expect(f.serverRequests()).toBe(0);
+				await expect(readFile(f.options.receiptPath)).rejects.toThrow();
 			});
-			const uploaded = await f.sealUpload();
-			f.fail(kind === "helpers" ? HELPER_MIRROR_STATE_FILENAME : EXECUTOR_MANIFEST_FILENAME);
+		test("corrupt source bundle cannot make the draft public", async () => {
+			const f = await fixture(kind);
+			const binary = [...f.files.keys()][0] as string;
+			await writeFile(join(f.bundleDir, binary), "corrupt");
+			await expect(
+				publishHelperReleasePlan(f.plan, f.bundleDir, false, f.options),
+			).rejects.toThrow();
+			expect(f.publicRelease()).toBe(false);
+			expect(f.githubWrites).toEqual([]);
+		});
+		for (const revoked of ["tag", "environment", "ancestor"] as const)
+			test(`revoked ${revoked} after upload blocks public promotion`, async () => {
+				const f = await fixture(kind);
+				const original = f.options.run;
+				let uploaded = false;
+				const run = async (args: string[]) => {
+					const path = args[1] ?? "";
+					if (uploaded && revoked === "tag" && path.includes("/git/ref/"))
+						return JSON.stringify({ object: { type: "commit", sha: "b".repeat(40) } });
+					if (uploaded && revoked === "environment" && path.endsWith("/environments/release"))
+						return JSON.stringify({
+							name: "release",
+							protection_rules: [],
+							deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+						});
+					if (uploaded && revoked === "ancestor" && path.includes("/compare/"))
+						return JSON.stringify({
+							status: "diverged",
+							merge_base_commit: { sha: "b".repeat(40) },
+						});
+					const value = await original(args);
+					if (args[0] === "release" && args[1] === "upload") uploaded = true;
+					return value;
+				};
+				await expect(
+					publishHelperReleasePlan(f.plan, f.bundleDir, false, { ...f.options, run }),
+				).rejects.toThrow();
+				expect(uploaded).toBe(true);
+				expect(f.publicRelease()).toBe(false);
+				expect(f.githubWrites).not.toContain("edit");
+				await expect(readFile(f.options.receiptPath)).rejects.toThrow();
+			});
+		test("parent cancellation never writes GitHub or contacts a server", async () => {
+			const f = await fixture(kind);
 			await expect(
 				publishHelperReleasePlan(f.plan, f.bundleDir, false, {
 					...f.options,
-					...uploaded,
-					bridgeDir: join(f.root, "publish-bridge"),
+					signal: AbortSignal.abort(new Error("cancelled")),
 				}),
-			).rejects.toThrow("PUBLISHED_NOT_MIRRORED");
-			const receipt = JSON.parse(
-				await readFile(join(f.root, "publish-bridge", "tools-mirror-receipt.json"), "utf8"),
-			);
-			expect(receipt.status).toBe("PUBLISHED_NOT_MIRRORED");
-			expect(receipt.verified.length).toBeGreaterThan(0);
-			expect(await readFile(join(f.root, "summary.txt"), "utf8")).toContain(
-				"source_run_id=11 bridge_run_id=22",
-			);
-			const writes = [...f.githubWrites];
-			f.fail(undefined);
-			await mirrorHelperReleasePlan(
-				{ ...f.plan, mirrorOnly: true, bridgeRunId: "22" },
-				f.bundleDir,
-				{
-					...f.options,
-					environment: { ...f.options.environment, GITHUB_RUN_ID: "33" },
-					bridgeDir: join(f.root, "recovered-bridge"),
-				},
-			);
-			expect(f.githubWrites).toEqual(writes);
+			).rejects.toThrow("cancelled");
+			expect(f.githubWrites).toEqual([]);
+			expect(f.serverRequests()).toBe(0);
 		});
 	});

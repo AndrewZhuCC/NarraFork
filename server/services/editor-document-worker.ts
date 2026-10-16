@@ -11,11 +11,13 @@ import {
 	EDITOR_TRANSFER_CHUNK_BYTES,
 	EDITOR_TRANSFER_MAX_BYTES,
 } from "../../shared/editor-document";
+// The settings-free core: this worker is a fresh thread per job, and loading settings (with the
+// model catalog) only to encode bytes cost ~170 ms per editor operation.
 import {
 	decodeFileBytesAs,
 	detectFileEncoding,
 	encodeFileBytesAs,
-} from "../lib/agent/tools/encoding";
+} from "../lib/agent/tools/encoding-core";
 
 import {
 	type EditorOperationMetadata,

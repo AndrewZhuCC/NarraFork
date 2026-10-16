@@ -13,6 +13,19 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
+import {
+	type IntelligentUiFileReference,
+	readIntelligentUiFileReference,
+} from "../intelligent-ui-files";
+import { type IntelligentUiKitNotice, readIntelligentUiKitNotice } from "../intelligent-ui-kit";
+import {
+	INTELLIGENT_UI_PUBLIC_SUMMARY,
+	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+} from "../intelligent-ui-public";
+import {
+	INTELLIGENT_UI_INLINE_HEIGHTS,
+	readIntelligentUiInlineSize,
+} from "../intelligent-ui-tool-policy";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -491,6 +504,31 @@ export type ToolSectionLabel =
 	| "plan"
 	| "error";
 
+export interface ToolIntelligentUiDetail {
+	kind: "intelligent-ui";
+	file: IntelligentUiFileReference | null;
+	publicSummary?: boolean;
+	historyUnavailable?: boolean;
+	/**
+	 * Inline markup of a `render` call, growing while its input streams. Named `text`,
+	 * `live` and `contentPx` on purpose: those are the fields the measure cache already
+	 * folds into a row's revision, so each chunk repaints and the reserved height is keyed.
+	 */
+	text?: string;
+	live?: boolean;
+	/** Reserved body height: a pure function of the declared size, never a measurement. */
+	contentPx?: number;
+	title?: string;
+	kit?: IntelligentUiKitNotice;
+	/**
+	 * The runtime the finished call was validated against. Old UI keeps rendering with it
+	 * after the workspace later gains (or loses) a project kit; absent while streaming.
+	 */
+	runtime?: "builtin" | "project";
+	/** Identity of the host-owned state above, which arrives after the input does. */
+	revision?: string;
+}
+
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
 export type ToolSectionBody =
 	| ToolCappedDetail
@@ -498,7 +536,8 @@ export type ToolSectionBody =
 	| ToolErrorDetail
 	| ToolSpecTasksDetail
 	| ToolMetaRowsDetail
-	| ToolAskDetail;
+	| ToolAskDetail
+	| ToolIntelligentUiDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -778,10 +817,13 @@ export type ClassifyToolDetailInput = ClassifyToolDetailFields &
 	({ toolUseId: string; previewId?: never } | { previewId: string; toolUseId?: never });
 
 interface ClassifyToolDetailFields {
+	/** Actual visible historical row; COW copies have a new PK but unchanged output metadata. */
+	toolCallId?: string;
 	/** Explicit producer-supplied attempt identity; never inferred from a viewport index. */
 	occurrence?: string | number;
 	toolName: string;
 	category: string;
+	publicSummary?: string;
 	status?: string | null;
 	inputJson?: unknown;
 	outputJson?: unknown;
@@ -851,8 +893,78 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			? toolInputFieldView(input.inputJson)
 			: input.inputJson;
 	const output = toolOutputValue(input.outputJson, metadata);
+	if (
+		toolName === "IntelligentUI" &&
+		(input.publicSummary === INTELLIGENT_UI_PUBLIC_SUMMARY_CODE ||
+			output === INTELLIGENT_UI_PUBLIC_SUMMARY ||
+			asObject(output)?.text === INTELLIGENT_UI_PUBLIC_SUMMARY)
+	) {
+		return single("intelligent-ui", {
+			kind: "intelligent-ui",
+			file: null,
+			publicSummary: true,
+		});
+	}
+	// Only host-owned metadata is a file reference; never promote tool input or output text.
+	const uiRef = toolName === "IntelligentUI" ? metadata?.intelligentUi : null;
+	const uiFile = readIntelligentUiFileReference(uiRef);
+	const uiKit =
+		toolName === "IntelligentUI"
+			? (readIntelligentUiKitNotice(metadata?.intelligentUiKit) ?? undefined)
+			: undefined;
+	const uiDrawnWith = asObject(metadata?.intelligentUiInline)?.kit;
+	const uiRuntime: "builtin" | "project" | undefined =
+		toolName === "IntelligentUI" && (uiDrawnWith === "builtin" || uiDrawnWith === "project")
+			? uiDrawnWith
+			: undefined;
+	const uiKitFields = {
+		...(uiKit ? { kit: uiKit } : {}),
+		...(uiRuntime ? { runtime: uiRuntime } : {}),
+		...(uiKit || uiRuntime
+			? {
+					revision: `${uiRuntime ?? ""}:${uiKit?.state ?? ""}:${uiKit?.request?.id ?? ""}:${uiKit?.request?.state ?? ""}`,
+				}
+			: {}),
+	};
+	const uiInput = toolName === "IntelligentUI" ? asObject(fields) : undefined;
+	// A call that failed, was refused or was stopped drew nothing the reader should take
+	// for an answer: its status and error text are the body instead.
+	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
+	// `render` carries its UI in its own input, so the card exists from the first streamed
+	// chunk.
+	const uiInline: ToolDetailData | null =
+		typeof uiInput?.source === "string" &&
+		(uiInput.action === undefined || uiInput.action === "render") &&
+		!uiUnusable
+			? single("intelligent-ui", {
+					kind: "intelligent-ui",
+					file: null,
+					text: uiInput.source,
+					contentPx: INTELLIGENT_UI_INLINE_HEIGHTS[readIntelligentUiInlineSize(uiInput.size)],
+					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
+					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
+					...uiKitFields,
+				})
+			: null;
+	const uiDetail: ToolDetailData | null = uiInline
+		? uiInline
+		: uiRef
+			? single("intelligent-ui", {
+					kind: "intelligent-ui",
+					// Select the visible copy, not an origin PK retained in immutable tool output.
+					// The server checks both visibility and the copy's trusted provenance column.
+					file: uiFile && input.toolCallId ? { ...uiFile, toolCallId: input.toolCallId } : uiFile,
+					...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
+					...uiKitFields,
+				})
+			: // A kit build the user must confirm is something to act on, not text to read.
+				uiKit?.request && !uiUnusable
+				? single("intelligent-ui", { kind: "intelligent-ui", file: null, ...uiKitFields })
+				: null;
 	const base = withErrorSection(
-		classifyByCategory(toolName, category, status, fields, output, metadata, input),
+		toolName === "IntelligentUI"
+			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
+			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
 	);

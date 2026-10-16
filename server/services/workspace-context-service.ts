@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, constants, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects } from "../db/schema";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
@@ -18,7 +18,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { invalidateComposerSuggestion } from "./narrator-composer";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	type ActiveNarrator,
 	activeNarrators,
@@ -119,6 +119,7 @@ export async function prepareLocalWorkspaceContext(
 					workspaceKey: gitWorkspaceIdentity(localBackend, probe.rootPath),
 					repositoryKey: gitWorkspaceIdentity(localBackend, probe.repositoryPath),
 					rootPath: probe.rootPath,
+					repositoryPath: probe.repositoryPath,
 				}
 			: undefined;
 	if (
@@ -128,6 +129,16 @@ export async function prepareLocalWorkspaceContext(
 		probe.state !== "git_unavailable"
 	)
 		throw new ValidationError(probe.reason ?? "Cannot safely resolve working directory");
+	return localWorkspaceContext(canonical, revision, contextProjectId, git);
+}
+
+/** Construct from an already-authoritative probe; never re-probe to cache facts. */
+export function localWorkspaceContext(
+	canonical: string,
+	revision: number,
+	contextProjectId: string | undefined,
+	git: WorkspaceContext["git"],
+): WorkspaceContext {
 	return {
 		revision,
 		deviceId: "local",
@@ -147,6 +158,36 @@ export async function prepareLocalWorkspaceContext(
 			.digest("hex"),
 		capabilities: { switchDirectory: true },
 	};
+}
+
+/** Discovery must not overwrite a concurrently committed directory or device transition. */
+export async function cacheLocalWorkspaceContext(
+	id: string,
+	row: Pick<
+		typeof narrators.$inferSelect,
+		"workspaceRevision" | "workspaceContext" | "cwd" | "defaultDeviceId"
+	>,
+	context: WorkspaceContext,
+): Promise<boolean> {
+	if (JSON.stringify(context) === JSON.stringify(row.workspaceContext)) return true;
+	const saved = await db
+		.update(narrators)
+		.set({ workspaceContext: context })
+		.where(
+			and(
+				eq(narrators.id, id),
+				eq(narrators.workspaceRevision, row.workspaceRevision),
+				row.workspaceContext
+					? eq(narrators.workspaceContext, row.workspaceContext)
+					: isNull(narrators.workspaceContext),
+				row.cwd === null ? isNull(narrators.cwd) : eq(narrators.cwd, row.cwd),
+				row.defaultDeviceId === null
+					? isNull(narrators.defaultDeviceId)
+					: eq(narrators.defaultDeviceId, row.defaultDeviceId),
+			),
+		)
+		.returning({ id: narrators.id });
+	return saved.length === 1;
 }
 
 function prepareRemoteWorkspaceContext(
@@ -292,7 +333,7 @@ export const workspaceContextService = {
 		const chapter = row.chapterId
 			? await db.query.chapters.findFirst({
 					where: eq(chapters.id, row.chapterId),
-					columns: { worktreePath: true, projectId: true },
+					columns: { worktreePath: true, projectId: true, isRoot: true },
 				})
 			: undefined;
 		const projectId = chapter?.projectId ?? row.contextProjectId ?? undefined;
@@ -336,19 +377,41 @@ export const workspaceContextService = {
 		}
 		const committed =
 			row.workspaceContext?.revision === row.workspaceRevision &&
+			(!row.cwd || localBackend.paths.equals(row.cwd, row.workspaceContext.cwd)) &&
 			row.workspaceContext.deviceId === "local"
 				? row.workspaceContext
 				: null;
 		const cwd =
 			committed?.cwd ??
 			activeNarrators.get(id)?.cwd ??
-			resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome());
-		const context =
-			row.workspaceContext?.cwd === cwd &&
-			row.workspaceContext.deviceId === deviceId &&
-			row.workspaceContext.revision === row.workspaceRevision
-				? { ...row.workspaceContext, contextProjectId: projectId }
-				: await prepareLocalWorkspaceContext(cwd, row.workspaceRevision, projectId, true);
+			(chapter
+				? resolveLegacyNarratorCwd(
+						row.cwd,
+						chapter.worktreePath,
+						project?.gitPath,
+						chapter.isRoot === 1,
+					)
+				: resolveNarratorSessionCwd(row.cwd, null, project?.gitPath, getHome()));
+		if (!cwd)
+			throw new AppError(
+				"This legacy workspace has no directory. Choose a working directory to continue.",
+				409,
+				"WORKSPACE_DIRECTORY_REQUIRED",
+			);
+		let context = committed
+			? { ...committed, contextProjectId: projectId }
+			: await prepareLocalWorkspaceContext(cwd, row.workspaceRevision, projectId, true);
+		if (committed && !committed.git?.repositoryPath) {
+			const discovered = await prepareLocalWorkspaceContext(
+				cwd,
+				row.workspaceRevision,
+				projectId,
+				true,
+			);
+			// A missing checkout must retain its last known identity, not erase it.
+			if (discovered.git) context = discovered;
+		}
+		if (context.git && !(await cacheLocalWorkspaceContext(id, row, context))) return this.get(id);
 		return {
 			...context,
 			capabilities: {

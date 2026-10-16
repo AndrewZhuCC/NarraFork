@@ -625,8 +625,11 @@ export function useVListLabels(): VListLabels {
 					error: t("toolSectionError"),
 				},
 				download: tCommon("download"),
-				copy: tCommon("copy"),
-				copied: tCommon("copied"),
+				// The share card's OWN words, not the generic "copy"/"copied": the button
+				// hands over a link, and the chunked card has always said so. This is the
+				// exact key pair it used, so the wording survives the renderer swap.
+				copy: t("shareFile.copyLink"),
+				copied: t("shareFile.linkCopied"),
 				terminate: t("terminateProcess"),
 				// `{count}` stays literal: the render layer substitutes the per-body
 				// hidden row count — same trick as COUNT_PLACEHOLDER above.

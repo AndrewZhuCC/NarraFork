@@ -53,7 +53,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -108,7 +108,10 @@ jobs:
           ./server/services/file-change-platform-capability.test.ts
           ./server/services/file-change-local-restore.test.ts
           ./server/services/file-change-runtime.test.ts
+          ./server/services/file-change-namespace-cleanup.test.ts
           ./server/services/revert-transaction-service.test.ts
+          ./server/services/revert-transaction-interleaving.test.ts
+          ./server/services/revert-transaction-real-tools.test.ts
           ./server/services/revert-planner-local-access.test.ts
           ./server/services/revert-mutation-journal.test.ts
           ./server/services/narrator-scoped-revert.test.ts

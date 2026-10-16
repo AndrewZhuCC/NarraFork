@@ -88,10 +88,7 @@ export function computeBinaryMetadataFromBuffer(
 		...(input.helperDistribution === undefined
 			? {}
 			: {
-					helperDistribution: parseHelperDistributionDependencies(
-						input.helperDistribution,
-						input.version,
-					),
+					helperDistribution: parseHelperDistributionDependencies(input.helperDistribution),
 				}),
 		buildDate: input.buildDate,
 		size: buf.length,

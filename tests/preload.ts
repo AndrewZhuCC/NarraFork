@@ -66,11 +66,22 @@ process.env.USERPROFILE = isolatedHome;
 process.env.NARRAFORK_HOME = isolatedNarraforkHome;
 process.env.NARRAFORK_TEST = "1";
 
+// Seed the isolated database with an already-migrated copy so the ~200-migration replay is not
+// repeated by every database-backed test file. Startup still runs its full sequence against it.
+// Explicit NARRAFORK_HOME callers own their directory and are left untouched.
+let sqliteSeed: import("./sqlite-template").SqliteSeedOutcome | "explicit-home" = "explicit-home";
+if (!requestedNarraforkHome) {
+	const { seedSqliteTestDatabase } = await import("./sqlite-template");
+	sqliteSeed = seedSqliteTestDatabase(isolatedNarraforkHome);
+}
+
 export const testEnvironment = Object.freeze({
 	originalHome,
 	realNarraforkHome,
 	isolatedHome,
 	narraforkHome: isolatedNarraforkHome,
+	/** What the preload did with the pre-migrated SQLite template for this process. */
+	sqliteSeed,
 });
 
 // This import must remain dynamic and below the environment setup. A static import

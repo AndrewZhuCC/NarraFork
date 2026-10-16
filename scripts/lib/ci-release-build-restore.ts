@@ -2,6 +2,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { validateSmokeMetadata } from "../smoke-release-binary";
+import { runPublicationProcess as runBridgeProcess } from "./ci-publication-runtime";
 import {
 	CI_DISK_RESERVE,
 	CI_METADATA_LIMIT,
@@ -11,6 +12,7 @@ import {
 } from "./ci-release-io";
 import {
 	assertCiMainAncestor,
+	type CiReleaseComponentChecks,
 	ciApi,
 	ciApiList,
 	ciGhRunner,
@@ -29,7 +31,6 @@ import {
 	type CiReleasePlan,
 	type CiReleaseTarget,
 } from "./ci-release-types";
-import { runBridgeProcess } from "./ci-update-server-bridge-restore";
 import type { GhRunner } from "./github-release";
 
 const TIMEOUT = 15 * 60_000;
@@ -105,6 +106,8 @@ export interface PrepareCiReleaseBuildOptions extends BuildOptions {
 	tag: string;
 	target?: string;
 	publish: boolean;
+	/** Fixture injection only, forwarded to online control-plan prechecks. */
+	componentChecks?: CiReleaseComponentChecks;
 }
 
 function targetSet(target?: string): CiReleaseTarget[] {
@@ -457,7 +460,12 @@ export async function prepareCiReleaseBuild(
 		bounded,
 	);
 	if (result.original.tag !== options.tag) throw new Error("Original build tag mismatch");
-	await revalidateCiReleasePlan(result.original, { ...bounded, publish: options.publish });
+	const verified = await revalidateCiReleasePlan(result.original, {
+		...bounded,
+		publish: options.publish,
+		componentChecks: options.componentChecks,
+		componentRun: options.run,
+	});
 	const buildSource: CiReleaseBuildSource = {
 		runId: result.source.id,
 		runAttempt: result.source.run_attempt,
@@ -469,7 +477,7 @@ export async function prepareCiReleaseBuild(
 		})),
 	};
 	bounded.signal.throwIfAborted();
-	return validateCiReleasePlan({ ...result.original, ...result.dispatch, buildSource });
+	return validateCiReleasePlan({ ...verified, ...result.dispatch, buildSource });
 }
 
 function productIdentity(plan: CiReleasePlan) {

@@ -12,7 +12,9 @@ import {
 	powershellSingleQuote,
 	shellSingleQuote,
 } from "../executor-install-script";
-import { APP_VERSION } from "../version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 const SHA256 = "a".repeat(64);
 const TICKET = "b".repeat(64);
@@ -28,9 +30,9 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 		deviceName: "Build Server",
 		connectionMode: "reverse",
 		disableShell: false,
-		artifactFilename: executorPublishedFilename(APP_VERSION, platform),
+		artifactFilename: executorPublishedFilename(EXECUTOR_VERSION, platform),
 		expectedSha256: SHA256,
-		executorVersion: APP_VERSION,
+		executorVersion: EXECUTOR_VERSION,
 		ticket: TICKET,
 		...overrides,
 	};

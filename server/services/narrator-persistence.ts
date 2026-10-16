@@ -740,71 +740,157 @@ function guardPersistedPlanBody(
 }
 
 const COMPACT_RESTART_ERROR = "Interrupted by server restart";
+const COMPACT_RECOVERY_PAGE_SIZE = 100;
 
 /**
  * Recover compact markers left in the transient `[Compacting]` state.
  *
  * Modern markers carry attempt history and are audit records: preserve them,
  * fail every still-running attempt, and leave the marker retryable when its
- * history position is still valid. Only legacy placeholders with no attempt or
- * retry metadata are removed.
+ * history position is still valid. Legacy compact blocks with no attempt or
+ * retry metadata are removed. Text-only placeholders or inconsistent non-pending
+ * JSON are deliberately outside startup recovery: finding them would require a
+ * historical table scan. Normal writers put the compact block first, which is
+ * the same invariant used by the generated column and fork's pending index.
  */
 export async function recoverStaleCompactingMessages(
 	error = COMPACT_RESTART_ERROR,
 ): Promise<{ preserved: number; deleted: number }> {
-	const staleMessages = await db.query.narratorMessages.findMany({
-		where: and(
-			eq(narratorMessages.role, "system"),
-			eq(narratorMessages.contentText, "[Compacting]"),
-		),
-		columns: { id: true },
-	});
+	const startedAt = performance.now();
+	// Both modern and legacy compact blocks are represented in this tiny partial
+	// index. Never search historical message text (or fall back to doing so): a
+	// missing index is a schema error, not permission to scan the message table.
+	const upperBound = sqlite
+		.query<{ cursor: number }, []>(
+			`SELECT rowid AS cursor FROM narrator_messages INDEXED BY idx_messages_compact_pending
+			 WHERE compact_pending = 1 ORDER BY rowid DESC LIMIT 1`,
+		)
+		.get()?.cursor;
+	let selectionMs = performance.now() - startedAt;
+	let recoveryMs = 0;
+	let batches = 0;
+	let candidates = 0;
+	let skipped = 0;
+	let failed = 0;
 	let preserved = 0;
 	let deleted = 0;
+	let cursor: number | undefined;
 	const failureText = truncateCompactError(error);
 
-	for (const stale of staleMessages) {
-		const affectedNarrators = new Set<string>();
-		try {
-			const action = await withDbRetry(
-				async () =>
-					db.transaction((tx) => {
-						const current = tx.query.narratorMessages
-							.findFirst({
-								where: and(
-									eq(narratorMessages.id, stale.id),
-									eq(narratorMessages.role, "system"),
-									eq(narratorMessages.contentText, "[Compacting]"),
-								),
-								columns: { contentJson: true },
-							})
-							.sync();
-						if (!current) return "skipped" as const;
+	// The startup admission barrier still owns concurrency. This bound only makes
+	// this invocation finite; it is not a snapshot or a durable recovery cursor.
+	while (upperBound !== undefined) {
+		const selectionStartedAt = performance.now();
+		const staleMessages = sqlite
+			.query<{ cursor: number; id: string }, number[]>(
+				`SELECT rowid AS cursor, id FROM narrator_messages INDEXED BY idx_messages_compact_pending
+				 WHERE compact_pending = 1 AND rowid <= ? ${cursor === undefined ? "" : "AND rowid > ?"}
+				 ORDER BY rowid LIMIT ?`,
+			)
+			.all(
+				...(cursor === undefined
+					? [upperBound, COMPACT_RECOVERY_PAGE_SIZE]
+					: [upperBound, cursor, COMPACT_RECOVERY_PAGE_SIZE]),
+			);
+		selectionMs += performance.now() - selectionStartedAt;
+		if (staleMessages.length === 0) break;
+		batches++;
+		candidates += staleMessages.length;
+		// Advance independently of recovery success, so a failed row cannot trap us.
+		cursor = staleMessages[staleMessages.length - 1].cursor;
 
-						const refs = tx
-							.select()
-							.from(narratorMessageRefs)
-							.where(eq(narratorMessageRefs.messageId, stale.id))
-							.all();
-						for (const ref of refs) affectedNarrators.add(ref.narratorId);
-						const blocks = Array.isArray(current.contentJson) ? current.contentJson : [];
-						const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-						const attempts = normalizeCompactAttempts(compactBlock?.attempts);
-						const hasRetryHistory =
-							attempts.length > 0 ||
-							compactBlock?.trigger === "retry" ||
-							compactBlock?.retryBaseCompactMessageId !== undefined;
-						const now = new Date().toISOString();
+		for (const stale of staleMessages) {
+			const recoveryStartedAt = performance.now();
+			const affectedNarrators = new Set<string>();
+			try {
+				const action = await withDbRetry(
+					async () =>
+						db.transaction((tx) => {
+							const current = tx.query.narratorMessages
+								.findFirst({
+									where: and(
+										eq(narratorMessages.id, stale.id),
+										eq(narratorMessages.compactPending, 1),
+										eq(narratorMessages.role, "system"),
+										eq(narratorMessages.contentText, "[Compacting]"),
+									),
+									columns: { contentJson: true },
+								})
+								.sync();
+							if (!current) return "skipped" as const;
 
-						if (refs.length === 0) {
-							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
-							return "deleted" as const;
-						}
+							const refs = tx
+								.select()
+								.from(narratorMessageRefs)
+								.where(eq(narratorMessageRefs.messageId, stale.id))
+								.all();
+							for (const ref of refs) affectedNarrators.add(ref.narratorId);
+							const blocks = Array.isArray(current.contentJson) ? current.contentJson : [];
+							const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+							const attempts = normalizeCompactAttempts(compactBlock?.attempts);
+							const hasRetryHistory =
+								attempts.length > 0 ||
+								compactBlock?.trigger === "retry" ||
+								compactBlock?.retryBaseCompactMessageId !== undefined;
+							const now = new Date().toISOString();
 
-						if (!compactBlock || !hasRetryHistory) {
+							if (refs.length === 0) {
+								tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+								tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+								return "deleted" as const;
+							}
+
+							if (!compactBlock || !hasRetryHistory) {
+								for (const ref of refs) {
+									deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
+									tx.update(narrators)
+										.set({
+											messageVersion: sql`${narrators.messageVersion} + 1`,
+											updatedAt: now,
+										})
+										.where(eq(narrators.id, ref.narratorId))
+										.run();
+								}
+								tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+								tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+								return "deleted" as const;
+							}
+
+							const failedAttempts = attempts.map((attempt) =>
+								attempt.status === "running"
+									? {
+											...attempt,
+											status: "failed" as const,
+											finishedAt: now,
+											error: failureText,
+										}
+									: attempt,
+							);
+							const failedBlock = {
+								...compactBlock,
+								status: "failed" as const,
+								error: failureText,
+								attempts: failedAttempts,
+							};
+							const failedOverrides: Partial<typeof narratorMessages.$inferInsert> = {
+								contentJson: [failedBlock],
+								contextCharsJson: measureMessageCharacters("system", [failedBlock]),
+								contentText: `[Compact Failed] ${failureText.slice(0, 200)}...`,
+								contextPercent: null,
+							};
+							const forceCopy = refs.length > 1;
 							for (const ref of refs) {
-								deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
+								const copied = copyMessageForNarratorTx(
+									tx,
+									ref.narratorId,
+									stale.id,
+									failedOverrides,
+									forceCopy,
+								);
+								tx.update(narratorMessageRefs)
+									.set({ isCompact: 0 })
+									.where(eq(narratorMessageRefs.id, ref.id))
+									.run();
 								tx.update(narrators)
 									.set({
 										messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -812,84 +898,57 @@ export async function recoverStaleCompactingMessages(
 									})
 									.where(eq(narrators.id, ref.narratorId))
 									.run();
+								// Keep the local variable useful for reviewers and future callers: the
+								// helper has moved this exact ref before the isCompact update.
+								void copied;
 							}
-							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
-							return "deleted" as const;
-						}
 
-						const failedAttempts = attempts.map((attempt) =>
-							attempt.status === "running"
-								? {
-										...attempt,
-										status: "failed" as const,
-										finishedAt: now,
-										error: failureText,
-									}
-								: attempt,
-						);
-						const failedBlock = {
-							...compactBlock,
-							status: "failed" as const,
-							error: failureText,
-							attempts: failedAttempts,
-						};
-						const failedOverrides: Partial<typeof narratorMessages.$inferInsert> = {
-							contentJson: [failedBlock],
-							contextCharsJson: measureMessageCharacters("system", [failedBlock]),
-							contentText: `[Compact Failed] ${failureText.slice(0, 200)}...`,
-							contextPercent: null,
-						};
-						const forceCopy = refs.length > 1;
-						for (const ref of refs) {
-							const copied = copyMessageForNarratorTx(
-								tx,
-								ref.narratorId,
-								stale.id,
-								failedOverrides,
-								forceCopy,
-							);
-							tx.update(narratorMessageRefs)
-								.set({ isCompact: 0 })
-								.where(eq(narratorMessageRefs.id, ref.id))
-								.run();
-							tx.update(narrators)
-								.set({
-									messageVersion: sql`${narrators.messageVersion} + 1`,
-									updatedAt: now,
-								})
-								.where(eq(narrators.id, ref.narratorId))
-								.run();
-							// Keep the local variable useful for reviewers and future callers: the
-							// helper has moved this exact ref before the isCompact update.
-							void copied;
-						}
-
-						// Every shared ref was moved to a private failed marker. Remove the
-						// original only after the last source ref is gone.
-						const remaining = tx.query.narratorMessageRefs
-							.findFirst({ where: eq(narratorMessageRefs.messageId, stale.id) })
-							.sync();
-						if (!remaining) {
-							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
-						}
-						return "preserved" as const;
-					}),
-				{ label: "recoverStaleCompactingMessage", maxRetries: 5 },
-			);
-			if (action !== "skipped")
-				for (const id of affectedNarrators) queueContextCharacterRefresh(id);
-			if (action === "preserved") preserved++;
-			else if (action === "deleted") deleted++;
-		} catch (recoveryError) {
-			logger.error("Failed to recover stale compacting message", {
-				messageId: stale.id,
-				error: String(recoveryError),
-			});
+							// Every shared ref was moved to a private failed marker. Remove the
+							// original only after the last source ref is gone.
+							const remaining = tx.query.narratorMessageRefs
+								.findFirst({ where: eq(narratorMessageRefs.messageId, stale.id) })
+								.sync();
+							if (!remaining) {
+								tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+								tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+							}
+							return "preserved" as const;
+						}),
+					{ label: "recoverStaleCompactingMessage", maxRetries: 5 },
+				);
+				if (action !== "skipped")
+					for (const id of affectedNarrators) queueContextCharacterRefresh(id);
+				if (action === "preserved") preserved++;
+				else if (action === "deleted") deleted++;
+				else skipped++;
+			} catch (recoveryError) {
+				failed++;
+				logger.error("Failed to recover stale compacting message", {
+					messageId: stale.id,
+					error: String(recoveryError),
+				});
+			} finally {
+				recoveryMs += performance.now() - recoveryStartedAt;
+			}
 		}
+		if (staleMessages.length < COMPACT_RECOVERY_PAGE_SIZE || cursor >= upperBound) break;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	}
 
+	const durationMs = performance.now() - startedAt;
+	const stats = {
+		batches,
+		candidates,
+		preserved,
+		deleted,
+		skipped,
+		failed,
+		selectionMs,
+		recoveryMs,
+		durationMs,
+	};
+	if (durationMs >= 1_000) logger.warn("Slow stale compacting message recovery on startup", stats);
+	else logger.info("Stale compacting message recovery completed on startup", stats);
 	return { preserved, deleted };
 }
 
@@ -2107,121 +2166,132 @@ const sqliteNarratorPersistence = {
 	) {
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
-		const existing = db.query.narratorMessages
-			.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true, parentToolUseId: true },
-			})
-			.sync();
-		if (!existing) throw new NotFoundError("Assistant message", messageId);
-
-		type StoredAssistantBlock =
-			| {
-					type: "text";
-					text: string;
-					outputIndex?: number;
-					citations?: import("@shared/citations").TextCitation[];
-					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
-					id?: string;
-					revision?: number;
-					rawTextLength?: number;
-					completed?: boolean;
-			  }
-			| {
-					type: "reasoning";
-					text: string;
-					id?: string;
-					revision?: number;
-					rawTextLength?: number;
-					completed?: boolean;
-					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-					outputIndex?: number;
-			  }
-			| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
-			| {
-					type: "tool_use";
-					id: string;
-					name: string;
-					input: Record<string, unknown>;
-					streamStartedAt?: number;
-					streamCompletedAt?: number;
-					outputIndex?: number;
-					thoughtSignature?: string;
-					thoughtSignatureSource?: string;
-			  }
-			| {
-					type: "web_search";
-					id: string;
-					query?: string;
-					queries?: string[];
-					outputIndex?: number;
-			  }
-			| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
-		const current = (
-			Array.isArray(existing.contentJson) ? existing.contentJson : []
-		) as StoredAssistantBlock[];
-		let content: StoredAssistantBlock[];
-		const matchingIndex =
-			(block.type === "text" || block.type === "reasoning") && block.id
-				? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
-				: -1;
-		if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
-			const previous = current[matchingIndex] as Record<string, unknown>;
-			const stale =
-				typeof previous.revision === "number" &&
-				(block.revision == null || block.revision < previous.revision);
-			const next: Record<string, unknown> = {
-				...previous,
-				...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
-			};
-			if (block.type === "reasoning" && block.providerMetadata) {
-				next.providerMetadata = mergeReasoningMetadata(
-					previous.providerMetadata as ReasoningProviderMetadata | undefined,
-					block.providerMetadata,
-				);
-			}
-			if (previous.text !== block.text) delete next.translatedText;
-			if (stale || isDeepStrictEqual(previous, next)) {
-				content = current;
-			} else {
-				// A checkpoint updates the original chronological slot, even when its
-				// metadata arrives after a tool has already been committed.
-				content = [...current];
-				content[matchingIndex] = next as StoredAssistantBlock;
-			}
-		} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
-			const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
-				const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
-				return typeof outputIndex === "number" ? outputIndex : undefined;
-			};
-			const next = [...current, block as StoredAssistantBlock];
-			const indexed = next.map((entry, index) => ({ entry, index }));
-			indexed.sort((a, b) => {
-				const aOrder = getOutputIndex(a.entry) ?? Number.POSITIVE_INFINITY;
-				const bOrder = getOutputIndex(b.entry) ?? Number.POSITIVE_INFINITY;
-				return aOrder === bOrder ? a.index - b.index : aOrder - bOrder;
-			});
-			content = indexed.map(({ entry }) => entry);
-		} else {
-			// Unindexed providers/checkpoints already arrive in occurrence order. Do not
-			// pull later reasoning in front of text/tools that were actually seen first.
-			content = [...current, block];
-		}
-		if (content === current && !options?.republishUnchanged) return undefined;
-		if (content !== current) {
-			const contentText = content
-				.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
-				.join("\n");
-			db.update(narratorMessages)
-				.set({
-					contentJson: content,
-					contextCharsJson: measureMessageCharacters("assistant", content),
-					contentText: contentText || null,
+		const persisted = db.transaction((tx) => {
+			const existing = tx.query.narratorMessages
+				.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					columns: { contentJson: true, parentToolUseId: true },
 				})
-				.where(eq(narratorMessages.id, messageId))
-				.run();
-			queueContextCharacterRefresh(narratorId, messageId);
-		}
+				.sync();
+			if (!existing) throw new NotFoundError("Assistant message", messageId);
+
+			type StoredAssistantBlock =
+				| {
+						type: "text";
+						text: string;
+						outputIndex?: number;
+						citations?: import("@shared/citations").TextCitation[];
+						fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+						id?: string;
+						revision?: number;
+						rawTextLength?: number;
+						completed?: boolean;
+				  }
+				| {
+						type: "reasoning";
+						text: string;
+						id?: string;
+						revision?: number;
+						rawTextLength?: number;
+						completed?: boolean;
+						providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+						outputIndex?: number;
+				  }
+				| {
+						type: "redacted_thinking";
+						data: string;
+						outputIndex?: number;
+						signatureSource?: string;
+				  }
+				| {
+						type: "tool_use";
+						id: string;
+						name: string;
+						input: Record<string, unknown>;
+						streamStartedAt?: number;
+						streamCompletedAt?: number;
+						outputIndex?: number;
+						thoughtSignature?: string;
+						thoughtSignatureSource?: string;
+				  }
+				| {
+						type: "web_search";
+						id: string;
+						query?: string;
+						queries?: string[];
+						outputIndex?: number;
+				  }
+				| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
+			const current = (
+				Array.isArray(existing.contentJson) ? existing.contentJson : []
+			) as StoredAssistantBlock[];
+			let content: StoredAssistantBlock[];
+			const matchingIndex =
+				(block.type === "text" || block.type === "reasoning") && block.id
+					? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+					: -1;
+			if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+				const previous = current[matchingIndex] as Record<string, unknown>;
+				const stale =
+					typeof previous.revision === "number" &&
+					(block.revision == null || block.revision < previous.revision);
+				const next: Record<string, unknown> = {
+					...previous,
+					...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
+				};
+				if (block.type === "reasoning" && block.providerMetadata) {
+					next.providerMetadata = mergeReasoningMetadata(
+						previous.providerMetadata as ReasoningProviderMetadata | undefined,
+						block.providerMetadata,
+					);
+				}
+				if (previous.text !== block.text) delete next.translatedText;
+				if (stale || isDeepStrictEqual(previous, next)) {
+					content = current;
+				} else {
+					// A checkpoint updates the original chronological slot, even when its
+					// metadata arrives after a tool has already been committed.
+					content = [...current];
+					content[matchingIndex] = next as StoredAssistantBlock;
+				}
+			} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+				const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
+					const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
+					return typeof outputIndex === "number" ? outputIndex : undefined;
+				};
+				// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
+				// avoid the former wrapper object + two extra arrays for every checkpoint.
+				content = [...current, block as StoredAssistantBlock];
+				content.sort((a, b) => {
+					const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
+					const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
+					return aOrder === bOrder ? 0 : aOrder - bOrder;
+				});
+			} else {
+				// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+				// pull later reasoning in front of text/tools that were actually seen first.
+				content = [...current, block];
+			}
+			if (content === current && !options?.republishUnchanged) return undefined;
+			if (content !== current) {
+				const textParts: string[] = [];
+				for (const entry of content)
+					if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
+				const contentText = textParts.join("\n");
+				tx.update(narratorMessages)
+					.set({
+						contentJson: content,
+						contextCharsJson: measureMessageCharacters("assistant", content),
+						contentText: contentText || null,
+					})
+					.where(eq(narratorMessages.id, messageId))
+					.run();
+				queueContextCharacterRefresh(narratorId, messageId);
+			}
+			return existing;
+		});
+		if (!persisted) return undefined;
+		const existing = persisted;
 
 		/**
 		 * Publish the partial now that it holds real content.

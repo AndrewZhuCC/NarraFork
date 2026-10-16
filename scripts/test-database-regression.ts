@@ -744,9 +744,11 @@ export async function runTestFile(options: RunFileOptions): Promise<FileRunResul
 	}
 
 	const combinedOutput = `${stdout.text}\n${stderr.text}`;
+	// bun-types 1.4.3 reports an unnamed signal (e.g. Linux real-time) as its number.
+	const signal = proc.signalCode === null ? null : String(proc.signalCode);
 	const status = classifyRunOutcome({
 		exitCode,
-		signal: proc.signalCode ?? null,
+		signal,
 		timedOut,
 		cancelled,
 		outputOverflowKilled: killedForOutput,
@@ -759,7 +761,7 @@ export async function runTestFile(options: RunFileOptions): Promise<FileRunResul
 		file: options.file,
 		status,
 		exitCode,
-		signal: proc.signalCode ?? null,
+		signal,
 		durationMs: Math.round((Bun.nanoseconds() - started) / 1e6),
 		timedOut,
 		killedForOutput,

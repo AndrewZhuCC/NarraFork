@@ -8,6 +8,70 @@ import {
 	type ResourceMigrationSnapshot,
 } from "../../finalize-sqlite-resource-migration";
 import { generatePostgresSchema } from "../../generate-postgres-schema";
+import {
+	appendGeneratedModelHistoryTriggers,
+	generatedModelHistoryTriggerSuffix,
+} from "../generated-model-history-triggers";
+import { modelHistorySnapshots, revisionMigrationSql } from "./model-history-migration-fixture";
+
+test("only the exact generated trigger suffix is allowed, installed and validated read-only", () => {
+	const { before, after, previousDDL } = modelHistorySnapshots();
+	const suffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
+	const input = appendGeneratedModelHistoryTriggers(revisionMigrationSql, suffix);
+	const finalized = finalizeResourceMigration(input, before, after);
+	expect(finalized.endsWith(suffix)).toBe(true);
+	expect(finalizeResourceMigration(finalized, before, after)).toBe(finalized);
+	expect(() => assertResourceMigrationValidated(finalized, before, after)).not.toThrow();
+	const db = new Database(":memory:");
+	try {
+		db.exec(previousDDL);
+		db.exec(finalized);
+		expect(db.query("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger'").get()).toEqual({
+			n: 11,
+		});
+		expect(db.query("SELECT * FROM model_history_revision_contracts").get()).toEqual({
+			id: "model-history",
+			installed_version: "model-history-v1",
+		});
+		db.exec(
+			"INSERT INTO narrators(id) VALUES('owner'); INSERT INTO narrator_messages(id,narrator_id,content_json) VALUES('message','owner','[]');",
+		);
+		expect(db.query("SELECT body_revision FROM narrator_messages").get()).toEqual({
+			body_revision: 1,
+		});
+		expect(db.query("SELECT model_history_revision FROM narrators").get()).toEqual({
+			model_history_revision: 1,
+		});
+	} finally {
+		db.close();
+	}
+	for (const changed of [
+		revisionMigrationSql,
+		input.replace("model_history_revision + 1", "model_history_revision + 2"),
+		`${input}ATTACH DATABASE 'user.db' AS victim;`,
+		appendGeneratedModelHistoryTriggers(
+			`${revisionMigrationSql}\nCREATE TRIGGER untrusted AFTER UPDATE ON narrators BEGIN DELETE FROM users; END;`,
+			suffix,
+		),
+	])
+		expect(() => finalizeResourceMigration(changed, before, after)).toThrow();
+});
+
+test("machine triggers are compiled against every target column and later destructive rebuilds fail closed", () => {
+	const { before, after } = modelHistorySnapshots();
+	const brokenBefore = structuredClone(before),
+		brokenAfter = structuredClone(after);
+	delete brokenBefore.tables.narrator_messages.columns.origin_label;
+	delete brokenAfter.tables.narrator_messages.columns.origin_label;
+	const input = appendGeneratedModelHistoryTriggers(
+		revisionMigrationSql,
+		generatedModelHistoryTriggerSuffix(brokenBefore, brokenAfter, "sqlite"),
+	);
+	expect(() => finalizeResourceMigration(input, brokenBefore, brokenAfter)).toThrow("origin_label");
+	expect(() => finalizeResourceMigration("DROP TABLE narrator_messages;", after, after)).toThrow(
+		"versioned reinstall",
+	);
+});
 
 const before: ResourceMigrationSnapshot = {
 	tables: {
@@ -450,6 +514,139 @@ test("snapshot PK, unique, CHECK and partial/composite indices are verified in r
 		}
 	}
 });
+test("rebuild repairs a quoted constant term only with exact snapshot expression provenance", () => {
+	const previous = structuredClone(before);
+	const next = structuredClone(after);
+	for (const snapshot of [previous, next]) {
+		snapshot.tables.resources.indexes = {
+			singleton: {
+				name: "singleton",
+				columns: ["(1)"],
+				isUnique: true,
+				where: "owner is not null",
+			},
+		};
+		snapshot.internal = { indexes: { singleton: { columns: { "(1)": { isExpression: true } } } } };
+	}
+	const source = `${sql} CREATE UNIQUE INDEX singleton ON resources(\`(1)\`) WHERE owner is not null;`;
+	const valid = finalizeResourceMigration(source, previous, next);
+	expect(valid).toContain("CREATE UNIQUE INDEX singleton ON resources(1) WHERE owner is not null;");
+	expect(finalizeResourceMigration(valid, previous, next)).toBe(valid);
+	expect(() => assertResourceMigrationValidated(source, previous, next)).toThrow("Unvalidated");
+	expect(() => assertResourceMigrationValidated(valid, previous, next)).not.toThrow();
+	const db = new Database(":memory:");
+	try {
+		db.exec(
+			"CREATE TABLE users(id text primary key); CREATE TABLE resources(id text primary key, owner text); CREATE UNIQUE INDEX singleton ON resources((1)) WHERE owner is not null; INSERT INTO resources VALUES('a', 'owner');",
+		);
+		db.exec(valid);
+		expect(db.query("SELECT id, owner FROM resources").get()).toEqual({ id: "a", owner: "owner" });
+		expect(() => db.exec("INSERT INTO resources(id, owner) VALUES('b', 'other');")).toThrow(
+			"UNIQUE",
+		);
+	} finally {
+		db.close();
+	}
+	for (const marked of [undefined, false]) {
+		const untrusted = structuredClone(next);
+		untrusted.internal =
+			marked === undefined
+				? undefined
+				: { indexes: { singleton: { columns: { "(1)": { isExpression: marked } } } } };
+		expect(() => finalizeResourceMigration(source, previous, untrusted)).toThrow();
+	}
+	for (const damaged of [
+		source.replace("`(1)`", "`1`"),
+		source.replace("`(1)`", "`(2)`"),
+		source.replace("CREATE UNIQUE INDEX", "CREATE INDEX"),
+		source.replace("WHERE owner is not null", "WHERE owner is null"),
+	])
+		expect(() => finalizeResourceMigration(damaged, previous, next)).toThrow();
+	const unknown = structuredClone(next);
+	unknown.tables.resources.indexes = {
+		singleton: {
+			name: "singleton",
+			columns: ["abs(1)"],
+			isUnique: true,
+			where: "owner is not null",
+		},
+	};
+	unknown.internal = { indexes: { singleton: { columns: { "abs(1)": { isExpression: true } } } } };
+	expect(() =>
+		finalizeResourceMigration(source.replace("`(1)`", "`abs(1)`"), previous, unknown),
+	).toThrow();
+});
+
+test.each([
+	"1",
+	"(1)",
+	"(( 1 ))",
+])("single constant index %s validates exactly and enforces partial uniqueness", (term) => {
+	const next = structuredClone(before);
+	next.tables.resources.indexes = {
+		singleton: { name: "singleton", columns: [term], isUnique: true, where: "owner is not null" },
+	};
+	const source = `CREATE UNIQUE INDEX singleton ON resources ((${term})) WHERE owner is not null;`;
+	const valid = finalizeResourceMigration(source, before, next);
+	expect(() => assertResourceMigrationValidated(valid, before, next)).not.toThrow();
+	expect(finalizeResourceMigration(valid, before, next)).toBe(valid);
+	// Existing expression indexes must also survive unrelated subsequent migrations.
+	expect(() => finalizeResourceMigration("", next, next)).not.toThrow();
+	const db = new Database(":memory:");
+	try {
+		db.exec("CREATE TABLE resources(id text primary key, owner text);");
+		db.exec(valid);
+		db.exec("INSERT INTO resources VALUES('a', NULL), ('b', NULL), ('c', 'owner');");
+		expect(() => db.exec("INSERT INTO resources VALUES('d', 'another');")).toThrow("UNIQUE");
+	} finally {
+		db.close();
+	}
+	for (const damaged of [
+		source.replace(`((${term}))`, "(owner)"),
+		source.replace("CREATE UNIQUE INDEX", "CREATE INDEX"),
+		source.replace("owner is not null", "owner is null"),
+		"",
+	])
+		expect(() => finalizeResourceMigration(damaged, before, next)).toThrow("Target DDL differs");
+	for (const expression of [
+		"2",
+		"1 + 0",
+		"true",
+		"'1'",
+		'"1"',
+		"abs(1)",
+		"lower(owner)",
+		"1, owner",
+		"1 DESC",
+	]) {
+		const damaged = source.replace(`((${term}))`, `(${expression})`);
+		expect(() => finalizeResourceMigration(damaged, before, next)).toThrow();
+		expect(() => assertResourceMigrationValidated(damaged, before, next)).toThrow();
+	}
+});
+
+test("unknown snapshot index expressions and multi-term constant indexes fail closed", () => {
+	for (const columns of [["2"], ["1 + 0"], ["true"], ["lower(owner)"], ["1", "owner"]]) {
+		const next = structuredClone(before);
+		next.tables.resources.indexes = { idx: { name: "idx", columns, isUnique: true } };
+		expect(() =>
+			finalizeResourceMigration("CREATE UNIQUE INDEX idx ON resources(1);", before, next),
+		).toThrow();
+	}
+});
+
+test("a real column named 1 never compares equal to the constant expression 1", () => {
+	const previous = structuredClone(before);
+	previous.tables.resources.columns["1"] = { name: "1", type: "integer" };
+	const next = structuredClone(previous);
+	next.tables.resources.indexes = { idx: { name: "idx", columns: ["1"], isUnique: true } };
+	const valid = 'CREATE UNIQUE INDEX idx ON resources("1");';
+	expect(() => finalizeResourceMigration(valid, previous, next)).not.toThrow();
+	expect(() => finalizeResourceMigration(valid.replace('("1")', "(1)"), previous, next)).toThrow(
+		"Target DDL differs",
+	);
+});
+
 test("composite primary key order is semantic; unsupported expressions/constraints fail closed", () => {
 	const next = structuredClone(before);
 	next.tables.resources.columns.id.primaryKey = false;

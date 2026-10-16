@@ -299,15 +299,14 @@ You have completed 20 tool call(s) since your last visible text reply. Before ca
 			kind: "knowledge",
 			hits: [
 				{ entryId: "k1", title: "SQLite WAL", summary: "why WAL is on" },
-				{ entryId: "k2", title: "FTS5 trigram", summary: "CJK search" },
+				{ scope: "personal", entryId: "k2", title: "FTS5 trigram", summary: "CJK search" },
 			],
 		};
-		// Original: `${heading}\n${lines.join("\n")}\n\n(Use KnowledgeRead with an id for full content.)`
+		// Each scope names the exact KnowledgeRead argument; missing scope is legacy global.
 		expect(renderSideCarBodyToText("knowledge_base_hint", body, EN)).toBe(
 			"Relevant knowledge-base entries were found based on the latest tool output:\n" +
-				"- [k1] SQLite WAL: why WAL is on\n" +
-				"- [k2] FTS5 trigram: CJK search\n" +
-				"\n(Use KnowledgeRead with an id for full content.)",
+				'- [global:k1] SQLite WAL: why WAL is on (KnowledgeRead {"entryId":"k1"})\n' +
+				'- [personal:k2] FTS5 trigram: CJK search (KnowledgeRead {"personalEntryId":"k2"})',
 		);
 	});
 

@@ -7,9 +7,11 @@ import { join, resolve } from "node:path";
 import { runInNewContext } from "node:vm";
 import {
 	assertReleaseGate,
+	createCiReleaseGhRunner,
 	normalizeMatrixArtifacts,
 	parseCiReleaseArgs,
 	releaseMatrix,
+	runCiRelease,
 	validateBuildRecoveryArgs,
 } from "../../scripts/ci-release";
 import { CI_RELEASE_TARGETS, type CiReleasePlan } from "../../scripts/lib/ci-release-types";
@@ -81,6 +83,152 @@ function gateEnv(restore: boolean, publish: boolean): NodeJS.ProcessEnv {
 	};
 }
 
+describe("CI component read transport", () => {
+	test("read budgets reach the cancellable transport while uploads retain the ordinary runner", async () => {
+		const parent = new AbortController();
+		const request = new AbortController();
+		const commands: string[][] = [];
+		let forwarded:
+			| { signal?: AbortSignal; timeoutMs?: number; maxOutputBytes?: number }
+			| undefined;
+		const run = createCiReleaseGhRunner(
+			parent.signal,
+			async (args) => {
+				commands.push(args);
+				return "upload";
+			},
+			async (_args, controls) => {
+				forwarded = controls;
+				return "read";
+			},
+		);
+		expect(await run(["release", "upload", "v0.9.2"])).toBe("upload");
+		expect(
+			await run(["api", "repos/Example/Fork/git/trees/sha"], {
+				signal: request.signal,
+				timeoutMs: 30_000,
+				maxOutputBytes: 1024 * 1024,
+			}),
+		).toBe("read");
+		expect(commands).toHaveLength(1);
+		expect(forwarded?.timeoutMs).toBe(30_000);
+		expect(forwarded?.maxOutputBytes).toBe(1024 * 1024);
+		expect(forwarded?.signal?.aborted).toBe(false);
+		request.abort(new Error("request budget expired"));
+		expect(forwarded?.signal?.aborted).toBe(true);
+	});
+	test("parent cancellation reaches active reads and pre-aborted requests never start a child", async () => {
+		const parent = new AbortController();
+		let entered = false;
+		const run = createCiReleaseGhRunner(
+			parent.signal,
+			async () => "ordinary",
+			async (_args, controls) => {
+				entered = true;
+				return new Promise<string>((_resolve, reject) => {
+					controls?.signal?.addEventListener("abort", () => reject(controls.signal?.reason), {
+						once: true,
+					});
+					parent.abort(new Error("publisher deadline"));
+				});
+			},
+		);
+		await expect(
+			run(["api", "source"], { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 }),
+		).rejects.toThrow("publisher deadline");
+		expect(entered).toBe(true);
+		entered = false;
+		await expect(run(["api", "source"], { timeoutMs: 30_000 })).rejects.toThrow();
+		expect(entered).toBe(false);
+	});
+});
+
+describe("published recovery component mode forwarding", () => {
+	test.each([
+		"index",
+		"publish",
+	] as const)("%s CLI forwards the correct readiness mode at every publication recheck", async (command) => {
+		const original = { tag: "v0.9.0", version: "0.9.0", runId: 45, runAttempt: 2 };
+		const seen: { requireAlreadyPublished?: boolean; publish: boolean }[] = [];
+		const stop = new Error("verified mode forwarding");
+		// Execute the actual dispatcher in a fresh VM; only external boundaries are mocked.
+		// This avoids persistent module mocks and any real GitHub, git or filesystem writes.
+		const context = {
+			argv:
+				command === "index"
+					? ["index", "--plan=plan.json", "--publish=true"]
+					: [command, "--tag=v0.9.0", "--source-run-id=45", "--bundle-dir=bundle"],
+			parseCiReleaseArgs,
+			timeReleasePhase: (_phase: string, _details: unknown, operation: () => unknown) =>
+				operation(),
+			AbortController,
+			process: {
+				cwd: () => root,
+				env: { PUBLISH_REQUESTED: "true" },
+				once: () => {},
+				removeListener: () => {},
+			},
+			ciPublicationDeadlineSignal: (_env: unknown, signal: AbortSignal) => signal,
+			createPublicationGhRunner: () => async () => "",
+			createCiReleaseGhRunner: () => async () => "",
+			runGh: async () => "",
+			required: (values: Record<string, string>, name: string) => values[name],
+			positiveId: Number,
+			resolve,
+			join,
+			readPlan: async () => original,
+			assertPrimaryReleaseCheckout: () => {},
+			resolveUpdateServerBridgeConfig: () => ({ serverUrl: "https://fixture.invalid" }),
+			restoreCiReleaseBundle: async () => ({ plan: original }),
+			verifyReleaseBundle: async () => ({ plan: original }),
+			hashReleaseFile: async () => ({ sha256: "a".repeat(64) }),
+			preparePublishedUpdateIndexRelease: async () => ({}),
+			revalidateCiReleasePlan: async (
+				value: unknown,
+				options: { requireAlreadyPublished?: boolean; publish: boolean },
+			) => {
+				seen.push(options);
+				if (command !== "index" || seen.length === 2) throw stop;
+				return value;
+			},
+		};
+		await expect(runInNewContext(`(${runCiRelease.toString()})(argv)`, context)).rejects.toBe(stop);
+		expect(seen).toHaveLength(command === "index" ? 2 : 1);
+		for (const options of seen) {
+			expect(options.publish).toBe(true);
+			expect(options.requireAlreadyPublished).toBe(command !== "publish");
+		}
+	});
+	test.each([
+		"index",
+	] as const)("%s-only preflight forwards recovery mode without changing publication authorization", async (mode) => {
+		let seen: { indexOnly?: boolean; mirrorOnly?: boolean; publish: boolean } | undefined;
+		const stop = new Error("verified preflight mode");
+		await expect(
+			runInNewContext(`(${runCiRelease.toString()})(argv)`, {
+				argv: ["preflight", "--tag=v0.9.0", "--publish=true", `--${mode}-only=true`],
+				parseCiReleaseArgs,
+				timeReleasePhase: (_phase: string, _details: unknown, operation: () => unknown) =>
+					operation(),
+				AbortController,
+				process: { cwd: () => root, env: {}, once: () => {}, removeListener: () => {} },
+				runGh: async () => "",
+				createCiReleaseGhRunner: () => async () => "",
+				required: (values: Record<string, string>, name: string) => values[name],
+				assertBridgeMode: () => {},
+				validateBuildRecoveryArgs,
+				createCiReleasePlan: async (options: typeof seen) => {
+					seen = options;
+					throw stop;
+				},
+			}),
+		).rejects.toBe(stop);
+		expect(seen?.publish).toBe(true);
+		expect(seen?.indexOnly).toBe(mode === "index");
+		expect(seen?.mirrorOnly).toBeUndefined();
+	});
+});
+
 describe("release workflow safety", () => {
 	test("release entry points and imported helpers survive an ordinary fresh clone", () => {
 		const paths = [
@@ -91,6 +239,8 @@ describe("release workflow safety", () => {
 			"scripts/lib/build-repository.ts",
 			"scripts/lib/update-index.ts",
 			"scripts/lib/update-index-github.ts",
+			"scripts/lib/ci-publication-runtime.ts",
+			"scripts/lib/publication-receipt.ts",
 			...new Bun.Glob("scripts/lib/ci-{release,build}-*.ts").scanSync({ cwd: root }),
 		];
 		const result = spawnSync("git", ["check-ignore", "--no-index", "--", ...paths], {
@@ -111,12 +261,9 @@ describe("release workflow safety", () => {
 			default: false,
 		});
 		expect(Object.keys(release.on.workflow_dispatch?.inputs ?? {}).sort()).toEqual([
-			"bridge_run_attempt",
-			"bridge_run_id",
 			"build_run_attempt",
 			"build_run_id",
 			"index_only",
-			"mirror_only",
 			"publish",
 			"smoke_target",
 			"source_run_id",
@@ -393,9 +540,6 @@ describe("original build native re-verification", () => {
 			{ "build-run-id": "9007199254740992" },
 			{ "source-run-id": "34" },
 			{ "index-only": "true" },
-			{ "mirror-only": "true" },
-			{ "bridge-run-id": "34" },
-			{ "bridge-run-attempt": "1" },
 			{ publish: "true" },
 			{ "smoke-target": "windows-x86" },
 		];

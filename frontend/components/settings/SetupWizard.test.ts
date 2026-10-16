@@ -133,35 +133,39 @@ describe("setup wizard step order and gating", () => {
 });
 
 describe("setup wizard provider readiness", () => {
-	test("counts credentialed providers without requiring cached models", () => {
-		expect(
-			countConfiguredProviders({
-				customApiProviders: [
-					{
-						id: "gemini",
-						prefix: "gemini",
-						apiKey: "key",
-						protocol: "gemini-compatible",
-					},
-				],
-				nugProviders: [{ id: "nug", prefix: "nug", apiKey: "key", baseUrl: "https://nug.example" }],
-				codexAvailable: true,
-				agent: { disabledProviders: [] },
-			}),
-		).toBe(3);
+	test("allows any registered provider to advance without a frontend allowlist or catalog", () => {
+		for (const prefix of ["tokendance", "codex", "future-provider", "plugin-provider"]) {
+			const providerCount = countConfiguredProviders({
+				providerReadiness: [{ id: `instance:${prefix}`, prefix, name: prefix, ready: true }],
+			});
+			expect(providerCount).toBe(1);
+			expect(
+				wizardNextBlockedReasonKey({
+					step: wizardStepIndex("provider"),
+					providerCount,
+					basicStepValid: false,
+				}),
+			).toBeNull();
+		}
 	});
 
-	test("ignores disabled or incomplete credentials", () => {
+	test("counts unique ready instances and ignores unready providers", () => {
+		const ready = { id: "api:first", prefix: "custom", name: "Custom", ready: true };
 		expect(
 			countConfiguredProviders({
-				customApiProviders: [
-					{ id: "disabled", prefix: "gemini", apiKey: "key", disabled: true },
-					{ id: "empty", prefix: "openai", apiKey: "" },
+				providerReadiness: [
+					ready,
+					ready,
+					{ ...ready, id: "api:second", prefix: "custom-two" },
+					{ ...ready, id: "api:disabled", ready: false },
 				],
-				nugProviders: [{ id: "nug", prefix: "nug", apiKey: "key", baseUrl: "" }],
-				codexAvailable: true,
-				agent: { disabledProviders: ["codex"] },
 			}),
-		).toBe(0);
+		).toBe(2);
+	});
+
+	test("does not advance before readiness is loaded", () => {
+		expect(countConfiguredProviders(undefined)).toBe(0);
+		expect(countConfiguredProviders({})).toBe(0);
+		expect(countConfiguredProviders({ providerReadiness: [] })).toBe(0);
 	});
 });

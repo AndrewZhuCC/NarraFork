@@ -11,6 +11,7 @@ import { describe, expect, it } from "bun:test";
 import { TREE_ROOT_KEY, type TreeChange } from "./tree-patch";
 import {
 	applyTreePatch,
+	buildTreeChangedPaths,
 	buildTreeLineStats,
 	emptyTreeState,
 	ingestChanges,
@@ -45,6 +46,17 @@ const changed = (path: string, kind: TreeChange["kind"] = "updated"): TreeChange
 	{ path, kind },
 ];
 
+describe("buildTreeChangedPaths", () => {
+	it("preserves changed files and ancestors without line measurements", () => {
+		expect([...buildTreeChangedPaths([{ path: "src/nested/a.ts" }, { path: "../bad" }])]).toEqual([
+			"src/nested/a.ts",
+			"src/nested",
+			"src",
+		]);
+		expect(buildTreeChangedPaths([]).size).toBe(0);
+	});
+});
+
 describe("buildTreeLineStats", () => {
 	it("indexes files and aggregates every ancestor directory", () => {
 		const stats = buildTreeLineStats([
@@ -59,6 +71,27 @@ describe("buildTreeLineStats", () => {
 		expect(stats.get("src")).toEqual({ added: 5, removed: 5 });
 		expect(stats.get("docs/readme.md")).toEqual({ added: 1, removed: 0 });
 		expect(stats.get("docs")).toEqual({ added: 1, removed: 0 });
+	});
+
+	it("hides unknown figures and all incomplete ancestors without losing known siblings", () => {
+		const stats = buildTreeLineStats([
+			{ path: "src/a.ts", linesAdded: 3, linesRemoved: 1 },
+			{ path: "src/nested/unknown.ts" },
+			{ path: "src/nested/known.ts", linesAdded: 2, linesRemoved: 0 },
+			{ path: "docs/a.md", linesAdded: 1, linesRemoved: 0 },
+			{ path: "bad.ts", linesAdded: Number.NaN, linesRemoved: 1 },
+		]);
+		expect(stats.get("src/a.ts")).toEqual({ added: 3, removed: 1 });
+		expect(stats.get("docs")).toEqual({ added: 1, removed: 0 });
+		for (const path of ["src", "src/nested", "src/nested/unknown.ts", "bad.ts"])
+			expect(stats.has(path)).toBe(false);
+		expect(buildTreeLineStats([{ path: "src/a.ts" }]).size).toBe(0);
+	});
+
+	it("keeps measured files but hides directory totals when the file list is incomplete", () => {
+		const stats = buildTreeLineStats([{ path: "src/a.ts", linesAdded: 3, linesRemoved: 0 }], false);
+		expect(stats.get("src/a.ts")).toEqual({ added: 3, removed: 0 });
+		expect(stats.has("src")).toBe(false);
 	});
 
 	it("ignores paths outside the tree instead of attaching them to a parent", () => {

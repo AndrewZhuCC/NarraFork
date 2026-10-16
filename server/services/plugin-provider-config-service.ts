@@ -159,6 +159,78 @@ export class PluginProviderConfigService {
 		return this.viewFor(this.registry.get(providerInstanceId) ?? entry);
 	}
 
+	/** Local readiness only: inspect secret presence, never read credentials or invoke plugins. */
+	async isConfigured(providerInstanceId: string, signal: AbortSignal): Promise<boolean> {
+		signal.throwIfAborted();
+		const entry = this.registry.get(providerInstanceId);
+		if (!entry || entry.kind !== "executable-plugin" || !entry.pluginId) return false;
+		const config = { ...this.registry.getConfig(providerInstanceId) };
+		const secretFields = new Set(secretFieldsOf(entry.configSchema));
+		// Legacy plain-text values and UI placeholders cannot stand in for vault presence.
+		for (const field of secretFields) delete config[field];
+		const required =
+			typeof entry.configSchema === "boolean" || !Array.isArray(entry.configSchema.required)
+				? []
+				: entry.configSchema.required;
+		const requiredSecrets = this.registry.requiredConfigSecretFields(
+			providerInstanceId,
+			secretFields,
+		);
+		for (const field of requiredSecrets) {
+			if (this.secretStore) {
+				let onAbort: (() => void) | undefined;
+				try {
+					const present = await Promise.race([
+						Promise.resolve(
+							this.secretStore.hasSecret({
+								pluginId: entry.pluginId,
+								key: providerSecretKey(entry.localId, field),
+							}),
+						),
+						new Promise<never>((_, reject) => {
+							onAbort = () => reject(signal.reason);
+							signal.addEventListener("abort", onAbort, { once: true });
+							if (signal.aborted) onAbort();
+						}),
+					]);
+					signal.throwIfAborted();
+					if (present) config[field] = SECRET_PLACEHOLDER;
+				} finally {
+					if (onAbort) signal.removeEventListener("abort", onAbort);
+				}
+			}
+		}
+		for (const field of required) {
+			if (typeof field !== "string" || secretFields.has(field)) continue;
+			if (
+				!Object.hasOwn(config, field) ||
+				config[field] === null ||
+				(typeof config[field] === "string" && !config[field].trim())
+			) {
+				return false;
+			}
+		}
+		signal.throwIfAborted();
+		// Plain config may have changed while a local vault lookup was pending.
+		const currentConfig = this.registry.getConfig(providerInstanceId);
+		for (const field of secretFields) {
+			delete currentConfig[field];
+			if (Object.hasOwn(config, field)) currentConfig[field] = config[field];
+		}
+		for (const field of required) {
+			if (typeof field !== "string" || secretFields.has(field)) continue;
+			if (
+				!Object.hasOwn(currentConfig, field) ||
+				currentConfig[field] === null ||
+				(typeof currentConfig[field] === "string" && !currentConfig[field].trim())
+			) {
+				return false;
+			}
+		}
+		return this.registry.validateConfigPresence(providerInstanceId, currentConfig, secretFields)
+			.valid;
+	}
+
 	/** Config for every provider a plugin contributes, safe to send to the UI. */
 	async list(pluginId: string): Promise<ProviderConfigView[]> {
 		const views: ProviderConfigView[] = [];

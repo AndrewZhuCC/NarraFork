@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import type { Root } from "react-dom/client";
-import type { GitWorkspace } from "../../shared/git-workspace";
+import type { GitWorkspace, GitWorkspaceSummary } from "../../shared/git-workspace";
 
 // Query's browser timer policy is decided at module load. Install the DOM before
 // importing the real QueryClient/hooks so these tests exercise actual scheduling.
@@ -55,18 +55,18 @@ mock.module("../lib/narrator-ws-manager", () => ({
 const { QueryClient, QueryClientProvider, useQuery } = await import("@tanstack/react-query");
 const { createRoot } = await import("react-dom/client");
 const { api, ApiError } = await import("../lib/api");
-const { useGitWorkspace } = await import("./useGit");
-
+const { useGitWorkspace, gitWorkspaceTarget } = await import("./useGit");
 const nativeSetInterval = globalThis.setInterval;
 const nativeClearInterval = globalThis.clearInterval;
 const intervals = new Map<ReturnType<typeof setInterval>, { delay: number; tick: () => void }>();
 let root: Root | undefined;
 let client: InstanceType<typeof QueryClient>;
 let container: HTMLElement;
-
-function workspace(state: GitWorkspace["state"]): GitWorkspace {
+let latest: ReturnType<typeof useGitWorkspace>;
+function workspace(state: GitWorkspace["state"] = "ready", branch?: string): GitWorkspace {
 	return {
 		state,
+		branch,
 		deviceId: "remote",
 		cwd: "/repo",
 		rootPath: state === "ready" ? "/repo" : null,
@@ -75,44 +75,61 @@ function workspace(state: GitWorkspace["state"]): GitWorkspace {
 		capabilities: { read: state === "ready", write: state === "ready" },
 	};
 }
-function Probe({ narratorId = "narrator" }: { narratorId?: string }) {
-	const query = useGitWorkspace(narratorId);
+function Probe({ narratorId }: { narratorId: string }) {
+	latest = useGitWorkspace(narratorId);
 	return (
-		<output data-layout-ready={String(query.layoutReady)} data-branch={query.data?.branch}>
-			{query.isError ? "error" : (query.data?.state ?? "pending")}
+		<output
+			data-layout-ready={String(latest.layoutReady)}
+			data-branch={latest.data?.branch}
+			data-authorized={String(!!gitWorkspaceTarget(narratorId, latest.data))}
+		>
+			{latest.isError ? "error" : (latest.data?.state ?? "pending")}
 		</output>
 	);
 }
 async function flush() {
 	for (let i = 0; i < 6; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
-async function mount(narratorId = "narrator", refreshSummary = true) {
-	root = createRoot(container);
-	root.render(
+function render(id: string) {
+	root?.render(
 		<QueryClientProvider client={client}>
-			<Probe narratorId={narratorId} />
+			<Probe narratorId={id} />
 		</QueryClientProvider>,
 	);
-	await flush();
-	// Authority-response scenarios explicitly invalidate fresh seeded summaries.
-	// The cold-mount test disables this to assert no redundant discovery request.
-	if (
-		refreshSummary &&
-		client.getQueryData<Record<string, unknown>>(["narrators", narratorId])?.gitSummary
-	) {
-		void client.invalidateQueries({ queryKey: ["gitWorkspace", narratorId] });
-		await flush();
-	}
 }
-
+async function mount(id = "narrator") {
+	root = createRoot(container);
+	render(id);
+	await flush();
+}
+function detail(id: string, revision = 3, state?: GitWorkspace["state"]) {
+	client.setQueryData(["narrators", id], {
+		id,
+		cwd: "/repo",
+		defaultDeviceId: "remote",
+		workspaceRevision: revision,
+		...(state
+			? { gitSummary: { revision, branch: `branch-${id}`, workspace: workspace(state) } }
+			: {}),
+	});
+}
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+const branch = () => container.querySelector("output")?.getAttribute("data-branch");
 beforeEach(() => {
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
 	client.setQueryDefaults(["narrators"], { gcTime: Infinity });
-	// Recovery scenarios represent an already loaded legacy detail without summary.
-	client.setQueryData(["narrators", "narrator"], { id: "narrator" });
+	client.setQueryDefaults(["settings"], { staleTime: Infinity });
+	client.setQueryData(["settings"], { git: { narratorDetectionDefaultEnabled: false } });
+	detail("narrator", 0);
+	spyOn(api, "getNarratorGitSummary").mockResolvedValue(null);
 	container = document.createElement("div");
 	document.body.appendChild(container);
-	// Control only interval ticks; leave React and Query notifications on real timers.
 	spyOn(globalThis, "setInterval").mockImplementation(((
 		callback: (...args: unknown[]) => void,
 		delay = 0,
@@ -133,7 +150,6 @@ afterEach(async () => {
 	root?.unmount();
 	root = undefined;
 	client.clear();
-	// React schedules passive unmount work; drain it before restoring the DOM.
 	await flush();
 	container.remove();
 	for (const timer of intervals.keys()) nativeClearInterval(timer);
@@ -147,31 +163,7 @@ afterAll(() => {
 	}
 });
 
-function seedSummary(id: string, revision = 3, state: GitWorkspace["state"] = "ready") {
-	client.setQueryData(["narrators", id], {
-		id,
-		cwd: "/repo",
-		defaultDeviceId: "remote",
-		workspaceRevision: revision,
-		gitSummary: { revision, branch: `branch-${id}`, workspace: workspace(state) },
-	});
-}
-function switchTo(id: string) {
-	root?.render(
-		<QueryClientProvider client={client}>
-			<Probe narratorId={id} />
-		</QueryClientProvider>,
-	);
-}
-function deferred<T>() {
-	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((done) => {
-		resolve = done;
-	});
-	return { promise, resolve };
-}
-
-describe("Git summary layout readiness", () => {
+describe("non-blocking Git summaries and operation authority", () => {
 	test("a 403 keeps the nested Git consumer mounted instead of retrying in a loop", async () => {
 		const stalled = deferred<GitWorkspace>();
 		let reads = 0;
@@ -181,7 +173,7 @@ describe("Git summary layout readiness", () => {
 		);
 		function Panel() {
 			const query = useGitWorkspace("narrator");
-			return query.layoutReady ? <Probe /> : <span>loading</span>;
+			return query.layoutReady ? <Probe narratorId="narrator" /> : <span>loading</span>;
 		}
 		root = createRoot(container);
 		root.render(
@@ -191,338 +183,355 @@ describe("Git summary layout readiness", () => {
 		);
 		await flush();
 		await flush();
-		expect(request).toHaveBeenCalledTimes(2);
+		expect(request).toHaveBeenCalledTimes(1);
 		expect(container.textContent).toBe("error");
 		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
 		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
 		expect(intervals.size).toBe(0);
 	});
-	test("cold detail discovery waits and its late summary never triggers a duplicate workspace GET", async () => {
-		client.removeQueries({ queryKey: ["narrators", "narrator"], exact: true });
-		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready"));
-		await mount("narrator", false);
+	test("disabled detection starts no Git reads, and manual opt-in controls both queries", async () => {
+		spyOn(localStorage, "getItem").mockReturnValue(null);
+		detail("disabled-detection");
+		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace());
+		const summary = spyOn(api, "getNarratorGitSummary").mockResolvedValue(null);
+		await mount("disabled-detection");
+		expect(latest.detectionEnabled).toBe(false);
 		expect(request).not.toHaveBeenCalled();
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
-		seedSummary("narrator");
+		expect(summary).not.toHaveBeenCalled();
+		expect(latest.layoutReady).toBe(true);
+		latest.setDetectionEnabled(true);
 		await flush();
-		expect(request).not.toHaveBeenCalled();
-		expect(container.textContent).toBe("ready");
+		expect(request).toHaveBeenCalledTimes(1);
+		expect(summary).toHaveBeenCalledTimes(1);
+		expect(latest.target).not.toBeNull();
+		latest.rememberCounts({ totalFiles: 3 });
+		latest.setDetectionEnabled(false);
+		await flush();
+		expect(latest.data).toBeUndefined();
+		expect(latest.authoritativeData).toBeUndefined();
+		expect(latest.displayCounts).toBeUndefined();
+		expect(request).toHaveBeenCalledTimes(1);
+		expect(summary).toHaveBeenCalledTimes(1);
+		expect(intervals.size).toBe(0);
 	});
-	test("a failed cold detail read still enables authoritative workspace recovery", async () => {
-		client.removeQueries({ queryKey: ["narrators", "narrator"], exact: true });
-		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready"));
-		await mount("narrator", false);
+	test("cold detail and slow Git never determine chat layout readiness", async () => {
+		client.removeQueries({ queryKey: ["narrators", "narrator"] });
+		const request = spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
+		await mount();
 		expect(request).not.toHaveBeenCalled();
+		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
+		detail("narrator");
+		await flush();
+		expect(request).toHaveBeenCalledTimes(1);
+		expect(container.textContent).toBe("pending");
+	});
+	test("summary endpoint paints a branch while the separate authoritative read waits", async () => {
+		detail("narrator");
+		const summary = deferred<GitWorkspaceSummary | null>();
+		spyOn(api, "getNarratorGitSummary").mockReturnValue(summary.promise);
+		const authority = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace").mockReturnValue(authority.promise);
+		await mount();
+		summary.resolve({ revision: 3, workspace: workspace(), branch: "summary" });
+		await flush();
+		expect(branch()).toBe("summary");
+		expect(gitWorkspaceTarget("narrator", latest.data)).toBeNull();
+		authority.resolve(workspace("ready", "authorized"));
+		await flush();
+		expect(branch()).toBe("authorized");
+		const target = gitWorkspaceTarget("narrator", latest.data);
+		expect(typeof target !== "string" && target?.canWrite).toBe(true);
+	});
+	test("legacy summaries are display hints, never seeds for operation queries", async () => {
+		detail("narrator", 3, "ready");
+		const probe = spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
+		await mount();
+		expect(branch()).toBe("branch-narrator");
+		expect(probe).toHaveBeenCalledTimes(1);
+		expect(gitWorkspaceTarget("narrator", latest.data)).toBeNull();
+	});
+	test("unsupported summary is not automatically probed", async () => {
+		detail("narrator", 3, "unsupported");
+		const request = spyOn(api, "getGitWorkspace");
+		await mount();
+		expect(container.textContent).toBe("unsupported");
+		expect(request).not.toHaveBeenCalled();
+	});
+	test("failed detail can still recover through the authoritative workspace read", async () => {
+		client.removeQueries({ queryKey: ["narrators", "narrator"] });
+		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace());
+		await mount();
 		client
 			.getQueryCache()
 			.find({ queryKey: ["narrators", "narrator"], exact: true })
-			?.setState({ status: "error", error: new Error("detail offline") });
+			?.setState({ status: "error", error: new Error("offline") });
 		await flush();
 		expect(request).toHaveBeenCalledTimes(1);
 		expect(container.textContent).toBe("ready");
-	});
-	test("null summary after temporary detail discovery failure recovers without focus or remount", async () => {
-		client.removeQueries({ queryKey: ["narrators", "narrator"], exact: true });
-		const request = spyOn(api, "getGitWorkspace")
-			.mockRejectedValueOnce(new ApiError("Temporary discovery failure", 503))
-			.mockResolvedValue(workspace("ready"));
-		await mount("narrator", false);
-		expect(request).not.toHaveBeenCalled();
-		client.setQueryData(["narrators", "narrator"], {
-			id: "narrator",
-			cwd: "/repo",
-			defaultDeviceId: null,
-			workspaceRevision: 0,
-			gitSummary: null,
-		});
-		await flush();
-		expect(request).toHaveBeenCalledTimes(1);
-		expect(container.textContent).toBe("error");
-		expect(intervals.size).toBe(1);
-		[...intervals.values()][0]?.tick();
-		await flush();
-		expect(request).toHaveBeenCalledTimes(2);
-		expect(container.textContent).toBe("ready");
-		expect(intervals.size).toBe(0);
-	});
-
-	test("a genuinely unsupported detail summary is not retried automatically", async () => {
-		seedSummary("narrator", 3, "unsupported");
-		const request = spyOn(api, "getGitWorkspace");
-		await mount("narrator", false);
-		expect(container.textContent).toBe("unsupported");
-		expect(request).not.toHaveBeenCalled();
-		expect(intervals.size).toBe(0);
-	});
-
-	test("a fresh same-version summary seeds cold mount without a duplicate workspace GET", async () => {
-		seedSummary("narrator");
-		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready"));
-		await mount("narrator", false);
-		expect(request).not.toHaveBeenCalled();
-		expect(container.textContent).toBe("ready");
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
-		void client.invalidateQueries({ queryKey: ["gitWorkspace", "narrator"] });
-		await flush();
-		expect(request).toHaveBeenCalledTimes(1);
-	});
-	test("same-version detail shows branch immediately while the authoritative probe waits", async () => {
-		seedSummary("narrator");
-		const pending = deferred<GitWorkspace>();
-		spyOn(api, "getGitWorkspace").mockReturnValue(pending.promise);
-		await mount();
-		expect(container.textContent).toBe("ready");
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
-		pending.resolve(workspace("not_git"));
-		await flush();
-		expect(container.textContent).toBe("not_git");
-		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
-	});
-	test.each([
-		"remote",
-		"local",
-	])("%s summaries accept executor or realpath-normalized directories", async (deviceId) => {
-		seedSummary("narrator");
-		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
-			...old,
-			cwd: "/host-or-symlink",
-			defaultDeviceId: deviceId,
-			gitSummary: {
-				revision: 3,
-				branch: "normalized",
-				workspace: { ...workspace("ready"), deviceId },
-			},
-		}));
-		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
-		await mount();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("normalized");
 	});
 	test.each([
 		"same",
 		"different-root",
 		"different-device",
 		"explicit-null",
-	])("branchless authoritative probe preserves summary labels only for the same worktree: %s", async (kind) => {
-		seedSummary("narrator");
-		const result = {
-			...workspace("ready"),
+	])("branchless authority preserves a label only for its exact worktree: %s", async (kind) => {
+		detail("narrator", 3, "ready");
+		spyOn(api, "getGitWorkspace").mockResolvedValue({
+			...workspace(),
 			...(kind === "different-root" ? { workspaceKey: "remote:/other", rootPath: "/other" } : {}),
 			...(kind === "different-device" ? { deviceId: "other" } : {}),
 			...(kind === "explicit-null" ? { branch: null } : {}),
-		};
-		spyOn(api, "getGitWorkspace").mockResolvedValue(result);
+		});
 		await mount();
-		expect(container.textContent).toBe("ready");
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe(
-			kind === "same" ? "branch-narrator" : null,
-		);
+		expect(branch()).toBe(kind === "same" ? "branch-narrator" : null);
 	});
-	test("execution context hydration at the same revision never replaces the query key", async () => {
-		seedSummary("narrator");
-		const pending = deferred<GitWorkspace>();
-		const request = spyOn(api, "getGitWorkspace").mockReturnValue(pending.promise);
+	test("executionContext hydration at the same revision does not replace query keys", async () => {
+		detail("narrator");
+		const request = spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
 		await mount();
 		const keys = client
 			.getQueryCache()
 			.findAll({ queryKey: ["gitWorkspace"] })
-			.map((query) => query.queryHash);
-		client.setQueryData(["workspaceContext", "narrator"], {
-			revision: 3,
-			contextKey: "loaded-context",
-		});
+			.map((q) => q.queryHash);
+		client.setQueryData(["workspaceContext", "narrator"], { revision: 3, contextKey: "hydrated" });
 		await flush();
 		expect(
 			client
 				.getQueryCache()
 				.findAll({ queryKey: ["gitWorkspace"] })
-				.map((query) => query.queryHash),
+				.map((q) => q.queryHash),
 		).toEqual(keys);
 		expect(request).toHaveBeenCalledTimes(1);
-		expect(container.textContent).toBe("ready");
-	});
-	test("a detail arriving after the pending probe supplies synchronous fallback", async () => {
-		seedSummary("narrator", 0);
-		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
-			...old,
-			gitSummary: null,
-		}));
-		const request = spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
-		await mount();
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
-		seedSummary("narrator", 0);
-		await flush();
-		expect(container.textContent).toBe("ready");
-		expect(request).toHaveBeenCalledTimes(1);
-	});
-	test("switching narrators ignores late responses from the previous panel", async () => {
-		seedSummary("first");
-		seedSummary("second");
-		const first = deferred<GitWorkspace>();
-		const second = deferred<GitWorkspace>();
-		spyOn(api, "getGitWorkspace").mockImplementation((id) =>
-			id === "first" ? first.promise : second.promise,
-		);
-		await mount("first");
-		switchTo("second");
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-second");
-		first.resolve({ ...workspace("ready"), branch: "late-first" });
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-second");
-	});
-	test("device change cannot borrow the previous summary", async () => {
-		seedSummary("narrator");
-		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
-		await mount();
-		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
-			...old,
-			defaultDeviceId: "changed",
-		}));
-		await flush();
-		expect(container.textContent).toBe("pending");
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
 	});
 	test.each([
 		"revision",
 		"cwd",
-	])("%s switch carries the previous workspace until the new context is probed", async (change) => {
-		seedSummary("narrator");
-		const probe = deferred<GitWorkspace>();
-		const request = spyOn(api, "getGitWorkspace").mockReturnValue(probe.promise);
-		await mount("narrator", false);
-		if (change === "revision")
-			client.setQueryData(["workspaceContext", "narrator"], { revision: 4, contextKey: "new" });
-		else
-			client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
-				...old,
-				cwd: "changed",
-				workspaceRevision: 4,
-			}));
+		"device",
+	])("%s switch clears old branch instead of carrying facts", async (kind) => {
+		detail("narrator", 3, "ready");
+		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
+		await mount();
+		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
+			...old,
+			...(kind === "revision"
+				? { workspaceRevision: 4 }
+				: kind === "cwd"
+					? { cwd: "/other" }
+					: { defaultDeviceId: "other" }),
+		}));
 		await flush();
-		// The switch window must not collapse the panel layout (NarratorPanel
-		// skeleton), and the carried branch is presentation-only…
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
-		expect(container.textContent).toBe("ready");
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
-		// …but the new context is still probed, and its answer replaces the carryover.
-		expect(request).toHaveBeenCalledTimes(1);
-		probe.resolve({ ...workspace("ready"), branch: "after-switch" });
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("after-switch");
+		expect(branch()).toBeNull();
+		expect(container.textContent).toBe("pending");
+		expect(latest.layoutReady).toBe(true);
 	});
-	test("a fresh detail summary upgrades the carried workspace before the probe lands", async () => {
-		seedSummary("narrator");
-		const probe = deferred<GitWorkspace>();
-		spyOn(api, "getGitWorkspace").mockReturnValue(probe.promise);
-		await mount("narrator", false);
-		client.setQueryData(["workspaceContext", "narrator"], { revision: 4, contextKey: "new" });
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
-		// The narrators detail refetch lands with a summary for the new revision.
+	test("late metadata that only completes the scope keeps the authorized workspace visible", async () => {
+		// Metadata without device yet: scope [3, "/repo", null].
 		client.setQueryData(["narrators", "narrator"], {
 			id: "narrator",
 			cwd: "/repo",
-			defaultDeviceId: "remote",
-			workspaceRevision: 4,
-			gitSummary: { revision: 4, branch: "branch-new", workspace: workspace("ready") },
+			workspaceRevision: 3,
 		});
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-new");
-		probe.resolve({ ...workspace("ready"), branch: "probed" });
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("probed");
-	});
-	test("switching narrators never carries the previous narrator's workspace", async () => {
-		seedSummary("first");
-		client.setQueryData(["narrators", "second"], { id: "second" });
-		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
-		await mount("first");
-		expect(container.textContent).toBe("ready");
-		switchTo("second");
-		await flush();
-		expect(container.textContent).toBe("pending");
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
-		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
-	});
-	test("list-only detail waits for layout but a non-Git summary does not reserve a row", async () => {
-		client.setQueryData(["narrators", "narrator"], { id: "narrator" });
-		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
+		const reprobe = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace")
+			.mockResolvedValueOnce(workspace("ready", "authorized"))
+			.mockReturnValue(reprobe.promise);
 		await mount();
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
-		seedSummary("narrator", 0, "not_git");
+		expect(branch()).toBe("authorized");
+		expect(gitWorkspaceTarget("narrator", latest.data)).not.toBeNull();
+		// The device arrives at the same revision: a completion, not a switch.
+		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
+			...old,
+			defaultDeviceId: "remote",
+		}));
 		await flush();
-		expect(container.textContent).toBe("not_git");
-		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
+		expect(api.getGitWorkspace).toHaveBeenCalledTimes(2);
+		expect(container.textContent).toBe("ready");
+		expect(branch()).toBe("authorized");
+		reprobe.resolve(workspace("ready", "reprobed"));
+		await flush();
+		expect(branch()).toBe("reprobed");
 	});
-	test("permission events discard summary sources before resetting pending workspace reads", async () => {
-		seedSummary("narrator");
-		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
+	test("a refusal is never carried into a completed scope", async () => {
+		client.setQueryData(["narrators", "narrator"], {
+			id: "narrator",
+			cwd: "/repo",
+			workspaceRevision: 3,
+		});
+		spyOn(api, "getGitWorkspace")
+			.mockResolvedValueOnce(workspace("access_denied"))
+			.mockReturnValue(deferred<GitWorkspace>().promise);
+		await mount();
+		expect(latest.accessDenied).toBe(true);
+		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
+			...old,
+			defaultDeviceId: "remote",
+		}));
+		await flush();
+		expect(latest.data).toBeUndefined();
+		expect(latest.accessDenied).toBe(true);
+	});
+
+	test("another narrator never inherits the old branch and late response", async () => {
+		detail("first", 3, "ready");
+		detail("second");
+		const first = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace").mockImplementation((id) =>
+			id === "first" ? first.promise : deferred<GitWorkspace>().promise,
+		);
+		await mount("first");
+		render("second");
+		await flush();
+		first.resolve(workspace("ready", "late-first"));
+		await flush();
+		expect(branch()).toBeNull();
+		expect(container.textContent).toBe("pending");
+	});
+	test.each([
+		401, 403,
+	])("HTTP %s clears branch/counts and does not use the ready summary", async (status) => {
+		detail("narrator", 3, "ready");
+		spyOn(api, "getGitWorkspace").mockRejectedValue(new ApiError("denied", status));
+		await mount();
+		expect(container.textContent).toBe("error");
+		expect(branch()).toBeNull();
+		expect(latest.displayCounts).toBeUndefined();
+	});
+	test("summary permission denial rejects a late authority response", async () => {
+		detail("narrator", 3, "ready");
+		const authority = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace").mockReturnValue(authority.promise);
+		spyOn(api, "getNarratorGitSummary").mockRejectedValue(new ApiError("denied", 403));
+		await mount();
+		authority.resolve(workspace("ready", "private-late"));
+		await flush();
+		expect(branch()).toBeNull();
+	});
+	test("access WS event clears seeds and rejects both old in-flight responses", async () => {
+		detail("narrator", 3, "ready");
+		const old = deferred<GitWorkspace>();
+		const next = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace").mockReturnValueOnce(old.promise).mockReturnValue(next.promise);
+		const oldSummary = deferred<GitWorkspaceSummary | null>();
+		spyOn(api, "getNarratorGitSummary")
+			.mockReturnValueOnce(oldSummary.promise)
+			.mockReturnValue(deferred<GitWorkspaceSummary | null>().promise);
 		await mount();
 		for (const listener of accessListeners) listener();
 		await flush();
-		expect(
-			client.getQueryData<Record<string, unknown>>(["narrators", "narrator"])?.gitSummary,
-		).toBeNull();
-		expect(container.textContent).toBe("pending");
-	});
-	test("a known denial blocks later detail summaries until an authoritative read succeeds", async () => {
-		seedSummary("narrator");
-		const request = spyOn(api, "getGitWorkspace").mockRejectedValue(new ApiError("denied", 403));
-		await mount();
-		seedSummary("narrator");
-		const recovery = deferred<GitWorkspace>();
-		request.mockReturnValue(recovery.promise);
-		void client.resetQueries({ queryKey: ["gitWorkspace"] });
+		old.resolve(workspace("ready", "private"));
+		oldSummary.resolve({ revision: 3, branch: "private", workspace: workspace() });
 		await flush();
-		expect(container.textContent).toBe("pending");
-		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
-		// An identical result still represents a new authority check, not the old seed.
-		recovery.resolve({ ...workspace("ready"), branch: "branch-narrator" });
-		await flush();
-		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
-	});
-	test("authoritative denial cannot reuse a ready summary", async () => {
-		seedSummary("narrator");
-		spyOn(api, "getGitWorkspace").mockRejectedValue(new ApiError("denied", 403));
-		await mount();
-		expect(container.textContent).toBe("error");
-		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
+		expect(branch()).toBeNull();
 	});
 });
 
-describe("unavailable Git workspace recovery", () => {
+describe("bounded presentation snapshot cache", () => {
+	test("hot revisit reuses same-scope branch and small counts while refreshing in background", async () => {
+		detail("first");
+		detail("second");
+		const probe = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready", "remembered"));
+		await mount("first");
+		latest.rememberCounts({ totalFiles: 10, linesAdded: 12, linesRemoved: 3 });
+		render("second");
+		await flush();
+		client.removeQueries({ queryKey: ["gitWorkspace", "first"] });
+		client.removeQueries({ queryKey: ["gitSummary", "first"] });
+		probe.mockReturnValue(deferred<GitWorkspace>().promise);
+		render("first");
+		await flush();
+		expect(branch()).toBe("remembered");
+		expect(latest.displayCounts).toEqual({ totalFiles: 10, linesAdded: 12, linesRemoved: 3 });
+		expect(gitWorkspaceTarget("first", latest.data)).toBeNull();
+	});
+	test("a lightweight status replaces remembered line counts and retains lower-bound metadata", async () => {
+		detail("first");
+		detail("second");
+		const probe = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready", "remembered"));
+		await mount("first");
+		latest.rememberCounts({ totalFiles: 10, linesAdded: 12, linesRemoved: 3 });
+		latest.rememberCounts({ totalFiles: 8, totalFilesExact: false });
+		render("second");
+		await flush();
+		client.removeQueries({ queryKey: ["gitWorkspace", "first"] });
+		client.removeQueries({ queryKey: ["gitSummary", "first"] });
+		probe.mockReturnValue(deferred<GitWorkspace>().promise);
+		render("first");
+		await flush();
+		expect(latest.displayCounts?.totalFiles).toBe(8);
+		expect(latest.displayCounts?.totalFilesExact).toBe(false);
+		expect(latest.displayCounts?.linesAdded).toBeUndefined();
+		expect(latest.displayCounts?.linesRemoved).toBeUndefined();
+	});
+	test("TTL removes a ten-minute-old snapshot", async () => {
+		detail("first");
+		detail("second");
+		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready", "old"));
+		await mount("first");
+		render("second");
+		await flush();
+		client.removeQueries({ queryKey: ["gitWorkspace", "first"] });
+		client.removeQueries({ queryKey: ["gitSummary", "first"] });
+		const now = Date.now();
+		spyOn(Date, "now").mockReturnValue(now + 10 * 60_000 + 1);
+		request.mockReturnValue(deferred<GitWorkspace>().promise);
+		render("first");
+		await flush();
+		expect(branch()).toBeNull();
+	});
+	test("cache retains at most sixteen narrators", async () => {
+		const request = spyOn(api, "getGitWorkspace").mockImplementation(async (id) =>
+			workspace("ready", id),
+		);
+		for (let i = 0; i < 17; i++) detail(`n${i}`);
+		await mount("n0");
+		for (let i = 1; i < 17; i++) {
+			render(`n${i}`);
+			await flush();
+		}
+		client.removeQueries({ queryKey: ["gitWorkspace"] });
+		client.removeQueries({ queryKey: ["gitSummary"] });
+		request.mockReturnValue(deferred<GitWorkspace>().promise);
+		render("n0");
+		await flush();
+		expect(branch()).toBeNull();
+		render("n15");
+		await flush();
+		expect(branch()).toBe("n15");
+	});
+	test("QueryClient principal changes clear presentation facts", async () => {
+		client.setQueryData(["auth", "me"], { id: "user-a" });
+		detail("first");
+		detail("second");
+		const request = spyOn(api, "getGitWorkspace").mockResolvedValue(
+			workspace("ready", "private-a"),
+		);
+		await mount("first");
+		render("second");
+		await flush();
+		client.removeQueries({ queryKey: ["gitWorkspace"] });
+		client.removeQueries({ queryKey: ["gitSummary"] });
+		client.setQueryData(["auth", "me"], { id: "user-b" });
+		request.mockReturnValue(deferred<GitWorkspace>().promise);
+		render("first");
+		await flush();
+		expect(branch()).toBeNull();
+	});
+});
+
+describe("unavailable workspace recovery", () => {
 	test.each([
 		"device_offline",
 		"missing_directory",
 		"not_git",
 		"git_unavailable",
-	] as const)("re-probes %s automatically and stops polling once ready", async (state) => {
+	] as const)("re-probes %s without remount and stops once ready", async (state) => {
 		const request = spyOn(api, "getGitWorkspace")
 			.mockResolvedValueOnce(workspace(state))
-			.mockResolvedValue(workspace("ready"));
+			.mockResolvedValue(workspace());
 		await mount();
 		expect(container.textContent).toBe(state);
-		expect(request).toHaveBeenCalledTimes(1);
 		expect(intervals.size).toBe(1);
-		const [timer] = [...intervals.values()];
-		expect(timer?.delay).toBe(30_000);
-		timer?.tick();
-		await flush();
-		expect(request).toHaveBeenCalledTimes(2);
-		expect(container.textContent).toBe("ready");
-		expect(intervals.size).toBe(0);
-	});
-	test.each([
-		new Error("network offline"),
-		new ApiError("unavailable", 503),
-	])("recovers an initial transport failure without manual invalidation: %s", async (error) => {
-		const request = spyOn(api, "getGitWorkspace")
-			.mockRejectedValueOnce(error)
-			.mockResolvedValue(workspace("ready"));
-		await mount();
-		expect(container.textContent).toBe("error");
-		expect(intervals.size).toBe(1);
+		expect([...intervals.values()][0]?.delay).toBe(30_000);
 		[...intervals.values()][0]?.tick();
 		await flush();
 		expect(request).toHaveBeenCalledTimes(2);
@@ -530,22 +539,34 @@ describe("unavailable Git workspace recovery", () => {
 		expect(intervals.size).toBe(0);
 	});
 	test.each([
-		"ready",
-		"access_denied",
-		"unsupported",
-	] as const)("does not poll %s workspaces", async (state) => {
-		spyOn(api, "getGitWorkspace").mockResolvedValue(workspace(state));
-		await mount();
-		expect(container.textContent).toBe(state);
-		expect(intervals.size).toBe(0);
-	});
-	test.each([401, 403, 404])("does not retry HTTP %s denials", async (status) => {
-		spyOn(api, "getGitWorkspace").mockRejectedValue(new ApiError("denied", status));
+		new Error("offline"),
+		new ApiError("offline", 503),
+	])("recovers transport errors", async (error) => {
+		const request = spyOn(api, "getGitWorkspace")
+			.mockRejectedValueOnce(error)
+			.mockResolvedValue(workspace());
 		await mount();
 		expect(container.textContent).toBe("error");
+		[...intervals.values()][0]?.tick();
+		await flush();
+		expect(request).toHaveBeenCalledTimes(2);
+		expect(container.textContent).toBe("ready");
+	});
+	test.each([401, 403, 404])("does not poll HTTP %s", async (status) => {
+		spyOn(api, "getGitWorkspace").mockRejectedValue(new ApiError("denied", status));
+		await mount();
 		expect(intervals.size).toBe(0);
 	});
-	test("releases the recovery interval on unmount", async () => {
+	test.each([
+		"ready",
+		"unsupported",
+		"access_denied",
+	] as const)("does not poll %s", async (state) => {
+		spyOn(api, "getGitWorkspace").mockResolvedValue(workspace(state));
+		await mount();
+		expect(intervals.size).toBe(0);
+	});
+	test("unmount releases recovery intervals", async () => {
 		spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("device_offline"));
 		await mount();
 		expect(intervals.size).toBe(1);
@@ -553,10 +574,10 @@ describe("unavailable Git workspace recovery", () => {
 		root = undefined;
 		expect(intervals.size).toBe(0);
 	});
-	test("does not probe without a narrator", async () => {
+	test("missing narrator never starts discovery", async () => {
 		const request = spyOn(api, "getGitWorkspace");
 		await mount("");
 		expect(request).not.toHaveBeenCalled();
-		expect(intervals.size).toBe(0);
+		expect(latest.layoutReady).toBe(true);
 	});
 });

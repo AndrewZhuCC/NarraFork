@@ -6,6 +6,7 @@ import { useCommentDrafts } from "../comment-draft-store";
 import { resolveComposerActionSlot } from "./composer-action-slot";
 import { NarratorComposer, type NarratorComposerHandle } from "./NarratorComposer";
 import { type QueueMode, SendOptionsSplitButton } from "./SendOptionsSplitButton";
+import { StableActionLabel } from "./StableActionLabel";
 
 export interface NarratorComposerRowProps {
 	// Core refs
@@ -97,6 +98,9 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 	const hasInput = props.composerHasText || commentDrafts.length > 0;
 	const hasAttachments = props.composerHasAttachments;
 	const sendLabel = props.isActive ? t(`queueMode_${props.enterQueueMode}`) : tc("send");
+	const idleCandidates = [tc("send"), t("retry"), t("continue")];
+	const stableIdleLabel = (label: string) =>
+		props.isActive ? label : <StableActionLabel label={label} candidates={idleCandidates} />;
 
 	// Wrap a primary button as the right segment of the split send-options control
 	const withSendOptions = (
@@ -188,7 +192,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		if (showRetry) {
 			return withSendOptions(
 				<Button key="retry" onClick={props.onRetry}>
-					{t("retry")}
+					{stableIdleLabel(t("retry"))}
 				</Button>,
 			);
 		}
@@ -197,7 +201,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		if (showContinue) {
 			return withSendOptions(
 				<Button key="continue" onClick={props.onContinue}>
-					{t("continue")}
+					{stableIdleLabel(t("continue"))}
 				</Button>,
 			);
 		}
@@ -212,7 +216,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 					loading={props.isSending}
 				>
 					{!props.isActive
-						? sendLabel
+						? stableIdleLabel(sendLabel)
 						: props.queuedMessagesCount > 0
 							? `${t("queue")} (${props.queuedMessagesCount})`
 							: t("queue")}
@@ -263,7 +267,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 								}}
 							/>
 						)}
-						<span style={{ position: "relative" }}>{sendLabel}</span>
+						<span style={{ position: "relative" }}>{stableIdleLabel(sendLabel)}</span>
 					</Button>
 				</Tooltip>,
 			);
@@ -277,7 +281,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				disabled={!hasInput && !hasAttachments}
 				loading={props.isSending}
 			>
-				{sendLabel}
+				{stableIdleLabel(sendLabel)}
 			</Button>,
 		);
 	};

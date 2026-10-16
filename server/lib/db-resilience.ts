@@ -254,52 +254,90 @@ export function recoverWithCli(dbPath: string): boolean {
 }
 
 /**
- * Refresh the query planner's statistics.
- *
- * `PRAGMA optimize` is cheap: it only re-runs ANALYZE on tables whose stats have gone
- * stale since the last run (or are missing), so it's safe to call at startup and on a
- * timer. Stale stats on large tables (e.g. narrator_messages / api_requests) can push
- * the planner toward the wrong index; keeping them fresh avoids that without a full
- * ANALYZE scan. `analysis_limit` bounds the work per index so a huge table can't turn
- * this into a long main-thread stall (bun:sqlite is synchronous).
+ * Refresh planner statistics with a bounded sample per index.
+ * This is still synchronous: sampling is not a wall-time or I/O budget, so record
+ * its actual duration instead of assuming multi-GB databases are always cheap.
  */
-export function optimizeDatabase(sqlite: Database): void {
+export function optimizeDatabase(
+	sqlite: Database,
+	context: { source?: string; tick?: number } = {},
+): void {
+	const operation = "PRAGMA optimize";
+	const startedAt = new Date().toISOString();
+	logger.info("SQLite maintenance started", { operation, ...context, startedAt });
+	const started = performance.now();
+	let success = false;
 	try {
-		// Cap rows sampled per index so optimize stays fast even on multi-GB tables.
 		sqlite.run("PRAGMA analysis_limit = 1000");
 		sqlite.run("PRAGMA optimize");
+		success = true;
 	} catch (err) {
-		logger.warn("PRAGMA optimize failed", { error: String(err) });
+		logger.warn("PRAGMA optimize failed", { error: String(err), ...context });
+	} finally {
+		const durationMs = Math.round((performance.now() - started) * 100) / 100;
+		const log = durationMs >= 100 || !success ? logger.warn : logger.info;
+		log("SQLite maintenance completed", {
+			operation,
+			...context,
+			startedAt,
+			durationMs,
+			analysisLimit: 1000,
+			success,
+		});
 	}
 }
 
 /** How often the periodic WAL/statistics upkeep runs. */
 export const WAL_UPKEEP_INTERVAL_MS = 5 * 60 * 1000;
 
-/**
- * One tick of the periodic upkeep: checkpoint the WAL so it cannot grow unbounded, and refresh
- * planner statistics every sixth tick (~30 min).
- *
- * Split out from {@link startWalCheckpointInterval} so the SQLite lifecycle adapter can hand the
- * tick body to the caller that owns the timer. That ownership matters: the timer must live in
- * hot-reload-safe state (`hotTimer`), otherwise every Bun `--hot` cycle leaves the previous
- * interval running against the same connection.
- *
- * Never throws — a failed checkpoint is a hardening step, not a correctness requirement, and an
- * unhandled throw inside a timer callback would take the process down.
- */
+/** Best-effort five-minute checkpoint; every sixth tick also refreshes statistics. */
 export function createWalUpkeepTick(sqlite: Database): () => void {
 	let ticks = 0;
 	return () => {
+		const tick = ++ticks;
+		const operation = "wal_checkpoint(PASSIVE)";
+		const startedAt = new Date().toISOString();
+		logger.info("SQLite maintenance started", {
+			operation,
+			source: "periodic",
+			tick,
+			startedAt,
+		});
+		const started = performance.now();
+		let success = false;
+		let result: { busy: number; log: number; checkpointed: number } | null = null;
 		try {
-			sqlite.run("PRAGMA wal_checkpoint(PASSIVE)");
+			result = sqlite
+				.query<{ busy: number; log: number; checkpointed: number }, []>(
+					"PRAGMA wal_checkpoint(PASSIVE)",
+				)
+				.get();
+			success = true;
 		} catch (err) {
-			logger.warn("Periodic WAL checkpoint failed", { error: String(err) });
+			logger.warn("Periodic WAL checkpoint failed", { error: String(err), tick });
+		} finally {
+			const durationMs = Math.round((performance.now() - started) * 100) / 100;
+			const log = durationMs >= 100 || !success ? logger.warn : logger.info;
+			log("SQLite maintenance completed", {
+				operation,
+				source: "periodic",
+				tick,
+				startedAt,
+				durationMs,
+				success,
+				busy: result?.busy ?? null,
+				logPages: result?.log ?? null,
+				// SQLite returns the cumulative checkpoint position, not pages newly
+				// copied by this invocation. Never label this as per-call write volume.
+				checkpointedPagesTotal: result?.checkpointed ?? null,
+				remainingPages:
+					result && result.log >= 0 && result.checkpointed >= 0
+						? Math.max(0, result.log - result.checkpointed)
+						: null,
+			});
 		}
-		// Refresh planner stats less often than the checkpoint (every ~6th tick, ~30 min).
-		ticks++;
-		if (ticks % 6 === 0) {
-			optimizeDatabase(sqlite);
+		if (tick % 6 === 0) {
+			optimizeDatabase(sqlite, { source: "periodic", tick });
 		}
 	};
 }

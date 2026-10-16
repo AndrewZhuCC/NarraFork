@@ -365,6 +365,53 @@ async function cleanupFileContextNarrator(id: string) {
 	}
 }
 
+describe("owned request-end round accounting", () => {
+	test("multiple requests, retries, duplicate ends and child broadcasts do not lose or duplicate charges", async () => {
+		const parent = makeMainContext();
+		const child = makeSubagentContext();
+		const parentUsage: Array<TokenUsageSnapshot | undefined> = [];
+		const childUsage: Array<TokenUsageSnapshot | undefined> = [];
+		parent.accountRequestTokenUsage = (usage) => parentUsage.push(usage);
+		child.accountRequestTokenUsage = (usage) => childUsage.push(usage);
+		async function start(ctx: EventHandlerContext, requestId: string) {
+			await processEvent(
+				{ type: "api_request_start", requestId, provider: "anthropic", model: "test" },
+				ctx,
+			);
+		}
+		await start(parent, "round-tool");
+		const end = {
+			type: "api_request_end" as const,
+			requestId: "round-tool",
+			usage: { inputTokens: 1000, completionTokens: 100 },
+		};
+		// Concurrent duplicate ends must consume the in-flight ownership only once.
+		await Promise.all([processEvent(end, parent), processEvent(end, parent)]);
+		await start(parent, "round-retry");
+		await processEvent({ ...end, requestId: "round-retry", errorMessage: "retryable" }, parent);
+		await start(parent, "round-final");
+		await processEvent(
+			{ ...end, requestId: "round-final", usage: { inputTokens: 1100, completionTokens: 100 } },
+			parent,
+		);
+		await start(child, "round-child");
+		await processEvent({ ...end, requestId: "round-child" }, parent);
+		await processEvent({ ...end, requestId: "round-child" }, child);
+		await start(parent, "round-empty");
+		await processEvent({ type: "api_request_end", requestId: "round-empty" }, parent);
+		await processEvent({ ...end, requestId: "round-final" }, parent);
+		expect(parentUsage).toEqual([
+			end.usage,
+			end.usage,
+			{ inputTokens: 1100, completionTokens: 100 },
+			undefined,
+		]);
+		expect(childUsage).toEqual([end.usage]);
+		expect(parent.apiRequestsMap?.size).toBe(0);
+		expect(child.apiRequestsMap?.size).toBe(0);
+	});
+});
+
 describe("request occupancy is independent from billing and historical usage", () => {
 	test("real usage explicitly clears sticky estimate state in memory, WS and SSE", async () => {
 		let usage: TokenUsageSnapshot = { promptTokens: 42, inputTokens: 42, isEstimated: true };

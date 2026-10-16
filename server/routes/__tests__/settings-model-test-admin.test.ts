@@ -45,6 +45,44 @@ function appForRole(role: "admin" | "user") {
 }
 
 describe("settings availability stays lightweight", () => {
+	test("GET and PATCH expose readiness from an unknown registered provider", async () => {
+		const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
+		const original = structuredClone(settings);
+		const descriptor = { id: "future:instance", prefix: "future-api", name: "Future", ready: true };
+		let adapterCalls = 0;
+		const unregister = registerExternalProviderResolver({
+			resolve: () => {
+				adapterCalls++;
+				throw new Error("Readiness must not create adapters");
+			},
+			listReadiness: () => [descriptor],
+		});
+		try {
+			settings.agent.summaryModel = "";
+			const app = appForRole("admin");
+			const response = await app.request("http://localhost/settings");
+			expect(response.status).toBe(200);
+			expect((await response.json()).providerReadiness).toContainEqual(descriptor);
+			const saved = await app.request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ agent: { disabledProviders: [descriptor.prefix] } }),
+			});
+			expect(saved.status).toBe(200);
+			expect((await saved.json()).providerReadiness).toContainEqual({
+				...descriptor,
+				ready: false,
+			});
+			expect(adapterCalls).toBe(0);
+			unregister();
+			const removed = await app.request("http://localhost/settings");
+			expect((await removed.json()).providerReadiness).not.toContainEqual(descriptor);
+		} finally {
+			unregister();
+			saveSettings(original);
+		}
+	});
+
 	test("GET and summary-model PATCH never build a full Codex quota snapshot", async () => {
 		const { getCodexManager } = await import("../../lib/codex-manager");
 		const manager = getCodexManager();
@@ -458,6 +496,67 @@ describe("settings conditional admin guards", () => {
 					protocol: "gemini-compatible",
 				}),
 			]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test.each([
+		"generate-content",
+		"interactions",
+	] as const)("legacy Gemini %s settings preserve fingerprints through HTTP save and readback", async (geminiTransport) => {
+		const original = structuredClone(settings);
+		try {
+			const provider = {
+				id: "gemini-fingerprint",
+				name: "Gemini",
+				prefix: "gemini-fingerprint",
+				apiKey: "real-gemini-key",
+				baseUrl: "https://opencode.ai/inference/go/v1",
+				defaultModel: "gemini-2.5-flash",
+				geminiTransport,
+				userAgentMode: "custom" as const,
+				customUserAgent: "Gemini-Client/1",
+				extraHeaders: { "X-OpenCode-Session": "manual-session", "X-Test": "retained" },
+			};
+			const app = appForRole("admin");
+			const patch = (body: unknown) =>
+				app.request("/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(body),
+				});
+			expect((await patch({ geminiProviders: [provider] })).status).toBe(200);
+			for (const family of ["geminiProviders", "customApiProviders"] as const) {
+				expect(settings[family]?.find((entry) => entry.id === provider.id)).toMatchObject(provider);
+			}
+			const response = await app.request("/settings");
+			expect(response.status).toBe(200);
+			const saved = await response.json();
+			const legacy = saved.geminiProviders.find(
+				(entry: { id: string }) => entry.id === provider.id,
+			);
+			expect(legacy).toMatchObject({
+				userAgentMode: provider.userAgentMode,
+				customUserAgent: provider.customUserAgent,
+				extraHeaders: provider.extraHeaders,
+			});
+			expect(legacy.apiKey).not.toBe(provider.apiKey);
+			expect((await patch({ geminiProviders: saved.geminiProviders })).status).toBe(200);
+			expect(settings.customApiProviders?.find((entry) => entry.id === provider.id)).toMatchObject(
+				provider,
+			);
+			expect(
+				(
+					await patch({
+						openaiProviders: saved.openaiProviders,
+						anthropicProviders: saved.anthropicProviders,
+					})
+				).status,
+			).toBe(200);
+			expect(settings.geminiProviders?.find((entry) => entry.id === provider.id)).toMatchObject(
+				provider,
+			);
 		} finally {
 			saveSettings(original);
 		}

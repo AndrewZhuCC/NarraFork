@@ -1,24 +1,19 @@
 /**
- * Shared git status cache.
- *
- * Multiple narrators (and subagents) may share the same working directory.
- * Without coordination, each one independently runs `getStatusSummary`
- * (6 parallel git commands + untracked line-stat scans), which is wasteful
- * and can hammer the same `.git` on every file-change event.
- *
- * This cache is keyed by *normalized workspace path* and provides:
- *   - short-TTL caching of the last status result
- *   - in-flight de-duplication (concurrent callers share one git query)
- *   - explicit invalidation hooks for the watcher / tool execution
- *
- * It deliberately holds no chapter/narrator state — callers map a path to
- * subscribers themselves. Follows the main-thread performance rules: every
- * query is small, bounded, and short-lived.
+ * Short-TTL cache for legacy status consumers. The service-level query coordinator
+ * shares subprocesses with fresh management reads and owns cancellation/queue bounds.
+ * This layer caches only successful, non-invalidated results; each subscriber still
+ * goes through the coordinator so one HTTP disconnect cannot cancel other readers.
  */
 import { logger } from "../lib/logger";
 import { invalidateBoundaries } from "./git-commit-boundary-cache";
 import { gitDiscoveryCache } from "./git-discovery-cache";
-import { type GitStatusSummary, gitService } from "./git-service";
+import { type GitStatusSummary, gitService, withGitRequestContext } from "./git-service";
+import {
+	clearGitStatusQueries,
+	getLocalGitStatusQueryKey,
+	invalidateLocalGitStatusQueries,
+	localGitStatusScopesOverlap,
+} from "./git-status-query";
 import { normalizeWorkspacePath } from "./git-workspace";
 
 /** How long a cached status is considered fresh (ms). */
@@ -50,8 +45,10 @@ interface CacheEntry {
 	value: GitStatusSummary | null;
 	/** Epoch ms when `value` was produced. */
 	producedAt: number;
-	/** Shared in-flight promise so concurrent callers don't duplicate work. */
-	inflight: Promise<GitStatusSummary> | null;
+	/** Readers remain independent; the service coordinator shares their subprocess. */
+	pending: number;
+	/** An invalidated query must not repopulate the short-TTL cache. */
+	version: number;
 }
 
 /** Insertion-ordered, so the first key is the least recently used. */
@@ -60,15 +57,14 @@ const cache = new Map<string, CacheEntry>();
 /**
  * Evict least-recently-used entries until the cache is within its cap.
  *
- * An entry with a query in flight is never evicted: its promise is what concurrent callers
- * are waiting on, and dropping the entry would let the next caller start a second git
- * process for the same answer while the first is still running.
+ * Keep entries with active readers until they settle, so completion can publish into
+ * the same generation-checked cache slot. Subprocess sharing is handled below this cache.
  */
 function evictIfNeeded(): void {
 	if (cache.size <= MAX_ENTRIES) return;
 	for (const [key, entry] of cache) {
 		if (cache.size <= MAX_ENTRIES) return;
-		if (entry.inflight) continue;
+		if (entry.pending > 0) continue;
 		cache.delete(key);
 	}
 }
@@ -79,75 +75,44 @@ function touch(key: string, entry: CacheEntry): void {
 	cache.set(key, entry);
 }
 
-/**
- * Get a git status summary for `rawPath`, reusing a recent cached result or a
- * concurrent in-flight query when possible.
- *
- * @param rawPath  Filesystem path to pass to git (un-normalized).
- * @param opts.ttlMs  Override freshness window. Pass 0 to force a refresh.
- */
 export async function getStatusSummaryCached(
 	rawPath: string,
-	opts: { ttlMs?: number } = {},
+	opts: { ttlMs?: number; signal?: AbortSignal } = {},
 ): Promise<GitStatusSummary> {
-	const key = normalizeWorkspacePath(rawPath);
+	opts.signal?.throwIfAborted();
+	const key = getLocalGitStatusQueryKey(rawPath);
 	const ttl = opts.ttlMs ?? DEFAULT_TTL_MS;
-	const now = Date.now();
-
 	let entry = cache.get(key);
-
-	// Fresh cached value
-	if (entry?.value && ttl > 0 && now - entry.producedAt < ttl) {
+	if (entry?.value && ttl > 0 && Date.now() - entry.producedAt < ttl) {
 		touch(key, entry);
 		return entry.value;
 	}
-
-	// A query is already running — share it
-	if (entry?.inflight) {
-		return entry.inflight;
-	}
-
-	if (entry) {
-		// An expired entry that is about to be recomputed is still a USE of this key.
-		// Without the touch it keeps its old position, so a workspace being polled every
-		// 30 s could be evicted by one-off cold paths — the opposite of what the cap is for.
-		touch(key, entry);
-	} else {
-		entry = { value: null, producedAt: 0, inflight: null };
+	if (entry) touch(key, entry);
+	else {
+		entry = { value: null, producedAt: 0, pending: 0, version: 0 };
 		cache.set(key, entry);
 	}
 	const live = entry;
-
-	const inflight = gitService
-		.getStatusSummary(rawPath)
-		.then((summary) => {
+	const version = live.version;
+	live.pending++;
+	try {
+		// Each reader subscribes independently (especially its cancellation signal).
+		// gitService coordinates these with uncached REST/remote management reads.
+		const read = () => gitService.getStatusSummary(rawPath);
+		const summary = await (opts.signal ? withGitRequestContext(opts.signal, read) : read());
+		if (cache.get(key) === live && live.version === version) {
 			live.value = summary;
 			live.producedAt = Date.now();
-			return summary;
-		})
-		.catch((error) => {
-			// A failed query must not leave a polluted entry in the cache. Without this,
-			// `live.value` stays null / `producedAt` stays 0, making every subsequent caller
-			// see an expired entry and re-trigger git — a thundering-herd on a workspace
-			// whose git is broken or timing out. Deleting the entry lets the next caller
-			// start fresh with a clean slot (and hit the cold path, which is correct).
-			// Mirrors the pattern in git-commit-boundary-cache.ts.
-			logger.debug("Status query failed, evicting cache entry", {
-				workspacePath: key,
-				error: String(error),
-			});
-			cache.delete(key);
-			throw error;
-		})
-		.finally(() => {
-			live.inflight = null;
-			// Evicted after the query settles, never before: while `inflight` is set the
-			// entry is what concurrent callers are sharing.
-			evictIfNeeded();
-		});
-
-	live.inflight = inflight;
-	return inflight;
+		}
+		return summary;
+	} catch (error) {
+		logger.debug("Status query failed", { workspacePath: key, error: String(error) });
+		throw error;
+	} finally {
+		live.pending--;
+		if (live.pending === 0 && !live.value && cache.get(key) === live) cache.delete(key);
+		evictIfNeeded();
+	}
 }
 
 /**
@@ -155,7 +120,7 @@ export async function getStatusSummaryCached(
  * Returns null when nothing is cached.
  */
 export function peekStatusSummary(rawPath: string): GitStatusSummary | null {
-	return cache.get(normalizeWorkspacePath(rawPath))?.value ?? null;
+	return cache.get(getLocalGitStatusQueryKey(rawPath))?.value ?? null;
 }
 
 /**
@@ -176,12 +141,13 @@ export function invalidateStatus(rawPath: string): void {
 		(a, b) => normalizeWorkspacePath(a) === normalizeWorkspacePath(b),
 	);
 
-	const key = normalizeWorkspacePath(rawPath);
-	const entry = cache.get(key);
-	if (!entry) return;
-	// Keep any in-flight promise (its result is still wanted) but mark stale.
-	entry.value = null;
-	entry.producedAt = 0;
+	invalidateLocalGitStatusQueries(rawPath);
+	for (const [key, entry] of cache) {
+		if (!localGitStatusScopesOverlap(key, rawPath)) continue;
+		entry.version++;
+		entry.value = null;
+		entry.producedAt = 0;
+	}
 }
 
 /**
@@ -189,8 +155,8 @@ export function invalidateStatus(rawPath: string): void {
  *
  * `invalidateStatus` is not a substitute: it nulls the value but keeps the key, precisely
  * because the path is expected to come back. Once the directory is destroyed nothing can
- * read the entry again, so keeping the key leaks it (this Map is uncapped and each entry
- * holds up to 200 `GitStatusFile` records) for the process's lifetime.
+ * read the entry again, so keeping the key needlessly retains up to 200 file records
+ * until eventual LRU eviction.
  *
  * Called from the three places that destroy a worktree, alongside their existing
  * `worktreeTreeSnapshot.destroy` call for the same reason — a per-path resource that
@@ -203,6 +169,7 @@ export function invalidateStatus(rawPath: string): void {
  * so one `dropStatus` call at each site covers both caches.
  */
 export function dropStatus(rawPath: string): void {
+	invalidateLocalGitStatusQueries(rawPath);
 	invalidateBoundaries(rawPath);
 	gitDiscoveryCache.invalidate(
 		"local",
@@ -210,11 +177,14 @@ export function dropStatus(rawPath: string): void {
 		undefined,
 		(a, b) => normalizeWorkspacePath(a) === normalizeWorkspacePath(b),
 	);
-	cache.delete(normalizeWorkspacePath(rawPath));
+	for (const key of cache.keys()) {
+		if (localGitStatusScopesOverlap(key, rawPath)) cache.delete(key);
+	}
 }
 
 /** Clear the entire cache. Used on shutdown / test teardown. */
 export function clearStatusCache(): void {
+	clearGitStatusQueries();
 	cache.clear();
 }
 

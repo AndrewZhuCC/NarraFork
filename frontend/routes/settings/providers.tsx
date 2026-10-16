@@ -2,6 +2,7 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { isValidModelContextWindow } from "@shared/model-context-window";
 import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -523,7 +524,7 @@ function SettingsProvidersPage() {
 			// Also update the saved snapshot so dirty detection doesn't falsely trigger
 			const snap = savedSnapshot.current;
 			for (const [key, value] of Object.entries(windows)) {
-				if (!(key in snap.modelContextWindows)) {
+				if (isValidModelContextWindow(value) && !(key in snap.modelContextWindows)) {
 					snap.modelContextWindows[key] = value;
 				}
 			}
@@ -1020,7 +1021,7 @@ function SettingsProvidersPage() {
 			const key = `${prefix}:${id}`;
 			if (existing[key] != null) continue;
 			const def = getModelDefaultContextWindow(id);
-			if (def != null) additions[key] = def;
+			if (isValidModelContextWindow(def)) additions[key] = def;
 		}
 		if (Object.keys(additions).length === 0) return;
 

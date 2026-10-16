@@ -3,6 +3,7 @@ import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hotSafe } from "../hot-safe";
+import { logger } from "../logger";
 
 // === Limits ===
 
@@ -119,25 +120,73 @@ export function persistOutput(text: string): string {
 
 // === Cleanup ===
 
-function cleanup(): void {
-	let entries: string[];
+export function cleanupTruncatedOutputs(outputDir = OUTPUT_DIR): void {
+	const startedAt = new Date().toISOString();
+	logger.info("Truncated output cleanup started", { startedAt });
+	const started = performance.now();
+	let entries: string[] = [];
+	let scanned = 0;
+	let deleted = 0;
+	let deletedBytes = 0;
+	let errors = 0;
+	let directoryAvailable = false;
+	let readDirectoryMs = 0;
+	let statMs = 0;
+	let unlinkMs = 0;
 	try {
-		entries = readdirSync(OUTPUT_DIR);
-	} catch {
-		return;
-	}
-	const cutoff = Date.now() - RETENTION_MS;
-	for (const entry of entries) {
-		if (!entry.startsWith("tool_") && !entry.startsWith("toolcall_")) continue;
+		const readStarted = performance.now();
 		try {
-			const filepath = join(OUTPUT_DIR, entry);
-			const stat = statSync(filepath);
-			if (stat.mtimeMs < cutoff) {
-				unlinkSync(filepath);
-			}
+			entries = readdirSync(outputDir);
+			directoryAvailable = true;
 		} catch {
-			// ignore individual file errors
+			return;
+		} finally {
+			readDirectoryMs = performance.now() - readStarted;
 		}
+		const cutoff = Date.now() - RETENTION_MS;
+		for (const entry of entries) {
+			if (!entry.startsWith("tool_") && !entry.startsWith("toolcall_")) continue;
+			scanned++;
+			try {
+				const filepath = join(outputDir, entry);
+				const statStarted = performance.now();
+				let stat: ReturnType<typeof statSync>;
+				try {
+					stat = statSync(filepath);
+				} finally {
+					statMs += performance.now() - statStarted;
+				}
+				if (stat.mtimeMs < cutoff) {
+					const unlinkStarted = performance.now();
+					try {
+						unlinkSync(filepath);
+						deleted++;
+						deletedBytes += stat.size;
+					} finally {
+						unlinkMs += performance.now() - unlinkStarted;
+					}
+				}
+			} catch {
+				errors++;
+			}
+		}
+	} finally {
+		const round = (ms: number) => Math.round(ms * 100) / 100;
+		const durationMs = round(performance.now() - started);
+		const log = durationMs >= 100 ? logger.warn : logger.info;
+		log("Truncated output cleanup completed", {
+			startedAt,
+			durationMs,
+			directoryAvailable,
+			entries: entries.length,
+			scanned,
+			deleted,
+			deletedBytes,
+			errors,
+			readDirectoryMs: round(readDirectoryMs),
+			statMs: round(statMs),
+			unlinkMs: round(unlinkMs),
+		});
 	}
 }
 
@@ -148,8 +197,8 @@ export function initTruncateCleanup(): void {
 		() => ({}),
 	);
 	if (existing.timer) return;
-	cleanup(); // run once immediately
-	const timer = setInterval(cleanup, CLEANUP_INTERVAL_MS);
+	cleanupTruncatedOutputs(); // run once immediately
+	const timer = setInterval(cleanupTruncatedOutputs, CLEANUP_INTERVAL_MS);
 	// Don't block process exit.
 	if (timer && typeof timer === "object" && "unref" in timer) {
 		timer.unref();

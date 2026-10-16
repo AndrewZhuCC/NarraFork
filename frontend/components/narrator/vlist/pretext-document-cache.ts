@@ -34,6 +34,7 @@
  */
 
 import type { PretextDocumentInput } from "./pretext-document-loader";
+import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
 
 /** A restorable snapshot of one narrator's loaded document window. */
 export interface CachedPretextDocument {
@@ -81,12 +82,14 @@ interface CacheEntry {
 /**
  * A snapshot is only worth caching once it describes a real loaded window.
  *
- * An empty message list or a zero version means the initial load never finished
- * (or StrictMode is tearing down the throwaway first mount), and restoring that
- * would show an empty conversation while suppressing the fetch that fills it.
+ * An empty message list means the initial load never finished (or StrictMode is
+ * tearing down a throwaway mount). Version zero is a valid server revision for
+ * non-empty loaded windows, including shared fork prefixes; it is not a miss.
  */
 function isCacheable(input: PretextDocumentInput): boolean {
-	return input.messages.length > 0 && input.messageVersion > 0;
+	return (
+		input.messages.length > 0 && Number.isInteger(input.messageVersion) && input.messageVersion >= 0
+	);
 }
 
 /**
@@ -198,20 +201,21 @@ export function createPretextDocumentCache(
 }
 
 const sharedCache = createPretextDocumentCache();
+const unsubscribeSession = onPretextSessionChange(() => sharedCache.clear());
 
-export const peekCachedPretextDocument: PretextDocumentCache["peek"] = (narratorId) =>
-	sharedCache.peek(narratorId);
-export const writeCachedPretextDocument: PretextDocumentCache["write"] = (snapshot) =>
+export const peekCachedPretextDocument: PretextDocumentCache["peek"] = (narratorId) => {
+	pretextSessionEpoch();
+	return sharedCache.peek(narratorId);
+};
+export const writeCachedPretextDocument: PretextDocumentCache["write"] = (snapshot) => {
+	pretextSessionEpoch();
 	sharedCache.write(snapshot);
+};
 export const invalidateCachedPretextDocument: PretextDocumentCache["invalidate"] = (narratorId) =>
 	sharedCache.invalidate(narratorId);
 /**
- * Clear every cached document (tests, and any future in-page principal switch).
- *
- * NOT wired into logout, for two reasons: `useLogout` navigates with `window.location.href`, which tears down the
- * whole module graph including this cache, and the vlist isolation guard forbids
- * `useAuth` from statically importing anything under `vlist/`. If logout ever
- * becomes an in-page transition, this needs calling from a dynamic import there.
+ * Explicit test/reset entry point. Session changes already clear the cache through
+ * the token observer, without importing the lazy vlist graph from useAuth.
  */
 export const clearPretextDocumentCache: PretextDocumentCache["clear"] = () => sharedCache.clear();
 export const pretextDocumentCacheStats: PretextDocumentCache["stats"] = () => sharedCache.stats();
@@ -221,5 +225,8 @@ export const pretextDocumentCacheStats: PretextDocumentCache["stats"] = () => sh
 // nobody reads. Dropping the outgoing contents keeps the two from disagreeing; the
 // cost is one refetch, which is exactly what a cache miss already does.
 if (import.meta.hot) {
-	import.meta.hot.dispose(() => sharedCache.clear());
+	import.meta.hot.dispose(() => {
+		unsubscribeSession();
+		sharedCache.clear();
+	});
 }

@@ -99,6 +99,76 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 }
 
 describe("agentLoop reasoning-only dead turn", () => {
+	test("等待外部工作时首个纯 reasoning 回合直接 idle，不重试或压缩", async () => {
+		providerScenario = "reasoning_high_context_then_text";
+		providerAttempts = 0;
+		const events: AgentEvent[] = [];
+		let compactCalls = 0;
+		for await (const event of agentLoop(
+			makeConfig(new AbortController().signal, {
+				shouldIdleOnReasoningOnly: async () => true,
+				onReasoningOnlyHighContext: async () => {
+					compactCalls++;
+					return null;
+				},
+			}),
+			"wait for result",
+			[],
+		))
+			events.push(event);
+		expect(providerAttempts).toBe(1);
+		expect(compactCalls).toBe(0);
+		expect(events.some((event) => event.type === "stream_reset")).toBe(true);
+		expect(
+			events.some((event) => event.type === "retrying" || event.type === "invalid_state"),
+		).toBe(false);
+		expect(
+			events.some((event) => event.type === "assistant_message" || event.type === "block_complete"),
+		).toBe(false);
+		expect(events.at(-1)).toEqual({ type: "done", reason: "reasoning_only_idle" });
+	});
+
+	test("不满足 idle 条件时仍重试，正常文本不会查询 idle 条件", async () => {
+		providerScenario = "reasoning_then_text";
+		providerAttempts = 0;
+		let idleChecks = 0;
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			makeConfig(new AbortController().signal, {
+				shouldIdleOnReasoningOnly: () => {
+					idleChecks++;
+					return false;
+				},
+			}),
+			"do the thing",
+			[],
+		))
+			events.push(event);
+		expect(providerAttempts).toBe(2);
+		expect(idleChecks).toBe(1);
+		expect(events.at(-1)).toEqual({ type: "done" });
+	});
+
+	test("idle 检查期间被中断仍报告 Aborted", async () => {
+		providerScenario = "reasoning_forever";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			makeConfig(ac.signal, {
+				shouldIdleOnReasoningOnly: async () => {
+					ac.abort();
+					return true;
+				},
+			}),
+			"wait",
+			[],
+		))
+			events.push(event);
+		expect(providerAttempts).toBe(1);
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+	});
+
 	test("首回合纯 reasoning 死回合不入库，重发后产出正常文本", async () => {
 		providerScenario = "reasoning_then_text";
 		providerAttempts = 0;

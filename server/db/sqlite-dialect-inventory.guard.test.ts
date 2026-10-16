@@ -464,6 +464,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `getDbPath` (the PG branch acquires the same instance lock at the same path — the lock
 	// guards local resources, not the database file). Neither opens a SQLite connection.
 	"server/db/index.ts": ["drizzleDialect", "driver", "connectionModule"],
+	"server/db/resource-protection-index.ts": ["driver"],
+	"server/services/resource-protection-index.ts": ["driver", "handle"],
 	"server/db/integrity-check.ts": ["connectionModule", "sqliteCli"],
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
@@ -474,6 +476,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragmaFn",
 		"sqliteCatalog",
 		"insertOr",
+		// Bound the migration proof to the published trigger namespace; other triggers remain valid.
+		"glob",
 		// The `user_git_identities` backfill generates ids inside its INSERT…SELECT, the same
 		// way `narrator-service.ts` does for forked transcripts, rather than round-tripping
 		// every user row through JS during startup.
@@ -493,6 +497,14 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/routes/storage.ts": ["vacuum"],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
+	// History/display ports also have PG implementations. Register the SQLite branches
+	// and Database types without claiming these main-database modules are SQLite-only.
+	"server/services/agent-runtime/model-history-revision.ts": ["driver", "sqliteCatalog"],
+	"server/services/agent-runtime/model-history-source.ts": ["driver"],
+	"server/services/agent-runtime/model-history-query.ts": ["driver"],
+	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
+	"server/services/narrator-display-page-reader.ts": ["driver"],
+	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
@@ -526,8 +538,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
-	"server/services/narrator-messages.ts": ["json1", "glob"],
-	"server/services/narrator-persistence.ts": ["handle", "json1"],
+	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
+	"server/services/narrator-panel-state.ts": ["json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],
@@ -544,6 +557,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/export-rows.ts": ["driver"],
 	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
+	// Explicit SQLite branch of the dual-backend, off-thread historical accounting store.
+	"server/services/usage-token-repair-store.ts": ["driver", "pragma", "indexHint"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
 	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
@@ -573,7 +588,13 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/revert-planner-local-access.ts": ["json1"],
 	"server/services/revert-planner-service.ts": ["nativeClient"],
-	"server/services/revert-selection-service.ts": ["driver", "nativeClient", "rowid", "indexHint"],
+	"server/services/revert-selection-service.ts": [
+		"driver",
+		"nativeClient",
+		"rowid",
+		"indexHint",
+		"json1",
+	],
 	"server/services/revert-transaction-service.ts": ["nativeClient", "pragma", "sessionFn"],
 	"server/services/routine-service.ts": ["handle"],
 	// The whole search surface, in one file behind `services/search/port.ts`. NOT SQLite-only: a
@@ -617,7 +638,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/narrator-worktree-resources.ts": ["json1"],
 	"server/services/project-archive/legacy-import-worker.ts": [
 		"driver",
 		"connectionModule",

@@ -18,6 +18,7 @@ import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { hookAdminTool } from "./hook-admin";
+import { intelligentUiTool } from "./intelligent-ui";
 import { knowledgeLibraryTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
@@ -39,6 +40,7 @@ import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
+import { stopTool } from "./stop";
 import { structSedTool } from "./struct-sed";
 import { structViewTool } from "./struct-view";
 import { switchDeviceTool } from "./switch-device";
@@ -64,6 +66,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["IntelligentUI", intelligentUiTool],
 	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],
@@ -134,6 +137,7 @@ const coreProvider: ToolProvider = {
 			enterPlanModeTool,
 			exitPlanModeTool,
 			agentTool,
+			stopTool,
 			awaitTool,
 			contextAskTool,
 			sendTool,

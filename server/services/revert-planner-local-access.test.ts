@@ -1805,9 +1805,20 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		});
 		let held = false;
 		let execution: RevertTransactionExecution | undefined;
+		// The settling 409 is produced only after the cleanup budget elapses with IO still
+		// pending. Production's 30 s budget made this one case ~31 s of pure waiting; a 3 s
+		// budget exercises the identical path. The route caches its service across tests, so
+		// the original budget is restored in `finally`.
+		const CLEANUP_BUDGET_MS = 3_000;
+		let budgeted: { service: RevertTransactionService; original: unknown } | undefined;
 		const execute = RevertTransactionService.prototype.execute;
 		const executeObserver = spyOn(RevertTransactionService.prototype, "execute").mockImplementation(
 			function (this: RevertTransactionService, input) {
+				if (!budgeted) {
+					budgeted = { service: this, original: Reflect.get(this, "cleanupMs") };
+					expect(budgeted.original).toBe(30_000);
+					Reflect.set(this, "cleanupMs", CLEANUP_BUDGET_MS);
+				}
 				// Retain the real lifetime capability for cleanup; do not replace any
 				// request, executor, journal, restore operation or returned outcome.
 				execution = execute.call(this, input);
@@ -1858,7 +1869,11 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 			await execution?.whenSettled.catch(() => {});
 			guard.mockRestore();
 			executeObserver.mockRestore();
+			if (budgeted) Reflect.set(budgeted.service, "cleanupMs", budgeted.original);
 		}
+		// The shortened budget must actually have been applied, or this test silently
+		// went back to waiting the production 30 s.
+		expect(budgeted).toBeDefined();
 		const settled = await execution?.whenSettled;
 		expect(settled).toMatchObject({ status: "recovery_required", settling: false });
 		expect(history()).toBe(before);
@@ -1980,12 +1995,15 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 describe("production preview API and actual local evidence", () => {
 	test("real Write -> human editor -> Edit -> late human produces a prepared HTTP plan without applying", async () => {
 		const path = join(workspace, "combined.txt");
+		// A two-character marker can occur inside an unrelated random metadata ID.
+		// Use a body sentinel longer than those IDs without weakening the leak check.
+		const lateHumanBody = "LATE_HUMAN_FILE_BODY_MUST_NOT_LEAK_IN_METADATA";
 		const original = "A0\n1\n2\n3\n4\nH0\n5\n6\n7\n8\nB0\n";
 		await writeFile(path, original);
 		await write(path, original.replace("A0", "A1"));
 		await human(path, (await readFile(path, "utf8")).replace("H0", "H1"));
 		await edit(path, "B0", "B1");
-		await human(path, (await readFile(path, "utf8")).replace("H1", "H2"));
+		await human(path, (await readFile(path, "utf8")).replace("H1", lateHumanBody));
 		const before = history();
 		const disk = await readFile(path);
 		const plan = await prepared();
@@ -2006,14 +2024,14 @@ describe("production preview API and actual local evidence", () => {
 		expect(page.hasMore).toBe(false);
 		expect(page.items).toHaveLength(1);
 		expect((await bytes(page.items[0].desiredStateJson)).toString()).toBe(
-			original.replace("H0", "H2"),
+			original.replace("H0", lateHumanBody),
 		);
 		expect(await bytes(page.items[0].expectedStateJson)).toEqual(disk);
 		expect(await readFile(path)).toEqual(disk);
 		expect(history()).toBe(before);
 		expect(raw).not.toContain("contentJson");
 		expect(raw).not.toContain("executionReceiptJson");
-		expect(raw).not.toContain("H2");
+		expect(raw).not.toContain(lateHumanBody);
 		const repeated = await prepared();
 		expect(repeated.id).toBe(plan.id);
 	});

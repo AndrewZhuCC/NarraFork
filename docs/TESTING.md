@@ -60,7 +60,7 @@ bun server/index.ts --no-auto-resume
 
 - **Static checks**：SQLite 迁移资产检查、全仓 Biome、i18n 检查。
 - **Build and typecheck**：先构建前端（Vite 自动生成 `routeTree.gen.ts`），再运行 TypeScript。根目录测试导入 VS Code 扩展的类型接口，因此还需按 `vscode-extension/bun.lock` 安装该子项目的类型依赖。
-- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate` 和固定的 `--parallel=2`。Bun 按 `.github/test-timings.json` 中的历史文件耗时均衡分片、优先调度慢文件；它只是调度提示，不是文件清单，新增或缺少提示的测试仍由 Bun 自动发现。`scripts/run-ci-tests.ts` 有界校验后将提示独占复制到 `artifacts/ci-test-timings.json`，`--update-timings` 仅更新该片的 artifact；不写回仓库基线，不执行自建文件过滤，也不使用共享同文件状态的 `--concurrent`/`--no-isolate`。runner 原样转交白名单内 native 参数（仍兼容旧五参数），将 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，避免固定 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的运行时缺陷；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志、唯一命名的 JUnit 和耗时报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
+- **Tests (1/4…4/4)**：下载构建产物，验证测试 preload 的数据隔离，再使用 Bun 原生 `--shard=1/4` 至 `4/4` 执行完整测试集，每片均带 `--isolate` 和固定的 `--parallel=2`。Bun 按 `.github/test-timings.json` 中的历史文件耗时均衡分片、优先调度慢文件；它只是调度提示，不是文件清单，新增或缺少提示的测试仍由 Bun 自动发现。`scripts/run-ci-tests.ts` 有界校验后将提示独占复制到 `artifacts/ci-test-timings.json`，`--update-timings` 仅更新该片的 artifact；不写回仓库基线，不执行自建文件过滤，也不使用共享同文件状态的 `--concurrent`/`--no-isolate`。runner 原样转交白名单内 native 参数（仍兼容旧五参数），将 stdout/stderr 接到独占常规日志文件、由父进程有界分块转发，保留针对 Bun 1.4.2 隔离上下文 stdio sink 回收时误操作 `spawnSync` 私有 poll 的规避（当前固定 Bun 1.4.3，不假定升级已修复该缺陷）；不重试、不筛选测试、不改变单例时限，整片 watchdog 为 30 分钟、总日志预算 64MiB，取消和超限均失败。矩阵 `fail-fast: false`，保留各片失败、原始日志、唯一命名的 JUnit 和耗时报告，不设置 `continue-on-error`。正常结束时生成报告，失败也尝试上传；预检失败或超时可能没有报告，仍不能算通过。
 - **CI Gate**：只有以上任务全部成功才成功；失败、取消或跳过都不能变成通过。启用合并保护时选择该检查；仅增加 workflow 不会自动修改仓库保护规则。
 
 ### SQLite 历史资产
@@ -76,6 +76,48 @@ bun server/index.ts --no-auto-resume
 - 浏览器必须实际能够启动。设置 `NF_TEST_CHROMIUM_PATH`（前端 browser suites）和 `PUPPETEER_EXECUTABLE_PATH`（后端 browser pool），CI 启动 headless Chrome 探针，不能仅因浏览器缺失而算通过。
 - `dist/frontend/index.html` 必须存在，防止构建后 PWA/品牌测试因为没有产物而跳过。
 - 通用 CI 不启用 `PG_INTEGRATION`、`NF_PG_HARNESS_INTEGRATION`、`NF_REFERENCE_COST_PG_URL`、`NF_PROGRAMMATIC_TEST_IMAGE` 或 `NF_TASK_CHALLENGES_PODMAN` 等现有 opt-in。它们有独立的数据库/专用镜像前提，不代表已由默认门禁验收。无 opt-in 的真实 PG baseline 仍运行，不排除 `pg-*`、`integration`、`browser` 或 `e2e` 文件。
+
+### 预迁移 SQLite 模板
+
+`tests/preload.ts` 会用 `tests/sqlite-template.ts` 把一份已完成启动流程的数据库复制到隔离目录，再由 `@server/db` 照常执行完整启动（锁、标记、按哈希迁移、ensureColumns、回填、FTS），只是迁移已全部存在。此前每个导入数据库的测试文件都要重放约 200 条迁移（约 0.6–0.8s），4 vCPU 上占全仓时间的显著部分。
+
+- 缓存键是 `drizzle/*.sql`、`_journal.json`、`server/db/**/*.ts`（非测试）和 Bun 版本的内容哈希；任何改动都会生成新模板，不会复用旧结构。
+- 模板由子进程构建、写临时文件后原子 rename；并发 worker 要么看到完整模板，要么各自构建。构建失败自动回退为逐文件迁移。
+- 模板不带 clean-shutdown 标记，测试库仍走 unclean 启动分支；`tests/sqlite-template.test.ts` 守护这一点和缓存键。
+- 自行设置 `NARRAFORK_HOME` 的测试不受影响。`NF_TEST_SQLITE_TEMPLATE=0` 关闭模板，`NF_TEST_SQLITE_TEMPLATE_DIR` 改变模板目录（默认 `$TMPDIR/narrafork-test-templates`）。
+- 缓存键还包含 `tests/sqlite-template.ts`（构建配方）和 `bun.lock`（Drizzle/迁移器版本），改动任一都会重建模板。
+- preload 把结果记在 `testEnvironment.sqliteSeed`（`seeded` / `disabled` / `unavailable` / `explicit-home`）；守卫测试按这个结果断言，关闭或构建失败时不会误报。
+
+### 每例的空 schema 库
+
+需要“每个用例一个全新空库”的服务测试不要逐条回放 `sqlite_master` 里的约 550 条 DDL（每次 30–35ms）。改用 `tests/sqlite-schema-image.ts`：
+
+- `openSchemaCopyInMemory(isolatedTemplate)` 返回内存库；`openSchemaCopyAt(isolatedTemplate, path)` 写出文件后打开（文件必须不存在）。
+- 镜像每个进程只构建一次，定义集合与原先的回放查询相同（同样排除 FTS 表、不含任何行）。连接级 PRAGMA（WAL、synchronous、foreign_keys、busy_timeout）不在文件镜像里，调用方照旧在自己的句柄上设置。
+- `tests/sqlite-schema-image.test.ts` 守护：sqlite_master 定义、`user_version`/`application_id`、文件库 WAL PRAGMA 与逐条回放一致，且副本之间互不共享行。
+
+### 等待生产超时的用例
+
+单例耗时紧贴整秒（如 15.01s、30.9s）通常是在等一个生产超时或预算，而不是在干活。测的是“预算到期后的行为”时，用 spy 把真实函数包一层、只把预算参数调小，并断言 spy 确实被调用，避免缩短失效后悄悄退回长等待。已这样处理：`interruptAndWaitForIdle` 的 15s、`tryCaptureHot` 的 4s、`RevertTransactionService` 的 30s cleanup 预算。
+
+### Worker 线程的导入图
+
+每个 worker 线程都会重新求值自己的模块图。worker 入口只要间接导入了 `@server/lib/settings`，就会额外付出约 200ms（settings 会顺带校验 model catalog），线上每个任务也一样。worker 只需要纯函数时，导入不依赖 settings 的模块（例如 `encoding-core.ts`，不要用 `encoding.ts`）。
+
+### 本地复现 CI 的 CPU 受限条件
+
+公开仓库的 `ubuntu-24.04` runner 只有 4 vCPU，每片又以 `--parallel=2` 同时跑重型真实 IO 测试。本机多核时能过的时序假设，在这里常被饿死。复现时把每片绑定到 4 个核心：
+
+```sh
+taskset -c 0-3 bun test --isolate --only-failures --shard=3/4 --parallel=2 \
+  --timings=artifacts/ci-test-timings.json
+```
+
+只复现单个文件时，可以同时在相同核心上跑几个空转进程制造竞争。已确认的 CPU 受限型缺陷模式：
+
+- **零预算并不等于“一定进入后台”**：`tryCaptureHot({ budgetMs: 0 })` 的同一个零预算也会与之前的异步磁盘探测赛跑，负载高时直接返回 null 而不登记 warm-up。断言“正在进行的 warm-up”之前要先确认它确实存在（见 `worktree-tree-snapshot.test.ts` 的 `promoteToWarmup`）。
+- **夹具不要用同步子进程**：`Bun.spawnSync` 一旦不返回，会阻塞整个 worker，文件里剩余用例全部以 5s 超时 + `killed 1 dangling process` 失败，看起来像十几个无关回归。夹具用 `safeSpawn` 并设置 `timeout`。
+- **不要对随机 ID 做字符前缀断言**：nanoid 以某个字母开头的概率约 1/64，跑够次数必然失败。要断言“是新副本”，就和源 ID 比较。
 
 ### 测试耗时与准备复用
 

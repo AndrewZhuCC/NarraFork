@@ -30,7 +30,9 @@ import { generateId } from "../id";
 import { setOutboundFetchOverrideForTest } from "../net/outbound-fetch";
 import { settings } from "../settings";
 import { DEFAULT_UPDATE_SETTINGS } from "../settings/update-source";
-import { APP_VERSION } from "../version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -41,14 +43,14 @@ function deferred<T>() {
 }
 function manifest() {
 	return {
-		version: APP_VERSION,
+		version: EXECUTOR_VERSION,
 		protocolVersion: 1,
 		releasedAt: "2026-01-01T00:00:00Z",
 		platforms: Object.fromEntries(
 			EXECUTOR_PLATFORMS.map((platform) => [
 				platform,
 				{
-					filename: executorPublishedFilename(APP_VERSION, platform),
+					filename: executorPublishedFilename(EXECUTOR_VERSION, platform),
 					size: 256,
 					sha256: "a".repeat(64),
 				},
@@ -65,7 +67,12 @@ function selectSource(source: HelperSource) {
 	settings.update = {
 		...DEFAULT_UPDATE_SETTINGS,
 		...source,
-		...(source.source === "github" ? { githubRepository: source.repository } : {}),
+		githubRepository:
+			source.source === "github"
+				? source.repository
+				: source.serverUrl.includes("server-b")
+					? "fork/repo-b"
+					: "fork/repo-a",
 		proxy: { mode: "direct" },
 	};
 }
@@ -79,20 +86,22 @@ function sourceB(kind: "github" | "update-server"): HelperSource {
 		? { source: "github", repository: "fork/repo-b" }
 		: { source: "update-server", serverUrl: "https://server-b.example" };
 }
-function offlineFixture(source: HelperSource) {
-	const tag = source.source === "github" ? `executor-v${APP_VERSION}` : "legacy-tools";
-	const value =
-		source.source === "github"
-			? {
-					schemaVersion: 1,
-					repository: source.repository,
-					tag,
-					commit: "a".repeat(40),
-					manifest: manifest(),
-					licenses: [{ name: "LICENSE.txt", size: 10, sha256: "a".repeat(64) }],
-				}
-			: manifest();
-	const path = distribution.distributionPath(source, `${tag}\0${APP_VERSION}\0${1}\0manifest`);
+function offlineFixture(_source: HelperSource) {
+	const tag = `executor-v${EXECUTOR_VERSION}`;
+	const canonical = distribution.captureHelperSource();
+	if (canonical.source !== "github") throw new Error("Expected GitHub authority");
+	const value = {
+		schemaVersion: 1,
+		repository: canonical.repository,
+		tag,
+		commit: "a".repeat(40),
+		manifest: manifest(),
+		licenses: [{ name: "LICENSE.txt", size: 10, sha256: "a".repeat(64) }],
+	};
+	const path = distribution.distributionPath(
+		canonical,
+		`${tag}\0${EXECUTOR_VERSION}\0${1}\0manifest`,
+	);
 	writeFileSync(path, JSON.stringify(value));
 	return path;
 }

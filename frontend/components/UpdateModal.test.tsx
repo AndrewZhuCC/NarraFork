@@ -756,11 +756,7 @@ describe("UpdateModal saved source changes", () => {
 			initial: githubSettings,
 			next: { ...githubSettings, githubRepository: "FORK/Project" },
 		},
-		{
-			name: "server ignores GitHub repository",
-			initial: serverSettings,
-			next: { ...serverSettings, githubRepository: "another/project" },
-		},
+
 		{
 			name: "server URL normalization",
 			initial: serverSettings,
@@ -790,6 +786,11 @@ describe("UpdateModal saved source changes", () => {
 
 	test.each([
 		{ name: "source", initial: githubSettings, next: serverSettings },
+		{
+			name: "mirror repository",
+			initial: serverSettings,
+			next: { ...serverSettings, githubRepository: "another/project" },
+		},
 		{
 			name: "GitHub repository",
 			initial: githubSettings,

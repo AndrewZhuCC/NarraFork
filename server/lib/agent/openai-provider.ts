@@ -134,41 +134,62 @@ export function applyOpenAIModelMetadata(
 	assertModelInputModalities(model, body, metadata);
 }
 
-function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
-	if (typeof usage !== "object" || usage === null) return null;
-	const data = usage as Record<string, unknown>;
-	const details =
-		typeof data.output_tokens_details === "object" && data.output_tokens_details !== null
-			? (data.output_tokens_details as Record<string, unknown>)
-			: undefined;
-	const inputDetails =
-		typeof data.input_tokens_details === "object" && data.input_tokens_details !== null
-			? (data.input_tokens_details as Record<string, unknown>)
-			: undefined;
-	const numberValue = (...keys: string[]) => {
-		for (const key of keys) {
-			const value = data[key];
-			if (typeof value === "number") return value;
-		}
-		return undefined;
-	};
+/** Parsed stream events already carry disjoint counters; never subtract cache twice. */
+function parsedUsageToUsageData(
+	usage: NonNullable<ParsedStreamEvent["usage"]>,
+): NonNullable<GenerateMetaResult["usage"]> {
 	return {
-		inputTokens: numberValue("inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0,
-		outputTokens:
-			numberValue("completionTokens", "outputTokens", "completion_tokens", "output_tokens") ?? 0,
-		cachedInputTokens:
-			numberValue("cachedInputTokens", "cached_input_tokens") ??
-			(typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : 0),
-		cacheCreationInputTokens:
-			numberValue("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0,
-		cacheCreation5mInputTokens:
-			numberValue("cacheCreation5mTokens", "cache_creation_5m_tokens") ?? 0,
-		cacheCreation1hInputTokens:
-			numberValue("cacheCreation1hTokens", "cache_creation_1h_tokens") ?? 0,
-		reasoningTokens:
-			numberValue("reasoningTokens", "reasoning_tokens") ??
-			(typeof details?.reasoning_tokens === "number" ? details.reasoning_tokens : 0),
+		inputTokens: usage.inputTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
+}
+
+// The parser's tool map is created per request/attempt, including Codex WS.
+// Keep partial usage under the same lifetime instead of leaking it across retries.
+const openAIUsageState = new WeakMap<object, NonNullable<ParsedStreamEvent["usage"]>>();
+
+/** Merge reported counters first; derive net input only after cache updates. */
+function openAIUsageToParsedUsage(
+	usage: Parameters<typeof extractOpenAIUsage>[0],
+	request: object,
+): NonNullable<ParsedStreamEvent["usage"]> {
+	const merged = { ...openAIUsageState.get(request) };
+	const normalized = extractOpenAIUsage(usage);
+	const prompt = usage.input_tokens ?? usage.prompt_tokens;
+	// Relays can finish with a zero prompt placeholder and output-only accounting.
+	if (prompt != null && (prompt > 0 || merged.promptTokens == null)) {
+		merged.promptTokens = prompt;
+	}
+	if (usage.output_tokens != null || usage.completion_tokens != null) {
+		merged.completionTokens = normalized.outputTokens;
+	}
+	if (normalized.cachedInputTokens !== undefined) {
+		merged.cachedInputTokens = normalized.cachedInputTokens;
+	}
+	if (normalized.cacheCreationInputTokens !== undefined) {
+		merged.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+	}
+	if (
+		usage.output_tokens_details?.reasoning_tokens != null ||
+		usage.completion_tokens_details?.reasoning_tokens != null
+	) {
+		merged.reasoningTokens = normalized.reasoningTokens;
+	}
+	if (merged.promptTokens != null) {
+		merged.inputTokens = Math.max(
+			merged.promptTokens -
+				(merged.cachedInputTokens ?? 0) -
+				(merged.cacheCreationInputTokens ?? 0),
+			0,
+		);
+	}
+	openAIUsageState.set(request, merged);
+	return merged;
 }
 
 /** Resolve apiMode from provider config, with backward compat for the old `responsesApi` boolean. */
@@ -518,6 +539,21 @@ export interface OAIMessage {
 	}>;
 	/** Plain-text reasoning summary fallback when Responses API reasoning items cannot be replayed. */
 	_reasoningTextFallback?: string;
+}
+
+/**
+ * Thinking-mode Chat Completions relays (DeepSeek, GLM, Kimi, MiniMax, QwQ, …)
+ * reject a follow-up when any assistant message omits `reasoning_content`.
+ * Captured text is copied in by the caller; this only fills the gap with an
+ * empty string, which is what those APIs accept for a turn that produced none.
+ * Credential-strict models must not call this — the official API rejects the field.
+ */
+function ensureCompletionsReasoningContent(messages: OAIMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role === "assistant" && msg.reasoning_content == null) {
+			msg.reasoning_content = "";
+		}
+	}
 }
 
 export interface OAIToolCall {
@@ -1053,14 +1089,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (m._reasoningTextFallback !== undefined) {
 				delete m._reasoningTextFallback;
 			}
-			// Relay thinking models require reasoning_content on ALL assistant
-			// messages (not just those with tool_calls). When switching from a
-			// non-thinking model, historical messages lack this field — patch
-			// with empty string so the API doesn't reject the request.
-			if (!strict && m.role === "assistant" && m.reasoning_content == null) {
-				m.reasoning_content = "";
-			}
 		}
+		// Relay thinking models require reasoning_content on ALL assistant
+		// messages (not just those with tool_calls). When switching from a
+		// non-thinking model, historical messages lack this field — patch
+		// with empty string so the API doesn't reject the request.
+		if (!strict) ensureCompletionsReasoningContent(result.history);
 		return result;
 	}
 
@@ -1223,6 +1257,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		} else {
 			// Completions: POST /chat/completions
 			endpoint = `${baseUrl}/chat/completions`;
+			// Live tool loops replay pushAssistantTurn history instead of a fresh
+			// buildHistory. Thinking-mode relays reject that request unless every
+			// assistant message still carries reasoning_content.
+			if (!hasCredentialBoundReasoning(model)) {
+				ensureCompletionsReasoningContent(messages);
+			}
 			body = {
 				model,
 				messages,
@@ -1532,13 +1572,14 @@ export class OpenAIProvider implements ProviderAdapter {
 				}));
 			}
 			// Pass reasoning_content back for relay models that replay reasoning as
-			// plain text (DeepSeek, QwQ, GLM, Kimi…). Credential-strict models must
-			// not receive the field at all — the official API rejects it.
-			if (!this.isCredentialStrict() && reasoningBlocks?.length) {
-				const reasoningText = reasoningBlocks.map((b) => b.text).join("\n\n");
-				if (reasoningText) {
-					msg.reasoning_content = reasoningText;
-				}
+			// plain text (DeepSeek, QwQ, GLM, Kimi…). A tool-call turn that produced
+			// no reasoning text still needs the field — thinking mode 400s with
+			// "reasoning_content must be passed back" when it is absent. Credential-
+			// strict models must not receive the field at all.
+			if (!this.isCredentialStrict()) {
+				const reasoningText = reasoningBlocks?.map((b) => b.text).join("\n\n");
+				if (reasoningText) msg.reasoning_content = reasoningText;
+				ensureCompletionsReasoningContent([msg]);
 			}
 			h.push(msg);
 		}
@@ -1791,7 +1832,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			return {
 				text,
 				...(outputTruncated && { outputTruncated }),
-				usage: parsedUsageToUsageData(json.usage),
+				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
 			};
 		}
 
@@ -2234,11 +2275,11 @@ function createOpenAIApiError(response: Response, rawBody: string): ApiError {
 /** Parse a /responses JSON payload with a clearer error message. */
 function parseResponsesJson(raw: string): {
 	output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
-	usage?: unknown;
+	usage?: Parameters<typeof extractOpenAIUsage>[0];
 } {
 	return parseJsonWithPreview<{
 		output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
-		usage?: unknown;
+		usage?: Parameters<typeof extractOpenAIUsage>[0];
 	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 
@@ -2795,6 +2836,7 @@ async function* _parseResponsesAPIStream(
 
 export interface ResponsesAPIChunk {
 	type?: string;
+	usage?: Parameters<typeof extractOpenAIUsage>[0];
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	item?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: provider-native content part
@@ -3028,9 +3070,8 @@ export function parseResponsesAPIEvent(
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic gateway response may have usage at top level
-	const usage = chunk.response?.usage || (chunk as any).usage;
-	if (usage?.input_tokens != null) {
+	const usage = chunk.response?.usage ?? chunk.usage;
+	if (usage) {
 		logger.debug("OpenAI Responses API usage found", {
 			type,
 			inputTokens: usage.input_tokens,
@@ -3039,13 +3080,7 @@ export function parseResponsesAPIEvent(
 			cachedInputTokens: usage.input_tokens_details?.cached_tokens,
 		});
 		results.push({
-			usage: {
-				promptTokens: usage.input_tokens,
-				inputTokens: usage.input_tokens,
-				completionTokens: usage.output_tokens,
-				reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? undefined,
-				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
-			},
+			usage: openAIUsageToParsedUsage(usage, toolAccum),
 		});
 	}
 
@@ -3871,20 +3906,7 @@ function parseSSELine(
 			hasPromptTokens: promptTokens != null,
 			usage: chunk.usage,
 		});
-		if (promptTokens != null) {
-			return [
-				{
-					usage: {
-						promptTokens,
-						inputTokens: promptTokens,
-						completionTokens: chunk.usage.completion_tokens,
-						reasoningTokens: chunk.usage.completion_tokens_details?.reasoning_tokens ?? undefined,
-						cachedInputTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? undefined,
-					},
-				},
-			];
-		}
-		return [];
+		return [{ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) }];
 	}
 
 	// ── Responses API: function call start (item with call_id + name) ──
@@ -3999,6 +4021,9 @@ function parseSSELine(
 
 	const delta = choice.delta;
 	const results: ParsedStreamEvent[] = [];
+	if (chunk.usage) {
+		results.push({ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) });
+	}
 	const result: ParsedStreamEvent = {};
 
 	// A chunk may contain all three lanes. Publish content before any tool can
@@ -4007,14 +4032,23 @@ function parseSSELine(
 	// emit `reasoning_content`, while OpenRouter-style layers emit only `reasoning`.
 	// Reading just one silently drops the other's thinking stream, so accept both;
 	// a non-empty `reasoning_content` wins when a relay happens to send both.
+	// Some relays put the full thinking text on the final `message` instead of
+	// streaming it through `delta`. Prefer a non-empty delta, then that snapshot,
+	// so the next request can pass the original reasoning_content back.
 	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
 	const deltaAny = delta as any;
-	const reasoning: unknown = deltaAny.reasoning_content || deltaAny.reasoning;
+	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
+	const messageAny = (choice as { message?: any }).message;
+	const reasoning: unknown =
+		deltaAny?.reasoning_content ||
+		deltaAny?.reasoning ||
+		messageAny?.reasoning_content ||
+		messageAny?.reasoning;
 	if (typeof reasoning === "string" && reasoning) results.push({ reasoning });
-	if (delta.content) results.push({ text: delta.content });
+	if (delta?.content) results.push({ text: delta.content });
 
 	// Tool call deltas — emit as toolUseChunk for early execution support
-	if (delta.tool_calls) {
+	if (delta?.tool_calls) {
 		for (const tc of delta.tool_calls) {
 			const idx = tc.index;
 

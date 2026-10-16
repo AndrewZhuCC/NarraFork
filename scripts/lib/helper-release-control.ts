@@ -24,6 +24,7 @@ import {
 	HELPER_TOOL_VERSIONS,
 	HELPER_TOOLS,
 	type HelperPlatform,
+	parseComponentVersions,
 	parseExecutorReleaseManifest,
 	parseHelperManifest,
 } from "../../shared/helper-distribution";
@@ -32,16 +33,9 @@ import {
 	executorPublishedFilename,
 } from "../../shared/remote-executor";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
+import { createPublicationGhRunner, runPublicationProcess } from "./ci-publication-runtime";
 import { assertCiMainAncestor, assertReleaseEnvironment, parseCiId } from "./ci-release-plan";
-import {
-	assertBridgeMode,
-	type BridgeIdentity,
-	createBridgeGhRunner,
-	hasMirrorFailureReceipt,
-	restoreUpdateServerBridgeArtifact,
-	runBridgeProcess,
-	writeBridgeEnvelope,
-} from "./ci-update-server-bridge-restore";
+import { compareExecutorRecipeIdentity } from "./component-release-inputs";
 import { buildExecutorManifest } from "./executor-manifest";
 import { type GhRunner, runGh, validateGitHubRepository } from "./github-release";
 import { validateHelperArtifactZip } from "./helper-artifact";
@@ -60,16 +54,7 @@ import {
 	resolveHelperTagCommit,
 	validateHelperReleaseBundle,
 } from "./helper-release";
-import {
-	resolveUpdateServerBridgeConfig,
-	type UpdateServerBridgeConfig,
-} from "./update-server-bridge-http";
-import {
-	type PreparedToolsMirror,
-	prepareUpdateServerToolsMirror,
-	publishUpdateServerToolsMirror,
-	restoreUpdateServerToolsMirror,
-} from "./update-server-tools-mirror";
+import { writePublicationReceipt } from "./publication-receipt";
 
 export interface HelperReleasePlan {
 	schemaVersion: 1;
@@ -83,14 +68,13 @@ export interface HelperReleasePlan {
 	protocolVersion: number;
 	sourceRunId: string;
 	publish: boolean;
-	mirrorOnly?: boolean;
-	bridgeRunId?: string;
-	bridgeRunAttempt?: string;
 }
 interface HelperControlOptions {
 	run?: GhRunner;
 	environment?: NodeJS.ProcessEnv;
 	git?: (root: string, args: string[]) => string;
+	signal?: AbortSignal;
+	deadline?: number;
 }
 async function resolveHelperRepositoryContext(
 	repository: string,
@@ -155,19 +139,9 @@ export async function planHelperRelease(
 	sourceRunId = "",
 	options: HelperControlOptions & {
 		publish?: boolean;
-		mirrorOnly?: boolean;
-		bridgeRunId?: string;
-		bridgeRunAttempt?: string;
 	} = {},
 ): Promise<HelperReleasePlan> {
 	const environment = options.environment ?? process.env;
-	assertBridgeMode({
-		publish: String(options.publish ?? false),
-		mirrorOnly: String(options.mirrorOnly ?? false),
-		sourceRunId,
-		bridgeRunId: options.bridgeRunId,
-	});
-	if (options.bridgeRunAttempt) parseCiId(options.bridgeRunAttempt);
 	const run = options.run ?? runGh;
 	const readGit = options.git ?? git;
 	const repository = environment.GITHUB_REPOSITORY ?? "";
@@ -192,16 +166,44 @@ export async function planHelperRelease(
 	readGit(root, ["merge-base", "--is-ancestor", commit, `refs/remotes/origin/${defaultBranch}`]);
 	await assertCiMainAncestor(run, commit, repository, defaultBranch);
 	const version = kind === "executor" ? tag.slice("executor-v".length) : HELPER_CATALOG_VERSION;
-	if (
-		kind === "executor" &&
-		JSON.parse(readGit(root, ["show", `${commit}:package.json`])).version !== version
-	)
-		throw new Error("Executor tag must match the source application version");
 	const protocol = readGit(root, [
 		"show",
 		`${commit}:remote-executor/internal/rpc/protocol.go`,
 	]).match(/\bProtocolVersion\s*=\s*(\d+)/);
 	if (!protocol) throw new Error("Missing executor protocol version");
+	const protocolVersion = Number(protocol[1]);
+	if (!Number.isSafeInteger(protocolVersion) || protocolVersion <= 0)
+		throw new Error("Invalid executor protocol version");
+	if (kind === "executor") {
+		// Check the exact path in the target tree. Only proven absence is legacy;
+		// corrupt JSON, failed git reads and malformed tree output must fail closed.
+		const componentPath = "shared/component-versions.json";
+		const entry = readGit(root, ["ls-tree", "--name-only", commit, "--", componentPath]);
+		if (entry !== "" && entry !== componentPath)
+			throw new Error("Unexpected component configuration tree entry");
+		if (entry === componentPath) {
+			const components = parseComponentVersions(
+				JSON.parse(readGit(root, ["show", `${commit}:${componentPath}`])),
+			);
+			if (components.executor.version !== version)
+				throw new Error("Executor tag must match the source component version");
+			if (components.executor.protocolVersion !== protocolVersion)
+				throw new Error("Executor component protocol must match the source wire protocol");
+			// The workflow bundles trusted control code, but checks out target Go sources.
+			// A new envelope may attribute that recipe to the tag only after proving parity.
+			// Restores consume their original sealed bundle and must never reselect a recipe.
+			if (!sourceRunId)
+				await compareExecutorRecipeIdentity({
+					commit,
+					controlCommit: environment.GITHUB_SHA as string,
+					readSource: (sourceCommit, path) => readGit(root, ["show", `${sourceCommit}:${path}`]),
+					signal: options.signal,
+					deadline: options.deadline,
+				});
+		} else if (JSON.parse(readGit(root, ["show", `${commit}:package.json`])).version !== version) {
+			throw new Error("Legacy executor tag must match the source application version");
+		}
+	}
 	return {
 		schemaVersion: 1,
 		repository,
@@ -211,12 +213,9 @@ export async function planHelperRelease(
 		controlCommit: environment.GITHUB_SHA as string,
 		kind,
 		version,
-		protocolVersion: Number(protocol[1]),
+		protocolVersion,
 		sourceRunId,
 		publish: options.publish === true,
-		mirrorOnly: options.mirrorOnly === true,
-		bridgeRunId: options.bridgeRunId ?? "",
-		bridgeRunAttempt: options.bridgeRunAttempt ?? "",
 	};
 }
 export async function writeHelperReleasePlan(path: string, plan: HelperReleasePlan): Promise<void> {
@@ -249,13 +248,9 @@ export async function readHelperReleasePlan(path: string): Promise<HelperRelease
 		process.env.GITHUB_REPOSITORY.toLowerCase() !== value.repository.toLowerCase()
 	)
 		throw new Error("Helper plan repository mismatch");
-	assertBridgeMode({
-		publish: String(value.publish),
-		mirrorOnly: String(value.mirrorOnly ?? false),
-		sourceRunId: value.sourceRunId,
-		bridgeRunId: value.bridgeRunId,
-	});
-	if (value.bridgeRunAttempt) parseCiId(value.bridgeRunAttempt);
+	if (value.sourceRunId && !/^[1-9]\d{0,15}$/.test(value.sourceRunId))
+		throw new Error("Invalid helper source run ID");
+
 	return value;
 }
 export async function buildHelperReleasePlatform(
@@ -589,7 +584,7 @@ export async function restoreHelperReleaseBundle(
 	const signal = options.signal;
 	const environment = options.environment ?? process.env;
 	signal?.throwIfAborted();
-	const runner = options.run ?? (signal ? createBridgeGhRunner(signal, environment) : runGh);
+	const runner = options.run ?? (signal ? createPublicationGhRunner(signal, environment) : runGh);
 	const query: GhRunner = async (args) => {
 		signal?.throwIfAborted();
 		const result = await runner(args);
@@ -696,7 +691,7 @@ export async function restoreHelperReleaseBundle(
 		signal?.throwIfAborted();
 		await mkdir(output, { recursive: false });
 		ownsOutput = true;
-		await runBridgeProcess("unzip", ["-q", zip, "-d", output], {
+		await runPublicationProcess("unzip", ["-q", zip, "-d", output], {
 			signal,
 			environment,
 			timeoutMs: 30_000,
@@ -716,39 +711,14 @@ export async function restoreHelperReleaseBundle(
 		await rm(temporary, { recursive: true, force: true });
 	}
 }
-export interface HelperBridgeOptions extends HelperControlOptions {
-	bridgeDir?: string;
+export interface HelperPublicationOptions extends HelperControlOptions {
 	sourceRunAttempt?: string;
-	artifactId?: string;
-	artifactDigest?: string;
-	signal?: AbortSignal;
-	/** Fixture transport seams; provenance and byte checks are never bypassed. */
+	bundleArtifactId?: string;
+	receiptPath?: string;
+	/** Fixture-only network seam asserts that publication never requests a mirror server. */
 	fetchImpl?: typeof fetch;
-	artifactFetch?: typeof fetch;
 }
-async function helperBridgeIdentity(
-	plan: HelperReleasePlan,
-	output: string,
-	serverUrl: string,
-	options: HelperBridgeOptions,
-): Promise<BridgeIdentity> {
-	const env = options.environment ?? process.env;
-	const manifestName =
-		plan.kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
-	return {
-		kind: plan.kind,
-		repository: plan.repository,
-		defaultBranch: plan.defaultBranch,
-		tag: plan.tag,
-		version: plan.version,
-		commit: plan.commit,
-		sourceRunId: parseCiId(plan.sourceRunId || env.GITHUB_RUN_ID),
-		sourceRunAttempt: parseCiId(options.sourceRunAttempt),
-		serverUrl,
-		manifestSha256: (await helperFileIdentity(join(output, manifestName), 64 * 1024)).sha256,
-	};
-}
-async function bridgeOutput(values: Record<string, string>, options: HelperControlOptions) {
+async function publicationOutput(values: Record<string, string>, options: HelperControlOptions) {
 	const env = options.environment ?? process.env;
 	if (env.GITHUB_OUTPUT)
 		for (const [key, value] of Object.entries(values)) {
@@ -757,118 +727,56 @@ async function bridgeOutput(values: Record<string, string>, options: HelperContr
 			await appendFile(env.GITHUB_OUTPUT, `${key}=${value}\n`);
 		}
 }
-async function bridgeSummary(message: string, options: HelperControlOptions) {
+async function publicationSummary(message: string, options: HelperControlOptions) {
 	console.log(message);
 	const env = options.environment ?? process.env;
 	if (env.GITHUB_STEP_SUMMARY) await appendFile(env.GITHUB_STEP_SUMMARY, `${message}\n`);
 }
-export async function prepareHelperReleaseBridge(
-	plan: HelperReleasePlan,
-	output: string,
-	options: HelperBridgeOptions = {},
-) {
-	const config = resolveUpdateServerBridgeConfig(options.environment ?? process.env);
-	await assertHelperPublishEnvironment(plan, options);
-	if (plan.mirrorOnly)
-		throw new Error("Mirror-only must restore the original bridge, not prepare again");
-	await validateHelperReleaseBundle({ ...plan, bundleDir: output });
-	await bridgeOutput(
-		{ "mirror-required": String(!!config), "publication-status": "BUILD_COMPLETE" },
-		options,
+/** Historical seals are diagnostics, never current publication authority. */
+export async function prepareHelperReleaseBridge(): Promise<never> {
+	throw new Error(
+		"prepare-bridge is retired; use the independent update-server-mirror workflow for an already-public GitHub release. Historical seals are diagnostic only.",
 	);
-	if (!config) {
-		await bridgeSummary(
-			"BUILD_COMPLETE: GitHub-only helper publication; no legacy server requests.",
-			options,
-		);
-		return;
-	}
-	if (!options.bridgeDir) throw new Error("Missing immutable helper bridge directory");
-	const identity = await helperBridgeIdentity(plan, output, config.serverUrl, options);
-	const prepared = await prepareUpdateServerToolsMirror({
-		kind: plan.kind,
-		bundleDir: output,
-		repo: plan.repository,
-		version: plan.version,
-		commit: plan.commit,
-		protocolVersion: plan.protocolVersion,
-		config,
-		bridgeDir: options.bridgeDir,
-		sourceRunId: String(identity.sourceRunId),
-		sourceRunAttempt: String(identity.sourceRunAttempt),
-		signal: options.signal,
-		fetchImpl: options.fetchImpl,
-	});
-	await writeBridgeEnvelope(options.bridgeDir, identity, prepared.sealSha256, options.environment);
-	await bridgeSummary(
-		`BUILD_COMPLETE: immutable ${plan.kind} bridge ready; artifact upload must succeed before GitHub writes.`,
-		options,
+}
+export async function mirrorHelperReleasePlan(): Promise<never> {
+	throw new Error(
+		"Bridge mirror recovery is retired; use the independent update-server-mirror workflow.",
 	);
 }
 export async function publishHelperReleasePlan(
 	plan: HelperReleasePlan,
 	output: string,
 	dryRun = true,
-	options: HelperBridgeOptions = {},
+	options: HelperPublicationOptions = {},
 ): Promise<void> {
-	// Offline preview is deliberately independent of all update-server configuration.
-	const config = dryRun
-		? undefined
-		: resolveUpdateServerBridgeConfig(options.environment ?? process.env);
-	let acceptedMirror:
-		| {
-				prepared: PreparedToolsMirror;
-				identity: BridgeIdentity;
-				bridgeRunId: number;
-				bridgeRunAttempt: number;
-		  }
-		| undefined;
 	const guard = async () => {
 		options.signal?.throwIfAborted();
 		await assertHelperPublishEnvironment(plan, options);
 		options.signal?.throwIfAborted();
 	};
-	if (!dryRun) {
-		if (plan.mirrorOnly) throw new Error("Mirror-only may not mutate GitHub releases");
-		await guard();
-		if (config) {
-			if (!options.bridgeDir || !options.artifactId || !options.artifactDigest)
-				throw new Error("Publication requires a successfully uploaded immutable bridge artifact");
-			const identity = await helperBridgeIdentity(plan, output, config.serverUrl, options);
-			const restored = await restoreUpdateServerBridgeArtifact({
-				identity,
-				bridgeRunId: parseCiId((options.environment ?? process.env).GITHUB_RUN_ID),
-				destination: options.bridgeDir,
-				uploadedArtifactId: options.artifactId,
-				uploadedArtifactDigest: options.artifactDigest,
-				run: options.run,
-				env: options.environment,
-				signal: options.signal,
-				fetch: options.artifactFetch,
-			});
-			const prepared = await restoreUpdateServerToolsMirror({
-				kind: plan.kind,
-				bundleDir: output,
-				repo: plan.repository,
-				version: plan.version,
-				commit: plan.commit,
-				protocolVersion: plan.protocolVersion,
-				config,
-				bridgeDir: options.bridgeDir,
-				trustedSealSha256: restored.envelope.sealSha256,
-				signal: options.signal,
-				fetchImpl: options.fetchImpl,
-			});
-			if (prepared.sealSha256 !== restored.envelope.sealSha256)
-				throw new Error("Helper bridge seal mismatch");
-			acceptedMirror = {
-				prepared,
-				identity,
-				bridgeRunId: restored.envelope.bridgeRunId,
-				bridgeRunAttempt: restored.envelope.bridgeRunAttempt,
+	if (!dryRun) await guard();
+	// Validate and freeze receipt provenance before the publisher can write remotely.
+	// An empty sourceRunId denotes this dispatch; a restored run must retain its own identity.
+	const env = options.environment ?? process.env;
+	const provenance = dryRun
+		? undefined
+		: {
+				source: {
+					runId: parseCiId(env.GITHUB_RUN_ID),
+					runAttempt: parseCiId(env.GITHUB_RUN_ATTEMPT),
+					workflowPath: ".github/workflows/helpers-release.yml",
+					nativeProof: "verified-original-bundle" as const,
+				},
+				buildSource: {
+					runId: parseCiId(plan.sourceRunId === "" ? env.GITHUB_RUN_ID : plan.sourceRunId),
+					runAttempt: parseCiId(options.sourceRunAttempt),
+					workflowPath: ".github/workflows/helpers-release.yml",
+					...(options.bundleArtifactId
+						? { bundleArtifactId: parseCiId(options.bundleArtifactId) }
+						: {}),
+					nativeProof: "verified-original-bundle" as const,
+				},
 			};
-		}
-	}
 	await publishHelperRelease({
 		...plan,
 		bundleDir: output,
@@ -877,14 +785,26 @@ export async function publishHelperReleasePlan(
 		signal: options.signal,
 		beforeWrite: dryRun ? undefined : guard,
 	});
-	if (!dryRun)
-		await bridgeOutput(
-			{ "publication-status": "PUBLISHED", "mirror-required": String(!!config) },
+	if (provenance) {
+		await verifyPublicHelperRelease(plan, output, options);
+		const description = await validateHelperReleaseBundle({ ...plan, bundleDir: output });
+		await writePublicationReceipt({
+			kind: plan.kind,
+			repository: plan.repository,
+			tag: plan.tag,
+			version: plan.version,
+			commit: plan.commit,
+			expectedAssets: description.files,
+			...provenance,
+			run: options.run ?? runGh,
+			signal: options.signal,
+			path: options.receiptPath,
+		});
+		await publicationOutput({ "publication-status": "PUBLISHED" }, options);
+		await publicationSummary(
+			`PUBLISHED: complete immutable GitHub ${plan.kind} Release verified.`,
 			options,
 		);
-	if (acceptedMirror && config) {
-		await verifyPublicHelperRelease(plan, output, options);
-		await publishPreparedHelperMirror(plan, acceptedMirror, config, options);
 	}
 }
 /** Public asset inspection only. Never calls the draft/upload/publication helper. */
@@ -926,99 +846,12 @@ export async function verifyPublicHelperRelease(
 			throw new Error("Public helper asset identity mismatch");
 	}
 }
-export async function mirrorHelperReleasePlan(
-	plan: HelperReleasePlan,
-	output: string,
-	options: HelperBridgeOptions = {},
-) {
-	const env = options.environment ?? process.env;
-	const config = resolveUpdateServerBridgeConfig(env);
-	if (!config || !options.bridgeDir)
-		throw new Error("Mirror requires explicit server configuration and original bridge artifact");
-	await assertHelperPublishEnvironment(plan, options);
-	const identity = await helperBridgeIdentity(plan, output, config.serverUrl, options);
-	const bridgeRunId = plan.mirrorOnly ? parseCiId(plan.bridgeRunId) : parseCiId(env.GITHUB_RUN_ID);
-	const restored = await restoreUpdateServerBridgeArtifact({
-		identity,
-		bridgeRunId,
-		bridgeRunAttempt: plan.bridgeRunAttempt ? parseCiId(plan.bridgeRunAttempt) : undefined,
-		destination: options.bridgeDir,
-		run: options.run,
-		env,
-		signal: options.signal,
-		fetch: options.artifactFetch,
-	});
-	const prepared = await restoreUpdateServerToolsMirror({
-		kind: plan.kind,
-		bundleDir: output,
-		repo: plan.repository,
-		version: plan.version,
-		commit: plan.commit,
-		protocolVersion: plan.protocolVersion,
-		config,
-		bridgeDir: options.bridgeDir,
-		trustedSealSha256: restored.envelope.sealSha256,
-		signal: options.signal,
-		fetchImpl: options.fetchImpl,
-	});
-	if (prepared.sealSha256 !== restored.envelope.sealSha256)
-		throw new Error("Helper mirror seal mismatch");
-	await verifyPublicHelperRelease(plan, output, options);
-	await publishPreparedHelperMirror(
-		plan,
-		{ prepared, identity, bridgeRunId, bridgeRunAttempt: restored.envelope.bridgeRunAttempt },
-		config,
-		options,
-	);
-}
-async function publishPreparedHelperMirror(
-	plan: HelperReleasePlan,
-	accepted: {
-		prepared: PreparedToolsMirror;
-		identity: BridgeIdentity;
-		bridgeRunId: number;
-		bridgeRunAttempt: number;
-	},
-	config: UpdateServerBridgeConfig,
-	options: HelperBridgeOptions,
-) {
-	const { prepared, identity, bridgeRunId, bridgeRunAttempt } = accepted;
-	try {
-		await publishUpdateServerToolsMirror(prepared, config, {
-			signal: options.signal,
-			fetchImpl: options.fetchImpl,
-		});
-		await bridgeOutput(
-			{ "mirror-required": "true", "mirror-status": "MIRRORED", "publication-status": "MIRRORED" },
-			options,
-		);
-		await bridgeSummary(
-			`MIRRORED: ${plan.tag}; original bytes verified. Legacy tools API has no CAS; external private publishers can still race workflow serialization.`,
-			options,
-		);
-	} catch (error) {
-		await bridgeOutput({ "mirror-status": "PUBLISHED_NOT_MIRRORED" }, options);
-		const partialReceipt = await hasMirrorFailureReceipt(
-			prepared.receiptPath,
-			"PUBLISHED_NOT_MIRRORED",
-		);
-		await bridgeSummary(
-			`PUBLISHED_NOT_MIRRORED: ${plan.tag}. Retry publish=true mirror_only=true source_run_id=${identity.sourceRunId} bridge_run_id=${bridgeRunId} bridge_run_attempt=${bridgeRunAttempt}; original bundle and sealed bridge retained; partial receipt ${partialReceipt ? "retained" : "unavailable"}. Retry will not rebuild or write GitHub.`,
-			options,
-		);
-		throw error;
-	}
-}
 export function assertHelperReleaseGate(env: NodeJS.ProcessEnv) {
 	if (
 		env.SOURCE_RUN_ID === undefined ||
 		(env.SOURCE_RUN_ID !== "" && !/^[1-9]\d*$/.test(env.SOURCE_RUN_ID))
 	)
 		throw new Error("Invalid helper source run mode");
-	if (env.MIRROR_ONLY !== undefined && !["true", "false"].includes(env.MIRROR_ONLY))
-		throw new Error("Invalid helper mirror-only mode");
-	if (env.MIRROR_REQUIRED !== undefined && !["", "true", "false"].includes(env.MIRROR_REQUIRED))
-		throw new Error("Invalid helper mirror requirement");
 	if (env.PREFLIGHT_RESULT !== "success") throw new Error("Helper preflight failed");
 	const restore = env.SOURCE_RUN_ID !== "";
 	for (const key of ["BUILD_RESULT", "SMOKE_RESULT", "ASSEMBLE_RESULT"])
@@ -1030,14 +863,4 @@ export function assertHelperReleaseGate(env: NodeJS.ProcessEnv) {
 		env.PUBLISH_RESULT !== (env.PUBLISH_REQUESTED === "true" ? "success" : "skipped")
 	)
 		throw new Error("Helper publisher did not succeed");
-	if (env.MIRROR_REQUIRED === "true" && env.MIRROR_STATUS !== "MIRRORED")
-		throw new Error("Configured helper mirror failed");
-	if (
-		env.MIRROR_ONLY === "true" &&
-		(!restore ||
-			env.PUBLISH_REQUESTED !== "true" ||
-			env.MIRROR_REQUIRED !== "true" ||
-			env.MIRROR_STATUS !== "MIRRORED")
-	)
-		throw new Error("Mirror-only helper receipt missing");
 }

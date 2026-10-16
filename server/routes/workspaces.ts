@@ -24,6 +24,7 @@ import {
 	updateWorkspacePanelConfig,
 	WorkspaceLayoutConflictError,
 } from "../services/workspace-panel-service";
+import { broadcastToUser } from "../websocket/narrator-ws";
 
 export const workspaceRoutes = new Hono();
 
@@ -270,6 +271,13 @@ workspaceRoutes.patch("/:id", workspaceWriteBodyLimit, async (c) => {
 
 	await db.update(workspaces).set(updates).where(eq(workspaces.id, id));
 
+	// Other devices with this workspace open show the title in their toolbar —
+	// but only a real change earns a broadcast; a same-title resubmit changes
+	// nothing they could refetch.
+	if (parsed.data.title !== undefined && parsed.data.title !== ws.title) {
+		broadcastToUser(userId, { type: "workspace_changed", workspaceId: id, reason: "title" });
+	}
+
 	return c.json({ ok: true });
 });
 
@@ -286,7 +294,18 @@ workspaceRoutes.delete("/:id", async (c) => {
 	// Remove the authoritative header first so children are released and clients receive a delta.
 	await removeRecentTab(userId, "workspace", id);
 	// Keep DELETE semantics for legacy/inconsistent rows that had no recent-tab header.
-	await db.delete(workspaces).where(eq(workspaces.id, id));
+	// `removeRecentTab` may already have deleted the row (announcing it in the
+	// process); announce only when THIS delete is the one that lands.
+	const remaining = await db.query.workspaces.findFirst({
+		where: eq(workspaces.id, id),
+		columns: { id: true },
+	});
+	if (remaining) {
+		await db.delete(workspaces).where(eq(workspaces.id, id));
+		// A device with this workspace still open navigates away on this signal; its
+		// re-fetch would 404 now.
+		broadcastToUser(userId, { type: "workspace_changed", workspaceId: id, reason: "deleted" });
+	}
 
 	return c.json({ ok: true });
 });

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -28,9 +28,109 @@ import {
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const roots: string[] = [];
+let infoCalls: unknown[][] = [];
+let restoreInfo: (() => void) | undefined;
+beforeEach(() => {
+	infoCalls = [];
+	const logger = spyOn(console, "info").mockImplementation((...args: unknown[]) => {
+		infoCalls.push(args);
+	});
+	restoreInfo = () => logger.mockRestore();
+});
 afterEach(async () => {
+	restoreInfo?.();
+	restoreInfo = undefined;
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+interface PhaseRecord {
+	event: "release.phase";
+	id: number;
+	parentId?: number;
+	phase: string;
+	state: "start" | "end";
+	timestamp: string;
+	durationMs?: number;
+	status?: "success" | "error" | "cancelled";
+	controllerRssBytes: number;
+	errorKind?: "Error" | "AbortError" | "TimeoutError";
+	platform?: string;
+	version?: string;
+	fromVersion?: string;
+	inputBytes?: number;
+	outputBytes?: number;
+	fileCount?: number;
+	targetCount?: number;
+	baselineCount?: number;
+}
+
+function phaseRecords(): PhaseRecord[] {
+	return infoCalls.flatMap(([message]) => {
+		if (typeof message !== "string" || !message.startsWith("{")) return [];
+		const record = JSON.parse(message);
+		return record.event === "release.phase" ? [record as PhaseRecord] : [];
+	});
+}
+
+function expectPairedPhases(records: PhaseRecord[]) {
+	expect(records.length).toBeGreaterThan(0);
+	const starts = records.filter((record) => record.state === "start");
+	expect(starts.length * 2).toBe(records.length);
+	expect(new Set(starts.map((record) => record.id)).size).toBe(starts.length);
+	const safeKeys = new Set([
+		"event",
+		"id",
+		"parentId",
+		"phase",
+		"state",
+		"timestamp",
+		"durationMs",
+		"status",
+		"controllerRssBytes",
+		"errorKind",
+		"platform",
+		"version",
+		"fromVersion",
+		"inputBytes",
+		"outputBytes",
+		"fileCount",
+		"targetCount",
+		"baselineCount",
+	]);
+	for (const record of records) {
+		expect(Object.keys(record).every((key) => safeKeys.has(key))).toBe(true);
+		expect(record.phase).toMatch(/^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)*$/);
+		expect(record.phase.length).toBeLessThanOrEqual(96);
+		expect(Number.isFinite(Date.parse(record.timestamp))).toBe(true);
+		expect(record.controllerRssBytes).toBeGreaterThan(0);
+	}
+	for (const start of starts) {
+		const pair = records.filter((record) => record.id === start.id);
+		expect(pair).toHaveLength(2);
+		const end = pair[1];
+		if (!end) throw new Error("fixture missing phase end boundary");
+		expect(end).toMatchObject({ phase: start.phase, state: "end" });
+		expect(end.parentId).toBe(start.parentId);
+		expect(end.durationMs).toBeGreaterThanOrEqual(0);
+		if (end.status === undefined) throw new Error("fixture missing phase end status");
+		expect(["success", "error", "cancelled"]).toContain(end.status);
+		expect(start.status).toBeUndefined();
+		expect(start.durationMs).toBeUndefined();
+		if (start.parentId !== undefined) {
+			const parent = records.find(
+				(record) => record.id === start.parentId && record.state === "start",
+			);
+			const parentEnd = records.find(
+				(record) => record.id === start.parentId && record.state === "end",
+			);
+			expect(parent).toBeDefined();
+			expect(parentEnd).toBeDefined();
+			if (!parent || !parentEnd || !end) throw new Error("fixture missing phase boundary");
+			expect(records.indexOf(parent)).toBeLessThan(records.indexOf(start));
+			expect(records.indexOf(parentEnd)).toBeGreaterThan(records.indexOf(end));
+		}
+	}
+}
 
 async function fixture(declareHelpers = false) {
 	const root = await mkdtemp(join(tmpdir(), "nf-ci-bundle-test-"));
@@ -66,7 +166,7 @@ async function fixture(declareHelpers = false) {
 			commit: plan.commit.slice(0, 12),
 			buildDate: "2026-10-08T00:00:00.000Z",
 			...(declareHelpers
-				? { helperDistribution: createHelperDistributionDependencies(plan.version) }
+				? { helperDistribution: createHelperDistributionDependencies("0.9.1") }
 				: {}),
 		});
 		await writeFile(join(directory, name), bytes);
@@ -90,8 +190,30 @@ async function fixture(declareHelpers = false) {
 		};
 		await writeFile(join(smokeDirectory, "smoke.json"), JSON.stringify(smoke));
 	}
-	const options: AssembleReleaseBundleOptions = { plan, platformsDir, smokeDir, bundleDir };
+	const options: AssembleReleaseBundleOptions = {
+		plan,
+		platformsDir,
+		smokeDir,
+		bundleDir,
+		...(declareHelpers
+			? { targetHelperDistribution: createHelperDistributionDependencies("0.9.1") }
+			: {}),
+	};
 	return { root, options, plan, name: `narrafork-${plan.version}-linux-x64` };
+}
+
+async function fixtureSnapshot(f: Awaited<ReturnType<typeof fixture>>) {
+	return Promise.all(
+		CI_RELEASE_TARGETS.map(async (target) => {
+			const name = `narrafork-${f.plan.version}-${target.suffix}`;
+			const directory = join(f.options.platformsDir, target.target);
+			return {
+				binary: await readFile(join(directory, name)),
+				sidecar: await readFile(join(directory, `${name}.metadata.json`)),
+				smoke: await readFile(join(f.options.smokeDir, target.target, "smoke.json")),
+			};
+		}),
+	);
 }
 
 async function baseline(f: Awaited<ReturnType<typeof fixture>>) {
@@ -245,6 +367,62 @@ describe("immutable eight-platform CI bundle", () => {
 			"ignored build diagnostic",
 		);
 		const manifest = await assembleReleaseBundle(f.options);
+		const records = phaseRecords();
+		expectPairedPhases(records);
+		expect(
+			records
+				.filter((record) => record.state === "end")
+				.every((record) => record.status === "success"),
+		).toBe(true);
+		for (const phase of [
+			"bundle.assemble",
+			"platform.read",
+			"platform.metadata.read",
+			"platform.binary.hash",
+			"platform.metadata.verify",
+			"platform.smoke.verify",
+			"platform.stage.binary.copy",
+			"platform.stage.sidecar.copy",
+			"platform.stage.binary.hash",
+			"bundle.manifest.hash",
+			"bundle.manifest.write",
+			"bundle.verify",
+			"bundle.verify.assets.hash",
+			"bundle.verify.platforms.read",
+			"bundle.verify.platform.read",
+			"bundle.verify.smoke.verify",
+			"bundle.verify.publisher.dryrun",
+			"bundle.seal.rename",
+			"bundle.staging.cleanup",
+		]) {
+			expect(records.some((record) => record.phase === phase)).toBe(true);
+		}
+		const assembly = records.find(
+			(record) => record.phase === "bundle.assemble" && record.state === "end",
+		);
+		expect(assembly).toMatchObject({ version: f.plan.version, targetCount: 8, baselineCount: 0 });
+		const hashes = records.find(
+			(record) => record.phase === "bundle.manifest.hash" && record.state === "end",
+		);
+		expect(hashes).toMatchObject({
+			fileCount: 18,
+			outputBytes: manifest.files.reduce((sum, file) => sum + file.size, 0),
+		});
+		const dryRun = records.find(
+			(record) => record.phase === "bundle.verify.publisher.dryrun" && record.state === "end",
+		);
+		const verify = records.find(
+			(record) => record.phase === "bundle.verify" && record.state === "start",
+		);
+		expect(dryRun).toMatchObject({
+			status: "success",
+			version: f.plan.version,
+			fileCount: 18,
+			parentId: verify?.id,
+		});
+		expect(dryRun?.durationMs).toBeGreaterThanOrEqual(0);
+		expect(JSON.stringify(records)).not.toContain(f.root);
+		expect(JSON.stringify(records)).not.toContain("ignored build diagnostic");
 		expect(manifest.files).toHaveLength(18);
 		expect(manifest.smoke).toHaveLength(8);
 		expect((await readdir(f.options.bundleDir)).sort()).toEqual(["dist", "manifest.json"]);
@@ -382,7 +560,37 @@ describe("immutable eight-platform CI bundle", () => {
 	test("downloads exact base IDs and generates/applies a real zstd patch locally", async () => {
 		const f = await fixture();
 		const base = await baseline(f);
+		const snapshot = await fixtureSnapshot(f);
 		const manifest = await assembleReleaseBundle(f.options);
+		const records = phaseRecords();
+		expectPairedPhases(records);
+		for (const phase of [
+			"baseline.sidecar.download",
+			"baseline.sidecar.verify",
+			"baseline.binary.download",
+			"baseline.binary.hash",
+			"baseline.patch.generate",
+			"baseline.patch.hash",
+			"baseline.patch.rebuild",
+			"baseline.patch.rebuild.hash",
+			"baseline.patch.copy",
+			"baseline.patch.metadata.write",
+			"baseline.scratch.cleanup",
+		]) {
+			expect(
+				records.find((record) => record.phase === phase && record.state === "end"),
+			).toMatchObject({
+				status: "success",
+				platform: base.base.platform,
+				version: f.plan.version,
+				fromVersion: base.base.version,
+			});
+		}
+		const patch = manifest.files.find((file) => file.name.endsWith(".zstd-patch"));
+		expect(
+			records.find((record) => record.phase === "baseline.patch.hash" && record.state === "end"),
+		).toMatchObject({ outputBytes: patch?.size });
+		expect(await fixtureSnapshot(f)).toEqual(snapshot);
 		expect(base.downloaded).toEqual([3, 2]);
 		expect(manifest.files).toHaveLength(20);
 		expect(manifest.files.some((file) => file.name === `${f.name}.from-1.0.0.zstd-patch`)).toBe(
@@ -409,30 +617,79 @@ describe("immutable eight-platform CI bundle", () => {
 			);
 		}
 	});
-	test("network and zstd errors abort assembly and clean owned temporary files", async () => {
+	test("network and zstd errors preserve errors and snapshots while timing cleanup", async () => {
 		for (const stage of ["network", "zstd"] as const) {
+			infoCalls = [];
 			const f = await fixture();
 			await baseline(f);
+			const snapshot = await fixtureSnapshot(f);
+			const failure = new Error(`private-${stage}-diagnostic https://secret.invalid/token`);
 			if (stage === "network")
 				f.options.dependencies = {
 					downloadAsset: async () => {
-						throw new Error("network down");
+						throw failure;
 					},
 				};
 			else
 				f.options.dependencies = {
 					...f.options.dependencies,
 					generatePatch: async () => {
-						throw new Error("zstd failed");
+						throw failure;
 					},
 				};
-			await expect(assembleReleaseBundle(f.options)).rejects.toThrow(
-				stage === "network" ? "network down" : "zstd failed",
-			);
-			expect((await readdir(f.root)).some((name) => name.startsWith(".ci-release-bundle-"))).toBe(
-				false,
-			);
+			await expect(assembleReleaseBundle(f.options)).rejects.toBe(failure);
+			const records = phaseRecords();
+			expectPairedPhases(records);
+			for (const phase of [
+				"bundle.assemble",
+				stage === "network" ? "baseline.sidecar.download" : "baseline.patch.generate",
+			]) {
+				expect(
+					records.find((record) => record.phase === phase && record.state === "end"),
+				).toMatchObject({ status: "error", errorKind: "Error" });
+			}
+			for (const phase of ["baseline.scratch.cleanup", "bundle.staging.cleanup"]) {
+				expect(
+					records.find((record) => record.phase === phase && record.state === "end"),
+				).toMatchObject({ status: "success" });
+			}
+			expect(JSON.stringify(records)).not.toContain(failure.message);
+			expect(JSON.stringify(records)).not.toContain(f.root);
+			expect(await fixtureSnapshot(f)).toEqual(snapshot);
+			expect((await readdir(f.root)).sort()).toEqual(["platforms", "smoke"]);
 		}
+	});
+	test("cancelled patch generation keeps the original reason and still times cleanup", async () => {
+		const f = await fixture();
+		await baseline(f);
+		const snapshot = await fixtureSnapshot(f);
+		const controller = new AbortController();
+		const reason = new DOMException("private cancelled diagnostic", "AbortError");
+		f.options.signal = controller.signal;
+		f.options.dependencies = {
+			...f.options.dependencies,
+			generatePatch: async (options) => {
+				controller.abort(reason);
+				options.signal?.throwIfAborted();
+				throw new Error("fixture did not propagate cancellation");
+			},
+		};
+		await expect(assembleReleaseBundle(f.options)).rejects.toBe(reason);
+		const records = phaseRecords();
+		expectPairedPhases(records);
+		for (const phase of ["baseline.patch.generate", "bundle.assemble"]) {
+			expect(
+				records.find((record) => record.phase === phase && record.state === "end"),
+			).toMatchObject({ status: "cancelled", errorKind: "AbortError" });
+		}
+		for (const phase of ["baseline.scratch.cleanup", "bundle.staging.cleanup"]) {
+			expect(
+				records.find((record) => record.phase === phase && record.state === "end"),
+			).toMatchObject({ status: "success" });
+		}
+		expect(JSON.stringify(records)).not.toContain(reason.message);
+		expect(await fixtureSnapshot(f)).toEqual(snapshot);
+		expect((await readdir(f.root)).sort()).toEqual(["platforms", "smoke"]);
 	});
 	test("reconstructed output is independently hashed, not trusted from apply's return", async () => {
 		const f = await fixture();
@@ -497,10 +754,57 @@ describe("immutable helper dependencies in release bundles", () => {
 	test("all eight new sidecars seal and restore the same declaration without network readiness", async () => {
 		const f = await fixture(true);
 		const sealed = await assembleReleaseBundle(f.options);
-		expect(sealed.helperDistribution).toEqual(createHelperDistributionDependencies(f.plan.version));
+		expect(sealed.helperDistribution).toEqual(createHelperDistributionDependencies("0.9.1"));
 		expect((await verifyReleaseBundle(f.options.bundleDir)).helperDistribution).toEqual(
 			sealed.helperDistribution,
 		);
+	});
+	test("different component pins or protocols cannot be mixed across platforms", async () => {
+		for (const helperDistribution of [
+			createHelperDistributionDependencies("0.9.2"),
+			createHelperDistributionDependencies("0.9.1", 2),
+		]) {
+			const f = await fixture(true);
+			const path = join(f.options.platformsDir, "linux-x64", `${f.name}.metadata.json`);
+			const metadata = JSON.parse(await readFile(path, "utf8"));
+			await writeFile(path, JSON.stringify({ ...metadata, helperDistribution }));
+			await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Inconsistent");
+		}
+	});
+	test("eight agreeing sidecars must still match target JSON rather than current control pin", async () => {
+		const f = await fixture(true);
+		f.options.targetHelperDistribution = createHelperDistributionDependencies("0.9.2");
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow(
+			"target component configuration",
+		);
+		f.options.targetHelperDistribution = undefined;
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Legacy target");
+		f.options.targetHelperDistribution = createHelperDistributionDependencies("0.9.1");
+		expect((await assembleReleaseBundle(f.options)).helperDistribution?.executor.version).toBe(
+			"0.9.1",
+		);
+	});
+	test("component evidence must match all sidecars and its original expected plan", async () => {
+		const f = await fixture(true);
+		f.plan.componentEvidence = {
+			executor: {
+				version: "0.9.1",
+				protocolVersion: 1,
+				tag: "executor-v0.9.1",
+				commit: "d".repeat(40),
+				manifestSha256: "e".repeat(64),
+				buildInputsSha256: "f".repeat(64),
+			},
+		};
+		await assembleReleaseBundle(f.options);
+		await expect(
+			verifyReleaseBundle(f.options.bundleDir, { ...f.plan, componentEvidence: undefined }),
+		).rejects.toThrow("componentEvidence");
+		await changeManifest(f, (manifest) => {
+			if (!manifest.plan.componentEvidence) throw new Error("fixture");
+			manifest.plan.componentEvidence.executor.protocolVersion = 2;
+		});
+		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("evidence/dependency");
 	});
 	test("legacy bundles do not invent dependencies from the current control code", async () => {
 		const f = await fixture();

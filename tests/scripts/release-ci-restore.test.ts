@@ -32,6 +32,8 @@ import {
 	type CiReleasePlan,
 } from "../../scripts/lib/ci-release-types";
 
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+
 const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -72,7 +74,7 @@ function contents(value: unknown) {
 		content: bytes.toString("base64"),
 	});
 }
-function fixture(releasePlan: CiReleasePlan = plan) {
+function fixture(releasePlan: CiReleasePlan = plan, declareHelpers = false) {
 	const repositoryName = releasePlan.repository;
 	const defaultBranch = releasePlan.defaultBranch ?? "main";
 	const root = mkdtempSync(join(tmpdir(), "narrafork-ci-restore-"));
@@ -94,6 +96,9 @@ function fixture(releasePlan: CiReleasePlan = plan) {
 				? {}
 				: { repository: releasePlan.repository }),
 			buildDate: "2026-10-08T00:00:00.000Z",
+			...(declareHelpers
+				? { helperDistribution: createHelperDistributionDependencies("0.9.1") }
+				: {}),
 		});
 		entries.set(name, bytes);
 		entries.set(`${name}.metadata.json`, Buffer.from(formatMetadataJson(meta)));
@@ -129,6 +134,9 @@ function fixture(releasePlan: CiReleasePlan = plan) {
 	const manifest: CiReleaseManifest = {
 		schemaVersion: 1,
 		plan: structuredClone(releasePlan),
+		...(declareHelpers
+			? { helperDistribution: createHelperDistributionDependencies("0.9.1") }
+			: {}),
 		smoke,
 		files: [...entries].map(([name, bytes]) => ({
 			name,
@@ -143,6 +151,9 @@ function fixture(releasePlan: CiReleasePlan = plan) {
 		root,
 		bundle,
 		manifest,
+		componentVersions: (declareHelpers
+			? { executor: { version: "0.9.1", protocolVersion: 1 } }
+			: undefined) as unknown,
 		archive: Buffer.alloc(0),
 		calls: [] as string[][],
 		downloads: 0,
@@ -228,6 +239,34 @@ function fixture(releasePlan: CiReleasePlan = plan) {
 				return JSON.stringify({ status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } });
 			if (path === "git/ref/tags/v1.2.0")
 				return JSON.stringify({ object: { type: "commit", sha: commit } });
+			const sharedTree = "1".repeat(40);
+			const config = Buffer.from(JSON.stringify(state.componentVersions ?? null));
+			const configSha = createHash("sha1")
+				.update(`blob ${config.length}\0`)
+				.update(config)
+				.digest("hex");
+			if (path === `git/trees/${commit}`)
+				return JSON.stringify({
+					truncated: false,
+					tree:
+						state.componentVersions === undefined
+							? []
+							: [{ path: "shared", mode: "040000", type: "tree", sha: sharedTree }],
+				});
+			if (path === `git/trees/${sharedTree}`)
+				return JSON.stringify({
+					truncated: false,
+					tree: [
+						{
+							path: "component-versions.json",
+							mode: "100644",
+							type: "blob",
+							sha: configSha,
+							size: config.length,
+						},
+					],
+				});
+			if (path === `git/blobs/${configSha}`) return config.toString("base64");
 			if (path === `contents/package.json?ref=${commit}`)
 				return contents({ version: releasePlan.version, packageManager: `bun@${CI_RELEASE_BUN}` });
 			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
@@ -260,6 +299,39 @@ function options(state: ReturnType<typeof fixture>) {
 }
 
 describe("CI immutable release bundle restoration", () => {
+	test("restores independently pinned build-only bundle bytes without inventing publication evidence", async () => {
+		const state = fixture(plan, true);
+		const before = readFileSync(join(state.bundle, "manifest.json"));
+		const restored = await restoreCiReleaseBundle(options(state));
+		expect(restored.plan.componentEvidence).toBeUndefined();
+		expect(state.manifest.helperDistribution?.executor.version).toBe("0.9.1");
+		expect(readFileSync(join(restored.destination, "manifest.json"))).toEqual(before);
+		for (const file of state.manifest.files)
+			expect(readFileSync(join(restored.destination, "dist", file.name))).toEqual(
+				readFileSync(join(state.bundle, "dist", file.name)),
+			);
+		expect(state.calls.some((args) => /executor-v|helpers-v|releases/.test(args[1]))).toBe(false);
+	});
+	test("restored declarations must match target JSON, never the current control pin", async () => {
+		for (const componentVersions of [
+			{ executor: { version: "0.9.2", protocolVersion: 1 } },
+			{ executor: { version: "0.9.1", protocolVersion: 2 } },
+		]) {
+			const state = fixture(plan, true);
+			state.componentVersions = componentVersions;
+			await expect(restoreCiReleaseBundle(options(state))).rejects.toThrow(
+				"target component configuration",
+			);
+		}
+		const missing = fixture();
+		missing.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 } };
+		await expect(restoreCiReleaseBundle(options(missing))).rejects.toThrow(
+			"target component configuration",
+		);
+		const legacy = fixture(plan, true);
+		legacy.componentVersions = undefined;
+		await expect(restoreCiReleaseBundle(options(legacy))).rejects.toThrow("Legacy target");
+	});
 	test("fork restore uses the same repository/default branch through artifact download", async () => {
 		const repository = "Example/Custom";
 		const defaultBranch = "trunk";

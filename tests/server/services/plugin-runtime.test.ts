@@ -767,13 +767,33 @@ describe("RuntimeSupervisor", () => {
 			restartMaxDelayMs: 1,
 			restartJitterRatio: 0,
 		});
+		const restarted = Promise.withResolvers<void>();
+		const quarantined = Promise.withResolvers<void>();
 		const runtime = supervisor.register({
 			...baseRuntimeOptions,
-			command: [bunPath, fixturePath, "crash"],
+			onStateChange(state) {
+				if (state === "active" && runtime.generation === 2) restarted.resolve();
+				if (state === "quarantine") quarantined.resolve();
+			},
 		});
-		await supervisor.start("com.example.runtime");
-		await eventually(() => runtime.state === "quarantine", 1_500);
-		expect(supervisor.getDiagnostics("com.example.runtime")[0]?.state).toBe("quarantine");
+		const crashOwnedFixture = () => {
+			const pid = runtime.pid;
+			if (!pid) throw new Error("Expected this fixture's active child PID");
+			process.kill(pid, "SIGKILL");
+		};
+		try {
+			await supervisor.start("com.example.runtime");
+			expect(runtime.state).toBe("active");
+			crashOwnedFixture();
+			await restarted.promise;
+			expect(runtime.generation).toBe(2);
+			crashOwnedFixture();
+			await quarantined.promise;
+			expect(runtime.generation).toBe(2);
+			expect(supervisor.getDiagnostics("com.example.runtime")[0]?.state).toBe("quarantine");
+		} finally {
+			await supervisor.shutdown();
+		}
 	});
 
 	it("handles slow and malformed real-process fixtures", async () => {

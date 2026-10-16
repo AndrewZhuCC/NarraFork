@@ -1,10 +1,16 @@
-import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
+import type {
+	AsyncQuestion,
+	HumanAttentionDetail,
+	PendingPermission,
+} from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { CodexComposerSuggestion } from "@shared/codex-composer";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
+import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import type { NarratorNavigationSummary, NarratorPanelState } from "@shared/narrator-panel-state";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
@@ -15,12 +21,15 @@ import type { RequestRecordingDetail, SavedRecording } from "@shared/request-rec
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { narratorLoadingMetrics } from "../narrator-loading-metrics";
+import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
 import type { GitIdentity } from "./auth";
 import {
 	ApiError,
 	absorbRenewedToken,
 	apiBase,
 	authorizedFetch,
+	clearTokenOnSessionFailure,
 	getToken,
 	postFormDataWithProgress,
 	readFetchError,
@@ -53,6 +62,56 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+export interface NarratorPanelStateOptions extends SharedReadOptions {
+	permissionsCursor?: string;
+	bufferCursor?: string;
+}
+
+export type NarratorPanelStateResponse = NarratorPanelState<
+	PendingPermission,
+	BufferMessageSummary
+>;
+
+export type NarratorDetail = ApiEntity & {
+	navigationSummary?: NarratorNavigationSummary;
+};
+
+const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
+
+/** Live-request deduplication only; safety reconciliation never adopts query-cache permissions. */
+export function getNarratorPanelState(id: string, options: NarratorPanelStateOptions = {}) {
+	const { permissionsCursor, bufferCursor } = options;
+	const scope = getToken();
+	const key = JSON.stringify([scope, id, permissionsCursor ?? null, bufferCursor ?? null]);
+	return sharePanelStateRead(
+		key,
+		async (signal) => {
+			const controller = new AbortController();
+			const abort = () => controller.abort(signal.reason);
+			signal.addEventListener("abort", abort, { once: true });
+			if (signal.aborted) abort();
+			const timer = setTimeout(
+				() => controller.abort(new Error("Panel state read timed out")),
+				10_000,
+			);
+			try {
+				const params = new URLSearchParams();
+				if (permissionsCursor) params.set("permissionsCursor", permissionsCursor);
+				if (bufferCursor) params.set("bufferCursor", bufferCursor);
+				const query = params.toString();
+				return await request<NarratorPanelStateResponse>(
+					`/narrators/${encodeURIComponent(id)}/panel-state${query ? `?${query}` : ""}`,
+					{ signal: controller.signal },
+				);
+			} finally {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", abort);
+			}
+		},
+		options,
+	);
+}
 
 /** Bounded source lane: timeout, packet bytes and caller cancellation are independent of document size. */
 async function requestTextDocumentJson<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -661,8 +720,30 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
-	getNarrator: (id: string, signal?: AbortSignal) =>
-		request<ApiEntity>(`/narrators/${id}`, { signal }),
+	getNarrator: async (id: string, signal?: AbortSignal) => {
+		const token = narratorLoadingMetrics.current(id);
+		if (token) narratorLoadingMetrics.mark(token, "detail-start");
+		const detail = await request<NarratorDetail>(`/narrators/${id}`, { signal });
+		if (token) narratorLoadingMetrics.mark(token, "detail-ready");
+		return detail;
+	},
+	getNarratorPanelState,
+	getNarratorGitSummary: async (
+		id: string,
+		signal?: AbortSignal,
+	): Promise<GitWorkspaceSummary | null> => {
+		// Generic request() treats JSON null as malformed; null is an explicit valid summary here.
+		const response = await authorizedFetch(
+			`${apiBase()}/narrators/${encodeURIComponent(id)}/git/summary`,
+			{ signal },
+		);
+		if (!response.ok) {
+			await clearTokenOnSessionFailure(response.clone());
+			const error = await readFetchError(response, "Git summary read failed");
+			throw new ApiError(error.message, response.status, error.data);
+		}
+		return response.json() as Promise<GitWorkspaceSummary | null>;
+	},
 
 	/**
 	 * Upload a custom bitmap avatar for a narrator, replacing any previous one.
@@ -690,7 +771,7 @@ export const narratorsApi = {
 			signal,
 			maxResponseBytes: 4_096,
 		}),
-	getNarratorDraft: (id: string) =>
+	getNarratorDraft: (id: string, signal?: AbortSignal) =>
 		request<{
 			hasDraft: boolean;
 			text: string;
@@ -699,7 +780,7 @@ export const narratorsApi = {
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
-		}>(`/narrators/${id}/draft`),
+		}>(`/narrators/${id}/draft`, { signal }),
 	updateNarratorDraft: (
 		id: string,
 		text: string,
@@ -1042,7 +1123,8 @@ export const narratorsApi = {
 		}),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
-	getBufferedMessages: (id: string) => request<BufferMessageSummary[]>(`/narrators/${id}/buffer`),
+	getBufferedMessages: (id: string, signal?: AbortSignal) =>
+		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
 	/**
 	 * Edit a queued message's text and/or its attachments.
 	 *
@@ -1127,7 +1209,8 @@ export const narratorsApi = {
 		request<HumanAttentionDetail>(`/narrators/human-attention/${encodeURIComponent(id)}`, {
 			signal,
 		}),
-	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
+	getPendingPermissions: (id: string, signal?: AbortSignal) =>
+		request<PendingPermission[]>(`/narrators/${id}/permissions`, { signal }),
 	// Async AskUserQuestion inbox — separate from permissions because nothing is
 	// suspended waiting for these (see the AsyncQuestion type).
 	//
@@ -1964,12 +2047,19 @@ export const narratorsApi = {
 			body: JSON.stringify({ summary }),
 		}),
 
-	// File tree — current uncommitted Git line counts, relative to this narrator's cwd.
+	// File tree — current Git changes relative to this narrator's cwd; legacy line counts are optional.
 	getFileTreeStatus: (narratorId: string, workspaceKey?: string, signal?: AbortSignal) =>
 		request<{
 			isGitRepo: boolean;
-			files: Array<{ path: string; linesAdded: number; linesRemoved: number }>;
+			files: Array<{
+				path: string;
+				status?: string;
+				oldPath?: string;
+				linesAdded?: number;
+				linesRemoved?: number;
+			}>;
 			totalFiles: number;
+			totalFilesExact?: boolean;
 			truncated: boolean;
 		}>(
 			`/narrators/${narratorId}/file-tree-status${workspaceKey ? `?workspaceKey=${encodeURIComponent(workspaceKey)}` : ""}`,

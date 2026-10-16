@@ -1,10 +1,10 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.9.1",
+	"version": "0.9.2",
 	"private": true,
 	"license": "MPL-2.0",
-	"packageManager": "bun@1.4.2",
+	"packageManager": "bun@1.4.3",
 	"dependencies": {
 		"@babel/parser": "7.29.0",
 		"@chenglou/pretext": "^0.0.8",
@@ -80,6 +80,7 @@
 		"sanitize-html": "^2.17.3",
 		"selfsigned": "^5.5.0",
 		"shiki": "^4.0.2",
+		"tldts": "6.1.86",
 		"tree-sitter-bash": "0.25.0",
 		"tweetnacl": "^0.14.5",
 		"undici": "6.24.1",
@@ -91,7 +92,7 @@
 		"@biomejs/biome": "^2.4.12",
 		"@tanstack/router-plugin": "1.168.18",
 		"@types/archiver": "^7.0.0",
-		"@types/bun": "^1.4.2",
+		"@types/bun": "^1.4.3",
 		"@types/dagre": "^0.7.54",
 		"@types/katex": "^0.16.8",
 		"@types/qrcode": "^1.5.6",
@@ -155,6 +156,7 @@
 		"tree-sitter-bash"
 	],
 	"patchedDependencies": {
-		"@openuidev/react-ui@0.17.0": "patches/@openuidev%2Freact-ui@0.17.0.patch"
+		"@openuidev/react-ui@0.17.0": "patches/@openuidev%2Freact-ui@0.17.0.patch",
+		"@cypress/request-promise@5.0.0": "patches/@cypress%2Frequest-promise@5.0.0.patch"
 	}
 }

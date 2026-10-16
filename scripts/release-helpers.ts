@@ -2,6 +2,7 @@
  * Auxiliary release controller. No implicit publishing: use preview for offline
  * validation; publish is an explicit remote write and --dry-run makes it offline.
  */
+
 import { appendFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
@@ -10,18 +11,16 @@ import {
 	type HelperPlatform,
 } from "../shared/helper-distribution";
 import {
-	assertBridgeMode,
-	ciBridgeDeadlineSignal,
-	createBridgeGhRunner,
-} from "./lib/ci-update-server-bridge-restore";
+	ciPublicationDeadlineSignal,
+	createPublicationGhRunner,
+} from "./lib/ci-publication-runtime";
+import { timeReleasePhase } from "./lib/ci-release-io";
 import {
 	assembleHelperReleaseBundle,
 	assertHelperReleaseGate,
 	buildHelperReleasePlatform,
 	type HelperReleasePlan,
-	mirrorHelperReleasePlan,
 	planHelperRelease,
-	prepareHelperReleaseBridge,
 	publishHelperReleasePlan,
 	readHelperReleasePlan,
 	restoreHelperReleaseBundle,
@@ -43,34 +42,15 @@ const COMMANDS = [
 ] as const;
 type HelperControllerCommand = (typeof COMMANDS)[number];
 const COMMAND_OPTIONS: Record<HelperControllerCommand, readonly string[]> = {
-	preflight: [
-		"root",
-		"plan",
-		"kind",
-		"tag",
-		"source-run-id",
-		"publish",
-		"mirror-only",
-		"bridge-run-id",
-		"bridge-run-attempt",
-	],
+	preflight: ["root", "plan", "kind", "tag", "source-run-id", "publish"],
 	build: ["root", "plan", "output", "cache", "platform"],
 	smoke: ["root", "plan", "output", "platform"],
 	assemble: ["root", "plan", "output", "native"],
 	restore: ["root", "plan", "output", "source-run-id"],
 	preview: ["root", "plan", "output"],
-	publish: [
-		"root",
-		"plan",
-		"output",
-		"dry-run",
-		"bridge-dir",
-		"source-run-attempt",
-		"bridge-artifact-id",
-		"bridge-artifact-digest",
-	],
-	"prepare-bridge": ["root", "plan", "output", "bridge-dir", "source-run-attempt"],
-	mirror: ["root", "plan", "output", "bridge-dir", "source-run-attempt"],
+	publish: ["root", "plan", "output", "dry-run", "source-run-attempt", "bundle-artifact-id"],
+	"prepare-bridge": [],
+	mirror: [],
 	gate: [],
 };
 function validRunId(value: string): boolean {
@@ -82,6 +62,10 @@ export function parseHelperReleaseArguments(args: string[]): {
 	dryRun: boolean;
 } {
 	const command = args[0] as HelperControllerCommand;
+	if (command === "prepare-bridge" || command === "mirror")
+		throw new Error(
+			"Legacy bridge publication is retired; use the independent update-server-mirror workflow. Historical seals are diagnostic only.",
+		);
 	if (!COMMANDS.includes(command))
 		throw new Error(
 			"Expected preflight|build|smoke|assemble|restore|preview|publish; publish explicitly writes remotely, preview and publish --dry-run validate offline",
@@ -107,13 +91,7 @@ export function parseHelperReleaseArguments(args: string[]): {
 				(character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
 			) ||
 			(!value.trim() &&
-				!(
-					value === "" &&
-					((command === "preflight" &&
-						["source-run-id", "bridge-run-id", "bridge-run-attempt"].includes(name)) ||
-						(command === "publish" &&
-							["bridge-artifact-id", "bridge-artifact-digest"].includes(name)))
-				))
+				!(value === "" && command === "preflight" && ["source-run-id"].includes(name)))
 		)
 			throw new Error(`Invalid option value: --${name}`);
 		options.set(name, value);
@@ -121,12 +99,6 @@ export function parseHelperReleaseArguments(args: string[]): {
 	if (command === "preflight") {
 		const publish = options.get("publish") ?? "false";
 		if (publish !== "true" && publish !== "false") throw new Error("Expected --publish=true|false");
-		assertBridgeMode({
-			publish,
-			mirrorOnly: options.get("mirror-only") ?? "false",
-			sourceRunId: options.get("source-run-id"),
-			bridgeRunId: options.get("bridge-run-id"),
-		});
 		const kind = options.get("kind");
 		const tag = options.get("tag");
 		if (kind !== "helpers" && kind !== "executor")
@@ -144,13 +116,7 @@ export function parseHelperReleaseArguments(args: string[]): {
 		!HELPER_PLATFORMS.includes(options.get("platform") as HelperPlatform)
 	)
 		throw new Error(`${command} requires a supported --platform`);
-	for (const name of [
-		"source-run-id",
-		"bridge-run-id",
-		"bridge-run-attempt",
-		"source-run-attempt",
-		"bridge-artifact-id",
-	]) {
+	for (const name of ["source-run-id", "source-run-attempt", "bundle-artifact-id"]) {
 		const value = options.get(name);
 		if (value !== undefined && value !== "" && !validRunId(value))
 			throw new Error(`Invalid --${name}`);
@@ -180,11 +146,16 @@ export async function runHelperReleaseController(args: string[]): Promise<void> 
 	const cancel = () => abort.abort(new Error("Helper release cancelled"));
 	process.once("SIGINT", cancel);
 	process.once("SIGTERM", cancel);
-	const signal = ["prepare-bridge", "publish", "mirror", "restore"].includes(args[0] ?? "")
-		? ciBridgeDeadlineSignal(process.env, abort.signal)
+	const signal = ["publish", "restore"].includes(args[0] ?? "")
+		? ciPublicationDeadlineSignal(process.env, abort.signal)
 		: abort.signal;
 	try {
-		await runHelperReleaseCommand(args, signal);
+		await timeReleasePhase(
+			`auxiliary.${args[0] ?? "unknown"}.total`,
+			{},
+			() => runHelperReleaseCommand(args, signal),
+			signal,
+		);
 	} finally {
 		process.removeListener("SIGINT", cancel);
 		process.removeListener("SIGTERM", cancel);
@@ -206,9 +177,6 @@ async function runHelperReleaseCommand(args: string[], signal: AbortSignal): Pro
 			planPath,
 			await planHelperRelease(root, option("kind"), option("tag"), option("source-run-id"), {
 				publish: option("publish", "false") === "true",
-				mirrorOnly: option("mirror-only", "false") === "true",
-				bridgeRunId: option("bridge-run-id"),
-				bridgeRunAttempt: option("bridge-run-attempt"),
 			}),
 		);
 		return;
@@ -241,36 +209,20 @@ async function runHelperReleaseCommand(args: string[], signal: AbortSignal): Pro
 				sourceRunId: resolveHelperRestoreSource(plan, parsed.options.get("source-run-id")),
 			},
 			output,
-			{ signal, run: createBridgeGhRunner(signal) },
+			{ signal, run: createPublicationGhRunner(signal) },
 		);
 		if (process.env.GITHUB_OUTPUT)
 			await appendFile(
 				process.env.GITHUB_OUTPUT,
-				`source-run-attempt=${restored.sourceRunAttempt}\n`,
+				`source-run-attempt=${restored.sourceRunAttempt}\nbundle-artifact-id=${restored.artifactId}\n`,
 			);
-	} else if (
-		command === "preview" ||
-		command === "publish" ||
-		command === "prepare-bridge" ||
-		command === "mirror"
-	) {
-		const bridgeOptions = {
-			run: createBridgeGhRunner(signal),
-			bridgeDir: resolve(root, option("bridge-dir", ".helper-release/bridge")),
+	} else if (command === "preview" || command === "publish") {
+		await publishHelperReleasePlan(plan, output, command === "preview" || parsed.dryRun, {
+			run: createPublicationGhRunner(signal),
 			sourceRunAttempt: option("source-run-attempt"),
-			artifactId: option("bridge-artifact-id"),
-			artifactDigest: option("bridge-artifact-digest"),
+			bundleArtifactId: option("bundle-artifact-id"),
 			signal,
-		};
-		if (command === "prepare-bridge") await prepareHelperReleaseBridge(plan, output, bridgeOptions);
-		else if (command === "mirror") await mirrorHelperReleasePlan(plan, output, bridgeOptions);
-		else
-			await publishHelperReleasePlan(
-				plan,
-				output,
-				command === "preview" || parsed.dryRun,
-				bridgeOptions,
-			);
+		});
 	} else throw new Error("Expected preflight|build|smoke|assemble|restore|preview|publish");
 }
 if (import.meta.main) await runHelperReleaseController(process.argv.slice(2));

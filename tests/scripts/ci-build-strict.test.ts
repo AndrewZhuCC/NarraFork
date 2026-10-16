@@ -20,6 +20,7 @@ import {
 	verifyCiSidecar,
 	writeBuildAggregates,
 } from "../../scripts/lib/ci-build-strict";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const dirs: string[] = [];
 function temp() {
@@ -56,6 +57,7 @@ async function worker(
 				version: identity.version,
 				commit: identity.commit,
 				repository: identity.repository,
+				helperDistribution: createHelperDistributionDependencies("0.9.1"),
 				releaseCi,
 			},
 		});
@@ -83,11 +85,11 @@ async function worker(
 
 describe("strict CI builds fail closed without compiling or publishing", () => {
 	test("requires exact pinned Bun and a complete commit", () => {
-		validateCiBuildIdentity("bun@1.4.2", "1.4.2", identity.commit);
-		for (const pin of [undefined, "bun@latest", "bun@^1.4.2", "bun@1.4.1"]) {
-			expect(() => validateCiBuildIdentity(pin, "1.4.2", identity.commit)).toThrow("Bun");
+		validateCiBuildIdentity("bun@1.4.3", "1.4.3", identity.commit);
+		for (const pin of [undefined, "bun@latest", "bun@^1.4.3", "bun@1.4.2"]) {
+			expect(() => validateCiBuildIdentity(pin, "1.4.3", identity.commit)).toThrow("Bun");
 		}
-		expect(() => validateCiBuildIdentity("bun@1.4.2", "1.4.2", "a123456")).toThrow("commit");
+		expect(() => validateCiBuildIdentity("bun@1.4.3", "1.4.3", "a123456")).toThrow("commit");
 	});
 	test("macOS uses system codesign, verifies, and propagates sign/verify failures", async () => {
 		const commands: string[][] = [];
@@ -127,6 +129,27 @@ describe("strict CI builds fail closed without compiling or publishing", () => {
 		await expect(verifyCiSidecar(join(dist, platform.name), identity)).resolves.toEqual(
 			result.metadata,
 		);
+	});
+	test("APP and executor versions differ while frozen component pin remains strict", async () => {
+		const path = join(temp(), platform.name);
+		writeFileSync(path, "fixture executable");
+		const dependencies = createHelperDistributionDependencies("0.9.1");
+		const metadata = await computeCiBinaryMetadata(path, {
+			...input,
+			helperDistribution: dependencies,
+		});
+		const expected = { ...identity, helperDistribution: dependencies };
+		validateCiMetadata(metadata, expected);
+		expect(metadata.version).toBe("1.2.3");
+		expect(metadata.helperDistribution).toEqual(dependencies);
+		for (const helperDistribution of [
+			undefined,
+			createHelperDistributionDependencies("0.9.2"),
+			createHelperDistributionDependencies("0.9.1", 2),
+			{ ...dependencies, executor: { ...dependencies.executor, tag: "executor-v0.9.2" } },
+		]) {
+			expect(() => validateCiMetadata({ ...metadata, helperDistribution }, expected)).toThrow();
+		}
 	});
 	test("metadata write failure fails strict worker but local mode remains best effort", async () => {
 		const dist = temp();

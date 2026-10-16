@@ -1624,14 +1624,16 @@ async function maybeDeliverInterruptTaskGuard(
 
 // === Agent loop execution ===
 
-/** Sum non-cached input + output tokens from a usage snapshot (for round token totals). */
 function tokenUsageValue(usage?: TokenUsageSnapshot): number {
 	if (!usage) return 0;
-	const nonCachedInput = Math.max(0, (usage.inputTokens ?? 0) - (usage.cachedInputTokens ?? 0));
-	if (usage.inputTokens != null || usage.completionTokens != null) {
-		return nonCachedInput + Math.max(0, usage.completionTokens ?? 0);
-	}
-	return Math.max(0, usage.promptTokens ?? 0) + Math.max(0, usage.completionTokens ?? 0);
+	const cacheWrite = Math.max(
+		usage.cacheCreationInputTokens ?? 0,
+		(usage.cacheCreation5mTokens ?? 0) + (usage.cacheCreation1hTokens ?? 0),
+	);
+	const input =
+		usage.inputTokens ??
+		Math.max(0, (usage.promptTokens ?? 0) - (usage.cachedInputTokens ?? 0) - cacheWrite);
+	return Math.max(0, input) + Math.max(0, usage.completionTokens ?? 0);
 }
 
 export async function ensureSkillCacheFreshForActiveNarrator(
@@ -1680,12 +1682,15 @@ export async function updateActiveNarratorCwdAndSkillContext(
  * obtain a round-level token total for the Stop hook.
  */
 export function accountTokenUsageForTurn(active: ActiveNarrator): number {
-	const tokenDelta = Math.max(
-		0,
-		tokenUsageValue(active._lastTokenUsage) - tokenUsageValue(active._tokenUsageBaseline),
-	);
-	active._tokenUsageBaseline = active._lastTokenUsage;
+	const total = active._requestTokenTotal ?? 0;
+	const tokenDelta = Math.max(0, total - (active._tokenUsageBaseline ?? 0));
+	active._tokenUsageBaseline = total;
 	return tokenDelta;
+}
+
+/** Called once for each owned request end, independently of context occupancy snapshots. */
+export function accountRequestTokenUsage(active: ActiveNarrator, usage?: TokenUsageSnapshot): void {
+	active._requestTokenTotal = (active._requestTokenTotal ?? 0) + tokenUsageValue(usage);
 }
 
 async function loadCompiledSpecForContinuation(narratorId: string) {
@@ -2358,7 +2363,12 @@ export async function drainInjectionsIntoHistory(
 	active: ActiveNarrator,
 	locale: Locale,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
-): Promise<{ text: string; parts: AgentInputPart[]; onConsumed: () => void }> {
+): Promise<{
+	text: string;
+	parts: AgentInputPart[];
+	lastInputWasMailbox: boolean;
+	onConsumed: () => void;
+}> {
 	const narratorId = active.narratorId;
 	const parts: AgentInputPart[] = [];
 	const { buildPendingQuestionHint } = await import("./narrator-question-service");
@@ -2499,6 +2509,9 @@ export async function drainInjectionsIntoHistory(
 	return {
 		text: parts.map((part) => part.text).join("\n\n"),
 		parts,
+		lastInputWasMailbox: adoptedDeliveries.some(
+			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
+		),
 		onConsumed: () => {
 			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
 			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
@@ -2741,7 +2754,13 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
-		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+		const deadline = Date.now() + 10_000;
+		const signal = opts.attachmentSignal;
+		signal?.throwIfAborted();
+		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+			signal,
+			deadline,
+		});
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -2752,11 +2771,16 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			profile: isSubagentNarrator ? "subagent" : "primary",
 			sourceMessages: rawMsgs,
 			attachmentCwd: opts.getAttachmentCwd?.(),
-			attachmentSignal: opts.attachmentSignal,
+			attachmentSignal: signal,
+			deadline,
 		});
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
 			: undefined;
+		const { verifyModelHistoryRowsCurrent } = await import("./agent-runtime/model-history-source");
+		await verifyModelHistoryRowsCurrent(rawMsgs, { signal, deadline });
+		signal?.throwIfAborted();
+		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {
 			history: result.history,
 			pendingToolResults: result.trailingToolResults,
@@ -4241,49 +4265,8 @@ export async function startBackgroundCompletionContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
-	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
-
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status !== "idle") return { started: false };
-		// Plan-mode narrators are not auto-woken, matching goal and inbound continuation.
-		// This check was missing here while the other three entries had it, so a finished
-		// background task could pull a narrator out of planning and into execution.
-		// Declining to wake loses nothing: the notification stays queued for the next
-		// drain (the queue is only emptied by a path that delivers it).
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
-
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
-
-		const prompt = await drainAndPersistPendingInjections(active);
-		if (!prompt) return { started: false };
-
-		active._continuationSuppressed = false;
-		active._continuationStallCount = 0;
-		active._continuationStallKey = undefined;
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = new Date().toISOString();
-
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (background completion)", {
-				narratorId,
-				error: String(err),
-			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
-		});
-		return { started: true };
-	});
+	// Background results and Send(parent) share one mailbox and the same wake policy.
+	return startParentInboundContinuationIfPossible(narratorId, locale, replyInUserLanguage);
 }
 
 /**
@@ -4719,7 +4702,7 @@ export async function startInjectionContinuationIfPossible(
 		if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
+		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
 		if (
 			executionPrincipal &&
 			db
@@ -4880,8 +4863,8 @@ export async function resumeBufferedMessagesIfIdle(
  * Wake an idle parent narrator to consume progress reports sent by its child
  * subagents via Send({ id: "parent" }). A working/waiting parent drains the
  * queue at its next after_tools sidecar boundary, so this only acts on idle
- * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation)
- * — the message stays queued until their next activity.
+ * narrators, including plan-mode parents gathering delegated research. Delivering
+ * a report does not approve/exit plan mode; the resumed loop retains its plan gates.
  *
  * Reuses continuationStartLock so it cannot race the background-task
  * completion continuation into starting two concurrent loops.
@@ -4892,12 +4875,19 @@ export async function startParentInboundContinuationIfPossible(
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
+		// Recheck inside start admission: publication may have observed an idle
+		// recipient before an approval, compaction, or another owner took over.
+		if (
+			isNarratorRuntimeBusy(narratorId) ||
+			compactLocks.has(narratorId) ||
+			isNarratorRevertAdmissionBlocked(narratorId)
+		)
+			return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
-		// Plan-mode narrators are not auto-woken; leave the report queued.
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
+		if (narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error")
+			return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
@@ -8356,10 +8346,7 @@ export async function recoverOnStartup(
 	// Preserve modern compact lifecycle records across restarts. Running attempts
 	// become failed audit entries; only legacy placeholders with no attempt/retry
 	// history are removed.
-	const staleCompactRecovery = await recoverStaleCompactingMessages();
-	if (staleCompactRecovery.preserved > 0 || staleCompactRecovery.deleted > 0) {
-		logger.info("Stale compacting messages recovered on startup", staleCompactRecovery);
-	}
+	await recoverStaleCompactingMessages();
 
 	const transientCompactRows = await db.query.narrators.findMany({
 		columns: { id: true, substatus: true },

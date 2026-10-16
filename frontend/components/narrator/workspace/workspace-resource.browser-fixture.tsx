@@ -11,10 +11,17 @@ import { createInstance } from "i18next";
 import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import type { PretextDocumentPageResult, TreeMessage } from "../../../lib/api/types";
 import { onPanelDragEnd, onPanelDragMove } from "../../../lib/panel-drag";
 import narratorTranslations from "../../../locales/en/narrators.json";
 import { ToolPanelShell } from "../dock/panels";
-import { useNarratorPanelVisible } from "../narrator-panel-visibility";
+import {
+	DockviewNarratorPanelVisibilityProvider,
+	useNarratorPanelVisible,
+} from "../narrator-panel-visibility";
+import type { PretextDocumentFetchPage } from "../vlist/pretext-document-loader";
+import { usePretextDocument } from "../vlist/usePretextDocument";
+import { hasVisibleVListGeometry } from "../vlist/vlist-visible-viewport";
 import { DEFAULT_DIRECTOR_STATE, serializeWorkspaceLayout } from "./dockview-layout";
 import type { WorkspacePanelParams } from "./panel-types";
 import { WorkspaceResourceFrame } from "./WorkspaceResourceFrame";
@@ -48,6 +55,26 @@ let nextInstance = 0;
 let reveals = 0;
 let overlayClicks = 0;
 let ready = false;
+// Opt-in only: existing resource/Director cases retain their original mocked bodies.
+const messagesMode = new URLSearchParams(location.search).get("messages") === "1";
+const messageRequests: { narratorId: string; tail: boolean; aborted: boolean }[] = [];
+const messageDocuments: Record<
+	string,
+	{
+		narratorId: string;
+		providerVisible: boolean;
+		status: string;
+		messageIds: string[];
+		texts: string[];
+		itemCount: number;
+		totalHeight: number;
+		itemWidths: (number | undefined)[];
+		firstReadyMs: number | null;
+		clearedAfterReady: number;
+		zeroSizeAdoptions: number;
+		error: string | null;
+	}
+> = {};
 let normalDragMoves = 0;
 let normalDragDrops = 0;
 onPanelDragMove(() => normalDragMoves++);
@@ -151,6 +178,166 @@ function ResourceButtons({ director = false }: { director?: boolean }) {
 			</button>
 		</div>
 	);
+}
+
+// Stable identity is essential: coordinator rerenders must not restart transport.
+const fetchMessagePage: PretextDocumentFetchPage = async (narratorId, options) => {
+	const request = {
+		narratorId,
+		tail: options.afterSeq == null && options.beforeSeq == null,
+		aborted: options.signal?.aborted ?? false,
+	};
+	messageRequests.push(request);
+	options.signal?.addEventListener(
+		"abort",
+		() => {
+			request.aborted = true;
+		},
+		{ once: true },
+	);
+	const messages = [0, 1].map((seq): TreeMessage => {
+		const text =
+			`## ${narratorId} message ${seq}\n\nReal measured document body for ${narratorId}. ` +
+			"Several words wrap naturally using this panel's actual browser width. ".repeat(8);
+		return {
+			id: `${narratorId}-message-${seq}`,
+			narratorId,
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [{ type: "text", text }],
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-10-01T00:00:00.000Z",
+			children: [],
+			seq,
+		} as TreeMessage;
+	});
+	return {
+		messages,
+		minSeq: 0,
+		maxSeq: 1,
+		hasNext: false,
+		hasPrev: false,
+		messageVersion: 1,
+	} satisfies PretextDocumentPageResult;
+};
+const messageLoadOptions = { fetchPage: fetchMessagePage };
+
+/** Real hook/coordinator/build; only the transport and expensive session/WS view are mocked. */
+function MessageDocumentProbe({ panelId, narratorId }: { panelId: string; narratorId: string }) {
+	const visible = useNarratorPanelVisible();
+	const nodeRef = useRef<HTMLDivElement | null>(null);
+	const [geometry, setGeometry] = useState({ width: 0, height: 0, ready: false });
+	const startedAt = useRef(performance.now());
+	const firstReadyAt = useRef<number | null>(null);
+	const previouslyReady = useRef(false);
+	const previousIndex = useRef<unknown>(null);
+	const cleared = useRef(0);
+	const zeroAdoptions = useRef(0);
+	useEffect(() => {
+		const node = nodeRef.current;
+		if (!node) return;
+		const measure = () => {
+			const ready = visible && hasVisibleVListGeometry(node);
+			const width = node.clientWidth;
+			const height = node.clientHeight;
+			setGeometry((old) =>
+				old.width === width && old.height === height && old.ready === ready
+					? old
+					: { width, height, ready },
+			);
+		};
+		const observer = new ResizeObserver(measure);
+		observer.observe(node);
+		measure();
+		return () => observer.disconnect();
+	}, [visible]);
+	const document = usePretextDocument(narratorId, {
+		layoutReady: visible && geometry.ready,
+		lod: 5,
+		widthBucket: String(geometry.width),
+		contentWidth: geometry.width,
+		viewportHeight: geometry.height,
+		scrollTop: 0,
+		pinnedToBottom: true,
+		loadOptions: messageLoadOptions,
+	});
+	useEffect(() => {
+		if (document.status === "ready" && document.index && firstReadyAt.current == null)
+			firstReadyAt.current = performance.now();
+		if (previouslyReady.current && document.messages.length === 0) cleared.current++;
+		if (
+			document.index &&
+			document.index !== previousIndex.current &&
+			(!nodeRef.current || !hasVisibleVListGeometry(nodeRef.current))
+		)
+			zeroAdoptions.current++;
+		previousIndex.current = document.index;
+		previouslyReady.current ||= document.messages.length > 0;
+		messageDocuments[panelId] = {
+			narratorId,
+			providerVisible: visible,
+			status: document.status,
+			messageIds: document.messages.map((message) => message.id),
+			texts: document.messages.map((message) => message.contentText ?? ""),
+			itemCount: document.items.length,
+			totalHeight: document.index?.totalHeight ?? 0,
+			itemWidths: document.items.map((item) => item.contentWidth),
+			firstReadyMs: firstReadyAt.current == null ? null : firstReadyAt.current - startedAt.current,
+			clearedAfterReady: cleared.current,
+			zeroSizeAdoptions: zeroAdoptions.current,
+			error: document.error == null ? null : String(document.error),
+		};
+	});
+	return (
+		<div
+			ref={nodeRef}
+			data-message-document={panelId}
+			data-message-status={document.status}
+			style={{ height: "100%", overflow: "auto" }}
+		>
+			{document.messages.map((message) => (
+				<p key={message.id}>{message.contentText}</p>
+			))}
+		</div>
+	);
+}
+
+export function messageSnapshot() {
+	return {
+		requests: messageRequests.map((request) => ({ ...request })),
+		documents: Object.entries(messageDocuments).map(([panelId, document]) => {
+			const node = window.document.querySelector(`[data-message-document="${panelId}"]`);
+			const panel = apiRef.current?.getPanel(panelId);
+			return {
+				panelId,
+				...document,
+				width: node?.clientWidth ?? 0,
+				height: node?.clientHeight ?? 0,
+				apiVisible: panel?.api.isVisible,
+				apiActive: panel?.api.isActive,
+			};
+		}),
+	};
+}
+
+/** Exercise real zero-size CSS parking, independently of Dockview's visibility:hidden overlay. */
+export function parkMessageViewport(panelId: string, parked: boolean) {
+	const node = document.querySelector<HTMLElement>(`[data-message-document="${panelId}"]`);
+	if (!messagesMode || !node) throw new Error("Message viewport is not mounted");
+	node.style.display = parked ? "none" : "";
+}
+
+export function addMessageTab(panelId: string, narratorId: string) {
+	if (!messagesMode) throw new Error("Message fixture mode is not enabled");
+	return nativeDockviewApi().addPanel({
+		id: panelId,
+		component: "narrator",
+		params: { panelType: "narrator", narratorId },
+		title: narratorId,
+		inactive: true,
+		position: { referencePanel: "source-a", direction: "within" },
+	});
 }
 
 function BodyVisibilityProbe({ children }: { children: ReactNode }) {
@@ -264,7 +451,13 @@ function MockPanel(props: IDockviewPanelProps<WorkspacePanelParams>) {
 			}}
 		>
 			{params.panelType === "narrator" ? (
-				body
+				messagesMode ? (
+					<DockviewNarratorPanelVisibilityProvider api={api}>
+						<MessageDocumentProbe panelId={api.id} narratorId={params.narratorId} />
+					</DockviewNarratorPanelVisibilityProvider>
+				) : (
+					body
+				)
 			) : (
 				<WorkspaceResourceFrame props={props}>
 					<ToolPanelShell
@@ -373,6 +566,15 @@ function Harness() {
 										params: { panelType: "narrator", narratorId: "narrator-b" },
 										title: "Bob",
 										position: { referencePanel: "source-a", direction: "right" },
+									});
+								}
+								if (new URLSearchParams(location.search).get("slots") === "3") {
+									api.addPanel({
+										id: "source-c",
+										component: "narrator",
+										params: { panelType: "narrator", narratorId: "narrator-c" },
+										title: "Carol",
+										position: { referencePanel: "source-b", direction: "right" },
 									});
 								}
 								ready = true;

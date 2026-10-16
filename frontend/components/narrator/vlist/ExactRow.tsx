@@ -22,6 +22,7 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
+import { QUOTE_ROLE_ATTR } from "../composer/quote-source-attrs";
 import { MessageIdentityCtx } from "../MessageIdentityCtx";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { openCommunicationRecipient } from "./communication-navigation";
@@ -456,10 +457,8 @@ export const ExactRow = memo(
 		// only decides whether they respond to a click.
 		if (kind === "knowledge-hint" && injectionNavigation?.onOpenKnowledge) {
 			const openKnowledge = injectionNavigation.onOpenKnowledge;
-			// A hint always names GLOBAL entries: the injector matches against the
-			// project's shared collections, so a personal scope here would resolve to an
-			// id that does not exist.
-			extra.onOpenEntry = (entryId: string) => openKnowledge(entryId, "global");
+			extra.onOpenEntry = (entryId: string, scope: "global" | "personal" = "global") =>
+				openKnowledge(entryId, scope);
 		}
 		// Dynamic Spec task rows animate ONLY on the newest surface of a running
 		// narrator. Both surfaces get the same flag: a framed task bubble
@@ -976,6 +975,7 @@ export const ExactRow = memo(
 				// to this node (see vlist-fold-motion). `id` cannot serve: it is the
 				// MESSAGE id, which several rows of one message share. Height-neutral.
 				data-nf-row-key={item.spec.key}
+				{...(kind === "markdown" ? { [QUOTE_ROLE_ATTR]: "assistant" } : {})}
 				style={{
 					position: "absolute",
 					top,

@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,11 +10,33 @@ import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
 import { settings } from "../../lib/settings";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
+import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
+import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
+import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
+import {
+	loadModelHistorySource,
+	markModelHistoryRows,
+} from "../agent-runtime/model-history-source";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
-const { buildRuntimeHistory } = await import("../agent-runtime/history");
+const { buildRuntimeHistory: buildSignedRuntimeHistory } = await import("../agent-runtime/history");
+// Explicit sourceMessages in this provider-projection suite are synthetic, not persisted rows.
+// Obtain their unversioned provenance through the real loader on a private legacy fixture;
+// never bypass the guard or downgrade rows loaded from the shipped DB in the integration cases.
+const syntheticDb = new Database(":memory:");
+syntheticDb.run(modelHistoryFixtureSql);
+syntheticDb.run("INSERT INTO narrators (id,title) VALUES ('synthetic','Synthetic')");
+const syntheticSource = await loadModelHistorySource(
+	{ backend: "sqlite", sqlite: syntheticDb },
+	"synthetic",
+);
+syntheticDb.close();
+function buildRuntimeHistory(options: Parameters<typeof buildSignedRuntimeHistory>[0]) {
+	if (options.sourceMessages) markModelHistoryRows(options.sourceMessages, syntheticSource);
+	return buildSignedRuntimeHistory(options);
+}
 const { narratorPersistence } = await import("../narrator-persistence");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { consumeAgentMessageHistory } = await import("../agent-message-delivery");
@@ -24,6 +47,12 @@ const originalGeminiProviders = settings.geminiProviders;
 const time = "2026-09-09T00:00:00.000Z";
 beforeEach(() => {
 	cleanDb(sqlite);
+	// Keep the actual loader integration cases versioned after cleanDb clears fixture rows.
+	sqlite
+		.query(
+			"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
+		)
+		.run(MODEL_HISTORY_REVISION_CONTRACT);
 	settings.anthropicProviders = [false, true].map((officialApi) => ({
 		id: officialApi ? "history-official" : "history-relay",
 		name: "History test",
@@ -55,6 +84,7 @@ beforeEach(() => {
 	);
 	for (const id of ["primary", "child", "fork"])
 		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	expect(readSqliteModelHistorySignature(sqlite, "primary").trusted).toBe(true);
 });
 afterEach(() => {
 	for (const id of ["primary", "child", "fork"]) getExecutionOwner(id)?.release();

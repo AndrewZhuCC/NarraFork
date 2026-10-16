@@ -53,9 +53,10 @@ const provider: ProviderAdapter = {
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
 };
-const unregisterProvider = registerExternalProviderResolver((name) =>
-	name === "test" ? provider : null,
-);
+const unregisterProvider = registerExternalProviderResolver({
+	resolve: (name) => (name === "test" ? provider : null),
+	listReadiness: () => [],
+});
 
 const ROOT = "runtime-owner-root";
 const CHILD = "runtime-owner-child";

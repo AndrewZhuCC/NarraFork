@@ -502,7 +502,78 @@ describe("GitChangesTab status filter", () => {
 		expect(container.textContent).toContain("Unstaged (3+)");
 		expect(container.textContent).toContain("Staged count is a lower bound");
 		expect(container.textContent).toContain("Unstaged count is a lower bound");
+		client.setQueryData<GitStatusSummary>(
+			["gitStatus", chapterId],
+			(old) =>
+				old && {
+					...old,
+					truncated: false,
+					totalFilesExact: false,
+				},
+		);
+		await flushRender();
+		expect(container.textContent).toContain("Staged (3+)");
+		expect(container.textContent).toContain("Unstaged (3+)");
+		expect(container.textContent).toContain("Unstaged count is a lower bound");
 
+		client.clear();
+	});
+
+	test("lightweight status hides line figures and clears older measurements", async () => {
+		const chapterId = "chapter-lightweight";
+		const client = makeClient();
+		const status: GitStatusSummary = {
+			hasChanges: true,
+			staged: 0,
+			unstaged: 2,
+			untracked: 0,
+			files: [file(" M", "src/known.ts"), { status: " M", path: "src/unknown.ts" }],
+			totalFiles: 2,
+			headSha: "abc",
+			branch: "main",
+		};
+		client.setQueryData(["gitStatus", chapterId], status);
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		// The closed directory must not claim the known child's partial sum.
+		expect(container.textContent).not.toContain("+1");
+		expect(container.textContent).not.toContain("NaN");
+		await expandAllFolders(container);
+		expect(container.textContent).toContain("+1");
+		client.setQueryData(["gitStatus", chapterId], {
+			...status,
+			files: status.files.map(({ status, path }) => ({ status, path })),
+		});
+		await flushRender();
+		expect(container.textContent).not.toMatch(/[+-]1|[+-]0|NaN/);
+		expect(fileRowPaths(container)).toHaveLength(2);
+		client.clear();
+	});
+
+	test("a list cap with an exact scan does not claim lower-bound section counts", async () => {
+		const chapterId = "chapter-exact-capped";
+		const client = makeClient();
+		client.setQueryData(["gitStatus", chapterId], {
+			hasChanges: true,
+			truncated: true,
+			totalFilesExact: true,
+			staged: 3,
+			unstaged: 2,
+			untracked: 1,
+			files: [
+				{ status: "M ", path: "src/staged.ts" },
+				{ status: " M", path: "src/worktree.ts" },
+			],
+			totalFiles: 6,
+			headSha: "abc",
+			branch: "main",
+		} satisfies GitStatusSummary);
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		expect(container.textContent).toContain("Staged (3)");
+		expect(container.textContent).toContain("Unstaged (3)");
+		expect(container.textContent).not.toContain("lower bound");
+		expect(container.textContent).toContain("some files are not shown");
 		client.clear();
 	});
 

@@ -34,7 +34,7 @@ import {
 } from "../dock/panels";
 import { useFilePanelSourceOpener } from "../file-panel/file-panel-navigation";
 import { NarratorPanel } from "../NarratorPanel";
-import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
+import { DockviewNarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import type {
 	FilePanelParams,
 	KnowledgePanelParams,
@@ -85,13 +85,6 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const { ref: compactRef, compact } = usePanelCompact();
 	const { ref, geometryReady } = usePanelGeometryReady(compactRef);
 	const directorActive = useWorkspaceDirectorActive();
-	const [isActive, setIsActive] = useState(props.api.isActive);
-
-	useLayoutEffect(() => {
-		setIsActive(props.api.isActive);
-		const disposable = props.api.onDidActiveChange(() => setIsActive(props.api.isActive));
-		return () => disposable.dispose();
-	}, [props.api]);
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const onHeaderPointerDown = usePanelHeaderDrag(
 		props as IDockviewPanelProps<WorkspacePanelParams>,
@@ -110,7 +103,7 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const content = (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
 			{geometryReady && !directorActive && (
-				<NarratorPanelVisibilityProvider value={isActive}>
+				<DockviewNarratorPanelVisibilityProvider api={props.api}>
 					<NarratorPanel
 						key={narratorId}
 						narratorId={narratorId}
@@ -119,7 +112,7 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 						onHeaderPointerDown={onHeaderPointerDown}
 						onViewSubagentSession={dockValue?.openSubagentPanel}
 					/>
-				</NarratorPanelVisibilityProvider>
+				</DockviewNarratorPanelVisibilityProvider>
 			)}
 		</Box>
 	);

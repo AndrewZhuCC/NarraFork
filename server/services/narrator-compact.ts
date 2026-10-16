@@ -659,6 +659,7 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 ): Promise<{ message: T; contextPercent?: number }> {
 	try {
 		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale);
+		if (!estimate) return { message };
 		const updated = await narratorService.updateMessageHistoryTokenEstimate(
 			message.id,
 			narratorId,
@@ -1057,7 +1058,10 @@ async function doRunCustomCompact({
 		// An unavailable chat provider must not block a separately configured local summary.
 		resolutionError = error;
 	}
-	let messages = beforeMessageId
+	let messages: Array<
+		| Awaited<ReturnType<typeof narratorService.getMessagesBefore>>[number]
+		| Awaited<ReturnType<typeof narratorService.getModelHistorySinceLastCompact>>[number]
+	> = beforeMessageId
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId, {
 				includeRemoteCompact:
 					resolutionError !== undefined ||

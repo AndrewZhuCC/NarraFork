@@ -6,12 +6,12 @@ const CHAPTER_GIT_STATUS_GC_TIME_MS = 60_000;
 export interface ChapterGitStatus {
 	commitsAhead: number;
 	baseBranch: string;
-	linesAdded: number;
-	linesRemoved: number;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 /**
- * Fetches chapter git status (commits ahead of base branch + uncommitted line changes).
+ * Fetches chapter commits ahead of the base branch (legacy servers may include line counts).
  * Initial load via API, then updated in real-time via WS `git_status` messages
  * pushed through the narrator channel.
  *
@@ -39,7 +39,12 @@ export function useChapterGitStatusUpdater() {
 	return (chapterId: string, data: Partial<ChapterGitStatus>) => {
 		qc.setQueryData<ChapterGitStatus>(["chapterGitStatus", chapterId], (old) => {
 			if (!old) return old;
-			return { ...old, ...data };
+			return {
+				...old,
+				...data,
+				linesAdded: data.linesAdded,
+				linesRemoved: data.linesRemoved,
+			};
 		});
 	};
 }

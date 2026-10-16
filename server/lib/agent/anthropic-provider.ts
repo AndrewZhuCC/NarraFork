@@ -32,11 +32,7 @@ import {
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
-import {
-	isCompletionLimitReason,
-	isConnectionClosedError,
-	ProviderInvalidStateError,
-} from "./error-handling";
+import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
@@ -1373,15 +1369,9 @@ export class AnthropicProvider implements ProviderAdapter {
 	/**
 	 * Fetch with automatic /v1 suffix fallback.
 	 *
-	 * Triggers the `/v1` retry in two cases when the base URL lacks `/v1`:
-	 *   1. The initial request returns a non-ok HTTP response (e.g. 404). This
-	 *      is what small requests hit — the gateway answers quickly.
-	 *   2. The initial request THROWS a connection-closed error (ECONNRESET /
-	 *      "socket connection was closed unexpectedly"). Large request bodies on
-	 *      a wrong path can make the gateway RST the connection before sending
-	 *      any response, so case 1 never fires. Without this branch the error
-	 *      propagates as a retryable error and the agent loop retries forever
-	 *      against the same wrong path (observed as 0% success on long sessions).
+	 * Only HTTP responses trigger the `/v1` compatibility retry when the base
+	 * URL lacks that suffix. A connection reset is not evidence of a wrong path:
+	 * propagate transport errors so the agent loop can retry the configured URL.
 	 *
 	 * On a successful fallback the resolved base URL is cached (instance- and
 	 * process-wide) and a fix suggestion is broadcast to clients.
@@ -1416,40 +1406,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		};
 		const canFallback = !AnthropicProvider.hasV1Suffix(baseUrl);
 
-		let response: Response;
-		try {
-			response = await doFetch(url, init);
-		} catch (err) {
-			// Connection reset before any response. Under this branch's design
-			// assumption, a thrown connection error means the ORIGINAL path was
-			// wrong: gateways RST large request bodies on wrong paths before
-			// answering, so `/v1` is the corrected path. We therefore surface the
-			// retry's outcome (even a non-ok status) — re-throwing the original
-			// retryable connection error would make the agent loop retry the wrong
-			// path forever (observed as 0% success on long sessions).
-			if (canFallback && !init.signal?.aborted && isConnectionClosedError(err)) {
-				const retryBase = `${baseUrl}/v1`;
-				const retryUrl = `${retryBase}${path}`;
-				logger.debug("Anthropic request connection closed, retrying with /v1 suffix", {
-					originalUrl: url,
-					retryUrl,
-					error: err instanceof Error ? err.message : String(err),
-				});
-				let retryResponse: Response;
-				try {
-					retryResponse = await doFetch(retryUrl, init);
-				} catch {
-					// Both paths dropped the connection — surface the ORIGINAL
-					// (user-configured) URL's error, which is the one they control.
-					throw err;
-				}
-				if (retryResponse.ok) {
-					this.recordV1Fallback(baseUrl, retryBase);
-				}
-				return retryResponse;
-			}
-			throw err;
-		}
+		const response = await doFetch(url, init);
 
 		if (response.ok || !canFallback) {
 			return response;

@@ -16,6 +16,8 @@ import {
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import type { RuntimeProfile } from "../agent-runtime/input";
+import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
+import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { deferred } from "./agent-runtime-contract.harness";
@@ -79,9 +81,10 @@ const adapter: ProviderAdapter = {
 		throw new Error("Contract must not generate history");
 	},
 };
-const unregister = provider.registerExternalProviderResolver((name) =>
-	name === "orchestratorfixture" ? adapter : null,
-);
+const unregister = provider.registerExternalProviderResolver({
+	resolve: (name) => (name === "orchestratorfixture" ? adapter : null),
+	listReadiness: () => [],
+});
 const ids = ["contract-parent", "contract-primary", "contract-child"];
 beforeEach(() => {
 	cleanDb(sqlite);
@@ -181,6 +184,62 @@ function fixture(
 	};
 }
 
+describe("round token totals at the Stop hook", () => {
+	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
+		test(`accounts every owned request before ${exit} exits`, async () => {
+			const { hookService } = await import("../hook-service");
+			const stopTotals: number[] = [];
+			spyOn(hookService, "runHooks").mockImplementation(async (event, input) => {
+				if (event === "Stop") stopTotals.push(input.total_tokens as number);
+				return { outcome: "success" };
+			});
+			const h = fixture(profiles[0], [
+				async (options) => {
+					options.eventContext.accountRequestTokenUsage?.({
+						inputTokens: 1000,
+						completionTokens: 100,
+					});
+					options.eventContext.accountRequestTokenUsage?.({
+						inputTokens: 1100,
+						completionTokens: 100,
+					});
+					// Latest occupancy deliberately disagrees with request totals.
+					options.eventContext.setTokenUsage({ inputTokens: 1, completionTokens: 1 });
+					if (exit === "workspace") h.session._workspacePassInvalidated = true;
+					if (exit === "tool-limit") options.config.onToolCallLimitExceeded?.(1);
+					if (exit === "throw") throw new Error("scripted failure after usage");
+					return { ...finished };
+				},
+				async (options) => {
+					options.eventContext.accountRequestTokenUsage?.({ inputTokens: 10, completionTokens: 5 });
+					return { ...finished };
+				},
+			]);
+			await h.run();
+			expect(stopTotals).toEqual([exit === "workspace" ? 2315 : 2300]);
+		});
+	}
+
+	test("stale active callbacks cannot charge the replacement narrator or parent", async () => {
+		const h = fixture(profiles[1], [
+			async (options) => {
+				const replacement = active("contract-child");
+				activeNarrators.set("contract-child", replacement);
+				options.eventContext.accountRequestTokenUsage?.({
+					inputTokens: 1000,
+					completionTokens: 100,
+				});
+				expect(replacement._requestTokenTotal).toBeUndefined();
+				expect(h.session._requestTokenTotal).toBeUndefined();
+				activeNarrators.set("contract-child", h.session);
+				return { ...finished };
+			},
+		]);
+		await h.run();
+		expect(h.session._requestTokenTotal).toBeUndefined();
+	});
+});
+
 describe("Bash Git command detection for status refresh", () => {
 	test("uses parsed command nodes instead of matching argument text", async () => {
 		expect(await isGitCommandToolResult("Bash", { command: "git status" }, "/tmp")).toBe(true);
@@ -193,6 +252,83 @@ describe("Bash Git command detection for status refresh", () => {
 		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
 		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
+
+describe("subagent signed source projection", () => {
+	function seed() {
+		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.
+		// Restore only that private fixture row so these tests exercise a trusted production guard.
+		sqlite
+			.query(
+				"INSERT INTO model_history_revision_contracts (id, installed_version) VALUES ('model-history', ?)",
+			)
+			.run(MODEL_HISTORY_REVISION_CONTRACT);
+		expect(readSqliteModelHistorySignature(sqlite, "contract-child").trusted).toBe(true);
+		const now = new Date().toISOString();
+		db.insert(narratorMessages)
+			.values({
+				id: "signed-subagent-history",
+				narratorId: "contract-child",
+				parentToolUseId: "origin-agent",
+				role: "assistant",
+				contentJson: [{ type: "text", text: "signed original" }],
+				contentText: "signed original",
+				createdAt: now,
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({
+				id: "signed-subagent-ref",
+				narratorId: "contract-child",
+				messageId: "signed-subagent-history",
+				seq: 0,
+			})
+			.run();
+	}
+	test("retains trusted raw rows while clearing placement only in detached provider rows", async () => {
+		seed();
+		const build = adapter.buildHistory;
+		let projected = false;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			const row = args[0].find((message) => message.id === "signed-subagent-history");
+			expect(row?.parentToolUseId).toBeNull();
+			projected = true;
+			return build(...args);
+		});
+		const h = fixture(profiles[1], [finished]);
+		expect((await h.run()).hasError).toBe(false);
+		expect(projected).toBe(true);
+		expect(h.calls).toHaveLength(1);
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, "signed-subagent-history"))
+				.get()?.parentToolUseId,
+		).toBe("origin-agent");
+	});
+	test("a body edit during detached provider projection is refused before a model pass", async () => {
+		seed();
+		const build = adapter.buildHistory;
+		let projected = false;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			expect(
+				args[0].find((message) => message.id === "signed-subagent-history")?.parentToolUseId,
+			).toBeNull();
+			projected = true;
+			db.update(narratorMessages)
+				.set({ contentJson: [{ type: "text", text: "late body edit" }] })
+				.where(eq(narratorMessages.id, "signed-subagent-history"))
+				.run();
+			return build(...args);
+		});
+		const h = fixture(profiles[1], [finished]);
+		const result = await h.run();
+		expect(result.hasError).toBe(true);
+		expect(projected).toBe(true);
+		expect(h.calls).toHaveLength(0);
+		expect(result.finalText).toContain("changed after provider preparation");
 	});
 });
 

@@ -82,7 +82,7 @@ import {
 	saveTextFileToWorktree,
 } from "../../lib/uploads";
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
-import { consumeAgentMessageHistory } from "../agent-message-delivery";
+import { consumeAgentMessageHistory, isLastModelInputMailbox } from "../agent-message-delivery";
 import {
 	claimInboxHead,
 	hasInboxKind,
@@ -91,10 +91,11 @@ import {
 } from "../agent-runtime/inbox";
 import type { ExecutionOwner } from "../agent-runtime/ownership";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { gitService } from "../git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
-import { knowledgeInjection } from "../knowledge-injection";
+import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -139,6 +140,7 @@ import {
 } from "../narrator-recovery";
 import { handleBashCommand, narratorService } from "../narrator-service";
 import {
+	accountRequestTokenUsage,
 	accountTokenUsageForTurn,
 	applySessionDefaultDevice,
 	buildContextManagementHooks,
@@ -243,6 +245,7 @@ import {
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import { verifyModelHistoryRowsCurrent } from "./model-history-source";
 import { resolveRuntimePolicy } from "./policy";
 import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
@@ -466,6 +469,7 @@ export async function runAgentLoopUnlocked(
 	}
 
 	const continueForSpec = async (cause: "spec" | "maxTurns", suppressed: boolean) => {
+		if (runState.lastPass?.reasoningOnlyIdle) return null;
 		if (profile.kind === "primary") return maybeStartContinuation(active, suppressed);
 		const spec = await readSubagentSpecContinuationState(narratorId);
 		const fresh = await narratorService.getById(narratorId);
@@ -600,7 +604,15 @@ export async function runAgentLoopUnlocked(
 			// request exactly once through normal history adoption (including subagents).
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, subagentPlacement);
-			const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
+			const historyDeadline = Date.now() + 10_000;
+			const rawMessages = await narratorService.getModelHistorySinceLastCompact(
+				narratorId,
+				undefined,
+				{
+					signal: active.abortController.signal,
+					deadline: historyDeadline,
+				},
+			);
 			// History below is rebuilt from the latest post-compact messages, so any
 			// pending-compact guard set by a background compact can be released here.
 			clearActiveHistoryCompactPending(narratorId);
@@ -632,12 +644,9 @@ export async function runAgentLoopUnlocked(
 				? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
 				: resolvedTurnSessionDevices;
 
-			// Subagent messages all have parentToolUseId set — clear it so
-			// buildHistory treats them as top-level (same as loadSubagentHistory).
+			// Preserve the original signed array. buildRuntimeHistory clears subagent placement
+			// on its detached model projection, while both freshness guards use these raw rows.
 			const isSubagentNarrator = isSubagentVariant(freshNarrator.variant);
-			const dbMessages = isSubagentNarrator
-				? rawMessages.map((m) => ({ ...m, parentToolUseId: null }))
-				: rawMessages;
 
 			// The row is authoritative, including a pin made after the executor built
 			// its one-time snapshot. initialModel only identifies the initial history.
@@ -713,10 +722,17 @@ export async function runAgentLoopUnlocked(
 				model: resolved.model,
 				provider: resolved.provider,
 				profile: isSubagentNarrator ? "subagent" : "primary",
-				sourceMessages: dbMessages,
+				sourceMessages: rawMessages,
 				currentInput: runState.input.text,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
+				deadline: historyDeadline,
+			});
+			// The subagent view is detached, but freshness belongs to the original signed rows.
+			// Fail explicitly rather than sending a mixed revision or re-registering receipts forever.
+			await verifyModelHistoryRowsCurrent(rawMessages, {
+				signal: active.abortController.signal,
+				deadline: historyDeadline,
 			});
 			let { history, trailingToolResults } = preparedHistory;
 			let initialQuestionReceiptText = "";
@@ -851,6 +867,11 @@ export async function runAgentLoopUnlocked(
 				},
 				setTokenUsage: (usage) => {
 					active._lastTokenUsage = usage;
+				},
+				accountRequestTokenUsage: (usage) => {
+					if (activeNarrators.get(narratorId) === active) {
+						accountRequestTokenUsage(active, usage);
+					}
 				},
 				setTtftMs: (ttftMs) => {
 					active._ttftMs = ttftMs;
@@ -1283,6 +1304,9 @@ export async function runAgentLoopUnlocked(
 			const composerGeneration =
 				profile.kind === "primary" ? beginComposerRun(narratorId) : undefined;
 			if (composerGeneration) active._composerGeneration = composerGeneration;
+			let lastModelInputWasMailbox = false;
+			let adoptedInput: { history: unknown[]; content: string } | undefined;
+			let afterToolsInput: { history: unknown[]; content: string; mailbox: boolean } | undefined;
 			const config: import("../../lib/agent").AgentConfig = {
 				onCodexComposerSeed: composerGeneration
 					? (seed, userId) => rememberComposerSeed(narratorId, composerGeneration, seed, userId)
@@ -1510,6 +1534,12 @@ export async function runAgentLoopUnlocked(
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
+				shouldIdleOnReasoningOnly: async () => {
+					if (isSubagentNarrator) return lastModelInputWasMailbox;
+					const { activeWorkCount } =
+						await backgroundTaskService.countActiveKindsByParent(narratorId);
+					return activeWorkCount > 0;
+				},
 				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;
@@ -1521,6 +1551,11 @@ export async function runAgentLoopUnlocked(
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
 				onModelInputConsumed: (history, content, answerEventIds) => {
+					adoptedInput = { history, content };
+					lastModelInputWasMailbox =
+						afterToolsInput?.history === history && afterToolsInput.content === content
+							? afterToolsInput.mailbox
+							: isLastModelInputMailbox(history, content);
 					consumeAgentMessageHistory(history, content);
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
@@ -1529,8 +1564,23 @@ export async function runAgentLoopUnlocked(
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
 				},
-				getAfterToolsInjections: () =>
-					drainInjectionsIntoHistory(active, locale, subagentPlacement),
+				getAfterToolsInjections: async () => {
+					const input = await drainInjectionsIntoHistory(active, locale, subagentPlacement);
+					return {
+						...input,
+						onConsumed: () => {
+							input.onConsumed();
+							if (input.parts.length > 0) {
+								lastModelInputWasMailbox = input.lastInputWasMailbox;
+								// onConsumed runs only once, whereas the exact same request can
+								// be adopted again after a transient retry. Retain its provenance.
+								afterToolsInput = adoptedInput
+									? { ...adoptedInput, mailbox: input.lastInputWasMailbox }
+									: undefined;
+							}
+						},
+					};
+				},
 				deliverInjectionRow: async (injection) => {
 					const { messageId, turnText } = await deliverInjection(narratorId, {
 						subagent: subagentPlacement,
@@ -1768,7 +1818,7 @@ export async function runAgentLoopUnlocked(
 								source: "user_message",
 								hits,
 							});
-							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
+							for (const h of hits) knowledgeInjectedIds.add(injectionKey(h));
 							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
 						}
 					}
@@ -1955,7 +2005,7 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
-			active._tokenUsageBaseline = active._lastTokenUsage;
+			active._tokenUsageBaseline = active._requestTokenTotal ?? 0;
 			active._interruptCleanupDone = false;
 			const result = await executeAgentLoop({
 				config,
@@ -1965,6 +2015,9 @@ export async function runAgentLoopUnlocked(
 				images: loopImages,
 				eventContext,
 				hooks,
+			}).finally(() => {
+				// Account before workspace restarts, limits, or thrown-error exits.
+				runState.totalTokens += accountTokenUsageForTurn(active);
 			});
 			runState.lastPass = result;
 			if (
@@ -1997,7 +2050,7 @@ export async function runAgentLoopUnlocked(
 			// Track the latest pass's final text for the Stop hook (set on every pass,
 			// so the most recent assistant text / error message wins regardless of how
 			// the loop ultimately terminates).
-			if (result.finalText) {
+			if (result.finalText || result.reasoningOnlyIdle) {
 				runState.finalText = result.finalText;
 			}
 
@@ -2007,7 +2060,6 @@ export async function runAgentLoopUnlocked(
 			// normally, this is cleared back to false before the Stop hook fires.
 			runState.hitMaxTurns = result.maxTurnsExceeded === true;
 
-			runState.totalTokens += accountTokenUsageForTurn(active);
 			const searchScope = getSearchExecutionScope();
 			if (searchScope && (searchScope.remainingTurns <= 0 || result.maxTurnsExceeded)) {
 				// No retry/spec/goal continuation can acquire a fresh budget implicitly.
@@ -3510,7 +3562,13 @@ export async function runAgentLoopUnlocked(
 	let finalText = runState.finalText;
 	if (runState.lastPass?.paymentRequired)
 		finalText = `Payment required: ${runState.lastPass.paymentRequired.message}`;
-	if (profile.kind === "subagent" && !finalText.trim() && !runState.hadError && !aborted) {
+	if (
+		profile.kind === "subagent" &&
+		!runState.lastPass?.reasoningOnlyIdle &&
+		!finalText.trim() &&
+		!runState.hadError &&
+		!aborted
+	) {
 		const latest = await narratorService.getLatestAssistantTextAndId(narratorId).catch(() => null);
 		if (latest?.text.trim()) finalText = latest.text;
 		else

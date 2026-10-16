@@ -8,6 +8,9 @@ import { resolve } from "node:path";
 import { createApp } from "./app";
 import { getConfig, initConfig } from "./lib/config";
 import { logger } from "./lib/logger";
+import { resolveMirrorRelaySettings } from "./lib/mirror-relay-config";
+import { MirrorIngestService } from "./services/mirror-ingest";
+import { MirrorRelayPuller } from "./services/mirror-relay-pull";
 import { LocalStorage } from "./storage/local";
 
 // Parse CLI args
@@ -43,31 +46,44 @@ const host = config.host;
 const dataDir = resolve(configPath, "..", config.dataDir);
 const storage = new LocalStorage(dataDir);
 
-// Create app
-const app = createApp(storage);
+// Both direct HTTP and optional pull delivery share exactly the same ingest locks and validation.
+const ingest = new MirrorIngestService(storage);
+const relaySettings = resolveMirrorRelaySettings(config);
+const relay = relaySettings
+	? new MirrorRelayPuller(storage, ingest, relaySettings, {
+			onEvent: (event) => logger.info("Mirror relay pull", { ...event }),
+		})
+	: undefined;
+const app = createApp(storage, ingest);
 
 // Start server
 const server = Bun.serve({
 	port,
 	hostname: host,
-	// Full release binaries exceed Bun's 128 MiB default; match the production proxy's
-	// bounded 256 MiB upload budget, including multipart headers and release notes.
-	maxRequestBodySize: 256 * 1024 * 1024,
+	// Raw mirror patch admission; each authenticated stream independently enforces its exact size.
+	maxRequestBodySize: 512 * 1024 * 1024,
+	idleTimeout: 30,
 	fetch: app.fetch,
 });
 
 logger.info(`Update server listening on http://${host}:${server.port}`);
 logger.info(`Data directory: ${dataDir}`);
 
-// Graceful shutdown
-process.on("SIGINT", () => {
-	logger.info("Shutting down...");
-	server.stop();
-	process.exit(0);
-});
+// Disabled relay configurations create no worker and no timer.
+relay?.start();
 
-process.on("SIGTERM", () => {
+// Only this standalone server's ordinary signal lifecycle is affected. Never reload NarraFork.
+let shuttingDown = false;
+async function shutdown() {
+	if (shuttingDown) return;
+	shuttingDown = true;
 	logger.info("Shutting down...");
+	const deadline = setTimeout(() => process.exit(1), 5000);
+	deadline.unref();
+	await relay?.stop();
 	server.stop();
+	clearTimeout(deadline);
 	process.exit(0);
-});
+}
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());

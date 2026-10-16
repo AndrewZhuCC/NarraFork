@@ -73,9 +73,11 @@ bun scripts/build-cross-platform.ts --platform=linux-arm64
 
 ### 辅助分发依赖
 
-新构建在生成的 build-info 和 sidecar 中声明 `helperDistribution`：固定 helpers catalog/tag，加应用版本对应的 executor tag/protocol。严格构建和八平台 bundle 核对同一声明；旧无声明产物保持兼容。构建与 dry-run 不要求远端已经有辅助 Release，真正主程序发布前才做只读就绪检查。
+新构建在生成的 build-info 和 sidecar 中声明 `helperDistribution`：固定 helpers catalog/tag，加 `shared/component-versions.json` 锁定的独立 executor version/tag/protocol，不按应用版本重新选择。构建开始冻结同一声明并传入所有后处理 worker，严格构建和八平台 bundle 核对它；旧无声明产物保持兼容。构建与 dry-run 不要求远端已经有辅助 Release，真正主程序发布前才做只读资产就绪与组件构建输入一致性检查。主程序 0.9.2 可以直接复用未变化的 executor 0.9.1；组件实际变化时才显式升组件版本并独立发布。
 
-辅助工具通过独立 `.github/workflows/helpers-release.yml` 构建并原生 smoke，不加入主程序资产。rg/zstd 各覆盖六平台；Linux zstd 使用固定 Alpine 镜像摘要及源码摘要的 musl 静态 recipe，Windows ARM64 复用固定 llvm-mingw recipe，macOS 原生构建。不要恢复 `Alpine latest`、未经摘要校验的 musl.cc 工具链或 `-march=native`。发布细节、许可附件和显式触发步骤见 [RELEASE.md](RELEASE.md)。
+普通本地 build 只产出 full 和 metadata，不枚举 dist 猜旧基线生成 patch。生产 patch 由 GitHub Release CI 使用此前已公开的原始 GitHub binary/sidecar 单次生成并重建验证；本地上传现存 patch 也须证明公开基线身份，离线无证据时明确拒绝该 patch 而不偷偷联网。独立更新服务器只在 GitHub Release/index 完成后镜像 metadata/当前 patch，不参与构建、补包或主发布门禁。默认 direct，可显式配置 WebDAV 暂存后由服务器主动拉取；两种方式都由服务器校验大小/SHA256，不回传资产给 runner。WebDAV 的 `STAGED_FOR_PULL` 仅表示已暂存，不等于服务器已导入，配置与保留期见 [RELEASE.md](RELEASE.md)。
+
+辅助工具通过独立 `.github/workflows/helpers-release.yml` 构建并原生 smoke，不加入主程序资产；即使应用 metadata 选择独立镜像，helper/executor binary 仍取固定 GitHub tag。rg/zstd 各覆盖六平台；Linux zstd 使用固定 Alpine 镜像摘要及源码摘要的 musl 静态 recipe，Windows ARM64 复用固定 llvm-mingw recipe，macOS 原生构建。不要恢复 `Alpine latest`、未经摘要校验的 musl.cc 工具链或 `-march=native`。发布细节、许可附件和显式触发步骤见 [RELEASE.md](RELEASE.md)。
 
 ## 交叉编译说明
 

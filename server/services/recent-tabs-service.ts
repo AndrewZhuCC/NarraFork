@@ -62,7 +62,11 @@ type WorkspacePanelInsert = typeof workspacePanels.$inferInsert;
  */
 export type WorkspacePanelMembershipWrite =
 	| { action: "insert"; row: WorkspacePanelInsert }
-	| { action: "remove"; panelId: string };
+	| { action: "remove"; panelId: string }
+	| { action: "removeByNarrator"; workspaceId: string; narratorId: string }
+	// Undo restore of a cascade-removed row. Conflict-tolerant: a re-added panel
+	// for the same narrator (new row id) must not abort the whole tab restore.
+	| { action: "insertIfAbsent"; row: WorkspacePanelInsert };
 
 interface UndoEntry {
 	token: string;
@@ -71,6 +75,12 @@ interface UndoEntry {
 	revision: number;
 	tabs: PersistedRecentTab[];
 	deferredWorkspaceIds: string[];
+	/**
+	 * Membership row removed alongside a grouped narrator tab close. Re-inserted
+	 * on undo so the restored tab's workspace actually contains the panel again —
+	 * the tab-list snapshot alone cannot express that half of the state.
+	 */
+	panelRow?: WorkspacePanelInsert;
 }
 
 interface PendingWorkspaceCleanup {
@@ -83,6 +93,12 @@ interface PendingWorkspaceCleanup {
 interface MutationOptions {
 	removedCount?: number;
 	undoTabs?: PersistedRecentTab[];
+	/**
+	 * Membership row captured at removal time, stored with the undo entry so
+	 * `restoreRecentTabs` can re-insert it. Only meaningful together with
+	 * `undoTabs`; discarded otherwise.
+	 */
+	undoPanelRow?: WorkspacePanelInsert;
 	workspaceIdsToDelete?: string[];
 	deferredWorkspaceIds?: string[];
 	/**
@@ -188,6 +204,19 @@ export async function runExpiredRecentTabsWorkspaceCleanup(now = Date.now()): Pr
 			),
 		);
 		removed += existingRows.length;
+		// Same contract as the route DELETE: a device holding one of these open gets
+		// a navigation signal instead of a 404 on its next refetch.
+		for (const row of existingRows) {
+			try {
+				broadcastToUser(cleanup.userId, {
+					type: "workspace_changed",
+					workspaceId: row.id,
+					reason: "deleted",
+				});
+			} catch (error) {
+				logger.warn("workspace deletion broadcast failed", { workspaceId: row.id, error });
+			}
+		}
 	}
 	scheduleNextWorkspaceCleanup();
 	return removed;
@@ -716,7 +745,7 @@ function writeLegacyShadowInTransaction(
  * Apply a caller-declared workspace-panel membership write.
  *
  * Declared locally — never received as a callback — so its synchronous body is
- * visible to the transaction-atomicity gate. Both shapes are single statements;
+ * visible to the transaction-atomicity gate. Every shape is a single statement;
  * a throw here (e.g. the workspace/narrator unique index) aborts the enclosing
  * transaction and rolls the tab rows and revision bump back with it.
  */
@@ -727,6 +756,21 @@ function applyPanelMembershipInTransaction(
 ): void {
 	if (write.action === "insert") {
 		tx.insert(workspacePanels).values(write.row).run();
+		return;
+	}
+	if (write.action === "insertIfAbsent") {
+		tx.insert(workspacePanels).values(write.row).onConflictDoNothing().run();
+		return;
+	}
+	if (write.action === "removeByNarrator") {
+		tx.delete(workspacePanels)
+			.where(
+				and(
+					eq(workspacePanels.workspaceId, write.workspaceId),
+					eq(workspacePanels.narratorId, write.narratorId),
+				),
+			)
+			.run();
 		return;
 	}
 	tx.delete(workspacePanels).where(eq(workspacePanels.id, write.panelId)).run();
@@ -909,6 +953,7 @@ function persistMutationLocked(
 
 	const revision = baseRevision + 1;
 	const now = new Date().toISOString();
+	const deletedWorkspaceIds: string[] = [];
 	db.transaction((tx) => {
 		applyRowDiffInTransaction(tx, userId, after, oldRows, now);
 		// Before the meta/revision write so a throw from the membership write aborts
@@ -920,10 +965,18 @@ function persistMutationLocked(
 			.run();
 		writeLegacyShadowInTransaction(tx, userId, after, now);
 		const workspaceIds = [...new Set(options.workspaceIdsToDelete ?? [])];
-		if (workspaceIds.length > 0) {
-			tx.delete(workspaces)
-				.where(and(eq(workspaces.userId, userId), inArray(workspaces.id, workspaceIds)))
-				.run();
+		for (const workspaceId of workspaceIds) {
+			// Existence checked first so the broadcast below only names rows that were
+			// actually deleted here — the route DELETE may already have removed the
+			// row (and announced it) on the way in.
+			const existing = tx
+				.select({ id: workspaces.id })
+				.from(workspaces)
+				.where(and(eq(workspaces.userId, userId), eq(workspaces.id, workspaceId)))
+				.get();
+			if (!existing) continue;
+			tx.delete(workspaces).where(eq(workspaces.id, workspaceId)).run();
+			deletedWorkspaceIds.push(workspaceId);
 		}
 	});
 
@@ -945,6 +998,7 @@ function persistMutationLocked(
 			revision,
 			tabs: options.undoTabs.map(cloneTab),
 			deferredWorkspaceIds,
+			...(options.undoPanelRow ? { panelRow: options.undoPanelRow } : {}),
 		});
 		scheduleDeferredWorkspaceCleanup({
 			token,
@@ -953,6 +1007,16 @@ function persistMutationLocked(
 			workspaceIds: deferredWorkspaceIds,
 		});
 		result.undoToken = token;
+	}
+	// Announce workspace rows this mutation deleted so any device holding one open
+	// navigates away instead of refetching into a 404. Committed above; the frame
+	// is an invalidation signal, so it must not fail the mutation.
+	for (const workspaceId of deletedWorkspaceIds) {
+		try {
+			broadcastToUser(userId, { type: "workspace_changed", workspaceId, reason: "deleted" });
+		} catch (error) {
+			logger.warn("workspace deletion broadcast failed", { workspaceId, error });
+		}
 	}
 	broadcastDelta(userId, result);
 	return result;
@@ -1212,7 +1276,14 @@ export async function removeRecentTab(
 	id: string,
 	options: { storeUndo?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => {
+	// Closing a workspace child's own narrator tab removes its membership with
+	// it: the panel row is the membership authority, and a closed tab that left
+	// the row behind would linger as a panel in every open view of that
+	// workspace (and be re-synced back by the membership projection).
+	// Chapter tabs carry a workspaceId only because their NARRATOR is a member —
+	// closing one must not evict the narrator's panel.
+	let removedMembership: { workspaceId: string; narratorId: string } | undefined;
+	const result = await mutate(userId, (tabs) => {
 		const key = `${type}:${id}`;
 		const index = tabs.findIndex((tab) => tabKey(tab) === key);
 		if (index < 0) return { tabs };
@@ -1220,7 +1291,45 @@ export async function removeRecentTab(
 			// Snapshot BEFORE the splice — after it the removed tab is gone and the
 			// undo entry would restore an already-empty slot.
 			const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
+			const removed = tabs[index];
 			tabs.splice(index, 1);
+			if ((type === "narrator" || type === "subagent") && removed.workspaceId) {
+				removedMembership = { workspaceId: removed.workspaceId, narratorId: id };
+				// Release the narrator's OTHER tabs (its chapters) from the group too —
+				// `removeWorkspacePanel`'s projection does the same for the reverse
+				// direction, and leaving them grouped would point at a workspace that
+				// no longer contains their narrator.
+				const formerWorkspaceId = removed.workspaceId;
+				for (const tab of tabs) {
+					if (tab.workspaceId === formerWorkspaceId && getTabNarratorId(tab) === id) {
+						delete tab.workspaceId;
+					}
+				}
+				// Capture the membership row while it still exists so a tab-list undo
+				// can re-insert it — otherwise the restored tab would point at a
+				// workspace that no longer contains the narrator.
+				const undoPanelRow = undoTabs
+					? db
+							.select()
+							.from(workspacePanels)
+							.where(
+								and(
+									eq(workspacePanels.workspaceId, formerWorkspaceId),
+									eq(workspacePanels.narratorId, id),
+								),
+							)
+							.get()
+					: undefined;
+				return {
+					tabs,
+					options: {
+						removedCount: 1,
+						...(undoTabs ? { undoTabs } : {}),
+						...(undoPanelRow ? { undoPanelRow } : {}),
+						panelMembership: { action: "removeByNarrator", ...removedMembership },
+					},
+				};
+			}
 			return {
 				tabs,
 				options: {
@@ -1240,6 +1349,16 @@ export async function removeRecentTab(
 		// tab-list undo cannot restore — so no undo token is stored here.
 		return { tabs, options: { workspaceIdsToDelete: [id] } };
 	});
+	if (removedMembership) {
+		// Open workspace views close the panel on this signal; the sidebar itself
+		// is already covered by the tab delta above.
+		broadcastToUser(userId, {
+			type: "workspace_changed",
+			workspaceId: removedMembership.workspaceId,
+			reason: "membership",
+		});
+	}
+	return result;
 }
 
 function extractMovedGroup(
@@ -1484,9 +1603,29 @@ export async function restoreRecentTabs(
 			const oldRows = readRows(userId);
 			const before = oldRows.map(rowToTab);
 			const after = normalizeAndLimitTabs(entry.tabs.map(cloneTab)).tabs;
-			const result = persistMutationLocked(userId, oldRows, before, after, baseRevision);
+			// Re-insert the membership row the close cascaded away, in the same
+			// transaction as the tab rows: the restored tab would otherwise group
+			// under a workspace that no longer contains the narrator.
+			const result = persistMutationLocked(
+				userId,
+				oldRows,
+				before,
+				after,
+				baseRevision,
+				entry.panelRow
+					? { panelMembership: { action: "insertIfAbsent", row: entry.panelRow } }
+					: {},
+			);
 			undoByUser.delete(userId);
 			cancelDeferredWorkspaceCleanup(entry.token);
+			if (entry.panelRow) {
+				// Symmetric with the close: open workspace views re-add the panel.
+				broadcastToUser(userId, {
+					type: "workspace_changed",
+					workspaceId: entry.panelRow.workspaceId,
+					reason: "membership",
+				});
+			}
 			return result;
 		});
 	}

@@ -138,6 +138,96 @@ describe("read-only lifecycle protection", () => {
 			expect(result).toMatchObject({ status: "unavailable", complete: false });
 		});
 	}
+	test("legacy migration gates deletion, not exclusive cold shadow creation", async () => {
+		const { ports } = fixture();
+		const includeLegacy: boolean[] = [];
+		ports.readClaims = async (_deadline, _signal, _targets, legacy = true) => {
+			includeLegacy.push(legacy);
+			return { complete: !legacy, claims: [] };
+		};
+		const guard = createLifecycleGuard(ports);
+		expect(
+			await guard.withShadowCreationReservation(
+				{ deviceId: "local", ...target },
+				async () => "created",
+			),
+		).toBe("created");
+		// A diagnostic label cannot grant creation policy to a normal inspection.
+		expect((await guard.inspect([target], "shadow initialization")).status).toBe("unavailable");
+		expect((await guard.inspect([target], "shadow destroy")).status).toBe("unavailable");
+		expect(includeLegacy).toEqual([false, true, true]);
+	});
+
+	test("cold creation still refuses a live business reference", async () => {
+		const { ports } = fixture();
+		ports.readClaims = async (_deadline, _signal, _targets, legacy) => {
+			expect(legacy).toBe(false);
+			return {
+				complete: true,
+				claims: [{ kind: "registry", id: "independent", path: target.path }],
+			};
+		};
+		await expect(
+			createLifecycleGuard(ports).withShadowCreationReservation(
+				{ deviceId: "local", ...target },
+				async () => undefined,
+			),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("streamed references do not inherit a global historical byte cap", async () => {
+		const { ports } = fixture();
+		ports.readClaims = async (_deadline, _signal, targets) => {
+			expect(targets).toEqual([target]);
+			return {
+				complete: true,
+				claims: (async function* () {
+					for (let i = 0; i < 4000; i++) {
+						yield {
+							kind: "narrator" as const,
+							id: `historical-${i}`,
+							path: `/unrelated/workspace-${i}`,
+						};
+					}
+				})(),
+			};
+		};
+		expect((await createLifecycleGuard(ports).inspect([target], "remove")).status).toBe("clear");
+	});
+
+	test("a streamed read error cannot become missing-reference evidence", async () => {
+		const { ports } = fixture();
+		ports.readClaims = async () => ({
+			complete: true,
+			claims: (async function* () {
+				yield { kind: "narrator" as const, id: "other", path: "/unrelated" };
+				throw new Error("source changed during inspection");
+			})(),
+		});
+		expect(await createLifecycleGuard(ports).inspect([target], "remove")).toMatchObject({
+			status: "unavailable",
+			complete: false,
+		});
+	});
+
+	test("one independent reference refuses without collecting all resource users", async () => {
+		const { ports } = fixture();
+		let reads = 0;
+		ports.readClaims = async () => ({
+			complete: true,
+			claims: (async function* () {
+				reads++;
+				yield { kind: "registry" as const, id: "owner", path: target.path };
+				reads++;
+				throw new Error("must not need the rest of the owner list");
+			})(),
+		});
+		expect((await createLifecycleGuard(ports).inspect([target], "remove")).status).toBe(
+			"protected",
+		);
+		expect(reads).toBe(1);
+	});
+
 	test("unclaimed legacy removal keeps command dispatch and its ordinary failure", async () => {
 		const { guard } = fixture();
 		const remove = mock(async () => {

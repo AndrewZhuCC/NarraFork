@@ -30,7 +30,7 @@ afterEach(() => fetchSpy.mockRestore());
 afterAll(() => mock.restore());
 
 function sentProxy(index = 0) {
-	return (fetchSpy.mock.calls[index]?.[1] as RequestInit & { proxy?: string })?.proxy;
+	return (fetchSpy.mock.calls[index]?.[1] as RequestInit & { proxy?: string | false })?.proxy;
 }
 
 describe("update transport proxy policy", () => {
@@ -40,7 +40,7 @@ describe("update transport proxy policy", () => {
 		expect(sentProxy()).toBe("http://global-proxy.test:8080/");
 		config.update.proxy = { mode: "direct" };
 		await createUpdateFetchContext().fetch("https://github.com/test/repo");
-		expect(sentProxy(1)).toBe("");
+		expect(sentProxy(1)).toBe(false);
 	});
 	test("dedicated custom/system and explicit default use the existing modes", async () => {
 		config.update.proxy = { mode: "custom", url: "http://custom-proxy.test:3128" };
@@ -67,8 +67,8 @@ describe("update transport proxy policy", () => {
 		await context.fetch("https://raw.githubusercontent.com/test/repo/main/file");
 		await context.fetch("http://127.0.0.1:1234/file");
 		expect(sentProxy()).toBe("http://user:secret@proxy.test:8080/");
-		expect(sentProxy(1)).toBe("");
-		expect(sentProxy(2)).toBe("");
+		expect(sentProxy(1)).toBe(false);
+		expect(sentProxy(2)).toBe(false);
 	});
 	test("preserves cancellation/headers/redirect and never disables TLS", async () => {
 		const signal = new AbortController().signal;
@@ -169,7 +169,7 @@ describe("GitHub update transport integration", () => {
 		);
 		expect(response.ok).toBe(true);
 		expect(sentProxy()).toBe("http://proxy.test:8080/");
-		expect(sentProxy(1)).toBe("");
+		expect(sentProxy(1)).toBe(false);
 	});
 });
 

@@ -79,6 +79,8 @@ import {
 	shutdownComposerSuggestions,
 } from "./services/narrator-composer";
 import { pluginManager } from "./services/plugin-manager";
+import { pluginPlatformServices } from "./services/plugin-platform-services";
+import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
 	activatePostgresRuntimeQueue,
@@ -158,9 +160,15 @@ import {
 
 // Builtin/compatible-API providers are resolved first. Only an unregistered plugin
 // prefix may decline here; preserve registered providers' actual failure reasons.
-const unregisterExternalProviderResolver = registerExternalProviderResolver((provider, model) =>
-	pluginProviderRegistry.resolveExternalProvider(provider, model),
-);
+const unregisterExternalProviderResolver = registerExternalProviderResolver({
+	resolve: (provider, model) => pluginProviderRegistry.resolveExternalProvider(provider, model),
+	listReadiness: (signal) =>
+		listPluginProviderReadiness(
+			pluginProviderRegistry,
+			pluginPlatformServices.providerConfigService,
+			signal,
+		),
+});
 
 // A circular import may evaluate publication.ts while db/index.ts is still awaiting
 // migrations. Explicitly await its completion before capturing the legacy rowid
@@ -1441,6 +1449,23 @@ try {
 	void refreshAllKimiUsages().catch(() => {});
 } catch (err) {
 	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
+}
+
+try {
+	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
+	// restart re-reads it rather than trusting numbers from the previous process.
+	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
+	void refreshAllOpencodeUsages().catch(() => {});
+} catch (err) {
+	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
+}
+
+try {
+	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
+	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
+	void refreshAllDeepSeekBalances().catch(() => {});
+} catch {
+	logger.warn("DeepSeek balance startup refresh failed");
 }
 
 // Mark any stale terminals from a previous run as exited

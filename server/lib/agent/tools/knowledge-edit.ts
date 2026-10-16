@@ -130,13 +130,19 @@ export const knowledgeCreateTool: ToolDefinition = {
 			fallbackToPersonal?: boolean;
 			changeNote?: string;
 		};
+		// Pass the exact tool input: danger reflection, approval fingerprints and recovery all
+		// compare against it, and the reviewer must see the content that will be written.
 		const decision = await ctx.requestPermission(
 			"KnowledgeCreate",
-			{ title: a.title, collectionId: a.collectionId ?? "", direct: !!a.direct },
+			{ ...a },
 			ctx.currentToolUseId ?? "",
 		);
 		if (decision.behavior !== "allow") {
-			return deny("KnowledgeCreate was denied by the user.");
+			return deny(
+				decision.behavior === "deny" && decision.message
+					? decision.message
+					: "KnowledgeCreate was denied by the user.",
+			);
 		}
 		try {
 			const principal = await principalOf(ctx);
@@ -217,7 +223,7 @@ export const knowledgeCreateTool: ToolDefinition = {
 				output:
 					`${downgraded ? `⚠️ DOWNGRADED: the requested DIRECT global create was not possible (${downgradeReason}), so this became a personal entry instead. Report this to the user. ` : ""}` +
 					`Created a personal entry "${a.title}" (${personal.id}) in your personal library. ` +
-					`It is private to you. Use KnowledgeEdit (action 'publish') to propose publishing it into the global base` +
+					`It is private to you and ready to use: read it with KnowledgeRead (personalEntryId: "${personal.id}"), or edit it with KnowledgeEdit (save / update_meta). Publication is optional. Use KnowledgeEdit (action 'publish') only to share it into the global base` +
 					`${a.collectionId ? "" : " (set a target collection first via action 'set_target')"}.`,
 				title: `KnowledgeCreate: ${a.title}`,
 				metadata: {
@@ -476,7 +482,7 @@ async function editSave(principal: Principal, a: Record<string, unknown>): Promi
 	return {
 		output:
 			`${downgraded ? `⚠️ DOWNGRADED: the requested DIRECT global save was not possible (${downgradeReason}), so the content went to your personal entry instead. Report this to the user. ` : ""}` +
-			`Saved content to your personal entry (${draftId}). Use action 'publish' to propose it for the global base.`,
+			`Saved content to your personal entry (${draftId}). Read it with KnowledgeRead personalEntryId. Publishing is optional, only when you want to share it through review.`,
 		title: "KnowledgeEdit: save",
 		metadata: {
 			tool: "KnowledgeEdit",

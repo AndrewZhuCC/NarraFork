@@ -45,6 +45,7 @@ export type RawColumn = {
 export type RawIndex = {
 	name: string;
 	columns: string[];
+	expression?: string;
 	unique: boolean;
 	predicate?: string;
 	emitAsUniqueConstraint?: boolean;
@@ -98,7 +99,14 @@ const COLUMN_KEYS = new Set([
 	"generated",
 	"identity",
 ]);
-const INDEX_KEYS = new Set(["name", "columns", "unique", "predicate", "emitAsUniqueConstraint"]);
+const INDEX_KEYS = new Set([
+	"name",
+	"columns",
+	"expression",
+	"unique",
+	"predicate",
+	"emitAsUniqueConstraint",
+]);
 const REFERENCE_KEYS = new Set(["table", "column", "onDelete", "onUpdate", "constraintName"]);
 const TABLE_FK_KEYS = new Set(["name", "columns", "references"]);
 const NAMED_CONSTRAINT_KEYS = new Set(["name", "columns"]);
@@ -173,6 +181,7 @@ export type NormalizedColumn = {
 export type NormalizedIndex = {
 	name: string;
 	columns: string[];
+	expression: string | null;
 	unique: boolean;
 	predicate: string | null;
 	emitAsUniqueConstraint: boolean;
@@ -404,8 +413,18 @@ export function normalizeCoverage(
 		for (const index of table.indexes) {
 			const label = `${origin} ${table.name}/${index.name}`;
 			auditKeys(index, INDEX_KEYS, label, errors);
-			if (index.emitAsUniqueConstraint && (!index.unique || index.predicate))
-				errors.push(`${label}: emitAsUniqueConstraint requires an unconditional unique index`);
+			if (index.expression !== undefined) {
+				if (index.expression !== "1") errors.push(`${label}: unsupported index expression`);
+				if (index.columns.length) errors.push(`${label}: expression index cannot contain columns`);
+			} else if (!index.columns.length)
+				errors.push(`${label}: index requires columns or an expression`);
+			if (
+				index.emitAsUniqueConstraint &&
+				(!index.unique || index.predicate || index.expression !== undefined)
+			)
+				errors.push(
+					`${label}: emitAsUniqueConstraint requires an unconditional unique index on columns`,
+				);
 			indexes.push({
 				name: index.name,
 				columns: index.columns.map((property) => {
@@ -413,6 +432,7 @@ export function normalizeCoverage(
 					if (!resolved) errors.push(`${label}: index column "${property}" does not exist`);
 					return resolved ?? `__unknown__:${property}`;
 				}),
+				expression: index.expression ?? null,
 				unique: !!index.unique,
 				predicate: normExpression(index.predicate),
 				emitAsUniqueConstraint: !!index.emitAsUniqueConstraint,
@@ -464,6 +484,7 @@ export function normalizeCoverage(
 				const covering = target.indexes.find(
 					(index) =>
 						index.unique &&
+						!index.expression &&
 						!index.predicate &&
 						index.columns.length === 1 &&
 						index.columns[0] === column,

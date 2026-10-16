@@ -50,6 +50,14 @@ scripts/lib/*
 !scripts/lib/github-release.ts
 # Release CI control, immutable bundles, strict native inputs and native smoke.
 !scripts/ci-release.ts
+!scripts/mirror-update-server.ts
+!scripts/lib/ci-publication-runtime.ts
+!scripts/lib/publication-receipt.ts
+!scripts/lib/local-github-patch-source.ts
+!scripts/lib/mirror-public-github.ts
+!scripts/lib/mirror-workflow.ts
+!scripts/lib/mirror-relay-stage.ts
+!scripts/lib/update-server-main-mirror-history.ts
 !scripts/smoke-release-binary.ts
 # Explicit 123 distribution operators; old server receives patches/metadata only.
 !scripts/publish-123-distribution.ts
@@ -84,6 +92,8 @@ scripts/lib/*
 !scripts/lib/helper-artifact.ts
 !scripts/lib/helper-release.ts
 !scripts/lib/helper-release-control.ts
+# Shared read-only component pin/source verification must survive a fresh clone.
+!scripts/lib/component-release-inputs.ts
 .helper-release/
 !scripts/lib/zstd-windows-arm64.ts
 !scripts/lib/executor-manifest.ts
@@ -127,6 +137,12 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts
 !scripts/lib/__tests__/generate-sqlite-migrations.test.ts
+# Generated model-history trigger contracts and their migration fixtures must ship with the generators.
+!scripts/lib/generated-model-history-triggers.ts
+!scripts/lib/__tests__/model-history-migration-fixture.ts
+!scripts/lib/__tests__/model-history-trigger-generators.test.ts
+# Full application loading/layout smoke is referenced by the browser regression tests.
+!scripts/smoke-narrator-loading.ts
 !scripts/lib/sqlite-generation-lock.ts
 !scripts/lib/__tests__/sqlite-generation-lock.test.ts
 !scripts/lib/__tests__/generate-postgres-schema.test.ts
@@ -174,9 +190,10 @@ package-lock.json
 IMPROVEMENT-PLAN.md
 *.log
 
-# Dynamic Spec runtime state (per-narrator task queue / planning notes)
-spec/
-spec:/
+# Dynamic Spec 运行时状态（叙述者任务队列 / 规划笔记）。锚定到仓库根，
+# 避免把源码目录 frontend/components/narrator/spec/ 一并忽略。
+/spec/
+/spec:/
 
 # Dual-database regression reports written by scripts/test-database-regression.ts
 # (ARTIFACT_ROOT). Per-run junit XML, results.json, rerun.txt and logs are reproducible

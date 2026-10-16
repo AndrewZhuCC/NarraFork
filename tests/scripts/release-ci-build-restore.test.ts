@@ -32,6 +32,8 @@ import {
 	type CiReleasePlan,
 } from "../../scripts/lib/ci-release-types";
 
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+
 const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -295,6 +297,7 @@ function fixture(supplied?: CiReleasePlan) {
 				value = { object: { type: "commit", sha: currentCommit } };
 			else if (path.startsWith("compare/"))
 				value = { status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } };
+			else if (path === `git/trees/${commit}`) value = { truncated: false, tree: [] };
 			else if (path === `contents/package.json?ref=${commit}`)
 				value = contents({ version: "1.2.0", packageManager: `bun@${CI_RELEASE_BUN}` });
 			else if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
@@ -558,6 +561,40 @@ describe("original build recovery", () => {
 			publish: true,
 		});
 		expect(state.calls.some((path) => path.endsWith("environments/release"))).toBe(true);
+	});
+	test("online native recovery retains new control evidence without rewriting original artifacts", async () => {
+		const state = fixture();
+		const evidence = {
+			executor: {
+				version: "0.9.1",
+				protocolVersion: 1,
+				tag: "executor-v0.9.1",
+				commit: "d".repeat(40),
+				manifestSha256: "e".repeat(64),
+				buildInputsSha256: "f".repeat(64),
+			},
+		};
+		const before = new Map([...state.archives].map(([id, bytes]) => [id, Buffer.from(bytes)]));
+		const control = await prepareCiReleaseBuild({
+			...state,
+			sourceRunId: 101,
+			sourceRunAttempt: 2,
+			tag: "v1.2.0",
+			publish: true,
+			componentChecks: {
+				readDependencies: async () => createHelperDistributionDependencies("0.9.1"),
+				verifyEvidence: async () => evidence,
+			},
+		});
+		expect(control.componentEvidence).toEqual(evidence);
+		expect(control.runId).toBe(102);
+		expect(control.buildSource?.runId).toBe(101);
+		expect(state.original.componentEvidence).toBeUndefined();
+		for (const [id, bytes] of state.archives) {
+			const original = before.get(id);
+			if (!original) throw new Error("Missing original archive fixture");
+			expect(bytes).toEqual(original);
+		}
 	});
 	test("freezes original baselines, never selects current baselines", async () => {
 		const state = fixture();

@@ -1,3 +1,4 @@
+import { TokenRepairNotice } from "@frontend/components/usage-history/TokenRepairNotice";
 import { UsageBreakdownChart } from "@frontend/components/usage-history/UsageBreakdownChart";
 import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHistoryChart";
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
@@ -315,6 +316,7 @@ function SettingsUsagePage() {
 			}}
 		>
 			<Stack gap={isMobile ? "md" : "lg"}>
+				<TokenRepairNotice />
 				{/* Header */}
 				<Group justify="space-between">
 					<Title order={isMobile ? 3 : 2}>{t("usageHistoryTitle")}</Title>

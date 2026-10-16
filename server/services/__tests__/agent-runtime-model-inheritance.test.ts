@@ -56,9 +56,11 @@ const otherAdapter: ProviderAdapter = {
 		return { history: [{ protocol: "otherfixture", source: "rebuilt" }], trailingToolResults: [] };
 	},
 };
-const unregister = registerExternalProviderResolver((name) =>
-	name === "inheritfixture" ? adapter : name === "otherfixture" ? otherAdapter : null,
-);
+const unregister = registerExternalProviderResolver({
+	resolve: (name) =>
+		name === "inheritfixture" ? adapter : name === "otherfixture" ? otherAdapter : null,
+	listReadiness: () => [],
+});
 const PARENT = "inherit-parent";
 const CHILD = "inherit-child";
 const A = "inheritfixture:a";

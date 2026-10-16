@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import {
 	getHelperAssetName,
 	HELPER_CATALOG_VERSION,
@@ -40,7 +41,9 @@ import {
 	resetHelperDistributionCache,
 } from "../helper-distribution-runtime";
 import { settings } from "../settings";
-import { APP_VERSION } from "../version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 function binary(platform: HelperPlatform): Buffer<ArrayBuffer> {
 	const bytes = Buffer.alloc(256);
@@ -390,7 +393,7 @@ describe("source-bound helper runtime", () => {
 			),
 		).rejects.toThrow("limit");
 	});
-	test("legacy update-server tools paths remain compatible without cross-origin redirects", async () => {
+	test("mirror metadata selection still downloads canonical GitHub helpers", async () => {
 		settings.update = {
 			...(settings.update ?? originalUpdate),
 			source: "update-server",
@@ -400,20 +403,158 @@ describe("source-bound helper runtime", () => {
 		const calls: string[] = [];
 		const path = await downloadHelperBinary(value, { fetcher: routes(calls) });
 		expect(path).not.toBeNull();
-		expect(calls).toEqual(["https://legacy.example/api/v2/tools/zstd-linux-x64"]);
+		expect(calls).toEqual([
+			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/helper-manifest-v1.json`,
+			`https://github.com/fork/repo/releases/download/${HELPER_RELEASE_TAG}/zstd-linux-x64`,
+		]);
+		const context = createDistributionContext({
+			source: "update-server",
+			repository: "fork/repo",
+			serverUrl: "https://legacy.example",
+		});
+		expect(context.source).toEqual({ source: "github", repository: "fork/repo" });
+		expect(context.isCurrent()).toBe(true);
 	});
 });
+describe("executor build identity integration", () => {
+	function fixture(mode: string) {
+		const root = mkdtempSync(resolve(".narrafork/executor-build-identity-"));
+		const path = join(root, "fixture.ts");
+		const module = (path: string) => JSON.stringify(resolve(path));
+		writeFileSync(
+			path,
+			`
+import { mock } from "bun:test";
+import * as fs from "node:fs";
+const originalExists = fs.existsSync;
+const originalRead = fs.readFileSync;
+const mode = ${JSON.stringify(mode)};
+mock.module("node:fs", () => ({ ...fs,
+ existsSync: (path) => String(path).endsWith("package.json") ? mode === "dev" : originalExists(path),
+ readFileSync: (path, ...args) => String(path).endsWith("package.json") ? '{"version":"0.9.2"}' : originalRead(path, ...args),
+}));
+const { createHelperDistributionDependencies } = await import(${module("shared/helper-distribution.ts")});
+const declaration = mode === "legacy" ? undefined : mode === "malformed" ? {} : mode === "null" ? null :
+ createHelperDistributionDependencies(mode === "historical" ? "0.8.7" : "0.9.1", mode === "protocol" ? 2 : 1);
+mock.module("@server/generated/build-info", () => ({buildVersion: "0.9.2", buildCommit: "fixture", buildHelperDistribution: declaration}));
+try {
+ const version = await import(${module("server/lib/version.ts")});
+ const { APP_VERSION, BUILD_HELPER_DISTRIBUTION, BUILD_EXECUTOR_DISTRIBUTION: pin } = version;
+ if (mode === "legacy") {
+  console.log(JSON.stringify({ app: APP_VERSION, pin, declared: BUILD_HELPER_DISTRIBUTION !== undefined }));
+ } else {
+  const { settings } = await import(${module("server/lib/settings/index.ts")});
+  settings.update = { ...settings.update, source: "github", githubRepository: "fork/identity-fixture", proxy: {mode: "direct"} };
+  const { getExecutorManifest, ensureExecutorBinary } = await import(${module("server/lib/executor-binaries.ts")});
+  const { buildExecutorInstallScript } = await import(${module("server/lib/executor-install-script.ts")});
+  const bytes = new Uint8Array(${JSON.stringify([...binary("linux-x64")])});
+  const releasedVersion = mode === "wrong-version" ? "0.9.2" : pin.version;
+  const manifest = { version: releasedVersion, protocolVersion: pin.protocolVersion, releasedAt: "2026-01-01T00:00:00Z", platforms: ${JSON.stringify(Object.fromEntries(EXECUTOR_PLATFORMS.map((platform) => [platform, { filename: executorPublishedFilename("0.9.1", platform), size: 256, sha256: digest(binary(platform.replace("amd64", "x64") as HelperPlatform)) }])))} };
+  for (const entry of Object.values(manifest.platforms)) entry.filename = entry.filename.replace("0.9.1", releasedVersion);
+  const installInput = { platform: "linux-amd64", mode: "user", serverBaseUrl: "https://nf.example", deviceWsUrl: "wss://nf.example/ws/device", deviceSlug: "fixture", deviceName: "Fixture", connectionMode: "reverse", disableShell: false, artifactFilename: manifest.platforms["linux-amd64"].filename, expectedSha256: manifest.platforms["linux-amd64"].sha256, executorVersion: releasedVersion, ticket: "b".repeat(64) };
+  const calls = [];
+  const fetcher = async (url) => { calls.push(url); return url.endsWith(".json") ? Response.json({schemaVersion: 1, repository: "fork/identity-fixture", tag: pin.tag, commit: "a".repeat(40), manifest, licenses: [{ name: "LICENSE.txt", size: 1, sha256: "a".repeat(64)}]}) : new Response(bytes); };
+  const resolved = await getExecutorManifest({fetcher});
+  if (mode === "protocol" || mode === "wrong-version") {
+   let rejected = false;
+   try { await ensureExecutorBinary("linux-amd64", {manifest, fetcher}); } catch { rejected = true; }
+   const installRejected = [undefined, pin.protocolVersion].map((protocol) => {
+    try { buildExecutorInstallScript({...installInput, executorProtocolVersion: protocol}); return false; } catch { return true; }
+   });
+   console.log(JSON.stringify({app: APP_VERSION, pin, manifest: resolved, rejected, installRejected, calls}));
+  } else {
+   const downloaded = await ensureExecutorBinary("linux-amd64", {fetcher});
+   const script = buildExecutorInstallScript({...installInput, executorProtocolVersion: pin.protocolVersion}).script;
+   console.log(JSON.stringify({app: APP_VERSION, pin, calls, downloaded, script}));
+  }
+ }
+} catch (error) { console.log(JSON.stringify({ error: error.message })); }
+`,
+		);
+		try {
+			return JSON.parse(
+				execFileSync(process.execPath, [path], {
+					cwd: process.cwd(),
+					encoding: "utf8",
+					timeout: 15_000,
+					maxBuffer: 64 * 1024,
+					env: {
+						...process.env,
+						NARRAFORK_HOME: join(root, "data"),
+						HOME: root,
+						USERPROFILE: root,
+					},
+				}),
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+	for (const mode of ["dev", "compiled"]) {
+		test(`${mode} APP 0.9.2 fetches and generates install script for executor 0.9.1`, () => {
+			const result = fixture(mode);
+			expect(result.error).toBeUndefined();
+			expect(result.app).toBe("0.9.2");
+			expect(result.pin).toEqual({ version: "0.9.1", protocolVersion: 1, tag: "executor-v0.9.1" });
+			expect(result.downloaded.version).toBe("0.9.1");
+			expect(result.calls).toEqual([
+				"https://github.com/fork/identity-fixture/releases/download/executor-v0.9.1/narrafork-executor-manifest.json",
+				"https://github.com/fork/identity-fixture/releases/download/executor-v0.9.1/narrafork-executor-0.9.1-linux-amd64",
+			]);
+			expect(result.script).toContain("Executor v0.9.1");
+			expect(result.script).not.toContain("Executor v0.9.2");
+		}, 20_000);
+	}
+	test("compiled historical declaration retains its own executor release, not today's pin", () => {
+		const result = fixture("historical");
+		expect(result.error).toBeUndefined();
+		expect(result.app).toBe("0.9.2");
+		expect(result.pin).toEqual({ version: "0.8.7", protocolVersion: 1, tag: "executor-v0.8.7" });
+		expect(result.downloaded.version).toBe("0.8.7");
+		expect(result.calls.every((url: string) => url.includes("/executor-v0.8.7/"))).toBe(true);
+		expect(result.script).toContain("Executor v0.8.7");
+	}, 20_000);
+	test("only an undeclared compiled legacy build falls back to APP identity", () => {
+		expect(fixture("legacy")).toEqual({
+			app: "0.9.2",
+			pin: { version: "0.9.2", protocolVersion: 1, tag: "executor-v0.9.2" },
+			declared: false,
+		});
+		for (const mode of ["malformed", "null"])
+			expect(fixture(mode).error).toBe("Invalid distribution object");
+	}, 50_000);
+	test("a structurally valid historical protocol remains declared but runtime rejects incompatibility", () => {
+		const result = fixture("protocol");
+		expect(result.error).toBeUndefined();
+		expect(result.pin.protocolVersion).toBe(2);
+		expect(result.manifest).toBeNull();
+		expect(result.rejected).toBe(true);
+		expect(result.installRejected).toEqual([true, true]);
+		expect(result.calls).toHaveLength(1);
+	}, 20_000);
+	test("APP-matching executor 0.9.2 is rejected when the declared pin is 0.9.1", () => {
+		const result = fixture("wrong-version");
+		expect(result.error).toBeUndefined();
+		expect(result.app).toBe("0.9.2");
+		expect(result.pin.version).toBe("0.9.1");
+		expect(result.manifest).toBeNull();
+		expect(result.rejected).toBe(true);
+		expect(result.installRejected).toEqual([true, true]);
+		expect(result.calls).toHaveLength(1);
+	}, 20_000);
+});
+
 describe("executor pinned ticket distribution", () => {
 	test("ticket retains exact source/version/tag/platform/size/digest, never refreshes manifest", async () => {
 		const executorManifest = {
-			version: APP_VERSION,
+			version: EXECUTOR_VERSION,
 			protocolVersion: 1,
 			releasedAt: "2026-01-01T00:00:00Z",
 			platforms: Object.fromEntries(
 				EXECUTOR_PLATFORMS.map((platform) => [
 					platform,
 					{
-						filename: executorPublishedFilename(APP_VERSION, platform),
+						filename: executorPublishedFilename(EXECUTOR_VERSION, platform),
 						size: 256,
 						sha256: digest(binary(platform.replace("amd64", "x64") as HelperPlatform)),
 					},
@@ -427,7 +568,7 @@ describe("executor pinned ticket distribution", () => {
 				return Response.json({
 					schemaVersion: 1,
 					repository: "fork/repo",
-					tag: `executor-v${APP_VERSION}`,
+					tag: `executor-v${EXECUTOR_VERSION}`,
 					commit: "a".repeat(40),
 					manifest: executorManifest,
 					licenses: manifest().licenses,
@@ -451,6 +592,6 @@ describe("executor pinned ticket distribution", () => {
 		});
 		expect(result.sha256).toBe(digest(binary("linux-x64")));
 		expect(calls).toHaveLength(2);
-		expect(calls[1]).toContain(`/fork/repo/releases/download/executor-v${APP_VERSION}/`);
+		expect(calls[1]).toContain(`/fork/repo/releases/download/executor-v${EXECUTOR_VERSION}/`);
 	});
 });

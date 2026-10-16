@@ -30,12 +30,14 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
+	DeepSeekBalanceCache,
 	HookApiRecord,
 	KimiUsageCache,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
 	LicenseManifestResponse,
+	OpencodeUsageCache,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchResponse,
@@ -699,10 +701,26 @@ export const miscApi = {
 			>
 		>("/nug/relay-status"),
 
+	deepseekGetBalances: (options?: object) =>
+		request<Record<string, DeepSeekBalanceCache>>(
+			"/deepseek/balances",
+			pickRequestOptions(options),
+		),
+	deepseekRefreshBalances: () =>
+		request<Record<string, DeepSeekBalanceCache>>("/deepseek/balances/refresh", { method: "POST" }),
+
 	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
 	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
 	kimiRefreshUsages: () =>
 		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
+
+	// OpenCode Go plan allowance — per-provider server-side cache
+	opencodeGetUsages: (options?: object) =>
+		request<Record<string, OpencodeUsageCache>>("/opencode/usages", pickRequestOptions(options)),
+	opencodeRefreshUsages: () =>
+		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
+			method: "POST",
+		}),
 	nugGetBillingConfig: (providerId: string) =>
 		request<{
 			enabled: boolean;

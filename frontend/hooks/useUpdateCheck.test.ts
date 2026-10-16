@@ -249,16 +249,20 @@ describe("update source behavior", () => {
 		const draftKey = updateSettingsKey({
 			source: savedUpdateSettings.source,
 			serverUrl: savedUpdateSettings.serverUrl,
-			githubRepository: "another/project",
+			githubRepository: savedUpdateSettings.githubRepository,
 			product: savedUpdateSettings.product,
 			channel: savedUpdateSettings.channel,
 		});
 		expect(draftKey).toBe(updateSettingsKey(savedUpdateSettings));
 		expect(draftKey).not.toBe(updateSettingsKey({ ...savedUpdateSettings, product: "narrafork" }));
+		expect(draftKey).not.toBe(
+			updateSettingsKey({ ...savedUpdateSettings, githubRepository: "another/project" }),
+		);
 	});
 	test("every backend check failure has a bilingual classification", () => {
 		for (const code of [
 			"RATE_LIMITED",
+			"CANONICAL_MIRROR_REQUIRED",
 			"REPOSITORY_UNAVAILABLE",
 			"PLATFORM_UNAVAILABLE",
 			"INVALID_CONFIGURATION",
@@ -391,6 +395,7 @@ describe("update source behavior", () => {
 		{ source: "github", repository: "fork/project", channel: "stable", platform: "linux-arm64" },
 		{
 			source: "update-server",
+			repository: "fork/project",
 			serverUrl: "https://updates.example",
 			product: "other",
 			channel: "stable",

@@ -29,6 +29,7 @@ import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
+import { deepseekRoutes } from "./routes/deepseek";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
 import { editorDocumentRoutes } from "./routes/editor-documents";
@@ -45,6 +46,7 @@ import { graphRoutes } from "./routes/graph";
 import { grokRoutes } from "./routes/grok";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
+import { intelligentUiRoutes } from "./routes/intelligent-ui";
 import { kimiRoutes } from "./routes/kimi";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
@@ -62,6 +64,7 @@ import { oauthRoutes } from "./routes/oauth";
 import { oauthAppRoutes } from "./routes/oauth-apps";
 import { oauthGrantRoutes } from "./routes/oauth-grants";
 import { openaiRoutes } from "./routes/openai";
+import { opencodeRoutes } from "./routes/opencode";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectDbRoutes } from "./routes/project-db";
@@ -76,6 +79,7 @@ import { rulerRoutes } from "./routes/ruler";
 import { runtimeRoutes } from "./routes/runtime";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks";
 import { searchRoutes } from "./routes/search";
+import { sessionInterchangeRoutes } from "./routes/session-interchange";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
@@ -176,7 +180,16 @@ app.use(
 		},
 		// The sliding-renewal token rides on a custom response header, which is
 		// invisible to cross-origin readers unless explicitly exposed.
-		exposeHeaders: [SESSION_RENEWAL_HEADER],
+		// The session export download carries its resume command and warnings in
+		// headers so the body stays a plain file.
+		exposeHeaders: [
+			SESSION_RENEWAL_HEADER,
+			"Content-Disposition",
+			"X-Session-Id",
+			"X-Resume-Command",
+			"X-Session-Warnings",
+			"X-Session-Path",
+		],
 	}),
 );
 
@@ -370,6 +383,7 @@ app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
+app.route("/api/narrators", intelligentUiRoutes);
 // Worktree paths must precede the generic Git router's workspace middleware.
 app.route(
 	"/api/narrators",
@@ -386,6 +400,7 @@ app.route("/api/learning", learningRoutes);
 app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
+app.route("/api/session-interchange", sessionInterchangeRoutes);
 app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-cards", modelCardRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
@@ -403,7 +418,9 @@ app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/kimi", kimiRoutes);
+app.route("/api/deepseek", deepseekRoutes);
 app.route("/api/openai", openaiRoutes);
+app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
 app.route("/api/grok", grokRoutes);
 app.route("/api/gemini", geminiRoutes);

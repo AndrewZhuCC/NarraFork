@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { apiRequests, userUsageTotals } from "@server/db/schema";
+import { apiRequests, credentialUsageTotals, userUsageTotals } from "@server/db/schema";
 import {
 	clearRememberedSpills,
 	RAW_DUMP_INLINE_MAX_BYTES,
@@ -669,6 +669,50 @@ describe("request occupancy snapshot persistence", () => {
 });
 
 describe("request user attribution", () => {
+	test.each([
+		"openai",
+		"codex",
+		"gemini",
+		"nug",
+		"anthropic",
+	])("%s preserves normalized buckets in request, user and credential totals exactly once", async (provider) => {
+		const userId = `normalized-${provider}`;
+		const credentialId = `normalized-credential-${provider}`;
+		const handle = startApiRequest({ provider, model: "unknown", userId, credentialId });
+		const usage = {
+			inputTokens: 200,
+			outputTokens: 100,
+			cachedInputTokens: 800,
+			cacheCreationInputTokens: 50,
+		};
+		await finishApiRequest(handle, { usage });
+		await finishApiRequest(handle, { usage });
+		expect(db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get()).toMatchObject(
+			usage,
+		);
+		expect(
+			db.select().from(userUsageTotals).where(eq(userUsageTotals.userId, userId)).get(),
+		).toMatchObject({
+			requestCount: 1,
+			inputTokens: 200,
+			outputTokens: 100,
+			cachedInputTokens: 800,
+			cacheCreationTokens: 50,
+		});
+		expect(
+			db
+				.select()
+				.from(credentialUsageTotals)
+				.where(eq(credentialUsageTotals.credentialId, credentialId))
+				.get(),
+		).toMatchObject({
+			requestCount: 1,
+			inputTokens: 200,
+			outputTokens: 100,
+			cachedInputTokens: 800,
+			cacheCreationTokens: 50,
+		});
+	});
 	test("completion persists frozen user and rolls up once, including unknown-cost failures", async () => {
 		const userId = "tracker-user-rollup-test";
 		const handle = startApiRequest({ provider: "test", model: "unknown", userId });

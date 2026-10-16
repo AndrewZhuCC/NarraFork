@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	ciApiList,
 	createCiReleasePlan,
@@ -50,6 +51,7 @@ function fixture(repository = CI_RELEASE_REPOSITORY, defaultBranch = "main") {
 		pkg: { version: "1.2.0", packageManager: `bun@${CI_RELEASE_BUN}` },
 		changelog: { ...changelog },
 		marker: true,
+		componentVersions: undefined as unknown,
 		releases: [] as unknown[],
 		environment: {
 			name: "release",
@@ -91,6 +93,34 @@ function fixture(repository = CI_RELEASE_REPOSITORY, defaultBranch = "main") {
 					status: state.ancestor ? "ahead" : "diverged",
 					merge_base_commit: { sha: path.slice(8, 48) },
 				});
+			const sharedTree = "1".repeat(40);
+			const config = Buffer.from(JSON.stringify(state.componentVersions ?? null));
+			const configSha = createHash("sha1")
+				.update(`blob ${config.length}\0`)
+				.update(config)
+				.digest("hex");
+			if (path === `git/trees/${commit}`)
+				return JSON.stringify({
+					truncated: false,
+					tree:
+						state.componentVersions === undefined
+							? []
+							: [{ path: "shared", mode: "040000", type: "tree", sha: sharedTree }],
+				});
+			if (path === `git/trees/${sharedTree}`)
+				return JSON.stringify({
+					truncated: false,
+					tree: [
+						{
+							path: "component-versions.json",
+							mode: "100644",
+							type: "blob",
+							sha: configSha,
+							size: config.length,
+						},
+					],
+				});
+			if (path === `git/blobs/${configSha}`) return config.toString("base64");
 			if (path === `contents/package.json?ref=${commit}`)
 				return JSON.stringify(contents(state.pkg));
 			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
@@ -115,10 +145,256 @@ function options(state: ReturnType<typeof fixture>) {
 	return { root: process.cwd(), tag: "v1.2.0", publish: false, env, run: state.run };
 }
 
+const componentEvidence = {
+	executor: {
+		version: "0.9.1",
+		protocolVersion: 1,
+		tag: "executor-v0.9.1",
+		commit: "d".repeat(40),
+		manifestSha256: "e".repeat(64),
+		buildInputsSha256: "f".repeat(64),
+	},
+};
+
 describe("CI release plan trust boundary", () => {
+	test("component evidence has strict bounded structure and its own version/tag identity", async () => {
+		const plan = await createCiReleasePlan(options(fixture()));
+		expect(validateCiReleasePlan({ ...plan, componentEvidence }).componentEvidence).toEqual(
+			componentEvidence,
+		);
+		for (const executor of [
+			{ ...componentEvidence.executor, version: "v0.9.1" },
+			{ ...componentEvidence.executor, version: "1".repeat(65) },
+			{ ...componentEvidence.executor, tag: "executor-v0.9.2" },
+			{ ...componentEvidence.executor, tag: "x".repeat(81) },
+			{ ...componentEvidence.executor, protocolVersion: 0 },
+			{ ...componentEvidence.executor, protocolVersion: 2 ** 31 },
+			{ ...componentEvidence.executor, commit: "d".repeat(7) },
+			{ ...componentEvidence.executor, manifestSha256: "bad" },
+			{ ...componentEvidence.executor, buildInputsSha256: "F".repeat(64) },
+			{ ...componentEvidence.executor, extra: true },
+		]) {
+			expect(() => validateCiReleasePlan({ ...plan, componentEvidence: { executor } })).toThrow();
+		}
+		expect(() =>
+			validateCiReleasePlan({ ...plan, componentEvidence: { ...componentEvidence, extra: true } }),
+		).toThrow();
+	});
+	test("only online publishing collects evidence; builds perform zero component checks", async () => {
+		const state = fixture();
+		const dependencies = createHelperDistributionDependencies("0.9.1");
+		const calls: string[] = [];
+		const componentChecks = {
+			readDependencies: async () => {
+				calls.push("read");
+				return dependencies;
+			},
+			collectEvidence: async () => {
+				calls.push("collect");
+				return componentEvidence;
+			},
+		};
+		expect(
+			(await createCiReleasePlan({ ...options(state), componentChecks })).componentEvidence,
+		).toBeUndefined();
+		expect(calls).toEqual([]);
+		const plan = await createCiReleasePlan({ ...options(state), publish: true, componentChecks });
+		expect(plan.componentEvidence).toEqual(componentEvidence);
+		expect(calls).toEqual(["read", "collect"]);
+	});
+	test("index recovery preflight skips unavailable components but still requires protected publication", async () => {
+		const state = fixture();
+		state.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 } };
+		state.releases = [
+			{
+				databaseId: 1,
+				tagName: "v1.2.0",
+				isDraft: false,
+				isPrerelease: false,
+				publishedAt: "2026-10-08T00:00:00Z",
+				releaseAssets: { totalCount: 18 },
+			},
+		];
+		let componentCalls = 0;
+		const unavailable = async () => {
+			componentCalls++;
+			throw new Error("helpers/executor unavailable");
+		};
+		const opts = {
+			...options(state),
+			publish: true,
+			indexOnly: true,
+			sourceRunId: 122,
+			componentChecks: { readDependencies: unavailable, collectEvidence: unavailable },
+		};
+		const plan = await createCiReleasePlan(opts);
+		expect(plan.componentEvidence).toBeUndefined();
+		expect(componentCalls).toBe(0);
+		expect(state.calls.some((call) => call[1].endsWith("environments/release"))).toBe(true);
+		await expect(createCiReleasePlan({ ...opts, indexOnly: false })).rejects.toThrow(
+			"helpers/executor unavailable",
+		);
+		expect(componentCalls).toBe(1);
+		state.environment.protection_rules = [];
+		await expect(createCiReleasePlan(opts)).rejects.toThrow("required reviewers");
+		expect(componentCalls).toBe(1);
+	});
+	test.each([
+		false,
+		true,
+	])("published recovery preserves sealed evidence=%s without remote readiness, but rejects identity changes", async (withEvidence) => {
+		const state = fixture();
+		state.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 } };
+		const original = await createCiReleasePlan(options(state));
+		const plan = withEvidence ? { ...original, componentEvidence } : original;
+		const raw = JSON.stringify(plan);
+		const dependencies = createHelperDistributionDependencies("0.9.1");
+		let verified = 0;
+		const opts = {
+			...options(state),
+			publish: true,
+			requireAlreadyPublished: true,
+			helperDistribution: dependencies,
+			componentChecks: {
+				verifyEvidence: async () => {
+					verified++;
+					throw new Error("helpers/executor unavailable");
+				},
+			},
+		};
+		expect(await revalidateCiReleasePlan(plan, opts)).toEqual(plan);
+		expect(JSON.stringify(plan)).toBe(raw);
+		expect(verified).toBe(0);
+		for (const helperDistribution of [undefined, createHelperDistributionDependencies("0.9.2")]) {
+			await expect(revalidateCiReleasePlan(plan, { ...opts, helperDistribution })).rejects.toThrow(
+				"target component configuration",
+			);
+		}
+		await expect(
+			revalidateCiReleasePlan(plan, {
+				...opts,
+				requireAlreadyPublished: false,
+			}),
+		).rejects.toThrow("helpers/executor unavailable");
+		expect(verified).toBe(1);
+		state.environment.protection_rules = [];
+		await expect(revalidateCiReleasePlan(plan, opts)).rejects.toThrow("required reviewers");
+		state.tag = "d".repeat(40);
+		await expect(revalidateCiReleasePlan(plan, opts)).rejects.toThrow("tag moved");
+		state.tag = commit;
+		state.changelog.en = "changed";
+		await expect(revalidateCiReleasePlan(plan, opts)).rejects.toThrow("changelog changed");
+		expect(verified).toBe(1);
+	});
+	test("online preflight derives independent pins from exact target tree; malformed JSON fails closed", async () => {
+		const state = fixture("Example/Fork");
+		state.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 } };
+		const forkEnv = {
+			...env,
+			GITHUB_REPOSITORY: "Example/Fork",
+			GITHUB_WORKFLOW_REF: `Example/Fork/${CI_RELEASE_WORKFLOW}@refs/heads/main`,
+		};
+		let collected = 0;
+		const componentChecks = {
+			collectEvidence: async (input: {
+				repository: string;
+				targetCommit: string;
+				dependencies?: unknown;
+			}) => {
+				collected++;
+				expect(input.repository).toBe("Example/Fork");
+				expect(input.targetCommit).toBe(commit);
+				expect(input.dependencies).toEqual(createHelperDistributionDependencies("0.9.1"));
+				return componentEvidence;
+			},
+		};
+		const opts = { ...options(state), env: forkEnv, componentChecks };
+		expect((await createCiReleasePlan(opts)).componentEvidence).toBeUndefined();
+		expect(state.calls.some((call) => /git\/(trees|blobs)|executor-v/.test(call[1]))).toBe(false);
+		expect((await createCiReleasePlan({ ...opts, publish: true })).componentEvidence).toEqual(
+			componentEvidence,
+		);
+		state.componentVersions = { executor: { version: "0.9.1", protocolVersion: 1 }, extra: true };
+		await expect(createCiReleasePlan({ ...opts, publish: true })).rejects.toThrow(
+			"Unknown distribution field",
+		);
+		expect(collected).toBe(1);
+		expect(
+			state.calls.every(
+				(call) => call[1] === "graphql" || call[1].startsWith("repos/Example/Fork"),
+			),
+		).toBe(true);
+	});
+	test("publisher revalidation adds evidence to a new control plan without mutating old bundle plan", async () => {
+		const state = fixture();
+		const original = await createCiReleasePlan(options(state));
+		const raw = JSON.stringify(original);
+		const dependencies = createHelperDistributionDependencies("0.9.1");
+		let verified = 0;
+		const componentChecks = {
+			readDependencies: async () => dependencies,
+			verifyEvidence: async () => {
+				verified++;
+				return componentEvidence;
+			},
+		};
+		const opts = {
+			...options(state),
+			publish: true,
+			componentChecks,
+			helperDistribution: dependencies,
+		};
+		const control = await revalidateCiReleasePlan(original, opts);
+		expect(control.componentEvidence).toEqual(componentEvidence);
+		expect(JSON.stringify(original)).toBe(raw);
+		expect(original.componentEvidence).toBeUndefined();
+		for (const helperDistribution of [
+			undefined,
+			createHelperDistributionDependencies("0.9.2"),
+			createHelperDistributionDependencies("0.9.1", 2),
+		]) {
+			await expect(
+				revalidateCiReleasePlan(original, { ...opts, helperDistribution }),
+			).rejects.toThrow("target component configuration");
+		}
+		expect(verified).toBe(1);
+		await expect(
+			revalidateCiReleasePlan(original, {
+				...opts,
+				componentChecks: {
+					...componentChecks,
+					verifyEvidence: async () => ({
+						executor: { ...componentEvidence.executor, version: "0.9.2", tag: "executor-v0.9.2" },
+					}),
+				},
+			}),
+		).rejects.toThrow("evidence/dependency");
+	});
+	test("legacy targets retain old declaration identity and never acquire current pin evidence", async () => {
+		const state = fixture();
+		const plan = await createCiReleasePlan(options(state));
+		const opts = { ...options(state), publish: true };
+		expect(
+			(
+				await revalidateCiReleasePlan(plan, {
+					...opts,
+					helperDistribution: createHelperDistributionDependencies(plan.version),
+				})
+			).componentEvidence,
+		).toBeUndefined();
+		await expect(
+			revalidateCiReleasePlan(plan, {
+				...opts,
+				helperDistribution: createHelperDistributionDependencies("0.9.1"),
+			}),
+		).rejects.toThrow("Legacy target");
+		await expect(revalidateCiReleasePlan({ ...plan, componentEvidence }, opts)).rejects.toThrow(
+			"Legacy target",
+		);
+	});
 	test("retains validated helper dependencies from published baseline metadata", async () => {
 		const plan = await createCiReleasePlan(options(fixture()));
-		const dependencies = createHelperDistributionDependencies("1.1.0");
+		const dependencies = createHelperDistributionDependencies("0.9.1");
 		const name = "narrafork-1.1.0-linux-x64";
 		const baseline = {
 			releaseId: 100,
@@ -151,8 +427,7 @@ describe("CI release plan trust boundary", () => {
 				.baselines[0]?.metadata.helperDistribution,
 		).toBeUndefined();
 		for (const dependency of [
-			createHelperDistributionDependencies("1.1.1"),
-			{ ...dependencies, executor: { ...dependencies.executor, protocolVersion: 2 } },
+			{ ...dependencies, executor: { ...dependencies.executor, protocolVersion: 0 } },
 			{ ...dependencies, helpers: { ...dependencies.helpers, extra: true } },
 			{ ...dependencies, executor: { ...dependencies.executor, tag: "executor-v9.9.9" } },
 			null,

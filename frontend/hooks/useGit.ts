@@ -35,7 +35,7 @@ export type { GitLogEntry, GitTarget, GitWorkspace } from "../lib/api/git";
 
 // Types
 export interface GitStatusSummary {
-	/** The executor reached its output budget; counts may be lower bounds. */
+	/** The file list is incomplete; totalFilesExact separately indicates scan completeness. */
 	truncated?: boolean;
 	hasChanges: boolean;
 	staged: number;
@@ -45,19 +45,21 @@ export interface GitStatusSummary {
 		/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
 		status: string;
 		path: string;
-		linesAdded: number;
-		linesRemoved: number;
-		stagedLinesAdded: number;
-		stagedLinesRemoved: number;
-		unstagedLinesAdded: number;
-		unstagedLinesRemoved: number;
+		linesAdded?: number;
+		linesRemoved?: number;
+		stagedLinesAdded?: number;
+		stagedLinesRemoved?: number;
+		unstagedLinesAdded?: number;
+		unstagedLinesRemoved?: number;
 	}>;
 	/** Total changed files (may exceed files.length when capped server-side). */
 	totalFiles: number;
+	/** False means the scan stopped early; undefined preserves older responses. */
+	totalFilesExact?: boolean;
 	headSha: string;
 	branch: string;
-	linesAdded: number;
-	linesRemoved: number;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface GitStashEntry {
@@ -301,7 +303,12 @@ export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
 );
 
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
-	if (workspace?.state !== "ready" || !workspace.capabilities.read || !workspace.workspaceKey)
+	if (
+		workspace?.state !== "ready" ||
+		gitSummarySeeds.has(workspace) ||
+		!workspace.capabilities.read ||
+		!workspace.workspaceKey
+	)
 		return null;
 	return {
 		narratorId,
@@ -339,9 +346,98 @@ export function useGitWorkspaceSubscription(target: GitTarget) {
 
 // One permission subscription per QueryClient, shared by all mounted workspace consumers.
 const deniedGitSummaries = new WeakMap<QueryClient, Set<string>>();
-// Query.reset restores its original initialData snapshot. Mark presentation seeds
-// so a reset cannot mistake that old snapshot for a new authoritative response.
+// Presentation summaries may paint immediately, but can never become Git API targets.
 const gitSummarySeeds = new WeakSet<GitWorkspace>();
+const gitDetailSummaryScopes = new WeakMap<GitWorkspaceSummary, string>();
+export type GitDisplayCounts = Pick<
+	GitStatusSummary,
+	"totalFiles" | "totalFilesExact" | "truncated" | "linesAdded" | "linesRemoved"
+>;
+interface GitDisplaySnapshot {
+	scope: string;
+	workspace: GitWorkspace;
+	counts?: GitDisplayCounts;
+	storedAt: number;
+}
+const gitDisplayCaches = new WeakMap<
+	QueryClient,
+	{ epoch: number; entries: Map<string, GitDisplaySnapshot>; principal: unknown }
+>();
+const GIT_DISPLAY_TTL_MS = 10 * 60_000;
+function gitDisplayCache(qc: QueryClient) {
+	const principal = qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id;
+	let cache = gitDisplayCaches.get(qc);
+	if (!cache) {
+		cache = { epoch: 0, entries: new Map(), principal };
+		gitDisplayCaches.set(qc, cache);
+	} else if (cache.principal !== principal) {
+		cache.epoch++;
+		cache.entries.clear();
+		cache.principal = principal;
+	}
+	return cache;
+}
+function clearGitDisplay(qc: QueryClient, narratorId?: string) {
+	const cache = gitDisplayCache(qc);
+	cache.epoch++;
+	if (narratorId) cache.entries.delete(narratorId);
+	else cache.entries.clear();
+}
+function peekGitDisplay(qc: QueryClient, narratorId: string, scope: string) {
+	const cache = gitDisplayCache(qc);
+	const entry = cache.entries.get(narratorId);
+	if (!entry || entry.scope !== scope) return undefined;
+	if (Date.now() - entry.storedAt > GIT_DISPLAY_TTL_MS) {
+		cache.entries.delete(narratorId);
+		return undefined;
+	}
+	cache.entries.delete(narratorId);
+	cache.entries.set(narratorId, entry);
+	return entry;
+}
+function storeGitDisplay(
+	qc: QueryClient,
+	narratorId: string,
+	scope: string,
+	workspace: GitWorkspace,
+	counts?: GitDisplayCounts,
+) {
+	const cache = gitDisplayCache(qc);
+	// Never retain Git status's diff file list or grant capabilities from a snapshot.
+	const display = { ...workspace, capabilities: { read: false, write: false } };
+	gitSummarySeeds.add(display);
+	const previous = cache.entries.get(narratorId);
+	const retainedCounts =
+		previous?.scope === scope && previous.workspace.workspaceKey === workspace.workspaceKey
+			? previous.counts
+			: undefined;
+	cache.entries.delete(narratorId);
+	cache.entries.set(narratorId, {
+		scope,
+		workspace: display,
+		counts: counts ?? retainedCounts,
+		storedAt: Date.now(),
+	});
+	while (cache.entries.size > 16) {
+		const key = cache.entries.keys().next().value;
+		if (key !== undefined) cache.entries.delete(key);
+	}
+}
+// Monotonic count of authoritative grants (non-denied probe results) per narrator. A refusal
+// observed by a render may only be applied if no newer grant has arrived since that render.
+const gitAccessGrants = new WeakMap<QueryClient, Map<string, number>>();
+function gitAccessGrantCount(qc: QueryClient, narratorId: string): number {
+	return gitAccessGrants.get(qc)?.get(narratorId) ?? 0;
+}
+function recordGitAccessGrant(qc: QueryClient, narratorId: string) {
+	let grants = gitAccessGrants.get(qc);
+	if (!grants) {
+		grants = new Map();
+		gitAccessGrants.set(qc, grants);
+	}
+	grants.set(narratorId, gitAccessGrantCount(qc, narratorId) + 1);
+}
+
 function blockGitSummary(qc: QueryClient, narratorId: string) {
 	let denied = deniedGitSummaries.get(qc);
 	if (!denied) {
@@ -349,6 +445,9 @@ function blockGitSummary(qc: QueryClient, narratorId: string) {
 		deniedGitSummaries.set(qc, denied);
 	}
 	denied.add(narratorId);
+	clearGitDisplay(qc, narratorId);
+	void qc.cancelQueries({ queryKey: ["gitSummary", narratorId] });
+	qc.removeQueries({ queryKey: ["gitSummary", narratorId] });
 	void qc.cancelQueries({ queryKey: ["narrators", narratorId], exact: true });
 	qc.setQueryData<Record<string, unknown>>(["narrators", narratorId], (detail) =>
 		detail ? { ...detail, gitSummary: null } : detail,
@@ -364,6 +463,9 @@ function subscribeGitAccess(qc: QueryClient) {
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: "*", types: ["narrator_access_changed"] },
 			() => {
+				clearGitDisplay(qc);
+				void qc.cancelQueries({ queryKey: ["gitSummary"] });
+				qc.removeQueries({ queryKey: ["gitSummary"] });
 				// Cancel in-flight detail reads before clearing presentation-only summaries.
 				// A late response must not revive private facts after access changed.
 				const details = {
@@ -438,14 +540,10 @@ export function gitSummaryWorkspace(
 	return { ...summary.workspace, branch: summary.workspace.branch ?? summary.branch };
 }
 
-/** A monotonic revision does not change when execution context first hydrates. */
+/** Display and authoritative operation facts have separate lifetimes. */
 export function useGitWorkspace(narratorId: string | null | undefined, revision?: unknown) {
 	const qc = useQueryClient();
-	const {
-		data: narrator,
-		dataUpdatedAt: narratorUpdatedAt,
-		isError: narratorError,
-	} = useNarrator(narratorId ?? "");
+	const { data: narrator, isError: narratorError } = useNarrator(narratorId ?? "");
 	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	const detection = useGitDetectionPreference(narratorId);
 	useEffect(
@@ -456,8 +554,6 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		typeof narrator?.workspaceRevision === "number" ? narrator.workspaceRevision : 0,
 		executionContext?.revision ?? 0,
 	);
-	// Directory/device switches advance this revision. Late hydration of optional
-	// narrator metadata must not replace an already authorized workspace query.
 	const context = revision ?? workspaceRevision;
 	const selectionScope = JSON.stringify([narratorId, context]);
 	const selection = useGitWorkspaceSelection(selectionScope);
@@ -466,70 +562,119 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		(!selection.workspaceKey || selection.workspaceKey === workspace?.workspaceKey)
 			? workspace
 			: undefined;
-	const summaryWorkspace = eligibleSummary(gitSummaryWorkspace(narrator, workspaceRevision));
-	// Rotating the revision-keyed query starts the new context empty; carrying
-	// the previous workspace as placeholder keeps the panel layout (and the Git
-	// strip) mounted while the new context is probed. Scoped to this narrator —
-	// switching panels must never borrow another narrator's workspace. Access
-	// resets clear the recorded data before placeholder reads it, and the denied
-	// check below blocks a carried workspace outright, so revoked facts cannot
-	// reappear through the carryover.
-	const carryPreviousWorkspace = useCallback(
+	// Revision owns normalized executor cwd. Raw narrator fields also guard legacy
+	// switches which did not advance it; hydration of executionContext is not a switch.
+	const scope = JSON.stringify([
+		context,
+		narrator?.cwd ?? null,
+		narrator?.defaultDeviceId ?? null,
+		selection.workspaceKey,
+	]);
+	const cache = gitDisplayCache(qc);
+	const snapshot = narratorId ? peekGitDisplay(qc, narratorId, scope) : undefined;
+	const denied = !!narratorId && !!deniedGitSummaries.get(qc)?.has(narratorId);
+	const detailSummary = narrator?.gitSummary as GitWorkspaceSummary | undefined;
+	const recordedScope = detailSummary ? gitDetailSummaryScopes.get(detailSummary) : undefined;
+	if (detailSummary && !recordedScope) gitDetailSummaryScopes.set(detailSummary, scope);
+	const legacySummary =
+		recordedScope && recordedScope !== scope
+			? undefined
+			: gitSummaryWorkspace(narrator, workspaceRevision);
+	const summary = useQuery({
+		queryKey: ["gitSummary", narratorId, detection.enabled, context, scope],
+		queryFn: async ({ signal }) => {
+			const epoch = cache.epoch;
+			try {
+				const result = await api.getNarratorGitSummary(narratorId as string, signal);
+				if (signal.aborted || epoch !== gitDisplayCache(qc).epoch)
+					throw new DOMException("Git summary superseded", "AbortError");
+				const display = gitSummaryWorkspace({ ...narrator, gitSummary: result }, workspaceRevision);
+				if (display?.state === "access_denied") blockGitSummary(qc, narratorId as string);
+				else if (
+					display &&
+					(!selection.workspaceKey || selection.workspaceKey === display.workspaceKey)
+				)
+					storeGitDisplay(qc, narratorId as string, scope, display);
+				return result;
+			} catch (error) {
+				if ([401, 403].includes((error as ApiError)?.status))
+					blockGitSummary(qc, narratorId as string);
+				throw error;
+			}
+		},
+		enabled: !!narratorId && detection.enabled && !!narrator && !denied,
+		retry: false,
+		staleTime: 5_000,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+	const incoming = summary.data?.revision === workspaceRevision ? summary.data : undefined;
+	const summaryWorkspace = eligibleSummary(
+		incoming
+			? gitSummaryWorkspace({ ...narrator, gitSummary: incoming }, workspaceRevision)
+			: legacySummary,
+	);
+	if (summaryWorkspace) gitSummarySeeds.add(summaryWorkspace);
+	// Only metadata hydration at the same revision may carry authoritative facts.
+	// Directory/device/repository switches and refusals must start without old facts.
+	const carryHydratedScope = useCallback(
 		(
 			previousData: GitWorkspace | undefined,
 			previousQuery: { queryKey: readonly unknown[] } | undefined,
-		): GitWorkspace | undefined =>
-			detection.enabled &&
-			previousQuery?.queryKey[0] === "gitWorkspace" &&
-			previousQuery.queryKey[1] === narratorId &&
-			previousQuery.queryKey[2] === true &&
-			previousQuery.queryKey[4] === selection.workspaceKey
-				? previousData
-				: undefined,
-		[narratorId, detection.enabled, selection.workspaceKey],
+		): GitWorkspace | undefined => {
+			if (!detection.enabled || !narratorId || deniedGitSummaries.get(qc)?.has(narratorId))
+				return undefined;
+			if (!previousData || previousData.state === "access_denied") return undefined;
+			if (gitSummarySeeds.has(previousData)) return undefined;
+			const key = previousQuery?.queryKey;
+			if (key?.[0] !== "gitWorkspace" || key[1] !== narratorId || key[2] !== true)
+				return undefined;
+			if (JSON.stringify(key[3]) !== JSON.stringify(context) || key[4] !== selection.workspaceKey)
+				return undefined;
+			const previous = JSON.parse(String(key[5])) as unknown[];
+			const current = JSON.parse(scope) as unknown[];
+			const completes = current.every(
+				(value, index) => previous[index] === null || previous[index] === value,
+			);
+			return completes ? previousData : undefined;
+		},
+		[qc, narratorId, detection.enabled, context, selection.workspaceKey, scope],
 	);
-	const query = useQuery({
-		queryKey: ["gitWorkspace", narratorId, detection.enabled, context, selection.workspaceKey],
+	const query = useQuery<GitWorkspace>({
+		queryKey: ["gitWorkspace", narratorId, detection.enabled, context, selection.workspaceKey, scope],
+		placeholderData: carryHydratedScope,
 		queryFn: async ({ signal }) => {
+			const epoch = cache.epoch;
+			let result: GitWorkspace;
 			try {
-				return await api.getGitWorkspace(
+				result = await api.getGitWorkspace(
 					narratorId as string,
 					signal,
 					selection.workspaceKey ?? undefined,
 					true,
 				);
 			} catch (error) {
-				if (selection.workspaceKey && (error as ApiError)?.status === 409) {
-					selection.clearIfCurrent(selection.workspaceKey);
-					return api.getGitWorkspace(narratorId as string, signal, undefined, true);
-				}
-				throw error;
+				if (!selection.workspaceKey || (error as ApiError)?.status !== 409) throw error;
+				selection.clearIfCurrent(selection.workspaceKey);
+				result = await api.getGitWorkspace(narratorId as string, signal, undefined, true);
 			}
+			if (signal.aborted || epoch !== gitDisplayCache(qc).epoch)
+				throw new DOMException("Git workspace superseded", "AbortError");
+			if (result.state !== "access_denied") {
+				deniedGitSummaries.get(qc)?.delete(narratorId as string);
+				recordGitAccessGrant(qc, narratorId as string);
+				storeGitDisplay(qc, narratorId as string, scope, result);
+			}
+			return result;
 		},
-		placeholderData: carryPreviousWorkspace,
-		initialData: () => {
-			if (!narratorId || deniedGitSummaries.get(qc)?.has(narratorId)) return undefined;
-			// resetQueries may call this again: re-read the source rather than capture
-			// a summary which an access event has since removed from the detail cache.
-			const detail =
-				qc.getQueryData<Record<string, unknown>>(["narrators", narratorId]) ?? narrator;
-			const seed = eligibleSummary(gitSummaryWorkspace(detail, workspaceRevision));
-			// A base not_git fact does not include the user's opted-in nested discovery.
-			if (seed?.state === "not_git") return undefined;
-			if (seed) gitSummarySeeds.add(seed);
-			return seed;
-		},
-		initialDataUpdatedAt: narratorUpdatedAt || Date.now(),
-		// Keep presentation seeds distinguishable from authoritative responses even
-		// when a successful probe returns exactly the same small facts object.
-		structuralSharing: false,
-		// Wait for detail hydration so an authorized cache summary can seed this query.
-		// Missing summaries and failed detail reads recover only when detection is enabled.
-		enabled: !!narratorId && detection.enabled && (!!narrator || narratorError),
+		// Summary data never seeds this query: only this probe authorizes operations.
+		enabled:
+			!!narratorId &&
+			detection.enabled &&
+			(!!narrator || narratorError) &&
+			summaryWorkspace?.state !== "unsupported",
 		retry: false,
 		staleTime: 5_000,
-		// A non-ready workspace has no panel watch yet. Probe only recoverable
-		// states until ready; Git facts remain subscription-driven, never polled.
+		structuralSharing: false,
 		refetchInterval: (query) => {
 			if (query.state.status === "error") {
 				const status = (query.state.error as ApiError)?.status;
@@ -545,6 +690,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	});
 	useEffect(() => {
 		if (!narratorId || detection.enabled) return;
+		gitDisplayCache(qc).entries.delete(narratorId);
 		const workspaces = qc.getQueriesData<GitWorkspace>({ queryKey: ["gitWorkspace"] });
 		const disabledWorkspaceKeys = new Set(
 			workspaces
@@ -560,7 +706,8 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		);
 		const shouldClearQuery = (candidate: { queryKey: readonly unknown[] }) => {
 			const [prefix, scope, kind] = candidate.queryKey;
-			if (prefix === "gitWorkspace") return scope === narratorId && kind !== false;
+			if (prefix === "gitWorkspace" || prefix === "gitSummary")
+				return scope === narratorId && kind !== false;
 			if (prefix === "narrators") {
 				return scope === narratorId && kind === "file-tree-status";
 			}
@@ -573,55 +720,28 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		void qc.cancelQueries({ predicate: shouldClearQuery });
 		qc.removeQueries({ predicate: shouldClearQuery });
 	}, [qc, narratorId, detection.enabled]);
-	// A carried placeholder may itself be a summary seed object; it is still the
-	// previous context's presentation data, never this revision's seed.
-	const isSummarySeed = !!query.data && !query.isPlaceholderData && gitSummarySeeds.has(query.data);
-	// Do not leave private facts visible after an authorization/capability failure.
+	const accessFailure =
+		(query.isError && [401, 403].includes((query.error as ApiError)?.status)) ||
+		(summary.isError && [401, 403].includes((summary.error as ApiError)?.status)) ||
+		query.data?.state === "access_denied" ||
+		summaryWorkspace?.state === "access_denied";
+	// The refusal below is applied in a passive effect, which can run after a newer probe has
+	// already granted access (e.g. a retry resolving before the effect of the refused render).
+	// Remember which grant this render observed so a stale refusal cannot re-block a newer grant.
+	const grantsAtRender = narratorId ? gitAccessGrantCount(qc, narratorId) : 0;
 	useEffect(() => {
-		if (narratorId) {
-			if (
-				(query.isError && [401, 403].includes((query.error as ApiError)?.status)) ||
-				query.data?.state === "access_denied"
-			)
-				blockGitSummary(qc, narratorId);
-			// Only an authoritative read clears a known denial — neither a summary
-			// seed nor a carried placeholder proves access on the new context.
-			else if (
-				!isSummarySeed &&
-				!query.isPlaceholderData &&
-				query.isSuccess &&
-				query.data?.capabilities.read
-			)
-				deniedGitSummaries.get(qc)?.delete(narratorId);
+		if (narratorId && accessFailure && gitAccessGrantCount(qc, narratorId) === grantsAtRender) {
+			blockGitSummary(qc, narratorId);
+			void qc.cancelQueries({ queryKey: ["gitWorkspace", narratorId] });
+			qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
 		}
-		if (!query.isError && query.data?.capabilities.read !== false) return;
-		qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
-	}, [
-		qc,
-		narratorId,
-		isSummarySeed,
-		query.isError,
-		query.error,
-		query.isSuccess,
-		query.isPlaceholderData,
-		query.data?.state,
-		query.data?.capabilities.read,
-	]);
-	// Synchronous fallback also works when a pending query already existed before
-	// the detail arrived (initialData cannot seed that existing query).
-	const denied = !!narratorId && !!deniedGitSummaries.get(qc)?.has(narratorId);
-	let data: GitWorkspace | undefined;
-	if (!detection.enabled || query.isError) data = undefined;
-	else if (query.isPending || isSummarySeed) data = denied ? undefined : summaryWorkspace;
-	// Carried over from the previous context: a known denial must not borrow it,
-	// and a summary already matching this revision is fresher than the carryover.
-	else if (query.isPlaceholderData) data = denied ? undefined : (summaryWorkspace ?? query.data);
-	else data = query.data;
-	// Old executors and the authority-only probe may omit branch. Preserve only
-	// the label from a same-version summary of this exact device/worktree.
+	}, [qc, narratorId, accessFailure, grantsAtRender]);
+	let data =
+		!detection.enabled || accessFailure || denied
+			? undefined
+			: (query.data ?? summaryWorkspace ?? snapshot?.workspace);
 	if (
-		data?.state === "ready" &&
-		data.capabilities.read &&
+		data &&
 		data.branch === undefined &&
 		data.workspaceKey &&
 		data.workspaceKey === summaryWorkspace?.workspaceKey &&
@@ -629,18 +749,34 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		data.rootPath === summaryWorkspace.rootPath
 	)
 		data = { ...data, branch: summaryWorkspace.branch };
-	const target = data ? gitWorkspaceTarget(narratorId as string, data) : null;
+	const target = !query.isError && data ? gitWorkspaceTarget(narratorId as string, data) : null;
+	const rememberCounts = useCallback(
+		(counts: GitDisplayCounts) => {
+			if (!narratorId || !data || accessFailure || denied) return;
+			storeGitDisplay(qc, narratorId, scope, data, {
+				totalFiles: counts.totalFiles,
+				totalFilesExact: counts.totalFilesExact,
+				truncated: counts.truncated,
+				linesAdded: counts.linesAdded,
+				linesRemoved: counts.linesRemoved,
+			});
+		},
+		[qc, narratorId, scope, data, accessFailure, denied],
+	);
 	return {
 		...query,
 		data,
-		// Denied discovery is finished too: keep the panel mounted without revealing Git facts.
-		layoutReady:
-			!narratorId ||
-			!detection.enabled ||
-			!!data ||
-			query.isError ||
-			denied ||
-			query.data?.state === "access_denied",
+		/**
+		 * True once the server has refused this principal. `data` is then withheld (no branch,
+		 * path or counts may leak), so consumers need this to explain the refusal instead of
+		 * rendering an empty or generic state.
+		 */
+		accessDenied: accessFailure || denied,
+		authoritativeData: !detection.enabled || accessFailure || denied ? undefined : query.data,
+		displayCounts: !detection.enabled || accessFailure || denied ? undefined : snapshot?.counts,
+		rememberCounts,
+		// Retained for legacy consumers. Fixed slots, not Git, own first-screen readiness.
+		layoutReady: true,
 		detectionEnabled: detection.enabled,
 		setDetectionEnabled: detection.setEnabled,
 		workspaceKey: target && typeof target !== "string" ? target.workspaceKey : null,

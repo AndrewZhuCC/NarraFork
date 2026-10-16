@@ -739,7 +739,11 @@ export async function smokePty(
 		stage = "round-trip";
 		resize();
 		output = "";
-		ws.send(JSON.stringify({ type: "input", terminalId: terminal.id, data: `echo ${marker}\r` }));
+		// A late Unix shell prompt can arrive between input echo and command output.
+		// Print a leading newline so the marker remains a whole output line, not "$ marker".
+		const command =
+			process.platform === "win32" ? `echo ${marker}\r` : `printf '\\n%s\\n' '${marker}'\r`;
+		ws.send(JSON.stringify({ type: "input", terminalId: terminal.id, data: command }));
 		await scope.until("PTY shell round trip", () => {
 			if (failure) throw failure;
 			return hasPtyMarker(output, marker) ? true : undefined;

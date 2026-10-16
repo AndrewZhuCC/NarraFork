@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { isValidModelContextWindow } from "@shared/model-context-window";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
 import { resolveProxyForUrl } from "../lib/net/proxy";
@@ -380,7 +381,7 @@ function fillContextWindows(models: GeminiModelInfo[], provider: GeminiProviderC
 	const windows = settings.agent.modelContextWindows ?? {};
 	settings.agent.modelContextWindows = windows;
 	for (const m of models) {
-		if (m.contextLength != null && !windows[`${provider.prefix}:${m.id}`]) {
+		if (isValidModelContextWindow(m.contextLength) && !windows[`${provider.prefix}:${m.id}`]) {
 			windows[`${provider.prefix}:${m.id}`] = m.contextLength;
 			changed = true;
 		}

@@ -384,6 +384,8 @@ function describeExecutionTargetDrift(
 }
 
 export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKind {
+	// Cancellation is a bounded control operation, not a resumable child execution.
+	if (tu.name === "Stop") return "ordinary";
 	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}
@@ -1530,6 +1532,12 @@ export async function executeTool(
 					: undefined;
 				if (authorizeFinalStart && typeof finalTicket?.assertStillCurrent !== "function")
 					throw new Error("Final authorization did not return a synchronous policy fence");
+				ctx.assertFinalExecutionPermission = () => {
+					config.signal.throwIfAborted();
+					config.assertWorkspaceCurrent?.();
+					if (!finalTicket) throw new Error("A final execution permission fence is required");
+					finalTicket.assertStillCurrent();
+				};
 				config.signal.throwIfAborted();
 				config.assertWorkspaceCurrent?.();
 				// Only actual execution is painted as running; captures are preparation.

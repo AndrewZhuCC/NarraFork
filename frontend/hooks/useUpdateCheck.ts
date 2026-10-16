@@ -27,10 +27,7 @@ export function useUpdateNotes(
 	preparedId?: string,
 ) {
 	const identity =
-		enabled &&
-		release?.notesDeferred &&
-		release.notesAvailable &&
-		release.sourceIdentity?.source === "github"
+		enabled && release?.notesDeferred && release.notesAvailable && release.sourceIdentity
 			? { version: release.version, sha512: release.sha512, sourceIdentity: release.sourceIdentity }
 			: null;
 	return useQuery({

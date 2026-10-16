@@ -43,13 +43,20 @@ mock.module("@frontend/hooks/useChapterGitStatus", () => ({
 mock.module("@frontend/hooks/useContainers", () => ({ useContainers: () => ({ data: [] }) }));
 let gitWorkspace: { data?: GitWorkspace; isPending?: boolean; isError?: boolean } = {};
 let gitStatus:
-	| { branch: string; totalFiles: number; linesAdded: number; linesRemoved: number }
+	| {
+			branch: string;
+			totalFiles: number;
+			totalFilesExact?: boolean;
+			truncated?: boolean;
+			linesAdded?: number;
+			linesRemoved?: number;
+	  }
 	| undefined;
 mock.module("@frontend/hooks/useGit", () => ({
 	useGitWorkspace: () => gitWorkspace,
 	useGitStatus: () => ({ data: gitStatus }),
 	gitWorkspaceTarget: (_id: string, workspace?: GitWorkspace) =>
-		workspace?.state === "ready" ? { narratorId: "n" } : null,
+		workspace?.state === "ready" && workspace.capabilities?.read ? { narratorId: "n" } : null,
 }));
 let currentCwd = "/different/current-workspace";
 let containerSupported = true;
@@ -71,7 +78,9 @@ mock.module("react-i18next", () => ({
 		t: (key: string, values?: Record<string, unknown>) =>
 			key === "worktree.legacyContainerSource"
 				? `original:${values?.title}:${values?.chapterId}:${values?.path}`
-				: key,
+				: key === "workspace.atLeastFiles"
+					? `at least ${values?.count}`
+					: key,
 	}),
 }));
 mock.module("../dock/NarratorDockContext", () => ({ useNarratorDockContext: () => null }));
@@ -156,6 +165,7 @@ mock.module("@mantine/core", () => ({
 	Badge: Wrapper,
 	Text: Wrapper,
 	Stack: Wrapper,
+	Skeleton: Wrapper,
 	Tooltip: Wrapper,
 	ActionIcon: (
 		props: WrapperProps & { onClick?: () => void; disabled?: boolean; "aria-label"?: string },
@@ -220,20 +230,100 @@ afterAll(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
-test("non-Git and unresolved standalone workspaces never reserve a strip", async () => {
+test("cold and cached non-Git use the same fixed cwd slot without Git activation", async () => {
 	gitWorkspace = { isPending: true };
 	await act(async () => {
 		root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />);
 		await flush();
 	});
-	expect(container.textContent).toBe("");
+	const slot = container.firstElementChild as HTMLElement;
+	expect(slot.style.height).toBe("30px");
+	expect(container.querySelector('[role="button"]')).toBeNull();
 	gitWorkspace = { data: { state: "not_git" } as GitWorkspace };
 	await act(async () => {
 		root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />);
 		await flush();
 	});
-	expect(container.textContent).toBe("");
+	expect(container.firstElementChild).toBe(slot);
+	expect(slot.style.height).toBe("30px");
+	expect(container.textContent).toContain(currentCwd);
+	await act(async () => {
+		root.render(<NarratorGitBar key="cached-remount" narratorId="n" onOpenGitPanel={() => {}} />);
+		await flush();
+	});
+	expect((container.firstElementChild as HTMLElement).style.height).toBe("30px");
+	expect(container.textContent).toContain(currentCwd);
+	expect(container.querySelector('[role="button"]')).toBeNull();
 });
+
+test("cached non-Git becomes an activatable read-only Git row in place after git init", async () => {
+	gitWorkspace = {
+		data: { state: "not_git", capabilities: { read: false, write: false } } as GitWorkspace,
+	};
+	const openGit = mock(() => {});
+	const render = () => root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={openGit} />);
+	await act(async () => {
+		render();
+		await flush();
+	});
+	const slot = container.firstElementChild as HTMLElement;
+	expect(slot.style.height).toBe("30px");
+	expect(container.querySelector('[role="button"]')).toBeNull();
+	await act(async () => slot.click());
+	expect(openGit).not.toHaveBeenCalled();
+	gitWorkspace = {
+		data: {
+			state: "ready",
+			branch: "initialized",
+			capabilities: { read: true, write: false },
+		} as GitWorkspace,
+	};
+	await act(async () => {
+		render();
+		await flush();
+	});
+	expect(container.firstElementChild).toBe(slot);
+	expect(slot.style.height).toBe("30px");
+	expect(container.textContent).toContain("initialized");
+	expect(container.textContent).toContain("workspace.readOnly");
+	await act(async () => container.querySelector<HTMLElement>('[role="button"]')?.click());
+	expect(openGit).toHaveBeenCalledTimes(1);
+});
+
+test("chapter-linked primary shows a non-Git cwd and enables Git info only after authority becomes ready", async () => {
+	gitWorkspace = {
+		data: { state: "not_git", capabilities: { read: false, write: false } } as GitWorkspace,
+	};
+	const openGit = mock(() => {});
+	const render = () =>
+		root.render(<ChapterBar chapterId="chapter" narratorId="n" onOpenGitPanel={openGit} />);
+	await act(async () => {
+		render();
+		await flush();
+	});
+	const slot = container.firstElementChild as HTMLElement;
+	expect(slot.style.height).toBe("30px");
+	expect(container.textContent).toContain(currentCwd);
+	expect(container.querySelector('[role="button"]')).toBeNull();
+	currentCwd = "/new/current-workspace";
+	gitWorkspace = {
+		data: {
+			state: "ready",
+			branch: "new-branch",
+			capabilities: { read: true, write: false },
+		} as GitWorkspace,
+	};
+	await act(async () => {
+		render();
+		await flush();
+	});
+	expect(container.firstElementChild).toBe(slot);
+	expect(slot.style.height).toBe("30px");
+	expect(container.textContent).toContain("new-branch");
+	await act(async () => container.querySelector<HTMLElement>('[role="button"]')?.click());
+	expect(openGit).toHaveBeenCalledTimes(1);
+});
+
 for (const variant of ["chapter", "standalone"] as const) {
 	test(`${variant} shows summary branch before statistics and keeps a fixed strip height`, async () => {
 		gitWorkspace = {
@@ -276,10 +366,30 @@ for (const variant of ["chapter", "standalone"] as const) {
 		});
 		expect(container.textContent).toContain("authoritative-branch");
 		expect((container.firstElementChild as HTMLElement).style.height).toBe("30px");
+		gitStatus = { branch: "lightweight", totalFiles: 12, totalFilesExact: false };
+		await act(async () => {
+			render();
+			await flush();
+		});
+		if (variant === "standalone") {
+			expect(container.textContent).toContain("at least 12");
+			expect(container.textContent).not.toContain("+100");
+			expect(container.textContent).not.toContain("-2");
+			expect(container.textContent).not.toMatch(/[+-]0|NaN/);
+			gitStatus = { ...gitStatus, totalFilesExact: true, truncated: true };
+			await act(async () => {
+				render();
+				await flush();
+			});
+			expect(container.textContent).not.toContain("at least");
+		}
 	});
 }
 for (const variant of ["chapter", "standalone"] as const) {
 	test(`${variant} Git row ignores worktree portal clicks and activation keys`, async () => {
+		gitWorkspace = {
+			data: { state: "ready", capabilities: { read: true, write: true } } as GitWorkspace,
+		};
 		const openGit = mock(() => {});
 		await act(async () => {
 			root.render(

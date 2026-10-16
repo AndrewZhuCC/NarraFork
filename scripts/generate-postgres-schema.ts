@@ -80,6 +80,8 @@ export type Column = {
 export type Index = {
 	name: string;
 	columns: string[];
+	/** A single literal expression, never a column or a usable FK uniqueness target. */
+	expression?: "1";
 	unique: boolean;
 	predicate?: string;
 	/**
@@ -305,10 +307,17 @@ export function generatePostgresSchema(
 			);
 		}
 		// SQL is deliberately a small language here. Unknown SQLite functions cannot silently leak into PG.
-		const functions = [...sql.matchAll(/\b([a-z_]\w*)\s*\(/gi)].map((m) => m[1].toLowerCase());
-		for (const fn of functions)
-			if (!["coalesce", "in", "or", "and", "when", "not", "octet_length"].includes(fn))
+		for (const match of sql.matchAll(/\b([a-z_]\w*)\s*\(/gi)) {
+			const fn = match[1].toLowerCase();
+			if (fn === "length") {
+				// Both backends count characters in text (JSON mode is also stored as text).
+				// Byte budgets were handled above; do not admit arbitrary length arguments.
+				const argument = sql.slice(match.index).match(/^length\s*\(\s*"(\w+)"\s*\)/i);
+				if (!argument || !table.columns.some((c) => c.name === argument[1] && c.kind === "text"))
+					fail(object, "unsupported length argument: expected a text column");
+			} else if (!["coalesce", "in", "or", "and", "when", "not", "octet_length"].includes(fn))
 				fail(object, `unsupported SQL function ${fn}`);
+		}
 		return sql.trim().replace(/\s+/g, " ");
 	};
 	const pending: {
@@ -474,9 +483,22 @@ export function generatePostgresSchema(
 							unique: kind === "uniqueIndex",
 						};
 						for (const method of methods) {
-							if (callName(method) === "on" && !i.columns.length)
-								i.columns = columnList(method.arguments, object);
-							else if (
+							if (callName(method) === "on" && !i.columns.length && !i.expression) {
+								const node = method.arguments[0];
+								if (node && ts.isTaggedTemplateExpression(node)) {
+									if (
+										method.arguments.length !== 1 ||
+										text(node.tag) !== "sql" ||
+										!ts.isNoSubstitutionTemplateLiteral(node.template)
+									)
+										fail(object, "unsupported index expression");
+									let value = node.template.text.trim();
+									while (value.startsWith("(") && value.endsWith(")"))
+										value = value.slice(1, -1).trim();
+									if (value !== "1") fail(object, "unsupported index expression");
+									i.expression = "1";
+								} else i.columns = columnList(method.arguments, object);
+							} else if (
 								callName(method) === "where" &&
 								!i.predicate &&
 								method.arguments.length === 1
@@ -484,7 +506,7 @@ export function generatePostgresSchema(
 								i.predicate = sqlExpression(method.arguments[0], table, alias, object);
 							else fail(object, `unsupported index method ${callName(method)}`);
 						}
-						if (!i.columns.length || base.arguments.length !== 1)
+						if ((!i.columns.length && !i.expression) || base.arguments.length !== 1)
 							fail(object, "invalid index definition");
 						table.indexes.push(i);
 					} else if (kind === "check") {
@@ -678,6 +700,7 @@ export function generatePostgresSchema(
 			const covering = table.indexes.find(
 				(index) =>
 					index.unique &&
+					!index.expression &&
 					!index.predicate &&
 					index.columns.length === 1 &&
 					columnName(table, index.columns[0]) === column,
@@ -760,7 +783,7 @@ export function generatePostgresSchema(
 				...table.indexes.map((i) =>
 					i.emitAsUniqueConstraint
 						? `unique(${q(i.name)}).on(${i.columns.map((c) => `table.${c}`).join(", ")})`
-						: `${i.unique ? "uniqueIndex" : "index"}(${q(i.name)}).on(${i.columns.map((c) => `table.${c}`).join(", ")})${i.predicate ? `.where(sql.raw(${q(i.predicate)}))` : ""}`,
+						: `${i.unique ? "uniqueIndex" : "index"}(${q(i.name)}).on(${i.expression ? 'sql.raw("(1)")' : i.columns.map((c) => `table.${c}`).join(", ")})${i.predicate ? `.where(sql.raw(${q(i.predicate)}))` : ""}`,
 				),
 				...table.checkDefinitions.map((c) => `check(${q(c.name)}, sql.raw(${q(c.expression)}))`),
 				// Column references whose automatic name would be truncated are emitted here so

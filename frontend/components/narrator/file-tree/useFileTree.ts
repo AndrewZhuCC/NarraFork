@@ -13,6 +13,15 @@ import {
 } from "./tree-store";
 
 const REVALIDATE_CONCURRENCY = 3;
+
+/**
+ * Drop the git directory itself. Other dotfiles (`.env`, `.gitignore`) stay.
+ * `.git` is not a project file, and expanding it is a synchronous directory
+ * scan of object storage.
+ */
+export function omitGitDirectory<T extends { name: string }>(entries: readonly T[]): T[] {
+	return entries.filter((entry) => entry.name !== ".git");
+}
 export interface DirError {
 	dir: string;
 	message: string;
@@ -97,7 +106,7 @@ export function useFileTree(
 					const path = dir === TREE_ROOT_KEY ? root : `${root}/${dir}`;
 					const response = await api.fsBrowse(path, { showHidden, includeFiles: true });
 					if (!current()) return;
-					const entries: TreeEntry[] = response.entries.map((entry) => ({
+					const entries: TreeEntry[] = omitGitDirectory(response.entries).map((entry) => ({
 						name: entry.name,
 						path: dir === TREE_ROOT_KEY ? entry.name : `${dir}/${entry.name}`,
 						isDirectory: entry.isDirectory !== false,

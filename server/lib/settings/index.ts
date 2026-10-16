@@ -36,6 +36,7 @@ import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../p
 import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
+import { normalizeModelContextWindows } from "./model-context-windows";
 import { _bindSettings } from "./provider";
 import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
@@ -466,6 +467,12 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		merged.customApiProviders = undefined;
 	}
 	if (normalizeCustomApiProviderSettings(merged)) {
+		needsSave = true;
+	}
+
+	// Existing catalogs must observe the original windows until binding/upgrade,
+	// so normalization can update only the changed legacy bindings as well.
+	if (!merged.agent.modelCatalog && normalizeModelContextWindows(merged)) {
 		needsSave = true;
 	}
 

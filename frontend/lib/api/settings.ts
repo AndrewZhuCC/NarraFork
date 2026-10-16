@@ -1,5 +1,6 @@
 import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import type { Locale } from "@shared/i18n-locales";
+import type { ProviderReadiness } from "@shared/provider-readiness";
 import type {
 	PersistedRecentTab,
 	RecentTabsMutationResult,
@@ -163,13 +164,17 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ confirmed: true }),
 		}),
-	getSettings: (options?: object) => request<ApiEntity>("/settings", pickRequestOptions(options)),
+	getSettings: (options?: object) =>
+		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>(
+			"/settings",
+			pickRequestOptions(options),
+		),
 	getContextThresholds: (model: string, provider: string) =>
 		request<{ compactStart: number }>(
 			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
 		),
 	updateSettings: (data: Record<string, unknown>, options?: object) =>
-		request<ApiEntity>("/settings", {
+		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>("/settings", {
 			method: "PATCH",
 			body: JSON.stringify(data),
 			...pickRequestOptions(options),
@@ -362,6 +367,8 @@ export const settingsApi = {
 			narratorToolbarLayout: {
 				items: Array<{ id: string }>;
 			};
+			/** 大纲标签排布（JSON: { [narratorId]: { order, pinned } }）。 */
+			specTabLayout: Record<string, unknown>;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -531,5 +538,14 @@ export const settingsApi = {
 		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
 			method: "PATCH",
 			body: JSON.stringify({ projectId, viewport }),
+		}),
+	/**
+	 * 保存某个叙述者的大纲标签排布。服务端按 narratorId 合并写入，
+	 * 不会覆盖其他叙述者的记录。
+	 */
+	saveSpecTabLayout: (narratorId: string, layout: { order: string[]; pinned: string[] }) =>
+		request<{ ok: boolean }>("/user-preferences/spec-tab-layout", {
+			method: "PATCH",
+			body: JSON.stringify({ narratorId, ...layout }),
 		}),
 };

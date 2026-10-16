@@ -28,6 +28,7 @@ import {
 	IconMessageQuestion,
 	IconPencil,
 	IconPlayerPlay,
+	IconPlayerStop,
 	type IconProps,
 	IconRobot,
 	IconSearch,
@@ -106,6 +107,8 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconGitFork;
 		case "await":
 			return IconClock;
+		case "stop":
+			return IconPlayerStop;
 		case "send":
 			return IconMessageQuestion;
 		case "ask":

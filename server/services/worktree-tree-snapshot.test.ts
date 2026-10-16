@@ -14,6 +14,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -21,11 +22,14 @@ import iconv from "iconv-lite";
 import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { AsyncMutex } from "../lib/async-mutex";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
+import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import {
+	hasHotPathWarmupForTests,
 	planTreeRevertSegments,
 	resetHotPathCaptureStateForTests,
 	TreeRestoreError,
@@ -99,6 +103,284 @@ afterEach(async () => {
 });
 
 describe("worktree tree snapshots", () => {
+	for (const partial of ["empty", "HEAD", "objects", "complete"] as const) {
+		for (const cold of [false, true]) {
+			test(`failed ${partial} shadow birth resumes ${cold ? "in a cold process" : "on retry"} without deleting evidence`, async () => {
+				const repo = await createRepo("nf-tree-init-resume-");
+				writeFileSync(join(repo, "a.txt"), "recoverable\n");
+				const dir = treeSnapshotPhysicalDir("local", repo);
+				const markerPath = join(dir, "nf-shadow-init");
+				const evidence = Buffer.from([0, 255, 128, 13, 10]);
+				const realSpawn = spawn.safeSpawn;
+				const failed = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+					if (opts.cmd[1] !== "init" || !opts.cmd.includes("--bare")) return realSpawn(opts);
+					if (partial === "complete") expect((await realSpawn(opts)).exitCode).toBe(0);
+					writeFileSync(join(dir, "marker.bin"), evidence);
+					if (partial === "HEAD") writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+					if (partial === "objects") {
+						mkdirSync(join(dir, "objects"));
+						writeFileSync(join(dir, "objects", "evidence.bin"), evidence);
+						mkdirSync(join(dir, "refs", "nf"), { recursive: true });
+						writeFileSync(join(dir, "refs", "nf", "preserved"), `${"a".repeat(40)}\n`);
+					}
+					return { exitCode: 1, stdout: "", stderr: "injected init failure" };
+				});
+				try {
+					await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
+						"shadow repo init failed",
+					);
+				} finally {
+					failed.mockRestore();
+				}
+				const birth = lstatSync(dir);
+				const marker = readFileSync(markerPath);
+				const headBefore = existsSync(join(dir, "HEAD")) ? readFileSync(join(dir, "HEAD")) : null;
+				expect(marker.length).toBeLessThanOrEqual(256);
+				await worktreeTreeSnapshot.gcAll();
+				expect(existsSync(join(dir, "HEAD")) ? readFileSync(join(dir, "HEAD")) : null).toEqual(
+					headBefore,
+				);
+				expect(readFileSync(markerPath)).toEqual(marker);
+				expect(readFileSync(join(dir, "marker.bin"))).toEqual(evidence);
+				if (cold) {
+					// A separate module graph and database, but the same physical shadow store.
+					// Never share the parent's live DB lock or bypass instance locking.
+					const coldHome = mkdtempSync(join(tmpdir(), "nf-tree-cold-home-"));
+					tempDirs.push(coldHome);
+					symlinkSync(join(dir, ".."), join(coldHome, "tree-snapshots"), "dir");
+					const result = await realSpawn({
+						cmd: [
+							process.execPath,
+							"--eval",
+							`
+							if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME)
+								throw new Error("isolated test home required");
+							const { worktreeTreeSnapshot } = await import(${JSON.stringify(join(import.meta.dir, "worktree-tree-snapshot.ts"))});
+							const tree = await worktreeTreeSnapshot.capture(${JSON.stringify(repo)});
+							console.log("RECOVERED:" + tree);
+							process.exit(0);
+						`,
+						],
+						env: { ...process.env, NARRAFORK_HOME: coldHome },
+						timeout: 15_000,
+						maxOutputBytes: 64 * 1024,
+					});
+					if (result.exitCode !== 0)
+						throw new Error(`cold capture failed: ${result.stdout}\n${result.stderr}`);
+					expect(result.stdout).toMatch(/RECOVERED:[0-9a-f]{40}/);
+				} else {
+					expect(await worktreeTreeSnapshot.capture(repo)).toMatch(/^[0-9a-f]{40}$/);
+				}
+				expect(lstatSync(dir).ino).toBe(birth.ino);
+				expect(lstatSync(dir).dev).toBe(birth.dev);
+				expect(existsSync(markerPath)).toBe(false);
+				expect(readFileSync(join(dir, "marker.bin"))).toEqual(evidence);
+				if (partial === "objects") {
+					expect(readFileSync(join(dir, "objects", "evidence.bin"))).toEqual(evidence);
+					expect(readFileSync(join(dir, "refs", "nf", "preserved"), "utf8")).toBe(
+						`${"a".repeat(40)}\n`,
+					);
+				}
+			}, 25_000);
+		}
+	}
+
+	for (const damage of [
+		"missing",
+		"corrupt",
+		"oversized",
+		"foreign-key",
+		"directory",
+		"parent",
+		"symlink",
+	] as const) {
+		test(`failed shadow birth refuses a ${damage} initialization marker without init or deletion`, async () => {
+			const repo = await createRepo("nf-tree-init-refuse-");
+			const dir = treeSnapshotPhysicalDir("local", repo);
+			const markerPath = join(dir, "nf-shadow-init");
+			const realSpawn = spawn.safeSpawn;
+			const failed = spyOn(spawn, "safeSpawn").mockImplementation((opts) =>
+				opts.cmd[1] === "init" && opts.cmd.includes("--bare")
+					? Promise.resolve({ exitCode: 1, stdout: "", stderr: "injected init failure" })
+					: realSpawn(opts),
+			);
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("shadow repo init failed");
+			} finally {
+				failed.mockRestore();
+			}
+			const marker = readFileSync(markerPath, "utf8");
+			if (damage === "missing") rmSync(markerPath);
+			if (damage === "corrupt") writeFileSync(markerPath, "{broken");
+			if (damage === "oversized") writeFileSync(markerPath, "x".repeat(257));
+			if (damage === "foreign-key")
+				writeFileSync(markerPath, marker.replace(/[a-f0-9]{64}/, "0".repeat(64)));
+			if (damage === "parent") {
+				const lines = marker.split("\n");
+				lines[3] = "0:0";
+				writeFileSync(markerPath, lines.join("\n"));
+			}
+			if (damage === "directory") {
+				const backup = join(repo, "failed-shadow");
+				renameSync(dir, backup);
+				mkdirSync(dir);
+				writeFileSync(markerPath, marker);
+				expect(lstatSync(dir).ino).not.toBe(lstatSync(backup).ino);
+				expect(readFileSync(join(backup, "nf-shadow-init"), "utf8")).toBe(marker);
+			}
+			if (damage === "symlink") {
+				const external = join(repo, "external-marker");
+				writeFileSync(external, marker);
+				rmSync(markerPath);
+				symlinkSync(external, markerPath);
+			}
+			writeFileSync(join(dir, "marker.bin"), "retained evidence");
+			writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+			const dispatch = spyOn(spawn, "safeSpawn");
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(TreeSnapshotError);
+				expect(dispatch).toHaveBeenCalledTimes(0);
+				expect(readFileSync(join(dir, "marker.bin"), "utf8")).toBe("retained evidence");
+			} finally {
+				dispatch.mockRestore();
+			}
+		});
+	}
+
+	test("marker creation failure preserves the birth but does not authorize recovery", async () => {
+		const repo = await createRepo("nf-tree-init-marker-failure-");
+		const dir = treeSnapshotPhysicalDir("local", repo);
+		const realWrite = fsPromises.writeFile;
+		const writing = spyOn(fsPromises, "writeFile").mockImplementation((...args) =>
+			args[0] === join(dir, "nf-shadow-init")
+				? Promise.reject(new Error("injected marker creation failure"))
+				: realWrite(...args),
+		);
+		const dispatch = spyOn(spawn, "safeSpawn");
+		try {
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("marker creation failed");
+			expect(dispatch).toHaveBeenCalledTimes(0);
+		} finally {
+			writing.mockRestore();
+			dispatch.mockRestore();
+		}
+		expect(lstatSync(dir).isDirectory()).toBe(true);
+		expect(existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+		await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
+			"existing shadow repo is invalid",
+		);
+	});
+
+	test("gcAll waits for the shadow mutex before repairing HEAD", async () => {
+		const repo = await createRepo("nf-tree-gc-repair-lock-");
+		writeFileSync(join(repo, "a.txt"), "retained\n");
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		const dir = treeSnapshotPhysicalDir("local", repo);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const queued = Promise.withResolvers<void>();
+		const realSpawn = spawn.safeSpawn;
+		const git = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			if (opts.cmd.includes("add") && opts.cmd.includes(dir)) {
+				started.resolve();
+				await release.promise;
+				return { exitCode: 1, stdout: "", stderr: "fixture paused capture" };
+			}
+			return realSpawn(opts);
+		});
+		const capturing = worktreeTreeSnapshot.capture(repo).then(
+			() => null,
+			(error) => error,
+		);
+		try {
+			await Promise.race([
+				started.promise,
+				capturing.then((error) => {
+					throw error;
+				}),
+			]);
+		} catch (error) {
+			git.mockRestore();
+			throw error;
+		}
+		rmSync(join(dir, "HEAD"));
+		const acquire = AsyncMutex.prototype.acquire;
+		const mutex = spyOn(AsyncMutex.prototype, "acquire").mockImplementation(function <T>(
+			this: AsyncMutex,
+			key: string,
+			body: () => Promise<T>,
+		): Promise<T> {
+			if (key === dir) queued.resolve();
+			return acquire.call(this, key, body) as Promise<T>;
+		});
+		const collecting = worktreeTreeSnapshot.gcAll();
+		try {
+			await queued.promise;
+			expect(existsSync(join(dir, "HEAD"))).toBe(false);
+			release.resolve();
+			expect(await capturing).toBeInstanceOf(TreeSnapshotError);
+			await collecting;
+			expect(existsSync(join(dir, "HEAD"))).toBe(true);
+			expect(await worktreeTreeSnapshot.hasTree(repo, tree)).toBe(true);
+		} finally {
+			release.resolve();
+			await capturing;
+			await collecting;
+			mutex.mockRestore();
+			git.mockRestore();
+		}
+	});
+
+	for (const corruption of [
+		"non-bare",
+		"invalid-config",
+		"oversized-config",
+		"foreign-gitdir",
+		"foreign-common-dir",
+	] as const) {
+		test(`capture and structural writes refuse an existing ${corruption} shadow without init or metadata writes`, async () => {
+			const repo = await createRepo("nf-tree-existing-invalid-");
+			writeFileSync(join(repo, "a.txt"), "retained\n");
+			const tree = await worktreeTreeSnapshot.capture(repo);
+			const dir = treeSnapshotPhysicalDir("local", repo);
+			const configPath = join(dir, "config");
+			if (corruption === "non-bare") {
+				writeFileSync(configPath, "[core]\n\tbare = false\n");
+			} else if (corruption === "invalid-config") {
+				writeFileSync(configPath, "[malformed\n");
+			} else if (corruption === "oversized-config") {
+				writeFileSync(configPath, "#".repeat(64 * 1024 + 1));
+			} else if (corruption === "foreign-common-dir") {
+				writeFileSync(join(dir, "commondir"), join(repo, ".git"));
+			}
+			const config = readFileSync(configPath);
+			const head = readFileSync(join(dir, "HEAD"));
+			const realSpawn = spawn.safeSpawn;
+			const git = spyOn(spawn, "safeSpawn").mockImplementation((opts) =>
+				corruption === "foreign-gitdir" && opts.cmd.includes("--absolute-git-dir")
+					? Promise.resolve({ exitCode: 0, stdout: `true\n${repo}\n`, stderr: "" })
+					: realSpawn(opts),
+			);
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(TreeSnapshotError);
+				await expect(worktreeTreeSnapshot.commitSnapshot(repo, tree)).rejects.toThrow(
+					TreeSnapshotError,
+				);
+				for (const [opts] of git.mock.calls) {
+					expect(opts.cmd).toContain("rev-parse");
+					expect(opts.cmd).not.toContain("init");
+				}
+				if (corruption === "oversized-config" || corruption === "foreign-common-dir") {
+					expect(git).toHaveBeenCalledTimes(0);
+				}
+				expect(readFileSync(configPath)).toEqual(config);
+				expect(readFileSync(join(dir, "HEAD"))).toEqual(head);
+			} finally {
+				git.mockRestore();
+			}
+		});
+	}
+
 	test("captures a tree hash and records it once per distinct state", async () => {
 		const repo = await createRepo("nf-tree-capture-");
 		writeFileSync(join(repo, "a.txt"), "one\n");
@@ -1793,10 +2075,7 @@ describe("hot-path capture budget", () => {
 
 		// A zero budget expires before the first git process can possibly exit, so
 		// the tool path gets its null and moves on...
-		const timedOut = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
-			budgetMs: 0,
-		});
-		expect(timedOut).toBeNull();
+		await promoteToWarmup(repo);
 
 		// ...while the capture keeps running as the warm-up. A later call shares that
 		// scan instead of queueing a second one, and resolves with its hash.
@@ -1847,11 +2126,28 @@ describe("hot-path capture budget", () => {
 		const repo = await createRepo("nf-tree-hot-shared-");
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
-		const results = await Promise.all([
-			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		]);
+		// Warm only the disk-space probe (its result is cached per path), then return to an EMPTY
+		// warm-up slot. Without this, the zero budget can expire on the probe and no call would
+		// ever reach the slot, so "they share one warm-up" would be vacuous on a loaded runner.
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 30_000 }),
+		).toMatch(/^[0-9a-f]{40}$/);
+		resetHotPathCaptureStateForTests();
+		writeFileSync(join(repo, "a.txt"), "two\n");
+
+		// Three concurrent calls race for the empty slot: exactly one real scan may start.
+		const capture = spyOn(worktreeTreeSnapshot, "capture");
+		let results: (string | null)[];
+		try {
+			results = await Promise.all([
+				worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+				worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+				worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+			]);
+			expect(capture).toHaveBeenCalledTimes(1);
+		} finally {
+			capture.mockRestore();
+		}
 		expect(results).toEqual([null, null, null]);
 
 		// One warm-up completed underneath them all.
@@ -1869,11 +2165,7 @@ describe("hot-path capture budget", () => {
 		tempDirs.push(dir);
 		snapshotPaths.push(normalizePathForComparison(dir));
 
-		const timedOut = await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, {
-			budgetMs: 0,
-			cooldownMs: 1_000,
-		});
-		expect(timedOut).toBeNull();
+		await promoteToWarmup(dir, 1_000);
 		// Sharing the warm-up to its conclusion guarantees the cooldown has engaged
 		// by the time this resolves (the cooldown window came from the first call).
 		expect(
@@ -1924,9 +2216,7 @@ describe("hot-path capture budget", () => {
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
 		// Promote a capture to the background warm-up.
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 
 		// A boundary measured *now* must not come from that older scan (its window
 		// may straddle the writes being measured): the call waits for the stale scan
@@ -1949,9 +2239,7 @@ describe("hot-path capture budget", () => {
 		const repo = await createRepo("nf-tree-hot-share-");
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 
 		// The in-flight scan started after the cutoff, so its result is valid for the
 		// caller and no second scan is started.
@@ -1989,6 +2277,30 @@ describe("hot-path capture budget", () => {
 		return { spy, state };
 	}
 
+	/**
+	 * Promote a capture to the background warm-up slot and PROVE it got there.
+	 *
+	 * `budgetMs: 0` alone is not enough: the same zero budget also races the async disk-space
+	 * probe that runs before any capture starts. On a loaded runner that probe loses, the call
+	 * returns null without registering a warm-up, and every later assertion about "the
+	 * in-flight warm-up" silently tests nothing. Retry the zero-budget call until a warm-up is
+	 * really registered (the disk probe result is cached after its first completion, so this
+	 * converges in a few attempts), then hand control back to the test.
+	 */
+	async function promoteToWarmup(repo: string, cooldownMs?: number): Promise<void> {
+		for (let attempt = 0; attempt < 200; attempt++) {
+			expect(
+				await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+					budgetMs: 0,
+					...(cooldownMs === undefined ? {} : { cooldownMs }),
+				}),
+			).toBeNull();
+			if (hasHotPathWarmupForTests(repo)) return;
+			await Bun.sleep(5);
+		}
+		throw new Error("no warm-up was registered for the zero-budget capture");
+	}
+
 	test("a structural capture preempts an in-flight warm-up instead of queueing behind it", async () => {
 		resetHotPathCaptureStateForTests();
 		const repo = await createRepo("nf-tree-hot-preempt-");
@@ -1996,9 +2308,7 @@ describe("hot-path capture budget", () => {
 
 		const { spy, state } = mockHungCapture();
 		// Promote the hung capture to the warm-up slot.
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 
 		// The structural path must kill the warm-up's scan rather than queue behind
 		// it for the full warm-up timeout.
@@ -2020,9 +2330,7 @@ describe("hot-path capture budget", () => {
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
 		const { spy, state } = mockHungCapture();
-		expect(
-			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
-		).toBeNull();
+		await promoteToWarmup(repo);
 		spy.mockRestore();
 
 		expect(await worktreeTreeSnapshot.destroy(repo, LOCAL_DEVICE_ID, { force: true })).toBe(true);

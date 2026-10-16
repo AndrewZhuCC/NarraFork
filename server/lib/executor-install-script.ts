@@ -35,7 +35,7 @@ import {
 } from "@shared/remote-executor";
 import { DEVICE_PROTOCOL_VERSION } from "./agent/execution/rpc-types";
 import { ValidationError } from "./errors";
-import { APP_VERSION } from "./version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "./version";
 
 export type ExecutorInstallMode = "system" | "user";
 
@@ -315,8 +315,11 @@ interface ResolvedInput extends ExecutorInstallScriptInput {
 
 function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 	if (
-		input.executorVersion !== APP_VERSION ||
-		(input.executorProtocolVersion ?? DEVICE_PROTOCOL_VERSION) !== DEVICE_PROTOCOL_VERSION ||
+		input.executorVersion !== BUILD_EXECUTOR_DISTRIBUTION.version ||
+		(input.executorProtocolVersion ?? BUILD_EXECUTOR_DISTRIBUTION.protocolVersion) !==
+			BUILD_EXECUTOR_DISTRIBUTION.protocolVersion ||
+		(input.executorProtocolVersion ?? BUILD_EXECUTOR_DISTRIBUTION.protocolVersion) !==
+			DEVICE_PROTOCOL_VERSION ||
 		input.artifactFilename !== executorPublishedFilename(input.executorVersion, input.platform)
 	) {
 		throw new ValidationError(

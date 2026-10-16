@@ -8,6 +8,7 @@ import type { FileReference } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import {
 	copyFileReferences,
+	type FileReferenceInput,
 	readFileReferences,
 	sameFileReferenceInput,
 } from "./file-reference-input";
@@ -34,6 +35,10 @@ export interface StoredNarratorInputDraft {
 	fileReferences?: FileReference[];
 	serverRevision: number | null;
 	serverUpdatedAt: string | null;
+	/** Present only when this exact text/reference snapshot was acknowledged by the server. */
+	syncedRevision?: number;
+	/** Dirty snapshots keep their CAS base but cannot claim that their content is synchronized. */
+	unsynced?: true;
 }
 
 interface StoredNarratorInputDraftEnvelope extends StoredNarratorInputDraft {
@@ -228,6 +233,11 @@ export function readNarratorInputDraft(
 			...(fileReferences.length ? { fileReferences } : {}),
 			serverRevision: parsed.serverRevision ?? null,
 			serverUpdatedAt: parsed.serverUpdatedAt ?? null,
+			...(typeof parsed.syncedRevision === "number" &&
+			parsed.syncedRevision === parsed.serverRevision
+				? { syncedRevision: parsed.syncedRevision }
+				: {}),
+			...(parsed.unsynced === true ? { unsynced: true as const } : {}),
 		};
 	} catch {
 		return emptyStoredDraft();
@@ -252,6 +262,8 @@ export function persistNarratorInputDraft(
 	serverRevision: number | null,
 	serverUpdatedAt: string | null,
 	fileReferences: FileReference[] = [],
+	// undefined: legacy/unknown snapshot; null: explicitly unsynced, including a clear.
+	syncedInput?: FileReferenceInput | null,
 ): boolean {
 	const id = getNarratorDraftStorageId(userId, narratorId);
 	if (text.length > MAX_LOCAL_DRAFT_MIRROR_CHARS) {
@@ -273,6 +285,13 @@ export function persistNarratorInputDraft(
 		fileReferences: references,
 		serverRevision,
 		serverUpdatedAt,
+		...(syncedInput !== undefined
+			? syncedInput &&
+				serverRevision != null &&
+				sameFileReferenceInput({ text, fileReferences: references }, syncedInput)
+				? { syncedRevision: serverRevision }
+				: { unsynced: true as const }
+			: {}),
 	};
 	const serialized = JSON.stringify(envelope);
 	if (serialized.length > SESSION_STORE_LIMITS.MAX_VALUE_CHARS) {
@@ -300,6 +319,29 @@ export function persistNarratorInputDraft(
 		text || references.length ? "durable" : "disposable",
 	);
 	return true;
+}
+
+/** A revision alone is a CAS base, not proof that the local contents were acknowledged. */
+export function isAcknowledgedNarratorDraft(local: StoredNarratorInputDraft): boolean {
+	return (
+		!local.unsynced &&
+		local.syncedRevision != null &&
+		Number.isInteger(local.syncedRevision) &&
+		local.syncedRevision >= 0 &&
+		local.syncedRevision === local.serverRevision
+	);
+}
+
+/** Metadata can skip a full body read only for an acknowledged local content snapshot. */
+export function canHydrateNarratorDraftFromMeta(
+	local: StoredNarratorInputDraft,
+	meta: { hasDraft: boolean; revision: number },
+): boolean {
+	return (
+		isAcknowledgedNarratorDraft(local) &&
+		local.serverRevision === meta.revision &&
+		meta.hasDraft === !!(local.text || local.fileReferences?.length)
+	);
 }
 
 export function resolveHydratedNarratorDraft(options: {
@@ -340,8 +382,8 @@ export function resolveHydratedNarratorDraft(options: {
 		return result(local, false);
 	}
 	if (
-		options.local.serverRevision === null &&
-		(local.text || local.fileReferences.length) &&
+		(options.local.unsynced || options.local.serverRevision === null) &&
+		(local.text || local.fileReferences.length || options.local.unsynced) &&
 		!sameFileReferenceInput(local, server)
 	) {
 		// Version-1 browser storage has no trustworthy base revision.

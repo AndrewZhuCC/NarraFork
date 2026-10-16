@@ -7,9 +7,11 @@ import type { GeminiProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { reportInputCharacters } from "./input-characters";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -175,6 +177,30 @@ export class GeminiProvider implements ProviderAdapter {
 		return (this.config.baseUrl || DEFAULT_GEMINI_BASE).replace(/\/+$/, "");
 	}
 
+	private headers(apiKey: string, conversationId?: string, stream = false): Record<string, string> {
+		const fingerprint = resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			conversationId,
+		});
+		const headers = new Headers({
+			"Content-Type": "application/json",
+			"x-goog-api-key": apiKey,
+			"User-Agent": fingerprint.userAgent,
+			...(stream ? { Accept: "text/event-stream" } : {}),
+			...buildOpencodeSessionHeader({
+				baseUrl: this.baseUrl(),
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		});
+		// HTTP names are case-insensitive; extra headers replace, never comma-join defaults.
+		for (const [name, value] of Object.entries(fingerprint.headers)) headers.set(name, value);
+		return Object.fromEntries(headers.entries());
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (tools.length === 0) return [];
 		const functionDeclarations: GeminiFunctionDeclaration[] = tools.map((tool) => {
@@ -286,10 +312,7 @@ export class GeminiProvider implements ProviderAdapter {
 
 		assertModelInputModalities(params.model, body, metadata);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-		const headers: Record<string, string> = {
-			"Content-Type": "application/json",
-			"x-goog-api-key": apiKey,
-		};
+		const headers = this.headers(apiKey, params.conversationId);
 
 		logger.debug("Gemini chat request", {
 			model,
@@ -573,11 +596,7 @@ export class GeminiProvider implements ProviderAdapter {
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-		const headers = {
-			Accept: "text/event-stream",
-			"Content-Type": "application/json",
-			"x-goog-api-key": apiKey,
-		};
+		const headers = this.headers(apiKey, undefined, true);
 		opts.requestDump?.beginResponseAttempt(
 			{ transport: "http", url, headers, body },
 			settings.agent.requestDumpMaxSize,
@@ -1045,7 +1064,8 @@ async function readResponseTextWithLimit(response: Response, limit: number): Pro
  * Recursively sanitize a JSON Schema for Gemini's function-declaration format.
  * Gemini's Schema type is a strict OpenAPI subset — it rejects `additionalProperties`,
  * `$schema`, `const`, `$ref`, and a few other keywords. This drops the unsupported
- * keys and rewrites `const` to a single-value `enum`.
+ * keys and rewrites string `const` to a single-value `enum`. Non-string enum
+ * constraints are dropped while preserving the schema's type.
  */
 export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
 	return sanitizeNode(schema) as Record<string, unknown>;
@@ -1100,8 +1120,11 @@ function sanitizeNode(node: unknown): unknown {
 	for (const [key, value] of Object.entries(input)) {
 		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
 		if (key === "const") {
-			// Rewrite const → single-value enum, which Gemini supports.
-			out.enum = [value];
+			// Gemini's enum field accepts strings only; retain the type for other literals.
+			if (typeof value === "string") out.enum = [value];
+			continue;
+		}
+		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
 			continue;
 		}
 		if (key === "properties" && value && typeof value === "object") {
@@ -1229,30 +1252,46 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
 }
 
+/**
+ * ⚠️ 新增 provider adapter 前必须先调研其 token 数据组成：input 是否已含缓存、缓存读取/写入
+ * 分别落在哪个字段、数值是「单次值」还是「会话累计值」，再决定换算方式。弄错的代价不会立刻
+ * 显现——错误口径会被静默写入 api_requests，污染用量统计与缓存命中率，事后只能靠数据特征
+ * 反推修补。
+ */
 function mapUsage(usage: GeminiUsageMetadata | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		inputTokens: usage.promptTokenCount ?? 0,
+		// Gemini promptTokenCount 明确包含缓存读取，异常计数也不能按净输入猜测。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.candidatesTokenCount ?? 0,
-		cachedInputTokens: usage.cachedContentTokenCount ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? 0,
 	};
 }
 
 function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEvent["usage"]> {
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		promptTokens: usage.promptTokenCount ?? 0,
-		inputTokens: (usage.promptTokenCount ?? 0) - (usage.cachedContentTokenCount ?? 0),
+		promptTokens,
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		completionTokens: usage.candidatesTokenCount ?? 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? undefined,
 		cachedInputTokens: usage.cachedContentTokenCount ?? undefined,

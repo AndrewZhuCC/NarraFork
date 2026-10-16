@@ -230,6 +230,12 @@ export async function downloadGithubUpdateToFile(
 				signal.throwIfAborted();
 				if ((await stat(patchPath)).size !== step.patchSize)
 					throw new Error("GitHub patch payload size mismatch");
+				if (step.sha256) {
+					const digest = createHash("sha256");
+					for await (const chunk of createReadStream(patchPath, { signal })) digest.update(chunk);
+					if (digest.digest("hex") !== step.sha256)
+						throw new Error("Patch payload SHA256 mismatch");
+				}
 				if (step.meta.mode !== "patch-from") {
 					// Recheck the actual input after the payload download, immediately before
 					// the bounded legacy decoder can read its files into memory.
@@ -271,7 +277,7 @@ export async function downloadGithubUpdateToFile(
 			signal.throwIfAborted();
 			fallback = strategy === "zstd";
 			strategy = "full";
-			dependencies.onFallback?.(error);
+			if (fallback) dependencies.onFallback?.(error);
 		} finally {
 			if (directory) {
 				await rm(directory, { recursive: true, force: true });

@@ -122,6 +122,125 @@ describe("parity fixture baseline", () => {
 	});
 });
 
+describe("table primary key parity", () => {
+	const compositeFixture = () => {
+		const source = fixture();
+		source.tables[1].columns[0].primary = false;
+		source.tables[1].primaryKeys = [{ name: "posts_scope_pk", columns: ["authorEmail", "id"] }];
+		return source;
+	};
+
+	test("compares table-level PKs without requiring inline column primary flags", () => {
+		const source = compositeFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+	});
+
+	test.each([
+		"name",
+		"order",
+		"wrong column",
+		"missing key",
+		"extra key",
+	])("detects %s drift", (change) => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		const table = target.tables[1];
+		switch (change) {
+			case "name":
+				table.primaryKeys[0].name = "renamed_pk";
+				break;
+			case "order":
+				table.primaryKeys[0].columns.reverse();
+				break;
+			case "wrong column":
+				table.primaryKeys[0].columns = ["id"];
+				break;
+			case "missing key":
+				table.primaryKeys = [];
+				break;
+			case "extra key":
+				table.primaryKeys.push({ name: "extra_pk", columns: ["id"] });
+				break;
+		}
+		expect(validateCoverage(source, target).join("\n")).toContain("primary key");
+	});
+
+	test("retains inline column primary flag comparison", () => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		target.tables[1].columns[0].primary = true;
+		expect(validateCoverage(source, target)).toContain("column mismatch posts.id");
+	});
+});
+
+describe("constant expression index parity", () => {
+	const expressionFixture = () => {
+		const source = fixture();
+		source.tables[1].indexes.push({
+			name: "singleton",
+			columns: [],
+			expression: "1",
+			unique: true,
+			predicate: '"author_email" IS NOT NULL',
+		});
+		return source;
+	};
+	test("an exact constant expression retains a distinct structural signature", () => {
+		const source = expressionFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+		expect(
+			normalizeCoverage(source, "test").coverage.tables.find((table) => table.name === "posts")
+				?.indexes[0].expression,
+		).toBe("1");
+	});
+	test.each([
+		"2",
+		"1+0",
+		"(1)",
+		"lower(id)",
+		"",
+		"true",
+	])("rejects unknown expression %s even on both sides", (expression) => {
+		const source = expressionFixture();
+		source.tables[1].indexes[0].expression = expression;
+		expect(validateCoverage(source, structuredClone(source)).join(" ")).toContain(
+			"unsupported index expression",
+		);
+	});
+	test("removal or replacement with a column is a mismatch", () => {
+		const source = expressionFixture();
+		for (const columns of [[], ["id"]]) {
+			const target = structuredClone(source);
+			delete target.tables[1].indexes[0].expression;
+			target.tables[1].indexes[0].columns = columns;
+			expect(validateCoverage(source, target).length).toBeGreaterThan(0);
+		}
+	});
+	test("mixed terms, unknown fields and promotion to a unique constraint fail closed", () => {
+		for (const extras of [
+			{ columns: ["id"] },
+			{ unexpectedExpression: "1" },
+			{ emitAsUniqueConstraint: true },
+		]) {
+			const source = expressionFixture();
+			Object.assign(source.tables[1].indexes[0], extras);
+			expect(validateCoverage(source, structuredClone(source)).length).toBeGreaterThan(0);
+		}
+	});
+	test("a constant expression cannot cover a referenced column", () => {
+		const source = fixture();
+		source.tables[0].indexes[0] = {
+			name: "idx_users_email",
+			columns: [],
+			expression: "1",
+			unique: true,
+		};
+		expect(validateCoverage(source, structuredClone(source)).join(" ")).toContain(
+			"no unique constraint",
+		);
+	});
+});
+
 describe("foreign key constraint names", () => {
 	test("a renamed column-level constraint fails", () => {
 		const errors = mutate((target) => {
@@ -404,10 +523,37 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 118 tables and 1685 columns including reusable Git identities", () => {
-		expect(target.tables.length).toBe(118);
-		// 1682 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1685);
+	test("covers 123 tables and 1739 columns including resource protection and local extensions", () => {
+		expect(target.tables.length).toBe(123);
+		// 1736 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1739);
+		expect(
+			target.tables
+				.find((table) => table.name === "knowledge_injection_events")
+				?.columns.find((column) => column.property === "personalEntryId"),
+		).toMatchObject({
+			name: "personal_entry_id",
+			pgType: "text",
+			notNull: false,
+			references: { table: "knowledgeDrafts", column: "id", onDelete: "cascade" },
+		});
+		expect(target.tables.some((table) => table.name.startsWith("intelligent_ui_"))).toBe(false);
+		expect(
+			target.tables
+				.find((table) => table.name === "model_history_revision_contracts")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "installedVersion"]);
+		for (const [tableName, property, name] of [
+			["narrators", "modelHistoryRevision", "model_history_revision"],
+			["narrator_messages", "bodyRevision", "body_revision"],
+			["narrator_tool_calls", "modelRevision", "model_revision"],
+		]) {
+			expect(
+				target.tables
+					.find((table) => table.name === tableName)
+					?.columns.find((column) => column.property === property),
+			).toMatchObject({ name, pgType: "integer", notNull: true, defaultExpression: "0" });
+		}
 		expect(
 			target.tables
 				.find((table) => table.name === "user_git_identities")

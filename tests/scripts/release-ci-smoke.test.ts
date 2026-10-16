@@ -338,6 +338,8 @@ describe("native protocol and database assertions", () => {
 			true,
 		);
 		expect(hasPtyMarker("echo NF_MARKER\r\nNF_MARK", "NF_MARKER")).toBe(false);
+		expect(hasPtyMarker("$ printf '\\n%s\\n' 'NF_MARKER'\r\n$ ", "NF_MARKER")).toBe(false);
+		expect(hasPtyMarker("$ NF_MARKER\r\n$ ", "NF_MARKER")).toBe(false);
 	});
 	test("checks real SQLite migration evidence and persisted bootstrap user read-only", async () => {
 		const root = await temporary();
@@ -637,8 +639,12 @@ if (process.argv.includes("--narrafork-watcher-worker")) {
           send("bufferState", { activeBuffer: "normal" });
         } else if (message.type === "input") {
           if (message.data === "exit\\r") { send("exit", { code: 0 }); return; }
-          const marker = /^echo (NF_RELEASE_PTY_[a-f0-9]+)\\r$/.exec(message.data)?.[1];
-          send("output", { data: marker + "\\r\\n" });
+          const command = process.platform === "win32"
+            ? /^echo (NF_RELEASE_PTY_[a-f0-9]{32})\\r$/
+            : /^printf '\\\\n%s\\\\n' '(NF_RELEASE_PTY_[a-f0-9]{32})'\\r$/;
+          const marker = command.exec(message.data)?.[1];
+          if (!marker) { send("error", { message: "invalid marker command" }); return; }
+          send("output", { data: (process.platform === "win32" ? "" : "\\r\\n") + marker + "\\r\\n" });
         }
       }
     }
@@ -760,11 +766,21 @@ test("native fixture separates complete smoke, product failure and cleanup-only 
 }, 90_000);
 
 async function ptyFixture(
-	mode: "pass" | "echo" | "replay" | "exit" | "oversize" | "hang-exit" | "bad-exit",
+	mode:
+		| "pass"
+		| "late-prompt"
+		| "prompt-marker"
+		| "echo"
+		| "replay"
+		| "exit"
+		| "oversize"
+		| "hang-exit"
+		| "bad-exit",
 	deleteStatus = 200,
 ) {
 	let deleted = 0;
 	let inputs = 0;
+	let input = "";
 	let exits = 0;
 	let resized = 0;
 	let ready = false;
@@ -804,11 +820,16 @@ async function ptyFixture(
 						return;
 					}
 					inputs++;
+					input = message.data;
 					if (!ready) {
 						send("error", { message: "input raced subscription" });
 						return;
 					}
-					const marker = /^echo (NF_RELEASE_PTY_[a-f0-9]+)\r$/.exec(message.data)?.[1];
+					const command =
+						process.platform === "win32"
+							? /^echo (NF_RELEASE_PTY_[a-f0-9]{32})\r$/
+							: /^printf '\\n%s\\n' '(NF_RELEASE_PTY_[a-f0-9]{32})'\r$/;
+					const marker = command.exec(message.data)?.[1];
 					if (!marker) {
 						send("error", { message: "invalid marker command" });
 						return;
@@ -827,10 +848,21 @@ async function ptyFixture(
 						send("scrollback", { data: `${marker}\r\n` });
 						return;
 					}
-					if (mode === "pass" || mode === "hang-exit" || mode === "bad-exit") {
+					if (mode === "prompt-marker") {
+						send("output", { data: `$ ${marker}\r\n$ ` });
+						return;
+					}
+					if (
+						mode === "pass" ||
+						mode === "late-prompt" ||
+						mode === "hang-exit" ||
+						mode === "bad-exit"
+					) {
 						send("output", { terminalId: "other-terminal", data: "foreign-output\r\n" });
+						if (mode === "late-prompt") send("output", { data: "$ " });
+						if (process.platform !== "win32") send("output", { data: "\r\n" });
 						send("output", { data: marker.slice(0, 12) });
-						send("output", { data: `${marker.slice(12)}\r\n` });
+						send("output", { data: `${marker.slice(12)}\r\n$ ` });
 					}
 				}
 			},
@@ -843,6 +875,9 @@ async function ptyFixture(
 		},
 		get inputs() {
 			return inputs;
+		},
+		get input() {
+			return input;
 		},
 		get exits() {
 			return exits;
@@ -872,6 +907,33 @@ describe("PTY subscription and cleanup regression", () => {
 			fixture.close();
 		}
 	});
+	test.skipIf(process.platform === "win32")(
+		"Unix probe isolates a late prompt with a newline and works in a real shell",
+		async () => {
+			const fixture = await ptyFixture("late-prompt");
+			const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 2_000 });
+			try {
+				await smokePty(fixture.origin, "isolated-token", scope);
+				const marker = /'(NF_RELEASE_PTY_[a-f0-9]{32})'\r$/.exec(fixture.input)?.[1];
+				if (!marker) throw new Error("Missing Unix probe marker");
+				let output = "";
+				const child = scope.spawn(
+					["/bin/sh", "-c", `printf '$ '; ${fixture.input.trimEnd()}`],
+					(chunk) => {
+						output += chunk.toString();
+					},
+				);
+				expect(await scope.until("probe shell exit", () => child.status)).toBe(0);
+				expect(output).toBe(`$ \n${marker}\n`);
+				expect(hasPtyMarker(output, marker)).toBe(true);
+				expect(fixture.exits).toBe(1);
+				expect(fixture.deleted).toBe(1);
+			} finally {
+				await scope.close();
+				fixture.close();
+			}
+		},
+	);
 	for (const mode of ["hang-exit", "bad-exit"] as const) {
 		test(`${mode} never passes cleanup just because the marker was received`, async () => {
 			const fixture = await ptyFixture(mode);
@@ -889,7 +951,7 @@ describe("PTY subscription and cleanup regression", () => {
 			}
 		});
 	}
-	for (const mode of ["echo", "replay"] as const) {
+	for (const mode of ["echo", "replay", "prompt-marker"] as const) {
 		test(`${mode} alone never attests a completed live shell round trip`, async () => {
 			const fixture = await ptyFixture(mode);
 			const scope = new SmokeProcessScope(await temporary(), { PATH: "" }, { timeoutMs: 300 });

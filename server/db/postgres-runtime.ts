@@ -564,6 +564,18 @@ const HOT_RUNTIME_KEY = Symbol.for("narrafork.postgresRuntime");
 
 interface PinnedRuntime {
 	runtime: PostgresRuntime;
+	/** Private connection identity. Never include this credential-bearing value in diagnostics. */
+	config: PostgresConfig;
+}
+
+function samePostgresConnectionConfig(a: PostgresConfig, b: PostgresConfig): boolean {
+	return (
+		a.url === b.url &&
+		a.pool.max === b.pool.max &&
+		a.pool.idleTimeout === b.pool.idleTimeout &&
+		a.pool.maxLifetime === b.pool.maxLifetime &&
+		a.pool.connectTimeout === b.pool.connectTimeout
+	);
 }
 
 function pinnedRuntime(): PinnedRuntime | undefined {
@@ -578,13 +590,28 @@ function pinnedRuntime(): PinnedRuntime | undefined {
 export async function getOrStartPostgresRuntime(
 	config: PostgresConfig,
 	deps: PostgresRuntimeDeps = {},
-): Promise<{ runtime: PostgresRuntime; isHotReload: boolean }> {
+): Promise<{ runtime: PostgresRuntime; isHotReload: boolean; readUrl: string }> {
 	const existing = pinnedRuntime();
-	if (existing) return { runtime: existing.runtime, isHotReload: true };
-	const runtime = await startPostgresRuntime(config, deps);
+	if (existing) {
+		// A predecessor without identity metadata cannot prove where its connection points.
+		// Keep that runtime alive; only an operator restart may change the database/pool.
+		if (!existing.config?.url || !existing.config.pool)
+			throw new DatabaseConfigError(
+				"Pinned PostgreSQL connection identity is unavailable; restart the server to confirm configuration.",
+			);
+		if (!samePostgresConnectionConfig(existing.config, config))
+			throw new DatabaseConfigError(
+				"PostgreSQL connection configuration changed during hot reload; restart the server to apply it.",
+			);
+		return { runtime: existing.runtime, isHotReload: true, readUrl: existing.config.url };
+	}
+	// Snapshot before asynchronous startup so caller mutations cannot change the identity of
+	// the already-created client. The same snapshot supplies both the client and read workers.
+	const pinnedConfig = Object.freeze({ ...config, pool: Object.freeze({ ...config.pool }) });
+	const runtime = await startPostgresRuntime(pinnedConfig, deps);
 	// biome-ignore lint/suspicious/noExplicitAny: global symbol storage survives hot reload
-	(globalThis as any)[HOT_RUNTIME_KEY] = { runtime } satisfies PinnedRuntime;
-	return { runtime, isHotReload: false };
+	(globalThis as any)[HOT_RUNTIME_KEY] = { runtime, config: pinnedConfig } satisfies PinnedRuntime;
+	return { runtime, isHotReload: false, readUrl: pinnedConfig.url };
 }
 
 /**

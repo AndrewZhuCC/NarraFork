@@ -79,6 +79,7 @@
         "sanitize-html": "^2.17.3",
         "selfsigned": "^5.5.0",
         "shiki": "^4.0.2",
+        "tldts": "6.1.86",
         "tree-sitter-bash": "0.25.0",
         "tweetnacl": "^0.14.5",
         "undici": "6.24.1",
@@ -90,7 +91,7 @@
         "@biomejs/biome": "^2.4.12",
         "@tanstack/router-plugin": "1.168.18",
         "@types/archiver": "^7.0.0",
-        "@types/bun": "^1.4.2",
+        "@types/bun": "^1.4.3",
         "@types/dagre": "^0.7.54",
         "@types/katex": "^0.16.8",
         "@types/qrcode": "^1.5.6",
@@ -117,6 +118,7 @@
   ],
   "patchedDependencies": {
     "@openuidev/react-ui@0.17.0": "patches/@openuidev%2Freact-ui@0.17.0.patch",
+    "@cypress/request-promise@5.0.0": "patches/@cypress%2Frequest-promise@5.0.0.patch",
   },
   "packages": {
     "@ag-ui/core": ["@ag-ui/core@0.0.53", "", { "dependencies": { "zod": "^3.22.4" } }, "sha512-11UocR7fFdMWw503bWCX2IOK15vbWfxT11Mn9xOiPBVO/UVcn57ywGrlLL4UaBlPgmUTvuzr2yYR2ElSqiN2wQ=="],
@@ -845,7 +847,7 @@
 
     "@types/body-parser": ["@types/body-parser@1.19.6", "https://registry.npmmirror.com/@types/body-parser/-/body-parser-1.19.6.tgz", { "dependencies": { "@types/connect": "*", "@types/node": "*" } }, "sha512-HLFeCYgz89uk22N5Qg3dvGvsv46B8GLvKKo1zKG4NybA8U2DiEO3w9lqGg29t/tfLRJpJ6iQxnVw4OnB7MoM9g=="],
 
-    "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
+    "@types/bun": ["@types/bun@1.4.3", "", { "dependencies": { "bun-types": "1.4.3" } }, "sha512-N67Pqy8JXbAY/j0tNraS3V5mubGvc6rrrNDmDCtZLlFzccbUJPDb0tvgUBC5q4m8ybkP93Jcn1QB+RYQ6PvBhw=="],
 
     "@types/connect": ["@types/connect@3.4.38", "https://registry.npmmirror.com/@types/connect/-/connect-3.4.38.tgz", { "dependencies": { "@types/node": "*" } }, "sha512-K6uROf1LD88uDQqJCktA4yzL1YYAK6NgfsI0v/mTgyPKWsX1CnJ0XPSDhViejru1GcRkLWb8RlzFYJRqGUbaug=="],
 
@@ -1133,7 +1135,7 @@
 
     "bun-pty": ["bun-pty@0.4.11", "", {}, "sha512-DpBfXCoWbcDziqL4gT3sFw/O6vfe2Gm1LmsnjfGjpqNhmsPjBcVorTrRv7OVATsy88PiXfn486vp0w4x3/Q84g=="],
 
-    "bun-types": ["bun-types@1.4.2", "", { "dependencies": { "@types/node": "*" } }, "sha512-bxV1FgK7yBIzjRe5zBozIM4Bem11ZJcCXSrjWRG3YWLt8yFDePu4cLjpebO8OvPeIE9trbyPF4fuj3Cia4Fj3w=="],
+    "bun-types": ["bun-types@1.4.3", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-tinRJNGOmUN+tEAsn2y2e942n9JHRHR42iUYzDH75NmhJqVBokGSQkkfSFdNWwsANIdrK6ACH9t01M452YyTwg=="],
 
     "bytes": ["bytes@3.1.2", "https://registry.npmmirror.com/bytes/-/bytes-3.1.2.tgz", {}, "sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg=="],
 

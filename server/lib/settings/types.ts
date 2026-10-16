@@ -284,6 +284,10 @@ export interface GeminiProviderConfig {
 	 * Must be unique across all providers.
 	 */
 	prefix: string;
+	/** Outbound client fingerprint, including operator-supplied header overrides. */
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
 	/** Google Generative Language API key (sent as x-goog-api-key). */
 	apiKey: string;
 	/** API base URL, e.g. "https://generativelanguage.googleapis.com/v1beta". */

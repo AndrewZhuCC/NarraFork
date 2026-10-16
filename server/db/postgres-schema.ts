@@ -11,6 +11,7 @@ import {
 	integer,
 	type PgColumn,
 	pgTable,
+	primaryKey,
 	text,
 	unique,
 	uniqueIndex,
@@ -56,6 +57,68 @@ export const permissionRuleRequests = pgTable(
 			table.createdAt,
 			table.id,
 		),
+	],
+);
+
+export const resourceProtectionPaths = pgTable(
+	"resource_protection_paths",
+	{
+		source: text("source").notNull(),
+		sourceId: text("source_id").notNull(),
+		slot: integer("slot").notNull(),
+		deviceId: text("device_id").notNull(),
+		canonicalPath: text("canonical_path"),
+		repositoryKey: text("repository_key"),
+		shadowKey: text("shadow_key"),
+		scopeProjectId: text("scope_project_id"),
+		aliasSensitive: integer("alias_sensitive").notNull().default(0),
+		claimJson: text("claim_json").notNull(),
+	},
+	(table) => [
+		index("idx_protection_path").on(
+			table.deviceId,
+			table.canonicalPath,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_repository").on(
+			table.deviceId,
+			table.repositoryKey,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_shadow").on(table.shadowKey, table.source, table.sourceId, table.slot),
+		index("idx_protection_scope").on(
+			table.scopeProjectId,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		index("idx_protection_alias").on(
+			table.aliasSensitive,
+			table.source,
+			table.sourceId,
+			table.slot,
+		),
+		primaryKey({ columns: [table.source, table.sourceId, table.slot] }),
+	],
+);
+
+export const resourceProtectionSources = pgTable(
+	"resource_protection_sources",
+	{
+		source: text("source").notNull(),
+		sourceId: text("source_id").notNull(),
+		revision: integer("revision").notNull().default(1),
+		dirty: integer("dirty").notNull().default(1),
+		cursor: text("cursor"),
+		complete: integer("complete").notNull().default(0),
+	},
+	(table) => [
+		index("idx_protection_dirty").on(table.dirty, table.source, table.sourceId),
+		primaryKey({ columns: [table.source, table.sourceId] }),
 	],
 );
 
@@ -376,6 +439,7 @@ export const narrators = pgTable(
 		turnStartedAt: text("turn_started_at"),
 		turnEndedAt: text("turn_ended_at"),
 		messageVersion: integer("message_version").notNull().default(0),
+		modelHistoryRevision: integer("model_history_revision").notNull().default(0),
 		messageStructureVersion: integer("message_structure_version").notNull().default(0),
 		defaultDeviceId: text("default_device_id"),
 		oauthOwnerGrantId: text("oauth_owner_grant_id").references((): PgColumn => oauthGrants.id, {
@@ -715,6 +779,11 @@ export const specProtectedTasks = pgTable(
 	],
 );
 
+export const modelHistoryRevisionContracts = pgTable("model_history_revision_contracts", {
+	id: text("id").primaryKey().notNull(),
+	installedVersion: text("installed_version").notNull(),
+});
+
 export const narratorContextCharPages = pgTable(
 	"narrator_context_char_pages",
 	{
@@ -746,6 +815,7 @@ export const narratorMessages = pgTable(
 		parentToolUseId: text("parent_tool_use_id"),
 		role: text("role").notNull(),
 		contentJson: jsonText("content_json").notNull(),
+		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
 		contextCharsJson: jsonText("context_chars_json"),
 		tokensIn: integer("tokens_in"),
@@ -834,6 +904,7 @@ export const narratorToolCalls = pgTable(
 			.references((): PgColumn => narratorMessages.id, {}),
 		toolUseId: text("tool_use_id").notNull(),
 		toolName: text("tool_name").notNull(),
+		modelRevision: integer("model_revision").notNull().default(0),
 		inputJson: jsonText("input_json"),
 		outputJson: jsonText("output_json"),
 		inputChars: integer("input_chars").notNull().default(0),
@@ -1202,6 +1273,7 @@ export const userPreferences = pgTable("user_preferences", {
 	gatewayConfig: text("gateway_config").notNull().default("{}"),
 	navLayout: text("nav_layout").notNull().default("{}"),
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
+	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
 	createdAt: text("created_at").notNull(),
@@ -1966,6 +2038,8 @@ export const apiRequests = pgTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
+		tokenAccountingVersion: integer("token_accounting_version"),
+		tokenAccountingReviewVersion: integer("token_accounting_review_version"),
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
 		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
@@ -1993,7 +2067,79 @@ export const apiRequests = pgTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_api_requests_token_repair_pending")
+			.on(table.createdAt, table.id)
+			.where(
+				sql.raw(
+					'"token_accounting_version" IS NULL AND "token_accounting_review_version" IS NULL AND ("cached_input_tokens" > 0 OR "cache_creation_input_tokens" > 0 OR "cache_creation_5m_tokens" > 0 OR "cache_creation_1h_tokens" > 0)',
+				),
+			),
+		index("idx_api_requests_token_repair_reviewed")
+			.on(table.createdAt, table.id)
+			.where(
+				sql.raw(
+					'"token_accounting_version" IS NULL AND ("cached_input_tokens" > 0 OR "cache_creation_input_tokens" > 0 OR "cache_creation_5m_tokens" > 0 OR "cache_creation_1h_tokens" > 0)',
+				),
+			),
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
+	],
+);
+
+export const usageTokenRepairJobs = pgTable(
+	"usage_token_repair_jobs",
+	{
+		id: text("id").primaryKey().notNull(),
+		status: text("status").notNull(),
+		createdBy: text("created_by").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		ownerId: text("owner_id"),
+		leaseUntil: text("lease_until"),
+		scanned: integer("scanned").notNull().default(0),
+		repaired: integer("repaired").notNull().default(0),
+		conflicts: integer("conflicts").notNull().default(0),
+		upperCreatedAt: text("upper_created_at"),
+		upperId: text("upper_id"),
+		cursorCreatedAt: text("cursor_created_at"),
+		cursorId: text("cursor_id"),
+		includeReviewed: boolean("include_reviewed").notNull(),
+		protocolOverridesJson: text("protocol_overrides_json").notNull().default("[]"),
+		sourceJobId: text("source_job_id"),
+		error: text("error"),
+	},
+	(table) => [
+		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
+		uniqueIndex("idx_token_repair_single_active")
+			.on(sql.raw("(1)"))
+			.where(sql.raw("\"status\" IN ('analyzing', 'ready', 'applying')")),
+		check(
+			"token_repair_protocol_config_bound",
+			sql.raw('length("protocol_overrides_json") <= 16384'),
+		),
+		check("token_repair_error_bound", sql.raw('"error" IS NULL OR length("error") <= 2048')),
+	],
+);
+
+export const usageTokenRepairCandidates = pgTable(
+	"usage_token_repair_candidates",
+	{
+		id: text("id").primaryKey().notNull(),
+		jobId: text("job_id").notNull(),
+		requestId: text("request_id").notNull(),
+		createdAt: text("created_at").notNull(),
+		provider: text("provider"),
+		model: text("model"),
+		snapshotJson: text("snapshot_json").notNull(),
+		evidenceJson: text("evidence_json").notNull(),
+		appliedAt: text("applied_at"),
+		appliedBy: text("applied_by"),
+		totalsStatus: text("totals_status").notNull().default("unchanged"),
+	},
+	(table) => [
+		uniqueIndex("idx_token_repair_candidate_request").on(table.jobId, table.requestId),
+		index("idx_token_repair_candidates_page").on(table.jobId, table.id),
+		check("token_repair_snapshot_bound", sql.raw('length("snapshot_json") <= 8192')),
+		check("token_repair_evidence_bound", sql.raw('length("evidence_json") <= 16384')),
 	],
 );
 
@@ -2991,9 +3137,10 @@ export const knowledgeInjectionEvents = pgTable(
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		compactSeq: integer("compact_seq").notNull(),
-		entryId: text("entry_id")
-			.notNull()
-			.references((): PgColumn => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryId: text("entry_id").references((): PgColumn => knowledgeEntries.id, {
+			onDelete: "cascade",
+		}),
+		personalEntryId: text("personal_entry_id"),
 		entryRevisionId: text("entry_revision_id"),
 		source: text("source").notNull(),
 		triggerMessageId: text("trigger_message_id"),
@@ -3003,11 +3150,28 @@ export const knowledgeInjectionEvents = pgTable(
 	},
 	(table) => [
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		uniqueIndex("idx_kie_cycle_personal_entry").on(
+			table.narratorId,
+			table.compactSeq,
+			table.personalEntryId,
+		),
+		index("idx_kie_personal_entry").on(table.personalEntryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
 		index("idx_kie_trigger_message").on(table.triggerMessageId),
 		index("idx_kie_trigger_tool_call").on(table.triggerToolCallId),
 		index("idx_kie_entry_revision").on(table.entryRevisionId),
+		check(
+			"knowledge_injection_exactly_one_entry",
+			sql.raw(
+				'("entry_id" IS NOT NULL AND "personal_entry_id" IS NULL) OR ("entry_id" IS NULL AND "personal_entry_id" IS NOT NULL)',
+			),
+		),
+		foreignKey({
+			name: "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk",
+			columns: [table.personalEntryId],
+			foreignColumns: [knowledgeDrafts.id],
+		}).onDelete("cascade"),
 		foreignKey({
 			name: "knowledge_injection_events_entry_revision_id_know_a5763cfc54_fk",
 			columns: [table.entryRevisionId],
@@ -3760,8 +3924,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 118,
-  "columnCount": 1685,
+  "tableCount": 123,
+  "columnCount": 1739,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -3986,6 +4150,260 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "resourceProtectionPaths",
+      "name": "resource_protection_paths",
+      "columns": [
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceId",
+          "name": "source_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "slot",
+          "name": "slot",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "canonicalPath",
+          "name": "canonical_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "repositoryKey",
+          "name": "repository_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "shadowKey",
+          "name": "shadow_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeProjectId",
+          "name": "scope_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "aliasSensitive",
+          "name": "alias_sensitive",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "claimJson",
+          "name": "claim_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_protection_path",
+          "columns": [
+            "deviceId",
+            "canonicalPath",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_repository",
+          "columns": [
+            "deviceId",
+            "repositoryKey",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_shadow",
+          "columns": [
+            "shadowKey",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_scope",
+          "columns": [
+            "scopeProjectId",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_protection_alias",
+          "columns": [
+            "aliasSensitive",
+            "source",
+            "sourceId",
+            "slot"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "source",
+            "sourceId",
+            "slot"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "resourceProtectionSources",
+      "name": "resource_protection_sources",
+      "columns": [
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceId",
+          "name": "source_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "dirty",
+          "name": "dirty",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "cursor",
+          "name": "cursor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "complete",
+          "name": "complete",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_protection_dirty",
+          "columns": [
+            "dirty",
+            "source",
+            "sourceId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "source",
+            "sourceId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "narratorWorktreeResources",
@@ -6202,6 +6620,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "0"
         },
         {
+          "property": "modelHistoryRevision",
+          "name": "model_history_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "messageStructureVersion",
           "name": "message_structure_version",
           "kind": "integer",
@@ -8067,6 +8496,36 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "modelHistoryRevisionContracts",
+      "name": "model_history_revision_contracts",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "installedVersion",
+          "name": "installed_version",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "narratorContextCharPages",
       "name": "narrator_context_char_pages",
       "columns": [
@@ -8205,6 +8664,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "bodyRevision",
+          "name": "body_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         },
         {
           "property": "contentText",
@@ -8786,6 +9256,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "modelRevision",
+          "name": "model_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         },
         {
           "property": "inputJson",
@@ -11111,6 +11592,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "narratorToolbarLayout",
           "name": "narrator_toolbar_layout",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"{}\"",
+          "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "specTabLayout",
+          "name": "spec_tab_layout",
           "kind": "text",
           "pgType": "text",
           "notNull": true,
@@ -15285,6 +15777,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "tokenAccountingVersion",
+          "name": "token_accounting_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "tokenAccountingReviewVersion",
+          "name": "token_accounting_review_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "inputTokens",
           "name": "input_tokens",
           "kind": "integer",
@@ -15522,6 +16032,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_api_requests_token_repair_pending",
+          "columns": [
+            "createdAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"token_accounting_version\" IS NULL AND \"token_accounting_review_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)"
+        },
+        {
+          "name": "idx_api_requests_token_repair_reviewed",
+          "columns": [
+            "createdAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"token_accounting_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)"
+        },
+        {
           "name": "idx_api_requests_credential",
           "columns": [
             "credentialId",
@@ -15532,6 +16060,359 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "checks": [],
       "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "usageTokenRepairJobs",
+      "name": "usage_token_repair_jobs",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdBy",
+          "name": "created_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "ownerId",
+          "name": "owner_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "leaseUntil",
+          "name": "lease_until",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scanned",
+          "name": "scanned",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "repaired",
+          "name": "repaired",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "conflicts",
+          "name": "conflicts",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "upperCreatedAt",
+          "name": "upper_created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "upperId",
+          "name": "upper_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "cursorCreatedAt",
+          "name": "cursor_created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "cursorId",
+          "name": "cursor_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "includeReviewed",
+          "name": "include_reviewed",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "protocolOverridesJson",
+          "name": "protocol_overrides_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"[]\"",
+          "defaultExpression": "\"[]\""
+        },
+        {
+          "property": "sourceJobId",
+          "name": "source_job_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "error",
+          "name": "error",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_token_repair_jobs_created",
+          "columns": [
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_token_repair_single_active",
+          "columns": [],
+          "unique": true,
+          "expression": "1",
+          "predicate": "\"status\" IN ('analyzing', 'ready', 'applying')"
+        }
+      ],
+      "checks": [
+        "token_repair_protocol_config_bound",
+        "token_repair_error_bound"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "token_repair_protocol_config_bound",
+          "expression": "length(\"protocol_overrides_json\") <= 16384"
+        },
+        {
+          "name": "token_repair_error_bound",
+          "expression": "\"error\" IS NULL OR length(\"error\") <= 2048"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "usageTokenRepairCandidates",
+      "name": "usage_token_repair_candidates",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "jobId",
+          "name": "job_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "requestId",
+          "name": "request_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "provider",
+          "name": "provider",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "model",
+          "name": "model",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "snapshotJson",
+          "name": "snapshot_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "evidenceJson",
+          "name": "evidence_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "appliedAt",
+          "name": "applied_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "appliedBy",
+          "name": "applied_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "totalsStatus",
+          "name": "totals_status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"unchanged\"",
+          "defaultExpression": "\"unchanged\""
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_token_repair_candidate_request",
+          "columns": [
+            "jobId",
+            "requestId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_token_repair_candidates_page",
+          "columns": [
+            "jobId",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "token_repair_snapshot_bound",
+        "token_repair_evidence_bound"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "token_repair_snapshot_bound",
+          "expression": "length(\"snapshot_json\") <= 8192"
+        },
+        {
+          "name": "token_repair_evidence_bound",
+          "expression": "length(\"evidence_json\") <= 16384"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
@@ -21763,7 +22644,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "entry_id",
           "kind": "text",
           "pgType": "text",
-          "notNull": true,
+          "notNull": false,
           "primary": false,
           "unique": false,
           "references": {
@@ -21773,6 +22654,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "knowledge_injection_events_entry_id_knowledge_entries_id_fk"
           },
           "emitAsTableConstraint": false
+        },
+        {
+          "property": "personalEntryId",
+          "name": "personal_entry_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "knowledgeDrafts",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "knowledge_injection_events_personal_entry_id_know_6467dc6ce2_fk"
+          },
+          "emitAsTableConstraint": true
         },
         {
           "property": "entryRevisionId",
@@ -21861,6 +22758,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": true
         },
         {
+          "name": "idx_kie_cycle_personal_entry",
+          "columns": [
+            "narratorId",
+            "compactSeq",
+            "personalEntryId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_kie_personal_entry",
+          "columns": [
+            "personalEntryId"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_kie_narrator_cycle",
           "columns": [
             "narratorId",
@@ -21897,8 +22810,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
-      "checks": [],
-      "checkDefinitions": [],
+      "checks": [
+        "knowledge_injection_exactly_one_entry"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "knowledge_injection_exactly_one_entry",
+          "expression": "(\"entry_id\" IS NOT NULL AND \"personal_entry_id\" IS NULL) OR (\"entry_id\" IS NULL AND \"personal_entry_id\" IS NOT NULL)"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1249,5 +1249,185 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 		await expect(service.finishFiles(p.ctx, { signal: c.signal })).rejects.toThrow("cancelled");
 		expect(journal(p.ctx, file.id)?.status).toBe("applying");
 		expect(service.listPending(owner, { status: "applying" }).items).toHaveLength(1);
+	});
+});
+
+describe("receipt admission carries proven totals instead of rescanning the plan", () => {
+	// `scan` is private; observe it through the prototype without changing behaviour.
+	let spy: ReturnType<typeof spyOn> | undefined;
+	const scans = () => {
+		spy = spyOn(
+			RevertMutationJournal.prototype as unknown as { scan: (...args: unknown[]) => unknown },
+			"scan",
+		);
+		spy.mockClear();
+		return spy;
+	};
+	afterEach(() => {
+		spy?.mockRestore();
+		spy = undefined;
+	});
+
+	test("N receipts cost one complete scan, not N, and still count every applied file", async () => {
+		const p = await started(Array.from({ length: 40 }, (_, i) => fixed(i, ABSENT, ABSENT)));
+		const scan = scans();
+		await rollback(async (lease) => {
+			for (const file of p.files) await applyFile(p.ctx, file, lease);
+		});
+		expect(scan).toHaveBeenCalledTimes(1);
+		expect(service.getOperation(p.ctx).appliedFileCount).toBe(40);
+		// finish still proves the whole set on its own.
+		expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
+		expect(scan).toHaveBeenCalledTimes(2);
+	});
+
+	test("tampering with another row between receipts is still rejected by finish", async () => {
+		const p = await started(Array.from({ length: 3 }, (_, i) => fixed(i, ABSENT, ABSENT)));
+		const [a, b, c] = p.files;
+		if (!a || !b || !c) throw new Error("fixture");
+		await rollback(async (lease) => {
+			await applyFile(p.ctx, a, lease);
+			// A raw write outside the journal that does not bump the operation revision.
+			db.update(revertOperationFiles)
+				.set({ fileKey: "f".repeat(64) })
+				.where(eq(revertOperationFiles.id, c.id))
+				.run();
+			await applyFile(p.ctx, b, lease);
+		});
+		await expect(service.finishFiles(p.ctx)).rejects.toThrow("File identity changed");
+		expect(service.getOperation(p.ctx).status).not.toBe("files_verified");
+	});
+
+	test("the receipt's own row is still fully validated on the incremental path", async () => {
+		const p = await started(Array.from({ length: 2 }, (_, i) => fixed(i, ABSENT, ABSENT)));
+		const [a, b] = p.files;
+		if (!a || !b) throw new Error("fixture");
+		await rollback(async (lease) => {
+			await applyFile(p.ctx, a, lease);
+			const claim = service.claimApply(p.ctx, b, lease);
+			lease.registerMutation(claim.mutationId);
+			db.update(revertOperationFiles)
+				.set({ fileKey: "f".repeat(64) })
+				.where(eq(revertOperationFiles.id, b.id))
+				.run();
+			await expect(service.recordApplyReceipt(p.ctx, b.id, receipt(claim))).rejects.toThrow(
+				"File identity changed",
+			);
+			lease.settle(claim.mutationId, "not_applied");
+		});
+	});
+
+	test("an operation changed outside this journal instance forces a fresh complete scan", async () => {
+		const p = await started(Array.from({ length: 3 }, (_, i) => fixed(i, ABSENT, ABSENT)));
+		const [a, b, c] = p.files;
+		if (!a || !b || !c) throw new Error("fixture");
+		const scan = scans();
+		await rollback(async (lease) => {
+			await applyFile(p.ctx, a, lease);
+			await applyFile(p.ctx, b, lease);
+			expect(scan).toHaveBeenCalledTimes(1);
+			// Another writer moves the revision (and lies about the counter).
+			db.update(revertOperations)
+				.set({ updatedAt: "2026-09-07T15:00:00.000Z", appliedFileCount: 0 })
+				.where(eq(revertOperations.id, p.ctx.planId))
+				.run();
+			await applyFile(p.ctx, c, lease);
+		});
+		expect(scan).toHaveBeenCalledTimes(2);
+		// The rescan recounted from real receipts instead of trusting the forged counter.
+		expect(service.getOperation(p.ctx).appliedFileCount).toBe(3);
+	});
+
+	test("a rolled-back receipt does not advance the carried totals", async () => {
+		const p = await started(Array.from({ length: 3 }, (_, i) => fixed(i, ABSENT, ABSENT)));
+		const [a, b, c] = p.files;
+		if (!a || !b || !c) throw new Error("fixture");
+		await rollback(async (lease) => {
+			await applyFile(p.ctx, a, lease);
+			const claim = service.claimApply(p.ctx, b, lease);
+			lease.registerMutation(claim.mutationId);
+			injection("revert_operations", "BEFORE UPDATE", "SELECT RAISE(ABORT, 'receipt failed')");
+			await expect(service.recordApplyReceipt(p.ctx, b.id, receipt(claim))).rejects.toThrow();
+			conn.run("DROP TRIGGER injected_failure");
+			await service.recordApplyReceipt(p.ctx, b.id, receipt(claim));
+			lease.settle(claim.mutationId, "applied");
+			await applyFile(p.ctx, c, lease);
+		});
+		expect(service.getOperation(p.ctx).appliedFileCount).toBe(3);
+		expect((await service.finishFiles(p.ctx)).appliedFileCount).toBe(3);
+	});
+
+	test("a COMMIT failure after the receipt's writes is never counted by later receipts", async () => {
+		const p = await started(Array.from({ length: 3 }, (_, i) => fixed(i, ABSENT, ABSENT)));
+		const [a, b, c] = p.files;
+		if (!a || !b || !c) throw new Error("fixture");
+		const scan = scans();
+		await rollback(async (lease) => {
+			await applyFile(p.ctx, a, lease);
+			const claim = service.claimApply(p.ctx, b, lease);
+			lease.registerMutation(claim.mutationId);
+			// Every statement of the receipt succeeds, including updateOperation; only the final
+			// COMMIT is refused, by a deferred foreign-key violation written inside the transaction.
+			conn.run("PRAGMA defer_foreign_keys = ON");
+			injection(
+				"revert_operations",
+				"AFTER UPDATE",
+				"UPDATE revert_operations SET narrator_id = 'does-not-exist' WHERE id = NEW.id AND NEW.applied_file_count = 2",
+			);
+			await expect(service.recordApplyReceipt(p.ctx, b.id, receipt(claim))).rejects.toThrow();
+			conn.run("DROP TRIGGER injected_failure");
+			conn.run("PRAGMA defer_foreign_keys = OFF");
+			expect(service.getOperation(p.ctx).appliedFileCount).toBe(1);
+			expect(journal(p.ctx, b.id)?.observedAfterStateJson).toBeNull();
+			// The rolled-back attempt's revision never became live, so the revision equality check
+			// makes any totals that counted it unreachable; the retry reuses only the totals proven
+			// for the still-live claim revision and counts this file exactly once.
+			await service.recordApplyReceipt(p.ctx, b.id, receipt(claim));
+			expect(service.getOperation(p.ctx).appliedFileCount).toBe(2);
+			lease.settle(claim.mutationId, "applied");
+			await applyFile(p.ctx, c, lease);
+		});
+		expect(service.getOperation(p.ctx).appliedFileCount).toBe(3);
+		expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
+		expect(scan).toHaveBeenCalledTimes(2);
+	});
+
+	test("carried evidence bytes still enforce the complete plan budget across receipts", async () => {
+		const huge = known("budget-fixture", FILE_CHANGE_LIMITS.blobBytes);
+		const list = Array.from({ length: 3 }, (_, i) => fixed(i, huge, huge));
+		list.push(
+			fixed(3, huge, known("near-budget-2", FILE_CHANGE_LIMITS.blobBytes - 3 * 1024 * 1024)),
+		);
+		const p = await started(list);
+		const [a, b] = p.files;
+		if (!a || !b) throw new Error("fixture");
+		const scan = scans();
+		await rollback(async (lease) => {
+			// Claim both first: an unverified receipt moves the plan to recovery_required, which
+			// still admits receipts for already-claimed files but no new claims.
+			const claimA = service.claimApply(p.ctx, a, lease);
+			const claimB = service.claimApply(p.ctx, b, lease);
+			lease.registerMutation(claimA.mutationId);
+			lease.registerMutation(claimB.mutationId);
+			// Plan ≈ 253 MiB of 256. A 1 MiB extra observation fits on its own, and so would a
+			// 2 MiB one; together they exceed the budget, so the second must see the first.
+			await service.recordApplyReceipt(
+				p.ctx,
+				a.id,
+				receipt(claimA, { observedAfter: known("obs-1", 1024 * 1024) }),
+			);
+			await expect(
+				service.recordApplyReceipt(
+					p.ctx,
+					b.id,
+					receipt(claimB, { observedAfter: known("obs-2", 2 * 1024 * 1024) }),
+				),
+			).rejects.toThrow("finite budget");
+			lease.settle(claimA.mutationId, "applied");
+			lease.settle(claimB.mutationId, "not_applied");
+		});
+		// The second receipt was judged from carried totals, not a rescan.
+		expect(scan).toHaveBeenCalledTimes(1);
+		expect(journal(p.ctx, b.id)?.observedAfterStateJson).toBeNull();
 	});
 });

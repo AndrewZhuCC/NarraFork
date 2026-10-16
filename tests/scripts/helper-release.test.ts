@@ -301,7 +301,11 @@ describe("actual helper tag refs", () => {
 describe("read-only auxiliary dependency readiness", () => {
 	test("checks same-repository fixed tags, exact twelve helpers and six executors", async () => {
 		const f = fixture();
-		await verifyPublishedHelperDependencies(f.options);
+		const verified = await verifyPublishedHelperDependencies(f.options);
+		expect(verified.executor).toEqual({
+			commit,
+			manifestSha256: digest(f.raws.get(EXECUTOR_MANIFEST_FILENAME) as string),
+		});
 		expect(f.calls.length).toBe(6);
 		expect(
 			f.calls.every((args) => args[0] === "api" && args[1]?.startsWith(`repos/${repository}/`)),
@@ -1033,6 +1037,8 @@ describe("authenticated draft lookup", () => {
 			GITHUB_EVENT_NAME: "workflow_dispatch",
 			GITHUB_REF: "refs/heads/main",
 			GITHUB_SHA: commit,
+			GITHUB_RUN_ID: "123",
+			GITHUB_RUN_ATTEMPT: "2",
 		};
 		const calls: string[][] = [];
 		const run: GhRunner = async (args) => {
@@ -1081,7 +1087,7 @@ describe("authenticated draft lookup", () => {
 				},
 				dir,
 				false,
-				{ run, environment },
+				{ run, environment, sourceRunAttempt: "1" },
 			),
 		).rejects.toThrow("required reviewers");
 		expect(f.helperRelease.draft).toBe(true);

@@ -91,6 +91,60 @@ function makeProvider(host: string): TestProvider {
 }
 
 describe("AnthropicProvider /v1 fallback error surfacing", () => {
+	for (const basePath of ["/relay", "/v1/anthropic"]) {
+		for (const errorMessage of [
+			"ECONNRESET: upstream connection closed",
+			"socket connection was closed unexpectedly",
+		]) {
+			test(`preserves the configured ${basePath} endpoint after ${errorMessage}`, async () => {
+				const host = `reset-${basePath.includes("anthropic") ? "nested" : "relay"}-${errorMessage.startsWith("ECONNRESET") ? "code" : "socket"}`;
+				const base = `https://${host}.example.com${basePath}`;
+				const urls: string[] = [];
+				const transportError = Object.assign(new Error(errorMessage), {
+					code: errorMessage.startsWith("ECONNRESET") ? "ECONNRESET" : undefined,
+				});
+				let disconnected = false;
+				setOutboundFetchOverrideForTest(async (input) => {
+					const url = String(input);
+					urls.push(url);
+					if (url !== `${base}/messages`) {
+						return new Response("404 page not found", { status: 404 });
+					}
+					if (!disconnected) {
+						disconnected = true;
+						throw transportError;
+					}
+					return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
+						headers: { "content-type": "application/json" },
+					});
+				});
+				const config = {
+					id: host,
+					name: host,
+					prefix: host,
+					baseUrl: base,
+					apiKey: "sk-test",
+					officialApi: false,
+				};
+				const provider = new AnthropicProvider(config);
+				await expect(
+					provider.generateWithHistoryWithMeta("sys", "hi", "anthropic:claude-3"),
+				).rejects.toMatchObject({ cause: transportError, category: "connection_reset" });
+				expect(urls).toEqual([`${base}/messages`]);
+				// Retrying the same instance and creating another must not cache a changed URL.
+				for (const retryProvider of [provider, new AnthropicProvider(config)]) {
+					const result = await retryProvider.generateWithHistoryWithMeta(
+						"sys",
+						"hi",
+						"anthropic:claude-3",
+					);
+					expect(result.text).toBe("ok");
+				}
+				expect(urls).toEqual(Array(3).fill(`${base}/messages`));
+			});
+		}
+	}
+
 	test("surfaces the ORIGINAL 401 when the /v1 fallback only 404s", async () => {
 		const base = "https://a1.example.com/relay";
 		setOutboundFetchOverrideForTest(async (input: RequestInfo | URL) => {

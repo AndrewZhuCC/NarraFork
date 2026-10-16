@@ -1,8 +1,13 @@
 import { execFileSync } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { isValidGitHubRepository } from "../../shared/github-repository";
-import { parseHelperDistributionDependencies } from "../../shared/helper-distribution";
+import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../../shared/helper-distribution";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import { EXECUTOR_VERSION_RE } from "../../shared/remote-executor-manifest";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import {
 	CI_RELEASE_BUN,
@@ -11,6 +16,11 @@ import {
 	CI_RELEASE_WORKFLOW,
 	type CiReleasePlan,
 } from "./ci-release-types";
+import {
+	collectComponentReleaseEvidence,
+	readTargetComponentDependencies,
+	verifyComponentReleaseEvidence,
+} from "./component-release-inputs";
 import { type GhRunner, releaseChannel } from "./github-release";
 import { listGitHubReleaseSummaries } from "./github-release-summary";
 
@@ -75,6 +85,24 @@ const buildSourceSchema = z
 			.max(8),
 	})
 	.strict();
+const componentEvidenceSchema = z
+	.object({
+		executor: z
+			.object({
+				version: version.max(64),
+				protocolVersion: z
+					.number()
+					.int()
+					.positive()
+					.max(2 ** 31 - 1),
+				tag: z.string().max(80),
+				commit: sha,
+				manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+				buildInputsSha256: z.string().regex(/^[a-f0-9]{64}$/),
+			})
+			.strict(),
+	})
+	.strict();
 const planSchema = z
 	.object({
 		schemaVersion: z.literal(1),
@@ -90,6 +118,7 @@ const planSchema = z
 		runId: id,
 		runAttempt: id,
 		buildSource: buildSourceSchema.optional(),
+		componentEvidence: componentEvidenceSchema.optional(),
 		baselines: z
 			.array(
 				z
@@ -217,6 +246,14 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 		plan.channel !== releaseChannel(plan.version)
 	)
 		throw new Error("Release plan version/channel mismatch");
+	if (plan.componentEvidence) {
+		const executor = plan.componentEvidence.executor;
+		if (
+			!EXECUTOR_VERSION_RE.test(executor.version) ||
+			executor.tag !== `executor-v${executor.version}`
+		)
+			throw new Error("Invalid component evidence version/tag identity");
+	}
 	if (plan.buildSource) {
 		const source = plan.buildSource;
 		const targets = new Set(source.platforms.map(({ target }) => target));
@@ -235,7 +272,7 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 	const count = new Map<string, number>();
 	for (const base of plan.baselines) {
 		if (base.metadata.helperDistribution !== undefined)
-			parseHelperDistributionDependencies(base.metadata.helperDistribution, base.version);
+			parseHelperDistributionDependencies(base.metadata.helperDistribution);
 		const target = CI_RELEASE_TARGETS.find((item) => item.platform === base.platform);
 		const key = `${base.platform}/${base.version}`;
 		if (
@@ -257,6 +294,24 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 		count.set(base.platform, (count.get(base.platform) ?? 0) + 1);
 	}
 	return plan;
+}
+
+/** Evidence refers to the sealed artifact's pin, never the current control checkout's pin. */
+export function validateCiComponentDependencies(
+	plan: CiReleasePlan,
+	dependencies: HelperDistributionDependencies | undefined,
+): void {
+	if (!plan.componentEvidence) return;
+	const declared =
+		dependencies === undefined ? undefined : parseHelperDistributionDependencies(dependencies);
+	const evidence = plan.componentEvidence.executor;
+	if (
+		declared === undefined ||
+		declared.executor.version !== evidence.version ||
+		declared.executor.protocolVersion !== evidence.protocolVersion ||
+		declared.executor.tag !== evidence.tag
+	)
+		throw new Error("Release component evidence/dependency identity mismatch");
 }
 
 export function validateCiDispatch(
@@ -462,12 +517,21 @@ export async function assertReleaseEnvironment(
 	}
 }
 
+export interface CiReleaseComponentChecks {
+	readDependencies?: typeof readTargetComponentDependencies;
+	collectEvidence?: typeof collectComponentReleaseEvidence;
+	verifyEvidence?: typeof verifyComponentReleaseEvidence;
+}
+
 export interface CreateCiReleasePlanOptions {
 	root: string;
 	tag: string;
 	publish: boolean;
 	/** Read-only preparation or repair of the index for an already published release. */
 	indexOnly?: boolean;
+	signal?: AbortSignal;
+	/** Fixture injection only; production uses bounded read-only component checks. */
+	componentChecks?: CiReleaseComponentChecks;
 	sourceRunId?: string | number;
 	env?: NodeJS.ProcessEnv;
 	run?: GhRunner;
@@ -502,8 +566,28 @@ export async function createCiReleasePlan(
 			);
 		}
 	}
+	let componentEvidence: CiReleasePlan["componentEvidence"];
+	let dependencies: HelperDistributionDependencies | undefined;
 	if (options.publish) await assertReleaseEnvironment(run, repository, defaultBranch);
-	return validateCiReleasePlan({
+	// Repairs authorize writes to an existing publication, not a new component release.
+	if (options.publish && !options.indexOnly) {
+		const componentOptions = {
+			repository,
+			targetCommit: commit,
+			run: options.run,
+			signal: options.signal,
+		};
+		dependencies = await (
+			options.componentChecks?.readDependencies ?? readTargetComponentDependencies
+		)(componentOptions);
+		if (dependencies !== undefined)
+			componentEvidence = await (
+				options.componentChecks?.collectEvidence ?? collectComponentReleaseEvidence
+			)({ ...componentOptions, dependencies });
+		if (dependencies !== undefined && componentEvidence === undefined)
+			throw new Error("Missing component publication evidence for configured target");
+	}
+	const plan = validateCiReleasePlan({
 		schemaVersion: 1,
 		tag: options.tag,
 		version: releaseVersion,
@@ -513,13 +597,28 @@ export async function createCiReleasePlan(
 		channel: releaseChannel(releaseVersion),
 		changelog,
 		baselines: [],
+		...(componentEvidence === undefined ? {} : { componentEvidence }),
 	});
+	validateCiComponentDependencies(plan, dependencies);
+	return plan;
 }
 
 export async function revalidateCiReleasePlan(
 	value: CiReleasePlan,
-	options: { root: string; publish: boolean; run?: GhRunner; env?: NodeJS.ProcessEnv },
-): Promise<void> {
+	options: {
+		root: string;
+		publish: boolean;
+		/** Index recovery verifies sealed identities, not current remote component readiness. */
+		requireAlreadyPublished?: boolean;
+		run?: GhRunner;
+		env?: NodeJS.ProcessEnv;
+		signal?: AbortSignal;
+		helperDistribution?: HelperDistributionDependencies;
+		/** Keep nested default synchronous control runners out of component source transport. */
+		componentRun?: GhRunner;
+		componentChecks?: CiReleaseComponentChecks;
+	},
+): Promise<CiReleasePlan> {
 	const plan = validateCiReleasePlan(value);
 	const env = options.env ?? process.env;
 	const run = options.run ?? ciGhRunner(env);
@@ -535,5 +634,45 @@ export async function revalidateCiReleasePlan(
 	const changelog = await targetIdentity(run, plan.commit, plan.version, repository);
 	if (JSON.stringify(changelog) !== JSON.stringify(plan.changelog))
 		throw new Error("Release changelog changed");
+	const hasArtifactDependencies = Object.hasOwn(options, "helperDistribution");
+	if (!options.publish && !hasArtifactDependencies) return plan;
 	if (options.publish) await assertReleaseEnvironment(run, repository, defaultBranch);
+	const componentOptions = {
+		repository,
+		targetCommit: plan.commit,
+		signal: options.signal,
+		run: Object.hasOwn(options, "componentRun") ? options.componentRun : options.run,
+	};
+	const targetDependencies = await (
+		options.componentChecks?.readDependencies ?? readTargetComponentDependencies
+	)(componentOptions);
+	const dependencies = hasArtifactDependencies ? options.helperDistribution : targetDependencies;
+	if (targetDependencies !== undefined && !isDeepStrictEqual(dependencies, targetDependencies))
+		throw new Error("Release helper dependencies do not match target component configuration");
+	if (targetDependencies === undefined) {
+		if (plan.componentEvidence !== undefined)
+			throw new Error("Legacy target cannot declare component evidence");
+		if (dependencies !== undefined) {
+			const legacy = parseHelperDistributionDependencies(dependencies);
+			if (legacy.executor.version !== plan.version || legacy.executor.protocolVersion !== 1)
+				throw new Error("Legacy target helper dependency version/protocol mismatch");
+		}
+		return plan;
+	}
+	if (!options.publish || options.requireAlreadyPublished) {
+		validateCiComponentDependencies(plan, dependencies);
+		return plan;
+	}
+	const componentEvidence = await (
+		options.componentChecks?.verifyEvidence ?? verifyComponentReleaseEvidence
+	)({
+		...componentOptions,
+		dependencies,
+		evidence: plan.componentEvidence,
+	});
+	if (componentEvidence === undefined)
+		throw new Error("Missing component publication evidence for configured target");
+	const controlPlan = validateCiReleasePlan({ ...plan, componentEvidence });
+	validateCiComponentDependencies(controlPlan, dependencies);
+	return controlPlan;
 }

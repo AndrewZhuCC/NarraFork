@@ -137,6 +137,7 @@ type Outcome = {
 		foreignKeys: number;
 		indexes: number;
 		uniques: number;
+		primaryKeys: number;
 		checks: number;
 		generated: number;
 		canonicalExpressions: number;
@@ -281,10 +282,39 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 				const tamperDetected: string[] = [];
 				const tampers: Array<{ label: string; sql: string; facets: FacetName[]; match: RegExp }> = [
 					{
+						label: "renamed composite primary key",
+						sql: `ALTER TABLE "resource_protection_sources" RENAME CONSTRAINT "resource_protection_sources_source_source_id_pk" TO "tampered_sources_pk";`,
+						facets: ["primaryKeys"],
+						match:
+							/^primary key resource_protection_sources\.resource_protection_sources_source_source_id_pk: missing/,
+					},
+					{
+						label: "reordered composite primary key",
+						sql: `ALTER TABLE "resource_protection_paths" DROP CONSTRAINT "resource_protection_paths_source_source_id_slot_pk";
+ALTER TABLE "resource_protection_paths" ADD CONSTRAINT "resource_protection_paths_source_source_id_slot_pk" PRIMARY KEY ("source_id", "source", "slot");`,
+						facets: ["primaryKeys", "columns"],
+						match:
+							/^primary key resource_protection_paths\.resource_protection_paths_source_source_id_slot_pk: expected/,
+					},
+					{
+						label: "dropped composite primary key",
+						sql: `ALTER TABLE "resource_protection_paths" DROP CONSTRAINT "resource_protection_paths_source_source_id_slot_pk";`,
+						facets: ["primaryKeys", "columns"],
+						match:
+							/^primary key resource_protection_paths\.resource_protection_paths_source_source_id_slot_pk: missing/,
+					},
+					{
 						label: "dropped foreign key",
 						sql: `ALTER TABLE "chapters" DROP CONSTRAINT "chapters_project_id_projects_id_fk";`,
 						facets: ["foreignKeys"],
 						match: /^foreign key chapters_project_id_projects_id_fk: missing/,
+					},
+					{
+						label: "changed expression index key",
+						sql: `DROP INDEX "idx_token_repair_single_active";
+CREATE UNIQUE INDEX "idx_token_repair_single_active" ON "usage_token_repair_jobs" ((2)) WHERE status IN ('analyzing', 'ready', 'applying');`,
+						facets: ["indexes"],
+						match: /^index usage_token_repair_jobs\.idx_token_repair_single_active: expected/,
 					},
 					{
 						label: "dropped index",
@@ -351,6 +381,7 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 						foreignKeys: read.catalog.foreignKeys.length,
 						indexes: read.catalog.indexes.length,
 						uniques: read.catalog.uniques.length,
+						primaryKeys: read.catalog.primaryKeys.length,
 						checks: read.catalog.checks.length,
 						generated: read.catalog.generated.length,
 						canonicalExpressions: canonical.canonical.size,
@@ -386,6 +417,7 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 				columns: observed.columns,
 				foreignKeys: observed.foreignKeys,
 				uniques: observed.uniques,
+				primaryKeys: observed.primaryKeys,
 				checks: observed.checks,
 				generated: observed.generated,
 			}).toEqual({
@@ -393,6 +425,7 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 				columns: expected.counts.columns,
 				foreignKeys: expected.counts.foreignKeys,
 				uniques: expected.counts.uniqueConstraints,
+				primaryKeys: expected.counts.primaryKeys,
 				checks: expected.counts.checkConstraints,
 				generated: expected.counts.generatedColumns,
 			});
@@ -403,7 +436,11 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 			expect(observed.unquotedAliasFolds).toBe(true);
 			// And the gate can still fail on real damage.
 			expect(observed.tamperDetected).toEqual([
+				"renamed composite primary key",
+				"reordered composite primary key",
+				"dropped composite primary key",
 				"dropped foreign key",
+				"changed expression index key",
 				"dropped index",
 				"changed default",
 				"dropped unique constraint",

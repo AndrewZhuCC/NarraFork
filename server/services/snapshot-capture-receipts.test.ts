@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { openSchemaCopyAt } from "../../tests/sqlite-schema-image";
 import { db as appDb, sqlite as template } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -65,18 +66,11 @@ beforeEach(async () => {
 		timeout: 5000,
 	});
 	expect(initialized.exitCode).toBe(0);
-	sqlite = new Database(join(root, "evidence.db"));
-	sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	// Copy schema only from bunfig/preload's isolated template, never migrate a live DB.
-	const definitions = template
-		.query<{ sql: string }, []>(
-			"SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '*_fts*' ORDER BY type DESC LIMIT 2048",
-		)
-		.all();
-	expect(definitions.length).toBeLessThan(2048);
-	sqlite.transaction(() => {
-		for (const definition of definitions) sqlite.exec(definition.sql);
-	})();
+	// The file starts as a byte image of that schema (built once per process) instead of
+	// replaying ~550 DDL statements per case; the connection PRAGMAs are unchanged.
+	sqlite = openSchemaCopyAt(template, join(root, "evidence.db"));
+	sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	db = database(sqlite);
 	narratorId = generateId();
 	userId = generateId();
@@ -666,29 +660,74 @@ describe("actual tree-scan observation receipts", () => {
 
 	test("bounded finish metadata stays pending after timeout, even once the delayed read completes", async () => {
 		const delayed = gate();
+		const finishEntered = gate();
+		const readCompleted = gate();
 		const original = localIo.localDirectoryIdentity;
+		const setTimer = globalThis.setTimeout;
+		const metadataTimers: Array<() => void> = [];
+		const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: TimerHandler,
+			delay?: number,
+			...args: unknown[]
+		) => {
+			if (delay === 15 && typeof callback === "function") {
+				// Exercise the real timeout callback without racing begin against host load.
+				metadataTimers.push(() => callback(...args));
+				const timer = setTimer(() => {}, delay);
+				clearTimeout(timer);
+				return timer;
+			}
+			return setTimer(callback, delay, ...args);
+		}) as typeof setTimeout);
 		let calls = 0;
 		const identitySpy = spyOn(localIo, "localDirectoryIdentity").mockImplementation(
 			async (path) => {
-				if (++calls === 2) await delayed.promise;
-				return original(path);
+				if (++calls !== 2) return original(path);
+				finishEntered.resolve();
+				await delayed.promise;
+				try {
+					return await original(path);
+				} finally {
+					readCompleted.resolve();
+				}
 			},
 		);
-		cleanupSpies.push(identitySpy);
+		cleanupSpies.push(timerSpy, identitySpy);
 		receipts = new SnapshotCaptureReceiptService({ db, privateRoot, metadataBudgetMs: 15 });
-		const hash = await capture();
-		const pending = rows()[0];
-		expect(pending).toMatchObject({
-			finishedAt: null,
-			treeHash: null,
-			coverage: "unavailable",
-			reason: "result_unknown",
-		});
-		identitySpy.mockRestore();
-		delayed.resolve();
-		await new Promise<void>((done) => setImmediate(done));
-		expect(await capture()).toBe(hash);
-		expect(rows().find((row) => row.id === pending.id)).toEqual(pending);
+		const capturing = capture();
+		try {
+			await finishEntered.promise;
+			expect(rows()).toHaveLength(1);
+			expect(metadataTimers).toHaveLength(2);
+			metadataTimers[1]?.();
+			const hash = await capturing;
+			const pending = rows()[0];
+			expect(pending).toMatchObject({
+				finishedAt: null,
+				treeHash: null,
+				coverage: "unavailable",
+				reason: "result_unknown",
+			});
+			timerSpy.mockRestore();
+			identitySpy.mockRestore();
+			delayed.resolve();
+			await readCompleted.promise;
+			await new Promise<void>((done) => setImmediate(done));
+			expect(await capture()).toBe(hash);
+			expect(rows().find((row) => row.id === pending.id)).toEqual(pending);
+		} finally {
+			delayed.resolve();
+			timerSpy.mockRestore();
+			identitySpy.mockRestore();
+			// A failed assertion must also drain the real read before afterEach removes HOME.
+			for (const expire of metadataTimers) expire();
+			try {
+				await capturing;
+			} finally {
+				if (calls >= 2) await readCompleted.promise;
+				await new Promise<void>((done) => setImmediate(done));
+			}
+		}
 	});
 
 	test("actual SQLite writer contention has a short bounded wait and no fake receipt", async () => {

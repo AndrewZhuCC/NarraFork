@@ -411,7 +411,8 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 	interface KnowledgeRawRow {
 		id: string;
-		collection_id: string;
+		collection_id: string | null;
+		personal_entry_id?: string | null;
 		title: string;
 		slug: string;
 		tags_json: string | null;
@@ -426,6 +427,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		return {
 			id: row.id,
 			collectionId: row.collection_id,
+			...(row.personal_entry_id ? { personalEntryId: row.personal_entry_id } : {}),
 			title: row.title,
 			slug: row.slug,
 			tagsJson: row.tags_json,
@@ -648,15 +650,30 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 		async searchKnowledgeDrafts(query: KnowledgeDraftSearchQuery): Promise<KnowledgeSearchRow[]> {
 			const options = { signal: query.signal, operation: "searchKnowledgeDrafts" };
-			const project = projectClause(query.projectId);
+			const collection = query.includeStandalone
+				? "COALESCE(e.collection_id, d.target_collection_id)"
+				: "e.collection_id";
+			const title = query.includeStandalone ? "COALESCE(e.title, d.title, '')" : "e.title";
+			const join = query.includeStandalone ? "LEFT JOIN" : "JOIN";
+			const project = query.projectId
+				? `AND (${query.includeStandalone ? "(d.entry_id IS NULL AND d.target_collection_id IS NULL) OR " : ""}${collection} IN (
+					SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
+				))`
+				: "";
 			// The drafts index has no keyword column, so a field restriction has no meaning here;
 			// callers route those searches to the committed path instead.
 			const drift = `(d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) as drifted`;
-			const columns =
-				query.sort === "time"
+			const columns = query.includeStandalone
+				? `COALESCE(e.id, d.id) AS id, ${collection} AS collection_id,
+					${title} AS title, COALESCE(e.slug, '') AS slug, e.tags_json,
+					COALESCE(e.status, d.status) AS status, COALESCE(e.created_at, d.created_at) AS created_at,
+					${query.sort === "time" ? "d.updated_at" : "COALESCE(e.updated_at, d.updated_at)"} AS updated_at,
+					CASE WHEN d.entry_id IS NULL THEN d.id END AS personal_entry_id`
+				: query.sort === "time"
 					? KNOWLEDGE_ENTRY_COLUMNS.replace("e.updated_at", "d.updated_at")
 					: KNOWLEDGE_ENTRY_COLUMNS;
-			const order = query.sort === "time" ? "d.updated_at DESC, e.id ASC" : "rank";
+			const idOrder = query.includeStandalone ? "COALESCE(e.id, d.id)" : "e.id";
+			const order = query.sort === "time" ? `d.updated_at DESC, ${idOrder} ASC` : "rank";
 
 			if (query.strategy === "index") {
 				const params: (string | number | null)[] = [
@@ -674,11 +691,11 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				  ${snippetCall("knowledge_drafts_fts", 1, KNOWLEDGE_SNIPPET)} as snippet
 				 FROM knowledge_drafts_fts
 				 JOIN knowledge_drafts d ON d.rowid = knowledge_drafts_fts.rowid
-				 JOIN knowledge_entries e ON e.id = d.entry_id
+				 ${join} knowledge_entries e ON e.id = d.entry_id
 				 WHERE knowledge_drafts_fts MATCH ?
 				   AND d.author_user_id = ?
 				   AND d.status = ?
-				   AND (? IS NULL OR e.collection_id = ?)
+				   AND (? IS NULL OR ${collection} = ?)
 				   ${project}
 				 ORDER BY ${order} LIMIT ?`,
 					params,
@@ -702,15 +719,15 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			const rows = (await execute(
 				`SELECT ${columns},
 			  ${drift},
-			  substr(COALESCE(d.content, e.title), 1, ${PREVIEW_CHARS}) as snippet
+			  substr(COALESCE(d.content, ${title}), 1, ${PREVIEW_CHARS}) as snippet
 			 FROM knowledge_drafts d
-			 JOIN knowledge_entries e ON e.id = d.entry_id
-			 WHERE (? = '' OR e.title LIKE ? ESCAPE '\\' OR d.content LIKE ? ESCAPE '\\')
+			 ${join} knowledge_entries e ON e.id = d.entry_id
+			 WHERE (? = '' OR ${title} LIKE ? ESCAPE '\\' OR d.content LIKE ? ESCAPE '\\')
 			   AND d.author_user_id = ?
 			   AND d.status = ?
-			   AND (? IS NULL OR e.collection_id = ?)
+			   AND (? IS NULL OR ${collection} = ?)
 			   ${project}
-			 ORDER BY d.updated_at DESC${query.sort === "time" ? ", e.id ASC" : ""} LIMIT ?`,
+			 ORDER BY d.updated_at DESC${query.sort === "time" ? `, ${idOrder} ASC` : ""} LIMIT ?`,
 				params,
 				options,
 			)) as unknown as KnowledgeRawRow[];

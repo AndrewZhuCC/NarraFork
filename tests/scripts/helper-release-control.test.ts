@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { parseHelperArtifactZipDirectory } from "../../scripts/lib/helper-artifact";
 import { HELPER_LICENSE_FILES } from "../../scripts/lib/helper-release";
 import {
@@ -104,6 +106,16 @@ function protectedContextFixture() {
 		tagPresent: true,
 		tagCommit: commit,
 		ancestor: true,
+		componentConfig: JSON.stringify({ executor: { version: "0.9.1", protocolVersion: 1 } }),
+		componentPresent: true,
+		componentReadError: false,
+		treeReadError: false,
+		packageVersion: "0.9.2",
+		protocolVersion: 1,
+		recipeChange: false,
+		toolchainChange: false,
+		recipeReadError: false,
+		gitCalls: [] as string[][],
 	};
 	const run = async (args: string[]) => {
 		calls.push(args);
@@ -138,9 +150,41 @@ function protectedContextFixture() {
 		throw new Error(`Unexpected API ${args[1]}`);
 	};
 	const git = (_root: string, args: string[]) => {
+		state.gitCalls.push(args);
 		if (args[0] === "rev-parse") return commit;
 		if (args[0] === "merge-base") return "";
-		if (args[0] === "show") return "const ProtocolVersion = 1\n";
+		if (args[0] === "ls-tree") {
+			if (state.treeReadError) throw new Error("git tree read failed");
+			return state.componentPresent ? "shared/component-versions.json" : "";
+		}
+		if (args[0] === "show" && args[1] === `${commit}:shared/component-versions.json`) {
+			if (state.componentReadError) throw new Error("git component read failed");
+			return state.componentConfig;
+		}
+		if (args[0] === "show" && args[1] === `${commit}:package.json`)
+			return JSON.stringify({ version: state.packageVersion });
+		if (args[0] === "show" && args[1] === `${commit}:remote-executor/internal/rpc/protocol.go`)
+			return `const ProtocolVersion = ${state.protocolVersion}\n`;
+		if (args[0] === "show") {
+			const [sourceCommit, path] = (args[1] ?? "").split(":");
+			if (
+				[
+					"scripts/lib/helper-build.ts",
+					"shared/remote-executor.ts",
+					".github/workflows/helpers-release.yml",
+				].includes(path ?? "")
+			) {
+				if (state.recipeReadError) throw new Error("git recipe read failed");
+				let source = readFileSync(resolve(path as string), "utf8");
+				if (sourceCommit === environment.GITHUB_SHA && sourceCommit !== commit) {
+					if (state.recipeChange && path === "scripts/lib/helper-build.ts")
+						source = source.replace('"-trimpath"', '"-race"');
+					if (state.toolchainChange && path === ".github/workflows/helpers-release.yml")
+						source = source.replace("go-version: 1.24.13", "go-version: 1.25.0");
+				}
+				return source;
+			}
+		}
 		throw new Error("Unexpected git read");
 	};
 	return { calls, environment, state, options: { run, git, environment } };
@@ -219,6 +263,262 @@ describe("protected helper Environment", () => {
 		).rejects.toThrow("control commit");
 		expect(f.calls.length).toBe(0);
 	});
+});
+
+describe("independent executor source identity", () => {
+	test("executor tag matches target component pin, independently of APP 0.9.2", async () => {
+		const f = protectedContextFixture();
+		const planned = await planHelperRelease(".", "executor", "executor-v0.9.1", "", f.options);
+		expect(planned).toMatchObject({ version: "0.9.1", protocolVersion: 1, commit });
+		expect(f.state.gitCalls).toContainEqual([
+			"ls-tree",
+			"--name-only",
+			commit,
+			"--",
+			"shared/component-versions.json",
+		]);
+		expect(f.state.gitCalls.some((args) => args[1] === `${commit}:package.json`)).toBe(false);
+	});
+	for (const mode of [
+		"wrong-version",
+		"wrong-protocol",
+		"bad-json",
+		"bad-shape",
+		"read-error",
+		"tree-error",
+	]) {
+		test(`rejects ${mode}, never treating a bad declaration/read as legacy`, async () => {
+			const f = protectedContextFixture();
+			f.state.packageVersion = "0.9.1";
+			if (mode === "wrong-version")
+				f.state.componentConfig = JSON.stringify({
+					executor: { version: "0.9.2", protocolVersion: 1 },
+				});
+			if (mode === "wrong-protocol")
+				f.state.componentConfig = JSON.stringify({
+					executor: { version: "0.9.1", protocolVersion: 2 },
+				});
+			if (mode === "bad-json") f.state.componentConfig = "{";
+			if (mode === "bad-shape") f.state.componentConfig = "{}";
+			if (mode === "read-error") f.state.componentReadError = true;
+			if (mode === "tree-error") f.state.treeReadError = true;
+			await expect(
+				planHelperRelease(".", "executor", "executor-v0.9.1", "", f.options),
+			).rejects.toThrow();
+			expect(f.state.gitCalls.some((args) => args[1] === `${commit}:package.json`)).toBe(false);
+		});
+	}
+	test("only a proven absent target configuration preserves legacy package validation", async () => {
+		const f = protectedContextFixture();
+		f.state.componentPresent = false;
+		f.state.packageVersion = "0.9.1";
+		expect(
+			(await planHelperRelease(".", "executor", "executor-v0.9.1", "123", f.options)).version,
+		).toBe("0.9.1");
+		f.state.packageVersion = "0.9.2";
+		await expect(
+			planHelperRelease(".", "executor", "executor-v0.9.1", "123", f.options),
+		).rejects.toThrow("Legacy executor tag");
+	});
+});
+
+describe("new executor trusted-control recipe parity", () => {
+	test("independent source/control commits with identical executor recipe remain buildable", async () => {
+		const f = protectedContextFixture();
+		f.environment.GITHUB_SHA = "b".repeat(40);
+		const planned = await planHelperRelease(".", "executor", "executor-v0.9.1", "", f.options);
+		expect(planned.controlCommit).toBe(f.environment.GITHUB_SHA);
+		for (const sha of [commit, f.environment.GITHUB_SHA])
+			for (const path of [
+				"scripts/lib/helper-build.ts",
+				"shared/remote-executor.ts",
+				".github/workflows/helpers-release.yml",
+			])
+				expect(f.state.gitCalls).toContainEqual(["show", `${sha}:${path}`]);
+	});
+	for (const mode of ["recipe", "toolchain", "read-error"]) {
+		test(`new component build rejects trusted-control ${mode} mismatch`, async () => {
+			const f = protectedContextFixture();
+			f.environment.GITHUB_SHA = "b".repeat(40);
+			f.state.recipeChange = mode === "recipe";
+			f.state.toolchainChange = mode === "toolchain";
+			f.state.recipeReadError = mode === "read-error";
+			await expect(
+				planHelperRelease(".", "executor", "executor-v0.9.1", "", f.options),
+			).rejects.toThrow();
+		});
+	}
+	test("historical sealed bundle restore does not inspect or require today's control recipe", async () => {
+		const f = protectedContextFixture();
+		f.environment.GITHUB_SHA = "b".repeat(40);
+		f.state.recipeReadError = true;
+		expect(
+			(await planHelperRelease(".", "executor", "executor-v0.9.1", "123", f.options)).sourceRunId,
+		).toBe("123");
+		expect(f.state.gitCalls.some((args) => args[1]?.includes("helper-build.ts"))).toBe(false);
+	});
+	test("unconfigured legacy source keeps its previous build path", async () => {
+		const f = protectedContextFixture();
+		f.environment.GITHUB_SHA = "b".repeat(40);
+		f.state.componentPresent = false;
+		f.state.packageVersion = "0.9.1";
+		f.state.recipeReadError = true;
+		expect(
+			(await planHelperRelease(".", "executor", "executor-v0.9.1", "", f.options)).version,
+		).toBe("0.9.1");
+		expect(f.state.gitCalls.some((args) => args[1]?.includes("helper-build.ts"))).toBe(false);
+	});
+});
+
+describe("executor CLI component identity", () => {
+	function fixture(args: string[], protocol = 1) {
+		const root = mkdtempSync(resolve(".narrafork/executor-release-cli-"));
+		const path = join(root, "fixture.ts");
+		writeFileSync(
+			path,
+			`
+import { mock } from "bun:test";
+import * as fs from "node:fs";
+import * as child from "node:child_process";
+const read = fs.readFileSync;
+const exists = fs.existsSync;
+const stat = fs.statSync;
+const exec = child.execFileSync;
+const writes = [];
+const calls = [];
+const protocolReads = [];
+const artifact = Buffer.from("executor version 0.9.1");
+const isArtifact = (path) => /remote-executor[/\\\\]dist[/\\\\]narrafork-executor-linux-amd64$/.test(String(path));
+mock.module("node:fs", () => ({ ...fs,
+ existsSync: (path) => isArtifact(path) || exists(path),
+ statSync: (path) => isArtifact(path) ? {size: artifact.length} : stat(path),
+ readFileSync: (path, ...args) => { if (String(path).endsWith("protocol.go")) { protocolReads.push(String(path)); throw new Error("Forbidden mirror source protocol read ${protocol}"); } return isArtifact(path) ? artifact : read(path, ...args); },
+ writeFileSync: (path, contents) => { writes.push({path: String(path), manifest: JSON.parse(contents)}); },
+}));
+mock.module("node:child_process", () => ({ ...child, execFileSync: (path, ...args) => isArtifact(path) ? "executor version 0.9.1" : exec(path, ...args) }));
+const {parseHelperReleaseArguments: parseArguments} = await import(${JSON.stringify(resolve("scripts/release-helpers.ts"))});
+mock.module(${JSON.stringify(resolve("scripts/release-helpers.ts"))}, () => ({
+ parseHelperReleaseArguments: (args) => {
+  const parsed = parseArguments(args);
+  return {...parsed, options: new Map([...parsed.options, ["root", ${JSON.stringify(root)}]])};
+ },
+ runHelperReleaseController: async (args) => { calls.push(args); },
+}));
+mock.module(${JSON.stringify(resolve("scripts/lib/helper-release-control.ts"))}, () => ({readHelperReleasePlan: async () => ({kind: "executor", version: "0.5.24", repository: "Example/Fork"})}));
+mock.module(${JSON.stringify(resolve("scripts/lib/build-repository.ts"))}, () => ({resolveBuildGitHubRepository: () => "Example/Fork"}));
+process.argv = [process.execPath, ${JSON.stringify(resolve("scripts/release-executor.ts"))}, ...${JSON.stringify(args)}];
+process.exit = (code) => { throw new Error("fixture exit " + code); };
+try { await import(${JSON.stringify(resolve("scripts/release-executor.ts"))}); }
+catch (error) { console.log(JSON.stringify({error: error.message, writes, calls, protocolReads})); }
+`,
+		);
+		try {
+			const output = execFileSync(process.execPath, [path], {
+				cwd: process.cwd(),
+				encoding: "utf8",
+				timeout: 15_000,
+				maxBuffer: 64 * 1024,
+				env: { ...process.env, NARRAFORK_HOME: join(root, "data"), HOME: root, USERPROFILE: root },
+			});
+			return JSON.parse(output.trim().split("\n").at(-1) as string);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+	test("server mirror defaults to component pin without writing current manifest", () => {
+		const result = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"]);
+		expect(result.error).toBe("fixture exit 0");
+		expect(result.writes).toHaveLength(0);
+		expect(result.protocolReads).toHaveLength(0);
+		expect(result.calls).toHaveLength(0);
+	}, 20_000);
+	test("server mirror rejects malformed versions and never reads source protocol or builds", () => {
+		const wrongVersion = fixture(["invalid", "--dry-run", "--upload-only"]);
+		expect(wrongVersion.error).toContain("version format");
+		expect(wrongVersion.writes).toHaveLength(0);
+		const wrongProtocol = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"], 2);
+		expect(wrongProtocol.error).toBe("fixture exit 0");
+		expect(wrongProtocol.protocolReads).toHaveLength(0);
+		expect(wrongProtocol.writes).toHaveLength(0);
+		const obsolete = fixture(["--skip-build", "--dry-run"]);
+		expect(obsolete.error).toContain("obsolete/unsupported");
+		expect(obsolete.writes).toHaveLength(0);
+	}, 40_000);
+	test("GitHub historical restore keeps immutable bundle version instead of current pin", () => {
+		for (const positional of [[], ["0.5.24"]]) {
+			const result = fixture([
+				...positional,
+				"--target=github",
+				"--dry-run",
+				"--plan=plan.json",
+				"--output=bundle",
+			]);
+			expect(result.error).toBe("fixture exit 0");
+			expect(result.writes).toHaveLength(0);
+			expect(result.calls).toEqual([["preview", "--plan=plan.json", "--output=bundle"]]);
+		}
+		const result = fixture([
+			"0.9.1",
+			"--target=github",
+			"--dry-run",
+			"--plan=plan.json",
+			"--output=bundle",
+		]);
+		expect(result.error).toContain("immutable bundle plan");
+		expect(result.calls).toHaveLength(0);
+		const wrongRepository = fixture([
+			"--target=github",
+			"--dry-run",
+			"--plan=plan.json",
+			"--output=bundle",
+			"--github-repository=Other/Fork",
+		]);
+		expect(wrongRepository.error).toContain("repository does not match the immutable bundle plan");
+		expect(wrongRepository.calls).toHaveLength(0);
+	}, 50_000);
+	test("GitHub CLI forwards original attempt and artifact for publication and offline dry-run", () => {
+		for (const dryRun of [false, true]) {
+			const result = fixture([
+				"--target=github",
+				"--plan=plan.json",
+				"--output=bundle",
+				"--source-run-attempt=1",
+				"--bundle-artifact-id=456",
+				"--upload-only",
+				...(dryRun ? ["--dry-run"] : []),
+			]);
+			expect(result.error).toBe("fixture exit 0");
+			expect(result.writes).toHaveLength(0);
+			expect(result.protocolReads).toHaveLength(0);
+			expect(result.calls).toEqual([
+				[
+					"publish",
+					"--plan=plan.json",
+					"--output=bundle",
+					"--source-run-attempt=1",
+					"--bundle-artifact-id=456",
+					...(dryRun ? ["--dry-run"] : []),
+				],
+			]);
+			const parsed = parseHelperReleaseArguments(result.calls[0]);
+			expect(parsed.command).toBe("publish");
+			expect(parsed.dryRun).toBe(dryRun);
+			expect(parsed.options.get("source-run-attempt")).toBe("1");
+			expect(parsed.options.get("bundle-artifact-id")).toBe("456");
+		}
+	}, 40_000);
+	for (const option of ["source-run-attempt", "bundle-artifact-id"])
+		test(`GitHub CLI rejects malformed --${option} before controller execution`, () => {
+			const result = fixture([
+				"--target=github",
+				"--plan=plan.json",
+				"--output=bundle",
+				`--${option}=not-an-id`,
+			]);
+			expect(result.error).toContain(`Invalid --${option}`);
+			expect(result.calls).toHaveLength(0);
+			expect(result.writes).toHaveLength(0);
+		}, 20_000);
 });
 
 describe("strict auxiliary controller arguments", () => {
@@ -501,7 +801,7 @@ describe("protected workflow and pinned recipe guards", () => {
 		expect(uses.length).toBeGreaterThan(0);
 		expect(uses.every((value) => /@[0-9a-f]{40}$/.test(value as string))).toBe(true);
 		expect(workflow).not.toContain("bun-version: latest");
-		expect(workflow).toContain("bun-version: 1.4.2");
+		expect(workflow).toContain("bun-version: 1.4.3");
 	});
 	test("native matrix has all six platform runners and original-bundle recovery", () => {
 		for (const platform of HELPER_PLATFORMS) expect(workflow).toContain(`platform: ${platform}`);

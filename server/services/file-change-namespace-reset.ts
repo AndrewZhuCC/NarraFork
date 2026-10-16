@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { mkdir, opendir, rename, rmdir, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { eq, sql } from "drizzle-orm";
 import type { db as applicationDb } from "../db";
@@ -230,7 +230,7 @@ export async function resetFileChangeNamespace(input: {
 	const retired = join(input.privateRoot, `file-change-blobs.retired-${randomUUID()}`);
 	try {
 		await rename(root, retired);
-		scheduleRetiredCleanup(retired);
+		scheduleRetiredCleanup(retired, input.privateRoot);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
@@ -239,14 +239,41 @@ export async function resetFileChangeNamespace(input: {
 	await invalidateMetadata(input.db);
 }
 
-const cleanupQueue = hotSafe("narrafork.file-change-cache-cleanup.v1", () => ({
+// Retained v1 runners cannot publish per-path settlement. Keep their queue separate
+// and conservatively drain that one-time legacy IO before declaring teardown safe.
+const legacyCleanupQueue = hotSafe("narrafork.file-change-cache-cleanup.v1", () => ({
 	running: false,
 	paths: [] as string[],
 }));
-function scheduleRetiredCleanup(path: string): void {
+type RetiredCleanup = { privateRoot: string; settled: Promise<void>; finish(): void };
+const cleanupQueue = hotSafe("narrafork.file-change-cache-cleanup.v2", () => ({
+	running: false,
+	paths: [] as string[],
+	pending: new Map<string, RetiredCleanup>(),
+}));
+
+/** Call after namespace producers have drained. Wait for actual IO/handle closure,
+ * not merely reset's rename, including cleanup failures. Other roots do not wait
+ * for this root; the map holds at most one running job and eight queued jobs. */
+export async function waitForRetiredFileChangeCleanup(privateRoot: string): Promise<void> {
+	while (legacyCleanupQueue.running) await yieldToEventLoop();
+	const key = resolve(privateRoot);
+	for (;;) {
+		const jobs = [...cleanupQueue.pending.values()].filter((job) => job.privateRoot === key);
+		if (!jobs.length) return;
+		await Promise.all(jobs.map((job) => job.settled));
+	}
+}
+
+function scheduleRetiredCleanup(path: string, privateRoot: string): void {
 	// Backpressure: do not accumulate unbounded tasks if a disk is slow. A skipped
 	// directory is already isolated and may be removed by storage maintenance.
 	if (cleanupQueue.paths.length >= 8) return;
+	let finish!: () => void;
+	const settled = new Promise<void>((done) => {
+		finish = done;
+	});
+	cleanupQueue.pending.set(path, { privateRoot: resolve(privateRoot), settled, finish });
 	cleanupQueue.paths.push(path);
 	if (cleanupQueue.running) return;
 	cleanupQueue.running = true;
@@ -274,6 +301,12 @@ function scheduleRetiredCleanup(path: string): void {
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT")
 						logger.warn("Isolated old blob cache cleanup deferred", { error: String(error) });
+				} finally {
+					// for-await closes every opened directory before remove settles,
+					// including recursive errors and budget exhaustion.
+					const job = cleanupQueue.pending.get(next);
+					cleanupQueue.pending.delete(next);
+					job?.finish();
 				}
 			}
 		} finally {

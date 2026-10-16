@@ -1,13 +1,34 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import type { MessageSegmentationCache } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { peekCachedPretextDocument } from "./pretext-document-cache";
 import { captureCoordinatorAnchor, PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import type { StreamingBlockCache } from "./streaming-block-cache";
 
+const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 beforeAll(() => {
 	installCanvasStub();
+	if (!previousStorage) {
+		const values = new Map<string, string>();
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem: (key: string) => values.get(key) ?? null,
+				setItem: (key: string, value: string) => {
+					values.set(key, value);
+				},
+				removeItem: (key: string) => {
+					values.delete(key);
+				},
+			},
+		});
+	}
+});
+afterAll(() => {
+	if (!previousStorage) Reflect.deleteProperty(globalThis, "localStorage");
 });
 
 function message(seq: number, text: string): TreeMessage {
@@ -59,6 +80,102 @@ const COMPACT_LABELS = {
 const compactBuildOptions = { ...buildOptions, labels: COMPACT_LABELS };
 
 describe("PretextLayoutCoordinator", () => {
+	it("shares one canonical refresh between warm and Ask-in-Passing consumers", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let release = () => {};
+		let queries = 0;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await coordinator.load("refresh-shared", buildOptions, {
+			locateMessage: async () => ({ seq: 0 }),
+			fetchPage: async (_id, options) => {
+				if (options.afterSeq === undefined) return page();
+				queries++;
+				await gate;
+				return { ...page(), messageVersion: 4 };
+			},
+		});
+		const view = () => ({ scrollTop: 0, viewportHeight: 720, pinnedToBottom: true });
+		const first = coordinator.refreshCurrentWindow(view);
+		expect(coordinator.refreshAskInPassing(view)).toBe(first);
+		release();
+		expect(await first).toBe(true);
+		expect(queries).toBe(1);
+		expect(coordinator.getSnapshot().input?.messageVersion).toBe(4);
+	});
+
+	for (const boundary of ["reset", "cancel", "append", "narrator", "session"] as const) {
+		it(`${boundary} cancels canonical transport and rejects a late commit`, async () => {
+			if (boundary === "session") setToken("canonical-window-first-principal");
+			const coordinator = new PretextLayoutCoordinator();
+			let release = () => {};
+			let started = () => {};
+			let signal: AbortSignal | undefined;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const opened = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			await coordinator.load(`refresh-${boundary}`, buildOptions, {
+				locateMessage: async () => ({ seq: 0 }),
+				fetchPage: async (_id, options) => {
+					if (options.afterSeq === undefined) return page();
+					signal = options.signal;
+					started();
+					await gate;
+					return { ...page(), messageVersion: 999 };
+				},
+			});
+			const outcome = coordinator
+				.refreshCurrentWindow(() => ({ scrollTop: 0, viewportHeight: 720, pinnedToBottom: true }))
+				.catch((error: Error) => error);
+			await opened;
+			expect(signal?.aborted).toBe(false);
+			if (boundary === "reset") coordinator.reset();
+			if (boundary === "cancel") coordinator.cancel();
+			if (boundary === "append")
+				expect(coordinator.appendMessage(message(2, "new persisted tail"), false)).toBe(true);
+			if (boundary === "narrator")
+				await coordinator.load("replacement-scope", buildOptions, {
+					fetchPage: async () => ({ ...page(), messageVersion: 12 }),
+				});
+			if (boundary === "session") setToken("canonical-window-second-principal");
+			expect(signal?.aborted).toBe(true);
+			expect(((await outcome) as Error).name).toBe("AbortError");
+			release();
+			for (let turn = 0; turn < 6; turn++) await Promise.resolve();
+			expect(coordinator.getSnapshot().input?.messageVersion).not.toBe(999);
+			if (boundary === "narrator") expect(coordinator.getSnapshot().input?.messageVersion).toBe(12);
+			if (boundary === "session") {
+				coordinator.publishDocumentSnapshot();
+				expect(peekCachedPretextDocument("refresh-session")).toBeNull();
+				clearToken();
+			}
+		});
+	}
+
+	it("an unpositioned restore never evicts a valid input or invents a one-pixel layout", async () => {
+		const first = new PretextLayoutCoordinator();
+		await first.load("restore-geometry", buildOptions, { fetchPage: async () => page() });
+		first.publishDocumentSnapshot();
+		const cached = peekCachedPretextDocument("restore-geometry");
+		if (!cached) throw new Error("Expected the valid input to remain cached");
+		const next = new PretextLayoutCoordinator();
+		for (const width of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(next.restore("restore-geometry", { ...buildOptions, contentWidth: width })).toBe(
+				false,
+			);
+			expect(next.getSnapshot().status).toBe("idle");
+			expect(next.getSnapshot().index).toBeUndefined();
+			expect(peekCachedPretextDocument("restore-geometry")).toBe(cached);
+		}
+		expect(next.restore("restore-geometry", buildOptions)).toBe(true);
+		expect(next.getSnapshot().input).toBe(cached);
+		expect(next.getSnapshot().index).toBeDefined();
+	});
+
 	it("keeps the old document unavailable until the complete input is laid out", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		const states: string[] = [];

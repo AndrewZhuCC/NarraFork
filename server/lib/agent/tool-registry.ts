@@ -120,6 +120,15 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 	const def = (schema as any)._zod?.def;
 	const typeName: string | undefined = def?.typeName;
 
+	// A preprocess wraps its input schema in a transform -> schema pipe. Other
+	// pipes describe their accepted input on the left, not their transformed output.
+	if (schema instanceof z.ZodPipe) {
+		const inner = schema.in instanceof z.ZodTransform ? schema.out : schema.in;
+		const converted = convertNode(inner as z.ZodType);
+		if (schema.description && !converted.description) converted.description = schema.description;
+		return converted;
+	}
+
 	// Unwrap optionals and defaults, preserving description from wrapper
 	if (typeName === "ZodOptional" || schema instanceof z.ZodOptional) {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

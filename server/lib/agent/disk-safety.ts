@@ -8,6 +8,7 @@ import {
 	diskSpaceMonitor,
 } from "../disk-safety";
 import type { DiskSafetySettings } from "../disk-safety-config";
+import { logger } from "../logger";
 import { getNarraforkHome } from "../narrafork-home";
 import type { ToolContext } from "./types";
 
@@ -24,21 +25,25 @@ const READ_ONLY_TOOLS = new Set([
 	"Recall",
 ]);
 const warnedAt = new Map<string, number>();
+/** Operator log throttle, separate so diagnostics can never evict model-notice keys. */
+const loggedAt = new Map<string, number>();
 const MAX_NOTICES = 512;
 
 /** Health notices are per narrator + volume, not per file. No persistent DB writes or timers. */
-function shouldNotify(key: string, intervalMs: number): boolean {
+function throttle(map: Map<string, number>, key: string, intervalMs: number): boolean {
 	const now = Date.now();
-	const last = warnedAt.get(key);
+	const last = map.get(key);
 	if (last !== undefined && now - last < intervalMs) return false;
-	warnedAt.delete(key);
-	warnedAt.set(key, now);
-	if (warnedAt.size > MAX_NOTICES) {
-		const first = warnedAt.keys().next();
-		if (!first.done) warnedAt.delete(first.value);
+	map.delete(key);
+	map.set(key, now);
+	if (map.size > MAX_NOTICES) {
+		const first = map.keys().next();
+		if (!first.done) map.delete(first.value);
 	}
 	return true;
 }
+const shouldNotify = (key: string, intervalMs: number) => throttle(warnedAt, key, intervalMs);
+const shouldLog = (key: string, intervalMs: number) => throttle(loggedAt, key, intervalMs);
 
 export interface ToolDiskCheck {
 	assessments: DiskAssessment[];
@@ -92,15 +97,19 @@ export async function checkToolDiskSafety(
 		entries.map(async ([path]) => monitor.assess(path, config)),
 	);
 	const cancelling =
-		["Bash", "bash", "Agent", "Task"].includes(toolName) &&
-		typeof input.stop === "string" &&
-		!input.command;
+		toolName === "Stop" ||
+		(["Bash", "bash", "Agent", "Task"].includes(toolName) &&
+			typeof input.stop === "string" &&
+			!input.command);
 	const readOnly = READ_ONLY_TOOLS.has(toolName) || cancelling;
 	const writeVolumes = new Set(
 		endpoints
 			.filter((e) => e.operation === "write" || e.operation === "execute")
 			.map((e) => e.target.canonicalPath ?? e.target.cwd),
 	);
+	// Only advice the model can act on goes into tool output. Probe failures, remote
+	// coverage gaps and the warn-mode override are operator diagnostics: an agent cannot
+	// repair them, and a footer on a successful result reads as a tool failure.
 	const notices: string[] = [];
 	const reported = new Set<string>();
 	for (const assessment of assessments) {
@@ -129,7 +138,21 @@ export async function checkToolDiskSafety(
 			);
 		}
 		if (assessment.level === "ok") continue;
-		const key = assessment.space?.key ?? "unknown";
+		if (!assessment.space) {
+			// Host state, not per narrator or per file: throttle by failure cause (+ HOME), so
+			// a host whose statfs never works logs once per TTL rather than once per Read path.
+			const reason = monitor.failureReason(assessment.path) ?? "unknown";
+			if (shouldLog(`probe-unknown:${homePath}:${reason}`, config.pathCacheTtlMs))
+				logger.warn("Disk safety probe unavailable; free space unknown, writes not blocked", {
+					path: assessment.path,
+					isHome: homePath,
+					reason,
+					mode: config.mode,
+					platform: process.platform,
+				});
+			continue;
+		}
+		const key = assessment.space.key;
 		if (reported.has(key)) continue;
 		reported.add(key);
 		if (
@@ -139,35 +162,18 @@ export async function checkToolDiskSafety(
 			)
 		)
 			continue;
-		if (!assessment.space) {
-			notices.push(
-				ctx.locale.startsWith("zh")
-					? `磁盘安全检测暂不可用：${assessment.path}；本次未阻断，但无法保证空间预检有效。`
-					: `Disk safety probe unavailable for ${assessment.path}; free space is unknown.`,
-			);
-		} else {
-			const free = Math.floor(assessment.space.freeBytes / (1024 * 1024));
-			notices.push(
-				ctx.locale.startsWith("zh")
-					? `磁盘空间警告：${assessment.space.mountPath} 仅余 ${free} MiB（${assessment.level}）。低空间下可选快照/dump 会跳过；请释放空间。`
-					: `Disk space warning: ${assessment.space.mountPath} has ${free} MiB free (${assessment.level}). Optional snapshots/dumps may be skipped; free space before further writes.`,
-			);
-		}
-	}
-	if (remote && shouldNotify(`${ctx.narratorId}:remote-disk-unknown`, config.pathCacheTtlMs)) {
+		const free = Math.floor(assessment.space.freeBytes / (1024 * 1024));
 		notices.push(
 			ctx.locale.startsWith("zh")
-				? "远程设备磁盘空间尚不能探测；以上保护只覆盖 NarraFork 宿主磁盘。"
-				: "Remote device disk space is not probed yet; this guard covers the NarraFork host only.",
+				? `磁盘空间警告：${assessment.space.mountPath} 仅余 ${free} MiB。请避免大体积写入（大文件、构建产物、依赖安装），必要时提醒用户释放空间。`
+				: `Disk space warning: ${assessment.space.mountPath} has only ${free} MiB free. Avoid large writes (big files, build output, dependency installs) and tell the user if space is needed.`,
 		);
 	}
-	if (notices.length && config.mode === "warn") {
-		notices.push(
-			ctx.locale.startsWith("zh")
-				? "管理员已选择 diskSafety.mode=warn：当前不会拒绝危险写入，也不会跳过快照/dump。"
-				: "Administrator override diskSafety.mode=warn is active: unsafe writes and optional snapshots/dumps are not blocked.",
-		);
-	}
+	// Intentionally global: one coverage reminder per TTL for the whole host, not per narrator.
+	if (remote && shouldLog("remote-disk-unknown", config.pathCacheTtlMs))
+		logger.info("Disk safety does not probe remote devices; only the host disk is guarded", {
+			narratorId: ctx.narratorId,
+		});
 	return { assessments, notice: notices.length ? `\n\n${notices.join("\n")}` : "" };
 }
 

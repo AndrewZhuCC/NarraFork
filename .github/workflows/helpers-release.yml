@@ -10,7 +10,7 @@ on:
         options: [helpers, executor]
         default: helpers
       tag:
-        description: Existing helpers-v1.0.0 or executor-vX.Y.Z tag on default-branch ancestry
+        description: Existing helpers-v1.0.0 or executor-vX.Y.Z tag (component version, not app version) on default-branch ancestry
         required: true
         type: string
       publish:
@@ -20,21 +20,6 @@ on:
         default: false
       source_run_id:
         description: Restore the exact original successful bundle; never rebuild
-        required: false
-        type: string
-        default: ""
-      mirror_only:
-        description: Retry only the legacy mirror using the original sealed bridge (requires publish)
-        required: true
-        type: boolean
-        default: false
-      bridge_run_id:
-        description: Original publisher run containing the bridge artifact, not necessarily the build run
-        required: false
-        type: string
-        default: ""
-      bridge_run_attempt:
-        description: Original bridge attempt if the publisher run has been rerun
         required: false
         type: string
         default: ""
@@ -79,7 +64,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - name: Install trusted control dependencies without lifecycle scripts
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Freeze exact existing tag and source
@@ -90,14 +75,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           PUBLISH_REQUESTED: ${{ inputs.publish }}
-          MIRROR_ONLY: ${{ inputs.mirror_only }}
-          BRIDGE_RUN_ID: ${{ inputs.bridge_run_id }}
-          BRIDGE_RUN_ATTEMPT: ${{ inputs.bridge_run_attempt }}
         run: >-
           bun scripts/release-helpers.ts preflight
           --kind="$RELEASE_KIND" --tag="$RELEASE_TAG" --source-run-id="$SOURCE_RUN_ID"
-          --publish="$PUBLISH_REQUESTED" --mirror-only="$MIRROR_ONLY"
-          --bridge-run-id="$BRIDGE_RUN_ID" --bridge-run-attempt="$BRIDGE_RUN_ATTEMPT"
+          --publish="$PUBLISH_REQUESTED"
       - name: Bundle trusted control code
         run: bun build scripts/release-helpers.ts --target=bun --outfile=.helper-release/control/control.js
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -131,7 +112,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.commit }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - if: ${{ needs.preflight.outputs.kind == 'executor' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -177,7 +158,7 @@ jobs:
     steps:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
@@ -210,7 +191,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.commit }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
@@ -246,7 +227,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
@@ -266,15 +247,6 @@ jobs:
       ((needs.assemble.result == 'success' && needs.restore.result == 'skipped') ||
       (needs.restore.result == 'success' && needs.assemble.result == 'skipped')) }}
     environment: release
-    concurrency:
-      group: update-server-publish
-      cancel-in-progress: false
-    env:
-      NF_UPDATE_SERVER: ${{ vars.NF_UPDATE_SERVER }}
-      NF_UPDATE_TOKEN: ${{ secrets.NF_UPDATE_TOKEN }}
-    outputs:
-      mirror-required: ${{ steps.prepare-bridge.outputs.mirror-required || steps.mirror.outputs.mirror-required }}
-      mirror-status: ${{ steps.publish.outputs.mirror-status || steps.mirror.outputs.mirror-status }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -290,7 +262,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
@@ -303,54 +275,21 @@ jobs:
         run: >-
           bun .helper-release/control/control.js restore
           --source-run-id="$ORIGIN_RUN_ID" --output=.helper-release/bundle
-      - name: Prepare immutable update server bridge
-        id: prepare-bridge
-        if: ${{ !inputs.mirror_only }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source-run-attempt }}
-        run: >-
-          bun .helper-release/control/control.js prepare-bridge --output=.helper-release/bundle
-          --bridge-dir=.helper-release/bridge --source-run-attempt="$SOURCE_RUN_ATTEMPT"
-      - name: Seal immutable update server bridge artifact
-        id: bridge-artifact
-        if: ${{ steps.prepare-bridge.outputs.mirror-required == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: update-server-bridge-${{ inputs.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .helper-release/bridge/
-          if-no-files-found: error
-          retention-days: 30
       - name: Draft, upload missing assets without clobber, verify, publish
         id: publish
-        if: ${{ !inputs.mirror_only }}
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source-run-attempt }}
-          BRIDGE_ARTIFACT_ID: ${{ steps.bridge-artifact.outputs.artifact-id }}
-          BRIDGE_ARTIFACT_DIGEST: ${{ steps.bridge-artifact.outputs.artifact-digest }}
+          BUNDLE_ARTIFACT_ID: ${{ steps.source.outputs.bundle-artifact-id }}
         run: >-
           bun .helper-release/control/control.js publish --output=.helper-release/bundle
-          --bridge-dir=.helper-release/publish-bridge --source-run-attempt="$SOURCE_RUN_ATTEMPT"
-          --bridge-artifact-id="$BRIDGE_ARTIFACT_ID" --bridge-artifact-digest="$BRIDGE_ARTIFACT_DIGEST"
-      - name: Mirror accepted bytes and verify legacy publication
-        id: mirror
-        if: ${{ inputs.mirror_only }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source-run-attempt }}
-        run: >-
-          bun .helper-release/control/control.js mirror --output=.helper-release/bundle
-          --bridge-dir=.helper-release/mirror-bridge --source-run-attempt="$SOURCE_RUN_ATTEMPT"
-      - name: Preserve partial publication receipts
-        if: ${{ always() }}
+          --source-run-attempt="$SOURCE_RUN_ATTEMPT" --bundle-artifact-id="$BUNDLE_ARTIFACT_ID"
+      - name: Record verified GitHub publication
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: update-server-helper-receipts-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .helper-release/publish-bridge/tools-mirror-receipt.json
-            .helper-release/mirror-bridge/tools-mirror-receipt.json
-          if-no-files-found: ignore
+          name: auxiliary-publication-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/publication/publication-receipt.json
+          if-no-files-found: error
           retention-days: 30
 
   gate:
@@ -366,12 +305,12 @@ jobs:
         run: test "$PREFLIGHT_RESULT" = success
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .helper-release/control/
-      - name: Require build, publication and configured mirror receipts
+      - name: Require build and GitHub publication receipts
         env:
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
@@ -381,7 +320,4 @@ jobs:
           ASSEMBLE_RESULT: ${{ needs.assemble.result }}
           RESTORE_RESULT: ${{ needs.restore.result }}
           PUBLISH_RESULT: ${{ needs.publisher.result }}
-          MIRROR_ONLY: ${{ inputs.mirror_only }}
-          MIRROR_REQUIRED: ${{ needs.publisher.outputs.mirror-required }}
-          MIRROR_STATUS: ${{ needs.publisher.outputs.mirror-status }}
         run: bun .helper-release/control/control.js gate

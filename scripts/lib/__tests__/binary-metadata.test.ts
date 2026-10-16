@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { createHelperDistributionDependencies } from "../../../shared/helper-distribution";
 import {
 	type BinaryMetadata,
 	computeBinaryMetadataFromBuffer,
@@ -30,6 +31,36 @@ describe("computeBinaryMetadataFromBuffer", () => {
 		expect(meta.size).toBe(buf.length);
 		expect(meta.sha256).toBe(createHash("sha256").update(buf).digest("hex"));
 		expect(meta.sha512).toBe(createHash("sha512").update(buf).digest("base64"));
+	});
+
+	test("application upgrades retain the independently pinned component identity", () => {
+		const helperDistribution = createHelperDistributionDependencies();
+		for (const version of ["0.9.2", "0.9.3", "1.0.0"]) {
+			const meta = computeBinaryMetadataFromBuffer(
+				`narrafork-${version}-linux-x64`,
+				Buffer.from(`application ${version}`),
+				{ ...INPUT, version, helperDistribution },
+			);
+			expect(meta.version).toBe(version);
+			expect(JSON.parse(formatMetadataJson(meta)).helperDistribution).toEqual(helperDistribution);
+			expect(meta.helperDistribution?.executor.version).toBe("0.9.1");
+			expect(meta.helperDistribution?.executor.tag).toBe("executor-v0.9.1");
+		}
+	});
+
+	test("legacy sidecars stay undeclared and malformed declarations cannot become legacy", () => {
+		const legacy = computeBinaryMetadataFromBuffer("legacy", Buffer.from("old"), INPUT);
+		expect(Object.hasOwn(legacy, "helperDistribution")).toBe(false);
+		const declared = createHelperDistributionDependencies();
+		expect(() =>
+			computeBinaryMetadataFromBuffer("invalid", Buffer.from("bad"), {
+				...INPUT,
+				helperDistribution: {
+					...declared,
+					executor: { ...declared.executor, tag: "executor-latest" },
+				},
+			}),
+		).toThrow();
 	});
 
 	test("sha256 is lowercase 64-char hex", () => {

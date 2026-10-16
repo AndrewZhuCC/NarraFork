@@ -71,6 +71,9 @@ const { activateSqliteRuntimePublication } = await import("../agent-runtime/publ
 activateSqliteRuntimePublication(db);
 const {
 	acceptUserMessage,
+	acquireNarratorRevertAdmission,
+	startBackgroundCompletionContinuationIfPossible,
+	startParentInboundContinuationIfPossible,
 	closeNarrator,
 	clearBufferedMessageSoftStopIfIdle,
 	ensureNarrator,
@@ -82,6 +85,9 @@ const { enqueueBufferedMessage, removeBufferedMessage, updateBufferedMessageMode
 	"../narrator-buffer"
 );
 const { narratorService } = await import("../narrator-service");
+const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+const { compactLocks, pendingPermissions } = await import("../narrator-session-state");
+const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 
 const now = new Date().toISOString();
@@ -757,6 +763,264 @@ test.each([
 	expect(rows.every((row) => row.state === "materialized")).toBe(true);
 	closeNarrator(narratorId);
 });
+function enqueueDelegatedReport(narratorId: string, kind: "agent" | "bash" | "send") {
+	const text = `delegated ${kind} research result`;
+	// Seed an already accepted delivery; producer receipt admission is covered by inbox tests.
+	db.insert(narrators)
+		.values({
+			id: "research-child",
+			type: "subagent",
+			variant: "subagent:plan",
+			parentNarratorId: narratorId,
+			createdAt: now,
+			updatedAt: now,
+		})
+		.onConflictDoNothing()
+		.run();
+	const store = createMailboxStore(db);
+	const resultMessageId = `${narratorId}-result`;
+	if (kind === "agent")
+		db.insert(narratorMessages)
+			.values({
+				id: resultMessageId,
+				narratorId: "research-child",
+				role: "assistant",
+				contentJson: [{ type: "text", text }],
+				contentText: text,
+				createdAt: now,
+			})
+			.run();
+	const delivery = createAgentMessageDelivery(
+		narratorId,
+		{ id: "research-child", label: "research-child", type: "plan", isParent: false },
+		"research-send",
+		text,
+	);
+	const result = store.enqueue({
+		narratorId,
+		...(kind === "send"
+			? {
+					kind: "agent_message" as const,
+					recipientMessageId: delivery.recipientMessageId,
+					sourceNarratorId: "research-child",
+					sourceToolCallId: "research-send",
+					sourceAttempt: 1,
+				}
+			: { kind: "task_notice" as const, noticeKind: kind }),
+		sourceKey: `delegated-${kind}`,
+		text,
+		projectedByteSize: Buffer.byteLength(text),
+		metadata:
+			kind === "send"
+				? { delivery, channel: "parent" }
+				: {
+						producerKind: kind,
+						taskId: "research-child",
+						logicalRunId: "research-run",
+						eventKind: "completed",
+						...(kind === "agent" ? { resultRef: `message:${resultMessageId}` } : {}),
+					},
+	});
+	if (!("delivery" in result)) throw new Error("failed to enqueue delegated report");
+}
+
+for (const plan of [false, true]) {
+	for (const kind of ["agent", "bash", "send"] as const) {
+		test(`delegated ${kind} report wakes idle parent without changing plan mode (${plan})`, async () => {
+			const narratorId = `mailbox-report-${kind}-${plan}`;
+			seedNarrator(narratorId);
+			const traits = plan ? ["standalone", "plan"] : ["standalone"];
+			db.update(narrators).set({ traits }).where(eq(narrators.id, narratorId)).run();
+			enqueueDelegatedReport(narratorId, kind);
+			try {
+				expect(await wakeInboxIfEligible(narratorId)).toBe(true);
+				await waitForIdle(narratorId);
+				expect(providerCalls).toHaveLength(1);
+				const row = db.select().from(narrators).where(eq(narrators.id, narratorId)).get();
+				expect(row?.traits).toEqual(traits);
+				expect(row?.permissionMode).toBe("bypassPermissions");
+				const receipt = db
+					.select()
+					.from(narratorBufferedMessages)
+					.where(eq(narratorBufferedMessages.narratorId, narratorId))
+					.get();
+				expect(receipt?.state).toBe("materialized");
+				const message = db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.id, receipt?.recipientMessageId ?? ""))
+					.get();
+				expect(message?.contentText).toContain(`delegated ${kind} research result`);
+				expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+			} finally {
+				closeNarrator(narratorId);
+			}
+		});
+	}
+}
+
+test("notification entries share admission and start only one plan-mode loop", async () => {
+	const narratorId = "mailbox-report-concurrent-plan";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	enqueueDelegatedReport(narratorId, "agent");
+	try {
+		const results = await Promise.all([
+			startBackgroundCompletionContinuationIfPossible(narratorId),
+			startParentInboundContinuationIfPossible(narratorId),
+		]);
+		expect(results.filter((result) => result.started)).toHaveLength(1);
+		await waitForIdle(narratorId);
+		expect(providerCalls).toHaveLength(1);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test("plan-mode parent wakes after a report arrives during idle finalization", async () => {
+	const narratorId = "mailbox-report-finalization-plan";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	const original = narratorService.compareAndSetStatus.bind(narratorService);
+	let queued = false;
+	const update = spyOn(narratorService, "compareAndSetStatus").mockImplementation(
+		async (...args) => {
+			const result = await original(...args);
+			if (args[0] === narratorId && args[2] === "idle" && providerCalls.length === 1 && !queued) {
+				queued = true;
+				enqueueDelegatedReport(narratorId, "agent");
+				// The old owner still holds execution; release must recheck the durable queue.
+				expect(getExecutionOwner(narratorId)).toBeDefined();
+				expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+			}
+			return result;
+		},
+	);
+	try {
+		await acceptUserMessage(narratorId, "delegate research then stop");
+		await waitForIdle(narratorId, 2);
+		expect(queued).toBe(true);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.get()?.state,
+		).toBe("materialized");
+	} finally {
+		update.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
+
+test("plan parent without queued work does not start a notification turn", async () => {
+	const narratorId = "mailbox-report-empty-plan";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	try {
+		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		expect(await startBackgroundCompletionContinuationIfPossible(narratorId)).toEqual({
+			started: false,
+		});
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test.each([
+	"owner",
+	"approval",
+	"compact",
+	"revert",
+	"working",
+	"waiting",
+	"archived",
+	"user_interrupt",
+	"error",
+] as const)("plan-mode notification respects %s barrier and leaves report queued", async (barrier) => {
+	const narratorId = `mailbox-report-barrier-${barrier}`;
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	enqueueDelegatedReport(narratorId, "agent");
+	let release: (() => void) | undefined;
+	if (barrier === "owner") {
+		const owner = tryClaimExecution(narratorId, "primary");
+		if (!owner) throw new Error("failed to claim owner");
+		release = () => {
+			owner.release();
+		};
+	} else if (barrier === "approval") {
+		pendingPermissions.set(narratorId, {
+			narratorId,
+			toolName: "ExitPlanMode",
+			toolUseId: "exit-plan",
+			broadcastTargetId: narratorId,
+			cwd: process.cwd(),
+			locale: "en",
+			input: { mode: "inline", inline_plan: "pending plan" },
+			signal: new AbortController().signal,
+			resolve: () => {},
+			cleanup: () => {},
+		});
+		release = () => {
+			pendingPermissions.delete(narratorId);
+		};
+	} else if (barrier === "compact") {
+		compactLocks.set(narratorId, {
+			kind: "history",
+			promise: Promise.resolve({ kind: "history", compacted: false }),
+		});
+		release = () => {
+			compactLocks.delete(narratorId);
+		};
+	} else if (barrier === "revert") {
+		release = await acquireNarratorRevertAdmission(narratorId, {
+			signal: new AbortController().signal,
+			interrupt: false,
+		});
+	} else if (barrier === "user_interrupt" || barrier === "error") {
+		db.update(narrators).set({ lastStopReason: barrier }).where(eq(narrators.id, narratorId)).run();
+	} else {
+		db.update(narrators).set({ status: barrier }).where(eq(narrators.id, narratorId)).run();
+	}
+	try {
+		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		// The compatibility entry must apply the same gates inside start admission.
+		if (barrier !== "revert") {
+			expect(await startBackgroundCompletionContinuationIfPossible(narratorId)).toEqual({
+				started: false,
+			});
+			expect(await startParentInboundContinuationIfPossible(narratorId)).toEqual({
+				started: false,
+			});
+		}
+		expect(providerCalls).toHaveLength(0);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.get()?.state,
+		).toBe("queued");
+	} finally {
+		release?.();
+		closeNarrator(narratorId);
+	}
+});
+
 test("gates the synchronous pending-work probe on PostgreSQL", () => {
 	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
 	try {

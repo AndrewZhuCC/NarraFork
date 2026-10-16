@@ -321,6 +321,7 @@ import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-l
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
+import { installVListTextDragGuard } from "./vlist-text-drag";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
 import {
@@ -675,6 +676,7 @@ export const PretextExactMessageList = memo(
 			const [layoutCompactUsageLines, setLayoutCompactUsageLines] = useState(isMobileViewport);
 			const committedCompactUsageLinesRef = useRef(isMobileViewport);
 			const [contentWidth, setContentWidth] = useState(0);
+			const [layoutGeometryNode, setLayoutGeometryNode] = useState<HTMLDivElement | null>(null);
 			const [widthCommitEpoch, setWidthCommitEpoch] = useState(0);
 			// Exact viewport height can change live; only the finished height reaches the full build.
 			const [layoutHeight, setLayoutHeight] = useState(0);
@@ -2088,6 +2090,7 @@ export const PretextExactMessageList = memo(
 				[dataSource?.fetchPage, dataSource?.locateMessage],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
 				keepEmptyReasoningLive: isActive,
 				labels: vlistLabels,
@@ -3952,15 +3955,32 @@ export const PretextExactMessageList = memo(
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
+				// Before the pointer tracker. A text-selection dragstart is cancelled here,
+				// and the tracker must observe that cancellation instead of latching a
+				// native-drag slot that dragend will never clear.
+				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
+				const canMeasure = () => {
+					return (
+						panelVisible &&
+						visibleViewportRef.current.isVisible(node) &&
+						Number.isFinite(node.clientWidth) &&
+						node.clientWidth > PAGE_PADDING * 2
+					);
+				};
 				const controller = createVListResizeController({
 					previewPolicy: "freeze",
-					readSize: () => ({
-						width: resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn),
-						boxWidth: node.offsetWidth,
-						height: node.clientHeight,
-						presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
-					}),
+					readSize: () => {
+						const ready = canMeasure();
+						return {
+							width: ready
+								? resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn)
+								: 0,
+							boxWidth: ready ? node.offsetWidth : 0,
+							height: ready ? node.clientHeight : 0,
+							presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
+						};
+					},
 					getCommittedWidth: () => committedContentWidthRef.current,
 					getCommittedPresentationKey: () =>
 						committedCompactUsageLinesRef.current ? "mobile" : "desktop",
@@ -3990,7 +4010,11 @@ export const PretextExactMessageList = memo(
 					morphScrollOrigin.invalidate();
 					// The stable chat temporarily parks off-layout while a dock slot mounts.
 					// Do not commit a one-pixel reading width or zero plan-detail cap.
-					if (!visibleViewportRef.current.isVisible(node)) return;
+					if (!canMeasure()) {
+						setLayoutGeometryNode(null);
+						return;
+					}
+					setLayoutGeometryNode(node);
 					// Replay hidden anchored commits before the resize coordinator reads
 					// the restored viewport, even when its width/height did not change.
 					visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
@@ -4007,11 +4031,19 @@ export const PretextExactMessageList = memo(
 				observer?.observe(node);
 				return () => {
 					observer?.disconnect();
+					stopTextDrag();
 					pointerTracker.dispose();
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop, morphScrollOrigin]);
+			}, [
+				viewportNode,
+				centeredColumn,
+				panelVisible,
+				readViewportView,
+				writeScrollTop,
+				morphScrollOrigin,
+			]);
 			// A capped column may keep the same width across a viewport breakpoint.
 			// Notify the controller explicitly rather than relying on ResizeObserver.
 			useLayoutEffect(() => {

@@ -2,8 +2,9 @@
  * Remote executor distribution contract, shared by the release script, the
  * server, and the settings UI.
  *
- * The executor is a statically linked Go single-file binary published to the
- * update server's public `tools/` channel alongside a manifest. Platform ids use
+ * The executor is a statically linked Go single-file binary with an independent
+ * release tag, also mirrored to the update server's public `tools/` channel.
+ * Each NarraFork build pins its component identity in a manifest. Platform ids use
  * Go's `GOOS-GOARCH` spelling so published filenames map 1:1 onto `make dist`
  * output, rather than being translated into the NarraFork release platform ids
  * (`linux-x64`, `win-x64`, …) which cover a different set of targets.
@@ -35,7 +36,7 @@ export interface ExecutorPlatformArtifact {
 }
 
 export interface ExecutorManifest {
-	/** Executor release version, tracking the NarraFork version it shipped with. */
+	/** Independent executor release version, explicitly pinned by each NarraFork build. */
 	version: string;
 	/** Device RPC protocol version this build speaks. */
 	protocolVersion: number;

@@ -29,7 +29,10 @@ import { resetExecutorManifestCache } from "../../lib/executor-binaries";
 import { redeemExecutorTicket, resetExecutorTickets } from "../../lib/executor-bootstrap-ticket";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
-import { APP_VERSION } from "../../lib/version";
+import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
+
+const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
+
 import { deviceRoutes } from "../devices";
 
 const OWNER = "user-owner";
@@ -40,7 +43,7 @@ const created: string[] = [];
 const createdProjects: string[] = [];
 const originalFetch = globalThis.fetch;
 const FIXTURE_REPOSITORY = "fixture/device-authorization";
-const MANIFEST_URL = `https://github.com/${FIXTURE_REPOSITORY}/releases/download/executor-v${APP_VERSION}/${EXECUTOR_MANIFEST_FILENAME}`;
+const MANIFEST_URL = `https://github.com/${FIXTURE_REPOSITORY}/releases/download/executor-v${EXECUTOR_VERSION}/${EXECUTOR_MANIFEST_FILENAME}`;
 const fetchCalls: string[] = [];
 
 /** A real project row: project-scoped devices are validated against it. */
@@ -214,17 +217,17 @@ describe("managing one's own device", () => {
 			return Response.json({
 				schemaVersion: 1,
 				repository: FIXTURE_REPOSITORY,
-				tag: `executor-v${APP_VERSION}`,
+				tag: `executor-v${EXECUTOR_VERSION}`,
 				commit: "b".repeat(40),
 				manifest: {
-					version: APP_VERSION,
+					version: EXECUTOR_VERSION,
 					protocolVersion: DEVICE_PROTOCOL_VERSION,
 					releasedAt: "2026-01-01T00:00:00Z",
 					platforms: Object.fromEntries(
 						EXECUTOR_PLATFORMS.map((platform) => [
 							platform,
 							{
-								filename: executorPublishedFilename(APP_VERSION, platform),
+								filename: executorPublishedFilename(EXECUTOR_VERSION, platform),
 								size: 256,
 								sha256: "a".repeat(64),
 							},
@@ -242,7 +245,7 @@ describe("managing one's own device", () => {
 		});
 		expect(res.status).toBe(200);
 		const result = await res.json();
-		expect(result.executorVersion).toBe(APP_VERSION);
+		expect(result.executorVersion).toBe(EXECUTOR_VERSION);
 		expect(result.platform).toBe("linux-amd64");
 		expect(result.script).toContain(`EXPECTED_SHA256='${"a".repeat(64)}'`);
 		const ticket = new URL(result.scriptUrl).searchParams.get("ticket");
@@ -251,11 +254,11 @@ describe("managing one's own device", () => {
 		expect(redemption.deviceId).toBe(id);
 		expect(redemption.artifact).toEqual({
 			source: { source: "github", repository: FIXTURE_REPOSITORY },
-			tag: `executor-v${APP_VERSION}`,
-			version: APP_VERSION,
+			tag: `executor-v${EXECUTOR_VERSION}`,
+			version: EXECUTOR_VERSION,
 			protocolVersion: DEVICE_PROTOCOL_VERSION,
 			platform: "linux-amd64",
-			filename: executorPublishedFilename(APP_VERSION, "linux-amd64"),
+			filename: executorPublishedFilename(EXECUTOR_VERSION, "linux-amd64"),
 			size: 256,
 			sha256: "a".repeat(64),
 		});

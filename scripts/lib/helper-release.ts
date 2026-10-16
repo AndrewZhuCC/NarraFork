@@ -299,7 +299,7 @@ function assertRemoteFiles(
 }
 async function verifyOne(
 	options: Omit<HelperReleaseOptions, "bundleDir" | "commit">,
-): Promise<void> {
+): Promise<{ commit: string; manifestSha256: string }> {
 	validateGitHubRepository(options.repository);
 	const tag = options.kind === "helpers" ? HELPER_RELEASE_TAG : `executor-v${options.version}`;
 	const commit = await resolveHelperTagCommit(options, tag);
@@ -331,6 +331,7 @@ async function verifyOne(
 	};
 	const description = describe(JSON.parse(raw), { ...options, commit });
 	assertRemoteFiles(release, [...description.files, manifestFile]);
+	return { commit, manifestSha256: manifestFile.sha256 };
 }
 /** Read-only readiness gate. No latest, index, draft creation, upload, or tag mutation. */
 export async function verifyPublishedHelperDependencies(options: {
@@ -340,7 +341,9 @@ export async function verifyPublishedHelperDependencies(options: {
 	protocolVersion: number;
 	run?: GhRunner;
 	signal?: AbortSignal;
-}): Promise<void> {
+}): Promise<{
+	executor: { commit: string; manifestSha256: string };
+}> {
 	validateGitHubRepository(options.repository);
 	if (
 		options.helpersTag !== HELPER_RELEASE_TAG ||
@@ -350,7 +353,12 @@ export async function verifyPublishedHelperDependencies(options: {
 	)
 		throw new Error("Invalid helper dependency declaration");
 	await verifyOne({ ...options, kind: "helpers", version: "1.0.0" });
-	await verifyOne({ ...options, kind: "executor", version: options.executorVersion });
+	const executor = await verifyOne({
+		...options,
+		kind: "executor",
+		version: options.executorVersion,
+	});
+	return { executor };
 }
 export async function validateHelperReleaseBundle(
 	options: HelperReleaseOptions,

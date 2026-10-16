@@ -235,6 +235,95 @@ process.send = (message) => {
 	}
 }
 
+/**
+ * Deterministic hold inside the PHYSICAL phase, for tests that must act while an object hash is
+ * in flight. Progress is throttled to one event per 250 ms in the worker AND again in the parent,
+ * so on a loaded runner a 2 MiB hash can finish, or its physical event be dropped, before a test's
+ * onProgress mutation ever runs. Instead, the worker's preload pauses right after it emits its
+ * first physical progress with readBytes > 0 (object handle open mid-hash) and records that in a
+ * marker file. `held` resolves from the marker, independent of the parent's progress throttle.
+ * Hashing, metadata, budgets and the summary are untouched; only the emission is gated, like the
+ * metadata barrier above. Once released, every later worker runs free.
+ */
+async function withPhysicalBarrier<T>(
+	body: (barrier: { held: Promise<number>; release: () => void }) => Promise<T>,
+): Promise<T> {
+	const preload = join(sandbox, "physical-barrier.ts");
+	const marker = join(sandbox, "physical-barrier.held");
+	await rm(marker, { force: true });
+	await writeFile(
+		preload,
+		`import { readFileSync, writeFileSync } from "node:fs";
+const send = process.send.bind(process);
+let paused = false;
+process.send = (message) => {
+	const data = typeof message === "string" ? JSON.parse(message) : undefined;
+	send(message);
+	if (!paused && data?.type === "progress" && data.value.phase === "physical" && data.value.readBytes > 0) {
+		paused = true;
+		writeFileSync(${JSON.stringify(marker)}, String(data.value.readBytes), { mode: 0o600 });
+		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test physical barrier");
+	}
+};
+`,
+		{ mode: 0o600 },
+	);
+	const realSpawn = Bun.spawn;
+	const pending: Bun.Subprocess<"pipe", "ignore", "ignore">[] = [];
+	let open = false;
+	const flush = () => {
+		for (const worker of pending.splice(0)) {
+			try {
+				worker.stdin.write("release");
+				worker.stdin.end();
+			} catch {
+				/* already exited */
+			}
+		}
+	};
+	const spawnWithBarrier = ((command: string[], config?: Parameters<typeof Bun.spawn>[1]) => {
+		if (!command[1]?.endsWith("/file-change-physical-audit-worker.ts"))
+			throw new Error("Physical barrier must only wrap its own audit worker");
+		const worker = realSpawn<"pipe", "ignore", "ignore">(
+			[command[0], "--preload", preload, ...command.slice(1)],
+			{
+				...config,
+				stdio: ["pipe", "ignore", "ignore"],
+				stdin: "pipe",
+				stdout: "ignore",
+				stderr: "ignore",
+			},
+		);
+		pending.push(worker);
+		if (open) flush();
+		return worker;
+	}) as typeof Bun.spawn;
+	const spawn = spyOn(Bun, "spawn").mockImplementation(spawnWithBarrier);
+	const release = () => {
+		open = true;
+		flush();
+	};
+	let stopPolling = false;
+	const held = (async () => {
+		while (!stopPolling) {
+			try {
+				return Number(await readFile(marker, "utf8"));
+			} catch {
+				await Bun.sleep(5);
+			}
+		}
+		throw new Error("Physical barrier was never reached");
+	})();
+	held.catch(() => {});
+	try {
+		return await body({ held, release });
+	} finally {
+		stopPolling = true;
+		release();
+		spawn.mockRestore();
+	}
+}
+
 function pathFor(ref: FileChangeBlobRef): string {
 	return join(blobRoot, "sha256", ref.digest.slice(0, 2), ref.digest);
 }
@@ -461,10 +550,19 @@ describe("physical audit: fail-closed paths and metadata", () => {
 			renameSync(target, moved);
 			await symlink(where === "object" ? secret : moved, target);
 		}
+		// Re-pin the root identity after the swap. Replacing a child (shard, .tmp, the object)
+		// changes the root's ctime, so a stale identity is rejected as root_identity_mismatch
+		// before the replaced entry is ever reached. On a coarse/stale timestamp the test then
+		// passed only by that accident; with a fresh pin it proves the symlink itself refused.
+		if (where !== "root" && where !== "ancestor")
+			request = { ...request, rootIdentity: await identity(blobRoot) };
 		const summary = await auditFileChangePhysical(request);
 		expect(summary.full).toBe(false);
 		expect(summary.metrics.readBytes).toBe(0);
-		expect(codes(summary).some((code) => /unsafe|identity/.test(code))).toBe(true);
+		// A symlinked .tmp is never followed; lstat sees a link, not a 0700 directory.
+		expect(codes(summary).some((code) => /unsafe|identity|non_private_mode/.test(code))).toBe(true);
+		expect(codes(summary)).not.toContain("root_identity_mismatch");
+		expect(JSON.stringify(summary)).not.toContain("outside-raw-secret");
 		expect(JSON.stringify(summary)).not.toContain("outside-raw-secret");
 		expect(await readFile(secret)).toEqual(Buffer.from("outside-raw-secret"));
 	});
@@ -624,31 +722,31 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		const controller = new AbortController();
 		const events: { phase: string; at: number }[] = [];
 		const request = await options({ budget: { chunkBytes: 256 } });
-		let startedResolve: () => void = () => {};
-		const started = new Promise<void>((resolve) => {
-			startedResolve = resolve;
-		});
-		const running = auditFileChangePhysical({
-			...request,
-			signal: controller.signal,
-			onProgress(progress) {
-				events.push({ phase: progress.phase, at: performance.now() });
-				if (progress.phase === "physical") {
-					startedResolve();
-					controller.abort();
-				}
-			},
-		});
-		await started;
 		let nextStarted = false;
-		const queued = auditFileChangePhysical({
-			...request,
-			budget: { readBytes: 0 },
-			onProgress() {
-				nextStarted = true;
-			},
+		let queued: Promise<FileChangePhysicalAuditSummary> | undefined;
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical({
+				...request,
+				signal: controller.signal,
+				onProgress(progress) {
+					events.push({ phase: progress.phase, at: performance.now() });
+				},
+			});
+			// The worker is held mid-hash: cancel it there, and admit the queued job while the
+			// first one still owns the scope; only then may the cancelled worker continue.
+			expect(await held).toBeGreaterThan(0);
+			controller.abort();
+			queued = auditFileChangePhysical({
+				...request,
+				budget: { readBytes: 0 },
+				onProgress() {
+					nextStarted = true;
+				},
+			});
+			release();
+			return running;
 		});
-		const summary = await running;
+		if (!queued) throw new Error("fixture");
 		expect(codes(summary)).toContain("cancelled");
 		expect(summary.full).toBe(false);
 		expect(nextStarted).toBe(false);
@@ -690,20 +788,22 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		let changed = false;
 		let mutationObservedAt: number | undefined;
 		let generationBeforeMutation: number | undefined;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 128 },
-				onProgress(progress) {
-					if (changed || progress.phase !== "physical" || progress.readBytes === 0) return;
-					changed = true;
-					mutationObservedAt = progress.readBytes;
-					const currentBudget = catalog.getBudget();
-					if (!currentBudget) throw new Error("Observed hash progress has no catalog budget");
-					generationBeforeMutation = currentBudget.generation;
-					catalog.beginReconciliation({ expectedGeneration: generation });
-				},
-			}),
-		);
+		const request = await options({ budget: { chunkBytes: 128 } });
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical(request);
+			// Mutate exactly while the worker is held mid-hash, after observed physical reads.
+			mutationObservedAt = await held;
+			changed = true;
+			try {
+				const currentBudget = catalog.getBudget();
+				if (!currentBudget) throw new Error("Observed hash progress has no catalog budget");
+				generationBeforeMutation = currentBudget.generation;
+				catalog.beginReconciliation({ expectedGeneration: generation });
+			} finally {
+				release();
+			}
+			return running;
+		});
 		expect(changed).toBe(true);
 		expect(mutationObservedAt).toBeGreaterThan(0);
 		expect(generationBeforeMutation).toBe(1);
@@ -718,16 +818,18 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("object ctime/mtime drift during hashing never counts it as a verified object", async () => {
 		const ref = await put(Buffer.alloc(2 * 1024 * 1024, 31));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 128 },
-				onProgress(progress) {
-					if (changed || progress.phase !== "physical") return;
-					changed = true;
-					utimesSync(pathFor(ref), new Date(), new Date(Date.now() + 5000));
-				},
-			}),
-		);
+		const request = await options({ budget: { chunkBytes: 128 } });
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical(request);
+			expect(await held).toBeGreaterThan(0);
+			changed = true;
+			try {
+				utimesSync(pathFor(ref), new Date(), new Date(Date.now() + 5000));
+			} finally {
+				release();
+			}
+			return running;
+		});
 		expect(changed).toBe(true);
 		expect(summary.full).toBe(false);
 		expect(summary.metrics.verifiedObjects).toBe(0);
@@ -835,16 +937,18 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("mode changes after opening cannot be certified by a successful content hash", async () => {
 		const ref = await put(Buffer.alloc(2 * 1024 * 1024, 73));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 128 },
-				onProgress(progress) {
-					if (changed || progress.phase !== "physical") return;
-					changed = true;
-					chmodSync(pathFor(ref), 0o644);
-				},
-			}),
-		);
+		const request = await options({ budget: { chunkBytes: 128 } });
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical(request);
+			expect(await held).toBeGreaterThan(0);
+			changed = true;
+			try {
+				chmodSync(pathFor(ref), 0o644);
+			} finally {
+				release();
+			}
+			return running;
+		});
 		expect(changed).toBe(true);
 		expect(summary.full).toBe(false);
 		expect(summary.metrics.verifiedObjects).toBe(0);

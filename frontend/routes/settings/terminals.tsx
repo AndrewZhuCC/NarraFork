@@ -1,20 +1,24 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Alert,
 	Badge,
 	Box,
 	Button,
+	Card,
 	Checkbox,
 	Collapse,
 	Group,
 	Loader,
 	Paper,
+	ScrollArea,
 	Stack,
 	Table,
 	Text,
 	Title,
 	Tooltip,
 } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconPlugConnected,
 	IconPlugConnectedX,
@@ -109,6 +113,7 @@ function SettingsTerminalsPage() {
 		terminalCapability.processTree?.supported === false;
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 	const [openTerminalId, setOpenTerminalId] = useState<string | null>(null);
 	const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -205,7 +210,7 @@ function SettingsTerminalsPage() {
 
 	return (
 		<Stack>
-			<Group justify="space-between">
+			<Group justify="space-between" wrap="wrap" gap="xs">
 				<Title order={3}>{t("adminTerminalsTitle")}</Title>
 				<Tooltip label={terminalSupported ? t("refresh") : terminalUnsupportedReason}>
 					<ActionIcon variant="subtle" disabled={!terminalSupported} onClick={() => refetch()}>
@@ -245,11 +250,13 @@ function SettingsTerminalsPage() {
 							px="sm"
 							py={4}
 							justify="space-between"
+							wrap="nowrap"
+							gap="xs"
 							style={{ backgroundColor: "var(--mantine-color-dark-7)" }}
 						>
-							<Group gap="xs">
-								<IconTerminal2 size={14} />
-								<Text size="xs" ff="monospace">
+							<Group gap="xs" wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+								<IconTerminal2 size={14} style={{ flexShrink: 0 }} />
+								<Text size="xs" ff="monospace" lineClamp={1} title={openTerminalId}>
 									{openTerminalId}
 								</Text>
 							</Group>
@@ -273,59 +280,86 @@ function SettingsTerminalsPage() {
 						<Title order={4} c="orange">
 							{t("orphanSockets")} ({orphanSockets.length})
 						</Title>
-						<Table>
-							<Table.Thead>
-								<Table.Tr>
-									<Table.Th>{t("terminalId")}</Table.Th>
-									<Table.Th>{t("socketPath")}</Table.Th>
-									<Table.Th>{t("actions")}</Table.Th>
-								</Table.Tr>
-							</Table.Thead>
-							<Table.Tbody>
+						{isMobile ? (
+							<Stack gap="xs">
 								{orphanSockets.map((s: { terminalId: string; socketPath: string }) => (
-									<Table.Tr key={s.terminalId}>
-										<Table.Td>
-											<Text size="xs" ff="monospace">
-												{s.terminalId}
-											</Text>
-										</Table.Td>
-										<Table.Td>
-											<Text size="xs" ff="monospace" lineClamp={1}>
-												{s.socketPath}
-											</Text>
-										</Table.Td>
-										<Table.Td>
-											<Group gap="xs">
-												<Tooltip label={t("reattachOrphan")}>
-													<ActionIcon
-														color="green"
-														variant="subtle"
-														onClick={() => reattachOrphan.mutate(s.terminalId)}
-														loading={reattachOrphan.isPending}
-													>
-														<IconPlugConnected size={16} />
-													</ActionIcon>
-												</Tooltip>
-												<Tooltip label={t("killOrphan")}>
-													<ActionIcon
-														color="red"
-														variant="subtle"
-														onClick={async () => {
+									<Card key={s.terminalId} withBorder radius="sm" padding="xs">
+										<Stack gap="xs">
+											<Stack gap={2} style={{ minWidth: 0 }}>
+												<Text size="xs" c="dimmed">
+													{t("terminalId")}
+												</Text>
+												<Text size="sm" ff="monospace" lineClamp={1} title={s.terminalId}>
+													{s.terminalId}
+												</Text>
+												<Text size="xs" c="dimmed" mt={4}>
+													{t("socketPath")}
+												</Text>
+												<Text size="xs" ff="monospace" style={{ wordBreak: "break-all" }}>
+													{s.socketPath}
+												</Text>
+											</Stack>
+											<Group justify="flex-end">
+												<OrphanSocketActions
+													terminalId={s.terminalId}
+													t={t}
+													onReattach={(id) => reattachOrphan.mutate(id)}
+													reattachPending={reattachOrphan.isPending}
+													onKill={async (id) => {
+														if (await confirm({ message: t("confirmKillOrphan") })) {
+															killOrphan.mutate(id);
+														}
+													}}
+													killPending={killOrphan.isPending}
+												/>
+											</Group>
+										</Stack>
+									</Card>
+								))}
+							</Stack>
+						) : (
+							<ScrollArea type="auto" offsetScrollbars>
+								<Table miw={640}>
+									<Table.Thead>
+										<Table.Tr>
+											<Table.Th>{t("terminalId")}</Table.Th>
+											<Table.Th>{t("socketPath")}</Table.Th>
+											<Table.Th>{t("actions")}</Table.Th>
+										</Table.Tr>
+									</Table.Thead>
+									<Table.Tbody>
+										{orphanSockets.map((s: { terminalId: string; socketPath: string }) => (
+											<Table.Tr key={s.terminalId}>
+												<Table.Td>
+													<Text size="xs" ff="monospace" lineClamp={1} title={s.terminalId}>
+														{s.terminalId}
+													</Text>
+												</Table.Td>
+												<Table.Td>
+													<Text size="xs" ff="monospace" lineClamp={1} title={s.socketPath}>
+														{s.socketPath}
+													</Text>
+												</Table.Td>
+												<Table.Td>
+													<OrphanSocketActions
+														terminalId={s.terminalId}
+														t={t}
+														onReattach={(id) => reattachOrphan.mutate(id)}
+														reattachPending={reattachOrphan.isPending}
+														onKill={async (id) => {
 															if (await confirm({ message: t("confirmKillOrphan") })) {
-																killOrphan.mutate(s.terminalId);
+																killOrphan.mutate(id);
 															}
 														}}
-														loading={killOrphan.isPending}
-													>
-														<IconTrash size={16} />
-													</ActionIcon>
-												</Tooltip>
-											</Group>
-										</Table.Td>
-									</Table.Tr>
-								))}
-							</Table.Tbody>
-						</Table>
+														killPending={killOrphan.isPending}
+													/>
+												</Table.Td>
+											</Table.Tr>
+										))}
+									</Table.Tbody>
+								</Table>
+							</ScrollArea>
+						)}
 					</Stack>
 				</Paper>
 			)}
@@ -333,7 +367,7 @@ function SettingsTerminalsPage() {
 			{/* Running terminals */}
 			<Paper withBorder p="md">
 				<Stack>
-					<Group justify="space-between">
+					<Group justify="space-between" wrap="wrap" gap="xs">
 						<Title order={4}>
 							{t("running")} ({runningTerminals.length})
 						</Title>
@@ -402,6 +436,130 @@ function SettingsTerminalsPage() {
 	);
 }
 
+function TerminalStatusBadges({
+	term,
+	t,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	term: any;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+	return (
+		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+			<Badge color={term.status === "running" ? "green" : "gray"} size="sm">
+				{t(term.status)}
+			</Badge>
+			{term.status === "running" && (
+				<Badge color={term.attached ? "teal" : "yellow"} size="sm" variant="light">
+					{term.attached ? t("attached") : t("detached")}
+				</Badge>
+			)}
+		</Group>
+	);
+}
+
+function OrphanSocketActions({
+	terminalId,
+	t,
+	onReattach,
+	reattachPending,
+	onKill,
+	killPending,
+}: {
+	terminalId: string;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+	onReattach: (terminalId: string) => void;
+	reattachPending?: boolean;
+	onKill: (terminalId: string) => void | Promise<void>;
+	killPending?: boolean;
+}) {
+	const reattachLabel = t("reattachOrphan");
+	const killLabel = t("killOrphan");
+	return (
+		<Group gap="xs" wrap="nowrap">
+			<Tooltip label={reattachLabel} events={{ hover: true, focus: true, touch: true }}>
+				<ActionIcon
+					color="green"
+					variant="subtle"
+					aria-label={reattachLabel}
+					onClick={() => onReattach(terminalId)}
+					loading={reattachPending}
+				>
+					<IconPlugConnected size={16} />
+				</ActionIcon>
+			</Tooltip>
+			<Tooltip label={killLabel} events={{ hover: true, focus: true, touch: true }}>
+				<ActionIcon
+					color="red"
+					variant="subtle"
+					aria-label={killLabel}
+					onClick={() => onKill(terminalId)}
+					loading={killPending}
+				>
+					<IconTrash size={16} />
+				</ActionIcon>
+			</Tooltip>
+		</Group>
+	);
+}
+
+function TerminalRowActions({
+	term,
+	t,
+	openTerminalId,
+	onConnect,
+	reattachPending,
+	onKill,
+	killPending,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	term: any;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+	openTerminalId?: string | null;
+	onConnect?: (id: string, attached: boolean) => void;
+	reattachPending?: boolean;
+	onKill?: (id: string) => void | Promise<void>;
+	killPending?: boolean;
+}) {
+	if (!onConnect && !onKill) return null;
+	const connectLabel = term.attached
+		? openTerminalId === term.id
+			? t("closePanel")
+			: t("attach")
+		: t("reattach");
+	const killLabel = t("killTerminal");
+	return (
+		<Group gap="xs" wrap="nowrap">
+			{onConnect && (
+				<Tooltip label={connectLabel} events={{ hover: true, focus: true, touch: true }}>
+					<ActionIcon
+						color={term.attached ? "teal" : "yellow"}
+						variant={openTerminalId === term.id ? "filled" : "subtle"}
+						aria-label={connectLabel}
+						onClick={() => onConnect(term.id, !!term.attached)}
+						loading={reattachPending}
+					>
+						{term.attached ? <IconTerminal2 size={16} /> : <IconPlugConnectedX size={16} />}
+					</ActionIcon>
+				</Tooltip>
+			)}
+			{onKill && (
+				<Tooltip label={killLabel} events={{ hover: true, focus: true, touch: true }}>
+					<ActionIcon
+						color="red"
+						variant="subtle"
+						aria-label={killLabel}
+						onClick={() => onKill(term.id)}
+						loading={killPending}
+					>
+						<IconTrash size={16} />
+					</ActionIcon>
+				</Tooltip>
+			)}
+		</Group>
+	);
+}
+
 function TerminalTable({
 	terminals,
 	t,
@@ -430,126 +588,178 @@ function TerminalTable({
 	onKill?: (id: string) => void | Promise<void>;
 	killPending?: boolean;
 }) {
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const selectable = !!onToggleSelect;
-	return (
-		<Table>
-			<Table.Thead>
-				<Table.Tr>
-					{selectable && (
-						<Table.Th w={40}>
-							<Checkbox
-								size="xs"
-								aria-label={t("selectAll")}
-								checked={allSelected}
-								indeterminate={someSelected && !allSelected}
-								onChange={onToggleSelectAll}
-							/>
-						</Table.Th>
-					)}
-					<Table.Th>{t("terminalName")}</Table.Th>
-					<Table.Th>{t("terminalStatus")}</Table.Th>
-					<Table.Th>{t("terminalProcesses")}</Table.Th>
-					<Table.Th>{t("terminalCwd")}</Table.Th>
-					<Table.Th>{t("terminalCreated")}</Table.Th>
-					{(onConnect || onKill) && <Table.Th>{t("actions")}</Table.Th>}
-				</Table.Tr>
-			</Table.Thead>
-			<Table.Tbody>
+
+	if (isMobile) {
+		return (
+			<Stack gap="xs">
+				{selectable && (
+					<Checkbox
+						size="sm"
+						label={t("selectAll")}
+						checked={allSelected}
+						indeterminate={someSelected && !allSelected}
+						onChange={onToggleSelectAll}
+					/>
+				)}
 				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 				{terminals.map((term: any) => (
-					<Table.Tr
+					<Card
 						key={term.id}
+						withBorder
+						radius="sm"
+						padding="xs"
 						style={
 							openTerminalId === term.id
-								? { backgroundColor: "var(--mantine-color-dark-6)" }
+								? { borderColor: "var(--mantine-color-teal-5)" }
 								: undefined
 						}
 					>
+						<Stack gap="xs">
+							<Group justify="space-between" align="start" wrap="nowrap" gap="xs">
+								{selectable && (
+									<Checkbox
+										size="sm"
+										aria-label={term.name}
+										checked={selected?.has(term.id) ?? false}
+										onChange={() => onToggleSelect?.(term.id)}
+										mt={2}
+									/>
+								)}
+								<Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
+									<Text size="sm" fw={500} lineClamp={1}>
+										{term.name}
+									</Text>
+									<Text size="xs" c="dimmed" ff="monospace" lineClamp={1} title={term.id}>
+										{term.id}
+									</Text>
+								</Stack>
+								<TerminalStatusBadges term={term} t={t} />
+							</Group>
+
+							<Stack gap={2}>
+								<Text size="xs" c="dimmed">
+									{t("terminalCwd")}
+								</Text>
+								<Text size="xs" ff="monospace" style={{ wordBreak: "break-all" }}>
+									{term.cwd ?? "—"}
+								</Text>
+							</Stack>
+
+							{(term.processes?.length ?? 0) > 0 && (
+								<Stack gap={2}>
+									<Text size="xs" c="dimmed">
+										{t("terminalProcesses")}
+									</Text>
+									<ProcessList processes={term.processes} />
+								</Stack>
+							)}
+
+							<Group justify="space-between" align="center" wrap="nowrap" gap="xs">
+								<Text size="xs" c="dimmed" lineClamp={1} style={{ minWidth: 0, flex: 1 }}>
+									{formatLocaleDateTime(term.createdAt)}
+								</Text>
+								<TerminalRowActions
+									term={term}
+									t={t}
+									openTerminalId={openTerminalId}
+									onConnect={onConnect}
+									reattachPending={reattachPending}
+									onKill={onKill}
+									killPending={killPending}
+								/>
+							</Group>
+						</Stack>
+					</Card>
+				))}
+			</Stack>
+		);
+	}
+
+	return (
+		<ScrollArea type="auto" offsetScrollbars>
+			<Table miw={900}>
+				<Table.Thead>
+					<Table.Tr>
 						{selectable && (
-							<Table.Td>
+							<Table.Th w={40}>
 								<Checkbox
 									size="xs"
-									aria-label={term.name}
-									checked={selected?.has(term.id) ?? false}
-									onChange={() => onToggleSelect?.(term.id)}
+									aria-label={t("selectAll")}
+									checked={allSelected}
+									indeterminate={someSelected && !allSelected}
+									onChange={onToggleSelectAll}
 								/>
-							</Table.Td>
+							</Table.Th>
 						)}
-						<Table.Td>
-							<Text size="sm">{term.name}</Text>
-							<Text size="xs" c="dimmed" ff="monospace">
-								{term.id}
-							</Text>
-						</Table.Td>
-						<Table.Td>
-							<Group gap={4}>
-								<Badge color={term.status === "running" ? "green" : "gray"} size="sm">
-									{t(term.status)}
-								</Badge>
-								{term.status === "running" && (
-									<Badge color={term.attached ? "teal" : "yellow"} size="sm" variant="light">
-										{term.attached ? t("attached") : t("detached")}
-									</Badge>
-								)}
-							</Group>
-						</Table.Td>
-						<Table.Td>
-							<ProcessList processes={term.processes} />
-						</Table.Td>
-						<Table.Td>
-							<Text size="xs" ff="monospace" lineClamp={1} maw={200}>
-								{term.cwd ?? "—"}
-							</Text>
-						</Table.Td>
-						<Table.Td>
-							<Text size="xs">{formatLocaleDateTime(term.createdAt)}</Text>
-						</Table.Td>
-						{(onConnect || onKill) && (
-							<Table.Td>
-								<Group gap="xs">
-									{onConnect && (
-										<Tooltip
-											label={
-												term.attached
-													? openTerminalId === term.id
-														? t("closePanel")
-														: t("attach")
-													: t("reattach")
-											}
-										>
-											<ActionIcon
-												color={term.attached ? "teal" : "yellow"}
-												variant={openTerminalId === term.id ? "filled" : "subtle"}
-												onClick={() => onConnect(term.id, !!term.attached)}
-												loading={reattachPending}
-											>
-												{term.attached ? (
-													<IconTerminal2 size={16} />
-												) : (
-													<IconPlugConnectedX size={16} />
-												)}
-											</ActionIcon>
-										</Tooltip>
-									)}
-									{onKill && (
-										<Tooltip label={t("killTerminal")}>
-											<ActionIcon
-												color="red"
-												variant="subtle"
-												onClick={() => onKill(term.id)}
-												loading={killPending}
-											>
-												<IconTrash size={16} />
-											</ActionIcon>
-										</Tooltip>
-									)}
-								</Group>
-							</Table.Td>
-						)}
+						<Table.Th>{t("terminalName")}</Table.Th>
+						<Table.Th>{t("terminalStatus")}</Table.Th>
+						<Table.Th>{t("terminalProcesses")}</Table.Th>
+						<Table.Th>{t("terminalCwd")}</Table.Th>
+						<Table.Th>{t("terminalCreated")}</Table.Th>
+						{(onConnect || onKill) && <Table.Th>{t("actions")}</Table.Th>}
 					</Table.Tr>
-				))}
-			</Table.Tbody>
-		</Table>
+				</Table.Thead>
+				<Table.Tbody>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+					{terminals.map((term: any) => (
+						<Table.Tr
+							key={term.id}
+							style={
+								openTerminalId === term.id
+									? { backgroundColor: "var(--mantine-color-dark-6)" }
+									: undefined
+							}
+						>
+							{selectable && (
+								<Table.Td>
+									<Checkbox
+										size="xs"
+										aria-label={term.name}
+										checked={selected?.has(term.id) ?? false}
+										onChange={() => onToggleSelect?.(term.id)}
+									/>
+								</Table.Td>
+							)}
+							<Table.Td>
+								<Text size="sm">{term.name}</Text>
+								<Text size="xs" c="dimmed" ff="monospace" lineClamp={1} title={term.id}>
+									{term.id}
+								</Text>
+							</Table.Td>
+							<Table.Td>
+								<TerminalStatusBadges term={term} t={t} />
+							</Table.Td>
+							<Table.Td>
+								<ProcessList processes={term.processes} />
+							</Table.Td>
+							<Table.Td>
+								<Text size="xs" ff="monospace" lineClamp={1} maw={200}>
+									{term.cwd ?? "—"}
+								</Text>
+							</Table.Td>
+							<Table.Td>
+								<Text size="xs">{formatLocaleDateTime(term.createdAt)}</Text>
+							</Table.Td>
+							{(onConnect || onKill) && (
+								<Table.Td>
+									<TerminalRowActions
+										term={term}
+										t={t}
+										openTerminalId={openTerminalId}
+										onConnect={onConnect}
+										reattachPending={reattachPending}
+										onKill={onKill}
+										killPending={killPending}
+									/>
+								</Table.Td>
+							)}
+						</Table.Tr>
+					))}
+				</Table.Tbody>
+			</Table>
+		</ScrollArea>
 	);
 }
 
@@ -577,13 +787,16 @@ function ProcessList({
 					cpu: number;
 					elapsed: string;
 				}) => (
-					<Group key={p.pid} gap={6} wrap="nowrap">
+					<Group key={p.pid} gap={6} wrap="wrap">
 						<Badge
 							size="xs"
 							variant="dot"
 							color={p.state.startsWith("R") ? "green" : p.state.startsWith("S") ? "blue" : "gray"}
+							maw="100%"
 						>
-							{p.command}
+							<Text size="xs" span lineClamp={1} title={p.command}>
+								{p.command}
+							</Text>
 						</Badge>
 						<Text size="xs" c="dimmed" ff="monospace">
 							{formatRss(p.rss)}

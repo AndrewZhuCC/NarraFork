@@ -525,7 +525,9 @@ const citationIndexSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_I
 
 export const providerUsageSchema = z
 	.object({
+		// Full prompt footprint, including cache reads and writes.
 		promptTokens: z.number().int().nonnegative().optional(),
+		// Already-normalized ordinary input; plugins must exclude cache reads/writes.
 		inputTokens: z.number().int().nonnegative().optional(),
 		completionTokens: z.number().int().nonnegative().optional(),
 		reasoningTokens: z.number().int().nonnegative().optional(),

@@ -1,0 +1,22 @@
+.label {
+	display: inline-grid;
+	align-items: center;
+	justify-items: center;
+}
+
+.actual,
+.sizer {
+	grid-area: 1 / 1;
+	white-space: nowrap;
+}
+
+.sizer {
+	visibility: hidden;
+	pointer-events: none;
+	user-select: none;
+}
+
+/* Generated public labels contribute intrinsic width but not DOM textContent. */
+.sizer::before {
+	content: attr(data-label);
+}

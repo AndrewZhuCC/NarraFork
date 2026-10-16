@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type * as Fixture from "./workspace-resource.browser-fixture";
@@ -10,19 +10,20 @@ const cachedChromium =
 	"/home/fulcrum/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome";
 const executablePath = process.env.NF_TEST_CHROMIUM_PATH ?? cachedChromium;
 const browserAvailable = existsSync(executablePath);
-if (!browserAvailable)
-	console.warn(
-		`workspace-resource browser regression skipped: Chromium unavailable at ${executablePath}; set NF_TEST_CHROMIUM_PATH`,
-	);
-const browserTest = test.skipIf(!browserAvailable);
+// A missing browser is a failed prerequisite, never a green skipped regression.
+const browserTest = test;
 let browser: Browser | undefined;
 let server: ReturnType<typeof Bun.serve> | undefined;
 type FixtureWindow = Window & { fixture: typeof Fixture };
 type Snapshot = ReturnType<typeof Fixture.snapshot>;
 
 beforeAll(async () => {
-	if (!browserAvailable) return;
+	if (!browserAvailable)
+		throw new Error(`Chromium unavailable at ${executablePath}; set NF_TEST_CHROMIUM_PATH`);
 	mkdirSync("artifacts", { recursive: true });
+	console.info(
+		"workspace-resource scope: real Chromium + Dockview/provider/document build, mock transport; no production/backend performance or running-version-conflict claim",
+	);
 	const bundle = await Bun.build({
 		entrypoints: [new URL("./workspace-resource.browser-fixture.tsx", import.meta.url).pathname],
 		target: "browser",
@@ -91,6 +92,7 @@ async function withFixture(
 	width = 1200,
 	height = 800,
 	slots = 2,
+	messages = false,
 ) {
 	if (!browser || !server) throw new Error("Browser fixture not initialized");
 	const page = await browser.newPage();
@@ -105,7 +107,9 @@ async function withFixture(
 	});
 	try {
 		await page.setViewport({ width, height });
-		await page.goto(`${origin}/?slots=${slots}`, { waitUntil: "networkidle0" });
+		await page.goto(`${origin}/?slots=${slots}${messages ? "&messages=1" : ""}`, {
+			waitUntil: "networkidle0",
+		});
 		await page.waitForFunction(
 			() => (window as unknown as FixtureWindow).fixture?.snapshot().ready,
 		);
@@ -245,6 +249,234 @@ async function dragSelector(page: Page, selector: string, dx: number, dy: number
 	await page.mouse.up();
 	await settle(page);
 }
+
+type MessageSnapshot = ReturnType<typeof Fixture.messageSnapshot>;
+const messageState = (page: Page) =>
+	page.evaluate(() => (window as unknown as FixtureWindow).fixture.messageSnapshot());
+
+async function expectReadyDocuments(page: Page, panelIds: string[]) {
+	try {
+		await page.waitForFunction(
+			(ids) => {
+				const snapshot = (window as unknown as FixtureWindow).fixture.messageSnapshot();
+				return ids.every((id) =>
+					snapshot.documents.some(
+						(entry) =>
+							entry.panelId === id &&
+							entry.status === "ready" &&
+							entry.messageIds.length > 0 &&
+							entry.itemCount > 0,
+					),
+				);
+			},
+			{ timeout: 3_000 },
+			panelIds,
+		);
+	} catch (error) {
+		const actual = await messageState(page);
+		throw new Error(
+			`First-screen documents did not all become ready within 3000ms: ${JSON.stringify(actual)}; ${String(error)}`,
+		);
+	}
+	return messageState(page);
+}
+
+function expectBuiltDocument(snapshot: MessageSnapshot, panelId: string, narratorId: string) {
+	const entry = snapshot.documents.find((document) => document.panelId === panelId);
+	if (!entry) throw new Error(`Missing measured document ${panelId}`);
+	expect(entry.status).toBe("ready");
+	expect(entry.messageIds).toEqual([`${narratorId}-message-0`, `${narratorId}-message-1`]);
+	expect(entry.texts.every((text) => text.includes(narratorId))).toBe(true);
+	expect(entry.itemCount).toBeGreaterThan(0);
+	expect(entry.totalHeight).toBeGreaterThan(0);
+	expect(
+		entry.itemWidths.every(
+			(width) => typeof width === "number" && Number.isFinite(width) && width > 0,
+		),
+	).toBe(true);
+	expect(entry.width).toBeGreaterThan(0);
+	expect(entry.height).toBeGreaterThan(0);
+	expect(entry.firstReadyMs).not.toBeNull();
+	expect(entry.firstReadyMs ?? Infinity).toBeLessThan(3_000);
+	expect(entry.clearedAfterReady).toBe(0);
+	expect(entry.zeroSizeAdoptions).toBe(0);
+	expect(entry.error).toBeNull();
+}
+
+test("Production NarratorDockPanel wires the same Dockview visibility provider used in browser regressions", () => {
+	const source = readFileSync(new URL("./panels.tsx", import.meta.url), "utf8");
+	const adapter = source.match(
+		/function NarratorDockPanel\([\s\S]*?(?=\nfunction SubagentDockPanel)/,
+	)?.[0];
+	expect(adapter).toBeDefined();
+	expect(adapter).toMatch(
+		/<DockviewNarratorPanelVisibilityProvider\s+api=\{props\.api\}>[\s\S]*?<NarratorPanel\b[\s\S]*?<\/DockviewNarratorPanelVisibilityProvider>/,
+	);
+	expect(adapter).not.toContain("<NarratorPanelVisibilityProvider");
+});
+
+browserTest(
+	"Messages: three visible groups load real first-screen documents without focus; focus rotation retains them",
+	async () => {
+		await withFixture(
+			async (page) => {
+				// Do not click or focus anything before all three real documents succeed.
+				const before = await messageState(page);
+				expect(before.documents).toHaveLength(3);
+				expect(before.documents.filter((entry) => entry.apiVisible)).toHaveLength(3);
+				expect(before.documents.filter((entry) => entry.apiActive)).toHaveLength(1);
+				const loaded = await expectReadyDocuments(page, ["source-a", "source-b", "source-c"]);
+				console.info(
+					"mock-transport three-group first-screen observations:",
+					JSON.stringify(
+						loaded.documents.map(({ panelId, firstReadyMs, width, height }) => ({
+							panelId,
+							firstReadyMs,
+							width,
+							height,
+						})),
+					),
+				);
+				for (const [panelId, narratorId] of [
+					["source-a", "narrator-a"],
+					["source-b", "narrator-b"],
+					["source-c", "narrator-c"],
+				]) {
+					expectBuiltDocument(loaded, panelId, narratorId);
+					expect(loaded.requests.filter((request) => request.narratorId === narratorId)).toEqual([
+						{ narratorId, tail: true, aborted: false },
+					]);
+				}
+				for (const panelId of ["source-a", "source-b", "source-c", "source-a"]) {
+					// A real pointer click activates the group via Dockview's native listeners.
+					await page.click(`[data-message-document="${panelId}"] p`);
+					await settle(page);
+					const rotated = await messageState(page);
+					expect(
+						rotated.documents.filter((entry) => entry.apiActive).map((entry) => entry.panelId),
+					).toEqual([panelId]);
+					expect(rotated.documents.filter((entry) => entry.apiVisible)).toHaveLength(3);
+					for (const entry of rotated.documents)
+						expectBuiltDocument(rotated, entry.panelId, entry.narratorId);
+					expect(rotated.requests).toEqual(loaded.requests);
+				}
+			},
+			1440,
+			900,
+			3,
+			true,
+		);
+	},
+	20_000,
+);
+
+browserTest(
+	"Messages: hidden always-rendered tab cannot adopt zero-size document; reveal loads once and re-reveal retains it",
+	async () => {
+		await withFixture(
+			async (page) => {
+				await expectReadyDocuments(page, ["source-a", "source-b", "source-c"]);
+				await page.evaluate(() => {
+					(window as unknown as FixtureWindow).fixture.addMessageTab(
+						"hidden-tab",
+						"narrator-hidden",
+					);
+				});
+				await page.waitForFunction(() =>
+					(window as unknown as FixtureWindow).fixture
+						.messageSnapshot()
+						.documents.some((entry) => entry.panelId === "hidden-tab"),
+				);
+				await settle(page);
+				// Native always overlays use visibility:hidden and may retain nonzero geometry.
+				// Test native hidden admission first, then explicitly CSS-park the real DOM
+				// to cover zero geometry without stubbing clientWidth or ResizeObserver.
+				const nativeHidden = await messageState(page);
+				expect(
+					nativeHidden.documents.find((entry) => entry.panelId === "hidden-tab"),
+				).toMatchObject({
+					apiVisible: false,
+					providerVisible: false,
+					messageIds: [],
+					itemCount: 0,
+					firstReadyMs: null,
+				});
+				await page.evaluate(() => {
+					(window as unknown as FixtureWindow).fixture.parkMessageViewport("hidden-tab", true);
+				});
+				await settle(page);
+				const hidden = await messageState(page);
+				const parked = hidden.documents.find((entry) => entry.panelId === "hidden-tab");
+				expect(parked).toMatchObject({
+					apiVisible: false,
+					apiActive: false,
+					providerVisible: false,
+					width: 0,
+					height: 0,
+					messageIds: [],
+					itemCount: 0,
+					zeroSizeAdoptions: 0,
+					firstReadyMs: null,
+				});
+				expect(parked?.status).not.toBe("ready");
+				expect(
+					hidden.requests.filter((request) => request.narratorId === "narrator-hidden"),
+				).toEqual([]);
+				await page.evaluate(() => {
+					(window as unknown as FixtureWindow).fixture.parkMessageViewport("hidden-tab", false);
+					(window as unknown as FixtureWindow).fixture
+						.nativeDockviewApi()
+						.getPanel("hidden-tab")
+						?.api.setActive();
+				});
+				const shown = await expectReadyDocuments(page, ["hidden-tab"]);
+				expectBuiltDocument(shown, "hidden-tab", "narrator-hidden");
+				expect(
+					shown.requests.filter((request) => request.narratorId === "narrator-hidden"),
+				).toEqual([{ narratorId: "narrator-hidden", tail: true, aborted: false }]);
+				await page.evaluate(() => {
+					(window as unknown as FixtureWindow).fixture
+						.nativeDockviewApi()
+						.getPanel("source-a")
+						?.api.setActive();
+					(window as unknown as FixtureWindow).fixture.parkMessageViewport("hidden-tab", true);
+				});
+				await settle(page);
+				const rehidden = await messageState(page);
+				expect(rehidden.documents.find((entry) => entry.panelId === "hidden-tab")).toMatchObject({
+					apiVisible: false,
+					width: 0,
+					height: 0,
+					status: "ready",
+					messageIds: shown.documents.find((entry) => entry.panelId === "hidden-tab")?.messageIds,
+					clearedAfterReady: 0,
+					zeroSizeAdoptions: 0,
+				});
+				await page.evaluate(() => {
+					(window as unknown as FixtureWindow).fixture.parkMessageViewport("hidden-tab", false);
+					(window as unknown as FixtureWindow).fixture
+						.nativeDockviewApi()
+						.getPanel("hidden-tab")
+						?.api.setActive();
+				});
+				await settle(page);
+				const reshown = await expectReadyDocuments(page, ["hidden-tab"]);
+				expectBuiltDocument(reshown, "hidden-tab", "narrator-hidden");
+				expect(reshown.requests).toEqual(shown.requests);
+				const layout = await state(page);
+				expect(panelState(layout, "hidden-tab")).toMatchObject({ mounts: 1, cleanups: 0 });
+				console.info(
+					"mock-transport hidden-tab observation: native hidden admission idle; real CSS-parked DOM 0x0; reveal ready; one tail; zero adoptions/clears/remounts",
+				);
+			},
+			1440,
+			900,
+			3,
+			true,
+		);
+	},
+	20_000,
+);
 
 for (const kind of ["terminal", "browser", "subagent"] as const) {
 	browserTest(

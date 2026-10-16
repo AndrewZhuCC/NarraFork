@@ -66,6 +66,7 @@ export interface RecentTabsSnapshotMessage {
 export type NarratorServerMessage =
 	| { type: "composer_suggestion_changed"; narratorId: string }
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent
+	| import("@shared/workspace-events").WorkspaceChangedEvent
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
 	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */

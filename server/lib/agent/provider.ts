@@ -12,6 +12,8 @@ import type {
 	WebSearchAction,
 } from "@shared/agent-protocol/types";
 import type { ContextInputCharacters } from "@shared/context-usage";
+import type { ProviderReadiness } from "@shared/provider-readiness";
+import { getCodexManager } from "../codex-manager";
 import { catalogError } from "../errors";
 import {
 	FOLLOW_DEFAULT_MODEL,
@@ -34,6 +36,7 @@ import { GeminiProvider } from "./gemini-provider";
 import { GrokProvider } from "./grok-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import { type ProviderSource, ProviderSourceRegistry } from "./provider-source-registry";
 import type { ApiRequestDumpCollector } from "./request-dump";
 import { TokenDanceProvider } from "./tokendance-provider";
 
@@ -345,63 +348,148 @@ export function createGeminiProvider(
 		: new GeminiProvider(config);
 }
 
-function createProviderByName(provider: string): ProviderAdapter | null {
-	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
-		const legacy = [
-			...(settings.customApiProviders ?? []),
-			...(settings.openaiProviders ?? []),
-			...(settings.anthropicProviders ?? []),
-			...(settings.geminiProviders ?? []),
-			...(settings.nugProviders ?? []),
-		];
-		if (legacy.some((entry) => entry.prefix === "tokendance")) {
+const builtinProviderSources = new ProviderSourceRegistry();
+const externalProviderSources = new ProviderSourceRegistry();
+
+function hasTokenDancePrefixConflict(): boolean {
+	return [
+		...(settings.customApiProviders ?? []),
+		...(settings.openaiProviders ?? []),
+		...(settings.anthropicProviders ?? []),
+		...(settings.geminiProviders ?? []),
+		...(settings.nugProviders ?? []),
+	].some((entry) => entry.prefix === "tokendance");
+}
+
+builtinProviderSources.register("tokendance", {
+	resolve: (provider) => {
+		if (provider !== "tokendance" || !getTokenDanceRuntimeConfig()) return null;
+		if (hasTokenDancePrefixConflict()) {
 			throw new Error(
 				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
 			);
 		}
 		return new TokenDanceProvider();
-	}
-	// Keep the retired prefix reserved: old sessions must fail locally, never be
-	// claimed by a configured provider or plugin and sent to a billable upstream.
-	if (provider === "tutorial") {
-		throw catalogError("TUTORIAL_REMOVED");
-	}
+	},
+	listReadiness: () => {
+		const config = getTokenDanceRuntimeConfig();
+		return [
+			{
+				id: "builtin:tokendance",
+				prefix: "tokendance",
+				name: "TokenDance",
+				ready: !!config && !config.disabled,
+			},
+		];
+	},
+});
 
-	if (provider === "codex") {
-		return new CodexProvider({
-			useWebSocket: settings.codex?.useWebSocket ?? true,
-			useWebSearch: settings.codex?.useWebSearch ?? true,
-			useImageGeneration: settings.codex?.useImageGeneration ?? true,
-			useRemoteCompact: settings.codex?.useRemoteCompact ?? false,
-		});
-	}
+builtinProviderSources.register("codex", {
+	resolve: (provider) =>
+		provider === "codex"
+			? new CodexProvider({
+					useWebSocket: settings.codex?.useWebSocket ?? true,
+					useWebSearch: settings.codex?.useWebSearch ?? true,
+					useImageGeneration: settings.codex?.useImageGeneration ?? true,
+					useRemoteCompact: settings.codex?.useRemoteCompact ?? false,
+				})
+			: null,
+	listReadiness: () => [
+		{
+			id: "builtin:codex",
+			prefix: "codex",
+			name: "Codex",
+			ready: getCodexManager().hasAvailableCredentials,
+		},
+	],
+});
 
-	const anthropicConfig = getAnthropicProviderConfig(provider);
-	if (anthropicConfig) {
-		return new AnthropicProvider(anthropicConfig);
-	}
+/** API families expose the same instances used to construct their adapters. */
+function registerCredentialProviderSource<
+	T extends {
+		id: string;
+		prefix: string;
+		name: string;
+		apiKey?: string;
+		disabled?: boolean;
+	},
+>(
+	kind: string,
+	listConfigs: () => T[],
+	getConfig: (prefix: string) => T | undefined,
+	create: (config: T) => ProviderAdapter,
+	isComplete: (config: T) => boolean = (config) => !!config.apiKey?.trim(),
+): void {
+	builtinProviderSources.register(kind, {
+		resolve: (prefix) => {
+			const config = getConfig(prefix);
+			return config ? create(config) : null;
+		},
+		listReadiness: () =>
+			listConfigs().map((config) => ({
+				id: `api:${config.id}`,
+				prefix: config.prefix,
+				name: config.name,
+				ready: !config.disabled && isComplete(config),
+			})),
+	});
+}
 
-	const nugConfig = getNugProviderConfig(provider);
-	if (nugConfig) {
-		return new NugProvider(nugConfig);
-	}
+registerCredentialProviderSource(
+	"anthropic",
+	() => settings.anthropicProviders ?? [],
+	getAnthropicProviderConfig,
+	(config) => new AnthropicProvider(config),
+);
+registerCredentialProviderSource(
+	"nug",
+	() => settings.nugProviders ?? [],
+	getNugProviderConfig,
+	(config) => new NugProvider(config),
+	(config) => !!config.apiKey.trim() && !!config.baseUrl.trim(),
+);
+registerCredentialProviderSource(
+	"openai",
+	() => settings.openaiProviders ?? [],
+	getOpenaiProviderConfig,
+	(config) => new OpenAIProvider(config),
+);
+registerCredentialProviderSource(
+	"grok",
+	() => settings.grokProviders ?? [],
+	getGrokProviderConfig,
+	(config) => new GrokProvider(config),
+);
+registerCredentialProviderSource(
+	"gemini",
+	() => settings.geminiProviders ?? [],
+	getGeminiProviderConfig,
+	createGeminiProvider,
+);
 
-	const openaiConfig = getOpenaiProviderConfig(provider);
-	if (openaiConfig) {
-		return new OpenAIProvider(openaiConfig);
-	}
+/** Synchronous routing and asynchronous local readiness share the registered sources. */
+export async function listProviderReadiness(): Promise<ProviderReadiness[]> {
+	const disabled = new Set(settings.agent.disabledProviders ?? []);
+	disabled.add("tutorial");
+	if (getTokenDanceRuntimeConfig() && hasTokenDancePrefixConflict()) disabled.add("tokendance");
+	const builtin = await builtinProviderSources.listReadiness(disabled);
+	const external = await externalProviderSources.listReadiness(disabled);
+	const reserved = new Set([
+		"codex",
+		"tokendance",
+		"tutorial",
+		...builtin.map((entry) => entry.prefix),
+	]);
+	return [...builtin, ...external.filter((entry) => !reserved.has(entry.prefix))];
+}
 
-	const grokConfig = getGrokProviderConfig(provider);
-	if (grokConfig) {
-		return new GrokProvider(grokConfig);
-	}
-
-	const geminiConfig = getGeminiProviderConfig(provider);
-	if (geminiConfig) {
-		return createGeminiProvider(geminiConfig);
-	}
-
-	return null;
+function createProviderByName(
+	provider: string,
+	model = `${provider}:default`,
+): ProviderAdapter | null {
+	// The retired prefix must never route to a billable upstream or plugin.
+	if (provider === "tutorial") throw catalogError("TUTORIAL_REMOVED");
+	return builtinProviderSources.resolve(provider, model);
 }
 
 function isDefaultSentinel(model: string | undefined): boolean {
@@ -468,21 +556,11 @@ export interface ProviderResolution {
 	model: string;
 }
 
-export type ExternalProviderResolver = (
-	requestedProvider: string,
-	requestedModel: string,
-) => ProviderAdapter | null | undefined;
+export type ExternalProviderResolver = ProviderSource;
 
-let externalProviderResolver: ExternalProviderResolver | undefined;
-
-/** Register the optional executable-plugin provider bridge without changing builtin resolution. */
-export function registerExternalProviderResolver(
-	resolver: ExternalProviderResolver | undefined,
-): () => void {
-	externalProviderResolver = resolver;
-	return () => {
-		if (externalProviderResolver === resolver) externalProviderResolver = undefined;
-	};
+/** External routing cannot be registered without its readiness projection. */
+export function registerExternalProviderResolver(source: ProviderSource): () => void {
+	return externalProviderSources.register("external", source);
 }
 
 function buildResolution(
@@ -515,7 +593,7 @@ export function resolveProviderAndModel(
 	const requestedModel = resolveEffectiveModel(model, stickyProvider);
 	const requestedProvider = resolveProvider(requestedModel);
 
-	const explicit = createProviderByName(requestedProvider);
+	const explicit = createProviderByName(requestedProvider, requestedModel);
 	if (explicit) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
 	}
@@ -523,7 +601,7 @@ export function resolveProviderAndModel(
 	// Executable-plugin providers are resolved only after every builtin and
 	// compatible-API provider has declined, so a plugin can never shadow a
 	// builtin prefix (anthropic/openai/nug/gemini/codex).
-	const external = externalProviderResolver?.(requestedProvider, requestedModel);
+	const external = externalProviderSources.resolve(requestedProvider, requestedModel);
 	if (external) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, external);
 	}

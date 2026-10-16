@@ -19,6 +19,17 @@ import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspac
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
+	authorizeList: (principal, narratorId, _need, signal) =>
+		authorizeGitTargetForPrincipal(
+			principal,
+			{ narratorId },
+			"read",
+			signal,
+			undefined,
+			false,
+			false,
+			true,
+		),
 	authorize: async (principal, narratorId, need, signal) => {
 		if (activeDatabaseBackend !== "sqlite")
 			throw new AppError(
@@ -75,7 +86,11 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 		}),
 	principalKey: (principal) => principal.userId,
 	withRepositoryLock: withWorkspaceRepositoryLock,
-	journal: new FileWorktreeJournal(join(narraforkDir, "worktree-requests")),
+	// Keep the legacy namespace immutable for its one-time protection import.
+	journal: new FileWorktreeJournal(
+		join(narraforkDir, "worktree-requests-v2"),
+		join(narraforkDir, "worktree-requests"),
+	),
 	resources: narratorWorktreeResourceRegistry,
 	generateBranchName: async (principal, narratorId, requirement, signal) => {
 		const [{ summaryGenerate }, { db }, { narrators }] = await Promise.all([

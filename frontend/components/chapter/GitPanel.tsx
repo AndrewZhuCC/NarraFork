@@ -35,7 +35,10 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 	const repositories = workspace?.capabilities.read ? (workspace.repositories ?? []) : [];
 	const errorStatus = (workspaceQuery.error as { status?: number } | null)?.status;
 	const errorDetail =
-		errorStatus === 401 || errorStatus === 403 || workspace?.capabilities.read === false
+		workspaceQuery.accessDenied ||
+		errorStatus === 401 ||
+		errorStatus === 403 ||
+		workspace?.capabilities.read === false
 			? undefined
 			: workspaceQuery.error?.message || workspace?.reason;
 
@@ -54,7 +57,7 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 				<Alert color="gray" mx="xs" mt={4}>
 					{t("workspace.detectionDisabled")}
 				</Alert>
-			) : workspaceQuery.isPending ? (
+			) : workspaceQuery.isPending && !workspaceQuery.accessDenied ? (
 				<Group justify="center" style={{ flex: 1 }}>
 					<Loader size="sm" />
 				</Group>
@@ -96,7 +99,13 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 							<Alert
 								color="yellow"
 								title={t(
-									`workspace.${workspaceQuery.isError ? "error" : (workspace?.state ?? "error")}`,
+									`workspace.${
+										workspaceQuery.accessDenied
+											? "access_denied"
+											: workspaceQuery.isError
+												? "error"
+												: (workspace?.state ?? "error")
+									}`,
 								)}
 							>
 								{errorDetail}

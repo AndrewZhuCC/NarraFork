@@ -45,6 +45,7 @@ function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	delete workspace.chapterId;
 	delete workspace.projectId;
 	delete target.repositoryPath;
+	delete target.worktreeListOnly;
 	delete workspace.branch;
 }
 
@@ -210,7 +211,12 @@ async function authorizeResolvedGitCandidate(
 	policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>>,
 ): Promise<boolean> {
 	const { workspace, backend } = target;
-	if (workspace.state !== "ready" || !backend || !workspace.rootPath) return false;
+	if (
+		(workspace.state !== "ready" && !target.worktreeListOnly) ||
+		!backend ||
+		!workspace.rootPath
+	)
+		return false;
 	let canWrite = canWriteBase;
 	try {
 		for (const project of await relatedProjects(target, scan, principal)) {
@@ -232,7 +238,7 @@ async function authorizeResolvedGitCandidate(
 				if (
 					compiled.evaluatePath({ path: workspace.rootPath, operation: "read" }).decision !==
 						"allow" &&
-					!backend.paths.contains(context.target.cwd, workspace.rootPath)
+					!backend.paths.contains(workspace.cwd, workspace.rootPath)
 				)
 					throw denied();
 				canWrite &&=
@@ -242,7 +248,9 @@ async function authorizeResolvedGitCandidate(
 		}
 		if (need === "write" && !canWrite) throw denied();
 		scan.check();
-		workspace.capabilities = { read: true, write: canWrite };
+		workspace.capabilities = target.worktreeListOnly
+			? { read: false, write: false }
+			: { read: true, write: canWrite };
 		return true;
 	} catch (error) {
 		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
@@ -278,6 +286,7 @@ export async function authorizeGitTargetForPrincipal(
 	requestedWorkspaceKey?: string,
 	discoverNested = false,
 	cachedDiscovery: boolean | "cache-only" = false,
+	recoverWorktreeList = false,
 ): Promise<GitWorkspaceTarget> {
 	let canWriteBase = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
@@ -417,6 +426,7 @@ export async function authorizeGitTargetForPrincipal(
 			},
 			cachedDiscovery !== "cache-only" && (discoverNested || requestedWorkspaceKey !== undefined),
 			need === "read" ? cachedDiscovery : false,
+			recoverWorktreeList && need === "read",
 		);
 	} else {
 		await assertChapterProjectAccess(source.chapterId, principal, need);
@@ -434,7 +444,7 @@ export async function authorizeGitTargetForPrincipal(
 		: 5000;
 	const scan = discoveryAccessScan ?? new GitAccessScan(signal, authorizationBudgetMs);
 	try {
-		if (target.workspace.state === "ready") {
+		if (target.workspace.state === "ready" || target.worktreeListOnly) {
 			if (
 				!(await authorizeResolvedGitCandidate(
 					target,

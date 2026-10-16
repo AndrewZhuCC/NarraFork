@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
+	MAX_MODEL_CONTEXT_WINDOW,
+	MIN_MODEL_CONTEXT_WINDOW,
+	normalizeModelContextWindowOverrides,
+} from "@shared/model-context-window";
+import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -15,7 +20,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
-import { resolveProviderAndModel } from "../lib/agent/provider";
+import { listProviderReadiness, resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
@@ -25,6 +30,11 @@ import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
 } from "../lib/custom-api-quota-cache";
+import {
+	getDeepSeekBalanceGenerations,
+	refreshAllDeepSeekBalances,
+	syncDeepSeekBalanceCache,
+} from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import {
@@ -37,6 +47,11 @@ import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
+import {
+	getOpencodeUsageGenerations,
+	refreshAllOpencodeUsages,
+	syncOpencodeUsageCache,
+} from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
@@ -232,6 +247,9 @@ const nugProviderSchema = z.object({
 });
 
 const geminiProviderSchema = z.object({
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),
@@ -536,7 +554,13 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.record(z.string(), z.number().int().min(256).max(10_000_000)),
+				modelContextWindows: z.preprocess(
+					normalizeModelContextWindowOverrides,
+					z.record(
+						z.string(),
+						z.number().int().min(MIN_MODEL_CONTEXT_WINDOW).max(MAX_MODEL_CONTEXT_WINDOW),
+					),
+				),
 				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
@@ -897,7 +921,7 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
-function buildSettingsResponse(
+async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
 ) {
@@ -906,8 +930,10 @@ function buildSettingsResponse(
 	stripObsoleteSettingsKeys(safeSource);
 	return {
 		...safeSource,
+		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
+		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -966,6 +992,10 @@ function buildSettingsResponse(
 		grokModelsGrouped: getGrokModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
+		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
+		// them so an allowance fetched for a replaced account is never rendered
+		// under the new one.
+		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
@@ -1201,8 +1231,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 }
 
-settingsRoutes.get("/", (c) => {
-	return c.json(buildSettingsResponse(settings));
+settingsRoutes.get("/", async (c) => {
+	return c.json(await buildSettingsResponse(settings));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -1709,6 +1739,11 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		} else {
 			saveSettings(merged);
 		}
+		// Invalidate account/transport identities immediately after a successful save.
+		syncDeepSeekBalanceCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllDeepSeekBalances().catch(() => {});
+		}
 		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
 		// configs: new local-egress providers connect immediately, removed or
@@ -1733,6 +1768,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// settings response.
 		if (validated.customApiProviders) {
 			void refreshAllKimiUsages().catch(() => {});
+		}
+
+		// Invalidate account/transport identities immediately after a successful
+		// save, then warm the new ones so a freshly added (or replaced) OpenCode Go
+		// provider shows its allowance without waiting for the next staleness window.
+		syncOpencodeUsageCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllOpencodeUsages().catch(() => {});
 		}
 
 		if (vnetChanged) {
@@ -1772,7 +1815,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 
 		const responseStartedAt = performance.now();
 		const response = c.json(
-			buildSettingsResponse(merged, {
+			await buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
 			}),

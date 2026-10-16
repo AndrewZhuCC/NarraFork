@@ -17,7 +17,7 @@ const plan: CiReleasePlan = {
 	channel: "beta",
 	commit: "a".repeat(40),
 	workflowCommit: "b".repeat(40),
-	bunVersion: "1.4.2",
+	bunVersion: "1.4.3",
 	runId: 456,
 	runAttempt: 1,
 	changelog: { version: "1.2.1", date: "2026-01-02", en: "Published notes", "zh-CN": "发布说明" },
@@ -49,8 +49,10 @@ const published: UpdateIndexRelease = {
 	],
 };
 const trace: string[] = [];
-const revalidate = mock(async (_value: CiReleasePlan, _options: { publish: boolean }) => {
+// Real contract: returns the revalidated plan (unchanged here: no component evidence).
+const revalidate = mock(async (value: CiReleasePlan, _options: { publish: boolean }) => {
 	trace.push("revalidate");
+	return value;
 });
 const restore = mock(async (options: { sourceRunId: number; destination: string }) => {
 	trace.push("restore");

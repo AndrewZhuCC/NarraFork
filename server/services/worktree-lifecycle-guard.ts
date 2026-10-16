@@ -1,16 +1,19 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open, opendir, readlink, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { eq, gt, inArray, sql } from "drizzle-orm";
+import { lstat } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { eq, inArray, sql } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { normalizePathForComparison } from "../lib/platform-path";
-import { narraforkDir } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
+import {
+	canonicalProtectionAdmissionPath as canonicalAdmissionPath,
+	canonicalProtectionPath as canonicalPath,
+	readProtectionClaims,
+} from "./resource-protection-index";
 import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 
 export interface LifecycleTarget {
@@ -59,7 +62,6 @@ export function isResourceProtectionError(error: unknown): error is ResourceProt
 
 const MAX_BYTES = 256 * 1024;
 const MAX_MS = 5000;
-const PAGE = 128;
 const MAX_TARGETS = 128;
 /** Opaque, service-created authority; callers cannot supply chapter IDs as a force token. */
 interface VerifiedReleaseScope {
@@ -273,46 +275,13 @@ export async function withWorkspaceAdmission<T>(
 	}
 }
 
-/** Resolve filesystem aliases without turning a display/execution path into a comparison key. */
-async function canonicalAdmissionPath(path: string): Promise<string> {
-	if (!isAbsolute(path) || path.length > 4096 || path.includes("\0"))
-		throw new Error("Invalid resource path");
-	let current = path;
-	const suffix: string[] = [];
-	for (let depth = 0; depth < 64; depth++) {
-		try {
-			return resolve(await realpath(current), ...suffix);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			const node = await lstat(current).catch((cause) => {
-				if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
-				throw cause;
-			});
-			if (node?.isSymbolicLink()) {
-				const link = await readlink(current);
-				if (Buffer.byteLength(link) > 4096) throw new Error("Symlink target exceeds budget");
-				current = resolve(dirname(current), link);
-				continue;
-			}
-			const parent = dirname(current);
-			if (parent === current) throw error;
-			suffix.unshift(localPathSemantics.basename(current));
-			current = parent;
-		}
-	}
-	throw new Error("Resource path ancestry exceeded budget");
-}
-
-/** Internal ownership keys remain case-insensitive on Windows. Never persist these as cwd. */
-async function canonicalPath(path: string): Promise<string> {
-	return normalizePathForComparison(await canonicalAdmissionPath(path));
-}
-
 export interface LifecycleGuardPorts {
 	readClaims(
 		deadline: number,
 		signal?: AbortSignal,
-	): Promise<{ complete: boolean; claims: ResourceClaim[] }>;
+		targets?: readonly LifecycleTarget[],
+		includeLegacyReceipts?: boolean,
+	): Promise<{ complete: boolean; claims: ResourceClaim[] | AsyncIterable<ResourceClaim> }>;
 	/** Canonical comparison key, case-folded on Windows. */
 	canonicalPath(path: string): Promise<string>;
 	/** Case-preserving canonical path for a committed cwd/context (fixture seam). */
@@ -320,224 +289,6 @@ export interface LifecycleGuardPorts {
 	/** Bounded lstat projection: device/inode only, never contents or a directory walk. */
 	pathIdentity?(path: string): Promise<string | null>;
 	probeGitRoot?(path: string, deadline: number): Promise<{ root: string; common: string } | null>;
-}
-
-/** Small projections only; cursor pagination never converts a truncated scan to no owners. */
-async function readClaims(deadline: number, signal?: AbortSignal) {
-	const { db } = await import("../db");
-	const { chapters, narrators, narratorWorktreeResources } = await import("../db/schema");
-	const claims: ResourceClaim[] = [];
-	let bytes = 0;
-	const append = (claim: ResourceClaim) => {
-		bytes += Buffer.byteLength(JSON.stringify(claim));
-		if (bytes > MAX_BYTES || performance.now() > deadline || signal?.aborted)
-			throw new Error("Inventory budget exceeded");
-		claims.push(claim);
-	};
-	let cursor: string | undefined;
-	for (let page = 0; page < 32; page++) {
-		const rows = db
-			.select({
-				id: narratorWorktreeResources.id,
-				deviceId: narratorWorktreeResources.deviceId,
-				path: narratorWorktreeResources.worktreePath,
-				repositoryKey: narratorWorktreeResources.repositoryKey,
-				scopeProjectId: narratorWorktreeResources.scopeProjectId,
-				state: narratorWorktreeResources.state,
-			})
-			.from(narratorWorktreeResources)
-			.where(cursor ? gt(narratorWorktreeResources.id, cursor) : undefined)
-			.orderBy(narratorWorktreeResources.id)
-			.limit(PAGE + 1)
-			.all();
-		for (const row of rows.slice(0, PAGE)) append({ kind: "registry", ...row });
-		if (rows.length <= PAGE) break;
-		if (page === 31) throw new Error("Inventory truncated");
-		cursor = rows[PAGE - 1]?.id;
-		await new Promise<void>((done) => setTimeout(done, 0));
-	}
-	cursor = undefined;
-	for (let page = 0; page < 32; page++) {
-		const rows = db
-			.select({
-				id: chapters.id,
-				path: chapters.worktreePath,
-				shadowKey: chapters.snapshotShadowKey,
-			})
-			.from(chapters)
-			.where(cursor ? gt(chapters.id, cursor) : undefined)
-			.orderBy(chapters.id)
-			.limit(PAGE + 1)
-			.all();
-		for (const row of rows.slice(0, PAGE))
-			append({
-				kind: "chapter",
-				id: row.id,
-				...(row.path ? { path: row.path } : {}),
-				...(row.shadowKey ? { shadowKey: row.shadowKey } : {}),
-			});
-		if (rows.length <= PAGE) break;
-		if (page === 31) throw new Error("Chapter inventory truncated");
-		cursor = rows[PAGE - 1]?.id;
-		await new Promise<void>((done) => setTimeout(done, 0));
-	}
-	cursor = undefined;
-	for (let page = 0; page < 32; page++) {
-		const rows = db
-			.select({
-				id: narrators.id,
-				chapterId: narrators.chapterId,
-				cwd: narrators.cwd,
-				defaultDeviceId: narrators.defaultDeviceId,
-				revision: narrators.workspaceRevision,
-				contextCwd: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.cwd')`,
-				contextCwdType: sql<string | null>`json_type(${narrators.workspaceContext}, '$.cwd')`,
-				deviceId: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.deviceId')`,
-				contextDeviceType: sql<
-					string | null
-				>`json_type(${narrators.workspaceContext}, '$.deviceId')`,
-				repositoryKey: sql<
-					string | null
-				>`json_extract(${narrators.workspaceContext}, '$.git.repositoryKey')`,
-			})
-			.from(narrators)
-			.where(cursor ? gt(narrators.id, cursor) : undefined)
-			.orderBy(narrators.id)
-			.limit(PAGE + 1)
-			.all();
-		for (const row of rows.slice(0, PAGE)) {
-			const validDevice = (device: unknown) =>
-				device === null ||
-				(typeof device === "string" &&
-					device.length > 0 &&
-					device.length <= 256 &&
-					!device.includes("\0"));
-			if (
-				!validDevice(row.defaultDeviceId) ||
-				!validDevice(row.deviceId) ||
-				(row.contextDeviceType !== null &&
-					row.contextDeviceType !== "null" &&
-					row.contextDeviceType !== "text")
-			)
-				throw new Error("Legacy claim device is unverifiable");
-			if (
-				(row.cwd !== null &&
-					(typeof row.cwd !== "string" ||
-						row.cwd.length === 0 ||
-						row.cwd.length > 4096 ||
-						row.cwd.includes("\0"))) ||
-				(row.contextCwdType !== null &&
-					row.contextCwdType !== "null" &&
-					row.contextCwdType !== "text") ||
-				(row.contextCwd !== null &&
-					(typeof row.contextCwd !== "string" ||
-						row.contextCwd.length === 0 ||
-						row.contextCwd.length > 4096 ||
-						row.contextCwd.includes("\0")))
-			)
-				throw new Error("Legacy claim cwd is unverifiable");
-			const rawDevice =
-				row.cwd && isAbsolute(row.cwd) ? "local" : (row.defaultDeviceId ?? row.deviceId ?? "local");
-			const contextDevice =
-				row.deviceId ?? (row.defaultDeviceId && row.defaultDeviceId !== "local" ? null : "local");
-			if (row.contextCwd && !contextDevice)
-				throw new Error("Legacy context device is unverifiable");
-			if (row.cwd)
-				append({
-					kind: "narrator",
-					id: row.id,
-					chapterId: row.chapterId,
-					legacyChapterCwd: !!row.chapterId && row.revision === 0,
-					revision: row.revision,
-					path:
-						rawDevice === "local" ? localPathSemantics.resolve(process.cwd(), row.cwd) : row.cwd,
-					deviceId: rawDevice,
-				});
-			if (row.contextCwd)
-				append({
-					kind: "narrator",
-					id: row.id,
-					chapterId: row.chapterId,
-					legacyChapterCwd: !!row.chapterId && row.revision === 0,
-					revision: row.revision,
-					deviceId: contextDevice ?? "local",
-					path:
-						contextDevice === "local"
-							? localPathSemantics.resolve(process.cwd(), row.contextCwd)
-							: row.contextCwd,
-					...(row.repositoryKey ? { repositoryKey: row.repositoryKey } : {}),
-				});
-		}
-		if (rows.length <= PAGE) break;
-		if (page === 31) throw new Error("Narrator inventory truncated");
-		cursor = rows[PAGE - 1]?.id;
-		await new Promise<void>((done) => setTimeout(done, 0));
-	}
-	const directory = join(narraforkDir, "worktree-requests");
-	const metadata = await lstat(directory).catch((error) => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	if (metadata) {
-		if (!metadata.isDirectory() || metadata.isSymbolicLink())
-			throw new Error("Unsafe receipt directory");
-		let count = 0;
-		for await (const entry of await opendir(directory)) {
-			if (
-				++count > 512 ||
-				performance.now() > deadline ||
-				signal?.aborted ||
-				!entry.isFile() ||
-				!/^[a-f0-9]{64}\.json$/.test(entry.name)
-			)
-				throw new Error("Receipt inventory unavailable");
-			const file = await open(
-				join(directory, entry.name),
-				constants.O_RDONLY | constants.O_NOFOLLOW,
-			);
-			try {
-				const stat = await file.stat();
-				if (stat.size > 32 * 1024 || bytes + stat.size > MAX_BYTES)
-					throw new Error("Receipt budget exceeded");
-				const buffer = Buffer.alloc(Math.min(32 * 1024 + 1, MAX_BYTES - bytes + 1));
-				const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-				bytes += bytesRead;
-				if (bytesRead > 32 * 1024 || bytes > MAX_BYTES) throw new Error("Receipt budget exceeded");
-				const record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
-				// The actual journal's historical contract is unversioned, with an
-				// optional deviceId (absence means local). Explicit null is NOT absence.
-				if (
-					!record ||
-					Array.isArray(record) ||
-					Object.getPrototypeOf(record) !== Object.prototype ||
-					Object.hasOwn(record, "__proto__") ||
-					Object.hasOwn(record, "version") ||
-					typeof record.destination !== "string" ||
-					!isAbsolute(record.destination) ||
-					record.destination.length > 4096 ||
-					record.destination.includes("\0") ||
-					typeof record.repositoryKey !== "string" ||
-					!record.repositoryKey.trim() ||
-					record.repositoryKey.length > 4096 ||
-					(Object.hasOwn(record, "deviceId") &&
-						(typeof record.deviceId !== "string" ||
-							!record.deviceId.trim() ||
-							!/^[-A-Za-z0-9_]{1,128}$/.test(record.deviceId)))
-				)
-					throw new Error("Invalid receipt");
-				append({
-					kind: "receipt",
-					id: entry.name,
-					deviceId: record.deviceId ?? "local",
-					path: record.destination,
-					repositoryKey: record.repositoryKey,
-				});
-			} finally {
-				await file.close();
-			}
-		}
-	}
-	return { complete: true, claims };
 }
 
 const fixturePorts = new AsyncLocalStorage<LifecycleGuardPorts>();
@@ -591,8 +342,12 @@ async function probeGitRoot(
 const productionPorts: LifecycleGuardPorts & {
 	canonicalAdmissionPath(path: string): Promise<string>;
 } = {
-	readClaims: (deadline, signal) =>
-		(fixturePorts.getStore()?.readClaims ?? readClaims)(deadline, signal),
+	readClaims: (deadline, signal, targets, includeLegacyReceipts) => {
+		const fixture = fixturePorts.getStore();
+		return fixture
+			? fixture.readClaims(deadline, signal, targets, includeLegacyReceipts)
+			: readProtectionClaims(targets ?? [], deadline, signal, includeLegacyReceipts);
+	},
 	canonicalPath: (path) => (fixturePorts.getStore()?.canonicalPath ?? canonicalPath)(path),
 	canonicalAdmissionPath: (path) => {
 		const fixture = fixturePorts.getStore();
@@ -774,6 +529,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		scope?: VerifiedReleaseScope,
 		signal?: AbortSignal,
 		frozenTargets = false,
+		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const deadline = performance.now() + MAX_MS;
 		try {
@@ -801,9 +557,10 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 					};
 				}),
 			);
-			const inventory = await ports.readClaims(deadline, signal);
+			// Cold capture creates an exclusive new shadow and never deletes a failed
+			// birth. Legacy request-log migration is a prerequisite for deletion, not capture.
+			const inventory = await ports.readClaims(deadline, signal, normalized, !creatingShadow);
 			if (!inventory.complete) return unavailable();
-			const protectedClaims: ResourceClaim[] = [];
 			let bytes = Buffer.byteLength(JSON.stringify(normalized));
 			const probes = new Map<string, { root: string; common: string } | null>();
 			const held = footprintReservation();
@@ -844,9 +601,13 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				}
 				return distinct;
 			}
-			for (const claim of inventory.claims) {
-				bytes += Buffer.byteLength(JSON.stringify(claim));
-				if (bytes > MAX_BYTES || performance.now() > deadline || signal?.aborted)
+			for await (const claim of inventory.claims) {
+				// Bound individual evidence, not the amount of unrelated instance history.
+				if (
+					Buffer.byteLength(JSON.stringify(claim)) > MAX_BYTES ||
+					performance.now() > deadline ||
+					signal?.aborted
+				)
 					return unavailable();
 				if (claim.kind === "chapter" && scope?.chapters.has(claim.id)) continue;
 				const canonical = {
@@ -903,15 +664,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						(await distinctGitRoots(targetPath, claimPath))
 					)
 						continue;
-					protectedClaims.push(canonical);
-					break;
+					// One independent reference is sufficient to refuse; diagnostics need
+					// not collect every user of a shared resource into the main-thread heap.
+					return { status: "protected", complete: true, claims: [canonical] };
 				}
 			}
-			return {
-				status: protectedClaims.length ? "protected" : "clear",
-				complete: true,
-				claims: protectedClaims,
-			};
+			return { status: "clear", complete: true, claims: [] };
 		} catch {
 			return unavailable();
 		}
@@ -922,11 +680,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		scope?: VerifiedReleaseScope,
 		signal?: AbortSignal,
 		frozenTargets = false,
+		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const started = performance.now();
 		try {
 			return await boundedRead(
-				inspectOnce(targets, operation, scope, signal, frozenTargets),
+				inspectOnce(targets, operation, scope, signal, frozenTargets, creatingShadow),
 				started + MAX_MS,
 			);
 		} catch {
@@ -949,6 +708,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		deadline = performance.now() + MAX_MS,
 		signal?: AbortSignal,
 		contextPaths: readonly string[] = [],
+		creatingShadow = false,
 	): Promise<T> {
 		if (
 			signal?.aborted ||
@@ -977,7 +737,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		// absent destination. This skips a self-admission conflict, not any claim.
 		const birth = targets.length === 1 ? targets[0] : undefined;
 		const birthTarget =
-			operation === "shadow initialization" &&
+			creatingShadow &&
 			birth?.deviceId === "local" &&
 			!birth.scopeProjectId &&
 			!birth.repositoryKey &&
@@ -1051,7 +811,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			held.preparing = false;
 			const inspection = await boundedRead(
 				domain.context.run({ reservation: held, scope: effectiveScope }, () =>
-					inspect(resolved, operation, effectiveScope, signal, true),
+					inspect(resolved, operation, effectiveScope, signal, true, creatingShadow),
 				),
 				deadline,
 			);
@@ -1068,7 +828,25 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			if (!previous) domain.reservations.delete(held);
 		}
 	}
-	return { inspect, withProtectionReservation: reserve };
+	return {
+		inspect,
+		withProtectionReservation: reserve,
+		withShadowCreationReservation<T>(
+			target: { deviceId: "local"; path: string },
+			body: () => Promise<T>,
+		): Promise<T> {
+			return reserve(
+				[target],
+				"shadow initialization",
+				body,
+				undefined,
+				undefined,
+				undefined,
+				[],
+				true,
+			);
+		},
+	};
 }
 const guard = createLifecycleGuard(productionPorts);
 export const inspect = guard.inspect;
@@ -1107,6 +885,14 @@ export function withProtectionReservation<T>(
 		signal,
 		contextPaths,
 	);
+}
+
+/** Creation reserves only its physical destination; it never grants cleanup authority. */
+export function withShadowCreationReservation<T>(
+	target: { deviceId: "local"; path: string },
+	body: () => Promise<T>,
+): Promise<T> {
+	return guard.withShadowCreationReservation(target, body);
 }
 
 /** Rollback preflight precedes even narrator/chapter deletion, so deleting those rows

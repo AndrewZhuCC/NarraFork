@@ -16,10 +16,12 @@ import {
 	NarratorListLocalSearchSummary,
 } from "../../components/narrator/list/NarratorListControls";
 import {
+	applyNarratorListEvent,
 	buildNarratorListQueryOptions,
 	filterNarratorsByLocalQuery,
 	getNarratorListState,
 	type NarratorListSearchParams,
+	type NarratorsInfiniteData,
 	normalizeNarratorListSearchPatch,
 	parseBool,
 	useNarratorInfiniteScroll,
@@ -37,16 +39,14 @@ const CreateNarratorModal = lazy(() =>
 	})),
 );
 
+const ImportSessionModal = lazy(() =>
+	import("../../components/narrator/session-interchange/ImportSessionModal").then((m) => ({
+		default: m.ImportSessionModal,
+	})),
+);
+
 interface NarratorSearchParams extends NarratorListSearchParams {
 	create?: boolean;
-}
-
-interface NarratorsInfiniteData {
-	pages: Array<{
-		items: NarratorListItem[];
-		[key: string]: unknown;
-	}>;
-	[key: string]: unknown;
 }
 
 export const Route = createFileRoute("/narrators/")({
@@ -93,6 +93,7 @@ function NarratorsPage() {
 	);
 	const archiveNarrator = useArchiveNarrator();
 	const [opened, { open, close }] = useDisclosure(false);
+	const [importOpened, { open: openImport, close: closeImport }] = useDisclosure(false);
 	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
@@ -121,27 +122,9 @@ function NarratorsPage() {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			return;
 		}
-		qc.setQueryData<NarratorsInfiniteData>(["narrators", "paginated", queryOptions], (old) => {
-			if (!old?.pages) return old;
-			let changed = false;
-			const pages = old.pages.map((page) => ({
-				...page,
-				items: page.items.map((item) => {
-					if (item.id !== narratorId) return item;
-					changed = true;
-					return {
-						...item,
-						...(event.status !== undefined ? { status: event.status } : {}),
-						...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
-						...(event.title !== undefined ? { title: event.title } : {}),
-						...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
-						...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
-						updatedAt: new Date().toISOString(),
-					};
-				}),
-			}));
-			return changed ? { ...old, pages } : old;
-		});
+		qc.setQueryData<NarratorsInfiniteData>(["narrators", "paginated", queryOptions], (old) =>
+			applyNarratorListEvent(old, narratorId, event),
+		);
 	});
 
 	// Infinite scroll sentinel
@@ -180,6 +163,14 @@ function NarratorsPage() {
 		[navigate],
 	);
 
+	const handleImported = useCallback(
+		(data: { narratorId: string; title: string }) => {
+			addRecentTab({ type: "narrator", id: data.narratorId, title: data.title });
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.narratorId } });
+		},
+		[navigate],
+	);
+
 	return (
 		<Stack>
 			{/* Desktop header */}
@@ -189,6 +180,9 @@ function NarratorsPage() {
 					<NarratorListControls state={listState} onChange={setSearch} includeExtraFilters />
 					<Button variant="subtle" component={Link} to="/narrators/archived">
 						{t("viewArchived")}
+					</Button>
+					<Button variant="default" onClick={openImport}>
+						{t("sessionInterchange.importButton")}
 					</Button>
 					<Button onClick={guardedOpen}>{t("newNarrator")}</Button>
 				</Group>
@@ -200,6 +194,9 @@ function NarratorsPage() {
 					<Title order={3}>{t("title")}</Title>
 					<Group gap="xs">
 						<NarratorListExtraFiltersButton state={listState} onChange={setSearch} />
+						<Button size="xs" variant="default" onClick={openImport}>
+							{t("sessionInterchange.importButton")}
+						</Button>
 						<Button size="xs" onClick={guardedOpen}>
 							{t("newNarrator")}
 						</Button>
@@ -272,6 +269,16 @@ function NarratorsPage() {
 			{opened && (
 				<Suspense fallback={null}>
 					<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
+				</Suspense>
+			)}
+
+			{importOpened && (
+				<Suspense fallback={null}>
+					<ImportSessionModal
+						opened={importOpened}
+						onClose={closeImport}
+						onImported={handleImported}
+					/>
 				</Suspense>
 			)}
 

@@ -109,6 +109,8 @@ export interface ToolContext {
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
 	recheckAuthorization?: () => Promise<void>;
+	/** Trusted synchronous policy fence; invoke after awaits, immediately before a deferred side effect. */
+	assertFinalExecutionPermission?: () => void;
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
@@ -818,7 +820,7 @@ export type AgentEvent =
 			dumpSpillReuseToken?: string;
 	  }
 	| { type: "silent_disconnect" }
-	| { type: "done" };
+	| { type: "done"; reason?: "reasoning_only_idle" };
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
@@ -906,12 +908,15 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Bash",
 	"Agent",
 	"Await",
+	"Stop",
 	"Send",
 	"TeamStatus",
 	"AskUserQuestion",
 	"Question",
 	"Skill",
 	"LearningGuide",
+	// Visibility only: narrator-permission admits show, never create.
+	"IntelligentUI",
 ]);
 
 // === Agent config ===
@@ -1234,6 +1239,8 @@ export interface AgentConfig {
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
 	) => Promise<AgentHistoryReplacement | null>;
+	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
+	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**

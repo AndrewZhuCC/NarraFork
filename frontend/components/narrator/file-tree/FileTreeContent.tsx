@@ -29,6 +29,7 @@ import {
 	IconAlertTriangle,
 	IconChevronDown,
 	IconChevronRight,
+	IconEye,
 	IconEyeOff,
 	IconRefresh,
 } from "@tabler/icons-react";
@@ -62,8 +63,11 @@ export interface FileTreeContentProps {
 	/** Frozen device/revision/context identity supplied by the narrator-bound host. */
 	contextKey?: string;
 	showHidden: boolean;
+	/** Toggle dotfile visibility from the panel toolbar. Omit to render no toggle. */
+	onToggleShowHidden?: () => void;
 	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
+	changedPaths?: ReadonlySet<string>;
 	/** Git returned only a bounded prefix, so directory totals are lower bounds. */
 	lineStatsTruncated?: boolean;
 	/** Refresh the Git figures alongside a manual directory refresh. */
@@ -114,7 +118,9 @@ export function FileTreeContent({
 	root,
 	contextKey,
 	showHidden,
+	onToggleShowHidden,
 	lineStats,
+	changedPaths,
 	lineStatsTruncated = false,
 	onRefreshLineStats,
 	onOpenFile,
@@ -169,13 +175,14 @@ export function FileTreeContent({
 				root={root}
 				loading={loading}
 				errors={errors}
+				changedPaths={changedPaths}
 				lineStats={lineStats}
 				lineStatsTruncated={lineStatsTruncated}
 				onOpenFile={onOpenFile}
 				onReload={reload}
 			/>
 		),
-		[errors, lineStats, lineStatsTruncated, loading, onOpenFile, reload, root],
+		[changedPaths, errors, lineStats, lineStatsTruncated, loading, onOpenFile, reload, root],
 	);
 	const refreshAll = useCallback(() => {
 		reloadAll();
@@ -221,6 +228,22 @@ export function FileTreeContent({
 	return (
 		<Box style={{ height: "100%", overflow: "auto" }} p="xs">
 			<Group justify="flex-end" gap={4} mb={4}>
+				{onToggleShowHidden && (
+					<Tooltip
+						label={t(showHidden ? "fileTree.hideHidden" : "fileTree.showHidden")}
+						openDelay={200}
+					>
+						<ActionIcon
+							variant="subtle"
+							color={showHidden ? "indigo" : "gray"}
+							size="sm"
+							onClick={onToggleShowHidden}
+							aria-pressed={showHidden}
+						>
+							{showHidden ? <IconEye size={14} /> : <IconEyeOff size={14} />}
+						</ActionIcon>
+					</Tooltip>
+				)}
 				<Tooltip label={t("fileTree.refresh")} openDelay={200}>
 					<ActionIcon variant="subtle" color="gray" size="sm" onClick={refreshAll}>
 						<IconRefresh size={14} />
@@ -254,6 +277,7 @@ interface FileTreeRowProps {
 	loading: ReadonlySet<string>;
 	errors: ReadonlyMap<string, string>;
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
+	changedPaths?: ReadonlySet<string>;
 	lineStatsTruncated: boolean;
 	onOpenFile: (absolutePath: string, fileName: string) => void;
 	onReload: (dir: string) => Promise<void>;
@@ -265,6 +289,7 @@ function FileTreeRow({
 	loading,
 	errors,
 	lineStats,
+	changedPaths,
 	lineStatsTruncated,
 	onOpenFile,
 	onReload,
@@ -290,6 +315,7 @@ function FileTreeRow({
 
 	const isLoading = loading.has(entry.path);
 	const error = errors.get(entry.path);
+	const changed = changedPaths?.has(entry.path);
 	const stats = lineStats?.get(entry.path);
 	const hasStats = !!stats && (stats.added > 0 || stats.removed > 0);
 	const statsAreLowerBound = entry.isDirectory && lineStatsTruncated;
@@ -330,6 +356,9 @@ function FileTreeRow({
 			)}
 			<Text
 				size="sm"
+				c={changed ? "yellow" : undefined}
+				title={changed ? t("fileTree.gitChanged") : undefined}
+				data-git-changed={changed || undefined}
 				truncate
 				style={{
 					flex: 1,

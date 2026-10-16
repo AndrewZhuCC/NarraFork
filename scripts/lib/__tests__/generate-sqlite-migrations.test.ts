@@ -17,6 +17,12 @@ import { join, resolve } from "node:path";
 import { safeSpawn } from "../../../server/lib/spawn";
 import type { ResourceMigrationSnapshot } from "../../finalize-sqlite-resource-migration";
 import { generateSqliteMigrations } from "../../generate-sqlite-migrations";
+import {
+	generatedModelHistoryTriggerSuffix,
+	MODEL_HISTORY_REVISION_CONTRACT,
+	renderModelHistoryRevisionSql,
+} from "../generated-model-history-triggers";
+import { modelHistorySnapshots, revisionMigrationSql } from "./model-history-migration-fixture";
 
 const previous: ResourceMigrationSnapshot = {
 	tables: {
@@ -48,6 +54,7 @@ const generated = `ALTER TABLE resources RENAME COLUMN old TO renamed;
 CREATE TABLE __new_resources(id text primary key, renamed text, added text default 'default');
 INSERT INTO __new_resources(id,renamed,added) SELECT id,renamed,added FROM resources;
 DROP TABLE resources; ALTER TABLE __new_resources RENAME TO resources;`;
+const digest = (source: string) => createHash("sha256").update(source).digest("hex");
 const roots: string[] = [];
 const ok = { exitCode: 0, stdout: "", stderr: "" };
 function fixture() {
@@ -90,6 +97,40 @@ function emit(root: string, source = generated) {
 	writeFileSync(join(root, "drizzle/0189_fixture.sql"), source);
 	return ok;
 }
+test.each([
+	18, 188, 189,
+])("journal gaps preserve history but duplicate/backwards indices fail: %s", async (firstIdx) => {
+	const root = fixture();
+	const path = join(root, "drizzle/meta/_journal.json");
+	const journal = JSON.parse(readFileSync(path, "utf8"));
+	journal.entries[0].idx = firstIdx;
+	if (firstIdx === 18) {
+		cpSync(
+			join(root, "drizzle/meta/0187_snapshot.json"),
+			join(root, "drizzle/meta/0018_snapshot.json"),
+		);
+	}
+	const original = JSON.stringify(journal);
+	writeFileSync(path, original);
+	let calls = 0;
+	const generate = () =>
+		generateSqliteMigrations([], {
+			root,
+			runGenerate: async () => {
+				calls++;
+				return ok;
+			},
+		});
+	if (firstIdx < 188) {
+		await generate();
+		expect(calls).toBe(1);
+	} else {
+		await expect(generate()).rejects.toThrow("Invalid SQLite generator journal");
+		expect(calls).toBe(0);
+	}
+	expect(readFileSync(path, "utf8")).toBe(original);
+});
+
 const pending = (root: string) =>
 	JSON.parse(readFileSync(join(root, "drizzle/meta/_generation_pending.json"), "utf8"));
 const raw = (root: string) => readFileSync(join(root, "drizzle/0189_fixture.sql"), "utf8");
@@ -100,6 +141,76 @@ afterEach(async () => {
 	}
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+test("revision schema and exact trigger suffix share one receipt-bound migration and restart deterministically", async () => {
+	const root = fixture();
+	const { before, after, previousDDL } = modelHistorySnapshots();
+	for (const idx of [187, 188])
+		writeFileSync(join(root, `drizzle/meta/0${idx}_snapshot.json`), JSON.stringify(before));
+	writeFileSync(
+		join(root, "drizzle/0188_fixture.sql"),
+		"PRAGMA foreign_keys=OFF; PRAGMA foreign_keys=ON;",
+	);
+	const originalBaseline = readFileSync(join(root, "drizzle/0188_fixture.sql"), "utf8");
+	const suffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
+	await expect(
+		generateSqliteMigrations([], {
+			root,
+			runGenerate: async () => {
+				emit(root, revisionMigrationSql);
+				writeFileSync(join(root, "drizzle/meta/0189_snapshot.json"), JSON.stringify(after));
+				return ok;
+			},
+			finalize: (sql) => {
+				expect(sql.endsWith(suffix)).toBe(true);
+				throw new Error("trigger finalizer interrupted");
+			},
+		}),
+	).rejects.toThrow("interrupted");
+	const provenance = pending(root);
+	expect(provenance.generated.rawDigest).toBe(digest(revisionMigrationSql));
+	expect(provenance.modelHistoryTriggers).toEqual({
+		contract: MODEL_HISTORY_REVISION_CONTRACT,
+		sqlDigest: digest(renderModelHistoryRevisionSql("sqlite")),
+	});
+	const tampered = structuredClone(provenance);
+	tampered.modelHistoryTriggers.sqlDigest = "0".repeat(64);
+	writeFileSync(join(root, "drizzle/meta/_generation_pending.json"), JSON.stringify(tampered));
+	await expect(generateSqliteMigrations([], { root })).rejects.toThrow("source/arguments changed");
+	expect(raw(root)).toBe(revisionMigrationSql);
+	writeFileSync(join(root, "drizzle/meta/_generation_pending.json"), JSON.stringify(provenance));
+	const child = await safeSpawn({
+		cmd: [
+			"bun",
+			"-e",
+			`import { generateSqliteMigrations } from ${JSON.stringify(resolve(import.meta.dir, "../../generate-sqlite-migrations.ts"))}; await generateSqliteMigrations([], { root: ${JSON.stringify(root)} });`,
+		],
+		cwd: root,
+		timeout: 15_000,
+		maxOutputBytes: 64 * 1024,
+	});
+	expect(child.exitCode).toBe(0);
+	expect(raw(root).endsWith(suffix)).toBe(true);
+	const receipt = JSON.parse(
+		readFileSync(join(root, "drizzle/meta/_generation_validated.json"), "utf8"),
+	);
+	expect(receipt.modelHistoryTriggers).toEqual(provenance.modelHistoryTriggers);
+	expect(receipt.sqlDigest).toBe(digest(raw(root)));
+	const db = new Database(":memory:");
+	try {
+		db.exec(previousDDL);
+		db.exec(raw(root));
+		expect(db.query("SELECT count(*) AS n FROM sqlite_master WHERE type='trigger'").get()).toEqual({
+			n: 11,
+		});
+	} finally {
+		db.close();
+	}
+	const finalized = raw(root);
+	await generateSqliteMigrations([], { root, runGenerate: async () => ok });
+	expect(raw(root)).toBe(finalized);
+	expect(readFileSync(join(root, "drizzle/0188_fixture.sql"), "utf8")).toBe(originalBaseline);
+});
+
 test("canonical generation finalizes a new receipt-bound batch, is idempotent and preserves memory SQLite rename values", async () => {
 	const root = fixture();
 	let runs = 0;

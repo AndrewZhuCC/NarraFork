@@ -7,7 +7,7 @@ import { logger } from "../lib/logger";
 import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
 import type { NarratorPrincipal } from "./narrator-acl";
 
-/** Authorized cached first-paint facts. Never start or wait for Git/directory discovery. */
+/** Opt-in authorized discovery, independent of detail first paint. Never scan status/diff here. */
 export async function getNarratorGitSummary(
 	id: string,
 	revision: number,
@@ -23,10 +23,9 @@ export async function getNarratorGitSummary(
 			AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
 			undefined,
 			false,
-			"cache-only",
+			true,
 		);
-		if (!["ready", "not_git", "access_denied"].includes(target.workspace.state)) return null;
-		// A switch completing during authorization must not label old detail with new facts.
+		// A switch completing during discovery must not label the old detail with new facts.
 		const current = await db.query.narrators.findFirst({
 			where: eq(narrators.id, id),
 			columns: { workspaceRevision: true },
@@ -35,7 +34,6 @@ export async function getNarratorGitSummary(
 		return { workspace: target.workspace, branch: target.workspace.branch ?? null, revision };
 	} catch (error) {
 		signal.throwIfAborted();
-		if (error instanceof AppError && error.code === "GIT_DISCOVERY_CACHE_MISS") return null;
 		const denied = error instanceof AppError && error.statusCode === 403;
 		if (!denied) {
 			logger.warn("Narrator Git summary discovery failed", {

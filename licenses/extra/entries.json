@@ -1,7 +1,7 @@
 [
 	{
 		"name": "Bun runtime",
-		"version": "1.4.2",
+		"version": "1.4.3",
 		"versionSource": "bun-runtime",
 		"license": "MIT",
 		"author": "Oven",

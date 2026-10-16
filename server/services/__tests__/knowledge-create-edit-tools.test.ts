@@ -122,10 +122,89 @@ describe("KnowledgeCreate", () => {
 			ctxFor(plainId, async () => ({ behavior: "deny" })),
 		);
 		expect(res.isError).toBe(true);
+		expect(res.output).toBe("KnowledgeCreate was denied by the user.");
+	});
+
+	test.each([
+		false,
+		true,
+	])("preserves a reflection denial without writing (direct:%s)", async (direct) => {
+		const title = `Reflection denied ${direct} ${TAG}`;
+		const reason = "Confirm the proposed body before publishing.";
+		const res = await knowledgeCreateTool.execute(
+			{ title, collectionId, content: "must not be written", direct },
+			ctxFor(ownerId, async () => ({ behavior: "deny", message: reason })),
+		);
+		expect(res.isError).toBe(true);
+		expect(res.output).toBe(reason);
+		expect(
+			await db.query.knowledgeEntries.findFirst({
+				where: (entry, { eq }) => eq(entry.title, title),
+				columns: { id: true },
+			}),
+		).toBeUndefined();
+		expect(
+			await db.query.knowledgeDrafts.findFirst({
+				where: (draft, { eq }) => eq(draft.title, title),
+				columns: { id: true },
+			}),
+		).toBeUndefined();
+	});
+
+	test("passes the complete create payload and tool-use identity to approval", async () => {
+		const input = {
+			title: `Approval payload ${TAG}`,
+			content: "Full proposed knowledge body",
+			collectionId,
+			tags: ["docs"],
+			keywords: ["example-keyword"],
+			direct: true,
+			fallbackToPersonal: true,
+			changeNote: "Initial knowledge entry",
+		};
+		const calls: unknown[][] = [];
+		const ctx = ctxFor(ownerId, async (...args) => {
+			calls.push(args);
+			return { behavior: "deny", message: "Approval payload captured" };
+		});
+		await knowledgeCreateTool.execute(input, ctx);
+		expect(calls).toEqual([["KnowledgeCreate", input, ctx.currentToolUseId]]);
+	});
+
+	test("does not invent absent optional fields in approval input", async () => {
+		const input = { title: `Minimal payload ${TAG}`, content: "personal note" };
+		const calls: unknown[][] = [];
+		const ctx = ctxFor(plainId, async (...args) => {
+			calls.push(args);
+			return { behavior: "deny" };
+		});
+		await knowledgeCreateTool.execute(input, ctx);
+		expect(calls).toEqual([["KnowledgeCreate", input, ctx.currentToolUseId]]);
 	});
 });
 
 describe("KnowledgeEdit", () => {
+	test("preserves denial feedback and full save payload without changing the entry", async () => {
+		const principal = { userId: plainId, role: "user" as const };
+		const entry = await knowledgeBranchService.createStandalone(principal, {
+			title: `Denied edit ${TAG}`,
+			content: "original body",
+		});
+		const input = { action: "save", personalEntryId: entry.id, content: "must not be saved" };
+		const reason = "Revise the proposed knowledge edit before retrying.";
+		const calls: unknown[][] = [];
+		const ctx = ctxFor(plainId, async (...args) => {
+			calls.push(args);
+			return { behavior: "deny", message: reason };
+		});
+		const res = await knowledgeEditTool.execute(input, ctx);
+		expect(res.isError).toBe(true);
+		expect(res.output).toBe(reason);
+		expect(calls).toEqual([["KnowledgeEdit", input, ctx.currentToolUseId]]);
+		expect((await knowledgeBranchService.getMine(principal, entry.id)).content).toBe(
+			"original body",
+		);
+	});
 	test("save to a standalone personal entry, then publish", async () => {
 		const created = await knowledgeBranchService.createStandalone(
 			{ userId: plainId, role: "user" },

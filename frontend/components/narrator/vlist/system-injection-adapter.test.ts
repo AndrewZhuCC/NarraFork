@@ -1082,6 +1082,21 @@ describe("injection bubbles — the navigation target", () => {
 		expect(targetOf(specs)).toEqual({ kind: "knowledge", entryId: "k1", scope: "global" });
 	});
 
+	it("a personal knowledge hit retains its personal navigation scope", () => {
+		const specs = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "knowledge_base_hint",
+				body: {
+					kind: "knowledge",
+					hits: [{ scope: "personal", entryId: "p1", title: "Private", summary: "private detail" }],
+				},
+			}),
+			CTX,
+		);
+		expect(targetOf(specs)).toEqual({ kind: "knowledge", entryId: "p1", scope: "personal" });
+	});
+
 	it("a SINGLE-file spec save points at that file", () => {
 		const specs = adaptSegment(
 			injectionSegment({

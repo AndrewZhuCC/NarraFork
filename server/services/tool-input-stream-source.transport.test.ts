@@ -67,6 +67,7 @@ const {
 const { narratorRoutes } = await import("../routes/narrators");
 const { publicNarratorShareRoutes } = await import("../routes/public-narrator-shares");
 const { createPublicShare, revokePublicShare } = await import("./public-narrator-share-service");
+const { rememberPublicToolIdentity } = await import("./public-narrator-share-intelligent-ui");
 
 const owner = generateId();
 const outsider = generateId();
@@ -117,6 +118,9 @@ afterAll(async () => {
 });
 
 async function source(ownerId = narratorId, text = "raw\r\n\ud800") {
+	// The share gate fail-closes an unclassified tool. This fixture is an ordinary
+	// Write stream, not an IntelligentUI card.
+	rememberPublicToolIdentity(ownerId, { toolUseId: "provider-id", toolName: "Write" });
 	const ref = service.create(
 		{ narratorId: ownerId, toolUseId: "provider-id", field: "content" },
 		generateId(),
