@@ -184,18 +184,29 @@ export function injectSpaBaseHref(html: string, requestPath: string): string {
 	return setBaseHref(html, computeSpaBaseHref(requestPath));
 }
 
-/** Both filesystem and embedded SPA responses use the same public-share privacy policy. */
+/**
+ * Headers for every SPA document NarraFork serves — filesystem and embedded alike.
+ *
+ * `X-Robots-Tag` is present on ALL of them, app pages included, and it is not a
+ * duplicate of `frontend/public/robots.txt`: robots.txt is fetched from the ORIGIN
+ * root, so a deployment mounted under a reverse-proxy prefix (`/nf/`) leaves that
+ * request to whatever else answers the origin — the app never sees it. The header
+ * travels with the response itself, and it also covers a URL indexed before this
+ * policy existed: `Disallow` stops future crawls but never de-indexes, while
+ * `noindex` on the live response eventually does.
+ *
+ * That includes public narrator shares: readable by anyone holding the link, but
+ * still a private instance's conversation. They already carried this header before
+ * the policy became app-wide, and they are the only pages that also drop caching
+ * and the referrer — everything else sits behind authentication.
+ */
 export function spaIndexHeaders(requestPath: string): Record<string, string> {
 	const publicShare =
 		requestPath === "/shared/narrators" || requestPath.startsWith("/shared/narrators/");
 	return {
 		"Content-Type": "text/html; charset=utf-8",
 		"Cache-Control": publicShare ? "no-store" : "no-cache",
-		...(publicShare
-			? {
-					"Referrer-Policy": "no-referrer",
-					"X-Robots-Tag": "noindex, nofollow, noarchive",
-				}
-			: {}),
+		"X-Robots-Tag": "noindex, nofollow, noarchive",
+		...(publicShare ? { "Referrer-Policy": "no-referrer" } : {}),
 	};
 }
