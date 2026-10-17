@@ -5,8 +5,6 @@
  * materialize a `SKILL.md` when enabled (see `routine-service`).
  */
 
-import { OPENUI_SKILL_CONTENT } from "../generated/openui-skill";
-
 export interface BuiltinCommandDef {
 	name: string;
 	prompt: string;
@@ -97,6 +95,7 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		id: "gen_ui",
 		type: "tool",
 		category: "tools",
+		defaultEnabled: true,
 		tool: {
 			toolName: "GenUI",
 			descriptionEn:
@@ -401,21 +400,6 @@ When testing is warranted, verify observable behavior rather than wording. Prefe
 - Unrelated permissions, product decisions, or scope expansions
 - Empty directories, placeholder examples, or docs nobody will read
 `,
-		},
-	},
-	{
-		id: "nf-openui",
-		type: "skill",
-		category: "workflow",
-		// Discoverable by default; the full component reference is still loaded on demand.
-		defaultEnabled: true,
-		skill: {
-			name: "nf-openui",
-			descriptionEn:
-				"Prefer NarraFork chat components for parallel information, comparisons, steps, and data; combine them with Markdown explanations and use forms to collect input.",
-			descriptionZh:
-				"优先用 NarraFork 聊天组件组织并列信息、对比、步骤和数据，配合 Markdown 说明；通过表单收集输入。",
-			content: OPENUI_SKILL_CONTENT,
 		},
 	},
 ];

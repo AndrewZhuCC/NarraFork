@@ -36,7 +36,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import type { Command } from "./chapter-service";
-import { invalidateGlobalSkillDirectoryCache } from "./skill-service";
+import { cleanupRetiredBuiltinSkill, invalidateGlobalSkillDirectoryCache } from "./skill-service";
 
 // ---------------------------------------------------------------------------
 // Marker used to identify routine-managed entries
@@ -140,7 +140,7 @@ export function getGlobalRoutineStatuses(): RoutineStatus[] {
 /** Refresh enabled built-in skills before accepting requests, without changing user settings. */
 export async function syncBuiltinSkillRoutines(): Promise<void> {
 	const config = globalRoutineConfig();
-	let synced = false;
+	let synced = await cleanupRetiredBuiltinSkill(getGlobalSkillsDir());
 	for (const routine of getAllBuiltinRoutines()) {
 		if (routine.type !== "skill" || !isPreloadedMode(resolveToolRoutineMode(routine, config)))
 			continue;

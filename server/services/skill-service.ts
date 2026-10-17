@@ -223,8 +223,28 @@ async function loadSkillCached(
 	return skill;
 }
 
+/** Retire only the directory reserved for the former built-in OpenUI skill. */
+export async function cleanupRetiredBuiltinSkill(skillsDir: string): Promise<boolean> {
+	const retiredDir = join(skillsDir, "_routine-nf-openui");
+	try {
+		await lstat(retiredDir);
+		await rm(retiredDir, { recursive: true, force: true });
+		skillCache.delete(join(retiredDir, "SKILL.md"));
+		skillCache.delete(join(retiredDir, "SKILL.md.disabled"));
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			logger.warn("Failed to remove retired built-in skill", {
+				path: retiredDir,
+				error: String(error),
+			});
+		}
+		return false;
+	}
+}
+
 /** Directories to skip when recursively scanning for skills. */
-const SKIP_DIRS = new Set(["node_modules", ".git"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", "_routine-nf-openui"]);
 
 /** Maximum recursion depth when walking skill directories. */
 const MAX_WALK_DEPTH = 5;
@@ -585,6 +605,7 @@ function asSummaryArray(value: unknown): SkillSummaryInfo[] | null {
 				Array.isArray((item as SkillSummaryInfo).files)
 			);
 		})
+		.filter((skill) => basename(dirname(skill.location)) !== "_routine-nf-openui")
 		.slice(0, MAX_SKILLS_PER_ROOT);
 }
 
@@ -796,6 +817,12 @@ async function loadRootSkillSummaries(
 	root: SkillRootInfo,
 	options: { forceRefresh?: boolean } = {},
 ): Promise<{ skills: SkillSummaryInfo[]; meta: SkillRootCacheMeta }> {
+	if (
+		root.rootKind !== "global" &&
+		(await cleanupRetiredBuiltinSkill(join(root.rootPath, ".narrafork", "skills")))
+	) {
+		await invalidateRootCache(root.rootKind, root.rootPath);
+	}
 	const nowMs = Date.now();
 	const nowIso = new Date(nowMs).toISOString();
 	const expiresAt = nextExpiry(nowMs);
@@ -1002,6 +1029,7 @@ export async function resolveSkillContextForNarrator(narratorId: string): Promis
  * Skills are keyed by name; later entries override earlier ones.
  */
 export async function loadProjectSkills(projectGitPath: string): Promise<SkillInfo[]> {
+	await cleanupRetiredBuiltinSkill(join(projectGitPath, ".narrafork", "skills"));
 	const skillMap = new Map<string, SkillInfo>();
 
 	const skills = await scanSkillDirs(projectGitPath);
@@ -1050,6 +1078,7 @@ export async function loadAllSkills(projectGitPath: string | null): Promise<Skil
 
 	// 2. Project-level skills (override global)
 	if (projectGitPath) {
+		await cleanupRetiredBuiltinSkill(join(projectGitPath, ".narrafork", "skills"));
 		const projectSkills = await scanSkillDirs(projectGitPath);
 		for (const s of projectSkills) skillMap.set(s.name, s);
 	}

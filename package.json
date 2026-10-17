@@ -138,7 +138,6 @@
 		"dev:cold": "bun server/dev-all.ts --cold",
 		"dev:ts": "bun server/dev-all.ts",
 		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
-		"openui:generate-skill": "bun scripts/generate-openui-skill.ts",
 		"format": "bunx @biomejs/biome check --write .",
 		"i18n:check": "bun server/scripts/check-i18n.ts",
 		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",

@@ -16,7 +16,6 @@ drizzle/meta/*
 
 frontend/routeTree.gen.ts
 server/generated/*
-!server/generated/openui-skill.ts
 *.db
 *.db-journal
 *.db-wal
@@ -104,7 +103,6 @@ scripts/lib/__tests__/*
 !scripts/post-process-worker.ts
 !scripts/post-process-worker.test.ts
 !scripts/build-local.ts
-!scripts/generate-openui-skill.ts
 !scripts/install-local.py
 !scripts/install-local.test.py
 !scripts/install-ks-mini.py

@@ -1,192 +1,118 @@
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
-import { access, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import { join } from "node:path";
-import { OPENUI_SKILL_CONTENT } from "../../generated/openui-skill";
-import { getBuiltinRoutine, getBuiltinSkillRoutines } from "../../lib/builtin-routines";
+import { eq } from "drizzle-orm";
+import { db } from "../../db";
+import { skillDirectoryCaches } from "../../db/schema";
+import { getBuiltinRoutine } from "../../lib/builtin-routines";
 import { getNarraforkHome } from "../../lib/narrafork-home";
 import { settings } from "../../lib/settings";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
-import {
-	disableRoutineGlobal,
-	enableRoutineGlobal,
-	getGlobalRoutineStatuses,
-	syncBuiltinSkillRoutines,
-} from "../routine-service";
+import { getGlobalRoutineStatuses, syncBuiltinSkillRoutines } from "../routine-service";
 import {
 	invalidateGlobalSkillDirectoryCache,
+	loadProjectSkills,
 	loadSkillByNameForContext,
 	loadSkillSummariesForContext,
-	toggleGlobalSkill,
 } from "../skill-service";
 
-const ROUTINE_ID = "nf-openui";
 const originalRoutines = structuredClone(settings.routines);
-const skillPath = join(getNarraforkHome(), "skills", "_routine-nf-openui", "SKILL.md");
-const creatorPath = join(getNarraforkHome(), "skills", "_routine-skill-creator", "SKILL.md");
+const skillsDir = join(getNarraforkHome(), "skills");
+const managedDir = join(skillsDir, "_routine-nf-openui");
+const customDir = join(skillsDir, "user-openui");
+const projectDir = join(getNarraforkHome(), "retired-skill-project");
 const context = { projectGitPath: null, cwd: null };
-// Bun resolves homedir from the account, not HOME; keep discovery out of real user skills.
+const skillContent =
+	'---\nname: "nf-openui"\ndescription: "User-maintained UI skill"\n---\n\nUser content.\n';
+// Bun resolves homedir from the account, independently of HOME.
 const homeMock = spyOn(os, "homedir").mockReturnValue(getNarraforkHome());
 afterAll(() => homeMock.mockRestore());
-
 afterEach(async () => {
 	settings.routines = structuredClone(originalRoutines);
-	for (const id of [ROUTINE_ID, "skill-creator"]) {
-		await rm(join(getNarraforkHome(), "skills", `_routine-${id}`), {
-			recursive: true,
-			force: true,
-		});
+	for (const path of [managedDir, customDir, projectDir]) {
+		await rm(path, { recursive: true, force: true });
 	}
 	await invalidateGlobalSkillDirectoryCache();
 });
 
-function openuiSkill() {
-	const routine = getBuiltinRoutine(ROUTINE_ID);
-	if (!routine?.skill) throw new Error("nf-openui skill routine is missing");
-	return routine.skill;
-}
-
-describe("nf-openui builtin skill routine", () => {
-	test("is available by default but exposes only a short, chat-UI-specific description", () => {
-		const routine = getBuiltinRoutine(ROUTINE_ID);
-		expect(routine?.type).toBe("skill");
-		expect(routine?.category).toBe("workflow");
-		expect(routine?.defaultEnabled).toBe(true);
-		expect(getBuiltinSkillRoutines().some((entry) => entry.id === ROUTINE_ID)).toBe(true);
-		expect(getGlobalRoutineStatuses().find((entry) => entry.id === ROUTINE_ID)?.enabled).toBe(true);
-		const skill = openuiSkill();
-		expect(skill.name).toBe(ROUTINE_ID);
-		expect(skill.descriptionEn).toContain("Prefer NarraFork chat components");
-		expect(skill.descriptionEn).toContain("collect input");
-		expect(skill.descriptionZh).toContain("优先用 NarraFork 聊天组件");
-		expect(skill.descriptionEn.length).toBeLessThan(200);
-		expect(skill.descriptionZh.length).toBeLessThan(100);
+describe("retired OpenUI guidance", () => {
+	test("removes the builtin while GenUI defaults on and still respects explicit disabling", () => {
+		expect(getBuiltinRoutine("nf-openui")).toBeUndefined();
+		settings.routines = { enabledRoutines: [], disabledRoutines: [], toolModes: {} };
+		expect(getGlobalRoutineStatuses().find((routine) => routine.id === "gen_ui")?.enabled).toBe(
+			true,
+		);
+		settings.routines.disabledRoutines = ["gen_ui"];
+		expect(getGlobalRoutineStatuses().find((routine) => routine.id === "gen_ui")?.enabled).toBe(
+			false,
+		);
 	});
 
-	test("uses the generated component reference with Markdown and execution boundaries", () => {
-		const content = openuiSkill().content;
-		expect(content).toBe(OPENUI_SKILL_CONTENT);
-		expect(content).toContain("## Component Signatures");
-		expect(content).toContain("Table(");
-		expect(content).toContain("Form(");
-		expect(content).toContain("After compaction");
-		expect(content).toContain("```openui-lang");
-		expect(content).toContain(
-			"`inlineMode: true`, `bindings: true`, `tools: []`, and `toolCalls: false`",
-		);
-		expect(content).toContain("charts for patterns and trends");
-		expect(content).toContain(
-			"Use Markdown for brief answers, connective prose, and copyable code",
-		);
-		expect(content).not.toContain("only for explicitly requested");
-		expect(content).not.toContain("unless the user explicitly requests");
-		expect(content).not.toContain("when the user asks a QUESTION");
-		expect(content).not.toContain("respond with text only — NO code");
-		expect(content).not.toContain("Your ENTIRE response must be valid openui-lang");
-		expect(content).not.toContain("## Query");
-		expect(content).not.toContain("## Mutation");
-		expect(content).toContain("never emit Query(), Mutation(), @Run, MCP calls");
-		expect(content).toContain("The only outward actions are explicit user clicks");
-		expect(content).toContain("Never emit @OpenUrl, open_url");
-		expect(content).toContain("unknown action types");
-		expect(content).toContain("do not install anything for it");
+	test.each([
+		"SKILL.md",
+		"SKILL.md.disabled",
+	])("startup removes managed %s, refreshes discovery, and preserves a same-named user skill", async (filename) => {
+		await mkdir(managedDir, { recursive: true });
+		await mkdir(customDir, { recursive: true });
+		await writeFile(join(managedDir, filename), skillContent);
+		await writeFile(join(customDir, "SKILL.md"), skillContent);
+		settings.routines = { enabledRoutines: ["nf-openui"], disabledRoutines: [], toolModes: {} };
+		await syncBuiltinSkillRoutines();
+		await syncBuiltinSkillRoutines();
+		await expect(access(managedDir)).rejects.toThrow();
+		expect(await readFile(join(customDir, "SKILL.md"), "utf8")).toBe(skillContent);
+		const loaded = await loadSkillByNameForContext(context, "nf-openui");
+		expect(loaded?.location).toBe(join(customDir, "SKILL.md"));
 	});
 
-	test("built-in capability hints describe chat UI capabilities without embedding component docs", async () => {
+	test("does not expose retired entries from a still-fresh persisted summary cache", async () => {
+		await mkdir(customDir, { recursive: true });
+		await writeFile(join(customDir, "SKILL.md"), skillContent);
+		const before = await loadSkillSummariesForContext(context, { forceRefresh: true });
+		const custom = before.skills.find((skill) => skill.location === join(customDir, "SKILL.md"));
+		if (!custom) throw new Error("Expected the user skill in discovery");
+		await db
+			.update(skillDirectoryCaches)
+			.set({
+				skillsJson: [
+					custom,
+					{ ...custom, location: join(managedDir, "SKILL.md"), description: "Retired builtin" },
+				],
+			})
+			.where(eq(skillDirectoryCaches.rootKind, "global"));
+		const after = await loadSkillSummariesForContext(context);
+		expect(after.skills.filter((skill) => skill.name === "nf-openui")).toEqual([custom]);
+		expect(after.roots.some((root) => root.cacheHit)).toBe(true);
+	});
+
+	test("lazily removes only the reserved project directory during discovery", async () => {
+		const projectSkills = join(projectDir, ".narrafork", "skills");
+		const retired = join(projectSkills, "_routine-nf-openui");
+		const custom = join(projectSkills, "user-openui");
+		await mkdir(retired, { recursive: true });
+		await mkdir(custom, { recursive: true });
+		await writeFile(join(retired, "SKILL.md.disabled"), skillContent);
+		await writeFile(join(custom, "SKILL.md"), skillContent);
+		await loadSkillSummariesForContext(
+			{ projectGitPath: projectDir, cwd: null },
+			{ forceRefresh: true },
+		);
+		await expect(access(retired)).rejects.toThrow();
+		expect((await loadProjectSkills(projectDir)).map((skill) => skill.location)).toContain(
+			join(custom, "SKILL.md"),
+		);
+	});
+
+	test("does not inject the retired capability hint into either language", async () => {
 		for (const locale of ["en", "zh-CN"] as const) {
 			const { prompt } = await buildEffectiveSystemPrompt({
 				basePrompt: "Test narrator",
 				cwd: getNarraforkHome(),
 				locale,
 			});
-			expect(prompt).toContain("## Chat UI");
-			expect(prompt).toContain("nf-openui");
-			expect(prompt).toContain(
-				locale === "zh-CN"
-					? "优先用组件组织并列信息、对比、步骤和数据"
-					: "Prefer components for parallel information, comparisons, steps, and data",
-			);
-			expect(prompt).not.toContain("## Component Signatures");
+			expect(prompt).not.toContain("nf-openui");
+			expect(prompt).not.toContain("## Chat UI");
 		}
-	});
-
-	test("materializes on enable, keeps discovery brief, and loads the body only on demand", async () => {
-		// bunfig's preload isolates NARRAFORK_HOME before any service imports.
-		const path = join(getNarraforkHome(), "skills", "_routine-nf-openui", "SKILL.md");
-		const context = { projectGitPath: null, cwd: null };
-		await expect(access(path)).rejects.toThrow();
-		try {
-			await enableRoutineGlobal(ROUTINE_ID, "test-openui-skill-user");
-			const raw = await readFile(path, "utf8");
-			expect(raw).toContain('name: "nf-openui"');
-			expect(raw).toContain(OPENUI_SKILL_CONTENT);
-
-			const summaries = await loadSkillSummariesForContext(context, { forceRefresh: true });
-			const summary = summaries.skills.find((skill) => skill.name === ROUTINE_ID);
-			expect(summary?.description).toBe(openuiSkill().descriptionEn);
-			expect(summary).not.toHaveProperty("content");
-
-			const loaded = await loadSkillByNameForContext(context, ROUTINE_ID);
-			expect(loaded?.location).toBe(path);
-			expect(loaded?.content).toBe(OPENUI_SKILL_CONTENT.trim());
-		} finally {
-			await disableRoutineGlobal(ROUTINE_ID, "test-openui-skill-user");
-		}
-		await expect(access(path)).rejects.toThrow();
-		expect(await loadSkillByNameForContext(context, ROUTINE_ID)).toBeNull();
-	});
-
-	test("startup installs the default skill and invalidates cached discovery", async () => {
-		const before = await loadSkillSummariesForContext(context, { forceRefresh: true });
-		expect(before.skills.some((skill) => skill.name === ROUTINE_ID)).toBe(false);
-		await syncBuiltinSkillRoutines();
-		const after = await loadSkillSummariesForContext(context);
-		const summary = after.skills.find((skill) => skill.name === ROUTINE_ID);
-		expect(summary?.description).toBe(openuiSkill().descriptionEn);
-		expect(summary).not.toHaveProperty("content");
-		expect((await loadSkillByNameForContext(context, ROUTINE_ID))?.content).toBe(
-			OPENUI_SKILL_CONTENT.trim(),
-		);
-		await expect(access(creatorPath)).rejects.toThrow();
-	});
-
-	test("startup refreshes enabled builtin definitions using the same materialization path", async () => {
-		await enableRoutineGlobal("skill-creator", "test-openui-skill-user");
-		await writeFile(creatorPath, "old builtin definition", "utf8");
-		await syncBuiltinSkillRoutines();
-		expect(await readFile(creatorPath, "utf8")).toContain(
-			getBuiltinRoutine("skill-creator")?.skill?.content ?? "missing skill-creator",
-		);
-		expect(await readFile(skillPath, "utf8")).toContain(OPENUI_SKILL_CONTENT);
-		await syncBuiltinSkillRoutines();
-		const summaries = await loadSkillSummariesForContext(context);
-		expect(summaries.skills.filter((skill) => skill.name === ROUTINE_ID)).toHaveLength(1);
-		expect(settings.routines.enabledRoutines).not.toContain(ROUTINE_ID);
-	});
-
-	test("an explicit routine disable remains disabled after startup", async () => {
-		await disableRoutineGlobal(ROUTINE_ID, "test-openui-skill-user");
-		await syncBuiltinSkillRoutines();
-		await expect(access(skillPath)).rejects.toThrow();
-		expect(getGlobalRoutineStatuses().find((routine) => routine.id === ROUTINE_ID)?.enabled).toBe(
-			false,
-		);
-		expect(await loadSkillByNameForContext(context, ROUTINE_ID)).toBeNull();
-	});
-
-	test("Skills page disable survives startup while its definition stays up to date", async () => {
-		await syncBuiltinSkillRoutines();
-		await toggleGlobalSkill(ROUTINE_ID, false);
-		await writeFile(`${skillPath}.disabled`, "old disabled builtin definition", "utf8");
-		await syncBuiltinSkillRoutines();
-		await expect(access(skillPath)).rejects.toThrow();
-		expect(await readFile(`${skillPath}.disabled`, "utf8")).toContain(OPENUI_SKILL_CONTENT);
-		expect(await loadSkillByNameForContext(context, ROUTINE_ID)).toBeNull();
-
-		await toggleGlobalSkill(ROUTINE_ID, true);
-		await syncBuiltinSkillRoutines();
-		expect((await loadSkillByNameForContext(context, ROUTINE_ID))?.content).toBe(
-			OPENUI_SKILL_CONTENT.trim(),
-		);
 	});
 });
