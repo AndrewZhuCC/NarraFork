@@ -167,4 +167,14 @@ provider.chat()
 - **D2 `/save_dump` 保留窗口快照**（多请求）；单条固定由报错卡片和使用历史负责。
 - **D3 不再区分新旧**：只有新版证据 + 有界诊断。
 - **D4 历史 Token 核对直接下线**：dump 只用于排查，旧问题已排查完，不再保留依赖旧 dump 的功能。
-- **Q5 设置是否改键名**：推荐改为 `requestEvidence.*` 并迁移，因为 `requestDumpEnabled` 的含义已经变了，沿用旧名会继续误导；代价是一个版本的双键兼容。
+- **D5 设置键改名为 `requestEvidence.*`**，加载时迁移旧键，API 在一个版本内同时接受旧键。
+
+## 7. 实现与本文的差异
+
+落地时有几处与上文不同，以代码为准（使用说明见 `docs/REQUEST_DUMPS.md`）：
+
+- **没有新增 `status` 操作。** 单请求状态沿用已有的 `GET /request-recordings/requests/:requestId` 详情接口；recorder 只新增了 `pin` 操作。
+- **固定原因多一个 `leak`。** 泄漏工具调用（recovered / unrecovered）走 recorder 固定，通知里带 `recordingRequestId`，原 `/leaked-tool-dump` 接口删除。
+- **重复响应头不保存为数组。** headers 仍是 `Record<string, string>`，只加了独立预算和截断标记（4.5）。
+- **旧列由迁移直接删除。** `raw_dump_json` 与 Token 核对列、两张核对表在 `0207_drop_legacy_request_dumps` 中删除，没有走后台置空；旧目录由启动时的后台任务删除。
+- **使用历史详情只展示 diagnostics。** 完整证据通过「固定并下载请求证据」按需固定单个请求后下载，不在详情弹窗里内联。
