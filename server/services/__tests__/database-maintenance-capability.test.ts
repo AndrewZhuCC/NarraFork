@@ -240,15 +240,29 @@ describe("space reclamation dispatch", () => {
 });
 
 describe("row cleanup never opens a maintenance window", () => {
-	test("executeCleanup checkpoints and optimizes but never reclaims space", async () => {
+	function insertOldToolCallPayload(id: string) {
+		const createdAt = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString();
+		sqlite
+			.prepare("INSERT OR IGNORE INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)")
+			.run("cleanup-narrator", createdAt, createdAt);
 		sqlite
 			.prepare(
-				`INSERT INTO api_requests (id, created_at, raw_dump_json)
-				 VALUES ('req-old', ?, '{"body":"x"}')`,
+				`INSERT OR IGNORE INTO narrator_messages (id, narrator_id, role, content_json, created_at)
+				 VALUES ('cleanup-message', 'cleanup-narrator', 'assistant', '[]', ?)`,
 			)
-			.run(new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString());
+			.run(createdAt);
+		sqlite
+			.prepare(
+				`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, created_at)
+				 VALUES (?, 'cleanup-narrator', 'cleanup-message', ?, 'Read', '{"path":"x"}', ?)`,
+			)
+			.run(id, id, createdAt);
+	}
 
-		const result = await databaseCleanupService.executeCleanup("apiRequestDumps", {
+	test("executeCleanup checkpoints and optimizes but never reclaims space", async () => {
+		insertOldToolCallPayload("tc-old");
+
+		const result = await databaseCleanupService.executeCleanup("toolCallPayloads", {
 			olderThanDays: 30,
 		});
 
@@ -263,7 +277,7 @@ describe("row cleanup never opens a maintenance window", () => {
 	});
 
 	test("a cleanup that changed nothing skips maintenance entirely", async () => {
-		const result = await databaseCleanupService.executeCleanup("apiRequestDumps", {
+		const result = await databaseCleanupService.executeCleanup("toolCallPayloads", {
 			olderThanDays: 30,
 		});
 		expect(result.changed).toBe(false);
@@ -295,14 +309,9 @@ describe("row cleanup never opens a maintenance window", () => {
 		}));
 		const { databaseCleanupService: service } = await import("../database-cleanup-service");
 		try {
-			sqlite
-				.prepare(
-					`INSERT INTO api_requests (id, created_at, raw_dump_json)
-					 VALUES ('req-old-2', ?, '{"body":"y"}')`,
-				)
-				.run(new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString());
+			insertOldToolCallPayload("tc-old-2");
 
-			const result = await service.executeCleanup("apiRequestDumps", { olderThanDays: 30 });
+			const result = await service.executeCleanup("toolCallPayloads", { olderThanDays: 30 });
 			expect(result.ok).toBe(true);
 			expect(result.changed).toBe(true);
 			expect(result.vacuumRan).toBe(false);

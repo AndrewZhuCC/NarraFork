@@ -29,21 +29,19 @@ function publishedFrames(text: string, requestId: string): Frame[] {
 	return frames;
 }
 
-const originalAgent = settings.agent;
+const originalEvidence = settings.requestEvidence;
 
 // The shared preload restores settings after every test, including parser unit cases.
 beforeEach(() => {
-	settings.agent = {
-		...settings.agent,
-		requestDumpRecordingEnabled: true,
-		requestDumpRequestBytes: 4 * 1024 * 1024,
-		requestDumpResponseBytes: 4 * 1024 * 1024,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
+	settings.requestEvidence = {
+		ringEnabled: true,
+		ringRequestBytes: 4 * 1024 * 1024,
+		ringResponseBytes: 4 * 1024 * 1024,
+		autoPin: "off",
 	};
 });
 afterAll(async () => {
-	settings.agent = originalAgent;
+	settings.requestEvidence = originalEvidence;
 	// Stop the shared worker so the test process can exit.
 	const clients = (globalThis as Record<symbol, unknown>)[
 		Symbol.for("request-recording-clients")
