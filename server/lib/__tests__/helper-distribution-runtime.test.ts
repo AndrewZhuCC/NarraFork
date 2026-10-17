@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+	EXECUTOR_RELEASE_VERSION,
 	getHelperAssetName,
 	HELPER_CATALOG_VERSION,
 	HELPER_EXECUTOR_PROTOCOL_VERSION,
@@ -490,24 +491,26 @@ try {
 			rmSync(root, { recursive: true, force: true });
 		}
 	}
-	for (const mode of ["dev", "compiled"] as const) {
-		// Dev reads the current component pin. Compiled uses the declaration embedded in the fixture.
-		const executorVersion = mode === "dev" ? "0.9.3" : "0.9.1";
-		test(`${mode} APP 0.9.2 fetches and generates install script for executor ${executorVersion}`, () => {
+	// Dev reads the repository pin; compiled reads the build declaration (0.9.1 in the fixture).
+	for (const [mode, executor] of [
+		["dev", EXECUTOR_RELEASE_VERSION],
+		["compiled", "0.9.1"],
+	] as const) {
+		test(`${mode} APP 0.9.2 fetches and generates install script for executor ${executor}`, () => {
 			const result = fixture(mode);
 			expect(result.error).toBeUndefined();
 			expect(result.app).toBe("0.9.2");
 			expect(result.pin).toEqual({
-				version: executorVersion,
+				version: executor,
 				protocolVersion: 1,
-				tag: `executor-v${executorVersion}`,
+				tag: `executor-v${executor}`,
 			});
-			expect(result.downloaded.version).toBe(executorVersion);
+			expect(result.downloaded.version).toBe(executor);
 			expect(result.calls).toEqual([
-				`https://github.com/fork/identity-fixture/releases/download/executor-v${executorVersion}/narrafork-executor-manifest.json`,
-				`https://github.com/fork/identity-fixture/releases/download/executor-v${executorVersion}/narrafork-executor-${executorVersion}-linux-amd64`,
+				`https://github.com/fork/identity-fixture/releases/download/executor-v${executor}/narrafork-executor-manifest.json`,
+				`https://github.com/fork/identity-fixture/releases/download/executor-v${executor}/narrafork-executor-${executor}-linux-amd64`,
 			]);
-			expect(result.script).toContain(`Executor v${executorVersion}`);
+			expect(result.script).toContain(`Executor v${executor}`);
 			expect(result.script).not.toContain("Executor v0.9.2");
 		}, 20_000);
 	}
