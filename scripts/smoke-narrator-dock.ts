@@ -789,11 +789,11 @@ async function main() {
 							}
 						).__smokeChatMove;
 						if (!before) return undefined;
-						const valueOf = (el: HTMLElement) =>
+						const editorText = (el: HTMLElement) =>
 							el instanceof HTMLTextAreaElement ? el.value : (el.textContent ?? "");
 						const current = Array.from(
 							document.querySelectorAll<HTMLElement>("textarea, [contenteditable='true']"),
-						).find((el) => valueOf(el).includes(text));
+						).find((el) => editorText(el).includes(text));
 						const rect = current?.getBoundingClientRect();
 						const group = rect
 							? Array.from(document.querySelectorAll<HTMLElement>(".dv-groupview")).find(
@@ -817,7 +817,7 @@ async function main() {
 							to: { left: bounds?.left ?? input.from.left, top: bounds?.top ?? input.from.top },
 							target: input.target,
 							sameElement: current === before.element && before.element.isConnected,
-							hasSentinel: current ? valueOf(current).includes(text) : false,
+							hasSentinel: current ? editorText(current).includes(text) : false,
 						};
 					},
 					{ text: sentinel, from: chatGeom.from, target: chatGeom.target },
