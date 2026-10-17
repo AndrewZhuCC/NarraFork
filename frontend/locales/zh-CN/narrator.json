@@ -387,6 +387,7 @@
 		},
 		"add": "引用",
 		"addHint": "引用选中内容（Tab）",
+		"tabKey": "Tab 键",
 		"dismiss": "忽略",
 		"remove": "移除引用",
 		"limit": "每条消息最多引用 {{count}} 段内容。",

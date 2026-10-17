@@ -387,6 +387,7 @@
 		},
 		"add": "Quote",
 		"addHint": "Quote selection (Tab)",
+		"tabKey": "Tab key",
 		"dismiss": "Dismiss",
 		"remove": "Remove quote",
 		"limit": "You can quote up to {{count}} excerpts per message.",
