@@ -12,8 +12,8 @@
 	"tokendanceBalanceDetails": "累计充值 ¥{{credits}}\n已消耗 ¥{{used}}\n剩余 ¥{{balance}}",
 	"tokendanceBalanceStale": "余额可能已过期，请刷新",
 	"tokendanceAdminRechargeRequired": "余额不足，请联系管理员充值",
-	"intelligentUi": {
-		"title": "智能 UI",
+	"genUi": {
+		"title": "GenUI",
 		"staticPreview": "共享记录不提供交互式预览。",
 		"unavailable": "旧版 UI 引用不可用，请重新展示当前文件以预览。",
 		"currentFiles": "当前文件 · 非历史快照",
@@ -27,6 +27,10 @@
 		"historyUnavailable": "当前文件 · 此创建无法随消息回退",
 		"streaming": "正在生成 {{title}}…",
 		"expand": "放大",
+		"run": "运行",
+		"notRunning": "未运行。点“运行”会按当前文件构建。",
+		"formWaiting": "等待你填写：{{title}}",
+		"formClose": "关闭表单",
 		"sendFailed": "消息发送失败",
 		"linkConfirm": "打开 {{url}}？",
 		"linkOpen": "打开",

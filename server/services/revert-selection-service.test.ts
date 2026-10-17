@@ -682,9 +682,9 @@ test("spec writes and real read-only tools are excluded independently of unknown
 	]);
 	expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: disk.id });
 });
-test("IntelligentUI show is read-only while create without a journal is an explicit gap", async () => {
-	const show = tool(1, "IntelligentUI");
-	const create = tool(2, "IntelligentUI");
+test("GenUI show is read-only while create without a journal is an explicit gap", async () => {
+	const show = tool(1, "GenUI");
+	const create = tool(2, "GenUI");
 	sqlite
 		.query("UPDATE narrator_tool_calls SET input_json=? WHERE id=?")
 		.run(JSON.stringify({ action: "show", path: "/repo/ui" }), show.id);

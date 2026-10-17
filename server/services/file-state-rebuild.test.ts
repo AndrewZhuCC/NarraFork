@@ -3173,10 +3173,10 @@ describe("device-aware snapshot revert", () => {
  * old nor the new revision.
  */
 describe("replay divergence is never silently absorbed", () => {
-	test("IntelligentUI creates require the ordinary byte journal, not legacy input replay", () => {
+	test("GenUI creates require the ordinary byte journal, not legacy input replay", () => {
 		const call: OrderedToolCall = {
 			toolUseId: "ui-create",
-			toolName: "IntelligentUI",
+			toolName: "GenUI",
 			inputJson: { action: "create", prefix: "demo" },
 			status: "success",
 			messageId: "message",

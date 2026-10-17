@@ -910,7 +910,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Skill",
 	"LearningGuide",
 	// Visibility only: narrator-permission admits show, never create.
-	"IntelligentUI",
+	"GenUI",
 ]);
 
 // === Agent config ===

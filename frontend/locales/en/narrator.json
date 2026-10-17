@@ -12,8 +12,8 @@
 	"tokendanceBalanceDetails": "Total credited ¥{{credits}}\nConsumed ¥{{used}}\nRemaining ¥{{balance}}",
 	"tokendanceBalanceStale": "Balance may be outdated; please refresh",
 	"tokendanceAdminRechargeRequired": "Insufficient balance; contact your administrator to recharge",
-	"intelligentUi": {
-		"title": "Intelligent UI",
+	"genUi": {
+		"title": "GenUI",
 		"staticPreview": "Interactive previews are unavailable in this shared transcript.",
 		"unavailable": "This older UI reference is unavailable. Show the current file to preview it.",
 		"currentFiles": "Current files · not a historical snapshot",
@@ -27,6 +27,10 @@
 		"historyUnavailable": "Current files · history rollback unavailable",
 		"streaming": "Generating {{title}}…",
 		"expand": "Expand",
+		"run": "Run",
+		"notRunning": "Not running. Run builds it from the files as they are now.",
+		"formWaiting": "Waiting for your answer: {{title}}",
+		"formClose": "Close form",
 		"sendFailed": "Could not send the message",
 		"linkConfirm": "Open {{url}}?",
 		"linkOpen": "Open",

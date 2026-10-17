@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
-import { INTELLIGENT_UI_STREAM_FIELDS } from "@shared/intelligent-ui-tool-policy";
+import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -202,9 +202,9 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	// call is not rendered as an empty question.
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
 	// `source` is UI markup the chat renders while it streams.
-	IntelligentUI: {
-		short: [...INTELLIGENT_UI_STREAM_FIELDS.short],
-		large: [...INTELLIGENT_UI_STREAM_FIELDS.large],
+	GenUI: {
+		short: [...GEN_UI_STREAM_FIELDS.short],
+		large: [...GEN_UI_STREAM_FIELDS.large],
 	},
 };
 

@@ -37,10 +37,7 @@
  *   `captureSessionTree`, so it applies to every caller of this module.
  */
 import { lstat } from "node:fs/promises";
-import {
-	INTELLIGENT_UI_TOOL_NAME,
-	isIntelligentUiReadAction,
-} from "@shared/intelligent-ui-tool-policy";
+import { GEN_UI_TOOL_NAME, isGenUiReadAction } from "@shared/gen-ui-tool-policy";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
@@ -78,15 +75,15 @@ export const FILE_MUTATING_TOOLS = new Set([
 	"Edit",
 	"StructSed",
 	SHELL_TOOL_NAME,
-	INTELLIGENT_UI_TOOL_NAME,
+	GEN_UI_TOOL_NAME,
 ]);
 
 function isFileMutation(toolName: string, input: unknown): boolean {
 	return (
 		FILE_MUTATING_TOOLS.has(toolName) &&
 		!(
-			toolName === INTELLIGENT_UI_TOOL_NAME &&
-			isIntelligentUiReadAction((input as Record<string, unknown> | null)?.action)
+			toolName === GEN_UI_TOOL_NAME &&
+			isGenUiReadAction((input as Record<string, unknown> | null)?.action)
 		)
 	);
 }
@@ -301,7 +298,7 @@ export function buildTreeSnapshotEventHooks(
 			// resulting tree delta be attributed in a shared worktree. Bash cannot,
 			// so it declares nothing and its set is derived instead.
 			const lexicalDeclared =
-				toolName === SHELL_TOOL_NAME || toolName === INTELLIGENT_UI_TOOL_NAME
+				toolName === SHELL_TOOL_NAME || toolName === GEN_UI_TOOL_NAME
 					? null // create allocates its unique directory at execution time.
 					: declaredWorktreePaths(session.cwd, input);
 			localCalls.delete(toolUseId);
@@ -368,7 +365,7 @@ export function buildTreeSnapshotEventHooks(
 		onSnapshotAfter: async (toolUseId, toolName) => {
 			if (!FILE_MUTATING_TOOLS.has(toolName)) return;
 			// show never admitted a before boundary; do not manufacture an unavailable after.
-			if (toolName === INTELLIGENT_UI_TOOL_NAME && !localCalls.has(toolUseId)) return;
+			if (toolName === GEN_UI_TOOL_NAME && !localCalls.has(toolUseId)) return;
 			const capturedCwd = localCalls.get(toolUseId);
 			localCalls.delete(toolUseId);
 			const bashWindow =
