@@ -28,6 +28,8 @@ export const ID = {
 	logTitle: 307,
 	/** 日志被裁断后出现的"查看完整日志"按钮。 */
 	openLogFile: 308,
+	/** 在资源管理器中定位 server.log。 */
+	serverLog: 309,
 	logEdit: 401,
 } as const;
 
@@ -38,21 +40,32 @@ export const BUTTON_RADIUS = 6;
 export const CONFIG_CARD_TOP = 198;
 export const CONFIG_CARD_HEIGHT = 98;
 export const BUTTON_Y = 148;
-export const BUTTON_WIDTH = 86;
+/** 启动按钮要放下「启动 NarraFork 服务器」，其余按钮按各自文案收窄。 */
+export const ACTION_WIDTHS = [172, 104, 104, 120, 64] as const;
+export const BUTTON_WIDTH = ACTION_WIDTHS[0];
 export const BUTTON_HEIGHT = 32;
 export const BUTTON_GAP = 8;
 /** 初始值；窗口缩放后由 computeLayout 重算。 */
 export const LOG_CARD_TOP = CONFIG_CARD_TOP + CONFIG_CARD_HEIGHT + 14;
-/** 最小窗口（客户区）= 左右 16 边距 + 5 按钮 + 4 间距的按钮排：最小尺寸下五个按钮恰好
- * 占满窗口宽，放大后按钮保持该尺寸（buttonX 是固定布局）。 */
-export const MIN_WINDOW_WIDTH = CARD_X * 2 + BUTTON_WIDTH * 5 + BUTTON_GAP * 4;
-/** 最小窗口保持宽:高 = 3:4 的竖向比例。 */
-export const MIN_WINDOW_HEIGHT = Math.round((MIN_WINDOW_WIDTH * 4) / 3);
+/** 最小窗口（客户区）刚好排下五个动作按钮。放大后按钮保持该尺寸。 */
+export const MIN_WINDOW_WIDTH =
+	CARD_X * 2 +
+	ACTION_WIDTHS.reduce((sum, width) => sum + width, 0) +
+	BUTTON_GAP * (ACTION_WIDTHS.length - 1);
+/** 日志区需要一块固定高度；不再按 3:4 把窗口拉得比屏幕还高。 */
+export const MIN_WINDOW_HEIGHT = 720;
+export function buttonWidth(index: number): number {
+	return ACTION_WIDTHS[index] ?? BUTTON_WIDTH;
+}
 /** 初始卡片宽：内容按最小窗口排版，创建后再由 computeLayout 跟随实际客户区。 */
 export const CARD_WIDTH = MIN_WINDOW_WIDTH - 32;
 /** IP 输入框的最小宽度；更宽由内容自适应（见 main.ts 的 ipEditWidth）。 */
 export const IP_EDIT_MIN_WIDTH = 100;
-export const buttonX = (index: number): number => CARD_X + (BUTTON_WIDTH + BUTTON_GAP) * index;
+export function buttonX(index: number): number {
+	let x = CARD_X;
+	for (let i = 0; i < index; i++) x += buttonWidth(i) + BUTTON_GAP;
+	return x;
+}
 
 /** 窗口伸缩时只让日志卡与日志框跟随，其余元素保持设计位置（参考图本身就是固定列）。 */
 export interface Layout {

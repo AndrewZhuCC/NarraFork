@@ -65,3 +65,8 @@ export function shellExecute(target: string, params?: string): boolean {
 	void parameters?.bytes;
 	return Number(result) > 32;
 }
+
+/** 在资源管理器中选中文件。explorer 本身就是要显示的窗口，不能走隐藏控制台的启动方式。 */
+export function revealInFolder(filePath: string): boolean {
+	return shellExecute("explorer.exe", `/select,"${filePath}"`);
+}

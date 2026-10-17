@@ -1,4 +1,5 @@
 import { type Context, Hono } from "hono";
+import { scheduleOperatorShutdown } from "../lib/server-restart";
 import { requireAdmin, requireAdminOrManagerToken, requireAuth } from "../middleware/auth";
 import { systemLifecycle } from "../services/system-lifecycle-service";
 
@@ -32,6 +33,11 @@ systemLifecycleRoutes.post("/shutdown", requireAdmin, (c) => shutdownResponse(c)
  */
 export const managerLifecycleRoutes = new Hono();
 managerLifecycleRoutes.post("/shutdown", requireAdminOrManagerToken, (c) => shutdownResponse(c));
+// 与 Ctrl+C 相同：reason=signal 走完整优雅退出，不走更新交接那条保留现场的准备流程。
+managerLifecycleRoutes.post("/signal", requireAdminOrManagerToken, (c) => {
+	const scheduled = scheduleOperatorShutdown({ reason: "signal" });
+	return c.json({ success: scheduled }, scheduled ? 202 : 409);
+});
 systemLifecycleRoutes.post("/cancel", requireAdmin, (c) => {
 	const result = systemLifecycle.cancel();
 	return c.json(result, result.success ? 202 : 409);

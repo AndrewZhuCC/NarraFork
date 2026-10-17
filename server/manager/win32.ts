@@ -22,7 +22,10 @@ import {
 } from "bun:ffi";
 import { existsSync } from "node:fs";
 import { CHROMIUM_PATHS } from "@shared/browser-paths";
-import { shellExecute as shellExecuteWin } from "../lib/shell-exec";
+import {
+	revealInFolder as revealInFolderWin,
+	shellExecute as shellExecuteWin,
+} from "../lib/shell-exec";
 
 export type { Pointer };
 
@@ -969,6 +972,11 @@ export function postMessage(hwnd: Pointer, msg: number, wParam = 0, lParam = 0):
 /** 用系统默认程序打开 URL 或文件：复用 server 侧实现（其内部走 ShellExecuteW，无中间控制台进程）。 */
 export function openExternal(url: string): boolean {
 	return shellExecuteWin(url);
+}
+
+/** 在资源管理器中选中文件。 */
+export function revealInFolder(filePath: string): boolean {
+	return revealInFolderWin(filePath);
 }
 
 /**

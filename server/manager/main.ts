@@ -13,7 +13,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { createWriteStream, renameSync, statSync } from "node:fs";
+import { createWriteStream, existsSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { urlHost } from "@shared/server-host";
 import { decodeRgbaPng, getBrandIcons } from "../lib/branding";
@@ -27,8 +27,8 @@ import { showCloseDialog } from "./close-dialog";
 import { requestManagedShutdown } from "./control-client";
 import {
 	BUTTON_HEIGHT,
-	BUTTON_WIDTH,
 	BUTTON_Y,
+	buttonWidth,
 	buttonX,
 	CARD_WIDTH,
 	CARD_X,
@@ -109,6 +109,7 @@ import {
 	redrawWindow,
 	removeTrayIcon,
 	restoreScrollPixelPos,
+	revealInFolder,
 	richTextLength,
 	SS_LEFT,
 	SW_HIDE,
@@ -143,11 +144,7 @@ const WM_TRAY = WM_APP + 10;
 /** 窗口标题：单实例聚焦时按它查找已有窗口，必须与创建时一致。 */
 const WINDOW_TITLE = "NarraFork Manager";
 const TRAY_ID_OPEN = 9101;
-const TRAY_ID_ASK_TOGGLE = 9102;
 const TRAY_ID_EXIT = 9103;
-const TRAY_ID_WEB = 9104;
-const TRAY_ID_WEB_NEW = 9105;
-const TRAY_ID_SETTINGS = 9106;
 
 interface ManagerSettings {
 	host: string;
@@ -220,6 +217,7 @@ const BUTTONS: Record<number, { key: string; primary: boolean }> = {
 	[ID.settings]: { key: "button.settings", primary: false },
 	[ID.save]: { key: "button.save", primary: false },
 	[ID.openLogFile]: { key: "button.openLog", primary: false },
+	[ID.serverLog]: { key: "button.serverLog", primary: false },
 };
 
 interface Controls {
@@ -242,6 +240,7 @@ interface Controls {
 	portLabel?: Pointer;
 	logTitle?: Pointer;
 	openLogFile?: Pointer;
+	serverLog?: Pointer;
 	logEdit?: Pointer;
 }
 
@@ -570,9 +569,15 @@ function ipEditWidth(cardWidth: number): number {
 /** 响应式重排：卡片与日志随窗口伸缩，卡片内的右侧控件贴右边。 */
 function relayout(hwnd: Pointer): void {
 	const layout = computeLayout(hwnd);
-	const handles = [controls.start, controls.restart, controls.stop, controls.open];
+	const handles = [
+		controls.start,
+		controls.restart,
+		controls.stop,
+		controls.open,
+		controls.settings,
+	];
 	handles.forEach((handle, index) => {
-		moveWindow(handle, buttonX(index), BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT);
+		moveWindow(handle, buttonX(index), BUTTON_Y, buttonWidth(index), BUTTON_HEIGHT);
 	});
 
 	moveWindow(controls.bannerTitle, 22, 14, Math.max(200, layout.width - 44), 30);
@@ -592,8 +597,9 @@ function relayout(hwnd: Pointer): void {
 	moveWindow(controls.portEdit, ipRight + 60, CONFIG_CARD_TOP + 45, 68, 26);
 	moveWindow(controls.save, ipRight + 140, CONFIG_CARD_TOP + 44, 124, 28);
 
-	moveWindow(controls.logTitle, CARD_X + 16, layout.logCardTop + 12, 200, 20);
-	moveWindow(controls.openLogFile, CARD_X + 110, layout.logCardTop + 11, 104, 22);
+	moveWindow(controls.logTitle, CARD_X + 16, layout.logCardTop + 12, 160, 20);
+	moveWindow(controls.serverLog, layout.width - CARD_X - 132, layout.logCardTop + 10, 124, 24);
+	moveWindow(controls.openLogFile, CARD_X + 180, layout.logCardTop + 11, 104, 22);
 	moveWindow(
 		controls.logEdit,
 		CARD_X + 14,
@@ -646,6 +652,9 @@ function onCommand(id: number): void {
 		case ID.openLogFile:
 			// 用系统默认程序打开日志文件（面板内存里被裁断的完整历史在这里）。
 			openExternal(logFilePath);
+			break;
+		case ID.serverLog:
+			revealServerLog();
 			break;
 		case ID.save: {
 			const ip = controls.ipEdit
@@ -725,41 +734,20 @@ function handleMessage(
 			return 1;
 		}
 		case WM_TRAY: {
-			// lParam 的低位字是鼠标消息：双击还原窗口，右键弹菜单。
+			// 双击按用户设置打开 NarraFork 前端。右键只提供管理器窗口和优雅退出。
 			const event = Number(lParam) & 0xffff;
 			if (event === WM_LBUTTONDBLCLK) {
-				restoreFromTray(hwnd);
+				openPanel(false, true);
 				return 0;
 			}
 			if (event === WM_RBUTTONUP) {
 				const choice = showTrayMenu(hwnd, [
 					{ id: TRAY_ID_OPEN, text: t("tray.openWindow") },
-					{ id: TRAY_ID_SETTINGS, text: t("tray.settings") },
-					{ separator: true, id: 0, text: "" },
-					{ id: TRAY_ID_WEB, text: t("tray.openPanel") },
-					{ id: TRAY_ID_WEB_NEW, text: t("tray.openNewWindow") },
-					{ id: TRAY_ID_ASK_TOGGLE, text: t("tray.askToggle"), checked: !preferences.askOnClose },
 					{ separator: true, id: 0, text: "" },
 					{ id: TRAY_ID_EXIT, text: t("tray.exit") },
 				]);
-				if (choice === TRAY_ID_OPEN) {
-					restoreFromTray(hwnd);
-				} else if (choice === TRAY_ID_WEB) {
-					openPanel();
-				} else if (choice === TRAY_ID_WEB_NEW) {
-					openPanel(true);
-				} else if (choice === TRAY_ID_SETTINGS) {
-					void openSettings();
-				} else if (choice === TRAY_ID_EXIT) {
-					exitApplication(hwnd);
-				} else if (choice === TRAY_ID_ASK_TOGGLE) {
-					preferences = { ...preferences, askOnClose: !preferences.askOnClose };
-					writePreferences(preferences);
-					appendLog(
-						"PREP",
-						preferences.askOnClose ? t("log.askOnCloseOn") : t("log.askOnCloseOff"),
-					);
-				}
+				if (choice === TRAY_ID_OPEN) restoreFromTray(hwnd);
+				else if (choice === TRAY_ID_EXIT) void exitApplication(hwnd);
 				return 0;
 			}
 			return 0;
@@ -947,24 +935,42 @@ function restoreFromTray(hwnd: Pointer): void {
  * forceNewWindow 表示"用户明确要求打开"（托盘「打开新窗口」、Shift+点击）：此时即使设置是
  * "不打开"，也回落为浏览器网页 —— 否则那个菜单项会像坏掉一样毫无反应。
  */
-function openPanel(forceNewWindow = false): void {
+function openPanel(forceNewWindow = false, explicit = false): void {
 	// 已有前端窗口（--app 窗口的标题就是实例显示名）时直接聚焦，不重复打开。
 	if (!forceNewWindow && focusWindowByTitle(settings.brandName)) {
 		appendLog("WEB", t("log.focusedPanel"));
 		return;
 	}
 	const mode = readNarraForkSettings().openBrowser;
-	if (mode === "off" && !forceNewWindow) return;
+	// 托盘双击是明确要求打开。设置为「不打开」时仍回落为浏览器，避免点了没反应。
+	if (mode === "off" && !forceNewWindow && !explicit) return;
 	const url = `${serviceOrigin()}/`;
 	appendLog(
 		"WEB",
 		forceNewWindow ? t("log.openedPanelNew", { url }) : t("log.openedPanel", { url }),
 	);
-	if (mode === "app") {
-		openWebPanel(url, forceNewWindow);
-	} else {
-		openExternal(url);
+	if (mode === "app") openWebPanel(url, forceNewWindow);
+	else openExternal(url);
+}
+
+function revealServerLog(): void {
+	const path = join(resolveNarraforkHome(), "server.log");
+	if (!existsSync(path)) {
+		appendLog("WARN", t("log.serverLogMissing"));
+		openExternal(resolveNarraforkHome());
+		return;
 	}
+	revealInFolder(path);
+}
+
+/** 启动失败时才把管理器窗口带到前面，方便看日志。 */
+function showManagerWindow(): void {
+	if (!mainWindow) return;
+	showWindow(mainWindow.hwnd, SW_SHOW);
+	focusWindow(mainWindow.hwnd);
+	redrawWindow(mainWindow.hwnd);
+	relayout(mainWindow.hwnd);
+	invalidate(mainWindow.hwnd);
 }
 
 /** 按当前语言刷新静态文案；自绘按钮与状态行的文字在重绘时自动取新值。 */
@@ -981,6 +987,8 @@ function refreshControlTexts(): void {
 
 /** 服务就绪后是否已经按设置打开过前端；服务停下时复位。 */
 let frontendOpened = false;
+/** 同一次启动失败只打开一次管理器，避免 error 之后的退出码再弹一次。 */
+let startupFailureShown = false;
 
 /**
  * 服务就绪后打开前端。
@@ -1076,9 +1084,19 @@ export async function runManager(): Promise<void> {
 			}
 			if (state === "running") {
 				supervision = "none";
+				startupFailureShown = false;
 				openFrontendOnce();
+			} else if (state === "error" || (state === "stopped" && detail)) {
+				if (supervision !== "reconnecting" && supervision !== "adopted") {
+					frontendOpened = false;
+					if (!startupFailureShown) {
+						startupFailureShown = true;
+						appendLog("ERROR", t("log.startupFailed"));
+						showManagerWindow();
+					}
+				}
 			} else if (
-				(state === "stopped" || state === "error") &&
+				state === "stopped" &&
 				supervision !== "reconnecting" &&
 				supervision !== "adopted"
 			) {
@@ -1156,7 +1174,7 @@ export async function runManager(): Promise<void> {
 	);
 	controls.bannerSubtitle = add(
 		"STATIC",
-		"项目服务控制台",
+		t("label.console"),
 		SS_LEFT,
 		ID.bannerSubtitle,
 		24,
@@ -1174,56 +1192,56 @@ export async function runManager(): Promise<void> {
 	// 四个动作按钮（位置与尺寸由 relayout 统一管理）。
 	controls.start = add(
 		"BUTTON",
-		"启动项目",
+		t("button.start"),
 		BS_OWNERDRAW,
 		ID.start,
 		buttonX(0),
 		BUTTON_Y,
-		BUTTON_WIDTH,
+		buttonWidth(0),
 		BUTTON_HEIGHT,
 		uiFont,
 	);
 	controls.restart = add(
 		"BUTTON",
-		"重启服务",
+		t("button.restart"),
 		BS_OWNERDRAW,
 		ID.restart,
 		buttonX(1),
 		BUTTON_Y,
-		BUTTON_WIDTH,
+		buttonWidth(1),
 		BUTTON_HEIGHT,
 		uiFont,
 	);
 	controls.stop = add(
 		"BUTTON",
-		"关闭项目",
+		t("button.stop"),
 		BS_OWNERDRAW,
 		ID.stop,
 		buttonX(2),
 		BUTTON_Y,
-		BUTTON_WIDTH,
+		buttonWidth(2),
 		BUTTON_HEIGHT,
 		uiFont,
 	);
 	controls.open = add(
 		"BUTTON",
-		"打开面板",
+		t("button.open"),
 		BS_OWNERDRAW,
 		ID.open,
 		buttonX(3),
 		BUTTON_Y,
-		BUTTON_WIDTH,
+		buttonWidth(3),
 		BUTTON_HEIGHT,
 		uiFont,
 	);
 	controls.settings = add(
 		"BUTTON",
-		"设置",
+		t("button.settings"),
 		BS_OWNERDRAW,
 		ID.settings,
 		buttonX(4),
 		BUTTON_Y,
-		BUTTON_WIDTH,
+		buttonWidth(4),
 		BUTTON_HEIGHT,
 		uiFont,
 	);
@@ -1310,14 +1328,25 @@ export async function runManager(): Promise<void> {
 	// 输出日志卡片。
 	controls.logTitle = add(
 		"STATIC",
-		"输出日志",
+		t("label.output"),
 		SS_LEFT,
 		ID.logTitle,
 		CARD_X + 16,
 		LOG_CARD_TOP + 12,
-		200,
+		160,
 		20,
 		cardTitleFont,
+	);
+	controls.serverLog = add(
+		"BUTTON",
+		t("button.serverLog"),
+		BS_OWNERDRAW,
+		ID.serverLog,
+		CARD_X + CARD_WIDTH - 140,
+		LOG_CARD_TOP + 10,
+		124,
+		24,
+		uiFont,
 	);
 	// 日志被裁断后、用户滚到顶部时才显示：打开完整日志文件。
 	controls.openLogFile = add(
@@ -1354,13 +1383,9 @@ export async function runManager(): Promise<void> {
 		if (!trayAdded) appendLog("WARN", t("log.trayFailed"));
 	}
 
-	// 窗口是隐藏创建的；托盘挂好后决定是否需要显示。托盘没挂上时必须显示窗口，
-	// 否则窗口就再也找不回来了。
-	if (preferences.startMinimized && trayAdded) {
-		appendLog("PREP", t("log.minimized"));
-	} else {
-		showWindow(hwnd, SW_SHOW);
-	}
+	// 正常启动不显示管理器。托盘没挂上时必须显示窗口，否则再也找不回来。
+	if (!trayAdded) showManagerWindow();
+	else appendLog("PREP", t("log.minimized"));
 	// 必须在显示之后：RedrawWindow 对隐藏窗口不生效，否则自绘按钮首次显示时是空白，要等用户
 	// 改变窗口大小才画出来。
 	relayout(hwnd);
@@ -1404,22 +1429,28 @@ export async function runManager(): Promise<void> {
 				void backend?.start();
 				return;
 			}
-			// 首次探测结束后按偏好自动启动：此时才知道有没有外部服务在跑，避免与它抢实例锁。
-			if (!firstProbeDone) {
-				firstProbeDone = true;
-				if (preferences.autoStartBackend && !alive) {
-					appendLog("RUN", t("settings.autoStarting"));
-					void backend?.start();
-					return;
-				}
-			}
+			if (!firstProbeDone) firstProbeDone = true;
 			if (alive === externalRunning) return;
 			externalRunning = alive;
 			appendLog("PREP", alive ? t("log.externalDetected") : t("log.externalStopped"));
 			applyStatus("stopped");
 		});
 	};
-	void probeExternal();
+	const launchOnStartup = async (): Promise<void> => {
+		const alive = await probeServiceHealth(settings.host, settings.port, settings.tls);
+		firstProbeDone = true;
+		if (backend?.current !== "stopped") return;
+		if (alive) {
+			externalRunning = true;
+			appendLog("PREP", t("log.externalDetected"));
+			applyStatus("stopped");
+			openFrontendOnce();
+			return;
+		}
+		appendLog("RUN", t("log.startingService"));
+		await backend?.start();
+	};
+	void launchOnStartup();
 	const externalTimer = setInterval(probeExternal, 4000);
 
 	// 悬停高亮：光标下的控件变化时重绘两侧 —— 自绘按钮不会自己收到"已进入/已离开"通知。

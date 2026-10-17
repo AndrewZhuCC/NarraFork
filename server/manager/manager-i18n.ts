@@ -36,14 +36,15 @@ const MESSAGES: Record<string, Message> = {
 	},
 
 	// ── 主窗口 ───────────────────────────────────────────────────────────────
-	"button.start": { "zh-CN": "启动项目", en: "Start" },
-	"button.restart": { "zh-CN": "重启服务", en: "Restart" },
-	"button.stop": { "zh-CN": "关闭项目", en: "Stop" },
-	"button.open": { "zh-CN": "打开面板", en: "Open" },
+	"button.start": { "zh-CN": "启动 NarraFork 服务器", en: "Start NarraFork Server" },
+	"button.restart": { "zh-CN": "重启服务器", en: "Restart Server" },
+	"button.stop": { "zh-CN": "停止服务器", en: "Stop Server" },
+	"button.open": { "zh-CN": "打开 NarraFork", en: "Open NarraFork" },
 	"button.settings": { "zh-CN": "设置", en: "Settings" },
 	"button.save": { "zh-CN": "保存并应用", en: "Save" },
 	"button.openLog": { "zh-CN": "查看完整日志", en: "Log" },
-	"label.console": { "zh-CN": "项目服务控制台", en: "Service Console" },
+	"button.serverLog": { "zh-CN": "定位 server.log", en: "Show server.log" },
+	"label.console": { "zh-CN": "NarraFork 服务器控制台", en: "NarraFork Server Console" },
 	"label.listenConfig": { "zh-CN": "监听配置", en: "Listen Address" },
 	"label.autoApply": { "zh-CN": "保存后自动生效", en: "Applied automatically after saving" },
 	"label.ip": { "zh-CN": "IP 地址", en: "IP Address" },
@@ -57,12 +58,21 @@ const MESSAGES: Record<string, Message> = {
 		en: "Manager started (brand color {color}).",
 	},
 	"log.clickStart": {
-		"zh-CN": "点击「启动项目」拉起后端服务。",
-		en: "Click “Start Project” to launch the backend service.",
+		"zh-CN": "正在启动 NarraFork 服务器...",
+		en: "Starting the NarraFork server...",
 	},
-	"log.startingService": { "zh-CN": "正在启动服务...", en: "Starting service..." },
-	"log.restartingService": { "zh-CN": "正在重启服务...", en: "Restarting service..." },
-	"log.stoppingService": { "zh-CN": "正在关闭服务...", en: "Stopping service..." },
+	"log.startingService": {
+		"zh-CN": "正在启动 NarraFork 服务器...",
+		en: "Starting the NarraFork server...",
+	},
+	"log.restartingService": {
+		"zh-CN": "正在重启 NarraFork 服务器...",
+		en: "Restarting the NarraFork server...",
+	},
+	"log.stoppingService": {
+		"zh-CN": "正在停止 NarraFork 服务器...",
+		en: "Stopping the NarraFork server...",
+	},
 	"log.settingsSaved": {
 		"zh-CN": "监听配置已保存，后端将自动应用：{address}",
 		en: "Listen address saved; the backend applies it automatically: {address}",
@@ -84,8 +94,9 @@ const MESSAGES: Record<string, Message> = {
 		en: "The externally started service has stopped.",
 	},
 	"log.externalDetected": {
-		"zh-CN": "检测到服务已在运行（外部启动）；点「启动项目」可在其退出后由面板接管。",
-		en: "A service is already running (started externally); click “Start Project” to take over after it exits.",
+		"zh-CN":
+			"NarraFork 服务器已在运行（外部启动）。点「启动 NarraFork 服务器」可在其退出后由托盘接管。",
+		en: "The NarraFork server is already running (started externally). Click “Start NarraFork Server” to take over after it exits.",
 	},
 	"log.takeoverStart": {
 		"zh-CN": "外部服务已停止，面板开始接管启动...",
@@ -107,7 +118,15 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "托盘图标添加失败，关闭窗口将直接退出。",
 		en: "Failed to add the tray icon; closing the window will exit.",
 	},
-	"log.openedPanel": { "zh-CN": "已打开面板: {url}", en: "Opened the panel: {url}" },
+	"log.serverLogMissing": {
+		"zh-CN": "server.log 还不存在，已打开数据目录。",
+		en: "server.log does not exist yet; opened the data folder.",
+	},
+	"log.startupFailed": {
+		"zh-CN": "NarraFork 服务器启动失败，已打开管理器窗口。",
+		en: "The NarraFork server failed to start. The manager window is open.",
+	},
+	"log.openedPanel": { "zh-CN": "已打开 NarraFork: {url}", en: "Opened NarraFork: {url}" },
 	"log.openedPanelNew": {
 		"zh-CN": "已打开新面板窗口: {url}",
 		en: "Opened a new panel window: {url}",
@@ -132,11 +151,11 @@ const MESSAGES: Record<string, Message> = {
 
 	// ── 托盘 ─────────────────────────────────────────────────────────────────
 	"tray.openWindow": { "zh-CN": "打开管理器窗口", en: "Open Manager Window" },
-	"tray.openPanel": { "zh-CN": "打开前端面板", en: "Open Frontend Panel" },
+	"tray.openPanel": { "zh-CN": "打开 NarraFork", en: "Open NarraFork" },
 	"tray.openNewWindow": { "zh-CN": "打开新窗口", en: "Open New Window" },
 	"tray.askToggle": { "zh-CN": "关闭时不再询问", en: "Don't Ask on Close" },
 	"tray.settings": { "zh-CN": "设置...", en: "Settings..." },
-	"tray.exit": { "zh-CN": "退出并关闭项目", en: "Exit and Stop Project" },
+	"tray.exit": { "zh-CN": "退出 NarraFork", en: "Exit NarraFork" },
 
 	// ── 关闭确认对话框 ───────────────────────────────────────────────────────
 	"close.title": { "zh-CN": "关闭 NarraFork", en: "Close NarraFork" },
@@ -145,15 +164,15 @@ const MESSAGES: Record<string, Message> = {
 		en: "Stop the backend and exit, or minimize to the tray and keep running in the background?",
 	},
 	"close.minimize": { "zh-CN": "最小化到托盘", en: "Minimize to Tray" },
-	"close.exit": { "zh-CN": "退出程序", en: "Exit" },
+	"close.exit": { "zh-CN": "退出 NarraFork", en: "Exit NarraFork" },
 	"close.cancel": { "zh-CN": "取消", en: "Cancel" },
 	"close.remember": {
 		"zh-CN": "记住我的选择，下次不再询问",
 		en: "Remember my choice and don't ask again",
 	},
 	"close.hint": {
-		"zh-CN": "最小化到托盘后，项目服务继续在后台运行。",
-		en: "When minimized to the tray, the project service keeps running in the background.",
+		"zh-CN": "最小化到托盘后，NarraFork 服务器继续在后台运行。",
+		en: "When minimized to the tray, the NarraFork server keeps running.",
 	},
 
 	// ── 设置窗口 ─────────────────────────────────────────────────────────────
@@ -163,14 +182,17 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "面板界面语言，保存在管理器自己的配置里",
 		en: "Panel language, stored in the manager's own configuration",
 	},
-	"settings.openBrowser": { "zh-CN": "启动项目时前端打开方式", en: "Open the frontend on start" },
+	"settings.openBrowser": {
+		"zh-CN": "启动时如何打开 NarraFork",
+		en: "How to open NarraFork on start",
+	},
 	"settings.openBrowserHint": {
 		"zh-CN": "同步 NarraFork 配置（settings.json）",
 		en: "Synced with NarraFork configuration (settings.json)",
 	},
 	"settings.openBrowser.off": { "zh-CN": "不打开", en: "Don't open" },
-	"settings.openBrowser.browser": { "zh-CN": "网页", en: "Browser tab" },
-	"settings.openBrowser.app": { "zh-CN": "应用", en: "App window" },
+	"settings.openBrowser.browser": { "zh-CN": "浏览器", en: "Browser" },
+	"settings.openBrowser.app": { "zh-CN": "网页应用", en: "Web app" },
 	"settings.instanceName": { "zh-CN": "实例名称", en: "Instance Name" },
 	"settings.instanceNameHint": {
 		"zh-CN": "留空使用默认名；同步 NarraFork 配置",

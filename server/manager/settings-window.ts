@@ -90,7 +90,7 @@ export interface SettingsDialogResult {
 }
 
 const WIDTH = 460;
-const HEIGHT = 586;
+const HEIGHT = 470;
 const CARD_BG = 0x00ffffff;
 const TEXT_MAIN = 0x0028231f;
 const TEXT_FAINT = 0x008d8a8a;
@@ -401,41 +401,11 @@ export async function showSettingsDialog(
 		22,
 		uiFont,
 	);
-	y = 320;
-	controls.startMinimized = add(
-		"BUTTON",
-		t("settings.startMinimized"),
-		BS_AUTOCHECKBOX,
-		ID.startMinimized,
-		CONTROL_X,
-		y,
-		CONTROL_WIDTH,
-		22,
-		uiFont,
-	);
-	addHint(t("settings.startMinimizedHint"), y + 24);
-
-	y = 370;
-	controls.autoStart = add(
-		"BUTTON",
-		t("settings.autoStart"),
-		BS_AUTOCHECKBOX,
-		ID.autoStart,
-		CONTROL_X,
-		y,
-		CONTROL_WIDTH,
-		22,
-		uiFont,
-	);
-	addHint(t("settings.autoStartHint"), y + 24);
-
-	// 复选框按已保存的偏好回显，否则每次打开都是默认未勾选。
+	// 双击 exe 固定为托盘启动并拉起服务器，不再提供这两项开关。
 	checkBoxSetChecked(controls.askOnClose, input.preferences.askOnClose);
-	checkBoxSetChecked(controls.startMinimized, input.preferences.startMinimized);
-	checkBoxSetChecked(controls.autoStart, input.preferences.autoStartBackend);
 
 	// ── 更新（服务端自带接口，本机回环免认证）─────────────────────────────
-	y = 428;
+	y = 328;
 	add("STATIC", t("settings.update"), SS_LEFT, 626, LABEL_X, y + 4, 120, 20, titleFont);
 	controls.checkUpdate = add(
 		"BUTTON",
@@ -517,8 +487,6 @@ export async function showSettingsDialog(
 			language,
 			closeAction: comboBoxSelected(controls.closeAction) === 1 ? "minimize" : "exit",
 			askOnClose: isChecked(controls.askOnClose),
-			startMinimized: isChecked(controls.startMinimized),
-			autoStartBackend: isChecked(controls.autoStart),
 		};
 		const nextNarrafork: NarraForkSettings = {
 			openBrowser: mode ?? input.narrafork.openBrowser,
