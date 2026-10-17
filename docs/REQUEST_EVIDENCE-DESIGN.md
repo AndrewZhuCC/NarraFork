@@ -125,20 +125,9 @@ provider.chat()
 - 重复 header（如多个 `set-cookie`、`via`）保留为数组，不再被 `Headers.entries()` 合并时丢失。
 - 预算按次 attempt 计；`/v1` 回退、重连等多次 attempt 各自独立，不互相挤占。
 
-### 4.6 token 修复改为读证据（取决于 Q4）
+### 4.6 历史 Token 核对：随旧 dump 一起下线（D4）
 
-`analyzeTokenRepairEvidence(row, rawDumpJson)` 改为接收一个证据源接口：
-
-```ts
-interface UsageEvidenceSource {
-  kind: "recording" | "legacy";
-  responseItems(signal): AsyncIterable<unknown>; // 已解析的 SSE/JSON 响应事件
-  requestUrl?: string;
-  complete: boolean; // 对应 partial/truncated/bodyIncomplete
-}
-```
-
-recording 实现由 evidence worker 读固定区段文件流式解析（已在 worker 内，不碰主线程）；legacy 实现就是现有逻辑。注意：只有**被固定**的证据对修复可用，循环区的可能随时淘汰——修复任务遇到 `ring` 状态可以先 pin(`request`) 再读，或直接判 `insufficient`（待定 Q4）。
+「历史 Token 核对」（`/settings/usage-repair`，`usage-token-repair-*`）唯一的证据来源是旧版 dump；旧数据丢弃后它对历史行再无证据，新请求又已按新口径记账，因此整体下线：删除前端页面与 `TokenRepairNotice`、`/api/usage-history/token-repair` 路由、worker 与 store。`api_requests.token_accounting_version` / `token_accounting_review_version` 两列及其部分索引一并作为待删列处理（与 `raw_dump_json` 同批次删列）；`usage_token_repair_jobs` 等核对任务表同样走 schema 删除 + `db:generate`（tracker 写这两列的代码一并移除；除核对外无其他读取方）。
 
 ### 4.7 UI：一个证据面板，三个入口
 
@@ -169,7 +158,7 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 
 1. **P1 打通索引（纯增量）**：`recording_request_id` 列 + recorder `status` 操作 + 使用历史抽屉显示证据状态与「固定并下载」；headers 单独预算（4.5）。用户立刻能在使用历史里拿到循环录制。
 2. **P2 收敛固定路径**：`leak`/`malformed` 改为 pin；`requestDumpEnabled` 不再写旧版 JSON（停止双写）；新请求只写 `diagnostics_json`，`hasRawDump` 改为 `hasDiagnostics`。ZIP 内增加派生 `dump.json`。
-3. **P3 消费方迁移**：token 修复双源；设置合并与迁移；存储分类合并；`REQUEST_DUMPS.md` 改写。
+3. **P3 消费方迁移**：下线历史 Token 核对；设置合并与迁移；存储分类合并；`REQUEST_DUMPS.md` 改写。
 4. **P4 下线旧代码与旧数据**：删除溢写、畸形 dump、collector 快照物化及 raw-dump 下载路由；后台清空 `raw_dump_json` 与两个旧目录；下一个版本删列。
 
 ## 6. 已定与待定
@@ -177,5 +166,5 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 - **D1 旧数据：直接丢弃。** 不做只读兼容、不做转换；旧目录和 `raw_dump_json` 由后台任务清理。
 - **D2 `/save_dump` 保留窗口快照**（多请求）；单条固定由报错卡片和使用历史负责。
 - **D3 不再区分新旧**：只有新版证据 + 有界诊断。
-- **Q4 token 修复（历史 Token 核对）**：它依赖旧 dump 里的响应 usage 重算历史行的缓存 token；旧 dump 丢弃后它对历史行就没有证据了。待定：先跑一次核对再丢弃，还是连同该功能的 dump 证据路径一起移除。
+- **D4 历史 Token 核对直接下线**：dump 只用于排查，旧问题已排查完，不再保留依赖旧 dump 的功能。
 - **Q5 设置是否改键名**：推荐改为 `requestEvidence.*` 并迁移，因为 `requestDumpEnabled` 的含义已经变了，沿用旧名会继续误导；代价是一个版本的双键兼容。
