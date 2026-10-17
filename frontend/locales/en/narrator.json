@@ -2,7 +2,12 @@
 	"composerAttachmentInsertionExpired": "The draft changed while attachments were being prepared. Nothing was inserted; please attach them again.",
 	"composerAttachmentsProcessing": "Attachments are still being prepared. Please wait before sending.",
 	"composerMissingAssets": "Some attachments are unavailable. Reselect the files or remove their nodes.",
-	"attachments": { "missing": "Attachment needs to be reselected" },
+	"composerRestoringAssets": "Restoring draft attachments. Please wait before sending.",
+	"composerAttachmentsRestoreFailed": "Could not read draft attachments. Local attachment storage was not overwritten. Retry before sending.",
+	"attachments": {
+		"missing": "Attachment needs to be reselected",
+		"restoring": "Restoring attachment…"
+	},
 	"richComposer": {
 		"collapse": "Exit fullscreen",
 		"optimizeChanged": "The draft changed or the optimization could not preserve its text segments. Nothing was replaced; please try again."

@@ -8,6 +8,7 @@ import type { FileReference } from "@shared/file-reference";
 import {
 	IconExternalLink,
 	IconFileText,
+	IconLoader2,
 	IconPaperclip,
 	IconPhoto,
 	IconQuote,
@@ -94,6 +95,8 @@ export interface InlineComposerEditorProps {
 	value: ComposerDocument;
 	onChange(document: ComposerDocument): void;
 	resources?: ReadonlyMap<string, File | string>;
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
 	elementRef?: RefObject<HTMLDivElement | null>;
 	onElement?: (element: HTMLDivElement | null) => void;
 	/** Notification only: retain resources for undo until the editor lifecycle ends. */
@@ -121,7 +124,13 @@ const candidateKey = new PluginKey<number | null>("inlineComposerCandidate");
 type AtomNode = Exclude<ComposerInlineNode, { type: "text" } | { type: "break" }>;
 type AtomContextValue = Pick<
 	InlineComposerEditorProps,
-	"resources" | "disabled" | "onOpenQuote" | "onOpenFile" | "onOpenImage"
+	| "resources"
+	| "attachmentsHydrating"
+	| "attachmentsRestoreFailed"
+	| "disabled"
+	| "onOpenQuote"
+	| "onOpenFile"
+	| "onOpenImage"
 > & { assets: ReadonlyMap<string, ComposerAsset> };
 const AtomContext = createContext<AtomContextValue>({ assets: new Map() });
 
@@ -247,27 +256,37 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 	const value = node.attrs.value as AtomNode;
 	const asset = value.type === "attachment" ? context.assets.get(value.assetId) : undefined;
 	const resource = value.type === "attachment" ? context.resources?.get(value.assetId) : undefined;
-	const [objectURL, setObjectURL] = useState<string>();
-	const [failed, setFailed] = useState(false);
+	const [objectURL, setObjectURL] = useState<{ file: File; url: string }>();
+	const [failedSource, setFailedSource] = useState<string>();
 	useEffect(() => {
-		setFailed(false);
+		setFailedSource(undefined);
 		if (asset?.kind !== "image" || !resource || typeof resource === "string") {
 			setObjectURL(undefined);
 			return;
 		}
 		const url = URL.createObjectURL(resource);
-		setObjectURL(url);
+		setObjectURL({ file: resource, url });
 		return () => URL.revokeObjectURL(url);
 	}, [resource, asset?.kind]);
 	const image = asset?.kind === "image";
-	const source = objectURL ?? safeImageSource(resource);
+	const source =
+		typeof resource === "string"
+			? safeImageSource(resource)
+			: objectURL?.file === resource
+				? objectURL?.url
+				: undefined;
+	const failed = !!source && failedSource === source;
+	const restoring =
+		value.type === "attachment" &&
+		((!resource && context.attachmentsHydrating) ||
+			(image && !!resource && typeof resource !== "string" && !source));
 	const label =
 		value.type === "quote"
 			? value.label
 			: value.type === "fileReference"
 				? fileReferenceToken(value.reference).replace(/^#file:/, "")
 				: (asset?.name ?? t("attachments.missing", { defaultValue: "Attachment unavailable" }));
-	const missing = value.type === "attachment" && !resource;
+	const missing = value.type === "attachment" && !resource && !restoring;
 	const select = () => {
 		const position = getPos();
 		if (typeof position === "number") editor.chain().focus().setNodeSelection(position).run();
@@ -305,7 +324,10 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 			contentEditable={false}
 			className={`${classes.atom} ${image ? classes.imageAtom : classes.chip} ${selected ? classes.selected : ""}`}
 			data-composer-atom={value.type}
+			data-composer-asset-id={value.type === "attachment" ? value.assetId : undefined}
 			data-missing={missing || undefined}
+			data-loading={restoring || undefined}
+			aria-busy={restoring || undefined}
 		>
 			<button
 				type="button"
@@ -318,15 +340,19 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				{image ? (
 					<span className={classes.thumbnail}>
 						{source && !failed ? (
-							<img src={source} alt={label} onError={() => setFailed(true)} />
+							<img key={source} src={source} alt={label} onError={() => setFailedSource(source)} />
+						) : restoring ? (
+							<IconLoader2 size={22} />
 						) : (
 							<IconPhoto size={22} />
 						)}
-						<span className={classes.imageLabel}>{label}</span>
+						<span className={classes.imageLabel}>
+							{restoring ? t("attachments.restoring") : label}
+						</span>
 					</span>
 				) : (
 					<>
-						<Icon size={14} />
+						{restoring ? <IconLoader2 size={14} /> : <Icon size={14} />}
 						<span className={classes.label}>{label}</span>
 						{asset && <small>{Math.ceil(asset.size / 1024)} KB</small>}
 					</>
@@ -338,6 +364,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 						type="button"
 						className={classes.action}
 						aria-label={t("quote.open", { defaultValue: "Open" })}
+						disabled={restoring || missing}
 						onPointerDown={(event) => event.preventDefault()}
 						onClick={open}
 					>
@@ -365,7 +392,11 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 			{missing && (
 				<span
 					className={classes.missing}
-					title={t("attachments.missing", { defaultValue: "Attachment needs to be reselected" })}
+					title={
+						context.attachmentsRestoreFailed
+							? t("composerAttachmentsRestoreFailed")
+							: t("attachments.missing", { defaultValue: "Attachment needs to be reselected" })
+					}
 				>
 					!
 				</span>
@@ -874,6 +905,8 @@ export const InlineComposerEditor = forwardRef<
 		() => ({
 			assets: new Map(assetsRef.current),
 			resources: props.resources,
+			attachmentsHydrating: props.attachmentsHydrating,
+			attachmentsRestoreFailed: props.attachmentsRestoreFailed,
 			disabled: props.disabled,
 			onOpenQuote: props.onOpenQuote,
 			onOpenFile: props.onOpenFile,
@@ -884,6 +917,8 @@ export const InlineComposerEditor = forwardRef<
 		[
 			assetGeneration,
 			props.resources,
+			props.attachmentsHydrating,
+			props.attachmentsRestoreFailed,
 			props.disabled,
 			props.onOpenQuote,
 			props.onOpenFile,

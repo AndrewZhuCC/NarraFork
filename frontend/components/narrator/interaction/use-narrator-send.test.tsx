@@ -292,6 +292,105 @@ describe("structured send snapshots", () => {
 		await act(async () => actions.handleSend());
 		expect(send).toHaveBeenCalledTimes(1);
 	});
+	for (const restoreFailed of [false, true]) {
+		test.each([
+			"direct",
+			"send ref",
+			"turn",
+			"tool",
+			"interrupt",
+			"composer turn",
+			"composer tool",
+			"composer interrupt",
+			"forward",
+			"registered forward",
+		] as const)(`%s preserves input and resources while attachment restoration ${restoreFailed ? "has failed" : "is pending"}`, async (path) => {
+			const { doc, images, textFiles } = richDraft();
+			const ingestingRef = { current: true };
+			let registeredForward: ((text: string) => void) | undefined;
+			await render({
+				attachmentsHydrating: !restoreFailed,
+				attachmentsRestoreFailed: restoreFailed,
+				ingestingRef,
+				attachedImages: images,
+				attachedTextFiles: textFiles,
+				attachedImagesRef: { current: images },
+				attachedTextFilesRef: { current: textFiles },
+				registerSubmitToNarrator: (submit) => {
+					registeredForward = submit;
+					return undefined;
+				},
+			});
+			const submit = async () => {
+				switch (path) {
+					case "direct":
+						await actions.handleSend();
+						break;
+					case "send ref":
+						await actions.handleSendRef.current();
+						break;
+					case "turn":
+					case "tool":
+					case "interrupt":
+						await actions.handleSendWithModeRef.current(path);
+						break;
+					case "composer turn":
+						actions.composerSendWithMode("turn");
+						break;
+					case "composer tool":
+						actions.composerSendWithMode("tool");
+						break;
+					case "composer interrupt":
+						actions.composerSendWithMode("interrupt");
+						break;
+					case "forward":
+						actions.forwardTextToNarrator("forwarded");
+						break;
+					case "registered forward":
+						expect(registeredForward).toBeDefined();
+						registeredForward?.("forwarded");
+						break;
+				}
+				await Promise.resolve();
+			};
+			await act(submit);
+			expect(send).not.toHaveBeenCalled();
+			expect(options.createNarrator.mutateAsync).not.toHaveBeenCalled();
+			expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+			expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+			expect(options.updateAttachedImages).not.toHaveBeenCalled();
+			expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.getDocument()).toEqual(doc);
+			expect(options.sendingRef.current).toBe(false);
+			expect(actions.sendingState).toBeNull();
+			expect(queue.map((message) => message.id)).toEqual(["existing"]);
+			expect(notify).toHaveBeenCalledTimes(1);
+			expect(notify).toHaveBeenLastCalledWith(
+				expect.objectContaining({
+					...(!restoreFailed ? { color: "yellow" } : {}),
+					message: restoreFailed ? "composerAttachmentsRestoreFailed" : "composerRestoringAssets",
+				}),
+			);
+			ingestingRef.current = false;
+			await render({ attachmentsHydrating: false, attachmentsRestoreFailed: false });
+			await act(submit);
+			expect(send).toHaveBeenCalledTimes(1);
+			if (path === "forward" || path === "registered forward") {
+				expect(send.mock.calls[0]?.[1]).toBe("forwarded");
+				expect(send.mock.calls[0]?.[2]).toBeUndefined();
+				expect(send.mock.calls[0]?.[3]).toBeUndefined();
+			} else {
+				expect(send.mock.calls[0]?.[2]).toEqual([images[1], images[0]]);
+				expect(send.mock.calls[0]?.[3]).toEqual(textFiles);
+				expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+			}
+		});
+	}
 	test("old handles without getDocument remain supported", async () => {
 		Reflect.deleteProperty(options.composerRef.current ?? {}, "getDocument");
 		Reflect.deleteProperty(options.composerRef.current ?? {}, "hasMissingAssets");

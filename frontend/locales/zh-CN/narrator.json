@@ -2,7 +2,12 @@
 	"composerAttachmentInsertionExpired": "附件处理期间草稿已切换，未插入任何附件，请重新添加。",
 	"composerAttachmentsProcessing": "附件仍在处理中，请稍后发送。",
 	"composerMissingAssets": "附件资源缺失，请重新选择文件或移除对应节点。",
-	"attachments": { "missing": "附件需重新选择" },
+	"composerRestoringAssets": "正在恢复草稿附件，请恢复完成后发送。",
+	"composerAttachmentsRestoreFailed": "草稿附件读取失败，未覆盖本地附件。请重试恢复后再发送。",
+	"attachments": {
+		"missing": "附件需重新选择",
+		"restoring": "正在恢复附件…"
+	},
 	"richComposer": {
 		"collapse": "退出全屏",
 		"optimizeChanged": "草稿已变化，或优化结果无法保留文本分段。未替换任何内容，请重试。"

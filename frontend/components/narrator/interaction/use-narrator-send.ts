@@ -100,6 +100,9 @@ export interface UseNarratorSendOptions {
 	sendingRef: React.RefObject<boolean>;
 	/** Set synchronously when a file is enqueued, before asynchronous resize/validation. */
 	ingestingRef?: React.RefObject<boolean>;
+	/** Pending IndexedDB recovery may still add files referenced by the current draft. */
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
 
 	// Queue buffer (owned by the WS layer).
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
@@ -217,10 +220,18 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 
 	const ingestingRef = options.ingestingRef;
 	const blockWhileIngesting = useCallback(() => {
+		if (options.attachmentsRestoreFailed) {
+			notifications.show({ color: "yellow", message: t("composerAttachmentsRestoreFailed") });
+			return true;
+		}
+		if (options.attachmentsHydrating) {
+			notifications.show({ color: "yellow", message: t("composerRestoringAssets") });
+			return true;
+		}
 		if (!ingestingRef?.current) return false;
 		notifications.show({ color: "yellow", message: t("composerAttachmentsProcessing") });
 		return true;
-	}, [ingestingRef, t]);
+	}, [ingestingRef, options.attachmentsHydrating, options.attachmentsRestoreFailed, t]);
 	const recordingSavedRef = useRef(options.onRequestRecordingSaved);
 	recordingSavedRef.current = options.onRequestRecordingSaved;
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);

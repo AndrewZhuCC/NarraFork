@@ -955,6 +955,10 @@ function NarratorPanelBody({
 		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 		reconcileDocumentAssets,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
+		retryAttachmentRestore,
+		restoredAttachmentResources,
 	} = useComposerAttachments({ narratorId, currentUserId, sendingRef, t });
 
 	// Composer file ingestion (image/text validation + resize, file picker, paste
@@ -2595,6 +2599,8 @@ function NarratorPanelBody({
 		narratorId,
 		composerRef,
 		ingestingRef,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
 		attachedImagesRef,
@@ -3456,6 +3462,10 @@ function NarratorPanelBody({
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
+						attachmentsHydrating={attachmentsHydrating}
+						attachmentsRestoreFailed={attachmentsRestoreFailed}
+						onRetryAttachments={retryAttachmentRestore}
+						restoredAttachmentResources={restoredAttachmentResources}
 						updateAttachedImages={updateAttachedImages}
 						updateAttachedTextFiles={updateAttachedTextFiles}
 						reconcileDocumentAssets={reconcileDocumentAssets}

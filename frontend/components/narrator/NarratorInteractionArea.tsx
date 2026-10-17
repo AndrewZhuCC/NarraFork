@@ -42,6 +42,10 @@ export interface NarratorInteractionAreaProps {
 	// pure util imported directly, and the image viewer comes from context.
 	attachedImages: File[];
 	attachedTextFiles: File[];
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
+	onRetryAttachments?: () => void;
+	restoredAttachmentResources?: ReadonlyMap<string, File>;
 	updateAttachedImages: React.Dispatch<React.SetStateAction<File[]>>;
 	updateAttachedTextFiles: React.Dispatch<React.SetStateAction<File[]>>;
 	reconcileDocumentAssets?: (ids: readonly string[]) => void;
@@ -226,6 +230,10 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 					{...props.composerRowProps}
 					attachedImages={props.attachedImages}
 					attachedTextFiles={props.attachedTextFiles}
+					attachmentsHydrating={props.attachmentsHydrating}
+					attachmentsRestoreFailed={props.attachmentsRestoreFailed}
+					onRetryAttachments={props.onRetryAttachments}
+					restoredAttachmentResources={props.restoredAttachmentResources}
 					onDocumentAssetsChange={props.reconcileDocumentAssets}
 					onAttachmentsChange={(images, textFiles) => {
 						props.updateAttachedImages(images);
