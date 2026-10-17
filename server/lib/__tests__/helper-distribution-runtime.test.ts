@@ -490,18 +490,24 @@ try {
 			rmSync(root, { recursive: true, force: true });
 		}
 	}
-	for (const mode of ["dev", "compiled"]) {
-		test(`${mode} APP 0.9.2 fetches and generates install script for executor 0.9.1`, () => {
+	for (const mode of ["dev", "compiled"] as const) {
+		// Dev reads the current component pin. Compiled uses the declaration embedded in the fixture.
+		const executorVersion = mode === "dev" ? "0.9.3" : "0.9.1";
+		test(`${mode} APP 0.9.2 fetches and generates install script for executor ${executorVersion}`, () => {
 			const result = fixture(mode);
 			expect(result.error).toBeUndefined();
 			expect(result.app).toBe("0.9.2");
-			expect(result.pin).toEqual({ version: "0.9.1", protocolVersion: 1, tag: "executor-v0.9.1" });
-			expect(result.downloaded.version).toBe("0.9.1");
+			expect(result.pin).toEqual({
+				version: executorVersion,
+				protocolVersion: 1,
+				tag: `executor-v${executorVersion}`,
+			});
+			expect(result.downloaded.version).toBe(executorVersion);
 			expect(result.calls).toEqual([
-				"https://github.com/fork/identity-fixture/releases/download/executor-v0.9.1/narrafork-executor-manifest.json",
-				"https://github.com/fork/identity-fixture/releases/download/executor-v0.9.1/narrafork-executor-0.9.1-linux-amd64",
+				`https://github.com/fork/identity-fixture/releases/download/executor-v${executorVersion}/narrafork-executor-manifest.json`,
+				`https://github.com/fork/identity-fixture/releases/download/executor-v${executorVersion}/narrafork-executor-${executorVersion}-linux-amd64`,
 			]);
-			expect(result.script).toContain("Executor v0.9.1");
+			expect(result.script).toContain(`Executor v${executorVersion}`);
 			expect(result.script).not.toContain("Executor v0.9.2");
 		}, 20_000);
 	}
