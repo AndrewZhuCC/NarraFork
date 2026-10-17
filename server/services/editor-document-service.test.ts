@@ -211,6 +211,30 @@ async function expectFastFifoRejection(
 }
 
 describe("large editor objects and real durable pipeline", () => {
+	test("cached saved status reauthorizes its original device without opening a deleted target", async () => {
+		let revoked = false,
+			metadataChecks = 0;
+		actor.authorizeOperation = async (deviceId) => {
+			expect(deviceId).toBe("local");
+			metadataChecks++;
+			if (revoked) throw new EditorDocumentError("FORBIDDEN", "Device access revoked", 403);
+		};
+		const doc = await create(),
+			uploaded = await upload(doc, "saved\n");
+		const saved = await service.commit(actor, doc.docId, uploaded, {});
+		await rm(target);
+		actor.authorize = async () => {
+			throw new Error("Receipt query must not reopen the target");
+		};
+		expect((await service.operation(actor, saved.operationId)).status).toBe("saved");
+		revoked = true;
+		await expect(service.operation(actor, saved.operationId)).rejects.toMatchObject({
+			statusCode: 403,
+		});
+		expect(metadataChecks).toBe(2);
+		expect(dispatches).toBe(1);
+	});
+
 	test.skipIf(process.platform === "win32")(
 		"worker refuses a FIFO without waiting for a writer",
 		async () => {

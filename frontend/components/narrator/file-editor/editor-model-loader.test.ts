@@ -165,6 +165,54 @@ for (const failure of [
 		expect(target.disposed).toBe(true);
 		expect(source.disposed).toBe(true);
 	});
+test("20 MiB ASCII credit never degenerates into tiny remote pulls", async () => {
+	const bytes = new Uint8Array(20 * 1024 * 1024).fill(65),
+		document = metadata(bytes),
+		target = model();
+	let requests = 0,
+		minCredit = Number.POSITIVE_INFINITY;
+	const started = performance.now();
+	const candidate = await loadEditorRawCandidate({
+		document,
+		path: "/ascii.txt",
+		signal: new AbortController().signal,
+		decoder: decoder(),
+		createModel: async () => target.model,
+		yield: async () => {},
+		read: async (consume, credit) => {
+			for (let offset = 0; offset < bytes.length; ) {
+				const allowance = credit();
+				minCredit = Math.min(minCredit, allowance);
+				requests++;
+				const length = Math.min(allowance, bytes.length - offset);
+				offset += length;
+				await consume(bytes.slice(offset - length, offset), offset === bytes.length);
+			}
+		},
+	});
+	console.info(
+		"EDITOR_ASCII_CREDIT",
+		JSON.stringify({
+			threshold: EDITOR_MODEL_BATCH_UNITS,
+			bytes: bytes.length,
+			requests,
+			minCredit,
+			batches: candidate.batches,
+			maxQueuedBytes: candidate.maxQueuedBytes,
+			loadMs: Math.round(performance.now() - started),
+		}),
+	);
+	expect(requests).toBeLessThanOrEqual(Math.ceil(bytes.length / (32 * 1024)));
+	expect(minCredit).toBeGreaterThanOrEqual(16 * 1024 - 16);
+	expect(candidate.maxQueuedBytes).toBeLessThanOrEqual(256 * 1024);
+	expect(
+		target.batches
+			.slice(0, -1)
+			.every((size) => size >= EDITOR_MODEL_BATCH_UNITS && size <= 128 * 1024),
+	).toBe(true);
+	candidate.model.dispose();
+}, 30_000);
+
 test("preflight profile thresholds precede language loader/model construction", async () => {
 	expect(
 		editorRawProfile({ textLength: 1024 * 1024, lineCount: 2, maxLineLength: 1 }).plaintext,

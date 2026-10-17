@@ -38,6 +38,7 @@ import {
 } from "../services/editor-document-service";
 import { rejectEditorSymlinks } from "../services/editor-document-worker";
 import {
+	authorizeEditorOperationDevice,
 	authorizeEditorReferenceContext,
 	authorizeEditorReferenceTarget,
 } from "../services/file-reference-service";
@@ -76,18 +77,24 @@ export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<
 }
 export function editorActor(c: Context): EditorActor {
 	const actor: EditorActor = {
+		signal: c.req.raw.signal,
 		userId: c.get("user").sub,
 		narratorId: c.req.param("id") ?? "",
 		locale: c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en",
+		async authorizeOperation(deviceId) {
+			await requireNarratorAccess(c, actor.narratorId, "read");
+			await authorizeEditorOperationDevice(actor.narratorId, actor.userId, deviceId);
+		},
 		async authorize(input, need) {
 			const narrator = await requireNarratorAccess(c, c.req.param("id") ?? "", need);
 			const device = input.deviceId ?? narrator.defaultDeviceId ?? "local";
-			if (device !== "local" && input.protocol === "raw-v2" && need === "read") {
+			if (device !== "local" && input.protocol === "raw-v2") {
 				const context = await authorizeEditorReferenceContext(
 					narrator.id,
 					actor.userId,
 					input.path,
 					device,
+					need,
 				);
 				const backend = context.backend;
 				if (!(backend instanceof RemoteBackend) || !backend.supportsEditorRawRead)
@@ -96,8 +103,21 @@ export function editorActor(c: Context): EditorActor {
 						422,
 						"EDITOR_PROVIDER_UNSUPPORTED",
 					);
+				const contextKey = JSON.stringify([
+					narrator.workspaceRevision,
+					narrator.workspaceContext?.contextKey,
+					narrator.defaultDeviceId,
+					narrator.chapterId,
+				]);
 				const root = await backend.editorRootIdentity();
+				if (need === "write" && !backend.supportsEditorDurableWrite)
+					throw new AppError(
+						"Upgrade the executor: editor.durable-write.v1 is required",
+						422,
+						"EDITOR_PROVIDER_UNSUPPORTED",
+					);
 				const binding: EditorBinding = {
+					workspaceRevision: narrator.workspaceRevision,
 					deviceId: device,
 					cwd: root.canonicalRoot,
 					projectId: null,
@@ -106,12 +126,8 @@ export function editorActor(c: Context): EditorActor {
 						backend.paths.resolve(backend.defaultCwd ?? "", input.path),
 					canonicalPath: context.target.canonicalPath as string,
 					outsideRoots: false,
-					contextKey: JSON.stringify([
-						narrator.workspaceRevision,
-						narrator.workspaceContext?.contextKey,
-						narrator.defaultDeviceId,
-						narrator.chapterId,
-					]),
+					writeConfirmationRequired: context.editorNeedsConfirmation,
+					contextKey,
 					workspaceIdentity: root.rootIdentity,
 					pathFlavor: backend.pathFlavor,
 					runtimeGeneration: backend.runtimeGeneration,
@@ -129,6 +145,35 @@ export function editorActor(c: Context): EditorActor {
 					},
 					editorResourceKey(actor, input, binding),
 				);
+				binding.writeTarget = {
+					backend,
+					rootIdentity: root.rootIdentity,
+					runtime: {
+						runtimeEpoch: root.runtimeEpoch,
+						runtimeGeneration: backend.runtimeGeneration,
+					},
+					currentRuntime: () =>
+						backend.supportsEditorDurableWrite
+							? { runtimeEpoch: root.runtimeEpoch, runtimeGeneration: backend.runtimeGeneration }
+							: null,
+					assertParent: async (signal) => {
+						const parent = await backend.editorWriteRpc().call<{ isDirectory: boolean }>(
+							"fs.stat",
+							{
+								path: backend.paths.dirname(binding.canonicalPath),
+								editorIdentity: true,
+								editorRoot: root.canonicalRoot,
+							},
+							signal,
+						);
+						if (!parent.isDirectory)
+							throw new AppError(
+								"Editor target parent must already exist",
+								409,
+								"EDITOR_APPLY_REJECTED",
+							);
+					},
+				};
 				return binding;
 			}
 			if (device !== "local")
@@ -192,6 +237,7 @@ export function editorActor(c: Context): EditorActor {
 			const canonicalRoot = await realpath(cwd);
 			const root = await lstat(canonicalRoot, { bigint: true });
 			return {
+				workspaceRevision: narrator.workspaceRevision,
 				contextKey: JSON.stringify([
 					narrator.workspaceRevision,
 					narrator.workspaceContext?.contextKey,

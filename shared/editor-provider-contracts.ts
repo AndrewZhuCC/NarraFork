@@ -8,11 +8,15 @@
  * The request/response types below are mirrored in
  * remote-executor/internal/rpc/editor_contracts.go and pinned by the shared
  * fixture editor-provider-contracts.golden.json (decoded strictly by Go and
- * type/enum-checked by TS). Phase 6 implements only raw read; stage/apply/query/watch
- * remain unavailable until their handlers and tests ship.
+ * type/enum-checked by TS). Raw read and durable write are individually negotiated;
+ * watch remains unavailable until its handler and tests ship.
  */
 
 export interface EditorProviderCapabilities {
+	readonly writeUnavailableReason?:
+		| "verified_helper_unavailable"
+		| "durable_executor_unavailable"
+		| "host_receipt_storage_unavailable";
 	/** Bounded, identity-verified read of the complete current source (never truncated). */
 	readonly boundedRead: boolean;
 	/** Existing v1 upload/commit save. Not a durable/atomic apply. */
@@ -103,8 +107,19 @@ export interface EditorRawReadClose {
 
 // ── Phase 7/8: stage, apply, query ───────────────────────────────────────────
 
-export interface EditorStageOpen {
+export interface EditorWriteOwner {
+	/** Stable source instance + authenticated owner + device; never connection generation. */
+	readonly namespace: string;
 	readonly resourceKey: string;
+}
+export interface EditorHelperCapabilities {
+	readonly protocolVersion: 1;
+	readonly features: readonly string[];
+	readonly maxChunkBytes: number;
+	readonly maxBytes: number;
+	readonly runtimeEpoch: string;
+}
+export interface EditorStageOpen extends EditorWriteOwner {
 	readonly maxBytes: number;
 	readonly idleTimeoutMs: number;
 }
@@ -114,7 +129,7 @@ export interface EditorStageHandle {
 	readonly resourceKey: string;
 	readonly expiresAt: number;
 }
-export interface EditorStageAppend {
+export interface EditorStageAppend extends EditorWriteOwner {
 	readonly stageId: string;
 	readonly seq: number;
 	readonly offset: number;
@@ -122,18 +137,18 @@ export interface EditorStageAppend {
 	readonly digest: string;
 	readonly dataB64: string;
 }
-export interface EditorStageSeal {
+export interface EditorStageSeal extends EditorWriteOwner {
 	readonly stageId: string;
 	readonly totalBytes: number;
 	readonly rawDigest: string;
 }
 export const EDITOR_STAGE_ABORT_REASONS = ["cancel", "idle_timeout", "superseded"] as const;
-export interface EditorStageAbort {
+export interface EditorStageAbort extends EditorWriteOwner {
 	readonly stageId: string;
 	readonly reason: (typeof EDITOR_STAGE_ABORT_REASONS)[number];
 }
 export const EDITOR_METADATA_POLICIES = ["preserve", "reject"] as const;
-export interface EditorApplyRequest {
+export interface EditorApplyRequest extends EditorWriteOwner {
 	readonly operationId: string;
 	readonly requestDigest: string;
 	readonly stageId: string;
@@ -152,9 +167,9 @@ export interface EditorApplyResult {
 	/** Optional: omitted on committed. */
 	readonly error?: { readonly code: string; readonly message: string };
 }
-export interface EditorQueryRequest {
-	/** Stable persistent namespace; never contains a connection generation. */
-	readonly namespace: string;
+export interface EditorQueryRequest extends EditorWriteOwner {
+	/** Host has durably settled its original effect/lease; permits bounded terminal retention. */
+	readonly acknowledgeTerminal?: boolean;
 	readonly operationId: string;
 	readonly requestDigest: string;
 }
@@ -171,6 +186,43 @@ export interface EditorQueryResult {
 	readonly outcome: (typeof EDITOR_QUERY_OUTCOMES)[number];
 	/** Required. null when no durable result exists. */
 	readonly result: EditorApplyResult | null;
+}
+
+/** Host-only bounded recovery metadata; stdio bootstrap fixes its private directory.
+ * These methods are intentionally unavailable to remote WebSocket RPC clients. */
+export interface EditorHostReceiptRecord {
+	version: 1;
+	createdAt: number;
+	userId: string;
+	narratorId: string;
+	deviceId: string;
+	operationId: string;
+	hostOperationId: string;
+	leaseId: string;
+	effectId: string;
+	saved: { hash: string; bytes: number; snapshotRevision: number; hashKind?: "raw-sha256" };
+	requestDigest: string;
+	namespace: string;
+	resourceKey: string;
+	root: string;
+	identity: EditorResourceIdentity;
+	rawDigest: string;
+	bytes: number;
+	receipt?: EditorApplyResult;
+}
+// Native Host store H3 (VALUE): authoritative shape; earlier RECORD proposals are not wire contracts.
+export interface EditorHostReceiptPut {
+	value: EditorHostReceiptRecord;
+}
+export interface EditorHostReceiptGet {
+	operationId: string;
+}
+export interface EditorHostReceiptValue {
+	value: EditorHostReceiptRecord | null;
+}
+export interface EditorHostReceiptSettle {
+	operationId: string;
+	receipt: EditorApplyResult;
 }
 
 // ── Phase 9: watch ───────────────────────────────────────────────────────────

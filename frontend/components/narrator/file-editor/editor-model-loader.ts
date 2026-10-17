@@ -13,7 +13,9 @@ import { loadMonacoLanguage } from "./monaco-languages";
 import { loadMonaco } from "./monaco-loader";
 import { editorRawProfile } from "./monaco-profile";
 
-export const EDITOR_MODEL_BATCH_UNITS = 120 * 1024;
+// Leave useful decode credit inside the same 256 KiB window. With ASCII this
+// flushes at ~112 Ki UTF-16 units; waiting for 120 Ki geometrically shrinks pulls.
+export const EDITOR_MODEL_BATCH_UNITS = 96 * 1024;
 export interface EditorRawCandidate {
 	model: editor.ITextModel;
 	format: EditorFormat;

@@ -104,7 +104,7 @@ const CONFLICT_DIFF_CHARS = 32 * 1024;
 
 export interface FileEditorContentProps {
 	filePath: string;
-	/** Explicit raw-v2 read-only rollout. Default remains the existing v1 editor. */
+	/** Explicit raw-v2 opt-in; writing requires the complete negotiated durable capability set. */
 	rawProtocol?: boolean;
 	rawEncoding?: EditorRawEncoding;
 	/** Actual source narrator; the dock host is not a filesystem authority. */
@@ -999,7 +999,15 @@ function FileEditorDocument({
 						{filePath}
 					</Text>
 					{readOnly && (
-						<Badge size="xs" color="gray">
+						<Badge
+							size="xs"
+							color="gray"
+							title={
+								state.capabilities?.writeUnavailableReason
+									? t(`fileEditor.${state.capabilities.writeUnavailableReason}`)
+									: undefined
+							}
+						>
 							{t("fileEditor.readOnly")}
 						</Badge>
 					)}

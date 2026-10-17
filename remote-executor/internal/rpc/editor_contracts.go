@@ -1,11 +1,13 @@
 // Mirror of shared/editor-provider-contracts.ts. These are frozen wire shapes
-// for editor Phases 6-9. Phase 6 raw read is implemented and feature-gated;
-// future stage/apply/query/watch contracts remain unadvertised. The shared fixture
+// for editor Phases 6-9. Raw read and durable stage/apply/query are implemented
+// and independently feature-gated; watch remains unadvertised. The shared fixture
 // shared/editor-provider-contracts.golden.json is decoded strictly here and
 // type-checked on the TS side. Required-nullable fields are pointers WITHOUT
 // omitempty (they always encode, as null when absent); optional fields use
 // omitempty.
 package rpc
+
+import "github.com/narrafork/remote-executor/internal/handlers"
 
 type EditorProviderCapabilities struct {
 	BoundedRead  bool `json:"boundedRead"`
@@ -17,15 +19,7 @@ type EditorProviderCapabilities struct {
 	Watch        bool `json:"watch"`
 }
 
-type EditorResourceIdentity struct {
-	DeviceID          string `json:"deviceId"`
-	PathFlavor        string `json:"pathFlavor"`
-	CanonicalPath     string `json:"canonicalPath"`
-	WorkspaceIdentity string `json:"workspaceIdentity"`
-	RuntimeEpoch      string `json:"runtimeEpoch"`
-	RuntimeGeneration int64  `json:"runtimeGeneration"`
-	FencingToken      int64  `json:"fencingToken"`
-}
+type EditorResourceIdentity = handlers.EditorResourceIdentity
 
 type EditorRawReadPreflight struct {
 	ResourceKey string                 `json:"resourceKey"`
@@ -63,74 +57,16 @@ type EditorRawReadClose struct {
 	Abort  bool   `json:"abort"`
 }
 
-type EditorStageOpen struct {
-	ResourceKey   string `json:"resourceKey"`
-	MaxBytes      int64  `json:"maxBytes"`
-	IdleTimeoutMs int64  `json:"idleTimeoutMs"`
-}
-
-type EditorStageHandle struct {
-	StageID     string `json:"stageId"`
-	ResourceKey string `json:"resourceKey"`
-	ExpiresAt   int64  `json:"expiresAt"`
-}
-
-type EditorStageAppend struct {
-	StageID string `json:"stageId"`
-	Seq     int64  `json:"seq"`
-	Offset  int64  `json:"offset"`
-	Bytes   int64  `json:"bytes"`
-	Digest  string `json:"digest"`
-	DataB64 string `json:"dataB64"`
-}
-
-type EditorStageSeal struct {
-	StageID    string `json:"stageId"`
-	TotalBytes int64  `json:"totalBytes"`
-	RawDigest  string `json:"rawDigest"`
-}
-
-type EditorStageAbort struct {
-	StageID string `json:"stageId"`
-	Reason  string `json:"reason"`
-}
-
-type EditorApplyRequest struct {
-	OperationID   string `json:"operationId"`
-	RequestDigest string `json:"requestDigest"`
-	StageID       string `json:"stageId"`
-	// Required; nil encodes as null and means the target must not exist.
-	ExpectedRawHash *string                `json:"expectedRawHash"`
-	Identity        EditorResourceIdentity `json:"identity"`
-	MetadataPolicy  string                 `json:"metadataPolicy"`
-}
-
-type EditorProviderError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-type EditorApplyResult struct {
-	OperationID string  `json:"operationId"`
-	Outcome     string  `json:"outcome"`
-	RawDigest   *string `json:"rawDigest"`
-	TotalBytes  *int64  `json:"totalBytes"`
-	// Optional; omitted on committed.
-	Error *EditorProviderError `json:"error,omitempty"`
-}
-
-type EditorQueryRequest struct {
-	Namespace     string `json:"namespace"`
-	OperationID   string `json:"operationId"`
-	RequestDigest string `json:"requestDigest"`
-}
-
-type EditorQueryResult struct {
-	OperationID string `json:"operationId"`
-	Outcome     string `json:"outcome"`
-	// Required; nil encodes as null when no durable result exists.
-	Result *EditorApplyResult `json:"result"`
-}
+type EditorStageOpen = handlers.EditorStageOpen
+type EditorStageHandle = handlers.EditorStageHandle
+type EditorStageAppend = handlers.EditorStageAppend
+type EditorStageSeal = handlers.EditorStageSeal
+type EditorStageAbort = handlers.EditorStageAbort
+type EditorApplyRequest = handlers.EditorApplyRequest
+type EditorProviderError = handlers.EditorProviderError
+type EditorApplyResult = handlers.EditorApplyResult
+type EditorQueryRequest = handlers.EditorQueryRequest
+type EditorQueryResult = handlers.EditorQueryResult
 
 type EditorWatchOpen struct {
 	ResourceKey string `json:"resourceKey"`

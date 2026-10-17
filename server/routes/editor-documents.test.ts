@@ -694,9 +694,13 @@ describe("fs preview bounded panel reads", () => {
 			).status,
 		).toBe(403);
 	});
-	test("lexical secret paths and canonical secret aliases are forbidden", async () => {
+	test.each([
+		"editor-transfers",
+		"editor-native",
+		"editor-native-operations",
+	])("lexical %s paths and canonical aliases are forbidden", async (directory) => {
 		const { mkdir } = await import("node:fs/promises");
-		const secretRoot = join(narraforkDir, "editor-transfers", generateId());
+		const secretRoot = join(narraforkDir, directory, generateId());
 		const secret = join(secretRoot, "private.txt");
 		await mkdir(secretRoot, { recursive: true });
 		await writeFile(secret, "private key");
@@ -1103,6 +1107,8 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		for (const target of [
 			join(testEnvironment.narraforkHome, "settings.json"),
 			join(testEnvironment.narraforkHome, "editor-transfers", "ed-private.json"),
+			join(testEnvironment.narraforkHome, "editor-native", "receipt.op.json"),
+			join(testEnvironment.narraforkHome, "editor-native-operations", "operation.json"),
 			join(root, ".git", "config"),
 		]) {
 			const response = await request(base(), "POST", {

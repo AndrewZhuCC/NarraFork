@@ -79,9 +79,16 @@
 		"eof": true
 	},
 	"rawReadClose": { "readId": "read-1", "abort": true },
-	"stageOpen": { "resourceKey": "res-a", "maxBytes": 20971520, "idleTimeoutMs": 10000 },
+	"stageOpen": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"maxBytes": 20971520,
+		"idleTimeoutMs": 10000
+	},
 	"stageHandle": { "stageId": "stage-1", "resourceKey": "res-a", "expiresAt": 1700000000000 },
 	"stageAppend": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
 		"stageId": "stage-1",
 		"seq": 0,
 		"offset": 0,
@@ -90,12 +97,21 @@
 		"dataB64": "AQID"
 	},
 	"stageSeal": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
 		"stageId": "stage-1",
 		"totalBytes": 3,
 		"rawDigest": "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
 	},
-	"stageAbort": { "stageId": "stage-1", "reason": "idle_timeout" },
+	"stageAbort": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"stageId": "stage-1",
+		"reason": "idle_timeout"
+	},
 	"applyCreate": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
 		"operationId": "op-1",
 		"requestDigest": "req-1",
 		"stageId": "stage-1",
@@ -112,6 +128,8 @@
 		"metadataPolicy": "reject"
 	},
 	"applyReplace": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
 		"operationId": "op-2",
 		"requestDigest": "req-2",
 		"stageId": "stage-2",
@@ -140,7 +158,13 @@
 		"totalBytes": null,
 		"error": { "code": "EDITOR_UNCERTAIN", "message": "dispatch reply lost" }
 	},
-	"queryRequest": { "namespace": "editor-ns-a", "operationId": "op-2", "requestDigest": "req-2" },
+	"queryRequest": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"operationId": "op-2",
+		"requestDigest": "req-2",
+		"acknowledgeTerminal": true
+	},
 	"queryNotFound": { "operationId": "op-4", "outcome": "not_found", "result": null },
 	"queryCommitted": {
 		"operationId": "op-2",

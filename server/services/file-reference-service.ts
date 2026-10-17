@@ -1082,9 +1082,10 @@ export async function authorizeEditorReferenceContext(
 	userId: string,
 	path: string,
 	deviceId = "local",
+	need: "read" | "write" = "read",
 ) {
 	const deps = productionDependencies;
-	const scope = await deps.loadScope(narratorId, userId, "read");
+	const scope = await deps.loadScope(narratorId, userId, need);
 	if (
 		scope.runtimePolicy &&
 		(deviceId === "local"
@@ -1132,7 +1133,73 @@ export async function authorizeEditorReferenceContext(
 		(await deps.readDecision(scope, context)) !== "allow"
 	)
 		throw failure("FORBIDDEN", "Read policy denies this editor source", 403);
-	return context;
+	let editorNeedsConfirmation = false;
+	if (need === "write") {
+		if (scope.permissionMode === "readOnly")
+			throw failure("FORBIDDEN", "Narrator is read-only", 403);
+		const runtime = scope.runtimePolicy;
+		if (runtime) {
+			const { integrationResourceBindingService } = await import(
+				"./integration-resource-binding-service"
+			);
+			const binding =
+				deviceId === "local"
+					? null
+					: await integrationResourceBindingService.get("device", deviceId);
+			const deviceClass =
+				deviceId === "local"
+					? "host"
+					: binding?.sourceType === "oauth_client" &&
+							binding.sourceId === runtime.clientId &&
+							binding.authorityType === "oauth_grant" &&
+							binding.authorityId === runtime.grantId
+						? "selfRegistered"
+						: "global";
+			if (
+				!runtime.allowedTools.has("Write") ||
+				runtime.policy.deviceAccess[deviceClass] !== "readWrite"
+			)
+				throw failure("FORBIDDEN", "Narrator runtime policy denies editor writes", 403);
+		}
+		const { executionPolicyEngine } = await import("./execution-policy/engine");
+		const policy = await executionPolicyEngine.compile(
+			narratorId,
+			context,
+			runtime?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+		);
+		for (const path of [context.target.lexicalPath as string, canonical]) {
+			const decision = policy.evaluatePath({ path, operation: "write" }).decision;
+			if (decision === "deny")
+				throw failure("FORBIDDEN", "Write policy denies this editor target", 403);
+			if (
+				decision === "unmatched" &&
+				!context.paths.contains(context.target.cwd, path) &&
+				scope.permissionMode !== "bypassPermissions"
+			) {
+				if (scope.permissionMode === "dontAsk")
+					throw failure("FORBIDDEN", "Write confirmation is disabled", 403);
+				editorNeedsConfirmation = true;
+			}
+		}
+	}
+	return { ...context, editorNeedsConfirmation };
+}
+/** Receipt metadata only: current owner/narrator/device ACL, no target resolution or file IO. */
+export async function authorizeEditorOperationDevice(
+	narratorId: string,
+	userId: string,
+	deviceId: string,
+) {
+	const scope = await productionDependencies.loadScope(narratorId, userId, "read");
+	if (
+		scope.runtimePolicy &&
+		(deviceId === "local"
+			? !scope.runtimePolicy.allowLocalExecution
+			: !scope.runtimePolicy.deviceIds.includes(deviceId))
+	)
+		throw failure("FORBIDDEN", "Narrator runtime policy denies this device", 403);
+	if (deviceId !== "local" && !scope.devices.some((device) => device.id === deviceId))
+		throw failure("FORBIDDEN", "Original receipt device is not authorized", 403);
 }
 export async function authorizeEditorReferenceTarget(
 	narratorId: string,

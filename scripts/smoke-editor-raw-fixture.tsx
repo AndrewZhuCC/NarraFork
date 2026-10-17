@@ -37,7 +37,10 @@ import { NarratorPanelVisibilityProvider } from "../frontend/components/narrator
 import en from "../frontend/locales/en/narrator.json";
 import type { EditorRawEncoding } from "../shared/editor-document";
 
-const config = (await (await fetch("/fixture-config")).json()) as { narratorId: string };
+const config = (await (await fetch("/fixture-config")).json()) as {
+	narratorId: string;
+	deviceId?: string;
+};
 const api = await loadMonaco();
 const i18n = i18next.createInstance();
 await i18n.init({
@@ -105,7 +108,7 @@ export async function open(filePath: string, hint?: EditorRawEncoding) {
 		{
 			narratorId: config.narratorId,
 			path,
-			deviceId: "local",
+			deviceId: config.deviceId ?? "local",
 			origin: () => "legacy",
 			protocol: "raw-v2",
 			encodingHint,
@@ -127,6 +130,7 @@ export function dualViews(visible = true) {
 								<FileEditorContent
 									filePath={path}
 									narratorId={config.narratorId}
+									deviceId={config.deviceId ?? "local"}
 									rawProtocol
 									rawEncoding={encodingHint}
 								/>
@@ -135,6 +139,7 @@ export function dualViews(visible = true) {
 								<FileEditorContent
 									filePath={path}
 									narratorId={config.narratorId}
+									deviceId={config.deviceId ?? "local"}
 									rawProtocol
 									rawEncoding={encodingHint}
 								/>
@@ -204,6 +209,7 @@ function panelViews(rawOnly: boolean, a = true, b = true, secondary = true) {
 								key={rawOnly ? "raw-a" : "v1"}
 								filePath={path}
 								narratorId={config.narratorId}
+								deviceId={config.deviceId ?? "local"}
 								confirmed
 								visible={a}
 							/>
@@ -214,6 +220,7 @@ function panelViews(rawOnly: boolean, a = true, b = true, secondary = true) {
 									key={rawOnly ? "raw-b" : "raw"}
 									filePath={path}
 									narratorId={config.narratorId}
+									deviceId={config.deviceId ?? "local"}
 									confirmed
 									visible={b}
 								/>
@@ -231,7 +238,12 @@ export async function mixedStart(filePath: string) {
 	path = filePath;
 	controller = new AbortController();
 	lease = await editorDocumentRegistry.acquire(
-		{ narratorId: config.narratorId, path, deviceId: "local", origin: () => "legacy" },
+		{
+			narratorId: config.narratorId,
+			path,
+			deviceId: config.deviceId ?? "local",
+			origin: () => "legacy",
+		},
 		controller.signal,
 	);
 	await lease.copy.ensureLoaded();
@@ -247,7 +259,7 @@ export async function mixedInspect() {
 			{
 				narratorId: config.narratorId,
 				path,
-				deviceId: "local",
+				deviceId: config.deviceId ?? "local",
 				origin: () => "legacy",
 				protocol: "raw-v2",
 			},

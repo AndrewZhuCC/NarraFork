@@ -17,10 +17,15 @@ import { narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
 import { safeSpawn } from "../lib/spawn";
 import {
+	executeAtomicEditorFileChange,
+	queryEditorOperation,
+} from "../services/editor-document-runtime";
+import {
 	type EditorDocumentDependencies,
 	EditorDocumentService,
 } from "../services/editor-document-service";
 import { createEditorDocumentRoutes } from "./editor-documents";
+import { nativeEditorFixture } from "./editor-native-fixture";
 
 const CHROME =
 	process.env.NF_TEST_CHROMIUM_PATH ??
@@ -34,7 +39,7 @@ const deferred = () => {
 	return { promise, resolve };
 };
 type RawWindow = Window & { rawFixture: typeof Fixture };
-test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through real host handlers (test writer, not production atomic)", async () => {
+test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through production atomic helper", async () => {
 	const project = resolve(import.meta.dir, "../.."),
 		root = await mkdtemp(join(testEnvironment.isolatedHome, "format-browser-")),
 		bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.format-browser-")),
@@ -64,7 +69,8 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 	let pause:
 		| { entered: ReturnType<typeof deferred>; released: ReturnType<typeof deferred> }
 		| undefined;
-	// Deliberately NOT an atomic writer: Phase 7 injects a trusted capability fixture only.
+	const native = await nativeEditorFixture(root, workspace);
+	// Real verified precompiled helper; the HTTP identity is synthetic like the existing fixture.
 	const execute: EditorDocumentDependencies["execute"] = async (request) => {
 		const gate = pause;
 		pause = undefined;
@@ -72,22 +78,16 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 			gate.entered.resolve();
 			await gate.released.promise;
 		}
-		await request.authorize();
-		const prepared = await request.construct({
-			bytes: new Uint8Array(await readFile(request.canonicalPath)),
-		} as Parameters<typeof request.construct>[0]);
+		const completed = await executeAtomicEditorFileChange(request);
 		writes++;
-		await writeFile(request.canonicalPath, prepared.nextBytes);
-		return { result: prepared.result } as Awaited<
-			ReturnType<EditorDocumentDependencies["execute"]>
-		>;
+		return completed;
 	};
 	const service = new EditorDocumentService({
 		root: join(root, "transfers"),
 		execute,
 		rawWriter: {
 			execute,
-			queryOperation: async (_actor, operationId) => ({ operationId, status: "uncertain" }),
+			queryOperation: queryEditorOperation,
 		},
 	});
 	const app = new Hono();
@@ -619,6 +619,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		await browser?.close();
 		server?.stop(true);
 		await service.dispose();
+		await native.dispose();
 		await rm(bundleRoot, { recursive: true, force: true });
 		await rm(root, { recursive: true, force: true });
 	}

@@ -74,6 +74,8 @@ func (d *Dispatcher) Dispatch(
 	switch method {
 	case "system.ping":
 		return map[string]any{"ok": true}, nil
+	case "editor.capabilities", "editor.stage.open", "editor.stage.append", "editor.stage.seal", "editor.stage.abort", "editor.apply", "editor.query":
+		return d.h.EditorDispatch(ctx, method, params)
 	case "editor.read.open":
 		var req EditorRawReadPreflight
 		if err := decodeEditorParams(params, &req); err != nil {

@@ -32,7 +32,10 @@ import {
 	type EditorUploadChunkInput,
 	type EditorUploadDescriptor,
 } from "../../shared/editor-document";
-import { EDITOR_LOCAL_V1_CAPABILITIES } from "../../shared/editor-provider-contracts";
+import {
+	EDITOR_LOCAL_V1_CAPABILITIES,
+	type EditorProviderCapabilities,
+} from "../../shared/editor-provider-contracts";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { EditorOperationMetadata } from "../lib/validators/editor-documents";
@@ -43,11 +46,14 @@ import { EditorDraftAnchorStore } from "./editor-draft-anchor-store";
 import type { EditorFileChangeRequest, FileChangeCompletion } from "./file-change-runtime";
 
 export interface EditorBinding {
+	workspaceRevision?: number;
+	writeTarget?: EditorFileChangeRequest<unknown>["remote"];
 	cwd: string;
 	projectId: string | null;
 	lexicalPath: string;
 	canonicalPath: string;
 	outsideRoots: boolean;
+	writeConfirmationRequired?: boolean;
 	/** Execution identity, never the UI workspace or dock host. */
 	contextKey?: string;
 	workspaceIdentity?: string;
@@ -100,9 +106,13 @@ export function editorRecoveryKey(actor: EditorActor, input: CreateEditorDocumen
 		.digest("hex");
 }
 export interface EditorActor {
+	/** Cancels metadata/recovery helpers when the requesting HTTP client leaves. */
+	signal?: AbortSignal;
 	userId: string;
 	narratorId: string;
 	locale?: "en" | "zh-CN";
+	/** Historical receipt authorization; deliberately does not resolve/reopen its old target. */
+	authorizeOperation?(deviceId: string): Promise<void>;
 	authorize(
 		input: CreateEditorDocumentInput,
 		need: "read" | "write",
@@ -186,6 +196,8 @@ interface Session {
 	cleanup?: Promise<void>;
 }
 interface Operation {
+	/** Original execution device; even cached status is metadata-authorized before publication. */
+	deviceId?: string;
 	userId: string;
 	narratorId: string;
 	value: EditorOperationResult;
@@ -194,7 +206,12 @@ interface Operation {
 }
 export interface EditorDocumentDependencies {
 	root: string;
-	/** Trusted provider injection only. Production supplies no raw writer before Phase 8. */
+	/** Fast capability snapshot; must not install/download on the read request's critical path. */
+	writerAvailable?(binding: EditorBinding): boolean;
+	writerUnavailableReason?(
+		binding: EditorBinding,
+	): EditorProviderCapabilities["writeUnavailableReason"];
+	/** Trusted provider only. Availability is negotiated per authorized resource. */
 	rawWriter?: {
 		execute: EditorDocumentDependencies["execute"];
 		queryOperation: NonNullable<EditorDocumentDependencies["queryOperation"]>;
@@ -498,6 +515,12 @@ export class EditorDocumentService {
 				403,
 			);
 		const binding = await actor.authorize(session.input, need);
+		if (need === "write" && this.deps.writerAvailable && !this.deps.writerAvailable(binding))
+			throw new EditorDocumentError(
+				"EDITOR_PROVIDER_UNSUPPORTED",
+				"Verified editor helper unavailable; prepare the pinned executor from the configured update source and reopen this file",
+				503,
+			);
 		assertSameEditorBinding(actor, session.input, session.binding, binding);
 		if (session.closing || !this.sessions.has(docId)) throw expired();
 		session.lastUsed = Date.now();
@@ -555,10 +578,23 @@ export class EditorDocumentService {
 					capabilities: {
 						...EDITOR_LOCAL_V1_CAPABILITIES,
 						v1Save: false,
+						...(this.deps.writerAvailable && !this.deps.writerAvailable(binding)
+							? {
+									writeUnavailableReason:
+										this.deps.writerUnavailableReason?.(binding) ??
+										(binding.rawSource
+											? ("durable_executor_unavailable" as const)
+											: ("verified_helper_unavailable" as const)),
+								}
+							: {}),
 						rawRead: true,
-						stage: !binding.rawSource,
-						durableApply: !!this.deps.rawWriter && !binding.rawSource,
-						durableQuery: !!this.deps.rawWriter && !binding.rawSource,
+						stage: this.deps.writerAvailable
+							? !!this.deps.rawWriter && this.deps.writerAvailable(binding)
+							: !binding.rawSource,
+						durableApply:
+							!!this.deps.rawWriter && (this.deps.writerAvailable?.(binding) ?? !binding.rawSource),
+						durableQuery:
+							!!this.deps.rawWriter && (this.deps.writerAvailable?.(binding) ?? !binding.rawSource),
 					},
 					...metadata,
 				};
@@ -579,7 +615,17 @@ export class EditorDocumentService {
 				versionHandle: session.source.handle,
 				// The route admits only local bindings, so this session owns the local
 				// worker read and the v1 save; nothing in Phases 6-9 is claimed.
-				capabilities: EDITOR_LOCAL_V1_CAPABILITIES,
+				capabilities: {
+					...EDITOR_LOCAL_V1_CAPABILITIES,
+					v1Save: this.deps.writerAvailable?.(binding) ?? true,
+					...(this.deps.writerAvailable && !this.deps.writerAvailable(binding)
+						? {
+								writeUnavailableReason:
+									this.deps.writerUnavailableReason?.(binding) ??
+									("verified_helper_unavailable" as const),
+							}
+						: {}),
+				},
 				...result.metadata,
 			};
 		} catch (error) {
@@ -946,7 +992,7 @@ export class EditorDocumentService {
 			input.protocol === "raw-v2" &&
 			(input.hashKind !== "raw-sha256" ||
 				input.bom !== session.raw?.metadata.bom ||
-				binding.rawSource)
+				(binding.rawSource && !this.deps.writerAvailable?.(binding)))
 		)
 			throw invalid("Raw stage format mismatch");
 		if (session.uploads.size >= EDITOR_MAX_UPLOADS_PER_SESSION)
@@ -982,7 +1028,12 @@ export class EditorDocumentService {
 	}
 	private async stageBound(actor: EditorActor, docId: string) {
 		const value = await this.bound(actor, docId, "read");
-		if (value.session.input.protocol !== "raw-v2" || value.binding.rawSource)
+		if (
+			value.session.input.protocol !== "raw-v2" ||
+			(this.deps.writerAvailable
+				? !this.deps.writerAvailable(value.binding)
+				: !!value.binding.rawSource)
+		)
 			throw invalid("Raw staging is unavailable for this provider");
 		const fresh = await actor.authorize(value.session.input, "write");
 		assertSameEditorBinding(actor, value.session.input, value.binding, fresh);
@@ -1332,7 +1383,7 @@ export class EditorDocumentService {
 			upload.confirmation.physicalPath === binding.canonicalPath &&
 			upload.confirmation.digest === upload.digest &&
 			upload.confirmation.baseHash === upload.baseHash;
-		if (binding.outsideRoots && !confirmed) {
+		if ((binding.outsideRoots || binding.writeConfirmationRequired) && !confirmed) {
 			upload.confirmation = {
 				token: randomUUID(),
 				expires: Date.now() + 60_000,
@@ -1369,6 +1420,7 @@ export class EditorDocumentService {
 		const recoveryTemporary = join(this.deps.root, `ed-${operationId}`);
 		session.looseFiles.add(recoveryTemporary);
 		const operation: Operation = {
+			deviceId: binding.deviceId ?? session.input.deviceId ?? "local",
 			userId: actor.userId,
 			narratorId: actor.narratorId,
 			value: { status: "committing", operationId },
@@ -1403,6 +1455,9 @@ export class EditorDocumentService {
 						? (this.deps.rawWriter?.execute as EditorDocumentDependencies["execute"])
 						: this.deps.execute)({
 						requestId: operationId,
+						resourceKey: editorResourceKey(actor, session.input, binding),
+						workspaceRevision: binding.workspaceRevision,
+						remote: binding.writeTarget,
 						userId: actor.userId,
 						narratorId: actor.narratorId,
 						projectId: binding.projectId,
@@ -1419,11 +1474,20 @@ export class EditorDocumentService {
 							hashKind: upload.hashKind,
 							snapshotRevision: upload.snapshotRevision,
 						},
+						authorizeReceipt: async () => {
+							if (!actor.authorizeOperation)
+								throw new EditorDocumentError(
+									"EDITOR_OPERATION_UNKNOWN",
+									"Receipt metadata authorization unavailable",
+									403,
+								);
+							await actor.authorizeOperation(binding.deviceId ?? session.input.deviceId ?? "local");
+						},
 						authorize: async () => {
 							// Cancellation/DELETE may mark closing after commit began; pin keeps the bound bytes alive.
 							const fresh = await actor.authorize(session.input, "write");
 							assertSameEditorBinding(actor, session.input, binding, fresh);
-							if (fresh.outsideRoots && !confirmed)
+							if ((fresh.outsideRoots || fresh.writeConfirmationRequired) && !confirmed)
 								throw new EditorDocumentError(
 									"EDITOR_IDENTITY_CHANGED",
 									"Write authorization or physical target changed",
@@ -1563,9 +1627,13 @@ export class EditorDocumentService {
 			operation.userId === actor.userId &&
 			operation.narratorId === actor.narratorId
 		) {
+			if (operation.deviceId && actor.authorizeOperation)
+				await actor.authorizeOperation(operation.deviceId);
 			if (operation.recovery?.hashKind === "raw-sha256" && this.deps.rawWriter)
 				return this.deps.rawWriter.queryOperation(actor, operationId, operation.recovery);
 			if (operation.recovery && this.deps.queryOperation)
+				return this.deps.queryOperation(actor, operationId, operation.recovery);
+			if (operation.value.status === "uncertain" && this.deps.queryOperation)
 				return this.deps.queryOperation(actor, operationId, operation.recovery);
 			return operation.value;
 		}
