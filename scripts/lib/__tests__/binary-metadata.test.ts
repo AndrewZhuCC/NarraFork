@@ -44,8 +44,8 @@ describe("computeBinaryMetadataFromBuffer", () => {
 			);
 			expect(meta.version).toBe(version);
 			expect(JSON.parse(formatMetadataJson(meta)).helperDistribution).toEqual(helperDistribution);
-			expect(meta.helperDistribution?.executor.version).toBe("0.9.1");
-			expect(meta.helperDistribution?.executor.tag).toBe("executor-v0.9.1");
+			expect(meta.helperDistribution?.executor.version).toBe("0.9.3");
+			expect(meta.helperDistribution?.executor.tag).toBe("executor-v0.9.3");
 		}
 	});
 
