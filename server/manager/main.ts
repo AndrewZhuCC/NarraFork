@@ -1,8 +1,8 @@
 /**
  * 后端管理器面板：NarraFork 的图形化启停界面。
  *
- * 启动流程见 `server/index.ts` 的分流：默认进入本模块（开窗口并托管服务子进程），
- * `--serve` 走原有的服务模式。采用子进程模型的原因见 backend-process.ts。
+ * 启动流程见 `server/index.ts`：Windows 编译产物默认进入本模块；源码启动和 `--serve`
+ * 走服务模式。开发面板时加 `--manager`。子进程模型见 backend-process.ts。
  *
  * 本模块只依赖 bun:ffi 与 Node 内置模块，不 import server 的重型模块 —— 管理器开窗
  * 不该顺带拉起数据库、事件总线或 HTTP 服务。
@@ -12,9 +12,10 @@
  * 编译产物里是经典灰色外观，与面板风格冲突）。
  */
 
+import { randomBytes } from "node:crypto";
 import { createWriteStream, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
+import { urlHost } from "@shared/server-host";
 import { decodeRgbaPng, getBrandIcons } from "../lib/branding";
 import {
 	BackendProcess,
@@ -23,6 +24,7 @@ import {
 	resolveNarraforkHome,
 } from "./backend-process";
 import { showCloseDialog } from "./close-dialog";
+import { requestManagedShutdown } from "./control-client";
 import {
 	BUTTON_HEIGHT,
 	BUTTON_WIDTH,
@@ -150,10 +152,14 @@ const TRAY_ID_SETTINGS = 9106;
 interface ManagerSettings {
 	host: string;
 	port: number;
+	tls: boolean;
 	brandColor: string;
 	/** 实例显示名：前端页面标题用的就是它，用于查找已打开的前端窗口。 */
 	brandName: string;
 }
+
+/** 子进程退出后，面板是否还在跟踪同一次更新拉起的替换进程。 */
+type Supervision = "none" | "reconnecting" | "adopted";
 
 /** 只读品牌色与实例显示名；监听地址由 manager-config 负责（同一份文件还要写入与回显）。 */
 async function loadBranding(): Promise<{ color: string; name: string }> {
@@ -172,17 +178,6 @@ async function loadBranding(): Promise<{ color: string; name: string }> {
 }
 
 /**
- * URL 里可用的主机名。
- *
- * `auto-lan` 是"监听第一个局域网地址"的配置意图，通配地址表示监听所有接口：
- * 两者都不是可访问的主机名，直接拼进 URL 只会得到浏览器报地址错误的页面。
- * 面板自己在本机运行，因此这类值一律回退到回环地址。
- */
-function displayHost(host: string): string {
-	return isWildcardHost(host) || host === AUTO_LAN_HOST ? "127.0.0.1" : host;
-}
-
-/**
  * 面板当前使用的端口。
  *
  * 托管服务运行中时以它实际监听的端口为准 —— 配置端口被占用时服务会自动换端口，
@@ -195,6 +190,15 @@ function activePort(): number {
 /** 面板当前使用的主机名；托管服务运行中时以它实际监听的值为准。 */
 function activeHost(): string {
 	return backend?.listeningHost ?? settings.host;
+}
+
+function activeTls(): boolean {
+	return backend?.listeningTls ?? settings.tls;
+}
+
+/** 打开面板、健康检查和更新请求共用的源。 */
+function serviceOrigin(): string {
+	return `${activeTls() ? "https" : "http"}://${urlHost(activeHost())}:${activePort()}`;
 }
 
 // ── 状态 ────────────────────────────────────────────────────────────────────
@@ -245,9 +249,15 @@ const controls: Controls = {};
 const settings: ManagerSettings = {
 	host: "127.0.0.1",
 	port: 7779,
+	tls: false,
 	brandColor: DEFAULT_BRAND_COLOR,
 	brandName: DEFAULT_BRAND_NAME,
 };
+/** 只放进服务子进程。更新替换进程从子进程环境继承它。 */
+const managerToken = randomBytes(32).toString("base64url");
+let supervision: Supervision = "none";
+/** 面板已请求应用更新，子进程退出后应等待替换进程而不是当成崩溃。 */
+let expectRelaunch = false;
 let brandColorRef = toColorRef(DEFAULT_BRAND_COLOR);
 let backend: BackendProcess | undefined;
 let preferences: ManagerPreferences = {
@@ -428,29 +438,43 @@ function formatBackendLine(line: string): string {
 
 // ── 状态与按钮 ──────────────────────────────────────────────────────────────
 
-/** 子进程状态是唯一事实：状态灯、按钮可用性、主按钮高亮都由它推导。 */
+/** 子进程状态加上托管方式：灯、按钮可用性、主按钮高亮都由它推导。 */
 function applyStatus(status: BackendState, detail?: string): void {
+	const reconnecting = supervision === "reconnecting";
+	const adopted = supervision === "adopted";
 	// 外部启动的服务（终端里跑的那份）：面板只显示状态；点"启动项目"进入接管等待。
-	const external = status === "stopped" && externalRunning;
-	const style = external ? STATUS_STYLE.running : STATUS_STYLE[status];
-	const suffix = external
-		? awaitingHandover
-			? t("status.handover")
-			: t("status.external")
-		: detail
-			? t("status.detail", { detail })
-			: "";
+	const external = !reconnecting && !adopted && status === "stopped" && externalRunning;
+	const shown: BackendState = reconnecting ? "starting" : adopted || external ? "running" : status;
+	const style = STATUS_STYLE[shown];
+	const suffix = reconnecting
+		? t("status.detail", { detail: t("status.reconnecting") })
+		: external
+			? awaitingHandover
+				? t("status.handover")
+				: t("status.external")
+			: detail
+				? t("status.detail", { detail })
+				: "";
 	setText(controls.statusDot, "●");
 	setText(controls.statusText, `${t(style.key)}${suffix}`);
-	setText(
-		controls.address,
-		t("label.address", { url: `${displayHost(activeHost())}:${activePort()}/` }),
-	);
-	const startEnabled = external ? !awaitingHandover : status === "stopped" || status === "error";
+	setText(controls.address, t("label.address", { url: `${serviceOrigin()}/` }));
+	const childAlive = backend?.pid !== undefined;
+	const startEnabled =
+		reconnecting || adopted
+			? false
+			: external
+				? !awaitingHandover
+				: status === "stopped" || status === "error";
 	setEnabled(controls.start, startEnabled);
 	// 异常退出时也允许重启（等价于重新启动）：否则用户只能点「启动项目」，语义不符。
-	setEnabled(controls.restart, !external && (status === "running" || status === "error"));
-	setEnabled(controls.stop, !external && (status === "running" || status === "starting"));
+	setEnabled(
+		controls.restart,
+		adopted || (!external && !reconnecting && (status === "running" || status === "error")),
+	);
+	setEnabled(
+		controls.stop,
+		adopted || (!external && !reconnecting && childAlive && status !== "stopping"),
+	);
 	invalidate(controls.statusDot);
 	invalidate(controls.start);
 	invalidate(controls.restart);
@@ -458,9 +482,74 @@ function applyStatus(status: BackendState, detail?: string): void {
 }
 
 function currentStatusColor(): number {
+	if (supervision === "reconnecting") return WARNING_COLOR;
+	if (supervision === "adopted") return SUCCESS_COLOR;
 	const status = backend?.current ?? "stopped";
 	if (status === "stopped" && externalRunning) return STATUS_STYLE.running.color;
 	return STATUS_STYLE[status].color;
+}
+
+function syncListenTarget(): void {
+	backend?.setTarget({ host: settings.host, port: settings.port, tls: settings.tls });
+}
+
+/** 面板启动的服务，或更新后认领的替换进程，才带得动关闭和更新令牌。 */
+function serviceIsManaged(): boolean {
+	return supervision === "adopted" || backend?.pid !== undefined;
+}
+
+async function requestShutdownIfManaged(): Promise<void> {
+	if (!serviceIsManaged() && supervision !== "reconnecting") return;
+	const accepted = await requestManagedShutdown(serviceOrigin(), managerToken);
+	if (!accepted) appendLog("WARN", t("error.shutdownFailed"));
+}
+
+/** 先请求优雅关闭，仍在则结束进程树。认领的替换进程没有子进程句柄，只走 HTTP。 */
+async function stopSupervised(): Promise<void> {
+	const adopted = supervision === "adopted";
+	if (!adopted && backend?.pid === undefined) {
+		supervision = "none";
+		expectRelaunch = false;
+		return;
+	}
+	await requestShutdownIfManaged();
+	if (adopted) {
+		const deadline = Date.now() + 15_000;
+		while (Date.now() < deadline) {
+			if (!(await probeServiceHealth(activeHost(), activePort(), activeTls()))) break;
+			await Bun.sleep(500);
+		}
+		supervision = "none";
+		externalRunning = false;
+		frontendOpened = false;
+		applyStatus("stopped");
+		return;
+	}
+	await backend?.stop({ graceful: true });
+	supervision = "none";
+	expectRelaunch = false;
+}
+
+/** 更新替换进程脱离了面板的子进程关系。健康检查通过后按远程托管继续控制它。 */
+async function adoptRelaunch(): Promise<void> {
+	supervision = "reconnecting";
+	applyStatus("starting");
+	const deadline = Date.now() + 90_000;
+	while (Date.now() < deadline) {
+		if (await probeServiceHealth(activeHost(), activePort(), activeTls())) {
+			supervision = "adopted";
+			externalRunning = false;
+			frontendOpened = false;
+			appendLog("OK", t("log.relaunched"));
+			applyStatus("running");
+			openFrontendOnce();
+			return;
+		}
+		await Bun.sleep(700);
+	}
+	supervision = "none";
+	appendLog("ERROR", t("error.relaunchTimeout"));
+	applyStatus("error", t("error.relaunchTimeout"));
 }
 
 // ── 绘制 ────────────────────────────────────────────────────────────────────
@@ -535,11 +624,17 @@ function onCommand(id: number): void {
 			break;
 		case ID.restart:
 			appendLog("RUN", t("log.restartingService"));
-			void backend?.restart();
+			void (async () => {
+				await stopSupervised();
+				externalRunning = false;
+				awaitingHandover = false;
+				appendLog("RUN", t("log.startingService"));
+				await backend?.start();
+			})();
 			break;
 		case ID.stop:
 			appendLog("RUN", t("log.stoppingService"));
-			void backend?.stop();
+			void stopSupervised();
 			break;
 		case ID.open:
 			// Shift+点击 = 强制新建前端窗口（对齐浏览器 Shift+点击的惯例）。
@@ -566,6 +661,7 @@ function onCommand(id: number): void {
 			if (writeServerAddress({ host: ip, port })) {
 				settings.host = ip;
 				settings.port = port;
+				syncListenTarget();
 				appendLog("OK", t("log.settingsSaved", { address: `${ip}:${port}` }));
 			} else {
 				appendLog("ERROR", t("log.settingsWriteFailed"));
@@ -644,7 +740,7 @@ function handleMessage(
 					{ id: TRAY_ID_WEB_NEW, text: t("tray.openNewWindow") },
 					{ id: TRAY_ID_ASK_TOGGLE, text: t("tray.askToggle"), checked: !preferences.askOnClose },
 					{ separator: true, id: 0, text: "" },
-					{ id: TRAY_ID_EXIT, text: "退出并关闭项目" },
+					{ id: TRAY_ID_EXIT, text: t("tray.exit") },
 				]);
 				if (choice === TRAY_ID_OPEN) {
 					restoreFromTray(hwnd);
@@ -816,18 +912,26 @@ async function handleCloseRequest(hwnd: Pointer): Promise<void> {
 
 function minimizeToTray(hwnd: Pointer): void {
 	showWindow(hwnd, SW_HIDE);
-	appendLog("PREP", "已最小化到任务栏，双击托盘图标可以重新打开。");
+	appendLog("PREP", t("log.minimized"));
 }
 
-function exitApplication(hwnd: Pointer): void {
-	if (trayAdded) {
-		removeTrayIcon(hwnd);
-		trayAdded = false;
+let exiting = false;
+
+async function exitApplication(hwnd: Pointer): Promise<void> {
+	if (exiting) return;
+	exiting = true;
+	try {
+		await stopSupervised();
+	} finally {
+		if (trayAdded) {
+			removeTrayIcon(hwnd);
+			trayAdded = false;
+		}
+		backend?.dispose();
+		// 直接退出进程：WM_QUIT 是线程消息，穿过对话框的模态泵并可靠送达主循环
+		// 的路径并不总是成立（实测存在关不干净的残留），停止完成后硬退出最稳。
+		process.exit(0);
 	}
-	backend?.dispose();
-	// 直接退出进程：WM_QUIT 是线程消息，穿过对话框的模态泵并可靠送达主循环
-	// 的路径并不总是成立（实测存在关不干净的残留），dispose 完成后硬退出最稳。
-	process.exit(0);
 }
 
 function restoreFromTray(hwnd: Pointer): void {
@@ -851,7 +955,7 @@ function openPanel(forceNewWindow = false): void {
 	}
 	const mode = readNarraForkSettings().openBrowser;
 	if (mode === "off" && !forceNewWindow) return;
-	const url = `http://${displayHost(activeHost())}:${activePort()}/`;
+	const url = `${serviceOrigin()}/`;
 	appendLog(
 		"WEB",
 		forceNewWindow ? t("log.openedPanelNew", { url }) : t("log.openedPanel", { url }),
@@ -893,15 +997,23 @@ function openFrontendOnce(): void {
 
 /**
  * 打开设置窗口（模态），保存后即时应用：语言立即切换，主题色/实例名变化时刷新窗口图标与强调色。
- * 更新检查与下载走服务端自带接口（本机回环免认证），地址用面板当前实际使用的 host/port。
+ * 更新检查与下载走服务端自带接口。只有面板自己拉起（或更新后认领）的服务才带令牌。
  */
 async function openSettings(): Promise<void> {
 	if (!mainWindow) return;
+	const managed = serviceIsManaged();
 	const result = await showSettingsDialog(mainWindow.hwnd, {
 		preferences,
 		narrafork: readNarraForkSettings(),
 		brandColorRef,
-		serviceBaseUrl: `http://${displayHost(activeHost())}:${activePort()}`,
+		serviceBaseUrl: managed || externalRunning ? serviceOrigin() : undefined,
+		managerToken: managed ? managerToken : undefined,
+		onApplyStarting: () => {
+			expectRelaunch = true;
+		},
+		onApplyFailed: () => {
+			expectRelaunch = false;
+		},
 	});
 	if (!result) return;
 	preferences = result.preferences;
@@ -943,6 +1055,7 @@ export async function runManager(): Promise<void> {
 	const address = readServerAddress();
 	settings.host = address.host;
 	settings.port = address.port;
+	settings.tls = address.tls;
 	const branding = await loadBranding();
 	settings.brandColor = branding.color;
 	settings.brandName = branding.name;
@@ -952,12 +1065,27 @@ export async function runManager(): Promise<void> {
 	backend = new BackendProcess({
 		host: settings.host,
 		port: settings.port,
+		tls: settings.tls,
+		managerToken,
 		onLine: (line) => appendLog(undefined, formatBackendLine(line)),
 		onState: (state, detail) => {
+			if (state === "stopped" && expectRelaunch) {
+				expectRelaunch = false;
+				void adoptRelaunch();
+				return;
+			}
+			if (state === "running") {
+				supervision = "none";
+				openFrontendOnce();
+			} else if (
+				(state === "stopped" || state === "error") &&
+				supervision !== "reconnecting" &&
+				supervision !== "adopted"
+			) {
+				frontendOpened = false;
+			}
+			if (supervision === "reconnecting" || supervision === "adopted") return;
 			applyStatus(state, detail);
-			// 服务就绪后按设置打开前端；服务停下来时复位，下次启动可以再打开一次。
-			if (state === "running") openFrontendOnce();
-			else if (state === "stopped" || state === "error") frontendOpened = false;
 		},
 	});
 
@@ -1244,9 +1372,17 @@ export async function runManager(): Promise<void> {
 	// 前端改的也是同一份 settings，按 mtime 回显到输入框。
 	const stopWatching = watchSettings(() => {
 		const current = readServerAddress();
-		if (current.host === settings.host && current.port === settings.port) return;
+		if (
+			current.host === settings.host &&
+			current.port === settings.port &&
+			current.tls === settings.tls
+		) {
+			return;
+		}
 		settings.host = current.host;
 		settings.port = current.port;
+		settings.tls = current.tls;
+		syncListenTarget();
 		if (controls.ipEdit) setText(controls.ipEdit, current.host);
 		if (controls.portEdit) setText(controls.portEdit, String(current.port));
 		appendLog("PREP", t("log.addressChanged", { address: `${current.host}:${current.port}` }));
@@ -1257,7 +1393,8 @@ export async function runManager(): Promise<void> {
 	let firstProbeDone = false;
 	const probeExternal = (): void => {
 		if (backend?.current !== "stopped") return;
-		void probeServiceHealth(settings.host, settings.port).then((alive) => {
+		if (supervision !== "none" || expectRelaunch) return;
+		void probeServiceHealth(settings.host, settings.port, settings.tls).then((alive) => {
 			if (awaitingHandover && !alive) {
 				// 外部服务已退出：完成接管，启动面板托管的后端。
 				awaitingHandover = false;
@@ -1300,7 +1437,10 @@ export async function runManager(): Promise<void> {
 			lastHovered = hovered;
 		}
 		const currentStatus = backend?.current ?? "stopped";
-		const shouldBlink = currentStatus === "starting" || currentStatus === "stopping";
+		const shouldBlink =
+			supervision === "reconnecting" ||
+			currentStatus === "starting" ||
+			currentStatus === "stopping";
 		if (shouldBlink) {
 			const on = Math.floor(Date.now() / 450) % 2 === 0;
 			if (on !== statusDotBlinking) {

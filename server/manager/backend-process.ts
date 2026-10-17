@@ -1,12 +1,21 @@
-import { AUTO_LAN_HOST, isWildcardHost } from "@shared/server-host";
+import { AUTO_LAN_HOST, isWildcardHost, urlHost } from "@shared/server-host";
+import { MANAGER_TOKEN_ENV } from "../lib/manager-token";
 import { getLanAddresses } from "../lib/net/lan-addresses";
+import { isCompiledRuntime } from "../lib/runtime-target";
+import { parseServiceLogLine } from "./listen-log";
 import { t } from "./manager-i18n";
 
 export type BackendState = "stopped" | "starting" | "running" | "stopping" | "error";
 
-export interface BackendProcessOptions {
+export interface ListenTarget {
 	host: string;
 	port: number;
+	tls: boolean;
+}
+
+export interface BackendProcessOptions extends ListenTarget {
+	/** 只放进服务子进程的环境变量，不写进面板自己的 process.env。 */
+	managerToken: string;
 	/** 子进程的每一行输出（已去掉行尾）。 */
 	onLine: (line: string) => void;
 	/** 状态变化；`detail` 用于异常退出等需要说明的情形。 */
@@ -18,6 +27,8 @@ const READY_POLL_MS = 700;
 const READY_TIMEOUT_MS = 90_000;
 /** 等待服务自报监听地址的上限；超过后回退到配置端口探测，避免解析失败时一路悬空。 */
 const ADDRESS_WAIT_MS = 15_000;
+/** 优雅停止之后，进程仍在就结束整棵进程树。 */
+const GRACEFUL_STOP_MS = 15_000;
 
 /**
  * 健康检查用的本地探测地址。
@@ -29,26 +40,28 @@ const ADDRESS_WAIT_MS = 15_000;
 function probeHost(host: string): string {
 	if (isWildcardHost(host)) return "127.0.0.1";
 	if (host === AUTO_LAN_HOST) return getLanAddresses()[0] ?? "127.0.0.1";
-	if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
-	return host;
+	return urlHost(host);
 }
 
 /** 探测给定地址上是否已有 NarraFork 服务在响应（供识别外部启动的实例）。 */
-export async function probeServiceHealth(host: string, port: number): Promise<boolean> {
+export async function probeServiceHealth(
+	host: string,
+	port: number,
+	tls = false,
+): Promise<boolean> {
 	try {
-		const response = await fetch(`http://${probeHost(host)}:${port}/api/health`, {
-			signal: AbortSignal.timeout(1500),
-		});
+		const response = await fetch(
+			`${tls ? "https" : "http"}://${probeHost(host)}:${port}/api/health`,
+			{
+				signal: AbortSignal.timeout(1500),
+				// 本机自签证书只用于这一次健康检查。
+				tls: { rejectUnauthorized: false },
+			},
+		);
 		return response.ok;
 	} catch {
 		return false;
 	}
-}
-
-/** 当前是否运行在编译后的单文件产物里。 */
-function isCompiledRuntime(): boolean {
-	const url = import.meta.url;
-	return url.includes("$bunfs/") || url.includes("%7EBUN/");
 }
 
 /** 数据目录：直接复用 server 侧实现 —— 环境变量约定只能有一处。 */
@@ -60,25 +73,55 @@ export class BackendProcess {
 	/** 可中断等待的唤醒句柄：stop/dispose 用它立刻结束 waitUntilReady 的 sleep。 */
 	private sleepResolve?: () => void;
 	private disposed = false;
+	private target: ListenTarget;
 
-	constructor(private readonly options: BackendProcessOptions) {}
+	constructor(private readonly options: BackendProcessOptions) {
+		this.target = { host: options.host, port: options.port, tls: options.tls };
+	}
 
 	get current(): BackendState {
 		return this.state;
 	}
 
-	/** 服务当前监听的端口（未运行时为配置值）。 */
+	/** 服务当前监听的端口（未观测到时为配置值）。 */
 	get listeningPort(): number {
 		return this.probePort();
 	}
 
 	/** 服务实际监听的主机名（未解析到时为配置值）。 */
 	get listeningHost(): string {
-		return this.observedHost ?? this.options.host;
+		return this.observedHost ?? this.target.host;
+	}
+
+	/** 健康检查和打开面板使用的协议。日志里出现 https 时以日志为准。 */
+	get listeningTls(): boolean {
+		if (this.observedProtocol) return this.observedProtocol === "https";
+		return this.target.tls;
 	}
 
 	get pid(): number | undefined {
 		return this.child?.pid;
+	}
+
+	/**
+	 * 用户改了监听配置。清掉上一次观测，面板立刻按新目标显示；
+	 * 服务重绑后的 `running on` 日志会再把实际地址写回来。
+	 */
+	setTarget(next: ListenTarget): void {
+		const changed =
+			next.host !== this.target.host ||
+			next.port !== this.target.port ||
+			next.tls !== this.target.tls;
+		this.target = { host: next.host, port: next.port, tls: next.tls };
+		if (!changed) return;
+		this.observedHost = undefined;
+		this.observedPort = 0;
+		this.observedProtocol = undefined;
+	}
+
+	/** 按当前观测地址做一次健康检查。 */
+	checkHealth(): Promise<boolean> {
+		return probeServiceHealth(this.listeningHost, this.listeningPort, this.listeningTls);
 	}
 
 	private setState(state: BackendState, detail?: string): void {
@@ -89,6 +132,10 @@ export class BackendProcess {
 	/** 启动后端；已在运行时直接返回。 */
 	async start(): Promise<void> {
 		if (this.child || this.disposed) return;
+		this.lockConflictPid = undefined;
+		this.observedHost = undefined;
+		this.observedPort = 0;
+		this.observedProtocol = undefined;
 		this.setState("starting");
 		const args = isCompiledRuntime() ? ["--serve"] : ["server/index.ts", "--serve"];
 		try {
@@ -97,7 +144,11 @@ export class BackendProcess {
 				windowsHide: true,
 				stdout: "pipe",
 				stderr: "pipe",
-				env: { ...process.env, NARRAFORK_MANAGER_MANAGED: "1" },
+				env: {
+					...process.env,
+					NARRAFORK_MANAGER_MANAGED: "1",
+					[MANAGER_TOKEN_ENV]: this.options.managerToken,
+				},
 			});
 		} catch (error) {
 			this.setState("error", error instanceof Error ? error.message : String(error));
@@ -127,43 +178,33 @@ export class BackendProcess {
 	 */
 	private observedPort = 0;
 
-	/**
-	 * 服务实际监听的主机名（`running on` 那一行里的值）。
-	 *
-	 * 配置里的 host 可能是 `auto-lan` 这类"意图值"而非可用主机名，直接拼进 URL 只会
-	 * 得到浏览器报地址错误的页面；以服务自己报出的实际地址为准。
-	 */
+	/** 服务实际监听的主机名（`running on` 那一行里的值）。 */
 	private observedHost: string | undefined;
+
+	private observedProtocol: "http" | "https" | undefined;
 
 	/**
 	 * 实例锁冲突：同一数据目录已有另一个 NarraFork 在运行（服务输出会报出持有者 PID）。
-	 *
-	 * 面板托管的服务与用户手动启动的服务共用 ~/.narrafork，单实例锁只允许一个；此时
-	 * 新服务会立即退出，健康检查只会一直失败。记录 PID 以便马上给出明确原因。
+	 * 每次 start() 清空，否则上一次冲突会让随后的启动立刻失败。
 	 */
 	private lockConflictPid: number | undefined;
 
 	/** 健康检查应使用的端口。 */
 	private probePort(): number {
-		return this.observedPort > 0 ? this.observedPort : this.options.port;
+		return this.observedPort > 0 ? this.observedPort : this.target.port;
 	}
 
 	/** 从服务输出里解析实际监听地址与实例锁冲突。 */
 	private observeListenerAddress(line: string): void {
-		const conflict = line.match(/Another NarraFork process \(pid (\d+)\) is already using/);
-		if (conflict) {
-			const pid = Number.parseInt(conflict[1], 10);
-			if (Number.isFinite(pid) && pid > 0) this.lockConflictPid = pid;
+		const event = parseServiceLogLine(line);
+		if (!event) return;
+		if (event.kind === "lock") {
+			this.lockConflictPid = event.pid;
 			return;
 		}
-		// 主机名可能是 IPv4/主机名，也可能是带方括号的 IPv6 字面量（[::1]）。
-		const match = line.match(/running on https?:\/\/(\[[^\]]+\]|[^:/]+):(\d+)/);
-		if (!match) return;
-		const port = Number.parseInt(match[2], 10);
-		if (Number.isFinite(port) && port > 0) {
-			this.observedHost = match[1];
-			this.observedPort = port;
-		}
+		this.observedProtocol = event.protocol;
+		this.observedHost = event.host;
+		this.observedPort = event.port;
 	}
 
 	/** 轮询健康检查直到就绪；超时只报状态，不杀进程（服务可能仍在慢启动）。 */
@@ -184,19 +225,9 @@ export class BackendProcess {
 				await this.sleep(READY_POLL_MS);
 				continue;
 			}
-			try {
-				const response = await fetch(
-					`http://${probeHost(this.options.host)}:${this.probePort()}/api/health`,
-					{
-						signal: AbortSignal.timeout(1500),
-					},
-				);
-				if (response.ok) {
-					this.setState("running");
-					return;
-				}
-			} catch {
-				// 还没起来，继续等。
+			if (await this.checkHealth()) {
+				this.setState("running");
+				return;
 			}
 			await this.sleep(READY_POLL_MS);
 		}
@@ -254,8 +285,12 @@ export class BackendProcess {
 		}
 	}
 
-	/** 停止后端并等待进程真正退出。 */
-	async stop(): Promise<void> {
+	/**
+	 * 停止后端并等待进程真正退出。
+	 *
+	 * `graceful` 时先等进程自己退出（调用方应已请求 HTTP 关闭），超时再结束进程树。
+	 */
+	async stop(options?: { graceful?: boolean }): Promise<void> {
 		const child = this.child;
 		if (!child) {
 			this.setState("stopped");
@@ -264,13 +299,21 @@ export class BackendProcess {
 		this.setState("stopping");
 		this.child = undefined;
 		this.interruptSleep();
-		child.kill();
+		if (options?.graceful) {
+			const exited = await Promise.race([
+				child.exited.then(() => true),
+				this.sleep(GRACEFUL_STOP_MS).then(() => false),
+			]);
+			if (!exited) this.forceKill(child);
+		} else {
+			this.forceKill(child);
+		}
 		await child.exited.catch(() => undefined);
 		this.setState("stopped");
 	}
 
 	async restart(): Promise<void> {
-		await this.stop();
+		await this.stop({ graceful: true });
 		await this.start();
 	}
 
@@ -278,7 +321,23 @@ export class BackendProcess {
 	dispose(): void {
 		this.disposed = true;
 		this.interruptSleep();
-		this.child?.kill();
+		const child = this.child;
 		this.child = undefined;
+		if (child) this.forceKill(child);
+	}
+
+	private forceKill(child: Bun.Subprocess): void {
+		if (process.platform === "win32" && child.pid) {
+			Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(child.pid)], {
+				stdout: "ignore",
+				stderr: "ignore",
+				windowsHide: true,
+			});
+		}
+		try {
+			child.kill();
+		} catch {
+			// 进程已经退出。
+		}
 	}
 }

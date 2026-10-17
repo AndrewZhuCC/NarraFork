@@ -15,12 +15,12 @@ import {
 	renewToken,
 	verifyToken,
 } from "../lib/auth";
+import { AppError, catalogError } from "../lib/errors";
+import { logger } from "../lib/logger";
 // The two remaining raw AppErrors below are deliberate: `INVALID_SCOPE` is a programming
 // error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
 // OAuth clients rather than rendered in the UI, so neither needs a localized wording.
-import { isTrustedProxyAddress } from "../lib/client-ip";
-import { AppError, catalogError } from "../lib/errors";
-import { logger } from "../lib/logger";
+import { isManagerTokenAuthorized, MANAGER_TOKEN_ENV } from "../lib/manager-token";
 import { validateAccessToken } from "../lib/oauth-provider";
 import { authSessionStore } from "../services/auth/store";
 
@@ -395,19 +395,22 @@ export async function requireAdmin(c: Context, next: Next) {
 	await next();
 }
 
-/** 本机回环网段：管理器面板与服务同机运行，没有登录凭据。 */
-const LOCAL_PEER_CIDRS = ["127.0.0.0/8", "::1/128"];
-
 /**
- * 管理员会话，或来自本机回环的请求。
+ * 管理员会话，或管理器面板持有的本机令牌。
  *
- * 管理器面板是独立进程、没有 JWT，需要对少量接口（更新检查/下载/应用）免凭据调用；
- * 只放行回环来源，其余请求仍走完整的认证与管理员校验。clientIp 由 Bun 边界解析后
- * 注入 Context（见 server/main.ts），不信任调用方自带的转发头。
+ * 面板是独立进程、没有用户 JWT。令牌由面板生成，只放进它拉起的服务进程的环境变量。
+ * 对端必须是回环 socket（`peerIp`，不是解析过转发头的 clientIp），并且 Bearer 与令牌一致。
+ * 终端里手动启动的服务没有这个环境变量，因此没有旁路。
  */
-export async function requireAdminOrLocalPeer(c: Context, next: Next) {
-	const clientIp = (c.env as { clientIp?: string } | undefined)?.clientIp;
-	if (isTrustedProxyAddress(clientIp, LOCAL_PEER_CIDRS)) {
+export async function requireAdminOrManagerToken(c: Context, next: Next) {
+	const env = c.env as { peerIp?: string } | undefined;
+	if (
+		isManagerTokenAuthorized({
+			peerIp: env?.peerIp,
+			authorization: c.req.header("authorization"),
+			expectedToken: process.env[MANAGER_TOKEN_ENV],
+		})
+	) {
 		await next();
 		return;
 	}

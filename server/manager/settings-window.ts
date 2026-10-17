@@ -74,6 +74,12 @@ export interface SettingsDialogInput {
 	brandColorRef: number;
 	/** 更新检查的服务基地址（如 http://127.0.0.1:7778）；服务未运行时为 undefined。 */
 	serviceBaseUrl?: string;
+	/** 面板拉起的服务才有令牌。外部启动的实例不传，更新按钮会说明原因。 */
+	managerToken?: string;
+	/** 应用更新即将发出。面板据此在子进程退出后等待替换进程。 */
+	onApplyStarting?: () => void;
+	/** 应用请求被服务拒绝。连接被重启打断不算失败。 */
+	onApplyFailed?: () => void;
 }
 
 export interface SettingsDialogResult {
@@ -543,14 +549,19 @@ export async function showSettingsDialog(
 	/** 检查更新：结果写入状态行，检测到新版本时露出「立即更新」。 */
 	function runCheck(): void {
 		const baseUrl = input.serviceBaseUrl;
+		const token = input.managerToken;
 		if (!baseUrl) {
 			setText(controls.status, t("settings.nfUnavailable"));
+			return;
+		}
+		if (!token) {
+			setText(controls.status, t("settings.updateUnmanaged"));
 			return;
 		}
 		setText(controls.status, t("settings.checking"));
 		setVisible(controls.updateNow, false);
 		void (async () => {
-			const summary = await checkForUpdate(baseUrl);
+			const summary = await checkForUpdate(baseUrl, token);
 			if (closed) return;
 			if (summary.error) {
 				latestCheck = undefined;
@@ -577,8 +588,9 @@ export async function showSettingsDialog(
 	/** 下载并应用：进度进状态行；服务端应用后重启，连接中断属正常。 */
 	function runUpdate(): void {
 		const baseUrl = input.serviceBaseUrl;
+		const token = input.managerToken;
 		const releaseInfo = latestCheck?.releaseInfo;
-		if (!baseUrl || !releaseInfo) return;
+		if (!baseUrl || !token || !releaseInfo) return;
 		if (
 			messageBox(hwnd, t("settings.updateConfirm"), t("settings.title"), MB_YESNO_QUESTION) !==
 			IDYES
@@ -588,7 +600,7 @@ export async function showSettingsDialog(
 		setVisible(controls.updateNow, false);
 		setText(controls.status, t("settings.downloading", { percent: 0 }));
 		void (async () => {
-			const outcome = await downloadUpdate(baseUrl, releaseInfo, (percent) => {
+			const outcome = await downloadUpdate(baseUrl, token, releaseInfo, (percent) => {
 				if (closed) return;
 				setText(controls.status, t("settings.downloading", { percent: Math.round(percent) }));
 			});
@@ -601,7 +613,9 @@ export async function showSettingsDialog(
 				return;
 			}
 			setText(controls.status, t("settings.applying"));
-			await applyUpdate(baseUrl, outcome.version, outcome.preparedIdentity);
+			input.onApplyStarting?.();
+			const applied = await applyUpdate(baseUrl, token, outcome.version, outcome.preparedIdentity);
+			if (!applied.success && !applied.interrupted) input.onApplyFailed?.();
 		})();
 	}
 

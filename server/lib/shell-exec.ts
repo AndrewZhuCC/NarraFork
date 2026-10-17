@@ -38,22 +38,30 @@ function loadShell32(): typeof shell32 {
 	return shell32;
 }
 
-/** UTF-16 以 NUL 结尾；ShellExecuteW 是同步调用，缓冲在调用期间由形参持有。 */
-function wide(text: string): Pointer {
-	return ptr(Buffer.from(`${text}\0`, "utf16le")) as Pointer;
+/** UTF-16 以 NUL 结尾。返回的 Buffer 必须活过 ShellExecuteW，调用方在调用之后还要引用它。 */
+function wide(text: string): { bytes: Buffer; pointer: Pointer } {
+	const bytes = Buffer.from(`${text}\0`, "utf16le");
+	return { bytes, pointer: ptr(bytes) as Pointer };
 }
 
 /** 打开 URL / 文件；返回是否被 shell 受理（返回值 <= 32 皆为错误码）。 */
 export function shellExecute(target: string, params?: string): boolean {
 	const lib = loadShell32();
 	if (!lib) return false;
+	const operation = wide("open");
+	const file = wide(target);
+	const parameters = params === undefined ? undefined : wide(params);
 	const result = lib.ShellExecuteW(
 		0n as unknown as Pointer,
-		wide("open"),
-		wide(target),
-		params === undefined ? (null as unknown as Pointer) : wide(params),
+		operation.pointer,
+		file.pointer,
+		parameters === undefined ? (null as unknown as Pointer) : parameters.pointer,
 		null as unknown as Pointer,
 		SW_SHOWNORMAL,
 	);
+	// 调用返回前保持缓冲可达。ptr() 不持有 Buffer，提前变成垃圾会被下一次分配回收。
+	void operation.bytes;
+	void file.bytes;
+	void parameters?.bytes;
 	return Number(result) > 32;
 }

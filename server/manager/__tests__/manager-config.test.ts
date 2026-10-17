@@ -36,7 +36,7 @@ function writeSettings(value: unknown): void {
 
 describe("监听地址读写", () => {
 	test("缺文件时回落到默认值", () => {
-		expect(readServerAddress()).toEqual({ host: "127.0.0.1", port: 7779 });
+		expect(readServerAddress()).toEqual({ host: "127.0.0.1", port: 7779, tls: false });
 	});
 
 	test("写入只改 server.host/port，其它配置原样保留", () => {
@@ -52,7 +52,27 @@ describe("监听地址读写", () => {
 		expect(saved.server).toEqual({ host: "0.0.0.0", port: 8080, trustProxy: true });
 		expect(saved.branding).toEqual({ iconColor: "#123456" });
 		expect(saved.agent).toEqual({ defaultModel: "x" });
-		expect(readServerAddress()).toEqual({ host: "0.0.0.0", port: 8080 });
+		expect(readServerAddress()).toEqual({ host: "0.0.0.0", port: 8080, tls: false });
+	});
+
+	test("读取 server.tls.enabled", () => {
+		writeSettings({ server: { host: "127.0.0.1", port: 7779, tls: { enabled: true } } });
+		expect(readServerAddress().tls).toBe(true);
+	});
+
+	test("随后写入品牌字段时保留刚保存的监听地址", () => {
+		writeSettings({ server: { host: "127.0.0.1", port: 1 }, agent: { keep: true } });
+		expect(writeServerAddress({ host: "0.0.0.0", port: 9 })).toBe(true);
+		expect(writeNarraForkSettings({ brandName: "Lab" })).toBe(true);
+		const saved = JSON.parse(readFileSync(join(home, "settings.json"), "utf8")) as {
+			server: { host: string; port: number };
+			branding: { name: string };
+			agent: { keep: boolean };
+		};
+		expect(saved.server.host).toBe("0.0.0.0");
+		expect(saved.server.port).toBe(9);
+		expect(saved.branding.name).toBe("Lab");
+		expect(saved.agent.keep).toBe(true);
 	});
 
 	test("写入后 mtime 前进，回显轮询据此发现外部修改", async () => {

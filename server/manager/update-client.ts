@@ -1,9 +1,8 @@
 /**
  * 管理器面板的更新客户端。
  *
- * 走 NarraFork 服务端自带的更新接口（检查/下载/应用三个路由对本机回环免认证，见
- * middleware/auth.ts 的 requireAdminOrLocalPeer）：流程与前端的更新模态框同源，
- * 面板只把它搬进原生窗口，不重复实现检测、下载与校验。
+ * 走 NarraFork 服务端自带的更新接口。面板把启动服务时发下去的令牌放进
+ * Authorization。流程与前端的更新模态框同源，面板不重复实现检测、下载与校验。
  */
 
 export interface UpdateCheckSummary {
@@ -26,6 +25,8 @@ export interface DownloadOutcome {
 export interface ApplyOutcome {
 	success: boolean;
 	error?: string;
+	/** 连接在服务重启时断开。调用方应把它当成“替换进程已启动”，而不是失败。 */
+	interrupted?: boolean;
 }
 
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -34,10 +35,15 @@ function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function authHeaders(token: string, extra?: Record<string, string>): Record<string, string> {
+	return { ...extra, authorization: `Bearer ${token}` };
+}
+
 /** 检查更新；服务不可用或出错时返回带 error 的结果（面板只负责展示文案）。 */
-export async function checkForUpdate(baseUrl: string): Promise<UpdateCheckSummary> {
+export async function checkForUpdate(baseUrl: string, token: string): Promise<UpdateCheckSummary> {
 	try {
 		const response = await fetch(`${baseUrl}/api/update/check`, {
+			headers: authHeaders(token),
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
 		const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
@@ -68,6 +74,7 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheckSummar
  */
 export async function downloadUpdate(
 	baseUrl: string,
+	token: string,
 	releaseInfo: unknown,
 	onProgress: (percent: number) => void,
 	signal?: AbortSignal,
@@ -75,7 +82,7 @@ export async function downloadUpdate(
 	try {
 		const response = await fetch(`${baseUrl}/api/update/download`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: authHeaders(token, { "content-type": "application/json" }),
 			body: JSON.stringify({ releaseInfo }),
 			signal,
 		});
@@ -139,13 +146,14 @@ export async function downloadUpdate(
  */
 export async function applyUpdate(
 	baseUrl: string,
+	token: string,
 	version: string | undefined,
 	preparedIdentity: string,
 ): Promise<ApplyOutcome> {
 	try {
 		const response = await fetch(`${baseUrl}/api/update/apply`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: authHeaders(token, { "content-type": "application/json" }),
 			body: JSON.stringify({ version, preparedId: preparedIdentity }),
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
@@ -158,6 +166,6 @@ export async function applyUpdate(
 		}
 		return { success: true };
 	} catch (error) {
-		return { success: false, error: messageOf(error) };
+		return { success: false, interrupted: true, error: messageOf(error) };
 	}
 }

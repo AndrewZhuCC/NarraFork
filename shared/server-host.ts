@@ -10,3 +10,15 @@ export const AUTO_LAN_HOST = "auto-lan";
 export function isWildcardHost(host: string): boolean {
 	return host === "0.0.0.0" || host === "::" || host === "[::]" || host === "";
 }
+
+/**
+ * 可以放进 URL 的主机名。
+ *
+ * 通配地址和 `auto-lan` 都不是可访问的主机；裸 IPv6 字面量必须加方括号，
+ * 否则 `http://:::7778` 既打不开，也解析不出端口。
+ */
+export function urlHost(host: string): string {
+	if (isWildcardHost(host) || host === AUTO_LAN_HOST) return "127.0.0.1";
+	if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
+	return host;
+}

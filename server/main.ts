@@ -12,7 +12,7 @@ import {
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
 import { CHROMIUM_PATHS } from "../shared/browser-paths";
-import { isWildcardHost } from "../shared/server-host";
+import { urlHost } from "../shared/server-host";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -806,18 +806,6 @@ function getProtocol(): "https" | "http" {
 	return settings.server.tls?.enabled ? "https" : "http";
 }
 
-/**
- * URL 里可用的主机名。
- *
- * 通配地址（0.0.0.0 / :: / 空）不是可访问的主机名，IPv6 字面量还必须有方括号；
- * 直接拼进 URL 会得到 `http://:::7778` 这种畸形地址 —— 浏览器报错，解析方也读不出端口。
- */
-function urlHost(host: string): string {
-	if (isWildcardHost(host)) return "127.0.0.1";
-	if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
-	return host;
-}
-
 async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
 	if (!settings.vnet?.enabled) return null;
 	const bearer = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
@@ -1130,6 +1118,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 				});
 				return app.fetch(req, {
 					clientIp,
+					peerIp,
 					trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
 				});
 			});
@@ -1304,7 +1293,11 @@ registerServerRestart((newHost: string, newPort: number, options) => {
 		options?.preserveResponse === true,
 	);
 	const address = runtimeAddress();
-	logger.info("Server listener rebound", address);
+	// 与启动时同一句式，管理器才能在热重绑后更新面板上的地址。
+	logger.info(
+		`NarraFork server running on ${address.protocol}://${urlHost(address.host)}:${address.port}`,
+		{ rebound: true, listenHost: address.host, port: address.port },
+	);
 	return address;
 });
 

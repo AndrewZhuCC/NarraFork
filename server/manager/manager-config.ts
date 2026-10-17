@@ -4,21 +4,23 @@
  * 监听地址/端口直接读写 NarraFork 自己的 settings.json —— 前端设置页改的就是同一份配置，
  * 所以两边天然同步：面板保存后前端看得到，前端改了面板也能通过 mtime 轮询回显。
  *
- * 写入采用「读整份 → 改两个字段 → 写回」，其余配置原样保留；并且先写同目录临时文件再原子
- * 改名，避免与 NarraFork 进程同时写时留下半截 JSON。
+ * 写入在 settings.lock 内重新读取、只改自己的字段，再写临时文件并原子改名。
+ * 这样和正在运行的服务同时保存时，不会用旧快照盖掉对方刚写入的键。
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { withSettingsFileLock } from "../lib/settings-file-lock";
 import { resolveNarraforkHome } from "./backend-process";
 import { isManagerLang, type ManagerLang } from "./manager-i18n";
 
 export interface ServerAddress {
 	host: string;
 	port: number;
+	tls: boolean;
 }
 
-const DEFAULT_ADDRESS: ServerAddress = { host: "127.0.0.1", port: 7779 };
+const DEFAULT_ADDRESS: ServerAddress = { host: "127.0.0.1", port: 7779, tls: false };
 
 function settingsPath(): string {
 	return join(resolveNarraforkHome(), "settings.json");
@@ -28,7 +30,7 @@ function settingsPath(): string {
 export function readServerAddress(): ServerAddress {
 	try {
 		const raw = JSON.parse(readFileSync(settingsPath(), "utf8")) as {
-			server?: { host?: string; port?: number };
+			server?: { host?: string; port?: number; tls?: { enabled?: boolean } };
 		};
 		return {
 			host:
@@ -36,6 +38,7 @@ export function readServerAddress(): ServerAddress {
 					? raw.server.host
 					: DEFAULT_ADDRESS.host,
 			port: typeof raw.server?.port === "number" ? raw.server.port : DEFAULT_ADDRESS.port,
+			tls: raw.server?.tls?.enabled === true,
 		};
 	} catch {
 		return { ...DEFAULT_ADDRESS };
@@ -43,19 +46,21 @@ export function readServerAddress(): ServerAddress {
 }
 
 /** 只覆盖 server.host / server.port，其余字段原样保留。返回是否写入成功。 */
-export function writeServerAddress(address: ServerAddress): boolean {
+export function writeServerAddress(address: Pick<ServerAddress, "host" | "port">): boolean {
 	try {
-		const path = settingsPath();
-		const raw = existsSync(path)
-			? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
-			: {};
-		const server = (
-			typeof raw.server === "object" && raw.server !== null ? raw.server : {}
-		) as Record<string, unknown>;
-		raw.server = { ...server, host: address.host, port: address.port };
-		const temporary = `${path}.manager.tmp`;
-		writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
-		renameSync(temporary, path);
+		withSettingsFileLock(resolveNarraforkHome(), () => {
+			const path = settingsPath();
+			const raw = existsSync(path)
+				? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+				: {};
+			const server = (
+				typeof raw.server === "object" && raw.server !== null ? raw.server : {}
+			) as Record<string, unknown>;
+			raw.server = { ...server, host: address.host, port: address.port };
+			const temporary = `${path}.manager.tmp`;
+			writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+			renameSync(temporary, path);
+		});
 		return true;
 	} catch {
 		return false;
@@ -106,33 +111,35 @@ export function readNarraForkSettings(): NarraForkSettings {
 /** 只覆盖传入的字段，其余配置（含面板不认识的键）原样保留；空串表示删除该键回到默认。 */
 export function writeNarraForkSettings(patch: Partial<NarraForkSettings>): boolean {
 	try {
-		const path = settingsPath();
-		const raw = existsSync(path)
-			? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
-			: {};
-		if (patch.openBrowser !== undefined) {
-			const server = (
-				typeof raw.server === "object" && raw.server !== null ? raw.server : {}
-			) as Record<string, unknown>;
-			raw.server = { ...server, openBrowser: patch.openBrowser };
-		}
-		if (patch.brandName !== undefined || patch.brandColor !== undefined) {
-			const branding = (
-				typeof raw.branding === "object" && raw.branding !== null ? raw.branding : {}
-			) as Record<string, unknown>;
-			if (patch.brandName !== undefined) {
-				if (patch.brandName) branding.name = patch.brandName;
-				else delete branding.name;
+		withSettingsFileLock(resolveNarraforkHome(), () => {
+			const path = settingsPath();
+			const raw = existsSync(path)
+				? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+				: {};
+			if (patch.openBrowser !== undefined) {
+				const server = (
+					typeof raw.server === "object" && raw.server !== null ? raw.server : {}
+				) as Record<string, unknown>;
+				raw.server = { ...server, openBrowser: patch.openBrowser };
 			}
-			if (patch.brandColor !== undefined) {
-				if (patch.brandColor) branding.iconColor = patch.brandColor;
-				else delete branding.iconColor;
+			if (patch.brandName !== undefined || patch.brandColor !== undefined) {
+				const branding = (
+					typeof raw.branding === "object" && raw.branding !== null ? raw.branding : {}
+				) as Record<string, unknown>;
+				if (patch.brandName !== undefined) {
+					if (patch.brandName) branding.name = patch.brandName;
+					else delete branding.name;
+				}
+				if (patch.brandColor !== undefined) {
+					if (patch.brandColor) branding.iconColor = patch.brandColor;
+					else delete branding.iconColor;
+				}
+				raw.branding = branding;
 			}
-			raw.branding = branding;
-		}
-		const temporary = `${path}.manager.tmp`;
-		writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
-		renameSync(temporary, path);
+			const temporary = `${path}.manager.tmp`;
+			writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+			renameSync(temporary, path);
+		});
 		return true;
 	} catch {
 		return false;

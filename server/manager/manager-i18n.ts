@@ -28,6 +28,7 @@ const MESSAGES: Record<string, Message> = {
 	"status.stopped": { "zh-CN": "已停止", en: "Stopped" },
 	"status.error": { "zh-CN": "异常退出", en: "Failed" },
 	"status.external": { "zh-CN": "（外部启动）", en: " (external)" },
+	"status.reconnecting": { "zh-CN": "正在重新连接", en: "Reconnecting" },
 	"status.detail": { "zh-CN": "（{detail}）", en: " ({detail})" },
 	"status.handover": {
 		"zh-CN": "（等待接管：请在终端停止外部服务）",
@@ -48,7 +49,7 @@ const MESSAGES: Record<string, Message> = {
 	"label.ip": { "zh-CN": "IP 地址", en: "IP Address" },
 	"label.port": { "zh-CN": "端口", en: "Port" },
 	"label.output": { "zh-CN": "输出日志", en: "Output Log" },
-	"label.address": { "zh-CN": "面板地址: http://{url}", en: "Panel: http://{url}" },
+	"label.address": { "zh-CN": "面板地址: {url}", en: "Panel: {url}" },
 
 	// ── 日志与提示 ───────────────────────────────────────────────────────────
 	"log.managerStarted": {
@@ -97,6 +98,10 @@ const MESSAGES: Record<string, Message> = {
 	"log.minimized": {
 		"zh-CN": "已最小化到任务栏，双击托盘图标可以重新打开。",
 		en: "Minimized to the tray; double-click the tray icon to reopen.",
+	},
+	"log.relaunched": {
+		"zh-CN": "更新后的服务已重新就绪。",
+		en: "The updated service is ready.",
 	},
 	"log.trayFailed": {
 		"zh-CN": "托盘图标添加失败，关闭窗口将直接退出。",
@@ -248,6 +253,10 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "NarraFork 服务未运行，配置将在服务启动后生效",
 		en: "The NarraFork service is not running; changes apply once it starts",
 	},
+	"settings.updateUnmanaged": {
+		"zh-CN": "这个服务不是面板启动的，请在网页里用管理员账号更新",
+		en: "This service was not started by the manager. Update it from the web UI as an admin.",
+	},
 
 	// ── 启动错误 ─────────────────────────────────────────────────────────────
 	"error.nativeUnavailable": {
@@ -269,6 +278,14 @@ const MESSAGES: Record<string, Message> = {
 	"error.readyTimeout": {
 		"zh-CN": "启动超时：健康检查未通过",
 		en: "Startup timed out: health check did not pass",
+	},
+	"error.relaunchTimeout": {
+		"zh-CN": "更新后没有重新连上服务",
+		en: "The service did not come back after the update",
+	},
+	"error.shutdownFailed": {
+		"zh-CN": "优雅关闭请求失败，将直接结束进程",
+		en: "Graceful shutdown was not accepted; the process will be stopped directly",
 	},
 	"error.exitedWithCode": { "zh-CN": "退出码 {code}", en: "exit code {code}" },
 };
