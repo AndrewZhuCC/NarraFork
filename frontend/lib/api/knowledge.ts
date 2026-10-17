@@ -12,6 +12,8 @@ import type {
 	KnowledgeEntryDetail,
 	KnowledgeEntryLink,
 	KnowledgeEntryPage,
+	KnowledgeEntrySort,
+	KnowledgeEntryStatus,
 	KnowledgeFinding,
 	KnowledgeGrant,
 	KnowledgeGraph,
@@ -20,6 +22,7 @@ import type {
 	KnowledgeLinkType,
 	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgePersonalEntryDetail,
 	KnowledgePersonalEntrySummary,
 	KnowledgeRebaseResult,
 	KnowledgeRebaseStrategy,
@@ -123,7 +126,16 @@ export const knowledgeApi = {
 		request<KnowledgeSearchResult[] | KnowledgeEntry[]>(`/knowledge/entries${qs(opts)}`),
 	/** Keyset-paginated entry list; follow `nextCursor` until null. */
 	listKnowledgeEntriesPage: (
-		opts: { collectionId?: string; tag?: string; q?: string; cursor?: string; limit?: number } = {},
+		opts: {
+			collectionId?: string;
+			tag?: string;
+			q?: string;
+			level?: string;
+			status?: KnowledgeEntryStatus;
+			sort?: KnowledgeEntrySort;
+			cursor?: string;
+			limit?: number;
+		} = {},
 	) =>
 		request<KnowledgeEntryPage>(
 			`/knowledge/entries${qs({
@@ -242,7 +254,7 @@ export const knowledgeApi = {
 			body: JSON.stringify(data),
 		}),
 	getPersonalEntry: (id: string) =>
-		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`),
+		request<KnowledgePersonalEntryDetail>(`/knowledge/personal-entries/${id}`),
 	updatePersonalEntryMeta: (
 		id: string,
 		data: { title?: string; targetCollectionId?: string | null; keywords?: string[] },

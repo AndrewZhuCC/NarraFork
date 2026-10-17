@@ -634,7 +634,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/file-change-diagnostics.ts": ["errorCode"],
 	"server/services/file-change-namespace-reset.ts": ["rowid"],
 	"server/services/local-session-detach/store.ts": ["driver"],
-	"server/services/narrator-context-composition.ts": ["driver", "handle", "json1"],
+	"server/services/narrator-context-composition.ts": ["driver", "handle"],
 	"server/services/narrator-permission.ts": ["json1"],
 	"server/services/narrator-question-history.ts": [
 		"driver",

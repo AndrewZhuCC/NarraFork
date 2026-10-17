@@ -176,6 +176,14 @@
 			"prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
 			"version": "7",
 			"snapshotDigest": "3c80d720f39991d0d854ae8fb218d53dcd253d49bd4aa9c3a655536cb487d123"
+		},
+		{
+			"idx": 22,
+			"tag": "0022_context_numeric_stats",
+			"id": "3fc16cee-d009-4621-8ff8-75080ec7d211",
+			"prevId": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
+			"version": "7",
+			"snapshotDigest": "0f56b1fc448b5bc0a187faa9e0649ca59003698b49141c0b733242eaeed2cc9c"
 		}
 	]
 }

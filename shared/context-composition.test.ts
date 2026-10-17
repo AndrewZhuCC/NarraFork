@@ -8,7 +8,7 @@ import {
 } from "./context-composition";
 
 describe("context character composition", () => {
-	test("groups all nine categories without modifying chronological segments", () => {
+	test("groups all ten categories without modifying chronological segments", () => {
 		const source = [
 			{ category: "user" as const, chars: 12 },
 			{ category: "system" as const, chars: 4 },
@@ -35,7 +35,7 @@ describe("context character composition", () => {
 		expect(result.generation).toBeNull();
 		expect(result.totalChars).toBe(0);
 		expect(result.pending).toBe(true);
-		expect(result.totals).toHaveLength(9);
+		expect(result.totals).toHaveLength(CONTEXT_CATEGORIES.length);
 		expect(result.segments).toEqual([]);
 	});
 });

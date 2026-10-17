@@ -1,7 +1,6 @@
 {
 	"panel.title": "Git",
 	"lineStats.loading": "Counting lines…",
-	"lineStats.updating": "Updating line counts…",
 	"lineStats.failed": "Line counts failed",
 	"lineStats.partial": "Incomplete line counts",
 	"lineStats.unsupported": "Update executor for line counts",

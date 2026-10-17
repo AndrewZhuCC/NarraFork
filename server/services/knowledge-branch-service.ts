@@ -13,7 +13,12 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { slugify } from "../lib/slug";
 import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
-import { WITHDRAWABLE_SUBMISSION_STATUSES } from "./knowledge/write-store";
+import {
+	CLAIMABLE_SUBMISSION_STATUSES,
+	CLOSED_ON_ENTRY_DELETE_STATUSES,
+	OPEN_SUBMISSION_SCAN_LIMIT,
+	WITHDRAWABLE_SUBMISSION_STATUSES,
+} from "./knowledge/write-store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -22,6 +27,7 @@ import {
 	canReview,
 	canWriteCollection,
 	type Principal,
+	type PrincipalCaps,
 	resolvePrincipalCaps,
 } from "./knowledge-acl";
 import { emitEntryDrifted } from "./knowledge-notify";
@@ -40,6 +46,9 @@ function hashContent(content: string): string {
  * knowledge_submissions instead.
  */
 type PersonalEntryStatus = "active" | "archived";
+type PersonalEntryRow = NonNullable<
+	Awaited<ReturnType<typeof knowledgeReadStore.getPersonalEntryById>>
+>;
 /** Statuses whose personal entries still shadow main / participate in search. */
 const ACTIVE_DRAFT_STATUSES: PersonalEntryStatus[] = ["active"];
 
@@ -280,6 +289,212 @@ async function findDriftedDraftIds(
 /** Read one of the caller's own personal entries by id. */
 async function getMine(principal: Principal, draftId: string) {
 	return loadOwnDraft(principal, draftId);
+}
+
+// ─── Personal-version page views (KNOWLEDGE_UI_REDESIGN §5.4 / §5.5) ──────
+
+/**
+ * The subset of `entryIds` the caller can currently READ (collection gate + entry gate), with
+ * the columns the personal views display. One `inArray` per table, bounded by the input (the
+ * caller's own list page). An entry the caller lost access to is simply absent, so its title
+ * never reaches a personal-version view.
+ */
+async function loadReadableEntries(caps: PrincipalCaps, entryIds: readonly string[]) {
+	const ids = [...new Set(entryIds)];
+	if (ids.length === 0) return new Map<string, ReadableEntrySummary>();
+	const entries = await db.query.knowledgeEntries.findMany({
+		where: (e, { inArray: ia }) => ia(e.id, ids),
+		columns: {
+			id: true,
+			title: true,
+			collectionId: true,
+			ownerUserId: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			reviewTagsJson: true,
+			currentRevisionId: true,
+		},
+	});
+	const cols = await loadCollectionAclRows(entries.map((e) => e.collectionId));
+	const out = new Map<string, ReadableEntrySummary>();
+	for (const e of entries) {
+		const col = cols.get(e.collectionId);
+		if (!col) continue;
+		if (await canRead(caps, toAclEntry(e), toAclCollection(col))) out.set(e.id, e);
+	}
+	return out;
+}
+
+interface ReadableEntrySummary {
+	id: string;
+	title: string;
+	collectionId: string;
+	currentRevisionId: string | null;
+}
+
+async function loadCollectionAclRows(collectionIds: readonly string[]) {
+	const ids = [...new Set(collectionIds)];
+	if (ids.length === 0) return new Map<string, CollectionAclRow>();
+	const rows = await db.query.knowledgeCollections.findMany({
+		where: (c, { inArray: ia }) => ia(c.id, ids),
+		columns: {
+			id: true,
+			name: true,
+			defaultLevel: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
+	});
+	return new Map(rows.map((c) => [c.id, c]));
+}
+
+type CollectionAclRow = Pick<
+	CollectionRow,
+	"id" | "name" | "defaultLevel" | "classificationLevel" | "controlledTagsJson" | "ownerUserId"
+>;
+
+/** Names of the collections (among `collectionIds`) the caller can read. */
+async function readableCollectionNames(caps: PrincipalCaps, collectionIds: readonly string[]) {
+	const cols = await loadCollectionAclRows(collectionIds);
+	const out = new Map<string, string>();
+	for (const c of cols.values()) {
+		if (await canReadCollection(caps, toAclCollection(c))) out.set(c.id, c.name);
+	}
+	return out;
+}
+
+/**
+ * `GET /personal-entries` for "My" (§5.4): {@link listMine} + `drifted` (as before) + the
+ * display names the list shows — `entryTitle` (linked, only while the caller can READ that
+ * entry) and `targetCollectionName` (standalone, only while the target collection is readable).
+ * Bounded by the list cap; two `inArray` lookups per kind, no per-row queries.
+ */
+async function listMineForViewer(
+	principal: Principal,
+	opts: { status?: PersonalEntryStatus; limit?: number } = {},
+) {
+	const rows = await listMine(principal, opts);
+	if (rows.length === 0) return [];
+	const driftedIds = await findDriftedDraftIds(rows);
+	const caps = await resolvePrincipalCaps(principal);
+	const entries = await loadReadableEntries(
+		caps,
+		rows.map((r) => r.entryId).filter((id): id is string => !!id),
+	);
+	const colNames = await readableCollectionNames(
+		caps,
+		rows
+			.filter((r) => !r.entryId)
+			.map((r) => r.targetCollectionId)
+			.filter((id): id is string => !!id),
+	);
+	return rows.map((r) => ({
+		...r,
+		drifted: driftedIds.has(r.id),
+		entryTitle: r.entryId ? (entries.get(r.entryId)?.title ?? null) : null,
+		targetCollectionName:
+			!r.entryId && r.targetCollectionId ? (colNames.get(r.targetCollectionId) ?? null) : null,
+	}));
+}
+
+/**
+ * What the owner may do with one personal version. Each flag is the gate of the endpoint it
+ * stands for (all of them first pass {@link loadOwnDraft}: author or admin):
+ *  - `canEdit` — `PATCH /drafts/:id` ({@link updateDraft}): not archived;
+ *  - `canEditMeta` — `PATCH /personal-entries/:id` ({@link updateStandaloneMeta}): not archived
+ *    and standalone (linked entries inherit title/target from the global entry);
+ *  - `canRebase` — `POST /drafts/:id/rebase` ({@link rebaseDraft}): not archived, linked, and
+ *    the linked entry is readable;
+ *  - `canDelete` — `DELETE /personal-entries/:id`: not archived (deleting an archived entry is
+ *    an idempotent no-op, so there is nothing to offer);
+ *  - `canSubmit` / `submitBlockers` — `POST /drafts/:id/submit` ({@link submitForReview}):
+ *    {@link personalEntrySubmitBlockers}.
+ */
+export function personalEntryViewerCaps(
+	draft: Pick<PersonalEntryRow, "status" | "entryId" | "targetCollectionId" | "title">,
+	ctx: { entryReadable: boolean; unclosedStatuses: readonly string[] },
+) {
+	const active = draft.status !== "archived";
+	const submitBlockers = personalEntrySubmitBlockers(draft, ctx.unclosedStatuses);
+	return {
+		canEdit: active,
+		canEditMeta: active && !draft.entryId,
+		canRebase: active && !!draft.entryId && ctx.entryReadable,
+		canDelete: active,
+		canSubmit: submitBlockers.length === 0,
+		submitBlockers,
+	};
+}
+
+/**
+ * `GET /personal-entries/:id` for the personal-version page (§5.5): the entry (with body) plus
+ * everything the page shows, same gate as {@link getMine}. On top of that gate:
+ *  - linked: `entryTitle`, `currentMainContent` (the diff baseline) and `drift` only while the
+ *    caller can READ the linked entry — losing access must not keep leaking main through the
+ *    owner's copy;
+ *  - standalone: `targetCollectionName` only while that collection is readable;
+ *  - `openSubmissions`: the requests a delete would close ({@link CLOSED_ON_ENTRY_DELETE_STATUSES}
+ *    — pending / conflict / changes requested), newest first, no bodies; the caller's own rows.
+ */
+async function getMineForViewer(principal: Principal, draftId: string) {
+	const draft = await loadOwnDraft(principal, draftId);
+	const caps = await resolvePrincipalCaps(principal);
+
+	let entryTitle: string | null = null;
+	let currentMainContent: string | null = null;
+	let drift: { drifted: boolean; versionsBehind: number } | null = null;
+	let entryReadable = false;
+	if (draft.entryId) {
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: eq(knowledgeEntries.id, draft.entryId),
+		});
+		const col = entry
+			? (await loadCollectionAclRows([entry.collectionId])).get(entry.collectionId)
+			: null;
+		entryReadable =
+			!!entry && !!col && (await canRead(caps, toAclEntry(entry), toAclCollection(col)));
+		if (entry && entryReadable) {
+			entryTitle = entry.title;
+			currentMainContent = entry.currentContent ?? "";
+			const drifted = !!draft.baseRevisionId && draft.baseRevisionId !== entry.currentRevisionId;
+			drift = {
+				drifted,
+				versionsBehind: drifted
+					? await countVersionsBehind(draft.baseRevisionId, entry.currentRevisionId ?? null)
+					: 0,
+			};
+		}
+	}
+
+	let targetCollectionName: string | null = null;
+	if (!draft.entryId && draft.targetCollectionId) {
+		targetCollectionName =
+			(await readableCollectionNames(caps, [draft.targetCollectionId])).get(
+				draft.targetCollectionId,
+			) ?? null;
+	}
+
+	const openSubmissions = await db.query.knowledgeSubmissions.findMany({
+		where: (s, { and: a, eq: e, inArray: ia }) =>
+			a(e(s.draftId, draftId), ia(s.status, [...CLOSED_ON_ENTRY_DELETE_STATUSES])),
+		columns: { id: true, status: true, round: true, createdAt: true },
+		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit: OPEN_SUBMISSION_SCAN_LIMIT,
+	});
+
+	return {
+		...draft,
+		entryTitle,
+		currentMainContent,
+		drift,
+		targetCollectionName,
+		openSubmissions,
+		viewerCaps: personalEntryViewerCaps(draft, {
+			entryReadable,
+			unclosedStatuses: openSubmissions.map((s) => s.status),
+		}),
+	};
 }
 
 /**
@@ -619,6 +834,61 @@ async function rebaseDraft(
 
 // ─── Submission + review ────────────────────────────────────────────────
 
+/**
+ * Why a personal entry cannot be submitted, in the order {@link submitForReview} checks:
+ *  - `archived` — retired entries are immutable;
+ *  - `missing_target` / `missing_title` — a STANDALONE entry publishes by creating a new global
+ *    entry on approve, so it needs both (linked entries inherit them from the global entry);
+ *  - `open_request` — the store's create guard refuses a second request while one is
+ *    claimable (pending / conflict); see `createSubmissionGuarded`.
+ */
+export type PersonalEntrySubmitBlocker =
+	| "archived"
+	| "missing_target"
+	| "missing_title"
+	| "open_request";
+
+const SUBMIT_BLOCKER_MESSAGES: Record<
+	Exclude<PersonalEntrySubmitBlocker, "open_request">,
+	string
+> = {
+	archived: "Personal entry is archived and cannot be published",
+	missing_target: "This personal entry has no target collection; set one before publishing",
+	missing_title: "This personal entry has no title; set one before publishing",
+};
+
+/** The first content precondition {@link submitForReview} rejects, or null. Pure. */
+export function personalEntrySubmitPreconditionBlocker(
+	draft: Pick<PersonalEntryRow, "status" | "entryId" | "targetCollectionId" | "title">,
+): Exclude<PersonalEntrySubmitBlocker, "open_request"> | null {
+	if (draft.status === "archived") return "archived";
+	if (!draft.entryId) {
+		if (!draft.targetCollectionId) return "missing_target";
+		if (!draft.title?.trim()) return "missing_title";
+	}
+	return null;
+}
+
+/**
+ * Every reason a submit would be refused right now (for the page to list them all, not just
+ * the first). `openStatuses` are the statuses of the entry's unclosed requests.
+ */
+export function personalEntrySubmitBlockers(
+	draft: Pick<PersonalEntryRow, "status" | "entryId" | "targetCollectionId" | "title">,
+	openStatuses: readonly string[],
+): PersonalEntrySubmitBlocker[] {
+	const out: PersonalEntrySubmitBlocker[] = [];
+	if (draft.status === "archived") out.push("archived");
+	if (!draft.entryId) {
+		if (!draft.targetCollectionId) out.push("missing_target");
+		if (!draft.title?.trim()) out.push("missing_title");
+	}
+	if (openStatuses.some((s) => (CLAIMABLE_SUBMISSION_STATUSES as readonly string[]).includes(s))) {
+		out.push("open_request");
+	}
+	return out;
+}
+
 async function submitForReview(
 	principal: Principal,
 	draftId: string,
@@ -631,22 +901,10 @@ async function submitForReview(
 	},
 ) {
 	const draft = await loadOwnDraft(principal, draftId);
-	if (draft.status === "archived") {
-		throw new ValidationError("Personal entry is archived and cannot be published");
-	}
-	// Standalone personal entries (no linked global entry) publish by CREATING a new global
-	// entry on approve. They need a target collection + title; for linked entries these are
-	// derived from the existing entry and ignored here.
-	if (!draft.entryId) {
-		if (!draft.targetCollectionId) {
-			throw new ValidationError(
-				"This personal entry has no target collection; set one before publishing",
-			);
-		}
-		if (!draft.title?.trim()) {
-			throw new ValidationError("This personal entry has no title; set one before publishing");
-		}
-	}
+	// Content preconditions — the same pure check the personal-version page's `viewerCaps`
+	// reports as blocked reasons, so the page and this endpoint cannot disagree.
+	const blocker = personalEntrySubmitPreconditionBlocker(draft);
+	if (blocker) throw new ValidationError(SUBMIT_BLOCKER_MESSAGES[blocker]);
 	// Drift check BEFORE submitting (linked entries only; a standalone entry has no main).
 	//
 	// Submitting from a stale fork point is allowed — approve does a three-way merge and
@@ -1960,8 +2218,10 @@ export const knowledgeBranchService = {
 	createDraft,
 	createStandalone,
 	listMine,
+	listMineForViewer,
 	findDriftedDraftIds,
 	getMine,
+	getMineForViewer,
 	updateStandaloneMeta,
 	deletePersonalEntry,
 	getMyDraft,

@@ -1,7 +1,6 @@
 {
 	"panel.title": "Git",
 	"lineStats.loading": "行数统计中…",
-	"lineStats.updating": "行数更新中…",
 	"lineStats.failed": "行数统计失败",
 	"lineStats.partial": "行数统计不完整",
 	"lineStats.unsupported": "统计行数需升级执行器",

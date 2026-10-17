@@ -155,6 +155,13 @@
 			"when": 1792144295364,
 			"tag": "0021_rich_composer_document",
 			"breakpoints": true
+		},
+		{
+			"idx": 22,
+			"version": "7",
+			"when": 1792157728491,
+			"tag": "0022_context_numeric_stats",
+			"breakpoints": true
 		}
   ]
 }

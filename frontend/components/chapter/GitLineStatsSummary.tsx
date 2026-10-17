@@ -3,15 +3,13 @@ import { useTranslation } from "react-i18next";
 import type { GitLineStats } from "../../../shared/git-line-stats";
 import type { ApiError } from "../../lib/api";
 
-/** Keep the last measured totals while updating; unknown and failed are never zero. */
+/** Refresh measured totals silently; unknown and failed are never zero. */
 export function GitLineStatsSummary({
 	data,
-	isFetching,
 	error,
 	compact = false,
 }: {
 	data?: Omit<GitLineStats, "files">;
-	isFetching: boolean;
 	error: Error | null;
 	compact?: boolean;
 }) {
@@ -22,10 +20,10 @@ export function GitLineStatsSummary({
 					? "lineStats.unsupported"
 					: "lineStats.failed",
 			)
-		: isFetching || !data
-			? t(data ? "lineStats.updating" : "lineStats.loading")
+		: !data
+			? t("lineStats.loading")
 			: undefined;
-	if (message && (!data || error))
+	if (message)
 		return (
 			<Tooltip label={message}>
 				<Text span size="xs" c="dimmed" role="status" aria-label={message}>
@@ -42,13 +40,6 @@ export function GitLineStatsSummary({
 			<Text span size="xs" c="red" fw={600}>
 				-{data.linesRemoved}
 			</Text>
-			{isFetching && (
-				<Tooltip label={t("lineStats.updating")}>
-					<Text span size="xs" c="dimmed" role="status" aria-label={t("lineStats.updating")}>
-						{compact ? "…" : t("lineStats.updating")}
-					</Text>
-				</Tooltip>
-			)}
 			{!data.complete && (
 				<Tooltip label={t("lineStats.partial")}>
 					<Text span size="xs" c="dimmed" aria-label={t("lineStats.partial")}>

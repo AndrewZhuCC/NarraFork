@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CONTEXT_CATEGORIES } from "./context-composition";
 import {
 	CONTEXT_USAGE_SNAPSHOT_MAX_BYTES,
 	type ContextUsageSnapshot,
@@ -99,7 +100,15 @@ describe("bounded request occupancy snapshots", () => {
 
 	test("rejects malformed classifications without walking unbounded lists", () => {
 		for (const composition of [
-			{ ...snapshot.composition, totals: Array(10).fill({ category: "system", chars: 1 }) },
+			// One category past the enum keeps the length bound itself exercised, so an
+			// over-long foreign list is rejected before it is walked.
+			{
+				...snapshot.composition,
+				totals: [...CONTEXT_CATEGORIES, "system" as const].map((category) => ({
+					category,
+					chars: 1,
+				})),
+			},
 			{ ...snapshot.composition, totalChars: 100_001 },
 			{
 				...snapshot.composition,

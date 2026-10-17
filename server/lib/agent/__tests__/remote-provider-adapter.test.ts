@@ -296,7 +296,8 @@ describe("RemoteProviderAdapter", () => {
 				{ category: "summary", chars: 5 },
 				{ category: "toolDefinition", chars: 40 },
 				{ category: "user", chars: 20 },
-				{ category: "assistant", chars: 10 },
+				{ category: "assistant", chars: 5 },
+				{ category: "reasoning", chars: 5 },
 				{ category: "toolCall", chars: 5 },
 				{ category: "toolResult", chars: 10 },
 				{ category: "attachment", chars: 10 },
@@ -328,6 +329,12 @@ describe("RemoteProviderAdapter", () => {
 			);
 			expect(snapshots).toEqual([null, reported ?? null]);
 		}
+		expect(
+			providerStreamEventSchema.safeParse({
+				type: "request_started",
+				inputCharacters: classified,
+			}).success,
+		).toBe(true);
 		expect(
 			providerStreamEventSchema.safeParse({
 				type: "request_started",

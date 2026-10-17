@@ -35,7 +35,8 @@ describe("complete logical input characters", () => {
 			{ category: "user", chars: wireText.length },
 			{ category: "toolCall", chars: JSON.stringify(call).length },
 			{ category: "toolResult", chars: JSON.stringify(result).length },
-			{ category: "assistant", chars: "keptreply".length },
+			{ category: "reasoning", chars: "kept".length },
+			{ category: "assistant", chars: "reply".length },
 			{ category: "other", chars: "oldunknown owner".length },
 			{ category: "toolDefinition", chars: JSON.stringify(tool).length },
 		]);
@@ -94,7 +95,7 @@ describe("complete logical input characters", () => {
 			const counts = await countInputCharacters(body, undefined, { includeComposition: true });
 			expect(counts?.compositionSegments?.map((item) => item.category)).toEqual([
 				"system",
-				"assistant",
+				"reasoning",
 				"toolCall",
 				"toolResult",
 				"user",

@@ -83,7 +83,7 @@ async function makeFixture(state: State): Promise<Fixture> {
 		controlled: false,
 		createdAt: nowIso(),
 	});
-	const collectionName = `${TAG}-col-${generateId(4)}`;
+	const collectionName = `${TAG}-col-${generateId()}`;
 	const col = await knowledgeService.createCollection({
 		name: collectionName,
 		ownerUserId: ids.collectionOwner,

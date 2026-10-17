@@ -3268,12 +3268,18 @@ function classifyKnowledge(
 		for (let i = 0; i < visible; i++) {
 			const r = asObject(results[i]) ?? {};
 			const id = readLeafText(r.id) ?? "";
+			// Standalone personal results have no global entry page: they open their own.
+			const personalId = readLeafText(r.personalEntryId);
 			const title = readLeafText(r.title) ?? (id || "entry");
 			const tags = stringArray(r.tags);
 			const snippet = readLeafText(r.snippet) ?? "";
 			entries.push({
 				title,
-				...(id ? { href: knowledgeEntryHref(id) } : {}),
+				...(personalId
+					? { href: knowledgePersonalEntryHref(personalId) }
+					: id
+						? { href: knowledgeEntryHref(id) }
+						: {}),
 				badges: chips([
 					...tags.slice(0, 6).map((tag) => chip(`#${tag}`, "grape")),
 					chip(r.isPersonal === true ? "personal" : undefined, "cyan"),
@@ -3294,14 +3300,16 @@ function classifyKnowledge(
 		const body = resolveDisplayText(outputJson);
 		const entryId =
 			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
+		const personalId = personalEntryIdOf(metadata, inputJson);
+		const href = knowledgeHref(entryId, personalId);
 		const title = (metadata ? readLeafText(metadata.title) : undefined) ?? "";
 		const tags = stringArray(metadata?.tags);
 		const keywords = stringArray(metadata?.keywords);
 		const header = metaRows([
-			title || entryId
+			title || entryId || personalId
 				? {
-						text: title || entryId,
-						...(entryId ? { href: knowledgeEntryHref(entryId) } : {}),
+						text: title || entryId || personalId || "",
+						...(href ? { href } : {}),
 						badges: chips([
 							chip(metadata?.isPersonal === true ? "personal" : undefined, "cyan"),
 							chip(metadata?.behindMain === true ? "behind main" : undefined, "orange"),
@@ -3331,8 +3339,12 @@ function classifyKnowledge(
 		const entryId =
 			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
 		const scope = (metadata ? readLeafText(metadata.scope) : undefined) ?? "";
+		const personalId = entryId ? undefined : personalEntryIdOf(metadata, inputJson);
+		const headerId = entryId || personalId;
 		const header = metaRows([
-			entryId ? { text: entryId, mono: true, href: knowledgeEntryHref(entryId) } : null,
+			headerId
+				? { text: headerId, mono: true, href: knowledgeHref(entryId, personalId) as string }
+				: null,
 			badgeRow(
 				chips([
 					chip(scope, "grape"),
@@ -3356,6 +3368,31 @@ function classifyKnowledge(
 /** In-app link to a knowledge entry (the chunked EntryLink target). */
 function knowledgeEntryHref(entryId: string): string {
 	return `/knowledge/${entryId}`;
+}
+
+/** In-app link to a personal version (linked or standalone): its one page. */
+function knowledgePersonalEntryHref(personalEntryId: string): string {
+	return `/knowledge/mine/${personalEntryId}`;
+}
+
+function personalEntryIdOf(
+	metadata: Record<string, unknown> | null,
+	inputJson: unknown,
+): string | undefined {
+	return (
+		(metadata ? readLeafText(metadata.personalEntryId) : undefined) ||
+		extractField(inputJson, "personalEntryId") ||
+		undefined
+	);
+}
+
+/** A personal version opens its own page; otherwise the global entry's. */
+function knowledgeHref(
+	entryId: string | undefined,
+	personalEntryId: string | undefined,
+): string | undefined {
+	if (personalEntryId) return knowledgePersonalEntryHref(personalEntryId);
+	return entryId ? knowledgeEntryHref(entryId) : undefined;
 }
 
 /**

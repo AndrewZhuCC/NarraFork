@@ -20,9 +20,11 @@
  */
 import {
 	and,
+	asc,
 	desc,
 	eq,
 	getTableColumns,
+	gt,
 	inArray,
 	isNotNull,
 	isNull,
@@ -52,6 +54,8 @@ import type {
 	AclEventReadRow,
 	KeywordInjectionCandidateRow,
 	KnowledgeEntryLinkRow,
+	KnowledgeEntryListFilter,
+	KnowledgeEntryListOrder,
 	KnowledgeEntryListRow,
 	KnowledgeEntryRow,
 	KnowledgeReadStore,
@@ -90,6 +94,53 @@ const ENTRY_LIST_COLUMNS = {
 	createdAt: true,
 	updatedAt: true,
 } as const;
+
+/**
+ * WHERE for the ordered browse list: SQL-side filters + the keyset predicate of the order.
+ * `level` is the effective level (own level, else the collection's default — a small `IN`
+ * subselect over collections).
+ */
+function entryListWhere(filter: KnowledgeEntryListFilter, order: KnowledgeEntryListOrder) {
+	const level = filter.level;
+	let keyset: ReturnType<typeof or>;
+	if (order.sort === "title") {
+		const after = order.after;
+		keyset = after
+			? or(
+					gt(knowledgeEntries.title, after.title),
+					and(eq(knowledgeEntries.title, after.title), gt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	} else {
+		const after = order.after;
+		keyset = after
+			? or(
+					lt(knowledgeEntries.updatedAt, after.updatedAt),
+					and(eq(knowledgeEntries.updatedAt, after.updatedAt), lt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	}
+	return and(
+		filter.collectionId ? eq(knowledgeEntries.collectionId, filter.collectionId) : undefined,
+		filter.status ? eq(knowledgeEntries.status, filter.status) : undefined,
+		level
+			? or(
+					eq(knowledgeEntries.classificationLevel, level),
+					and(
+						isNull(knowledgeEntries.classificationLevel),
+						inArray(
+							knowledgeEntries.collectionId,
+							db
+								.select({ id: knowledgeCollections.id })
+								.from(knowledgeCollections)
+								.where(eq(knowledgeCollections.defaultLevel, level)),
+						),
+					),
+				)
+			: undefined,
+		keyset,
+	);
+}
 
 const COLLECTION_ACL_COLUMNS = {
 	id: true,
@@ -340,6 +391,19 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 		}) as Promise<KnowledgeEntryListRow[]>;
 	},
 
+	async listEntriesOrdered(opts) {
+		const { limit, order, ...filter } = opts;
+		return db.query.knowledgeEntries.findMany({
+			where: entryListWhere(filter, order),
+			columns: ENTRY_LIST_COLUMNS,
+			orderBy:
+				order.sort === "title"
+					? [asc(knowledgeEntries.title), asc(knowledgeEntries.id)]
+					: [desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id)],
+			limit,
+		}) as Promise<KnowledgeEntryListRow[]>;
+	},
+
 	async findEntryBySlug(collectionId, slug) {
 		const row = await db.query.knowledgeEntries.findFirst({
 			where: and(eq(knowledgeEntries.collectionId, collectionId), eq(knowledgeEntries.slug, slug)),
@@ -466,6 +530,14 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			columns: { username: true },
 		});
 		return row ?? null;
+	},
+
+	async listUsernamesByIds(userIds) {
+		if (userIds.length === 0) return [];
+		return db.query.users.findMany({
+			where: inArray(users.id, userIds),
+			columns: { id: true, username: true },
+		});
 	},
 
 	async listUserIdsAndRoles(opts) {
@@ -683,6 +755,21 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 			columns: { id: true },
 		});
 		return row?.id ?? null;
+	},
+
+	async listActivePersonalEntriesForEntries(entryIds, authorUserId) {
+		if (entryIds.length === 0) return [];
+		const rows = await db.query.knowledgeDrafts.findMany({
+			where: and(
+				inArray(knowledgeDrafts.entryId, entryIds),
+				eq(knowledgeDrafts.authorUserId, authorUserId),
+				eq(knowledgeDrafts.status, "active"),
+			),
+			columns: { id: true, entryId: true, baseRevisionId: true },
+		});
+		return rows.flatMap((r) =>
+			r.entryId ? [{ id: r.id, entryId: r.entryId, baseRevisionId: r.baseRevisionId }] : [],
+		);
 	},
 
 	async listKnowledgeAclEventRows(opts) {

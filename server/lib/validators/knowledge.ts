@@ -70,9 +70,16 @@ export const knowledgeSearchQuerySchema = z.object({
 // === entry list (keyset pagination) ===
 // Supplying `limit` and/or `cursor` opts in to the paged `{ items, nextCursor }` envelope;
 // without either, GET /entries keeps returning the legacy bare array (first page only).
+// `sort`: `updated` (default, updatedAt DESC) | `title` (title ASC) on the paged list;
+// `relevance` (default with `q`) | `updated` | `title` on the search path. `level` is the
+// effective classification level (entry's own, else its collection's default); `status`
+// is the entry status. Title cursors embed the title, hence the larger cursor bound.
 export const listKnowledgeEntriesQuerySchema = z.object({
-	cursor: z.string().min(1).max(512).optional(),
+	cursor: z.string().min(1).max(4096).optional(),
 	limit: z.coerce.number().int().min(1).max(200).optional(),
+	level: z.string().min(1).max(64).optional(),
+	status: z.enum(["active", "archived"]).optional(),
+	sort: z.enum(["updated", "title", "relevance"]).optional(),
 });
 
 // === drafts (personal working copies) ===
