@@ -1,4 +1,4 @@
-import { Button, Group, Select, Stack, TagsInput, Text, TextInput, Title } from "@mantine/core";
+import { Button, Group, Select, Stack, TagsInput, Text, TextInput } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateKnowledgeEntryMeta } from "../../hooks/useKnowledge";
@@ -7,10 +7,9 @@ import type { KnowledgeEntry } from "../../lib/api";
 type EntryStatus = "active" | "archived";
 
 /**
- * Edit an entry's metadata: title, free-form tags, and status.
- * Backend gate: PATCH /entries/:id has no extra role check, so this mirrors the
- * direct-write audience (admin / owner) for a coherent UX — the panel is only
- * mounted by the detail page when the viewer can direct-write.
+ * Edit an entry's metadata: title, free-form tags, keywords and status.
+ * Mounted only when the server says `viewerCaps.canEditMeta` (the same canWriteMain gate
+ * PATCH /entries/:id enforces).
  */
 export function EntryMetaPanel({ entry }: { entry: KnowledgeEntry }) {
 	const { t } = useTranslation("knowledge");
@@ -36,12 +35,10 @@ export function EntryMetaPanel({ entry }: { entry: KnowledgeEntry }) {
 
 	return (
 		<Stack gap="sm">
-			<div>
-				<Title order={5}>{t("metaSettings")}</Title>
-				<Text size="xs" c="dimmed">
-					{t("metaDesc")}
-				</Text>
-			</div>
+			{/* The surrounding settings card owns the heading; only the description here. */}
+			<Text size="xs" c="dimmed">
+				{t("metaDesc")}
+			</Text>
 
 			<TextInput
 				label={t("title_field")}

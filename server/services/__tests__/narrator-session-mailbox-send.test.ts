@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { asc, eq } from "drizzle-orm";
@@ -89,6 +89,7 @@ const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
 const { compactLocks, pendingPermissions } = await import("../narrator-session-state");
 const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
 const now = new Date().toISOString();
 
@@ -108,6 +109,8 @@ function seedNarrator(narratorId: string) {
 			updatedAt: now,
 		})
 		.run();
+	// Direct SQL fixtures must publish the same entity-specific maintenance as production writes.
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 }
 
 function enqueueCancelledNotice(narratorId: string, index: number) {
@@ -149,8 +152,10 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 	throw new Error("Timed out waiting for narrator loop");
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	providerCalls.length = 0;
 	beforeResponse = undefined;
 });
@@ -217,6 +222,35 @@ test.each([
 		broadcastSpy.mockRestore();
 		closeNarrator(narratorId);
 	}
+});
+afterEach(async () => {
+	await backgroundOccupancyStore.flush();
+});
+
+test.each([
+	false,
+	true,
+])("composer document persists atomically with accepted input (queued=%s)", async (queued) => {
+	const narratorId = `composer-send-${queued}`;
+	seedNarrator(narratorId);
+	if (queued) await enqueueBufferedMessage(narratorId, "earlier");
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: "rich 😀" }] }],
+		assets: [],
+	};
+	const result = await acceptUserMessage(narratorId, "rich 😀", { composerDocument: document });
+	if (!result.buffered) expect(result.userMsg).toMatchObject({ hasComposerDocument: true });
+	await waitForIdle(narratorId, queued ? 2 : 1);
+	const row = db
+		.select()
+		.from(narratorMessages)
+		.where(eq(narratorMessages.contentText, "rich 😀"))
+		.get();
+	expect(row?.composerDocument).toEqual(document);
+	expect(row?.contentJson).toEqual([{ type: "text", text: "rich 😀" }]);
+	expect(providerCalls.at(-1)).toBe("rich 😀");
+	closeNarrator(narratorId);
 });
 
 test("consumes earlier cancelled task notices before sending a new idle user input", async () => {
@@ -620,6 +654,7 @@ test("a stale control finalizer cannot settle or release a replacement epoch", a
 		replacement = tryClaimExecution(narratorId, "tool-replay");
 		expect(replacement).not.toBeNull();
 		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, narratorId));
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 		finish.resolve();
 		await completion;
 		expect(getExecutionOwner(narratorId)).toBe(replacement ?? undefined);
@@ -749,6 +784,7 @@ test.each([
 			.set({ traits: ["standalone", "plan"] })
 			.where(eq(narrators.id, narratorId))
 			.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	for (let index = 0; index < 25; index++) enqueueCancelledNotice(narratorId, index);
 	const result = await acceptUserMessage(narratorId, "continue after the notice backlog");
 	expect(result).toMatchObject({ buffered: true });
@@ -777,6 +813,7 @@ function enqueueDelegatedReport(narratorId: string, kind: "agent" | "bash" | "se
 		})
 		.onConflictDoNothing()
 		.run();
+	backgroundOccupancyStore.refreshNarrator("research-child");
 	const store = createMailboxStore(db);
 	const resultMessageId = `${narratorId}-result`;
 	if (kind === "agent")
@@ -831,6 +868,7 @@ for (const plan of [false, true]) {
 			seedNarrator(narratorId);
 			const traits = plan ? ["standalone", "plan"] : ["standalone"];
 			db.update(narrators).set({ traits }).where(eq(narrators.id, narratorId)).run();
+			backgroundOccupancyStore.refreshNarrator(narratorId);
 			enqueueDelegatedReport(narratorId, kind);
 			try {
 				expect(await wakeInboxIfEligible(narratorId)).toBe(true);
@@ -866,6 +904,7 @@ test("notification entries share admission and start only one plan-mode loop", a
 		.set({ traits: ["standalone", "plan"] })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	enqueueDelegatedReport(narratorId, "agent");
 	try {
 		const results = await Promise.all([
@@ -887,6 +926,7 @@ test("plan-mode parent wakes after a report arrives during idle finalization", a
 		.set({ traits: ["standalone", "plan"] })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	const original = narratorService.compareAndSetStatus.bind(narratorService);
 	let queued = false;
 	const update = spyOn(narratorService, "compareAndSetStatus").mockImplementation(
@@ -926,6 +966,7 @@ test("plan parent without queued work does not start a notification turn", async
 		.set({ traits: ["standalone", "plan"] })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	try {
 		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
 		expect(await startBackgroundCompletionContinuationIfPossible(narratorId)).toEqual({
@@ -954,6 +995,7 @@ test.each([
 		.set({ traits: ["standalone", "plan"] })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	enqueueDelegatedReport(narratorId, "agent");
 	let release: (() => void) | undefined;
 	if (barrier === "owner") {
@@ -996,6 +1038,7 @@ test.each([
 	} else {
 		db.update(narrators).set({ status: barrier }).where(eq(narrators.id, narratorId)).run();
 	}
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	try {
 		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
 		// The compatibility entry must apply the same gates inside start admission.
@@ -1097,6 +1140,7 @@ test.each([
 	}
 });
 afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
 	mock.restore();
 	cleanDb(sqlite);

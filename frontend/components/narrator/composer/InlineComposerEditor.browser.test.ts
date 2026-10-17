@@ -1,0 +1,1469 @@
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { basename } from "node:path";
+import type { ComposerDocument } from "@shared/composer-document";
+import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import type * as Fixture from "./InlineComposerEditor.browser-fixture";
+
+type FixtureWindow = Window & { fixture: typeof Fixture };
+const executablePath =
+	process.env.NF_TEST_CHROMIUM_PATH ??
+	"/home/fulcrum/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome";
+let browser: Browser | undefined;
+let server: ReturnType<typeof Bun.serve> | undefined;
+const pageErrors = new WeakMap<Page, string[]>();
+const empty: ComposerDocument = { version: 1, paragraphs: [{ children: [] }], assets: [] };
+const quoted: ComposerDocument = {
+	version: 1,
+	paragraphs: [
+		{
+			children: [
+				{ type: "text", text: "A😀" },
+				{ type: "quote", id: "q1", label: "Source", text: "Quoted source" },
+				{ type: "text", text: "Z" },
+			],
+		},
+	],
+	assets: [],
+};
+const imageAsset = {
+	id: "image-1",
+	kind: "image",
+	name: "pixel.png",
+	size: 68,
+	mimeType: "image/png",
+} as const;
+const attached: ComposerDocument = {
+	version: 1,
+	paragraphs: [
+		{
+			children: [
+				{ type: "text", text: "Before " },
+				{ type: "attachment", id: "image-node", assetId: imageAsset.id },
+				{ type: "text", text: " after" },
+			],
+		},
+	],
+	assets: [imageAsset],
+};
+const commentable: ComposerDocument = {
+	version: 1,
+	paragraphs: [
+		{
+			children: [
+				{ type: "text", text: "A😀" },
+				{
+					type: "quote",
+					id: "q1",
+					label: "Source",
+					text: "Quoted source",
+					anchor: "m:message-1",
+					comment: "saved quote comment",
+				},
+				{
+					type: "fileReference",
+					id: "file-node",
+					reference: {
+						id: "ref-1",
+						deviceId: "local",
+						path: "/a.ts",
+						label: "a.ts",
+						expectedHash: "saved-hash",
+						selection: { startLineNumber: 2, startColumn: 1, endLineNumber: 5, endColumn: 1 },
+					},
+					comment: "saved file comment",
+				},
+				{ type: "attachment", id: "image-node", assetId: imageAsset.id },
+				{ type: "text", text: "Z" },
+			],
+		},
+	],
+	assets: [imageAsset],
+};
+beforeAll(async () => {
+	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
+	const bundle = await Bun.build({
+		entrypoints: [new URL("./InlineComposerEditor.browser-fixture.tsx", import.meta.url).pathname],
+		target: "browser",
+		format: "esm",
+		define: { "process.env.NODE_ENV": '"production"' },
+	});
+	if (!bundle.success) throw new Error(bundle.logs.join("\n"));
+	const assets = new Map(bundle.outputs.map((output) => [`/${basename(output.path)}`, output]));
+	const script = [...assets.keys()].find((path) => path.endsWith(".js"));
+	const styles = [...assets.keys()].filter((path) => path.endsWith(".css"));
+	if (!script || !styles.length) throw new Error("Editor/CSS bundle missing");
+	server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			const path = new URL(request.url).pathname;
+			if (path === "/api/test-image") {
+				return new Response(
+					Buffer.from(
+						"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j1ioAAAAASUVORK5CYII=",
+						"base64",
+					),
+					{ headers: { "content-type": "image/png" } },
+				);
+			}
+			if (path === "/")
+				return new Response(
+					`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">${styles.map((style) => `<link rel="stylesheet" href="${style}">`).join("")}<style>html,body{height:100%;margin:0}</style></head><body><div id="root"></div><script type="module">window.fixture=await import(${JSON.stringify(script)});</script></body></html>`,
+					{ headers: { "content-type": "text/html" } },
+				);
+			const asset = assets.get(path);
+			return asset ? new Response(asset) : new Response("Not found", { status: 404 });
+		},
+	});
+	browser = await puppeteer.launch({
+		executablePath,
+		headless: true,
+		args: ["--no-sandbox"],
+		timeout: 15_000,
+	});
+}, 60_000);
+afterAll(async () => {
+	try {
+		await browser?.close();
+	} finally {
+		server?.stop(true);
+	}
+});
+async function settle(page: Page) {
+	await page.evaluate(
+		() =>
+			new Promise<void>((resolve) =>
+				requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+			),
+	);
+}
+async function open(query = "") {
+	if (!browser || !server) throw new Error("Fixture unavailable");
+	const page = await browser.newPage();
+	const errors: string[] = [];
+	pageErrors.set(page, errors);
+	page.on("pageerror", (error) => errors.push(String(error)));
+	await page.goto(server.url.origin + query);
+	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
+	return page;
+}
+async function close(page: Page) {
+	await page.close();
+	expect(pageErrors.get(page)).toEqual([]);
+}
+async function load(page: Page, document: ComposerDocument) {
+	await page.evaluate(
+		(value) => (window as unknown as FixtureWindow).fixture.load(value),
+		document,
+	);
+	await settle(page);
+}
+async function snapshot(page: Page) {
+	return page.evaluate(() => (window as unknown as FixtureWindow).fixture.snapshot());
+}
+async function chord(
+	page: Page,
+	key: "z" | "Z" | "Enter",
+	...modifiers: ("Control" | "Meta" | "Shift")[]
+) {
+	for (const modifier of modifiers) await page.keyboard.down(modifier);
+	await page.keyboard.press(key);
+	for (const modifier of [...modifiers].reverse()) await page.keyboard.up(modifier);
+}
+
+test.each([
+	{ id: "q1", type: "quote" },
+	{ id: "file-node", type: "fileReference" },
+])("%j comment edits preserve source and native state", async ({ id, type }) => {
+	const page = await open("?comments");
+	try {
+		const undoModifier = await page.evaluate(() =>
+			navigator.platform.includes("Mac") ? ("Meta" as const) : ("Control" as const),
+		);
+		await load(page, commentable);
+		expect((await snapshot(page)).document).toEqual(commentable);
+		expect(await page.$$("[data-composer-comment]")).toHaveLength(2);
+		expect(await page.$('[data-composer-atom="attachment"] [data-composer-comment]')).toBeNull();
+		await page.click(`[data-composer-atom="${type}"] > button`);
+		await settle(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.captureBookmark("comment"),
+		);
+		const before = await snapshot(page);
+		expect(before.nativeSelection.type).toBe("node");
+		await page.click(`[data-composer-comment="${id}"][aria-label="Edit comment"]`);
+		const opened = await snapshot(page);
+		expect(opened.editedComments).toEqual([id]);
+		expect(opened.commentBubbles).toBe(0);
+		expect(opened.document).toEqual(commentable);
+		expect(opened.changes).toBe(before.changes);
+		expect(opened.selection).toEqual(before.selection);
+		expect(opened.nativeSelection).toEqual(before.nativeSelection);
+
+		const comment = "new comment\n| [comment]\n> not original source";
+		const updated: ComposerDocument = {
+			...commentable,
+			paragraphs: commentable.paragraphs.map((paragraph) => ({
+				children: paragraph.children.map((node) =>
+					(node.type === "quote" || node.type === "fileReference") && node.id === id
+						? { ...node, comment }
+						: node,
+				),
+			})),
+		};
+		await page.evaluate(
+			({ id, comment }) => (window as unknown as FixtureWindow).fixture.setComment(id, comment),
+			{ id, comment },
+		);
+		await settle(page);
+		const changed = await snapshot(page);
+		expect(changed.document).toEqual(updated);
+		expect(changed.changes).toBe(before.changes + 1);
+		expect(changed.selection).toEqual(before.selection);
+		expect(changed.nativeSelection).toEqual(before.nativeSelection);
+		expect(await page.evaluate(() => document.activeElement?.id)).toBe("comment-input");
+		expect(
+			await page.evaluate(() => {
+				const fixture = (window as unknown as FixtureWindow).fixture;
+				fixture.selection(0);
+				return fixture.restoreBookmark("comment");
+			}),
+		).toBe(true);
+		await settle(page);
+		expect((await snapshot(page)).selection).toEqual(before.selection);
+		expect((await snapshot(page)).nativeSelection).toEqual(before.nativeSelection);
+
+		await page.focus('[role="textbox"]');
+		await chord(page, "z", undoModifier);
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(commentable);
+		await chord(page, "z", undoModifier, "Shift");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(updated);
+		await page.focus("#comment-input");
+		await page.evaluate(
+			(id) => (window as unknown as FixtureWindow).fixture.setComment(id, ""),
+			id,
+		);
+		await settle(page);
+		const cleared = (await snapshot(page)).document?.paragraphs[0].children.find(
+			(node) => (node.type === "quote" || node.type === "fileReference") && node.id === id,
+		);
+		expect(cleared).toMatchObject({ id, type });
+		expect(cleared).not.toHaveProperty("comment");
+		expect(
+			await page.$eval(`[data-composer-comment="${id}"]`, (button) =>
+				button.hasAttribute("data-has-comment"),
+			),
+		).toBe(false);
+		expect(await page.evaluate(() => document.activeElement?.id)).toBe("comment-input");
+		await page.focus('[role="textbox"]');
+		await chord(page, "z", undoModifier);
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(updated);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("comment updates ignore no-op, invalid and disabled targets", async () => {
+	const page = await open("?comments");
+	try {
+		await load(page, commentable);
+		const before = await snapshot(page);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.setComment("q1", "saved quote comment");
+			fixture.setComment("missing", "ignored");
+			fixture.setComment("image-node", "ignored");
+			fixture.setComment("q1", "x".repeat(200001));
+		});
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(commentable);
+		expect((await snapshot(page)).changes).toBe(before.changes);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.disable(true));
+		await settle(page);
+		expect(
+			await page.$$eval("[data-composer-comment]", (buttons) =>
+				buttons.every((button) => (button as HTMLButtonElement).disabled),
+			),
+		).toBe(true);
+		await page.click('[data-composer-comment="q1"]');
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.setComment("q1", "disabled quote");
+			fixture.setComment("file-node", "disabled file");
+		});
+		await settle(page);
+		const after = await snapshot(page);
+		expect(after.document).toEqual(commentable);
+		expect(after.changes).toBe(before.changes);
+		expect(after.editedComments).toEqual([]);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("empty insert deletes a selected suffix once but remains a noop for a collapsed cursor", async () => {
+	const page = await open();
+	try {
+		const original: ComposerDocument = {
+			...empty,
+			paragraphs: [{ children: [{ type: "text", text: "/compactxxx" }] }],
+		};
+		await load(page, original);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(8, 11);
+			fixture.insert([]);
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "/compact" },
+		]);
+		const after = await snapshot(page);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.insert([]));
+		expect((await snapshot(page)).changes).toBe(after.changes);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(original);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("file/mention replacement preserves zero-width boundary atoms and collapsed selection keeps native affinity", async () => {
+	const page = await open();
+	try {
+		for (const prefix of ["#foo", "@foo"]) {
+			const doc: ComposerDocument = {
+				...attached,
+				paragraphs: [
+					{
+						children: [
+							{ type: "quote", id: "before", label: "Before", text: "Keep this quote" },
+							{ type: "text", text: prefix },
+							{ type: "attachment", id: "image-node", assetId: imageAsset.id },
+							{ type: "text", text: " rest" },
+						],
+					},
+				],
+			};
+			await load(page, doc);
+			await page.evaluate((query) => {
+				const fixture = (window as unknown as FixtureWindow).fixture;
+				fixture.selection(0, 4);
+				fixture.insert(
+					query === "#foo"
+						? [
+								{
+									type: "fileReference",
+									id: "file-node",
+									reference: {
+										id: "file-ref",
+										deviceId: "local",
+										path: "/src/file.ts",
+										label: "file.ts",
+									},
+								},
+							]
+						: [{ type: "text", text: "@Alice" }],
+				);
+			}, prefix);
+			await settle(page);
+			expect(
+				(await snapshot(page)).document?.paragraphs[0].children.map((node) => node.type),
+			).toEqual(["quote", prefix === "#foo" ? "fileReference" : "text", "attachment", "text"]);
+			expect((await snapshot(page)).document?.assets).toEqual([imageAsset]);
+		}
+		await load(page, {
+			...attached,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "#foo" },
+						{ type: "attachment", id: "image-node", assetId: imageAsset.id },
+						{ type: "text", text: " rest" },
+					],
+				},
+			],
+		});
+		await page.evaluate(() => {
+			const editable = document.querySelector<HTMLElement>('[role="textbox"]');
+			const text = editable?.querySelector("p")?.firstChild;
+			if (!editable || !text) throw new Error("Missing boundary text");
+			editable.focus();
+			const range = document.createRange();
+			range.setStart(text, 4);
+			range.collapse(true);
+			window.getSelection()?.removeAllRanges();
+			window.getSelection()?.addRange(range);
+		});
+		await settle(page);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(4);
+			fixture.insert([{ type: "text", text: "M" }]);
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children[0]).toEqual({
+			type: "text",
+			text: "#fooM",
+		});
+		expect((await snapshot(page)).document?.paragraphs[0].children[1].type).toBe("attachment");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("mount/editability changes never emit document updates; pre-instance restore→append is installed", async () => {
+	const page = await open("?early-restore");
+	try {
+		await settle(page);
+		const before = await snapshot(page);
+		expect(before.restoredBeforeInstance).toBe(true);
+		expect(before.changes).toBe(0);
+		expect(before.document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "restored appended" },
+		]);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.disable(true));
+		await settle(page);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.disable(false));
+		await settle(page);
+		expect((await snapshot(page)).changes).toBe(0);
+		expect((await snapshot(page)).document).toEqual(before.document);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("editor drop delegates mixed files once, stops panel bubbling and resets disabled drops through empty callback", async () => {
+	const page = await open();
+	try {
+		const drop = () =>
+			page.evaluate(() => {
+				const element = document.querySelector<HTMLElement>('[role="textbox"]');
+				if (!element) throw new Error("Missing editor");
+				const rect = element.getBoundingClientRect();
+				const transfer = new DataTransfer();
+				transfer.items.add(new File(["text"], "note.txt", { type: "text/plain" }));
+				transfer.items.add(new File(["png"], "image.png", { type: "image/png" }));
+				element.dispatchEvent(
+					new DragEvent("drop", {
+						dataTransfer: transfer,
+						bubbles: true,
+						cancelable: true,
+						clientX: rect.left + 10,
+						clientY: rect.top + 10,
+					}),
+				);
+			});
+		await drop();
+		expect((await snapshot(page)).pasted).toEqual(["note.txt", "image.png"]);
+		expect((await snapshot(page)).pasteCalls).toBe(1);
+		expect((await snapshot(page)).panelDrops).toBe(0);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.disable(true));
+		await settle(page);
+		await drop();
+		expect((await snapshot(page)).pasted).toEqual([]);
+		expect((await snapshot(page)).pasteCalls).toBe(2);
+		expect((await snapshot(page)).panelDrops).toBe(0);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("UTF-16 caret mapping, atoms need two Backspaces, undo/redo survives controlled value echo", async () => {
+	const page = await open();
+	try {
+		await load(page, quoted);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(3));
+		await settle(page);
+		await page.keyboard.press("Backspace");
+		await settle(page);
+		const selected = await snapshot(page);
+		expect(selected.document).toEqual(quoted);
+		expect(selected.selected).toBe(true);
+		expect(selected.atoms[0].height).toBe(24);
+		await page.keyboard.press("Backspace");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "A😀Z" },
+		]);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(quoted);
+		await chord(page, "z", "Control", "Shift");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "A😀Z" },
+		]);
+		expect(selected.elementMatches).toBe(true);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("insertion uses native bookmark on blur, adjacent atoms and text share a single undo stack", async () => {
+	const page = await open();
+	try {
+		await load(page, { ...empty, paragraphs: [{ children: [{ type: "text", text: "ab" }] }] });
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(1));
+		await page.click("#outside");
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.insert([
+				{ type: "quote", id: "q1", label: "One", text: "first" },
+				{ type: "quote", id: "q2", label: "Two", text: "second" },
+			]),
+		);
+		await settle(page);
+		expect(
+			(await snapshot(page)).document?.paragraphs[0].children.map((node) => node.type),
+		).toEqual(["text", "quote", "quote", "text"]);
+		await page.keyboard.type("X");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children.at(-1)).toEqual({
+			type: "text",
+			text: "Xb",
+		});
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children.at(-1)).toEqual({
+			type: "text",
+			text: "b",
+		});
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "ab" },
+		]);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("plain-text paste keeps whitespace/HTML literal and Shift+Enter; composing Enter never sends", async () => {
+	const page = await open();
+	try {
+		await page.click('[role="textbox"]');
+		await page.evaluate(() => {
+			const transfer = new DataTransfer();
+			transfer.setData("text/plain", "<b>code</b>\n  next");
+			transfer.setData("text/html", '<h1>Wrong HTML</h1><img src="https://invalid.test/x">');
+			document
+				.querySelector('[role="textbox"]')
+				?.dispatchEvent(
+					new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }),
+				);
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "<b>code</b>" },
+			{ type: "break" },
+			{ type: "text", text: "  next" },
+		]);
+		await chord(page, "Enter", "Shift");
+		await page.keyboard.type("tail");
+		const session = await page.createCDPSession();
+		await session.send("Input.imeSetComposition", {
+			text: "中文",
+			selectionStart: 2,
+			selectionEnd: 2,
+		});
+		await page.keyboard.press("Enter");
+		expect((await snapshot(page)).sends).toBe(0);
+		await session.send("Input.insertText", { text: "中文" });
+		await settle(page);
+		expect(JSON.stringify((await snapshot(page)).document)).toContain("中文");
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.pasteFiles());
+		expect((await snapshot(page)).pasted).toEqual(["note.txt"]);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+for (const width of [1440, 390])
+	test(`${width}px: candidate stays inline, images reserve 64px before decoding, internal scrolling`, async () => {
+		const page = await open();
+		try {
+			await page.setViewport({ width, height: 844 });
+			await load(page, attached);
+			const before = await snapshot(page);
+			expect(before.atoms[0].height).toBe(64);
+			expect(before.atoms[0].width).toBe(96);
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
+			await page.waitForSelector("[data-inline-quote-candidate]");
+			const candidate = await snapshot(page);
+			if (
+				before.shellHeight === undefined ||
+				before.viewportHeight === undefined ||
+				candidate.shellHeight === undefined ||
+				candidate.viewportHeight === undefined
+			)
+				throw new Error("Missing editor geometry");
+			// A genuine inline preview may occupy one extra visual line on a narrow viewport.
+			expect(candidate.shellHeight - before.shellHeight).toBeGreaterThanOrEqual(0);
+			expect(candidate.shellHeight - before.shellHeight).toBeLessThanOrEqual(25);
+			expect(candidate.shellHeight + candidate.viewportHeight).toBe(
+				before.shellHeight + before.viewportHeight,
+			);
+			expect(
+				await page.$eval(
+					"[data-inline-quote-candidate]",
+					(node) => !!node.closest('[data-inline-composer] [role="textbox"]'),
+				),
+			).toBe(true);
+			expect(candidate.document).toEqual(before.document);
+			expect(candidate.changes).toBe(before.changes);
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.resources([["image-1", "/api/test-image"]]),
+			);
+			await page.waitForFunction(() => {
+				const image = document.querySelector("img");
+				return image?.complete && image.naturalWidth > 0;
+			});
+			const decoded = await snapshot(page);
+			expect(decoded.shellHeight).toBe(candidate.shellHeight);
+			expect(decoded.viewportHeight).toBe(candidate.viewportHeight);
+			expect(decoded.atoms[0].height).toBe(64);
+			await page.click("[data-composer-atom] button");
+			expect((await snapshot(page)).opened).toBe(0);
+			await load(page, {
+				...empty,
+				paragraphs: Array.from({ length: 40 }, (_, index) => ({
+					children: [{ type: "text" as const, text: `Line ${index}` }],
+				})),
+			});
+			const scroll = await snapshot(page);
+			expect(scroll.contentHeight ?? 999).toBeLessThanOrEqual(200);
+			expect(scroll.scrollHeight ?? 0).toBeGreaterThan(scroll.contentHeight ?? 0);
+		} finally {
+			await close(page);
+		}
+	}, 15_000);
+
+test("CSS fullscreen retains DOM identity, cursor and undo; candidate portal targets its owner Document", async () => {
+	const page = await open();
+	try {
+		await page.click('[role="textbox"]');
+		await page.keyboard.type("first");
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			(window as unknown as { original: Element | null }).original =
+				document.querySelector('[role="textbox"]');
+			fixture.expand(true);
+		});
+		await page.keyboard.type(" second");
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.expand(false));
+		expect(
+			await page.evaluate(
+				() =>
+					(window as unknown as { original: Element | null }).original ===
+					document.querySelector('[role="textbox"]'),
+			),
+		).toBe(true);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(empty);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.frameCandidate());
+		await page.waitForFunction(
+			() =>
+				!!document
+					.querySelector<HTMLIFrameElement>("#candidate-frame")
+					?.contentDocument?.querySelector("[data-inline-quote-candidate]"),
+		);
+		expect(await page.$("body > [data-inline-quote-candidate]")).toBeNull();
+		const iframe = await page.$("#candidate-frame");
+		const frame = await iframe?.contentFrame();
+		if (!frame) throw new Error("Missing candidate frame");
+		await frame.click("[data-inline-quote-candidate] button");
+		expect(await frame.evaluate(() => window.getSelection()?.toString())).toBe("Selected source");
+		expect((await snapshot(page)).accepted).toBe(1);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("file tokens retain real UTF-16 width; Delete selects then removes, external loads reset undo", async () => {
+	const page = await open();
+	try {
+		const doc: ComposerDocument = {
+			...empty,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "😀" },
+						{ type: "quote", id: "q", label: "Source", text: "not body" },
+						{
+							type: "fileReference",
+							id: "file-node",
+							reference: { id: "file-ref", deviceId: "local", path: "/src/a.ts", label: "a.ts" },
+						},
+						{ type: "text", text: "Z" },
+					],
+				},
+			],
+		};
+		await load(page, doc);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(2));
+		await settle(page);
+		expect((await snapshot(page)).selection).toEqual({ start: 2, end: 2 });
+		await page.keyboard.press("Delete");
+		await settle(page);
+		expect((await snapshot(page)).selection).toEqual({ start: 2, end: 12 });
+		expect((await snapshot(page)).document).toEqual(doc);
+		await page.keyboard.press("Delete");
+		await settle(page);
+		expect(
+			(await snapshot(page)).document?.paragraphs[0].children.some(
+				(node) => node.type === "fileReference",
+			),
+		).toBe(false);
+		await load(page, quoted);
+		await page.click('[role="textbox"]');
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(quoted);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("real File previews decode object URLs, revoke on removal/clear and regenerate on undo", async () => {
+	const page = await open();
+	try {
+		await load(page, attached);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.fileImageResource());
+		await page.waitForFunction(() => {
+			const image = document.querySelector("img");
+			return image?.complete && image.naturalWidth > 0 && image.src.startsWith("blob:");
+		});
+		expect((await snapshot(page)).objectURLs).toEqual({ created: 1, revoked: 0 });
+		await page.click('[data-composer-atom] button[aria-label="Remove attachment"]');
+		await settle(page);
+		expect((await snapshot(page)).objectURLs).toEqual({ created: 1, revoked: 1 });
+		await chord(page, "z", "Control");
+		await page.waitForFunction(() => {
+			const image = document.querySelector("img");
+			return image?.complete && image.naturalWidth > 0;
+		});
+		expect((await snapshot(page)).document).toEqual(attached);
+		expect((await snapshot(page)).objectURLs).toEqual({ created: 2, revoked: 1 });
+		await load(page, empty);
+		expect((await snapshot(page)).objectURLs).toEqual({ created: 2, revoked: 2 });
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("attachment removal and undo keep resource metadata; disabled editor rejects mutations", async () => {
+	const page = await open();
+	try {
+		await load(page, attached);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.resources([["image-1", "/api/test-image"]]),
+		);
+		await page.waitForSelector("img");
+		await page.click('[data-composer-atom] button[aria-label="Remove attachment"]');
+		await settle(page);
+		expect((await snapshot(page)).document?.assets).toEqual([]);
+		expect((await snapshot(page)).removed).toEqual(["image-1"]);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(attached);
+		await page.waitForSelector("img");
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.disable(true));
+		await settle(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.insert([{ type: "text", text: "forbidden" }]),
+		);
+		expect((await snapshot(page)).document).toEqual(attached);
+		expect(
+			await page.$eval('[role="textbox"]', (element) => element.getAttribute("contenteditable")),
+		).toBe("false");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("imperative silent restore survives internal rerenders without a controlled value echo", async () => {
+	const page = await open();
+	try {
+		const before = await snapshot(page);
+		await page.evaluate(
+			(value) => (window as unknown as FixtureWindow).fixture.restoreSilently(value),
+			quoted,
+		);
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(quoted);
+		expect((await snapshot(page)).changes).toBe(before.changes);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(quoted);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("optimization replaces text in one undo step while preserving node order", async () => {
+	const page = await open();
+	try {
+		await load(page, quoted);
+		const optimized: ComposerDocument = {
+			...quoted,
+			paragraphs: [
+				{
+					children: quoted.paragraphs[0].children.map((node) =>
+						node.type === "text" ? { ...node, text: `optimized ${node.text}` } : node,
+					),
+				},
+			],
+		};
+		const before = await snapshot(page);
+		await page.evaluate(
+			(value) => (window as unknown as FixtureWindow).fixture.replaceUndoable(value),
+			optimized,
+		);
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(optimized);
+		expect((await snapshot(page)).changes).toBe(before.changes + 1);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(quoted);
+		await chord(page, "z", "Control", "Shift");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(optimized);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("arrow navigation permits typing between adjacent atoms and before first atom", async () => {
+	const page = await open();
+	try {
+		const doc: ComposerDocument = {
+			...empty,
+			paragraphs: [
+				{
+					children: [
+						{ type: "quote", id: "first", label: "First", text: "one" },
+						{ type: "quote", id: "second", label: "Second", text: "two" },
+					],
+				},
+			],
+		};
+		await load(page, doc);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(0));
+		await settle(page);
+		await page.keyboard.press("ArrowLeft");
+		await page.keyboard.press("ArrowLeft");
+		await page.keyboard.type("between");
+		await settle(page);
+		expect(
+			(await snapshot(page)).document?.paragraphs[0].children.map((node) => node.type),
+		).toEqual(["quote", "text", "quote"]);
+		await page.keyboard.press("Home");
+		await page.keyboard.type("before");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children[0]).toEqual({
+			type: "text",
+			text: "before",
+		});
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+for (const kind of ["text", "nodes"] as const)
+	test(`boundary benchmark: ${kind} keeps transactions and projections below 500ms`, async () => {
+		const page = await open();
+		try {
+			const metrics = await page.evaluate(
+				(mode) => (window as unknown as FixtureWindow).fixture.benchmarkBoundary(mode),
+				kind,
+			);
+			console.info("[InlineComposerEditor boundary benchmark]", JSON.stringify(metrics));
+			expect(metrics.characters).toBe(200_000);
+			expect(metrics.nodes).toBe(kind === "nodes" ? 4096 : 2);
+			expect(metrics.samples).toBe(20);
+			expect(metrics.transactionMaxMs).toBeLessThan(500);
+			expect(metrics.projectionMaxMs).toBeLessThan(500);
+		} finally {
+			await close(page);
+		}
+	}, 60_000);
+
+test("atom selections never optimize surrounding text; text selections and empty caret retain their rules", async () => {
+	const page = await open();
+	try {
+		for (const doc of [quoted, attached]) {
+			await load(page, doc);
+			await page.click("[data-composer-atom] button");
+			const state = await snapshot(page);
+			expect(state.selection?.start).toBe(state.selection?.end);
+			expect(state.nativeSelection).toEqual({ empty: false, type: "node" });
+			expect(state.textContext).toBeNull();
+			expect(
+				await page.evaluate(() => (window as unknown as FixtureWindow).fixture.optimize()),
+			).toBeNull();
+			expect((await snapshot(page)).document).toEqual(doc);
+			await page.evaluate(() => {
+				const paragraph = document.querySelector('[role="textbox"] p');
+				if (!paragraph) throw new Error("Missing paragraph");
+				const range = document.createRange();
+				range.setStart(paragraph, 1);
+				range.setEnd(paragraph, 2);
+				window.getSelection()?.removeAllRanges();
+				window.getSelection()?.addRange(range);
+			});
+			await settle(page);
+			const domSelection = await page.evaluate(() => {
+				const fixture = (window as unknown as FixtureWindow).fixture;
+				return { state: fixture.snapshot(), optimized: fixture.optimize() };
+			});
+			expect(domSelection.state.nativeSelection.empty).toBe(false);
+			expect(["text", "node"]).toContain(domSelection.state.nativeSelection.type ?? "");
+			expect(domSelection.optimized).toBeNull();
+			// Dispatch and observe synchronously: later DOM selection events may legally normalize
+			// an atom-only range back to NodeSelection, hiding the distinct TextSelection branch.
+			const textSelection = await page.evaluate(() => {
+				const fixture = (window as unknown as FixtureWindow).fixture;
+				fixture.selectAtomAsText();
+				return { state: fixture.snapshot(), optimized: fixture.optimize() };
+			});
+			expect(textSelection.state.nativeSelection).toEqual({ empty: false, type: "text" });
+			expect(textSelection.state.selection?.start).toBe(textSelection.state.selection?.end);
+			expect(textSelection.state.textContext).toBeNull();
+			expect(textSelection.optimized).toBeNull();
+			expect(textSelection.state.document).toEqual(doc);
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(1));
+			const whole = await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.optimize(),
+			);
+			expect(whole).toContain("<<<NF_");
+			expect(whole).not.toContain("Quoted source");
+		}
+		await load(page, {
+			...empty,
+			paragraphs: [{ children: [{ type: "text", text: "hello world" }] }],
+		});
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(0, 5));
+		expect(await page.evaluate(() => (window as unknown as FixtureWindow).fixture.optimize())).toBe(
+			"hello",
+		);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.applyOptimization("hi"));
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "hi world" },
+		]);
+		await chord(page, "z", "Control");
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(4));
+		expect(await page.evaluate(() => (window as unknown as FixtureWindow).fixture.optimize())).toBe(
+			"hello world",
+		);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("text context respects every atom, UTF-16, hard breaks and paragraph boundaries", async () => {
+	const page = await open();
+	try {
+		await load(page, {
+			...attached,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "#前😀" },
+						{ type: "quote", id: "q", label: "Quote", text: "hidden" },
+						{ type: "text", text: "后@人" },
+						{ type: "attachment", id: "a", assetId: imageAsset.id },
+						{ type: "text", text: "tail" },
+						{ type: "break" },
+						{ type: "text", text: "line😀" },
+					],
+				},
+				{ children: [{ type: "text", text: "段😀" }] },
+			],
+		});
+		for (const [caret, context] of [
+			[2, { text: "#前😀", start: 0, end: 4, caret: 2 }],
+			[5, { text: "后@人", start: 4, end: 7, caret: 5 }],
+			[8, { text: "tail", start: 7, end: 11, caret: 8 }],
+			[15, { text: "line😀", start: 12, end: 18, caret: 15 }],
+			[20, { text: "段😀", start: 19, end: 22, caret: 20 }],
+		] as const) {
+			await page.evaluate(
+				(offset) => (window as unknown as FixtureWindow).fixture.selection(offset),
+				caret,
+			);
+			expect((await snapshot(page)).textContext).toEqual(context);
+		}
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(1, 8));
+		expect((await snapshot(page)).textContext).toBeNull();
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("selection bookmarks map through transactions, preserve native atom affinity and restore once without undo effects", async () => {
+	const page = await open();
+	try {
+		await load(page, quoted);
+		// Capture immediately before the zero-body-width atom, which offsets cannot distinguish.
+		await page.evaluate(() => {
+			const textbox = document.querySelector<HTMLElement>('[role="textbox"]');
+			const text = textbox?.querySelector("p")?.firstChild;
+			if (!textbox || !text) throw new Error("Missing text");
+			textbox.focus();
+			const range = document.createRange();
+			range.setStart(text, 3);
+			range.collapse(true);
+			window.getSelection()?.removeAllRanges();
+			window.getSelection()?.addRange(range);
+		});
+		await settle(page);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.captureBookmark("upload");
+			fixture.selection(0);
+			fixture.insert([{ type: "text", text: "NEW" }]);
+			fixture.selection(6, 7);
+		});
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("upload"),
+			),
+		).toBe(true);
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("upload"),
+			),
+		).toBe(false);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.insert([{ type: "text", text: "FILE" }]),
+		);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "NEWA😀FILE" },
+			quoted.paragraphs[0].children[1],
+			{ type: "text", text: "Z" },
+		]);
+		await chord(page, "z", "Control");
+		expect((await snapshot(page)).document?.paragraphs[0].children[0]).toEqual({
+			type: "text",
+			text: "NEWA😀",
+		});
+		await chord(page, "z", "Control");
+		expect((await snapshot(page)).document).toEqual(quoted);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("bookmark cancellation, bounded eviction and external draft reset invalidate pending insertions", async () => {
+	const page = await open();
+	try {
+		await load(page, quoted);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.captureBookmark("cancel");
+			fixture.cancelBookmark("cancel");
+		});
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("cancel"),
+			),
+		).toBe(false);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			for (let i = 0; i < 65; i++) fixture.captureBookmark(String(i));
+		});
+		expect(
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.restoreBookmark("0")),
+		).toBe(false);
+		expect(
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.restoreBookmark("1")),
+		).toBe(true);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.captureBookmark("reset");
+			fixture.restoreSilently({ version: 1, paragraphs: [{ children: [] }], assets: [] });
+		});
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("reset"),
+			),
+		).toBe(false);
+		await load(page, quoted);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.captureBookmark("prop"));
+		await load(page, attached);
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("prop"),
+			),
+		).toBe(false);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("file token width remains absolute while completion context never crosses its atom", async () => {
+	const page = await open();
+	try {
+		await load(page, {
+			...empty,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "#start" },
+						{
+							type: "fileReference",
+							id: "f",
+							reference: { id: "f", deviceId: "local", path: "/a.ts", label: "a.ts" },
+						},
+						{ type: "text", text: "tail😀" },
+					],
+				},
+			],
+		});
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(17));
+		expect((await snapshot(page)).textContext).toEqual({
+			text: "tail😀",
+			start: 16,
+			end: 22,
+			caret: 17,
+		});
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(2));
+		expect((await snapshot(page)).textContext).toEqual({
+			text: "#start",
+			start: 0,
+			end: 6,
+			caret: 2,
+		});
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("real drop coordinates are captured before async file work and survive a later different selection", async () => {
+	const page = await open();
+	try {
+		await load(page, { ...empty, paragraphs: [{ children: [{ type: "text", text: "abcdef" }] }] });
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(6);
+			fixture.prepareAsyncDrop();
+			const textbox = document.querySelector<HTMLElement>('[role="textbox"]');
+			const text = textbox?.querySelector("p")?.firstChild;
+			if (!textbox || !text) throw new Error("Missing drop text");
+			const range = document.createRange();
+			range.setStart(text, 3);
+			range.collapse(true);
+			const box = range.getBoundingClientRect();
+			const transfer = new DataTransfer();
+			transfer.items.add(new File(["data"], "upload.txt", { type: "text/plain" }));
+			textbox.dispatchEvent(
+				new DragEvent("drop", {
+					dataTransfer: transfer,
+					clientX: box.x,
+					clientY: box.y + box.height / 2,
+					bubbles: true,
+					cancelable: true,
+				}),
+			);
+		});
+		expect((await snapshot(page)).selection).toEqual({ start: 3, end: 3 });
+		expect((await snapshot(page)).pasteCalls).toBe(1);
+		expect((await snapshot(page)).panelDrops).toBe(0);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(0);
+			fixture.insert([{ type: "text", text: "NEW" }]);
+			fixture.selection(7, 9);
+		});
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("drop"),
+			),
+		).toBe(true);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.insert(
+				[{ type: "attachment", id: "uploaded", assetId: "uploaded" }],
+				[{ id: "uploaded", kind: "textFile", name: "upload.txt", size: 4, mimeType: "text/plain" }],
+			),
+		);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "NEWabc" },
+			{ type: "attachment", id: "uploaded", assetId: "uploaded" },
+			{ type: "text", text: "def" },
+		]);
+		await chord(page, "z", "Control");
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "NEWabcdef" },
+		]);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("bookmarks restore native node selections and cannot restore after unmount", async () => {
+	const page = await open();
+	try {
+		await load(page, attached);
+		await page.click("[data-composer-atom] button");
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.captureBookmark("atom");
+			fixture.selection(0);
+		});
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("atom"),
+			),
+		).toBe(true);
+		expect((await snapshot(page)).nativeSelection).toEqual({ empty: false, type: "node" });
+		expect((await snapshot(page)).document).toEqual(attached);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.captureBookmark("unmount");
+			fixture.unmount();
+		});
+		await settle(page);
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.restoreBookmark("unmount"),
+			),
+		).toBe(false);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("production fullscreen CSS fills the remaining height and scrolls only its editing viewport", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.expand(true));
+		await settle(page);
+		const expanded = await snapshot(page);
+		expect(expanded.contentHeight ?? 0).toBeGreaterThan(400);
+		expect(expanded.contentHeight ?? 0).toBeGreaterThan((expanded.shellHeight ?? 0) - 100);
+		await load(page, {
+			...empty,
+			paragraphs: Array.from({ length: 100 }, () => ({
+				children: [{ type: "text", text: "long line" }],
+			})),
+		});
+		const long = await snapshot(page);
+		expect(long.contentHeight).toBe(expanded.contentHeight);
+		expect(long.scrollHeight ?? 0).toBeGreaterThan(long.contentHeight ?? 0);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.expand(false));
+		expect((await snapshot(page)).contentHeight ?? 999).toBeLessThanOrEqual(200);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("schema limits reject oversized paste/duplicate atoms without dirtying document", async () => {
+	const page = await open();
+	try {
+		await load(page, quoted);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.insert([
+				{ type: "quote", id: "q1", label: "Duplicate", text: "text" },
+			]),
+		);
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(quoted);
+		await page.evaluate(() => {
+			const transfer = new DataTransfer();
+			transfer.setData("text/plain", "x".repeat(200_001));
+			document
+				.querySelector('[role="textbox"]')
+				?.dispatchEvent(
+					new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }),
+				);
+		});
+		expect((await snapshot(page)).document).toEqual(quoted);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+for (const width of [320, 1000]) {
+	for (const fontSize of [14, 18]) {
+		test(`${width}px ${fontSize}px font: ordinary chips do not increase a genuine single-line editor`, async () => {
+			const page = await open();
+			try {
+				await page.setViewport({ width, height: 800 });
+				await page.evaluate((size) => {
+					document
+						.querySelector<HTMLElement>("[data-inline-composer]")
+						?.style.setProperty("--composer-min-height", "0px");
+					const editor = document.querySelector<HTMLElement>('[role="textbox"]');
+					if (editor) editor.style.fontSize = `${size}px`;
+				}, fontSize);
+				const geometry = () =>
+					page.evaluate(() => {
+						const editor = document.querySelector<HTMLElement>('[role="textbox"]');
+						const shell = document.querySelector<HTMLElement>("[data-inline-composer]");
+						if (!editor || !shell) throw new Error("Missing editor");
+						return {
+							editor: editor.getBoundingClientRect().height,
+							shell: shell.getBoundingClientRect().height,
+						};
+					});
+				await load(page, {
+					...empty,
+					paragraphs: [{ children: [{ type: "text", text: "Hi there" }] }],
+				});
+				const baseline = await geometry();
+				const textAsset = {
+					id: "single-file",
+					kind: "textFile",
+					name: "a.txt",
+					size: 5,
+					mimeType: "text/plain",
+				} as const;
+				const chips: ComposerDocument[] = [
+					{
+						...empty,
+						paragraphs: [
+							{
+								children: [
+									{ type: "text", text: "Hi " },
+									{ type: "quote", id: "single-quote", label: "Quote", text: "Source" },
+								],
+							},
+						],
+					},
+					{
+						...empty,
+						paragraphs: [
+							{
+								children: [
+									{ type: "text", text: "Hi " },
+									{
+										type: "fileReference",
+										id: "single-ref",
+										reference: {
+											id: "single-ref",
+											deviceId: "local",
+											path: "/a.ts",
+											label: "a.ts",
+										},
+									},
+								],
+							},
+						],
+					},
+					{
+						...empty,
+						assets: [textAsset],
+						paragraphs: [
+							{
+								children: [
+									{ type: "text", text: "Hi " },
+									{ type: "attachment", id: "single-attachment", assetId: textAsset.id },
+								],
+							},
+						],
+					},
+				];
+				for (const doc of chips) {
+					await load(page, doc);
+					const added = await geometry();
+					expect(Math.abs(added.editor - baseline.editor)).toBeLessThan(0.1);
+					expect(Math.abs(added.shell - baseline.shell)).toBeLessThan(0.1);
+					await page.click("[data-composer-atom] button");
+					await settle(page);
+					expect(Math.abs((await geometry()).editor - baseline.editor)).toBeLessThan(0.1);
+					await page.keyboard.press("Backspace");
+					await settle(page);
+					expect((await snapshot(page)).atoms).toHaveLength(0);
+					expect(Math.abs((await geometry()).shell - baseline.shell)).toBeLessThan(0.1);
+				}
+				await load(page, empty);
+				expect(Math.abs((await geometry()).editor - baseline.editor)).toBeLessThan(0.1);
+			} finally {
+				await close(page);
+			}
+		}, 15000);
+	}
+}
+
+test("single-line height remains content-driven for images and wrapped text", async () => {
+	const page = await open();
+	try {
+		await page.setViewport({ width: 320, height: 800 });
+		await page.evaluate(() =>
+			document
+				.querySelector<HTMLElement>("[data-inline-composer]")
+				?.style.setProperty("--composer-min-height", "0px"),
+		);
+		await load(page, { ...empty, paragraphs: [{ children: [{ type: "text", text: "Hi" }] }] });
+		const height = () =>
+			page.evaluate(
+				() => document.querySelector('[role="textbox"]')?.getBoundingClientRect().height ?? 0,
+			);
+		const baseline = await height();
+		await load(page, attached);
+		expect(await height()).toBeGreaterThan(baseline);
+		expect((await snapshot(page)).atoms[0].height).toBe(64);
+		await load(page, {
+			...empty,
+			paragraphs: [{ children: [{ type: "text", text: "words ".repeat(30) }] }],
+		});
+		expect(await height()).toBeGreaterThan(baseline);
+		await load(page, {
+			...empty,
+			paragraphs: [
+				{
+					children: Array.from({ length: 4 }, (_, index) => ({
+						type: "quote" as const,
+						id: `wrap-${index}`,
+						label: "Quoted source",
+						text: "Source text",
+					})),
+				},
+			],
+		});
+		expect(await height()).toBeGreaterThan(baseline);
+		expect((await snapshot(page)).atoms.every((atom) => atom.height === 24)).toBe(true);
+	} finally {
+		await close(page);
+	}
+});
+
+test("placeholder follows the real document, including restored trailing newlines and atoms", async () => {
+	const page = await open();
+	try {
+		for (const document of [
+			{ ...empty, paragraphs: [{ children: [{ type: "text" as const, text: "restored\n" }] }] },
+			{ ...empty, paragraphs: [{ children: [{ type: "text" as const, text: "one\ntwo\n" }] }] },
+			quoted,
+			attached,
+		]) {
+			await load(page, document);
+			expect(
+				await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
+			).toBe("none");
+		}
+		await load(page, empty);
+		expect(
+			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
+		).toBe('"Message"');
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
+		await page.waitForSelector('[role="textbox"] [data-inline-quote-candidate]');
+		expect(
+			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
+		).toBe("none");
+		expect((await snapshot(page)).document).toEqual(empty);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(false));
+		await settle(page);
+		expect(
+			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
+		).toBe('"Message"');
+	} finally {
+		await close(page);
+	}
+});

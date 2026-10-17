@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AnthropicProvider } from "../anthropic-provider";
 import { GrokProvider } from "../grok-provider";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
-import { ApiRequestDumpCollector, HARD_DUMP_MAX_BYTES } from "../request-dump";
+import { ApiRequestDumpCollector } from "../request-dump";
 
 /**
  * NUG injects its own gateway events (credit consumption, context-window
@@ -83,7 +83,23 @@ const MIXED_SSE =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n' +
 	'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 
-describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response capture", (kind) => {
+function recordingCollector() {
+	const meta: Record<string, unknown> = {};
+	const chunks: string[] = [];
+	const dump = new ApiRequestDumpCollector({
+		requestId: "diagnostic-recording",
+		pin: () => {},
+		request: () => {},
+		responseMeta: (value) => Object.assign(meta, value),
+		responseChunk: (value) =>
+			chunks.push(typeof value === "string" ? value : new TextDecoder().decode(value)),
+		frame: () => {},
+		finish: () => {},
+	});
+	return { dump, recordedResponse: () => ({ ...meta, bodyText: chunks.join("") }) };
+}
+
+describe.each(["anthropic", "grok"] as const)("%s request recording", (kind) => {
 	const config = {
 		id: "diagnostic-test",
 		prefix: "diagnostic-test",
@@ -123,7 +139,7 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 		return events;
 	}
 
-	test("keeps output and usage unchanged while bounding an oversized streamed response", async () => {
+	test("forwards the full stream without changing output or usage", async () => {
 		const chunks = [textFrame, ...Array<string>(80).fill(`: ${"x".repeat(1024)}\n\n`), usageFrame];
 		install(chunks.join(""));
 		const baseline = await run();
@@ -139,21 +155,16 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 				{ highWaterMark: 0 },
 			),
 		);
-		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
+		const { dump, recordedResponse } = recordingCollector();
 		expect(await run(dump)).toEqual(baseline);
 		expect(baseline.some((event) => event.text === "hello")).toBe(true);
 		expect(baseline.some((event) => event.usage?.inputTokens === 30)).toBe(true);
-		const response = dump.snapshot(HARD_DUMP_MAX_BYTES).response;
-		expect(response).toMatchObject({
+		expect(recordedResponse()).toMatchObject({
 			status: 200,
 			headers: { "x-request-id": "diagnostic-request" },
-			bodyBytesReceived: Buffer.byteLength(chunks.join("")),
-			bodyBytesKept: 4096,
-			bodyTruncated: true,
 			bodyIncomplete: false,
+			bodyText: chunks.join(""),
 		});
-		expect(Buffer.byteLength(response?.bodyText ?? "")).toBeLessThanOrEqual(4096);
-		expect(response?.bodyText).toContain("hello");
 	});
 
 	test("consumer cancellation stops pulling and preserves the partial prefix", async () => {
@@ -173,13 +184,13 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 				{ highWaterMark: 0 },
 			),
 		);
-		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
+		const { dump, recordedResponse } = recordingCollector();
 		const stream = provider.chat({ ...chatParams(), requestDump: dump });
 		expect((await stream.next()).value).toMatchObject({ text: "hello" });
 		await stream.return(undefined);
 		expect(pulls).toBe(1);
 		expect(cancelled).toBe(true);
-		expect(dump.snapshot().response).toMatchObject({ bodyText: textFrame, bodyIncomplete: true });
+		expect(recordedResponse()).toMatchObject({ bodyText: textFrame, bodyIncomplete: true });
 	});
 
 	test("transport failure preserves emitted text, the error and partial capture", async () => {
@@ -195,11 +206,11 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 				{ highWaterMark: 0 },
 			),
 		);
-		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
+		const { dump, recordedResponse } = recordingCollector();
 		const stream = provider.chat({ ...chatParams(), requestDump: dump });
 		expect((await stream.next()).value).toMatchObject({ text: "hello" });
 		await expect(stream.next()).rejects.toThrow("broken transport");
-		expect(dump.snapshot().response).toMatchObject({
+		expect(recordedResponse()).toMatchObject({
 			bodyText: textFrame,
 			bodyIncomplete: true,
 			error: "broken transport",
@@ -211,18 +222,18 @@ describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response ca
 		install(body);
 		const baseline = await run();
 		install(body);
-		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
+		const { dump, recordedResponse } = recordingCollector();
 		expect(await run(dump)).toEqual(baseline);
 		expect(baseline.some((event) => event.invalidState?.message === "retry later")).toBe(true);
-		expect(dump.snapshot().response?.bodyText).toBe(body);
+		expect(recordedResponse()?.bodyText).toBe(body);
 	});
 
 	test("HTTP errors retain their original status and body without cloning", async () => {
 		const body = '{"error":{"type":"overloaded_error","message":"retry later"}}';
 		install(body, 503);
-		const dump = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
+		const { dump, recordedResponse } = recordingCollector();
 		await expect(run(dump)).rejects.toMatchObject({ status: 503 });
-		expect(dump.snapshot().response).toMatchObject({ status: 503, bodyText: body });
+		expect(recordedResponse()).toMatchObject({ status: 503, bodyText: body });
 	});
 });
 

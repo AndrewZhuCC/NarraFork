@@ -47,26 +47,17 @@ mock.module("./interaction/QueuedMessageRow", () => ({
 mock.module("./interaction/NarratorInteractionStatusBar", () => ({
 	NarratorInteractionStatusBar: () => <div data-region="status" />,
 }));
-mock.module("./interaction/AttachmentPreviews", () => ({
-	AttachmentPreviews: ({
-		attachedImages,
-		attachedTextFiles,
-	}: {
-		attachedImages: File[];
-		attachedTextFiles: File[];
-	}) => (
-		<div
-			data-region="attachments"
-			data-images={attachedImages.length}
-			data-files={attachedTextFiles.length}
-		/>
-	),
-}));
 mock.module("./interaction/UploadProgressBar", () => ({
 	UploadProgressBar: () => <div data-region="upload" />,
 }));
 mock.module("./composer/NarratorComposerRow", () => ({
-	NarratorComposerRow: () => <div data-region="composer" />,
+	NarratorComposerRow: (props: { attachedImages: File[]; attachedTextFiles: File[] }) => (
+		<div
+			data-region="composer"
+			data-images={props.attachedImages.length}
+			data-files={props.attachedTextFiles.length}
+		/>
+	),
 }));
 mock.module("./permission/PermissionRuleResultNotice", () => ({
 	PermissionRulePolicySync: () => null,
@@ -74,7 +65,7 @@ mock.module("./permission/PermissionRuleResultNotice", () => ({
 const { NarratorInteractionArea } = await import("./NarratorInteractionArea");
 
 for (const chapterId of ["chapter", null]) {
-	test(`${chapterId ? "chapter" : "standalone"} places image/file previews below status and immediately above composer`, () => {
+	test(`${chapterId ? "chapter" : "standalone"} passes image/file resources into the composer without an external attachment strip`, () => {
 		// Control hooks and leaf panels are mocked: only the real area's composition is under test.
 		const props = {
 			common: { narratorId: "n", isWorkspacePreview: false },
@@ -90,7 +81,8 @@ for (const chapterId of ["chapter", null]) {
 		} as unknown as NarratorInteractionAreaProps;
 		const html = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
 		const regions = [...html.matchAll(/data-region="([^"]+)"/g)].map((match) => match[1]);
-		expect(regions).toEqual(["queue", "git", "status", "attachments", "upload", "composer"]);
+		expect(regions).toEqual(["queue", "git", "status", "upload", "composer"]);
+		expect(html).not.toContain('data-region="attachments"');
 		expect(html).not.toContain('role="separator"');
 		expect(html).not.toContain("ns-resize");
 		expect(html).toContain("pointer-events:none");

@@ -25,6 +25,7 @@ import type { GithubPatchStep } from "../../shared/release-patch";
 import {
 	isLegacyMirrorSourceIdentity,
 	type PreparedUpdateIdentity,
+	parseRecoveryManifestVersions,
 	parseUpdateSourceIdentity,
 	sameUpdateSourceIdentity,
 	type UpdateSourceIdentity,
@@ -37,6 +38,7 @@ import {
 	createDistributionContext,
 	type DistributionContext,
 } from "../lib/helper-distribution-runtime";
+import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
@@ -65,6 +67,7 @@ import {
 	githubReleaseUpdater,
 	type UpdateNotesRequest,
 } from "./github-release-update";
+import { getReservedRecoverySourceEpochs } from "./recovery-handoff";
 import { toolContinuationService } from "./tool-continuation-service";
 import {
 	assertUpdateNotCancelled,
@@ -73,17 +76,22 @@ import {
 	capturePlannedUpdateRecoverySnapshot,
 	consumePlannedUpdateRecoverySnapshot,
 	failScheduledUpdate,
+	getScheduledRecoveryEpochs,
 	getUpdateCoordinationStatus,
 	markUpdateRestarting,
 	type PlannedUpdateRecoverySnapshot,
+	releasePreparedUpdateRecoveryHandoff,
 	removePlannedUpdateRecoverySnapshot,
+	rollbackPreparedUpdateRecoverySnapshot,
 	scheduleUpdate,
 	UpdateCancelledError,
 	type UpdateCoordinationStatus,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
+	waitForScheduledRecoveryHandoff,
 	waitForUpdateCheckpointFence,
 	writePlannedUpdateRecoverySnapshot,
+	writePreparedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 import { checkMirrorUpdate, downloadMirrorPatch, getMirrorNotes } from "./update-mirror-client";
 import {
@@ -145,6 +153,8 @@ export interface ReleaseInfo {
 	repository?: string;
 	/** Effective source policy captured before the check starts, never inferred at download time. */
 	sourceIdentity?: UpdateSourceIdentity;
+	/** Verified binary sidecar capability; never supplied by an apply request. */
+	recoveryManifestVersions?: number[];
 	_github?: { repository: string; downloadUrl: string; patchChain?: GithubPatchStep[] };
 	_mirror?: {
 		serverUrl: string;
@@ -234,6 +244,30 @@ const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
 const CHECKPOINT_MAX_ROUNDS = 8;
 const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;
 
+interface FailedUpdateCleanup {
+	updateEpoch: string;
+	targetVersion: string;
+	error: string;
+	cancelled?: boolean;
+}
+
+// A failed durable rollback keeps its gate closed. Preserve the current attempt
+// so the operator can retry cleanup instead of being stranded after the watchdog.
+const failedUpdateCleanup = hotSafe("update.failedHandoffCleanup", () => ({
+	pending: null as { options: FailedUpdateCleanup; retrying: boolean; error: string } | null,
+}));
+function getUpdateCoordinationWithCleanup(): UpdateCoordinationStatus & {
+	cleanupRetryPending: boolean;
+} {
+	const status = getUpdateCoordinationStatus();
+	const pending = failedUpdateCleanup.pending;
+	const needsRetry = status.scheduled && status.updateEpoch === pending?.options.updateEpoch;
+	return {
+		...status,
+		cleanupRetryPending: needsRetry,
+		...(needsRetry && pending ? { error: pending.error, errorKind: "failed" as const } : {}),
+	};
+}
 interface PlacedUpdateInfo {
 	version: string;
 	fromVersion: string;
@@ -248,6 +282,8 @@ interface PlacedUpdateInfo {
 	stablePathInstall?: StablePathInstall;
 	/** Absent on legacy metadata; never backfilled from the current source settings. */
 	sourceIdentity?: UpdateSourceIdentity;
+	/** Frozen with the verified binary identity, not inferred from its version. */
+	recoveryManifestVersions?: number[];
 }
 
 /**
@@ -619,7 +655,20 @@ export async function downloadUpdate(
 }> {
 	const forceDownload = options.forceDownload ?? false;
 	const sourceIdentity = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
-	releaseInfo = { ...releaseInfo, sourceIdentity: sourceIdentity ?? undefined };
+	let recoveryManifestVersions: number[];
+	try {
+		recoveryManifestVersions = parseRecoveryManifestVersions(releaseInfo.recoveryManifestVersions);
+	} catch {
+		return {
+			success: false,
+			error: "Invalid recovery protocol capabilities; check for updates again",
+		};
+	}
+	releaseInfo = {
+		...releaseInfo,
+		sourceIdentity: sourceIdentity ?? undefined,
+		recoveryManifestVersions,
+	};
 	const isGithub =
 		!!releaseInfo._github && (releaseInfo.source === "github" || !!releaseInfo._mirror);
 	if (!sourceIdentity || !isUpdateSourceCurrent(releaseInfo)) {
@@ -800,6 +849,7 @@ export async function downloadUpdate(
 		const finalSize = statSync(finalUpdatePath).size;
 		const preparedInfo: PlacedUpdateInfo = {
 			sourceIdentity,
+			recoveryManifestVersions,
 			version: releaseInfo.version,
 			fromVersion: APP_VERSION,
 			fileName: finalFileName,
@@ -956,6 +1006,7 @@ async function verifyFileSha512Cached(
 
 function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity {
 	const sourceIdentity = parseUpdateSourceIdentity(info.sourceIdentity);
+	const recoveryManifestVersions = parseRecoveryManifestVersions(info.recoveryManifestVersions);
 	const id = createHash("sha256")
 		.update(
 			JSON.stringify([
@@ -970,6 +1021,8 @@ function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity 
 				info.sha512,
 				info.sizeBytes,
 				sourceIdentity,
+				// Keep legacy selectors stable, but bind newly verified capabilities.
+				...(info.recoveryManifestVersions === undefined ? [] : [recoveryManifestVersions]),
 			]),
 		)
 		.digest("hex");
@@ -979,6 +1032,7 @@ function preparedUpdateIdentity(info: PlacedUpdateInfo): PreparedUpdateIdentity 
 		sha512: info.sha512,
 		sizeBytes: info.sizeBytes,
 		sourceIdentity,
+		recoveryManifestVersions,
 	};
 }
 
@@ -1010,6 +1064,9 @@ function readPlacedUpdateRecord(): PlacedUpdateInfo | null {
 				!isLegacyMirrorSourceIdentity(info.sourceIdentity))
 		)
 			return null;
+		if (info.recoveryManifestVersions !== undefined) {
+			info.recoveryManifestVersions = parseRecoveryManifestVersions(info.recoveryManifestVersions);
+		}
 		return info;
 	} catch {
 		return null;
@@ -1161,6 +1218,7 @@ export function getUpdateDirectory(): string {
 export async function getUpdateStatus(targetVersion?: string): Promise<
 	UpdateCoordinationStatus & {
 		ready: boolean;
+		cleanupRetryPending: boolean;
 		updateFile?: string;
 		canAutoRestart: boolean;
 		newBinaryPath?: string;
@@ -1185,7 +1243,7 @@ export async function getUpdateStatus(targetVersion?: string): Promise<
 		...(artifactPath
 			? { instructions: getUpdateInstructions(artifactPath, placedInfo?.newBinaryPath) }
 			: {}),
-		...getUpdateCoordinationStatus(),
+		...getUpdateCoordinationWithCleanup(),
 	};
 }
 
@@ -1304,7 +1362,16 @@ export async function applyUpdate(
 		};
 	}
 
-	const scheduled = scheduleUpdate(placedInfo.version);
+	let scheduled: UpdateCoordinationStatus;
+	try {
+		scheduled = scheduleUpdate(placedInfo.version, "update", {
+			supportedRecoveryManifestVersions: parseRecoveryManifestVersions(
+				placedInfo.recoveryManifestVersions,
+			),
+		});
+	} catch (reason) {
+		return { success: false, error: reason instanceof Error ? reason.message : String(reason) };
+	}
 	// scheduleUpdate always assigns an epoch when it transitions an idle coordinator.
 	const updateEpoch = scheduled.updateEpoch as string;
 	const drainStartedAt = new Date().toISOString();
@@ -1347,9 +1414,9 @@ function preserveFailedUpdateRecoveryEvidence(options: {
 	try {
 		const existing = consumePlannedUpdateRecoverySnapshot();
 		if (existing?.updateEpoch === options.updateEpoch) {
-			// A cancelled manual preparation must not leave a valid next-start authorization
-			// behind when continuation cleanup fails. Retain diagnostics, revoke resume permission.
-			if (existing.resumeOnNextStartup) {
+			// A failed automatic or manual handoff must not retain authorization.
+			// Automatic snapshots normally have a nonce, not resumeOnNextStartup.
+			if (!existing.evidenceOnly || existing.resumeOnNextStartup) {
 				writePlannedUpdateRecoverySnapshot(
 					{ ...existing, resumeOnNextStartup: false, evidenceOnly: true },
 					{ expectedEpoch: options.updateEpoch },
@@ -1391,13 +1458,33 @@ function preserveFailedUpdateRecoveryEvidence(options: {
 }
 
 /** @internal Exported for focused update failure-path tests. */
-export async function failPreparedUpdateAttempt(options: {
-	updateEpoch: string;
-	targetVersion: string;
-	error: string;
-	/** Operator-initiated abandonment rather than a genuine failure. */
-	cancelled?: boolean;
-}): Promise<void> {
+export async function failPreparedUpdateAttempt(options: FailedUpdateCleanup): Promise<void> {
+	try {
+		await cleanupPreparedUpdateAttempt(options);
+		if (
+			!getUpdateCoordinationStatus().scheduled &&
+			failedUpdateCleanup.pending?.options.updateEpoch === options.updateEpoch
+		) {
+			failedUpdateCleanup.pending = null;
+		}
+	} catch (error) {
+		const current = getUpdateCoordinationStatus();
+		if (
+			current.scheduled &&
+			current.updateEpoch === options.updateEpoch &&
+			current.operation !== "system_shutdown"
+		) {
+			failedUpdateCleanup.pending = {
+				options: { ...options },
+				retrying: false,
+				error: `${options.error}; cleanup failed: ${String(error)}`,
+			};
+		}
+		throw error;
+	}
+}
+
+async function cleanupPreparedUpdateAttempt(options: FailedUpdateCleanup): Promise<void> {
 	const current = getUpdateCoordinationStatus();
 	if (current.updateEpoch !== options.updateEpoch) {
 		logger.warn("Ignoring stale prepared-update failure", {
@@ -1409,6 +1496,37 @@ export async function failPreparedUpdateAttempt(options: {
 	}
 
 	cancelGracefulRestartSession();
+	// Inspect the immutable reservation, not source validators: a failed source
+	// identity check is itself a rollback failure that must remain retryable.
+	if (getReservedRecoverySourceEpochs(options.updateEpoch).length > 0) {
+		// A new root may include waits owned by earlier recovery passes. Revoke
+		// only our publication, then cancel only rows created by this attempt.
+		// Any failure here deliberately keeps the ticket/gate for a retry.
+		try {
+			rollbackPreparedUpdateRecoverySnapshot(options.updateEpoch);
+			const cancelledCount = await toolContinuationService.cancelEpoch(
+				options.updateEpoch,
+				options.error,
+			);
+			if (getUpdateCoordinationStatus().updateEpoch !== options.updateEpoch) return;
+			releasePreparedUpdateRecoveryHandoff(options.updateEpoch);
+			if (failedUpdateCleanup.pending?.options.updateEpoch === options.updateEpoch) {
+				failedUpdateCleanup.pending = null;
+			}
+			failScheduledUpdate(options.error, { cancelled: options.cancelled });
+			logger.info("Recovery handoff rolled back without cancelling inherited sources", {
+				updateEpoch: options.updateEpoch,
+				cancelledCount,
+			});
+		} catch (error) {
+			logger.error("Recovery handoff rollback incomplete; retaining checkpoint gate", {
+				updateEpoch: options.updateEpoch,
+				error: String(error),
+			});
+			throw error;
+		}
+		return;
+	}
 	try {
 		const manifest = consumePlannedUpdateRecoverySnapshot();
 		if (manifest?.updateEpoch === options.updateEpoch && manifest.resumeOnNextStartup) {
@@ -1493,9 +1611,23 @@ export function cancelPreparedUpdate(reason?: string): {
 	cancelled: boolean;
 	status: UpdateCoordinationStatus;
 } {
-	const before = getUpdateCoordinationStatus();
+	const before = getUpdateCoordinationWithCleanup();
 	if (!before.scheduled || !before.updateEpoch || before.operation === "system_shutdown") {
 		return { cancelled: false, status: before };
+	}
+	const pendingCleanup = failedUpdateCleanup.pending;
+	if (pendingCleanup?.options.updateEpoch === before.updateEpoch) {
+		// This epoch's handoff session has already been revoked by the failed
+		// cleanup. Unlike a live replacement handshake, retrying is now safe.
+		if (!pendingCleanup.retrying) {
+			pendingCleanup.retrying = true;
+			runFailedUpdateCleanup({
+				...pendingCleanup.options,
+				error: reason ?? pendingCleanup.options.error,
+				cancelled: true,
+			});
+		}
+		return { cancelled: true, status: getUpdateCoordinationWithCleanup() };
 	}
 	// Cancelling during `restarting` would leave the already-spawned replacement racing this
 	// process for the same port and handoff; let the handoff watchdog resolve that instead.
@@ -1503,7 +1635,7 @@ export function cancelPreparedUpdate(reason?: string): {
 		return { cancelled: false, status: before };
 	}
 	cancelScheduledUpdate(reason);
-	return { cancelled: true, status: getUpdateCoordinationStatus() };
+	return { cancelled: true, status: getUpdateCoordinationWithCleanup() };
 }
 
 /**
@@ -1648,14 +1780,21 @@ export async function checkpointPreparedUpdateFence(
 	updateEpoch: string,
 	hooks: PlannedUpdateCheckpointHooks = {},
 ): Promise<PlannedUpdateRecoverySnapshot> {
+	await waitForScheduledRecoveryHandoff();
+	assertUpdateNotCancelled();
+	const recoveryEpochs = () => {
+		const epochs = getScheduledRecoveryEpochs();
+		return epochs.length ? epochs : [updateEpoch];
+	};
 	const waitForFence = hooks.waitForFence ?? waitForUpdateCheckpointFence;
 	const checkpoint = hooks.checkpoint ?? checkpointPlannedUpdateContinuations;
 	const loadActiveToolCallIds = hooks.listActiveToolCallIds ?? listActiveToolCallIds;
 	const loadCoveredToolCallIds =
 		hooks.listCoveredToolCallIds ??
-		(async (epoch: string) =>
-			(await toolContinuationService.listByEpoch(epoch)).map((row) => row.toolCallId));
-	const verifySendAwaits = hooks.verifySendAwaitContinuations ?? verifySendAwaitCheckpointEpoch;
+		(async () =>
+			(await toolContinuationService.listByEpoch(recoveryEpochs())).map((row) => row.toolCallId));
+	const verifySendAwaits =
+		hooks.verifySendAwaitContinuations ?? (() => verifySendAwaitCheckpointEpoch(recoveryEpochs()));
 
 	let stablePasses = 0;
 	let snapshot: PlannedUpdateRecoverySnapshot | null = null;
@@ -1712,6 +1851,8 @@ async function drainAndSpawnPreparedUpdate(options: {
 	updateEpoch: string;
 	preparedUpdate: PlacedUpdateInfo;
 }): Promise<void> {
+	await waitForScheduledRecoveryHandoff();
+	assertUpdateNotCancelled();
 	await waitForBackgroundBashDrain();
 	assertUpdateNotCancelled();
 	beginQuiescingTools();
@@ -1734,7 +1875,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 	// Last cancellation checkpoint before the two irreversible steps: writing the recovery
 	// manifest and spawning the replacement process.
 	assertUpdateNotCancelled();
-	writePlannedUpdateRecoverySnapshot(recoverySnapshot);
+	writePreparedUpdateRecoverySnapshot(recoverySnapshot);
 	markUpdateRestarting();
 
 	let session: ReturnType<typeof beginGracefulRestartSession>;
@@ -1748,7 +1889,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 	// handoff session (so a crash between the two still leaves recovery evidence), so the nonce is
 	// stamped in now that it is known. Only the replacement receiving this same nonce may act on
 	// the manifest; any other startup discards it instead of resuming its narrators.
-	writePlannedUpdateRecoverySnapshot(recoverySnapshot, {
+	writePreparedUpdateRecoverySnapshot(recoverySnapshot, {
 		expectedEpoch: options.updateEpoch,
 		handoffMarkerNonce: session.markerNonce,
 	});

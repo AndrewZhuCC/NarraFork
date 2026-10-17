@@ -106,6 +106,33 @@ describe("git APIs", () => {
 		clearToken();
 	});
 
+	test("line stats reads pin the workspace, preserve the chapter adapter and forward cancellation", async () => {
+		installLocalStorage();
+		const calls: Array<{ url: string; init?: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				calls.push({ url: String(input), init });
+				return Response.json({ files: [], linesAdded: 0, linesRemoved: 0, complete: true });
+			},
+		});
+		const controller = new AbortController();
+		await api.getGitLineStats(
+			{ narratorId: "n /", workspaceKey: "设备:/a b?", canWrite: false },
+			controller.signal,
+		);
+		await api.getGitLineStats("chapter /", controller.signal);
+		const urls = calls.map(({ url }) => new URL(url, "http://localhost"));
+		expect(urls[0]?.pathname).toBe("/api/narrators/n%20%2F/git/line-stats");
+		expect(urls[0]?.searchParams.get("workspaceKey")).toBe("设备:/a b?");
+		expect(urls[1]?.pathname).toBe("/api/chapters/chapter%20%2F/git/line-stats");
+		expect(urls[1]?.search).toBe("");
+		controller.abort();
+		expect(calls.every(({ init }) => init?.signal?.aborted && !init.body && !init.method)).toBe(
+			true,
+		);
+	});
+
 	test("commit preview reads pin and encode workspace, paths and route identities without writes", async () => {
 		installLocalStorage();
 		setToken("git-token");

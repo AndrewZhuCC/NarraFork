@@ -21,6 +21,8 @@ import {
 import { commitSyncService } from "../services/commit-sync-service";
 import { getCommitBoundariesCached } from "../services/git-commit-boundary-cache";
 import {
+	getGitWorkspaceLineStats,
+	getGitWorkspaceStatus,
 	gitAttributionScopes,
 	gitManagementService,
 	invalidateGitWorkspace,
@@ -225,15 +227,25 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 		if (!path) throw new ValidationError("Git workspace root is unavailable");
 		return { target, path, git: gitManagementService(target, c.req.raw.signal) };
 	};
-	const summary = async (c: Context<GitEnv>) => {
-		const { git, path } = access(c);
-		// Management reads are bounded and fresh. Legacy watcher consumers retain their cache.
-		return git.getStatusSummary(path);
-	};
+	const summary = (c: Context<GitEnv>) =>
+		getGitWorkspaceStatus(
+			c.get("gitTarget"),
+			c.req.raw.signal,
+			c.req.query("fresh") === "1" ? 0 : undefined,
+		);
 	const changed = (c: Context<GitEnv>) => invalidateGitWorkspace(c.get("gitTarget"));
 
 	routes.get(`${prefix}/workspace`, (c) => c.json(c.get("gitTarget").workspace));
 	routes.get(`${prefix}/status`, async (c) => c.json(await summary(c)));
+	routes.get(`${prefix}/line-stats`, async (c) =>
+		c.json(
+			await getGitWorkspaceLineStats(
+				c.get("gitTarget"),
+				c.req.raw.signal,
+				c.req.query("fresh") === "1" ? 0 : undefined,
+			),
+		),
+	);
 	routes.get(`${prefix}/modifications`, async (c) => {
 		const { target, path, git } = access(c);
 		const query = gitModificationsQuerySchema.parse(c.req.query());

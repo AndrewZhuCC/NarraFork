@@ -1,63 +1,35 @@
-import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
+import type {
+	RecordingFrame,
+	RecordingPinReason,
+	RecordingRequest,
+	RequestRecording,
+} from "@shared/request-recording";
 import { readWithTimeout } from "../stream-timeout";
 import { sliceToUtf8Budget, utf8Bytes } from "../utf8-budget";
-import type { ApiRequestDiagnostics } from "./types";
 
-export interface ApiRequestDump {
-	provider?: string;
-	model?: string;
-	/** A diagnostic capture exceeded its byte, node, or depth budget. */
-	captureTruncated?: boolean;
-	diagnostics?: ApiRequestDiagnostics;
-	/**
-	 * Annotation attached by a special-case capture (currently only the upstream
-	 * "malformed request body" rejection).
-	 *
-	 * Deliberately an ADDITIONAL field rather than a replacement for the dump: a user who
-	 * opens a dump is asking what was sent, and answering with a structural summary while
-	 * dropping the request itself is the one outcome the dump exists to prevent. Size is
-	 * handled downstream by spilling the whole dump to a file, not by discarding parts of it.
-	 */
-	capture?: unknown;
-	/** Earlier transport attempts; request previews are explicitly bounded. */
-	attempts?: Array<{ requestText: string; response?: ApiRequestDump["response"] }>;
-	attemptsTruncated?: boolean;
-	/** Never erase the original request when a reconnect/fallback changes the payload. */
-	initialRequest?: ApiRequestDump["request"];
-	request?: {
-		transport?: string;
-		url?: string;
-		headers?: Record<string, string>;
-		body?: unknown;
-	};
-	response?: {
-		status?: number;
-		headers?: Record<string, string>;
-		bodyText?: string;
-		events?: unknown[];
-		error?: string;
-		errorTruncated?: boolean;
-		bodyBytesReceived?: number;
-		bodyBytesKept?: number;
-		bodyTruncated?: boolean;
-		bodyIncomplete?: boolean;
-	};
+/** Request metadata a provider reports at the start of each transport attempt. */
+export interface RecordingAttemptRequest extends RecordingRequest {
+	/** Structured body; serialized once when the provider did not pass `bodyText`. */
+	body?: unknown;
 }
 
-/** Default byte cap for a persisted raw dump's response body / events (1 MB). */
-export const DEFAULT_DUMP_MAX_BYTES = 1024 * 1024;
-/** Hard cap on the number of stored SSE events in a raw dump. */
-export const MAX_DUMP_EVENT_COUNT = 2000;
+/** Response metadata; body bytes travel separately through `appendResponseText`. */
+export interface RecordingResponseMeta {
+	status?: number;
+	headers?: Record<string, string>;
+	error?: string;
+	errorTruncated?: boolean;
+	bodyBytesReceived?: number;
+	bodyTruncated?: boolean;
+	bodyIncomplete?: boolean;
+}
 
+/** Byte cap for bounded error-body prefixes read into memory (1 MB). */
+export const DEFAULT_DUMP_MAX_BYTES = 1024 * 1024;
 /** Negative/unlimited settings still obey this in-memory safety ceiling. */
 export const HARD_DUMP_MAX_BYTES = 32 * 1024 * 1024;
-/** Ring-only requests keep just a small local error-diagnostic prefix; bytes stream to the worker. */
-export const RING_DIAGNOSTIC_PREFIX_BYTES = 64 * 1024;
-export function responseDumpBudget(value = DEFAULT_DUMP_MAX_BYTES): number {
-	return Number.isFinite(value) && value >= 0
-		? Math.min(Math.floor(value), HARD_DUMP_MAX_BYTES)
-		: HARD_DUMP_MAX_BYTES;
-}
+/** Request bodies above this are not parsed for the malformed-request structural summary. */
+const MAX_SUMMARY_PARSE_BYTES = 32 * 1024 * 1024;
 
 /** Retains a UTF-8 prefix, never allocates an encoding of an unbounded input string. */
 export class BoundedUtf8Capture {
@@ -79,7 +51,10 @@ export class BoundedUtf8Capture {
 	received = 0;
 	readonly limit: number;
 	constructor(limit = DEFAULT_DUMP_MAX_BYTES) {
-		this.limit = responseDumpBudget(limit);
+		this.limit =
+			Number.isFinite(limit) && limit >= 0
+				? Math.min(Math.floor(limit), HARD_DUMP_MAX_BYTES)
+				: HARD_DUMP_MAX_BYTES;
 	}
 	append(value: string | Uint8Array): void {
 		if (typeof value === "string") {
@@ -169,6 +144,7 @@ export function captureDumpResponse(
 	});
 	return captured;
 }
+
 /** Bounded error-body read; also cancels the pull tap when the prefix cap is reached. */
 export async function readResponsePrefix(
 	response: Response,
@@ -224,15 +200,6 @@ function jsonReplacer(_key: string, value: unknown): unknown {
 	return value;
 }
 
-function toJsonSafe<T>(value: T): T {
-	if (value == null) return value;
-	try {
-		return JSON.parse(JSON.stringify(value, jsonReplacer)) as T;
-	} catch {
-		return value;
-	}
-}
-
 export function sanitizeHeaders(
 	headers?: Headers | Record<string, string> | Record<string, unknown>,
 ): Record<string, string> | undefined {
@@ -248,10 +215,7 @@ export function sanitizeHeaders(
 	);
 }
 
-/** Independent diagnostic budget; turning on diagnosis must not retain unbounded bodies. */
-export const CACHE_DIAGNOSTIC_DUMP_MAX_BYTES = 4 * 1024 * 1024;
-
-/** Copy only a bounded JSON prefix, without first serializing the unbounded source. */
+/** Copy a bounded Codex request template without first serializing the unbounded source. */
 export function boundedJsonCopy<T>(value: T, maxBytes: number): { value: T; truncated: boolean } {
 	let remaining = Math.max(0, maxBytes - 128);
 	let nodes = 50_000;
@@ -414,21 +378,19 @@ export function maskSecretValues(text: string, secrets: readonly string[]): stri
 	return masked;
 }
 
+/**
+ * Per-attempt bridge from a provider to the request recorder.
+ *
+ * Request evidence lives only in the recorder (ring window + pinned saves). The collector
+ * never materializes a JSON copy of the request or response on the main thread: bodies are
+ * forwarded as the exact bytes sent/received, metadata as bounded records.
+ */
 export class ApiRequestDumpCollector {
-	private dump: ApiRequestDump;
-	private responseCapture?: BoundedUtf8Capture;
-	private responseBudgetUsed = 0;
-	private captureTruncated = false;
-
-	private copy<T>(value: T, maxBytes = this.maxCaptureBytes): T {
-		if (maxBytes === undefined) return toJsonSafe(value);
-		const bounded = boundedJsonCopy(value, maxBytes);
-		this.captureTruncated ||= bounded.truncated;
-		return bounded.value;
-	}
-	private requestBodyText?: string;
-	private initialRequestBodyText?: string;
 	private recordingFinished = false;
+	/** Reference (not a copy) to the latest body, only for the malformed-request summary. */
+	private lastRequestBodyText?: string;
+
+	constructor(private readonly recording?: RequestRecording) {}
 
 	/** Diagnostics must never interrupt the provider's business stream. */
 	private record(action: (recording: RequestRecording) => void): void {
@@ -444,211 +406,47 @@ export class ApiRequestDumpCollector {
 		this.record((recording) => recording.frame(frame));
 	}
 
+	/** Keep this request's evidence after it ends, regardless of the auto-pin policy. */
+	pin(reason: RecordingPinReason): void {
+		if (!this.recording) return;
+		try {
+			this.recording.pin(reason);
+		} catch {
+			// Observational only.
+		}
+	}
+
 	finish(result?: { error?: string; status?: string }): void {
 		this.record((recording) => recording.finish(result));
 		this.recordingFinished = true;
 	}
 
-	private materializeRequest(): void {
-		if (this.initialRequestBodyText !== undefined && this.dump.initialRequest) {
-			try {
-				this.dump.initialRequest.body = JSON.parse(this.initialRequestBodyText);
-			} catch {
-				this.dump.initialRequest.body = this.initialRequestBodyText;
-			}
-			this.initialRequestBodyText = undefined;
-		}
-		if (this.requestBodyText === undefined || !this.dump.request) return;
-		try {
-			this.dump.request.body = JSON.parse(this.requestBodyText);
-		} catch {
-			this.dump.request.body = this.requestBodyText;
-		}
-		this.requestBodyText = undefined;
+	beginResponseAttempt(request: RecordingAttemptRequest, recordBody = true): void {
+		this.setRequest(request, recordBody);
 	}
 
-	beginResponseAttempt(
-		request: NonNullable<ApiRequestDump["request"]> & RecordingRequest,
-		maxBytes = DEFAULT_DUMP_MAX_BYTES,
-		recordBody = true,
-	): void {
-		this.flushResponseCapture();
-		if (this.dump.request) {
-			if (!this.dump.initialRequest) {
-				this.dump.initialRequest = this.dump.request;
-				this.initialRequestBodyText = this.requestBodyText;
-			}
-			this.dump.attempts ??= [];
-			const attempts = this.dump.attempts;
-			if (attempts.length < 16) {
-				const preview = new BoundedUtf8Capture(64 * 1024);
-				preview.append(JSON.stringify(this.dump.request));
-				if (this.requestBodyText !== undefined) preview.append(this.requestBodyText);
-				attempts.push({
-					requestText:
-						preview.text() +
-						(preview.received > preview.kept ? "\n[request preview truncated]" : ""),
-					response: this.dump.response,
-				});
-			} else this.dump.attemptsTruncated = true;
-		}
-		this.responseBudgetUsed += this.responseCapture?.kept ?? 0;
-		this.responseCapture = new BoundedUtf8Capture(
-			Math.max(
-				0,
-				Math.min(
-					responseDumpBudget(maxBytes),
-					this.legacyResponseMaxBytes,
-					this.maxCaptureBytes ?? HARD_DUMP_MAX_BYTES,
-				) - this.responseBudgetUsed,
-			),
+	setRequest(request: RecordingAttemptRequest, recordBody = true): void {
+		const { body, bodyText, ...meta } = request;
+		// Built-in providers pass the exact string they send; keep that reference.
+		const serialized =
+			bodyText ?? (body === undefined ? undefined : JSON.stringify(body, jsonReplacer));
+		if (recordBody) this.lastRequestBodyText = serialized;
+		this.record((recording) =>
+			recording.request({ ...meta, bodyText: recordBody ? serialized : undefined }),
 		);
-		this.dump.response = { bodyIncomplete: true };
-		this.setRequest(request, recordBody);
 	}
 
 	appendResponseText(value: string | Uint8Array, record = true): void {
 		if (record) this.record((recording) => recording.responseChunk(value));
-		this.responseCapture?.append(value);
 	}
 
 	finishResponseCapture(complete: boolean): void {
-		if (this.responseCapture) this.setResponseMeta({ bodyIncomplete: !complete });
-		this.flushResponseCapture();
+		this.setResponseMeta({ bodyIncomplete: !complete });
 	}
 
-	private flushResponseCapture(): void {
-		const capture = this.responseCapture;
-		if (!capture) return;
-		this.setResponseMeta({
-			bodyText: capture.text(),
-			bodyBytesReceived: capture.received,
-			bodyBytesKept: capture.kept,
-			bodyTruncated: capture.received > capture.kept,
-		});
-	}
-
-	constructor(
-		initial?: ApiRequestDump,
-		private readonly recording?: RequestRecording,
-		private readonly legacyResponseMaxBytes = HARD_DUMP_MAX_BYTES,
-		readonly maxCaptureBytes?: number,
-		readonly retainInitialRequest = maxCaptureBytes !== undefined,
-	) {
-		this.dump = this.copy(initial ?? {});
-	}
-
-	setRequest(
-		request: NonNullable<ApiRequestDump["request"]> & RecordingRequest,
-		recordBody = true,
-	): void {
-		const { body, bodyText, ...meta } = request;
-		let serialized = bodyText;
-		this.record((recording) => {
-			if (recordBody && serialized === undefined && body !== undefined) {
-				serialized = JSON.stringify(body, jsonReplacer);
-			}
-			recording.request({ ...meta, bodyText: recordBody ? serialized : undefined });
-		});
-		// Preserve the full logical history only when the actual WS frame is a delta.
-		if (
-			this.retainInitialRequest &&
-			this.dump.request &&
-			!this.dump.initialRequest &&
-			typeof (body as { previous_response_id?: unknown } | undefined)?.previous_response_id ===
-				"string"
-		) {
-			this.dump.initialRequest = this.dump.request;
-			this.initialRequestBodyText = this.requestBodyText;
-		}
-		this.dump.request = this.copy({ ...meta, headers: sanitizeHeaders(meta.headers) });
-		this.requestBodyText = undefined;
-		if (this.maxCaptureBytes !== undefined && bodyText === undefined) {
-			this.dump.request.body = this.copy(body);
-			return;
-		}
-		serialized ??= body === undefined ? undefined : JSON.stringify(body, jsonReplacer);
-		if (serialized !== undefined) {
-			const maxBytes = this.maxCaptureBytes ?? HARD_DUMP_MAX_BYTES;
-			if (serialized.length <= maxBytes / 3 || Buffer.byteLength(serialized) <= maxBytes) {
-				this.requestBodyText = serialized;
-			} else {
-				const marker = "\n[legacy request dump truncated]";
-				const capture = new BoundedUtf8Capture(Math.max(0, maxBytes - Buffer.byteLength(marker)));
-				capture.append(serialized);
-				this.requestBodyText = `${capture.text()}${marker}`;
-				this.captureTruncated = true;
-			}
-		}
-	}
-
-	setResponseMeta(response: Partial<NonNullable<ApiRequestDump["response"]>>): void {
+	setResponseMeta(response: RecordingResponseMeta & Record<string, unknown>): void {
 		const { bodyText: _bodyText, events: _events, ...meta } = response;
 		if (Object.keys(meta).length) this.record((recording) => recording.responseMeta(meta));
-		this.dump.response = {
-			...(this.dump.response ?? {}),
-			...this.copy(response),
-		};
-	}
-
-	setResponseBodyText(bodyText: string): void {
-		this.setResponseBodyTextWithLimit(bodyText, DEFAULT_DUMP_MAX_BYTES);
-	}
-
-	setResponseBodyTextWithLimit(bodyText: string, maxSize: number): void {
-		this.record((recording) => recording.responseChunk(bodyText));
-		const capture = new BoundedUtf8Capture(
-			Math.min(responseDumpBudget(maxSize), this.legacyResponseMaxBytes),
-		);
-		capture.append(bodyText);
-		this.setResponseMeta({
-			bodyText: capture.text(),
-			bodyBytesReceived: capture.received,
-			bodyBytesKept: capture.kept,
-			bodyTruncated: capture.received > capture.kept,
-		});
-	}
-
-	setResponseEvents(events: unknown[]): void {
-		this.setResponseMeta({ events: this.copy(events) });
-	}
-
-	/**
-	 * Store response events with a hard cap on both element count and serialized byte
-	 * size, so force-persisting a dump on leak detection cannot buffer an unbounded SSE
-	 * stream (see CLAUDE.md backend memory rules). When the cap is exceeded, the head
-	 * elements are kept and a truncation marker is appended.
-	 */
-	setResponseEventsWithLimit(events: unknown[], maxCount: number, maxBytes: number): void {
-		const safe = this.copy(
-			events,
-			this.maxCaptureBytes === undefined
-				? undefined
-				: Math.min(this.maxCaptureBytes, responseDumpBudget(maxBytes)),
-		);
-		if (!Array.isArray(safe)) {
-			this.setResponseMeta({ events: safe });
-			return;
-		}
-
-		let kept = maxCount >= 0 && safe.length > maxCount ? safe.slice(0, maxCount) : safe;
-		let droppedForCount = safe.length - kept.length;
-
-		// Enforce byte cap by trimming from the tail until under the limit.
-		if (maxBytes >= 0) {
-			while (kept.length > 0 && JSON.stringify(kept).length > maxBytes) {
-				kept = kept.slice(0, -1);
-				droppedForCount++;
-			}
-		}
-
-		if (droppedForCount > 0) {
-			this.setResponseMeta({
-				events: [...kept, { _truncated: droppedForCount }],
-			});
-			return;
-		}
-		this.setResponseMeta({ events: kept });
 	}
 
 	setResponseError(error: unknown): void {
@@ -661,58 +459,17 @@ export class ApiRequestDumpCollector {
 		});
 	}
 
-	setDiagnostics(diagnostics: ApiRequestDiagnostics | undefined): void {
-		if (!diagnostics) return;
-		this.dump.diagnostics = this.copy(diagnostics);
-	}
-
 	/**
-	 * Attach a special-case capture annotation alongside the dump.
-	 *
-	 * Never touches `request`/`response`: the annotation is a pointer plus a structural
-	 * summary, and the request it describes must remain in the dump next to it.
+	 * Parse the last recorded request body for a structural summary. Only used on the rare
+	 * upstream "malformed request body" rejection; bounded by {@link MAX_SUMMARY_PARSE_BYTES}.
 	 */
-	setCapture(capture: unknown): void {
-		if (capture == null) return;
-		this.dump.capture = this.copy(capture);
-	}
-
-	snapshot(maxBytes = this.maxCaptureBytes): ApiRequestDump {
-		this.flushResponseCapture();
-		this.materializeRequest();
-		if (maxBytes === undefined) return toJsonSafe(this.dump);
-		const { initialRequest, request, response, attempts, ...metadata } = this.dump;
-		const complete = boundedJsonCopy(
-			{ ...metadata, request, response, initialRequest, attempts },
-			maxBytes,
-		);
-		if (!complete.truncated) {
-			return { ...complete.value, ...(this.captureTruncated ? { captureTruncated: true } : {}) };
+	lastRequestBody(): unknown {
+		const text = this.lastRequestBodyText;
+		if (text === undefined || text.length > MAX_SUMMARY_PARSE_BYTES) return undefined;
+		try {
+			return JSON.parse(text);
+		} catch {
+			return undefined;
 		}
-		// Only genuinely oversized snapshots need partitioning; do not truncate a reply that fits.
-		// Reserve room for upstream headers/usage evidence; neither side may erase the other.
-		const { bodyText, events, ...responseMeta } = response ?? {};
-		const keptResponse = response
-			? boundedJsonCopy({ ...responseMeta, bodyText, events }, Math.floor(maxBytes / 4))
-			: undefined;
-		if (
-			keptResponse?.value &&
-			typeof bodyText === "string" &&
-			keptResponse.value.bodyText !== bodyText
-		) {
-			keptResponse.value.bodyTruncated = true;
-		}
-		const responseBytes = utf8Bytes(JSON.stringify(keptResponse?.value) ?? "") + 64;
-		const bounded = boundedJsonCopy(
-			{ ...metadata, request, initialRequest, attempts },
-			Math.max(0, maxBytes - responseBytes),
-		);
-		return {
-			...bounded.value,
-			...(keptResponse?.value ? { response: keptResponse.value } : {}),
-			...(this.captureTruncated || bounded.truncated || keptResponse?.truncated
-				? { captureTruncated: true }
-				: {}),
-		};
 	}
 }

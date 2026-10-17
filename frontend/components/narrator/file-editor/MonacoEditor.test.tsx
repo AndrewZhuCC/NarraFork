@@ -83,7 +83,18 @@ class View {
 	setModel = (model: Model) => {
 		this.model = model;
 	};
+	getModel = () => this.model;
 	getSelection = () => this.selection;
+	widgets = new Set<editor.IGlyphMarginWidget>();
+	addGlyphMarginWidget = mock((widget: editor.IGlyphMarginWidget) => {
+		this.widgets.add(widget);
+		host.appendChild(widget.getDomNode());
+	});
+	layoutGlyphMarginWidget = mock((_widget: editor.IGlyphMarginWidget) => {});
+	removeGlyphMarginWidget = mock((widget: editor.IGlyphMarginWidget) => {
+		this.widgets.delete(widget);
+		widget.getDomNode().remove();
+	});
 	setPosition = mock((p: IPosition) => {
 		this.selection = {
 			startLineNumber: p.lineNumber,
@@ -178,6 +189,7 @@ beforeEach(() => {
 		navigator: window.navigator,
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
+		Event: window.Event,
 		Node: window.Node,
 		MutationObserver: window.MutationObserver,
 		ResizeObserver: class {
@@ -221,6 +233,7 @@ beforeEach(() => {
 			setModelLanguage() {},
 			CursorChangeReason: { ContentFlush: 1, RecoverFromMarkers: 2 },
 			MouseTargetType: { CONTENT_TEXT: 6, CONTENT_EMPTY: 7, GUTTER_LINE_NUMBERS: 2 },
+			GlyphMarginLane: { Center: 2 },
 			create: (_host: HTMLElement, options: editor.IStandaloneEditorConstructionOptions) => {
 				expect(options.largeFileOptimizations).toBe(false);
 				expect(options.model).toBeNull();
@@ -554,6 +567,83 @@ test("mouse drag-select coalesces cursor events until pointer end", async () => 
 	await act(async () => view.mouseUp.emit());
 	expect(selectionChange).toHaveBeenCalledTimes(1);
 	expect(selectionChange).toHaveBeenLastCalledWith(final, true);
+});
+
+test("selection quote follows live selection and latest callbacks without commands or model rebuild", async () => {
+	const quote = mock((_selection: unknown) => {});
+	const replacement = mock((_selection: unknown) => {});
+	await render({ onQuoteSelection: quote, readOnly: true });
+	const view = views[0];
+	const selected = { startLineNumber: 1, startColumn: 2, endLineNumber: 2, endColumn: 3 };
+	const select = (selection: IRange) => {
+		view.selection = selection;
+		view.cursor.emit({ selection, reason: 3 } as editor.ICursorSelectionChangedEvent);
+	};
+	const button = () => host.querySelector<HTMLButtonElement>("[data-monaco-quote-selection]");
+	expect(button()).toBeNull();
+	select(selected);
+	expect(button()).toBeTruthy();
+	expect([...view.widgets][0].getPosition()).toMatchObject({ lane: 2, range: selected });
+	const down = new Event("mousedown", { cancelable: true, bubbles: true });
+	button()?.dispatchEvent(down);
+	expect(down.defaultPrevented).toBe(true);
+	button()?.click();
+	expect(quote).toHaveBeenLastCalledWith(selected);
+	expect(view.selection).toBe(selected);
+	await render({ onQuoteSelection: replacement, quoteSelectionDisabledReason: "Save first" });
+	expect(button()?.disabled).toBe(true);
+	expect(button()?.title).toBe("Save first");
+	button()?.dispatchEvent(new Event("click"));
+	expect(replacement).not.toHaveBeenCalled();
+	await render({ onQuoteSelection: replacement });
+	button()?.click();
+	expect(replacement).toHaveBeenLastCalledWith(selected);
+	// This must reread Monaco rather than quote the widget's previous range.
+	const current = { ...selected, endColumn: 2 };
+	view.selection = current;
+	button()?.click();
+	expect(replacement).toHaveBeenLastCalledWith(current);
+	models[0].version++;
+	button()?.click();
+	expect(replacement).toHaveBeenCalledTimes(2);
+	expect([...view.commands.keys()].sort()).toEqual([2048 | 36, 2048 | 49]);
+	expect(
+		view.updateOptions.mock.calls.every(
+			([options]) => !(options as { glyphMargin?: boolean }).glyphMargin,
+		),
+	).toBe(true);
+	expect(models).toHaveLength(1);
+	expect(models[0].setValue).not.toHaveBeenCalled();
+	select({ startLineNumber: 1, endLineNumber: 1, startColumn: 1, endColumn: 1 });
+	expect(button()).toBeNull();
+});
+
+test("selection quote clears for absent callback, owner change, reload and unmount", async () => {
+	const quote = mock((_selection: unknown) => {});
+	await render({ onQuoteSelection: quote });
+	const view = views[0];
+	const selected = { startLineNumber: 1, startColumn: 1, endLineNumber: 2, endColumn: 2 };
+	const select = () => {
+		view.selection = selected;
+		view.cursor.emit({ selection: selected, reason: 3 } as editor.ICursorSelectionChangedEvent);
+	};
+	select();
+	await render();
+	expect(view.widgets.size).toBe(0);
+	await render({ onQuoteSelection: quote });
+	expect(view.widgets.size).toBe(1);
+	await render({ onQuoteSelection: quote, filePath: "other.ts" });
+	expect(view.widgets.size).toBe(0);
+	select();
+	expect(view.widgets.size).toBe(1);
+	await act(async () => models[0].setValue("fresh bytes"));
+	expect(view.widgets.size).toBe(0);
+	select();
+	const detached = [...view.widgets][0].getDomNode().querySelector("button");
+	await render({ documentKey: "other" });
+	expect(view.widgets.size).toBe(0);
+	detached?.dispatchEvent(new Event("click"));
+	expect(quote).not.toHaveBeenCalled();
 });
 
 test("shortcuts use latest callbacks and readonly blocks toolbar history commands", async () => {

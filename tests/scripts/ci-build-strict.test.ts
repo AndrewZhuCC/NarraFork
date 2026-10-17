@@ -21,6 +21,7 @@ import {
 	writeBuildAggregates,
 } from "../../scripts/lib/ci-build-strict";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../../shared/update-identity";
 
 const dirs: string[] = [];
 function temp() {
@@ -47,6 +48,7 @@ const input = { ...identity, buildDate: "2026-10-08T00:00:00.000Z" };
 async function worker(
 	distDir: string,
 	releaseCi = true,
+	recoveryManifestVersions?: readonly number[],
 ): Promise<{ metadata: BinaryMetadata; logs: string[] }> {
 	return new Promise((resolve, reject) => {
 		const w = new Worker(join(process.cwd(), "scripts/post-process-worker.ts"), {
@@ -59,6 +61,7 @@ async function worker(
 				repository: identity.repository,
 				helperDistribution: createHelperDistributionDependencies("0.9.1"),
 				releaseCi,
+				recoveryManifestVersions,
 			},
 		});
 		const logs: string[] = [];
@@ -129,6 +132,40 @@ describe("strict CI builds fail closed without compiling or publishing", () => {
 		await expect(verifyCiSidecar(join(dist, platform.name), identity)).resolves.toEqual(
 			result.metadata,
 		);
+	});
+	test("main build explicitly declares capabilities through local and strict post-processing", async () => {
+		const source = readFileSync(join(process.cwd(), "scripts/build-cross-platform.ts"), "utf8");
+		expect(source).toContain("recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS");
+		for (const releaseCi of [false, true]) {
+			const dist = temp();
+			const binary = join(dist, platform.name);
+			writeFileSync(binary, "fixture executable");
+			const { metadata } = await worker(dist, releaseCi, CURRENT_RECOVERY_MANIFEST_VERSIONS);
+			expect(metadata.recoveryManifestVersions).toEqual([1, 2, 3]);
+			const expected = {
+				...identity,
+				recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
+			};
+			await expect(verifyCiSidecar(binary, expected)).resolves.toEqual(metadata);
+			for (const recoveryManifestVersions of [undefined, [1, 2], [3, 3], [], [256]]) {
+				expect(() =>
+					validateCiMetadata({ ...metadata, recoveryManifestVersions }, expected),
+				).toThrow();
+			}
+		}
+	});
+	test("strict generic metadata does not invent main-program capabilities for legacy or component callers", async () => {
+		const binary = join(temp(), platform.name);
+		writeFileSync(binary, "fixture executable");
+		const metadata = await computeCiBinaryMetadata(binary, input);
+		expect(Object.hasOwn(metadata, "recoveryManifestVersions")).toBe(false);
+		validateCiMetadata(metadata, identity);
+		expect(() =>
+			validateCiMetadata({ ...metadata, recoveryManifestVersions: [3, 3] }, identity),
+		).toThrow("recoveryManifestVersions");
+		await expect(
+			computeCiBinaryMetadata(binary, { ...input, recoveryManifestVersions: [0, 3] }),
+		).rejects.toThrow("recoveryManifestVersions");
 	});
 	test("APP and executor versions differ while frozen component pin remains strict", async () => {
 		const path = join(temp(), platform.name);

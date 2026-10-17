@@ -33,12 +33,24 @@ const finishRequest = mock(
 	async (_handle: ApiRequestHandle, _options: ApiRequestFinishOptions) => "composer-request",
 );
 const warn = mock((_message: string, _data?: Record<string, unknown>) => {});
+const recordingEvents: Array<Record<string, unknown>> = [];
+mock.module("@server/lib/request-recorder", () => ({
+	bindRecordingRequest: (requestId: string, apiRequestId: string) =>
+		recordingEvents.push({ requestId, apiRequestId }),
+	createRequestRecording: ({ requestId }: { requestId: string }) => ({
+		requestId,
+		pin: () => {},
+		request: (request: unknown) => recordingEvents.push({ request }),
+		responseMeta: (response: unknown) => recordingEvents.push({ response }),
+		responseChunk: (text: unknown) => recordingEvents.push({ text }),
+		frame: () => {},
+		finish: (result: unknown) => recordingEvents.push({ result }),
+	}),
+}));
 mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator: broadcast }));
 mock.module("@server/lib/api-request-tracker", () => ({
 	startApiRequest: startRequest,
 	finishApiRequest: finishRequest,
-	isRequestDumpEnabled: () => settings.agent.requestDumpEnabled === true,
-	isRequestDumpErrorsOnly: () => settings.agent.requestDumpErrorsOnly === true,
 }));
 mock.module("@server/lib/logger", () => ({ logger: { debug: () => {}, warn } }));
 
@@ -85,7 +97,7 @@ function codexSettings() {
 
 beforeEach(() => {
 	codexSettings().useComposer = true;
-	settings.agent.requestDumpEnabled = false;
+	recordingEvents.length = 0;
 	broadcast.mockClear();
 	startRequest.mockClear();
 	finishRequest.mockClear();
@@ -273,9 +285,7 @@ describe("server Composer state", () => {
 		expect(run).toHaveBeenCalledTimes(2);
 	});
 
-	test("host validation failures retain consumed usage and error-only dumps without unsafe logs", async () => {
-		settings.agent.requestDumpEnabled = true;
-		settings.agent.requestDumpErrorsOnly = true;
+	test("host validation failures retain usage and recorder evidence without unsafe logs", async () => {
 		const invalidText = '{"suggestion":"wrong","extra":true}';
 		const run = mock(async ({ requestDump }: CodexComposerRunOptions) => {
 			requestDump?.setRequest({
@@ -283,7 +293,7 @@ describe("server Composer state", () => {
 				url: "https://composer.test.invalid",
 				body: { input: [] },
 			});
-			requestDump?.setResponseBodyText(invalidText);
+			requestDump?.appendResponseText(invalidText);
 			return {
 				text: invalidText,
 				usage: { inputTokens: 100, cachedInputTokens: 99, outputTokens: 3 },
@@ -297,15 +307,25 @@ describe("server Composer state", () => {
 		expect(recorded?.usage).toEqual({ inputTokens: 100, cachedInputTokens: 99, outputTokens: 3 });
 		expect(recorded?.credentialId).toBe("ordinary-account");
 		expect(recorded?.errorMessage).toBe("Invalid Composer suggestion object");
-		expect(recorded?.rawDump).toMatchObject({
-			response: { bodyText: invalidText, error: "Invalid Composer suggestion object" },
+		expect(recordingEvents).toContainEqual({ text: invalidText });
+		expect(recordingEvents).toContainEqual({
+			response: expect.objectContaining({ error: "Invalid Composer suggestion object" }),
 		});
+		expect(recordingEvents).toContainEqual({
+			result: { status: "error", error: "Invalid Composer suggestion object" },
+		});
+		expect(recorded?.diagnostics).toMatchObject({
+			schema: "narrafork.error-diagnostics.v1",
+			recordingRequestId: expect.any(String),
+		});
+		expect(recorded).not.toHaveProperty("rawDump");
 		expect(getComposerSuggestion("invalid")).toEqual({ suggestion: null });
 		expect(JSON.stringify(warn.mock.calls)).not.toContain(invalidText);
 		const valid = mock(async () => answer());
 		startComposerPrediction("valid", prepare("valid", seed(valid)));
 		await settle();
-		expect(finishRequest.mock.calls.at(-1)?.[1].rawDump).toBeUndefined();
+		expect(finishRequest.mock.calls.at(-1)?.[1].diagnostics).toBeUndefined();
+		expect(recordingEvents).toContainEqual({ result: { status: "completed", error: undefined } });
 	});
 
 	test("the 90s deadline aborts the original signal and prevents late publication", async () => {

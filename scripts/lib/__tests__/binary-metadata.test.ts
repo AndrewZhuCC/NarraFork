@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createHelperDistributionDependencies } from "../../../shared/helper-distribution";
+import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../../../shared/update-identity";
 import {
 	type BinaryMetadata,
 	computeBinaryMetadataFromBuffer,
@@ -43,8 +44,8 @@ describe("computeBinaryMetadataFromBuffer", () => {
 			);
 			expect(meta.version).toBe(version);
 			expect(JSON.parse(formatMetadataJson(meta)).helperDistribution).toEqual(helperDistribution);
-			expect(meta.helperDistribution?.executor.version).toBe("0.9.1");
-			expect(meta.helperDistribution?.executor.tag).toBe("executor-v0.9.1");
+			expect(meta.helperDistribution?.executor.version).toBe("0.9.3");
+			expect(meta.helperDistribution?.executor.tag).toBe("executor-v0.9.3");
 		}
 	});
 
@@ -61,6 +62,38 @@ describe("computeBinaryMetadataFromBuffer", () => {
 				},
 			}),
 		).toThrow();
+	});
+
+	test("only explicit main-program declarations serialize recovery capabilities", () => {
+		const helperDistribution = createHelperDistributionDependencies();
+		const meta = computeBinaryMetadataFromBuffer("main", Buffer.from("binary"), {
+			...INPUT,
+			helperDistribution,
+			recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
+		});
+		expect(JSON.parse(formatMetadataJson(meta)).recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(meta.helperDistribution).toEqual(helperDistribution);
+		for (const name of ["legacy-main", "narrafork-executor", "helper"]) {
+			const legacy = computeBinaryMetadataFromBuffer(name, Buffer.from("binary"), INPUT);
+			expect(
+				Object.hasOwn(JSON.parse(formatMetadataJson(legacy)), "recoveryManifestVersions"),
+			).toBe(false);
+		}
+		for (const versions of [[], [1, 2, 3, 3], [0], [256], [1.5]]) {
+			expect(() =>
+				computeBinaryMetadataFromBuffer("bad", Buffer.from("binary"), {
+					...INPUT,
+					recoveryManifestVersions: versions,
+				}),
+			).toThrow("recoveryManifestVersions");
+			expect(() => formatMetadataJson({ ...meta, recoveryManifestVersions: versions })).toThrow(
+				"recoveryManifestVersions",
+			);
+		}
+		expect(
+			JSON.parse(formatMetadataJson({ ...meta, recoveryManifestVersions: [3, 1, 2] }))
+				.recoveryManifestVersions,
+		).toEqual([1, 2, 3]);
 	});
 
 	test("sha256 is lowercase 64-char hex", () => {

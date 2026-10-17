@@ -2,11 +2,7 @@
 // in databases not yet migrated to the new status+substatus model.
 export const STALE_SESSION_STATUSES = new Set(["idle", "done", "error", "interrupted"]);
 
-export type DatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"
@@ -53,9 +49,7 @@ export interface CleanupPlanBlockedRoot {
 	blockingStatus: string;
 }
 
-type NarratorCleanupTarget =
-	| Exclude<DatabaseCleanupTarget, "apiRequestDumps">
-	| "scheduledSessions";
+type NarratorCleanupTarget = DatabaseCleanupTarget | "scheduledSessions";
 
 export interface BuildNarratorCleanupPlanOptions {
 	staleCutoffIso?: string;

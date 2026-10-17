@@ -18,6 +18,11 @@ import { safeSpawn } from "../../../server/lib/spawn";
 import type { ResourceMigrationSnapshot } from "../../finalize-sqlite-resource-migration";
 import { generateSqliteMigrations } from "../../generate-sqlite-migrations";
 import {
+	CONTEXT_STATS_MIGRATION_CONTRACT,
+	CONTEXT_STATS_MIGRATION_SQL,
+	generatedContextStatsMigrationSuffix,
+} from "../generated-context-stats-migration";
+import {
 	generatedModelHistoryTriggerSuffix,
 	MODEL_HISTORY_REVISION_CONTRACT,
 	renderModelHistoryRevisionSql,
@@ -209,6 +214,90 @@ test("revision schema and exact trigger suffix share one receipt-bound migration
 	await generateSqliteMigrations([], { root, runGenerate: async () => ok });
 	expect(raw(root)).toBe(finalized);
 	expect(readFileSync(join(root, "drizzle/0188_fixture.sql"), "utf8")).toBe(originalBaseline);
+});
+
+test("context stats backfill and triggers are receipt-bound, restartable and installed only once", async () => {
+	const root = fixture();
+	const before = structuredClone(previous);
+	before.tables.narrator_messages = {
+		columns: {
+			id: { name: "id", type: "text", primaryKey: true, notNull: true },
+			role: { name: "role", type: "text", notNull: true },
+			parent_tool_use_id: { name: "parent_tool_use_id", type: "text" },
+			context_chars_json: { name: "context_chars_json", type: "text" },
+		},
+		foreignKeys: {},
+	};
+	const after = structuredClone(before);
+	after.tables.narrator_message_context_stats = {
+		columns: {
+			message_id: { name: "message_id", type: "text", primaryKey: true, notNull: true },
+			role: { name: "role", type: "text", notNull: true },
+			parent_tool_use_id: { name: "parent_tool_use_id", type: "text" },
+			segments_json: { name: "segments_json", type: "text", notNull: true },
+		},
+		foreignKeys: {
+			stats_message: {
+				columnsFrom: ["message_id"],
+				tableTo: "narrator_messages",
+				columnsTo: ["id"],
+				onDelete: "cascade",
+				onUpdate: "no action",
+			},
+		},
+	};
+	for (const idx of [187, 188])
+		writeFileSync(join(root, `drizzle/meta/0${idx}_snapshot.json`), JSON.stringify(before));
+	const source = `CREATE TABLE narrator_message_context_stats (
+		message_id text PRIMARY KEY NOT NULL,
+		role text NOT NULL,
+		parent_tool_use_id text,
+		segments_json text NOT NULL,
+		FOREIGN KEY (message_id) REFERENCES narrator_messages(id) ON UPDATE no action ON DELETE cascade
+	);`;
+	await expect(
+		generateSqliteMigrations([], {
+			root,
+			runGenerate: async () => {
+				emit(root, source);
+				writeFileSync(join(root, "drizzle/meta/0189_snapshot.json"), JSON.stringify(after));
+				return ok;
+			},
+			beforeCommit: () => {
+				throw new Error("context stats publication interrupted");
+			},
+		}),
+	).rejects.toThrow("publication interrupted");
+	const provenance = pending(root);
+	expect(provenance.phase).toBe("validated");
+	expect(provenance.contextStatsMigration).toEqual({
+		contract: CONTEXT_STATS_MIGRATION_CONTRACT,
+		sqlDigest: digest(CONTEXT_STATS_MIGRATION_SQL),
+	});
+	expect(raw(root)).toBe(source);
+	const tampered = structuredClone(provenance);
+	tampered.contextStatsMigration.sqlDigest = "0".repeat(64);
+	writeFileSync(join(root, "drizzle/meta/_generation_pending.json"), JSON.stringify(tampered));
+	await expect(generateSqliteMigrations([], { root })).rejects.toThrow("source/arguments changed");
+	writeFileSync(join(root, "drizzle/meta/_generation_pending.json"), JSON.stringify(provenance));
+	await generateSqliteMigrations([], { root });
+	const finalized = raw(root);
+	expect(finalized.endsWith(generatedContextStatsMigrationSuffix(before, after))).toBe(true);
+	expect(generatedContextStatsMigrationSuffix(after, after)).toBe("");
+	const receipt = JSON.parse(
+		readFileSync(join(root, "drizzle/meta/_generation_validated.json"), "utf8"),
+	);
+	expect(receipt.contextStatsMigration).toEqual(provenance.contextStatsMigration);
+	expect(receipt.sqlDigest).toBe(digest(finalized));
+	await generateSqliteMigrations([], { root, runGenerate: async () => ok });
+	expect(raw(root)).toBe(finalized);
+	writeFileSync(
+		join(root, "drizzle/0189_fixture.sql"),
+		finalized.replace("WHERE true", "WHERE false"),
+	);
+	await expect(generateSqliteMigrations([], { root, runGenerate: async () => ok })).rejects.toThrow(
+		"noncanonical generated context-stats",
+	);
 });
 
 test("canonical generation finalizes a new receipt-bound batch, is idempotent and preserves memory SQLite rename values", async () => {

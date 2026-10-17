@@ -511,7 +511,7 @@ describe("providers report their final logical inputs", () => {
 			compositionSegments: [
 				{ category: "system", chars: systemChars },
 				{ category: "user", chars: "history".length },
-				{ category: "assistant", chars: "thought".length },
+				{ category: "reasoning", chars: "thought".length },
 				{ category: "toolCall", chars: JSON.stringify({ name: "Read", arguments: args }).length },
 				{ category: "assistant", chars: "reply".length },
 				{ category: "toolResult", chars: "result".length },

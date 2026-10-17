@@ -40,6 +40,12 @@ export const DEFAULTS: NarraForkSettings = {
 		packMaxUncompressedMb: 500,
 		packActivateRequiresPermission: true,
 	},
+	requestEvidence: {
+		ringEnabled: true,
+		ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
+		ringResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
+		autoPin: "off",
+	},
 	plugins: {
 		enabled: true,
 	},
@@ -83,17 +89,7 @@ export const DEFAULTS: NarraForkSettings = {
 		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
-		requestDumpRecordingEnabled: true,
-		requestDumpRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
-		requestDumpResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
 		cacheDropDumpEnabled: false,
-		// 32MB. Enabling dumping is an explicit, warned, high-risk opt-in made to capture
-		// a specific failure, so the ceiling must be high enough that a real request —
-		// full conversation history, replayed tool output, inline images — survives intact.
-		// The old 1MB default silently truncated almost every request worth dumping.
-		requestDumpMaxSize: 32 * 1024 * 1024,
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
@@ -410,6 +406,22 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
+	"requestEvidence.ringEnabled": {
+		desc: "循环录制近期模型/API 请求与响应（请求证据），默认开启。使用 /save_dump 或报错卡片、使用历史固定证据，不打断会话。设置立即生效。",
+		type: "boolean",
+	},
+	"requestEvidence.ringRequestBytes": {
+		desc: "循环窗口请求侧容量（字节），默认 16MiB，范围 0 或 1KiB..512MiB。0 关闭该侧循环录制，不影响 autoPin=all。",
+		type: "number",
+	},
+	"requestEvidence.ringResponseBytes": {
+		desc: "循环窗口响应侧容量（字节），默认 128MiB，范围 0 或 1KiB..2GiB。0 关闭该侧循环录制，不影响 autoPin=all。",
+		type: "number",
+	},
+	"requestEvidence.autoPin": {
+		desc: '自动固定策略："off" 只在手动保存时固定；"errors" 请求报错结束时自动固定；"all" 每个请求从开始就固定（不受循环容量限制，可能占用大量磁盘）。单份固定保存有 512MiB 安全上限。',
+		type: '"off" | "errors" | "all"',
+	},
 	"plugins.enabled": {
 		desc: "是否启用插件子系统（默认启用）。环境变量 NF_PLUGINS_ENABLED / NARRAFORK_PLUGINS_ENABLED 若设置则优先，可作为应急关闭开关。",
 		type: "boolean",
@@ -601,33 +613,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "启用后 Bash 工具通过 login shell 加载最新环境变量，而非继承服务器进程环境。适用于服务器启动后修改了 shell 配置的场景。",
 		type: "boolean",
 	},
-	"agent.requestDumpRecordingEnabled": {
-		desc: "循环录制近期模型/API 请求与响应，默认开启。使用 /save_dump 保存当前证据，不打断会话。设置立即生效。",
-		type: "boolean",
-	},
-	"agent.requestDumpRequestBytes": {
-		desc: "循环录制请求侧容量（字节），默认 16MiB，范围 0 或 1KiB..512MiB。0 关闭该侧循环录制，不限制强制持续保留。",
-		type: "number",
-	},
-	"agent.requestDumpResponseBytes": {
-		desc: "循环录制响应侧容量（字节），默认 128MiB，范围 0 或 1KiB..2GiB。0 关闭该侧循环录制，不限制强制持续保留。",
-		type: "number",
-	},
-	"agent.requestDumpEnabled": {
-		desc: "强制持续保留模型/API 请求与响应 dump，不受循环容量限制。单份持续录制和保存包各有 512MiB 安全上限，超限截断证据，不影响业务请求。保存后即时生效，无需重启叙述者。",
-		type: "boolean",
-	},
-	"agent.requestDumpErrorsOnly": {
-		desc: "强制持续保留开启时，仅持久保留报错请求。不会过滤循环录制中的成功请求。保存后即时生效。",
-		type: "boolean",
-	},
 	"agent.cacheDropDumpEnabled": {
-		desc: "缓存骤降诊断：按叙述者滚动保留最近 3 次请求样本，骤降时保留前后样本，独立于全量 dump。包含对话正文，应按敏感数据保管。路径 ~/.narrafork/request-dumps/cache-diagnostics/，全局上限 256 MiB，保留 7 天。关闭后停止捕获并清理正常滚动样本，异常样本保留到过期或空间淘汰。默认关闭。",
+		desc: "缓存骤降时保留关联请求证据与诊断元数据，使用统一请求录制存储，不额外写入 JSON dump。包含敏感会话内容，默认关闭。",
 		type: "boolean",
-	},
-	"agent.requestDumpMaxSize": {
-		desc: "单条 raw dump 落库的最大字节数。默认 32MB (33554432)。设为 -1 表示不限制。超出时优先丢弃 SSE 事件、再按剩余预算截断请求/响应体，并标记 bodyTextTruncated，不会整包丢弃请求体。",
-		type: "number",
 	},
 	"agent.modelContextWindows": {
 		desc: '按模型覆盖上下文窗口大小（tokens）。键为完整模型值 "provider:modelId"，值为 token 数。优先级最高。',

@@ -18,8 +18,11 @@ export interface WorktreeResourceRegistration {
 	scope?: VerifiedWorktreeScope;
 }
 export interface WorktreeResourceRegistry {
-	register(resource: WorktreeResourceRegistration): Promise<void>;
+	// biome-ignore lint/suspicious/noConfusingVoidType: Legacy registries return Promise<void>, not Promise<undefined>.
+	register(resource: WorktreeResourceRegistration): Promise<void | { inserted: boolean }>;
 	setState(resource: WorktreeResourceRegistration, state: "ready" | "unknown"): Promise<void>;
+	/** Only the fresh creator with this call's inserted:true evidence, before Git dispatch. No disk cleanup. */
+	releaseUndispatched?(resource: WorktreeResourceRegistration): Promise<void>;
 }
 export const unknownWorktreeScope: VerifiedWorktreeScope = Object.freeze({
 	scopeKind: "unknown",
@@ -45,7 +48,7 @@ export function validateVerifiedWorktreeScope(scope: VerifiedWorktreeScope): voi
 		);
 }
 
-type StoreDb = Pick<typeof import("../db").db, "insert" | "select" | "update">;
+type StoreDb = Pick<typeof import("../db").db, "insert" | "select" | "update" | "delete">;
 export type WorktreeResourceAdmission = <T>(
 	resource: Pick<WorktreeResourceRegistration, "deviceId" | "repositoryKey" | "worktreePath"> & {
 		scopeProjectId?: string | null;
@@ -58,13 +61,13 @@ export function createWorktreeResourceRegistry(
 	admission: WorktreeResourceAdmission,
 ) {
 	return {
-		async register(resource: WorktreeResourceRegistration): Promise<void> {
+		async register(resource: WorktreeResourceRegistration): Promise<{ inserted: boolean }> {
 			const { scope = unknownWorktreeScope, ...identity } = resource;
 			validateVerifiedWorktreeScope(scope);
-			await admission({ ...resource, scopeProjectId: scope.scopeProjectId }, async () => {
+			return admission({ ...resource, scopeProjectId: scope.scopeProjectId }, async () => {
 				const id = worktreeResourceId(resource.deviceId, resource.worktreePath);
 				const now = new Date().toISOString();
-				await database
+				const inserted = await database
 					.insert(narratorWorktreeResources)
 					.values({
 						id,
@@ -74,7 +77,8 @@ export function createWorktreeResourceRegistry(
 						createdAt: now,
 						updatedAt: now,
 					})
-					.onConflictDoNothing();
+					.onConflictDoNothing()
+					.returning({ id: narratorWorktreeResources.id });
 				const existing = database
 					.select({
 						repositoryKey: narratorWorktreeResources.repositoryKey,
@@ -95,6 +99,7 @@ export function createWorktreeResourceRegistry(
 						409,
 						"WORKTREE_RESOURCE_CONFLICT",
 					);
+				return { inserted: inserted.length === 1 };
 			});
 		},
 		async setState(
@@ -111,6 +116,27 @@ export function createWorktreeResourceRegistry(
 							worktreeResourceId(resource.deviceId, resource.worktreePath),
 						),
 						eq(narratorWorktreeResources.createRequestId, resource.createRequestId),
+					),
+				);
+		},
+		async releaseUndispatched(resource: WorktreeResourceRegistration): Promise<void> {
+			// This only retracts this creator's untouched preparing metadata. Scope transfers,
+			// ready/unknown results and another owner/request must remain durable claims.
+			await database
+				.delete(narratorWorktreeResources)
+				.where(
+					and(
+						eq(
+							narratorWorktreeResources.id,
+							worktreeResourceId(resource.deviceId, resource.worktreePath),
+						),
+						eq(narratorWorktreeResources.deviceId, resource.deviceId),
+						eq(narratorWorktreeResources.worktreePath, resource.worktreePath),
+						eq(narratorWorktreeResources.repositoryKey, resource.repositoryKey),
+						eq(narratorWorktreeResources.ownerNarratorId, resource.ownerNarratorId),
+						eq(narratorWorktreeResources.createRequestId, resource.createRequestId),
+						eq(narratorWorktreeResources.state, "preparing"),
+						eq(narratorWorktreeResources.ownershipRevision, 0),
 					),
 				);
 		},

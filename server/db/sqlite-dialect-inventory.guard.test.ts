@@ -506,12 +506,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	// The injected occupancy source currently uses the SQLite builder; the maintained
+	// graph is backend-neutral, so this is not a permanently SQLite-only module.
+	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
-	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "json1", "vacuum"],
+	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
@@ -557,8 +560,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/export-rows.ts": ["driver"],
 	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
-	// Explicit SQLite branch of the dual-backend, off-thread historical accounting store.
-	"server/services/usage-token-repair-store.ts": ["driver", "pragma", "indexHint"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
 	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
@@ -629,7 +630,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/context-composition-history.ts": ["driver"],
 	"server/services/file-change-diagnostics.ts": ["errorCode"],
 	"server/services/local-session-detach/store.ts": ["driver"],
-	"server/services/narrator-context-composition.ts": ["driver", "handle", "json1"],
+	"server/services/narrator-context-composition.ts": ["driver", "handle"],
 	"server/services/narrator-permission.ts": ["json1"],
 	"server/services/narrator-question-history.ts": [
 		"driver",

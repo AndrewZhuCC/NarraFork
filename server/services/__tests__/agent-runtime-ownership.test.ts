@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	backgroundTasks,
 	fileChangeExecutionSegments,
 	narratorMessageRefs,
 	narratorMessages,
@@ -27,7 +28,9 @@ const { activateSqliteRuntimePublication } = await import("../agent-runtime/publ
 activateSqliteRuntimePublication(db);
 // Context now imports publication services; load it only after binding the isolated DB.
 const { createRuntimeEventContext } = await import("../agent-runtime/context");
-const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
+const { createRuntimeMapView, getExecutionOwner, setExecutionSuspended, tryClaimExecution } =
+	await import("../agent-runtime/ownership");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const sessionModule = await import("../narrator-session");
 const { runAgentLoop } = sessionModule;
 const executorModule = await import("../subagent-executor");
@@ -1033,6 +1036,135 @@ describe("runner owns the entire finalization and publication", () => {
 });
 
 describe("epoch CAS and legacy projections", () => {
+	test("occupancy liveness keeps the remaining session or execution owner live", () => {
+		const publish = spyOn(backgroundOccupancyStore, "setRuntimeLive").mockImplementation(() => {});
+		const first = tryClaimExecution(CHILD, "subagent");
+		if (!first) throw new Error("expected owner");
+		expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+		state.activeNarrators.set(CHILD, active(CHILD));
+		first.release();
+		expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+		state.activeNarrators.delete(CHILD);
+		expect(publish).toHaveBeenLastCalledWith(CHILD, false);
+
+		const second = tryClaimExecution(CHILD, "subagent");
+		if (!second) throw new Error("expected second owner");
+		state.activeNarrators.set(CHILD, active(CHILD));
+		state.activeNarrators.delete(CHILD);
+		expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+		expect(first.release()).toBe(false);
+		expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+		second.release();
+		expect(publish).toHaveBeenLastCalledWith(CHILD, false);
+	});
+
+	test("occupancy liveness follows tool-replay views, including clear", () => {
+		const publish = spyOn(backgroundOccupancyStore, "setRuntimeLive").mockImplementation(() => {});
+		const replay = createRuntimeMapView("toolReplayCompletion");
+		replay.set(CHILD, Promise.resolve());
+		expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+		replay.clear();
+		expect(publish).toHaveBeenLastCalledWith(CHILD, false);
+	});
+
+	test("occupancy suspension preserves session presence and resumes the same owner", async () => {
+		const publish = spyOn(backgroundOccupancyStore, "setRuntimeLive").mockImplementation(() => {});
+		const manual = await import("../subagent-manual-override");
+		const owner = tryClaimExecution(CHILD, "subagent");
+		if (!owner) throw new Error("expected owner");
+		const signal = new AbortController();
+		const waiting = manual.waitForManualOverride(CHILD, signal.signal, ROOT, "occupancy-control");
+		try {
+			setExecutionSuspended(owner, true);
+			expect(publish).toHaveBeenLastCalledWith(CHILD, false);
+			state.activeNarrators.set(CHILD, active(CHILD));
+			expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+			state.activeNarrators.clear();
+			expect(publish).toHaveBeenLastCalledWith(CHILD, false);
+			setExecutionSuspended(owner, false);
+			expect(publish).toHaveBeenLastCalledWith(CHILD, true);
+		} finally {
+			signal.abort();
+			await waiting;
+			owner.release();
+		}
+	});
+
+	test("status and substatus refresh occupancy after persistence, but rejected CAS does not", async () => {
+		const observed: { status: string; substatus: string }[] = [];
+		const refresh = spyOn(backgroundOccupancyStore, "refreshNarrator").mockImplementation((id) => {
+			const row = db
+				.select({ status: narrators.status, substatus: narrators.substatus })
+				.from(narrators)
+				.where(eq(narrators.id, id))
+				.get();
+			if (!row) throw new Error("refresh must observe a committed narrator");
+			observed.push(row);
+		});
+		await narratorService.updateStatus(CHILD, "working");
+		expect(observed.at(-1)?.status).toBe("working");
+		refresh.mockClear();
+		expect(await narratorService.compareAndSetStatus(CHILD, "idle", "waiting")).toBe(false);
+		expect(refresh).not.toHaveBeenCalled();
+		expect(await narratorService.compareAndSetStatus(CHILD, "working", "idle")).toBe(true);
+		expect(observed.at(-1)?.status).toBe("idle");
+		await narratorService.addSubstatus(CHILD, "taken_over");
+		expect(JSON.parse(observed.at(-1)?.substatus ?? "[]")).toContain("taken_over");
+		await narratorService.removeSubstatus(CHILD, "taken_over");
+		expect(JSON.parse(observed.at(-1)?.substatus ?? "[]")).not.toContain("taken_over");
+	});
+
+	test("narrator removal refreshes surviving forks only after detach and task cascade commit", async () => {
+		db.update(narrators)
+			.set({ type: "primary", variant: "primary" })
+			.where(eq(narrators.id, SIBLING))
+			.run();
+		const now = new Date().toISOString();
+		db.insert(backgroundTasks)
+			.values({
+				id: "occupancy-cascaded-task",
+				parentNarratorId: ROOT,
+				subagentNarratorId: CHILD,
+				type: "agent",
+				status: "running",
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		const remove = backgroundOccupancyStore.removeNarrators.bind(backgroundOccupancyStore);
+		const refresh = backgroundOccupancyStore.refreshNarrators.bind(backgroundOccupancyStore);
+		const removals = spyOn(backgroundOccupancyStore, "removeNarrators").mockImplementation(
+			(ids) => {
+				for (const id of ids) {
+					expect(
+						db.select({ id: narrators.id }).from(narrators).where(eq(narrators.id, id)).get(),
+					).toBeUndefined();
+				}
+				expect(db.select({ id: backgroundTasks.id }).from(backgroundTasks).get()).toBeUndefined();
+				remove(ids);
+			},
+		);
+		const refreshes = spyOn(backgroundOccupancyStore, "refreshNarrators").mockImplementation(
+			(ids) => {
+				if (ids.includes(SIBLING)) {
+					expect(
+						db
+							.select({ parent: narrators.parentNarratorId })
+							.from(narrators)
+							.where(eq(narrators.id, SIBLING))
+							.get()?.parent,
+					).toBeNull();
+				}
+				refresh(ids);
+			},
+		);
+		await narratorService.remove(ROOT);
+		expect(removals).toHaveBeenCalledWith([CHILD]);
+		expect(removals).toHaveBeenCalledWith([ROOT]);
+		expect(refreshes).toHaveBeenCalledWith([SIBLING]);
+	});
+
 	test("old releases cannot clear a new owner or its session/settings view", () => {
 		const old = tryClaimExecution(CHILD, "subagent");
 		if (!old) throw new Error("expected old owner");

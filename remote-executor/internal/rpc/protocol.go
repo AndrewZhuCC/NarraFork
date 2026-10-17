@@ -56,6 +56,9 @@ const FeatureGitWorkspaceWatchV1 = "git.workspace.watch.v1"
 // and early termination at the byte budget or 10000 complete logical records.
 const FeatureGitWorkspaceStatusV1 = "git.workspace.status.v1"
 
+// FeatureGitLineStatsV1 adds the independent, bounded lineStats read operation.
+const FeatureGitLineStatsV1 = "git.workspace.line-stats.v1"
+
 // FeatureGitCommitPreviewV1 adds read-only git.workspace operations commitDetail
 // and commitDiff. They read only the object database, never the working tree.
 // Preview maxBytes includes metadata and JSON escaping. CommitDiff reports
@@ -131,6 +134,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
 		FeatureGitWorkspaceStatusV1,
+		FeatureGitLineStatsV1,
 		FeatureGitCommitPreviewV1,
 	} {
 		seen := false

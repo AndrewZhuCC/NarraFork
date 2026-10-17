@@ -21,9 +21,9 @@ function SettingsAgentPage() {
 	const hash = useRouterState({ select: (s) => s.location.hash });
 
 	useEffect(() => {
-		if (hash !== "request-dump-enabled") return;
+		if (hash !== "request-evidence") return;
 		requestAnimationFrame(() => {
-			document.getElementById("request-dump-enabled")?.scrollIntoView({
+			document.getElementById("request-evidence")?.scrollIntoView({
 				behavior: "smooth",
 				block: "center",
 			});
@@ -47,18 +47,16 @@ function SettingsAgentPage() {
 				setFreshShellEnv={is.setFreshShellEnv}
 				translateReasoning={is.translateReasoning}
 				setTranslateReasoning={is.setTranslateReasoning}
-				requestDumpRecordingEnabled={is.requestDumpRecordingEnabled}
-				setRequestDumpRecordingEnabled={is.setRequestDumpRecordingEnabled}
-				requestDumpRequestBytes={is.requestDumpRequestBytes}
-				setRequestDumpRequestBytes={is.setRequestDumpRequestBytes}
-				requestDumpResponseBytes={is.requestDumpResponseBytes}
-				setRequestDumpResponseBytes={is.setRequestDumpResponseBytes}
-				requestDumpEnabled={is.requestDumpEnabled}
-				setRequestDumpEnabled={is.setRequestDumpEnabled}
-				requestDumpErrorsOnly={is.requestDumpErrorsOnly}
-				setRequestDumpErrorsOnly={is.setRequestDumpErrorsOnly}
 				cacheDropDumpEnabled={is.cacheDropDumpEnabled}
 				setCacheDropDumpEnabled={is.setCacheDropDumpEnabled}
+				ringEnabled={is.ringEnabled}
+				setRingEnabled={is.setRingEnabled}
+				ringRequestBytes={is.ringRequestBytes}
+				setRingRequestBytes={is.setRingRequestBytes}
+				ringResponseBytes={is.ringResponseBytes}
+				setRingResponseBytes={is.setRingResponseBytes}
+				autoPin={is.autoPin}
+				setAutoPin={is.setAutoPin}
 				defaultNarratorVisibility={is.defaultNarratorVisibility}
 				setDefaultNarratorVisibility={is.setDefaultNarratorVisibility}
 				defaultNarratorWriteAudience={is.defaultNarratorWriteAudience}

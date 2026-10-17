@@ -34,6 +34,7 @@ import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
+import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
@@ -92,6 +93,10 @@ import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
 
+import {
+	backgroundOccupancyInitializer,
+	withBackgroundOccupancyInitialization,
+} from "./services/background-occupancy-startup";
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import {
@@ -101,6 +106,7 @@ import {
 } from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
 import {
+	failUnownedStartupRecovery,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
@@ -132,6 +138,7 @@ import {
 	type VerifiedPublicShare,
 	verifyPublicShare,
 } from "./services/public-narrator-share-service";
+import { beginRecoveryDiscovery, finishRecoveryDiscovery } from "./services/recovery-handoff";
 import {
 	automaticResumeEnabled,
 	mergeStartupProtection,
@@ -157,6 +164,10 @@ import {
 	waitForWebSocketActivityDrain,
 	wsHandlers,
 } from "./websocket/ws-handler";
+
+// Startup ownership must be classified before a new shutdown/update may allocate
+// an epoch. This is separate from long-running recovery terminal completion.
+beginRecoveryDiscovery();
 
 // Builtin/compatible-API providers are resolved first. Only an unregistered plugin
 // prefix may decline here; preserve registered providers' actual failure reasons.
@@ -1380,7 +1391,13 @@ async function openAsApp(url: string) {
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
 	const proto = getProtocol();
-	const url = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	const listenUrl = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
+	// (7779); the banner and the browser open must send the user to the frontend.
+	const url = resolveAdvertisedAppUrl({
+		listenUrl,
+		devAppUrl: process.env.NARRAFORK_DEV_APP_URL,
+	});
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
@@ -1505,20 +1522,48 @@ function startQuestionAnswerRecovery(): void {
 	});
 }
 
+// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
+// never compensate by scanning every narrator or interrupting another queue's live owner.
+const startupRecoveryNarratorIds = new Set<string>();
+const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
+	for (const id of ids) startupRecoveryNarratorIds.add(id);
+};
+
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
 // the background after that queue is mounted.
-getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled() })
-	.then(async (plannedUpdate) => {
+withBackgroundOccupancyInitialization(
+	async () => {
+		const plannedUpdate = await getPlannedUpdateStartupProtection({
+			claimAuthorization: automaticResumeEnabled(),
+			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+		});
+		for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+		for (const target of plannedUpdate.snapshot?.narrators ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		for (const source of plannedUpdate.snapshot?.sources ?? [])
+			for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
 		// The instance lock is already held. Release only previous-process mailbox claims
 		// before planned recovery mounts owners; hot reload preserves the process marker.
 		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
 			recoverInboxClaimsOnColdStartup(),
 		);
-		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection);
+		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
+			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+		});
+		for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+		for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		for (const target of ordinaryRestart.manifest?.targets ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
 		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
 		await recoverNarrators(protection);
+		return { plannedUpdate, ordinaryRestart };
+	},
+	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
+)
+	.then(async ({ plannedUpdate, ordinaryRestart }) => {
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation
 		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
@@ -1529,6 +1574,9 @@ getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled()
 					error: err instanceof Error ? err.message : String(err),
 				});
 			});
+		// All sources are now registered. New preparation can reserve them without
+		// waiting for an Agent, Await, or human approval to finish (or even mount).
+		finishRecoveryDiscovery();
 		const recoveryHandles = automaticResumeEnabled()
 			? await Promise.all([
 					restoreNarratorsAfterPlannedUpdate(plannedUpdate),
@@ -1546,20 +1594,22 @@ getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled()
 					startQuestionAnswerRecovery();
 					logger.info("Planned-update background continuation recovery completed");
 				})
-				.catch((err) => {
+				.catch(async (err) => {
 					const error = err instanceof Error ? err.message : String(err);
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
+					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
 				});
 		} else {
 			startQuestionAnswerRecovery();
 		}
 	})
-	.catch((err) => {
+	.catch(async (err) => {
 		const error = err instanceof Error ? err.message : String(err);
 		startupReadiness.markFailed(error);
 		logger.error("Narrator state recovery failed", { error });
 		startupReadiness.settle({ ok: false, error });
+		await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
 		// A recovery failure caused by an unusable provider is almost always a persisted
 		// narrator pointing at a prefix the user has since removed. Surface which narrators
 		// are affected instead of leaving the reason buried in this log line.
@@ -1614,6 +1664,11 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Request dumps and token repair data from before request evidence unification are discarded.
+import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
+
+void removeLegacyRequestDumpDirs();
+
 // Clean up leftover pack extraction directories from previous server runs and mark any
 // still-"active" pack activations as released (their temp dirs don't survive a restart).
 import { packActivationService } from "./services/knowledge-pack-activation-service";
@@ -1625,7 +1680,7 @@ import { startSkillCacheCleanupTimer } from "./services/skill-service";
 
 startSkillCacheCleanupTimer();
 
-// Cache incident retention remains bounded even while capture is switched off.
+// Clear expired cache-drop comparison metadata; request evidence stays in the recorder.
 import { startCacheDropMaintenance } from "./lib/cache-drop-diagnostics";
 
 startCacheDropMaintenance();
@@ -1805,6 +1860,7 @@ async function performGracefulShutdown(
 
 	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
+		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
 		// Track every teardown step's outcome. The clean-shutdown marker is a promise that the DB

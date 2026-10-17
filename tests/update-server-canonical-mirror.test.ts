@@ -452,10 +452,12 @@ for (const budget of [
 				const asset = current.snapshot.assets.find((entry) => entry.kind === "patch");
 				if (!asset) throw new Error("Expected canonical patch");
 				const original = ctx.storage.saveVerifiedFile.bind(ctx.storage);
-				const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
-					(path, stream, options) =>
+				// Accelerate only the intentionally stalled upload, not the healthy retry's disk IO.
+				const saving = spyOn(ctx.storage, "saveVerifiedFile")
+					.mockImplementation(original)
+					.mockImplementationOnce((path, stream, options) =>
 						original(path, stream, { ...options, timeoutMs: options.timeoutMs / 1000 }),
-				);
+					);
 				try {
 					let cancelled = false;
 					const response = await ctx.app.request(
@@ -488,7 +490,11 @@ for (const budget of [
 						headers: headers(ctx.token, asset),
 						body: Uint8Array.from(current.bytes.get(asset.name) as Buffer),
 					});
-					expect(retry.status).toBe(200);
+					expect(saving.mock.calls[1]?.[2].timeoutMs).toBe(budget.selected);
+					expect(retry.status, await retry.text()).toBe(200);
+					expect(await ctx.storage.getFile(`mirror-objects/${asset.sha256}`)).toEqual(
+						current.bytes.get(asset.name) as Buffer,
+					);
 				} finally {
 					saving.mockRestore();
 				}

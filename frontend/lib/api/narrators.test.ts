@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import { ApiError } from "./client";
 import { api } from "./index";
 import {
@@ -22,6 +23,116 @@ describe("narrators API", () => {
 		} else {
 			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
 		}
+	});
+
+	describe("composer document transport", () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "hello" }] }],
+		};
+		test.each([
+			false,
+			true,
+		])("send/queue/history edit preserve optional layout in JSON and multipart (%s)", async (multipart) => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null },
+				configurable: true,
+			});
+			const requests: RequestInit[] = [];
+			Object.defineProperty(g, "fetch", {
+				configurable: true,
+				value: async (_url: unknown, init: RequestInit) => {
+					requests.push(init);
+					return Response.json({ ok: true });
+				},
+			});
+			const originalXHR = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+			class TestXHR {
+				status = 200;
+				statusText = "OK";
+				responseText = '{"ok":true}';
+				onload: (() => void) | null = null;
+				open() {}
+				setRequestHeader() {}
+				getAllResponseHeaders() {
+					return "Content-Type: application/json";
+				}
+				send(body: FormData) {
+					requests.push({ body });
+					queueMicrotask(() => this.onload?.());
+				}
+			}
+			Object.defineProperty(globalThis, "XMLHttpRequest", { value: TestXHR, configurable: true });
+			try {
+				for (const composerDocument of [undefined, doc]) {
+					const uploads = multipart
+						? [new File(["x"], "a.txt", { type: "text/plain" })]
+						: undefined;
+					await api.sendNarratorMessage(
+						"n",
+						"hello",
+						undefined,
+						uploads,
+						undefined,
+						undefined,
+						undefined,
+						[],
+						undefined,
+						"turn",
+						{ composerDocument },
+					);
+					await api.updateBufferedMessage("n", "q", "hello", {
+						newTextFiles: uploads,
+						composerDocument,
+					});
+					await api.editAndRegenerate("n", "m", "hello", {
+						newTextFiles: uploads,
+						composerDocument,
+					});
+					for (const request of requests.splice(0)) {
+						const body = request.body;
+						if (body instanceof FormData) {
+							expect(body.has("composerDocument")).toBe(composerDocument !== undefined);
+							if (composerDocument)
+								expect(JSON.parse(String(body.get("composerDocument")))).toEqual(composerDocument);
+						} else {
+							expect(JSON.parse(String(body)).composerDocument).toEqual(composerDocument);
+						}
+					}
+				}
+			} finally {
+				if (originalXHR) Object.defineProperty(globalThis, "XMLHttpRequest", originalXHR);
+				else Reflect.deleteProperty(globalThis, "XMLHttpRequest");
+			}
+		});
+		test("drafts and lazy detail endpoints carry the same document and cancellation", async () => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null },
+				configurable: true,
+			});
+			const requests: Array<{ url: string; init: RequestInit }> = [];
+			Object.defineProperty(g, "fetch", {
+				configurable: true,
+				value: async (url: string, init: RequestInit) => {
+					requests.push({ url, init });
+					return Response.json({ composerDocument: doc });
+				},
+			});
+			await api.updateNarratorDraft("n", "hello", 1, "source", [], doc);
+			expect(JSON.parse(String(requests[0].init.body)).composerDocument).toEqual(doc);
+			const controller = new AbortController();
+			expect(await api.getMessageComposerDocument("n/a", "m/a", controller.signal)).toEqual({
+				composerDocument: doc,
+			});
+			expect(await api.getBufferedMessageComposerDocument("n/a", "q/a", controller.signal)).toEqual(
+				{ composerDocument: doc },
+			);
+			expect(requests[1].url).toBe("/api/narrators/n%2Fa/messages/m%2Fa/composer-document");
+			expect(requests[2].url).toBe("/api/narrators/n%2Fa/buffer/q%2Fa/composer-document");
+			expect(requests[1].init.signal).toBe(controller.signal);
+			expect(requests[2].init.signal).toBe(controller.signal);
+		});
 	});
 
 	describe("request recordings", () => {

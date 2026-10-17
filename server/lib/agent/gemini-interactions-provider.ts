@@ -4,7 +4,7 @@ import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { GeminiProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { parseModelId } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
 import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
@@ -28,12 +28,7 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import {
-	captureDumpResponse,
-	captureResponseStream,
-	responseDumpBudget,
-	sanitizeHeaders,
-} from "./request-dump";
+import { captureDumpResponse, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -51,7 +46,6 @@ export const GEMINI_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 export const GEMINI_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
 export const GEMINI_MAX_TEXT_BYTES = 16 * 1024 * 1024;
 export const GEMINI_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024;
-export const GEMINI_MAX_REQUEST_DUMP_BYTES = 4 * 1024 * 1024;
 
 interface GeminiSystemMarker {
 	type: "system";
@@ -274,19 +268,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 		const url = `${this.baseUrl()}/interactions`;
 		const headers = this.headers(true, params.conversationId);
-		params.requestDump?.beginResponseAttempt(
-			{
-				transport: "http",
-				method: "POST",
-				url,
-				headers: sanitizeHeaders(headers),
-				bodyText,
-			},
-			Math.min(
-				responseDumpBudget(settings.agent?.requestDumpMaxSize),
-				GEMINI_MAX_REQUEST_DUMP_BYTES,
-			),
-		);
+		params.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		logger.debug("Gemini Interactions request", {
 			model,
 			baseUrl: this.baseUrl(),
@@ -619,10 +607,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
 		const url = `${this.baseUrl()}/interactions`;
 		const headers = this.headers(true);
-		options.requestDump?.beginResponseAttempt(
-			{ transport: "http", url, headers, body },
-			settings.agent.requestDumpMaxSize,
-		);
+		options.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		const response = captureDumpResponse(
 			await this.pfetch(url, {
 				method: "POST",

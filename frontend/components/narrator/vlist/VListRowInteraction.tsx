@@ -20,8 +20,11 @@
  *      call, copy file path, view file — gated by the row's tool metadata
  *      (vlist-tool-meta.ts) exactly like ToolCallCard / SubagentCard gate them.
  *
- * The inspector & file-preview modals are lazy AND only mounted while open, so
- * scrolling rows pay for neither.
+ * File preview is lazy and only mounted while open, so scrolling rows pay nothing
+ * for it. The tool-call inspector is owned by the list shell (see
+ * tool-call-inspector-host): a virtual row is evicted past the overscan window,
+ * and a dialog mounted here would unmount mid-copy. Without a host, the row
+ * keeps a local fallback.
  *
  * It is deliberately a self-contained child component: all swipe/menu state
  * lives inside this row, so interacting with one row never re-renders the

@@ -174,7 +174,7 @@ describe("settings deepMerge", () => {
 });
 
 describe("cache-drop diagnostic settings", () => {
-	it("defaults off for legacy settings and roundtrips independently of full dumps", () => {
+	it("defaults off for legacy settings and roundtrips independently of request evidence", () => {
 		// tests/preload.ts isolates this file from the user's settings.
 		const path = resolve(getNarraforkHome(), "settings.json");
 		const original = readFileSync(path, "utf8");
@@ -191,7 +191,6 @@ describe("cache-drop diagnostic settings", () => {
 					...defaults,
 					agent: {
 						...defaults.agent,
-						requestDumpEnabled: false,
 						cacheDropDumpEnabled: enabled,
 					},
 				});
@@ -199,8 +198,8 @@ describe("cache-drop diagnostic settings", () => {
 				const loaded = reloadSettings();
 				for (const agent of [liveSettings.agent, loaded.agent, persisted.agent]) {
 					expect(agent.cacheDropDumpEnabled).toBe(enabled);
-					expect(agent.requestDumpEnabled).toBe(false);
 				}
+				expect(loaded.requestEvidence).toEqual(defaults.requestEvidence);
 			}
 		} finally {
 			saveSettings(snapshot);

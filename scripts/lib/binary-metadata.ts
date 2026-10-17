@@ -17,6 +17,7 @@ import {
 	type HelperDistributionDependencies,
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
+import { parseRecoveryManifestVersions } from "../../shared/update-identity";
 
 export interface BinaryMetadata {
 	/** Binary filename (basename), e.g. "narrafork-0.5.0-linux-x64". */
@@ -33,6 +34,8 @@ export interface BinaryMetadata {
 	repository?: string;
 	/** Absent in legacy builds; binds this binary's immutable helper/executor selection. */
 	helperDistribution?: HelperDistributionDependencies;
+	/** Main-program recovery protocols only; omitted by legacy/helper/executor builds. */
+	recoveryManifestVersions?: readonly number[];
 	/** ISO-8601 build timestamp. */
 	buildDate: string;
 	/** File size in bytes. */
@@ -52,6 +55,8 @@ export interface ComputeMetadataInput {
 	repository?: string;
 	/** Absent in legacy builds; binds this binary's immutable helper/executor selection. */
 	helperDistribution?: HelperDistributionDependencies;
+	/** Main-program recovery protocols only; omitted by legacy/helper/executor builds. */
+	recoveryManifestVersions?: readonly number[];
 	buildDate: string;
 }
 
@@ -90,6 +95,11 @@ export function computeBinaryMetadataFromBuffer(
 			: {
 					helperDistribution: parseHelperDistributionDependencies(input.helperDistribution),
 				}),
+		...(input.recoveryManifestVersions === undefined
+			? {}
+			: {
+					recoveryManifestVersions: parseRecoveryManifestVersions(input.recoveryManifestVersions),
+				}),
 		buildDate: input.buildDate,
 		size: buf.length,
 		sha256,
@@ -99,7 +109,13 @@ export function computeBinaryMetadataFromBuffer(
 
 /** Serialize metadata to the sidecar `<name>.metadata.json` content. */
 export function formatMetadataJson(meta: BinaryMetadata): string {
-	return `${JSON.stringify(meta, null, 2)}\n`;
+	const validated = {
+		...meta,
+		...(meta.recoveryManifestVersions === undefined
+			? {}
+			: { recoveryManifestVersions: parseRecoveryManifestVersions(meta.recoveryManifestVersions) }),
+	};
+	return `${JSON.stringify(validated, null, 2)}\n`;
 }
 
 /**

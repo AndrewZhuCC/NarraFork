@@ -854,7 +854,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			signal,
 			extraHeaders: headers,
 			requestDump: options.requestDump,
-			requestDumpMaxBytes: settings.agent.requestDumpMaxSize,
 			onResponseFrame: (frame) => {
 				try {
 					budget.add(Buffer.byteLength(frame, "utf8"));
@@ -969,7 +968,6 @@ export class OpenAIProvider implements ProviderAdapter {
 					ephemeral: true,
 					extraHeaders: headers,
 					requestDump: options?.requestDump,
-					requestDumpMaxBytes: settings.agent.requestDumpMaxSize,
 					onResponseFrame: (frame) => {
 						budget.add(Buffer.byteLength(frame, "utf8"));
 						options?.onActivity?.();
@@ -988,15 +986,19 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (!items) {
 			headers.Accept = "text/event-stream";
 			const url = `${baseUrl}/responses`;
-			options?.requestDump?.beginResponseAttempt(
-				{ transport: "http", url, headers, body },
-				settings.agent.requestDumpMaxSize,
-			);
+			const bodyText = JSON.stringify(body);
+			options?.requestDump?.beginResponseAttempt({
+				transport: "http",
+				method: "POST",
+				url,
+				headers: sanitizeHeaders(headers),
+				bodyText,
+			});
 			const response = captureDumpResponse(
 				await this.pfetch(url, {
 					method: "POST",
 					headers,
-					body: JSON.stringify(body),
+					body: bodyText,
 					signal: options?.signal,
 				}),
 				options?.requestDump,
@@ -1299,16 +1301,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			await reportInputCharacters(params, body);
 			const bodyText = JSON.stringify(body);
-			params.requestDump?.beginResponseAttempt(
-				{
-					transport: "http",
-					method: "POST",
-					url: endpoint,
-					headers: sanitizeHeaders(requestHeaders),
-					bodyText,
-				},
-				settings.agent?.requestDumpMaxSize,
-			);
+			params.requestDump?.beginResponseAttempt({
+				transport: "http",
+				method: "POST",
+				url: endpoint,
+				headers: sanitizeHeaders(requestHeaders),
+				bodyText,
+			});
 
 			params.onRequestStart?.(
 				this.apiMode === "codex"
@@ -1772,15 +1771,19 @@ export class OpenAIProvider implements ProviderAdapter {
 			headers["x-codex-turn-state"] = turnState.value;
 		}
 		const url = `${baseUrl}/responses`;
-		options?.requestDump?.beginResponseAttempt(
-			{ transport: "http", url, headers, body },
-			settings.agent.requestDumpMaxSize,
-		);
+		const bodyText = JSON.stringify(body);
+		options?.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		let response = captureDumpResponse(
 			await this.pfetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: bodyText,
 				signal,
 			}),
 			options?.requestDump,
@@ -1877,15 +1880,19 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 		const url = `${baseUrl}/chat/completions`;
 		const headers = this.buildHeaders(apiKey);
-		options?.requestDump?.beginResponseAttempt(
-			{ transport: "http", url, headers, body },
-			settings.agent.requestDumpMaxSize,
-		);
+		const bodyText = JSON.stringify(body);
+		options?.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		const response = captureDumpResponse(
 			await this.pfetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: bodyText,
 				signal,
 			}),
 			options?.requestDump,
@@ -2087,7 +2094,6 @@ export class OpenAIProvider implements ProviderAdapter {
 				userAgent: fingerprint.userAgent,
 				extraHeaders: fingerprint.headers,
 				requestDump: params.requestDump,
-				requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 			})) {
 				yield stampReasoningSource(event, this.getActiveReasoningSource());
 			}

@@ -58,6 +58,7 @@ class TestResizeObserver {
 
 let root: Root | undefined;
 let restoreGitApi: (() => void) | undefined;
+const originalGitLineStats = api.getGitLineStats;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -170,11 +171,18 @@ function makeMixedStatus(): GitStatusSummary {
 function stubGitApi(calls: Array<{ name: string; body?: unknown }>, status: GitStatusSummary) {
 	const original = {
 		getGitStatus: api.getGitStatus,
+		getGitLineStats: api.getGitLineStats,
 		gitStage: api.gitStage,
 		gitUnstage: api.gitUnstage,
 		gitDiscard: api.gitDiscard,
 	};
 	api.getGitStatus = async () => status;
+	api.getGitLineStats = async () => ({
+		files: status.files.map((f) => ({ ...f, complete: true })),
+		linesAdded: status.linesAdded ?? 0,
+		linesRemoved: status.linesRemoved ?? 0,
+		complete: true,
+	});
 	api.gitStage = async (_chapterId, body) => {
 		calls.push({ name: "stage", body });
 		return status;
@@ -328,6 +336,12 @@ function buttonByLabel(container: HTMLElement, label: string): HTMLButtonElement
 describe("GitChangesTab status filter", () => {
 	beforeEach(async () => {
 		installDom();
+		api.getGitLineStats = async () => ({
+			files: [],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
 		// Both preference caches are memoized at module scope, and installDom() hands
 		// out a FRESH Map-backed sessionStorage per test: a stale parse would leak one
 		// test's filter into the next.
@@ -339,9 +353,70 @@ describe("GitChangesTab status filter", () => {
 	afterEach(() => {
 		restoreGitApi?.();
 		restoreGitApi = undefined;
+		api.getGitLineStats = originalGitLineStats;
 		if (!root) return;
 		root.unmount();
 		root = undefined;
+	});
+
+	test("slow and failed line stats never delay status rows or disable actions", async () => {
+		const client = makeClient();
+		const chapterId = "chapter-slow-stats";
+		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
+		let rejectStats!: (error: Error) => void;
+		api.getGitLineStats = () =>
+			new Promise((_resolve, reject) => {
+				rejectStats = reject;
+			});
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		await expandAllFolders(container);
+		expect(fileRowPaths(container)).toHaveLength(5);
+		expect(container.querySelector('[aria-label="Counting lines…"]')).not.toBeNull();
+		expect(buttonByText(container, "Stage All").disabled).toBe(false);
+		rejectStats(new Error("stats failed"));
+		await waitFor(
+			() => container.textContent?.includes("Line counts failed") === true,
+			"stats failure",
+		);
+		expect(fileRowPaths(container)).toHaveLength(5);
+		expect(buttonByText(container, "Stage All").disabled).toBe(false);
+		client.clear();
+	});
+
+	test("complete binary measurements may display zero, but missing measurements do not", async () => {
+		const client = makeClient();
+		const chapterId = "chapter-binary-stats";
+		const status = {
+			...makeMixedStatus(),
+			staged: 0,
+			unstaged: 2,
+			untracked: 0,
+			files: [
+				{ status: " M", path: "binary.png" },
+				{ status: " M", path: "unknown.png" },
+			],
+			totalFiles: 2,
+		};
+		client.setQueryData(["gitStatus", chapterId], status);
+		client.setQueryData(["gitLineStats", chapterId], {
+			files: [
+				{ path: "binary.png", unstagedLinesAdded: 0, unstagedLinesRemoved: 0, complete: true },
+				{ path: "unknown.png", complete: false },
+			],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
+		const container = renderTab(chapterId, client);
+		await flushRender();
+		expect(
+			container.querySelector('[aria-label="View diff of binary.png"]')?.textContent,
+		).toContain("+0-0");
+		expect(
+			container.querySelector('[aria-label="View diff of unknown.png"]')?.textContent,
+		).not.toMatch(/[+-]0/);
+		client.clear();
 	});
 
 	test("branch name uses the remaining header space instead of a percentage cap", async () => {
@@ -519,7 +594,7 @@ describe("GitChangesTab status filter", () => {
 		client.clear();
 	});
 
-	test("lightweight status hides line figures and clears older measurements", async () => {
+	test("independent partial stats show known rows, never invent zero or sum incomplete folders", async () => {
 		const chapterId = "chapter-lightweight";
 		const client = makeClient();
 		const status: GitStatusSummary = {
@@ -533,19 +608,38 @@ describe("GitChangesTab status filter", () => {
 			branch: "main",
 		};
 		client.setQueryData(["gitStatus", chapterId], status);
+		client.setQueryData(["gitLineStats", chapterId], {
+			files: [
+				{ path: "src/known.ts", unstagedLinesAdded: 1, unstagedLinesRemoved: 0, complete: true },
+			],
+			linesAdded: 1,
+			linesRemoved: 0,
+			complete: false,
+		});
 		const container = renderTab(chapterId, client);
 		await flushRender();
-		// The closed directory must not claim the known child's partial sum.
-		expect(container.textContent).not.toContain("+1");
-		expect(container.textContent).not.toContain("NaN");
+		const folder = container.querySelector('[aria-label="Expand folder src"]');
+		expect(folder?.textContent).not.toContain("+1");
+		expect(container.querySelector('[aria-label="Incomplete line counts"]')).not.toBeNull();
 		await expandAllFolders(container);
-		expect(container.textContent).toContain("+1");
+		const row = (path: string) => container.querySelector(`[aria-label="View diff of ${path}"]`);
+		expect(row("src/known.ts")?.textContent).toContain("+1");
+		expect(row("src/unknown.ts")?.textContent).not.toMatch(/[+-]0|NaN/);
+		// A lightweight status refresh does not erase independently measured rows.
 		client.setQueryData(["gitStatus", chapterId], {
 			...status,
 			files: status.files.map(({ status, path }) => ({ status, path })),
 		});
 		await flushRender();
-		expect(container.textContent).not.toMatch(/[+-]1|[+-]0|NaN/);
+		expect(row("src/known.ts")?.textContent).toContain("+1");
+		client.setQueryData(["gitLineStats", chapterId], {
+			files: [],
+			linesAdded: 0,
+			linesRemoved: 0,
+			complete: false,
+		});
+		await flushRender();
+		expect(row("src/known.ts")?.textContent).not.toMatch(/[+-]1|[+-]0|NaN/);
 		expect(fileRowPaths(container)).toHaveLength(2);
 		client.clear();
 	});

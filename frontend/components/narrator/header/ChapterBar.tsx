@@ -1,7 +1,12 @@
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter } from "@frontend/hooks/useChapters";
 import { useContainers } from "@frontend/hooks/useContainers";
-import { gitWorkspaceTarget, useGitStatus, useGitWorkspace } from "@frontend/hooks/useGit";
+import {
+	gitWorkspaceTarget,
+	useGitLineStats,
+	useGitStatus,
+	useGitWorkspace,
+} from "@frontend/hooks/useGit";
 import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { useWorkspaceContext } from "@frontend/hooks/useWorkspaceContext";
 import { type ApiError, api } from "@frontend/lib/api";
@@ -32,6 +37,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { GitLineStatsSummary } from "../../chapter/GitLineStatsSummary";
 import { NarratorCompatibilityModal } from "../../project/NarratorCompatibilityEntry";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import classes from "./ChapterBar.module.css";
@@ -85,7 +91,8 @@ export function NarratorGitBar({
 	const workspace = useGitWorkspace(narratorId);
 	const { data: executionContext } = useWorkspaceContext(narratorId);
 	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
-	const status = useGitStatus(target);
+	const status = useGitStatus(target, "summary");
+	const lineStats = useGitLineStats(target, "summary");
 	const workspaceState = workspace.data?.state;
 	useEffect(() => {
 		if (status.data) workspace.rememberCounts?.(status.data);
@@ -162,16 +169,7 @@ export function NarratorGitBar({
 									? t("workspace.atLeastFiles", { count: counts.totalFiles })
 									: counts.totalFiles}
 							</Text>
-							{counts.linesAdded != null && Number.isFinite(counts.linesAdded) && (
-								<Text span size="xs" c="green" fw={600}>
-									+{counts.linesAdded}
-								</Text>
-							)}
-							{counts.linesRemoved != null && Number.isFinite(counts.linesRemoved) && (
-								<Text span size="xs" c="red" fw={600}>
-									-{counts.linesRemoved}
-								</Text>
-							)}
+							{target && <GitLineStatsSummary {...lineStats} compact />}
 						</Group>
 					</Badge>
 				</Tooltip>
@@ -220,7 +218,8 @@ export function ChapterBar({
 		narratorId && !workspaceQuery.isError
 			? gitWorkspaceTarget(narratorId, workspaceQuery.data)
 			: null;
-	const { data: workspaceStatus } = useGitStatus(workspaceTarget);
+	const { data: workspaceStatus } = useGitStatus(workspaceTarget, "summary");
+	const workspaceLineStats = useGitLineStats(workspaceTarget, "summary");
 	const { data: chapterStatus } = useChapterGitStatus(narratorId ? null : chapterId);
 	const gitStatus = narratorId
 		? workspaceStatus
@@ -419,6 +418,7 @@ export function ChapterBar({
 								)}
 							</Group>
 						)}
+					{workspaceTarget && <GitLineStatsSummary {...workspaceLineStats} compact />}
 					{chapter.status !== "active" && (
 						<Badge
 							size="xs"

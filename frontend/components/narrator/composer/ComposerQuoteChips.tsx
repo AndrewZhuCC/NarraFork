@@ -3,14 +3,11 @@ import {
 	Box,
 	CloseButton,
 	Group,
-	Kbd,
 	Popover,
 	Text,
 	Textarea,
-	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import type { FileReference } from "@shared/file-reference";
 import { IconCheck, IconFileText, IconMessageCircle, IconQuote } from "@tabler/icons-react";
 import {
 	type ComponentPropsWithoutRef,
@@ -22,16 +19,7 @@ import {
 	useRef,
 } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	type ComposerQuote,
-	fileReferenceQuote,
-	MAX_COMPOSER_QUOTE_CHARS,
-	sameComposerQuote,
-} from "./composer-quotes";
-import { fileReferenceToken } from "./file-reference-input";
-import type { QuoteCandidate } from "./use-quote-candidate";
-
-const PREVIEW_CHARS = 600;
+import { type ComposerQuote, MAX_COMPOSER_QUOTE_CHARS } from "./composer-quotes";
 
 const chipStyle: CSSProperties = {
 	display: "inline-flex",
@@ -51,19 +39,8 @@ const solidChipStyle: CSSProperties = {
 	background: "var(--mantine-color-default-hover)",
 };
 
-const pendingChipStyle: CSSProperties = {
-	...chipStyle,
-	border: "1px dashed var(--mantine-primary-color-filled)",
-	color: "var(--mantine-color-dimmed)",
-	cursor: "pointer",
-};
-
 // Chips must not take focus or collapse the document selection they quote.
 const keepSelection = (event: MouseEvent) => event.preventDefault();
-
-function preview(text: string): string {
-	return text.length > PREVIEW_CHARS ? `${text.slice(0, PREVIEW_CHARS)}…` : text;
-}
 
 function ChipLabel({ children }: { children: ReactNode }) {
 	return (
@@ -163,77 +140,41 @@ export function QuoteChip({
 		</span>
 	);
 }
-function QuotePreview({ quote }: { quote: ComposerQuote }) {
-	return (
-		<Text size="xs" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-			{preview(quote.text)}
-		</Text>
-	);
+export interface ComposerQuoteCommentProps {
+	quoteId: string | null;
+	quote: ComposerQuote | null;
+	onChange: (comment: string) => void;
+	onClose: () => void;
+	onDone: () => void;
+	children: ReactNode;
 }
 
-export interface ComposerQuoteChipsProps {
-	quotes: readonly ComposerQuote[];
-	/** References without an inline `#file:` token in the text. */
-	fileReferences: readonly FileReference[];
-	candidate: QuoteCandidate | null;
-	editingQuote: ComposerQuote | null;
-	onEditQuote: (quote: ComposerQuote | null) => void;
-	onChangeComment: (quote: ComposerQuote, comment: string) => void;
-	onCommentDone: () => void;
-	onAccept: (candidate: QuoteCandidate) => void;
-	onDismiss: (candidate: QuoteCandidate) => void;
-	onRemoveQuote: (index: number) => void;
-	onRemoveFileReference: (id: string) => void;
-	/** Scroll to the quoted source and highlight it. */
-	onOpenQuote?: (quote: ComposerQuote) => void;
-	/** Open the quoted file on its line range. */
-	onOpenFile?: (reference: FileReference) => void;
-}
-
-export function ComposerQuoteChips({
-	quotes,
-	fileReferences,
-	candidate,
-	editingQuote,
-	onEditQuote,
-	onChangeComment,
-	onCommentDone,
-	onAccept,
-	onDismiss,
-	onRemoveQuote,
-	onRemoveFileReference,
-	onOpenQuote,
-	onOpenFile,
-}: ComposerQuoteChipsProps) {
+/** The comment stays above the unified editor, outside its editable document. */
+export function ComposerQuoteComment({
+	quoteId,
+	quote,
+	onChange,
+	onClose,
+	onDone,
+	children,
+}: ComposerQuoteCommentProps) {
 	const { t } = useTranslation("narrator");
 	const commentRef = useRef<HTMLTextAreaElement>(null);
-	const editedFile = fileReferences.find((ref) => editingQuote?.anchor === `f:${ref.id}`);
-	const activeQuote = editingQuote
-		? (quotes.find((quote) => sameComposerQuote(quote, editingQuote)) ??
-			(editedFile ? fileReferenceQuote(editedFile) : null))
-		: null;
 	useEffect(() => {
-		if (!editingQuote) return;
+		if (!quoteId) return;
 		const frame = requestAnimationFrame(() => {
 			const textarea = commentRef.current;
 			textarea?.focus({ preventScroll: true });
 			textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
 		});
 		return () => cancelAnimationFrame(frame);
-	}, [editingQuote]);
-	useEffect(() => {
-		if (editingQuote && !activeQuote) onEditQuote(null);
-	}, [editingQuote, activeQuote, onEditQuote]);
-	if (!quotes.length && !fileReferences.length && !candidate) return null;
-	const unavailable = candidate?.kind === "file" && !candidate.reference;
+	}, [quoteId]);
 	return (
 		<Popover
-			opened={!!activeQuote}
-			onDismiss={() => onEditQuote(null)}
+			opened={!!quote}
+			onDismiss={onClose}
 			position="top-start"
 			floatingStrategy="fixed"
-			// Keyboard viewport transitions can briefly clip the anchor. Hiding the
-			// dropdown would blur its textarea and dismiss the keyboard in turn.
 			hideDetached={false}
 			middlewares={{ flip: false, shift: { padding: 12, crossAxis: true, limiter: undefined } }}
 			width="min(420px, calc(100vw - 24px))"
@@ -243,129 +184,21 @@ export function ComposerQuoteChips({
 			returnFocus={false}
 		>
 			<Popover.Target>
-				<Box>
-					<Group gap={6} mb={6} wrap="wrap" data-composer-quote-chips>
-						{quotes.map((quote, index) =>
-							quote.anchor?.startsWith("f:") ? null : (
-								<Tooltip
-									// biome-ignore lint/suspicious/noArrayIndexKey: quotes are an ordered prefix of the text
-									key={index}
-									label={<QuotePreview quote={quote} />}
-									multiline
-									w={360}
-									openDelay={300}
-									withinPortal
-								>
-									<QuoteChip
-										label={quote.label}
-										comment={quote.comment}
-										onOpen={quote.anchor && onOpenQuote ? () => onOpenQuote(quote) : undefined}
-										onComment={() => onEditQuote(quote)}
-										onRemove={() => onRemoveQuote(index)}
-									/>
-								</Tooltip>
-							),
-						)}
-						{fileReferences.map((reference) => {
-							const quote =
-								quotes.find((item) => item.anchor === `f:${reference.id}`) ??
-								fileReferenceQuote(reference);
-							return (
-								<QuoteChip
-									key={reference.id}
-									file
-									label={`${reference.deviceId === "local" ? "" : `${reference.deviceId} · `}${fileReferenceToken(reference).replace(/^#file:/, "")}`}
-									comment={quote.comment}
-									onOpen={onOpenFile ? () => onOpenFile(reference) : undefined}
-									onComment={() => onEditQuote(quote)}
-									onRemove={() => onRemoveFileReference(reference.id)}
-								/>
-							);
-						})}
-						{candidate && (
-							<Tooltip
-								label={
-									unavailable ? (
-										t("quote.fileUnsaved")
-									) : candidate.kind === "text" ? (
-										<QuotePreview quote={candidate.quote} />
-									) : (
-										t("quote.addHint")
-									)
-								}
-								multiline
-								w={candidate.kind === "text" ? 360 : undefined}
-								openDelay={300}
-								withinPortal
-							>
-								<span
-									style={{ ...pendingChipStyle, ...(unavailable ? { opacity: 0.6 } : null) }}
-									data-composer-quote-candidate
-								>
-									<UnstyledButton
-										onMouseDown={keepSelection}
-										onClick={() => onAccept(candidate)}
-										disabled={unavailable}
-										aria-label={t("quote.addHint")}
-										style={{
-											display: "inline-flex",
-											alignItems: "center",
-											gap: 4,
-											minWidth: 0,
-											color: "inherit",
-											fontSize: "inherit",
-										}}
-									>
-										{candidate.kind === "file" ? (
-											<IconFileText size={12} />
-										) : (
-											<IconQuote size={12} />
-										)}
-										<ChipLabel>
-											{candidate.kind === "file" ? candidate.label : candidate.quote.label}
-										</ChipLabel>
-										{!unavailable && (
-											<>
-												<Text
-													component="span"
-													size="xs"
-													fw={500}
-													c="var(--mantine-primary-color-filled)"
-													style={{ flexShrink: 0 }}
-												>
-													{t("quote.add")}
-												</Text>
-												<Kbd size="xs" style={{ flexShrink: 0 }}>
-													Alt Q
-												</Kbd>
-											</>
-										)}
-									</UnstyledButton>
-									<CloseButton
-										size="xs"
-										aria-label={t("quote.dismiss")}
-										onMouseDown={keepSelection}
-										onClick={() => onDismiss(candidate)}
-									/>
-								</span>
-							</Tooltip>
-						)}
-					</Group>
-				</Box>
+				<Box style={{ minWidth: 0 }}>{children}</Box>
 			</Popover.Target>
-			{activeQuote && (
+			{quote && (
 				<Popover.Dropdown p="xs" role="dialog" aria-label={t("quote.editComment")}>
 					<Group gap={6} wrap="nowrap" mb={6}>
 						<IconQuote size={14} style={{ flexShrink: 0 }} />
 						<Text size="xs" truncate style={{ flex: 1, minWidth: 0 }}>
-							{activeQuote.label}
+							{quote.label}
 						</Text>
 						<ActionIcon
 							variant="subtle"
 							size="sm"
 							aria-label={t("quote.commentDone")}
 							title={t("quote.commentDone")}
-							onClick={onCommentDone}
+							onClick={onDone}
 						>
 							<IconCheck size={16} />
 						</ActionIcon>
@@ -380,8 +213,8 @@ export function ComposerQuoteChips({
 							data-quote-comment-editor
 							aria-label={t("quote.editComment")}
 							placeholder={t("quote.commentPlaceholder")}
-							value={activeQuote.comment ?? ""}
-							onChange={(event) => onChangeComment(activeQuote, event.currentTarget.value)}
+							value={quote.comment ?? ""}
+							onChange={(event) => onChange(event.currentTarget.value)}
 							onKeyDown={(event) => {
 								event.stopPropagation();
 								if (event.nativeEvent.isComposing) return;
@@ -390,7 +223,7 @@ export function ComposerQuoteChips({
 									(event.key === "Enter" && (event.metaKey || event.ctrlKey))
 								) {
 									event.preventDefault();
-									onCommentDone();
+									onDone();
 								}
 							}}
 							autosize

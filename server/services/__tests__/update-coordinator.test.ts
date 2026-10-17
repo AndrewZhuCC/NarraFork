@@ -1,4 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { getNarraforkPath } from "../../lib/narrafork-home";
+import {
+	MAX_RECOVERY_MANIFEST_BYTES,
+	registerRecoverySource,
+	withRecoveryAdvance,
+} from "../recovery-handoff";
+
+const manifestPath = join(getNarraforkPath("updates"), "planned-update-recovery.json");
+
 import {
 	assertUpdateNotCancelled,
 	beginNarratorResponseActivity,
@@ -11,22 +23,462 @@ import {
 	consumePlannedUpdateRecoverySnapshot,
 	convertToolStartGrantToExecution,
 	failScheduledUpdate,
+	getScheduledRecoverySources,
 	getUpdateCoordinationStatus,
 	markUpdateRestarting,
 	parsePlannedUpdateRecoverySnapshot,
 	registerNarratorLoop,
+	releasePreparedUpdateRecoveryHandoff,
 	removePlannedUpdateRecoverySnapshot,
 	resetUpdateCoordinationForTests,
+	rollbackPreparedUpdateRecoverySnapshot,
 	scheduleUpdate,
 	tryAcquireFinalUpdateExecution,
 	tryAcquireUpdateExecution,
 	UpdateCancelledError,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
+	waitForScheduledRecoveryHandoff,
 	waitForUpdateCheckpointFence,
 	waitUntilUpdateGateOpens,
 	writePlannedUpdateRecoverySnapshot,
+	writePreparedUpdateRecoverySnapshot,
 } from "../update-coordinator";
+
+describe("update coordinator handoff", () => {
+	beforeEach(() => resetUpdateCoordinationForTests());
+	afterEach(() => resetUpdateCoordinationForTests());
+	const old = () => ({
+		version: 2 as const,
+		updateEpoch: "old",
+		capturedAt: "2026-01-01",
+		resumeOnNextStartup: true,
+		narrators: [{ narratorId: "n", locale: "en" }],
+	});
+	test("rejects unclaimed root before phase and response changes", () => {
+		writePlannedUpdateRecoverySnapshot(old());
+		expect(() => scheduleUpdate(undefined, "system_shutdown")).toThrow();
+		expect(getUpdateCoordinationStatus().phase).toBe("idle");
+	});
+	test("claimed root transfers atomically, old completion cannot delete new root, rollback restores exact authorization", async () => {
+		const original = writePlannedUpdateRecoverySnapshot(old());
+		registerRecoverySource(
+			{
+				updateEpoch: original.updateEpoch,
+				kind: "planned",
+				capturedAt: original.capturedAt,
+				narrators: original.narrators,
+				pendingNarratorIds: ["n"],
+			},
+			{ manifestIdentity: JSON.stringify(original) },
+		);
+		const scheduled = scheduleUpdate(undefined, "system_shutdown");
+		if (!scheduled.updateEpoch) throw new Error("Missing epoch");
+		await waitForScheduledRecoveryHandoff();
+		expect(getScheduledRecoverySources()).toHaveLength(1);
+		const captured = capturePlannedUpdateRecoverySnapshot();
+		expect(captured.version).toBe(3);
+		expect(() => writePlannedUpdateRecoverySnapshot(captured)).toThrow();
+		writePreparedUpdateRecoverySnapshot({ ...captured, resumeOnNextStartup: true });
+		removePlannedUpdateRecoverySnapshot({ expectedEpoch: "old" });
+		expect(consumePlannedUpdateRecoverySnapshot()?.updateEpoch).toBe(scheduled.updateEpoch);
+		rollbackPreparedUpdateRecoverySnapshot(scheduled.updateEpoch);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+		releasePreparedUpdateRecoveryHandoff(scheduled.updateEpoch);
+	});
+	test("same-epoch authorization replacement is rejected despite matching target metadata", () => {
+		const original = writePlannedUpdateRecoverySnapshot(old());
+		registerRecoverySource(
+			{
+				updateEpoch: original.updateEpoch,
+				kind: "planned",
+				capturedAt: original.capturedAt,
+				narrators: original.narrators,
+				pendingNarratorIds: ["n"],
+			},
+			{ manifestIdentity: JSON.stringify(original) },
+		);
+		writePlannedUpdateRecoverySnapshot({ ...original, handoffMarkerNonce: "foreign" });
+		expect(() => scheduleUpdate(undefined, "system_shutdown")).toThrow("not claimed");
+		expect(getUpdateCoordinationStatus().phase).toBe("idle");
+	});
+	test("prepared writer accepts only bounded receipt augmentation, never arbitrary source metadata", async () => {
+		registerRecoverySource({
+			updateEpoch: "ordinary",
+			kind: "ordinary",
+			capturedAt: "today",
+			narrators: [{ narratorId: "n", locale: "en" }],
+			pendingNarratorIds: ["n"],
+		});
+		scheduleUpdate(undefined, "system_shutdown");
+		await waitForScheduledRecoveryHandoff();
+		const captured = capturePlannedUpdateRecoverySnapshot();
+		const source = captured.sources?.[0];
+		if (!source) throw new Error("Missing source");
+		expect(() =>
+			writePreparedUpdateRecoverySnapshot({
+				...captured,
+				sources: [{ ...source, pendingNarratorIds: [] }],
+			}),
+		).toThrow();
+		const published = writePreparedUpdateRecoverySnapshot({
+			...captured,
+			sources: [{ ...source, unstartedTools: [{ toolCallId: "t", executionAttempt: 2 }] }],
+		});
+		expect(published.sources?.[0]?.unstartedTools).toEqual([
+			{ toolCallId: "t", executionAttempt: 2 },
+		]);
+		expect(() =>
+			writePlannedUpdateRecoverySnapshot({ ...published, version: 2, sources: undefined }),
+		).toThrow("inherited sources");
+	});
+	test("ordinary same-epoch publication is tracked for rollback and failed evidence remains inert", () => {
+		const epoch = scheduleUpdate("new").updateEpoch;
+		if (!epoch) throw new Error("Missing epoch");
+		writePlannedUpdateRecoverySnapshot({
+			...capturePlannedUpdateRecoverySnapshot(),
+			resumeOnNextStartup: true,
+		});
+		rollbackPreparedUpdateRecoverySnapshot(epoch);
+		expect(consumePlannedUpdateRecoverySnapshot()).toBeNull();
+		writePlannedUpdateRecoverySnapshot({
+			...capturePlannedUpdateRecoverySnapshot(),
+			evidenceOnly: true,
+		});
+		failScheduledUpdate("failed cleanup");
+		expect(getUpdateCoordinationStatus().phase).toBe("idle");
+		expect(consumePlannedUpdateRecoverySnapshot()?.evidenceOnly).toBe(true);
+	});
+	test("ordinary manifest validator rejects before assigning epoch or changing the gate", () => {
+		let valid = false;
+		registerRecoverySource(
+			{
+				updateEpoch: "restart-old",
+				kind: "ordinary",
+				capturedAt: "today",
+				narrators: [],
+				pendingNarratorIds: [],
+			},
+			{
+				validateManifest() {
+					if (!valid) throw new Error("ordinary manifest changed");
+				},
+			},
+		);
+		expect(() => scheduleUpdate(undefined, "system_shutdown")).toThrow("ordinary manifest changed");
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			phase: "idle",
+			scheduled: false,
+		});
+		expect(getUpdateCoordinationStatus().updateEpoch).toBeUndefined();
+		valid = true;
+		expect(scheduleUpdate(undefined, "system_shutdown").scheduled).toBe(true);
+	});
+	test("scheduling logs reuse preflight source identities instead of validating after mutation", () => {
+		let validations = 0;
+		registerRecoverySource(
+			{
+				updateEpoch: "restart-log-check",
+				kind: "ordinary",
+				capturedAt: "today",
+				narrators: [],
+				pendingNarratorIds: [],
+			},
+			{
+				validateManifest() {
+					validations++;
+					if (validations > 2) throw new Error("late source read failed");
+				},
+			},
+		);
+		const scheduled = scheduleUpdate(undefined, "system_shutdown");
+		expect(scheduled.scheduled).toBe(true);
+		expect(validations).toBe(2);
+		expect(scheduled.updateEpoch).toBeDefined();
+	});
+	test("target binary capability must explicitly support inherited sources", () => {
+		registerRecoverySource({
+			updateEpoch: "restart-old",
+			kind: "ordinary",
+			capturedAt: "today",
+			narrators: [],
+			pendingNarratorIds: [],
+		});
+		expect(() => scheduleUpdate("new")).toThrow();
+		expect(getUpdateCoordinationStatus().phase).toBe("idle");
+		expect(
+			scheduleUpdate("new", "update", { supportedRecoveryManifestVersions: [1, 2, 3] }).scheduled,
+		).toBe(true);
+	});
+	test("enforces exact source, aggregate target and UTF-8 byte limits", () => {
+		const source = (i: number) => ({
+			updateEpoch: `source-${i}`,
+			kind: "planned" as const,
+			capturedAt: "today",
+			narrators: [],
+			pendingNarratorIds: [],
+		});
+		const root = {
+			...old(),
+			version: 3 as const,
+			sources: Array.from({ length: 64 }, (_, i) => source(i)),
+		};
+		expect(parsePlannedUpdateRecoverySnapshot(root)?.sources).toHaveLength(64);
+		expect(
+			parsePlannedUpdateRecoverySnapshot({ ...root, sources: [...root.sources, source(65)] }),
+		).toBeNull();
+		const narrators = Array.from({ length: 10_000 }, (_, i) => ({
+			narratorId: `n-${i}`,
+			locale: "en",
+		}));
+		expect(parsePlannedUpdateRecoverySnapshot({ ...old(), narrators })?.narrators).toHaveLength(
+			10_000,
+		);
+		expect(
+			parsePlannedUpdateRecoverySnapshot({
+				...old(),
+				narrators: [...narrators, { narratorId: "extra", locale: "en" }],
+			}),
+		).toBeNull();
+		expect(
+			parsePlannedUpdateRecoverySnapshot({
+				...root,
+				narrators,
+				sources: [{ ...source(1), narrators: old().narrators }],
+			}),
+		).toBeNull();
+		const base = { ...old(), padding: "" };
+		const padding = "x".repeat(
+			MAX_RECOVERY_MANIFEST_BYTES - Buffer.byteLength(JSON.stringify(base)),
+		);
+		expect(parsePlannedUpdateRecoverySnapshot({ ...base, padding })).not.toBeNull();
+		expect(parsePlannedUpdateRecoverySnapshot({ ...base, padding: `${padding}x` })).toBeNull();
+		expect(() =>
+			writePlannedUpdateRecoverySnapshot({
+				...old(),
+				narrators: [{ narratorId: "huge", locale: "中".repeat(MAX_RECOVERY_MANIFEST_BYTES / 3) }],
+			}),
+		).toThrow();
+	});
+	test("preserves oversized, corrupt and unknown disk evidence without interrupting responses", async () => {
+		mkdirSync(getNarraforkPath("updates"), { recursive: true });
+		for (const text of [
+			"{broken",
+			JSON.stringify({ ...old(), version: 99 }),
+			" ".repeat(MAX_RECOVERY_MANIFEST_BYTES + 1),
+		]) {
+			writeFileSync(manifestPath, text);
+			const response = await beginNarratorResponseActivity("active");
+			expect(consumePlannedUpdateRecoverySnapshot()).toBeNull();
+			expect(() => scheduleUpdate(undefined, "system_shutdown")).toThrow();
+			expect(getUpdateCoordinationStatus().phase).toBe("idle");
+			expect(readFileSync(manifestPath, "utf8")).toBe(text);
+			response.release();
+		}
+	});
+	test("rollback CAS failure keeps the reservation and gate until exact root is restored", async () => {
+		const original = writePlannedUpdateRecoverySnapshot(old());
+		registerRecoverySource(
+			{
+				updateEpoch: "old",
+				kind: "planned",
+				capturedAt: original.capturedAt,
+				narrators: original.narrators,
+				pendingNarratorIds: ["n"],
+			},
+			{ manifestIdentity: JSON.stringify(original) },
+		);
+		const epoch = scheduleUpdate(undefined, "system_shutdown").updateEpoch;
+		if (!epoch) throw new Error("Missing epoch");
+		await waitForScheduledRecoveryHandoff();
+		writePreparedUpdateRecoverySnapshot({
+			...capturePlannedUpdateRecoverySnapshot(),
+			resumeOnNextStartup: true,
+		});
+		const published = readFileSync(manifestPath, "utf8");
+		writeFileSync(manifestPath, "foreign evidence");
+		expect(() => rollbackPreparedUpdateRecoverySnapshot(epoch)).toThrow();
+		expect(() => releasePreparedUpdateRecoveryHandoff(epoch)).toThrow();
+		expect(() => failScheduledUpdate("rollback failed")).toThrow();
+		expect(getUpdateCoordinationStatus().scheduled).toBe(true);
+		let progressed = false;
+		const queued = withRecoveryAdvance("old", () => {
+			progressed = true;
+		});
+		await Promise.resolve();
+		expect(progressed).toBe(false);
+		writeFileSync(manifestPath, published);
+		rollbackPreparedUpdateRecoverySnapshot(epoch);
+		releasePreparedUpdateRecoveryHandoff(epoch);
+		failScheduledUpdate("cancelled", { cancelled: true });
+		await queued;
+		expect(progressed).toBe(true);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+	});
+	test("failed atomic publication or rollback keeps the authoritative root and reservation", async () => {
+		const original = writePlannedUpdateRecoverySnapshot(old());
+		registerRecoverySource(
+			{
+				updateEpoch: original.updateEpoch,
+				kind: "planned",
+				capturedAt: original.capturedAt,
+				narrators: original.narrators,
+				pendingNarratorIds: ["n"],
+			},
+			{ manifestIdentity: JSON.stringify(original) },
+		);
+		const epoch = scheduleUpdate(undefined, "system_shutdown").updateEpoch;
+		if (!epoch) throw new Error("Missing epoch");
+		await waitForScheduledRecoveryHandoff();
+		const snapshot = capturePlannedUpdateRecoverySnapshot();
+		const failedWrite = spyOn(fs, "renameSync").mockImplementationOnce(() => {
+			throw new Error("injected EIO");
+		});
+		try {
+			expect(() => writePreparedUpdateRecoverySnapshot(snapshot)).toThrow("injected EIO");
+		} finally {
+			failedWrite.mockRestore();
+		}
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+		writePreparedUpdateRecoverySnapshot(snapshot);
+		const failedRollback = spyOn(fs, "renameSync").mockImplementationOnce(() => {
+			throw new Error("injected EIO");
+		});
+		try {
+			expect(() => rollbackPreparedUpdateRecoverySnapshot(epoch)).toThrow("injected EIO");
+		} finally {
+			failedRollback.mockRestore();
+		}
+		expect(consumePlannedUpdateRecoverySnapshot()?.updateEpoch).toBe(epoch);
+		expect(() => releasePreparedUpdateRecoveryHandoff(epoch)).toThrow();
+		rollbackPreparedUpdateRecoverySnapshot(epoch);
+		releasePreparedUpdateRecoveryHandoff(epoch);
+		expect(consumePlannedUpdateRecoverySnapshot()).toEqual(original);
+	});
+	test("two successive boots flatten planned and ordinary ancestry without inheriting source authorization", async () => {
+		const original = writePlannedUpdateRecoverySnapshot(old());
+		registerRecoverySource(
+			{
+				updateEpoch: "old",
+				kind: "planned",
+				capturedAt: original.capturedAt,
+				narrators: original.narrators,
+				pendingNarratorIds: ["n"],
+			},
+			{ manifestIdentity: JSON.stringify(original) },
+		);
+		registerRecoverySource({
+			updateEpoch: "restart-a",
+			kind: "ordinary",
+			capturedAt: "today",
+			narrators: [{ narratorId: "o", locale: "en" }],
+			pendingNarratorIds: ["o"],
+			logicalRuns: [{ narratorId: "o", logicalRunId: "run" }],
+		});
+		scheduleUpdate(undefined, "system_shutdown");
+		await waitForScheduledRecoveryHandoff();
+		const first = writePreparedUpdateRecoverySnapshot({
+			...capturePlannedUpdateRecoverySnapshot(),
+			resumeOnNextStartup: true,
+		});
+		expect(first.sources?.map((source) => source.updateEpoch)).toEqual(["old", "restart-a"]);
+		resetUpdateCoordinationForTests();
+		writePlannedUpdateRecoverySnapshot(first);
+		registerRecoverySource(
+			{
+				updateEpoch: first.updateEpoch,
+				kind: "planned",
+				capturedAt: first.capturedAt,
+				narrators: first.narrators,
+				pendingNarratorIds: [],
+			},
+			{ manifestIdentity: JSON.stringify(first) },
+		);
+		for (const source of first.sources ?? []) registerRecoverySource(source);
+		scheduleUpdate(undefined, "system_shutdown");
+		await waitForScheduledRecoveryHandoff();
+		const second = writePreparedUpdateRecoverySnapshot(capturePlannedUpdateRecoverySnapshot());
+		expect(second.sources?.map((source) => source.updateEpoch)).toEqual([
+			first.updateEpoch,
+			"old",
+			"restart-a",
+		]);
+		expect(second.resumeOnNextStartup).toBeUndefined();
+		expect(
+			second.sources?.every(
+				(source) => !("sources" in source) && !("resumeOnNextStartup" in source),
+			),
+		).toBe(true);
+	});
+	test("operator cancellation immediately aborts a pending short barrier", async () => {
+		registerRecoverySource({
+			updateEpoch: "restart-a",
+			kind: "ordinary",
+			capturedAt: "today",
+			narrators: [],
+			pendingNarratorIds: [],
+		});
+		let complete!: () => void;
+		const advance = withRecoveryAdvance(
+			"restart-a",
+			() =>
+				new Promise<void>((resolve) => {
+					complete = resolve;
+				}),
+		);
+		const epoch = scheduleUpdate(undefined, "system_shutdown").updateEpoch;
+		if (!epoch) throw new Error("Missing epoch");
+		const waiting = waitForScheduledRecoveryHandoff();
+		cancelScheduledUpdate();
+		await expect(waiting).rejects.toBeInstanceOf(UpdateCancelledError);
+		rollbackPreparedUpdateRecoverySnapshot(epoch);
+		releasePreparedUpdateRecoveryHandoff(epoch);
+		failScheduledUpdate("cancel", { cancelled: true });
+		complete();
+		await advance;
+	});
+	test("already-entered finalizer can finish before publication without resurrecting its root", async () => {
+		const original = writePlannedUpdateRecoverySnapshot(old());
+		const handle = registerRecoverySource(
+			{
+				updateEpoch: "old",
+				kind: "planned",
+				capturedAt: original.capturedAt,
+				narrators: original.narrators,
+				pendingNarratorIds: ["n"],
+			},
+			{ manifestIdentity: JSON.stringify(original) },
+		);
+		let complete!: () => void;
+		const finalizer = handle.withAdvance(async () => {
+			await new Promise<void>((resolve) => {
+				complete = resolve;
+			});
+			removePlannedUpdateRecoverySnapshot({ expectedEpoch: "old" });
+			handle.retire();
+		});
+		scheduleUpdate(undefined, "system_shutdown");
+		const ready = waitForScheduledRecoveryHandoff();
+		complete();
+		await finalizer;
+		await ready;
+		expect(getScheduledRecoverySources()).toEqual([]);
+		expect(
+			writePreparedUpdateRecoverySnapshot(capturePlannedUpdateRecoverySnapshot()).version,
+		).toBe(2);
+	});
+	test("unknown versions and malformed targets fail closed", () => {
+		expect(parsePlannedUpdateRecoverySnapshot({ ...old(), version: 4 })).toBeNull();
+		expect(parsePlannedUpdateRecoverySnapshot({ ...old(), narrators: [null] })).toBeNull();
+		expect(
+			parsePlannedUpdateRecoverySnapshot({
+				...old(),
+				version: 3,
+				sources: [{ ...old(), kind: "planned", pendingNarratorIds: ["n"] }],
+			}),
+		).toBeNull();
+	});
+});
 
 describe("update coordinator", () => {
 	beforeEach(() => {

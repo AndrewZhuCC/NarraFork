@@ -4,7 +4,7 @@ import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { GeminiProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { parseModelId } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
 import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
@@ -29,12 +29,7 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import {
-	captureDumpResponse,
-	captureResponseStream,
-	responseDumpBudget,
-	sanitizeHeaders,
-} from "./request-dump";
+import { captureDumpResponse, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -51,7 +46,6 @@ export const GEMINI_GENERATE_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 export const GEMINI_GENERATE_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
 export const GEMINI_GENERATE_MAX_TEXT_BYTES = 16 * 1024 * 1024;
 export const GEMINI_GENERATE_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024;
-const GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES = 4 * 1024 * 1024;
 
 // === Gemini wire types ===
 
@@ -326,13 +320,13 @@ export class GeminiProvider implements ProviderAdapter {
 		await reportInputCharacters(params, body);
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
-		params.requestDump?.beginResponseAttempt(
-			{ transport: "http", method: "POST", url, headers: sanitizeHeaders(headers), bodyText },
-			Math.min(
-				responseDumpBudget(settings.agent?.requestDumpMaxSize),
-				GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES,
-			),
-		);
+		params.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		params.onRequestStart?.();
 		const response = await this.pfetch(url, {
 			method: "POST",
@@ -597,10 +591,13 @@ export class GeminiProvider implements ProviderAdapter {
 		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const headers = this.headers(apiKey, undefined, true);
-		opts.requestDump?.beginResponseAttempt(
-			{ transport: "http", url, headers, body },
-			settings.agent.requestDumpMaxSize,
-		);
+		opts.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		const response = captureDumpResponse(
 			await this.pfetch(url, {
 				method: "POST",

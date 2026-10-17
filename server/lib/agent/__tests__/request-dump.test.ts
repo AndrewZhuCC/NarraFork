@@ -3,7 +3,12 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RecordingRequest, RequestRecording, SavedRecording } from "@shared/request-recording";
+import type {
+	RecordingPinReason,
+	RecordingRequest,
+	RequestRecording,
+	SavedRecording,
+} from "@shared/request-recording";
 import {
 	createRequestRecording,
 	RequestRecorderClient,
@@ -23,136 +28,53 @@ import {
 import {
 	ApiRequestDumpCollector,
 	BoundedUtf8Capture,
+	boundedJsonCopy,
 	captureResponseStream,
 	HARD_DUMP_MAX_BYTES,
-	MAX_DUMP_EVENT_COUNT,
-	RING_DIAGNOSTIC_PREFIX_BYTES,
-	responseDumpBudget,
 	sanitizeHeaders,
 } from "../request-dump";
 
-describe("bounded diagnostic capture", () => {
-	test("full WS frames do not duplicate the prepared history and crowd out the response", () => {
-		const collector = new ApiRequestDumpCollector({}, undefined, undefined, 4 * 1024 * 1024);
-		const prepared = {
-			transport: "websocket",
-			body: {
-				type: "response.create",
-				input: [{ role: "user", content: "x".repeat(2300000) }],
-				tools: [{ type: "function", name: "Read" }],
-				client_metadata: { session_id: "session" },
-			},
-		};
-		collector.beginResponseAttempt(prepared, 4 * 1024 * 1024);
-		const actual = {
-			...prepared,
-			body: {
-				...prepared.body,
-				client_metadata: {
-					...prepared.body.client_metadata,
-					"x-codex-turn-state": "routing-state",
-				},
-			},
-		};
-		collector.setRequest(actual);
-		collector.setResponseMeta({ status: 200, headers: { "x-request-id": "upstream-id" } });
-		collector.appendResponseText(
-			'data: {"type":"response.completed","response":{"usage":{"input_tokens_details":{"cached_tokens":3968}}}}\n\n',
-		);
-		collector.finishResponseCapture(true);
-		const result = collector.snapshot();
-		expect(result.initialRequest === undefined).toBe(true);
-		expect(JSON.stringify(result.request?.body) === JSON.stringify(actual.body)).toBe(true);
-		expect(result.response?.headers?.["x-request-id"]).toBe("upstream-id");
-		expect(result.response?.bodyText).toContain('"cached_tokens":3968');
-		expect(result.captureTruncated).toBeUndefined();
-		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(4 * 1024 * 1024);
-	});
-
-	test("oversized requests cannot erase response status, headers and available response text", () => {
-		const collector = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
-		collector.beginResponseAttempt({ body: { input: "x".repeat(10000) } }, 4096);
-		collector.setResponseMeta({ status: 200, headers: { "x-request-id": "kept" } });
-		collector.appendResponseText("small complete reply");
-		collector.finishResponseCapture(true);
-		const result = collector.snapshot();
-		expect(result.captureTruncated).toBe(true);
-		expect(result.response?.status).toBe(200);
-		expect(result.response?.headers?.["x-request-id"]).toBe("kept");
-		expect(result.response?.bodyText).toBe("small complete reply");
-		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4096);
-	});
-
-	test("preserves the logical WS request and the actual frame without modifying either", () => {
-		const collector = new ApiRequestDumpCollector(
-			{ provider: "openai" },
-			undefined,
-			undefined,
-			4096,
-		);
-		const full = { transport: "websocket", body: { input: [{ role: "user", content: "before" }] } };
-		const delta = {
-			transport: "websocket",
-			body: { input: [], previous_response_id: "resp-before" },
-		};
-		collector.beginResponseAttempt(full, 4096);
-		collector.setRequest(delta);
-		full.body.input[0].content = "changed later";
-		collector.appendResponseText("completed");
-		collector.finishResponseCapture(true);
-		const result = collector.snapshot();
-		expect(result.initialRequest?.body).toEqual({ input: [{ role: "user", content: "before" }] });
-		expect(result.request?.body).toEqual(delta.body);
-		expect(result.response?.bodyText).toBe("completed");
-		expect(result.captureTruncated).toBeUndefined();
-	});
-
-	test("bounds request, response and combined UTF8 snapshot including escaped strings", () => {
-		const collector = new ApiRequestDumpCollector({}, undefined, undefined, 1024);
-		collector.beginResponseAttempt(
-			{
-				body: { text: '中文😀\\"\n'.repeat(10000) },
-				headers: { Authorization: "Bearer secret-value" },
-			},
-			32 * 1024 * 1024,
-		);
-		collector.appendResponseText("x".repeat(10000));
-		collector.finishResponseCapture(true);
-		const result = collector.snapshot();
-		expect(result.captureTruncated).toBe(true);
-		expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(1024);
-		expect(JSON.stringify(result)).not.toContain("secret-value");
-	});
-
-	test("bounded snapshot is independently available without changing normal full-dump retention", () => {
-		const collector = new ApiRequestDumpCollector();
-		collector.setRequest({ body: { text: "x".repeat(10000) } });
-		expect(collector.snapshot(1024).captureTruncated).toBe(true);
-		expect(collector.snapshot().request?.body).toEqual({ text: "x".repeat(10000) });
-		expect(collector.snapshot().captureTruncated).toBeUndefined();
-	});
-
-	test("depth and node limits stop pathological request graphs", () => {
-		const collector = new ApiRequestDumpCollector({}, undefined, undefined, 4096);
-		const circular: Record<string, unknown> = { input: Array(100000).fill(null) };
-		circular.self = circular;
-		collector.setRequest({ body: circular });
-		const result = collector.snapshot();
-		expect(result.captureTruncated).toBe(true);
-		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4096);
+describe("bounded Codex template copies", () => {
+	test("bounds UTF-8, escaped strings and cyclic graphs without serializing the source", () => {
+		const source: Record<string, unknown> = { input: '中文😀\\"\n'.repeat(10000) };
+		source.self = source;
+		const result = boundedJsonCopy(source, 1024);
+		expect(result.truncated).toBe(true);
+		expect(Buffer.byteLength(JSON.stringify(result.value))).toBeLessThanOrEqual(1024);
+		expect(source.input).toBe('中文😀\\"\n'.repeat(10000));
 	});
 });
+
+/** In-memory RequestRecording that keeps every call for assertions. */
+function fakeRecording(requestId = "fake") {
+	const requests: RecordingRequest[] = [];
+	const metas: Record<string, unknown>[] = [];
+	const chunks: string[] = [];
+	const pins: RecordingPinReason[] = [];
+	const recording: RequestRecording = {
+		requestId,
+		pin: (reason) => pins.push(reason),
+		request: (value) => requests.push(value),
+		responseMeta: (value) => metas.push(value),
+		responseChunk: (value) =>
+			chunks.push(typeof value === "string" ? value : new TextDecoder().decode(value)),
+		frame: () => {},
+		finish: () => {},
+	};
+	const lastMeta = () => Object.assign({}, ...metas) as Record<string, unknown>;
+	return { recording, requests, metas, chunks, pins, lastMeta };
+}
+
 async function saveCoreRecording(
 	action: (dump: ApiRequestDumpCollector, recording: RequestRecording) => Promise<void>,
 ) {
 	const home = await mkdtemp(join(tmpdir(), "recording-source-test-"));
-	const originalAgent = settings.agent;
-	settings.agent = {
-		...originalAgent,
-		requestDumpRecordingEnabled: true,
-		requestDumpEnabled: false,
-		requestDumpRequestBytes: 1024 * 1024,
-		requestDumpResponseBytes: 1024 * 1024,
+	const originalEvidence = settings.requestEvidence;
+	settings.requestEvidence = {
+		ringEnabled: true,
+		ringRequestBytes: 1024 * 1024,
+		ringResponseBytes: 1024 * 1024,
+		autoPin: "off",
 	};
 	const operations: RecorderOperation[] = [];
 	// Capture the core's exact worker messages without starting its singleton worker.
@@ -176,7 +98,7 @@ async function saveCoreRecording(
 			model: "fixture",
 		});
 		if (!recording) throw new Error("Recording fixture must be enabled");
-		const dump = new ApiRequestDumpCollector(undefined, recording, RING_DIAGNOSTIC_PREFIX_BYTES);
+		const dump = new ApiRequestDumpCollector(recording);
 		await action(dump, recording);
 		dump.finish({ status: "completed" });
 		for (const operation of operations) await store.execute(operation);
@@ -191,11 +113,11 @@ async function saveCoreRecording(
 				"utf8",
 			),
 		) as { requests: Array<{ gapReasons: string[]; gaps: { request: number; response: number } }> };
-		return { saved, manifest, operations, dump: dump.snapshot() };
+		return { saved, manifest, operations };
 	} finally {
 		capture.mockRestore();
 		configure.mockRestore();
-		settings.agent = originalAgent;
+		settings.requestEvidence = originalEvidence;
 		await rm(home, { recursive: true, force: true });
 	}
 }
@@ -227,8 +149,8 @@ describe("live request recording", () => {
 		]);
 	});
 
-	test("complete SSE beyond 64KiB only truncates the legacy prefix, not the saved recording", async () => {
-		const body = `data: ${"x".repeat(RING_DIAGNOSTIC_PREFIX_BYTES + 4096)}\n\ndata: [DONE]\n\n`;
+	test("complete SSE beyond 64KiB is saved without truncation", async () => {
+		const body = `data: ${"x".repeat(64 * 1024 + 4096)}\n\ndata: [DONE]\n\n`;
 		const result = await saveCoreRecording(async (dump) => {
 			dump.beginResponseAttempt({ bodyText: "{}" });
 			const tap = captureResponseStream(
@@ -241,12 +163,6 @@ describe("live request recording", () => {
 				dump,
 			);
 			expect(await new Response(tap.stream).text()).toBe(body);
-		});
-		expect(result.dump.response).toMatchObject({
-			bodyTruncated: true,
-			bodyIncomplete: false,
-			bodyBytesKept: RING_DIAGNOSTIC_PREFIX_BYTES,
-			bodyBytesReceived: Buffer.byteLength(body),
 		});
 		expect(result.saved).toMatchObject({ truncated: false, partial: false });
 		expect(result.manifest.requests[0].gapReasons).toEqual([]);
@@ -262,16 +178,8 @@ describe("live request recording", () => {
 	});
 
 	test("serialized request is forwarded without cloning/parsing even across fallback", () => {
-		const requests: RecordingRequest[] = [];
-		const recording: RequestRecording = {
-			requestId: "request-1",
-			request: (value) => requests.push(value),
-			responseMeta: () => {},
-			responseChunk: () => {},
-			frame: () => {},
-			finish: () => {},
-		};
-		const dump = new ApiRequestDumpCollector(undefined, recording);
+		const { recording, requests } = fakeRecording("request-1");
+		const dump = new ApiRequestDumpCollector(recording);
 		const parse = spyOn(JSON, "parse");
 		try {
 			const bodyText = '{ "input": "actual serialized bytes" }';
@@ -287,16 +195,18 @@ describe("live request recording", () => {
 		} finally {
 			parse.mockRestore();
 		}
-		expect(dump.snapshot().request?.body).toEqual({ input: "actual serialized bytes" });
+		expect(dump.lastRequestBody()).toEqual({ input: "actual serialized bytes" });
 	});
 
-	test("raw chunks are recorded before completion beyond the legacy prefix cap, cancellation remains pull-only", async () => {
+	test("raw chunks are recorded before completion, cancellation remains pull-only", async () => {
 		const chunks: Uint8Array[] = [];
+		const metas: Record<string, unknown>[] = [];
 		let finishCount = 0;
 		const recording: RequestRecording = {
 			requestId: "request-2",
+			pin: () => {},
 			request: () => {},
-			responseMeta: () => {},
+			responseMeta: (value) => metas.push(value),
 			frame: () => {},
 			responseChunk: (chunk) =>
 				chunks.push(typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk.slice()),
@@ -304,8 +214,8 @@ describe("live request recording", () => {
 				finishCount++;
 			},
 		};
-		const dump = new ApiRequestDumpCollector(undefined, recording);
-		dump.beginResponseAttempt({ bodyText: "{}" }, 3);
+		const dump = new ApiRequestDumpCollector(recording);
+		dump.beginResponseAttempt({ bodyText: "{}" });
 		let pulls = 0;
 		let cancelled = false;
 		const tap = captureResponseStream(
@@ -332,11 +242,7 @@ describe("live request recording", () => {
 		await reader.cancel();
 		expect(cancelled).toBe(true);
 		expect(pulls).toBe(2);
-		expect(dump.snapshot().response).toMatchObject({
-			bodyText: "abc",
-			bodyTruncated: true,
-			bodyIncomplete: true,
-		});
+		expect(metas.at(-1)).toEqual({ bodyIncomplete: true });
 		dump.finish({ status: "cancelled" });
 		dump.finish();
 		expect(finishCount).toBe(1);
@@ -348,14 +254,16 @@ describe("live request recording", () => {
 		};
 		const recording: RequestRecording = {
 			requestId: "request-3",
+			pin: fail,
 			request: fail,
 			responseMeta: fail,
 			responseChunk: fail,
 			frame: fail,
 			finish: fail,
 		};
-		const dump = new ApiRequestDumpCollector(undefined, recording);
+		const dump = new ApiRequestDumpCollector(recording);
 		dump.beginResponseAttempt({ bodyText: "{}" });
+		expect(() => dump.pin("error")).not.toThrow();
 		const tap = captureResponseStream(
 			new ReadableStream<Uint8Array>({
 				start(controller) {
@@ -382,8 +290,8 @@ describe("incremental response capture", () => {
 		for (const byte of bytes) split.append(new Uint8Array([byte]));
 		expect(split.text()).toBe("中😀");
 		expect(split.kept).toBe(7);
-		expect(responseDumpBudget(-1)).toBe(HARD_DUMP_MAX_BYTES);
-		expect(responseDumpBudget(Infinity)).toBe(HARD_DUMP_MAX_BYTES);
+		expect(new BoundedUtf8Capture(-1).limit).toBe(HARD_DUMP_MAX_BYTES);
+		expect(new BoundedUtf8Capture(Infinity).limit).toBe(HARD_DUMP_MAX_BYTES);
 		expect(new BoundedUtf8Capture(0).text()).toBe("");
 	});
 
@@ -404,8 +312,9 @@ describe("incremental response capture", () => {
 	});
 
 	test("HTTP early exit cancels without draining and keeps received bytes", async () => {
-		const dump = new ApiRequestDumpCollector();
-		dump.beginResponseAttempt({ transport: "http" }, 32);
+		const fake = fakeRecording();
+		const dump = new ApiRequestDumpCollector(fake.recording);
+		dump.beginResponseAttempt({ transport: "http" });
 		let pulls = 0;
 		let cancelled = false;
 		const capture = captureResponseStream(
@@ -427,14 +336,16 @@ describe("incremental response capture", () => {
 		capture.finish();
 		expect(pulls).toBe(1);
 		expect(cancelled).toBe(true);
-		expect(dump.snapshot().response).toMatchObject({ bodyText: "raw中", bodyIncomplete: true });
+		expect(fake.chunks).toEqual(["raw中"]);
+		expect(fake.lastMeta()).toMatchObject({ bodyIncomplete: true });
 	});
 
-	test("stream error preserves the prefix and attempts share a byte budget", async () => {
-		const dump = new ApiRequestDumpCollector();
-		dump.beginResponseAttempt({ transport: "websocket", body: "first" }, 5);
+	test("stream error records the error and every attempt's request and bytes", async () => {
+		const fake = fakeRecording();
+		const dump = new ApiRequestDumpCollector(fake.recording);
+		dump.beginResponseAttempt({ transport: "websocket", body: "first" });
 		dump.appendResponseText("abc");
-		dump.beginResponseAttempt({ transport: "http", body: "second" }, 5);
+		dump.beginResponseAttempt({ transport: "http", body: "second" });
 		let reads = 0;
 		const tap = captureResponseStream(
 			new ReadableStream(
@@ -451,54 +362,13 @@ describe("incremental response capture", () => {
 		const reader = tap.stream.getReader();
 		await reader.read();
 		await expect(reader.read()).rejects.toThrow("broken");
-		expect(dump.snapshot().response).toMatchObject({
-			bodyText: "de",
-			bodyTruncated: true,
-			error: "broken",
-		});
-		expect(dump.snapshot().attempts?.[0].response?.bodyText).toBe("abc");
-		expect(dump.snapshot().initialRequest?.body).toBe("first");
-		expect(dump.snapshot().request?.body).toBe("second");
-	});
-});
-
-describe("ApiRequestDumpCollector.setResponseEventsWithLimit", () => {
-	test("keeps all events when under both caps", () => {
-		const c = new ApiRequestDumpCollector();
-		const events = [{ a: 1 }, { b: 2 }, { c: 3 }];
-		c.setResponseEventsWithLimit(events, 100, 1024 * 1024);
-		expect(c.snapshot().response?.events).toEqual(events);
-	});
-
-	test("truncates by element count and appends a marker", () => {
-		const c = new ApiRequestDumpCollector();
-		const events = Array.from({ length: 10 }, (_, i) => ({ i }));
-		c.setResponseEventsWithLimit(events, 4, 1024 * 1024);
-		const stored = c.snapshot().response?.events as unknown[];
-		// 4 kept + 1 truncation marker
-		expect(stored).toHaveLength(5);
-		expect(stored.slice(0, 4)).toEqual(events.slice(0, 4));
-		expect(stored[4]).toEqual({ _truncated: 6 });
-	});
-
-	test("truncates by byte size from the tail", () => {
-		const c = new ApiRequestDumpCollector();
-		// Each event serializes to a sizable string; cap bytes so only a few fit.
-		const events = Array.from({ length: 20 }, (_, i) => ({ i, pad: "x".repeat(100) }));
-		c.setResponseEventsWithLimit(events, MAX_DUMP_EVENT_COUNT, 300);
-		const stored = c.snapshot().response?.events as unknown[];
-		// At least one event dropped → truncation marker present.
-		const marker = stored.at(-1) as { _truncated?: number };
-		expect(marker._truncated).toBeGreaterThan(0);
-		// Final serialized size is within a small multiple of the cap (kept + marker).
-		expect(JSON.stringify(stored).length).toBeLessThan(600);
-	});
-
-	test("negative caps disable limiting", () => {
-		const c = new ApiRequestDumpCollector();
-		const events = Array.from({ length: 5 }, (_, i) => ({ i }));
-		c.setResponseEventsWithLimit(events, -1, -1);
-		expect(c.snapshot().response?.events).toEqual(events);
+		expect(fake.chunks).toEqual(["abc", "def"]);
+		expect(fake.lastMeta()).toMatchObject({ error: "broken", bodyIncomplete: true });
+		expect(fake.requests).toEqual([
+			{ transport: "websocket", bodyText: '"first"' },
+			{ transport: "http", bodyText: '"second"' },
+		]);
+		expect(dump.lastRequestBody()).toBe("second");
 	});
 });
 
@@ -530,28 +400,6 @@ describe("sanitizeHeaders", () => {
 });
 
 describe("error diagnostics", () => {
-	test("stores normalized diagnostics on the request dump", () => {
-		const collector = new ApiRequestDumpCollector({ provider: "nug" });
-		collector.setDiagnostics(
-			normalizeApiRequestDiagnostics({
-				source: "gateway",
-				statusCode: 502,
-				requestId: "req-123",
-				responseHeaders: {
-					"x-request-id": "req-123",
-					authorization: "Bearer secret",
-				},
-			}),
-		);
-		expect(collector.snapshot().diagnostics).toEqual({
-			schema: "narrafork.error-diagnostics.v1",
-			source: "gateway",
-			statusCode: 502,
-			requestId: "req-123",
-			responseHeaders: { "x-request-id": "req-123" },
-		});
-	});
-
 	test("enforces an independent total diagnostics size limit", () => {
 		const diagnostics = normalizeApiRequestDiagnostics({
 			message: "m".repeat(20_000),

@@ -2,6 +2,11 @@ import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
 import { lstat, opendir, readdir, realpath, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import {
+	STORAGE_CATEGORY_KEYS,
+	STORAGE_CATEGORY_PROGRESS_MESSAGE,
+	type StorageCategoryKey,
+} from "@shared/storage-categories";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -13,14 +18,16 @@ import {
 	projects,
 } from "../db/schema";
 import { localBackend } from "../lib/agent/execution/registry";
-import { MALFORMED_REQUEST_DUMP_DIR } from "../lib/agent/malformed-request-dump";
-import { REQUEST_DUMP_SPILL_DIR } from "../lib/api-request-dump-store";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
 	getChatAttachmentsDir,
 	listStoredChatAttachmentNames,
 } from "../lib/chat-attachments";
+import {
+	DirectoryMeasureAbortedError,
+	measureDirectoriesOffThread,
+} from "../lib/fs-scan-worker/client";
 import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "../lib/request-recorder";
@@ -121,29 +128,6 @@ export function invalidateStorageCache(): void {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/**
- * Entry budget for one {@link measureDirSize} call.
- *
- * Derived from the largest thing this scan realistically walks: a checked-out
- * worktree of a big monorepo with `node_modules` present is on the order of a few
- * hundred thousand files. 2,000,000 leaves an order of magnitude of headroom above
- * that while still bounding a pathological or hostile tree — at ~2 syscalls per
- * entry this is seconds of async I/O, not an unbounded walk. Every category shares
- * the constant because they are all measured by the same function.
- */
-const DIR_SCAN_MAX_ENTRIES = 2_000_000;
-
-/**
- * Depth budget for one {@link measureDirSize} call.
- *
- * Real trees measured here (uploads/<narrator>/, shares/<id>/, bare snapshot repos,
- * git worktrees) are well under 30 levels; 64 is generous for deliberately nested
- * source trees while keeping recursion far from any stack limit. Symlinks are not
- * followed, so this is a guard against genuinely deep directories rather than
- * against link cycles.
- */
-const DIR_SCAN_MAX_DEPTH = 64;
-
 export interface DirSizeResult {
 	sizeBytes: number;
 	/** Entries actually visited (files + directories), for observability. */
@@ -157,60 +141,36 @@ export interface DirSizeResult {
 	truncated: boolean;
 }
 
-/**
- * Recursively sum file sizes in a directory (async to avoid blocking the event loop).
- *
- * Bounded on three axes and never follows symlinks:
- *  - `lstat` is used instead of `stat`, and only real directories are recursed into,
- *    so a self-referential or mutually-referential directory link (which `readdir`'s
- *    Dirent reports as a directory when it resolves to one) cannot spin forever;
- *  - symlinked files are skipped rather than counted, because their bytes belong to
- *    the target and would otherwise be double counted;
- *  - entry count and depth are capped, and hitting either sets `truncated` instead of
- *    quietly returning a smaller number.
- */
-async function measureDirSize(dirPath: string): Promise<DirSizeResult> {
-	if (!existsSync(dirPath)) return { sizeBytes: 0, entriesScanned: 0, truncated: false };
-	let sizeBytes = 0;
-	let entriesScanned = 0;
-	let truncated = false;
+export interface CategoryScanOptions {
+	signal?: AbortSignal;
+	onProgress?: (progress: { done: number; total: number | null }) => void;
+}
 
-	const walk = async (current: string, depth: number): Promise<void> => {
-		if (truncated) return;
-		if (depth > DIR_SCAN_MAX_DEPTH) {
-			truncated = true;
-			return;
-		}
-		let entries: Dirent[];
-		try {
-			entries = await readdir(current, { withFileTypes: true });
-		} catch {
-			// directory not readable
-			return;
-		}
-		for (const entry of entries) {
-			if (truncated) return;
-			if (entriesScanned >= DIR_SCAN_MAX_ENTRIES) {
-				truncated = true;
-				return;
-			}
-			entriesScanned++;
-			const full = resolve(current, entry.name);
-			try {
-				// lstat, not stat: a symlink must be identified as a link even when it
-				// points at a directory, otherwise a link cycle recurses without end.
-				const info = await lstat(full);
-				if (info.isSymbolicLink()) continue;
-				if (info.isDirectory()) await walk(full, depth + 1);
-				else if (info.isFile()) sizeBytes += info.size;
-			} catch {
-				// skip inaccessible entries
-			}
-		}
+function directoryProgress(
+	onProgress: CategoryScanOptions["onProgress"],
+): ((progress: { entriesScanned: number; sizeBytes: number }) => void) | undefined {
+	if (!onProgress) return undefined;
+	return (progress) => {
+		onProgress({ done: progress.entriesScanned, total: null });
 	};
+}
 
-	await walk(dirPath, 0);
-	return { sizeBytes, entriesScanned, truncated };
+/**
+ * Recursively sum file sizes in one directory.
+ *
+ * The walk itself runs in a filesystem worker. Symlinks are not followed, and
+ * entry count and depth are capped; hitting either sets `truncated`.
+ */
+async function measureDirSize(
+	dirPath: string,
+	options: CategoryScanOptions = {},
+): Promise<DirSizeResult> {
+	if (!existsSync(dirPath)) return { sizeBytes: 0, entriesScanned: 0, truncated: false };
+	const [measured] = await measureDirectoriesOffThread([dirPath], {
+		signal: options.signal,
+		onProgress: directoryProgress(options.onProgress),
+	});
+	return measured ?? { sizeBytes: 0, entriesScanned: 0, truncated: false };
 }
 
 /**
@@ -313,7 +273,9 @@ async function scanDatabase(
  * would inflate a figure whose cleanup button can never reclaim them. Their
  * size still ships in `details` so the omission stays visible instead of silent.
  */
-export async function scanUploads(): Promise<StorageCategoryResult> {
+export async function scanUploads(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const uploadsDir = getUploadsDir();
 	let narratorBytes = 0;
 	let narratorCount = 0;
@@ -324,7 +286,7 @@ export async function scanUploads(): Promise<StorageCategoryResult> {
 		for (const entry of entries) {
 			const fullPath = resolve(uploadsDir, entry.name);
 			if (entry.isDirectory()) {
-				const measured = await measureDirSize(fullPath);
+				const measured = await measureDirSize(fullPath, options);
 				truncated ||= measured.truncated;
 				if (entry.name === "avatars") {
 					avatarBytes = measured.sizeBytes;
@@ -365,9 +327,11 @@ export async function scanUploads(): Promise<StorageCategoryResult> {
  * and different reclamation rules (a room vs. a narrator), so a combined figure
  * could not tell an operator which cleanup button would actually free it.
  */
-async function scanChatAttachments(): Promise<StorageCategoryResult> {
+async function scanChatAttachments(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const dir = getChatAttachmentsDir();
-	const measured = await measureDirSize(dir);
+	const measured = await measureDirSize(dir, options);
 	let roomCount = 0;
 	try {
 		const entries = await readdir(dir, { withFileTypes: true });
@@ -383,47 +347,13 @@ async function scanChatAttachments(): Promise<StorageCategoryResult> {
 	};
 }
 
-/**
- * Spilled API request dumps (`~/.narrafork/request-dumps` and the malformed-request
- * captures next to them).
- *
- * A dump too large for its database row is written here so "download" can return the
- * complete request; that makes the directory grow with debugging activity rather than with
- * user data, so it needs to be visible in the breakdown. Both directories are self-pruning
- * (newest N kept) and safe to delete — deleting only costs the ability to download older
- * dumps in full.
- */
-async function scanRequestDumps(): Promise<StorageCategoryResult> {
-	const dirs = [
-		resolve(NARRAFORK_DIR, REQUEST_DUMP_SPILL_DIR),
-		resolve(NARRAFORK_DIR, MALFORMED_REQUEST_DUMP_DIR),
-	];
-	let sizeBytes = 0;
-	let truncated = false;
-	let fileCount = 0;
-	for (const dir of dirs) {
-		const measured = await measureDirSize(dir);
-		sizeBytes += measured.sizeBytes;
-		if (measured.truncated) truncated = true;
-		try {
-			const entries = await readdir(dir, { withFileTypes: true });
-			fileCount += entries.filter((e) => e.isFile()).length;
-		} catch {
-			// dir may not exist yet
-		}
-	}
-	return {
-		key: "requestDumps",
-		sizeBytes,
-		...(truncated ? { truncated: true } : {}),
-		details: { fileCount },
-	};
-}
-
 /** Saved bundles have their own category and are never reclaimed by rolling-buffer cleanup. */
-export async function scanRequestRecordings(saved = false): Promise<StorageCategoryResult> {
+export async function scanRequestRecordings(
+	saved = false,
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const directory = saved ? REQUEST_RECORDING_SAVED_DIR : REQUEST_RECORDING_DIR;
-	const measured = await measureDirSize(resolve(NARRAFORK_DIR, directory));
+	const measured = await measureDirSize(resolve(NARRAFORK_DIR, directory), options);
 	return {
 		key: saved ? "savedRequestRecordings" : "requestRecordings",
 		sizeBytes: measured.sizeBytes,
@@ -432,8 +362,8 @@ export async function scanRequestRecordings(saved = false): Promise<StorageCateg
 	};
 }
 
-async function scanShares(): Promise<StorageCategoryResult> {
-	const measured = await measureDirSize(SHARES_DIR);
+async function scanShares(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
+	const measured = await measureDirSize(SHARES_DIR, options);
 	let fileCount = 0;
 	try {
 		const entries = await readdir(SHARES_DIR, { withFileTypes: true });
@@ -455,8 +385,10 @@ async function scanShares(): Promise<StorageCategoryResult> {
  * These grow with every recorded tool boundary, so they need to be visible in the
  * storage breakdown rather than accumulating unaccounted for.
  */
-async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
-	const measured = await measureDirSize(TREE_SNAPSHOTS_DIR);
+async function scanTreeSnapshots(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	const measured = await measureDirSize(TREE_SNAPSHOTS_DIR, options);
 	let repoCount = 0;
 	try {
 		const entries = await readdir(TREE_SNAPSHOTS_DIR, { withFileTypes: true });
@@ -479,9 +411,11 @@ async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
  * user's untracked secrets rather than derived data, so "how much is here and is any of
  * it orphaned" is a question worth being able to answer.
  */
-async function scanDormantIgnored(): Promise<StorageCategoryResult> {
+async function scanDormantIgnored(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const dir = dormantIgnoredDir();
-	const measured = await measureDirSize(dir);
+	const measured = await measureDirSize(dir, options);
 	let archiveCount = 0;
 	let orphanCount = 0;
 	try {
@@ -511,7 +445,7 @@ async function scanDormantIgnored(): Promise<StorageCategoryResult> {
 	};
 }
 
-async function scanWorktrees(): Promise<StorageCategoryResult> {
+async function scanWorktrees(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
 	let truncated = false;
@@ -527,7 +461,7 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 			if (!proj.gitPath) continue;
 			const wtDir = resolve(proj.gitPath, ".worktrees");
 			if (!existsSync(wtDir)) continue;
-			const measured = await measureDirSize(wtDir);
+			const measured = await measureDirSize(wtDir, options);
 			truncated ||= measured.truncated;
 			const projSize = measured.sizeBytes;
 			let projWtCount = 0;
@@ -559,11 +493,12 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 	};
 }
 
-async function scanContainers(): Promise<StorageCategoryResult> {
+async function scanContainers(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	try {
 		const result = await safeSpawn({
 			cmd: ["podman", "system", "df", "--format", "json"],
 			timeout: 15_000,
+			signal: options.signal,
 		});
 		if (result.exitCode !== 0) {
 			return { key: "containers", sizeBytes: 0, details: { available: false } };
@@ -689,115 +624,190 @@ function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted) throw new StorageScanAbortedError();
 }
 
-export async function* scanStorage(
-	options: { signal?: AbortSignal } = {},
-): AsyncGenerator<
-	| { type: "progress"; message: string; detail?: { done: number; total: number } }
-	| { type: "category"; data: StorageCategoryResult },
-	StorageScanResult
-> {
-	const { signal } = options;
-	const categories: StorageCategoryResult[] = [];
+function rethrowScanFailure(error: unknown): never {
+	if (error instanceof StorageScanAbortedError) throw error;
+	if (error instanceof DirectoryMeasureAbortedError) throw new StorageScanAbortedError();
+	throw error;
+}
 
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_database" };
-	// The database scan measures ~116 tables and is by far the longest step, so stream table-level
-	// progress instead of leaving the UI on one static message for seconds. Progress is produced by
-	// a callback while we await the scan, so pump it through a queue and yield as it arrives.
-	const dbProgress = createProgressPump(signal);
-	const dbScan = scanDatabase(dbProgress.push, signal).finally(dbProgress.close);
-	// Attached now so an abort-driven rejection is never an unhandled rejection, even if the code
-	// below stops awaiting `dbScan` (for example because the consumer abandons the generator).
-	dbScan.catch(() => {});
-	for await (const progress of dbProgress.drain()) {
-		yield {
-			type: "progress",
-			message: "scanning_database",
-			detail: { done: progress.done, total: progress.total },
-		};
-	}
-	if (signal?.aborted) {
-		// The pump was closed by the abort, so `dbScan` may still be running. Do not await it: the
-		// worker tasks are already cancelled and the caller is gone.
-		throw new StorageScanAbortedError();
-	}
-	const dbResult = await dbScan;
-	categories.push(dbResult);
-	yield { type: "category", data: dbResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_uploads" };
-	const uploadsResult = await scanUploads();
-	categories.push(uploadsResult);
-	yield { type: "category", data: uploadsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_chat_attachments" };
-	const chatAttachmentsResult = await scanChatAttachments();
-	categories.push(chatAttachmentsResult);
-	yield { type: "category", data: chatAttachmentsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_shares" };
-	const sharesResult = await scanShares();
-	categories.push(sharesResult);
-	yield { type: "category", data: sharesResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_request_dumps" };
-	const requestDumpsResult = await scanRequestDumps();
-	categories.push(requestDumpsResult);
-	yield { type: "category", data: requestDumpsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_request_recordings" };
-	const requestRecordingsResult = await scanRequestRecordings();
-	categories.push(requestRecordingsResult);
-	yield { type: "category", data: requestRecordingsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_saved_request_recordings" };
-	const savedRequestRecordingsResult = await scanRequestRecordings(true);
-	categories.push(savedRequestRecordingsResult);
-	yield { type: "category", data: savedRequestRecordingsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_worktrees" };
-	const worktreesResult = await scanWorktrees();
-	categories.push(worktreesResult);
-	yield { type: "category", data: worktreesResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_tree_snapshots" };
-	const treeSnapshotsResult = await scanTreeSnapshots();
-	categories.push(treeSnapshotsResult);
-	yield { type: "category", data: treeSnapshotsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_dormant_ignored" };
-	const dormantIgnoredResult = await scanDormantIgnored();
-	categories.push(dormantIgnoredResult);
-	yield { type: "category", data: dormantIgnoredResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_containers" };
-	const containersResult = await scanContainers();
-	categories.push(containersResult);
-	yield { type: "category", data: containersResult };
-
-	throwIfAborted(signal);
-
+export function assembleStorageScanResult(categories: StorageCategoryResult[]): StorageScanResult {
 	const truncated = categories.some((c) => c.truncated === true);
 	// An unmeasurable category contributes nothing to the total AND makes the total a lower bound.
 	// Adding its placeholder zero would be arithmetically harmless and semantically wrong: the sum
 	// would read as complete while a whole category was missing from it.
 	const unavailable = categories.filter((c) => c.unavailable);
-	const result: StorageScanResult = {
+	return {
 		categories,
 		totalBytes: categories.filter((c) => !c.unavailable).reduce((sum, c) => sum + c.sizeBytes, 0),
 		...(truncated || unavailable.length > 0 ? { truncated: true } : {}),
 		scannedAt: Date.now(),
 	};
+}
+
+/** Merge one finished category into the shared cache. Other categories stay put. */
+export function rememberStorageCategory(category: StorageCategoryResult): StorageScanResult {
+	const previous =
+		cachedResult && Date.now() - cachedResult.scannedAt <= CACHE_TTL_MS
+			? cachedResult.categories
+			: [];
+	const merged = new Map(previous.map((entry) => [entry.key, entry]));
+	merged.set(category.key, category);
+	const ordered = STORAGE_CATEGORY_KEYS.map((key) => merged.get(key)).filter(
+		(entry): entry is StorageCategoryResult => Boolean(entry),
+	);
+	for (const entry of merged.values()) {
+		if (!ordered.some((existing) => existing.key === entry.key)) ordered.push(entry);
+	}
+	const result = assembleStorageScanResult(ordered);
+	cachedResult = result;
+	return result;
+}
+
+/**
+ * Measure one category.
+ *
+ * Categories do not wait on each other. Directory walks run in filesystem workers;
+ * the database measurement keeps its own read-worker path. `await Promise.resolve()`
+ * lets every category reach its first real wait before any of them does synchronous
+ * sqlite on the way into the database scan.
+ */
+export async function scanStorageCategory(
+	key: StorageCategoryKey,
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	await Promise.resolve();
+	throwIfAborted(options.signal);
+	// The database step still has synchronous sqlite before its first internal await.
+	// Yielding a turn lets sibling directory workers spawn first when a full scan
+	// starts every category together.
+	if (key === "database") {
+		await new Promise<void>((resolve) => {
+			setTimeout(resolve, 0);
+		});
+		throwIfAborted(options.signal);
+	}
+	try {
+		switch (key) {
+			case "database":
+				return await scanDatabase((progress) => {
+					options.onProgress?.({ done: progress.done, total: progress.total });
+				}, options.signal);
+			case "uploads":
+				return await scanUploads(options);
+			case "chatAttachments":
+				return await scanChatAttachments(options);
+			case "shares":
+				return await scanShares(options);
+			case "worktrees":
+				return await scanWorktrees(options);
+			case "treeSnapshots":
+				return await scanTreeSnapshots(options);
+			case "requestRecordings":
+				return await scanRequestRecordings(false, options);
+			case "savedRequestRecordings":
+				return await scanRequestRecordings(true, options);
+			case "dormantIgnored":
+				return await scanDormantIgnored(options);
+			case "containers":
+				return await scanContainers(options);
+		}
+	} catch (error) {
+		rethrowScanFailure(error);
+	}
+}
+
+type StorageScanEvent =
+	| {
+			type: "progress";
+			message: string;
+			detail?: { done: number; total: number | null };
+	  }
+	| { type: "category"; data: StorageCategoryResult }
+	| { type: "error"; error: unknown }
+	| { type: "done" };
+
+/**
+ * Scan every category at once.
+ *
+ * Completion order is whatever finishes first. The returned category list is
+ * still the stable display order. A failure in one category aborts the rest and
+ * rejects the generator, matching the previous all-or-nothing contract.
+ */
+export async function* scanStorage(
+	options: { signal?: AbortSignal } = {},
+): AsyncGenerator<
+	| { type: "progress"; message: string; detail?: { done: number; total: number | null } }
+	| { type: "category"; data: StorageCategoryResult },
+	StorageScanResult
+> {
+	const callerSignal = options.signal;
+	throwIfAborted(callerSignal);
+	const linked = new AbortController();
+	if (callerSignal) {
+		if (callerSignal.aborted) linked.abort();
+		else callerSignal.addEventListener("abort", () => linked.abort(), { once: true });
+	}
+
+	const finished: StorageCategoryResult[] = [];
+	const queue: StorageScanEvent[] = [];
+	let notify: (() => void) | null = null;
+	let remaining = STORAGE_CATEGORY_KEYS.length;
+	let failure: unknown = null;
+
+	const push = (event: StorageScanEvent) => {
+		queue.push(event);
+		const resume = notify;
+		notify = null;
+		resume?.();
+	};
+
+	for (const key of STORAGE_CATEGORY_KEYS) {
+		void (async () => {
+			try {
+				push({ type: "progress", message: STORAGE_CATEGORY_PROGRESS_MESSAGE[key] });
+				const result = await scanStorageCategory(key, {
+					signal: linked.signal,
+					onProgress: (detail) => {
+						push({
+							type: "progress",
+							message: STORAGE_CATEGORY_PROGRESS_MESSAGE[key],
+							detail,
+						});
+					},
+				});
+				finished.push(result);
+				push({ type: "category", data: result });
+			} catch (error) {
+				if (!failure) {
+					failure = error;
+					linked.abort();
+					push({ type: "error", error });
+				}
+			} finally {
+				remaining--;
+				if (remaining === 0) push({ type: "done" });
+			}
+		})();
+	}
+
+	while (true) {
+		if (queue.length === 0) {
+			await new Promise<void>((resolve) => {
+				notify = resolve;
+			});
+			continue;
+		}
+		const event = queue.shift();
+		if (!event || event.type === "done") break;
+		if (event.type === "error") rethrowScanFailure(event.error);
+		yield event;
+	}
+	if (failure) rethrowScanFailure(failure);
+
+	const ordered = STORAGE_CATEGORY_KEYS.map((key) =>
+		finished.find((entry) => entry.key === key),
+	).filter((entry): entry is StorageCategoryResult => Boolean(entry));
+	const result = assembleStorageScanResult(ordered);
 	cachedResult = result;
 	return result;
 }

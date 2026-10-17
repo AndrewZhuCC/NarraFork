@@ -49,6 +49,7 @@ import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
+import { savedSelectionReference } from "../composer/file-reference-input";
 import type { DiffLine } from "../diff/DiffView";
 import { availableModes } from "../file-viewer/file-viewer-modes";
 import { filePanelBaseName } from "../panels/panel-kind";
@@ -153,6 +154,10 @@ function FileEditorDocument({
 	const tRef = useRef(t);
 	tRef.current = t;
 	const scope = useFileReferenceScope();
+	const addReferenceRef = useRef(scope.addReference);
+	addReferenceRef.current = scope.addReference;
+	const quoteActiveRef = useRef(false);
+	const sourceTargetRef = useRef({ deviceId, path: filePath });
 	const publishSelection = onFileReferenceSelectionChange ?? scope.setSelection;
 	// Session callbacks outlive renders; always invoke the latest publisher.
 	const publishSelectionRef = useRef(publishSelection);
@@ -236,6 +241,7 @@ function FileEditorDocument({
 				encode: encodeEditorSnapshot,
 				translate: (key, defaultValue) => tRef.current(`fileEditor.${key}`, { defaultValue }),
 				applyContent: (text, document) => {
+					if (document) sourceTargetRef.current = document.target;
 					const model = editorRef.current?.getModel();
 					// Document identity changed: drop selection ownership without a React
 					// render storm. Non-explicit Monaco callbacks only clear the ref.
@@ -298,12 +304,16 @@ function FileEditorDocument({
 								]);
 								if ((origin.current || deviceId !== "local") && !narratorId)
 									throw new Error(tRef.current("fileEditor.missingContext"));
-								if (deviceId !== "local")
-									return fileReferenceApi.preview(
+								if (deviceId !== "local") {
+									const source = await fileReferenceApi.preview(
 										narratorId as string,
 										{ deviceId, path: filePath },
 										boundedSignal,
 									);
+									boundedSignal.throwIfAborted();
+									sourceTargetRef.current = source.target;
+									return source;
+								}
 								return request<{ content: string; encoding: string; hash: string }>(
 									`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
 									{ signal: boundedSignal },
@@ -316,9 +326,11 @@ function FileEditorDocument({
 	);
 
 	useEffect(() => {
+		quoteActiveRef.current = true;
 		session.activate();
 		void session.load();
 		return () => {
+			quoteActiveRef.current = false;
 			previewController.current?.abort();
 			session.dispose();
 		};
@@ -384,6 +396,43 @@ function FileEditorDocument({
 		},
 		[deviceId, filePath, publishSelection, session],
 	);
+	const quoteBlocked = (current: EditorSessionState | null) =>
+		!current?.loaded ||
+		current.loading ||
+		current.phase !== "idle" ||
+		!current.baseHash ||
+		!!current.error ||
+		!!current.conflict ||
+		!!current.confirmation ||
+		sessionDirty(current);
+	const quoteSelection = (range: FileSelection) => {
+		// Check the controller, not a render snapshot: edits/save-start publish synchronously.
+		const current = session.state;
+		if (
+			!quoteActiveRef.current ||
+			!addReferenceRef.current ||
+			!current.baseHash ||
+			quoteBlocked(current)
+		)
+			return;
+		const reference = savedSelectionReference({
+			target: { ...sourceTargetRef.current, selection: range },
+			label: filePanelBaseName(sourceTargetRef.current.path),
+			expectedHash: current.baseHash,
+			dirty: sessionDirty(current),
+		});
+		if (reference) addReferenceRef.current(reference);
+	};
+	const quoteSelectionDisabledReason =
+		!state?.loaded || state.loading
+			? t("common:loading")
+			: state.phase !== "idle"
+				? t(state.phase === "unknown" ? "fileEditor.unknownSave" : "fileEditor.saveTask")
+				: sessionDirty(state)
+					? t("quote.fileUnsaved")
+					: quoteBlocked(state)
+						? t("quote.fileUnavailable")
+						: null;
 	const dirty = state ? sessionDirty(state) : false;
 	const exitBlocked = state ? sessionExitBlocked(state) : false;
 	const baseHash = state?.baseHash;
@@ -1117,6 +1166,8 @@ function FileEditorDocument({
 						onReady={handleReady}
 						onDocumentChange={handleChange}
 						onSelectionChange={handleSelection}
+						onQuoteSelection={scope.addReference ? quoteSelection : undefined}
+						quoteSelectionDisabledReason={quoteSelectionDisabledReason}
 						onSearchRequested={openSearch}
 						onSave={handleSave}
 						onError={(error) => setEditorError(error.message)}

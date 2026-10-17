@@ -1,6 +1,6 @@
 {
-  "id": "ad2f22a4-0a76-46e9-8e78-faabb8a2a810",
-  "prevId": "d328ea85-67c6-4b54-b1a0-b00e6fca594b",
+  "id": "0df527be-c9be-4537-ae5f-3533e4a5148b",
+  "prevId": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -538,18 +538,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "token_accounting_version": {
-          "name": "token_accounting_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "token_accounting_review_version": {
-          "name": "token_accounting_review_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false
-        },
         "input_tokens": {
           "name": "input_tokens",
           "type": "integer",
@@ -659,8 +647,14 @@
           "primaryKey": false,
           "notNull": false
         },
-        "raw_dump_json": {
-          "name": "raw_dump_json",
+        "diagnostics_json": {
+          "name": "diagnostics_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recording_request_id": {
+          "name": "recording_request_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -799,46 +793,17 @@
           "method": "btree",
           "with": {}
         },
-        "idx_api_requests_token_repair_pending": {
-          "name": "idx_api_requests_token_repair_pending",
+        "idx_api_requests_recording": {
+          "name": "idx_api_requests_recording",
           "columns": [
             {
-              "expression": "created_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
+              "expression": "recording_request_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
             }
           ],
           "isUnique": false,
-          "where": "\"token_accounting_version\" IS NULL AND \"token_accounting_review_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "idx_api_requests_token_repair_reviewed": {
-          "name": "idx_api_requests_token_repair_reviewed",
-          "columns": [
-            {
-              "expression": "created_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"token_accounting_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -11316,12 +11281,12 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.narrator_context_char_pages": {
-      "name": "narrator_context_char_pages",
+    "public.narrator_context_pins": {
+      "name": "narrator_context_pins",
       "schema": "",
       "columns": {
-        "id": {
-          "name": "id",
+        "generation": {
+          "name": "generation",
           "type": "text",
           "primaryKey": true,
           "notNull": true
@@ -11329,18 +11294,6 @@
         "narrator_id": {
           "name": "narrator_id",
           "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "generation": {
-          "name": "generation",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "page": {
-          "name": "page",
-          "type": "integer",
           "primaryKey": false,
           "notNull": true
         },
@@ -11352,38 +11305,26 @@
         }
       },
       "indexes": {
-        "context_char_pages_generation_page_idx": {
-          "name": "context_char_pages_generation_page_idx",
+        "idx_context_pins_narrator": {
+          "name": "idx_context_pins_narrator",
           "columns": [
             {
               "expression": "narrator_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
-            },
-            {
-              "expression": "generation",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "page",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
             }
           ],
-          "isUnique": true,
+          "isUnique": false,
           "concurrently": false,
           "method": "btree",
           "with": {}
         }
       },
       "foreignKeys": {
-        "narrator_context_char_pages_narrator_id_narrators_id_fk": {
-          "name": "narrator_context_char_pages_narrator_id_narrators_id_fk",
-          "tableFrom": "narrator_context_char_pages",
+        "narrator_context_pins_narrator_id_narrators_id_fk": {
+          "name": "narrator_context_pins_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_context_pins",
           "tableTo": "narrators",
           "columnsFrom": [
             "narrator_id"
@@ -11432,6 +11373,12 @@
         },
         "file_references_json": {
           "name": "file_references_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "composer_document": {
+          "name": "composer_document",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -11945,6 +11892,57 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_message_context_stats": {
+      "name": "narrator_message_context_stats",
+      "schema": "",
+      "columns": {
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "parent_tool_use_id": {
+          "name": "parent_tool_use_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "segments_json": {
+          "name": "segments_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk": {
+          "name": "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk",
+          "tableFrom": "narrator_message_context_stats",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.narrator_message_refs": {
       "name": "narrator_message_refs",
       "schema": "",
@@ -12198,6 +12196,12 @@
         },
         "content_text": {
           "name": "content_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "composer_document": {
+          "name": "composer_document",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -13615,6 +13619,36 @@
             },
             {
               "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "tool_use_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "execution_attempt",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "input_chars",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "output_chars",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -21604,310 +21638,6 @@
         "ck_terminals_resource_owner": {
           "name": "ck_terminals_resource_owner",
           "value": "\"worktree_resource_id\" is null or (\"chapter_id\" is null and \"narrator_id\" is null)"
-        }
-      },
-      "isRLSEnabled": false
-    },
-    "public.usage_token_repair_candidates": {
-      "name": "usage_token_repair_candidates",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "job_id": {
-          "name": "job_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "request_id": {
-          "name": "request_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "provider": {
-          "name": "provider",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "model": {
-          "name": "model",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "snapshot_json": {
-          "name": "snapshot_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "evidence_json": {
-          "name": "evidence_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "applied_at": {
-          "name": "applied_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "applied_by": {
-          "name": "applied_by",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "totals_status": {
-          "name": "totals_status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'unchanged'"
-        }
-      },
-      "indexes": {
-        "idx_token_repair_candidate_request": {
-          "name": "idx_token_repair_candidate_request",
-          "columns": [
-            {
-              "expression": "job_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "request_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "idx_token_repair_candidates_page": {
-          "name": "idx_token_repair_candidates_page",
-          "columns": [
-            {
-              "expression": "job_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "token_repair_snapshot_bound": {
-          "name": "token_repair_snapshot_bound",
-          "value": "length(\"snapshot_json\") <= 8192"
-        },
-        "token_repair_evidence_bound": {
-          "name": "token_repair_evidence_bound",
-          "value": "length(\"evidence_json\") <= 16384"
-        }
-      },
-      "isRLSEnabled": false
-    },
-    "public.usage_token_repair_jobs": {
-      "name": "usage_token_repair_jobs",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "status": {
-          "name": "status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_by": {
-          "name": "created_by",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "owner_id": {
-          "name": "owner_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "lease_until": {
-          "name": "lease_until",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "scanned": {
-          "name": "scanned",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "repaired": {
-          "name": "repaired",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "conflicts": {
-          "name": "conflicts",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "upper_created_at": {
-          "name": "upper_created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "upper_id": {
-          "name": "upper_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "cursor_created_at": {
-          "name": "cursor_created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "cursor_id": {
-          "name": "cursor_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "include_reviewed": {
-          "name": "include_reviewed",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "protocol_overrides_json": {
-          "name": "protocol_overrides_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'[]'"
-        },
-        "source_job_id": {
-          "name": "source_job_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "error": {
-          "name": "error",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        }
-      },
-      "indexes": {
-        "idx_token_repair_jobs_created": {
-          "name": "idx_token_repair_jobs_created",
-          "columns": [
-            {
-              "expression": "created_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "idx_token_repair_single_active": {
-          "name": "idx_token_repair_single_active",
-          "columns": [
-            {
-              "expression": "(1)",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"status\" IN ('analyzing', 'ready', 'applying')",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "token_repair_protocol_config_bound": {
-          "name": "token_repair_protocol_config_bound",
-          "value": "length(\"protocol_overrides_json\") <= 16384"
-        },
-        "token_repair_error_bound": {
-          "name": "token_repair_error_bound",
-          "value": "\"error\" IS NULL OR length(\"error\") <= 2048"
         }
       },
       "isRLSEnabled": false

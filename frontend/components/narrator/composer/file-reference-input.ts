@@ -1,4 +1,9 @@
 import {
+	type ComposerDocument,
+	composerDocumentText,
+	readComposerDocument,
+} from "@shared/composer-document";
+import {
 	type FileReference,
 	type FileReferenceCandidate,
 	type FileReferenceEditorSelection,
@@ -14,6 +19,22 @@ import {
 export interface FileReferenceInput {
 	text: string;
 	fileReferences: FileReference[];
+	composerDocument?: ComposerDocument;
+}
+
+/** Discard stale sidecars rather than letting a legacy text mutation restore an old layout. */
+export function readInputComposerDocument(
+	value: unknown,
+	text: string,
+	fileReferences: FileReference[],
+): ComposerDocument | undefined {
+	const document = readComposerDocument(value);
+	if (!document) return undefined;
+	const projection = composerDocumentText(document);
+	return projection.text === text &&
+		JSON.stringify(projection.fileReferences) === JSON.stringify(fileReferences)
+		? document
+		: undefined;
 }
 
 export interface FileReferenceQuery {
@@ -55,10 +76,12 @@ export function getFileReferenceQuery(
 	value: string,
 	caret: number,
 	references: readonly FileReference[] = [],
+	/** Start of the current contiguous text run; atoms are hard query boundaries. */
+	textStart = 0,
 ): FileReferenceQuery | null {
 	if (caret <= 0 || caret > value.length) return null;
 	const start = value.lastIndexOf("#", caret - 1);
-	if (start < 0 || (start > 0 && !BOUNDARY.test(value[start - 1]))) return null;
+	if (start < textStart || (start > textStart && !BOUNDARY.test(value[start - 1]))) return null;
 	if (
 		references.some(
 			(ref) => ref.inputRange && start >= ref.inputRange[0] && start < ref.inputRange[1],
@@ -190,7 +213,20 @@ export function readFileReferences(value: unknown, text?: string): FileReference
 }
 
 export function sameFileReferenceInput(a: FileReferenceInput, b: FileReferenceInput): boolean {
-	return a.text === b.text && JSON.stringify(a.fileReferences) === JSON.stringify(b.fileReferences);
+	return (
+		a.text === b.text &&
+		JSON.stringify(a.fileReferences) === JSON.stringify(b.fileReferences) &&
+		JSON.stringify(
+			a.composerDocument
+				? (readComposerDocument(a.composerDocument) ?? a.composerDocument)
+				: undefined,
+		) ===
+			JSON.stringify(
+				b.composerDocument
+					? (readComposerDocument(b.composerDocument) ?? b.composerDocument)
+					: undefined,
+			)
+	);
 }
 
 /** A single browser edit moves disjoint tokens and invalidates every touched occurrence. */
@@ -231,11 +267,65 @@ export function editFileReferenceInput(
 		if (start >= b) return [ref];
 		return [];
 	});
-	return { text, fileReferences };
+	let composerDocument: ComposerDocument | undefined;
+	const document = input.composerDocument;
+	if (document) {
+		// Quote prefixes are model-only projection; map edits only into a single real text node.
+		const quoteNodes = document.paragraphs.flatMap((p) =>
+			p.children.filter((n) => n.type === "quote"),
+		);
+		let offset = composerDocumentText({ ...document, paragraphs: [{ children: quoteNodes }] }).text
+			.length;
+		for (let p = 0; p < document.paragraphs.length; p++) {
+			if (p) offset++;
+			for (let n = 0; n < document.paragraphs[p].children.length; n++) {
+				const node = document.paragraphs[p].children[n];
+				const length =
+					node.type === "text"
+						? node.text.length
+						: node.type === "break"
+							? 1
+							: node.type === "fileReference"
+								? fileReferenceToken(node.reference).length
+								: 0;
+				if (
+					!composerDocument &&
+					node.type === "text" &&
+					start >= offset &&
+					end <= offset + length
+				) {
+					const replacement = {
+						...node,
+						text:
+							node.text.slice(0, start - offset) +
+							text.slice(start, nextEnd) +
+							node.text.slice(end - offset),
+					};
+					const candidate: ComposerDocument = {
+						...document,
+						paragraphs: document.paragraphs.map((paragraph, pi) =>
+							pi === p
+								? {
+										children: paragraph.children.map((child, ni) =>
+											ni === n ? replacement : child,
+										),
+									}
+								: paragraph,
+						),
+					};
+					composerDocument = readInputComposerDocument(candidate, text, fileReferences);
+				}
+				offset += length;
+			}
+		}
+	}
+	return { text, fileReferences, ...(composerDocument ? { composerDocument } : {}) };
 }
 
 /** Trim the two edges separately: a single broad diff could swallow otherwise intact tokens. */
 export function trimFileReferenceInput(input: FileReferenceInput): FileReferenceInput {
+	// The structured projection owns UTF-16 ranges, including its edge whitespace.
+	if (input.composerDocument) return input;
 	const leftTrimmed = editFileReferenceInput(input, input.text.trimStart());
 	return editFileReferenceInput(leftTrimmed, leftTrimmed.text.trimEnd());
 }

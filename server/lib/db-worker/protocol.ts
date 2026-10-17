@@ -30,6 +30,8 @@ import type {
 export type DbReadTaskName =
 	| "storageScanContext"
 	| "storageScanTables"
+	| "storageScanSerial"
+	| "storageScanCleanupSummaries"
 	| "usageHistoryQuery"
 	| "searchQuery"
 	| "displayPageMessages"
@@ -80,6 +82,50 @@ export interface StorageScanTablesParams {
 	kind: "storageScanTables";
 	/** The shard: which tables this worker should measure. */
 	tableNames: string[];
+	/**
+	 * Schema and dbstat snapshot from `storageScanContext`.
+	 *
+	 * When present the shard must not run `dbstat` again. Absent only for older callers and tests;
+	 * the worker then loads context itself.
+	 */
+	context?: StorageScanContextResult;
+}
+
+/** One read-only connection measures every table. Used when sharded workers cannot run. */
+export interface StorageScanSerialParams {
+	kind: "storageScanSerial";
+	mainBytes: number;
+}
+
+export interface StorageScanCleanupRelation {
+	tableName: string;
+	alias: string;
+	narratorColumn: string;
+	countAs?: "toolCalls" | "apiRequests";
+}
+
+/**
+ * Cleanup-candidate byte totals. The narrator id lists are already decided on the main
+ * thread; this task only runs the aggregates.
+ */
+export interface StorageScanCleanupSummariesParams {
+	kind: "storageScanCleanupSummaries";
+	archivedNarratorIds: string[];
+	staleNarratorIds: string[];
+	relations: StorageScanCleanupRelation[];
+	toolCallCutoffIso: string;
+}
+
+export interface StorageScanByteSummary {
+	count: number;
+	approxBytes: number;
+	oldestAt: string | null;
+}
+
+export interface StorageScanCleanupSummariesResult {
+	archivedApproxBytes: number;
+	staleApproxBytes: number;
+	toolCalls: StorageScanByteSummary;
 }
 
 export interface StorageScanTablesResult {
@@ -112,6 +158,8 @@ export interface StorageScanTablesResult {
 export type DbReadTaskParams =
 	| StorageScanContextParams
 	| StorageScanTablesParams
+	| StorageScanSerialParams
+	| StorageScanCleanupSummariesParams
 	| UsageHistoryQueryParams
 	| SearchQueryParams
 	| DisplayPageMessagesParams

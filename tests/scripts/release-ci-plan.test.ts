@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	assertCiMainAncestor,
 	ciApiList,
 	createCiReleasePlan,
 	revalidateCiReleasePlan,
@@ -157,6 +158,26 @@ const componentEvidence = {
 };
 
 describe("CI release plan trust boundary", () => {
+	test("ancestry checks project only trust fields before bounded output collection", async () => {
+		const state = fixture();
+		await assertCiMainAncestor(state.run, commit);
+		expect(state.calls.at(-1)).toEqual([
+			"api",
+			`repos/${CI_RELEASE_REPOSITORY}/compare/${commit}...${main}?per_page=1`,
+			"--jq",
+			"{status, merge_base_commit: {sha: .merge_base_commit.sha}}",
+		]);
+		state.ancestor = false;
+		await expect(assertCiMainAncestor(state.run, commit)).rejects.toThrow("not an ancestor");
+		await expect(
+			assertCiMainAncestor(async (args) => {
+				if (args[1].includes("/compare/")) {
+					return JSON.stringify({ status: "ahead", merge_base_commit: { sha: main } });
+				}
+				return state.run(args);
+			}, commit),
+		).rejects.toThrow("not an ancestor");
+	});
 	test("component evidence has strict bounded structure and its own version/tag identity", async () => {
 		const plan = await createCiReleasePlan(options(fixture()));
 		expect(validateCiReleasePlan({ ...plan, componentEvidence }).componentEvidence).toEqual(
@@ -644,7 +665,14 @@ describe("CI release plan trust boundary", () => {
 		await expect(createCiReleasePlan({ ...options(state), publish: true, run })).rejects.toThrow(
 			"404",
 		);
-		expect(state.calls.every((args) => args.length === 2 || args[1] === "graphql")).toBe(true);
+		expect(
+			state.calls.every(
+				(args) =>
+					args.length === 2 ||
+					args[1] === "graphql" ||
+					(args.length === 4 && args[1].includes("/compare/") && args[2] === "--jq"),
+			),
+		).toBe(true);
 	});
 	test("publication rechecks moved tag and lost main ancestry", async () => {
 		const state = fixture();

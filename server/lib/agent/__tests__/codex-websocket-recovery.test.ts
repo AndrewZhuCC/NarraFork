@@ -13,7 +13,7 @@
  */
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { saveSettings, settings } from "@server/lib/settings";
-import type { RecordingFrame, RequestRecording } from "@shared/request-recording";
+import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
 import type { ServerWebSocket } from "bun";
 import type { CodexComposerCapture } from "../codex-composer";
 import {
@@ -177,15 +177,49 @@ async function runStream(
 	return events;
 }
 
-function liveRecording(frames: RecordingFrame[]): RequestRecording {
+type RecordingEntry =
+	| { kind: "request"; request: RecordingRequest }
+	| { kind: "meta"; meta: Record<string, unknown> }
+	| { kind: "frame"; frame: RecordingFrame };
+
+function liveRecording(frames: RecordingFrame[], log: RecordingEntry[] = []): RequestRecording {
 	return {
 		requestId: "ws-recording",
-		request: () => {},
-		responseMeta: () => {},
+		pin: () => {},
+		request: (request) => log.push({ kind: "request", request }),
+		responseMeta: (meta) => log.push({ kind: "meta", meta }),
 		responseChunk: () => {},
-		frame: (frame) => frames.push(frame),
+		frame: (frame) => {
+			frames.push(frame);
+			log.push({ kind: "frame", frame });
+		},
 		finish: () => {},
 	};
+}
+
+/** Split recorded frames into per-dispatch groups, each opened by an outgoing WS message. */
+function attemptFrames(log: RecordingEntry[]): RecordingFrame[][] {
+	const attempts: RecordingFrame[][] = [];
+	for (const entry of log) {
+		if (entry.kind !== "frame") continue;
+		const { frame } = entry;
+		if (frame.direction === "request" && frame.type === "websocket.message") attempts.push([]);
+		attempts.at(-1)?.push(frame);
+	}
+	return attempts;
+}
+
+function responseTranscript(frames: RecordingFrame[]): string {
+	return frames
+		.filter((frame) => frame.direction === "response")
+		.map((frame) =>
+			frame.type === "websocket.close"
+				? `[websocket close ${frame.metadata?.code}] ${frame.metadata?.reason}`
+				: typeof frame.text === "string"
+					? frame.text
+					: "",
+		)
+		.join("\n");
 }
 
 test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incoming message boundaries", async () => {
@@ -193,7 +227,7 @@ test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incomi
 		for (const frame of completedFrames(`live-${requestIndex}`, "ok中")) send(frame);
 	});
 	const firstFrames: RecordingFrame[] = [];
-	const first = new ApiRequestDumpCollector(undefined, liveRecording(firstFrames));
+	const first = new ApiRequestDumpCollector(liveRecording(firstFrames));
 	await runStream(activeServer, { requestDump: first, input: ["hello"] });
 	const upgrade = firstFrames.find((frame) => frame.type === "websocket.upgrade");
 	expect(upgrade?.metadata?.status).toBe(101);
@@ -202,23 +236,14 @@ test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incomi
 	);
 	expect(responseMessages.map((frame) => frame.text)).toEqual(completedFrames("live-0", "ok中"));
 	const secondFrames: RecordingFrame[] = [];
-	const second = new ApiRequestDumpCollector(
-		undefined,
-		liveRecording(secondFrames),
-		undefined,
-		4096,
-	);
+	const secondLog: RecordingEntry[] = [];
 	await runStream(activeServer, {
-		requestDump: second,
+		requestDump: new ApiRequestDumpCollector(liveRecording(secondFrames, secondLog)),
 		input: ["hello", "again"],
 	});
-	expect(second.snapshot().initialRequest?.body).toMatchObject({
-		input: ["hello", "again"].map((text) => ({
-			role: "user",
-			content: [{ type: "input_text", text }],
-		})),
-	});
-	expect(second.snapshot().request?.body).toEqual(activeServer.requests[1].body);
+	// The actual delta is recorded once as a WS message, not copied as a logical full body.
+	const requests = secondLog.flatMap((entry) => (entry.kind === "request" ? [entry.request] : []));
+	expect(requests.every((request) => request.bodyText === undefined)).toBe(true);
 	const reused = secondFrames.find((frame) => frame.type === "websocket.connection");
 	expect(reused?.metadata).toMatchObject({
 		reused: true,
@@ -255,7 +280,7 @@ test("WS rejection records actual HTTP status and sanitized headers before fallb
 					connectionCount: () => 0,
 					stop: () => {},
 				},
-				{ requestDump: new ApiRequestDumpCollector(undefined, liveRecording(frames)) },
+				{ requestDump: new ApiRequestDumpCollector(liveRecording(frames)) },
 			),
 		).rejects.toThrow("403");
 		const rejected = frames.find((frame) => frame.type === "websocket.upgrade_rejected");
@@ -272,7 +297,8 @@ test("consumer cancellation captures the actual close and leaves no live WS coll
 		send(JSON.stringify({ type: "response.output_text.delta", delta: "partial", output_index: 0 }));
 	});
 	const frames: RecordingFrame[] = [];
-	const dump = new ApiRequestDumpCollector(undefined, liveRecording(frames));
+	const log: RecordingEntry[] = [];
+	const dump = new ApiRequestDumpCollector(liveRecording(frames, log));
 	const stream = streamCodexResponsesWebSocket({
 		baseUrl: activeServer.baseUrl,
 		apiKey: "sk-test",
@@ -292,7 +318,8 @@ test("consumer cancellation captures the actual close and leaves no live WS coll
 	expect((await stream.next()).value?.text).toBe("partial");
 	await stream.return(undefined);
 	expect(frames.some((frame) => frame.type === "websocket.close")).toBe(true);
-	expect(dump.snapshot().response?.bodyIncomplete).toBe(true);
+	const metas = log.flatMap((entry) => (entry.kind === "meta" ? [entry.meta] : []));
+	expect(Object.assign({}, ...metas).bodyIncomplete).toBe(true);
 });
 
 test("raw malformed frames and close reasons survive retries without mixing attempts", async () => {
@@ -302,17 +329,26 @@ test("raw malformed frames and close reasons survive retries without mixing atte
 			close(1008, "websocket_connection_limit_reached");
 		} else for (const frame of completedFrames(`r-${requestIndex}`, "ok")) send(frame);
 	});
-	const first = new ApiRequestDumpCollector();
-	await runStream(activeServer, { requestDump: first });
-	expect(first.snapshot().attempts?.[0].response?.bodyText).toContain("not-json 中\n");
-	expect(first.snapshot().attempts?.[0].response?.bodyText).toContain("[websocket close 1008]");
-	expect(first.snapshot().response?.bodyText).toContain("response.completed");
-	expect(first.snapshot().response?.bodyText).not.toContain("not-json");
-	const before = JSON.stringify(first.snapshot());
-	const second = new ApiRequestDumpCollector();
-	await runStream(activeServer, { requestDump: second });
-	expect(JSON.stringify(first.snapshot())).toBe(before);
-	expect(second.snapshot().response?.bodyText).toContain("r-2");
+	const firstLog: RecordingEntry[] = [];
+	await runStream(activeServer, {
+		requestDump: new ApiRequestDumpCollector(liveRecording([], firstLog)),
+	});
+	const attempts = attemptFrames(firstLog);
+	expect(attempts.length).toBeGreaterThanOrEqual(2);
+	expect(responseTranscript(attempts[0])).toContain("not-json 中");
+	expect(responseTranscript(attempts[0])).toContain(
+		"[websocket close 1008] websocket_connection_limit_reached",
+	);
+	const last = responseTranscript(attempts.at(-1) ?? []);
+	expect(last).toContain("response.completed");
+	expect(last).not.toContain("not-json");
+	const before = JSON.stringify(firstLog);
+	const secondLog: RecordingEntry[] = [];
+	await runStream(activeServer, {
+		requestDump: new ApiRequestDumpCollector(liveRecording([], secondLog)),
+	});
+	expect(JSON.stringify(firstLog)).toBe(before);
+	expect(responseTranscript(attemptFrames(secondLog).at(-1) ?? [])).toContain("r-2");
 });
 
 function collectText(events: ParsedStreamEvent[]): string {

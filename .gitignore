@@ -42,6 +42,7 @@ analyze2/
 *.heapsnapshot
 script/
 scripts/*
+!scripts/benchmark-token-repair-bulk.ts
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts
@@ -139,6 +140,7 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/lib/__tests__/generate-sqlite-migrations.test.ts
 # Generated model-history trigger contracts and their migration fixtures must ship with the generators.
 !scripts/lib/generated-model-history-triggers.ts
+!scripts/lib/generated-context-stats-migration.ts
 !scripts/lib/__tests__/model-history-migration-fixture.ts
 !scripts/lib/__tests__/model-history-trigger-generators.test.ts
 # Full application loading/layout smoke is referenced by the browser regression tests.

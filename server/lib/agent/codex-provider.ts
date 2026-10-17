@@ -668,7 +668,6 @@ export class CodexProvider implements ProviderAdapter {
 					userAgent: fingerprint.userAgent,
 					extraHeaders: fingerprint.headers,
 					requestDump: params.requestDump,
-					requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					// Same neutrality rule as the SSE path: a policy violation is a

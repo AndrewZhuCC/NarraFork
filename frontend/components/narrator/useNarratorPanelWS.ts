@@ -114,6 +114,7 @@ export interface PaymentRequiredInfo {
 export interface LeakedToolEvent {
 	phase: "recovered" | "unrecovered";
 	apiRequestId: string;
+	recordingRequestId?: string;
 	toolNames?: string[];
 	snippet?: string;
 }
@@ -1294,7 +1295,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				const signature = JSON.stringify([
 					resolved.requestId,
 					resolved.composition?.generation,
-					resolved.inputCharacters,
 					resolved.occupiedTokens,
 					resolved.percentage,
 					resolved.contextWindow,
@@ -1574,6 +1574,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setLeakedToolEvent({
 					phase: info.phase,
 					apiRequestId: info.apiRequestId,
+					recordingRequestId: info.recordingRequestId,
 					toolNames: info.toolNames,
 					snippet: info.snippet,
 				});

@@ -257,8 +257,8 @@ export function AuthenticatedLayout() {
 		queryFn: api.getSettings,
 		enabled: hasToken,
 	});
-	const requestDumpEnabled = settings?.agent?.requestDumpEnabled === true;
-	const requestDumpErrorsOnly = settings?.agent?.requestDumpErrorsOnly === true;
+	const requestEvidenceAutoPin = settings?.requestEvidence?.autoPin;
+	const requestEvidencePinning = requestEvidenceAutoPin === "all";
 
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const previewLoginRedirect = useRouterState({
@@ -440,8 +440,8 @@ export function AuthenticatedLayout() {
 		);
 	}
 
-	const openRequestDumpSetting = () => {
-		navigate({ to: "/settings/agent", hash: "request-dump-enabled" });
+	const openRequestEvidenceSetting = () => {
+		navigate({ to: "/settings/agent", hash: "request-evidence" });
 	};
 
 	// Only session tabs are projected; persisted project visits are left untouched.
@@ -520,17 +520,17 @@ export function AuthenticatedLayout() {
 
 						<SystemMaintenanceBadge />
 						<UpdateBadge />
-						{requestDumpEnabled && !requestDumpErrorsOnly && (
-							<Tooltip label={t("requestDumpEnabledTooltip")} position="bottom" withArrow>
+						{requestEvidencePinning && (
+							<Tooltip label={t("requestEvidenceAllTooltip")} position="bottom" withArrow>
 								<Button
 									variant="light"
 									color="orange"
 									size="xs"
 									leftSection={<IconAlertTriangle size={14} />}
-									onClick={openRequestDumpSetting}
+									onClick={openRequestEvidenceSetting}
 									style={{ flexShrink: 0 }}
 								>
-									{t("requestDumpEnabledBadge")}
+									{t("requestEvidencePinningBadge")}
 								</Button>
 							</Tooltip>
 						)}

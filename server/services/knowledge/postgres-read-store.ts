@@ -40,6 +40,7 @@ import {
 	desc,
 	eq,
 	getTableColumns,
+	gt,
 	inArray,
 	isNotNull,
 	isNull,
@@ -59,6 +60,8 @@ import type {
 	KnowledgeEntryAclRow,
 	KnowledgeEntryGraphRow,
 	KnowledgeEntryLinkRow,
+	KnowledgeEntryListFilter,
+	KnowledgeEntryListOrder,
 	KnowledgeEntryListRow,
 	KnowledgeEntryRow,
 	KnowledgeLevelRow,
@@ -128,6 +131,58 @@ const GRANT_SELECT = {
 	domainValue: aclGrants.domainValue,
 	createdAt: aclGrants.createdAt,
 } as const;
+
+/**
+ * WHERE for the ordered browse list: SQL-side filters + the keyset predicate of the order
+ * (same rows as the SQLite twin). `level` is the effective level (own level, else the
+ * collection's default — a small `IN` subselect over collections). Title comparison uses the
+ * column's database collation, the same one its ORDER BY uses, so the keyset stays exact.
+ */
+function entryListWhere(
+	db: PgDb,
+	filter: KnowledgeEntryListFilter,
+	order: KnowledgeEntryListOrder,
+) {
+	const level = filter.level;
+	let keyset: ReturnType<typeof or>;
+	if (order.sort === "title") {
+		const after = order.after;
+		keyset = after
+			? or(
+					gt(knowledgeEntries.title, after.title),
+					and(eq(knowledgeEntries.title, after.title), gt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	} else {
+		const after = order.after;
+		keyset = after
+			? or(
+					lt(knowledgeEntries.updatedAt, after.updatedAt),
+					and(eq(knowledgeEntries.updatedAt, after.updatedAt), lt(knowledgeEntries.id, after.id)),
+				)
+			: undefined;
+	}
+	return and(
+		filter.collectionId ? eq(knowledgeEntries.collectionId, filter.collectionId) : undefined,
+		filter.status ? eq(knowledgeEntries.status, filter.status) : undefined,
+		level
+			? or(
+					eq(knowledgeEntries.classificationLevel, level),
+					and(
+						isNull(knowledgeEntries.classificationLevel),
+						inArray(
+							knowledgeEntries.collectionId,
+							db
+								.select({ id: knowledgeCollections.id })
+								.from(knowledgeCollections)
+								.where(eq(knowledgeCollections.defaultLevel, level)),
+						),
+					),
+				)
+			: undefined,
+		keyset,
+	);
+}
 
 export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 	/** Knowledge-scoped grant rows: the two scopes the knowledge ACL lives in. */
@@ -255,12 +310,41 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 		},
 
 		async listEntries(opts) {
+			const after = opts.after;
 			const rows = await db
 				.select(ENTRY_LIST_SELECT)
 				.from(knowledgeEntries)
-				.where(opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined)
-				.orderBy(desc(knowledgeEntries.updatedAt))
+				.where(
+					and(
+						opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+						after
+							? or(
+									lt(knowledgeEntries.updatedAt, after.updatedAt),
+									and(
+										eq(knowledgeEntries.updatedAt, after.updatedAt),
+										lt(knowledgeEntries.id, after.id),
+									),
+								)
+							: undefined,
+					),
+				)
+				.orderBy(desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id))
 				.limit(opts.limit);
+			return rows as KnowledgeEntryListRow[];
+		},
+
+		async listEntriesOrdered(opts) {
+			const { limit, order, ...filter } = opts;
+			const rows = await db
+				.select(ENTRY_LIST_SELECT)
+				.from(knowledgeEntries)
+				.where(entryListWhere(db, filter, order))
+				.orderBy(
+					...(order.sort === "title"
+						? [asc(knowledgeEntries.title), asc(knowledgeEntries.id)]
+						: [desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id)]),
+				)
+				.limit(limit);
 			return rows as KnowledgeEntryListRow[];
 		},
 
@@ -410,6 +494,14 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 				.where(eq(users.id, userId))
 				.limit(1);
 			return rows[0] ?? null;
+		},
+
+		async listUsernamesByIds(userIds) {
+			if (userIds.length === 0) return [];
+			return db
+				.select({ id: users.id, username: users.username })
+				.from(users)
+				.where(inArray(users.id, userIds));
 		},
 
 		async listUserIdsAndRoles(opts) {
@@ -650,6 +742,42 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 					),
 				)
 				.limit(limit);
+		},
+
+		async findActivePersonalEntryId(entryId, authorUserId) {
+			const rows = await db
+				.select({ id: knowledgeDrafts.id })
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.entryId, entryId),
+						eq(knowledgeDrafts.authorUserId, authorUserId),
+						eq(knowledgeDrafts.status, "active"),
+					),
+				)
+				.limit(1);
+			return rows[0]?.id ?? null;
+		},
+
+		async listActivePersonalEntriesForEntries(entryIds, authorUserId) {
+			if (entryIds.length === 0) return [];
+			const rows = await db
+				.select({
+					id: knowledgeDrafts.id,
+					entryId: knowledgeDrafts.entryId,
+					baseRevisionId: knowledgeDrafts.baseRevisionId,
+				})
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						inArray(knowledgeDrafts.entryId, entryIds),
+						eq(knowledgeDrafts.authorUserId, authorUserId),
+						eq(knowledgeDrafts.status, "active"),
+					),
+				);
+			return rows.flatMap((r) =>
+				r.entryId ? [{ id: r.id, entryId: r.entryId, baseRevisionId: r.baseRevisionId }] : [],
+			);
 		},
 
 		async listKnowledgeAclEventRows(opts) {

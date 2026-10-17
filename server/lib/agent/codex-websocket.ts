@@ -202,7 +202,6 @@ export interface StreamCodexResponsesWebSocketOptions {
 	extraHeaders?: Record<string, string>;
 	/** Optional, request-scoped raw transcript capture (not attached to the cached session). */
 	requestDump?: ApiRequestDumpCollector;
-	requestDumpMaxBytes?: number;
 	/** Observe the first exact request envelope and effective handshake headers. */
 	onRequestPrepared?: (request: {
 		url: string;
@@ -1249,19 +1248,12 @@ export async function* streamCodexResponsesWebSocket(
 		const handshakeHeaders = buildHandshakeHeaders(options);
 		let requestReported = false;
 		const beginAttempt = () =>
-			options.requestDump?.beginResponseAttempt(
-				{
-					transport: "websocket",
-					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
-					headers: sanitizeHeaders(handshakeHeaders),
-					method: "GET",
-					...(options.requestDump?.retainInitialRequest
-						? { body: { type: "response.create", ...request } }
-						: {}),
-				},
-				options.requestDumpMaxBytes,
-				false,
-			);
+			options.requestDump?.beginResponseAttempt({
+				transport: "websocket",
+				url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+				headers: sanitizeHeaders(handshakeHeaders),
+				method: "GET",
+			});
 		beginAttempt();
 
 		/**

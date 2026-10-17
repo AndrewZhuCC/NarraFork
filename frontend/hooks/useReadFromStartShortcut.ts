@@ -170,14 +170,15 @@ export function registerReadFromStartTarget(get: () => ReadingTarget): () => voi
 }
 
 export function useFocusComposerShortcut(
-	ref: RefObject<HTMLTextAreaElement | null>,
+	ref: RefObject<HTMLElement | null>,
 	isPrimary = false,
+	element?: HTMLElement | null,
 ): void {
 	const active = useNarratorPanelVisible();
 	const latest = useRef({ active, isPrimary });
 	latest.current = { active, isPrimary };
 	useEffect(() => {
-		const host = ref.current;
+		const host = element ?? ref.current;
 		if (!host) return;
 		return registerReadFromStartTarget(() => ({
 			host,
@@ -186,7 +187,7 @@ export function useFocusComposerShortcut(
 			composer: true,
 			read: () => host.focus(),
 		}));
-	}, [ref]);
+	}, [ref, element]);
 }
 
 export function useReadFromStartShortcut(

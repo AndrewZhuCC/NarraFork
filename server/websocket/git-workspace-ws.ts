@@ -2,19 +2,20 @@ import type {
 	GitWorkspaceCategory,
 	GitWorkspaceClientMessage,
 	GitWorkspaceServerMessage,
+	GitWorkspaceSnapshot,
 	GitWorkspaceSubscribe,
+	GitWorkspaceView,
 } from "@shared/git-workspace-events";
 import { isSessionTokenVersionCurrent } from "@shared/session-auth";
 import { AppError } from "../lib/errors";
 import { authSessionStore } from "../services/auth/store";
-import { invalidateGitWorkspace } from "../services/git-management-service";
 import type { GitWorkspaceTarget } from "../services/git-workspace";
 import { assertGitWorkspaceKey } from "../services/git-workspace";
 import {
 	authorizeGitTargetForPrincipal,
 	requireReadyGitTarget,
 } from "../services/git-workspace-access";
-import { GitWorkspaceWatchPool } from "../services/git-workspace-watch";
+import { GitWorkspaceWatchPool, projectGitSnapshot } from "../services/git-workspace-watch";
 
 interface Socket {
 	data: {
@@ -28,10 +29,16 @@ interface Socket {
 	close?(code?: number, reason?: string): void;
 }
 interface Subscription {
+	target: GitWorkspaceSubscribe;
+	view: GitWorkspaceView;
+	updateView?: (view: GitWorkspaceView) => Promise<void>;
 	controller: AbortController;
 	stop?: () => void;
 	checking: boolean;
 	pending: Set<GitWorkspaceCategory>;
+	pendingSnapshot?: GitWorkspaceSnapshot;
+	refreshRequested?: boolean;
+	refresh?: () => Promise<void>;
 	retryTimer?: ReturnType<typeof setTimeout>;
 }
 const sockets = new Map<Socket, Map<string, Subscription>>();
@@ -99,8 +106,23 @@ export async function handleGitWorkspaceMessage(
 	ws: Socket,
 	message: GitWorkspaceClientMessage,
 ): Promise<void> {
+	if (message.type === "git_workspace_refresh") {
+		await sockets.get(ws)?.get(message.subscriptionId)?.refresh?.();
+		return;
+	}
+	const existing = sockets.get(ws)?.get(message.subscriptionId);
+	if (
+		message.type === "git_workspace_subscribe" &&
+		existing &&
+		existing.target.narratorId === message.narratorId &&
+		existing.target.chapterId === message.chapterId &&
+		existing.target.workspaceKey === message.workspaceKey
+	) {
+		await existing.updateView?.(message.view ?? "details");
+		return;
+	}
 	cancel(ws, message.subscriptionId);
-	if (message.type === "git_workspace_unsubscribe") return;
+	if (message.type !== "git_workspace_subscribe") return;
 	let entries = sockets.get(ws);
 	if (!entries) {
 		entries = new Map();
@@ -118,6 +140,8 @@ export async function handleGitWorkspaceMessage(
 		return;
 	}
 	const sub: Subscription = {
+		target: message,
+		view: message.view ?? "details",
 		controller: new AbortController(),
 		checking: false,
 		pending: new Set(),
@@ -129,13 +153,25 @@ export async function handleGitWorkspaceMessage(
 	let lastAuthorizedAt = 0;
 	let failures = 0;
 	let version = 0;
-	const run = async (categories: GitWorkspaceCategory[]) => {
+	let lastSnapshot: GitWorkspaceSnapshot | undefined;
+	const run = async (categories: GitWorkspaceCategory[], snapshot?: GitWorkspaceSnapshot) => {
 		if (signal.aborted) return;
 		for (const category of categories) sub.pending.add(category);
+		if (snapshot && (!sub.pendingSnapshot || snapshot.revision >= sub.pendingSnapshot.revision)) {
+			sub.pendingSnapshot = snapshot;
+			lastSnapshot = snapshot;
+		}
 		if (sub.checking || sub.retryTimer) return;
 		// Quiet workspaces do not redo the full ACL/path scan every three seconds.
 		// Every actual notification still passes a fresh authorization check.
-		if (currentTarget && !sub.pending.size && Date.now() - lastAuthorizedAt < 30_000) return;
+		if (
+			currentTarget &&
+			!sub.pending.size &&
+			!sub.pendingSnapshot &&
+			!sub.refreshRequested &&
+			Date.now() - lastAuthorizedAt < 30_000
+		)
+			return;
 		sub.checking = true;
 		try {
 			const fresh = await authorize(
@@ -160,15 +196,20 @@ export async function handleGitWorkspaceMessage(
 				sub.stop?.();
 				currentTarget = fresh;
 				expectedKey = workspaceKey;
-				sub.stop = pool.subscribe(fresh, run);
-				// The ACK makes a reconnect/device generation transition take one snapshot.
-				invalidateGitWorkspace(fresh);
+				sub.pendingSnapshot = undefined;
+				lastSnapshot = undefined;
+				// New readers consume the shared snapshot; subscribing is not a filesystem change.
 				send(ws, { type: "git_workspace_subscribed", ...identity, version: ++version });
+				if (signal.aborted) return;
+				sub.stop = pool.subscribe(fresh, run, (value) => void run([], value));
 			}
 			lastAuthorizedAt = Date.now();
 			failures = 0;
+			if (sub.refreshRequested) {
+				sub.refreshRequested = false;
+				pool.refresh(fresh);
+			}
 			if (sub.pending.size) {
-				invalidateGitWorkspace(fresh);
 				send(ws, {
 					type: "git_workspace_changed",
 					...identity,
@@ -176,6 +217,18 @@ export async function handleGitWorkspaceMessage(
 					version: ++version,
 				});
 				sub.pending.clear();
+			}
+			if (sub.pendingSnapshot && !signal.aborted) {
+				const value = sub.pendingSnapshot;
+				sub.pendingSnapshot = undefined;
+				const view = sub.view;
+				send(ws, {
+					type: "git_workspace_snapshot",
+					...identity,
+					version: ++version,
+					view,
+					snapshot: projectGitSnapshot(value, view),
+				});
 			}
 		} catch (error) {
 			if (signal.aborted) return;
@@ -205,6 +258,17 @@ export async function handleGitWorkspaceMessage(
 		} finally {
 			sub.checking = false;
 		}
+	};
+	// Projection changes reuse the directory observer and its existing results.
+	sub.updateView = async (view) => {
+		sub.view = view;
+		await run([], lastSnapshot);
+	};
+	sub.refresh = async () => {
+		sub.refreshRequested = true;
+		clearTimeout(sub.retryTimer);
+		sub.retryTimer = undefined;
+		await run([]);
 	};
 	await run([]);
 }

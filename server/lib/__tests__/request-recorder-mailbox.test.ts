@@ -15,11 +15,10 @@ import {
 import { settings } from "../settings";
 
 const configuration: RecordingSettings = {
-	requestDumpRecordingEnabled: true,
-	requestDumpRequestBytes: 1024 * 1024,
-	requestDumpResponseBytes: 1024 * 1024,
-	requestDumpEnabled: false,
-	requestDumpErrorsOnly: false,
+	ringEnabled: true,
+	ringRequestBytes: 1024 * 1024,
+	ringResponseBytes: 1024 * 1024,
+	autoPin: "off",
 };
 // Pause only the main-side pump to deterministically fill its mailbox. Every queued operation
 // is subsequently handled by the real recorder worker; no worker/store methods are mocked.
@@ -112,7 +111,7 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 					type: "configure",
 					settings: {
 						...configuration,
-						requestDumpRequestBytes: 1024 * 1024 + index,
+						ringRequestBytes: 1024 * 1024 + index,
 					},
 				}),
 			).toBe(true);
@@ -375,7 +374,7 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 			client.capture({ type: "meta", requestId: "ordered", side: "response", value: { index } });
 			client.capture({
 				type: "configure",
-				settings: { ...configuration, requestDumpRequestBytes: 1000 + index },
+				settings: { ...configuration, ringRequestBytes: 1000 + index },
 			});
 		}
 		expect(state.queued.filter((item) => item.op.type === "configure").length).toBe(10);

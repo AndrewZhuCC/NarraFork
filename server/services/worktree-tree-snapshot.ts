@@ -71,7 +71,7 @@ import {
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
-import { normalizePathForComparison } from "../lib/platform-path";
+import { normalizePathForComparison, pathsEqualForOS } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-snapshot-paths";
@@ -84,6 +84,7 @@ import {
 	isResourceProtectionError,
 	lifecycleCreationPath,
 	revalidateLifecycleTarget,
+	withLifecycleContext,
 	withProtectionReservation,
 	withShadowCreationReservation,
 } from "./worktree-lifecycle-guard";
@@ -1135,6 +1136,9 @@ async function validateShadowRepo(dir: string): Promise<void> {
 	});
 	const after = lstatSync(dir);
 	const [bare, gitDir] = result.stdout.trim().split("\n");
+	// Windows realpath preserves the input casing, while Git reports the disk
+	// spelling. Compare OS paths, but still require the exact directory identity.
+	const reported = gitDir && existsSync(gitDir) ? lstatSync(gitDir) : null;
 	if (
 		result.exitCode !== 0 ||
 		result.stdoutTruncated ||
@@ -1143,8 +1147,10 @@ async function validateShadowRepo(dir: string): Promise<void> {
 		!gitDir ||
 		before.dev !== after.dev ||
 		before.ino !== after.ino ||
-		realpathSync(dir) !== canonical ||
-		realpathSync(gitDir) !== canonical
+		reported?.dev !== before.dev ||
+		reported?.ino !== before.ino ||
+		!pathsEqualForOS(realpathSync(dir), canonical, process.platform) ||
+		!pathsEqualForOS(realpathSync(gitDir), canonical, process.platform)
 	)
 		throw new TreeSnapshotError("existing shadow repo is invalid or changed identity");
 }
@@ -1194,72 +1200,80 @@ async function hasValidShadowInitMarker(dir: string, worktreePath: string): Prom
 
 /** Create only an exclusively born shadow directory; never adopt unknown contents. */
 async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void> {
-	// A retirement may take its final snapshot before removing the checkout.
-	dir = await lifecycleCreationPath(dir);
-	if (
-		existsSync(resolve(dir, "HEAD")) &&
-		!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))
-	) {
-		await validateShadowRepo(dir);
-		await syncExcludesIfStale(dir, worktreePath);
-		return;
-	}
-	await withShadowCreationReservation({ deviceId: LOCAL_DEVICE_ID, path: dir }, async () => {
-		dir = await revalidateLifecycleTarget(dir);
-		if (await lstatIfPresent(dir)) {
-			if (!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))) {
-				await validateShadowRepo(dir);
+	// Shared checkout use freezes identities, not ownership. Keep the raw checkout
+	// path for shadow keys; canonical paths are only lifecycle comparison identities.
+	await withLifecycleContext([dir, worktreePath], async () => {
+		// A retirement may take its final snapshot before removing the checkout.
+		dir = await lifecycleCreationPath(dir);
+		if (
+			existsSync(resolve(dir, "HEAD")) &&
+			!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))
+		) {
+			await validateShadowRepo(dir);
+			dir = await revalidateLifecycleTarget(dir);
+			await syncExcludesIfStale(dir, worktreePath);
+			return;
+		}
+		// Only the physical cold birth is exclusive. The source checkout remains
+		// shareable, and existing valid repos never need receipt migration here.
+		await withShadowCreationReservation({ deviceId: LOCAL_DEVICE_ID, path: dir }, async () => {
+			dir = await revalidateLifecycleTarget(dir);
+			if (await lstatIfPresent(dir)) {
+				if (!(await lstatIfPresent(resolve(dir, SHADOW_INIT_MARKER)))) {
+					await validateShadowRepo(dir);
+					dir = await revalidateLifecycleTarget(dir);
+					await syncExcludesIfStale(dir, worktreePath);
+					return;
+				}
+			} else {
+				mkdirSync(resolve(dir, ".."), { recursive: true });
 				dir = await revalidateLifecycleTarget(dir);
-				await syncExcludesIfStale(dir, worktreePath);
-				return;
+				// EEXIST is not permission to run git init against somebody else's directory.
+				mkdirSync(dir);
+				const born = lstatSync(dir);
+				if (!born.isDirectory()) throw new TreeSnapshotError("shadow birth is not a directory");
+				await confirmLifecyclePathCreated(dir, `${born.dev}:${born.ino}`);
+				dir = await revalidateLifecycleTarget(dir);
+				try {
+					await writeFile(
+						resolve(dir, SHADOW_INIT_MARKER),
+						shadowInitMarkerContents(dir, worktreePath),
+						{
+							flag: "wx",
+							mode: 0o600,
+						},
+					);
+				} catch (error) {
+					throw new TreeSnapshotError(
+						`shadow initialization marker creation failed: ${String(error)}`,
+					);
+				}
 			}
-		} else {
-			mkdirSync(resolve(dir, ".."), { recursive: true });
 			dir = await revalidateLifecycleTarget(dir);
-			// EEXIST is not permission to run git init against somebody else's directory.
-			mkdirSync(dir);
-			const born = lstatSync(dir);
-			if (!born.isDirectory()) throw new TreeSnapshotError("shadow birth is not a directory");
-			await confirmLifecyclePathCreated(dir, `${born.dev}:${born.ino}`);
-			dir = await revalidateLifecycleTarget(dir);
-			try {
-				await writeFile(
-					resolve(dir, SHADOW_INIT_MARKER),
-					shadowInitMarkerContents(dir, worktreePath),
-					{
-						flag: "wx",
-						mode: 0o600,
-					},
-				);
-			} catch (error) {
-				throw new TreeSnapshotError(
-					`shadow initialization marker creation failed: ${String(error)}`,
-				);
+			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
+			// `git init --bare` rejects --work-tree, so this cannot go through runGit.
+			const result = await safeSpawn({
+				cmd: ["git", "init", "--bare", dir],
+				timeout: GIT_TIMEOUT_MS,
+				maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+			});
+			if (result.exitCode !== 0) {
+				// Retain even our own failed birth: partial files are evidence, not garbage.
+				throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
 			}
-		}
-		dir = await revalidateLifecycleTarget(dir);
-		if (!(await hasValidShadowInitMarker(dir, worktreePath)))
-			throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
-		// `git init --bare` rejects --work-tree, so this cannot go through runGit.
-		const result = await safeSpawn({
-			cmd: ["git", "init", "--bare", dir],
-			timeout: GIT_TIMEOUT_MS,
-			maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+			dir = await revalidateLifecycleTarget(dir);
+			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
+			await validateShadowRepo(dir);
+			dir = await revalidateLifecycleTarget(dir);
+			await syncExcludes(dir, worktreePath);
+			dir = await revalidateLifecycleTarget(dir);
+			if (!(await hasValidShadowInitMarker(dir, worktreePath)))
+				throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
+			await unlink(resolve(dir, SHADOW_INIT_MARKER));
+			excludeMtimes.delete(dir);
 		});
-		if (result.exitCode !== 0) {
-			// Retain even our own failed birth: partial files are evidence, not garbage.
-			throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
-		}
-		dir = await revalidateLifecycleTarget(dir);
-		if (!(await hasValidShadowInitMarker(dir, worktreePath)))
-			throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
-		await validateShadowRepo(dir);
-		await syncExcludes(dir, worktreePath);
-		dir = await revalidateLifecycleTarget(dir);
-		if (!(await hasValidShadowInitMarker(dir, worktreePath)))
-			throw new TreeSnapshotError("shadow initialization marker is invalid or changed identity");
-		await unlink(resolve(dir, SHADOW_INIT_MARKER));
-		excludeMtimes.delete(dir);
 	});
 }
 
@@ -3732,7 +3746,7 @@ export const worktreeTreeSnapshot = {
 		try {
 			return await withProtectionReservation(
 				[
-					{ deviceId, path: worktreePath, shadowKey: treeSnapshotKey(deviceId, worktreePath) },
+					{ deviceId, shadowKey: treeSnapshotKey(deviceId, worktreePath) },
 					{ deviceId, path: dir },
 				],
 				"shadow destroy",

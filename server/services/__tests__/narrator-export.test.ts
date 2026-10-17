@@ -15,10 +15,7 @@
  *   - lazily-forked history is reachable without materializing (writing) refs
  */
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import {
-	INTELLIGENT_UI_PUBLIC_SUMMARY,
-	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
-} from "@shared/intelligent-ui-public";
+import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "@shared/gen-ui-public";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
@@ -1061,7 +1058,7 @@ describe("cancellation", () => {
 	});
 });
 
-describe("IntelligentUI portable export privacy", () => {
+describe("GenUI portable export privacy", () => {
 	const secret = "PRIVATE_UI_EXPORT_SOURCE_<script>capability-secret</script>";
 
 	async function seedPrivateUi(messageId = "ui-message", toolUseId = "ui-use") {
@@ -1070,12 +1067,12 @@ describe("IntelligentUI portable export privacy", () => {
 			narratorId: "n1",
 			messageId,
 			toolUseId,
-			toolName: "IntelligentUI",
+			toolName: "GenUI",
 			input: { source: secret, privacy: "public" },
 			output: {
 				text: secret.repeat(EXPORT_TOOL_FIELD_LIMIT / secret.length + 2),
 				_metadata: {
-					intelligentUi: { version: 1, path: `${secret}/index.tsx`, title: secret },
+					genUi: { version: 1, path: `${secret}/index.tsx`, title: secret },
 					capability: secret,
 				},
 			},
@@ -1100,18 +1097,14 @@ describe("IntelligentUI portable export privacy", () => {
 			for (const includeToolIO of [true, false]) {
 				const exported = await collect("n1", { format, includeToolIO, lang: "en" });
 				expect(exported).not.toContain(secret);
-				expect(exported).not.toContain('"intelligentUi"');
+				expect(exported).not.toContain('"genUi"');
 				expect(exported).not.toContain('"uiId"');
-				expect(exported).toContain(INTELLIGENT_UI_PUBLIC_SUMMARY);
+				expect(exported).toContain(GEN_UI_PUBLIC_SUMMARY);
 				if (format === "json") {
 					const parsed = JSON.parse(exported);
 					expect(parsed.complete).toBe(true);
-					expect(parsed.messages[0].toolCalls[0].publicSummary).toBe(
-						INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
-					);
-					expect(parsed.messages[0].content[0].publicSummary).toBe(
-						INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
-					);
+					expect(parsed.messages[0].toolCalls[0].publicSummary).toBe(GEN_UI_PUBLIC_SUMMARY_CODE);
+					expect(parsed.messages[0].content[0].publicSummary).toBe(GEN_UI_PUBLIC_SUMMARY_CODE);
 				}
 			}
 		}
@@ -1142,7 +1135,7 @@ describe("IntelligentUI portable export privacy", () => {
 
 	test("ordinary tools keep raw blocks and similarly named metadata unchanged", async () => {
 		seedNarrator("n1");
-		const input = { command: "printf example", privacy: "private", intelligentUi: secret };
+		const input = { command: "printf example", privacy: "private", genUi: secret };
 		const blocks = [{ type: "tool_use", id: "bash-use", name: "Bash", input }];
 		await seedMessage({ id: "bash-message", narratorId: "n1", seq: 1, contentJson: blocks });
 		await seedToolCall({
@@ -1164,7 +1157,7 @@ describe("IntelligentUI portable export privacy", () => {
 		test(`${toolName} exports UI source like ordinary file history`, async () => {
 			seedNarrator("n1");
 			const input = {
-				file_path: ".narrafork/intelligent_ui/demo-abc123/App.tsx",
+				file_path: ".narrafork/gen_ui/demo-abc123/App.tsx",
 				content: "export default function App() { return <p>ordinary UI source</p>; }",
 			};
 			const blocks = [{ type: "tool_use", id: "file-use", name: toolName, input }];
@@ -1182,7 +1175,7 @@ describe("IntelligentUI portable export privacy", () => {
 				const text = await collect("n1", { format, includeToolIO: true });
 				expect(text).toContain(input.file_path);
 				expect(text).toContain("ordinary UI source");
-				expect(text).not.toContain(INTELLIGENT_UI_PUBLIC_SUMMARY_CODE);
+				expect(text).not.toContain(GEN_UI_PUBLIC_SUMMARY_CODE);
 			}
 		});
 	}
@@ -1225,7 +1218,7 @@ describe("IntelligentUI portable export privacy", () => {
 		expect(raw).not.toContain(secret);
 		const child = JSON.parse(raw).messages[0].toolCalls[0].subagentMessages[0];
 		expect(child.content[0].text).toBe("public child text");
-		expect(child.content[1].publicSummary).toBe(INTELLIGENT_UI_PUBLIC_SUMMARY_CODE);
+		expect(child.content[1].publicSummary).toBe(GEN_UI_PUBLIC_SUMMARY_CODE);
 		expect(child.contentText).toBeNull();
 		const markdown = await collect("n1", { lang: "zh-CN" });
 		expect(markdown).not.toContain(secret);
@@ -1237,7 +1230,7 @@ describe("IntelligentUI portable export privacy", () => {
 		for (const format of ["json", "markdown"] as const) {
 			const exported = await collect("n1", { format, lang: "en" });
 			expect(exported).not.toContain(secret);
-			expect(exported).toContain(INTELLIGENT_UI_PUBLIC_SUMMARY);
+			expect(exported).toContain(GEN_UI_PUBLIC_SUMMARY);
 		}
 	});
 
@@ -1256,7 +1249,7 @@ describe("IntelligentUI portable export privacy", () => {
 		for (const format of ["json", "markdown"] as const) {
 			const exported = await collect("n1", { format, lang: "en" });
 			expect(exported).not.toContain(secret);
-			expect(exported).toContain(INTELLIGENT_UI_PUBLIC_SUMMARY);
+			expect(exported).toContain(GEN_UI_PUBLIC_SUMMARY);
 		}
 	});
 });

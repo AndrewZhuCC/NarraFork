@@ -83,6 +83,8 @@ interface WatcherEntry {
 	lastMetadataFingerprint?: string;
 	processing: boolean;
 	pendingProcess: boolean;
+	/** A queued follow-up stays speculative only if every coalesced trigger is a poll. */
+	pendingProcessPolled?: boolean;
 	rateLimit: RateLimitState;
 	/**
 	 * Paths reported by the native watcher during the current debounce window,
@@ -440,14 +442,16 @@ export const worktreeWatcher = {
 	 * anything changed — from a watcher event, which is evidence of a write. Only the
 	 * speculative kind is allowed to skip snapshot work on an unchanged status.
 	 *
-	 * A coalesced follow-up drops the flag: `pendingProcess` was set because a *second*
-	 * trigger arrived while the first was running, and there is no way to tell whether
-	 * that one was a poll or an event, so it is treated as an event. Erring toward doing
-	 * the work is the right direction on a data-safety path.
+	 * A coalesced follow-up stays speculative when only polls arrived. Any native
+	 * event makes it a confirmed write, so overlapping idle polls cannot accidentally
+	 * invalidate shared caches while real filesystem events still force a refresh.
 	 */
 	_enqueueProcessChange(worktreePath: string, entry: WatcherEntry, polled = false): void {
 		if (!this._entries.has(worktreePath)) return;
 		if (entry.processing) {
+			entry.pendingProcessPolled = entry.pendingProcess
+				? entry.pendingProcessPolled === true && polled
+				: polled;
 			entry.pendingProcess = true;
 			return;
 		}
@@ -464,8 +468,10 @@ export const worktreeWatcher = {
 				entry.processing = false;
 				if (!this._entries.has(worktreePath)) return;
 				if (entry.pendingProcess) {
+					const pendingPolled = entry.pendingProcessPolled === true;
 					entry.pendingProcess = false;
-					this._enqueueProcessChange(worktreePath, entry);
+					entry.pendingProcessPolled = undefined;
+					this._enqueueProcessChange(worktreePath, entry, pendingPolled);
 				}
 			});
 	},
@@ -492,9 +498,10 @@ export const worktreeWatcher = {
 		// `statusChanged` would have made those rows silently permanent.
 		this._emitPathChanges(worktreePath, entry, changedPaths, pathsTruncated);
 
-		// Files changed on disk → the cached status is stale. Invalidate then
-		// read through the shared cache so concurrent narrators reuse one query.
-		invalidateStatus(worktreePath);
+		// Native events are evidence of a write. A speculative poll is not: get a
+		// fresh lightweight status without evicting line stats or notifying directory
+		// subscribers until the status/metadata comparison establishes a refresh.
+		if (!polled) invalidateStatus(worktreePath);
 		const statusSummary = await getStatusSummaryCached(worktreePath, { ttlMs: 0 });
 		const currentHead = statusSummary.headSha;
 		const previousHead = entry.lastHeadSha;
@@ -521,6 +528,9 @@ export const worktreeWatcher = {
 			pathsTruncated ||
 			sweepDue;
 		if (refreshNeeded) {
+			// Only changed/uncertain/sweep polls invalidate shared status and line stats.
+			// Keep using this tick's fresh status below rather than querying it twice.
+			if (polled) invalidateStatus(worktreePath);
 			entry.skippedPolls = 0;
 			await this._recordExternalChanges(worktreePath, entry, changedPaths, pathsTruncated);
 		} else {

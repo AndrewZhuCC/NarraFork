@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { apiRequests } from "@server/db/schema";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { apiRequests, narrators } from "@server/db/schema";
 import { settings } from "@server/lib/settings";
 import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { RequestRecorderClient } from "../../request-recorder";
+import type { RecorderOperation } from "../../request-recorder-protocol";
 import { AnthropicProvider } from "../anthropic-provider";
 import { clearCodexResponsesWebSocketSessions } from "../codex-websocket";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
@@ -9,16 +11,14 @@ import { GeminiProvider } from "../gemini-provider";
 import { GrokProvider } from "../grok-provider";
 import { OpenAIProvider } from "../openai-provider";
 import type { ProviderAdapter } from "../provider";
-import type { ApiRequestDump } from "../request-dump";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("@server/db")) };
 mock.module("@server/db", () => ({ ...realDbModule, db, sqlite }));
 const { trackApiRequest } = await import("../../api-request-tracker");
 const { agentGenerateWithMetaResolved } = await import("../index");
-
 const realFetch = globalThis.fetch;
-const key = "sk-compact-dump-test-key";
+const key = "sk-compact-evidence-test-key";
 const config = {
 	id: "dump-test",
 	name: "Dump test",
@@ -28,21 +28,37 @@ const config = {
 	defaultModel: "gpt-6-luna",
 };
 const model = "dump-test:gpt-6-luna";
-const tracking = { kind: "compact" as const, provider: "dump-test", model };
+const narratorId = "compact-evidence-narrator";
+const tracking = { kind: "compact" as const, provider: "dump-test", model, narratorId };
 const compactOutput = { type: "compaction", encrypted_content: "test-encrypted" };
 const history = [{ role: "user", content: "compact this conversation" }];
 let sentBody: unknown;
 let sentUrl = "";
+let operations: RecorderOperation[] = [];
+let configure: ReturnType<typeof spyOn>;
+let capture: ReturnType<typeof spyOn>;
 
 beforeEach(() => {
-	settings.agent.requestDumpEnabled = true;
-	settings.agent.requestDumpErrorsOnly = true;
-	settings.agent.requestDumpMaxSize = 64 * 1024;
+	const now = new Date().toISOString();
+	db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now }).run();
+	settings.requestEvidence = {
+		ringEnabled: true,
+		ringRequestBytes: 1024 * 1024,
+		ringResponseBytes: 1024 * 1024,
+		autoPin: "errors",
+	};
+	operations = [];
+	configure = spyOn(RequestRecorderClient.prototype, "configure").mockImplementation(() => {});
+	capture = spyOn(RequestRecorderClient.prototype, "capture").mockImplementation((operation) => {
+		operations.push(operation);
+		return true;
+	});
 	sentBody = undefined;
 	sentUrl = "";
 });
-
 afterEach(async () => {
+	configure.mockRestore();
+	capture.mockRestore();
 	globalThis.fetch = realFetch;
 	await clearCodexResponsesWebSocketSessions();
 	cleanDb(sqlite);
@@ -55,7 +71,6 @@ function respond(body: string, status = 200, contentType = "application/json") {
 		return new Response(body, { status, headers: { "content-type": contentType } });
 	}) as typeof fetch;
 }
-
 function remoteProvider(baseUrl = config.baseUrl) {
 	return new OpenAIProvider({
 		...config,
@@ -65,28 +80,49 @@ function remoteProvider(baseUrl = config.baseUrl) {
 		codexWebSocket: false,
 	});
 }
-
 function compact(provider = remoteProvider()) {
 	return trackApiRequest(tracking, (requestDump) =>
 		provider.compactRemote(history, model, {
-			conversationId: "compact-dump-http",
+			conversationId: "compact-evidence-http",
 			requestDump,
 		}),
 	);
 }
-
 function record() {
 	const rows = db.select().from(apiRequests).all();
 	expect(rows).toHaveLength(1);
 	return rows[0];
 }
-
-function dumpOf(row = record()): ApiRequestDump {
-	if (!row.rawDumpJson) throw new Error("Expected a persisted request dump");
-	return JSON.parse(row.rawDumpJson) as ApiRequestDump;
+function evidence() {
+	const requestMeta = Object.assign(
+		{},
+		...operations.flatMap((operation) =>
+			operation.type === "meta" && operation.side === "request" ? [operation.value] : [],
+		),
+	);
+	const responseMeta = Object.assign(
+		{},
+		...operations.flatMap((operation) =>
+			operation.type === "meta" && operation.side === "response" ? [operation.value] : [],
+		),
+	);
+	const text = (side: "request" | "response") =>
+		operations
+			.flatMap((operation) =>
+				operation.type === "chunk" && operation.side === side
+					? [Buffer.from(operation.data).toString()]
+					: [],
+			)
+			.join("");
+	return {
+		requestMeta,
+		responseMeta,
+		requestText: text("request"),
+		responseText: text("response"),
+	};
 }
 
-describe("compact request dump", () => {
+describe("compact request recorder evidence", () => {
 	test.each([
 		[400, "application/json", '{"error":{"message":"invalid compact input"}}'],
 		[
@@ -94,68 +130,66 @@ describe("compact request dump", () => {
 			"text/event-stream",
 			'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"message":"response protection is unavailable"}}}\n\n',
 		],
-	])("remote HTTP retains raw failure (%s)", async (status, contentType, responseBody) => {
+	])("remote HTTP retains actual failure (%s)", async (status, contentType, responseBody) => {
 		respond(responseBody, status, contentType);
 		await expect(compact()).rejects.toThrow();
 		const row = record();
-		const dump = dumpOf(row);
+		const saved = evidence();
 		expect(row.errorMessage).toBeTruthy();
-		expect(dump.request?.body).toEqual(sentBody);
-		expect(dump.request?.url).toBe(sentUrl);
-		expect(dump.response?.bodyText).toBe(responseBody);
-		expect(dump.response?.status).toBe(status);
-		expect(dump.response?.error).toBe(row.errorMessage ?? undefined);
-		expect(row.rawDumpJson).not.toContain(key);
+		expect(JSON.parse(saved.requestText)).toEqual(sentBody);
+		expect(saved.requestMeta.url).toBe(sentUrl);
+		expect(saved.responseText).toBe(responseBody);
+		expect(saved.responseMeta.status).toBe(status);
+		expect(saved.responseMeta.error).toBe(row.errorMessage);
+		expect(JSON.stringify(operations)).not.toContain(key);
+		expect(operations).toContainEqual(
+			expect.objectContaining({ type: "end", error: row.errorMessage, status: "error" }),
+		);
+		const recordingRequestId = row.recordingRequestId;
+		if (!recordingRequestId) throw new Error("Expected a recording request ID");
+		expect(operations).toContainEqual({
+			type: "bind",
+			requestId: recordingRequestId,
+			apiRequestId: row.id,
+		});
+		expect(row).not.toHaveProperty("rawDumpJson");
 	});
 
 	test.each([
-		[false, false, false],
-		[false, true, false],
-		[true, true, false],
-		[true, false, true],
-	])("success follows enabled=%s, errorsOnly=%s", async (enabled, errorsOnly, persisted) => {
-		settings.agent.requestDumpEnabled = enabled;
-		settings.agent.requestDumpErrorsOnly = errorsOnly;
+		[false, "off", false],
+		[true, "off", true],
+		[true, "errors", true],
+		[false, "all", true],
+	] as const)("success respects live recording ring=%s autoPin=%s", async (ringEnabled, autoPin, recorded) => {
+		settings.requestEvidence = { ...settings.requestEvidence, ringEnabled, autoPin };
 		respond(JSON.stringify({ status: "completed", output: [compactOutput] }));
 		expect((await compact()).items).toEqual([compactOutput]);
-		const row = record();
-		expect(row.rawDumpJson !== null).toBe(persisted);
-		if (persisted) expect(dumpOf(row).request?.body).toEqual(sentBody);
+		expect(record().errorMessage).toBeNull();
+		expect(operations.some((operation) => operation.type === "begin")).toBe(recorded);
+		if (recorded) expect(JSON.parse(evidence().requestText)).toEqual(sentBody);
 	});
 
-	test("disabled dumping keeps error metadata but not raw content", async () => {
-		settings.agent.requestDumpEnabled = false;
+	test("disabled recording keeps error metadata without raw content", async () => {
+		settings.requestEvidence = { ...settings.requestEvidence, ringEnabled: false, autoPin: "off" };
 		respond('{"error":{"message":"invalid compact input"}}', 400);
 		await expect(compact()).rejects.toThrow();
-		const row = record();
-		expect(row.errorMessage).toContain("invalid compact input");
-		const dump = JSON.parse(row.rawDumpJson ?? "{}");
-		expect(dump.request).toBeUndefined();
-		expect(dump.response).toBeUndefined();
+		expect(record().errorMessage).toContain("invalid compact input");
+		expect(operations.filter((operation) => operation.type !== "bind")).toEqual([]);
 	});
 
-	test("dump toggle does not alter remote request body", async () => {
-		respond(JSON.stringify({ status: "completed", output: [compactOutput] }));
-		await compact();
-		const withDump = sentBody;
-		settings.agent.requestDumpEnabled = false;
-		await compact();
-		expect(sentBody).toEqual(withDump);
-	});
-
-	test("transport failure still retains the prepared HTTP request", async () => {
+	test("transport failure retains the prepared request and recording association", async () => {
 		globalThis.fetch = (async () => {
 			throw new Error("test network disconnected");
 		}) as unknown as typeof fetch;
 		await expect(compact()).rejects.toThrow("Network request failed");
-		const dump = dumpOf();
-		expect(dump.request?.transport).toBe("http");
-		expect(dump.request?.body).toHaveProperty("input");
-		expect(dump.response?.error).toContain("Network request failed");
-		expect(dump.response?.bodyIncomplete).toBe(true);
+		const row = record();
+		expect(evidence().requestMeta.transport).toBe("http");
+		expect(JSON.parse(evidence().requestText)).toHaveProperty("input");
+		expect(evidence().responseMeta.error).toContain("Network request failed");
+		expect(JSON.parse(row.diagnosticsJson ?? "{}").recordingRequestId).toBe(row.recordingRequestId);
 	});
 
-	test("WebSocket 1008 saves the actual frame and close reason without HTTP fallback", async () => {
+	test("WebSocket 1008 retains exact frame and close reason without HTTP fallback", async () => {
 		let frame: unknown;
 		let httpRequests = 0;
 		const server = Bun.serve({
@@ -178,8 +212,7 @@ describe("compact request dump", () => {
 		});
 		try {
 			const provider = remoteProvider(`http://127.0.0.1:${server.port}/v1`);
-			const conversationId = "compact-dump-ws";
-			// Obtain a real ordinary-request template; compact may then select WebSocket.
+			const conversationId = "compact-evidence-ws";
 			for await (const _event of provider.chat({
 				model,
 				history,
@@ -190,7 +223,7 @@ describe("compact request dump", () => {
 				conversationId,
 				signal: new AbortController().signal,
 			})) {
-				// Consume the ordinary request.
+				/* warm template */
 			}
 			await expect(
 				trackApiRequest(tracking, (requestDump) =>
@@ -202,16 +235,23 @@ describe("compact request dump", () => {
 					}),
 				),
 			).rejects.toThrow("1008");
-			const dump = dumpOf();
-			expect(dump.request?.transport).toBe("websocket");
-			expect(dump.request?.body).toEqual(frame);
-			expect(dump.response?.bodyText).toContain("[websocket close 1008]");
-			expect(dump.response?.error).toContain("missing first response.create message");
-			expect(JSON.stringify(dump)).not.toContain(key);
+			const saved = evidence();
+			expect(saved.requestMeta.transport).toBe("websocket");
+			expect(JSON.parse(saved.requestText)).toEqual(frame);
+			expect(operations).toContainEqual(
+				expect.objectContaining({
+					type: "meta",
+					side: "response",
+					value: expect.objectContaining({ type: "websocket.close", code: 1008 }),
+				}),
+			);
+			expect(saved.responseMeta.error).toContain("missing first response.create message");
+			expect(JSON.stringify(operations)).not.toContain(key);
 			expect(httpRequests).toBe(1);
+			expect(record().recordingRequestId).toBeTruthy();
 		} finally {
 			await clearCodexResponsesWebSocketSessions();
-			await server.stop(true);
+			server.stop(true);
 		}
 	});
 });
@@ -225,7 +265,6 @@ const semanticProviders: [string, () => ProviderAdapter][] = [
 	["Gemini Interactions", () => new GeminiInteractionsProvider(config)],
 	["Grok", () => new GrokProvider(config)],
 ];
-
 function semantic(provider: ProviderAdapter) {
 	return agentGenerateWithMetaResolved(
 		"conversation to summarize",
@@ -238,25 +277,24 @@ function semantic(provider: ProviderAdapter) {
 		},
 		"summarize",
 		{ signal: AbortSignal.timeout(3000) },
-		{ kind: "compact" },
+		{ kind: "compact", narratorId },
 	);
 }
-
-test.each(semanticProviders)("semantic compact captures %s failures", async (_name, create) => {
+test.each(semanticProviders)("semantic compact records %s failures", async (_name, create) => {
 	const responseBody = '{"error":{"message":"test compact rejection"}}';
 	respond(responseBody, 400);
 	await expect(semantic(create())).rejects.toThrow();
-	const row = record();
-	const dump = dumpOf(row);
-	expect(dump.request?.body).toEqual(sentBody);
-	expect(dump.request?.url).toBe(sentUrl);
-	expect(dump.response?.bodyText).toBe(responseBody);
-	expect(dump.response?.status).toBe(400);
-	expect(row.rawDumpJson).not.toContain(key);
+	const saved = evidence();
+	expect(JSON.parse(saved.requestText)).toEqual(sentBody);
+	expect(saved.requestMeta.url).toBe(sentUrl);
+	expect(saved.responseText).toBe(responseBody);
+	expect(saved.responseMeta.status).toBe(400);
+	expect(JSON.stringify(operations)).not.toContain(key);
+	expect(record().recordingRequestId).toBeTruthy();
 });
-
-test("empty semantic compact is a failed request, not a discarded success dump", async () => {
+test("empty semantic compact ends its recording as failed", async () => {
 	respond('{"status":"completed","output":[]}');
 	await expect(semantic(remoteProvider())).rejects.toThrow("returned empty output");
-	expect(dumpOf().response?.bodyText).toContain('"output":[]');
+	expect(evidence().responseText).toContain('"output":[]');
+	expect(operations).toContainEqual(expect.objectContaining({ type: "end", status: "error" }));
 });

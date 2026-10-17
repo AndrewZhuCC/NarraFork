@@ -105,7 +105,7 @@ export interface RevertSelectionTool {
 	toolUseId: string;
 	toolName: string;
 	/** Bounded scalar extracted in SQL; never materialize the full tool input. */
-	intelligentUiAction?: string | null;
+	genUiAction?: string | null;
 	status: string;
 	isBackground: number;
 	executionIdentityVersion: number;
@@ -774,10 +774,10 @@ export class RevertSelectionService {
 			});
 			return;
 		}
-		const isUiShow = tool.toolName === "IntelligentUI" && tool.intelligentUiAction === "show";
+		const isUiShow = tool.toolName === "GenUI" && tool.genUiAction === "show";
 		const isFileTool =
 			["Write", "Edit", "StructSed"].includes(tool.toolName) ||
-			(tool.toolName === "IntelligentUI" && !isUiShow);
+			(tool.toolName === "GenUI" && !isUiShow);
 		const isDelegationTool = ["Agent", "Task"].includes(tool.toolName);
 		if (!isFileTool && !isDelegationTool) {
 			this.add(state, state.result.noDiskTools, {
@@ -1212,9 +1212,9 @@ const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrato
  m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;
 const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS messageId, tool_use_id AS toolUseId, tool_name AS toolName, status,
- CASE WHEN tool_name = 'IntelligentUI' AND octet_length(input_json) <= 8192
+ CASE WHEN tool_name = 'GenUI' AND octet_length(input_json) <= 8192
  THEN CASE WHEN json_valid(input_json) THEN CASE WHEN json_extract(input_json, '$.action') = 'show'
- THEN 'show' ELSE 'create' END END END AS intelligentUiAction,
+ THEN 'show' ELSE 'create' END END END AS genUiAction,
  is_background AS isBackground, execution_identity_version AS executionIdentityVersion, execution_origin_tool_call_id AS executionOriginToolCallId,
  execution_attempt AS executionAttempt, file_change_operation_id AS fileChangeOperationId, execution_device_id AS executionDeviceId,
  execution_path_flavor AS executionPathFlavor, resolved_file_path AS resolvedFilePath, canonical_file_path AS canonicalFilePath,

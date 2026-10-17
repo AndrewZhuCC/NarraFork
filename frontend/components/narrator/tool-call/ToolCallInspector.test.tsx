@@ -12,6 +12,7 @@ import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { TraceRowInteraction } from "../trace/TraceRowInteraction";
 import { ToolCallInspector } from "./ToolCallInspector";
+import { openHostedToolCallInspector, useToolCallInspectorHost } from "./tool-call-inspector-host";
 
 const { VListRowInteraction } = await import("../vlist/VListRowInteraction");
 const { adaptSegment, adaptActivityUnit } = await import("../vlist/segment-adapter");
@@ -436,6 +437,81 @@ function assertOwnRequests() {
 }
 
 describe("row menu click → real Inspector fetch", () => {
+	test("the list host keeps the inspector after its row unmounts", async () => {
+		function Harness({ showRow }: { showRow: boolean }) {
+			const modal = useToolCallInspectorHost("n1");
+			return (
+				<>
+					{showRow ? (
+						<VListRowInteraction
+							blockId="tc-hosted-tool"
+							messageId="wrong-selection-message"
+							blockIndex={0}
+							actions={{ messageId: "wrong-selection-message" }}
+							narratorId="n1"
+							toolUseId="hosted-tool"
+							toolDetailRef={{ toolCallId: "row-1", messageId: "message-1" }}
+						>
+							<div data-test-tool-row="0">tool</div>
+						</VListRowInteraction>
+					) : null}
+					{modal}
+				</>
+			);
+		}
+		await renderRowNodes(<Harness showRow />);
+		await inspectRow(0);
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(document.body.textContent).toContain("input:");
+		const fetched = calls.length;
+		await renderRowNodes(<Harness showRow={false} />);
+		expect(document.querySelector("[data-test-tool-row]")).toBeNull();
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(document.body.textContent).toContain("input:");
+		expect(calls).toHaveLength(fetched);
+	});
+
+	test("unmounting one list keeps the other list's inspector host", async () => {
+		function Pane({ label }: { label: string }) {
+			const modal = useToolCallInspectorHost("n1");
+			return (
+				<div data-pane={label}>
+					<button
+						type="button"
+						data-open={label}
+						onClick={() =>
+							openHostedToolCallInspector({
+								narratorId: "n1",
+								toolUseId: "hosted-tool",
+								toolCallId: "row-1",
+								messageId: "message-1",
+							})
+						}
+					>
+						open
+					</button>
+					{modal}
+				</div>
+			);
+		}
+		function Panes({ second }: { second: boolean }) {
+			return (
+				<>
+					<Pane label="a" />
+					{second ? <Pane label="b" /> : null}
+				</>
+			);
+		}
+		await renderRowNodes(<Panes second />);
+		await renderRowNodes(<Panes second={false} />);
+		expect(document.querySelector("[data-pane='b']")).toBeNull();
+		await rowAct(() => {
+			document.querySelector<HTMLButtonElement>("[data-open='a']")?.click();
+		});
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(document.body.textContent).toContain("input:");
+	});
+
 	test("standalone repeated tools use card-owned refs, not the selection message or suffixed key", async () => {
 		const specs = adaptSegment(
 			{ kind: "tool-run", items: toolItems(), sourceMessages: [] },

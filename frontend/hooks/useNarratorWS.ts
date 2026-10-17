@@ -648,6 +648,7 @@ export interface NarratorWSCallbacks {
 		hasDraft: boolean;
 		text: string;
 		fileReferences?: import("@shared/file-reference").FileReference[];
+		hasComposerDocument?: boolean;
 		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
@@ -780,6 +781,8 @@ export interface NarratorWSCallbacks {
 	onLeakedToolCall?: (info: {
 		phase: "stream_captured" | "recovered" | "unrecovered";
 		apiRequestId: string;
+		/** Recorder attempt id; the leak path pins it so the evidence outlives the window. */
+		recordingRequestId?: string;
 		toolUseIds?: string[];
 		toolNames?: string[];
 		snippet?: string;
@@ -1377,6 +1380,7 @@ export function useNarratorWS(
 					case "draft_changed":
 						callbackOwner.callbacks.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
+							...(data.hasComposerDocument ? { hasComposerDocument: true } : {}),
 							text: typeof data.text === "string" ? data.text : "",
 							fileReferences: Array.isArray(data.fileReferences)
 								? (data.fileReferences as import("@shared/file-reference").FileReference[])
@@ -1587,6 +1591,8 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onLeakedToolCall?.({
 							phase: data.phase as "stream_captured" | "recovered" | "unrecovered",
 							apiRequestId: data.apiRequestId as string,
+							recordingRequestId:
+								typeof data.recordingRequestId === "string" ? data.recordingRequestId : undefined,
 							toolUseIds: data.toolUseIds as string[] | undefined,
 							toolNames: data.toolNames as string[] | undefined,
 							snippet: data.snippet as string | undefined,

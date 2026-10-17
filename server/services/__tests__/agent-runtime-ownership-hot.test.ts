@@ -1,6 +1,7 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { hotSafe } from "../../lib/hot-safe";
+import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator, ActiveSubagentSettings } from "../narrator-session-state";
 import type { RunningSubagentExecutionSnapshot } from "../subagent-runner";
 
@@ -86,12 +87,29 @@ legacyRunners.set(SUSPENDED, { ...runner(SUSPENDED), background: false });
 legacyTools.set(REPLAY, replayCompletion);
 legacySessions.set(CACHE, cached);
 
+// Simulate installing occupancy after runtime ownership already used hot records.
+// This session never passes through the legacy adoption or modern view setters.
+const RETAINED_SESSION = "hot-retained-session-only";
+const retainedSession = session(RETAINED_SESSION);
+retainedSession.alive = false;
+retainedSession._loopRunning = false;
+hotSafe<Map<string, { session?: ActiveNarrator }>>(
+	"narrafork.agentRuntime.records",
+	() => new Map(),
+).set(RETAINED_SESSION, { session: retainedSession });
+const initialLiveness: [string, boolean][] = [];
+const initialPublish = spyOn(backgroundOccupancyStore, "setRuntimeLive").mockImplementation(
+	(id, live) => {
+		initialLiveness.push([id, live]);
+	},
+);
 const ownership = await import("../agent-runtime/ownership");
+initialPublish.mockRestore();
 const sessions = ownership.createRuntimeMapView("session");
 const settings = ownership.createRuntimeMapView("subagentSettings");
 const runners = ownership.createRuntimeMapView("subagentExecution");
 const tools = ownership.createRuntimeMapView("toolReplayCompletion");
-const extraIds = new Set<string>();
+const extraIds = new Set<string>([RETAINED_SESSION]);
 function requireOwner(id: string) {
 	const owner = ownership.getExecutionOwner(id);
 	if (!owner) throw new Error(`Missing execution owner: ${id}`);
@@ -117,6 +135,15 @@ afterAll(() => {
 		runners.delete(id);
 		tools.delete(id);
 	}
+});
+
+test("first occupancy installation seeds existing session-only hot records without mutation", () => {
+	expect(sessions.get(RETAINED_SESSION)).toBe(retainedSession);
+	expect(ownership.getExecutionOwner(RETAINED_SESSION)).toBeUndefined();
+	expect(initialLiveness).toContainEqual([RETAINED_SESSION, true]);
+	expect(initialLiveness).toContainEqual([PRIMARY, true]);
+	expect(initialLiveness).toContainEqual([REPLAY, true]);
+	expect(initialLiveness).toContainEqual([SUSPENDED, false]);
 });
 
 test("adopts native containers once without losing observable objects, caches or old owners", () => {
@@ -259,7 +286,18 @@ test("a second module evaluation retains forwarding identity and does not re-ado
 	const before = requireOwner(PRIMARY);
 	const get = legacySessions.get;
 	const remove = legacyAdmissions.delete;
-	const reloaded: typeof ownership = await import(path);
+	const publish = spyOn(backgroundOccupancyStore, "setRuntimeLive").mockImplementation(() => {});
+	let reloaded: typeof ownership;
+	try {
+		reloaded = await import(path);
+		expect(publish).toHaveBeenCalledWith(RETAINED_SESSION, true);
+		expect(publish).toHaveBeenCalledWith(PRIMARY, true);
+		expect(publish).toHaveBeenCalledWith(CACHE, true);
+		expect(publish).toHaveBeenCalledWith(REPLAY, true);
+		expect(publish).toHaveBeenCalledWith(SUSPENDED, false);
+	} finally {
+		publish.mockRestore();
+	}
 	expect(reloaded.getExecutionOwner(PRIMARY)).toBe(before);
 	expect(legacySessions.get).toBe(get);
 	expect(legacyAdmissions.delete).toBe(remove);

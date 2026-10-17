@@ -37,7 +37,7 @@ beforeAll(async () => {
 					}));
 					builder.onLoad({ filter: /.*/, namespace: "composer-fixture" }, () => ({
 						loader: "jsx",
-						contents: `import {Textarea} from '@mantine/core'; import {useState} from 'react'; export const NarratorComposer=props=>{const [value,setValue]=useState('');return <div style={{flex:1,minWidth:0}}><Textarea autosize minRows={1} maxRows={12} value={value} placeholder="Send a message... Shift+Enter for a new line" onChange={event=>{setValue(event.currentTarget.value);props.onTextFlagsChange(event.currentTarget.value.length>0);}}/></div>};`,
+						contents: `import {Textarea} from '@mantine/core'; import {useState} from 'react'; export const NarratorComposer=props=>{const [value,setValue]=useState('');return <div style={{flex:1,minWidth:0}}><Textarea autosize minRows={1} maxRows={12} value={value} placeholder="Send a message... Shift+Enter for a new line" onChange={event=>{setValue(event.currentTarget.value);props.onTextFlagsChange(event.currentTarget.value.length>0);}}/><div style={{display:'flex',justifyContent:'space-between'}}>{props.controls}{props.actions}</div></div>};`,
 					}));
 				},
 			},

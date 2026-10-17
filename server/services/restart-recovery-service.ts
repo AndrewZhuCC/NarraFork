@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { closeSync, openSync, readSync } from "node:fs";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { and, asc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import { db } from "../db";
@@ -9,6 +10,13 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { isSubagentVariant, parseSubstatus } from "../lib/narrator-utils";
 import { narratorPersistence } from "./narrator-persistence";
+import {
+	getRecoverySource,
+	getRegisteredRecoverySource,
+	type RecoverySource,
+	registerRecoverySource,
+	withRecoveryAdvance,
+} from "./recovery-handoff";
 import {
 	isToolContinuationOwnerMounted,
 	type ToolContinuationProtectionSets,
@@ -50,6 +58,35 @@ const processState = hotSafe("restart-recovery", () => ({
 	permissionToolCalls: new Map<string, string>(),
 }));
 const manifestPath = () => getNarraforkPath("restart-recovery.json");
+const manifestIdentities = hotSafe(
+	"restart-recovery-identities",
+	() => new Map<string, { text: string }>(),
+);
+
+function readBoundedManifestText(): string {
+	const fd = openSync(manifestPath(), "r");
+	try {
+		const buffer = Buffer.alloc(MAX_MANIFEST_BYTES + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = readSync(fd, buffer, length, buffer.length - length, null);
+			if (read === 0) break;
+			length += read;
+		}
+		if (length > MAX_MANIFEST_BYTES)
+			throw new Error("Restart recovery manifest exceeds size limit");
+		return buffer.toString("utf8", 0, length);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function assertManifestIdentity(epoch: string): void {
+	const expected = manifestIdentities.get(epoch);
+	if (expected && readBoundedManifestText() !== expected.text) {
+		throw new Error("Ordinary recovery manifest changed after it was claimed");
+	}
+}
 
 export function automaticResumeEnabled(args: readonly string[] = process.argv): boolean {
 	return !args.includes(NO_AUTO_RESUME_FLAG);
@@ -76,9 +113,7 @@ export function restartToolDisposition(row: {
 
 async function readManifest(): Promise<RestartManifest | null> {
 	try {
-		if ((await stat(manifestPath())).size > MAX_MANIFEST_BYTES)
-			throw new Error("Restart recovery manifest exceeds size limit");
-		const value: unknown = JSON.parse(await readFile(manifestPath(), "utf8"));
+		const value: unknown = JSON.parse(readBoundedManifestText());
 		if (!value || typeof value !== "object") throw new Error("Invalid restart manifest");
 		const manifest = value as RestartManifest;
 		if (
@@ -100,11 +135,12 @@ async function readManifest(): Promise<RestartManifest | null> {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 		// Keep malformed evidence, but do not let it authorize execution.
 		logger.warn("Cannot read ordinary restart recovery manifest", { error: String(error) });
-		return null;
+		throw error;
 	}
 }
 
 async function writeManifest(manifest: RestartManifest): Promise<void> {
+	assertManifestIdentity(manifest.snapshot.updateEpoch);
 	const text = JSON.stringify(manifest);
 	if (Buffer.byteLength(text) > MAX_MANIFEST_BYTES) throw new Error("Restart manifest too large");
 	const path = manifestPath();
@@ -112,13 +148,17 @@ async function writeManifest(manifest: RestartManifest): Promise<void> {
 	const temporary = `${path}.${process.pid}.tmp`;
 	await writeFile(temporary, text, { mode: 0o600 });
 	await rename(temporary, path);
+	const identity = manifestIdentities.get(manifest.snapshot.updateEpoch);
+	if (identity) identity.text = text;
 }
 
 async function removeManifest(epoch: string): Promise<void> {
+	assertManifestIdentity(epoch);
 	if ((await readManifest())?.snapshot.updateEpoch !== epoch) return;
 	await unlink(manifestPath()).catch((error: NodeJS.ErrnoException) => {
 		if (error.code !== "ENOENT") throw error;
 	});
+	manifestIdentities.delete(epoch);
 }
 
 async function loadActiveRows() {
@@ -238,6 +278,7 @@ export function mergeStartupProtection(
 /** Runs under the database instance lock, before generic startup cleanup touches any rows. */
 export async function prepareOrdinaryRestartRecovery(
 	plannedProtection: ToolContinuationProtectionSets,
+	options: { onTargetsDiscovered?: (ids: readonly string[]) => void } = {},
 ): Promise<RestartStartupRecovery> {
 	const empty: RestartStartupRecovery = {
 		manifest: null,
@@ -245,7 +286,11 @@ export async function prepareOrdinaryRestartRecovery(
 	};
 	if (processState.prepared) return empty; // Hot reload must not mount duplicate runtimes.
 	processState.prepared = true;
-	const previous = await readManifest();
+	const saved = await readManifest();
+	// A v3 planned root already owns this source; never load the ordinary file a second time.
+	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
+	// Publish only the validated, unclaimed ordinary source before bounded continuation reads.
+	if (previous) options.onTargetsDiscovered?.(previous.targets.map((target) => target.narratorId));
 	const unfinishedOwners = new Set(
 		previous
 			? (await toolContinuationService.listByEpoch(previous.snapshot.updateEpoch))
@@ -261,7 +306,24 @@ export async function prepareOrdinaryRestartRecovery(
 	}
 	if (active.length > MAX_TARGETS) throw new Error("Too many restart recovery targets");
 	const rows = active.filter((row) => !plannedProtection.narratorIds.has(row.id));
-	const children = rows.filter((row) => row.type === "subagent" || isSubagentVariant(row.variant));
+	const children = [] as typeof rows;
+	for (const row of rows) {
+		if (row.type !== "subagent" && !isSubagentVariant(row.variant)) continue;
+		const origin = row.originToolCallId
+			? await toolContinuationService.getByToolCallId(row.originToolCallId)
+			: null;
+		// A dead process can leave an active status behind after a durable cancellation/delivery.
+		// It is not new ordinary authorization for that same child run.
+		if (
+			origin &&
+			isToolContinuationOwnerMounted(origin) &&
+			(origin.state === "cancelled" || origin.kind !== "background_agent") &&
+			origin.payloadJson?.subagentId === row.id &&
+			origin.payloadJson?.logicalRunId === row.logicalRunId
+		)
+			continue;
+		children.push(row);
+	}
 	const selectedIds = new Set([
 		...children.map((row) => row.id),
 		...rows.filter((row) => unfinishedOwners.has(row.id)).map((row) => row.id),
@@ -279,6 +341,8 @@ export async function prepareOrdinaryRestartRecovery(
 		return empty;
 	}
 	const selected = rows.filter((row) => selectedIds.has(row.id));
+	// If manifest publication or any repair fails, startup can still settle these known runs.
+	options.onTargetsDiscovered?.(selected.map((row) => row.id));
 	const snapshot: PlannedUpdateRecoverySnapshot = {
 		version: 2,
 		updateEpoch: previous?.snapshot.updateEpoch ?? `restart-${generateId()}`,
@@ -298,6 +362,18 @@ export async function prepareOrdinaryRestartRecovery(
 	};
 	// Write eligibility before repairing tools. A crash between writes can safely repeat repair.
 	await writeManifest(manifest);
+	manifestIdentities.set(snapshot.updateEpoch, { text: JSON.stringify(manifest) });
+	registerRecoverySource(
+		{
+			updateEpoch: snapshot.updateEpoch,
+			kind: "ordinary",
+			capturedAt: snapshot.capturedAt,
+			narrators: snapshot.narrators,
+			pendingNarratorIds: manifest.targets.map((target) => target.narratorId),
+			logicalRuns: manifest.targets,
+		},
+		{ validateManifest: () => assertManifestIdentity(snapshot.updateEpoch) },
+	);
 	const { cleanupIncompleteNarratorOutput } = await import("./narrator-output-recovery");
 	for (const row of selected) await cleanupIncompleteNarratorOutput(row.id);
 	const protection = empty.protection;
@@ -454,24 +530,167 @@ export async function prepareOrdinaryRestartRecovery(
 
 async function putColdContinuation(input: Parameters<typeof toolContinuationService.upsert>[0]) {
 	const previous = await toolContinuationService.getByToolCallId(input.toolCallId);
-	// The old process is gone (instance lock acquired). A permission wait without a tool start is
-	// safe to remount; never replay a real execution. Preserve durable owner-result phases.
-	if (previous?.updateEpoch === input.updateEpoch && previous.state === "completed") {
-		if (input.kind !== "foreground_agent" && input.kind !== "background_agent") return;
+	if (!previous) {
+		await toolContinuationService.upsert(input);
+		return;
 	}
-	if (previous?.state === "resuming") {
-		const { narratorToolContinuations } = await import("../db/schema");
-		await db
-			.update(narratorToolContinuations)
-			.set({
-				state: "paused",
-				claimToken: null,
-				claimedAt: null,
-				deadlineAt: null,
-			})
-			.where(eq(narratorToolContinuations.id, previous.id));
+	if (previous.state === "cancelled" || isToolContinuationOwnerMounted(previous)) return;
+	if (
+		previous.updateEpoch === input.updateEpoch &&
+		previous.state === "completed" &&
+		input.kind !== "foreground_agent" &&
+		input.kind !== "background_agent"
+	)
+		return;
+	if (previous.updateEpoch !== input.updateEpoch) {
+		const pass = await toolContinuationService.beginOrdinaryColdAdoptionPass({
+			rootEpoch: input.updateEpoch,
+			toolCallId: input.toolCallId,
+		});
+		try {
+			const adopted = await toolContinuationService.controlledOrdinaryColdAdoption(
+				input,
+				pass.authorization,
+			);
+			if (!adopted)
+				logger.warn("Ordinary cold recovery could not prove continuation identity", {
+					toolCallId: input.toolCallId,
+					rootEpoch: input.updateEpoch,
+					sourceEpoch: previous.updateEpoch,
+				});
+		} finally {
+			pass.close();
+		}
+		return;
 	}
-	await toolContinuationService.upsert(input);
+	const call = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, input.toolCallId),
+		columns: { executionAttempt: true, executionStartedAt: true },
+	});
+	if (!call) return;
+	const pass = toolContinuationService.beginColdRecoveryPass({
+		rootEpoch: input.updateEpoch,
+		sourceEpochs: [previous.updateEpoch],
+		unstartedTools:
+			call.executionStartedAt == null
+				? [{ toolCallId: input.toolCallId, executionAttempt: call.executionAttempt }]
+				: [],
+	});
+	try {
+		const evidence = {
+			sourceEpoch: previous.updateEpoch,
+			executionAttempt: call.executionAttempt,
+			authorization: pass.authorization,
+		};
+		if (input.kind === "foreground_agent" || input.kind === "background_agent") {
+			const subagentId = input.payloadJson?.subagentId;
+			const logicalRunId = input.payloadJson?.logicalRunId;
+			if (typeof subagentId === "string" && typeof logicalRunId === "string") {
+				const reattached = await toolContinuationService.controlledColdReattachAgent(input, {
+					...evidence,
+					subagentId,
+					logicalRunId,
+				});
+				if (reattached) return;
+			}
+		} else {
+			const taken = await toolContinuationService.controlledColdTakeover(input, evidence);
+			if (taken) return;
+		}
+		if (previous.updateEpoch !== input.updateEpoch || previous.state === "resuming") {
+			throw new Error(`Cold recovery cannot prove execution identity for ${input.toolCallId}`);
+		}
+		await toolContinuationService.upsert(input);
+	} finally {
+		pass.close();
+	}
+}
+
+/** A v3 root owns this source's authorization; the old file cannot run independently. */
+export async function removeCarriedOrdinaryManifest(epoch: string): Promise<void> {
+	await removeManifest(epoch);
+}
+
+export async function restoreCarriedOrdinaryTargets(
+	source: RecoverySource,
+	driven: ReadonlySet<string>,
+	includedNarratorIds?: ReadonlySet<string>,
+): Promise<void> {
+	const { resumeSubagent } = await import("./subagent-resume");
+	const failures: string[] = [];
+	for (const target of source.logicalRuns ?? []) {
+		if (
+			driven.has(target.narratorId) ||
+			(includedNarratorIds && !includedNarratorIds.has(target.narratorId))
+		)
+			continue;
+		try {
+			await withRecoveryAdvance(source.updateEpoch, async () => {
+				const current = getRecoverySource(source.updateEpoch);
+				if (!current?.pendingNarratorIds.includes(target.narratorId)) return;
+				const row = await db.query.narrators.findFirst({
+					where: eq(narrators.id, target.narratorId),
+					columns: {
+						id: true,
+						variant: true,
+						type: true,
+						logicalRunId: true,
+						status: true,
+						substatus: true,
+					},
+				});
+				const valid =
+					row &&
+					row.logicalRunId === target.logicalRunId &&
+					(row.type === "subagent" || isSubagentVariant(row.variant)) &&
+					(restartEligible(row) ||
+						(row.status === "idle" &&
+							parseSubstatus(row.substatus).includes("interrupted") &&
+							!parseSubstatus(row.substatus).some((tag) =>
+								["error", "taken_over", "manual_override", "cancelled"].includes(tag),
+							)));
+				if (valid) {
+					const background = await db.query.backgroundTasks.findFirst({
+						where: and(
+							eq(backgroundTasks.type, "agent"),
+							eq(backgroundTasks.status, "running"),
+							eq(backgroundTasks.subagentNarratorId, row.id),
+							row.logicalRunId
+								? eq(backgroundTasks.logicalRunId, row.logicalRunId)
+								: isNull(backgroundTasks.logicalRunId),
+						),
+						columns: { id: true },
+					});
+					const resumed = await resumeSubagent({
+						subagentId: row.id,
+						intent: "continue_tool_results",
+						actor: "parent_agent",
+						locale: "en",
+						resumeLogicalRunId: row.logicalRunId ?? undefined,
+						allowRunningRestart: true,
+						skipStaleAttach: true,
+						skipConclusionDelivery: true,
+						preserveBackground: Boolean(background),
+					});
+					if (!resumed.started) throw new Error("Standalone child recovery did not start");
+				}
+				const original = getRegisteredRecoverySource(source.updateEpoch);
+				if (original)
+					registerRecoverySource(original).update({
+						...current,
+						pendingNarratorIds: current.pendingNarratorIds.filter((id) => id !== target.narratorId),
+					});
+			});
+		} catch (error) {
+			failures.push(target.narratorId);
+			logger.error("Could not resume interrupted standalone subagent", {
+				narratorId: target.narratorId,
+				error: String(error),
+			});
+		}
+	}
+	if (failures.length)
+		throw new Error(`Failed to mount ordinary restart targets: ${failures.join(", ")}`);
 }
 
 export async function restoreOrdinaryRestartRecovery(
@@ -494,62 +713,14 @@ export async function restoreOrdinaryRestartRecovery(
 				: []),
 		]),
 	);
-	// Independent streaming-only children must not wait behind another child's human approval.
-	const { resumeSubagent } = await import("./subagent-resume");
-	for (const target of manifest.targets) {
-		if (
-			driven.has(target.narratorId) ||
-			(options.includedNarratorIds && !options.includedNarratorIds.has(target.narratorId))
-		)
-			continue;
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, target.narratorId),
-			columns: {
-				id: true,
-				variant: true,
-				type: true,
-				logicalRunId: true,
-				status: true,
-				substatus: true,
-			},
-		});
-		if (
-			!row ||
-			row.logicalRunId !== target.logicalRunId ||
-			!(row.type === "subagent" || isSubagentVariant(row.variant)) ||
-			!(
-				restartEligible(row) ||
-				(row.status === "idle" && parseSubstatus(row.substatus).includes("interrupted"))
-			)
-		)
-			continue;
-		try {
-			await resumeSubagent({
-				subagentId: row.id,
-				intent: "continue_tool_results",
-				actor: "parent_agent",
-				locale: "en",
-				resumeLogicalRunId: row.logicalRunId ?? undefined,
-				allowRunningRestart: true,
-				skipStaleAttach: true,
-				skipConclusionDelivery: true,
-			});
-		} catch (error) {
-			logger.error("Could not resume interrupted standalone subagent", {
-				narratorId: row.id,
-				error: String(error),
-			});
-			const { narratorService } = await import("./narrator-service");
-			await narratorService.updateStatus(row.id, "idle", {
-				substatus: ["error"],
-				errorMessage: String(error),
-			});
-		}
-	}
+	const source = getRecoverySource(manifest.snapshot.updateEpoch);
+	if (!source) throw new Error("Ordinary recovery source was not registered during classification");
 	return restoreNarratorsAfterPlannedUpdate(
 		{ snapshot: manifest.snapshot, protection },
 		{
 			includedNarratorIds: options.includedNarratorIds,
+			onSendWaitersSettled: () =>
+				restoreCarriedOrdinaryTargets(source, driven, options.includedNarratorIds),
 			onQueueCompleted: async () => {
 				if (!options.includedNarratorIds) {
 					await removeManifest(manifest.snapshot.updateEpoch);
@@ -620,4 +791,5 @@ export function resetRestartRecoveryForTests(): void {
 	processState.prepared = false;
 	processState.pausedRecovery = null;
 	processState.permissionToolCalls.clear();
+	manifestIdentities.clear();
 }

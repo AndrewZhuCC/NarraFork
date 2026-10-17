@@ -40,13 +40,13 @@ import { favoriteRoutes } from "./routes/favorites";
 import { fsRoutes } from "./routes/fs";
 import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { geminiRoutes } from "./routes/gemini";
+import { genUiRoutes } from "./routes/gen-ui";
 import { gitRoutes, narratorGitRoutes } from "./routes/git";
 import { grammarRoutes } from "./routes/grammars";
 import { graphRoutes } from "./routes/graph";
 import { grokRoutes } from "./routes/grok";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
-import { intelligentUiRoutes } from "./routes/intelligent-ui";
 import { kimiRoutes } from "./routes/kimi";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
@@ -383,7 +383,7 @@ app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
-app.route("/api/narrators", intelligentUiRoutes);
+app.route("/api/narrators", genUiRoutes);
 // Worktree paths must precede the generic Git router's workspace middleware.
 app.route(
 	"/api/narrators",

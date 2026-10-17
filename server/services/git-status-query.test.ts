@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { GitStatusSummary } from "./git-service";
 import {
 	GitStatusQueryCoordinator,
@@ -30,6 +30,81 @@ function deferred<T>() {
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("Git status query coordination", () => {
+	test("ten readers share one fresh query and staggered reads reuse the default 3s result", async () => {
+		const c = new GitStatusQueryCoordinator();
+		const clock = spyOn(Date, "now");
+		let now = 10_000;
+		clock.mockImplementation(() => now);
+		let calls = 0;
+		const pending = deferred<GitStatusSummary>();
+		const load = () => {
+			calls++;
+			return pending.promise;
+		};
+		try {
+			const readers = Array.from({ length: 10 }, () => c.query("repo", load, { ttlMs: 0 }));
+			await turn();
+			expect(calls).toBe(1);
+			pending.resolve(summary());
+			await Promise.all(readers);
+			for (const elapsed of [100, 1000, 2999]) {
+				now = 10_000 + elapsed;
+				await c.query("repo", load);
+			}
+			expect(calls).toBe(1);
+			now = 13_000;
+			await c.query("repo", load);
+			expect(calls).toBe(2);
+		} finally {
+			clock.mockRestore();
+			c.clear();
+		}
+	});
+
+	test("validation extends only existing clean values and never clears dirty", async () => {
+		const c = new GitStatusQueryCoordinator();
+		const clock = spyOn(Date, "now");
+		let now = 0;
+		clock.mockImplementation(() => now);
+		let calls = 0;
+		const load = async () => summary(String(++calls));
+		try {
+			c.validate("missing");
+			expect(c.size).toBe(0);
+			await c.query("repo", load);
+			now = 2999;
+			c.validate("repo");
+			now = 5000;
+			expect((await c.query("repo", load)).branch).toBe("1");
+			c.invalidate("repo");
+			c.validate("repo");
+			expect(c.peek("repo")?.branch).toBe("1");
+			expect((await c.query("repo", load)).branch).toBe("2");
+			now = 5100;
+			await c.query("repo", load, { ttlMs: 50 });
+			expect(calls).toBe(3);
+			c.clear();
+			expect(c.size).toBe(0);
+		} finally {
+			clock.mockRestore();
+			c.clear();
+		}
+	});
+
+	test("invalidated completion without a trailing reader cannot become a fresh hit", async () => {
+		const c = new GitStatusQueryCoordinator();
+		await c.query("repo", async () => summary("last"));
+		const pending = deferred<GitStatusSummary>();
+		const old = c.query("repo", () => pending.promise, { ttlMs: 0 });
+		await turn();
+		c.invalidate("repo");
+		pending.resolve(summary("old"));
+		await old;
+		expect(c.peek("repo")?.branch).toBe("last");
+		c.validate("repo");
+		expect((await c.query("repo", async () => summary("new"))).branch).toBe("new");
+	});
+
 	test("same target shares one query, but a later fresh read runs again", async () => {
 		const c = new GitStatusQueryCoordinator();
 		const first = deferred<GitStatusSummary>();
@@ -44,7 +119,7 @@ describe("Git status query coordination", () => {
 		expect(calls).toBe(1);
 		first.resolve(summary());
 		expect(await a).toEqual(await b);
-		expect((await c.query("repo", loader)).branch).toBe("fresh");
+		expect((await c.query("repo", loader, { ttlMs: 0 })).branch).toBe("fresh");
 		expect(calls).toBe(2);
 	});
 

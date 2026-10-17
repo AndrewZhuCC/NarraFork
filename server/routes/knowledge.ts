@@ -16,6 +16,7 @@ import {
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
 	listKnowledgeAclEventsQuerySchema,
+	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,
@@ -64,7 +65,9 @@ function actorOf(c: { get: (k: "user") => { sub: string; role: "admin" | "user" 
 
 knowledgeRoutes.get("/collections", async (c) => {
 	const projectId = c.req.query("projectId") || undefined;
-	return c.json(await knowledgeService.listCollections(projectId, principalOf(c)));
+	// Each row carries `viewerCaps` (what the caller may do with it), computed from the same
+	// predicates the collection write endpoints enforce.
+	return c.json(await knowledgeService.listCollectionsForViewer(projectId, principalOf(c)));
 });
 
 knowledgeRoutes.post("/collections", async (c) => {
@@ -127,18 +130,78 @@ knowledgeRoutes.delete("/collections/:id", async (c) => {
 
 // ─── Entries ──────────────────────────────────────────────────────────
 
+// List entries. Two response shapes, chosen by the caller:
+//   - legacy (no `limit` / `cursor`): a bare array — the first page (up to 100 readable
+//     entries, newest-updated first). `X-Next-Cursor` carries the resume cursor when more
+//     exist, so legacy callers can at least detect truncation.
+//   - paged (`limit` and/or `cursor` present): `{ items, nextCursor }`, keyset-paginated on
+//     (updatedAt DESC, id DESC); `nextCursor` is null once the list is exhausted. Pages may
+//     come back short (even empty) with a non-null cursor when ACL filtering hides most
+//     rows within the per-request scan budget — keep following `nextCursor`.
+// With `q` the FTS search path runs instead (already capped, not paginated): the paged
+// shape then always carries `nextCursor: null`.
+//
+// Paged mode also takes `level` (effective level), `status` and `sort` (`updated` default /
+// `title`, keyset on (title, id); `relevance` is the search default) and annotates each row
+// with `ownerUsername`, `myPersonalEntryId` and `myPersonalEntryBehindMain` (two bounded
+// batch lookups per page). The legacy array shape is unchanged.
 knowledgeRoutes.get("/entries", async (c) => {
 	const collectionId = c.req.query("collectionId") || undefined;
 	const tag = c.req.query("tag") || undefined;
 	const q = c.req.query("q");
+	const parsed = listKnowledgeEntriesQuerySchema.safeParse({
+		cursor: c.req.query("cursor") || undefined,
+		limit: c.req.query("limit") || undefined,
+		level: c.req.query("level") || undefined,
+		status: c.req.query("status") || undefined,
+		sort: c.req.query("sort") || undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { level, status, sort } = parsed.data;
+	const paged = parsed.data.cursor !== undefined || parsed.data.limit !== undefined;
 	const principal = principalOf(c);
 	if (q?.trim()) {
-		const results = await knowledgeService.search({ q, collectionId, tag });
-		return c.json(await knowledgeService.filterReadable(principal, results));
+		if (!paged) {
+			const results = await knowledgeService.search({ q, collectionId, tag });
+			return c.json(await knowledgeService.filterReadable(principal, results));
+		}
+		const rows = await knowledgeService.searchEntriesForBrowse({
+			principal,
+			q,
+			collectionId,
+			tag,
+			level,
+			status,
+			sort,
+		});
+		return c.json({
+			items: await knowledgeService.annotateEntryRows(principal, rows),
+			nextCursor: null,
+		});
 	}
-	const entries = await knowledgeService.listEntries({ collectionId, tag });
-	return c.json(await knowledgeService.filterReadable(principal, entries));
+	const page = await knowledgeService.listEntriesPage({
+		principal,
+		collectionId,
+		tag,
+		level,
+		status,
+		// `relevance` only means something with `q`; the list falls back to its default order.
+		sort: sort === "title" ? "title" : "updated",
+		limit: parsed.data.limit ?? (paged ? undefined : LEGACY_ENTRY_LIST_LIMIT),
+		cursor: parsed.data.cursor,
+	});
+	if (paged) {
+		return c.json({
+			items: await knowledgeService.annotateEntryRows(principal, page.items),
+			nextCursor: page.nextCursor,
+		});
+	}
+	if (page.nextCursor) c.header("X-Next-Cursor", page.nextCursor);
+	return c.json(page.items);
 });
+
+/** Size of the legacy (un-paged) GET /entries response — unchanged from before paging. */
+const LEGACY_ENTRY_LIST_LIMIT = 100;
 
 knowledgeRoutes.post("/entries", async (c) => {
 	const parsed = createKnowledgeEntrySchema.safeParse(await c.req.json());
@@ -155,12 +218,10 @@ knowledgeRoutes.post("/entries", async (c) => {
 	);
 });
 
+// Returns the entry plus `viewerCaps` — the caller's capability bits, each computed by the same
+// predicate its write endpoint enforces — so the UI shows actions without re-deriving the ACL.
 knowledgeRoutes.get("/entries/:id", async (c) => {
-	const entry = await knowledgeService.getEntry(c.req.param("id"), {
-		withContent: true,
-		principal: principalOf(c),
-	});
-	return c.json(entry);
+	return c.json(await knowledgeService.getEntryForViewer(c.req.param("id"), principalOf(c)));
 });
 
 knowledgeRoutes.patch("/entries/:id", async (c) => {
@@ -282,9 +343,8 @@ knowledgeRoutes.get("/personal-entries", async (c) => {
 		limit: c.req.query("limit"),
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const rows = await knowledgeBranchService.listMine(principalOf(c), parsed.data);
-	const driftedIds = await knowledgeBranchService.findDriftedDraftIds(rows);
-	return c.json(rows.map((r) => ({ ...r, drifted: driftedIds.has(r.id) })));
+	// + ACL-checked display names (linked entry title, standalone target collection name).
+	return c.json(await knowledgeBranchService.listMineForViewer(principalOf(c), parsed.data));
 });
 
 knowledgeRoutes.post("/personal-entries", async (c) => {
@@ -293,8 +353,11 @@ knowledgeRoutes.post("/personal-entries", async (c) => {
 	return c.json(await knowledgeBranchService.createStandalone(principalOf(c), parsed.data), 201);
 });
 
+// The personal-version page payload: the entry + ACL-checked linked-entry / target display
+// fields, drift, the requests a delete would close, and `viewerCaps` (same gates as the
+// edit / meta / rebase / delete / submit endpoints).
 knowledgeRoutes.get("/personal-entries/:id", async (c) => {
-	return c.json(await knowledgeBranchService.getMine(principalOf(c), c.req.param("id")));
+	return c.json(await knowledgeBranchService.getMineForViewer(principalOf(c), c.req.param("id")));
 });
 
 knowledgeRoutes.patch("/personal-entries/:id", async (c) => {
@@ -373,11 +436,19 @@ knowledgeRoutes.post("/drafts/:id/submit", async (c) => {
 knowledgeRoutes.get("/submissions", async (c) => {
 	const entryId = c.req.query("entryId") || undefined;
 	const status = c.req.query("status") || undefined;
-	return c.json(await knowledgeBranchService.listSubmissions(principalOf(c), { entryId, status }));
+	// Reviewer list + ACL-checked display metadata (entry title, collection name, submitter,
+	// drift) for the review inbox.
+	return c.json(
+		await knowledgeBranchService.listSubmissionsForInbox(principalOf(c), { entryId, status }),
+	);
 });
 
+// One publish request for the request page: diff, display metadata and `viewerCaps` (what the
+// caller may do with it, computed by the same functions the action endpoints use).
 knowledgeRoutes.get("/submissions/:id", async (c) => {
-	return c.json(await knowledgeBranchService.getSubmission(principalOf(c), c.req.param("id")));
+	return c.json(
+		await knowledgeBranchService.getSubmissionForViewer(principalOf(c), c.req.param("id")),
+	);
 });
 
 knowledgeRoutes.post("/submissions/:id/review", async (c) => {
@@ -577,6 +648,16 @@ knowledgeRoutes.get("/my-open-submissions", async (c) => {
 	const parsed = listDraftSubmissionsQuerySchema.safeParse({ limit: c.req.query("limit") });
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await knowledgeBranchService.listMyOpenSubmissions(principalOf(c), parsed.data));
+});
+
+// Recent verdicts on the caller's own submissions (approved / rejected / changes requested).
+// Powers the notification bell. Ids, status, and findings only — no title or body, so the
+// bell cannot become a side channel for a classified entry the caller cannot read.
+// Own rows only; a stranger's call returns their own (empty) list, never this user's.
+knowledgeRoutes.get("/my-submission-outcomes", async (c) => {
+	const parsed = listDraftSubmissionsQuerySchema.safeParse({ limit: c.req.query("limit") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeBranchService.listMySubmissionOutcomes(principalOf(c), parsed.data));
 });
 
 // ─── Bulk grants + collection ACL readback (admin only) ─────────────────

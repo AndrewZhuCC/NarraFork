@@ -1,9 +1,9 @@
 import type { ContextComposition } from "@shared/context-composition";
 import { request } from "./client";
 
-export function getContextComposition(narratorId: string, signal?: AbortSignal, cursor?: string) {
+export function getContextComposition(narratorId: string, signal?: AbortSignal) {
 	return request<ContextComposition>(
-		`/narrators/${encodeURIComponent(narratorId)}/context-composition${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+		`/narrators/${encodeURIComponent(narratorId)}/context-composition`,
 		{
 			signal: signal
 				? AbortSignal.any([signal, AbortSignal.timeout(10_000)])

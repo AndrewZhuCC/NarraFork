@@ -1,4 +1,4 @@
-import { isIntelligentUiToolName } from "@shared/intelligent-ui-public";
+import { isGenUiToolName } from "@shared/gen-ui-public";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -14,7 +14,7 @@ import { narratorService } from "../services/narrator-service";
 import {
 	isPublicToolSourceAllowed,
 	projectPublicNarratorPayload,
-} from "../services/public-narrator-share-intelligent-ui";
+} from "../services/public-narrator-share-gen-ui";
 import { PUBLIC_SHARE_LIMITS as L } from "../services/public-narrator-share-limits";
 import { publicShareRateLimiter } from "../services/public-narrator-share-rate-limit";
 import {
@@ -170,7 +170,7 @@ publicNarratorShareRoutes.get("/:shareId/session", (c) =>
 );
 
 // ── Narrator document read-through ──────────────────────────────────────────
-// The share link grants existing narrator reads unchanged, except IntelligentUI
+// The share link grants existing narrator reads unchanged, except GenUI
 // tool cards: preview references/results become a static server-authored summary.
 // Ordinary Read/Write/Edit file history is unchanged, including UI source files.
 // Parameter parsing mirrors `server/routes/narrators.ts` — keep them in sync.
@@ -223,7 +223,7 @@ publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId/input-document", 
 		c.req.param("toolUseId"),
 		reference,
 	);
-	if (isIntelligentUiToolName(metadata.toolName)) throw unavailablePublicShare();
+	if (isGenUiToolName(metadata.toolName)) throw unavailablePublicShare();
 	const ref = await toolInputStreamSource.ensureWriteDocumentSource(
 		auth.narratorId,
 		c.req.param("toolUseId"),
@@ -279,13 +279,13 @@ publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId", async (c) => {
 	);
 	// The existing selector handles shared refs/COW/subagent ancestry. Do not load
 	// private input/output/error bodies just to discover that access is forbidden.
-	if (isIntelligentUiToolName(metadata.toolName)) throw unavailablePublicShare();
+	if (isGenUiToolName(metadata.toolName)) throw unavailablePublicShare();
 	const detail = await narratorService.getToolCallDetail(
 		auth.narratorId,
 		c.req.param("toolUseId"),
 		{ toolCallId: metadata.id, messageId: metadata.messageId },
 	);
-	if (isIntelligentUiToolName(detail.toolName)) throw unavailablePublicShare();
+	if (isGenUiToolName(detail.toolName)) throw unavailablePublicShare();
 	revalidatePublicShare(auth);
 	return c.json(detail);
 });

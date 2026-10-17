@@ -180,9 +180,14 @@ export async function ciApi(
 	run: GhRunner,
 	path: string,
 	repository = CI_RELEASE_REPOSITORY,
+	projection?: string,
 ): Promise<unknown> {
 	if (!isValidGitHubRepository(repository)) throw new Error("Invalid CI repository");
-	const output = await run(["api", `repos/${repository}${path ? `/${path}` : ""}`]);
+	const output = await run([
+		"api",
+		`repos/${repository}${path ? `/${path}` : ""}`,
+		...(projection ? ["--jq", projection] : []),
+	]);
 	if (Buffer.byteLength(output) > CI_API_MAX_BYTES) throw new Error("GitHub API output limit");
 	return JSON.parse(output);
 }
@@ -412,7 +417,14 @@ export async function assertCiMainAncestor(
 		.object.sha;
 	const comparison = z
 		.object({ status: z.string(), merge_base_commit: z.object({ sha }) })
-		.parse(await ciApi(run, `compare/${commit}...${main}`, repository));
+		.parse(
+			await ciApi(
+				run,
+				`compare/${commit}...${main}?per_page=1`,
+				repository,
+				"{status, merge_base_commit: {sha: .merge_base_commit.sha}}",
+			),
+		);
 	if (
 		!["ahead", "identical"].includes(comparison.status) ||
 		comparison.merge_base_commit.sha !== commit

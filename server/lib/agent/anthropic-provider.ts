@@ -19,7 +19,6 @@ import {
 	getSettingsRevision,
 	parseModelId,
 	resolveModelContextWindow,
-	settings,
 } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
@@ -1386,16 +1385,13 @@ export class AnthropicProvider implements ProviderAdapter {
 		// All requests go through the proxy-aware fetch so streaming and auxiliary
 		// calls uniformly follow the global outbound proxy policy.
 		const doFetch = async (actualUrl: string, requestInit: RequestInit): Promise<Response> => {
-			collector?.beginResponseAttempt(
-				{
-					transport: "http",
-					url: actualUrl,
-					method: requestInit.method ?? "POST",
-					headers: sanitizeHeaders(new Headers(requestInit.headers)),
-					bodyText: typeof requestInit.body === "string" ? requestInit.body : undefined,
-				},
-				settings.agent?.requestDumpMaxSize,
-			);
+			collector?.beginResponseAttempt({
+				transport: "http",
+				url: actualUrl,
+				method: requestInit.method ?? "POST",
+				headers: sanitizeHeaders(new Headers(requestInit.headers)),
+				bodyText: typeof requestInit.body === "string" ? requestInit.body : undefined,
+			});
 			try {
 				return captureDumpResponse(await this.pfetch(actualUrl, requestInit), collector);
 			} catch (error) {

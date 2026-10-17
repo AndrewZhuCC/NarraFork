@@ -9,6 +9,7 @@ import type { FileReference, FileReferenceContext } from "@shared/file-reference
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
+import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -226,8 +227,12 @@ export interface SearchResponse {
 export interface StorageCategoryResult {
 	key: string;
 	sizeBytes: number;
+	truncated?: boolean;
+	unavailable?: { backend: string; reason: string };
 	details?: Record<string, unknown>;
 }
+
+export type { StorageCategoryKey };
 
 export interface StorageScanResult {
 	categories: StorageCategoryResult[];
@@ -241,11 +246,23 @@ export interface StorageScanResult {
  */
 export type StorageScanJobStatus = "idle" | "running" | "complete" | "error" | "cancelled";
 
+export interface StorageCategoryJobState {
+	key: StorageCategoryKey;
+	status: StorageScanJobStatus;
+	progressMessage: string | null;
+	progressDetail: { done: number; total: number | null } | null;
+	result: StorageCategoryResult | null;
+	error: string | null;
+	startedAt: number | null;
+	finishedAt: number | null;
+}
+
 export interface StorageScanJobState {
 	status: StorageScanJobStatus;
 	progressMessage: string | null;
-	progressDetail: { done: number; total: number } | null;
+	progressDetail: { done: number; total: number | null } | null;
 	categories: StorageCategoryResult[];
+	categoryJobs: StorageCategoryJobState[];
 	result: StorageScanResult | null;
 	error: string | null;
 	startedAt: number | null;
@@ -319,7 +336,6 @@ export interface DatabaseStorageBreakdown {
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
-		apiRequestDumps: DatabaseCleanupCandidateSummary;
 		/**
 		 * Aged tool-call input/output payloads. Clears the columns and KEEPS the rows —
 		 * they carry the tree hashes that file-history revert depends on.
@@ -328,11 +344,7 @@ export interface DatabaseStorageBreakdown {
 	};
 }
 
-export type DatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"
@@ -362,7 +374,6 @@ export interface DatabaseCleanupPreviewCounts {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 }
 
 export interface DatabaseCleanupNarratorSample extends FallbackDiagnostics {

@@ -101,6 +101,7 @@ import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -1672,6 +1673,7 @@ export function createPreparedNarratorInTransaction(
 
 /** Publish non-transactional narrator creation side effects after commit. */
 export function publishNarratorCreated(narrator: typeof narrators.$inferSelect): void {
+	backgroundOccupancyStore.refreshNarrator(narrator.id);
 	logger.info("Narrator created", {
 		id: narrator.id,
 		chapterId: narrator.chapterId,
@@ -1861,6 +1863,7 @@ export const narratorService = {
 					})
 					.returning();
 
+				backgroundOccupancyStore.refreshNarrator(id);
 				logger.info("Subagent created", {
 					id,
 					parentNarratorId: input.parentNarratorId,
@@ -2042,6 +2045,7 @@ export const narratorService = {
 			images?: ImageRef[];
 			textFiles?: TextFileRef[];
 			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
+			composerDocument?: import("@shared/composer-document").ComposerDocument;
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
@@ -2103,6 +2107,7 @@ export const narratorService = {
 				parentToolUseId,
 				messageId: delivery?.recipientMessageId,
 				mailboxClaim: options?.mailboxClaim ?? delivery?.mailboxClaim,
+				composerDocument: options?.composerDocument,
 			},
 		);
 		// See (2) above: withheld here rather than in the shared entry point, so the
@@ -2380,6 +2385,8 @@ export const narratorService = {
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		backgroundOccupancyStore.removeNarrators([narratorId]);
+		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
 		eventBus.emit({ type: "human_attention:changed" });
 		if (bindingTransition) {

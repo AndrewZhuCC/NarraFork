@@ -205,6 +205,9 @@ describe("intent-only worktree tools", () => {
 			baseRef: "HEAD",
 		});
 		expect(output.data.worktree).toEqual(created.worktree);
+		expect(output.data.nextAction).toBe(
+			"Worktree created; cwd unchanged. SwitchWorkingDirectory if this narrator will work there (visible git stats follow cwd). Pass the path as Agent workdir to assign it to a subagent without switching.",
+		);
 	});
 
 	test("attaches existing branch without baseRef or hidden model naming", async () => {

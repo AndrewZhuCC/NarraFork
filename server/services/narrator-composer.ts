@@ -1,22 +1,22 @@
 import {
-	CODEX_COMPOSER_MAX_RESPONSE_BYTES,
 	CODEX_COMPOSER_MAX_SEED_BYTES,
 	type CodexComposerSeed,
 	getCodexComposerSettings,
 } from "@server/lib/agent/codex-composer";
-import { diagnosticsFromError } from "@server/lib/agent/error-diagnostics";
+import {
+	diagnosticsFromError,
+	normalizeApiRequestDiagnostics,
+} from "@server/lib/agent/error-diagnostics";
 import type { GenerateMetaResult } from "@server/lib/agent/provider";
-import { ApiRequestDumpCollector, responseDumpBudget } from "@server/lib/agent/request-dump";
+import { ApiRequestDumpCollector } from "@server/lib/agent/request-dump";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
-	isRequestDumpEnabled,
-	isRequestDumpErrorsOnly,
 	startApiRequest,
 } from "@server/lib/api-request-tracker";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
-import { settings } from "@server/lib/settings";
+import { bindRecordingRequest, createRequestRecording } from "@server/lib/request-recorder";
 import { broadcastToNarrator } from "@server/websocket/narrator-ws";
 import { type CodexComposerSuggestion, parseCodexComposerSuggestion } from "@shared/codex-composer";
 
@@ -195,16 +195,19 @@ async function predict(task: PredictionTask): Promise<void> {
 			model: task.model,
 			kind: "composer",
 		});
-		if (isRequestDumpEnabled()) {
-			dump = new ApiRequestDumpCollector(
-				{ provider: task.providerId, model: task.model },
-				undefined,
-				undefined,
-				Math.min(
-					responseDumpBudget(settings.agent.requestDumpMaxSize),
-					CODEX_COMPOSER_MAX_SEED_BYTES + CODEX_COMPOSER_MAX_RESPONSE_BYTES,
-				),
-			);
+		const recordingRequestId = generateId();
+		handle.recordingRequestId = recordingRequestId;
+		const recording = createRequestRecording({
+			requestId: recordingRequestId,
+			narratorId: task.narratorId,
+			userId: task.userId,
+			provider: task.providerId,
+			model: task.model,
+			kind: "composer",
+		});
+		if (recording) {
+			bindRecordingRequest(recordingRequestId, handle.id);
+			dump = new ApiRequestDumpCollector(recording);
 		}
 		task.controller.signal.throwIfAborted();
 		if (!task.seed) throw new Error("Composer prediction has no seed");
@@ -254,11 +257,13 @@ async function predict(task: PredictionTask): Promise<void> {
 					failure === undefined
 						? null
 						: (failure instanceof Error ? failure.message : String(failure)).slice(0, 1024),
-				diagnostics: failure === undefined ? undefined : diagnosticsFromError(failure),
-				rawDump:
-					isRequestDumpEnabled() && (failure !== undefined || !isRequestDumpErrorsOnly())
-						? dump?.snapshot()
-						: undefined,
+				diagnostics:
+					failure === undefined
+						? undefined
+						: normalizeApiRequestDiagnostics({
+								...diagnosticsFromError(failure),
+								recordingRequestId: handle.recordingRequestId,
+							}),
 			});
 		}
 	} catch {
@@ -268,6 +273,15 @@ async function predict(task: PredictionTask): Promise<void> {
 			error: "usage_record_failed",
 		});
 	} finally {
+		dump?.finish({
+			status: failure === undefined ? "completed" : "error",
+			error:
+				failure === undefined
+					? undefined
+					: failure instanceof Error
+						? failure.message
+						: String(failure),
+		});
 		tasks.delete(task);
 		task.promise = undefined;
 	}

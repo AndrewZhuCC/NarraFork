@@ -8,6 +8,32 @@ import type { WorktreeCreateRequest } from "../lib/validators/narrator-worktrees
 
 const MAX_RECORD_BYTES = 32 * 1024;
 
+/** Resource evidence only, never recovery authorization or permission to retry a request.
+ * Unknown/malformed/contradictory evidence stays protected; only a proven pre-dispatch
+ * receipt can be omitted before validating its (possibly rejected) destination.
+ */
+export function worktreeReceiptHasResourceEffect(record: unknown): boolean {
+	if (!record || typeof record !== "object" || Array.isArray(record)) return true;
+	const receipt = record as Record<string, unknown>;
+	if (receipt.commandSucceeded !== undefined || receipt.dispatchState === "started") return true;
+	if (receipt.dispatchState !== undefined && receipt.dispatchState !== "not_started") return true;
+	if (receipt.result === undefined) return receipt.dispatchState !== "not_started";
+	if (!receipt.result || typeof receipt.result !== "object" || Array.isArray(receipt.result))
+		return true;
+	const result = receipt.result as Record<string, unknown>;
+	if (result.outcome !== "failed" || result.worktree !== null) return true;
+	if (!result.error || typeof result.error !== "object" || Array.isArray(result.error)) return true;
+	const failure = result.error as Record<string, unknown>;
+	if (typeof failure.code !== "string" || !failure.code || typeof failure.message !== "string")
+		return true;
+	if (!result.residuals || typeof result.residuals !== "object" || Array.isArray(result.residuals))
+		return true;
+	const residuals = result.residuals as Record<string, unknown>;
+	if (residuals.destinationExists !== null || residuals.branchExists !== null) return true;
+	// Legacy HEAD was saved after validation, before any possible worktree add.
+	return receipt.dispatchState !== "not_started" && receipt.expectedHead !== "";
+}
+
 export type { WorktreeCreateResult, WorktreeEntry } from "@shared/narrator-worktrees";
 export interface WorktreeJournalRecord {
 	proposalHash: string;
@@ -20,6 +46,8 @@ export interface WorktreeJournalRecord {
 	expectedHead: string;
 	/** Resolved once before dispatch; original request stays unchanged for proposal hashing. */
 	branchName?: string;
+	/** Persist started before dispatch; an interrupted started operation is never retried. */
+	dispatchState?: "not_started" | "started";
 	commandSucceeded?: boolean;
 	result?: WorktreeCreateResult;
 }

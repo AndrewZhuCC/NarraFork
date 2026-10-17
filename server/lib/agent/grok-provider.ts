@@ -28,13 +28,14 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { captureDumpResponse, captureResponseStream, sanitizeHeaders } from "./request-dump";
-import { resolveToolJsonSchema } from "./tool-registry";
 import {
-	type AgentToolUse,
-	ApiError,
-	type ResolvedToolDefinition,
-} from "./types";
+	captureDumpResponse,
+	captureResponseStream,
+	readResponsePrefix,
+	sanitizeHeaders,
+} from "./request-dump";
+import { resolveToolJsonSchema } from "./tool-registry";
+import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
 const DEFAULT_GROK_API_BASE = "https://api.x.ai/v1";
 /** xAI Grok 4.x context window (user-verified). */
@@ -103,16 +104,12 @@ export class GrokProvider implements ProviderAdapter {
 
 	/** Context window for a model: upstream default is 500K for Grok 4.x. */
 	contextWindowForModel(model: string): number {
-		if (this.config.defaultContextWindow)
-			return this.config.defaultContextWindow;
+		if (this.config.defaultContextWindow) return this.config.defaultContextWindow;
 		const bare = parseModelId(model).model;
 		return /grok-4/i.test(bare) ? DEFAULT_GROK_CONTEXT_WINDOW : 131_072;
 	}
 
-	private pfetch(
-		input: string | URL | Request,
-		init?: RequestInit,
-	): Promise<Response> {
+	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
 		return fetchWithNetworkDiagnostics(input, init, { proxy });
@@ -121,9 +118,7 @@ export class GrokProvider implements ProviderAdapter {
 	private getApiKey(): string {
 		const apiKey = this.config.apiKey;
 		if (!apiKey) {
-			throw new Error(
-				`Grok API key not configured for provider "${this.config.name}".`,
-			);
+			throw new Error(`Grok API key not configured for provider "${this.config.name}".`);
 		}
 		return apiKey;
 	}
@@ -168,10 +163,7 @@ export class GrokProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const apiKey = this.getApiKey();
-		const baseUrl = (this.config.baseUrl || DEFAULT_GROK_API_BASE).replace(
-			/\/+$/,
-			"",
-		);
+		const baseUrl = (this.config.baseUrl || DEFAULT_GROK_API_BASE).replace(/\/+$/, "");
 
 		// Build the conversation: developer/system prompt + history, then the
 		// current user turn and any pending tool results.
@@ -187,9 +179,7 @@ export class GrokProvider implements ProviderAdapter {
 		}
 		if (params.content && params.content !== ".") {
 			if (params.images?.length) {
-				const parts: GrokContentPart[] = [
-					{ type: "text", text: params.content },
-				];
+				const parts: GrokContentPart[] = [{ type: "text", text: params.content }];
 				for (const img of params.images) {
 					parts.push({
 						type: "image_url",
@@ -231,19 +221,14 @@ export class GrokProvider implements ProviderAdapter {
 		if (tools.length > 0) body.tools = tools;
 
 		const headers = this.buildHeaders(apiKey);
-		const dumpRequest = {
+		const bodyText = JSON.stringify(body);
+		params.requestDump?.beginResponseAttempt({
 			transport: "http",
+			method: "POST",
 			url: `${baseUrl}/responses`,
 			headers: sanitizeHeaders(headers),
-			body,
-		};
-		const diagnosticDump =
-			params.requestDump?.maxCaptureBytes !== undefined ? params.requestDump : undefined;
-		if (diagnosticDump) {
-			diagnosticDump.beginResponseAttempt(dumpRequest, diagnosticDump.maxCaptureBytes);
-		} else {
-			params.requestDump?.setRequest(dumpRequest);
-		}
+			bodyText,
+		});
 		logger.debug("Grok chat request", {
 			model,
 			baseUrl,
@@ -258,53 +243,30 @@ export class GrokProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(body),
+			body: bodyText,
 			signal: params.signal,
+		}).catch((error) => {
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		});
-		// Only diagnostic capture uses the bounded tap; legacy full-dump buffering is unchanged.
-		const responseTextPromise =
-			params.requestDump && !diagnosticDump
-				? response
-						.clone()
-						.text()
-						.catch((error) => {
-							params.requestDump?.setResponseError(error);
-							return "";
-						})
-				: undefined;
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			if (diagnosticDump) {
-				diagnosticDump.appendResponseText(errText);
-				diagnosticDump.finishResponseCapture(true);
-			} else {
-				params.requestDump?.setResponseBodyText(errText);
-			}
-			throw new ApiError(
-				response.status,
-				`Grok API error ${response.status}: ${errText}`,
-			);
-		}
-
-		if (!response.body) {
-			throw new Error("Grok API returned no body");
-		}
-
-		const capture = captureResponseStream(response.body, diagnosticDump);
+		if (!response.body) throw new Error("Grok API returned no body");
+		const tap = captureResponseStream(response.body, params.requestDump);
 		try {
-			yield* this.parseResponsesStream(capture.stream);
+			if (!response.ok) {
+				const errText = await readResponsePrefix(new Response(tap.stream)).catch(() => "");
+				throw new ApiError(response.status, `Grok API error ${response.status}: ${errText}`);
+			}
+			yield* this.parseResponsesStream(tap.stream);
+		} catch (error) {
+			params.requestDump?.setResponseError(error);
+			throw error;
 		} finally {
-			capture.finish();
-		}
-		if (responseTextPromise) {
-			const bodyText = await responseTextPromise;
-			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
-			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+			tap.finish();
 		}
 	}
 
@@ -391,10 +353,7 @@ export class GrokProvider implements ProviderAdapter {
 		options?: import("./provider").GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const apiKey = this.getApiKey();
-		const baseUrl = (this.config.baseUrl || DEFAULT_GROK_API_BASE).replace(
-			/\/+$/,
-			"",
-		);
+		const baseUrl = (this.config.baseUrl || DEFAULT_GROK_API_BASE).replace(/\/+$/, "");
 
 		const bareModel = parseModelId(model).model;
 		const messages: Array<{ role: "system" | "user"; content: string }> = [];
@@ -406,15 +365,19 @@ export class GrokProvider implements ProviderAdapter {
 		const url = `${baseUrl}/responses`;
 		const headers = this.buildHeaders(apiKey);
 		const body = { model: bareModel, input: messages, stream: true, store: false };
-		options?.requestDump?.beginResponseAttempt(
-			{ transport: "http", url, headers, body },
-			settings.agent.requestDumpMaxSize,
-		);
+		const bodyText = JSON.stringify(body);
+		options?.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText,
+		});
 		const response = captureDumpResponse(
 			await this.pfetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: bodyText,
 				signal: options?.signal,
 			}),
 			options?.requestDump,
@@ -422,10 +385,7 @@ export class GrokProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(
-				response.status,
-				`Grok API error ${response.status}: ${errText}`,
-			);
+			throw new ApiError(response.status, `Grok API error ${response.status}: ${errText}`);
 		}
 
 		if (!response.body) {
@@ -460,15 +420,9 @@ export class GrokProvider implements ProviderAdapter {
 		options?: import("./provider").GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const apiKey = this.getApiKey();
-		const baseUrl = (this.config.baseUrl || DEFAULT_GROK_API_BASE).replace(
-			/\/+$/,
-			"",
-		);
+		const baseUrl = (this.config.baseUrl || DEFAULT_GROK_API_BASE).replace(/\/+$/, "");
 
-		const reminder = getToolMessage(
-			"titleReminder",
-			(locale ?? "en") as Locale,
-		);
+		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
 
 		const response = await this.pfetch(`${baseUrl}/responses`, {
@@ -488,10 +442,7 @@ export class GrokProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(
-				response.status,
-				`Grok API error ${response.status}: ${errText}`,
-			);
+			throw new ApiError(response.status, `Grok API error ${response.status}: ${errText}`);
 		}
 
 		if (!response.body) {
@@ -509,8 +460,7 @@ export class GrokProvider implements ProviderAdapter {
 	} {
 		const topLevel = dbMessages.filter(
 			(m) =>
-				!m.parentToolUseId &&
-				(m.role === "user" || m.role === "assistant" || m.role === "sys"),
+				!m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 		);
 
 		if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
@@ -592,11 +542,7 @@ export class GrokProvider implements ProviderAdapter {
 				name?: string;
 				input?: unknown;
 			};
-			if (
-				b.type === "tool_use" &&
-				typeof b.toolUseId === "string" &&
-				typeof b.name === "string"
-			) {
+			if (b.type === "tool_use" && typeof b.toolUseId === "string" && typeof b.name === "string") {
 				result.push({
 					toolUseId: b.toolUseId,
 					name: b.name,
@@ -610,9 +556,7 @@ export class GrokProvider implements ProviderAdapter {
 	}
 
 	/** Normalize stored assistant/tool turns into Responses input items. */
-	private toResponsesMessages(
-		history: GrokResponsesMessage[],
-	): GrokResponsesMessage[] {
+	private toResponsesMessages(history: GrokResponsesMessage[]): GrokResponsesMessage[] {
 		return history.flatMap((m) => {
 			if (m.type === "function_call_output") return [m];
 			if (m.type === "function_call") return [m];
@@ -621,9 +565,7 @@ export class GrokProvider implements ProviderAdapter {
 				m.content == null &&
 				Array.isArray((m as { tool_calls?: unknown }).tool_calls)
 			) {
-				const calls =
-					(m as unknown as { tool_calls?: GrokResponsesToolCall[] })
-						.tool_calls ?? [];
+				const calls = (m as unknown as { tool_calls?: GrokResponsesToolCall[] }).tool_calls ?? [];
 				return calls.map(
 					(tc): GrokResponsesMessage => ({
 						type: "function_call",
@@ -675,23 +617,16 @@ export class GrokProvider implements ProviderAdapter {
 						continue;
 					}
 					const type = payload.type ?? "";
-					if (
-						type === "response.output_text.delta" &&
-						typeof payload.delta === "string"
-					) {
+					if (type === "response.output_text.delta" && typeof payload.delta === "string") {
 						text += payload.delta;
 						await options?.onTextDelta?.(payload.delta);
 					}
-					if (
-						type === "response.output_text.done" &&
-						typeof payload.text === "string"
-					) {
+					if (type === "response.output_text.done" && typeof payload.text === "string") {
 						text = payload.text;
 					}
 					if (type === "response.completed" && payload.response) {
 						const response = payload.response;
-						if (typeof response.output_text === "string")
-							text = response.output_text;
+						if (typeof response.output_text === "string") text = response.output_text;
 						if (response.usage) usage = extractOpenAIUsage(response.usage);
 					}
 				}
@@ -746,18 +681,12 @@ export class GrokProvider implements ProviderAdapter {
 					const type = payload.type ?? "";
 					const event: ParsedStreamEvent = {};
 
-					if (
-						type === "response.output_text.delta" &&
-						typeof payload.delta === "string"
-					) {
+					if (type === "response.output_text.delta" && typeof payload.delta === "string") {
 						event.text = payload.delta;
 						yield event;
 						continue;
 					}
-					if (
-						type === "response.output_text.done" &&
-						typeof payload.text === "string"
-					) {
+					if (type === "response.output_text.done" && typeof payload.text === "string") {
 						// Terminal text for this output item; nothing to yield.
 						continue;
 					}
@@ -781,20 +710,14 @@ export class GrokProvider implements ProviderAdapter {
 						// Delta events already streamed the text; emitting the full
 						// `.done` text again duplicates every block (same sentence
 						// twice). Only fall back to it when nothing was streamed.
-						if (
-							payload.output_index != null &&
-							reasoningSeen.has(payload.output_index)
-						) {
+						if (payload.output_index != null && reasoningSeen.has(payload.output_index)) {
 							continue;
 						}
 						event.reasoning = payload.text;
 						yield event;
 						continue;
 					}
-					if (
-						type === "response.output_item.added" ||
-						type === "response.output_item.done"
-					) {
+					if (type === "response.output_item.added" || type === "response.output_item.done") {
 						const item = payload.item;
 						if (!item) continue;
 						const finalize = type === "response.output_item.done";
@@ -818,19 +741,13 @@ export class GrokProvider implements ProviderAdapter {
 							}
 							continue;
 						}
-						if (
-							item.type === "web_search_call" ||
-							item.type === "x_search_call"
-						) {
+						if (item.type === "web_search_call" || item.type === "x_search_call") {
 							// Server-side search activity; surface for the UI but do not
 							// execute. Both web and X search map to the host's webSearch
 							// lifecycle events.
 							const id = item.id ?? `${item.type}-${item.name ?? "tool"}`;
-							const query =
-								firstString(item.query, item.action?.query) ??
-								item.action?.queries;
-							const status =
-								item.status === "completed" ? "completed" : "in_progress";
+							const query = firstString(item.query, item.action?.query) ?? item.action?.queries;
+							const status = item.status === "completed" ? "completed" : "in_progress";
 							event.webSearch = {
 								id,
 								status,
@@ -846,13 +763,10 @@ export class GrokProvider implements ProviderAdapter {
 							// They are already executed upstream — their results are folded
 							// into the assistant text with url_citation annotations — so they
 							// must never be executed by the host. Surface as search activity.
-							const id =
-								firstString(item.id, item.call_id) ??
-								`${item.name}-${item.name}`;
+							const id = firstString(item.id, item.call_id) ?? `${item.name}-${item.name}`;
 							event.webSearch = {
 								id,
-								status:
-									item.status === "completed" ? "completed" : "in_progress",
+								status: item.status === "completed" ? "completed" : "in_progress",
 								query: parseXSearchQuery(item),
 								outputIndex: payload.output_index,
 							};
@@ -938,9 +852,7 @@ export class GrokProvider implements ProviderAdapter {
 							const usage = extractOpenAIUsage(response.usage);
 							event.usage = {
 								...(usage ?? {}),
-								contextWindow: this.contextWindowForModel(
-									settings.agent?.defaultModel ?? "",
-								),
+								contextWindow: this.contextWindowForModel(settings.agent?.defaultModel ?? ""),
 							};
 							yield event;
 						}

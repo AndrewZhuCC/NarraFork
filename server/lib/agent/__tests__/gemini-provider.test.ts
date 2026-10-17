@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { RequestRecording } from "@shared/request-recording";
 import { z } from "zod/v4";
 import {
 	customApiProviderToGemini,
@@ -87,14 +88,6 @@ let setOutboundFetchOverrideForTest: (
 ) => void;
 let maxSseEventBytes = 0;
 let maxStreamBytes = 0;
-/**
- * The provider's ceiling on a persisted dump, whatever `agent.requestDumpMaxSize` says.
- *
- * Read from the module rather than written literally: the configurable setting is
- * clamped to this value, so a test that hard-codes the setting's current default breaks
- * when that default changes even though the capping behaviour is unchanged.
- */
-let maxDumpBytes = 0;
 let testHome = "";
 let originalNarraforkHome: string | undefined;
 
@@ -117,7 +110,6 @@ beforeAll(async () => {
 		factoryModule.createGeminiProvider as unknown as typeof createGeminiProvider;
 	maxSseEventBytes = interactionsModule.GEMINI_MAX_SSE_EVENT_BYTES;
 	maxStreamBytes = interactionsModule.GEMINI_MAX_STREAM_BYTES;
-	maxDumpBytes = interactionsModule.GEMINI_MAX_REQUEST_DUMP_BYTES;
 	setOutboundFetchOverrideForTest = outboundFetchModule.setOutboundFetchOverrideForTest;
 });
 
@@ -1071,8 +1063,21 @@ describe("Gemini Interactions API provider", () => {
 		]);
 	});
 
-	test("enforces per-SSE-event hard limit without cloning the whole stream dump", async () => {
-		const dump = new ApiRequestDumpCollector();
+	test("enforces per-SSE-event hard limit and records the error on the recording", async () => {
+		const metas: Record<string, unknown>[] = [];
+		let chunkBytes = 0;
+		const recording: RequestRecording = {
+			requestId: "gemini-hard-limit",
+			pin: () => {},
+			request: () => {},
+			responseMeta: (meta) => metas.push(meta),
+			responseChunk: (chunk) => {
+				chunkBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+			},
+			frame: () => {},
+			finish: () => {},
+		};
+		const dump = new ApiRequestDumpCollector(recording);
 		const huge = "x".repeat(maxSseEventBytes + 1);
 		setOutboundFetchOverrideForTest(
 			async () =>
@@ -1088,18 +1093,9 @@ describe("Gemini Interactions API provider", () => {
 			thrown = error as Error;
 		}
 		expect(thrown?.message).toContain("SSE event exceeded hard limit");
-		const snapshot = dump.snapshot();
-		// Bounded by the provider's OWN dump ceiling, not by a hard-coded 1MB: the
-		// configurable `agent.requestDumpMaxSize` feeds `resolveDumpLimit`, so writing the
-		// old default in here made this test fail the moment that default was raised —
-		// while the property under test (the dump is capped rather than cloning the whole
-		// stream) still held. `maxDumpBytes` is the effective cap for any configured value.
-		// The slack covers the appended truncation marker.
-		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThanOrEqual(maxDumpBytes + 200);
-		// The stream itself is larger than the cap, so a real truncation must have happened
-		// — otherwise this assertion would pass for an unbounded dump that simply fit.
-		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThan(huge.length);
-		expect(snapshot.response?.error).toContain("hard limit");
+		// The raw bytes reach the recorder (bounded by its ring window, not an in-memory copy).
+		expect(chunkBytes).toBeGreaterThan(0);
+		expect(metas.find((meta) => typeof meta.error === "string")?.error).toContain("hard limit");
 	});
 
 	test("accepts one chunk whose complete small frames exceed the per-event limit in aggregate", async () => {

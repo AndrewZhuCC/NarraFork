@@ -346,7 +346,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	if _, err := exec.LookPath("git"); err != nil {
 		return probeFailure("git_unavailable", err)
 	}
-	if op == "status" {
+	if op == "status" || op == "lineStats" {
 		release, err := gitStatusAdmissions.admit(runCtx)
 		if err != nil {
 			return nil, err
@@ -432,7 +432,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	}
 	g.remaining, g.truncated = maxBytes, false
 	// Whole-worktree reads must not let supplied file actions add per-file processes.
-	if _, present := params["files"]; (op == "watch" || op == "status") && present {
+	if _, present := params["files"]; (op == "watch" || op == "status" || op == "lineStats") && present {
 		return nil, fmt.Errorf("%s does not accept files", op)
 	}
 	if op == "commitDetail" || op == "commitDiff" {
@@ -454,7 +454,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	switch op {
 	case "stage", "unstage", "commit", "discard", "stashPush", "stashPop", "stashDrop", "reset":
 		write = true
-	case "watch", "status", "diff", "fullDiff", "log", "stashList":
+	case "watch", "status", "lineStats", "diff", "fullDiff", "log", "stashList":
 	default:
 		return nil, fmt.Errorf("unknown Git workspace operation")
 	}
@@ -462,7 +462,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	if filepath.Separator == '\\' {
 		lockKey = strings.ToLower(common)
 	}
-	if op == "status" {
+	if op == "status" || op == "lineStats" {
 		release, err := gitStatusQueries.acquire(runCtx, root)
 		if err != nil {
 			return nil, err
@@ -513,6 +513,8 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	g.remaining, g.truncated = maxBytes, false // metadata isn't part of the user-visible output budget
 	var out string
 	switch op {
+	case "lineStats":
+		return h.gitWorkspaceLineStats(g, maxBytes)
 	case "watch":
 		return h.gitWorkspaceWatch(g, head)
 	case "status":

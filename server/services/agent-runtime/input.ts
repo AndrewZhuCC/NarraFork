@@ -35,7 +35,7 @@ export interface SubagentRuntimeProfile {
 }
 
 export type RuntimeProfile =
-	| { kind: "primary"; reasoningEffort?: ReasoningEffort }
+	| { kind: "primary"; reasoningEffort?: ReasoningEffort; initialPrePromptBashCommand?: string }
 	| SubagentRuntimeProfile;
 
 export type RuntimeInput =
@@ -69,8 +69,7 @@ export function createRuntimeRunState(
 		recovery: createRuntimeRecoveryState(),
 		firstPass: true,
 		initialSettingsApplied: false,
-		pendingPrePromptBashCommand:
-			profile.kind === "subagent" ? profile.initialPrePromptBashCommand : undefined,
+		pendingPrePromptBashCommand: profile.initialPrePromptBashCommand,
 		hadError: false,
 		wasInterrupted: false,
 		finalText: "",

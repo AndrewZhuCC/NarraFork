@@ -53,6 +53,7 @@ import {
 	write,
 } from "./__tests__/revert-transaction.fixture";
 import { fileChangeLocalIo } from "./file-change-local-io";
+import * as localRestore from "./file-change-local-restore";
 import { resetFileChangeNamespace } from "./file-change-namespace-reset";
 import { FileChangeReversalCalculator } from "./file-change-reversal";
 import { localFileChangeRuntimeBinding } from "./file-change-runtime";
@@ -1107,46 +1108,97 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			apply: { receipt: { confirmed: true, outcome: "not_applied" } },
 		});
 	});
-	test("real 50ms cleanup expiry retains recovery-required without blind compensation", async () => {
+	test("real 50ms early cleanup expiry before dispatch retains recovery-required without blind compensation", async () => {
 		const { a, b, plan } = await twoFiles();
 		const before = history();
+		const filesBefore = journalFiles(plan);
 		const controller = new AbortController();
-		let cleanupExpired = false;
+		const entered = hold();
+		const expired = hold();
+		const release = hold();
+		let cleanupSignal: AbortSignal | undefined;
+		let namespaceAcquired = false;
+		let namespaceWait: Promise<void> | undefined;
 		setService(makeFixtureTransaction(db, { ...options, cleanupTimeoutMs: 50 }));
-		setFileHook(async (path, signal) => {
-			if (
-				path === b &&
-				operation(plan)?.status === "applying" &&
-				journalFiles(plan)[1].status === "applying"
-			)
-				controller.abort();
-			if (!cleanupExpired && path === a && operation(plan)?.status === "compensating") {
+		const start = RevertMutationJournal.prototype.startExecution;
+		const cancel = spyOn(RevertMutationJournal.prototype, "startExecution").mockImplementation(
+			async function (this: RevertMutationJournal, ...args) {
+				const admission = await start.apply(this, args);
+				// Cancel after real durable admission, but before ANY restore or its own
+				// 50ms receipt-publication budget. Slow blob IO must not choose our phase.
+				if (admission.started) controller.abort();
+				return admission;
+			},
+		);
+		const finish = RevertMutationJournal.prototype.finishCompensation;
+		const fault = spyOn(RevertMutationJournal.prototype, "finishCompensation").mockImplementation(
+			async function (this: RevertMutationJournal, ctx, options) {
+				// With no dispatched files, this is compensate()'s FIRST async dependency:
+				// its original 50ms signal has just been created, with no intervening IO.
+				const signal = options?.signal;
+				if (!signal) throw new Error("Missing real compensation cleanup signal");
+				cleanupSignal = signal;
+				entered.release();
 				await new Promise<void>((resolve) => {
 					if (signal.aborted) resolve();
 					else signal.addEventListener("abort", () => resolve(), { once: true });
 				});
-				cleanupExpired = signal.aborted;
-				// Resume the original authorization/namespace path with its REAL aborted
-				// cleanup signal. No timer replacement or fabricated receipt is involved.
-			}
-		});
+				expired.release();
+				await release.promise;
+				// Run the original scan/transition with its REAL expired signal, never
+				// a fabricated receipt or timer. Later tests cover pending dispatched IO.
+				return finish.call(this, ctx, options);
+			},
+		);
+		const restore = spyOn(localRestore, "restoreLocalFile");
+		restores.push(
+			() => cancel.mockRestore(),
+			() => fault.mockRestore(),
+			() => restore.mockRestore(),
+		);
 		const attempt = execution(plan, controller.signal);
+		try {
+			await Promise.race([
+				entered.promise,
+				attempt.whenSettled.then(() => {
+					throw new Error("Compensation settled before the cleanup-entry barrier");
+				}),
+			]);
+			namespaceWait = runtime.withNamespaceAccess(async () => {
+				namespaceAcquired = true;
+			});
+			await expired.promise;
+			expect(cleanupSignal?.aborted).toBe(true);
+			expect(cleanupSignal?.reason).toMatchObject({ name: "TimeoutError" });
+			expect(await attempt.result).toMatchObject({
+				status: "recovery_required",
+				journalStatus: "compensating",
+				settling: true,
+			});
+			expect(journalFiles(plan)).toEqual(filesBefore);
+			const scope = runtime.evidence.getScope(filesBefore[0].scopeId);
+			if (!scope) throw new Error("Missing scope");
+			expect(scope.activeLeaseId).toBeTruthy();
+			expect(scope.activeMutationCount).toBe(0);
+			expect(namespaceAcquired).toBe(false);
+		} finally {
+			release.release();
+		}
 		const final = await attempt.whenSettled;
-		expect(cleanupExpired).toBe(true);
+		await namespaceWait;
+		expect(namespaceAcquired).toBe(true);
 		expect(final).toMatchObject({
 			status: "recovery_required",
 			journalStatus: "compensating",
 			settling: false,
 		});
-		// The expired cleanup cannot pretend its final durable transition completed.
+		// Expiry cannot pretend the final durable transition completed or dispatch
+		// blind compensation for files that were never applied.
 		expect(operation(plan)?.status).toBe("compensating");
-		expect(await fs.readFile(a, "utf8")).toBe("original");
-		expect(await fs.readFile(b, "utf8")).toBe("changed");
+		expect(restore).not.toHaveBeenCalled();
+		expect(journalFiles(plan)).toEqual(filesBefore);
+		for (const path of [a, b]) expect(await fs.readFile(path, "utf8")).toBe("changed");
 		expect(history()).toBe(before);
-		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
-			apply: { receipt: { confirmed: true, outcome: "applied" } },
-			compensate: { receipt: { confirmed: true, outcome: "not_applied" } },
-		});
 	});
 
 	test("bounded response keeps namespace until compensation IO settlement", async () => {

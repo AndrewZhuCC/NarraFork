@@ -784,23 +784,32 @@ export const modelHistoryRevisionContracts = pgTable("model_history_revision_con
 	installedVersion: text("installed_version").notNull(),
 });
 
-export const narratorContextCharPages = pgTable(
-	"narrator_context_char_pages",
+export const narratorContextPins = pgTable(
+	"narrator_context_pins",
 	{
-		id: text("id").primaryKey().notNull(),
+		generation: text("generation").primaryKey().notNull(),
 		narratorId: text("narrator_id")
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
-		generation: text("generation").notNull(),
-		page: integer("page").notNull(),
+		segmentsJson: jsonText("segments_json").notNull(),
+	},
+	(table) => [index("idx_context_pins_narrator").on(table.narratorId)],
+);
+
+export const narratorMessageContextStats = pgTable(
+	"narrator_message_context_stats",
+	{
+		messageId: text("message_id").primaryKey().notNull(),
+		role: text("role").notNull(),
+		parentToolUseId: text("parent_tool_use_id"),
 		segmentsJson: jsonText("segments_json").notNull(),
 	},
 	(table) => [
-		uniqueIndex("context_char_pages_generation_page_idx").on(
-			table.narratorId,
-			table.generation,
-			table.page,
-		),
+		foreignKey({
+			name: "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk",
+			columns: [table.messageId],
+			foreignColumns: [narratorMessages.id],
+		}).onDelete("cascade"),
 	],
 );
 
@@ -817,6 +826,7 @@ export const narratorMessages = pgTable(
 		contentJson: jsonText("content_json").notNull(),
 		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
+		composerDocument: jsonText("composer_document"),
 		contextCharsJson: jsonText("context_chars_json"),
 		tokensIn: integer("tokens_in"),
 		costUsd: doublePrecision("cost_usd"),
@@ -965,7 +975,15 @@ export const narratorToolCalls = pgTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
-		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		index("idx_toolcalls_context_id").on(
+			table.messageId,
+			table.id,
+			table.toolUseId,
+			table.createdAt,
+			table.executionAttempt,
+			table.inputChars,
+			table.outputChars,
+		),
 		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
 		index("idx_toolcalls_context_latest").on(
 			table.messageId,
@@ -1579,6 +1597,7 @@ export const narratorDrafts = pgTable(
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
 		fileReferencesJson: text("file_references_json"),
+		composerDocument: jsonText("composer_document"),
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
@@ -2038,8 +2057,6 @@ export const apiRequests = pgTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
-		tokenAccountingVersion: integer("token_accounting_version"),
-		tokenAccountingReviewVersion: integer("token_accounting_review_version"),
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
 		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
@@ -2057,7 +2074,8 @@ export const apiRequests = pgTable(
 		meterUsage: doublePrecision("meter_usage"),
 		meterUnit: text("meter_unit"),
 		errorMessage: text("error_message"),
-		rawDumpJson: text("raw_dump_json"),
+		diagnosticsJson: text("diagnostics_json"),
+		recordingRequestId: text("recording_request_id"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -2067,79 +2085,8 @@ export const apiRequests = pgTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
-		index("idx_api_requests_token_repair_pending")
-			.on(table.createdAt, table.id)
-			.where(
-				sql.raw(
-					'"token_accounting_version" IS NULL AND "token_accounting_review_version" IS NULL AND ("cached_input_tokens" > 0 OR "cache_creation_input_tokens" > 0 OR "cache_creation_5m_tokens" > 0 OR "cache_creation_1h_tokens" > 0)',
-				),
-			),
-		index("idx_api_requests_token_repair_reviewed")
-			.on(table.createdAt, table.id)
-			.where(
-				sql.raw(
-					'"token_accounting_version" IS NULL AND ("cached_input_tokens" > 0 OR "cache_creation_input_tokens" > 0 OR "cache_creation_5m_tokens" > 0 OR "cache_creation_1h_tokens" > 0)',
-				),
-			),
+		index("idx_api_requests_recording").on(table.recordingRequestId),
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
-	],
-);
-
-export const usageTokenRepairJobs = pgTable(
-	"usage_token_repair_jobs",
-	{
-		id: text("id").primaryKey().notNull(),
-		status: text("status").notNull(),
-		createdBy: text("created_by").notNull(),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-		ownerId: text("owner_id"),
-		leaseUntil: text("lease_until"),
-		scanned: integer("scanned").notNull().default(0),
-		repaired: integer("repaired").notNull().default(0),
-		conflicts: integer("conflicts").notNull().default(0),
-		upperCreatedAt: text("upper_created_at"),
-		upperId: text("upper_id"),
-		cursorCreatedAt: text("cursor_created_at"),
-		cursorId: text("cursor_id"),
-		includeReviewed: boolean("include_reviewed").notNull(),
-		protocolOverridesJson: text("protocol_overrides_json").notNull().default("[]"),
-		sourceJobId: text("source_job_id"),
-		error: text("error"),
-	},
-	(table) => [
-		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
-		uniqueIndex("idx_token_repair_single_active")
-			.on(sql.raw("(1)"))
-			.where(sql.raw("\"status\" IN ('analyzing', 'ready', 'applying')")),
-		check(
-			"token_repair_protocol_config_bound",
-			sql.raw('length("protocol_overrides_json") <= 16384'),
-		),
-		check("token_repair_error_bound", sql.raw('"error" IS NULL OR length("error") <= 2048')),
-	],
-);
-
-export const usageTokenRepairCandidates = pgTable(
-	"usage_token_repair_candidates",
-	{
-		id: text("id").primaryKey().notNull(),
-		jobId: text("job_id").notNull(),
-		requestId: text("request_id").notNull(),
-		createdAt: text("created_at").notNull(),
-		provider: text("provider"),
-		model: text("model"),
-		snapshotJson: text("snapshot_json").notNull(),
-		evidenceJson: text("evidence_json").notNull(),
-		appliedAt: text("applied_at"),
-		appliedBy: text("applied_by"),
-		totalsStatus: text("totals_status").notNull().default("unchanged"),
-	},
-	(table) => [
-		uniqueIndex("idx_token_repair_candidate_request").on(table.jobId, table.requestId),
-		index("idx_token_repair_candidates_page").on(table.jobId, table.id),
-		check("token_repair_snapshot_bound", sql.raw('length("snapshot_json") <= 8192')),
-		check("token_repair_evidence_bound", sql.raw('length("evidence_json") <= 16384')),
 	],
 );
 
@@ -3924,8 +3871,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 123,
-  "columnCount": 1739,
+  "tableCount": 122,
+  "columnCount": 1713,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8526,12 +8473,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
-      "exportName": "narratorContextCharPages",
-      "name": "narrator_context_char_pages",
+      "exportName": "narratorContextPins",
+      "name": "narrator_context_pins",
       "columns": [
         {
-          "property": "id",
-          "name": "id",
+          "property": "generation",
+          "name": "generation",
           "kind": "text",
           "pgType": "text",
           "notNull": true,
@@ -8550,27 +8497,9 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "table": "narrators",
             "column": "id",
             "onDelete": "cascade",
-            "constraintName": "narrator_context_char_pages_narrator_id_narrators_id_fk"
+            "constraintName": "narrator_context_pins_narrator_id_narrators_id_fk"
           },
           "emitAsTableConstraint": false
-        },
-        {
-          "property": "generation",
-          "name": "generation",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "page",
-          "name": "page",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false
         },
         {
           "property": "segmentsJson",
@@ -8585,15 +8514,69 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "indexes": [
         {
-          "name": "context_char_pages_generation_page_idx",
+          "name": "idx_context_pins_narrator",
           "columns": [
-            "narratorId",
-            "generation",
-            "page"
+            "narratorId"
           ],
-          "unique": true
+          "unique": false
         }
       ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorMessageContextStats",
+      "name": "narrator_message_context_stats",
+      "columns": [
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_message_context_stats_message_id_narrato_8cbeb8b7e2_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "role",
+          "name": "role",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "parentToolUseId",
+          "name": "parent_tool_use_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "segmentsJson",
+          "name": "segments_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -8680,6 +8663,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "contentText",
           "name": "content_text",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "composerDocument",
+          "name": "composer_document",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,
@@ -9814,7 +9807,12 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_toolcalls_context_id",
           "columns": [
             "messageId",
-            "id"
+            "id",
+            "toolUseId",
+            "createdAt",
+            "executionAttempt",
+            "inputChars",
+            "outputChars"
           ],
           "unique": false
         },
@@ -13323,6 +13321,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "composerDocument",
+          "name": "composer_document",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "sourceId",
           "name": "source_id",
           "kind": "text",
@@ -15777,24 +15785,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "property": "tokenAccountingVersion",
-          "name": "token_accounting_version",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "tokenAccountingReviewVersion",
-          "name": "token_accounting_review_version",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
           "property": "inputTokens",
           "name": "input_tokens",
           "kind": "integer",
@@ -15964,8 +15954,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "property": "rawDumpJson",
-          "name": "raw_dump_json",
+          "property": "diagnosticsJson",
+          "name": "diagnostics_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "recordingRequestId",
+          "name": "recording_request_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -16032,22 +16031,11 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
-          "name": "idx_api_requests_token_repair_pending",
+          "name": "idx_api_requests_recording",
           "columns": [
-            "createdAt",
-            "id"
+            "recordingRequestId"
           ],
-          "unique": false,
-          "predicate": "\"token_accounting_version\" IS NULL AND \"token_accounting_review_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)"
-        },
-        {
-          "name": "idx_api_requests_token_repair_reviewed",
-          "columns": [
-            "createdAt",
-            "id"
-          ],
-          "unique": false,
-          "predicate": "\"token_accounting_version\" IS NULL AND (\"cached_input_tokens\" > 0 OR \"cache_creation_input_tokens\" > 0 OR \"cache_creation_5m_tokens\" > 0 OR \"cache_creation_1h_tokens\" > 0)"
+          "unique": false
         },
         {
           "name": "idx_api_requests_credential",
@@ -16060,359 +16048,6 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "checks": [],
       "checkDefinitions": [],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
-      "exportName": "usageTokenRepairJobs",
-      "name": "usage_token_repair_jobs",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "status",
-          "name": "status",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdBy",
-          "name": "created_by",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "updatedAt",
-          "name": "updated_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "ownerId",
-          "name": "owner_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "leaseUntil",
-          "name": "lease_until",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "scanned",
-          "name": "scanned",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "repaired",
-          "name": "repaired",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "conflicts",
-          "name": "conflicts",
-          "kind": "integer",
-          "pgType": "integer",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "0",
-          "defaultExpression": "0"
-        },
-        {
-          "property": "upperCreatedAt",
-          "name": "upper_created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "upperId",
-          "name": "upper_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "cursorCreatedAt",
-          "name": "cursor_created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "cursorId",
-          "name": "cursor_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "includeReviewed",
-          "name": "include_reviewed",
-          "kind": "integer",
-          "mode": "boolean",
-          "pgType": "boolean",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "protocolOverridesJson",
-          "name": "protocol_overrides_json",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"[]\"",
-          "defaultExpression": "\"[]\""
-        },
-        {
-          "property": "sourceJobId",
-          "name": "source_job_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "error",
-          "name": "error",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_token_repair_jobs_created",
-          "columns": [
-            "createdAt",
-            "id"
-          ],
-          "unique": false
-        },
-        {
-          "name": "idx_token_repair_single_active",
-          "columns": [],
-          "unique": true,
-          "expression": "1",
-          "predicate": "\"status\" IN ('analyzing', 'ready', 'applying')"
-        }
-      ],
-      "checks": [
-        "token_repair_protocol_config_bound",
-        "token_repair_error_bound"
-      ],
-      "checkDefinitions": [
-        {
-          "name": "token_repair_protocol_config_bound",
-          "expression": "length(\"protocol_overrides_json\") <= 16384"
-        },
-        {
-          "name": "token_repair_error_bound",
-          "expression": "\"error\" IS NULL OR length(\"error\") <= 2048"
-        }
-      ],
-      "foreignKeys": [],
-      "uniqueConstraints": [],
-      "primaryKeys": []
-    },
-    {
-      "exportName": "usageTokenRepairCandidates",
-      "name": "usage_token_repair_candidates",
-      "columns": [
-        {
-          "property": "id",
-          "name": "id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": true,
-          "unique": false
-        },
-        {
-          "property": "jobId",
-          "name": "job_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "requestId",
-          "name": "request_id",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "createdAt",
-          "name": "created_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "provider",
-          "name": "provider",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "model",
-          "name": "model",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "snapshotJson",
-          "name": "snapshot_json",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "evidenceJson",
-          "name": "evidence_json",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "appliedAt",
-          "name": "applied_at",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "appliedBy",
-          "name": "applied_by",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "property": "totalsStatus",
-          "name": "totals_status",
-          "kind": "text",
-          "pgType": "text",
-          "notNull": true,
-          "primary": false,
-          "unique": false,
-          "defaultValue": "\"unchanged\"",
-          "defaultExpression": "\"unchanged\""
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_token_repair_candidate_request",
-          "columns": [
-            "jobId",
-            "requestId"
-          ],
-          "unique": true
-        },
-        {
-          "name": "idx_token_repair_candidates_page",
-          "columns": [
-            "jobId",
-            "id"
-          ],
-          "unique": false
-        }
-      ],
-      "checks": [
-        "token_repair_snapshot_bound",
-        "token_repair_evidence_bound"
-      ],
-      "checkDefinitions": [
-        {
-          "name": "token_repair_snapshot_bound",
-          "expression": "length(\"snapshot_json\") <= 8192"
-        },
-        {
-          "name": "token_repair_evidence_bound",
-          "expression": "length(\"evidence_json\") <= 16384"
-        }
-      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

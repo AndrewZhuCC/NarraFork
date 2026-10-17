@@ -30,6 +30,7 @@ interface WorkerInput {
 	commit: string;
 	repository: string;
 	helperDistribution: HelperDistributionDependencies;
+	recoveryManifestVersions?: readonly number[];
 	releaseCi?: boolean;
 }
 
@@ -41,6 +42,7 @@ const {
 	commit,
 	repository,
 	helperDistribution,
+	recoveryManifestVersions,
 	releaseCi = false,
 } = workerData as WorkerInput;
 
@@ -176,6 +178,7 @@ const metadataInput = {
 	commit,
 	repository,
 	helperDistribution: parseHelperDistributionDependencies(helperDistribution),
+	recoveryManifestVersions,
 	buildDate,
 };
 const strictMetadata = releaseCi

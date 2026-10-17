@@ -5,6 +5,7 @@ import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
 	DEFAULT_RECORDING_RESPONSE_BYTES,
 	type RecordingSettings,
+	type RequestEvidenceAutoPin,
 } from "@shared/request-recording";
 import type {
 	SubagentAllowedModels,
@@ -68,11 +69,10 @@ export interface InstanceSettingsState {
 	legacyEncoding: boolean;
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
-	requestDumpRecordingEnabled: boolean;
-	requestDumpRequestBytes: number;
-	requestDumpResponseBytes: number;
-	requestDumpEnabled: boolean;
-	requestDumpErrorsOnly: boolean;
+	ringEnabled: boolean;
+	ringRequestBytes: number;
+	ringResponseBytes: number;
+	autoPin: RequestEvidenceAutoPin;
 	cacheDropDumpEnabled: boolean;
 	defaultNarratorVisibility: DefaultNarratorVisibility;
 	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
@@ -161,14 +161,13 @@ function normalizeSharedRules<
 
 /** Older servers/configurations omit these fields; zero and false are explicit settings. */
 export function readRequestRecordingSettings(
-	agent?: Partial<RecordingSettings>,
+	evidence?: Partial<RecordingSettings>,
 ): RecordingSettings {
 	return {
-		requestDumpRecordingEnabled: agent?.requestDumpRecordingEnabled ?? true,
-		requestDumpRequestBytes: agent?.requestDumpRequestBytes ?? DEFAULT_RECORDING_REQUEST_BYTES,
-		requestDumpResponseBytes: agent?.requestDumpResponseBytes ?? DEFAULT_RECORDING_RESPONSE_BYTES,
-		requestDumpEnabled: agent?.requestDumpEnabled ?? false,
-		requestDumpErrorsOnly: agent?.requestDumpErrorsOnly ?? false,
+		ringEnabled: evidence?.ringEnabled ?? true,
+		ringRequestBytes: evidence?.ringRequestBytes ?? DEFAULT_RECORDING_REQUEST_BYTES,
+		ringResponseBytes: evidence?.ringResponseBytes ?? DEFAULT_RECORDING_RESPONSE_BYTES,
+		autoPin: evidence?.autoPin ?? "off",
 	};
 }
 
@@ -331,7 +330,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
-				...readRequestRecordingSettings(settings.agent),
+				...readRequestRecordingSettings(settings.requestEvidence),
 				cacheDropDumpEnabled: settings.agent?.cacheDropDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
@@ -462,11 +461,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					legacyEncoding: state.legacyEncoding,
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,
-					requestDumpRecordingEnabled: state.requestDumpRecordingEnabled,
-					requestDumpRequestBytes: state.requestDumpRequestBytes,
-					requestDumpResponseBytes: state.requestDumpResponseBytes,
-					requestDumpEnabled: state.requestDumpEnabled,
-					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
 					cacheDropDumpEnabled: state.cacheDropDumpEnabled,
 					defaultNarratorVisibility: state.defaultNarratorVisibility,
 					defaultNarratorWriteAudience: state.defaultNarratorWriteAudience,
@@ -515,6 +509,12 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					blacklistDirs: state.globalBlacklistDirs,
 					commandWhitelist: state.globalCommandWhitelist,
 					commandBlacklist: state.globalCommandBlacklist,
+				},
+				requestEvidence: {
+					ringEnabled: state.ringEnabled,
+					ringRequestBytes: state.ringRequestBytes,
+					ringResponseBytes: state.ringResponseBytes,
+					autoPin: state.autoPin,
 				},
 				chapters: {
 					maxActiveWorktrees: state.maxWorktrees,

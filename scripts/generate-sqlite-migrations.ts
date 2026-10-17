@@ -8,6 +8,12 @@ import {
 	type ResourceMigrationSnapshot,
 } from "./finalize-sqlite-resource-migration";
 import {
+	CONTEXT_STATS_MIGRATION_CONTRACT,
+	CONTEXT_STATS_MIGRATION_SQL,
+	generatedContextStatsMigrationSuffix,
+	splitGeneratedContextStatsMigration,
+} from "./lib/generated-context-stats-migration";
+import {
 	appendGeneratedModelHistoryTriggers,
 	generatedModelHistoryTriggerSuffix,
 	MODEL_HISTORY_REVISION_CONTRACT,
@@ -36,6 +42,7 @@ interface Pending {
 	args: string[];
 	schemaDigest: string;
 	modelHistoryTriggers: { contract: string; sqlDigest: string };
+	contextStatsMigration: { contract: string; sqlDigest: string };
 	baseline: Journal;
 	baselineSnapshotDigest: string;
 	baselineSqlDigest: string;
@@ -133,6 +140,10 @@ async function generateLocked(
 		contract: MODEL_HISTORY_REVISION_CONTRACT,
 		sqlDigest: digest(renderModelHistoryRevisionSql("sqlite")),
 	};
+	const contextStatsMigration = {
+		contract: CONTEXT_STATS_MIGRATION_CONTRACT,
+		sqlDigest: digest(CONTEXT_STATS_MIGRATION_SQL),
+	};
 	let pending: Pending;
 	if (existsSync(pendingPath)) {
 		pending = JSON.parse(readBounded(pendingPath, 2 * 1024 * 1024)) as Pending;
@@ -144,6 +155,8 @@ async function generateLocked(
 			pending.schemaDigest !== schemaDigest ||
 			pending.modelHistoryTriggers?.contract !== modelHistoryTriggers.contract ||
 			pending.modelHistoryTriggers?.sqlDigest !== modelHistoryTriggers.sqlDigest ||
+			pending.contextStatsMigration?.contract !== contextStatsMigration.contract ||
+			pending.contextStatsMigration?.sqlDigest !== contextStatsMigration.sqlDigest ||
 			JSON.stringify(pending.args) !== JSON.stringify(args)
 		)
 			throw new Error("Pending generation source/arguments changed; refusing history rewrite");
@@ -166,6 +179,7 @@ async function generateLocked(
 			args: [...args],
 			schemaDigest,
 			modelHistoryTriggers,
+			contextStatsMigration,
 			baseline,
 			baselineSqlDigests,
 			baselineSnapshotDigest: digest(readBounded(snapshotPath(latest.idx), 8 * 1024 * 1024)),
@@ -255,7 +269,16 @@ async function generateLocked(
 		const original = readBounded(sqlPath(baselineLast.tag), 1024 * 1024);
 		// Old receipts may predate stronger DDL validation; digests prove identity, not
 		// constraints. Always validate history read-only, even if a receipt is present.
-		assertResourceMigrationValidated(original, snapshot(previous.idx), snapshot(baselineLast.idx));
+		const before = snapshot(previous.idx);
+		const after = snapshot(baselineLast.idx);
+		assertResourceMigrationValidated(
+			splitGeneratedContextStatsMigration(
+				original,
+				generatedContextStatsMigrationSuffix(before, after),
+			),
+			before,
+			after,
+		);
 		unlinkSync(pendingPath);
 		console.log(JSON.stringify({ tag: baselineLast.tag, generated: false, validated: true }));
 		return;
@@ -280,11 +303,20 @@ async function generateLocked(
 	const before = snapshot(baselineLast.idx);
 	const after = snapshot(latest.idx);
 	const triggerSuffix = generatedModelHistoryTriggerSuffix(before, after, "sqlite");
-	const finalized = (options.finalize ?? finalizeResourceMigration)(
-		appendGeneratedModelHistoryTriggers(original, triggerSuffix),
+	const contextSuffix = generatedContextStatsMigrationSuffix(before, after);
+	const schemaSql = original.endsWith(contextSuffix)
+		? splitGeneratedContextStatsMigration(original, contextSuffix)
+		: original;
+	const finalizedSchema = (options.finalize ?? finalizeResourceMigration)(
+		appendGeneratedModelHistoryTriggers(schemaSql, triggerSuffix),
 		before,
 		after,
 	);
+	const finalized = contextSuffix
+		? `${finalizedSchema.trimEnd()}${contextSuffix}`
+		: finalizedSchema;
+	if (Buffer.byteLength(finalized) > 1024 * 1024)
+		throw new Error("Finalized migration exceeds byte budget");
 	const finalDigest = digest(finalized);
 	if (pending.phase === "validated" && pending.finalDigest !== finalDigest)
 		throw new Error("Pending finalizer result changed");
@@ -314,6 +346,7 @@ async function generateLocked(
 		JSON.stringify({
 			tag: latest.tag,
 			modelHistoryTriggers,
+			contextStatsMigration,
 			sqlDigest: finalDigest,
 			snapshotDigest: expected.snapshotDigest,
 			journalDigest: expected.journalDigest,

@@ -310,6 +310,8 @@ export interface ExecutionBackend {
 	readonly supportsGitWorkspaceWatch?: boolean;
 	/** Status-only bounded scan. Legacy executors may still compute costly numstat. */
 	readonly supportsGitWorkspaceStatus?: boolean;
+	/** Independent bounded line-statistics read; never use status as a fallback. */
+	readonly supportsGitLineStats?: boolean;
 	/** Executor advertises the read-only commit preview operations. */
 	readonly supportsGitCommitPreview?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;

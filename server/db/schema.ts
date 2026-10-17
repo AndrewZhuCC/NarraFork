@@ -1521,21 +1521,33 @@ export const modelHistoryRevisionContracts = sqliteTable("model_history_revision
 });
 
 // === narrator_messages ===
-export const narratorContextCharPages = sqliteTable(
-	"narrator_context_char_pages",
+/**
+ * One frozen segment list for the request currently shown in the composition menu.
+ * The usage snapshot keeps the small totals; this row keeps the ordered numbers.
+ */
+export const narratorContextPins = sqliteTable(
+	"narrator_context_pins",
 	{
-		id: text("id").primaryKey(),
+		generation: text("generation").primaryKey(),
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
-		generation: text("generation").notNull(),
-		page: integer("page").notNull(),
 		segmentsJson: text("segments_json", { mode: "json" }).$type<ContextSegment[]>().notNull(),
 	},
-	(t) => [
-		uniqueIndex("context_char_pages_generation_page_idx").on(t.narratorId, t.generation, t.page),
-	],
+	(t) => [index("idx_context_pins_narrator").on(t.narratorId)],
 );
+/**
+ * Numeric projection of a message. Composition reads this instead of the message
+ * body. Triggers keep it aligned with role, parent and context_chars_json.
+ */
+export const narratorMessageContextStats = sqliteTable("narrator_message_context_stats", {
+	messageId: text("message_id")
+		.primaryKey()
+		.references(() => narratorMessages.id, { onDelete: "cascade" }),
+	role: text("role").notNull(),
+	parentToolUseId: text("parent_tool_use_id"),
+	segmentsJson: text("segments_json", { mode: "json" }).$type<ContextCharStats>().notNull(),
+});
 
 export const narratorMessages = sqliteTable(
 	"narrator_messages",
@@ -1551,6 +1563,9 @@ export const narratorMessages = sqliteTable(
 		/** Incremented transactionally when model-visible body/identity changes. */
 		bodyRevision: integer("body_revision").notNull().default(0),
 		contentText: text("content_text"),
+		composerDocument: text("composer_document", { mode: "json" }).$type<
+			import("@shared/composer-document").ComposerDocument
+		>(),
 		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
@@ -1828,8 +1843,17 @@ export const narratorToolCalls = sqliteTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
-		// Numeric context keyset paging must not sort the entire message on every batch.
-		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		// Numeric context keyset paging must not sort the entire message on every batch,
+		// and must not open input_json/output_json just to read the character columns.
+		index("idx_toolcalls_context_id").on(
+			table.messageId,
+			table.id,
+			table.toolUseId,
+			table.createdAt,
+			table.executionAttempt,
+			table.inputChars,
+			table.outputChars,
+		),
 		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
 		// Latest attempts are scoped to the canonical message, not its current fork holder.
 		index("idx_toolcalls_context_latest").on(
@@ -2852,6 +2876,9 @@ export const narratorDrafts = sqliteTable(
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
 		fileReferencesJson: text("file_references_json"), // bounded FileReference[]; no file contents
+		composerDocument: text("composer_document", { mode: "json" }).$type<
+			import("@shared/composer-document").ComposerDocument
+		>(),
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
@@ -3547,9 +3574,6 @@ export const apiRequests = sqliteTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
-		// Nullable so historical rows are never silently treated as normalized.
-		tokenAccountingVersion: integer("token_accounting_version"),
-		tokenAccountingReviewVersion: integer("token_accounting_review_version"),
 		// Token 使用统计
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
@@ -3577,8 +3601,10 @@ export const apiRequests = sqliteTable(
 		meterUnit: text("meter_unit"),
 		// 错误信息（请求失败时记录）
 		errorMessage: text("error_message"),
-		// 原始请求/响应 dump（调试用）
-		rawDumpJson: text("raw_dump_json"),
+		// 有界请求诊断（不是完整 dump；完整证据在请求录制里）
+		diagnosticsJson: text("diagnostics_json"),
+		// 本次请求在录制系统中的 attempt id，用于定位循环/固定录制
+		recordingRequestId: text("recording_request_id"),
 		// 时间戳
 		createdAt: text("created_at").notNull(),
 	},
@@ -3589,82 +3615,10 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
-		index("idx_api_requests_token_repair_pending")
-			.on(table.createdAt, table.id)
-			.where(
-				sql`${table.tokenAccountingVersion} IS NULL AND ${table.tokenAccountingReviewVersion} IS NULL AND (${table.cachedInputTokens} > 0 OR ${table.cacheCreationInputTokens} > 0 OR ${table.cacheCreation5mTokens} > 0 OR ${table.cacheCreation1hTokens} > 0)`,
-			),
-		index("idx_api_requests_token_repair_reviewed")
-			.on(table.createdAt, table.id)
-			.where(
-				sql`${table.tokenAccountingVersion} IS NULL AND (${table.cachedInputTokens} > 0 OR ${table.cacheCreationInputTokens} > 0 OR ${table.cacheCreation5mTokens} > 0 OR ${table.cacheCreation1hTokens} > 0)`,
-			),
+		// Usage history rows find their request evidence through this attempt id.
+		index("idx_api_requests_recording").on(table.recordingRequestId),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
-	],
-);
-
-// Deployment-wide maintenance audit. No FK to requests/users: audit survives cleanup.
-export const usageTokenRepairJobs = sqliteTable(
-	"usage_token_repair_jobs",
-	{
-		id: text("id").primaryKey(),
-		status: text("status").notNull(),
-		createdBy: text("created_by").notNull(),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-		ownerId: text("owner_id"),
-		leaseUntil: text("lease_until"),
-		scanned: integer("scanned").notNull().default(0),
-		repaired: integer("repaired").notNull().default(0),
-		conflicts: integer("conflicts").notNull().default(0),
-		upperCreatedAt: text("upper_created_at"),
-		upperId: text("upper_id"),
-		cursorCreatedAt: text("cursor_created_at"),
-		cursorId: text("cursor_id"),
-		includeReviewed: integer("include_reviewed", { mode: "boolean" }).notNull(),
-		protocolOverridesJson: text("protocol_overrides_json").notNull().default("[]"),
-		/** Immutable candidate scope for a manual reanalysis; audit survives cleanup. */
-		sourceJobId: text("source_job_id"),
-		error: text("error"),
-	},
-	(table) => [
-		index("idx_token_repair_jobs_created").on(table.createdAt, table.id),
-		uniqueIndex("idx_token_repair_single_active")
-			.on(sql`(1)`)
-			.where(sql`${table.status} IN ('analyzing', 'ready', 'applying')`),
-		check(
-			"token_repair_protocol_config_bound",
-			sql`length(${table.protocolOverridesJson}) <= 16384`,
-		),
-		check(
-			"token_repair_error_bound",
-			sql`${table.error} IS NULL OR length(${table.error}) <= 2048`,
-		),
-	],
-);
-
-export const usageTokenRepairCandidates = sqliteTable(
-	"usage_token_repair_candidates",
-	{
-		id: text("id").primaryKey(),
-		jobId: text("job_id").notNull(),
-		requestId: text("request_id").notNull(),
-		createdAt: text("created_at").notNull(),
-		provider: text("provider"),
-		model: text("model"),
-		// Only five counters and indexed ownership metadata; never prompts/dumps.
-		snapshotJson: text("snapshot_json").notNull(),
-		evidenceJson: text("evidence_json").notNull(),
-		appliedAt: text("applied_at"),
-		appliedBy: text("applied_by"),
-		totalsStatus: text("totals_status").notNull().default("unchanged"),
-	},
-	(table) => [
-		uniqueIndex("idx_token_repair_candidate_request").on(table.jobId, table.requestId),
-		index("idx_token_repair_candidates_page").on(table.jobId, table.id),
-		check("token_repair_snapshot_bound", sql`length(${table.snapshotJson}) <= 8192`),
-		check("token_repair_evidence_bound", sql`length(${table.evidenceJson}) <= 16384`),
 	],
 );
 

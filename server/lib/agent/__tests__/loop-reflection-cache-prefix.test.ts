@@ -12,8 +12,7 @@
 
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
-import { shouldPersistRawDump } from "../../api-request-tracker";
-import { CacheDropDumpStore } from "../../cache-drop-dump-store";
+import { CacheDropDetector } from "../../cache-drop-dump-store";
 import { settings } from "../../settings";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
@@ -180,14 +179,14 @@ describe("reflection loop cacheable prefix", () => {
 	test.each([
 		false,
 		true,
-	])("cache-drop capture is independent of full dumping (enabled=%s)", async (enabled) => {
+	])("cache-drop detection does not enable recording (enabled=%s)", async (enabled) => {
 		const previous = {
 			enabled: settings.agent.cacheDropDumpEnabled,
-			full: settings.agent.requestDumpEnabled,
+			evidence: settings.requestEvidence,
 		};
 		settings.agent.cacheDropDumpEnabled = enabled;
-		settings.agent.requestDumpEnabled = false;
-		const records = spyOn(CacheDropDumpStore.prototype, "record").mockResolvedValue(undefined);
+		settings.requestEvidence = { ...settings.requestEvidence, ringEnabled: false, autoPin: "off" };
+		const records = spyOn(CacheDropDetector.prototype, "record").mockReturnValue([]);
 		const collectors: boolean[] = [];
 		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
 			collectors.push(!!params.requestDump);
@@ -195,7 +194,7 @@ describe("reflection loop cacheable prefix", () => {
 				transport: "http",
 				body: { history: params.history, content: params.content },
 			});
-			params.requestDump?.setResponseBodyText("actual response");
+			params.requestDump?.appendResponseText("actual response");
 			params.onRequestStart?.();
 			if (params.content === "normal diagnostic") {
 				yield {
@@ -234,7 +233,7 @@ describe("reflection loop cacheable prefix", () => {
 				},
 				label: "diagnostic",
 			});
-			expect(collectors).toEqual([enabled, enabled]);
+			expect(collectors).toEqual([false, false]);
 			expect(records).toHaveBeenCalledTimes(enabled ? 2 : 0);
 			if (enabled) {
 				const normal = records.mock.calls[0][0];
@@ -245,13 +244,13 @@ describe("reflection loop cacheable prefix", () => {
 				expect(reflection.cachedInputTokens).toBe(9000);
 				expect(reflection.narratorId).toBe(normal.narratorId);
 				expect(reflection.conversationId).toBe(normal.conversationId);
-				expect(shouldPersistRawDump({ rawDump: normal.dump })).toBe(false);
+				expect(normal).not.toHaveProperty("dump");
 			}
 		} finally {
 			chat.mockRestore();
 			records.mockRestore();
 			settings.agent.cacheDropDumpEnabled = previous.enabled;
-			settings.agent.requestDumpEnabled = previous.full;
+			settings.requestEvidence = previous.evidence;
 		}
 	});
 	test("marks predeclared reflection definitions for the normal Codex execution ceiling", async () => {

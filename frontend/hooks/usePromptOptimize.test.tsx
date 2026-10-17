@@ -26,6 +26,7 @@ function Probe() {
 		textareaRef: {
 			current: {
 				value: "original",
+				ownerDocument: document,
 				focus() {},
 				setSelectionRange() {},
 			} as unknown as HTMLTextAreaElement,
