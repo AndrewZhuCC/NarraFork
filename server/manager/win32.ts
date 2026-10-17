@@ -828,12 +828,19 @@ export function focusWindow(hwnd: Pointer): void {
 	native.user32.SetFocus(hwnd);
 }
 
+/** 按标题找顶层窗口；找不到返回 null。隐藏窗口也能找到，本函数不改变它的可见性。 */
+export function findWindowByTitle(title: string): Pointer | null {
+	const native = loadNative();
+	if (!native) return null;
+	const hwnd = native.user32.FindWindowW(0 as unknown as Pointer, wstrTemp(title));
+	return hwnd ? hwnd : null;
+}
+
 /** 按标题找顶层窗口并前置它；找不到返回 false。 */
 export function focusWindowByTitle(title: string): boolean {
 	const native = loadNative();
-	if (!native) return false;
-	const hwnd = native.user32.FindWindowW(0 as unknown as Pointer, wstrTemp(title));
-	if (!hwnd) return false;
+	const hwnd = findWindowByTitle(title);
+	if (!native || !hwnd) return false;
 	// 只唤出最小化的窗口（恢复其最小化前的状态）；非最小化的一律只前置，不碰尺寸。
 	if (native.user32.IsIconic(hwnd)) native.user32.ShowWindow(hwnd, SW_RESTORE);
 	native.user32.SetForegroundWindow(hwnd);

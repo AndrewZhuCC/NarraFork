@@ -87,6 +87,7 @@ import {
 	ES_MULTILINE,
 	ES_READONLY,
 	fillRect,
+	findWindowByTitle,
 	focusWindow,
 	focusWindowByTitle,
 	getControlId,
@@ -103,6 +104,7 @@ import {
 	type Pointer,
 	paintBegin,
 	paintEnd,
+	postMessage,
 	readDrawItem,
 	readScrollPixelPos,
 	readWstr,
@@ -141,6 +143,8 @@ import {
 // ── 托盘与消息 ──────────────────────────────────────────────────────────────
 /** 托盘回调用自定义消息，避开系统消息区间。 */
 const WM_TRAY = WM_APP + 10;
+/** 第二个启动请求：已在托盘运行时，按用户设置打开前端，不把管理器窗口带到前面。 */
+const WM_OPEN_FRONTEND = WM_APP + 6;
 /** 窗口标题：单实例聚焦时按它查找已有窗口，必须与创建时一致。 */
 const WINDOW_TITLE = "NarraFork Manager";
 const TRAY_ID_OPEN = 9101;
@@ -271,7 +275,7 @@ let trayAdded = false;
 let closeDialogShown = false;
 /** 外部启动的服务（终端里手动跑的那份）是否在响应；面板对它只读。 */
 let externalRunning = false;
-/** 用户已在外部运行状态下点了"启动项目"：等外部服务退出后自动启动托管实例。 */
+/** 用户已在外部运行状态下点了「启动 NarraFork 服务器」：等外部服务退出后自动启动托管实例。 */
 let awaitingHandover = false;
 let windowSizeSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -441,7 +445,7 @@ function formatBackendLine(line: string): string {
 function applyStatus(status: BackendState, detail?: string): void {
 	const reconnecting = supervision === "reconnecting";
 	const adopted = supervision === "adopted";
-	// 外部启动的服务（终端里跑的那份）：面板只显示状态；点"启动项目"进入接管等待。
+	// 外部启动的服务（终端里跑的那份）：面板只显示状态；点「启动 NarraFork 服务器」进入接管等待。
 	const external = !reconnecting && !adopted && status === "stopped" && externalRunning;
 	const shown: BackendState = reconnecting ? "starting" : adopted || external ? "running" : status;
 	const style = STATUS_STYLE[shown];
@@ -465,7 +469,7 @@ function applyStatus(status: BackendState, detail?: string): void {
 				? !awaitingHandover
 				: status === "stopped" || status === "error";
 	setEnabled(controls.start, startEnabled);
-	// 异常退出时也允许重启（等价于重新启动）：否则用户只能点「启动项目」，语义不符。
+	// 异常退出时也允许重启（等价于重新启动）：否则用户只能点「启动 NarraFork 服务器」，语义不符。
 	setEnabled(
 		controls.restart,
 		adopted || (!external && !reconnecting && (status === "running" || status === "error")),
@@ -778,6 +782,10 @@ function handleMessage(
 			invalidate(hwnd);
 			return 0;
 		}
+		case WM_OPEN_FRONTEND: {
+			requestOpenFrontend();
+			return 0;
+		}
 		default:
 			return undefined;
 	}
@@ -987,20 +995,36 @@ function refreshControlTexts(): void {
 
 /** 服务就绪后是否已经按设置打开过前端；服务停下时复位。 */
 let frontendOpened = false;
+/** 再次启动时服务还没就绪，等进入运行后再按用户的明确要求打开前端。 */
+let openWhenReady = false;
 /** 同一次启动失败只打开一次管理器，避免 error 之后的退出码再弹一次。 */
 let startupFailureShown = false;
+
+/** 托盘双击，或再次启动已在运行的管理器：按用户设置打开前端，不显示管理器窗口。 */
+function requestOpenFrontend(): void {
+	const running = backend?.current === "running" || externalRunning || supervision === "adopted";
+	if (!running) {
+		openWhenReady = true;
+		return;
+	}
+	openWhenReady = false;
+	frontendOpened = true;
+	openPanel(false, true);
+}
 
 /**
  * 服务就绪后打开前端。
  *
- * 与「打开面板」按钮走同一条路径：先聚焦已存在的窗口，没有才新建 —— 所以反复启动项目
- * 不会堆出一排重复窗口。是否打开由 NarraFork 的"启动时打开前端"设置决定。
+ * 与「打开 NarraFork」按钮走同一条路径：先聚焦已存在的窗口，没有才新建。
+ * 启动时是否打开由 settings.json 的 openBrowser 决定；再次启动若带了明确要求，则仍会打开。
  */
 function openFrontendOnce(): void {
-	if (frontendOpened) return;
+	if (frontendOpened && !openWhenReady) return;
+	const explicit = openWhenReady;
+	openWhenReady = false;
 	frontendOpened = true;
-	if (readNarraForkSettings().openBrowser === "off") return;
-	openPanel();
+	if (!explicit && readNarraForkSettings().openBrowser === "off") return;
+	openPanel(false, explicit);
 }
 
 /**
@@ -1047,12 +1071,11 @@ export async function runManager(): Promise<void> {
 		process.exit(1);
 	}
 
-	// 单实例：已有管理器在运行时（双击 exe、任务栏图标等再次启动），聚焦它的窗口而不是
-	// 再开一个；找不到窗口则静默退出，避免留下第二个实例。
+	// 单实例：再次双击 exe 时通知已有托盘进程打开前端，不把隐藏的管理器窗口显示出来。
 	if (!acquireSingleInstanceMutex("Local\\NarraFork.Manager")) {
-		if (!focusWindowByTitle(WINDOW_TITLE)) {
-			console.error(t("error.alreadyRunning"));
-		}
+		const existing = findWindowByTitle(WINDOW_TITLE);
+		if (existing) postMessage(existing, WM_OPEN_FRONTEND);
+		else console.error(t("error.alreadyRunning"));
 		return;
 	}
 
@@ -1089,6 +1112,7 @@ export async function runManager(): Promise<void> {
 			} else if (state === "error" || (state === "stopped" && detail)) {
 				if (supervision !== "reconnecting" && supervision !== "adopted") {
 					frontendOpened = false;
+					openWhenReady = false;
 					if (!startupFailureShown) {
 						startupFailureShown = true;
 						appendLog("ERROR", t("log.startupFailed"));
@@ -1351,7 +1375,7 @@ export async function runManager(): Promise<void> {
 	// 日志被裁断后、用户滚到顶部时才显示：打开完整日志文件。
 	controls.openLogFile = add(
 		"BUTTON",
-		"查看完整日志",
+		t("button.openLog"),
 		BS_OWNERDRAW,
 		ID.openLogFile,
 		CARD_X + 110,
@@ -1392,7 +1416,6 @@ export async function runManager(): Promise<void> {
 	invalidate(hwnd);
 	applyStatus("stopped");
 	appendLog("PREP", t("log.managerStarted", { color: settings.brandColor }));
-	appendLog("PREP", t("log.clickStart"));
 
 	// 前端改的也是同一份 settings，按 mtime 回显到输入框。
 	const stopWatching = watchSettings(() => {

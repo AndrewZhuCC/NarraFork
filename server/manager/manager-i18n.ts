@@ -57,10 +57,6 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "管理器已启动（主题色 {color}）。",
 		en: "Manager started (brand color {color}).",
 	},
-	"log.clickStart": {
-		"zh-CN": "正在启动 NarraFork 服务器...",
-		en: "Starting the NarraFork server...",
-	},
 	"log.startingService": {
 		"zh-CN": "正在启动 NarraFork 服务器...",
 		en: "Starting the NarraFork server...",
@@ -107,8 +103,8 @@ const MESSAGES: Record<string, Message> = {
 		en: "Waiting to take over: stop the external service in its terminal (Ctrl+C); the manager starts its own instance once it exits.",
 	},
 	"log.minimized": {
-		"zh-CN": "已最小化到任务栏，双击托盘图标可以重新打开。",
-		en: "Minimized to the tray; double-click the tray icon to reopen.",
+		"zh-CN": "已最小化到托盘。双击托盘图标按设置打开 NarraFork，右键可打开管理器窗口。",
+		en: "Minimized to the tray. Double-click opens NarraFork; right-click opens the manager.",
 	},
 	"log.relaunched": {
 		"zh-CN": "更新后的服务已重新就绪。",
@@ -213,20 +209,20 @@ const MESSAGES: Record<string, Message> = {
 		en: "Start without showing the window",
 	},
 	"settings.startMinimizedHint": {
-		"zh-CN": "启动后只留托盘图标，双击可唤出窗口",
-		en: "Starts to the tray only; double-click the tray icon to show the window",
+		"zh-CN": "启动后只留托盘图标。双击打开 NarraFork，右键打开管理器窗口",
+		en: "Starts to the tray only. Double-click opens NarraFork; right-click opens the manager",
 	},
 	"settings.autoStart": {
-		"zh-CN": "运行时自动启动项目",
-		en: "Start the project on launch",
+		"zh-CN": "运行时自动启动 NarraFork 服务器",
+		en: "Start the NarraFork server on launch",
 	},
 	"settings.autoStartHint": {
-		"zh-CN": "启动后自动拉起后端服务，已有服务在跑时跳过",
-		en: "Launches the backend on start; skipped if one is already running",
+		"zh-CN": "启动后自动拉起 NarraFork 服务器，已有服务在跑时跳过",
+		en: "Starts the NarraFork server on launch; skipped if one is already running",
 	},
 	"settings.autoStarting": {
-		"zh-CN": "按设置自动启动项目...",
-		en: "Starting the project automatically...",
+		"zh-CN": "正在启动 NarraFork 服务器...",
+		en: "Starting the NarraFork server...",
 	},
 	"settings.update": { "zh-CN": "更新", en: "Updates" },
 	"settings.checkUpdate": { "zh-CN": "检查更新", en: "Check for Updates" },
