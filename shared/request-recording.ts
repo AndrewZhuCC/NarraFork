@@ -33,8 +33,19 @@ export interface RecordingFrame {
 	metadata?: Record<string, unknown>;
 }
 
+/** Why a recording left the ring window and became a pinned save. */
+export type RecordingPinReason =
+	| "manual"
+	| "request"
+	| "continuous"
+	| "error"
+	| "malformed"
+	| "leak";
+
 export interface RequestRecording {
 	readonly requestId: string;
+	/** Pin this request when it ends (immediately if it already ended). */
+	pin(reason: RecordingPinReason): void;
 	request(request: RecordingRequest): void;
 	responseMeta(meta: Record<string, unknown>): void;
 	responseChunk(value: string | Uint8Array): void;
@@ -53,6 +64,8 @@ export interface SavedRecording {
 	partial: boolean;
 	truncated: boolean;
 	continuous?: boolean;
+	/** Absent on saves written before pin reasons existed. */
+	reason?: RecordingPinReason;
 }
 
 export interface RequestRecordingDetail {
@@ -80,10 +93,18 @@ export interface RequestRecordingDetail {
 	};
 }
 
+/** Which finished requests are pinned automatically, beyond explicit saves. */
+export type RequestEvidenceAutoPin = "off" | "errors" | "all";
+export const REQUEST_EVIDENCE_AUTO_PIN_VALUES = ["off", "errors", "all"] as const;
+
+/** `settings.requestEvidence`: the single configuration for request evidence. */
 export interface RecordingSettings {
-	requestDumpRecordingEnabled: boolean;
-	requestDumpRequestBytes: number;
-	requestDumpResponseBytes: number;
-	requestDumpEnabled: boolean;
-	requestDumpErrorsOnly: boolean;
+	/** Bounded instance-wide ring window of recent requests. */
+	ringEnabled: boolean;
+	/** Ring request-side capacity in bytes; 0 disables that side of the ring. */
+	ringRequestBytes: number;
+	/** Ring response-side capacity in bytes; 0 disables that side of the ring. */
+	ringResponseBytes: number;
+	/** `all` pins every request from its start; `errors` pins failed ones when they end. */
+	autoPin: RequestEvidenceAutoPin;
 }

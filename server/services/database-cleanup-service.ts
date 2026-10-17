@@ -1,11 +1,7 @@
-import { stat, unlink } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { databaseMaintenance, sqlite } from "@server/db";
 import { describeUnsupported, type ReusableSpaceReport } from "@server/db/backend";
 import { getDbPath } from "@server/db/connection";
-import {
-	isServableDumpFilePath,
-	REQUEST_DUMP_SPILL_POINTER_SCHEMA,
-} from "@server/lib/api-request-dump-store";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import {
 	runEphemeralReadTask,
@@ -42,7 +38,6 @@ import {
 	numberFromRow,
 	type SessionAggregateStats,
 	type SessionOwnedTableRelation,
-	summarizeApiRequestDumps,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
 
@@ -58,11 +53,10 @@ export type {
 export { getDatabaseStorageCategory };
 
 export const DEFAULT_STALE_SESSION_DAYS = 90;
-export const DEFAULT_API_REQUEST_DUMP_DAYS = 30;
 /**
  * Retention default for tool-call payloads.
  *
- * Longer than the API-dump window because these payloads are what the execution
+ * Long because these payloads are what the execution
  * log shows; 180 days keeps a couple of release cycles of history readable while
  * still bounding a table measured at 561k rows / 6.6 GB.
  */
@@ -123,7 +117,6 @@ export interface DatabaseStorageBreakdown {
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
-		apiRequestDumps: DatabaseCleanupCandidateSummary;
 		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
 }
@@ -137,7 +130,6 @@ export interface DatabaseCleanupPreviewCounts {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 }
 
 export interface DatabaseCleanupNarratorSample {
@@ -226,7 +218,6 @@ function minIso(values: Array<string | null | undefined>): string | null {
 
 function getDefaultOlderThanDays(target: DatabaseCleanupTarget): number | undefined {
 	if (target === "staleSessions") return DEFAULT_STALE_SESSION_DAYS;
-	if (target === "apiRequestDumps") return DEFAULT_API_REQUEST_DUMP_DAYS;
 	if (target === "toolCallPayloads") return DEFAULT_TOOL_CALL_PAYLOAD_DAYS;
 	return undefined;
 }
@@ -393,7 +384,6 @@ async function buildSessionPreview(
 				messages: aggregate.messages,
 				toolCalls: aggregate.toolCalls,
 				apiRequests: aggregate.apiRequests,
-				dumpsCleared: aggregate.dumpsCleared,
 			},
 			blockedCount: plan.blockedRoots.length,
 			warningCodes: plan.safeRoots.length > 0 ? ["deletesUsageHistory"] : [],
@@ -405,127 +395,9 @@ async function buildSessionPreview(
 }
 
 /**
- * Cap on spill paths collected per cleanup run.
- *
- * Bounded because this runs a `.all()` on the main thread (CLAUDE.md: no unbounded reads
- * there). Exceeding it only leaves files for the store's own newest-N pruning to reclaim.
- */
-const MAX_SPILL_PATHS_PER_CLEANUP = 5000;
-
-/**
- * Paths of dump files referenced by the rows a dump cleanup is about to clear.
- *
- * Extraction happens in SQLite via `json_extract`, deliberately. The obvious spelling —
- * `SELECT raw_dump_json ... WHERE raw_dump_json LIKE '%schema%'` — cannot use an index, so
- * it copies every dump (each up to the inline ceiling) into the JS heap on the main thread
- * just to find a path, which is exactly the large-field read the project's performance rules
- * forbid outside a maintenance window. `json_extract` keeps the bytes inside SQLite and
- * returns only the short path.
- *
- * `json_valid` guards the extract: a hand-edited or truncated row would otherwise make the
- * whole statement error out and abandon every path in the batch.
- */
-function collectSpillFilePaths(cutoffIso: string): string[] {
-	try {
-		const rows = sqlite
-			.prepare(
-				`SELECT json_extract(raw_dump_json, '$.spill.filePath') AS filePath
-				 FROM api_requests
-				 WHERE raw_dump_json IS NOT NULL
-				   AND created_at <= ?
-				   AND json_valid(raw_dump_json)
-				   AND json_extract(raw_dump_json, '$.spill.schema') = ?
-				 LIMIT ?`,
-			)
-			.all(cutoffIso, REQUEST_DUMP_SPILL_POINTER_SCHEMA, MAX_SPILL_PATHS_PER_CLEANUP) as Array<{
-			filePath: string | null;
-		}>;
-		const paths: string[] = [];
-		for (const row of rows) {
-			// Same guard the download route applies: never act on a path outside the dump dirs.
-			// The value came from our own row, so this is defense in depth against a corrupted
-			// or hand-edited one — deleting the wrong file is not recoverable.
-			if (typeof row.filePath === "string" && isServableDumpFilePath(row.filePath)) {
-				paths.push(row.filePath);
-			}
-		}
-		return paths;
-	} catch (error) {
-		logger.warn("Failed to collect spilled dump paths for cleanup", { error: String(error) });
-		return [];
-	}
-}
-
-async function deleteSpillFiles(paths: string[]): Promise<void> {
-	for (const path of paths) {
-		await unlink(path).catch(() => {});
-	}
-}
-
-async function buildDumpPreview(
-	olderThanDays = DEFAULT_API_REQUEST_DUMP_DAYS,
-	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
-): Promise<DatabaseCleanupPreviewResult> {
-	const cutoffIso = getCutoffIso(olderThanDays);
-	const summary = summarizeApiRequestDumps(sqlite, cutoffIso);
-	const samples = sqlite
-		.prepare(
-			`SELECT
-			ar.id AS id,
-			ar.narrator_id AS narratorId,
-			n.title AS narratorTitle,
-			c.title AS chapterTitle,
-			ar.created_at AS createdAt,
-			length(CAST(coalesce(ar.raw_dump_json, '') AS BLOB)) AS approxBytes
-		 FROM api_requests ar
-		 LEFT JOIN narrators n ON n.id = ar.narrator_id
-		 LEFT JOIN chapters c ON c.id = n.chapter_id
-		 WHERE ar.raw_dump_json IS NOT NULL AND ar.created_at <= ?
-		 ORDER BY ar.created_at ASC
-		 LIMIT ?`,
-		)
-		.all(cutoffIso, Math.max(0, sampleLimit)) as Array<{
-		id: string;
-		narratorId: string | null;
-		narratorTitle: string | null;
-		chapterTitle: string | null;
-		createdAt: string;
-		approxBytes: number | string | bigint;
-	}>;
-	return {
-		target: "apiRequestDumps",
-		olderThanDays,
-		approxBytes: summary.approxBytes,
-		oldestAt: summary.oldestAt,
-		counts: {
-			sessions: 0,
-			narrators: 0,
-			descendantNarrators: 0,
-			messages: 0,
-			toolCalls: 0,
-			apiRequests: summary.count,
-			dumpsCleared: summary.count,
-		},
-		blockedCount: 0,
-		warningCodes: [],
-		samples: samples.map((sample) => ({
-			type: "apiRequest",
-			id: sample.id,
-			narratorId: sample.narratorId,
-			narratorTitle: sample.narratorTitle,
-			chapterTitle: sample.chapterTitle,
-			createdAt: sample.createdAt,
-			approxBytes: numberFromRow(sample.approxBytes),
-		})),
-		blocked: [],
-	};
-}
-
-/**
  * Preview for clearing aged tool-call PAYLOADS.
  *
- * ⚠️ Nulls `input_json` / `output_json` and leaves the ROW in place, exactly as the
- * API-dump target does. The rows are load-bearing well beyond the execution log:
+ * ⚠️ Nulls `input_json` / `output_json` and leaves the ROW in place. The rows are load-bearing well beyond the execution log:
  * `snapshot-revert` reads `tree_hash_before` off them to roll a workspace back, and
  * `file-state-rebuild` replays recorded Write/Edit inputs from checkpoint rows.
  * Deleting rows by age would silently disable file-history revert for older work —
@@ -584,7 +456,6 @@ async function buildToolCallPayloadPreview(
 			messages: 0,
 			toolCalls: summary.count,
 			apiRequests: 0,
-			dumpsCleared: summary.count,
 		},
 		blockedCount: 0,
 		warningCodes: [],
@@ -698,13 +569,6 @@ function cleanupSummariesFromAggregates(
 			aggregates.staleApproxBytes,
 			DEFAULT_STALE_SESSION_DAYS,
 		),
-		apiRequestDumps: {
-			count: aggregates.dumps.count,
-			approxBytes: aggregates.dumps.approxBytes,
-			blockedCount: 0,
-			oldestAt: aggregates.dumps.oldestAt,
-			retentionDays: DEFAULT_API_REQUEST_DUMP_DAYS,
-		},
 		toolCallPayloads: {
 			count: aggregates.toolCalls.count,
 			approxBytes: aggregates.toolCalls.approxBytes,
@@ -728,7 +592,6 @@ function measureCleanupCandidatesOnConnection(
 		).approxBytes,
 		staleApproxBytes: collectSessionAggregateStatsOn(db, staleNarratorIds, SESSION_OWNED_TABLES)
 			.approxBytes,
-		dumps: summarizeApiRequestDumps(db, getCutoffIso(DEFAULT_API_REQUEST_DUMP_DAYS)),
 		toolCalls: summarizeToolCallPayloads(db, getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS)),
 	};
 }
@@ -762,7 +625,6 @@ async function measureCleanupCandidatesOffThread(
 		archivedNarratorIds,
 		staleNarratorIds,
 		relations: SESSION_OWNED_TABLES,
-		dumpCutoffIso: getCutoffIso(DEFAULT_API_REQUEST_DUMP_DAYS),
 		toolCallCutoffIso: getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
 	};
 	const dbPath = getDbPath();
@@ -851,9 +713,6 @@ export const databaseCleanupService = {
 		const startedAt = performance.now();
 		try {
 			const sampleLimit = options.sampleLimit ?? DEFAULT_PREVIEW_SAMPLE_LIMIT;
-			if (target === "apiRequestDumps") {
-				return buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), sampleLimit);
-			}
 			if (target === "toolCallPayloads") {
 				return buildToolCallPayloadPreview(
 					normalizePreviewDays(target, options.olderThanDays),
@@ -885,31 +744,7 @@ export const databaseCleanupService = {
 				let preview: DatabaseCleanupPreviewResult;
 				let changed = false;
 
-				if (target === "apiRequestDumps") {
-					preview = await buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), 0);
-					if (preview.counts.dumpsCleared > 0) {
-						const cutoffIso = getCutoffIso(preview.olderThanDays ?? DEFAULT_API_REQUEST_DUMP_DAYS);
-						// Collect the spill files BEFORE clearing the rows: the pointer is the only
-						// record of which file belongs to which request, so clearing first would
-						// leave the files orphaned on disk with nothing left to find them by.
-						const spillPaths = collectSpillFilePaths(cutoffIso);
-						const result = sqlite
-							.prepare(
-								`UPDATE api_requests
-							 SET raw_dump_json = NULL
-							 WHERE raw_dump_json IS NOT NULL AND created_at <= ?`,
-							)
-							.run(cutoffIso);
-						changed = numberFromRow(result?.changes) > 0;
-						// Delete unconditionally, NOT only when this UPDATE reported changes. These
-						// dumps are past the cutoff and being discarded either way; if a concurrent
-						// run cleared the rows first, `changes` is 0 while the files it pointed at are
-						// now unreachable — nothing records which request they belong to anymore. Gating
-						// on `changed` would leak them until the store's newest-50 pruning happened to
-						// reach them. Deleting a file whose row someone else just cleared is correct.
-						await deleteSpillFiles(spillPaths);
-					}
-				} else if (target === "toolCallPayloads") {
+				if (target === "toolCallPayloads") {
 					preview = await buildToolCallPayloadPreview(
 						normalizePreviewDays(target, options.olderThanDays),
 						0,

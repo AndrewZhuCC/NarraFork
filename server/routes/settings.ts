@@ -14,6 +14,7 @@ import {
 	MAX_RECORDING_REQUEST_BYTES,
 	MAX_RECORDING_RESPONSE_BYTES,
 	MIN_RECORDING_WINDOW_BYTES,
+	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
 } from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
@@ -74,8 +75,10 @@ import {
 	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	purgeStaleAgentModelRefs,
+	requestEvidenceFromLegacyAgent,
 	saveSettings,
 	settings,
+	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
@@ -423,27 +426,6 @@ export const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
-				requestDumpRecordingEnabled: z.boolean(),
-				requestDumpRequestBytes: z
-					.number()
-					.int()
-					.min(0)
-					.max(MAX_RECORDING_REQUEST_BYTES)
-					.refine(
-						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
-						"Use 0 to disable recording, or at least 1024 bytes",
-					),
-				requestDumpResponseBytes: z
-					.number()
-					.int()
-					.min(0)
-					.max(MAX_RECORDING_RESPONSE_BYTES)
-					.refine(
-						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
-						"Use 0 to disable recording, or at least 1024 bytes",
-					),
-				requestDumpEnabled: z.boolean(),
-				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planModeAllowInlinePlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
@@ -577,6 +559,31 @@ export const updateSettingsSchema = z
 					.optional(),
 				providerOrder: z.array(z.string()).max(50).optional(),
 				disabledProviders: z.array(z.string()).max(200).optional(),
+			})
+			.partial()
+			.optional(),
+		requestEvidence: z
+			.object({
+				ringEnabled: z.boolean(),
+				ringRequestBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_REQUEST_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				ringResponseBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_RESPONSE_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				autoPin: z.enum(REQUEST_EVIDENCE_AUTO_PIN_VALUES),
 			})
 			.partial()
 			.optional(),
@@ -732,7 +739,7 @@ export const updateSettingsSchema = z
 	})
 	.strict();
 
-function normalizeLegacySettingsPatch(body: unknown): unknown {
+export function normalizeLegacySettingsPatch(body: unknown): unknown {
 	if (!body || typeof body !== "object" || Array.isArray(body)) return body;
 	const draft = { ...(body as Record<string, unknown>) };
 	stripObsoleteSettingsKeys(draft);
@@ -750,6 +757,16 @@ function normalizeLegacySettingsPatch(body: unknown): unknown {
 			agent.dangerReflectionEnabled = agent.dangerReflectionLevel !== "off";
 		} else if ("dangerReflectionEnabled" in agent) {
 			agent.dangerReflectionLevel = agent.dangerReflectionEnabled === false ? "off" : "standard";
+		}
+		// Legacy clients still send `agent.requestDump*`; an explicit section wins.
+		const legacyEvidence = requestEvidenceFromLegacyAgent(agent);
+		if (legacyEvidence) {
+			const explicit =
+				draft.requestEvidence && typeof draft.requestEvidence === "object"
+					? (draft.requestEvidence as Record<string, unknown>)
+					: {};
+			draft.requestEvidence = { ...legacyEvidence, ...explicit };
+			stripLegacyRequestDumpKeys(agent);
 		}
 		draft.agent = agent;
 	}

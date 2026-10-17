@@ -1616,6 +1616,11 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Request dumps and token repair data from before request evidence unification are discarded.
+import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
+
+void removeLegacyRequestDumpDirs();
+
 // Clean up leftover pack extraction directories from previous server runs and mark any
 // still-"active" pack activations as released (their temp dirs don't survive a restart).
 import { packActivationService } from "./services/knowledge-pack-activation-service";

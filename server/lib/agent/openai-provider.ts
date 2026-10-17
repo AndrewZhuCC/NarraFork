@@ -956,16 +956,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			await reportInputCharacters(params, body);
 			const bodyText = JSON.stringify(body);
-			params.requestDump?.beginResponseAttempt(
-				{
-					transport: "http",
-					method: "POST",
-					url: endpoint,
-					headers: sanitizeHeaders(requestHeaders),
-					bodyText,
-				},
-				settings.agent?.requestDumpMaxSize,
-			);
+			params.requestDump?.beginResponseAttempt({
+				transport: "http",
+				method: "POST",
+				url: endpoint,
+				headers: sanitizeHeaders(requestHeaders),
+				bodyText,
+			});
 
 			params.onRequestStart?.();
 			const response = await this.pfetch(endpoint, {
@@ -1693,7 +1690,6 @@ export class OpenAIProvider implements ProviderAdapter {
 				userAgent: fingerprint.userAgent,
 				extraHeaders: fingerprint.headers,
 				requestDump: params.requestDump,
-				requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 			})) {
 				yield stampReasoningSource(event, this.getActiveReasoningSource());
 			}
