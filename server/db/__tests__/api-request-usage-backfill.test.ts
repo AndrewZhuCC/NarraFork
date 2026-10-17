@@ -39,7 +39,7 @@ function readInputTokens(database: Database, id: string): number {
 }
 
 describe("历史 token 数据不在启动时自动修正", () => {
-	test("原始包含缓存的输入保留原值，等待人工核对", async () => {
+	test("原始包含缓存的输入保留原值", async () => {
 		const database = openDatabase();
 		await runMigrations(database);
 		insertRequest(database, "raw", 81250, 80256, 0);
@@ -47,13 +47,6 @@ describe("历史 token 数据不在启动时自动修正", () => {
 		await applySqliteDataBackfills(database);
 
 		expect(readInputTokens(database, "raw")).toBe(81250);
-		expect(
-			database
-				.query(
-					"SELECT token_accounting_version, token_accounting_review_version FROM api_requests WHERE id='raw'",
-				)
-				.get(),
-		).toEqual({ token_accounting_version: null, token_accounting_review_version: null });
 	});
 
 	test("已归一、Anthropic 缓存写入、无缓存的记录都不动，且重跑不再变化", async () => {

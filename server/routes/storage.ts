@@ -136,7 +136,6 @@ const cleanupTargetSchema = z.object({
 const databaseCleanupTargetSchema = z.enum([
 	"archivedSessions",
 	"staleSessions",
-	"apiRequestDumps",
 	"toolCallPayloads",
 ]);
 

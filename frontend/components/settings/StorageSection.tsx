@@ -24,7 +24,6 @@ import {
 	IconDatabase,
 	IconFileCode,
 	IconGitBranch,
-	IconInfoCircle,
 	IconLock,
 	IconPaperclip,
 	IconPhoto,
@@ -32,7 +31,6 @@ import {
 	IconShare,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -116,7 +114,6 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	shares: <IconShare size={18} />,
 	worktrees: <IconGitBranch size={18} />,
 	treeSnapshots: <IconCamera size={18} />,
-	requestDumps: <IconFileCode size={18} />,
 	requestRecordings: <IconFileCode size={18} />,
 	savedRequestRecordings: <IconFileCode size={18} />,
 	dormantIgnored: <IconLock size={18} />,
@@ -130,7 +127,6 @@ const CATEGORY_COLORS: Record<string, string> = {
 	shares: "teal",
 	worktrees: "orange",
 	treeSnapshots: "violet",
-	requestDumps: "indigo",
 	requestRecordings: "blue",
 	savedRequestRecordings: "grape",
 	dormantIgnored: "yellow",
@@ -156,8 +152,6 @@ function formatScanDetail(
 	return ` (${detail.done}/${detail.total})`;
 }
 
-const STORAGE_SETTINGS_QUERY_GC_TIME_MS = 60_000;
-
 // Nested rows need a subtle tint that differs from the card body in both color schemes.
 const NESTED_ROW_BG = "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-6))";
 
@@ -166,7 +160,6 @@ const DATABASE_TARGET_DEFAULT_DAYS: Record<
 	number
 > = {
 	staleSessions: 90,
-	apiRequestDumps: 30,
 	toolCallPayloads: 180,
 };
 
@@ -175,7 +168,6 @@ const DATABASE_TARGET_DAY_OPTIONS: Record<
 	string[]
 > = {
 	staleSessions: ["30", "90", "180", "365"],
-	apiRequestDumps: ["7", "30", "90", "180"],
 	// No option below 90 days: these payloads are what the execution log shows, and a
 	// short window would erase the recent history an administrator actually consults.
 	toolCallPayloads: ["90", "180", "365", "730"],
@@ -271,11 +263,6 @@ export function StorageSection() {
 					supported: false,
 					reason: storageHealthDisabledReason,
 				},
-				apiRequestDumps: {
-					...rawDatabaseCleanupCapabilities.apiRequestDumps,
-					supported: false,
-					reason: storageHealthDisabledReason,
-				},
 				toolCallPayloads: {
 					...rawDatabaseCleanupCapabilities.toolCallPayloads,
 					supported: false,
@@ -317,16 +304,6 @@ export function StorageSection() {
 	 * to poll.
 	 */
 	const mountedRef = useRef(true);
-
-	const { data: settingsData } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		gcTime: STORAGE_SETTINGS_QUERY_GC_TIME_MS,
-	});
-	const requestDumpEnabled = Boolean(
-		(settingsData as { agent?: { requestDumpEnabled?: boolean } } | undefined)?.agent
-			?.requestDumpEnabled,
-	);
 
 	const applyJobState = (state: StorageScanJobState) => {
 		const jobs = state.categoryJobs ?? [];
@@ -678,8 +655,6 @@ export function StorageSection() {
 		setDatabasePreviewError(null);
 		if (target === "staleSessions") {
 			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.staleSessions);
-		} else if (target === "apiRequestDumps") {
-			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.apiRequestDumps);
 		} else if (target === "toolCallPayloads") {
 			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.toolCallPayloads);
 		}
@@ -775,7 +750,6 @@ export function StorageSection() {
 				return t("storageTreeSnapshotRepoCount", { count: Number(d.repoCount ?? 0) });
 			case "requestRecordings":
 			case "savedRequestRecordings":
-			case "requestDumps":
 				return t("storageRequestDumpFileCount", { count: Number(d.fileCount ?? 0) });
 			case "dormantIgnored": {
 				const archives = t("storageIgnoredArchiveCount", {
@@ -847,13 +821,6 @@ export function StorageSection() {
 					summary: databaseDetails.cleanupCandidates.staleSessions,
 					description: t("storageDatabaseStaleSessionsDesc", {
 						days: databaseDetails.cleanupCandidates.staleSessions.retentionDays ?? 90,
-					}),
-				},
-				{
-					target: "apiRequestDumps" as const,
-					summary: databaseDetails.cleanupCandidates.apiRequestDumps,
-					description: t("storageDatabaseApiRequestDumpsDesc", {
-						days: databaseDetails.cleanupCandidates.apiRequestDumps.retentionDays ?? 30,
 					}),
 				},
 				{
@@ -1370,17 +1337,13 @@ export function StorageSection() {
 																		</Text>
 																		<Group gap="xs" mt={4} wrap="wrap">
 																			<Text size="xs" c="dimmed">
-																				{row.target === "apiRequestDumps"
-																					? t("storageDatabaseSummaryRequests", {
+																				{row.target === "toolCallPayloads"
+																					? t("storageDatabaseSummaryToolCalls", {
 																							count: row.summary.count,
 																						})
-																					: row.target === "toolCallPayloads"
-																						? t("storageDatabaseSummaryToolCalls", {
-																								count: row.summary.count,
-																							})
-																						: t("storageDatabaseSummarySessions", {
-																								count: row.summary.count,
-																							})}
+																					: t("storageDatabaseSummarySessions", {
+																							count: row.summary.count,
+																						})}
 																			</Text>
 																			{row.summary.oldestAt && (
 																				<Text size="xs" c="dimmed">
@@ -1397,14 +1360,6 @@ export function StorageSection() {
 																				</Text>
 																			)}
 																		</Group>
-																		{row.target === "apiRequestDumps" && requestDumpEnabled && (
-																			<Group mt={6} gap={6} wrap="nowrap">
-																				<IconInfoCircle size={14} />
-																				<Text size="xs" c="dimmed">
-																					{t("storageDatabaseDumpEnabledNote")}
-																				</Text>
-																			</Group>
-																		)}
 																	</div>
 																	<Button
 																		size="xs"
@@ -1458,12 +1413,6 @@ export function StorageSection() {
 								setDatabaseOlderThanDays(Number(value));
 							}}
 						/>
-					)}
-
-					{requestDumpEnabled && databaseTarget === "apiRequestDumps" && (
-						<Alert color="blue" icon={<IconInfoCircle size={16} />}>
-							{t("storageDatabaseDumpEnabledNote")}
-						</Alert>
 					)}
 
 					{databaseCleanupDisabledReason && (
@@ -1522,13 +1471,7 @@ export function StorageSection() {
 							</Group>
 
 							<Group gap="xs" wrap="wrap">
-								{databasePreview.target === "apiRequestDumps" ? (
-									<Text size="sm" c="dimmed">
-										{t("storageDatabaseCountsDumps", {
-											count: databasePreview.counts.dumpsCleared,
-										})}
-									</Text>
-								) : databasePreview.target === "toolCallPayloads" ? (
+								{databasePreview.target === "toolCallPayloads" ? (
 									<Text size="sm" c="dimmed">
 										{t("storageDatabaseCountsToolCallPayloads", {
 											count: databasePreview.counts.toolCalls,
@@ -1577,11 +1520,9 @@ export function StorageSection() {
 							{databasePreview.samples.length > 0 ? (
 								<Stack gap="xs">
 									<Text fw={500} size="sm">
-										{databasePreview.target === "apiRequestDumps"
-											? t("storageDatabaseSampleRequests")
-											: databasePreview.target === "toolCallPayloads"
-												? t("storageDatabaseSampleToolCalls")
-												: t("storageDatabaseSampleSessions")}
+										{databasePreview.target === "toolCallPayloads"
+											? t("storageDatabaseSampleToolCalls")
+											: t("storageDatabaseSampleSessions")}
 									</Text>
 									<Stack gap="xs" style={{ maxHeight: 260, overflow: "auto" }}>
 										{databasePreview.samples.map((sample) =>
@@ -1718,7 +1659,6 @@ export function StorageSection() {
 	function getDatabaseCleanupCount(
 		result: DatabaseCleanupPreviewResult | DatabaseCleanupExecutionResult,
 	): number {
-		if (result.target === "apiRequestDumps") return result.counts.dumpsCleared;
 		// Tool-call payloads are counted by ROW, not by session: the rows survive and only
 		// their payload columns are cleared, so `counts.sessions` would always be 0 and the
 		// confirm button would look like there was nothing to do.

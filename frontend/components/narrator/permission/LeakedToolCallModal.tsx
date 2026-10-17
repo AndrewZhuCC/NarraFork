@@ -1,22 +1,13 @@
-import { narratorsApi } from "@frontend/lib/api/narrators";
+import { isAbortError } from "@frontend/lib/api";
+import { ApiError } from "@frontend/lib/api/client";
+import { saveBlobAsFile } from "@frontend/lib/file-download";
 import { Alert, Button, Code, Group, Modal, Stack, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconAlertTriangle, IconDownload, IconInfoCircle } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { downloadErrorRequestDump } from "../useErrorRequestDump";
 import type { LeakedToolEvent } from "../useNarratorPanelWS";
-
-function downloadJsonFile(fileName: string, value: unknown): void {
-	const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
-	const url = URL.createObjectURL(blob);
-	const link = document.createElement("a");
-	link.href = url;
-	link.download = fileName;
-	document.body.append(link);
-	link.click();
-	link.remove();
-	URL.revokeObjectURL(url);
-}
 
 interface LeakedToolCallModalProps {
 	narratorId: string;
@@ -29,22 +20,36 @@ interface LeakedToolCallModalProps {
  * - `recovered`: the post-turn safety net extracted and executed the tool, but the raw
  *   data is worth downloading to investigate why streaming capture missed it.
  * - `unrecovered`: leaked `<invoke>` text remained that could not be parsed; a tool may
- *   not have executed. The raw SSE dump is force-persisted and downloadable here.
+ *   not have executed.
+ *
+ * Either way the server pins the attempt in the request recorder, so the download below
+ * is the same evidence ZIP as any other request recording.
  */
 export function LeakedToolCallModal({ narratorId, event, onClose }: LeakedToolCallModalProps) {
 	const { t } = useTranslation("narrator");
 	const [downloading, setDownloading] = useState(false);
 
 	const handleDownload = async () => {
-		if (!event) return;
+		const requestId = event?.recordingRequestId;
+		if (!requestId) return;
 		setDownloading(true);
 		try {
-			const dump = await narratorsApi.getLeakedToolDump(narratorId, event.apiRequestId);
-			downloadJsonFile(`narrator-${narratorId}-request-${event.apiRequestId}.json`, dump);
+			const { blob, fileName } = await downloadErrorRequestDump(
+				narratorId,
+				requestId,
+				AbortSignal.timeout(120_000),
+			);
+			saveBlobAsFile(blob, fileName ?? `request-recording-${requestId}.zip`);
 		} catch (error) {
+			if (isAbortError(error)) return;
 			notifications.show({
 				title: t("leakedToolDownloadFailedTitle"),
-				message: error instanceof Error ? error.message : String(error),
+				message:
+					error instanceof ApiError && error.status === 404
+						? t("errorRequest.unavailable")
+						: error instanceof Error
+							? error.message
+							: String(error),
 				color: "red",
 			});
 		} finally {
@@ -95,6 +100,7 @@ export function LeakedToolCallModal({ narratorId, event, onClose }: LeakedToolCa
 						<Button
 							leftSection={<IconDownload size={16} />}
 							loading={downloading}
+							disabled={!event.recordingRequestId}
 							onClick={handleDownload}
 						>
 							{t("leakedToolDownload")}

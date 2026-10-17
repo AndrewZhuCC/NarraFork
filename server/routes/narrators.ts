@@ -39,7 +39,6 @@ import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import {
-	apiRequests,
 	chapters,
 	containerInstances,
 	narratorBlacklistCmds,
@@ -61,7 +60,6 @@ import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
-import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
@@ -1629,63 +1627,6 @@ narratorRoutes.get("/:id/panel-state", async (c) => {
 	});
 	await requireNarratorAccess(c, id, "read");
 	return c.json(result);
-});
-
-// Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
-// Narrator-scoped so non-admin users participating in debugging can fetch the data,
-// with an ownership check preventing access to other narrators' requests.
-narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
-	const id = c.req.param("id");
-	const requestId = c.req.param("requestId");
-	await narratorService.getById(id); // 404 if narrator missing
-
-	const [row] = await db
-		.select({
-			id: apiRequests.id,
-			narratorId: apiRequests.narratorId,
-			provider: apiRequests.provider,
-			model: apiRequests.model,
-			createdAt: apiRequests.createdAt,
-			errorMessage: apiRequests.errorMessage,
-			rawDumpJson: apiRequests.rawDumpJson,
-		})
-		.from(apiRequests)
-		.where(eq(apiRequests.id, requestId));
-
-	if (!row || row.narratorId !== id) {
-		// Treat a mismatched owner the same as missing to avoid leaking existence.
-		return c.json({ error: "Request dump not found for this narrator" }, 404);
-	}
-	if (!row.rawDumpJson) {
-		return c.json(
-			{
-				error:
-					"No raw dump stored for this request. Raw SSE data is only retained when a leak is detected or request dumping is enabled.",
-			},
-			404,
-		);
-	}
-
-	let rawDump: unknown;
-	try {
-		// Same redaction as the usage-history detail path: the stored dump carries absolute
-		// server paths (spill pointer / malformed capture) that name the host OS account, and a
-		// dump is something users export and forward to whoever is helping them. This route
-		// used to return the row verbatim, so it leaked what the other path was careful about.
-		rawDump = redactSpillPointerPaths(JSON.parse(row.rawDumpJson));
-	} catch {
-		rawDump = { invalidJson: true, rawText: row.rawDumpJson };
-	}
-
-	return c.json({
-		id: row.id,
-		narratorId: row.narratorId,
-		provider: row.provider,
-		model: row.model,
-		createdAt: row.createdAt,
-		errorMessage: row.errorMessage,
-		rawDump,
-	});
 });
 
 narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {

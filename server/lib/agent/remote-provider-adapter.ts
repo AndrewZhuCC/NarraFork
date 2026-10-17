@@ -13,8 +13,6 @@ import type {
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
 import { historyInputMessageIds } from "@shared/native-injection";
-import type { RecordingRequest } from "@shared/request-recording";
-import { settings } from "../settings";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -25,12 +23,10 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import type { ApiRequestDump } from "./request-dump";
 import {
-	BoundedUtf8Capture,
 	collectSecretConfigValues,
 	maskSecretValues,
-	responseDumpBudget,
+	type RecordingAttemptRequest,
 	sanitizeHeaders,
 } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -540,8 +536,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 	 *
 	 * Attempt tracking mirrors the collector's model: a `dump.request` carrying
 	 * url/headers opens a new upstream attempt, and the first `dump.response` of an
-	 * attempt calls `beginResponseAttempt`, which archives the previous attempt into
-	 * `attempts[]` — so plugins that retry internally produce a faithful attempt list.
+	 * attempt calls `beginResponseAttempt` — so plugins that retry internally produce a
+	 * faithful attempt sequence in the recording.
 	 */
 	private createDumpTap(
 		params: ChatParams,
@@ -568,14 +564,12 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			transport?: string;
 			url?: string;
 			headers?: Record<string, string>;
-			body: BoundedUtf8Capture;
-			truncated: boolean;
 		}
 		let pendingRequest: PendingRequest | null = null;
 		let responseOpen = false;
 		let responseFailed = false;
 		let responseTruncated = false;
-		let responseBody: BoundedUtf8Capture | null = null;
+		let responseBytes = 0;
 		// Delay only a bounded suffix so credentials split across arbitrary plugin
 		// chunks are still masked. All other reported bytes reach the worker live.
 		const secretTail = Math.min(
@@ -600,41 +594,24 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 		};
 
-		const buildRequest = (): NonNullable<ApiRequestDump["request"]> & RecordingRequest => {
-			const pending = pendingRequest;
-			const sanitizedBody = new BoundedUtf8Capture(maxBytes);
-			sanitizedBody.append(mask(pending?.body.text() ?? ""));
-			let bodyText = sanitizedBody.text();
-			if (
-				pending?.truncated ||
-				(pending && pending.body.received > pending.body.kept) ||
-				sanitizedBody.received > sanitizedBody.kept
-			) {
-				bodyText += "\n[request body truncated by plugin to fit the dump budget]";
-			}
-			return {
-				transport: pending?.transport ?? "plugin",
-				...(pending?.url ? { url: pending.url } : {}),
-				...(pending?.headers ? { headers: pending.headers } : {}),
-				bodyText,
-			};
-		};
+		// Bodies already reached the recorder as sanitized frames; attempts carry metadata only.
+		const buildRequest = (): RecordingAttemptRequest => ({
+			transport: pendingRequest?.transport ?? "plugin",
+			...(pendingRequest?.url ? { url: pendingRequest.url } : {}),
+			...(pendingRequest?.headers ? { headers: pendingRequest.headers } : {}),
+		});
 		const closeResponse = (complete: boolean): void => {
 			if (!responseOpen) return;
 			responseOpen = false;
-			// Mask the bounded concatenation, not each chunk: plugins choose arbitrary
+			// Mask the pending tail, not each chunk: plugins choose arbitrary
 			// boundaries (including inside escaped secrets). Reset for EVERY retry.
 			emitBody("response", "", true);
-			if (responseBody) collector.appendResponseText(mask(responseBody.text()), false);
 			collector.finishResponseCapture(complete && !responseFailed && !responseTruncated);
-			if (responseBody)
-				collector.setResponseMeta({
-					bodyBytesReceived: responseBody.received,
-					...(responseTruncated || responseBody.received > responseBody.kept
-						? { bodyTruncated: true }
-						: {}),
-				});
-			responseBody = null;
+			collector.setResponseMeta({
+				bodyBytesReceived: responseBytes,
+				...(responseTruncated ? { bodyTruncated: true } : {}),
+			});
+			responseBytes = 0;
 			responseFailed = false;
 			responseTruncated = false;
 		};
@@ -672,24 +649,17 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						...(event.transport ? { transport: mask(event.transport) } : {}),
 						...(event.url ? { url: mask(event.url) } : {}),
 						...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
-						body: new BoundedUtf8Capture(maxBytes),
-						truncated: false,
 					};
 				}
-				if (event.bodyChunk) {
-					pendingRequest?.body.append(event.bodyChunk);
-					emitBody("request", event.bodyChunk);
-				}
-				if (event.truncated && pendingRequest) pendingRequest.truncated = true;
+				if (event.bodyChunk) emitBody("request", event.bodyChunk);
 				return;
 			}
 			// dump.response
 			if (!responseOpen) {
 				responseOpen = true;
 				responseFailed = false;
-				responseBody = new BoundedUtf8Capture(maxBytes);
 				emitBody("request", "", true);
-				collector.beginResponseAttempt(buildRequest(), maxBytes, false);
+				collector.beginResponseAttempt(buildRequest(), false);
 				pendingRequest = null;
 				collector.setResponseMeta({
 					...(event.status !== undefined ? { status: event.status } : {}),
@@ -697,7 +667,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 			}
 			if (event.bodyChunk) {
-				responseBody?.append(event.bodyChunk);
+				responseBytes += Buffer.byteLength(event.bodyChunk);
 				emitBody("response", event.bodyChunk);
 			}
 			if (event.truncated) responseTruncated = true;
@@ -733,10 +703,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			...(params.requestDump
 				? {
 						requestDump: {
-							maxBytes: Math.min(
-								responseDumpBudget(settings.agent?.requestDumpMaxSize),
-								PLUGIN_REQUEST_DUMP_MAX_BYTES,
-							),
+							maxBytes: PLUGIN_REQUEST_DUMP_MAX_BYTES,
 						},
 					}
 				: {}),

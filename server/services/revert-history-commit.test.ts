@@ -784,7 +784,7 @@ describe("manifest associations and real FK behavior", () => {
 				createdAt: time,
 				provider: "fixture",
 				model: "fixture",
-				rawDumpJson: '{"raw":"do not load or erase"}',
+				diagnosticsJson: '{"raw":"do not load or erase"}',
 			})
 			.run();
 		db.insert(schema.specNamespaces)
@@ -869,8 +869,8 @@ describe("manifest associations and real FK behavior", () => {
 		expect(edges).toHaveLength(2);
 		apply(await service.prepare({ principal, fixedSelection }));
 		expect(
-			query("SELECT message_id,raw_dump_json FROM api_requests WHERE id='request'")[0],
-		).toEqual({ message_id: null, raw_dump_json: '{"raw":"do not load or erase"}' });
+			query("SELECT message_id,diagnostics_json FROM api_requests WHERE id='request'")[0],
+		).toEqual({ message_id: null, diagnostics_json: '{"raw":"do not load or erase"}' });
 		expect(
 			query("SELECT source_message_id,content FROM spec_file_revisions WHERE id='revision'")[0],
 		).toEqual({ source_message_id: null, content: "private revision" });

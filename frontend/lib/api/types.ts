@@ -336,7 +336,6 @@ export interface DatabaseStorageBreakdown {
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
-		apiRequestDumps: DatabaseCleanupCandidateSummary;
 		/**
 		 * Aged tool-call input/output payloads. Clears the columns and KEEPS the rows —
 		 * they carry the tree hashes that file-history revert depends on.
@@ -345,11 +344,7 @@ export interface DatabaseStorageBreakdown {
 	};
 }
 
-export type DatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"
@@ -379,7 +374,6 @@ export interface DatabaseCleanupPreviewCounts {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 }
 
 export interface DatabaseCleanupNarratorSample extends FallbackDiagnostics {

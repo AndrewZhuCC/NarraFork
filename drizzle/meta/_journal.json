@@ -1450,6 +1450,20 @@
       "when": 1792157709586,
       "tag": "0206_context_numeric_stats",
       "breakpoints": true
+    },
+    {
+      "idx": 207,
+      "version": "6",
+      "when": 1792214891979,
+      "tag": "0207_drop_legacy_request_dumps",
+      "breakpoints": true
+    },
+    {
+      "idx": 208,
+      "version": "6",
+      "when": 1792214900978,
+      "tag": "0208_request_evidence_columns",
+      "breakpoints": true
     }
   ]
 }

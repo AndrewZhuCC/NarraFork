@@ -8,6 +8,7 @@ import {
 	MIN_RECORDING_WINDOW_BYTES,
 	type RecordingFrame,
 	type RecordingIdentity,
+	type RecordingPinReason,
 	type RecordingRequest,
 	type RecordingSettings,
 	type RequestRecording,
@@ -42,21 +43,20 @@ function capacity(value: unknown, fallback: number, maximum: number): number {
 	return bytes > 0 && bytes < MIN_RECORDING_WINDOW_BYTES ? 0 : bytes;
 }
 export function requestRecordingSettings(): RecordingSettings {
-	const agent = settings.agent as Partial<RecordingSettings>;
+	const evidence = (settings.requestEvidence ?? {}) as Partial<RecordingSettings>;
 	return {
-		requestDumpRecordingEnabled: agent.requestDumpRecordingEnabled !== false,
-		requestDumpRequestBytes: capacity(
-			agent.requestDumpRequestBytes,
+		ringEnabled: evidence.ringEnabled !== false,
+		ringRequestBytes: capacity(
+			evidence.ringRequestBytes,
 			DEFAULT_RECORDING_REQUEST_BYTES,
 			MAX_RECORDING_REQUEST_BYTES,
 		),
-		requestDumpResponseBytes: capacity(
-			agent.requestDumpResponseBytes,
+		ringResponseBytes: capacity(
+			evidence.ringResponseBytes,
 			DEFAULT_RECORDING_RESPONSE_BYTES,
 			MAX_RECORDING_RESPONSE_BYTES,
 		),
-		requestDumpEnabled: agent.requestDumpEnabled === true,
-		requestDumpErrorsOnly: agent.requestDumpErrorsOnly === true,
+		autoPin: evidence.autoPin === "all" || evidence.autoPin === "errors" ? evidence.autoPin : "off",
 	};
 }
 export { sanitizeRecordingMetadata, sanitizeRecordingUrl } from "./request-recorder-sanitize";
@@ -645,10 +645,8 @@ function sendBytes(
 export function createRequestRecording(identity: RecordingIdentity): RequestRecording | undefined {
 	const config = requestRecordingSettings();
 	if (
-		(!config.requestDumpRecordingEnabled && !config.requestDumpEnabled) ||
-		(!config.requestDumpEnabled &&
-			!config.requestDumpRequestBytes &&
-			!config.requestDumpResponseBytes)
+		(!config.ringEnabled && config.autoPin === "off") ||
+		(config.autoPin === "off" && !config.ringRequestBytes && !config.ringResponseBytes)
 	)
 		return undefined;
 	let port: RequestRecorderClient;
@@ -661,8 +659,8 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 	port.capture({
 		type: "begin",
 		identity,
-		continuous: config.requestDumpEnabled,
-		errorsOnly: config.requestDumpErrorsOnly,
+		continuous: config.autoPin !== "off",
+		errorsOnly: config.autoPin === "errors",
 	});
 	let packet = 0;
 	let finished = false;
@@ -677,13 +675,13 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 		if (finished || text == null) return;
 		const live = requestRecordingSettings();
 		port.configure(live);
-		if (!live.requestDumpRecordingEnabled && !live.requestDumpEnabled) {
+		if (!live.ringEnabled && live.autoPin === "off") {
 			noteMissing(side, "recording disabled during request");
 			return;
 		}
 		if (
-			!(config.requestDumpEnabled && !config.requestDumpErrorsOnly) &&
-			!(side === "request" ? live.requestDumpRequestBytes : live.requestDumpResponseBytes)
+			config.autoPin !== "all" &&
+			!(side === "request" ? live.ringRequestBytes : live.ringResponseBytes)
 		) {
 			noteMissing(side, `${side} body recording disabled`);
 			return;
@@ -692,7 +690,7 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 	};
 	const meta = (side: RecordingSide, value: Record<string, unknown>) => {
 		const live = requestRecordingSettings();
-		if (!live.requestDumpRecordingEnabled && !live.requestDumpEnabled) {
+		if (!live.ringEnabled && live.autoPin === "off") {
 			if (!finished) noteMissing(side, "recording disabled during request");
 			return;
 		}
@@ -710,13 +708,14 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 			const { bodyText, ...information } = request;
 			meta("request", {
 				...information,
-				bodyEnabled:
-					(config.requestDumpEnabled && !config.requestDumpErrorsOnly) ||
-					requestRecordingSettings().requestDumpRequestBytes > 0,
+				bodyEnabled: config.autoPin === "all" || requestRecordingSettings().ringRequestBytes > 0,
 			});
 			capture("request", "body", bodyText);
 		},
 		responseMeta: (value) => meta("response", value),
+		pin(reason) {
+			port.capture({ type: "pin", requestId: identity.requestId, reason });
+		},
 		responseChunk: (value) => capture("response", "body", value),
 		frame(frame: RecordingFrame) {
 			if (finished) return;
@@ -741,6 +740,10 @@ export function createRequestRecording(identity: RecordingIdentity): RequestReco
 }
 export function bindRecordingRequest(requestId: string, apiRequestId: string): void {
 	clients.get(getNarraforkHome())?.capture({ type: "bind", requestId, apiRequestId });
+}
+/** Pin a (possibly already finished) recording; a no-op when it already left the ring. */
+export function pinRecordingRequest(requestId: string, reason: RecordingPinReason): void {
+	clients.get(getNarraforkHome())?.capture({ type: "pin", requestId, reason });
 }
 export async function saveRequestRecording(narratorId: string): Promise<SavedRecording> {
 	return client().call({ type: "save", narratorId });

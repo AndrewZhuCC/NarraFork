@@ -310,11 +310,12 @@ ALTER TABLE "resource_protection_paths" ADD CONSTRAINT "resource_protection_path
 						match: /^foreign key chapters_project_id_projects_id_fk: missing/,
 					},
 					{
-						label: "changed expression index key",
-						sql: `DROP INDEX "idx_token_repair_single_active";
-CREATE UNIQUE INDEX "idx_token_repair_single_active" ON "usage_token_repair_jobs" ((2)) WHERE status IN ('analyzing', 'ready', 'applying');`,
+						label: "changed partial index predicate",
+						sql: `DROP INDEX "idx_integration_authorities_source_grant";
+CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_authorities" ("source_grant_id") WHERE "source_grant_id" is null;`,
 						facets: ["indexes"],
-						match: /^index usage_token_repair_jobs\.idx_token_repair_single_active: expected/,
+						match:
+							/^index integration_authorities\.idx_integration_authorities_source_grant: expected/,
 					},
 					{
 						label: "dropped index",
@@ -440,7 +441,7 @@ CREATE UNIQUE INDEX "idx_token_repair_single_active" ON "usage_token_repair_jobs
 				"reordered composite primary key",
 				"dropped composite primary key",
 				"dropped foreign key",
-				"changed expression index key",
+				"changed partial index predicate",
 				"dropped index",
 				"changed default",
 				"dropped unique constraint",

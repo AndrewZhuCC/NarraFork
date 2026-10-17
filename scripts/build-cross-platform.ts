@@ -459,9 +459,6 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		// Private archive scans/copies/imports must remain off-thread in released binaries.
 		"./server/services/project-archive/legacy-sync-worker.ts",
 		"./server/services/project-archive/legacy-import-worker.ts",
-		// Historical accounting analysis and bounded JSON parsing never run on the HTTP thread.
-		"./server/services/usage-token-repair-worker.ts",
-		"./server/services/usage-token-repair-evidence-worker.ts",
 		`--define=__NARRAFORK_BUILD_REPOSITORY__=${JSON.stringify(BUILD_REPOSITORY)}`,
 		"--compile",
 		"--minify",
