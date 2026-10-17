@@ -664,7 +664,6 @@ export interface SessionAggregateStats {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 	approxBytes: number;
 }
 
@@ -673,7 +672,6 @@ const EMPTY_SESSION_AGGREGATE_STATS: SessionAggregateStats = {
 	messages: 0,
 	toolCalls: 0,
 	apiRequests: 0,
-	dumpsCleared: 0,
 	approxBytes: 0,
 };
 
@@ -746,21 +744,6 @@ export function collectSessionAggregateStats(
 		else if (relation.countAs === "apiRequests") apiRequests += count;
 	}
 
-	let dumpsCleared = 0;
-	if (tableExists(sqlite, "api_requests")) {
-		dumpsCleared = numberFromRow(
-			(
-				sqlite
-					.prepare(
-						`SELECT COUNT(*) AS count
-						 FROM api_requests ar
-						 WHERE ar.narrator_id IN (${targetSelect}) AND ar.raw_dump_json IS NOT NULL`,
-					)
-					.get(targetIds) as { count: unknown } | undefined
-			)?.count,
-		);
-	}
-
 	if (tableExists(sqlite, "background_tasks")) {
 		approxBytes += countAndSumTableBytes(
 			sqlite,
@@ -802,7 +785,6 @@ export function collectSessionAggregateStats(
 		messages,
 		toolCalls,
 		apiRequests,
-		dumpsCleared,
 		approxBytes,
 	};
 }
@@ -922,30 +904,6 @@ export interface StorageByteSummary {
 }
 
 const EMPTY_BYTE_SUMMARY: StorageByteSummary = { count: 0, approxBytes: 0, oldestAt: null };
-
-/** Byte total for API request dumps older than the cutoff. Same predicate as the cleanup preview. */
-export function summarizeApiRequestDumps(sqlite: Database, cutoffIso: string): StorageByteSummary {
-	if (!tableExists(sqlite, "api_requests")) return { ...EMPTY_BYTE_SUMMARY };
-	const summary = sqlite
-		.prepare(
-			`SELECT
-				COUNT(*) AS count,
-				COALESCE(SUM(length(CAST(coalesce(raw_dump_json, '') AS BLOB))), 0) AS approxBytes,
-				MIN(created_at) AS oldestAt
-			 FROM api_requests
-			 WHERE raw_dump_json IS NOT NULL AND created_at <= ?`,
-		)
-		.get(cutoffIso) as {
-		count: number | string | bigint;
-		approxBytes: number | string | bigint;
-		oldestAt: string | null;
-	} | null;
-	return {
-		count: numberFromRow(summary?.count),
-		approxBytes: numberFromRow(summary?.approxBytes),
-		oldestAt: summary?.oldestAt ?? null,
-	};
-}
 
 /** Byte total for tool-call payloads older than the cutoff. Same predicate as the cleanup preview. */
 export function summarizeToolCallPayloads(sqlite: Database, cutoffIso: string): StorageByteSummary {

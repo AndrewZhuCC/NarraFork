@@ -113,7 +113,6 @@ export interface StorageScanCleanupSummariesParams {
 	archivedNarratorIds: string[];
 	staleNarratorIds: string[];
 	relations: StorageScanCleanupRelation[];
-	dumpCutoffIso: string;
 	toolCallCutoffIso: string;
 }
 
@@ -126,7 +125,6 @@ export interface StorageScanByteSummary {
 export interface StorageScanCleanupSummariesResult {
 	archivedApproxBytes: number;
 	staleApproxBytes: number;
-	dumps: StorageScanByteSummary;
 	toolCalls: StorageScanByteSummary;
 }
 

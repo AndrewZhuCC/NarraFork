@@ -17,11 +17,9 @@ export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
 /** Full UTF-8 JSON-RPC request body budget, including base64 images; inbound limits stay small. */
 export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
 /**
- * Ceiling on the dump budget the host advertises to a plugin in
- * `ProviderChatParams.requestDump.maxBytes`. The operator-configured
- * `agent.requestDumpMaxSize` is a retention ceiling and may be far larger; what crosses
- * the RPC boundary remains bounded independently from model output. Exceeding this
- * diagnostic budget truncates evidence, never terminates the business operation.
+ * Dump budget the host advertises to a plugin in `ProviderChatParams.requestDump.maxBytes`.
+ * What crosses the RPC boundary stays bounded independently from model output. Exceeding
+ * this diagnostic budget truncates evidence, never terminates the business operation.
  */
 export const PLUGIN_REQUEST_DUMP_MAX_BYTES = 4 * 1024 * 1024;
 /** Maximum size of a single `dump.request`/`dump.response` body chunk. */

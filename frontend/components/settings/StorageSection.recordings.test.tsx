@@ -30,7 +30,7 @@ mock.module("../../hooks/usePlatform", () => ({
 		),
 	useStorageDatabaseCleanupCapabilities: () =>
 		Object.fromEntries(
-			["archivedSessions", "staleSessions", "apiRequestDumps", "toolCallPayloads"].map((key) => [
+			["archivedSessions", "staleSessions", "toolCallPayloads"].map((key) => [
 				key,
 				{ supported: false },
 			]),
@@ -43,12 +43,11 @@ mock.module("../common/confirm-dialog-context", () => ({
 const { StorageSection } = await import("./StorageSection");
 
 const result: StorageScanResult = {
-	totalBytes: 6144,
+	totalBytes: 3072,
 	scannedAt: 1_760_000_000_000,
 	categories: [
 		{ key: "requestRecordings", sizeBytes: 1024, details: { fileCount: 3 } },
 		{ key: "savedRequestRecordings", sizeBytes: 2048, details: { fileCount: 7 } },
-		{ key: "requestDumps", sizeBytes: 3072, details: { fileCount: 11 } },
 	],
 };
 const globals = new Map<string, PropertyDescriptor | undefined>();
@@ -145,7 +144,7 @@ test.each([
 		for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 	});
 	expect(cached).toHaveBeenCalledTimes(1);
-	expect(document.querySelectorAll("[data-storage-category]")).toHaveLength(11);
+	expect(document.querySelectorAll("[data-storage-category]")).toHaveLength(10);
 	const checks = [
 		[
 			"requestRecordings",
@@ -161,7 +160,6 @@ test.each([
 			"2.0 KB",
 			7,
 		],
-		["requestDumps", labels.storageRequestDumps, labels.storageRequestDumpsDesc, "3.0 KB", 11],
 	] as const;
 	for (const [key, label, description, size, count] of checks) {
 		const card = document.querySelector(`[data-storage-category="${key}"]`);

@@ -23,7 +23,6 @@ import {
 	measureTable,
 	type ScanTableRef,
 	scanDatabaseObjectStorage,
-	summarizeApiRequestDumps,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
 import { DisplayPageReadError } from "./display-page-protocol";
@@ -147,7 +146,6 @@ function runStorageScanCleanupSummaries(
 			params.staleNarratorIds,
 			params.relations,
 		).approxBytes,
-		dumps: summarizeApiRequestDumps(sqlite, params.dumpCutoffIso),
 		toolCalls: summarizeToolCallPayloads(sqlite, params.toolCallCutoffIso),
 	};
 }

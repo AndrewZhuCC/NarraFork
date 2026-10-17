@@ -1,7 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import type { RecordingRequest, RequestRecording } from "@shared/request-recording";
 import { setOutboundFetchOverrideForTest } from "../../net/outbound-fetch";
-import { settings } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
 import { GeminiProvider } from "../gemini-provider";
@@ -70,6 +69,7 @@ function recorder() {
 	const meta: Record<string, unknown>[] = [];
 	const recording: RequestRecording = {
 		requestId: "live-recording",
+		pin: () => {},
 		request: (request) => requests.push(request),
 		responseMeta: (value) => meta.push(value),
 		responseChunk: (value) =>
@@ -77,7 +77,7 @@ function recorder() {
 		frame: () => {},
 		finish: () => {},
 	};
-	return { requests, chunks, meta, dump: new ApiRequestDumpCollector(undefined, recording) };
+	return { requests, chunks, meta, dump: new ApiRequestDumpCollector(recording) };
 }
 afterEach(() => {
 	setOutboundFetchOverrideForTest(null);
@@ -90,8 +90,6 @@ for (const scenario of cases) {
 		let sentUrl = "";
 		let pulls = 0;
 		let cancelled = false;
-		const previous = settings.agent.requestDumpMaxSize;
-		settings.agent.requestDumpMaxSize = 4;
 		const clone = spyOn(Response.prototype, "clone").mockImplementation(() => {
 			throw new Error("must not clone responses");
 		});
@@ -124,19 +122,16 @@ for (const scenario of cases) {
 			expect(recorded.requests[0]?.bodyText).toBe(String(sentBody));
 			expect(recorded.requests[0]?.url).toBe(sentUrl);
 			expect(recorded.chunks.join("")).toContain(scenario.chunk);
-			expect(recorded.meta[0]).toMatchObject({ status: 200 });
+			expect(recorded.meta.find((value) => value.status !== undefined)).toMatchObject({
+				status: 200,
+			});
 			const before = pulls;
 			await stream.return(undefined);
 			expect(cancelled).toBe(true);
 			expect(pulls).toBe(before);
 			expect(clone).not.toHaveBeenCalled();
-			expect(recorded.dump.snapshot().response).toMatchObject({
-				bodyBytesKept: 4,
-				bodyTruncated: true,
-				bodyIncomplete: true,
-			});
+			expect(Object.assign({}, ...recorded.meta)).toMatchObject({ bodyIncomplete: true });
 		} finally {
-			settings.agent.requestDumpMaxSize = previous;
 			clone.mockRestore();
 		}
 	});
@@ -160,7 +155,7 @@ test("Anthropic fallback captures both actual URLs and rejected response before 
 	]);
 	expect(recorded.chunks.join("")).toContain("wrong endpoint");
 	expect(recorded.chunks.join("")).toContain(anthropicChunk);
-	expect(recorded.dump.snapshot().attempts?.[0].response?.status).toBe(404);
+	expect(recorded.meta.find((value) => value.status !== undefined)?.status).toBe(404);
 });
 
 test("fetch cancellation preserves actual request and error metadata without a response", async () => {

@@ -835,14 +835,15 @@ export type NarratorServerMessage =
 	| {
 			/**
 			 * Non-persisted diagnostic for leaked XML tool calls. The frontend
-			 * uses it to mark stream-captured tool calls and to prompt downloading the raw SSE
-			 * dump when capture failed. `apiRequestId` points at the persisted api_requests row
-			 * for the leaked-tool-dump download endpoint.
+			 * uses it to mark stream-captured tool calls and to prompt downloading the request
+			 * evidence when capture failed. `recordingRequestId` locates the recording (pinned
+			 * with reason "leak"); `apiRequestId` is the persisted api_requests row.
 			 */
 			type: "leaked_tool_call_notice";
 			narratorId: string;
 			phase: "stream_captured" | "recovered" | "unrecovered";
 			apiRequestId: string;
+			recordingRequestId: string;
 			toolUseIds?: string[];
 			toolNames?: string[];
 			snippet?: string;

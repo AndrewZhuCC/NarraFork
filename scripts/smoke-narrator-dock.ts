@@ -623,54 +623,51 @@ async function main() {
 		// ── Check D4: moving a panel PRESERVES its component state (defaultRenderer
 		// "always"). Type a sentinel into the chat input, swap the chat pane onto
 		// the spec pane, and confirm the sentinel survives — proving the chat
-		// component was NOT remounted (which would clear the textarea). ──
+		// component was NOT remounted (which would clear the composer). ──
 		const sentinel = `keepalive-${Date.now()}`;
-		// Type into the visible composer. The rich editor is a ProseMirror surface;
-		// a plain textarea remains the fallback.
-		const typed = await page.evaluate((text: string) => {
-			const visible = (element: HTMLElement) => {
-				const rect = element.getBoundingClientRect();
-				return rect.width > 40 && rect.height > 10;
-			};
-			const textarea = Array.from(document.querySelectorAll<HTMLTextAreaElement>("textarea")).find(
-				visible,
-			);
-			const prose = Array.from(document.querySelectorAll<HTMLElement>(".ProseMirror")).find(
-				visible,
-			);
-			const target = textarea ?? prose;
-			if (!target) return false;
+		// Type into the chat composer (must be the visible one). The composer is a
+		// rich-text editor (contenteditable), so focus it and insert text through
+		// CDP to drive the editor's own input handling; a plain textarea also works.
+		const composerFound = await page.evaluate(() => {
+			const editors = Array.from(
+				document.querySelectorAll<HTMLElement>("textarea, [contenteditable='true']"),
+			).filter((el) => {
+				const r = el.getBoundingClientRect();
+				return r.width > 40 && r.height > 10;
+			});
+			const editor = editors[0];
+			if (!editor) return false;
+			const rect = editor.getBoundingClientRect();
 			(
 				window as unknown as {
-					__smokeChatMove: { element: HTMLElement; kind: "textarea" | "prosemirror" };
+					__smokeChatMove: { element: HTMLElement; left: number; top: number };
 				}
 			).__smokeChatMove = {
-				element: target,
-				kind: textarea ? "textarea" : "prosemirror",
+				element: editor,
+				left: rect.left,
+				top: rect.top,
 			};
-			if (textarea) {
-				const setter = Object.getOwnPropertyDescriptor(
-					window.HTMLTextAreaElement.prototype,
-					"value",
-				)?.set;
-				setter?.call(textarea, text);
-				textarea.dispatchEvent(new Event("input", { bubbles: true }));
-				return textarea.value === text;
-			}
-			target.focus();
-			const selection = window.getSelection();
-			const range = document.createRange();
-			range.selectNodeContents(target);
-			range.collapse(false);
-			selection?.removeAllRanges();
-			selection?.addRange(range);
-			const inserted = document.execCommand("insertText", false, text);
-			return inserted && (target.textContent ?? "").includes(text);
-		}, sentinel);
+			editor.focus();
+			return true;
+		});
+		let typed = false;
+		if (composerFound) {
+			const cdpType = await page.createCDPSession();
+			await cdpType.send("Input.insertText", { text: sentinel });
+			await cdpType.detach().catch(() => {});
+			typed = await page.evaluate((text: string) => {
+				const editor = (window as unknown as { __smokeChatMove?: { element: HTMLElement } })
+					.__smokeChatMove?.element;
+				if (!editor) return false;
+				const value =
+					editor instanceof HTMLTextAreaElement ? editor.value : (editor.textContent ?? "");
+				return value.includes(text);
+			}, sentinel);
+		}
 		await Bun.sleep(200);
 
 		let statePreserved = false;
-		let stateDetail = "no chat composer / not typed";
+		let stateDetail = composerFound ? "sentinel not typed" : "no chat composer";
 		if (typed) {
 			// Resolve the CHAT header (the draggable panel header whose text is not
 			// "Spec") and its group, plus the spec group as the swap target.
@@ -782,24 +779,21 @@ async function main() {
 				await cdp3.detach().catch(() => {});
 				await Bun.sleep(600);
 				// A no-op drag also keeps the sentinel. Require both a real position change
-				// and the exact original composer instance, not just matching text somewhere.
+				// and the exact original editor instance, not just matching text somewhere.
 				const observation = await page.evaluate(
 					(input) => {
 						const text = input.text;
 						const before = (
 							window as unknown as {
-								__smokeChatMove?: { element: HTMLElement; kind: "textarea" | "prosemirror" };
+								__smokeChatMove?: { element: HTMLElement; left: number; top: number };
 							}
 						).__smokeChatMove;
 						if (!before) return undefined;
-						const current =
-							before.kind === "textarea"
-								? Array.from(document.querySelectorAll<HTMLTextAreaElement>("textarea")).find(
-										(area) => area.value === text,
-									)
-								: Array.from(document.querySelectorAll<HTMLElement>(".ProseMirror")).find((area) =>
-										(area.textContent ?? "").includes(text),
-									);
+						const editorText = (el: HTMLElement) =>
+							el instanceof HTMLTextAreaElement ? el.value : (el.textContent ?? "");
+						const current = Array.from(
+							document.querySelectorAll<HTMLElement>("textarea, [contenteditable='true']"),
+						).find((el) => editorText(el).includes(text));
 						const rect = current?.getBoundingClientRect();
 						const group = rect
 							? Array.from(document.querySelectorAll<HTMLElement>(".dv-groupview")).find(
@@ -818,20 +812,18 @@ async function main() {
 								)
 							: undefined;
 						const bounds = group?.getBoundingClientRect();
-						const content =
-							current instanceof HTMLTextAreaElement ? current.value : (current?.textContent ?? "");
 						return {
 							from: input.from,
 							to: { left: bounds?.left ?? input.from.left, top: bounds?.top ?? input.from.top },
 							target: input.target,
 							sameElement: current === before.element && before.element.isConnected,
-							hasSentinel: content.includes(text),
+							hasSentinel: current ? editorText(current).includes(text) : false,
 						};
 					},
 					{ text: sentinel, from: chatGeom.from, target: chatGeom.target },
 				);
 				statePreserved = !!observation && panelMovePreservesState(observation);
-				stateDetail = `actual move + same textarea + sentinel: ${JSON.stringify(observation)}`;
+				stateDetail = `actual move + same editor + sentinel: ${JSON.stringify(observation)}`;
 			} else {
 				stateDetail = "could not resolve chat/spec geometry";
 			}

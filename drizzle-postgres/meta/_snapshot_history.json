@@ -184,6 +184,22 @@
 			"prevId": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
 			"version": "7",
 			"snapshotDigest": "0f56b1fc448b5bc0a187faa9e0649ca59003698b49141c0b733242eaeed2cc9c"
+		},
+		{
+			"idx": 23,
+			"tag": "0023_drop_legacy_request_dumps",
+			"id": "db796e37-a6d9-48f5-bb09-4d51967795a5",
+			"prevId": "3fc16cee-d009-4621-8ff8-75080ec7d211",
+			"version": "7",
+			"snapshotDigest": "ef0893f081518eef1149eb8707ad3bd60961cb0074ca69b3f5f0795d45ab270d"
+		},
+		{
+			"idx": 24,
+			"tag": "0024_request_evidence_columns",
+			"id": "0c30aad1-a7f6-4d90-871c-7319b389e6e5",
+			"prevId": "db796e37-a6d9-48f5-bb09-4d51967795a5",
+			"version": "7",
+			"snapshotDigest": "f5a511f0aa3f502c75f9e8d5bd322051c8d275fb23a9255322b2df1b47da1443"
 		}
 	]
 }

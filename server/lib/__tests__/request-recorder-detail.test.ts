@@ -18,11 +18,10 @@ let home: string;
 let client: RequestRecorderClient;
 let previousDiskSafety: typeof settings.diskSafety;
 const config: RecordingSettings = {
-	requestDumpRecordingEnabled: true,
-	requestDumpRequestBytes: 1048576,
-	requestDumpResponseBytes: 1048576,
-	requestDumpEnabled: false,
-	requestDumpErrorsOnly: false,
+	ringEnabled: true,
+	ringRequestBytes: 1048576,
+	ringResponseBytes: 1048576,
+	autoPin: "off",
 };
 beforeEach(async () => {
 	home = await mkdtemp(join(tmpdir(), "recording-detail-"));
@@ -74,9 +73,9 @@ async function evict() {
 		type: "configure",
 		settings: {
 			...config,
-			requestDumpRecordingEnabled: false,
-			requestDumpRequestBytes: 0,
-			requestDumpResponseBytes: 0,
+			ringEnabled: false,
+			ringRequestBytes: 0,
+			ringResponseBytes: 0,
 		},
 	});
 }
@@ -392,7 +391,7 @@ describe("真实 worker 精确请求详情与定向保存", () => {
 });
 
 test("已结束但部分/截断的证据也可只读复用，不重复创建保存", async () => {
-	await client.call({ type: "configure", settings: { ...config, requestDumpResponseBytes: 2048 } });
+	await client.call({ type: "configure", settings: { ...config, ringResponseBytes: 2048 } });
 	await begin("ended-partial");
 	await chunk("ended-partial", "request", "request body");
 	await client.call({
