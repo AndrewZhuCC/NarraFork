@@ -18,7 +18,9 @@ import {
 	createEditorUploadSchema,
 	editorRawChunkSchema,
 	editorRawOpenSchema,
+	editorRawSealSchema,
 	editorRecoveryScopeSchema,
+	editorUploadChunkSchema,
 } from "../lib/validators/editor-documents";
 import { RemoteBackend } from "../services/device-remote-backend";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
@@ -440,6 +442,40 @@ export function createEditorDocumentRoutes(
 			),
 		);
 	});
+	routes.put(`${base}/:docId/uploads/:uploadId/chunks/:seq`, async (c) => {
+		if (c.req.header("content-type") !== "application/octet-stream")
+			throw new AppError("Chunk requires octet-stream", 415, "EDITOR_INVALID_MEDIA_TYPE");
+		const numeric = (value: string | undefined) =>
+			value && /^\d+$/.test(value) ? Number(value) : NaN;
+		const parsed = editorUploadChunkSchema.safeParse({
+			seq: numeric(c.req.param("seq")),
+			offset: numeric(c.req.header("x-editor-offset")),
+			bytes: numeric(c.req.header("x-editor-bytes")),
+			digest: c.req.header("x-editor-digest"),
+		});
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		return c.json(
+			await getService().putChunk(
+				editorActor(c),
+				c.req.param("docId"),
+				c.req.param("uploadId"),
+				parsed.data,
+				c.req.raw.body,
+				c.req.raw.signal,
+			),
+		);
+	});
+	routes.post(`${base}/:docId/uploads/:uploadId/seal`, async (c) =>
+		c.json(
+			await getService().sealRaw(
+				editorActor(c),
+				c.req.param("docId"),
+				c.req.param("uploadId"),
+				await readEditorMetadata(c.req.raw, editorRawSealSchema),
+				c.req.raw.signal,
+			),
+		),
+	);
 	routes.post(`${base}/:docId/uploads/:uploadId/commit`, async (c) =>
 		c.json(
 			await getService().commit(

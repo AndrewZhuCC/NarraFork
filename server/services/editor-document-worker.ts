@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, fstatSync, lstatSync, readSync } from "node:fs";
 import { link, lstat, open, opendir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { rejectEditorSymlinks } from "./editor-source-path";
@@ -18,7 +18,11 @@ import {
 	EDITOR_TRANSFER_CHUNK_BYTES,
 	EDITOR_TRANSFER_MAX_BYTES,
 	EDITOR_USER_MAX_OPERATIONS,
+	type EditorBom,
+	type EditorRawEncoding,
+	type EditorRawSeal,
 } from "../../shared/editor-document";
+import { EditorStreamCodec } from "../../shared/editor-stream-codec";
 // The settings-free core: this worker is a fresh thread per job, and loading settings (with the
 // model catalog) only to encode bytes cost ~170 ms per editor operation.
 import {
@@ -45,6 +49,15 @@ export type EditorWorkerRequest =
 	| { action: "disk-state"; sourcePath: string }
 	| { action: "seal"; path: string }
 	| {
+			action: "raw-seal";
+			path: string;
+			/** Borrowed from the admitted parent job; never opened/closed by this worker. */
+			fd?: number;
+			encoding: EditorRawEncoding;
+			bom: EditorBom;
+			expected: EditorRawSeal;
+	  }
+	| {
 			action: "prepare";
 			before: Uint8Array | null;
 			uploadPath: string;
@@ -52,6 +65,7 @@ export type EditorWorkerRequest =
 			baseHash: string | null;
 			encoding: string;
 			digest: string;
+			hashKind?: "raw-sha256";
 			recovery?: {
 				path: string;
 				userId: string;
@@ -282,6 +296,47 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 		}
 		return { kind: "content", bytes: new TextEncoder().encode(text) };
 	}
+	if (request.action === "raw-seal") {
+		if (request.fd === undefined) fail("EDITOR_STAGE_SEAL_FD_REQUIRED");
+		const entry = lstatSync(request.path),
+			stat = fstatSync(request.fd);
+		if (
+			!entry.isFile() ||
+			!stat.isFile() ||
+			stat.nlink !== 1 ||
+			entry.nlink !== 1 ||
+			stat.size > EDITOR_FILE_MAX_BYTES ||
+			stat.size !== request.expected.bytes ||
+			stat.dev !== entry.dev ||
+			stat.ino !== entry.ino
+		)
+			fail("EDITOR_STAGE_SEAL_FAILED");
+		const codec = new EditorStreamCodec(request.encoding),
+			format = createHash("sha256"),
+			buffer = new Uint8Array(EDITOR_TRANSFER_CHUNK_BYTES);
+		let total = 0;
+		for (;;) {
+			// Synchronous ONLY in this dedicated worker: after its exit there can be
+			// no detached async read/fstat still using the parent's borrowed descriptor.
+			const bytesRead = readSync(request.fd, buffer, 0, buffer.length, total);
+			total += bytesRead;
+			const chunk = codec.push(buffer.subarray(0, bytesRead), !bytesRead);
+			format.update(chunk.tags);
+			if (!bytesRead) break;
+		}
+		const metadata = codec.finish();
+		if (
+			metadata.bom !== request.bom ||
+			metadata.baseHash !== request.expected.rawDigest ||
+			metadata.textDigest !== request.expected.textDigest ||
+			metadata.textLength !== request.expected.textLength ||
+			metadata.lineCount - 1 !== request.expected.newlines ||
+			total !== request.expected.bytes ||
+			format.digest("hex") !== request.expected.formatDigest
+		)
+			fail("EDITOR_STAGE_SEAL_FAILED");
+		return { kind: "sealed", bytes: total, digest: metadata.baseHash };
+	}
 	if (request.action === "seal") {
 		const bytes = await boundedRead(request.path, EDITOR_TRANSFER_MAX_BYTES);
 		const digest = createHash("sha256");
@@ -293,52 +348,72 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 		return { kind: "sealed", bytes: bytes.byteLength, digest: digest.digest("hex") };
 	}
 	const previous = request.before === null ? null : decode(request.before, request.encoding).text;
-	const currentHash = previous === null ? null : hash(previous);
+	const currentHash =
+		request.before === null
+			? null
+			: request.hashKind === "raw-sha256"
+				? hash(request.before)
+				: hash(previous ?? "");
 	if (currentHash !== request.baseHash) {
 		return {
 			kind: "conflict",
 			absent: previous === null,
-			metadata: await writeVersion(
-				request.before ?? new Uint8Array(),
-				request.conflictPath,
-				request.encoding,
-			),
+			metadata: {
+				...(await writeVersion(
+					request.before ?? new Uint8Array(),
+					request.conflictPath,
+					request.encoding,
+				)),
+				...(request.hashKind === "raw-sha256"
+					? { baseHash: currentHash ?? hash(new Uint8Array()) }
+					: {}),
+			},
 		};
 	}
-	const uploaded = await boundedRead(request.uploadPath, EDITOR_TRANSFER_MAX_BYTES);
-	if (hash(uploaded) !== request.digest) fail("Sealed upload digest changed");
-	const text = new TextDecoder("utf-8", { fatal: true }).decode(uploaded);
-	if (text.length > EDITOR_DOCUMENT_MAX_CHARS || text.includes("\0"))
-		fail("Upload exceeds text budget or is binary");
-	const ending = eolOf(previous ?? text);
-	const nextText = normalized(text).replaceAll(
-		"\n",
-		ending === "CRLF" ? "\r\n" : ending === "CR" ? "\r" : "\n",
+	const uploaded = await boundedRead(
+		request.uploadPath,
+		request.hashKind === "raw-sha256" ? EDITOR_FILE_MAX_BYTES : EDITOR_TRANSFER_MAX_BYTES,
 	);
-	let nextBytes = encodeFileBytesAs(nextText, request.encoding);
-	const bom =
-		request.encoding === "utf-8"
-			? [0xef, 0xbb, 0xbf]
-			: request.encoding === "utf-16le"
-				? [0xff, 0xfe]
-				: request.encoding === "utf-16be"
-					? [0xfe, 0xff]
-					: null;
-	const before = request.before;
-	if (before && bom?.every((byte, index) => before[index] === byte)) {
-		// Normalized editor snapshots omit the original file's encoding signature.
-		nextBytes = Buffer.concat([before.subarray(0, bom.length), nextBytes]);
+	if (hash(uploaded) !== request.digest) fail("Sealed upload digest changed");
+	let nextBytes: Uint8Array, savedHash: string;
+	if (request.hashKind === "raw-sha256") {
+		nextBytes = uploaded;
+		savedHash = request.digest;
+	} else {
+		const text = new TextDecoder("utf-8", { fatal: true }).decode(uploaded);
+		if (text.length > EDITOR_DOCUMENT_MAX_CHARS || text.includes("\0"))
+			fail("Upload exceeds text budget or is binary");
+		const ending = eolOf(previous ?? text);
+		const nextText = normalized(text).replaceAll(
+			"\n",
+			ending === "CRLF" ? "\r\n" : ending === "CR" ? "\r" : "\n",
+		);
+		nextBytes = encodeFileBytesAs(nextText, request.encoding);
+		const bom =
+			request.encoding === "utf-8"
+				? [0xef, 0xbb, 0xbf]
+				: request.encoding === "utf-16le"
+					? [0xff, 0xfe]
+					: request.encoding === "utf-16be"
+						? [0xfe, 0xff]
+						: null;
+		const before = request.before;
+		if (before && bom?.every((byte, index) => before[index] === byte)) {
+			// Normalized editor snapshots omit the original file's encoding signature.
+			nextBytes = Buffer.concat([before.subarray(0, bom.length), nextBytes]);
+		}
+		if (nextBytes.byteLength > EDITOR_FILE_MAX_BYTES) fail("Final encoded file exceeds 20 MiB");
+		const persisted = decodeFileBytesAs(nextBytes, request.encoding);
+		if (persisted !== nextText)
+			fail("The selected encoding cannot represent all characters losslessly");
+		savedHash = hash(persisted);
 	}
-	if (nextBytes.byteLength > EDITOR_FILE_MAX_BYTES) fail("Final encoded file exceeds 20 MiB");
-	const persisted = decodeFileBytesAs(nextBytes, request.encoding);
-	if (persisted !== nextText)
-		fail("The selected encoding cannot represent all characters losslessly");
-	const savedHash = hash(persisted);
 	if (request.recovery) {
 		const { path, ...recovery } = request.recovery;
 		const metadata = editorOperationMetadataSchema.parse({
 			...recovery,
 			version: 1,
+			...(request.hashKind ? { hashKind: request.hashKind } : {}),
 			hash: savedHash,
 			rawDigest: hash(nextBytes),
 			bytes: nextBytes.byteLength,
@@ -372,6 +447,7 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 					existing.narratorId !== metadata.narratorId ||
 					existing.snapshotRevision !== metadata.snapshotRevision ||
 					existing.hash !== metadata.hash ||
+					existing.hashKind !== metadata.hashKind ||
 					existing.rawDigest !== metadata.rawDigest ||
 					existing.bytes !== metadata.bytes
 				)

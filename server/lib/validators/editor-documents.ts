@@ -4,6 +4,7 @@ import { EDITOR_FILE_MAX_BYTES } from "../../../shared/editor-document";
 export const editorOperationMetadataSchema = z
 	.object({
 		version: z.literal(1),
+		hashKind: z.literal("raw-sha256").optional(),
 		userId: z.string().min(1).max(128),
 		narratorId: z.string().min(1).max(128),
 		operationId: z.string().uuid(),
@@ -13,7 +14,10 @@ export const editorOperationMetadataSchema = z
 		bytes: z.number().int().min(0).max(EDITOR_FILE_MAX_BYTES),
 		createdAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 	})
-	.strict();
+	.strict()
+	.refine((value) => value.hashKind !== "raw-sha256" || value.hash === value.rawDigest, {
+		message: "Raw receipt hash domain mismatch",
+	});
 export type EditorOperationMetadata = z.infer<typeof editorOperationMetadataSchema>;
 
 const path = z
@@ -73,6 +77,46 @@ export const createEditorUploadSchema = z
 			.nullable(),
 		encoding: z.string().min(1).max(64),
 		snapshotRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+		protocol: z.literal("raw-v2").optional(),
+		hashKind: z.literal("raw-sha256").optional(),
+		bom: z.enum(["none", "utf8", "utf16le", "utf16be"]).optional(),
+	})
+	.strict()
+	.refine((input) =>
+		input.protocol === "raw-v2"
+			? input.hashKind === "raw-sha256" && input.bom !== undefined
+			: input.hashKind === undefined && input.bom === undefined,
+	);
+export const editorRawSealSchema = z
+	.object({
+		protocol: z.literal("raw-v2"),
+		hashKind: z.literal("raw-sha256"),
+		bytes: z.number().int().min(0).max(EDITOR_FILE_MAX_BYTES),
+		rawDigest: z.string().regex(/^[a-f0-9]{64}$/),
+		textDigest: z.string().regex(/^[a-f0-9]{64}$/),
+		formatDigest: z.string().regex(/^[a-f0-9]{64}$/),
+		textLength: z
+			.number()
+			.int()
+			.min(0)
+			.max(20 * 1024 * 1024),
+		newlines: z.number().int().min(0).max(1_000_000),
+	})
+	.strict();
+export const editorUploadChunkSchema = z
+	.object({
+		seq: z
+			.number()
+			.int()
+			.min(0)
+			.max(20 * 1024 * 1024),
+		offset: z.number().int().min(0).max(EDITOR_FILE_MAX_BYTES),
+		bytes: z
+			.number()
+			.int()
+			.min(1)
+			.max(256 * 1024),
+		digest: z.string().regex(/^[a-f0-9]{64}$/),
 	})
 	.strict();
 export const commitEditorUploadSchema = z

@@ -8,6 +8,7 @@ import {
 	type CreateEditorDocumentInput,
 	type CreateEditorDraftAnchorInput,
 	type CreateEditorUploadInput,
+	EDITOR_FILE_MAX_BYTES,
 	EDITOR_MAX_OPERATIONS,
 	EDITOR_MAX_SESSIONS,
 	EDITOR_MAX_UPLOADS_PER_SESSION,
@@ -16,6 +17,7 @@ import {
 	EDITOR_TEMP_MAX_BYTES,
 	EDITOR_TRANSFER_CHUNK_BYTES,
 	EDITOR_TRANSFER_MAX_BYTES,
+	EDITOR_UPLOAD_CHUNK_BYTES,
 	EDITOR_UPLOAD_IDLE_MS,
 	EDITOR_USER_MAX_OPERATIONS,
 	EDITOR_USER_MAX_SESSIONS,
@@ -24,7 +26,10 @@ import {
 	type EditorCommitResult,
 	type EditorDocumentDescriptor,
 	type EditorOperationResult,
+	type EditorRawEncoding,
+	type EditorRawSeal,
 	type EditorSaveResult,
+	type EditorUploadChunkInput,
 	type EditorUploadDescriptor,
 } from "../../shared/editor-document";
 import { EDITOR_LOCAL_V1_CAPABILITIES } from "../../shared/editor-provider-contracts";
@@ -143,6 +148,9 @@ interface Version extends SourceVersion {
 	retiring?: boolean;
 }
 interface Upload extends CreateEditorUploadInput, EditorUploadDescriptor {
+	nextSeq?: number;
+	lastChunk?: EditorUploadChunkInput;
+	seal?: EditorRawSeal;
 	path: string;
 	reserved: number;
 	busy: boolean;
@@ -186,6 +194,11 @@ interface Operation {
 }
 export interface EditorDocumentDependencies {
 	root: string;
+	/** Trusted provider injection only. Production supplies no raw writer before Phase 8. */
+	rawWriter?: {
+		execute: EditorDocumentDependencies["execute"];
+		queryOperation: NonNullable<EditorDocumentDependencies["queryOperation"]>;
+	};
 	jobs?: EditorDocumentJobs;
 	/** Version-object unlink boundary, injectable for race/failure tests; never target-file IO. */
 	unlinkVersion?: (path: string) => Promise<void>;
@@ -478,7 +491,7 @@ export class EditorDocumentService {
 	}
 	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
 		const session = await this.owned(actor, docId);
-		if (need === "write" && session.input.protocol === "raw-v2")
+		if (need === "write" && session.input.protocol === "raw-v2" && !this.deps.rawWriter)
 			throw new EditorDocumentError(
 				"EDITOR_RAW_READ_ONLY",
 				"The raw-v2 writer is not available",
@@ -539,7 +552,14 @@ export class EditorDocumentService {
 						path: binding.canonicalPath,
 					},
 					versionHandle: session.raw.handle,
-					capabilities: { ...EDITOR_LOCAL_V1_CAPABILITIES, v1Save: false, rawRead: true },
+					capabilities: {
+						...EDITOR_LOCAL_V1_CAPABILITIES,
+						v1Save: false,
+						rawRead: true,
+						stage: !binding.rawSource,
+						durableApply: !!this.deps.rawWriter && !binding.rawSource,
+						durableQuery: !!this.deps.rawWriter && !binding.rawSource,
+					},
 					...metadata,
 				};
 			}
@@ -916,7 +936,19 @@ export class EditorDocumentService {
 		docId: string,
 		input: CreateEditorUploadInput,
 	): Promise<EditorUploadDescriptor> {
-		const { session } = await this.bound(actor, docId, "write");
+		const { session, binding } =
+			input.protocol === "raw-v2"
+				? await this.stageBound(actor, docId)
+				: await this.bound(actor, docId, "write");
+		if ((session.input.protocol === "raw-v2") !== (input.protocol === "raw-v2"))
+			throw invalid("Upload protocol does not match document");
+		if (
+			input.protocol === "raw-v2" &&
+			(input.hashKind !== "raw-sha256" ||
+				input.bom !== session.raw?.metadata.bom ||
+				binding.rawSource)
+		)
+			throw invalid("Raw stage format mismatch");
 		if (session.uploads.size >= EDITOR_MAX_UPLOADS_PER_SESSION)
 			throw new EditorDocumentError(
 				"EDITOR_QUOTA_EXCEEDED",
@@ -929,21 +961,228 @@ export class EditorDocumentService {
 			)
 		)
 			throw invalid("Document already has an active upload");
-		if (input.encoding !== session.source?.metadata.encoding)
+		if (input.encoding !== (session.raw?.metadata.encoding ?? session.source?.metadata.encoding))
 			throw invalid("Encoding does not match the opened source");
-		this.reserve(session, EDITOR_TRANSFER_MAX_BYTES);
+		const budget = input.protocol === "raw-v2" ? EDITOR_FILE_MAX_BYTES : EDITOR_TRANSFER_MAX_BYTES;
+		this.reserve(session, budget);
 		const upload: Upload = {
 			...input,
 			uploadId: randomUUID(),
 			operationId: randomUUID(),
 			state: "uploading",
 			path: this.path(),
-			reserved: EDITOR_TRANSFER_MAX_BYTES,
+			reserved: budget,
+			nextSeq: input.protocol === "raw-v2" ? 0 : undefined,
+			bytes: input.protocol === "raw-v2" ? 0 : undefined,
 			busy: false,
 			controller: new AbortController(),
 		};
 		session.uploads.set(upload.uploadId, upload);
 		return { uploadId: upload.uploadId, operationId: upload.operationId, state: upload.state };
+	}
+	private async stageBound(actor: EditorActor, docId: string) {
+		const value = await this.bound(actor, docId, "read");
+		if (value.session.input.protocol !== "raw-v2" || value.binding.rawSource)
+			throw invalid("Raw staging is unavailable for this provider");
+		const fresh = await actor.authorize(value.session.input, "write");
+		assertSameEditorBinding(actor, value.session.input, value.binding, fresh);
+		if (value.session.closing || !this.sessions.has(docId)) throw expired();
+		return value;
+	}
+	async putChunk(
+		actor: EditorActor,
+		docId: string,
+		uploadId: string,
+		input: EditorUploadChunkInput,
+		body: ReadableStream<Uint8Array> | null,
+		signal?: AbortSignal,
+	): Promise<EditorUploadDescriptor> {
+		const { session } = await this.stageBound(actor, docId);
+		const upload = this.upload(session, uploadId);
+		if (upload.protocol !== "raw-v2" || upload.busy || upload.state !== "uploading")
+			throw invalid("Raw upload is not receiving");
+		if (
+			!Number.isSafeInteger(input.bytes) ||
+			input.bytes < 1 ||
+			input.bytes > EDITOR_UPLOAD_CHUNK_BYTES ||
+			input.offset + input.bytes > EDITOR_FILE_MAX_BYTES
+		)
+			throw invalid("Raw chunk exceeds budget");
+		const duplicate = upload.lastChunk?.seq === input.seq;
+		if (
+			duplicate
+				? upload.lastChunk?.offset !== input.offset ||
+					upload.lastChunk?.bytes !== input.bytes ||
+					upload.lastChunk?.digest !== input.digest
+				: input.seq !== upload.nextSeq || input.offset !== upload.bytes
+		)
+			throw invalid("Raw chunk order or digest mismatch");
+		upload.busy = true;
+		session.pins++;
+		let wrote = false;
+		const reader = body?.getReader();
+		const cancelled = AbortSignal.any([upload.controller.signal, ...(signal ? [signal] : [])]);
+		try {
+			await this.jobs.withIo(
+				actor.userId,
+				async (deadline) => {
+					const bounded = AbortSignal.any([deadline, AbortSignal.timeout(EDITOR_UPLOAD_IDLE_MS)]);
+					const abort = () => {
+						void reader?.cancel().catch(() => {});
+					};
+					bounded.addEventListener("abort", abort, { once: true });
+					try {
+						bounded.throwIfAborted();
+						const bytes = new Uint8Array(input.bytes);
+						let count = 0;
+						while (reader) {
+							const next = await reader.read();
+							bounded.throwIfAborted();
+							if (next.done) break;
+							if (count + next.value.length > bytes.length)
+								throw invalid("Raw chunk exceeds declared bytes");
+							bytes.set(next.value, count);
+							count += next.value.length;
+						}
+						if (
+							count !== input.bytes ||
+							createHash("sha256").update(bytes).digest("hex") !== input.digest
+						)
+							throw invalid("Raw chunk truncated or digest mismatch");
+						if (!duplicate) {
+							const entry = input.seq > 0 ? await lstat(upload.path) : undefined;
+							if (entry && (!entry.isFile() || entry.nlink !== 1))
+								throw invalid("Raw stage is not private regular storage");
+							const file = await open(
+								upload.path,
+								constants.O_WRONLY |
+									(constants.O_NOFOLLOW ?? 0) |
+									(constants.O_NONBLOCK ?? 0) |
+									(input.seq === 0 ? constants.O_CREAT | constants.O_EXCL : 0),
+								0o600,
+							);
+							try {
+								const stat = await file.stat();
+								if (
+									!stat.isFile() ||
+									stat.nlink !== 1 ||
+									stat.size !== input.offset ||
+									(entry && (entry.dev !== stat.dev || entry.ino !== stat.ino))
+								)
+									throw invalid("Raw stage identity or length changed");
+								let offset = 0;
+								wrote = true;
+								while (offset < bytes.length) {
+									bounded.throwIfAborted();
+									const result = await file.write(
+										bytes,
+										offset,
+										bytes.length - offset,
+										input.offset + offset,
+									);
+									if (!result.bytesWritten) throw invalid("Raw stage made no progress");
+									offset += result.bytesWritten;
+								}
+							} finally {
+								await file.close();
+							}
+						}
+						await this.stageBound(actor, docId);
+						bounded.throwIfAborted();
+						if (!duplicate) {
+							upload.lastChunk = { ...input };
+							upload.bytes = input.offset + input.bytes;
+							upload.nextSeq = input.seq + 1;
+						}
+					} finally {
+						bounded.removeEventListener("abort", abort);
+					}
+				},
+				cancelled,
+			);
+			return {
+				uploadId,
+				state: upload.state,
+				bytes: upload.bytes,
+				operationId: upload.operationId,
+			};
+		} catch (error) {
+			void reader?.cancel().catch(() => {});
+			if (wrote) upload.state = "cancelled";
+			throw error;
+		} finally {
+			reader?.releaseLock();
+			upload.busy = false;
+			if (upload.state === "cancelled") await this.cleanUpload(session, upload);
+			session.pins--;
+			if (session.closing) await this.release(session);
+		}
+	}
+	async sealRaw(
+		actor: EditorActor,
+		docId: string,
+		uploadId: string,
+		input: EditorRawSeal,
+		signal?: AbortSignal,
+	): Promise<EditorUploadDescriptor> {
+		const { session } = await this.stageBound(actor, docId),
+			upload = this.upload(session, uploadId);
+		if (upload.protocol !== "raw-v2" || upload.busy) throw invalid("Raw upload unavailable");
+		if (upload.state === "sealed") {
+			if (JSON.stringify(upload.seal) !== JSON.stringify(input))
+				throw invalid("Raw seal is immutable");
+			return {
+				uploadId,
+				state: "sealed",
+				operationId: upload.operationId,
+				bytes: upload.bytes,
+				digest: upload.digest,
+			};
+		}
+		if (upload.state !== "uploading" || upload.bytes !== input.bytes)
+			throw invalid("Raw upload is incomplete");
+		upload.busy = true;
+		session.pins++;
+		try {
+			if (!input.bytes) {
+				const file = await open(upload.path, "wx", 0o600);
+				await file.close();
+			}
+			const result = await this.jobs.run(
+				actor.userId,
+				{
+					action: "raw-seal",
+					path: upload.path,
+					encoding: upload.encoding as EditorRawEncoding,
+					bom: upload.bom ?? "none",
+					expected: input,
+				},
+				AbortSignal.any([upload.controller.signal, ...(signal ? [signal] : [])]),
+			);
+			await this.stageBound(actor, docId);
+			if (result.kind !== "sealed") throw invalid("Raw seal failed");
+			upload.controller.signal.throwIfAborted();
+			this.reserve(session, input.bytes - upload.reserved);
+			upload.reserved = input.bytes;
+			upload.digest = result.digest;
+			upload.state = "sealed";
+			upload.seal = { ...input };
+			return {
+				uploadId,
+				state: "sealed",
+				operationId: upload.operationId,
+				bytes: input.bytes,
+				digest: result.digest,
+			};
+		} catch (error) {
+			upload.state = "cancelled";
+			throw error;
+		} finally {
+			upload.busy = false;
+			session.pins--;
+			if (upload.state === "cancelled") await this.cleanUpload(session, upload);
+			if (session.closing) await this.release(session);
+		}
 	}
 	private upload(session: Session, id: string): Upload {
 		const upload = session.uploads.get(id);
@@ -960,6 +1199,7 @@ export class EditorDocumentService {
 	): Promise<EditorUploadDescriptor> {
 		const { session } = await this.bound(actor, docId, "write");
 		const upload = this.upload(session, uploadId);
+		if (upload.protocol === "raw-v2") throw invalid("Raw uploads require chunk/seal");
 		if (upload.state !== "uploading" || upload.busy)
 			throw invalid("Upload body is immutable after sealing or while receiving");
 		if (
@@ -1076,7 +1316,11 @@ export class EditorDocumentService {
 		}
 		if (upload.state === "committing")
 			return { status: "committing", operationId: upload.operationId as string };
-		if (upload.state !== "sealed" || !upload.digest)
+		if (
+			upload.state !== "sealed" ||
+			!upload.digest ||
+			(upload.protocol === "raw-v2" && !upload.seal)
+		)
 			throw invalid("Only a sealed upload can be committed");
 		if (session.committing) throw invalid("Document is already committing");
 		if (session.conflict?.readers)
@@ -1155,7 +1399,9 @@ export class EditorDocumentService {
 			}
 			const run = async () =>
 				this.jobs.withIo(actor.userId, async (signal) => {
-					const completed = await this.deps.execute({
+					const completed = await (upload.protocol === "raw-v2"
+						? (this.deps.rawWriter?.execute as EditorDocumentDependencies["execute"])
+						: this.deps.execute)({
 						requestId: operationId,
 						userId: actor.userId,
 						narratorId: actor.narratorId,
@@ -1170,6 +1416,7 @@ export class EditorDocumentService {
 							digest: upload.digest,
 							baseHash: upload.baseHash,
 							encoding: upload.encoding,
+							hashKind: upload.hashKind,
 							snapshotRevision: upload.snapshotRevision,
 						},
 						authorize: async () => {
@@ -1191,6 +1438,7 @@ export class EditorDocumentService {
 								conflictPath,
 								baseHash: upload.baseHash,
 								encoding: upload.encoding,
+								hashKind: upload.hashKind,
 								digest: upload.digest as string,
 								recovery: {
 									path: join(this.deps.root, `ed-${operationId}.json`),
@@ -1248,6 +1496,7 @@ export class EditorDocumentService {
 						},
 					});
 					upload.result = {
+						...(upload.hashKind ? { hashKind: upload.hashKind } : {}),
 						status: "saved",
 						operationId,
 						...completed.result,
@@ -1314,6 +1563,8 @@ export class EditorDocumentService {
 			operation.userId === actor.userId &&
 			operation.narratorId === actor.narratorId
 		) {
+			if (operation.recovery?.hashKind === "raw-sha256" && this.deps.rawWriter)
+				return this.deps.rawWriter.queryOperation(actor, operationId, operation.recovery);
 			if (operation.recovery && this.deps.queryOperation)
 				return this.deps.queryOperation(actor, operationId, operation.recovery);
 			return operation.value;

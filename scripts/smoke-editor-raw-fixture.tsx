@@ -9,6 +9,20 @@ import {
 	type EditorDocumentLease,
 	editorDocumentRegistry,
 } from "../frontend/components/narrator/file-editor/editor-document-registry";
+import {
+	editorDraftStore,
+	editorDraftWriterId,
+} from "../frontend/components/narrator/file-editor/editor-draft-store";
+import {
+	EditorFormatHistory,
+	serializeEditorFormat,
+} from "../frontend/components/narrator/file-editor/editor-format";
+import {
+	type EditorRawSnapshot,
+	editorSaveDiagnostics,
+	encodeEditorRawSnapshot,
+} from "../frontend/components/narrator/file-editor/editor-save-client";
+import { sessionDirty } from "../frontend/components/narrator/file-editor/editor-session-state";
 import { editorCodecDiagnostics } from "../frontend/components/narrator/file-editor/editor-stream-decoder";
 import {
 	captureEditorSnapshot,
@@ -65,8 +79,16 @@ export function state() {
 		models: api.editor.getModels().length,
 		registry: editorDocumentRegistry.diagnostics(),
 		codecs: editorCodecDiagnostics(),
+		save: editorSaveDiagnostics(),
+		dirty: lease ? sessionDirty(lease.copy.session.state) : false,
+		lifetime: lease?.copy.lifetimeId,
+		format:
+			lease?.copy.format && lease.copy.format.count <= 64
+				? [...serializeEditorFormat(lease.copy.format)]
+				: undefined,
 		searchMirrors: getEditorWorkerDiagnostics().pool.slots.filter((slot) => slot.docId).length,
 		views: getEditorViewDiagnostics(),
+		viewReadOnly: api.editor.getEditors().map((view) => view.getRawOptions().readOnly),
 		disposal: [...disposal],
 		languages: [...languages],
 		maxLongTaskMs: Math.max(0, ...longTasks),
@@ -269,8 +291,146 @@ export async function close() {
 	editorDocumentRegistry.shutdown();
 	await new Promise((resolve) => setTimeout(resolve, 0));
 }
+export async function encodeRaw(tinyChunks = false) {
+	if (!lease) throw new Error("No copy");
+	const captured = lease.copy.captureSnapshot() as EditorRawSnapshot;
+	let pending = "",
+		offset = 0;
+	// Deliberately split a REAL immutable Monaco snapshot at every UTF-16 unit.
+	const snapshot: EditorRawSnapshot = tinyChunks
+		? {
+				...captured,
+				read() {
+					if (offset >= pending.length) {
+						pending = captured.read() ?? "";
+						offset = 0;
+					}
+					return pending ? pending[offset++] : null;
+				},
+			}
+		: captured;
+	const spool = await encodeEditorRawSnapshot(snapshot, new AbortController().signal);
+	try {
+		const bytes: number[] = [];
+		if ((spool.seal?.bytes ?? Infinity) <= 1024)
+			for await (const chunk of spool.chunks()) bytes.push(...chunk.data);
+		return {
+			...spool.seal,
+			storage: spool.storage,
+			chunks: spool.chunkCount,
+			data: bytes,
+			state: state(),
+		};
+	} finally {
+		await spool.dispose();
+	}
+}
+export async function saveRaw() {
+	await lease?.copy.session.save();
+	return state();
+}
+export async function verifyRaw() {
+	await lease?.copy.session.verifyEquivalent(new AbortController().signal);
+	return state();
+}
+export async function confirmRaw() {
+	await lease?.copy.session.confirm();
+	return state();
+}
+export async function reconcileRaw() {
+	await lease?.copy.session.reconcile();
+	return state();
+}
+export async function undoAndEncode() {
+	lease?.copy.model?.undo();
+	return encodeRaw();
+}
+export function redo() {
+	lease?.copy.model?.redo();
+	return state();
+}
+export function rawBatch(
+	edits: {
+		range: {
+			startLineNumber: number;
+			startColumn: number;
+			endLineNumber: number;
+			endColumn: number;
+		};
+		text: string;
+	}[],
+) {
+	const model = lease?.copy.model;
+	if (!model) throw new Error("No model");
+	model.pushStackElement();
+	model.pushEditOperations([], edits, () => null);
+	model.pushStackElement();
+	return state();
+}
+export function fragmentedEdits() {
+	const model = lease?.copy.model;
+	if (!model) throw new Error("No model");
+	model.pushStackElement();
+	model.pushEditOperations(
+		[],
+		Array.from({ length: 10_000 }, (_, i) => ({
+			range: { startLineNumber: 1, startColumn: i * 2 + 1, endLineNumber: 1, endColumn: i * 2 + 2 },
+			text: "y",
+		})),
+		() => null,
+	);
+	model.pushStackElement();
+	const snapshot = model.createSnapshot(false);
+	let pieces = 0;
+	while (snapshot.read() !== null) pieces++;
+	return { appliedEdits: 10_000, publicSnapshotReads: pieces, state: state() };
+}
+export function budgetNextEdit() {
+	if (!lease?.copy.format || !lease.copy.model) throw new Error("No format");
+	const copy = lease.copy;
+	(copy as unknown as { formatHistory: EditorFormatHistory }).formatHistory =
+		new EditorFormatHistory(
+			copy.format as NonNullable<typeof copy.format>,
+			copy.model?.getAlternativeVersionId() ?? 1,
+			1,
+			{ bytes: 8 * 1024 * 1024, roots: 1 },
+		);
+}
+export async function checkpointRaw() {
+	const copy = lease?.copy;
+	if (!copy?.draftCheckpoint || !copy.draftScope) throw new Error("No checkpoint");
+	await copy.draftCheckpoint.run(new AbortController().signal);
+	const rows = await editorDraftStore.list(copy.draftScope.recoveryKey);
+	return rows
+		.filter(
+			(row) =>
+				row.writerId === editorDraftWriterId &&
+				row.scope.resourceKey === copy.key &&
+				row.modelLifetime === copy.lifetimeId,
+		)
+		.map((row) => ({
+			revision: row.revision,
+			modelLifetime: row.modelLifetime,
+			format: row.format,
+			encoding: row.encoding,
+			bytes: row.bytes,
+			protocol: row.protocol,
+			operation: row.operation,
+		}));
+}
 Object.assign(window, {
 	rawFixture: {
+		encodeRaw,
+		saveRaw,
+		verifyRaw,
+		confirmRaw,
+		reconcileRaw,
+		undoAndEncode,
+		redo,
+		rawBatch,
+		fragmentedEdits,
+		budgetNextEdit,
+		checkpointRaw,
 		open,
 		state,
 		dualViews,

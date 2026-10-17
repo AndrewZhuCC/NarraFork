@@ -79,7 +79,17 @@ export function EditorDraftRecovery({
 				try {
 					const descriptor = await editorDocumentApi.create(
 						opts.narratorId,
-						{ path: opts.path, deviceId: opts.deviceId, origin: opts.origin() },
+						{
+							path: opts.path,
+							deviceId: opts.deviceId,
+							origin: opts.origin(),
+							...(current?.protocol === "raw-v2"
+								? {
+										protocol: "raw-v2" as const,
+										encodingHint: current.options.encodingHint,
+									}
+								: {}),
+						},
 						controller.signal,
 					);
 					void editorDocumentApi.release(opts.narratorId, descriptor.docId).catch(() => {});
@@ -132,6 +142,11 @@ export function EditorDraftStatus({ copy }: { copy: EditorWorkingCopy }) {
 	const { t } = useTranslation("narrator");
 	return (
 		<>
+			{state.formatProtected && state.formatReady && (
+				<Text size="xs" c="yellow" data-editor-format-protected>
+					{t("fileEditor.formatBudget")}
+				</Text>
+			)}
 			{state.backupIncomplete && (
 				<Text size="xs" c="yellow" data-editor-backup-incomplete>
 					{t("fileEditor.backupIncomplete")}
@@ -166,6 +181,7 @@ function DraftCandidate({
 		[error, setError] = useState(false),
 		[restored, setRestored] = useState(false);
 	const [receipt, setReceipt] = useState<string | null>(null);
+	const [formatUnavailable, setFormatUnavailable] = useState(false);
 	const state = useSyncExternalStore(
 		copy?.subscribe ?? noSubscribe,
 		copy?.getSnapshot ?? noSnapshot,
@@ -176,6 +192,7 @@ function DraftCandidate({
 	const run = async (action: "restore" | "export" | "query") => {
 		if (busy) return;
 		const expectedRevision = copy?.getSnapshot().version?.revision;
+		const expectedLifetime = copy?.lifetimeId;
 		const controller = new AbortController();
 		pending.current = controller;
 		setBusy(true);
@@ -223,7 +240,17 @@ function DraftCandidate({
 				throw new Error("EDITOR_DRAFT_READ_ONLY");
 			const descriptor = await editorDocumentApi.create(
 				options.narratorId,
-				{ path: options.path, deviceId: options.deviceId, origin: options.origin() },
+				{
+					path: options.path,
+					deviceId: options.deviceId,
+					origin: options.origin(),
+					...(copy.protocol === "raw-v2"
+						? {
+								protocol: "raw-v2" as const,
+								encodingHint: copy.options.encodingHint,
+							}
+						: {}),
+				},
 				controller.signal,
 			);
 			void editorDocumentApi.release(options.narratorId, descriptor.docId).catch(() => {});
@@ -232,12 +259,27 @@ function DraftCandidate({
 				descriptor.recoveryKey !== row.scope.recoveryKey
 			)
 				throw new Error("EDITOR_DRAFT_READ_ONLY");
+			const sidecar =
+				row.protocol === "raw-v2"
+					? await editorDraftStore.readFormat(row, scope.recoveryKey, controller.signal)
+					: undefined;
 			await claimDraftForRecovery(row, controller.signal);
+			if (sidecar) {
+				if (copy.protocol !== "raw-v2" || !expectedLifetime)
+					throw new Error("EDITOR_DRAFT_READ_ONLY");
+				await copy.restoreRawDraft(blob, row, sidecar, controller.signal, {
+					revision: expectedRevision,
+					lifetime: expectedLifetime,
+				});
+				setRestored(true);
+				return;
+			}
 			const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
 				await blob.arrayBuffer(),
 			);
 			controller.signal.throwIfAborted();
 			if (
+				copy.lifetimeId !== expectedLifetime ||
 				copy.getSnapshot().version?.revision !== expectedRevision ||
 				text.length !== row.length ||
 				sessionDirty(copy.getSnapshot()) ||
@@ -245,8 +287,12 @@ function DraftCandidate({
 			)
 				throw new Error("EDITOR_DRAFT_CHANGED");
 			setRestored(true);
-		} catch {
-			if (!controller.signal.aborted) setError(true);
+		} catch (error) {
+			if (!controller.signal.aborted) {
+				setError(true);
+				if (error instanceof Error && /EDITOR_(FORMAT|DRAFT_CORRUPT)/.test(error.message))
+					setFormatUnavailable(true);
+			}
 		} finally {
 			release?.();
 			if (bodyOwned) recoveryBodyInUse = false;
@@ -255,6 +301,7 @@ function DraftCandidate({
 	};
 	if (restored) return null;
 	const writable =
+		!formatUnavailable &&
 		!!copy?.model &&
 		!state?.invalidated &&
 		authorizedResource === row.scope.resourceKey &&
@@ -299,7 +346,11 @@ function DraftCandidate({
 					onClick={() => void run("export")}
 					data-editor-draft-export
 				>
-					{t("fileEditor.exportLocalDraft")}
+					{t(
+						row.bodyCodec === "utf8-v1"
+							? "fileEditor.exportLocalDraft"
+							: "fileEditor.exportStoredDraft",
+					)}
 				</Button>
 				{row.operation && (
 					<Button

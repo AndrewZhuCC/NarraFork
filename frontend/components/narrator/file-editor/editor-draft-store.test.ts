@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { IDBObjectStore as FakeObjectStore, IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import {
 	draftEditable,
@@ -58,6 +60,115 @@ const mutate = async (name: string, action: (db: IDBDatabase) => IDBTransaction)
 	});
 	db.close();
 };
+test("uniform raw checkpoint format is constant metadata, not one record per newline", async () => {
+	const body = new TextEncoder().encode("x\r\n".repeat(1000)),
+		tags = new Uint8Array(1000).fill(2),
+		digest = bytesToHex(sha256(body));
+	const row = await store.write(
+		{
+			...input(),
+			length: 2000,
+			protocol: "raw-v2",
+			bodyCodec: "raw-v2",
+			rawDigest: digest,
+			textDigest: bytesToHex(sha256(new TextEncoder().encode("x\n".repeat(1000)))),
+			bom: "none",
+			preferredEol: "CRLF",
+			baseVersion: { hash: digest, hashKind: "raw-sha256" },
+			format: {
+				revision: 1,
+				codec: "eol-uniform-v1",
+				root: { tag: 2, count: 1000, digest: bytesToHex(sha256(tags)) },
+			},
+		},
+		new Blob([body]),
+	);
+	expect(draftEditable(row)).toBe(true);
+	expect(JSON.stringify(row.format).length).toBeLessThan(256);
+	expect(await store.readFormat(row, scope.recoveryKey)).toEqual(tags);
+	await expect(
+		store.readFormat(
+			{
+				...row,
+				format: {
+					revision: 1,
+					codec: "eol-uniform-v1",
+					root: { tag: 1, count: 1000, digest: bytesToHex(sha256(tags)) },
+				},
+			},
+			scope.recoveryKey,
+		),
+	).rejects.toThrow("EDITOR_FORMAT_UNAVAILABLE");
+	expect(draftEditable({ ...row, format: undefined })).toBe(false);
+});
+test("raw checkpoint publishes body and sidecar at one revision, without large format metadata", async () => {
+	const digest = "5".repeat(64),
+		tags = Uint8Array.from({ length: 100_000 }, (_, i) => (i % 3) + 1);
+	const row = await store.write(
+		{
+			...input(),
+			protocol: "raw-v2",
+			bodyCodec: "raw-v2",
+			rawDigest: digest,
+			textDigest: digest,
+			bom: "none",
+			preferredEol: "LF",
+			baseVersion: { hash: digest, hashKind: "raw-sha256" },
+		},
+		new Blob(["hello"]),
+		undefined,
+		tags,
+	);
+	expect(JSON.stringify(row).length).toBeLessThan(2048);
+	expect(await store.readFormat(row, scope.recoveryKey)).toEqual(tags);
+	await store.close();
+	expect(await store.readFormat(row, scope.recoveryKey)).toEqual(tags);
+	await mutate("test-drafts", (db) => {
+		const tx = db.transaction("chunks", "readwrite");
+		tx.objectStore("chunks").delete([row.generation, 1024]);
+		return tx;
+	});
+	await expect(store.readFormat(row, scope.recoveryKey)).rejects.toThrow(
+		"EDITOR_FORMAT_UNAVAILABLE",
+	);
+	expect(await (await store.read(row, scope.recoveryKey)).text()).toBe("hello");
+});
+test("raw sidecar is counted against total quota and an older deletion cannot delete its replacement", async () => {
+	const limited = new EditorDraftStore(
+		() => factory,
+		{ ...EDITOR_DRAFT_LIMITS, bytes: 10 },
+		() => now,
+		"sidecar-quota",
+	);
+	try {
+		const tags = Uint8Array.of(1, 2, 3),
+			first = await limited.write(input(), new Blob(["hello"]), undefined, tags);
+		await expect(
+			limited.write({ ...input("other") }, new Blob(["hi"]), undefined, tags),
+		).rejects.toThrow("EDITOR_DRAFT_LIMIT");
+		await limited.removeSaved(
+			first.writerId,
+			scope.resourceKey,
+			first.revision,
+			first.modelLifetime,
+		);
+		const second = await limited.write(
+			{ ...input(), revision: 2 },
+			new Blob(["new"]),
+			undefined,
+			tags,
+		);
+		await limited.removeSaved(
+			first.writerId,
+			scope.resourceKey,
+			first.revision,
+			first.modelLifetime,
+		);
+		expect(await limited.readFormat(second, scope.recoveryKey)).toEqual(tags);
+	} finally {
+		await limited.close();
+	}
+});
 test("independent database separates metadata from chunks; never reads body during discovery", async () => {
 	const row = await write();
 	expect(await store.list(scope.recoveryKey)).toEqual([row]);

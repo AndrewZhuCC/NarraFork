@@ -194,9 +194,9 @@ test("preflight profile thresholds precede language loader/model construction", 
 test("format root stays uniform until mixed and refuses invalid/count-mismatched data", () => {
 	const format = new EditorFormatBuilder();
 	format.push(Uint8Array.of(2, 2, 2));
-	expect(format.finish(3)).toEqual({ version: 1, kind: "uniform", tag: 2, count: 3 });
+	expect(format.finish(3)).toMatchObject({ kind: "uniform", tag: 2, count: 3 });
 	format.push(Uint8Array.of(1, 3));
-	expect(format.finish(5)).toMatchObject({ kind: "mixed", prefixCount: 3, count: 5 });
+	expect(format.finish(5)).toMatchObject({ kind: "branch", count: 5 });
 	expect(() => format.finish(4)).toThrow("EDITOR_FORMAT_MISMATCH");
 	expect(() => format.push(Uint8Array.of(4))).toThrow("EDITOR_FORMAT_INVALID");
 });

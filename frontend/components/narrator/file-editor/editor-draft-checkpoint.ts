@@ -1,4 +1,5 @@
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
+import type { EditorAttemptSpool } from "./editor-attempt-spool";
 import {
 	type EditorDraftMetadata,
 	type EditorDraftOperation,
@@ -8,6 +9,8 @@ import {
 	editorDraftStore,
 	editorDraftWriterId,
 } from "./editor-draft-store";
+import { serializeEditorFormat } from "./editor-format";
+import { type EditorRawSnapshot, encodeEditorRawSnapshot } from "./editor-save-client";
 import { sessionDirty } from "./editor-session-state";
 import { captureEditorSnapshot, encodeEditorSnapshot } from "./editor-worker-client";
 import type { EditorWorkingCopy } from "./editor-working-copy";
@@ -118,6 +121,7 @@ export class EditorDraftCheckpoint {
 	private discardTask: Promise<boolean> | undefined;
 	private baseHash: string | null;
 	private capturedRevision: number | undefined;
+	private modelLifetime: string | undefined;
 	private hasServerAnchor = false;
 	private lastAnchorId: string | undefined;
 	private failedAnchorId: string | undefined;
@@ -193,6 +197,7 @@ export class EditorDraftCheckpoint {
 		readonly writerId = editorDraftWriterId,
 	) {
 		this.baseHash = copy.getSnapshot().baseHash;
+		this.modelLifetime = copy.lifetimeId;
 	}
 	changed() {
 		if (this.disposed || this.discarding) return;
@@ -200,7 +205,13 @@ export class EditorDraftCheckpoint {
 		if (state.phase === "idle" && !state.invalidated) this.operation = undefined;
 		const busy = state.phase === "encoding";
 		this.scheduler.priority(this, busy);
+		if (this.modelLifetime !== this.copy.lifetimeId) {
+			this.modelLifetime = this.copy.lifetimeId;
+			this.sequence++;
+			this.scheduler.cancel(this);
+		}
 		const signature = JSON.stringify([
+			this.copy.lifetimeId,
 			state.version?.revision,
 			state.phase,
 			state.baseHash,
@@ -270,7 +281,13 @@ export class EditorDraftCheckpoint {
 			if (!signal.aborted) this.copy.setBackupError(true);
 		}
 	}
-	async saved(revision: number) {
+	async saved(revision: number, lifetime = this.copy.lifetimeId) {
+		if (lifetime !== this.copy.lifetimeId) {
+			await this.store
+				.removeSaved(this.writerId, this.scope.resourceKey, revision, lifetime)
+				.catch(() => this.copy.setBackupError(true));
+			return;
+		}
 		this.operation = undefined;
 		if (this.capturedRevision === revision) {
 			this.sequence++;
@@ -304,25 +321,36 @@ export class EditorDraftCheckpoint {
 		if (!state.loaded || !sessionDirty(state) || state.phase === "encoding") return;
 		const sequence = this.sequence;
 		let createdAnchorId: string | undefined;
+		let rawSpool: EditorAttemptSpool | undefined;
 		let previousCoverage = false,
 			publicationEpoch = -1;
 		try {
 			signal.throwIfAborted();
 			// Snapshot and all revision metadata captured synchronously, without a view.
-			const snapshot = captureEditorSnapshot(this.copy.model);
+			const snapshot =
+				this.copy.protocol === "raw-v2"
+					? this.copy.captureSnapshot()
+					: captureEditorSnapshot(this.copy.model);
+			const lifetime = this.copy.lifetimeId;
+			const raw =
+				this.copy.protocol === "raw-v2" ? (snapshot as EditorRawSnapshot).rawFormat : undefined;
 			this.capturedRevision = snapshot.revision;
 			const operation = this.copy.session.draftOperation ?? this.operation;
 			const input = {
 				scope: this.scope,
 				writerId: this.writerId,
-				modelLifetime: this.copy.lifetimeId,
+				modelLifetime: lifetime,
 				revision: snapshot.revision,
 				alternativeVersionId: snapshot.alternativeVersionId,
 				length: snapshot.length,
-				baseVersion: { hash: state.baseHash, hashKind: "v1-decoded-sha256" as const },
-				encoding: state.encoding,
-				protocol: "v1" as const,
-				bodyCodec: "utf8-v1",
+				baseVersion: {
+					hash: state.baseHash,
+					hashKind: raw ? ("raw-sha256" as const) : ("v1-decoded-sha256" as const),
+				},
+				encoding: raw?.encoding ?? state.encoding,
+				protocol: raw ? ("raw-v2" as const) : ("v1" as const),
+				bodyCodec: raw ? "raw-v2" : "utf8-v1",
+				...(raw ? { bom: raw.bom, preferredEol: this.copy.preferredEol } : {}),
 				...(operation || state.phase === "unknown"
 					? {
 							operation: operation ?? {
@@ -336,7 +364,10 @@ export class EditorDraftCheckpoint {
 				models: 0,
 				bytes: snapshot.length * 12,
 			});
-			const blob = await encodeEditorSnapshot(snapshot, signal);
+			if (raw) rawSpool = await encodeEditorRawSnapshot(snapshot as EditorRawSnapshot, signal);
+			const blob = rawSpool ? rawSpool.body() : await encodeEditorSnapshot(snapshot, signal);
+			const sidecar =
+				raw && raw.root.kind !== "uniform" ? serializeEditorFormat(raw.root) : undefined;
 			signal.throwIfAborted();
 			if (sequence !== this.sequence || this.disposed) return;
 			await this.store.ensureAvailable(signal);
@@ -346,7 +377,7 @@ export class EditorDraftCheckpoint {
 					writerId: this.writerId,
 					resourceKey: this.scope.resourceKey,
 					revision: snapshot.revision,
-					modelLifetime: this.copy.lifetimeId,
+					modelLifetime: lifetime,
 					deviceId: this.scope.deviceId,
 					origin: this.scope.origin,
 					...(input.operation
@@ -365,7 +396,8 @@ export class EditorDraftCheckpoint {
 				anchor.resourceKey !== this.scope.resourceKey ||
 				anchor.writerId !== this.writerId ||
 				anchor.revision !== snapshot.revision ||
-				anchor.modelLifetime !== this.copy.lifetimeId
+				anchor.modelLifetime !== lifetime ||
+				this.copy.lifetimeId !== lifetime
 			)
 				throw new Error("EDITOR_DRAFT_ANCHOR_MISMATCH");
 			if (signal.aborted || sequence !== this.sequence || this.disposed || this.discarding) {
@@ -393,10 +425,30 @@ export class EditorDraftCheckpoint {
 			const checkpoint = await this.store.write(
 				{
 					...input,
+					...(rawSpool?.seal
+						? {
+								rawDigest: rawSpool.seal.rawDigest,
+								textDigest: rawSpool.seal.textDigest,
+								...(raw?.root.kind === "uniform"
+									? {
+											format: {
+												revision: snapshot.revision,
+												codec: "eol-uniform-v1",
+												root: {
+													tag: raw.root.tag,
+													count: raw.root.count,
+													digest: rawSpool.seal.formatDigest,
+												},
+											},
+										}
+									: {}),
+							}
+						: {}),
 					anchor: { anchorId: anchor.anchorId, checkpointGeneration: anchor.checkpointGeneration },
 				},
 				blob,
 				signal,
+				sidecar,
 			);
 			// Publication may have completed just before save/discard's CAS. A delayed JS
 			// completion must not resurrect an already released pointer, writer flag or lease.
@@ -430,6 +482,7 @@ export class EditorDraftCheckpoint {
 			}
 			if (!signal.aborted && !this.disposed) this.copy.setBackupError(true);
 		} finally {
+			await rawSpool?.dispose();
 			this.capturedRevision = undefined;
 			this.releaseSnapshot?.();
 			this.releaseSnapshot = undefined;
@@ -457,7 +510,9 @@ export async function queryDraftOperation(row: EditorDraftMetadata, signal: Abor
 	if (
 		receipt.operationId !== row.operation.operationId ||
 		(receipt.status === "saved" &&
-			(!receipt.result || receipt.result.snapshotRevision !== row.operation.snapshotRevision))
+			(!receipt.result ||
+				receipt.result.snapshotRevision !== row.operation.snapshotRevision ||
+				(row.protocol === "raw-v2" && receipt.result.hashKind !== "raw-sha256")))
 	)
 		throw new Error("EDITOR_DRAFT_RECEIPT_MISMATCH");
 	return receipt;

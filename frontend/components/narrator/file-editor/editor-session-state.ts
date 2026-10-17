@@ -14,6 +14,9 @@ import {
 } from "@shared/editor-provider-contracts";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
+import type { EditorAttemptSpool } from "./editor-attempt-spool";
+import type { EditorRawSnapshot } from "./editor-save-client";
+import type { EditorRawSaveFormat } from "./editor-save-codec";
 import {
 	EditorSnapshotReplay,
 	type EditorTextSnapshot,
@@ -22,6 +25,7 @@ import {
 } from "./editor-worker-client";
 
 export interface DocumentVersion {
+	modelLifetime?: string;
 	revision: number;
 	alternativeVersionId: number;
 	length: number;
@@ -33,6 +37,10 @@ export interface EditorSessionState {
 	protocol?: "text-v1" | "raw-v2";
 	hashKind?: "decoded-sha256" | "raw-sha256";
 	paged?: boolean;
+	codecSafe?: boolean;
+	formatReady?: boolean;
+	formatProtected?: boolean;
+	baselineLifetime?: string;
 	loaded: boolean;
 	loading: boolean;
 	invalidated?: boolean;
@@ -65,8 +73,9 @@ export interface EditorSessionState {
 export function sessionDirty(state: EditorSessionState): boolean {
 	return (
 		!!state.version &&
-		state.version.alternativeVersionId !== state.baseline &&
-		state.version.alternativeVersionId !== state.equivalentVersion
+		(state.version.modelLifetime !== state.baselineLifetime ||
+			(state.version.alternativeVersionId !== state.baseline &&
+				state.version.alternativeVersionId !== state.equivalentVersion))
 	);
 }
 export function sessionExitBlocked(state: EditorSessionState): boolean {
@@ -75,11 +84,18 @@ export function sessionExitBlocked(state: EditorSessionState): boolean {
 export function sessionCanSave(state: EditorSessionState): boolean {
 	return (
 		state.loaded &&
-		state.protocol !== "raw-v2" &&
+		(state.protocol !== "raw-v2" ||
+			!!(
+				state.codecSafe &&
+				state.formatReady &&
+				state.capabilities?.stage &&
+				state.capabilities.durableApply &&
+				state.capabilities.durableQuery
+			)) &&
 		!state.invalidated &&
 		// Declared capabilities are authoritative; only an older server that omits
 		// them keeps the legacy v1 save path.
-		state.capabilities?.v1Save !== false &&
+		(state.protocol === "raw-v2" || state.capabilities?.v1Save !== false) &&
 		!state.loading &&
 		state.phase === "idle" &&
 		!state.confirmation &&
@@ -94,6 +110,8 @@ interface Attempt {
 	uploadId?: string;
 	operationId?: string;
 	blob?: Blob;
+	spool?: EditorAttemptSpool;
+	rawFormat?: EditorRawSaveFormat;
 	controller: AbortController;
 }
 export interface EditorSessionOptions {
@@ -111,6 +129,8 @@ export interface EditorSessionOptions {
 	origin: () => "reference" | "legacy";
 	snapshot: () => EditorTextSnapshot;
 	encode: (snapshot: EditorTextSnapshot, signal: AbortSignal) => Promise<Blob>;
+	encodeRaw?: (snapshot: EditorTextSnapshot, signal: AbortSignal) => Promise<EditorAttemptSpool>;
+	rawReady?: () => Pick<EditorSessionState, "codecSafe" | "formatReady" | "formatProtected">;
 	hash?: typeof hashEditorSnapshot;
 	encodedHash?: typeof getEncodedEditorSnapshotHash;
 	applyContent: (text: string, document?: EditorDocumentDescriptor) => DocumentVersion | null;
@@ -120,7 +140,7 @@ export interface EditorSessionOptions {
 		snapshotRevision: number;
 		status: "query-first";
 	}) => Promise<undefined | { draftWriterId?: string; draftModelLifetime?: string }>;
-	onSaved?: (revision: number) => void;
+	onSaved?: (revision: number, modelLifetime?: string) => void;
 	api?: typeof editorDocumentApi;
 	translate?: (key: string, fallback: string) => string;
 	readOnlySource?: (
@@ -155,6 +175,7 @@ export class EditorDocumentSession {
 	private baselineDigest: Promise<string | null> | null = null;
 	private baselineController = new AbortController();
 	private baselineLength = -1;
+	private baselineFormat: EditorRawSaveFormat | undefined;
 	private baselineGeneration = 0;
 	private receiptQuery: Promise<void> | null = null;
 	/**
@@ -197,14 +218,29 @@ export class EditorDocumentSession {
 			if (this.loadController === controller) this.loadController = null;
 		}
 	}
-	private resetBaseline(version: DocumentVersion | null, source?: Blob) {
+	private resetBaseline(
+		version: DocumentVersion | null,
+		source?: Blob,
+		raw?: { format: EditorRawSaveFormat; textDigest: string },
+	) {
+		this.state = { ...this.state, baselineLifetime: version?.modelLifetime };
+		this.baselineFormat = raw?.format;
 		this.baselineController.abort();
 		this.baselineController = new AbortController();
 		this.baselineGeneration++;
 		this.baselineDigest = null;
 		this.baselineLength = version?.length ?? -1;
 		this.baselineSource = null;
-		if (source) {
+		if (raw) this.baselineDigest = Promise.resolve(raw.textDigest);
+		else if (
+			version &&
+			this.document?.protocol === "raw-v2" &&
+			this.options.rawReady?.().formatReady
+		) {
+			const snapshot = this.options.snapshot() as EditorRawSnapshot;
+			this.baselineFormat = snapshot.rawFormat;
+			this.baselineDigest = Promise.resolve(this.document.textDigest);
+		} else if (source) {
 			const digest = (this.options.encodedHash ?? getEncodedEditorSnapshotHash)(source);
 			if (digest) this.baselineDigest = Promise.resolve(digest);
 		} else if (version && this.document?.protocol !== "raw-v2") {
@@ -279,7 +315,19 @@ export class EditorDocumentSession {
 				this.state.version?.revision !== version.revision
 			)
 				return;
-			const candidate = await this.fingerprint(this.options.snapshot(), signal);
+			const snapshot = this.options.snapshot();
+			if (this.state.protocol === "raw-v2") {
+				const format = (snapshot as EditorRawSnapshot).rawFormat;
+				if (
+					!format ||
+					!this.baselineFormat ||
+					format.root !== this.baselineFormat.root ||
+					format.bom !== this.baselineFormat.bom ||
+					format.encoding !== this.baselineFormat.encoding
+				)
+					return;
+			}
+			const candidate = await this.fingerprint(snapshot, signal);
 			if (
 				!signal.aborted &&
 				generation === this.baselineGeneration &&
@@ -360,14 +408,31 @@ export class EditorDocumentSession {
 				}
 			: undefined;
 	}
+	setFormatFailure() {
+		this.update({
+			codecSafe: false,
+			formatReady: false,
+			formatProtected: true,
+			error: this.text(
+				"formatUnavailable",
+				"File format could not be preserved. Keep or export this draft; writing is disabled.",
+			),
+		});
+	}
 	setBackupError(incomplete: boolean) {
 		if (this.state.backupIncomplete === incomplete || this.disposed) return;
 		this.state = { ...this.state, backupIncomplete: incomplete };
 		this.options.onChange(this.state);
 	}
 	/** Explicit user recovery only: the original baseline is retained even if disk changed. */
-	restoreDraft(text: string, baseHash: string | null, encoding: string) {
-		if (this.options.protocol === "raw-v2" || this.state.protocol === "raw-v2") return false;
+	restoreDraft(
+		text: string,
+		baseHash: string | null,
+		encoding: string,
+		installRaw?: () => DocumentVersion,
+	) {
+		if ((this.options.protocol === "raw-v2" || this.state.protocol === "raw-v2") && !installRaw)
+			return false;
 		if (
 			this.disposed ||
 			!this.state.loaded ||
@@ -377,7 +442,7 @@ export class EditorDocumentSession {
 		)
 			return false;
 		const diskChanged = this.state.baseHash !== baseHash;
-		const version = this.options.applyContent(text);
+		const version = installRaw ? installRaw() : this.options.applyContent(text);
 		if (!version) return false;
 		this.resetBaseline(null);
 		this.update({
@@ -388,6 +453,7 @@ export class EditorDocumentSession {
 			encoding,
 			restoredDraft: true,
 			restoredDiskChanged: diskChanged,
+			...this.options.rawReady?.(),
 			confirmation: null,
 			conflict: null,
 		});
@@ -420,6 +486,7 @@ export class EditorDocumentSession {
 		if (confirmationChanged) this.cancel();
 		this.update({
 			version,
+			...this.options.rawReady?.(),
 			...(this.state.version === null && this.state.loaded
 				? { baseline: version.alternativeVersionId }
 				: {}),
@@ -440,6 +507,7 @@ export class EditorDocumentSession {
 		const controller = new AbortController();
 		this.loadController = controller;
 		const revision = this.state.version?.revision;
+		const lifetime = this.state.version?.modelLifetime;
 		const alternative = this.state.version?.alternativeVersionId;
 		if (!background) this.update({ loading: true, error: null });
 		let next: EditorDocumentDescriptor | null = null;
@@ -460,6 +528,7 @@ export class EditorDocumentSession {
 				controller.signal.throwIfAborted();
 				if (this.disposed || this.loadController !== controller) return false;
 				if (
+					lifetime !== this.state.version?.modelLifetime ||
 					revision !== this.state.version?.revision ||
 					alternative !== this.state.version?.alternativeVersionId
 				)
@@ -488,7 +557,12 @@ export class EditorDocumentSession {
 					controller.signal.throwIfAborted();
 					if (this.disposed || this.loadController !== controller) return false;
 					// A background refresh stops as soon as the clean document becomes a draft.
-					if (background && revision !== this.state.version?.revision) throw changedDuringReload();
+					if (
+						background &&
+						(revision !== this.state.version?.revision ||
+							lifetime !== this.state.version?.modelLifetime)
+					)
+						throw changedDuringReload();
 					if (next.protocol === "raw-v2") {
 						if (!this.options.loadRaw) throw new Error("EDITOR_RAW_LOADER_UNAVAILABLE");
 						candidate = await this.options.loadRaw(next, controller.signal);
@@ -520,6 +594,7 @@ export class EditorDocumentSession {
 			controller.signal.throwIfAborted();
 			if (this.disposed || this.loadController !== controller) return false;
 			if (
+				lifetime !== this.state.version?.modelLifetime ||
 				revision !== this.state.version?.revision ||
 				alternative !== this.state.version?.alternativeVersionId
 			)
@@ -543,6 +618,7 @@ export class EditorDocumentSession {
 				protocol: this.document.protocol ?? "text-v1",
 				hashKind: this.document.protocol === "raw-v2" ? "raw-sha256" : "decoded-sha256",
 				paged: !!paged,
+				...this.options.rawReady?.(),
 				version,
 				baseline: version?.alternativeVersionId ?? null,
 				equivalentVersion: null,
@@ -574,7 +650,13 @@ export class EditorDocumentSession {
 	}
 	private settle(result: EditorSaveResult, attempt: Attempt) {
 		if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
-		if (result.snapshotRevision !== attempt.version.revision) {
+		if (
+			result.snapshotRevision !== attempt.version.revision ||
+			(attempt.rawFormat &&
+				(result.hashKind !== "raw-sha256" ||
+					result.hash !== attempt.spool?.seal?.rawDigest ||
+					result.bytes !== attempt.spool?.seal?.bytes))
+		) {
 			this.clearPendingIntent();
 			this.update({
 				phase: "unknown",
@@ -586,8 +668,15 @@ export class EditorDocumentSession {
 			return;
 		}
 		this.attempt = null;
-		this.options.onSaved?.(attempt.version.revision);
-		this.resetBaseline(attempt.version, attempt.blob);
+		this.options.onSaved?.(attempt.version.revision, attempt.version.modelLifetime);
+		this.resetBaseline(
+			attempt.version,
+			attempt.blob,
+			attempt.rawFormat && attempt.spool?.seal
+				? { format: attempt.rawFormat, textDigest: attempt.spool.seal.textDigest }
+				: undefined,
+		);
+		void attempt.spool?.dispose();
 		this.update({
 			baseHash: result.hash,
 			equivalentVersion: null,
@@ -624,10 +713,12 @@ export class EditorDocumentSession {
 		}
 		const attempt: Attempt = {
 			version: {
+				modelLifetime: (snapshot as EditorRawSnapshot).modelLifetime,
 				revision: snapshot.revision,
 				alternativeVersionId: snapshot.alternativeVersionId,
 				length: snapshot.length,
 			},
+			rawFormat: (snapshot as EditorRawSnapshot).rawFormat,
 			baseHash: this.state.baseHash,
 			docId: this.document?.docId ?? "",
 			controller: new AbortController(),
@@ -635,8 +726,13 @@ export class EditorDocumentSession {
 		this.attempt = attempt;
 		this.update({ phase: "encoding", error: null });
 		try {
-			const blob = await this.options.encode(snapshot, attempt.controller.signal);
-			attempt.blob = blob;
+			if (this.state.protocol === "raw-v2") {
+				if (!attempt.rawFormat || !this.options.encodeRaw)
+					throw new Error("EDITOR_FORMAT_UNAVAILABLE");
+				attempt.spool = await this.options.encodeRaw(snapshot, attempt.controller.signal);
+				if (this.attempt === attempt && attempt.spool.storage === "memory")
+					this.setBackupError(true);
+			} else attempt.blob = await this.options.encode(snapshot, attempt.controller.signal);
 			attempt.controller.signal.throwIfAborted();
 			this.update({ phase: "uploading" });
 			if (!this.document) attempt.docId = (await this.recover(attempt.controller.signal)).docId;
@@ -646,7 +742,14 @@ export class EditorDocumentSession {
 					attempt.docId,
 					{
 						baseHash: attempt.baseHash,
-						encoding: this.state.encoding,
+						encoding: attempt.rawFormat?.encoding ?? this.state.encoding,
+						...(attempt.rawFormat
+							? {
+									protocol: "raw-v2" as const,
+									hashKind: "raw-sha256" as const,
+									bom: attempt.rawFormat.bom,
+								}
+							: {}),
 						snapshotRevision: attempt.version.revision,
 					},
 					attempt.controller.signal,
@@ -657,13 +760,21 @@ export class EditorDocumentSession {
 					attempt.uploadId = upload.uploadId;
 					attempt.operationId = upload.operationId;
 					attempt.controller.signal.throwIfAborted();
-					const sealed = await this.api.upload(
-						this.options.narratorId,
-						attempt.docId,
-						upload.uploadId,
-						blob,
-						attempt.controller.signal,
-					);
+					const sealed = attempt.spool
+						? await this.api.uploadRaw(
+								this.options.narratorId,
+								attempt.docId,
+								upload.uploadId,
+								attempt.spool,
+								attempt.controller.signal,
+							)
+						: await this.api.upload(
+								this.options.narratorId,
+								attempt.docId,
+								upload.uploadId,
+								attempt.blob as Blob,
+								attempt.controller.signal,
+							);
 					attempt.operationId = sealed.operationId ?? attempt.operationId;
 					break;
 				} catch (error) {
@@ -677,6 +788,7 @@ export class EditorDocumentSession {
 			attempt.controller.signal.throwIfAborted();
 			await this.commit(attempt);
 		} catch (error) {
+			if (this.attempt !== attempt) void attempt.spool?.dispose();
 			if (this.attempt === attempt && this.authorizationFailed(error)) return;
 			if (this.attempt === attempt && this.state.phase !== "unknown") {
 				this.clearPendingIntent();
@@ -752,6 +864,7 @@ export class EditorDocumentSession {
 				return;
 			}
 			if (data?.code === "STALE_WRITE") {
+				void attempt.spool?.dispose();
 				this.clearPendingIntent();
 				this.attempt = null;
 				this.update({
@@ -831,6 +944,7 @@ export class EditorDocumentSession {
 		const current = () => !this.disposed && this.attempt === attempt && !!this.state.invalidated;
 		const finish = (receipt: EditorRetiredReceipt) => {
 			if (!current()) return;
+			void attempt.spool?.dispose();
 			this.attempt = null;
 			// The old draft, version, baseline, encoding and authorization remain untouched.
 			publish({ receipt, receiptError: null, phase: "idle" });
@@ -858,7 +972,11 @@ export class EditorDocumentSession {
 								(receipt.status === "saved" &&
 									(!receipt.result ||
 										receipt.result.operationId !== attempt.operationId ||
-										receipt.result.snapshotRevision !== attempt.version.revision))
+										receipt.result.snapshotRevision !== attempt.version.revision ||
+										(attempt.rawFormat &&
+											(receipt.result.hashKind !== "raw-sha256" ||
+												receipt.result.hash !== attempt.spool?.seal?.rawDigest ||
+												receipt.result.bytes !== attempt.spool?.seal?.bytes))))
 							)
 								throw new Error(
 									this.text(
@@ -926,6 +1044,7 @@ export class EditorDocumentSession {
 					else if (operation.status === "failed") {
 						this.clearPendingIntent();
 						this.attempt = null;
+						void attempt.spool?.dispose();
 						this.update({ phase: "idle", error: operation.error?.message ?? "Save failed" });
 					} else
 						this.update({
@@ -983,6 +1102,7 @@ export class EditorDocumentSession {
 		const attempt = this.attempt;
 		this.attempt = null;
 		attempt?.controller.abort();
+		void attempt?.spool?.dispose();
 		// A cancelled upload-creation response may hide its newly allocated uploadId.
 		// Release that session rather than leave an unreachable active upload consuming its quota.
 		if (
@@ -1044,6 +1164,12 @@ export class EditorDocumentSession {
 		});
 	}
 	async takeTheirs() {
+		// A v1 UTF-8 conflict preview has no lossless sidecar. Raw UI explicitly offers
+		// Reload instead: authorize and validate a fresh raw candidate, never invent its format.
+		if (this.state.protocol === "raw-v2") {
+			await this.load();
+			return;
+		}
 		const conflict = this.state.conflict;
 		if (!conflict || this.state.loading || this.state.invalidated) return;
 		const revision = this.state.version?.revision;
@@ -1110,6 +1236,7 @@ export class EditorDocumentSession {
 				.cancelUpload(this.options.narratorId, this.attempt.docId, this.attempt.uploadId)
 				.catch(() => {});
 		if (this.document) this.release(this.document.docId);
+		void this.attempt?.spool?.dispose();
 		this.attempt = null;
 		this.document = null;
 	}

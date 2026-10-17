@@ -3,6 +3,29 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { EDITOR_TRANSFER_MAX_BYTES } from "@shared/editor-document";
 import { createEditorLocalId } from "./editor-local-id";
 
+export interface EditorDraftBody {
+	size: number;
+	slice(start: number, end: number): { arrayBuffer(): Promise<ArrayBuffer> };
+}
+export interface EditorDraftFormatIndex {
+	bytes: number;
+	chunks: number;
+	digest: string;
+}
+export const editorDraftFormatIndex = (row: Pick<EditorDraftMetadata, "format">) =>
+	row.format?.codec === "eol-tags-v1" ? (row.format.root as EditorDraftFormatIndex) : undefined;
+function uniformDraftFormat(row: Pick<EditorDraftMetadata, "format">) {
+	if (row.format?.codec !== "eol-uniform-v1") return undefined;
+	const root = row.format.root as { tag: 1 | 2 | 3; count: number; digest: string } | undefined;
+	return root &&
+		[1, 2, 3].includes(root.tag) &&
+		Number.isSafeInteger(root.count) &&
+		root.count >= 0 &&
+		root.count <= 1_000_000 &&
+		/^[a-f0-9]{64}$/.test(root.digest)
+		? root
+		: undefined;
+}
 export const EDITOR_DRAFT_DB = "narrafork-editor-drafts";
 export const EDITOR_DRAFT_LIMITS = {
 	count: 32,
@@ -49,6 +72,7 @@ export interface EditorDraftMetadata {
 	rawDigest?: string;
 	textDigest?: string;
 	bom?: "none" | "utf8" | "utf16le" | "utf16be";
+	preferredEol?: "LF" | "CRLF" | "CR";
 	format?: { revision: number; codec: string; root: unknown };
 	operation?: EditorDraftOperation;
 	digest: string;
@@ -191,6 +215,7 @@ function draftInput(input: EditorDraftInput): EditorDraftInput {
 		...(input.rawDigest !== undefined ? { rawDigest: input.rawDigest } : {}),
 		...(input.textDigest !== undefined ? { textDigest: input.textDigest } : {}),
 		...(input.bom !== undefined ? { bom: input.bom } : {}),
+		...(input.preferredEol !== undefined ? { preferredEol: input.preferredEol } : {}),
 		...(input.format !== undefined ? { format: structuredClone(input.format) } : {}),
 	};
 	if (
@@ -287,15 +312,41 @@ export class EditorDraftStore {
 			(row) => row.updatedAt > this.now() - this.limits.ttlMs || row.activeUntil > this.now(),
 		);
 	}
-	async write(input: EditorDraftInput, body: Blob, signal?: AbortSignal) {
+	async write(
+		input: EditorDraftInput,
+		body: EditorDraftBody,
+		signal?: AbortSignal,
+		sidecar?: Uint8Array,
+	) {
 		try {
-			return await this.writeAtomic(input, body, signal);
+			return await this.writeAtomic(input, body, signal, sidecar);
 		} catch (error) {
 			throw new EditorDraftWriteFailure(error);
 		}
 	}
-	private async writeAtomic(input: EditorDraftInput, body: Blob, signal?: AbortSignal) {
+	private async writeAtomic(
+		input: EditorDraftInput,
+		body: EditorDraftBody,
+		signal?: AbortSignal,
+		sidecar?: Uint8Array,
+	) {
 		signal?.throwIfAborted();
+		if (sidecar) {
+			if (sidecar.length > 1_000_000 || sidecar.some((tag) => tag < 1 || tag > 3))
+				throw new Error("EDITOR_FORMAT_INVALID");
+			input = {
+				...input,
+				format: {
+					revision: input.revision,
+					codec: "eol-tags-v1",
+					root: {
+						bytes: sidecar.length,
+						chunks: Math.ceil(sidecar.length / this.limits.chunkBytes),
+						digest: bytesToHex(sha256(sidecar)),
+					},
+				},
+			};
+		}
 		input = draftInput(input);
 		if (body.size > this.limits.entryBytes) throw new Error("EDITOR_DRAFT_LIMIT");
 		const db = await this.open();
@@ -335,13 +386,17 @@ export class EditorDraftStore {
 				}
 			const ids = new Set([...live, ...active].map((row) => row.id));
 			ids.add(id);
-			const bytes = [...live, ...active].reduce((sum, row) => sum + row.bytes, body.size);
+			const bytes = [...live, ...active].reduce(
+				(sum, row) =>
+					sum + row.bytes + ("format" in row ? (editorDraftFormatIndex(row)?.bytes ?? 0) : 0),
+				body.size + (sidecar?.length ?? 0),
+			);
 			if (ids.size > this.limits.count || bytes > this.limits.bytes)
 				throw new Error("EDITOR_DRAFT_LIMIT");
 			writes.put({
 				id,
 				generation,
-				bytes: body.size,
+				bytes: body.size + (sidecar?.length ?? 0),
 				revision: input.revision,
 				modelLifetime: input.modelLifetime,
 				expires: started + this.limits.writeMs,
@@ -377,6 +432,27 @@ export class EditorDraftStore {
 				tx.objectStore("chunks").put({ generation, seq: chunks++, bytes });
 				await done;
 			}
+			if (sidecar)
+				for (
+					let offset = 0, seq = 1024;
+					offset < sidecar.length;
+					offset += this.limits.chunkBytes, seq++
+				) {
+					signal?.throwIfAborted();
+					const tx = db.transaction(["writes", "chunks"], "readwrite"),
+						settled = completed(tx);
+					const current = await request<PendingWrite | undefined>(tx.objectStore("writes").get(id));
+					if (current?.generation !== generation) {
+						tx.abort();
+						throw new Error("EDITOR_DRAFT_CANCELLED");
+					}
+					tx.objectStore("chunks").put({
+						generation,
+						seq,
+						bytes: sidecar.slice(offset, offset + this.limits.chunkBytes),
+					});
+					await settled;
+				}
 			signal?.throwIfAborted();
 			const row: EditorDraftMetadata = {
 				...input,
@@ -568,6 +644,60 @@ export class EditorDraftStore {
 		signal?.throwIfAborted();
 		return new Blob(parts, { type: "text/plain;charset=utf-8" });
 	}
+	async readFormat(row: EditorDraftMetadata, recoveryKey: string, signal?: AbortSignal) {
+		const uniform = uniformDraftFormat(row);
+		if (
+			uniform &&
+			validDraftMetadata(row) &&
+			row.scope.recoveryKey === recoveryKey &&
+			row.format?.revision === row.revision
+		) {
+			signal?.throwIfAborted();
+			const tags = new Uint8Array(uniform.count).fill(uniform.tag);
+			if (bytesToHex(sha256(tags)) !== uniform.digest) throw new Error("EDITOR_FORMAT_UNAVAILABLE");
+			return tags;
+		}
+		const index = editorDraftFormatIndex(row);
+		if (
+			!validDraftMetadata(row) ||
+			row.scope.recoveryKey !== recoveryKey ||
+			row.format?.codec !== "eol-tags-v1" ||
+			row.format.revision !== row.revision ||
+			!index ||
+			!Number.isSafeInteger(index.bytes) ||
+			index.bytes < 0 ||
+			index.bytes > 1_000_000 ||
+			index.chunks !== Math.ceil(index.bytes / this.limits.chunkBytes)
+		)
+			throw new Error("EDITOR_FORMAT_UNAVAILABLE");
+		const db = await this.open(),
+			bytes = new Uint8Array(index.bytes);
+		let offset = 0;
+		for (let seq = 0; seq < index.chunks; seq++) {
+			signal?.throwIfAborted();
+			const chunk = await request<{ bytes: Uint8Array } | undefined>(
+				db
+					.transaction("chunks")
+					.objectStore("chunks")
+					.get([row.generation, 1024 + seq]),
+			);
+			if (
+				!chunk ||
+				!(chunk.bytes instanceof Uint8Array) ||
+				chunk.bytes.length !== Math.min(this.limits.chunkBytes, bytes.length - offset)
+			)
+				throw new Error("EDITOR_FORMAT_UNAVAILABLE");
+			bytes.set(chunk.bytes, offset);
+			offset += chunk.bytes.length;
+		}
+		if (
+			offset !== bytes.length ||
+			bytesToHex(sha256(bytes)) !== index.digest ||
+			bytes.some((tag) => tag < 1 || tag > 3)
+		)
+			throw new Error("EDITOR_FORMAT_UNAVAILABLE");
+		return bytes;
+	}
 	async close() {
 		const db = await this.database;
 		db?.close();
@@ -578,6 +708,27 @@ export const editorDraftStore = new EditorDraftStore();
 /** Minted in memory once per realm, NEVER inherited from window.open/sessionStorage. */
 export const editorDraftWriterId = createEditorLocalId();
 export function draftEditable(row: EditorDraftMetadata) {
+	if (row.protocol === "raw-v2") {
+		const format = editorDraftFormatIndex(row);
+		return (
+			row.schemaVersion === 1 &&
+			row.bodyCodec === "raw-v2" &&
+			row.baseVersion.hashKind === "raw-sha256" &&
+			!row.operation &&
+			["utf-8", "utf-16le", "utf-16be", "gbk", "gb18030"].includes(row.encoding) &&
+			["none", "utf8", "utf16le", "utf16be"].includes(row.bom ?? "") &&
+			!!row.rawDigest &&
+			row.rawDigest === row.digest &&
+			!!row.textDigest &&
+			row.format?.revision === row.revision &&
+			["LF", "CRLF", "CR"].includes(row.preferredEol ?? "") &&
+			(!!uniformDraftFormat(row) ||
+				(!!format &&
+					Number.isSafeInteger(format.bytes) &&
+					format.bytes >= 0 &&
+					format.bytes <= 1_000_000))
+		);
+	}
 	return (
 		row.schemaVersion === 1 &&
 		row.protocol === "v1" &&

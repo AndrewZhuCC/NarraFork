@@ -39,6 +39,7 @@
         "@xyflow/react": "^12.10.2",
         "archiver": "^7.0.1",
         "broad-infinite-list": "^1.4.1",
+        "buffer": "6.0.3",
         "bun-pty": "0.4.11",
         "chardet": "^2.1.1",
         "croner": "^10.0.1",

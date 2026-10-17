@@ -63,6 +63,8 @@ export interface MonacoEditorProps {
 	onSave?: () => void;
 	onError?: (error: Error) => void;
 	readOnly?: boolean;
+	/** Synchronous content-event guard; React props may not have rendered yet. */
+	isFormatProtected?: () => boolean;
 	forcePlaintext?: boolean;
 	selection?: FileSelection;
 	navigationRequestId?: string;
@@ -136,13 +138,13 @@ export function MonacoEditor(props: MonacoEditorProps) {
 		getEditor: () => runtime.current?.view ?? null,
 		getModel: () => runtime.current?.model ?? null,
 		undo: () => {
-			if (!latest.current.readOnly) {
+			if (!latest.current.readOnly && !latest.current.isFormatProtected?.()) {
 				runtime.current?.view.trigger("toolbar", "undo", null);
 				runtime.current?.view.focus();
 			}
 		},
 		redo: () => {
-			if (!latest.current.readOnly) {
+			if (!latest.current.readOnly && !latest.current.isFormatProtected?.()) {
 				runtime.current?.view.trigger("toolbar", "redo", null);
 				runtime.current?.view.focus();
 			}
@@ -295,8 +297,8 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					lastTheme = darkRef.current;
 					updateTheme(api, host, lastTheme);
 				}
-				if (readOnly !== !!next.readOnly) {
-					readOnly = !!next.readOnly;
+				if (readOnly !== (!!next.readOnly || !!next.isFormatProtected?.())) {
+					readOnly = !!next.readOnly || !!next.isFormatProtected?.();
 					view.updateOptions({ readOnly });
 					emit();
 				}
@@ -398,6 +400,10 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					});
 				}),
 				model.onDidChangeContent((event) => {
+					if (latest.current.isFormatProtected?.()) {
+						readOnly = true;
+						view.updateOptions({ readOnly: true });
+					}
 					if (event.isFlush) {
 						loadRevision++;
 						// Also support explicit reloads performed through the public model handle.

@@ -14,6 +14,7 @@ import {
 	type EditorDraftAnchorDescriptor,
 	type EditorOperationResult,
 	type EditorRawDocumentDescriptor,
+	type EditorRawSeal,
 	type EditorRecoveryScope,
 	type EditorRecoveryScopeInput,
 	type EditorUploadDescriptor,
@@ -149,6 +150,54 @@ async function metadata<T>(
 }
 
 export const editorDocumentApi = {
+	async uploadRaw(
+		narratorId: string,
+		docId: string,
+		uploadId: string,
+		spool: {
+			seal?: EditorRawSeal;
+			chunks(): AsyncIterable<{
+				seq: number;
+				offset: number;
+				digest: string;
+				data: Uint8Array<ArrayBuffer>;
+			}>;
+		},
+		signal: AbortSignal,
+	) {
+		if (!spool.seal) throw new Error("EDITOR_ATTEMPT_INCOMPLETE");
+		for await (const chunk of spool.chunks()) {
+			for (let retry = 0; ; retry++) {
+				try {
+					const response = await checkedFetch(
+						`${uploadPath(narratorId, docId, uploadId)}/chunks/${chunk.seq}`,
+						{
+							method: "PUT",
+							headers: {
+								"Content-Type": "application/octet-stream",
+								"X-Editor-Offset": String(chunk.offset),
+								"X-Editor-Bytes": String(chunk.data.length),
+								"X-Editor-Digest": chunk.digest,
+							},
+							body: chunk.data,
+						},
+						timedSignal(signal),
+					);
+					await readEditorBody(response, EDITOR_METADATA_MAX_BYTES, signal);
+					break;
+				} catch (error) {
+					if (signal.aborted || retry || (error instanceof ApiError && error.status < 500))
+						throw error;
+				}
+			}
+		}
+		return metadata<EditorUploadDescriptor>(
+			`${uploadPath(narratorId, docId, uploadId)}/seal`,
+			"POST",
+			spool.seal,
+			signal,
+		);
+	},
 	recoveryScope(narratorId: string, input: EditorRecoveryScopeInput, signal?: AbortSignal) {
 		const query = new URLSearchParams({
 			deviceId: input.deviceId ?? "local",

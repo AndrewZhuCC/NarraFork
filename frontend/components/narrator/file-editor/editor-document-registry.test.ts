@@ -255,7 +255,7 @@ for (const rapid of [false, true])
 				models.push(target);
 				return {
 					model: target.getModel(),
-					format: { version: 1, kind: "uniform", tag: 1, count: 0 },
+					format: { height: 1, kind: "uniform", tag: 1, count: 0 },
 					batches: 1,
 					maxBatchMs: 0,
 					maxQueuedBytes: 0,

@@ -5,6 +5,9 @@
 	"tokendanceBalanceStale": "余额可能已过期，请刷新",
 	"tokendanceAdminRechargeRequired": "余额不足，请联系管理员充值",
 	"you": "你",
+	"fileEditor.exportStoredDraft": "导出草稿原始字节",
+	"fileEditor.formatUnavailable": "无法保全文件格式。请保留或导出草稿；已禁止写入。",
+	"fileEditor.formatBudget": "格式历史已达上限。当前正文及文件格式已保全；请保存或导出后重新打开。撤销与编辑已禁用。",
 	"errorRequest": {
 		"view": "查看请求详情",
 		"download": "下载 Dump",

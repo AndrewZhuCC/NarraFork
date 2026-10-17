@@ -356,11 +356,21 @@ function FileEditorDocument({
 	const [searchOpen, setSearchOpen] = useState(false);
 	// Server-declared capabilities of the current authorization decide editability.
 	// Only an older server that declares none keeps the original device heuristic.
-	const readOnly =
-		!narratorId ||
-		state.protocol === "raw-v2" ||
-		!!state.invalidated ||
-		(state.capabilities ? !state.capabilities.v1Save : deviceId !== "local");
+	const canWrite =
+		!!narratorId &&
+		!state.invalidated &&
+		(state.protocol === "raw-v2"
+			? !!(
+					state.codecSafe &&
+					state.formatReady &&
+					state.capabilities?.stage &&
+					state.capabilities.durableApply &&
+					state.capabilities.durableQuery
+				)
+			: state.capabilities
+				? state.capabilities.v1Save
+				: deviceId === "local");
+	const readOnly = !canWrite || !!state.formatProtected;
 	const clipboard = useClipboard({ timeout: 1500 });
 	const [downloading, setDownloading] = useState(false);
 	const download = async () => {
@@ -510,8 +520,8 @@ function FileEditorDocument({
 		setHistory(status);
 	}, []);
 	const handleSave = useCallback(() => {
-		if (!readOnly) void session.save();
-	}, [session, readOnly]);
+		if (canWrite) void session.save();
+	}, [session, canWrite]);
 	const openSearch = useCallback(() => {
 		if (modeRef.current !== "split") setMode("raw");
 		setSearchOpen(true);
@@ -1088,7 +1098,7 @@ function FileEditorDocument({
 								<IconRefresh size={14} />
 							</ActionIcon>
 						</Tooltip>
-						{!readOnly && (
+						{canWrite && (
 							<Tooltip label={`${t("fileEditor.save")} (Ctrl/Cmd+S)`} openDelay={200}>
 								<ActionIcon
 									variant={dirty ? "filled" : "subtle"}
@@ -1315,7 +1325,9 @@ function FileEditorDocument({
 								if (window.confirm(t("fileEditor.confirmReload"))) void session.takeTheirs();
 							}}
 						>
-							{t("fileEditor.conflictTakeTheirs")}
+							{t(
+								state.protocol === "raw-v2" ? "fileEditor.reload" : "fileEditor.conflictTakeTheirs",
+							)}
 						</Button>
 					</Group>
 				</Alert>
@@ -1370,6 +1382,7 @@ function FileEditorDocument({
 							onError={(error) => setEditorError(error.message)}
 							selection={selection}
 							navigationRequestId={navigationRequestId}
+							isFormatProtected={() => !!workingCopy.session.state.formatProtected}
 							readOnly={readOnly || state.loading || !!state.invalidated}
 							lineWrapping={lineWrapping}
 							visible={editorActive}

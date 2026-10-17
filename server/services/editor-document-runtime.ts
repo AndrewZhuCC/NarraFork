@@ -152,6 +152,7 @@ export const queryEditorOperation: NonNullable<
 		result: {
 			status: "saved",
 			operationId,
+			...(recovery.hashKind ? { hashKind: recovery.hashKind } : {}),
 			hash: recovery.hash,
 			bytes: recovery.bytes,
 			snapshotRevision: recovery.snapshotRevision,

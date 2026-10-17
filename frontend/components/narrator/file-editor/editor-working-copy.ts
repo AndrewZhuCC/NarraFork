@@ -1,14 +1,30 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type {
 	EditorDocumentDescriptor,
 	EditorRawDocumentDescriptor,
 } from "@shared/editor-document";
+import { EditorStreamCodec } from "@shared/editor-stream-codec";
 import type { editor } from "monaco-editor/editor/editor.api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { EditorDraftCheckpoint } from "./editor-draft-checkpoint";
-import type { EditorDraftScope } from "./editor-draft-store";
-import type { EditorFormat } from "./editor-format";
+import type { EditorDraftMetadata, EditorDraftScope } from "./editor-draft-store";
+import {
+	type EditorFormat,
+	EditorFormatHistory,
+	editorEolTag,
+	restoreEditorFormat,
+	serializeEditorFormat,
+} from "./editor-format";
+import { eolBytes } from "./editor-format-rope";
 import { createEditorLocalId } from "./editor-local-id";
 import { loadEditorRawCandidate } from "./editor-model-loader";
+import {
+	type EditorRawSnapshot,
+	encodeEditorRawSnapshot,
+	inspectEditorRawSnapshot,
+} from "./editor-save-client";
+import type { EditorRawSaveFormat } from "./editor-save-codec";
 import {
 	EditorDocumentSession,
 	type EditorSessionOptions,
@@ -56,7 +72,35 @@ export class EditorWorkingCopy {
 	readonly session: EditorDocumentSession;
 	readonly key: string;
 	readonly protocol: "text-v1" | "raw-v2";
-	readonly lifetimeId = createEditorLocalId();
+	lifetimeId = createEditorLocalId();
+	private formatHistory?: EditorFormatHistory;
+	private rawEncoding?: EditorRawSaveFormat;
+	private rawCodecSafe = false;
+	get formatProtected() {
+		return !!this.formatHistory?.protected;
+	}
+	get preferredEol() {
+		return this.formatHistory?.preferred === 2
+			? ("CRLF" as const)
+			: this.formatHistory?.preferred === 3
+				? ("CR" as const)
+				: ("LF" as const);
+	}
+	captureSnapshot() {
+		if (!this.model) throw new Error("Editor is not ready");
+		const snapshot = captureEditorSnapshot(this.model);
+		return this.protocol === "raw-v2"
+			? Object.freeze({
+					...snapshot,
+					modelLifetime: this.lifetimeId,
+					rawFormat: this.captureFormat(),
+				})
+			: { ...snapshot, modelLifetime: this.lifetimeId };
+	}
+	captureFormat(): EditorRawSaveFormat {
+		if (!this.format || !this.rawEncoding) throw new Error("EDITOR_FORMAT_UNAVAILABLE");
+		return Object.freeze({ ...this.rawEncoding, root: this.format });
+	}
 	readonly recoveryKey?: string;
 	readonly draftScope?: EditorDraftScope;
 	readonly draftCheckpoint?: EditorDraftCheckpoint;
@@ -128,11 +172,7 @@ export class EditorWorkingCopy {
 			// Conservative accounting of UTF-16 text/index, retained baseline and edits.
 			// Monaco/GC overhead is implementation-dependent: this is NOT a heap bound.
 			bytes:
-				(this.format?.kind === "mixed"
-					? this.format.chunks.reduce((bytes, chunk) => bytes + chunk.byteLength, 0)
-					: this.format
-						? 64
-						: 0) +
+				(this.formatHistory?.bytes ?? (this.format ? eolBytes(this.format) : 0)) +
 				this.reserved.bytes +
 				Math.max(
 					this.session.state.loaded ? 0 : this.admissionBytes,
@@ -178,10 +218,14 @@ export class EditorWorkingCopy {
 			...options,
 			protocol: this.protocol,
 			resourceKey: descriptor?.resourceKey,
-			snapshot: () => {
-				if (!this.model) throw new Error("Editor is not ready");
-				return captureEditorSnapshot(this.model);
-			},
+			snapshot: () => this.captureSnapshot(),
+			rawReady: () => ({
+				formatReady: !!this.format && !!this.rawEncoding,
+				codecSafe: this.rawCodecSafe,
+				formatProtected: this.formatProtected,
+			}),
+			encodeRaw: (snapshot, signal) =>
+				encodeEditorRawSnapshot(snapshot as EditorRawSnapshot, signal),
 			encode: encodeEditorSnapshot,
 			api: {
 				...editorDocumentApi,
@@ -230,6 +274,26 @@ export class EditorWorkingCopy {
 					release();
 					throw error;
 				}
+				let codecSafe = true;
+				if (document.encoding === "gbk" || document.encoding === "gb18030") {
+					try {
+						const encoded = await inspectEditorRawSnapshot(
+							{
+								...captureEditorSnapshot(candidate.model),
+								modelLifetime: createEditorLocalId(),
+								rawFormat: {
+									root: candidate.format,
+									encoding: document.encoding,
+									bom: document.bom,
+								},
+							},
+							signal,
+						);
+						codecSafe = encoded.rawDigest === document.baseHash;
+					} catch {
+						codecSafe = false;
+					}
+				}
 				let installed = false;
 				return {
 					install: () => {
@@ -242,7 +306,18 @@ export class EditorWorkingCopy {
 							maxBatchMs: candidate.maxBatchMs,
 							maxQueuedBytes: candidate.maxQueuedBytes,
 						};
+						this.rawEncoding = {
+							root: candidate.format,
+							encoding: document.encoding,
+							bom: document.bom,
+						};
+						this.rawCodecSafe = codecSafe;
 						this.replaceModel(candidate.model);
+						this.formatHistory = new EditorFormatHistory(
+							candidate.format,
+							candidate.model.getAlternativeVersionId(),
+							editorEolTag(document.preferredEol),
+						);
 						installed = true;
 						release();
 						return this.version();
@@ -269,16 +344,11 @@ export class EditorWorkingCopy {
 			onChange: () => this.emit(),
 			beforeDispatch: (operation) =>
 				this.draftCheckpoint?.beforeDispatch(operation) ?? Promise.resolve(undefined),
-			onSaved: (revision) => {
-				void this.draftCheckpoint?.saved(revision);
+			onSaved: (revision, lifetime) => {
+				void this.draftCheckpoint?.saved(revision, lifetime);
 			},
 		});
-		if (
-			descriptor?.resourceKey &&
-			descriptor.recoveryKey &&
-			!options.readOnlySource &&
-			descriptor.protocol !== "raw-v2"
-		) {
+		if (descriptor?.resourceKey && descriptor.recoveryKey && !options.readOnlySource) {
 			this.draftScope = {
 				recoveryKey: descriptor.recoveryKey,
 				resourceKey: descriptor.resourceKey,
@@ -291,11 +361,101 @@ export class EditorWorkingCopy {
 			this.draftCheckpoint = new EditorDraftCheckpoint(this, this.draftScope);
 		}
 	}
+	async restoreRawDraft(
+		blob: Blob,
+		row: EditorDraftMetadata,
+		tags: Uint8Array,
+		signal: AbortSignal,
+		expected: { revision?: number; lifetime: string },
+	) {
+		const document = this.session.currentDocument;
+		if (
+			document?.protocol !== "raw-v2" ||
+			row.protocol !== "raw-v2" ||
+			!["LF", "CRLF", "CR"].includes(row.preferredEol ?? "") ||
+			blob.size > 20 * 1024 * 1024
+		)
+			throw new Error("EDITOR_DRAFT_READ_ONLY");
+		const codec = new EditorStreamCodec(row.encoding as EditorRawDocumentDescriptor["encoding"]),
+			formatHash = sha256.create();
+		const read = async (
+			consume: (bytes: Uint8Array<ArrayBuffer>, eof: boolean) => Promise<void>,
+		) => {
+			for (let offset = 0; offset < blob.size; offset += 64 * 1024) {
+				signal.throwIfAborted();
+				await consume(
+					new Uint8Array(await blob.slice(offset, offset + 64 * 1024).arrayBuffer()),
+					false,
+				);
+			}
+			await consume(new Uint8Array(), true);
+		};
+		await read(async (bytes, eof) => {
+			formatHash.update(codec.push(bytes, eof).tags);
+		});
+		const metadata = codec.finish();
+		if (
+			metadata.baseHash !== row.rawDigest ||
+			metadata.textDigest !== row.textDigest ||
+			metadata.textLength !== row.length ||
+			metadata.bom !== row.bom ||
+			bytesToHex(formatHash.digest()) !== bytesToHex(sha256(tags))
+		)
+			throw new Error("EDITOR_DRAFT_CORRUPT");
+		const root = restoreEditorFormat(tags, metadata.lineCount - 1);
+		const candidate = await loadEditorRawCandidate({
+			document: { ...document, ...metadata },
+			path: this.options.path,
+			signal,
+			read,
+		});
+		let installed = false;
+		try {
+			if (metadata.encoding === "gbk" || metadata.encoding === "gb18030") {
+				const checked = await inspectEditorRawSnapshot(
+					{
+						...captureEditorSnapshot(candidate.model),
+						modelLifetime: createEditorLocalId(),
+						rawFormat: { root, encoding: metadata.encoding, bom: metadata.bom },
+					},
+					signal,
+				);
+				if (checked.rawDigest !== metadata.baseHash) throw new Error("EDITOR_DRAFT_READ_ONLY");
+			}
+			signal.throwIfAborted();
+			if (this.lifetimeId !== expected.lifetime || this.model?.getVersionId() !== expected.revision)
+				throw new Error("EDITOR_DRAFT_CHANGED");
+			if (
+				!this.session.restoreDraft("", row.baseVersion.hash, row.encoding, () => {
+					if (
+						bytesToHex(sha256(serializeEditorFormat(candidate.format))) !== bytesToHex(sha256(tags))
+					)
+						throw new Error("EDITOR_FORMAT_MISMATCH");
+					this.format = root;
+					this.rawEncoding = { root, encoding: metadata.encoding, bom: metadata.bom };
+					this.rawCodecSafe = true;
+					this.replaceModel(candidate.model);
+					this.formatHistory = new EditorFormatHistory(
+						root,
+						candidate.model.getAlternativeVersionId(),
+						editorEolTag(row.preferredEol as "LF" | "CRLF" | "CR"),
+					);
+					installed = true;
+					return this.version();
+				})
+			)
+				throw new Error("EDITOR_DRAFT_CHANGED");
+		} finally {
+			if (!installed) candidate.model.dispose();
+		}
+	}
 	private replaceModel(next: editor.ITextModel | null) {
 		const restore = [...this.beforeApply].map((listener) => listener(next));
 		const old = this.model;
 		this.subscription?.dispose();
 		this.model = next;
+		this.lifetimeId = createEditorLocalId();
+		this.formatHistory = undefined;
 		this.undoBytes = 0;
 		this.watchModel();
 		for (const listener of restore) listener();
@@ -308,6 +468,20 @@ export class EditorWorkingCopy {
 				if (!this.applying) {
 					for (const change of event.changes ?? [])
 						this.undoBytes += (change.rangeLength + change.text.length) * 2 + 64;
+					if (this.formatHistory && this.model) {
+						try {
+							this.format = this.formatHistory.change(
+								event,
+								this.model.getAlternativeVersionId(),
+								this.model.getLineCount() - 1,
+							);
+						} catch {
+							this.rawCodecSafe = false;
+							this.format = undefined;
+							this.formatHistory.protected = true;
+							this.session.setFormatFailure();
+						}
+					}
 					this.session.change(this.version());
 				}
 			}) ?? null;
@@ -315,6 +489,7 @@ export class EditorWorkingCopy {
 	private version() {
 		if (!this.model) throw new Error("Editor is not ready");
 		return {
+			modelLifetime: this.lifetimeId,
 			revision: this.model.getVersionId(),
 			alternativeVersionId: this.model.getAlternativeVersionId(),
 			length: this.model.getValueLength(),

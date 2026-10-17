@@ -5,6 +5,9 @@
 	"tokendanceBalanceStale": "Balance may be outdated; please refresh",
 	"tokendanceAdminRechargeRequired": "Insufficient balance; contact your administrator to recharge",
 	"you": "You",
+	"fileEditor.exportStoredDraft": "Export stored draft bytes",
+	"fileEditor.formatUnavailable": "File format could not be preserved. Keep or export this draft; writing is disabled.",
+	"fileEditor.formatBudget": "Format history reached its limit. Your current text and file format are preserved; save or export before reopening. Undo and editing are disabled.",
 	"errorRequest": {
 		"view": "View request details",
 		"download": "Download Dump",

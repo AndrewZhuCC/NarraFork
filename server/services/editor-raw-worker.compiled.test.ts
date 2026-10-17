@@ -17,6 +17,7 @@ test("compiled binary embeds both reusable raw source workers and codecs outside
 				"--compile",
 				"./server/editor-raw-smoke.fixture.ts",
 				"./server/services/editor-document-stream-worker.ts",
+				"./server/services/editor-document-worker.ts",
 				"--outfile",
 				binary,
 			],
@@ -26,12 +27,14 @@ test("compiled binary embeds both reusable raw source workers and codecs outside
 		});
 		if (build.exitCode)
 			throw new Error(`Compiled worker build failed: ${build.stderr || build.stdout}`);
-		for (const encoding of ["utf-8", "utf-16be", "gbk", "gb18030"] as const) {
+		for (const scenario of ["utf-8", "utf-16be", "gbk", "gb18030", "large"] as const) {
+			const encoding = scenario === "large" ? "utf-8" : scenario;
 			const text =
 				encoding === "gbk"
 					? "compiled raw\r\n中文\r尾\n"
 					: "\ufeffcompiled raw\r\n中文😀\r\ufeff\n";
-			const bytes = iconv.encode(text, encoding);
+			const bytes =
+				scenario === "large" ? Buffer.alloc(20 * 1024 * 1024, 65) : iconv.encode(text, encoding);
 			await writeFile(source, bytes);
 			const run = await safeSpawn({
 				cmd: [binary, source, encoding],
@@ -47,6 +50,8 @@ test("compiled binary embeds both reusable raw source workers and codecs outside
 			expect(result.hashKind).toBe("raw-sha256");
 			expect(result.encoding).toBe(encoding);
 			expect(result.bytes).toBe(bytes.length);
+			expect(result.sealed.bytes).toBe(bytes.length);
+			expect(result.sealed.kind).toBe("sealed");
 			expect(result.counters).toHaveLength(2);
 			expect(result.counters.every((value: { fds: number }) => value.fds === 0)).toBe(true);
 			expect(result.admission.active).toBe(0);

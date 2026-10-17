@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 import { EDITOR_IO_TIMEOUT_MS } from "../../shared/editor-document";
 import { AppError } from "../lib/errors";
@@ -173,7 +175,31 @@ export class EditorDocumentJobs {
 		request: EditorWorkerRequest,
 		signal?: AbortSignal,
 	): Promise<EditorWorkerResult> {
-		return this.withIo(userId, (admitted) => this.worker(request, admitted), signal);
+		return this.withIo(
+			userId,
+			async (admitted) => {
+				if (request.action !== "raw-seal") return this.worker(request, admitted);
+				const entry = await lstat(request.path);
+				if (!entry.isFile() || entry.nlink !== 1)
+					throw new AppError(
+						"Raw stage is not private regular storage",
+						422,
+						"EDITOR_INVALID_CONTENT",
+					);
+				const file = await open(
+					request.path,
+					constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+				);
+				try {
+					// Bun termination does not reliably close worker-owned FileHandles. Keep
+					// ownership here; workerAt joins exit before this close, even on cancellation.
+					return await this.worker({ ...request, fd: file.fd }, admitted);
+				} finally {
+					await file.close();
+				}
+			},
+			signal,
+		);
 	}
 	private async worker(
 		request: EditorWorkerRequest,

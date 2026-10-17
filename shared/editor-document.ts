@@ -87,7 +87,27 @@ export interface CreateEditorUploadInput {
 	baseHash: string | null;
 	encoding: string;
 	snapshotRevision: number;
+	protocol?: "raw-v2";
+	hashKind?: "raw-sha256";
+	bom?: EditorBom;
 }
+export interface EditorRawSeal {
+	protocol: "raw-v2";
+	hashKind: "raw-sha256";
+	bytes: number;
+	rawDigest: string;
+	textDigest: string;
+	formatDigest: string;
+	textLength: number;
+	newlines: number;
+}
+export interface EditorUploadChunkInput {
+	seq: number;
+	offset: number;
+	bytes: number;
+	digest: string;
+}
+export const EDITOR_UPLOAD_CHUNK_BYTES = 256 * 1024;
 
 export type EditorUploadPhase =
 	| "uploading"
@@ -136,6 +156,7 @@ export interface EditorDraftAnchorDescriptor {
 }
 
 export interface EditorSaveResult {
+	hashKind?: "raw-sha256";
 	status: "saved";
 	operationId: string;
 	hash: string;
