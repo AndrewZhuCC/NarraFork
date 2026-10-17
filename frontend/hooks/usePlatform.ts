@@ -1020,11 +1020,7 @@ export function useStorageDatabasePreviewCapability(): { supported: boolean; rea
 	return SUPPORTED;
 }
 
-type StorageDatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+type StorageDatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 type StorageDatabaseCleanupCapability = {
 	supported: boolean;
@@ -1039,7 +1035,6 @@ const STORAGE_DATABASE_CLEANUP_CAPABILITIES: Record<
 > = Object.freeze({
 	archivedSessions: SUPPORTED,
 	staleSessions: SUPPORTED,
-	apiRequestDumps: SUPPORTED,
 	toolCallPayloads: SUPPORTED,
 });
 
