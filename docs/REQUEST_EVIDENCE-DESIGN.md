@@ -116,7 +116,16 @@ provider.chat()
 - 用户下载拿到的始终是同一种 ZIP：`manifest.json` + `chunks/` + `dump.json`（可读视图）。
 - 旧版行的下载也包成同样的 ZIP：`manifest.json`（`source: "legacy"`）+ 原 dump JSON。使用历史的「下载」按钮只有一种产物。
 
-### 4.5 token 修复改为读证据
+### 4.5 header 完整度：给 headers 单独预算
+
+现状：`sanitizeRecordingMetadata`（`request-recorder-sanitize.ts`）对整份 meta 一视同仁地限制为 32 个键、值 1024 字符、合计 8KiB，超出就丢弃尾部键并标 `metadataTruncated`。body 是逐字节录制的，但 header 多的网关（大量 `x-ratelimit-*`、trace 头）会丢失后面的 header，这一点不如旧版 dump（只掩码凭据、不限数量）。录制要取代旧版，这里必须补齐。
+
+- `request` / `response` meta 中的 `headers` 字段单独处理，不计入通用 8KiB meta 预算：最多 256 个，单值 8KiB，合计 64KiB；按原始顺序保留，超出时保留前段并标 `headersTruncated`（与 `metadataTruncated` 区分）。
+- 掩码规则不变（凭据类 header 值替换为 `[REDACTED]`），并与 `sanitizeHeaders` 的名单合并为一份，避免两处漂移。
+- 重复 header（如多个 `set-cookie`、`via`）保留为数组，不再被 `Headers.entries()` 合并时丢失。
+- 预算按次 attempt 计；`/v1` 回退、重连等多次 attempt 各自独立，不互相挤占。
+
+### 4.6 token 修复改为读证据
 
 `analyzeTokenRepairEvidence(row, rawDumpJson)` 改为接收一个证据源接口：
 
@@ -131,7 +140,7 @@ interface UsageEvidenceSource {
 
 recording 实现由 evidence worker 读固定区段文件流式解析（已在 worker 内，不碰主线程）；legacy 实现就是现有逻辑。注意：只有**被固定**的证据对修复可用，循环区的可能随时淘汰——修复任务遇到 `ring` 状态可以先 pin(`request`) 再读，或直接判 `insufficient`（待定 Q4）。
 
-### 4.6 UI：一个证据面板，三个入口
+### 4.7 UI：一个证据面板，三个入口
 
 新增 `RequestEvidencePanel` + `useRequestEvidence(narratorId, recordingRequestId | apiRequestId)`，由现在的 `useErrorRequestDump` 演化：
 
@@ -139,7 +148,7 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 - **报错卡片**：复用同一面板（现在的 ErrorRequestModal）。
 - **SaveDumpModal（`/save_dump` 列表）**：每份固定保存列出包含的请求，可跳转到对应使用历史行。
 
-### 4.7 设置：一节「请求证据」
+### 4.8 设置：一节「请求证据」
 
 | 新设置 | 取代 | 迁移规则 |
 | --- | --- | --- |
@@ -150,7 +159,7 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 
 旧键在 `settings/index.ts` 的加载迁移中改写一次（与现有 `LEGACY_REQUEST_DUMP_MAX_SIZE` 改写同一处），API 读写在一个版本内同时接受旧键。是否改键名见待定 Q5。
 
-### 4.8 存储统计
+### 4.9 存储统计
 
 合并为一个分类 `requestEvidence`，下分三行：循环区、固定区、旧版（`request-dumps/` + `malformed-request-dumps/` + `raw_dump_json` 估算）。旧版行提供「清理旧版 dump」按钮，走现有 database-cleanup 后台任务。
 
@@ -158,7 +167,7 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 
 每一阶段都可单独合并，且不破坏现状。
 
-1. **P1 打通索引（纯增量）**：`recording_request_id` 列 + recorder `status` 操作 + 使用历史抽屉显示证据状态与「固定并下载」。用户立刻能在使用历史里拿到循环录制。
+1. **P1 打通索引（纯增量）**：`recording_request_id` 列 + recorder `status` 操作 + 使用历史抽屉显示证据状态与「固定并下载」；headers 单独预算（4.5）。用户立刻能在使用历史里拿到循环录制。
 2. **P2 收敛固定路径**：`leak`/`malformed` 改为 pin；`requestDumpEnabled` 不再写旧版 JSON（停止双写）；`raw_dump_json` 只写 diagnostics；列表字段拆分。ZIP 内增加派生 `dump.json`。
 3. **P3 消费方迁移**：token 修复双源；设置合并与迁移；存储分类合并；`REQUEST_DUMPS.md` 改写。
 4. **P4 下线旧写入代码**：删除溢写写入、畸形 dump 写入、collector 快照物化；旧版只读路径保留到后续版本再评估移除。
