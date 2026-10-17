@@ -631,8 +631,20 @@ async function editorDiskStateAcceptance(
 	expect((await pane("file-2")).text).toBe(external);
 	expect((await state()).disk.reloads).toBe(reloadsBeforeRevoke);
 
+	// Revocation is terminal for the old authority, even when an ACL is later restored.
+	// Explicit reopen obtains a new verified copy; no background poll thaws history.
+	expect((await pane("file-2")).readOnly).toBe(true);
+	const revokedLifetime = (await pane("file-2")).lifetime;
 	// 7. Slow save A, type B, mash Ctrl+S: exactly A then B, B based on A's receipt.
 	await writeFile(cleanFile, external);
+	await page.evaluate(() => window.__editorCache.reopen("file-2"));
+	await wait(() =>
+		window.__editorCache
+			.snapshot()
+			.panes.some((pane) => pane.id === "file-2" && pane.firstLine === "EXTERNAL BASH WRITE"),
+	);
+	expect((await pane("file-2")).lifetime).not.toBe(revokedLifetime);
+	expect((await pane("file-2")).readOnly).toBe(false);
 	await page.evaluate(() => window.dispatchEvent(new Event("focus")));
 	await page.waitForFunction(() => window.__editorCache.paneState("file-2").hint === null, {
 		timeout: 10_000,

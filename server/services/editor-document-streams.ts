@@ -36,6 +36,13 @@ type WorkerSlot = {
 // JSON/base64 and worker decoding coexist during remote preflight. Smaller RPC
 // credit includes those copies in the same 256KiB application window.
 const REMOTE_RAW_CHUNK_BYTES = 16 * 1024;
+// Body publication alone may assemble two sequential peer frames inside the
+// caller's existing credit. No larger JSON RPC, preflight batch or read-ahead.
+// Conservative live Host copies: 5 * (base64(16KiB) + 8KiB envelope) for wire +
+// full UTF16 JSON + parsed UTF16 base64; 2 * 16KiB decode copies; 2 * 32KiB for
+// assembly + HTTP body = 248,504 bytes < the unchanged 256KiB stream window.
+// The browser's existing requested-byte/text/format credit is unchanged.
+const REMOTE_BODY_PUBLISH_BYTES = 2 * REMOTE_RAW_CHUNK_BYTES;
 const streamError = (message: string, status = 409) => new AppError(message, status, message);
 function remoteChunkBytes(chunk: EditorRawReadChunk, maxBytes: number) {
 	if (
@@ -482,19 +489,38 @@ export class EditorDocumentStreams {
 			read.permit.signal.throwIfAborted();
 			let result: { bytes?: Uint8Array; eof?: boolean };
 			if (read.remote && read.remoteOpen) {
-				const chunk = await read.remote.chunk(
-					{
-						readId: read.remoteOpen.readId,
-						offset,
-						maxBytes: Math.min(maxBytes, REMOTE_RAW_CHUNK_BYTES),
-						timeoutMs: 10_000,
-					},
-					read.permit.signal,
-				);
-				const bytes = remoteChunkBytes(chunk, Math.min(maxBytes, REMOTE_RAW_CHUNK_BYTES));
-				if (chunk.offset !== offset || chunk.sourceGeneration !== read.remoteOpen.sourceGeneration)
-					throw streamError("EDITOR_SOURCE_CHANGED");
-				result = { bytes, eof: chunk.eof };
+				const bytes = new Uint8Array(Math.min(maxBytes, REMOTE_BODY_PUBLISH_BYTES));
+				let used = 0,
+					eof = false;
+				for (let frame = 0; frame < 2 && used < bytes.length; frame++) {
+					read.permit.signal.throwIfAborted();
+					if (closedRead(this.reads, read)) throw streamError("EDITOR_STREAM_CLOSED");
+					const credit = Math.min(bytes.length - used, REMOTE_RAW_CHUNK_BYTES);
+					const chunk = await read.remote.chunk(
+						{
+							readId: read.remoteOpen.readId,
+							offset: offset + used,
+							maxBytes: credit,
+							timeoutMs: 10_000,
+						},
+						read.permit.signal,
+					);
+					read.permit.signal.throwIfAborted();
+					if (closedRead(this.reads, read)) throw streamError("EDITOR_STREAM_CLOSED");
+					const part = remoteChunkBytes(chunk, credit);
+					if (
+						chunk.offset !== offset + used ||
+						chunk.sourceGeneration !== read.remoteOpen.sourceGeneration
+					)
+						throw streamError("EDITOR_SOURCE_CHANGED");
+					bytes.set(part, used);
+					used += part.length;
+					eof = chunk.eof;
+					if (eof) break;
+				}
+				// A second-frame failure reaches the existing close-on-error path without
+				// publishing the first frame or advancing the reusable stream offset.
+				result = { bytes: bytes.subarray(0, used), eof };
 			} else
 				result = await this.workers.run(read.worker, {
 					action: "read",

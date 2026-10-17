@@ -160,6 +160,7 @@ function renderViews(secondary = true) {
 				<div style={{ display: "flex", height: "100%" }}>
 					<div key="primary" style={{ width: "50%", height: "100%" }}>
 						<FilePane
+							rawProtocol={false}
 							key={documentGeneration}
 							filePath={config.path}
 							narratorId={config.narratorId}
@@ -173,6 +174,7 @@ function renderViews(secondary = true) {
 					{secondary && (
 						<div key="secondary" style={{ width: "50%", height: "100%" }}>
 							<FilePane
+								rawProtocol={false}
 								filePath={config.path}
 								narratorId={config.narratorId}
 								deviceId={config.deviceId}

@@ -24,9 +24,10 @@ interface EditorDocumentInput {
 	deviceId?: string;
 	origin: "reference" | "legacy";
 }
-/** Opt-in only until the lossless writer is available. Omission preserves v1 semantics. */
+/** Explicit protocol negotiation: omission still preserves old clients' v1 semantics. */
 export type CreateEditorDocumentInput = EditorDocumentInput &
 	({ protocol?: "text-v1" } | { protocol: "raw-v2"; encodingHint?: EditorRawEncoding });
+export type EditorReadMode = "raw-v2" | "text-v1" | "bounded-preview";
 export type EditorRawEncoding = "utf-8" | "utf-16le" | "utf-16be" | "gbk" | "gb18030";
 export type EditorBom = "none" | "utf8" | "utf16le" | "utf16be";
 export interface EditorRawMetadata {
@@ -65,6 +66,8 @@ export interface EditorV1DocumentDescriptor {
 	docId: string;
 	/** Opaque, server-authorized identity; absent on older v1 servers (no sharing). */
 	resourceKey?: string;
+	/** Same verified permission/root scope across runtime-only reconnects. Never a capability. */
+	stableResourceKey?: string;
 	/** Opaque verified principal/narrator/device/origin scope; discovery only, never model sharing. */
 	recoveryKey?: string;
 	target: FileTarget;

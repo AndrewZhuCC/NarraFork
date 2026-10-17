@@ -15,6 +15,7 @@ import {
 	type EditorOperationResult,
 	type EditorRawDocumentDescriptor,
 	type EditorRawSeal,
+	type EditorReadMode,
 	type EditorRecoveryScope,
 	type EditorRecoveryScopeInput,
 	type EditorUploadDescriptor,
@@ -350,8 +351,47 @@ export const editorDocumentApi = {
 			await metadata(`${path}/${encodeURIComponent(readId)}`, "DELETE").catch(() => {});
 		}
 	},
-	create(narratorId: string, input: CreateEditorDocumentInput, signal?: AbortSignal) {
-		return metadata<EditorDocumentDescriptor>(base(narratorId), "POST", input, signal);
+	async readMode(
+		narratorId: string,
+		input: Pick<CreateEditorDocumentInput, "path" | "deviceId" | "origin">,
+		signal?: AbortSignal,
+	): Promise<EditorReadMode> {
+		const legacy = input.deviceId && input.deviceId !== "local" ? "bounded-preview" : "text-v1";
+		const query = new URLSearchParams({
+			path: input.path,
+			deviceId: input.deviceId ?? "local",
+			origin: input.origin,
+		});
+		let result: { protocols: string[]; readMode?: EditorReadMode };
+		try {
+			result = await metadata(
+				`${base(narratorId)}/capabilities?${query}`,
+				"GET",
+				undefined,
+				signal,
+			);
+		} catch (error) {
+			if (!(error instanceof ApiError) || error.status !== 404) throw error;
+			return legacy;
+		}
+		if (["raw-v2", "text-v1", "bounded-preview"].includes(result.readMode ?? ""))
+			return result.readMode as EditorReadMode;
+		// An older Host's protocol list is not proof of this target's raw capability.
+		if (Array.isArray(result.protocols) && result.protocols.includes("text-v1")) return legacy;
+		throw new Error("Editor protocol negotiation unavailable");
+	},
+	async create(narratorId: string, input: CreateEditorDocumentInput, signal?: AbortSignal) {
+		const document = await metadata<EditorDocumentDescriptor>(
+			base(narratorId),
+			"POST",
+			input,
+			signal,
+		);
+		if (input.protocol === "raw-v2" && document.protocol !== "raw-v2") {
+			await metadata(`${documentPath(narratorId, document.docId)}`, "DELETE").catch(() => {});
+			throw new Error("Raw editor protocol unavailable; refresh file capabilities");
+		}
+		return document;
 	},
 	diskState(narratorId: string, docId: string, signal?: AbortSignal) {
 		return metadata<EditorDiskState>(

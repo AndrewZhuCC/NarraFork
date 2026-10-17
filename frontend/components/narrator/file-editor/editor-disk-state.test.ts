@@ -98,6 +98,7 @@ async function copyWith(
 		revision++;
 		return { revision, alternativeVersionId: revision, length: next.length };
 	});
+	const listeners = new Set<() => void>();
 	const session = new EditorDocumentSession({
 		narratorId: "narrator",
 		path: "/w/a.txt",
@@ -109,11 +110,17 @@ async function copyWith(
 		},
 		encode: async () => new Blob([text]),
 		applyContent,
-		onChange: () => {},
+		onChange: () => {
+			for (const listener of listeners) listener();
+		},
 	});
 	await session.load();
 	const copy = {
 		session,
+		subscribe: (listener: () => void) => {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
 		options: { narratorId: "narrator", deviceId: "local" },
 	} as unknown as EditorWorkingCopy;
 	const edit = () => {
@@ -135,6 +142,95 @@ async function copyWith(
 		},
 	};
 }
+
+test("twenty visible resources use one shared fallback timer and release it with the last view", async () => {
+	const registry = new EditorDiskStateRegistry(),
+		probe = mock(async () => disk("base-a"));
+	spyOn(editorDocumentApi, "diskState").mockImplementation(probe);
+	const owned = [];
+	for (let index = 0; index < 20; index++) {
+		const { copy } = await copyWith(probe, `doc-${index}`);
+		owned.push(track(registry.attach(copy, true)));
+	}
+	await flush();
+	expect(registry.resources()).toMatchObject({ copies: 20, timers: 1 });
+	for (const view of owned) view.detach();
+	await flush();
+	expect(registry.resources()).toEqual({
+		copies: 0,
+		running: 0,
+		pending: 0,
+		timers: 0,
+		subscriptions: 0,
+	});
+});
+
+test("unknown wake-up queries once before disk reads and never creates another attempt", async () => {
+	const registry = new EditorDiskStateRegistry(),
+		probe = mock(async () => disk("base-a"));
+	spyOn(editorDocumentApi, "diskState").mockImplementation(probe);
+	const value = await copyWith(probe);
+	value.session.state = { ...value.session.state, phase: "unknown" };
+	const query = spyOn(value.session, "reconcile").mockResolvedValue(undefined);
+	track(registry.attach(value.copy, true));
+	track(registry.attach(value.copy, true));
+	await flush();
+	expect(query).toHaveBeenCalledTimes(1);
+	expect(probe).not.toHaveBeenCalled();
+	expect(value.api.create).toHaveBeenCalledTimes(1);
+	expect(value.session.state.phase).toBe("unknown");
+});
+
+test.each([
+	"saving",
+	"hidden",
+] as const)("late identity failure after %s cannot freeze the current working copy", async (mutation) => {
+	let reject!: (error: unknown) => void;
+	const pending = new Promise<EditorDiskState>((_resolve, no) => {
+		reject = no;
+	});
+	const probe = mock(() => pending),
+		registry = new EditorDiskStateRegistry();
+	spyOn(editorDocumentApi, "diskState").mockImplementation(probe);
+	const { copy, session } = await copyWith(probe);
+	const view = track(registry.attach(copy, true));
+	if (mutation === "hidden") view.setVisible(false);
+	else session.state = { ...session.state, phase: "committing" };
+	reject(new ApiError("old runtime", 403, { code: "EDITOR_IDENTITY_CHANGED" }));
+	await flush();
+	expect(session.state.invalidated).not.toBe(true);
+});
+
+test("revocation clears queued probes and the shared timer while preserving the visible draft", async () => {
+	const pending = deferred<EditorDiskState>(),
+		registry = new EditorDiskStateRegistry();
+	const probe = mock(() => pending.promise);
+	spyOn(editorDocumentApi, "diskState").mockImplementation(probe);
+	const { copy, session, edit } = await copyWith(probe);
+	edit();
+	const before = session.state.version;
+	track(registry.attach(copy, true));
+	session.invalidateAuthorization();
+	expect(registry.resources()).toMatchObject({ timers: 0, pending: 0, subscriptions: 0 });
+	pending.resolve(disk("late"));
+	await flush();
+	expect(session.state.invalidated).toBe(true);
+	expect(session.state.version).toBe(before);
+	expect(session.state.baseHash).toBe("base-a");
+});
+
+test("a cold remote copy attaches before load publishes its negotiated capabilities", async () => {
+	const registry = new EditorDiskStateRegistry(),
+		probe = mock(async () => disk("base-a"));
+	spyOn(editorDocumentApi, "diskState").mockImplementation(probe);
+	const { copy, session } = await copyWith(probe);
+	copy.options.deviceId = "remote";
+	expect(session.state.capabilities).toBeUndefined();
+	track(registry.attach(copy, true));
+	await flush();
+	expect(registry.size).toBe(1);
+	expect(probe).toHaveBeenCalledTimes(1);
+});
 
 test("hidden views never probe; a hidden copy is not polled", async () => {
 	const registry = new EditorDiskStateRegistry();

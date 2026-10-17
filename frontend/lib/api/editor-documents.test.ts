@@ -33,6 +33,111 @@ function mockFetch(fn: (url: string, options?: RequestInit) => Response | Promis
 		fn(String(url), options)) as typeof fetch;
 }
 
+test.each([
+	"raw",
+	"v1",
+	"older",
+] as const)("explicit protocol negotiation interoperates with %s server without reinterpreting hashes", async (mode) => {
+	const requests: { url: string; body?: unknown }[] = [];
+	mockFetch((url, options) => {
+		requests.push({ url, body: options?.body ? JSON.parse(String(options.body)) : undefined });
+		if (new URL(url, "http://fixture").pathname.endsWith("/capabilities"))
+			return mode === "older"
+				? new Response(null, { status: 404 })
+				: Response.json(
+						mode === "raw"
+							? { protocols: ["text-v1", "raw-v2"], readMode: "raw-v2" }
+							: { protocols: ["text-v1"] },
+					);
+		return Response.json(
+			mode === "raw" ? rawDocument() : { docId: "v1", baseHash: "decoded-only" },
+		);
+	});
+	const selected = await editorDocumentApi.readMode("n", { path: "/a", origin: "legacy" });
+	const result = await editorDocumentApi.create("n", {
+		path: "/a",
+		origin: "legacy",
+		...(selected === "raw-v2" ? { protocol: "raw-v2" as const } : {}),
+	});
+	expect(requests).toHaveLength(2);
+	expect(requests[1].body).toEqual(
+		mode === "raw"
+			? { path: "/a", origin: "legacy", protocol: "raw-v2" }
+			: { path: "/a", origin: "legacy" },
+	);
+	expect(result.protocol === "raw-v2").toBe(mode === "raw");
+});
+
+test.each([
+	403, 422, 500,
+])("negotiated raw provider failure %s is never downgraded to a v1 writer", async (status) => {
+	let posts = 0;
+	mockFetch((url) => {
+		if (new URL(url, "http://fixture").pathname.endsWith("/capabilities"))
+			return Response.json({ protocols: ["raw-v2", "text-v1"], readMode: "raw-v2" });
+		posts++;
+		return Response.json(
+			{ error: "Capability unavailable", code: "EDITOR_PROVIDER_UNSUPPORTED" },
+			{ status },
+		);
+	});
+	await expect(
+		editorDocumentApi.create("n", { path: "/a", origin: "legacy", protocol: "raw-v2" }),
+	).rejects.toThrow("Capability unavailable");
+	expect(posts).toBe(1);
+});
+
+test("remote read negotiation uses the actual file scope and never offers a v1 writer", async () => {
+	let observed = "";
+	mockFetch((url) => {
+		observed = url;
+		return Response.json({ protocols: ["text-v1", "raw-v2"], readMode: "bounded-preview" });
+	});
+	expect(
+		await editorDocumentApi.readMode("file-narrator", {
+			path: "/remote/file",
+			deviceId: "device",
+			origin: "reference",
+		}),
+	).toBe("bounded-preview");
+	const url = new URL(observed, "http://fixture");
+	expect(url.pathname).toBe("/api/narrators/file-narrator/editor-documents/capabilities");
+	expect(Object.fromEntries(url.searchParams)).toEqual({
+		path: "/remote/file",
+		deviceId: "device",
+		origin: "reference",
+	});
+	mockFetch(() => Response.json({ error: "Read denied" }, { status: 403 }));
+	await expect(
+		editorDocumentApi.readMode("file-narrator", {
+			path: "/remote/file",
+			deviceId: "device",
+			origin: "reference",
+		}),
+	).rejects.toThrow("Read denied");
+});
+
+test("an explicit raw create rejects and releases an old Host's text descriptor before any body read", async () => {
+	const calls: string[] = [];
+	mockFetch((url, options) => {
+		calls.push(`${options?.method} ${url}`);
+		return options?.method === "DELETE"
+			? new Response(null, { status: 204 })
+			: Response.json({
+					docId: "legacy",
+					baseHash: "decoded",
+					target: { deviceId: "local", path: "/a" },
+				});
+	});
+	await expect(
+		editorDocumentApi.create("n", { path: "/a", origin: "legacy", protocol: "raw-v2" }),
+	).rejects.toThrow("Raw editor protocol unavailable");
+	expect(calls).toEqual([
+		"POST /api/narrators/n/editor-documents",
+		"DELETE /api/narrators/n/editor-documents/legacy",
+	]);
+});
+
 describe("bounded editor document transport", () => {
 	test("raw pull credit waits for real consumer completion and never materializes a body Blob", async () => {
 		let pulls = 0,

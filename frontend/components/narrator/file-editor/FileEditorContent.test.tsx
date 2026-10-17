@@ -81,6 +81,7 @@ const descriptor: EditorDocumentDescriptor = {
 };
 let preview: ReturnType<typeof spyOn<typeof fileReferenceApi, "preview">>;
 let create: ReturnType<typeof spyOn<typeof editorDocumentApi, "create">>;
+let readMode: ReturnType<typeof spyOn<typeof editorDocumentApi, "readMode">>;
 let read: ReturnType<typeof spyOn<typeof editorDocumentApi, "source">>;
 let release: ReturnType<typeof spyOn<typeof editorDocumentApi, "release">>;
 let beginUpload: ReturnType<typeof spyOn<typeof editorDocumentApi, "createUpload">>;
@@ -168,6 +169,7 @@ beforeEach(async () => {
 	}));
 	restores.push(() => info.mockRestore());
 	preview = spyOn(fileReferenceApi, "preview").mockResolvedValue(source);
+	readMode = spyOn(editorDocumentApi, "readMode").mockResolvedValue("raw-v2");
 	create = spyOn(editorDocumentApi, "create").mockImplementation(async (_narrator, input) => ({
 		...descriptor,
 		target: { deviceId: input.deviceId ?? "local", path: input.path },
@@ -203,6 +205,7 @@ beforeEach(async () => {
 	);
 	for (const spy of [
 		preview,
+		readMode,
 		create,
 		read,
 		beginUpload,
@@ -234,12 +237,27 @@ afterEach(async () => {
 		mountedTestModels.clear();
 	}
 });
+test("default raw preference honors a legacy executor's authorized bounded-preview capability", async () => {
+	readMode.mockResolvedValue("bounded-preview");
+	const model = await mount({ deviceId: "remote", rawProtocol: true });
+	expect(readMode).toHaveBeenCalled();
+	expect(preview).toHaveBeenCalledWith(
+		"narrator",
+		{ deviceId: "remote", path: source.target.path },
+		expect.any(AbortSignal),
+	);
+	expect(create).not.toHaveBeenCalled();
+	expect(beginUpload).not.toHaveBeenCalled();
+	expect(model.props.readOnly).toBe(true);
+});
+
 async function mount(props: Partial<FileEditorContentProps> = {}) {
 	await act(async () =>
 		root?.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">
 					<FileEditorContent
+						rawProtocol={false}
 						filePath={source.target.path}
 						narratorId="narrator"
 						referenceOrigin
@@ -582,7 +600,13 @@ for (const surface of ["focus", "workspace"] as const)
 			});
 			expect(create).toHaveBeenCalledWith(
 				"child",
-				{ deviceId: "local", path: filePath, origin: "reference" },
+				{
+					deviceId: "local",
+					path: filePath,
+					origin: "reference",
+					protocol: "raw-v2",
+					encodingHint: undefined,
+				},
 				expect.any(AbortSignal),
 			);
 			const model = [...mountedTestModels.values()][0];
@@ -618,10 +642,12 @@ test("StrictMode effect replay still loads an editable session and releases aban
 	);
 	const model = [...mountedTestModels.values()][0];
 	expect(model?.text).toBe("a\nb\n");
-	expect(create).toHaveBeenCalledTimes(2);
+	expect(readMode).toHaveBeenCalledTimes(2);
+	expect(readMode.mock.calls[0]?.[2]?.aborted).toBe(true);
+	expect(create).toHaveBeenCalledTimes(1);
 	expect(read).toHaveBeenCalledTimes(1);
 	expect(workingCopies.createWorkingCopyModel).toHaveBeenCalledTimes(1);
-	expect(release).toHaveBeenCalledWith("child", "strict-1");
+	expect(release).not.toHaveBeenCalled();
 	await edit(model, "strict draft");
 	await click(iconButton("device-floppy"));
 	expect(await upload.mock.calls[0]?.[3].text()).toBe("strict draft");
@@ -632,7 +658,7 @@ test("StrictMode effect replay still loads an editable session and releases aban
 	editorDocumentRegistry.invalidateNarrator("child", "retired clean test context");
 	await act(async () => {});
 	expect(model.disposed).toBe(true);
-	expect(release).toHaveBeenCalledWith("child", "strict-2");
+	expect(release).toHaveBeenCalledWith("child", "strict-1");
 });
 
 for (const currentFailure of ["none", "deleted", "forbidden"] as const)

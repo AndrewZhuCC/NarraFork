@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Worker } from "node:worker_threads";
 import iconv from "iconv-lite";
-import { EDITOR_FILE_MAX_BYTES } from "../../shared/editor-document";
+import { EDITOR_FILE_MAX_BYTES, type EditorRawMetadata } from "../../shared/editor-document";
 import { EditorDocumentJobs } from "./editor-document-jobs";
 import { runStreamWorker } from "./editor-document-stream-worker";
 import {
@@ -81,6 +81,262 @@ function ownedFile(streams: EditorDocumentStreams, readId: string) {
 	if (!file) throw new Error("Fixture source must own an open FileHandle");
 	return file;
 }
+
+async function remoteBodyFixture(size = 64 * 1024 + 3) {
+	const bytes = new Uint8Array(size).fill(65);
+	const { streams } = await fixture(new Uint8Array());
+	// This fixture tests body publication, not local preflight throughput. ASCII A
+	// has identical raw/normalized UTF8 digests and one exact, newline-free line.
+	// Native Chrome still performs the real 20MiB metadata/body pipeline; the
+	// separate remote-preflight test below exercises the real worker codec too.
+	const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+	const metadata: EditorRawMetadata = {
+		protocol: "raw-v2",
+		hashKind: "raw-sha256",
+		formatVersion: 1,
+		baseHash: digest,
+		textDigest: digest,
+		encoding: "utf-8",
+		bom: "none",
+		sourceBytes: size,
+		utf8Bytes: size,
+		textLength: size,
+		lineCount: 1,
+		maxLineLength: size,
+		eolCounts: { LF: 0, CRLF: 0, CR: 0 },
+		preferredEol: "LF",
+		eol: "LF",
+	};
+	const controller = new AbortController();
+	const requests: { offset: number; maxBytes: number }[] = [];
+	const closes: boolean[] = [];
+	const behavior = {
+		peerCredit: 16 * 1024,
+		onChunk: async (_index: number) => {},
+		changedAt: 0,
+		offsetAt: 0,
+		oversizedAt: 0,
+	};
+	const remote: EditorRemoteRawSource = {
+		open: async () => ({
+			readId: "remote-body",
+			sourceGeneration: "generation",
+			totalBytes: bytes.length,
+			rawDigest: metadata.baseHash,
+			identity: {
+				deviceId: "peer",
+				pathFlavor: "posix",
+				canonicalPath: "/peer/file",
+				workspaceIdentity: "root",
+				runtimeEpoch: "epoch",
+				runtimeGeneration: 1,
+				fencingToken: 1,
+			},
+		}),
+		chunk: async (input, signal) => {
+			requests.push({ offset: input.offset, maxBytes: input.maxBytes });
+			expect(input.maxBytes).toBeLessThanOrEqual(16 * 1024);
+			await behavior.onChunk(requests.length);
+			signal.throwIfAborted();
+			const body = bytes.subarray(
+				input.offset,
+				input.offset +
+					Math.min(input.maxBytes, behavior.peerCredit) +
+					(behavior.oversizedAt === requests.length ? 1 : 0),
+			);
+			return {
+				readId: input.readId,
+				sourceGeneration: behavior.changedAt === requests.length ? "changed" : "generation",
+				offset: input.offset + (behavior.offsetAt === requests.length ? 1 : 0),
+				bytes: body.length,
+				dataB64: Buffer.from(body).toString("base64"),
+				eof: input.offset + body.length === bytes.length,
+			};
+		},
+		close: async (input) => {
+			closes.push(input.abort);
+		},
+	};
+	const opened = await streams.open(
+		"u",
+		"remote-doc",
+		remote,
+		undefined,
+		metadata,
+		controller.signal,
+	);
+	return { streams, opened, metadata, bytes, controller, requests, closes, behavior, remote };
+}
+
+test("remote body publishes at most two unchanged 16KiB peer frames within one 32KiB HTTP credit", async () => {
+	const f = await remoteBodyFixture();
+	const result = await f.streams.chunk("remote-doc", f.opened.readId, 0, 64 * 1024);
+	expect(result.bytes?.length).toBe(32 * 1024);
+	expect(result.bytes).toEqual(f.bytes.subarray(0, 32 * 1024));
+	expect(result.eof).toBe(false);
+	expect(f.requests).toEqual([
+		{ offset: 0, maxBytes: 16 * 1024 },
+		{ offset: 16 * 1024, maxBytes: 16 * 1024 },
+	]);
+	expect(f.streams.diagnostics.windowBytes).toBe(256 * 1024);
+	// Conforming RPC envelope <=8KiB beyond base64. Conservatively count its wire,
+	// complete UTF16 JSON and parsed UTF16 base64, both decode copies, the 32KiB
+	// assembly and a separate 32KiB HTTP body. Preflight's worker path is unchanged.
+	const frame = Math.ceil(Math.max(...f.requests.map((r) => r.maxBytes)) / 3) * 4 + 8192;
+	const liveHostCopyBound = frame * 5 + 2 * 16 * 1024 + 2 * (result.bytes?.length ?? 0);
+	expect(liveHostCopyBound).toBeLessThan(256 * 1024);
+});
+
+test.each([
+	1, 16383, 16384, 16385, 32768, 65536,
+])("remote body respects client credit %i without prefetch or a larger RPC", async (credit) => {
+	const f = await remoteBodyFixture();
+	const result = await f.streams.chunk("remote-doc", f.opened.readId, 0, credit);
+	expect(result.bytes?.length).toBe(Math.min(credit, 32 * 1024));
+	expect(f.requests.length).toBe(credit > 16384 ? 2 : 1);
+	expect(f.requests.reduce((n, r) => n + r.maxBytes, 0)).toBe(Math.min(credit, 32 * 1024));
+});
+
+test.each([
+	0, 1, 16384, 16385, 32768, 32769,
+])("remote body validates and publishes the exact EOF tail at %i bytes", async (size) => {
+	const f = await remoteBodyFixture(size);
+	let offset = 0;
+	const digest = new Bun.CryptoHasher("sha256");
+	for (;;) {
+		const result = await f.streams.chunk("remote-doc", f.opened.readId, offset, 65536);
+		digest.update(result.bytes ?? new Uint8Array());
+		offset += result.bytes?.length ?? 0;
+		if (result.eof) break;
+	}
+	expect(offset).toBe(size);
+	expect(digest.digest("hex")).toBe(f.metadata.baseHash);
+	expect(f.requests.length).toBe(Math.max(1, Math.ceil(size / 16384)));
+	await f.streams.close("remote-doc", f.opened.readId);
+	expect(f.closes).toEqual([false]);
+	expect(f.streams.diagnostics.windowBytes).toBe(0);
+});
+
+test.each([
+	"throw",
+	"cancel",
+	"generation",
+	"offset",
+	"oversized",
+] as const)("second remote frame %s never publishes its first frame or leaves a reusable stream", async (failure) => {
+	const f = await remoteBodyFixture();
+	f.behavior.onChunk = async (index) => {
+		if (index !== 2) return;
+		if (failure === "throw") throw new Error("second-frame-failed");
+		if (failure === "cancel") f.controller.abort();
+	};
+	if (failure === "generation") f.behavior.changedAt = 2;
+	if (failure === "offset") f.behavior.offsetAt = 2;
+	if (failure === "oversized") f.behavior.oversizedAt = 2;
+	await expectRejected(f.streams.chunk("remote-doc", f.opened.readId, 0, 65536));
+	expect(f.requests.length).toBe(2);
+	expect(f.closes).toEqual([true]);
+	expect(f.streams.diagnostics.windowBytes).toBe(0);
+	expect(f.streams.diagnostics.active).toBe(0);
+	await expectRejected(
+		f.streams.chunk("remote-doc", f.opened.readId, 0, 65536),
+		"EDITOR_STREAM_CLOSED",
+	);
+});
+
+test("one body publication holds busy across both frames and rejects a concurrent consumer", async () => {
+	const f = await remoteBodyFixture();
+	let entered!: () => void, resume!: () => void;
+	const started = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const gate = new Promise<void>((resolve) => {
+		resume = resolve;
+	});
+	f.behavior.onChunk = async (index) => {
+		if (index === 1) {
+			entered();
+			await gate;
+		}
+	};
+	const pending = f.streams.chunk("remote-doc", f.opened.readId, 0, 65536);
+	await started;
+	try {
+		await expectRejected(
+			f.streams.chunk("remote-doc", f.opened.readId, 0, 65536),
+			"EDITOR_STREAM_INVALID",
+		);
+		expect(f.requests.length).toBe(1);
+	} finally {
+		resume();
+	}
+	expect((await pending).bytes?.length).toBe(32768);
+	expect(f.requests.length).toBe(2);
+});
+
+test("a low-credit peer remains sequential, never requires a larger JSON RPC and never prefetches a third frame", async () => {
+	const f = await remoteBodyFixture();
+	f.behavior.peerCredit = 4096;
+	const result = await f.streams.chunk("remote-doc", f.opened.readId, 0, 65536);
+	expect(result.bytes).toEqual(f.bytes.subarray(0, 8192));
+	expect(f.requests.length).toBe(2);
+	expect(f.requests[1]?.offset).toBe(4096);
+	// The shipped WS gate is ceil(maxRpcBytes * 1.4) + 4096. Neither the
+	// 16KiB peer nor a 4KiB short-frame peer must accept a 32KiB JSON frame.
+	for (const rawBytes of [4096, 16384]) {
+		const frame = {
+			type: "rpc_result",
+			id: "x".repeat(128),
+			result: {
+				readId: "x".repeat(128),
+				sourceGeneration: "x".repeat(128),
+				offset: EDITOR_FILE_MAX_BYTES,
+				bytes: rawBytes,
+				dataB64: Buffer.alloc(rawBytes, 255).toString("base64"),
+				eof: false,
+			},
+		};
+		expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThanOrEqual(
+			Math.ceil(rawBytes * 1.4) + 4096,
+		);
+	}
+});
+
+test("20MiB remote body hashes exactly with 640 bounded publications and the original 1280 peer frames", async () => {
+	const f = await remoteBodyFixture(EDITOR_FILE_MAX_BYTES);
+	let offset = 0,
+		publications = 0;
+	const digest = new Bun.CryptoHasher("sha256");
+	for (;;) {
+		const result = await f.streams.chunk("remote-doc", f.opened.readId, offset, 65536);
+		expect(result.bytes?.length).toBeLessThanOrEqual(32768);
+		digest.update(result.bytes ?? new Uint8Array());
+		offset += result.bytes?.length ?? 0;
+		publications++;
+		if (result.eof) break;
+	}
+	expect(offset).toBe(EDITOR_FILE_MAX_BYTES);
+	expect(digest.digest("hex")).toBe(f.metadata.baseHash);
+	expect(publications).toBe(640);
+	expect(f.requests.length).toBe(1280);
+	await f.streams.close("remote-doc", f.opened.readId);
+	expect(f.streams.diagnostics.windowBytes).toBe(0);
+});
+
+test("remote metadata preflight keeps one 16KiB peer/worker frame and releases its original window", async () => {
+	const f = await remoteBodyFixture();
+	await f.streams.close("remote-doc", f.opened.readId);
+	f.requests.length = 0;
+	f.closes.length = 0;
+	const metadata = await f.streams.metadata("u", f.remote);
+	expect(metadata.baseHash).toBe(f.metadata.baseHash);
+	expect(metadata.sourceBytes).toBe(f.bytes.length);
+	expect(f.requests.length).toBe(5);
+	expect(Math.max(...f.requests.map((r) => r.maxBytes))).toBe(16384);
+	expect(f.closes).toEqual([false]);
+	expect(f.streams.diagnostics.windowBytes).toBe(0);
+	expect(f.streams.workers.count).toBeLessThanOrEqual(2);
+});
 
 test("ready worker exit releases local and remote read owners, rejects old handles and admits new streams", async () => {
 	const { path, streams } = await fixture();

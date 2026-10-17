@@ -47,6 +47,7 @@ import { useTranslation } from "react-i18next";
 import { useMobileViewport } from "../../../hooks/useMobileViewport";
 import { api } from "../../../lib/api";
 import { request } from "../../../lib/api/client";
+import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
@@ -104,7 +105,7 @@ const CONFLICT_DIFF_CHARS = 32 * 1024;
 
 export interface FileEditorContentProps {
 	filePath: string;
-	/** Explicit raw-v2 opt-in; writing requires the complete negotiated durable capability set. */
+	/** Protocol override (default raw-v2); writing requires negotiated durable capabilities. */
 	rawProtocol?: boolean;
 	rawEncoding?: EditorRawEncoding;
 	/** Actual source narrator; the dock host is not a filesystem authority. */
@@ -205,47 +206,61 @@ function FileEditorBinding(props: FileEditorContentProps) {
 		setError(null);
 		const controller = new AbortController();
 		controllerRef.current = controller;
-		const readOnly = !narratorId || (deviceId !== "local" && !rawV2);
-		const options: WorkingCopyOptions = {
-			narratorId: narratorId ?? "",
-			path: filePath,
-			deviceId,
-			...(rawV2 && narratorId
-				? { protocol: "raw-v2" as const, encodingHint: props.rawEncoding }
-				: {}),
-			origin: () => (referenceOrigin ? "reference" : "legacy"),
-			translate: (key, defaultValue) => latest.current(`fileEditor.${key}`, { defaultValue }),
-			...(readOnly
-				? {
-						readOnlySource: async (signal: AbortSignal) => {
-							const boundedSignal = AbortSignal.any([
-								signal,
-								AbortSignal.timeout(FILE_REFERENCE_READ_TIMEOUT_MS),
-							]);
-							if ((referenceOrigin || deviceId !== "local") && !narratorId)
-								throw new Error(latest.current("fileEditor.missingContext"));
-							if (deviceId !== "local")
-								return fileReferenceApi.preview(
-									narratorId as string,
-									{ deviceId, path: filePath },
-									boundedSignal,
+		const viewing = (async () => {
+			const readMode =
+				rawV2 && narratorId
+					? (recovery?.readMode ??
+						(await editorDocumentApi.readMode(
+							narratorId,
+							{ path: filePath, deviceId, origin: referenceOrigin ? "reference" : "legacy" },
+							controller.signal,
+						)))
+					: deviceId !== "local"
+						? "bounded-preview"
+						: "text-v1";
+			controller.signal.throwIfAborted();
+			if (rawV2) recovery?.setReadMode(readMode);
+			const readOnly = !narratorId || (deviceId !== "local" && readMode !== "raw-v2");
+			const options: WorkingCopyOptions = {
+				narratorId: narratorId ?? "",
+				path: filePath,
+				deviceId,
+				...(readMode === "raw-v2" && narratorId
+					? { protocol: "raw-v2" as const, encodingHint: props.rawEncoding }
+					: {}),
+				origin: () => (referenceOrigin ? "reference" : "legacy"),
+				translate: (key, defaultValue) => latest.current(`fileEditor.${key}`, { defaultValue }),
+				...(readOnly
+					? {
+							readOnlySource: async (signal: AbortSignal) => {
+								const boundedSignal = AbortSignal.any([
+									signal,
+									AbortSignal.timeout(FILE_REFERENCE_READ_TIMEOUT_MS),
+								]);
+								if ((referenceOrigin || deviceId !== "local") && !narratorId)
+									throw new Error(latest.current("fileEditor.missingContext"));
+								if (deviceId !== "local")
+									return fileReferenceApi.preview(
+										narratorId as string,
+										{ deviceId, path: filePath },
+										boundedSignal,
+									);
+								return request<{ content: string; encoding: string; hash: string }>(
+									`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
+									{ signal: boundedSignal },
 								);
-							return request<{ content: string; encoding: string; hash: string }>(
-								`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
-								{ signal: boundedSignal },
-							);
-						},
-					}
-				: {}),
-		};
-		const viewing = editorDocumentRegistry
-			.acquire(options, controller.signal, () => {
+							},
+						}
+					: {}),
+			};
+			return editorDocumentRegistry.acquire(options, controller.signal, () => {
 				controllerRef.current?.abort();
 				leaseRef.current?.release();
 				leaseRef.current = null;
 				controllerRef.current = null;
 				setCopy(null);
-			})
+			});
+		})()
 			.then((lease) => {
 				if (controller.signal.aborted) {
 					lease.release();
@@ -1124,7 +1139,7 @@ function FileEditorDocument({
 					</Group>
 				</Box>
 			</Group>
-			{deviceId !== "local" && (
+			{deviceId !== "local" && workingCopy.options.readOnlySource && (
 				<Text size="xs" c="dimmed" px="xs">
 					{t("fileEditor.remoteBudget", {
 						defaultValue: "Remote files are read-only and use the existing 1 MiB preview limit.",

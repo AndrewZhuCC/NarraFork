@@ -69,6 +69,7 @@ export function editorResourceKey(
 	actor: EditorActor,
 	input: CreateEditorDocumentInput,
 	binding: EditorBinding,
+	stable = false,
 ) {
 	return createHash("sha256")
 		.update(
@@ -86,7 +87,11 @@ export function editorResourceKey(
 				binding.canonicalPath,
 				binding.outsideRoots,
 				...(input.protocol === "raw-v2"
-					? ["raw-v2", input.encodingHint, binding.runtimeGeneration, binding.runtimeEpoch]
+					? [
+							"raw-v2",
+							input.encodingHint,
+							...(stable ? [] : [binding.runtimeGeneration, binding.runtimeEpoch]),
+						]
 					: []),
 			]),
 		)
@@ -569,6 +574,7 @@ export class EditorDocumentService {
 				return {
 					docId: session.id,
 					resourceKey: editorResourceKey(actor, input, binding),
+					stableResourceKey: editorResourceKey(actor, input, binding, true),
 					recoveryKey: editorRecoveryKey(actor, input),
 					target: {
 						deviceId: binding.deviceId ?? input.deviceId ?? "local",
@@ -577,6 +583,7 @@ export class EditorDocumentService {
 					versionHandle: session.raw.handle,
 					capabilities: {
 						...EDITOR_LOCAL_V1_CAPABILITIES,
+						watch: true,
 						v1Save: false,
 						...(this.deps.writerAvailable && !this.deps.writerAvailable(binding)
 							? {
@@ -617,6 +624,7 @@ export class EditorDocumentService {
 				// worker read and the v1 save; nothing in Phases 6-9 is claimed.
 				capabilities: {
 					...EDITOR_LOCAL_V1_CAPABILITIES,
+					watch: true,
 					v1Save: this.deps.writerAvailable?.(binding) ?? true,
 					...(this.deps.writerAvailable && !this.deps.writerAvailable(binding)
 						? {
@@ -684,6 +692,42 @@ export class EditorDocumentService {
 			eol: result.metadata.eol,
 			sourceBytes: result.metadata.sourceBytes,
 			utf8Bytes: result.metadata.utf8Bytes,
+		};
+	}
+	/** Finite counters only: no filesystem, body or session scan. */
+	get diagnostics() {
+		return {
+			documents: this.sessions.size,
+			reservedBytes: this.totalBytes,
+			operations: this.operations.size,
+			streams: this.streams.diagnostics,
+		};
+	}
+	/** Snapshot only the authorization input, never pin/touch a document for a watcher. */
+	watchTarget(actor: EditorActor, docId: string) {
+		const session = this.sessions.get(docId);
+		if (
+			!session ||
+			session.closing ||
+			session.userId !== actor.userId ||
+			session.narratorId !== actor.narratorId ||
+			(Date.now() - session.lastUsed > EDITOR_SESSION_IDLE_MS && !session.pins)
+		)
+			throw expired();
+		const input = session.input;
+		const resourceId = editorResourceKey(actor, input, session.binding, true);
+		// Fresh authorization runs in the four-job shared scheduler, including the
+		// initial ACK. Reading a verified metadata entry itself grants nothing.
+		return {
+			resourceId,
+			async authorize(signal: AbortSignal) {
+				signal.throwIfAborted();
+				const fresh = await actor.authorize(input, "read", signal);
+				signal.throwIfAborted();
+				if (editorResourceKey(actor, input, fresh, true) !== resourceId)
+					throw new EditorDocumentError("EDITOR_IDENTITY_CHANGED", "Editor identity changed", 403);
+				return editorResourceKey(actor, input, fresh);
+			},
 		};
 	}
 	/** Explicit consumer pulls are credit; no HTTP fetch read-ahead can drain the source. */
@@ -1431,7 +1475,7 @@ export class EditorDocumentService {
 		try {
 			if (input.draftWriterId) {
 				const owner = editorRecoveryKey(actor, session.input),
-					resource = editorResourceKey(actor, session.input, binding),
+					resource = editorResourceKey(actor, session.input, binding, true),
 					lifetime = input.draftModelLifetime ?? "";
 				const settled = await this.settledDraftOperations(
 					actor,
@@ -1455,7 +1499,7 @@ export class EditorDocumentService {
 						? (this.deps.rawWriter?.execute as EditorDocumentDependencies["execute"])
 						: this.deps.execute)({
 						requestId: operationId,
-						resourceKey: editorResourceKey(actor, session.input, binding),
+						resourceKey: editorResourceKey(actor, session.input, binding, true),
 						workspaceRevision: binding.workspaceRevision,
 						remote: binding.writeTarget,
 						userId: actor.userId,

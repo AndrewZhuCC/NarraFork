@@ -1,4 +1,5 @@
 import { Button, Center, Group, Loader, NumberInput, Stack, Text } from "@mantine/core";
+import { EDITOR_FILE_MAX_BYTES, type EditorReadMode } from "@shared/editor-document";
 import {
 	FILE_PANEL_PAGE_BYTES,
 	type FilePanelPage,
@@ -6,6 +7,7 @@ import {
 } from "@shared/file-reference";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { type FilePanelReadOrigin, fileReferenceApi } from "../../../lib/api/file-references";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { useEditorRecoveryHost } from "../file-editor/EditorRecoveryBoundary";
@@ -76,17 +78,39 @@ function LargeFileResource({
 	});
 	const origin: FilePanelReadOrigin =
 		!referenceOrigin && deviceId === "local" ? (legacyViewer ? "preview" : "legacy") : "reference";
-	const [info, setInfo] = useState<{ fileName: string; size: number } | null>(null);
+	const [info, setInfo] = useState<{
+		fileName: string;
+		size: number;
+		readMode?: EditorReadMode;
+		requestKey: string;
+	} | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [retry, setRetry] = useState(0);
 	const recovery = useEditorRecoveryHost({ narratorId, deviceId, filePath, referenceOrigin });
+	// Raw providers enforce their own complete-read/profile budgets. Keep the existing
+	// explicit large-file confirmation, but do not strand a safe 20 MiB editor in v1 pages.
+	const requestKey = JSON.stringify([
+		narratorId,
+		deviceId,
+		filePath,
+		origin,
+		retry,
+		recovery?.protocol,
+	]);
+	const rawEditor =
+		!legacyViewer &&
+		recovery?.protocol === "raw-v2" &&
+		recovery.readMode === "raw-v2" &&
+		info?.readMode === "raw-v2" &&
+		info.requestKey === requestKey &&
+		info.size <= EDITOR_FILE_MAX_BYTES;
 	const presentation = !narratorId
 		? "editor"
 		: error
 			? "blocked"
 			: !info
 				? "pending"
-				: filePanelLoadPolicy(info.size) === "auto"
+				: filePanelLoadPolicy(info.size) === "auto" || (rawEditor && (allowed || confirmed))
 					? "editor"
 					: "blocked";
 	// This notification only coordinates cached recovery outside the gate. It never
@@ -95,7 +119,6 @@ function LargeFileResource({
 		recovery?.gate(presentation, retry);
 	}, [recovery, presentation, retry]);
 	useEffect(() => {
-		const requestKey = JSON.stringify([narratorId, deviceId, filePath, origin, retry]);
 		if (!visible || !narratorId || successfulInfo.current === requestKey) return;
 		const controller = new AbortController();
 		// Revalidating a legacy-to-reference upgrade must not dispose a loaded draft.
@@ -103,10 +126,22 @@ function LargeFileResource({
 		setError(null);
 		void fileReferenceApi
 			.info(narratorId, { deviceId, path: filePath }, controller.signal, origin)
-			.then((value) => {
+			.then(async (value) => {
+				let readMode: EditorReadMode | undefined;
+				if (
+					!legacyViewer &&
+					recovery?.protocol === "raw-v2" &&
+					value.size > FILE_PANEL_AUTO_LOAD_BYTES
+				)
+					readMode = await editorDocumentApi.readMode(
+						narratorId,
+						{ path: filePath, deviceId, origin: referenceOrigin ? "reference" : "legacy" },
+						controller.signal,
+					);
 				if (!controller.signal.aborted) {
+					if (readMode) recovery?.setReadMode(readMode);
 					successfulInfo.current = requestKey;
-					setInfo(value);
+					setInfo({ ...value, readMode, requestKey });
 				}
 			})
 			.catch((reason: unknown) => {
@@ -114,7 +149,17 @@ function LargeFileResource({
 					setError(String(reason instanceof Error ? reason.message : reason));
 			});
 		return () => controller.abort();
-	}, [narratorId, deviceId, filePath, origin, retry, visible]);
+	}, [
+		narratorId,
+		deviceId,
+		filePath,
+		origin,
+		visible,
+		recovery,
+		referenceOrigin,
+		requestKey,
+		legacyViewer,
+	]);
 
 	// Legacy unbound local previews retain their existing bounded reader.
 	if (!narratorId) return children;
@@ -136,7 +181,7 @@ function LargeFileResource({
 			</Center>
 		);
 	const policy = filePanelLoadPolicy(info.size);
-	if (policy === "auto") return children;
+	if (policy === "auto" || (rawEditor && (allowed || confirmed))) return children;
 	if (policy === "confirm" && (allowed || confirmed)) {
 		return (
 			<LargeFilePages

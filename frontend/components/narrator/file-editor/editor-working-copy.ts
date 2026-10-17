@@ -200,8 +200,10 @@ export class EditorWorkingCopy {
 		readonly options: WorkingCopyOptions,
 		descriptor?: EditorDocumentDescriptor,
 	) {
-		this.key = descriptor?.resourceKey ?? createEditorLocalId();
-		this.protocol = descriptor?.protocol ?? options.protocol ?? "text-v1";
+		this.key = descriptor?.stableResourceKey ?? descriptor?.resourceKey ?? createEditorLocalId();
+		this.protocol = descriptor
+			? (descriptor.protocol ?? "text-v1")
+			: (options.protocol ?? "text-v1");
 		this.recoveryKey = descriptor?.recoveryKey;
 		this.seed = descriptor;
 		// V1 has no full text profile. Reserve a soft estimate from authorized metadata
@@ -218,6 +220,7 @@ export class EditorWorkingCopy {
 			...options,
 			protocol: this.protocol,
 			resourceKey: descriptor?.resourceKey,
+			stableResourceKey: descriptor?.stableResourceKey,
 			snapshot: () => this.captureSnapshot(),
 			rawReady: () => ({
 				formatReady: !!this.format && !!this.rawEncoding,
@@ -351,7 +354,7 @@ export class EditorWorkingCopy {
 		if (descriptor?.resourceKey && descriptor.recoveryKey && !options.readOnlySource) {
 			this.draftScope = {
 				recoveryKey: descriptor.recoveryKey,
-				resourceKey: descriptor.resourceKey,
+				resourceKey: descriptor.stableResourceKey ?? descriptor.resourceKey,
 				narratorId: options.narratorId,
 				deviceId: options.deviceId,
 				origin: options.origin(),

@@ -135,6 +135,72 @@ async function setup(load = true) {
 	return { session, api, encode, hash, applyContent, snapshot, change, text: () => text };
 }
 
+test("a background reauthorization completing during upload cannot release its active document", async () => {
+	const { session, api, change } = await setup();
+	const authorization = deferred<EditorDocumentDescriptor>(),
+		upload = deferred<Awaited<ReturnType<typeof editorDocumentApi.createUpload>>>();
+	api.create.mockReturnValueOnce(authorization.promise);
+	const refreshing = session.refreshDocument();
+	change("saved while authorizing");
+	api.createUpload.mockReturnValueOnce(upload.promise);
+	const saving = session.save();
+	for (let step = 0; step < 20 && !api.createUpload.mock.calls.length; step++)
+		await Promise.resolve();
+	expect(api.createUpload).toHaveBeenCalledTimes(1);
+	authorization.resolve({ ...descriptor, docId: "background-doc" });
+	expect(await refreshing).toBe(false);
+	expect(api.release).toHaveBeenCalledWith("child", "background-doc");
+	expect(api.release.mock.calls.some((call) => call[1] === "doc")).toBe(false);
+	upload.resolve({ uploadId: "upload", state: "uploading" });
+	await saving;
+	expect(api.commit.mock.calls[0]?.[1]).toBe("doc");
+	expect(sessionDirty(session.state)).toBe(false);
+	session.dispose();
+});
+
+test("runtime change at commit verifies fresh scope but retains the original sealed proof for query-first cancellation", async () => {
+	const { session, api, change, text } = await setup(false);
+	api.create.mockResolvedValue({
+		...descriptor,
+		resourceKey: "runtime-A",
+		stableResourceKey: "verified-root",
+	});
+	await session.load();
+	change("immutable draft");
+	api.create.mockResolvedValue({
+		...descriptor,
+		docId: "fresh",
+		resourceKey: "runtime-B",
+		stableResourceKey: "verified-root",
+	});
+	Object.assign(api, { diskState: mock(async () => ({ exists: true, ...descriptor })) });
+	api.createUpload.mockResolvedValue({
+		uploadId: "upload",
+		state: "uploading",
+		operationId: "original-op",
+	});
+	api.commit.mockRejectedValue(
+		new ApiError("runtime restarted", 403, { code: "EDITOR_IDENTITY_CHANGED" }),
+	);
+	api.operation.mockRejectedValue(new ApiError("missing", 404));
+	api.getUpload.mockImplementation(async (_narrator, id) => {
+		expect(id).toBe("doc");
+		expect(api.release.mock.calls.some((call) => call[1] === "doc")).toBe(false);
+		return { uploadId: "upload", state: "sealed" };
+	});
+	await session.save();
+	expect(api.operation).toHaveBeenCalledWith("child", "original-op");
+	expect(api.commit).toHaveBeenCalledTimes(1);
+	expect(api.createUpload).toHaveBeenCalledTimes(1);
+	expect(api.release).toHaveBeenCalledWith("child", "fresh");
+	expect(session.state.phase).toBe("idle");
+	expect(session.state.invalidated).not.toBe(true);
+	expect(session.state.baseHash).toBe("original-hash");
+	expect(text()).toBe("immutable draft");
+	expect(sessionDirty(session.state)).toBe(true);
+	session.dispose();
+});
+
 test("410 reauthorization cannot bind a dirty draft to another authorized execution scope", async () => {
 	const { session, api, change, text } = await setup(false);
 	api.create.mockResolvedValue({ ...descriptor, resourceKey: "original-scope" });

@@ -148,7 +148,7 @@ export class EditorDocumentRegistry {
 			throw new Error(options.translate?.("identityChanged", fallback) ?? fallback);
 		}
 		const canonicalKey = descriptor?.resourceKey
-			? `${descriptor.protocol ?? "text-v1"}:${descriptor.resourceKey}`
+			? `${descriptor.protocol ?? "text-v1"}:${descriptor.stableResourceKey ?? descriptor.resourceKey}`
 			: undefined;
 		let entry = canonicalKey ? this.canonical.get(canonicalKey) : undefined;
 		if (entry?.copy.getSnapshot().invalidated) entry = undefined;
@@ -255,11 +255,10 @@ export class EditorDocumentRegistry {
 				options.translate?.("identityChanged", "Editor authorization changed") ??
 					"Editor authorization changed",
 			);
-		const protocol = alreadyViewing?.protocol ?? options.protocol ?? "text-v1";
 		const candidates = [...this.entries].filter(
 			(entry) =>
 				entry.copy !== alreadyViewing &&
-				entry.copy.protocol === protocol &&
+				(!alreadyViewing || entry.copy.protocol === alreadyViewing.protocol) &&
 				entry.copy.recoveryKey &&
 				entry.copy.protected &&
 				entry.copy.options.narratorId === options.narratorId &&
@@ -297,7 +296,7 @@ export class EditorDocumentRegistry {
 			(entry) =>
 				this.entries.has(entry) &&
 				entry.copy !== current &&
-				entry.copy.protocol === (current?.protocol ?? protocol) &&
+				(!current || entry.copy.protocol === current.protocol) &&
 				entry.copy.recoveryKey === scope.recoveryKey &&
 				entry.copy.protected &&
 				!entry.copy.getSnapshot().discarded,

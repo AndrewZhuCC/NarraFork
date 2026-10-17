@@ -56,6 +56,11 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 	let childLogs = "";
 	let dropNext = false,
 		low = false,
+		withoutRawRead = false,
+		reads = 0,
+		rawOpens = 0,
+		rawChunks = 0,
+		maxRawCredit = 0,
 		applies = 0;
 	const applyIds = new Set<string>();
 	type Data = { adapter?: Parameters<typeof handleDeviceWS.message>[0] };
@@ -75,6 +80,12 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 			send(data: string | Uint8Array) {
 				if (typeof data === "string") {
 					const frame = JSON.parse(data);
+					if (frame.type === "rpc" && frame.method === "fs.read") reads++;
+					if (frame.type === "rpc" && frame.method === "editor.read.open") rawOpens++;
+					if (frame.type === "rpc" && frame.method === "editor.read.chunk") {
+						rawChunks++;
+						maxRawCredit = Math.max(maxRawCredit, frame.params.maxBytes);
+					}
 					if (frame.type === "rpc" && frame.method === "editor.apply") {
 						applies++;
 						applyIds.add(frame.id);
@@ -106,6 +117,10 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 				if (frame.type === "hello" && low)
 					frame.capabilities.features = frame.capabilities.features.filter(
 						(name: string) => name !== "editor.durable-write.v1",
+					);
+				if (frame.type === "hello" && withoutRawRead)
+					frame.capabilities.features = frame.capabilities.features.filter(
+						(name: string) => name !== "editor.raw-read.v1",
 					);
 				if (frame.type === "rpc_result" && applyIds.delete(frame.id) && dropNext) {
 					dropNext = false;
@@ -195,10 +210,23 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 	}
 	return {
 		deviceId,
+		distributionUrl: `http://127.0.0.1:${server.port}`,
 		start,
 		binarySha256: createHash("sha256").update(binary).digest("hex"),
 		get applies() {
 			return applies;
+		},
+		get reads() {
+			return reads;
+		},
+		get rawOpens() {
+			return rawOpens;
+		},
+		get rawChunks() {
+			return rawChunks;
+		},
+		get maxRawCredit() {
+			return maxRawCredit;
 		},
 		get logs() {
 			return childLogs;
@@ -206,9 +234,10 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 		dropSuccess() {
 			dropNext = true;
 		},
-		async reconnect(lowCapability = false) {
+		async reconnect(lowCapability = false, removeRawRead = false) {
 			const old = getDeviceConnectionGeneration(deviceId) ?? undefined;
 			low = lowCapability;
+			withoutRawRead = removeRawRead;
 			socket?.close();
 			return waitOnline(old);
 		},

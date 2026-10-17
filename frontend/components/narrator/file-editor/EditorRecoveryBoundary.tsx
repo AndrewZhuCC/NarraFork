@@ -1,5 +1,5 @@
 import { Alert, Box, Button, Group, Text } from "@mantine/core";
-import type { EditorRecoveryScope } from "@shared/editor-document";
+import type { EditorReadMode, EditorRecoveryScope } from "@shared/editor-document";
 import {
 	createContext,
 	type ReactNode,
@@ -31,12 +31,7 @@ export interface EditorRecoveryScopeProps {
 	rawProtocol?: boolean;
 }
 export function readEditorProtocol(explicit?: boolean): "text-v1" | "raw-v2" {
-	if (explicit !== undefined) return explicit ? "raw-v2" : "text-v1";
-	try {
-		return localStorage.getItem("narrafork_editor_raw_v2") === "1" ? "raw-v2" : "text-v1";
-	} catch {
-		return "text-v1";
-	}
+	return explicit === false ? "text-v1" : "raw-v2";
 }
 export function editorRecoveryScopeIdentity(props: EditorRecoveryScopeProps) {
 	return JSON.stringify([
@@ -62,6 +57,7 @@ function exclusionSlot() {
 class RecoveryHost {
 	private slot = exclusionSlot();
 	private snapshot = { epoch: 0, exclude: this.slot.exclude };
+	readMode?: EditorReadMode;
 	private listeners = new Set<() => void>();
 	private gateAttempt: number | undefined;
 	constructor(
@@ -75,9 +71,17 @@ class RecoveryHost {
 		};
 	};
 	getSnapshot = () => this.snapshot;
+	/** Target negotiation only, never a file permission or a body/model binding. */
+	setReadMode(readMode: EditorReadMode) {
+		this.readMode = readMode;
+	}
 	private replace() {
 		this.slot = exclusionSlot();
-		this.snapshot = { epoch: this.snapshot.epoch + 1, exclude: this.slot.exclude };
+		this.snapshot = {
+			...this.snapshot,
+			epoch: this.snapshot.epoch + 1,
+			exclude: this.slot.exclude,
+		};
 		for (const listener of this.listeners) listener();
 	}
 	registerViewing(viewing: Promise<EditorWorkingCopy | null>) {
@@ -95,7 +99,11 @@ class RecoveryHost {
 				const next = !!copy.getSnapshot().invalidated;
 				if (next === invalidated || this.slot.token !== token) return;
 				invalidated = next;
-				this.snapshot = { epoch: this.snapshot.epoch + 1, exclude: this.slot.exclude };
+				this.snapshot = {
+					...this.snapshot,
+					epoch: this.snapshot.epoch + 1,
+					exclude: this.slot.exclude,
+				};
 				for (const listener of this.listeners) listener();
 			});
 		});

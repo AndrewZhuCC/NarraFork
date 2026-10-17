@@ -126,6 +126,7 @@ export interface EditorSessionOptions {
 	) => Promise<{ install(): DocumentVersion | null; dispose(): void; paged?: boolean }>;
 	/** A registry seed fixes authorization before even the first source read/retry. */
 	resourceKey?: string;
+	stableResourceKey?: string;
 	origin: () => "reference" | "legacy";
 	snapshot: () => EditorTextSnapshot;
 	encode: (snapshot: EditorTextSnapshot, signal: AbortSignal) => Promise<Blob>;
@@ -209,10 +210,14 @@ export class EditorDocumentSession {
 		const controller = new AbortController();
 		this.loadController = controller;
 		try {
-			await this.recover(controller.signal);
+			await this.recover(
+				controller.signal,
+				() => !this.attempt && this.state.phase === "idle" && this.loadController === controller,
+			);
 			return this.loadController === controller;
 		} catch (error) {
-			if (this.loadController === controller) this.authorizationFailed(error);
+			if (this.loadController === controller && !controller.signal.aborted)
+				this.authorizationFailed(error);
 			return false;
 		} finally {
 			if (this.loadController === controller) this.loadController = null;
@@ -357,6 +362,14 @@ export class EditorDocumentSession {
 	private release(docId: string) {
 		void this.api.release(this.options.narratorId, docId).catch(() => {});
 	}
+	invalidateAuthorization() {
+		this.invalidate(
+			this.text(
+				"identityChanged",
+				"Editor authorization changed. The previous draft was preserved; reopen the file in its new context.",
+			),
+		);
+	}
 	invalidate(reason: string) {
 		if (this.state.invalidated) return;
 		this.clearPendingIntent();
@@ -386,8 +399,14 @@ export class EditorDocumentSession {
 			},
 			signal,
 		);
-		const expectedKey = this.options.resourceKey ?? this.document?.resourceKey;
-		if (expectedKey && next.resourceKey !== expectedKey) {
+		if (signal.aborted) {
+			this.release(next.docId);
+			signal.throwIfAborted();
+		}
+		const expectedKey = this.document?.resourceKey ?? this.options.resourceKey;
+		const stableKey = this.options.stableResourceKey ?? this.document?.stableResourceKey;
+		const runtimeOnly = !!stableKey && next.stableResourceKey === stableKey;
+		if (expectedKey && next.resourceKey !== expectedKey && !runtimeOnly) {
 			this.release(next.docId);
 			const reason = this.text(
 				"identityChanged",
@@ -395,6 +414,17 @@ export class EditorDocumentSession {
 			);
 			this.invalidate(reason);
 			throw new Error(reason);
+		}
+		if (expectedKey && next.resourceKey !== expectedKey && runtimeOnly) {
+			try {
+				// Fresh create authenticates the full scope; a forced version check fences
+				// runtime-only replacement without moving the draft's saved baseline.
+				await this.api.diskState(this.options.narratorId, next.docId, signal);
+				signal.throwIfAborted();
+			} catch (error) {
+				this.release(next.docId);
+				throw error;
+			}
 		}
 		return next;
 	}
@@ -460,9 +490,9 @@ export class EditorDocumentSession {
 		return true;
 	}
 	/** Reauthorization deliberately does NOT install the newly observed disk baseline or text. */
-	private async recover(signal: AbortSignal) {
+	private async recover(signal: AbortSignal, current?: () => boolean) {
 		const next = await this.authorize(signal);
-		if (this.disposed || signal.aborted) {
+		if (this.disposed || signal.aborted || (current && !current())) {
 			this.release(next.docId);
 			signal.throwIfAborted();
 			throw new Error("Editor closed");
@@ -498,7 +528,11 @@ export class EditorDocumentSession {
 	 * false) if the user edits before the fresh source is installed.
 	 */
 	cancelRawLoad() {
-		if (this.options.protocol === "raw-v2") this.loadController?.abort();
+		if (this.options.protocol === "raw-v2") this.cancelSourceLoad();
+	}
+	/** A disconnected observation cannot finish installing a previous connection's candidate. */
+	cancelSourceLoad() {
+		this.loadController?.abort();
 	}
 	async load(background = false): Promise<boolean> {
 		if (this.state.phase !== "idle" || this.disposed || this.state.invalidated) return false;
@@ -629,7 +663,12 @@ export class EditorDocumentSession {
 			installed = true;
 			if (old) this.release(old.docId);
 		} catch (error) {
-			if (this.loadController === controller && !this.disposed && this.authorizationFailed(error))
+			if (
+				this.loadController === controller &&
+				!controller.signal.aborted &&
+				!this.disposed &&
+				this.authorizationFailed(error)
+			)
 				return false;
 			if (
 				this.loadController === controller &&
@@ -779,7 +818,12 @@ export class EditorDocumentSession {
 					break;
 				} catch (error) {
 					// No commit has been sent: one reauthorization/re-upload is safe and bounded.
-					if (!expired(error) || recovery > 0) throw error;
+					const runtimeChanged =
+						error instanceof ApiError &&
+						error.status === 403 &&
+						error.data?.code === "EDITOR_IDENTITY_CHANGED" &&
+						!!this.document?.stableResourceKey;
+					if ((!expired(error) && !runtimeChanged) || recovery > 0) throw error;
 					attempt.docId = (await this.recover(attempt.controller.signal)).docId;
 					attempt.uploadId = undefined;
 					attempt.operationId = undefined;
@@ -830,6 +874,30 @@ export class EditorDocumentSession {
 					? (error.data as { code?: string; operationId?: string } | undefined)
 					: undefined;
 			if (data?.operationId) attempt.operationId = data.operationId;
+			if (
+				data?.code === "EDITOR_IDENTITY_CHANGED" &&
+				this.document?.stableResourceKey &&
+				!this.state.invalidated
+			) {
+				// Reauthorize before distinguishing a runtime restart from actual root/ACL
+				// retirement. Keep the original dispatched attempt/op and query only it.
+				try {
+					const fresh = await this.authorize(attempt.controller.signal);
+					this.release(fresh.docId);
+					if (this.attempt !== attempt || this.disposed || this.state.invalidated) return;
+					this.update({ capabilities: fresh.capabilities });
+					// Keep the original doc's private upload metadata until query/cancel
+					// proves its disposition. Releasing it now would destroy sealed proof.
+				} catch (freshError) {
+					if (!this.state.invalidated && !this.authorizationFailed(freshError))
+						this.update({ phase: "unknown", error: message(freshError) });
+					return;
+				}
+				this.clearPendingIntent();
+				this.update({ phase: "unknown", error: message(error) });
+				await this.reconcile();
+				return;
+			}
 			if (this.state.invalidated || this.authorizationFailed(error)) return;
 			if (
 				data?.code === "EDITOR_DRAFT_WRITER_RETIRED" ||
@@ -1200,7 +1268,12 @@ export class EditorDocumentSession {
 				conflict: null,
 			});
 		} catch (error) {
-			if (this.loadController === controller && this.authorizationFailed(error)) return;
+			if (
+				this.loadController === controller &&
+				!controller.signal.aborted &&
+				this.authorizationFailed(error)
+			)
+				return;
 			if (this.loadController === controller) this.update({ error: message(error) });
 		} finally {
 			if (this.loadController === controller) {

@@ -293,7 +293,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		await page.waitForFunction(() => !!(window as unknown as RawWindow).rawFixture);
 		await call("open", checkpointPath);
 		await call("dualViews");
-		await page.waitForSelector("[data-editor-draft-restore]");
+		await page.waitForSelector("[data-editor-draft-restore]:not([disabled])");
 		await page.click("[data-editor-draft-restore]");
 		await page.waitForFunction(
 			() => (window as unknown as RawWindow).rawFixture.state().session?.restoredDraft === true,
@@ -385,7 +385,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		await page.waitForFunction(() => !!(window as unknown as RawWindow).rawFixture);
 		await call("open", uniformPath);
 		await call("dualViews");
-		await page.waitForSelector("[data-editor-draft-restore]");
+		await page.waitForSelector("[data-editor-draft-restore]:not([disabled])");
 		await page.click("[data-editor-draft-restore]");
 		await page.waitForFunction(
 			() => (window as unknown as RawWindow).rawFixture.state().session?.restoredDraft === true,
@@ -466,7 +466,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		}, badPath);
 		await call("open", badPath);
 		await call("dualViews");
-		await page.waitForSelector("[data-editor-draft-restore]");
+		await page.waitForSelector("[data-editor-draft-restore]:not([disabled])");
 		await page.click("[data-editor-draft-restore]");
 		await page.waitForFunction(() => {
 			const row = document.querySelector("[data-editor-local-draft]");

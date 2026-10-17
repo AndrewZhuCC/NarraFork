@@ -61,3 +61,28 @@ test("opaque identity merges only canonical aliases inside the complete authoriz
 	] as const)
 		expect(editorResourceKey(otherActor, otherInput, otherBinding)).not.toBe(key);
 });
+
+test("stable raw identity excludes only runtime generation/epoch, never authority or physical root", () => {
+	const raw = { ...input, protocol: "raw-v2" as const };
+	const previous = { ...binding, runtimeGeneration: 1, runtimeEpoch: "before" };
+	const restarted = { ...binding, runtimeGeneration: 2, runtimeEpoch: "after" };
+	expect(editorResourceKey(actor, raw, previous)).not.toBe(
+		editorResourceKey(actor, raw, restarted),
+	);
+	const stable = editorResourceKey(actor, raw, previous, true);
+	expect(editorResourceKey(actor, raw, restarted, true)).toBe(stable);
+	for (const changed of [
+		{ ...restarted, workspaceIdentity: "different-physical-root" },
+		{ ...restarted, contextKey: "different-context" },
+		{ ...restarted, cwd: "/new-root" },
+		{ ...restarted, pathFlavor: "windows" as const },
+		{ ...restarted, deviceId: "different-device" },
+	])
+		expect(editorResourceKey(actor, raw, changed, true)).not.toBe(stable);
+	for (const changed of [
+		{ ...actor, userId: "other" },
+		{ ...actor, narratorId: "host" },
+	])
+		expect(editorResourceKey(changed, raw, restarted, true)).not.toBe(stable);
+	expect(editorResourceKey(actor, { ...raw, origin: "legacy" }, restarted, true)).not.toBe(stable);
+});

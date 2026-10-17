@@ -265,14 +265,14 @@ test("binary navigation preserves viewer identity", async () => {
 	expect(viewerProps?.highlightRequestId).toBe("second");
 });
 
-test("large local text stays gated, uses legacy not preview, and confirms bounded pages", async () => {
+test("v1-compatible large local text stays gated, uses legacy not preview, and confirms bounded pages", async () => {
 	info.mockImplementation(async (_narrator, target) => ({
 		target,
 		fileName: "file.txt",
 		size: 2 * 1024 ** 2,
 	}));
 	const confirm = mock(() => {});
-	await render({ onConfirm: confirm, persistenceKey: "pane:source" });
+	await render({ rawProtocol: false, onConfirm: confirm, persistenceKey: "pane:source" });
 	expect(info.mock.calls[0]?.[3]).toBe("legacy");
 	expect(editorMounts).toBe(0);
 	expect(page).not.toHaveBeenCalled();
@@ -288,13 +288,13 @@ test("large local text stays gated, uses legacy not preview, and confirms bounde
 	expect(editorMounts).toBe(0);
 });
 
-test("confirmed remote large files use reference pages and oversized files remain blocked", async () => {
+test("v1-compatible confirmed remote large files use reference pages and oversized files remain blocked", async () => {
 	info.mockImplementation(async (_narrator, target) => ({
 		target,
 		fileName: "file.txt",
 		size: 2 * 1024 ** 2,
 	}));
-	await render({ deviceId: "remote", confirmed: true });
+	await render({ rawProtocol: false, deviceId: "remote", confirmed: true });
 	expect(page.mock.calls[0]?.[4]).toBe("reference");
 	expect(editorMounts).toBe(0);
 	info.mockImplementation(async (_narrator, target) => ({
@@ -302,7 +302,7 @@ test("confirmed remote large files use reference pages and oversized files remai
 		fileName: "too-big.txt",
 		size: MAX_FILE_PANEL_BYTES + 1,
 	}));
-	await render({ filePath: "/too-big.txt", confirmed: true });
+	await render({ rawProtocol: false, filePath: "/too-big.txt", confirmed: true });
 	expect(host.textContent).toContain("1 GiB viewing limit");
 	expect(page).toHaveBeenCalledTimes(1);
 	expect(editorMounts).toBe(0);

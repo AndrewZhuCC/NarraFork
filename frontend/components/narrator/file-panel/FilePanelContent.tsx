@@ -25,6 +25,8 @@ export interface FilePanelContentProps {
 	narratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
+	/** Explicit compatibility entry for a v1-only participant. */
+	rawProtocol?: boolean;
 	selection?: FileSelection;
 	navigationRequestId?: string;
 	onFileReferenceSelectionChange?: FileEditorContentProps["onFileReferenceSelectionChange"];
@@ -60,6 +62,7 @@ function FilePanelBody({
 	narratorId,
 	deviceId,
 	referenceOrigin,
+	rawProtocol,
 	selection,
 	navigationRequestId,
 	onFileReferenceSelectionChange,
@@ -96,6 +99,7 @@ function FilePanelBody({
 						narratorId={narratorId}
 						deviceId={deviceId}
 						referenceOrigin={referenceOrigin}
+						rawProtocol={rawProtocol}
 						selection={selection}
 						navigationRequestId={navigationRequestId}
 						onFileReferenceSelectionChange={onFileReferenceSelectionChange}
@@ -123,6 +127,7 @@ function FilePanelBody({
 			narratorId={narratorId}
 			deviceId={deviceId}
 			referenceOrigin={referenceOrigin}
+			rawProtocol={rawProtocol}
 		>
 			{content}
 		</EditorRecoveryBoundary>

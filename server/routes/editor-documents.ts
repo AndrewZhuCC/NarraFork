@@ -5,10 +5,11 @@ import { type Context, Hono } from "hono";
 import type { z } from "zod";
 import { EDITOR_METADATA_MAX_BYTES } from "../../shared/editor-document";
 import { db } from "../db";
-import { chapters, projects } from "../db/schema";
+import { chapters, projects, users } from "../db/schema";
 import { AppError, NotFoundError, zodValidationError } from "../lib/errors";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
 import { requireNarratorAccess } from "../lib/narrator-access";
+import { validateAccessTokenById } from "../lib/oauth-provider";
 import { getHome } from "../lib/platform";
 import { settings } from "../lib/settings";
 import {
@@ -22,6 +23,7 @@ import {
 	editorRecoveryScopeSchema,
 	editorUploadChunkSchema,
 } from "../lib/validators/editor-documents";
+import type { AuthPrincipal } from "../middleware/auth";
 import { RemoteBackend } from "../services/device-remote-backend";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import {
@@ -42,6 +44,7 @@ import {
 	authorizeEditorReferenceContext,
 	authorizeEditorReferenceTarget,
 } from "../services/file-reference-service";
+import { loadNarratorForAccess } from "../services/narrator-acl";
 import { resolveNarratorSessionCwd } from "../services/narrator-cwd";
 
 /** Bounded raw metadata reading also covers chunked requests with no Content-Length. */
@@ -75,18 +78,71 @@ export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<
 	if (!parsed.success) throw zodValidationError(parsed.error);
 	return parsed.data;
 }
-export function editorActor(c: Context): EditorActor {
-	const actor: EditorActor = {
-		signal: c.req.raw.signal,
-		userId: c.get("user").sub,
-		narratorId: c.req.param("id") ?? "",
-		locale: c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en",
+export function editorActor(c: Context): ReturnType<typeof editorActorForSubject> {
+	return editorActorForSubject(
+		{
+			userId: c.get("user").sub,
+			auth: c.get("auth"),
+			narratorId: c.req.param("id") ?? "",
+			locale: c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en",
+		},
+		c.req.raw.signal,
+	);
+}
+
+/** Rebuildable verified identity only: never retain a request, bearer or Hono context. */
+export function editorActorForSubject(
+	subject: { userId: string; narratorId: string; locale?: "en" | "zh-CN"; auth?: AuthPrincipal },
+	signal?: AbortSignal,
+): EditorActor & Required<Pick<EditorActor, "authorizeOperation">> {
+	const requireAccess = async (need: "read" | "write") => {
+		const user = await db.query.users.findFirst({
+			where: eq(users.id, subject.userId),
+			columns: { role: true, tokenVersion: true },
+		});
+		if (!user) throw new NotFoundError("User", subject.userId);
+		const auth = subject.auth;
+		if (
+			auth?.type === "session" &&
+			(auth.user.sub !== subject.userId ||
+				auth.user.exp <= Date.now() / 1000 ||
+				(auth.user.sv ?? 0) !== user.tokenVersion)
+		)
+			throw new AppError("Editor authorization expired", 403, "EDITOR_IDENTITY_CHANGED");
+		if (auth?.type === "oauth") {
+			const live = await validateAccessTokenById(auth.oauth.tokenId);
+			if (
+				!live ||
+				live.userId !== subject.userId ||
+				live.tokenId !== auth.oauth.tokenId ||
+				live.clientId !== auth.oauth.clientId ||
+				live.oauthClientId !== auth.oauth.oauthClientId ||
+				live.grantId !== auth.oauth.grantId ||
+				live.refreshFamilyId !== auth.oauth.refreshFamilyId ||
+				!auth.oauth.scopes.every((scope) => live.scopes.includes(scope))
+			)
+				throw new AppError("Editor authorization expired", 403, "EDITOR_IDENTITY_CHANGED");
+		}
+		return loadNarratorForAccess(
+			subject.narratorId,
+			{
+				userId: subject.userId,
+				isAdmin: user.role === "admin",
+			},
+			need,
+		);
+	};
+	const actor: EditorActor & Required<Pick<EditorActor, "authorizeOperation">> = {
+		...subject,
+		signal,
 		async authorizeOperation(deviceId) {
-			await requireNarratorAccess(c, actor.narratorId, "read");
+			await requireAccess("read");
 			await authorizeEditorOperationDevice(actor.narratorId, actor.userId, deviceId);
 		},
-		async authorize(input, need) {
-			const narrator = await requireNarratorAccess(c, c.req.param("id") ?? "", need);
+		async authorize(input, need, operationSignal = signal) {
+			operationSignal?.throwIfAborted();
+			const narrator = await requireAccess(need);
+			operationSignal?.throwIfAborted();
 			const device = input.deviceId ?? narrator.defaultDeviceId ?? "local";
 			if (device !== "local" && input.protocol === "raw-v2") {
 				const context = await authorizeEditorReferenceContext(
@@ -109,7 +165,7 @@ export function editorActor(c: Context): EditorActor {
 					narrator.defaultDeviceId,
 					narrator.chapterId,
 				]);
-				const root = await backend.editorRootIdentity();
+				const root = await backend.editorRootIdentity(operationSignal);
 				if (need === "write" && !backend.supportsEditorDurableWrite)
 					throw new AppError(
 						"Upgrade the executor: editor.durable-write.v1 is required",
@@ -228,7 +284,7 @@ export function editorActor(c: Context): EditorActor {
 			if (input.origin === "reference") {
 				const canonical = await authorizeEditorReferenceTarget(
 					narrator.id,
-					c.get("user").sub,
+					actor.userId,
 					lexicalPath,
 				);
 				if (canonical !== decision.physicalPath)
@@ -267,6 +323,13 @@ export function createEditorDocumentRoutes(
 		c.header("Cache-Control", "no-store");
 		await requireNarratorAccess(c, c.req.param("id") ?? "", "read");
 	};
+	// Draft/receipt metadata stays in the verified original-device namespace, even
+	// offline. This does not reopen a target or turn a remote path into Host IO.
+	const draftOwner = async (c: Context, scope: { deviceId?: string }) => {
+		const actor = editorActor(c);
+		await actor.authorizeOperation(scope.deviceId ?? "local");
+		return actor;
+	};
 	const base = "/:id/editor-documents";
 	routes.use(`${base}/*`, async (c, next) => {
 		if (
@@ -298,6 +361,42 @@ export function createEditorDocumentRoutes(
 		if (deviceId !== undefined && deviceId !== "local")
 			throw new AppError("Legacy panels are local only", 422, "EDITOR_REMOTE_UNSUPPORTED");
 	};
+	routes.get(`${base}/capabilities`, async (c) => {
+		const parsed = createEditorDocumentSchema.safeParse({ ...c.req.query(), protocol: "raw-v2" });
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const input = parsed.data,
+			actor = editorActor(c),
+			device = input.deviceId ?? "local";
+		let readMode: "raw-v2" | "bounded-preview" = "raw-v2";
+		if (device !== "local") {
+			const context = await authorizeEditorReferenceContext(
+				actor.narratorId,
+				actor.userId,
+				input.path,
+				device,
+				"read",
+			);
+			const backend = context.backend;
+			if (!(backend instanceof RemoteBackend))
+				throw new AppError("Execution device unavailable", 422, "EDITOR_PROVIDER_UNSUPPORTED");
+			if (!backend.supportsEditorRawRead) {
+				if (
+					!backend.supportsFsStatResolvedPath ||
+					!backend.supportsFsReadAtomicResolvedPath ||
+					!backend.supportsFsReadBounded
+				)
+					throw new AppError(
+						"Upgrade the executor: safe bounded filesystem reads are required",
+						422,
+						"EDITOR_PROVIDER_UNSUPPORTED",
+					);
+				readMode = "bounded-preview";
+			} else await actor.authorize(input, "read", c.req.raw.signal);
+		} else await actor.authorize(input, "read", c.req.raw.signal);
+		await actor.authorizeOperation(device);
+		await protect(c);
+		return c.json({ protocols: ["text-v1", "raw-v2"], readMode });
+	});
 	routes.get(`${base}/info`, async (c) => {
 		localPanelDevice(c);
 		return c.json(
@@ -324,16 +423,21 @@ export function createEditorDocumentRoutes(
 		// Match the owner namespace minted on the original transfer without opening today's
 		// path, creating a document, or depending on an unexpired transfer session. Current
 		// verified principal + narrator ACL authorize private draft/receipt discovery only.
-		const scope = { recoveryKey: editorRecoveryKey(editorActor(c), { ...parsed.data, path: "" }) };
+		const scope = {
+			recoveryKey: editorRecoveryKey(await draftOwner(c, parsed.data), {
+				...parsed.data,
+				path: "",
+			}),
+		};
+		await draftOwner(c, parsed.data);
 		await protect(c);
 		return c.json(scope);
 	});
 	routes.post(`${base}/draft-anchors`, async (c) => {
 		await protect(c);
 		const input = await readEditorMetadata(c.req.raw, createEditorDraftAnchorSchema);
-		if (input.deviceId && input.deviceId !== "local")
-			throw new AppError("Remote draft anchors are unsupported", 422, "EDITOR_REMOTE_UNSUPPORTED");
-		const anchor = await getService().createDraftAnchor(editorActor(c), input);
+		const anchor = await getService().createDraftAnchor(await draftOwner(c, input), input);
+		await draftOwner(c, input);
 		await protect(c);
 		return c.json(anchor);
 	});
@@ -345,9 +449,10 @@ export function createEditorDocumentRoutes(
 		if (!/^[a-f0-9-]{36}$/.test(id))
 			throw new AppError("Invalid draft anchor", 400, "VALIDATION_ERROR");
 		const anchor = await getService().draftAnchors.get(
-			editorRecoveryKey(editorActor(c), { ...parsed.data, path: "" }),
+			editorRecoveryKey(await draftOwner(c, parsed.data), { ...parsed.data, path: "" }),
 			id,
 		);
+		await draftOwner(c, parsed.data);
 		await protect(c);
 		return c.json(anchor);
 	});
@@ -359,9 +464,10 @@ export function createEditorDocumentRoutes(
 		if (!/^[a-f0-9-]{36}$/.test(id))
 			throw new AppError("Invalid draft anchor", 400, "VALIDATION_ERROR");
 		const result = await getService().draftAnchors.release(
-			editorRecoveryKey(editorActor(c), { ...parsed.data, path: "" }),
+			editorRecoveryKey(await draftOwner(c, parsed.data), { ...parsed.data, path: "" }),
 			id,
 		);
+		await draftOwner(c, parsed.data);
 		await protect(c);
 		return c.json(result);
 	});
@@ -373,9 +479,10 @@ export function createEditorDocumentRoutes(
 			if (!/^[a-f0-9-]{36}$/.test(id))
 				throw new AppError("Invalid draft anchor", 400, "VALIDATION_ERROR");
 			const anchor = await getService().draftAnchors[action](
-				editorRecoveryKey(editorActor(c), { ...scope, path: "" }),
+				editorRecoveryKey(await draftOwner(c, scope), { ...scope, path: "" }),
 				id,
 			);
+			await draftOwner(c, scope);
 			await protect(c);
 			return c.json(anchor);
 		});

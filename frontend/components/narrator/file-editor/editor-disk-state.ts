@@ -20,6 +20,7 @@
 import type { EditorDiskState } from "@shared/editor-document";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
+import { EditorFileSubscriptions } from "../../../lib/editor-file-subscription";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { sessionDirty } from "./editor-session-state";
 import type { EditorWorkingCopy } from "./editor-working-copy";
@@ -34,7 +35,11 @@ interface Entry {
 	visibleViews: number;
 	queued: boolean;
 	inflight?: AbortController;
-	idleTimer?: ReturnType<typeof setTimeout>;
+	watchId?: string;
+	watchActive?: boolean;
+	stopWatch?: () => void;
+	rebind?: boolean;
+	removeListener?: () => void;
 }
 interface NarratorHint {
 	copies: number;
@@ -49,22 +54,34 @@ export interface EditorDiskStateView {
 export class EditorDiskStateRegistry {
 	private entries = new Map<EditorWorkingCopy, Entry>();
 	private hints = new Map<string, NarratorHint>();
+	private pending = new Set<Entry>();
 	private running = 0;
+	private idleTimer?: ReturnType<typeof setInterval>;
+	private subscriptions = new EditorFileSubscriptions(narratorWSManager);
 	private removeGlobal?: () => void;
 	/** Diagnostics only (tests/acceptance): never drives behaviour. */
 	readonly diagnostics = { probes: 0, reloads: 0, discarded: 0 };
 
 	/** One handle per view; the copy's entry lives while any view is attached. */
 	attach(copy: EditorWorkingCopy, visible: boolean): EditorDiskStateView {
-		const { narratorId, deviceId, readOnlySource } = copy.options;
+		const { narratorId, readOnlySource } = copy.options;
 		// Probes need an editor-document session (readOnlySource has none). Whether
 		// the provider can verify it is decided per probe from the current caps.
-		if (!narratorId || readOnlySource || (!copy.session.state.capabilities && deviceId !== "local"))
-			return { setVisible: () => {}, detach: () => {} };
+		if (!narratorId || readOnlySource) return { setVisible: () => {}, detach: () => {} };
 		let entry = this.entries.get(copy);
 		if (!entry) {
 			entry = { copy, views: 0, visibleViews: 0, queued: false };
 			this.entries.set(copy, entry);
+			const observed = entry;
+			entry.removeListener = copy.subscribe(() => {
+				this.syncWatch(observed);
+				if (copy.session.state.invalidated) {
+					observed.inflight?.abort();
+					observed.queued = false;
+					this.pending.delete(observed);
+					this.scheduleIdle(observed);
+				}
+			});
 			this.retainHint(narratorId);
 			this.watchGlobal();
 		}
@@ -78,9 +95,15 @@ export class EditorDiskStateRegistry {
 			owned.visibleViews += next ? 1 : -1;
 			if (owned.visibleViews === 1 && next) this.request(owned);
 			else if (!owned.visibleViews) {
-				clearTimeout(owned.idleTimer);
-				owned.idleTimer = undefined;
+				owned.inflight?.abort();
+				owned.copy.session.cancelSourceLoad();
+				owned.queued = false;
+				this.pending.delete(owned);
+				owned.stopWatch?.();
+				owned.stopWatch = undefined;
+				owned.watchId = undefined;
 			}
+			this.scheduleIdle(owned);
 		};
 		setVisible(visible);
 		return {
@@ -90,8 +113,10 @@ export class EditorDiskStateRegistry {
 				setVisible(false);
 				attached = false;
 				if (--owned.views) return;
+				owned.removeListener?.();
 				owned.inflight?.abort();
 				this.entries.delete(copy);
+				this.scheduleIdle(owned);
 				this.releaseHint(narratorId);
 				if (!this.entries.size) {
 					this.removeGlobal?.();
@@ -104,8 +129,15 @@ export class EditorDiskStateRegistry {
 	/** Collapse any number of wake-ups into one queued probe per copy. */
 	private request(entry: Entry) {
 		// Hidden copies drop the wake-up; becoming visible again re-verifies.
-		if (!entry.visibleViews) return;
+		if (
+			!entry.visibleViews ||
+			entry.copy.session.state.invalidated ||
+			(typeof document !== "undefined" && document.visibilityState === "hidden")
+		)
+			return;
+		if (!entry.queued && this.pending.size >= 128) return;
 		entry.queued = true;
+		this.pending.add(entry);
 		this.pump();
 	}
 	private requestNarrator(narratorId?: string) {
@@ -113,20 +145,21 @@ export class EditorDiskStateRegistry {
 			if (!narratorId || entry.copy.options.narratorId === narratorId) this.request(entry);
 	}
 	private pump() {
-		for (const entry of this.entries.values()) {
+		for (const entry of this.pending) {
 			if (this.running >= MAX_CONCURRENT) return;
 			if (entry.queued && !entry.inflight && entry.visibleViews) this.start(entry);
 		}
 	}
 	private start(entry: Entry) {
 		entry.queued = false;
+		this.pending.delete(entry);
 		const session = entry.copy.session;
 		const docId = session.documentId;
 		const { phase, loading, invalidated, baseHash, capabilities } = session.state;
 		// A declared provider without a bounded read cannot verify disk identity.
 		if (capabilities && !capabilities.boundedRead) return;
 		// Unknown/in-flight saves and reloads own the baseline; check again later.
-		if (!docId || phase !== "idle" || loading || invalidated) {
+		if (!docId || (phase !== "idle" && phase !== "unknown") || loading || invalidated) {
 			this.scheduleIdle(entry);
 			return;
 		}
@@ -134,11 +167,27 @@ export class EditorDiskStateRegistry {
 		entry.inflight = controller;
 		this.running++;
 		this.diagnostics.probes++;
-		void editorDocumentApi
-			.diskState(entry.copy.options.narratorId, docId, controller.signal)
+		void (async () => {
+			if (phase === "unknown") {
+				await session.reconcile();
+				if (!controller.signal.aborted && session.state.phase === "idle") this.request(entry);
+				return;
+			}
+			if (entry.rebind) {
+				entry.rebind = false;
+				await session.refreshDocument();
+				if (!controller.signal.aborted) this.request(entry);
+				return;
+			}
+			return editorDocumentApi.diskState(entry.copy.options.narratorId, docId, controller.signal);
+		})()
 			.then(
-				(state) => this.apply(entry, docId, baseHash, state),
-				(error) => this.failed(entry, docId, error),
+				(state) => {
+					if (state && !controller.signal.aborted) this.apply(entry, docId, baseHash, state);
+				},
+				(error) => {
+					if (!controller.signal.aborted) this.failed(entry, docId, baseHash, error);
+				},
 			)
 			.finally(() => {
 				this.running--;
@@ -162,7 +211,7 @@ export class EditorDiskStateRegistry {
 		if (!this.current(entry, docId, baseHash)) {
 			// Our own receipt (or a reload/rebind) superseded this observation.
 			this.diagnostics.discarded++;
-			entry.queued = true;
+			this.request(entry);
 			return;
 		}
 		if (
@@ -184,27 +233,84 @@ export class EditorDiskStateRegistry {
 				entry.copy.session.setExternalDisk("modified");
 		});
 	}
-	private failed(entry: Entry, docId: string, error: unknown) {
+	private failed(entry: Entry, docId: string, baseHash: string | null, error: unknown) {
+		if (!this.current(entry, docId, baseHash)) return;
 		// Idle server documents expire; reauthorize the binding without touching text.
 		// A changed execution binding invalidates through the existing identity check.
 		if (
 			error instanceof ApiError &&
-			error.status === 410 &&
-			this.current(entry, docId, entry.copy.session.state.baseHash)
+			(error.status === 410 ||
+				(error.status === 403 && error.data?.code === "EDITOR_IDENTITY_CHANGED"))
 		)
 			void entry.copy.session.refreshDocument().then((refreshed) => {
 				if (refreshed && this.entries.get(entry.copy) === entry) this.request(entry);
 			});
+		else if (error instanceof ApiError && (error.status === 403 || error.status === 404))
+			entry.copy.session.invalidateAuthorization();
 		// Transport failures are not disk evidence; the next wake-up retries.
 	}
+	private syncWatch(entry: Entry) {
+		const doc = entry.copy.session.currentDocument;
+		const visible =
+			entry.visibleViews &&
+			(typeof document === "undefined" || document.visibilityState !== "hidden");
+		const id =
+			visible && !entry.copy.session.state.invalidated && doc?.capabilities?.watch
+				? doc.docId
+				: undefined;
+		if (id === entry.watchId) return;
+		entry.stopWatch?.();
+		entry.stopWatch = undefined;
+		entry.watchId = id;
+		entry.watchActive = false;
+		if (!id || !doc?.resourceKey) return;
+		entry.stopWatch = this.subscriptions.subscribe(
+			{
+				narratorId: entry.copy.options.narratorId,
+				docId: id,
+				resourceId: doc.stableResourceKey ?? doc.resourceKey,
+			},
+			(reason) => {
+				if (reason === "denied") {
+					entry.watchActive = false;
+					entry.inflight?.abort();
+					entry.copy.session.invalidateAuthorization();
+					entry.stopWatch?.();
+					entry.stopWatch = undefined;
+					entry.watchId = undefined;
+				} else if (reason === "disconnect") {
+					entry.watchActive = false;
+					entry.inflight?.abort();
+					entry.copy.session.cancelSourceLoad();
+					entry.rebind = true;
+				} else {
+					if (reason === "check") entry.watchActive = true;
+					if (reason === "unavailable") entry.watchActive = false;
+					if (reason === "rebind") {
+						entry.inflight?.abort();
+						entry.copy.session.cancelSourceLoad();
+						entry.rebind = true;
+					}
+					this.request(entry);
+				}
+			},
+		);
+	}
 	private scheduleIdle(entry: Entry) {
-		clearTimeout(entry.idleTimer);
-		entry.idleTimer = undefined;
-		if (!entry.visibleViews || this.entries.get(entry.copy) !== entry) return;
-		if (entry.queued) return this.pump();
-		entry.idleTimer = setTimeout(() => {
-			entry.idleTimer = undefined;
-			this.request(entry);
+		if (this.entries.get(entry.copy) === entry) this.syncWatch(entry);
+		const visible =
+			(typeof document === "undefined" || document.visibilityState !== "hidden") &&
+			[...this.entries.values()].some(
+				(item) => item.visibleViews && !item.copy.session.state.invalidated,
+			);
+		if (!visible) {
+			clearInterval(this.idleTimer);
+			this.idleTimer = undefined;
+			return;
+		}
+		this.idleTimer ??= setInterval(() => {
+			for (const entry of this.entries.values())
+				if (!entry.watchActive || !narratorWSManager.connected) this.request(entry);
 		}, VISIBLE_IDLE_MS);
 	}
 	private retainHint(narratorId: string) {
@@ -241,9 +347,20 @@ export class EditorDiskStateRegistry {
 	private watchGlobal() {
 		if (this.removeGlobal || typeof document === "undefined") return;
 		const focus = () => {
+			for (const entry of this.entries.values()) {
+				if (document.visibilityState === "hidden") entry.inflight?.abort();
+				this.scheduleIdle(entry);
+			}
 			if (document.visibilityState === "visible") this.requestNarrator();
 		};
 		const removeConnection = narratorWSManager.onConnectionChange((connected, reconnect) => {
+			for (const entry of this.entries.values()) {
+				if (!connected) {
+					entry.inflight?.abort();
+					entry.copy.session.cancelSourceLoad();
+				}
+				if (reconnect) entry.rebind = true;
+			}
 			if (connected && reconnect) this.requestNarrator();
 		});
 		document.addEventListener("visibilitychange", focus);
@@ -252,6 +369,15 @@ export class EditorDiskStateRegistry {
 			document.removeEventListener("visibilitychange", focus);
 			window.removeEventListener("focus", focus);
 			removeConnection();
+		};
+	}
+	resources() {
+		return {
+			copies: this.entries.size,
+			running: this.running,
+			pending: this.pending.size,
+			timers: this.idleTimer ? 1 : 0,
+			subscriptions: this.subscriptions.size,
 		};
 	}
 	/** Diagnostics only. */
@@ -274,7 +400,9 @@ export class EditorDiskStateRegistry {
 				visibleViews: entry.visibleViews,
 				queued: entry.queued,
 				inflight: !!entry.inflight,
-				idleTimer: !!entry.idleTimer,
+				idleTimer: !!this.idleTimer,
+				subscriptions: this.subscriptions.size,
+				watchActive: !!entry.watchActive,
 				globalListening: !!this.removeGlobal,
 			};
 		}

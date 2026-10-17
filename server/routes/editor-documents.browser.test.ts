@@ -562,11 +562,13 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 							),
 						);
 						expect(diagnostics).toEqual([]);
-						// Exactly the revoked-principal probe is refused; nothing else fails.
+						// The revoked probe and independent recovery proof both fail closed.
+						// Restoring an ACL cannot thaw the old copy; explicit reopen is fresh.
 						expect(httpErrorUrls).toEqual([
 							`404 /api/narrators/${narratorId}/editor-documents/:id/disk-state`,
+							`404 /api/narrators/${narratorId}/editor-documents/recovery-scope`,
 						]);
-						expect(httpErrors).toBe(1);
+						expect(httpErrors).toBe(2);
 						expect(offOriginCount).toBe(0);
 						return;
 					}

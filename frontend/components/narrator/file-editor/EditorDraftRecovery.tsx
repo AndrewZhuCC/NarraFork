@@ -44,7 +44,7 @@ export function EditorDraftRecovery({
 	latest.current = options;
 	// biome-ignore lint/correctness/useExhaustiveDependencies: identity fences late discovery without depending on unstable option closures
 	useEffect(() => {
-		if (!visible || !latest.current.narratorId || latest.current.deviceId !== "local") {
+		if (!visible || !latest.current.narratorId) {
 			setRows([]);
 			setCopy(null);
 			setIncomplete(false);
@@ -95,7 +95,7 @@ export function EditorDraftRecovery({
 					void editorDocumentApi.release(opts.narratorId, descriptor.docId).catch(() => {});
 					controller.signal.throwIfAborted();
 					if (descriptor.recoveryKey === scope.recoveryKey)
-						setAuthorizedResource(descriptor.resourceKey ?? null);
+						setAuthorizedResource(descriptor.stableResourceKey ?? descriptor.resourceKey ?? null);
 				} catch {
 					controller.signal.throwIfAborted(); /* original owner may still export */
 				}
@@ -255,7 +255,7 @@ function DraftCandidate({
 			);
 			void editorDocumentApi.release(options.narratorId, descriptor.docId).catch(() => {});
 			if (
-				descriptor.resourceKey !== row.scope.resourceKey ||
+				(descriptor.stableResourceKey ?? descriptor.resourceKey) !== row.scope.resourceKey ||
 				descriptor.recoveryKey !== row.scope.recoveryKey
 			)
 				throw new Error("EDITOR_DRAFT_READ_ONLY");

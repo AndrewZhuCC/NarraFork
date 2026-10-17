@@ -180,6 +180,85 @@ test("raw open final authorization and DELETE settle without leaking the closing
 	}
 });
 
+test.each([
+	"before",
+	"second-frame",
+] as const)("remote assembled body reauthorizes current access %s publication and returns its window on denial", async (when) => {
+	const bytes = Buffer.alloc(64 * 1024, 65);
+	await writeFile(target, bytes);
+	const digest = createHash("sha256").update(bytes).digest("hex");
+	const original = actor.authorize.bind(actor);
+	let revoked = false,
+		body = false,
+		bodyFrames = 0,
+		checks = 0;
+	const closes: boolean[] = [];
+	actor.authorize = async (...args) => {
+		checks++;
+		if (revoked) throw new EditorDocumentError("FORBIDDEN", "Current device access revoked", 403);
+		return {
+			...(await original(...args)),
+			deviceId: "peer",
+			workspaceIdentity: "root",
+			runtimeEpoch: "epoch",
+			runtimeGeneration: 1,
+			rawSource: {
+				open: async () => ({
+					readId: "peer-read",
+					sourceGeneration: "generation",
+					totalBytes: bytes.length,
+					rawDigest: digest,
+					identity: {
+						deviceId: "peer",
+						pathFlavor: "posix" as const,
+						canonicalPath: target,
+						workspaceIdentity: "root",
+						runtimeEpoch: "epoch",
+						runtimeGeneration: 1,
+						fencingToken: 1,
+					},
+				}),
+				chunk: async (input) => {
+					expect(input.maxBytes).toBeLessThanOrEqual(16384);
+					if (body && ++bodyFrames === 2 && when === "second-frame") revoked = true;
+					const part = bytes.subarray(input.offset, input.offset + input.maxBytes);
+					return {
+						readId: input.readId,
+						sourceGeneration: "generation",
+						offset: input.offset,
+						bytes: part.length,
+						dataB64: part.toString("base64"),
+						eof: input.offset + part.length === bytes.length,
+					};
+				},
+				close: async (input) => {
+					if (body) closes.push(input.abort);
+				},
+			},
+		};
+	};
+	const doc = await service.create(actor, {
+		path: target,
+		deviceId: "peer",
+		origin: "reference",
+		protocol: "raw-v2",
+	});
+	const opened = await service.rawOpen(actor, doc.docId, doc.versionHandle);
+	body = true;
+	checks = 0;
+	if (when === "before") revoked = true;
+	await expect(service.rawChunk(actor, doc.docId, opened.readId, 0, 65536)).rejects.toMatchObject({
+		code: "FORBIDDEN",
+		statusCode: 403,
+	});
+	expect(bodyFrames).toBe(when === "before" ? 0 : 2);
+	expect(checks).toBe(when === "before" ? 1 : 2);
+	expect(closes).toEqual([true]);
+	expect(service.streams.diagnostics.active).toBe(0);
+	expect(service.streams.diagnostics.windowBytes).toBe(0);
+	expect(dispatches).toBe(0);
+});
+
 async function createFifo(path: string) {
 	const command = Bun.spawn(["mkfifo", path], {
 		stdin: "ignore",

@@ -1,6 +1,7 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import type { EditorRawDocumentDescriptor } from "@shared/editor-document";
 import { EditorStreamCodec } from "@shared/editor-stream-codec";
+import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { EditorDocumentSession, sessionCanSave } from "./editor-session-state";
 import { EditorWorkingCopy } from "./editor-working-copy";
@@ -25,8 +26,8 @@ function descriptor(): EditorRawDocumentDescriptor {
 		},
 	};
 }
-function setup() {
-	const document = descriptor();
+function setup(stableResourceKey?: string) {
+	const document = { ...descriptor(), ...(stableResourceKey ? { stableResourceKey } : {}) };
 	let installed = 0,
 		disposed = 0;
 	const api = {
@@ -36,6 +37,7 @@ function setup() {
 			throw new Error("v1 full source must not run");
 		}),
 		release: mock(async () => ({})),
+		diskState: mock(async () => ({ exists: true as const, ...document })),
 		createUpload: mock(editorDocumentApi.createUpload),
 	};
 	let prepare = async () => ({
@@ -82,6 +84,66 @@ function setup() {
 		},
 	};
 }
+test.each([
+	"denied",
+	"rebound",
+] as const)("cancelled source authorization cannot freeze a live copy on a late %s response", async (outcome) => {
+	const value = setup("root-A");
+	await value.session.load();
+	let resolve!: (document: typeof value.document) => void, reject!: (error: unknown) => void;
+	value.api.create.mockImplementationOnce(
+		() =>
+			new Promise((yes, no) => {
+				resolve = yes;
+				reject = no;
+			}),
+	);
+	const loading = value.session.load(true);
+	value.session.change({ revision: 2, alternativeVersionId: 2, length: 3 });
+	value.session.cancelSourceLoad();
+	if (outcome === "denied")
+		reject(new ApiError("old response", 403, { code: "EDITOR_IDENTITY_CHANGED" }));
+	else resolve({ ...value.document, resourceKey: "late-root-B", stableResourceKey: "root-B" });
+	expect(await loading).toBe(false);
+	expect(value.session.state.invalidated).not.toBe(true);
+	expect(value.session.state.baseHash).toBe(value.document.baseHash);
+	expect(value.installed).toBe(1);
+	value.session.dispose();
+});
+
+test("runtime-only fresh authorization forces version verification, preserves dirty revision/base/format, and root changes freeze", async () => {
+	const value = setup("verified-root-A");
+	try {
+		await value.session.load();
+		value.session.change({ revision: 2, alternativeVersionId: 2, length: 3 });
+		const before = value.session.state;
+		value.api.create.mockResolvedValue({
+			...value.document,
+			resourceKey: "new-runtime",
+			docId: "new-doc",
+			baseHash: "different-disk",
+		});
+		expect(await value.session.refreshDocument()).toBe(true);
+		expect(value.api.diskState).toHaveBeenCalledTimes(1);
+		expect(value.session.state.version).toBe(before.version);
+		expect(value.session.state.baseHash).toBe(before.baseHash);
+		expect(value.installed).toBe(1);
+		expect(value.session.state.invalidated).toBeUndefined();
+		value.api.create.mockResolvedValue({
+			...value.document,
+			stableResourceKey: "verified-root-B",
+			resourceKey: "root-B-runtime",
+		});
+		expect(await value.session.refreshDocument()).toBe(false);
+		expect(value.session.state.invalidated).toBe(true);
+		expect(value.session.state.version).toBe(before.version);
+		expect(value.session.state.baseHash).toBe(before.baseHash);
+		expect(value.installed).toBe(1);
+	} finally {
+		value.session.dispose();
+	}
+});
+
 test("paged metadata follows the single reauthorized document without rebasing its original raw baseline", async () => {
 	const first = { ...descriptor(), docId: "expired", lineCount: 1_000_001 };
 	let next = { ...first, docId: "fresh" };

@@ -54,13 +54,18 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 	});
 	function FilePane(
 		props: IDockviewPanelProps<
-			{ path: string } & Pick<FilePanelContentProps, "selection" | "navigationRequestId">
+			{ path: string; fixtureRevision?: number } & Pick<
+				FilePanelContentProps,
+				"selection" | "navigationRequestId"
+			>
 		>,
 	) {
 		return (
 			<WorkspaceResourceFrame props={props}>
 				<div data-cache-pane={props.api.id} style={{ height: "100%" }}>
 					<FilePanelContent
+						key={props.params.fixtureRevision ?? 0}
+						rawProtocol={false}
 						filePath={props.params.path}
 						narratorId={config.narratorId}
 						selection={props.params.selection}
@@ -193,6 +198,14 @@ export async function runEditorCacheFixture(config: { path: string; narratorId: 
 		},
 		show(id: string) {
 			dock?.getPanel(id)?.api.setActive();
+		},
+		reopen(id: string) {
+			const panel = dock?.getPanel(id);
+			if (!panel?.params) throw new Error(`Missing explicit reopen panel ${id}`);
+			panel.api.updateParameters({
+				...panel.params,
+				fixtureRevision: (panel.params.fixtureRevision ?? 0) + 1,
+			});
 		},
 		mode(id: string, value: string) {
 			const input = document.querySelector<HTMLInputElement>(
