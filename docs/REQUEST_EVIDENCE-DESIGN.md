@@ -47,7 +47,7 @@
 
 ## 3. 核心模型：请求证据（Request Evidence）
 
-把「dump」和「录制」合并为一个概念：**请求证据**。它就是现有的录制，旧版 JSON dump 降级为它的一种**派生视图**和**历史来源**。
+把「dump」和「录制」合并为一个概念：**请求证据**。它就是现有的录制，旧版 JSON dump 只作为导出时的**派生视图**存在；旧数据直接丢弃（决定 D1）。
 
 ```
 provider.chat()
@@ -66,7 +66,6 @@ provider.chat()
 | `ring` | 仍在循环窗口内 | 固定并下载 |
 | `pinned` | 已固定（带 `reason`） | 下载、删除 |
 | `evicted` | 已被循环淘汰，未固定 | 只能看 diagnostics |
-| `legacy` | 旧版 `raw_dump_json`/溢写文件 | 查看、下载（只读兼容） |
 | `none` | 录制关闭或该请求未录 | 只能看 diagnostics |
 
 ### 3.2 固定原因（`pin.reason`）
@@ -90,7 +89,8 @@ provider.chat()
 
 - `api_requests` 新增 `recording_request_id text`（可空，建索引 `(recording_request_id)`）。tracker 在 `createApiRequest`/`finish` 时已经拿到 `options.recordingRequestId`，顺手写入；`bindRecordingRequest` 保留，worker 仍需要它写 manifest。
 - 固定状态**不**写进数据库：它的权威在 recorder（manifest/summary），且循环淘汰频繁，镜像进 SQLite 会变成高频写。使用历史列表需要状态时，对当前页（≤100 条）的 `recording_request_id` 批量调用 recorder 新增的 `status` 操作（worker 内存索引查表，O(n)，有上限）。
-- `raw_dump_json` 语义收窄为「诊断 + 旧版兼容」：新请求只写 diagnostics；列表字段拆成 `hasDiagnostics` 与 `hasLegacyDump`（`json_extract(raw_dump_json,'$.request') IS NOT NULL OR '$.spill'`——注意这是列表路径，需要避免全行读取；可改为写入时就设定一个小的 `dump_kind` 列，详见待定 Q3）。
+- 新增 `api_requests.diagnostics_json`（有界诊断，≤ 16KiB），新请求只写这一列；列表字段 `hasRawDump` 改为 `hasDiagnostics`，不再有「旧版 dump」分支（决定 D3）。
+- `raw_dump_json` 停止写入，存量由后台分批 `SET raw_dump_json = NULL`（复用 `database-cleanup-service` 现有的分批清空逻辑，不在启动迁移里同步跑），全部清空后的下一个版本再删列。旧诊断随之丢弃，可接受。
 - 迁移按 CLAUDE.md 流程：改 `server/db/schema.ts` → `bun run db:generate`；PG 走 `db:generate:pg`。
 
 ### 4.2 recorder 新增操作
@@ -107,14 +107,14 @@ provider.chat()
 
 - `ApiRequestDumpCollector` 只保留：转发给 recording、有界 diagnostics 前缀（现有 `RING_DIAGNOSTIC_PREFIX_BYTES`）、畸形请求的结构摘要。删除 `snapshot()`/`materializeRequest()`/`attempts` 预览这类主线程 JSON 物化。
 - `loop.ts` 的 `rawDump: requestDumpEnabled || forceDumpPersist ? snapshot() : …` 改为只传 diagnostics；`forceDumpPersist` 变成 `pin("leak")`。
-- `api-request-dump-store.ts` 的溢写写入路径、`malformed-request-dump.ts` 的写文件路径下线；读取路径保留给 legacy。
+- `api-request-dump-store.ts`、`malformed-request-dump.ts` 整体删除，`GET /api/usage-history/:id/raw-dump` 下线；`request-dumps/`、`malformed-request-dumps/` 两个目录由启动后的后台任务分批删除（D1）。
 
 ### 4.4 派生视图：「旧版 JSON」只在导出时生成
 
 很多人（和 token 修复）习惯的是 `{ request: { body }, response: { events } }` 这种 JSON。统一后它由 worker 在**打包 ZIP 时**从帧派生，作为 bundle 内的 `dump.json`（每个请求一份，有上限，超限就不生成并在 manifest 标注），而不是在请求热路径上维护。这样：
 
 - 用户下载拿到的始终是同一种 ZIP：`manifest.json` + `chunks/` + `dump.json`（可读视图）。
-- 旧版行的下载也包成同样的 ZIP：`manifest.json`（`source: "legacy"`）+ 原 dump JSON。使用历史的「下载」按钮只有一种产物。
+- 使用历史的「下载」按钮只有一种产物。
 
 ### 4.5 header 完整度：给 headers 单独预算
 
@@ -125,7 +125,7 @@ provider.chat()
 - 重复 header（如多个 `set-cookie`、`via`）保留为数组，不再被 `Headers.entries()` 合并时丢失。
 - 预算按次 attempt 计；`/v1` 回退、重连等多次 attempt 各自独立，不互相挤占。
 
-### 4.6 token 修复改为读证据
+### 4.6 token 修复改为读证据（取决于 Q4）
 
 `analyzeTokenRepairEvidence(row, rawDumpJson)` 改为接收一个证据源接口：
 
@@ -144,7 +144,7 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 
 新增 `RequestEvidencePanel` + `useRequestEvidence(narratorId, recordingRequestId | apiRequestId)`，由现在的 `useErrorRequestDump` 演化：
 
-- **使用历史详情抽屉**：显示状态徽标（循环中 / 已固定·原因 / 已淘汰 / 旧版），按钮「固定并下载」或「下载」；diagnostics 单独一节，不再冒充 dump。列表的「查看 dump」改为证据状态图标。
+- **使用历史详情抽屉**：显示状态徽标（循环中 / 已固定·原因 / 已淘汰 / 未录制），按钮「固定并下载」或「下载」；diagnostics 单独一节，不再冒充 dump。列表的「查看 dump」改为证据状态图标。
 - **报错卡片**：复用同一面板（现在的 ErrorRequestModal）。
 - **SaveDumpModal（`/save_dump` 列表）**：每份固定保存列出包含的请求，可跳转到对应使用历史行。
 
@@ -161,21 +161,21 @@ recording 实现由 evidence worker 读固定区段文件流式解析（已在 w
 
 ### 4.9 存储统计
 
-合并为一个分类 `requestEvidence`，下分三行：循环区、固定区、旧版（`request-dumps/` + `malformed-request-dumps/` + `raw_dump_json` 估算）。旧版行提供「清理旧版 dump」按钮，走现有 database-cleanup 后台任务。
+合并为一个分类 `requestEvidence`，下分两行：循环区、固定区。`requestDumps` 分类随旧目录删除一起移除。
 
 ## 5. 分阶段落地
 
 每一阶段都可单独合并，且不破坏现状。
 
 1. **P1 打通索引（纯增量）**：`recording_request_id` 列 + recorder `status` 操作 + 使用历史抽屉显示证据状态与「固定并下载」；headers 单独预算（4.5）。用户立刻能在使用历史里拿到循环录制。
-2. **P2 收敛固定路径**：`leak`/`malformed` 改为 pin；`requestDumpEnabled` 不再写旧版 JSON（停止双写）；`raw_dump_json` 只写 diagnostics；列表字段拆分。ZIP 内增加派生 `dump.json`。
+2. **P2 收敛固定路径**：`leak`/`malformed` 改为 pin；`requestDumpEnabled` 不再写旧版 JSON（停止双写）；新请求只写 `diagnostics_json`，`hasRawDump` 改为 `hasDiagnostics`。ZIP 内增加派生 `dump.json`。
 3. **P3 消费方迁移**：token 修复双源；设置合并与迁移；存储分类合并；`REQUEST_DUMPS.md` 改写。
-4. **P4 下线旧写入代码**：删除溢写写入、畸形 dump 写入、collector 快照物化；旧版只读路径保留到后续版本再评估移除。
+4. **P4 下线旧代码与旧数据**：删除溢写、畸形 dump、collector 快照物化及 raw-dump 下载路由；后台清空 `raw_dump_json` 与两个旧目录；下一个版本删列。
 
-## 6. 待定问题（需要决定）
+## 6. 已定与待定
 
-- **Q1 旧数据**：推荐**只读兼容**（旧行继续能查看/下载，随清理任务老化），不做后台转换成固定保存——转换要读大量溢写文件，收益只是格式统一。
-- **Q2 `/save_dump` 窗口快照是否保留多请求语义**：推荐保留；它和单请求固定是两种不同用途（「刚才那一段」vs「这一条」）。
-- **Q3 列表如何判断旧版 dump**：推荐新增小列 `dump_kind`（`diagnostics` / `legacy`）在写入时设定，避免列表路径 `json_extract` 大字段；旧行由后台一次性分批回填，未回填前按 `legacy` 对待。
-- **Q4 token 修复遇到循环区证据**：推荐直接判 `insufficient`，不为修复自动 pin，避免修复任务悄悄占用固定区。
+- **D1 旧数据：直接丢弃。** 不做只读兼容、不做转换；旧目录和 `raw_dump_json` 由后台任务清理。
+- **D2 `/save_dump` 保留窗口快照**（多请求）；单条固定由报错卡片和使用历史负责。
+- **D3 不再区分新旧**：只有新版证据 + 有界诊断。
+- **Q4 token 修复（历史 Token 核对）**：它依赖旧 dump 里的响应 usage 重算历史行的缓存 token；旧 dump 丢弃后它对历史行就没有证据了。待定：先跑一次核对再丢弃，还是连同该功能的 dump 证据路径一起移除。
 - **Q5 设置是否改键名**：推荐改为 `requestEvidence.*` 并迁移，因为 `requestDumpEnabled` 的含义已经变了，沿用旧名会继续误导；代价是一个版本的双键兼容。
