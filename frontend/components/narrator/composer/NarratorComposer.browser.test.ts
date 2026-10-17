@@ -620,6 +620,36 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 		expect(await page.$eval("[data-inline-quote-candidate] kbd", (node) => node.textContent)).toBe(
 			"Tab",
 		);
+		const shortcut = await page.$eval("[data-inline-quote-candidate]", (candidate) => {
+			const button = candidate.querySelector("button");
+			const keycap = button?.querySelector("kbd");
+			const action = button?.querySelector("[data-quote-action]");
+			if (!button || !keycap || !action) throw new Error("Missing quote shortcut parts");
+			const style = getComputedStyle(keycap);
+			return {
+				first: button.firstElementChild === keycap,
+				precedesAction: !!(
+					keycap.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING
+				),
+				label: keycap.getAttribute("aria-label"),
+				shortcut: button.getAttribute("aria-keyshortcuts"),
+				icon: !!keycap.querySelector("svg"),
+				topBorder: Number.parseFloat(style.borderTopWidth),
+				bottomBorder: Number.parseFloat(style.borderBottomWidth),
+				shrink: style.flexShrink,
+				height: keycap.getBoundingClientRect().height,
+				chipHeight: candidate.getBoundingClientRect().height,
+			};
+		});
+		expect(shortcut.first).toBe(true);
+		expect(shortcut.precedesAction).toBe(true);
+		expect(shortcut.label).toBe("Tab key");
+		expect(shortcut.shortcut).toBe("Tab");
+		expect(shortcut.icon).toBe(true);
+		expect(shortcut.topBorder).toBeGreaterThan(0);
+		expect(shortcut.bottomBorder).toBeGreaterThan(shortcut.topBorder);
+		expect(shortcut.shrink).toBe("0");
+		expect(shortcut.height).toBeLessThan(shortcut.chipHeight);
 		const consumed = await page.evaluate(() =>
 			[
 				{ key: "q", code: "KeyQ", altKey: true },

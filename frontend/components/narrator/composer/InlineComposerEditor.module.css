@@ -303,6 +303,31 @@
 	cursor: pointer;
 }
 
+.candidateAction,
+.candidateAccept > svg {
+	flex-shrink: 0;
+}
+
+.candidateShortcut {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	gap: 3px;
+	height: 18px;
+	box-sizing: border-box;
+	padding-inline: 4px;
+	border: 1px solid var(--mantine-color-dimmed);
+	border-bottom-width: 2px;
+	border-radius: 4px;
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 10px;
+	font-weight: 600;
+	line-height: 1;
+}
+
 .candidateAccept:disabled {
 	opacity: 0.6;
 	cursor: default;

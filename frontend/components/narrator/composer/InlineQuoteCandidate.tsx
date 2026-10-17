@@ -1,4 +1,4 @@
-import { IconFileText, IconQuote, IconX } from "@tabler/icons-react";
+import { IconArrowBarToRight, IconFileText, IconQuote, IconX } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import classes from "./InlineComposerEditor.module.css";
 import type { QuoteCandidate } from "./use-quote-candidate";
@@ -23,6 +23,7 @@ export function InlineQuoteCandidate({
 	const unavailable = candidate.kind === "file" && !candidate.reference;
 	const label = candidate.kind === "text" ? candidate.quote.label : candidate.label;
 	const Icon = candidate.kind === "text" ? IconQuote : IconFileText;
+	const keyboardShortcut = showShortcut && candidate.kind === "text";
 	return (
 		// biome-ignore lint/a11y/useSemanticElements: a paragraph widget requires phrasing content, not a block fieldset.
 		<span
@@ -35,6 +36,7 @@ export function InlineQuoteCandidate({
 			<button
 				type="button"
 				className={classes.candidateAccept}
+				aria-keyshortcuts={keyboardShortcut ? "Tab" : undefined}
 				disabled={disabled || unavailable}
 				title={
 					unavailable
@@ -45,11 +47,22 @@ export function InlineQuoteCandidate({
 				}
 				onClick={() => onAccept(candidate)}
 			>
-				<Icon size={14} />
-				<span className={classes.label}>
-					{t("quote.add", { defaultValue: "Quote selection" })} · {label}
+				{keyboardShortcut ? (
+					<kbd
+						className={classes.candidateShortcut}
+						aria-label={t("quote.tabKey")}
+						title={t("quote.tabKey")}
+					>
+						<IconArrowBarToRight size={12} aria-hidden="true" />
+						Tab
+					</kbd>
+				) : (
+					<Icon size={14} />
+				)}
+				<span className={classes.candidateAction} data-quote-action>
+					{t("quote.add", { defaultValue: "Quote selection" })}
 				</span>
-				{showShortcut && candidate.kind === "text" && <kbd>Tab</kbd>}
+				<span className={classes.label}>· {label}</span>
 			</button>
 			<button
 				type="button"
