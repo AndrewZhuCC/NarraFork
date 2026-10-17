@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
 import { ApiError, api } from "@frontend/lib/api";
 import { resetSessionStoreForTest } from "@frontend/lib/session-store";
@@ -51,6 +51,10 @@ let sendingRef = { current: false };
 let flags: boolean[];
 let renders: number;
 let testNarratorId = "n1";
+let attachmentsHydrating: boolean;
+let attachmentsRestoreFailed: boolean;
+let retryAttachments = mock(() => {});
+let documentAssetsChange = mock((_ids: readonly string[]) => {});
 let getSpy: ReturnType<typeof spyOn<typeof api, "getNarratorDraft">>;
 let panelSpy: ReturnType<typeof spyOn<typeof api, "getNarratorPanelState">>;
 let updateSpy: ReturnType<typeof spyOn<typeof api, "updateNarratorDraft">>;
@@ -65,6 +69,10 @@ function Harness() {
 			sendingRef={sendingRef}
 			permEnterActive={false}
 			hasAttachments={false}
+			attachmentsHydrating={attachmentsHydrating}
+			attachmentsRestoreFailed={attachmentsRestoreFailed}
+			onRetryAttachments={retryAttachments}
+			onDocumentAssetsChange={documentAssetsChange}
 			enterMode="turn"
 			ctrlEnterMode="interrupt"
 			onSendWithMode={() => {}}
@@ -202,6 +210,10 @@ beforeEach(async () => {
 	flags = [];
 	renders = 0;
 	testNarratorId = "n1";
+	attachmentsHydrating = false;
+	attachmentsRestoreFailed = false;
+	retryAttachments = mock(() => {});
+	documentAssetsChange = mock((_ids: readonly string[]) => {});
 });
 
 afterEach(async () => {
@@ -670,6 +682,207 @@ describe("composer rich document contract", () => {
 			],
 		});
 	}
+	test.each([
+		"local hydration",
+		"metadata fast path",
+	] as const)("%s declares rich draft asset ownership before Files finish restoring", async (path) => {
+		attachmentsHydrating = true;
+		const doc = richDocument();
+		const input = { ...composerDocumentText(doc), composerDocument: doc };
+		persistNarratorInputDraft("u1", "n1", input.text, 7, "t7", input.fileReferences, input, doc);
+		if (path === "local hydration") {
+			panelSpy.mockReturnValue(
+				deferred<Awaited<ReturnType<typeof api.getNarratorPanelState>>>().promise,
+			);
+		} else {
+			panelSpy.mockResolvedValue({
+				permissions: [],
+				buffer: [],
+				draft: { hasDraft: true, revision: 7, updatedAt: "t7" },
+				hasMore: { permissions: false, buffer: false },
+			});
+		}
+		await render();
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(documentAssetsChange).toHaveBeenCalledWith(["missing-image"]);
+		expect(documentAssetsChange.mock.calls.every(([ids]) => ids.includes("missing-image"))).toBe(
+			true,
+		);
+		expect(getSpy).not.toHaveBeenCalled();
+		expect(updateSpy).not.toHaveBeenCalled();
+	});
+	test("deleting a pending image declares empty membership without waiting for its File", async () => {
+		attachmentsHydrating = true;
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(documentAssetsChange).toHaveBeenLastCalledWith(["missing-image"]);
+		const pendingImage = host.querySelector('[data-composer-asset-id="missing-image"]');
+		expect(pendingImage?.getAttribute("data-loading")).toBe("true");
+		expect(pendingImage?.hasAttribute("data-missing")).toBe(false);
+		expect(pendingImage?.getAttribute("aria-busy")).toBe("true");
+		documentAssetsChange.mockClear();
+		const editor = getEditor();
+		let position = -1;
+		editor.state.doc.descendants((node, pos) => {
+			if (node.type.name === "attachment") position = pos;
+		});
+		expect(position).toBeGreaterThan(0);
+		await act(async () => editor.view.dispatch(editor.state.tr.delete(position, position + 1)));
+		expect(handle.current?.getDocument()?.assets).toEqual([]);
+		expect(documentAssetsChange).toHaveBeenLastCalledWith([]);
+		expect(handle.current?.getText()).toBe(input.text);
+		attachmentsHydrating = false;
+		await render();
+		expect(handle.current?.getDocument()?.assets).toEqual([]);
+		expect(handle.current?.hasMissingAssets()).toBe(false);
+	});
+	test("an unavailable image becomes missing only after attachment restoration settles", async () => {
+		attachmentsHydrating = true;
+		await render();
+		const doc = richDocument();
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		const image = () => host.querySelector('[data-composer-asset-id="missing-image"]');
+		expect(image()?.getAttribute("data-loading")).toBe("true");
+		expect(image()?.hasAttribute("data-missing")).toBe(false);
+		expect(handle.current?.hasMissingAssets()).toBe(true);
+		expect(host.textContent).toContain("composerRestoringAssets");
+		expect(host.textContent).not.toContain("composerMissingAssets");
+		attachmentsHydrating = false;
+		await render();
+		expect(image()?.hasAttribute("data-loading")).toBe(false);
+		expect(image()?.getAttribute("data-missing")).toBe("true");
+		expect(image()?.hasAttribute("aria-busy")).toBe(false);
+		expect(handle.current?.hasMissingAssets()).toBe(true);
+		expect(host.textContent).toContain("composerMissingAssets");
+		expect(host.textContent).not.toContain("composerRestoringAssets");
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(documentAssetsChange).toHaveBeenLastCalledWith(["missing-image"]);
+	});
+	test("legacy typing during attachment hydration does not declare unknown membership empty", async () => {
+		attachmentsHydrating = true;
+		const input = { text: "legacy input", fileReferences: [] };
+		persistNarratorInputDraft("u1", "n1", input.text, 7, "t7", [], input);
+		panelSpy.mockReturnValue(
+			deferred<Awaited<ReturnType<typeof api.getNarratorPanelState>>>().promise,
+		);
+		await render();
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("typed ", 1)));
+		expect(handle.current?.getText()).toBe("typed legacy input");
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+		await act(async () => handle.current?.clearTextAndDraft());
+		expect(documentAssetsChange).toHaveBeenLastCalledWith([]);
+		expect(handle.current?.getText()).toBe("");
+	});
+	test.each([
+		"hydrating",
+		"failed",
+		"fails after editing",
+	] as const)("legacy %s edits preserve unknown membership in local mirrors and autosaves", async (state) => {
+		attachmentsHydrating = state !== "failed";
+		attachmentsRestoreFailed = state === "failed";
+		const input = insertFileReference({ text: "legacy input", fileReferences: [] }, reference);
+		const edited = insertFileReference(
+			{ text: "typed legacy input", fileReferences: [] },
+			reference,
+		);
+		persistNarratorInputDraft("u1", "n1", input.text, 7, "t7", input.fileReferences, input);
+		panelSpy.mockResolvedValue({
+			permissions: [],
+			buffer: [],
+			draft: { hasDraft: true, revision: 7, updatedAt: "t7" },
+			hasMore: { permissions: false, buffer: false },
+		});
+		await render();
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("typed ", 1)));
+		if (state === "fails after editing") {
+			attachmentsHydrating = false;
+			attachmentsRestoreFailed = true;
+			await render();
+		}
+		expect(handle.current?.getText()).toBe(edited.text);
+		expect(handle.current?.getFileReferences()).toEqual(edited.fileReferences);
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+		expect(readNarratorInputDraft("u1", "n1")).toMatchObject({
+			text: edited.text,
+			fileReferences: edited.fileReferences,
+		});
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeUndefined();
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 820));
+		});
+		expect(updateSpy).toHaveBeenCalledTimes(1);
+		expect(updateSpy.mock.calls[0]?.[1]).toBe(edited.text);
+		expect(updateSpy.mock.calls[0]?.[4]).toEqual(edited.fileReferences);
+		expect(updateSpy.mock.calls[0]?.[5]).toBeUndefined();
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeUndefined();
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+	});
+	test.each([
+		"explicit clear",
+		"rich restore",
+		"successful retry",
+	] as const)("a failed legacy restore accepts authoritative membership after %s", async (action) => {
+		attachmentsRestoreFailed = true;
+		const input = { text: "legacy input", fileReferences: [] };
+		persistNarratorInputDraft("u1", "n1", input.text, 7, "t7", [], input);
+		panelSpy.mockReturnValue(
+			deferred<Awaited<ReturnType<typeof api.getNarratorPanelState>>>().promise,
+		);
+		await render();
+		if (action === "successful retry") {
+			attachmentsRestoreFailed = false;
+			await render();
+		} else if (action === "explicit clear") {
+			await act(async () => handle.current?.clearTextAndDraft());
+		} else {
+			const doc = richDocument();
+			const restored = composerDocumentText(doc);
+			await act(async () =>
+				handle.current?.restoreInput(restored.text, restored.fileReferences, doc),
+			);
+		}
+		const expectedIds = action === "rich restore" ? ["missing-image"] : [];
+		if (action !== "successful retry")
+			expect(documentAssetsChange).toHaveBeenLastCalledWith(expectedIds);
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("new ", 1)));
+		expect(handle.current?.getText()).toContain("new ");
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(
+			handle.current?.getDocument(),
+		);
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeDefined();
+		expect(documentAssetsChange).toHaveBeenLastCalledWith(expectedIds);
+	});
+	test("attachment restoration failure offers a retry without clearing editable legacy input", async () => {
+		attachmentsRestoreFailed = true;
+		const input = { text: "legacy input", fileReferences: [] };
+		persistNarratorInputDraft("u1", "n1", input.text, 7, "t7", [], input);
+		panelSpy.mockReturnValue(
+			deferred<Awaited<ReturnType<typeof api.getNarratorPanelState>>>().promise,
+		);
+		await render();
+		expect(host.textContent).toContain("composerAttachmentsRestoreFailed");
+		const retry = [...host.querySelectorAll("button")].find((button) =>
+			/retry/i.test(button.textContent ?? ""),
+		);
+		expect(retry).toBeDefined();
+		await act(async () => retry?.click());
+		expect(retryAttachments).toHaveBeenCalledTimes(1);
+		expect(handle.current?.getText()).toBe(input.text);
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeUndefined();
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("still editable ", 1)));
+		expect(handle.current?.getText()).toBe("still editable legacy input");
+		expect(documentAssetsChange).not.toHaveBeenCalled();
+	});
 	test("restore, hide and failure restore retain the exact document and missing-resource state", async () => {
 		await render();
 		const doc = richDocument();

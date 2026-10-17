@@ -160,7 +160,8 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 	if (!idb) return Promise.resolve(null);
 	if (dbPromise) return dbPromise;
 
-	dbPromise = new Promise((resolve) => {
+	let failed = false;
+	const pending = new Promise<IDBDatabase>((resolve, reject) => {
 		const request = idb.open(DB_NAME, DB_VERSION);
 
 		request.onupgradeneeded = (event) => {
@@ -182,26 +183,38 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 		};
 
 		request.onerror = () => {
-			dbPromise = null;
-			resolve(null);
+			failed = true;
+			reject(request.error ?? new Error("IndexedDB draft attachments open failed"));
 		};
 
 		request.onblocked = () => {
-			dbPromise = null;
-			resolve(null);
+			failed = true;
+			reject(new Error("IndexedDB draft attachments open blocked"));
 		};
 
 		request.onsuccess = () => {
 			const db = request.result;
+			// A blocked request can still succeed after the caller has retried.
+			// It must not retain a handle or replace the newer cached connection.
+			if (failed) {
+				db.close();
+				return;
+			}
 			db.onversionchange = () => {
 				db.close();
-				dbPromise = null;
+				if (dbPromise === pending) dbPromise = null;
 			};
 			resolve(db);
 		};
 	});
+	dbPromise = pending;
+	// Also reset after a synchronous open() exception. Only this attempt owns
+	// this cache entry; a late failure must not clear a newer successful open.
+	void pending.catch(() => {
+		if (dbPromise === pending) dbPromise = null;
+	});
 
-	return dbPromise;
+	return pending;
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
@@ -414,8 +427,11 @@ export async function loadDraftImageAttachments(
 	narratorId: string,
 ): Promise<LoadedDraftAttachments> {
 	const empty: LoadedDraftAttachments = { images: [], textFiles: [], droppedCount: 0 };
+	if (!userId || !narratorId) return empty;
 	const db = await openDraftImageAttachmentDb();
-	if (!db || !userId || !narratorId) return empty;
+	// Unreadable storage is not evidence that this owner has no stored draft.
+	// Callers must retain the old record rather than autosaving a partial cache.
+	if (!db) throw new Error("IndexedDB draft attachments storage unavailable");
 
 	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
 	// Migrate legacy resource ids atomically with this read; never overwrite a newer record.

@@ -174,6 +174,10 @@ export interface NarratorComposerProps {
 	onPasteImages?: (files: File[]) => void;
 	attachedImages?: File[];
 	attachedTextFiles?: File[];
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
+	onRetryAttachments?: () => void;
+	restoredAttachmentResources?: ReadonlyMap<string, File>;
 	onAttachmentsChange?: (images: File[], textFiles: File[]) => void;
 	onDocumentAssetsChange?: (ids: readonly string[]) => void;
 	controls?: React.ReactNode;
@@ -210,6 +214,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			onPasteImages,
 			attachedImages = EMPTY_FILES,
 			attachedTextFiles = EMPTY_FILES,
+			attachmentsHydrating = false,
+			attachmentsRestoreFailed = false,
+			onRetryAttachments,
+			restoredAttachmentResources,
 			onAttachmentsChange,
 			onDocumentAssetsChange,
 			controls,
@@ -315,11 +323,29 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const resourceCacheRef = useRef(new Map<string, File>());
 		const resourceOwnerRef = useRef(currentDraftScope);
 		const authoritativeAssetsRef = useRef<Set<string> | null>(null);
+		const attachmentRecoveryRef = useRef({ attachmentsHydrating, attachmentsRestoreFailed });
+		attachmentRecoveryRef.current = { attachmentsHydrating, attachmentsRestoreFailed };
+		const hasUnconfirmedLegacyAttachments = useCallback(
+			() =>
+				authoritativeAssetsRef.current === null &&
+				(attachmentRecoveryRef.current.attachmentsHydrating ||
+					attachmentRecoveryRef.current.attachmentsRestoreFailed),
+			[],
+		);
+		const readPersistableDocument = useCallback(
+			(value: ComposerDocument | null | undefined) =>
+				hasUnconfirmedLegacyAttachments() ? undefined : (value ?? undefined),
+			[hasUnconfirmedLegacyAttachments],
+		);
 		if (resourceOwnerRef.current !== currentDraftScope) {
 			resourceCacheRef.current.clear();
 			authoritativeAssetsRef.current = null;
 			resourceOwnerRef.current = currentDraftScope;
 		}
+		// Successfully recovered but deleted files stay available to this owner's undo history.
+		// They are not live attachments and never drive legacy adoption or persistence by themselves.
+		for (const [id, file] of restoredAttachmentResources ?? [])
+			if (!resourceCacheRef.current.has(id)) resourceCacheRef.current.set(id, file);
 		for (const file of [...attachedImages, ...attachedTextFiles])
 			resourceCacheRef.current.set(getComposerAssetId(file), file);
 		const resources = new Map(resourceCacheRef.current);
@@ -363,6 +389,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const inputHistory = useInputHistory(
 			currentUserId ? getNarratorDraftStorageId(currentUserId, narratorId) : null,
 		);
+
+		const declareDocumentAssets = useCallback((ids: readonly string[]) => {
+			authoritativeAssetsRef.current = new Set(ids);
+			reconcileAssetsRef.current?.(ids);
+		}, []);
 
 		/** Synchronous ref updates make restore→send in the same tick atomic. */
 		const applyInput = useCallback((next: FileReferenceInput) => {
@@ -414,17 +445,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				const restored = parseComposerDocument(importComposerInput(next));
 				editorRef.current?.setDocument(restored);
 				applyInput(next);
+				// Local acknowledged snapshots need the same ownership contract as remote detail.
+				// An absent legacy layout is still unknown until its old blobs have been imported.
+				if (readComposerDocument(composerDocument))
+					declareDocumentAssets(restored.assets.map((asset) => asset.id));
 			},
-			[applyInput],
+			[applyInput, declareDocumentAssets],
 		);
 		/** Remote documents are authoritative about membership, not just text/layout. */
 		const restoreRemoteInput = useCallback(
 			(text: string, refs: FileReference[], composerDocument?: ComposerDocument) => {
 				restoreInput(text, refs, composerDocument);
 				const ids = composerDocument?.assets.map((asset) => asset.id) ?? [];
-				authoritativeAssetsRef.current = new Set(ids);
-				if (reconcileAssetsRef.current) reconcileAssetsRef.current(ids);
-				else {
+				declareDocumentAssets(ids);
+				if (!reconcileAssetsRef.current) {
 					const keep = new Set(ids);
 					const current = attachmentStateRef.current;
 					const images = current.images.filter((file) => keep.has(getComposerAssetId(file)));
@@ -436,7 +470,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						current.onChange?.(images, textFiles);
 				}
 			},
-			[restoreInput],
+			[restoreInput, declareDocumentAssets],
 		);
 		const captureAttachmentSelection = useCallback(() => {
 			pickerBookmarkRef.current?.cancel();
@@ -506,10 +540,18 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				)
 					return;
 				applyInput(composerInputFromDocument(next));
+				if (!hasUnconfirmedLegacyAttachments())
+					declareDocumentAssets(next.assets.map((asset) => asset.id));
 				inputHistory.reset();
 				syncAttachedFiles(next);
 			},
-			[applyInput, inputHistory.reset, syncAttachedFiles],
+			[
+				applyInput,
+				inputHistory.reset,
+				syncAttachedFiles,
+				hasUnconfirmedLegacyAttachments,
+				declareDocumentAssets,
+			],
 		);
 
 		const insertAcceptedFiles = useCallback(
@@ -518,6 +560,18 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				bookmark?: ReturnType<InlineComposerEditorHandle["captureSelectionBookmark"]>,
 			) => {
 				const editor = editorRef.current;
+				if (files.length && hasUnconfirmedLegacyAttachments()) {
+					bookmark?.cancel();
+					notifications.show({
+						color: "yellow",
+						message: t(
+							attachmentRecoveryRef.current.attachmentsRestoreFailed
+								? "composerAttachmentsRestoreFailed"
+								: "composerRestoringAssets",
+						),
+					});
+					return false;
+				}
 				if (!files.length || !editor?.getElement() || sendingRef.current) {
 					bookmark?.cancel();
 					return false;
@@ -554,7 +608,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					return false;
 				}
 			},
-			[sendingRef, t],
+			[sendingRef, t, hasUnconfirmedLegacyAttachments],
 		);
 
 		// Legacy/local hydration only. New uploads are inserted through per-batch bookmarks.
@@ -642,7 +696,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				lastDraftUpdatedAtRef.current,
 				fileReferences,
 				lastSyncedDraftRef.current ?? (unknownEdited ? null : undefined),
-				inputState.composerDocument,
+				readPersistableDocument(inputState.composerDocument),
 			);
 		}, [
 			currentUserId,
@@ -653,6 +707,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			fileReferences,
 			narratorId,
 			sendingRef,
+			readPersistableDocument,
 		]);
 
 		const syncDraftNow = useCallback(
@@ -686,7 +741,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							revision,
 							sourceId,
 							refs,
-							composerDocument ?? undefined,
+							readPersistableDocument(composerDocument),
 						);
 						if (
 							seq === draftSyncSeqRef.current &&
@@ -711,7 +766,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								result.updatedAt,
 								inputStateRef.current.fileReferences,
 								lastSyncedDraftRef.current,
-								inputStateRef.current.composerDocument,
+								readPersistableDocument(inputStateRef.current.composerDocument),
 							);
 							qc.setQueryData(
 								["narrators", narratorId],
@@ -776,15 +831,16 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					}
 				}
 			},
-			[currentUserId, currentDraftScope, narratorId, qc],
+			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument],
 		);
 
 		const clearTextAndDraft = useCallback(() => {
 			restoreInput("", []);
+			declareDocumentAssets([]);
 			releaseUnusedResources();
 			attachmentStateRef.current.onChange?.([], []);
 			if (draftSyncState === "ready") void syncDraftNow("", undefined, [], null).catch(() => {});
-		}, [draftSyncState, syncDraftNow, restoreInput, releaseUnusedResources]);
+		}, [draftSyncState, syncDraftNow, restoreInput, releaseUnusedResources, declareDocumentAssets]);
 
 		const hideTextForSend = useCallback(() => {
 			restoreInput("", []);
@@ -881,7 +937,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							panel.draft.updatedAt,
 							inputStateRef.current.fileReferences,
 							lastSyncedDraftRef.current,
-							inputStateRef.current.composerDocument,
+							readPersistableDocument(inputStateRef.current.composerDocument),
 						);
 						return;
 					}
@@ -905,7 +961,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						serverFileReferences,
 						serverRevision: draft.revision,
 						serverComposerDocument: readComposerDocument(draft.composerDocument),
-						currentComposerDocument: inputStateRef.current.composerDocument,
+						currentComposerDocument: readPersistableDocument(
+							inputStateRef.current.composerDocument,
+						),
 						currentInput,
 						currentFileReferences: inputStateRef.current.fileReferences,
 						localChangedSinceRequest:
@@ -939,7 +997,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
 						resolved.fileReferences ?? [],
 						lastSyncedDraftRef.current,
-						inputStateRef.current.composerDocument,
+						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
 					if (resolved.conflict) {
 						draftConflictRef.current = draft;
@@ -965,6 +1023,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			narratorId,
 			restoreInput,
 			restoreRemoteInput,
+			readPersistableDocument,
 			qc,
 		]);
 
@@ -1019,9 +1078,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				remote.updatedAt,
 				refs,
 				lastSyncedDraftRef.current,
-				inputStateRef.current.composerDocument,
+				readPersistableDocument(inputStateRef.current.composerDocument),
 			);
-		}, [currentUserId, narratorId, restoreRemoteInput]);
+		}, [currentUserId, narratorId, restoreRemoteInput, readPersistableDocument]);
 
 		const commitDraftAfterSend = useCallback(() => {
 			if (draftSyncState === "ready") {
@@ -1135,11 +1194,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						draft.updatedAt,
 						nextInput.fileReferences,
 						lastSyncedDraftRef.current,
-						nextInput.composerDocument,
+						readPersistableDocument(nextInput.composerDocument),
 					);
 				}
 			},
-			[currentUserId, narratorId, restoreRemoteInput],
+			[currentUserId, narratorId, restoreRemoteInput, readPersistableDocument],
 		);
 
 		remoteDraftHandlerRef.current = handleDraftChanged;
@@ -1351,6 +1410,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		});
 		const acceptQuote = useCallback(
 			(candidate: QuoteCandidate) => {
+				if (hasUnconfirmedLegacyAttachments()) {
+					notifications.show({
+						color: "yellow",
+						message: t(
+							attachmentRecoveryRef.current.attachmentsRestoreFailed
+								? "composerAttachmentsRestoreFailed"
+								: "composerRestoringAssets",
+						),
+					});
+					return;
+				}
 				try {
 					if (candidate.kind === "file") {
 						if (!candidate.reference) throw new Error(t("quote.fileUnsaved"));
@@ -1374,7 +1444,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					});
 				}
 			},
-			[addFileReference, quoteCandidate.hide, t],
+			[addFileReference, quoteCandidate.hide, t, hasUnconfirmedLegacyAttachments],
 		);
 		acceptQuoteRef.current = acceptQuote;
 
@@ -1506,7 +1576,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						direction,
 						inputRef.current,
 						inputStateRef.current.fileReferences,
-						inputStateRef.current.composerDocument,
+						readPersistableDocument(inputStateRef.current.composerDocument),
 					);
 					if (result) {
 						restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
@@ -1611,6 +1681,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						visible={!commandPopoverVisible}
 					/>
 				)}
+				{attachmentsRestoreFailed && (
+					<Group gap="xs" mb={4} wrap="nowrap" data-attachment-restore-error>
+						<Text size="xs" c="orange" style={{ flex: 1 }}>
+							{t("composerAttachmentsRestoreFailed")}
+						</Text>
+						{onRetryAttachments && (
+							<Button
+								size="compact-xs"
+								variant="light"
+								onClick={onRetryAttachments}
+								disabled={sending}
+							>
+								{t("draftRetry")}
+							</Button>
+						)}
+					</Group>
+				)}
 				{draftSyncState === "error" && (
 					<Group gap="xs" mb={4} wrap="nowrap">
 						<Text size="xs" c="orange" style={{ flex: 1 }}>
@@ -1658,7 +1745,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 										<InlineQuoteCandidate
 											candidate={quoteCandidate.candidate}
 											showShortcut={quoteCandidate.showShortcut}
-											disabled={sending}
+											disabled={sending || hasUnconfirmedLegacyAttachments()}
 											onAccept={acceptQuote}
 											onDismiss={quoteCandidate.hide}
 										/>
@@ -1668,6 +1755,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					}
 					onChange={applyDocument}
 					resources={resources}
+					attachmentsHydrating={attachmentsHydrating}
+					attachmentsRestoreFailed={attachmentsRestoreFailed}
 					disabled={sending}
 					placeholder={t(quotes.length ? "quote.placeholder" : "sendPlaceholder")}
 					onSelectionChange={handleComposerSelection}
@@ -1716,9 +1805,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						</Group>
 					}
 				/>
-				{missingComposerAssets(document, resources) && (
-					<Text size="xs" c="orange">
-						{t("composerMissingAssets")}
+				{!attachmentsRestoreFailed && missingComposerAssets(document, resources) && (
+					<Text size="xs" c={attachmentsHydrating ? "dimmed" : "orange"}>
+						{t(attachmentsHydrating ? "composerRestoringAssets" : "composerMissingAssets")}
 					</Text>
 				)}
 			</Box>

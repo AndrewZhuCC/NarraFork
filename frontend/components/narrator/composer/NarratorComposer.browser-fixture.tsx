@@ -1,5 +1,6 @@
 import "@mantine/core/styles.css";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
+import { api } from "@frontend/lib/api";
 import common from "@frontend/locales/en/common.json";
 import narrator from "@frontend/locales/en/narrator.json";
 import { MantineProvider } from "@mantine/core";
@@ -12,11 +13,17 @@ import { createRef, useCallback, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { useComposerAttachments } from "../interaction/use-composer-attachments";
 import { useComposerFileIngest } from "../interaction/use-composer-file-ingest";
-import { getComposerAssetId } from "./draft-image-attachments";
+import {
+	clearDraftImageAttachments,
+	getComposerAssetId,
+	loadDraftImageAttachments,
+} from "./draft-image-attachments";
 import { FileReferenceScopeProvider } from "./FileReferenceScope";
 import type { NarratorComposerHandle } from "./NarratorComposer";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./NarratorComposerRow";
+import { persistNarratorInputDraft, readNarratorInputDraft } from "./narrator-draft-storage";
 
 const i18n = i18next.createInstance();
 await i18n
@@ -30,7 +37,24 @@ query.setQueryData(["named-narrators"], []);
 const composer = createRef<NarratorComposerHandle>();
 const fileInput = createRef<HTMLInputElement>();
 const sending = { current: false };
+const persistentAttachments = new URLSearchParams(window.location.search).has("persist");
+const attachmentT = (key: string, options?: Record<string, unknown>) =>
+	String(i18n.t(key, { ...options, ns: "narrator" }));
+if (persistentAttachments) localStorage.setItem("narrafork_token", "fixture-user");
 const noop = () => {};
+let switchNarrator: (id: string) => void;
+let switchAccount: (id: string) => void;
+let currentUser = "fixture-user";
+let attachmentsHydrating = false;
+let hidePersistedAttachments: () => void;
+let clearPersistedAttachments: () => void;
+let hiddenFiles: File[] = [];
+const heldReads: {
+	userId: string;
+	narratorId: string;
+	release(): void;
+	reject(reason: Error): void;
+}[] = [];
 let parentRenders = 0;
 let sends = 0;
 let updateFiles: (images: File[], textFiles: File[]) => void;
@@ -89,24 +113,50 @@ const defaults = {
 	NarratorComposerRowProps,
 	"composerHasText" | "composerHasAttachments" | "setComposerHasText" | "isSending"
 >;
-function PanelBoundary({ showFileSource = false }: { showFileSource?: boolean }) {
+function PanelBoundary({
+	narratorId,
+	userId,
+	showFileSource = false,
+}: {
+	narratorId: string;
+	userId: string;
+	showFileSource?: boolean;
+}) {
 	parentRenders++;
 	const [hasText, setHasText] = useState(false);
-	const [images, setImages] = useState<File[]>([]);
-	const [textFiles, setTextFiles] = useState<File[]>([]);
+	const [localImages, setLocalImages] = useState<File[]>([]);
+	const [localTextFiles, setLocalTextFiles] = useState<File[]>([]);
+	const persisted = useComposerAttachments({
+		narratorId,
+		currentUserId: persistentAttachments ? userId : null,
+		sendingRef: sending,
+		t: attachmentT,
+	});
+	const images = persistentAttachments ? persisted.attachedImages : localImages;
+	const textFiles = persistentAttachments ? persisted.attachedTextFiles : localTextFiles;
+	const setImages = persistentAttachments ? persisted.updateAttachedImages : setLocalImages;
+	const setTextFiles = persistentAttachments
+		? persisted.updateAttachedTextFiles
+		: setLocalTextFiles;
+	attachmentsHydrating = persistentAttachments && persisted.attachmentsHydrating;
+	hidePersistedAttachments = persisted.hideAttachedFilesForSend;
+	clearPersistedAttachments = persisted.clearAttachedFilesAndDraft;
 	const [isSending, setIsSending] = useState(false);
 	const [takenOver, setTakenOver] = useState(false);
 	updateTakeover = setTakenOver;
-	const changeFiles = useCallback((nextImages: File[], nextTextFiles: File[]) => {
-		setImages(nextImages);
-		setTextFiles(nextTextFiles);
-	}, []);
+	const changeFiles = useCallback(
+		(nextImages: File[], nextTextFiles: File[]) => {
+			setImages(nextImages);
+			setTextFiles(nextTextFiles);
+		},
+		[setImages, setTextFiles],
+	);
 	updateFiles = changeFiles;
 	updateSending = setIsSending;
 	currentFiles = [...images, ...textFiles];
 	const dragCounterRef = useRef(0);
 	const ingest = useComposerFileIngest({
-		narratorId: "fixture-narrator",
+		narratorId,
 		sendingRef: sending,
 		updateAttachedImages: setImages,
 		updateAttachedTextFiles: setTextFiles,
@@ -121,6 +171,8 @@ function PanelBoundary({ showFileSource = false }: { showFileSource?: boolean })
 	return (
 		<div
 			data-narrator-panel
+			data-fixture-owner={narratorId}
+			data-fixture-user={userId}
 			id="panel"
 			style={{
 				height: "100dvh",
@@ -152,6 +204,16 @@ function PanelBoundary({ showFileSource = false }: { showFileSource?: boolean })
 			<div id="row">
 				<NarratorComposerRow
 					{...defaults}
+					narratorId={narratorId}
+					attachmentsHydrating={attachmentsHydrating}
+					attachmentsRestoreFailed={persistentAttachments && persisted.attachmentsRestoreFailed}
+					onRetryAttachments={persistentAttachments ? persisted.retryAttachmentRestore : undefined}
+					restoredAttachmentResources={
+						persistentAttachments ? persisted.restoredAttachmentResources : undefined
+					}
+					onDocumentAssetsChange={
+						persistentAttachments ? persisted.reconcileDocumentAssets : undefined
+					}
 					canTakeover={takenOver}
 					isTakenOver={takenOver}
 					onFileInputChange={ingest.handleFileInputChange}
@@ -169,17 +231,33 @@ function PanelBoundary({ showFileSource = false }: { showFileSource?: boolean })
 	);
 }
 function ScopedFixture() {
+	const [narratorId, setNarratorId] = useState(
+		persistentAttachments ? "persist-a" : "fixture-narrator",
+	);
+	const [userId, setUserId] = useState("fixture-user");
+	currentUser = userId;
+	switchNarrator = setNarratorId;
+	switchAccount = setUserId;
 	const [selection, setSelection] = useState<FileReferenceEditorSelection | null>(null);
 	updateSourceSelection = setSelection;
 	return (
 		<FileReferenceScopeProvider
 			value={{
-				narratorId: "fixture-narrator",
+				narratorId,
 				context: { deviceId: "local", cwd: "/work" },
 				selection,
 			}}
 		>
-			<PanelBoundary showFileSource={!!selection} />
+			<PanelBoundary
+				key={
+					new URLSearchParams(window.location.search).has("reuse")
+						? "reused"
+						: `${userId}:${narratorId}`
+				}
+				narratorId={narratorId}
+				userId={userId}
+				showFileSource={!!selection}
+			/>
 		</FileReferenceScopeProvider>
 	);
 }
@@ -205,6 +283,7 @@ export function snapshot() {
 		parentRenders,
 		sends,
 		files: currentFiles.map((file) => file.name),
+		hydrating: attachmentsHydrating,
 	};
 }
 export function selectSource() {
@@ -276,20 +355,37 @@ export function load(doc: ComposerDocument) {
 	composer.current?.restoreInput(projection.text, projection.fileReferences, doc);
 }
 export function hide() {
+	hiddenFiles = [...currentFiles];
 	sending.current = true;
 	composer.current?.hideTextForSend();
 	flushSync(() => {
-		updateFiles([], []);
+		if (persistentAttachments) hidePersistedAttachments();
+		else updateFiles([], []);
 		updateSending(true);
 	});
 }
 export function restore(doc: ComposerDocument) {
 	sending.current = false;
-	flushSync(() => updateSending(false));
+	flushSync(() => {
+		if (persistentAttachments) {
+			const images = new Set(
+				doc.assets.filter((asset) => asset.kind === "image").map((asset) => asset.id),
+			);
+			const texts = new Set(
+				doc.assets.filter((asset) => asset.kind === "textFile").map((asset) => asset.id),
+			);
+			updateFiles(
+				hiddenFiles.filter((file) => images.has(getComposerAssetId(file))),
+				hiddenFiles.filter((file) => texts.has(getComposerAssetId(file))),
+			);
+		}
+		updateSending(false);
+	});
 	load(doc);
 }
 export function commit() {
 	composer.current?.commitDraftAfterSend();
+	if (persistentAttachments) clearPersistedAttachments();
 }
 
 export function ingestImage() {
@@ -358,4 +454,111 @@ export function publishFileSelection(dirty = false) {
 
 export function takeover(value: boolean) {
 	updateTakeover(value);
+}
+
+type AttachmentReadGlobal = typeof globalThis & {
+	__draftAttachmentReadGate?: (userId: string, narratorId: string) => Promise<void>;
+};
+export function switchToNarrator(narratorId: string) {
+	flushSync(() => switchNarrator(narratorId));
+}
+export function switchToUser(userId: string) {
+	flushSync(() => {
+		localStorage.setItem("narrafork_token", userId);
+		query.setQueryData(["auth", "me"], { id: userId });
+		switchAccount(userId);
+	});
+}
+export function owner() {
+	return document.querySelector<HTMLElement>("[data-fixture-owner]")?.dataset.fixtureOwner;
+}
+export function holdAttachmentReads() {
+	(globalThis as AttachmentReadGlobal).__draftAttachmentReadGate = (userId, narratorId) =>
+		new Promise<void>((release, reject) => heldReads.push({ userId, narratorId, release, reject }));
+}
+export function heldAttachmentReads() {
+	return heldReads.map(({ userId, narratorId }) => ({ userId, narratorId }));
+}
+export function releaseAttachmentReads(narratorId?: string, userId?: string, keepHolding = false) {
+	if (!keepHolding) delete (globalThis as AttachmentReadGlobal).__draftAttachmentReadGate;
+	for (let index = heldReads.length - 1; index >= 0; index--) {
+		const item = heldReads[index];
+		if ((narratorId && item.narratorId !== narratorId) || (userId && item.userId !== userId))
+			continue;
+		heldReads.splice(index, 1);
+		item.release();
+	}
+}
+export async function storedAttachments(narratorId = owner() ?? "persist-a", userId = currentUser) {
+	const loaded = await loadDraftImageAttachments(userId, narratorId);
+	return Promise.all(
+		[...loaded.images, ...loaded.textFiles].map(async (file) => ({
+			id: getComposerAssetId(file),
+			name: file.name,
+			type: file.type,
+			bytes: Array.from(new Uint8Array(await file.arrayBuffer())),
+		})),
+	);
+}
+
+export function ownerUser() {
+	return document.querySelector<HTMLElement>("[data-fixture-owner]")?.dataset.fixtureUser;
+}
+export async function dropStoredAttachments() {
+	await clearDraftImageAttachments(currentUser, owner() ?? "persist-a");
+}
+
+export function ingestDifferentImage() {
+	pendingFiles = (async () => {
+		const canvas = document.createElement("canvas");
+		canvas.width = 1;
+		canvas.height = 1;
+		const context = canvas.getContext("2d");
+		if (!context) throw new Error("Canvas unavailable");
+		context.fillStyle = "#ff0000";
+		context.fillRect(0, 0, 1, 1);
+		const blob = await new Promise<Blob>((resolve, reject) =>
+			canvas.toBlob(
+				(blob) => (blob ? resolve(blob) : reject(new Error("PNG encode failed"))),
+				"image/png",
+			),
+		);
+		return ingestFiles([new File([blob], "async.png", { type: "image/png" })], "paste");
+	})();
+}
+export async function activeAttachmentBytes() {
+	return Promise.all(
+		currentFiles.map(async (file) => ({
+			id: getComposerAssetId(file),
+			name: file.name,
+			type: file.type,
+			bytes: Array.from(new Uint8Array(await file.arrayBuffer())),
+		})),
+	);
+}
+
+export function rejectAttachmentReads() {
+	delete (globalThis as AttachmentReadGlobal).__draftAttachmentReadGate;
+	for (const item of heldReads.splice(0)) item.reject(new Error("Test attachment read failure"));
+}
+export async function seedLegacyTextDraft(text: string) {
+	const id = owner() ?? "persist-a";
+	const previous = readNarratorInputDraft(currentUser, id);
+	const stored = await api.updateNarratorDraft(
+		id,
+		text,
+		previous.serverRevision ?? 1,
+		"legacy-fixture",
+		[],
+	);
+	persistNarratorInputDraft(currentUser, id, text, stored.revision, stored.updatedAt, [], {
+		text,
+		fileReferences: [],
+	});
+}
+export function cachedDraft() {
+	return readNarratorInputDraft(currentUser, owner() ?? "persist-a");
+}
+export function append(text: string) {
+	composer.current?.appendText(text);
 }

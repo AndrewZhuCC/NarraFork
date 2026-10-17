@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, dirname } from "node:path";
 import type { ComposerDocument } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type * as Fixture from "./NarratorComposer.browser-fixture";
@@ -21,6 +21,18 @@ const emptyDraft = {
 	updatedBy: null,
 	sourceId: null,
 };
+const persistentDrafts = new Map<
+	string,
+	{
+		hasDraft: boolean;
+		revision: number;
+		updatedAt: string | null;
+		text: string;
+		fileReferences: unknown[];
+		composerDocument?: ComposerDocument;
+		sourceId: string | null;
+	}
+>();
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
 	const bundle = await Bun.build({
@@ -31,6 +43,28 @@ beforeAll(async () => {
 			"process.env.NODE_ENV": '"production"',
 			"import.meta.env": '{"DEV":false,"PROD":true}',
 		},
+		plugins: [
+			{
+				name: "pause-native-attachment-read-delivery",
+				setup(build) {
+					build.onLoad({ filter: /use-composer-attachments\.ts$/ }, async ({ path }) => {
+						const source = await Bun.file(path).text();
+						const marker = "void loadDraftImageAttachments(currentUserId, narratorId)";
+						if (!source.includes(marker)) throw new Error("Attachment read test boundary missing");
+						// Keep native IndexedDB/Blob reconstruction; only delay delivery to the real hook.
+						const gate = `${marker}.then(async loaded => {
+						await (globalThis as typeof globalThis & { __draftAttachmentReadGate?: (user: string, narrator: string) => Promise<void> }).__draftAttachmentReadGate?.(currentUserId, narratorId);
+						return loaded;
+					})`;
+						return {
+							contents: source.replace(marker, gate),
+							loader: "ts",
+							resolveDir: dirname(path),
+						};
+					});
+				},
+			},
+		],
 	});
 	if (!bundle.success) throw new Error(bundle.logs.join("\n"));
 	const assets = new Map(bundle.outputs.map((output) => [`/${basename(output.path)}`, output]));
@@ -42,6 +76,37 @@ beforeAll(async () => {
 		port: 0,
 		async fetch(request) {
 			const path = new URL(request.url).pathname;
+			const persistent = path.match(/^\/api\/narrators\/(persist-[^/]+)\/(draft|panel-state)$/);
+			if (persistent) {
+				const user =
+					request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "fixture-user";
+				const key = `${user}:${persistent[1]}`;
+				const row = persistentDrafts.get(key) ?? emptyDraft;
+				if (persistent[2] === "panel-state")
+					return Response.json({
+						permissions: [],
+						buffer: [],
+						draft: { hasDraft: row.hasDraft, revision: row.revision, updatedAt: row.updatedAt },
+						hasMore: { permissions: false, buffer: false },
+					});
+				if (request.method === "PUT") {
+					const body = await request.json();
+					const next = {
+						...emptyDraft,
+						...body,
+						ok: true,
+						traits: [],
+						revision: body.baseRevision + 1,
+						hasDraft:
+							!!body.text ||
+							!!body.fileReferences?.length ||
+							!!body.composerDocument?.assets.length,
+					};
+					persistentDrafts.set(key, next);
+					return Response.json(next);
+				}
+				return Response.json(row);
+			}
 			if (path === "/api/narrators/fixture-narrator/panel-state")
 				return Response.json({
 					permissions: [],
@@ -1045,3 +1110,415 @@ test.each([
 	},
 	15_000,
 );
+
+async function openPersistentAttachments(reuse = false) {
+	if (!browser || !server) throw new Error("Browser fixture unavailable");
+	persistentDrafts.clear();
+	const context = await browser.createBrowserContext();
+	const page = await context.newPage();
+	page.setDefaultTimeout(8000);
+	await page.setViewport({ width: 1000, height: 700 });
+	const captured: string[] = [];
+	errors.set(page, captured);
+	page.on("pageerror", (error) => captured.push(String(error)));
+	const loaded = page.waitForResponse(
+		(response) =>
+			response.url().endsWith("/persist-a/draft") && response.request().method() === "GET",
+	);
+	await page.goto(`${server.url.origin}/?persist${reuse ? "&reuse" : ""}`);
+	await loaded;
+	await waitAttachmentOwner(page, "persist-a");
+	return page;
+}
+async function closePersistentAttachments(page: Page) {
+	const context = page.browserContext();
+	await close(page);
+	await context.close();
+}
+async function waitAttachmentOwner(page: Page, narratorId: string, userId = "fixture-user") {
+	await page.waitForFunction(
+		({ narratorId, userId }) => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			return (
+				fixture?.ready() &&
+				fixture.owner() === narratorId &&
+				fixture.ownerUser() === userId &&
+				!fixture.snapshot().hydrating
+			);
+		},
+		{},
+		{ narratorId, userId },
+	);
+	await settle(page);
+}
+async function waitImageCount(page: Page, count: number) {
+	await page.waitForFunction(
+		(count) => {
+			const images = [
+				...document.querySelectorAll<HTMLImageElement>('[data-composer-atom="attachment"] img'),
+			];
+			return (
+				images.length === count &&
+				images.every((image) => image.complete && image.naturalWidth === 1)
+			);
+		},
+		{},
+		count,
+	);
+}
+async function waitStoredCount(page: Page, count: number) {
+	await page.waitForFunction(
+		async (count) =>
+			(await (window as unknown as FixtureWindow).fixture.storedAttachments()).length === count,
+		{},
+		count,
+	);
+	return page.evaluate(() => (window as unknown as FixtureWindow).fixture.storedAttachments());
+}
+async function persistFirstImage(page: Page) {
+	const saved = page.waitForResponse(
+		(response) =>
+			response.url().endsWith("/persist-a/draft") &&
+			response.request().method() === "PUT" &&
+			response.ok(),
+	);
+	await page.evaluate(async () => {
+		const fixture = (window as unknown as FixtureWindow).fixture;
+		fixture.ingestImage();
+		await fixture.awaitFiles();
+	});
+	await waitImageCount(page, 1);
+	await saved;
+	await settle(page);
+	return waitStoredCount(page, 1);
+}
+async function returnWithAttachmentReadHeld(page: Page, expectImage = true) {
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.switchToNarrator("persist-b"),
+	);
+	await waitAttachmentOwner(page, "persist-b");
+	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.holdAttachmentReads());
+	const metadata = page.waitForResponse((response) =>
+		response.url().endsWith("/persist-a/panel-state"),
+	);
+	await page.evaluate(() =>
+		(window as unknown as FixtureWindow).fixture.switchToNarrator("persist-a"),
+	);
+	await metadata;
+	await page.waitForFunction(() =>
+		(window as unknown as FixtureWindow).fixture
+			.heldAttachmentReads()
+			.some((read) => read.narratorId === "persist-a"),
+	);
+	await settle(page);
+	expect((await snapshot(page)).hydrating).toBe(true);
+	if (expectImage) expect(await page.$("[data-composer-atom][data-loading]")).not.toBeNull();
+	expect(await page.$("[data-composer-atom][data-missing]")).toBeNull();
+}
+
+test("real IndexedDB draft images survive narrator remounts and a page reload with stable bytes and fresh URLs", async () => {
+	const page = await openPersistentAttachments();
+	try {
+		const stored = await persistFirstImage(page);
+		const before = await snapshot(page);
+		const oldURL = await page.$eval(
+			'[data-composer-atom="attachment"] img',
+			(image) => (image as HTMLImageElement).src,
+		);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.switchToNarrator("persist-b"),
+		);
+		await waitAttachmentOwner(page, "persist-b");
+		expect((await snapshot(page)).files).toEqual([]);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.switchToNarrator("persist-a"),
+		);
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 1);
+		expect((await snapshot(page)).document).toEqual(before.document);
+		expect((await snapshot(page)).missing).toBe(false);
+		expect(
+			await page.$eval(
+				'[data-composer-atom="attachment"] img',
+				(image) => (image as HTMLImageElement).src,
+			),
+		).not.toBe(oldURL);
+		expect(await waitStoredCount(page, 1)).toEqual(stored);
+		await page.reload();
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 1);
+		expect((await snapshot(page)).document).toEqual(before.document);
+		expect(await waitStoredCount(page, 1)).toEqual(stored);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test("a same-name new image cannot overwrite a still-restoring draft image in real IndexedDB", async () => {
+	const page = await openPersistentAttachments();
+	try {
+		const original = await persistFirstImage(page);
+		await returnWithAttachmentReadHeld(page);
+		await page.evaluate(async () => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.ingestDifferentImage();
+			await fixture.awaitFiles();
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.assets).toHaveLength(2);
+		const newFiles = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.activeAttachmentBytes(),
+		);
+		expect(newFiles).toHaveLength(1);
+		// No incomplete local array may replace the old Blob before its pending read is merged.
+		expect(
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.storedAttachments()),
+		).toEqual(original);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.releaseAttachmentReads(),
+		);
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 2);
+		const merged = await waitStoredCount(page, 2);
+		expect(merged[0]).toEqual(original[0]);
+		expect(merged[1].id).not.toBe(original[0].id);
+		expect(merged[1].name).toBe(original[0].name);
+		expect(merged[1].bytes).not.toEqual(original[0].bytes);
+		expect(merged[1]).toEqual(newFiles[0]);
+		expect((await snapshot(page)).missing).toBe(false);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test.each([
+	"none",
+	"before",
+	"after",
+] as const)("deleting a pending image updates membership, and undo may restore its original Blob (undo=%s)", async (undo) => {
+	const page = await openPersistentAttachments();
+	try {
+		const stored = await persistFirstImage(page);
+		await returnWithAttachmentReadHeld(page);
+		await page.click(
+			`[data-composer-asset-id="${stored[0].id}"] button[aria-label="Remove attachment"]`,
+		);
+		await settle(page);
+		expect((await snapshot(page)).document?.assets).toEqual([]);
+		if (undo === "before") {
+			await page.keyboard.down("Control");
+			await page.keyboard.press("z");
+			await page.keyboard.up("Control");
+			await settle(page);
+			expect((await snapshot(page)).document?.assets.map((asset) => asset.id)).toEqual([
+				stored[0].id,
+			]);
+		}
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.releaseAttachmentReads(),
+		);
+		await waitAttachmentOwner(page, "persist-a");
+		if (undo === "after") {
+			// The record was already pruned: only this owner's undo resource pool can recover F.
+			expect(await waitStoredCount(page, 0)).toEqual([]);
+			await page.click('[role="textbox"]');
+			await page.keyboard.down("Control");
+			await page.keyboard.press("z");
+			await page.keyboard.up("Control");
+			await settle(page);
+		}
+		if (undo !== "none") {
+			await waitImageCount(page, 1);
+			expect(await waitStoredCount(page, 1)).toEqual(stored);
+		} else {
+			expect(await waitStoredCount(page, 0)).toEqual([]);
+			expect((await snapshot(page)).document?.assets).toEqual([]);
+			expect(await page.$('[data-composer-atom="attachment"]')).toBeNull();
+		}
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test("a late attachment read cannot cross accounts and the original account keeps its Blob", async () => {
+	const page = await openPersistentAttachments();
+	try {
+		const stored = await persistFirstImage(page);
+		await returnWithAttachmentReadHeld(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.switchToUser("other-user"),
+		);
+		await page.waitForFunction(() =>
+			(window as unknown as FixtureWindow).fixture
+				.heldAttachmentReads()
+				.some((read) => read.userId === "other-user"),
+		);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.releaseAttachmentReads(
+				"persist-a",
+				"fixture-user",
+				true,
+			),
+		);
+		await settle(page);
+		expect((await snapshot(page)).files).toEqual([]);
+		expect(await page.$('[data-composer-atom="attachment"]')).toBeNull();
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.releaseAttachmentReads(
+				"persist-a",
+				"other-user",
+			),
+		);
+		await waitAttachmentOwner(page, "persist-a", "other-user");
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.storedAttachments("persist-a", "fixture-user"),
+			),
+		).toEqual(stored);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.switchToUser("fixture-user"),
+		);
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 1);
+		expect(await waitStoredCount(page, 1)).toEqual(stored);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test("a genuinely evicted Blob remains visibly missing after recovery, never silently removed from the draft", async () => {
+	const page = await openPersistentAttachments();
+	try {
+		const stored = await persistFirstImage(page);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.dropStoredAttachments());
+		await page.reload();
+		await waitAttachmentOwner(page, "persist-a");
+		await page.waitForSelector("[data-composer-atom][data-missing]");
+		expect(await page.$("[data-composer-atom][data-loading]")).toBeNull();
+		expect((await snapshot(page)).missing).toBe(true);
+		expect((await snapshot(page)).document?.assets.map((asset) => asset.id)).toEqual([
+			stored[0].id,
+		]);
+		expect(await page.$eval("#row", (node) => node.textContent)).toContain("Reselect");
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test("explicit clearing during a held read cannot revive the old picture", async () => {
+	const page = await openPersistentAttachments();
+	try {
+		await persistFirstImage(page);
+		await returnWithAttachmentReadHeld(page);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clear());
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.releaseAttachmentReads(),
+		);
+		await waitAttachmentOwner(page, "persist-a");
+		expect(await waitStoredCount(page, 0)).toEqual([]);
+		expect((await snapshot(page)).missing).toBe(false);
+		expect(await page.$('[data-composer-atom="attachment"]')).toBeNull();
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test("native attachment persistence survives send hiding and failed-send restoration", async () => {
+	const page = await openPersistentAttachments();
+	try {
+		const stored = await persistFirstImage(page);
+		const draft = (await snapshot(page)).document;
+		if (!draft) throw new Error("Missing image document");
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.hide());
+		await settle(page);
+		expect(await page.$('[data-composer-atom="attachment"]')).toBeNull();
+		expect(
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.storedAttachments()),
+		).toEqual(stored);
+		await page.evaluate((doc) => (window as unknown as FixtureWindow).fixture.restore(doc), draft);
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 1);
+		expect((await snapshot(page)).document).toEqual(draft);
+		expect((await snapshot(page)).missing).toBe(false);
+		expect(await waitStoredCount(page, 1)).toEqual(stored);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test.each([
+	"retry",
+	"switch",
+] as const)("legacy typing after a failed read preserves unknown stored images across %s", async (recovery) => {
+	const page = await openPersistentAttachments();
+	try {
+		const stored = await persistFirstImage(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.seedLegacyTextDraft("legacy"),
+		);
+		await returnWithAttachmentReadHeld(page, false);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.rejectAttachmentReads());
+		await waitAttachmentOwner(page, "persist-a");
+		await page.waitForSelector("[data-attachment-restore-error] button");
+		const saved = page.waitForResponse(
+			(response) =>
+				response.url().endsWith("/persist-a/draft") && response.request().method() === "PUT",
+		);
+		await page.click('[role="textbox"]');
+		await page.keyboard.down("Control");
+		await page.keyboard.press("End");
+		await page.keyboard.up("Control");
+		await page.keyboard.type(" typed");
+		await settle(page);
+		expect((await snapshot(page)).text).toBe("legacy typed");
+		expect(
+			(await page.evaluate(() => (window as unknown as FixtureWindow).fixture.cachedDraft()))
+				.composerDocument,
+		).toBeUndefined();
+		const response = await saved;
+		expect(JSON.parse(response.request().postData() ?? "{}").composerDocument).toBeUndefined();
+		expect(
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.storedAttachments()),
+		).toEqual(stored);
+		if (recovery === "retry") {
+			await page.click("[data-attachment-restore-error] button");
+		} else {
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.switchToNarrator("persist-b"),
+			);
+			await waitAttachmentOwner(page, "persist-b");
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.switchToNarrator("persist-a"),
+			);
+		}
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 1);
+		expect((await snapshot(page)).text).toBe("legacy typed");
+		expect((await snapshot(page)).missing).toBe(false);
+		expect(await waitStoredCount(page, 1)).toEqual(stored);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
+
+test("reusing the mounted composer never exposes the previous account's live or restored files", async () => {
+	const page = await openPersistentAttachments(true);
+	try {
+		const stored = await persistFirstImage(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.switchToUser("other-user"),
+		);
+		await waitAttachmentOwner(page, "persist-a", "other-user");
+		expect((await snapshot(page)).files).toEqual([]);
+		expect(await page.$('[data-composer-atom="attachment"]')).toBeNull();
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.switchToUser("fixture-user"),
+		);
+		await waitAttachmentOwner(page, "persist-a");
+		await waitImageCount(page, 1);
+		expect((await snapshot(page)).missing).toBe(false);
+		expect(await waitStoredCount(page, 1)).toEqual(stored);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
