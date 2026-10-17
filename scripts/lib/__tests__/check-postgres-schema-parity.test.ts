@@ -122,6 +122,57 @@ describe("parity fixture baseline", () => {
 	});
 });
 
+describe("table primary key parity", () => {
+	const compositeFixture = () => {
+		const source = fixture();
+		source.tables[1].columns[0].primary = false;
+		source.tables[1].primaryKeys = [{ name: "posts_scope_pk", columns: ["authorEmail", "id"] }];
+		return source;
+	};
+
+	test("compares table-level PKs without requiring inline column primary flags", () => {
+		const source = compositeFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+	});
+
+	test.each([
+		"name",
+		"order",
+		"wrong column",
+		"missing key",
+		"extra key",
+	])("detects %s drift", (change) => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		const table = target.tables[1];
+		switch (change) {
+			case "name":
+				table.primaryKeys[0].name = "renamed_pk";
+				break;
+			case "order":
+				table.primaryKeys[0].columns.reverse();
+				break;
+			case "wrong column":
+				table.primaryKeys[0].columns = ["id"];
+				break;
+			case "missing key":
+				table.primaryKeys = [];
+				break;
+			case "extra key":
+				table.primaryKeys.push({ name: "extra_pk", columns: ["id"] });
+				break;
+		}
+		expect(validateCoverage(source, target).join("\n")).toContain("primary key");
+	});
+
+	test("retains inline column primary flag comparison", () => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		target.tables[1].columns[0].primary = true;
+		expect(validateCoverage(source, target)).toContain("column mismatch posts.id");
+	});
+});
+
 describe("constant expression index parity", () => {
 	const expressionFixture = () => {
 		const source = fixture();
@@ -472,10 +523,34 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 121 tables and 1721 columns including personal knowledge injection", () => {
-		expect(target.tables.length).toBe(121);
-		// 1718 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1721);
+	test("covers 124 tables and 1746 columns including composer layouts", () => {
+		expect(target.tables.length).toBe(124);
+		// 1743 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1746);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_context_pins")
+				?.columns.map((column) => column.property),
+		).toEqual(["generation", "narratorId", "segmentsJson"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_message_context_stats")
+				?.columns.map((column) => column.property),
+		).toEqual(["messageId", "role", "parentToolUseId", "segmentsJson"]);
+		expect(target.tables.some((table) => table.name === "narrator_context_char_pages")).toBe(false);
+		for (const name of ["narrator_drafts", "narrator_messages"]) {
+			expect(
+				target.tables
+					.find((table) => table.name === name)
+					?.columns.find((column) => column.property === "composerDocument"),
+			).toMatchObject({
+				name: "composer_document",
+				mode: "json",
+				pgType: "text",
+				notNull: false,
+			});
+		}
 		expect(
 			target.tables
 				.find((table) => table.name === "knowledge_injection_events")
@@ -547,6 +622,31 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrators")
 				?.columns.map((column) => column.property),
 		).toContain("lastStopReason");
+	});
+
+	test("bulk token maintenance keeps nullable state and an indexed durable retirement marker", () => {
+		const jobs = target.tables.find((table) => table.name === "usage_token_repair_jobs");
+		for (const [property, name, pgType] of [
+			["workflowVersion", "workflow_version", "integer"],
+			["phase", "phase", "text"],
+			["summaryJson", "summary_json", "text"],
+			["rowsPerSecond", "rows_per_second", "double precision"],
+			["scratchRetiredAt", "scratch_retired_at", "text"],
+		]) {
+			expect(jobs?.columns.find((column) => column.property === property)).toMatchObject({
+				name,
+				pgType,
+				notNull: false,
+			});
+		}
+		expect(
+			jobs?.indexes.find((index) => index.name === "idx_token_repair_scratch_retirement"),
+		).toMatchObject({
+			columns: ["updatedAt", "id"],
+			unique: false,
+			predicate:
+				"\"scratch_retired_at\" IS NULL AND \"status\" IN ('completed', 'cancelled', 'failed', 'interrupted')",
+		});
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

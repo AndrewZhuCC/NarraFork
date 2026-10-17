@@ -220,7 +220,7 @@ function responseItems(response: RecordValue): ParsedResponse {
 	throw new Error("response_missing");
 }
 
-interface UsageEvidence {
+export interface UsageEvidence {
 	protocol: TokenRepairProtocol;
 	after: TokenRepairCounters;
 	legacy: TokenRepairCounters[];
@@ -334,6 +334,60 @@ function gemini(usage: RecordValue, metadata: boolean): UsageEvidence {
 }
 
 type ProtocolHint = Exclude<TokenRepairProtocol, "unknown">;
+
+/** Safe to persist in private scratch: only validated counters, never request/response text. */
+export interface RepairEvidence extends TokenRepairEvidence {
+	structuredUsage?: {
+		version: 1;
+		options: Partial<Record<ProtocolHint, UsageEvidence>>;
+	};
+}
+
+export function resolveRepairEvidence(
+	row: Row,
+	evidence: RepairEvidence,
+	hint?: ProtocolHint,
+): RepairEvidence {
+	if (!equal(row, evidence.before))
+		return { ...evidence, classification: "conflict", reason: "source_changed", after: null };
+	if (hint && evidence.protocol !== "unknown" && hint !== evidence.protocol)
+		return { ...evidence, classification: "ambiguous", reason: "protocol_conflict", after: null };
+	if (!hint || evidence.reason !== "needs_protocol") return evidence;
+	const usage = evidence.structuredUsage?.options[hint];
+	if (!usage)
+		return {
+			...evidence,
+			manualProtocol: hint,
+			classification: "insufficient",
+			reason: "protocol_not_supported",
+			after: null,
+		};
+	return finishUsage(evidence.before, usage, hint, evidence.structuredUsage);
+}
+
+function finishUsage(
+	before: TokenRepairCounters,
+	usage: UsageEvidence,
+	manualProtocol?: ProtocolHint,
+	structuredUsage?: RepairEvidence["structuredUsage"],
+): RepairEvidence {
+	const correct = equal(before, usage.after);
+	const repairable = usage.legacy.some((legacy) => equal(before, legacy));
+	return {
+		before,
+		after: correct || repairable ? usage.after : null,
+		protocol: usage.protocol,
+		classification: correct ? "correct" : repairable ? "repairable" : "ambiguous",
+		reason: correct
+			? "matches_protocol_usage"
+			: repairable
+				? "matches_known_legacy_conversion"
+				: "unrecognized_previous_conversion",
+		evidence: `${manualProtocol ? `manualProtocol=${manualProtocol}; ` : ""}${usage.protocol}: rawInput=${usage.raw}; netInput=${usage.after.inputTokens}; cacheRead=${usage.after.cachedInputTokens}; cacheWrite=${usage.after.cacheCreationInputTokens}; cache5m=${usage.after.cacheCreation5mTokens}; cache1h=${usage.after.cacheCreation1hTokens}`,
+		...(manualProtocol ? { manualProtocol } : {}),
+		...(structuredUsage ? { structuredUsage } : {}),
+	};
+}
 
 function identify(items: ParsedResponse, url: unknown, hint?: ProtocolHint): UsageEvidence {
 	const path = typeof url === "string" ? url.split("?")[0] : "";
@@ -553,7 +607,7 @@ export async function analyzeTokenRepairEvidence(
 	row: Row,
 	rawDumpJson: string | null,
 	options?: { signal?: AbortSignal; dumpDirectory?: string; protocolHint?: ProtocolHint },
-): Promise<TokenRepairEvidence> {
+): Promise<RepairEvidence> {
 	const before = Object.fromEntries(
 		KEYS.map((key) => [key, row[key]]),
 	) as unknown as TokenRepairCounters;
@@ -618,25 +672,53 @@ export async function analyzeTokenRepairEvidence(
 				response.bodyBytesReceived > response.bodyBytesKept)
 		)
 			return result("insufficient", "response_incomplete");
-		const usage = identify(
-			responseItems(response),
-			record(dump.request).url,
-			options?.protocolHint,
-		);
+		const items = responseItems(response);
+		const url = record(dump.request).url;
+		let usage: UsageEvidence;
+		try {
+			usage = identify(items, url, options?.protocolHint);
+		} catch (error) {
+			if (options?.protocolHint || !(error instanceof Error) || error.message !== "usage_missing")
+				throw error;
+			const alternatives: Partial<Record<ProtocolHint, UsageEvidence>> = {};
+			let invalidInterpretation: Error | undefined;
+			for (const protocol of ["openai", "anthropic", "gemini"] as const) {
+				try {
+					alternatives[protocol] = identify(items, url, protocol);
+				} catch (failure) {
+					// Only fully validated protocol interpretations may be selected later.
+					if (
+						failure instanceof Error &&
+						[
+							"invalid_token_counter",
+							"multiple_requests",
+							"multiple_usage_totals",
+							"response_incomplete",
+						].includes(failure.message)
+					)
+						invalidInterpretation = failure;
+				}
+			}
+			const interpretations = Object.values(alternatives);
+			if (!interpretations.length) throw invalidInterpretation ?? error;
+			// A unique validated wire interpretation needs no model-level manual rule.
+			if (interpretations.length === 1) return finishUsage(before, interpretations[0]);
+			if (
+				!interpretations.some(
+					(candidate) =>
+						equal(before, candidate.after) ||
+						candidate.legacy.some((legacy) => equal(before, legacy)),
+				)
+			)
+				return result("ambiguous", "unrecognized_previous_conversion");
+			return {
+				...result("insufficient", "needs_protocol"),
+				structuredUsage: { version: 1, options: alternatives },
+			};
+		}
 		checkAbort(options?.signal);
 		for (const value of Object.values(usage.after)) count(value);
-		const evidence = `${usage.protocol}: rawInput=${usage.raw}; netInput=${usage.after.inputTokens}; cacheRead=${usage.after.cachedInputTokens}; cacheWrite=${usage.after.cacheCreationInputTokens}; cache5m=${usage.after.cacheCreation5mTokens}; cache1h=${usage.after.cacheCreation1hTokens}`;
-		if (equal(before, usage.after))
-			return result("correct", "matches_protocol_usage", usage.protocol, usage.after, evidence);
-		if (usage.legacy.some((legacy) => equal(before, legacy)))
-			return result(
-				"repairable",
-				"matches_known_legacy_conversion",
-				usage.protocol,
-				usage.after,
-				evidence,
-			);
-		return result("ambiguous", "unrecognized_previous_conversion", usage.protocol, null, evidence);
+		return finishUsage(before, usage, options?.protocolHint);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "";
 		const reasons = [

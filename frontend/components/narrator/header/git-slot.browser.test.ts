@@ -14,7 +14,7 @@ let browser: Browser | undefined;
 let server: ReturnType<typeof Bun.serve> | undefined;
 type FixtureWindow = Window & { fixture: typeof Fixture };
 const hookStubs: Record<string, string> = {
-	useGit: `export const useGitWorkspace=()=>window.gitFixtureWorkspace; export const useGitStatus=()=>({data:undefined}); export const gitWorkspaceTarget=(_id,workspace)=>workspace?.state==='ready'&&workspace.capabilities.read?{narratorId:'n'}:null;`,
+	useGit: `export const useGitWorkspace=()=>window.gitFixtureWorkspace; export const useGitStatus=()=>({data:undefined}); export const useGitLineStats=()=>({data:undefined,isFetching:false,error:null}); export const gitWorkspaceTarget=(_id,workspace)=>workspace?.state==='ready'&&workspace.capabilities.read?{narratorId:'n'}:null;`,
 	useWorkspaceContext: `export const useWorkspaceContext=()=>({data:window.gitFixtureContext});`,
 	useChapters: `export const useChapter=()=>({data:{id:'chapter',projectId:'p',title:'Chapter',branch:'base',status:'active',worktreePath:'/repo'}});`,
 	useChapterGitStatus: `export const useChapterGitStatus=()=>({data:undefined});`,

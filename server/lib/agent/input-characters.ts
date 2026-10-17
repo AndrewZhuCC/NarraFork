@@ -200,9 +200,11 @@ async function measureInputCharacters(
 				part.type === "reasoning" ||
 				part.type === "thinking" ||
 				part.type === "reasoning_text" ||
-				part.type === "thought"
+				part.type === "thought" ||
+				// Gemini parts carry no `type`; `thought: true` is their reasoning marker.
+				part.thought === true
 			)
-				category = "assistant";
+				category = "reasoning";
 		}
 		// Explicit protocol discriminants. Never inspect image/data/signature/encrypted blobs.
 		switch (part.type) {
@@ -281,7 +283,7 @@ async function measureInputCharacters(
 					await json({ name: fn.name, arguments: fn.arguments }, "toolCall");
 				}
 			}
-			text(part.reasoning_content, category);
+			text(part.reasoning_content, "reasoning");
 			return;
 		}
 		// Unknown typed blocks may carry new model-visible fields: never label a partial count complete.

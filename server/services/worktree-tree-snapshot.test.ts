@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -6,6 +6,7 @@ import {
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
@@ -14,6 +15,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -21,10 +23,13 @@ import iconv from "iconv-lite";
 import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { AsyncMutex } from "../lib/async-mutex";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
+import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { withLifecycleGuardPorts } from "./worktree-lifecycle-guard";
 import {
 	hasHotPathWarmupForTests,
 	planTreeRevertSegments,
@@ -100,6 +105,378 @@ afterEach(async () => {
 });
 
 describe("worktree tree snapshots", () => {
+	test("captures a mixed-case native workspace through its canonical comparison path", async () => {
+		const repo = await createRepo("Nf-Tree-Case-Identity-");
+		const target = normalizePathForComparison(repo);
+		writeFileSync(join(repo, "a.txt"), "case-preserving bytes\n");
+		// On Windows the reservation lowercases the dispatch path, while Git
+		// reports the on-disk spelling. Both must identify the same real inode.
+		const tree = await worktreeTreeSnapshot.capture(target);
+		const dir = treeSnapshotPhysicalDir("local", target);
+		const before = lstatSync(dir);
+		expect(await worktreeTreeSnapshot.capture(target)).toBe(tree);
+		expect(await worktreeTreeSnapshot.readFileAtTree(target, tree, "a.txt")).toBe(
+			"case-preserving bytes\n",
+		);
+		expect(lstatSync(dir).dev).toBe(before.dev);
+		expect(lstatSync(dir).ino).toBe(before.ino);
+	});
+
+	for (const partial of ["empty", "HEAD", "objects", "complete"] as const) {
+		for (const cold of [false, true]) {
+			test(`failed ${partial} shadow birth resumes ${cold ? "in a cold process" : "on retry"} without deleting evidence`, async () => {
+				const repo = await createRepo("nf-tree-init-resume-");
+				writeFileSync(join(repo, "a.txt"), "recoverable\n");
+				const dir = treeSnapshotPhysicalDir("local", repo);
+				const markerPath = join(dir, "nf-shadow-init");
+				const evidence = Buffer.from([0, 255, 128, 13, 10]);
+				const realSpawn = spawn.safeSpawn;
+				const failed = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+					if (opts.cmd[1] !== "init" || !opts.cmd.includes("--bare")) return realSpawn(opts);
+					if (partial === "complete") expect((await realSpawn(opts)).exitCode).toBe(0);
+					writeFileSync(join(dir, "marker.bin"), evidence);
+					if (partial === "HEAD") writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+					if (partial === "objects") {
+						mkdirSync(join(dir, "objects"));
+						writeFileSync(join(dir, "objects", "evidence.bin"), evidence);
+						mkdirSync(join(dir, "refs", "nf"), { recursive: true });
+						writeFileSync(join(dir, "refs", "nf", "preserved"), `${"a".repeat(40)}\n`);
+					}
+					return { exitCode: 1, stdout: "", stderr: "injected init failure" };
+				});
+				try {
+					await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
+						"shadow repo init failed",
+					);
+				} finally {
+					failed.mockRestore();
+				}
+				const birth = lstatSync(dir);
+				const marker = readFileSync(markerPath);
+				const headBefore = existsSync(join(dir, "HEAD")) ? readFileSync(join(dir, "HEAD")) : null;
+				expect(marker.length).toBeLessThanOrEqual(256);
+				await worktreeTreeSnapshot.gcAll();
+				expect(existsSync(join(dir, "HEAD")) ? readFileSync(join(dir, "HEAD")) : null).toEqual(
+					headBefore,
+				);
+				expect(readFileSync(markerPath)).toEqual(marker);
+				expect(readFileSync(join(dir, "marker.bin"))).toEqual(evidence);
+				if (cold) {
+					// A separate module graph and database, but the same physical shadow store.
+					// Never share the parent's live DB lock or bypass instance locking.
+					const coldHome = mkdtempSync(join(tmpdir(), "nf-tree-cold-home-"));
+					tempDirs.push(coldHome);
+					symlinkSync(join(dir, ".."), join(coldHome, "tree-snapshots"), "dir");
+					const result = await realSpawn({
+						cmd: [
+							process.execPath,
+							"--eval",
+							`
+							if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME)
+								throw new Error("isolated test home required");
+							const { worktreeTreeSnapshot } = await import(${JSON.stringify(join(import.meta.dir, "worktree-tree-snapshot.ts"))});
+							const tree = await worktreeTreeSnapshot.capture(${JSON.stringify(repo)});
+							console.log("RECOVERED:" + tree);
+							process.exit(0);
+						`,
+						],
+						env: { ...process.env, NARRAFORK_HOME: coldHome },
+						timeout: 15_000,
+						maxOutputBytes: 64 * 1024,
+					});
+					if (result.exitCode !== 0)
+						throw new Error(`cold capture failed: ${result.stdout}\n${result.stderr}`);
+					expect(result.stdout).toMatch(/RECOVERED:[0-9a-f]{40}/);
+				} else {
+					expect(await worktreeTreeSnapshot.capture(repo)).toMatch(/^[0-9a-f]{40}$/);
+				}
+				expect(lstatSync(dir).ino).toBe(birth.ino);
+				expect(lstatSync(dir).dev).toBe(birth.dev);
+				expect(existsSync(markerPath)).toBe(false);
+				expect(readFileSync(join(dir, "marker.bin"))).toEqual(evidence);
+				if (partial === "objects") {
+					expect(readFileSync(join(dir, "objects", "evidence.bin"))).toEqual(evidence);
+					expect(readFileSync(join(dir, "refs", "nf", "preserved"), "utf8")).toBe(
+						`${"a".repeat(40)}\n`,
+					);
+				}
+			}, 25_000);
+		}
+	}
+
+	for (const damage of [
+		"missing",
+		"corrupt",
+		"oversized",
+		"foreign-key",
+		"directory",
+		"parent",
+		"symlink",
+	] as const) {
+		test(`failed shadow birth refuses a ${damage} initialization marker without init or deletion`, async () => {
+			const repo = await createRepo("nf-tree-init-refuse-");
+			const dir = treeSnapshotPhysicalDir("local", repo);
+			const markerPath = join(dir, "nf-shadow-init");
+			const realSpawn = spawn.safeSpawn;
+			const failed = spyOn(spawn, "safeSpawn").mockImplementation((opts) =>
+				opts.cmd[1] === "init" && opts.cmd.includes("--bare")
+					? Promise.resolve({ exitCode: 1, stdout: "", stderr: "injected init failure" })
+					: realSpawn(opts),
+			);
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("shadow repo init failed");
+			} finally {
+				failed.mockRestore();
+			}
+			const marker = readFileSync(markerPath, "utf8");
+			if (damage === "missing") rmSync(markerPath);
+			if (damage === "corrupt") writeFileSync(markerPath, "{broken");
+			if (damage === "oversized") writeFileSync(markerPath, "x".repeat(257));
+			if (damage === "foreign-key")
+				writeFileSync(markerPath, marker.replace(/[a-f0-9]{64}/, "0".repeat(64)));
+			if (damage === "parent") {
+				const lines = marker.split("\n");
+				lines[3] = "0:0";
+				writeFileSync(markerPath, lines.join("\n"));
+			}
+			if (damage === "directory") {
+				const backup = join(repo, "failed-shadow");
+				renameSync(dir, backup);
+				mkdirSync(dir);
+				writeFileSync(markerPath, marker);
+				expect(lstatSync(dir).ino).not.toBe(lstatSync(backup).ino);
+				expect(readFileSync(join(backup, "nf-shadow-init"), "utf8")).toBe(marker);
+			}
+			if (damage === "symlink") {
+				const external = join(repo, "external-marker");
+				writeFileSync(external, marker);
+				rmSync(markerPath);
+				symlinkSync(external, markerPath);
+			}
+			writeFileSync(join(dir, "marker.bin"), "retained evidence");
+			writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n");
+			const dispatch = spyOn(spawn, "safeSpawn");
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(TreeSnapshotError);
+				expect(dispatch).toHaveBeenCalledTimes(0);
+				expect(readFileSync(join(dir, "marker.bin"), "utf8")).toBe("retained evidence");
+			} finally {
+				dispatch.mockRestore();
+			}
+		});
+	}
+
+	test("marker creation failure preserves the birth but does not authorize recovery", async () => {
+		const repo = await createRepo("nf-tree-init-marker-failure-");
+		const dir = treeSnapshotPhysicalDir("local", repo);
+		const realWrite = fsPromises.writeFile;
+		const writing = spyOn(fsPromises, "writeFile").mockImplementation((...args) =>
+			args[0] === join(dir, "nf-shadow-init")
+				? Promise.reject(new Error("injected marker creation failure"))
+				: realWrite(...args),
+		);
+		const dispatch = spyOn(spawn, "safeSpawn");
+		try {
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("marker creation failed");
+			expect(dispatch).toHaveBeenCalledTimes(0);
+		} finally {
+			writing.mockRestore();
+			dispatch.mockRestore();
+		}
+		expect(lstatSync(dir).isDirectory()).toBe(true);
+		expect(existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+		await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
+			"existing shadow repo is invalid",
+		);
+	});
+
+	test("an existing valid shadow does not require lifecycle inventory or receipt migration", async () => {
+		const repo = await createRepo("nf-tree-existing-inventory-");
+		writeFileSync(join(repo, "a.txt"), "existing shadow\n");
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		const readClaims = mock(async () => {
+			throw new Error("unrelated inventory and legacy migration unavailable");
+		});
+		const current = await withLifecycleGuardPorts(
+			{ canonicalPath: async (value) => value, readClaims },
+			() => worktreeTreeSnapshot.capture(repo),
+		);
+		expect(current).toBe(tree);
+		expect(readClaims).not.toHaveBeenCalled();
+	});
+
+	test("a canonical checkout identity does not replace the raw shadow key or stored path", async () => {
+		const repo = await createRepo("nf-tree-raw-key-");
+		writeFileSync(join(repo, "a.txt"), "shared checkout\n");
+		const aliases = mkdtempSync(join(tmpdir(), "nf-tree-raw-key-alias-"));
+		const alias = join(aliases, "checkout");
+		symlinkSync(repo, alias, "dir");
+		tempDirs.push(aliases, alias);
+		snapshotPaths.push(normalizePathForComparison(alias));
+		const dir = treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, alias);
+		const canonicalDir = treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, repo);
+		expect(dir).not.toBe(canonicalDir);
+		const tree = await worktreeTreeSnapshot.capture(alias);
+		expect(await worktreeTreeSnapshot.hasTree(alias, tree)).toBe(true);
+		expect(existsSync(join(dir, "HEAD"))).toBe(true);
+		expect(existsSync(canonicalDir)).toBe(false);
+		const rows = await db.query.worktreeTreeSnapshots.findMany({
+			where: eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(alias)),
+		});
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.treeHash).toBe(tree);
+	});
+
+	for (const replaced of ["shadow", "checkout"] as const) {
+		test(`successful init refuses a replaced ${replaced} inode before metadata writes or capture`, async () => {
+			const repo = await createRepo("nf-tree-init-context-");
+			writeFileSync(join(repo, "a.txt"), "original checkout\n");
+			const dir = treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, repo);
+			const target = replaced === "shadow" ? dir : repo;
+			const backup = `${target}-before-replacement`;
+			tempDirs.push(backup);
+			const realSpawn = spawn.safeSpawn;
+			const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				const result = await realSpawn(opts);
+				if (opts.cmd[1] === "init" && opts.cmd.includes("--bare")) {
+					expect(result.exitCode).toBe(0);
+					renameSync(target, backup);
+					mkdirSync(target);
+					writeFileSync(join(target, "sentinel.bin"), "replacement must stay untouched");
+				}
+				return result;
+			});
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(
+					"resource footprint changed",
+				);
+				expect(dispatch).toHaveBeenCalledTimes(1);
+				expect(readdirSync(target)).toEqual(["sentinel.bin"]);
+				expect(readFileSync(join(target, "sentinel.bin"), "utf8")).toBe(
+					"replacement must stay untouched",
+				);
+				expect(existsSync(join(replaced === "shadow" ? backup : dir, "nf-shadow-init"))).toBe(true);
+				expect(
+					await db.query.worktreeTreeSnapshots.findMany({
+						where: eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(repo)),
+					}),
+				).toHaveLength(0);
+			} finally {
+				dispatch.mockRestore();
+			}
+		});
+	}
+
+	test("gcAll waits for the shadow mutex before repairing HEAD", async () => {
+		const repo = await createRepo("nf-tree-gc-repair-lock-");
+		writeFileSync(join(repo, "a.txt"), "retained\n");
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		const dir = treeSnapshotPhysicalDir("local", repo);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const queued = Promise.withResolvers<void>();
+		const realSpawn = spawn.safeSpawn;
+		const git = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			if (opts.cmd.includes("add") && opts.cmd.includes(dir)) {
+				started.resolve();
+				await release.promise;
+				return { exitCode: 1, stdout: "", stderr: "fixture paused capture" };
+			}
+			return realSpawn(opts);
+		});
+		const capturing = worktreeTreeSnapshot.capture(repo).then(
+			() => null,
+			(error) => error,
+		);
+		try {
+			await Promise.race([
+				started.promise,
+				capturing.then((error) => {
+					throw error;
+				}),
+			]);
+		} catch (error) {
+			git.mockRestore();
+			throw error;
+		}
+		rmSync(join(dir, "HEAD"));
+		const acquire = AsyncMutex.prototype.acquire;
+		const mutex = spyOn(AsyncMutex.prototype, "acquire").mockImplementation(function <T>(
+			this: AsyncMutex,
+			key: string,
+			body: () => Promise<T>,
+		): Promise<T> {
+			if (key === dir) queued.resolve();
+			return acquire.call(this, key, body) as Promise<T>;
+		});
+		const collecting = worktreeTreeSnapshot.gcAll();
+		try {
+			await queued.promise;
+			expect(existsSync(join(dir, "HEAD"))).toBe(false);
+			release.resolve();
+			expect(await capturing).toBeInstanceOf(TreeSnapshotError);
+			await collecting;
+			expect(existsSync(join(dir, "HEAD"))).toBe(true);
+			expect(await worktreeTreeSnapshot.hasTree(repo, tree)).toBe(true);
+		} finally {
+			release.resolve();
+			await capturing;
+			await collecting;
+			mutex.mockRestore();
+			git.mockRestore();
+		}
+	});
+
+	for (const corruption of [
+		"non-bare",
+		"invalid-config",
+		"oversized-config",
+		"foreign-gitdir",
+		"foreign-common-dir",
+	] as const) {
+		test(`capture and structural writes refuse an existing ${corruption} shadow without init or metadata writes`, async () => {
+			const repo = await createRepo("nf-tree-existing-invalid-");
+			writeFileSync(join(repo, "a.txt"), "retained\n");
+			const tree = await worktreeTreeSnapshot.capture(repo);
+			const dir = treeSnapshotPhysicalDir("local", repo);
+			const configPath = join(dir, "config");
+			if (corruption === "non-bare") {
+				writeFileSync(configPath, "[core]\n\tbare = false\n");
+			} else if (corruption === "invalid-config") {
+				writeFileSync(configPath, "[malformed\n");
+			} else if (corruption === "oversized-config") {
+				writeFileSync(configPath, "#".repeat(64 * 1024 + 1));
+			} else if (corruption === "foreign-common-dir") {
+				writeFileSync(join(dir, "commondir"), join(repo, ".git"));
+			}
+			const config = readFileSync(configPath);
+			const head = readFileSync(join(dir, "HEAD"));
+			const realSpawn = spawn.safeSpawn;
+			const git = spyOn(spawn, "safeSpawn").mockImplementation((opts) =>
+				corruption === "foreign-gitdir" && opts.cmd.includes("--absolute-git-dir")
+					? Promise.resolve({ exitCode: 0, stdout: `true\n${repo}\n`, stderr: "" })
+					: realSpawn(opts),
+			);
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(TreeSnapshotError);
+				await expect(worktreeTreeSnapshot.commitSnapshot(repo, tree)).rejects.toThrow(
+					TreeSnapshotError,
+				);
+				for (const [opts] of git.mock.calls) {
+					expect(opts.cmd).toContain("rev-parse");
+					expect(opts.cmd).not.toContain("init");
+				}
+				if (corruption === "oversized-config" || corruption === "foreign-common-dir") {
+					expect(git).toHaveBeenCalledTimes(0);
+				}
+				expect(readFileSync(configPath)).toEqual(config);
+				expect(readFileSync(join(dir, "HEAD"))).toEqual(head);
+			} finally {
+				git.mockRestore();
+			}
+		});
+	}
+
 	test("captures a tree hash and records it once per distinct state", async () => {
 		const repo = await createRepo("nf-tree-capture-");
 		writeFileSync(join(repo, "a.txt"), "one\n");

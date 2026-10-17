@@ -319,6 +319,7 @@ export const knowledgeGrants = sqliteTable(
 - **admin 角色**视为拥有最高 clearance + 所有受控标签（实现层短路，不必逐条 grant）。
 - **owner**（条目/集合 `ownerUserId`）对自己拥有的内容拥有完整访问 + 写权限。
 - 默认：未授予任何 grant 的 principal 拥有 `public` clearance、无任何受控标签——即只能读 `public` 密级且不带受控标签的条目。
+- **管理界面**（仅 admin）：密级（3.4）在 `/knowledge/admin/levels`，ACL 标签与标签类型（3.5）在 `/knowledge/admin/tags`，用户授权（逐用户替换式 `setUserAcl` + 追加式批量授权）在 `/knowledge/admin/users`；知识库浏览页标题栏的「管理」按钮进入，旧的 `/knowledge?tab=admin` 重定向到这里（见 KNOWLEDGE_UI_REDESIGN.md §8.5）。
 
 ### 3.7 条目链接：knowledge_entry_links（知识图谱 + 内容级内联链接）
 
@@ -616,7 +617,8 @@ knowledgeService = {
   // 集合
   listCollections(scope), createCollection(...), updateCollection(...), deleteCollection(...),
   // 条目
-  listEntries(collectionId, { tags, status, cursor }),
+  listEntriesPage({ principal, collectionId, tag, level, status, sort, limit, cursor }),  // keyset 分页 + 标签/ACL 后过滤回填，见 4.2
+  listEntries({ collectionId, tag, limit }),  // 未过滤的原始首页，仅内部/测试用；对外一律走 listEntriesPage
   getEntry(entryId, { withContent, viewContext }),  // viewContext 命中时返回按条件块裁剪后的正文（见 3.9）
   createEntry(...),            // 创建条目 + 首个 revision（含 classificationLevel、tags）
   updateEntryMeta(...),        // 改 title/slug/tags/classificationLevel/metadata（不改正文）
@@ -657,9 +659,9 @@ POST   /api/knowledge/collections                   创建集合
 PATCH  /api/knowledge/collections/:id
 DELETE /api/knowledge/collections/:id
 
-GET    /api/knowledge/entries?collectionId=&tags=&q=&view.version=&view.product= 列出/筛选条目（q 触发 FTS；结果按权限过滤；view.* 传 viewContext 裁剪正文/摘要）
+GET    /api/knowledge/entries?collectionId=&tag=&level=&status=&sort=&q=&limit=&cursor=&view.version=&view.product= 列出/筛选条目（q 触发 FTS；结果按权限过滤；view.* 传 viewContext 裁剪正文/摘要；分页见下）
 POST   /api/knowledge/entries                        创建条目（含首版本、密级、标签）
-GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）
+GET    /api/knowledge/entries/:id?view.version=&view.audience=  读取条目（默认 current 正文；带 view.* 时返回按条件块裁剪后的正文）；附 viewerCaps（见下）
 PATCH  /api/knowledge/entries/:id                    改元数据（标题/标签/密级/metadata）
 DELETE /api/knowledge/entries/:id                    归档/删除
 
@@ -683,6 +685,20 @@ GET    /api/knowledge/grants?scope=&principal=         列出授权（clearance 
 POST   /api/knowledge/grants                           授予 clearance 或 tag
 DELETE /api/knowledge/grants/:id                       撤销授权
 ```
+
+**`GET /entries` 分页（keyset）：**
+
+- 排序由 `sort` 决定：`updated`（默认）= `(updatedAt DESC, id DESC)`；`title` = `(title ASC, id ASC)`。`id` 作为相同时间戳/相同标题下的稳定决胜键；标题按各引擎列自身的排序规则比较（SQLite 二进制、PG 数据库排序规则），keyset 谓词与 `ORDER BY` 同一规则，故分页精确。`cursor` 是不透明的 base64url 串（`updated` 编码 `[updatedAt, id]`，`title` 编码 `["title", title, id]`，上限 4096 字符），非法值或**与 `sort` 不匹配的游标**返回 400。
+- 分页模式另有两个 SQL 侧筛选：`level` 匹配**有效密级**（条目自身 `classificationLevel`，为空时取所在集合的 `defaultLevel`——与读闸排名用的同一个值；对集合是一个小的 `IN` 子查询）；`status`（`active` / `archived`）。`tag` 与 ACL 仍是读取后的后过滤，共用下面的扫描预算。
+- 分页模式的每一行附带 `ownerUsername`、`myPersonalEntryId`（调用者自己的 active 个人版本）、`myPersonalEntryBehindMain`（该版本的 fork 基线 ≠ 条目当前 revision）——每页两次 `IN` 批量查询（用户名、`idx_kd_entry_author`），无逐行查询，不泄露行本身之外的信息。
+- **带 `limit`（1–200，默认 50）或 `cursor` 时**返回分页信封 `{ items, nextCursor }`，`nextCursor` 为 `null` 表示已到底。
+- **两者都不带时**保留旧形状：裸数组，即第一页（最多 100 条可读条目）；若还有更多，用响应头 `X-Next-Cursor` 告知，旧调用方至少能察觉截断。选择"参数显式开启信封"而不是直接改形状，是为了不打断任何仍按数组解析的调用方（`GET /entries` 不在 External API v1 中，见 `OPEN_API.md`）。
+- 标签与 ACL 过滤发生在 DB 读取之后，所以服务层（`listEntriesPage`）会按批（`max(limit+1, 50)`，上限 200）继续往后读，直到凑满一页、源数据读尽，或单次请求扫描满 `ENTRY_PAGE_MAX_SCAN_ROWS = 1000` 行为止。预算耗尽时返回一页**偏短甚至为空**的结果 + 指向最后扫描行之后的 `nextCursor`——调用方应继续跟随游标，而不是把"短页"当作结束。页填满时游标指向最后返回的那一行，因此跨页不重不漏。
+- 带 `q` 时走 FTS 检索（自身已有上限、不分页）；分页模式下其 `nextCursor` 恒为 `null`。分页模式的 `q` 分支默认按相关度（`sort=relevance`），`sort=updated` 走检索的时间序，`sort=title` 在已限量的结果集内存排序；`level` / `status` 同样作用于该结果集（补齐 owner/密级用一次 ACL 投影批量查询），行注解同上（检索行不带 revision id，`myPersonalEntryBehindMain` 恒为 false）。
+- 全量（无 `collectionId`）列表目前没有 `(updated_at, id)` 索引，`title` 排序也没有 `(collection_id, title, id)` 索引——集合内按标题排序走 `idx_ke_collection` 过滤后排序，全量按标题排序与全量按时间排序一样是整表 top-N。二者都依赖每次请求的行数预算限界返回行数；若条目量很大需补索引（schema 变更 + 迁移，另行立项）。
+- 侧栏**不显示每个集合的条目数**：按条目逐条 ACL 判定后计数需要全表扫描，不满足主线程约束；而从已加载的列表推算的数字是错误的（只覆盖当前筛选与已加载页），因此去掉。
+
+**`viewerCaps`（调用者能力位）**：`GET /entries/:id` 返回条目时附带 `ownerUsername`、`currentVersion`（最新 revision 的版本号，单行元数据查询）与 `viewerCaps: { canWriteMain, canEditMeta, canManageAcl, canTransferOwner, canDelete, canReview, canManageLinks, myPersonalEntryId }`。`canManageLinks` 与 `POST /entries/:id/links`（本条目作源）、`DELETE /links/:id`（链接的源条目）共用 `canManageEntryLinks`（当前等于 `canRead`，即 6.5 中"源可写"被有意放宽；收紧时界面与接口一起变）；`GET /entries/:id/links` 的每一行另带 `canRemove`（对该链接源条目的同一判定），入链的删除按钮按它显示；`GET /collections` 的每一行附带 `viewerCaps: { canEdit, canManageAcl, canTransferOwner, canDelete, canCreateEntry }`。每一位都由对应写接口所用的同一判定函数计算（`canDirectWriteEntry` / `canWriteMain` / `isEntryOwnerOrAdmin` / `canAdministerKnowledgeAcl` / `canReview` / `isCollectionOwnerOrAdmin` / `canWriteCollection`），前端只按它显隐操作，不自行推断权限。映射表见 `KNOWLEDGE_UI_REDESIGN.md` §8.1，一致性由 `server/services/__tests__/knowledge-viewer-caps.test.ts` 保证。能力位只说明"该类调用会被接受"，不含逐请求的输入校验（如"只有 admin 能把 owner 设为空"、"不能审核自己的提交"）。
 
 > 开放 API（API token 鉴权、外部读写）见 `OPEN_API.md`；本文件只定义资源本身与内部（JWT）接口。两者复用同一 `knowledgeService`。
 
@@ -788,6 +804,7 @@ principal P：clearance=secret，grantedTags={product:M20}
 ### 6.4 命中过滤发生在返回/注入之前
 
 - 检索（FTS / tag / metadata）先召回候选，再按 6.1 逐条 `canRead` 过滤，**未通过的条目既不返回也不计数**，避免通过结果数量/标题泄露存在性（侧信道）。
+- 列表分页（4.2）同理：被过滤的行只推进游标，不出现在 `items` 里；短页/空页 + 非空游标只说明"扫描预算用完、后面还有行"，不暴露被隐藏条目的标题、内容或确切数量（这是有界扫描的固有代价：读者最多能推断"存在大量不可读条目"）。
 - 关键词自动注入（第 5 节）同样在注入前过滤：principal 看不到无权访问的条目摘要。
 - 受控标签本身的存在（如"有个 team:售后 分区"）不向无权 principal 暴露。
 
@@ -854,6 +871,8 @@ principal P：clearance=secret，grantedTags={product:M20}
 - **未发布也可使用**：`KnowledgeRead({ personalEntryId })` 读取本人的个人条目；`KnowledgeEdit` 的 `save` / `update_meta` 可直接修改正文、标题和关键词。发布仅用于分享。
 - `KnowledgeSearch` 默认包含本人的 active standalone（内部 `includeStandalone` 开关），结果给出 `personalEntryId`；`useDraft:false` 只搜索全局版本。现有 HTTP 搜索默认契约不变。
 - 关键词注入也包含本人的 active standalone，复用现有匹配、摘要限额和持久去重；personal/global 身份贯穿模型提示与气泡导航。无发布目标的条目可跨项目使用，有目标时遵循当前项目或全局集合范围；个人候选缓存按用户隔离。
+- **前端入口**（KNOWLEDGE_UI_REDESIGN.md §5.4 / §5.5 / §8.3）：两种形态共用一个列表 `/knowledge/mine` 和一个编辑页 `/knowledge/mine/<personalEntryId>`；条目页的「提议修改 / 我的个人版本」按钮进入或创建（`createDraft`）它。旧的 `/knowledge/personal/<id>`、条目页 `#draft`、`/knowledge?tab=mylibrary` 均重定向到这里；叙述者 dock 面板、知识提示与工具详情里的个人条目链接同样指向它。
+- **页面数据**：`GET /personal-entries/:id`（作者或 admin，否则 404）在条目本身之外返回 `entryTitle` / `currentMainContent` / `drift`（仅 linked 且调用者当前**仍可读**该条目时）、`targetCollectionName`（仅 standalone 且目标集合可读时）、`openSubmissions`（删除会一并撤回的 pending / conflict / changes_requested 请求，不含正文）和 `viewerCaps`：`canEdit` / `canEditMeta` / `canRebase` / `canDelete` / `canSubmit` + `submitBlockers`（`archived` / `missing_target` / `missing_title` / `open_request`），每一位与对应写接口同一判定（提交前置条件是 `submitForReview` 共用的纯函数）。`GET /personal-entries` 每行同样带 ACL 检查过的 `entryTitle` / `targetCollectionName`。失去条目读权限后，作者自己的副本正文仍可见可改，但 main 的标题、正文与 drift 不再经个人条目泄露。
 
 ### 6.7.2 drift 与 rebase
 
@@ -949,6 +968,14 @@ principal P：clearance=secret，grantedTags={product:M20}
 | `owner_transferred` | 原 owner + 新 owner | 条目/集合所有权转移 |
 
 后三类走 `knowledge:library_changed`（读者视角的变化，与审核队列无关）；前四类走 `knowledge:review_inbox_changed`。drift 与 ACL 的通知都有**上限**（各 200 用户），避免一次写入引发无界扇出。
+
+**和通知铃的关系。** 这些 WS 帧只让客户端重新拉取，不写入平台通知中心的 `notifications` 表（该表的动态投影会回查源内容，知识库标题一旦写进去就可能泄露密级）。铃铛另读两条 ACL 检查过的 HTTP 接口：
+
+- 审核者：`GET /api/knowledge/review-inbox/count`，加上待审列表。点击一条提交（linked 与 standalone 相同）打开请求页 `/knowledge/requests/<id>`；收件箱入口打开 `/knowledge/review`。
+- 作者：`GET /api/knowledge/my-submission-outcomes`，最近 30 天内自己的 `approved` / `rejected` / `changes_requested`。响应只有 id、状态和 findings，**没有标题、变更说明或正文**。点击后同样打开请求页 `/knowledge/requests/<id>`——作者与审核者是同一个 URL，页面按 `GET /submissions/:id` 返回的 `viewerCaps` 显示各自的操作（见 KNOWLEDGE_UI_REDESIGN.md §8.2）。请求页的「编辑我的版本」进入 `/knowledge/mine/<draftId>`；`/knowledge/mine` 的「我发起的请求」区也列出同样的结论（标签取自作者自己的个人条目列表）。
+- 请求页本身再走 ACL 检查过的 `GET /api/knowledge/submissions/:id`：提交者本人或对目标有审核权（§6.7.5）才能看到，其余一律 404；条目标题、当前 main 等展示字段另需对条目/集合的读权限。
+
+收到 `knowledge:review_inbox_changed` 时前端会失效上述查询，所以审核队列有变化时铃铛不会一直空着。
 
 ### 6.7.7 ACL 审计
 
@@ -1050,6 +1077,5 @@ principal P：clearance=secret，grantedTags={product:M20}
 ### 10.4 知识库前端的其余缺口
 
 - **知识图谱无可视化**：`useEntryGraph` hook 与 `GET /entries/:id/graph` 都已就绪，缺 React Flow 之类的图视图组件。
-- **条目筛选**：`GET /entries` 支持 `tag`，但前端无标签筛选控件；按密级筛选前后端都没有。
-- **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页。
-- **知识库事件尚未进站内通知中心**：平台已有应用内通知中心（`notifications` 表 + NotificationBell/Drawer），但知识库通知仍走 WS 推送 + React Query 失效（6.7.6），未写入通知中心的未读列表。`notification-service` 另有钉钉/飞书 webhook。要把知识库审核/发布等事件接入通知中心，需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。
+- **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页；管理区 `/knowledge/admin` 的子导航在该页实现前不列此项（知识包 10.1 同理）。
+- **知识库事件不进 `notifications` 表**：平台通知中心（`notifications` 表）仍只存聊天和权限请求。知识库审核/发布走 6.7.6 的 WS 失效 + 铃铛里的知识库区块（审核队列计数、作者最近结论）。这是有意的：通知中心的动态投影会回查源内容，把条目标题写进该表会泄露密级，不写标题则没有可读性。铃铛上的文案因此是固定句子，不带标题或正文；findings 只出现在作者自己的结论里。`notification-service` 的钉钉/飞书 webhook 仍未接入知识库事件。

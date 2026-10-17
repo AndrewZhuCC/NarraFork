@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import type {
 	BulkKnowledgeGrantInput,
@@ -57,6 +57,27 @@ export function useKnowledgeEntries(opts: { collectionId?: string; tag?: string;
 		queryKey: ["knowledge", "entries", opts],
 		queryFn: () => api.listKnowledgeEntries(opts),
 		staleTime: STALE,
+	});
+}
+
+/**
+ * Keyset-paginated entry list (GET /knowledge/entries with `limit`/`cursor`). Use this
+ * wherever the full list matters: the legacy `useKnowledgeEntries` only ever sees the
+ * first 100 readable entries. With `q` the server's capped FTS results come back as a
+ * single page (`nextCursor: null`).
+ */
+export function useKnowledgeEntriesPaged(
+	opts: Omit<Parameters<typeof api.listKnowledgeEntriesPage>[0] & object, "cursor">,
+	queryOpts: { enabled?: boolean } = {},
+) {
+	return useInfiniteQuery({
+		queryKey: ["knowledge", "entries", "paged", opts],
+		queryFn: ({ pageParam }) =>
+			api.listKnowledgeEntriesPage({ ...opts, cursor: pageParam ?? undefined }),
+		initialPageParam: null as string | null,
+		getNextPageParam: (last) => last.nextCursor,
+		staleTime: STALE,
+		enabled: queryOpts.enabled ?? true,
 	});
 }
 
@@ -191,38 +212,17 @@ export function useEntryGraph(entryId: string | undefined, depth?: number) {
 }
 
 // ─── Drafts ───
-export function useMyKnowledgeDraft(entryId: string | undefined) {
-	return useQuery({
-		queryKey: ["knowledge", "draft", entryId],
-		queryFn: () => api.getMyKnowledgeDraft(entryId as string),
-		enabled: !!entryId,
-	});
-}
 
 export function useCreateKnowledgeDraft() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: ({ entryId, name }: { entryId: string; name?: string }) =>
 			api.createKnowledgeDraft(entryId, name ? { name } : {}),
-		onSuccess: (_r, { entryId }) =>
-			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] }),
-	});
-}
-
-export function useUpdateKnowledgeDraft() {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: ({
-			draftId,
-			...data
-		}: {
-			draftId: string;
-			entryId: string;
-			content: string;
-			name?: string;
-		}) => api.updateKnowledgeDraft(draftId, { content: data.content, name: data.name }),
-		onSuccess: (_r, { entryId }) =>
-			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] }),
+		onSuccess: (_r, { entryId }) => {
+			// The entry's viewerCaps.myPersonalEntryId now points at the new personal version.
+			qc.invalidateQueries({ queryKey: ["knowledge", "entry", entryId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+		},
 	});
 }
 
@@ -234,15 +234,6 @@ export function useKnowledgeDraftDiff(
 		queryKey: ["knowledge", "draftDiff", draftId, against],
 		queryFn: () => api.getKnowledgeDraftDiff(draftId as string, against),
 		enabled: !!draftId,
-	});
-}
-
-/** Whether the caller's active draft on this entry has drifted behind current main. */
-export function useKnowledgeDraftDrift(entryId: string | undefined) {
-	return useQuery({
-		queryKey: ["knowledge", "draftDrift", entryId],
-		queryFn: () => api.getKnowledgeDraftDrift(entryId as string),
-		enabled: !!entryId,
 	});
 }
 
@@ -264,9 +255,13 @@ export function useRebaseKnowledgeDraft() {
 			entryId: string;
 			strategy?: KnowledgeRebaseStrategy;
 		}) => api.rebaseKnowledgeDraft(draftId, strategy ?? "merge"),
-		onSuccess: (_r, { entryId }) => {
-			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
-			qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", entryId] });
+		onSuccess: (_r, { draftId }) => {
+			// The personal-version page reads body + drift from the personal-entry detail; a
+			// rebase also supersedes a pending request.
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry", draftId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", draftId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "draftDiff"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
 		},
@@ -274,11 +269,15 @@ export function useRebaseKnowledgeDraft() {
 }
 
 // ─── Personal library (standalone personal entries) ───
-export function useMyPersonalEntries(opts: { status?: "active" | "archived" } = {}) {
+export function useMyPersonalEntries(
+	opts: { status?: "active" | "archived" } = {},
+	queryOpts: { enabled?: boolean } = {},
+) {
 	return useQuery({
 		queryKey: ["knowledge", "personalEntries", opts],
 		queryFn: () => api.listMyPersonalEntries(opts),
 		staleTime: 5_000,
+		enabled: queryOpts.enabled ?? true,
 	});
 }
 
@@ -307,28 +306,23 @@ export function useUpdatePersonalEntryMeta() {
 			targetCollectionId?: string | null;
 			keywords?: string[];
 		}) => api.updatePersonalEntryMeta(id, data),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] }),
-	});
-}
-
-export function useSubmitKnowledgeDraft() {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: ({ draftId, ...data }: { draftId: string; entryId: string; changeNote?: string }) =>
-			api.submitKnowledgeDraft(draftId, { changeNote: data.changeNote }),
-		onSuccess: (_r, { entryId }) => {
-			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
-			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+		onSuccess: (_r, { id }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry", id] });
 		},
 	});
 }
 
 // ─── Submissions ───
-export function useKnowledgeSubmissions(opts: { entryId?: string; status?: string } = {}) {
+export function useKnowledgeSubmissions(
+	opts: { entryId?: string; status?: string } = {},
+	{ enabled = true }: { enabled?: boolean } = {},
+) {
 	return useQuery({
 		queryKey: ["knowledge", "submissions", opts],
 		queryFn: () => api.listKnowledgeSubmissions(opts),
 		staleTime: 10_000,
+		enabled,
 	});
 }
 
@@ -356,6 +350,8 @@ export function useReviewKnowledgeSubmission() {
 			qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entry"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+			qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 		},
 	});
 }
@@ -372,6 +368,8 @@ export function useResolveKnowledgeConflict() {
 			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entry"] });
+			qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 		},
 	});
 }
@@ -612,9 +610,8 @@ export function useDeletePersonalEntry() {
 /**
  * Save the body of a personal entry (standalone or linked) by draft id.
  *
- * `useUpdateKnowledgeDraft` requires an `entryId` for cache invalidation, which a
- * standalone personal entry doesn't have. This variant keys invalidation on the personal
- * entry id instead so the standalone detail page can save its content.
+ * Invalidation is keyed on the personal entry id, so the personal-version page and the
+ * narrator dock (linked and standalone alike) refresh their copy after a save.
  */
 export function useUpdatePersonalEntryContent() {
 	const qc = useQueryClient();
@@ -758,6 +755,33 @@ export function useReviewInboxCount() {
 	});
 }
 
+/** React Query key for the author's recent verdicts (notification bell). */
+export const SUBMISSION_OUTCOMES_KEY = ["knowledge", "submissionOutcomes"] as const;
+
+/**
+ * Verdicts on the caller's own submissions from the last 30 days.
+ *
+ * The bell uses this so an author hears about approve / reject / request-changes
+ * without those events being copied into the notification-center table.
+ */
+export function useMyKnowledgeSubmissionOutcomes(limit?: number) {
+	return useQuery({
+		queryKey: [...SUBMISSION_OUTCOMES_KEY, limit ?? null],
+		queryFn: () => api.listMyKnowledgeSubmissionOutcomes({ limit }),
+		staleTime: STALE,
+	});
+}
+
+/**
+ * True when the bell should show a knowledge-review section: open reviews for this
+ * user, or a recent verdict on something they submitted.
+ */
+export function useHasKnowledgeReviewNotices(): boolean {
+	const inbox = useReviewInboxCount();
+	const outcomes = useMyKnowledgeSubmissionOutcomes();
+	return (inbox.data?.count ?? 0) > 0 || (outcomes.data?.length ?? 0) > 0;
+}
+
 /**
  * Subscribe to knowledge-base publish/review pushes and invalidate the affected
  * queries. The WS frame carries ids only (no entry content), so every refresh goes
@@ -777,12 +801,11 @@ export function useKnowledgeNotifications(): void {
 				if (data.type === "knowledge:library_changed") {
 					const changedEntryId = typeof data.entryId === "string" ? data.entryId : undefined;
 					if (data.reason === "entry_drifted") {
-						// The personal-library list carries the drift badges; the entry's own draft
-						// views hold the banner and the three-way diff.
+						// "My" carries the drift badges; the personal-version page reads drift and the
+						// diff baseline (current main) from its detail payload.
 						qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+						qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry"] });
 						if (changedEntryId) {
-							qc.invalidateQueries({ queryKey: ["knowledge", "draft", changedEntryId] });
-							qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", changedEntryId] });
 							qc.invalidateQueries({ queryKey: ["knowledge", "entry", changedEntryId] });
 						}
 						return;
@@ -794,6 +817,9 @@ export function useKnowledgeNotifications(): void {
 					qc.invalidateQueries({ queryKey: ["knowledge", "myReviewScope"] });
 					qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
 					qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+					// Personal views show ACL-checked titles / target names.
+					qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+					qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry"] });
 					if (changedEntryId) {
 						qc.invalidateQueries({ queryKey: ["knowledge", "entry", changedEntryId] });
 					}
@@ -804,10 +830,15 @@ export function useKnowledgeNotifications(): void {
 				}
 				if (data.type !== "knowledge:review_inbox_changed") return;
 				qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+				qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 				qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+				// The personal-version page: its open requests, request history and (after a
+				// publish) archived state.
+				qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry"] });
+				qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions"] });
 				const entryId = typeof data.entryId === "string" ? data.entryId : undefined;
 				if (data.reason === "entry_published") {
 					qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
@@ -815,10 +846,6 @@ export function useKnowledgeNotifications(): void {
 						qc.invalidateQueries({ queryKey: ["knowledge", "entry", entryId] });
 						qc.invalidateQueries({ queryKey: ["knowledge", "revisions", entryId] });
 					}
-				}
-				if (entryId) {
-					qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
-					qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", entryId] });
 				}
 			},
 		);
@@ -840,6 +867,7 @@ function invalidateSubmissionViews(qc: ReturnType<typeof useQueryClient>, id?: s
 	qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 	qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
 	qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+	qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
 	// The history list is keyed by personal-entry (draft) id; invalidate the whole prefix
 	// when the caller only knows the submission id.
 	if (id) qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });

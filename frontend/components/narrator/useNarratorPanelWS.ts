@@ -1248,7 +1248,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				const signature = JSON.stringify([
 					resolved.requestId,
 					resolved.composition?.generation,
-					resolved.inputCharacters,
 					resolved.occupiedTokens,
 					resolved.percentage,
 					resolved.contextWindow,

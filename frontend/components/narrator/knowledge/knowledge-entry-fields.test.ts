@@ -9,7 +9,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import type { KnowledgeEntry, KnowledgePersonalEntry } from "@frontend/lib/api/knowledge-types";
+import type {
+	KnowledgeEntry,
+	KnowledgeEntryViewerCaps,
+	KnowledgePersonalEntry,
+} from "@frontend/lib/api/knowledge-types";
 import {
 	canEditKnowledgeEntry,
 	knowledgeEntryContent,
@@ -104,11 +108,28 @@ describe("knowledgeEntryTitle", () => {
 });
 
 describe("canEditKnowledgeEntry", () => {
-	test("global: the owner and an admin may edit; nobody else", () => {
-		const entry = globalEntry();
-		expect(canEditKnowledgeEntry("global", entry, { id: "u-owner", role: "user" })).toBe(true);
-		expect(canEditKnowledgeEntry("global", entry, { id: "u-other", role: "admin" })).toBe(true);
-		expect(canEditKnowledgeEntry("global", entry, { id: "u-other", role: "user" })).toBe(false);
+	test("global: follows the server's viewerCaps.canWriteMain, not role/owner inference", () => {
+		const caps = (canWriteMain: boolean): KnowledgeEntryViewerCaps => ({
+			canWriteMain,
+			canEditMeta: false,
+			canManageAcl: false,
+			canTransferOwner: false,
+			canDelete: false,
+			canReview: false,
+			canManageLinks: true,
+			myPersonalEntryId: null,
+		});
+		// A write-grant holder who is neither admin nor owner: the server allows it.
+		const writable = { ...globalEntry(), viewerCaps: caps(true) };
+		expect(canEditKnowledgeEntry("global", writable, { id: "u-other", role: "user" })).toBe(true);
+		// The owner when the server says no (e.g. read through a narrower path) stays read-only.
+		const readOnly = { ...globalEntry(), viewerCaps: caps(false) };
+		expect(canEditKnowledgeEntry("global", readOnly, { id: "u-owner", role: "user" })).toBe(false);
+		expect(canEditKnowledgeEntry("global", readOnly, { id: "u-x", role: "admin" })).toBe(false);
+		// No caps (a list row) → not editable.
+		expect(canEditKnowledgeEntry("global", globalEntry(), { id: "u-owner", role: "user" })).toBe(
+			false,
+		);
 	});
 
 	test("personal: always editable by whoever can read it", () => {
@@ -119,6 +140,6 @@ describe("canEditKnowledgeEntry", () => {
 
 	test("no entry or no user → not editable", () => {
 		expect(canEditKnowledgeEntry("global", null, { id: "u1", role: "admin" })).toBe(false);
-		expect(canEditKnowledgeEntry("global", globalEntry(), null)).toBe(false);
+		expect(canEditKnowledgeEntry("personal", personalEntry(), null)).toBe(false);
 	});
 });

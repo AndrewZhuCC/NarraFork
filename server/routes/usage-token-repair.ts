@@ -1,6 +1,7 @@
-import { NotFoundError } from "@server/lib/errors";
+import { AppError, NotFoundError } from "@server/lib/errors";
 import {
 	tokenRepairApplySchema,
+	tokenRepairDryRunSchema,
 	tokenRepairIdSchema,
 	tokenRepairPageSchema,
 	tokenRepairStartSchema,
@@ -28,12 +29,7 @@ export function createUsageTokenRepairRoutes(
 		const input = tokenRepairStartSchema.parse(await c.req.json());
 		return c.json(
 			{
-				job: await service.start(
-					c.get("user").sub,
-					input.includeReviewed,
-					input.protocolOverrides,
-					input.sourceJobId,
-				),
+				job: await service.start(c.get("user").sub, input.includeReviewed),
 			},
 			202,
 		);
@@ -46,9 +42,33 @@ export function createUsageTokenRepairRoutes(
 	routes.get("/jobs/:jobId/candidates", async (c) => {
 		const id = jobId(c.req.param("jobId"));
 		const { cursor } = tokenRepairPageSchema.parse(c.req.query());
-		if (!(await service.getJob(id)))
-			throw new NotFoundError("Token repair job", c.req.param("jobId"));
+		const job = await service.getJob(id);
+		if (!job) throw new NotFoundError("Token repair job", c.req.param("jobId"));
+		if (job.workflowVersion === 2)
+			throw new AppError(
+				"Bulk repair exposes aggregate results only",
+				410,
+				"TOKEN_REPAIR_AGGREGATE_ONLY",
+			);
 		return c.json(await service.listCandidates(id, cursor));
+	});
+	routes.get("/jobs/:jobId/models", async (c) => {
+		const id = jobId(c.req.param("jobId"));
+		const { cursor } = tokenRepairPageSchema.parse(c.req.query());
+		const job = await service.getJob(id);
+		if (!job) throw new NotFoundError("Token repair job", c.req.param("jobId"));
+		if (job.workflowVersion !== 2 || job.status === "analyzing" || job.status === "applying")
+			throw new AppError(
+				"Model associations require a completed scan",
+				409,
+				"TOKEN_REPAIR_NOT_READY",
+			);
+		return c.json(await service.models(id, cursor));
+	});
+	routes.post("/jobs/:jobId/dry-run", async (c) => {
+		const id = jobId(c.req.param("jobId"));
+		const input = tokenRepairDryRunSchema.parse(await c.req.json());
+		return c.json({ job: await service.dryRun(id, input.protocolOverrides) }, 202);
 	});
 	routes.post("/jobs/:jobId/cancel", async (c) => {
 		const job = await service.cancel(jobId(c.req.param("jobId")));
@@ -58,7 +78,10 @@ export function createUsageTokenRepairRoutes(
 	routes.post("/jobs/:jobId/apply", async (c) => {
 		const id = jobId(c.req.param("jobId"));
 		const input = tokenRepairApplySchema.parse(await c.req.json());
-		return c.json(await service.apply(id, input.candidateIds, c.get("user").sub));
+		return c.json(
+			{ job: await service.applyPreview(id, input.previewVersion, c.get("user").sub) },
+			202,
+		);
 	});
 	return routes;
 }

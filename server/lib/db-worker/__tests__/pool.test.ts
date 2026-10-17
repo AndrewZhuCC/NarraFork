@@ -302,7 +302,7 @@ describe("worker pool", () => {
 			"narrator_messages",
 		]);
 		const messages = result.tables.find((table) => table.name === "narrator_messages");
-		expect(messages?.rowCount).toBe(200);
+		expect(messages?.rowCount).toBeNull();
 		expect(messages?.category).toBe("sessions");
 		// `approxContentBytes` is the APPROXIMATE mode's output and is deliberately 0 when `dbstat`
 		// is available (that path skips the extra `SUM(length(...))` full-table scan, since dbstat

@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -13,6 +13,7 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const broadcasts: Array<{ narratorId: string; message: Record<string, unknown> }> = [];
 tasks.setBroadcastFnForTests((narratorId, message) => {
 	broadcasts.push({ narratorId, message: message as unknown as Record<string, unknown> });
@@ -22,17 +23,23 @@ const publisher = getRuntimePublicationService();
 publisher.stop();
 const now = "2026-10-08T00:00:00.000Z";
 let wakes = 0;
-beforeEach(() => {
-	cleanDb(sqlite);
-	broadcasts.length = 0;
+beforeEach(async () => {
 	tasks.resetListVersionsForTests();
+	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
+	broadcasts.length = 0;
 	wakes = 0;
 	publisher.setWake(() => {
 		wakes++;
 	});
 	db.insert(narrators).values({ id: "parent", createdAt: now, updatedAt: now }).run();
+	backgroundOccupancyStore.refreshNarrator("parent");
+});
+afterEach(async () => {
+	await backgroundOccupancyStore.flush();
 });
 afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
 	publisher.stop();
 	runtimePublication.stop();
 	tasks.setBroadcastFnForTests(null);
@@ -108,6 +115,7 @@ for (const backgroundKind of ["service", "task"] as const) {
 				updatedAt: now,
 			})
 			.run();
+		backgroundOccupancyStore.refreshTask(run.taskId);
 		const cancelled = await publisher.cancelTask({
 			taskId: run.taskId,
 			now,
@@ -168,6 +176,7 @@ test("service stop revokes an already queued cancellation notice, without discar
 			updatedAt: now,
 		})
 		.run();
+	backgroundOccupancyStore.refreshTask(run.taskId);
 	await publisher.commit({
 		...run,
 		eventKind: "cancelled",
@@ -209,6 +218,7 @@ test("failed service suppression rolls back cancellation and keeps its reserved 
 			updatedAt: now,
 		})
 		.run();
+	backgroundOccupancyStore.refreshTask(run.taskId);
 	sqlite.run(
 		"CREATE TRIGGER reject_service_receipt BEFORE INSERT ON runtime_awaited_terminal_consumptions BEGIN SELECT RAISE(ABORT, 'receipt failure'); END",
 	);
@@ -248,6 +258,7 @@ for (const eventKind of ["completed", "failed", "timed_out"] as const) {
 				updatedAt: now,
 			})
 			.run();
+		backgroundOccupancyStore.refreshTask(run.taskId);
 		await publisher.commitBashTerminal({ run, eventKind, text: "exit", summary: "service exited" });
 		await publisher.flushRecipient("parent");
 		expect(db.select().from(mailbox).all()).toHaveLength(1);

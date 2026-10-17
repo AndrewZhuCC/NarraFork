@@ -13,22 +13,41 @@
  * `linkSnapshot` deduplicates an unchanged tree — so the DAG looks identical whether
  * the expensive work ran or was skipped, which is exactly the bug being fixed.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
+import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { gitService } from "./git-service";
+import * as statusCache from "./git-status-cache";
 import { clearStatusCache } from "./git-status-cache";
+import * as statusStream from "./git-status-stream";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 import { MAX_SKIPPED_POLLS, worktreeWatcher } from "./worktree-watcher";
+import { worktreeWatcherMetadata } from "./worktree-watcher-metadata";
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];
 const capturedTrees = new Map<string, string>();
+const statusEvents: NarraForkEvent[] = [];
+const fileEvents: NarraForkEvent[] = [];
+const onStatus = (event: NarraForkEvent) => {
+	if (event.type === "narrator:ws_broadcast" && event.message.type === "git_status")
+		statusEvents.push(event);
+};
+const onFiles = (event: NarraForkEvent) => fileEvents.push(event);
+
+beforeEach(() => {
+	statusEvents.length = 0;
+	fileEvents.length = 0;
+	eventBus.on("narrator:ws_broadcast", onStatus);
+	eventBus.on("chapter:files_changed", onFiles);
+});
 
 async function createRepo(prefix: string): Promise<string> {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -81,6 +100,8 @@ async function countCaptures(run: () => Promise<void>): Promise<number> {
 }
 
 afterEach(async () => {
+	eventBus.off("narrator:ws_broadcast", onStatus);
+	eventBus.off("chapter:files_changed", onFiles);
 	clearStatusCache();
 	capturedTrees.clear();
 	for (const dir of tempDirs.splice(0)) {
@@ -94,6 +115,79 @@ afterEach(async () => {
 });
 
 describe("watcher polling ticks", () => {
+	for (const triggers of [
+		[true, true],
+		[true, false, true],
+		[false, true],
+	]) {
+		test(`coalesced triggers retain poll-only provenance: ${JSON.stringify(triggers)}`, async () => {
+			const repo = await createRepo("nf-watch-coalesced-");
+			registerEntry(repo);
+			const entry = worktreeWatcher._entries.get(repo);
+			if (!entry) throw new Error("entry was not registered");
+			let release!: () => void;
+			const pending = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const process = spyOn(worktreeWatcher, "_processChange")
+				.mockImplementationOnce(() => pending)
+				.mockResolvedValue(undefined);
+			try {
+				worktreeWatcher._enqueueProcessChange(repo, entry, true);
+				for (const polled of triggers) {
+					worktreeWatcher._enqueueProcessChange(repo, entry, polled);
+				}
+				expect(process).toHaveBeenCalledTimes(1);
+				release();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(process).toHaveBeenCalledTimes(2);
+				expect(process.mock.calls[1][2]).toBe(triggers.every(Boolean));
+				expect(entry.pendingProcess).toBe(false);
+			} finally {
+				release();
+				process.mockRestore();
+			}
+		});
+	}
+
+	test("idle polls preserve shared caches; writes and sweeps invalidate once without rereading", async () => {
+		const repo = await createRepo("nf-watch-cache-");
+		registerEntry(repo);
+		const entry = worktreeWatcher._entries.get(repo);
+		if (!entry) throw new Error("entry was not registered");
+		await worktreeWatcher._processChange(repo, entry, true);
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const query = spyOn(statusStream, "readGitStatusStream");
+		try {
+			for (let tick = 0; tick < 3; tick++) {
+				await worktreeWatcher._processChange(repo, entry, true);
+			}
+			expect(invalidate).not.toHaveBeenCalled();
+			expect(query).toHaveBeenCalledTimes(3);
+			// The latest idle probe remains reusable by legacy narrator readers.
+			await statusCache.getStatusSummaryCached(repo);
+			expect(query).toHaveBeenCalledTimes(3);
+
+			writeFileSync(join(repo, "seed.txt"), "external write\n");
+			await worktreeWatcher._processChange(repo, entry, true);
+			expect(invalidate).toHaveBeenCalledTimes(1);
+			expect(query).toHaveBeenCalledTimes(4);
+
+			entry.skippedPolls = MAX_SKIPPED_POLLS;
+			await worktreeWatcher._processChange(repo, entry, true);
+			expect(invalidate).toHaveBeenCalledTimes(2);
+			expect(query).toHaveBeenCalledTimes(5);
+
+			// Native events are write evidence even if the structural status is unchanged.
+			await worktreeWatcher._processChange(repo, entry, false);
+			expect(invalidate).toHaveBeenCalledTimes(3);
+			expect(query).toHaveBeenCalledTimes(6);
+		} finally {
+			invalidate.mockRestore();
+			query.mockRestore();
+		}
+	});
+
 	test("an idle polled tick takes no snapshot", async () => {
 		const repo = await createRepo("nf-watch-idle-");
 		registerEntry(repo);
@@ -115,6 +209,8 @@ describe("watcher polling ticks", () => {
 			await worktreeWatcher._processChange(repo, registered, true);
 		});
 		expect(idle).toBe(0);
+		expect(statusEvents).toHaveLength(1);
+		expect(fileEvents).toHaveLength(1);
 	});
 
 	test("a polled tick after a real edit still captures", async () => {
@@ -140,6 +236,56 @@ describe("watcher polling ticks", () => {
 		);
 	});
 
+	test("native ignored-file events publish paths before status and retain external attribution", async () => {
+		const repo = await createRepo("nf-watch-native-ignored-");
+		writeFileSync(join(repo, ".gitignore"), "build/\n");
+		await safeSpawn({ cmd: ["git", "add", ".gitignore"], cwd: repo, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "ignore"], cwd: repo, timeout: 15_000 });
+		registerEntry(repo);
+		const entry = worktreeWatcher._entries.get(repo);
+		if (!entry) throw new Error("entry was not registered");
+		await worktreeWatcher._processChange(repo, entry, true);
+		const signature = entry.lastStatusSignature;
+		mkdirSync(join(repo, "build"));
+		const path = join(repo, "build", "asset.txt");
+		writeFileSync(path, "ignored artifact\n");
+		entry.pendingPaths = new Map([[path, "added"]]);
+		const changedPaths = entry.pendingPaths;
+		const paths: NarraForkEvent[] = [];
+		const listener = (event: NarraForkEvent) => {
+			if (
+				event.type === "narrator:ws_broadcast" &&
+				event.message.type === "workspace_paths_changed"
+			)
+				paths.push(event);
+		};
+		eventBus.on("narrator:ws_broadcast", listener);
+		const original = gitService.getStatusSummary;
+		const query = spyOn(gitService, "getStatusSummary").mockImplementation((...args) => {
+			expect(paths).toHaveLength(1);
+			return original.apply(gitService, args);
+		});
+		const attribute = spyOn(worktreeWatcher, "_recordExternalChanges");
+		try {
+			await worktreeWatcher._processChange(repo, entry, false);
+			expect(entry.lastStatusSignature).toBe(signature);
+			expect(attribute).toHaveBeenCalledWith(repo, entry, changedPaths, false);
+			expect(paths[0]).toMatchObject({
+				type: "narrator:ws_broadcast",
+				narratorId: "narrator-test",
+				message: {
+					type: "workspace_paths_changed",
+					changes: [{ path: "build/asset.txt", kind: "added" }],
+					truncated: false,
+				},
+			});
+		} finally {
+			eventBus.off("narrator:ws_broadcast", listener);
+			query.mockRestore();
+			attribute.mockRestore();
+		}
+	});
+
 	test("a watcher event captures even when git status is unchanged", async () => {
 		const repo = await createRepo("nf-watch-event-");
 		registerEntry(repo);
@@ -150,10 +296,14 @@ describe("watcher polling ticks", () => {
 		// `polled = false` means the native watcher reported an actual filesystem event,
 		// which is evidence of a write. The skip is only ever applied to a speculative
 		// timer tick, so this path stays unconditional.
+		const signature = entry.lastStatusSignature;
 		const captures = await countCaptures(async () => {
 			await worktreeWatcher._processChange(repo, entry, false);
 		});
 		expect(captures).toBe(1);
+		expect(entry.lastStatusSignature).toBe(signature);
+		expect(statusEvents).toHaveLength(2);
+		expect(fileEvents).toHaveLength(2);
 	});
 
 	test("a change to a tracked-but-ignored file is not mistaken for an idle tick", async () => {
@@ -187,49 +337,65 @@ describe("watcher polling ticks", () => {
 		);
 	});
 
-	test("an equal-sized in-place edit is eventually captured by the tick sweep", async () => {
-		// The failure mode the signature reasoning did not actually cover. The signature
-		// folds in `git diff --numstat` counts, the status code and the path — not content —
-		// so replacing one line with another of the same line count on an *already dirty*
-		// file leaves all three identical (verified: `1 1`, ` M f.txt`, same path) while the
-		// bytes on disk differ. Every such tick was skipped, so an external editor doing
-		// exactly that produced no boundary at all and the edit was unrevertable.
-		//
-		// The existing "after a real edit" case does not reach this: it goes clean → dirty,
-		// which moves the counts from nothing to `1 1`.
-		//
-		// What is asserted is convergence, not per-tick capture. Intermediate states between
-		// forced captures genuinely have no boundary; the guarantee is that a run of skips
-		// terminates in one, so the latest bytes become revertable.
-		const repo = await createRepo("nf-watch-equal-size-");
-		registerEntry(repo);
-		const entry = worktreeWatcher._entries.get(repo);
-		if (!entry) throw new Error("entry was not registered");
-		// Get to the dirty state first, so the next edit is dirty → dirty rather than
-		// clean → dirty.
-		writeFileSync(join(repo, "seed.txt"), "aaaa\n");
-		await worktreeWatcher._processChange(repo, entry, true);
-
-		writeFileSync(join(repo, "seed.txt"), "bbbb\n");
-		// The signature is unchanged, so the immediate tick is a skip — that part is the
-		// documented trade-off rather than the bug.
-		const immediate = await countCaptures(async () => {
+	for (const content of ["bbbb\n", "bbbb\nanother line\n"]) {
+		test(`dirty-to-dirty edit immediately captures and notifies (${content.length} bytes)`, async () => {
+			const repo = await createRepo("nf-watch-dirty-edit-");
+			registerEntry(repo);
+			const entry = worktreeWatcher._entries.get(repo);
+			if (!entry) throw new Error("entry was not registered");
+			writeFileSync(join(repo, "seed.txt"), "aaaa\n");
 			await worktreeWatcher._processChange(repo, entry, true);
-		});
-		expect(immediate).toBe(0);
+			const signature = entry.lastStatusSignature;
 
-		// Left alone, this would never capture again. The sweep is what bounds it.
-		const eventual = await countCaptures(async () => {
-			for (let tick = 0; tick < MAX_SKIPPED_POLLS + 2; tick++) {
+			writeFileSync(join(repo, "seed.txt"), content);
+			const immediate = await countCaptures(async () => {
 				await worktreeWatcher._processChange(repo, entry, true);
-			}
+			});
+			expect(entry.lastStatusSignature).toBe(signature);
+			expect(immediate).toBe(1);
+			expect(statusEvents).toHaveLength(2);
+			expect(fileEvents).toHaveLength(2);
+			const tree = capturedTrees.get(repo);
+			if (!tree) throw new Error("No actual watcher capture");
+			expect(await worktreeTreeSnapshot.readFileAtTree(repo, tree, "seed.txt")).toBe(content);
 		});
-		expect(eventual).toBeGreaterThan(0);
-		// And the captured tree holds the new bytes, which is the property the boundary
-		// exists for — a capture of stale content would satisfy the count and nothing else.
-		const tree = capturedTrees.get(repo);
-		if (!tree) throw new Error("Sweep did not publish an actual captured tree");
-		expect(await worktreeTreeSnapshot.readFileAtTree(repo, tree, "seed.txt")).toBe("bbbb\n");
+	}
+
+	test("subdirectory polling captures repeated dirty edits using real CWD-relative status", async () => {
+		const repo = await createRepo("nf-watch-subdir-");
+		const cwd = join(repo, "nested");
+		mkdirSync(cwd);
+		writeFileSync(join(cwd, "seed.txt"), "seed\n");
+		await safeSpawn({ cmd: ["git", "add", "nested/seed.txt"], cwd: repo, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "nested"], cwd: repo, timeout: 15_000 });
+		registerEntry(cwd);
+		snapshotPaths.push(normalizePathForComparison(cwd));
+		const entry = worktreeWatcher._entries.get(cwd);
+		if (!entry) throw new Error("entry was not registered");
+		try {
+			writeFileSync(join(cwd, "seed.txt"), "aaaa\n");
+			await worktreeWatcher._processChange(cwd, entry, true);
+			const signature = entry.lastStatusSignature;
+			expect((await gitService.getStatusSummary(cwd)).files).toEqual([
+				{ path: "seed.txt", status: " M" },
+			]);
+			for (const content of ["bbbb\n", "bbbb\nanother line\n"]) {
+				writeFileSync(join(cwd, "seed.txt"), content);
+				const captures = await countCaptures(async () => {
+					await worktreeWatcher._processChange(cwd, entry, true);
+				});
+				expect(captures).toBe(1);
+				expect(entry.lastStatusSignature).toBe(signature);
+				const tree = capturedTrees.get(cwd);
+				if (!tree) throw new Error("No actual subdirectory watcher capture");
+				expect(await worktreeTreeSnapshot.readFileAtTree(cwd, tree, "seed.txt")).toBe(content);
+			}
+			expect(statusEvents).toHaveLength(3);
+			expect(fileEvents).toHaveLength(3);
+		} finally {
+			worktreeWatcher.unwatchAll(cwd);
+			await worktreeTreeSnapshot.destroy(cwd, undefined, { force: true });
+		}
 	});
 
 	test("the sweep does not fire again until another run of skips accumulates", async () => {
@@ -242,10 +408,17 @@ describe("watcher polling ticks", () => {
 		if (!entry) throw new Error("entry was not registered");
 		await worktreeWatcher._processChange(repo, entry, true);
 
-		// Drive one full run so the sweep fires and the counter goes back to zero.
-		for (let tick = 0; tick <= MAX_SKIPPED_POLLS; tick++) {
-			await worktreeWatcher._processChange(repo, entry, true);
-		}
+		// Identical metadata is not proof of identical content: keep a bounded sweep,
+		// and notify clients when it fires even though the structural status is unchanged.
+		const swept = await countCaptures(async () => {
+			for (let tick = 0; tick <= MAX_SKIPPED_POLLS; tick++) {
+				await worktreeWatcher._processChange(repo, entry, true);
+			}
+		});
+		expect(swept).toBe(1);
+		expect(entry.skippedPolls).toBe(0);
+		expect(statusEvents).toHaveLength(2);
+		expect(fileEvents).toHaveLength(2);
 
 		const afterSweep = await countCaptures(async () => {
 			for (let tick = 0; tick < MAX_SKIPPED_POLLS - 1; tick++) {
@@ -253,6 +426,84 @@ describe("watcher polling ticks", () => {
 			}
 		});
 		expect(afterSweep).toBe(0);
+	});
+
+	test("index-only metadata changes capture and notify without a structural change", async () => {
+		const repo = await createRepo("nf-watch-index-");
+		registerEntry(repo);
+		const entry = worktreeWatcher._entries.get(repo);
+		if (!entry) throw new Error("entry was not registered");
+		await worktreeWatcher._processChange(repo, entry, true);
+		const signature = entry.lastStatusSignature;
+		const changed = await safeSpawn({
+			cmd: ["git", "update-index", "--assume-unchanged", "seed.txt"],
+			cwd: repo,
+			timeout: 15_000,
+		});
+		expect(changed.exitCode).toBe(0);
+		const captures = await countCaptures(async () => {
+			await worktreeWatcher._processChange(repo, entry, true);
+		});
+		expect(entry.lastStatusSignature).toBe(signature);
+		expect(captures).toBe(1);
+		expect(statusEvents).toHaveLength(2);
+		expect(fileEvents).toHaveLength(2);
+	});
+
+	for (const partial of [{ truncated: true }, { totalFilesExact: false }]) {
+		test(`partial status evidence refreshes conservatively: ${JSON.stringify(partial)}`, async () => {
+			const repo = await createRepo("nf-watch-partial-");
+			registerEntry(repo);
+			const entry = worktreeWatcher._entries.get(repo);
+			if (!entry) throw new Error("entry was not registered");
+			const summary = { ...(await gitService.getStatusSummary(repo)), ...partial };
+			const summarySpy = spyOn(gitService, "getStatusSummary").mockResolvedValue(summary);
+			try {
+				await worktreeWatcher._processChange(repo, entry, true);
+				const captures = await countCaptures(async () => {
+					await worktreeWatcher._processChange(repo, entry, true);
+				});
+				expect(captures).toBe(1);
+				expect(statusEvents).toHaveLength(2);
+				expect(fileEvents).toHaveLength(2);
+			} finally {
+				summarySpy.mockRestore();
+			}
+		});
+	}
+
+	test("the sweep captures bytes hidden by unchanged metadata and notifies", async () => {
+		const repo = await createRepo("nf-watch-sweep-hidden-");
+		registerEntry(repo);
+		const entry = worktreeWatcher._entries.get(repo);
+		if (!entry) throw new Error("entry was not registered");
+		writeFileSync(join(repo, "seed.txt"), "aaaa\n");
+		const metadataSpy = spyOn(worktreeWatcherMetadata, "probe").mockResolvedValue({
+			fingerprint: "same-metadata",
+			uncertain: false,
+		});
+		try {
+			await worktreeWatcher._processChange(repo, entry, true);
+			writeFileSync(join(repo, "seed.txt"), "bbbb\n");
+			const idle = await countCaptures(async () => {
+				for (let tick = 0; tick < MAX_SKIPPED_POLLS; tick++) {
+					await worktreeWatcher._processChange(repo, entry, true);
+				}
+			});
+			expect(idle).toBe(0);
+			expect(statusEvents).toHaveLength(1);
+			const sweep = await countCaptures(async () => {
+				await worktreeWatcher._processChange(repo, entry, true);
+			});
+			expect(sweep).toBe(1);
+			expect(statusEvents).toHaveLength(2);
+			expect(fileEvents).toHaveLength(2);
+			const tree = capturedTrees.get(repo);
+			if (!tree) throw new Error("Sweep did not capture a tree");
+			expect(await worktreeTreeSnapshot.readFileAtTree(repo, tree, "seed.txt")).toBe("bbbb\n");
+		} finally {
+			metadataSpy.mockRestore();
+		}
 	});
 
 	test("a purely ignored file changing does leave a polled tick idle", async () => {

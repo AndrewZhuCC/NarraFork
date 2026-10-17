@@ -1,7 +1,12 @@
 {
 	"panel.title": "Git",
+	"lineStats.loading": "行数统计中…",
+	"lineStats.failed": "行数统计失败",
+	"lineStats.partial": "行数统计不完整",
+	"lineStats.unsupported": "统计行数需升级执行器",
 	"workspace.statusTruncated": "状态输出已截断，文件计数可能不完整；全部操作仍会作用于整个工作树。",
 	"workspace.sectionTruncated": "{{section}}计数是下界",
+	"workspace.atLeastFiles": "至少 {{count}}",
 	"workspace.serverFilesTruncated": "部分文件未显示",
 	"workspace.ready": "Git 工作区",
 	"workspace.loading": "正在检测工作区…",

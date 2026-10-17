@@ -52,6 +52,7 @@ import { ImageViewer } from "../../common/ImageViewer";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { TruncatedText } from "../../common/TruncatedText";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
+import { savedSelectionReference } from "../composer/file-reference-input";
 import { ContentViewer } from "../content/ContentViewer";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {
@@ -229,6 +230,12 @@ export function FileViewerContent({
 	const [mode, setMode] = useState<FileViewerMode>(defaultMode);
 	const [reloadToken, setReloadToken] = useState(0);
 	const [load, setLoad] = useState<LoadState>(INITIAL_LOAD);
+	const readKey = JSON.stringify([narratorId, deviceId, filePath, readerMode, reloadToken]);
+	const readKeyRef = useRef(readKey);
+	readKeyRef.current = readKey;
+	const liveLoadRef = useRef({ key: readKey, value: INITIAL_LOAD });
+	const addReferenceRef = useRef(parentScope.addReference);
+	addReferenceRef.current = parentScope.addReference;
 
 	const previewType = getFilePreviewType(filePath);
 	const isText = fileViewerUsesText(previewType, selection, referenceOrigin, deviceId);
@@ -247,13 +254,17 @@ export function FileViewerContent({
 	// Fetch text here; binary previews own their request and object URL lifecycle.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadToken is the intentional re-fetch trigger
 	useEffect(() => {
+		const updateLoad = (next: LoadState) => {
+			liveLoadRef.current = { key: readKey, value: next };
+			setLoad(next);
+		};
 		if (!isText || !previewSupported) {
-			setLoad(INITIAL_LOAD);
+			updateLoad(INITIAL_LOAD);
 			return;
 		}
 		let cancelled = false;
 		const controller = new AbortController();
-		setLoad({ text: null, truncated: false, error: null, loading: true });
+		updateLoad({ text: null, truncated: false, error: null, loading: true });
 		setSourceSelection(null);
 		const timeout = setTimeout(() => controller.abort(), FILE_REFERENCE_READ_TIMEOUT_MS);
 		const read = async (): Promise<LoadState> => {
@@ -300,11 +311,11 @@ export function FileViewerContent({
 		};
 		read()
 			.then((preview) => {
-				if (!cancelled) setLoad(preview);
+				if (!cancelled) updateLoad(preview);
 			})
 			.catch((err) => {
 				if (cancelled) return;
-				setLoad({
+				updateLoad({
 					text: null,
 					truncated: false,
 					error: err instanceof Error ? err.message : tRef.current("filePreview_loadError"),
@@ -314,6 +325,8 @@ export function FileViewerContent({
 			.finally(() => clearTimeout(timeout));
 		return () => {
 			cancelled = true;
+			// Retained Monaco callbacks must not quote a disposed/replaced read.
+			if (liveLoadRef.current.key === readKey) liveLoadRef.current.value = INITIAL_LOAD;
 			clearTimeout(timeout);
 			controller.abort();
 		};
@@ -327,9 +340,14 @@ export function FileViewerContent({
 		previewType,
 		referenceOrigin,
 		reloadToken,
+		readKey,
 	]);
 
-	const reload = useCallback(() => setReloadToken((token) => token + 1), []);
+	const reload = useCallback(() => {
+		// Invalidate before React commits a new token, just as a save invalidates an editor.
+		liveLoadRef.current.value = INITIAL_LOAD;
+		setReloadToken((token) => token + 1);
+	}, []);
 
 	const [downloading, setDownloading] = useState(false);
 
@@ -379,6 +397,36 @@ export function FileViewerContent({
 		sourceOnly || (mode === "node" && nodeUnavailable) ? "raw" : mode;
 	const sourcePath = load.target?.path ?? filePath;
 	const sourceDeviceId = load.target?.deviceId ?? deviceId;
+	const quoteSelection = (range: FileSelection) => {
+		const current = liveLoadRef.current;
+		const saved = current.value;
+		if (
+			readKeyRef.current !== readKey ||
+			current.key !== readKey ||
+			!addReferenceRef.current ||
+			saved.loading ||
+			saved.error ||
+			saved.truncated ||
+			saved.text === null ||
+			!saved.hash
+		)
+			return;
+		// The canonical target and hash must be taken from the SAME completed response.
+		const target = saved.target ?? { deviceId, path: filePath };
+		const reference = savedSelectionReference({
+			target: { ...target, selection: range },
+			label: fileBaseName(target.path),
+			expectedHash: saved.hash,
+			dirty: false,
+		});
+		if (reference) addReferenceRef.current(reference);
+	};
+	const quoteSelectionDisabledReason =
+		liveLoadRef.current.key !== readKey || load.loading
+			? t("common:loading")
+			: load.truncated || !load.hash || load.error || load.text === null
+				? t("quote.fileUnavailable")
+				: null;
 	const viewerScope = useMemo(
 		() => ({
 			narratorId,
@@ -526,6 +574,8 @@ export function FileViewerContent({
 									selection={selection}
 									navigationRequestId={highlightRequestId}
 									onSelectionChange={setSourceSelection}
+									onQuoteSelection={parentScope.addReference ? quoteSelection : undefined}
+									quoteSelectionDisabledReason={quoteSelectionDisabledReason}
 								/>
 							</Box>
 							{load.truncated && (

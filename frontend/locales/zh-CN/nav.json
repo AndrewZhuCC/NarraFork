@@ -82,6 +82,7 @@
 	"notificationCenterTooltip": "打开通知中心",
 	"notificationAttentionBadge": "{{count}} 项待处理",
 	"notificationConversationBadge": "{{count}} 个未读会话",
+	"notificationKnowledgeBadge": "{{count}} 条知识库审核动态",
 	"notificationCountUnknown": "通知数量暂不可用，打开后可重试",
 	"notificationTabAttention": "待处理",
 	"notificationTabActivity": "动态",

@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
-import { INTELLIGENT_UI_STREAM_FIELDS } from "@shared/intelligent-ui-tool-policy";
+import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -202,9 +202,9 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	// call is not rendered as an empty question.
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
 	// `source` is UI markup the chat renders while it streams.
-	IntelligentUI: {
-		short: [...INTELLIGENT_UI_STREAM_FIELDS.short],
-		large: [...INTELLIGENT_UI_STREAM_FIELDS.large],
+	GenUI: {
+		short: [...GEN_UI_STREAM_FIELDS.short],
+		large: [...GEN_UI_STREAM_FIELDS.large],
 	},
 };
 
@@ -1359,6 +1359,7 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -6797,6 +6798,17 @@ async function* agentLoopInMetadataSnapshot(
 					yield* abandonAttemptForReplay(REASONING_ONLY_MESSAGE);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// Keep the ordinary cleanup above, but do not retry or compact a model
+					// that has nothing to say while waiting for a background result / Send.
+					if (await config.shouldIdleOnReasoningOnly?.()) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield { type: "done", reason: "reasoning_only_idle" };
 						return;
 					}
 

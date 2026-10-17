@@ -2,15 +2,15 @@
  * Parallel object-storage scan orchestration.
  *
  * Splits the per-table measurement work across read workers and merges the shards on the main
- * thread. Falls back to a serial main-thread scan whenever workers are unusable, so the storage
- * settings page always produces a result.
+ * thread. When the pool cannot shard, one worker runs the serial scan. The server thread
+ * does not.
  *
  * Determinism contract: a table is never split across shards, and `aggregateObjectStorage` re-sorts
  * every shard's tables by name before accumulating. The output is therefore field-for-field
- * identical to the serial fallback regardless of how shards were distributed or which finished
- * first. `storage-scan-runner.test.ts` verifies this by running `runParallelObjectStorageScan`
- * itself twice — once with workers enabled and once with them disabled so the fallback triggers —
- * and comparing the two results field for field.
+ * identical to the single-worker serial scan regardless of how shards were distributed or which
+ * finished first. `storage-scan-runner.test.ts` verifies this by running
+ * `runParallelObjectStorageScan` twice — sharded, then with the pool disabled — and comparing
+ * the results field for field.
  */
 
 import type { Database } from "bun:sqlite";
@@ -20,10 +20,14 @@ import {
 	type DatabaseStorageCategoryKey,
 	type DatabaseStorageTableSummary,
 	type DatabaseTableKind,
-	scanDatabaseObjectStorage,
 } from "../../services/storage-scan-queries";
 import { logger } from "../logger";
-import { getConfiguredConcurrency, runReadTask, WorkersUnavailableError } from "./pool";
+import {
+	getConfiguredConcurrency,
+	runEphemeralReadTask,
+	runReadTask,
+	WorkersUnavailableError,
+} from "./pool";
 import type { StorageScanContextResult, StorageScanTablesResult } from "./protocol";
 
 export interface ParallelScanOptions {
@@ -37,7 +41,7 @@ export interface ParallelScanOptions {
 
 export interface ParallelScanOutcome extends DatabaseObjectStorageResult {
 	/** How the scan actually ran, for logging and diagnostics. */
-	executedOn: "workers" | "main-thread";
+	executedOn: "workers" | "worker-serial" | "unavailable";
 	workerCount: number;
 	durationMs: number;
 }
@@ -126,14 +130,14 @@ function toTableSummary(
  * Run the object-storage scan, preferring workers.
  *
  * On the worker path the main thread only builds the shard plan, forwards progress, and merges —
- * all cheap. The per-table `COUNT(*)` / `SUM(length(...))` scans (the multi-second part) happen
- * entirely off-thread.
+ * all cheap. With dbstat, per-table work is a lookup: row counts are not measured. Without
+ * dbstat, the `SUM(length(...))` scans (the multi-second part) happen entirely off-thread.
  */
 export async function runParallelObjectStorageScan(
 	options: ParallelScanOptions,
 ): Promise<ParallelScanOutcome> {
 	const startedAt = Date.now();
-	const { sqlite, dbPath, mainBytes, onProgress, signal } = options;
+	const { dbPath, mainBytes, onProgress, signal } = options;
 
 	try {
 		// One cheap task first: pragmas + schema listing, so the shard plan uses the same table
@@ -152,20 +156,27 @@ export async function runParallelObjectStorageScan(
 
 		const tableNames = context.tables.map((table) => table.name);
 		const shards = shardTableNames(tableNames, getConfiguredConcurrency());
-		const total = tableNames.length;
-		let done = 0;
+		// The context step is unit 1, so a long dbstat walk is visible before the first table finishes.
+		const total = tableNames.length + 1;
+		const completedTables = new Set<string>();
+		const report = (tableName: string) => {
+			onProgress?.({ done: 1 + completedTables.size, total, tableName });
+		};
+		report("__dbstat__");
 
 		const shardResults = await Promise.all(
-			shards.map((tableNames) =>
+			shards.map((shardNames) =>
 				runReadTask<StorageScanTablesResult>(
 					dbPath,
-					{ kind: "storageScanTables", tableNames },
+					{ kind: "storageScanTables", tableNames: shardNames, context },
 					{
 						signal,
 						onProgress: (progress) => {
-							// Shards report their own 1..n counts; translate to overall progress.
-							done += 1;
-							onProgress?.({ done, total, tableName: progress.tableName });
+							// One count per table. Parallel shards must not each add 1 for the same name,
+							// and a shard's own 1..n counter is not the overall count.
+							if (completedTables.has(progress.tableName)) return;
+							completedTables.add(progress.tableName);
+							report(progress.tableName);
 						},
 					},
 				),
@@ -202,28 +213,72 @@ export async function runParallelObjectStorageScan(
 			logger.info("Storage scan cancelled by database maintenance", { reason: err.reason });
 			throw err;
 		}
-		// Degrade, never fail: a slow scan beats a broken settings page. Log at warn so a persistent
-		// worker problem is visible rather than silently costing seconds of main-thread stalls.
+		// The sharded pool could not take the work. Measure on one worker instead of the server
+		// thread: the serial scan is the same queries, and running them here freezes HTTP.
 		const reason = err instanceof Error ? err.message : String(err);
-		if (err instanceof WorkersUnavailableError) {
-			logger.info("Storage scan running on the main thread", { reason: err.reason });
-		} else {
-			logger.warn("Storage scan worker path failed; falling back to the main thread", { reason });
+		logger.warn("Storage scan worker path failed; measuring on a single worker", { reason });
+		try {
+			const result = await runReadTask<DatabaseObjectStorageResult>(
+				dbPath,
+				{ kind: "storageScanSerial", mainBytes },
+				{
+					signal,
+					onProgress: (progress) => onProgress?.(progress),
+				},
+			);
+			return {
+				...result,
+				executedOn: "worker-serial",
+				workerCount: 1,
+				durationMs: Date.now() - startedAt,
+			};
+		} catch (serialErr) {
+			if (signal?.aborted) throw serialErr;
+			if (serialErr instanceof WorkersUnavailableError && serialErr.reason === "pool_shutdown") {
+				throw serialErr;
+			}
+			if (
+				!(serialErr instanceof WorkersUnavailableError) &&
+				!(err instanceof WorkersUnavailableError)
+			) {
+				// The sharded scan failed for a reason other than "no pool", and the serial task
+				// failed the same way. Don't hide a real query error behind an empty report.
+				throw serialErr;
+			}
+			try {
+				const result = await runEphemeralReadTask<DatabaseObjectStorageResult>(
+					dbPath,
+					{ kind: "storageScanSerial", mainBytes },
+					{
+						signal,
+						onProgress: (progress) => onProgress?.(progress),
+					},
+				);
+				return {
+					...result,
+					executedOn: "worker-serial",
+					workerCount: 1,
+					durationMs: Date.now() - startedAt,
+				};
+			} catch (ephemeralErr) {
+				if (signal?.aborted) throw ephemeralErr;
+				logger.warn("Storage scan could not run off-thread; per-table breakdown is unavailable", {
+					reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
+				});
+				return {
+					pageSize: 0,
+					pageCount: 0,
+					freelistBytes: 0,
+					objectBytes: 0,
+					scanMode: "approximate",
+					categories: [],
+					topTables: [],
+					readFailures: { tableCount: 1, tableNames: [] },
+					executedOn: "unavailable",
+					workerCount: 0,
+					durationMs: Date.now() - startedAt,
+				};
+			}
 		}
-
-		const result = scanDatabaseObjectStorage(sqlite, mainBytes, {
-			onTableMeasured: (tableName, index, total) => {
-				// The serial scan cannot be interrupted mid-query, but it can stop between tables. That
-				// bounds a cancelled fallback to one table instead of the full multi-second scan.
-				if (signal?.aborted) throw new Error("storage scan aborted");
-				onProgress?.({ done: index, total, tableName });
-			},
-		});
-		return {
-			...result,
-			executedOn: "main-thread",
-			workerCount: 0,
-			durationMs: Date.now() - startedAt,
-		};
 	}
 }

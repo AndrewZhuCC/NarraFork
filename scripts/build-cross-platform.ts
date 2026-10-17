@@ -13,6 +13,7 @@ import { Worker } from "node:worker_threads";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import type { LocalizedValue } from "../shared/i18n-locales";
+import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
@@ -441,8 +442,12 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		// `worker-entry.js` (note the rewritten extension), which is what pool.ts resolves at
 		// runtime when it detects the compiled runtime.
 		"./server/lib/db-worker/worker-entry.ts",
+		// Storage directory walks (worktrees, uploads, snapshots) stay off the HTTP thread.
+		"./server/lib/fs-scan-worker/fs-scan-worker-entry.ts",
 		// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 		"./server/services/editor-document-worker.ts",
+		// Untracked file line counting must also stay off-thread in compiled distributions.
+		"./server/services/git-untracked-line-worker.ts",
 		// Model history JSON decoding stays off-thread in compiled distributions too.
 		"./server/services/agent-runtime/model-history-worker.ts",
 		"./server/lib/browser/memory-snapshot-worker.ts",
@@ -511,6 +516,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 				commit: commitHash,
 				repository: BUILD_REPOSITORY,
 				helperDistribution: HELPER_DISTRIBUTION,
+				recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 				releaseCi,
 			},
 		});
@@ -535,6 +541,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 								commit: commitHash,
 								repository: BUILD_REPOSITORY,
 								helperDistribution: HELPER_DISTRIBUTION,
+								recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 							});
 						} catch (error) {
 							reject(error);
@@ -579,6 +586,7 @@ if (releaseCi) {
 			commit: commitHash,
 			repository: BUILD_REPOSITORY,
 			helperDistribution: HELPER_DISTRIBUTION,
+			recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
 		});
 		const reported = results[index].metadata;
 		if (

@@ -193,10 +193,10 @@ export class EditorFileChangeUncertainError extends Error {
  * Adding a name here is not enough on its own: the replay path (`applyToolCall` in
  * file-state-rebuild.ts) dispatches on this same name and SILENTLY treats an unknown one
  * as "no change", which would reconstruct a file as though the edit never happened. Any
- * new member needs a replay branch there too. IntelligentUI requires its byte-exact
+ * new member needs a replay branch there too. GenUI requires its byte-exact
  * journal; legacy text replay explicitly refuses it because input has no template bytes.
  */
-export type FileChangeToolName = "Write" | "Edit" | "StructSed" | "IntelligentUI";
+export type FileChangeToolName = "Write" | "Edit" | "StructSed" | "GenUI";
 
 type BoundFileChange<Result> = {
 	backend: ExecutionBackend;
@@ -237,7 +237,7 @@ export interface LocalFileChangeRequest {
 	backend: ExecutionBackend;
 	toolName: FileChangeToolName;
 	filePath: string;
-	/** IntelligentUI alone creates a generated App.tsx beneath its frozen directory target. */
+	/** GenUI alone creates a generated App.tsx beneath its frozen directory target. */
 	exclusiveCreate?: boolean;
 	/** Only this tool's actual input, hashed with the frozen target. Never stored as a body. */
 	input: Record<string, unknown>;
@@ -551,7 +551,7 @@ export class LocalFileChangeRuntime {
 			row.lexical !== target.lexicalPath ||
 			row.canonical !== target.canonicalPath ||
 			row.generation !== target.runtimeGeneration ||
-			(toolName === "IntelligentUI" && row.segmentId !== (ctx.executionSegmentId ?? null)) ||
+			(toolName === "GenUI" && row.segmentId !== (ctx.executionSegmentId ?? null)) ||
 			((row.status !== "running" || row.startedAt === null) && row.operationId === null)
 		)
 			throw new Error("Tool-call row/attempt does not match its real authorized execution");
@@ -561,7 +561,7 @@ export class LocalFileChangeRuntime {
 			// direct child App.tsx may refine it; never rewrite the tool-call identity.
 			const directory = backend.paths.dirname(filePath);
 			if (
-				toolName !== "IntelligentUI" ||
+				toolName !== "GenUI" ||
 				!backend.paths.equals(target.lexicalPath, target.canonicalPath) ||
 				!backend.paths.equals(backend.paths.dirname(directory), target.canonicalPath) ||
 				backend.paths.basename(filePath) !== "App.tsx" ||
@@ -813,8 +813,8 @@ export class LocalFileChangeRuntime {
 			},
 		};
 		const { ctx, backend } = request;
-		if (request.toolName === "IntelligentUI" && !request.exclusiveCreate)
-			throw new Error("IntelligentUI file changes require exclusive creation");
+		if (request.toolName === "GenUI" && !request.exclusiveCreate)
+			throw new Error("GenUI file changes require exclusive creation");
 		const frozen = this.validateCall(request);
 		try {
 			request.input = snapshotFileToolInput(request.input);
@@ -1975,7 +1975,7 @@ export class LocalFileChangeRuntime {
 					action:
 						request.sourceKind === "editor"
 							? "human"
-							: request.toolName === "Write" || request.toolName === "IntelligentUI"
+							: request.toolName === "Write" || request.toolName === "GenUI"
 								? "write"
 								: "edit",
 					toolName: request.toolName,

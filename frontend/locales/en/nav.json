@@ -82,6 +82,7 @@
 	"notificationCenterTooltip": "Open notifications",
 	"notificationAttentionBadge": "{{count}} pending items",
 	"notificationConversationBadge": "{{count}} unread conversations",
+	"notificationKnowledgeBadge": "{{count}} knowledge review updates",
 	"notificationCountUnknown": "Notification counts unavailable; open to retry",
 	"notificationTabAttention": "Pending",
 	"notificationTabActivity": "Activity",

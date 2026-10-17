@@ -134,6 +134,34 @@
 			"when": 1792071785464,
 			"tag": "0018_personal_knowledge_injection",
 			"breakpoints": true
+		},
+		{
+			"idx": 19,
+			"version": "7",
+			"when": 1792086101922,
+			"tag": "0019_resource_protection",
+			"breakpoints": true
+		},
+		{
+			"idx": 20,
+			"version": "7",
+			"when": 1792089888326,
+			"tag": "0020_history_token_repair_bulk",
+			"breakpoints": true
+		},
+		{
+			"idx": 21,
+			"version": "7",
+			"when": 1792144295364,
+			"tag": "0021_rich_composer_document",
+			"breakpoints": true
+		},
+		{
+			"idx": 22,
+			"version": "7",
+			"when": 1792157728491,
+			"tag": "0022_context_numeric_stats",
+			"breakpoints": true
 		}
   ]
 }

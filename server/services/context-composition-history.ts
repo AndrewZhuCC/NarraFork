@@ -1,12 +1,122 @@
-import type { Database } from "bun:sqlite";
+import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type ContextSegment, safeCharacters } from "@shared/context-composition";
+import type { SQL } from "bun";
 import { readContextSegments } from "./context-composition-projection";
+
+/** Shared by SQLite and PostgreSQL. `?` placeholders are rewritten to `$1` for Postgres. */
+export interface ContextQuery {
+	get<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T | null>;
+	all<T>(sql: string, bindings: readonly SQLQueryBindings[]): Promise<T[]>;
+	run(sql: string, bindings: readonly SQLQueryBindings[]): Promise<void>;
+	transaction(fn: (tx: ContextQuery) => Promise<void>): Promise<void>;
+}
+
+export function sqliteContextQuery(database: Database): ContextQuery {
+	const query: ContextQuery = {
+		async get<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
+			return (database.query(sql).get(...bindings) as T | null | undefined) ?? null;
+		},
+		async all<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
+			return database.query(sql).all(...bindings) as T[];
+		},
+		async run(sql: string, bindings: readonly SQLQueryBindings[]) {
+			database.query(sql).run(...bindings);
+		},
+		async transaction(fn) {
+			const queued: Array<{ sql: string; bindings: readonly SQLQueryBindings[] }> = [];
+			const tx: ContextQuery = {
+				...query,
+				async run(sql, bindings) {
+					queued.push({ sql, bindings });
+				},
+				async transaction() {
+					throw new Error("Nested context composition transaction");
+				},
+			};
+			await fn(tx);
+			database.transaction(() => {
+				for (const statement of queued) database.query(statement.sql).run(...statement.bindings);
+			})();
+		},
+	};
+	return query;
+}
+
+const NUMERIC_FIELDS = new Set([
+	"seq",
+	"inputChars",
+	"outputChars",
+	"executionAttempt",
+	"isLatest",
+	"systemChars",
+	"summaryChars",
+	"toolsChars",
+]);
+
+function normalizeRow<T>(row: Record<string, unknown>): T {
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(row)) {
+		if (typeof value === "bigint") out[key] = Number(value);
+		else if (typeof value === "string" && NUMERIC_FIELDS.has(key) && /^-?\d+$/.test(value))
+			out[key] = Number(value);
+		else if (
+			(key === "stats" || key === "json" || key === "usage") &&
+			value &&
+			typeof value === "object"
+		)
+			out[key] = JSON.stringify(value);
+		else out[key] = value;
+	}
+	return out as T;
+}
+
+/** `?` only appears as bindings in these statements, never inside literals. */
+export function postgresPlaceholders(sql: string): string {
+	let index = 0;
+	return sql.replace(/\?/g, () => `$${++index}`);
+}
+
+export function postgresContextQuery(sql: SQL): ContextQuery {
+	const run = async (statement: string, bindings: readonly SQLQueryBindings[]) =>
+		sql.unsafe(postgresPlaceholders(statement), [...bindings]);
+	const query: ContextQuery = {
+		async get<T>(statement: string, bindings: readonly SQLQueryBindings[]) {
+			const rows = (await run(statement, bindings)) as Record<string, unknown>[];
+			return rows[0] ? normalizeRow<T>(rows[0]) : null;
+		},
+		async all<T>(statement: string, bindings: readonly SQLQueryBindings[]) {
+			const rows = (await run(statement, bindings)) as Record<string, unknown>[];
+			return rows.map((row) => normalizeRow<T>(row));
+		},
+		async run(statement: string, bindings: readonly SQLQueryBindings[]) {
+			await run(statement, bindings);
+		},
+		async transaction(fn) {
+			await sql.begin(async (tx) => {
+				await fn(postgresContextQuery(tx as unknown as SQL));
+			});
+		},
+	};
+	return query;
+}
+
+function resolveContextQuery(source: Database | ContextQuery): ContextQuery {
+	return typeof (source as Database).query === "function"
+		? sqliteContextQuery(source as Database)
+		: (source as ContextQuery);
+}
 
 export const CONTEXT_COMPOSITION_LIMITS = {
 	batch: 64,
 	toolBatch: 256,
 	toolCache: 1024,
 	sliceMs: 4,
+	/**
+	 * Cheap rows must still pause eventually so cancellation can run, but a timer
+	 * turn per SQL batch made cold rebuild wall time track history length and
+	 * tripped the slow-rebuild warning while SQL itself stayed small.
+	 */
+	sliceUnits: 2048,
 	pageSegments: 128,
 	responseBytes: 256 * 1024,
 } as const;
@@ -39,9 +149,9 @@ type NumericTool = {
 	inputChars: number;
 	outputChars: number;
 };
-const TOOL_COLUMNS = `t.id, t.message_id AS messageId, t.tool_use_id AS toolUseId,
- t.created_at AS createdAt, t.execution_attempt AS executionAttempt,
- t.input_chars AS inputChars, t.output_chars AS outputChars`;
+const TOOL_COLUMNS = `t.id, t.message_id AS "messageId", t.tool_use_id AS "toolUseId",
+ t.created_at AS "createdAt", t.execution_attempt AS "executionAttempt",
+ t.input_chars AS "inputChars", t.output_chars AS "outputChars"`;
 const LATEST_TOOL = `NOT EXISTS (SELECT 1 FROM narrator_tool_calls newer
  WHERE newer.message_id = t.message_id AND newer.tool_use_id = t.tool_use_id AND
  (newer.execution_attempt, newer.created_at, newer.id) >
@@ -64,29 +174,33 @@ const executionOrder = (a: NumericTool, b: NumericTool) =>
 					? 1
 					: 0;
 
-/** Check cancellation at boundaries; yield after 4ms or a hard work-count boundary. */
+/**
+ * Pause only after 4ms of work or a large cheap-unit budget.
+ * Returning undefined (instead of an already-resolved promise) keeps the fast path
+ * synchronous: awaiting a resolved promise once per segment is itself a timer-scale cost.
+ */
 function timeSlice(check: () => void) {
 	let started = performance.now();
 	let work = 0;
-	return async (count = 1, force = false) => {
+	return (count = 1): Promise<void> | undefined => {
 		work += count;
 		if (
-			!force &&
-			work < CONTEXT_COMPOSITION_LIMITS.toolBatch &&
+			work < CONTEXT_COMPOSITION_LIMITS.sliceUnits &&
 			performance.now() - started < CONTEXT_COMPOSITION_LIMITS.sliceMs
 		)
 			return;
 		check();
-		await yieldContextReader();
-		check();
-		started = performance.now();
-		work = 0;
+		return yieldContextReader().then(() => {
+			check();
+			started = performance.now();
+			work = 0;
+		});
 	};
 }
 
 /** Common path: read raw numeric rows once, reduce attempts in a bounded temporary map. */
 async function readBatchTools(
-	database: Database,
+	query: ContextQuery,
 	rows: HistoryRow[],
 	slice: ReturnType<typeof timeSlice>,
 	check: () => void,
@@ -98,13 +212,12 @@ async function readBatchTools(
 	let count = 0;
 	while (true) {
 		check();
-		const tools = database
-			.query<NumericTool, (string | number)[]>(
-				`SELECT ${TOOL_COLUMNS} FROM narrator_tool_calls t
+		const tools = await query.all<NumericTool>(
+			`SELECT ${TOOL_COLUMNS} FROM narrator_tool_calls t
 			 WHERE t.message_id IN (${placeholders(rows.length)}) AND (t.message_id, t.id) > (?, ?)
 			 ORDER BY t.message_id, t.id LIMIT ?`,
-			)
-			.all(...rows.map((row) => row.id), messageId, id, CONTEXT_COMPOSITION_LIMITS.toolBatch);
+			[...rows.map((row) => row.id), messageId, id, CONTEXT_COMPOSITION_LIMITS.toolBatch],
+		);
 		for (const tool of tools) {
 			// The sentinel is not retained. Large messages switch to bounded SQL streaming.
 			if (++count > CONTEXT_COMPOSITION_LIMITS.toolCache) return null;
@@ -115,18 +228,18 @@ async function readBatchTools(
 			}
 			const previous = calls.get(tool.toolUseId);
 			if (!previous || newerThan(tool, previous)) calls.set(tool.toolUseId, tool);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		if (tools.length < CONTEXT_COMPOSITION_LIMITS.toolBatch) return byMessage;
 		messageId = tools[tools.length - 1].messageId;
 		id = tools[tools.length - 1].id;
-		await slice(0, true);
 	}
 }
 
 /** Large-message fallback never collects tool rows; results are already entry output. */
 async function* streamMessageTools(
-	database: Database,
+	query: ContextQuery,
 	messageId: string,
 	check: () => void,
 	slice: ReturnType<typeof timeSlice>,
@@ -137,27 +250,29 @@ async function* streamMessageTools(
 		check();
 		// Limit raw candidates, not matching latest rows: a 5000-attempt single call
 		// must not scan all 5000 candidates synchronously merely to return one row.
-		const tools = database
-			.query<NumericTool & { isLatest: number }, (string | number)[]>(
-				`SELECT ${TOOL_COLUMNS}, ${LATEST_TOOL} AS isLatest
+		const tools = await query.all<NumericTool & { isLatest: number }>(
+			`SELECT ${TOOL_COLUMNS}, ${LATEST_TOOL} AS "isLatest"
 			 FROM narrator_tool_calls t WHERE t.message_id = ?
 			 AND (t.created_at, t.id) > (?, ?)
 			 ORDER BY t.created_at, t.id LIMIT ?`,
-			)
-			.all(messageId, time, id, CONTEXT_COMPOSITION_LIMITS.toolBatch);
+			[messageId, time, id, CONTEXT_COMPOSITION_LIMITS.toolBatch],
+		);
 		for (const tool of tools) {
 			if (tool.isLatest) yield tool;
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		if (tools.length < CONTEXT_COMPOSITION_LIMITS.toolBatch) return;
 		id = tools[tools.length - 1].id;
 		time = tools[tools.length - 1].createdAt;
-		await slice(0, true);
+		// A 5000-attempt call is many full pages. Pause between pages so that scan cannot
+		// run to completion on the main thread; the common batched reader stays on sliceUnits.
+		await yieldContextReader();
 	}
 }
 
 async function projectRow(
-	database: Database,
+	query: ContextQuery,
 	row: HistoryRow,
 	tools: Map<string, NumericTool> | undefined,
 	fallback: boolean,
@@ -169,7 +284,8 @@ async function projectRow(
 	if (row.role === "system") {
 		for (const segment of metadata) {
 			if (segment.category === "summary") segments.push(segment);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		return segments;
 	}
@@ -189,17 +305,16 @@ async function projectRow(
 			markerTools = new Map();
 			if (ids.length) {
 				check();
-				const matches = database
-					.query<NumericTool, (string | number)[]>(
-						`WITH requested(tool_use_id) AS (VALUES ${ids.map(() => "(?)").join(",")})
+				const matches = await query.all<NumericTool>(
+					`WITH requested(tool_use_id) AS (VALUES ${ids.map(() => "(?)").join(",")})
 					 SELECT ${TOOL_COLUMNS} FROM requested
 					 JOIN narrator_tool_calls t ON t.id = (
 					 SELECT latest.id FROM narrator_tool_calls latest
 					 WHERE latest.message_id = ? AND latest.tool_use_id = requested.tool_use_id
 					 ORDER BY latest.execution_attempt DESC, latest.created_at DESC, latest.id DESC LIMIT 1)
 					 LIMIT ?`,
-					)
-					.all(...ids, row.id, CONTEXT_COMPOSITION_LIMITS.batch);
+					[...ids, row.id, CONTEXT_COMPOSITION_LIMITS.batch],
+				);
 				for (const tool of matches) markerTools.set(tool.toolUseId, tool);
 			}
 		}
@@ -212,7 +327,8 @@ async function projectRow(
 						segments.push({ category: "toolCall", chars: safeCharacters(tool.inputChars) });
 				}
 			} else if (segment.category !== "toolResult") segments.push(segment);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 	}
 	const results: ContextSegment[] = [];
@@ -223,37 +339,40 @@ async function projectRow(
 			results.push({ category: "toolResult", chars: safeCharacters(tool.outputChars) });
 	};
 	if (fallback) {
-		for await (const tool of streamMessageTools(database, row.id, check, slice)) append(tool);
+		for await (const tool of streamMessageTools(query, row.id, check, slice)) append(tool);
 	} else {
 		for (const tool of [...(tools?.values() ?? [])].sort(executionOrder)) {
 			append(tool);
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 	}
 	for (const result of results) {
 		segments.push(result);
-		await slice();
+		const pending = slice();
+		if (pending) await pending;
 	}
 	return segments;
 }
 
 /** Numeric-only full or targeted refs projection; empty entries invalidate old contributions. */
 export async function* readContextHistoryEntries(
-	database: Database,
+	source: Database | ContextQuery,
 	narratorId: string,
 	options: Options,
 ): AsyncGenerator<ContextHistoryEntry> {
+	const query = resolveContextQuery(source);
 	const { check, profile, messageIds } = options;
 	const slice = timeSlice(check);
 	check();
-	const boundary =
-		database
-			.query<{ seq: number }, [string, string]>(
-				`SELECT r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
+	const boundaryRow = await query.get<{ seq: number }>(
+		`SELECT r.seq AS "seq" FROM narrator_message_refs r
+		 JOIN narrator_message_context_stats s ON s.message_id = r.message_id
 		 WHERE r.narrator_id = ? AND r.is_compact = 1
-		 AND (? = 'subagent' OR m.parent_tool_use_id IS NULL) ORDER BY r.seq DESC LIMIT 1`,
-			)
-			.get(narratorId, profile)?.seq ?? -1;
+		 AND (? = 'subagent' OR s.parent_tool_use_id IS NULL) ORDER BY r.seq DESC LIMIT 1`,
+		[narratorId, profile],
+	);
+	const boundary = boundaryRow?.seq ?? -1;
 	let seq = Math.max(boundary, options.afterSeq ?? -1);
 	let targetOffset = 0;
 	while (true) {
@@ -263,45 +382,47 @@ export async function* readContextHistoryEntries(
 			targetOffset + CONTEXT_COMPOSITION_LIMITS.batch,
 		);
 		if (targets && !targets.length) return;
-		const rows = database
-			.query<HistoryRow, (string | number)[]>(
-				`SELECT r.seq, m.id, m.context_chars_json AS stats, m.role, r.segment_compact_id AS hidden,
-			 m.parent_tool_use_id AS parentToolUseId FROM narrator_message_refs r
-			 JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ?
+		const rows = await query.all<HistoryRow>(
+			`SELECT r.seq AS "seq", s.message_id AS "id", s.segments_json AS "stats", s.role AS "role",
+			 r.segment_compact_id AS "hidden", s.parent_tool_use_id AS "parentToolUseId"
+			 FROM narrator_message_refs r
+			 JOIN narrator_message_context_stats s ON s.message_id = r.message_id
+			 WHERE r.narrator_id = ?
 			 AND ${targets ? `r.message_id IN (${placeholders(targets.length)})` : "r.seq > ?"}
 			 ORDER BY r.seq LIMIT ?`,
-			)
-			.all(narratorId, ...(targets ?? [seq]), CONTEXT_COMPOSITION_LIMITS.batch);
+			[narratorId, ...(targets ?? [seq]), CONTEXT_COMPOSITION_LIMITS.batch],
+		);
 		if (!rows.length && !targets) return;
 		const active = rows.filter(
 			(row) => row.seq > boundary && visible(row, profile) && row.role !== "system",
 		);
-		const tools = await readBatchTools(database, active, slice, check);
+		const tools = await readBatchTools(query, active, slice, check);
 		for (const row of rows) {
 			const segments =
 				row.seq > boundary && visible(row, profile)
-					? await projectRow(database, row, tools?.get(row.id), tools === null, slice, check)
+					? await projectRow(query, row, tools?.get(row.id), tools === null, slice, check)
 					: [];
 			yield { messageId: row.id, seq: row.seq, segments };
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 		if (rows.length) seq = rows[rows.length - 1].seq;
 		targetOffset += CONTEXT_COMPOSITION_LIMITS.batch;
-		await slice(0, true);
 	}
 }
 
 /** Compatibility wrapper for existing segment consumers. */
 export async function* readContextHistory(
-	database: Database,
+	source: Database | ContextQuery,
 	narratorId: string,
 	options: Options,
 ): AsyncGenerator<ContextSegment> {
 	const slice = timeSlice(options.check);
-	for await (const entry of readContextHistoryEntries(database, narratorId, options)) {
+	for await (const entry of readContextHistoryEntries(source, narratorId, options)) {
 		for (const segment of entry.segments) {
 			yield segment;
-			await slice();
+			const pending = slice();
+			if (pending) await pending;
 		}
 	}
 }

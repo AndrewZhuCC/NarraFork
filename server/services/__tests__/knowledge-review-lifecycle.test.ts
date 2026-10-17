@@ -844,3 +844,46 @@ describe("listSubmissions agrees with countReviewInbox on own submissions", () =
 		expect(res.status).toBe("approved");
 	});
 });
+
+describe("listMySubmissionOutcomes", () => {
+	test("returns the author's recent verdicts with findings and without classified text", async () => {
+		const pending = await makePendingSubmission("OutcomePending");
+		const bounced = await makePendingSubmission("OutcomeBounced");
+		await knowledgeBranchService.review(admin, bounced.submissionId, {
+			verdict: "request_changes",
+			findings: [{ severity: "minor", message: "spell out the clearance grant" }],
+		});
+		const published = await makePendingSubmission("OutcomePublished");
+		await knowledgeBranchService.review(admin, published.submissionId, { verdict: "approve" });
+
+		const rows = await knowledgeBranchService.listMySubmissionOutcomes(author);
+		const pendingRow = rows.find((row) => row.id === pending.submissionId);
+		const bouncedRow = rows.find((row) => row.id === bounced.submissionId);
+		const publishedRow = rows.find((row) => row.id === published.submissionId);
+
+		expect(pendingRow).toBeUndefined();
+		expect(bouncedRow?.status).toBe("changes_requested");
+		expect(bouncedRow?.findingsJson).toEqual([
+			{ severity: "minor", message: "spell out the clearance grant" },
+		]);
+		expect(publishedRow?.status).toBe("approved");
+		for (const row of [bouncedRow, publishedRow]) {
+			expect(row).toBeDefined();
+			expect(row).not.toHaveProperty("proposedContent");
+			expect(row).not.toHaveProperty("title");
+			expect(row).not.toHaveProperty("changeNote");
+		}
+
+		// Another user does not see this author's verdicts.
+		const strangerRows = await knowledgeBranchService.listMySubmissionOutcomes(stranger);
+		expect(strangerRows.some((row) => row.id === bounced.submissionId)).toBe(false);
+
+		const res = await appFor(author).request("/knowledge/my-submission-outcomes");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as Array<Record<string, unknown>>;
+		const fromHttp = body.find((row) => row.id === bounced.submissionId);
+		expect(fromHttp?.status).toBe("changes_requested");
+		expect(fromHttp).not.toHaveProperty("proposedContent");
+		expect(fromHttp).not.toHaveProperty("title");
+	});
+});

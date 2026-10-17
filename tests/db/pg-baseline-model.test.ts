@@ -345,6 +345,10 @@ function fixture(): {
 				constraintBacked: true,
 			},
 		],
+		primaryKeys: [
+			{ table: "parent", name: "parent_pkey", columns: ["id"], columnCount: 1 },
+			{ table: "child", name: "child_pkey", columns: ["id"], columnCount: 1 },
+		],
 		uniques: [
 			{
 				table: "parent",
@@ -388,6 +392,161 @@ const compare = (mutate: (state: ReturnType<typeof fixture>) => void = () => {})
 
 /** Deep clone so a mutation cannot leak into the next case through a shared reference. */
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+describe("primary key constraints", () => {
+	const compositeSnapshot = () => {
+		const snap = snapshot();
+		childColumn(snap, "id").primaryKey = false;
+		childTable(snap).compositePrimaryKeys = {
+			child_scope_pk: { name: "child_scope_pk", columns: ["kind", "id"] },
+		};
+		return snap;
+	};
+	const compositeFixture = () => {
+		const state = fixture();
+		const built = buildExpected(compositeSnapshot());
+		expect(built.problems).toEqual([]);
+		state.expected = built.expected;
+		state.catalog.primaryKeys[1] = {
+			table: "child",
+			name: "child_scope_pk",
+			columns: ["kind", "id"],
+			columnCount: 2,
+		};
+		find(
+			state.catalog.columns,
+			(c) => c.table === "child" && c.name === "kind",
+			"kind",
+		).primaryKey = true;
+		return state;
+	};
+	const compareComposite = (mutate: (state: ReturnType<typeof fixture>) => void) => {
+		const state = compositeFixture();
+		mutate(state);
+		return compareBaseline(state.expected, state.catalog, state.canonical, state.counts);
+	};
+
+	it("models inline and table-level PK names, ordered columns, membership and constraint counts", () => {
+		const state = compositeFixture();
+		expect(state.expected.primaryKeys).toEqual([
+			{ table: "parent", name: "parent_pkey", columns: ["id"] },
+			{ table: "child", name: "child_scope_pk", columns: ["kind", "id"] },
+		]);
+		expect(state.expected.counts.primaryKeys).toBe(2);
+		expect(
+			state.expected.columns.filter((c) => c.table === "child" && c.primaryKey).map((c) => c.name),
+		).toEqual(["id", "kind"]);
+		expect(compareBaseline(state.expected, state.catalog, state.canonical, state.counts)).toEqual(
+			[],
+		);
+	});
+
+	it.each([
+		["reordered", ["id", "kind"]],
+		["wrong", ["kind", "parent_id"]],
+		["shortened", ["kind"]],
+	])("detects %s PK columns even with unchanged column membership and counts", (_label, columns) => {
+		expect(
+			compareComposite((state) => {
+				state.catalog.primaryKeys[1].columns = columns;
+			}),
+		).toContainEqual(expect.stringContaining("primary key child.child_scope_pk: expected"));
+	});
+
+	it("checks resolved PK column count independently", () => {
+		expect(
+			compareComposite((state) => {
+				state.catalog.primaryKeys[1].columns = ["kind"];
+			}),
+		).toContain("primary key child.child_scope_pk: 1 of 2 columns resolved");
+	});
+
+	it("detects a renamed PK with identical columns and counts", () => {
+		expect(
+			compareComposite((state) => {
+				state.catalog.primaryKeys[1].name = "renamed_pk";
+			}),
+		).toEqual([
+			"primary key child.child_scope_pk: missing from the server",
+			"primary key child.renamed_pk: present on the server, not committed",
+		]);
+	});
+
+	it("detects a missing PK and independent server constraint count", () => {
+		expect(
+			compareComposite((state) => {
+				state.catalog.primaryKeys.pop();
+				state.counts.primaryKeys = 1;
+			}),
+		).toEqual([
+			"primary key child.child_scope_pk: missing from the server",
+			"count primaryKeys: expected 2, server reported 1",
+		]);
+	});
+
+	it("still checks column PK membership against the catalog", () => {
+		expect(
+			compareComposite((state) => {
+				find(
+					state.catalog.columns,
+					(c) => c.table === "child" && c.name === "kind",
+					"kind",
+				).primaryKey = false;
+			}),
+		).toEqual([expect.stringContaining("column child.kind: expected")]);
+	});
+
+	it("expects implicit NOT NULL for table-level PK members", () => {
+		const snap = compositeSnapshot();
+		childColumn(snap, "kind").notNull = false;
+		const built = buildExpected(snap);
+		expect(built.problems).toEqual([]);
+		expect(
+			built.expected.columns.find((c) => c.table === "child" && c.name === "kind")?.notNull,
+		).toBe(true);
+	});
+
+	it.each([
+		["no columns", []],
+		["duplicate columns", ["kind", "kind"]],
+		["unknown column missing", ["missing"]],
+	])("rejects a malformed snapshot PK: %s", (message, columns) => {
+		const snap = compositeSnapshot();
+		childTable(snap).compositePrimaryKeys = { pk: { name: "pk", columns } };
+		expect(buildExpected(snap).problems).toEqual([`primary key child.pk: ${message}`]);
+	});
+
+	it("rejects multiple PK definitions rather than merging them", () => {
+		const snap = compositeSnapshot();
+		childColumn(snap, "id").primaryKey = true;
+		expect(buildExpected(snap).problems).toEqual(["table child: multiple primary keys"]);
+	});
+
+	it("parses ordered PK catalog columns and fails a missing facet closed", () => {
+		const facets: Record<FacetName, unknown[][]> = {
+			tables: [],
+			columns: [],
+			foreignKeys: [],
+			indexes: [],
+			primaryKeys: [["child", "child_scope_pk", ["kind", "id"], 2]],
+			uniques: [],
+			checks: [],
+			generated: [],
+			sequences: [],
+		};
+		const parsed = parseCatalog(facets);
+		expect(parsed.problems).toEqual([]);
+		expect(parsed.catalog.primaryKeys).toEqual([
+			{ table: "child", name: "child_scope_pk", columns: ["kind", "id"], columnCount: 2 },
+		]);
+		facets.primaryKeys[0].pop();
+		expect(parseCatalog(facets).problems).toContainEqual(
+			expect.stringContaining("facet primaryKeys: expected 4 fields"),
+		);
+		delete (facets as Partial<typeof facets>).primaryKeys;
+		expect(parseCatalog(facets).problems).toEqual(["facet primaryKeys: missing entirely"]);
+	});
+});
 
 describe("the baseline fixture agrees with itself", () => {
 	it("reports no problems for a faithful catalog", () => {
@@ -539,6 +698,7 @@ describe("foreign keys", () => {
 			columns: [],
 			foreignKeys: [["child", "fk", "parent", ["parent_id"], ["id"], 1, 1, "c"]],
 			indexes: [],
+			primaryKeys: [],
 			uniques: [],
 			checks: [],
 			generated: [],
@@ -909,6 +1069,7 @@ describe("generated columns", () => {
 			columns: [["child", "pending", "integer", false, false, "CASE WHEN 1 THEN 1 END", "s", null]],
 			foreignKeys: [],
 			indexes: [],
+			primaryKeys: [],
 			uniques: [],
 			checks: [],
 			generated: [],
@@ -1089,14 +1250,6 @@ describe("landmarks", () => {
 		expect(buildExpected(tampered).problems).toEqual([
 			"snapshot enums are not covered by this gate (1)",
 			"snapshot views are not covered by this gate (1)",
-		]);
-	});
-
-	it("reports a composite primary key it cannot express", () => {
-		const tampered = snapshot();
-		childTable(tampered).compositePrimaryKeys = { pk: { columns: ["id", "kind"] } };
-		expect(buildExpected(tampered).problems).toEqual([
-			"table child: composite primary keys are not covered",
 		]);
 	});
 
@@ -1348,6 +1501,7 @@ describe("expression index keys", () => {
 			tables: [],
 			columns: [],
 			foreignKeys: [],
+			primaryKeys: [],
 			uniques: [],
 			checks: [],
 			generated: [],

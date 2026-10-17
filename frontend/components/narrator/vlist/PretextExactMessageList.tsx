@@ -83,6 +83,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
+import { useToolCallInspectorHost } from "../tool-call/tool-call-inspector-host";
 import {
 	getCategory,
 	getCategoryColor,
@@ -881,6 +882,9 @@ export const PretextExactMessageList = memo(
 			} | null>(null);
 			/** Message whose pre-edit original text the (single) shell modal reveals. */
 			const [originalModalMessageId, setOriginalModalMessageId] = useState<string | null>(null);
+			// One inspector for the list. Rows only request it; mounting the dialog on
+			// the row unmounts it whenever that row leaves the overscan window.
+			const toolCallInspector = useToolCallInspectorHost(narratorId);
 			// Per-key real-pixel height overrides for rows whose content cannot be
 			// predicted arithmetically (mermaid / katex / unknown images, the live
 			// permission form, and the inline editor). A row reports its settled height via
@@ -5568,6 +5572,7 @@ export const PretextExactMessageList = memo(
 					{/* Fullscreen content viewer — ONE instance for the whole list, mounted only
 			    while a body is open. Rows (and their action bars) only report which
 			    target to show, so a scrolling list never builds a modal per body. */}
+					{toolCallInspector}
 					{contentView.openTarget ? (
 						<VListContentViewModal
 							target={contentView.openTarget}

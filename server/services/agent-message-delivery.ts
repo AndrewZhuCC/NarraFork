@@ -8,6 +8,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { modelInputContainsText } from "../lib/agent/question-model-input";
 import type { ToolCallBinding } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -489,6 +490,22 @@ const historyConsumptions = new WeakMap<
 	Array<AgentMessageConsumption & { currentInputText?: string }>
 >();
 
+// Provenance outlives receipt consumption, but never the builder's history identity.
+const lastMailboxModelInputs = new WeakMap<
+	unknown[],
+	{ text: string; length: number; tail: unknown }
+>();
+
+/** Whether this exact built input ends in a structured agent mailbox source row. */
+export function isLastModelInputMailbox(history: unknown[], currentContent: string): boolean {
+	const input = lastMailboxModelInputs.get(history);
+	if (!input || history.length !== input.length || history.at(-1) !== input.tail) return false;
+	const current = currentContent.trim();
+	// Some adapters retain a sys-only mailbox in history instead of extracting it
+	// as current content. Confirm its actual bytes are present in that exact packet.
+	return current === input.text || (!current && modelInputContainsText(history, input.text));
+}
+
 /** Register candidates only. Loading/compacting/preparing history is NOT consumption. */
 export async function trackAgentMessageHistory(
 	narratorId: string,
@@ -515,6 +532,33 @@ export async function trackAgentMessageHistory(
 	while (trailingUserText && modelMessages[lastNonSystem]?.role === "sys") lastNonSystem--;
 	const poppedUser =
 		modelMessages[lastNonSystem]?.role === "user" ? modelMessages[lastNonSystem] : undefined;
+	lastMailboxModelInputs.delete(history);
+	const lastSource = modelMessages.at(-1);
+	if (
+		(lastSource?.role === "user" || lastSource?.role === "sys") &&
+		Array.isArray(lastSource.contentJson) &&
+		lastSource.contentJson.some(
+			(block) => block?.type === "system_injection" && block.body?.kind === "messages",
+		)
+	) {
+		// Match the runtime builder's extracted sys tail + current user composition.
+		// Unlike consumption candidates, source provenance includes already-adopted rows.
+		const userText =
+			poppedUser && Array.isArray(poppedUser.contentJson)
+				? modelTextFromContentBlocks(poppedUser.contentJson).trim()
+				: "";
+		const expectedInput = trailingUserText?.trim()
+			? userText
+				? `${trailingUserText}\n\n${userText}`.trim()
+				: trailingUserText.trim()
+			: userText || modelTextFromContentBlocks(lastSource.contentJson).trim();
+		if (expectedInput)
+			lastMailboxModelInputs.set(history, {
+				text: expectedInput,
+				length: history.length,
+				tail: history.at(-1),
+			});
+	}
 	for (const message of modelMessages) {
 		// Shared fork refs and child subtrees must never acknowledge another recipient.
 		if (message.narratorId !== narratorId || message.injectionConsumedAt) continue;

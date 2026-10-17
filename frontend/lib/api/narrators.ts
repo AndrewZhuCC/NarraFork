@@ -5,6 +5,7 @@ import type {
 } from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { GitWorkspaceSummary } from "@shared/git-workspace";
@@ -61,6 +62,26 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+export interface ComposerDocumentDetail {
+	composerDocument?: ComposerDocument;
+	/** These summaries are read together with the document, never from a stale list row. */
+	images?: {
+		id?: string;
+		imageId: string;
+		filename?: string;
+		mediaType?: string;
+		width?: number;
+		height?: number;
+		size?: number;
+		sourceMimeType?: string;
+		uploadNarratorId?: string;
+	}[];
+	textFiles?: { filename: string; size: number; filePath?: string; index?: number }[];
+	text?: string;
+	fileReferences?: FileReference[];
+	bodyRevision?: number;
+}
 
 export interface NarratorPanelStateOptions extends SharedReadOptions {
 	permissionsCursor?: string;
@@ -769,6 +790,7 @@ export const narratorsApi = {
 			hasDraft: boolean;
 			text: string;
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
@@ -780,6 +802,7 @@ export const narratorsApi = {
 		baseRevision: number,
 		sourceId?: string,
 		fileReferences?: FileReference[],
+		composerDocument?: ComposerDocument,
 	) =>
 		request<{
 			ok: boolean;
@@ -787,13 +810,14 @@ export const narratorsApi = {
 			hasDraft: boolean;
 			text: string;
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`, {
 			method: "PUT",
-			body: JSON.stringify({ text, baseRevision, sourceId, fileReferences }),
+			body: JSON.stringify({ text, baseRevision, sourceId, fileReferences, composerDocument }),
 		}),
 	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
 		const params = new URLSearchParams();
@@ -1114,6 +1138,20 @@ export const narratorsApi = {
 		}),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
+	getMessageComposerDocument: (narratorId: string, messageId: string, signal?: AbortSignal) =>
+		request<ComposerDocumentDetail>(
+			`/narrators/${encodeURIComponent(narratorId)}/messages/${encodeURIComponent(messageId)}/composer-document`,
+			{ signal },
+		),
+	getBufferedMessageComposerDocument: (
+		narratorId: string,
+		messageId: string,
+		signal?: AbortSignal,
+	) =>
+		request<ComposerDocumentDetail>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/composer-document`,
+			{ signal },
+		),
 	getBufferedMessages: (id: string, signal?: AbortSignal) =>
 		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
 	/**
@@ -1133,6 +1171,7 @@ export const narratorsApi = {
 			newImages?: File[];
 			newTextFiles?: File[];
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 		},
 	) => {
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
@@ -1144,6 +1183,7 @@ export const narratorsApi = {
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
 					...(opts?.keepTextFiles ? { keepTextFiles: opts.keepTextFiles } : {}),
 					fileReferences: opts?.fileReferences,
+					composerDocument: opts?.composerDocument,
 				}),
 			});
 		}
@@ -1153,6 +1193,9 @@ export const narratorsApi = {
 		if (opts.keepTextFiles) formData.append("keepTextFiles", JSON.stringify(opts.keepTextFiles));
 		if (opts.fileReferences !== undefined) {
 			formData.append("fileReferences", JSON.stringify(opts.fileReferences));
+		}
+		if (opts.composerDocument !== undefined) {
+			formData.append("composerDocument", JSON.stringify(opts.composerDocument));
 		}
 		for (const img of opts.newImages ?? []) formData.append("images", img);
 		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
@@ -1641,6 +1684,7 @@ export const narratorsApi = {
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
 		queueMode?: "turn" | "tool" | "interrupt",
+		options?: { composerDocument?: ComposerDocument },
 	) => {
 		if (queueMode !== undefined) {
 			priority = queueMode !== "turn";
@@ -1669,6 +1713,9 @@ export const narratorsApi = {
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
 			}
+			if (options?.composerDocument !== undefined) {
+				formData.append("composerDocument", JSON.stringify(options.composerDocument));
+			}
 			// Use XHR-backed upload so we can surface real upload progress to the UI.
 			res = await postFormDataWithProgress(url, formData, {
 				headers,
@@ -1686,6 +1733,7 @@ export const narratorsApi = {
 					...(interrupt ? { interrupt: true } : {}),
 					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
+					composerDocument: options?.composerDocument,
 				}),
 				signal,
 			});
@@ -1805,6 +1853,7 @@ export const narratorsApi = {
 			keepTextFilePaths?: string[];
 			newTextFiles?: File[];
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 		},
 	) => {
 		const headers: Record<string, string> = {};
@@ -1830,6 +1879,9 @@ export const narratorsApi = {
 			if (opts.fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(opts.fileReferences));
 			}
+			if (opts.composerDocument !== undefined) {
+				formData.append("composerDocument", JSON.stringify(opts.composerDocument));
+			}
 			for (const img of opts.newImages ?? []) formData.append("images", img);
 			for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
 			body = formData;
@@ -1842,6 +1894,7 @@ export const narratorsApi = {
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 				fileReferences: opts?.fileReferences,
+				composerDocument: opts?.composerDocument,
 			});
 		}
 
@@ -2034,12 +2087,19 @@ export const narratorsApi = {
 			body: JSON.stringify({ summary }),
 		}),
 
-	// File tree — current uncommitted Git line counts, relative to this narrator's cwd.
+	// File tree — current Git changes relative to this narrator's cwd; legacy line counts are optional.
 	getFileTreeStatus: (narratorId: string) =>
 		request<{
 			isGitRepo: boolean;
-			files: Array<{ path: string; linesAdded: number; linesRemoved: number }>;
+			files: Array<{
+				path: string;
+				status?: string;
+				oldPath?: string;
+				linesAdded?: number;
+				linesRemoved?: number;
+			}>;
 			totalFiles: number;
+			totalFilesExact?: boolean;
 			truncated: boolean;
 		}>(`/narrators/${narratorId}/file-tree-status`),
 

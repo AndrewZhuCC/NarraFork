@@ -4,6 +4,7 @@ export const CONTEXT_CATEGORIES = [
 	"toolDefinition",
 	"user",
 	"assistant",
+	"reasoning",
 	"toolCall",
 	"toolResult",
 	"attachment",
@@ -37,7 +38,7 @@ export interface ContextComposition {
 	segments: ContextSegment[];
 	nextCursor: string | null;
 	pending: boolean;
-	/** Matched request occupancy and complete character calibration, if available. */
+	/** Latest occupancy snapshot recorded for this narrator, if any. */
 	usage?: import("./context-usage").ContextUsageSnapshot | null;
 }
 export function safeCharacters(chars: number): number {

@@ -4,9 +4,10 @@ import { analyzeTokenRepairEvidence } from "../lib/usage-token-repair-evidence";
 import type { RepairRequestRow } from "./usage-token-repair-store";
 
 if (!parentPort) throw new Error("Token repair evidence worker requires a parent");
-parentPort.once(
+parentPort.on(
 	"message",
 	async (input: {
+		id: number;
 		row: RepairRequestRow;
 		rawDumpJson: string | null;
 		dumpDirectory: string;
@@ -17,9 +18,12 @@ parentPort.once(
 				dumpDirectory: input.dumpDirectory,
 				protocolHint: input.protocolHint,
 			});
-			parentPort?.postMessage({ result });
+			parentPort?.postMessage({ id: input.id, result });
 		} catch {
-			parentPort?.postMessage({ error: "Historical request evidence could not be read safely" });
+			parentPort?.postMessage({
+				id: input.id,
+				error: "Historical request evidence could not be read safely",
+			});
 		}
 	},
 );

@@ -25,6 +25,7 @@ export interface SafeSpawnResult {
 	exitCode: number;
 	stdoutTruncated?: boolean;
 	stderrTruncated?: boolean;
+	terminationReason?: "timeout" | "abort" | "watchdog" | "output-limit" | "consumer";
 }
 
 /** Watchdog check interval in milliseconds. */
@@ -82,6 +83,12 @@ export interface SafeSpawnOptions {
 	 * Set to 0 to keep no output, or Infinity to explicitly allow unbounded capture.
 	 */
 	maxOutputBytes?: number;
+	/** Opt-in raw stdout streaming: retain no stdout and stop at the byte budget.
+	 * Return false to finish intentionally (distinct from timeout/cancellation).
+	 */
+	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined };
+	/** Independent stderr capture budget; defaults to maxOutputBytes. */
+	maxStderrBytes?: number;
 	/**
 	 * Best-effort cleanup of child processes spawned by the command. Useful for
 	 * startup hooks that may launch long-running dev servers via a shell.
@@ -168,12 +175,14 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 	}
 
 	let killed = false;
+	let terminationReason: SafeSpawnResult["terminationReason"];
 	let hardTimer: ReturnType<typeof setTimeout> | undefined;
 	let watchdogTimer: ReturnType<typeof setInterval> | undefined;
 
-	const kill = () => {
+	const kill = (reason: SafeSpawnResult["terminationReason"]) => {
 		if (killed) return;
 		killed = true;
+		terminationReason = reason;
 		if (opts.killProcessTree && process.platform !== "win32" && proc.pid) {
 			killUnixProcessTree(proc.pid);
 		}
@@ -203,15 +212,15 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 				cmd: opts.cmd.join(" "),
 				timeout: opts.timeout,
 			});
-			kill();
+			kill("timeout");
 		}, opts.timeout);
 	}
 
 	// --- External abort ---
-	const abortHandler = () => kill();
+	const abortHandler = () => kill("abort");
 	if (opts.signal) {
 		if (opts.signal.aborted) {
-			kill();
+			kill("abort");
 		} else {
 			opts.signal.addEventListener("abort", abortHandler, { once: true });
 		}
@@ -252,7 +261,7 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 					pidAlive,
 					tick,
 				});
-				kill();
+				kill("watchdog");
 				return;
 			}
 
@@ -271,8 +280,22 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		// 而 await proc.exited 又在等子进程退出 → 死锁。
 		const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 		const [stdout, stderr] = await Promise.all([
-			drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
-			drainStream(proc.stderr as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
+			opts.stdoutStream
+				? consumeStdout(
+						proc.stdout as ReadableStream<Uint8Array>,
+						opts.stdoutStream,
+						kill,
+						(bytes) => {
+							currentOutputLength += bytes;
+						},
+					)
+				: drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
+			drainStream(
+				proc.stderr as ReadableStream<Uint8Array>,
+				trackOutput,
+				opts.maxStderrBytes ?? maxOutputBytes,
+				opts.maxStderrBytes == null,
+			),
 		]);
 		const exitCode = await proc.exited;
 
@@ -282,7 +305,14 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			exitCode,
 			stdoutTruncated: stdout.truncated,
 			stderrTruncated: stderr.truncated,
+			...(opts.stdoutStream ? { terminationReason } : {}),
 		};
+	} catch (error) {
+		if (opts.stdoutStream) {
+			kill("consumer");
+			await proc.exited;
+		}
+		throw error;
 	} finally {
 		if (hardTimer != null) clearTimeout(hardTimer);
 		if (watchdogTimer != null) clearInterval(watchdogTimer);
@@ -290,11 +320,42 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 	}
 }
 
-/**
- * Default watchdog policy:
- *   - PID dead + no recent output → kill (process leaked / zombie)
- *   - Otherwise → renew
- */
+/** Consume raw stdout without retaining it; intentional stops kill and close the pipe. */
+async function consumeStdout(
+	stream: ReadableStream<Uint8Array>,
+	options: NonNullable<SafeSpawnOptions["stdoutStream"]>,
+	stop: (reason: SafeSpawnResult["terminationReason"]) => void,
+	track: (bytes: number) => void,
+): Promise<{ text: string; truncated: boolean }> {
+	const reader = stream.getReader();
+	let bytes = 0;
+	let truncated = false;
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			track(value.byteLength);
+			const chunk = value.subarray(0, Math.max(0, options.maxBytes - bytes));
+			bytes += chunk.byteLength;
+			if (chunk.byteLength && options.onChunk(chunk) === false) {
+				stop("consumer");
+				truncated = true;
+				break;
+			}
+			if (bytes >= options.maxBytes) {
+				stop("output-limit");
+				truncated = true;
+				break;
+			}
+		}
+		if (truncated) await reader.cancel();
+	} finally {
+		reader.releaseLock();
+	}
+	return { text: "", truncated };
+}
+
+/** Kill a dead process with no output; otherwise renew the watchdog. */
 function defaultWatchdog(info: WatchdogInfo): "kill" | "renew" {
 	if (!info.pidAlive && !info.hadOutput) return "kill";
 	return "renew";
@@ -309,6 +370,7 @@ async function drainStream(
 	stream: ReadableStream<Uint8Array>,
 	onChunk: (text: string) => void,
 	maxBytes: number,
+	includeTruncationMarker = true,
 ): Promise<{ text: string; truncated: boolean }> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
@@ -336,7 +398,8 @@ async function drainStream(
 			}
 			if (cutLen > 0) chunks.push(text.slice(0, cutLen));
 		}
-		chunks.push("\n\n[safeSpawn output truncated — exceeded capture limit]");
+		if (includeTruncationMarker)
+			chunks.push("\n\n[safeSpawn output truncated — exceeded capture limit]");
 		truncated = true;
 	};
 	try {

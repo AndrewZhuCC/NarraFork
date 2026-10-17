@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,19 +11,14 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { gitWorkspaceIdentity } from "./git-workspace";
-import {
-	FileWorktreeJournal,
-	readWorktreeReceiptProtection,
-	worktreeProposalHash,
-} from "./narrator-worktree-journal";
-import {
-	narratorWorktreeResourceRegistry,
-	readLegacyNarratorWorktreeProtection,
-} from "./narrator-worktree-resources";
+import { FileWorktreeJournal, worktreeProposalHash } from "./narrator-worktree-journal";
+import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { narratorWorktreeService } from "./narrator-worktree-runtime";
 import { NarratorWorktreeService, type WorktreeTarget } from "./narrator-worktree-service";
+import { maintainProtectionIndex } from "./resource-protection-index";
 import { cleanupOrphanedWorktrees } from "./storage-service";
 import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspace-context-service";
+import { inspect } from "./worktree-lifecycle-guard";
 
 // Isolated preload DB only. This suite does not generate migrations or touch live data.
 // Until the main agent generates the new migration, materialize just this table in the
@@ -47,6 +43,28 @@ let target: WorktreeTarget;
 let service: NarratorWorktreeService<string>;
 const binary = Buffer.from([0, 255, 128, 13, 10, 0, 42]);
 const signal = () => new AbortController().signal;
+async function removeReceipts() {
+	await rm(getNarraforkPath("worktree-requests"), { recursive: true, force: true });
+	await rm(getNarraforkPath("worktree-requests-v2"), { recursive: true, force: true });
+}
+function beginLegacyReceiptImport() {
+	// Test-only upgrade boundary: files are injected before this one-time import starts.
+	sqlite.exec(`UPDATE resource_protection_sources SET complete = 0, cursor = NULL
+		WHERE source = 'receipt' AND source_id = ''`);
+}
+async function finishProtectionMaintenance() {
+	for (let batch = 0; batch < 96; batch++) {
+		await maintainProtectionIndex(performance.now() + 5000);
+		const pending = sqlite
+			.query<{ pending: number }, []>(`SELECT EXISTS(
+				SELECT 1 FROM resource_protection_sources
+				WHERE (source_id = '' AND complete = 0) OR (source_id != '' AND dirty = 1)
+			) AS pending`)
+			.get()?.pending;
+		if (!pending) return;
+	}
+	throw new Error("Protection fixture maintenance did not complete");
+}
 async function git(args: string[], cwd = source) {
 	const result = await safeSpawn({
 		cmd: ["git", "-C", cwd, ...args],
@@ -88,6 +106,10 @@ async function assertDirty(path: string) {
 }
 
 beforeEach(async () => {
+	await removeReceipts();
+	sqlite.exec(`DELETE FROM resource_protection_paths WHERE source = 'receipt';
+		DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''`);
+	beginLegacyReceiptImport();
 	temporary = await mkdtemp(join(tmpdir(), "narrafork-worktree-storage-"));
 	source = join(temporary, "repo");
 	await mkdir(source);
@@ -145,9 +167,13 @@ beforeEach(async () => {
 		authorize: async () => target,
 		withRevision: async (_id, _revision, action) => action(),
 		withRepositoryLock: withWorkspaceRepositoryLock,
-		journal: new FileWorktreeJournal(getNarraforkPath("worktree-requests")),
+		journal: new FileWorktreeJournal(
+			getNarraforkPath("worktree-requests-v2"),
+			getNarraforkPath("worktree-requests"),
+		),
 		resources: narratorWorktreeResourceRegistry,
 	});
+	await finishProtectionMaintenance();
 });
 
 afterEach(async () => {
@@ -158,7 +184,7 @@ afterEach(async () => {
 		.where(eq(narratorWorktreeResources.repositoryKey, target.workspace.repositoryKey ?? ""));
 	await db.delete(projects).where(eq(projects.id, projectId));
 	await db.delete(users).where(eq(users.id, owner));
-	await rm(getNarraforkPath("worktree-requests"), { recursive: true, force: true });
+	await removeReceipts();
 	await rm(temporary, { recursive: true, force: true });
 });
 
@@ -204,12 +230,15 @@ describe("production worktree storage cleanup", () => {
 		await assertDirty(prepared.destinationPath);
 		// Remove receipt evidence, rebuild journal/service objects, then delete owner.
 		// Remaining durable DB ownership alone must protect after restart/owner removal.
-		await rm(getNarraforkPath("worktree-requests"), { recursive: true, force: true });
+		await removeReceipts();
 		service = new NarratorWorktreeService({
 			authorize: async () => target,
 			withRevision: async (_id, _revision, action) => action(),
 			withRepositoryLock: withWorkspaceRepositoryLock,
-			journal: new FileWorktreeJournal(getNarraforkPath("worktree-requests")),
+			journal: new FileWorktreeJournal(
+				getNarraforkPath("worktree-requests-v2"),
+				getNarraforkPath("worktree-requests"),
+			),
 			resources: narratorWorktreeResourceRegistry,
 		});
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
@@ -257,7 +286,10 @@ describe("production worktree storage cleanup", () => {
 				authorize: async () => target,
 				withRevision: async (_id, _revision, action) => action(),
 				withRepositoryLock: withWorkspaceRepositoryLock,
-				journal: new FileWorktreeJournal(getNarraforkPath("worktree-requests")),
+				journal: new FileWorktreeJournal(
+					getNarraforkPath("worktree-requests-v2"),
+					getNarraforkPath("worktree-requests"),
+				),
 				resources: {
 					register: narratorWorktreeResourceRegistry.register,
 					setState: async (...args) => {
@@ -287,7 +319,7 @@ describe("production worktree storage cleanup", () => {
 				.get();
 			expect(row?.state).toBe(failStateSave ? "preparing" : "unknown");
 		}
-		await rm(getNarraforkPath("worktree-requests"), { recursive: true, force: true });
+		await removeReceipts();
 		// Both worktrees are clean: protection here cannot be credited to a dirty-check.
 		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
 		for (const leaf of ["unknown-Ab1234", "unfinished-Cd1234"]) {
@@ -355,6 +387,8 @@ describe("production worktree storage cleanup", () => {
 			.update(narrators)
 			.set({ workspaceContext: { ...context, cwd: contextPath } })
 			.where(eq(narrators.id, narratorId));
+		beginLegacyReceiptImport();
+		await finishProtectionMaintenance();
 		await cleanupOrphanedWorktrees();
 		for (const path of [receiptPath, cwdPath, contextPath])
 			expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
@@ -377,8 +411,59 @@ describe("production worktree storage cleanup", () => {
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 		await cleanupOrphanedWorktrees();
 		for (const path of [cwdPath, contextPath]) await assertDirty(path);
+		// The migrated pin is frozen: corrupting and then deleting its old file cannot release it.
+		const receiptFile = getNarraforkPath(
+			"worktree-requests",
+			`${createHash("sha256")
+				.update(JSON.stringify([narratorId, request.requestId]))
+				.digest("hex")}.json`,
+		);
+		await writeFile(receiptFile, "{");
+		await finishProtectionMaintenance();
+		expect(await inspect([{ path: receiptPath }], "frozen migrated receipt fixture")).toMatchObject(
+			{
+				complete: true,
+				status: "protected",
+			},
+		);
+		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
+		await removeReceipts();
+		const restarted = await safeSpawn({
+			cmd: [
+				"bun",
+				"--eval",
+				'const { cleanupOrphanedWorktrees } = await import("./server/services/storage-service"); console.log(JSON.stringify(await cleanupOrphanedWorktrees())); process.exit(0);',
+			],
+			env: { ...process.env, NARRAFORK_ALLOW_MULTIPLE: "1" },
+			timeout: 15_000,
+			maxOutputBytes: 64 * 1024,
+		});
+		expect(restarted.exitCode).toBe(0);
+		expect(restarted.stdout).toContain('"removed":0');
 		// Receipt protection remains independently durable even for this CLEAN worktree.
 		expect(await readFile(join(receiptPath, "tracked.txt"), "utf8")).toBe("initial\n");
+	});
+
+	test("ordinary journal publication after migration does not invent a clean orphan owner", async () => {
+		const path = await add("journal-Ab1234");
+		const request = proposal("journal-Ab1234");
+		await new FileWorktreeJournal(getNarraforkPath("worktree-requests")).claim(
+			narratorId,
+			request.requestId,
+			{
+				request,
+				destination: path,
+				proposalHash: worktreeProposalHash(request),
+				repositoryKey: target.workspace.repositoryKey ?? "",
+				expectedHead: await git(["rev-parse", "HEAD"]),
+			},
+		);
+		expect(await inspect([{ path }], "ordinary journal is not an owner fixture")).toMatchObject({
+			complete: true,
+			status: "clear",
+		});
+		expect((await cleanupOrphanedWorktrees()).removed).toBe(1);
+		expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(false);
 	});
 
 	test("create/cleanup repository race protects the window before inventory and interrupted preparing registration", async () => {
@@ -397,7 +482,10 @@ describe("production worktree storage cleanup", () => {
 			authorize: async () => target,
 			withRevision: async (_id, _revision, action) => action(),
 			withRepositoryLock: withWorkspaceRepositoryLock,
-			journal: new FileWorktreeJournal(getNarraforkPath("worktree-requests")),
+			journal: new FileWorktreeJournal(
+				getNarraforkPath("worktree-requests-v2"),
+				getNarraforkPath("worktree-requests"),
+			),
 			resources: {
 				register: async (resource) => {
 					enter();
@@ -493,29 +581,44 @@ describe("production worktree storage cleanup", () => {
 		const directory = getNarraforkPath("worktree-requests");
 		await mkdir(directory);
 		const receipt = join(directory, `${"a".repeat(64)}.json`);
+		beginLegacyReceiptImport();
 		for (const text of ["{", " ".repeat(32 * 1024 + 1)]) {
 			await writeFile(receipt, text);
-			expect((await readWorktreeReceiptProtection(directory)).complete).toBe(false);
+			await maintainProtectionIndex(performance.now() + 5000);
+			await maintainProtectionIndex(performance.now() + 5000);
+			expect((await inspect([{ path }], "legacy invalid evidence fixture")).complete).toBe(false);
 			expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
 			expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
 		}
 	});
 
-	test("legacy receipt scan cap never creates false-negative ownership", async () => {
+	test("paged legacy receipt import refuses deletion until complete and preserves the last owner", async () => {
 		const path = await add("late-Ab1234");
 		const directory = getNarraforkPath("worktree-requests");
 		await mkdir(directory);
 		for (let index = 0; index < 513; index++)
 			await writeFile(
 				join(directory, `${index.toString(16).padStart(64, "0")}.json`),
-				JSON.stringify({ destination: index === 512 ? path : join(source, `other-${index}`) }),
+				JSON.stringify({
+					destination: index === 512 ? path : join(source, `other-${index}`),
+					deviceId: "local",
+					repositoryKey: target.workspace.repositoryKey,
+				}),
 			);
-		expect((await readWorktreeReceiptProtection(directory)).complete).toBe(false);
+		beginLegacyReceiptImport();
+		expect((await inspect([{ path }], "legacy pending import fixture")).complete).toBe(false);
 		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
 		expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
+		await finishProtectionMaintenance();
+		expect(await inspect([{ path }], "legacy imported owner fixture")).toMatchObject({
+			complete: true,
+			status: "protected",
+		});
+		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
+		expect(await readFile(join(path, "tracked.txt"), "utf8")).toBe("initial\n");
 	});
 
-	test("legacy cwd cursor cap cannot make a clean owned directory appear orphaned", async () => {
+	test("paged legacy cwd maintenance never makes a clean owned directory appear orphaned", async () => {
 		const path = await add("manyowners-Ab1234");
 		const now = new Date().toISOString();
 		// Keep fixture inserts under SQLite's bind budget, just like production pages.
@@ -531,11 +634,21 @@ describe("production worktree storage cleanup", () => {
 				})),
 			);
 		}
-		expect((await readLegacyNarratorWorktreeProtection(performance.now() + 5000)).complete).toBe(
+		// Model a historical DB before its first bounded narrator bootstrap page.
+		sqlite.exec(`UPDATE resource_protection_sources SET complete = 0, cursor = NULL
+			WHERE source = 'narrator' AND source_id = ''`);
+		expect((await inspect([{ path }], "legacy cwd pending maintenance fixture")).complete).toBe(
 			false,
 		);
 		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
 		expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
+		await finishProtectionMaintenance();
+		expect(await inspect([{ path }], "legacy cwd maintained owner fixture")).toMatchObject({
+			complete: true,
+			status: "protected",
+		});
+		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
+		expect(await readFile(join(path, "tracked.txt"), "utf8")).toBe("initial\n");
 	});
 
 	test("a symlink worktrees parent cannot redirect cleanup into another repository", async () => {

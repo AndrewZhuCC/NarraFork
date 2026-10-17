@@ -35,6 +35,7 @@ import type {
 	BooleanOverride,
 	DangerReflectionOverride,
 } from "../lib/boolean-override";
+import { validatePersistedComposerDocument } from "../lib/composer-document";
 import {
 	measureMessageCharacters,
 	measureSerializedCharacters,
@@ -56,6 +57,7 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
@@ -695,6 +697,7 @@ async function writeSubstatus(
 				.where(eq(narrators.id, narratorId)),
 		{ label: "writeSubstatus", maxRetries: 5 },
 	);
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 }
 
 /**
@@ -739,71 +742,157 @@ function guardPersistedPlanBody(
 }
 
 const COMPACT_RESTART_ERROR = "Interrupted by server restart";
+const COMPACT_RECOVERY_PAGE_SIZE = 100;
 
 /**
  * Recover compact markers left in the transient `[Compacting]` state.
  *
  * Modern markers carry attempt history and are audit records: preserve them,
  * fail every still-running attempt, and leave the marker retryable when its
- * history position is still valid. Only legacy placeholders with no attempt or
- * retry metadata are removed.
+ * history position is still valid. Legacy compact blocks with no attempt or
+ * retry metadata are removed. Text-only placeholders or inconsistent non-pending
+ * JSON are deliberately outside startup recovery: finding them would require a
+ * historical table scan. Normal writers put the compact block first, which is
+ * the same invariant used by the generated column and fork's pending index.
  */
 export async function recoverStaleCompactingMessages(
 	error = COMPACT_RESTART_ERROR,
 ): Promise<{ preserved: number; deleted: number }> {
-	const staleMessages = await db.query.narratorMessages.findMany({
-		where: and(
-			eq(narratorMessages.role, "system"),
-			eq(narratorMessages.contentText, "[Compacting]"),
-		),
-		columns: { id: true },
-	});
+	const startedAt = performance.now();
+	// Both modern and legacy compact blocks are represented in this tiny partial
+	// index. Never search historical message text (or fall back to doing so): a
+	// missing index is a schema error, not permission to scan the message table.
+	const upperBound = sqlite
+		.query<{ cursor: number }, []>(
+			`SELECT rowid AS cursor FROM narrator_messages INDEXED BY idx_messages_compact_pending
+			 WHERE compact_pending = 1 ORDER BY rowid DESC LIMIT 1`,
+		)
+		.get()?.cursor;
+	let selectionMs = performance.now() - startedAt;
+	let recoveryMs = 0;
+	let batches = 0;
+	let candidates = 0;
+	let skipped = 0;
+	let failed = 0;
 	let preserved = 0;
 	let deleted = 0;
+	let cursor: number | undefined;
 	const failureText = truncateCompactError(error);
 
-	for (const stale of staleMessages) {
-		const affectedNarrators = new Set<string>();
-		try {
-			const action = await withDbRetry(
-				async () =>
-					db.transaction((tx) => {
-						const current = tx.query.narratorMessages
-							.findFirst({
-								where: and(
-									eq(narratorMessages.id, stale.id),
-									eq(narratorMessages.role, "system"),
-									eq(narratorMessages.contentText, "[Compacting]"),
-								),
-								columns: { contentJson: true },
-							})
-							.sync();
-						if (!current) return "skipped" as const;
+	// The startup admission barrier still owns concurrency. This bound only makes
+	// this invocation finite; it is not a snapshot or a durable recovery cursor.
+	while (upperBound !== undefined) {
+		const selectionStartedAt = performance.now();
+		const staleMessages = sqlite
+			.query<{ cursor: number; id: string }, number[]>(
+				`SELECT rowid AS cursor, id FROM narrator_messages INDEXED BY idx_messages_compact_pending
+				 WHERE compact_pending = 1 AND rowid <= ? ${cursor === undefined ? "" : "AND rowid > ?"}
+				 ORDER BY rowid LIMIT ?`,
+			)
+			.all(
+				...(cursor === undefined
+					? [upperBound, COMPACT_RECOVERY_PAGE_SIZE]
+					: [upperBound, cursor, COMPACT_RECOVERY_PAGE_SIZE]),
+			);
+		selectionMs += performance.now() - selectionStartedAt;
+		if (staleMessages.length === 0) break;
+		batches++;
+		candidates += staleMessages.length;
+		// Advance independently of recovery success, so a failed row cannot trap us.
+		cursor = staleMessages[staleMessages.length - 1].cursor;
 
-						const refs = tx
-							.select()
-							.from(narratorMessageRefs)
-							.where(eq(narratorMessageRefs.messageId, stale.id))
-							.all();
-						for (const ref of refs) affectedNarrators.add(ref.narratorId);
-						const blocks = Array.isArray(current.contentJson) ? current.contentJson : [];
-						const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-						const attempts = normalizeCompactAttempts(compactBlock?.attempts);
-						const hasRetryHistory =
-							attempts.length > 0 ||
-							compactBlock?.trigger === "retry" ||
-							compactBlock?.retryBaseCompactMessageId !== undefined;
-						const now = new Date().toISOString();
+		for (const stale of staleMessages) {
+			const recoveryStartedAt = performance.now();
+			const affectedNarrators = new Set<string>();
+			try {
+				const action = await withDbRetry(
+					async () =>
+						db.transaction((tx) => {
+							const current = tx.query.narratorMessages
+								.findFirst({
+									where: and(
+										eq(narratorMessages.id, stale.id),
+										eq(narratorMessages.compactPending, 1),
+										eq(narratorMessages.role, "system"),
+										eq(narratorMessages.contentText, "[Compacting]"),
+									),
+									columns: { contentJson: true },
+								})
+								.sync();
+							if (!current) return "skipped" as const;
 
-						if (refs.length === 0) {
-							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
-							return "deleted" as const;
-						}
+							const refs = tx
+								.select()
+								.from(narratorMessageRefs)
+								.where(eq(narratorMessageRefs.messageId, stale.id))
+								.all();
+							for (const ref of refs) affectedNarrators.add(ref.narratorId);
+							const blocks = Array.isArray(current.contentJson) ? current.contentJson : [];
+							const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+							const attempts = normalizeCompactAttempts(compactBlock?.attempts);
+							const hasRetryHistory =
+								attempts.length > 0 ||
+								compactBlock?.trigger === "retry" ||
+								compactBlock?.retryBaseCompactMessageId !== undefined;
+							const now = new Date().toISOString();
 
-						if (!compactBlock || !hasRetryHistory) {
+							if (refs.length === 0) {
+								tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+								tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+								return "deleted" as const;
+							}
+
+							if (!compactBlock || !hasRetryHistory) {
+								for (const ref of refs) {
+									deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
+									tx.update(narrators)
+										.set({
+											messageVersion: sql`${narrators.messageVersion} + 1`,
+											updatedAt: now,
+										})
+										.where(eq(narrators.id, ref.narratorId))
+										.run();
+								}
+								tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+								tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+								return "deleted" as const;
+							}
+
+							const failedAttempts = attempts.map((attempt) =>
+								attempt.status === "running"
+									? {
+											...attempt,
+											status: "failed" as const,
+											finishedAt: now,
+											error: failureText,
+										}
+									: attempt,
+							);
+							const failedBlock = {
+								...compactBlock,
+								status: "failed" as const,
+								error: failureText,
+								attempts: failedAttempts,
+							};
+							const failedOverrides: Partial<typeof narratorMessages.$inferInsert> = {
+								contentJson: [failedBlock],
+								contextCharsJson: measureMessageCharacters("system", [failedBlock]),
+								contentText: `[Compact Failed] ${failureText.slice(0, 200)}...`,
+								contextPercent: null,
+							};
+							const forceCopy = refs.length > 1;
 							for (const ref of refs) {
-								deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
+								const copied = copyMessageForNarratorTx(
+									tx,
+									ref.narratorId,
+									stale.id,
+									failedOverrides,
+									forceCopy,
+								);
+								tx.update(narratorMessageRefs)
+									.set({ isCompact: 0 })
+									.where(eq(narratorMessageRefs.id, ref.id))
+									.run();
 								tx.update(narrators)
 									.set({
 										messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -811,84 +900,57 @@ export async function recoverStaleCompactingMessages(
 									})
 									.where(eq(narrators.id, ref.narratorId))
 									.run();
+								// Keep the local variable useful for reviewers and future callers: the
+								// helper has moved this exact ref before the isCompact update.
+								void copied;
 							}
-							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
-							return "deleted" as const;
-						}
 
-						const failedAttempts = attempts.map((attempt) =>
-							attempt.status === "running"
-								? {
-										...attempt,
-										status: "failed" as const,
-										finishedAt: now,
-										error: failureText,
-									}
-								: attempt,
-						);
-						const failedBlock = {
-							...compactBlock,
-							status: "failed" as const,
-							error: failureText,
-							attempts: failedAttempts,
-						};
-						const failedOverrides: Partial<typeof narratorMessages.$inferInsert> = {
-							contentJson: [failedBlock],
-							contextCharsJson: measureMessageCharacters("system", [failedBlock]),
-							contentText: `[Compact Failed] ${failureText.slice(0, 200)}...`,
-							contextPercent: null,
-						};
-						const forceCopy = refs.length > 1;
-						for (const ref of refs) {
-							const copied = copyMessageForNarratorTx(
-								tx,
-								ref.narratorId,
-								stale.id,
-								failedOverrides,
-								forceCopy,
-							);
-							tx.update(narratorMessageRefs)
-								.set({ isCompact: 0 })
-								.where(eq(narratorMessageRefs.id, ref.id))
-								.run();
-							tx.update(narrators)
-								.set({
-									messageVersion: sql`${narrators.messageVersion} + 1`,
-									updatedAt: now,
-								})
-								.where(eq(narrators.id, ref.narratorId))
-								.run();
-							// Keep the local variable useful for reviewers and future callers: the
-							// helper has moved this exact ref before the isCompact update.
-							void copied;
-						}
-
-						// Every shared ref was moved to a private failed marker. Remove the
-						// original only after the last source ref is gone.
-						const remaining = tx.query.narratorMessageRefs
-							.findFirst({ where: eq(narratorMessageRefs.messageId, stale.id) })
-							.sync();
-						if (!remaining) {
-							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
-							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
-						}
-						return "preserved" as const;
-					}),
-				{ label: "recoverStaleCompactingMessage", maxRetries: 5 },
-			);
-			if (action !== "skipped")
-				for (const id of affectedNarrators) queueContextCharacterRefresh(id);
-			if (action === "preserved") preserved++;
-			else if (action === "deleted") deleted++;
-		} catch (recoveryError) {
-			logger.error("Failed to recover stale compacting message", {
-				messageId: stale.id,
-				error: String(recoveryError),
-			});
+							// Every shared ref was moved to a private failed marker. Remove the
+							// original only after the last source ref is gone.
+							const remaining = tx.query.narratorMessageRefs
+								.findFirst({ where: eq(narratorMessageRefs.messageId, stale.id) })
+								.sync();
+							if (!remaining) {
+								tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+								tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+							}
+							return "preserved" as const;
+						}),
+					{ label: "recoverStaleCompactingMessage", maxRetries: 5 },
+				);
+				if (action !== "skipped")
+					for (const id of affectedNarrators) queueContextCharacterRefresh(id);
+				if (action === "preserved") preserved++;
+				else if (action === "deleted") deleted++;
+				else skipped++;
+			} catch (recoveryError) {
+				failed++;
+				logger.error("Failed to recover stale compacting message", {
+					messageId: stale.id,
+					error: String(recoveryError),
+				});
+			} finally {
+				recoveryMs += performance.now() - recoveryStartedAt;
+			}
 		}
+		if (staleMessages.length < COMPACT_RECOVERY_PAGE_SIZE || cursor >= upperBound) break;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	}
 
+	const durationMs = performance.now() - startedAt;
+	const stats = {
+		batches,
+		candidates,
+		preserved,
+		deleted,
+		skipped,
+		failed,
+		selectionMs,
+		recoveryMs,
+		durationMs,
+	};
+	if (durationMs >= 1_000) logger.warn("Slow stale compacting message recovery on startup", stats);
+	else logger.info("Stale compacting message recovery completed on startup", stats);
 	return { preserved, deleted };
 }
 
@@ -919,6 +981,7 @@ export async function recoverStaleCompactingMessages(
  * pass it when the recipient is a subagent whose page drops the filter.
  */
 export interface MessagePlacementOptions {
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Reserved by the exact agent delivery; never supplied by public input. */
 	messageId?: string;
 	/** Claimed durable input; user_input does not require an agent delivery envelope. */
@@ -1144,6 +1207,10 @@ const sqliteNarratorPersistence = {
 		origin?: MessageOriginOptions,
 		placement?: MessagePlacementOptions,
 	) {
+		const composerDocument = validatePersistedComposerDocument(
+			placement?.composerDocument,
+			contentBlocks ?? [{ type: "text", text }],
+		);
 		const parentToolUseId = placement?.parentToolUseId ?? null;
 		const pg = getNarratorMessageRefsPort();
 		if (pg) {
@@ -1154,6 +1221,7 @@ const sqliteNarratorPersistence = {
 				parentToolUseId,
 				role: "user",
 				contentJson: contentBlocks ?? [{ type: "text", text }],
+				composerDocument: composerDocument ?? null,
 				contextCharsJson: measureMessageCharacters(
 					"user",
 					contentBlocks ?? [{ type: "text", text }],
@@ -1186,6 +1254,7 @@ const sqliteNarratorPersistence = {
 							parentToolUseId,
 							role: "user",
 							contentJson: contentBlocks ?? [{ type: "text", text }],
+							composerDocument: composerDocument ?? null,
 							contextCharsJson: measureMessageCharacters(
 								"user",
 								contentBlocks ?? [{ type: "text", text }],
@@ -2655,6 +2724,7 @@ const sqliteNarratorPersistence = {
 			await writeStatus();
 		}
 
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 		// Always emit status_changed so downstream listeners (gateway, notifications)
 		// are notified. For errors, also emit the dedicated narrator:error event.
 		eventBus.emit({
@@ -2862,6 +2932,7 @@ const sqliteNarratorPersistence = {
 				: await runCompareAndSet();
 
 		if (result.changes === 0) return false;
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 
 		// Always emit status_changed; for errors also emit narrator:error.
 		eventBus.emit({

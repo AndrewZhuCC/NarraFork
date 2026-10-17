@@ -3,6 +3,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
+	isLastModelInputMailbox,
 	markAgentMessageConsumed,
 	trackAgentMessageHistory,
 } from "../agent-message-delivery";
@@ -198,6 +199,103 @@ afterAll(() => {
 	mock.module("../../websocket/narrator-ws", () => realWs);
 	mock.module("../../db", () => realDb);
 	mock.module("../../lib/agent", () => realAgent);
+});
+
+describe("last model input mailbox provenance", () => {
+	const mailbox = {
+		id: "mailbox-source",
+		narratorId: "child",
+		role: "user",
+		contentJson: [
+			{
+				type: "system_injection",
+				source: "agent_message",
+				modelText: "mailbox input",
+				body: { kind: "messages", items: [] },
+			},
+		],
+	};
+	const ordinary = {
+		id: "human-source",
+		narratorId: "child",
+		role: "user",
+		contentJson: [{ type: "text", text: "mailbox input" }],
+	};
+
+	test("recognizes only the tracked history identity and exact popped user input", async () => {
+		const history: unknown[] = [];
+		await trackAgentMessageHistory("child", history, [mailbox]);
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(true);
+		expect(isLastModelInputMailbox([...history], "mailbox input")).toBe(false);
+		expect(isLastModelInputMailbox(history, "new input")).toBe(false);
+		expect(isLastModelInputMailbox(history, "mailbox input\n\nlater user input")).toBe(false);
+	});
+
+	test.each([
+		["ordinary user", [ordinary]],
+		["old mailbox followed by ordinary user", [mailbox, ordinary]],
+		["assistant tail", [mailbox, { ...ordinary, role: "assistant" }]],
+		[
+			"other injection kind",
+			[
+				{
+					...mailbox,
+					contentJson: [
+						{ type: "system_injection", modelText: "mailbox input", body: { kind: "notice" } },
+					],
+				},
+			],
+		],
+	])("rejects %s even with identical text", async (_label, messages) => {
+		const history: unknown[] = [];
+		await trackAgentMessageHistory("child", history, messages);
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(false);
+	});
+
+	test("history-only mailbox accepts empty current input but not a subsequently extended packet", async () => {
+		const history: unknown[] = [{ role: "user", content: "mailbox input" }];
+		await trackAgentMessageHistory("child", history, [{ ...mailbox, role: "sys" }]);
+		expect(isLastModelInputMailbox(history, "")).toBe(true);
+		expect(isLastModelInputMailbox(history, "new human input")).toBe(false);
+		history.push({ role: "assistant", content: "answer" });
+		expect(isLastModelInputMailbox(history, "")).toBe(false);
+	});
+
+	test("retains provenance after receipt consumption and when rebuilt already consumed", async () => {
+		const history: unknown[] = [];
+		await trackAgentMessageHistory("child", history, [mailbox]);
+		consumeAgentMessageHistory(history, "mailbox input");
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(true);
+		await trackAgentMessageHistory("child", history, [{ ...mailbox, injectionConsumedAt: now }]);
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(true);
+		await trackAgentMessageHistory("child", history, [ordinary]);
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(false);
+	});
+
+	test("honors the builder's extracted sys tail instead of an older mailbox", async () => {
+		const history: unknown[] = [];
+		const sysMailbox = { ...mailbox, role: "sys" };
+		await trackAgentMessageHistory("child", history, [ordinary, sysMailbox], "mailbox input");
+		expect(isLastModelInputMailbox(history, "mailbox input\n\nmailbox input")).toBe(true);
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(false);
+		await trackAgentMessageHistory(
+			"child",
+			history,
+			[mailbox, { ...ordinary, role: "sys" }],
+			"reminder",
+		);
+		expect(isLastModelInputMailbox(history, "reminder\n\nmailbox input")).toBe(false);
+	});
+
+	test("ignores child subtree and display-only tail rows", async () => {
+		const history: unknown[] = [];
+		await trackAgentMessageHistory("child", history, [
+			mailbox,
+			{ ...ordinary, parentToolUseId: "nested" },
+			{ ...ordinary, role: "disp" },
+		]);
+		expect(isLastModelInputMailbox(history, "mailbox input")).toBe(true);
+	});
 });
 
 describe("Send exact delivery receipts", () => {

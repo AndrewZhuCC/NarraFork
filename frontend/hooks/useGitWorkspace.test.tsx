@@ -376,8 +376,27 @@ describe("bounded presentation snapshot cache", () => {
 		render("first");
 		await flush();
 		expect(branch()).toBe("remembered");
-		expect(latest.displayCounts).toEqual({ totalFiles: 10, linesAdded: 12, linesRemoved: 3 });
+		expect(latest.displayCounts).toEqual({ totalFiles: 10 });
 		expect(gitWorkspaceTarget("first", latest.data)).toBeNull();
+	});
+	test("a lightweight status replaces remembered line counts and retains lower-bound metadata", async () => {
+		detail("first");
+		detail("second");
+		const probe = spyOn(api, "getGitWorkspace").mockResolvedValue(workspace("ready", "remembered"));
+		await mount("first");
+		latest.rememberCounts({ totalFiles: 10, linesAdded: 12, linesRemoved: 3 });
+		latest.rememberCounts({ totalFiles: 8, totalFilesExact: false });
+		render("second");
+		await flush();
+		client.removeQueries({ queryKey: ["gitWorkspace", "first"] });
+		client.removeQueries({ queryKey: ["gitSummary", "first"] });
+		probe.mockReturnValue(deferred<GitWorkspace>().promise);
+		render("first");
+		await flush();
+		expect(latest.displayCounts?.totalFiles).toBe(8);
+		expect(latest.displayCounts?.totalFilesExact).toBe(false);
+		expect(latest.displayCounts?.linesAdded).toBeUndefined();
+		expect(latest.displayCounts?.linesRemoved).toBeUndefined();
 	});
 	test("TTL removes a ten-minute-old snapshot", async () => {
 		detail("first");

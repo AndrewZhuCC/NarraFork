@@ -44,7 +44,14 @@ describe("invalidateGitStatusPushQueries", () => {
 		const invalidate = spyOn(client, "invalidateQueries");
 		invalidateGitStatusPushQueries(client, "n1", "c1");
 		const keys = invalidate.mock.calls.map((call) => call[0]?.queryKey);
-		for (const prefix of ["gitStatus", "gitModifications", "gitDiff", "gitLog", "gitStashList"]) {
+		for (const prefix of [
+			"gitStatus",
+			"gitLineStats",
+			"gitModifications",
+			"gitDiff",
+			"gitLog",
+			"gitStashList",
+		]) {
 			expect(keys).toContainEqual([prefix, "wk-1"]);
 			expect(keys).toContainEqual([prefix, "c1"]);
 		}

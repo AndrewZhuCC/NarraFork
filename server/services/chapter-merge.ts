@@ -1,9 +1,10 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve } from "node:path";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, reviewConclusions } from "../db/schema";
-import { worktreeLock } from "../lib/async-mutex";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { chapterLock, worktreeLock } from "../lib/async-mutex";
+import { NotFoundError, UnbornHeadError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { requireCompleteMergeTree, requireMarkerResolvableTree } from "../lib/git-tree-merge";
@@ -33,7 +34,12 @@ import { collectMergeContext, mergeSummaryService } from "./merge-summary-servic
 import { startSession } from "./narrator-session";
 import { parkUncommittedWork, reapplyParkedWork, restoreParkedWork } from "./snapshot-dirty-git-op";
 import { terminalService } from "./terminal-service";
-import { isResourceProtectionError, withLegacyRetirement } from "./worktree-lifecycle-guard";
+import {
+	isResourceProtectionError,
+	legacyDeletionTargets,
+	withLegacyRetirement,
+	withLifecycleContext,
+} from "./worktree-lifecycle-guard";
 import { SNAPSHOT_HEAD_REF, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export interface MergeCheckResult {
@@ -171,11 +177,10 @@ async function isUnbornHead(targetWorktree: string): Promise<boolean> {
 /**
  * Read the worktree's *real* git HEAD for a guarded abort.
  *
- * Reuses {@link gitService.getHeadCommit} (bounded `rev-parse HEAD` via `execRead`).
- * That method throws for every non-zero exit, which conflates unborn HEAD with a
- * broken worktree; the secondary probe above separates them. Only an unborn HEAD
- * yields `null`. Any other failure throws — a guard must never interpret "git is
- * broken" as "empty repository, expectedHeadSha null, restore anyway".
+ * {@link gitService.getHeadCommit} throws {@link UnbornHeadError} when the repository
+ * has no commits, and throws when git could not answer. Only the unborn case yields
+ * `null`. Any other failure throws — a guard must never interpret "git is broken" as
+ * "empty repository, expectedHeadSha null, restore anyway".
  */
 async function readRealHeadShaForGuard(targetWorktree: string): Promise<string | null> {
 	try {
@@ -184,6 +189,7 @@ async function readRealHeadShaForGuard(targetWorktree: string): Promise<string |
 		// Resolved to empty: treat as unreadable, not as empty-repo.
 	} catch (err) {
 		if (isResourceProtectionError(err)) throw err;
+		if (err instanceof UnbornHeadError) return null;
 		if (await isUnbornHead(targetWorktree)) return null;
 		throw new ValidationError(
 			`Cannot abort snapshot merge: failed to read HEAD in ${targetWorktree}: ` +
@@ -203,6 +209,43 @@ export interface AiResolveResult {
 }
 
 type ChapterRow = typeof chapters.$inferSelect;
+
+// Only the source's single merge/undo coordinate needs business serialization.
+// The mutable lifetime token prevents inherited fire-and-forget contexts from
+// bypassing chapterLock after the operation that owned it has returned.
+const sourceMergeContext = new AsyncLocalStorage<{ sourceId: string; active: boolean }>();
+
+function holdsSourceMergeLock(sourceId: string): boolean {
+	const held = sourceMergeContext.getStore();
+	return held?.sourceId === sourceId && held.active;
+}
+
+async function withSourceMerge<T>(
+	sourceId: string,
+	body: (source: ChapterRow) => Promise<T>,
+): Promise<T> {
+	return chapterLock.acquire(sourceId, async () => {
+		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceId) });
+		if (!source) throw new NotFoundError("Chapter", sourceId);
+		const held = { sourceId, active: true };
+		try {
+			return await sourceMergeContext.run(held, async () => {
+				if (!source.worktreePath) return body(source);
+				const gitPath = await getProjectGitPath(source.projectId);
+				// Identity only: no deletion targets, claims inventory, or sharing denial.
+				return withLifecycleContext([gitPath, source.worktreePath], () => body(source));
+			});
+		} finally {
+			held.active = false;
+		}
+	});
+}
+
+async function assertSourceStillMergeable(sourceId: string, target: ChapterRow): Promise<void> {
+	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceId) });
+	if (!source) throw new NotFoundError("Chapter", sourceId);
+	assertMergeableChapters(source, target);
+}
 
 export interface RulerAiResolveResult {
 	resolved: boolean;
@@ -694,6 +737,60 @@ async function resolveMergeMode(
 	return "snapshot";
 }
 
+async function withMergeMetadataScope<T>(
+	sourceChapterId: string,
+	body: (scopeWarning?: string) => Promise<T>,
+): Promise<T> {
+	let entered = false;
+	try {
+		return await withLegacyRetirement([sourceChapterId], "merge metadata", () => {
+			entered = true;
+			return body();
+		});
+	} catch (err) {
+		// The merge is already applied. Failure to prepare an optional deletion scope
+		// must not retry its metadata or roll back Git; real errors in body still escape.
+		if (entered || !isResourceProtectionError(err)) throw err;
+		logger.warn("Merge metadata proceeding without optional source cleanup", {
+			sourceChapterId,
+			error: String(err),
+		});
+		return body(
+			`The merge succeeded, but the source worktree was kept because cleanup scope ` +
+				`could not be verified (${String(err)}). Its snapshot history was retained.`,
+		);
+	}
+}
+
+async function cleanUpMergedSourceWorktree(source: ChapterRow): Promise<{ warning?: string }> {
+	if (!source.worktreePath) return {};
+	const worktreePath = source.worktreePath;
+	try {
+		await withLegacyRetirement(
+			[source.id],
+			"merge source cleanup",
+			async () => {
+				const gitPath = await getProjectGitPath(source.projectId);
+				await terminalService.cleanupForChapter(source.id);
+				await gitService.removeWorktree(gitPath, worktreePath);
+			},
+			legacyDeletionTargets(worktreePath, { checkout: true, shadow: false }),
+		);
+		return {};
+	} catch (err) {
+		logger.warn("Keeping source worktree after completed merge", {
+			sourceChapterId: source.id,
+			worktreePath,
+			error: String(err),
+		});
+		return {
+			warning:
+				`The merge succeeded, but the source worktree was kept because cleanup could not ` +
+				`be completed (${String(err)}). Its snapshot history was retained.`,
+		};
+	}
+}
+
 /**
  * Record a completed snapshot merge and retire the source chapter.
  *
@@ -719,103 +816,102 @@ async function markMergedSnapshot(
 	userId?: string,
 	mergeContext?: { commits: string[]; diffStat: string },
 ): Promise<{ warning?: string }> {
-	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
-	const now = new Date().toISOString();
-	let warning: string | undefined;
+	// Capture old chapter-owned narrator bindings before metadata clears worktreePath.
+	// No deletion target is reserved until the optional source cleanup below.
+	return withMergeMetadataScope(sourceChapterId, async (scopeWarning) => {
+		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
+		const now = new Date().toISOString();
+		let warning = scopeWarning;
 
-	await chapterWriteStore.recordChapterSnapshotMerge({
-		sourceChapterId,
-		targetChapterId,
-		strategy,
-		mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
-		preMergeTargetSnapshotSha: snapshot.preMergeTargetSnapshotSha,
-		mergedSourceSnapshotSha: snapshot.mergedSourceSnapshotSha,
-		preMergeTargetSha: snapshot.preMergeTargetSha,
-		now,
-	});
+		await chapterWriteStore.recordChapterSnapshotMerge({
+			sourceChapterId,
+			targetChapterId,
+			strategy,
+			mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
+			preMergeTargetSnapshotSha: snapshot.preMergeTargetSnapshotSha,
+			mergedSourceSnapshotSha: snapshot.mergedSourceSnapshotSha,
+			preMergeTargetSha: snapshot.preMergeTargetSha,
+			now,
+		});
 
-	if (source?.worktreePath) {
-		// The snapshot was already taken while planning the merge; re-verify rather
-		// than assume, because this is the last checkpoint before the bytes go away.
-		const preserved = await worktreeTreeSnapshot
-			.treeOfSnapshot(source.worktreePath, snapshot.mergedSourceSnapshotSha)
-			.catch(() => null);
-		if (!preserved) {
-			warning =
-				"The source worktree was kept because its uncommitted state could not be " +
-				"verified in the snapshot store. Remove it manually once you have checked it.";
-			logger.warn("Keeping source worktree after merge: snapshot not verifiable", {
-				sourceChapterId,
-				worktreePath: source.worktreePath,
-			});
-			// Leave worktreePath null in the DB but keep the directory: the chapter is
-			// merged, and an orphan directory is recoverable while deleted bytes are not.
-		} else {
+		if (source?.worktreePath && !scopeWarning) {
+			// The snapshot was already taken while planning the merge; re-verify rather
+			// than assume, because this is the last checkpoint before the bytes go away.
+			const preserved = await worktreeTreeSnapshot
+				.treeOfSnapshot(source.worktreePath, snapshot.mergedSourceSnapshotSha)
+				.catch(() => null);
+			if (!preserved) {
+				warning =
+					"The source worktree was kept because its uncommitted state could not be " +
+					"verified in the snapshot store. Remove it manually once you have checked it.";
+				logger.warn("Keeping source worktree after merge: snapshot not verifiable", {
+					sourceChapterId,
+					worktreePath: source.worktreePath,
+				});
+				// Leave worktreePath null in the DB but keep the directory: the chapter is
+				// merged, and an orphan directory is recoverable while deleted bytes are not.
+			} else {
+				({ warning } = await cleanUpMergedSourceWorktree(source));
+			}
+		}
+
+		if (source) {
 			try {
-				const gitPath = await getProjectGitPath(source.projectId);
-				await terminalService.cleanupForChapter(sourceChapterId);
-				await gitService.removeWorktree(gitPath, source.worktreePath);
+				await chapterEdgeService.createMergeEdge(
+					source.projectId,
+					sourceChapterId,
+					targetChapterId,
+					{
+						strategy: strategy as string,
+						status: "completed",
+						mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
+					},
+				);
 			} catch (err) {
 				if (isResourceProtectionError(err)) throw err;
-				logger.warn("Failed to clean up source worktree after snapshot merge", {
+				logger.error("Failed to create merge edge after snapshot merge (non-fatal)", {
 					sourceChapterId,
+					targetChapterId,
 					error: String(err),
 				});
 			}
 		}
-	}
 
-	if (source) {
-		try {
-			await chapterEdgeService.createMergeEdge(source.projectId, sourceChapterId, targetChapterId, {
-				strategy: strategy as string,
-				status: "completed",
-				mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
-			});
-		} catch (err) {
-			if (isResourceProtectionError(err)) throw err;
-			logger.error("Failed to create merge edge after snapshot merge (non-fatal)", {
+		logger.info("Chapter merged without a commit", {
+			sourceId: sourceChapterId,
+			targetId: targetChapterId,
+			strategy,
+			mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
+		});
+
+		eventBus.emit({
+			type: "chapter:merged",
+			sourceId: sourceChapterId,
+			targetId: targetChapterId,
+			userId,
+		});
+
+		// Fire-and-forget, as the commit path does. No commit sha exists, so the summary
+		// card records the merge without one; its `commitSha` field is already nullable.
+		void mergeSummaryService
+			.generateAndInject({
 				sourceChapterId,
 				targetChapterId,
-				error: String(err),
-			});
-		}
-	}
+				strategy,
+				userId,
+				// commitSha is deliberately omitted: there is no git commit to name.
+				preCollectedCommits: mergeContext?.commits,
+				preCollectedDiffStat: mergeContext?.diffStat,
+			})
+			.catch((err) =>
+				logger.warn("Failed to inject merge summary after snapshot merge (non-fatal)", {
+					sourceChapterId,
+					error: String(err),
+				}),
+			);
 
-	logger.info("Chapter merged without a commit", {
-		sourceId: sourceChapterId,
-		targetId: targetChapterId,
-		strategy,
-		mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
+		return warning ? { warning } : {};
 	});
-
-	eventBus.emit({
-		type: "chapter:merged",
-		sourceId: sourceChapterId,
-		targetId: targetChapterId,
-		userId,
-	});
-
-	// Fire-and-forget, as the commit path does. No commit sha exists, so the summary
-	// card records the merge without one; its `commitSha` field is already nullable.
-	void mergeSummaryService
-		.generateAndInject({
-			sourceChapterId,
-			targetChapterId,
-			strategy,
-			userId,
-			// commitSha is deliberately omitted: there is no git commit to name.
-			preCollectedCommits: mergeContext?.commits,
-			preCollectedDiffStat: mergeContext?.diffStat,
-		})
-		.catch((err) =>
-			logger.warn("Failed to inject merge summary after snapshot merge (non-fatal)", {
-				sourceChapterId,
-				error: String(err),
-			}),
-		);
-
-	return warning ? { warning } : {};
 }
 
 export const chapterMerge = {
@@ -933,6 +1029,12 @@ export const chapterMerge = {
 		message: string,
 		userId?: string,
 	): Promise<MergeResult> {
+		if (!holdsSourceMergeLock(source.id)) {
+			return withSourceMerge(source.id, (freshSource) =>
+				this.mergeViaSnapshot(freshSource, target, strategy, message, userId),
+			);
+		}
+		assertMergeableChapters(source, target);
 		const targetWorktree = target.worktreePath;
 		if (!targetWorktree) throw new ValidationError("Target chapter has no worktree");
 		const gitPath = await getProjectGitPath(source.projectId);
@@ -950,6 +1052,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			// Recorded even though snapshot mode does not use it to undo: it keeps
 			// `preMergeTargetSha` meaning "the target's HEAD before this merge" in both
 			// modes, which several readers rely on.
@@ -984,6 +1087,9 @@ export const chapterMerge = {
 		input: MergeChapterInput,
 		userId?: string,
 	): Promise<MergeResult> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () => this.merge(sourceChapterId, input, userId));
+		}
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
 		});
@@ -1040,6 +1146,7 @@ export const chapterMerge = {
 		// window where another operation could modify the target between the
 		// SHA read and the actual merge.
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			await assertTargetOnItsBranch(target, targetWorktree);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			let result: MergeResult;
@@ -1116,7 +1223,7 @@ export const chapterMerge = {
 			if (result.success) {
 				// Git succeeded — persist to DB with retry on failure
 				try {
-					await this.markMerged(
+					const cleanup = await this.markMerged(
 						sourceChapterId,
 						input.targetChapterId,
 						strategy,
@@ -1125,6 +1232,9 @@ export const chapterMerge = {
 						mergeContext,
 						preMergeTargetSha,
 					);
+					if (cleanup.warning) {
+						result.warning = [result.warning, cleanup.warning].filter(Boolean).join(" ");
+					}
 				} catch (dbErr) {
 					logger.error("Failed to mark chapter as merged after successful git merge, retrying", {
 						sourceChapterId,
@@ -1133,7 +1243,7 @@ export const chapterMerge = {
 						error: String(dbErr),
 					});
 					try {
-						await this.markMerged(
+						const cleanup = await this.markMerged(
 							sourceChapterId,
 							input.targetChapterId,
 							strategy,
@@ -1142,6 +1252,9 @@ export const chapterMerge = {
 							mergeContext,
 							preMergeTargetSha,
 						);
+						if (cleanup.warning) {
+							result.warning = [result.warning, cleanup.warning].filter(Boolean).join(" ");
+						}
 					} catch (retryErr) {
 						// DB update failed twice. Undoing the git merge keeps git and the DB
 						// consistent, but `reset --hard` is not a rollback in general — it
@@ -1283,6 +1396,12 @@ export const chapterMerge = {
 		locale: Locale,
 		userId?: string,
 	): Promise<InteractiveMergeResult> {
+		if (!holdsSourceMergeLock(source.id)) {
+			return withSourceMerge(source.id, (freshSource) =>
+				this.startInteractiveSnapshotMerge(freshSource, target, strategy, message, locale, userId),
+			);
+		}
+		assertMergeableChapters(source, target);
 		const targetWorktree = target.worktreePath;
 		if (!targetWorktree) throw new ValidationError("Target chapter has no worktree");
 		const gitPath = await getProjectGitPath(source.projectId);
@@ -1291,6 +1410,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const plan = await planSnapshotMerge(source, target);
 			requireCompleteMergeTree(plan);
@@ -1363,6 +1483,19 @@ export const chapterMerge = {
 		state: InteractiveSnapshotState,
 		userId?: string,
 	): Promise<AiResolveResult> {
+		if (!holdsSourceMergeLock(source.id)) {
+			return withSourceMerge(source.id, (freshSource) =>
+				this.completeInteractiveSnapshotMerge(
+					freshSource,
+					target,
+					strategy,
+					message,
+					state,
+					userId,
+				),
+			);
+		}
+		assertMergeableChapters(source, target);
 		const targetWorktree = target.worktreePath;
 		if (!targetWorktree) throw new ValidationError("Target chapter has no worktree");
 		const gitPath = await getProjectGitPath(source.projectId);
@@ -1371,6 +1504,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			await revalidateSnapshotConflictPlan(source, target, {
 				targetSnapshot: state.targetSnapshot,
 				sourceSnapshot: state.sourceSnapshot,
@@ -1500,6 +1634,11 @@ export const chapterMerge = {
 		locale: Locale = "en",
 		userId?: string,
 	): Promise<InteractiveMergeResult> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () =>
+				this.startInteractiveConflictMerge(sourceChapterId, input, locale, userId),
+			);
+		}
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
 		});
@@ -1549,6 +1688,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			await assertTargetOnItsBranch(target, targetWorktree);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
@@ -1564,7 +1704,11 @@ export const chapterMerge = {
 					mergeContext,
 					preMergeTargetSha,
 				);
-				return { success: true, commitSha: resolved.mergeResult?.commitSha };
+				return {
+					success: true,
+					commitSha: resolved.mergeResult?.commitSha,
+					...(resolved.mergeResult?.warning ? { warning: resolved.mergeResult.warning } : {}),
+				};
 			}
 
 			const conflictFiles = mergeResult.conflictFiles;
@@ -1620,6 +1764,11 @@ export const chapterMerge = {
 		input: MergeChapterInput,
 		userId?: string,
 	): Promise<AiResolveResult> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () =>
+				this.completeInteractiveConflictMerge(sourceChapterId, input, userId),
+			);
+		}
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
 		});
@@ -1649,6 +1798,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			const remainingFiles = await gitService.getConflictFiles(targetWorktree);
 			if (remainingFiles.length > 0) {
 				return {
@@ -1719,6 +1869,12 @@ export const chapterMerge = {
 		locale: Locale,
 		userId?: string,
 	): Promise<AiResolveResult> {
+		if (!holdsSourceMergeLock(source.id)) {
+			return withSourceMerge(source.id, (freshSource) =>
+				this.aiResolveViaSnapshot(freshSource, target, strategy, message, locale, userId),
+			);
+		}
+		assertMergeableChapters(source, target);
 		const targetWorktree = target.worktreePath;
 		if (!targetWorktree) throw new ValidationError("Target chapter has no worktree");
 		const primaryNarrator = await db.query.narrators.findFirst({
@@ -1733,6 +1889,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const plan = await planSnapshotMerge(source, target);
 			requireCompleteMergeTree(plan);
@@ -1833,6 +1990,11 @@ export const chapterMerge = {
 		locale: Locale = "en",
 		userId?: string,
 	): Promise<AiResolveResult> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () =>
+				this.aiResolveConflicts(sourceChapterId, input, locale, userId),
+			);
+		}
 		const source = await db.query.chapters.findFirst({
 			where: eq(chapters.id, sourceChapterId),
 		});
@@ -1848,18 +2010,9 @@ export const chapterMerge = {
 		if (source.projectId !== target.projectId) {
 			throw new ValidationError("Cannot merge chapters from different projects");
 		}
-		// Only the root guard from `assertMergeableChapters`, not its status rules: this
-		// entry point deliberately never had them (it is reached from a retry after a
-		// conflict, where the source's status has already been decided) and imposing them
-		// now would refuse resolutions that work today. The root guard is different in
-		// kind — it prevents a state no later operation can repair, so it applies wherever
-		// a source can end up retired. See `assertMergeableChapters`.
-		if (source.isRoot) {
-			throw new ValidationError(
-				"The root chapter cannot be merged into another chapter: it owns the project's " +
-					"main working tree, which cannot be retired. Merge the other way round instead.",
-			);
-		}
+		// Conflict retries still need an unmerged source: its undo coordinates can
+		// describe only one completed target, even through a different entry point.
+		assertMergeableChapters(source, target);
 
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, input.targetChapterId), eq(narrators.variant, "primary")),
@@ -1903,6 +2056,7 @@ export const chapterMerge = {
 		// Lock the target worktree for the entire AI resolution.
 		// preMergeTargetSha is captured inside the lock (same rationale as merge()).
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await assertSourceStillMergeable(source.id, target);
 			if (strategy !== "cherry-pick") await assertTargetOnItsBranch(target, targetWorktree);
 			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			/**
@@ -2039,126 +2193,141 @@ export const chapterMerge = {
 		userId?: string,
 		mergeContext?: { commits: string[]; diffStat: string },
 		preMergeTargetSha?: string,
-	): Promise<void> {
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
-		const now = new Date().toISOString();
-
-		// Update DB FIRST — if this fails the worktree is still intact and the
-		// chapter remains active, so the user doesn't lose their working directory.
-		//
-		// The snapshot-merge fields are cleared by the store in the same statement:
-		// this merge produced a real git commit, so any snapshot coordinate on the row
-		// belongs to an earlier commit-free merge that has since been undone. Leaving
-		// it would route this merge's unmerge down the snapshot path — with a base and
-		// a pre-merge tree from a merge that no longer exists — and reverse a merge
-		// that never happened over the target's current work. The paths a chapter can
-		// take here (merge → unmerge → merge in the other mode) make this reachable,
-		// not theoretical.
-		await chapterWriteStore.recordChapterMerge({
-			sourceChapterId,
-			targetChapterId,
-			strategy,
-			mergeCommitSha: commitSha ?? null,
-			preMergeTargetSha: preMergeTargetSha ?? null,
-			now,
-		});
-
-		// Clean up source chapter's worktree AFTER DB update — merged chapters
-		// don't need one.  Failure here is non-fatal: the worktree is orphaned
-		// but the DB state is already consistent.
-		if (source?.worktreePath) {
-			try {
-				const gitPath = await getProjectGitPath(source.projectId);
-				await terminalService.cleanupForChapter(sourceChapterId);
-				await gitService.removeWorktree(gitPath, source.worktreePath);
-			} catch (err) {
-				if (isResourceProtectionError(err)) throw err;
-				logger.warn("Failed to clean up source worktree after merge", {
-					sourceChapterId,
-					error: String(err),
-				});
-			}
-		}
-
-		// Create merge edge in chapter_edges
-		if (source) {
-			try {
-				await chapterEdgeService.createMergeEdge(
-					source.projectId,
+	): Promise<{ warning?: string }> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () =>
+				this.markMerged(
 					sourceChapterId,
 					targetChapterId,
-					{
-						mergeCommitSha: commitSha,
-						strategy: strategy as string,
-						status: "completed",
-					},
-				);
-			} catch (err) {
-				if (isResourceProtectionError(err)) throw err;
-				// Edge is auxiliary data — log but don't fail the merge operation,
-				// otherwise the retry path in merge() could create duplicate edges.
-				logger.error("Failed to create merge edge (non-fatal)", {
-					sourceChapterId,
-					targetChapterId,
-					error: String(err),
-				});
-			}
-		}
-
-		logger.info("Chapter merged", {
-			sourceId: sourceChapterId,
-			targetId: targetChapterId,
-			strategy,
-			commitSha,
-		});
-
-		// Record merge commit in the target chapter
-		if (commitSha) {
-			try {
-				// TODO: use the actual git commit message instead of this synthetic one
-				await commitSyncService.recordCommit({
-					chapterId: targetChapterId,
-					sha: commitSha,
-					message: `Merge ${source?.branch ?? sourceChapterId} (${strategy})`,
-					source: strategy === "cherry-pick" ? "cherry_pick" : "merge",
-				});
-			} catch (err) {
-				if (isResourceProtectionError(err)) throw err;
-				logger.warn("Failed to record merge commit (non-fatal)", {
-					targetChapterId,
+					strategy,
 					commitSha,
-					error: String(err),
-				});
-			}
+					userId,
+					mergeContext,
+					preMergeTargetSha,
+				),
+			);
 		}
+		// Identity-only metadata scope remembers legacy bindings without reserving deletion.
+		return withMergeMetadataScope(sourceChapterId, async (scopeWarning) => {
+			const source = await db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			});
+			if (
+				source?.status === "merged" &&
+				(source.mergedIntoChapterId !== targetChapterId ||
+					source.mergeCommitSha !== (commitSha ?? null) ||
+					source.preMergeTargetSha !== (preMergeTargetSha ?? null))
+			) {
+				throw new ValidationError("Source chapter already has different merge coordinates");
+			}
+			const now = new Date().toISOString();
 
-		eventBus.emit({
-			type: "chapter:merged",
-			sourceId: sourceChapterId,
-			targetId: targetChapterId,
-			userId,
-		});
-
-		// Fire-and-forget: generate merge summary asynchronously
-		mergeSummaryService
-			.generateAndInject({
+			// Update DB FIRST — if this fails the worktree is still intact and the
+			// chapter remains active, so the user doesn't lose their working directory.
+			//
+			// The snapshot-merge fields are cleared by the store in the same statement:
+			// this merge produced a real git commit, so any snapshot coordinate on the row
+			// belongs to an earlier commit-free merge that has since been undone. Leaving
+			// it would route this merge's unmerge down the snapshot path — with a base and
+			// a pre-merge tree from a merge that no longer exists — and reverse a merge
+			// that never happened over the target's current work. The paths a chapter can
+			// take here (merge → unmerge → merge in the other mode) make this reachable,
+			// not theoretical.
+			await chapterWriteStore.recordChapterMerge({
 				sourceChapterId,
 				targetChapterId,
-				userId,
+				strategy,
+				mergeCommitSha: commitSha ?? null,
+				preMergeTargetSha: preMergeTargetSha ?? null,
+				now,
+			});
+
+			// Optional cleanup cannot turn a completed merge into a retry or rollback.
+			const cleanup = scopeWarning
+				? { warning: scopeWarning }
+				: source
+					? await cleanUpMergedSourceWorktree(source)
+					: {};
+
+			// Create merge edge in chapter_edges
+			if (source) {
+				try {
+					await chapterEdgeService.createMergeEdge(
+						source.projectId,
+						sourceChapterId,
+						targetChapterId,
+						{
+							mergeCommitSha: commitSha,
+							strategy: strategy as string,
+							status: "completed",
+						},
+					);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					// Edge is auxiliary data — log but don't fail the merge operation,
+					// otherwise the retry path in merge() could create duplicate edges.
+					logger.error("Failed to create merge edge (non-fatal)", {
+						sourceChapterId,
+						targetChapterId,
+						error: String(err),
+					});
+				}
+			}
+
+			logger.info("Chapter merged", {
+				sourceId: sourceChapterId,
+				targetId: targetChapterId,
 				strategy,
 				commitSha,
-				preCollectedCommits: mergeContext?.commits,
-				preCollectedDiffStat: mergeContext?.diffStat,
-			})
-			.catch((err) => {
-				logger.error("Merge summary fire-and-forget failed", {
+			});
+
+			// Record merge commit in the target chapter
+			if (commitSha) {
+				try {
+					// TODO: use the actual git commit message instead of this synthetic one
+					await commitSyncService.recordCommit({
+						chapterId: targetChapterId,
+						sha: commitSha,
+						message: `Merge ${source?.branch ?? sourceChapterId} (${strategy})`,
+						source: strategy === "cherry-pick" ? "cherry_pick" : "merge",
+					});
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to record merge commit (non-fatal)", {
+						targetChapterId,
+						commitSha,
+						error: String(err),
+					});
+				}
+			}
+
+			eventBus.emit({
+				type: "chapter:merged",
+				sourceId: sourceChapterId,
+				targetId: targetChapterId,
+				userId,
+			});
+
+			// Fire-and-forget: generate merge summary asynchronously
+			mergeSummaryService
+				.generateAndInject({
 					sourceChapterId,
 					targetChapterId,
-					error: err instanceof Error ? err.message : String(err),
+					userId,
+					strategy,
+					commitSha,
+					preCollectedCommits: mergeContext?.commits,
+					preCollectedDiffStat: mergeContext?.diffStat,
+				})
+				.catch((err) => {
+					logger.error("Merge summary fire-and-forget failed", {
+						sourceChapterId,
+						targetChapterId,
+						error: err instanceof Error ? err.message : String(err),
+					});
 				});
-			});
+			return cleanup;
+		});
 	},
 
 	async markMergedResult(
@@ -2170,7 +2339,7 @@ export const chapterMerge = {
 		mergeContext?: { commits: string[]; diffStat: string },
 		preMergeTargetSha?: string,
 	): Promise<AiResolveResult> {
-		await this.markMerged(
+		const cleanup = await this.markMerged(
 			sourceChapterId,
 			targetChapterId,
 			strategy,
@@ -2179,7 +2348,7 @@ export const chapterMerge = {
 			mergeContext,
 			preMergeTargetSha,
 		);
-		return { resolved: true, mergeResult: { success: true, commitSha } };
+		return { resolved: true, mergeResult: { success: true, commitSha, ...cleanup } };
 	},
 
 	/**
@@ -2334,9 +2503,14 @@ export const chapterMerge = {
 				now,
 			});
 		} catch (dbErr) {
-			// Clean up orphan worktree on DB failure
+			// Clean up only the checkout created by this failed unmerge.
 			try {
-				await gitService.removeWorktree(gitPath, worktreePath);
+				await withLegacyRetirement(
+					[sourceChapterId],
+					"unmerge failure cleanup",
+					() => gitService.removeWorktree(gitPath, worktreePath),
+					legacyDeletionTargets(worktreePath, { checkout: true, shadow: false }),
+				);
 			} catch {
 				// best effort
 			}
@@ -2488,7 +2662,12 @@ export const chapterMerge = {
 			});
 		} catch (dbErr) {
 			try {
-				await gitService.removeWorktree(gitPath, worktreePath);
+				await withLegacyRetirement(
+					[source.id],
+					"snapshot unmerge failure cleanup",
+					() => gitService.removeWorktree(gitPath, worktreePath),
+					legacyDeletionTargets(worktreePath, { checkout: true, shadow: false }),
+				);
 			} catch {
 				// best effort
 			}
@@ -2551,6 +2730,11 @@ export const chapterMerge = {
 			userId?: string;
 		},
 	): Promise<RulerAiResolveResult> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () =>
+				this.rulerAiResolve(sourceChapterId, targetChapterId, options),
+			);
+		}
 		const { chapterFork } = await import("./chapter-fork");
 		const { chapterService } = await import("./chapter-service");
 		const { narratorService } = await import("./narrator-service");
@@ -2734,6 +2918,22 @@ export const chapterMerge = {
 		gitPath: string,
 		chapterService: { remove: (id: string) => Promise<unknown> },
 	): Promise<RulerAiResolveResult> {
+		if (!holdsSourceMergeLock(sourceChapterId)) {
+			return withSourceMerge(sourceChapterId, () =>
+				this.finalizeTempMerge(
+					sourceChapterId,
+					targetChapterId,
+					tempChapter,
+					strategy,
+					message,
+					_commitSha,
+					userId,
+					mergeContext,
+					gitPath,
+					chapterService,
+				),
+			);
+		}
 		const target = await db.query.chapters.findFirst({
 			where: eq(chapters.id, targetChapterId),
 		});
@@ -2741,6 +2941,7 @@ export const chapterMerge = {
 			return { resolved: false, error: "Target chapter lost worktree during resolve" };
 		}
 
+		await assertSourceStillMergeable(sourceChapterId, target);
 		// Capture target HEAD right before the merge — this is the most
 		// accurate point for unmerge since AI resolution may have taken a while.
 		const preMergeTargetSha = (await gitService.getHeadCommit(target.worktreePath)).trim();
@@ -2763,7 +2964,7 @@ export const chapterMerge = {
 		}
 
 		// Mark source chapter as merged
-		await this.markMerged(
+		const cleanup = await this.markMerged(
 			sourceChapterId,
 			targetChapterId,
 			strategy,
@@ -2778,7 +2979,12 @@ export const chapterMerge = {
 			await chapterService.remove(tempChapter.id);
 			await gitService.deleteBranch(gitPath, tempChapter.branch).catch(() => {});
 		} catch (err) {
-			if (isResourceProtectionError(err)) throw err;
+			cleanup.warning = [
+				cleanup.warning,
+				`The merge succeeded, but temporary chapter ${tempChapter.id} was kept (${String(err)}).`,
+			]
+				.filter(Boolean)
+				.join(" ");
 			logger.warn("Failed to clean up temporary chapter after ruler AI resolve", {
 				tempChapterId: tempChapter.id,
 				error: String(err),
@@ -2787,66 +2993,10 @@ export const chapterMerge = {
 
 		return {
 			resolved: true,
-			mergeResult: { success: true, commitSha: trunkMerge.commitSha },
+			mergeResult: { success: true, commitSha: trunkMerge.commitSha, ...cleanup },
 		};
 	},
 };
-
-// Source retirement is reserved BEFORE commits, target mutations or terminal cleanup.
-// Nested finalization reuses the service-derived scope rather than reacquiring a mutex.
-function protectSource<Args extends unknown[], Result>(
-	method: (...args: Args) => Promise<Result>,
-	sourceId: (...args: Args) => string,
-): (...args: Args) => Promise<Result> {
-	return (...args) =>
-		withLegacyRetirement([sourceId(...args)], "merge source retirement", () => method(...args));
-}
-chapterMerge.merge = protectSource(chapterMerge.merge.bind(chapterMerge), (id) => id);
-chapterMerge.mergeViaSnapshot = protectSource(
-	chapterMerge.mergeViaSnapshot.bind(chapterMerge),
-	(source) => source.id,
-);
-chapterMerge.startInteractiveSnapshotMerge = protectSource(
-	chapterMerge.startInteractiveSnapshotMerge.bind(chapterMerge),
-	(source) => source.id,
-);
-chapterMerge.completeInteractiveSnapshotMerge = protectSource(
-	chapterMerge.completeInteractiveSnapshotMerge.bind(chapterMerge),
-	(source) => source.id,
-);
-chapterMerge.completeInteractiveSnapshotMergeById = protectSource(
-	chapterMerge.completeInteractiveSnapshotMergeById.bind(chapterMerge),
-	(id) => id,
-);
-chapterMerge.startInteractiveConflictMerge = protectSource(
-	chapterMerge.startInteractiveConflictMerge.bind(chapterMerge),
-	(id) => id,
-);
-chapterMerge.completeInteractiveConflictMerge = protectSource(
-	chapterMerge.completeInteractiveConflictMerge.bind(chapterMerge),
-	(id) => id,
-);
-chapterMerge.aiResolveViaSnapshot = protectSource(
-	chapterMerge.aiResolveViaSnapshot.bind(chapterMerge),
-	(source) => source.id,
-);
-chapterMerge.aiResolveConflicts = protectSource(
-	chapterMerge.aiResolveConflicts.bind(chapterMerge),
-	(id) => id,
-);
-chapterMerge.markMerged = protectSource(chapterMerge.markMerged.bind(chapterMerge), (id) => id);
-chapterMerge.markMergedResult = protectSource(
-	chapterMerge.markMergedResult.bind(chapterMerge),
-	(id) => id,
-);
-chapterMerge.rulerAiResolve = protectSource(
-	chapterMerge.rulerAiResolve.bind(chapterMerge),
-	(id) => id,
-);
-chapterMerge.finalizeTempMerge = protectSource(
-	chapterMerge.finalizeTempMerge.bind(chapterMerge),
-	(id) => id,
-);
 
 function buildConflictResolutionPrompt(
 	conflictFiles: string[],

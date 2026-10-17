@@ -59,6 +59,8 @@ const SECRET_HOME_FILES: readonly string[] = [
 const PRIVATE_RECORDING_DIRS: readonly string[] = [
 	REQUEST_RECORDING_DIR,
 	REQUEST_RECORDING_SAVED_DIR,
+	// Cross-user maintenance snapshots and repair plans are administrator-only.
+	"token-repair-jobs",
 ];
 
 /** Private protocol state must not be exposed or rewritten through generic file APIs.

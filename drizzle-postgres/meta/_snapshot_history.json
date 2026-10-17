@@ -152,6 +152,38 @@
 			"prevId": "589f163a-9f46-4c42-9b4f-7421ec507a16",
 			"version": "7",
 			"snapshotDigest": "3cdb7aad98c67d8abcecfb9fda4f0102cb1dda7d3374719a7eaee0c519732ffe"
+		},
+		{
+			"idx": 19,
+			"tag": "0019_resource_protection",
+			"id": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
+			"prevId": "6be48d6e-f317-4a20-a682-9ef0d5f5fba5",
+			"version": "7",
+			"snapshotDigest": "1c2b7c90348a965d5a92acb2a76160e89172db410126889d3b19fcc33df79510"
+		},
+		{
+			"idx": 20,
+			"tag": "0020_history_token_repair_bulk",
+			"id": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+			"prevId": "55c3fdfb-ac05-4e54-b90c-674a1af03d6e",
+			"version": "7",
+			"snapshotDigest": "7cf8740acee4caea396d53dfaa786cb7d29552068ea4fd1674a5f34eac764ae6"
+		},
+		{
+			"idx": 21,
+			"tag": "0021_rich_composer_document",
+			"id": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
+			"prevId": "2f01cac8-80a6-438d-ade2-c770cfeeca91",
+			"version": "7",
+			"snapshotDigest": "3c80d720f39991d0d854ae8fb218d53dcd253d49bd4aa9c3a655536cb487d123"
+		},
+		{
+			"idx": 22,
+			"tag": "0022_context_numeric_stats",
+			"id": "3fc16cee-d009-4621-8ff8-75080ec7d211",
+			"prevId": "601247a6-8086-4a01-a8ac-19ff5eb9aaa4",
+			"version": "7",
+			"snapshotDigest": "0f56b1fc448b5bc0a187faa9e0649ca59003698b49141c0b733242eaeed2cc9c"
 		}
 	]
 }

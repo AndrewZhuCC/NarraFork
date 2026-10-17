@@ -38,23 +38,21 @@ export const tokenRepairProtocolOverridesSchema = z
 	);
 export const tokenRepairStartSchema = z
 	.object({
-		includeReviewed: z.boolean().default(false),
-		protocolOverrides: tokenRepairProtocolOverridesSchema.default([]),
-		sourceJobId: tokenRepairIdSchema.optional(),
+		// A full v2 scan includes legacy reviewed rows; choices are made after scanning.
+		includeReviewed: z.literal(true).default(true),
 	})
-	.strict()
-	.refine(
-		(input) => !input.sourceJobId || input.includeReviewed,
-		"Source-batch reanalysis must include reviewed records",
-	);
+	.strict();
 export const tokenRepairApplySchema = z
 	.object({
-		candidateIds: z
-			.array(tokenRepairIdSchema)
-			.min(1)
-			.max(50)
-			.refine((ids) => new Set(ids).size === ids.length, "Duplicate candidate IDs"),
+		previewVersion: tokenRepairIdSchema,
 		confirm: z.literal(true),
 	})
 	.strict();
-export const tokenRepairPageSchema = z.object({ cursor: tokenRepairIdSchema.optional() }).strict();
+
+export const tokenRepairDryRunSchema = z
+	.object({ protocolOverrides: tokenRepairProtocolOverridesSchema.default([]) })
+	.strict();
+// Model cursors are opaque identities, not request IDs (they may contain JSON punctuation).
+export const tokenRepairPageSchema = z
+	.object({ cursor: z.string().min(1).max(2048).optional() })
+	.strict();

@@ -428,6 +428,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
 	[
+		"server/services/usage-token-repair-scratch.ts",
+		"private local maintenance scratch file; deliberately SQLite even with a PostgreSQL source database",
+	],
+	[
 		"server/services/file-change-physical-audit-worker.ts",
 		"SQLite-side physical audit in a worker",
 	],
@@ -464,6 +468,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `getDbPath` (the PG branch acquires the same instance lock at the same path — the lock
 	// guards local resources, not the database file). Neither opens a SQLite connection.
 	"server/db/index.ts": ["drizzleDialect", "driver", "connectionModule"],
+	"server/db/resource-protection-index.ts": ["driver"],
+	"server/services/resource-protection-index.ts": ["driver", "handle"],
 	"server/db/integrity-check.ts": ["connectionModule", "sqliteCli"],
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
@@ -503,6 +509,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	// The injected occupancy source currently uses the SQLite builder; the maintained
+	// graph is backend-neutral, so this is not a permanently SQLite-only module.
+	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays
@@ -536,7 +545,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
-	"server/services/narrator-persistence.ts": ["handle", "json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],
@@ -555,6 +564,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// Explicit SQLite branch of the dual-backend, off-thread historical accounting store.
 	"server/services/usage-token-repair-store.ts": ["driver", "pragma", "indexHint"],
+	"server/services/usage-token-repair-scratch.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
 	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
@@ -624,7 +634,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/file-change-diagnostics.ts": ["errorCode"],
 	"server/services/file-change-namespace-reset.ts": ["rowid"],
 	"server/services/local-session-detach/store.ts": ["driver"],
-	"server/services/narrator-context-composition.ts": ["driver", "handle", "json1"],
+	"server/services/narrator-context-composition.ts": ["driver", "handle"],
 	"server/services/narrator-permission.ts": ["json1"],
 	"server/services/narrator-question-history.ts": [
 		"driver",
@@ -633,7 +643,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/narrator-worktree-resources.ts": ["json1"],
 	"server/services/project-archive/legacy-import-worker.ts": [
 		"driver",
 		"connectionModule",

@@ -1,15 +1,21 @@
+import { type ComposerDocument, readComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorDrafts } from "../db/schema";
 import { copyFileReference } from "../lib/agent/file-reference-projection";
 import { narratorDraftLock } from "../lib/async-mutex";
+import {
+	parseOptionalComposerDocument,
+	validateComposerProjection,
+} from "../lib/composer-document";
 import { generateId } from "../lib/id";
 
 export interface NarratorDraftState {
 	hasDraft: boolean;
 	text: string;
 	fileReferences: FileReference[];
+	composerDocument?: ComposerDocument;
 	revision: number;
 	updatedAt: string | null;
 	updatedBy: string | null;
@@ -44,6 +50,7 @@ function rowToDraftState(
 		| {
 				text: string;
 				fileReferencesJson?: string | null;
+				composerDocument?: ComposerDocument | null;
 				revision: number;
 				updatedAt: string;
 				sourceId: string | null;
@@ -55,10 +62,12 @@ function rowToDraftState(
 	const fileReferences: FileReference[] = row.fileReferencesJson
 		? (JSON.parse(row.fileReferencesJson) as FileReference[]).map(copyFileReference)
 		: [];
+	const composerDocument = readComposerDocument(row.composerDocument);
 	return {
-		hasDraft: !!row.text.trim() || fileReferences.length > 0,
+		hasDraft: !!row.text.trim() || fileReferences.length > 0 || !!composerDocument?.assets.length,
 		text: row.text,
 		fileReferences,
+		composerDocument,
 		revision: row.revision,
 		updatedAt: row.updatedAt,
 		updatedBy: userId,
@@ -95,6 +104,7 @@ export function retainMatchingDraftFileReferences(
 const draftColumns = {
 	text: narratorDrafts.text,
 	fileReferencesJson: narratorDrafts.fileReferencesJson,
+	composerDocument: narratorDrafts.composerDocument,
 	revision: narratorDrafts.revision,
 	updatedAt: narratorDrafts.updatedAt,
 	sourceId: narratorDrafts.sourceId,
@@ -120,7 +130,7 @@ export async function getNarratorDraftMetadata(
 	const row = await db
 		.select({
 			hasDraft: sql<number>`CASE WHEN length(trim(${narratorDrafts.text})) > 0 OR
-			(${narratorDrafts.fileReferencesJson} IS NOT NULL AND ${narratorDrafts.fileReferencesJson} <> '[]') THEN 1 ELSE 0 END`,
+			(${narratorDrafts.fileReferencesJson} IS NOT NULL AND ${narratorDrafts.fileReferencesJson} <> '[]') OR ${narratorDrafts.composerDocument} IS NOT NULL THEN 1 ELSE 0 END`,
 			revision: narratorDrafts.revision,
 			updatedAt: narratorDrafts.updatedAt,
 		})
@@ -141,7 +151,10 @@ export async function updateNarratorDraft(
 	sourceId?: string,
 	baseRevision?: number,
 	fileReferences?: FileReference[],
+	composerDocument?: ComposerDocument,
 ): Promise<NarratorDraftUpdateResult> {
+	composerDocument = parseOptionalComposerDocument(composerDocument);
+	validateComposerProjection(composerDocument, text, fileReferences);
 	// Capture metadata before awaiting the lock: text and references are one CAS value.
 	const suppliedReferences = fileReferences?.map(copyFileReference);
 	return narratorDraftLock.acquire(`${userId.length}:${userId}:${narratorId}`, async () => {
@@ -157,7 +170,7 @@ export async function updateNarratorDraft(
 		}
 
 		const now = new Date().toISOString();
-		const storedText = text.trim() ? text : "";
+		const storedText = text.trim() || composerDocument?.assets.length ? text : "";
 		const storedReferences =
 			suppliedReferences ??
 			retainMatchingDraftFileReferences(current.text, storedText, current.fileReferences);
@@ -165,9 +178,14 @@ export async function updateNarratorDraft(
 		// Omission keeps the previous source attribution for legacy autosave clients.
 		const storedSourceId = sourceId ?? current.sourceId ?? null;
 		const nextRevision = current.revision + 1;
+		const storedComposerDocument =
+			storedText.trim() || storedReferences.length || composerDocument?.assets.length
+				? composerDocument
+				: undefined;
 		const fields = {
 			text: storedText,
 			fileReferencesJson,
+			composerDocument: storedComposerDocument ?? null,
 			sourceId: storedSourceId,
 			revision: nextRevision,
 			updatedAt: now,
@@ -182,9 +200,13 @@ export async function updateNarratorDraft(
 
 		return {
 			previousHasDraft: current.hasDraft,
-			hasDraft: !!storedText || storedReferences.length > 0,
+			hasDraft:
+				!!storedText.trim() ||
+				storedReferences.length > 0 ||
+				!!storedComposerDocument?.assets.length,
 			text: storedText,
 			fileReferences: storedReferences,
+			composerDocument: storedComposerDocument,
 			revision: nextRevision,
 			updatedAt: now,
 			updatedBy: userId,
@@ -196,7 +218,11 @@ export async function updateNarratorDraft(
 // Empty reference lists are always stored as NULL. Presence queries return only
 // ids: neither the draft text nor the up-to-64-KiB locator JSON is materialized.
 function draftPresent() {
-	return or(ne(narratorDrafts.text, ""), isNotNull(narratorDrafts.fileReferencesJson));
+	return or(
+		ne(narratorDrafts.text, ""),
+		isNotNull(narratorDrafts.fileReferencesJson),
+		isNotNull(narratorDrafts.composerDocument),
+	);
 }
 
 export async function narratorHasDraft(userId: string, narratorId: string): Promise<boolean> {

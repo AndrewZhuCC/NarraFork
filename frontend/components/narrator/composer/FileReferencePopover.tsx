@@ -26,7 +26,7 @@ export interface FileReferencePopoverProps {
 	cacheScope: string | null;
 	query: FileReferenceQuery | null;
 	selection?: FileReferenceEditorSelection | null;
-	textareaRef: RefObject<HTMLTextAreaElement | null>;
+	textareaRef: RefObject<HTMLElement | null>;
 	onSelect: (reference: FileReference) => void;
 	onNavigate: (candidate: FileReferenceCandidate) => void;
 	onClose: () => void;

@@ -1422,6 +1422,34 @@
       "when": 1792071700491,
       "tag": "0202_personal_knowledge_injection",
       "breakpoints": true
+    },
+    {
+      "idx": 203,
+      "version": "6",
+      "when": 1792086100087,
+      "tag": "0203_magical_speed_demon",
+      "breakpoints": true
+    },
+    {
+      "idx": 204,
+      "version": "6",
+      "when": 1792089886575,
+      "tag": "0204_productive_bill_hollister",
+      "breakpoints": true
+    },
+    {
+      "idx": 205,
+      "version": "6",
+      "when": 1792144293651,
+      "tag": "0205_rich_composer_document",
+      "breakpoints": true
+    },
+    {
+      "idx": 206,
+      "version": "6",
+      "when": 1792157709586,
+      "tag": "0206_context_numeric_stats",
+      "breakpoints": true
     }
   ]
 }

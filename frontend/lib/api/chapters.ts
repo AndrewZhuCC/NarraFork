@@ -100,8 +100,8 @@ export const chaptersApi = {
 		request<{
 			commitsAhead: number;
 			baseBranch: string;
-			linesAdded: number;
-			linesRemoved: number;
+			linesAdded?: number;
+			linesRemoved?: number;
 		}>(`/chapters/${id}/git-status`),
 
 	// Chapter split

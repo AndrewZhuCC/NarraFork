@@ -103,6 +103,7 @@ import {
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
+import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
@@ -814,6 +815,7 @@ function NarratorPanelBody({
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
 				fileReferences?: FileReference[];
+				composerDocument?: import("@shared/composer-document").ComposerDocument;
 			},
 		): Promise<boolean> => {
 			if (!rollbackEditRegenerateSupported) {
@@ -952,8 +954,29 @@ function NarratorPanelBody({
 		updateAttachedTextFiles,
 		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
+		reconcileDocumentAssets,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
+		retryAttachmentRestore,
+		restoredAttachmentResources,
 	} = useComposerAttachments({ narratorId, currentUserId, sendingRef, t });
 
+	// Composer file ingestion (image/text validation + resize, file picker, paste
+	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
+	// the panel root below, so the hook is called here rather than sunk into a child.
+	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps, ingestingRef } =
+		useComposerFileIngest({
+			narratorId,
+			sendingRef,
+			updateAttachedImages,
+			updateAttachedTextFiles,
+			setIsDragging,
+			dragCounterRef,
+			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
+			onAcceptedFiles: (files, bookmark) =>
+				composerRef.current?.insertAcceptedFiles(files, bookmark) ?? false,
+			t,
+		});
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
@@ -2048,10 +2071,7 @@ function NarratorPanelBody({
 				return;
 			}
 			if (scope === "personal") {
-				navigate({
-					to: "/knowledge/personal/$personalEntryId",
-					params: { personalEntryId: entryId },
-				});
+				navigate(knowledgePersonalEntryDestination(entryId));
 				return;
 			}
 			navigate({ to: "/knowledge/$entryId", params: { entryId } });
@@ -2578,6 +2598,9 @@ function NarratorPanelBody({
 	} = useNarratorSend({
 		narratorId,
 		composerRef,
+		ingestingRef,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
 		attachedImagesRef,
@@ -2649,19 +2672,6 @@ function NarratorPanelBody({
 			onAllowRetry: handleAllowRetryToolCall,
 		}),
 		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
-	);
-
-	// Composer file ingestion (image/text validation + resize, file picker, paste
-	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
-	// the panel root below, so the hook is called here rather than sunk into a child.
-	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps } = useComposerFileIngest(
-		{
-			updateAttachedImages,
-			updateAttachedTextFiles,
-			setIsDragging,
-			dragCounterRef,
-			t,
-		},
 	);
 
 	/*
@@ -3452,8 +3462,13 @@ function NarratorPanelBody({
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
+						attachmentsHydrating={attachmentsHydrating}
+						attachmentsRestoreFailed={attachmentsRestoreFailed}
+						onRetryAttachments={retryAttachmentRestore}
+						restoredAttachmentResources={restoredAttachmentResources}
 						updateAttachedImages={updateAttachedImages}
 						updateAttachedTextFiles={updateAttachedTextFiles}
+						reconcileDocumentAssets={reconcileDocumentAssets}
 						sendingState={sendingState}
 						cancelSending={cancelSending}
 						queueDeps={{

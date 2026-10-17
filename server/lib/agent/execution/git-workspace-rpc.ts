@@ -1,6 +1,11 @@
+import type { GitLineStats } from "@shared/git-line-stats";
+
 /** Additive, shell-free Git management contract, mirrored by the Go executor. */
 export const FEATURE_GIT_WORKSPACE_V1 = "git.workspace.v1";
 export const FEATURE_GIT_WORKSPACE_WATCH_V1 = "git.workspace.watch.v1";
+/** Status-only, bounded 10,000-record scan with early stop; legacy executors may compute numstat. */
+export const FEATURE_GIT_WORKSPACE_STATUS_V1 = "git.workspace.status.v1";
+export const FEATURE_GIT_LINE_STATS_V1 = "git.workspace.line-stats.v1";
 /** Read-only `commitDetail`/`commitDiff` operations; older executors lack them. */
 export const FEATURE_GIT_COMMIT_PREVIEW_V1 = "git.workspace.commit-preview.v1";
 export const GIT_WORKSPACE_TIMEOUT_MS = 30_000;
@@ -12,6 +17,7 @@ export type GitWorkspaceOperation =
 	| "probe"
 	| "watch"
 	| "status"
+	| "lineStats"
 	| "diff"
 	| "fullDiff"
 	| "stage"
@@ -76,5 +82,8 @@ export interface GitWorkspaceResult {
 	 */
 	outputs?: Record<string, string>;
 	truncated?: boolean;
+	lineStats?: GitLineStats;
+	/** Status counts are exact only when the complete porcelain stream was scanned. */
+	totalFilesExact?: boolean;
 	hasConflicts?: boolean;
 }

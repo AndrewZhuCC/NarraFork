@@ -1,17 +1,19 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open, opendir, readlink, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { eq, gt, inArray, sql } from "drizzle-orm";
+import { lstat } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { eq, inArray, sql } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { normalizePathForComparison } from "../lib/platform-path";
-import { narraforkDir } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import {
+	canonicalProtectionAdmissionPath as canonicalAdmissionPath,
+	canonicalProtectionPath as canonicalPath,
+	readProtectionClaims,
+} from "./resource-protection-index";
+import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 
 export interface LifecycleTarget {
 	deviceId?: string;
@@ -59,14 +61,12 @@ export function isResourceProtectionError(error: unknown): error is ResourceProt
 
 const MAX_BYTES = 256 * 1024;
 const MAX_MS = 5000;
-const PAGE = 128;
 const MAX_TARGETS = 128;
 /** Opaque, service-created authority; callers cannot supply chapter IDs as a force token. */
 interface VerifiedReleaseScope {
 	chapters: Set<string>;
+	/** Raw pre-switch legacy bindings; canonicalized only by an actual sink. */
 	narrators: Map<string, string[]>;
-	/** Service-verified dormant lineage identities; these operations do not delete cwd. */
-	shadowOnlyPaths: Set<string>;
 }
 interface PathFootprint {
 	raw: string;
@@ -79,11 +79,12 @@ interface Reservation {
 	footprints?: Map<string, PathFootprint>;
 	ports?: LifecycleGuardPorts;
 	targets: LifecycleTarget[];
-	preparing: boolean;
 	admission: boolean;
 	/** Rows inserted by this service creation, not pre-existing legacy ownership. */
 	createdChapters?: Set<string>;
 	createdNarrators?: Set<string>;
+	/** Paths proven to have been born inside this identity context. */
+	createdPaths?: Set<string>;
 	/** Positive Git-root evidence acquired before this reserved retirement changes paths. */
 	distinctRoots?: Map<string, string>;
 }
@@ -123,6 +124,16 @@ function overlaps(a: LifecycleTarget, b: LifecycleTarget): boolean {
 		(localPathSemantics.contains(a.path, b.path) || localPathSemantics.contains(b.path, a.path))
 	);
 }
+/** A new cwd above a retiring linked checkout is not being deleted. Admissions
+ * conflict only when the deletion contains the reference, not vice versa. */
+function deletionContainsAdmission(deletion: LifecycleTarget, claim: LifecycleTarget): boolean {
+	if (deletion.scopeProjectId && deletion.scopeProjectId === claim.scopeProjectId) return true;
+	if ((deletion.deviceId ?? "local") !== (claim.deviceId ?? "local")) return false;
+	if (deletion.repositoryKey && deletion.repositoryKey === claim.repositoryKey) return true;
+	if (deletion.shadowKey && deletion.shadowKey === claim.shadowKey) return true;
+	return !!(deletion.path && claim.path && localPathSemantics.contains(deletion.path, claim.path));
+}
+
 const unavailable = (): ProtectionInspection => ({
 	status: "unavailable",
 	complete: false,
@@ -135,21 +146,19 @@ function reject(operation: string, inspection: ProtectionInspection): never {
 /** Called after backend canonicalization. No await may separate this check from a sync commit. */
 export function assertWorkspaceAdmission(target: LifecycleTarget): void {
 	for (const held of domain.reservations) {
-		if (!held.admission && (held.preparing || held.targets.some((item) => overlaps(item, target))))
+		if (!held.admission && held.targets.some((item) => deletionContainsAdmission(item, target)))
 			reject("workspace admission", { status: "protected", complete: true, claims: [] });
 	}
 }
 /** Initial chapter creation is an admission, never a legacy-release authority.
- * Install the reservation before canonicalization and hold it through compensation.
- * A nested retirement callback cannot borrow its release scope to become a creator. */
+ * The source repository is identity context, not an exclusive directory target. */
 export async function withChapterCreation<T>(
 	projectId: string,
 	gitPath: string,
 	body: () => Promise<T>,
 	worktreePath?: string,
 ): Promise<T> {
-	const raw = { scopeProjectId: projectId, deviceId: "local", path: gitPath };
-	const targets: LifecycleTarget[] = [raw];
+	const targets: LifecycleTarget[] = [{ scopeProjectId: projectId }];
 	if (worktreePath)
 		targets.push(
 			{ deviceId: "local", path: worktreePath },
@@ -187,36 +196,32 @@ export async function withChapterCreation<T>(
 		}
 		await revalidateFootprints(held, deadline);
 	};
-	for (const target of targets) assertWorkspaceAdmission(target);
 	const current = creationContext.getStore();
-	if (current && domain.reservations.has(current)) {
-		current.preparing = true;
-		try {
-			const canonical = await Promise.all(targets.map(canonicalWorkspaceAdmissionTarget));
-			for (const target of canonical) assertWorkspaceAdmission(target);
-			current.targets.push(...canonical);
-			if (current.targets.length > MAX_TARGETS) reject("chapter creation budget", unavailable());
-			await prepare(current);
-			current.preparing = false;
-			return await body();
-		} finally {
-			current.preparing = false;
-		}
+	const previous = current && domain.reservations.has(current) ? current : undefined;
+	const held: Reservation = previous ?? {
+		id: Symbol(),
+		targets: [],
+		admission: true,
+		ports: productionPorts,
+	};
+	try {
+		await prepare(held);
+		const canonical = await Promise.all(targets.map(canonicalWorkspaceAdmissionTarget));
+		await revalidateFootprints(held);
+		if (held.targets.length + canonical.length > MAX_TARGETS)
+			reject("chapter creation budget", unavailable());
+		// No await between comparing published canonical targets and publishing ours.
+		for (const target of canonical) assertWorkspaceAdmission(target);
+		held.targets.push(...canonical);
+		if (!previous) domain.reservations.add(held);
+		// Publication may follow a completed project retirement. Re-read the row, too.
+		await prepare(held);
+		// An unrelated enclosing retirement must neither supply release authority
+		// nor intercept the new creator's identity ledger.
+		return await domain.context.exit(() => creationContext.run(held, body));
+	} finally {
+		if (!previous) domain.reservations.delete(held);
 	}
-	return withWorkspaceAdmission(targets, async () => {
-		const held = [...domain.reservations].find((item) => item.targets.includes(raw));
-		if (!held) reject("chapter creation", unavailable());
-		held.preparing = true;
-		try {
-			held.targets = await Promise.all(targets.map(canonicalWorkspaceAdmissionTarget));
-			for (const target of held.targets) assertWorkspaceAdmission(target);
-			await prepare(held);
-			held.preparing = false;
-			return await creationContext.run(held, body);
-		} finally {
-			held.preparing = false;
-		}
-	});
 }
 
 /** Called synchronously after the service insert returns; this grants row
@@ -247,12 +252,14 @@ export async function canonicalWorkspaceAdmissionTarget(
 	if (target.path && (target.path.length > 4096 || target.path.includes("\0")))
 		reject("workspace claim admission", unavailable());
 	if ((target.deviceId ?? "local") !== "local") return { ...target, canonicalCwd: target.path };
-	if (!target.path) return { ...target };
+	const shadow = await canonicalShadowReference(target.shadowKey, productionPorts);
+	const resolved = { ...target, ...(shadow ? { shadowKey: shadow.key } : {}) };
+	if (!target.path) return resolved;
 	const canonicalCwd = await boundedRead(
 		productionPorts.canonicalAdmissionPath(target.path),
 		performance.now() + MAX_MS,
 	);
-	return { ...target, path: normalizePathForComparison(canonicalCwd), canonicalCwd };
+	return { ...resolved, path: normalizePathForComparison(canonicalCwd), canonicalCwd };
 }
 /** Async registration/CAS must keep their claim visible until the durable write completes. */
 export async function withWorkspaceAdmission<T>(
@@ -263,8 +270,9 @@ export async function withWorkspaceAdmission<T>(
 		? [...target]
 		: [target as LifecycleTarget];
 	if (!targets.length || targets.length > MAX_TARGETS) reject("workspace admission", unavailable());
-	for (const item of targets) assertWorkspaceAdmission(item);
-	const held: Reservation = { id: Symbol(), targets, preparing: false, admission: true };
+	const canonical = await Promise.all(targets.map(canonicalWorkspaceAdmissionTarget));
+	for (const item of canonical) assertWorkspaceAdmission(item);
+	const held: Reservation = { id: Symbol(), targets: canonical, admission: true };
 	domain.reservations.add(held);
 	try {
 		return await body();
@@ -273,46 +281,13 @@ export async function withWorkspaceAdmission<T>(
 	}
 }
 
-/** Resolve filesystem aliases without turning a display/execution path into a comparison key. */
-async function canonicalAdmissionPath(path: string): Promise<string> {
-	if (!isAbsolute(path) || path.length > 4096 || path.includes("\0"))
-		throw new Error("Invalid resource path");
-	let current = path;
-	const suffix: string[] = [];
-	for (let depth = 0; depth < 64; depth++) {
-		try {
-			return resolve(await realpath(current), ...suffix);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			const node = await lstat(current).catch((cause) => {
-				if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
-				throw cause;
-			});
-			if (node?.isSymbolicLink()) {
-				const link = await readlink(current);
-				if (Buffer.byteLength(link) > 4096) throw new Error("Symlink target exceeds budget");
-				current = resolve(dirname(current), link);
-				continue;
-			}
-			const parent = dirname(current);
-			if (parent === current) throw error;
-			suffix.unshift(localPathSemantics.basename(current));
-			current = parent;
-		}
-	}
-	throw new Error("Resource path ancestry exceeded budget");
-}
-
-/** Internal ownership keys remain case-insensitive on Windows. Never persist these as cwd. */
-async function canonicalPath(path: string): Promise<string> {
-	return normalizePathForComparison(await canonicalAdmissionPath(path));
-}
-
 export interface LifecycleGuardPorts {
 	readClaims(
 		deadline: number,
 		signal?: AbortSignal,
-	): Promise<{ complete: boolean; claims: ResourceClaim[] }>;
+		targets?: readonly LifecycleTarget[],
+		includeLegacyReceipts?: boolean,
+	): Promise<{ complete: boolean; claims: ResourceClaim[] | AsyncIterable<ResourceClaim> }>;
 	/** Canonical comparison key, case-folded on Windows. */
 	canonicalPath(path: string): Promise<string>;
 	/** Case-preserving canonical path for a committed cwd/context (fixture seam). */
@@ -322,222 +297,41 @@ export interface LifecycleGuardPorts {
 	probeGitRoot?(path: string, deadline: number): Promise<{ root: string; common: string } | null>;
 }
 
-/** Small projections only; cursor pagination never converts a truncated scan to no owners. */
-async function readClaims(deadline: number, signal?: AbortSignal) {
-	const { db } = await import("../db");
-	const { chapters, narrators, narratorWorktreeResources } = await import("../db/schema");
-	const claims: ResourceClaim[] = [];
-	let bytes = 0;
-	const append = (claim: ResourceClaim) => {
-		bytes += Buffer.byteLength(JSON.stringify(claim));
-		if (bytes > MAX_BYTES || performance.now() > deadline || signal?.aborted)
-			throw new Error("Inventory budget exceeded");
-		claims.push(claim);
+/** A shadow reference owns its hashed storage, never its historical logical cwd. */
+async function canonicalShadowReference(
+	key: string | undefined,
+	ports: LifecycleGuardPorts,
+	deadline = performance.now() + MAX_MS,
+): Promise<{ key: string; deviceId: string; physicalPath: string } | undefined> {
+	if (!key) return undefined;
+	const parts = key.split("\0");
+	const [deviceId, path] = parts;
+	if (parts.length !== 2 || !deviceId || !path || path.length > 4096 || !isAbsolute(path))
+		throw new Error("Unverifiable shadow reference");
+	const canonical =
+		deviceId === "local" ? await boundedRead(ports.canonicalPath(path), deadline) : path;
+	return {
+		key: treeSnapshotKey(deviceId, canonical),
+		deviceId,
+		physicalPath: treeSnapshotPhysicalDir(deviceId, path),
 	};
-	let cursor: string | undefined;
-	for (let page = 0; page < 32; page++) {
-		const rows = db
-			.select({
-				id: narratorWorktreeResources.id,
-				deviceId: narratorWorktreeResources.deviceId,
-				path: narratorWorktreeResources.worktreePath,
-				repositoryKey: narratorWorktreeResources.repositoryKey,
-				scopeProjectId: narratorWorktreeResources.scopeProjectId,
-				state: narratorWorktreeResources.state,
-			})
-			.from(narratorWorktreeResources)
-			.where(cursor ? gt(narratorWorktreeResources.id, cursor) : undefined)
-			.orderBy(narratorWorktreeResources.id)
-			.limit(PAGE + 1)
-			.all();
-		for (const row of rows.slice(0, PAGE)) append({ kind: "registry", ...row });
-		if (rows.length <= PAGE) break;
-		if (page === 31) throw new Error("Inventory truncated");
-		cursor = rows[PAGE - 1]?.id;
-		await new Promise<void>((done) => setTimeout(done, 0));
-	}
-	cursor = undefined;
-	for (let page = 0; page < 32; page++) {
-		const rows = db
-			.select({
-				id: chapters.id,
-				path: chapters.worktreePath,
-				shadowKey: chapters.snapshotShadowKey,
-			})
-			.from(chapters)
-			.where(cursor ? gt(chapters.id, cursor) : undefined)
-			.orderBy(chapters.id)
-			.limit(PAGE + 1)
-			.all();
-		for (const row of rows.slice(0, PAGE))
-			append({
-				kind: "chapter",
-				id: row.id,
-				...(row.path ? { path: row.path } : {}),
-				...(row.shadowKey ? { shadowKey: row.shadowKey } : {}),
-			});
-		if (rows.length <= PAGE) break;
-		if (page === 31) throw new Error("Chapter inventory truncated");
-		cursor = rows[PAGE - 1]?.id;
-		await new Promise<void>((done) => setTimeout(done, 0));
-	}
-	cursor = undefined;
-	for (let page = 0; page < 32; page++) {
-		const rows = db
-			.select({
-				id: narrators.id,
-				chapterId: narrators.chapterId,
-				cwd: narrators.cwd,
-				defaultDeviceId: narrators.defaultDeviceId,
-				revision: narrators.workspaceRevision,
-				contextCwd: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.cwd')`,
-				contextCwdType: sql<string | null>`json_type(${narrators.workspaceContext}, '$.cwd')`,
-				deviceId: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.deviceId')`,
-				contextDeviceType: sql<
-					string | null
-				>`json_type(${narrators.workspaceContext}, '$.deviceId')`,
-				repositoryKey: sql<
-					string | null
-				>`json_extract(${narrators.workspaceContext}, '$.git.repositoryKey')`,
-			})
-			.from(narrators)
-			.where(cursor ? gt(narrators.id, cursor) : undefined)
-			.orderBy(narrators.id)
-			.limit(PAGE + 1)
-			.all();
-		for (const row of rows.slice(0, PAGE)) {
-			const validDevice = (device: unknown) =>
-				device === null ||
-				(typeof device === "string" &&
-					device.length > 0 &&
-					device.length <= 256 &&
-					!device.includes("\0"));
-			if (
-				!validDevice(row.defaultDeviceId) ||
-				!validDevice(row.deviceId) ||
-				(row.contextDeviceType !== null &&
-					row.contextDeviceType !== "null" &&
-					row.contextDeviceType !== "text")
-			)
-				throw new Error("Legacy claim device is unverifiable");
-			if (
-				(row.cwd !== null &&
-					(typeof row.cwd !== "string" ||
-						row.cwd.length === 0 ||
-						row.cwd.length > 4096 ||
-						row.cwd.includes("\0"))) ||
-				(row.contextCwdType !== null &&
-					row.contextCwdType !== "null" &&
-					row.contextCwdType !== "text") ||
-				(row.contextCwd !== null &&
-					(typeof row.contextCwd !== "string" ||
-						row.contextCwd.length === 0 ||
-						row.contextCwd.length > 4096 ||
-						row.contextCwd.includes("\0")))
-			)
-				throw new Error("Legacy claim cwd is unverifiable");
-			const rawDevice =
-				row.cwd && isAbsolute(row.cwd) ? "local" : (row.defaultDeviceId ?? row.deviceId ?? "local");
-			const contextDevice =
-				row.deviceId ?? (row.defaultDeviceId && row.defaultDeviceId !== "local" ? null : "local");
-			if (row.contextCwd && !contextDevice)
-				throw new Error("Legacy context device is unverifiable");
-			if (row.cwd)
-				append({
-					kind: "narrator",
-					id: row.id,
-					chapterId: row.chapterId,
-					legacyChapterCwd: !!row.chapterId && row.revision === 0,
-					revision: row.revision,
-					path:
-						rawDevice === "local" ? localPathSemantics.resolve(process.cwd(), row.cwd) : row.cwd,
-					deviceId: rawDevice,
-				});
-			if (row.contextCwd)
-				append({
-					kind: "narrator",
-					id: row.id,
-					chapterId: row.chapterId,
-					legacyChapterCwd: !!row.chapterId && row.revision === 0,
-					revision: row.revision,
-					deviceId: contextDevice ?? "local",
-					path:
-						contextDevice === "local"
-							? localPathSemantics.resolve(process.cwd(), row.contextCwd)
-							: row.contextCwd,
-					...(row.repositoryKey ? { repositoryKey: row.repositoryKey } : {}),
-				});
-		}
-		if (rows.length <= PAGE) break;
-		if (page === 31) throw new Error("Narrator inventory truncated");
-		cursor = rows[PAGE - 1]?.id;
-		await new Promise<void>((done) => setTimeout(done, 0));
-	}
-	const directory = join(narraforkDir, "worktree-requests");
-	const metadata = await lstat(directory).catch((error) => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	if (metadata) {
-		if (!metadata.isDirectory() || metadata.isSymbolicLink())
-			throw new Error("Unsafe receipt directory");
-		let count = 0;
-		for await (const entry of await opendir(directory)) {
-			if (
-				++count > 512 ||
-				performance.now() > deadline ||
-				signal?.aborted ||
-				!entry.isFile() ||
-				!/^[a-f0-9]{64}\.json$/.test(entry.name)
-			)
-				throw new Error("Receipt inventory unavailable");
-			const file = await open(
-				join(directory, entry.name),
-				constants.O_RDONLY | constants.O_NOFOLLOW,
-			);
-			try {
-				const stat = await file.stat();
-				if (stat.size > 32 * 1024 || bytes + stat.size > MAX_BYTES)
-					throw new Error("Receipt budget exceeded");
-				const buffer = Buffer.alloc(Math.min(32 * 1024 + 1, MAX_BYTES - bytes + 1));
-				const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-				bytes += bytesRead;
-				if (bytesRead > 32 * 1024 || bytes > MAX_BYTES) throw new Error("Receipt budget exceeded");
-				const record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
-				// The actual journal's historical contract is unversioned, with an
-				// optional deviceId (absence means local). Explicit null is NOT absence.
-				if (
-					!record ||
-					Array.isArray(record) ||
-					Object.getPrototypeOf(record) !== Object.prototype ||
-					Object.hasOwn(record, "__proto__") ||
-					Object.hasOwn(record, "version") ||
-					typeof record.destination !== "string" ||
-					!isAbsolute(record.destination) ||
-					record.destination.length > 4096 ||
-					record.destination.includes("\0") ||
-					typeof record.repositoryKey !== "string" ||
-					!record.repositoryKey.trim() ||
-					record.repositoryKey.length > 4096 ||
-					(Object.hasOwn(record, "deviceId") &&
-						(typeof record.deviceId !== "string" ||
-							!record.deviceId.trim() ||
-							!/^[-A-Za-z0-9_]{1,128}$/.test(record.deviceId)))
-				)
-					throw new Error("Invalid receipt");
-				append({
-					kind: "receipt",
-					id: entry.name,
-					deviceId: record.deviceId ?? "local",
-					path: record.destination,
-					repositoryKey: record.repositoryKey,
-				});
-			} finally {
-				await file.close();
-			}
-		}
-	}
-	return { complete: true, claims };
+}
+
+/** The caller's complete actual deletion set; retained shadows do not own checkout paths. */
+export function legacyDeletionTargets(
+	path: string | null | undefined,
+	effects: { checkout: boolean; shadow: boolean },
+): LifecycleTarget[] {
+	if (!path) return [];
+	return [
+		...(effects.checkout ? [{ deviceId: "local", path }] : []),
+		...(effects.shadow
+			? [
+					{ deviceId: "local", shadowKey: treeSnapshotKey("local", path) },
+					{ deviceId: "local", path: treeSnapshotPhysicalDir("local", path) },
+				]
+			: []),
+	];
 }
 
 const fixturePorts = new AsyncLocalStorage<LifecycleGuardPorts>();
@@ -591,8 +385,12 @@ async function probeGitRoot(
 const productionPorts: LifecycleGuardPorts & {
 	canonicalAdmissionPath(path: string): Promise<string>;
 } = {
-	readClaims: (deadline, signal) =>
-		(fixturePorts.getStore()?.readClaims ?? readClaims)(deadline, signal),
+	readClaims: (deadline, signal, targets, includeLegacyReceipts) => {
+		const fixture = fixturePorts.getStore();
+		return fixture
+			? fixture.readClaims(deadline, signal, targets, includeLegacyReceipts)
+			: readProtectionClaims(targets ?? [], deadline, signal, includeLegacyReceipts);
+	},
 	canonicalPath: (path) => (fixturePorts.getStore()?.canonicalPath ?? canonicalPath)(path),
 	canonicalAdmissionPath: (path) => {
 		const fixture = fixturePorts.getStore();
@@ -669,6 +467,45 @@ async function revalidateFootprints(held: Reservation, deadline = performance.no
 	for (const footprint of held.footprints?.values() ?? [])
 		await freezeFootprint(held, footprint.raw, deadline);
 }
+/** Identity context is deliberately target-free: normal use neither inventories nor
+ * excludes sharing. A later destructive sink must still publish its real targets. */
+export function withLifecycleContext<T>(
+	paths: readonly string[],
+	body: () => Promise<T>,
+): Promise<T> {
+	return runLifecycleContext(paths, body);
+}
+
+async function runLifecycleContext<T>(
+	paths: readonly string[],
+	body: () => Promise<T>,
+	scope?: VerifiedReleaseScope,
+	deadline = performance.now() + MAX_MS,
+	signal?: AbortSignal,
+): Promise<T> {
+	if (paths.length > MAX_TARGETS || signal?.aborted) reject("lifecycle context", unavailable());
+	const previous = liveContext();
+	const creation = creationContext.getStore();
+	if (creation && domain.reservations.has(creation)) creation.footprints ??= new Map();
+	const held: Reservation = previous?.reservation ?? {
+		id: Symbol(),
+		targets: [],
+		admission: false,
+		ports: productionPorts,
+		// Trusted births must remain visible to an enclosing chapter creation.
+		footprints: creation && domain.reservations.has(creation) ? creation.footprints : new Map(),
+	};
+	try {
+		for (const path of paths) await freezeFootprint(held, path, deadline);
+		await revalidateFootprints(held, deadline);
+		if (signal?.aborted) reject("lifecycle context", unavailable());
+		if (!previous) domain.reservations.add(held);
+		return await domain.context.run({ reservation: held, scope: scope ?? previous?.scope }, body);
+	} finally {
+		if (!previous) domain.reservations.delete(held);
+	}
+}
+
 /** Last dispatch check. Never re-target a reserved raw alias to a new directory/inode. */
 export async function revalidateLifecycleTarget(path: string): Promise<string> {
 	const held = footprintReservation();
@@ -736,6 +573,10 @@ export async function confirmLifecyclePathCreated(
 			reject("legacy creation alias changed", unavailable());
 		if (record.identity !== null && !record.removed && record.identity !== identity)
 			reject("legacy creation footprint changed", unavailable());
+		if (identity !== null && (record.identity === null || record.removed)) {
+			held.createdPaths ??= new Set();
+			held.createdPaths.add(canonical);
+		}
 		record.identity = identity;
 		record.removed = false;
 	}
@@ -770,10 +611,11 @@ export async function confirmLifecyclePathRemoved(path: string): Promise<void> {
 export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 	async function inspectOnce(
 		targets: readonly LifecycleTarget[],
-		operation: string,
+		_operation: string,
 		scope?: VerifiedReleaseScope,
 		signal?: AbortSignal,
 		frozenTargets = false,
+		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const deadline = performance.now() + MAX_MS;
 		try {
@@ -793,17 +635,22 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				targets.map(async (target) => {
 					if ((target.deviceId ?? "local") !== "local")
 						throw new Error("Remote retirement unsupported");
+					const shadow = frozenTargets
+						? undefined
+						: await canonicalShadowReference(target.shadowKey, ports, deadline);
 					return {
 						...target,
+						...(shadow ? { shadowKey: shadow.key } : {}),
 						...(target.path
 							? { path: frozenTargets ? target.path : await ports.canonicalPath(target.path) }
 							: {}),
 					};
 				}),
 			);
-			const inventory = await ports.readClaims(deadline, signal);
+			// Cold capture creates an exclusive new shadow and never deletes a failed
+			// birth. Legacy request-log migration is a prerequisite for deletion, not capture.
+			const inventory = await ports.readClaims(deadline, signal, normalized, !creatingShadow);
 			if (!inventory.complete) return unavailable();
-			const protectedClaims: ResourceClaim[] = [];
 			let bytes = Buffer.byteLength(JSON.stringify(normalized));
 			const probes = new Map<string, { root: string; common: string } | null>();
 			const held = footprintReservation();
@@ -844,9 +691,13 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				}
 				return distinct;
 			}
-			for (const claim of inventory.claims) {
-				bytes += Buffer.byteLength(JSON.stringify(claim));
-				if (bytes > MAX_BYTES || performance.now() > deadline || signal?.aborted)
+			for await (const claim of inventory.claims) {
+				// Bound individual evidence, not the amount of unrelated instance history.
+				if (
+					Buffer.byteLength(JSON.stringify(claim)) > MAX_BYTES ||
+					performance.now() > deadline ||
+					signal?.aborted
+				)
 					return unavailable();
 				if (claim.kind === "chapter" && scope?.chapters.has(claim.id)) continue;
 				const canonical = {
@@ -855,33 +706,29 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						? { path: await ports.canonicalPath(claim.path) }
 						: {}),
 				};
-				if (canonical.shadowKey && !canonical.path) {
-					const parts = canonical.shadowKey.split("\0");
-					const [deviceId, path] = parts;
-					if (parts.length !== 2 || !deviceId || !path)
-						throw new Error("Unverifiable shadow reference");
-					canonical.deviceId = deviceId;
-					canonical.path = deviceId === "local" ? await ports.canonicalPath(path) : path;
+				const shadow = await canonicalShadowReference(claim.shadowKey, ports, deadline);
+				if (shadow) canonical.shadowKey = shadow.key;
+				// A cold mkdir birth is not deletion of an existing lineage store.
+				// Direct cwd/registry paths still protect D; only the derived shadow
+				// reference is non-exclusive while initializing the new physical store.
+				const shadowPhysical = !creatingShadow &&
+					shadow && {
+						deviceId: shadow.deviceId,
+						path:
+							shadow.deviceId === "local"
+								? await ports.canonicalPath(shadow.physicalPath)
+								: shadow.physicalPath,
+					};
+				if (claim.kind === "narrator" && claim.revision === 0 && canonical.path) {
+					const released = await Promise.all(
+						(scope?.narrators.get(claim.id) ?? []).map((path) =>
+							boundedRead(ports.canonicalPath(path), deadline),
+						),
+					);
+					if (released.includes(canonical.path)) continue;
 				}
-				if (
-					claim.kind === "narrator" &&
-					claim.revision === 0 &&
-					canonical.path &&
-					scope?.narrators.get(claim.id)?.includes(canonical.path)
-				)
-					continue;
 				for (const target of normalized) {
-					if (!overlaps(target, canonical)) continue;
-					if (
-						claim.kind === "chapter" &&
-						target.path &&
-						canonical.path &&
-						(operation === "legacy creation rollback" || operation === "shadow destroy") &&
-						scope?.shadowOnlyPaths.has(target.path) &&
-						target.path !== canonical.path &&
-						localPathSemantics.contains(canonical.path, target.path) &&
-						!(target.shadowKey && target.shadowKey === canonical.shadowKey)
-					)
+					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
 					// A repository-root cwd is not an owner of every linked worktree stored
 					// beneath it. This exception needs positive distinct Git-root evidence,
@@ -903,15 +750,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						(await distinctGitRoots(targetPath, claimPath))
 					)
 						continue;
-					protectedClaims.push(canonical);
-					break;
+					// One independent reference is sufficient to refuse; diagnostics need
+					// not collect every user of a shared resource into the main-thread heap.
+					return { status: "protected", complete: true, claims: [canonical] };
 				}
 			}
-			return {
-				status: protectedClaims.length ? "protected" : "clear",
-				complete: true,
-				claims: protectedClaims,
-			};
+			return { status: "clear", complete: true, claims: [] };
 		} catch {
 			return unavailable();
 		}
@@ -922,11 +766,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		scope?: VerifiedReleaseScope,
 		signal?: AbortSignal,
 		frozenTargets = false,
+		creatingShadow = false,
 	): Promise<ProtectionInspection> {
 		const started = performance.now();
 		try {
 			return await boundedRead(
-				inspectOnce(targets, operation, scope, signal, frozenTargets),
+				inspectOnce(targets, operation, scope, signal, frozenTargets, creatingShadow),
 				started + MAX_MS,
 			);
 		} catch {
@@ -949,6 +794,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		deadline = performance.now() + MAX_MS,
 		signal?: AbortSignal,
 		contextPaths: readonly string[] = [],
+		creatingShadow = false,
 	): Promise<T> {
 		if (
 			signal?.aborted ||
@@ -956,7 +802,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			targets.length > MAX_TARGETS ||
 			contextPaths.length > MAX_TARGETS ||
 			Buffer.byteLength(JSON.stringify(targets)) > MAX_BYTES ||
-			targets.some((target) => (target.deviceId ?? "local") !== "local")
+			(scope && !verifiedScopes.has(scope)) ||
+			targets.some(
+				(target) =>
+					(target.deviceId ?? "local") !== "local" ||
+					(!target.path && !target.shadowKey && !target.repositoryKey && !target.scopeProjectId),
+			)
 		)
 			reject(operation, unavailable());
 		const previous = liveContext();
@@ -964,7 +815,6 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 		const held: Reservation = previous?.reservation ?? {
 			id: Symbol(),
 			targets: [],
-			preparing: true,
 			admission: false,
 		};
 		const ownCreation = creationContext.getStore();
@@ -972,12 +822,12 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			!targets.some((target) => target.scopeProjectId) &&
 			(operation === "legacy creation rollback" ||
 				(!!effectiveScope &&
+					effectiveScope.chapters.size > 0 &&
 					[...effectiveScope.chapters].every((id) => ownCreation?.createdChapters?.has(id))));
-		// A cold shadow initializer may reuse only its creator's already frozen,
-		// absent destination. This skips a self-admission conflict, not any claim.
-		const birth = targets.length === 1 ? targets[0] : undefined;
+		// A cold initializer can reuse only its creator's frozen absent destination;
+		// preparation stays private until all canonical targets are known.
+		const birth = creatingShadow && targets.length === 1 ? targets[0] : undefined;
 		const birthTarget =
-			operation === "shadow initialization" &&
 			birth?.deviceId === "local" &&
 			!birth.scopeProjectId &&
 			!birth.repositoryKey &&
@@ -997,38 +847,45 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				(target) => !target.scopeProjectId && target.path === birthFootprint.canonical,
 			)
 		);
-		// Capturing a parent's cold shadow is also a tracked context birth, not
-		// creator ownership. Synchronize its inode without skipping self-admission.
 		if (birthFootprint && !previous) held.footprints = ownCreation?.footprints;
-		const skipOwnAdmission = isCompensation || isOwnedBirth;
-		for (const other of domain.reservations) {
-			if (other === held || (skipOwnAdmission && other === ownCreation)) continue;
-			if (other.preparing || other.targets.some((a) => targets.some((b) => overlaps(a, b))))
-				reject(operation, unavailable());
-		}
-		if (!previous) domain.reservations.add(held);
 		held.ports ??= ports;
+		const publishedTargets: LifecycleTarget[] = [];
 		let admitted = false;
 		try {
 			const resolved = await boundedRead(
 				Promise.all(
-					targets.map(async (target) => ({
-						...target,
-						...(target.path
-							? { path: (await freezeFootprint(held, target.path, deadline)).canonical }
-							: {}),
-					})),
+					targets.map(async (target) => {
+						const shadow = await canonicalShadowReference(target.shadowKey, ports, deadline);
+						return {
+							...target,
+							...(shadow ? { shadowKey: shadow.key } : {}),
+							...(target.path
+								? { path: (await freezeFootprint(held, target.path, deadline)).canonical }
+								: {}),
+						};
+					}),
 				),
 				deadline,
 			);
 			for (const path of contextPaths) await freezeFootprint(held, path, deadline);
+			await revalidateFootprints(held, deadline);
+			const ownBirthRollback =
+				operation === "shadow initialization rollback" &&
+				resolved.every((target) => target.path && held.createdPaths?.has(target.path));
+			const skipOwnAdmission = isCompensation || ownBirthRollback || isOwnedBirth;
+			// Compare and publish in one synchronous segment. Preparing work stays private;
+			// any claim committed during it is checked by the subsequent inventory read.
 			for (const other of domain.reservations) {
 				if (
 					other !== held &&
 					!(skipOwnAdmission && other === ownCreation) &&
-					(other.preparing || other.targets.some((a) => resolved.some((b) => overlaps(a, b))))
+					other.targets.some((a) =>
+						resolved.some((b) =>
+							other.admission ? deletionContainsAdmission(b, a) : overlaps(a, b),
+						),
+					)
 				)
-					reject(operation, unavailable());
+					reject(operation, { status: "protected", complete: true, claims: [] });
 			}
 			for (const target of resolved) {
 				if (
@@ -1040,22 +897,31 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 							item.shadowKey === target.shadowKey &&
 							item.scopeProjectId === target.scopeProjectId,
 					)
-				)
+				) {
 					held.targets.push(target);
+					publishedTargets.push(target);
+				}
 			}
 			if (
 				held.targets.length > MAX_TARGETS ||
 				Buffer.byteLength(JSON.stringify(held.targets)) > MAX_BYTES
 			)
 				reject(operation, unavailable());
-			held.preparing = false;
-			const inspection = await boundedRead(
-				domain.context.run({ reservation: held, scope: effectiveScope }, () =>
-					inspect(resolved, operation, effectiveScope, signal, true),
-				),
-				deadline,
+			if (!previous) domain.reservations.add(held);
+			// Metadata-only coordination has an indexed project-scope check at its
+			// caller, and must not turn into a global resource inventory operation.
+			const resources = resolved.filter(
+				(target) => target.path || target.shadowKey || target.repositoryKey,
 			);
-			if (inspection.status !== "clear") reject(operation, inspection);
+			if (resources.length) {
+				const inspection = await boundedRead(
+					domain.context.run({ reservation: held, scope: effectiveScope }, () =>
+						inspect(resources, operation, effectiveScope, signal, true, creatingShadow),
+					),
+					deadline,
+				);
+				if (inspection.status !== "clear") reject(operation, inspection);
+			}
 			await revalidateFootprints(held, deadline);
 			if (signal?.aborted) reject(operation, unavailable());
 			admitted = true;
@@ -1065,10 +931,30 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 			if (!admitted) reject(operation, unavailable());
 			throw error;
 		} finally {
+			if (!admitted && publishedTargets.length)
+				held.targets = held.targets.filter((target) => !publishedTargets.includes(target));
 			if (!previous) domain.reservations.delete(held);
 		}
 	}
-	return { inspect, withProtectionReservation: reserve };
+	return {
+		inspect,
+		withProtectionReservation: reserve,
+		withShadowCreationReservation<T>(
+			target: { deviceId: "local"; path: string },
+			body: () => Promise<T>,
+		): Promise<T> {
+			return reserve(
+				[target],
+				"shadow initialization",
+				body,
+				undefined,
+				undefined,
+				undefined,
+				[],
+				true,
+			);
+		},
+	};
 }
 const guard = createLifecycleGuard(productionPorts);
 export const inspect = guard.inspect;
@@ -1085,6 +971,23 @@ export async function assertLifecycleProtectionCurrent(
 			...(target.path ? { path: await revalidateLifecycleTarget(target.path) } : {}),
 		})),
 	);
+	for (const target of resolved) {
+		const path = target.path;
+		const published = current.reservation.targets.filter(
+			(item) => (item.deviceId ?? "local") === (target.deviceId ?? "local"),
+		);
+		if (
+			(!target.path && !target.shadowKey && !target.repositoryKey && !target.scopeProjectId) ||
+			(path &&
+				!published.some((item) => item.path && localPathSemantics.contains(item.path, path))) ||
+			(target.shadowKey && !published.some((item) => item.shadowKey === target.shadowKey)) ||
+			(target.repositoryKey &&
+				!published.some((item) => item.repositoryKey === target.repositoryKey)) ||
+			(target.scopeProjectId &&
+				!published.some((item) => item.scopeProjectId === target.scopeProjectId))
+		)
+			reject("unreserved destructive target", unavailable());
+	}
 	const inspection = await createLifecycleGuard(
 		current.reservation.ports ?? productionPorts,
 	).inspect(resolved, operation, current.scope, undefined, true);
@@ -1109,6 +1012,14 @@ export function withProtectionReservation<T>(
 	);
 }
 
+/** Creation reserves only its physical destination; it never grants cleanup authority. */
+export function withShadowCreationReservation<T>(
+	target: { deviceId: "local"; path: string },
+	body: () => Promise<T>,
+): Promise<T> {
+	return guard.withShadowCreationReservation(target, body);
+}
+
 /** Rollback preflight precedes even narrator/chapter deletion, so deleting those rows
  * cannot erase the evidence which protects an independently claimed resource. */
 export async function withLegacyCreationRollback<T>(
@@ -1129,7 +1040,7 @@ export async function withLegacyCreationRollback<T>(
 		reject("unowned chapter compensation", unavailable());
 	if (!row)
 		return withProtectionReservation(
-			[{ path }, { path: treeSnapshotPhysicalDir("local", path) }],
+			legacyDeletionTargets(path, { checkout: true, shadow: true }),
 			"legacy creation rollback",
 			body,
 		);
@@ -1137,7 +1048,14 @@ export async function withLegacyCreationRollback<T>(
 		reject("legacy creation rollback", unavailable());
 	if (row.shadowKey && row.shadowKey !== `local\0${normalizePathForComparison(path)}`)
 		reject("legacy creation rollback", unavailable());
-	return withLegacyRetirement([chapterId], "legacy creation rollback", body, [{ path }]);
+	return withLegacyRetirement(
+		[chapterId],
+		"legacy creation rollback",
+		body,
+		// A dormant split prefix never had a checkout. Its rollback destroys
+		// only the real shadow storage, not an invented path beneath the repo.
+		legacyDeletionTargets(path, { checkout: !!row.path, shadow: true }),
+	);
 }
 
 /** Compensate only steps recorded AFTER successful creation. A refused compensation
@@ -1174,22 +1092,15 @@ export async function withLegacyRetirement<T>(
 	chapterIds: readonly string[],
 	operation: string,
 	body: () => Promise<T>,
-	extraTargets: readonly LifecycleTarget[] = [],
+	targets: readonly LifecycleTarget[] = [],
 	deadlineLimit = performance.now() + MAX_MS,
 	signal?: AbortSignal,
 ): Promise<T> {
 	if (signal?.aborted) reject(operation, unavailable());
 	const current = liveContext();
 	if (current?.scope && chapterIds.every((id) => current.scope?.chapters.has(id))) {
-		return extraTargets.length
-			? guard.withProtectionReservation(
-					extraTargets,
-					operation,
-					body,
-					undefined,
-					deadlineLimit,
-					signal,
-				)
+		return targets.length
+			? guard.withProtectionReservation(targets, operation, body, undefined, deadlineLimit, signal)
 			: body();
 	}
 	if (!chapterIds.length || chapterIds.length > MAX_TARGETS) reject(operation, unavailable());
@@ -1209,49 +1120,11 @@ export async function withLegacyRetirement<T>(
 			.limit(MAX_TARGETS + 1)
 			.all();
 		if (rows.length !== new Set(chapterIds).size) reject(operation, unavailable());
-		const targets: LifecycleTarget[] = [...extraTargets];
 		const scope: VerifiedReleaseScope = {
 			chapters: new Set(rows.map((row) => row.id)),
 			narrators: new Map(),
-			shadowOnlyPaths: new Set(),
 		};
 		verifiedScopes.add(scope);
-		for (const row of rows) {
-			if (
-				(row.path !== null &&
-					(!row.path ||
-						row.path.length > 4096 ||
-						row.path.includes("\0") ||
-						!isAbsolute(row.path))) ||
-				(row.shadowKey !== null && (!row.shadowKey || row.shadowKey.length > 4102))
-			)
-				reject(operation, unavailable());
-			// Physical shadow storage is not beneath the logical checkout. Reserve every
-			// actual sink key (current path and persisted dormant/alias lineage) up front.
-			const shadowPaths = new Set<string>();
-			if (row.path) shadowPaths.add(row.path);
-			if (row.shadowKey) {
-				const parts = row.shadowKey.split("\0");
-				if (parts.length !== 2 || parts[0] !== "local" || !parts[1] || !isAbsolute(parts[1]))
-					reject(operation, unavailable());
-				shadowPaths.add(parts[1]);
-			}
-			for (const path of shadowPaths)
-				targets.push({ deviceId: "local", path: treeSnapshotPhysicalDir("local", path) });
-			if (row.path)
-				targets.push({ path: row.path, ...(row.shadowKey ? { shadowKey: row.shadowKey } : {}) });
-			else if (row.shadowKey) {
-				const [deviceId, path] = row.shadowKey.split("\0");
-				if (path)
-					scope.shadowOnlyPaths.add(
-						await boundedRead(productionPorts.canonicalPath(path), deadline),
-					);
-				targets.push({ deviceId, path, shadowKey: row.shadowKey });
-			}
-		}
-		// No resources may exist for old dormant rows. A DB-only retirement still must read
-		// inventory, and a harmless, non-filesystem sentinel avoids granting force authority.
-		if (!targets.length) targets.push({ shadowKey: `legacy-retirement:${chapterIds.join(",")}` });
 		const owners = db
 			.select({
 				id: narrators.id,
@@ -1263,16 +1136,14 @@ export async function withLegacyRetirement<T>(
 			.where(inArray(narrators.chapterId, [...chapterIds]))
 			.limit(MAX_TARGETS + 1)
 			.all();
-		if (
-			owners.length > MAX_TARGETS ||
-			Buffer.byteLength(JSON.stringify(rows)) + Buffer.byteLength(JSON.stringify(owners)) >
-				MAX_BYTES ||
-			performance.now() > deadline
-		)
-			reject(operation, unavailable());
+		const provenanceComplete =
+			owners.length <= MAX_TARGETS &&
+			Buffer.byteLength(JSON.stringify(rows)) + Buffer.byteLength(JSON.stringify(owners)) <=
+				MAX_BYTES;
+		if (performance.now() > deadline) reject(operation, unavailable());
 		const creation = creationContext.getStore();
 		const newlyCreated = creation && chapterIds.every((id) => creation.createdChapters?.has(id));
-		for (const owner of owners) {
+		for (const owner of provenanceComplete ? owners : []) {
 			// A new chapter binding is not proof that this request created that narrator.
 			if (newlyCreated && !creation.createdNarrators?.has(owner.id)) continue;
 			// Changed contexts are ordinary independent claims, not old chapter cwd aliases.
@@ -1280,18 +1151,33 @@ export async function withLegacyRetirement<T>(
 			const allowed: string[] = [];
 			for (const path of [owner.cwd, owner.contextCwd]) {
 				if (
-					path &&
+					typeof path === "string" &&
+					path.length > 0 &&
+					path.length <= 4096 &&
+					!path.includes("\0") &&
+					isAbsolute(path) &&
 					rows.some((row) =>
 						[row.path, row.shadowKey?.split("\0")[1]].some(
 							(logicalPath) => logicalPath && localPathSemantics.contains(logicalPath, path),
 						),
 					)
 				)
-					allowed.push(await boundedRead(productionPorts.canonicalPath(path), deadline));
+					allowed.push(path); // Canonicalize only if a real sink later needs this release proof.
 			}
 			scope.narrators.set(owner.id, allowed);
 		}
 		if (performance.now() > deadline) reject(operation, unavailable());
+		if (!targets.length)
+			return await runLifecycleContext(
+				[],
+				async () => {
+					admitted = true;
+					return body();
+				},
+				scope,
+				deadline,
+				signal,
+			);
 		return await guard.withProtectionReservation(
 			targets,
 			operation,
@@ -1309,7 +1195,7 @@ export async function withLegacyRetirement<T>(
 	}
 }
 
-/** Project deletion also protects linked independent worktrees outside its gitPath. */
+/** Project metadata is a scope barrier; only actual non-root cleanup owns disk targets. */
 export async function withProjectRetirement<T>(
 	projectId: string,
 	gitPath: string | null,
@@ -1324,76 +1210,57 @@ export async function withProjectRetirement<T>(
 		return body();
 	};
 	try {
-		const { db } = await import("../db");
-		const { chapters, narratorWorktreeResources } = await import("../db/schema");
-		const scopedResource = db
-			.select({
-				id: narratorWorktreeResources.id,
-				path: narratorWorktreeResources.worktreePath,
-				deviceId: narratorWorktreeResources.deviceId,
-				state: narratorWorktreeResources.state,
-				scopeProjectId: narratorWorktreeResources.scopeProjectId,
-			})
-			.from(narratorWorktreeResources)
-			.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
-			.limit(1)
-			.get();
-		if (scopedResource)
-			reject("project delete", {
-				status: "protected",
-				// Indexed existence is conclusive protection, not a complete owner inventory.
-				complete: false,
-				claims: [{ kind: "registry", ...scopedResource }],
-			});
-		const rows = db
-			.select({ id: chapters.id })
-			.from(chapters)
-			.where(eq(chapters.projectId, projectId))
-			.limit(MAX_TARGETS + 1)
-			.all();
-		if (rows.length > MAX_TARGETS) reject("project delete", unavailable());
-		const targets: LifecycleTarget[] = [{ scopeProjectId: projectId }];
-		if (gitPath) {
-			const result = await safeSpawn({
-				cmd: [
-					"git",
-					"--no-optional-locks",
-					"-C",
-					gitPath,
-					"rev-parse",
-					"--path-format=absolute",
-					"--git-common-dir",
-				],
-				timeout: Math.max(1, deadline - performance.now()),
-				maxOutputBytes: 4096,
-				env: lifecycleGitProbeEnv(),
-				signal,
-			});
-			if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated)
-				reject("project delete", unavailable());
-			const repositoryPath = await boundedRead(
-				productionPorts.canonicalPath(result.stdout.trim()),
-				deadline,
-			);
-			const repositoryKey = createHash("sha256")
-				.update(JSON.stringify(["local", localPathSemantics.identityKey(repositoryPath)]))
-				.digest("hex");
-			targets.push({ path: gitPath, repositoryKey });
-		}
-		if (performance.now() > deadline) reject("project delete", unavailable());
-		if (rows.length)
-			return await withLegacyRetirement(
-				rows.map((row) => row.id),
-				"project delete",
-				run,
-				targets,
-				deadline,
-				signal,
-			);
+		// Publish metadata first, without inventory or filesystem probing. Chapter
+		// creation and scope CAS now cannot insert a missed same-project resource.
 		return await guard.withProtectionReservation(
-			targets.length ? targets : [{ shadowKey: `project:${projectId}` }],
+			[{ scopeProjectId: projectId }],
 			"project delete",
-			run,
+			async () => {
+				const { db } = await import("../db");
+				const { chapters, narratorWorktreeResources } = await import("../db/schema");
+				const scopedResource = db
+					.select({
+						id: narratorWorktreeResources.id,
+						path: narratorWorktreeResources.worktreePath,
+						deviceId: narratorWorktreeResources.deviceId,
+						state: narratorWorktreeResources.state,
+						scopeProjectId: narratorWorktreeResources.scopeProjectId,
+					})
+					.from(narratorWorktreeResources)
+					.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
+					.limit(1)
+					.get();
+				if (scopedResource)
+					reject("project delete", {
+						status: "protected",
+						complete: false,
+						claims: [{ kind: "registry", ...scopedResource }],
+					});
+				const rows = db
+					.select({ id: chapters.id, path: chapters.worktreePath, isRoot: chapters.isRoot })
+					.from(chapters)
+					.where(eq(chapters.projectId, projectId))
+					.limit(MAX_TARGETS + 1)
+					.all();
+				if (rows.length > MAX_TARGETS) reject("project delete", unavailable());
+				const targets: LifecycleTarget[] = [];
+				for (const row of rows) {
+					if (gitPath && !row.isRoot && row.path)
+						targets.push(...legacyDeletionTargets(row.path, { checkout: true, shadow: true }));
+				}
+				if (performance.now() > deadline || signal?.aborted)
+					reject("project delete", unavailable());
+				return rows.length
+					? withLegacyRetirement(
+							rows.map((row) => row.id),
+							"project delete",
+							run,
+							targets,
+							deadline,
+							signal,
+						)
+					: run();
+			},
 			undefined,
 			deadline,
 			signal,

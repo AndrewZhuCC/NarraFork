@@ -13,7 +13,12 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { slugify } from "../lib/slug";
 import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
-import { WITHDRAWABLE_SUBMISSION_STATUSES } from "./knowledge/write-store";
+import {
+	CLAIMABLE_SUBMISSION_STATUSES,
+	CLOSED_ON_ENTRY_DELETE_STATUSES,
+	OPEN_SUBMISSION_SCAN_LIMIT,
+	WITHDRAWABLE_SUBMISSION_STATUSES,
+} from "./knowledge/write-store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -22,6 +27,7 @@ import {
 	canReview,
 	canWriteCollection,
 	type Principal,
+	type PrincipalCaps,
 	resolvePrincipalCaps,
 } from "./knowledge-acl";
 import { emitEntryDrifted } from "./knowledge-notify";
@@ -40,6 +46,9 @@ function hashContent(content: string): string {
  * knowledge_submissions instead.
  */
 type PersonalEntryStatus = "active" | "archived";
+type PersonalEntryRow = NonNullable<
+	Awaited<ReturnType<typeof knowledgeReadStore.getPersonalEntryById>>
+>;
 /** Statuses whose personal entries still shadow main / participate in search. */
 const ACTIVE_DRAFT_STATUSES: PersonalEntryStatus[] = ["active"];
 
@@ -280,6 +289,212 @@ async function findDriftedDraftIds(
 /** Read one of the caller's own personal entries by id. */
 async function getMine(principal: Principal, draftId: string) {
 	return loadOwnDraft(principal, draftId);
+}
+
+// ─── Personal-version page views (KNOWLEDGE_UI_REDESIGN §5.4 / §5.5) ──────
+
+/**
+ * The subset of `entryIds` the caller can currently READ (collection gate + entry gate), with
+ * the columns the personal views display. One `inArray` per table, bounded by the input (the
+ * caller's own list page). An entry the caller lost access to is simply absent, so its title
+ * never reaches a personal-version view.
+ */
+async function loadReadableEntries(caps: PrincipalCaps, entryIds: readonly string[]) {
+	const ids = [...new Set(entryIds)];
+	if (ids.length === 0) return new Map<string, ReadableEntrySummary>();
+	const entries = await db.query.knowledgeEntries.findMany({
+		where: (e, { inArray: ia }) => ia(e.id, ids),
+		columns: {
+			id: true,
+			title: true,
+			collectionId: true,
+			ownerUserId: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			reviewTagsJson: true,
+			currentRevisionId: true,
+		},
+	});
+	const cols = await loadCollectionAclRows(entries.map((e) => e.collectionId));
+	const out = new Map<string, ReadableEntrySummary>();
+	for (const e of entries) {
+		const col = cols.get(e.collectionId);
+		if (!col) continue;
+		if (await canRead(caps, toAclEntry(e), toAclCollection(col))) out.set(e.id, e);
+	}
+	return out;
+}
+
+interface ReadableEntrySummary {
+	id: string;
+	title: string;
+	collectionId: string;
+	currentRevisionId: string | null;
+}
+
+async function loadCollectionAclRows(collectionIds: readonly string[]) {
+	const ids = [...new Set(collectionIds)];
+	if (ids.length === 0) return new Map<string, CollectionAclRow>();
+	const rows = await db.query.knowledgeCollections.findMany({
+		where: (c, { inArray: ia }) => ia(c.id, ids),
+		columns: {
+			id: true,
+			name: true,
+			defaultLevel: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
+	});
+	return new Map(rows.map((c) => [c.id, c]));
+}
+
+type CollectionAclRow = Pick<
+	CollectionRow,
+	"id" | "name" | "defaultLevel" | "classificationLevel" | "controlledTagsJson" | "ownerUserId"
+>;
+
+/** Names of the collections (among `collectionIds`) the caller can read. */
+async function readableCollectionNames(caps: PrincipalCaps, collectionIds: readonly string[]) {
+	const cols = await loadCollectionAclRows(collectionIds);
+	const out = new Map<string, string>();
+	for (const c of cols.values()) {
+		if (await canReadCollection(caps, toAclCollection(c))) out.set(c.id, c.name);
+	}
+	return out;
+}
+
+/**
+ * `GET /personal-entries` for "My" (§5.4): {@link listMine} + `drifted` (as before) + the
+ * display names the list shows — `entryTitle` (linked, only while the caller can READ that
+ * entry) and `targetCollectionName` (standalone, only while the target collection is readable).
+ * Bounded by the list cap; two `inArray` lookups per kind, no per-row queries.
+ */
+async function listMineForViewer(
+	principal: Principal,
+	opts: { status?: PersonalEntryStatus; limit?: number } = {},
+) {
+	const rows = await listMine(principal, opts);
+	if (rows.length === 0) return [];
+	const driftedIds = await findDriftedDraftIds(rows);
+	const caps = await resolvePrincipalCaps(principal);
+	const entries = await loadReadableEntries(
+		caps,
+		rows.map((r) => r.entryId).filter((id): id is string => !!id),
+	);
+	const colNames = await readableCollectionNames(
+		caps,
+		rows
+			.filter((r) => !r.entryId)
+			.map((r) => r.targetCollectionId)
+			.filter((id): id is string => !!id),
+	);
+	return rows.map((r) => ({
+		...r,
+		drifted: driftedIds.has(r.id),
+		entryTitle: r.entryId ? (entries.get(r.entryId)?.title ?? null) : null,
+		targetCollectionName:
+			!r.entryId && r.targetCollectionId ? (colNames.get(r.targetCollectionId) ?? null) : null,
+	}));
+}
+
+/**
+ * What the owner may do with one personal version. Each flag is the gate of the endpoint it
+ * stands for (all of them first pass {@link loadOwnDraft}: author or admin):
+ *  - `canEdit` — `PATCH /drafts/:id` ({@link updateDraft}): not archived;
+ *  - `canEditMeta` — `PATCH /personal-entries/:id` ({@link updateStandaloneMeta}): not archived
+ *    and standalone (linked entries inherit title/target from the global entry);
+ *  - `canRebase` — `POST /drafts/:id/rebase` ({@link rebaseDraft}): not archived, linked, and
+ *    the linked entry is readable;
+ *  - `canDelete` — `DELETE /personal-entries/:id`: not archived (deleting an archived entry is
+ *    an idempotent no-op, so there is nothing to offer);
+ *  - `canSubmit` / `submitBlockers` — `POST /drafts/:id/submit` ({@link submitForReview}):
+ *    {@link personalEntrySubmitBlockers}.
+ */
+export function personalEntryViewerCaps(
+	draft: Pick<PersonalEntryRow, "status" | "entryId" | "targetCollectionId" | "title">,
+	ctx: { entryReadable: boolean; unclosedStatuses: readonly string[] },
+) {
+	const active = draft.status !== "archived";
+	const submitBlockers = personalEntrySubmitBlockers(draft, ctx.unclosedStatuses);
+	return {
+		canEdit: active,
+		canEditMeta: active && !draft.entryId,
+		canRebase: active && !!draft.entryId && ctx.entryReadable,
+		canDelete: active,
+		canSubmit: submitBlockers.length === 0,
+		submitBlockers,
+	};
+}
+
+/**
+ * `GET /personal-entries/:id` for the personal-version page (§5.5): the entry (with body) plus
+ * everything the page shows, same gate as {@link getMine}. On top of that gate:
+ *  - linked: `entryTitle`, `currentMainContent` (the diff baseline) and `drift` only while the
+ *    caller can READ the linked entry — losing access must not keep leaking main through the
+ *    owner's copy;
+ *  - standalone: `targetCollectionName` only while that collection is readable;
+ *  - `openSubmissions`: the requests a delete would close ({@link CLOSED_ON_ENTRY_DELETE_STATUSES}
+ *    — pending / conflict / changes requested), newest first, no bodies; the caller's own rows.
+ */
+async function getMineForViewer(principal: Principal, draftId: string) {
+	const draft = await loadOwnDraft(principal, draftId);
+	const caps = await resolvePrincipalCaps(principal);
+
+	let entryTitle: string | null = null;
+	let currentMainContent: string | null = null;
+	let drift: { drifted: boolean; versionsBehind: number } | null = null;
+	let entryReadable = false;
+	if (draft.entryId) {
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: eq(knowledgeEntries.id, draft.entryId),
+		});
+		const col = entry
+			? (await loadCollectionAclRows([entry.collectionId])).get(entry.collectionId)
+			: null;
+		entryReadable =
+			!!entry && !!col && (await canRead(caps, toAclEntry(entry), toAclCollection(col)));
+		if (entry && entryReadable) {
+			entryTitle = entry.title;
+			currentMainContent = entry.currentContent ?? "";
+			const drifted = !!draft.baseRevisionId && draft.baseRevisionId !== entry.currentRevisionId;
+			drift = {
+				drifted,
+				versionsBehind: drifted
+					? await countVersionsBehind(draft.baseRevisionId, entry.currentRevisionId ?? null)
+					: 0,
+			};
+		}
+	}
+
+	let targetCollectionName: string | null = null;
+	if (!draft.entryId && draft.targetCollectionId) {
+		targetCollectionName =
+			(await readableCollectionNames(caps, [draft.targetCollectionId])).get(
+				draft.targetCollectionId,
+			) ?? null;
+	}
+
+	const openSubmissions = await db.query.knowledgeSubmissions.findMany({
+		where: (s, { and: a, eq: e, inArray: ia }) =>
+			a(e(s.draftId, draftId), ia(s.status, [...CLOSED_ON_ENTRY_DELETE_STATUSES])),
+		columns: { id: true, status: true, round: true, createdAt: true },
+		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit: OPEN_SUBMISSION_SCAN_LIMIT,
+	});
+
+	return {
+		...draft,
+		entryTitle,
+		currentMainContent,
+		drift,
+		targetCollectionName,
+		openSubmissions,
+		viewerCaps: personalEntryViewerCaps(draft, {
+			entryReadable,
+			unclosedStatuses: openSubmissions.map((s) => s.status),
+		}),
+	};
 }
 
 /**
@@ -619,6 +834,61 @@ async function rebaseDraft(
 
 // ─── Submission + review ────────────────────────────────────────────────
 
+/**
+ * Why a personal entry cannot be submitted, in the order {@link submitForReview} checks:
+ *  - `archived` — retired entries are immutable;
+ *  - `missing_target` / `missing_title` — a STANDALONE entry publishes by creating a new global
+ *    entry on approve, so it needs both (linked entries inherit them from the global entry);
+ *  - `open_request` — the store's create guard refuses a second request while one is
+ *    claimable (pending / conflict); see `createSubmissionGuarded`.
+ */
+export type PersonalEntrySubmitBlocker =
+	| "archived"
+	| "missing_target"
+	| "missing_title"
+	| "open_request";
+
+const SUBMIT_BLOCKER_MESSAGES: Record<
+	Exclude<PersonalEntrySubmitBlocker, "open_request">,
+	string
+> = {
+	archived: "Personal entry is archived and cannot be published",
+	missing_target: "This personal entry has no target collection; set one before publishing",
+	missing_title: "This personal entry has no title; set one before publishing",
+};
+
+/** The first content precondition {@link submitForReview} rejects, or null. Pure. */
+export function personalEntrySubmitPreconditionBlocker(
+	draft: Pick<PersonalEntryRow, "status" | "entryId" | "targetCollectionId" | "title">,
+): Exclude<PersonalEntrySubmitBlocker, "open_request"> | null {
+	if (draft.status === "archived") return "archived";
+	if (!draft.entryId) {
+		if (!draft.targetCollectionId) return "missing_target";
+		if (!draft.title?.trim()) return "missing_title";
+	}
+	return null;
+}
+
+/**
+ * Every reason a submit would be refused right now (for the page to list them all, not just
+ * the first). `openStatuses` are the statuses of the entry's unclosed requests.
+ */
+export function personalEntrySubmitBlockers(
+	draft: Pick<PersonalEntryRow, "status" | "entryId" | "targetCollectionId" | "title">,
+	openStatuses: readonly string[],
+): PersonalEntrySubmitBlocker[] {
+	const out: PersonalEntrySubmitBlocker[] = [];
+	if (draft.status === "archived") out.push("archived");
+	if (!draft.entryId) {
+		if (!draft.targetCollectionId) out.push("missing_target");
+		if (!draft.title?.trim()) out.push("missing_title");
+	}
+	if (openStatuses.some((s) => (CLAIMABLE_SUBMISSION_STATUSES as readonly string[]).includes(s))) {
+		out.push("open_request");
+	}
+	return out;
+}
+
 async function submitForReview(
 	principal: Principal,
 	draftId: string,
@@ -631,22 +901,10 @@ async function submitForReview(
 	},
 ) {
 	const draft = await loadOwnDraft(principal, draftId);
-	if (draft.status === "archived") {
-		throw new ValidationError("Personal entry is archived and cannot be published");
-	}
-	// Standalone personal entries (no linked global entry) publish by CREATING a new global
-	// entry on approve. They need a target collection + title; for linked entries these are
-	// derived from the existing entry and ignored here.
-	if (!draft.entryId) {
-		if (!draft.targetCollectionId) {
-			throw new ValidationError(
-				"This personal entry has no target collection; set one before publishing",
-			);
-		}
-		if (!draft.title?.trim()) {
-			throw new ValidationError("This personal entry has no title; set one before publishing");
-		}
-	}
+	// Content preconditions — the same pure check the personal-version page's `viewerCaps`
+	// reports as blocked reasons, so the page and this endpoint cannot disagree.
+	const blocker = personalEntrySubmitPreconditionBlocker(draft);
+	if (blocker) throw new ValidationError(SUBMIT_BLOCKER_MESSAGES[blocker]);
 	// Drift check BEFORE submitting (linked entries only; a standalone entry has no main).
 	//
 	// Submitting from a stale fork point is allowed — approve does a three-way merge and
@@ -725,6 +983,161 @@ async function loadSubmission(submissionId: string) {
 	return sub;
 }
 
+// ─── Shared submission decisions ──────────────────────────────────────────
+//
+// Each write endpoint below (`review`, `resolveConflict`, `withdrawSubmission`, `resubmit`)
+// and the request-detail `viewerCaps` call THESE functions, so the UI's buttons and the
+// endpoints cannot drift apart (docs/KNOWLEDGE_UI_REDESIGN.md §8.2).
+
+type SubmissionRow = typeof knowledgeSubmissions.$inferSelect;
+type ResolvedCaps = Awaited<ReturnType<typeof resolvePrincipalCaps>>;
+type EntryRow = typeof knowledgeEntries.$inferSelect;
+type CollectionRow = typeof knowledgeCollections.$inferSelect;
+
+/**
+ * Reviewer authority over a submission's TARGET, independent of status and of who submitted:
+ *  - linked     → target entry's collection readable AND `canReview(entry)`;
+ *  - standalone → target collection readable AND writable (approve creates an entry there).
+ *
+ * `hidden` marks a refusal that must not reveal the submission (unreadable / missing target);
+ * the others are ordinary permission errors. `error` is exactly what the write paths throw.
+ */
+type SubmissionReviewAuthority =
+	| { ok: true; entry: EntryRow | null; collection: CollectionRow }
+	| { ok: false; hidden: boolean; error: AppError };
+
+async function submissionReviewAuthority(
+	caps: ResolvedCaps,
+	sub: Pick<SubmissionRow, "id" | "entryId" | "collectionId">,
+): Promise<SubmissionReviewAuthority> {
+	if (sub.entryId) {
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: eq(knowledgeEntries.id, sub.entryId),
+		});
+		if (!entry) {
+			return { ok: false, hidden: true, error: new NotFoundError("Knowledge entry", sub.entryId) };
+		}
+		const collection = await db.query.knowledgeCollections.findFirst({
+			where: eq(knowledgeCollections.id, entry.collectionId),
+		});
+		if (!collection) {
+			return {
+				ok: false,
+				hidden: true,
+				error: new NotFoundError("Knowledge collection", entry.collectionId),
+			};
+		}
+		if (!(await canReadCollection(caps, toAclCollection(collection)))) {
+			return { ok: false, hidden: true, error: new NotFoundError("Knowledge submission", sub.id) };
+		}
+		if (!canReview(caps, toAclEntry(entry))) {
+			return {
+				ok: false,
+				hidden: false,
+				error: new ValidationError("You do not have permission to review this entry"),
+			};
+		}
+		return { ok: true, entry, collection };
+	}
+	if (!sub.collectionId) {
+		return {
+			ok: false,
+			hidden: false,
+			error: new ValidationError("Standalone publish has no target collection"),
+		};
+	}
+	const collection = await db.query.knowledgeCollections.findFirst({
+		where: eq(knowledgeCollections.id, sub.collectionId),
+	});
+	if (!collection) {
+		return {
+			ok: false,
+			hidden: true,
+			error: new NotFoundError("Knowledge collection", sub.collectionId),
+		};
+	}
+	const aclCol = toAclCollection(collection);
+	if (!(await canReadCollection(caps, aclCol))) {
+		return { ok: false, hidden: true, error: new NotFoundError("Knowledge submission", sub.id) };
+	}
+	if (!canWriteCollection(caps, aclCol)) {
+		return {
+			ok: false,
+			hidden: false,
+			error: new ValidationError("You do not have permission to publish into this collection"),
+		};
+	}
+	return { ok: true, entry: null, collection };
+}
+
+async function assertSubmissionReviewAuthority(
+	caps: ResolvedCaps,
+	sub: Pick<SubmissionRow, "id" | "entryId" | "collectionId">,
+) {
+	const authority = await submissionReviewAuthority(caps, sub);
+	if (!authority.ok) throw authority.error;
+	return authority;
+}
+
+/** Self-review is refused for everyone but an admin (§6.7.5). */
+function isSelfReviewBlocked(principal: Principal, sub: Pick<SubmissionRow, "submitterUserId">) {
+	return sub.submitterUserId === principal.userId && principal.role !== "admin";
+}
+
+/** Author-side actions (withdraw / resubmit) belong to the submitter, or an admin cleaning up. */
+function canActAsSubmitter(principal: Principal, sub: Pick<SubmissionRow, "submitterUserId">) {
+	return sub.submitterUserId === principal.userId || principal.role === "admin";
+}
+
+/** Statuses `review` accepts a verdict on (`approve` additionally needs `pending`). */
+const REVIEWABLE_SUBMISSION_STATUSES = ["pending", "conflict"] as const;
+
+function isReviewableStatus(status: string): boolean {
+	return (REVIEWABLE_SUBMISSION_STATUSES as readonly string[]).includes(status);
+}
+
+function isWithdrawableStatus(status: string): boolean {
+	return (WITHDRAWABLE_SUBMISSION_STATUSES as readonly string[]).includes(status);
+}
+
+/** What the requesting principal may do with one publish request (GET /submissions/:id). */
+export interface KnowledgeSubmissionViewerCaps {
+	/** The viewer submitted this request. */
+	isSubmitter: boolean;
+	/** `POST /submissions/:id/review` accepts a verdict (at least `comment_only`). */
+	canReview: boolean;
+	/** `POST /submissions/:id/review` accepts `approve` (pending only; conflict → resolve). */
+	canApprove: boolean;
+	/** `POST /submissions/:id/resolve`. */
+	canResolveConflict: boolean;
+	/** `POST /submissions/:id/withdraw`. */
+	canWithdraw: boolean;
+	/**
+	 * `POST /submissions/:id/resubmit` passes its own gate (submitter-or-admin + status).
+	 * submitForReview's content preconditions (archived draft, missing title/target) are
+	 * reported by that call, not folded in here.
+	 */
+	canResubmit: boolean;
+}
+
+/** Pure given the resolved authority; mirrors each write path's checks in order. */
+export function submissionViewerCaps(
+	principal: Principal,
+	sub: Pick<SubmissionRow, "status" | "entryId" | "submitterUserId">,
+	authorityOk: boolean,
+): KnowledgeSubmissionViewerCaps {
+	const reviewer = authorityOk && !isSelfReviewBlocked(principal, sub);
+	const author = canActAsSubmitter(principal, sub);
+	return {
+		isSubmitter: sub.submitterUserId === principal.userId,
+		canReview: reviewer && isReviewableStatus(sub.status),
+		canApprove: reviewer && sub.status === "pending",
+		canResolveConflict: reviewer && sub.status === "conflict" && !!sub.entryId,
+		canWithdraw: author && isWithdrawableStatus(sub.status),
+		canResubmit: author && sub.status === "changes_requested",
+	};
+}
+
 interface Finding {
 	severity: "critical" | "major" | "minor" | "suggestion";
 	message: string;
@@ -765,22 +1178,12 @@ async function review(
 		);
 	}
 	const caps = await resolvePrincipalCaps(principal);
-	// Authorization differs by publish kind:
+	// Authorization differs by publish kind (see submissionReviewAuthority):
 	//  - linked (entryId set): collection-gate + canReview on the target entry.
 	//  - standalone (entryId null): the publish creates a NEW entry in sub.collectionId, so
 	//    the reviewer must be able to READ + WRITE that target collection.
-	if (sub.entryId) {
-		const { entry, collection } = await loadEntryAndCollection(sub.entryId);
-		if (!(await canReadCollection(caps, toAclCollection(collection)))) {
-			throw new NotFoundError("Knowledge submission", submissionId);
-		}
-		if (!canReview(caps, toAclEntry(entry))) {
-			throw new ValidationError("You do not have permission to review this entry");
-		}
-	} else {
-		await assertCanReviewStandalone(caps, sub);
-	}
-	if (sub.submitterUserId === principal.userId && principal.role !== "admin") {
+	await assertSubmissionReviewAuthority(caps, sub);
+	if (isSelfReviewBlocked(principal, sub)) {
 		throw new ValidationError("You cannot review your own submission");
 	}
 
@@ -819,31 +1222,6 @@ async function review(
 		reviewerUserId: principal.userId,
 	});
 	return { submissionId, status: newStatus, verdict: input.verdict };
-}
-
-/**
- * Authorize a reviewer for a STANDALONE publish (creating a new global entry in the
- * submission's target collection): the collection must be readable AND writable by them.
- * Throws NotFound when the collection is unreadable (don't leak), ValidationError otherwise.
- */
-async function assertCanReviewStandalone(
-	caps: Awaited<ReturnType<typeof resolvePrincipalCaps>>,
-	sub: typeof knowledgeSubmissions.$inferSelect,
-) {
-	if (!sub.collectionId) {
-		throw new ValidationError("Standalone publish has no target collection");
-	}
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, sub.collectionId),
-	});
-	if (!collection) throw new NotFoundError("Knowledge collection", sub.collectionId);
-	const aclCol = toAclCollection(collection);
-	if (!(await canReadCollection(caps, aclCol))) {
-		throw new NotFoundError("Knowledge submission", sub.id);
-	}
-	if (!canWriteCollection(caps, aclCol)) {
-		throw new ValidationError("You do not have permission to publish into this collection");
-	}
 }
 
 /** Three-way merge proposed content into main via patch apply; conflict → return three-way content. */
@@ -992,15 +1370,9 @@ async function resolveConflict(
 	if (!sub.entryId) {
 		throw new ValidationError("Submission has no target entry to resolve against");
 	}
-	const { entry, collection } = await loadEntryAndCollection(sub.entryId);
 	const caps = await resolvePrincipalCaps(principal);
-	if (!(await canReadCollection(caps, toAclCollection(collection)))) {
-		throw new NotFoundError("Knowledge submission", submissionId);
-	}
-	if (!canReview(caps, toAclEntry(entry))) {
-		throw new ValidationError("You do not have permission to review this entry");
-	}
-	if (sub.submitterUserId === principal.userId && principal.role !== "admin") {
+	await assertSubmissionReviewAuthority(caps, sub);
+	if (isSelfReviewBlocked(principal, sub)) {
 		throw new ValidationError("You cannot resolve your own submission");
 	}
 	const now = nowIso();
@@ -1302,27 +1674,217 @@ async function countReviewInbox(
 	return { count, capped, limit: REVIEW_INBOX_COUNT_LIMIT };
 }
 
-async function getSubmission(principal: Principal, submissionId: string) {
+/**
+ * The read gate for ONE submission: the submitter may always view their own; anyone else needs
+ * reviewer authority over its target (linked → collection read + canReview; standalone →
+ * collection read + write). Every refusal is NotFound, so a request's existence (and its
+ * title / body) never leaks to someone who could not review it.
+ */
+async function loadViewableSubmission(principal: Principal, submissionId: string) {
 	const sub = await loadSubmission(submissionId);
-	// Submitter can view their own submission; otherwise collection-read + reviewer
-	// permission are required (linked → target entry; standalone → target collection).
-	if (sub.submitterUserId !== principal.userId) {
-		const caps = await resolvePrincipalCaps(principal);
-		if (sub.entryId) {
-			const { entry, collection } = await loadEntryAndCollection(sub.entryId);
-			if (!(await canReadCollection(caps, toAclCollection(collection)))) {
-				throw new NotFoundError("Knowledge submission", submissionId);
-			}
-			if (!canReview(caps, toAclEntry(entry))) {
-				throw new NotFoundError("Knowledge submission", submissionId);
-			}
-		} else {
-			await assertCanReviewStandalone(caps, sub);
-		}
+	const caps = await resolvePrincipalCaps(principal);
+	const authority = await submissionReviewAuthority(caps, sub);
+	if (sub.submitterUserId !== principal.userId && !authority.ok) {
+		throw new NotFoundError("Knowledge submission", submissionId);
 	}
+	return { sub, caps, authority };
+}
+
+async function getSubmission(principal: Principal, submissionId: string) {
+	const { sub } = await loadViewableSubmission(principal, submissionId);
 	const baseContent = await baseContentOf(sub.baseRevisionId);
 	const unified = createPatch("entry", baseContent, sub.proposedContent, "base", "proposed");
 	return { ...sub, diff: unified };
+}
+
+/** Bounded per-draft request history shown on the request page (rounds of one proposal). */
+const SUBMISSION_HISTORY_LIMIT = 20;
+
+/** Usernames for display; one `inArray` lookup bounded by the caller's row set. */
+async function usernamesById(userIds: (string | null | undefined)[]) {
+	const ids = [...new Set(userIds.filter((id): id is string => !!id))];
+	if (ids.length === 0) return new Map<string, string>();
+	const rows = await db.query.users.findMany({
+		where: (u, { inArray: ia }) => ia(u.id, ids),
+		columns: { id: true, username: true },
+	});
+	return new Map(rows.map((u) => [u.id, u.username]));
+}
+
+/**
+ * `GET /submissions/:id` for the request page: the submission (+ unified diff) plus everything
+ * the page needs to render without assembling several requests (§6.2), and `viewerCaps`.
+ *
+ * Same gate as {@link getSubmission}. Display metadata is ACL-checked on top of it:
+ *  - `entryTitle` / `currentMainContent` / drift need `canRead` on the target entry (a reviewer
+ *    by review tag, or a submitter who lost access, does not automatically read main);
+ *  - `collectionName` needs `canReadCollection`;
+ *  - `baseContent` is the fork point the proposal was diffed against — already derivable from
+ *    `proposedContent` + `diff`, so it reveals nothing new.
+ */
+async function getSubmissionForViewer(principal: Principal, submissionId: string) {
+	const { sub, caps, authority } = await loadViewableSubmission(principal, submissionId);
+	const baseContent = await baseContentOf(sub.baseRevisionId);
+	const diff = createPatch("entry", baseContent, sub.proposedContent, "base", "proposed");
+
+	// Target rows: reuse what the authority check loaded; a submitter without authority still
+	// needs them for the (separately gated) display fields.
+	let entry: EntryRow | null = authority.ok ? authority.entry : null;
+	let collection: CollectionRow | null = authority.ok ? authority.collection : null;
+	if (!authority.ok) {
+		if (sub.entryId) {
+			entry =
+				(await db.query.knowledgeEntries.findFirst({
+					where: eq(knowledgeEntries.id, sub.entryId),
+				})) ?? null;
+		}
+		const colId = entry?.collectionId ?? sub.collectionId;
+		if (colId) {
+			collection =
+				(await db.query.knowledgeCollections.findFirst({
+					where: eq(knowledgeCollections.id, colId),
+				})) ?? null;
+		}
+	}
+	const aclCol = collection ? toAclCollection(collection) : null;
+	const collectionReadable = !!aclCol && (await canReadCollection(caps, aclCol));
+	const entryReadable = !!entry && !!aclCol && (await canRead(caps, toAclEntry(entry), aclCol));
+
+	let drift: { drifted: boolean; versionsBehind: number } | null = null;
+	if (entry && entryReadable) {
+		const drifted = !!sub.baseRevisionId && sub.baseRevisionId !== entry.currentRevisionId;
+		drift = {
+			drifted,
+			versionsBehind: drifted
+				? await countVersionsBehind(sub.baseRevisionId, entry.currentRevisionId)
+				: 0,
+		};
+	}
+
+	// Rounds of the same proposal (resubmits share the draft). Restricted to the same target so
+	// a standalone draft re-targeted elsewhere never surfaces another collection's request.
+	const history = await db.query.knowledgeSubmissions.findMany({
+		where: (s, { eq: e }) => e(s.draftId, sub.draftId),
+		columns: {
+			id: true,
+			entryId: true,
+			collectionId: true,
+			changeNote: true,
+			round: true,
+			status: true,
+			verdict: true,
+			findingsJson: true,
+			reviewerUserId: true,
+			reviewedAt: true,
+			createdAt: true,
+		},
+		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit: SUBMISSION_HISTORY_LIMIT,
+	});
+	const sameTarget = history.filter(
+		(h) => h.entryId === sub.entryId && h.collectionId === sub.collectionId,
+	);
+	const names = await usernamesById([
+		sub.submitterUserId,
+		sub.reviewerUserId,
+		...sameTarget.map((h) => h.reviewerUserId),
+	]);
+
+	return {
+		...sub,
+		diff,
+		baseContent,
+		currentMainContent: entry && entryReadable ? (entry.currentContent ?? "") : null,
+		entryTitle: entry && entryReadable ? entry.title : null,
+		targetCollectionId: collection?.id ?? sub.collectionId ?? null,
+		collectionName: collection && collectionReadable ? collection.name : null,
+		submitterUsername: names.get(sub.submitterUserId) ?? null,
+		reviewerUsername: sub.reviewerUserId ? (names.get(sub.reviewerUserId) ?? null) : null,
+		drift,
+		history: sameTarget.map(({ entryId: _e, collectionId: _c, ...h }) => ({
+			...h,
+			reviewerUsername: h.reviewerUserId ? (names.get(h.reviewerUserId) ?? null) : null,
+		})),
+		viewerCaps: submissionViewerCaps(principal, sub, authority.ok),
+	};
+}
+
+/**
+ * The reviewer list ({@link listSubmissions}) plus per-row display metadata for the review
+ * inbox: entry title (only when the caller can READ the entry), target collection id/name
+ * (name only when readable), submitter username, and a drift flag for open linked requests.
+ * Bounded by the list cap; three `inArray` lookups, no per-row queries.
+ */
+async function listSubmissionsForInbox(
+	principal: Principal,
+	opts: { entryId?: string; status?: string; limit?: number },
+) {
+	const rows = await listSubmissions(principal, opts);
+	if (rows.length === 0) return [];
+	const caps = await resolvePrincipalCaps(principal);
+	const entryIds = [...new Set(rows.map((s) => s.entryId).filter((id): id is string => !!id))];
+	const entries =
+		entryIds.length > 0
+			? await db.query.knowledgeEntries.findMany({
+					where: (e, { inArray: ia }) => ia(e.id, entryIds),
+					columns: {
+						id: true,
+						title: true,
+						collectionId: true,
+						ownerUserId: true,
+						classificationLevel: true,
+						controlledTagsJson: true,
+						reviewTagsJson: true,
+						currentRevisionId: true,
+					},
+				})
+			: [];
+	const entryById = new Map(entries.map((e) => [e.id, e]));
+	const colIds = [
+		...new Set([
+			...entries.map((e) => e.collectionId),
+			...rows.map((s) => s.collectionId).filter((id): id is string => !!id),
+		]),
+	];
+	const cols =
+		colIds.length > 0
+			? await db.query.knowledgeCollections.findMany({
+					where: (c, { inArray: ia }) => ia(c.id, colIds),
+					columns: {
+						id: true,
+						name: true,
+						defaultLevel: true,
+						classificationLevel: true,
+						controlledTagsJson: true,
+						ownerUserId: true,
+					},
+				})
+			: [];
+	const colById = new Map(cols.map((c) => [c.id, c]));
+	const names = await usernamesById(rows.map((s) => s.submitterUserId));
+
+	const out = [];
+	for (const s of rows) {
+		const entry = s.entryId ? entryById.get(s.entryId) : undefined;
+		const colId = entry?.collectionId ?? s.collectionId ?? null;
+		const col = colId ? colById.get(colId) : undefined;
+		const aclCol = col ? toAclCollection(col) : null;
+		const colReadable = !!aclCol && (await canReadCollection(caps, aclCol));
+		const entryReadable = !!entry && !!aclCol && (await canRead(caps, toAclEntry(entry), aclCol));
+		const open = s.status === "pending" || s.status === "conflict";
+		out.push({
+			...s,
+			entryTitle: entry && entryReadable ? entry.title : null,
+			targetCollectionId: colId,
+			collectionName: col && colReadable ? col.name : null,
+			submitterUsername: names.get(s.submitterUserId) ?? null,
+			drifted:
+				open && entry && entryReadable
+					? !!s.baseRevisionId && s.baseRevisionId !== entry.currentRevisionId
+					: null,
+		});
+	}
+	return out;
 }
 
 /**
@@ -1334,6 +1896,48 @@ async function getSubmission(principal: Principal, submissionId: string) {
  * and excluding the large proposedContent blob. No ACL gate is needed: these are the
  * caller's own submissions.
  */
+/**
+ * Author-facing verdicts from the last 30 days.
+ *
+ * The notification bell reads this instead of the `notifications` table. That table's
+ * activity projection re-joins source rows and would have to store a title; knowledge
+ * titles are classified, so review events stay id-only here (no title, change note, or
+ * proposed content). Findings are included because they are the reviewer's notes to the
+ * author of this submission — the same rows `listSubmissionsForDraft` already returns.
+ *
+ * Pending requests are omitted: the author just submitted those. `changes_requested`,
+ * `approved`, and `rejected` are the verdicts they would otherwise miss.
+ */
+const SUBMISSION_OUTCOME_STATUSES = ["approved", "rejected", "changes_requested"] as const;
+const SUBMISSION_OUTCOME_LIMIT = 30;
+const SUBMISSION_OUTCOME_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+async function listMySubmissionOutcomes(principal: Principal, opts: { limit?: number } = {}) {
+	if (!principal.userId) return [];
+	const limit = Math.min(opts.limit ?? SUBMISSION_OUTCOME_LIMIT, SUBMISSION_OUTCOME_LIMIT);
+	const cutoff = new Date(Date.now() - SUBMISSION_OUTCOME_MAX_AGE_MS).toISOString();
+	return db.query.knowledgeSubmissions.findMany({
+		where: (s, { and: a, eq: e, inArray: ia, gte }) =>
+			a(
+				e(s.submitterUserId, principal.userId),
+				ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
+				gte(s.reviewedAt, cutoff),
+			),
+		columns: {
+			id: true,
+			draftId: true,
+			entryId: true,
+			status: true,
+			verdict: true,
+			findingsJson: true,
+			reviewedAt: true,
+			createdAt: true,
+		},
+		orderBy: (s, { desc: d }) => [d(s.reviewedAt)],
+		limit,
+	});
+}
+
 async function listMyOpenSubmissions(principal: Principal, opts: { limit?: number } = {}) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
@@ -1431,10 +2035,10 @@ async function withdrawSubmission(
 ) {
 	const sub = await loadSubmission(submissionId);
 	// Existence is only revealed to the submitter or an admin (mirrors loadOwnDraft).
-	if (sub.submitterUserId !== principal.userId && principal.role !== "admin") {
+	if (!canActAsSubmitter(principal, sub)) {
 		throw new NotFoundError("Knowledge submission", submissionId);
 	}
-	if (!(WITHDRAWABLE_SUBMISSION_STATUSES as readonly string[]).includes(sub.status)) {
+	if (!isWithdrawableStatus(sub.status)) {
 		throw new ValidationError(
 			`Submission is ${sub.status} and can no longer be withdrawn ` +
 				`(only pending, conflict, or changes_requested requests can)`,
@@ -1488,7 +2092,7 @@ async function resubmit(
 	input: { changeNote?: string } = {},
 ) {
 	const sub = await loadSubmission(submissionId);
-	if (sub.submitterUserId !== principal.userId && principal.role !== "admin") {
+	if (!canActAsSubmitter(principal, sub)) {
 		throw new NotFoundError("Knowledge submission", submissionId);
 	}
 	if (sub.status !== "changes_requested") {
@@ -1614,8 +2218,10 @@ export const knowledgeBranchService = {
 	createDraft,
 	createStandalone,
 	listMine,
+	listMineForViewer,
 	findDriftedDraftIds,
 	getMine,
+	getMineForViewer,
 	updateStandaloneMeta,
 	deletePersonalEntry,
 	getMyDraft,
@@ -1629,8 +2235,11 @@ export const knowledgeBranchService = {
 	listSubmissions,
 	listSubmissionsForDraft,
 	listMyOpenSubmissions,
+	listMySubmissionOutcomes,
 	countReviewInbox,
 	getSubmission,
+	getSubmissionForViewer,
+	listSubmissionsForInbox,
 	withdrawSubmission,
 	resubmit,
 	getMyReviewScope,

@@ -33,7 +33,9 @@ export interface SubagentRuntimeProfile {
 	control?: RuntimeForegroundControl;
 }
 
-export type RuntimeProfile = { kind: "primary" } | SubagentRuntimeProfile;
+export type RuntimeProfile =
+	| { kind: "primary"; initialPrePromptBashCommand?: string }
+	| SubagentRuntimeProfile;
 
 export type RuntimeInput =
 	| { kind: "current"; text: string; images?: ImageRef[] }
@@ -66,8 +68,7 @@ export function createRuntimeRunState(
 		recovery: createRuntimeRecoveryState(),
 		firstPass: true,
 		initialSettingsApplied: false,
-		pendingPrePromptBashCommand:
-			profile.kind === "subagent" ? profile.initialPrePromptBashCommand : undefined,
+		pendingPrePromptBashCommand: profile.initialPrePromptBashCommand,
 		hadError: false,
 		wasInterrupted: false,
 		finalText: "",

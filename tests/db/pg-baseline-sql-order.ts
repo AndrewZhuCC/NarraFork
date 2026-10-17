@@ -314,6 +314,14 @@ function alterTable(cursor: Cursor, order: Map<string, string[]>): void {
 		} else if (part.keyword("validate") && part.keyword("constraint")) {
 			part.identifier();
 			part.end();
+		} else if (
+			(part.keyword("disable") || part.keyword("enable")) &&
+			part.keyword("row") &&
+			part.keyword("level") &&
+			part.keyword("security")
+		) {
+			// drizzle-kit emits this before DROP TABLE. It does not add, drop, or reorder columns.
+			part.end();
 		} else throw new Error(`Unsupported ALTER TABLE action for ${table}`);
 	}
 }
@@ -351,10 +359,12 @@ function dataOnly(tokens: readonly Token[]): void {
  * Reviewed procedural statements, admitted by EXACT text only.
  *
  * Layout replay cannot see inside a dollar-quoted body, so procedural DDL stays fail-closed in
- * general. These are the model-history revision triggers of migration 0012: they bump integer
- * counters and never alter, create or drop a relation or column. Each entry is the SHA-256 of
- * the statement as written in the SQL file (trimmed, without its terminating semicolon); a single
- * changed character falls back to the generic rejection and requires a fresh review here.
+ * general. Admitted statements are the model-history revision triggers of migration 0012 (they
+ * bump integer counters) and the numeric context-stats copy of migration 0022 (it upserts one
+ * existing table). None of them alter, create or drop a relation or column. Each entry is the
+ * SHA-256 of the statement as written in the SQL file (trimmed, without its terminating
+ * semicolon); a single changed character falls back to the generic rejection and requires a
+ * fresh review here.
  */
 const REVIEWED_PROCEDURAL_STATEMENTS = new Map<string, string>([
 	// 0012_narrator_model_history_revision.sql
@@ -401,6 +411,24 @@ const REVIEWED_PROCEDURAL_STATEMENTS = new Map<string, string>([
 	[
 		"4549dcc98c05b70107eed1856f9687b2ab67795464f97dd8acd77d38b58d73ae",
 		"seed model_history_revision_contracts",
+	],
+	// 0022_context_numeric_stats.sql — copy numeric segment stats into the narrow table.
+	// The function and triggers only upsert that table; they do not create or alter relations.
+	[
+		"dc09f67bd5b97b0440d33d62c4c50db8b69957264bc8e8edda207e51dabf1dec",
+		"seed narrator_message_context_stats",
+	],
+	[
+		"83352de61b413232368259136465e60f215807870009912ce46b176471f38519",
+		"function narrator_message_context_stats_sync",
+	],
+	[
+		"e7c8c9b44becb63fe0e904db984449dceeac533d2d1e47def2b13705b1741ea6",
+		"trigger narrator_message_context_stats_insert",
+	],
+	[
+		"adb48fb8a2e584de04374d4bdd36395b87299f1d5b0b53e726ecdef2890b4c13",
+		"trigger narrator_message_context_stats_update",
 	],
 ]);
 

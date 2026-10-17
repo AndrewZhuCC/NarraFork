@@ -1,0 +1,340 @@
+.root {
+	--composer-chip-height: 24px;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-md);
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	font-family: var(--mantine-font-family);
+	font-size: var(--mantine-font-size-sm);
+	min-width: 0;
+	width: 100%;
+}
+
+.root:focus-within {
+	border-color: var(--mantine-primary-color-filled);
+}
+
+.root[data-disabled] {
+	opacity: 0.65;
+}
+
+.content {
+	min-width: 0;
+	min-height: var(--composer-min-height, 84px);
+	max-height: var(--composer-max-height, 200px);
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: thin;
+}
+
+.editable {
+	--composer-line-height: max(var(--composer-chip-height), 1.65em);
+	outline: none;
+	padding: 9px 12px;
+	min-height: var(--composer-min-height, 84px);
+	box-sizing: border-box;
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: anywhere;
+	line-height: var(--composer-line-height);
+	cursor: text;
+}
+
+.editable p {
+	margin: 0;
+	min-height: var(--composer-line-height);
+}
+
+.editable[data-empty="true"]::before {
+	content: attr(data-placeholder);
+	color: var(--mantine-color-placeholder);
+	pointer-events: none;
+	float: left;
+	height: 0;
+}
+
+.controls {
+	padding: 4px 8px 8px;
+	flex-shrink: 0;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+
+.leadingControls,
+.trailingControls {
+	flex: 0 0 auto;
+	min-width: 0;
+}
+
+.root[data-adaptive] {
+	position: relative;
+	display: block;
+	overflow: hidden;
+}
+
+.root[data-adaptive][data-layout-ready] {
+	transition: height 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.root[data-adaptive] .content {
+	min-height: 0;
+	height: var(--composer-content-height, 42px);
+}
+
+.root[data-adaptive] .editable {
+	min-height: 0;
+	transform: translateY(var(--composer-text-offset, 0px));
+	transition: transform 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.root[data-adaptive]:not([data-layout="expanded"]) .editable {
+	padding-inline-start: calc(12px + var(--composer-leading-space, 0px));
+	padding-inline-end: calc(12px + var(--composer-trailing-space, 0px));
+}
+
+.root[data-adaptive] .controls {
+	position: absolute;
+	inset-inline: 8px;
+	bottom: 8px;
+	padding: 0;
+	pointer-events: none;
+}
+
+.root[data-adaptive] .controls > * {
+	pointer-events: auto;
+}
+
+.root[data-adaptive]:not([data-layout="expanded"]) .content {
+	max-height: none;
+}
+
+.root[data-adaptive][data-layout="expanded"] .controls {
+	flex-wrap: wrap;
+}
+
+.root[data-adaptive][data-layout="expanded"] .trailingControls {
+	flex: 0 1 auto;
+	max-width: 100%;
+	margin-inline-start: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.root[data-adaptive][data-layout-ready],
+	.root[data-adaptive] .editable {
+		transition: none;
+	}
+}
+
+.atom {
+	display: inline-flex;
+	position: relative;
+	align-items: center;
+	vertical-align: middle;
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-sm);
+	background: var(--mantine-color-default-hover);
+	color: var(--mantine-color-text);
+	box-sizing: border-box;
+	user-select: none;
+	max-width: min(240px, 100%);
+	margin-inline: 2px;
+}
+
+.chip {
+	height: var(--composer-chip-height);
+	/* Middle alignment adds font descent to the line box even when both are 24px. */
+	vertical-align: bottom;
+	padding-inline: 4px 2px;
+	gap: 3px;
+	font-size: var(--mantine-font-size-xs);
+}
+
+.selected {
+	outline: 2px solid var(--mantine-primary-color-filled);
+	outline-offset: 1px;
+}
+
+.nodeBody {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0;
+	min-width: 0;
+	border: 0;
+	background: transparent;
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+}
+
+.nodeBody svg,
+.nodeBody small {
+	flex-shrink: 0;
+}
+
+.label {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	min-width: 0;
+}
+
+.nodeActions {
+	display: inline-flex;
+	flex-shrink: 0;
+}
+
+.action {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	padding: 0;
+	border: 0;
+	border-radius: var(--mantine-radius-xs);
+	background: transparent;
+	color: var(--mantine-color-dimmed);
+	cursor: pointer;
+}
+
+.action:hover,
+.action:focus-visible {
+	background: var(--mantine-color-default-border);
+	color: var(--mantine-color-text);
+}
+
+.action:disabled {
+	cursor: default;
+}
+
+.imageAtom {
+	width: 96px;
+	height: 64px;
+	max-width: 96px;
+	overflow: hidden;
+}
+
+.imageAtom .nodeBody,
+.thumbnail {
+	width: 100%;
+	height: 100%;
+}
+
+.thumbnail {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.thumbnail img {
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+}
+
+.imageAtom .nodeActions {
+	position: absolute;
+	right: 0;
+	top: 0;
+	background: var(--mantine-color-body);
+	border-radius: var(--mantine-radius-xs);
+}
+
+.imageLabel {
+	position: absolute;
+	inset-inline: 0;
+	bottom: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 10px;
+	line-height: 14px;
+	background: var(--mantine-color-body);
+	opacity: 0.9;
+}
+
+.missing {
+	color: var(--mantine-color-orange-text);
+	font-weight: bold;
+}
+
+.imageAtom .missing {
+	position: absolute;
+	left: 3px;
+	top: 0;
+}
+
+.candidate {
+	margin-inline: 2px;
+	min-width: 0;
+	display: inline-flex;
+	align-items: center;
+	vertical-align: bottom;
+	height: var(--composer-chip-height);
+	box-sizing: border-box;
+	gap: 4px;
+	max-width: min(260px, 100%);
+	padding-inline: 4px 2px;
+	border: 1px dashed var(--mantine-primary-color-filled);
+	border-radius: var(--mantine-radius-sm);
+	background: var(--mantine-color-default-hover);
+	color: var(--mantine-color-text);
+	font: var(--mantine-font-size-xs) var(--mantine-font-family);
+	white-space: nowrap;
+	user-select: none;
+}
+
+.candidateAccept {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+	max-width: 100%;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	cursor: pointer;
+}
+
+.candidateAction,
+.candidateAccept > svg {
+	flex-shrink: 0;
+}
+
+.candidateShortcut {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	gap: 3px;
+	height: 18px;
+	box-sizing: border-box;
+	padding-inline: 4px;
+	border: 1px solid var(--mantine-color-dimmed);
+	border-bottom-width: 2px;
+	border-radius: 4px;
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 10px;
+	font-weight: 600;
+	line-height: 1;
+}
+
+.candidateAccept:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+@media (max-width: 48em) {
+	.content {
+		max-height: var(--composer-max-height, min(200px, 30dvh));
+	}
+}

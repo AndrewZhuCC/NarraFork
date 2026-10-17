@@ -1,10 +1,12 @@
 import {
 	type FileReferenceInput,
 	readFileReferences,
+	readInputComposerDocument,
 	sameFileReferenceInput,
 	trimFileReferenceInput,
 } from "@frontend/components/narrator/composer/file-reference-input";
 import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
@@ -27,7 +29,13 @@ function readHistoryEntry(value: unknown): FileReferenceInput | null {
 	if (!value || typeof value !== "object") return null;
 	const entry = value as FileReferenceInput;
 	if (typeof entry.text !== "string" || entry.text.length > MAX_HISTORY_MESSAGE_CHARS) return null;
-	return { text: entry.text, fileReferences: readFileReferences(entry.fileReferences, entry.text) };
+	const fileReferences = readFileReferences(entry.fileReferences, entry.text);
+	const composerDocument = readInputComposerDocument(
+		entry.composerDocument,
+		entry.text,
+		fileReferences,
+	);
+	return { text: entry.text, fileReferences, ...(composerDocument ? { composerDocument } : {}) };
 }
 
 export function readInputHistoryEntries(storageKey: string | null): FileReferenceInput[] {
@@ -62,7 +70,7 @@ export function writeInputHistoryEntries(
 		.map(readHistoryEntry)
 		.filter((entry): entry is FileReferenceInput => entry !== null)
 		.slice(0, MAX_HISTORY)
-		.map((entry) => (entry.fileReferences.length ? entry : entry.text));
+		.map((entry) => (entry.fileReferences.length || entry.composerDocument ? entry : entry.text));
 	if (kept.length === 0) {
 		removeSession("narrator-history", storageId);
 		return;
@@ -134,14 +142,20 @@ export function useInputHistory(storageKey: string | null) {
 
 	/** 发送消息后调用，将消息推入历史并重置浏览位置 */
 	const push = useCallback(
-		(message: string, fileReferences: FileReference[] = []) => {
+		(
+			message: string,
+			fileReferences: FileReference[] = [],
+			composerDocument?: ComposerDocument,
+		) => {
 			const trimmed = message.trim();
 			const entry = trimFileReferenceInput({
 				text: message,
 				fileReferences: readFileReferences(fileReferences, message),
+				composerDocument,
 			});
-			if (!trimmed && entry.fileReferences.length === 0) return;
-			if (trimmed.length > MAX_HISTORY_MESSAGE_CHARS) {
+			if (!trimmed && entry.fileReferences.length === 0 && !entry.composerDocument?.assets.length)
+				return;
+			if (entry.text.length > MAX_HISTORY_MESSAGE_CHARS) {
 				indexRef.current = -1;
 				notify();
 				return;
@@ -171,6 +185,7 @@ export function useInputHistory(storageKey: string | null) {
 			direction: "up" | "down",
 			currentInput: string,
 			fileReferences: FileReference[] = [],
+			composerDocument?: ComposerDocument,
 		): FileReferenceInput | null => {
 			const history = getHistory();
 			if (history.length === 0) return null;
@@ -181,6 +196,7 @@ export function useInputHistory(storageKey: string | null) {
 					draftRef.current = {
 						text: currentInput,
 						fileReferences: readFileReferences(fileReferences, currentInput),
+						...(composerDocument ? { composerDocument } : {}),
 					};
 				}
 				const nextIndex = Math.min(indexRef.current + 1, history.length - 1);

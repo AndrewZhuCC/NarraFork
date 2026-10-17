@@ -20,7 +20,11 @@
  * a renamed field becomes a compile error instead of a silently empty panel.
  */
 
-import type { KnowledgeEntry, KnowledgePersonalEntry } from "@frontend/lib/api/knowledge-types";
+import type {
+	KnowledgeEntry,
+	KnowledgeEntryDetail,
+	KnowledgePersonalEntry,
+} from "@frontend/lib/api/knowledge-types";
 import type { KnowledgeEntryScope } from "../panels/panel-kind";
 
 /** The entry shape each scope hands to the panel. */
@@ -73,20 +77,21 @@ export function knowledgeEntryTitle(
 /**
  * Whether the caller may edit this entry from the panel.
  *
- * Global: admin or the entry owner (write grants are NOT honored here — the panel's edit
- * button writes straight to main via `useAddKnowledgeRevision`, and the server re-checks
- * anyway; being conservative in the UI only costs a button, while being permissive shows
- * an affordance that 403s).
+ * Global: exactly the server's direct-write decision, `viewerCaps.canWriteMain` from
+ * GET /knowledge/entries/:id (admin / entry owner / write grant / collection owner — the same
+ * predicate `addRevision` enforces). The panel's edit button writes straight to main via
+ * `useAddKnowledgeRevision`, so the UI must neither hide it from a write-grant holder nor show
+ * it to someone the server will refuse. An entry without `viewerCaps` (a list row, an older
+ * cache entry) is treated as not editable.
  * Personal: always, because a personal entry belongs to whoever is reading it (the detail
  * endpoint 404s for anybody else).
  */
 export function canEditKnowledgeEntry(
 	scope: KnowledgeEntryScope,
-	entry: KnowledgeEntry | KnowledgePersonalEntry | null | undefined,
+	entry: KnowledgeEntry | KnowledgeEntryDetail | KnowledgePersonalEntry | null | undefined,
 	user: { id: string; role?: string | null } | null | undefined,
 ): boolean {
 	if (!entry || !user) return false;
 	if (scope === "personal") return true;
-	const global = entry as KnowledgeEntry;
-	return user.role === "admin" || global.ownerUserId === user.id;
+	return (entry as Partial<KnowledgeEntryDetail>).viewerCaps?.canWriteMain === true;
 }

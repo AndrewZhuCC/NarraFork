@@ -346,6 +346,15 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	if _, err := exec.LookPath("git"); err != nil {
 		return probeFailure("git_unavailable", err)
 	}
+	if op == "status" || op == "lineStats" {
+		release, err := gitStatusAdmissions.admit(runCtx)
+		if err != nil {
+			return nil, err
+		}
+		// Keep global admission through root discovery and all failure/cancel
+		// paths. Each g.run/runStatus joins cmd.Wait before this defer runs.
+		defer release()
+	}
 	g := &workspaceGit{ctx: runCtx, root: cwd, remaining: 16384, env: gitWorkspaceEnv(nil)}
 	bare, _, bareErr := g.run("rev-parse", "--is-bare-repository")
 	if runCtx.Err() != nil {
@@ -422,9 +431,9 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		return nil, fmt.Errorf("Git workspace changed; refresh before retrying")
 	}
 	g.remaining, g.truncated = maxBytes, false
-	// Watch is whole-worktree only; do not let supplied file actions add per-file processes.
-	if _, present := params["files"]; op == "watch" && present {
-		return nil, fmt.Errorf("watch does not accept files")
+	// Whole-worktree reads must not let supplied file actions add per-file processes.
+	if _, present := params["files"]; (op == "watch" || op == "status" || op == "lineStats") && present {
+		return nil, fmt.Errorf("%s does not accept files", op)
 	}
 	if op == "commitDetail" || op == "commitDiff" {
 		// Historical paths are validated lexically only: they may no longer exist,
@@ -445,13 +454,22 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	switch op {
 	case "stage", "unstage", "commit", "discard", "stashPush", "stashPop", "stashDrop", "reset":
 		write = true
-	case "watch", "status", "diff", "fullDiff", "log", "stashList":
+	case "watch", "status", "lineStats", "diff", "fullDiff", "log", "stashList":
 	default:
 		return nil, fmt.Errorf("unknown Git workspace operation")
 	}
 	lockKey := common
 	if filepath.Separator == '\\' {
 		lockKey = strings.ToLower(common)
+	}
+	if op == "status" || op == "lineStats" {
+		release, err := gitStatusQueries.acquire(runCtx, root)
+		if err != nil {
+			return nil, err
+		}
+		// Canonical root serialization is separate from the already-held global
+		// admission. Every run waits for its subprocess, including on cancellation.
+		defer release()
 	}
 	if err := h.checkGitHelpers(g, write); err != nil {
 		return nil, err
@@ -495,15 +513,21 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	g.remaining, g.truncated = maxBytes, false // metadata isn't part of the user-visible output budget
 	var out string
 	switch op {
+	case "lineStats":
+		return h.gitWorkspaceLineStats(g, maxBytes)
 	case "watch":
 		return h.gitWorkspaceWatch(g, head)
 	case "status":
 		outputs := map[string]string{"head": strings.TrimSpace(head)}
 		g.remaining = 4096
-		outputs["branch"], _, err = g.run("symbolic-ref", "--quiet", "--short", "HEAD")
+		var branchCode int
+		outputs["branch"], branchCode, err = g.run("symbolic-ref", "--quiet", "--short", "HEAD")
 		branchTruncated := g.lastTruncated
 		g.remaining, g.truncated = maxBytes, false
-		if err != nil && hasHead {
+		if g.ctx.Err() != nil {
+			return nil, g.ctx.Err()
+		}
+		if err != nil && branchCode == 1 && hasHead {
 			outputs["branch"], err = "HEAD", nil
 		}
 		if err != nil {
@@ -512,49 +536,13 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		if branchTruncated {
 			return nil, fmt.Errorf("Git branch identity exceeds metadata budget")
 		}
-		// Status is the authoritative changed-file list, so it always receives the
-		// shared budget first. A map here made execution order random and could spend
-		// the entire budget on numstat before returning any file records.
-		commands := []struct {
-			key  string
-			args []string
-		}{
-			{"status", []string{"status", "--porcelain=v1", "-z", "--untracked-files=all"}},
-			{"stagedNumstat", []string{"diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z"}},
-			{"unstagedNumstat", []string{"diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z"}},
-		}
-		for _, command := range commands {
-			if g.truncated {
-				break
-			}
-			outputs[command.key], _, err = g.runNUL(command.args...)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if !g.truncated {
-			// Count untracked lines using Git's binary detection and capped diff output.
-			// A partial list or numstat record is omitted, while the top-level truncated
-			// flag tells callers that counts and statistics are lower bounds.
-			untracked, _, listErr := g.runNUL("ls-files", "--others", "--exclude-standard", "-z")
-			if listErr != nil {
-				return nil, listErr
-			}
-			for _, path := range strings.Split(untracked, "\x00") {
-				if path == "" || g.truncated {
-					continue
-				}
-				if _, pathErr := h.gitFilePaths(g, root, map[string]any{"files": []any{path}}); pathErr != nil {
-					continue
-				}
-				stats, code, statErr := g.runNUL("diff", "--no-ext-diff", "--no-textconv", "--no-index", "--numstat", "-z", "--", os.DevNull, path)
-				if statErr != nil && code != 1 {
-					return nil, statErr
-				}
-				outputs["untrackedNumstat"] += stats
-			}
+		// Status never computes line counts or enumerates untracked files twice.
+		outputs["status"], err = g.runStatus()
+		if err != nil {
+			return nil, err
 		}
 		result["outputs"] = outputs
+		result["totalFilesExact"] = !g.truncated
 	case "diff":
 		if len(files) != 1 {
 			return nil, fmt.Errorf("diff requires exactly one file")

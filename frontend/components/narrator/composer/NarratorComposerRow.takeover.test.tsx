@@ -21,8 +21,16 @@ import zhNarrator from "../../../locales/zh-CN/narrator.json";
 import type { NarratorComposerRowProps } from "./NarratorComposerRow";
 
 mock.module("./NarratorComposer", () => ({
-	NarratorComposer: (props: { ref?: unknown; narratorId?: string }) => (
-		<div data-testid="composer-input" data-narrator-id={props.narratorId} />
+	NarratorComposer: (props: {
+		ref?: unknown;
+		narratorId?: string;
+		controls?: import("react").ReactNode;
+		actions?: import("react").ReactNode;
+	}) => (
+		<div data-testid="composer-input" data-narrator-id={props.narratorId}>
+			{props.controls}
+			{props.actions}
+		</div>
 	),
 }));
 

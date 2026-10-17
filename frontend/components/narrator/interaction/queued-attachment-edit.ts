@@ -13,6 +13,12 @@
  * identity there.
  */
 
+import {
+	type ComposerAsset,
+	type ComposerDocument,
+	type ComposerInlineNode,
+	parseComposerDocument,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -23,6 +29,12 @@ import type {
 	BufferedTextFileSummary,
 	BufferMessageSummary,
 } from "../../../lib/api/types";
+import {
+	composerInputFromDocument,
+	composerNodeId,
+	importComposerInput,
+} from "../composer/composer-document-adapter";
+import { getComposerAssetId } from "../composer/draft-image-attachments";
 import { trimFileReferenceInput } from "../composer/file-reference-input";
 
 /**
@@ -48,6 +60,202 @@ export interface QueuedEditPayload {
 	newImages: File[];
 	newTextFiles: File[];
 	fileReferences: FileReference[];
+	composerDocument?: ComposerDocument;
+}
+
+/** The binding is local editor state, never an arbitrary client-provided storage credential. */
+export interface ExistingComposerAttachment {
+	kind: ComposerAsset["kind"];
+	name: string;
+	size: number;
+	mimeType: string;
+	imageId?: string;
+	filePath?: string;
+	index?: number;
+	uploadNarratorId?: string;
+	previewUrl?: string;
+}
+
+export interface ComposerEditDetail {
+	composerDocument?: ComposerDocument;
+	text?: string;
+	fileReferences?: FileReference[];
+	images?: {
+		imageId: string;
+		filename?: string;
+		mediaType?: string;
+		sourceMimeType?: string;
+		size?: number;
+		uploadNarratorId?: string;
+	}[];
+	textFiles?: { filename: string; size: number; index?: number; filePath?: string }[];
+}
+
+/** The detail response supplies both layout and authorized resource identities from one snapshot. */
+export function composerEditDetailAttachments(
+	detail: ComposerEditDetail,
+	narratorId?: string,
+): ExistingComposerAttachment[] | undefined {
+	if (!detail.images || !detail.textFiles) return undefined;
+	return [
+		...detail.images.map((image) => ({
+			kind: "image" as const,
+			imageId: image.imageId,
+			name: image.filename ?? "image",
+			size: image.size ?? 0,
+			mimeType: image.sourceMimeType ?? image.mediaType ?? "image/png",
+			uploadNarratorId: image.uploadNarratorId ?? narratorId,
+		})),
+		...detail.textFiles.map((file) => ({
+			kind: "textFile" as const,
+			index: file.index,
+			filePath: file.filePath,
+			name: file.filename,
+			size: file.size,
+			mimeType: "text/plain",
+		})),
+	];
+}
+
+export interface ComposerEditSession {
+	document: ComposerDocument;
+	/** In original server order, followed by locally inserted resources. Retained for undo. */
+	bindings: Map<string, ExistingComposerAttachment | File>;
+}
+
+export interface ComposerEditSnapshot {
+	text: string;
+	fileReferences: FileReference[];
+	composerDocument: ComposerDocument;
+	keepImageIds: string[];
+	keepTextFilePaths: string[];
+	keepTextFiles: { index: number; filename: string }[];
+	newImages: File[];
+	newTextFiles: File[];
+}
+
+/** A new document preserves its identities; legacy records import the old attachment grouping. */
+export function seedComposerEditSession(
+	input: { text: string; fileReferences: FileReference[]; composerDocument?: ComposerDocument },
+	existing: ExistingComposerAttachment[],
+): ComposerEditSession {
+	const document = input.composerDocument
+		? parseComposerDocument(input.composerDocument)
+		: importComposerInput(input);
+	const bindings: ComposerEditSession["bindings"] = new Map();
+	for (const resource of existing) {
+		if (
+			resource.kind === "image"
+				? !resource.imageId
+				: resource.filePath === undefined && resource.index === undefined
+		)
+			throw new Error("Attachment identity is missing");
+	}
+	if (input.composerDocument) {
+		for (const kind of ["image", "textFile"] as const) {
+			const assets = document.assets.filter((asset) => asset.kind === kind);
+			const resources = existing.filter((resource) => resource.kind === kind);
+			if (assets.length !== resources.length) throw new Error("Attachment layout is out of date");
+			assets.forEach((asset, index) => {
+				bindings.set(asset.id, resources[index]);
+			});
+		}
+		return { document, bindings };
+	}
+	const nodes: ComposerInlineNode[] = [];
+	const assets: ComposerAsset[] = [];
+	for (const [index, resource] of existing.entries()) {
+		const id = `existing-${resource.kind}-${index}`;
+		bindings.set(id, resource);
+		assets.push({
+			id,
+			kind: resource.kind,
+			name: resource.name,
+			size: resource.size,
+			mimeType: resource.mimeType,
+		});
+		nodes.push({ type: "attachment", id: `node-${id}`, assetId: id });
+	}
+	return {
+		document: {
+			...document,
+			assets,
+			paragraphs: nodes.length
+				? [{ children: nodes }, ...document.paragraphs]
+				: document.paragraphs,
+		},
+		bindings,
+	};
+}
+
+/** Each File gets a stable identity, including files with identical names and bytes. */
+export function bindComposerEditFiles(
+	session: ComposerEditSession,
+	files: File[],
+	kind: ComposerAsset["kind"],
+) {
+	const assets: ComposerAsset[] = [];
+	const nodes: ComposerInlineNode[] = [];
+	for (const file of files) {
+		const id = getComposerAssetId(file);
+		session.bindings.set(id, file);
+		assets.push({ id, kind, name: file.name, size: file.size, mimeType: file.type });
+		nodes.push({ type: "attachment", id: composerNodeId(), assetId: id });
+	}
+	return { assets, nodes };
+}
+
+/**
+ * Node order and upload order are different: moving a node must not rebind an asset to
+ * another server attachment. Keep arrays and manifest use server order + new files.
+ */
+export function projectComposerEdit(
+	session: ComposerEditSession,
+	document: ComposerDocument,
+): ComposerEditSnapshot {
+	const active = new Set(
+		document.paragraphs.flatMap((paragraph) =>
+			paragraph.children.flatMap((node) => (node.type === "attachment" ? [node.assetId] : [])),
+		),
+	);
+	const metadata = new Map(document.assets.map((asset) => [asset.id, asset]));
+	for (const id of active) {
+		if (!session.bindings.has(id) || !metadata.has(id))
+			throw new Error("Attachment resource is missing");
+	}
+	const assets: ComposerAsset[] = [];
+	const keepImageIds: string[] = [];
+	const keepTextFilePaths: string[] = [];
+	const keepTextFiles: { index: number; filename: string }[] = [];
+	const newImages: File[] = [];
+	const newTextFiles: File[] = [];
+	for (const kind of ["image", "textFile"] as const) {
+		for (const [id, resource] of session.bindings) {
+			const asset = metadata.get(id);
+			if (!active.has(id) || asset?.kind !== kind) continue;
+			assets.push(asset);
+			if (resource instanceof File) {
+				(kind === "image" ? newImages : newTextFiles).push(resource);
+			} else if (kind === "image" && resource.imageId) {
+				keepImageIds.push(resource.imageId);
+			} else if (kind === "textFile") {
+				if (resource.filePath !== undefined) keepTextFilePaths.push(resource.filePath);
+				if (resource.index !== undefined)
+					keepTextFiles.push({ index: resource.index, filename: resource.name });
+			}
+		}
+	}
+	const composerDocument = { ...document, assets };
+	const input = composerInputFromDocument(composerDocument);
+	return {
+		...input,
+		composerDocument,
+		keepImageIds,
+		keepTextFilePaths,
+		keepTextFiles,
+		newImages,
+		newTextFiles,
+	};
 }
 
 /**
