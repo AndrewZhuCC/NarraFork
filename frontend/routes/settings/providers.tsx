@@ -141,6 +141,7 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 			agent: {
 				hiddenModels: [...state.hiddenModels],
 				customModels: state.customModels,
+				modelProtocols: state.modelProtocols,
 				modelContextWindows: migratedWindows,
 				providerOrder: state.providerOrder,
 				disabledProviders: [...state.disabledProviders],
@@ -1155,6 +1156,8 @@ function SettingsProvidersPage() {
 							hiddenModels={state.hiddenModels}
 							onToggleHidden={dispatchers.toggleHidden}
 							onBatchToggleHidden={dispatchers.batchToggleHidden}
+							modelProtocols={state.modelProtocols}
+							onModelProtocolChange={dispatchers.setModelProtocol}
 							modelContextWindows={state.modelContextWindows}
 							onContextWindowChange={dispatchers.handleContextWindowChange}
 							onTestModel={setTestingModel}
@@ -1380,6 +1383,8 @@ function ProviderSectionContent({
 				onBatchToggleHidden={dispatchers.batchToggleHidden}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
+				modelProtocols={state.modelProtocols}
+				onModelProtocolChange={dispatchers.setModelProtocol}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onTestModel={onTestModel}
@@ -1395,6 +1400,8 @@ function ProviderSectionContent({
 				onToggleHidden={dispatchers.toggleHidden}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
+				modelProtocols={state.modelProtocols}
+				onModelProtocolChange={dispatchers.setModelProtocol}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onTestModel={onTestModel}
@@ -1426,6 +1433,8 @@ function ProviderSectionContent({
 					onContextWindowChange: dispatchers.handleContextWindowChange,
 					customModels: state.customModels,
 					onCustomModelsChange: dispatchers.setCustomModels,
+					modelProtocols: state.modelProtocols,
+					onModelProtocolChange: dispatchers.setModelProtocol,
 					onTestModel,
 				}}
 			/>
@@ -1450,6 +1459,8 @@ function ProviderSectionContent({
 				isProviderDirty={isCustomApiProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
+				modelProtocols={state.modelProtocols}
+				onModelProtocolChange={dispatchers.setModelProtocol}
 				getPrefixError={getPrefixError}
 				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}

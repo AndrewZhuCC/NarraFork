@@ -55,6 +55,8 @@ export interface ProvidersState {
 	tokenDanceDisabled: boolean;
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
+	/** 逐模型协议覆盖（`agent.modelProtocols`），键是带前缀的完整模型 ID。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
 	modelContextWindows: Record<string, number>;
 	providerOrder: string[];
 	disabledProviders: Set<string>;
@@ -70,6 +72,7 @@ export interface SavedSnapshot {
 	tokenDanceDisabled: boolean;
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
+	modelProtocols: Record<string, CustomApiProtocol>;
 	modelContextWindows: Record<string, number>;
 	providerOrder: string[];
 	disabledProviders: string[];
@@ -90,6 +93,7 @@ export type ProvidersAction =
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
 	| { type: "SET_CUSTOM_MODELS"; models: CustomModelEntry[] }
+	| { type: "SET_MODEL_PROTOCOL"; modelVal: string; protocol: CustomApiProtocol | null }
 	| { type: "SET_CONTEXT_WINDOW"; modelVal: string; size: number | null }
 	| { type: "SET_PROVIDER_ORDER"; order: string[] }
 	| { type: "TOGGLE_PROVIDER_DISABLED"; prefix: string }
@@ -287,6 +291,7 @@ export const initialProvidersState: ProvidersState = {
 	tokenDanceDisabled: false,
 	hiddenModels: new Set(),
 	customModels: [],
+	modelProtocols: {},
 	modelContextWindows: {},
 	providerOrder: [],
 	disabledProviders: new Set(),
@@ -411,6 +416,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			}));
 
 			const windows = (agent.modelContextWindows as Record<string, number>) ?? {};
+			const modelProtocols = (agent.modelProtocols as Record<string, CustomApiProtocol>) ?? {};
 
 			const providerOrder: string[] = (agent.providerOrder as string[]) ?? [];
 			const disabledProviders = new Set<string>((agent.disabledProviders as string[]) ?? []);
@@ -440,6 +446,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				tokenDanceDisabled: s.tokendance?.disabled === true,
 				hiddenModels: new Set(hidden),
 				customModels: custom,
+				modelProtocols,
 				modelContextWindows: windows,
 				providerOrder,
 				disabledProviders,
@@ -514,6 +521,13 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 		case "SET_CUSTOM_MODELS":
 			return { ...state, customModels: action.models };
+
+		case "SET_MODEL_PROTOCOL": {
+			const next = { ...state.modelProtocols };
+			if (action.protocol) next[action.modelVal] = action.protocol;
+			else delete next[action.modelVal];
+			return { ...state, modelProtocols: next };
+		}
 
 		case "SET_CONTEXT_WINDOW": {
 			if (action.size == null) {
@@ -604,6 +618,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				tokenDanceDisabled: snap.tokenDanceDisabled,
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
+				modelProtocols: { ...snap.modelProtocols },
 				modelContextWindows: { ...snap.modelContextWindows },
 				providerOrder: [...snap.providerOrder],
 				disabledProviders: new Set(snap.disabledProviders),
@@ -635,6 +650,12 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (JSON.stringify(state.commandCode) !== JSON.stringify(savedSnapshot.commandCode))
 			return true;
 		if (state.tokenDanceDisabled !== savedSnapshot.tokenDanceDisabled) return true;
+		// Key order is not meaningful here, so compare sorted entries rather than the raw objects.
+		if (
+			JSON.stringify(Object.entries(state.modelProtocols).sort()) !==
+			JSON.stringify(Object.entries(savedSnapshot.modelProtocols).sort())
+		)
+			return true;
 		// Fast path: array length comparison
 		if (state.customApiProviders.length !== savedSnapshot.customApiProviders.length) return true;
 		if (state.nugProviders.length !== savedSnapshot.nugProviders.length) return true;
@@ -685,6 +706,7 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		tokenDanceDisabled: state.tokenDanceDisabled,
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
+		modelProtocols: { ...state.modelProtocols },
 		modelContextWindows: { ...state.modelContextWindows },
 		providerOrder: [...state.providerOrder],
 		disabledProviders: [...state.disabledProviders],
@@ -751,6 +773,12 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
+	const setModelProtocol = useCallback(
+		(modelVal: string, protocol: CustomApiProtocol | null) =>
+			dispatch({ type: "SET_MODEL_PROTOCOL", modelVal, protocol }),
+		[dispatch],
+	);
+
 	const handleContextWindowChange = useCallback(
 		(modelVal: string, size: number | null) =>
 			dispatch({ type: "SET_CONTEXT_WINDOW", modelVal, size }),
@@ -783,6 +811,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			toggleHidden,
 			batchToggleHidden,
 			setCustomModels,
+			setModelProtocol,
 			handleContextWindowChange,
 			setProviderOrder,
 			toggleProviderDisabled,
@@ -798,6 +827,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			toggleHidden,
 			batchToggleHidden,
 			setCustomModels,
+			setModelProtocol,
 			handleContextWindowChange,
 			setProviderOrder,
 			toggleProviderDisabled,

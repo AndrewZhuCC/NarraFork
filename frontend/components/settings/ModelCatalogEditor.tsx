@@ -27,6 +27,8 @@ import {
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { Z } from "../../lib/z-index";
+import { ModelProtocolSelect, modelProtocolLabel } from "../providers/ModelProtocolSelect";
+import type { CustomApiProtocol } from "../providers/types";
 import { ModelCardDetails } from "./ModelCardDetails";
 import {
 	buildCatalogPatch,
@@ -45,6 +47,24 @@ export interface CatalogEditorTarget {
 	variantId?: string;
 	query?: ModelQuery;
 	resolved?: ResolvedModelMetadata;
+}
+
+/**
+ * 模型级协议覆盖的读写入口。
+ *
+ * 协议分两层：provider 层（`settings.agent.modelProtocols`，设置页模型行写的）与本地覆盖层
+ * （`settings.agent.modelProtocolOverrides`，本对话框单独保存的，优先级更高）。两层都不在
+ * catalog 快照里、也不参与 revision 校验，因此由调用方负责读写；不传该项时编辑器不显示协议字段。
+ */
+export interface ModelProtocolDraft {
+	/** 作用对象：带前缀的完整模型 ID，例如 `CommandCode:deepseek/deepseek-v4.1-flash`。 */
+	modelValue: string;
+	/** 本层已保存的覆盖；`null` 表示本层没有覆盖，跟随继承。 */
+	value: CustomApiProtocol | null;
+	/** 继承来的值（provider 层写的协议）；本层覆盖被删除后由它生效。 */
+	inheritedValue: CustomApiProtocol | null;
+	/** `null` 表示删除本层覆盖（恢复继承），否则写入本层。 */
+	onSave: (protocol: CustomApiProtocol | null) => Promise<void>;
 }
 
 export function CatalogMetadataFields({
@@ -117,6 +137,7 @@ export function CatalogMetadataFields({
 											{options ? (
 												<Select
 													aria-label={label}
+													comboboxProps={EDITOR_COMBOBOX_PROPS}
 													data={options.map((v) => ({ value: v, label: t(`catalog.values.${v}`) }))}
 													value={value || null}
 													disabled={readOnly || (!!edit && edit.mode !== "set")}
@@ -182,16 +203,26 @@ export function CatalogMetadataFields({
 }
 
 /** Snapshot revision is captured on open, not silently rebased after a background refetch. */
+/**
+ * 本编辑器的 Modal 被显式抬到 `Z.modal + 1`（它可能嵌在价格弹窗之类更高的浮层里），
+ * 而 Mantine 的 Select 下拉默认停在 popover 层(300) —— 不抬高就会被自己的 Modal 盖住，
+ * 表现为「下拉点不开 / 选不了」。这里比 Modal 再高一层；Modal 用默认层级的场景不受影响。
+ */
+const EDITOR_COMBOBOX_PROPS = { withinPortal: true, zIndex: Z.modal + 2 } as const;
+
 export function ModelCatalogEditor({
 	target,
 	snapshot,
 	readOnly,
 	onClose,
+	protocol,
 }: {
 	target: CatalogEditorTarget;
 	snapshot: ModelCatalogSnapshot;
 	readOnly: boolean;
 	onClose: () => void;
+	/** 协议字段（可选）：模型级覆盖，与 catalog 快照分开保存。 */
+	protocol?: ModelProtocolDraft;
 }) {
 	const { t } = useTranslation("settings");
 	const mutation = useCatalogMutation();
@@ -219,6 +250,12 @@ export function ModelCatalogEditor({
 	const [providerId, setProviderId] = useState(target.query?.providerId ?? "");
 	const [channelId, setChannelId] = useState(target.query?.channelId ?? "");
 	const [upstream, setUpstream] = useState(target.query?.upstreamModelId ?? "");
+	const [protocolDraft, setProtocolDraft] = useState<CustomApiProtocol | null>(
+		protocol?.value ?? null,
+	);
+	const protocolChanged = !!protocol && protocolDraft !== (protocol.value ?? null);
+	/** 最终生效的协议：本层覆盖优先，其次继承 provider 层。 */
+	const effectiveProtocol = protocolDraft ?? protocol?.inheritedValue ?? null;
 	const [validationError, setValidationError] = useState("");
 	const conflict = mutation.error instanceof ApiError && mutation.error.status === 409;
 	const models = [
@@ -242,6 +279,8 @@ export function ModelCatalogEditor({
 	async function save() {
 		setValidationError("");
 		try {
+			// 协议不属于 catalog 快照，先单独落库；它没有 revision 冲突语义。
+			if (protocol && protocolChanged) await protocol.onSave(protocolDraft);
 			const patch = buildCatalogPatch(edits);
 			if (!target.isNew) {
 				if (!patch) {
@@ -348,6 +387,7 @@ export function ModelCatalogEditor({
 								label={t("catalog.model")}
 								searchable
 								clearable
+								comboboxProps={EDITOR_COMBOBOX_PROPS}
 								data={models.map((m) => ({ value: m.id, label: m.name ?? m.id }))}
 								value={modelId || null}
 								onChange={(value) => {
@@ -362,6 +402,7 @@ export function ModelCatalogEditor({
 								label={t("catalog.variant")}
 								searchable
 								clearable
+								comboboxProps={EDITOR_COMBOBOX_PROPS}
 								data={variants
 									.filter((v) => !modelId || v.modelId === modelId)
 									.map((v) => ({ value: v.id, label: v.name ?? v.id }))}
@@ -409,6 +450,59 @@ export function ModelCatalogEditor({
 					<Text size="sm" c="dimmed">
 						{t("catalog.patchHint")}
 					</Text>
+				)}
+				{protocol && (
+					<Stack gap={4} data-catalog-field="protocol">
+						<Group justify="space-between">
+							<Text size="sm">{t("catalog.protocol")}</Text>
+							{protocolDraft !== null && <Badge size="xs">{t("catalog.set")}</Badge>}
+						</Group>
+						<Text size="xs" c="dimmed">
+							{t("catalog.effective")}:{" "}
+							{effectiveProtocol
+								? modelProtocolLabel(t, effectiveProtocol)
+								: t("modelProtocolInherit")}{" "}
+							·{" "}
+							{protocolDraft !== null
+								? t("catalog.set")
+								: protocol.inheritedValue
+									? t("catalog.protocolProviderLayer")
+									: t("catalog.unreported")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("catalog.protocolHint", { model: protocol.modelValue })}
+						</Text>
+						{/* 下拉默认停在 popover 层，比本 Modal 低，所以要显式抬高（见 EDITOR_COMBOBOX_PROPS）。
+						    选中项写着「本地覆盖」，选「跟随默认」等于清掉本层覆盖。 */}
+						<ModelProtocolSelect
+							value={effectiveProtocol}
+							onChange={setProtocolDraft}
+							size="xs"
+							dropdownZIndex={Z.modal + 2}
+							disabled={readOnly}
+						/>
+						{!readOnly && (
+							<Group gap="xs">
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									disabled={protocolDraft === null}
+									onClick={() => setProtocolDraft(null)}
+								>
+									{t("catalog.reset")}
+								</Button>
+								{protocolDraft !== protocol.value && (
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										onClick={() => setProtocolDraft(protocol.value)}
+									>
+										{t("catalog.undo")}
+									</Button>
+								)}
+							</Group>
+						)}
+					</Stack>
 				)}
 				<CatalogMetadataFields
 					resolved={target.resolved}

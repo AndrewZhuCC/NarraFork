@@ -418,6 +418,18 @@ export const updateSettingsSchema = z
 						]),
 					)
 					.optional(),
+				/** 「编辑此连接覆盖」里单独保存的协议，优先级高于 modelProtocols。 */
+				modelProtocolOverrides: z
+					.record(
+						z.string(),
+						z.enum([
+							"anthropic-messages",
+							"openai-responses",
+							"completions-compatible",
+							"gemini-compatible",
+						]),
+					)
+					.optional(),
 				maxTurns: z.number().int().min(1).max(1000),
 				subagentModels: z
 					.object({

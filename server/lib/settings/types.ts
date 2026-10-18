@@ -500,7 +500,7 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
-/** 逐模型可选的协议；`agent.modelProtocols` 的值域。 */
+/** 逐模型可选的协议；`agent.modelProtocols` 与 `agent.modelProtocolOverrides` 的值域。 */
 export type ModelProtocol =
 	| "anthropic-messages"
 	| "openai-responses"
@@ -662,6 +662,11 @@ export interface NarraForkSettings {
 		hiddenModels: string[];
 		/** 逐模型的协议覆盖，键为带前缀的完整模型 ID；缺省即跟随该 provider 的默认协议。 */
 		modelProtocols?: Record<string, ModelProtocol>;
+		/**
+		 * 「编辑此连接覆盖」里按模型单独保存的协议，优先级高于 `modelProtocols`。
+		 * 键同样是带前缀的完整模型 ID；删除键即恢复继承 provider 层写的协议。
+		 */
+		modelProtocolOverrides?: Record<string, ModelProtocol>;
 		maxTurns: number;
 		subagentModels: {
 			explore: string;

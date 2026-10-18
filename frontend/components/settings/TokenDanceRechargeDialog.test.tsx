@@ -257,6 +257,8 @@ async function renderSection() {
 								onChanged={async () => {}}
 								onDeleted={() => {}}
 								hiddenModels={new Set()}
+								modelProtocols={{}}
+								onModelProtocolChange={() => {}}
 								modelContextWindows={{}}
 								onToggleHidden={() => {}}
 								onContextWindowChange={() => {}}

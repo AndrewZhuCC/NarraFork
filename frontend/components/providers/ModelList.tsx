@@ -2,7 +2,9 @@ import { ActionIcon, Group, Stack, Text, TextInput, Tooltip } from "@mantine/cor
 import { IconEye, IconEyeOff, IconSearch } from "@tabler/icons-react";
 import React, { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ModelProtocolSelect } from "./ModelProtocolSelect";
 import { ModelRow } from "./ModelRow";
+import type { CustomApiProtocol } from "./types";
 
 export interface ModelListItem {
 	value: string;
@@ -16,11 +18,16 @@ export interface ModelListProps {
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	onBatchToggleHidden?: (modelValues: string[], hidden: boolean) => void;
+	/** 逐模型协议覆盖（`agent.modelProtocols` 的草稿），由页面统一提交。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
+	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
 	modelContextWindows: Record<string, number>;
 	defaultContextWindows?: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 	showContextWindow?: boolean;
+	/** Provider-specific control appended to each row (e.g. a protocol picker). */
+	renderExtraForModel?: (modelValue: string) => React.ReactNode;
 }
 
 export const ModelList = React.memo(function ModelList({
@@ -28,14 +35,25 @@ export const ModelList = React.memo(function ModelList({
 	hiddenModels,
 	onToggleHidden,
 	onBatchToggleHidden,
+	modelProtocols,
+	onModelProtocolChange,
 	modelContextWindows,
 	defaultContextWindows,
 	onContextWindowChange,
 	onTestModel,
 	showContextWindow = true,
+	renderExtraForModel,
 }: ModelListProps) {
 	const { t } = useTranslation("settings");
 	const [query, setQuery] = useState("");
+
+	const renderProtocolPicker = (modelValue: string) => (
+		<ModelProtocolSelect
+			value={modelProtocols[modelValue] ?? null}
+			onChange={(protocol) => onModelProtocolChange(modelValue, protocol)}
+			width={190}
+		/>
+	);
 	const normalizedQuery = query.trim().toLowerCase();
 	const allHidden = useMemo(
 		() => models.every((m) => hiddenModels.has(m.value)),
@@ -100,6 +118,12 @@ export const ModelList = React.memo(function ModelList({
 					onContextWindowChange={(size) => onContextWindowChange(m.value, size)}
 					onTestModel={onTestModel ? () => onTestModel(m.value) : undefined}
 					showContextWindow={showContextWindow}
+					extra={
+						<>
+							{renderProtocolPicker(m.value)}
+							{renderExtraForModel?.(m.value)}
+						</>
+					}
 				/>
 			))}
 			{hiddenRowCount > 0 && (

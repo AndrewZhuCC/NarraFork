@@ -15,7 +15,12 @@ import { modelCatalogKeys } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { modelCatalogApi } from "../../lib/api/model-catalog";
 import settings from "../../locales/en/settings.json";
-import { type CatalogEditorTarget, ModelCatalogEditor } from "./ModelCatalogEditor";
+import type { CustomApiProtocol } from "../providers/types";
+import {
+	type CatalogEditorTarget,
+	ModelCatalogEditor,
+	type ModelProtocolDraft,
+} from "./ModelCatalogEditor";
 
 const snapshot: ModelCatalogSnapshot = {
 	catalog: {
@@ -200,6 +205,7 @@ afterEach(async () => {
 async function render(
 	readOnly = false,
 	target: CatalogEditorTarget = { kind: "model", id: "base", resolved },
+	protocol?: ModelProtocolDraft,
 ) {
 	await act(async () => {
 		root.render(
@@ -218,6 +224,7 @@ async function render(
 							target={target}
 							snapshot={snapshot}
 							readOnly={readOnly}
+							protocol={protocol}
 							onClose={() => {
 								closed += 1;
 							}}
@@ -401,5 +408,46 @@ describe("real catalog editor form", () => {
 		);
 		expect(field("limits.contextWindow").querySelector("input")?.disabled).toBe(true);
 		expect(mutations).toEqual([]);
+	});
+	test("keeps the protocol override on its own layer and inherits the provider value back", async () => {
+		const saved: Array<CustomApiProtocol | null> = [];
+		await render(
+			false,
+			{ kind: "binding", id: "binding-1", resolved },
+			{
+				modelValue: "CommandCode:demo-model",
+				value: "completions-compatible",
+				inheritedValue: "openai-responses",
+				onSave: async (protocol) => {
+					saved.push(protocol);
+				},
+			},
+		);
+		const text = () => document.body.textContent ?? "";
+		expect(text()).toContain("Protocol");
+		expect(text()).toContain("CommandCode:demo-model");
+		// 本层有覆盖：有效值取本层，来源标为 Override（与「能力」字段同一套说法）。
+		expect(text()).toContain("Legacy Completions Compatible");
+		expect(text()).toContain("Override");
+		// 下拉本身就是当前有效值（选中态由它体现；它曾被 Modal 的层级盖住过）。
+		const select = document.querySelector(
+			'input[aria-label="Model protocol"]',
+		) as HTMLInputElement | null;
+		expect(select?.value).toBe("Legacy Completions Compatible");
+		// 渲染本身不落库：协议只在点「保存」时经调用方写出。
+		expect(saved).toEqual([]);
+
+		// 「恢复继承」清掉本层覆盖 → 有效值回到 provider 层写的协议，保存时写出 null。
+		await click(button("Inherit"));
+		expect(text()).toContain("OpenAI Responses");
+		expect(text()).toContain("Provider setting");
+		await click(button("Save"));
+		await waitFor(() => saved.length === 1);
+		expect(saved[0]).toBeNull();
+	});
+
+	test("omits the protocol field when the caller does not provide one", async () => {
+		await render(true, { kind: "binding", id: "binding-1", resolved });
+		expect(document.body.textContent ?? "").not.toContain("Applies to");
 	});
 });

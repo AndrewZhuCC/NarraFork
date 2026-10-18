@@ -810,12 +810,14 @@ export function hasConfiguredCommandCodeProvider(): boolean {
 }
 
 /**
- * 逐模型协议：`modelProtocols`（设置页模型行写的 provider 层）；缺省时由各 provider 的默认规则决定。
+ * 逐模型协议：`modelProtocolOverrides`（「编辑此连接覆盖」里单独保存的那层）优先于
+ * `modelProtocols`（设置页模型行写的 provider 层）；两层都没有时由各 provider 的默认规则决定。
  */
 export function resolveModelProtocol(prefix: string, model?: string): ModelProtocol | undefined {
 	if (!model) return undefined;
 	const key = `${prefix}:${model}`;
-	return s().agent?.modelProtocols?.[key];
+	const agent = s().agent;
+	return agent?.modelProtocolOverrides?.[key] ?? agent?.modelProtocols?.[key];
 }
 
 export function hasConfiguredNugProvider(): boolean {

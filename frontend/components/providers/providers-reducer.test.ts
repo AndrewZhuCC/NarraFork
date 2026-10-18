@@ -271,6 +271,58 @@ describe("Command Code 草稿", () => {
 		});
 		expect(dirtyLabel(edited, snapshot)).toBe("<i>true</i>");
 	});
+
+	test("逐模型协议进草稿：可放弃更改、可清空，且与键顺序无关", () => {
+		const saved = providersStateFromSettings({
+			...settingsWithCommandCode(),
+			agent: { modelProtocols: { "CommandCode:gpt-x": "openai-responses" } },
+		});
+		expect(saved.modelProtocols).toEqual({ "CommandCode:gpt-x": "openai-responses" });
+		const snapshot = createSnapshot(saved);
+		expect(dirtyLabel(saved, snapshot)).toBe("<i>false</i>");
+
+		// 改协议 → 脏；放弃更改 → 回到原值（这正是之前「选了就立即落库」做不到的）。
+		const changed = providersReducer(saved, {
+			type: "SET_MODEL_PROTOCOL",
+			modelVal: "CommandCode:gpt-x",
+			protocol: "completions-compatible",
+		});
+		expect(changed.modelProtocols["CommandCode:gpt-x"]).toBe("completions-compatible");
+		expect(dirtyLabel(changed, snapshot)).toBe("<i>true</i>");
+		const discarded = providersReducer(changed, { type: "RESTORE_FROM_SNAPSHOT", snapshot });
+		expect(discarded.modelProtocols).toEqual({ "CommandCode:gpt-x": "openai-responses" });
+		expect(dirtyLabel(discarded, snapshot)).toBe("<i>false</i>");
+
+		// 选择「跟随默认」= 删除该键；新增与删除都进草稿。
+		const withExtra = providersReducer(changed, {
+			type: "SET_MODEL_PROTOCOL",
+			modelVal: "openai:gpt-y",
+			protocol: "anthropic-messages",
+		});
+		const resetToDefault = providersReducer(withExtra, {
+			type: "SET_MODEL_PROTOCOL",
+			modelVal: "CommandCode:gpt-x",
+			protocol: null,
+		});
+		expect(resetToDefault.modelProtocols).toEqual({ "openai:gpt-y": "anthropic-messages" });
+
+		// 同一个映射换一种键顺序不该算脏，否则保存条会因为对象重排无故出现。
+		const baseline: ProvidersState = {
+			...saved,
+			modelProtocols: {
+				"CommandCode:gpt-x": "openai-responses",
+				"openai:gpt-y": "anthropic-messages",
+			},
+		};
+		const reordered: ProvidersState = {
+			...saved,
+			modelProtocols: {
+				"openai:gpt-y": "anthropic-messages",
+				"CommandCode:gpt-x": "openai-responses",
+			},
+		};
+		expect(dirtyLabel(reordered, createSnapshot(baseline))).toBe("<i>false</i>");
+	});
 });
 
 /**

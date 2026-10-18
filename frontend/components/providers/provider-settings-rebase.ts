@@ -98,6 +98,9 @@ export function rebaseProviderState(
 		customModels: equalValue(local.customModels, baseline.customModels)
 			? fresh.customModels
 			: local.customModels,
+		modelProtocols: equalValue(local.modelProtocols, baseline.modelProtocols)
+			? fresh.modelProtocols
+			: local.modelProtocols,
 		providerOrder: equalValue(local.providerOrder, baseline.providerOrder)
 			? fresh.providerOrder
 			: local.providerOrder,

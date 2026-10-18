@@ -40,6 +40,7 @@ import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { type CustomModelEntry, InlineCustomModels } from "./InlineCustomModels";
 import { ModelList, type ModelListItem } from "./ModelList";
 import type { CommandCodeState } from "./providers-reducer";
+import type { CustomApiProtocol } from "./types";
 
 const STUDIO_API_KEYS_URL = "https://commandcode.ai/studio/";
 
@@ -56,6 +57,9 @@ export interface CommandCodeSectionProps {
 	onBatchToggleHidden?: (modelValues: string[], hidden: boolean) => void;
 	customModels?: CustomModelEntry[];
 	onCustomModelsChange?: (models: CustomModelEntry[]) => void;
+	/** 逐模型协议覆盖的草稿（由设置页统一提交）。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
+	onModelProtocolChange: (modelVal: string, protocol: CustomApiProtocol | null) => void;
 	modelContextWindows?: Record<string, number>;
 	onContextWindowChange?: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
@@ -125,6 +129,8 @@ export function CommandCodeSection({
 	onBatchToggleHidden,
 	customModels,
 	onCustomModelsChange,
+	modelProtocols,
+	onModelProtocolChange,
 	modelContextWindows,
 	onContextWindowChange,
 	onTestModel,
@@ -331,6 +337,8 @@ export function CommandCodeSection({
 							hiddenModels={hiddenModels ?? new Set()}
 							onToggleHidden={onToggleHidden ?? (() => {})}
 							onBatchToggleHidden={onBatchToggleHidden}
+							modelProtocols={modelProtocols}
+							onModelProtocolChange={onModelProtocolChange}
 							modelContextWindows={modelContextWindows ?? {}}
 							onContextWindowChange={onContextWindowChange ?? (() => {})}
 							onTestModel={onTestModel}
