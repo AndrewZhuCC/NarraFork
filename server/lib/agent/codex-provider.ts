@@ -47,6 +47,7 @@ import type {
 	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
+	RemoteCompactResult,
 } from "./provider";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
@@ -497,7 +498,7 @@ export class CodexProvider implements ProviderAdapter {
 			onActivity?: () => void;
 			requestDump?: ChatParams["requestDump"];
 		},
-	): Promise<{ items: unknown[] }> {
+	): Promise<RemoteCompactResult> {
 		if (!this.useRemoteCompact) {
 			throw new Error("Codex remote compact is disabled");
 		}

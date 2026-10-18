@@ -547,6 +547,34 @@ describe("remote compact completion and activity", () => {
 		});
 	}
 
+	test.each(["json", "sse"])("returns normalized compact usage over HTTP %s", async (format) => {
+		const response = {
+			status: "completed",
+			output: [item],
+			usage: {
+				input_tokens: 12730,
+				input_tokens_details: { cached_tokens: 12672, cache_write_tokens: 0 },
+				output_tokens: 51,
+				output_tokens_details: { reasoning_tokens: 7 },
+			},
+		};
+		const result = await run(
+			format === "json"
+				? Response.json(response)
+				: sse(done + frame("response.completed", { response })),
+		);
+		expect(result).toEqual({
+			items: [item],
+			usage: {
+				inputTokens: 58,
+				cachedInputTokens: 12672,
+				cacheCreationInputTokens: 0,
+				outputTokens: 51,
+				reasoningTokens: 7,
+			},
+		});
+	});
+
 	for (const status of [undefined, "in_progress", "failed", "incomplete"]) {
 		test(`JSON output requires completed status, not ${status}`, async () => {
 			await expect(run(Response.json({ status, output: [item] }))).rejects.toThrow(

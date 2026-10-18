@@ -533,6 +533,11 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			transport === "native-ws" ? "test-credential" : undefined,
 		);
 		const requests: Record<string, unknown>[] = [];
+		const compactUsage = {
+			input_tokens: 12730,
+			input_tokens_details: { cached_tokens: 12672 },
+			output_tokens: 51,
+		};
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
 			requests.push(JSON.parse(String(init?.body)));
@@ -540,6 +545,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				JSON.stringify({
 					status: "completed",
 					output: [{ type: "compaction", encrypted_content: "compacted" }],
+					usage: compactUsage,
 				}),
 				{ headers: { "Content-Type": "application/json" } },
 			);
@@ -558,7 +564,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				options.onResponseFrame?.(
 					JSON.stringify({
 						type: "response.completed",
-						response: { status: "completed", output: [] },
+						response: { status: "completed", output: [], usage: compactUsage },
 					}),
 				);
 				yield { text: "" };
@@ -570,6 +576,11 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				trailingToolResults,
 			});
 			expect(result.items).toEqual([{ type: "compaction", encrypted_content: "compacted" }]);
+			expect(result.usage).toMatchObject({
+				inputTokens: 58,
+				cachedInputTokens: 12672,
+				outputTokens: 51,
+			});
 			const { input, ...prefix } = normal.body;
 			expect(requests[0]).toEqual({
 				...prefix,

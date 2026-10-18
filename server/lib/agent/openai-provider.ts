@@ -64,6 +64,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 	ProviderTextCitation,
+	RemoteCompactResult,
 } from "./provider";
 import {
 	assertModelInputModalities,
@@ -894,7 +895,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			/** Official Codex selects its transport outside this delegate. */
 			useWebSocket?: boolean;
 		},
-	): Promise<{ items: unknown[]; retainedUsers?: CodexRetainedUserMessage[] }> {
+	): Promise<RemoteCompactResult> {
 		if (this.apiMode !== "codex") {
 			throw new Error("Remote compact is only supported for Codex providers");
 		}
@@ -946,7 +947,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (!hasNativeTool(tools, "web_search")) body.tools = [...tools, { type: "web_search" }];
 		}
 		const headers = this.buildHeaders(apiKey, conversationId);
-		let items: unknown[] | undefined;
+		let result: RemoteCompactResult | undefined;
 		if (prefix && conversationId && (options?.useWebSocket ?? this.useWebSocket)) {
 			const collector = createCompactOutputCollector();
 			const budget = new StreamByteBudget(16 * 1024 * 1024, "Codex remote compact response");
@@ -977,13 +978,13 @@ export class OpenAIProvider implements ProviderAdapter {
 				})) {
 					/* The compact collector, not ordinary chat events, owns the result. */
 				}
-				items = collector.finish();
+				result = collector.finish();
 			} catch (error) {
 				// Only unsupported handshakes fall back; never replay a failed/aborted compaction.
 				if (!(error instanceof CodexWebSocketFallbackError)) throw error;
 			}
 		}
-		if (!items) {
+		if (!result) {
 			headers.Accept = "text/event-stream";
 			const url = `${baseUrl}/responses`;
 			const bodyText = JSON.stringify(body);
@@ -1003,10 +1004,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				}),
 				options?.requestDump,
 			);
-			items = await readCompactOutputItems(response, options);
+			result = await readCompactResponse(response, options);
 		}
 		const retainedUsers = retainCompactUsers(input);
-		return { items, ...(retainedUsers.length ? { retainedUsers } : {}) };
+		return { ...result, ...(retainedUsers.length ? { retainedUsers } : {}) };
 	}
 
 	/**
@@ -2322,6 +2323,7 @@ function createCompactOutputCollector() {
 		return isRecord(value) ? value : fail("expected a JSON object");
 	};
 	let items: Record<string, unknown>[] = [];
+	let usage: RemoteCompactResult["usage"];
 	let completed = false;
 	return {
 		get completed() {
@@ -2339,12 +2341,12 @@ function createCompactOutputCollector() {
 			}
 			if (type === "response.completed") {
 				validate(items);
-				if (
-					!isRecord(event.response) ||
-					(event.response.status !== undefined && event.response.status !== "completed")
-				)
+				const response = isRecord(event.response)
+					? event.response
+					: fail("response was not completed");
+				if (response.status !== undefined && response.status !== "completed")
 					fail("response was not completed");
-				const finalItems = fromJson(event.response);
+				const finalItems = fromJson(response);
 				if (finalItems.length) {
 					validate(finalItems);
 					if (
@@ -2355,6 +2357,7 @@ function createCompactOutputCollector() {
 					)
 						fail("completed output disagreed with the finished compaction item");
 				}
+				usage = isRecord(response.usage) ? extractOpenAIUsage(response.usage) : undefined;
 				completed = true;
 			}
 		},
@@ -2362,20 +2365,21 @@ function createCompactOutputCollector() {
 			const value = parseJson(text);
 			items = validate(fromJson(value));
 			if (value.status !== "completed") fail("JSON response was not completed");
+			usage = isRecord(value.usage) ? extractOpenAIUsage(value.usage) : undefined;
 			completed = true;
 		},
-		finish() {
+		finish(): RemoteCompactResult {
 			if (!completed) fail("stream closed before response.completed");
-			return items;
+			return { items, ...(usage ? { usage } : {}) };
 		},
 	};
 }
 
 /** Consume only this compact response; ordinary chat parsing is intentionally unchanged. */
-async function readCompactOutputItems(
+async function readCompactResponse(
 	response: Response,
 	options?: { signal?: AbortSignal; onActivity?: () => void },
-): Promise<unknown[]> {
+): Promise<RemoteCompactResult> {
 	const collector = createCompactOutputCollector();
 	const parseFrame = (frame: string) => {
 		const lines = frame.split(/\r?\n/);
