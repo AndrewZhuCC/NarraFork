@@ -42,7 +42,10 @@ let env: NodeJS.ProcessEnv = {};
 const gh = mock(async (args: string[]) => {
 	trace.push(`API:${args[1]}`);
 	const path = args[1] ?? "";
-	if (args[0] !== "api" || args.length !== 2) throw new Error("Read-only fixture boundary");
+	// `--jq` only narrows the read; the fixture returns the full object.
+	const projected = args.length === 4 && args[2] === "--jq";
+	if (args[0] !== "api" || (args.length !== 2 && !projected))
+		throw new Error("Read-only fixture boundary");
 	if (path === "repos/Example/Fork")
 		return JSON.stringify({ full_name: plan.repository, default_branch: "trunk" });
 	if (path.endsWith("environments/release"))

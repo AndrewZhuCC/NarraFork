@@ -1,7 +1,9 @@
 import { describe, expect, mock, test } from "bun:test";
 import { getFileReferenceSnapshots } from "@server/lib/agent/file-reference-projection";
 import {
+	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "@server/lib/composer-document";
@@ -236,6 +238,8 @@ function fixture(
 		NotFoundError,
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
+		bindComposerDocumentReferences,
+		restoreMultipartComposerText,
 		validateComposerAssets,
 		validateComposerProjection,
 		replaceFileReferenceSnapshots,

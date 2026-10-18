@@ -162,7 +162,14 @@ describe("immutable CI bridge restoration", () => {
 			expect(await readFile(join(f.options.destination, "assets", "frozen-patch"), "utf8")).toBe(
 				"original sealed bytes",
 			);
-			expect(f.calls.every((args) => args[0] === "api" && args.length === 2)).toBe(true);
+			expect(
+				f.calls.every(
+					(args) =>
+						args[0] === "api" &&
+						(args.length === 2 ||
+							(args.length === 4 && args[1].includes("/compare/") && args[2] === "--jq")),
+				),
+			).toBe(true);
 			expect(JSON.stringify(result)).not.toContain("fixture-github-token");
 		});
 	for (const [field, value] of [
