@@ -25,9 +25,6 @@ export function snapshotWorkerSpecifiers(
 		compiled,
 	);
 }
-export function snapshotWorkerEntryPoint(specifier: string): string | URL {
-	return workerEntryFromSpecifier(specifier);
-}
 type SnapshotReply =
 	| { kind: "ready" }
 	| { kind: "done"; fileSize: number }
@@ -89,7 +86,7 @@ export function createSnapshotExporter(
 				if (signal.aborted) throw new SnapshotError("cancelled");
 				if (Date.now() >= deadline) throw new SnapshotError("timeout");
 				try {
-					worker = (dependencies.spawn ?? ((path) => new Worker(snapshotWorkerEntryPoint(path))))(
+					worker = (dependencies.spawn ?? ((path) => new Worker(workerEntryFromSpecifier(path))))(
 						specifier,
 					);
 					const current = worker;

@@ -4,27 +4,17 @@ import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "@server/lib/
 import { hotSafe } from "@server/lib/hot-safe";
 import { isCompiledRuntime } from "@server/lib/runtime-target";
 export type PrivateArchiveWorkerKind = "legacy-sync" | "legacy-import";
-const paths = {
-	"legacy-sync": "project-archive/legacy-sync-worker",
-	"legacy-import": "project-archive/legacy-import-worker",
-} as const;
 export function privateArchiveWorkerSpecifiers(
 	kind: PrivateArchiveWorkerKind,
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	const path = paths[kind];
 	return compiledWorkerSpecifiers(
-		kind === "legacy-sync"
-			? "services/project-archive/legacy-sync-worker.ts"
-			: "services/project-archive/legacy-import-worker.ts",
-		`./${path.split("/").at(-1)}.ts`,
+		`services/project-archive/${kind}-worker.ts`,
+		`./${kind}-worker.ts`,
 		moduleUrl,
 		compiled,
 	);
-}
-function entryPoint(specifier: string): URL | string {
-	return workerEntryFromSpecifier(specifier);
 }
 type PrivateArchiveWorkerHandle = Pick<EventEmitter, "once" | "off"> & {
 	terminate(): Promise<number>;
@@ -68,7 +58,7 @@ export function createPrivateArchiveWorkerLifecycle<W extends PrivateArchiveWork
 			assertOpen();
 			signal.throwIfAborted();
 			if (Date.now() >= deadline) throw new Error("Project archive worker startup timed out");
-			const worker = createWorker(entryPoint(specifier));
+			const worker = createWorker(workerEntryFromSpecifier(specifier));
 			const entry: Entry = { onExit: () => forget(worker, entry) };
 			// Register BEFORE ready: startup and detached HTTP-202 jobs also hold DB handles.
 			workers.set(worker, entry);

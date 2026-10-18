@@ -20,12 +20,6 @@ export function editorWorkerSpecifierCandidates(
 		compiled,
 	);
 }
-/** Bun's Windows embedded module keys use forward slashes. Bypass Worker's
- * file URL → native OS path conversion so the loader receives that exact key.
- * Only unwrap the compiled virtual drive; real files retain normal URL handling. */
-export function editorWorkerEntryPoint(specifier: string): string | URL {
-	return workerEntryFromSpecifier(specifier);
-}
 const WORKER_READY_TIMEOUT_MS = 5_000;
 
 type Permit = { userId: string; signal: AbortSignal };
@@ -160,7 +154,7 @@ export class EditorDocumentJobs {
 					abort();
 					return;
 				}
-				worker = new Worker(editorWorkerEntryPoint(specifier));
+				worker = new Worker(workerEntryFromSpecifier(specifier));
 				startupTimer = setTimeout(
 					() =>
 						reject(new AppError("Editor worker did not become ready", 503, "EDITOR_WORKER_FAILED")),

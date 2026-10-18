@@ -16,10 +16,6 @@ export function shareHtmlWorkerSpecifiers(
 		compiled,
 	);
 }
-/** Preserve Bun's Windows embedded module key, instead of converting it to backslashes. */
-export function shareHtmlWorkerEntry(specifier: string): string | URL {
-	return workerEntryFromSpecifier(specifier);
-}
 let activeWorkers = 0;
 let resolvedSpecifier: string | undefined;
 
@@ -66,7 +62,7 @@ async function workerAt(
 	let abort: (() => void) | undefined;
 	try {
 		return await new Promise<string>((resolve, reject) => {
-			worker = new Worker(shareHtmlWorkerEntry(specifier));
+			worker = new Worker(workerEntryFromSpecifier(specifier));
 			abort = () =>
 				reject(new AppError("HTML preview cancelled or timed out", 504, "SHARE_PREVIEW_TIMEOUT"));
 			signal.addEventListener("abort", abort, { once: true });

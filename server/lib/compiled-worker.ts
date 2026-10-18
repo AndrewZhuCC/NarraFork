@@ -22,9 +22,35 @@ import { isCompiledRuntime } from "./runtime-target";
  * - A relative `./file.js` string is resolved against the process cwd on Bun 1.4, not against
  *   the embedded graph (oven-sh/bun#40619).
  *
- * See oven-sh/bun#15981, #29124, #36286, #40619, and #32730. The build list is
- * `shared/compiled-worker-entries.ts`.
+ * See oven-sh/bun#15981, #29124, #36286, #40619, and #32730.
  */
+
+/**
+ * Extra `bun build --compile` entry points, relative to `server/`. `new Worker()` specifiers are
+ * not followed by the bundler, so a worker missing here is absent from the binary.
+ */
+export const COMPILED_WORKER_ENTRIES = [
+	"lib/db-worker/worker-entry.ts",
+	"lib/fs-scan-worker/fs-scan-worker-entry.ts",
+	"lib/browser/memory-snapshot-worker.ts",
+	"lib/browser/memory-profile-worker.ts",
+	"lib/share-preview-worker.ts",
+	"lib/request-recorder-worker.ts",
+	"services/editor-document-worker.ts",
+	"services/git-untracked-line-worker.ts",
+	"services/git-current-baseline-worker.ts",
+	"services/agent-runtime/model-history-worker.ts",
+	"services/revert-transaction-manifest-worker.ts",
+	"services/project-archive/legacy-sync-worker.ts",
+	"services/project-archive/legacy-import-worker.ts",
+] as const;
+
+export type CompiledWorkerEntry = (typeof COMPILED_WORKER_ENTRIES)[number];
+
+/** Arguments inserted after `./server/index.ts` in the production compile command. */
+export function compiledWorkerBuildEntrypoints(): string[] {
+	return COMPILED_WORKER_ENTRIES.map((path) => `./server/${path}`);
+}
 
 const WINDOWS_VIRTUAL_ROOT = /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i;
 
@@ -36,16 +62,17 @@ const WINDOWS_VIRTUAL_ROOT = /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i;
  * runs. Callers must pass their own `import.meta.url`: a default here would be this file.
  */
 export function compiledWorkerSpecifiers(
-	serverRelativePath: string,
+	serverRelativePath: CompiledWorkerEntry,
 	devRelativePath: string,
 	moduleUrl: string,
 	compiled = isCompiledRuntime(),
 ): string[] {
 	if (!compiled) return [new URL(devRelativePath, moduleUrl).href];
-	const embedded = serverRelativePath.replace(/\.tsx?$/, ".js");
+	const embedded = serverRelativePath.replace(/\.ts$/, ".js");
 	const base = embedded.slice(embedded.lastIndexOf("/") + 1);
-	const relative = [`./${embedded}`, `./server/${embedded}`, `./${base}`];
-	return [...new Set(relative)].map((path) => new URL(path, moduleUrl).href);
+	return [`./${embedded}`, `./server/${embedded}`, `./${base}`].map(
+		(path) => new URL(path, moduleUrl).href,
+	);
 }
 
 /**
@@ -73,7 +100,9 @@ export interface ConnectedWorker {
 /**
  * Start the first candidate that reports ready. A missing embedded module fails on the
  * worker's `error` event (or a synchronous throw for a rejected filename) and the next
- * layout is tried. The returned worker has had its startup listeners removed.
+ * layout is tried. Only earlier candidates are probes with a timeout: the last one (the only
+ * one in source runs and once a layout is cached) may start slowly and is bounded by `signal`.
+ * The returned worker has had its startup listeners removed.
  */
 export async function connectCompiledWorker(
 	specifiers: readonly string[],
@@ -89,22 +118,28 @@ export async function connectCompiledWorker(
 		((message: unknown) =>
 			!!message && typeof message === "object" && (message as { ready?: boolean }).ready === true);
 	const failures: string[] = [];
-	for (const specifier of specifiers) {
+	for (const [index, specifier] of specifiers.entries()) {
 		options.signal?.throwIfAborted();
+		const probe = index < specifiers.length - 1;
 		try {
-			const worker = await startOne(specifier, timeoutMs, isReady, options.signal);
+			const worker = await startOne(
+				specifier,
+				probe ? timeoutMs : undefined,
+				isReady,
+				options.signal,
+			);
 			return { worker, specifier };
 		} catch (error) {
 			if (options.signal?.aborted) throw error;
 			failures.push(`${specifier}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	throw new Error(`No embedded worker entry loaded (${failures.join(" | ")})`);
+	throw new Error(`No worker entry loaded (${failures.join(" | ")})`);
 }
 
 function startOne(
 	specifier: string,
-	timeoutMs: number,
+	timeoutMs: number | undefined,
 	isReady: (message: unknown) => boolean,
 	signal?: AbortSignal,
 ): Promise<Worker> {
@@ -132,7 +167,10 @@ function startOne(
 		const onMessage = (message: unknown) => {
 			if (isReady(message)) finish(undefined, thread);
 		};
-		const timer = setTimeout(() => finish(new Error("worker did not become ready")), timeoutMs);
+		const timer =
+			timeoutMs === undefined
+				? undefined
+				: setTimeout(() => finish(new Error("worker did not become ready")), timeoutMs);
 		try {
 			thread = new Worker(workerEntryFromSpecifier(specifier));
 		} catch (error) {

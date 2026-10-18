@@ -4,7 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { compiledWorkerBuildEntrypoints } from "../../shared/compiled-worker-entries";
+import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 import type { GitLineStats } from "../../shared/git-line-stats";
 
 const exec = promisify(execFile);
@@ -48,11 +48,11 @@ test("compiled Git line statistics embed the worker and run after all copied sou
 		const probe = join(source, "server/probe.ts");
 		await writeFile(
 			probe,
-			`import { getGitLineStats, gitLineStatsWorkerEntryPoint } from "./services/git-line-stats";
+			`import { getGitLineStats, gitLineStatsWorkerSpecifiers } from "./services/git-line-stats";
 import { isCompiledRuntime } from "./lib/runtime-target";
 console.log(JSON.stringify({
 	compiled: isCompiledRuntime(),
-	worker: String(gitLineStatsWorkerEntryPoint()),
+	worker: gitLineStatsWorkerSpecifiers()[0],
 	cwd: process.cwd(),
 	stats: await getGitLineStats(Bun.argv[2]),
 }));

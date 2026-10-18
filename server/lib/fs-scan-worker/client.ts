@@ -55,11 +55,6 @@ export function fsScanWorkerSpecifierCandidates(
 	);
 }
 
-/** Bun's compiled module keys use forward slashes. Only unwrap the virtual drive. */
-export function fsScanWorkerEntryPoint(specifier: string): string | URL {
-	return workerEntryFromSpecifier(specifier);
-}
-
 async function withSlot<T>(run: () => Promise<T>): Promise<T> {
 	const current = gate();
 	if (current.active >= CONCURRENCY) {
@@ -105,7 +100,7 @@ function measureInWorker(
 	const maxEntries = options.maxEntries ?? DIR_SCAN_MAX_ENTRIES;
 	const maxDepth = options.maxDepth ?? DIR_SCAN_MAX_DEPTH;
 	return new Promise((resolve, reject) => {
-		const worker = new Worker(fsScanWorkerEntryPoint(specifier));
+		const worker = new Worker(workerEntryFromSpecifier(specifier));
 		let settled = false;
 		let ready = false;
 		const readyTimer = setTimeout(

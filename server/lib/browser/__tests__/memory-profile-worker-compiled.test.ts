@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { launch } from "puppeteer-core";
-import { compiledWorkerBuildEntrypoints } from "../../../../shared/compiled-worker-entries";
+import { compiledWorkerBuildEntrypoints } from "../../compiled-worker";
 import { PROFILE_LIMITS } from "../memory-profile-constants";
 import type { MemoryProfileRequest, MemoryProfileWorkerReply } from "../memory-profile-types";
 

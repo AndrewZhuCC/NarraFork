@@ -10,7 +10,7 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { Worker } from "node:worker_threads";
-import { compiledWorkerBuildEntrypoints } from "../shared/compiled-worker-entries";
+import { compiledWorkerBuildEntrypoints } from "../server/lib/compiled-worker";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import type { LocalizedValue } from "../shared/i18n-locales";
@@ -435,9 +435,7 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		process.execPath,
 		"build",
 		"./server/index.ts",
-		// `new Worker()` specifiers are not bundled imports. The list and the three embedded
-		// layouts ($bunfs relative to server/, prefixed with server/, or basename) live in
-		// shared/compiled-worker-entries.ts and server/lib/compiled-worker.ts.
+		// Worker entries are not bundled imports; see server/lib/compiled-worker.ts.
 		...compiledWorkerBuildEntrypoints(),
 		`--define=__NARRAFORK_BUILD_REPOSITORY__=${JSON.stringify(BUILD_REPOSITORY)}`,
 		"--compile",

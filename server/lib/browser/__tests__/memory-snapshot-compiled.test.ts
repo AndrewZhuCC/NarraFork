@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { compiledWorkerBuildEntrypoints } from "../../../../shared/compiled-worker-entries";
+import { compiledWorkerBuildEntrypoints } from "../../compiled-worker";
 
 const execute = promisify(execFile);
 const root = resolve(import.meta.dir, "../../../..");

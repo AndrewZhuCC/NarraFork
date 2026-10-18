@@ -153,9 +153,6 @@ export function profileWorkerSpecifiers(
 		compiled,
 	);
 }
-export function profileWorkerEntryPoint(specifier: string): string | URL {
-	return workerEntryFromSpecifier(specifier);
-}
 function configFor(opts: MemoryProfileOptions): MemoryProfileConfig {
 	const mode = opts.mode ?? "both";
 	if (!["allocation", "gc", "both"].includes(mode)) throw new MemoryProfileError("input");
@@ -685,7 +682,7 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 						return;
 					}
 					try {
-						worker = (deps.spawn ?? ((path) => new Worker(profileWorkerEntryPoint(path))))(
+						worker = (deps.spawn ?? ((path) => new Worker(workerEntryFromSpecifier(path))))(
 							candidates[index++],
 						);
 					} catch {

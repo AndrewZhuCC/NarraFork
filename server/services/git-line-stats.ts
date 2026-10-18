@@ -1,10 +1,6 @@
 import type { Worker } from "node:worker_threads";
 import type { GitLineStats, GitLineStatsFile } from "../../shared/git-line-stats";
-import {
-	compiledWorkerSpecifiers,
-	connectCompiledWorker,
-	workerEntryFromSpecifier,
-} from "../lib/compiled-worker";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
 import { GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -140,14 +136,6 @@ export function gitLineStatsWorkerSpecifiers(
 	);
 }
 
-/** First candidate, in the form `new Worker` accepts. Startup probes the full list. */
-export function gitLineStatsWorkerEntryPoint(
-	compiled = isCompiledRuntime(),
-	moduleUrl = import.meta.url,
-): string | URL {
-	return workerEntryFromSpecifier(gitLineStatsWorkerSpecifiers(compiled, moduleUrl)[0]);
-}
-
 let thread: Worker | undefined;
 let resolvedWorkerSpecifier: string | undefined;
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -224,6 +212,7 @@ async function workerRead(request: PendingRead): Promise<UntrackedLineBatch> {
 			created = started.worker;
 			resolvedWorkerSpecifier = started.specifier;
 		} catch (error) {
+			if (signal.aborted) throw error;
 			throw new GitError(
 				error instanceof Error ? error.message : "Git line statistics worker failed to start",
 			);

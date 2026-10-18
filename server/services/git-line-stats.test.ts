@@ -4,12 +4,10 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { workerEntryFromSpecifier } from "../lib/compiled-worker";
 import type { SafeSpawnOptions } from "../lib/spawn";
 import * as spawn from "../lib/spawn";
 import {
 	getGitLineStats,
-	gitLineStatsWorkerEntryPoint,
 	gitLineStatsWorkerSpecifiers,
 	parseGitLineNumstat,
 } from "./git-line-stats";
@@ -111,29 +109,14 @@ describe("independent Git line statistics", () => {
 		});
 	});
 
-	test("worker URLs preserve source and compiled Windows virtual paths", () => {
+	test("worker URLs resolve next to the source and probe compiled layouts", () => {
 		expect(
-			gitLineStatsWorkerEntryPoint(
-				false,
-				"file:///project/server/services/git-line-stats.ts",
-			).toString(),
-		).toBe("file:///project/server/services/git-untracked-line-worker.ts");
+			gitLineStatsWorkerSpecifiers(false, "file:///project/server/services/git-line-stats.ts"),
+		).toEqual(["file:///project/server/services/git-untracked-line-worker.ts"]);
 		expect(gitLineStatsWorkerSpecifiers(true, "file:///$bunfs/root/binary")).toEqual([
 			"file:///$bunfs/root/services/git-untracked-line-worker.js",
 			"file:///$bunfs/root/server/services/git-untracked-line-worker.js",
 			"file:///$bunfs/root/git-untracked-line-worker.js",
-		]);
-		expect(gitLineStatsWorkerEntryPoint(true, "file:///$bunfs/root/binary").toString()).toBe(
-			"file:///$bunfs/root/services/git-untracked-line-worker.js",
-		);
-		expect(
-			gitLineStatsWorkerSpecifiers(true, "file:///C:/%7EBUN/root/binary.exe").map((specifier) =>
-				workerEntryFromSpecifier(specifier),
-			),
-		).toEqual([
-			"C:/~BUN/root/services/git-untracked-line-worker.js",
-			"C:/~BUN/root/server/services/git-untracked-line-worker.js",
-			"C:/~BUN/root/git-untracked-line-worker.js",
 		]);
 	});
 

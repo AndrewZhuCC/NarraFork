@@ -25,11 +25,6 @@ export function revertManifestWorkerSpecifiers(
 	);
 }
 
-/** Preserve Bun's Windows virtual module key instead of converting it to backslashes. */
-export function revertManifestWorkerEntryPoint(specifier: string): string | URL {
-	return workerEntryFromSpecifier(specifier);
-}
-
 const READY_TIMEOUT_MS = 5_000;
 interface WorkerOptions {
 	/** Trusted test seams, never supplied by HTTP. Only startup probing may retry. */
@@ -86,7 +81,7 @@ async function workerAt<T>(
 			abort = () => refuse(new RevertTransactionError("MANIFEST_CANCELLED"));
 			signal.addEventListener("abort", abort, { once: true });
 			if (signal.aborted) return abort();
-			thread = new Worker(revertManifestWorkerEntryPoint(specifier));
+			thread = new Worker(workerEntryFromSpecifier(specifier));
 			timer = setTimeout(
 				() => refuse(new RevertTransactionError("MANIFEST_WORKER_TIMEOUT")),
 				timeoutMs,
