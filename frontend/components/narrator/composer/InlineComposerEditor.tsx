@@ -65,6 +65,11 @@ export interface InlineComposerSelection {
 	empty?: boolean;
 	type?: "text" | "node" | "all";
 }
+/** Document positions of the browser caret, read from the DOM rather than editor state. */
+export interface InlineComposerCaret {
+	anchor: number;
+	head: number;
+}
 export interface InlineComposerTextContext {
 	text: string;
 	start: number;
@@ -85,6 +90,13 @@ export interface InlineComposerEditorHandle {
 	/** Delegates validation/resource allocation to onPasteFiles; never allocates hidden assets. */
 	insertFiles(files: File[]): void;
 	getSelection(): InlineComposerSelection;
+	/**
+	 * Browser caret mapped through the current DOM. Editor state lags arrow keys until
+	 * `selectionchange`, so line-vs-history decisions must not read `state.selection`.
+	 */
+	readLiveCaret(): InlineComposerCaret | null;
+	/** Collapsed caret still on `before`'s visual line, including soft wraps and boundary jitter. */
+	caretStayedOnLine(before: InlineComposerCaret | null): boolean;
 	/** The caret's contiguous text run; atoms, hard breaks and paragraphs are boundaries. */
 	getTextContext(): InlineComposerTextContext | null;
 	captureSelectionBookmark(): InlineComposerSelectionBookmark;
@@ -794,6 +806,39 @@ export const InlineComposerEditor = forwardRef<
 		editor.view.dom.setAttribute("data-placeholder", props.placeholder ?? "");
 		editor.view.dom.setAttribute("aria-disabled", String(!!props.disabled));
 	}, [editor, props.placeholder, props.disabled, t]);
+	const readLiveCaret = (): InlineComposerCaret | null => {
+		if (!editor || editor.isDestroyed) return null;
+		const view = editor.view;
+		const selection = view.dom.ownerDocument.getSelection();
+		if (!selection?.anchorNode || !selection.focusNode || selection.rangeCount === 0) return null;
+		if (!view.dom.contains(selection.anchorNode) || !view.dom.contains(selection.focusNode))
+			return null;
+		try {
+			return {
+				anchor: view.posAtDOM(selection.anchorNode, selection.anchorOffset),
+				head: view.posAtDOM(selection.focusNode, selection.focusOffset),
+			};
+		} catch {
+			return null;
+		}
+	};
+	const caretStayedOnLine = (before: InlineComposerCaret | null) => {
+		const after = readLiveCaret();
+		if (!before || !after || before.anchor !== before.head || after.anchor !== after.head)
+			return false;
+		if (before.head === after.head) return true;
+		if (!editor || editor.isDestroyed) return false;
+		try {
+			const from = editor.view.coordsAtPos(before.head);
+			const to = editor.view.coordsAtPos(after.head);
+			const lineHeight =
+				Number.parseFloat(getComputedStyle(editor.view.dom).lineHeight) || to.bottom - to.top || 24;
+			// A boundary press can nudge the DOM caret onto a trailing break without leaving the line.
+			return Math.abs(from.top - to.top) < Math.max(4, lineHeight / 2);
+		} catch {
+			return false;
+		}
+	};
 	useImperativeHandle(ref, () => ({
 		focus: () => {
 			editor?.commands.focus();
@@ -825,6 +870,8 @@ export const InlineComposerEditor = forwardRef<
 		},
 		getSelection: () =>
 			editor ? selectionOf(editor.state.doc, editor.state.selection) : { start: 0, end: 0 },
+		readLiveCaret,
+		caretStayedOnLine,
 		getTextContext: () => {
 			if (!editor || editor.isDestroyed) return null;
 			const { selection, doc } = editor.state;
