@@ -1236,6 +1236,7 @@
 	"overviewHiddenPreviewTruncated": "此预览已显示 {{shown}} 个隐藏模型；另有 {{hidden}} 个已隐藏。",
 	"overviewFinalList": "模型列表预览",
 	"providerNames": {
+		"commandcode": "Command Code",
 		"silicon": "硅基流动",
 		"ovms": "OpenVINO Model Server",
 		"ocoolai": "ocoolAI",
@@ -2653,5 +2654,28 @@
 	"narratorParagraphScale": "段落间距",
 	"narratorParagraphScaleDesc": "段落、列表、代码块与消息之间的间距。",
 	"narratorLineHeight": "行间距",
-	"narratorLineHeightDesc": "同一段落内各行之间的间距。"
+	"narratorLineHeightDesc": "同一段落内各行之间的间距。",
+	"commandcode": {
+		"configured": "已配置",
+		"notConfigured": "未配置",
+		"sectionDesc": "Command Code（commandcode.ai）作为平台 provider：填 API key 即可使用，模型从 Provider API 动态获取。",
+		"apiKeyLabel": "API key",
+		"apiKeyDesc": "在 Studio → API keys 里生成，无需安装 CLI",
+		"getKey": "获取 API key",
+		"enabled": "启用",
+		"usageTitle": "额度",
+		"usageDesc": "月度额度与滚动窗口用量，来自 Command Code 的计费接口。",
+		"usageUnavailable": "暂无额度数据 —— 请先在上方填入 API key。",
+		"monthlyCredits": "月度额度",
+		"windowUsed": "已用 {{used}} / {{total}}（{{percent}}%）",
+		"resetAt": "{{time}} 后重置",
+		"resetUnknown": "未知",
+		"fiveHour": "5 小时窗口",
+		"weekly": "周窗口",
+		"requests": "请求数",
+		"tokens": "Token 数",
+		"successRate": "成功率",
+		"modelsTitle": "模型",
+		"modelsDesc": "从 Provider API 拉取并缓存 10 分钟；默认协议不对时可为单个模型指定协议。"
+	}
 }

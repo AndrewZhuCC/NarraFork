@@ -1234,6 +1234,7 @@
 	"overviewHiddenPreviewTruncated": "Showing {{shown}} hidden models in this preview; {{hidden}} more hidden.",
 	"overviewFinalList": "Model List Preview",
 	"providerNames": {
+		"commandcode": "Command Code",
 		"silicon": "SiliconFlow",
 		"ovms": "OpenVINO Model Server",
 		"ocoolai": "ocoolAI",
@@ -2651,5 +2652,28 @@
 	"narratorParagraphScale": "Paragraph spacing",
 	"narratorParagraphScaleDesc": "Gaps between paragraphs, lists, code blocks and messages.",
 	"narratorLineHeight": "Line spacing",
-	"narratorLineHeightDesc": "Spacing between lines inside a paragraph."
+	"narratorLineHeightDesc": "Spacing between lines inside a paragraph.",
+	"commandcode": {
+		"configured": "Connected",
+		"notConfigured": "Not connected",
+		"sectionDesc": "Command Code (commandcode.ai) is a platform provider: paste an API key and its models come from the Provider API.",
+		"apiKeyLabel": "API key",
+		"apiKeyDesc": "Generate one at Studio → API keys. No CLI installation needed.",
+		"getKey": "Get an API key",
+		"enabled": "Enabled",
+		"usageTitle": "Usage",
+		"usageDesc": "Monthly credits and rolling windows, read from the Command Code billing API.",
+		"usageUnavailable": "No usage to show yet — paste an API key above.",
+		"monthlyCredits": "Monthly credits",
+		"windowUsed": "Used {{used}} / {{total}} ({{percent}}%)",
+		"resetAt": "Resets in {{time}}",
+		"resetUnknown": "unknown",
+		"fiveHour": "5-hour window",
+		"weekly": "Weekly window",
+		"requests": "Requests",
+		"tokens": "Tokens",
+		"successRate": "Success rate",
+		"modelsTitle": "Models",
+		"modelsDesc": "Fetched from the Provider API and cached for 10 minutes. Set a protocol per model when the default is wrong."
+	}
 }

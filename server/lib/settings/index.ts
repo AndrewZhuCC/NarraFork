@@ -18,6 +18,7 @@ import { resolve } from "node:path";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
@@ -101,6 +102,7 @@ export {
 	getSummaryModelContextWindow,
 	getSummaryModelContextWindowDetail,
 	getVisibleModels,
+	hasConfiguredCommandCodeProvider,
 	hasConfiguredGeminiProvider,
 	hasConfiguredNugProvider,
 	isAnthropicProvider,
@@ -129,6 +131,7 @@ export {
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveModelContextWindow,
+	resolveModelProtocol,
 	resolveProvider,
 	resolveTranslationModelOverride,
 	usesCodexApiMode,
@@ -526,6 +529,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (migrateCommandCodeDisabledFlag(merged)) {
+		needsSave = true;
+	}
+
 	// Loading settings must not destructively purge model references. Custom API
 	// providers, aggregations and plugin providers are not all represented by the
 	// legacy provider arrays (plugins may not even be registered yet at startup).
@@ -606,6 +613,26 @@ export function normalizeMcpServerIds(settings: NarraForkSettings): boolean {
 		seen.add(server.id);
 	}
 	return dirty;
+}
+
+/**
+ * Move a legacy `agent.disabledProviders` entry for Command Code onto its own
+ * `commandCode.disabled` flag.
+ *
+ * Earlier builds treated Command Code as an ordinary prefix in that set. The set
+ * still filters models client-side, so leaving the entry behind would hide every
+ * Command Code model while the provider itself stayed enabled. The user's intent
+ * (it was switched off) is preserved on the flag the provider actually reads.
+ */
+export function migrateCommandCodeDisabledFlag(settings: NarraForkSettings): boolean {
+	const disabled = settings.agent?.disabledProviders;
+	if (!disabled?.includes(COMMAND_CODE_PREFIX)) return false;
+	settings.agent.disabledProviders = disabled.filter((prefix) => prefix !== COMMAND_CODE_PREFIX);
+	settings.commandCode = {
+		...settings.commandCode,
+		disabled: settings.commandCode?.disabled ?? true,
+	};
+	return true;
 }
 
 /** Migrate pre readOnly/readWrite MCP behavior values. */

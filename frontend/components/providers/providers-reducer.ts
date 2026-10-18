@@ -1,11 +1,13 @@
 import { isValidModelContextWindow } from "@shared/model-context-window";
 import { useCallback, useMemo } from "react";
+import type { ProxyOverride } from "../../lib/proxy";
 import type { NUGProviderState } from "./NUGProvidersSection";
 import type {
 	AnthropicProviderState,
 	CustomApiProtocol,
 	CustomApiProviderState,
 	OpenAIProviderState,
+	UserAgentMode,
 } from "./types";
 
 // ── Types ──────────────────────────────────────────────
@@ -16,11 +18,41 @@ export interface CustomModelEntry {
 	provider?: string;
 }
 
+/** Command Code 平台 provider 的草稿（settings.commandCode 的镜像）。 */
+export interface CommandCodeState {
+	apiKey: string;
+	/** 后端据此把该 provider 从可用候选里剔除，所以必须跟着草稿一起保存。 */
+	disabled: boolean;
+	proxy?: ProxyOverride;
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+}
+
+/**
+ * 平台集成（codex / Command Code / TokenDance）的前缀清单。
+ *
+ * 约定：**平台 provider 的启用开关一律写成这里的草稿**，由页面底部的保存条统一提交，
+ * 「放弃更改」随快照回滚。UI 里不允许直接调用后端接口去改启用状态 —— 新增平台 provider
+ * 时把它加进这个数组，`SET_PLATFORM_DISABLED` 会强制你在这里落地对应字段。
+ */
+export const PLATFORM_PROVIDER_PREFIXES = ["codex", "CommandCode", "tokendance"] as const;
+
+export type PlatformProviderPrefix = (typeof PLATFORM_PROVIDER_PREFIXES)[number];
+
+/** 判断某个 prefix 是不是平台 provider（决定开关走草稿还是普通 provider 的 toggle）。 */
+export function isPlatformProviderPrefix(prefix: string): prefix is PlatformProviderPrefix {
+	return (PLATFORM_PROVIDER_PREFIXES as readonly string[]).includes(prefix);
+}
+
 export interface ProvidersState {
 	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
 	nugProviders: NUGProviderState[];
+	commandCode: CommandCodeState;
+	/** TokenDance 的连接开关草稿（它存在自己的连接记录里，保存时单独提交）。 */
+	tokenDanceDisabled: boolean;
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
 	modelContextWindows: Record<string, number>;
@@ -34,6 +66,8 @@ export interface SavedSnapshot {
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
 	nugProviders: NUGProviderState[];
+	commandCode: CommandCodeState;
+	tokenDanceDisabled: boolean;
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
 	modelContextWindows: Record<string, number>;
@@ -51,6 +85,8 @@ export type ProvidersAction =
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
 	| { type: "SET_NUG_PROVIDERS"; providers: Updater<NUGProviderState[]> }
+	| { type: "SET_COMMAND_CODE"; config: CommandCodeState }
+	| { type: "SET_PLATFORM_DISABLED"; prefix: PlatformProviderPrefix; disabled: boolean }
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
 	| { type: "SET_CUSTOM_MODELS"; models: CustomModelEntry[] }
@@ -247,6 +283,8 @@ export const initialProvidersState: ProvidersState = {
 	openaiProviders: [],
 	anthropicProviders: [],
 	nugProviders: [],
+	commandCode: { apiKey: "", disabled: false },
+	tokenDanceDisabled: false,
 	hiddenModels: new Set(),
 	customModels: [],
 	modelContextWindows: {},
@@ -391,6 +429,15 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				openaiProviders: splitCustomApiProviders.openai,
 				anthropicProviders: splitCustomApiProviders.anthropic,
 				nugProviders: nug,
+				commandCode: {
+					apiKey: s.commandCode?.apiKey ?? "",
+					disabled: s.commandCode?.disabled === true,
+					proxy: s.commandCode?.proxy,
+					userAgentMode: s.commandCode?.userAgentMode,
+					customUserAgent: s.commandCode?.customUserAgent,
+					extraHeaders: s.commandCode?.extraHeaders,
+				},
+				tokenDanceDisabled: s.tokendance?.disabled === true,
 				hiddenModels: new Set(hidden),
 				customModels: custom,
 				modelContextWindows: windows,
@@ -423,6 +470,30 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				...state,
 				nugProviders: resolveUpdater(state.nugProviders, action.providers),
 			};
+
+		case "SET_COMMAND_CODE":
+			return { ...state, commandCode: action.config };
+
+		case "SET_PLATFORM_DISABLED": {
+			// 平台 provider 的启用开关只有这一个写入点：它只改草稿，绝不碰后端接口。
+			// 保存条是唯一的提交点，「放弃更改」时随快照一起回滚。
+			switch (action.prefix) {
+				case "codex": {
+					const next = new Set(state.disabledProviders);
+					if (action.disabled) next.add("codex");
+					else next.delete("codex");
+					return { ...state, disabledProviders: next };
+				}
+				case "CommandCode":
+					return {
+						...state,
+						commandCode: { ...state.commandCode, disabled: action.disabled },
+					};
+				case "tokendance":
+					return { ...state, tokenDanceDisabled: action.disabled };
+			}
+			return state;
+		}
 
 		case "TOGGLE_HIDDEN": {
 			const next = new Set(state.hiddenModels);
@@ -529,6 +600,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				openaiProviders: snap.openaiProviders.map((p) => ({ ...p })),
 				anthropicProviders: snap.anthropicProviders.map((p) => ({ ...p })),
 				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
+				commandCode: { ...snap.commandCode },
+				tokenDanceDisabled: snap.tokenDanceDisabled,
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
 				modelContextWindows: { ...snap.modelContextWindows },
@@ -559,6 +632,9 @@ export function providersStateFromSettings(settings: Record<string, unknown>): P
 export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot): boolean {
 	return useMemo(() => {
 		if (!state.initialized) return false;
+		if (JSON.stringify(state.commandCode) !== JSON.stringify(savedSnapshot.commandCode))
+			return true;
+		if (state.tokenDanceDisabled !== savedSnapshot.tokenDanceDisabled) return true;
 		// Fast path: array length comparison
 		if (state.customApiProviders.length !== savedSnapshot.customApiProviders.length) return true;
 		if (state.nugProviders.length !== savedSnapshot.nugProviders.length) return true;
@@ -605,6 +681,8 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		openaiProviders: state.openaiProviders.map((p) => ({ ...p })),
 		anthropicProviders: state.anthropicProviders.map((p) => ({ ...p })),
 		nugProviders: state.nugProviders.map((p) => ({ ...p })),
+		commandCode: { ...state.commandCode },
+		tokenDanceDisabled: state.tokenDanceDisabled,
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
 		modelContextWindows: { ...state.modelContextWindows },
@@ -642,6 +720,18 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 	const setNugProviders = useCallback(
 		(updater: NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[])) =>
 			dispatch({ type: "SET_NUG_PROVIDERS", providers: updater }),
+		[dispatch],
+	);
+
+	const setCommandCode = useCallback(
+		(config: CommandCodeState) => dispatch({ type: "SET_COMMAND_CODE", config }),
+		[dispatch],
+	);
+
+	/** 平台 provider 启用开关的唯一入口（只改草稿，保存条统一提交）。 */
+	const setPlatformDisabled = useCallback(
+		(prefix: PlatformProviderPrefix, disabled: boolean) =>
+			dispatch({ type: "SET_PLATFORM_DISABLED", prefix, disabled }),
 		[dispatch],
 	);
 
@@ -688,6 +778,8 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			setOpenaiProviders,
 			setAnthropicProviders,
 			setNugProviders,
+			setCommandCode,
+			setPlatformDisabled,
 			toggleHidden,
 			batchToggleHidden,
 			setCustomModels,
@@ -701,6 +793,8 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			setOpenaiProviders,
 			setAnthropicProviders,
 			setNugProviders,
+			setCommandCode,
+			setPlatformDisabled,
 			toggleHidden,
 			batchToggleHidden,
 			setCustomModels,

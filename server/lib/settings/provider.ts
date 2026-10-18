@@ -9,6 +9,7 @@ import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
+import { resolveCommandCodeToken } from "../commandcode-manager";
 import { AppError, ValidationError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { getEffectiveModelMetadata } from "../model-catalog";
@@ -18,6 +19,7 @@ import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
 	ModelAggregation,
+	ModelProtocol,
 	NarraForkSettings,
 	NUGProviderConfig,
 	OpenAIProviderConfig,
@@ -801,6 +803,21 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
+/** Command Code 的凭据可以来自设置页手填的 API key，或 CLI 落盘的 auth.json。 */
+export function hasConfiguredCommandCodeProvider(): boolean {
+	const config = s().commandCode;
+	return !config?.disabled && !!resolveCommandCodeToken(config?.apiKey).credential;
+}
+
+/**
+ * 逐模型协议：`modelProtocols`（设置页模型行写的 provider 层）；缺省时由各 provider 的默认规则决定。
+ */
+export function resolveModelProtocol(prefix: string, model?: string): ModelProtocol | undefined {
+	if (!model) return undefined;
+	const key = `${prefix}:${model}`;
+	return s().agent?.modelProtocols?.[key];
+}
+
 export function hasConfiguredNugProvider(): boolean {
 	const providers = s().nugProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
@@ -830,6 +847,9 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
+	}
+	if (hasConfiguredCommandCodeProvider()) {
+		available.add("CommandCode");
 	}
 	if (hasConfiguredNugProvider()) {
 		for (const p of s().nugProviders ?? []) {

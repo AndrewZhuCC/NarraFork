@@ -101,6 +101,17 @@ export function rebaseProviderState(
 		providerOrder: equalValue(local.providerOrder, baseline.providerOrder)
 			? fresh.providerOrder
 			: local.providerOrder,
+		// A draft restored from an older snapshot may predate this field — take the fresh value then.
+		commandCode:
+			local.commandCode && !equalValue(local.commandCode, baseline.commandCode)
+				? local.commandCode
+				: fresh.commandCode,
+		// 旧快照里可能没有这一项；本地改过才保留，否则跟随服务端。
+		tokenDanceDisabled:
+			typeof local.tokenDanceDisabled === "boolean" &&
+			local.tokenDanceDisabled !== baseline.tokenDanceDisabled
+				? local.tokenDanceDisabled
+				: fresh.tokenDanceDisabled,
 		modelContextWindows,
 	});
 }

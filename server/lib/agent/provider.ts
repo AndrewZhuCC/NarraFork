@@ -14,6 +14,7 @@ import type {
 import type { ContextInputCharacters } from "@shared/context-usage";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import { getCodexManager } from "../codex-manager";
+import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
 import {
 	FOLLOW_DEFAULT_MODEL,
@@ -23,6 +24,7 @@ import {
 	getOpenaiProviderConfig,
 	parseModelId,
 	resolveEffectiveModel,
+	resolveModelProtocol,
 	resolveProvider,
 	settings,
 } from "../settings";
@@ -30,6 +32,7 @@ import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../token
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
+import { buildCommandCodeProvider } from "./commandcode-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
@@ -335,6 +338,21 @@ builtinProviderSources.register("codex", {
 	],
 });
 
+builtinProviderSources.register("CommandCode", {
+	resolve: (provider, model) =>
+		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
+	listReadiness: () => [
+		{
+			id: "builtin:CommandCode",
+			prefix: "CommandCode",
+			name: "Command Code",
+			ready:
+				!settings.commandCode?.disabled &&
+				!!resolveCommandCodeToken(settings.commandCode?.apiKey).credential,
+		},
+	],
+});
+
 /** API families expose the same instances used to construct their adapters. */
 function registerCredentialProviderSource<
 	T extends {
@@ -352,9 +370,40 @@ function registerCredentialProviderSource<
 	isComplete: (config: T) => boolean = (config) => !!config.apiKey.trim(),
 ): void {
 	builtinProviderSources.register(kind, {
-		resolve: (prefix) => {
+		resolve: (prefix, model) => {
 			const config = getConfig(prefix);
-			return config ? create(config) : null;
+			if (!config) return null;
+			// 逐模型协议覆盖：把同一份连接配置交给另一族适配器。构造失败则回退默认，避免影响其它模型。
+			const protocol = resolveModelProtocol(prefix, model);
+			if (protocol) {
+				try {
+					const base = config as unknown as {
+						id: string;
+						name: string;
+						prefix: string;
+						apiKey: string;
+						baseUrl?: string;
+						defaultModel?: string;
+					};
+					const shared = {
+						id: base.id,
+						name: base.name,
+						prefix: base.prefix,
+						apiKey: base.apiKey,
+						baseUrl: base.baseUrl ?? "",
+						defaultModel: base.defaultModel ?? model ?? "default",
+					};
+					if (protocol === "anthropic-messages") return new AnthropicProvider(shared);
+					if (protocol === "gemini-compatible") return createGeminiProvider(shared as never);
+					return new OpenAIProvider({
+						...shared,
+						apiMode: protocol === "openai-responses" ? "responses" : "completions",
+					});
+				} catch {
+					// 落到默认构造
+				}
+			}
+			return create(config);
 		},
 		listReadiness: () =>
 			listConfigs().map((config) => ({

@@ -3,6 +3,7 @@ import { rebaseProviderState } from "./provider-settings-rebase";
 import {
 	createSnapshot,
 	initialProvidersState,
+	type ProvidersState,
 	providersStateFromSettings,
 } from "./providers-reducer";
 
@@ -199,5 +200,26 @@ describe("provider settings three-way rebase", () => {
 			{},
 		);
 		expect(result.initialized).toBe(true);
+	});
+
+	test("keeps an edited Command Code key while clean and legacy drafts take the server value", () => {
+		const saved = providersStateFromSettings({ commandCode: { apiKey: "********abcd" } });
+		const baseline = createSnapshot(saved);
+		const server = { commandCode: { apiKey: "********wxyz" } };
+
+		const edited = structuredClone(saved);
+		edited.commandCode.apiKey = "user_demo0000000000000000";
+		expect(rebaseProviderState(edited, baseline, server).commandCode.apiKey).toBe(
+			"user_demo0000000000000000",
+		);
+
+		expect(rebaseProviderState(saved, baseline, server).commandCode.apiKey).toBe("********wxyz");
+
+		// 旧版本留下的草稿可能还没有这个字段 —— 必须退回服务端值，不能让 state 缺字段。
+		const legacy = structuredClone(saved) as Partial<ProvidersState>;
+		delete legacy.commandCode;
+		expect(rebaseProviderState(legacy as ProvidersState, baseline, server).commandCode.apiKey).toBe(
+			"********wxyz",
+		);
 	});
 });

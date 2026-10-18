@@ -8,6 +8,7 @@ import type { ModelCard } from "@shared/model-card";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
+import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { DiskSafetySettings } from "../disk-safety-config";
@@ -499,6 +500,13 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
+/** 逐模型可选的协议；`agent.modelProtocols` 的值域。 */
+export type ModelProtocol =
+	| "anthropic-messages"
+	| "openai-responses"
+	| "completions-compatible"
+	| "gemini-compatible";
+
 export interface TokenDanceSettings {
 	apiKey: string;
 	disabled: boolean;
@@ -652,6 +660,8 @@ export interface NarraForkSettings {
 		promptOptimizeContextMaxMessages?: number;
 		customModels: ModelOption[];
 		hiddenModels: string[];
+		/** 逐模型的协议覆盖，键为带前缀的完整模型 ID；缺省即跟随该 provider 的默认协议。 */
+		modelProtocols?: Record<string, ModelProtocol>;
 		maxTurns: number;
 		subagentModels: {
 			explore: string;
@@ -1001,6 +1011,8 @@ export interface NarraForkSettings {
 	nugProviders?: NUGProviderConfig[];
 	/** Google Gemini API providers — native generativelanguage.googleapis.com protocol. */
 	geminiProviders?: GeminiProviderConfig[];
+	/** Command Code（commandcode.ai）接入配置；凭据复用 CLI 的 ~/.commandcode/auth.json。 */
+	commandCode?: CommandCodeProviderSettings;
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
 	/** Update source and download configuration. */
