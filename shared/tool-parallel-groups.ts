@@ -73,6 +73,25 @@ const AGENT_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Await", "Send"]);
 const AGENT_TOOL_NAME = "Agent";
 
 /**
+ * Send wakes an idle subagent before it returns. An Await in the same batch would
+ * otherwise read the previous run's terminal state and hand back the old report, so
+ * Await after Send starts in a fresh group. Unlike the Agent barrier this waits for
+ * the whole Send group, which settles as soon as delivery is accepted.
+ */
+const SEND_TOOL_NAME = "Send";
+const SEND_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Await"]);
+
+function crossesSendBarrier<T extends ToolExecutionGroupItem>(
+	previousGroup: readonly T[] | undefined,
+	item: T,
+): boolean {
+	return (
+		(previousGroup?.some((member) => getToolName(member) === SEND_TOOL_NAME) ?? false) &&
+		SEND_BARRIER_DEPENDENT_TOOL_NAMES.has(getToolName(item))
+	);
+}
+
+/**
  * The shell tool's canonical name.
  *
  * Duplicated from `server/lib/agent/tool-name.ts` rather than imported: that
@@ -146,7 +165,9 @@ export function isParallelSafeToolExecution(item: ToolExecutionGroupItem): boole
  * Additionally, an Agent already present in the current parallel batch forms a
  * deterministic barrier for a subsequent Await/Send: those open a new group so the
  * spawned agent is observable before the wait/message runs. Agent+Agent and Agent+Read
- * stay parallel. The same grouping drives both the live loop and planned-update recovery.
+ * stay parallel. Likewise a Send in the current batch splits off a later Await, so the
+ * wait observes the run that Send woke. The same grouping drives both the live loop and
+ * planned-update recovery.
  */
 export function groupToolExecutions<T extends ToolExecutionGroupItem>(items: readonly T[]): T[][] {
 	const groups: T[][] = [];
@@ -156,30 +177,15 @@ export function groupToolExecutions<T extends ToolExecutionGroupItem>(items: rea
 		const firstInLastGroup = lastGroup?.[0];
 		const lastGroupIsParallel =
 			firstInLastGroup !== undefined && isParallelSafeToolExecution(firstInLastGroup);
-		const crossesAgentBarrier = isAgentDependentToolExecutionGroup(lastGroup, [item]);
-		if (isParallel && lastGroupIsParallel && !crossesAgentBarrier) {
+		const crossesBarrier =
+			isAgentDependentToolExecutionGroup(lastGroup, [item]) || crossesSendBarrier(lastGroup, item);
+		if (isParallel && lastGroupIsParallel && !crossesBarrier) {
 			lastGroup.push(item);
 		} else {
 			groups.push([item]);
 		}
 	}
 	return groups;
-}
-
-/**
- * Whether two calls that are ADJACENT in provider order land in the same parallel
- * execution group — i.e. whether they start together.
- *
- * Adjacency is the whole question: grouping only ever merges CONSECUTIVE calls, so
- * a non-adjacent pair is in the same group only if everything between them is too,
- * which callers establish by walking the prefix (see `sharesParallelGroup`).
- */
-function adjacentCallsShareGroup(
-	earlier: ToolExecutionGroupItem,
-	later: ToolExecutionGroupItem,
-): boolean {
-	if (!isParallelSafeToolExecution(earlier) || !isParallelSafeToolExecution(later)) return false;
-	return !isAgentDependentToolExecutionGroup([earlier], [later]);
 }
 
 /**
@@ -196,11 +202,6 @@ function adjacentCallsShareGroup(
  */
 export function sharesParallelGroup(sequence: readonly ToolExecutionGroupItem[]): boolean {
 	if (sequence.length < 2) return false;
-	for (let i = 1; i < sequence.length; i++) {
-		const previous = sequence[i - 1];
-		const current = sequence[i];
-		if (!previous || !current) return false;
-		if (!adjacentCallsShareGroup(previous, current)) return false;
-	}
-	return true;
+	// Barriers depend on every member already in the group, not just the adjacent call.
+	return groupToolExecutions(sequence).length === 1;
 }

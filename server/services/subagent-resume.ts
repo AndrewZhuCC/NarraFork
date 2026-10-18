@@ -27,6 +27,10 @@ import {
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
+import {
+	claimSubagentBackgroundRun,
+	clearSubagentBackgroundRunClaim,
+} from "./subagent-background-claim";
 import { establishSubagentExecutionSegment } from "./subagent-execution-boundary";
 import { consumeNextBufferedSubagentMessage, loadSubagentHistory } from "./subagent-executor";
 import {
@@ -113,6 +117,12 @@ export interface ResumeSubagentInput {
 	preserveBackground?: boolean;
 	/** Background recovery must not publish into the already-completed Agent tool call. */
 	skipConclusionDelivery?: boolean;
+	/**
+	 * Claim the subagent as a running background task before continuing it. Implies
+	 * `preserveBackground`, `skipStaleAttach` and `skipConclusionDelivery`: the result
+	 * arrives as a background completion notice, not in the historical Agent tool call.
+	 */
+	asBackgroundTask?: boolean;
 	/** Keep a recovered Agent checkpointable by subsequent planned updates. */
 	resumableUpdateLease?: boolean;
 	/** Persisted logical run from the planned-update checkpoint, never an execution epoch. */
@@ -439,6 +449,9 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 	// Freeze accepted caller-owned snapshots before admission's first async boundary.
 	input = {
 		...input,
+		...(input.asBackgroundTask
+			? { preserveBackground: true, skipStaleAttach: true, skipConclusionDelivery: true }
+			: {}),
 		fileReferences:
 			input.fileReferences === undefined
 				? undefined
@@ -862,6 +875,22 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 			}
 		}
 
+		if (input.asBackgroundTask) {
+			try {
+				await claimSubagentBackgroundRun({
+					parentNarratorId: original.parentNarratorId,
+					subagent: original,
+					originToolUseId,
+				});
+			} catch (error) {
+				await clearSubagentBackgroundRunClaim(
+					input.subagentId,
+					original.parentNarratorId,
+					error instanceof Error ? error.message : String(error),
+				);
+				throw error;
+			}
+		}
 		const token = generateId();
 		const publicationClaimId = generateId();
 		const abortController = input.preserveBackground
@@ -1012,6 +1041,13 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				})
 				.catch(() => {});
 			await restoreTemporaryModel(input.subagentId).catch(() => {});
+			if (input.asBackgroundTask) {
+				await clearSubagentBackgroundRunClaim(
+					input.subagentId,
+					original.parentNarratorId,
+					error instanceof Error ? error.message : String(error),
+				);
+			}
 			throw error;
 		}
 	}).catch(async (error) => {
