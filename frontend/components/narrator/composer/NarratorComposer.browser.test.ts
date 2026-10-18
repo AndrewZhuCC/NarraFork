@@ -665,7 +665,9 @@ test("arrow keys recall history from the first or last wrapped line, not from th
 		);
 		await page.keyboard.press("ArrowDown");
 		await page.waitForFunction(
-			() => (window as unknown as FixtureWindow).fixture.snapshot().text === wrapped,
+			(expected) => (window as unknown as FixtureWindow).fixture.snapshot().text === expected,
+			{},
+			wrapped,
 		);
 		await settle(page);
 		const end = await page.evaluate(() =>
