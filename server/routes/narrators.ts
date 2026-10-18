@@ -3653,28 +3653,17 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 				? expectedMessageVersion
 				: undefined,
 	});
-	// Read the message version AFTER the page, never concurrently.
-	//
-	// The page builder materializes a lazy fork's missing refs on demand
-	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
-	// parallel, this query resolves BEFORE the backfill commits while the page
-	// carries the post-backfill version — so the equality check below failed
-	// deterministically on the first upward scroll past a fork boundary, the one
-	// place the backfill actually copies anything. Sequenced, both sides observe
-	// the same post-backfill version, and the check goes back to meaning what it
-	// says: another writer changed the narrator underneath us.
+	// The page is internally consistent on its own: the service snapshots
+	// `messageVersion` after any lazy-ref backfill and re-checks it after the build
+	// (rebuilding unpinned pages on drift). A second comparison here only reopened a
+	// window in which any unrelated write on a live narrator turned a good page into
+	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
-		columns: { messageVersion: true },
+		columns: { id: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	if (narratorMeta.messageVersion !== result.messageVersion)
-		throw new AppError(
-			"Narrator message version changed while the exact-layout page was being built",
-			409,
-			"PRETEXT_DOCUMENT_CHANGED",
-		);
 	return c.json(result);
 });
 

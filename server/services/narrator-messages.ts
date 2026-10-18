@@ -2740,6 +2740,38 @@ function assertDisplayReadActive(signal?: AbortSignal, deadlineAt?: number): voi
 		);
 }
 
+/** Total builds (first try included) an unpinned exact-layout page gets under version drift. */
+export const PRETEXT_PAGE_DRIFT_ATTEMPTS = 4;
+
+/**
+ * Short jittered pause before rebuilding a page whose revision moved mid-build. Writes on a
+ * live narrator come in bursts (a block commit, then its tool row, then the parent bump), so
+ * an immediate rebuild would mostly collide with the same burst. Never sleeps past the read's
+ * own deadline, and wakes early on cancellation.
+ */
+async function waitForPretextDriftRetry(
+	attempt: number,
+	signal: AbortSignal | undefined,
+	deadlineAt: number,
+): Promise<void> {
+	const delayMs = Math.min(
+		25 * 2 ** (attempt - 1) + Math.floor(Math.random() * 25),
+		Math.max(0, deadlineAt - Date.now()),
+	);
+	if (delayMs > 0) {
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(done, delayMs);
+			function done() {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", done);
+				resolve();
+			}
+			signal?.addEventListener("abort", done, { once: true });
+		});
+	}
+	assertDisplayReadActive(signal, deadlineAt);
+}
+
 async function loadAggregateRefMessages(
 	narratorId: string,
 	messageIds: string[],
@@ -4037,164 +4069,191 @@ const narratorMessageQueriesUnlocked = {
 		if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
 			await ensureRefsCoverSeq(narratorId, Math.trunc(opts.beforeSeq as number) - limit);
 		}
-		const narratorMeta = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { variant: true, messageVersion: true },
-		});
-		const isSubagent = narratorMeta != null && isSubagentVariant(narratorMeta.variant);
-		const messageVersion = narratorMeta?.messageVersion ?? 0;
-		if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
-			throw new AppError(
-				"Narrator document changed before the exact-layout page was built",
-				409,
-				"PRETEXT_DOCUMENT_CHANGED",
-			);
-		const assertDocumentUnchanged = async () => {
-			assertDisplayReadActive(opts.signal, deadlineAt);
-			if ((await this.getMessageVersion(narratorId)) !== messageVersion)
+		// The version check below is an optimistic-concurrency guard, and on a live
+		// narrator it loses often: every committed block, tool completion and child
+		// subagent row bumps `messageVersion`, while one page build awaits dozens of
+		// reads. Surfacing each lost race as a 409 made the first screen of a running
+		// narrator fail routinely. An unpinned read has no revision the caller is
+		// committed to, so a mid-build drift just means "build it again against the
+		// new revision" — bounded by attempts and the shared deadline. A pinned read
+		// (`opts.messageVersion`) asked for one exact revision and still fails fast.
+		const driftErrors = new WeakSet<AppError>();
+		const markDrift = (error: AppError) => {
+			driftErrors.add(error);
+			return error;
+		};
+		const maxAttempts = opts.messageVersion == null ? PRETEXT_PAGE_DRIFT_ATTEMPTS : 1;
+		const buildPage = async () => {
+			const narratorMeta = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { variant: true, messageVersion: true },
+			});
+			const isSubagent = narratorMeta != null && isSubagentVariant(narratorMeta.variant);
+			const messageVersion = narratorMeta?.messageVersion ?? 0;
+			if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
 				throw new AppError(
-					"Narrator document changed while the exact-layout page was being built",
+					"Narrator document changed before the exact-layout page was built",
 					409,
 					"PRETEXT_DOCUMENT_CHANGED",
 				);
-		};
-		// "Top-level message" is expressed as a correlated EXISTS rather than the
-		// inner join this used to be, because the join form admitted a catastrophic
-		// plan: SQLite drove from `narrator_messages` through
-		// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL`
-		// predicate matches ~90% of all messages, re-looked-up every ref and sorted
-		// the whole set in a temp B-tree merely to read the newest `limit` rows.
-		// That is the FIRST request of every narrator open, and it measured 306ms
-		// on a 131k-message library (p50 8.1s end to end in the logs).
-		//
-		// As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order
-		// and stops after `limit + 1` rows, since the subquery is answered by the
-		// message primary key. Measured 0.07ms — row-for-row identical on the 12
-		// largest narrators, for the tail page and the `beforeSeq` scroll-up page
-		// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
-		// SQLite-only syntax, so it stays off the dialect-migration ledger.
-		const isTopLevelRef = () =>
-			exists(
-				db
-					.select({ one: sql`1` })
-					.from(narratorMessages)
-					.where(
-						and(
-							eq(narratorMessages.id, narratorMessageRefs.messageId),
-							isNull(narratorMessages.parentToolUseId),
+			const assertDocumentUnchanged = async () => {
+				assertDisplayReadActive(opts.signal, deadlineAt);
+				if ((await this.getMessageVersion(narratorId)) !== messageVersion)
+					throw markDrift(
+						new AppError(
+							"Narrator document changed while the exact-layout page was being built",
+							409,
+							"PRETEXT_DOCUMENT_CHANGED",
 						),
-					),
-			);
-		const baseConditions = [
-			eq(narratorMessageRefs.narratorId, narratorId),
-			isNull(narratorMessageRefs.segmentCompactId),
-			...(isSubagent ? [] : [isTopLevelRef()]),
-		];
-
-		// `afterSeq` → ascending page after the cursor (kept for compatibility with
-		// the legacy full-document loader/tests). Otherwise the newest `limit` rows
-		// are taken descending and reversed to ascending: no argument = tail page
-		// (first screen), `beforeSeq` = the page immediately older than that seq
-		// (reverse infinite scroll toward the top).
-		const ascending = opts.afterSeq != null && Number.isFinite(opts.afterSeq);
-		const conditions = [...baseConditions];
-		if (ascending) {
-			conditions.push(gt(narratorMessageRefs.seq, Math.trunc(opts.afterSeq as number)));
-		} else if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
-			conditions.push(lt(narratorMessageRefs.seq, Math.trunc(opts.beforeSeq)));
-		}
-
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(and(...conditions))
-			.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
-			.limit(limit + 1);
-		const hasMoreInDirection = refRows.length > limit;
-		const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
-		// Descending queries return newest-first; flip to the ascending order the
-		// exact-layout builder always consumes.
-		if (!ascending) pageRows.reverse();
-
-		if (pageRows.length === 0) {
-			await assertDocumentUnchanged();
-			// An empty window is NOT necessarily the start of history. A lazy fork's
-			// ancestors can still hold older messages while this narrator has no visible
-			// ref in the requested range — e.g. a segment-compact hole wider than one
-			// page, which the backfill cursor skips past without copying anything. The
-			// legacy chunk reader probed for that case; reporting `hasPrev: false` here
-			// instead ends the client's upward scroll permanently (the loader latches it),
-			// silently hiding history that does exist.
-			const hasPrevBelowEmptyWindow =
-				opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)
-					? await hasUnmaterializedRefsBelow(narratorId, Math.trunc(opts.beforeSeq))
-					: false;
-			return {
-				messages: [],
-				minSeq: null,
-				maxSeq: null,
-				// Mirrors the non-empty descending branch: a `beforeSeq` page is by
-				// definition preceded by newer rows the caller already holds.
-				hasNext: !ascending && opts.beforeSeq != null,
-				hasPrev: hasPrevBelowEmptyWindow,
-				messageVersion,
+					);
 			};
-		}
+			// "Top-level message" is expressed as a correlated EXISTS rather than the
+			// inner join this used to be, because the join form admitted a catastrophic
+			// plan: SQLite drove from `narrator_messages` through
+			// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL`
+			// predicate matches ~90% of all messages, re-looked-up every ref and sorted
+			// the whole set in a temp B-tree merely to read the newest `limit` rows.
+			// That is the FIRST request of every narrator open, and it measured 306ms
+			// on a 131k-message library (p50 8.1s end to end in the logs).
+			//
+			// As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order
+			// and stops after `limit + 1` rows, since the subquery is answered by the
+			// message primary key. Measured 0.07ms — row-for-row identical on the 12
+			// largest narrators, for the tail page and the `beforeSeq` scroll-up page
+			// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
+			// SQLite-only syntax, so it stays off the dialect-migration ledger.
+			const isTopLevelRef = () =>
+				exists(
+					db
+						.select({ one: sql`1` })
+						.from(narratorMessages)
+						.where(
+							and(
+								eq(narratorMessages.id, narratorMessageRefs.messageId),
+								isNull(narratorMessages.parentToolUseId),
+							),
+						),
+				);
+			const baseConditions = [
+				eq(narratorMessageRefs.narratorId, narratorId),
+				isNull(narratorMessageRefs.segmentCompactId),
+				...(isSubagent ? [] : [isTopLevelRef()]),
+			];
 
-		// Transport-only projections, applied AFTER enrichment so both are safe: the
-		// tool rows are pure duplicates of the enriched blocks, and `providerMetadata`
-		// is replay state the browser can neither display nor send back (its one
-		// display-relevant bit is preserved as a flag). Together they removed ~46% of
-		// the page on the six largest narrators measured.
-		const tree = stripProviderMetadata(
-			stripRedundantToolCallRows(
-				await buildTreeFromTopLevelRefs(
-					narratorId,
-					pageRows,
-					isSubagent,
-					// The ONLY path whose bodies are measured for the exact layout: the budget
-					// must fill the detail caps, or a card reserves a box it cannot fill.
-					EXACT_TOOL_IO_BUDGET,
-					opts.signal,
-					deadlineAt,
+			// `afterSeq` → ascending page after the cursor (kept for compatibility with
+			// the legacy full-document loader/tests). Otherwise the newest `limit` rows
+			// are taken descending and reversed to ascending: no argument = tail page
+			// (first screen), `beforeSeq` = the page immediately older than that seq
+			// (reverse infinite scroll toward the top).
+			const ascending = opts.afterSeq != null && Number.isFinite(opts.afterSeq);
+			const conditions = [...baseConditions];
+			if (ascending) {
+				conditions.push(gt(narratorMessageRefs.seq, Math.trunc(opts.afterSeq as number)));
+			} else if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
+				conditions.push(lt(narratorMessageRefs.seq, Math.trunc(opts.beforeSeq)));
+			}
+
+			const refRows = await db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(and(...conditions))
+				.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
+				.limit(limit + 1);
+			const hasMoreInDirection = refRows.length > limit;
+			const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
+			// Descending queries return newest-first; flip to the ascending order the
+			// exact-layout builder always consumes.
+			if (!ascending) pageRows.reverse();
+
+			if (pageRows.length === 0) {
+				await assertDocumentUnchanged();
+				// An empty window is NOT necessarily the start of history. A lazy fork's
+				// ancestors can still hold older messages while this narrator has no visible
+				// ref in the requested range — e.g. a segment-compact hole wider than one
+				// page, which the backfill cursor skips past without copying anything. The
+				// legacy chunk reader probed for that case; reporting `hasPrev: false` here
+				// instead ends the client's upward scroll permanently (the loader latches it),
+				// silently hiding history that does exist.
+				const hasPrevBelowEmptyWindow =
+					opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)
+						? await hasUnmaterializedRefsBelow(narratorId, Math.trunc(opts.beforeSeq))
+						: false;
+				return {
+					messages: [],
+					minSeq: null,
+					maxSeq: null,
+					// Mirrors the non-empty descending branch: a `beforeSeq` page is by
+					// definition preceded by newer rows the caller already holds.
+					hasNext: !ascending && opts.beforeSeq != null,
+					hasPrev: hasPrevBelowEmptyWindow,
+					messageVersion,
+				};
+			}
+
+			// Transport-only projections, applied AFTER enrichment so both are safe: the
+			// tool rows are pure duplicates of the enriched blocks, and `providerMetadata`
+			// is replay state the browser can neither display nor send back (its one
+			// display-relevant bit is preserved as a flag). Together they removed ~46% of
+			// the page on the six largest narrators measured.
+			const tree = stripProviderMetadata(
+				stripRedundantToolCallRows(
+					await buildTreeFromTopLevelRefs(
+						narratorId,
+						pageRows,
+						isSubagent,
+						// The ONLY path whose bodies are measured for the exact layout: the budget
+						// must fill the detail caps, or a card reserves a box it cannot fill.
+						EXACT_TOOL_IO_BUDGET,
+						opts.signal,
+						deadlineAt,
+					),
 				),
-			),
-		);
-		const minSeq = pageRows[0]?.seq ?? null;
-		const maxSeq = pageRows.at(-1)?.seq ?? null;
+			);
+			const minSeq = pageRows[0]?.seq ?? null;
+			const maxSeq = pageRows.at(-1)?.seq ?? null;
 
-		let hasPrev: boolean;
-		let hasNext: boolean;
-		// A lazy fork can be out of local refs while its parent still holds older
-		// history, so "no more rows here" is not the same as "start of history" —
-		// the lazy-aware probe keeps hasPrev true until the lineage is exhausted.
-		const probeUnmaterializedBelow = async (): Promise<boolean> =>
-			minSeq != null && (await hasUnmaterializedRefsBelow(narratorId, minSeq));
-		if (ascending) {
-			// Ascending page after `afterSeq`: more-in-direction means newer rows
-			// remain; probe once (indexed LIMIT 1) for anything older than the window.
-			hasNext = hasMoreInDirection;
-			hasPrev =
-				(minSeq != null &&
-					(
-						await db
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
-							.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-							.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
-							.limit(1)
-					).length > 0) ||
-				(await probeUnmaterializedBelow());
-		} else {
-			// Descending newest page: more-in-direction means older rows remain. The
-			// tail page has nothing newer; a `beforeSeq` page is by definition
-			// preceded by the newer rows the caller already holds.
-			hasPrev = hasMoreInDirection || (await probeUnmaterializedBelow());
-			hasNext = opts.beforeSeq != null;
+			let hasPrev: boolean;
+			let hasNext: boolean;
+			// A lazy fork can be out of local refs while its parent still holds older
+			// history, so "no more rows here" is not the same as "start of history" —
+			// the lazy-aware probe keeps hasPrev true until the lineage is exhausted.
+			const probeUnmaterializedBelow = async (): Promise<boolean> =>
+				minSeq != null && (await hasUnmaterializedRefsBelow(narratorId, minSeq));
+			if (ascending) {
+				// Ascending page after `afterSeq`: more-in-direction means newer rows
+				// remain; probe once (indexed LIMIT 1) for anything older than the window.
+				hasNext = hasMoreInDirection;
+				hasPrev =
+					(minSeq != null &&
+						(
+							await db
+								.select({ seq: narratorMessageRefs.seq })
+								.from(narratorMessageRefs)
+								.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+								.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
+								.limit(1)
+						).length > 0) ||
+					(await probeUnmaterializedBelow());
+			} else {
+				// Descending newest page: more-in-direction means older rows remain. The
+				// tail page has nothing newer; a `beforeSeq` page is by definition
+				// preceded by the newer rows the caller already holds.
+				hasPrev = hasMoreInDirection || (await probeUnmaterializedBelow());
+				hasNext = opts.beforeSeq != null;
+			}
+
+			await assertDocumentUnchanged();
+			return { messages: tree, minSeq, maxSeq, hasNext, hasPrev, messageVersion };
+		};
+		for (let attempt = 1; ; attempt++) {
+			try {
+				return await buildPage();
+			} catch (error) {
+				if (!(error instanceof AppError) || !driftErrors.has(error) || attempt >= maxAttempts)
+					throw error;
+			}
+			await waitForPretextDriftRetry(attempt, opts.signal, deadlineAt);
 		}
-
-		await assertDocumentUnchanged();
-		return { messages: tree, minSeq, maxSeq, hasNext, hasPrev, messageVersion };
 	},
 
 	async getMessagesAfter(narratorId: string, after: CatchUpCursor, limit = 200) {

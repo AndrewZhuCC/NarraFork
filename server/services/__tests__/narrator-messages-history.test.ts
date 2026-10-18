@@ -710,6 +710,60 @@ describe("pretext exact document transport", () => {
 			narratorMessageQueries.getMessageVersion = original;
 		}
 	});
+
+	test("rebuilds an unpinned page when the revision drifts mid-build, then succeeds", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const original = narratorMessageQueries.getMessageVersion;
+		let calls = 0;
+		// The first build's final check sees a concurrent write; the rebuild is quiet.
+		narratorMessageQueries.getMessageVersion = async function (this: unknown, id: string) {
+			const actual = await original.call(this, id);
+			return calls++ === 0 ? actual + 1 : actual;
+		};
+		try {
+			const page = await narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 });
+			expect(page.messages.map((message) => message.id)).toEqual(["m-1"]);
+			expect(calls).toBe(2);
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
+
+	test("does not rebuild a page pinned to a revision when it drifts mid-build", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const pinned = await narratorMessageQueries.getMessageVersion("n1");
+		const original = narratorMessageQueries.getMessageVersion;
+		let calls = 0;
+		narratorMessageQueries.getMessageVersion = async () => {
+			calls++;
+			return pinned + 1;
+		};
+		try {
+			await expect(
+				narratorMessageQueries.getPretextDocumentPage("n1", {
+					limit: 1,
+					messageVersion: pinned,
+				}),
+			).rejects.toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
+			expect(calls).toBe(1);
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
 });
 
 describe("latest assistant text across compact boundary", () => {
