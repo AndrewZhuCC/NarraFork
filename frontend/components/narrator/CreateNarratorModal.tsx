@@ -190,6 +190,7 @@ export function CreateNarratorModal({
 	// Query resolved ⇒ we know the default (server merges agent defaults). Until
 	// then the switch is a placeholder and submit omits the field.
 	const planModeSettingsKnown = settings != null;
+	const [sessionTitle, setSessionTitle] = useState("");
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
 	// 提交身份只对当前用户生效（服务端按 用户 × 会话 保存），默认跟随本人默认身份。
@@ -359,6 +360,8 @@ export function CreateNarratorModal({
 				...(contextProjectId ? { contextProjectId } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(sendPlanMode ? { startInPlanMode } : {}),
+				// 自定义标题留空时不传，服务端沿用「首条消息后自动命名」的原逻辑。
+				...(sessionTitle.trim() ? { title: sessionTitle.trim() } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
 				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
 			},
@@ -601,6 +604,14 @@ export function CreateNarratorModal({
 			/>
 
 			<Divider label={t("sectionSessionType")} labelPosition="left" />
+
+			<TextInput
+				label={t("sessionTitle")}
+				placeholder={t("sessionTitleHint")}
+				value={sessionTitle}
+				onChange={(e) => setSessionTitle(e.currentTarget.value)}
+				maxLength={200}
+			/>
 
 			<Checkbox
 				label={t("makeNamed")}

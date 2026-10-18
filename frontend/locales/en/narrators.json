@@ -30,6 +30,8 @@
 	"startInPlanMode": "Start in plan mode",
 	"startInPlanModeHint": "Narrator will plan before executing, requiring your approval before implementation",
 	"sectionSessionType": "Session type",
+	"sessionTitle": "Session title",
+	"sessionTitleHint": "Optional. Leave blank to name it automatically from your first message.",
 	"resizeFavorites": "Drag to resize the favorites list",
 	"makeNamed": "Make this a named narrator",
 	"makeNamedHint": "Give it a memorable @handle so you can mention it from any session",

@@ -30,6 +30,8 @@
 	"startInPlanMode": "以计划模式启动",
 	"startInPlanModeHint": "叙述者会先制定计划再执行，需要你批准后才会实施",
 	"sectionSessionType": "会话类型",
+	"sessionTitle": "会话名称",
+	"sessionTitleHint": "可选。留空则由首条消息自动命名。",
 	"resizeFavorites": "拖拽调整收藏列表高度",
 	"makeNamed": "设为命名叙述者",
 	"makeNamedHint": "为它起一个易记的 @名字，便于在任意会话中召唤",
