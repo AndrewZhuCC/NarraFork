@@ -70,3 +70,28 @@ describe("createNarratorSchema named-narrator fields", () => {
 		expect(() => createNarratorSchema.parse({ makeNamed: true, handle: "bad handle" })).toThrow();
 	});
 });
+
+describe("createNarratorSchema title", () => {
+	test("trims a custom title", () => {
+		expect(createNarratorSchema.parse({ title: "  Review the auth flow  " }).title).toBe(
+			"Review the auth flow",
+		);
+	});
+
+	test("leaves title undefined when the field is omitted", () => {
+		expect(createNarratorSchema.parse({ model: "claude-sonnet-4.5" }).title).toBeUndefined();
+	});
+
+	test("rejects an empty or whitespace-only title", () => {
+		expect(createNarratorSchema.safeParse({ title: "" }).success).toBe(false);
+		expect(createNarratorSchema.safeParse({ title: "   " }).success).toBe(false);
+	});
+
+	test("accepts 200 characters and rejects 201, counting after trim", () => {
+		expect(createNarratorSchema.safeParse({ title: "a".repeat(200) }).success).toBe(true);
+		expect(createNarratorSchema.safeParse({ title: `  ${"a".repeat(200)}  ` }).success).toBe(true);
+		expect(createNarratorSchema.safeParse({ title: "a".repeat(201) }).success).toBe(false);
+		expect(createNarratorSchema.safeParse({ title: "字".repeat(200) }).success).toBe(true);
+		expect(createNarratorSchema.safeParse({ title: "字".repeat(201) }).success).toBe(false);
+	});
+});
