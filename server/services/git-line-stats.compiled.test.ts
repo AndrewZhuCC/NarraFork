@@ -4,8 +4,8 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 import type { GitLineStats } from "../../shared/git-line-stats";
+import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 
 const exec = promisify(execFile);
 const project = resolve(import.meta.dir, "../..");
