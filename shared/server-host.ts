@@ -22,3 +22,18 @@ export function urlHost(host: string): string {
 	if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
 	return host;
 }
+
+/**
+ * 健康检查要连得上的主机。
+ *
+ * 写进浏览器地址栏时，通配地址和 `auto-lan` 都换成回环。探测则不同：服务实际听在
+ * 第一块局域网地址上，打 127.0.0.1 会错过它。没有局域网地址时才回落到回环。
+ */
+export function probeHost(host: string, lanAddresses: readonly string[] = []): string {
+	if (isWildcardHost(host)) return "127.0.0.1";
+	if (host === AUTO_LAN_HOST) {
+		const lan = lanAddresses.find((address) => address.trim().length > 0);
+		return lan ? urlHost(lan) : "127.0.0.1";
+	}
+	return urlHost(host);
+}

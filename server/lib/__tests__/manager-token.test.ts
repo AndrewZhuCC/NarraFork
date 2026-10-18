@@ -1,5 +1,13 @@
-import { describe, expect, test } from "bun:test";
-import { isManagerTokenAuthorized } from "../manager-token";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+	captureManagerTokenFromEnv,
+	isManagerTokenAuthorized,
+	MANAGER_TOKEN_ENV,
+	managerChildTokenEnv,
+	readManagerToken,
+	resetManagerTokenForTests,
+} from "../manager-token";
+import { envWithAmbientProxy } from "../net/proxy-env";
 
 const TOKEN = "manager-token-value";
 
@@ -62,5 +70,34 @@ describe("isManagerTokenAuthorized", () => {
 				expectedToken: TOKEN,
 			}),
 		).toBe(false);
+	});
+});
+
+describe("captureManagerTokenFromEnv", () => {
+	const previous = process.env[MANAGER_TOKEN_ENV];
+
+	afterEach(() => {
+		resetManagerTokenForTests();
+		if (previous === undefined) delete process.env[MANAGER_TOKEN_ENV];
+		else process.env[MANAGER_TOKEN_ENV] = previous;
+	});
+
+	test("收进内存后，子进程环境里不再有这份令牌", () => {
+		process.env[MANAGER_TOKEN_ENV] = TOKEN;
+		captureManagerTokenFromEnv();
+
+		expect(readManagerToken()).toBe(TOKEN);
+		expect(envWithAmbientProxy()[MANAGER_TOKEN_ENV]).not.toBe(TOKEN);
+		expect(managerChildTokenEnv()).toEqual({ [MANAGER_TOKEN_ENV]: TOKEN });
+	});
+
+	test("第二次捕获不会把已经收走的令牌清掉", () => {
+		process.env[MANAGER_TOKEN_ENV] = TOKEN;
+		captureManagerTokenFromEnv();
+		process.env[MANAGER_TOKEN_ENV] = "other-token";
+		captureManagerTokenFromEnv();
+
+		expect(readManagerToken()).toBe(TOKEN);
+		expect(managerChildTokenEnv()).toEqual({ [MANAGER_TOKEN_ENV]: TOKEN });
 	});
 });

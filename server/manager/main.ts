@@ -50,6 +50,7 @@ import {
 	writeServerAddress,
 } from "./manager-config";
 import { setLanguage, t } from "./manager-i18n";
+import { resolveFrontendOpen } from "./open-frontend";
 import { showSettingsDialog } from "./settings-window";
 import {
 	CARD_BG,
@@ -647,8 +648,8 @@ function onCommand(id: number): void {
 			void stopSupervised();
 			break;
 		case ID.open:
-			// Shift+点击 = 强制新建前端窗口（对齐浏览器 Shift+点击的惯例）。
-			openPanel(isShiftPressed());
+			// Shift+点击 = 强制新建前端窗口。普通点击也是明确要求打开。
+			openPanel(isShiftPressed(), true);
 			break;
 		case ID.settings:
 			void openSettings();
@@ -949,9 +950,12 @@ function openPanel(forceNewWindow = false, explicit = false): void {
 		appendLog("WEB", t("log.focusedPanel"));
 		return;
 	}
-	const mode = readNarraForkSettings().openBrowser;
-	// 托盘双击是明确要求打开。设置为「不打开」时仍回落为浏览器，避免点了没反应。
-	if (mode === "off" && !forceNewWindow && !explicit) return;
+	const mode = resolveFrontendOpen({
+		openBrowser: readNarraForkSettings().openBrowser,
+		explicit,
+		forceNewWindow,
+	});
+	if (mode === "skip") return;
 	const url = `${serviceOrigin()}/`;
 	appendLog(
 		"WEB",

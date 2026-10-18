@@ -29,6 +29,9 @@ export interface ApplyOutcome {
 	interrupted?: boolean;
 }
 
+import { managerFetch } from "./manager-fetch";
+import { managerUpdateDownloadBody } from "./update-download-body";
+
 const REQUEST_TIMEOUT_MS = 20_000;
 
 function messageOf(error: unknown): string {
@@ -42,7 +45,7 @@ function authHeaders(token: string, extra?: Record<string, string>): Record<stri
 /** 检查更新；服务不可用或出错时返回带 error 的结果（面板只负责展示文案）。 */
 export async function checkForUpdate(baseUrl: string, token: string): Promise<UpdateCheckSummary> {
 	try {
-		const response = await fetch(`${baseUrl}/api/update/check`, {
+		const response = await managerFetch(`${baseUrl}/api/update/check`, {
 			headers: authHeaders(token),
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
@@ -80,10 +83,10 @@ export async function downloadUpdate(
 	signal?: AbortSignal,
 ): Promise<DownloadOutcome> {
 	try {
-		const response = await fetch(`${baseUrl}/api/update/download`, {
+		const response = await managerFetch(`${baseUrl}/api/update/download`, {
 			method: "POST",
 			headers: authHeaders(token, { "content-type": "application/json" }),
-			body: JSON.stringify({ releaseInfo }),
+			body: JSON.stringify(managerUpdateDownloadBody(releaseInfo)),
 			signal,
 		});
 		if (!response.ok || !response.body) {
@@ -151,7 +154,7 @@ export async function applyUpdate(
 	preparedIdentity: string,
 ): Promise<ApplyOutcome> {
 	try {
-		const response = await fetch(`${baseUrl}/api/update/apply`, {
+		const response = await managerFetch(`${baseUrl}/api/update/apply`, {
 			method: "POST",
 			headers: authHeaders(token, { "content-type": "application/json" }),
 			body: JSON.stringify({ version, preparedId: preparedIdentity }),

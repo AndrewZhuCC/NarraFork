@@ -1,8 +1,9 @@
-import { AUTO_LAN_HOST, isWildcardHost, urlHost } from "@shared/server-host";
+import { probeHost } from "@shared/server-host";
 import { MANAGER_TOKEN_ENV } from "../lib/manager-token";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { isCompiledRuntime } from "../lib/runtime-target";
 import { parseServiceLogLine } from "./listen-log";
+import { managerFetch } from "./manager-fetch";
 import { t } from "./manager-i18n";
 
 export type BackendState = "stopped" | "starting" | "running" | "stopping" | "error";
@@ -30,19 +31,6 @@ const ADDRESS_WAIT_MS = 15_000;
 /** 优雅停止之后，进程仍在就结束整棵进程树。 */
 const GRACEFUL_STOP_MS = 15_000;
 
-/**
- * 健康检查用的本地探测地址。
- *
- * settings 里的 host 可以是 0.0.0.0 / ::（监听所有网卡）或 auto-lan（监听第一个
- * 局域网地址），它们都不能作为请求目标；IPv6 字面量还要加方括号。修正后才能得到
- * 能真正连通的地址。
- */
-function probeHost(host: string): string {
-	if (isWildcardHost(host)) return "127.0.0.1";
-	if (host === AUTO_LAN_HOST) return getLanAddresses()[0] ?? "127.0.0.1";
-	return urlHost(host);
-}
-
 /** 探测给定地址上是否已有 NarraFork 服务在响应（供识别外部启动的实例）。 */
 export async function probeServiceHealth(
 	host: string,
@@ -50,13 +38,9 @@ export async function probeServiceHealth(
 	tls = false,
 ): Promise<boolean> {
 	try {
-		const response = await fetch(
-			`${tls ? "https" : "http"}://${probeHost(host)}:${port}/api/health`,
-			{
-				signal: AbortSignal.timeout(1500),
-				// 本机自签证书只用于这一次健康检查。
-				tls: { rejectUnauthorized: false },
-			},
+		const response = await managerFetch(
+			`${tls ? "https" : "http"}://${probeHost(host, getLanAddresses())}:${port}/api/health`,
+			{ signal: AbortSignal.timeout(1500) },
 		);
 		return response.ok;
 	} catch {

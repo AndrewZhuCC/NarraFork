@@ -1,4 +1,5 @@
 import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
+import { captureManagerTokenFromEnv } from "./lib/manager-token";
 import { neutralizeAmbientProxyEnv } from "./lib/net/proxy-env";
 import { waitForPreviousServerShutdown } from "./lib/restart-handoff";
 import { isCompiledRuntime } from "./lib/runtime-target";
@@ -11,6 +12,8 @@ import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 // values are snapshotted and blanked here to make the configured proxy policy
 // the single authority. See lib/net/proxy-env.ts.
 neutralizeAmbientProxyEnv();
+// 管理器令牌只留在本进程内存里。放在拉起任何子进程之前，终端和 Bash 就复制不到它。
+captureManagerTokenFromEnv();
 
 if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
 	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main

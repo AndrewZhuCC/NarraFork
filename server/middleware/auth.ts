@@ -20,7 +20,7 @@ import { logger } from "../lib/logger";
 // The two remaining raw AppErrors below are deliberate: `INVALID_SCOPE` is a programming
 // error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
 // OAuth clients rather than rendered in the UI, so neither needs a localized wording.
-import { isManagerTokenAuthorized, MANAGER_TOKEN_ENV } from "../lib/manager-token";
+import { isManagerTokenAuthorized, readManagerToken } from "../lib/manager-token";
 import { validateAccessToken } from "../lib/oauth-provider";
 import { authSessionStore } from "../services/auth/store";
 
@@ -408,7 +408,7 @@ export async function requireAdminOrManagerToken(c: Context, next: Next) {
 		isManagerTokenAuthorized({
 			peerIp: env?.peerIp,
 			authorization: c.req.header("authorization"),
-			expectedToken: process.env[MANAGER_TOKEN_ENV],
+			expectedToken: readManagerToken(),
 		})
 	) {
 		await next();
