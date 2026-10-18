@@ -2740,6 +2740,16 @@ function assertDisplayReadActive(signal?: AbortSignal, deadlineAt?: number): voi
 		);
 }
 
+function sameTransportWindow(
+	left: ReadonlyArray<{ messageId: string; seq: number }>,
+	right: ReadonlyArray<{ messageId: string; seq: number }>,
+): boolean {
+	if (left.length !== right.length) return false;
+	return left.every(
+		(row, index) => row.messageId === right[index]?.messageId && row.seq === right[index]?.seq,
+	);
+}
+
 /** Total builds (first try included) an unpinned exact-layout page gets under version drift. */
 export const PRETEXT_PAGE_DRIFT_ATTEMPTS = 4;
 
@@ -4073,10 +4083,10 @@ const narratorMessageQueriesUnlocked = {
 		// narrator it loses often: every committed block, tool completion and child
 		// subagent row bumps `messageVersion`, while one page build awaits dozens of
 		// reads. Surfacing each lost race as a 409 made the first screen of a running
-		// narrator fail routinely. An unpinned read has no revision the caller is
-		// committed to, so a mid-build drift just means "build it again against the
-		// new revision" — bounded by attempts and the shared deadline. A pinned read
-		// (`opts.messageVersion`) asked for one exact revision and still fails fast.
+		// narrator fail routinely. An unpinned read accepts drift that left its window
+		// in place (see `assertDocumentUnchanged`) and rebuilds against the new
+		// revision when the window moved — bounded by attempts and the shared
+		// deadline. A pinned read (`opts.messageVersion`) still fails fast.
 		const driftErrors = new WeakSet<AppError>();
 		const markDrift = (error: AppError) => {
 			driftErrors.add(error);
@@ -4096,17 +4106,6 @@ const narratorMessageQueriesUnlocked = {
 					409,
 					"PRETEXT_DOCUMENT_CHANGED",
 				);
-			const assertDocumentUnchanged = async () => {
-				assertDisplayReadActive(opts.signal, deadlineAt);
-				if ((await this.getMessageVersion(narratorId)) !== messageVersion)
-					throw markDrift(
-						new AppError(
-							"Narrator document changed while the exact-layout page was being built",
-							409,
-							"PRETEXT_DOCUMENT_CHANGED",
-						),
-					);
-			};
 			// "Top-level message" is expressed as a correlated EXISTS rather than the
 			// inner join this used to be, because the join form admitted a catastrophic
 			// plan: SQLite drove from `narrator_messages` through
@@ -4153,17 +4152,47 @@ const narratorMessageQueriesUnlocked = {
 				conditions.push(lt(narratorMessageRefs.seq, Math.trunc(opts.beforeSeq)));
 			}
 
-			const refRows = await db
-				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.where(and(...conditions))
-				.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
-				.limit(limit + 1);
-			const hasMoreInDirection = refRows.length > limit;
-			const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
-			// Descending queries return newest-first; flip to the ascending order the
-			// exact-layout builder always consumes.
-			if (!ascending) pageRows.reverse();
+			const loadWindow = async () => {
+				const refRows = await db
+					.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(and(...conditions))
+					.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
+					.limit(limit + 1);
+				const hasMoreInDirection = refRows.length > limit;
+				const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
+				// Descending queries return newest-first; flip to the ascending order the
+				// exact-layout builder always consumes.
+				if (!ascending) pageRows.reverse();
+				return { pageRows, hasMoreInDirection };
+			};
+			const { pageRows, hasMoreInDirection } = await loadWindow();
+			// Most version bumps on a live narrator rewrite bodies in place (a block
+			// commit, a tool result, a child row's parent bump) and leave the page's
+			// ordered top-level ids untouched. Such a page is not torn: its content is
+			// at least as new as the snapshot it reports, and sync catch-up from that
+			// snapshot replays the rest. So an unpinned read only rebuilds when the
+			// window itself moved (insert, delete, compact). A pinned read is one page
+			// of a multi-page walk and must observe exactly one revision.
+			const assertDocumentUnchanged = async () => {
+				assertDisplayReadActive(opts.signal, deadlineAt);
+				if ((await this.getMessageVersion(narratorId)) === messageVersion) return;
+				const drift = () =>
+					markDrift(
+						new AppError(
+							"Narrator document changed while the exact-layout page was being built",
+							409,
+							"PRETEXT_DOCUMENT_CHANGED",
+						),
+					);
+				if (opts.messageVersion != null) throw drift();
+				const current = await loadWindow();
+				if (
+					current.hasMoreInDirection !== hasMoreInDirection ||
+					!sameTransportWindow(pageRows, current.pageRows)
+				)
+					throw drift();
+			};
 
 			if (pageRows.length === 0) {
 				await assertDocumentUnchanged();
