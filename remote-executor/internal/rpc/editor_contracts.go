@@ -10,13 +10,14 @@ package rpc
 import "github.com/narrafork/remote-executor/internal/handlers"
 
 type EditorProviderCapabilities struct {
-	BoundedRead  bool `json:"boundedRead"`
-	V1Save       bool `json:"v1Save"`
-	RawRead      bool `json:"rawRead"`
-	Stage        bool `json:"stage"`
-	DurableApply bool `json:"durableApply"`
-	DurableQuery bool `json:"durableQuery"`
-	Watch        bool `json:"watch"`
+	BoundedRead  bool  `json:"boundedRead"`
+	V1Save       bool  `json:"v1Save"`
+	RawRead      bool  `json:"rawRead"`
+	RawSave      *bool `json:"rawSave,omitempty"` // nil preserves legacy capability negotiation.
+	Stage        bool  `json:"stage"`
+	DurableApply bool  `json:"durableApply"`
+	DurableQuery bool  `json:"durableQuery"`
+	Watch        bool  `json:"watch"`
 }
 
 type EditorResourceIdentity = handlers.EditorResourceIdentity

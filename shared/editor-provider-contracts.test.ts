@@ -30,6 +30,7 @@ import {
 	type EditorWatchHandle,
 	type EditorWatchNotify,
 	type EditorWatchOpen,
+	editorProviderCanRawSave,
 } from "./editor-provider-contracts";
 import golden from "./editor-provider-contracts.golden.json";
 
@@ -56,6 +57,9 @@ const typed = {
 	capabilitiesNone: golden.capabilitiesNone,
 	capabilitiesLocalV1: golden.capabilitiesLocalV1,
 	capabilitiesBoundedRead: golden.capabilitiesBoundedRead,
+	capabilitiesHostRawSave: golden.capabilitiesHostRawSave,
+	capabilitiesRawSaveDisabled: golden.capabilitiesRawSaveDisabled,
+	capabilitiesLegacyRawSave: golden.capabilitiesLegacyRawSave,
 	identityPosix: identity(golden.identityPosix),
 	rawReadPreflight: {
 		...golden.rawReadPreflight,
@@ -107,6 +111,9 @@ const typed = {
 	capabilitiesNone: EditorProviderCapabilities;
 	capabilitiesLocalV1: EditorProviderCapabilities;
 	capabilitiesBoundedRead: EditorProviderCapabilities;
+	capabilitiesHostRawSave: EditorProviderCapabilities;
+	capabilitiesRawSaveDisabled: EditorProviderCapabilities;
+	capabilitiesLegacyRawSave: EditorProviderCapabilities;
 	identityPosix: EditorResourceIdentity;
 	rawReadPreflight: EditorRawReadPreflight;
 	rawReadOpen: EditorRawReadOpen;
@@ -142,6 +149,17 @@ test("capability presets match the shared fixture and nothing unimplemented is t
 	for (const caps of [EDITOR_LOCAL_V1_CAPABILITIES, EDITOR_BOUNDED_READ_CAPABILITIES])
 		for (const key of ["rawRead", "stage", "durableApply", "durableQuery", "watch"] as const)
 			expect([key, caps[key]]).toEqual([key, false]);
+});
+
+test("raw save uses explicit support or the absent-only legacy durable tuple", () => {
+	expect(editorProviderCanRawSave(typed.capabilitiesHostRawSave)).toBe(true);
+	expect(typed.capabilitiesHostRawSave.durableApply).toBe(false);
+	expect(editorProviderCanRawSave(typed.capabilitiesRawSaveDisabled)).toBe(false);
+	expect(editorProviderCanRawSave(typed.capabilitiesLegacyRawSave)).toBe(true);
+	expect(editorProviderCanRawSave({ ...typed.capabilitiesLegacyRawSave, stage: false })).toBe(
+		false,
+	);
+	expect(editorProviderCanRawSave(undefined)).toBe(false);
 });
 
 test("string unions and error codes equal the fixture enums used by Go", () => {

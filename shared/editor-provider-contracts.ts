@@ -25,6 +25,9 @@ export interface EditorProviderCapabilities {
 	readonly rawRead: boolean;
 	/** Phase 7/8: private stage + chunk + seal. */
 	readonly stage: boolean;
+	/** Raw-v2 save support; true does not promise atomic replacement. Explicit false
+	 * forbids raw saving; only absence permits the legacy durable capability tuple. */
+	readonly rawSave?: boolean;
 	/** Phase 8: durable atomic apply. */
 	readonly durableApply: boolean;
 	/** Phase 8: durable operation query. */
@@ -53,6 +56,13 @@ export const EDITOR_BOUNDED_READ_CAPABILITIES: EditorProviderCapabilities = Obje
 	...EDITOR_NO_CAPABILITIES,
 	boundedRead: true,
 });
+
+/** One negotiation rule shared by save enablement and explanatory UI. */
+export function editorProviderCanRawSave(caps?: EditorProviderCapabilities): boolean {
+	return caps?.rawSave !== undefined
+		? caps.rawSave
+		: !!(caps?.stage && caps.durableApply && caps.durableQuery);
+}
 
 // ── Shared identity ──────────────────────────────────────────────────────────
 

@@ -176,7 +176,7 @@ export async function editorHostColdBrowserAcceptance(options: {
 			nativeCalls: { apply: number; query: number };
 		};
 		expect(before.operations).toHaveLength(1);
-		expect(before.nativeCalls.apply).toBe(1);
+		expect(before.nativeCalls).toMatchObject({ apply: 0, query: 0, helperStarts: 0, network: 0 });
 		expect(before.helpers.processes).toBe(0);
 		await stop();
 		const second = await start();
@@ -217,7 +217,7 @@ export async function editorHostColdBrowserAcceptance(options: {
 			})
 		).json()) as { operations: { id: string }[]; nativeCalls: { apply: number; query: number } };
 		expect(after.operations).toEqual(before.operations);
-		expect(after.nativeCalls.apply).toBe(0);
+		expect(after.nativeCalls).toMatchObject({ apply: 0, query: 0, helperStarts: 0, network: 0 });
 		expect(hash(await readFile(target))).toBe(hash(committed));
 		const nextSave = await page.evaluate(() =>
 			(window as unknown as RawWindow).rawFixture.saveRaw(),
@@ -232,7 +232,7 @@ export async function editorHostColdBrowserAcceptance(options: {
 			})
 		).json()) as { operations: { id: string }[]; nativeCalls: { apply: number } };
 		expect(next.operations).toHaveLength(2);
-		expect(next.nativeCalls.apply).toBe(1);
+		expect(next.nativeCalls).toMatchObject({ apply: 0, query: 0, helperStarts: 0, network: 0 });
 		if (readFailure) throw readFailure;
 		console.info(
 			"EDITOR_HOST_COLD_CHROMIUM",
@@ -251,6 +251,90 @@ export async function editorHostColdBrowserAcceptance(options: {
 				freshAuthenticatedQuery: true,
 				nextWriteUnblocked: true,
 				reapply: 0,
+			}),
+		);
+		// A separate real Host mutation succeeds at the FD layer, then its first
+		// evidence settlement fails. Never manufacture pending by editing settled SQL.
+		const pendingArmed = await fetch(`${origin}/fixture-fault?pending=1`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${second.token}` },
+			signal: AbortSignal.timeout(5000),
+		});
+		expect(pendingArmed.ok).toBe(true);
+		await pendingArmed.body?.cancel();
+		await page.evaluate(() =>
+			(window as unknown as RawWindow).rawFixture.rawBatch([
+				{
+					range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 2 },
+					text: "Q",
+				},
+			]),
+		);
+		const pending = await page.evaluate(() =>
+			(window as unknown as RawWindow).rawFixture.saveRaw(),
+		);
+		expect(pending.session?.phase).toBe("unknown");
+		expect(pending.dirty).toBe(true);
+		const pendingBytes = Buffer.concat([Buffer.from("Q"), options.original]);
+		expect(hash(await readFile(target))).toBe(hash(pendingBytes));
+		type PendingInfo = {
+			operations: { id: string; settlement: string }[];
+			leases: { id: string; status: string }[];
+			nativeCalls: { apply: number; query: number; helperStarts: number; network: number };
+		};
+		const info = async (token: string): Promise<PendingInfo> => {
+			const response = await fetch(`${origin}/fixture-info`, {
+				headers: { Authorization: `Bearer ${token}` },
+				signal: AbortSignal.timeout(5000),
+			});
+			expect(response.ok).toBe(true);
+			return response.json();
+		};
+		const pendingBefore = await info(second.token);
+		expect(pendingBefore.operations).toHaveLength(3);
+		const unresolved = pendingBefore.operations.filter(
+			(operation) => operation.settlement !== "settled",
+		);
+		expect(unresolved).toHaveLength(1);
+		const quarantined = pendingBefore.leases.filter((lease) => lease.status === "quarantined");
+		expect(quarantined).toHaveLength(1);
+		await stop();
+		const third = await start();
+		expect(third.pid).not.toBe(second.pid);
+		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.reconnectHost());
+		await page.waitForFunction(
+			() => (window as unknown as RawWindow).rawFixture.state().connected,
+			{ timeout: 30_000 },
+		);
+		const stillUnknown = await page.evaluate(() =>
+			(window as unknown as RawWindow).rawFixture.reconcileRaw(),
+		);
+		expect(stillUnknown.session?.phase).toBe("unknown");
+		expect(stillUnknown.dirty).toBe(true);
+		expect(stillUnknown.lifetime).toBe(pending.lifetime);
+		expect(stillUnknown.session?.version).toEqual(pending.session?.version);
+		expect(stillUnknown.session?.baseHash).toBe(hash(edited));
+		// Even identical current disk bytes cannot promote pending evidence or open
+		// the old lease. A save gesture in unknown is query-only, never another apply.
+		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.saveRaw());
+		const pendingAfter = await info(third.token);
+		expect(pendingAfter.operations).toEqual(pendingBefore.operations);
+		expect(pendingAfter.leases).toEqual(pendingBefore.leases);
+		expect(pendingAfter.nativeCalls).toEqual({ apply: 0, query: 0, helperStarts: 0, network: 0 });
+		expect(hash(await readFile(target))).toBe(hash(pendingBytes));
+		console.info(
+			"EDITOR_HOST_PENDING_COLD_CHROMIUM",
+			JSON.stringify({
+				hostProcesses: [second.pid, third.pid],
+				operations: pendingAfter.operations.length,
+				pendingOperation: unresolved[0]?.id,
+				barrier: quarantined[0]?.id,
+				phase: stillUnknown.session?.phase,
+				sameCurrentDiskDoesNotProveSaved: true,
+				barrierUnchanged: true,
+				reapply: 0,
+				helperStarts: 0,
+				network: 0,
 			}),
 		);
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.close());

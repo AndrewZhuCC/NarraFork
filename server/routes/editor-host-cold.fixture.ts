@@ -9,12 +9,12 @@ if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME)
 	throw new Error("Cold Host fixture requires test isolation before importing persistence");
 const [
 	{ db },
-	{ fileChangeOperations, narrators, users },
+	{ fileChangeOperations, narrators, users, workspaceWriteLeases },
 	{ createToken, verifyToken },
 	{ settings },
 	{ requireAuth },
 	{ getEditorDocumentService },
-	{ EditorHelperSession, editorHelperAvailable, editorHelperDiagnostics, resolveEditorHelper },
+	{ EditorHelperSession, editorHelperDiagnostics },
 	{ handleNarratorWS },
 	{ resolveWSData },
 	{ createEditorDocumentRoutes },
@@ -54,17 +54,21 @@ settings.update = {
 	serverUrl: config.distributionUrl,
 	proxy: { mode: "direct" },
 };
-const nativeCalls = { apply: 0, query: 0 };
-const originalCall = EditorHelperSession.prototype.call;
-EditorHelperSession.prototype.call = function <T>(
-	method: string,
-	params: object,
-	signal?: AbortSignal,
-): Promise<T> {
-	if (method === "editor.apply") nativeCalls.apply++;
-	if (method === "editor.query") nativeCalls.query++;
-	return originalCall.call(this, method, params, signal) as Promise<T>;
+const nativeCalls = { apply: 0, query: 0, helperStarts: 0, network: 0 };
+// Process-local traps: leave worker/Git/browser subprocesses alone. Any local
+// executor bootstrap or network dependency is a fixture failure, not a fallback.
+EditorHelperSession.open = async () => {
+	nativeCalls.helperStarts++;
+	throw new Error("Cold Host ordinary save must not launch an editor helper");
 };
+const originalFetch = globalThis.fetch;
+globalThis.fetch = Object.assign(
+	() => {
+		nativeCalls.network++;
+		throw new Error("Cold Host ordinary save must not fetch a helper");
+	},
+	{ preconnect: originalFetch.preconnect },
+);
 const now = new Date().toISOString();
 db.insert(users)
 	.values({
@@ -88,12 +92,6 @@ db.insert(narrators)
 	})
 	.onConflictDoNothing()
 	.run();
-await resolveEditorHelper(AbortSignal.timeout(15_000));
-const readyDeadline = Date.now() + 15_000;
-while (!editorHelperAvailable()) {
-	if (Date.now() >= readyDeadline) throw new Error("Verified fixture helper did not become ready");
-	await new Promise((resolve) => setTimeout(resolve, 5));
-}
 const manifestFile = Bun.file(config.manifest);
 if (manifestFile.size > 1024 * 1024) throw new Error("Fixture bundle manifest exceeds budget");
 const bundle = (await manifestFile.json()) as {
@@ -103,7 +101,20 @@ const bundle = (await manifestFile.json()) as {
 const assets = new Map(bundle.assets);
 const token = await createToken(config.userId, "user");
 let dropReply = false,
-	blockQuery = false;
+	blockQuery = false,
+	failSettlement = false;
+// Instance-local evidence fault after actual Host write/sync/close/verification.
+// This is not a mock writer and never changes a global prototype or disk bytes.
+const { getDefaultLocalFileChangeRuntime } = await import("../services/file-change-runtime");
+const evidence = (await getDefaultLocalFileChangeRuntime()).evidence;
+const settleEffect = evidence.settleEffect.bind(evidence);
+evidence.settleEffect = (...args: Parameters<typeof settleEffect>) => {
+	if (failSettlement && args[0].receipt?.outcome === "applied") {
+		failSettlement = false;
+		throw new Error("Fixture Host evidence settlement unavailable after write");
+	}
+	return settleEffect(...args);
+};
 const app = new Hono();
 app.use("*", requireAuth);
 app.use("*", async (c, next) => {
@@ -112,16 +123,22 @@ app.use("*", async (c, next) => {
 	await next();
 });
 app.post("/fixture-fault", (c) => {
-	dropReply = true;
+	failSettlement = c.req.query("pending") === "1";
+	dropReply = !failSettlement;
 	blockQuery = true;
 	return c.json({ armed: true });
 });
 app.get("/fixture-info", (c) =>
 	c.json({
 		operations: db
-			.select({ id: fileChangeOperations.id })
+			.select({ id: fileChangeOperations.id, settlement: fileChangeOperations.settlement })
 			.from(fileChangeOperations)
 			.where(eq(fileChangeOperations.sourceKind, "editor"))
+			.limit(4)
+			.all(),
+		leases: db
+			.select({ id: workspaceWriteLeases.leaseId, status: workspaceWriteLeases.status })
+			.from(workspaceWriteLeases)
 			.limit(4)
 			.all(),
 		helpers: editorHelperDiagnostics(),
@@ -171,7 +188,7 @@ const server = Bun.serve<WSData>({
 		if (path === "/fixture-config")
 			return Response.json({ narratorId: config.narratorId, deviceId: "local", token });
 		// Only this fixture's deliberately lost reply/query is unavailable. All file
-		// operations still traverse real JWT middleware, production runtime and native IO.
+		// operations still traverse real JWT middleware, production runtime and ordinary Host IO.
 		if (path.startsWith("/api/") || path.startsWith("/fixture-")) {
 			const response = await app.fetch(request);
 			if (dropReply && path.endsWith("/commit") && response.ok) {

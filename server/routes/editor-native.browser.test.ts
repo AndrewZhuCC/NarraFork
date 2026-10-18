@@ -22,11 +22,7 @@ import {
 	withEditorOperationStore,
 } from "../services/editor-document-runtime";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
-import {
-	editorHelperAvailable,
-	editorHelperDiagnostics,
-	resolveEditorHelper,
-} from "../services/editor-helper";
+import { editorHelperDiagnostics } from "../services/editor-helper";
 import {
 	EDITOR_OPERATION_STORE_LIMITS,
 	EditorRemoteOperationStore,
@@ -78,7 +74,7 @@ async function fixtureBytes(
 test.each([
 	"local",
 	"remote",
-] as const)("Chrome production writer, actual verified binary and authenticated executor WS (%s)", async (device) => {
+] as const)("Chrome production writer, ordinary Host or verified authenticated executor WS (%s)", async (device) => {
 	const project = resolve(import.meta.dir, "../.."),
 		root = await mkdtemp(join(testEnvironment.isolatedHome, "native-browser-"));
 	const bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.native-browser-"));
@@ -147,15 +143,7 @@ test.each([
 	}[] = [];
 	try {
 		if (device === "remote") await fixture.start();
-		else {
-			const artifact = await resolveEditorHelper(AbortSignal.timeout(15_000));
-			expect(artifact.sha256).toBe(fixture.binarySha256);
-			const end = Date.now() + 15_000;
-			while (!editorHelperAvailable()) {
-				if (Date.now() > end) throw new Error("Verified native helper feature probe failed");
-				await new Promise((resolve) => setTimeout(resolve, 10));
-			}
-		}
+		// Local uses the production Host writer; no helper preparation/probe.
 		const service = getEditorDocumentService();
 		const nativeStore =
 			device === "remote"
@@ -374,8 +362,9 @@ test.each([
 			(window as unknown as RawWindow).rawFixture.adoptVisible(),
 		);
 		expect(opened.session?.capabilities).toMatchObject({
+			rawSave: true,
 			stage: true,
-			durableApply: true,
+			durableApply: device === "remote",
 			durableQuery: true,
 		});
 		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.edit("Z"));
@@ -384,7 +373,12 @@ test.each([
 		expect(saved.dirty).toBe(false);
 		const expected = Buffer.concat([Buffer.from("Z"), original]);
 		expect(hash(await readFile(target))).toBe(hash(expected));
-		expect((await lstat(target)).ino).not.toBe(initialInode);
+		if (device === "remote") expect((await lstat(target)).ino).not.toBe(initialInode);
+		else {
+			expect((await lstat(target)).ino).toBe(initialInode);
+			expect(fixture.applies).toBe(0);
+			expect(editorHelperDiagnostics()).toMatchObject({ processes: 0, roots: 0, queued: 0 });
+		}
 		expect((await lstat(target)).mode & 0o777).toBe(0o640);
 		expect(commits).toBe(1);
 		if (device === "remote") {
@@ -769,7 +763,7 @@ test.each([
 				bytes: expected.length,
 				commits,
 				actualExecutorApplies: fixture.applies,
-				atomicMode: (await lstat(target)).mode & 0o777,
+				savedMode: (await lstat(target)).mode & 0o777,
 				resources: {
 					samples: samples.length,
 					baseline: samples[0],

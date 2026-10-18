@@ -11,7 +11,7 @@ import * as relations from "../db/relations";
 import * as schema from "../db/schema";
 import { safeSpawn } from "../lib/spawn";
 import { nativeEditorFixture } from "../routes/editor-native-fixture";
-import { editorOperationStore, executeAtomicEditorFileChange } from "./editor-document-runtime";
+import { executeAtomicEditorFileChange } from "./editor-document-runtime";
 import { EditorDocumentService } from "./editor-document-service";
 import { createEditorFileAtomicIo } from "./editor-file-atomic-io";
 import { EditorHelperSession, type EditorRpc } from "./editor-helper";
@@ -597,7 +597,7 @@ test("native Host metadata permission refusal is before target dispatch", async 
 	expect((await lstat(target)).ino).toBe(inode);
 });
 
-test("production editor holds narrator revision and worktree admission through real helper settlement", async () => {
+test("production editor holds narrator revision and worktree admission through ordinary Host settlement", async () => {
 	await writeFile(target, "before");
 	const fixture = await nativeEditorFixture(root, workspace);
 	const now = new Date().toISOString();
@@ -678,9 +678,15 @@ test("production editor holds narrator revision and worktree admission through r
 		await expect(
 			withLocalFileChangeRuntime(runtime, () => executeAtomicEditorFileChange(rejected)),
 		).rejects.toThrow();
-		expect((await editorOperationStore().get(rejected.requestId))?.receipt?.outcome).toBe(
-			"rejected",
-		);
+		await expect(
+			lstat(
+				join(
+					testEnvironment.narraforkHome,
+					"editor-native-operations",
+					`${rejected.requestId}.json`,
+				),
+			),
+		).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		release();
 		await saving;

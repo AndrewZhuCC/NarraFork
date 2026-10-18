@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -24,8 +24,8 @@ import {
 	type EditorDocumentDependencies,
 	EditorDocumentService,
 } from "../services/editor-document-service";
+import { EditorHelperSession, editorHelperDiagnostics } from "../services/editor-helper";
 import { createEditorDocumentRoutes } from "./editor-documents";
-import { nativeEditorFixture } from "./editor-native-fixture";
 
 const CHROME =
 	process.env.NF_TEST_CHROMIUM_PATH ??
@@ -39,7 +39,7 @@ const deferred = () => {
 	return { promise, resolve };
 };
 type RawWindow = Window & { rawFixture: typeof Fixture };
-test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through production atomic helper", async () => {
+test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through ordinary Host writer", async () => {
 	const project = resolve(import.meta.dir, "../.."),
 		root = await mkdtemp(join(testEnvironment.isolatedHome, "format-browser-")),
 		bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.format-browser-")),
@@ -69,8 +69,10 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 	let pause:
 		| { entered: ReturnType<typeof deferred>; released: ReturnType<typeof deferred> }
 		| undefined;
-	const native = await nativeEditorFixture(root, workspace);
-	// Real verified precompiled helper; the HTTP identity is synthetic like the existing fixture.
+	const helperOpen = spyOn(EditorHelperSession, "open").mockImplementation(async () => {
+		throw new Error("Host format saves must not launch an editor helper");
+	});
+	// Production Host IO; the HTTP identity is synthetic like the existing fixture.
 	const execute: EditorDocumentDependencies["execute"] = async (request) => {
 		const gate = pause;
 		pause = undefined;
@@ -85,6 +87,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 	const service = new EditorDocumentService({
 		root: join(root, "transfers"),
 		execute,
+		atomicWriter: () => false,
 		rawWriter: {
 			execute,
 			queryOperation: queryEditorOperation,
@@ -601,6 +604,8 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		const final = await call("state");
 		expect(final.save.activeWorkers).toBe(0);
 		expect(final.codecs.workers).toBe(0);
+		expect(helperOpen).toHaveBeenCalledTimes(0);
+		expect(editorHelperDiagnostics()).toMatchObject({ processes: 0, roots: 0, queued: 0 });
 		console.info(
 			"EDITOR_FORMAT_CHROME146",
 			JSON.stringify({
@@ -619,7 +624,7 @@ test("Chrome146 raw encoder/Monaco format/undo/spool/chunk/save/recovery through
 		await browser?.close();
 		server?.stop(true);
 		await service.dispose();
-		await native.dispose();
+		helperOpen.mockRestore();
 		await rm(bundleRoot, { recursive: true, force: true });
 		await rm(root, { recursive: true, force: true });
 	}

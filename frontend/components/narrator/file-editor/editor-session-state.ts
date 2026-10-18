@@ -11,6 +11,7 @@ import type {
 import {
 	EDITOR_BOUNDED_READ_CAPABILITIES,
 	type EditorProviderCapabilities,
+	editorProviderCanRawSave,
 } from "@shared/editor-provider-contracts";
 import { ApiError } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
@@ -85,13 +86,7 @@ export function sessionCanSave(state: EditorSessionState): boolean {
 	return (
 		state.loaded &&
 		(state.protocol !== "raw-v2" ||
-			!!(
-				state.codecSafe &&
-				state.formatReady &&
-				state.capabilities?.stage &&
-				state.capabilities.durableApply &&
-				state.capabilities.durableQuery
-			)) &&
+			!!(state.codecSafe && state.formatReady && editorProviderCanRawSave(state.capabilities))) &&
 		!state.invalidated &&
 		// Declared capabilities are authoritative; only an older server that omits
 		// them keeps the legacy v1 save path.

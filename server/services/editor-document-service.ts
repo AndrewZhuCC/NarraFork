@@ -216,6 +216,8 @@ export interface EditorDocumentDependencies {
 	writerUnavailableReason?(
 		binding: EditorBinding,
 	): EditorProviderCapabilities["writeUnavailableReason"];
+	/** Whether the trusted writer provides atomic durable apply, distinct from raw save. */
+	atomicWriter?(binding: EditorBinding): boolean;
 	/** Trusted provider only. Availability is negotiated per authorized resource. */
 	rawWriter?: {
 		execute: EditorDocumentDependencies["execute"];
@@ -595,11 +597,15 @@ export class EditorDocumentService {
 								}
 							: {}),
 						rawRead: true,
+						rawSave:
+							!!this.deps.rawWriter && (this.deps.writerAvailable?.(binding) ?? !binding.rawSource),
 						stage: this.deps.writerAvailable
 							? !!this.deps.rawWriter && this.deps.writerAvailable(binding)
 							: !binding.rawSource,
 						durableApply:
-							!!this.deps.rawWriter && (this.deps.writerAvailable?.(binding) ?? !binding.rawSource),
+							!!this.deps.rawWriter &&
+							(this.deps.writerAvailable?.(binding) ?? !binding.rawSource) &&
+							(this.deps.atomicWriter?.(binding) ?? true),
 						durableQuery:
 							!!this.deps.rawWriter && (this.deps.writerAvailable?.(binding) ?? !binding.rawSource),
 					},

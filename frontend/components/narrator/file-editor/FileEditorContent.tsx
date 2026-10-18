@@ -15,6 +15,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { EditorRawEncoding } from "@shared/editor-document";
+import { editorProviderCanRawSave } from "@shared/editor-provider-contracts";
 import {
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	type FileReferenceEditorSelection,
@@ -375,13 +376,7 @@ function FileEditorDocument({
 		!!narratorId &&
 		!state.invalidated &&
 		(state.protocol === "raw-v2"
-			? !!(
-					state.codecSafe &&
-					state.formatReady &&
-					state.capabilities?.stage &&
-					state.capabilities.durableApply &&
-					state.capabilities.durableQuery
-				)
+			? !!(state.codecSafe && state.formatReady && editorProviderCanRawSave(state.capabilities))
 			: state.capabilities
 				? state.capabilities.v1Save
 				: deviceId === "local");

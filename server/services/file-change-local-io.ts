@@ -228,9 +228,13 @@ function directory(stat: BigIntStats): void {
  */
 export function createFileChangeLocalIo(
 	syscalls: LocalFileSyscalls = { lstat, mkdir, open },
+	profile: { maxBytes: number; createParents: boolean; cancelledMutationIsUnknown?: boolean } = {
+		maxBytes: FILE_CHANGE_LIMITS.blobBytes,
+		createParents: true,
+	},
 ): FileChangeLocalIo {
 	return {
-		async read(path, signal, maxBytes) {
+		async read(path, signal, maxBytes = profile.maxBytes) {
 			signal?.throwIfAborted();
 			let entry: BigIntStats;
 			try {
@@ -283,8 +287,8 @@ export function createFileChangeLocalIo(
 			try {
 				input.diagnostics?.enter("io_validate");
 				signal.throwIfAborted();
-				if (nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
-					throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
+				if (nextBytes.byteLength > profile.maxBytes)
+					throw new LocalFileValidationError("Output exceeds the file evidence byte budget");
 				await input.assertTarget();
 				// Before mkdir/create/truncate: keep the WAL/result reserve and charge the
 				// entire new content (not just growth; rewrites can allocate fresh blocks).
@@ -313,6 +317,8 @@ export function createFileChangeLocalIo(
 							break;
 						} catch (error) {
 							if (codeOf(error) !== "ENOENT") throw error;
+							if (!profile.createParents)
+								throw new LocalFileValidationError("Editor parent directory does not exist");
 							missing.push(ancestor);
 						}
 					}
@@ -360,7 +366,7 @@ export function createFileChangeLocalIo(
 				}
 				if (before.bytes !== null) {
 					input.diagnostics?.enter("io_read_descriptor");
-					if (!equal(before, await readHandle(file, signal)))
+					if (!equal(before, await readHandle(file, signal, profile.maxBytes)))
 						throw new LocalFileValidationError("Opened content/object changed before dispatch");
 				}
 				input.diagnostics?.enter("io_validate_before_mutation");
@@ -450,6 +456,12 @@ export function createFileChangeLocalIo(
 					failed = true;
 					failure = error;
 				}
+			}
+			if (!failed && profile.cancelledMutationIsUnknown && signal.aborted) {
+				// Still drain write/sync/close and verification. A cancelled editor
+				// response cannot establish successful save acknowledgement.
+				failed = true;
+				failure = signal.reason;
 			}
 			if (!failed) return { kind: "applied", error: null, parentEffects };
 			return {

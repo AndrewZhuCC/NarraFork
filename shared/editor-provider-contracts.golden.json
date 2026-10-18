@@ -26,6 +26,35 @@
 		"durableQuery": false,
 		"watch": false
 	},
+	"capabilitiesHostRawSave": {
+		"boundedRead": true,
+		"v1Save": false,
+		"rawRead": true,
+		"rawSave": true,
+		"stage": true,
+		"durableApply": false,
+		"durableQuery": true,
+		"watch": true
+	},
+	"capabilitiesRawSaveDisabled": {
+		"boundedRead": true,
+		"v1Save": false,
+		"rawRead": true,
+		"rawSave": false,
+		"stage": true,
+		"durableApply": true,
+		"durableQuery": true,
+		"watch": false
+	},
+	"capabilitiesLegacyRawSave": {
+		"boundedRead": true,
+		"v1Save": false,
+		"rawRead": true,
+		"stage": true,
+		"durableApply": true,
+		"durableQuery": true,
+		"watch": false
+	},
 	"identityPosix": {
 		"deviceId": "Device-A",
 		"pathFlavor": "posix",

@@ -8,7 +8,7 @@ import { EditorAttemptSpool } from "./editor-attempt-spool";
 import { spliceEols, tagBlock } from "./editor-format-rope";
 import type { EditorRawSnapshot } from "./editor-save-client";
 import { EditorSaveCodec } from "./editor-save-codec";
-import { EditorDocumentSession, sessionDirty } from "./editor-session-state";
+import { EditorDocumentSession, sessionCanSave, sessionDirty } from "./editor-session-state";
 
 globalThis.IDBKeyRange = IDBKeyRange;
 const deferred = () => {
@@ -161,6 +161,27 @@ function setup(factory: IDBFactory | null = new IDBFactory()) {
 		},
 	};
 }
+test.each([
+	true,
+	false,
+	undefined,
+])("rawSave=%s overrides the legacy durable tuple only when declared", async (rawSave) => {
+	const value = setup();
+	if (!value.doc.capabilities) throw new Error("Missing fixture capabilities");
+	value.doc.capabilities = {
+		...value.doc.capabilities,
+		...(rawSave === undefined ? {} : { rawSave }),
+		durableApply: rawSave !== true,
+	};
+	await value.session.load();
+	value.edit("A\nb\nc\n");
+	expect(sessionCanSave(value.session.state)).toBe(rawSave !== false);
+	await value.session.save();
+	expect(value.api.commit).toHaveBeenCalledTimes(rawSave === false ? 0 : 1);
+	expect(sessionDirty(value.session.state)).toBe(rawSave === false);
+	value.session.dispose();
+});
+
 test("raw save captures format and bytes once across confirmation while typing remains dirty", async () => {
 	const value = setup();
 	await value.session.load();

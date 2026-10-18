@@ -75,6 +75,24 @@ func TestEditorContractGoldenFixture(t *testing.T) {
 				t.Fatalf("bounded-read capabilities: %+v", caps)
 			}
 		},
+		"capabilitiesHostRawSave": func(raw json.RawMessage) {
+			caps := roundTrip[EditorProviderCapabilities](t, "capabilitiesHostRawSave", raw)
+			if caps.RawSave == nil || !*caps.RawSave || caps.DurableApply || !caps.DurableQuery || !caps.Stage {
+				t.Fatalf("Host raw save must not advertise durable apply: %+v", caps)
+			}
+		},
+		"capabilitiesRawSaveDisabled": func(raw json.RawMessage) {
+			caps := roundTrip[EditorProviderCapabilities](t, "capabilitiesRawSaveDisabled", raw)
+			if caps.RawSave == nil || *caps.RawSave || !caps.Stage || !caps.DurableApply || !caps.DurableQuery {
+				t.Fatalf("explicit raw-save false must survive legacy capabilities: %+v", caps)
+			}
+		},
+		"capabilitiesLegacyRawSave": func(raw json.RawMessage) {
+			caps := roundTrip[EditorProviderCapabilities](t, "capabilitiesLegacyRawSave", raw)
+			if caps.RawSave != nil || !caps.Stage || !caps.DurableApply || !caps.DurableQuery {
+				t.Fatalf("legacy raw-save capability must remain absent: %+v", caps)
+			}
+		},
 		"identityPosix":       func(raw json.RawMessage) { roundTrip[EditorResourceIdentity](t, "identityPosix", raw) },
 		"rawReadOpen":         func(raw json.RawMessage) { roundTrip[EditorRawReadOpen](t, "rawReadOpen", raw) },
 		"rawReadChunkRequest": func(raw json.RawMessage) { roundTrip[EditorRawReadChunkRequest](t, "rawReadChunkRequest", raw) },
@@ -159,6 +177,27 @@ func TestEditorContractGoldenFixture(t *testing.T) {
 			t.Fatalf("fixture is missing case %q", name)
 		}
 		check(raw)
+	}
+}
+
+func TestEditorCapabilitiesRawSaveOptionalBool(t *testing.T) {
+	falseValue, trueValue := false, true
+	for _, tc := range []struct {
+		name  string
+		field string
+		want  *bool
+	}{
+		{name: "absent"},
+		{name: "false", field: `,"rawSave":false`, want: &falseValue},
+		{name: "true", field: `,"rawSave":true`, want: &trueValue},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := json.RawMessage(`{"boundedRead":true,"v1Save":false,"rawRead":true,"stage":true,"durableApply":true,"durableQuery":true,"watch":false` + tc.field + `}`)
+			caps := roundTrip[EditorProviderCapabilities](t, tc.name, raw)
+			if !reflect.DeepEqual(caps.RawSave, tc.want) {
+				t.Fatalf("rawSave tri-state changed: got %v, want %v", caps.RawSave, tc.want)
+			}
+		})
 	}
 }
 

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Hono } from "hono";
 import { testEnvironment } from "../../tests/preload";
@@ -162,10 +162,21 @@ test("actual HTTP recovery disconnect cancels the native Host lookup before it c
 		port: 0,
 		fetch: (req) => withEditorOperationStore(store, () => app.fetch(req)),
 	});
+	// A fresh unknown Host operation must not initialize the native store. The
+	// cancellation scenario applies only to an identified historical association.
+	const missing = await fetch(
+		`http://127.0.0.1:${server.port}/api/narrators/${narratorId}/editor-operations/${randomUUID()}`,
+	);
+	expect(missing.ok).toBe(false);
+	expect(editorHelperDiagnostics().queued).toBe(0);
+	const operationId = randomUUID();
+	await mkdir(store.root, { recursive: true });
+	// The blocked helper must never get far enough to parse this fault fixture.
+	await writeFile(join(store.root, `${operationId}.json`), "{}");
 	const controller = new AbortController();
 	controllers.push(controller);
 	const response = fetch(
-		`http://127.0.0.1:${server.port}/api/narrators/${narratorId}/editor-operations/${randomUUID()}`,
+		`http://127.0.0.1:${server.port}/api/narrators/${narratorId}/editor-operations/${operationId}`,
 		{ signal: controller.signal },
 	);
 	const aborted = response.then(
