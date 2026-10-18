@@ -1,5 +1,6 @@
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import type { FileChangeBlobRef } from "../../shared/file-change-protocol";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
 import type { CurrentBaselineRequest, CurrentGitBaseline } from "./git-current-baseline-worker";
 
 export type {
@@ -9,6 +10,7 @@ export type {
 } from "./git-current-baseline-worker";
 
 let workers = 0;
+let resolvedWorkerSpecifier: string | undefined;
 /** No unbounded queue of expensive per-panel scans. Callers disclose busy as unknown. */
 async function worker<T>(request: CurrentBaselineRequest, signal: AbortSignal): Promise<T> {
 	signal.throwIfAborted();
@@ -18,7 +20,18 @@ async function worker<T>(request: CurrentBaselineRequest, signal: AbortSignal): 
 	let abort = () => {};
 	let forcedTermination: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const active = new Worker(new URL("./git-current-baseline-worker.ts", import.meta.url));
+		const started = await connectCompiledWorker(
+			resolvedWorkerSpecifier
+				? [resolvedWorkerSpecifier]
+				: compiledWorkerSpecifiers(
+						"services/git-current-baseline-worker.ts",
+						"./git-current-baseline-worker.ts",
+						import.meta.url,
+					),
+			{ signal },
+		);
+		resolvedWorkerSpecifier = started.specifier;
+		const active = started.worker;
 		thread = active;
 		return await new Promise<T>((resolve, reject) => {
 			abort = () => {

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { SQL } from "bun";
+import { compiledWorkerSpecifiers } from "../../lib/compiled-worker";
 import { hotSafe } from "../../lib/hot-safe";
 import { isCompiledRuntime } from "../../lib/runtime-target";
 import { modelHistoryManifest } from "./model-history-delta";
@@ -201,23 +202,19 @@ export async function freezeModelHistorySource(
 
 /**
  * The embedded worker key inside a compiled binary depends on the build layout: a build whose
- * entries share the `server/` root folds the prefix away, while multi-entry builds keep the full
- * path. No single shape is correct for both, so candidates are probed (same reason
- * COMPILED_WORKER_PATHS exists for the db worker); the winner is cached in state.
+ * entries share the `server/` root folds the prefix away, while a main entry outside `server/`
+ * keeps the full path. Candidates are probed; the winner is cached in state.
  */
 export function modelHistoryWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	return (
-		compiled
-			? [
-					"./services/agent-runtime/model-history-worker.js",
-					"./server/services/agent-runtime/model-history-worker.js",
-					"./model-history-worker.js",
-				]
-			: ["./model-history-worker.ts"]
-	).map((path) => new URL(path, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		"services/agent-runtime/model-history-worker.ts",
+		"./model-history-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 
 /** Sentinel distinguishing a worker that never started from one that failed mid-query. */
@@ -247,6 +244,7 @@ async function readWorker(
 		for (const specifier of candidates) {
 			options.signal?.throwIfAborted();
 			if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
+			// Global Worker: a file: href resolves inside $bunfs. node:worker_threads would reject it.
 			const worker = new Worker(specifier);
 			// A module-load failure surfaces as onerror with no message at all; a running
 			// worker always communicates before dying. That difference gates the probe.
