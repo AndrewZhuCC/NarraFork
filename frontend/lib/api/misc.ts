@@ -991,11 +991,20 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ parent, name }),
 		}),
-	fsReveal: (path: string) =>
-		request<{ ok: true }>("/fs/reveal", {
+	/**
+	 * Open a directory in the server host's file manager.
+	 *
+	 * On Windows the server answers with a one-time `narrafork://` URI instead of launching Explorer
+	 * itself; opening it from the page lets Explorer come to the foreground.
+	 */
+	fsReveal: async (path: string) => {
+		const result = await request<{ ok: true; protocolUrl?: string }>("/fs/reveal", {
 			method: "POST",
 			body: JSON.stringify({ path }),
-		}),
+		});
+		if (result.protocolUrl) window.location.href = result.protocolUrl;
+		return result;
+	},
 	/**
 	 * Fetch a file for saving to disk.
 	 *

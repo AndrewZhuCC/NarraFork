@@ -12,6 +12,7 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
@@ -321,6 +322,13 @@ app.route("/api/external/v1", externalV1Routes);
 
 // Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
 app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
+
+// Claimed by the `narrafork://` protocol client, which has no session: the one-time token is the
+// credential (see lib/reveal-protocol.ts).
+app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
+	const path = claimRevealToken(c.req.param("token"));
+	return path ? c.json({ path }) : c.json({ error: "Unknown or expired reveal token" }, 404);
+});
 
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through

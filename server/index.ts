@@ -1,6 +1,7 @@
 import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
 import { neutralizeAmbientProxyEnv } from "./lib/net/proxy-env";
 import { waitForPreviousServerShutdown } from "./lib/restart-handoff";
+import { parseRevealActivation } from "./lib/reveal-protocol";
 import { WATCHER_WORKER_FLAG } from "./lib/watcher/worker-protocol";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 
@@ -10,7 +11,16 @@ import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 // the single authority. See lib/net/proxy-env.ts.
 neutralizeAmbientProxyEnv();
 
-if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
+if (parseRevealActivation(process.argv)) {
+	// `narrafork://` activation (Windows "reveal in Explorer"): a short-lived client of the running
+	// server, so it never touches settings, the database or the port. See lib/reveal-protocol.ts.
+	const { runRevealProtocolClient } = await import("./lib/reveal-protocol-client");
+	await runRevealProtocolClient(process.argv).catch(async (error) => {
+		const { logger } = await import("./lib/logger");
+		logger.warn("Reveal protocol activation failed", { error: String(error) });
+	});
+	process.exit(0);
+} else if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
 	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main
 	// (or the watcher worker) would open the database read-write and take the instance lock.
 	await import("./db/integrity-probe-worker");
