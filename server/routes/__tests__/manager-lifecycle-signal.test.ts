@@ -81,6 +81,7 @@ describe("manager lifecycle signal", () => {
 
 		expect(response.status).toBe(202);
 		expect(await response.json()).toEqual({ success: true });
+		// scheduleOperatorShutdown 先等 300ms 再调用处理函数，好让 HTTP 响应先写完。
 		await Bun.sleep(500);
 		expect(reasons).toEqual(["signal"]);
 		expect(shutdown).not.toHaveBeenCalled();
