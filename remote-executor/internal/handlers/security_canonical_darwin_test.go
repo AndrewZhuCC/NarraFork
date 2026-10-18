@@ -46,8 +46,16 @@ func darwinCaseVolume(t *testing.T, fs string, caseSensitive bool) string {
 	if err := os.Mkdir(mount, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if output, err := darwinCaseCommand("create", "-quiet", "-size", "128m", "-type", "SPARSE", "-fs", fs, "-volname", "NFEditorCase", image); err != nil {
-		t.Fatalf("create isolated %s volume: %v %s", fs, err, output)
+	// APFSX is the test label, not an assumed hdiutil filesystem personality.
+	// hdiutil documents -fsargs as newfs arguments; newfs_apfs -e selects CS.
+	args := []string{"create", "-size", "128m", "-type", "SPARSE", "-fs", "APFS", "-volname", "NFEditorCase"}
+	if caseSensitive {
+		args = append(args, "-fsargs", "-e")
+	}
+	args = append(args, image)
+	// Do not use -quiet here: it closes stdout AND stderr, hiding failure causes.
+	if output, err := darwinCaseCommand(args...); err != nil {
+		t.Fatalf("create isolated %s volume with %q: %v %s", fs, args, err, output)
 	}
 	if output, err := darwinCaseCommand("attach", "-quiet", "-nobrowse", "-mountpoint", mount, image); err != nil {
 		t.Fatalf("attach isolated %s volume: %v %s", fs, err, output)

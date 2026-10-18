@@ -246,6 +246,41 @@ describe("generic CI workflow", () => {
 			expect(step["continue-on-error"]).toBeUndefined();
 	});
 
+	test("Linux executor Go tests install and verify real ripgrep before the unchanged full suite", () => {
+		const auxiliary = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/remote-executor.yml"), "utf8"),
+		) as Workflow;
+		const linux = auxiliary.jobs["executor-go"];
+		const install = linux.steps.find(
+			(value) => value.name === "Install Go test system dependencies",
+		);
+		const tests = linux.steps.find((value) => value.name === "Run Go tests");
+		if (!install || !tests) throw new Error("Missing Linux executor test preparation");
+		expect(linux["runs-on"]).toBe("ubuntu-latest");
+		expect(
+			install.run
+				?.trim()
+				.split("\n")
+				.map((line) => line.trim()),
+		).toEqual([
+			"sudo apt-get update",
+			"sudo apt-get install --yes ripgrep",
+			"command -v rg",
+			"rg --version",
+		]);
+		expect(linux.steps.indexOf(install)).toBeLessThan(linux.steps.indexOf(tests));
+		expect(tests.run?.trim()).toBe("go test ./...");
+		expect(linux["continue-on-error"]).toBeUndefined();
+		expect(linux.if).toBeUndefined();
+		for (const value of [install, tests]) {
+			expect(value.if).toBeUndefined();
+			expect(value["continue-on-error"]).toBeUndefined();
+		}
+		expect(
+			auxiliary.jobs["executor-native-files"].steps.some((value) => value.run?.includes("apt-get")),
+		).toBe(false);
+	});
+
 	test("executor dry-run uses the shared component pin instead of a fabricated CI version", () => {
 		const auxiliary = Bun.YAML.parse(
 			readFileSync(join(repository, ".github/workflows/remote-executor.yml"), "utf8"),
