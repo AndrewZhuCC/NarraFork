@@ -9,6 +9,7 @@ import { Hono } from "hono";
 import {
 	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../../lib/composer-document";
@@ -110,6 +111,7 @@ function fixture(
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
 		bindComposerDocumentReferences,
+		restoreMultipartComposerText,
 		validateComposerProjection,
 		validateComposerAssets,
 		sendMessageSchema,
@@ -334,6 +336,29 @@ describe("primary HTTP message admission", () => {
 		expect(
 			(await f.post({ message: "rich", composerDocument: { ...document, version: 9 } })).status,
 		).toBe(400);
+	});
+	test("multipart CRLF normalization keeps a pasted-image document in sync", async () => {
+		const f = fixture({ buffered: true });
+		const document = {
+			version: 1,
+			paragraphs: [
+				{ children: [{ type: "text", text: "line one" }] },
+				{
+					children: [
+						{ type: "text", text: "line two" },
+						{ type: "attachment", id: "node", assetId: "asset" },
+					],
+				},
+			],
+			assets: [{ id: "asset", kind: "image", name: "image.png", size: 5, mimeType: "image/png" }],
+		};
+		const body = new FormData();
+		body.set("message", "line one\nline two");
+		body.append("images", new File(["image"], "image.png", { type: "image/png" }));
+		body.set("composerDocument", JSON.stringify(document));
+		expect((await f.post(body)).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[1]).toBe("line one\nline two");
+		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
 	});
 	test("document adopts canonical file reference metadata from capture", async () => {
 		const f = fixture({ buffered: true, canonicalPrefix: "/private" });

@@ -21,6 +21,18 @@ export function parseOptionalComposerDocument(value: unknown): ComposerDocument 
 		throw new ValidationError("Invalid composer document");
 	}
 }
+/**
+ * multipart/form-data serialization rewrites every lone LF/CR in string fields to CRLF, while
+ * the JSON composerDocument keeps the editor's LF. Recover the exact projection in that case.
+ */
+export function restoreMultipartComposerText(
+	value: string,
+	document: ComposerDocument | undefined,
+): string {
+	if (!document) return value;
+	const { text } = composerDocumentText(document);
+	return value !== text && text.replace(/\r\n|\r|\n/g, "\r\n") === value ? text : value;
+}
 export function validateComposerProjection(
 	document: ComposerDocument | undefined,
 	text: string,

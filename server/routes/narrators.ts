@@ -94,6 +94,7 @@ import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-rout
 import {
 	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../lib/composer-document";
@@ -524,9 +525,12 @@ export async function parseMessageRequest(
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		const message = restoreMultipartComposerText(
+			typeof rawMessage === "string" ? rawMessage : "",
+			composerDocument,
+		);
 		validateComposerProjection(composerDocument, message, fileReferences);
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
@@ -2992,9 +2996,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
 		const formData = await c.req.formData();
-		content = (formData.get("content") as string) ?? "";
 		fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		content = restoreMultipartComposerText(
+			(formData.get("content") as string) ?? "",
+			composerDocument,
+		);
 		const rawSkipRevert = formData.get("skipRevert");
 		if (typeof rawSkipRevert === "string") skipRevert = rawSkipRevert === "true";
 		const rawRollback = formData.get("rollback");
@@ -3320,6 +3327,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
+		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
