@@ -1560,6 +1560,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return;
 			}
+			// Up/down follow visual lines, including soft wraps. History runs only when that
+			// press leaves the caret on the same line (start of the text going up, end going
+			// down). Editor state still has the pre-key caret until selectionchange, which can
+			// land after this frame and make every ArrowUp look like the boundary.
 			if (
 				(e.key === "ArrowUp" || e.key === "ArrowDown") &&
 				!e.shiftKey &&
@@ -1567,11 +1571,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				!e.metaKey &&
 				(!documentRef.current.assets.length || inputHistory.isBrowsing)
 			) {
-				const before = editorRef.current?.getSelection();
+				const before = editorRef.current?.readLiveCaret() ?? null;
 				const direction = e.key === "ArrowUp" ? "up" : "down";
-				requestAnimationFrame(() => {
-					const after = editorRef.current?.getSelection();
-					if (!before || !after || before.start !== after.start || before.end !== after.end) return;
+				const recallIfCaretStayed = () => {
+					if (!editorRef.current?.caretStayedOnLine(before)) return;
 					const result = inputHistory.navigateEntry(
 						direction,
 						inputRef.current,
@@ -1585,7 +1588,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							editorRef.current?.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
 						);
 					}
-				});
+				};
+				const frame = editorRef.current?.getElement()?.ownerDocument.defaultView;
+				if (frame) frame.requestAnimationFrame(recallIfCaretStayed);
+				else requestAnimationFrame(recallIfCaretStayed);
 			}
 		};
 
