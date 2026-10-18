@@ -32,12 +32,7 @@
 
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import {
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
+import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { generateId, generateShortId } from "../lib/id";
