@@ -1,7 +1,10 @@
 import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
+import { captureManagerTokenFromEnv } from "./lib/manager-token";
 import { neutralizeAmbientProxyEnv } from "./lib/net/proxy-env";
 import { waitForPreviousServerShutdown } from "./lib/restart-handoff";
+import { isCompiledRuntime } from "./lib/runtime-target";
 import { WATCHER_WORKER_FLAG } from "./lib/watcher/worker-protocol";
+import { shouldRunManager } from "./manager/launch-mode";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 
 // Must run before ANY outbound fetch. Bun's fetch honours ambient HTTP(S)_PROXY
@@ -9,6 +12,8 @@ import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 // values are snapshotted and blanked here to make the configured proxy policy
 // the single authority. See lib/net/proxy-env.ts.
 neutralizeAmbientProxyEnv();
+// 管理器令牌只留在本进程内存里。放在拉起任何子进程之前，终端和 Bash 就复制不到它。
+captureManagerTokenFromEnv();
 
 if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
 	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main
@@ -22,7 +27,18 @@ if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
 	// before ./main, so no instance lock / DB / HTTP server. Loads the plugin
 	// entry, which owns the stdio RPC channel.
 	await import("./plugin-runtime-worker").then((m) => m.runPluginRuntimeWorker());
+} else if (
+	shouldRunManager({
+		argv: process.argv,
+		platform: process.platform,
+		compiled: isCompiledRuntime(),
+	})
+) {
+	// 图形化管理器不监听端口，所以不做"上一次服务退出等待"。
+	// 真正的服务由管理器以 `--serve` 子进程拉起，那一步会做该等待。
+	await import("./manager/main").then((manager) => manager.runManager());
 } else {
+	// 源码启动（bun run dev / start）以及 `--serve` 子进程走服务模式。
 	const handoffOk = await waitForPreviousServerShutdown();
 	if (!handoffOk) {
 		process.exit(1);
