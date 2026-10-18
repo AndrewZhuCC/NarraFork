@@ -411,6 +411,7 @@ export function CreateNarratorModal({
 		setMakeNamed(false);
 		setKnowledgeSteward(false);
 		setHandle("");
+		setSessionTitle("");
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
 	};
 
@@ -603,15 +604,15 @@ export function CreateNarratorModal({
 				}}
 			/>
 
-			<Divider label={t("sectionSessionType")} labelPosition="left" />
-
 			<TextInput
 				label={t("sessionTitle")}
-				placeholder={t("sessionTitleHint")}
+				description={t("sessionTitleHint")}
 				value={sessionTitle}
 				onChange={(e) => setSessionTitle(e.currentTarget.value)}
 				maxLength={200}
 			/>
+
+			<Divider label={t("sectionSessionType")} labelPosition="left" />
 
 			<Checkbox
 				label={t("makeNamed")}
