@@ -1,5 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { SHARE_HTML_TIMEOUT_MS } from "../../shared/share-preview";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "./compiled-worker";
 import { AppError } from "./errors";
 import { logger } from "./logger";
 import { isCompiledRuntime } from "./runtime-target";
@@ -8,22 +9,16 @@ export function shareHtmlWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	return (
-		compiled
-			? [
-					"./lib/share-preview-worker.js",
-					"./server/lib/share-preview-worker.js",
-					"./share-preview-worker.js",
-				]
-			: ["./share-preview-worker.ts"]
-	).map((path) => new URL(path, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		"lib/share-preview-worker.ts",
+		"./share-preview-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 /** Preserve Bun's Windows embedded module key, instead of converting it to backslashes. */
 export function shareHtmlWorkerEntry(specifier: string): string | URL {
-	const url = new URL(specifier);
-	return url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)
-		? decodeURIComponent(url.pathname.slice(1))
-		: url;
+	return workerEntryFromSpecifier(specifier);
 }
 let activeWorkers = 0;
 let resolvedSpecifier: string | undefined;

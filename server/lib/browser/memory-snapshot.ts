@@ -1,5 +1,6 @@
 import { unlink } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
 import { isCompiledRuntime } from "../runtime-target";
 import {
 	boundedCleanup,
@@ -17,22 +18,15 @@ export function snapshotWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	return (
-		compiled
-			? [
-					"./lib/browser/memory-snapshot-worker.js",
-					"./server/lib/browser/memory-snapshot-worker.js",
-					"./memory-snapshot-worker.js",
-				]
-			: ["./memory-snapshot-worker.ts"]
-	).map((path) => new URL(path, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		"lib/browser/memory-snapshot-worker.ts",
+		"./memory-snapshot-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 export function snapshotWorkerEntryPoint(specifier: string): string | URL {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
-		return decodeURIComponent(url.pathname.slice(1));
-	}
-	return url;
+	return workerEntryFromSpecifier(specifier);
 }
 type SnapshotReply =
 	| { kind: "ready" }

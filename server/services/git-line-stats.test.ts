@@ -4,11 +4,13 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
+import { workerEntryFromSpecifier } from "../lib/compiled-worker";
 import type { SafeSpawnOptions } from "../lib/spawn";
 import * as spawn from "../lib/spawn";
 import {
 	getGitLineStats,
 	gitLineStatsWorkerEntryPoint,
+	gitLineStatsWorkerSpecifiers,
 	parseGitLineNumstat,
 } from "./git-line-stats";
 import { UntrackedLineReader } from "./git-untracked-line-worker";
@@ -116,12 +118,23 @@ describe("independent Git line statistics", () => {
 				"file:///project/server/services/git-line-stats.ts",
 			).toString(),
 		).toBe("file:///project/server/services/git-untracked-line-worker.ts");
+		expect(gitLineStatsWorkerSpecifiers(true, "file:///$bunfs/root/binary")).toEqual([
+			"file:///$bunfs/root/services/git-untracked-line-worker.js",
+			"file:///$bunfs/root/server/services/git-untracked-line-worker.js",
+			"file:///$bunfs/root/git-untracked-line-worker.js",
+		]);
 		expect(gitLineStatsWorkerEntryPoint(true, "file:///$bunfs/root/binary").toString()).toBe(
 			"file:///$bunfs/root/services/git-untracked-line-worker.js",
 		);
-		expect(gitLineStatsWorkerEntryPoint(true, "file:///C:/%7EBUN/root/binary.exe")).toBe(
+		expect(
+			gitLineStatsWorkerSpecifiers(true, "file:///C:/%7EBUN/root/binary.exe").map((specifier) =>
+				workerEntryFromSpecifier(specifier),
+			),
+		).toEqual([
 			"C:/~BUN/root/services/git-untracked-line-worker.js",
-		);
+			"C:/~BUN/root/server/services/git-untracked-line-worker.js",
+			"C:/~BUN/root/git-untracked-line-worker.js",
+		]);
 	});
 
 	test("unborn repositories need no HEAD and binary files measure zero text lines", async () => {
@@ -288,7 +301,10 @@ describe("independent Git line statistics", () => {
 		for (const controller of controllers) controller.abort(new Error("queued cancellation"));
 		const cancelled = await Promise.all(waiting);
 		expect(cancelled.every((result) => result instanceof Error)).toBe(true);
-		expect(postSpy).toHaveBeenCalledTimes(1);
+		const reads = postSpy.mock.calls.filter(
+			(call) => (call[0] as { action?: string }).action === "read",
+		);
+		expect(reads).toHaveLength(1);
 		if (!held) throw new Error("Worker did not start");
 		postMessage.call(held.thread, held.message);
 		expect(await first).toMatchObject({ complete: true, linesAdded: 1 });

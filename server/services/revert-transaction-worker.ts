@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -16,23 +17,17 @@ export function revertManifestWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	const paths = compiled
-		? [
-				"./services/revert-transaction-manifest-worker.js",
-				"./server/services/revert-transaction-manifest-worker.js",
-				"./revert-transaction-manifest-worker.js",
-			]
-		: ["./revert-transaction-manifest-worker.ts"];
-	return paths.map((path) => new URL(path, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		"services/revert-transaction-manifest-worker.ts",
+		"./revert-transaction-manifest-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 
 /** Preserve Bun's Windows virtual module key instead of converting it to backslashes. */
 export function revertManifestWorkerEntryPoint(specifier: string): string | URL {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
-		return decodeURIComponent(url.pathname.slice(1));
-	}
-	return url;
+	return workerEntryFromSpecifier(specifier);
 }
 
 const READY_TIMEOUT_MS = 5_000;

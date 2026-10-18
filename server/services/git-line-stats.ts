@@ -1,5 +1,10 @@
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import type { GitLineStats, GitLineStatsFile } from "../../shared/git-line-stats";
+import {
+	compiledWorkerSpecifiers,
+	connectCompiledWorker,
+	workerEntryFromSpecifier,
+} from "../lib/compiled-worker";
 import { GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -122,23 +127,29 @@ async function gitOutput(cwd: string, args: string[], signal: AbortSignal): Prom
 	};
 }
 
-/** Production build entries share server/ as their root and become .js virtual modules. */
+/** Embedded layouts for the untracked-line worker. Dev has one source URL. */
+export function gitLineStatsWorkerSpecifiers(
+	compiled = isCompiledRuntime(),
+	moduleUrl = import.meta.url,
+): string[] {
+	return compiledWorkerSpecifiers(
+		"services/git-untracked-line-worker.ts",
+		"./git-untracked-line-worker.ts",
+		moduleUrl,
+		compiled,
+	);
+}
+
+/** First candidate, in the form `new Worker` accepts. Startup probes the full list. */
 export function gitLineStatsWorkerEntryPoint(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string | URL {
-	const url = new URL(
-		compiled ? "./services/git-untracked-line-worker.js" : "./git-untracked-line-worker.ts",
-		moduleUrl,
-	);
-	// Preserve Bun's Windows virtual module key rather than converting it to backslashes.
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
-		return decodeURIComponent(url.pathname.slice(1));
-	}
-	return url;
+	return workerEntryFromSpecifier(gitLineStatsWorkerSpecifiers(compiled, moduleUrl)[0]);
 }
 
 let thread: Worker | undefined;
+let resolvedWorkerSpecifier: string | undefined;
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 let workerBusy = false;
 interface PendingRead {
@@ -204,7 +215,19 @@ async function workerRead(request: PendingRead): Promise<UntrackedLineBatch> {
 	signal.throwIfAborted();
 	if (idleTimer) clearTimeout(idleTimer);
 	if (!thread) {
-		const created = new Worker(gitLineStatsWorkerEntryPoint());
+		let created: Worker;
+		try {
+			const started = await connectCompiledWorker(
+				resolvedWorkerSpecifier ? [resolvedWorkerSpecifier] : gitLineStatsWorkerSpecifiers(),
+				{ signal },
+			);
+			created = started.worker;
+			resolvedWorkerSpecifier = started.specifier;
+		} catch (error) {
+			throw new GitError(
+				error instanceof Error ? error.message : "Git line statistics worker failed to start",
+			);
+		}
 		thread = created;
 		const forget = () => {
 			if (thread === created) thread = undefined;

@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { launch } from "puppeteer-core";
+import { compiledWorkerBuildEntrypoints } from "../../../../shared/compiled-worker-entries";
 import { PROFILE_LIMITS } from "../memory-profile-constants";
 import type { MemoryProfileRequest, MemoryProfileWorkerReply } from "../memory-profile-types";
 
@@ -19,6 +20,7 @@ test("production compile command includes the profile worker entry", async () =>
 	expect(command).not.toBeNull();
 	const args = command?.[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "") ?? "";
 	expect(args).toMatch(/^\s*process\.execPath\s*,\s*"build"\s*,/);
+	expect(args).toContain("...compiledWorkerBuildEntrypoints()");
 	const { stdout } = await execute(
 		process.execPath,
 		["--eval", "process.stdout.write(Bun.version)"],
@@ -28,7 +30,7 @@ test("production compile command includes the profile worker entry", async () =>
 		},
 	);
 	expect(stdout).toBe(Bun.version);
-	expect(args).toContain(`"${workerEntry}"`);
+	expect(compiledWorkerBuildEntrypoints()).toContain(workerEntry);
 });
 
 test("minified compiled worker is present outside source cwd, closes port; omission fails safely", async () => {

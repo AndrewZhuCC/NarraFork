@@ -1,5 +1,6 @@
 import type { EventEmitter } from "node:events";
 import { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "@server/lib/compiled-worker";
 import { hotSafe } from "@server/lib/hot-safe";
 import { isCompiledRuntime } from "@server/lib/runtime-target";
 export type PrivateArchiveWorkerKind = "legacy-sync" | "legacy-import";
@@ -13,17 +14,17 @@ export function privateArchiveWorkerSpecifiers(
 	moduleUrl = import.meta.url,
 ): string[] {
 	const path = paths[kind];
-	return (
-		compiled
-			? [`./services/${path}.js`, `./server/services/${path}.js`, `./${path.split("/").at(-1)}.js`]
-			: [`./${path.split("/").at(-1)}.ts`]
-	).map((specifier) => new URL(specifier, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		kind === "legacy-sync"
+			? "services/project-archive/legacy-sync-worker.ts"
+			: "services/project-archive/legacy-import-worker.ts",
+		`./${path.split("/").at(-1)}.ts`,
+		moduleUrl,
+		compiled,
+	);
 }
 function entryPoint(specifier: string): URL | string {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname))
-		return decodeURIComponent(url.pathname.slice(1));
-	return url;
+	return workerEntryFromSpecifier(specifier);
 }
 type PrivateArchiveWorkerHandle = Pick<EventEmitter, "once" | "off"> & {
 	terminate(): Promise<number>;

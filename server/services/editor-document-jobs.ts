@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Worker } from "node:worker_threads";
 import { EDITOR_IO_TIMEOUT_MS } from "../../shared/editor-document";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../lib/compiled-worker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -12,24 +13,18 @@ export function editorWorkerSpecifierCandidates(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	const paths = compiled
-		? [
-				"./services/editor-document-worker.js",
-				"./server/services/editor-document-worker.js",
-				"./editor-document-worker.js",
-			]
-		: ["./editor-document-worker.ts"];
-	return paths.map((path) => new URL(path, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		"services/editor-document-worker.ts",
+		"./editor-document-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 /** Bun's Windows embedded module keys use forward slashes. Bypass Worker's
  * file URL → native OS path conversion so the loader receives that exact key.
  * Only unwrap the compiled virtual drive; real files retain normal URL handling. */
 export function editorWorkerEntryPoint(specifier: string): string | URL {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
-		return decodeURIComponent(url.pathname.slice(1));
-	}
-	return url;
+	return workerEntryFromSpecifier(specifier);
 }
 const WORKER_READY_TIMEOUT_MS = 5_000;
 

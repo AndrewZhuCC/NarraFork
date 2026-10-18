@@ -2,6 +2,7 @@ import { lstat, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { CDPSessionEvent } from "puppeteer-core";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
 import { generateId } from "../id";
 import { getNarraforkPath } from "../narrafork-home";
 import { isCompiledRuntime } from "../runtime-target";
@@ -145,21 +146,15 @@ export function profileWorkerSpecifiers(
 	compiled = isCompiledRuntime(),
 	moduleUrl = import.meta.url,
 ): string[] {
-	return (
-		compiled
-			? [
-					"./lib/browser/memory-profile-worker.js",
-					"./server/lib/browser/memory-profile-worker.js",
-					"./memory-profile-worker.js",
-				]
-			: ["./memory-profile-worker.ts"]
-	).map((path) => new URL(path, moduleUrl).href);
+	return compiledWorkerSpecifiers(
+		"lib/browser/memory-profile-worker.ts",
+		"./memory-profile-worker.ts",
+		moduleUrl,
+		compiled,
+	);
 }
 export function profileWorkerEntryPoint(specifier: string): string | URL {
-	const url = new URL(specifier);
-	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname))
-		return decodeURIComponent(url.pathname.slice(1));
-	return url;
+	return workerEntryFromSpecifier(specifier);
 }
 function configFor(opts: MemoryProfileOptions): MemoryProfileConfig {
 	const mode = opts.mode ?? "both";

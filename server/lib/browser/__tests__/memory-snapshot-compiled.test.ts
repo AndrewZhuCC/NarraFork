@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { compiledWorkerBuildEntrypoints } from "../../../../shared/compiled-worker-entries";
 
 const execute = promisify(execFile);
 const root = resolve(import.meta.dir, "../../../..");
@@ -15,6 +16,7 @@ test("production compile arguments register snapshot worker", async () => {
 	expect(command).not.toBeNull();
 	const args = command?.[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "") ?? "";
 	expect(args).toMatch(/^\s*process\.execPath\s*,\s*"build"\s*,/);
+	expect(args).toContain("...compiledWorkerBuildEntrypoints()");
 	const { stdout } = await execute(
 		process.execPath,
 		["--eval", "process.stdout.write(Bun.version)"],
@@ -24,7 +26,7 @@ test("production compile arguments register snapshot worker", async () => {
 		},
 	);
 	expect(stdout).toBe(Bun.version);
-	expect(args).toContain(`"${workerEntry}"`);
+	expect(compiledWorkerBuildEntrypoints()).toContain(workerEntry);
 });
 
 test("real minified compiled binary loads worker outside source cwd; omitted entry fails safely", async () => {
