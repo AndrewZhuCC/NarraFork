@@ -81,6 +81,50 @@
 - 投递状态是确定性事实，应由结构化接口回答：信箱行本身有 `state`（queued / 已消费等）和 `deliveryMessageId`。建议在 `TeamStatus` 增加按 `deliveryMessageId` 查询的动作（或在其 status 输出里列出每个子代理的未消费信箱条目），返回 queued / consumed（附消费它的 run）/ cancelled / failed。
 - `ContextAsk` 描述里补一句：投递状态请用 TeamStatus 查询，不要问摘要模型。
 
+### TeamStatus 投递状态查询：具体设计
+
+**0. 先让调用方拿到投递 ID。** 每次 Send 已经生成 `recipientMessageId`（`createAgentMessageDelivery`），也放进了工具 metadata（`targets[].deliveryMessageId`），但模型看到的 `output` 文本里没有。第一步是在 Send 每个目标的结果行末尾加上 `(delivery: <id>)`。TeamStatus 的 `send` 动作同样补上。
+
+**1. 新增动作 `delivery`。**
+
+```
+TeamStatus({ action: "delivery", target_id: "<子代理>", delivery_id: "<id>" })
+TeamStatus({ action: "delivery", target_id: "<子代理>" })   // 不给 delivery_id：列出该子代理未消费的信箱条目
+```
+
+`target_id` 必填：信箱索引 `idx_nbm_reserved` 是 `(narrator_id, recipient_message_id)`，带上收件人才能走索引，也顺便复用 TeamStatus 现有的"只限本团队直属子代理"授权。
+
+**2. 判定顺序**（都是有索引的单行或小范围读，不读消息正文大字段）：
+
+1. 查 `narrator_buffered_messages`（信箱表），条件 `narrator_id = 目标 AND recipient_message_id = delivery_id`：
+   - `queued`：返回 **排队中**，附排在第几位（按 `arrival_seq` 取前 N+1 行算，不用 `COUNT(*)`）、目标当前状态，以及**会不会被自动处理**。目标 idle 且 `lastStopReason` 是 `error` 或 `user_interrupt` 时，`wakeInboxIfEligible` 不会唤醒它，这里要明确写"目标上一轮异常结束，需要再次 Send 或手动重试才会处理"。这正是问题2里"返回 queued 却一直没执行"的场景。
+   - `claimed`：**正在被消费**（已被某一轮领取，尚未写入转录）。
+   - `materialized`：**已写入转录**，附 `adopted_at`。
+   - `failed` / `cancelled`：**投递失败或已撤回**，附 `last_error`。
+2. 信箱行已被回收（`materialized`/`cancelled` 的行会被 `collectTombstones` 清理）时，查 `narrator_message_refs`（`narrator_id = 目标 AND message_id = delivery_id`，有 `idx_narrator_refs_message`）。找到就是 **已写入转录**，附 `seq`。
+3. 已写入转录时，再用 `idx_narrator_refs_seq` 查该 `seq` 之后是否存在 assistant 消息（`LIMIT 1`）：有就是 **已处理**（子代理在读到这条消息之后至少回复过一次），没有就是 **已送达但还没处理**。
+4. 两处都查不到：返回 **未找到**（ID 不对，或者不属于这个子代理）。不要猜测。
+
+**3. 返回格式**（给模型读的文本 + 结构化 metadata）：
+
+```
+Delivery dlv_xxx → dsf-tail-rope: queued (position 2 of 2).
+Target is idle; its last run ended with an error, so it will NOT be picked up automatically.
+Send again or retry the subagent to run it.
+```
+
+```
+Delivery dlv_xxx → dsf-tail-rope: delivered at transcript seq 418, processed (assistant replied at seq 420).
+```
+
+metadata：`{ kind: "delivery", targetId, deliveryId, state: "queued"|"claimed"|"delivered"|"processed"|"failed"|"cancelled"|"not_found", position?, seq?, autoWake?: boolean, lastError? }`，前端可以用它画投递状态徽标。
+
+**4. 顺带增强 `list_agents`。** 每个子代理行加一个"未消费信箱 N 条"（按 `idx_nbm_state_arrival` 取 `LIMIT n+1`，超过显示 `N+`），让"有消息卡住"不用逐条查就能被看到。
+
+**5. 约束。** 遵守主线程性能规则：每次查询最多几次带索引的点查；`delivery_id` 不给时的列表模式按 `arrival_seq` 分页、限定行数，只返回 ID、发送方、时间和不超过 80 字的预览，不返回正文。
+
+**6. 测试。** 至少覆盖：queued 且会自动唤醒；queued 且上一轮以 error 结束（不会唤醒）；claimed；信箱行仍在的 materialized；信箱行已回收、只能从 refs 查到；已送达未处理和已处理两种；跨团队 ID 被拒；ID 不存在。
+
 ## 推荐的实施顺序
 
 1. 问题1 执行屏障 + 问题3 方案A：根因确定、改动面可控，先做并配回归测试。
