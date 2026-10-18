@@ -92,7 +92,9 @@ import {
 } from "../lib/browser/session";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
+	bindComposerDocumentReferences,
 	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../lib/composer-document";
@@ -523,9 +525,12 @@ export async function parseMessageRequest(
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		const message = restoreMultipartComposerText(
+			typeof rawMessage === "string" ? rawMessage : "",
+			composerDocument,
+		);
 		validateComposerProjection(composerDocument, message, fileReferences);
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
@@ -2159,7 +2164,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		interrupt: requestedInterrupt,
 		queueMode,
 		fileReferences,
-		composerDocument,
+		composerDocument: requestedComposerDocument,
 	} = await parseMessageRequest(c, id);
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
@@ -2173,7 +2178,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// a rejected reference must not strand images saved by multipart parsing.
 	let uploadsAccepted = false;
 	try {
-		const mixedDocument = composerDocument?.paragraphs.some((paragraph) =>
+		const mixedDocument = requestedComposerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
 		);
 		const queuedNewCommand = mixedDocument ? null : parseNewCommand(message);
@@ -2405,6 +2410,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		const snapshots = fileReferences?.length
 			? await captureFileReferences(id, userId, fileReferences, c.req.raw.signal)
 			: undefined;
+		const composerDocument = bindComposerDocumentReferences(
+			requestedComposerDocument,
+			snapshots?.map((snapshot) => snapshot.reference),
+		);
 
 		// Extract model override from resolved command (if any)
 		const modelOverride =
@@ -2987,9 +2996,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
 		const formData = await c.req.formData();
-		content = (formData.get("content") as string) ?? "";
 		fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		content = restoreMultipartComposerText(
+			(formData.get("content") as string) ?? "",
+			composerDocument,
+		);
 		const rawSkipRevert = formData.get("skipRevert");
 		if (typeof rawSkipRevert === "string") skipRevert = rawSkipRevert === "true";
 		const rawRollback = formData.get("rollback");
@@ -3058,6 +3070,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		fileReferences,
 		userId,
 		c.req.raw.signal,
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 
 	// Editing a message truncates everything after it and regenerates, so the running
@@ -3311,6 +3327,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
+		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
@@ -3375,6 +3392,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		located.message.fileReferences ?? [],
 		fileReferences,
 		(references) => captureFileReferences(id, c.get("user").sub, references, c.req.raw.signal),
+	);
+	composerDocument = bindComposerDocumentReferences(
+		composerDocument,
+		snapshots?.map((snapshot) => snapshot.reference),
 	);
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
